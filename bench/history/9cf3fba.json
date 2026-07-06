@@ -1,0 +1,56 @@
+{
+  "commit": "9cf3fba6969edbcddf6e4f737f201cf1fb4d9ffd",
+  "commit_short": "9cf3fba",
+  "subject": "perf(bench): robust perf gate — min-of-N + machine-invariant ratio, hot workloads only",
+  "dirty": false,
+  "host": "miknix-laptop",
+  "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
+  "timestamp_unix": 1783340239,
+  "iters": 9,
+  "workloads": [
+    {
+      "name": "fib32",
+      "kind": "dispatch-micro",
+      "native_ns": null,
+      "interp_ns": 1060690588,
+      "jit_ns": 120713141,
+      "chained": 21147457,
+      "ibtc_filled": 0,
+      "fast_hits": 0,
+      "misses": 7
+    },
+    {
+      "name": "sha256",
+      "kind": "compute-hot",
+      "native_ns": 1017164,
+      "interp_ns": 215138767,
+      "jit_ns": 19100064,
+      "chained": 460069,
+      "ibtc_filled": 0,
+      "fast_hits": 0,
+      "misses": 19
+    },
+    {
+      "name": "sqlite",
+      "kind": "one-shot",
+      "native_ns": 420242,
+      "interp_ns": 19176789,
+      "jit_ns": 1227863712,
+      "chained": 93417,
+      "ibtc_filled": 193,
+      "fast_hits": 28,
+      "misses": 6484
+    },
+    {
+      "name": "lua",
+      "kind": "one-shot",
+      "native_ns": 299734,
+      "interp_ns": 16938045,
+      "jit_ns": 533248651,
+      "chained": 93733,
+      "ibtc_filled": 119,
+      "fast_hits": 21,
+      "misses": 2764
+    }
+  ]
+}
