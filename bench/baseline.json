@@ -1,129 +1,177 @@
 {
-  "commit": "a3a49ad44fee2b19a074b27e341f14aa69658dc0",
-  "commit_short": "a3a49ad",
-  "subject": "perf(bench): PB-3 native ratios + PB-4 rolling-median series & load-aware gate (doc-29)",
+  "commit": "2a1c30558c1239a9381adb5d69112bec509ec729",
+  "commit_short": "2a1c305",
+  "subject": "perf(bench): tiering modes in record — eager / tier(50) / bg(50) wall-clock (doc-29)",
   "dirty": false,
   "host": "miknix-laptop",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
-  "timestamp_unix": 1783417232,
+  "timestamp_unix": 1783418083,
   "iters": 15,
   "workloads": [
     {
       "name": "fib32",
       "kind": "dispatch-micro",
       "native_ns": null,
-      "interp_ns": 990686926,
-      "jit_ns": 114773350,
+      "interp_ns": 1018445310,
+      "jit_ns": 117954887,
       "chained": 21147457,
       "ibtc_filled": 0,
       "fast_hits": 0,
       "misses": 7,
       "interp_stat": {
-        "min_ns": 990686926,
-        "median_ns": 1028366998,
-        "mad_ns": 12715707,
+        "min_ns": 1018445310,
+        "median_ns": 1052438416,
+        "mad_ns": 17295090,
         "n": 15
       },
       "jit_stat": {
-        "min_ns": 114773350,
-        "median_ns": 120971373,
-        "mad_ns": 2201991,
+        "min_ns": 117954887,
+        "median_ns": 122079188,
+        "mad_ns": 2873834,
         "n": 15
       },
       "native_stat": null,
-      "compile_ns": 1018001
+      "compile_ns": 1008069,
+      "tier_stat": {
+        "min_ns": 117796359,
+        "median_ns": 126244496,
+        "mad_ns": 4720345,
+        "n": 15
+      },
+      "bg_stat": {
+        "min_ns": 123767939,
+        "median_ns": 127941893,
+        "mad_ns": 2504790,
+        "n": 15
+      }
     },
     {
       "name": "sha256",
       "kind": "compute-hot",
-      "native_ns": 935002,
-      "interp_ns": 210168529,
-      "jit_ns": 19219240,
+      "native_ns": 926346,
+      "interp_ns": 210232856,
+      "jit_ns": 19326833,
       "chained": 460069,
       "ibtc_filled": 0,
       "fast_hits": 0,
       "misses": 19,
       "interp_stat": {
-        "min_ns": 210168529,
-        "median_ns": 217999540,
-        "mad_ns": 6110820,
+        "min_ns": 210232856,
+        "median_ns": 216583931,
+        "mad_ns": 4028850,
         "n": 15
       },
       "jit_stat": {
-        "min_ns": 19219240,
-        "median_ns": 20535472,
-        "mad_ns": 695221,
+        "min_ns": 19326833,
+        "median_ns": 21301113,
+        "mad_ns": 1570800,
         "n": 15
       },
       "native_stat": {
-        "min_ns": 935002,
-        "median_ns": 1031935,
-        "mad_ns": 96933,
+        "min_ns": 926346,
+        "median_ns": 1502420,
+        "mad_ns": 344088,
         "n": 15
       },
-      "compile_ns": 13229051
+      "compile_ns": 10859913,
+      "tier_stat": {
+        "min_ns": 14033550,
+        "median_ns": 16715524,
+        "mad_ns": 965170,
+        "n": 15
+      },
+      "bg_stat": {
+        "min_ns": 11911702,
+        "median_ns": 14455626,
+        "mad_ns": 1271976,
+        "n": 15
+      }
     },
     {
       "name": "sqlite",
       "kind": "one-shot",
-      "native_ns": 413489,
-      "interp_ns": 18986281,
-      "jit_ns": 1225287482,
+      "native_ns": 393421,
+      "interp_ns": 20056127,
+      "jit_ns": 1240968154,
       "chained": 93417,
       "ibtc_filled": 193,
       "fast_hits": 28,
       "misses": 6484,
       "interp_stat": {
-        "min_ns": 18986281,
-        "median_ns": 20574315,
-        "mad_ns": 1232705,
+        "min_ns": 20056127,
+        "median_ns": 21160017,
+        "mad_ns": 952475,
         "n": 15
       },
       "jit_stat": {
-        "min_ns": 1225287482,
-        "median_ns": 1257699274,
-        "mad_ns": 7973401,
+        "min_ns": 1240968154,
+        "median_ns": 1261828212,
+        "mad_ns": 16131034,
         "n": 15
       },
       "native_stat": {
-        "min_ns": 413489,
-        "median_ns": 467311,
-        "mad_ns": 46307,
+        "min_ns": 393421,
+        "median_ns": 429309,
+        "mad_ns": 20849,
         "n": 15
       },
-      "compile_ns": 1223860939
+      "compile_ns": 1318901544,
+      "tier_stat": {
+        "min_ns": 96626190,
+        "median_ns": 107419707,
+        "mad_ns": 6184192,
+        "n": 15
+      },
+      "bg_stat": {
+        "min_ns": 32833731,
+        "median_ns": 37018085,
+        "mad_ns": 2824431,
+        "n": 15
+      }
     },
     {
       "name": "lua",
       "kind": "one-shot",
-      "native_ns": 266513,
-      "interp_ns": 16039886,
-      "jit_ns": 525210596,
+      "native_ns": 239210,
+      "interp_ns": 17397388,
+      "jit_ns": 527753131,
       "chained": 93733,
       "ibtc_filled": 119,
       "fast_hits": 21,
       "misses": 2764,
       "interp_stat": {
-        "min_ns": 16039886,
-        "median_ns": 17360215,
-        "mad_ns": 583188,
+        "min_ns": 17397388,
+        "median_ns": 20197103,
+        "mad_ns": 889145,
         "n": 15
       },
       "jit_stat": {
-        "min_ns": 525210596,
-        "median_ns": 534595914,
-        "mad_ns": 6862686,
+        "min_ns": 527753131,
+        "median_ns": 545205583,
+        "mad_ns": 12365176,
         "n": 15
       },
       "native_stat": {
-        "min_ns": 266513,
-        "median_ns": 316417,
-        "mad_ns": 36029,
+        "min_ns": 239210,
+        "median_ns": 289044,
+        "mad_ns": 44994,
         "n": 15
       },
-      "compile_ns": 508275681
+      "compile_ns": 533406334,
+      "tier_stat": {
+        "min_ns": 98402947,
+        "median_ns": 101387881,
+        "mad_ns": 2681382,
+        "n": 15
+      },
+      "bg_stat": {
+        "min_ns": 29051535,
+        "median_ns": 33060498,
+        "mad_ns": 1562294,
+        "n": 15
+      }
     }
   ],
-  "loadavg1": 1.15,
+  "loadavg1": 1.68,
   "quality": "clean"
 }
