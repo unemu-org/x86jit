@@ -1,0 +1,129 @@
+{
+  "commit": "a3a49ad44fee2b19a074b27e341f14aa69658dc0",
+  "commit_short": "a3a49ad",
+  "subject": "perf(bench): PB-3 native ratios + PB-4 rolling-median series & load-aware gate (doc-29)",
+  "dirty": false,
+  "host": "miknix-laptop",
+  "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
+  "timestamp_unix": 1783417232,
+  "iters": 15,
+  "workloads": [
+    {
+      "name": "fib32",
+      "kind": "dispatch-micro",
+      "native_ns": null,
+      "interp_ns": 990686926,
+      "jit_ns": 114773350,
+      "chained": 21147457,
+      "ibtc_filled": 0,
+      "fast_hits": 0,
+      "misses": 7,
+      "interp_stat": {
+        "min_ns": 990686926,
+        "median_ns": 1028366998,
+        "mad_ns": 12715707,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 114773350,
+        "median_ns": 120971373,
+        "mad_ns": 2201991,
+        "n": 15
+      },
+      "native_stat": null,
+      "compile_ns": 1018001
+    },
+    {
+      "name": "sha256",
+      "kind": "compute-hot",
+      "native_ns": 935002,
+      "interp_ns": 210168529,
+      "jit_ns": 19219240,
+      "chained": 460069,
+      "ibtc_filled": 0,
+      "fast_hits": 0,
+      "misses": 19,
+      "interp_stat": {
+        "min_ns": 210168529,
+        "median_ns": 217999540,
+        "mad_ns": 6110820,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 19219240,
+        "median_ns": 20535472,
+        "mad_ns": 695221,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 935002,
+        "median_ns": 1031935,
+        "mad_ns": 96933,
+        "n": 15
+      },
+      "compile_ns": 13229051
+    },
+    {
+      "name": "sqlite",
+      "kind": "one-shot",
+      "native_ns": 413489,
+      "interp_ns": 18986281,
+      "jit_ns": 1225287482,
+      "chained": 93417,
+      "ibtc_filled": 193,
+      "fast_hits": 28,
+      "misses": 6484,
+      "interp_stat": {
+        "min_ns": 18986281,
+        "median_ns": 20574315,
+        "mad_ns": 1232705,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 1225287482,
+        "median_ns": 1257699274,
+        "mad_ns": 7973401,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 413489,
+        "median_ns": 467311,
+        "mad_ns": 46307,
+        "n": 15
+      },
+      "compile_ns": 1223860939
+    },
+    {
+      "name": "lua",
+      "kind": "one-shot",
+      "native_ns": 266513,
+      "interp_ns": 16039886,
+      "jit_ns": 525210596,
+      "chained": 93733,
+      "ibtc_filled": 119,
+      "fast_hits": 21,
+      "misses": 2764,
+      "interp_stat": {
+        "min_ns": 16039886,
+        "median_ns": 17360215,
+        "mad_ns": 583188,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 525210596,
+        "median_ns": 534595914,
+        "mad_ns": 6862686,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 266513,
+        "median_ns": 316417,
+        "mad_ns": 36029,
+        "n": 15
+      },
+      "compile_ns": 508275681
+    }
+  ],
+  "loadavg1": 1.15,
+  "quality": "clean"
+}
