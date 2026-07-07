@@ -1,56 +1,129 @@
 {
-  "commit": "c18b9416f0832a5a03be35a724d8f3b6568fa17c",
-  "commit_short": "c18b941",
-  "subject": "chore(backlog): task-146 — bg-tier dispatch regression (sha256 jit/interp ~+19%)",
-  "dirty": true,
+  "commit": "358063a2e09b884671509ec5d8d0e6ae74742780",
+  "commit_short": "358063a",
+  "subject": "perf(bench): PB-1 — statistics core + noise-aware gate (perf-bench v2, doc-29)",
+  "dirty": false,
   "host": "miknix-laptop",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
-  "timestamp_unix": 1783412941,
-  "iters": 3,
+  "timestamp_unix": 1783415774,
+  "iters": 15,
   "workloads": [
     {
       "name": "fib32",
       "kind": "dispatch-micro",
       "native_ns": null,
-      "interp_ns": 1008203709,
-      "jit_ns": 125352519,
+      "interp_ns": 978680908,
+      "jit_ns": 108700008,
       "chained": 21147457,
       "ibtc_filled": 0,
       "fast_hits": 0,
-      "misses": 7
+      "misses": 7,
+      "interp_stat": {
+        "min_ns": 978680908,
+        "median_ns": 1018011861,
+        "mad_ns": 8168565,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 108700008,
+        "median_ns": 118286984,
+        "mad_ns": 6546159,
+        "n": 15
+      },
+      "native_stat": null,
+      "compile_ns": null
     },
     {
       "name": "sha256",
       "kind": "compute-hot",
-      "native_ns": 1038227,
-      "interp_ns": 200070375,
-      "jit_ns": 19893139,
+      "native_ns": 926195,
+      "interp_ns": 195632653,
+      "jit_ns": 18511855,
       "chained": 460069,
       "ibtc_filled": 0,
       "fast_hits": 0,
-      "misses": 19
+      "misses": 19,
+      "interp_stat": {
+        "min_ns": 195632653,
+        "median_ns": 204119156,
+        "mad_ns": 3010139,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 18511855,
+        "median_ns": 20453682,
+        "mad_ns": 1091416,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 926195,
+        "median_ns": 1486950,
+        "mad_ns": 255682,
+        "n": 15
+      },
+      "compile_ns": null
     },
     {
       "name": "sqlite",
       "kind": "one-shot",
-      "native_ns": 914022,
-      "interp_ns": 19702730,
-      "jit_ns": 1232806060,
+      "native_ns": 400274,
+      "interp_ns": 20428945,
+      "jit_ns": 1181558215,
       "chained": 93417,
       "ibtc_filled": 193,
       "fast_hits": 28,
-      "misses": 6484
+      "misses": 6484,
+      "interp_stat": {
+        "min_ns": 20428945,
+        "median_ns": 22272978,
+        "mad_ns": 856444,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 1181558215,
+        "median_ns": 1269210204,
+        "mad_ns": 28828564,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 400274,
+        "median_ns": 424279,
+        "mad_ns": 20258,
+        "n": 15
+      },
+      "compile_ns": null
     },
     {
       "name": "lua",
       "kind": "one-shot",
-      "native_ns": 414290,
-      "interp_ns": 17228968,
-      "jit_ns": 526907136,
+      "native_ns": 243609,
+      "interp_ns": 17245680,
+      "jit_ns": 519164914,
       "chained": 93733,
       "ibtc_filled": 119,
       "fast_hits": 21,
-      "misses": 2764
+      "misses": 2764,
+      "interp_stat": {
+        "min_ns": 17245680,
+        "median_ns": 19097818,
+        "mad_ns": 1052062,
+        "n": 15
+      },
+      "jit_stat": {
+        "min_ns": 519164914,
+        "median_ns": 532845209,
+        "mad_ns": 7784021,
+        "n": 15
+      },
+      "native_stat": {
+        "min_ns": 243609,
+        "median_ns": 261382,
+        "mad_ns": 12113,
+        "n": 15
+      },
+      "compile_ns": null
     }
-  ]
+  ],
+  "loadavg1": 1.87,
+  "quality": "clean"
 }
