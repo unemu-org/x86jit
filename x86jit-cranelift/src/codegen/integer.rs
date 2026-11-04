@@ -307,6 +307,36 @@ impl Translator<'_, '_> {
         false
     }
 
+    pub(crate) fn emit_tsc(&mut self, aux: bool) -> bool {
+        self.flush_gprs();
+        let aux = self.iconst(u64::from(aux));
+        self.call_helper(self.helpers.tsc, &[self.cpu, aux]);
+        self.reload_gprs();
+        false
+    }
+
+    pub(crate) fn emit_random(
+        &mut self,
+        dst: u32,
+        kind: x86jit_core::RandomKind,
+        size: u8,
+        set_flags: FlagMask,
+    ) -> bool {
+        let seed = self.iconst(u64::from(kind == x86jit_core::RandomKind::Rdseed));
+        let size = self.iconst(u64::from(size));
+        let mask = self.iconst(u64::from(set_flags.0));
+        let call = self.call_helper(self.helpers.random, &[self.cpu, seed, size, mask]);
+        let value = self.builder.inst_results(call)[0];
+        self.set(dst, value);
+        // The helper's writes supersede any cold flag recovery recipe.
+        for (i, pending) in self.pending_flags.iter_mut().enumerate() {
+            if set_flags.0 & (1 << i) != 0 {
+                *pending = None;
+            }
+        }
+        false
+    }
+
     pub(crate) fn emit_x87(
         &mut self,
         kind: &x86jit_core::x87::FpuKind,

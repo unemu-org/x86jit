@@ -5,6 +5,24 @@
 use x86jit_tests::compat::{compute_coverage, cpuid_lift_gaps, cpuid_waivers, Coverage};
 
 #[test]
+fn time_and_entropy_extensions_have_optional_coverage() {
+    let coverage = compute_coverage();
+    for (mode, buckets, forms) in [
+        ("long64", &coverage.generations, 7),
+        ("compat32", &coverage.compat32, 5),
+    ] {
+        let optional = buckets.get("optional").expect("optional bucket present");
+        assert_eq!(
+            optional.lifted, forms,
+            "{mode}: RDTSCP and RDRAND/RDSEED forms"
+        );
+        assert_eq!(optional.unsupported, 0, "{mode}");
+        assert_eq!(optional.unencodable, 0, "{mode}");
+        assert_eq!(optional.reg_only, 0, "{mode}");
+    }
+}
+
+#[test]
 fn compat_map_is_current() {
     let fresh = compute_coverage().to_json();
     let checked_in = std::fs::read_to_string(
@@ -149,9 +167,15 @@ fn cpuid_checker_accepts_tables_and_sees_extended_and_leaf7_bits() {
         CpuidLeaf::Constant(R::new(0, 0, 1 << 6, 1 << 27)),
     );
     let gaps = cpuid_lift_gaps(|l, s| table.query(l, s));
-    for feature in [CX8, RDRAND, RDSEED, ADX, SSE4A, RDTSCP, SHA512] {
+    for feature in [CX8, ADX, SSE4A, SHA512] {
         assert!(
             gaps.iter().any(|g| g.advertised.feature == feature),
+            "{feature:?}"
+        );
+    }
+    for feature in [RDRAND, RDSEED, RDTSCP] {
+        assert!(
+            !gaps.iter().any(|g| g.advertised.feature == feature),
             "{feature:?}"
         );
     }
@@ -241,6 +265,17 @@ fn probe_measures_real_coverage() {
         c32.missing.iter().any(|m| m == "Pushad"),
         "compat32 map should list the legacy-only forms (e.g. Pushad) as missing"
     );
+}
+
+#[test]
+fn cpu_source_instructions_are_in_compat_scope_and_lift() {
+    use iced_x86::Code::*;
+    use x86jit_tests::compat::{probe_code, Probe};
+    for code in [
+        Rdtscp, Rdrand_r16, Rdrand_r32, Rdrand_r64, Rdseed_r16, Rdseed_r32, Rdseed_r64,
+    ] {
+        assert_eq!(probe_code(code), Some(Probe::Lifted), "{code:?}");
+    }
 }
 
 /// Witness rows from SDM Vol 1 Tables 21-9/10/19/20/21/22/23/25,

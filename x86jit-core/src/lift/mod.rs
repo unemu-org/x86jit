@@ -431,6 +431,50 @@ mod tests {
         assert_eq!(op_reads(&IrOp::Lahf), F_CF | F_PF | F_AF | F_ZF | F_SF);
     }
 
+    #[test]
+    fn random_flag_elision_barrier_masks() {
+        // SDM Vol 2B RDRAND/RDSEED, Flags Affected: full status-flag writer.
+        // Our helper barrier conservatively keeps all earlier flags materialized,
+        // even when a later XOR overwrites them. SETB must retain its ADD input.
+        for opcode in [0xf0, 0xf8] {
+            for reader in [false, true] {
+                let mut bytes = vec![0x48, 0x01, 0xc0]; // add rax,rax
+                if reader {
+                    bytes.extend([0x0f, 0x92, 0xc3]);
+                } // setb bl
+                bytes.extend([0x48, 0x0f, 0xc7, opcode]); // rdrand/rdseed rax
+                bytes.extend([0x0f, 0x90, 0xc1, 0x31, 0xc0, 0xf4]); // seto cl; xor eax,eax; hlt
+                let mem = mem_with(&bytes);
+                let mut ir = lift_block(&mem, FetchAddr::flat(BASE), CpuMode::Long64).unwrap();
+                elide_dead_flags(&mut ir.ops);
+                let add = ir
+                    .ops
+                    .iter()
+                    .find_map(|op| {
+                        if let IrOp::Add { set_flags, .. } = op {
+                            Some(*set_flags)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let random = ir
+                    .ops
+                    .iter()
+                    .find_map(|op| {
+                        if let IrOp::Random { set_flags, .. } = op {
+                            Some(*set_flags)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(add, FlagMask::ALL);
+                assert_eq!(random, FlagMask::ALL);
+            }
+        }
+    }
+
     const BASE: u64 = 0x1000;
 
     fn mem_with(bytes: &[u8]) -> Memory {
@@ -899,6 +943,9 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | PopaReal
         | EnterReal { .. }
         | PortIo { .. } => FlagMask::ALL.0,
+        // SDM Vol 2B RDRAND/RDSEED, Flags Affected. Keep a helper barrier so
+        // omitted ALU recipes cannot overwrite its flags at a later fault exit.
+        Random { .. } => FlagMask::ALL.0,
         InsnStart { .. }
         | ReadReg { .. }
         | WriteReg { .. }
@@ -933,6 +980,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | Sahf
         | Cpuid
         | Xgetbv
+        | ReadTsc { .. }
         | Crc32 { .. }
         | VLoad { .. }
         | VStore { .. }
@@ -1414,19 +1462,29 @@ pub(crate) fn lift_insn(
             ops.push(IrOp::Xgetbv);
             Ok(false)
         }
-        // rdtsc: a fixed timestamp keeps whole-program runs deterministic (§14).
-        // EDX:EAX = counter; both writes zero the upper 32 bits of their register.
-        Rdtsc => {
-            ops.push(IrOp::WriteReg {
-                reg: Reg::Rax,
-                src: Val::Imm(0x1234_5678),
-                size: 4,
+        // §14: sample the embedder's source at runtime; without one the TSC is
+        // 0x12345678 and TSC_AUX is zero. SDM Vol 2B RDTSC/RDTSCP, Description.
+        Rdtsc | Rdtscp => {
+            ops.push(IrOp::ReadTsc {
+                aux: insn.mnemonic() == Rdtscp,
             });
-            ops.push(IrOp::WriteReg {
-                reg: Reg::Rdx,
-                src: Val::Imm(0),
-                size: 4,
+            Ok(false)
+        }
+        Rdrand | Rdseed => {
+            let size = operand_size(insn, 0);
+            let target = lower_write_target(insn, 0, ops, tg)?;
+            let dst = tg.fresh();
+            ops.push(IrOp::Random {
+                dst,
+                kind: if insn.mnemonic() == Rdrand {
+                    crate::state::RandomKind::Rdrand
+                } else {
+                    crate::state::RandomKind::Rdseed
+                },
+                size,
+                set_flags: FlagMask::ALL,
             });
+            emit_write(ops, tg, target, Val::Temp(dst));
             Ok(false)
         }
         Fld | Fst | Fstp | Fild | Fistp | Fisttp | Fadd | Faddp | Fsub | Fsubp | Fsubr | Fsubrp

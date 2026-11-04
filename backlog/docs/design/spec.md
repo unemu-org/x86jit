@@ -80,7 +80,7 @@ Key observation: **operand lowering (7.1) is the foundation of the lift** — wi
 - MMIO / devices / GPU — the user reacts to `Exit::MmioRead` / `Exit::MmioWrite`.
 - Decryption, loaders, higher-level guest thread scheduling.
 
-> **Boundary rule:** the core calls the outside world only through **exit reasons** (`Exit`) and through **Trap-type memory regions**. Everything else (especially access to ordinary guest RAM) is inlined into the generated code and never goes through a callback.
+> **Boundary rule:** the core communicates with the embedder through **exit reasons** (`Exit`) and **Trap-type memory regions**. The one exception is an optional `CpuSource` handle for time and entropy (RDTSC, RDTSCP, RDRAND, RDSEED), described in §14 and decision-12. Ordinary guest RAM access is always inlined into the generated code and never goes through a callback.
 
 ---
 
@@ -1068,7 +1068,9 @@ The order is chosen so as to **have a working, testable core as fast as possible
 - **Budget in instructions or blocks?** Recommendation: blocks (cheaper). Resolve in M1.
 - **Lazy flags right away or later?** Recommendation: later (M5). Simplicity first.
 - **Flat memory or softmmu?** Flat at the start (M0), softmmu when you hit a sparse/scattered address space.
-- **Hooks (model A) alongside return-based?** Add optionally after M4, if they turn out to be convenient for debugging. The core stays return-based.
+- **Time and entropy sources (decided, decision-12, 2026-11-04):** `Vm::set_cpu_source` installs a shared `CpuSource` handle for new vCPUs. Both backends sample it exactly once per executed RDTSC, RDTSCP, RDRAND or RDSEED. A TSC read returns a paired counter/AUX sample; a random read returns a value or unavailability. Without a source, TSC is `0x12345678`, AUX is zero, and random reads use a deterministic per-vCPU stream with CF=1. The source owns rate, offset, cross-vCPU monotonicity, entropy quality and replay; the embedder keeps invariant-TSC and CPUID leaves 0x15/0x16 consistent with it. Installing a source does not advertise features. Clones and forks share the external source state without snapshotting it. Source methods must not panic or re-enter execution. CPUID stays data-driven (decision-11).
+
+**Hooks (model A) alongside return-based?** General debugging hooks remain undecided; the core stays return-based apart from the `CpuSource` exception above.
 - **How to represent Cranelift values vs IR temps?** A `Temp → cranelift Value` map built per-block in the backend.
 - **How to represent CPU exceptions (`#DE` divide-by-zero, `#UD` from `ud2`, `int3`)?** They're guest-visible faults, not lift failures. Options: a dedicated `Exit::Exception { vector, error_code }` (extensible, honest) vs. folding into `Exit::Fault`. Recommendation: a dedicated exit — real programs `SIGFPE`/`SIGILL` on these and HLE must see the vector. Resolve before lifting `div` (M1/M2).
 - **Inline memory-access safety: bounds check vs guard pages?** (§8.2.3) Recommendation: explicit per-access bounds+permission check first (portable, doubles as the MMIO trap path), guard pages only as a measured M5 perf optimization. Resolve in M4.

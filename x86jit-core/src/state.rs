@@ -438,6 +438,53 @@ pub struct CpuState {
     /// Appended so existing JIT ABI field offsets do not move.
     pub cpuid_table: Option<std::sync::Arc<crate::features::CpuidTable>>,
     pub cpuid_overrides: crate::features::CpuidOverrides,
+    /// Source inherited at vCPU creation; may be replaced between runs.
+    pub cpu_source: Option<std::sync::Arc<dyn CpuSource>>,
+    /// Engine-allocated identity for the source, independent of guest CPUID IDs.
+    /// State clones retain this identity; embedders may replace it between runs.
+    pub source_id: u64,
+    /// Deterministic fallback stream, copied by CPU-state cloning.
+    pub random_state: u64,
+}
+
+/// One atomic TSC/TSC_AUX sample (SDM Vol 3B §20.17.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TscSample {
+    pub counter: u64,
+    pub aux: u32,
+}
+
+/// Which random instruction requested a sample (SDM Vol 2B RDRAND/RDSEED).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RandomKind {
+    Rdrand,
+    Rdseed,
+}
+
+/// Embedder-owned time and entropy, shared by a VM's vCPUs (§14).
+///
+/// The engine makes exactly one method call per executed instruction, never at
+/// lift/compile time. `vcpu_id` is `CpuState::source_id`; `size` is 2, 4 or 8 bytes.
+/// `None` means random data is unavailable, not a request for a fallback sample.
+/// Methods must not panic or reenter execution: JIT calls cross an extern-C boundary.
+/// The source owns rate, offset, cross-vCPU monotonicity, entropy quality and replay.
+/// Its TSC behavior must agree with any installed CPUID frequency/invariant fields
+/// (SDM Vol 3B §20.17/§20.17.1). Cloning CPU state or forking a VM shares this
+/// handle; it does not snapshot the source's internal state.
+///
+/// For RDTSCP, the engine retires all earlier guest instructions and orders their
+/// memory accesses with a host fence before calling `read_tsc`. The source must
+/// itself use an execution-synchronising hardware-counter read to prevent sampling
+/// ahead of earlier guest loads: on x86-64, RDTSCP or LFENCE;RDTSC (SDM Vol 2B
+/// RDTSCP/RDTSC, Description); on AArch64, ISB before CNTVCT_EL0, or the
+/// self-synchronising CNTVCTSS_EL0 with FEAT_ECV (see the Arm Architecture Reference
+/// Manual, generic timer). The memory fence alone does not synchronise counter
+/// execution. RDTSC has no ordering requirement (SDM Vol 2B RDTSC, Description).
+/// Both instructions use this same method, so a hardware-counter source must
+/// provide the RDTSCP ordering on every call.
+pub trait CpuSource: Send + Sync + std::fmt::Debug {
+    fn read_tsc(&self, vcpu_id: u64) -> TscSample;
+    fn read_random(&self, vcpu_id: u64, kind: RandomKind, size: u8) -> Option<u64>;
 }
 
 /// Precision selection for the x87 transcendentals (fsin/fcos/…/fyl2x). The
@@ -502,6 +549,9 @@ impl Default for CpuState {
             mmio_retry_cs: 0,
             cpuid_table: None,
             cpuid_overrides: crate::features::CpuidOverrides::default(),
+            cpu_source: None,
+            source_id: 0,
+            random_state: 0x4d59_5df4_d0f3_3173,
         }
     }
 }

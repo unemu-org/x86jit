@@ -290,6 +290,20 @@ pub enum IrOp {
     // routine so both backends answer identically (§14).
     Cpuid,
 
+    // Runtime sample from the per-vCPU source; deterministic without a source (§14).
+    ReadTsc {
+        aux: bool,
+    },
+
+    // SDM Vol 2B RDRAND/RDSEED, Flags Affected: all six status flags written.
+    // A helper barrier: set_flags stays ALL through dead-flag elision.
+    Random {
+        dst: Temp,
+        kind: crate::state::RandomKind,
+        size: u8,
+        set_flags: FlagMask,
+    },
+
     // xgetbv: EDX:EAX = extended control register selected by ECX. Guests read XCR0
     // (ECX=0). Runtime op: XCR0 comes from the per-vCPU override, else the
     // feature set.

@@ -68,9 +68,17 @@
       "reg_only": 0,
       "missing_mem_form": []
     },
+    "optional": {
+      "lifted": 7,
+      "unsupported": 0,
+      "unencodable": 0,
+      "missing": [],
+      "reg_only": 0,
+      "missing_mem_form": []
+    },
     "x86-64-v1": {
       "lifted": 562,
-      "unsupported": 116,
+      "unsupported": 115,
       "unencodable": 146,
       "missing": [
         "Call_m1632",
@@ -133,7 +141,6 @@
         "Pushfw",
         "Rcpps_xmm_xmmm128",
         "Rcpss_xmm_xmmm32",
-        "Rdtscp",
         "Reservednop_rm16_r16_0F0D",
         "Reservednop_rm16_r16_0F18",
         "Reservednop_rm16_r16_0F19",
@@ -718,9 +725,17 @@
       "reg_only": 0,
       "missing_mem_form": []
     },
+    "optional": {
+      "lifted": 5,
+      "unsupported": 0,
+      "unencodable": 0,
+      "missing": [],
+      "reg_only": 0,
+      "missing_mem_form": []
+    },
     "x86-64-v1": {
       "lifted": 547,
-      "unsupported": 135,
+      "unsupported": 134,
       "unencodable": 232,
       "missing": [
         "Aaa",
@@ -807,7 +822,6 @@
         "Pushfw",
         "Rcpps_xmm_xmmm128",
         "Rcpss_xmm_xmmm32",
-        "Rdtscp",
         "Reservednop_rm16_r16_0F0D",
         "Reservednop_rm16_r16_0F18",
         "Reservednop_rm16_r16_0F19",

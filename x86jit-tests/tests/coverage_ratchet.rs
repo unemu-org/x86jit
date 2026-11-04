@@ -200,6 +200,11 @@ const FUZZER_COVERED: &[&str] = &[
 /// reason. Seeded with exactly the current `lifted − fuzzer_covered` set, so the test
 /// passes today.
 const ALLOWLIST: &[&str] = &[
+    // cpu_source.rs checks both backends: paired TSC/AUX samples, entropy
+    // availability, destination widths, flags and exactly-once source calls.
+    "Rdtscp",
+    "Rdrand",
+    "Rdseed",
     "Addpd",
     "Addps",
     "Addsd",

@@ -243,6 +243,27 @@ unsafe extern "C" fn cpuid_helper(cpu: *mut u8) {
     x86jit_core::interp::cpuid_run(cpu);
 }
 
+/// # Safety
+/// `cpu` is a valid exclusive pointer to a `CpuState` for this call.
+unsafe extern "C" fn tsc_helper(cpu: *mut u8, aux: u64) {
+    // SAFETY: the compiled-block ABI supplies the live vCPU exclusively.
+    let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
+    x86jit_core::interp::tsc_run(cpu, aux != 0);
+}
+
+/// # Safety
+/// `cpu` is a valid exclusive pointer to a `CpuState` for this call.
+unsafe extern "C" fn random_helper(cpu: *mut u8, seed: u64, size: u64, flags: u64) -> u64 {
+    // SAFETY: the compiled-block ABI supplies the live vCPU exclusively.
+    let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
+    let kind = if seed != 0 {
+        x86jit_core::RandomKind::Rdseed
+    } else {
+        x86jit_core::RandomKind::Rdrand
+    };
+    x86jit_core::interp::random_run(cpu, kind, size as u8, x86jit_core::FlagMask(flags as u8))
+}
+
 /// `xgetbv` helper: delegates to the shared `xgetbv_run` so XCR0 tracks the guest
 /// feature set identically on both backends.
 ///
@@ -2338,6 +2359,8 @@ impl JitBackend {
         builder.symbol("x86jit_div", div_helper as *const u8);
         builder.symbol("x86jit_string", string_helper as *const u8);
         builder.symbol("x86jit_cpuid", cpuid_helper as *const u8);
+        builder.symbol("x86jit_tsc", tsc_helper as *const u8);
+        builder.symbol("x86jit_random", random_helper as *const u8);
         builder.symbol("x86jit_xgetbv", xgetbv_helper as *const u8);
         builder.symbol("x86jit_vmaskmov", vmaskmov_helper as *const u8);
         builder.symbol("x86jit_vmasked_logic", vmasked_logic_helper as *const u8);
@@ -2611,6 +2634,8 @@ impl Shared {
         let crc_sig = params(3, true); // crc32(crc, src, bytes) -> i64
         let note_watch_sig = params(3, false); // note_watch(mem_self, addr, len) -> ()
         let cpuid_sig = params(1, false); // cpuid(cpu) -> ()
+        let tsc_sig = params(2, false); // tsc(cpu, aux) -> ()
+        let random_sig = params(4, true); // random(cpu, seed, size, flags) -> i64
         let xgetbv_sig = params(1, false); // xgetbv(cpu) -> ()
         let vmaskmov_sig = params(7, false); // vmaskmov(cpu, dst, src, k, elem, zeroing, bytes) -> ()
         let vmaskmov_mem_sig = params(10, true); // (cpu, mem, reg, addr, k, elem, zeroing, bytes, is_store, cur_addr) -> i64
@@ -2707,6 +2732,8 @@ impl Shared {
                 div: helper!(div_sig, div_helper),
                 string: helper!(str_sig, string_helper),
                 cpuid: helper!(cpuid_sig, cpuid_helper),
+                tsc: helper!(tsc_sig, tsc_helper),
+                random: helper!(random_sig, random_helper),
                 xgetbv: helper!(xgetbv_sig, xgetbv_helper),
                 vmaskmov: helper!(vmaskmov_sig, vmaskmov_helper),
                 vmaskmov_mem: helper!(vmaskmov_mem_sig, vmaskmov_mem_helper),

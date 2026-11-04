@@ -317,6 +317,64 @@ including CX8, XSAVE and CX16 gaps. In particular, supplying leaf 0xD sizes can
 select XSAVE/XRSTOR paths that currently trap. See
 [decision-11](backlog/decisions/decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md).
 
+Embedders can install time and entropy through a shared `CpuSource` handle:
+
+```rust
+use std::{sync::Arc, time::Instant};
+use x86jit_core::{CpuSource, RandomKind, TscSample};
+
+#[derive(Debug)]
+struct Source(Instant);
+
+impl CpuSource for Source {
+    fn read_tsc(&self, vcpu_id: u64) -> TscSample {
+        TscSample {
+            counter: self.0.elapsed().as_nanos() as u64,
+            aux: vcpu_id as u32,
+        }
+    }
+
+    fn read_random(&self, _vcpu_id: u64, _kind: RandomKind, _size: u8) -> Option<u64> {
+        None // Supply entropy here; None makes the instruction report CF=0.
+    }
+}
+
+vm.set_cpu_source(Some(Arc::new(Source(Instant::now()))));
+let mut cpu = vm.new_vcpu();
+```
+
+The engine samples the source exactly once per executed RDTSC, RDTSCP, RDRAND
+or RDSEED. `source_id` identifies the requesting vCPU independently of CPUID IDs;
+RDTSCP returns the source's paired `aux` in ECX. The source owns rate, offset,
+cross-vCPU monotonicity and entropy quality. Its behavior must agree with any
+advertised invariant-TSC bit and CPUID frequency leaves 0x15/0x16 (SDM Vol 3B
+§20.17/§20.17.1; Vol 1 §21.3 CPUID.15H/16H). Installing a source does not
+advertise these instructions: select `Feature::Rdtscp`, `Rdrand` and `Rdseed`
+or supply a consistent CPUID table. They remain absent from the default preset.
+
+For RDTSCP, the engine guarantees that all earlier guest instructions have retired
+and their memory accesses are ordered by a host fence before calling `read_tsc`.
+A source reading a hardware counter must itself use an execution-synchronising
+read so that sampling cannot run ahead of earlier guest loads: on x86-64, RDTSCP
+or LFENCE;RDTSC (SDM Vol 2B RDTSCP/RDTSC, Description); on AArch64, ISB before
+CNTVCT_EL0, or the self-synchronising CNTVCTSS_EL0 with FEAT_ECV (see the Arm
+Architecture Reference Manual, generic timer). A memory fence alone does not
+synchronise the counter read. RDTSC has no ordering requirement (SDM Vol 2B
+RDTSC, Description). Both instructions call the same method, so hardware-counter
+sources must provide RDTSCP ordering on every call.
+
+With no source, RDTSC and RDTSCP return `0x12345678`, TSC_AUX is zero, and
+RDRAND/RDSEED share a deterministic per-vCPU sequence with CF=1. This fallback
+is test data and provides no cryptographic entropy. Existing vCPUs retain their
+handle when the VM setting changes; `CpuState::cpu_source` and
+`CpuState::source_id` can be replaced between runs. CPU-state clones retain the
+source identity and share the handle; VM forks share the handle and fresh-ID
+allocator. External source state is not snapshotted by either operation. Source
+methods must not panic or reenter
+execution across the JIT helper boundary. The accepted design is reflected in
+spec §1/§14; see
+[decision-12](backlog/decisions/decision-12%20-%20Shared-CPU-source-handles-for-time-and-entropy.md).
+
 Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
 API, identical guest state. Runnable examples:
 

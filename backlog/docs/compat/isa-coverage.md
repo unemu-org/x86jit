@@ -11,14 +11,15 @@ created_date: '2026-07-06 11:25'
 
 # ISA compatibility coverage
 
-**Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit by hand. Measured by probing the real lifter (`x86jit-tests/src/compat.rs`): a canonical instance of every in-scope `iced_x86::Code` is encoded and fed to `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; `unencodable` are exotic operand shapes the probe can't synthesize (not counted). Kept honest by the `compat_map_is_current` test.
+**Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit by hand. Measured by probing the real lifter (`x86jit-tests/src/compat.rs`): a canonical instance of every in-scope `iced_x86::Code` is encoded and fed to `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; `unencodable` are exotic operand shapes the probe can't synthesize (not counted). Kept honest by the `compat_map_is_current` test. The `optional` bucket groups RDTSCP/RDRAND/RDSEED, which are not psABI level requirements (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).
 
 ## 64-bit long mode (Long64)
 
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 59 | 2% | 0 |
-| x86-64-v1 | 562 | 0 | 116 | 83% | 146 |
+| optional | 7 | 0 | 0 | 100% | 0 |
+| x86-64-v1 | 562 | 0 | 115 | 83% | 146 |
 | x86-64-v2 | 90 | 0 | 27 | 77% | 0 |
 | x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
@@ -31,7 +32,8 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 57 | 2% | 0 |
-| x86-64-v1 | 547 | 0 | 135 | 80% | 232 |
+| optional | 5 | 0 | 0 | 100% | 0 |
+| x86-64-v1 | 547 | 0 | 134 | 80% | 232 |
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
@@ -99,7 +101,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## long64 x86-64-v1 — missing (116)
+## long64 x86-64-v1 — missing (115)
 
 - `Call_m1632`
 - `Clac`
@@ -161,7 +163,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Pushfw`
 - `Rcpps_xmm_xmmm128`
 - `Rcpss_xmm_xmmm32`
-- `Rdtscp`
 - `Reservednop_rm16_r16_0F0D`
 - `Reservednop_rm16_r16_0F18`
 - `Reservednop_rm16_r16_0F19`
@@ -533,7 +534,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## compat32 x86-64-v1 — missing (135)
+## compat32 x86-64-v1 — missing (134)
 
 - `Aaa`
 - `Aad_imm8`
@@ -619,7 +620,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Pushfw`
 - `Rcpps_xmm_xmmm128`
 - `Rcpss_xmm_xmmm32`
-- `Rdtscp`
 - `Reservednop_rm16_r16_0F0D`
 - `Reservednop_rm16_r16_0F18`
 - `Reservednop_rm16_r16_0F19`

@@ -475,6 +475,15 @@ fn walk_ops<const RETRY: bool>(
                     return r;
                 }
             }
+            IrOp::ReadTsc { aux } => tsc_run(cpu, *aux),
+            IrOp::Random {
+                dst,
+                kind,
+                size,
+                set_flags,
+            } => {
+                temps[*dst as usize] = random_run(cpu, *kind, *size, *set_flags);
+            }
             IrOp::Xgetbv => {
                 if let Some(r) = exec_xgetbv(cpu) {
                     return r;
@@ -6036,6 +6045,66 @@ pub fn cpuid_run(cpu: &mut CpuState) {
     cpu.write_gpr(RBX, ebx as u64, 4);
     cpu.write_gpr(RCX, ecx as u64, 4);
     cpu.write_gpr(RDX, edx as u64, 4);
+}
+
+/// Shared RDTSC/RDTSCP execution (§14). SDM Vol 2B RDTSC/RDTSCP,
+/// Description/Operation/Flags Affected: zero-extended outputs, flags preserved.
+pub fn tsc_run(cpu: &mut CpuState, aux: bool) {
+    if aux {
+        // SDM Vol 2B RDTSCP, Description: earlier loads must be globally visible
+        // before sampling. Order guest memory here; CpuSource must synchronise
+        // hardware-counter execution itself (see its ordering contract).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+    let sample = cpu.cpu_source.as_ref().map_or(
+        crate::state::TscSample {
+            counter: 0x1234_5678,
+            aux: 0,
+        },
+        |source| source.read_tsc(cpu.source_id),
+    );
+    cpu.write_gpr(RAX, u64::from(sample.counter as u32), 4);
+    cpu.write_gpr(RDX, sample.counter >> 32, 4);
+    if aux {
+        cpu.write_gpr(RCX, u64::from(sample.aux), 4);
+    }
+}
+
+/// Shared RDRAND/RDSEED execution (§14). SDM Vol 2B RDRAND/RDSEED,
+/// Operation/Flags Affected: failure returns zero; CF is success and the other
+/// five status flags are clear. The fallback stream is engine policy, not entropy.
+pub fn random_run(
+    cpu: &mut CpuState,
+    kind: crate::state::RandomKind,
+    size: u8,
+    set_flags: FlagMask,
+) -> u64 {
+    let value = if let Some(source) = &cpu.cpu_source {
+        source.read_random(cpu.source_id, kind, size)
+    } else {
+        // A fixed wrapping LCG makes the per-vCPU fallback reproducible, including
+        // CPU-state snapshots. It is deliberately not a cryptographic generator.
+        cpu.random_state = cpu
+            .random_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        Some(cpu.random_state)
+    };
+    let res = value.unwrap_or(0) & mask(size);
+    apply(
+        &mut cpu.flags,
+        set_flags,
+        &AluResult {
+            res,
+            cf: value.is_some(),
+            pf: false,
+            af: false,
+            zf: false,
+            sf: false,
+            of: false,
+        },
+    );
+    res
 }
 
 /// BMI1/BMI2 result + CF for one op. Shared by the interpreter and the

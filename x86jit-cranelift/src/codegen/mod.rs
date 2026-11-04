@@ -51,6 +51,8 @@ pub struct Helpers {
     pub div: (ir::SigRef, u64, u64),
     pub string: (ir::SigRef, u64, u64),
     pub cpuid: (ir::SigRef, u64, u64),
+    pub tsc: (ir::SigRef, u64, u64),
+    pub random: (ir::SigRef, u64, u64),
     pub xgetbv: (ir::SigRef, u64, u64),
     pub vmaskmov: (ir::SigRef, u64, u64),
     pub vmaskmov_mem: (ir::SigRef, u64, u64),
@@ -138,6 +140,8 @@ impl Helpers {
             div: mk(),
             string: mk(),
             cpuid: mk(),
+            tsc: mk(),
+            random: mk(),
             xgetbv: mk(),
             vmaskmov: mk(),
             vmaskmov_mem: mk(),
@@ -770,6 +774,13 @@ impl Translator<'_, '_> {
             IrOp::Lahf => self.emit_lahf(),
             IrOp::Sahf => self.emit_sahf(),
             IrOp::Cpuid => self.emit_cpuid(),
+            IrOp::ReadTsc { aux } => self.emit_tsc(*aux),
+            IrOp::Random {
+                dst,
+                kind,
+                size,
+                set_flags,
+            } => self.emit_random(*dst, *kind, *size, *set_flags),
             IrOp::Xgetbv => self.emit_xgetbv(),
             IrOp::X87 {
                 kind, addr, sti, ..

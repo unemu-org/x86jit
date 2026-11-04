@@ -1,6 +1,6 @@
 //! ISA compatibility probe: measure, *mechanically*, which x86-64 instruction forms
 //! the lifter (`x86jit_core::lift`) actually handles, bucketed by instruction-set
-//! generation (v1/v2/v3/v4 + x87/MMX). The map is computed by probing the real lifter
+//! generation (v1/v2/v3/v4 + x87/MMX + optional extensions). The map probes the real lifter
 //! — never hand-written prose, which rots immediately: the in-tree CPUID comment it
 //! replaced was already wrong when it was written.
 //!
@@ -34,6 +34,8 @@ pub enum Gen {
     X87,
     /// Legacy MMX.
     Mmx,
+    /// Optional time/entropy extensions outside the psABI micro-architecture levels.
+    Optional,
 }
 
 impl Gen {
@@ -45,6 +47,7 @@ impl Gen {
             Gen::V4 => "x86-64-v4",
             Gen::X87 => "x87",
             Gen::Mmx => "mmx",
+            Gen::Optional => "optional",
         }
     }
 }
@@ -58,8 +61,11 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
         // Baseline scalar userland — a v1 CPU without SIMD features.
         INTEL8086 | INTEL8086_ONLY | INTEL186 | INTEL286 | INTEL286_ONLY | INTEL386
         | INTEL386_ONLY | INTEL386_A0_ONLY | INTEL486 | INTEL486_A_ONLY | CMOV | CLFSH
-        | CLFLUSHOPT | CPUID | PAUSE | MULTIBYTENOP | FXSR | SSE | SSE2 | SYSCALL | SEP
-        | RDTSCP | SMAP => Gen::V1,
+        | CLFLUSHOPT | CPUID | PAUSE | MULTIBYTENOP | FXSR | SSE | SSE2 | SYSCALL | SEP | SMAP => {
+            Gen::V1
+        }
+        // psABI §3.1.1, Table 3.1 (Micro-Architecture Levels).
+        RDTSCP | RDRAND | RDSEED => Gen::Optional,
         // x86-64-v2.
         SSE3 | SSSE3 | SSE4_1 | SSE4_2 | POPCNT | CMPXCHG16B | MOVBE => Gen::V2,
         // x86-64-v3.
@@ -521,7 +527,9 @@ impl Coverage {
              canonical instance of every in-scope `iced_x86::Code` is encoded and fed to \
              `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; \
              `unencodable` are exotic operand shapes the probe can't synthesize (not counted). \
-             Kept honest by the `compat_map_is_current` test.\n\n",
+             Kept honest by the `compat_map_is_current` test. The `optional` bucket \
+             groups RDTSCP/RDRAND/RDSEED, which are not psABI level requirements \
+             (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).\n\n",
         );
         s.push_str("## 64-bit long mode (Long64)\n\n");
         render_mode_table(&mut s, &self.generations);

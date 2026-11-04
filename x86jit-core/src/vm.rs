@@ -328,6 +328,8 @@ pub struct Vm {
     /// vcpus.
     features: crate::features::GuestCpuFeatures,
     cpuid_table: Option<Arc<crate::features::CpuidTable>>,
+    cpu_source: Option<Arc<dyn crate::state::CpuSource>>,
+    next_source_id: Arc<AtomicU64>,
     /// x87 transcendental precision every new vcpu starts with. Default `Fast`
     /// (f64/libm); select `Extended` (full-80-bit) via [`Vm::set_x87_precision`].
     x87_precision: crate::state::X87Precision,
@@ -394,6 +396,13 @@ impl Vm {
         self.cpuid_table.as_deref()
     }
 
+    /// Install time/entropy for new vCPUs; existing vCPUs retain their handle.
+    /// `None` selects constant TSC 0x12345678, TSC_AUX zero and deterministic
+    /// successful random reads. See [`CpuSource`](crate::state::CpuSource).
+    pub fn set_cpu_source(&mut self, source: Option<Arc<dyn crate::state::CpuSource>>) {
+        self.cpu_source = source;
+    }
+
     /// Select the x87 transcendental precision new vcpus inherit: `Fast`
     /// (f64/libm, default) or `Extended` (full-80-bit F80). Set before spawning vcpus.
     pub fn set_x87_precision(&mut self, p: crate::state::X87Precision) {
@@ -438,6 +447,8 @@ impl Vm {
             tier_up_region_after: self.tier_up_region_after,
             features: self.features,
             cpuid_table: self.cpuid_table.clone(),
+            cpu_source: self.cpu_source.clone(),
+            next_source_id: self.next_source_id.clone(),
             x87_precision: self.x87_precision,
             mode: self.mode,
         })
@@ -456,6 +467,8 @@ impl Vm {
             tier_up_region_after: None,
             features: crate::features::GuestCpuFeatures::default(),
             cpuid_table: None,
+            cpu_source: None,
+            next_source_id: Arc::new(AtomicU64::new(0)),
             x87_precision: crate::state::X87Precision::default(),
             mode: CpuMode::Long64,
         }
@@ -623,6 +636,8 @@ impl Vm {
         cpu.features = self.features; // ISA level the embedder chose
         cpu.cpuid_table = self.cpuid_table.clone();
         cpu.cpuid_overrides = overrides;
+        cpu.cpu_source = self.cpu_source.clone();
+        cpu.source_id = self.next_source_id.fetch_add(1, Ordering::Relaxed);
         cpu.x87_precision = self.x87_precision; // transcendental precision
         let word = Arc::new(AtomicU64::new(0));
         self.mem.register_dispatch_word(&word);
