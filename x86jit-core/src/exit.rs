@@ -182,6 +182,11 @@ pub enum Exit {
     },
     /// `budget` blocks executed — cooperative yield.
     BudgetExhausted,
+    /// A host thread requested a yield at a checked boundary. Guest state is
+    /// resumable; REP may have completed only some iterations.
+    /// Like mid-block faults, this may over-charge the executed-instruction counter:
+    /// compiled code charges the whole block at entry, including its unexecuted tail.
+    Interrupted,
 }
 
 impl Exit {

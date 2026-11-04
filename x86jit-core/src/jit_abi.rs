@@ -55,6 +55,8 @@ pub const RET_MMIO_DEFER: u64 = 8;
 /// `Exit::PortIo` (and, for `in`, records the pending accumulator width the embedder
 /// answers via `complete_port_in`). Append-only ABI growth.
 pub const RET_PORTIO_DEFER: u64 = 9;
+/// A string helper stopped between iterations; the dispatcher consumes the request.
+pub const RET_INTERRUPTED: u64 = 10;
 
 // --- MemCtx: guest memory context + fault out-params. `#[repr(C)]`; codegen
 // addresses these fields by the byte offsets below. Growth is APPEND-ONLY: a new
@@ -164,6 +166,11 @@ pub struct MemCtx {
     /// next store. One `u64` so both halves arrive in a single load: a torn read could
     /// yield a NARROWED range, which would silently skip a page.
     pub code_range_ptr: u64,
+    /// In: live per-vcpu dispatch notification word (SMC | exit request).
+    /// Points to an immutable zero atomic for standalone compiled calls. Rust polls
+    /// Relaxed, generated regions use Cranelift's SeqCst atomic_load, and only the
+    /// dispatcher consumes requests (Acquire). Always non-null.
+    pub dispatch_word_ptr: u64,
 }
 
 /// Number of frames in the shadow return stack ring (R5). A power of two so the
@@ -222,6 +229,7 @@ pub const MEMCTX_MEM_SELF: i32 = 96;
 pub const MEMCTX_ICOUNT_PTR: i32 = 104;
 pub const MEMCTX_WATCH_BITS_PTR: i32 = 112;
 pub const MEMCTX_CODE_RANGE_PTR: i32 = 120;
+pub const MEMCTX_DISPATCH_WORD_PTR: i32 = 128;
 
 // RetStack field offsets (R5): `sp` then the ring of 16-byte frames.
 pub const RETSTACK_SP: i32 = 0;
@@ -303,6 +311,9 @@ pub fn cpu_offsets() -> CpuOffsets {
     }
 }
 
+// Standalone compiled calls have no notifier; this word is never written.
+static NO_DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl MemCtx {
     /// Build the guest-memory context for a run (fault/chain fields cleared).
     pub fn for_memory(mem: &Memory) -> Self {
@@ -331,6 +342,7 @@ impl MemCtx {
             icount_ptr: 0,
             watch_bits_ptr: mem.watch_bits_ptr(),
             code_range_ptr: mem.code_range_ptr(),
+            dispatch_word_ptr: &NO_DISPATCH as *const std::sync::atomic::AtomicU64 as u64,
         }
     }
 
@@ -383,6 +395,7 @@ pub unsafe fn run_compiled(
         RET_CONTINUE | RET_CHAIN | RET_LINK | RET_IBTC_MISS => StepResult::Continue,
         RET_SYSCALL => StepResult::Exit(Exit::Syscall),
         RET_HLT => StepResult::Exit(Exit::Hlt),
+        RET_INTERRUPTED => StepResult::Exit(Exit::Interrupted),
         RET_UNMAPPED => StepResult::Exit(ctx.unmapped_exit()),
         // An inlined access hit a Trap region (M4-T10): single-step the faulting
         // instruction on the interpreter, which yields the MmioRead/Write exit.
@@ -443,6 +456,10 @@ mod tests {
         }));
         let base = &m as *const MemCtx as usize;
         let off = |p: *const u64| (p as usize - base) as i32;
+        assert_eq!(off(&m.dispatch_word_ptr), MEMCTX_DISPATCH_WORD_PTR);
+        assert_eq!(MEMCTX_DISPATCH_WORD_PTR, 128);
+        assert_eq!(m.dispatch_word_ptr, &NO_DISPATCH as *const _ as u64);
+        assert_eq!(NO_DISPATCH.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(off(&m.base), MEMCTX_BASE);
         assert_eq!(off(&m.size), MEMCTX_SIZE);
         assert_eq!(off(&m.fault_addr), MEMCTX_FAULT_ADDR);

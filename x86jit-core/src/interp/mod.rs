@@ -25,7 +25,9 @@ const RSP: usize = 4;
 /// STI-shadow interrupt-injection gate. Callers that don't care pass `&mut
 /// RetireInfo::default()`.
 #[derive(Default, Clone, Copy, Debug)]
-pub struct RetireInfo {
+pub struct RetireInfo<'a> {
+    /// In: optional per-vcpu notification word, polled by long string operations.
+    pub exit_request: Option<&'a std::sync::atomic::AtomicU64>,
     /// Number of guest instructions that **retired** (completed) during this call. A
     /// mid-instruction memory trap (RIP left on the faulting instruction for retry) does
     /// NOT count it — on the retry it retires and is counted once. Straight-line no-trap
@@ -131,6 +133,7 @@ fn interpret_block_inner<const RETRY: bool>(
         &mut retired,
         &mut started,
         &mut sti_shadow,
+        info.exit_request,
     );
 
     // Final-instruction retirement (§17.6, sub-seam c): the last started instruction
@@ -176,6 +179,7 @@ fn walk_ops<const RETRY: bool>(
     retired: &mut u64,
     started: &mut bool,
     sti_shadow: &mut bool,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> StepResult {
     let mut bracket = crate::lockstep::begin();
     for op in &ir.ops {
@@ -2022,7 +2026,16 @@ fn walk_ops<const RETRY: bool>(
                 seg_base,
             } => {
                 if let Some(r) = exec_rep_string(
-                    cpu, mem, temps, *cur_addr, op, elem, rep, addr_bits, seg_base,
+                    cpu,
+                    mem,
+                    temps,
+                    *cur_addr,
+                    op,
+                    elem,
+                    rep,
+                    addr_bits,
+                    seg_base,
+                    exit_request,
                 ) {
                     return r;
                 }
@@ -2540,7 +2553,16 @@ fn walk_ops<const RETRY: bool>(
                 es_base,
             } => {
                 if let Some(r) = exec_rep_string_real(
-                    cpu, mem, temps, *cur_addr, op, elem, rep, ds_base, es_base,
+                    cpu,
+                    mem,
+                    temps,
+                    *cur_addr,
+                    op,
+                    elem,
+                    rep,
+                    ds_base,
+                    es_base,
+                    exit_request,
                 ) {
                     return r;
                 }
@@ -5410,7 +5432,7 @@ const RSI: usize = 6;
 const RDI: usize = 7;
 const R11: usize = 11;
 
-/// Guest-memory access for `string_run` (§10). Two implementors give the two
+/// Guest-memory access for `string_run_interruptible` (§10). Two implementors give the two
 /// backends the memory semantics each already uses for a *scalar* store, so a
 /// string op is never quietly weaker than the `mov` next to it:
 ///
@@ -5494,14 +5516,14 @@ pub struct StrFault {
     pub elem: u8,
 }
 
-/// Execute a (possibly repeated) string op over the raw guest buffer — the ONE
-/// implementation shared by the interpreter and the JIT's string helper (§10).
-/// Updates RSI/RDI/RCX/RAX/flags; restartable, so on a memory trap it commits the
-/// progress made, sets RIP to the faulting instruction, and returns
-/// `Some((addr, is_write))`. `None` = ran to completion.
-///
-/// Memory access goes through [`StrMem`] so the interpreter gets full region + SMC
-/// semantics while the JIT keeps its raw view (see the trait docs).
+/// Why a repeated string operation returned before completion.
+pub enum StringStop {
+    Fault(StrFault),
+    Interrupted,
+}
+
+/// Run a string operation without host interruption, using a flat destination
+/// segment. See [`string_run_interruptible`] for the interruptible implementation.
 #[allow(clippy::too_many_arguments)]
 pub fn string_run<M: StrMem>(
     cpu: &mut CpuState,
@@ -5513,16 +5535,11 @@ pub fn string_run<M: StrMem>(
     addr_bits: u8,
     seg_base: u64,
 ) -> Option<StrFault> {
-    // Long/compat: the ES destination base is always 0 (flat). Real mode calls
-    // `string_run_impl` directly with a non-zero `es<<4` destination base (§17.6).
     string_run_impl(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base, 0)
 }
 
-/// Shared string-op core, parameterised on **both** segment bases: `src_base` for the
-/// DS-relative read side (movs/lods/cmps) and `dst_base` for the ES-relative write side
-/// (stos/scas dest, movs dest, cmps second operand). The public [`string_run`] fixes
-/// `dst_base = 0` (long/compat flat ES) and keeps its 8-argument signature so the JIT's
-/// extern call is byte-identical; the real-mode interpreter path passes `es<<4` here.
+/// Run a string operation without host interruption, with separate source and
+/// destination segment bases. See [`string_run_interruptible`].
 #[allow(clippy::too_many_arguments)]
 pub fn string_run_impl<M: StrMem>(
     cpu: &mut CpuState,
@@ -5535,6 +5552,33 @@ pub fn string_run_impl<M: StrMem>(
     src_base: u64,
     dst_base: u64,
 ) -> Option<StrFault> {
+    match string_run_interruptible(
+        cpu, mem, op, elem, rep, cur_addr, addr_bits, src_base, dst_base, None,
+    ) {
+        Some(StringStop::Fault(fault)) => Some(fault),
+        None => None,
+        Some(StringStop::Interrupted) => unreachable!("no exit request supplied"),
+    }
+}
+
+/// Shared restartable string implementation for the interpreter and JIT (§10).
+/// Updates registers/flags after each iteration, preserving progress on a fault
+/// or host request. Source and destination segment bases are supplied separately;
+/// long/compat mode uses a flat ES destination, real mode passes `es<<4`.
+/// Memory access goes through [`StrMem`].
+#[allow(clippy::too_many_arguments)]
+pub fn string_run_interruptible<M: StrMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+) -> Option<StringStop> {
     let step = if cpu.flags.df {
         (elem as i64).wrapping_neg() as u64
     } else {
@@ -5573,16 +5617,32 @@ pub fn string_run_impl<M: StrMem>(
         if !matches!(rep, RepKind::None) && cpu.gpr[RCX] & amask == 0 {
             break;
         }
+        // SDM Vol 2B, REP/REPE/REPZ/REPNE/REPNZ—Repeat String Operation
+        // Prefix, Description and Operation (REP pp. 4-563–4-564;
+        // REPE/REPZ pp. 4-565–4-566; REPNE/REPNZ pp. 4-567–4-568): an interrupted repeat keeps the next source/
+        // destination pointers and the count after the last successful iteration;
+        // the saved instruction pointer names the string instruction.
+        // Relaxed polls only detect requests; the dispatcher consumes with Acquire.
+        if !matches!(rep, RepKind::None)
+            && exit_request.is_some_and(|word| {
+                word.load(std::sync::atomic::Ordering::Relaxed) & crate::vm::EXIT_REQUESTED != 0
+            })
+        {
+            cpu.rip = cur_addr;
+            return Some(StringStop::Interrupted);
+        }
         match op {
             StrOp::Movs => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);
                 let v = match mem.sload(sa, elem) {
                     Ok(v) => v,
-                    Err(t) => return trap(cpu, cur_addr, sa, false, t, 0, elem),
+                    Err(t) => {
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                    }
                 };
                 if let Err(t) = mem.sstore(da, v, elem) {
-                    return trap(cpu, cur_addr, da, true, t, v, elem);
+                    return trap(cpu, cur_addr, da, true, t, v, elem).map(StringStop::Fault);
                 }
                 cpu.gpr[RSI] = advance(cpu.gpr[RSI]);
                 cpu.gpr[RDI] = advance(cpu.gpr[RDI]);
@@ -5591,7 +5651,7 @@ pub fn string_run_impl<M: StrMem>(
                 let da = dst_lin(cpu.gpr[RDI]);
                 let v = cpu.gpr[RAX] & m;
                 if let Err(t) = mem.sstore(da, v, elem) {
-                    return trap(cpu, cur_addr, da, true, t, v, elem);
+                    return trap(cpu, cur_addr, da, true, t, v, elem).map(StringStop::Fault);
                 }
                 cpu.gpr[RDI] = advance(cpu.gpr[RDI]);
             }
@@ -5599,7 +5659,9 @@ pub fn string_run_impl<M: StrMem>(
                 let sa = src_lin(cpu.gpr[RSI]);
                 let v = match mem.sload(sa, elem) {
                     Ok(v) => v,
-                    Err(t) => return trap(cpu, cur_addr, sa, false, t, 0, elem),
+                    Err(t) => {
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                    }
                 };
                 cpu.write_gpr(RAX, v, elem);
                 cpu.gpr[RSI] = advance(cpu.gpr[RSI]);
@@ -5608,7 +5670,9 @@ pub fn string_run_impl<M: StrMem>(
                 let da = dst_lin(cpu.gpr[RDI]);
                 let b = match mem.sload(da, elem) {
                     Ok(v) => v,
-                    Err(t) => return trap(cpu, cur_addr, da, false, t, 0, elem),
+                    Err(t) => {
+                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault)
+                    }
                 };
                 let r = alu_sub(cpu.gpr[RAX] & m, b, 0, elem);
                 apply(&mut cpu.flags, FlagMask::ALL, &r);
@@ -5619,11 +5683,15 @@ pub fn string_run_impl<M: StrMem>(
                 let da = dst_lin(cpu.gpr[RDI]);
                 let a = match mem.sload(sa, elem) {
                     Ok(v) => v,
-                    Err(t) => return trap(cpu, cur_addr, sa, false, t, 0, elem),
+                    Err(t) => {
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                    }
                 };
                 let b = match mem.sload(da, elem) {
                     Ok(v) => v,
-                    Err(t) => return trap(cpu, cur_addr, da, false, t, 0, elem),
+                    Err(t) => {
+                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault)
+                    }
                 };
                 let r = alu_sub(a, b, 0, elem);
                 apply(&mut cpu.flags, FlagMask::ALL, &r);
@@ -5661,7 +5729,7 @@ pub fn string_run_impl<M: StrMem>(
     None
 }
 
-/// Build the `Exit` for a memory fault reported by a shared mem helper (`string_run`,
+/// Build the `Exit` for a memory fault reported by a shared mem helper (`string_run_interruptible`,
 /// `masked_load_run`, `masked_store_run`). RIP is already set by the helper.
 fn str_fault_exit(f: StrFault) -> Exit {
     let access = if f.write {
@@ -7843,6 +7911,113 @@ mod mmio_cleanup_tests {
                     "inactive retry fields were cleared for {instructions} instructions"
                 );
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod exit_request_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RequestAfterAccess<'a> {
+        word: Option<&'a AtomicU64>,
+        accesses: Cell<u64>,
+        limit: u64,
+        value: u64,
+    }
+
+    impl RequestAfterAccess<'_> {
+        fn access(&self) {
+            let count = self.accesses.get() + 1;
+            self.accesses.set(count);
+            if count == self.limit {
+                if let Some(word) = self.word {
+                    word.fetch_or(crate::vm::EXIT_REQUESTED, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    impl StrMem for RequestAfterAccess<'_> {
+        fn sload(&self, _addr: u64, _elem: u8) -> Result<u64, MemTrap> {
+            self.access();
+            Ok(self.value)
+        }
+
+        fn sstore(&self, _addr: u64, _value: u64, _elem: u8) -> Result<(), MemTrap> {
+            self.access();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exit_request_string_iteration_witness() {
+        // SDM Vol 2B, REP/REPE/REPZ/REPNE/REPNZ—Repeat String Operation
+        // Prefix, Description and Operation: REP pp. 4-563–4-564,
+        // REPE/REPZ pp. 4-565–4-566, REPNE/REPNZ pp. 4-567–4-568.
+        // Each loop services interrupts before its next string iteration, keeping
+        // the instruction pointer, remaining count and next element pointers.
+        for op in [
+            StrOp::Movs,
+            StrOp::Stos,
+            StrOp::Lods,
+            StrOp::Cmps,
+            StrOp::Scas,
+        ] {
+            let rep = match op {
+                StrOp::Cmps => RepKind::Repe,
+                StrOp::Scas => RepKind::Repne,
+                _ => RepKind::Rep,
+            };
+            let word = AtomicU64::new(0);
+            let mem = RequestAfterAccess {
+                word: Some(&word),
+                accesses: Cell::new(0),
+                limit: if matches!(op, StrOp::Cmps | StrOp::Movs) {
+                    6
+                } else {
+                    3
+                },
+                value: if matches!(op, StrOp::Scas) { 0 } else { 0x5a },
+            };
+            let mut cpu = CpuState::new();
+            cpu.rip = 0x1000;
+            cpu.gpr[0] = 0x5a;
+            cpu.gpr[RCX] = 8;
+            cpu.gpr[RSI] = 0x2000;
+            cpu.gpr[RDI] = 0x3000;
+            let mut reference = cpu.clone();
+            assert!(matches!(
+                string_run_interruptible(&mut cpu, &mem, op, 1, rep, 0x1234, 64, 0, 0, Some(&word),),
+                Some(StringStop::Interrupted)
+            ));
+            assert_eq!(cpu.rip, 0x1234);
+            assert_eq!(cpu.gpr[RCX], 5);
+            let reads_source = matches!(op, StrOp::Movs | StrOp::Lods | StrOp::Cmps);
+            let uses_destination = !matches!(op, StrOp::Lods);
+            assert_eq!(cpu.gpr[RSI], 0x2000 + if reads_source { 3 } else { 0 });
+            assert_eq!(cpu.gpr[RDI], 0x3000 + if uses_destination { 3 } else { 0 });
+            assert_eq!(mem.accesses.get(), mem.limit);
+            let reference_mem = RequestAfterAccess { word: None, ..mem };
+            reference.gpr[RCX] = 3;
+            assert!(string_run_interruptible(
+                &mut reference,
+                &reference_mem,
+                op,
+                1,
+                rep,
+                0x1234,
+                64,
+                0,
+                0,
+                None,
+            )
+            .is_none());
+            reference.gpr[RCX] = 5;
+            assert_eq!(cpu.gpr, reference.gpr);
+            assert_eq!(cpu.flags.to_rflags(), reference.flags.to_rflags());
         }
     }
 }

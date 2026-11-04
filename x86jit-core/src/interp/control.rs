@@ -84,23 +84,37 @@ pub(crate) fn exec_rep_string(
     rep: &RepKind,
     addr_bits: &u8,
     seg_base: &Val,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StepResult> {
     // Resolve the DS-source segment base (0, or the FS/GS base under an override).
     let seg_base = read_val(*seg_base, temps);
     // Route every element through `Memory` (region check + SMC `note_write`),
     // exactly like a scalar `Store` — so `rep stos` onto a code page is
     // caught and an MMIO/unmapped target traps (§10).
-    if let Some(f) = string_run(cpu, mem, *op, *elem, *rep, cur_addr, *addr_bits, seg_base) {
-        // `string_run` already set RIP to the faulting instruction.
-        return Some(StepResult::Exit(str_fault_exit(f)));
+    if let Some(stop) = string_run_interruptible(
+        cpu,
+        mem,
+        *op,
+        *elem,
+        *rep,
+        cur_addr,
+        *addr_bits,
+        seg_base,
+        0,
+        exit_request,
+    ) {
+        return Some(StepResult::Exit(match stop {
+            StringStop::Fault(f) => str_fault_exit(f),
+            StringStop::Interrupted => Exit::Interrupted,
+        }));
     }
     None
 }
 
 /// Real-mode (§17.6) string op: like [`exec_rep_string`] but with both segment bases
 /// resolved (`ds<<4` source, `es<<4` dest, already computed into the temps). Address
-/// size is always 16-bit. Routes through `string_run_impl` so the ES-destination base is
-/// honoured (the long/compat `string_run` hardcodes it to 0).
+/// size is always 16-bit. `string_run_interruptible` honours the ES destination
+/// base (the long/compat caller passes 0).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string_real(
     cpu: &mut CpuState,
@@ -112,11 +126,26 @@ pub(crate) fn exec_rep_string_real(
     rep: &RepKind,
     ds_base: &Val,
     es_base: &Val,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StepResult> {
     let ds_base = read_val(*ds_base, temps);
     let es_base = read_val(*es_base, temps);
-    if let Some(f) = string_run_impl(cpu, mem, *op, *elem, *rep, cur_addr, 16, ds_base, es_base) {
-        return Some(StepResult::Exit(str_fault_exit(f)));
+    if let Some(stop) = string_run_interruptible(
+        cpu,
+        mem,
+        *op,
+        *elem,
+        *rep,
+        cur_addr,
+        16,
+        ds_base,
+        es_base,
+        exit_request,
+    ) {
+        return Some(StepResult::Exit(match stop {
+            StringStop::Fault(f) => str_fault_exit(f),
+            StringStop::Interrupted => Exit::Interrupted,
+        }));
     }
     None
 }

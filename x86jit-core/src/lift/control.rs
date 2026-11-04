@@ -329,7 +329,7 @@ pub(crate) fn lift_string(
 
     // Address size (§17.5): iced encodes it in the implicit RSI/RDI register width —
     // RSI/RDI (8) = 64-bit, ESI/EDI (4) = 32-bit (a `67h` override in long mode or the
-    // default in Compat32), SI/DI (2) = 16-bit. The `string_run` loop masks the
+    // default in Compat32), SI/DI (2) = 16-bit. The `string_run_interruptible` loop masks the
     // pointer arithmetic and RCX to this width.
     let idx_reg = match op {
         StrOp::Stos | StrOp::Scas => insn.memory_base(), // ES:[RDI]-only

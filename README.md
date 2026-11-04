@@ -176,6 +176,18 @@ assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
 assert_eq!(cpu.reg(Reg::Rax) as u32, 5);
 ```
 
+`cpu.exit_request()` returns a cloneable, `Send + Sync` handle. Another host thread
+can call `handle.request_exit()` to make `run` return `Exit::Interrupted`, even
+without a block budget. The vCPU yields at its next checked instruction boundary:
+block/chain edges, region sub-block entries, or between REP string iterations.
+Guest state is precise; call `run` again to resume. Requests made outside `run`
+remain pending, and duplicate pending requests coalesce into one exit. Each handle
+targets one vCPU; a handle outliving that vCPU has no effect. Everything a thread
+wrote before `request_exit()` is visible to the caller once `run` returns the
+`Exit::Interrupted` that consumed that request. Compiled blocks charge their whole
+instruction count at entry, so an interrupted REP can over-charge that counter,
+like a mid-block fault.
+
 `Exit` and its struct-like variants are non-exhaustive: matches need a wildcard
 arm, and struct-like patterns need `..` to allow future exit reasons and fields.
 Replace struct literals with the stable constructors

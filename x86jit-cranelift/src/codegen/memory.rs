@@ -105,12 +105,27 @@ impl Translator<'_, '_> {
         let cur = self.iconst(self.cur_addr);
         let abits = self.iconst(*addr_bits as u64);
         // Resolve the DS-source segment base (0, or an FS/GS-base temp) BEFORE the
-        // GPR flush; the shared `string_run` adds it to the RSI-relative reads.
+        // GPR flush; the shared `string_run_interruptible` adds it to the RSI-relative reads.
         let seg = self.val(*seg_base);
         let args = [self.cpu, self.mem, op_code, elem, rep, cur, abits, seg];
         self.flush_gprs(); // helper reads/advances RSI/RDI/RCX in CpuState
         let inst = self.call_helper(self.helpers.string, &args);
-        self.trap_if_unmapped(inst);
+        let code = self.builder.inst_results(inst)[0];
+        let stopped = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, code, RET_CONTINUE as i64);
+        let ok = self.begin_trap_fork(stopped);
+        // The helper committed partial progress; stale register Variables must
+        // not overwrite it. Regions must still write back their live fuel.
+        if let Some(fv) = self.fuel_var {
+            let fuel = self.builder.use_var(fv);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), fuel, self.mem, MEMCTX_FUEL);
+        }
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(ok);
         self.reload_gprs(); // helper advanced RSI/RDI/RCX
         false
     }

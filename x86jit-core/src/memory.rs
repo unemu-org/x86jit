@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::ir::RmwOp;
 
@@ -495,6 +495,8 @@ impl WatchPages {
     }
 }
 
+pub(crate) const DISPATCH_DIRTY: u64 = 1;
+
 /// Guest memory. Owns the host-side backing buffer and region metadata.
 ///
 /// The `host_base` of the backing buffer is what the JIT adds to a guest
@@ -529,6 +531,7 @@ pub struct Memory {
     code_range: AtomicU64,
     dirty: Mutex<Vec<u64>>,
     dirty_flag: AtomicBool,
+    dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
     // Embedder-registered DATA-range dirty tracking — a parallel facility to the SMC
     // code-page mechanism above, independent of it (a watched page need not be code).
     // See `WatchPages`.
@@ -624,6 +627,7 @@ impl Memory {
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
+            dispatch_words: Mutex::new(Vec::new()),
             watch,
             guest_base,
             last_region: AtomicUsize::new(0),
@@ -815,8 +819,21 @@ impl Memory {
         let watched = self.watch.count.load(Ordering::Relaxed) != 0;
         for page in code_page_range(addr, len as u64) {
             if self.is_code_page(page) {
+                // Serialize notification and clearing with the drain. Exit bits in
+                // these words are independent and must survive every SMC update.
+                let mut words = self.dispatch_words.lock().unwrap();
                 self.dirty.lock().unwrap().push(page);
                 self.dirty_flag.store(true, Ordering::Relaxed);
+                words.retain(|weak| {
+                    if let Some(word) = weak.upgrade() {
+                        if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 {
+                            word.fetch_or(DISPATCH_DIRTY, Ordering::Relaxed);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             if watched && self.watch.is_watched(page) {
                 self.watch.mark_dirty(page);
@@ -824,10 +841,19 @@ impl Memory {
         }
     }
 
+    pub(crate) fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
+        let mut words = self.dispatch_words.lock().unwrap();
+        words.retain(|weak| weak.strong_count() != 0);
+        if self.has_dirty_code() {
+            word.fetch_or(DISPATCH_DIRTY, Ordering::Relaxed);
+        }
+        words.push(Arc::downgrade(word));
+    }
+
     /// Whether any code page has been written since the last `take_dirty_code` — the
-    /// cheap test the compiled-chain loop uses to decide it must return to the
-    /// dispatcher and let `Vm::handle_smc` run. One relaxed load; false for every guest
-    /// that does not modify its own code.
+    /// cheap global SMC test. Compiled chain edges poll their per-vcpu notification
+    /// word, which folds this condition with exit requests. One relaxed load; false
+    /// for every guest that does not modify its own code.
     pub fn has_dirty_code(&self) -> bool {
         self.dirty_flag.load(Ordering::Relaxed)
     }
@@ -934,6 +960,26 @@ impl Memory {
         if !self.dirty_flag.load(Ordering::Relaxed) {
             return Vec::new();
         }
+        let _words = self.dispatch_words.lock().unwrap();
+        self.take_dirty_code_locked()
+    }
+
+    /// Serialize invalidation and this vcpu's acknowledgement with notifications
+    /// and other dispatchers. A running vcpu must retain its own notice until it
+    /// reaches dispatch, even if another vcpu already drained the global list.
+    pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(Vec<u64>)) {
+        if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 && !self.has_dirty_code() {
+            return;
+        }
+        let _words = self.dispatch_words.lock().unwrap();
+        invalidate(self.take_dirty_code_locked());
+        // The lock makes prior invalidation visible before acknowledging this
+        // notice and prevents a new write from losing its notification here.
+        word.fetch_and(!DISPATCH_DIRTY, Ordering::Relaxed);
+    }
+
+    // Caller holds dispatch_words through any invalidation and acknowledgement.
+    fn take_dirty_code_locked(&self) -> Vec<u64> {
         // Something's dirty: claim it. A racing vcpu may have drained it already.
         if !self.dirty_flag.swap(false, Ordering::Relaxed) {
             return Vec::new();
@@ -1564,6 +1610,39 @@ fn apply_rmw(old: u64, src: u64, op: RmwOp, size: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smc_dispatch_acknowledges_only_its_own_notice_after_invalidation() {
+        let m = Memory::new(MemoryModel::Flat { size: 0x4000 });
+        let a = Arc::new(AtomicU64::new(crate::vm::EXIT_REQUESTED));
+        let b = Arc::new(AtomicU64::new(crate::vm::EXIT_REQUESTED));
+        m.register_dispatch_word(&a);
+        m.register_dispatch_word(&b);
+        m.mark_code(0x1000, 1);
+        m.note_write(0x1000, 1);
+        let pending = DISPATCH_DIRTY | crate::vm::EXIT_REQUESTED;
+        m.dispatch_smc(&b, |pages| {
+            assert_eq!(pages, vec![1]);
+            assert_eq!(a.load(Ordering::Relaxed), pending);
+            assert_eq!(b.load(Ordering::Relaxed), pending);
+            assert!(m.dispatch_words.try_lock().is_err());
+        });
+        assert_eq!(a.load(Ordering::Relaxed), pending);
+        assert_eq!(b.load(Ordering::Relaxed), crate::vm::EXIT_REQUESTED);
+        let mut acknowledged = false;
+        m.dispatch_smc(&a, |pages| {
+            assert!(pages.is_empty(), "another vcpu already drained the list");
+            assert_eq!(a.load(Ordering::Relaxed), pending);
+            acknowledged = true;
+        });
+        assert!(acknowledged);
+        assert_eq!(a.load(Ordering::Relaxed), crate::vm::EXIT_REQUESTED);
+
+        m.note_write(0x1000, 1);
+        assert_eq!(m.take_dirty_code(), vec![1]);
+        assert_eq!(a.load(Ordering::Relaxed), pending);
+        assert_eq!(b.load(Ordering::Relaxed), pending);
+    }
 
     fn flat(size: u64) -> Memory {
         Memory::new(MemoryModel::Flat { size })

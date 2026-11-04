@@ -10,7 +10,7 @@ use crate::exit::{AccessKind, Exit, StepResult};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
     call_block, MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
-    RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_SYSCALL, RET_UNMAPPED,
+    RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_SYSCALL, RET_UNMAPPED,
 };
 use crate::lift::{lift_block, lift_region, CpuMode, FetchAddr, LiftError};
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
@@ -548,27 +548,29 @@ impl Vm {
     /// JIT-side SMC — write-hooks or host page protection plus reverse-edge link
     /// invalidation — is the deliberately deferred "mark the host code dead" step
     /// (§10, §9.1).
-    fn handle_smc(&self) {
-        let mut invalidated = false;
-        for page in self.mem.take_dirty_code() {
-            let lo = page << crate::memory::CODE_PAGE_BITS;
-            let hi = lo + (1 << crate::memory::CODE_PAGE_BITS);
-            // A dropped unit's inbound link slots (in other, surviving blocks) still
-            // point at its now-stale compiled code. Note whether anything was
-            // dropped so we can clear the backend's slots once, below.
-            // The page tag is cleared *inside* `invalidate_overlapping`, under the
-            // spans lock and only if no block still spans the page — so it can't race
-            // a concurrent insert's mark.
-            invalidated |= !self
-                .cache
-                .invalidate_overlapping(lo, hi, || self.mem.clear_code_page(page))
-                .is_empty();
-        }
-        // Clear all backend-owned cached code pointers so no surviving block chains
-        // into a dropped unit. Cleared slots re-link on their next traversal.
-        if invalidated {
-            self.backend.invalidate_links();
-        }
+    fn handle_smc(&self, word: &AtomicU64) {
+        self.mem.dispatch_smc(word, |dirty| {
+            let mut invalidated = false;
+            for page in dirty {
+                let lo = page << crate::memory::CODE_PAGE_BITS;
+                let hi = lo + (1 << crate::memory::CODE_PAGE_BITS);
+                // A dropped unit's inbound link slots (in other, surviving blocks) still
+                // point at its now-stale compiled code. Note whether anything was
+                // dropped so we can clear the backend's slots once, below.
+                // The page tag is cleared *inside* `invalidate_overlapping`, under the
+                // spans lock and only if no block still spans the page — so it can't race
+                // a concurrent insert's mark.
+                invalidated |= !self
+                    .cache
+                    .invalidate_overlapping(lo, hi, || self.mem.clear_code_page(page))
+                    .is_empty();
+            }
+            // Clear all backend-owned cached code pointers so no surviving block chains
+            // into a dropped unit. Cleared slots re-link on their next traversal.
+            if invalidated {
+                self.backend.invalidate_links();
+            }
+        });
     }
 
     /// One execution context per guest thread (§4.3). Shares this `Vm`.
@@ -576,8 +578,11 @@ impl Vm {
         let mut cpu = CpuState::new();
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_precision = self.x87_precision; // transcendental precision
+        let word = Arc::new(AtomicU64::new(0));
+        self.mem.register_dispatch_word(&word);
         Vcpu {
             cpu,
+            exit_request: ExitRequest { word },
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             fast: Box::new(
                 [FastEntry {
@@ -619,9 +624,36 @@ struct FastEntry {
     entry: CompiledPtr,
 }
 
+pub(crate) const EXIT_REQUESTED: u64 = 2;
+
+/// Thread-safe, cloneable request to return from a vcpu's next running boundary.
+/// Requests coalesce until consumed by `run`; requests made outside `run` persist.
+/// A running vcpu checks within one compiled block or chain edge, one region
+/// sub-block, or one REP iteration. A handle that outlives its vcpu has no effect.
+/// Everything written by a thread before `request_exit` is visible to the caller
+/// once `run` returns the `Exit::Interrupted` that consumed that request.
+#[derive(Clone, Debug)]
+pub struct ExitRequest {
+    word: Arc<AtomicU64>,
+}
+
+impl ExitRequest {
+    /// Ask the vcpu to return [`Exit::Interrupted`] with resumable guest state.
+    /// Checks occur within one compiled block or chain edge, one region sub-block,
+    /// or one REP iteration. A handle outliving its vcpu has no effect.
+    /// Writes preceding this call are visible after `run` returns the
+    /// [`Exit::Interrupted`] that consumes it.
+    pub fn request_exit(&self) {
+        // Release publishes preceding writes; run's consuming Acquire pairs with
+        // this RMW. Preserve SMC and leave requests after consumption pending.
+        self.word.fetch_or(EXIT_REQUESTED, Ordering::Release);
+    }
+}
+
 /// Per-guest-thread execution context: CPU state + its own `run()` loop (§2).
 pub struct Vcpu {
     pub cpu: CpuState,
+    exit_request: ExitRequest,
     /// Decode/lift mode (§17.3), inherited from the `Vm`: threaded into every
     /// `resolve`/`lift`/`step_one` call and combined with the guest RIP to form the
     /// [`BlockKey`] a translation is cached under (§17.4). Constant for the vcpu's life
@@ -697,6 +729,11 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
+    /// Obtain a handle that may request an exit from any host thread.
+    pub fn exit_request(&self) -> ExitRequest {
+        self.exit_request.clone()
+    }
+
     /// Fast-resolve cache hits served without a shared-cache lookup.
     pub fn fast_hits(&self) -> u64 {
         self.fast_hits
@@ -987,9 +1024,18 @@ impl Vcpu {
     /// filled hands the next entry back via `MemCtx.next_entry` and the inner loop
     /// jumps straight there, skipping the cache lookup. The budget still ticks per
     /// block, so a tight chained loop yields `BudgetExhausted` (preemption, §9.2).
+    /// A host request yields `Interrupted` at the next checked boundary; REP may
+    /// have made partial progress and resumes at the string instruction.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         let exit = self.run_inner(vm, budget);
         self.cpu.finish_mmio_retry(Some(&exit));
+        if matches!(exit, Exit::Interrupted) {
+            // Acquire the writes published by the consumed request. A later
+            // request remains pending; a concurrent SMC bit survives the mask.
+            self.exit_request
+                .word
+                .fetch_and(!EXIT_REQUESTED, Ordering::Acquire);
+        }
         // Published here rather than at each of the inner loop's many exits, so no
         // path can forget it: one shared atomic per run instead of one per transfer.
         // (`executed` needs no flush — compiled code updates it live through
@@ -1003,8 +1049,9 @@ impl Vcpu {
     ///
     /// Distinct from [`Vcpu::retired_instructions`], which stays an interpreter-only,
     /// per-instruction virtual-time base. Compiled code charges a whole block's count
-    /// at its entry, so this advances in block-sized steps — exact totals, coarse
-    /// granularity. Divided by wall time it gives guest IPC; divided by
+    /// at its entry, so this advances in block-sized steps. Mid-block faults and
+    /// interrupted REP operations can charge an unexecuted tail. Divided by wall
+    /// time it gives guest IPC; divided by
     /// `TranslationCache::chained` it gives the average length of a compiled unit.
     pub fn executed_instructions(&self) -> u64 {
         self.executed
@@ -1012,9 +1059,12 @@ impl Vcpu {
 
     fn run_inner(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         let mut blocks_run: u64 = 0;
+        let exit_word_owner = Arc::clone(&self.exit_request.word);
+        let exit_word: &AtomicU64 = &exit_word_owner;
         // Deliberately a LOCAL: taking it as a `&mut` parameter instead measured +5.4%
         // on the dispatch-micro bench, because the compiler stops treating it as one.
         let mut ctx = MemCtx::for_memory(&vm.mem);
+        ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
         // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
         // boxed, so its address is stable for the whole run despite `&mut self`.
         ctx.ret_stack = std::ptr::addr_of_mut!(*self.ret_stack) as u64;
@@ -1024,13 +1074,20 @@ impl Vcpu {
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
         loop {
+            if exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
+                && self.cpu.pending_mmio.is_none()
+                && !self.cpu.pending_mmio_write
+                && self.cpu.pending_port_in.is_none()
+            {
+                return Exit::Interrupted;
+            }
             if budget.is_some_and(|b| blocks_run >= b) {
                 return Exit::BudgetExhausted;
             }
 
             // SMC (§10): drop any cached block a prior block's store landed on,
             // before fetching the next one, so re-execution re-lifts fresh bytes.
-            vm.handle_smc();
+            vm.handle_smc(exit_word);
 
             // Flush the fast-resolve cache if any invalidation happened since we
             // last synced — covers same-thread SMC (just handled above) and
@@ -1053,6 +1110,7 @@ impl Vcpu {
             // recorded transfers. Keep that retry on the interpreter until completion;
             // compiled blocks never inherit answers from a partially serviced operand.
             if self.cpu.mmio_retry_active {
+                // Finish the pending instruction before honouring a host request.
                 let mut info = crate::interp::RetireInfo::default();
                 let r = crate::interp::step_one(
                     &vm.mem,
@@ -1143,7 +1201,10 @@ impl Vcpu {
 
             match block {
                 CachedBlock::Interpreted(ir) => {
-                    let mut info = crate::interp::RetireInfo::default();
+                    let mut info = crate::interp::RetireInfo {
+                        exit_request: Some(exit_word),
+                        ..Default::default()
+                    };
                     let r = crate::interp::interpret_block(
                         &ir,
                         &mut self.cpu,
@@ -1189,20 +1250,12 @@ impl Vcpu {
                 CachedBlock::Compiled { entry, .. } => {
                     let mut cur = entry;
                     loop {
-                        // SMC (§10): a store from compiled code now marks its
-                        // code page dirty, but `handle_smc` runs in the OUTER loop — and
-                        // this inner one follows chain/link/IBTC edges without going back
-                        // there. Left alone, a chained guest could patch a block and
-                        // transfer into it with the invalidation still pending, which is
-                        // §10's accepted same-block deferral silently widened to an
-                        // unbounded one. Leaving the chain here bounds it back to one
-                        // block, matching the interpreter, which reaches `handle_smc`
-                        // every block by construction.
-                        //
-                        // The cost is one relaxed load of a shared-clean atomic per chain
-                        // edge — the same shape as the store path's watch gate, and it
-                        // does not touch generated code at all.
-                        if vm.mem.has_dirty_code() {
+                        // SMC (§10): leaving the chain bounds invalidation deferral
+                        // to one block while chaining.
+                        // One relaxed load folds SMC and exit notifications at
+                        // every chain/link/IBTC edge. The outer loop consumes exit
+                        // requests and handles SMC before re-entering compiled code.
+                        if exit_word.load(Ordering::Relaxed) != 0 {
                             break;
                         }
                         // Hand the block its remaining block quantum (superblocks,
@@ -1218,7 +1271,7 @@ impl Vcpu {
                         let code = unsafe { call_block(cur, &mut self.cpu, &mut ctx) };
                         blocks_run += (quantum - ctx.fuel).max(1);
                         match code {
-                            RET_CONTINUE => break,
+                            RET_CONTINUE | RET_INTERRUPTED => break,
                             RET_CHAIN => {
                                 // Plain per-vcpu counter, flushed once per `run`
                                 // (see `TranslationCache::add_chained`): this fires
@@ -1351,7 +1404,10 @@ impl Vcpu {
                                 // Interpreter single-step (not the hot compiled loop):
                                 // tick the retired counter for the one instruction it
                                 // may retire (§17.6, sub-seam c).
-                                let mut info = crate::interp::RetireInfo::default();
+                                let mut info = crate::interp::RetireInfo {
+                                    exit_request: Some(exit_word),
+                                    ..Default::default()
+                                };
                                 let r = crate::interp::step_one(
                                     &vm.mem,
                                     &mut self.cpu,
@@ -1369,7 +1425,10 @@ impl Vcpu {
                             // RIP to the instruction; single-step it on the interpreter
                             // to produce the `Exit::PortIo` (same deferral as MMIO).
                             RET_PORTIO_DEFER => {
-                                let mut info = crate::interp::RetireInfo::default();
+                                let mut info = crate::interp::RetireInfo {
+                                    exit_request: Some(exit_word),
+                                    ..Default::default()
+                                };
                                 let r = crate::interp::step_one(
                                     &vm.mem,
                                     &mut self.cpu,

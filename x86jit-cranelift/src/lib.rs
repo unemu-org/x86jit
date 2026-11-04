@@ -56,9 +56,10 @@ unsafe extern "C" fn div_helper(
     }
 }
 
-/// String-op helper: runs the whole (rep) loop via the shared `string_run`. Reads
-/// `cpu` and the guest buffer (`MemCtx.base`/`size`); on a trap it writes the
-/// fault into `MemCtx` and returns `RET_UNMAPPED`, else `RET_CONTINUE`.
+/// String-op helper: runs the (rep) loop via shared `string_run_interruptible`.
+/// Reads `cpu` and the guest buffer (`MemCtx.base`/`size`); a trap writes fault
+/// details and returns `RET_UNMAPPED`, a host request returns `RET_INTERRUPTED`,
+/// and completion returns `RET_CONTINUE`.
 ///
 /// # Safety
 /// `cpu`/`mem` are valid pointers to a `CpuState` / `MemCtx` for the call.
@@ -73,7 +74,7 @@ unsafe extern "C" fn string_helper(
     addr_bits: u64,
     seg_base: u64,
 ) -> u64 {
-    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_UNMAPPED};
     use x86jit_core::{RepKind, StrOp};
 
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -105,7 +106,7 @@ unsafe extern "C" fn string_helper(
     // itself.
     let track = matches!(op, StrOp::Movs | StrOp::Stos);
     let rdi0 = cpu.gpr[7];
-    let ret = match x86jit_core::interp::string_run(
+    let ret = match x86jit_core::interp::string_run_interruptible(
         cpu,
         &raw,
         op,
@@ -114,9 +115,13 @@ unsafe extern "C" fn string_helper(
         cur_addr,
         addr_bits as u8,
         seg_base,
+        0,
+        // SAFETY: points to the live vcpu word or the static zero atomic.
+        (ctx.dispatch_word_ptr as *const std::sync::atomic::AtomicU64).as_ref(),
     ) {
         None => RET_CONTINUE,
-        Some(f) => {
+        Some(x86jit_core::interp::StringStop::Interrupted) => RET_INTERRUPTED,
+        Some(x86jit_core::interp::StringStop::Fault(f)) => {
             ctx.fault_addr = f.addr;
             ctx.fault_access = f.write as u64;
             RET_UNMAPPED
@@ -2961,6 +2966,166 @@ mod tests {
     use x86jit_core::jit_abi::run_compiled;
     use x86jit_core::lift::{lift_block, CpuMode};
     use x86jit_core::{CpuState, Memory, MemoryModel, Prot, RegionKind, StepResult};
+
+    // Pause inside a real compiled sub-block, after its watched scalar store.
+    // Taking the hook makes later loop iterations run without another handshake.
+    thread_local! {
+        static SMC_PAUSE: std::cell::RefCell<Option<(
+            std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>
+        )>> = const { std::cell::RefCell::new(None) };
+    }
+
+    unsafe extern "C" fn paused_store(mem: u64, addr: u64, len: u64) {
+        // SAFETY: the generated store passes the same live Memory pointer and
+        // checked range as the normal note_write helper.
+        unsafe { note_write_helper(mem, addr, len) };
+        SMC_PAUSE.with(|slot| {
+            if let Some((entered, resume)) = slot.borrow_mut().take() {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+        });
+    }
+
+    struct PausedStoreBackend {
+        jit: JitBackend,
+        regions: bool,
+    }
+
+    impl Backend for PausedStoreBackend {
+        fn materialize(
+            &self,
+            ir: &IrBlock,
+            consistency: MemConsistency,
+            mmio: Option<(u64, u64)>,
+            guest_base: u64,
+        ) -> CachedBlock {
+            CachedBlock::Compiled {
+                entry: self.jit.shared.compile_with(
+                    perfmap::Kind::Block,
+                    ir.guest_start,
+                    |builder, mut helpers, alloc| {
+                        helpers.note_watch.1 = paused_store as *const () as u64;
+                        codegen::translate_block(
+                            builder,
+                            ir,
+                            &self.jit.shared.offsets,
+                            alloc,
+                            helpers,
+                            consistency,
+                            mmio,
+                            guest_base,
+                            false,
+                        )
+                    },
+                ),
+            }
+        }
+
+        fn region_caps(&self) -> Option<x86jit_core::RegionCaps> {
+            self.regions.then_some(x86jit_core::RegionCaps {
+                max_blocks: 8,
+                max_icount: 128,
+            })
+        }
+
+        fn materialize_region(
+            &self,
+            region: &IrRegion,
+            consistency: MemConsistency,
+            mmio: Option<(u64, u64)>,
+            guest_base: u64,
+        ) -> CachedBlock {
+            CachedBlock::Compiled {
+                entry: self.jit.shared.compile_with(
+                    perfmap::Kind::Region,
+                    region.entry,
+                    |builder, mut helpers, alloc| {
+                        helpers.note_watch.1 = paused_store as *const () as u64;
+                        codegen::translate_region(
+                            builder,
+                            region,
+                            &self.jit.shared.offsets,
+                            alloc,
+                            helpers,
+                            consistency,
+                            mmio,
+                            guest_base,
+                            false,
+                        )
+                    },
+                ),
+            }
+        }
+
+        fn invalidate_links(&self) {
+            self.jit.invalidate_links();
+        }
+    }
+
+    fn smc_notice_survives_other_vcpu_drain(regions: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+
+        // first: inc rax; mov [0x8000],rax; jmp second
+        // second: add rbx,1; cmp rax,3; jb first; hlt
+        let code = [
+            0x48, 0xff, 0xc0, 0x48, 0x89, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00, 0xeb, 0x00, 0x48,
+            0x83, 0xc3, 0x01, 0x48, 0x83, 0xf8, 0x03, 0x72, 0xe9, 0xf4,
+        ];
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(0x10000),
+            Box::new(PausedStoreBackend {
+                jit: JitBackend::new(),
+                regions,
+            }),
+        );
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, &code).unwrap();
+        vm.write_bytes(0x4000, &[0xf4]).unwrap();
+        vm.watch_range(0x8000, 8);
+        let vm = Arc::new(vm);
+        let mut a = vm.new_vcpu();
+        a.set_reg(Reg::Rip, ENTRY);
+        let mut b = vm.new_vcpu();
+        b.set_reg(Reg::Rip, 0x4000);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let running_vm = Arc::clone(&vm);
+        let worker = std::thread::spawn(move || {
+            SMC_PAUSE.with(|slot| *slot.borrow_mut() = Some((entered_tx, resume_rx)));
+            // A finite fallback bounds a broken gate without an exit request that
+            // could hide the missing SMC notice.
+            let exit = a.run(&running_vm, Some(32));
+            (exit, a)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if regions {
+            assert!(vm.cache.regions() > 0, "A must already be inside a region");
+        }
+        let epoch = vm.cache.epoch();
+        // A is inside first; change second's increment before its next gate.
+        vm.mem.write(ENTRY + 16, 10, 1).unwrap();
+        assert!(matches!(b.run(&vm, None), Exit::Hlt));
+        assert!(!vm.mem.has_dirty_code(), "B must drain the SMC page list");
+        assert!(vm.cache.epoch() > epoch, "B must publish invalidation");
+        resume_tx.send(()).unwrap();
+        let (exit, a) = worker.join().unwrap();
+        assert!(matches!(exit, Exit::Hlt), "{exit:?}");
+        assert_eq!(a.reg(Reg::Rax), 3);
+        assert_eq!(a.reg(Reg::Rbx), 30, "next sub-block must use the new code");
+    }
+
+    #[test]
+    fn smc_notice_survives_other_vcpu_drain_region() {
+        smc_notice_survives_other_vcpu_drain(true);
+    }
+
+    #[test]
+    fn smc_notice_survives_other_vcpu_drain_chained() {
+        smc_notice_survives_other_vcpu_drain(false);
+    }
 
     // `mov eax, 42` then `jmp $` (to self): sets RAX=42 and terminates the block
     // without touching guest memory (the jmp is the block terminator, not a loop).

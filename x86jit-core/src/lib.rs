@@ -68,7 +68,7 @@ pub use state::{
     CpuState, Flags, Reg, X87Precision, AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
 };
 pub use vm::{
-    Backend, InterpreterBackend, MemConsistency, TierUpFinished, TierUpRequest, TierUpSubmit,
-    TierUpUnit, Vcpu, Vm, VmConfig,
+    Backend, ExitRequest, InterpreterBackend, MemConsistency, TierUpFinished, TierUpRequest,
+    TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
 pub use x87::FpuKind;

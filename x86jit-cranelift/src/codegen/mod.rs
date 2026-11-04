@@ -15,12 +15,12 @@ use cranelift::prelude::*;
 use cranelift::codegen::ir::{self, ConstantData, StackSlotData, StackSlotKind};
 
 use x86jit_core::jit_abi::{
-    CpuOffsets, MEMCTX_BASE, MEMCTX_CODE_RANGE_PTR, MEMCTX_EXCEPTION_VECTOR, MEMCTX_FAULT_ACCESS,
-    MEMCTX_FAULT_ADDR, MEMCTX_FAULT_SIZE, MEMCTX_FUEL, MEMCTX_ICOUNT_PTR, MEMCTX_LINK_SLOT,
-    MEMCTX_MEM_SELF, MEMCTX_NEXT_ENTRY, MEMCTX_RET_STACK, MEMCTX_SIZE, MEMCTX_WATCH_BITS_PTR,
-    MEMCTX_WATCH_COUNT_PTR, RETSTACK_ENTRIES, RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN,
-    RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS, RET_LINK, RET_MMIO_DEFER,
-    RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED,
+    CpuOffsets, MEMCTX_BASE, MEMCTX_CODE_RANGE_PTR, MEMCTX_DISPATCH_WORD_PTR,
+    MEMCTX_EXCEPTION_VECTOR, MEMCTX_FAULT_ACCESS, MEMCTX_FAULT_ADDR, MEMCTX_FAULT_SIZE,
+    MEMCTX_FUEL, MEMCTX_ICOUNT_PTR, MEMCTX_LINK_SLOT, MEMCTX_MEM_SELF, MEMCTX_NEXT_ENTRY,
+    MEMCTX_RET_STACK, MEMCTX_SIZE, MEMCTX_WATCH_BITS_PTR, MEMCTX_WATCH_COUNT_PTR, RETSTACK_ENTRIES,
+    RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
+    RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED,
 };
 use x86jit_core::memory::CODE_PAGE_BITS;
 use x86jit_core::{
@@ -242,6 +242,7 @@ pub fn translate_block(
         gpr_cache: [None; 16],
         gpr_vars: None,
         fuel_var: None,
+        dispatch_word: None,
         mmio,
         guest_base,
         icount: icount_on,
@@ -324,6 +325,7 @@ pub fn translate_region(
         gpr_cache: [None; 16],
         gpr_vars: None,
         fuel_var: None,
+        dispatch_word: None,
         mmio,
         guest_base,
         icount: icount_on,
@@ -357,6 +359,7 @@ pub fn translate_region(
     let init_fuel = t.load_mem(MEMCTX_FUEL);
     t.builder.def_var(fuel_var, init_fuel);
     t.fuel_var = Some(fuel_var);
+    t.dispatch_word = Some(t.load_mem(MEMCTX_DISPATCH_WORD_PTR));
 
     // The entry block flows into the first sub-block.
     let first = clif[&region.entry];
@@ -466,6 +469,8 @@ struct Translator<'a, 'b> {
     /// register decrement, not a load+store. Loaded at entry, flushed at every exit
     /// (in `ret`, next to the GPRs). `None` in single-block mode.
     fuel_var: Option<Variable>,
+    /// Region entry dominates all sub-blocks; keep the notification pointer in SSA.
+    dispatch_word: Option<Value>,
     /// The guest's `Trap`-region window `[lo, hi)` baked as a constant (§5.2,
     /// M4-T10), or `None` when the VM has no MMIO regions. When `Some`, every
     /// inlined load/store gets a range check that defers a Trap-region access to the
@@ -4321,19 +4326,29 @@ impl Translator<'_, '_> {
         self.ret(RET_CONTINUE);
     }
 
-    /// Fuel gate before a region sub-block (§12 M5-T3): if `MemCtx.fuel` is spent,
-    /// store RIP = `block_addr` and return to the dispatcher (which re-enters there
-    /// with the next quantum); otherwise charge one block and fall through. Every
-    /// sub-block (including the first — where the dispatcher guarantees fuel ≥ 1, so
-    /// the exit is never taken) charges exactly once, so `quantum - fuel` equals the
-    /// number of guest blocks run.
+    /// Gate before a region sub-block (§12 M5-T3): spent fuel or a dispatch notice
+    /// saves RIP = `block_addr` and returns to the dispatcher. Otherwise charge one
+    /// block and fall through, so `quantum - fuel` counts guest blocks entered.
     pub(crate) fn emit_fuel_gate(&mut self, block_addr: u64) {
         let fv = self.fuel_var.expect("fuel Variable in region mode");
         let fuel = self.builder.use_var(fv);
         let spent = self.builder.ins().icmp_imm(IntCC::Equal, fuel, 0);
         let exit = self.builder.create_block();
+        let poll = self.builder.create_block();
         let cont = self.builder.create_block();
-        self.builder.ins().brif(spent, exit, &[], cont, &[]);
+        self.builder.ins().brif(spent, exit, &[], poll, &[]);
+        self.builder.switch_to_block(poll);
+        let ptr = self.dispatch_word.expect("dispatch pointer in region mode");
+        // Honour SMC as well as exit requests: cross-modifying code must leave
+        // a region within one sub-block, even when its internal edges loop.
+        // Cranelift atomic_load is sequentially consistent (at least acquire on
+        // AArch64). Stronger than the relaxed Rust notification polls; crucially
+        // this is atomic and cannot be hoisted out of a region's host loop.
+        let word = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, MemFlags::trusted(), ptr);
+        self.builder.ins().brif(word, exit, &[], cont, &[]);
         // Blocks are sealed en masse by `translate_region` after the whole CFG is
         // built (a DAG/loop may add predecessors as later blocks are emitted).
 
@@ -4719,6 +4734,93 @@ mod barrier_tests {
             .windows(4)
             .filter(|w| *w == DMB_ISH)
             .count()
+    }
+
+    #[test]
+    fn region_dispatch_poll_loads_pointer_once() {
+        use cranelift::codegen::ir::{InstructionData, Opcode};
+        use x86jit_core::jit_abi::MEMCTX_DISPATCH_WORD_PTR;
+        use x86jit_core::IrRegion;
+
+        let mut settings = settings::builder();
+        settings
+            .set("opt_level", OptLevel::default().flag())
+            .unwrap();
+        let isa = isa::lookup("aarch64-unknown-linux-gnu".parse().unwrap())
+            .unwrap()
+            .finish(settings::Flags::new(settings))
+            .unwrap();
+        let mut ctx = Context::new();
+        ctx.set_disasm(true);
+        ctx.func
+            .signature
+            .params
+            .extend([AbiParam::new(types::I64); 2]);
+        ctx.func.signature.returns.push(AbiParam::new(types::I64));
+        let region = IrRegion {
+            entry: 0,
+            has_loop: true,
+            blocks: (0..2)
+                .map(|addr| IrBlock {
+                    guest_start: addr,
+                    guest_len: 1,
+                    icount: 1,
+                    temp_count: 0,
+                    ops: vec![IrOp::Jump {
+                        target: Val::Imm(1 - addr),
+                    }],
+                })
+                .collect(),
+        };
+        let mut fbctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+        let sig = builder.import_signature(Signature::new(isa.default_call_conv()));
+        let mut dummy = || (sig, 0, 0);
+        let helpers = Helpers::all_dummy(&mut dummy, (sig, 0, 0));
+        super::translate_region(
+            &mut builder,
+            &region,
+            &cpu_offsets(),
+            &mut || 0,
+            helpers,
+            x86jit_core::MemConsistency::Fast,
+            None,
+            0,
+            false,
+        );
+        builder.finalize();
+        let entry = ctx.func.layout.entry_block().unwrap();
+        let mem = ctx.func.dfg.block_params(entry)[1];
+        let mut pointer_loads = 0;
+        let mut polls = 0;
+        for block in ctx.func.layout.blocks() {
+            for inst in ctx.func.layout.block_insts(block) {
+                match ctx.func.dfg.insts[inst] {
+                    InstructionData::Load { arg, offset, .. }
+                        if arg == mem && i32::from(offset) == MEMCTX_DISPATCH_WORD_PTR =>
+                    {
+                        pointer_loads += 1;
+                        assert_eq!(block, entry, "pointer load must dominate every gate");
+                    }
+                    data if data.opcode() == Opcode::AtomicLoad => {
+                        polls += 1;
+                        let word = ctx.func.dfg.first_result(inst);
+                        // The poll branches on the loaded value itself, with no
+                        // intervening compare or null-pointer branch.
+                        let next = ctx.func.layout.next_inst(inst).unwrap();
+                        assert_eq!(ctx.func.dfg.insts[next].opcode(), Opcode::Brif);
+                        assert_eq!(ctx.func.dfg.inst_args(next)[0], word);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(pointer_loads, 1);
+        assert_eq!(polls, region.blocks.len());
+        ctx.compile(&*isa, &mut Default::default()).unwrap();
+        let disasm = ctx.compiled_code().unwrap().vcode.as_ref().unwrap();
+        assert_eq!(disasm.matches("ldar").count(), 2, "{disasm}");
+        assert_eq!(disasm.matches("cbnz").count(), 2, "{disasm}");
     }
 
     #[test]
