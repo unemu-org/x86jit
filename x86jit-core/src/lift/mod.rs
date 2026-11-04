@@ -100,7 +100,8 @@ pub enum WriteTarget {
 pub enum LiftError {
     /// Decoded by iced, but the lift does not handle it yet.
     Unsupported { addr: u64, bytes: [u8; 15], len: u8 },
-    /// Could not decode (invalid encoding, unavailable bytes, or fetch from Trap).
+    /// Instruction fetch failed; `addr` is the first unavailable physical byte
+    /// (unmapped or Trap). Invalid opcodes lift to #UD; over-length instructions to #GP.
     DecodeFault { addr: u64 },
 }
 
@@ -167,37 +168,66 @@ fn decoder_options(mode: CpuMode) -> u32 {
     }
 }
 
-/// Real-mode `#UD` policy for an opcode iced could not decode (§17.6).
-///
-/// The distinction is exact and load-bearing — the 80286 oracle's gap list depends on
-/// it:
-///
-/// * **Architecturally invalid on the 286** — iced reports `is_invalid()` with
-///   `DecoderError::InvalidInstruction` *under the Real16 decoder options*
-///   (`NO_INVALID_CHECK`, which already tolerates the 286-legal-but-later-#UD forms like
-///   LOCK-on-register and `mov cs,r/m`). A genuine bad encoding here is a `#UD` the CPU
-///   raises in-guest (vector 6), delivered through the IVT exactly like `ud2`: this
-///   function emits that gate with the *faulting* instruction as the saved IP (a fault —
-///   `iret` re-runs it). Returns `true` so the caller terminates the block.
-///
-/// * **Decoded fine but the lifter has no arm for it** — that path never reaches here
-///   (iced decodes it, `lift_insn` returns `LiftError::Unsupported` → an
-///   `Exit::UnknownInstruction` naming the opcode to add). It must stay a real,
-///   reported gap; masking it as `#UD` would make the oracle lie.
-///
-/// * **`NoMoreBytes`** — the code fetch ran off the end of mapped memory, not a bad
-///   opcode. Returns `false`; the caller raises the usual execute-fault `DecodeFault`.
-///
-/// Long64/Compat32 never take this path (`mode.wraps_16()` is false and they decode
-/// strictly), so long-mode codegen is untouched.
-fn emit_real16_ud_if_invalid(
+/// iced reports both length exhaustion and a complete invalid 15-byte encoding as
+/// `InvalidInstruction`. Probe the first 15 bytes with length-neutral prefixes
+/// removed: needing more bytes still means the original exceeded the limit.
+/// Prefix formats: SDM Vol 2A §§2.1.1, 2.2.1; maximum length: §2.3.11.
+fn exceeds_length_limit(code: &[u8], mode: CpuMode) -> bool {
+    let prefix_len = code
+        .iter()
+        .take_while(|&&b| {
+            matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+            ) || (mode == CpuMode::Long64 && matches!(b, 0x40..=0x4f))
+        })
+        .count();
+    let mut probe = Vec::with_capacity(code.len());
+    for (i, &b) in code[..prefix_len].iter().enumerate() {
+        let later = &code[i + 1..prefix_len];
+        let keep = match b {
+            0x66 | 0x67 => !later.contains(&b),
+            0xf2 | 0xf3 => !later.iter().any(|b| matches!(b, 0xf2 | 0xf3)),
+            0x40..=0x4f => i + 1 == prefix_len,
+            _ => false, // LOCK and segment overrides do not change field lengths.
+        };
+        if keep {
+            probe.push(b);
+        }
+    }
+    probe.extend_from_slice(&code[prefix_len..]);
+    let mut decoder = Decoder::new(mode.bits(), &probe, decoder_options(mode));
+    let _ = decoder.decode();
+    decoder.last_error() == DecoderError::NoMoreBytes
+}
+
+/// SDM Vol 3A §7.15, Event 6; AMD APM Vol 2 §8.2.7: an invalid opcode
+/// raises #UD (vector 6), with saved IP on that instruction. Real16 delivers it
+/// through the IVT (§17.6); flat modes surface the existing exception exit.
+/// SDM Vol 3A §7.15, Event 13: exceeding 15 bytes raises #GP(0),
+/// with saved IP on that instruction. A decoded lifter gap remains `Unsupported`;
+/// missing bytes remain `DecodeFault`.
+fn emit_decode_exception(
     insn: &Instruction,
     last_error: DecoderError,
+    code: &[u8],
     mode: CpuMode,
     ops: &mut Vec<IrOp>,
 ) -> bool {
-    if mode.wraps_16() && last_error == DecoderError::InvalidInstruction {
-        push_real16_fault(insn, mode, 6, ops);
+    if last_error == DecoderError::InvalidInstruction {
+        let vector = if !mode.wraps_16() && insn.len() == 15 && exceeds_length_limit(code, mode) {
+            13
+        } else {
+            6
+        };
+        if mode.wraps_16() {
+            push_real16_fault(insn, mode, vector, ops);
+        } else {
+            ops.push(IrOp::InsnStart {
+                guest_addr: insn.ip(),
+            });
+            ops.push(IrOp::Trap { vector, advance: 0 });
+        }
         true
     } else {
         false
@@ -238,7 +268,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
     let start = at.ip;
     let code = mem
         .code_slice(at.pa, BLOCK_FETCH_WINDOW)
-        .map_err(|_| LiftError::DecodeFault { addr: start })?;
+        .map_err(|_| LiftError::DecodeFault { addr: at.pa })?;
     let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
 
     let mut ops = Vec::new();
@@ -250,23 +280,28 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
     while decoder.can_decode() {
         decoder.decode_out(&mut insn);
         if insn.is_invalid() {
-            // A fetch-window or region boundary can truncate the final instruction.
-            // Execute the complete prefix first, then retry at the incomplete
-            // instruction. A region-boundary retry faults at that instruction's
-            // start without fetching any bytes from the next region.
+            // Execute the complete prefix before retrying a truncated instruction
+            // with a fresh fetch window (or reporting its unavailable fetch byte).
             if decoder.last_error() == DecoderError::NoMoreBytes && guest_len > 0 {
                 break;
             }
-            // Real mode: a genuinely invalid encoding raises #UD in-guest (vector 6) — a
-            // deliberate CPU fault, not a lift gap. Appending the gate after any already-
-            // lifted valid prefix matches hardware: the prefix retires, then #UD faults on
-            // this instruction. See `emit_real16_ud_if_invalid` for the exact rule.
-            if emit_real16_ud_if_invalid(&insn, decoder.last_error(), mode, &mut ops) {
+            let offset = decoder.position() - insn.len();
+            if emit_decode_exception(
+                &insn,
+                decoder.last_error(),
+                &code[offset..decoder.position()],
+                mode,
+                &mut ops,
+            ) {
                 icount += 1;
                 guest_len += insn.len() as u32;
                 break;
             }
-            return Err(LiftError::DecodeFault { addr: insn.ip() });
+            // SDM Vol 3A §7.15, Event 14: CR2 names the unavailable byte,
+            // while saved IP stays on the instruction that attempted the fetch.
+            return Err(LiftError::DecodeFault {
+                addr: at.pa + code.len() as u64,
+            });
         }
         // 286 instruction-length limit: a valid but overlong (>10 byte) encoding raises
         // #GP in-guest before it executes (a prefix-padded encoding). #UD already won
@@ -277,14 +312,25 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
             guest_len += insn.len() as u32;
             break;
         }
-        icount += 1;
-        guest_len += insn.len() as u32;
+        let ops_start = ops.len();
         ops.push(IrOp::InsnStart {
             guest_addr: insn.ip(),
         });
 
-        let terminated = lift_insn(&insn, &mut ops, &mut tg, mode)
-            .map_err(|e| refill_unsupported_bytes(e, code, start))?;
+        let terminated = match lift_insn(&insn, &mut ops, &mut tg, mode) {
+            Ok(terminated) => terminated,
+            Err(e) => {
+                // Lowering can emit ops before discovering an unsupported operand.
+                // None may execute; dispatch retries this instruction after the prefix.
+                ops.truncate(ops_start);
+                if icount > 0 {
+                    break;
+                }
+                return Err(refill_unsupported_bytes(e, code, start));
+            }
+        };
+        icount += 1;
+        guest_len += insn.len() as u32;
         if terminated {
             break;
         }
@@ -308,20 +354,24 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     let start = at.ip;
     let code = mem
         .code_slice(at.pa, BLOCK_FETCH_WINDOW)
-        .map_err(|_| LiftError::DecodeFault { addr: start })?;
+        .map_err(|_| LiftError::DecodeFault { addr: at.pa })?;
     let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
 
     let mut ops = Vec::new();
     let mut tg = TempGen::new();
     let mut insn = Instruction::default();
     if !decoder.can_decode() {
-        return Err(LiftError::DecodeFault { addr: start });
+        return Err(LiftError::DecodeFault { addr: at.pa });
     }
     decoder.decode_out(&mut insn);
     if insn.is_invalid() {
-        // Real mode: a genuinely invalid encoding vectors #UD in-guest (like `ud2`); any
-        // other decode failure (bytes off the end of mapped code) stays an execute fault.
-        if emit_real16_ud_if_invalid(&insn, decoder.last_error(), mode, &mut ops) {
+        if emit_decode_exception(
+            &insn,
+            decoder.last_error(),
+            &code[..decoder.position()],
+            mode,
+            &mut ops,
+        ) {
             return Ok(IrBlock {
                 guest_start: start,
                 ops,
@@ -330,7 +380,9 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
                 icount: 1,
             });
         }
-        return Err(LiftError::DecodeFault { addr: insn.ip() });
+        return Err(LiftError::DecodeFault {
+            addr: at.pa + code.len() as u64,
+        });
     }
     // 286 instruction-length limit: a valid but overlong (>10 byte) encoding vectors #GP
     // in-guest before it executes (#UD above already handled an invalid opcode).
@@ -442,8 +494,7 @@ mod tests {
     /// The exact real-mode #UD rule (§17.6): an opcode iced *rejects* under the Real16
     /// decoder options is architecturally invalid on the 286 and vectors #UD (6) in-guest;
     /// an opcode iced *decodes* but the lifter has no arm for stays a real `Unsupported`
-    /// gap (→ `Exit::UnknownInstruction`), never masked as #UD. Long64/Compat32 keep
-    /// faulting a bad opcode as a `DecodeFault`, never a #UD gate.
+    /// gap (→ `Exit::UnknownInstruction`), never masked as #UD.
     #[test]
     fn real16_invalid_opcode_is_ud_not_gap() {
         // `les ax,ax` (C4 C0): a register source is illegal for `les` → iced-invalid →
@@ -455,10 +506,14 @@ mod tests {
             "invalid opcode → in-guest #UD gate, got {:?}",
             last_op(&ir),
         );
-        // The SAME bytes in Long64 are still a hard decode fault, never a #UD gate.
+        // SDM Vol 3A §7.15, Event 6: flat-mode invalid encodings also fault with #UD.
+        let ir = lift_one(&mem, FetchAddr::flat(BASE), CpuMode::Long64).expect("ud");
         assert!(matches!(
-            lift_one(&mem, FetchAddr::flat(BASE), CpuMode::Long64),
-            Err(LiftError::DecodeFault { .. })
+            last_op(&ir),
+            IrOp::Trap {
+                vector: 6,
+                advance: 0
+            }
         ));
 
         // A valid-decoding opcode the lifter does not implement must remain a reported gap.
@@ -709,7 +764,8 @@ pub fn lift_region(
                 blocks.insert(s, b);
                 dfs(mem, s, caps, mode, blocks, post, icount);
             }
-            // an unliftable successor simply stays an exit edge
+            // An unliftable first instruction stays an exit edge at `s`. A valid
+            // prefix is retained as a block, so it executes before that exit.
         }
         post.push(addr); // finished: post-order
     }

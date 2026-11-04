@@ -117,9 +117,9 @@ pub enum Exit {
     Hlt,
     /// Access to an unmapped address, or instruction fetch from a `RegionKind::Trap`
     /// region (`access: AccessKind::Execute`). Trap backing is never decoded.
-    /// For a Trap fetch, `addr` and RIP identify the attempted instruction's start
-    /// (the decode IP in Real16). An instruction straddling a region boundary also
-    /// exits with `Execute` at its start, without reading bytes from the next region.
+    /// For an execute fault, `addr` identifies the first unavailable fetch byte
+    /// (including a Trap boundary); RIP stays on the attempted instruction's start.
+    /// Fetch continues across adjacent mapped RAM/ROM regions.
     /// Earlier instructions have completed; the incomplete instruction has no effects.
     #[non_exhaustive]
     UnmappedMemory { addr: u64, access: AccessKind },
@@ -164,15 +164,19 @@ pub enum Exit {
         /// keep their indices. Scalar accesses have `total_size == size`, `part == 0`.
         part: u8,
     },
-    /// An instruction the lift does not yet support — tells you what to add next.
+    /// A decoded instruction the lift does not yet support. `addr` and RIP both
+    /// identify that instruction; earlier instructions have completed.
     #[non_exhaustive]
     UnknownInstruction { addr: u64, bytes: [u8; 15], len: u8 },
     /// A guest CPU exception, NOT a lift failure: `#DE` divide-by-zero, `#UD`
-    /// (`ud2`), `#BP` (`int3`), `#DB` (`int1`), etc. HLE maps these to
+    /// (`ud2` or an invalid encoding), `#BP` (`int3`), `#DB` (`int1`), etc. HLE maps these to
     /// SIGFPE/SIGILL/SIGTRAP. `vector` = x86 exception vector (§14 open decision).
     /// `addr` is the guest **saved RIP** — the x86 fault/trap convention: a fault
     /// (`#DE`/`#UD`) leaves it on the faulting instruction, a trap (`#BP`/`#DB`)
     /// resumes past it. It always equals the vcpu's RIP at exit.
+    /// Invalid opcodes produce vector 6; in Long64/Compat32, instructions exceeding
+    /// 15 bytes produce vector 13. Earlier instructions complete first
+    /// (SDM Vol 3A §7.15, Events 6 and 13; Vol 2A §2.3.11).
     #[non_exhaustive]
     Exception { addr: u64, vector: u8 },
     /// Guest executed a port-I/O instruction (`in`/`out`, §5.2) — the machine

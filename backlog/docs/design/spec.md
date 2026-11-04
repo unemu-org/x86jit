@@ -350,6 +350,11 @@ pub enum Exit {
     /// Invaluable during development: it tells you exactly what to add to the lift next.
     UnknownInstruction { addr: u64, bytes: [u8; 15], len: u8 },
 
+    /// A guest CPU exception. Invalid encodings raise #UD (vector 6); an instruction
+    /// longer than 15 bytes raises #GP(0) (vector 13). addr and RIP are on the
+    /// failing instruction after the valid prefix completes.
+    Exception { addr: u64, vector: u8 },
+
     /// Hit a breakpoint set by the user (debug).
     Breakpoint { addr: u64 },
 
@@ -362,6 +367,28 @@ pub enum Exit {
 
 pub enum AccessKind { Read, Write, Execute }
 ```
+
+**Decode and fetch exits.** In Long64 and Compat32, an architecturally invalid
+encoding produces `Exit::Exception { vector: 6, addr }` (#UD), with `addr` and the
+vcpu's RIP on that instruction (SDM Vol 3A §7.15, Event 6; AMD APM Vol 2 §8.2.7).
+An instruction that exceeds the 15-byte length limit (SDM Vol 2A §2.3.11) produces
+`Exit::Exception { vector: 13, addr }` (#GP(0), SDM Vol 3A §7.15, Event 13) when
+all 15 bytes are fetchable; if a byte inside the first 15 cannot be fetched, the
+fetch fault below is reported instead.
+A valid encoding the lifter does not support produces `Exit::UnknownInstruction`,
+also with `addr == RIP` on that instruction. Both preserve all completed earlier
+instructions and leave the failing instruction without effects. Real16 delivers
+invalid-opcode #UD through the guest IVT (§17.6).
+
+An instruction fetch that runs out of mapped bytes produces
+`Exit::UnmappedMemory { access: Execute, addr }`: `addr` is the first unavailable
+byte, while RIP stays on the instruction's start (SDM Vol 3A §7.15, Event 14,
+CR2 and Saved Instruction Pointer; AMD APM Vol 2 §8.2.15). Fetch continues across
+adjacent mapped RAM/ROM regions, but never reads Trap backing. A fetch starting
+in or crossing into Trap produces the same execute exit at the first Trap byte.
+These rules apply to block, region and single-instruction execution: an unliftable
+instruction ends the valid prefix, which executes before dispatch retries that
+instruction; any partial IR emitted for the unliftable instruction is discarded.
 
 > **Why MmioRead/MmioWrite are separated:** on an MMIO read, data flows FROM the user TO the guest (the guest wrote the address into the destination register and is waiting for a value); on a write — from the guest to the user. A single `value` field does not model both directions. A read additionally requires a mechanism for injecting the result:
 

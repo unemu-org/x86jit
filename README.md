@@ -247,12 +247,20 @@ Scalar loads/stores of 8 bytes or less and the existing MMIO constructors use
 `total_size == size` and `part == 0`.
 Both backends report the same metadata.
 
-Instruction fetch from a `RegionKind::Trap` region returns `Exit::UnmappedMemory`
-with `AccessKind::Execute`, even when the region is executable. Its `addr` and RIP
-identify the attempted instruction's start (the decode IP in Real16). An instruction
-straddling a region boundary faults at its start without reading bytes from the next
-region; earlier instructions complete first. Trap data reads and writes still use
-the MMIO exits and completion methods.
+Instruction fetch continues across adjacent mapped RAM/ROM regions. An unmapped
+byte or a `RegionKind::Trap` byte stops fetch, even when the Trap region is
+executable; Trap backing is never decoded. The resulting `Exit::UnmappedMemory`
+uses `AccessKind::Execute` and reports the first unavailable or first Trap byte
+as `addr`, while RIP stays on the attempted instruction's start. In Real16, `addr`
+is the physical fetch address and RIP is the instruction's IP offset within CS.
+Earlier instructions complete first; the faulting instruction has no effects.
+Trap data reads and writes use the MMIO exits and completion methods.
+
+In Long64 and Compat32, an invalid opcode raises `Exit::Exception` with vector 6
+(#UD); an instruction exceeding 15 bytes raises vector 13 (#GP). Both leave `addr`
+and RIP on the faulting instruction after earlier instructions complete (Intel SDM
+Vol 3A §7.15, Events 6 and 13; Vol 2A §2.3.11). A valid encoding the lifter does not
+handle returns `Exit::UnknownInstruction`.
 
 Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
 API, identical guest state. Runnable examples:

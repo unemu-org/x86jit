@@ -6974,9 +6974,18 @@ fn wrong_lifts_trap_rather_than_computing_something_else() {
         let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(InterpreterBackend));
         vm.map(CODE, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
         vm.write_bytes(CODE, &code).unwrap();
-        match lift_block(&vm.mem, FetchAddr::flat(CODE), CpuMode::Long64) {
-            Err(LiftError::Unsupported { .. }) => {}
-            other => panic!("{what} must trap, got {other:?}"),
+        // A block now ends before an unliftable instruction and runs its valid prefix
+        // (xj-obx.6), so follow the blocks to the instruction itself: lifting there
+        // must report Unsupported rather than produce IR.
+        let mut at = CODE;
+        loop {
+            match lift_block(&vm.mem, FetchAddr::flat(at), CpuMode::Long64) {
+                Err(LiftError::Unsupported { .. }) => break,
+                Ok(block) if block.guest_len > 0 && at < CODE + code.len() as u64 => {
+                    at += block.guest_len as u64;
+                }
+                other => panic!("{what} must trap, got {other:?}"),
+            }
         }
     };
 

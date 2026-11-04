@@ -28,12 +28,16 @@ fn assemble(origin: u64, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
 }
 
 fn assert_fetch_exit(vm: &Vm, cpu: &mut Vcpu, addr: u64) {
+    assert_fetch_exit_at(vm, cpu, addr, addr);
+}
+
+fn assert_fetch_exit_at(vm: &Vm, cpu: &mut Vcpu, addr: u64, rip: u64) {
     let exit = cpu.run(vm, Some(10));
     assert!(
         matches!(exit, Exit::UnmappedMemory { addr: a, access: AccessKind::Execute, .. } if a == addr),
         "expected execute fault at {addr:#x}, got {exit:?}"
     );
-    assert_eq!(cpu.reg(Reg::Rip), addr);
+    assert_eq!(cpu.reg(Reg::Rip), rip);
 }
 
 macro_rules! both_backends {
@@ -145,13 +149,13 @@ fn straddling_instruction(backend: Box<dyn Backend>) {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, start);
     cpu.set_reg(Reg::Rax, MARKER);
-    assert_fetch_exit(&vm, &mut cpu, fault);
+    assert_fetch_exit_at(&vm, &mut cpu, TRAP, fault);
     assert_eq!(cpu.reg(Reg::Rbx), MARKER);
     assert_eq!(vm.mem.read(0x3000, 8).unwrap(), MARKER);
     // SDM Vol 3A §7.5: a fault preserves the state before the faulting instruction.
     assert_eq!(cpu.reg(Reg::Rax), MARKER);
     // Re-entry must report the same incomplete instruction without changing state.
-    assert_fetch_exit(&vm, &mut cpu, fault);
+    assert_fetch_exit_at(&vm, &mut cpu, TRAP, fault);
     assert_eq!(cpu.reg(Reg::Rax), MARKER);
 }
 

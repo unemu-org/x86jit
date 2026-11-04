@@ -107,6 +107,7 @@ struct Capture {
     rflags: u64,
     fault_addr: u64,
     signal: libc::c_int,
+    si_code: libc::c_int,
     trapno: u64,
     error: u64,
     gpr: [u64; 16],
@@ -143,6 +144,12 @@ struct Capture {
 const CAP_NONE: u64 = 0;
 const CAP_HLT: u64 = 1;
 const CAP_FAULT: u64 = 2;
+
+// Linux uapi asm-generic/siginfo.h (oracles/linux-x86/siginfo.h).
+// libc does not export these si_code constants on Linux.
+const ILL_ILLOPN: libc::c_int = 2;
+const SEGV_MAPERR: libc::c_int = 1;
+const SEGV_ACCERR: libc::c_int = 2;
 
 /// A dedicated stack for the fault handler: the guest runs with its own `RSP` (0 in
 /// the fuzzer), so the kernel can't push the signal frame onto the guest stack.
@@ -194,6 +201,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         let is_hlt =
             sig == libc::SIGSEGV && si_code == libc::SI_KERNEL && *(rip as *const u8) == 0xf4;
         cap.signal = sig;
+        cap.si_code = si_code;
         cap.trapno = gregs[libc::REG_TRAPNO as usize] as u64;
         cap.error = gregs[libc::REG_ERR as usize] as u64;
         cap.fault_addr = (*info).si_addr() as u64;
@@ -470,6 +478,8 @@ pub fn run_native(input: &VectorInput) -> Option<RunOutcome> {
 pub enum NativeFault {
     PageFault { addr: u64 },
     DivideError,
+    InvalidOpcode,
+    GeneralProtection,
 }
 
 /// Capture a designated fault's full register file, with RIP at the faulting
@@ -691,7 +701,10 @@ fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<R
     } else if cap.status == CAP_FAULT {
         match fault {
             Some(NativeFault::PageFault { addr })
-                if cap.signal == libc::SIGSEGV && cap.trapno == 14 && cap.fault_addr == addr =>
+                if cap.signal == libc::SIGSEGV
+                    && matches!(cap.si_code, SEGV_MAPERR | SEGV_ACCERR)
+                    && cap.trapno == 14
+                    && cap.fault_addr == addr =>
             {
                 // SDM Vol 3A §7.15, #PF error code: I/D=bit 4, W/R=bit 1.
                 let access = if cap.error & 16 != 0 {
@@ -707,6 +720,27 @@ fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<R
                 Some(ExitKind::Exception {
                     addr: cap.rip,
                     vector: 0,
+                })
+            }
+            // SDM Vol 3A §7.15, Event 6; AMD APM Vol 2 §8.2.7.
+            Some(NativeFault::InvalidOpcode)
+                if cap.signal == libc::SIGILL && cap.si_code == ILL_ILLOPN && cap.trapno == 6 =>
+            {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 6,
+                })
+            }
+            // SDM Vol 3A §7.15, Event 13: #GP(0) is a restartable fault.
+            Some(NativeFault::GeneralProtection)
+                if cap.signal == libc::SIGSEGV
+                    && cap.si_code == libc::SI_KERNEL
+                    && cap.trapno == 13
+                    && cap.error == 0 =>
+            {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 13,
                 })
             }
             _ => None,

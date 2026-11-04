@@ -11,8 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::{Code, CpuidFeature, Encoder, Instruction, OpCodeOperandKind, OpKind, Register};
+use iced_x86::{
+    Code, CpuidFeature, Encoder, FlowControl, Instruction, OpCodeOperandKind, OpKind, Register,
+};
 use serde::{Deserialize, Serialize};
+use x86jit_core::ir::IrOp;
 use x86jit_core::lift::{lift_block, CpuMode, FetchAddr, LiftError};
 use x86jit_core::{Memory, MemoryModel, Prot, RegionKind};
 
@@ -96,12 +99,12 @@ fn code_gen(code: Code) -> Option<Gen> {
 /// Result of probing one instruction form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Probe {
-    /// The lifter produced IR for it.
+    /// The lifter produced IR covering the complete instruction.
     Lifted,
-    /// The lifter returned `Unsupported` — a real gap.
+    /// The lifter returned `Unsupported` at the start of the probe — a real gap.
     Unsupported,
-    /// We couldn't synthesize/encode a canonical form (exotic operand kind); not
-    /// counted for/against coverage, but logged so the scope is honest.
+    /// No complete probe result: synthesis/encoding failed, decoding faulted, or
+    /// lifting stopped partway through the form. Not counted for/against coverage.
     Unencodable,
     /// The register form lifts and the memory form does not.
     ///
@@ -179,9 +182,13 @@ fn probe_form(code: Code, op_count: u32, mode: CpuMode, mem_at: Option<u32>) -> 
         return Some(Probe::Unencodable);
     }
 
+    probe_encoded(code, &bytes, mode)
+}
+
+fn probe_encoded(code: Code, bytes: &[u8], mode: CpuMode) -> Option<Probe> {
     // Append a `ret` (0xC3) so a non-terminator probe instruction still closes the
     // block; a terminator probe (jmp/ret/…) ends it itself.
-    let mut prog = bytes.clone();
+    let mut prog = bytes.to_vec();
     prog.push(0xC3);
     let mut mem = Memory::new(MemoryModel::Flat { size: 0x4000 });
     // write_bytes needs a mapped region (it bypasses guest Prot but the region must
@@ -193,7 +200,29 @@ fn probe_form(code: Code, op_count: u32, mode: CpuMode, mem_at: Option<u32>) -> 
         return Some(Probe::Unencodable);
     }
     match lift_block(&mem, FetchAddr::flat(SCRATCH_BASE), mode) {
-        Ok(_) => Some(Probe::Lifted),
+        Ok(block) => {
+            // A waiting x87 form can lift FWAIT alone and stop before its remainder.
+            // Decode-failure IR also returns Ok, but does not implement the probed form.
+            // Instructions whose purpose is an exception (e.g. UD2 or INT) still count.
+            let intentional_exception = matches!(
+                code.flow_control(),
+                FlowControl::Exception | FlowControl::Interrupt
+            );
+            let decode_exception = !intentional_exception
+                && block.ops.iter().any(|op| {
+                    matches!(
+                        op,
+                        IrOp::Trap { vector: 6 | 13, .. } | IrOp::IntGate { vector: 6 | 13, .. }
+                    )
+                });
+            if block.guest_len < bytes.len() as u32 || decode_exception {
+                // Preserve the inconclusive classification of the corresponding
+                // decode error or unsupported instruction past the probe's start.
+                Some(Probe::Unencodable)
+            } else {
+                Some(Probe::Lifted)
+            }
+        }
         Err(LiftError::Unsupported { addr, .. }) if addr == SCRATCH_BASE => {
             Some(Probe::Unsupported)
         }
@@ -648,4 +677,90 @@ pub fn cpuid_waiver_path() -> std::path::PathBuf {
 pub fn cpuid_waivers() -> Vec<(String, String)> {
     let text = std::fs::read_to_string(cpuid_waiver_path()).expect("read cpuid-waivers.ron");
     ron::from_str(&text).expect("parse cpuid-waivers.ron")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_requires_complete_fwait_prefixed_instruction() {
+        for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+            for code in [
+                Code::Fdisi,
+                Code::Feni,
+                Code::Fsave_m94byte,
+                Code::Fsave_m108byte,
+                Code::Fsetpm,
+                Code::Fstenv_m14byte,
+            ] {
+                assert_eq!(
+                    probe_code_in(code, mode),
+                    Some(Probe::Unencodable),
+                    "{mode:?}: {code:?} must not receive credit for lifting only FWAIT"
+                );
+            }
+            // A waiting form whose remainder lifts still counts as complete.
+            assert_eq!(
+                probe_code_in(Code::Fstenv_m28byte, mode),
+                Some(Probe::Lifted),
+                "{mode:?}: supported waiting form"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_preserves_intentional_exceptions() {
+        for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+            for code in [Code::Ud2, Code::Int1, Code::Int3, Code::Int_imm8] {
+                assert_eq!(
+                    probe_code_in(code, mode),
+                    Some(Probe::Lifted),
+                    "{mode:?}: {code:?}"
+                );
+            }
+            for vector in [6, 13] {
+                assert_eq!(
+                    probe_encoded(Code::Int_imm8, &[0xcd, vector], mode),
+                    Some(Probe::Lifted),
+                    "{mode:?}: INT {vector}"
+                );
+            }
+        }
+        assert_eq!(
+            probe_code_in(Code::Into, CpuMode::Real16),
+            Some(Probe::Lifted)
+        );
+    }
+
+    #[test]
+    fn probe_rejects_invalid_encoding_trap() {
+        // SDM Vol 3A §7.15, Event 6: invalid encodings raise #UD.
+        for (mode, bytes) in [
+            (CpuMode::Long64, [0xf0, 0x90]),
+            (CpuMode::Compat32, [0xf0, 0x90]),
+            (CpuMode::Real16, [0xc4, 0xc0]),
+        ] {
+            assert_eq!(
+                probe_encoded(Code::Nopd, &bytes, mode),
+                Some(Probe::Unencodable),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_rejects_overlength_trap() {
+        // SDM Vol 3A §7.15, Event 13: exceeding 15 bytes raises #GP(0).
+        // The appended RET would be byte 16: the fault block covers every
+        // probed byte, so the byte-length check alone cannot reject it.
+        let overlong = [0x66; 15];
+        for mode in [CpuMode::Long64, CpuMode::Compat32] {
+            assert_eq!(
+                probe_encoded(Code::Nopd, &overlong, mode),
+                Some(Probe::Unencodable),
+                "{mode:?}"
+            );
+        }
+    }
 }
