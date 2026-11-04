@@ -184,6 +184,13 @@ Replace struct literals with the stable constructors
 `Exit::exception(addr, vector)` and `Exit::port_io(port, size, dir, value)`;
 fields added later receive defaults through these constructors.
 
+Instruction fetch from a `RegionKind::Trap` region returns `Exit::UnmappedMemory`
+with `AccessKind::Execute`, even when the region is executable. Its `addr` and RIP
+identify the attempted instruction's start (the decode IP in Real16). An instruction
+straddling a region boundary faults at its start without reading bytes from the next
+region; earlier instructions complete first. Trap data reads and writes still use
+the MMIO exits and completion methods.
+
 Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
 API, identical guest state. Runnable examples:
 

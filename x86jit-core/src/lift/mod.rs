@@ -100,7 +100,7 @@ pub enum WriteTarget {
 pub enum LiftError {
     /// Decoded by iced, but the lift does not handle it yet.
     Unsupported { addr: u64, bytes: [u8; 15], len: u8 },
-    /// Could not even decode (garbage / bytes outside mapped memory).
+    /// Could not decode (invalid encoding, unavailable bytes, or fetch from Trap).
     DecodeFault { addr: u64 },
 }
 
@@ -250,18 +250,11 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
     while decoder.can_decode() {
         decoder.decode_out(&mut insn);
         if insn.is_invalid() {
-            // A straight-line block longer than the fetch window truncates its final
-            // instruction at the window boundary: iced reports `NoMoreBytes`. When the
-            // region still has code past the window (we capped at `CODE_WINDOW`, not the
-            // region end, so the slice is full), end the block cleanly at the last
-            // complete instruction and fall through — the dispatcher lifts the
-            // continuation at `insn.ip()`. Only a genuine bad opcode, or truncation at
-            // the true end of mapped code (a short slice), is a real fault. (Go's bignum
-            // crypto, e.g. `p521Square`, has >4 KiB branchless stretches — go-caddy.)
-            if decoder.last_error() == DecoderError::NoMoreBytes
-                && code.len() == BLOCK_FETCH_WINDOW
-                && guest_len > 0
-            {
+            // A fetch-window or region boundary can truncate the final instruction.
+            // Execute the complete prefix first, then retry at the incomplete
+            // instruction. A region-boundary retry faults at that instruction's
+            // start without fetching any bytes from the next region.
+            if decoder.last_error() == DecoderError::NoMoreBytes && guest_len > 0 {
                 break;
             }
             // Real mode: a genuinely invalid encoding raises #UD in-guest (vector 6) — a

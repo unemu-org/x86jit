@@ -243,7 +243,8 @@ pub enum Prot {
 pub enum RegionKind {
     /// Ordinary RAM. Access is inlined into generated code — no trap-out.
     Ram,
-    /// Trapped region: every access yields `Exit::MmioRead`/`MmioWrite`.
+    /// Trapped region: data accesses yield `Exit::MmioRead`/`MmioWrite`;
+    /// instruction fetch yields `Exit::UnmappedMemory` with `AccessKind::Execute`.
     Trap,
     /// Read-only executable memory (a masked BIOS/option ROM mapped at, e.g.,
     /// physical `0xF0000`). Reads and instruction fetches behave EXACTLY like
@@ -1296,13 +1297,17 @@ impl Memory {
     /// Scalar `read` can't feed a decoder — it needs a byte slice. Returns up to
     /// `max_len` bytes from `addr`, capped at the containing region's end (a block
     /// that runs off the region simply re-lifts from the next one). `Unmapped` if
-    /// `addr` isn't inside a mapped region.
+    /// `addr` isn't inside a mapped region. `Trap` regions return `Mmio` without
+    /// exposing backing bytes; the lift maps this to an execute fault.
     pub fn code_slice(&self, addr: u64, max_len: usize) -> Result<&[u8], MemTrap> {
         let region = self
             .regions
             .iter()
             .find(|r| r.start <= addr && addr < r.start + r.size as u64)
             .ok_or(MemTrap::Unmapped)?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(MemTrap::Mmio);
+        }
         let region_end = region.start + region.size as u64;
         let end = addr.saturating_add(max_len as u64).min(region_end);
         // SAFETY: read-only view; `[addr, end)` lies inside a mapped region, hence

@@ -102,7 +102,12 @@ pub enum Exit {
     Syscall,
     /// Guest executed `hlt`.
     Hlt,
-    /// Access to an unmapped address.
+    /// Access to an unmapped address, or instruction fetch from a `RegionKind::Trap`
+    /// region (`access: AccessKind::Execute`). Trap backing is never decoded.
+    /// For a Trap fetch, `addr` and RIP identify the attempted instruction's start
+    /// (the decode IP in Real16). An instruction straddling a region boundary also
+    /// exits with `Execute` at its start, without reading bytes from the next region.
+    /// Earlier instructions have completed; the incomplete instruction has no effects.
     #[non_exhaustive]
     UnmappedMemory { addr: u64, access: AccessKind },
     /// READ from a Trap region (MMIO). Guest waits; user must call
