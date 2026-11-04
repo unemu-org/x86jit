@@ -127,8 +127,8 @@ rediscovering state from the diff.
 ## History
 
 Backlog.md was the tracker until 2026-11-04. Its Done history stays read-only under
-`backlog/completed/`; `backlog/archive/` stays empty until `xj-stf` archives the migrated task
-files. Every migrated bead carries its old id as
+`backlog/completed/`; the 61 task files migrated to beads are archived under
+`backlog/archive/tasks/`. Every migrated bead carries its old id as
 `external_ref` (`backlog:TASK-NNN`) and its old file name and dates in `metadata`. Text that
 mentions `TASK-NNN` resolves through `bd list --external-ref backlog:TASK-NNN` (exact, upper case;
 `--external-contains task-nnn` ignores case). No bead means the task was Done before the migration:
@@ -146,5 +146,5 @@ What the migration did, so it can be checked:
   added afterwards: `xj-obx.4` waits for `xj-i2n.7` and `xj-i2n.8`, `xj-pi7.3` for `xj-562.1`.
 - The per-task Definition of Done, identical on every task, moved to § Definition of Done above.
 - The ten Done tasks still in `backlog/tasks` moved to `backlog/completed`, not imported.
-- The migrated files stay in `backlog/tasks` as a fallback until the maintainer has checked the
-  migration; archiving them is `xj-stf`.
+- After the maintainer checked the migration, the migrated files moved to `backlog/archive/tasks/`
+  (`xj-stf`).

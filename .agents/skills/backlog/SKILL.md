@@ -23,8 +23,9 @@ beads (`bd`), and `backlog/completed/` + `backlog/archive/` are read-only Done h
 ```text
 backlog/
   config.yml            # project_name, task_prefix, … (task fields are historical)
-  tasks/                # migrated to beads; kept until the maintainer archives them
-  completed/  archive/  # read-only Done history of the old task board
+  tasks/                # empty: open work is in beads
+  completed/            # read-only Done history of the old task board
+  archive/tasks/        # the 61 task files migrated to beads on 2026-11-04 (source of record)
   docs/                 # guides & reference — backlog doc create → doc-N - Title.md
   decisions/            # architecture/tech records — backlog decision create → decision-N - Title.md
 ```
