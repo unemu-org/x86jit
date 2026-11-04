@@ -7,6 +7,91 @@ use x86jit_cranelift::JitBackend;
 const CODE: u64 = 0x1000;
 const MMIO: u64 = 0x4000;
 
+// SDM Vol 2B, MOVUPS, Description and Operation (VEX.128): unaligned 128-bit
+// moves. The exit contract (§5.2) exposes whole operands in 8-byte slots.
+fn page_crossing_movups(backend: Box<dyn Backend>, unaligned: bool, store: bool) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
+    vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.map(MMIO, 0x2000, Prot::RW, RegionKind::Trap).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    if store {
+        a.vmovups(xmmword_ptr(rax), xmm0).unwrap();
+    } else {
+        a.vmovups(xmm0, xmmword_ptr(rax)).unwrap();
+    }
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    let at = MMIO + 0x1000 - if unaligned { 4 } else { 8 };
+    let value = 0x1122334455667788_99aabbccddeeff00u128;
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rax, at);
+    cpu.set_xmm(0, value);
+    cpu.set_ymm_hi(0, u128::MAX);
+    // Repeat at the same RIP to check that completed answers are discarded.
+    for _ in 0..2 {
+        cpu.set_reg(Reg::Rip, CODE);
+        let initial = cpu.xmm(0);
+        for part in 0..2 {
+            let exit = cpu.run(&vm, None);
+            let expected = (at + part * 8, 8, 16, part as u8);
+            match exit {
+                Exit::MmioRead {
+                    addr,
+                    size,
+                    total_size,
+                    part,
+                    ..
+                } if !store => {
+                    assert_eq!((addr, size, total_size, part), expected);
+                    assert_eq!(cpu.xmm(0), initial, "no partial load destination");
+                    cpu.complete_mmio_read((value >> (part * 64)) as u64);
+                }
+                Exit::MmioWrite {
+                    addr,
+                    size,
+                    total_size,
+                    part,
+                    value: written,
+                    ..
+                } if store => {
+                    assert_eq!((addr, size, total_size, part), expected);
+                    assert_eq!(written, (value >> (part * 64)) as u64);
+                    cpu.complete_mmio_write();
+                }
+                other => panic!("unexpected exit: {other:?}"),
+            }
+            assert_eq!(cpu.reg(Reg::Rip), CODE);
+        }
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        assert_eq!(cpu.xmm(0), value);
+        if !store {
+            assert_eq!(cpu.ymm_hi(0), 0);
+        }
+    }
+}
+
+macro_rules! page_crossing_movups_tests {
+    ($($name:ident: ($backend:expr, $unaligned:expr, $store:expr)),* $(,)?) => {$(
+        #[test]
+        fn $name() {
+            page_crossing_movups(Box::new($backend), $unaligned, $store);
+        }
+    )*};
+}
+
+page_crossing_movups_tests! {
+    page_crossing_movups_aligned_load_interp: (InterpreterBackend, false, false),
+    page_crossing_movups_aligned_load_jit: (JitBackend::new(), false, false),
+    page_crossing_movups_unaligned_load_interp: (InterpreterBackend, true, false),
+    page_crossing_movups_unaligned_load_jit: (JitBackend::new(), true, false),
+    page_crossing_movups_aligned_store_interp: (InterpreterBackend, false, true),
+    page_crossing_movups_aligned_store_jit: (JitBackend::new(), false, true),
+    page_crossing_movups_unaligned_store_interp: (InterpreterBackend, true, true),
+    page_crossing_movups_unaligned_store_jit: (JitBackend::new(), true, true),
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Case {
     MaskedLoad,

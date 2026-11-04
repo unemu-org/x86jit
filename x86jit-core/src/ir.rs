@@ -477,6 +477,15 @@ pub enum IrOp {
         imm: u8,
         bytes: u16,
     },
+    /// Word blend with a by-value memory source; no destination staging.
+    /// SDM Vol 2B, PBLENDW: m128/m256 for VEX.128/256.
+    VBlendWM {
+        dst: u8,
+        a: u8,
+        addr: Val,
+        imm: u8,
+        bytes: u16,
+    },
     /// `vpblendd` — per-dword immediate blend over `bytes` (16/32): dword `i` is taken
     /// from `b` when `imm8[i]` is set, else from `a`. VEX form clears bits
     /// above `bytes`.
@@ -747,6 +756,13 @@ pub enum IrOp {
         imm: u8,
         high: bool,
         bytes: u16,
+    },
+    /// Memory-source word shuffle. SDM Vol 2B, PSHUFHW/PSHUFLW: m128.
+    VShuffle16M {
+        dst: u8,
+        addr: Val,
+        imm: u8,
+        high: bool,
     },
     // shufps: dst lanes 0,1 selected from `a`'s 32-bit lanes, lanes 2,3 from `b`'s,
     // per the imm8 (2 bits each).
@@ -1450,6 +1466,16 @@ pub enum IrOp {
         zeroing: bool,
         bytes: u16,
     },
+    /// Legacy uniform packed shift. SDM Vol 2B, PSLLW/PSLLD/PSLLQ,
+    /// PSRLW/PSRLD/PSRLQ and PSRAW/PSRAD: the count operand is m128,
+    /// even though only its low 64 bits determine the count.
+    VShiftRegM {
+        dst: u8,
+        addr: Val,
+        elem: u8,
+        right: bool,
+        arith: bool,
+    },
     /// AVX2/AVX-512 per-element **variable** shift `vp{sll,srl,sra}v{w,d,q}`:
     /// each `elem`-byte lane of `a` is shifted by the count in the corresponding lane of
     /// `count` (unlike the imm/xmm-count shifts, the count is NOT reduced modulo the lane
@@ -1899,6 +1925,11 @@ pub enum IrOp {
         b: u8,
         w256: bool,
     },
+    /// Flags-only legacy test. SDM Vol 2B, PTEST: m128.
+    VPtestM {
+        a: u8,
+        addr: Val,
+    },
     /// AVX `vtestps`/`vtestpd`: like [`VPtest`] but tests only each element's
     /// **sign bit** (MSB of the `elem`-byte float lane). `ZF = (a & b & signmask == 0)`,
     /// `CF = (b & !a & signmask == 0)`; OF/SF/AF/PF cleared. `a` = op0, `b` = op1.
@@ -2088,6 +2119,15 @@ pub enum IrOp {
         dst: u8,
         a: u8,
         b: u8,
+        imm: u8,
+        bytes: u16,
+    },
+    /// Sum of absolute differences with a by-value memory source.
+    /// SDM Vol 2B, MPSADBW: m128/m256 for VEX.128/256.
+    VMpsadbwM {
+        dst: u8,
+        a: u8,
+        addr: Val,
         imm: u8,
         bytes: u16,
     },

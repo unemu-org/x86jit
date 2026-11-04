@@ -420,6 +420,25 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
     };
     let km =
         x86jit_core::interp::vec_msb_mask(&cpu.vec_lanes(mask as usize), elem as u8, bytes as u16);
+    // §16 commit-last: validate all selected stores before the shared writer.
+    // SDM Vol 2C, VPMASKMOV: masked-off elements do not access memory.
+    if is_store != 0 {
+        for i in 0..bytes / elem {
+            if km & (1 << i) != 0 {
+                let ea = addr.wrapping_add(i * elem);
+                if ea < raw.guest_base || ea.checked_add(elem).map_or(true, |end| end > raw.size) {
+                    cpu.rip = cur_addr;
+                    ctx.fault_addr = if ea >= raw.guest_base && ea < raw.size {
+                        raw.size
+                    } else {
+                        ea
+                    };
+                    ctx.fault_access = 1;
+                    return RET_UNMAPPED;
+                }
+            }
+        }
+    }
     let fault = if is_store != 0 {
         x86jit_core::interp::masked_store_run(
             cpu,
@@ -1473,17 +1492,32 @@ unsafe extern "C" fn phminposuw_helper(cpu: *mut u8, dst: u64, src: u64) {
 }
 
 /// SSE4.1 `mpsadbw`/`vmpsadbw` helper: per 128-bit lane via the shared `mpsadbw`
-/// so JIT == interp. `bytes` = 16 (xmm) or 32 (ymm); imm[5:3] controls the high lane.
+/// so JIT == interp. The source value is loaded before any destination is written.
+/// `half` selects the destination lane; the caller selects that lane's immediate bits.
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn mpsadbw_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, imm: u64, bytes: u64) {
+unsafe extern "C" fn mpsadbw_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    lo: u64,
+    hi: u64,
+    imm: u64,
+    half: u64,
+) {
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
-    let (a, b, imm) = (a as usize, b as usize, imm as u8);
-    cpu.xmm[dst as usize] = x86jit_core::interp::mpsadbw(cpu.xmm[a], cpu.xmm[b], imm);
-    if bytes as u16 == 32 {
-        cpu.ymm_hi[dst as usize] =
-            x86jit_core::interp::mpsadbw(cpu.ymm_hi[a], cpu.ymm_hi[b], (imm >> 3) & 0x7);
+    let b = lo as u128 | ((hi as u128) << 64);
+    let av = if half == 0 {
+        cpu.xmm[a as usize]
+    } else {
+        cpu.ymm_hi[a as usize]
+    };
+    let r = x86jit_core::interp::mpsadbw(av, b, imm as u8);
+    if half == 0 {
+        cpu.xmm[dst as usize] = r;
+    } else {
+        cpu.ymm_hi[dst as usize] = r;
     }
 }
 
@@ -2612,7 +2646,7 @@ impl Shared {
         let cvtph2ps_sig = params(4, false); // (cpu, dst, src, lanes) -> ()
         let cvtps2ph_sig = params(5, false); // (cpu, dst, src, lanes, rc) -> ()
         let phminposuw_sig = params(3, false); // (cpu, dst, src) -> ()
-        let mpsadbw_sig = params(6, false); // (cpu, dst, a, b, imm, bytes) -> ()
+        let mpsadbw_sig = params(7, false); // (cpu, dst, a, lo, hi, imm, half) -> ()
         let pmaddwd_sig = params(4, false); // (cpu, dst, a, b) -> ()
         let fma_sig = params(14, false); // (cpu, dst, x, y, z, prec_f64, scalar, neg_prod, neg_add, bytes, alt_sign, k, masked, zeroing) -> ()
         let fma_mem_sig = params(18, true); // (cpu, mem, dst, x, y, z, base, mem_role, prec_f64, scalar, neg_prod, neg_add, bytes, alt_sign, cur_addr, k, masked, zeroing) -> ret

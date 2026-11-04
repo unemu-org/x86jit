@@ -838,13 +838,9 @@ fn int1_raises_db() {
 
 #[test]
 fn unknown_instruction_reports_real_bytes() {
-    // An unlifted instruction (`vpmaskmovd`, the AVX2 integer register-mask conditional
-    // move we deliberately do not lift) must surface its actual opcode bytes in the lift
-    // error, not 15 zeros — so compat triage isn't misdirected. `ptest`, `pcmpistri`,
-    // `dpps`, `mpsadbw` and `pmaddubsw` used to sit here but are now lifted, as are the
-    // float `vmaskmovps/pd`; the integer `vpmaskmovd/q` are not.
+    // An unsupported memory form must preserve the real opcode in lift errors.
     let mut asm = CodeAssembler::new(64).unwrap();
-    asm.vpmaskmovd(xmm0, xmm1, xmmword_ptr(rax)).unwrap();
+    asm.vpermd(ymm0, ymm1, ymmword_ptr(rax)).unwrap();
     let code = asm.assemble(CODE).unwrap();
 
     let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(InterpreterBackend));
@@ -857,7 +853,7 @@ fn unknown_instruction_reports_real_bytes() {
             assert_eq!(
                 &bytes[..len as usize],
                 &code[..len as usize],
-                "reported bytes must be the real vpmaskmovd opcode"
+                "reported bytes must be the real vpermd opcode"
             );
         }
         other => panic!("expected Unsupported, got {other:?}"),
@@ -7036,21 +7032,12 @@ fn wrong_lifts_trap_rather_than_computing_something_else() {
         "masked vmovsd load",
     );
 
-    // `vpblendw dst, dst, [mem], imm8`. The memory form loads the operand
-    // through `dst` and then blends `src1` against it — sound only while `dst` is not
-    // also `src1`. Aliased, the load overwrote src1 first, so the words the immediate
-    // selects from the *register* came back out of the memory operand. `lift_vmpsadbw`
-    // guards the identical trick with `d != a`; this one did not until
-    // `cargo xfuzz --mem --seed 3130` produced a wrong result with no trap.
-    trapped(
-        &|a| {
-            a.mov(rax, 0x1000u64).unwrap();
-            a.vpblendw(xmm0, xmm0, xmmword_ptr(rax), 0xd9).unwrap();
-        },
-        "vpblendw with dst aliasing src1 and a memory src2",
-    );
-    // The non-aliased form must still lift — a guard that rejected both would "fix" this
-    // by removing the instruction.
+    // `vpblendw dst, dst, [mem], imm8` used to load the operand through `dst` and so had
+    // to be rejected when `dst` aliased `src1` (`cargo xfuzz --mem --seed 3130` once
+    // produced a wrong result with no trap). Since xj-6vd.6 the memory operand is loaded
+    // first and passed by value, so the aliased form lifts and computes correctly; its
+    // correctness witness is `aliased_vpblendw_vmpsadbw_memory_match_register_and_interpreter`
+    // in sse_memory_forms.rs. The non-aliased form must of course still lift.
     {
         let mut asm = CodeAssembler::new(64).unwrap();
         asm.mov(rax, 0x1000u64).unwrap();

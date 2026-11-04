@@ -226,6 +226,24 @@ pub(crate) fn exec_v_vecmask_store_mem(
 ) -> Option<StepResult> {
     let base = read_val(*addr, &*temps);
     let km = vec_msb_mask(&cpu.vec_lanes(*mask as usize), *elem, *bytes);
+    // §16 commit-last: preflight every selected RAM destination before storing.
+    // SDM Vol 2C, VPMASKMOV: an inactive element must not be accessed.
+    for i in 0..(*bytes as usize / *elem as usize) {
+        if km & (1 << i) != 0 {
+            let ea = base.wrapping_add((i * *elem as usize) as u64);
+            if let Err(MemTrap::Unmapped) = mem.probe_write(ea, *elem) {
+                let fault = (0..*elem)
+                    .map(|j| ea.wrapping_add(u64::from(j)))
+                    .find(|&at| matches!(mem.probe_write(at, 1), Err(MemTrap::Unmapped)))
+                    .unwrap_or(ea);
+                cpu.rip = cur_addr;
+                return Some(StepResult::Exit(Exit::UnmappedMemory {
+                    addr: fault,
+                    access: AccessKind::Write,
+                }));
+            }
+        }
+    }
     if let Some(f) = masked_store_run(cpu, mem, *src, base, km, *elem, *bytes, cur_addr) {
         return Some(StepResult::Exit(vec_fault_exit(f, base, *bytes)));
     }
@@ -1667,20 +1685,28 @@ pub(crate) fn exec_v_blend_w(
     imm: &u8,
     bytes: &u16,
 ) -> Option<StepResult> {
-    // Per 128-bit lane the same imm8 selects each of the 8 words from `b` (bit set) or `a`.
     let av = cpu.vec_lanes(*a as usize);
     let bv = cpu.vec_lanes(*b as usize);
+    blend_w_value(cpu, *dst, av, bv, *imm, *bytes);
+    None
+}
+
+pub(super) fn blend_w_value(
+    cpu: &mut CpuState,
+    dst: u8,
+    av: [u128; 4],
+    bv: [u128; 4],
+    imm: u8,
+    bytes: u16,
+) {
     let mut r = [0u128; 4];
-    for c in 0..(*bytes as usize / 16) {
-        let mut lane = 0u128;
+    for c in 0..(bytes as usize / 16) {
         for i in 0..8u32 {
             let src = if (imm >> i) & 1 != 0 { bv[c] } else { av[c] };
-            lane |= ((src >> (i * 16)) & 0xffff) << (i * 16);
+            r[c] |= ((src >> (i * 16)) & 0xffff) << (i * 16);
         }
-        r[c] = lane;
     }
-    cpu.set_vec_low(*dst as usize, r, *bytes); // SSE preserves upper; VEX.128 zeroes via VZeroUpper
-    None
+    cpu.set_vec_low(dst as usize, r, bytes);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2821,13 +2847,17 @@ pub(crate) fn exec_v_ptest(cpu: &mut CpuState, a: &u8, b: &u8, w256: &bool) -> O
     } else {
         (0, 0)
     };
+    ptest_value(cpu, alo, blo, ahi, bhi);
+    None
+}
+
+pub(super) fn ptest_value(cpu: &mut CpuState, alo: u128, blo: u128, ahi: u128, bhi: u128) {
     cpu.flags.zf = (blo & alo) == 0 && (bhi & ahi) == 0;
     cpu.flags.cf = (blo & !alo) == 0 && (bhi & !ahi) == 0;
     cpu.flags.of = false;
     cpu.flags.sf = false;
     cpu.flags.set_af(false);
     cpu.flags.set_pf(false);
-    None
 }
 
 /// Sign-bit mask for `vtestps`/`vtestpd`: MSB set in each `elem`-byte lane over 128 bits.
@@ -3322,7 +3352,7 @@ pub(crate) fn exec_v_shuffle16(
 
 /// `pshuflw`/`pshufhw` on one 128-bit lane: shuffle the low (`high`=false) or high
 /// (`high`=true) 4 words per imm8, copying the other 64-bit half unchanged.
-fn shuffle16_128(v: u128, imm: u8, high: bool) -> u128 {
+pub(super) fn shuffle16_128(v: u128, imm: u8, high: bool) -> u128 {
     let base = if high { 4u32 } else { 0 };
     let keep = if high {
         v & 0xffff_ffff_ffff_ffffu128 // preserve low 64

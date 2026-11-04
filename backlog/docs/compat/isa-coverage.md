@@ -18,9 +18,9 @@ created_date: '2026-07-06 11:25'
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 59 | 2% | 0 |
-| x86-64-v1 | 546 | 16 | 116 | 82% | 146 |
-| x86-64-v2 | 86 | 4 | 27 | 76% | 0 |
-| x86-64-v3 | 594 | 73 | 10 | 98% | 17 |
+| x86-64-v1 | 562 | 0 | 116 | 83% | 146 |
+| x86-64-v2 | 90 | 0 | 27 | 77% | 0 |
+| x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
 | x87 | 102 | 0 | 52 | 66% | 6 |
 
@@ -31,9 +31,9 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 57 | 2% | 0 |
-| x86-64-v1 | 531 | 16 | 135 | 80% | 232 |
-| x86-64-v2 | 74 | 4 | 25 | 75% | 0 |
-| x86-64-v3 | 555 | 73 | 10 | 98% | 17 |
+| x86-64-v1 | 547 | 0 | 135 | 80% | 232 |
+| x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
+| x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
 | x87 | 102 | 0 | 52 | 66% | 11 |
 
@@ -247,19 +247,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Psignb_mm_mmm64`
 - `Psignd_mm_mmm64`
 - `Psignw_mm_mmm64`
-
-## long64 x86-64-v3 — missing (10)
-
-- `VEX_Vlddqu_xmm_m128`
-- `VEX_Vlddqu_ymm_m256`
-- `VEX_Vpmaskmovd_m128_xmm_xmm`
-- `VEX_Vpmaskmovd_m256_ymm_ymm`
-- `VEX_Vpmaskmovd_xmm_xmm_m128`
-- `VEX_Vpmaskmovd_ymm_ymm_m256`
-- `VEX_Vpmaskmovq_m128_xmm_xmm`
-- `VEX_Vpmaskmovq_m256_ymm_ymm`
-- `VEX_Vpmaskmovq_xmm_xmm_m128`
-- `VEX_Vpmaskmovq_ymm_ymm_m256`
 
 ## long64 x86-64-v4 — missing (167)
 
@@ -712,19 +699,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Psignd_mm_mmm64`
 - `Psignw_mm_mmm64`
 
-## compat32 x86-64-v3 — missing (10)
-
-- `VEX_Vlddqu_xmm_m128`
-- `VEX_Vlddqu_ymm_m256`
-- `VEX_Vpmaskmovd_m128_xmm_xmm`
-- `VEX_Vpmaskmovd_m256_ymm_ymm`
-- `VEX_Vpmaskmovd_xmm_xmm_m128`
-- `VEX_Vpmaskmovd_ymm_ymm_m256`
-- `VEX_Vpmaskmovq_m128_xmm_xmm`
-- `VEX_Vpmaskmovq_m256_ymm_ymm`
-- `VEX_Vpmaskmovq_xmm_xmm_m128`
-- `VEX_Vpmaskmovq_ymm_ymm_m256`
-
 ## compat32 x86-64-v4 — missing (167)
 
 - `EVEX_Vblendmpd_xmm_k1z_xmm_xmmm128b64`
@@ -950,32 +924,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Fxam`
 - `Fxtract`
 
-## long64 x86-64-v1 — register form lifts, memory form does not (16)
-
-- `Packuswb_xmm_xmmm128`
-- `Pmaddwd_xmm_xmmm128`
-- `Pshufhw_xmm_xmmm128_imm8`
-- `Pshuflw_xmm_xmmm128_imm8`
-- `Pslld_xmm_xmmm128`
-- `Psllq_xmm_xmmm128`
-- `Psllw_xmm_xmmm128`
-- `Psrad_xmm_xmmm128`
-- `Psraw_xmm_xmmm128`
-- `Psrld_xmm_xmmm128`
-- `Psrlq_xmm_xmmm128`
-- `Psrlw_xmm_xmmm128`
-- `Sqrtpd_xmm_xmmm128`
-- `Sqrtps_xmm_xmmm128`
-- `Sqrtsd_xmm_xmmm64`
-- `Sqrtss_xmm_xmmm32`
-
-## long64 x86-64-v2 — register form lifts, memory form does not (4)
-
-- `Mpsadbw_xmm_xmmm128_imm8`
-- `Pblendw_xmm_xmmm128_imm8`
-- `Pmaddubsw_xmm_xmmm128`
-- `Ptest_xmm_xmmm128`
-
 ## long64 x86-64-v3 — register form lifts, memory form does not (73)
 
 - `VEX_Vcvtps2ph_xmmm128_ymm_imm8`
@@ -1155,32 +1103,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vpsrlw_ymm_k1z_ymm_xmmm128`
 - `EVEX_Vshuff32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshuff64x2_ymm_k1z_ymm_ymmm256b64_imm8`
-
-## compat32 x86-64-v1 — register form lifts, memory form does not (16)
-
-- `Packuswb_xmm_xmmm128`
-- `Pmaddwd_xmm_xmmm128`
-- `Pshufhw_xmm_xmmm128_imm8`
-- `Pshuflw_xmm_xmmm128_imm8`
-- `Pslld_xmm_xmmm128`
-- `Psllq_xmm_xmmm128`
-- `Psllw_xmm_xmmm128`
-- `Psrad_xmm_xmmm128`
-- `Psraw_xmm_xmmm128`
-- `Psrld_xmm_xmmm128`
-- `Psrlq_xmm_xmmm128`
-- `Psrlw_xmm_xmmm128`
-- `Sqrtpd_xmm_xmmm128`
-- `Sqrtps_xmm_xmmm128`
-- `Sqrtsd_xmm_xmmm64`
-- `Sqrtss_xmm_xmmm32`
-
-## compat32 x86-64-v2 — register form lifts, memory form does not (4)
-
-- `Mpsadbw_xmm_xmmm128_imm8`
-- `Pblendw_xmm_xmmm128_imm8`
-- `Pmaddubsw_xmm_xmmm128`
-- `Ptest_xmm_xmmm128`
 
 ## compat32 x86-64-v3 — register form lifts, memory form does not (73)
 

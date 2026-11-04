@@ -1,5 +1,15 @@
 use super::*;
 
+/// Lower legacy m128 operands. The legacy-SSE alignment
+/// check belongs here once that check is available; scalar SQRTSS/SD bypass it.
+pub(crate) fn legacy_sse_memory(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<Val, LiftError> {
+    effective_address(insn, ops, tg)
+}
+
 /// VEX.128 move: as [`lift_vmov`], but a register destination also clears bits
 /// 255:128 of the YMM. A store (mem dest) writes no register.
 pub(crate) fn lift_vmov_vex(
@@ -2210,21 +2220,30 @@ pub(crate) fn lift_vpcmp_fixed_or_packed(
 }
 
 /// Packed shift by immediate `dst = dst << imm` / `>> imm` per lane; a right shift
-/// is arithmetic when `arith` (psra*). The register-count form (variable shift) is
-/// deferred.
+/// is arithmetic when `arith` (psra*). Register/m128 counts use the low qword.
 pub(crate) fn lift_vpacked_shift(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     lane: u8,
     right: bool,
     arith: bool,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
     if !is_immediate(insn.op_kind(1)) {
-        // Register-count form `psll/psrl/psra {w,d,q} xmm, xmm`: the low 64 bits of the count
-        // xmm shift every lane uniformly (x86 over-shift → 0 / sign fill). The native JIT path
-        // lowers this to a vector shift; the interp uses `exec_shift_reg`. Memory-count (`psll*
-        // xmm, m128`) is deferred, like the AVX 3-operand path.
+        // SDM Vol 2B, PSLLW/PSLLD/PSLLQ, PSRLW/PSRLD/PSRLQ,
+        // PSRAW/PSRAD: fetch all m128, then use its low qword as the count.
+        if insn.op_kind(1) == OpKind::Memory {
+            let addr = legacy_sse_memory(insn, ops, tg)?;
+            ops.push(IrOp::VShiftRegM {
+                dst: d,
+                addr,
+                elem: lane,
+                right,
+                arith,
+            });
+            return Ok(());
+        }
         let count = reg_xmm(insn, 1).or_unsupported(insn)?;
         ops.push(IrOp::VShiftReg {
             dst: d,
@@ -2421,38 +2440,22 @@ pub(crate) fn lift_vpblendw(
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
     let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
     let imm = insn.immediate(3) as u8;
-    // src2 is a register or a memory operand (a UE4 title hits the memory form
-    // `vpblendw imm8, m128, xmm, xmm`). For the memory form, load the operand into `dst` and
-    // blend with `b = dst`: `exec_v_blend_w`/`emit_v_blend_w` read both sources before writing
-    // dst, so aliasing dst onto src2 is sound, and it needs no temp vreg.
-    //
-    // The load must be as wide as the instruction. A fixed 16-byte load makes the ymm form
-    // `vpblendw ymm, ymm, m256` blend its high lane against whatever `dst` already held —
-    // wrong, silently, with no trap. A register-only fuzz campaign cannot reach it; the
-    // memory-operand campaign found it at seed 206.
-    //
-    // Loading through `dst` is only sound while `dst` is not also src1: the load happens before
-    // the blend, so `vpblendw xmm0, xmm0, [mem], imm` would read its "register" words back out
-    // of the memory operand it just wrote over dst (`cargo xfuzz --mem --seed 3130`).
-    // `lift_vmpsadbw` guards the identical trick with `d != a`. Reject rather than guess — the
-    // aliased form needs a temp vector register.
-    let b = match vec_operand_reg(insn, 2) {
-        Some(b) => b,
-        None if insn.op_kind(2) == OpKind::Memory && dst != a => {
-            let addr = effective_address(insn, ops, tg)?;
-            if bytes > 16 {
-                ops.push(IrOp::VLoadWide { dst, addr, bytes });
-            } else {
-                ops.push(IrOp::VLoad {
-                    dst,
-                    addr,
-                    size: 16,
-                });
-            }
-            dst
+    // SDM Vol 2B, PBLENDW: VEX.128 m128 / VEX.256 m256.
+    if insn.op_kind(2) == OpKind::Memory {
+        let addr = effective_address(insn, ops, tg)?;
+        ops.push(IrOp::VBlendWM {
+            dst,
+            a,
+            addr,
+            imm,
+            bytes,
+        });
+        if bytes == 16 {
+            ops.push(IrOp::VZeroUpper { reg: dst });
         }
-        _ => return Err(unsupported_insn(insn)),
-    };
+        return Ok(());
+    }
+    let b = vec_operand_reg(insn, 2).or_unsupported(insn)?;
     ops.push(IrOp::VBlendW {
         dst,
         a,
@@ -2808,10 +2811,22 @@ pub(crate) fn lift_vpermil_var(
 pub(crate) fn lift_pshufw(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     high: bool,
     vex: bool,
 ) -> Result<(), LiftError> {
     let (d, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
+    // SDM Vol 2B, PSHUFHW/PSHUFLW: legacy source is m128.
+    if !vex && insn.op_kind(1) == OpKind::Memory {
+        let addr = legacy_sse_memory(insn, ops, tg)?;
+        ops.push(IrOp::VShuffle16M {
+            dst: d,
+            addr,
+            imm: insn.immediate(2) as u8,
+            high,
+        });
+        return Ok(());
+    }
     let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
     let imm = insn.immediate(2) as u8;
     ops.push(IrOp::VShuffle16 {
@@ -3328,8 +3343,24 @@ pub(crate) fn lift_vpsign(
 }
 
 /// `packuswb`: pack dst+src 16-bit lanes to unsigned-saturated bytes.
-pub(crate) fn lift_packuswb(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
+pub(crate) fn lift_packuswb(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
+    // SDM Vol 2B, PACKUSWB: xmm source is m128.
+    if insn.op_kind(1) == OpKind::Memory {
+        let addr = legacy_sse_memory(insn, ops, tg)?;
+        ops.push(IrOp::VPackWideM {
+            dst: d,
+            a: d,
+            addr,
+            from_elem: 2,
+            signed: false,
+        });
+        return Ok(());
+    }
     let b = reg_xmm(insn, 1).or_unsupported(insn)?;
     ops.push(IrOp::VPackUsWB { dst: d, a: d, b });
     Ok(())
@@ -3370,10 +3401,26 @@ pub(crate) fn lift_pack_signed(
     Ok(())
 }
 
-/// Legacy SSE2 `pmaddwd`: 2-operand (dst == src1), register src2. Cold → shared `VPMAddWd`
+/// Legacy SSE2 `pmaddwd`: 2-operand (dst == src1), register or m128 src2. Cold → shared `VPMAddWd`
 /// helper (jit == interp).
-pub(crate) fn lift_pmaddwd(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
+pub(crate) fn lift_pmaddwd(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
+    // SDM Vol 2B, PMADDWD: xmm source is m128.
+    if insn.op_kind(1) == OpKind::Memory {
+        let addr = legacy_sse_memory(insn, ops, tg)?;
+        ops.push(IrOp::VPMaddM {
+            dst: d,
+            a: d,
+            addr,
+            ubsw: false,
+            bytes: 16,
+        });
+        return Ok(());
+    }
     let b = reg_xmm(insn, 1).or_unsupported(insn)?;
     ops.push(IrOp::VPMAddWd { dst: d, a: d, b });
     Ok(())
@@ -3382,8 +3429,24 @@ pub(crate) fn lift_pmaddwd(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<()
 /// Legacy SSSE3 `pmaddubsw`: 2-operand (dst == src1), register src2. The unsigned×signed
 /// byte-pair saturating multiply-add; cold → shared `exec_v_pmadd` (128-bit width, jit ==
 /// interp).
-pub(crate) fn lift_pmaddubsw(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
+pub(crate) fn lift_pmaddubsw(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
+    // SDM Vol 2B, PMADDUBSW: xmm source is m128.
+    if insn.op_kind(1) == OpKind::Memory {
+        let addr = legacy_sse_memory(insn, ops, tg)?;
+        ops.push(IrOp::VPMaddM {
+            dst: d,
+            a: d,
+            addr,
+            ubsw: true,
+            bytes: 16,
+        });
+        return Ok(());
+    }
     let b = reg_xmm(insn, 1).or_unsupported(insn)?;
     ops.push(IrOp::VPMadd {
         dst: d,
@@ -4253,15 +4316,33 @@ pub(crate) fn lift_cvt_to_int_signed(
 }
 
 /// `sqrts*`/`sqrtp*`: scalar (low lane, upper preserved) or packed square root.
-/// Register source (memory source deferred).
+/// Register or memory source.
 pub(crate) fn lift_float_unary(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     op: FloatUnOp,
     prec: FPrec,
     scalar: bool,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
+    // SDM Vol 2B, SQRTPD/PS: m128; SQRTSD: m64; SQRTSS: m32.
+    if insn.op_kind(1) == OpKind::Memory {
+        let src_addr = if scalar {
+            effective_address(insn, ops, tg)?
+        } else {
+            legacy_sse_memory(insn, ops, tg)?
+        };
+        ops.push(IrOp::VFloatUnaryM {
+            dst: d,
+            a: d,
+            src_addr,
+            op,
+            prec,
+            scalar,
+        });
+        return Ok(());
+    }
     let s = reg_xmm(insn, 1).or_unsupported(insn)?;
     ops.push(IrOp::VFloatUnary {
         dst: d,
@@ -4705,7 +4786,7 @@ pub(crate) fn lift_phminposuw(
 }
 
 /// SSE4.1 `mpsadbw`/`vmpsadbw`. SSE: 3-operand in-place (`dst = mpsad(dst, src2)`, register
-/// src2). VEX: 4-operand (`dst, src1, src2, imm`), xmm and ymm (per 128-bit lane), register
+/// or m128 src2). VEX: 4-operand (`dst, src1, src2, imm`), xmm and ymm (per 128-bit lane), register
 /// or memory src2. VEX.128 clears bits 255:128.
 pub(crate) fn lift_mpsadbw(
     insn: &Instruction,
@@ -4713,70 +4794,40 @@ pub(crate) fn lift_mpsadbw(
     tg: &mut TempGen,
     vex: bool,
 ) -> Result<(), LiftError> {
-    if vex {
-        let imm = insn.immediate(3) as u8;
-        // VEX.256 (ymm) form: per-128-bit-lane.
-        if let Some(d) = reg_ymm(insn, 0) {
-            let a = reg_ymm(insn, 1).or_unsupported(insn)?;
-            // Register src2, or a m256 src2 staged into `dst` (`d != a` so `a` survives; the
-            // op reads `a` and `b` before writing `dst`, so `b == d` is safe).
-            let b = match reg_ymm(insn, 2) {
-                Some(b) => b,
-                None if insn.op_kind(2) == OpKind::Memory && d != a => {
-                    let addr = effective_address(insn, ops, tg)?;
-                    ops.push(IrOp::VLoadWide {
-                        dst: d,
-                        addr,
-                        bytes: 32,
-                    });
-                    d
-                }
-                _ => return Err(unsupported_insn(insn)),
-            };
-            ops.push(IrOp::VMpsadbw {
-                dst: d,
-                a,
-                b,
-                imm,
-                bytes: 32,
-            });
-            return Ok(());
-        }
-        let d = reg_xmm(insn, 0).or_unsupported(insn)?;
-        let a = reg_xmm(insn, 1).or_unsupported(insn)?;
-        let b = match reg_xmm(insn, 2) {
-            Some(b) => b,
-            None if insn.op_kind(2) == OpKind::Memory && d != a => {
-                let addr = effective_address(insn, ops, tg)?;
-                ops.push(IrOp::VLoad {
-                    dst: d,
-                    addr,
-                    size: 16,
-                });
-                d
-            }
-            _ => return Err(unsupported_insn(insn)),
+    let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
+    let a = if vex {
+        vec_operand_reg(insn, 1).or_unsupported(insn)?
+    } else {
+        dst
+    };
+    let src = if vex { 2 } else { 1 };
+    let imm = insn.immediate(src + 1) as u8;
+    // SDM Vol 2B, MPSADBW: m128 (legacy/VEX.128) or m256 (VEX.256).
+    if insn.op_kind(src) == OpKind::Memory {
+        let addr = if vex {
+            effective_address(insn, ops, tg)?
+        } else {
+            legacy_sse_memory(insn, ops, tg)?
         };
+        ops.push(IrOp::VMpsadbwM {
+            dst,
+            a,
+            addr,
+            imm,
+            bytes,
+        });
+    } else {
+        let b = vec_operand_reg(insn, src).or_unsupported(insn)?;
         ops.push(IrOp::VMpsadbw {
-            dst: d,
+            dst,
             a,
             b,
             imm,
-            bytes: 16,
+            bytes,
         });
-        ops.push(IrOp::VZeroUpper { reg: d });
-        return Ok(());
     }
-    // SSE: `mpsadbw dst, src2, imm8` — dst is also src1.
-    let d = reg_xmm(insn, 0).or_unsupported(insn)?;
-    let imm = insn.immediate(2) as u8;
-    let b = reg_xmm(insn, 1).or_unsupported(insn)?;
-    ops.push(IrOp::VMpsadbw {
-        dst: d,
-        a: d,
-        b,
-        imm,
-        bytes: 16,
-    });
+    if vex && bytes == 16 {
+        ops.push(IrOp::VZeroUpper { reg: dst });
+    }
     Ok(())
 }

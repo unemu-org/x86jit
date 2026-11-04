@@ -171,6 +171,23 @@ const FUZZER_COVERED: &[&str] = &[
     // Shuffle/mask: pshufd + pmovmskb.
     "Pshufd",
     "Pmovmskb",
+    // Legacy SSE memory pairs, aliased VEX blends/SAD and conditional integer
+    // moves: fuzz V_VEX emit_mem plus sse_memory_forms differential/boundary tests.
+    "Pshufhw",
+    "Pshuflw",
+    "Sqrtpd",
+    "Sqrtps",
+    "Sqrtsd",
+    "Sqrtss",
+    "Mpsadbw",
+    "Pblendw",
+    "Pmaddubsw",
+    "Ptest",
+    "Vlddqu",
+    "Vpmaskmovd",
+    "Vpmaskmovq",
+    "Vpblendw",
+    "Vmpsadbw",
 ];
 
 /// Mnemonics that are LIFTED but lack a fuzzer-menu entry. Each entry is covered by a
@@ -492,8 +509,6 @@ const ALLOWLIST: &[&str] = &[
     // (vex256_* / f16c_converts_match_interp / sse41_avx_specialists_match_interp /
     // pcmpestr64_match_interp) and bit-exact native-oracle tests in native.rs
     // (native_vex256_width_converts_ / native_f16c_converts_ / native_specialists_and_test_).
-    "Mpsadbw",
-    "Vmpsadbw",
     "Phminposuw",
     "Vphminposuw",
     "Vdpps",
@@ -532,8 +547,6 @@ const ALLOWLIST: &[&str] = &[
     "Pmovzxwq",
     "Pmulld",
     "Pmuludq", // native+jit tests (native_vpmuludq/vpmuludq_match_interp)
-    // caddy HTTPS: SSE word blend — jit test pblendw_match_interp.
-    "Pblendw",
     // TLS: packed multiplies — jit test packed_muls_match_interp.
     "Pmuldq",
     "Pmulhuw",
@@ -541,8 +554,6 @@ const ALLOWLIST: &[&str] = &[
     "Pmullw",
     "Pop",
     "Pshufb",
-    "Pshufhw",
-    "Pshuflw",
     // SSSE3 psign — pure element-wise codegen, covered by the dedicated
     // `native_psign_matches_interp` (bit-exact vs real CPU) + `psign_all_variants_match_interp`.
     "Psignb",
@@ -550,7 +561,6 @@ const ALLOWLIST: &[&str] = &[
     "Psignw",
     "Pslldq",
     "Psrldq",
-    "Ptest",
     "Push",
     "Ret",
     "Roundpd",
@@ -566,10 +576,6 @@ const ALLOWLIST: &[&str] = &[
     "Sfence",
     "Shufpd",
     "Shufps",
-    "Sqrtpd",
-    "Sqrtps",
-    "Sqrtsd",
-    "Sqrtss",
     "Std",
     "Subpd",
     "Subps",
@@ -787,7 +793,6 @@ const ALLOWLIST: &[&str] = &[
     "Vpblendmd",
     "Vpblendmq",
     "Vpblendd", // native+jit tests (native_vpblendd/vpblendd_match_interp)
-    "Vpblendw",
     "Vpbroadcastb",
     "Vpbroadcastd",
     "Vpbroadcastq",
@@ -996,7 +1001,6 @@ const ALLOWLIST: &[&str] = &[
     // hand-written jit==interp test avx2_packed_int_sweep_match_interp (jit.rs) and the
     // native-oracle native_packed_int_sweep_matches_interp (native.rs), which exercise
     // every form at xmm+ymm, reg+mem, over saturation/rounding edges.
-    "Pmaddubsw",
     "Pmulhrsw",
     "Vpaddsb",
     "Vpaddsw",

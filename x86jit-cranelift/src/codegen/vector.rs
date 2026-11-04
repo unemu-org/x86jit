@@ -1042,39 +1042,8 @@ impl Translator<'_, '_> {
         // x86 over-shift (count ≥ lane width): logical → 0, arithmetic → sign fill; the
         // count is the full unsigned low qword of `count`. Matches `exec_shift_reg`.
         if *k == 0 && !*zeroing && *bytes == 16 {
-            let vty = vec_ty(*elem);
-            let bits = *elem as i64 * 8;
-            let xa = self.load_xmm(*a);
-            let va = self.bitcast_v(xa, vty);
             let xc = self.load_xmm(*count);
-            let cvec = self.bitcast_v(xc, types::I64X2);
-            let cnt = self.builder.ins().extractlane(cvec, 0); // full 64-bit count
-            let widthv = self.builder.ins().iconst(types::I64, bits);
-            let over = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThanOrEqual, cnt, widthv);
-            // In-range count fits I32 (bits ≤ 64); the over path selects a constant instead.
-            let amt = self.builder.ins().ireduce(types::I32, cnt);
-            let zero = {
-                let z = self.iconst(0);
-                let z128 = self.builder.ins().uextend(types::I128, z);
-                self.bitcast_v(z128, vty)
-            };
-            let r = if !*right {
-                let sh = self.builder.ins().ishl(va, amt);
-                self.builder.ins().select(over, zero, sh)
-            } else if !*arith {
-                let sh = self.builder.ins().ushr(va, amt);
-                self.builder.ins().select(over, zero, sh)
-            } else {
-                // Arithmetic: clamp the count to width-1 on over-shift (each lane → sign).
-                let wm1 = self.builder.ins().iconst(types::I32, bits - 1);
-                let eff = self.builder.ins().select(over, wm1, amt);
-                self.builder.ins().sshr(va, eff)
-            };
-            let r = self.bitcast_i128(r);
-            self.store_xmm(*dst, r);
+            self.emit_shift_count(*dst, *a, xc, *elem, *right, *arith);
             return false;
         }
         // Scalar-register-count shift via the shared exec_shift_reg helper → jit == interp.
@@ -1092,6 +1061,56 @@ impl Translator<'_, '_> {
             self.helpers.shift_reg,
             &[cpu, d, av, cv, el, r, ar, kk, z, by],
         );
+        false
+    }
+
+    fn emit_shift_count(&mut self, dst: u8, a: u8, xc: Value, elem: u8, right: bool, arith: bool) {
+        let vty = vec_ty(elem);
+        let bits = elem as i64 * 8;
+        let xa = self.load_xmm(a);
+        let va = self.bitcast_v(xa, vty);
+        let cvec = self.bitcast_v(xc, types::I64X2);
+        let cnt = self.builder.ins().extractlane(cvec, 0); // full 64-bit count
+        let widthv = self.builder.ins().iconst(types::I64, bits);
+        let over = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, cnt, widthv);
+        // In-range count fits I32 (bits ≤ 64); the over path selects a constant instead.
+        let amt = self.builder.ins().ireduce(types::I32, cnt);
+        let zero = {
+            let z = self.iconst(0);
+            let z128 = self.builder.ins().uextend(types::I128, z);
+            self.bitcast_v(z128, vty)
+        };
+        let r = if !right {
+            let sh = self.builder.ins().ishl(va, amt);
+            self.builder.ins().select(over, zero, sh)
+        } else if !arith {
+            let sh = self.builder.ins().ushr(va, amt);
+            self.builder.ins().select(over, zero, sh)
+        } else {
+            // Arithmetic: clamp the count to width-1 on over-shift (each lane → sign).
+            let wm1 = self.builder.ins().iconst(types::I32, bits - 1);
+            let eff = self.builder.ins().select(over, wm1, amt);
+            self.builder.ins().sshr(va, eff)
+        };
+        let r = self.bitcast_i128(r);
+        self.store_xmm(dst, r);
+    }
+
+    pub(crate) fn emit_v_shift_reg_m(
+        &mut self,
+        dst: &u8,
+        addr: &Val,
+        elem: &u8,
+        right: &bool,
+        arith: &bool,
+    ) -> bool {
+        let base = self.val(*addr);
+        let host = self.checked_addr(base, 16, 0);
+        let xc = self.gload(types::I128, host, 0);
+        self.emit_shift_count(*dst, *dst, xc, *elem, *right, *arith);
         false
     }
 
@@ -2388,16 +2407,32 @@ impl Translator<'_, '_> {
     }
 
     pub(crate) fn emit_v_ptest(&mut self, a: &u8, b: &u8, w256: &bool) -> bool {
+        let (alo, blo) = (self.load_xmm(*a), self.load_xmm(*b));
+        let high = if *w256 {
+            Some((self.load_ymm_hi(*a), self.load_ymm_hi(*b)))
+        } else {
+            None
+        };
+        self.ptest_values(alo, blo, high)
+    }
+
+    pub(crate) fn emit_v_ptest_m(&mut self, a: &u8, addr: &Val) -> bool {
+        let base = self.val(*addr);
+        let host = self.checked_addr(base, 16, 0);
+        let blo = self.gload(types::I128, host, 0);
+        let alo = self.load_xmm(*a);
+        self.ptest_values(alo, blo, None)
+    }
+
+    fn ptest_values(&mut self, alo: Value, blo: Value, high: Option<(Value, Value)>) -> bool {
         let zero = self.builder.ins().iconst(types::I64, 0);
         let z128 = self.builder.ins().uextend(types::I128, zero);
-        let (alo, blo) = (self.load_xmm(*a), self.load_xmm(*b));
         let and_lo = self.builder.ins().band(blo, alo);
         let nalo = self.builder.ins().bnot(alo);
         let andn_lo = self.builder.ins().band(blo, nalo);
         let mut zf = self.builder.ins().icmp(IntCC::Equal, and_lo, z128);
         let mut cf = self.builder.ins().icmp(IntCC::Equal, andn_lo, z128);
-        if *w256 {
-            let (ahi, bhi) = (self.load_ymm_hi(*a), self.load_ymm_hi(*b));
+        if let Some((ahi, bhi)) = high {
             let and_hi = self.builder.ins().band(bhi, ahi);
             let nahi = self.builder.ins().bnot(ahi);
             let andn_hi = self.builder.ins().band(bhi, nahi);
@@ -2583,6 +2618,20 @@ impl Translator<'_, '_> {
         imm: &u8,
         bytes: &u16,
     ) -> bool {
+        let n = *bytes as usize / 16;
+        for c in 0..n {
+            let xa = self.load_lane(*a, c);
+            let xb = self.load_lane(*b, c);
+            let r = self.blend_w_value(xa, xb, *imm);
+            self.store_lane(*dst, c, r);
+        }
+        if n > 1 {
+            self.store_lanes_zeroed_above(*dst, n);
+        }
+        false
+    }
+
+    fn blend_w_value(&mut self, xa: Value, xb: Value, imm: u8) -> Value {
         // Per-word select via a byte shuffle: word i from a (bytes 2i,2i+1) or from
         // b (bytes 16+2i,16+2i+1) per imm8[i]. The same imm applies to each 128-bit lane.
         // VEX.128 upper-zeroing is a trailing op; ymm zeroes lanes above.
@@ -2596,18 +2645,33 @@ impl Translator<'_, '_> {
             mask[2 * i] = base as u8;
             mask[2 * i + 1] = (base + 1) as u8;
         }
-        let n = *bytes as usize / 16;
-        for c in 0..n {
+        let va = self.bitcast_v(xa, types::I8X16);
+        let vb = self.bitcast_v(xb, types::I8X16);
+        let r = self.shuffle(va, vb, mask);
+        self.bitcast_i128(r)
+    }
+
+    pub(crate) fn emit_v_blend_w_m(
+        &mut self,
+        dst: &u8,
+        a: &u8,
+        addr: &Val,
+        imm: &u8,
+        bytes: &u16,
+    ) -> bool {
+        let base = self.val(*addr);
+        let host = self.checked_addr(base, *bytes as u8, 0);
+        // Load every lane before committing any destination, including dst == a.
+        let bv: Vec<_> = (0..*bytes as usize / 16)
+            .map(|c| self.gload(types::I128, host, (c * 16) as i32))
+            .collect();
+        for (c, xb) in bv.into_iter().enumerate() {
             let xa = self.load_lane(*a, c);
-            let xb = self.load_lane(*b, c);
-            let va = self.bitcast_v(xa, types::I8X16);
-            let vb = self.bitcast_v(xb, types::I8X16);
-            let r = self.shuffle(va, vb, mask);
-            let r = self.bitcast_i128(r);
+            let r = self.blend_w_value(xa, xb, *imm);
             self.store_lane(*dst, c, r);
         }
-        if n > 1 {
-            self.store_lanes_zeroed_above(*dst, n);
+        if *bytes > 16 {
+            self.store_lanes_zeroed_above(*dst, *bytes as usize / 16);
         }
         false
     }
@@ -3433,29 +3497,48 @@ impl Translator<'_, '_> {
         high: &bool,
         bytes: &u16,
     ) -> bool {
+        let n = *bytes as usize / 16;
+        for c in 0..n {
+            let x = self.load_lane(*a, c);
+            let r = self.shuffle16_value(x, *imm, *high);
+            self.store_lane(*dst, c, r);
+        }
+        if n > 1 {
+            self.store_lanes_zeroed_above(*dst, n);
+        }
+        false
+    }
+
+    fn shuffle16_value(&mut self, x: Value, imm: u8, high: bool) -> Value {
         // The imm8 shuffles the low/high 4 words within EACH 128-bit lane independently —
         // NOT cross-lane. Same mask per lane.
         let mut mask = [0u8; 16];
         for (b, m) in mask.iter_mut().enumerate() {
             *m = b as u8; // identity for the untouched half
         }
-        let base: usize = if *high { 8 } else { 0 };
+        let base: usize = if high { 8 } else { 0 };
         for i in 0..4 {
             let sel = ((imm >> (2 * i)) & 3) as usize;
             mask[base + i * 2] = (base + sel * 2) as u8;
             mask[base + i * 2 + 1] = (base + sel * 2 + 1) as u8;
         }
-        let n = *bytes as usize / 16;
-        for c in 0..n {
-            let x = self.load_lane(*a, c);
-            let va = self.bitcast_v(x, types::I8X16);
-            let r = self.shuffle(va, va, mask);
-            let r = self.bitcast_i128(r);
-            self.store_lane(*dst, c, r);
-        }
-        if n > 1 {
-            self.store_lanes_zeroed_above(*dst, n);
-        }
+        let va = self.bitcast_v(x, types::I8X16);
+        let r = self.shuffle(va, va, mask);
+        self.bitcast_i128(r)
+    }
+
+    pub(crate) fn emit_v_shuffle16_m(
+        &mut self,
+        dst: &u8,
+        addr: &Val,
+        imm: &u8,
+        high: &bool,
+    ) -> bool {
+        let base = self.val(*addr);
+        let host = self.checked_addr(base, 16, 0);
+        let x = self.gload(types::I128, host, 0);
+        let r = self.shuffle16_value(x, *imm, *high);
+        self.store_xmm(*dst, r);
         false
     }
 
@@ -4534,14 +4617,42 @@ impl Translator<'_, '_> {
         imm: &u8,
         bytes: &u16,
     ) -> bool {
-        let cpu = self.cpu;
-        let d = self.iconst(*dst as u64);
-        let av = self.iconst(*a as u64);
-        let bv = self.iconst(*b as u64);
-        let im = self.iconst(*imm as u64);
-        let by = self.iconst(*bytes as u64);
-        self.call_helper(self.helpers.mpsadbw, &[cpu, d, av, bv, im, by]);
+        let bv: Vec<_> = (0..*bytes as usize / 16)
+            .map(|c| self.load_lane(*b, c))
+            .collect();
+        self.mpsadbw_values(*dst, *a, &bv, *imm);
         false
+    }
+
+    pub(crate) fn emit_v_mpsadbw_m(
+        &mut self,
+        dst: &u8,
+        a: &u8,
+        addr: &Val,
+        imm: &u8,
+        bytes: &u16,
+    ) -> bool {
+        let base = self.val(*addr);
+        let host = self.checked_addr(base, *bytes as u8, 0);
+        let bv: Vec<_> = (0..*bytes as usize / 16)
+            .map(|c| self.gload(types::I128, host, (c * 16) as i32))
+            .collect();
+        self.mpsadbw_values(*dst, *a, &bv, *imm);
+        false
+    }
+
+    fn mpsadbw_values(&mut self, dst: u8, a: u8, bv: &[Value], imm: u8) {
+        let cpu = self.cpu;
+        let d = self.iconst(dst as u64);
+        let av = self.iconst(a as u64);
+        for (c, v) in bv.iter().enumerate() {
+            let lo = self.builder.ins().ireduce(types::I64, *v);
+            let hi = self.builder.ins().ushr_imm(*v, 64);
+            let hi = self.builder.ins().ireduce(types::I64, hi);
+            let im = self.iconst(if c == 0 { imm } else { (imm >> 3) & 7 } as u64);
+            let half = self.iconst(c as u64);
+            self.call_helper(self.helpers.mpsadbw, &[cpu, d, av, lo, hi, im, half]);
+        }
     }
 
     /// F16C `vcvtph2ps` via the shared `cvtph2ps` helper (jit == interp — soft

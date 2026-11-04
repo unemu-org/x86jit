@@ -537,7 +537,16 @@ pub fn to_mem_forms(prog: &mut Prog) {
                     dst,
                     a,
                     b,
-                    off: vec_mem_off(&mut rng),
+                    // SDM Vol 2B, legacy packed-SSE instruction exceptions:
+                    // keep m128 aligned for the native oracle.
+                    off: {
+                        let off = vec_mem_off(&mut rng);
+                        if V_VEX[op as usize].name.starts_with('v') {
+                            off
+                        } else {
+                            off & !15
+                        }
+                    },
                     imm,
                 };
             }
@@ -1434,9 +1443,9 @@ impl VexOp {
             &[]
         } else if self.name.contains("ph") {
             &[2, 4]
-        } else if self.name.contains("pd") {
+        } else if self.name.contains("pd") || self.name == "sqrtsd" {
             &[8]
-        } else if self.name.contains("ps") {
+        } else if self.name.contains("ps") || self.name == "sqrtss" {
             &[4]
         } else {
             &[4, 8] // float lane-dup movers (vmovddup/sh/sl) — no ps/pd in the name
@@ -1497,6 +1506,62 @@ macro_rules! r3 {
             // pool where the memory form is opt-in is a pool that will not have it.
             emit_mem: Some(|asm, d, a, _b, m, _imm| {
                 asm.$op(ymm(d), ymm(a), ymmword_ptr(m)).unwrap();
+            }),
+        }
+    };
+}
+
+// Legacy SSE entries also participate in `--mem`; their aligned m128 addresses
+// keep the native oracle valid before the pending engine alignment check lands.
+macro_rules! sse_mem {
+    ($name:literal, $family:expr, $op:ident, imm) => {
+        VexOp {
+            name: $name,
+            family: $family,
+            emit: |asm, d, _a, b, imm| {
+                asm.$op(xmm(d), xmm(b), imm as i32).unwrap();
+            },
+            emit_mem: Some(|asm, d, _a, _b, m, imm| {
+                asm.$op(xmm(d), xmmword_ptr(m), imm as i32).unwrap();
+            }),
+        }
+    };
+    ($name:literal, $family:expr, $op:ident, $ptr:ident) => {
+        VexOp {
+            name: $name,
+            family: $family,
+            emit: |asm, d, _a, b, _imm| {
+                asm.$op(xmm(d), xmm(b)).unwrap();
+            },
+            emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+                asm.$op(xmm(d), $ptr(m)).unwrap();
+            }),
+        }
+    };
+}
+
+macro_rules! maskmov_mem {
+    ($name:literal, $op:ident, $reg:ident, $ptr:ident, load) => {
+        VexOp {
+            name: $name,
+            family: Family::Dup,
+            emit: |asm, d, a, _b, _imm| {
+                asm.$op($reg(d), $reg(a), $ptr(SCRATCH)).unwrap();
+            },
+            emit_mem: Some(|asm, d, a, _b, m, _imm| {
+                asm.$op($reg(d), $reg(a), $ptr(m)).unwrap();
+            }),
+        }
+    };
+    ($name:literal, $op:ident, $reg:ident, $ptr:ident, store) => {
+        VexOp {
+            name: $name,
+            family: Family::Dup,
+            emit: |asm, _d, a, b, _imm| {
+                asm.$op($ptr(SCRATCH), $reg(a), $reg(b)).unwrap();
+            },
+            emit_mem: Some(|asm, _d, a, b, m, _imm| {
+                asm.$op($ptr(m), $reg(a), $reg(b)).unwrap();
             }),
         }
     };
@@ -1763,6 +1828,77 @@ pub static V_VEX: &[VexOp] = &[
                 .unwrap();
         }),
     },
+    // Memory-source coverage for the legacy SSE register/memory pairs.
+    sse_mem!("packuswb", Family::PackedInt, packuswb, xmmword_ptr),
+    sse_mem!("pmaddwd", Family::PackedInt, pmaddwd, xmmword_ptr),
+    sse_mem!("pshufhw", Family::Shuffle, pshufhw, imm),
+    sse_mem!("pshuflw", Family::Shuffle, pshuflw, imm),
+    sse_mem!("psllw", Family::PackedInt, psllw, xmmword_ptr),
+    sse_mem!("pslld", Family::PackedInt, pslld, xmmword_ptr),
+    sse_mem!("psllq", Family::PackedInt, psllq, xmmword_ptr),
+    sse_mem!("psrlw", Family::PackedInt, psrlw, xmmword_ptr),
+    sse_mem!("psrld", Family::PackedInt, psrld, xmmword_ptr),
+    sse_mem!("psrlq", Family::PackedInt, psrlq, xmmword_ptr),
+    sse_mem!("psraw", Family::PackedInt, psraw, xmmword_ptr),
+    sse_mem!("psrad", Family::PackedInt, psrad, xmmword_ptr),
+    sse_mem!("sqrtpd", Family::Convert, sqrtpd, xmmword_ptr),
+    sse_mem!("sqrtps", Family::Convert, sqrtps, xmmword_ptr),
+    sse_mem!("sqrtsd", Family::Convert, sqrtsd, qword_ptr),
+    sse_mem!("sqrtss", Family::Convert, sqrtss, dword_ptr),
+    sse_mem!("mpsadbw", Family::Blend, mpsadbw, imm),
+    sse_mem!("pblendw", Family::Blend, pblendw, imm),
+    sse_mem!("pmaddubsw", Family::PackedInt, pmaddubsw, xmmword_ptr),
+    sse_mem!("ptest", Family::PackedInt, ptest, xmmword_ptr),
+    VexOp {
+        name: "vpblendw",
+        family: Family::Blend,
+        emit: |asm, d, _a, b, imm| {
+            asm.vpblendw(xmm(d), xmm(d), xmm(b), imm as i32).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, imm| {
+            asm.vpblendw(xmm(d), xmm(d), xmmword_ptr(m), imm as i32)
+                .unwrap();
+        }),
+    },
+    VexOp {
+        name: "vmpsadbw",
+        family: Family::Blend,
+        emit: |asm, d, _a, b, imm| {
+            asm.vmpsadbw(xmm(d), xmm(d), xmm(b), imm as i32).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, imm| {
+            asm.vmpsadbw(xmm(d), xmm(d), xmmword_ptr(m), imm as i32)
+                .unwrap();
+        }),
+    },
+    VexOp {
+        name: "vlddqu",
+        family: Family::Dup,
+        emit: |asm, d, _a, _b, _imm| {
+            asm.vlddqu(xmm(d), xmmword_ptr(SCRATCH)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vlddqu(xmm(d), xmmword_ptr(m)).unwrap();
+        }),
+    },
+    maskmov_mem!("vpmaskmovd", vpmaskmovd, xmm, xmmword_ptr, load),
+    maskmov_mem!("vpmaskmovd", vpmaskmovd, xmm, xmmword_ptr, store),
+    maskmov_mem!("vpmaskmovq", vpmaskmovq, xmm, xmmword_ptr, load),
+    maskmov_mem!("vpmaskmovq", vpmaskmovq, xmm, xmmword_ptr, store),
+    VexOp {
+        name: "vlddqu",
+        family: Family::Dup,
+        emit: |asm, d, _a, _b, _imm| {
+            asm.vlddqu(ymm(d), ymmword_ptr(SCRATCH)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vlddqu(ymm(d), ymmword_ptr(m)).unwrap();
+        }),
+    },
+    maskmov_mem!("vpmaskmovd", vpmaskmovd, ymm, ymmword_ptr, load),
+    maskmov_mem!("vpmaskmovd", vpmaskmovd, ymm, ymmword_ptr, store),
+    maskmov_mem!("vpmaskmovq", vpmaskmovq, ymm, ymmword_ptr, load),
+    maskmov_mem!("vpmaskmovq", vpmaskmovq, ymm, ymmword_ptr, store),
 ];
 
 /// Assemble one VEX/AVX2 op by direct index into [`V_VEX`] (no modulo). `op` is the id
@@ -2701,11 +2837,11 @@ mod campaign_tests {
     use super::*;
 
     #[test]
-    fn table_is_63_ops_and_names_resolve() {
+    fn table_is_95_ops_and_names_resolve() {
         assert_eq!(
             V_VEX.len(),
-            63,
-            "pool size must stay 63 (RNG-stream stability)"
+            95,
+            "update the table witness when extending the pool"
         );
         // Every op resolves by name; families cover the whole pool.
         assert_eq!(resolve_ops("vcvtps2ph").unwrap(), vec![62]);

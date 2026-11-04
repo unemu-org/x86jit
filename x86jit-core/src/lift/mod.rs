@@ -926,6 +926,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VPcmpStrMaskM { .. }
         | VKOrTest { .. }
         | VPtest { .. }
+        | VPtestM { .. }
         | VTestFp { .. }
         | VFloatCmp { .. }
         | VCvtToInt { .. }
@@ -947,6 +948,10 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VByteShift { .. }
         | VShuffle32 { .. }
         | VBlendW { .. }
+        | VBlendWM { .. }
+        | VMpsadbwM { .. }
+        | VShuffle16M { .. }
+        | VShiftRegM { .. }
         | VBlendD { .. }
         | VFma { .. }
         | VFmaM { .. }
@@ -1598,14 +1603,14 @@ pub(crate) fn lift_insn(
         Pavgb => lift_vpacked_bin(insn, ops, tg, 1, PackedBinOp::AvgU).map(|_| false),
         Pavgw => lift_vpacked_bin(insn, ops, tg, 2, PackedBinOp::AvgU).map(|_| false),
         // packed shift by immediate
-        Psllw => lift_vpacked_shift(insn, ops, 2, false, false).map(|_| false),
-        Pslld => lift_vpacked_shift(insn, ops, 4, false, false).map(|_| false),
-        Psllq => lift_vpacked_shift(insn, ops, 8, false, false).map(|_| false),
-        Psrlw => lift_vpacked_shift(insn, ops, 2, true, false).map(|_| false),
-        Psrld => lift_vpacked_shift(insn, ops, 4, true, false).map(|_| false),
-        Psrlq => lift_vpacked_shift(insn, ops, 8, true, false).map(|_| false),
-        Psraw => lift_vpacked_shift(insn, ops, 2, true, true).map(|_| false),
-        Psrad => lift_vpacked_shift(insn, ops, 4, true, true).map(|_| false),
+        Psllw => lift_vpacked_shift(insn, ops, tg, 2, false, false).map(|_| false),
+        Pslld => lift_vpacked_shift(insn, ops, tg, 4, false, false).map(|_| false),
+        Psllq => lift_vpacked_shift(insn, ops, tg, 8, false, false).map(|_| false),
+        Psrlw => lift_vpacked_shift(insn, ops, tg, 2, true, false).map(|_| false),
+        Psrld => lift_vpacked_shift(insn, ops, tg, 4, true, false).map(|_| false),
+        Psrlq => lift_vpacked_shift(insn, ops, tg, 8, true, false).map(|_| false),
+        Psraw => lift_vpacked_shift(insn, ops, tg, 2, true, true).map(|_| false),
+        Psrad => lift_vpacked_shift(insn, ops, tg, 4, true, true).map(|_| false),
         Psrldq => lift_byteshift(insn, ops, true).map(|_| false),
         Pslldq => lift_byteshift(insn, ops, false).map(|_| false),
         // VEX.128 whole-lane byte shift: 3-operand `dst,a,imm8` + 255:128 clear.
@@ -1622,11 +1627,11 @@ pub(crate) fn lift_insn(
         Vmovsldup => lift_vmovdup(insn, ops, tg, 0xA0, false).map(|_| false),
         Vmovshdup => lift_vmovdup(insn, ops, tg, 0xF5, false).map(|_| false),
         Vmovddup => lift_vmovdup(insn, ops, tg, 0x44, true).map(|_| false),
-        Pshuflw => lift_pshufw(insn, ops, false, false).map(|_| false),
-        Pshufhw => lift_pshufw(insn, ops, true, false).map(|_| false),
+        Pshuflw => lift_pshufw(insn, ops, tg, false, false).map(|_| false),
+        Pshufhw => lift_pshufw(insn, ops, tg, true, false).map(|_| false),
         // VEX.128/256 `vpshuflw`/`vpshufhw`: in-lane word shuffle widened to ymm.
-        Vpshuflw => lift_pshufw(insn, ops, false, true).map(|_| false),
-        Vpshufhw => lift_pshufw(insn, ops, true, true).map(|_| false),
+        Vpshuflw => lift_pshufw(insn, ops, tg, false, true).map(|_| false),
+        Vpshufhw => lift_pshufw(insn, ops, tg, true, true).map(|_| false),
         Shufps | Shufpd => lift_shufps(insn, ops, tg).map(|_| false),
         // AVX `vshufps`/`vshufpd`: the VEX 3-operand shuffle — distinct merge base
         // (vvvv), register or m128 src2, + VEX.128 upper-lane zeroing. Reuses VShufps.
@@ -1764,11 +1769,11 @@ pub(crate) fn lift_insn(
         Vunpckhps => lift_vunpack_avx(insn, ops, tg, 4, true).map(|_| false),
         Vunpcklpd => lift_vunpack_avx(insn, ops, tg, 8, false).map(|_| false),
         Vunpckhpd => lift_vunpack_avx(insn, ops, tg, 8, true).map(|_| false),
-        Packuswb => lift_packuswb(insn, ops).map(|_| false),
+        Packuswb => lift_packuswb(insn, ops, tg).map(|_| false),
         // Legacy SSE2 signed packs + pmaddwd.
         Packsswb => lift_pack_signed(insn, ops, tg, 2).map(|_| false),
         Packssdw => lift_pack_signed(insn, ops, tg, 4).map(|_| false),
-        Pmaddwd => lift_pmaddwd(insn, ops).map(|_| false),
+        Pmaddwd => lift_pmaddwd(insn, ops, tg).map(|_| false),
         // VEX/EVEX saturating pack `vpack{ss,us}{wb,dw}`: python3 hits vpackusdw.
         // Register src (any width) or a 128-bit memory src2. VEX upper-zeroing is
         // implicit in the helper's set_vec (reg) or explicit (mem).
@@ -1831,8 +1836,9 @@ pub(crate) fn lift_insn(
         // model, so the stores (`vmovntdq`/`vmovntps`/`vmovntpd`, xmm -> [mem]) and the load
         // (`vmovntdqa`, [mem] -> xmm, with VEX.128 upper-zeroing) lower exactly like the
         // aligned `vmovdqa`/`vmovaps` path. libc's memmove emits `vmovntdq [rdi], xmm0`.
-        Vmovdqa | Vmovdqu | Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovntdq | Vmovntps
-        | Vmovntpd | Vmovntdqa => lift_vmov_avx(insn, ops, tg, 4).map(|_| false),
+        // SDM Vol 2A, LDDQU: VLDDQU loads unaligned m128/m256 like VMOVDQU.
+        Vmovdqa | Vmovdqu | Vlddqu | Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovntdq
+        | Vmovntps | Vmovntpd | Vmovntdqa => lift_vmov_avx(insn, ops, tg, 4).map(|_| false),
         // EVEX data movement. The element suffix is the write-mask granularity:
         // 8/16/32/64 → 1/2/4/8 bytes.
         Vmovdqu8 => lift_vmov_avx(insn, ops, tg, 1).map(|_| false),
@@ -1976,8 +1982,9 @@ pub(crate) fn lift_insn(
         Vpblendvb => lift_vblendv(insn, ops, tg, 1).map(|_| false),
         // AVX1 vector-mask conditional load/store: mask is a vector reg's
         // per-element sign bits; masked-off lanes never fault (a real-software blocker).
-        Vmaskmovps => lift_vmaskmov(insn, ops, tg, 4).map(|_| false),
-        Vmaskmovpd => lift_vmaskmov(insn, ops, tg, 8).map(|_| false),
+        // SDM Vol 2C, VPMASKMOV: element sign bits gate dword/qword accesses.
+        Vpmaskmovd | Vmaskmovps => lift_vmaskmov(insn, ops, tg, 4).map(|_| false),
+        Vpmaskmovq | Vmaskmovpd => lift_vmaskmov(insn, ops, tg, 8).map(|_| false),
         // SSE4.1 imm8 static blends `blendps`/`blendpd`: dst==src1; per lane,
         // imm8 bit i picks src2 lane i else keeps dst. Register or m128 src2.
         Blendps => lift_blendi(insn, ops, tg, 4).map(|_| false),
@@ -1990,7 +1997,19 @@ pub(crate) fn lift_insn(
         // SSE4.1 pblendw: imm8 word blend; dst is also src1, upper bits preserved.
         Pblendw => {
             let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
-            let b = reg_xmm(insn, 1).or_unsupported(insn)?; // mem src2 deferred
+            // SDM Vol 2B, PBLENDW: memory source is m128.
+            if insn.op_kind(1) == OpKind::Memory {
+                let addr = legacy_sse_memory(insn, ops, tg)?;
+                ops.push(IrOp::VBlendWM {
+                    dst,
+                    a: dst,
+                    addr,
+                    imm: insn.immediate(2) as u8,
+                    bytes: 16,
+                });
+                return Ok(false);
+            }
+            let b = reg_xmm(insn, 1).or_unsupported(insn)?;
             let imm = insn.immediate(2) as u8;
             ops.push(IrOp::VBlendW {
                 dst,
@@ -2126,7 +2145,7 @@ pub(crate) fn lift_insn(
         Vpmaddwd => lift_vpmadd(insn, ops, tg, false).map(|_| false),
         Vpmaddubsw => lift_vpmadd(insn, ops, tg, true).map(|_| false),
         // SSSE3 legacy `pmaddubsw`: the SSE 2-operand form (dst == src1).
-        Pmaddubsw => lift_pmaddubsw(insn, ops).map(|_| false),
+        Pmaddubsw => lift_pmaddubsw(insn, ops, tg).map(|_| false),
         // Packed absolute value `vpabs{b,w,d,q}` (VEX/EVEX): any width, masked.
         Vpabsb => lift_vpabs(insn, ops, 1).map(|_| false),
         Vpabsw => lift_vpabs(insn, ops, 2).map(|_| false),
@@ -2402,6 +2421,13 @@ pub(crate) fn lift_insn(
         // AVX `vptest` (+ legacy `ptest`): flags-only AND test. op0 = DEST, op1 =
         // SRC. YMM → 256-bit form. Register src; memory deferred.
         Ptest | Vptest => {
+            // SDM Vol 2B, PTEST: legacy memory source is m128.
+            if insn.mnemonic() == Ptest && insn.op_kind(1) == OpKind::Memory {
+                let a = reg_xmm(insn, 0).or_unsupported(insn)?;
+                let addr = legacy_sse_memory(insn, ops, tg)?;
+                ops.push(IrOp::VPtestM { a, addr });
+                return Ok(false);
+            }
             if let Some(a) = reg_ymm(insn, 0) {
                 let b = reg_ymm(insn, 1).or_unsupported(insn)?;
                 ops.push(IrOp::VPtest { a, b, w256: true });
@@ -2614,8 +2640,8 @@ pub(crate) fn lift_insn(
         // `HIntOp::Sad` path through lift_hint/lift_vhint. VEX forms clear bits 255:128.
         Psadbw => lift_hint(insn, ops, tg, HIntOp::Sad).map(|_| false),
         Vpsadbw => lift_vhint(insn, ops, tg, HIntOp::Sad).map(|_| false),
-        Sqrtss => lift_float_unary(insn, ops, FloatUnOp::Sqrt, FPrec::F32, true).map(|_| false),
-        Sqrtsd => lift_float_unary(insn, ops, FloatUnOp::Sqrt, FPrec::F64, true).map(|_| false),
+        Sqrtss => lift_float_unary(insn, ops, tg, FloatUnOp::Sqrt, FPrec::F32, true).map(|_| false),
+        Sqrtsd => lift_float_unary(insn, ops, tg, FloatUnOp::Sqrt, FPrec::F64, true).map(|_| false),
         // VEX scalar sqrt: 3-operand — sqrt(op2 low), upper from op1, 255:128
         // cleared. python3 hits vsqrtsd.
         Vsqrtss => {
@@ -2831,8 +2857,12 @@ pub(crate) fn lift_insn(
         Vfmsubadd231pd => {
             lift_fma(insn, ops, tg, 231, FPrec::F64, false, false, false, 2).map(|_| false)
         }
-        Sqrtps => lift_float_unary(insn, ops, FloatUnOp::Sqrt, FPrec::F32, false).map(|_| false),
-        Sqrtpd => lift_float_unary(insn, ops, FloatUnOp::Sqrt, FPrec::F64, false).map(|_| false),
+        Sqrtps => {
+            lift_float_unary(insn, ops, tg, FloatUnOp::Sqrt, FPrec::F32, false).map(|_| false)
+        }
+        Sqrtpd => {
+            lift_float_unary(insn, ops, tg, FloatUnOp::Sqrt, FPrec::F64, false).map(|_| false)
+        }
 
         Movzx => lift_movzx(insn, ops, tg).map(|_| false),
         Movsx | Movsxd => lift_movsx(insn, ops, tg).map(|_| false),

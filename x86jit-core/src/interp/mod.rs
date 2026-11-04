@@ -1301,6 +1301,75 @@ fn walk_ops<const RETRY: bool>(
                     return r;
                 }
             }
+            IrOp::VShuffle16M {
+                dst,
+                addr,
+                imm,
+                high,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
+                    Ok(v) => v,
+                    Err(f) => return vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
+                };
+                cpu.xmm[*dst as usize] = shuffle16_128(bv, *imm, *high);
+            }
+            IrOp::VShiftRegM {
+                dst,
+                addr,
+                elem,
+                right,
+                arith,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
+                    Ok(v) => v,
+                    Err(f) => return vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
+                };
+                let count = (bv as u64).min(u64::from(*elem) * 8) as u8;
+                cpu.xmm[*dst as usize] =
+                    packed_shift(cpu.xmm[*dst as usize], count, *elem, *right, *arith);
+            }
+            IrOp::VPtestM { a, addr } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
+                    Ok(v) => v,
+                    Err(f) => return vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
+                };
+                ptest_value(cpu, cpu.xmm[*a as usize], bv, 0, 0);
+            }
+            IrOp::VBlendWM {
+                dst,
+                a,
+                addr,
+                imm,
+                bytes,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => return vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                };
+                blend_w_value(cpu, *dst, cpu.vec_lanes(*a as usize), bv, *imm, *bytes);
+            }
+            IrOp::VMpsadbwM {
+                dst,
+                a,
+                addr,
+                imm,
+                bytes,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => return vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                };
+                let av = cpu.vec_lanes(*a as usize);
+                cpu.xmm[*dst as usize] = mpsadbw(av[0], bv[0], *imm);
+                if *bytes == 32 {
+                    cpu.ymm_hi[*dst as usize] = mpsadbw(av[1], bv[1], (*imm >> 3) & 7);
+                }
+            }
             IrOp::VBlendW {
                 dst,
                 a,
@@ -5198,12 +5267,25 @@ fn vpart<M: StrMem>(
                 value: 0,
             }),
         },
-        Err(trap) => Err(VecFault {
-            at,
-            size,
-            trap,
-            value: 0,
-        }),
+        Err(trap) => {
+            // §16: refine only an unavailable transfer, preserving successful and
+            // MMIO access widths. Unlike vpart, sload consumes no MMIO answer and
+            // returns a Trap verdict without producing an MMIO exit.
+            let at = if matches!(trap, MemTrap::Unmapped) {
+                (0..size)
+                    .map(|i| at.wrapping_add(u64::from(i)))
+                    .find(|&ea| matches!(mem.sload(ea, 1), Err(MemTrap::Unmapped)))
+                    .unwrap_or(at)
+            } else {
+                at
+            };
+            Err(VecFault {
+                at,
+                size,
+                trap,
+                value: 0,
+            })
+        }
     }
 }
 
@@ -5263,11 +5345,34 @@ fn vload(
     match size {
         16 => {
             let lo = vpart(cpu, mem, cur_addr, addr, 8)? as u128;
-            let hi = vpart(cpu, mem, cur_addr, addr + 8, 8)? as u128;
+            let hi = vpart(cpu, mem, cur_addr, addr.wrapping_add(8), 8)? as u128;
             Ok(lo | (hi << 64))
         }
         8 => Ok(vpart(cpu, mem, cur_addr, addr, 8)? as u128),
         _ => Ok(vpart(cpu, mem, cur_addr, addr, 4)? as u128),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn vector_fault_probe_preserves_mmio_answers() {
+    use crate::memory::{MemoryModel, Prot, RegionKind};
+
+    let mut mem = Memory::new(MemoryModel::Flat { size: 0x10000 });
+    mem.map(0x4000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+    for answer in [None, Some(0x1122334455667788)] {
+        let mut cpu = CpuState::new();
+        cpu.pending_mmio = answer;
+        cpu.pending_mmio_write = true;
+        let Err(fault) = vload(&mut cpu, &mem, 0x1000, 0x4ffc, 8) else {
+            panic!("a transfer extending beyond Trap memory must fault");
+        };
+        assert!(matches!(fault.trap, MemTrap::Unmapped));
+        assert_eq!(fault.at, 0x5000);
+        assert_eq!(fault.size, 8);
+        assert_eq!(cpu.pending_mmio, answer);
+        assert!(cpu.pending_mmio_write);
+        assert_eq!(cpu.mmio_part(0x1000, 0x4ffc), None);
     }
 }
 
