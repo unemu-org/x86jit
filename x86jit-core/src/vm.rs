@@ -394,7 +394,8 @@ impl Vm {
 
     /// Select the guest decode/lift mode (§17.3) this Vm — and every vcpu spawned from
     /// it — runs under. Call before [`new_vcpu`](Vm::new_vcpu). Default is
-    /// [`CpuMode::Long64`].
+    /// [`CpuMode::Long64`]. [`CpuMode::Real16`] always uses the interpreter, regardless
+    /// of the injected backend or tier-up/region policy.
     pub fn set_cpu_mode(&mut self, mode: CpuMode) {
         self.mode = mode;
     }
@@ -1571,6 +1572,16 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
     // Real16 `at.pa == at.ip == pc`, so this is byte-identical to the old `pc` keying.
     let pc = at.pa;
     let key = BlockKey::new(pc, mode);
+    // §17.6: Real16 has no compiled tier. Bypass tier-up and region formation even
+    // when the embedder injected a compiling backend.
+    if mode == CpuMode::Real16 {
+        if let Some(block) = vm.cache.get(key) {
+            return Ok(block);
+        }
+        return lift_block(&vm.mem, at, mode)
+            .map(|ir| finish_single(vm, key, pc, ir))
+            .map_err(lift_exit);
+    }
     loop {
         // Publish any completed background compiles first, so a
         // freshly-landed unit is seen by the lookup below. Cheap when idle (the
@@ -1740,10 +1751,9 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
 /// and the cache key must both be physical — see `resolve`).
 fn finish_single(vm: &Vm, key: BlockKey, span_start: u64, ir: IrBlock) -> CachedBlock {
     let (start, len) = (span_start, ir.guest_len);
-    // Defer compilation — a fresh block starts interpreted and is only
-    // JIT-compiled once it proves hot (see `resolve`). Eager (tier_up_after None)
-    // compiles immediately, the original behavior.
-    let materialized = if vm.tier_up_after.is_some() {
+    // Real16 stays interpreted (§17.6); other modes defer compilation only until
+    // the block proves hot under a tier-up policy (see `resolve`).
+    let materialized = if key.mode == CpuMode::Real16 || vm.tier_up_after.is_some() {
         CachedBlock::Interpreted(Arc::new(ir))
     } else {
         vm.materialize(&ir)

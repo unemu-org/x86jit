@@ -1149,7 +1149,7 @@ One place gathering all the mines scattered across the document. Review it befor
 
 ## 17. Extensibility points (seams, not a framework)
 
-> **Status (2026-11-04).** The seams below were used: `CpuMode` now has three variants — `Long64`, `Compat32` (32-bit code) and `Real16` (real mode; it requires the interpreter backend — JIT and region compilation of Real16 are unsupported). The text below is the original design rationale and still describes why the seams exist; where it says "today always `Long64`" or calls real mode future work, read it as history.
+> **Status (2026-11-04).** The seams below were used: `CpuMode` now has three variants — `Long64`, `Compat32` (32-bit code) and `Real16` (real mode; it always executes through the interpreter, whatever backend is configured — JIT and region compilation of Real16 are not implemented). The text below is the original design rationale and still describes why the seams exist; where it says "today always `Long64`" or calls real mode future work, read it as history.
 
 This library supports **x86-64 long mode only** (see §1). This section defines how to leave clean seams in case someone (or you in a few years) wants to extend it — **without building any framework now**. Goal: don't cement the "always 64" assumption where leaving a parameter is cheap. Nothing here mandates implementing other modes — it only keeps the door open.
 

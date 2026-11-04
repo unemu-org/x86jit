@@ -87,7 +87,9 @@ binary trapped on it.
 
 **CPU modes:** `CpuMode::Long64` (64-bit long mode), `CpuMode::Compat32`
 (32-bit protected/compatibility mode with flat segments), and `CpuMode::Real16`
-(16-bit real mode). **Real16 is interpreter-only**; an embedder uses it. Its interpreter is validated against the hardware-captured
+(16-bit real mode). **Real16 always runs on the interpreter**, even when the VM is
+configured with a JIT backend, tier-up, or superblocks. Its interpreter is validated
+against the hardware-captured
 [SingleStepTests 80286 corpus](x86jit-tests/tests/ss286.rs), comparing final CPU and
 memory state and in-guest exception delivery. The corpus reports remaining gaps;
 it is not a claim of full 286 conformance. Targeted
