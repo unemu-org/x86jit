@@ -207,12 +207,25 @@ as ordinary defects rather than listed here.
 - **Revisit when:** after M4, only if hooks prove useful. The return-based core stays authoritative (§14).
 - **Tracked in:** —
 
-### Other x86 processor modes (32-bit protected / real) + multi-mode machinery
+### Real-mode JIT tier, 286 fidelity, and protected-mode segmentation
 
-- **Why deferred:** the library is **x86-64 long mode only** (§1). §17 leaves three cheap *seams* (mode as a value not the literal `64`, mode in the cache key, single `effective_address` choke-point) so a mode could be added later — but **building the machinery now is forbidden**: no `trait ExecutionMode`/`AddressingMode` with one impl, no parametrizing things identical in 32/64-bit, no API for `Protected32` nobody wrote. Empty abstractions never validated by a second implementation come out wrong.
-- **Revisit when:** a real second mode is actually needed — then design the abstraction with the concrete case in hand. Today: reject non-64-bit binaries loudly at the loader (§17.7).
-- **Tracked in:** —
-- **Also here:** 16-bit real mode (MODE-B). 32-bit protected mode shipped because a real i386 binary demanded it; real mode has no consumer, and the SingleStepTests 80286 corpus validates the *semantics* without anything executing in that mode. Was task-143, closed into this entry.
+- **What ships:** `CpuMode::Long64`, `CpuMode::Compat32` (32-bit
+  protected/compatibility mode with flat segments), and `CpuMode::Real16` (16-bit
+  real mode). Real16 is **interpreter-only**; an embedder uses it. Real mode itself is not deferred.
+- **Validation:** the [SingleStepTests 80286 harness](../../x86jit-tests/tests/ss286.rs)
+  executes the hardware-captured corpus on the Real16 interpreter and compares
+  final CPU/memory state and in-guest exception delivery. It reports unsupported
+  opcodes and divergences rather than enforcing full conformance. Targeted
+  [Unicorn comparisons](../../x86jit-tests/tests/cf16.rs) also exercise real-mode
+  addressing and control flow.
+- **Still deferred:** a Real16 JIT tier; remaining 286 fidelity items exposed by
+  corpus failures, traps, and unsupported opcodes; and full protected-mode
+  segmentation (segment descriptors and their enforcement). Real16 segmented
+  addressing already exists; Compat32 remains flat apart from `FS`/`GS` bases.
+- **Revisit when:** a consumer needs real-mode compilation or protected-mode
+  segmentation, or a corpus gap requires a focused fidelity fix. Keep mode handling
+  concrete; do not add speculative mode traits or abstractions.
+- **History:** task-143 was closed into this entry before Real16 shipped.
 
 ### Other guest architectures (ARM/MIPS/6502) as a second front-end
 

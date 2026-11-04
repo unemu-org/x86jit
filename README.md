@@ -85,6 +85,15 @@ register form, so a missing memory-operand form can still be reported as lifted
 (`TASK-312`). That is how `vextract*`'s memory destination stayed invisible until a real
 binary trapped on it.
 
+**CPU modes:** `CpuMode::Long64` (64-bit long mode), `CpuMode::Compat32`
+(32-bit protected/compatibility mode with flat segments), and `CpuMode::Real16`
+(16-bit real mode). **Real16 is interpreter-only**; an embedder uses it. Its interpreter is validated against the hardware-captured
+[SingleStepTests 80286 corpus](x86jit-tests/tests/ss286.rs), comparing final CPU and
+memory state and in-guest exception delivery. The corpus reports remaining gaps;
+it is not a claim of full 286 conformance. Targeted
+[Unicorn comparisons](x86jit-tests/tests/cf16.rs) also cover real-mode addressing
+and control flow.
+
 **Engine:** two interchangeable backends — a portable interpreter and a Cranelift
 JIT — over a single IR, with a translation cache, hotness-gated tier-up, superblock
 regions, and block chaining + indirect-branch caching for fast dispatch. Self-modifying
@@ -109,8 +118,10 @@ interp/JIT/native timings per commit if you want real numbers.
   reads the full operand width where hardware reads one element. Embedded rounding `{er}`
   is likewise unread (`deferred.md` covers MXCSR.RC, which is a different thing). None of
   this is visible to the compat map or the differential corpus: both probe the plain form.
-- 64-bit long mode + 32-bit protected mode only — **no 16-bit real mode** (BIOS / boot code).
-- Segmentation is limited to the `FS`/`GS` base (modern TLS); no full segment-descriptor model.
+- Real16 has no JIT tier yet, and 286 fidelity gaps remain — see
+  [deferred work](backlog/docs/deferred.md#real-mode-jit-tier-286-fidelity-and-protected-mode-segmentation).
+- Protected-mode segmentation has no full segment-descriptor model; `Compat32`
+  uses flat segments with `FS`/`GS` bases. Real16 has segmented addressing.
 - Signals and fork/exec *after* a process spawns threads are not fully modeled (single-threaded fork/exec works; the threaded case returns a defined error rather than guessing).
 - OS emulation (syscalls, devices, loaders) is the embedder's job, not the core's — see [`unemulinux`](https://github.com/unemu-org/unemulinux) for a Linux userland built on this library.
 - **`Prot` is advisory — nothing enforces it.** A guest store into a region mapped `R` or `RX` succeeds and changes the bytes, on both backends; the engine models no permission fault (`TASK-330`). Map read-only expecting a trap and you get silent corruption instead.

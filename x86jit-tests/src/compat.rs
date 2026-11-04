@@ -496,8 +496,11 @@ impl Coverage {
             "\n## 32-bit compat mode (Compat32)\n\n\
              Probed at bitness 32: also covers the legacy-only forms long mode dropped \
              (`Pushad`/`Into`/`Daa`/…) and the 16-bit operand-size forms \
-             (`Call_rm16`/`Retnw`/`Pushaw`/…). A 16-bit real-mode table follows the same \
-             probe seam (`probe_code_in`) once a 16-bit `CpuMode` exists.\n\n",
+             (`Call_rm16`/`Retnw`/`Pushaw`/…). `CpuMode::Real16` exists and is \
+             interpreter-only; this generated map does not yet include a 16-bit real-mode \
+             table. Real16 validation uses the [SingleStepTests 80286 \
+             corpus](../../../x86jit-tests/tests/ss286.rs) and [targeted Unicorn \
+             comparisons](../../../x86jit-tests/tests/cf16.rs).\n\n",
         );
         render_mode_table(&mut s, &self.compat32);
         render_missing(&mut s, "long64", &self.generations);

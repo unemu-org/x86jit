@@ -136,7 +136,7 @@ is where they live.
   - The backend is an **injected `Box<dyn Backend>`** (`Vm::with_backend`), not a config enum — the core can't name the downstream JIT crate (§4.1).
   - JIT inlined memory access needs a bounds+permission check or guard pages — raw `host_base+addr` is host UB (§8.2.3).
 - **Extensibility seams (spec.md §17) — keep the discipline, don't build machinery:**
-  - Pass the guest mode as a value (`CpuMode`, today only `Long64`); never hardcode the literal `64` at `Decoder::new` or assume "segments are always 0" ad hoc (§17.3).
+  - Pass the guest mode as a value (`CpuMode`: `Long64`, `Compat32`, or interpreter-only `Real16`); never hardcode the literal `64` at `Decoder::new` or assume "segments are always 0" ad hoc (§17.3).
   - Address computation goes through the single `effective_address` helper — no lift computes an address itself. This is seam 3; it's also just correct for RMW/FS-GS (§17.5).
-  - **Do NOT** add `trait ExecutionMode`/`AddressingMode`, mode config, or an API for `Protected32`. Seams are cheap and good code; machinery before a second implementation is forbidden (§17.6). Reject non-64-bit binaries loudly at the loader (§17.7).
+  - **Do NOT** add speculative `trait ExecutionMode`/`AddressingMode` abstractions. Keep mode handling grounded in the implemented modes; full protected-mode segmentation and a Real16 JIT tier remain deferred. Loaders must select a supported decode mode explicitly.
 - **Test strategy:** differential testing is the primary oracle — run a block natively on an x86 host and compare state; interpreter is the oracle for the JIT (§13). Per-instruction unit tests cover edge cases (overflow, zero, sign). Decoder fuzzing must never panic. Whole-program native-vs-JIT differential is the macro integration oracle (testing.md §12).
