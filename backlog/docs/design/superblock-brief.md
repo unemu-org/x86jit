@@ -48,8 +48,9 @@ are the point.
 - **Lift** (`x86jit-core/src/lift.rs`): `lift_block(mem, start) -> IrBlock`. Decodes
   one guest **basic block** — straight-line until the first control-flow insn, which
   becomes the terminator. `IrBlock { guest_start, ops: Vec<IrOp>, temp_count,
-  guest_len, icount }`. A post-lift pass `elide_dead_flags` narrows ALU `set_flags`
-  masks by intra-block liveness (all flags conservatively live at block end).
+  guest_len, icount }`. At JIT translation time, `elide_dead_flags` narrows ALU
+  `set_flags` masks on a copy by intra-block liveness (all flags conservatively live
+  at block end). Interpreter and cached IR keep architectural masks.
 - **IR terminators** (`IrOp`): `Jump{target}`, `Branch{cond, taken, fallthrough}`,
   `Call{target, return_addr}`, `Ret`, `Syscall`, `Hlt`. Targets are `Val::Imm(addr)`
   (static) or `Val::Temp` (indirect/dynamic).

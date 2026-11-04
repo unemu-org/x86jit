@@ -101,11 +101,14 @@ const XFEATURE_HI16_ZMM: u64 = 1 << 7;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Capture {
-    /// 0 = nothing captured, 1 = clean `hlt` terminator, 2 = other fault (skip).
+    /// 0 = nothing captured, 1 = clean `hlt` terminator, 2 = other fault.
     status: u64,
     rip: u64,
     rflags: u64,
     fault_addr: u64,
+    signal: libc::c_int,
+    trapno: u64,
+    error: u64,
     gpr: [u64; 16],
     xmm: [u128; 16],
     /// Bits 255:128 of each YMM register, read from the signal XSAVE area.
@@ -167,8 +170,8 @@ const GREG_OF: [usize; 16] = [
 ];
 
 /// The fault handler (runs in the child, on the altstack). Async-signal-safe: it only
-/// touches raw memory and calls `_exit`. On the guest's terminating `hlt` it snapshots
-/// the register file; any other signal marks the run unusable so the parent skips it.
+/// touches raw memory and calls `_exit`. Captures the register file on every signal;
+/// the parent accepts only HLT or the caller's explicitly designated guest fault.
 ///
 /// A userspace `hlt` is a general-protection fault, which the kernel reports as a
 /// `SIGSEGV` with `si_code == SI_KERNEL` and no meaningful faulting address. A paging
@@ -190,17 +193,16 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
 
         let is_hlt =
             sig == libc::SIGSEGV && si_code == libc::SI_KERNEL && *(rip as *const u8) == 0xf4;
-        if !is_hlt {
-            cap.status = CAP_FAULT;
-            cap.fault_addr = rip;
-            libc::_exit(0);
-        }
+        cap.signal = sig;
+        cap.trapno = gregs[libc::REG_TRAPNO as usize] as u64;
+        cap.error = gregs[libc::REG_ERR as usize] as u64;
+        cap.fault_addr = (*info).si_addr() as u64;
 
         for (i, &g) in GREG_OF.iter().enumerate() {
             cap.gpr[i] = gregs[g] as u64;
         }
         // Engine convention: RIP resumes *past* the `hlt` (1 byte), matching Unicorn.
-        cap.rip = rip + 1;
+        cap.rip = if is_hlt { rip + 1 } else { rip };
         cap.rflags = gregs[libc::REG_EFL as usize] as u64;
 
         let fp = uc.uc_mcontext.fpregs;
@@ -284,7 +286,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
                 }
             }
         }
-        cap.status = CAP_HLT;
+        cap.status = if is_hlt { CAP_HLT } else { CAP_FAULT };
         libc::_exit(0);
     }
 }
@@ -459,6 +461,24 @@ fn assemble_stub(avx: bool, avx512: bool) -> Vec<u8> {
 /// Serialized process-wide: the fixed control/guest VAs can host only one run at a
 /// time. The whole body holds a mutex.
 pub fn run_native(input: &VectorInput) -> Option<RunOutcome> {
+    run_native_inner(input, None)
+}
+
+/// A guest fault explicitly accepted by the native oracle. All other unexpected
+/// signals retain `run_native`'s skip behaviour.
+#[derive(Clone, Copy)]
+pub enum NativeFault {
+    PageFault { addr: u64 },
+    DivideError,
+}
+
+/// Capture a designated fault's full register file, with RIP at the faulting
+/// instruction (SDM Vol 3A §7.5; AMD APM Vol 2 §8.1.3).
+pub fn run_native_fault(input: &VectorInput, fault: NativeFault) -> Option<RunOutcome> {
+    run_native_inner(input, Some(fault))
+}
+
+fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<RunOutcome> {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,8 +686,36 @@ pub fn run_native(input: &VectorInput) -> Option<RunOutcome> {
     // exited (waitpid returned) so there is no concurrent writer to the capture page.
     let cap = unsafe { *(SHARE as *const Capture) };
 
-    let outcome = if cap.status == CAP_HLT {
-        Some(RunOutcome {
+    let exit = if cap.status == CAP_HLT && fault.is_none() {
+        Some(ExitKind::Hlt)
+    } else if cap.status == CAP_FAULT {
+        match fault {
+            Some(NativeFault::PageFault { addr })
+                if cap.signal == libc::SIGSEGV && cap.trapno == 14 && cap.fault_addr == addr =>
+            {
+                // SDM Vol 3A §7.15, #PF error code: I/D=bit 4, W/R=bit 1.
+                let access = if cap.error & 16 != 0 {
+                    crate::vector::Access::Execute
+                } else if cap.error & 2 != 0 {
+                    crate::vector::Access::Write
+                } else {
+                    crate::vector::Access::Read
+                };
+                Some(ExitKind::UnmappedMemory { addr, access })
+            }
+            Some(NativeFault::DivideError) if cap.signal == libc::SIGFPE && cap.trapno == 0 => {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 0,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let outcome = exit.map(|exit| {
+        RunOutcome {
             cpu: CpuSnapshot {
                 gpr: cap.gpr,
                 rip: cap.rip,
@@ -695,11 +743,9 @@ pub fn run_native(input: &VectorInput) -> Option<RunOutcome> {
                 mxcsr: cap.mxcsr,
             },
             mem: read_back(&input.mem_init),
-            exit: ExitKind::Hlt,
-        })
-    } else {
-        None
-    };
+            exit,
+        }
+    });
 
     // `guard` unmaps every region as it drops here.
     outcome
@@ -985,16 +1031,9 @@ mod tests {
                     ));
                 }
             }
-            // Flag comparison is opt-in (X86JIT_LOCKSTEP_FLAGS=1) and DELIBERATELY not
-            // part of the default pass, because the interpreter elides dead flags: when
-            // an op's flags are overwritten before any read, the lifter emits
-            // FlagMask::NONE and `cpu.flags` keeps the previous live value. So per-op
-            // flag comparison diverges on nearly every op — it measures elision, not a
-            // bug. A wrongly-elided flag that is actually consumed by adc/sbb/adcx/adox
-            // would corrupt the GPR result, which the data pass compares exactly (clean);
-            // the only bug this can't catch is a flag consumed by a conditional BRANCH.
-            // Chasing that needs branch-point instrumentation (verify each jcc's taken
-            // direction against hardware), not this per-op replay. Kept as scaffolding.
+            // Flag comparison is opt-in (X86JIT_LOCKSTEP_FLAGS=1). The interpreter
+            // and cached IR retain architectural masks; only JIT translation narrows
+            // a copy with elide_dead_flags and recovers flags at explicit exits.
             if cmp_flags {
                 // Compare only flags this instruction leaves architecturally DEFINED —
                 // drop the ones iced marks undefined, whose value legitimately differs

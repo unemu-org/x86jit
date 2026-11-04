@@ -152,6 +152,10 @@ pub struct CpuState {
 
 ### 3.2 Flags
 
+The contract requires that at every exit, including a mid-block fault, flags are the architectural flags after the last retired instruction (Intel SDM Vol 3A §7.5; AMD64 APM Vol 2 §8.1.3).
+
+A host guard-page fault inside compiled code does not yet meet this contract: it reports flags as of the last flag store until xj-obx.2/xj-obx.4 land.
+
 x86 has arithmetic flags: **CF** (carry), **PF** (parity), **AF** (adjust), **ZF** (zero), **SF** (sign), **OF** (overflow), and **DF** (direction, for string instructions).
 
 Two strategies — the spec assumes the **simple version at the start, lazy as an optimization**:

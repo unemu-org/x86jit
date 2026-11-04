@@ -80,8 +80,10 @@ hand-managing 16 block params per guest block. The region former computes a stat
 every exit and trap-out). RIP, `fs_base`/`gs_base`, flags, and XMM stay
 memory-resident.
 
-**D3 — Flags.** Stay write-through `CpuState` stores as today; `elide_dead_flags` stays
-per sub-block (conservative all-live at each sub-block boundary). Rationale: flags cost
+**D3 — Flags.** Stay write-through `CpuState` stores as today; `elide_dead_flags` runs
+at JIT translation time on a copy. Interpreter and cached IR keep architectural masks.
+Narrowing stays per sub-block (conservative all-live at each sub-block boundary).
+Rationale: flags cost
 ~2% (ablation), and fuel can exit the region at *any* internal edge, so flags must be
 architecturally correct at every edge anyway. Cross-block flag elision is out of scope.
 

@@ -290,8 +290,6 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
         }
     }
 
-    elide_dead_flags(&mut ops);
-
     Ok(IrBlock {
         guest_start: start,
         ops,
@@ -324,7 +322,6 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
         // Real mode: a genuinely invalid encoding vectors #UD in-guest (like `ud2`); any
         // other decode failure (bytes off the end of mapped code) stays an execute fault.
         if emit_real16_ud_if_invalid(&insn, decoder.last_error(), mode, &mut ops) {
-            elide_dead_flags(&mut ops);
             return Ok(IrBlock {
                 guest_start: start,
                 ops,
@@ -339,7 +336,6 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     // in-guest before it executes (#UD above already handled an invalid opcode).
     if mode.wraps_16() && insn.len() as u32 > MAX_INSN_LEN_286 {
         push_real16_fault(&insn, mode, 13, &mut ops);
-        elide_dead_flags(&mut ops);
         return Ok(IrBlock {
             guest_start: start,
             ops,
@@ -353,7 +349,6 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     });
     lift_insn(&insn, &mut ops, &mut tg, mode)
         .map_err(|e| refill_unsupported_bytes(e, code, start))?;
-    elide_dead_flags(&mut ops);
 
     Ok(IrBlock {
         guest_start: start,
@@ -368,6 +363,21 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
 mod tests {
     use super::*;
     use crate::memory::{MemoryModel, Prot, RegionKind};
+
+    #[test]
+    fn flag_reader_masks() {
+        // SDM Vol 2A, AAA/AAS and DAA/DAS, Operation; Vol 2B,
+        // PUSHF/PUSHFD/PUSHFQ, Operation; Vol 2A, CMC and LAHF, Operation.
+        for kind in [BcdKind::Aaa, BcdKind::Aas] {
+            assert_eq!(op_reads(&IrOp::Bcd { kind }), F_AF);
+        }
+        for kind in [BcdKind::Daa, BcdKind::Das] {
+            assert_eq!(op_reads(&IrOp::Bcd { kind }), F_CF | F_AF);
+        }
+        assert_eq!(op_reads(&IrOp::PushfReal), FlagMask::ALL.0);
+        assert_eq!(op_reads(&IrOp::SetCf { value: None }), F_CF);
+        assert_eq!(op_reads(&IrOp::Lahf), F_CF | F_PF | F_AF | F_ZF | F_SF);
+    }
 
     const BASE: u64 = 0x1000;
 
@@ -741,13 +751,11 @@ pub fn lift_region(
 // Flag bit positions in a `FlagMask` (matches `store_flags` order): CF PF AF ZF SF OF.
 const F_CF: u8 = 1 << 0;
 const F_PF: u8 = 1 << 1;
+// AF is read as data by LAHF, DAA, DAS, AAA and AAS.
 const F_AF: u8 = 1 << 2;
 const F_ZF: u8 = 1 << 3;
 const F_SF: u8 = 1 << 4;
 const F_OF: u8 = 1 << 5;
-// AF is written by ALU ops but no condition code reads it (only `daa`/`aaa`, which
-// the lift doesn't cover) — kept for a complete bit map.
-const _: u8 = F_AF;
 
 /// Which flags a condition code inspects.
 pub(crate) fn cond_reads(cond: Cond) -> u8 {
@@ -764,15 +772,303 @@ pub(crate) fn cond_reads(cond: Cond) -> u8 {
     }
 }
 
-/// Flags an op *reads*. The IR has exactly four flag consumers: `Branch`/`GetCond`
-/// (a condition code) and `Adc`/`Sbb` (carry-in). No `lahf`/`sahf`/`pushf`/`rcl`
-/// exist to read the whole set, so this enumeration is complete — keep it in sync
-/// if a flag-reading op is ever added.
+/// Flags consumed as data, plus conservative barriers for helpers and flag writers
+/// whose recovery cannot use the straight-line ALU recipe. Enumerate every op so
+/// adding an IR operation requires reviewing its flag inputs and fault behaviour.
+/// Any lowering/helper that writes CF/PF/AF/ZF/SF/OF without Translator::store_flag,
+/// or reads them outside the readers listed here, must return ALL. This includes
+/// X87 (FCOMI/FUCOMI and FCMOV) and RepString (CMPS/SCAS).
 pub(crate) fn op_reads(op: &IrOp) -> u8 {
+    use IrOp::*;
     match op {
-        IrOp::Branch { cond, .. } | IrOp::GetCond { cond, .. } => cond_reads(*cond),
-        IrOp::Adc { .. } | IrOp::Sbb { .. } | IrOp::Rcl { .. } | IrOp::Rcr { .. } => F_CF,
-        _ => 0,
+        // SDM Vol 1 Appendix A Table A-2: Jcc/SETcc/CMOVcc test condition flags.
+        Branch { cond, .. } | GetCond { cond, .. } => cond_reads(*cond),
+        // SDM Vol 1 Appendix A Table A-2: ADC/SBB test CF.
+        Adc { .. } | Sbb { .. } => F_CF,
+        // SDM Vol 2A, LAHF, Operation.
+        Lahf => F_CF | F_PF | F_AF | F_ZF | F_SF,
+        // SDM Vol 2B, PUSHF/PUSHFD/PUSHFQ, Operation.
+        PushfReal => FlagMask::ALL.0,
+        // SDM Vol 2A, DAA / DAS, Operation: both old CF and AF are inputs.
+        Bcd {
+            kind: BcdKind::Daa | BcdKind::Das,
+        } => F_CF | F_AF,
+        // SDM Vol 2A, AAA / AAS, Operation: only AF is tested.
+        Bcd {
+            kind: BcdKind::Aaa | BcdKind::Aas,
+        } => F_AF,
+        // SDM Vol 2A, AAM / AAD, Flags Affected: no flag inputs.
+        // Keep a conservative barrier for their helper.
+        Bcd {
+            kind: BcdKind::Aam(_) | BcdKind::Aad(_),
+        } => FlagMask::ALL.0,
+        // SDM Vol 2A, CMC, Operation.
+        SetCf { value: None } => F_CF,
+        SetCf { value: Some(_) } => 0,
+        // Count-conditional writers use materialized flags on both paths. Keeping
+        // their inputs live avoids carrying cold recipes through their internal joins.
+        Rcl { set_flags, .. } | Rcr { set_flags, .. } => {
+            // SDM Vol 1 Appendix A Table A-2: RCL/RCR test CF.
+            if !set_flags.is_none() && shift_flags_may_skip(op) {
+                FlagMask::ALL.0
+            } else {
+                F_CF
+            }
+        }
+        Shl { set_flags, .. }
+        | Shr { set_flags, .. }
+        | Sar { set_flags, .. }
+        | Rol { set_flags, .. }
+        | Ror { set_flags, .. }
+        | DoubleShift { set_flags, .. } => {
+            if !set_flags.is_none() && shift_flags_may_skip(op) {
+                FlagMask::ALL.0
+            } else {
+                0
+            }
+        }
+        X87 { .. }
+        | PopfReal
+        | IntGate { .. }
+        | IntoGate { .. }
+        | BoundGate { .. }
+        | SegLimitCheck { .. }
+        | IretReal
+        | LoopCx { .. }
+        | FarCall { .. }
+        | FarRet { .. }
+        | RepString { .. }
+        | RepStringReal { .. }
+        | PushaReal
+        | PopaReal
+        | EnterReal { .. }
+        | PortIo { .. } => FlagMask::ALL.0,
+        InsnStart { .. }
+        | ReadReg { .. }
+        | WriteReg { .. }
+        | Add { .. }
+        | Sub { .. }
+        | And { .. }
+        | Or { .. }
+        | Xor { .. }
+        | Sext { .. }
+        | Bswap { .. }
+        | Mul { .. }
+        | Div { .. }
+        | FxState { .. }
+        | Load { .. }
+        | Store { .. }
+        | Bt { .. }
+        | Popcnt { .. }
+        | BitScan { .. }
+        | Bmi { .. }
+        | AtomicRmw { .. }
+        | AtomicCas { .. }
+        | VPcmpStr { .. }
+        | VPcmpStrM { .. }
+        | VPcmpStrMask { .. }
+        | VPcmpStrMaskM { .. }
+        | VKOrTest { .. }
+        | VPtest { .. }
+        | VTestFp { .. }
+        | VFloatCmp { .. }
+        | VCvtToInt { .. }
+        | Sahf
+        | Cpuid
+        | Xgetbv
+        | Crc32 { .. }
+        | VLoad { .. }
+        | VStore { .. }
+        | VMov { .. }
+        | VMov256 { .. }
+        | VFromGpr { .. }
+        | VToGpr { .. }
+        | VLogic { .. }
+        | VPackedBin { .. }
+        | VPackedBinM { .. }
+        | VLogicM { .. }
+        | VPackedShift { .. }
+        | VByteShift { .. }
+        | VShuffle32 { .. }
+        | VBlendW { .. }
+        | VBlendD { .. }
+        | VFma { .. }
+        | VFmaM { .. }
+        | VAes { .. }
+        | VAesM { .. }
+        | VAesImc { .. }
+        | VAesImcM { .. }
+        | VAesKeygen { .. }
+        | VAesKeygenM { .. }
+        | VSha { .. }
+        | VShaM { .. }
+        | VGfni { .. }
+        | VGfniM { .. }
+        | Movq2dq { .. }
+        | Movdq2q { .. }
+        | VPclmul { .. }
+        | VPclmulM { .. }
+        | VPsign { .. }
+        | VPsignM { .. }
+        | VPackWide { .. }
+        | VPackWideM { .. }
+        | VPMAddWd { .. }
+        | VPMadd { .. }
+        | VPMaddM { .. }
+        | VShuffle32Wide { .. }
+        | VShuffle16 { .. }
+        | VShufps { .. }
+        | VShufpsM { .. }
+        | VPshufb { .. }
+        | VPshufbM { .. }
+        | VPshufbWide { .. }
+        | VAlignr { .. }
+        | VAlignrM { .. }
+        | VUnpackLow { .. }
+        | VUnpackLowM { .. }
+        | VPackUsWB { .. }
+        | VInsertW { .. }
+        | VExtractW { .. }
+        | VExtractLane { .. }
+        | VInsertLane { .. }
+        | VMoveMaskB { .. }
+        | VMoveMaskFp { .. }
+        | VZeroUpper { .. }
+        | VZeroUpperAll { .. }
+        | VLoadWide { .. }
+        | VStoreWide { .. }
+        | VMovWide { .. }
+        | VMaskMov { .. }
+        | VMaskLoadMem { .. }
+        | VMaskStoreMem { .. }
+        | VVecMaskLoadMem { .. }
+        | VVecMaskStoreMem { .. }
+        | VLogic256 { .. }
+        | VLogic256M { .. }
+        | VLogicWide { .. }
+        | VLogicWideM { .. }
+        | VPopcnt { .. }
+        | VPopcntM { .. }
+        | VInsertLaneWide { .. }
+        | VExtractLaneWide { .. }
+        | VExtractLaneWideM { .. }
+        | VInsertPs { .. }
+        | VInsertPsM { .. }
+        | VInsertPs3 { .. }
+        | VInsertPsM3 { .. }
+        | VDpps { .. }
+        | VDppsM { .. }
+        | VAlign { .. }
+        | VPMovExtend { .. }
+        | VPMovExtendM { .. }
+        | VPMovExtendWide { .. }
+        | VPAbs { .. }
+        | VpUnaryLane { .. }
+        | VpBlendm { .. }
+        | VShuffLane { .. }
+        | VpMultishift { .. }
+        | VPBlendV { .. }
+        | VPBlendVM { .. }
+        | VPBlendVX { .. }
+        | VPBlendVXM { .. }
+        | VBlendI { .. }
+        | VBlendIM { .. }
+        | VDppd { .. }
+        | VDppdM { .. }
+        | VDp3 { .. }
+        | VDp3M { .. }
+        | VPRound { .. }
+        | VPRoundM { .. }
+        | VMaskedLogic { .. }
+        | VMaskedPacked { .. }
+        | VMaskedShift { .. }
+        | VShiftReg { .. }
+        | VShiftVar { .. }
+        | VGf2p8 { .. }
+        | VGf2p8M { .. }
+        | VPTernlog { .. }
+        | VPTernlogM { .. }
+        | VPackedBin256 { .. }
+        | VPackedBin256M { .. }
+        | VPackedWide { .. }
+        | VPackedWideM { .. }
+        | VMoveMaskB256 { .. }
+        | VBroadcast { .. }
+        | VBroadcastM { .. }
+        | VBroadcastGpr { .. }
+        | VBroadcastLane { .. }
+        | VBroadcastLaneM { .. }
+        | VPCmpToMask { .. }
+        | VPCmpToMaskM { .. }
+        | VPTestToMask { .. }
+        | VPTestToMaskM { .. }
+        | VKFromGpr { .. }
+        | VKToGpr { .. }
+        | VKMovKK { .. }
+        | VKUnpack { .. }
+        | VKBinOp { .. }
+        | VKNot { .. }
+        | VKShift { .. }
+        | VPmovNarrow { .. }
+        | VPmovNarrowMem { .. }
+        | VPermT2 { .. }
+        | VPermT2M { .. }
+        | VPerm1 { .. }
+        | VPerm1M { .. }
+        | VInsert128 { .. }
+        | VInsert128M { .. }
+        | VExtract128 { .. }
+        | VPshufb256 { .. }
+        | VPshufb256M { .. }
+        | VPackedShift256 { .. }
+        | VPermq { .. }
+        | VPermd { .. }
+        | VPermilVar { .. }
+        | VPerm2i128 { .. }
+        | VPalignr256 { .. }
+        | VFloatBin { .. }
+        | VFloatBinM { .. }
+        | VHFloat { .. }
+        | VHFloatM { .. }
+        | VHInt { .. }
+        | VHIntM { .. }
+        | VFloatMov { .. }
+        | VFloatCmpMask { .. }
+        | VFloatCmpMaskM { .. }
+        | VFloatCmpMask256 { .. }
+        | VFloatCmpMask256M { .. }
+        | VCvtFromInt { .. }
+        | VCvtFloat { .. }
+        | VPackedCvt { .. }
+        | VPhMinPosUw { .. }
+        | VMpsadbw { .. }
+        | VCvtPh2Ps { .. }
+        | VCvtPs2Ph { .. }
+        | VPackedCvtWide256 { .. }
+        | VFloatUnary { .. }
+        | VFloatUnaryM { .. }
+        | VFloatBin256 { .. }
+        | VFloatBin256M { .. }
+        | VFloatUnary256 { .. }
+        | VFloatUnary256M { .. }
+        | VPackedCvt256 { .. }
+        | VPackedCvt256M { .. }
+        | VShufps256 { .. }
+        | VShufps256M { .. }
+        | VUnpack256 { .. }
+        | VUnpack256M { .. }
+        | VMoveHalf { .. }
+        | VLoadHalf { .. }
+        | VStoreHalf { .. }
+        | SetDf { .. }
+        | SetIf { .. }
+        | FarJump { .. }
+        | Jump { .. }
+        | Call { .. }
+        | Ret { .. }
+        | Syscall { .. }
+        | Hlt
+        | Trap { .. } => 0,
     }
 }
 
@@ -849,44 +1145,46 @@ pub(crate) fn op_set_flags_mut(op: &mut IrOp) -> Option<&mut FlagMask> {
     }
 }
 
-/// `X86JIT_NO_FLAG_ELISION`, read once per process. It is consulted on every lift, and an embedder
-/// that single-steps lifts once per guest instruction: a `getenv` there takes a process-wide lock
-/// on macOS, which serialised embedders stepping on several threads.
+/// `X86JIT_NO_FLAG_ELISION`, read once per process to avoid repeated environment
+/// lookups during JIT translation.
 fn flag_elision_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("X86JIT_NO_FLAG_ELISION").is_some())
 }
 
-/// Dead-flag elimination (spec §3.2, M5-T2 — the compile-time form of "lazy
-/// flags"): narrow each ALU op's `set_flags` to only the flags still *live* at that
-/// point. A flag written but overwritten before any read is dead; dropping it from
-/// the mask lets the backend's flag computation for it (parity, AF, OF …) fall out
-/// as dead code. The last writer of each flag before the block ends is always kept
-/// (all flags are conservatively live at the boundary), so the observable flag
-/// state at every block exit is unchanged — interp == JIT == Unicorn still holds.
-pub(crate) fn elide_dead_flags(ops: &mut [IrOp]) {
+/// Narrow a JIT copy of the architectural IR's ALU masks (spec §3.2).
+/// The interpreter uses the original masks. JIT translation retains them beside
+/// this copy to recover omitted flags at explicit mid-block exits. Flags remain
+/// live at block boundaries; helper and conditional-writer barriers use full flags.
+/// Returns the original mask for each op (NONE for ops without an ALU mask).
+pub fn elide_dead_flags(ops: &mut [IrOp]) -> Vec<FlagMask> {
+    let original = ops
+        .iter_mut()
+        .map(|op| op_set_flags_mut(op).copied().unwrap_or(FlagMask::NONE))
+        .collect();
     if flag_elision_disabled() {
-        return; // experiment: keep every ALU op's full flag mask
+        return original; // experiment: keep every ALU op's full flag mask
     }
     let mut live: u8 = 0b11_1111; // all flags live-out at the block boundary
     for op in ops.iter_mut().rev() {
         let reads = op_reads(op);
         // A variable-count shift/rotate writes NO flags when the masked count is 0, so
         // it is only a *possible* clobber: a prior flag producer stays live across it.
-        // We still narrow the op's own mask to the live set — on the count!=0 path it
-        // is the producer of exactly those flags — but we must NOT clear them from
-        // `live` for the ops that precede it.
+        // Conditional writers keep their complete masks: their internal joins
+        // use materialized flags rather than cold recovery recipes.
         let may_skip = shift_flags_may_skip(op);
         if let Some(mask) = op_set_flags_mut(op) {
-            mask.0 &= live; // keep only the still-live flags this op writes
-                            // Effective *unconditional* writes: 0 when the flag write may be skipped
-                            // (runtime or masks-to-0 count), so the written flags remain live upward.
+            if !may_skip {
+                mask.0 &= live;
+            }
+            // A possible count-zero path cannot kill an earlier writer.
             let kills = if may_skip { 0 } else { mask.0 };
             live = (live & !kills) | reads;
         } else {
             live |= reads;
         }
     }
+    original
 }
 
 /// The reg-or-memory source trichotomy every 2-/3-operand vector lift repeats: operand

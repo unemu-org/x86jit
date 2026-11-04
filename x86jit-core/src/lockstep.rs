@@ -319,8 +319,8 @@ fn replayable_scalar(insn: &Instruction) -> bool {
             | Mnemonic::Rdpmc
             | Mnemonic::Rdpid
             | Mnemonic::Xgetbv
-            // Flag byte transfers whose result is the engine's elided/materialized flag
-            // state, not hardware's — comparing them reports flag-elision noise.
+            // Flag transfers remain outside this replay subset. Interpreter and
+            // cached IR keep architectural masks; JIT translation narrows a copy.
             | Mnemonic::Lahf
             | Mnemonic::Sahf
             | Mnemonic::Pushfq

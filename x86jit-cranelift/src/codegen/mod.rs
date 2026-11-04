@@ -247,13 +247,19 @@ pub fn translate_block(
         icount: icount_on,
         checked_ea: Vec::new(),
         guest_rips: Vec::new(),
+        full_flag_mask: FlagMask::NONE,
+        pending_flags: [None; 6],
+        flag_recipe: None,
+        exit_tails: Vec::new(),
     };
 
     t.charge_icount(ir.icount);
 
     let mut terminated = false;
-    for op in &ir.ops {
-        if t.op(op) {
+    let mut narrowed = ir.ops.clone();
+    let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
+    for (original, op) in masks.into_iter().zip(&narrowed) {
+        if t.op_with_flags(original, op) {
             terminated = true;
             break;
         }
@@ -264,6 +270,8 @@ pub fn translate_block(
         t.store_cpu(offsets.rip, end);
         t.ret(RET_CONTINUE);
     }
+    t.emit_exit_tails();
+    t.builder.seal_all_blocks();
     t.guest_rips.into_boxed_slice()
 }
 
@@ -321,6 +329,10 @@ pub fn translate_region(
         icount: icount_on,
         checked_ea: Vec::new(),
         guest_rips: Vec::new(),
+        full_flag_mask: FlagMask::NONE,
+        pending_flags: [None; 6],
+        flag_recipe: None,
+        exit_tails: Vec::new(),
     };
 
     // Carry the 16 GPRs as SSA Variables (§12 M5-T3e): declare them, seed each from
@@ -352,6 +364,7 @@ pub fn translate_region(
 
     for block in &region.blocks {
         t.builder.switch_to_block(clif[&block.guest_start]);
+        t.pending_flags = [None; 6];
         // Charge on entry; exit if the budget is spent.
         t.emit_fuel_gate(block.guest_start);
         // A region charges each guest block it actually enters, so the executed-
@@ -366,8 +379,57 @@ pub fn translate_region(
         t.emit_region_block(block, &clif);
     }
 
+    t.emit_exit_tails();
     t.builder.seal_all_blocks();
     t.guest_rips.into_boxed_slice()
+}
+
+/// Inputs needed to recompute flags on a cold exit, rather than keeping all six
+/// flag computations alive in the hot block. Conditional writers are barriers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagRecipe {
+    AddSub {
+        a: Value,
+        b: Value,
+        cin: Value,
+        size: u8,
+        sub: bool,
+    },
+    Logic {
+        result: Value,
+        size: u8,
+    },
+    Shift {
+        a: Value,
+        b: Value,
+        size: u8,
+        kind: ShiftKind,
+    },
+    DoubleShift {
+        a: Value,
+        b: Value,
+        count: Value,
+        size: u8,
+        left: bool,
+    },
+    CarryRotate {
+        result: Value,
+        cf: Value,
+        size: u8,
+        left: bool,
+    },
+    Mul {
+        a: Value,
+        b: Value,
+        size: u8,
+        signed: bool,
+    },
+}
+
+struct ExitTail {
+    block: Block,
+    pending: [Option<FlagRecipe>; 6],
+    flush_entry: Option<Block>,
 }
 
 struct Translator<'a, 'b> {
@@ -426,9 +488,99 @@ struct Translator<'a, 'b> {
     /// bound check + branch. Cleared at every basic-block boundary — the cached
     /// pointer only dominates uses in its own straight-line block.
     checked_ea: Vec<(Value, u8, Value)>,
+    /// Architectural mask of the op currently being translated, before narrowing.
+    full_flag_mask: FlagMask,
+    /// Latest omitted writer per flag (CF, PF, AF, ZF, SF, OF). Its SSA inputs
+    /// dominate every subsequent cold exit in this guest block.
+    pending_flags: [Option<FlagRecipe>; 6],
+    flag_recipe: Option<FlagRecipe>,
+    /// One cold recovery tail per pending recipe epoch. Helpers enter after the
+    /// optional region-register flush, preserving their authoritative CpuState.
+    exit_tails: Vec<ExitTail>,
 }
 
 impl Translator<'_, '_> {
+    fn op_with_flags(&mut self, original: FlagMask, narrowed: &IrOp) -> bool {
+        self.full_flag_mask = original;
+        self.op(narrowed)
+    }
+
+    fn flag_offsets(&self) -> [i32; 6] {
+        [
+            self.offsets.cf,
+            self.offsets.pf_src,
+            self.offsets.af_src,
+            self.offsets.zf,
+            self.offsets.sf,
+            self.offsets.of,
+        ]
+    }
+
+    /// SDM Vol 3A §7.5: a fault restores the state preceding the faulting
+    /// instruction (also AMD APM Vol 2 §8.1.3). Emit recovery stores only on exits;
+    /// do not change the recipes carried along the successful translation path.
+    fn recover_flags(&mut self) {
+        if self.pending_flags.iter().all(Option::is_none) {
+            return;
+        }
+        let pending = self.pending_flags;
+        let full_mask = self.full_flag_mask;
+        let recipe = self.flag_recipe;
+        self.full_flag_mask = FlagMask::NONE;
+        let scratch = self.temps.len() as u32;
+        self.temps.extend([None; 2]);
+        let mut remaining = pending;
+        for i in 0..6 {
+            let Some(writer) = remaining[i] else { continue };
+            let mut mask = FlagMask::NONE;
+            for (j, entry) in remaining.iter_mut().enumerate() {
+                if *entry == Some(writer) {
+                    mask.0 |= 1 << j;
+                    *entry = None;
+                }
+            }
+            match writer {
+                FlagRecipe::AddSub {
+                    a,
+                    b,
+                    cin,
+                    size,
+                    sub,
+                } => {
+                    self.add_sub(scratch, a, b, cin, size, mask, sub);
+                }
+                FlagRecipe::Logic { result, size } => self.logic(scratch, result, size, mask),
+                FlagRecipe::Shift { a, b, size, kind } => {
+                    self.emit_shift(scratch, kind, a, b, size, mask);
+                }
+                FlagRecipe::DoubleShift {
+                    a,
+                    b,
+                    count,
+                    size,
+                    left,
+                } => {
+                    self.emit_double_shift(scratch, a, b, count, size, left, mask);
+                }
+                FlagRecipe::CarryRotate {
+                    result,
+                    cf,
+                    size,
+                    left,
+                } => {
+                    self.carry_rotate_flags(result, cf, size, left, mask);
+                }
+                FlagRecipe::Mul { a, b, size, signed } => {
+                    self.emit_mul(scratch, scratch + 1, a, b, size, signed, mask);
+                }
+            }
+        }
+        self.temps.truncate(scratch as usize);
+        self.full_flag_mask = full_mask;
+        self.pending_flags = pending;
+        self.flag_recipe = recipe;
+    }
+
     /// Translate one op; return `true` if it terminated the block.
     fn op(&mut self, op: &IrOp) -> bool {
         match op {
@@ -1853,6 +2005,13 @@ impl Translator<'_, '_> {
         let af_src = self.af_src(am, bm, res);
 
         self.set(dst, res);
+        self.flag_recipe = Some(FlagRecipe::AddSub {
+            a,
+            b,
+            cin,
+            size,
+            sub,
+        });
         self.store_flags(mask, cf, pf_src, af_src, zf, sf, of);
     }
 
@@ -1884,6 +2043,8 @@ impl Translator<'_, '_> {
             ShiftKind::Ror => self.rotate(vm, cnt, size, false),
         };
         self.set(dst, res);
+        self.flag_recipe = Some(FlagRecipe::Shift { a, b, size, kind });
+        self.record_omitted_flags(mask);
         if mask.is_none() {
             return;
         }
@@ -2028,6 +2189,13 @@ impl Translator<'_, '_> {
         let ep = self.builder.block_params(exit).to_vec();
         let (res, cf_out) = (ep[0], ep[1]);
         self.set(dst, res);
+        self.flag_recipe = Some(FlagRecipe::CarryRotate {
+            result: res,
+            cf: cf_out,
+            size,
+            left,
+        });
+        self.record_omitted_flags(mask);
         if mask.is_none() {
             return;
         }
@@ -2039,6 +2207,22 @@ impl Translator<'_, '_> {
         self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
         self.builder.seal_block(doflags);
         self.builder.switch_to_block(doflags);
+        self.carry_rotate_flags(res, cf_out, size, left, mask);
+
+        self.builder.ins().jump(cont, &[]);
+        self.builder.seal_block(cont);
+        self.builder.switch_to_block(cont);
+    }
+
+    fn carry_rotate_flags(
+        &mut self,
+        res: Value,
+        cf_out: Value,
+        size: u8,
+        left: bool,
+        mask: FlagMask,
+    ) {
+        let w = (size as i64) * 8;
         let cf8 = self.builder.ins().ireduce(types::I8, cf_out);
         let msb = self.msb(res, size);
         let of = if left {
@@ -2056,10 +2240,6 @@ impl Translator<'_, '_> {
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf8, pf_src, zero8, zf, sf, of);
-
-        self.builder.ins().jump(cont, &[]);
-        self.builder.seal_block(cont);
-        self.builder.switch_to_block(cont);
     }
 
     /// `SHLD`/`SHRD` (mirrors interp `DoubleShift`): shift `a` by `count`, filling
@@ -2094,6 +2274,14 @@ impl Translator<'_, '_> {
         let iszero = self.builder.ins().icmp_imm(IntCC::Equal, cnt, 0);
         let res = self.builder.ins().select(iszero, va, shifted);
         self.set(dst, res);
+        self.flag_recipe = Some(FlagRecipe::DoubleShift {
+            a,
+            b,
+            count,
+            size,
+            left,
+        });
+        self.record_omitted_flags(mask);
         if mask.is_none() {
             return;
         }
@@ -2181,7 +2369,8 @@ impl Translator<'_, '_> {
         };
         self.set(lo_t, lo);
         self.set(hi_t, hi);
-        if !mask.is_none() {
+        if !mask.is_none() || !self.full_flag_mask.is_none() {
+            self.flag_recipe = Some(FlagRecipe::Mul { a, b, size, signed });
             let zero8 = self.builder.ins().iconst(types::I8, 0);
             // CF_OF stores only cf and of, so pass `overflow` for both — but with a PF
             // source that means PF=0; a raw zero byte has even parity and means PF=1.
@@ -2257,6 +2446,7 @@ impl Translator<'_, '_> {
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.set(dst, res);
+        self.flag_recipe = Some(FlagRecipe::Logic { result: res, size });
         self.store_flags(mask, zero8, pf_src, zero8, zf, sf, zero8);
     }
 
@@ -2331,6 +2521,7 @@ impl Translator<'_, '_> {
         of: Value,
     ) {
         let m = mask.0;
+        self.record_omitted_flags(mask);
         if m & 0b00_0001 != 0 {
             self.store_flag(self.offsets.cf, cf);
         }
@@ -2348,6 +2539,15 @@ impl Translator<'_, '_> {
         }
         if m & 0b10_0000 != 0 {
             self.store_flag(self.offsets.of, of);
+        }
+    }
+
+    fn record_omitted_flags(&mut self, mask: FlagMask) {
+        let m = mask.0;
+        for i in 0..6 {
+            if self.full_flag_mask.0 & !m & (1 << i) != 0 {
+                self.pending_flags[i] = Some(self.flag_recipe.expect("unconditional ALU recipe"));
+            }
         }
     }
 
@@ -3809,6 +4009,9 @@ impl Translator<'_, '_> {
     }
 
     pub(crate) fn store_flag(&mut self, off: i32, v: Value) {
+        if let Some(i) = self.flag_offsets().iter().position(|&offset| offset == off) {
+            self.pending_flags[i] = None;
+        }
         self.builder
             .ins()
             .store(MemFlags::trusted(), v, self.cpu, off);
@@ -3818,16 +4021,71 @@ impl Translator<'_, '_> {
     /// (a no-op in single-block mode). Every exit and trap flows through here (incl.
     /// `chain_or_link`), so this one flush covers them all.
     pub(crate) fn ret(&mut self, code: u64) {
-        self.flush_gprs();
-        self.ret_no_flush(code);
+        self.exit(code, true);
     }
 
-    /// Return WITHOUT flushing — for a helper's own trap path, where the helper has
-    /// already written the authoritative `CpuState` (e.g. a partial `rep movs`) and
-    /// flushing stale Variables over it would corrupt guest state.
+    /// Helpers have already written authoritative state on their trap path.
     pub(crate) fn ret_no_flush(&mut self, code: u64) {
+        self.exit(code, false);
+    }
+
+    fn exit(&mut self, code: u64, flush: bool) {
+        if self.pending_flags.iter().all(Option::is_none) {
+            if flush {
+                self.flush_gprs();
+            }
+            let v = self.iconst(code);
+            self.builder.ins().return_(&[v]);
+            return;
+        }
+        let index = if let Some(index) = self
+            .exit_tails
+            .iter()
+            .position(|tail| tail.pending == self.pending_flags)
+        {
+            index
+        } else {
+            let block = self.builder.create_block();
+            self.builder.set_cold_block(block);
+            self.builder.append_block_param(block, types::I64);
+            self.exit_tails.push(ExitTail {
+                block,
+                pending: self.pending_flags,
+                flush_entry: None,
+            });
+            self.exit_tails.len() - 1
+        };
+        let block = if flush && self.gpr_vars.is_some() {
+            if let Some(entry) = self.exit_tails[index].flush_entry {
+                entry
+            } else {
+                let entry = self.builder.create_block();
+                self.builder.set_cold_block(entry);
+                self.builder.append_block_param(entry, types::I64);
+                self.exit_tails[index].flush_entry = Some(entry);
+                entry
+            }
+        } else {
+            self.exit_tails[index].block
+        };
         let v = self.iconst(code);
-        self.builder.ins().return_(&[v]);
+        self.builder.ins().jump(block, &[v]);
+    }
+
+    fn emit_exit_tails(&mut self) {
+        for tail in std::mem::take(&mut self.exit_tails) {
+            if let Some(entry) = tail.flush_entry {
+                self.builder.switch_to_block(entry);
+                self.flush_gprs();
+                let code = self.builder.block_params(entry)[0];
+                self.builder.ins().jump(tail.block, &[code]);
+            }
+            self.builder.switch_to_block(tail.block);
+            self.pending_flags = tail.pending;
+            self.recover_flags();
+            let code = self.builder.block_params(tail.block)[0];
+            self.builder.ins().return_(&[code]);
+        }
     }
 
     /// Tail shared by the fault-capable helpers (x87 / fxstate / rep-string): `inst`'s
@@ -4111,8 +4369,10 @@ impl Translator<'_, '_> {
         } else {
             &block.ops[..]
         };
-        for op in body {
-            if self.op(op) {
+        let mut narrowed = body.to_vec();
+        let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
+        for (original, op) in masks.into_iter().zip(&narrowed) {
+            if self.op_with_flags(original, op) {
                 return; // a normal terminator handled the exit
             }
         }
@@ -4175,7 +4435,7 @@ impl Translator<'_, '_> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 enum ShiftKind {
     Shl,
     Shr,

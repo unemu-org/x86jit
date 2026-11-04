@@ -498,7 +498,8 @@ fn count0_runtime_shift_preserves_flags() {
 /// intervening `shl edx, cl` as a definite CF/SF/ZF/... clobber and drop `cmp`'s flags as
 /// dead. But with cl == 0 the shift writes nothing, so `setcc`/`cmovcc` must observe
 /// `cmp`'s flags — the earlier producer is still live. This is the case the block-boundary
-/// "everything live" rule does NOT cover, so it exercises the `elide_dead_flags` fix.
+/// "everything live" rule does NOT cover. `elide_dead_flags` runs at JIT translation
+/// time on a copy; interpreter and cached IR retain architectural masks.
 #[test]
 fn count0_shift_keeps_prior_flags_live_for_later_read() {
     let build = |a: &mut CodeAssembler| {
