@@ -14,6 +14,7 @@ use crate::ir::{
     IrBlock, IrOp, IrRegion, LoopKind, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps, RepKind,
     RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
+use crate::jit_abi::MAX_GUEST_ACCESS_DESCRIPTORS;
 use crate::memory::Memory;
 use crate::state::{iced_gpr_index, Reg};
 
@@ -254,10 +255,291 @@ fn push_real16_fault(insn: &Instruction, mode: CpuMode, vector: u8, ops: &mut Ve
     });
 }
 
+// Bound distinct (instruction owner, direction, transfer width) descriptors,
+// rather than transfers: vector chunks share a width and direction. Helper-only
+// memory ops are counted too, conservatively. Reverse-subtract atomics emit both
+// an initial read and a read/write CAS; other memory IR ops need at most one.
+fn guest_access_descriptors(ops: &[IrOp]) -> usize {
+    use IrOp::*;
+    ops.iter()
+        .map(|op| match op {
+            AtomicRmw {
+                op: RmwOp::Rsub, ..
+            } => 2,
+            Load { .. }
+            | Store { .. }
+            | X87 { .. }
+            | FxState { .. }
+            | AtomicRmw { .. }
+            | AtomicCas { .. }
+            | VLoad { .. }
+            | VStore { .. }
+            | VPackedBinM { .. }
+            | VLogicM { .. }
+            | VBlendWM { .. }
+            | VFmaM { .. }
+            | VAesM { .. }
+            | VAesImcM { .. }
+            | VAesKeygenM { .. }
+            | VShaM { .. }
+            | VGfniM { .. }
+            | VPclmulM { .. }
+            | VPsignM { .. }
+            | VPackWideM { .. }
+            | VPMaddM { .. }
+            | VShuffle16M { .. }
+            | VShufpsM { .. }
+            | VPshufbM { .. }
+            | VAlignrM { .. }
+            | VUnpackLowM { .. }
+            | VLoadWide { .. }
+            | VStoreWide { .. }
+            | VMaskLoadMem { .. }
+            | VMaskStoreMem { .. }
+            | VVecMaskLoadMem { .. }
+            | VVecMaskStoreMem { .. }
+            | VLogic256M { .. }
+            | VLogicWideM { .. }
+            | VPopcntM { .. }
+            | VExtractLaneWideM { .. }
+            | VPcmpStrM { .. }
+            | VPcmpStrMaskM { .. }
+            | VInsertPsM { .. }
+            | VInsertPsM3 { .. }
+            | VDppsM { .. }
+            | VPMovExtendM { .. }
+            | VPBlendVM { .. }
+            | VPBlendVXM { .. }
+            | VBlendIM { .. }
+            | VDppdM { .. }
+            | VDp3M { .. }
+            | VPRoundM { .. }
+            | VShiftRegM { .. }
+            | VGf2p8M { .. }
+            | VPTernlogM { .. }
+            | VPackedBin256M { .. }
+            | VPackedWideM { .. }
+            | VBroadcastM { .. }
+            | VBroadcastLaneM { .. }
+            | VPCmpToMaskM { .. }
+            | VPTestToMaskM { .. }
+            | VPmovNarrowMem { .. }
+            | VPermT2M { .. }
+            | VPerm1M { .. }
+            | VInsert128M { .. }
+            | VPshufb256M { .. }
+            | VPtestM { .. }
+            | VFloatBinM { .. }
+            | VFloatUnaryM { .. }
+            | VHFloatM { .. }
+            | VHIntM { .. }
+            | VFloatCmpMaskM { .. }
+            | VFloatCmpMask256M { .. }
+            | VMpsadbwM { .. }
+            | VFloatBin256M { .. }
+            | VFloatUnary256M { .. }
+            | VPackedCvt256M { .. }
+            | VShufps256M { .. }
+            | VUnpack256M { .. }
+            | VLoadHalf { .. }
+            | VStoreHalf { .. }
+            | Call { .. }
+            | Ret { .. } => 1,
+            InsnStart { .. }
+            | ReadReg { .. }
+            | WriteReg { .. }
+            | Add { .. }
+            | Sub { .. }
+            | Adc { .. }
+            | Sbb { .. }
+            | And { .. }
+            | Or { .. }
+            | Xor { .. }
+            | Shl { .. }
+            | Shr { .. }
+            | Sar { .. }
+            | DoubleShift { .. }
+            | Rol { .. }
+            | Ror { .. }
+            | Rcl { .. }
+            | Rcr { .. }
+            | Sext { .. }
+            | Bswap { .. }
+            | Mul { .. }
+            | Div { .. }
+            | GetCond { .. }
+            | Bt { .. }
+            | Cpuid
+            | ReadTsc { .. }
+            | Random { .. }
+            | Xgetbv
+            | Popcnt { .. }
+            | Crc32 { .. }
+            | BitScan { .. }
+            | Bmi { .. }
+            | VMov { .. }
+            | VMov256 { .. }
+            | VFromGpr { .. }
+            | VToGpr { .. }
+            | VLogic { .. }
+            | VPackedBin { .. }
+            | VPackedShift { .. }
+            | VByteShift { .. }
+            | VShuffle32 { .. }
+            | VBlendW { .. }
+            | VBlendD { .. }
+            | VFma { .. }
+            | VAes { .. }
+            | VAesImc { .. }
+            | VAesKeygen { .. }
+            | VSha { .. }
+            | VGfni { .. }
+            | Movq2dq { .. }
+            | Movdq2q { .. }
+            | VPclmul { .. }
+            | VPsign { .. }
+            | VPackWide { .. }
+            | VPMAddWd { .. }
+            | VPMadd { .. }
+            | VShuffle32Wide { .. }
+            | VShuffle16 { .. }
+            | VShufps { .. }
+            | VPshufb { .. }
+            | VPshufbWide { .. }
+            | VAlignr { .. }
+            | VUnpackLow { .. }
+            | VPackUsWB { .. }
+            | VInsertW { .. }
+            | VExtractW { .. }
+            | VExtractLane { .. }
+            | VInsertLane { .. }
+            | VMoveMaskB { .. }
+            | VMoveMaskFp { .. }
+            | VZeroUpper { .. }
+            | VZeroUpperAll { .. }
+            | VMovWide { .. }
+            | VMaskMov { .. }
+            | VLogic256 { .. }
+            | VLogicWide { .. }
+            | VPopcnt { .. }
+            | VInsertLaneWide { .. }
+            | VExtractLaneWide { .. }
+            | VPcmpStr { .. }
+            | VPcmpStrMask { .. }
+            | VInsertPs { .. }
+            | VInsertPs3 { .. }
+            | VDpps { .. }
+            | VAlign { .. }
+            | VPMovExtend { .. }
+            | VPMovExtendWide { .. }
+            | VPAbs { .. }
+            | VpUnaryLane { .. }
+            | VpBlendm { .. }
+            | VShuffLane { .. }
+            | VpMultishift { .. }
+            | VPBlendV { .. }
+            | VPBlendVX { .. }
+            | VBlendI { .. }
+            | VDppd { .. }
+            | VDp3 { .. }
+            | VPRound { .. }
+            | VMaskedLogic { .. }
+            | VMaskedPacked { .. }
+            | VMaskedShift { .. }
+            | VShiftReg { .. }
+            | VShiftVar { .. }
+            | VGf2p8 { .. }
+            | VPTernlog { .. }
+            | VPackedBin256 { .. }
+            | VPackedWide { .. }
+            | VMoveMaskB256 { .. }
+            | VBroadcast { .. }
+            | VBroadcastGpr { .. }
+            | VBroadcastLane { .. }
+            | VPCmpToMask { .. }
+            | VPTestToMask { .. }
+            | VKOrTest { .. }
+            | VKFromGpr { .. }
+            | VKToGpr { .. }
+            | VKMovKK { .. }
+            | VKUnpack { .. }
+            | VKBinOp { .. }
+            | VKNot { .. }
+            | VKShift { .. }
+            | VPmovNarrow { .. }
+            | VPermT2 { .. }
+            | VPerm1 { .. }
+            | VInsert128 { .. }
+            | VExtract128 { .. }
+            | VPshufb256 { .. }
+            | VPackedShift256 { .. }
+            | VPermq { .. }
+            | VPermd { .. }
+            | VPermilVar { .. }
+            | VPerm2i128 { .. }
+            | VPalignr256 { .. }
+            | VPtest { .. }
+            | VTestFp { .. }
+            | VFloatBin { .. }
+            | VHFloat { .. }
+            | VHInt { .. }
+            | VFloatMov { .. }
+            | VFloatCmp { .. }
+            | VFloatCmpMask { .. }
+            | VFloatCmpMask256 { .. }
+            | VCvtFromInt { .. }
+            | VCvtToInt { .. }
+            | VCvtFloat { .. }
+            | VPackedCvt { .. }
+            | VPhMinPosUw { .. }
+            | VMpsadbw { .. }
+            | VCvtPh2Ps { .. }
+            | VCvtPs2Ph { .. }
+            | VPackedCvtWide256 { .. }
+            | VFloatUnary { .. }
+            | VFloatBin256 { .. }
+            | VFloatUnary256 { .. }
+            | VPackedCvt256 { .. }
+            | VShufps256 { .. }
+            | VUnpack256 { .. }
+            | VMoveHalf { .. }
+            | SetDf { .. }
+            | SetIf { .. }
+            | PushfReal
+            | PopfReal
+            | IntGate { .. }
+            | IntoGate { .. }
+            | BoundGate { .. }
+            | SegLimitCheck { .. }
+            | IretReal
+            | SetCf { .. }
+            | Bcd { .. }
+            | LoopCx { .. }
+            | FarJump { .. }
+            | FarCall { .. }
+            | FarRet { .. }
+            | RepString { .. }
+            | RepStringReal { .. }
+            | Lahf
+            | Sahf
+            | PushaReal
+            | PopaReal
+            | EnterReal { .. }
+            | Jump { .. }
+            | Branch { .. }
+            | Syscall { .. }
+            | Hlt
+            | Trap { .. }
+            | PortIo { .. } => 0,
+        })
+        .sum()
+}
+
 /// Lift a single basic block starting at `at` (§7.3).
 ///
 /// The block ends at the first control-flow instruction (per iced's flow-control
-/// classification, not a hand list) or when the mapped code runs out. `TempGen`
+/// classification, not a hand list), before the guest-access descriptor limit,
+/// or when the mapped code runs out. `TempGen`
 /// grows across the whole block. Emits `IrOp::InsnStart` at each instruction
 /// boundary so a mid-block trap can set RIP to the faulting instruction (§8, §16).
 ///
@@ -273,6 +555,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
 
     let mut ops = Vec::new();
     let mut tg = TempGen::new();
+    let mut descriptors = 0;
     let mut icount = 0u32;
     let mut guest_len = 0u32;
     let mut insn = Instruction::default();
@@ -329,6 +612,12 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
                 return Err(refill_unsupported_bytes(e, code, start));
             }
         };
+        let instruction_descriptors = guest_access_descriptors(&ops[ops_start..]);
+        if icount > 0 && descriptors + instruction_descriptors > MAX_GUEST_ACCESS_DESCRIPTORS {
+            ops.truncate(ops_start);
+            break;
+        }
+        descriptors += instruction_descriptors;
         icount += 1;
         guest_len += insn.len() as u32;
         if terminated {
@@ -415,6 +704,53 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
 mod tests {
     use super::*;
     use crate::memory::{MemoryModel, Prot, RegionKind};
+
+    #[test]
+    fn guest_descriptor_limit_ends_blocks_at_instruction_boundaries() {
+        for (insn, count) in [
+            (&[0x48, 0x8b, 0x07][..], 249),
+            (&[0xf3, 0x0f, 0x51, 0x07][..], 249),
+            (&[0xf0, 0x48, 0xf7, 0x1f][..], 124),
+            (&[0x48, 0x83, 0x07, 1][..], 124),
+        ] {
+            let mut bytes = insn.repeat(250);
+            bytes.push(0xf4);
+            let mem = mem_with(&bytes);
+            let first = lift_block(&mem, FetchAddr::flat(BASE), CpuMode::Long64).unwrap();
+            assert_eq!(first.icount, count);
+            assert_eq!(first.guest_len as usize, count as usize * insn.len());
+            assert!(!matches!(first.ops.last(), Some(IrOp::Hlt)));
+            let next = BASE + u64::from(first.guest_len);
+            let second = lift_block(&mem, FetchAddr::flat(next), CpuMode::Long64).unwrap();
+            assert_eq!(second.guest_start, next);
+            assert!(
+                matches!(second.ops.first(), Some(IrOp::InsnStart { guest_addr }) if *guest_addr == next)
+            );
+        }
+    }
+
+    #[test]
+    fn guest_descriptor_limit_caps_region_before_successor() {
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            bytes.extend([0x48, 0x8b, 0x07].repeat(100));
+            bytes.extend([0xeb, 0]); // a distinct fall-through successor
+        }
+        bytes.push(0xf4);
+        let mem = mem_with(&bytes);
+        let region = lift_region(
+            &mem,
+            BASE,
+            RegionCaps {
+                max_blocks: 16,
+                max_icount: 1000,
+            },
+            CpuMode::Long64,
+        )
+        .unwrap();
+        assert_eq!(region.blocks.len(), 2);
+        assert_eq!(region.blocks[1].guest_start, BASE + 302);
+    }
 
     #[test]
     fn flag_reader_masks() {
@@ -785,6 +1121,7 @@ pub fn lift_region(
     use std::collections::HashMap;
 
     // DFS from the entry, lifting each block once, collecting a post-order.
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         mem: &Memory,
         addr: u64,
@@ -793,6 +1130,7 @@ pub fn lift_region(
         blocks: &mut HashMap<u64, IrBlock>,
         post: &mut Vec<u64>,
         icount: &mut u32,
+        descriptors: &mut usize,
     ) {
         for s in static_succs(&blocks[&addr]) {
             if blocks.contains_key(&s) {
@@ -804,9 +1142,14 @@ pub fn lift_region(
             // Region compilation is a JIT tier-up path; Real16 never JITs (§17.6, it
             // stays on the interpreter), so successor addresses are flat here.
             if let Ok(b) = lift_block(mem, FetchAddr::flat(s), mode) {
+                let count = guest_access_descriptors(&b.ops);
+                if *descriptors + count > MAX_GUEST_ACCESS_DESCRIPTORS {
+                    continue;
+                }
+                *descriptors += count;
                 *icount += b.icount;
                 blocks.insert(s, b);
-                dfs(mem, s, caps, mode, blocks, post, icount);
+                dfs(mem, s, caps, mode, blocks, post, icount, descriptors);
             }
             // An unliftable first instruction stays an exit edge at `s`. A valid
             // prefix is retained as a block, so it executes before that exit.
@@ -815,10 +1158,20 @@ pub fn lift_region(
     }
 
     let first = lift_block(mem, FetchAddr::flat(entry), mode)?;
+    let mut descriptors = guest_access_descriptors(&first.ops);
     let mut icount = first.icount;
     let mut blocks = HashMap::from([(entry, first)]);
     let mut post = Vec::new();
-    dfs(mem, entry, caps, mode, &mut blocks, &mut post, &mut icount);
+    dfs(
+        mem,
+        entry,
+        caps,
+        mode,
+        &mut blocks,
+        &mut post,
+        &mut icount,
+        &mut descriptors,
+    );
 
     // Reverse post-order (entry first). Remove from the map in this order so each
     // `IrBlock` moves out exactly once.

@@ -1,15 +1,15 @@
 //! Process-global host-PC → guest-RIP side table for guard-page fault recovery.
 //! Full-width guest RIPs are stored separately from compact `(host_off, rip_index)`
 //! source locations. Lookup uses an immutable AVL tree of non-overlapping host
-//! ranges, then binary-searches the function's source locations.
+//! ranges, then binary-searches the function's source locations or exact trap sites.
 //!
 //! Writers serialize under a mutex, copy only the insertion path, and publish a
 //! fully initialized root with Release. Readers acquire ONE root and traverse only
 //! immutable nodes: no allocation, lock, reference counting, or retry. Old paths,
-//! source locations and RIP arrays are never freed, even after an SMC invalidation
+//! source locations, RIP arrays and trap sites are never freed, even after an SMC invalidation
 //! or backend drop; a handler interrupted before publication can finish on its old
 //! root. This matches the unreclaimed executable arena's lifetime. There is no
-//! unregister operation. Lookup is async-signal-safe and O(log n + log srclocs).
+//! unregister operation. Lookup is async-signal-safe and O(log n + log table size).
 //! Retained index storage is O(n log n), bounded by the registration capacity;
 //! reclaiming translations and their metadata is separate work.
 //!
@@ -21,8 +21,29 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
 const MAX_ENTRIES: usize = 1024 * 4096;
+const MAX_TRAP_SITES: usize = 64 * 1024 * 1024;
 
-/// The process-global code map has reached its registration capacity.
+/// Direction of a faulting transfer in compiled guest code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestAccessKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// One potentially faulting host instruction accessing guest memory.
+/// Split operands have a record for each host transfer, with that transfer's width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestTrapSite {
+    pub host_offset: u32,
+    /// RIP of the access owner, independent of a merged consumer's source location.
+    pub guest_rip: u64,
+    pub access: GuestAccessKind,
+    /// Transfer width in bytes.
+    pub width: u8,
+}
+
+/// The process-global code map has reached its function or trap-site capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeMapFull;
 
@@ -33,6 +54,13 @@ struct Entry {
     table: *const (u32, u32),
     table_len: usize,
     guest_rips: *const u64,
+    traps: *const GuestTrapSite,
+    traps_len: usize,
+}
+
+struct Counts {
+    entries: usize,
+    traps: usize,
 }
 
 struct Node {
@@ -109,8 +137,9 @@ impl Node {
 pub struct CodeMap {
     root: AtomicPtr<Node>,
     /// Only writers read or update the count; readers never take this mutex.
-    len: Mutex<usize>,
+    len: Mutex<Counts>,
     capacity: usize,
+    trap_capacity: usize,
 }
 
 impl CodeMap {
@@ -121,8 +150,12 @@ impl CodeMap {
     const fn with_capacity(capacity: usize) -> Self {
         Self {
             root: AtomicPtr::new(ptr::null_mut()),
-            len: Mutex::new(0),
+            len: Mutex::new(Counts {
+                entries: 0,
+                traps: 0,
+            }),
             capacity,
+            trap_capacity: MAX_TRAP_SITES,
         }
     }
 
@@ -142,27 +175,52 @@ impl CodeMap {
         table: Box<[(u32, u32)]>,
         guest_rips: Box<[u64]>,
     ) -> Result<(), CodeMapFull> {
+        self.register_with_traps(start, code_len, table, guest_rips, Vec::new())
+    }
+
+    /// Register source locations and sorted, unique guest trap sites together.
+    /// The caller allocates `traps` fallibly; registration retains its allocation
+    /// without shrinking or copying it, charging its capacity (including spare slots).
+    /// Either capacity limit leaves the map intact.
+    pub fn register_with_traps(
+        &self,
+        start: usize,
+        code_len: u32,
+        table: Box<[(u32, u32)]>,
+        guest_rips: Box<[u64]>,
+        traps: Vec<GuestTrapSite>,
+    ) -> Result<(), CodeMapFull> {
         assert!(
             table.iter().all(|&(_, i)| (i as usize) < guest_rips.len()),
             "CodeMap RIP index out of bounds"
         );
+        assert!(traps
+            .windows(2)
+            .all(|s| s[0].host_offset < s[1].host_offset));
+        assert!(traps.iter().all(|s| s.host_offset < code_len));
+        let end = start
+            .checked_add(code_len as usize)
+            .expect("CodeMap host range overflow");
+        let retained_traps = traps.capacity();
         let mut len = self.len.lock().unwrap();
-        if *len >= self.capacity {
+        if len.entries >= self.capacity || retained_traps > self.trap_capacity - len.traps {
             return Err(CodeMapFull);
         }
         let entry = Entry {
             start,
-            end: start
-                .checked_add(code_len as usize)
-                .expect("CodeMap host range overflow"),
+            end,
             table_len: table.len(),
             table: Box::into_raw(table) as *const (u32, u32),
             guest_rips: Box::into_raw(guest_rips) as *const u64,
+            traps: traps.as_ptr(),
+            traps_len: traps.len(),
         };
+        std::mem::forget(traps);
         let root = Node::insert(self.root(), entry);
         self.root
             .store(root as *const Node as *mut Node, Ordering::Release);
-        *len += 1;
+        len.entries += 1;
+        len.traps += retained_traps;
         Ok(())
     }
 
@@ -172,6 +230,34 @@ impl CodeMap {
     }
 
     fn lookup_probed(&self, pc: usize, mut visit: impl FnMut()) -> Option<u64> {
+        let e = self.find_entry(pc, &mut visit)?;
+        let off = (pc - e.start) as u32;
+        // SAFETY: the leaked slice was published with the acquired root.
+        let table = unsafe { slice::from_raw_parts(e.table, e.table_len) };
+        let idx = table.partition_point(|&(h, _)| h <= off);
+        (idx > 0).then(|| {
+            // SAFETY: register validated every index into the leaked RIP
+            // array, which was published together with this table.
+            unsafe { *e.guest_rips.add(table[idx - 1].1 as usize) }
+        })
+    }
+
+    /// Resolve an exact faulting host PC to its guest transfer. Nearby instructions
+    /// do not inherit a trap site. Allocation-free, lock-free, async-signal-safe;
+    /// O(log functions + log sites in the function).
+    pub fn lookup_trap(&self, pc: usize) -> Option<GuestTrapSite> {
+        let e = self.find_entry(pc, &mut || {})?;
+        // SAFETY: registration leaks this immutable Vec allocation before Release
+        // publication; find_entry acquired the root and the length travels with it.
+        let traps = unsafe { slice::from_raw_parts(e.traps, e.traps_len) };
+        let off = (pc - e.start) as u32;
+        traps
+            .binary_search_by_key(&off, |s| s.host_offset)
+            .ok()
+            .map(|i| traps[i])
+    }
+
+    fn find_entry(&self, pc: usize, visit: &mut impl FnMut()) -> Option<Entry> {
         let mut node = self.root();
         while let Some(n) = node {
             visit();
@@ -181,15 +267,7 @@ impl CodeMap {
             } else if pc >= e.end {
                 node = n.right;
             } else {
-                let off = (pc - e.start) as u32;
-                // SAFETY: the leaked slice was published with the acquired root.
-                let table = unsafe { slice::from_raw_parts(e.table, e.table_len) };
-                let idx = table.partition_point(|&(h, _)| h <= off);
-                return (idx > 0).then(|| {
-                    // SAFETY: register validated every index into the leaked RIP
-                    // array, which was published together with this table.
-                    unsafe { *e.guest_rips.add(table[idx - 1].1 as usize) }
-                });
+                return Some(e);
             }
         }
         None
@@ -213,9 +291,212 @@ pub fn lookup(pc: usize) -> Option<u64> {
     CODE_MAP.lookup(pc)
 }
 
+/// Register a function and its guest trap sites in the process-global map.
+pub fn register_with_traps(
+    start: usize,
+    code_len: u32,
+    table: Box<[(u32, u32)]>,
+    guest_rips: Box<[u64]>,
+    traps: Vec<GuestTrapSite>,
+) -> Result<(), CodeMapFull> {
+    CODE_MAP.register_with_traps(start, code_len, table, guest_rips, traps)
+}
+
+/// Resolve an exact faulting PC in the process-global map.
+pub fn lookup_trap(pc: usize) -> Option<GuestTrapSite> {
+    CODE_MAP.lookup_trap(pc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trap_lookup_is_exact_and_keeps_split_transfer_records() {
+        let map = CodeMap::new();
+        let rip = 0x1234_5678_ffff_ffff;
+        let sites = vec![
+            GuestTrapSite {
+                host_offset: 4,
+                guest_rip: rip,
+                access: GuestAccessKind::Read,
+                width: 8,
+            },
+            GuestTrapSite {
+                host_offset: 8,
+                guest_rip: rip,
+                access: GuestAccessKind::Read,
+                width: 8,
+            },
+            GuestTrapSite {
+                host_offset: 16,
+                guest_rip: rip + (1 << 32),
+                access: GuestAccessKind::ReadWrite,
+                width: 4,
+            },
+        ];
+        map.register_with_traps(
+            0x1000,
+            24,
+            Box::new([(0, 0), (12, 1)]),
+            Box::new([rip, rip + (1 << 32)]),
+            sites.clone(),
+        )
+        .unwrap();
+        // Interrupting the writer must not prevent either lookup from completing.
+        let _writer = map.len.lock().unwrap();
+        for off in 0..32 {
+            let expected = sites
+                .iter()
+                .find(|s| s.host_offset as usize == off)
+                .copied();
+            assert_eq!(map.lookup_trap(0x1000 + off), expected);
+            if let Some(s) = expected {
+                assert_eq!(map.lookup(0x1000 + off), Some(s.guest_rip));
+            }
+        }
+        assert_eq!(map.lookup_trap(0xfff), None);
+    }
+
+    #[test]
+    fn trap_capacity_exhaustion_preserves_the_published_tree() {
+        let mut map = CodeMap::with_capacity(3);
+        map.trap_capacity = 1;
+        let site = GuestTrapSite {
+            host_offset: 4,
+            guest_rip: u64::MAX,
+            access: GuestAccessKind::Write,
+            width: 2,
+        };
+        map.register_with_traps(
+            0x1000,
+            8,
+            Box::new([(0, 0)]),
+            Box::new([u64::MAX]),
+            vec![site],
+        )
+        .unwrap();
+        let root = map.root.load(Ordering::Relaxed);
+        assert_eq!(
+            map.register_with_traps(
+                0x2000,
+                8,
+                Box::new([(0, 0)]),
+                Box::new([u64::MAX]),
+                vec![site]
+            ),
+            Err(CodeMapFull)
+        );
+        assert_eq!(map.root.load(Ordering::Relaxed), root);
+        assert_eq!(map.lookup_trap(0x1004), Some(site));
+        assert_eq!(map.lookup_trap(0x2004), None);
+        let counts = map.len.lock().unwrap();
+        assert_eq!(counts.entries, 1);
+        assert_eq!(counts.traps, 1);
+    }
+
+    #[test]
+    fn trap_capacity_charges_retained_allocation() {
+        let mut map = CodeMap::with_capacity(2);
+        map.trap_capacity = 2;
+        let mut traps = Vec::with_capacity(3);
+        traps.push(GuestTrapSite {
+            host_offset: 0,
+            guest_rip: 1,
+            access: GuestAccessKind::Read,
+            width: 1,
+        });
+        assert_eq!(
+            map.register_with_traps(0x1000, 8, Box::new([]), Box::new([]), traps),
+            Err(CodeMapFull)
+        );
+        assert!(map.root().is_none());
+
+        map.trap_capacity = 4;
+        let site = GuestTrapSite {
+            host_offset: 0,
+            guest_rip: 1,
+            access: GuestAccessKind::Read,
+            width: 1,
+        };
+        let mut traps = Vec::with_capacity(3);
+        traps.push(site);
+        map.register_with_traps(0x1000, 8, Box::new([]), Box::new([]), traps)
+            .unwrap();
+        assert_eq!(map.len.lock().unwrap().traps, 3);
+        let mut traps = Vec::with_capacity(2);
+        traps.push(site);
+        assert_eq!(
+            map.register_with_traps(0x2000, 8, Box::new([]), Box::new([]), traps),
+            Err(CodeMapFull)
+        );
+        assert_eq!(map.lookup_trap(0x1000), Some(site));
+        assert_eq!(map.lookup_trap(0x2000), None);
+    }
+
+    #[test]
+    fn invalid_trap_registration_does_not_poison_writer() {
+        let map = CodeMap::new();
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.register_with_traps(
+                0x1000,
+                8,
+                Box::new([]),
+                Box::new([]),
+                vec![GuestTrapSite {
+                    host_offset: 8,
+                    guest_rip: 1,
+                    access: GuestAccessKind::Read,
+                    width: 1,
+                }],
+            )
+        }));
+        assert!(invalid.is_err());
+        assert_eq!(map.register(0x1000, 8, Box::new([]), Box::new([])), Ok(()));
+    }
+
+    #[test]
+    fn trap_lookup_uses_the_logarithmic_function_index_and_sorted_sites() {
+        let map = CodeMap::new();
+        for i in 0..2048 {
+            let start = 0x1000 + ((i * 137) % 2048) * 4096;
+            let sites = (0..256)
+                .map(|j| GuestTrapSite {
+                    host_offset: j * 4,
+                    guest_rip: u64::MAX - i as u64,
+                    access: GuestAccessKind::Read,
+                    width: 1 << (j % 4),
+                })
+                .collect();
+            map.register_with_traps(
+                start,
+                2048,
+                Box::new([(0, 0)]),
+                Box::new([u64::MAX - i as u64]),
+                sites,
+            )
+            .unwrap();
+        }
+        for i in 0..2048 {
+            let start = 0x1000 + ((i * 137) % 2048) * 4096;
+            let mut visits = 0;
+            assert!(map.find_entry(start, &mut || visits += 1).is_some());
+            assert!(visits <= 16, "unbalanced index: {visits} visits");
+            for j in 0..256 {
+                assert_eq!(
+                    map.lookup_trap(start + j * 4),
+                    Some(GuestTrapSite {
+                        host_offset: (j * 4) as u32,
+                        guest_rip: u64::MAX - i as u64,
+                        access: GuestAccessKind::Read,
+                        width: 1 << (j % 4),
+                    })
+                );
+                assert_eq!(map.lookup_trap(start + j * 4 + 1), None);
+            }
+            assert_eq!(map.lookup_trap(start + 2048), None);
+        }
+    }
 
     #[test]
     fn lookup_resolves_within_a_range_and_picks_the_covering_rip() {
@@ -397,6 +678,16 @@ mod tests {
                             if finished || actual.is_some() {
                                 assert_eq!(actual, expected, "range {i}, offset {off}");
                             }
+                            let trap = map.lookup_trap(0x1000 + i * 32 + off);
+                            if finished || trap.is_some() {
+                                let expected = (off == 4).then_some(GuestTrapSite {
+                                    host_offset: 4,
+                                    guest_rip: u64::MAX - i as u64,
+                                    access: GuestAccessKind::Read,
+                                    width: 8,
+                                });
+                                assert_eq!(trap, expected);
+                            }
                         }
                     }
                     if finished {
@@ -406,11 +697,17 @@ mod tests {
             });
             barrier.wait();
             for i in 0..2048 {
-                map.register(
+                map.register_with_traps(
                     0x1000 + i * 32,
                     24,
                     Box::new([(4, 0), (12, 1)]),
                     Box::new([u64::MAX - i as u64, 0x1_0000_0000 + i as u64]),
+                    vec![GuestTrapSite {
+                        host_offset: 4,
+                        guest_rip: u64::MAX - i as u64,
+                        access: GuestAccessKind::Read,
+                        width: 8,
+                    }],
                 )
                 .unwrap();
             }

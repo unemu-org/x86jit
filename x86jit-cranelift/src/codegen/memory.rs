@@ -34,19 +34,22 @@ impl Translator<'_, '_> {
         let prev = if matches!(op, RmwOp::Rsub) {
             // No native reverse-subtract atomic (`lock neg`): CAS loop with
             // `new = s - cur`, retrying until the compare-exchange sticks.
-            let cur0 = self
-                .builder
-                .ins()
-                .atomic_load(ty, MemFlags::trusted(), host);
+            let cur0 = self.builder.ins().atomic_load(
+                ty,
+                guest_mem_flags(GuestAccessKind::Read, *size),
+                host,
+            );
             let loop_hdr = self.builder.create_block();
             let cur = self.builder.append_block_param(loop_hdr, ty);
             self.builder.ins().jump(loop_hdr, &[cur0]);
             self.builder.switch_to_block(loop_hdr);
             let new = self.builder.ins().isub(s, cur);
-            let seen = self
-                .builder
-                .ins()
-                .atomic_cas(MemFlags::trusted(), host, cur, new);
+            let seen = self.builder.ins().atomic_cas(
+                guest_mem_flags(GuestAccessKind::ReadWrite, *size),
+                host,
+                cur,
+                new,
+            );
             let ok = self.builder.ins().icmp(IntCC::Equal, seen, cur);
             let done = self.builder.create_block();
             // Retry (back-edge) on a lost race; `seen` is the old value on success.
@@ -57,9 +60,13 @@ impl Translator<'_, '_> {
             seen
         } else {
             let cl_op = rmw_op(*op);
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlags::trusted(), cl_op, host, s)
+            self.builder.ins().atomic_rmw(
+                ty,
+                guest_mem_flags(GuestAccessKind::ReadWrite, *size),
+                cl_op,
+                host,
+                s,
+            )
         };
         let prev = self.widen(prev, *size);
         self.set(*old, prev);
@@ -81,10 +88,12 @@ impl Translator<'_, '_> {
         let exp = self.narrow(exp, *size);
         let new = self.val(*src);
         let new = self.narrow(new, *size);
-        let prev = self
-            .builder
-            .ins()
-            .atomic_cas(MemFlags::trusted(), host, exp, new);
+        let prev = self.builder.ins().atomic_cas(
+            guest_mem_flags(GuestAccessKind::ReadWrite, *size),
+            host,
+            exp,
+            new,
+        );
         let prev = self.widen(prev, *size);
         self.set(*old, prev);
         self.note_store(a, *size);

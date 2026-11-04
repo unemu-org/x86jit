@@ -58,6 +58,10 @@ pub const RET_PORTIO_DEFER: u64 = 9;
 /// A string helper stopped between iterations; the dispatcher consumes the request.
 pub const RET_INTERRUPTED: u64 = 10;
 
+/// Maximum distinct guest-access descriptors in one compiled block or region.
+/// Cranelift user trap codes below 250 are reserved for these descriptors.
+pub const MAX_GUEST_ACCESS_DESCRIPTORS: usize = 249;
+
 // --- MemCtx: guest memory context + fault out-params. `#[repr(C)]`; codegen
 // addresses these fields by the byte offsets below. Growth is APPEND-ONLY: a new
 // field goes at the end so every offset above it — and therefore every

@@ -54,6 +54,7 @@ pub mod vm;
 pub mod x87;
 
 pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
+pub use codemap::{GuestAccessKind, GuestTrapSite};
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{AccessKind, Exit, PortDir, StepResult};
 pub use features::{

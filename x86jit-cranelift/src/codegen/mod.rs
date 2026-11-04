@@ -8,6 +8,9 @@ mod integer;
 mod memory;
 mod vector;
 
+#[cfg(test)]
+mod trap_tests;
+
 use std::collections::HashMap;
 
 use cranelift::prelude::*;
@@ -23,11 +26,44 @@ use x86jit_core::jit_abi::{
     RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED,
 };
 use x86jit_core::memory::CODE_PAGE_BITS;
+use x86jit_core::GuestAccessKind;
 use x86jit_core::{
     AesOp, BitScanOp, BtOp, Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, GfniOp, HFloatOp, HIntOp,
     IrBlock, IrOp, IrRegion, MemConsistency, PackedBinOp, PackedCvtKind, Reg, RepKind, RmwOp,
     ShaOp, StrOp, VKLogicOp, VLogicOp, Val, VpUnaryOp, PF_SRC_ONE, PF_SRC_ZERO,
 };
+
+// Cranelift 0.115.1 src/ir/memflags.rs: trusted() promises both notrap and
+// aligned; with_trap_code(Some(..)) retains a trapping, unaligned access.
+// src/ir/trapcode.rs allows user codes 1..=250. Encode direction and transfer
+// width during translation; prepare_guest_traps replaces these with owner codes.
+pub(crate) fn guest_mem_flags(access: GuestAccessKind, width: u8) -> MemFlags {
+    let direction = match access {
+        GuestAccessKind::Read => 0,
+        GuestAccessKind::Write => 1,
+        GuestAccessKind::ReadWrite => 2,
+    };
+    let size = match width {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        _ => unreachable!("guest transfer must be split to at most sixteen bytes"),
+    };
+    MemFlags::new().with_trap_code(ir::TrapCode::user(1 + direction * 5 + size))
+}
+
+pub(crate) fn guest_trap_access(code: ir::TrapCode) -> Option<(GuestAccessKind, u8)> {
+    let code = code.as_raw().get().checked_sub(1)?;
+    let access = match code / 5 {
+        0 => GuestAccessKind::Read,
+        1 => GuestAccessKind::Write,
+        2 => GuestAccessKind::ReadWrite,
+        _ => return None,
+    };
+    Some((access, 1 << (code % 5)))
+}
 
 const RAX: usize = 0;
 const RCX: usize = 1;
@@ -258,6 +294,9 @@ pub fn translate_block(
         exit_tails: Vec::new(),
     };
 
+    if !matches!(ir.ops.first(), Some(IrOp::InsnStart { .. })) {
+        t.emit_insn_start(&ir.guest_start);
+    }
     t.charge_icount(ir.icount);
 
     let mut terminated = false;
@@ -383,6 +422,9 @@ pub fn translate_region(
         t.checked_ea.clear(); // a checked pointer only dominates its own block
         t.cur_addr = block.guest_start;
         t.guest_end = block.guest_start + block.guest_len as u64;
+        if !matches!(block.ops.first(), Some(IrOp::InsnStart { .. })) {
+            t.emit_insn_start(&block.guest_start);
+        }
         t.emit_region_block(block, &clif);
     }
 
@@ -2793,6 +2835,8 @@ impl Translator<'_, '_> {
             self.builder.ins().iadd(base, off)
         };
         self.checked_ea.push((addr, size, host));
+        #[cfg(test)]
+        trap_tests::record_checked_addr(host);
         host
     }
 
@@ -2801,7 +2845,15 @@ impl Translator<'_, '_> {
     /// this is a plain load in every tier; on ARM, `AcqRel`/`FullTso` add an
     /// acquire fence after the load (blocks Load→Load / Load→Store reordering).
     pub(crate) fn gload(&mut self, ty: Type, host: Value, off: i32) -> Value {
-        let v = self.builder.ins().load(ty, MemFlags::trusted(), host, off);
+        let v = if ty == types::I128 && cfg!(target_arch = "x86_64") {
+            let flags = guest_mem_flags(GuestAccessKind::Read, 8);
+            let lo = self.builder.ins().load(types::I64, flags, host, off);
+            let hi = self.builder.ins().load(types::I64, flags, host, off + 8);
+            self.builder.ins().iconcat(lo, hi)
+        } else {
+            let flags = guest_mem_flags(GuestAccessKind::Read, ty.bytes() as u8);
+            self.builder.ins().load(ty, flags, host, off)
+        };
         if cfg!(target_arch = "aarch64") && self.consistency != MemConsistency::Fast {
             self.builder.ins().fence();
         }
@@ -2814,13 +2866,20 @@ impl Translator<'_, '_> {
     /// fences *after* it as well, additionally blocking Store→Load for full
     /// sequential consistency (the over-strong "hammer"). x86 stays plain.
     pub(crate) fn gstore(&mut self, val: Value, host: Value, off: i32) {
+        let ty = self.builder.func.dfg.value_type(val);
         let arm = cfg!(target_arch = "aarch64");
         if arm && self.consistency == MemConsistency::AcqRel {
             self.builder.ins().fence();
         }
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), val, host, off);
+        if ty == types::I128 && cfg!(target_arch = "x86_64") {
+            let flags = guest_mem_flags(GuestAccessKind::Write, 8);
+            let (lo, hi) = self.builder.ins().isplit(val);
+            self.builder.ins().store(flags, lo, host, off);
+            self.builder.ins().store(flags, hi, host, off + 8);
+        } else {
+            let flags = guest_mem_flags(GuestAccessKind::Write, ty.bytes() as u8);
+            self.builder.ins().store(flags, val, host, off);
+        }
         if arm && self.consistency == MemConsistency::FullTso {
             self.builder.ins().fence();
         }
@@ -3478,7 +3537,7 @@ impl Translator<'_, '_> {
         let zero = self.builder.ins().iconst(types::I32, 0);
         let mut lo = self.builder.ins().splat(types::I32X4, zero);
         let mut hi = self.builder.ins().splat(types::I32X4, zero);
-        let flags = MemFlags::new();
+        let flags = MemFlags::trusted();
         for i in 0..8u8 {
             let cvec = if i < 4 { clo } else { chi };
             let c = self.builder.ins().extractlane(cvec, i % 4);

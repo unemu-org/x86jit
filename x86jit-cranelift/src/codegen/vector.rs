@@ -2331,7 +2331,7 @@ impl Translator<'_, '_> {
         } else {
             (types::I64X2, types::I64, 8i64, 2u8)
         };
-        let flags = MemFlags::new();
+        let flags = MemFlags::trusted();
         for c in 0..n {
             let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,

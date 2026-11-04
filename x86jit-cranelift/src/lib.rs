@@ -20,16 +20,127 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use cranelift::codegen::ir;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, ModuleError};
 
 use x86jit_core::cache::CompiledPtr;
-use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets};
+use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets, MAX_GUEST_ACCESS_DESCRIPTORS};
+use x86jit_core::GuestTrapSite;
 use x86jit_core::{
     Backend, CachedBlock, IrBlock, IrRegion, MemConsistency, RegionCaps, TierUpFinished,
     TierUpRequest, TierUpSubmit, TierUpUnit,
 };
+
+// User trap codes identify transfers independently of machine source locations:
+// egraph-created extending loads can have a default location, and x64 can fold
+// a load into an ALU instruction carrying the consumer's location. Cranelift
+// preserves the load's trap code in both cases (0.115.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuestTrap {
+    guest_rip: u64,
+    access: x86jit_core::GuestAccessKind,
+    width: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompileError {
+    DescriptorLimit,
+    Unavailable,
+}
+
+fn prepare_guest_traps(
+    func: &mut ir::Function,
+    guest_rips: &[u64],
+) -> Result<Vec<GuestTrap>, CompileError> {
+    // The shared lifter caps blocks and regions conservatively. Retain a defensive
+    // refusal for oversized synthetic IR or a future lowering that breaks the bound.
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(MAX_GUEST_ACCESS_DESCRIPTORS)
+        .map_err(|_| CompileError::Unavailable)?;
+    let mut block = func.layout.entry_block();
+    while let Some(current_block) = block {
+        block = func.layout.next_block(current_block);
+        let mut next_inst = func.layout.first_inst(current_block);
+        while let Some(inst) = next_inst {
+            next_inst = func.layout.next_inst(inst);
+            let opcode = func.dfg.insts[inst].opcode();
+            if !opcode.can_load() && !opcode.can_store() {
+                continue;
+            }
+            let Some(flags) = func.dfg.insts[inst].memflags() else {
+                continue;
+            };
+            let Some(code) = flags.trap_code() else {
+                continue;
+            };
+            let Some((access, width)) = codegen::guest_trap_access(code) else {
+                return Err(CompileError::Unavailable);
+            };
+            let source = func.srcloc(inst);
+            let guest_rip = *guest_rips
+                .get(source.bits() as usize)
+                .filter(|_| !source.is_default())
+                .ok_or(CompileError::Unavailable)?;
+            let descriptor = GuestTrap {
+                guest_rip,
+                access,
+                width,
+            };
+            let index = match metadata.iter().position(|m| *m == descriptor) {
+                Some(index) => index,
+                None if metadata.len() < MAX_GUEST_ACCESS_DESCRIPTORS => {
+                    metadata.push(descriptor);
+                    metadata.len() - 1
+                }
+                None => return Err(CompileError::DescriptorLimit),
+            };
+            use ir::InstructionData::*;
+            let flags = match &mut func.dfg.insts[inst] {
+                Load { flags, .. }
+                | LoadNoOffset { flags, .. }
+                | Store { flags, .. }
+                | StoreNoOffset { flags, .. }
+                | AtomicCas { flags, .. }
+                | AtomicRmw { flags, .. } => flags,
+                _ => unreachable!("memflags only exists on memory instructions"),
+            };
+            *flags = flags.with_trap_code(ir::TrapCode::user(index as u8 + 1));
+        }
+    }
+    Ok(metadata)
+}
+
+fn collect_guest_traps(
+    code: &cranelift::codegen::CompiledCode,
+    metadata: &[GuestTrap],
+) -> Result<Vec<GuestTrapSite>, ()> {
+    // Validate before reserving: no unclassified traps may be silently dropped.
+    // Reserve exactly the records retained by the code map.
+    for trap in code.buffer.traps() {
+        let index = trap.code.as_raw().get() as usize - 1;
+        if metadata.get(index).is_none() {
+            return Err(());
+        }
+    }
+    let mut sites = Vec::new();
+    sites
+        .try_reserve_exact(code.buffer.traps().len())
+        .map_err(|_| ())?;
+    for trap in code.buffer.traps() {
+        let descriptor = metadata[trap.code.as_raw().get() as usize - 1];
+        sites.push(GuestTrapSite {
+            host_offset: trap.offset,
+            guest_rip: descriptor.guest_rip,
+            access: descriptor.access,
+            width: descriptor.width,
+        });
+    }
+    sites.sort_unstable_by_key(|s| s.host_offset);
+    Ok(sites)
+}
 
 /// Division helper called from compiled code (div isn't hot, so a call is fine and
 /// avoids 128-bit codegen). Reuses the interpreter's `divide` so both agree.
@@ -2520,7 +2631,7 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
-    ) -> Option<CompiledPtr> {
+    ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
             perfmap::Kind::Block,
@@ -2548,7 +2659,7 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
-    ) -> Option<CompiledPtr> {
+    ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
             perfmap::Kind::Region,
@@ -2586,19 +2697,19 @@ impl Shared {
             codegen::Helpers,
             &mut dyn FnMut() -> u64,
         ) -> Box<[u64]>,
-    ) -> Option<CompiledPtr> {
+    ) -> Result<CompiledPtr, CompileError> {
         let started = Instant::now();
         if self.code_space_exhausted.load(Ordering::Acquire) {
-            return None;
+            return Err(CompileError::Unavailable);
         }
         let mut jit = self.jit();
         // Serialized with every foreground/background compile. After an error the
         // module may contain unfinalized definitions; never retry or publish those.
         if self.code_space_exhausted.load(Ordering::Acquire) {
-            return None;
+            return Err(CompileError::Unavailable);
         }
         if jit.next_id >= self.compile_limit.load(Ordering::Relaxed) {
-            return self.exhaust_code_space();
+            return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
         jit.next_id += 1;
         let name = format!("blk_{}", jit.next_id);
@@ -2694,6 +2805,7 @@ impl Shared {
         let pcmpstrm_mem_sig = params(7, false); // pcmpstrm_mem(cpu, a, bv_lo, bv_hi, imm, explicit, out) -> ()
         let bmi_sig = params(5, false); // bmi(a, b, op, size, out) -> () — result + CF via `out`
 
+        let slots_start = jit.slots.len();
         let guest_rips = {
             let Jit { fbctx, slots, .. } = &mut *jit;
             let mut alloc_slot = || {
@@ -2801,6 +2913,13 @@ impl Shared {
             guest_rips
         };
 
+        let trap_metadata = match prepare_guest_traps(&mut ctx.func, &guest_rips) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                jit.slots.truncate(slots_start);
+                return Err(error);
+            }
+        };
         let id = jit
             .module
             .declare_function(&name, Linkage::Export, &ctx.func.signature)
@@ -2810,14 +2929,31 @@ impl Shared {
             self.compile_result(Err(ModuleError::Allocation {
                 message: "injected code arena exhaustion",
                 err: std::io::ErrorKind::OutOfMemory.into(),
-            }))?;
+            }))
+            .ok_or(CompileError::Unavailable)?;
         }
-        self.compile_result(jit.module.define_function(id, &mut ctx))?;
+        self.compile_result(jit.module.define_function(id, &mut ctx))
+            .ok_or(CompileError::Unavailable)?;
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
-        let (code_len, srcloc_table) = {
+        let (code_len, srcloc_table, trap_sites) = {
             let cc = ctx.compiled_code().expect("compiled code present");
+            let trap_sites = collect_guest_traps(cc, &trap_metadata);
+            #[cfg(test)]
+            let trap_sites = if self.fail_compile_stage.load(Ordering::Relaxed) == 4 {
+                let mut sites = Vec::<GuestTrapSite>::new();
+                sites
+                    .try_reserve_exact(usize::MAX)
+                    .map(|()| sites)
+                    .map_err(|_| ())
+            } else {
+                trap_sites
+            };
+            let trap_sites = match trap_sites {
+                Ok(sites) => sites,
+                Err(_) => return self.exhaust_code_space().ok_or(CompileError::Unavailable),
+            };
             let table: Vec<(u32, u32)> = cc
                 .buffer
                 .get_srclocs_sorted()
@@ -2825,16 +2961,22 @@ impl Shared {
                 .filter(|s| !s.loc.is_default())
                 .map(|s| (s.start, s.loc.bits()))
                 .collect();
-            (cc.code_info().total_size, table.into_boxed_slice())
+            (
+                cc.code_info().total_size,
+                table.into_boxed_slice(),
+                trap_sites,
+            )
         };
         jit.module.clear_context(&mut ctx);
         #[cfg(test)]
         if self.fail_compile_stage.load(Ordering::Relaxed) == 2 {
             self.compile_result(Err(ModuleError::Backend(
                 region::Error::SystemCall(std::io::ErrorKind::OutOfMemory.into()).into(),
-            )))?;
+            )))
+            .ok_or(CompileError::Unavailable)?;
         }
-        self.compile_result(jit.module.finalize_definitions())?;
+        self.compile_result(jit.module.finalize_definitions())
+            .ok_or(CompileError::Unavailable)?;
 
         let entry = CompiledPtr(jit.module.get_finalized_function(id));
         #[cfg(test)]
@@ -2842,10 +2984,16 @@ impl Shared {
         #[cfg(not(test))]
         let fail_registration = false;
         if fail_registration
-            || x86jit_core::codemap::register(entry.0 as usize, code_len, srcloc_table, guest_rips)
-                .is_err()
+            || x86jit_core::codemap::register_with_traps(
+                entry.0 as usize,
+                code_len,
+                srcloc_table,
+                guest_rips,
+                trap_sites,
+            )
+            .is_err()
         {
-            return self.exhaust_code_space();
+            return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
         // Mirror this range into `/tmp/perf-<pid>.map` iff X86JIT_PERF_MAP=1
         // (no-op otherwise). Same host range as `codemap`, named by the guest RIP so
@@ -2856,7 +3004,7 @@ impl Shared {
         // Includes the `inner` lock wait — that contention is real compile-path cost.
         self.compile_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Some(entry)
+        Ok(entry)
     }
 
     fn exhaust_code_space<T>(&self) -> Option<T> {
@@ -2908,13 +3056,13 @@ impl Shared {
             TierUpUnit::Block(ir) => self
                 .compile(ir, req.consistency, req.mmio, req.guest_base)
                 .map_or_else(
-                    || CachedBlock::Interpreted(ir.clone()),
+                    |_| CachedBlock::Interpreted(ir.clone()),
                     |entry| CachedBlock::Compiled { entry },
                 ),
             TierUpUnit::Region(region) => self
                 .compile_region(region, req.consistency, req.mmio, req.guest_base)
                 .map_or_else(
-                    || CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
+                    |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                     |entry| CachedBlock::Compiled { entry },
                 ),
         }
@@ -3032,7 +3180,7 @@ impl Backend for JitBackend {
         self.shared
             .compile(ir, consistency, mmio, guest_base)
             .map_or_else(
-                || CachedBlock::Interpreted(Arc::new(ir.clone())),
+                |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
                 |entry| CachedBlock::Compiled { entry },
             )
     }
@@ -3051,7 +3199,7 @@ impl Backend for JitBackend {
         self.shared
             .compile_region(region, consistency, mmio, guest_base)
             .map_or_else(
-                || CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
+                |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                 |entry| CachedBlock::Compiled { entry },
             )
     }
@@ -3379,7 +3527,9 @@ mod tests {
                 assert!(!entry.0.is_null(), "compiled entry is non-null");
                 entry
             }
-            CachedBlock::Interpreted(_) => panic!("expected a compiled block"),
+            CachedBlock::Interpreted(_) => {
+                panic!("expected a compiled block")
+            }
         }
     }
 
@@ -3440,6 +3590,11 @@ mod tests {
     #[test]
     fn codemap_registration_failure_recovers() {
         assert_compile_failure_recovers(3);
+    }
+
+    #[test]
+    fn trap_site_allocation_failure_recovers() {
+        assert_compile_failure_recovers(4);
     }
 
     #[test]
