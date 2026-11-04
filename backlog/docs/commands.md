@@ -162,11 +162,16 @@ git add bench/baseline.json backlog/docs/performance.md bench/history/
 The gate skips when there's no baseline (fresh clone) or the host differs (timings aren't comparable
 across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ vs the prior baseline.
 
-## Git / GitHub
+## Git remote and CI
 
-```sh
-gh issue list
-gh issue view <n>
-gh pr create --fill
-gh pr list
-```
+`origin` is the maintainer's private Forgejo; there is no GitHub remote and no `gh` flow. Push only
+to `origin`, only at the maintainer's request.
+
+- **x86-64**: a Forgejo Actions runner.
+- **aarch64**: no CI runner. The gate runs locally on the maintainer's aarch64 macOS host — the
+  full `cargo nextest` run, clippy, fmt. Changes to codegen, memory ordering or anything
+  host-specific need that run before merge. That host is aarch64-apple-darwin, not Linux:
+  Linux-only paths (the real-program ladder, which builds `unemulinux`) do not run there.
+- The pre-push hook `ladder-smoke` builds `../unemulinux`, which does not compile on macOS. On that
+  host the hook cannot pass; skipping it (`SKIP=ladder-smoke git push`, never `--no-verify`) is the
+  maintainer's call for each push, after the other pre-push hooks have passed.

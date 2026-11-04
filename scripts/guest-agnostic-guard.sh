@@ -13,9 +13,10 @@
 #
 #   scripts/guest-agnostic-guard.sh          # scan tracked Rust source
 #
-# Where a downstream reference IS legitimate — a backlog task recording who reported a
-# bug, or PROVENANCE naming a consumer — it belongs in backlog/ or a top-level document,
-# which this deliberately does not scan.
+# Where a downstream reference IS legitimate — PROVENANCE naming a consumer — it belongs
+# in a top-level document, which this deliberately does not scan. "Who reported this"
+# belongs in the reporting project's own tracker: bead text here is guest-agnostic too
+# (backlog/docs/agent-workflow.md).
 set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,8 +70,8 @@ if (( rc )); then
   cat >&2 <<'EOF'
 
 x86jit is guest-agnostic: no downstream project, guest, game or runtime may be named
-in engine source. Record it in the backlog task instead — that is where "who reported
-this" belongs, and it is not scanned.
+in engine source. "Who reported this" belongs in the reporting project's own tracker;
+beads and docs here stay guest-agnostic as well.
 
 If the term is a false positive (a crate name, an English word), add it to WORD_ONLY
 or drop it from DENY in scripts/guest-agnostic-guard.sh, with a comment saying why.

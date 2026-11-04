@@ -49,3 +49,10 @@ fuzz-avx-findings.log
 # See x86jit-tests/vendor/80286/fetch.sh and x86jit-tests/tests/ss286.rs.
 # The fetch script itself IS tracked; only the downloaded data is ignored.
 x86jit-tests/vendor/80286/v1_real_mode/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads/**/*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*

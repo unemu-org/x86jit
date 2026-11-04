@@ -8,13 +8,13 @@ Repo-specific notes for coding agents (Claude Code, Cursor, Aider, Copilot, …)
 
 `x86jit` is a guest-agnostic x86-64 → host recompiler (JIT) delivered as a pure-Rust library. You feed it a memory map plus an entry point; it executes guest x86-64 instructions on any host (x86-64 or ARM64) and hands control back through `Exit` whenever it hits something it doesn't handle (syscall, MMIO, unknown instruction). File-format parsing, OS syscall emulation, and devices live in the embedder's code, not the core — a Linux userland built on this library is [`unemulinux`](https://github.com/unemu-org/unemulinux), which is where the syscall shim, the process model, the OCI/ELF runner and the whole-program test ladder (busybox, sqlite, CPython, Go servers) live. That boundary is enforced, not just documented: `x86jit-core`'s dependency set is exactly `{iced-x86}` and `x86jit-tests/tests/boundary.rs` fails the build if it changes. The authoritative design is [`spec.md`](backlog/docs/design/spec.md); where the engine's *behaviour* comes from is [`PROVENANCE.md`](PROVENANCE.md).
 
-This project tracks work **locally** with [Backlog.md](https://github.com/MrLesk/Backlog.md) — tasks, docs, and decisions are committed markdown under `backlog/`, no external issue tracker. It's forge-agnostic: a git remote (GitHub here) is an optional mirror.
+Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. `origin` is the maintainer's private Forgejo; the bead database is pushed there too.
 
 ## Where things live
 
 | Need | Path | When to load |
 |------|------|--------------|
-| **Roadmap / task board (source of truth)** | Backlog.md — `backlog task list --plain` | Always. **Don't read roadmaps from markdown.** Milestones: `m0-skeleton`…`m8-simd`, `open-backlog`, `ps4-perf`, `go-caddy`, `code-review`. |
+| **Roadmap / task board (source of truth)** | beads — `bd ready --exclude-type epic`, `bd list --type epic`, `bd show <id>` | Always. **Don't read roadmaps from markdown.** One epic per theme; the list is in [`working-on-tasks.md`](backlog/docs/working-on-tasks.md) § Epics. |
 | **Authoritative design: contract, IR, backends, milestones** | [`spec.md`](backlog/docs/design/spec.md) + [`backlog/docs/design/`](backlog/docs/design/) | The source of truth for design. Every module cites a `spec.md` section. |
 | **Where behaviour comes from: sources, oracles, licences** | [`PROVENANCE.md`](PROVENANCE.md) + [`oracles/`](https://github.com/unemu-org/oracles) | Before encoding a hardware fact, or when an oracle disagrees with the engine |
 | Current repo shape, data flow, module map | [`backlog/docs/architecture.md`](backlog/docs/architecture.md) | Structural changes or unfamiliar layout |
@@ -23,13 +23,14 @@ This project tracks work **locally** with [Backlog.md](https://github.com/MrLesk
 | Build / test / run / lint commands | [`backlog/docs/commands.md`](backlog/docs/commands.md) | Running build/test/dev loops |
 | Interp-vs-hardware tracer (`scripts/lockstep.sh`) | [`backlog/docs/design/doc-24 - Lockstep-interp-vs-hardware-tracer.md`](backlog/docs/design/doc-24%20-%20Lockstep-interp-vs-hardware-tracer.md) | A deterministic wrong-result bug where interp==JIT but both differ from a real CPU |
 | **Real-program ladder** (`scripts/ladder.sh`) | [`backlog/docs/commands.md`](backlog/docs/commands.md) § the real-program ladder | After a lifter or codegen change — the corpus validates what *is* lifted, this validates what real software needs |
-| Toolchain (Nix devShell, direnv, pre-commit, `backlog`) | [`backlog/docs/dev-setup.md`](backlog/docs/dev-setup.md) | Fixing tooling, onboarding |
-| Task statuses, branch naming, session handoff | [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) | Before picking up a task |
+| Toolchain (Nix devShell, direnv, pre-commit, `backlog`, `bd`) | [`backlog/docs/dev-setup.md`](backlog/docs/dev-setup.md) | Fixing tooling, onboarding |
+| **Agent workflow: supervisor/worker roles, beads, review, Sol (Codex) workers** | [`backlog/docs/agent-workflow.md`](backlog/docs/agent-workflow.md) | **At session start, before any task work** |
+| Bead statuses, epics, lifecycle, Definition of Done, git flow, session handoff | [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) | Before picking up a task |
 | Where to capture a decision (`backlog decision` vs task note) | [`backlog/docs/decisions.md`](backlog/docs/decisions.md) + `ls backlog/decisions/` | Making a non-trivial decision |
 | Glossary / emulator + x86 terminology | [`backlog/docs/glossary.md`](backlog/docs/glossary.md) | Hitting an unfamiliar term |
 | Deliberately deferred — do NOT implement unprompted | [`backlog/docs/deferred.md`](backlog/docs/deferred.md) | Before adding features that "seem missing" |
 | ISA compatibility map (CI-tested artifact) | [`backlog/docs/compat/`](backlog/docs/compat/) | Touching the lifter's instruction coverage |
-| Backlog skill (`backlog` CLI + task/doc/decision workflow) | [`.agents/skills/backlog/SKILL.md`](.agents/skills/backlog/SKILL.md) | Auto-loaded by the backlog skill trigger; also when driving `backlog` manually |
+| Backlog skill (`backlog` CLI for **docs and decisions only** — tasks moved to beads) | [`.agents/skills/backlog/SKILL.md`](.agents/skills/backlog/SKILL.md) | Creating a doc or a decision with `backlog doc` / `backlog decision` |
 | Code navigation (`repoctx` — structure-aware, token-cheap) | `.claude/skills/repoctx/SKILL.md` | "Where is X?", callers/callees, blast radius — prefer over grep/find |
 
 > **Skills location.** Vendored skills (e.g. `backlog`) live at `.agents/skills/<name>/` (agent-agnostic, **committed**); `scripts/skills-bootstrap.sh` symlinks them into `.claude/skills/` (gitignored) for Claude Code auto-trigger — re-run it after adding one. `repoctx` is **tool-managed**: it lives directly under `.claude/skills/repoctx/` (gitignored, regenerated by the `repoctx` CLI), not vendored.
@@ -40,7 +41,7 @@ Don't read every `backlog/docs/` file at session start. Pick the file matching t
 
 ## Working on tasks
 
-Read [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for statuses (`To Do` / `In Progress` / `Done`), branch naming (Conventional Branch), and the forge-agnostic git flow. Milestone labels mirror `spec.md` §12. Set a task `In Progress` **before** writing code; `Done` only after it lands on the default branch. Run `backlog instructions overview` for the authoritative CLI workflow.
+Read [`backlog/docs/agent-workflow.md`](backlog/docs/agent-workflow.md) for roles and the path from a bead to `main`, and [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for statuses (`open` / `in_progress` / `closed`), epics, the Definition of Done and the git flow. The supervisor picks work with `bd ready --exclude-type epic`, claims it with `bd update <id> --claim` **before** code is written, and closes it only after it lands on `main`, with a reason that names the commit. Workers do not claim or close beads; they report to the supervisor. Append to notes with `--append-notes` — never `--notes` on an existing bead, which replaces the field. Where `bd prime`'s generic advice differs from these docs, these docs win. Text migrated from Backlog.md still says `TASK-NNN`: `bd list --external-ref backlog:TASK-NNN` finds the bead; no match means the task was already Done — read `backlog/completed/task-NNN - *.md`.
 
 **Cross-repository ids carry a tag.** `task-40 (unemulinux)`, `doc-7 (unemulinux)`, `decision-4 (unemups4)` name *that* project's numbering; an untagged `doc-22` or `decision-5` is ours. Every project involved keeps its own counter, so the tag is what makes a reference resolvable — a bare number is only unambiguous inside one repository. Tag it when you write it: retro-fitting the tag after two counters have drifted means guessing which one a reader meant.
 
@@ -49,21 +50,23 @@ Read [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for 
 > **Republish in progress.** Read
 > [`backlog/docs/doc-28 - Republish-handoff…`](backlog/docs/doc-28%20-%20Republish-handoff-%E2%80%94-state-known-defects-and-what-must-be-fixed-before-the-repo-is-created.md)
 > before touching it: it records what is done, the known defects, what blocks creating
-> the public repository, and the traps that already cost a session. **No repository has
-> been created yet** — do not run `gh repo create`.
+> the public repository, and the traps that already cost a session. **No public repository
+> has been created yet** — do not run `gh repo create`. `origin` is the maintainer's
+> private Forgejo; never push anywhere else.
 
-Ending a session mid-task, leave the state on the task itself:
+Ending a session mid-task, leave the state on the bead itself:
 
 ```sh
-backlog task edit <id> --notes "Session pause $(date -I). Done: <X>. Next: <Y>. Blocker: <Z|none>."
+bd update <id> --append-notes "Session pause $(date -I). Done: <X>. Next: <Y>. Blocker: <Z|none>."
 ```
 
-Starting a session, read the most-recently-touched in-progress task (`backlog task list -s "In Progress" --plain`, then `backlog task <id> --plain`) before doing anything else.
+Starting a session, read the in-progress beads (`bd list --status in_progress`, then `bd show <id>`) before doing anything else.
 
 ## Quick dev loop
 
 ```sh
 nix develop                 # toolchain (backlog, pre-commit, rust, cargo-deny) — or direnv auto-loads it
+bd --version                # beads ≥ 1.3.1, installed on the host (not in the devShell; dev-setup.md)
 git submodule update --init # oracles: the pinned manuals the code cites (PROVENANCE.md)
 cargo build                 # whole workspace
 cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)'   # fuzz excluded — >7min by design
@@ -79,7 +82,7 @@ Full list: [`backlog/docs/commands.md`](backlog/docs/commands.md).
 - **Don't add features, refactor, or introduce abstractions beyond what the task requires.** Bug fix = bug fix, not surrounding cleanup.
 - **Don't pre-empt later milestones.** `todo!()` stubs are milestone markers — fill them in `spec.md` §12 order. Don't half-implement a later milestone during earlier work.
 - **Encode x86 semantics traps once, centrally** (upper-32-bit zeroing, effective-address lowering, RIP-relative, FS/GS base, flags). See `spec.md` §16 and [`backlog/docs/conventions.md`](backlog/docs/conventions.md).
-- **All project docs live under `backlog/`** — the design spec and testing architecture are at [`backlog/docs/design/`](backlog/docs/design/) (`spec.md`, `testing.md`). Tasks and decisions live under `backlog/` too (`backlog/tasks/`, `backlog/decisions/`).
+- **All project docs live under `backlog/`** — the design spec and testing architecture are at [`backlog/docs/design/`](backlog/docs/design/) (`spec.md`, `testing.md`). Decisions live under `backlog/decisions/`; open work lives in beads, never in markdown.
 - **Provenance — derive behaviour from a cited primary source, and pin it with a witness test.** Every fact about how the *hardware* behaves — instruction semantics, flag effects, the x87 environment and tag-word images, rounding control, CPUID leaf/bit assignments, the initial stack and auxiliary vector — must come from and cite the **Intel SDM** (primary), the **AMD64 APM** (second witness where the SDM is silent or says "undefined"), the **x86-64 psABI**, or the **Linux uapi tables**, all pinned in [`oracles/`](#the-clean-oracle-stash-oracles). Cite by **volume and section**: `// SDM Vol 1 §8.1.7` is a citation, `// per the SDM` is not — the second cannot be checked and looks like it can. **An oracle is not an authority.** Unicorn, the host CPU and the 80286 corpus are things we compare against; they can falsify a claim but cannot license one, and when an oracle disagrees with the manual the manual wins and the divergence is recorded with the measured bytes. **Never take a semantic from reading another emulator's implementation** — naming a project as *precedent for a design choice* (the memory-ordering tiers cite Box64's `STRONGMEM` and FEX's RCpc use) is a different act from taking a fact from it. Comments and tests cite the source and say what it is — forward-only; they never narrate what a fact is *not* derived from.
 
 ## The clean-oracle stash (`oracles/`)

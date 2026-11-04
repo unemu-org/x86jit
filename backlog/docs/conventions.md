@@ -108,7 +108,7 @@ is where they live.
 ## When in doubt
 
 - Read the relevant spec.md section (every module cites one) and the matching ADR in [`../decisions/`](../decisions/).
-- Check GitHub issues for active work.
+- Check `bd ready --exclude-type epic` / `bd show <id>` for active work.
 - Ask the user. Solo project — they're the only deciding authority.
 
 ---

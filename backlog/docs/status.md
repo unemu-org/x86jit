@@ -15,7 +15,7 @@ created_date: '2026-07-06 11:25'
 > there. What stays here is the recompiler: core, the Cranelift backend, the ELF
 > loader helpers, and the ISA-level test and bench harnesses.
 
-Snapshot of what works, what's in flight, what's broken, keyed to the milestones in spec.md §12. **Not the roadmap** — roadmap lives in GitHub issues.
+Snapshot of what works, what's in flight, what's broken, keyed to the milestones in spec.md §12. **Not the roadmap** — the roadmap lives in beads (`bd ready`, `bd list --type epic`).
 
 Update this when a milestone advances, a feature lands, or something breaks. Stale status is worse than no status.
 
@@ -135,8 +135,10 @@ The generated map ([`compat/isa-coverage.md`](compat/isa-coverage.md)) mis-state
 
 ## In flight
 
-- **11 tasks in progress, 18 to do** — `backlog task list` is the live board; this section
-  is a summary, not a roadmap. Open threads worth naming: two perf investigations
+- **The live board is beads** (`bd status`, `bd ready --exclude-type epic`); the counts that
+  stood here were stale and were dropped on 2026-11-04. This section is a summary, not a
+  roadmap, and the threads below predate that date — check each against `bd` before relying
+  on it. Open threads worth naming then: two perf investigations
   (per-guest-instruction cost, and inlining the watch-bit test into generated stores), an
   AVX/VEX fuzz campaign with three open correctness bugs it surfaced (`vcvtps2ph`
   directed-rounding at underflow, legacy `packsswb`/`packssdw` clearing the ymm upper, `SAR`
@@ -160,6 +162,7 @@ The generated map ([`compat/isa-coverage.md`](compat/isa-coverage.md)) mis-state
 
 ## CI — the AArch64 JIT is exercised on real hardware
 
+- *(2026-11-04: GitHub is gone; x86-64 now runs on a Forgejo Actions runner and aarch64 locally on an aarch64 macOS host — see [`commands.md`](commands.md) § Git remote and CI. The paragraph below is the history of the GitHub ARM lane.)*
 - **GitHub Actions runs the whole suite on an ARM host.** [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) builds, clippy-lints, and tests on `ubuntu-latest` (x86-64) and `ubuntu-24.04-arm` (aarch64) via the Nix devShell (Unicorn oracle included). Manual (`workflow_dispatch`) only, a matrix over the two hosts. The Nix store and the cargo build (deps like unicorn-engine/cranelift) are cached in the GitHub Actions cache, so re-runs don't re-download the toolchain or recompile dependencies. Two ARM-only latents it caught the first time it actually ran the suite (both fixed): a `barrier_tests` `Helpers { .. }` literal missing the `fxstate` field (compiles only on ARM), and the OCI three-way tests exec'ing the x86 ELF natively on ARM (now `cfg`-skipped like `reference`). On x86 the whole-program tests run the guest ELF natively (native==interp==JIT); on ARM the native leg is skipped (a host can't exec an x86-64 ELF — see `x86jit-tests::reference`) and interp==JIT + interp==Unicorn carry the validation. **Every real program — busybox, sqlite, lua, glibc/musl dynamic hellos, pthreads, the Jaguar SSE4.2 fixture, and CPython 3.13 — passes interp==JIT on the AArch64 backend.** This is the first time the Cranelift ARM64 codegen runs against the full corpus on real ARM hardware.
 - **First ARM-only bug it caught:** the `cmp{ss,sd,ps,pd}` predicate mask fed Cranelift a vector `fcmp` with the `UnorderedOrGreaterThan{,OrEqual}` float condition codes (NLT/NLE), which its AArch64 backend can't lower (panicked in `lower_fp_condcode`). Fixed by building the mask from only `Equal`/`LessThan`/`LessThanOrEqual` + bit-negation/self-compares — byte-identical on x86, now lowerable on ARM. Surfaced only by CPython (the one program using those predicates), only on the ARM runner.
 - **M7 TSO barrier tiers now emit real barriers on ARM.** The JIT plumbs the `Vm`'s `MemConsistency` tier through `Backend::materialize` into codegen; every ordinary guest load/store goes through `gload`/`gstore`, which add fences on an aarch64 host (x86 stays plain — native TSO — so all existing tests are byte-identical there). `Fast` = bare LDR/STR; `AcqRel` = fence-after-load + fence-before-store (blocks LoadLoad/LoadStore/StoreStore, permits the StoreLoad reorder x86-TSO allows); `FullTso` = fence-after-store too (full SC). Locked ops/`mfence` keep their real atomics in every tier. Proven two ways: a deterministic codegen test compiles a store+load for aarch64 and asserts the `DMB ISH` count per tier (`Fast`→0, `AcqRel`/`FullTso`→one per access), and a lock-free message-passing litmus runs a real two-thread guest through the JIT under each tier. **Open:** provoking an actual weak-memory reorder under `Fast` didn't manifest on the virtualized ARM CI runner (reorder rate ≈ nil there), so the litmus is a liveness/correctness check rather than a demonstration; and `AcqRel` uses full `DMB` rather than the leaner `LDAPR`/`STLR` (a future optimization).

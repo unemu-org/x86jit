@@ -68,6 +68,11 @@ maintainer parked, and one in progress.
 
 ## The open tasks, and how to pick one up
 
+> **2026-11-04: the board moved to beads.** Open work is in `bd` now (`bd ready --exclude-type
+> epic`, `bd show <id>`); an old id here resolves with `bd list --external-ref backlog:TASK-NNN`.
+> This section and "Where things stand" predate the 2026-11-04 review filing (TASK-355 … 390):
+> "every HIGH task is closed" and "nothing on the board is programming work" no longer hold.
+
 **Nothing on the board is programming work.** Two are decisions, two are blocked on
 things that do not exist yet. Read the task body first (`backlog task <id> --plain`); each carries its evidence.
 

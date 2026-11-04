@@ -18,30 +18,33 @@ print_section() {
 print_section "branch + last 5 commits"
 git log --format="%h %s" -5 2>/dev/null || echo "(no git)"
 
-# --- task board lives in Backlog.md (backlog/), driven by the `backlog` CLI ---
-print_tasks() {
-  # --plain is the non-interactive view; never launch the TUI board from a hook.
-  out=$(backlog task list -s "$1" --plain 2>/dev/null | grep -iE 'task-' | head -12)
-  if [ -n "$out" ]; then echo "$out"; else echo "  (none — nothing in $1)"; fi
-}
-
-if command -v backlog >/dev/null 2>&1; then
-  print_section "in-progress tasks (backlog)"
-  print_tasks "In Progress"
-  print_section "to-do snapshot (backlog)"
-  print_tasks "To Do"
-  print_section "backlog workflow (authoritative)"
-  backlog instructions overview 2>/dev/null || echo "  (backlog instructions overview unavailable)"
+# --- open work lives in beads (`bd`, prefix xj); docs and decisions stay under backlog/ ---
+if command -v bd >/dev/null 2>&1 && [ -d .beads ]; then
+  # --flat: one line per bead with the id; errors are shown, never folded into "(none)".
+  print_section "in-progress beads"
+  if out=$(bd list --status in_progress --flat 2>&1); then
+    out=$(printf '%s\n' "$out" | grep -E 'xj-' | head -12)
+    if [ -n "$out" ]; then echo "$out"; else echo "  (none)"; fi
+  else
+    echo "  (bd list failed: $(printf '%s' "$out" | head -1))"
+  fi
+  print_section "ready beads (bd ready --exclude-type epic, top 15)"
+  if out=$(bd ready --exclude-type epic 2>&1); then
+    out=$(printf '%s\n' "$out" | grep -E 'xj-' | sed 's/ ← .*//' | head -15)
+    if [ -n "$out" ]; then echo "$out"; else echo "  (none)"; fi
+  else
+    echo "  (bd ready failed: $(printf '%s' "$out" | head -1))"
+  fi
 else
-  print_section "tasks (backlog)"
-  echo "  (backlog not on PATH — run 'nix develop' or 'direnv allow')"
+  print_section "beads"
+  echo "  (bd not on PATH or .beads/ missing — see backlog/docs/dev-setup.md § beads)"
 fi
 
 print_section "load order reminder"
 cat <<'EOF'
 1. AGENTS.md (root) → conventions + pointer table
-2. backlog task list --plain → roadmap; backlog/docs/working-on-tasks.md → workflow
-3. backlog task <id> --plain → recent notes on the active task
+2. backlog/docs/agent-workflow.md → roles + bead-to-main flow; working-on-tasks.md → bd usage
+3. bd list --status in_progress, then bd show <id> → recent notes on the active bead
 4. Read only the backlog/docs/*.md files relevant to the task
 5. backlog/docs/design/spec.md → authoritative design spec + milestones
 EOF
