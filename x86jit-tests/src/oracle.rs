@@ -280,21 +280,23 @@ fn exit_kind(exit: &Exit) -> ExitKind {
     match exit {
         Exit::Hlt => ExitKind::Hlt,
         Exit::Syscall => ExitKind::Syscall,
-        Exit::UnmappedMemory { addr, access } => ExitKind::UnmappedMemory {
+        Exit::UnmappedMemory { addr, access, .. } => ExitKind::UnmappedMemory {
             addr: *addr,
             access: access_kind(*access),
         },
-        Exit::MmioRead { addr, size } => ExitKind::MmioRead {
+        Exit::MmioRead { addr, size, .. } => ExitKind::MmioRead {
             addr: *addr,
             size: *size,
         },
-        Exit::MmioWrite { addr, size, value } => ExitKind::MmioWrite {
+        Exit::MmioWrite {
+            addr, size, value, ..
+        } => ExitKind::MmioWrite {
             addr: *addr,
             size: *size,
             value: *value,
         },
         Exit::UnknownInstruction { addr, .. } => ExitKind::UnknownInstruction { addr: *addr },
-        Exit::Exception { addr, vector } => ExitKind::Exception {
+        Exit::Exception { addr, vector, .. } => ExitKind::Exception {
             addr: *addr,
             vector: *vector,
         },
@@ -303,6 +305,7 @@ fn exit_kind(exit: &Exit) -> ExitKind {
             size,
             dir,
             value,
+            ..
         } => ExitKind::PortIo {
             port: *port,
             size: *size,
@@ -310,6 +313,7 @@ fn exit_kind(exit: &Exit) -> ExitKind {
             value: *value,
         },
         Exit::BudgetExhausted => ExitKind::Budget,
+        _ => panic!("unhandled exit: {exit:?}"),
     }
 }
 

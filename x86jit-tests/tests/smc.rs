@@ -410,7 +410,7 @@ fn mmio_read_resumes_with_the_supplied_value() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, MAIN);
     match cpu.run(&vm, None) {
-        Exit::MmioRead { addr, size } => {
+        Exit::MmioRead { addr, size, .. } => {
             assert_eq!(addr, 0x3000);
             assert_eq!(size, 4);
         }
@@ -453,7 +453,9 @@ fn rep_stos_into_mmio_region_traps() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, MAIN);
     match cpu.run(&vm, None) {
-        Exit::MmioWrite { addr, size, value } => {
+        Exit::MmioWrite {
+            addr, size, value, ..
+        } => {
             assert_eq!(addr, 0x3000, "trap at the first MMIO byte");
             assert_eq!(size, 1, "stosb element width");
             assert_eq!(value, 0xAB, "the AL byte being stored");
@@ -488,7 +490,9 @@ fn mmio_write_resumes_and_continues() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, MAIN);
     match cpu.run(&vm, None) {
-        Exit::MmioWrite { addr, size, value } => {
+        Exit::MmioWrite {
+            addr, size, value, ..
+        } => {
             assert_eq!(addr, 0x3004);
             assert_eq!(size, 4);
             assert_eq!(value, 0x1234_5678);
@@ -528,7 +532,7 @@ fn mmio_read_resumes_on_jit() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, MAIN);
     match cpu.run(&vm, None) {
-        Exit::MmioRead { addr, size } => {
+        Exit::MmioRead { addr, size, .. } => {
             assert_eq!(addr, 0x3000);
             assert_eq!(size, 4);
         }
@@ -565,7 +569,9 @@ fn mmio_write_resumes_on_jit() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, MAIN);
     match cpu.run(&vm, None) {
-        Exit::MmioWrite { addr, size, value } => {
+        Exit::MmioWrite {
+            addr, size, value, ..
+        } => {
             assert_eq!(addr, 0x3004);
             assert_eq!(size, 4);
             assert_eq!(value, 0x1234_5678);

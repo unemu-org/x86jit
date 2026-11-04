@@ -797,7 +797,7 @@ fn assert_trap_vector(code: &[u8], expected: u8, expected_rip: u64, jit: bool) {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, CODE);
     match cpu.run(&vm, Some(100)) {
-        Exit::Exception { vector, addr } => {
+        Exit::Exception { vector, addr, .. } => {
             assert_eq!(vector, expected, "trap vector (jit={jit})");
             // x86 saved-RIP: on the instruction for a fault, past it for a trap.
             assert_eq!(addr, expected_rip, "saved RIP (jit={jit})");
@@ -5197,7 +5197,7 @@ fn extract_lane_mem_dst_straddle_fault_match_interp() {
 
     // Both must fault at the UNBACKED half with a Write access — no partial commit.
     match interp_exit {
-        Exit::UnmappedMemory { addr, access } => {
+        Exit::UnmappedMemory { addr, access, .. } => {
             assert_eq!(
                 addr, TOP,
                 "interp must name the unbacked half, not the store base"
@@ -5262,7 +5262,7 @@ fn pop_mem_dst_fault_leaves_rsp_unchanged_match_interp() {
 
     // Both must fault at the store destination with a Write access.
     match interp_exit {
-        Exit::UnmappedMemory { addr, access } => {
+        Exit::UnmappedMemory { addr, access, .. } => {
             assert_eq!(addr, DST, "interp must fault at the store destination");
             assert_eq!(access, x86jit_core::AccessKind::Write);
         }

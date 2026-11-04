@@ -55,7 +55,7 @@ fn run_unmasked_divide(mask_ze: bool) -> (Exit, u64, u64) {
 fn traps_on_the_following_instruction(backend: fn() -> Box<dyn x86jit_core::Backend>) {
     let (exit, rip, next_op) = run_unmasked_divide_on(false, backend());
     match exit {
-        Exit::Exception { vector, addr } => {
+        Exit::Exception { vector, addr, .. } => {
             assert_eq!(vector, 16, "#MF is vector 16");
             assert_eq!(
                 addr, next_op,

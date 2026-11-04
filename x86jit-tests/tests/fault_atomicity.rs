@@ -270,7 +270,7 @@ fn vector_mmio_read_completes_transfer_by_transfer() {
     let mut asked = Vec::new();
     for round in 0..8 {
         match cpu.run(&vm, None) {
-            Exit::MmioRead { addr, size } => {
+            Exit::MmioRead { addr, size, .. } => {
                 assert_eq!(
                     size, 8,
                     "round {round}: a transfer must be answerable by complete_mmio_read"
@@ -388,7 +388,9 @@ fn vector_mmio_write_carries_each_half(backend: Box<dyn Backend>) {
     let mut seen = Vec::new();
     for round in 0..8 {
         match cpu.run(&vm, None) {
-            Exit::MmioWrite { addr, size, value } => {
+            Exit::MmioWrite {
+                addr, size, value, ..
+            } => {
                 assert_eq!(size, 8, "round {round}: transfer width");
                 seen.push((addr, value));
                 cpu.complete_mmio_write();
@@ -458,7 +460,9 @@ fn vector_extract_to_mmio_completes(backend: Box<dyn Backend>) {
     let mut seen = Vec::new();
     for round in 0..8 {
         match cpu.run(&vm, None) {
-            Exit::MmioWrite { addr, size, value } => {
+            Exit::MmioWrite {
+                addr, size, value, ..
+            } => {
                 assert_eq!(size, 8, "round {round}: transfer width");
                 seen.push((addr, value));
                 cpu.complete_mmio_write();

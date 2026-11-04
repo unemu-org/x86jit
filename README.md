@@ -176,6 +176,14 @@ assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
 assert_eq!(cpu.reg(Reg::Rax) as u32, 5);
 ```
 
+`Exit` and its struct-like variants are non-exhaustive: matches need a wildcard
+arm, and struct-like patterns need `..` to allow future exit reasons and fields.
+Replace struct literals with the stable constructors
+`Exit::unmapped_memory(addr, access)`, `Exit::mmio_read(addr, size)`,
+`Exit::mmio_write(addr, size, value)`, `Exit::unknown_instruction(addr, bytes, len)`,
+`Exit::exception(addr, vector)` and `Exit::port_io(port, size, dir, value)`;
+fields added later receive defaults through these constructors.
+
 Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
 API, identical guest state. Runnable examples:
 

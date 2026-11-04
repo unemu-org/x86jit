@@ -36,13 +36,15 @@ fn main() {
     // the faulting instruction; the next `run()` retries it.
     loop {
         match cpu.run(&vm, None) {
-            Exit::MmioRead { addr, size } => {
+            Exit::MmioRead { addr, size, .. } => {
                 // Device read: synthesize whatever the register should return.
                 let value = 0x0000_002A; // e.g. a "ready" status word
                 println!("device read  @ {addr:#x} ({size} bytes) -> {value:#x}");
                 cpu.complete_mmio_read(value);
             }
-            Exit::MmioWrite { addr, size, value } => {
+            Exit::MmioWrite {
+                addr, size, value, ..
+            } => {
                 // Device write: perform the side effect here, then acknowledge it.
                 // RIP was left on the store; `complete_mmio_write` lets the retried
                 // store skip re-trapping so execution moves on.

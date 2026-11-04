@@ -52,6 +52,7 @@ fn drive(code: &[u8], jit: bool, mut reads: Vec<u64>) -> (Vec<Event>, x86jit_cor
                 size,
                 dir,
                 value,
+                ..
             } => {
                 let out = dir == PortDir::Out;
                 log.push(Event {
