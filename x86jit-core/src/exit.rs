@@ -50,6 +50,7 @@ pub enum PortDir {
 /// const UNKNOWN: Exit = Exit::unknown_instruction(0x5000, [0xab; 15], 3);
 /// const EXCEPTION: Exit = Exit::exception(0x2000, 42);
 /// const PORT_IO: Exit = Exit::port_io(0x1234, 2, PortDir::Out, 0x5678);
+/// const CODE_SPACE: Exit = Exit::code_space_exhausted(0x6000);
 ///
 /// assert!(matches!(UNMAPPED, Exit::UnmappedMemory {
 ///     addr: 0x1000, access: AccessKind::Read, ..
@@ -69,6 +70,7 @@ pub enum PortDir {
 /// assert!(matches!(PORT_IO, Exit::PortIo {
 ///     port: 0x1234, size: 2, dir: PortDir::Out, value: 0x5678, ..
 /// }));
+/// assert!(matches!(CODE_SPACE, Exit::CodeSpaceExhausted { addr: 0x6000, .. }));
 /// ```
 ///
 /// Listing every current variant still requires a wildcard arm:
@@ -81,7 +83,8 @@ pub enum PortDir {
 ///         Exit::Syscall | Exit::Hlt | Exit::BudgetExhausted => {}
 ///         Exit::UnmappedMemory { .. } | Exit::MmioRead { .. }
 ///         | Exit::MmioWrite { .. } | Exit::UnknownInstruction { .. }
-///         | Exit::Exception { .. } | Exit::PortIo { .. } => {}
+///         | Exit::Exception { .. } | Exit::PortIo { .. }
+///         | Exit::CodeSpaceExhausted { .. } => {}
 ///     }
 /// }
 /// ```
@@ -98,6 +101,12 @@ pub enum PortDir {
 /// use x86jit_core::Exit;
 ///
 /// let exit = Exit::MmioWrite { addr: 0x1000, size: 4, value: 0 };
+/// ```
+///
+/// ```compile_fail,E0639
+/// use x86jit_core::Exit;
+///
+/// let exit = Exit::CodeSpaceExhausted { addr: 0x1000 };
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -187,9 +196,29 @@ pub enum Exit {
     /// Like mid-block faults, this may over-charge the executed-instruction counter:
     /// compiled code charges the whole block at entry, including its unexecuted tail.
     Interrupted,
+    /// JIT code storage could not grow or its background compiler could not start.
+    /// Returned once per vcpu, at a block
+    /// boundary; `addr` is its current RIP and no instruction at that boundary
+    /// has executed yet. Resume with `run()` to continue. The backend permanently
+    /// stops compiling new code and interprets blocks it cannot compile; existing
+    /// translations remain usable. This does not report global allocator failure.
+    /// On a weak host, interpreter fallback provides only the interpreter's
+    /// ordering for ordinary loads/stores; it does not honor the configured
+    /// [`MemConsistency::AcqRel`](crate::vm::MemConsistency::AcqRel) or
+    /// [`MemConsistency::FullTso`](crate::vm::MemConsistency::FullTso). An embedder
+    /// relying on either tier for a multithreaded guest should treat this exit
+    /// as fatal.
+    #[non_exhaustive]
+    CodeSpaceExhausted { addr: u64 },
 }
 
 impl Exit {
+    /// Construct an [`Exit::CodeSpaceExhausted`] at a resumable block boundary.
+    #[must_use]
+    pub const fn code_space_exhausted(addr: u64) -> Self {
+        Self::CodeSpaceExhausted { addr }
+    }
+
     /// Construct an [`Exit::UnmappedMemory`] for an embedder-reported memory fault.
     ///
     /// This is the stable construction API for this non-exhaustive variant:

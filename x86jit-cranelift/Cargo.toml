@@ -13,7 +13,7 @@ categories = ["emulators", "virtualization", "development-tools"]
 [features]
 # JIT is opt-in so the core can be built without pulling cranelift (§2, §15).
 default = ["jit"]
-jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:memmap2"]
+jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:memmap2", "dep:region"]
 
 [dependencies]
 x86jit-core.workspace = true
@@ -22,3 +22,7 @@ cranelift-jit = { workspace = true, optional = true }
 cranelift-module = { workspace = true, optional = true }
 cranelift-native = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
+region = { version = "=3.0.2", optional = true }
+
+[dev-dependencies]
+libc.workspace = true

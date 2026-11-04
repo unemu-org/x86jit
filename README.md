@@ -134,9 +134,29 @@ interp/JIT/native timings per commit if you want real numbers.
   (`TASK-341`); `fprem` never writes `C2`, so the architectural reduction loop exits early
   or spins (`TASK-342`).
 - **Nothing reclaims a dropped translation.** A guest that repeatedly patches code — a
-  guest-level JIT rewriting an inline cache — grows host memory linearly, about 8 KiB and
-  1.3 executable mappings per patch, and eventually **panics** rather than returning an
-  `Exit` the embedder can handle (`TASK-352`).
+  guest-level JIT rewriting an inline cache — was measured growing host RSS by about
+  8 KiB and 1.3 executable mappings per patch before the indexed CodeMap. The executable
+  arena and CodeMap metadata still grow with translations. The immutable CodeMap
+  index retains O(n log n) nodes across n registrations: measured index cost is
+  approximately 64 B × (log2 n + 1) per registration, about 1–1.4 KiB per compile
+  at the measured sizes, in addition to the per-patch growth above. Its 4,194,304-entry
+  capacity permits several GiB of retained index storage; this is a structural ceiling,
+  not a practical memory budget. Use the compile limit below to stop earlier.
+  IBTC descriptors continue growing per invalidation epoch per live indirect-branch
+  site, even after compilation stops. Reclaim is tracked separately in `xj-aau.4`.
+  Returned code-arena allocation errors, executable
+  memory finalization/protection resource failures (ENOMEM/EAGAIN, including Linux's
+  mapping-count limit), CodeMap capacity exhaustion, and failure to start the background
+  compiler now permanently stop new compilation. Each vcpu
+  returns `Exit::CodeSpaceExhausted { addr, .. }` once at a resumable block boundary;
+  call `run()` again to continue with interpreter fallback for uncompiled blocks.
+  Existing translations remain usable. `JitBackend::set_compile_limit` can cap
+  compilation attempts before host resources run out. On a weak host, interpreter
+  fallback provides only the interpreter's ordering for ordinary loads/stores and
+  does not honor `MemConsistency::AcqRel` or `FullTso`. An embedder relying on either
+  tier for a multithreaded guest should treat `CodeSpaceExhausted` as fatal.
+  Other finalization/protection errors retain their diagnostic panic. Global allocator
+  failure retains Rust's process-abort behavior.
 - **Self-modifying code is observed one block late.** A block that writes into the page it is itself executing runs to the end of that block on the old bytes; the re-lift takes effect on the next dispatch. This matches QEMU and is the deviation `spec.md` §10 records. Everything else — another block's page, `rep stos`, an x87 store — invalidates on both backends.
 
 **API stability.** Pre-1.0 (`0.x`). The embedding API (`Vm`, `Vcpu`, `Exit`, …) is not

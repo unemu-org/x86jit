@@ -1614,13 +1614,14 @@ mod tests {
     #[test]
     fn smc_dispatch_acknowledges_only_its_own_notice_after_invalidation() {
         let m = Memory::new(MemoryModel::Flat { size: 0x4000 });
-        let a = Arc::new(AtomicU64::new(crate::vm::EXIT_REQUESTED));
-        let b = Arc::new(AtomicU64::new(crate::vm::EXIT_REQUESTED));
+        let other_notices = crate::vm::EXIT_REQUESTED | crate::vm::CODE_SPACE_EXHAUSTED;
+        let a = Arc::new(AtomicU64::new(other_notices));
+        let b = Arc::new(AtomicU64::new(other_notices));
         m.register_dispatch_word(&a);
         m.register_dispatch_word(&b);
         m.mark_code(0x1000, 1);
         m.note_write(0x1000, 1);
-        let pending = DISPATCH_DIRTY | crate::vm::EXIT_REQUESTED;
+        let pending = DISPATCH_DIRTY | other_notices;
         m.dispatch_smc(&b, |pages| {
             assert_eq!(pages, vec![1]);
             assert_eq!(a.load(Ordering::Relaxed), pending);
@@ -1628,7 +1629,7 @@ mod tests {
             assert!(m.dispatch_words.try_lock().is_err());
         });
         assert_eq!(a.load(Ordering::Relaxed), pending);
-        assert_eq!(b.load(Ordering::Relaxed), crate::vm::EXIT_REQUESTED);
+        assert_eq!(b.load(Ordering::Relaxed), other_notices);
         let mut acknowledged = false;
         m.dispatch_smc(&a, |pages| {
             assert!(pages.is_empty(), "another vcpu already drained the list");
@@ -1636,7 +1637,7 @@ mod tests {
             acknowledged = true;
         });
         assert!(acknowledged);
-        assert_eq!(a.load(Ordering::Relaxed), crate::vm::EXIT_REQUESTED);
+        assert_eq!(a.load(Ordering::Relaxed), other_notices);
 
         m.note_write(0x1000, 1);
         assert_eq!(m.take_dirty_code(), vec![1]);

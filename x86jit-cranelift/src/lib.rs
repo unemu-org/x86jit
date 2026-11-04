@@ -16,13 +16,13 @@ mod perfmap;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{Linkage, Module, ModuleError};
 
 use x86jit_core::cache::CompiledPtr;
 use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets};
@@ -2061,6 +2061,16 @@ struct Shared {
     /// compile), for the bench's compile-vs-run split. Relaxed:
     /// a monotone accumulator, not a synchronization channel.
     compile_ns: AtomicU64,
+    /// Sticky: a failed module is never finalized or allocated from again.
+    code_space_exhausted: AtomicBool,
+    /// Registration and the exhaustion broadcast share a lock, so neither a
+    /// concurrent nor a later vcpu can miss its notification.
+    dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
+    compile_limit: AtomicU64,
+    #[cfg(test)]
+    fail_compile_stage: AtomicUsize,
+    #[cfg(test)]
+    fail_worker_spawn: AtomicBool,
 }
 
 /// The background compile queue and its liveness counters (bg-tier).
@@ -2124,6 +2134,16 @@ impl JitBackend {
     /// this one can.
     pub fn with_options(caps: Option<RegionCaps>, target: HostTarget, opt: OptLevel) -> Self {
         Self::build(caps, target, Some(opt))
+    }
+
+    /// Limit the number of compilation attempts for this backend's lifetime.
+    /// Set during setup, before executing guest code. The default is unlimited.
+    /// Reaching the cap has the same terminal behavior as an executable-memory
+    /// allocation failure: an `Exit::CodeSpaceExhausted` notification per vcpu and
+    /// interpreter fallback for new blocks. Useful for bounding code growth and
+    /// testing embedder recovery without exhausting host resources.
+    pub fn set_compile_limit(&self, limit: u64) {
+        self.shared.compile_limit.store(limit, Ordering::Relaxed);
     }
 
     /// Per-helper call counts, highest first, zero-count helpers omitted.
@@ -2210,6 +2230,13 @@ impl JitBackend {
                 done: Mutex::new(Vec::new()),
                 ready: AtomicUsize::new(0),
                 compile_ns: AtomicU64::new(0),
+                code_space_exhausted: AtomicBool::new(false),
+                dispatch_words: Mutex::new(Vec::new()),
+                compile_limit: AtomicU64::new(u64::MAX),
+                #[cfg(test)]
+                fail_compile_stage: AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_worker_spawn: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
         }
@@ -2362,17 +2389,24 @@ impl JitBackend {
 
     /// Spawn the background compiler thread if it isn't running yet (bg-tier).
     /// Lazy: eager/sync-only use never reaches here, so it never spawns.
-    fn ensure_worker(&self) {
+    fn ensure_worker(&self) -> std::io::Result<()> {
         let mut w = lock_recovering(&self.worker, "compile worker");
         if w.is_none() {
             let shared = Arc::clone(&self.shared);
-            *w = Some(
+            #[cfg(test)]
+            let fail = self.shared.fail_worker_spawn.load(Ordering::Relaxed);
+            #[cfg(not(test))]
+            let fail = false;
+            let spawned = if fail {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
                 std::thread::Builder::new()
                     .name("x86jit-tier".into())
                     .spawn(move || shared.worker_loop())
-                    .expect("spawn tier-up worker"),
-            );
+            };
+            *w = Some(spawned?);
         }
+        Ok(())
     }
 
     /// A handle to the background tier-up machinery (bg-tier). Its
@@ -2429,7 +2463,7 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
-    ) -> CompiledPtr {
+    ) -> Option<CompiledPtr> {
         let icount_on = self.icount_on();
         self.compile_with(
             perfmap::Kind::Block,
@@ -2457,7 +2491,7 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
-    ) -> CompiledPtr {
+    ) -> Option<CompiledPtr> {
         let icount_on = self.icount_on();
         self.compile_with(
             perfmap::Kind::Region,
@@ -2495,9 +2529,20 @@ impl Shared {
             codegen::Helpers,
             &mut dyn FnMut() -> u64,
         ) -> Box<[u64]>,
-    ) -> CompiledPtr {
+    ) -> Option<CompiledPtr> {
         let started = Instant::now();
+        if self.code_space_exhausted.load(Ordering::Acquire) {
+            return None;
+        }
         let mut jit = self.jit();
+        // Serialized with every foreground/background compile. After an error the
+        // module may contain unfinalized definitions; never retry or publish those.
+        if self.code_space_exhausted.load(Ordering::Acquire) {
+            return None;
+        }
+        if jit.next_id >= self.compile_limit.load(Ordering::Relaxed) {
+            return self.exhaust_code_space();
+        }
         jit.next_id += 1;
         let name = format!("blk_{}", jit.next_id);
 
@@ -2699,9 +2744,14 @@ impl Shared {
             .module
             .declare_function(&name, Linkage::Export, &ctx.func.signature)
             .expect("declare function");
-        jit.module
-            .define_function(id, &mut ctx)
-            .expect("define function");
+        #[cfg(test)]
+        if self.fail_compile_stage.load(Ordering::Relaxed) == 1 {
+            self.compile_result(Err(ModuleError::Allocation {
+                message: "injected code arena exhaustion",
+                err: std::io::ErrorKind::OutOfMemory.into(),
+            }))?;
+        }
+        self.compile_result(jit.module.define_function(id, &mut ctx))?;
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
@@ -2717,10 +2767,25 @@ impl Shared {
             (cc.code_info().total_size, table.into_boxed_slice())
         };
         jit.module.clear_context(&mut ctx);
-        jit.module.finalize_definitions().expect("finalize");
+        #[cfg(test)]
+        if self.fail_compile_stage.load(Ordering::Relaxed) == 2 {
+            self.compile_result(Err(ModuleError::Backend(
+                region::Error::SystemCall(std::io::ErrorKind::OutOfMemory.into()).into(),
+            )))?;
+        }
+        self.compile_result(jit.module.finalize_definitions())?;
 
         let entry = CompiledPtr(jit.module.get_finalized_function(id));
-        x86jit_core::codemap::register(entry.0 as usize, code_len, srcloc_table, guest_rips);
+        #[cfg(test)]
+        let fail_registration = self.fail_compile_stage.load(Ordering::Relaxed) == 3;
+        #[cfg(not(test))]
+        let fail_registration = false;
+        if fail_registration
+            || x86jit_core::codemap::register(entry.0 as usize, code_len, srcloc_table, guest_rips)
+                .is_err()
+        {
+            return self.exhaust_code_space();
+        }
         // Mirror this range into `/tmp/perf-<pid>.map` iff X86JIT_PERF_MAP=1
         // (no-op otherwise). Same host range as `codemap`, named by the guest RIP so
         // `perf` attributes samples in JIT'd code to `jit_0x<guest_rip>`. The guest PC
@@ -2730,17 +2795,67 @@ impl Shared {
         // Includes the `inner` lock wait — that contention is real compile-path cost.
         self.compile_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        entry
+        Some(entry)
+    }
+
+    fn exhaust_code_space<T>(&self) -> Option<T> {
+        let mut words = self.dispatch_words.lock().unwrap();
+        if !self.code_space_exhausted.swap(true, Ordering::AcqRel) {
+            words.retain(|weak| {
+                if let Some(word) = weak.upgrade() {
+                    word.fetch_or(x86jit_core::vm::CODE_SPACE_EXHAUSTED, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        None
+    }
+
+    fn compile_result(&self, result: Result<(), ModuleError>) -> Option<()> {
+        match result {
+            Ok(()) => Some(()),
+            Err(ModuleError::Allocation { .. }) => self.exhaust_code_space(),
+            // ENOMEM and EAGAIN from OS finalization/protection are resource
+            // exhaustion. Other backend errors retain their diagnostic panic.
+            Err(ModuleError::Backend(error))
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .or_else(|| match error.downcast_ref::<region::Error>() {
+                        // region does not expose the inner error through source().
+                        Some(region::Error::SystemCall(error)) => Some(error),
+                        _ => None,
+                    })
+                    .is_some_and(|e| {
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::OutOfMemory | std::io::ErrorKind::WouldBlock
+                        )
+                    }) =>
+            {
+                self.exhaust_code_space()
+            }
+            Err(error) => panic!("compile: {error}"),
+        }
     }
 
     /// Compile one background request's unit (bg-tier): a single block, or a
     /// hotness-gated superblock region — same off-thread path either way.
-    fn compile_request(&self, req: &TierUpRequest) -> CompiledPtr {
+    fn compile_request(&self, req: &TierUpRequest) -> CachedBlock {
         match &req.unit {
-            TierUpUnit::Block(ir) => self.compile(ir, req.consistency, req.mmio, req.guest_base),
-            TierUpUnit::Region(region) => {
-                self.compile_region(region, req.consistency, req.mmio, req.guest_base)
-            }
+            TierUpUnit::Block(ir) => self
+                .compile(ir, req.consistency, req.mmio, req.guest_base)
+                .map_or_else(
+                    || CachedBlock::Interpreted(ir.clone()),
+                    |entry| CachedBlock::Compiled { entry },
+                ),
+            TierUpUnit::Region(region) => self
+                .compile_region(region, req.consistency, req.mmio, req.guest_base)
+                .map_or_else(
+                    || CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
+                    |entry| CachedBlock::Compiled { entry },
+                ),
         }
     }
 
@@ -2763,12 +2878,12 @@ impl Shared {
             };
             // Compile OUTSIDE the queue lock (it takes `inner`); a concurrent submit
             // or foreground `materialize` isn't blocked by this block's compile.
-            let entry = self.compile_request(&req);
+            let block = self.compile_request(&req);
             {
                 let mut done = self.done.lock().unwrap();
                 done.push(TierUpFinished {
                     pc: req.pc,
-                    block: CachedBlock::Compiled { entry },
+                    block,
                     spans: req.spans.clone(),
                     epoch: req.epoch,
                 });
@@ -2833,6 +2948,19 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
+        let mut words = self.shared.dispatch_words.lock().unwrap();
+        words.retain(|weak| weak.strong_count() != 0);
+        if self.code_space_exhausted() {
+            word.fetch_or(x86jit_core::vm::CODE_SPACE_EXHAUSTED, Ordering::Release);
+        }
+        words.push(Arc::downgrade(word));
+    }
+
+    fn code_space_exhausted(&self) -> bool {
+        self.shared.code_space_exhausted.load(Ordering::Acquire)
+    }
+
     fn materialize(
         &self,
         ir: &IrBlock,
@@ -2840,13 +2968,16 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
-        CachedBlock::Compiled {
-            entry: self.shared.compile(ir, consistency, mmio, guest_base),
-        }
+        self.shared
+            .compile(ir, consistency, mmio, guest_base)
+            .map_or_else(
+                || CachedBlock::Interpreted(Arc::new(ir.clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
     }
 
     fn region_caps(&self) -> Option<RegionCaps> {
-        self.shared.caps
+        self.shared.caps.filter(|_| !self.code_space_exhausted())
     }
 
     fn materialize_region(
@@ -2856,11 +2987,12 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
-        CachedBlock::Compiled {
-            entry: self
-                .shared
-                .compile_region(region, consistency, mmio, guest_base),
-        }
+        self.shared
+            .compile_region(region, consistency, mmio, guest_base)
+            .map_or_else(
+                || CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
     }
 
     fn invalidate_links(&self) {
@@ -2880,7 +3012,13 @@ impl Backend for JitBackend {
     }
 
     fn tier_up_async(&self, req: TierUpRequest) -> TierUpSubmit {
-        self.ensure_worker();
+        if self.code_space_exhausted() {
+            return TierUpSubmit::Busy;
+        }
+        if self.ensure_worker().is_err() {
+            self.shared.exhaust_code_space::<()>();
+            return TierUpSubmit::Busy;
+        }
         let mut q = self.shared.queue.lock().unwrap();
         if q.shutdown {
             // Racing `Drop` — decline; the caller stays interpreted (correct, slow).
@@ -3001,24 +3139,28 @@ mod tests {
             guest_base: u64,
         ) -> CachedBlock {
             CachedBlock::Compiled {
-                entry: self.jit.shared.compile_with(
-                    perfmap::Kind::Block,
-                    ir.guest_start,
-                    |builder, mut helpers, alloc| {
-                        helpers.note_watch.1 = paused_store as *const () as u64;
-                        codegen::translate_block(
-                            builder,
-                            ir,
-                            &self.jit.shared.offsets,
-                            alloc,
-                            helpers,
-                            consistency,
-                            mmio,
-                            guest_base,
-                            false,
-                        )
-                    },
-                ),
+                entry: self
+                    .jit
+                    .shared
+                    .compile_with(
+                        perfmap::Kind::Block,
+                        ir.guest_start,
+                        |builder, mut helpers, alloc| {
+                            helpers.note_watch.1 = paused_store as *const () as u64;
+                            codegen::translate_block(
+                                builder,
+                                ir,
+                                &self.jit.shared.offsets,
+                                alloc,
+                                helpers,
+                                consistency,
+                                mmio,
+                                guest_base,
+                                false,
+                            )
+                        },
+                    )
+                    .expect("test compile"),
             }
         }
 
@@ -3037,24 +3179,28 @@ mod tests {
             guest_base: u64,
         ) -> CachedBlock {
             CachedBlock::Compiled {
-                entry: self.jit.shared.compile_with(
-                    perfmap::Kind::Region,
-                    region.entry,
-                    |builder, mut helpers, alloc| {
-                        helpers.note_watch.1 = paused_store as *const () as u64;
-                        codegen::translate_region(
-                            builder,
-                            region,
-                            &self.jit.shared.offsets,
-                            alloc,
-                            helpers,
-                            consistency,
-                            mmio,
-                            guest_base,
-                            false,
-                        )
-                    },
-                ),
+                entry: self
+                    .jit
+                    .shared
+                    .compile_with(
+                        perfmap::Kind::Region,
+                        region.entry,
+                        |builder, mut helpers, alloc| {
+                            helpers.note_watch.1 = paused_store as *const () as u64;
+                            codegen::translate_region(
+                                builder,
+                                region,
+                                &self.jit.shared.offsets,
+                                alloc,
+                                helpers,
+                                consistency,
+                                mmio,
+                                guest_base,
+                                false,
+                            )
+                        },
+                    )
+                    .expect("test compile"),
             }
         }
 
@@ -3173,6 +3319,466 @@ mod tests {
                 entry
             }
             CachedBlock::Interpreted(_) => panic!("expected a compiled block"),
+        }
+    }
+
+    fn assert_compile_failure_recovers(stage: usize) {
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+        let jit = JitBackend::new();
+        jit.shared
+            .fail_compile_stage
+            .store(stage, Ordering::Relaxed);
+        let shared = jit.shared.clone();
+        let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(jit));
+        vm.map(ENTRY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, CODE).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(
+            cpu.run(&vm, Some(1)),
+            Exit::CodeSpaceExhausted { addr: ENTRY, .. }
+        ));
+        assert_eq!(cpu.reg(Reg::Rax), 0);
+        assert_eq!(cpu.reg(Reg::Rip), ENTRY);
+        assert!(vm.backend.code_space_exhausted());
+        let compile_id = shared.jit().next_id;
+        shared.fail_compile_stage.store(0, Ordering::Relaxed);
+        vm.write_bytes(ENTRY + 0x100, CODE).unwrap();
+        let fresh = lift_block(
+            &vm.mem,
+            x86jit_core::lift::FetchAddr::flat(ENTRY + 0x100),
+            CpuMode::Long64,
+        )
+        .unwrap();
+        assert!(matches!(
+            vm.backend
+                .materialize(&fresh, MemConsistency::Fast, None, 0),
+            CachedBlock::Interpreted(_)
+        ));
+        assert_eq!(
+            shared.jit().next_id,
+            compile_id,
+            "no compile after exhaustion"
+        );
+        for _ in 0..3 {
+            assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+            assert_eq!(cpu.reg(Reg::Rax), 42);
+        }
+    }
+
+    #[test]
+    fn code_arena_allocation_error_recovers() {
+        assert_compile_failure_recovers(1);
+    }
+
+    #[test]
+    fn executable_memory_finalize_error_recovers() {
+        assert_compile_failure_recovers(2);
+    }
+
+    #[test]
+    fn codemap_registration_failure_recovers() {
+        assert_compile_failure_recovers(3);
+    }
+
+    #[test]
+    fn backend_resource_errors_exhaust_code_space() {
+        for kind in [
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let jit = JitBackend::new();
+            assert_eq!(
+                jit.shared
+                    .compile_result(Err(ModuleError::Backend(std::io::Error::from(kind).into()))),
+                None
+            );
+            assert!(jit.code_space_exhausted());
+        }
+    }
+
+    fn assert_wrapped_backend_resource_error(errno: i32) {
+        let jit = JitBackend::new();
+        let error = region::Error::SystemCall(std::io::Error::from_raw_os_error(errno));
+        assert_eq!(
+            jit.shared
+                .compile_result(Err(ModuleError::Backend(error.into()))),
+            None
+        );
+        assert!(jit.code_space_exhausted());
+    }
+
+    #[test]
+    fn wrapped_backend_enomem_exhausts_code_space() {
+        assert_wrapped_backend_resource_error(libc::ENOMEM);
+    }
+
+    #[test]
+    fn wrapped_backend_eagain_exhausts_code_space() {
+        assert_wrapped_backend_resource_error(libc::EAGAIN);
+    }
+
+    #[test]
+    fn wrapped_backend_permission_error_preserves_diagnostics() {
+        let jit = JitBackend::new();
+        let error = region::Error::SystemCall(std::io::Error::from_raw_os_error(libc::EACCES));
+        let diagnostic = error.to_string();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            jit.shared
+                .compile_result(Err(ModuleError::Backend(error.into())))
+        }))
+        .expect_err("permission errors must remain distinct from exhaustion");
+        let message = panic.downcast_ref::<String>().expect("diagnostic panic");
+        assert!(message.contains(&diagnostic), "{message}");
+        assert!(!jit.code_space_exhausted());
+    }
+
+    fn running_cycle_notices_exhaustion(region: bool) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+
+        const ENTRY: u64 = 0x1000;
+        const SIGNAL: u64 = 0x3000;
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let jit = if region {
+            JitBackend::with_superblocks(RegionCaps {
+                max_blocks: 8,
+                max_icount: 128,
+            })
+        } else {
+            JitBackend::new()
+        };
+        let shared = Arc::clone(&jit.shared);
+        let mut vm = Vm::with_backend(VmConfig::flat(0x4000), Box::new(jit));
+        vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+        // mov r11,1; xchg [SIGNAL],r11; jmp second;
+        // second: cmp rax,0; je first; hlt.
+        // SDM Vol 3A §11.1.2.1: memory XCHG is automatically locked.
+        // The handshake's aligned atomic read witnesses the guest's progress.
+        let code = [
+            0x49, 0xc7, 0xc3, 1, 0, 0, 0, 0x4c, 0x87, 0x1c, 0x25, 0, 0x30, 0, 0, 0xeb, 0, 0x48,
+            0x83, 0xf8, 0, 0x74, 0xe9, 0xf4,
+        ];
+        vm.write_bytes(ENTRY, &code).unwrap();
+        let vm = Arc::new(vm);
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(64)), Exit::BudgetExhausted));
+        if region {
+            assert!(vm.cache.regions() > 0, "must warm a compiled region loop");
+        } else {
+            assert!(vm.cache.chained() > 0, "must warm compiled chain edges");
+        }
+        vm.mem.write(SIGNAL, 0, 8).unwrap();
+        let waiting = vm.new_vcpu();
+        let words: Vec<_> = shared
+            .dispatch_words
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|word| word.upgrade().unwrap())
+            .collect();
+        let request = cpu.exit_request();
+        let running = Arc::clone(&vm);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let exit = cpu.run(&running, None);
+            tx.send((exit, cpu)).unwrap();
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        while vm.mem.read(SIGNAL, 8).unwrap() == 0 {
+            if Instant::now() >= deadline {
+                request.request_exit();
+                worker.join().unwrap();
+                panic!("warmed guest did not make progress");
+            }
+            std::thread::yield_now();
+        }
+        shared.exhaust_code_space::<()>();
+        let result = rx.recv_timeout(TIMEOUT);
+        // Bound a failing negative control too: release the worker before asserting.
+        if result.is_err() {
+            request.request_exit();
+            rx.recv_timeout(TIMEOUT)
+                .expect("exit request stops the guest");
+        }
+        worker.join().unwrap();
+        let (exit, mut cpu) = result.expect("exhaustion must bound an unbudgeted run");
+        assert!(matches!(exit, Exit::CodeSpaceExhausted { .. }), "{exit:?}");
+        assert_eq!(vm.mem.read(SIGNAL, 8).unwrap(), 1);
+        use x86jit_core::vm::CODE_SPACE_EXHAUSTED;
+        assert_eq!(words[0].load(Ordering::Acquire), 0);
+        assert_eq!(words[1].load(Ordering::Acquire), CODE_SPACE_EXHAUSTED);
+        // Consuming one vcpu's notice cannot consume another's, and late
+        // registration must inherit the sticky state.
+        for mut other in [waiting, vm.new_vcpu()] {
+            assert!(matches!(
+                other.run(&vm, Some(0)),
+                Exit::CodeSpaceExhausted { .. }
+            ));
+            assert!(matches!(other.run(&vm, Some(0)), Exit::BudgetExhausted));
+        }
+        // Model a broadcast arriving after the sticky flag was already reported.
+        // A simultaneous host request must remain independent of this late bit.
+        words[0].fetch_or(CODE_SPACE_EXHAUSTED, Ordering::Release);
+        request.request_exit();
+        assert!(matches!(cpu.run(&vm, Some(0)), Exit::Interrupted));
+        assert_eq!(words[0].load(Ordering::Acquire), CODE_SPACE_EXHAUSTED);
+        assert!(matches!(cpu.run(&vm, Some(0)), Exit::BudgetExhausted));
+        assert_eq!(words[0].load(Ordering::Acquire), 0);
+        // A repeated transition cannot re-arm a vcpu that already reported it.
+        shared.exhaust_code_space::<()>();
+        cpu.set_reg(Reg::Rax, 1);
+        let mut reference_vm = Vm::with_backend(
+            VmConfig::flat(0x4000),
+            Box::new(x86jit_core::InterpreterBackend),
+        );
+        reference_vm
+            .map(0, 0x4000, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        reference_vm.write_bytes(ENTRY, &code).unwrap();
+        reference_vm.mem.write(SIGNAL, 1, 8).unwrap();
+        let mut reference = reference_vm.new_vcpu();
+        reference.cpu = cpu.cpu.clone();
+        assert!(matches!(reference.run(&reference_vm, None), Exit::Hlt));
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        assert_eq!(cpu.cpu.rip, reference.cpu.rip);
+        assert_eq!(cpu.cpu.gpr, reference.cpu.gpr);
+        assert_eq!(cpu.cpu.flags.to_rflags(), reference.cpu.flags.to_rflags());
+    }
+
+    #[test]
+    fn code_exhaustion_notifies_running_chained_cycle() {
+        running_cycle_notices_exhaustion(false);
+    }
+
+    #[test]
+    fn code_exhaustion_notifies_running_region_loop() {
+        running_cycle_notices_exhaustion(true);
+    }
+
+    #[test]
+    fn backend_non_resource_errors_preserve_diagnostics() {
+        for errno in [libc::EPERM, libc::EACCES] {
+            let jit = JitBackend::new();
+            let error = std::io::Error::from_raw_os_error(errno);
+            let diagnostic = error.to_string();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                jit.shared
+                    .compile_result(Err(ModuleError::Backend(error.into())))
+            }))
+            .expect_err("permission errors must remain distinct from exhaustion");
+            let message = panic.downcast_ref::<String>().expect("diagnostic panic");
+            assert!(message.contains(&diagnostic), "{message}");
+            assert!(!jit.code_space_exhausted());
+        }
+    }
+
+    #[test]
+    fn background_worker_spawn_failure_is_recoverable() {
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+        let jit = JitBackend::new();
+        jit.shared.fail_worker_spawn.store(true, Ordering::Relaxed);
+        let handle = jit.tier_up_handle();
+        let shared = jit.shared.clone();
+        let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(jit));
+        vm.set_tier_up_after(Some(1));
+        vm.set_tier_up_background(true);
+        vm.map(ENTRY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, CODE).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        assert!(matches!(
+            cpu.run(&vm, Some(1)),
+            Exit::CodeSpaceExhausted { addr: ENTRY, .. }
+        ));
+        handle.wait_idle();
+        assert_eq!(vm.cache.tier_pending_len(), 0);
+        assert!(
+            shared.inner.lock().unwrap().is_none(),
+            "never compiled inline"
+        );
+        assert!(shared.queue.lock().unwrap().items.is_empty());
+        shared.fail_worker_spawn.store(false, Ordering::Relaxed);
+        assert!(matches!(cpu.run(&vm, Some(3)), Exit::BudgetExhausted));
+        assert_eq!(cpu.reg(Reg::Rax), 42);
+        assert!(shared.inner.lock().unwrap().is_none(), "sticky after reset");
+    }
+
+    const LOOP: &[u8] = &[
+        0x31, 0xc0, // xor eax, eax
+        0xb9, 7, 0, 0, 0, // mov ecx, 7
+        0x01, 0xc8, // add eax, ecx
+        0x83, 0xe9, 1, // sub ecx, 1
+        0x75, 0xf9, // jnz body
+        0xf4, // hlt
+    ];
+    const TEST_CAPS: RegionCaps = RegionCaps {
+        max_blocks: 16,
+        max_icount: 256,
+    };
+
+    #[test]
+    fn background_region_caps_snapshot_survives_exhaustion() {
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+        struct ExhaustOnCaps {
+            jit: JitBackend,
+            armed: Arc<AtomicBool>,
+        }
+        impl Backend for ExhaustOnCaps {
+            fn code_space_exhausted(&self) -> bool {
+                self.jit.code_space_exhausted()
+            }
+            fn materialize(
+                &self,
+                ir: &IrBlock,
+                consistency: MemConsistency,
+                mmio: Option<(u64, u64)>,
+                guest_base: u64,
+            ) -> CachedBlock {
+                self.jit.materialize(ir, consistency, mmio, guest_base)
+            }
+            fn region_caps(&self) -> Option<RegionCaps> {
+                let caps = self.jit.region_caps();
+                if self.armed.swap(false, Ordering::Relaxed) {
+                    // Deterministically model the worker exhausting storage between
+                    // the dispatcher's region decision and region lift.
+                    self.jit.shared.exhaust_code_space::<()>();
+                }
+                caps
+            }
+            fn tier_up_async(&self, req: TierUpRequest) -> TierUpSubmit {
+                assert!(matches!(req.unit, TierUpUnit::Region(_)));
+                self.jit.tier_up_async(req)
+            }
+        }
+        let armed = Arc::new(AtomicBool::new(false));
+        let backend = ExhaustOnCaps {
+            jit: JitBackend::with_superblocks(TEST_CAPS),
+            armed: armed.clone(),
+        };
+        let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(backend));
+        vm.set_tier_up_after(Some(1));
+        vm.set_tier_up_background(true);
+        vm.map(ENTRY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, LOOP).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        cpu.set_reg(Reg::Rip, ENTRY);
+        armed.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            cpu.run(&vm, Some(1)),
+            Exit::CodeSpaceExhausted { addr: ENTRY, .. }
+        ));
+        assert_eq!(vm.cache.tier_pending_len(), 0);
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(cpu.reg(Reg::Rax), 28);
+    }
+
+    fn assert_tier_failure_recovers(stage: usize, background: bool, region: bool) {
+        use x86jit_core::{cache::BlockKey, Exit, Reg, Vm, VmConfig};
+        let jit = if region {
+            JitBackend::with_superblocks(TEST_CAPS)
+        } else {
+            JitBackend::new()
+        };
+        jit.shared
+            .fail_compile_stage
+            .store(stage, Ordering::Relaxed);
+        let handle = jit.tier_up_handle();
+        let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(jit));
+        vm.set_tier_up_after(Some(1));
+        vm.set_tier_up_background(background);
+        vm.set_tier_up_region_after(Some(3));
+        vm.map(ENTRY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, if region { LOOP } else { CODE })
+            .unwrap();
+        let key = BlockKey::new(ENTRY, CpuMode::Long64);
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        let original = match vm.cache.get(key).unwrap() {
+            CachedBlock::Interpreted(ir) => ir,
+            _ => panic!("cold block must be interpreted"),
+        };
+        // Stall background compilation to inspect the submitted unit and spans.
+        let pause = background.then(|| handle.pause_compiler());
+        for heat in 1..=if region { 3 } else { 1 } {
+            cpu.set_reg(Reg::Rip, ENTRY);
+            let exit = cpu.run(&vm, Some(1));
+            if background || heat < 3 && region {
+                assert!(matches!(exit, Exit::BudgetExhausted));
+            } else {
+                assert!(matches!(exit, Exit::CodeSpaceExhausted { addr: ENTRY, .. }));
+            }
+            if region && heat < 3 {
+                assert_eq!(vm.cache.tier_pending_len(), 0, "waiting for T2");
+            }
+        }
+        if background {
+            let q = handle.shared.queue.lock().unwrap();
+            assert_eq!(q.items.len(), 1);
+            assert_eq!(matches!(q.items[0].unit, TierUpUnit::Region(_)), region);
+            assert_eq!(q.items[0].spans.len() > 1, region);
+            drop(q);
+            drop(pause);
+            handle.wait_idle();
+            assert_eq!(handle.shared.jit().next_id, 1, "failure hook was reached");
+            let done = handle.shared.done.lock().unwrap();
+            assert_eq!(done.len(), 1);
+            assert!(matches!(done[0].block, CachedBlock::Interpreted(_)));
+            drop(done);
+            cpu.set_reg(Reg::Rip, ENTRY);
+            assert!(matches!(
+                cpu.run(&vm, Some(1)),
+                Exit::CodeSpaceExhausted { addr: ENTRY, .. }
+            ));
+        }
+        assert!(vm.backend.code_space_exhausted());
+        cpu.set_reg(Reg::Rip, ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        assert_eq!(vm.cache.tier_pending_len(), 0, "failed completion cleared");
+        assert_eq!(vm.cache.tier_bg_published(), 0);
+        assert_eq!(vm.cache.tier_bg_rejected(), 0);
+        assert_eq!(vm.cache.regions(), 0);
+        let CachedBlock::Interpreted(retained) = vm.cache.get(key).unwrap() else {
+            panic!("failed compilation must leave the interpreted cache entry");
+        };
+        if background {
+            assert!(
+                Arc::ptr_eq(&retained, &original),
+                "no replacement published"
+            );
+        }
+        if region {
+            assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 28);
+        } else {
+            assert_eq!(cpu.reg(Reg::Rax), 42);
+        }
+    }
+
+    #[test]
+    fn inline_tier_real_failures_recover() {
+        for stage in 1..=3 {
+            assert_tier_failure_recovers(stage, false, false);
+        }
+    }
+
+    #[test]
+    fn background_block_real_failures_recover() {
+        for stage in 1..=3 {
+            assert_tier_failure_recovers(stage, true, false);
+        }
+    }
+
+    #[test]
+    fn background_loop_region_real_failures_recover() {
+        for stage in 1..=3 {
+            assert_tier_failure_recovers(stage, true, true);
         }
     }
 

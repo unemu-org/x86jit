@@ -29,6 +29,19 @@ use crate::state::{CpuState, Flags, Reg};
 /// vcpus behind `Arc`. A JIT impl that needs a mutable compiler context wraps it
 /// in interior mutability (e.g. `Mutex`).
 pub trait Backend: Send + Sync {
+    /// Whether code storage has exhausted its capacity. Once true, it stays true
+    /// for this backend's lifetime: materialization falls back to interpretation.
+    /// Each vcpu reports the transition through [`Exit::CodeSpaceExhausted`].
+    fn code_space_exhausted(&self) -> bool {
+        false
+    }
+
+    /// Register a vcpu's dispatch word for asynchronous code-space notification.
+    /// Exhaustion sets [`CODE_SPACE_EXHAUSTED`] in every live registered word,
+    /// including words registered after the sticky transition. Other bits belong
+    /// to SMC and host exit requests and must be preserved.
+    fn register_dispatch_word(&self, _word: &Arc<AtomicU64>) {}
+
     /// Compile `ir` for the given consistency tier. `consistency` only affects a
     /// JIT on a weak host (it picks the barrier strategy for ordinary guest
     /// loads/stores, §8.2.3); the interpreter and x86 hosts ignore it.
@@ -52,7 +65,9 @@ pub trait Backend: Send + Sync {
     /// Superblock caps if this backend forms regions (§12 M5), else `None`
     /// (the default). When `Some`, the dispatcher lifts a region and calls
     /// [`materialize_region`](Backend::materialize_region); a one-block region
-    /// falls back to `materialize`.
+    /// falls back to `materialize`. This can change from `Some` to `None` at
+    /// runtime after code-space exhaustion, including on a background worker.
+    /// Callers must snapshot the caps for each region-lifting operation.
     fn region_caps(&self) -> Option<RegionCaps> {
         None
     }
@@ -96,6 +111,8 @@ pub trait Backend: Send + Sync {
     /// empty `Vec` (no allocation) for a backend that never queues. Called at the top
     /// of the dispatch loop; each result carries the epoch snapshot taken at submit, so
     /// a stale compile is rejected on publish.
+    /// An `Interpreted` completion means compilation failed: the dispatcher
+    /// publishes nothing and clears the request's in-flight marker.
     fn tier_up_finished(&self) -> Vec<TierUpFinished> {
         Vec::new()
     }
@@ -187,7 +204,9 @@ pub enum TierUpUnit {
 pub struct TierUpFinished {
     /// Guest entry address (cache key), echoing the request's `pc`.
     pub pc: u64,
-    /// The compiled unit to swap in for the interpreted block.
+    /// The compiled unit to swap in for the interpreted block. `Interpreted`
+    /// means compilation failed: nothing is published and the in-flight marker
+    /// is cleared.
     pub block: CachedBlock,
     /// The guest byte span(s) `(start, len)` — one per sub-block for a region.
     pub spans: Vec<(u64, u32)>,
@@ -580,6 +599,7 @@ impl Vm {
         cpu.x87_precision = self.x87_precision; // transcendental precision
         let word = Arc::new(AtomicU64::new(0));
         self.mem.register_dispatch_word(&word);
+        self.backend.register_dispatch_word(&word);
         Vcpu {
             cpu,
             exit_request: ExitRequest { word },
@@ -600,6 +620,7 @@ impl Vm {
             pending_irq: None,
             retired: 0,
             sti_shadow: false,
+            code_space_reported: false,
         }
     }
 }
@@ -625,6 +646,9 @@ struct FastEntry {
 }
 
 pub(crate) const EXIT_REQUESTED: u64 = 2;
+
+/// Backend-to-vcpu notification in the dispatch word shared with SMC and exits.
+pub const CODE_SPACE_EXHAUSTED: u64 = 4;
 
 /// Thread-safe, cloneable request to return from a vcpu's next running boundary.
 /// Requests coalesce until consumed by `run`; requests made outside `run` persist.
@@ -654,6 +678,7 @@ impl ExitRequest {
 pub struct Vcpu {
     pub cpu: CpuState,
     exit_request: ExitRequest,
+    code_space_reported: bool,
     /// Decode/lift mode (§17.3), inherited from the `Vm`: threaded into every
     /// `resolve`/`lift`/`step_one` call and combined with the guest RIP to form the
     /// [`BlockKey`] a translation is cached under (§17.4). Constant for the vcpu's life
@@ -1057,6 +1082,18 @@ impl Vcpu {
         self.executed
     }
 
+    fn code_space_exit(&mut self, vm: &Vm) -> Option<Exit> {
+        if !self.code_space_reported && vm.backend.code_space_exhausted() {
+            self.code_space_reported = true;
+            self.exit_request
+                .word
+                .fetch_and(!CODE_SPACE_EXHAUSTED, Ordering::Acquire);
+            Some(Exit::code_space_exhausted(self.cpu.rip))
+        } else {
+            None
+        }
+    }
+
     fn run_inner(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         let mut blocks_run: u64 = 0;
         let exit_word_owner = Arc::clone(&self.exit_request.word);
@@ -1074,12 +1111,22 @@ impl Vcpu {
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
         loop {
-            if exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
+            let dispatch = exit_word.load(Ordering::Relaxed);
+            if dispatch & EXIT_REQUESTED != 0
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
                 && self.cpu.pending_port_in.is_none()
             {
                 return Exit::Interrupted;
+            }
+            // The sticky flag can be observed before the backend finishes its
+            // broadcast. A late bit must not keep an already-notified vcpu in
+            // the outer loop forever.
+            if self.code_space_reported && dispatch & CODE_SPACE_EXHAUSTED != 0 {
+                exit_word.fetch_and(!CODE_SPACE_EXHAUSTED, Ordering::Acquire);
+            }
+            if let Some(exit) = self.code_space_exit(vm) {
+                return exit;
             }
             if budget.is_some_and(|b| blocks_run >= b) {
                 return Exit::BudgetExhausted;
@@ -1199,6 +1246,9 @@ impl Vcpu {
                 },
             };
 
+            if let Some(exit) = self.code_space_exit(vm) {
+                return exit;
+            }
             match block {
                 CachedBlock::Interpreted(ir) => {
                     let mut info = crate::interp::RetireInfo {
@@ -1252,7 +1302,7 @@ impl Vcpu {
                     loop {
                         // SMC (§10): leaving the chain bounds invalidation deferral
                         // to one block while chaining.
-                        // One relaxed load folds SMC and exit notifications at
+                        // One relaxed load folds SMC, exhaustion and exit notifications at
                         // every chain/link/IBTC edge. The outer loop consumes exit
                         // requests and handles SMC before re-entering compiled code.
                         if exit_word.load(Ordering::Relaxed) != 0 {
@@ -1288,6 +1338,9 @@ impl Vcpu {
                                 let since_epoch = vm.cache.epoch();
                                 let resolved =
                                     resolve(vm, FetchAddr::flat(self.cpu.rip), self.mode);
+                                if let Some(exit) = self.code_space_exit(vm) {
+                                    return exit;
+                                }
                                 match resolved {
                                     Ok(CachedBlock::Compiled { entry, .. }) => {
                                         // SAFETY: `link_slot` is a live `Box<AtomicU64>`
@@ -1342,8 +1395,12 @@ impl Vcpu {
                                         Some(entry)
                                     }
                                     None => {
-                                        match resolve(vm, FetchAddr::flat(self.cpu.rip), self.mode)
-                                        {
+                                        let resolved =
+                                            resolve(vm, FetchAddr::flat(self.cpu.rip), self.mode);
+                                        if let Some(exit) = self.code_space_exit(vm) {
+                                            return exit;
+                                        }
+                                        match resolved {
                                             Ok(CachedBlock::Compiled { entry }) => {
                                                 self.fast_put(self.cpu.rip, entry);
                                                 Some(entry)
@@ -1474,6 +1531,12 @@ fn drain_tier_up(vm: &Vm) {
         // A Vm runs in a single mode (§17 scope fence), so the finished compile's
         // block key is its echoed pc under the Vm's mode (§17.4).
         let key = BlockKey::new(fin.pc, vm.mode);
+        if matches!(fin.block, CachedBlock::Interpreted(_)) {
+            // A failed background compile leaves the already-cached interpreter
+            // block in place; only clear its in-flight marker.
+            vm.cache.end_tier_up(key);
+            continue;
+        }
         // Multi-span publish: a region carries one span per sub-block; a block carries
         // one. `on_mark` re-tags the pages under the spans lock.
         let multi_span = fin.spans.len() > 1;
@@ -1530,6 +1593,9 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
         let (Some(thr), CachedBlock::Interpreted(ir)) = (vm.tier_up_after, &block) else {
             return Ok(block);
         };
+        if vm.backend.code_space_exhausted() {
+            return Ok(block);
+        }
         let count = vm.cache.bump_hotness(key);
         if count < thr {
             return Ok(block);
@@ -1543,7 +1609,8 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
             // interpreted until a much higher backedge threshold T2 (a premature region
             // on a short loop regresses, T3f) — the OSR analogue; a non-loop block (or a
             // `None`-caps backend) tiers the single block at T1 as before.
-            let region_candidate = match vm.backend.region_caps() {
+            let region_caps = vm.backend.region_caps();
+            let region_candidate = match region_caps {
                 Some(caps) => match vm.cache.region_decision(key) {
                     Some(c) => c,
                     None => {
@@ -1565,10 +1632,7 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
                 if !vm.cache.try_begin_tier_up(key) {
                     return Ok(block); // a compile for this pc is already in flight
                 }
-                let caps = vm
-                    .backend
-                    .region_caps()
-                    .expect("region candidate ⇒ region_caps");
+                let caps = region_caps.expect("region candidate ⇒ region_caps");
                 match lift_region(&vm.mem, pc, caps, mode) {
                     Ok(region) if region.blocks.len() > 1 && region.has_loop => {
                         let spans = region.spans();
@@ -1648,7 +1712,9 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
                         vm.mem.mark_code(*start, *len);
                     }
                 });
-                vm.cache.record_region();
+                if matches!(materialized, CachedBlock::Compiled { .. }) {
+                    vm.cache.record_region();
+                }
                 return Ok(materialized);
             }
             Ok(region) => {
@@ -1707,6 +1773,54 @@ fn lift_exit(e: LiftError) -> Exit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_chain_does_not_probe_exhaustion_per_edge() {
+        struct ChainBackend(Arc<AtomicU64>);
+        unsafe extern "C" fn chain(cpu: *mut u8, mem: *mut u8) -> u64 {
+            // SAFETY: the dispatcher supplies live CpuState/MemCtx pointers per ABI.
+            unsafe {
+                (*(cpu as *mut CpuState)).gpr[0] += 1;
+                (*(mem as *mut MemCtx)).next_entry = chain as *const () as u64;
+            }
+            RET_CHAIN
+        }
+        impl Backend for ChainBackend {
+            fn code_space_exhausted(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+
+            fn materialize(
+                &self,
+                _: &IrBlock,
+                _: MemConsistency,
+                _: Option<(u64, u64)>,
+                _: u64,
+            ) -> CachedBlock {
+                CachedBlock::Compiled {
+                    entry: CompiledPtr(chain as *const u8),
+                }
+            }
+        }
+        let probes = Arc::new(AtomicU64::new(0));
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(0x2000),
+            Box::new(ChainBackend(probes.clone())),
+        );
+        vm.map(0x1000, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0xeb, 0xfe]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, 0x1000);
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        let before = probes.load(Ordering::Relaxed);
+        assert!(matches!(cpu.run(&vm, Some(64)), Exit::BudgetExhausted));
+        assert_eq!(cpu.reg(Reg::Rax), 65);
+        assert!(
+            probes.load(Ordering::Relaxed) - before <= 2,
+            "exhaustion probes must not scale with compiled chain length"
+        );
+    }
 
     fn vcpu() -> Vcpu {
         let vm = Vm::new(VmConfig {
