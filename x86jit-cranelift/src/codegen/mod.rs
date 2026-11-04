@@ -204,6 +204,7 @@ impl Helpers {
 }
 
 /// Translate one `IrBlock` into the function `builder` is building.
+/// Returns the full-width guest RIP array indexed by the emitted SourceLocs.
 ///
 /// `alloc_slot` hands out a stable heap address for a link slot (a `*const u8`
 /// initialized to null); the block bakes it as a constant and the dispatcher fills it
@@ -219,7 +220,7 @@ pub fn translate_block(
     mmio: Option<(u64, u64)>,
     guest_base: u64,
     icount_on: bool,
-) {
+) -> Box<[u64]> {
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
@@ -245,6 +246,7 @@ pub fn translate_block(
         guest_base,
         icount: icount_on,
         checked_ea: Vec::new(),
+        guest_rips: Vec::new(),
     };
 
     t.charge_icount(ir.icount);
@@ -262,6 +264,7 @@ pub fn translate_block(
         t.store_cpu(offsets.rip, end);
         t.ret(RET_CONTINUE);
     }
+    t.guest_rips.into_boxed_slice()
 }
 
 /// Translate a **superblock region** (§12 M5-T3) into one function: its sub-blocks
@@ -285,7 +288,7 @@ pub fn translate_region(
     mmio: Option<(u64, u64)>,
     guest_base: u64,
     icount_on: bool,
-) {
+) -> Box<[u64]> {
     let fentry = builder.create_block();
     builder.append_block_params_for_function_params(fentry);
     builder.switch_to_block(fentry);
@@ -317,6 +320,7 @@ pub fn translate_region(
         guest_base,
         icount: icount_on,
         checked_ea: Vec::new(),
+        guest_rips: Vec::new(),
     };
 
     // Carry the 16 GPRs as SSA Variables (§12 M5-T3e): declare them, seed each from
@@ -363,6 +367,7 @@ pub fn translate_region(
     }
 
     t.builder.seal_all_blocks();
+    t.guest_rips.into_boxed_slice()
 }
 
 struct Translator<'a, 'b> {
@@ -373,6 +378,8 @@ struct Translator<'a, 'b> {
     temps: Vec<Option<Value>>,
     cur_addr: u64,
     guest_end: u64,
+    /// Full-width guest RIPs indexed by this function's SourceLocs.
+    guest_rips: Vec<u64>,
     alloc_slot: &'a mut dyn FnMut() -> u64,
     helpers: Helpers,
     /// Memory-consistency tier for ordinary guest loads/stores (§8.2.3). Only

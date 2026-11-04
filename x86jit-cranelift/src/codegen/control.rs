@@ -3,13 +3,13 @@ use super::*;
 impl Translator<'_, '_> {
     pub(crate) fn emit_insn_start(&mut self, guest_addr: &u64) -> bool {
         self.cur_addr = *guest_addr;
-        // Tag the machine code emitted for this guest instruction with its guest
-        // RIP, so a guard-page SIGSEGV can map the faulting host PC back to a
-        // precise guest RIP via the srcloc side table. Guest code lives below the
-        // 4 GiB CODE_WINDOW, so the `u32` SourceLoc is lossless. Emits zero
-        // instructions.
-        self.builder
-            .set_srcloc(ir::SourceLoc::new(*guest_addr as u32));
+        // SourceLoc indexes this function's full-width RIP array, including all
+        // region blocks. Only the instruction count is bounded by u32; reserve
+        // u32::MAX for Cranelift's default (unattributed) source location.
+        let index = u32::try_from(self.guest_rips.len()).expect("too many source locations");
+        assert_ne!(index, u32::MAX, "too many source locations");
+        self.guest_rips.push(*guest_addr);
+        self.builder.set_srcloc(ir::SourceLoc::new(index));
         false
     }
 

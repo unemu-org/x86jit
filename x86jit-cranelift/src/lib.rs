@@ -2440,7 +2440,7 @@ impl Shared {
                     mmio,
                     guest_base,
                     icount_on,
-                );
+                )
             },
         )
     }
@@ -2468,14 +2468,15 @@ impl Shared {
                     mmio,
                     guest_base,
                     icount_on,
-                );
+                )
             },
         )
     }
 
     /// Shared function-building spine: sets up the signature, imports the helpers,
     /// runs `translate` to emit the body, and finalizes. `translate` receives the
-    /// builder, the imported helper refs, and the link-slot allocator.
+    /// builder, the imported helper refs, and the link-slot allocator, and returns
+    /// the full-width RIP array indexed by the emitted SourceLocs.
     fn compile_with(
         &self,
         // Perf-map symbol kind + guest entry PC, threaded through so the emitted
@@ -2484,7 +2485,11 @@ impl Shared {
         // passed by the block/region callers.
         perf_kind: perfmap::Kind,
         perf_guest: u64,
-        translate: impl FnOnce(&mut FunctionBuilder, codegen::Helpers, &mut dyn FnMut() -> u64),
+        translate: impl FnOnce(
+            &mut FunctionBuilder,
+            codegen::Helpers,
+            &mut dyn FnMut() -> u64,
+        ) -> Box<[u64]>,
     ) -> CompiledPtr {
         let started = Instant::now();
         let mut jit = self.jit();
@@ -2580,7 +2585,7 @@ impl Shared {
         let pcmpstrm_mem_sig = params(7, false); // pcmpstrm_mem(cpu, a, bv_lo, bv_hi, imm, explicit, out) -> ()
         let bmi_sig = params(5, false); // bmi(a, b, op, size, out) -> () — result + CF via `out`
 
-        {
+        let guest_rips = {
             let Jit { fbctx, slots, .. } = &mut *jit;
             let mut alloc_slot = || {
                 let b = Box::new(AtomicU64::new(0));
@@ -2680,9 +2685,10 @@ impl Shared {
                 crc32: helper!(crc_sig, crc32_helper),
                 note_watch: helper!(note_watch_sig, note_write_helper),
             };
-            translate(&mut builder, helpers, &mut alloc_slot);
+            let guest_rips = translate(&mut builder, helpers, &mut alloc_slot);
             builder.finalize();
-        }
+            guest_rips
+        };
 
         let id = jit
             .module
@@ -2691,7 +2697,7 @@ impl Shared {
         jit.module
             .define_function(id, &mut ctx)
             .expect("define function");
-        // Capture the code size + sorted `(host_off, guest_rip)` srcloc table before
+        // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
         let (code_len, srcloc_table) = {
@@ -2709,12 +2715,11 @@ impl Shared {
         jit.module.finalize_definitions().expect("finalize");
 
         let entry = CompiledPtr(jit.module.get_finalized_function(id));
-        x86jit_core::codemap::register(entry.0 as usize, code_len, srcloc_table);
+        x86jit_core::codemap::register(entry.0 as usize, code_len, srcloc_table, guest_rips);
         // Mirror this range into `/tmp/perf-<pid>.map` iff X86JIT_PERF_MAP=1
         // (no-op otherwise). Same host range as `codemap`, named by the guest RIP so
         // `perf` attributes samples in JIT'd code to `jit_0x<guest_rip>`. The guest PC
-        // is the real block/region entry, not the srcloc table's first entry (whose
-        // guest RIPs are truncated to u32).
+        // is the real block/region entry, which may precede the first source location.
         perfmap::record(entry.0 as usize, code_len, perf_kind, perf_guest);
         // Account this compile's wall-time for the bench compile-vs-run split.
         // Includes the `inner` lock wait — that contention is real compile-path cost.
@@ -3108,10 +3113,10 @@ mod tests {
     /// call site), and the block is genuinely covered by `codemap` at that guest
     /// RIP. This intentionally does NOT assert on `codemap::lookup(entry.0)`: at the
     /// exact entry offset the srcloc table may have no covering entry (returns
-    /// `None`), and its guest RIPs are u32-truncated — which is *why* perfmap names
-    /// the symbol from `ir.guest_start` directly, not from codemap. Instead we scan
-    /// forward within the block and confirm codemap resolves it to `ENTRY` (which
-    /// fits in u32 here), proving the perf-map range and codemap agree on the block.
+    /// `None`), because the first source location can follow the prologue — which is
+    /// *why* perfmap names the symbol from `ir.guest_start` directly, not from
+    /// codemap. Instead we scan forward within the block and confirm codemap resolves
+    /// it to `ENTRY`, proving the perf-map range and codemap agree on the block.
     /// (Line formatting is covered by `perfmap::tests::format_line_*`; end-to-end
     /// file emission by the bench under `X86JIT_PERF_MAP=1`.)
     #[test]

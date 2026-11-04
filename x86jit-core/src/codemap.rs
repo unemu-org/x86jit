@@ -1,13 +1,15 @@
 //! Process-global host-PC → guest-RIP side table for guard-page fault recovery.
 //! A JIT registers, per compiled function, its host code range `[start, end)` plus
-//! a sorted `(host_off, guest_rip)` srcloc table (emitted by `set_srcloc` at each
-//! guest instruction; zero machine-code cost). On a SIGSEGV in JIT'd code, the
-//! embedder's guarded-run wrapper looks the faulting host PC up here to recover the
-//! precise guest RIP — the instruction the interpreter would have stopped on.
+//! a sorted `(host_off, rip_index)` srcloc table and an array of full-width guest
+//! RIPs (indexed by `set_srcloc` at each guest instruction; zero machine-code
+//! cost). On a SIGSEGV in JIT'd code, the embedder's guarded-run wrapper looks the
+//! faulting host PC up here to recover the precise guest RIP — the instruction
+//! the interpreter would have stopped on.
 //!
 //! **Async-signal-safe reads.** The map is append-only: entries and their srcloc
-//! tables are allocated once and never moved or freed for the process's life —
-//! cranelift-jit never frees compiled code, and an SMC-dropped block's bytes are
+//! tables and RIP arrays are allocated once and never moved or freed for the
+//! process's life — cranelift-jit never frees compiled code, and an SMC-dropped
+//! block's bytes are
 //! unchanged, so this matches the real lifetime. Storage is a fixed array of heap
 //! chunks (a chunk, once installed, never moves); a release/acquire `AtomicUsize`
 //! length publishes each append. A reader only loads the length and dereferences
@@ -36,11 +38,13 @@ struct Entry {
     /// Host code range `[start, end)` (absolute addresses).
     start: usize,
     end: usize,
-    /// Leaked, sorted-by-`host_off` `(host_off, guest_rip)` pairs. A raw pointer
+    /// Leaked, sorted-by-`host_off` `(host_off, rip_index)` pairs. A raw pointer
     /// (not `Box`) keeps `Entry` `Copy` and makes the handler-side read obviously
     /// a plain load of never-freed memory.
     table: *const (u32, u32),
     table_len: usize,
+    /// Leaked full-width RIPs. Every table index is validated before publication.
+    guest_rips: *const u64,
 }
 
 impl Entry {
@@ -49,6 +53,7 @@ impl Entry {
         end: 0,
         table: ptr::null(),
         table_len: 0,
+        guest_rips: ptr::null(),
     };
 }
 
@@ -81,9 +86,19 @@ impl CodeMap {
     }
 
     /// Register a compiled function's host range and srcloc table. `table` must be
-    /// sorted ascending by `host_off`. Cold path (compile-time), so it may lock
-    /// and allocate.
-    pub fn register(&self, start: usize, code_len: u32, table: Box<[(u32, u32)]>) {
+    /// sorted ascending by `host_off`, with each `rip_index` indexing `guest_rips`.
+    /// Cold path (compile-time), so it may lock and allocate.
+    pub fn register(
+        &self,
+        start: usize,
+        code_len: u32,
+        table: Box<[(u32, u32)]>,
+        guest_rips: Box<[u64]>,
+    ) {
+        assert!(
+            table.iter().all(|&(_, i)| (i as usize) < guest_rips.len()),
+            "CodeMap RIP index out of bounds"
+        );
         let _g = self.write_lock.lock().unwrap();
         let i = self.len.load(Ordering::Relaxed);
         let ci = i / CHUNK_CAP;
@@ -97,6 +112,7 @@ impl CodeMap {
         }
         let table_len = table.len();
         let table_ptr = Box::into_raw(table) as *const (u32, u32);
+        let guest_rips = Box::into_raw(guest_rips) as *const u64;
         // SAFETY: slot `i` is exclusive (write_lock held) and not yet published;
         // it is fully written before the Release store of `len` below.
         unsafe {
@@ -105,6 +121,7 @@ impl CodeMap {
                 end: start + code_len as usize,
                 table: table_ptr,
                 table_len,
+                guest_rips,
             };
         }
         self.len.store(i + 1, Ordering::Release);
@@ -129,7 +146,11 @@ impl CodeMap {
                 let table = unsafe { slice::from_raw_parts(e.table, e.table_len) };
                 // Largest `host_off <= off` → the guest RIP covering this PC.
                 let idx = table.partition_point(|&(h, _)| h <= off);
-                return (idx > 0).then(|| table[idx - 1].1 as u64);
+                return (idx > 0).then(|| {
+                    // SAFETY: register validated every index into the leaked RIP
+                    // array, which was published together with this table.
+                    unsafe { *e.guest_rips.add(table[idx - 1].1 as usize) }
+                });
             }
         }
         None
@@ -139,8 +160,8 @@ impl CodeMap {
 static CODE_MAP: CodeMap = CodeMap::new();
 
 /// Register a compiled function in the process-global map (see [`CodeMap::register`]).
-pub fn register(start: usize, code_len: u32, table: Box<[(u32, u32)]>) {
-    CODE_MAP.register(start, code_len, table);
+pub fn register(start: usize, code_len: u32, table: Box<[(u32, u32)]>, guest_rips: Box<[u64]>) {
+    CODE_MAP.register(start, code_len, table, guest_rips);
 }
 
 /// Look a host PC up in the process-global map (see [`CodeMap::lookup`]).
@@ -159,7 +180,8 @@ mod tests {
         map.register(
             0x1000,
             0x40,
-            vec![(0u32, 0x400100u32), (0x10, 0x400105)].into_boxed_slice(),
+            vec![(0, 0), (0x10, 1)].into_boxed_slice(),
+            vec![0x400100, 0x400105].into_boxed_slice(),
         );
         assert_eq!(map.lookup(0x1000), Some(0x400100)); // first insn
         assert_eq!(map.lookup(0x100f), Some(0x400100)); // still first insn
@@ -170,6 +192,35 @@ mod tests {
     }
 
     #[test]
+    fn lookup_resolves_full_width_rips_by_index() {
+        let map = CodeMap::new();
+        map.register(
+            0x1000,
+            0x40,
+            vec![(4, 1), (0x10, 0), (0x20, 1)].into_boxed_slice(),
+            vec![u64::MAX, 0x1_ffff_ffff].into_boxed_slice(),
+        );
+        assert_eq!(map.lookup(0x1000), None);
+        assert_eq!(map.lookup(0x1004), Some(0x1_ffff_ffff));
+        assert_eq!(map.lookup(0x100f), Some(0x1_ffff_ffff));
+        assert_eq!(map.lookup(0x1010), Some(u64::MAX));
+        assert_eq!(map.lookup(0x1020), Some(0x1_ffff_ffff));
+        assert_eq!(map.lookup(0x103f), Some(0x1_ffff_ffff));
+        assert_eq!(map.lookup(0x1040), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "CodeMap RIP index out of bounds")]
+    fn register_rejects_invalid_rip_indices() {
+        CodeMap::new().register(
+            0x1000,
+            0x40,
+            vec![(0, 1)].into_boxed_slice(),
+            Box::new([42]),
+        );
+    }
+
+    #[test]
     fn many_entries_span_multiple_chunks() {
         let map = CodeMap::new();
         for i in 0..(CHUNK_CAP + 5) {
@@ -177,7 +228,8 @@ mod tests {
             map.register(
                 base,
                 0x10,
-                vec![(0u32, (0x40_0000 + i) as u32)].into_boxed_slice(),
+                vec![(0, 0)].into_boxed_slice(),
+                vec![(0x40_0000 + i) as u64].into_boxed_slice(),
             );
         }
         // An entry in the first chunk and one in the second both resolve.
