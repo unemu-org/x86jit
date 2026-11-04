@@ -486,16 +486,18 @@ impl Vm {
     /// Like [`Vm::with_backend`] but for a `Reserved` model backed by an
     /// embedder-provided host mapping (a `MAP_NORESERVE` span the core can't allocate
     /// itself). `config.memory_model` should be `Reserved { span: ram.len }`.
+    /// The host pointer must equal `ram.guest_base` modulo 16. Returns an error
+    /// for misaligned backing or a backing that cannot contain the guest extent.
     pub fn with_backend_host_ram(
         config: VmConfig,
         backend: Box<dyn Backend>,
         ram: HostRam,
-    ) -> Self {
-        Self::from_mem(
-            Memory::from_host_ram(config.memory_model, ram),
+    ) -> Result<Self, crate::memory::HostRamError> {
+        Ok(Self::from_mem(
+            Memory::from_host_ram(config.memory_model, ram)?,
             backend,
             config.consistency,
-        )
+        ))
     }
 
     pub fn map(

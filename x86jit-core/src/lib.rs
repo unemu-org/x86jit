@@ -67,7 +67,9 @@ pub use ir::{
     ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
 pub use lift::CpuMode;
-pub use memory::{HostRam, MapError, MemError, MemTrap, Memory, MemoryModel, Prot, RegionKind};
+pub use memory::{
+    HostRam, HostRamError, MapError, MemError, MemTrap, Memory, MemoryModel, Prot, RegionKind,
+};
 pub use state::{
     CpuSource, CpuState, Flags, RandomKind, Reg, TscSample, X87Precision, AF_SRC_ONE, AF_SRC_ZERO,
     PF_SRC_ONE, PF_SRC_ZERO,

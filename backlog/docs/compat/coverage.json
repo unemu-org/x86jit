@@ -77,8 +77,8 @@
       "missing_mem_form": []
     },
     "x86-64-v1": {
-      "lifted": 562,
-      "unsupported": 115,
+      "lifted": 566,
+      "unsupported": 112,
       "unencodable": 146,
       "missing": [
         "Call_m1632",
@@ -89,9 +89,6 @@
         "Cli",
         "Clts",
         "Cmc",
-        "Cmpxchg_rm16_r16",
-        "Cmpxchg_rm32_r32",
-        "Cmpxchg_rm8_r8",
         "Cvtpd2pi_mm_xmmm128",
         "Cvtpi2pd_xmm_mmm64",
         "Cvtpi2ps_xmm_mmm64",
@@ -201,11 +198,10 @@
       "missing_mem_form": []
     },
     "x86-64-v2": {
-      "lifted": 90,
-      "unsupported": 27,
+      "lifted": 91,
+      "unsupported": 26,
       "unencodable": 0,
       "missing": [
-        "Cmpxchg16b_m128",
         "Extractps_r64m32_xmm_imm8",
         "Extractps_rm32_xmm_imm8",
         "Pabsb_mm_mmm64",
@@ -734,8 +730,8 @@
       "missing_mem_form": []
     },
     "x86-64-v1": {
-      "lifted": 547,
-      "unsupported": 134,
+      "lifted": 551,
+      "unsupported": 131,
       "unencodable": 232,
       "missing": [
         "Aaa",
@@ -755,9 +751,6 @@
         "Cli",
         "Clts",
         "Cmc",
-        "Cmpxchg_rm16_r16",
-        "Cmpxchg_rm32_r32",
-        "Cmpxchg_rm8_r8",
         "Cvtpd2pi_mm_xmmm128",
         "Cvtpi2pd_xmm_mmm64",
         "Cvtpi2ps_xmm_mmm64",

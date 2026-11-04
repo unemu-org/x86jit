@@ -209,6 +209,15 @@ assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
 assert_eq!(cpu.reg(Reg::Rax) as u32, 5);
 ```
 
+`Memory::from_host_ram` and `Vm::with_backend_host_ram` return a `Result`.
+Host backing must preserve 16-byte guest alignment: `ram.ptr as usize % 16`
+must equal `ram.guest_base % 16`. Invalid alignment returns
+`HostRamError::Misaligned`; invalid extents also return a `HostRamError`.
+Page-aligned backing with a page-aligned guest base, and identity mappings
+(`guest_base == ptr as u64`), satisfy this requirement. Owned memory is allocated
+with 16-byte alignment. This lets interpreted and compiled `cmpxchg16b` use the
+same host atomic operation.
+
 `cpu.exit_request()` returns a cloneable, `Send + Sync` handle. Another host thread
 can call `handle.request_exit()` to make `run` return `Exit::Interrupted`, even
 without a block budget. The vCPU yields at its next checked instruction boundary:

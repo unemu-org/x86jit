@@ -100,6 +100,36 @@ impl Translator<'_, '_> {
         false
     }
 
+    pub(crate) fn emit_atomic_cas_pair(&mut self, addr: &Val, size: u8, len: u8) -> bool {
+        let a = self.val(*addr);
+        let size = self.iconst(size as u64);
+        let cur = self.iconst(self.cur_addr);
+        self.flush_gprs();
+        let len = self.iconst(len as u64);
+        let inst = self.call_helper(
+            self.helpers.cas_pair,
+            &[self.cpu, self.mem, a, size, cur, len],
+        );
+        let code = self.builder.inst_results(inst)[0];
+        let stopped = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, code, RET_CONTINUE as i64);
+        let ok = self.begin_trap_fork(stopped);
+        if let Some(fv) = self.fuel_var {
+            let fuel = self.builder.use_var(fv);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), fuel, self.mem, MEMCTX_FUEL);
+        }
+        self.builder.ins().return_(&[code]);
+        self.builder.switch_to_block(ok);
+        self.reload_gprs();
+        // The helper changes ZF; a cold recovery recipe must not overwrite it.
+        self.pending_flags[3] = None;
+        false
+    }
+
     pub(crate) fn emit_rep_string(
         &mut self,
         op: &StrOp,

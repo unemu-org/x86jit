@@ -507,12 +507,120 @@ pub(crate) fn lift_xadd(
     Ok(())
 }
 
-/// `cmpxchg dst, src`: compare the accumulator (AL/AX/EAX/RAX) with `dst`; if
-/// equal, `dst = src` and ZF=1, else the accumulator takes `dst` and ZF=0. Flags
-/// are those of `cmp acc, dst`. A memory destination is atomic (`lock cmpxchg`,
-/// §8.2.3) via a single CAS. The register-destination form is deferred (rare, and
-/// not a synchronization primitive).
+/// SDM Vol 2A, CMPXCHG, Operation and Flags Affected: compare AL/AX/EAX/RAX
+/// with the destination, write the source on success, and the accumulator only
+/// on failure. Memory destinations use a single CAS (§8.2.3).
 pub(crate) fn lift_cmpxchg(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
+    let size = operand_size(insn, 0);
+    let src = lower_read(insn, 1, ops, tg)?;
+    let acc = read_reg(Reg::Rax, ops, tg);
+    let exp = alu_none(ops, tg, |dst| IrOp::And {
+        dst,
+        a: acc,
+        b: Val::Imm(size_mask(size)),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    let old = if insn.op_kind(0) == OpKind::Memory {
+        let addr = effective_address(insn, ops, tg)?;
+        let old = tg.fresh();
+        ops.push(IrOp::AtomicCas {
+            old,
+            addr,
+            expected: exp,
+            src,
+            size,
+        });
+        Val::Temp(old)
+    } else {
+        let value = lower_read(insn, 0, ops, tg)?;
+        alu_none(ops, tg, |dst| IrOp::And {
+            dst,
+            a: value,
+            b: Val::Imm(size_mask(size)),
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    };
+    let res = tg.fresh();
+    ops.push(IrOp::Sub {
+        dst: res,
+        a: exp,
+        b: old,
+        size,
+        set_flags: FlagMask::ALL,
+    });
+    let failed = tg.fresh();
+    ops.push(IrOp::GetCond {
+        dst: failed,
+        cond: Cond::Ne,
+    });
+    let failure_mask = alu_none(ops, tg, |dst| IrOp::Sub {
+        dst,
+        a: Val::Imm(0),
+        b: Val::Temp(failed),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    // SDM Vol 1 §3.4.1.1: a failed 32-bit comparison zero-extends EAX;
+    // success preserves all of RAX, and byte/word failures preserve upper bits.
+    let write_mask = if size < 4 {
+        alu_none(ops, tg, |dst| IrOp::And {
+            dst,
+            a: failure_mask,
+            b: Val::Imm(size_mask(size)),
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    } else {
+        failure_mask
+    };
+    let new_acc = cmpxchg_select(ops, tg, acc, old, write_mask);
+    ops.push(IrOp::WriteReg {
+        reg: Reg::Rax,
+        src: new_acc,
+        size: 8,
+    });
+    if insn.op_kind(0) != OpKind::Memory {
+        let result = cmpxchg_select(ops, tg, src, old, failure_mask);
+        let dst = lower_write_target(insn, 0, ops, tg)?;
+        // Commit DEST last: it may alias the accumulator (including AH).
+        emit_write(ops, tg, dst, result);
+    }
+    Ok(())
+}
+
+fn cmpxchg_select(ops: &mut Vec<IrOp>, tg: &mut TempGen, a: Val, b: Val, mask: Val) -> Val {
+    let diff = alu_none(ops, tg, |dst| IrOp::Xor {
+        dst,
+        a,
+        b,
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    let change = alu_none(ops, tg, |dst| IrOp::And {
+        dst,
+        a: diff,
+        b: mask,
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    alu_none(ops, tg, |dst| IrOp::Xor {
+        dst,
+        a,
+        b: change,
+        size: 8,
+        set_flags: FlagMask::NONE,
+    })
+}
+
+/// SDM Vol 2A, CMPXCHG8B/CMPXCHG16B, Operation and Flags Affected.
+/// Keep conditional pair writes and the faulting CAS in one operation.
+pub(crate) fn lift_cmpxchg_pair(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
     tg: &mut TempGen,
@@ -520,41 +628,16 @@ pub(crate) fn lift_cmpxchg(
     if insn.op_kind(0) != OpKind::Memory {
         return Err(unsupported_insn(insn));
     }
-    let size = operand_size(insn, 0);
     let addr = effective_address(insn, ops, tg)?;
-    let src = lower_read(insn, 1, ops, tg)?;
-    // Accumulator, masked to the operand width, is the expected value.
-    let acc = read_reg(Reg::Rax, ops, tg);
-    let exp = tg.fresh();
-    ops.push(IrOp::And {
-        dst: exp,
-        a: acc,
-        b: Val::Imm(size_mask(size)),
-        size: 8,
-        set_flags: FlagMask::NONE,
-    });
-    let old = tg.fresh();
-    ops.push(IrOp::AtomicCas {
-        old,
+    let size = if insn.mnemonic() == iced_x86::Mnemonic::Cmpxchg16b {
+        16
+    } else {
+        8
+    };
+    ops.push(IrOp::AtomicCasPair {
         addr,
-        expected: Val::Temp(exp),
-        src,
         size,
-    });
-    // Flags = cmp(acc, old).
-    let res = tg.fresh();
-    ops.push(IrOp::Sub {
-        dst: res,
-        a: Val::Temp(exp),
-        b: Val::Temp(old),
-        size,
-        set_flags: FlagMask::ALL,
-    });
-    // Accumulator <- old (a no-op on success, the memory value on failure).
-    ops.push(IrOp::WriteReg {
-        reg: Reg::Rax,
-        src: Val::Temp(old),
-        size,
+        len: insn.len() as u8,
     });
     Ok(())
 }

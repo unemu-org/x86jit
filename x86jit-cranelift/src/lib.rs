@@ -251,6 +251,48 @@ unsafe extern "C" fn string_helper(
     ret
 }
 
+/// Paired CAS helper; guest-memory accesses are checked by `Memory` before asm.
+/// This helper also needs helper fault-site coverage when that facility is added.
+///
+/// # Safety
+/// `cpu` and `mem` point to the live CpuState and MemCtx for this call.
+unsafe extern "C" fn cas_pair_helper(
+    cpu: *mut u8,
+    mem: *mut u8,
+    addr: u64,
+    size: u64,
+    cur: u64,
+    len: u64,
+) -> u64 {
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION, RET_MMIO_DEFER, RET_UNMAPPED};
+    // SAFETY: the compiled-block ABI supplies these live, per-vcpu pointers.
+    let (cpu, ctx) = unsafe {
+        (
+            &mut *(cpu as *mut x86jit_core::state::CpuState),
+            &mut *(mem as *mut MemCtx),
+        )
+    };
+    // SAFETY: for_memory retains the Memory for the whole compiled call.
+    let memory = unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) };
+    match x86jit_core::interp::cmpxchg_pair_run(cpu, memory, cur, addr, size as u8, len as u8) {
+        None => RET_CONTINUE,
+        Some(x86jit_core::Exit::Exception { vector, .. }) => {
+            ctx.exception_vector = vector as u64;
+            RET_EXCEPTION
+        }
+        Some(x86jit_core::Exit::UnmappedMemory { .. }) => {
+            ctx.fault_addr = addr;
+            ctx.fault_size = size;
+            ctx.fault_access = 1;
+            RET_UNMAPPED
+        }
+        // Re-execute in the interpreter so the dispatcher returns the precise
+        // unsupported-operation exit without requesting a device transfer.
+        Some(x86jit_core::Exit::UnknownInstruction { .. }) => RET_MMIO_DEFER,
+        Some(_) => unreachable!("paired CAS only raises memory/alignment faults or rejects MMIO"),
+    }
+}
+
 /// x87 helper: runs one FPU op via the shared `exec_x87`. On a memory fault it
 /// writes the fault into `MemCtx`, sets RIP to the faulting instruction, and
 /// returns `RET_UNMAPPED`; otherwise `RET_CONTINUE`.
@@ -2469,6 +2511,7 @@ impl JitBackend {
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         builder.symbol("x86jit_div", div_helper as *const u8);
         builder.symbol("x86jit_string", string_helper as *const u8);
+        builder.symbol("x86jit_cas_pair", cas_pair_helper as *const u8);
         builder.symbol("x86jit_cpuid", cpuid_helper as *const u8);
         builder.symbol("x86jit_tsc", tsc_helper as *const u8);
         builder.symbol("x86jit_random", random_helper as *const u8);
@@ -2739,6 +2782,7 @@ impl Shared {
             s
         };
         let div_sig = params(6, true); // div(hi, lo, divisor, size, signed, out) -> i64
+        let cas_pair_sig = params(6, true);
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
         let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> i64
         let fx_sig = params(5, true); // fxstate(cpu, mem, addr, restore, cur_addr) -> i64
@@ -2843,6 +2887,7 @@ impl Shared {
             let helpers = codegen::Helpers {
                 div: helper!(div_sig, div_helper),
                 string: helper!(str_sig, string_helper),
+                cas_pair: helper!(cas_pair_sig, cas_pair_helper),
                 cpuid: helper!(cpuid_sig, cpuid_helper),
                 tsc: helper!(tsc_sig, tsc_helper),
                 random: helper!(random_sig, random_helper),

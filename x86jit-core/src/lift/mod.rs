@@ -272,6 +272,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | FxState { .. }
             | AtomicRmw { .. }
             | AtomicCas { .. }
+            | AtomicCasPair { .. }
             | VLoad { .. }
             | VStore { .. }
             | VPackedBinM { .. }
@@ -1299,6 +1300,9 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         // SDM Vol 2B RDRAND/RDSEED, Flags Affected. Keep a helper barrier so
         // omitted ALU recipes cannot overwrite its flags at a later fault exit.
         Random { .. } => FlagMask::ALL.0,
+        // SDM Vol 2A CMPXCHG8B/CMPXCHG16B, Flags Affected: preserve the
+        // non-ZF inputs across the shared helper and its fault exits.
+        AtomicCasPair { .. } => FlagMask::ALL.0,
         InsnStart { .. }
         | ReadReg { .. }
         | WriteReg { .. }
@@ -1804,6 +1808,7 @@ pub(crate) fn lift_insn(
         Xchg => lift_xchg(insn, ops, tg).map(|_| false),
         Xadd => lift_xadd(insn, ops, tg).map(|_| false),
         Cmpxchg => lift_cmpxchg(insn, ops, tg).map(|_| false),
+        Cmpxchg8b | Cmpxchg16b => lift_cmpxchg_pair(insn, ops, tg).map(|_| false),
         Cpuid => {
             ops.push(IrOp::Cpuid);
             Ok(false)

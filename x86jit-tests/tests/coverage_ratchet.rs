@@ -200,6 +200,16 @@ const FUZZER_COVERED: &[&str] = &[
 /// reason. Seeded with exactly the current `lifted − fuzzer_covered` set, so the test
 /// passes today.
 const ALLOWLIST: &[&str] = &[
+    // cmpxchg_pair.rs: both tiers, conditional pair writes, preserved flags,
+    // fault precision, write notifications, oracle comparisons and mixed-tier contention.
+    // Register-only fuzzing cannot validate double-width memory CAS atomicity.
+    "Cmpxchg8b",
+    "Cmpxchg16b",
+    // cmpxchg_pair.rs cmpxchg_accumulator_{memory,register}_* run every operand
+    // width, success and failure, accumulator aliases and AH-class destinations on the
+    // interpreter, block JIT and a compiled region; cmpxchg_matches_interp compares
+    // full state. The register form became liftable with the accumulator fix.
+    "Cmpxchg",
     // cpu_source.rs checks both backends: paired TSC/AUX samples, entropy
     // availability, destination widths, flags and exactly-once source calls.
     "Rdtscp",

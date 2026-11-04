@@ -267,7 +267,7 @@ fn jit_store_above_the_4gib_code_window_is_reported() {
             protect: None,
         };
         let cfg = VmConfig::reserved(HIGH + LEN as u64);
-        let mut vm = Vm::with_backend_host_ram(cfg, backend, ram);
+        let mut vm = Vm::with_backend_host_ram(cfg, backend, ram).unwrap();
         if jit {
             vm.set_tier_up_after(Some(0));
         }

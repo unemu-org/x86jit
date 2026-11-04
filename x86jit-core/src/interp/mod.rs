@@ -459,6 +459,12 @@ fn walk_ops<const RETRY: bool>(
                     return r;
                 }
             }
+            IrOp::AtomicCasPair { addr, size, len } => {
+                let addr = read_val(*addr, temps);
+                if let Some(exit) = cmpxchg_pair_run(cpu, mem, *cur_addr, addr, *size, *len) {
+                    return StepResult::Exit(exit);
+                }
+            }
             IrOp::Bt {
                 result,
                 a,
@@ -6033,6 +6039,67 @@ pub fn crc32c(mut crc: u32, src: u64, bytes: u8) -> u32 {
         }
     }
     crc
+}
+
+/// Paired compare-exchange shared by the interpreter and JIT helper.
+/// SDM Vol 2A, CMPXCHG8B/CMPXCHG16B, Operation, Flags Affected,
+/// and 64-Bit Mode Exceptions. All fault checks precede state commits.
+pub fn cmpxchg_pair_run(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    cur_addr: u64,
+    addr: u64,
+    size: u8,
+    len: u8,
+) -> Option<Exit> {
+    if size == 16 && addr & 15 != 0 {
+        cpu.rip = cur_addr;
+        return Some(Exit::Exception {
+            vector: 13,
+            addr: cur_addr,
+        });
+    }
+    let bits = if size == 16 { 64 } else { 32 };
+    let mask = if size == 16 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    };
+    let expected = ((cpu.gpr[RDX] & mask) as u128) << bits | (cpu.gpr[RAX] & mask) as u128;
+    let src = ((cpu.gpr[RCX] & mask) as u128) << bits | (cpu.gpr[RBX] & mask) as u128;
+    let result = if size == 16 {
+        mem.atomic_cas128(addr, expected, src)
+    } else {
+        mem.atomic_cas(addr, expected as u64, src as u64, 8)
+            .map(u128::from)
+    };
+    let old = match result {
+        Ok(old) => old,
+        Err(MemTrap::Mmio) => {
+            // Engine policy: separate device reads/writes cannot implement a
+            // paired CAS atomically. Reject it before any guest state commits.
+            cpu.rip = cur_addr;
+            let mut bytes = [0; 15];
+            if let Ok(code) = mem.code_slice(cur_addr, len as usize) {
+                bytes[..code.len()].copy_from_slice(code);
+            }
+            return Some(Exit::unknown_instruction(cur_addr, bytes, len));
+        }
+        Err(t) => {
+            let StepResult::Exit(exit) =
+                trap_out(cpu, cur_addr, t, addr, size, AccessKind::Write, src as u64)
+            else {
+                unreachable!()
+            };
+            return Some(exit);
+        }
+    };
+    cpu.flags.zf = old == expected;
+    if old != expected {
+        cpu.write_gpr(RAX, old as u64, size / 2);
+        cpu.write_gpr(RDX, (old >> bits) as u64, size / 2);
+    }
+    None
 }
 
 /// `cpuid` (§14). Shared by both backends (the interpreter calls it directly; the JIT via

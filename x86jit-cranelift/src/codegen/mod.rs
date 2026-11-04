@@ -86,6 +86,7 @@ const PAGE_MASK: i64 = PAGE_BYTES - 1;
 pub struct Helpers {
     pub div: (ir::SigRef, u64, u64),
     pub string: (ir::SigRef, u64, u64),
+    pub cas_pair: (ir::SigRef, u64, u64),
     pub cpuid: (ir::SigRef, u64, u64),
     pub tsc: (ir::SigRef, u64, u64),
     pub random: (ir::SigRef, u64, u64),
@@ -175,6 +176,7 @@ impl Helpers {
         Helpers {
             div: mk(),
             string: mk(),
+            cas_pair: mk(),
             cpuid: mk(),
             tsc: mk(),
             random: mk(),
@@ -805,6 +807,7 @@ impl Translator<'_, '_> {
                 size,
                 ..
             } => self.emit_atomic_cas(old, addr, expected, src, size),
+            IrOp::AtomicCasPair { addr, size, len } => self.emit_atomic_cas_pair(addr, *size, *len),
             IrOp::Bt {
                 result,
                 a,

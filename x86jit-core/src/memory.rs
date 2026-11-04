@@ -28,6 +28,25 @@ pub enum MemoryModel {
     SoftMmu,
 }
 
+/// Invalid embedder-provided guest backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRamError {
+    Misaligned,
+    GuestBaseOutOfBounds,
+    BackingTooSmall,
+}
+
+impl std::fmt::Display for HostRamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Misaligned => "host RAM pointer must equal guest_base modulo 16",
+            Self::GuestBaseOutOfBounds => "host RAM guest_base exceeds the model span",
+            Self::BackingTooSmall => "host RAM backing is smaller than the guest extent",
+        })
+    }
+}
+impl std::error::Error for HostRamError {}
+
 /// Host-provided backing for a `Reserved` address space. The
 /// guest-agnostic core must not depend on an OS allocator, so an embedder that
 /// needs a huge sparse mapping (a `MAP_NORESERVE` mmap for Go's 768 GiB arena hints)
@@ -72,10 +91,8 @@ impl Drop for HostRam {
 /// Keeps the backing allocation alive for the `Memory`'s lifetime. `Backing` reads
 /// bytes through a raw `ptr`/`len` (uniform hot path); this only owns the storage.
 enum Owner {
-    /// The heap allocation as raw parts, NOT a live `Box`. A `Box` here would be a
-    /// second pointer to the same bytes, and moving it into this enum invalidates any
-    /// pointer derived from it beforehand — which is what `Backing::ptr` is. Keeping
-    /// the owner raw leaves `Backing::ptr` the single provenance root for guest RAM.
+    /// The aligned heap allocation, owned as a raw pointer so moving this owner
+    /// does not invalidate the access pointer in Backing::ptr.
     Boxed {
         ptr: *mut u8,
         len: usize,
@@ -86,9 +103,13 @@ enum Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         if let Owner::Boxed { ptr, len } = *self {
-            // SAFETY: `ptr`/`len` come from `Box::into_raw` in `Backing::boxed` and are
-            // freed nowhere else; `Backing` owns this allocation for its whole lifetime.
-            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
+            // SAFETY: Backing::boxed allocated with this exact layout and owns it.
+            unsafe {
+                std::alloc::dealloc(
+                    ptr,
+                    std::alloc::Layout::from_size_align(len.max(1), 16).unwrap(),
+                )
+            };
         }
     }
 }
@@ -114,17 +135,28 @@ unsafe impl Send for HostRam {}
 unsafe impl Sync for HostRam {}
 
 impl Backing {
-    /// Own a heap `Box<[u8]>` (the `Flat`/`Reserved`-via-`Vec` path). Zero-based
-    /// (`guest_base = 0`): an owned buffer always represents guest `[0, len)`.
-    fn boxed(b: Box<[u8]>) -> Backing {
-        let len = b.len();
-        let ptr = Box::into_raw(b) as *mut u8;
+    /// Allocate zeroed, 16-byte-aligned owned storage.
+    fn zeroed(len: usize) -> Backing {
+        let layout = std::alloc::Layout::from_size_align(len.max(1), 16).unwrap();
+        // SAFETY: a nonzero, valid layout; Backing owns the resulting allocation.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         Backing {
             ptr,
             len,
             guest_base: 0,
             owner: Owner::Boxed { ptr, len },
         }
+    }
+
+    /// Copy into 16-byte-aligned owned storage. Owned buffers are zero-based.
+    fn boxed(b: &[u8]) -> Backing {
+        let backing = Self::zeroed(b.len());
+        // SAFETY: both allocations contain b.len() bytes and do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), backing.ptr, b.len()) };
+        backing
     }
 
     /// Adopt an embedder-provided host mapping (the `Reserved` NORESERVE path),
@@ -557,23 +589,22 @@ unsafe impl Sync for Memory {}
 
 impl Memory {
     pub fn new(model: MemoryModel) -> Self {
-        let bytes: Box<[u8]> = match &model {
-            // A `Reserved` model built through `new` uses a plain `Vec` (fine for a
-            // modest span or a test); a huge NORESERVE span comes in via
-            // `from_host_ram`, where the embedder owns the mapping.
-            MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => {
-                vec![0u8; *size as usize].into_boxed_slice()
-            }
-            MemoryModel::SoftMmu => Box::new([]),
+        // Huge sparse mappings are supplied by the embedder through from_host_ram.
+        let len = match &model {
+            MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => *size as usize,
+            MemoryModel::SoftMmu => 0,
         };
-        Self::from_backing(model, Backing::boxed(bytes))
+        Self::from_backing(model, Backing::zeroed(len))
     }
 
     /// Build a `Reserved` memory over an embedder-provided host mapping.
     /// Core can't allocate a `MAP_NORESERVE` span itself (it must stay guest-agnostic,
     /// depending only on the decoder), so the embedder hands in the raw region; the
     /// `HostRam` dtor frees it on drop. `ram.len` is the span the JIT bounds against.
-    pub fn from_host_ram(model: MemoryModel, ram: HostRam) -> Self {
+    /// The host pointer must be congruent to `guest_base` modulo 16, so aligned
+    /// guest CMPXCHG16B operands are aligned on the host. Page-aligned mappings
+    /// and identity mappings satisfy this. Invalid backings return an error.
+    pub fn from_host_ram(model: MemoryModel, ram: HostRam) -> Result<Self, HostRamError> {
         // The JIT and `map()` bound guest accesses against the model span (`size()`),
         // but the backing is only `ram.len` bytes and represents guest `[guest_base,
         // guest_base + ram.len)`. A guest address `a` indexes the backing at `a -
@@ -584,32 +615,21 @@ impl Memory {
             MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => *size,
             MemoryModel::SoftMmu => 0,
         };
-        assert!(
-            ram.guest_base <= span,
-            "guest_base (0x{:x}) exceeds the model span (0x{:x})",
-            ram.guest_base,
-            span,
-        );
+        if ram.guest_base > span {
+            return Err(HostRamError::GuestBaseOutOfBounds);
+        }
+        if ram.ptr as usize & 15 != ram.guest_base as usize & 15 {
+            return Err(HostRamError::Misaligned);
+        }
         let extent = (span - ram.guest_base) as usize;
-        assert!(
-            extent <= ram.len,
-            "host RAM backing ({} bytes) is smaller than the guest extent above \
-             guest_base ({} bytes)",
-            ram.len,
-            extent,
-        );
-        Self::from_backing(model, Backing::host(ram))
+        if extent > ram.len {
+            return Err(HostRamError::BackingTooSmall);
+        }
+        Ok(Self::from_backing(model, Backing::host(ram)))
     }
 
     fn from_backing(model: MemoryModel, backing: Backing) -> Self {
-        // Note on atomics: a guest LOCK atomic runs as a host atomic only when the host
-        // pointer (`base + guest_addr`) is naturally aligned (see `atomic_rmw_raw`); a
-        // guest-aligned atomic over a host-misaligned base degrades to a non-atomic RMW.
-        // The system allocator and `mmap` return ≥16-aligned storage in practice, so host
-        // alignment tracks guest alignment — but that is not a type-level guarantee
-        // (`[u8]`'s layout is align-1, honored literally by Miri or a swapped
-        // `#[global_allocator]`), so it is documented here rather than asserted (an assert
-        // would false-abort a legitimate run on such an allocator).
+        // Owned storage is 16-byte aligned; host storage preserves guest alignment.
         let guest_base = backing.guest_base();
         // Sized over the guest SPAN like the watch table, not the backing length: pages
         // are indexed by raw page number, so an embedder identity-mapping at a non-zero
@@ -676,7 +696,7 @@ impl Memory {
             _ => src.to_vec().into_boxed_slice(),
         };
         Some(
-            Memory::from_backing(self.model, Backing::boxed(bytes))
+            Memory::from_backing(self.model, Backing::boxed(&bytes))
                 .with_regions(self.regions.clone()),
         )
     }
@@ -892,7 +912,7 @@ impl Memory {
     /// Generated code indexes this WITHOUT a bounds check, so the table must cover
     /// every address a store can reach. It does: `WatchPages::new` is sized over
     /// `guest_base + backing len`, while inlined stores are bounds-checked against
-    /// [`Self::size`] first, and `from_host_ram` asserts `size - guest_base <= backing
+    /// [`Self::size`] first, and `from_host_ram` checks `size - guest_base <= backing
     /// len`. [`Self::watch_bits_cover_size`] re-checks that chain at run start rather
     /// than leaving it to three facts in two crates.
     pub fn watch_bits_ptr(&self) -> u64 {
@@ -1419,6 +1439,34 @@ impl Memory {
         Ok(old & mask_bits(size))
     }
 
+    /// Aligned 16-byte CAS shared by interpreted and compiled CMPXCHG16B.
+    /// The caller checks guest alignment before invoking this operation.
+    pub fn atomic_cas128(&self, addr: u64, expected: u128, src: u128) -> Result<u128, MemTrap> {
+        let region = self.region_at(addr, 16)?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(MemTrap::Mmio);
+        }
+        // SAFETY: region_at checked all 16 bytes; backing preserves guest alignment.
+        let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(addr)) };
+        assert_eq!(
+            ptr as usize & 15,
+            0,
+            "16-byte CAS requires an aligned operand"
+        );
+        if matches!(region.kind, RegionKind::Rom) {
+            // ROM discards the write half, matching the scalar CAS policy.
+            // SAFETY: the full read is in the checked region.
+            return Ok(unsafe {
+                atomic_load_le(ptr, 8) as u128 | ((atomic_load_le(ptr.add(8), 8) as u128) << 64)
+            });
+        }
+        // SAFETY: ptr names 16 mapped, aligned, interior-mutable RAM bytes.
+        let old = unsafe { atomic_cas128_raw(ptr, expected, src) };
+        // SDM Vol 2A CMPXCHG8B/CMPXCHG16B, Description: failed compares write back too.
+        self.note_write(addr, 16);
+        Ok(old)
+    }
+
     /// Atomic compare-exchange (`cmpxchg`, §8.2.3). If `[addr] == expected`, store
     /// `src`; return the prior value either way (size-masked).
     pub fn atomic_cas(&self, addr: u64, expected: u64, src: u64, size: u8) -> Result<u64, MemTrap> {
@@ -1437,6 +1485,71 @@ impl Memory {
         self.note_write(addr, size as usize);
         Ok(old & mask_bits(size))
     }
+}
+
+/// # Safety
+/// ptr names 16 valid, aligned, writable bytes shared by the vcpus.
+#[cfg(target_arch = "aarch64")]
+unsafe fn atomic_cas128_raw(ptr: *mut u8, expected: u128, src: u128) -> u128 {
+    let (lo, hi): (u64, u64);
+    // The successful ST(L)XP validates the entire pair, including on a mismatch.
+    // Always store: LDXP alone need not give a single-copy-atomic 128-bit snapshot.
+    // DMBs supply the full ordering of a guest locked instruction in every tier.
+    // SDM Vol 3A §11.2.3.9, Loads and Stores Are Not Reordered with Locked Instructions.
+    // SAFETY: caller guarantees alignment and validity; outputs cannot alias inputs.
+    unsafe {
+        core::arch::asm!(
+            "dmb ish",
+            "2:",
+            "ldaxp {lo}, {hi}, [{ptr}]",
+            "cmp {lo}, {elo}",
+            "ccmp {hi}, {ehi}, #0, eq",
+            "csel {nlo}, {slo}, {lo}, eq",
+            "csel {nhi}, {shi}, {hi}, eq",
+            "stlxp {status:w}, {nlo}, {nhi}, [{ptr}]",
+            "cbnz {status:w}, 2b",
+            "dmb ish",
+            ptr = in(reg) ptr,
+            elo = in(reg) expected as u64, ehi = in(reg) (expected >> 64) as u64,
+            slo = in(reg) src as u64, shi = in(reg) (src >> 64) as u64,
+            lo = out(reg) lo, hi = out(reg) hi,
+            nlo = out(reg) _, nhi = out(reg) _, status = out(reg) _,
+            options(nostack),
+        )
+    };
+    (hi as u128) << 64 | lo as u128
+}
+
+/// # Safety
+/// ptr names 16 valid, aligned, writable bytes shared by the vcpus.
+#[cfg(target_arch = "x86_64")]
+unsafe fn atomic_cas128_raw(ptr: *mut u8, expected: u128, src: u128) -> u128 {
+    assert!(
+        std::is_x86_feature_detected!("cmpxchg16b"),
+        "host requires CMPXCHG16B"
+    );
+    let mut lo = expected as u64;
+    let mut hi = (expected >> 64) as u64;
+    // LLVM reserves RBX; exchange it with a scratch register and restore it.
+    // SDM Vol 2A CMPXCHG8B/CMPXCHG16B, Operation.
+    // SAFETY: caller guarantees the aligned 16-byte access; RBX is restored.
+    unsafe {
+        core::arch::asm!(
+            "xchg {scratch}, rbx",
+            "lock cmpxchg16b [{ptr}]",
+            "xchg {scratch}, rbx",
+            ptr = in(reg) ptr,
+            scratch = inout(reg) src as u64 => _,
+            inout("rax") lo, inout("rdx") hi, in("rcx") (src >> 64) as u64,
+            options(nostack),
+        )
+    };
+    (hi as u128) << 64 | lo as u128
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+unsafe fn atomic_cas128_raw(_: *mut u8, _: u128, _: u128) -> u128 {
+    unimplemented!("16-byte CAS requires an aarch64 or x86-64 host")
 }
 
 /// The SMC code-page bitset for a guest space of `span` bytes.
@@ -1688,7 +1801,7 @@ mod tests {
             }),
             protect: None,
         };
-        Memory::from_host_ram(MemoryModel::Reserved { span: span as u64 }, ram)
+        Memory::from_host_ram(MemoryModel::Reserved { span: span as u64 }, ram).unwrap()
     }
 
     #[test]
@@ -1739,7 +1852,7 @@ mod tests {
             })),
         };
         (
-            Memory::from_host_ram(MemoryModel::Reserved { span: span as u64 }, ram),
+            Memory::from_host_ram(MemoryModel::Reserved { span: span as u64 }, ram).unwrap(),
             log,
         )
     }
@@ -2143,6 +2256,7 @@ mod tests {
             },
             ram,
         )
+        .unwrap()
     }
 
     // Embedder-registered watched data-range dirty tracking.

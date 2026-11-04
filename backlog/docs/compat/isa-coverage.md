@@ -19,8 +19,8 @@ created_date: '2026-07-06 11:25'
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 59 | 2% | 0 |
 | optional | 7 | 0 | 0 | 100% | 0 |
-| x86-64-v1 | 562 | 0 | 115 | 83% | 146 |
-| x86-64-v2 | 90 | 0 | 27 | 77% | 0 |
+| x86-64-v1 | 566 | 0 | 112 | 83% | 146 |
+| x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
 | x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
 | x87 | 102 | 0 | 52 | 66% | 6 |
@@ -33,7 +33,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 57 | 2% | 0 |
 | optional | 5 | 0 | 0 | 100% | 0 |
-| x86-64-v1 | 547 | 0 | 134 | 80% | 232 |
+| x86-64-v1 | 551 | 0 | 131 | 81% | 232 |
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
@@ -101,7 +101,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## long64 x86-64-v1 — missing (115)
+## long64 x86-64-v1 — missing (112)
 
 - `Call_m1632`
 - `Clac`
@@ -111,9 +111,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Cli`
 - `Clts`
 - `Cmc`
-- `Cmpxchg_rm16_r16`
-- `Cmpxchg_rm32_r32`
-- `Cmpxchg_rm8_r8`
 - `Cvtpd2pi_mm_xmmm128`
 - `Cvtpi2pd_xmm_mmm64`
 - `Cvtpi2ps_xmm_mmm64`
@@ -219,9 +216,8 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Verw_rm16`
 - `Wbinvd`
 
-## long64 x86-64-v2 — missing (27)
+## long64 x86-64-v2 — missing (26)
 
-- `Cmpxchg16b_m128`
 - `Extractps_r64m32_xmm_imm8`
 - `Extractps_rm32_xmm_imm8`
 - `Pabsb_mm_mmm64`
@@ -534,7 +530,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## compat32 x86-64-v1 — missing (134)
+## compat32 x86-64-v1 — missing (131)
 
 - `Aaa`
 - `Aad_imm8`
@@ -553,9 +549,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Cli`
 - `Clts`
 - `Cmc`
-- `Cmpxchg_rm16_r16`
-- `Cmpxchg_rm32_r32`
-- `Cmpxchg_rm8_r8`
 - `Cvtpd2pi_mm_xmmm128`
 - `Cvtpi2pd_xmm_mmm64`
 - `Cvtpi2ps_xmm_mmm64`

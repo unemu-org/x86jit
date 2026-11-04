@@ -48,7 +48,8 @@ fn block_rips_round_trip(guest_base: u64, code_addr: u64) {
         VmConfig::reserved(guest_base + len as u64),
         Box::new(JitBackend::new()),
         ram,
-    );
+    )
+    .unwrap();
     vm.map(code_addr, 0x1000, Prot::RX, RegionKind::Ram)
         .unwrap();
     let mut asm = CodeAssembler::new(64).unwrap();

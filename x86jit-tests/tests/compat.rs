@@ -108,22 +108,18 @@ fn cpuid_waivers_are_not_stale() {
 #[test]
 fn cpuid_checker_finds_scalar_xsave_and_richer_preset_gaps() {
     use iced_x86::{Code, CpuidFeature};
+    use x86jit_tests::compat::{probe_code, Probe};
     for (name, features) in presets() {
         let gaps = cpuid_lift_gaps(|l, s| features.cpuid(l, s));
         assert!(
-            gaps.iter()
-                .any(|g| g.advertised.feature == CpuidFeature::CX8
-                    && g.missing.contains(&Code::Cmpxchg8b_m64)),
-            "{name}/CX8"
+            gaps.iter().all(|g| !matches!(
+                g.advertised.feature,
+                CpuidFeature::CX8 | CpuidFeature::CMPXCHG16B
+            )),
+            "{name}/paired CAS"
         );
-        if name != "default" {
-            assert!(
-                gaps.iter()
-                    .any(|g| g.advertised.feature == CpuidFeature::CMPXCHG16B
-                        && g.missing.contains(&Code::Cmpxchg16b_m128)),
-                "{name}/CX16"
-            );
-        }
+        assert_eq!(probe_code(Code::Cmpxchg8b_m64), Some(Probe::Lifted));
+        assert_eq!(probe_code(Code::Cmpxchg16b_m128), Some(Probe::Lifted));
         if name != "v2" {
             let xsave = gaps
                 .iter()
@@ -167,13 +163,13 @@ fn cpuid_checker_accepts_tables_and_sees_extended_and_leaf7_bits() {
         CpuidLeaf::Constant(R::new(0, 0, 1 << 6, 1 << 27)),
     );
     let gaps = cpuid_lift_gaps(|l, s| table.query(l, s));
-    for feature in [CX8, ADX, SSE4A, SHA512] {
+    for feature in [ADX, SSE4A, SHA512] {
         assert!(
             gaps.iter().any(|g| g.advertised.feature == feature),
             "{feature:?}"
         );
     }
-    for feature in [RDRAND, RDSEED, RDTSCP] {
+    for feature in [CX8, RDRAND, RDSEED, RDTSCP] {
         assert!(
             !gaps.iter().any(|g| g.advertised.feature == feature),
             "{feature:?}"

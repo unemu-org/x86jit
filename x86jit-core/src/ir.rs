@@ -387,6 +387,15 @@ pub enum IrOp {
         size: u8,
     },
 
+    /// Paired compare-exchange (CMPXCHG8B/16B): implicit accumulator/source
+    /// register pairs and ZF only. `size` is 8 or 16 bytes.
+    AtomicCasPair {
+        addr: Val,
+        size: u8,
+        /// Decoded instruction length for an unsupported MMIO exit.
+        len: u8,
+    },
+
     // --- SIMD (SSE, §3.1 M8). XMM registers by index (0..15), 128-bit values. ---
     // Load 16/8/4 bytes from memory into xmm `dst` (upper bytes zeroed for <16).
     VLoad {
