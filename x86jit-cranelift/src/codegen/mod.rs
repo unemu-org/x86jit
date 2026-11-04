@@ -769,10 +769,11 @@ impl Translator<'_, '_> {
             } => self.emit_v_dpps(dst, a, b, imm, bytes),
             IrOp::VDppsM {
                 dst,
+                a,
                 addr,
                 imm,
                 bytes,
-            } => self.emit_v_dpps_m(dst, addr, imm, bytes),
+            } => self.emit_v_dpps_m(dst, a, addr, imm, bytes),
             IrOp::VDppd { dst, b, imm, .. } => self.emit_v_dppd(dst, b, imm),
             IrOp::VDppdM { dst, addr, imm, .. } => self.emit_v_dppd_m(dst, addr, imm),
             IrOp::VDp3 {

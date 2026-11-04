@@ -1345,6 +1345,7 @@ pub(crate) fn lift_dpps(
         }),
         |addr| ops.push(IrOp::VDppsM {
             dst,
+            a: dst,
             addr,
             imm,
             bytes: 16
@@ -1437,17 +1438,13 @@ pub(crate) fn lift_vdpps(
                 imm,
                 bytes: 32
             }),
-            |addr| {
-                if dst != a {
-                    ops.push(IrOp::VMov256 { dst, src: a });
-                }
-                ops.push(IrOp::VDppsM {
-                    dst,
-                    addr,
-                    imm,
-                    bytes: 32,
-                });
-            }
+            |addr| ops.push(IrOp::VDppsM {
+                dst,
+                a,
+                addr,
+                imm,
+                bytes: 32
+            })
         );
         return Ok(());
     }
@@ -1466,17 +1463,13 @@ pub(crate) fn lift_vdpps(
             imm,
             bytes: 16
         }),
-        |addr| {
-            if dst != a {
-                ops.push(IrOp::VMov { dst, src: a });
-            }
-            ops.push(IrOp::VDppsM {
-                dst,
-                addr,
-                imm,
-                bytes: 16,
-            });
-        }
+        |addr| ops.push(IrOp::VDppsM {
+            dst,
+            a,
+            addr,
+            imm,
+            bytes: 16
+        })
     );
     ops.push(IrOp::VZeroUpper { reg: dst }); // VEX.128 clears bits 255:128
     Ok(())

@@ -614,15 +614,22 @@ impl Translator<'_, '_> {
     }
 
     /// SSE4.1 `dpps xmm, m128, imm8`: source 2 is loaded from `[addr]` (fault-checked
-    /// here); source 1 is `dst` (op1 pre-copied into `dst` for VEX). Same native body as
+    /// here); source 1 is `a`. Same native body as
     /// the register form, per 128-bit lane.
-    pub(crate) fn emit_v_dpps_m(&mut self, dst: &u8, addr: &Val, imm: &u8, bytes: &u16) -> bool {
+    pub(crate) fn emit_v_dpps_m(
+        &mut self,
+        dst: &u8,
+        a: &u8,
+        addr: &Val,
+        imm: &u8,
+        bytes: &u16,
+    ) -> bool {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
         for i in 0..n {
             let bv = self.gload(types::I128, host, (i * 16) as i32);
-            let av = self.load_lane(*dst, i);
+            let av = self.load_lane(*a, i);
             let r = self.dpps_native(av, bv, *imm);
             self.store_lane(*dst, i, r);
         }

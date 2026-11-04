@@ -490,3 +490,407 @@ fn vector_extract_to_mmio_completes_interp() {
 fn vector_extract_to_mmio_completes_jit() {
     vector_extract_to_mmio_completes(Box::new(JitBackend::new()));
 }
+
+#[derive(Clone, Copy)]
+enum VectorRead {
+    Dpps,
+    Psign,
+}
+
+/// SDM Vol 3A §§7.5–7.6: a fault restores the pre-instruction state and retries
+/// the instruction. MMIO retries follow the same commit-last contract (spec.md §16).
+fn aliased_wide_read_retries(backend: Box<dyn Backend>, case: VectorRead, mmio: bool) {
+    vector_read_retries(backend, case, mmio, 32, false);
+}
+
+fn vector_read_retries(
+    backend: Box<dyn Backend>,
+    case: VectorRead,
+    mmio: bool,
+    bytes: usize,
+    distinct: bool,
+) {
+    const MMIO: u64 = 0x4000;
+    const VALID: u64 = 0x8000;
+    let mut vm = Vm::with_backend(VmConfig::flat(SPAN), backend);
+    if mmio {
+        vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+    } else {
+        vm.map(0, SPAN as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+    }
+    let backed = if bytes == 32 { 16 } else { 8 };
+    let operand = if mmio { MMIO } else { SPAN } - backed as u64;
+    let mut a = CodeAssembler::new(64).unwrap();
+    let src = if distinct { 1 } else { 0 };
+    let (initial, memory, mut expected) = match case {
+        // SDM Vol 2A §3.3, DPPS Operation (VEX.256): four selected products are
+        // summed and broadcast independently in each 128-bit half.
+        VectorRead::Dpps => {
+            if bytes == 32 {
+                a.vdpps(
+                    ymm0,
+                    if distinct { ymm1 } else { ymm0 },
+                    ymmword_ptr(rax),
+                    0xffu32,
+                )
+                .unwrap();
+            } else {
+                a.vdpps(
+                    xmm0,
+                    if distinct { xmm1 } else { xmm0 },
+                    xmmword_ptr(rax),
+                    0xffu32,
+                )
+                .unwrap();
+            }
+            (
+                [splat(1.0), splat(3.0)],
+                [splat(2.0), splat(2.0)],
+                [splat(8.0), splat(24.0)],
+            )
+        }
+        // SDM Vol 2B §4.3, PSIGNB/PSIGNW/PSIGND Operation (VPSIGNB): negative
+        // control bytes negate source bytes exactly once.
+        VectorRead::Psign => {
+            if bytes == 32 {
+                a.vpsignb(ymm0, if distinct { ymm1 } else { ymm0 }, ymmword_ptr(rax))
+                    .unwrap();
+            } else {
+                a.vpsignb(xmm0, if distinct { xmm1 } else { xmm0 }, xmmword_ptr(rax))
+                    .unwrap();
+            }
+            (
+                [u128::from_le_bytes([5; 16]), u128::from_le_bytes([7; 16])],
+                [u128::MAX; 2],
+                [
+                    u128::from_le_bytes([0xfb; 16]),
+                    u128::from_le_bytes([0xf9; 16]),
+                ],
+            )
+        }
+    };
+    // SDM Vol 2A §3.3, DPPS Operation; Vol 2B §4.3, PSIGNB/PSIGNW/PSIGND
+    // Operation: VEX.128 clears bits 255:128 on completion.
+    if bytes == 16 {
+        expected[1] = 0;
+    }
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    vm.write_bytes(operand, &memory[0].to_le_bytes()[..backed])
+        .unwrap();
+    if !mmio {
+        for (i, lane) in memory.iter().enumerate() {
+            vm.write_bytes(VALID + i as u64 * 16, &lane.to_le_bytes())
+                .unwrap();
+        }
+    }
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rax, operand);
+    let destination = if distinct {
+        [0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00, u128::MAX]
+    } else {
+        initial
+    };
+    cpu.set_xmm(0, destination[0]);
+    cpu.set_ymm_hi(0, destination[1]);
+    cpu.set_xmm(src, initial[0]);
+    cpu.set_ymm_hi(src, initial[1]);
+    let mut trapped = Vec::new();
+    if mmio {
+        for offset in (backed..bytes).step_by(8) {
+            let exit = cpu.run(&vm, None);
+            assert!(
+                matches!(exit, Exit::MmioRead { addr, size: 8, .. } if addr == operand + offset as u64),
+                "expected the next high-half transfer, got {exit:?}"
+            );
+            assert_eq!(cpu.reg(Reg::Rip), CODE);
+            trapped.push([cpu.xmm(0), cpu.ymm_hi(0)]);
+            cpu.complete_mmio_read((memory[offset / 16] >> ((offset % 16) * 8)) as u64);
+        }
+    } else {
+        let exit = cpu.run(&vm, None);
+        assert!(
+            matches!(exit, Exit::UnmappedMemory { addr: SPAN, .. }),
+            "expected a fault on the high half, got {exit:?}"
+        );
+        assert_eq!(cpu.reg(Reg::Rip), CODE);
+        trapped.push([cpu.xmm(0), cpu.ymm_hi(0)]);
+        // Repair the operand address so both backends can retry within the fixed span.
+        cpu.set_reg(Reg::Rax, VALID);
+    }
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt), "retry must finish");
+    assert_eq!(
+        [cpu.xmm(0), cpu.ymm_hi(0)],
+        expected,
+        "retry must use the original source exactly once"
+    );
+    if distinct {
+        assert_eq!([cpu.xmm(src), cpu.ymm_hi(src)], initial, "source preserved");
+    }
+    for state in trapped {
+        assert_eq!(
+            state, destination,
+            "a failed load must leave both halves intact"
+        );
+    }
+}
+
+#[test]
+fn straddling_vdpps_retries_once_interp() {
+    aliased_wide_read_retries(Box::new(InterpreterBackend), VectorRead::Dpps, false);
+}
+
+#[test]
+fn straddling_vdpps_retries_once_jit() {
+    aliased_wide_read_retries(Box::new(JitBackend::new()), VectorRead::Dpps, false);
+}
+
+#[test]
+fn straddling_vpsignb_retries_once_interp() {
+    aliased_wide_read_retries(Box::new(InterpreterBackend), VectorRead::Psign, false);
+}
+
+#[test]
+fn straddling_vpsignb_retries_once_jit() {
+    aliased_wide_read_retries(Box::new(JitBackend::new()), VectorRead::Psign, false);
+}
+
+#[test]
+fn mmio_vdpps_retries_once_interp() {
+    aliased_wide_read_retries(Box::new(InterpreterBackend), VectorRead::Dpps, true);
+}
+
+#[test]
+fn mmio_vdpps_retries_once_jit() {
+    aliased_wide_read_retries(Box::new(JitBackend::new()), VectorRead::Dpps, true);
+}
+
+#[test]
+fn mmio_vpsignb_retries_once_interp() {
+    aliased_wide_read_retries(Box::new(InterpreterBackend), VectorRead::Psign, true);
+}
+
+#[test]
+fn mmio_vpsignb_retries_once_jit() {
+    aliased_wide_read_retries(Box::new(JitBackend::new()), VectorRead::Psign, true);
+}
+
+/// SDM Vol 3A §§7.5–7.6: a faulting store leaves the pre-instruction state intact.
+fn straddling_wide_store_leaves_memory_untouched(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(SPAN), backend);
+    vm.map(0, SPAN as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.vmovdqu(ymmword_ptr(rax), ymm0).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    for backed in [16, 8, 24] {
+        let operand = SPAN - backed;
+        let sentinel = vec![0xa5; backed as usize];
+        vm.write_bytes(operand, &sentinel).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, CODE);
+        cpu.set_reg(Reg::Rax, operand);
+        cpu.set_xmm(0, u128::from_le_bytes([1; 16]));
+        cpu.set_ymm_hi(0, u128::from_le_bytes([2; 16]));
+        let exit = cpu.run(&vm, None);
+        assert!(
+            matches!(
+                exit,
+                Exit::UnmappedMemory {
+                    addr: SPAN,
+                    access: x86jit_core::AccessKind::Write,
+                    ..
+                }
+            ),
+            "expected a store fault at the span end, got {exit:?}"
+        );
+        assert_eq!(cpu.reg(Reg::Rip), CODE);
+        let mut actual = vec![0; backed as usize];
+        vm.read_bytes(operand, &mut actual).unwrap();
+        assert_eq!(actual, sentinel, "no part of a faulting store may commit");
+    }
+}
+
+#[test]
+fn straddling_wide_store_leaves_memory_untouched_interp() {
+    straddling_wide_store_leaves_memory_untouched(Box::new(InterpreterBackend));
+}
+
+#[test]
+fn straddling_wide_store_leaves_memory_untouched_jit() {
+    straddling_wide_store_leaves_memory_untouched(Box::new(JitBackend::new()));
+}
+
+fn wide_store_to_mmio_completes(backend: Box<dyn Backend>) {
+    const MMIO: u64 = 0x4000;
+    let mut vm = Vm::with_backend(VmConfig::flat(SPAN), backend);
+    vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.vmovdqu(ymmword_ptr(rax), ymm0).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    // Include a 128-bit lane split between RAM and MMIO: probes must use the
+    // same transfer boundaries as vstore rather than requiring one region per lane.
+    for ram_bytes in [0, 8] {
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, CODE);
+        cpu.set_reg(Reg::Rax, MMIO - ram_bytes);
+        let values = [1u64, 2, 3, 4];
+        cpu.set_xmm(0, (values[0] as u128) | ((values[1] as u128) << 64));
+        cpu.set_ymm_hi(0, (values[2] as u128) | ((values[3] as u128) << 64));
+        for (i, &expected) in values.iter().enumerate().skip(ram_bytes as usize / 8) {
+            let exit = cpu.run(&vm, None);
+            assert!(
+                matches!(exit, Exit::MmioWrite { addr, size: 8, value, .. }
+                    if addr == MMIO - ram_bytes + i as u64 * 8 && value == expected),
+                "expected the next store transfer with its own value, got {exit:?}"
+            );
+            cpu.complete_mmio_write();
+        }
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt), "store must finish");
+        if ram_bytes != 0 {
+            let mut actual = [0; 8];
+            vm.read_bytes(MMIO - ram_bytes, &mut actual).unwrap();
+            assert_eq!(actual, values[0].to_le_bytes());
+        }
+    }
+}
+
+#[test]
+fn wide_store_to_mmio_completes_interp() {
+    wide_store_to_mmio_completes(Box::new(InterpreterBackend));
+}
+
+#[test]
+fn wide_store_to_mmio_completes_jit() {
+    wide_store_to_mmio_completes(Box::new(JitBackend::new()));
+}
+
+macro_rules! distinct_vector_read_test {
+    ($name:ident, $backend:expr, $case:ident, $mmio:expr, $bytes:expr) => {
+        #[test]
+        fn $name() {
+            vector_read_retries(Box::new($backend), VectorRead::$case, $mmio, $bytes, true);
+        }
+    };
+}
+
+distinct_vector_read_test!(
+    distinct_vdpps256_fault_interp,
+    InterpreterBackend,
+    Dpps,
+    false,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vdpps256_fault_jit,
+    JitBackend::new(),
+    Dpps,
+    false,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vdpps128_fault_interp,
+    InterpreterBackend,
+    Dpps,
+    false,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vdpps128_fault_jit,
+    JitBackend::new(),
+    Dpps,
+    false,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vdpps256_mmio_interp,
+    InterpreterBackend,
+    Dpps,
+    true,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vdpps256_mmio_jit,
+    JitBackend::new(),
+    Dpps,
+    true,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vdpps128_mmio_interp,
+    InterpreterBackend,
+    Dpps,
+    true,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vdpps128_mmio_jit,
+    JitBackend::new(),
+    Dpps,
+    true,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vpsignb256_fault_interp,
+    InterpreterBackend,
+    Psign,
+    false,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vpsignb256_fault_jit,
+    JitBackend::new(),
+    Psign,
+    false,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vpsignb128_fault_interp,
+    InterpreterBackend,
+    Psign,
+    false,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vpsignb128_fault_jit,
+    JitBackend::new(),
+    Psign,
+    false,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vpsignb256_mmio_interp,
+    InterpreterBackend,
+    Psign,
+    true,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vpsignb256_mmio_jit,
+    JitBackend::new(),
+    Psign,
+    true,
+    32
+);
+distinct_vector_read_test!(
+    distinct_vpsignb128_mmio_interp,
+    InterpreterBackend,
+    Psign,
+    true,
+    16
+);
+distinct_vector_read_test!(
+    distinct_vpsignb128_mmio_jit,
+    JitBackend::new(),
+    Psign,
+    true,
+    16
+);

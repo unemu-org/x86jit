@@ -1013,11 +1013,13 @@ fn walk_ops<const RETRY: bool>(
             }
             IrOp::VDppsM {
                 dst,
+                a,
                 addr,
                 imm,
                 bytes,
             } => {
-                if let Some(r) = exec_v_dpps_m(cpu, mem, temps, *cur_addr, dst, addr, imm, bytes) {
+                if let Some(r) = exec_v_dpps_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm, bytes)
+                {
                     return r;
                 }
             }

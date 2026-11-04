@@ -1145,10 +1145,11 @@ pub enum IrOp {
         bytes: u16,
     },
     /// As [`VDpps`] but source 2 is a memory operand `[addr]` loaded as 128/256 bits. A
-    /// fault on the load traps like any vector load. `dst` holds op1 (pre-copied by the
-    /// lift for VEX).
+    /// fault on the load traps before writing `dst`.
     VDppsM {
         dst: u8,
+        /// Source 1 (= `dst` for SSE, op1 for VEX). Read before writing.
+        a: u8,
         addr: Val,
         imm: u8,
         /// 16 = xmm/VEX.128, 32 = VEX.256.

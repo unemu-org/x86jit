@@ -109,6 +109,23 @@ pub(crate) fn exec_v_store_wide(
 ) -> Option<StepResult> {
     let a = read_val(*addr, &*temps);
     let lanes = cpu.vec_lanes(*src as usize);
+    // SDM Vol 3A §§7.5–7.6: a fault must leave the pre-instruction state intact.
+    // Probe every transfer before committing RAM. Ignore MMIO here: vstore handles
+    // its acknowledgements through vpart_store without consuming them in the probe.
+    for offset in (0..u64::from(*bytes)).step_by(8) {
+        let ea = a.wrapping_add(offset);
+        if let Err(MemTrap::Unmapped) = mem.probe_write(ea, 8) {
+            return Some(trap_out(
+                cpu,
+                cur_addr,
+                MemTrap::Unmapped,
+                ea,
+                8,
+                AccessKind::Write,
+                0,
+            ));
+        }
+    }
     for (i, v) in lanes.into_iter().enumerate().take(*bytes as usize / 16) {
         let ea = a.wrapping_add(i as u64 * 16);
         if let Err(f) = vstore(cpu, mem, cur_addr, ea, v, 16) {
@@ -1155,29 +1172,24 @@ pub(crate) fn exec_v_dpps_m(
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
+    a: &u8,
     addr: &Val,
     imm: &u8,
     bytes: &u16,
 ) -> Option<StepResult> {
-    // `dst` holds op1 (pre-copied by the VEX lift; SSE is in-place). Combine per 128-bit lane.
     let av = read_val(*addr, &*temps);
     let lanes = (*bytes as usize) / 16;
-    for l in 0..lanes {
+    // Commit only after every load succeeds (§16; SDM Vol 3A §§7.5–7.6).
+    let mut out = [0u128; 2];
+    for (l, o) in out.iter_mut().enumerate().take(lanes) {
         let ea = av.wrapping_add((l * 16) as u64);
         let d = if l == 0 {
-            cpu.xmm[*dst as usize]
+            cpu.xmm[*a as usize]
         } else {
-            cpu.ymm_hi[*dst as usize]
+            cpu.ymm_hi[*a as usize]
         };
         match vload(cpu, mem, cur_addr, ea, 16) {
-            Ok(bv) => {
-                let r = dpps(d, bv, *imm);
-                if l == 0 {
-                    cpu.xmm[*dst as usize] = r;
-                } else {
-                    cpu.ymm_hi[*dst as usize] = r;
-                }
-            }
+            Ok(bv) => *o = dpps(d, bv, *imm),
             Err(f) => {
                 return Some(trap_out(
                     cpu,
@@ -1190,6 +1202,10 @@ pub(crate) fn exec_v_dpps_m(
                 ))
             }
         }
+    }
+    cpu.xmm[*dst as usize] = out[0];
+    if lanes > 1 {
+        cpu.ymm_hi[*dst as usize] = out[1];
     }
     None
 }
@@ -3500,7 +3516,9 @@ pub(crate) fn exec_v_psign_m(
 ) -> Option<StepResult> {
     let ea = read_val(*addr, &*temps);
     let lanes = (*bytes as usize) / 16;
-    for l in 0..lanes {
+    // Commit only after every load succeeds (§16; SDM Vol 3A §§7.5–7.6).
+    let mut out = [0u128; 2];
+    for (l, o) in out.iter_mut().enumerate().take(lanes) {
         let addr_l = ea.wrapping_add((l * 16) as u64);
         let src = if l == 0 {
             cpu.xmm[*a as usize]
@@ -3508,14 +3526,7 @@ pub(crate) fn exec_v_psign_m(
             cpu.ymm_hi[*a as usize]
         };
         match vload(cpu, mem, cur_addr, addr_l, 16) {
-            Ok(ctrl) => {
-                let r = psign(src, ctrl, *lane);
-                if l == 0 {
-                    cpu.xmm[*dst as usize] = r;
-                } else {
-                    cpu.ymm_hi[*dst as usize] = r;
-                }
-            }
+            Ok(ctrl) => *o = psign(src, ctrl, *lane),
             Err(f) => {
                 return Some(trap_out(
                     cpu,
@@ -3528,6 +3539,10 @@ pub(crate) fn exec_v_psign_m(
                 ))
             }
         }
+    }
+    cpu.xmm[*dst as usize] = out[0];
+    if lanes > 1 {
+        cpu.ymm_hi[*dst as usize] = out[1];
     }
     None
 }
