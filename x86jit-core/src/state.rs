@@ -361,7 +361,7 @@ pub struct CpuState {
     /// semantics. `None` when no `in` is outstanding.
     pub pending_port_in: Option<u8>,
     /// Guest CPU feature set the embedder selected. Read by `cpuid_run` and
-    /// the `xgetbv` handler to project CPUID leaves / XCR0. Kept last and out of
+    /// the `xgetbv` handler when no table / XCR0 override is installed. Kept out of
     /// `jit_abi::CpuOffsets` — the JIT never field-loads it (only the cpuid/xgetbv
     /// helpers read it via Rust), so it needs no stable ABI offset.
     pub features: crate::features::GuestCpuFeatures,
@@ -420,7 +420,7 @@ pub struct CpuState {
     /// masked vector operands visit at most 64 / elem elements (elem >= 1), narrowing
     /// stores visit at most 64 / 2 elements, and unmasked operands use at most eight
     /// 8-byte transfers.
-    /// The fixed array keeps `CpuState` allocation-free and costs 1024 bytes, 896 more
+    /// The fixed array keeps MMIO retry storage allocation-free and costs 1024 bytes, 896 more
     /// than an eight-entry array.
     /// The interpreter clears these at instruction completion, including ordinary
     /// retries after a RAM fault. The dispatcher keeps partially serviced instructions
@@ -434,6 +434,10 @@ pub struct CpuState {
     pub mmio_retry_active: bool,
     /// Code segment owning the retry; a state replacement may redirect code at the same IP.
     pub mmio_retry_cs: u16,
+    /// Complete CPUID description, shared immutably by vCPUs and VM forks.
+    /// Appended so existing JIT ABI field offsets do not move.
+    pub cpuid_table: Option<std::sync::Arc<crate::features::CpuidTable>>,
+    pub cpuid_overrides: crate::features::CpuidOverrides,
 }
 
 /// Precision selection for the x87 transcendentals (fsin/fcos/…/fyl2x). The
@@ -496,6 +500,8 @@ impl Default for CpuState {
             mmio_parts_rip: 0,
             mmio_retry_active: false,
             mmio_retry_cs: 0,
+            cpuid_table: None,
+            cpuid_overrides: crate::features::CpuidOverrides::default(),
         }
     }
 }
@@ -503,6 +509,19 @@ impl Default for CpuState {
 impl CpuState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The effective CPUID source used by both backends and coverage tools.
+    pub fn cpuid(&self, leaf: u32, subleaf: u32) -> crate::features::CpuidRegisters {
+        let (leaf, subleaf, regs) = match &self.cpuid_table {
+            Some(table) => table.resolve(leaf, subleaf),
+            None => (
+                leaf,
+                if leaf == 7 { subleaf } else { 0 },
+                self.features.cpuid(leaf, subleaf),
+            ),
+        };
+        self.cpuid_overrides.apply(leaf, subleaf, regs)
     }
 
     /// A sub-transfer of the instruction at `rip` that the embedder has already

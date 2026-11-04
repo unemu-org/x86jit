@@ -264,6 +264,59 @@ and RIP on the faulting instruction after earlier instructions complete (Intel S
 Vol 3A §7.15, Events 6 and 13; Vol 2A §2.3.11). A valid encoding the lifter does not
 handle returns `Exit::UnknownInstruction`.
 
+For a complete CPU identity, install a CPUID table before creating vCPUs:
+
+```rust
+use x86jit_core::{CpuidLeaf, CpuidOutOfRange, CpuidOverride, CpuidOverrides,
+                  CpuidRegisters as R, CpuidTable};
+
+let mut table = CpuidTable::new(CpuidOutOfRange::HighestBasicLeaf);
+// SDM Vol 1 Tables 21-4/6/8: vendor, signature, and leaf-1 fields.
+table.leaves.insert(0, CpuidLeaf::Constant(R::new(
+    1, 0x756e_6547, 0x6c65_746e, 0x4965_6e69)));
+table.leaves.insert(1, CpuidLeaf::Constant(R::new(0x0003_06c3, 0x0002_0800, 0, 0)));
+vm.set_cpuid_table(Some(table));
+
+let mut overrides = CpuidOverrides::default();
+// Initial APIC ID: SDM Vol 1 Table 21-8.
+overrides.leaves.insert((1, 0), CpuidOverride {
+    mask: R::new(0, 0xff00_0000, 0, 0),
+    value: R::new(0, 1 << 24, 0, 0),
+});
+let vcpu = vm.new_vcpu_with_cpuid_overrides(overrides);
+```
+
+This is a minimal API example, not a complete CPU profile. `CpuidLeaf::Indexed`
+holds a `(subleaf, registers)` map and an `invalid_subleaf` reply; `Constant` ignores
+input ECX. The table also specifies replies for missing leaves and queries outside
+the maxima in leaves 0 and 0x8000_0000. `HighestBasicLeaf` follows SDM Vol 1
+§21.1.3; `Fixed` supplies a profile-specific reply. Explicit entries can describe
+software-defined ranges. A table replaces all preset CPUID replies. Set `None`
+to restore the selected `GuestCpuFeatures` projection for new vCPUs; existing vCPUs
+retain their description. That legacy projection returns zeros outside its ranges,
+a compatibility deviation from the SDM rule.
+
+Overrides apply masked fields after lookup, keyed by the resolved leaf and subleaf
+(zero for leaves that ignore ECX). They can carry logical-processor IDs and runtime
+fields such as OSXSAVE, leaf 0xD sizes, 07H ECX[4] OSPKE and 19H EBX[0]
+AESKLE (SDM Vol 1 §21.1.5, Table 21-1), and 80000001H EDX[11] SYSCALL
+(Table 21-90). The legacy projection keeps SYSCALL set in every mode, a frozen
+deviation from Table 21-90, which specifies zero outside 64-bit mode.
+`CpuidOverrides::xcr0` supplies XGETBV(0); otherwise the feature preset supplies it.
+The embedder keeps those fields consistent and can update `vcpu.cpu.cpuid_overrides`
+when its modeled state changes. Tables and overrides survive CPU-state cloning;
+VM forks inherit the table.
+
+Advertising a bit does not implement its instructions. In development tooling,
+`x86jit_tests::compat::cpuid_lift_gaps(|leaf, subleaf| vcpu.cpu.cpuid(leaf, subleaf))`
+reports incomplete or unknown user-mode lift coverage for an effective CPU source.
+The same helper accepts a preset's `cpuid` or a table's `query`. It covers Intel/AMD
+instruction-feature bits understood by iced, not legacy vendor-specific leaves or
+CPU-description consistency. The preset tests carry explicit per-preset waivers,
+including CX8, XSAVE and CX16 gaps. In particular, supplying leaf 0xD sizes can
+select XSAVE/XRSTOR paths that currently trap. See
+[decision-11](backlog/decisions/decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md).
+
 Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
 API, identical guest state. Runnable examples:
 

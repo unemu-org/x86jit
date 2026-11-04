@@ -327,6 +327,7 @@ pub struct Vm {
     /// selects a different ISA level via [`Vm::set_guest_cpu_features`] before spawning
     /// vcpus.
     features: crate::features::GuestCpuFeatures,
+    cpuid_table: Option<Arc<crate::features::CpuidTable>>,
     /// x87 transcendental precision every new vcpu starts with. Default `Fast`
     /// (f64/libm); select `Extended` (full-80-bit) via [`Vm::set_x87_precision`].
     x87_precision: crate::state::X87Precision,
@@ -381,6 +382,18 @@ impl Vm {
         self.features = features;
     }
 
+    /// Install a complete CPUID table for new vCPUs. `None` restores the selected
+    /// `GuestCpuFeatures` projection. Existing vCPUs retain their CPU description.
+    /// A table replaces all CPUID replies; `set_guest_cpu_features` still selects
+    /// the fallback XCR0 value unless the vCPU supplies an XCR0 override.
+    pub fn set_cpuid_table(&mut self, table: Option<crate::features::CpuidTable>) {
+        self.cpuid_table = table.map(Arc::new);
+    }
+
+    pub fn cpuid_table(&self) -> Option<&crate::features::CpuidTable> {
+        self.cpuid_table.as_deref()
+    }
+
     /// Select the x87 transcendental precision new vcpus inherit: `Fast`
     /// (f64/libm, default) or `Extended` (full-80-bit F80). Set before spawning vcpus.
     pub fn set_x87_precision(&mut self, p: crate::state::X87Precision) {
@@ -424,6 +437,7 @@ impl Vm {
             tier_up_background: self.tier_up_background,
             tier_up_region_after: self.tier_up_region_after,
             features: self.features,
+            cpuid_table: self.cpuid_table.clone(),
             x87_precision: self.x87_precision,
             mode: self.mode,
         })
@@ -441,6 +455,7 @@ impl Vm {
             tier_up_background: false,
             tier_up_region_after: None,
             features: crate::features::GuestCpuFeatures::default(),
+            cpuid_table: None,
             x87_precision: crate::state::X87Precision::default(),
             mode: CpuMode::Long64,
         }
@@ -595,8 +610,19 @@ impl Vm {
 
     /// One execution context per guest thread (§4.3). Shares this `Vm`.
     pub fn new_vcpu(&self) -> Vcpu {
+        self.new_vcpu_with_cpuid_overrides(crate::features::CpuidOverrides::default())
+    }
+
+    /// Create a vCPU with its logical-processor and runtime CPUID fields.
+    /// Overrides are owned by `CpuState`, so cloning state preserves them.
+    pub fn new_vcpu_with_cpuid_overrides(
+        &self,
+        overrides: crate::features::CpuidOverrides,
+    ) -> Vcpu {
         let mut cpu = CpuState::new();
         cpu.features = self.features; // ISA level the embedder chose
+        cpu.cpuid_table = self.cpuid_table.clone();
+        cpu.cpuid_overrides = overrides;
         cpu.x87_precision = self.x87_precision; // transcendental precision
         let word = Arc::new(AtomicU64::new(0));
         self.mem.register_dispatch_word(&word);

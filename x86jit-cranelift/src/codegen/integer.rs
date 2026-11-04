@@ -300,6 +300,7 @@ impl Translator<'_, '_> {
     }
 
     pub(crate) fn emit_xgetbv(&mut self) -> bool {
+        self.flush_gprs(); // preserve pending region writes before reloading GPRs
         let cpu = self.cpu;
         self.call_helper(self.helpers.xgetbv, &[cpu]);
         self.reload_gprs(); // helper wrote RAX/RDX (XCR0)

@@ -291,8 +291,8 @@ pub enum IrOp {
     Cpuid,
 
     // xgetbv: EDX:EAX = extended control register selected by ECX. Guests read XCR0
-    // (ECX=0). Runtime op (not baked at lift time) so XCR0 tracks the embedder's
-    // feature set — `cpu.features.xcr0()`.
+    // (ECX=0). Runtime op: XCR0 comes from the per-vCPU override, else the
+    // feature set.
     Xgetbv,
 
     // x87 FPU op (§14). `addr` is the effective address for memory forms (ignored

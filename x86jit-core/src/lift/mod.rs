@@ -1403,8 +1403,8 @@ pub(crate) fn lift_insn(
             Ok(false)
         }
         // xgetbv: EDX:EAX = the extended control register selected by ECX. Guests read
-        // XCR0 (ECX=0) after seeing CPUID.1.ECX.OSXSAVE. Runtime op so XCR0 tracks the
-        // embedder's feature set instead of a baked constant.
+        // XCR0 (ECX=0) after seeing CPUID.1.ECX.OSXSAVE. Runtime op: XCR0 comes from
+        // the per-vCPU override, else the feature set.
         Xgetbv => {
             ops.push(IrOp::Xgetbv);
             Ok(false)
@@ -1472,8 +1472,9 @@ pub(crate) fn lift_insn(
         }
         Ldmxcsr | Vldmxcsr => Ok(false),
         // fxsave/fxrstor: 512-byte legacy FP/SSE save area. Shared exec_fxstate in
-        // both backends (glibc's dynamic loader fxsaves to preserve XMM across the
-        // PLT resolver when XSAVE isn't advertised).
+        // both backends. The default CPUID advertises XSAVE but supplies no leaf 0xD
+        // sizes; XSAVE/XRSTOR still have no lift. A table exposing those sizes must
+        // account for that gap (see the per-preset compat waivers).
         Fxsave | Fxsave64 => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::FxState {

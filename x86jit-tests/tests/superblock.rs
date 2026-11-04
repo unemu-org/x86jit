@@ -48,6 +48,54 @@ const CAPS: RegionCaps = RegionCaps {
     max_icount: 256,
 };
 
+#[test]
+fn region_xgetbv_and_cpuid_preserve_pending_gpr_writes() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut top = a.create_label();
+    a.xor(rsi, rsi).unwrap();
+    a.jmp(top).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.add(rsi, 1).unwrap();
+    a.mov(r8, 0x1234i64).unwrap();
+    a.xor(ecx, ecx).unwrap();
+    a.xgetbv().unwrap();
+    a.mov(r9, rax).unwrap();
+    a.mov(r10, 0x5678i64).unwrap();
+    a.mov(eax, 1).unwrap();
+    a.mov(ecx, 99).unwrap();
+    a.cpuid().unwrap();
+    a.cmp(rsi, 3).unwrap();
+    a.jb(top).unwrap();
+    a.hlt().unwrap();
+    let code = a.assemble(CODE).unwrap();
+    let run = |backend: Box<dyn Backend>| {
+        let mut vm = Vm::with_backend(VmConfig::flat(FLAT), backend);
+        vm.map(CODE, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(CODE, &code).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, CODE);
+        // Bound a broken loop too: losing RSI's increment must fail, not hang.
+        assert!(matches!(cpu.run(&vm, Some(20)), Exit::Hlt));
+        let regs = [
+            Reg::Rax,
+            Reg::Rbx,
+            Reg::Rcx,
+            Reg::Rdx,
+            Reg::Rsi,
+            Reg::R8,
+            Reg::R9,
+            Reg::R10,
+        ]
+        .map(|r| cpu.reg(r));
+        (regs, vm.cache.regions())
+    };
+    let interp = run(Box::new(InterpreterBackend));
+    assert_eq!(&interp.0[4..], &[3, 0x1234, 7, 0x5678]);
+    let jit = run(Box::new(JitBackend::with_superblocks(CAPS)));
+    assert_eq!(jit.0, interp.0);
+    assert!(jit.1 > 0, "the loop must execute as a region");
+}
+
 /// Run to `hlt`; return (rax, mem[OUT]).
 fn run_to_hlt(vm: &Vm, mut cpu: x86jit_core::Vcpu) -> (u64, u64) {
     cpu.set_reg(Reg::Rip, CODE);

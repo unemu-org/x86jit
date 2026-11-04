@@ -2,9 +2,7 @@
 //! without refreshing `backlog/docs/compat/coverage.json` fails this test — the map is
 //! always the truth about what the lifter handles.
 
-use x86jit_tests::compat::{
-    advertised_simd_features, compute_coverage, cpuid_waivers, feature_coverage, Coverage,
-};
+use x86jit_tests::compat::{compute_coverage, cpuid_lift_gaps, cpuid_waivers, Coverage};
 
 #[test]
 fn compat_map_is_current() {
@@ -22,61 +20,196 @@ fn compat_map_is_current() {
     );
 }
 
-/// CPUID must not advertise a feature the lifter can't fully execute. A
-/// guest's CPUID-dispatched path (esp. glibc IFUNC resolvers) jumps straight into
-/// the instruction after seeing its bit, so an advertised-but-unimplemented feature
-/// is a live trap. Every advertised feature must be either 100% lifted or listed in
-/// `compat/cpuid-waivers.ron` with a reason. Advertising a new feature without
-/// implementing or waiving it fails here.
+fn presets() -> [(&'static str, x86jit_core::GuestCpuFeatures); 4] {
+    use x86jit_core::GuestCpuFeatures as F;
+    [
+        ("default", F::default()),
+        ("v2", F::v2()),
+        ("v3", F::v3()),
+        ("v4", F::v4()),
+    ]
+}
+
+/// Every preset's advertised instruction-feature bits must lift or carry an
+/// explicit per-preset waiver. This includes unknown (unencodable) probe coverage.
 #[test]
 fn cpuid_advertises_only_what_lifts() {
-    let waived: std::collections::HashSet<String> =
-        cpuid_waivers().into_iter().map(|(f, _)| f).collect();
-
+    let waivers = cpuid_waivers();
     let mut failures = Vec::new();
-    for f in advertised_simd_features() {
-        let name = format!("{f:?}");
-        let (_lifted, missing) = feature_coverage(f);
-        if !missing.is_empty() && !waived.contains(&name) {
-            let sample: Vec<_> = missing.iter().take(5).collect();
-            failures.push(format!(
-                "{name}: {} advertised codes not lifted, e.g. {sample:?}",
-                missing.len()
-            ));
+    for (preset, features) in presets() {
+        for gap in cpuid_lift_gaps(|l, s| features.cpuid(l, s)) {
+            let name = format!("{:?}", gap.advertised.feature);
+            if !waivers
+                .iter()
+                .any(|(p, f, reason)| p == preset && f == &name && !reason.trim().is_empty())
+            {
+                failures.push(format!(
+                    "{preset}/{name}: {} missing, {} unencodable, e.g. {:?} / {:?}",
+                    gap.missing.len(),
+                    gap.unencodable.len(),
+                    &gap.missing[..gap.missing.len().min(5)],
+                    &gap.unencodable[..gap.unencodable.len().min(5)]
+                ));
+            }
         }
     }
     assert!(
         failures.is_empty(),
-        "CPUID advertises features the lifter doesn't fully implement. Either implement \
-         them (see backlog/docs/compat/isa-coverage.md) or add a reasoned waiver to \
-         x86jit-tests/compat/cpuid-waivers.ron:\n{}",
+        "Unwaived CPUID lift gaps:\n{}",
         failures.join("\n")
     );
 }
 
-/// A waiver must name a real advertised feature — a stale waiver (feature no longer
-/// advertised, or now fully lifted) should be removed, not linger.
 #[test]
 fn cpuid_waivers_are_not_stale() {
-    let advertised: std::collections::HashSet<String> = advertised_simd_features()
-        .into_iter()
-        .map(|f| format!("{f:?}"))
-        .collect();
-
-    for (feat, _reason) in cpuid_waivers() {
+    let waivers = cpuid_waivers();
+    let mut seen = std::collections::HashSet::new();
+    for (preset, feature, reason) in &waivers {
         assert!(
-            advertised.contains(&feat),
-            "waiver for `{feat}` but that feature isn't advertised by cpuid_run — remove it"
+            seen.insert((preset, feature)),
+            "duplicate waiver: {preset}/{feature}"
         );
-        let iced_feat = advertised_simd_features()
+        assert!(
+            !reason.trim().is_empty(),
+            "empty waiver: {preset}/{feature}"
+        );
+        let (_, features) = presets()
             .into_iter()
-            .find(|f| format!("{f:?}") == feat)
-            .expect("advertised");
-        let (_lifted, missing) = feature_coverage(iced_feat);
+            .find(|(p, _)| p == preset)
+            .unwrap_or_else(|| panic!("unknown preset {preset}"));
         assert!(
-            !missing.is_empty(),
-            "waiver for `{feat}` but it's now fully lifted — remove the waiver"
+            cpuid_lift_gaps(|l, s| features.cpuid(l, s))
+                .iter()
+                .any(|g| format!("{:?}", g.advertised.feature) == *feature),
+            "stale waiver: {preset}/{feature}"
         );
+    }
+}
+
+/// Regression for gaps the old generation buckets and leaf-1-only check hid.
+#[test]
+fn cpuid_checker_finds_scalar_xsave_and_richer_preset_gaps() {
+    use iced_x86::{Code, CpuidFeature};
+    for (name, features) in presets() {
+        let gaps = cpuid_lift_gaps(|l, s| features.cpuid(l, s));
+        assert!(
+            gaps.iter()
+                .any(|g| g.advertised.feature == CpuidFeature::CX8
+                    && g.missing.contains(&Code::Cmpxchg8b_m64)),
+            "{name}/CX8"
+        );
+        if name != "default" {
+            assert!(
+                gaps.iter()
+                    .any(|g| g.advertised.feature == CpuidFeature::CMPXCHG16B
+                        && g.missing.contains(&Code::Cmpxchg16b_m128)),
+                "{name}/CX16"
+            );
+        }
+        if name != "v2" {
+            let xsave = gaps
+                .iter()
+                .find(|g| g.advertised.feature == CpuidFeature::XSAVE)
+                .expect("XSAVE gap");
+            assert!(xsave.missing.contains(&Code::Xsave_mem));
+            assert!(!xsave.missing.contains(&Code::Xsetbv), "CPL 0 excluded");
+        }
+    }
+}
+
+#[test]
+fn cpuid_checker_accepts_tables_and_sees_extended_and_leaf7_bits() {
+    use iced_x86::CpuidFeature::*;
+    use x86jit_core::{CpuidLeaf, CpuidOutOfRange, CpuidRegisters as R, CpuidTable};
+    let mut table = CpuidTable::new(CpuidOutOfRange::HighestBasicLeaf);
+    table
+        .leaves
+        .insert(0, CpuidLeaf::Constant(R::new(7, 0, 0, 0)));
+    table.leaves.insert(
+        0x8000_0000,
+        CpuidLeaf::Constant(R::new(0x8000_0001, 0, 0, 0)),
+    );
+    table.leaves.insert(
+        1,
+        CpuidLeaf::Constant(R::new(0, 0, (1 << 30) | (1 << 28), 1 << 8)),
+    );
+    table.leaves.insert(
+        7,
+        CpuidLeaf::Indexed {
+            subleaves: [
+                (0, R::new(1, (1 << 5) | (1 << 18) | (1 << 19), 0, 0)),
+                (1, R::new(1, 0, 0, 0)),
+            ]
+            .into(),
+            invalid_subleaf: R::ZERO,
+        },
+    );
+    table.leaves.insert(
+        0x8000_0001,
+        CpuidLeaf::Constant(R::new(0, 0, 1 << 6, 1 << 27)),
+    );
+    let gaps = cpuid_lift_gaps(|l, s| table.query(l, s));
+    for feature in [CX8, RDRAND, RDSEED, ADX, SSE4A, RDTSCP, SHA512] {
+        assert!(
+            gaps.iter().any(|g| g.advertised.feature == feature),
+            "{feature:?}"
+        );
+    }
+    // The highest-basic-leaf reply must not be mistaken for feature bits in 0xD.
+    assert!(!gaps.iter().any(|g| g.advertised.leaf == 0xd));
+}
+
+#[test]
+fn cpuid_checker_requires_all_known_instruction_features() {
+    use iced_x86::CpuidFeature;
+    use x86jit_core::{Feature, GuestCpuFeatures};
+    let vl_only = GuestCpuFeatures::empty().with(Feature::Avx512vl);
+    let gaps = cpuid_lift_gaps(|l, s| vl_only.cpuid(l, s));
+    assert!(
+        !gaps
+            .iter()
+            .any(|g| g.advertised.feature == CpuidFeature::AVX512VL),
+        "AVX512VL instructions also require unadvertised foundation features"
+    );
+    let with_foundation = vl_only.with(Feature::Avx512f);
+    assert!(cpuid_lift_gaps(|l, s| with_foundation.cpuid(l, s))
+        .iter()
+        .any(|g| g.advertised.feature == CpuidFeature::AVX512VL));
+}
+
+#[test]
+fn cpuid_checker_preserves_disjunctive_requirements() {
+    use iced_x86::{Code, CpuidFeature::*};
+    use x86jit_core::CpuidRegisters as R;
+    use x86jit_tests::compat::advertised_instruction_features;
+    for (leaf, register, bits, alternative) in [
+        (7, "ebx", [4, 11], HLE_or_RTM),
+        (0x8000_0001, "ecx", [2, 12], SKINIT_or_SVM),
+    ] {
+        for enabled in [0, 1 << bits[0], 1 << bits[1]] {
+            let source = |l, _| match l {
+                0 => R::new(7, 0, 0, 0),
+                0x8000_0000 => R::new(0x8000_0001, 0, 0, 0),
+                l if l == leaf && register == "ebx" => R::new(0, enabled, 0, 0),
+                l if l == leaf => R::new(0, 0, enabled, 0),
+                _ => R::ZERO,
+            };
+            assert_eq!(
+                advertised_instruction_features(source)
+                    .iter()
+                    .any(|f| f.feature == alternative),
+                enabled != 0
+            );
+            if alternative == HLE_or_RTM {
+                assert_eq!(
+                    cpuid_lift_gaps(source)
+                        .iter()
+                        .any(|g| g.advertised.feature == alternative
+                            && g.missing.contains(&Code::Xtest)),
+                    enabled != 0
+                );
+            }
+        }
     }
 }
 
@@ -108,4 +241,182 @@ fn probe_measures_real_coverage() {
         c32.missing.iter().any(|m| m == "Pushad"),
         "compat32 map should list the legacy-only forms (e.g. Pushad) as missing"
     );
+}
+
+/// Witness rows from SDM Vol 1 Tables 21-9/10/19/20/21/22/23/25,
+/// 21-35/47/51/62; AMD APM Vol 3 §E.4.2 and §E.4.7. Pin positions
+/// independently of the reader so a swapped bit cannot silently change the audit.
+#[test]
+fn cpuid_checker_feature_positions_match_manual() {
+    use iced_x86::CpuidFeature::*;
+    use x86jit_core::CpuidRegisters as R;
+    use x86jit_tests::compat::advertised_instruction_features;
+    #[rustfmt::skip]
+    let witnesses = [
+        (1, 0, "ecx", 0, SSE3),
+        (1, 0, "ecx", 1, PCLMULQDQ),
+        (1, 0, "ecx", 3, MONITOR),
+        (1, 0, "ecx", 5, VMX),
+        (1, 0, "ecx", 6, SMX),
+        (1, 0, "ecx", 9, SSSE3),
+        (1, 0, "ecx", 12, FMA),
+        (1, 0, "ecx", 13, CMPXCHG16B),
+        (1, 0, "ecx", 19, SSE4_1),
+        (1, 0, "ecx", 20, SSE4_2),
+        (1, 0, "ecx", 22, MOVBE),
+        (1, 0, "ecx", 23, POPCNT),
+        (1, 0, "ecx", 25, AES),
+        (1, 0, "ecx", 26, XSAVE),
+        (1, 0, "ecx", 28, AVX),
+        (1, 0, "ecx", 29, F16C),
+        (1, 0, "ecx", 30, RDRAND),
+        (1, 0, "edx", 0, FPU),
+        (1, 0, "edx", 4, TSC),
+        (1, 0, "edx", 5, MSR),
+        (1, 0, "edx", 8, CX8),
+        (1, 0, "edx", 11, SEP),
+        (1, 0, "edx", 15, CMOV),
+        (1, 0, "edx", 19, CLFSH),
+        (1, 0, "edx", 23, MMX),
+        (1, 0, "edx", 24, FXSR),
+        (1, 0, "edx", 25, SSE),
+        (1, 0, "edx", 26, SSE2),
+        (7, 0, "ebx", 0, FSGSBASE),
+        (7, 0, "ebx", 3, BMI1),
+        (7, 0, "ebx", 4, HLE),
+        (7, 0, "ebx", 5, AVX2),
+        (7, 0, "ebx", 8, BMI2),
+        (7, 0, "ebx", 10, INVPCID),
+        (7, 0, "ebx", 11, RTM),
+        (7, 0, "ebx", 14, MPX),
+        (7, 0, "ebx", 16, AVX512F),
+        (7, 0, "ebx", 17, AVX512DQ),
+        (7, 0, "ebx", 18, RDSEED),
+        (7, 0, "ebx", 19, ADX),
+        (7, 0, "ebx", 20, SMAP),
+        (7, 0, "ebx", 21, AVX512_IFMA),
+        (7, 0, "ebx", 23, CLFLUSHOPT),
+        (7, 0, "ebx", 24, CLWB),
+        (7, 0, "ebx", 26, AVX512PF),
+        (7, 0, "ebx", 27, AVX512ER),
+        (7, 0, "ebx", 28, AVX512CD),
+        (7, 0, "ebx", 29, SHA),
+        (7, 0, "ebx", 30, AVX512BW),
+        (7, 0, "ebx", 31, AVX512VL),
+        (7, 0, "ecx", 0, PREFETCHWT1),
+        (7, 0, "ecx", 1, AVX512_VBMI),
+        (7, 0, "ecx", 3, PKU),
+        (7, 0, "ecx", 5, WAITPKG),
+        (7, 0, "ecx", 6, AVX512_VBMI2),
+        (7, 0, "ecx", 7, CET_SS),
+        (7, 0, "ecx", 8, GFNI),
+        (7, 0, "ecx", 9, VAES),
+        (7, 0, "ecx", 10, VPCLMULQDQ),
+        (7, 0, "ecx", 11, AVX512_VNNI),
+        (7, 0, "ecx", 12, AVX512_BITALG),
+        (7, 0, "ecx", 14, AVX512_VPOPCNTDQ),
+        (7, 0, "ecx", 22, RDPID),
+        (7, 0, "ecx", 23, KL),
+        (7, 0, "ecx", 25, CLDEMOTE),
+        (7, 0, "ecx", 27, MOVDIRI),
+        (7, 0, "ecx", 28, MOVDIR64B),
+        (7, 0, "ecx", 29, ENQCMD),
+        (7, 0, "edx", 2, AVX512_4VNNIW),
+        (7, 0, "edx", 3, AVX512_4FMAPS),
+        (7, 0, "edx", 5, UINTR),
+        (7, 0, "edx", 8, AVX512_VP2INTERSECT),
+        (7, 0, "edx", 14, SERIALIZE),
+        (7, 0, "edx", 16, TSXLDTRK),
+        (7, 0, "edx", 18, PCONFIG),
+        (7, 0, "edx", 20, CET_IBT),
+        (7, 0, "edx", 22, AMX_BF16),
+        (7, 0, "edx", 23, AVX512_FP16),
+        (7, 0, "edx", 24, AMX_TILE),
+        (7, 0, "edx", 25, AMX_INT8),
+        (7, 1, "eax", 0, SHA512),
+        (7, 1, "eax", 1, SM3),
+        (7, 1, "eax", 2, SM4),
+        (7, 1, "eax", 4, AVX_VNNI),
+        (7, 1, "eax", 5, AVX512_BF16),
+        (7, 1, "eax", 7, CMPCCXADD),
+        (7, 1, "eax", 17, FRED),
+        (7, 1, "eax", 18, LKGS),
+        (7, 1, "eax", 19, WRMSRNS),
+        (7, 1, "eax", 21, AMX_FP16),
+        (7, 1, "eax", 22, HRESET),
+        (7, 1, "eax", 23, AVX_IFMA),
+        (7, 1, "eax", 27, MSRLIST),
+        (7, 1, "ebx", 1, TSE),
+        (7, 1, "edx", 4, AVX_VNNI_INT8),
+        (7, 1, "edx", 5, AVX_NE_CONVERT),
+        (7, 1, "edx", 8, AMX_COMPLEX),
+        (7, 1, "edx", 10, AVX_VNNI_INT16),
+        (7, 1, "edx", 14, PREFETCHITI),
+        (0xd, 1, "eax", 0, XSAVEOPT),
+        (0xd, 1, "eax", 1, XSAVEC),
+        (0xd, 1, "eax", 3, XSAVES),
+        (0x12, 0, "eax", 0, SGX1),
+        (0x14, 0, "ebx", 4, PTWRITE),
+        (0x19, 0, "ebx", 0, AESKLE),
+        (0x19, 0, "ebx", 2, WIDE_KL),
+        (0x8000_0001, 0, "ecx", 2, SVM),
+        (0x8000_0001, 0, "ecx", 5, LZCNT),
+        (0x8000_0001, 0, "ecx", 6, SSE4A),
+        (0x8000_0001, 0, "ecx", 8, PREFETCHW),
+        (0x8000_0001, 0, "ecx", 11, XOP),
+        (0x8000_0001, 0, "ecx", 12, SKINIT),
+        (0x8000_0001, 0, "ecx", 15, LWP),
+        (0x8000_0001, 0, "ecx", 16, FMA4),
+        (0x8000_0001, 0, "ecx", 21, TBM),
+        (0x8000_0001, 0, "ecx", 29, MONITORX),
+        (0x8000_0001, 0, "edx", 0, FPU),
+        (0x8000_0001, 0, "edx", 4, TSC),
+        (0x8000_0001, 0, "edx", 5, MSR),
+        (0x8000_0001, 0, "edx", 8, CX8),
+        (0x8000_0001, 0, "edx", 11, SYSCALL),
+        (0x8000_0001, 0, "edx", 15, CMOV),
+        (0x8000_0001, 0, "edx", 23, MMX),
+        (0x8000_0001, 0, "edx", 24, FXSR),
+        (0x8000_0001, 0, "edx", 27, RDTSCP),
+        (0x8000_0001, 0, "edx", 29, X64),
+        (0x8000_0001, 0, "edx", 30, D3NOWEXT),
+        (0x8000_0001, 0, "edx", 31, D3NOW),
+        (0x8000_0008, 0, "ebx", 0, CLZERO),
+        (0x8000_0008, 0, "ebx", 3, INVLPGB),
+        (0x8000_0008, 0, "ebx", 4, RDPRU),
+        (0x8000_0008, 0, "ebx", 8, MCOMMIT),
+        (0x8000_0008, 0, "ebx", 9, WBNOINVD),
+    ];
+    for (leaf, subleaf, register, bit, feature) in witnesses {
+        let found = advertised_instruction_features(|l, s| {
+            if l == 0 {
+                return R::new(0x1f, 0, 0, 0);
+            }
+            if l == 0x8000_0000 {
+                return R::new(0x8000_0008, 0, 0, 0);
+            }
+            let mut regs = if l == 7 && s == 0 {
+                R::new(2, 0, 0, 0)
+            } else {
+                R::ZERO
+            };
+            if (l, s) == (leaf, subleaf) {
+                match register {
+                    "eax" => regs.eax |= 1 << bit,
+                    "ebx" => regs.ebx |= 1 << bit,
+                    "ecx" => regs.ecx |= 1 << bit,
+                    "edx" => regs.edx |= 1 << bit,
+                    _ => unreachable!(),
+                }
+            }
+            regs
+        });
+        assert!(
+            found
+                .iter()
+                .any(|f| (f.leaf, f.subleaf, f.register, f.bit, f.feature)
+                    == (leaf, subleaf, register, bit, feature)),
+            "{feature:?} at {leaf:#x}:{subleaf} {register}[{bit}]"
+        );
+    }
 }

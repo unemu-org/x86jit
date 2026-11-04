@@ -1,18 +1,60 @@
-// CPUID features leaf-1 advertises that the lifter does NOT yet fully implement.
-// Each entry is a conscious, temporary exception checked by
-// `cpuid_advertises_only_what_lifts` (OCI-0.T2): a (feature, reason) pair. The test
-// fails if CPUID advertises a partially-implemented feature that is NOT listed here,
-// so a new advertisement forces either a full implementation or an explicit,
-// reasoned waiver. Removing a waiver requires the feature to reach 100% in the
-// compat map (wiki/compat/isa-coverage.md). Track: wiki/design/oci-plan.md §OCI-3.
+// (preset, iced feature, reason). Missing memory forms and unencodable probes
+// count as coverage gaps. These exceptions preserve existing presets and never
+// claim complete execution support. Remove an entry when its gap closes.
 [
-    ("MMX", "Zero MMX lifted, but load-bearing: glibc's cpu-features init needs the bit and the glibc-hello corpus test regresses to empty output without it, yet never executes an MMX instruction in the fixture. Do NOT narrow without re-verifying glibc."),
-    ("SSE", "Baseline, cannot un-advertise. Remaining gaps are MMX-interop conversions (Cvtpi2ps/Cvtps2pi/Cvttps2pi) and movmskps."),
-    ("SSE2", "Baseline, cannot un-advertise. Remaining gaps are the packed int<->float conversion family (cvtdq2ps/cvtps2dq/cvttps2dq/cvtpd2dq/...) and MMX-interop forms."),
-    // SSE3 reached 100% lift coverage (addsubp*/haddp*/hsubp* task-178, lddqu, and
-    // movddup/movsldup/movshdup task-187), so it no longer needs a waiver.
-    ("SSSE3", "pshufb + palignr lifted. Remaining: pabs*, phadd*/phsub*, pmaddubsw, pmulhrsw, psign*. Fully executable for the glibc SSSE3 string routines, which is why SSE4.1/4.2 could be un-advertised (see wiki/decisions/2026-07-06-cpuid-drop-sse4.md)."),
-    // SSE4.1 and SSE4.2 are deliberately no longer advertised by cpuid_run — their
-    // pcmpistri/pmovzx/ptest/blendv*/round* gaps were live traps for modern glibc,
-    // which now falls back to the SSSE3/SSE2 routines above. No waiver needed.
+    ("default", "SSSE3", "Legacy XMM PABSB/PABSW/PABSD and MMX SSSE3 forms have no lift (xj-6vd.14). Preserved advertising does not promise these forms."),
+    ("default", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
+    ("default", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
+    ("default", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
+    ("default", "CX8", "CMPXCHG8B has no lift. Preserve the frozen default and inherited baseline; making CX8 a Feature now lets an embedder withhold it."),
+    ("default", "CMOV", "Integer CMOV lifts, but iced also tags unlifted x87 FCMOV forms with this bit. Preserve the scalar baseline and report those forms."),
+    ("default", "MMX", "MMX forms remain unlifted. Preserve the detection bit used by existing CPU detection; execution of those forms still traps."),
+    ("default", "SSE", "Some scalar/vector square roots, reciprocal approximations and MMX conversions remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
+    ("default", "SSE2", "Some square roots, conversions and MMX interop forms remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
+    ("default", "AVX2", "Some YMM packing, shuffles, variable shifts and memory forms remain unlifted; VSIB gathers have no lift arm (xj-6vd.13) and cannot be synthesized by this probe. Preserve opt-in or frozen advertising with these explicit limits."),
+    ("default", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
+    ("v2", "SSSE3", "Legacy XMM PABSB/PABSW/PABSD and MMX SSSE3 forms have no lift (xj-6vd.14). Preserved advertising does not promise these forms."),
+    ("v2", "CMPXCHG16B", "CMPXCHG16B has no lift. Preserve this opt-in v2-and-up preset bit; the corresponding instruction still traps."),
+    ("v2", "SSE4_1", "PACKUSDW, PMINSB, PMINUW, PMAXSB, PMAXUW and EXTRACTPS have no lift (xj-6vd.15). This opt-in preset does not guarantee complete SSE4.1 execution."),
+    ("v2", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
+    ("v2", "CX8", "CMPXCHG8B has no lift. Preserve the frozen default and inherited baseline; making CX8 a Feature now lets an embedder withhold it."),
+    ("v2", "CMOV", "Integer CMOV lifts, but iced also tags unlifted x87 FCMOV forms with this bit. Preserve the scalar baseline and report those forms."),
+    ("v2", "MMX", "MMX forms remain unlifted. Preserve the detection bit used by existing CPU detection; execution of those forms still traps."),
+    ("v2", "SSE", "Some scalar/vector square roots, reciprocal approximations and MMX conversions remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
+    ("v2", "SSE2", "Some square roots, conversions and MMX interop forms remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
+    ("v2", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
+    ("v3", "SSSE3", "Legacy XMM PABSB/PABSW/PABSD and MMX SSSE3 forms have no lift (xj-6vd.14). Preserved advertising does not promise these forms."),
+    ("v3", "CMPXCHG16B", "CMPXCHG16B has no lift. Preserve this opt-in v2-and-up preset bit; the corresponding instruction still traps."),
+    ("v3", "SSE4_1", "PACKUSDW, PMINSB, PMINUW, PMAXSB, PMAXUW and EXTRACTPS have no lift (xj-6vd.15). This opt-in preset does not guarantee complete SSE4.1 execution."),
+    ("v3", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
+    ("v3", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
+    ("v3", "F16C", "The VCVTPS2PH forms remain unlifted. Preserve the opt-in v3-and-up preset while reporting the conversion gap."),
+    ("v3", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
+    ("v3", "CX8", "CMPXCHG8B has no lift. Preserve the frozen default and inherited baseline; making CX8 a Feature now lets an embedder withhold it."),
+    ("v3", "CMOV", "Integer CMOV lifts, but iced also tags unlifted x87 FCMOV forms with this bit. Preserve the scalar baseline and report those forms."),
+    ("v3", "MMX", "MMX forms remain unlifted. Preserve the detection bit used by existing CPU detection; execution of those forms still traps."),
+    ("v3", "SSE", "Some scalar/vector square roots, reciprocal approximations and MMX conversions remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
+    ("v3", "SSE2", "Some square roots, conversions and MMX interop forms remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
+    ("v3", "AVX2", "Some YMM packing, shuffles, variable shifts and memory forms remain unlifted; VSIB gathers have no lift arm (xj-6vd.13) and cannot be synthesized by this probe. Preserve opt-in or frozen advertising with these explicit limits."),
+    ("v3", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
+    ("v4", "SSSE3", "Legacy XMM PABSB/PABSW/PABSD and MMX SSSE3 forms have no lift (xj-6vd.14). Preserved advertising does not promise these forms."),
+    ("v4", "CMPXCHG16B", "CMPXCHG16B has no lift. Preserve this opt-in v2-and-up preset bit; the corresponding instruction still traps."),
+    ("v4", "SSE4_1", "PACKUSDW, PMINSB, PMINUW, PMAXSB, PMAXUW and EXTRACTPS have no lift (xj-6vd.15). This opt-in preset does not guarantee complete SSE4.1 execution."),
+    ("v4", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
+    ("v4", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
+    ("v4", "F16C", "The VCVTPS2PH forms remain unlifted. Preserve the opt-in v3-and-up preset while reporting the conversion gap."),
+    ("v4", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
+    ("v4", "CX8", "CMPXCHG8B has no lift. Preserve the frozen default and inherited baseline; making CX8 a Feature now lets an embedder withhold it."),
+    ("v4", "CMOV", "Integer CMOV lifts, but iced also tags unlifted x87 FCMOV forms with this bit. Preserve the scalar baseline and report those forms."),
+    ("v4", "MMX", "MMX forms remain unlifted. Preserve the detection bit used by existing CPU detection; execution of those forms still traps."),
+    ("v4", "SSE", "Some scalar/vector square roots, reciprocal approximations and MMX conversions remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
+    ("v4", "SSE2", "Some square roots, conversions and MMX interop forms remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
+    ("v4", "AVX2", "Some YMM packing, shuffles, variable shifts and memory forms remain unlifted; VSIB gathers have no lift arm (xj-6vd.13) and cannot be synthesized by this probe. Preserve opt-in or frozen advertising with these explicit limits."),
+    ("v4", "AVX512F", "AVX-512 foundation is partial: permutation, rotate and conversion forms remain unlifted, and many ZMM probes exceed the templates. Preserve this opt-in v4 description."),
+    ("v4", "AVX512DQ", "AVX-512 DQ conversions remain partial, and mask/ZMM probes exceed the templates. Preserve this opt-in v4 description."),
+    ("v4", "AVX512CD", "Conflict detection and packed leading-zero forms remain partial; some mask/ZMM probes are unencodable. Preserve this opt-in v4 description."),
+    ("v4", "AVX512BW", "Wide packed and shuffle forms remain partial; mask/ZMM probes are unencodable. Preserve this opt-in v4 description."),
+    ("v4", "AVX512VL", "The checker sees incomplete short EVEX forms, including forms also tagged with other extensions; mask probes are partly unencodable. Preserve this opt-in v4 description."),
+    ("v4", "GFNI", "No encodable GFNI form fails the lift probe, but three ZMM EVEX forms are unencodable by the templates. Unknown coverage is explicit for opt-in v4."),
+    ("v4", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
 ]

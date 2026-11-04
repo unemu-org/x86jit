@@ -5925,29 +5925,8 @@ pub fn crc32c(mut crc: u32, src: u64, bytes: u8) -> u32 {
 /// a helper) so `cpuid` answers identically everywhere. Reads leaf in EAX, subleaf in ECX;
 /// writes EAX/EBX/ECX/EDX (32-bit, zero-extended).
 pub fn cpuid_run(cpu: &mut CpuState) {
-    // Feature bits are projected from the embedder-selected set, NOT hardcoded. The
-    // default set — SSE/SSE2/SSE3/SSSE3/POPCNT/MMX/XSAVE/OSXSAVE/AVX/AVX2 — is guarded by
-    // the compat test `cpuid_advertises_only_what_lifts` (advertise ⊆ lift). SSE4/BMI/
-    // AVX-512 stay off in that preset to keep it identical to the pre-`CpuFeatures`
-    // hardcoded set, not because none of them lift; `v2`/`v3`/`v4` raise it. A guest's
-    // CPUID-dispatched path jumps straight into an instruction after seeing its bit, so an
-    // embedder advertising past the lifter is a documented caller risk.
-    let f = cpu.features;
-    let leaf = cpu.gpr[RAX] as u32;
-    let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
-        // Max basic leaf + "GenuineIntel".
-        0x0 => (0x7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
-        // Family/model (EAX) + feature flags projected from `f`.
-        0x1 => (0x0003_06c3, 0, f.leaf1_ecx(), f.leaf1_edx()),
-        // Structured extended features (subleaf 0): AVX2 / BMI / AVX-512 / SHA in EBX,
-        // GFNI in ECX.
-        0x7 => (0, f.leaf7_ebx(), f.leaf7_ecx(), 0),
-        // Max extended leaf.
-        0x8000_0000 => (0x8000_0001, 0, 0, 0),
-        // Extended: SYSCALL (EDX 11) + Long Mode (EDX 29); LAHF/LZCNT in ECX.
-        0x8000_0001 => (0, 0, f.ext_leaf1_ecx(), (1 << 11) | (1 << 29)),
-        _ => (0, 0, 0, 0),
-    };
+    let regs = cpu.cpuid(cpu.gpr[RAX] as u32, cpu.gpr[RCX] as u32);
+    let crate::features::CpuidRegisters { eax, ebx, ecx, edx } = regs;
     cpu.write_gpr(RAX, eax as u64, 4);
     cpu.write_gpr(RBX, ebx as u64, 4);
     cpu.write_gpr(RCX, ecx as u64, 4);
@@ -6014,11 +5993,15 @@ pub fn bmi_result(a: u64, b: u64, size: u8, op: crate::ir::BmiOp) -> (u64, bool)
     }
 }
 
-/// Shared `xgetbv`: EDX:EAX = XCR0 for ECX=0, projected from the guest feature set.
+/// Shared `xgetbv`: EDX:EAX = XCR0 for ECX=0, from the per-vCPU override or preset.
 /// Called by both backends so they answer identically.
 pub fn xgetbv_run(cpu: &mut CpuState) {
-    cpu.write_gpr(RAX, cpu.features.xcr0(), 4);
-    cpu.write_gpr(RDX, 0, 4);
+    let xcr0 = cpu
+        .cpuid_overrides
+        .xcr0
+        .unwrap_or_else(|| cpu.features.xcr0());
+    cpu.write_gpr(RAX, xcr0, 4);
+    cpu.write_gpr(RDX, xcr0 >> 32, 4);
 }
 
 /// Divide the `size`-width `hi:lo` dividend by `divisor` (§16). Returns the

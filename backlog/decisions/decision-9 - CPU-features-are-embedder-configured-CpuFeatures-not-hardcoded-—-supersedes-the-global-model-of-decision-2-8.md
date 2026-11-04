@@ -4,8 +4,10 @@ title: >-
   CPU features are embedder-configured (CpuFeatures), not hardcoded — supersedes
   the global model of decision-2/8
 date: '2026-07-08 19:17'
-status: accepted
+status: accepted — amended by decision-11
 ---
+
+Amended by [decision-11](decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md).
 
 **Deciders:** Mikołaj Mikołajczyk
 

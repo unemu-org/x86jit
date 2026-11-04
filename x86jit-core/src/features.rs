@@ -1,14 +1,164 @@
-//! Guest CPU feature set. The embedder chooses which ISA extensions the
-//! guest sees; `cpuid_run` and `xgetbv` project this into CPUID leaves / XCR0 instead
-//! of hardcoding a single global set. This turns "advertise AVX-512" from a risky
-//! all-or-nothing decision into a per-run parameter, and is the correct library shape:
-//! the embedder declares the guest CPU (like `qemu -cpu`), not us.
+//! Guest CPU descriptions: feature presets or complete CPUID tables. The embedder
+//! selects the ISA and identity. [`CpuidOverrides`] carries logical-processor and
+//! runtime fields, including an optional XCR0 value for XGETBV(0).
 //!
-//! **Advertise ⊆ lift.** Advertising a feature the lifter can't execute is a live trap
-//! (a CPUID-dispatched guest jumps straight into the instruction). The
-//! [`GuestCpuFeatures::default`] set is guarded by the compat tests
-//! (`cpuid_advertises_only_what_lifts`). An embedder selecting a richer preset than the
-//! lifter covers is a documented caller risk — a guest trap is a legal `Exit`, not a bug.
+//! Advertising does not guarantee lift coverage. The compat checker probes
+//! advertised instruction features for every preset, with reasoned per-preset
+//! waivers for existing gaps (including CX8 and XSAVE). Embedders can run the same
+//! checker against a table; unsupported guest instructions still return an `Exit`.
+
+/// Registers returned by CPUID, in architectural EAX/EBX/ECX/EDX order
+/// (SDM Vol 2A, CPUID, "Description").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CpuidRegisters {
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}
+
+impl CpuidRegisters {
+    pub const ZERO: Self = Self::new(0, 0, 0, 0);
+
+    pub const fn new(eax: u32, ebx: u32, ecx: u32, edx: u32) -> Self {
+        Self { eax, ebx, ecx, edx }
+    }
+}
+
+/// Whether input ECX selects a subleaf. Leaf 1 ignores it; leaf 7 uses it
+/// (SDM Vol 1 Tables 21-5 and 21-17). The table supplies the policy for each leaf.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CpuidLeaf {
+    Constant(CpuidRegisters),
+    Indexed {
+        subleaves: std::collections::BTreeMap<u32, CpuidRegisters>,
+        /// Reply for an unlisted subleaf; not inferred from subleaf zero's EAX.
+        invalid_subleaf: CpuidRegisters,
+    },
+}
+
+impl CpuidLeaf {
+    fn query(&self, subleaf: u32) -> (u32, CpuidRegisters) {
+        match self {
+            Self::Constant(regs) => (0, *regs),
+            Self::Indexed {
+                subleaves,
+                invalid_subleaf,
+            } => (
+                subleaf,
+                subleaves.get(&subleaf).copied().unwrap_or(*invalid_subleaf),
+            ),
+        }
+    }
+}
+
+/// Reply outside the ranges enumerated by leaf 0 EAX and 0x8000_0000 EAX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CpuidOutOfRange {
+    /// An embedder-selected reply, including zero for a profile that requires it.
+    Fixed(CpuidRegisters),
+    /// SDM Vol 1 §21.1.3 specifies the highest-basic-leaf redirect. Retaining
+    /// input ECX is an engine choice; Vol 2A CPUID, Operation calls outputs
+    /// for invalid leaves "Reserved".
+    HighestBasicLeaf,
+}
+
+/// A complete, comparable CPU description. It replaces the feature projection;
+/// unlisted leaves never fall through to [`GuestCpuFeatures`]. The embedder owns
+/// consistency between feature bits, maxima, subleaf lists, and instruction support.
+/// All fields are data so an embedder can serialize them or include them in a cache key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CpuidTable {
+    pub leaves: std::collections::BTreeMap<u32, CpuidLeaf>,
+    /// Reply for an unlisted leaf inside the enumerated ranges.
+    pub missing_leaf: CpuidRegisters,
+    pub out_of_range: CpuidOutOfRange,
+}
+
+impl CpuidTable {
+    pub fn new(out_of_range: CpuidOutOfRange) -> Self {
+        Self {
+            leaves: std::collections::BTreeMap::new(),
+            missing_leaf: CpuidRegisters::ZERO,
+            out_of_range,
+        }
+    }
+
+    pub fn query(&self, leaf: u32, subleaf: u32) -> CpuidRegisters {
+        self.resolve(leaf, subleaf).2
+    }
+
+    pub(crate) fn resolve(&self, leaf: u32, subleaf: u32) -> (u32, u32, CpuidRegisters) {
+        let max = |header| {
+            self.leaves
+                .get(&header)
+                .map(|l| l.query(0).1.eax)
+                .unwrap_or(0)
+        };
+        let max_basic = max(0);
+        let max_extended = max(0x8000_0000);
+        // Software-defined leaves occupy a separate range (SDM Vol 1 §21.1.3).
+        let software_leaf =
+            (0x4000_0000..=0x4fff_ffff).contains(&leaf) && self.leaves.contains_key(&leaf);
+        let leaf = if software_leaf
+            || leaf <= max_basic
+            || (leaf >= 0x8000_0000 && leaf <= max_extended)
+        {
+            leaf
+        } else {
+            match self.out_of_range {
+                CpuidOutOfRange::Fixed(regs) => return (leaf, subleaf, regs),
+                CpuidOutOfRange::HighestBasicLeaf => max_basic,
+            }
+        };
+        match self.leaves.get(&leaf) {
+            Some(entry) => {
+                let (subleaf, regs) = entry.query(subleaf);
+                (leaf, subleaf, regs)
+            }
+            None => (leaf, subleaf, self.missing_leaf),
+        }
+    }
+}
+
+/// Replace only masked bits: `(base & !mask) | (value & mask)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CpuidOverride {
+    pub mask: CpuidRegisters,
+    pub value: CpuidRegisters,
+}
+
+/// Per-vCPU data applied after CPUID lookup. Keys use the resolved leaf and subleaf
+/// (zero for a leaf that ignores ECX), including highest-basic-leaf redirection.
+/// Initial APIC ID (leaf 1 EBX[31:24]) and x2APIC ID (0xB/0x1F EDX) belong here:
+/// SDM Vol 1 §21.1.4, Tables 21-8, 21-31 and 21-70.
+/// The embedder must maintain runtime fields through overrides: OSXSAVE, leaf
+/// 0xD sizes, 07H ECX[4] OSPKE and 19H EBX[0] AESKLE (SDM Vol 1 §21.1.5,
+/// Table 21-1), plus 80000001H EDX[11] SYSCALL (Table 21-90), when applicable
+/// to its modeled mode and control state. XCR0 can be overridden alongside them.
+/// The embedder updates these values when its modeled runtime state changes;
+/// the core does not emulate CR4/XSETBV transitions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CpuidOverrides {
+    pub leaves: std::collections::BTreeMap<(u32, u32), CpuidOverride>,
+    /// Value returned by XGETBV(0); `None` keeps the feature preset's projection.
+    pub xcr0: Option<u64>,
+}
+
+impl CpuidOverrides {
+    pub(crate) fn apply(&self, leaf: u32, subleaf: u32, base: CpuidRegisters) -> CpuidRegisters {
+        let Some(over) = self.leaves.get(&(leaf, subleaf)) else {
+            return base;
+        };
+        let merge = |base: u32, mask: u32, value: u32| (base & !mask) | (value & mask);
+        CpuidRegisters::new(
+            merge(base.eax, over.mask.eax, over.value.eax),
+            merge(base.ebx, over.mask.ebx, over.value.ebx),
+            merge(base.ecx, over.mask.ecx, over.value.ecx),
+            merge(base.edx, over.mask.edx, over.value.edx),
+        )
+    }
+}
 
 /// A single guest CPU feature bit. The discriminant is the internal bit index within
 /// [`GuestCpuFeatures`]; the CPUID leaf position is assigned by the projection methods.
@@ -47,11 +197,17 @@ pub enum Feature {
     // Crypto ISA extensions. Orthogonal to the v-levels but ubiquitous on
     // real v2+ (AES/PCLMUL) and v4-era (SHA/GFNI) hardware. Only the 128-bit forms are
     // lifted — the wide VAES/VPCLMULQDQ (leaf7 ECX bits 9/10) stay unadvertised so guests
-    // pick the AES-NI/PCLMULQDQ path, keeping "advertise ⊆ lift".
+    // pick the AES-NI/PCLMULQDQ path.
     Aes,
     Pclmul,
     Sha,
     Gfni,
+    Sse4a,
+    Adx,
+    Rdrand,
+    Rdseed,
+    Rdtscp,
+    Cx8,
 }
 
 impl Feature {
@@ -98,7 +254,7 @@ impl GuestCpuFeatures {
     /// derivation mis-fires without it), so every preset
     /// carries it even though no MMX instruction is lifted.
     pub const fn baseline() -> Self {
-        Self::from_slice(&[Feature::Mmx, Feature::Sse, Feature::Sse2])
+        Self::from_slice(&[Feature::Mmx, Feature::Sse, Feature::Sse2, Feature::Cx8])
     }
 
     /// x86-64-v2: baseline + SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CMPXCHG16B/MOVBE, plus the
@@ -149,7 +305,8 @@ impl GuestCpuFeatures {
     }
 
     /// The set x86jit advertises by default: SSE, SSE2, SSE3, SSSE3, POPCNT, MMX, XSAVE,
-    /// OSXSAVE, AVX, AVX2 — chosen so the lifter fully executes every IFUNC-selected path.
+    /// OSXSAVE, AVX, AVX2 and CX8. Several advertised instruction families remain
+    /// incomplete; see the per-preset compat waivers.
     ///
     /// SSE4, BMI and AVX-512 stay off here even though much of each now lifts: this preset
     /// is frozen at what was hardcoded before the feature set became embedder-selected, so
@@ -171,6 +328,7 @@ impl GuestCpuFeatures {
             Feature::Osxsave,
             Feature::Avx,
             Feature::Avx2,
+            Feature::Cx8,
         ])
     }
 
@@ -217,17 +375,18 @@ impl GuestCpuFeatures {
             | self.if_has(Feature::Osxsave, 27)
             | self.if_has(Feature::Avx, 28)
             | self.if_has(Feature::F16c, 29)
+            | self.if_has(Feature::Rdrand, 30)
     }
 
-    /// CPUID leaf 1 EDX. The always-on scalar baseline (FPU/TSC/CX8/CMOV/FXSR) plus the
-    /// SSE/SSE2/MMX feature bits.
+    /// CPUID leaf 1 EDX. The always-on scalar baseline (FPU/TSC/CMOV/FXSR) plus the
+    /// SSE/SSE2/MMX/CX8 feature bits.
     pub fn leaf1_edx(self) -> u32 {
         const BASELINE: u32 = (1 << 0)   // FPU
             | (1 << 4)   // TSC
-            | (1 << 8)   // CX8 (cmpxchg8b)
             | (1 << 15)  // CMOV
             | (1 << 24); // FXSR
         BASELINE
+            | self.if_has(Feature::Cx8, 8)
             | self.if_has(Feature::Mmx, 23)
             | self.if_has(Feature::Sse, 25)
             | self.if_has(Feature::Sse2, 26)
@@ -240,6 +399,8 @@ impl GuestCpuFeatures {
             | self.if_has(Feature::Bmi2, 8)
             | self.if_has(Feature::Avx512f, 16)
             | self.if_has(Feature::Avx512dq, 17)
+            | self.if_has(Feature::Rdseed, 18)
+            | self.if_has(Feature::Adx, 19)
             | self.if_has(Feature::Sha, 29)
             | self.if_has(Feature::Avx512cd, 28)
             | self.if_has(Feature::Avx512bw, 30)
@@ -254,7 +415,30 @@ impl GuestCpuFeatures {
 
     /// CPUID extended leaf 0x8000_0001 ECX (LZCNT/ABM). LAHF (bit 0) always on.
     pub fn ext_leaf1_ecx(self) -> u32 {
-        (1 << 0) | self.if_has(Feature::Lzcnt, 5)
+        (1 << 0) | self.if_has(Feature::Lzcnt, 5) | self.if_has(Feature::Sse4a, 6)
+    }
+
+    /// Extended feature flags: SDM Vol 1 Table 21-90 (RDTSCP at EDX[27],
+    /// SYSCALL at EDX[11], Intel 64 at EDX[29]). The frozen feature projection
+    /// sets SYSCALL in every mode, deviating from Table 21-90: Intel reports
+    /// zero outside 64-bit mode. Embedders model that transition with overrides.
+    pub fn ext_leaf1_edx(self) -> u32 {
+        (1 << 11) | (1 << 29) | self.if_has(Feature::Rdtscp, 27)
+    }
+
+    /// Legacy feature projection. SDM Vol 1 Tables 21-4/6, 21-9/10, 21-17/19/20;
+    /// AMD APM Vol 3 §E.4.1–E.4.2 for extended leaves.
+    /// Unlisted leaves return zero, deliberately deviating from the highest-basic-
+    /// leaf rule in SDM Vol 1 §21.1.3 to preserve the frozen default profile.
+    pub fn cpuid(self, leaf: u32, subleaf: u32) -> CpuidRegisters {
+        match leaf {
+            0 => CpuidRegisters::new(7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+            1 => CpuidRegisters::new(0x0003_06c3, 0, self.leaf1_ecx(), self.leaf1_edx()),
+            7 if subleaf == 0 => CpuidRegisters::new(0, self.leaf7_ebx(), self.leaf7_ecx(), 0),
+            0x8000_0000 => CpuidRegisters::new(0x8000_0001, 0, 0, 0),
+            0x8000_0001 => CpuidRegisters::new(0, 0, self.ext_leaf1_ecx(), self.ext_leaf1_edx()),
+            _ => CpuidRegisters::ZERO,
+        }
     }
 
     /// XCR0 value returned by `xgetbv` (ECX=0). x87|SSE always; +AVX (bit 2) when AVX is
@@ -285,9 +469,9 @@ mod tests {
 
     /// **Witness test** for every CPUID feature-bit position this file encodes.
     ///
-    /// Source: Intel SDM Vol 2A, `CPUID—CPU Identification` — Table 3-10 (leaf 1 ECX),
-    /// Table 3-11 (leaf 1 EDX), Table 3-8 (leaf 7 subleaf 0 EBX/ECX); and AMD64 APM Vol 3,
-    /// `CPUID` (extended leaf `8000_0001` ECX), which is where `LZCNT`/`ABM` is defined —
+    /// Source: Intel SDM Vol 1 Tables 21-9 (leaf 1 ECX), 21-10 (leaf 1 EDX),
+    /// 21-19/21-20 (leaf 7 subleaf 0 EBX/ECX); and AMD64 APM Vol 3 Appendix E
+    /// §E.4.2 (extended leaf `8000_0001` ECX/EDX), which is where `LZCNT`/`ABM` is defined —
     /// Intel documents the same bit as `LZCNT` under leaf `8000_0001` ECX bit 5.
     /// `oracles/intel/sdm.pdf`, `oracles/intel/amd64-apm.pdf`.
     ///
@@ -317,6 +501,7 @@ mod tests {
             (Feature::Osxsave, 27),
             (Feature::Avx, 28),
             (Feature::F16c, 29),
+            (Feature::Rdrand, 30),
         ];
         for &(f, bit) in leaf1_ecx {
             let got = GuestCpuFeatures::empty().with(f).leaf1_ecx();
@@ -327,16 +512,16 @@ mod tests {
         // assertion is against the baseline rather than against zero.
         const EDX_BASELINE: u32 = (1 << 0)    // FPU
             | (1 << 4)                        // TSC
-            | (1 << 8)                        // CX8
             | (1 << 15)                       // CMOV
             | (1 << 24); // FXSR
         assert_eq!(
             GuestCpuFeatures::empty().leaf1_edx(),
             EDX_BASELINE,
-            "leaf 1 EDX baseline (FPU/TSC/CX8/CMOV/FXSR) — SDM Vol 2A Table 3-11"
+            "leaf 1 EDX baseline (FPU/TSC/CMOV/FXSR) — SDM Vol 1 Table 21-10"
         );
         for &(f, bit) in &[
-            (Feature::Mmx, 23u32),
+            (Feature::Cx8, 8u32),
+            (Feature::Mmx, 23),
             (Feature::Sse, 25),
             (Feature::Sse2, 26),
         ] {
@@ -354,6 +539,8 @@ mod tests {
             (Feature::Bmi2, 8),
             (Feature::Avx512f, 16),
             (Feature::Avx512dq, 17),
+            (Feature::Rdseed, 18),
+            (Feature::Adx, 19),
             (Feature::Avx512cd, 28),
             (Feature::Sha, 29),
             (Feature::Avx512bw, 30),
@@ -362,6 +549,20 @@ mod tests {
             let got = GuestCpuFeatures::empty().with(f).leaf7_ebx();
             assert_eq!(got, 1 << bit, "leaf 7 EBX bit for {f:?}: got {got:#x}");
         }
+
+        // AMD APM Vol 3 §E.4.2, Fn8000_0001_ECX/EDX.
+        for (f, bit) in [(Feature::Lzcnt, 5), (Feature::Sse4a, 6)] {
+            assert_eq!(
+                GuestCpuFeatures::empty().with(f).ext_leaf1_ecx(),
+                1 | (1 << bit)
+            );
+        }
+        assert_eq!(
+            GuestCpuFeatures::empty()
+                .with(Feature::Rdtscp)
+                .ext_leaf1_edx(),
+            (1 << 11) | (1 << 27) | (1 << 29)
+        );
 
         // GFNI is bit 8. Bits 9 and 10 (VAES, VPCLMULQDQ — the *wide* forms) must stay
         // clear: only the 128-bit forms are lifted, so advertising the wide ones would

@@ -9,7 +9,7 @@
 //! templated operands, encode it, feed the bytes (plus a `ret` terminator) to
 //! `lift_block`, and classify Lifted / Unsupported / Unencodable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use iced_x86::{
     Code, CpuidFeature, Encoder, FlowControl, Instruction, OpCodeOperandKind, OpKind, Register,
@@ -129,6 +129,11 @@ pub fn probe_code(code: Code) -> Option<Probe> {
 /// 16-bit-operand forms exist only outside long mode). A 16-bit real-mode probe is
 /// this same function with a 16-bit `CpuMode`, once such a mode exists.
 pub fn probe_code_in(code: Code, mode: CpuMode) -> Option<Probe> {
+    code_gen(code)?; // Generation-map scope only; CPUID checks bypass this gate.
+    probe_instruction(code, mode)
+}
+
+fn probe_instruction(code: Code, mode: CpuMode) -> Option<Probe> {
     let info = code.op_code();
     let valid_in_mode = match mode {
         CpuMode::Long64 => info.mode64(),
@@ -138,7 +143,6 @@ pub fn probe_code_in(code: Code, mode: CpuMode) -> Option<Probe> {
     if !valid_in_mode || code == Code::INVALID {
         return None;
     }
-    code_gen(code)?; // scope gate
 
     // Probe the register form first, then — for a `Code` that also has a memory
     // alternative — the memory form. iced files both under one `Code`, so a probe that
@@ -609,58 +613,338 @@ fn render_reg_only(s: &mut String, mode: &str, map: &BTreeMap<String, GenCoverag
 
 // --- CPUID ⇄ coverage consistency ---
 
-/// The SIMD/legacy features leaf-1 CPUID currently advertises, read straight from
-/// `cpuid_run` (the single source both interp and JIT use). Baseline scalar bits
-/// (FPU/TSC/CX8/CMOV/FXSR) are not returned — they aren't gated feature paths a
-/// guest branches on into unimplemented SIMD.
-pub fn advertised_simd_features() -> Vec<CpuidFeature> {
-    use x86jit_core::state::CpuState;
-    let mut cpu = CpuState::new();
-    cpu.gpr[0] = 1; // leaf 1 in RAX
-    x86jit_core::interp::cpuid_run(&mut cpu);
-    let ecx = cpu.gpr[1] as u32; // RCX
-    let edx = cpu.gpr[2] as u32; // RDX
-    use CpuidFeature::*;
-    let mut v = Vec::new();
-    for (bit, feat) in [(23u32, MMX), (25, SSE), (26, SSE2)] {
-        if edx & (1 << bit) != 0 {
-            v.push(feat);
-        }
-    }
-    for (bit, feat) in [
-        (0u32, SSE3),
-        (9, SSSE3),
-        (19, SSE4_1),
-        (20, SSE4_2),
-        (23, POPCNT),
-    ] {
-        if ecx & (1 << bit) != 0 {
-            v.push(feat);
-        }
-    }
-    v
+/// One architectural instruction-feature bit advertised by a CPUID source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvertisedCpuidFeature {
+    pub leaf: u32,
+    pub subleaf: u32,
+    pub register: &'static str,
+    pub bit: u32,
+    pub feature: CpuidFeature,
 }
 
-/// Probe every in-scope Code tagged with `target` and report (lifted count, sorted
-/// missing Code names).
-pub fn feature_coverage(target: CpuidFeature) -> (u32, Vec<String>) {
-    let mut lifted = 0;
-    let mut missing = Vec::new();
-    for code in Code::values() {
-        if code_gen(code).is_none() {
-            continue;
+/// Incomplete coverage for one advertised bit. Unencodable probes are reported
+/// separately: they are unknown coverage, never silently treated as implemented.
+#[derive(Clone, Debug)]
+pub struct CpuidLiftGap {
+    pub advertised: AdvertisedCpuidFeature,
+    pub missing: Vec<Code>,
+    pub unencodable: Vec<Code>,
+}
+
+/// Check any CPUID source, including `|l, s| preset.cpuid(l, s)`,
+/// `|l, s| table.query(l, s)`, or `|l, s| cpu.cpuid(l, s)` with vCPU overrides.
+/// Uses iced's per-Code requirements directly, without generation buckets. Only
+/// long-mode forms available at CPL 3 are probed. Both register and memory forms
+/// must lift. A Code counts only when all of its requirements with known CPUID
+/// bits are advertised; iced's HLE_or_RTM and SKINIT_or_SVM remain alternatives.
+/// This checks lift coverage, not execution semantics or CPU consistency.
+pub fn cpuid_lift_gaps(
+    source: impl FnMut(u32, u32) -> x86jit_core::CpuidRegisters,
+) -> Vec<CpuidLiftGap> {
+    let advertised_features = advertised_instruction_features(source);
+    let known: HashSet<_> = advertised_instruction_features(|_, _| {
+        x86jit_core::CpuidRegisters::new(u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+    })
+    .into_iter()
+    .map(|f| f.feature)
+    .collect();
+    let enabled: HashSet<_> = advertised_features.iter().map(|f| f.feature).collect();
+    advertised_features
+        .into_iter()
+        .filter_map(|advertised| {
+            let mut missing = Vec::new();
+            let mut unencodable = Vec::new();
+            for code in Code::values() {
+                if !code.op_code().cpl3()
+                    || !code.cpuid_features().contains(&advertised.feature)
+                    || code
+                        .cpuid_features()
+                        .iter()
+                        .any(|f| known.contains(f) && !enabled.contains(f))
+                {
+                    continue;
+                }
+                match probe_instruction(code, CpuMode::Long64) {
+                    Some(Probe::Unsupported | Probe::LiftedRegOnly) => missing.push(code),
+                    Some(Probe::Unencodable) => unencodable.push(code),
+                    _ => {}
+                }
+            }
+            (!missing.is_empty() || !unencodable.is_empty()).then_some(CpuidLiftGap {
+                advertised,
+                missing,
+                unencodable,
+            })
+        })
+        .collect()
+}
+
+/// Instruction-feature bits understood by iced and enumerated by Intel/AMD CPUID.
+/// Bits for platform capabilities without instruction requirements are not lift
+/// claims. Old vendor-specific features absent from the cited Intel/AMD tables
+/// (for example Centaur and Cyrix leaves), and bits now reserved by those tables,
+/// are outside this checker's scope.
+pub fn advertised_instruction_features(
+    mut source: impl FnMut(u32, u32) -> x86jit_core::CpuidRegisters,
+) -> Vec<AdvertisedCpuidFeature> {
+    use CpuidFeature::*;
+    let max_basic = source(0, 0).eax;
+    let max_extended = source(0x8000_0000, 0).eax;
+    let mut out = Vec::new();
+    let mut add = |leaf, subleaf, register, bits: &[(u32, CpuidFeature)]| {
+        if (leaf < 0x8000_0000 && leaf > max_basic) || (leaf >= 0x8000_0000 && leaf > max_extended)
+        {
+            return;
         }
-        if !code.cpuid_features().contains(&target) {
-            continue;
+        if leaf == 7 && subleaf > source(7, 0).eax {
+            return;
         }
-        match probe_code(code) {
-            Some(Probe::Lifted) => lifted += 1,
-            Some(Probe::Unsupported) => missing.push(format!("{code:?}")),
-            _ => {}
+        let regs = source(leaf, subleaf);
+        let value = match register {
+            "eax" => regs.eax,
+            "ebx" => regs.ebx,
+            "ecx" => regs.ecx,
+            "edx" => regs.edx,
+            _ => unreachable!(),
+        };
+        for &(bit, feature) in bits {
+            if value & (1 << bit) != 0 {
+                out.push(AdvertisedCpuidFeature {
+                    leaf,
+                    subleaf,
+                    register,
+                    bit,
+                    feature,
+                });
+            }
         }
+    };
+    // SDM Vol 1 Tables 21-9 and 21-10.
+    add(
+        1,
+        0,
+        "ecx",
+        &[
+            (0, SSE3),
+            (1, PCLMULQDQ),
+            (3, MONITOR),
+            (5, VMX),
+            (6, SMX),
+            (9, SSSE3),
+            (12, FMA),
+            (13, CMPXCHG16B),
+            (19, SSE4_1),
+            (20, SSE4_2),
+            (22, MOVBE),
+            (23, POPCNT),
+            (25, AES),
+            (26, XSAVE),
+            (28, AVX),
+            (29, F16C),
+            (30, RDRAND),
+        ],
+    );
+    add(
+        1,
+        0,
+        "edx",
+        &[
+            (0, FPU),
+            (4, TSC),
+            (5, MSR),
+            (8, CX8),
+            (11, SEP),
+            (15, CMOV),
+            (19, CLFSH),
+            (23, MMX),
+            (24, FXSR),
+            (25, SSE),
+            (26, SSE2),
+        ],
+    );
+    // SDM Vol 1 Tables 21-19, 21-20 and 21-21.
+    add(
+        7,
+        0,
+        "ebx",
+        &[
+            (0, FSGSBASE),
+            (3, BMI1),
+            (4, HLE),
+            (5, AVX2),
+            (8, BMI2),
+            (10, INVPCID),
+            (11, RTM),
+            (14, MPX),
+            (16, AVX512F),
+            (17, AVX512DQ),
+            (18, RDSEED),
+            (19, ADX),
+            (20, SMAP),
+            (21, AVX512_IFMA),
+            (23, CLFLUSHOPT),
+            (24, CLWB),
+            (26, AVX512PF),
+            (27, AVX512ER),
+            (28, AVX512CD),
+            (29, SHA),
+            (30, AVX512BW),
+            (31, AVX512VL),
+        ],
+    );
+    add(
+        7,
+        0,
+        "ecx",
+        &[
+            (0, PREFETCHWT1),
+            (1, AVX512_VBMI),
+            (3, PKU),
+            (5, WAITPKG),
+            (6, AVX512_VBMI2),
+            (7, CET_SS),
+            (8, GFNI),
+            (9, VAES),
+            (10, VPCLMULQDQ),
+            (11, AVX512_VNNI),
+            (12, AVX512_BITALG),
+            (14, AVX512_VPOPCNTDQ),
+            (22, RDPID),
+            (23, KL),
+            (25, CLDEMOTE),
+            (27, MOVDIRI),
+            (28, MOVDIR64B),
+            (29, ENQCMD),
+        ],
+    );
+    add(
+        7,
+        0,
+        "edx",
+        &[
+            (2, AVX512_4VNNIW),
+            (3, AVX512_4FMAPS),
+            (5, UINTR),
+            (8, AVX512_VP2INTERSECT),
+            (14, SERIALIZE),
+            (16, TSXLDTRK),
+            (18, PCONFIG),
+            (20, CET_IBT),
+            (22, AMX_BF16),
+            (23, AVX512_FP16),
+            (24, AMX_TILE),
+            (25, AMX_INT8),
+        ],
+    );
+    // SDM Vol 1 Tables 21-22, 21-23 and 21-25.
+    add(
+        7,
+        1,
+        "eax",
+        &[
+            (0, SHA512),
+            (1, SM3),
+            (2, SM4),
+            (4, AVX_VNNI),
+            (5, AVX512_BF16),
+            (7, CMPCCXADD),
+            (17, FRED),
+            (18, LKGS),
+            (19, WRMSRNS),
+            (21, AMX_FP16),
+            (22, HRESET),
+            (23, AVX_IFMA),
+            (27, MSRLIST),
+        ],
+    );
+    add(7, 1, "ebx", &[(1, TSE)]);
+    add(
+        7,
+        1,
+        "edx",
+        &[
+            (4, AVX_VNNI_INT8),
+            (5, AVX_NE_CONVERT),
+            (8, AMX_COMPLEX),
+            (10, AVX_VNNI_INT16),
+            (14, PREFETCHITI),
+        ],
+    );
+    // SDM Vol 1 Tables 21-35, 21-47, 21-51 and 21-62.
+    add(0xd, 1, "eax", &[(0, XSAVEOPT), (1, XSAVEC), (3, XSAVES)]);
+    add(0x12, 0, "eax", &[(0, SGX1)]);
+    add(0x14, 0, "ebx", &[(4, PTWRITE)]);
+    add(0x19, 0, "ebx", &[(0, AESKLE), (2, WIDE_KL)]);
+    // AMD APM Vol 3 §E.4.2 (including duplicate standard-feature bits in EDX).
+    add(
+        0x8000_0001,
+        0,
+        "ecx",
+        &[
+            (2, SVM),
+            (5, LZCNT),
+            (6, SSE4A),
+            (8, PREFETCHW),
+            (11, XOP),
+            (12, SKINIT),
+            (15, LWP),
+            (16, FMA4),
+            (21, TBM),
+            (29, MONITORX),
+        ],
+    );
+    add(
+        0x8000_0001,
+        0,
+        "edx",
+        &[
+            (0, FPU),
+            (4, TSC),
+            (5, MSR),
+            (8, CX8),
+            (11, SYSCALL),
+            (15, CMOV),
+            (23, MMX),
+            (24, FXSR),
+            (27, RDTSCP),
+            (29, X64),
+            (30, D3NOWEXT),
+            (31, D3NOW),
+        ],
+    );
+    // AMD APM Vol 3 §E.4.7, Fn8000_0008_EBX.
+    add(
+        0x8000_0008,
+        0,
+        "ebx",
+        &[
+            (0, CLZERO),
+            (3, INVLPGB),
+            (4, RDPRU),
+            (8, MCOMMIT),
+            (9, WBNOINVD),
+        ],
+    );
+    // iced uses disjunctive requirements for these instruction groups.
+    let hle_rtm = out.iter().find(|f| matches!(f.feature, HLE | RTM)).copied();
+    if let Some(bit) = hle_rtm {
+        out.push(AdvertisedCpuidFeature {
+            feature: HLE_or_RTM,
+            ..bit
+        });
     }
-    missing.sort();
-    (lifted, missing)
+    let skinit_svm = out
+        .iter()
+        .find(|f| matches!(f.feature, SKINIT | SVM))
+        .copied();
+    if let Some(bit) = skinit_svm {
+        out.push(AdvertisedCpuidFeature {
+            feature: SKINIT_or_SVM,
+            ..bit
+        });
+    }
+    out
 }
 
 /// Path to the checked-in CPUID waiver file (features advertised but not yet fully
@@ -671,10 +955,10 @@ pub fn cpuid_waiver_path() -> std::path::PathBuf {
         .join("cpuid-waivers.ron")
 }
 
-/// Load the waiver set: feature names that may be advertised despite partial lift
-/// coverage. Panics on a malformed file (a broken waiver list must not silently
+/// Load (preset, feature, reason) waivers for partial or unknown lift coverage.
+/// Panics on a malformed file (a broken waiver list must not silently
 /// pass the consistency test).
-pub fn cpuid_waivers() -> Vec<(String, String)> {
+pub fn cpuid_waivers() -> Vec<(String, String, String)> {
     let text = std::fs::read_to_string(cpuid_waiver_path()).expect("read cpuid-waivers.ron");
     ron::from_str(&text).expect("parse cpuid-waivers.ron")
 }
