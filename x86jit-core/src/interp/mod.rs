@@ -182,9 +182,11 @@ fn walk_ops<const RETRY: bool>(
     exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> StepResult {
     let mut bracket = crate::lockstep::begin();
+    let mut entry_flags = cpu.flags;
     for op in &ir.ops {
         match op {
             IrOp::InsnStart { guest_addr } => {
+                entry_flags = cpu.flags;
                 if RETRY && cpu.mmio_retry_active && (*started || !cpu.owns_mmio_retry(*guest_addr))
                 {
                     cpu.clear_mmio_parts();
@@ -429,9 +431,15 @@ fn walk_ops<const RETRY: bool>(
             IrOp::Store {
                 addr, src, size, ..
             } => {
+                // SDM Vol 3A §5.6 permits reads from write-protected pages;
+                // §7.5 restores pre-instruction state on faults. Expose entry
+                // flags during the write, including a host fault inside mem.write.
+                let result = cpu.flags;
+                cpu.flags = entry_flags;
                 if let Some(r) = exec_store(cpu, mem, temps, *cur_addr, addr, src, size) {
                     return r;
                 }
+                cpu.flags = result;
             }
             IrOp::AtomicRmw {
                 old,

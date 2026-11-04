@@ -53,10 +53,33 @@ unchanged; the flat `base + addr` translation stays. Delivered doc-7 (unemulinux
   recovered `Exit` is resumable on the faulting instruction — identical to the
   interpreter, single-block and region.
 
-The correct semantics is the interpreter's; the JIT now matches it for every
-host-backed span. Precision recorded: `addr`/`access`/`RIP` exact; GPRs exact in
-single-block mode, may be stale in region mode (full-register precision at an async
-fault needs deopt metadata — out until task-31 (unemulinux) builds a guest signal frame).
+SDM Vol 3A §5.6 defines access rights; §7.5 defines the instruction-entry state
+exposed at a fault.
+**Precision recorded (amended 2026-11-04):** `addr`/`access`/`RIP`
+and all 16 GPRs are exact at inline guest-access host faults in both single-block
+and region mode. Regions synchronize GPR Variables before each fault-capable guest
+access; compile-time dirty analysis over the full CFG removes stores for registers
+clean on every incoming path, including loop back-edges. Single-block GPRs remain
+write-through. Both JIT modes materialize deferred arithmetic flags before these
+accesses using the cold-exit recovery recipes. Within a memory RMW instruction,
+result flag stores and new recovery recipes remain pending until its final store
+succeeds; a write-only fault therefore exposes instruction-entry RFLAGS even when
+the preceding load succeeded. The interpreter follows the same commit rule.
+Compile-time dirty analysis also removes flag recovery stores already materialized
+on every incoming path, preserving cold-exit recovery and conditional paths. Eager
+materialization remains necessary until fault recovery can reconstruct deferred flags.
+This supersedes the previously recorded region-GPR staleness. The fork-isolated
+`region_guard_fault_recovers_gprs_and_flags` test in
+`x86jit-tests/tests/region_fault_state.rs` compares actual host faults with
+interpreter instruction state across loops, joins, scalar accesses, locked RMWs
+and split vector transfers. The `write_fault_*` tests in
+`x86jit-tests/tests/region_fault_state.rs` also compare
+readable-but-host-write-protected RMW faults with interpreter snapshots taken before
+the instruction, in the interpreter and both JIT modes. This guarantee concerns
+synchronous guest-access faults.
+`x86jit-cranelift/src/codegen/trap_tests.rs` pins removal of repeated recovery stores
+in single-block and region modes, including immediate shifts and double shifts.
+Arbitrary host-PC asynchronous snapshots still need a separate contract.
 
 ## Consequences
 

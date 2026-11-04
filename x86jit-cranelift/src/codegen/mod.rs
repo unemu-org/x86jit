@@ -4,6 +4,7 @@
 //! agree bit-for-bit (the M4 acceptance oracle).
 
 mod control;
+mod gpr_sync;
 mod integer;
 mod memory;
 mod vector;
@@ -283,6 +284,7 @@ pub fn translate_block(
         consistency,
         gpr_cache: [None; 16],
         gpr_vars: None,
+        gpr_sync: gpr_sync::GprSync::default(),
         fuel_var: None,
         dispatch_word: None,
         mmio,
@@ -292,6 +294,8 @@ pub fn translate_block(
         guest_rips: Vec::new(),
         full_flag_mask: FlagMask::NONE,
         pending_flags: [None; 6],
+        instruction_flags: None,
+        recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
     };
@@ -304,11 +308,13 @@ pub fn translate_block(
     let mut terminated = false;
     let mut narrowed = ir.ops.clone();
     let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
-    for (original, op) in masks.into_iter().zip(&narrowed) {
+    for (index, (original, op)) in masks.into_iter().zip(&narrowed).enumerate() {
+        t.prepare_instruction_flags(&narrowed[index..], index == 0);
         if t.op_with_flags(original, op) {
             terminated = true;
             break;
         }
+        t.finish_instruction_access(op);
     }
     if !terminated {
         // Straight-line block with no control-flow terminator: flow on past it.
@@ -318,19 +324,18 @@ pub fn translate_block(
     }
     t.emit_exit_tails();
     t.builder.seal_all_blocks();
+    t.gpr_sync.remove_clean_stores(t.builder.func);
     t.guest_rips.into_boxed_slice()
 }
 
 /// Translate a **superblock region** (§12 M5-T3) into one function: its sub-blocks
 /// each become one Cranelift block, wired by the guest control flow. Static
-/// forward/merge edges (an unconditional jump, or a conditional branch arm, to a
-/// block later in reverse-post-order) become internal Cranelift `jump`/`brif`;
-/// back-edges (loops) and edges leaving the region become chain/link exits — so a
-/// loop still returns to the dispatcher each iteration (proper loop bodies arrive
-/// in T3d). Each block starts with a fuel gate that charges one guest block and
+/// edges, including loop back-edges, become internal Cranelift `jump`/`brif`;
+/// edges leaving the region become chain/link exits. Each block starts with a
+/// fuel gate that charges one guest block and
 /// exits when the budget is spent, keeping the block count exact for §9.2 / the
-/// `Blocks(n)` oracle. Registers/flags stay write-through, so `CpuState` is current
-/// at every gate exit and every trap — no register flush yet (that is T3e).
+/// `Blocks(n)` oracle. GPRs are carried in SSA Variables and dirty values are
+/// synchronized before guest accesses, helper calls and exits.
 #[allow(clippy::too_many_arguments)]
 pub fn translate_region(
     builder: &mut FunctionBuilder,
@@ -369,6 +374,7 @@ pub fn translate_region(
         consistency,
         gpr_cache: [None; 16],
         gpr_vars: None,
+        gpr_sync: gpr_sync::GprSync::default(),
         fuel_var: None,
         dispatch_word: None,
         mmio,
@@ -378,6 +384,8 @@ pub fn translate_region(
         guest_rips: Vec::new(),
         full_flag_mask: FlagMask::NONE,
         pending_flags: [None; 6],
+        instruction_flags: None,
+        recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
     };
@@ -432,6 +440,7 @@ pub fn translate_region(
 
     t.emit_exit_tails();
     t.builder.seal_all_blocks();
+    t.gpr_sync.remove_clean_stores(t.builder.func);
     t.guest_rips.into_boxed_slice()
 }
 
@@ -483,6 +492,14 @@ struct ExitTail {
     flush_entry: Option<Block>,
 }
 
+struct InstructionFlags {
+    vars: [Variable; 6],
+    stores_left: usize,
+    written: u8,
+    stored: u8,
+    pending: [Option<FlagRecipe>; 6],
+}
+
 struct Translator<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     offsets: &'a CpuOffsets,
@@ -509,10 +526,13 @@ struct Translator<'a, 'b> {
     /// Region mode (§12 M5-T3e): the 16 GPRs are carried as Cranelift `Variable`s,
     /// so reads/writes stay in host registers across the whole region (loop bodies
     /// especially) instead of round-tripping through `CpuState`. Loaded once at
-    /// region entry and **flushed** to `CpuState` at every exit/trap (`ret`), so the
-    /// dispatcher and helpers always see current state. `None` in single-block mode,
+    /// region entry and flushed before guest accesses, helpers and exits, so
+    /// host faults also expose exact GPRs. `None` in single-block mode,
     /// where writes are write-through instead.
+    /// Cranelift 0.115.1, cranelift-frontend/src/frontend.rs: def_var/use_var
+    /// define/read the current SSA value at the builder position.
     gpr_vars: Option<[Variable; 16]>,
+    gpr_sync: gpr_sync::GprSync,
     /// Region mode: `MemCtx.fuel` carried as a Variable so the per-block gate is a
     /// register decrement, not a load+store. Loaded at entry, flushed at every exit
     /// (in `ret`, next to the GPRs). `None` in single-block mode.
@@ -546,6 +566,11 @@ struct Translator<'a, 'b> {
     /// Latest omitted writer per flag (CF, PF, AF, ZF, SF, OF). Its SSA inputs
     /// dominate every subsequent cold exit in this guest block.
     pending_flags: [Option<FlagRecipe>; 6],
+    /// SDM Vol 3A §5.6 permits reads from write-protected pages; §7.5
+    /// restores pre-instruction state on faults. Commit RMW flags after its store.
+    /// SSA Variables also carry unchanged flags through conditional shift paths.
+    instruction_flags: Option<InstructionFlags>,
+    recovering_flags: bool,
     flag_recipe: Option<FlagRecipe>,
     /// One cold recovery tail per pending recipe epoch. Helpers enter after the
     /// optional region-register flush, preserving their authoritative CpuState.
@@ -553,6 +578,87 @@ struct Translator<'a, 'b> {
 }
 
 impl Translator<'_, '_> {
+    fn prepare_instruction_flags(&mut self, ops: &[IrOp], first: bool) {
+        let boundary = matches!(ops.first(), Some(IrOp::InsnStart { .. }));
+        if !first && !boundary {
+            return;
+        }
+        let body = &ops[usize::from(boundary)..];
+        let end = body
+            .iter()
+            .position(|op| matches!(op, IrOp::InsnStart { .. }))
+            .unwrap_or(body.len());
+        let instruction = &body[..end];
+        let stores_left = instruction
+            .iter()
+            .filter(|op| matches!(op, IrOp::Store { .. }))
+            .count();
+        if stores_left == 0 {
+            return;
+        }
+        self.recover_flags();
+        let conditional = instruction.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Shl { set_flags, .. }
+                    | IrOp::Shr { set_flags, .. }
+                    | IrOp::Sar { set_flags, .. }
+                    | IrOp::Rol { set_flags, .. }
+                    | IrOp::Ror { set_flags, .. }
+                    | IrOp::Rcl { set_flags, .. }
+                    | IrOp::Rcr { set_flags, .. }
+                    | IrOp::DoubleShift { set_flags, .. } if !set_flags.is_none()
+            )
+        });
+        let mut vars = [Variable::new(0); 6];
+        for (i, off) in self.flag_offsets().into_iter().enumerate() {
+            let var = Variable::new(17 + self.guest_rips.len() * 6 + i);
+            self.builder.declare_var(var, types::I8);
+            if conditional {
+                let old = self.load_flag(off);
+                self.builder.def_var(var, old);
+            }
+            vars[i] = var;
+        }
+        self.instruction_flags = Some(InstructionFlags {
+            vars,
+            stores_left,
+            written: 0,
+            stored: 0,
+            pending: [None; 6],
+        });
+    }
+
+    fn finish_instruction_access(&mut self, op: &IrOp) {
+        if matches!(op, IrOp::Store { .. }) {
+            if let Some(flags) = &mut self.instruction_flags {
+                flags.stores_left -= 1;
+                if flags.stores_left == 0 {
+                    self.commit_instruction_flags();
+                }
+            }
+        }
+    }
+
+    fn commit_instruction_flags(&mut self) {
+        let Some(flags) = self.instruction_flags.take() else {
+            return;
+        };
+        for (i, off) in self.flag_offsets().into_iter().enumerate() {
+            if flags.written & (1 << i) == 0 {
+                continue;
+            }
+            if flags.stored & (1 << i) != 0 {
+                let value = self.builder.use_var(flags.vars[i]);
+                self.store_flag(off, value);
+            } else {
+                self.pending_flags[i] = flags.pending[i];
+                self.gpr_sync
+                    .write(self.builder.current_block().unwrap(), 16 + i);
+            }
+        }
+    }
+
     fn op_with_flags(&mut self, original: FlagMask, narrowed: &IrOp) -> bool {
         self.full_flag_mask = original;
         self.op(narrowed)
@@ -570,8 +676,8 @@ impl Translator<'_, '_> {
     }
 
     /// SDM Vol 3A §7.5: a fault restores the state preceding the faulting
-    /// instruction (also AMD APM Vol 2 §8.1.3). Emit recovery stores only on exits;
-    /// do not change the recipes carried along the successful translation path.
+    /// instruction (also AMD APM Vol 2 §8.1.3). Keep the recipe epoch for cold
+    /// exits; CFG dirty analysis removes repeated stores on materialized paths.
     fn recover_flags(&mut self) {
         if self.pending_flags.iter().all(Option::is_none) {
             return;
@@ -579,6 +685,7 @@ impl Translator<'_, '_> {
         let pending = self.pending_flags;
         let full_mask = self.full_flag_mask;
         let recipe = self.flag_recipe;
+        self.recovering_flags = true;
         self.full_flag_mask = FlagMask::NONE;
         let scratch = self.temps.len() as u32;
         self.temps.extend([None; 2]);
@@ -632,6 +739,7 @@ impl Translator<'_, '_> {
         self.full_flag_mask = full_mask;
         self.pending_flags = pending;
         self.flag_recipe = recipe;
+        self.recovering_flags = false;
     }
 
     /// Translate one op; return `true` if it terminated the block.
@@ -2138,12 +2246,19 @@ impl Translator<'_, '_> {
             return;
         }
 
-        let cont = self.builder.create_block();
-        let doflags = self.builder.create_block();
-        let iszero = self.builder.ins().icmp_imm(IntCC::Equal, cnt, 0);
-        self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
-        self.builder.seal_block(doflags);
-        self.builder.switch_to_block(doflags);
+        // lift::shift_flags_may_skip permits recipes only for an immediate
+        // count that masks to nonzero. Recovery therefore always writes flags.
+        let cont = if self.recovering_flags {
+            None
+        } else {
+            let cont = self.builder.create_block();
+            let doflags = self.builder.create_block();
+            let iszero = self.builder.ins().icmp_imm(IntCC::Equal, cnt, 0);
+            self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
+            self.builder.seal_block(doflags);
+            self.builder.switch_to_block(doflags);
+            Some(cont)
+        };
         let zero8 = self.builder.ins().iconst(types::I8, 0);
         let (cf, of) = match kind {
             ShiftKind::Shl => {
@@ -2206,9 +2321,11 @@ impl Translator<'_, '_> {
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf, pf_src, zero8, zf, sf, of);
 
-        self.builder.ins().jump(cont, &[]);
-        self.builder.seal_block(cont);
-        self.builder.switch_to_block(cont);
+        if let Some(cont) = cont {
+            self.builder.ins().jump(cont, &[]);
+            self.builder.seal_block(cont);
+            self.builder.switch_to_block(cont);
+        }
     }
 
     /// `RCL`/`RCR` — rotate-through-carry (mirrors interp `rcl`/`rcr`). A bit-serial
@@ -2375,11 +2492,17 @@ impl Translator<'_, '_> {
             return;
         }
 
-        let cont = self.builder.create_block();
-        let doflags = self.builder.create_block();
-        self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
-        self.builder.seal_block(doflags);
-        self.builder.switch_to_block(doflags);
+        // As with emit_shift, a recovery recipe has a nonzero immediate count.
+        let cont = if self.recovering_flags {
+            None
+        } else {
+            let cont = self.builder.create_block();
+            let doflags = self.builder.create_block();
+            self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
+            self.builder.seal_block(doflags);
+            self.builder.switch_to_block(doflags);
+            Some(cont)
+        };
         let zero8 = self.builder.ins().iconst(types::I8, 0);
         // CF = last bit shifted out of `a`: bit(n-cnt) for SHLD, bit(cnt-1) for SHRD.
         let cf = if left {
@@ -2401,9 +2524,11 @@ impl Translator<'_, '_> {
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf, pf_src, zero8, zf, sf, of);
 
-        self.builder.ins().jump(cont, &[]);
-        self.builder.seal_block(cont);
-        self.builder.switch_to_block(cont);
+        if let Some(cont) = cont {
+            self.builder.ins().jump(cont, &[]);
+            self.builder.seal_block(cont);
+            self.builder.switch_to_block(cont);
+        }
     }
 
     /// Widening multiply (mirrors interp `Mul`). CF=OF set iff the product spills
@@ -2635,7 +2760,16 @@ impl Translator<'_, '_> {
         let m = mask.0;
         for i in 0..6 {
             if self.full_flag_mask.0 & !m & (1 << i) != 0 {
-                self.pending_flags[i] = Some(self.flag_recipe.expect("unconditional ALU recipe"));
+                let recipe = Some(self.flag_recipe.expect("unconditional ALU recipe"));
+                if let Some(flags) = &mut self.instruction_flags {
+                    flags.pending[i] = recipe;
+                    flags.written |= 1 << i;
+                    flags.stored &= !(1 << i);
+                } else {
+                    self.pending_flags[i] = recipe;
+                    self.gpr_sync
+                        .write(self.builder.current_block().unwrap(), 16 + i);
+                }
             }
         }
     }
@@ -2848,6 +2982,7 @@ impl Translator<'_, '_> {
     /// this is a plain load in every tier; on ARM, `AcqRel`/`FullTso` add an
     /// acquire fence after the load (blocks Load→Load / Load→Store reordering).
     pub(crate) fn gload(&mut self, ty: Type, host: Value, off: i32) -> Value {
+        self.sync_guest_fault_state();
         let v = if ty == types::I128 && cfg!(target_arch = "x86_64") {
             let flags = guest_mem_flags(GuestAccessKind::Read, 8);
             let lo = self.builder.ins().load(types::I64, flags, host, off);
@@ -2869,6 +3004,7 @@ impl Translator<'_, '_> {
     /// fences *after* it as well, additionally blocking Store→Load for full
     /// sequential consistency (the over-strong "hammer"). x86 stays plain.
     pub(crate) fn gstore(&mut self, val: Value, host: Value, off: i32) {
+        self.sync_guest_fault_state();
         let ty = self.builder.func.dfg.value_type(val);
         let arm = cfg!(target_arch = "aarch64");
         if arm && self.consistency == MemConsistency::AcqRel {
@@ -3099,6 +3235,8 @@ impl Translator<'_, '_> {
         };
         if let Some(vars) = self.gpr_vars {
             self.builder.def_var(vars[index], new); // region: stays in a Variable
+            self.gpr_sync
+                .write(self.builder.current_block().unwrap(), index);
         } else {
             // Write-through so CpuState is always current, and cache the new value.
             self.store_cpu(off, new);
@@ -3106,20 +3244,39 @@ impl Translator<'_, '_> {
         }
     }
 
-    /// Region mode: store every GPR Variable back to `CpuState` (a no-op in
-    /// single-block mode, where writes are already write-through). Called before
-    /// every exit/trap so the dispatcher and helpers see current guest registers.
-    pub(crate) fn flush_gprs(&mut self) {
+    /// Stores are candidates until the complete CFG (including loop back-edges)
+    /// is known; GprSync removes those proved clean on every incoming path.
+    fn sync_gprs(&mut self) {
         if let Some(vars) = self.gpr_vars {
             for (i, &var) in vars.iter().enumerate() {
                 let v = self.builder.use_var(var);
-                self.store_cpu(self.offsets.gpr(i), v);
+                let inst =
+                    self.builder
+                        .ins()
+                        .store(MemFlags::trusted(), v, self.cpu, self.offsets.gpr(i));
+                self.gpr_sync
+                    .store(self.builder.current_block().unwrap(), i, inst);
             }
         }
+    }
+
+    /// Region mode: synchronize guest registers for helpers and dispatcher exits.
+    pub(crate) fn flush_gprs(&mut self) {
+        self.sync_gprs();
         if let Some(fv) = self.fuel_var {
             let v = self.builder.use_var(fv);
             self.store_mem(MEMCTX_FUEL, v); // the dispatcher reads this after the call
         }
+    }
+
+    /// SDM Vol 3A §7.5: expose pre-instruction state at a host guard fault.
+    /// Without a landing pad or flag-location metadata, a signal handler cannot
+    /// execute the cold recovery tail, so deferred flags must be stored eagerly.
+    pub(crate) fn sync_guest_fault_state(&mut self) {
+        if self.gpr_vars.is_some() {
+            self.sync_gprs();
+        }
+        self.recover_flags();
     }
 
     /// Reload the GPRs from `CpuState` after a helper that wrote them (cpuid, x87,
@@ -3131,6 +3288,7 @@ impl Translator<'_, '_> {
                 let v = self.load_cpu(self.offsets.gpr(i));
                 self.builder.def_var(var, v);
             }
+            self.gpr_sync.reload(self.builder.current_block().unwrap());
         } else {
             self.gpr_cache = [None; 16];
         }
@@ -4116,7 +4274,25 @@ impl Translator<'_, '_> {
 
     pub(crate) fn store_flag(&mut self, off: i32, v: Value) {
         if let Some(i) = self.flag_offsets().iter().position(|&offset| offset == off) {
+            if !self.recovering_flags {
+                if let Some(flags) = &mut self.instruction_flags {
+                    self.builder.def_var(flags.vars[i], v);
+                    flags.written |= 1 << i;
+                    flags.stored |= 1 << i;
+                    flags.pending[i] = None;
+                    return;
+                }
+                self.gpr_sync
+                    .write(self.builder.current_block().unwrap(), 16 + i);
+            }
             self.pending_flags[i] = None;
+            let inst = self
+                .builder
+                .ins()
+                .store(MemFlags::trusted(), v, self.cpu, off);
+            self.gpr_sync
+                .store(self.builder.current_block().unwrap(), 16 + i, inst);
+            return;
         }
         self.builder
             .ins()
@@ -4487,10 +4663,12 @@ impl Translator<'_, '_> {
         };
         let mut narrowed = body.to_vec();
         let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
-        for (original, op) in masks.into_iter().zip(&narrowed) {
+        for (index, (original, op)) in masks.into_iter().zip(&narrowed).enumerate() {
+            self.prepare_instruction_flags(&narrowed[index..], index == 0);
             if self.op_with_flags(original, op) {
                 return; // a normal terminator handled the exit
             }
+            self.finish_instruction_access(op);
         }
         match block.ops.last() {
             Some(IrOp::Branch {

@@ -110,7 +110,15 @@ fn compile_for_isa(
     region: bool,
     isa: &dyn cranelift::codegen::isa::TargetIsa,
 ) -> (Context, Box<[u64]>, usize) {
-    let ir = high_block(bytes);
+    compile_ir_for_isa(high_block(bytes), bytes, region, isa)
+}
+
+fn compile_ir_for_isa(
+    ir: IrBlock,
+    bytes: &[u8],
+    region: bool,
+    isa: &dyn cranelift::codegen::isa::TargetIsa,
+) -> (Context, Box<[u64]>, usize) {
     CHECKED_HOSTS.with(|hosts| hosts.borrow_mut().clear());
     let mut ctx = Context::new();
     ctx.func
@@ -188,9 +196,9 @@ fn compile_for_isa(
         cc.buffer.traps().len(),
         "every reported trap needs a record"
     );
-    // Count the optimized IR: a dominated identical load may be eliminated at
-    // Speed, because the first access faults first. Do not demand a record for
-    // an instruction removed by the optimizer.
+    // Count optimized IR, so removed accesses need no record. The lifted
+    // repeated-read fixture retains both loads because CpuState stores separate
+    // them; its synthetic sibling pins elimination without an intervening commit.
     let accesses: Vec<_> = ctx
         .func
         .layout
@@ -582,6 +590,106 @@ fn memory_fixture(isa: &dyn cranelift::codegen::isa::TargetIsa, flags: MemFlags)
 }
 
 #[test]
+fn wide_transfer_materializes_flags_once_in_both_modes() {
+    // Deferred ADD, SHL, SHLD and SHRD writers followed by a split transfer.
+    // SDM Vol 2B, SAL/SAR/SHL/SHR and SHLD/SHRD, Operation: masked count 3
+    // always writes flags, so recovery needs no count-zero branch.
+    // Count hot-path flag stores with optimization disabled as well as enabled.
+    let mut failures = Vec::new();
+    for writer in [
+        &[0x48, 0x01, 0xd8][..],      // add rax,rbx
+        &[0x48, 0xc1, 0xe0, 3],       // shl rax,3
+        &[0x48, 0x0f, 0xa4, 0xd8, 3], // shld rax,rbx,3
+        &[0x48, 0x0f, 0xac, 0xd8, 3], // shrd rax,rbx,3
+    ] {
+        let mut bytes = writer.to_vec();
+        bytes.extend_from_slice(&[0xc5, 0xfe, 0x6f, 0x07, 0x31, 0xc0, 0xf4]);
+        for region in [false, true] {
+            for opt in [OptLevel::None, OptLevel::Speed] {
+                let (ctx, _, _) = compile_at(&bytes, region, HostTarget::Native, opt);
+                let offsets = cpu_offsets();
+                let fields = [
+                    offsets.cf,
+                    offsets.pf_src,
+                    offsets.af_src,
+                    offsets.zf,
+                    offsets.sf,
+                    offsets.of,
+                ];
+                let mut stores = [0; 6];
+                for block in ctx
+                    .func
+                    .layout
+                    .blocks()
+                    .filter(|&b| !ctx.func.layout.is_cold(b))
+                {
+                    for inst in ctx.func.layout.block_insts(block) {
+                        if let ir::InstructionData::Store { offset, .. } = ctx.func.dfg.insts[inst]
+                        {
+                            if let Some(i) = fields.iter().position(|&o| o == i32::from(offset)) {
+                                if ctx.func.srcloc(inst).bits() == 1 {
+                                    stores[i] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let expected = if writer[1] == 0x01 {
+                    [1; 6]
+                } else {
+                    [1, 1, 0, 1, 1, 1]
+                };
+                if stores != expected {
+                    failures.push(format!("region={region}, {opt:?}, writer={writer:x?}: stores={stores:?}, expected={expected:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "one recovery per flag across the split transfer: {failures:?}"
+    );
+}
+
+#[test]
+fn region_fault_flush_only_dirty_gprs() {
+    // mov eax,42; mov [rdi],rax; mov [rsi],rax; hlt. No GPR changes
+    // between accesses: only RAX needs one store, even at opt_level=none.
+    for opt in [OptLevel::None, OptLevel::Speed] {
+        let (ctx, _, _) = compile_at(
+            &[0xb8, 42, 0, 0, 0, 0x48, 0x89, 0x07, 0x48, 0x89, 0x06, 0xf4],
+            true,
+            HostTarget::Native,
+            opt,
+        );
+        let cpu = ctx
+            .func
+            .dfg
+            .block_params(ctx.func.layout.entry_block().unwrap())[0];
+        let offsets = cpu_offsets();
+        let mut stores = [0; 16];
+        for inst in ctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|b| ctx.func.layout.block_insts(b))
+        {
+            if let ir::InstructionData::Store { args, offset, .. } = ctx.func.dfg.insts[inst] {
+                if ctx.func.dfg.resolve_aliases(args[1]) == cpu {
+                    if let Some(i) = (0..16).find(|&i| offsets.gpr(i) == i32::from(offset)) {
+                        stores[i] += 1;
+                    }
+                }
+            }
+        }
+        // A bounds-check exit before the first access also flushes RAX. The
+        // successful path and subsequent exits must not store any clean GPR.
+        assert_eq!(stores[0], 2, "{opt:?}: {stores:?}");
+        assert_eq!(&stores[1..], &[0; 15]);
+    }
+}
+
+#[test]
 fn guest_trap_sites_refuse_missing_owner_without_panicking() {
     let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::Speed);
     let mut ctx = memory_fixture(jit.module.isa(), guest_mem_flags(GuestAccessKind::Read, 8));
@@ -660,12 +768,49 @@ fn guest_trap_sites_repeated_read_counts_optimized_ir() {
             HostTarget::Native,
         );
         assert_eq!(accesses, 2);
-        // Eliminating the dominated read must retain the first read's owner.
+        // The pre-access RAX store separates the reads, so both retain owners.
         if region {
             let traps = ctx.compiled_code().unwrap().buffer.traps();
-            assert_eq!(traps.len(), 1);
+            assert_eq!(traps.len(), 2);
             assert_eq!(traps[0].code, ir::TrapCode::user(1).unwrap());
+            assert_eq!(traps[1].code, ir::TrapCode::user(2).unwrap());
         }
+        // Two identical loads before any architectural write, within one owner.
+        // This IR-only shape isolates dominated-load elimination from GPR sync.
+        let mut block = high_block(&[0xf4]);
+        block.temp_count = 3;
+        block.ops = vec![
+            IrOp::InsnStart {
+                guest_addr: HIGH_BASE,
+            },
+            IrOp::Load {
+                dst: 0,
+                addr: Val::Imm(0x8000),
+                size: 8,
+            },
+            IrOp::Load {
+                dst: 1,
+                addr: Val::Imm(0x8000),
+                size: 8,
+            },
+            IrOp::Add {
+                dst: 2,
+                a: Val::Temp(0),
+                b: Val::Temp(1),
+                size: 8,
+                set_flags: FlagMask::NONE,
+            },
+            IrOp::WriteReg {
+                reg: Reg::Rax,
+                src: Val::Temp(2),
+                size: 8,
+            },
+            IrOp::Hlt,
+        ];
+        let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::Speed);
+        let (ctx, _, original) = compile_ir_for_isa(block, &[], region, jit.module.isa());
+        assert_eq!(original, 2);
+        assert_eq!(ctx.compiled_code().unwrap().buffer.traps().len(), 1);
     }
 }
 

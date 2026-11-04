@@ -52,8 +52,28 @@ task-31 (unemulinux) (a guest signal frame built from a JIT fault) will want.
   where loop reuse pays for it.
 - task-105 is closed **won't-do** with this decision as the record, so the idea isn't
   re-attempted blind.
-- The guard-fault GPR-precision residual stays **single-block-precise / region-stale**
-  (decision-5), unchanged.
+- **Amended 2026-11-04:** guard-fault GPR precision is now exact in both modes
+  (decision-5). Regions keep SSA Variables but synchronize dirty GPRs before each
+  inline guest access that can fault, as well as before helpers and exits. Dirty
+  tracking is a compile-time CFG analysis; registers clean on every incoming path
+  require no stores. Both JIT modes materialize deferred flags before inline accesses;
+  a memory RMW's result flags and recovery recipes commit only after its final store
+  succeeds (SDM Vol 3A §5.6, access rights; §7.5, fault state). CFG dirty analysis
+  removes repeated flag stores on
+  paths where they are already materialized. Single-block GPRs remain write-through;
+  flag store ordering changes in both modes, with the same RMW rule in the interpreter.
+  `x86jit-tests/tests/region_fault_state.rs` contains
+  `region_guard_fault_recovers_gprs_and_flags`, which pins the fault state;
+  `write_fault_*` pins instruction-entry GPRs/RFLAGS at write-only faults;
+  `region_fault_flush_only_dirty_gprs` and
+  `wide_transfer_materializes_flags_once_in_both_modes` in
+  `x86jit-cranelift/src/codegen/trap_tests.rs`
+  pin elimination of clean-register and repeated flag stores.
+  This adds stores to region loop bodies. Measured on an aarch64 host against the
+  parent commit, three interleaved `x86jit-bench experiment` runs: `hotloop`
+  region-bg 7.80 ms -> 7.93 ms (about +1.7%; regions stay 3.3x faster than
+  single-block), the long `hotloop` 37.7 ms -> 38.4 ms, `memcpy` region-bg
+  unchanged; single-block modes within noise on every workload.
 - Real JIT run-side wins should be sought elsewhere — e.g. task-106 (guard pages
   eliminate the per-access bound check), or widening region formation (BGT-6, task-100)
   so more hot code runs where Variable carry already helps.

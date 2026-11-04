@@ -31,6 +31,7 @@ impl Translator<'_, '_> {
         let s = self.val(*src);
         let s = self.narrow(s, *size);
         let ty = int_ty(*size);
+        self.sync_guest_fault_state();
         let prev = if matches!(op, RmwOp::Rsub) {
             // No native reverse-subtract atomic (`lock neg`): CAS loop with
             // `new = s - cur`, retrying until the compare-exchange sticks.
@@ -88,6 +89,7 @@ impl Translator<'_, '_> {
         let exp = self.narrow(exp, *size);
         let new = self.val(*src);
         let new = self.narrow(new, *size);
+        self.sync_guest_fault_state();
         let prev = self.builder.ins().atomic_cas(
             guest_mem_flags(GuestAccessKind::ReadWrite, *size),
             host,
