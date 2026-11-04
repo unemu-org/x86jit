@@ -5101,6 +5101,45 @@ impl VecFault {
     }
 }
 
+/// Attach the memory operand's context after the shared transfer helper identifies
+/// the faulting part. Slots include RAM and masked-off elements, so their indices
+/// remain stable across retries and partially trapped operands.
+fn vec_fault_exit(f: StrFault, base: u64, width: u16) -> Exit {
+    let mut exit = str_fault_exit(f);
+    match &mut exit {
+        Exit::MmioRead {
+            addr,
+            size,
+            total_size,
+            part,
+        }
+        | Exit::MmioWrite {
+            addr,
+            size,
+            total_size,
+            part,
+            ..
+        } => {
+            *total_size = width;
+            *part = (addr.wrapping_sub(base) / u64::from(*size)) as u8;
+        }
+        _ => {}
+    }
+    exit
+}
+
+fn vec_trap_out(
+    cpu: &mut CpuState,
+    cur_addr: u64,
+    f: VecFault,
+    access: AccessKind,
+    base: u64,
+    width: u16,
+) -> StepResult {
+    let f = f.into_str_fault(cpu, cur_addr, access == AccessKind::Write);
+    StepResult::Exit(vec_fault_exit(f, base, width))
+}
+
 /// One 8-byte-or-narrower transfer of a vector access, with MMIO resumption.
 ///
 /// `cur_addr` is the faulting instruction's address; it keys the sub-transfers the
@@ -5280,8 +5319,8 @@ fn trap_out(
     cpu.rip = cur_addr;
     let exit = match (trap, access) {
         (MemTrap::Unmapped, _) => Exit::UnmappedMemory { addr, access },
-        (MemTrap::Mmio, AccessKind::Read) => Exit::MmioRead { addr, size },
-        (MemTrap::Mmio, _) => Exit::MmioWrite { addr, size, value },
+        (MemTrap::Mmio, AccessKind::Read) => Exit::mmio_read(addr, size),
+        (MemTrap::Mmio, _) => Exit::mmio_write(addr, size, value),
     };
     StepResult::Exit(exit)
 }
@@ -5635,15 +5674,8 @@ fn str_fault_exit(f: StrFault) -> Exit {
             addr: f.addr,
             access,
         },
-        (MemTrap::Mmio, AccessKind::Read) => Exit::MmioRead {
-            addr: f.addr,
-            size: f.elem,
-        },
-        (MemTrap::Mmio, _) => Exit::MmioWrite {
-            addr: f.addr,
-            size: f.elem,
-            value: f.value,
-        },
+        (MemTrap::Mmio, AccessKind::Read) => Exit::mmio_read(f.addr, f.elem),
+        (MemTrap::Mmio, _) => Exit::mmio_write(f.addr, f.elem, f.value),
     }
 }
 

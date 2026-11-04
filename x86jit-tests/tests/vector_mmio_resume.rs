@@ -173,10 +173,31 @@ fn run(case: Case, backend: Box<dyn Backend>) {
     let source = lanes(&source);
     cpu.set_xmm(1, source[0]);
     cpu.set_ymm_hi(1, source[1]);
+    let total_width = match case {
+        Case::MaskedLoad | Case::MaskedStore | Case::Fma | Case::BroadcastLane | Case::Permute2 => {
+            16
+        }
+        Case::NarrowStore => 8,
+        Case::Permute1 | Case::Gf2p8 => 32,
+        Case::BroadcastScalar => 4,
+        Case::ByteLoad(_) | Case::ByteStore(_) => 64,
+    };
     let mut seen = Vec::new();
     for _ in 0..(transfers.len() * 2 + 4) {
         match cpu.run(&vm, None) {
-            Exit::MmioRead { addr, size, .. } if !store => {
+            Exit::MmioRead {
+                addr,
+                size,
+                total_size,
+                part,
+                ..
+            } if !store => {
+                assert_eq!(total_size, total_width, "{case:?}: total width");
+                assert_eq!(
+                    u64::from(part),
+                    (addr - MMIO) / u64::from(size),
+                    "{case:?}: part index"
+                );
                 let previous = if cpu.reg(Reg::Rcx) == 2 {
                     lanes(&initial)
                 } else {
@@ -194,8 +215,19 @@ fn run(case: Case, backend: Box<dyn Backend>) {
                 cpu.complete_mmio_read(u64::from_le_bytes(answer));
             }
             Exit::MmioWrite {
-                addr, size, value, ..
+                addr,
+                size,
+                value,
+                total_size,
+                part,
+                ..
             } if store => {
+                assert_eq!(total_size, total_width, "{case:?}: total width");
+                assert_eq!(
+                    u64::from(part),
+                    (addr - MMIO) / u64::from(size),
+                    "{case:?}: part index"
+                );
                 let part = transfers
                     .iter()
                     .position(|t| *t == (addr, size))
@@ -546,6 +578,8 @@ fn wrapped_masked_access(backend: Box<dyn Backend>, store: bool) {
                     addr: 0,
                     size: 1,
                     value: 0x5a,
+                    total_size: 64,
+                    part: 32,
                     ..
                 }
             ),
@@ -559,6 +593,8 @@ fn wrapped_masked_access(backend: Box<dyn Backend>, store: bool) {
                 Exit::MmioRead {
                     addr: 0,
                     size: 1,
+                    total_size: 64,
+                    part: 32,
                     ..
                 }
             ),
@@ -856,4 +892,172 @@ fn unsupported_step_abandons_retry_jit() {
 #[test]
 fn unsupported_direct_step_abandons_retry() {
     unsupported_step_abandons_retry(Box::new(InterpreterBackend), true);
+}
+
+// SDM Vol 2B, MOVUPS, Operation (VEX/EVEX load/store), and
+// MOVDQU/VMOVDQU8/16/32/64, Operation (EVEX VMOVDQU32 load/store):
+// vector moves copy the operand bytes; the writemask selects dword elements.
+// SDM Vol 2B, MOV, Operation: the scalar forms copy the addressed operand.
+fn access_width(backend: Box<dyn Backend>, width: u8, store: bool, masked: bool, ram_prefix: bool) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
+    vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    match (width, store, masked) {
+        (1, false, _) => a.mov(dl, byte_ptr(rax)),
+        (2, false, _) => a.mov(dx, word_ptr(rax)),
+        (4, false, _) => a.mov(edx, dword_ptr(rax)),
+        (8, false, _) => a.mov(rdx, qword_ptr(rax)),
+        (1, true, _) => a.mov(byte_ptr(rax), dl),
+        (2, true, _) => a.mov(word_ptr(rax), dx),
+        (4, true, _) => a.mov(dword_ptr(rax), edx),
+        (8, true, _) => a.mov(qword_ptr(rax), rdx),
+        (16, false, false) => a.vmovups(xmm0, xmmword_ptr(rax)),
+        (32, false, false) => a.vmovups(ymm0, ymmword_ptr(rax)),
+        (64, false, false) => a.vmovups(zmm0, zmmword_ptr(rax)),
+        (16, true, false) => a.vmovups(xmmword_ptr(rax), xmm0),
+        (32, true, false) => a.vmovups(ymmword_ptr(rax), ymm0),
+        (64, true, false) => a.vmovups(zmmword_ptr(rax), zmm0),
+        (16, false, true) => a.vmovdqu32(xmm0.k1().z(), xmmword_ptr(rax)),
+        (32, false, true) => a.vmovdqu32(ymm0.k1().z(), ymmword_ptr(rax)),
+        (64, false, true) => a.vmovdqu32(zmm0.k1().z(), zmmword_ptr(rax)),
+        (16, true, true) => a.vmovdqu32(xmmword_ptr(rax).k1(), xmm0),
+        (32, true, true) => a.vmovdqu32(ymmword_ptr(rax).k1(), ymm0),
+        (64, true, true) => a.vmovdqu32(zmmword_ptr(rax).k1(), zmm0),
+        _ => unreachable!(),
+    }
+    .unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    let data: [u8; 64] = std::array::from_fn(|i| (i * 3 + 1) as u8);
+    let base = MMIO - if ram_prefix { 8 } else { 0 };
+    if ram_prefix {
+        vm.write_bytes(base, &data[..8]).unwrap();
+    }
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rax, base);
+    cpu.set_reg(
+        Reg::Rdx,
+        if store {
+            u64::from_le_bytes(data[..8].try_into().unwrap())
+        } else {
+            0
+        },
+    );
+    if store {
+        let v = lanes(&data);
+        cpu.set_xmm(0, v[0]);
+        cpu.set_ymm_hi(0, v[1]);
+        cpu.set_zmm_hi(0, 0, v[2]);
+        cpu.set_zmm_hi(0, 1, v[3]);
+    }
+    let active = if masked {
+        1 | (1 << 2) | (1 << (width / 4 - 1))
+    } else {
+        0
+    };
+    cpu.set_kmask(1, active);
+    let size = if masked { 4 } else { width.min(8) };
+    let mut assembled = [0; 64];
+    if ram_prefix {
+        assembled[..8].copy_from_slice(&data[..8]);
+    }
+    for part in 0..width / size {
+        if masked && active & (1 << part) == 0 {
+            continue;
+        }
+        let off = part as usize * size as usize;
+        if ram_prefix && off < 8 {
+            continue;
+        }
+        let exit = cpu.run(&vm, None);
+        assert_eq!(cpu.reg(Reg::Rip), CODE, "incomplete access advanced RIP");
+        let (addr, actual_size, total_size, actual_part, value) = match exit {
+            Exit::MmioRead {
+                addr,
+                size,
+                total_size,
+                part,
+                ..
+            } if !store => (addr, size, total_size, part, 0),
+            Exit::MmioWrite {
+                addr,
+                size,
+                total_size,
+                part,
+                value,
+                ..
+            } if store => (addr, size, total_size, part, value),
+            other => panic!("unexpected exit: {other:?}"),
+        };
+        assert_eq!(
+            (addr, actual_size, total_size, actual_part),
+            (base + off as u64, size, u16::from(width), part)
+        );
+        let mut answer = [0; 8];
+        answer[..size as usize].copy_from_slice(&data[off..off + size as usize]);
+        if store {
+            assert_eq!(
+                &value.to_le_bytes()[..size as usize],
+                &answer[..size as usize]
+            );
+            assembled[off..off + size as usize]
+                .copy_from_slice(&value.to_le_bytes()[..size as usize]);
+            cpu.complete_mmio_write();
+        } else {
+            assembled[off..off + size as usize].copy_from_slice(&answer[..size as usize]);
+            cpu.complete_mmio_read(u64::from_le_bytes(answer));
+        }
+    }
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let mut expected = [0; 64];
+    for part in 0..width / size {
+        if !masked || active & (1 << part) != 0 {
+            let off = part as usize * size as usize;
+            expected[off..off + size as usize].copy_from_slice(&data[off..off + size as usize]);
+        }
+    }
+    assert_eq!(assembled, expected);
+    if !store {
+        if width <= 8 {
+            assert_eq!(
+                cpu.reg(Reg::Rdx),
+                u64::from_le_bytes(expected[..8].try_into().unwrap())
+            );
+        } else {
+            assert_eq!(vector(&cpu), lanes(&expected));
+        }
+    } else if ram_prefix {
+        let mut bytes = [0; 8];
+        vm.read_bytes(base, &mut bytes).unwrap();
+        assert_eq!(bytes, data[..8]);
+    }
+}
+
+#[test]
+fn access_width_interp() {
+    for width in [1, 2, 4, 8, 16, 32, 64] {
+        for store in [false, true] {
+            access_width(Box::new(InterpreterBackend), width, store, false, false);
+            if width > 8 {
+                access_width(Box::new(InterpreterBackend), width, store, true, false);
+                access_width(Box::new(InterpreterBackend), width, store, false, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn access_width_jit() {
+    for width in [1, 2, 4, 8, 16, 32, 64] {
+        for store in [false, true] {
+            access_width(Box::new(JitBackend::new()), width, store, false, false);
+            if width > 8 {
+                access_width(Box::new(JitBackend::new()), width, store, true, false);
+                access_width(Box::new(JitBackend::new()), width, store, false, true);
+            }
+        }
+    }
 }

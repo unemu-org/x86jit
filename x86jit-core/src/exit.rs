@@ -19,6 +19,10 @@ pub enum PortDir {
 
 /// Reason `run()` returned control to the user (§5.2).
 ///
+/// MMIO exits describe one transfer of at most eight bytes. A wider memory
+/// operand produces several exits at the same RIP; `total_size` and `part`
+/// identify the operand width and transfer slot without decoding the instruction.
+///
 /// This enum and its struct-like variants are non-exhaustive so new exit reasons
 /// and fields can be added. Outside this crate, matches need a wildcard arm and
 /// struct-like patterns need `..`:
@@ -51,10 +55,10 @@ pub enum PortDir {
 ///     addr: 0x1000, access: AccessKind::Read, ..
 /// }));
 /// assert!(matches!(MMIO_READ, Exit::MmioRead {
-///     addr: 0x3000, size: 4, ..
+///     addr: 0x3000, size: 4, total_size: 4, part: 0, ..
 /// }));
 /// assert!(matches!(MMIO_WRITE, Exit::MmioWrite {
-///     addr: 0x4000, size: 8, value: 0x1234, ..
+///     addr: 0x4000, size: 8, value: 0x1234, total_size: 8, part: 0, ..
 /// }));
 /// assert!(matches!(UNKNOWN, Exit::UnknownInstruction {
 ///     addr: 0x5000, bytes, len: 3, ..
@@ -113,10 +117,44 @@ pub enum Exit {
     /// READ from a Trap region (MMIO). Guest waits; user must call
     /// `complete_mmio_read` before the next `run()`.
     #[non_exhaustive]
-    MmioRead { addr: u64, size: u8 },
+    MmioRead {
+        /// Address of this transfer, rather than the operand's base address.
+        addr: u64,
+        /// Bytes requested by this transfer (1–8); the answer occupies the low
+        /// `size` bytes passed to `complete_mmio_read`.
+        size: u8,
+        /// Full memory operand width in bytes, including masked-off elements
+        /// and any bytes served by RAM. This is the source width for broadcasts
+        /// and the destination width for narrowing stores, rather than the
+        /// vector register width or the count of active bytes.
+        total_size: u16,
+        /// Zero-based transfer slot within the memory operand:
+        /// `addr.wrapping_sub(operand_base) / size`. Ordinary wide accesses use
+        /// 8-byte slots. Per-element masked memory transfers and narrowing stores
+        /// use element-sized slots, retaining gaps for inactive elements.
+        /// Whole-table reads, including masked VPERMD and GFNI affine memory
+        /// forms, use 8-byte chunks: a 32-byte table reports parts 0, 1, 2 and 3,
+        /// regardless of the element width. RAM-served slots also retain
+        /// their indices. Scalar accesses have `total_size == size`, `part == 0`.
+        part: u8,
+    },
     /// WRITE to a Trap region (MMIO). User handles the side effect, then resumes.
     #[non_exhaustive]
-    MmioWrite { addr: u64, size: u8, value: u64 },
+    MmioWrite {
+        /// Address of this transfer, rather than the operand's base address.
+        addr: u64,
+        /// Bytes written by this transfer (1–8).
+        size: u8,
+        /// This transfer's bytes, in the low `size` bytes of the value.
+        value: u64,
+        /// Full memory operand width in bytes, with the same meaning as
+        /// the `total_size` field on [`Exit::MmioRead`]. Masked-off bytes still count.
+        total_size: u16,
+        /// Zero-based transfer slot, with the same meaning as
+        /// the `part` field on [`Exit::MmioRead`]. Masked-off and RAM-served slots
+        /// keep their indices. Scalar accesses have `total_size == size`, `part == 0`.
+        part: u8,
+    },
     /// An instruction the lift does not yet support — tells you what to add next.
     #[non_exhaustive]
     UnknownInstruction { addr: u64, bytes: [u8; 15], len: u8 },
@@ -158,20 +196,35 @@ impl Exit {
 
     /// Construct an [`Exit::MmioRead`].
     ///
+    /// Defaults to a single transfer: `total_size == size`, `part == 0`.
+    ///
     /// This is the stable construction API for this non-exhaustive variant:
     /// fields added later receive defaults through this constructor.
     #[must_use]
     pub const fn mmio_read(addr: u64, size: u8) -> Self {
-        Self::MmioRead { addr, size }
+        Self::MmioRead {
+            addr,
+            size,
+            total_size: size as u16,
+            part: 0,
+        }
     }
 
     /// Construct an [`Exit::MmioWrite`].
+    ///
+    /// Defaults to a single transfer: `total_size == size`, `part == 0`.
     ///
     /// This is the stable construction API for this non-exhaustive variant:
     /// fields added later receive defaults through this constructor.
     #[must_use]
     pub const fn mmio_write(addr: u64, size: u8, value: u64) -> Self {
-        Self::MmioWrite { addr, size, value }
+        Self::MmioWrite {
+            addr,
+            size,
+            value,
+            total_size: size as u16,
+            part: 0,
+        }
     }
 
     /// Construct an [`Exit::UnknownInstruction`].

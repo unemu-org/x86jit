@@ -184,6 +184,26 @@ Replace struct literals with the stable constructors
 `Exit::exception(addr, vector)` and `Exit::port_io(port, size, dir, value)`;
 fields added later receive defaults through these constructors.
 
+Trap data accesses return `Exit::MmioRead` or `Exit::MmioWrite` with `addr` and
+`size` for the current transfer (at most 8 bytes), plus `total_size: u16` for the
+full memory operand width and `part: u8` for its zero-based transfer slot.
+For example, a 32-byte load returns four 8-byte reads at offsets 0, 8, 16 and 24,
+each with `total_size == 32` and `part` 0 through 3. RIP stays on the instruction
+until all transfers finish. Supply each read through `complete_mmio_read(value)`;
+perform each write's side effect and call `complete_mmio_write()` before resuming.
+
+`total_size` includes masked-off bytes, rather than counting active bytes, and
+describes the memory operand (the source chunk for a broadcast, the destination
+for a narrowing store). `part` is `addr.wrapping_sub(operand_base) / size`:
+per-element masked memory transfers and narrowing stores use element-sized slots,
+so inactive elements leave gaps in the indices. Whole-table reads, including
+masked VPERMD and GFNI affine memory forms, use 8-byte chunks, so a 32-byte table
+reports parts 0, 1, 2 and 3, regardless of the element width.
+Slots served by RAM also keep their indices when only part of an operand traps.
+Scalar loads/stores of 8 bytes or less and the existing MMIO constructors use
+`total_size == size` and `part == 0`.
+Both backends report the same metadata.
+
 Instruction fetch from a `RegionKind::Trap` region returns `Exit::UnmappedMemory`
 with `AccessKind::Execute`, even when the region is executable. Its `addr` and RIP
 identify the attempted instruction's start (the decode IP in Real16). An instruction
