@@ -170,7 +170,17 @@ task numbers, which is the point — the project says what is wrong with it.
    missing `unemups4` trigger is a gap on that side rather than a reason to level down.
    Worth a `backlog decision`; the maintainer was asked and the session ended first.
 
-3. Decide `bench/history` — it carries a hostname and CPU model.
+3. Decide `bench/history` — it carries a hostname and CPU model. So do `bench/baseline.json` and
+   `backlog/docs/performance.md`.
+
+   *(Added 2026-11-04, after the move to beads and the private remote.)* The issue database
+   travels with the repository as `refs/dolt/data`, and the orphan commit drops git history but
+   not Dolt history: earlier bead and memory text (one epic description named a console before it
+   was reworded) survives there. Before `refs/dolt/data` first goes to a public remote, squash it
+   (`bd flatten`) and re-scan every bead and `bd memories` entry against the guest-agnostic guard's
+   terms plus private host and path names. Also restate as project facts the docs that describe
+   the maintainer's own machine and remote (`commands.md` § Git remote and CI, `status.md`, the
+   remote lines in `AGENTS.md` and `working-on-tasks.md`).
 
 4. Re-run: `cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)'`
    (and the same with `--release`), `cargo clippy --all-targets --all-features -- -D

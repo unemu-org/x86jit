@@ -9,10 +9,12 @@ created_date: '2026-07-06 11:25'
 
 Open work is tracked in **beads** (`bd`, a Dolt-backed issue tracker; issue prefix `xj`). Knowledge
 — design, decisions, guides — stays as markdown under `backlog/`; a bead links to a doc section and
-never copies it. Roles, review and the Sol (Codex) workers are in
-[`agent-workflow.md`](agent-workflow.md); this page is the day-to-day reference. `bd <cmd> --help`
-gives the flags. `bd prime` prints the tool's generic workflow; where it differs from these docs
-(who claims and closes, `bd remember`, pushing), these docs win.
+never copies it. Roles, the path from a bead to `main`, review and the worker rules are beads
+memories (`bd memories`, keys `roles`, `bead-to-main`, `bead-conventions`, `worker-prompts`,
+`sandbox-workers`, `publication-rule`); this page is the day-to-day reference. `bd <cmd> --help`
+gives the flags. `bd prime` prints the tool's generic workflow; where it differs from these docs and
+the beads memories (who claims and closes, what goes into `bd remember` — see
+`bd recall bead-conventions` — pushing), these docs and the memories win.
 
 ## Statuses
 
@@ -37,7 +39,8 @@ Priorities are `P0`…`P4` (`P0` highest). The import mapped Backlog.md high/med
 
 ## Epics
 
-Each theme is an epic (`bd list --type epic`); every bead belongs to one, through `--parent`. The
+Each theme is an epic (`bd list --type epic`); every task bead belongs to one, through `--parent`
+(housekeeping chores may stand alone). The
 epic carries the theme's label; children keep their own labels (create them with
 `--no-inherit-labels`). A dotted id (`xj-i2n.4`) shows the parent a bead was created under; after a
 reparent `bd show` is authoritative.
@@ -87,9 +90,11 @@ A bead closes only when all of these hold on `main`:
 2. `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 3. `cargo fmt --check` is clean (the nix-pinned rustfmt).
 
-Plus, when the change warrants it: `cargo deny --all-features check licenses bans sources`, the
-real-program ladder ([`commands.md`](commands.md)), and a hot-path measurement against
-`bench/baseline.json` for codegen changes.
+Plus, when the change warrants it: the same run on an aarch64 host for codegen, memory-ordering or
+host-specific changes (no CI runner covers aarch64 — [`commands.md`](commands.md) § Git remote and
+CI), `cargo deny --all-features check licenses bans sources`, the real-program ladder
+([`commands.md`](commands.md)), and a hot-path measurement against `bench/baseline.json` for codegen
+changes.
 
 ## Git flow
 
@@ -97,8 +102,7 @@ One bead, one branch (`<type>/<bead-or-topic>`, Conventional Branch), one worktr
 checkout. The supervisor squash-merges each bead into `main` as one commit: **Conventional Commits**
 (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`, `test:`, `ci:`, `build:`), **GPG-signed** (the
 pre-commit `gpg-uid-guard` refuses a sign-key/email mismatch). Commits and pushes happen only at the
-maintainer's request. Never bypass hooks. Details: [`agent-workflow.md`](agent-workflow.md) § From
-bead to `main`.
+maintainer's request. Never bypass hooks. Details: `bd recall bead-to-main`.
 
 `origin` is the maintainer's private Forgejo. The issue database lives in `.beads/` (gitignored);
 `bd dolt push` stores it in `refs/dolt/data` on `origin` (plus bd's `__dolt_remote_info__`
@@ -123,8 +127,24 @@ rediscovering state from the diff.
 ## History
 
 Backlog.md was the tracker until 2026-11-04. Its Done history stays read-only under
-`backlog/completed/` and `backlog/archive/`. Every migrated bead carries its old id as
+`backlog/completed/`; `backlog/archive/` stays empty until `xj-stf` archives the migrated task
+files. Every migrated bead carries its old id as
 `external_ref` (`backlog:TASK-NNN`) and its old file name and dates in `metadata`. Text that
 mentions `TASK-NNN` resolves through `bd list --external-ref backlog:TASK-NNN` (exact, upper case;
 `--external-contains task-nnn` ignores case). No bead means the task was Done before the migration:
 read `backlog/completed/task-NNN - *.md`.
+
+What the migration did, so it can be checked:
+
+- Every open task (61: 60 `To Do`, 1 `In Progress`) became one bead. Title, Description,
+  Acceptance Criteria (numbering and checked state kept) and Implementation Notes were copied
+  verbatim; labels were kept; priority high/medium/low became `P1`/`P2`/`P3` (unset became `P2`).
+- The board used labels, not milestones, so the epics follow the thematic labels. Five of the nine
+  `code-review` findings, which carried no theme label, were moved to the theme epic they belong to.
+- The 24 `dependencies:` entries became `blocks` dependencies; `bd ready --exclude-type epic` showed
+  the same 43 tasks the old board called unblocked. Three orderings written only in task prose were
+  added afterwards: `xj-obx.4` waits for `xj-i2n.7` and `xj-i2n.8`, `xj-pi7.3` for `xj-562.1`.
+- The per-task Definition of Done, identical on every task, moved to § Definition of Done above.
+- The ten Done tasks still in `backlog/tasks` moved to `backlog/completed`, not imported.
+- The migrated files stay in `backlog/tasks` as a fallback until the maintainer has checked the
+  migration; archiving them is `xj-stf`.

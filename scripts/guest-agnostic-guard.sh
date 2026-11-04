@@ -16,7 +16,7 @@
 # Where a downstream reference IS legitimate — PROVENANCE naming a consumer — it belongs
 # in a top-level document, which this deliberately does not scan. "Who reported this"
 # belongs in the reporting project's own tracker: bead text here is guest-agnostic too
-# (backlog/docs/agent-workflow.md).
+# (`bd recall publication-rule`).
 set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -24,7 +24,7 @@ Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue
 | Interp-vs-hardware tracer (`scripts/lockstep.sh`) | [`backlog/docs/design/doc-24 - Lockstep-interp-vs-hardware-tracer.md`](backlog/docs/design/doc-24%20-%20Lockstep-interp-vs-hardware-tracer.md) | A deterministic wrong-result bug where interp==JIT but both differ from a real CPU |
 | **Real-program ladder** (`scripts/ladder.sh`) | [`backlog/docs/commands.md`](backlog/docs/commands.md) § the real-program ladder | After a lifter or codegen change — the corpus validates what *is* lifted, this validates what real software needs |
 | Toolchain (Nix devShell, direnv, pre-commit, `backlog`, `bd`) | [`backlog/docs/dev-setup.md`](backlog/docs/dev-setup.md) | Fixing tooling, onboarding |
-| **Agent workflow: supervisor/worker roles, beads, review, Sol (Codex) workers** | [`backlog/docs/agent-workflow.md`](backlog/docs/agent-workflow.md) | **At session start, before any task work** |
+| **Shared working rules: roles, bead-to-main flow, worker briefs, publication rule** | beads memories — `bd memories`, `bd recall <key>` | **At session start, before any task work** |
 | Bead statuses, epics, lifecycle, Definition of Done, git flow, session handoff | [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) | Before picking up a task |
 | Where to capture a decision (`backlog decision` vs task note) | [`backlog/docs/decisions.md`](backlog/docs/decisions.md) + `ls backlog/decisions/` | Making a non-trivial decision |
 | Glossary / emulator + x86 terminology | [`backlog/docs/glossary.md`](backlog/docs/glossary.md) | Hitting an unfamiliar term |
@@ -41,7 +41,7 @@ Don't read every `backlog/docs/` file at session start. Pick the file matching t
 
 ## Working on tasks
 
-Read [`backlog/docs/agent-workflow.md`](backlog/docs/agent-workflow.md) for roles and the path from a bead to `main`, and [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for statuses (`open` / `in_progress` / `closed`), epics, the Definition of Done and the git flow. The supervisor picks work with `bd ready --exclude-type epic`, claims it with `bd update <id> --claim` **before** code is written, and closes it only after it lands on `main`, with a reason that names the commit. Workers do not claim or close beads; they report to the supervisor. Append to notes with `--append-notes` — never `--notes` on an existing bead, which replaces the field. Where `bd prime`'s generic advice differs from these docs, these docs win. Text migrated from Backlog.md still says `TASK-NNN`: `bd list --external-ref backlog:TASK-NNN` finds the bead; no match means the task was already Done — read `backlog/completed/task-NNN - *.md`.
+The roles, the path from a bead to `main`, the worker rules and the publication rule are beads memories — read them with `bd memories` (`bd recall <key>` for one; `bd prime` prints them too). Read [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for statuses (`open` / `in_progress` / `closed`), epics, the Definition of Done and the git flow. The supervisor picks work with `bd ready --exclude-type epic`, claims it with `bd update <id> --claim` **before** code is written, and closes it only after it lands on `main`, with a reason that names the commit. Workers do not claim or close beads; they report to the supervisor. Append to notes with `--append-notes` — never `--notes` on an existing bead, which replaces the field. Where `bd prime`'s generic advice differs from these docs and the beads memories, these docs and the memories win. Text migrated from Backlog.md still says `TASK-NNN`: `bd list --external-ref backlog:TASK-NNN` finds the bead; no match means the task was already Done — read `backlog/completed/task-NNN - *.md`.
 
 **Cross-repository ids carry a tag.** `task-40 (unemulinux)`, `doc-7 (unemulinux)`, `decision-4 (unemups4)` name *that* project's numbering; an untagged `doc-22` or `decision-5` is ours. Every project involved keeps its own counter, so the tag is what makes a reference resolvable — a bare number is only unambiguous inside one repository. Tag it when you write it: retro-fitting the tag after two counters have drifted means guessing which one a reader meant.
 
@@ -60,7 +60,7 @@ Ending a session mid-task, leave the state on the bead itself:
 bd update <id> --append-notes "Session pause $(date -I). Done: <X>. Next: <Y>. Blocker: <Z|none>."
 ```
 
-Starting a session, read the in-progress beads (`bd list --status in_progress`, then `bd show <id>`) before doing anything else.
+Starting a session, read the shared rules (`bd memories`), then the in-progress beads (`bd list --status in_progress`, then `bd show <id>`), before doing anything else. A sandboxed worker that cannot open the beads database (`openat LOCK: operation not permitted`) takes its rules from the supervisor's brief.
 
 ## Quick dev loop
 
@@ -79,6 +79,7 @@ Full list: [`backlog/docs/commands.md`](backlog/docs/commands.md).
 ## Hard rules (don't violate)
 
 - **Never commit without explicit user request.** Even mid-task, after accepting a plan, stop and ask. Plan acceptance ≠ commit acceptance.
+- **Write as if the repository were public.** Code, comments, docs, bead text and commit messages are English, publish-safe and guest-agnostic: never name a proprietary guest, a private host, a private path or anyone's personal setup. Push only to the configured `origin`; never create, mirror or publish a repository — publishing is the maintainer's step.
 - **Don't add features, refactor, or introduce abstractions beyond what the task requires.** Bug fix = bug fix, not surrounding cleanup.
 - **Don't pre-empt later milestones.** `todo!()` stubs are milestone markers — fill them in `spec.md` §12 order. Don't half-implement a later milestone during earlier work.
 - **Encode x86 semantics traps once, centrally** (upper-32-bit zeroing, effective-address lowering, RIP-relative, FS/GS base, flags). See `spec.md` §16 and [`backlog/docs/conventions.md`](backlog/docs/conventions.md).
