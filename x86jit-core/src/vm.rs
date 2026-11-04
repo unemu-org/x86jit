@@ -786,7 +786,10 @@ impl Vcpu {
         match reg.gpr_index() {
             Some(i) => self.cpu.gpr[i] = val,
             None => match reg {
-                Reg::Rip => self.cpu.rip = val,
+                Reg::Rip => {
+                    self.cpu.clear_mmio_parts();
+                    self.cpu.rip = val;
+                }
                 Reg::FsBase => self.cpu.fs_base = val,
                 Reg::GsBase => self.cpu.gs_base = val,
                 // Real-mode segment selectors (§17.6): the embedder seeds these before a
@@ -897,6 +900,11 @@ impl Vcpu {
     /// JIT-side MMIO trap/resume is deferred, and the JIT never emits an
     /// `Exit::MmioRead` for an inlined load, so this is only reached under the interp.
     pub fn complete_mmio_read(&mut self, value: u64) {
+        // Preserve the owner recorded at the exit, even if public state changed
+        // before completion. The next interpreter entry validates that owner.
+        if !self.cpu.mmio_retry_active {
+            self.cpu.begin_mmio_retry(self.cpu.rip);
+        }
         self.cpu.pending_mmio = Some(value);
     }
 
@@ -912,6 +920,9 @@ impl Vcpu {
     /// on retry its load re-traps as a fresh `MmioRead`. Model such a device with a
     /// pure load then a pure store instead.
     pub fn complete_mmio_write(&mut self) {
+        if !self.cpu.mmio_retry_active {
+            self.cpu.begin_mmio_retry(self.cpu.rip);
+        }
         self.cpu.pending_mmio_write = true;
     }
 
@@ -954,14 +965,19 @@ impl Vcpu {
         );
         self.retired += info.retired;
         self.sti_shadow = info.sti_shadow;
-        match r {
+        let result = match r {
             // §17.6 (sub-seam b): re-deliver a real-mode exception through the IVT,
             // mirroring the interpreted-block arm of `run`.
             StepResult::Exit(Exit::Exception { addr, vector }) if self.mode == CpuMode::Real16 => {
                 crate::interp::deliver_interrupt(&mut self.cpu, &vm.mem, addr, vector, addr)
             }
             other => other,
-        }
+        };
+        self.cpu.finish_mmio_retry(match &result {
+            StepResult::Exit(exit) => Some(exit),
+            StepResult::Continue => None,
+        });
+        result
     }
 
     /// Execute until an exit event or budget exhaustion (§5.1, §9.2).
@@ -973,6 +989,7 @@ impl Vcpu {
     /// block, so a tight chained loop yields `BudgetExhausted` (preemption, §9.2).
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         let exit = self.run_inner(vm, budget);
+        self.cpu.finish_mmio_retry(Some(&exit));
         // Published here rather than at each of the inner loop's many exits, so no
         // path can forget it: one shared atomic per run instead of one per transfer.
         // (`executed` needs no flush — compiled code updates it live through
@@ -1032,7 +1049,10 @@ impl Vcpu {
             // value/ack and advances RIP — before dispatching the next block. (Under
             // the interpreter backend this is equivalent to re-dispatching the block;
             // it just does the one faulting instruction first.)
-            if self.cpu.pending_mmio.is_some() || self.cpu.pending_mmio_write {
+            // A RAM fault may have consumed the pending completion while leaving
+            // recorded transfers. Keep that retry on the interpreter until completion;
+            // compiled blocks never inherit answers from a partially serviced operand.
+            if self.cpu.mmio_retry_active {
                 let mut info = crate::interp::RetireInfo::default();
                 let r = crate::interp::step_one(
                     &vm.mem,
@@ -1045,12 +1065,6 @@ impl Vcpu {
                 self.sti_shadow = info.sti_shadow;
                 match r {
                     StepResult::Continue => {
-                        // The faulting instruction finished, so the sub-transfers the
-                        // embedder answered for it are spent. Dropping them
-                        // here — rather than relying on the RIP key alone — is what keeps
-                        // a LOOP that re-reads the same MMIO address from being handed
-                        // the previous iteration's value.
-                        self.cpu.clear_mmio_parts();
                         blocks_run += 1;
                         continue;
                     }

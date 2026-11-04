@@ -2,6 +2,11 @@
 
 use std::fmt;
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static MMIO_CLEAR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use iced_x86::Register;
 
 /// Named guest registers exposed through the public API.
@@ -411,14 +416,24 @@ pub struct CpuState {
     /// fix: four rounds of `run` → `complete_mmio_read` produced four identical exits.
     ///
     /// Keyed by address rather than by transfer index so it does not depend on the
-    /// handlers visiting halves in a particular order. Eight entries covers the widest
-    /// access (64 bytes = eight transfers); a fixed array keeps `CpuState` allocation-free.
-    /// Discarded as soon as RIP leaves `mmio_parts_rip`, so a completed or abandoned
-    /// instruction cannot feed stale values to the next one.
-    pub mmio_parts: [(u64, u64); 8],
+    /// handlers visiting halves in a particular order. The maximum is 64 transfers:
+    /// masked vector operands visit at most 64 / elem elements (elem >= 1), narrowing
+    /// stores visit at most 64 / 2 elements, and unmasked operands use at most eight
+    /// 8-byte transfers.
+    /// The fixed array keeps `CpuState` allocation-free and costs 1024 bytes, 896 more
+    /// than an eight-entry array.
+    /// The interpreter clears these at instruction completion, including ordinary
+    /// retries after a RAM fault. The dispatcher keeps partially serviced instructions
+    /// on that path and clears abandoned retries at exits; explicit RIP writes also
+    /// clear the entries and pending completion.
+    pub mmio_parts: [(u64, u64); 64],
     pub mmio_parts_len: u8,
-    /// Guest RIP the entries in `mmio_parts` belong to.
+    /// Guest RIP owning the retry, including a pending completion with no parts yet.
     pub mmio_parts_rip: u64,
+    /// A retry owns either an outstanding MMIO transfer, a pending completion, or parts.
+    pub mmio_retry_active: bool,
+    /// Code segment owning the retry; a state replacement may redirect code at the same IP.
+    pub mmio_retry_cs: u16,
 }
 
 /// Precision selection for the x87 transcendentals (fsin/fcos/…/fyl2x). The
@@ -476,9 +491,11 @@ impl Default for CpuState {
             fpu_empty: 0xFF,
             fpu_sw: 0,
             fpu_env_tail: [0; 16],
-            mmio_parts: [(0, 0); 8],
+            mmio_parts: [(0, 0); 64],
             mmio_parts_len: 0,
             mmio_parts_rip: 0,
+            mmio_retry_active: false,
+            mmio_retry_cs: 0,
         }
     }
 }
@@ -489,7 +506,7 @@ impl CpuState {
     }
 
     /// A sub-transfer of the instruction at `rip` that the embedder has already
-    /// answered, or `None`. Entries for any other RIP are stale and dropped.
+    /// answered, or `None`. Entries for any other RIP are ignored.
     pub fn mmio_part(&self, rip: u64, addr: u64) -> Option<u64> {
         if self.mmio_parts_rip != rip {
             return None;
@@ -501,31 +518,74 @@ impl CpuState {
     }
 
     /// Record an answered sub-transfer for the instruction at `rip`. Switching RIP
-    /// discards the previous instruction's entries, which is what keeps a completed or
-    /// abandoned instruction from feeding stale values to the next one.
+    /// discards the previous instruction's entries. Completion and abandonment also
+    /// clear them explicitly, since the next execution can have the same RIP.
     ///
-    /// Silently drops the entry if the table is full. That is a bounded, benign loss —
-    /// it means an access wider than eight transfers, which no lifted instruction
-    /// produces, and the consequence is the old behaviour (re-trap) rather than a wrong
-    /// value.
+    /// Lifted vector instructions produce at most 64 transfers. Exceeding that bound
+    /// asserts in debug builds; release builds drop the excess entry, so a retry asks
+    /// again instead of reusing another transfer's value.
     pub fn record_mmio_part(&mut self, rip: u64, addr: u64, value: u64) {
-        if self.mmio_parts_rip != rip {
-            self.mmio_parts_rip = rip;
-            self.mmio_parts_len = 0;
-        }
+        self.begin_mmio_retry(rip);
         if self.mmio_part(rip, addr).is_some() {
             return;
         }
+        debug_assert!(
+            (self.mmio_parts_len as usize) < self.mmio_parts.len(),
+            "vector instruction exceeded the MMIO transfer bound"
+        );
         if let Some(slot) = self.mmio_parts.get_mut(self.mmio_parts_len as usize) {
             *slot = (addr, value);
             self.mmio_parts_len += 1;
         }
     }
 
-    /// Drop every recorded sub-transfer — the instruction finished or was abandoned.
+    /// Drop recorded transfers and the pending completion when an instruction finishes
+    /// or is abandoned, including a completion made unnecessary by a changed mask.
     pub fn clear_mmio_parts(&mut self) {
+        #[cfg(test)]
+        MMIO_CLEAR_CALLS.with(|calls| calls.set(calls.get() + 1));
+        if !self.mmio_retry_active {
+            return;
+        }
+        self.pending_mmio = None;
+        self.pending_mmio_write = false;
         self.mmio_parts_len = 0;
         self.mmio_parts_rip = 0;
+        self.mmio_retry_active = false;
+        self.mmio_retry_cs = 0;
+    }
+
+    pub(crate) fn owns_mmio_retry(&self, rip: u64) -> bool {
+        self.mmio_parts_rip == rip && self.mmio_retry_cs == self.cs
+    }
+
+    pub(crate) fn begin_mmio_retry(&mut self, rip: u64) {
+        if self.mmio_retry_active && !self.owns_mmio_retry(rip) {
+            self.clear_mmio_parts();
+        }
+        self.mmio_retry_active = true;
+        self.mmio_parts_rip = rip;
+        self.mmio_retry_cs = self.cs;
+    }
+
+    /// Common retry/abandonment policy for interpretation, stepping and dispatch exits.
+    pub(crate) fn finish_mmio_retry(&mut self, exit: Option<&crate::exit::Exit>) {
+        use crate::exit::Exit;
+        let retry = matches!(
+            exit,
+            Some(
+                Exit::MmioRead { .. }
+                    | Exit::MmioWrite { .. }
+                    | Exit::UnmappedMemory { .. }
+                    | Exit::BudgetExhausted
+            )
+        );
+        if self.mmio_retry_active && (!retry || !self.owns_mmio_retry(self.rip)) {
+            self.clear_mmio_parts();
+        }
+        if matches!(exit, Some(Exit::MmioRead { .. } | Exit::MmioWrite { .. })) {
+            self.begin_mmio_retry(self.rip);
+        }
     }
 
     /// The full 512-bit value of vector register `reg` as four 128-bit lanes, low→high:

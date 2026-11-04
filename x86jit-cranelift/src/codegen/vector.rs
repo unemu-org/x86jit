@@ -128,6 +128,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *bytes as u8);
         let reg = self.iconst(*dst as u64);
         let kk = self.iconst(*k as u64);
         let el = self.iconst(*elem as u64);
@@ -155,6 +156,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *bytes as u8);
         let reg = self.iconst(*src as u64);
         let kk = self.iconst(*k as u64);
         let el = self.iconst(*elem as u64);
@@ -208,6 +210,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, bytes as u8);
         let reg = self.iconst(reg as u64);
         let m = self.iconst(mask as u64);
         let el = self.iconst(elem as u64);
@@ -782,6 +785,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *bytes as u8);
         let d = self.iconst(*dst as u64);
         let ix = self.iconst(*idx as u64);
         let el = self.iconst(*elem as u64);
@@ -841,6 +845,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *bytes as u8);
         let d = self.iconst(*dst as u64);
         let ix = self.iconst(*idx as u64);
         let el = self.iconst(*elem as u64);
@@ -1127,6 +1132,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *bytes as u8);
         let d = self.iconst(*dst as u64);
         let av = self.iconst(*a as u64);
         let im = self.iconst(*imm as u64);
@@ -2056,6 +2062,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, (*src_width / u16::from(*from) * u16::from(*to)) as u8);
         let s = self.iconst(*src as u64);
         let fr = self.iconst(*from as u64);
         let t = self.iconst(*to as u64);
@@ -2695,6 +2702,18 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(
+            base,
+            if *scalar {
+                if matches!(prec, FPrec::F64) {
+                    8
+                } else {
+                    4
+                }
+            } else {
+                *bytes as u8
+            },
+        );
         let d = self.iconst(*dst as u64);
         let xv = self.iconst(*x as u64);
         let yv = self.iconst(*y as u64);
@@ -2765,6 +2784,7 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
+        self.defer_mmio(base, *chunk);
         let d = self.iconst(*dst as u64);
         let ch = self.iconst(*chunk as u64);
         let el = self.iconst(*elem as u64);

@@ -50,12 +50,15 @@ pub fn step_one(
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> StepResult {
+    if cpu.mmio_retry_active && !cpu.owns_mmio_retry(cpu.rip) {
+        cpu.clear_mmio_parts();
+    }
     // §17.6: in Real16 `cpu.rip` is the 16-bit IP; code is fetched from
     // `cs_base + IP`. `FetchAddr::for_mode` forms the physical fetch address while the
     // decoder still resolves against the IP (Long64/Compat32 are flat: pa == ip).
     let at = crate::lift::FetchAddr::for_mode(mode, cpu.rip, cpu.cs);
-    match crate::lift::lift_one(mem, at, mode) {
-        Ok(ir) => interpret_block(&ir, cpu, mem, scratch, info),
+    let result = match crate::lift::lift_one(mem, at, mode) {
+        Ok(ir) => return interpret_block(&ir, cpu, mem, scratch, info),
         Err(crate::lift::LiftError::Unsupported { addr, bytes, len }) => {
             StepResult::Exit(Exit::UnknownInstruction { addr, bytes, len })
         }
@@ -65,10 +68,30 @@ pub fn step_one(
                 access: AccessKind::Execute,
             })
         }
+    };
+    if let StepResult::Exit(exit) = &result {
+        cpu.finish_mmio_retry(Some(exit));
     }
+    result
 }
 
 pub fn interpret_block(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    scratch: &mut Vec<u64>,
+    info: &mut RetireInfo,
+) -> StepResult {
+    // One predictable retry-state branch per block. Const specialization removes
+    // retry cleanup from every instruction boundary and the end of a no-MMIO block.
+    if cpu.mmio_retry_active {
+        interpret_block_inner::<true>(ir, cpu, mem, scratch, info)
+    } else {
+        interpret_block_inner::<false>(ir, cpu, mem, scratch, info)
+    }
+}
+
+fn interpret_block_inner<const RETRY: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -99,7 +122,7 @@ pub fn interpret_block(
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
     // `sti_shadow` are threaded by `&mut` and read afterwards.
-    let result = walk_ops(
+    let result = walk_ops::<RETRY>(
         ir,
         cpu,
         mem,
@@ -119,6 +142,19 @@ pub fn interpret_block(
     if started && cpu.rip != cur_addr {
         retired += 1;
     }
+    // MMIO can activate a retry only on exit, so the ordinary block walk needs
+    // no dynamic retry-state checks. An active retry can also survive a RAM fault.
+    if RETRY
+        || matches!(
+            result,
+            StepResult::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+        )
+    {
+        cpu.finish_mmio_retry(match &result {
+            StepResult::Exit(exit) => Some(exit),
+            StepResult::Continue => None,
+        });
+    }
     info.retired = retired;
     // Report the STI shadow only when the last retiring instruction was `sti`. If that
     // `sti` did NOT retire (a self-trap is impossible for `sti`, but guard anyway), the
@@ -131,7 +167,7 @@ pub fn interpret_block(
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters (`cur_addr`/`retired`/`started`/`sti_shadow`).
 #[allow(clippy::too_many_arguments)]
-fn walk_ops(
+fn walk_ops<const RETRY: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -145,6 +181,10 @@ fn walk_ops(
     for op in &ir.ops {
         match op {
             IrOp::InsnStart { guest_addr } => {
+                if RETRY && cpu.mmio_retry_active && (*started || !cpu.owns_mmio_retry(*guest_addr))
+                {
+                    cpu.clear_mmio_parts();
+                }
                 if *started {
                     *retired += 1; // the previous instruction completed
                 }
@@ -1233,9 +1273,9 @@ fn walk_ops(
                 zeroing,
                 bytes,
             } => {
-                if let Some(r) =
-                    exec_v_gf2p8_m(cpu, mem, temps, dst, a, addr, imm, mode, k, zeroing, bytes)
-                {
+                if let Some(r) = exec_v_gf2p8_m(
+                    cpu, mem, temps, *cur_addr, dst, a, addr, imm, mode, k, zeroing, bytes,
+                ) {
                     return r;
                 }
             }
@@ -3273,18 +3313,8 @@ fn load_lane16<M: StrMem>(
     ea: u64,
     cur_addr: u64,
 ) -> Result<u128, StrFault> {
-    let half = |addr: u64, cpu: &mut CpuState| match mem.sload(addr, 8) {
-        Ok(v) => Ok(v),
-        Err(trap) => {
-            cpu.rip = cur_addr;
-            Err(StrFault {
-                addr,
-                write: false,
-                trap,
-                value: 0,
-                elem: 8,
-            })
-        }
+    let half = |addr: u64, cpu: &mut CpuState| {
+        vpart(cpu, mem, cur_addr, addr, 8).map_err(|f| f.into_str_fault(cpu, cur_addr, false))
     };
     let lo = half(ea, cpu)?;
     let hi = half(ea + 8, cpu)?;
@@ -3704,31 +3734,33 @@ pub fn gf2p8_mem_run<M: StrMem>(
     let op = crate::ir::GfniOp::from_u8(mode);
     let al = cpu.vec_lanes(a as usize);
     let mut r = [0u128; 4];
-    for lane in 0..(bytes as usize / 16) {
-        let cea = addr.wrapping_add(lane as u64 * 16);
-        // Report the fault at the actual failing 8-byte sub-address, not the lane base:
-        // the matrix is two `sload(..,8)` halves, and only one may be unmapped. A real
-        // CPU's #PF si_addr points at the touched byte, and because this ONE function is
-        // shared by both the interpreter (`&Memory`) and the JIT helper (`RawStrMem`),
-        // interp and JIT stay byte-identical on the reported address. The low half is
-        // touched first, so it takes precedence when both would fault.
-        let sub_fault = |off: u64, t: MemTrap| StrFault {
-            addr: cea.wrapping_add(off),
-            write: false,
-            trap: t,
-            value: 0,
-            elem: 8,
-        };
-        let lo = match mem.sload(cea, 8) {
-            Ok(v) => v,
-            Err(t) => return Some(sub_fault(0, t)),
-        };
-        let hi = match mem.sload(cea.wrapping_add(8), 8) {
-            Ok(v) => v,
-            Err(t) => return Some(sub_fault(8, t)),
-        };
-        let bl = ((hi as u128) << 64) | lo as u128;
-        r[lane] = op.apply(al[lane], bl, imm);
+    let mut bl = [0u128; 4];
+    if k != 0 && matches!(op, crate::ir::GfniOp::Mulb) {
+        // SDM Vol 1 §15.6.1; Vol 2A §2.8.4 and GF2P8MULB, Description:
+        // masked multiply suppresses memory faults at byte granularity.
+        for i in 0..bytes as usize {
+            if cpu.kmask[k as usize] & (1 << i) != 0 {
+                let ea = addr.wrapping_add(i as u64);
+                let v = match vpart(cpu, mem, cpu.rip, ea, 1) {
+                    Ok(v) => v,
+                    Err(f) => return Some(f.into_str_fault(cpu, cpu.rip, false)),
+                };
+                set_velem(&mut bl, i, 1, v);
+            }
+        }
+    } else {
+        // SDM Vol 2A, GF2P8AFFINEQB/GF2P8AFFINEINVQB, Description:
+        // affine forms do not support memory fault suppression.
+        for (lane, slot) in bl.iter_mut().enumerate().take(bytes as usize / 16) {
+            let ea = addr.wrapping_add(lane as u64 * 16);
+            *slot = match load_lane16(cpu, mem, ea, cpu.rip) {
+                Ok(v) => v,
+                Err(f) => return Some(f),
+            };
+        }
+    }
+    for lane in 0..bytes as usize / 16 {
+        r[lane] = op.apply(al[lane], bl[lane], imm);
     }
     if k == 0 {
         cpu.set_vec(dst as usize, r, bytes);
@@ -4677,23 +4709,29 @@ pub fn broadcast_lane_mem_run<M: StrMem>(
     cur_addr: u64,
 ) -> Option<StrFault> {
     let mut sb = [0u8; 64];
-    // Load the chunk 8 bytes at a time (chunk is 8/16/32).
-    let mut off = 0usize;
-    while off < chunk as usize {
-        match mem.sload(base.wrapping_add(off as u64), 8) {
-            Ok(v) => sb[off..off + 8].copy_from_slice(&v.to_le_bytes()),
-            Err(t) => {
-                cpu.rip = cur_addr;
-                return Some(StrFault {
-                    addr: base.wrapping_add(off as u64),
-                    write: false,
-                    trap: t,
-                    value: 0,
-                    elem: 8,
-                });
+    // SDM Vol 1 §15.6.1; Vol 2A §2.8.6; Vol 2C, VPBROADCAST, Operation:
+    // each active output selects its source element modulo the broadcast chunk.
+    // Repeated outputs need only one read of their shared source element.
+    let transfer = if masked { elem as usize } else { 8 };
+    for off in (0..chunk as usize).step_by(transfer) {
+        if masked {
+            let needed = (off / elem as usize..dst_width as usize / elem as usize)
+                .step_by(chunk as usize / elem as usize)
+                .any(|i| cpu.kmask[k as usize] & (1 << i) != 0);
+            if !needed {
+                continue;
             }
         }
-        off += 8;
+        match vpart(
+            cpu,
+            mem,
+            cur_addr,
+            base.wrapping_add(off as u64),
+            transfer as u8,
+        ) {
+            Ok(v) => sb[off..off + transfer].copy_from_slice(&v.to_le_bytes()[..transfer]),
+            Err(f) => return Some(f.into_str_fault(cpu, cur_addr, false)),
+        }
     }
     let res = broadcast_lane_lanes(&sb, chunk as usize, dst_width as usize);
     if masked {
@@ -4831,30 +4869,38 @@ pub fn fma_mem_run<M: StrMem>(
     let elem = prec.bytes();
     // Load the memory operand: a scalar (low element) or a full `bytes`-wide vector.
     let mut memv = [0u128; 4];
-    let count = if scalar { 1 } else { bytes as usize / 16 };
-    for (i, slot) in memv.iter_mut().enumerate().take(count.max(1)) {
-        if scalar {
-            let lo = match mem.sload(base, elem) {
-                Ok(v) => v,
-                Err(t) => {
-                    cpu.rip = cur_addr;
-                    return Some(StrFault {
-                        addr: base,
-                        write: false,
-                        trap: t,
-                        value: 0,
-                        elem,
-                    });
-                }
-            };
-            *slot = lo as u128;
-            break;
-        }
-        let ea = base.wrapping_add(i as u64 * 16);
-        *slot = match load_lane16(cpu, mem, ea, cur_addr) {
-            Ok(v) => v,
-            Err(f) => return Some(f),
+    if let Some(k) = writemask {
+        // SDM Vol 1 §15.6.1; Vol 2A §2.8.2, Table 2-48 (Type E2);
+        // Vol 2C, VFMADD132PS/VFMADD213PS/VFMADD231PS, Operation:
+        // masked-off elements suppress memory faults; active loads keep their width.
+        let count = if scalar {
+            1
+        } else {
+            bytes as usize / elem as usize
         };
+        for i in 0..count {
+            if cpu.kmask[k as usize] & (1 << i) != 0 {
+                let ea = base.wrapping_add((i * elem as usize) as u64);
+                let v = match vpart(cpu, mem, cur_addr, ea, elem) {
+                    Ok(v) => v,
+                    Err(f) => return Some(f.into_str_fault(cpu, cur_addr, false)),
+                };
+                set_velem(&mut memv, i, elem, v);
+            }
+        }
+    } else if scalar {
+        memv[0] = match vpart(cpu, mem, cur_addr, base, elem) {
+            Ok(v) => v as u128,
+            Err(f) => return Some(f.into_str_fault(cpu, cur_addr, false)),
+        };
+    } else {
+        for (i, slot) in memv.iter_mut().enumerate().take(bytes as usize / 16) {
+            let ea = base.wrapping_add(i as u64 * 16);
+            *slot = match load_lane16(cpu, mem, ea, cur_addr) {
+                Ok(v) => v,
+                Err(f) => return Some(f),
+            };
+        }
     }
     let xv = if mem_role == 0 {
         memv
@@ -5040,6 +5086,19 @@ pub(crate) struct VecFault {
     pub value: u64,
 }
 
+impl VecFault {
+    fn into_str_fault(self, cpu: &mut CpuState, cur_addr: u64, write: bool) -> StrFault {
+        cpu.rip = cur_addr;
+        StrFault {
+            addr: self.at,
+            write,
+            trap: self.trap,
+            value: self.value,
+            elem: self.size,
+        }
+    }
+}
+
 /// One 8-byte-or-narrower transfer of a vector access, with MMIO resumption.
 ///
 /// `cur_addr` is the faulting instruction's address; it keys the sub-transfers the
@@ -5049,9 +5108,9 @@ pub(crate) struct VecFault {
 /// and the second traps with nothing left — then the retry starts over and the first
 /// traps again. Measured before this existed: four `run` → `complete_mmio_read` rounds
 /// produced four identical exits.
-fn vpart(
+fn vpart<M: StrMem>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &M,
     cur_addr: u64,
     at: u64,
     size: u8,
@@ -5059,7 +5118,7 @@ fn vpart(
     if let Some(v) = cpu.mmio_part(cur_addr, at) {
         return Ok(v);
     }
-    match mem.read(at, size) {
+    match mem.sload(at, size) {
         Ok(v) => Ok(v),
         Err(MemTrap::Mmio) => match cpu.pending_mmio.take() {
             // The embedder answered THIS transfer since the last attempt. Record it so
@@ -5088,9 +5147,9 @@ fn vpart(
 /// The store counterpart of [`vpart`]. An acknowledgement is recorded the same way, with
 /// a zero value — only its presence matters, and sharing one table means a 16-byte store
 /// converges for the same reason a load does.
-fn vpart_store(
+fn vpart_store<M: StrMem>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &M,
     cur_addr: u64,
     at: u64,
     v: u64,
@@ -5099,7 +5158,7 @@ fn vpart_store(
     if cpu.mmio_part(cur_addr, at).is_some() {
         return Ok(());
     }
-    match mem.write(at, v, size) {
+    match mem.sstore(at, v, size) {
         Ok(()) => Ok(()),
         Err(MemTrap::Mmio) => {
             if cpu.pending_mmio_write {
@@ -5656,18 +5715,9 @@ pub fn masked_load_run<M: StrMem>(
     for i in 0..n {
         if k & (1 << i) != 0 {
             let ea = base.wrapping_add((i * elem as usize) as u64);
-            match mem.sload(ea, elem) {
+            match vpart(cpu, mem, cur_addr, ea, elem) {
                 Ok(v) => set_velem(&mut lanes, i, elem, v),
-                Err(t) => {
-                    cpu.rip = cur_addr;
-                    return Some(StrFault {
-                        addr: ea,
-                        write: false,
-                        trap: t,
-                        value: 0,
-                        elem,
-                    });
-                }
+                Err(f) => return Some(f.into_str_fault(cpu, cur_addr, false)),
             }
         } else if zeroing {
             set_velem(&mut lanes, i, elem, 0);
@@ -5699,15 +5749,8 @@ pub fn masked_store_run<M: StrMem>(
         if k & (1 << i) != 0 {
             let ea = base.wrapping_add((i * elem as usize) as u64);
             let v = get_velem(&lanes, i, elem);
-            if let Err(t) = mem.sstore(ea, v, elem) {
-                cpu.rip = cur_addr;
-                return Some(StrFault {
-                    addr: ea,
-                    write: true,
-                    trap: t,
-                    value: v,
-                    elem,
-                });
+            if let Err(f) = vpart_store(cpu, mem, cur_addr, ea, v, elem) {
+                return Some(f.into_str_fault(cpu, cur_addr, true));
             }
         }
     }
@@ -5735,15 +5778,8 @@ pub fn narrow_store_run<M: StrMem>(
     for i in 0..n {
         let v = get_velem(&lanes, i, from); // sstore truncates to `to` bytes on write
         let ea = base.wrapping_add((i * to as usize) as u64);
-        if let Err(t) = mem.sstore(ea, v, to) {
-            cpu.rip = cur_addr;
-            return Some(StrFault {
-                addr: ea,
-                write: true,
-                trap: t,
-                value: v,
-                elem: to,
-            });
+        if let Err(f) = vpart_store(cpu, mem, cur_addr, ea, v, to) {
+            return Some(f.into_str_fault(cpu, cur_addr, true));
         }
     }
     None
@@ -7745,5 +7781,34 @@ mod nan_rule_tests {
         assert_eq!(f32_to_f16(f(0x7F80_0001), 0), 0x7E00);
         // A payload that does survive the shift is carried, not overwritten.
         assert_eq!(f32_to_f16(f(0x7FC0_2000), 0), 0x7E01);
+    }
+}
+
+#[cfg(test)]
+mod mmio_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn no_mmio_block_does_not_clear_retry_fields() {
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x10000));
+        vm.map(0x1000, 0x1000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        // The instruction count varies while the retry-cleanup cost stays zero.
+        for instructions in [1, 32] {
+            let mut code = vec![0x90; instructions];
+            code.push(0xf4);
+            vm.write_bytes(0x1000, &code).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            crate::state::MMIO_CLEAR_CALLS.with(|calls| calls.set(0));
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+            crate::state::MMIO_CLEAR_CALLS.with(|calls| {
+                assert_eq!(
+                    calls.get(),
+                    0,
+                    "inactive retry fields were cleared for {instructions} instructions"
+                );
+            });
+        }
     }
 }

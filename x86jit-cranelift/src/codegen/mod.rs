@@ -2423,6 +2423,36 @@ impl Translator<'_, '_> {
         self.builder.ins().bxor_imm(b, 1)
     }
 
+    /// Defer before any access overlapping the Trap window (§5.2). Masked operands
+    /// use their full span here; the interpreter applies instruction-specific memory
+    /// masking rules.
+    fn defer_mmio(&mut self, addr: Value, size: u8) {
+        if let Some((lo, hi)) = self.mmio {
+            // An access can start before the window and still overlap it.
+            let first = self.iconst(lo.saturating_sub(u64::from(size) - 1));
+            let end = self.iconst(hi);
+            let ge = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, first);
+            let lt = self.builder.ins().icmp(IntCC::UnsignedLessThan, addr, end);
+            let overlaps = self.builder.ins().band(ge, lt);
+            // Sparse helpers form element addresses with wrapping_add. Any wrapped
+            // span can reach the Trap window even when its base is above the window.
+            let last_base = self.iconst(u64::MAX - (u64::from(size) - 1));
+            let wraps = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, addr, last_base);
+            let defer = self.builder.ins().bor(overlaps, wraps);
+            let ok = self.begin_trap_fork(defer);
+            let rip = self.iconst(self.cur_addr);
+            self.store_cpu(self.offsets.rip, rip);
+            self.ret(RET_MMIO_DEFER);
+            self.builder.switch_to_block(ok);
+        }
+    }
+
     // --- memory ---
 
     /// Bounds-check `[addr, addr+size)` against the guest buffer; on failure store
@@ -2505,33 +2535,7 @@ impl Translator<'_, '_> {
         self.ret(RET_UNMAPPED);
 
         self.builder.switch_to_block(ok);
-        // MMIO detection (§5.2, M4-T10): if the VM has Trap regions, an inlined
-        // access whose address falls in the baked `[lo, hi)` window is deferred to
-        // the interpreter — the block commits nothing of the faulting instruction,
-        // sets RIP to it, and returns `RET_MMIO_DEFER`. Nothing emitted when the VM
-        // has no MMIO regions (`self.mmio == None`), so the hot path is unchanged.
-        if let Some((lo, hi)) = self.mmio {
-            let lo_c = self.iconst(lo);
-            let hi_c = self.iconst(hi);
-            let ge = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, lo_c);
-            let lt = self.builder.ins().icmp(IntCC::UnsignedLessThan, addr, hi_c);
-            let in_trap = self.builder.ins().band(ge, lt);
-            let defer = self.builder.create_block();
-            let cont = self.builder.create_block();
-            self.builder.ins().brif(in_trap, defer, &[], cont, &[]);
-            self.builder.seal_block(defer);
-            self.builder.seal_block(cont);
-
-            self.builder.switch_to_block(defer);
-            let rip = self.iconst(self.cur_addr);
-            self.store_cpu(self.offsets.rip, rip);
-            self.ret(RET_MMIO_DEFER);
-
-            self.builder.switch_to_block(cont);
-        }
+        self.defer_mmio(addr, size);
         let base = self.load_mem(MEMCTX_BASE);
         // `base` is the host address of guest `guest_base`. Rebase the guest address to a
         // backing offset before adding — but only when the base is non-zero, so the zero

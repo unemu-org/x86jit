@@ -2262,13 +2262,23 @@ pub(crate) fn exec_v_broadcast_m(
     w256: &bool,
 ) -> Option<StepResult> {
     let a = read_val(*addr, &*temps);
-    match mem.read(a, *elem) {
+    match vpart(cpu, mem, cur_addr, a, *elem) {
         Ok(e) => {
             let v = broadcast_elem(e as u128, *elem);
             cpu.xmm[*dst as usize] = v;
             cpu.ymm_hi[*dst as usize] = if *w256 { v } else { 0 };
         }
-        Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *elem, AccessKind::Read, 0)),
+        Err(f) => {
+            return Some(trap_out(
+                cpu,
+                cur_addr,
+                f.trap,
+                f.at,
+                f.size,
+                AccessKind::Read,
+                0,
+            ))
+        }
     }
     None
 }
@@ -3324,6 +3334,7 @@ pub(crate) fn exec_v_gf2p8_m(
     cpu: &mut CpuState,
     mem: &Memory,
     temps: &mut [u64],
+    cur_addr: u64,
     dst: &u8,
     a: &u8,
     addr: &Val,
@@ -3334,8 +3345,16 @@ pub(crate) fn exec_v_gf2p8_m(
     bytes: &u16,
 ) -> Option<StepResult> {
     let ea = read_val(*addr, &*temps);
-    super::gf2p8_mem_run(cpu, mem, *dst, *a, ea, *imm, *mode, *k, *zeroing, *bytes)
-        .map(|f| StepResult::Exit(str_fault_exit(f)))
+    // The shared helper takes its instruction address from CpuState.
+    let saved_rip = cpu.rip;
+    cpu.rip = cur_addr;
+    match super::gf2p8_mem_run(cpu, mem, *dst, *a, ea, *imm, *mode, *k, *zeroing, *bytes) {
+        Some(f) => Some(StepResult::Exit(str_fault_exit(f))),
+        None => {
+            cpu.rip = saved_rip;
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
