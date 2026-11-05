@@ -235,7 +235,7 @@ impl Default for Flags {
 impl Flags {
     /// PF — even parity of the low byte of the last result.
     pub fn pf(&self) -> bool {
-        self.pf_src.count_ones() % 2 == 0
+        self.pf_src.count_ones().is_multiple_of(2)
     }
 
     /// Set PF to a known value (`popf`, the BCD instructions, forced-flag sites).

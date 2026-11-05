@@ -49,7 +49,8 @@ that changes.
 | `interp` | IR interpreter: `interpret_block` over a Vcpu-reused temps buffer, Variant-A flags, RIP-on-trap; also the shared `string_run`/`divide`/`crc32c` helpers the JIT calls (§8.1) |
 | `x87` | x87 FPU exec (`exec_x87`/`exec_fxstate`), shared by both backends; register file is `[F80; 8]` (§14) |
 | `f80` | software 80-bit extended float (`F80`) — true x87 precision, rounds each op to a 64-bit significand; pure Rust (portable across x86/ARM) (§14) |
-| `jit_abi` | compiled-block ABI (shared with the JIT crate): `MemCtx`, `CpuOffsets`, result codes, `run_compiled` (§8.2.1-2) |
+| `jit_abi` | compiled-block ABI (shared with the JIT crate): `MemCtx`, `CpuOffsets`, result codes, `run_compiled`; `jit_abi::fault` owns per-run records, one-frame unwind recipes, mangled naked landing stubs and signal-context classification (§8.2.1-2) |
+| `codemap` | immutable host ranges, source locations, exact transfer sites and compiler-derived unwind recipes, published together for signal-safe lookup (§8.2) |
 | `disasm` | decode-and-print helper: `disassemble`, `print_disassembly`, `DecodedInsn` (inspection only, §12 M0) |
 | `exit` | `Exit`, `AccessKind`, `StepResult` (§5, §8) |
 | `cache` | `TranslationCache`, `CachedBlock`, `CompiledPtr`; SMC page-tag mark/clear run through `insert`/`invalidate_overlapping` callbacks under the spans lock (§9) |
@@ -66,6 +67,16 @@ guest bytes → iced-x86 decode → lift → IR (IrBlock) → backend.materializ
 ```
 
 Hot path (RAM access) is **inlined** into generated code — never a callback. Rare events (syscall, MMIO, unknown instruction) **trap out** through `Exit` (§1 boundary rule).
+
+Compiled fault recovery keeps each dispatcher call direct. The Cranelift backend's
+`unwind` module extracts one-frame save-slot recipes at compilation and publishes
+them with exact trap sites. `Vcpu::run` publishes its record once; an embedder's
+signal adapter derives Access/Alignment from the OS reason (saved ESR on macOS
+AArch64), restores the outermost compiled frame and returns through a mangled
+naked landing stub. Alignment faults replay in the interpreter; run-record cleanup
+also runs on panic. AArch64 adapters copy LR, scratch and d8–d15 as well as
+preserved GPRs; nested compiled frames and Rust helpers are rejected. See
+[decision-13](../decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md).
 
 The KVM-style split: **`Vm`** owns shared state (memory + cache); **`Vcpu`** owns per-thread `CpuState` and its own `run()` loop. Many `Vcpu`s over one `Vm` is the path to multithreading (§2, §11).
 

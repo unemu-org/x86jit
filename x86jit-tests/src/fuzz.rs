@@ -1468,7 +1468,7 @@ fn prog_fp_widths(prog: &Prog) -> Vec<u32> {
             }
             // VNew 0..=9: roundps/pd/ss/sd, hadd/hsub ps/pd, addsub ps/pd — even = f32, odd = f64.
             FuzzInsn::VNew { op, .. } if (*op % V_NEW_OPS as u8) <= 9 => {
-                w.insert(if (*op % V_NEW_OPS as u8) % 2 == 0 {
+                w.insert(if (*op % V_NEW_OPS as u8).is_multiple_of(2) {
                     4
                 } else {
                     8
@@ -2876,7 +2876,7 @@ mod campaign_tests {
                         o + 32 <= VSCRATCH_LEN,
                         "a {o:#x} operand runs past the mapped region"
                     );
-                    if o % 32 == 0 {
+                    if o.is_multiple_of(32) {
                         aligned += 1;
                     } else {
                         unaligned += 1;

@@ -9,8 +9,9 @@ use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 use crate::exit::{AccessKind, Exit, StepResult};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
-    call_block, MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
-    RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_SYSCALL, RET_UNMAPPED,
+    call_block, MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_HOST_FAULT,
+    RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_SYSCALL,
+    RET_UNMAPPED,
 };
 use crate::lift::{lift_block, lift_region, CpuMode, FetchAddr, LiftError};
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
@@ -657,6 +658,7 @@ impl Vm {
             fast_epoch: self.cache.epoch(),
             ibtc_refills: HashMap::new(),
             ret_stack: Box::new(RetStack::new()),
+            fault_entry: Box::default(),
             fast_hits: 0,
             chained: 0,
             executed: 0,
@@ -749,6 +751,7 @@ pub struct Vcpu {
     /// calls (syscall exits re-enter `run()` constantly); its `sp` resets on an
     /// invalidation-epoch change. Boxed for a stable address and a small `Vcpu`.
     ret_stack: Box<RetStack>,
+    fault_entry: Box<crate::jit_abi::fault::EntryRecord>,
     /// Fast-resolve cache hits over this vcpu's lifetime. A plain counter, not atomic —
     /// a shared atomic here would reintroduce exactly the contention the private cache
     /// removes. Read via [`Vcpu::fast_hits`].
@@ -1086,6 +1089,12 @@ impl Vcpu {
         result
     }
 
+    /// Obtain a stable signal-handler handle. It remains valid until this vCPU is
+    /// dropped, including across moves. See `jit_abi::fault::classify` for safety.
+    pub fn fault_handle(&self) -> crate::jit_abi::fault::FaultHandle {
+        self.fault_entry.handle()
+    }
+
     /// Execute until an exit event or budget exhaustion (§5.1, §9.2).
     /// `budget` is measured in blocks (§5.1 recommendation).
     ///
@@ -1096,7 +1105,20 @@ impl Vcpu {
     /// A host request yields `Interrupted` at the next checked boundary; REP may
     /// have made partial progress and resumes at the string instruction.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+        self.fault_entry.prepare_run();
+        struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
+        impl Drop for FaultRunGuard {
+            fn drop(&mut self) {
+                // SAFETY: the boxed record stays live and fixed throughout run's
+                // exclusive vCPU borrow, including while run_inner unwinds.
+                unsafe {
+                    (*self.0).deactivate();
+                }
+            }
+        }
+        let fault_run = FaultRunGuard(&mut *self.fault_entry);
         let exit = self.run_inner(vm, budget);
+        drop(fault_run);
         self.cpu.finish_mmio_retry(Some(&exit));
         if matches!(exit, Exit::Interrupted) {
             // Acquire the writes published by the consumed request. A later
@@ -1145,6 +1167,7 @@ impl Vcpu {
         // Deliberately a LOCAL: taking it as a `&mut` parameter instead measured +5.4%
         // on the dispatch-micro bench, because the compiler stops treating it as one.
         let mut ctx = MemCtx::for_memory(&vm.mem);
+        self.fault_entry.publish(&mut self.cpu, &mut ctx);
         ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
         // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
         // boxed, so its address is stable for the whole run despite `&mut self`.
@@ -1498,10 +1521,20 @@ impl Vcpu {
                             RET_SYSCALL => return Exit::Syscall,
                             RET_HLT => return Exit::Hlt,
                             RET_UNMAPPED => return ctx.unmapped_exit(),
-                            // Inlined access to a Trap region: single-step
-                            // the faulting instruction on the interpreter, which
-                            // produces the MmioRead/Write exit (nothing committed).
-                            RET_MMIO_DEFER => {
+                            RET_HOST_FAULT
+                                if self.fault_entry.fault_kind()
+                                    != crate::jit_abi::fault::HostFaultKind::Alignment
+                                    && vm.mem.probe_write(ctx.fault_addr, 1).is_ok() =>
+                            {
+                                // A mapped page protected by the embedder would fault
+                                // again inside the interpreter. Leave it to the embedder.
+                                return ctx.unmapped_exit();
+                            }
+                            RET_MMIO_DEFER | RET_HOST_FAULT => {
+                                // Trap-region accesses replay to produce MMIO exits.
+                                // Host faults reach replay only for unmapped addresses
+                                // or alignment faults. Misaligned locked operations
+                                // currently replay non-atomically (tracked in xj-0w3.5).
                                 // Interpreter single-step (not the hot compiled loop):
                                 // tick the retired counter for the one instruction it
                                 // may retire (§17.6, sub-seam c).

@@ -18,6 +18,10 @@ status: accepted
 > before it execve's — lack guards, a backing property (the core can't allocate host
 > RAM), not a reachable real-guest gap.
 
+> **2026-11-05 01:10 draft amendment:** [decision-13](decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md)
+> supersedes GP-2's longjmp/glibc recovery with a core signal-context landing pad
+> for inline compiled guest accesses; GP-1 and GP-3 remain in effect.
+
 ## Context
 
 A guest access inside the flat span but outside every mapped region diverged: the

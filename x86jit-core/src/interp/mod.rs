@@ -6308,7 +6308,7 @@ fn sign_extend(v: u64, from: u8) -> u64 {
 }
 
 fn parity(v: u64) -> bool {
-    (v as u8).count_ones() % 2 == 0
+    (v as u8).count_ones().is_multiple_of(2)
 }
 
 /// `pshufb` byte shuffle: each result byte is selected from `data` by the low

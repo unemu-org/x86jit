@@ -15,6 +15,8 @@ use crate::exit::{AccessKind, Exit, StepResult};
 use crate::memory::Memory;
 use crate::state::CpuState;
 
+pub mod fault;
+
 /// Every compiled block shares this signature so the dispatcher jumps in
 /// uniformly (§8.2.1).
 pub type CompiledFn = unsafe extern "C" fn(cpu: *mut u8, mem: *mut u8) -> u64;
@@ -57,6 +59,8 @@ pub const RET_MMIO_DEFER: u64 = 8;
 pub const RET_PORTIO_DEFER: u64 = 9;
 /// A string helper stopped between iterations; the dispatcher consumes the request.
 pub const RET_INTERRUPTED: u64 = 10;
+/// Returned only by the signal-context landing pad; see [`fault`].
+pub const RET_HOST_FAULT: u64 = 11;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -369,6 +373,7 @@ impl MemCtx {
 /// # Safety
 /// `entry` must point at a block compiled to this exact ABI, alive in the JIT
 /// arena for the call. `cpu` is exclusive; `ctx` wraps the shared guest buffer.
+/// Recovery additionally requires the frame-pointer contract in [`fault::classify`].
 pub unsafe fn call_block(entry: CompiledPtr, cpu: &mut CpuState, ctx: &mut MemCtx) -> u64 {
     let f: CompiledFn = core::mem::transmute(entry.0);
     f(

@@ -13,6 +13,7 @@
 
 mod codegen;
 mod perfmap;
+mod unwind;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -600,7 +601,7 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
         for i in 0..bytes / elem {
             if km & (1 << i) != 0 {
                 let ea = addr.wrapping_add(i * elem);
-                if ea < raw.guest_base || ea.checked_add(elem).map_or(true, |end| end > raw.size) {
+                if ea < raw.guest_base || ea.checked_add(elem).is_none_or(|end| end > raw.size) {
                     cpu.rip = cur_addr;
                     ctx.fault_addr = if ea >= raw.guest_base && ea < raw.size {
                         raw.size
@@ -2297,6 +2298,7 @@ struct Queue {
 
 struct Jit {
     module: JITModule,
+    return_address_bkey: bool,
     fbctx: FunctionBuilderContext,
     next_id: u64,
     // Link slots for block chaining (§12 M5). Each `Box<AtomicU64>` holds a
@@ -2464,6 +2466,10 @@ impl JitBackend {
         let mut flags = settings::builder();
         flags.set("use_colocated_libcalls", "false").unwrap();
         flags.set("is_pic", "false").unwrap();
+        // Fault recovery unwinds exactly one compiled frame.
+        flags.set("preserve_frame_pointers", "true").unwrap();
+        flags.set("unwind_info", "true").unwrap();
+
         // Set explicitly rather than inheriting Cranelift's default of `none` — see
         // `OptLevel` for why the mid-end passes are worth their compile time on
         // lifted x86.
@@ -2508,6 +2514,7 @@ impl JitBackend {
         let isa = isa_builder
             .finish(settings::Flags::new(flags))
             .expect("finish ISA");
+        let return_address_bkey = unwind::uses_bkey(isa.as_ref());
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         builder.symbol("x86jit_div", div_helper as *const u8);
         builder.symbol("x86jit_string", string_helper as *const u8);
@@ -2592,6 +2599,7 @@ impl JitBackend {
 
         Jit {
             module,
+            return_address_bkey,
             fbctx: FunctionBuilderContext::new(),
             next_id: 0,
             slots: Vec::new(),
@@ -2982,7 +2990,7 @@ impl Shared {
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
-        let (code_len, srcloc_table, trap_sites) = {
+        let (code_len, srcloc_table, trap_sites, recipe) = {
             let cc = ctx.compiled_code().expect("compiled code present");
             let trap_sites = collect_guest_traps(cc, &trap_metadata);
             #[cfg(test)]
@@ -3010,6 +3018,12 @@ impl Shared {
                 cc.code_info().total_size,
                 table.into_boxed_slice(),
                 trap_sites,
+                unwind::recipe(
+                    cc,
+                    jit.return_address_bkey,
+                    ctx.func.signature.call_conv,
+                    jit.module.isa().default_call_conv(),
+                ),
             )
         };
         jit.module.clear_context(&mut ctx);
@@ -3029,12 +3043,13 @@ impl Shared {
         #[cfg(not(test))]
         let fail_registration = false;
         if fail_registration
-            || x86jit_core::codemap::register_with_traps(
+            || x86jit_core::codemap::register_with_recovery(
                 entry.0 as usize,
                 code_len,
                 srcloc_table,
                 guest_rips,
                 trap_sites,
+                recipe,
             )
             .is_err()
         {

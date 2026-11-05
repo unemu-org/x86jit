@@ -1686,9 +1686,15 @@ unsafe fn atomic_load_le(ptr: *const u8, size: u8) -> u64 {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
     match size {
         1 => unsafe { (*(ptr as *const AtomicU8)).load(Relaxed) as u64 },
-        2 if ptr as usize % 2 == 0 => unsafe { (*(ptr as *const AtomicU16)).load(Relaxed) as u64 },
-        4 if ptr as usize % 4 == 0 => unsafe { (*(ptr as *const AtomicU32)).load(Relaxed) as u64 },
-        8 if ptr as usize % 8 == 0 => unsafe { (*(ptr as *const AtomicU64)).load(Relaxed) },
+        2 if (ptr as usize).is_multiple_of(2) => unsafe {
+            (*(ptr as *const AtomicU16)).load(Relaxed) as u64
+        },
+        4 if (ptr as usize).is_multiple_of(4) => unsafe {
+            (*(ptr as *const AtomicU32)).load(Relaxed) as u64
+        },
+        8 if (ptr as usize).is_multiple_of(8) => unsafe {
+            (*(ptr as *const AtomicU64)).load(Relaxed)
+        },
         _ => unsafe { plain_read(ptr, size) },
     }
 }
@@ -1704,13 +1710,15 @@ unsafe fn atomic_store_le(ptr: *mut u8, val: u64, size: u8) {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
     match size {
         1 => unsafe { (*(ptr as *const AtomicU8)).store(val as u8, Relaxed) },
-        2 if ptr as usize % 2 == 0 => unsafe {
+        2 if (ptr as usize).is_multiple_of(2) => unsafe {
             (*(ptr as *const AtomicU16)).store(val as u16, Relaxed)
         },
-        4 if ptr as usize % 4 == 0 => unsafe {
+        4 if (ptr as usize).is_multiple_of(4) => unsafe {
             (*(ptr as *const AtomicU32)).store(val as u32, Relaxed)
         },
-        8 if ptr as usize % 8 == 0 => unsafe { (*(ptr as *const AtomicU64)).store(val, Relaxed) },
+        8 if (ptr as usize).is_multiple_of(8) => unsafe {
+            (*(ptr as *const AtomicU64)).store(val, Relaxed)
+        },
         _ => unsafe { plain_write(ptr, val, size) },
     }
 }

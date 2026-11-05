@@ -218,6 +218,23 @@ Page-aligned backing with a page-aligned guest base, and identity mappings
 with 16-byte alignment. This lets interpreted and compiled `cmpxchg16b` use the
 same host atomic operation.
 
+Guard-backed JIT memory can recover inline guest-access host faults through
+`cpu.fault_handle()` and `jit_abi::fault::classify`. The embedder owns the
+SIGSEGV/SIGBUS handler and copies the returned host registers into its signal
+context, including the scratch register the classifier sets (x9 / r11), and on
+AArch64 LR and d8–d15. The embedder derives `HostFaultKind` from the OS fault
+reason; macOS AArch64 needs the saved ESR to distinguish access from alignment.
+The handler must not depend on the interrupted FP mode. Returning from it reaches
+a mangled core landing stub, which restores host FP control before control returns
+to `call_block`'s caller. Access faults produce a resumable `Exit::UnmappedMemory`;
+alignment faults replay in the interpreter. Handles must
+remain live, and a rejected fault must chain to the previous signal disposition.
+See [decision-13](backlog/decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md)
+for supported hosts, signal safety, and the protected-mapped-page fallback.
+Compiled calls stay direct; recovery uses compiler-provided unwind recipes and
+one record published per run and cleared on return or panic. macOS x86-64 is
+compile-unverified.
+
 `cpu.exit_request()` returns a cloneable, `Send + Sync` handle. Another host thread
 can call `handle.request_exit()` to make `run` return `Exit::Interrupted`, even
 without a block budget. The vCPU yields at its next checked instruction boundary:

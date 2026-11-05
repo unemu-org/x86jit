@@ -15,6 +15,7 @@
 //!
 //! Pure data — no OS dependencies, so the core stays `{iced-x86}` (§8.2).
 
+use crate::jit_abi::fault::FrameRecipe;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -56,6 +57,7 @@ struct Entry {
     guest_rips: *const u64,
     traps: *const GuestTrapSite,
     traps_len: usize,
+    recipe: Option<&'static FrameRecipe>,
 }
 
 struct Counts {
@@ -190,6 +192,20 @@ impl CodeMap {
         guest_rips: Box<[u64]>,
         traps: Vec<GuestTrapSite>,
     ) -> Result<(), CodeMapFull> {
+        self.register_with_recovery(start, code_len, table, guest_rips, traps, None)
+    }
+
+    /// Publish a function's unwind recipe and exact transfer records atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_recovery(
+        &self,
+        start: usize,
+        code_len: u32,
+        table: Box<[(u32, u32)]>,
+        guest_rips: Box<[u64]>,
+        traps: Vec<GuestTrapSite>,
+        recipe: Option<FrameRecipe>,
+    ) -> Result<(), CodeMapFull> {
         assert!(
             table.iter().all(|&(_, i)| (i as usize) < guest_rips.len()),
             "CodeMap RIP index out of bounds"
@@ -214,6 +230,7 @@ impl CodeMap {
             guest_rips: Box::into_raw(guest_rips) as *const u64,
             traps: traps.as_ptr(),
             traps_len: traps.len(),
+            recipe: recipe.map(|r| &*Box::leak(Box::new(r))),
         };
         std::mem::forget(traps);
         let root = Node::insert(self.root(), entry);
@@ -247,6 +264,10 @@ impl CodeMap {
     /// O(log functions + log sites in the function).
     pub fn lookup_trap(&self, pc: usize) -> Option<GuestTrapSite> {
         let e = self.find_entry(pc, &mut || {})?;
+        Self::trap_in_entry(e, pc)
+    }
+
+    fn trap_in_entry(e: Entry, pc: usize) -> Option<GuestTrapSite> {
         // SAFETY: registration leaks this immutable Vec allocation before Release
         // publication; find_entry acquired the root and the length travels with it.
         let traps = unsafe { slice::from_raw_parts(e.traps, e.traps_len) };
@@ -255,6 +276,15 @@ impl CodeMap {
             .binary_search_by_key(&off, |s| s.host_offset)
             .ok()
             .map(|i| traps[i])
+    }
+
+    fn lookup_recovery(&self, pc: usize) -> Option<(GuestTrapSite, &'static FrameRecipe)> {
+        let entry = self.find_entry(pc, &mut || {})?;
+        let recipe = entry.recipe?;
+        if pc - entry.start < recipe.prologue_end as usize {
+            return None;
+        }
+        Some((Self::trap_in_entry(entry, pc)?, recipe))
     }
 
     fn find_entry(&self, pc: usize, visit: &mut impl FnMut()) -> Option<Entry> {
@@ -305,6 +335,29 @@ pub fn register_with_traps(
 /// Resolve an exact faulting PC in the process-global map.
 pub fn lookup_trap(pc: usize) -> Option<GuestTrapSite> {
     CODE_MAP.lookup_trap(pc)
+}
+
+/// Register immutable recovery metadata alongside a compiled function.
+pub fn register_with_recovery(
+    start: usize,
+    code_len: u32,
+    table: Box<[(u32, u32)]>,
+    guest_rips: Box<[u64]>,
+    traps: Vec<GuestTrapSite>,
+    recipe: Option<FrameRecipe>,
+) -> Result<(), CodeMapFull> {
+    CODE_MAP.register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
+}
+
+/// Exact transfer and one-frame unwind recipe, acquired from the immutable map.
+pub fn lookup_recovery(pc: usize) -> Option<(GuestTrapSite, &'static FrameRecipe)> {
+    CODE_MAP.lookup_recovery(pc)
+}
+
+/// Whether an address belongs to any registered compiled function, even one with
+/// no source locations, transfer records, or supported unwind recipe.
+pub fn contains(pc: usize) -> bool {
+    CODE_MAP.find_entry(pc, &mut || {}).is_some()
 }
 
 #[cfg(test)]

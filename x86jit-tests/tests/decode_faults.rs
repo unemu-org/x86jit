@@ -231,7 +231,7 @@ fn length_boundary(tier: usize) {
                 let fault = start + bytes.len() as u64;
                 // SDM Vol 2A §2.2.1: 40h is a REX prefix only in Long64.
                 let prefix_byte = if mode == CpuMode::Long64 { 0x40 } else { 0x66 };
-                bytes.extend(std::iter::repeat(prefix_byte).take(available as usize));
+                bytes.extend(std::iter::repeat_n(prefix_byte, available as usize));
                 vm.write_bytes(start, &bytes).unwrap();
                 let mut cpu = vm.new_vcpu();
                 cpu.set_reg(Reg::Rip, start);
