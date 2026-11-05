@@ -2,7 +2,7 @@
 id: decision-13
 title: Signal-context landing pads for compiled guest faults
 date: '2026-11-05 01:10'
-status: proposed
+status: accepted
 ---
 
 ## Context
@@ -18,7 +18,12 @@ to 6.7 ms, and indirect by 19–28%. Removing most restores still left fib32 at
 chain edge (about 21 million times in fib32). Per-call recovery stores do not fit
 that path. Frame-pointer preservation alone measured within noise of direct calls.
 
-## Proposed decision
+## Decision
+
+Accepted by the maintainer on 2026-11-05, together with its 2026-11-05 amendment
+(opt-in recovery for Rust guest accesses) and the workspace MSRV of Rust 1.88
+that the naked landing stub and fixup routines need.
+
 
 **Supersede decision-5 GP-2 with compiler-described, one-frame recovery and a
 static signal-context landing stub.** GP-1 protection callbacks and GP-3's
