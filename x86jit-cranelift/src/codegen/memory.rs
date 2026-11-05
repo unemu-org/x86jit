@@ -108,9 +108,10 @@ impl Translator<'_, '_> {
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
         let len = self.iconst(len as u64);
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.cas_pair,
             &[self.cpu, self.mem, a, size, cur, len],
+            Some(GuestAccessKind::ReadWrite),
         );
         let code = self.builder.inst_results(inst)[0];
         let stopped = self
@@ -151,7 +152,12 @@ impl Translator<'_, '_> {
         let seg = self.val(*seg_base);
         let args = [self.cpu, self.mem, op_code, elem, rep, cur, abits, seg];
         self.flush_gprs(); // helper reads/advances RSI/RDI/RCX in CpuState
-        let inst = self.call_helper(self.helpers.string, &args);
+        let access = match op {
+            StrOp::Movs => GuestAccessKind::ReadWrite,
+            StrOp::Stos => GuestAccessKind::Write,
+            StrOp::Lods | StrOp::Scas | StrOp::Cmps => GuestAccessKind::Read,
+        };
+        let inst = self.call_memory_helper(self.helpers.string, &args, Some(access));
         let code = self.builder.inst_results(inst)[0];
         let stopped = self
             .builder

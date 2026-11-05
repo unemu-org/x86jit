@@ -47,6 +47,23 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
     let mut signature = ir::Signature::new(isa.default_call_conv());
     signature.params.push(AbiParam::new(types::I64));
     helpers.cpuid = (builder.import_signature(signature), 0, 0);
+    for (slot, params) in [
+        (&mut helpers.x87, 6),
+        (&mut helpers.fxstate, 5),
+        (&mut helpers.vmaskmov_mem, 10),
+        (&mut helpers.vec_maskmov_mem, 9),
+        (&mut helpers.vpermt2_mem, 12),
+        (&mut helpers.vperm1_mem, 11),
+        (&mut helpers.gf2p8_mem, 11),
+        (&mut helpers.vpmov_narrow_mem, 8),
+        (&mut helpers.fma_mem, 18),
+        (&mut helpers.broadcast_lane_mem, 11),
+    ] {
+        let mut signature = ir::Signature::new(isa.default_call_conv());
+        signature.params = vec![AbiParam::new(types::I64); params];
+        signature.returns.push(AbiParam::new(types::I64));
+        *slot = (builder.import_signature(signature), 0, 0);
+    }
     translate_block_for_target(
         &mut builder,
         ir,
@@ -368,6 +385,246 @@ fn cpuid_has_an_explicit_full_barrier() {
             assert!(code[store..load]
                 .windows(barrier.len())
                 .any(|w| w == barrier));
+        }
+    }
+}
+
+#[test]
+fn guest_memory_helpers_follow_host_and_tier_rule() {
+    // SDM Vol 3A §11.2.2 and §11.2.4.1: order ordinary guest accesses,
+    // including string operations, across the helper boundary.
+    let mut cases = Vec::new();
+    for (name, bytes, loads, stores) in [
+        ("stos", &[0xf3, 0xaa][..], false, true),
+        ("movs", &[0xf3, 0xa4][..], true, true),
+        ("lods", &[0xf3, 0xac][..], true, false),
+        ("scas", &[0xf2, 0xae][..], true, false),
+        ("cmps", &[0xf3, 0xa6][..], true, false),
+        ("fld", &[0xd9, 0x03][..], true, false),
+        ("fstp", &[0xd9, 0x1b][..], false, true),
+        ("fld1", &[0xd9, 0xe8][..], false, false),
+        ("fxsave", &[0x0f, 0xae, 0x03][..], false, true),
+        ("fxrstor", &[0x0f, 0xae, 0x0b][..], true, false),
+        (
+            "vmaskmov-load",
+            &[0xc4, 0xe2, 0x71, 0x2c, 0x03][..],
+            true,
+            false,
+        ),
+        (
+            "vmaskmov-store",
+            &[0xc4, 0xe2, 0x71, 0x2e, 0x03][..],
+            false,
+            true,
+        ),
+    ] {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &snippet(bytes, None, &[])).unwrap();
+        let ir = lift_block(&vm.mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
+        cases.push((name, ir, loads, stores));
+    }
+    let fault = x86jit_core::ir::MemoryAccess::new(16, true, false);
+    let addr = Val::Imm(0x8000);
+    for (name, op, loads, stores) in [
+        (
+            "masked-load",
+            IrOp::VMaskLoadMem {
+                fault,
+                dst: 0,
+                addr,
+                k: 1,
+                elem: 4,
+                zeroing: false,
+                bytes: 16,
+            },
+            true,
+            false,
+        ),
+        (
+            "masked-store",
+            IrOp::VMaskStoreMem {
+                fault,
+                src: 0,
+                addr,
+                k: 1,
+                elem: 4,
+                bytes: 16,
+            },
+            false,
+            true,
+        ),
+        (
+            "permute-two",
+            IrOp::VPermT2M {
+                fault,
+                dst: 0,
+                idx: 1,
+                addr,
+                elem: 4,
+                writemask: None,
+                zeroing: false,
+                bytes: 16,
+                imode: false,
+            },
+            true,
+            false,
+        ),
+        (
+            "permute-one",
+            IrOp::VPerm1M {
+                fault,
+                dst: 0,
+                idx: 1,
+                addr,
+                elem: 4,
+                bytes: 16,
+                writemask: None,
+                zeroing: false,
+            },
+            true,
+            false,
+        ),
+        (
+            "gf2p8",
+            IrOp::VGf2p8M {
+                fault,
+                dst: 0,
+                a: 1,
+                addr,
+                imm: 0,
+                mode: 0,
+                k: 0,
+                zeroing: false,
+                bytes: 16,
+            },
+            true,
+            false,
+        ),
+        (
+            "narrow-store",
+            IrOp::VPmovNarrowMem {
+                fault,
+                src: 0,
+                addr,
+                from: 4,
+                to: 2,
+                src_width: 16,
+            },
+            false,
+            true,
+        ),
+        (
+            "fma",
+            IrOp::VFmaM {
+                fault,
+                dst: 0,
+                x: 0,
+                y: 1,
+                z: 2,
+                addr,
+                mem_role: 1,
+                prec: FPrec::F32,
+                scalar: false,
+                neg_prod: false,
+                neg_add: false,
+                bytes: 16,
+                alt_sign: 0,
+                writemask: None,
+                zeroing: false,
+            },
+            true,
+            false,
+        ),
+        (
+            "broadcast",
+            IrOp::VBroadcastLaneM {
+                fault,
+                dst: 0,
+                addr,
+                chunk: 8,
+                elem: 4,
+                dst_width: 16,
+                writemask: None,
+                zeroing: false,
+            },
+            true,
+            false,
+        ),
+        (
+            "cas-pair",
+            IrOp::AtomicCasPair {
+                fault,
+                addr,
+                size: 16,
+                len: 4,
+            },
+            true,
+            true,
+        ),
+    ] {
+        cases.push((
+            name,
+            IrBlock {
+                ops: vec![op, IrOp::Hlt],
+                temp_count: 0,
+                guest_start: 0x1000,
+                guest_len: 1,
+                icount: 1,
+            },
+            loads,
+            stores,
+        ));
+    }
+    for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
+        for tier in [
+            MemConsistency::Fast,
+            MemConsistency::AcqRel,
+            MemConsistency::FullTso,
+        ] {
+            for (name, ir, loads, stores) in &cases {
+                let (loads, stores) = (*loads, *stores);
+                let ctx = compile_ir(ir, target, tier, crate::OptLevel::Speed);
+                let code = ctx.compiled_code().unwrap().code_buffer();
+                let arm = target.starts_with("aarch64");
+                let (before, after) = if !arm {
+                    (false, false)
+                } else {
+                    match tier {
+                        MemConsistency::Fast => (false, false),
+                        MemConsistency::AcqRel => (stores, loads),
+                        MemConsistency::FullTso => (loads, loads || stores),
+                    }
+                };
+                assert_eq!(
+                    code.windows(4).filter(|w| *w == DMB).count(),
+                    usize::from(before) + usize::from(after),
+                    "{name}/{target}/{tier:?}"
+                );
+                assert_eq!(code.windows(3).filter(|w| *w == MFENCE).count(), 0);
+                if arm {
+                    let calls: Vec<_> = code
+                        .chunks_exact(4)
+                        .enumerate()
+                        .filter_map(|(i, w)| {
+                            let instruction = u32::from_le_bytes(w.try_into().unwrap());
+                            (instruction & 0xffff_fc1f == 0xd63f_0000).then_some(i * 4)
+                        })
+                        .collect();
+                    assert_eq!(calls.len(), 1, "{name}: expected one helper call");
+                    let call = calls[0];
+                    assert_eq!(
+                        code[..call].windows(4).filter(|w| *w == DMB).count(),
+                        usize::from(before),
+                        "{name}/{tier:?}: leading barrier"
+                    );
+                    assert_eq!(
+                        code[call + 4..].windows(4).filter(|w| *w == DMB).count(),
+                        usize::from(after),
+                        "{name}/{tier:?}: trailing barrier"
+                    );
+                }
+            }
         }
     }
 }

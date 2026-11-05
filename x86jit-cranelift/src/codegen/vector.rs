@@ -140,9 +140,10 @@ impl Translator<'_, '_> {
         let is_store = self.iconst(0);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs(); // helper's fault path reads the committed CpuState
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vmaskmov_mem,
             &[cpu, mem, reg, base, kk, el, z, by, is_store, cur],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false
@@ -168,9 +169,10 @@ impl Translator<'_, '_> {
         let is_store = self.iconst(1);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vmaskmov_mem,
             &[cpu, mem, reg, base, kk, el, z, by, is_store, cur],
+            Some(GuestAccessKind::Write),
         );
         self.trap_if_unmapped(inst);
         false
@@ -221,9 +223,14 @@ impl Translator<'_, '_> {
         let is_store = self.iconst(is_store_flag as u64);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs(); // helper's fault path reads the committed CpuState
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vec_maskmov_mem,
             &[cpu, mem, reg, base, m, el, by, is_store, cur],
+            Some(if is_store_flag != 0 {
+                GuestAccessKind::Write
+            } else {
+                GuestAccessKind::Read
+            }),
         );
         self.trap_if_unmapped(inst);
         false
@@ -825,9 +832,10 @@ impl Translator<'_, '_> {
         let im = self.iconst(*imode as u64);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vpermt2_mem,
             &[cpu, mem, d, ix, base, el, k, masked, z, by, im, cur],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false
@@ -884,9 +892,10 @@ impl Translator<'_, '_> {
         let by = self.memory_helper_bytes(*bytes);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vperm1_mem,
             &[cpu, mem, d, ix, base, el, k, masked, z, by, cur],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false
@@ -1190,9 +1199,10 @@ impl Translator<'_, '_> {
         let by = self.memory_helper_bytes(*bytes);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.gf2p8_mem,
             &[cpu, mem, d, av, base, im, m, kk, z, by, cur],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false
@@ -2146,9 +2156,10 @@ impl Translator<'_, '_> {
         let sw = self.iconst(*src_width as u64);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.vpmov_narrow_mem,
             &[cpu, mem, s, base, fr, t, sw, cur],
+            Some(GuestAccessKind::Write),
         );
         self.trap_if_unmapped(inst);
         false
@@ -2852,11 +2863,12 @@ impl Translator<'_, '_> {
         let masked = self.iconst(writemask.is_some() as u64);
         let z = self.iconst(*zeroing as u64);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.fma_mem,
             &[
                 cpu, mem, d, xv, yv, zv, base, mr, pf, sc, np, na, by, alt, cur, k, masked, z,
             ],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false
@@ -2916,9 +2928,10 @@ impl Translator<'_, '_> {
         let z = self.iconst(*zeroing as u64);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
-        let inst = self.call_helper(
+        let inst = self.call_memory_helper(
             self.helpers.broadcast_lane_mem,
             &[cpu, mem, d, base, ch, el, dw, k, masked, z, cur],
+            Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
         false

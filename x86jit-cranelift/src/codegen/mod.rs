@@ -3248,8 +3248,7 @@ impl Translator<'_, '_> {
 
     /// Inline guest-RAM load at `host`, applying the JIT tier (§8.2.3).
     /// On aarch64 AcqRel/FullTso emit LDR followed by a full DMB ISH;
-    /// Fast and x86 hosts use a plain load. Helper accesses bypass this path
-    /// and carry no tier barrier (xj-0w3.7).
+    /// Fast and x86 hosts use a plain load.
     pub(crate) fn gload(&mut self, ty: Type, host: Value, off: i32) -> Value {
         self.sync_guest_fault_state();
         let v = if ty == types::I128 && cfg!(target_arch = "x86_64") {
@@ -3270,7 +3269,6 @@ impl Translator<'_, '_> {
     /// Inline guest-RAM store of `val` at `host`, applying the JIT tier.
     /// On aarch64 AcqRel emits DMB ISH then STR; FullTso emits STR then
     /// DMB ISH, with no leading fence. Fast and x86 hosts use a plain store.
-    /// Helper accesses bypass this path and carry no tier barrier (xj-0w3.7).
     pub(crate) fn gstore(&mut self, val: Value, host: Value, off: i32) {
         self.sync_guest_fault_state();
         let ty = self.builder.func.dfg.value_type(val);
@@ -3592,6 +3590,42 @@ impl Translator<'_, '_> {
 
     pub(crate) fn iconst(&mut self, v: u64) -> Value {
         self.builder.ins().iconst(types::I64, v as i64)
+    }
+
+    /// Order guest accesses performed inside a helper against compiled accesses.
+    /// The emitter supplies the access direction from its IR operation; helpers
+    /// receiving already-loaded operands use `call_helper` instead.
+    pub(crate) fn call_memory_helper(
+        &mut self,
+        helper: (ir::SigRef, u64, u64),
+        args: &[Value],
+        access: Option<GuestAccessKind>,
+    ) -> ir::Inst {
+        let loads = matches!(
+            access,
+            Some(GuestAccessKind::Read | GuestAccessKind::ReadWrite)
+        );
+        let stores = matches!(
+            access,
+            Some(GuestAccessKind::Write | GuestAccessKind::ReadWrite)
+        );
+        let (before, after) = match self.consistency {
+            MemConsistency::Fast => (false, false),
+            MemConsistency::AcqRel => (stores, loads),
+            MemConsistency::FullTso => (loads, loads || stores),
+        };
+        // SDM Vol 3A §11.2.2, §11.2.4.1: ordinary accesses, including
+        // string stores, obey the guest's ordering across this call boundary.
+        if self.aarch64 && before {
+            self.builder.ins().fence();
+        }
+        let call = self.call_helper(helper, args);
+        // Place this before the caller's trap fork: a helper can commit partial
+        // progress before reporting a fault or an interrupted string operation.
+        if self.aarch64 && after {
+            self.builder.ins().fence();
+        }
+        call
     }
 
     /// Call an imported Rust helper indirectly through its baked absolute address,

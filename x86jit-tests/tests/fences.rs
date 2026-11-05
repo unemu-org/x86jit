@@ -63,6 +63,54 @@ fn fences_lift_to_explicit_ir() {
     }
 }
 
+fn helper_mp_program(regions: bool, writer: bool) -> Vec<u8> {
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    if regions {
+        let mut body = a.create_label();
+        a.jmp(body).unwrap();
+        a.set_label(&mut body).unwrap();
+    }
+    if writer {
+        a.rep().stosb().unwrap();
+        a.mov(qword_ptr(Y), 1).unwrap();
+    } else {
+        a.mov(rax, qword_ptr(Y)).unwrap();
+        a.mfence().unwrap();
+        a.mov(rcx, qword_ptr(X)).unwrap();
+    }
+    if regions {
+        a.dec(r8).unwrap();
+        a.jnz(top).unwrap();
+    }
+    a.hlt().unwrap();
+    a.assemble(CODE + if writer { 0 } else { 0x100 }).unwrap()
+}
+
+#[test]
+fn helper_stos_message_passing_jit_block_and_region() {
+    // SDM Vol 3A §11.2.4.1 item 3: string operations are not reordered
+    // with other stores. The reader MFENCE isolates the writer's ordering.
+    let mut failures = Vec::new();
+    for mode in ["block", "regions"] {
+        for tier in [
+            MemConsistency::Fast,
+            MemConsistency::AcqRel,
+            MemConsistency::FullTso,
+        ] {
+            let count = race(tier, mode, true);
+            if tier != MemConsistency::Fast && count != 0 {
+                failures.push(format!("{tier:?}/{mode}: {count}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "helper MP allowed Y=1,X=0: {failures:?}"
+    );
+}
+
 #[derive(Default)]
 struct Rendezvous {
     epoch: AtomicUsize,
@@ -81,7 +129,8 @@ fn wait_yield(spins: &mut u32) {
     }
 }
 
-fn sb(tier: MemConsistency, mode: &str) -> usize {
+fn race(tier: MemConsistency, mode: &str, helper_mp: bool) -> usize {
+    let iters = if helper_mp { 200_000 } else { ITERS };
     let regions = mode == "regions";
     let backend: Box<dyn Backend> = match mode {
         "interp" => Box::new(InterpreterBackend),
@@ -96,15 +145,27 @@ fn sb(tier: MemConsistency, mode: &str) -> usize {
     config.consistency = tier;
     let mut vm = Vm::with_backend(config, backend);
     vm.map(0, 0x10000, Prot::RW, RegionKind::Ram).unwrap();
-    vm.write_bytes(CODE, &program(regions)).unwrap();
+    for id in 0..2 {
+        let code = if helper_mp {
+            helper_mp_program(regions, id == 0)
+        } else {
+            program(regions)
+        };
+        vm.write_bytes(CODE + id * 0x100, &code).unwrap();
+    }
     // Materialize before the race: neither compilation nor a first code-page
     // registration should add incidental synchronization to the measured pair.
-    let mut warm = vm.new_vcpu();
-    warm.set_reg(Reg::Rip, CODE);
-    warm.set_reg(Reg::Rcx, 1);
-    warm.set_reg(Reg::Rbx, X);
-    warm.set_reg(Reg::Rdx, Y);
-    assert!(matches!(warm.run(&vm, Some(4)), Exit::Hlt));
+    for id in 0..2 {
+        let mut warm = vm.new_vcpu();
+        warm.set_reg(Reg::Rip, CODE + id * 0x100);
+        warm.set_reg(Reg::Rcx, 1);
+        warm.set_reg(Reg::Rax, 1);
+        warm.set_reg(Reg::Rdi, X);
+        warm.set_reg(Reg::Rbx, X);
+        warm.set_reg(Reg::Rdx, Y);
+        warm.set_reg(Reg::R8, 1);
+        assert!(matches!(warm.run(&vm, Some(8)), Exit::Hlt));
+    }
     if regions {
         assert!(vm.cache.regions() > 0, "region path must actually execute");
     }
@@ -119,7 +180,7 @@ fn sb(tier: MemConsistency, mode: &str) -> usize {
                 let mut cpu = vm.new_vcpu();
                 cpu.set_reg(Reg::Rbx, if id == 0 { X } else { Y });
                 cpu.set_reg(Reg::Rdx, if id == 0 { Y } else { X });
-                for epoch in 1..=ITERS {
+                for epoch in 1..=iters {
                     let mut spins = 0;
                     while sync.epoch.load(Ordering::Acquire) != epoch {
                         if sync.stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -128,10 +189,18 @@ fn sb(tier: MemConsistency, mode: &str) -> usize {
                         }
                         wait_yield(&mut spins);
                     }
-                    cpu.set_reg(Reg::Rip, CODE);
+                    cpu.set_reg(Reg::Rip, CODE + id as u64 * 0x100);
                     cpu.set_reg(Reg::Rcx, 1);
-                    assert!(matches!(cpu.run(&vm, Some(4)), Exit::Hlt));
-                    sync.result[id].store(cpu.reg(Reg::Rax), Ordering::Relaxed);
+                    cpu.set_reg(Reg::Rax, 1);
+                    cpu.set_reg(Reg::Rdi, X);
+                    cpu.set_reg(Reg::R8, 1);
+                    assert!(matches!(cpu.run(&vm, Some(8)), Exit::Hlt));
+                    let result = if helper_mp {
+                        u64::from(cpu.reg(Reg::Rax) == 1 && cpu.reg(Reg::Rcx) == 0)
+                    } else {
+                        cpu.reg(Reg::Rax)
+                    };
+                    sync.result[id].store(result, Ordering::Relaxed);
                     sync.done[id].store(epoch, Ordering::Release);
                 }
             })
@@ -139,7 +208,7 @@ fn sb(tier: MemConsistency, mode: &str) -> usize {
         .collect();
     let mut relaxed = 0;
     let mut timed_out = false;
-    for epoch in 1..=ITERS {
+    for epoch in 1..=iters {
         vm.mem.write(X, 0, 8).unwrap();
         vm.mem.write(Y, 0, 8).unwrap();
         sync.epoch.store(epoch, Ordering::Release);
@@ -154,14 +223,21 @@ fn sb(tier: MemConsistency, mode: &str) -> usize {
         if timed_out {
             break;
         }
-        relaxed += usize::from(sync.result.iter().all(|r| r.load(Ordering::Relaxed) == 0));
+        relaxed += usize::from(if helper_mp {
+            sync.result[1].load(Ordering::Relaxed) == 1
+        } else {
+            sync.result.iter().all(|r| r.load(Ordering::Relaxed) == 0)
+        });
     }
     sync.stop.store(true, Ordering::Relaxed);
     for handle in handles {
         handle.join().unwrap();
     }
-    assert!(!timed_out, "SB rendezvous timed out: {tier:?}/{mode}");
-    eprintln!("SB+mfence {tier:?}/{mode}: {relaxed}/{ITERS} relaxed outcomes");
+    assert!(
+        !timed_out,
+        "rendezvous timed out: {tier:?}/{mode}, helper_mp={helper_mp}"
+    );
+    eprintln!("helper_mp={helper_mp} {tier:?}/{mode}: {relaxed}/{iters} relaxed outcomes");
     relaxed
 }
 
@@ -174,7 +250,7 @@ fn sb_mfence_all_tiers_and_backends() {
         MemConsistency::FullTso,
     ] {
         for mode in ["interp", "block", "regions"] {
-            let count = sb(tier, mode);
+            let count = race(tier, mode, false);
             if count != 0 {
                 failures.push(format!("{tier:?}/{mode}: {count}"));
             }
@@ -481,5 +557,77 @@ fn real16_iret_uses_interpreter_with_either_backend() {
         assert_eq!(cpu.reg(Reg::Rax), 0x1234);
         assert_eq!(cpu.reg(Reg::Rsp), 0x8006);
         assert!(cpu.flags().if_);
+    }
+}
+
+#[test]
+#[ignore = "release-only helper cost measurement; run explicitly"]
+fn helper_string_loop_costs() {
+    const LOOPS: u64 = 20_000;
+    for tier in [
+        MemConsistency::Fast,
+        MemConsistency::AcqRel,
+        MemConsistency::FullTso,
+    ] {
+        for mode in ["block", "regions"] {
+            for copy in [false, true] {
+                for bytes in [1u64, 64, 4096] {
+                    let mut a = CodeAssembler::new(64).unwrap();
+                    let mut top = a.create_label();
+                    a.set_label(&mut top).unwrap();
+                    a.mov(rdi, X).unwrap();
+                    a.mov(rsi, 0xa000u64).unwrap();
+                    a.mov(rcx, bytes).unwrap();
+                    if copy {
+                        a.rep().movsb().unwrap();
+                    } else {
+                        a.rep().stosb().unwrap();
+                    }
+                    a.dec(r8).unwrap();
+                    a.jnz(top).unwrap();
+                    a.hlt().unwrap();
+                    let code = a.assemble(CODE).unwrap();
+                    let backend: Box<dyn Backend> = if mode == "regions" {
+                        Box::new(JitBackend::with_superblocks(RegionCaps {
+                            max_blocks: 4,
+                            max_icount: 32,
+                        }))
+                    } else {
+                        Box::new(JitBackend::new())
+                    };
+                    let mut config = VmConfig::flat(0x10000);
+                    config.consistency = tier;
+                    let mut vm = Vm::with_backend(config, backend);
+                    vm.map(0, 0x10000, Prot::RW, RegionKind::Ram).unwrap();
+                    vm.write_bytes(CODE, &code).unwrap();
+                    vm.write_bytes(0xa000, &vec![0x5a; 4096]).unwrap();
+                    let mut times = Vec::new();
+                    for sample in 0..8 {
+                        let mut cpu = vm.new_vcpu();
+                        cpu.set_reg(Reg::Rip, CODE);
+                        cpu.set_reg(Reg::Rax, 0x5a);
+                        cpu.set_reg(Reg::R8, LOOPS);
+                        let start = Instant::now();
+                        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                        let elapsed = start.elapsed().as_nanos();
+                        if sample != 0 {
+                            times.push(elapsed);
+                        }
+                        let mut out = vec![0; bytes as usize];
+                        vm.mem.read_bytes(X, &mut out).unwrap();
+                        assert!(out.iter().all(|b| *b == 0x5a));
+                    }
+                    if mode == "regions" {
+                        assert!(vm.cache.regions() > 0);
+                    }
+                    times.sort_unstable();
+                    let median = times[times.len() / 2];
+                    let mut deviations: Vec<_> = times.iter().map(|v| v.abs_diff(median)).collect();
+                    deviations.sort_unstable();
+                    eprintln!("helper-cost {tier:?}/{mode}/{} bytes={bytes} loops={LOOPS} median_ns={median} mad_ns={}",
+                        if copy { "movsb" } else { "stosb" }, deviations[deviations.len()/2]);
+                }
+            }
+        }
     }
 }

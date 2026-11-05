@@ -349,7 +349,14 @@ impl Translator<'_, '_> {
         let cur = self.iconst(self.cur_addr);
         let args = [self.cpu, self.mem, kc, a, stic, cur];
         self.flush_gprs(); // helper reads/writes CpuState
-        let inst = self.call_helper(self.helpers.x87, &args);
+        let access = if x86jit_core::x87::mem_write_bytes(*kind).is_some() {
+            Some(GuestAccessKind::Write)
+        } else if x86jit_core::x87::mem_operand_bytes(*kind) != 0 {
+            Some(GuestAccessKind::Read)
+        } else {
+            None
+        };
+        let inst = self.call_memory_helper(self.helpers.x87, &args, access);
         self.trap_if_unmapped_or_exception(inst);
         self.reload_gprs(); // e.g. fnstsw wrote AX
         false
@@ -361,7 +368,12 @@ impl Translator<'_, '_> {
         let cur = self.iconst(self.cur_addr);
         let args = [self.cpu, self.mem, a, rc, cur];
         self.flush_gprs(); // helper reads CpuState (XMM/x87)
-        let inst = self.call_helper(self.helpers.fxstate, &args);
+        let access = if *restore {
+            GuestAccessKind::Read
+        } else {
+            GuestAccessKind::Write
+        };
+        let inst = self.call_memory_helper(self.helpers.fxstate, &args, Some(access));
         self.trap_if_unmapped_or_exception(inst);
         false
     }
