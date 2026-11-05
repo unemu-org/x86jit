@@ -5,6 +5,8 @@
 //! before an op is emitted; memory operands expand to effective-address arithmetic
 //! (the single `effective_address` helper, §17.5) plus `Load`/`Store`.
 
+mod mmx;
+
 use iced_x86::{
     Code, CodeSize, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind, Register,
 };
@@ -450,6 +452,11 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VAesKeygen { .. }
             | VSha { .. }
             | VGfni { .. }
+            | MmxRead { .. }
+            | MmxWrite { .. }
+            | MmxState { .. }
+            | MmxCompute { .. }
+            | MmxConvert { .. }
             | Movq2dq { .. }
             | Movdq2q { .. }
             | VPclmul { .. }
@@ -622,6 +629,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
     let mut ops = Vec::new();
     let mut tg = TempGen::new();
     let mut descriptors = 0;
+    let mut mmx_sequence = mmx::Sequence::default();
     let mut icount = 0u32;
     let mut guest_len = 0u32;
     let mut insn = Instruction::default();
@@ -690,7 +698,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
             guest_addr: insn.ip(),
         });
 
-        let terminated = match lift_insn(&insn, &mut ops, &mut tg, mode) {
+        let terminated = match lift_insn(&insn, &mut ops, &mut tg, mode, &mut mmx_sequence) {
             Ok(terminated) => terminated,
             Err(e) => {
                 // Lowering can emit ops before discovering an unsupported operand.
@@ -794,8 +802,14 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     ops.push(IrOp::InsnStart {
         guest_addr: insn.ip(),
     });
-    lift_insn(&insn, &mut ops, &mut tg, mode)
-        .map_err(|e| refill_unsupported_bytes(e, code, start))?;
+    lift_insn(
+        &insn,
+        &mut ops,
+        &mut tg,
+        mode,
+        &mut mmx::Sequence::default(),
+    )
+    .map_err(|e| refill_unsupported_bytes(e, code, start))?;
     mark_memory_accesses(&insn, mode, &mut ops);
     fill_ir_bytes(&insn, code, start, &mut ops);
 
@@ -812,6 +826,124 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
 mod tests {
     use super::*;
     use crate::memory::{MemoryModel, Prot, RegionKind};
+
+    #[test]
+    fn mmx_sequences_check_once_and_transition_before_commit() {
+        // SDM Vol 3A §§15.2, 15.5.1: MMX cannot raise a new pending x87
+        // exception. Any x87 instruction/restore ends that knowledge.
+        for (bytes, states, waits) in [
+            (&[0x0f, 0xef, 0xc0, 0x0f, 0xef, 0xc9, 0xf4][..], 1, 1),
+            (
+                &[0x0f, 0xef, 0xc0, 0x0f, 0x77, 0x0f, 0xef, 0xc9, 0xf4],
+                3,
+                2,
+            ),
+            (
+                &[0x0f, 0xef, 0xc0, 0xd9, 0xe8, 0x0f, 0xef, 0xc9, 0xf4],
+                2,
+                2,
+            ),
+            // FXRSTOR terminates this block; its continuation is tested below.
+            (
+                &[0x0f, 0xef, 0xc0, 0x0f, 0xae, 0x08, 0x0f, 0xef, 0xc9, 0xf4],
+                1,
+                1,
+            ),
+            (
+                &[0xf2, 0x0f, 0xd6, 0xc0, 0xf3, 0x0f, 0xd6, 0xc9, 0xf4],
+                1,
+                1,
+            ),
+            (&[0x66, 0x0f, 0x2a, 0x00, 0xf4], 0, 0),
+        ] {
+            let mem = mem_with(bytes);
+            let block = lift_block(&mem, FetchAddr::flat(BASE), CpuMode::Long64).unwrap();
+            assert_eq!(
+                block
+                    .ops
+                    .iter()
+                    .filter(|o| matches!(o, IrOp::MmxState { .. }))
+                    .count(),
+                states,
+                "{bytes:02x?}"
+            );
+            assert_eq!(
+                block
+                    .ops
+                    .iter()
+                    .filter(|o| matches!(
+                        o,
+                        IrOp::X87 {
+                            kind: crate::x87::FpuKind::Fwait,
+                            ..
+                        }
+                    ))
+                    .count(),
+                waits,
+                "{bytes:02x?}"
+            );
+            if block.guest_len < bytes.len() as u32 {
+                let continuation = lift_block(
+                    &mem,
+                    FetchAddr::flat(BASE + u64::from(block.guest_len)),
+                    CpuMode::Long64,
+                )
+                .unwrap();
+                assert_eq!(
+                    continuation
+                        .ops
+                        .iter()
+                        .filter(|o| matches!(o, IrOp::MmxState { empty: false }))
+                        .count(),
+                    1
+                );
+                assert!(matches!(
+                    continuation.ops[1],
+                    IrOp::X87 {
+                        kind: crate::x87::FpuKind::Fwait,
+                        ..
+                    }
+                ));
+            }
+        }
+        for bytes in [
+            &[0x0f, 0xef, 0x00, 0xf4][..],
+            &[0x66, 0x0f, 0x2d, 0x00, 0xf4],
+            &[0x0f, 0x7f, 0x00, 0xf4],
+        ] {
+            let mem = mem_with(bytes);
+            let block = lift_block(&mem, FetchAddr::flat(BASE), CpuMode::Long64).unwrap();
+            let transition = block
+                .ops
+                .iter()
+                .position(|o| matches!(o, IrOp::MmxState { empty: false }))
+                .unwrap();
+            let wait = block
+                .ops
+                .iter()
+                .position(|o| {
+                    matches!(
+                        o,
+                        IrOp::X87 {
+                            kind: crate::x87::FpuKind::Fwait,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            for (n, op) in block.ops.iter().enumerate() {
+                if matches!(
+                    op,
+                    IrOp::Load { .. } | IrOp::Store { .. } | IrOp::CheckAlign { .. }
+                ) {
+                    assert!(wait < n && n < transition, "{bytes:02x?}: {op:?}");
+                }
+                if matches!(op, IrOp::MmxWrite { .. } | IrOp::MmxConvert { .. }) {
+                    assert!(transition < n, "{bytes:02x?}: {op:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn guest_descriptor_limit_ends_blocks_at_instruction_boundaries() {
@@ -1507,6 +1639,11 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VShaM { .. }
         | VGfni { .. }
         | VGfniM { .. }
+        | MmxRead { .. }
+        | MmxWrite { .. }
+        | MmxState { .. }
+        | MmxCompute { .. }
+        | MmxConvert { .. }
         | Movq2dq { .. }
         | Movdq2q { .. }
         | VPclmul { .. }
@@ -1816,13 +1953,33 @@ macro_rules! vec_src_dispatch {
 pub(crate) use vec_src_dispatch;
 
 /// Lift one instruction; returns `true` if it ends the block (control flow).
-pub(crate) fn lift_insn(
+fn lift_insn(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
     tg: &mut TempGen,
     mode: CpuMode,
+    sequence: &mut mmx::Sequence,
+) -> Result<bool, LiftError> {
+    sequence.check(insn, ops);
+    let start = ops.len();
+    let result = lift_insn_inner(insn, ops, tg, mode, sequence);
+    // Exclude our own FWAIT: it checks state without changing it. Every real
+    // x87 op (including no-wait controls), FXRSTOR and EMMS ends the sequence.
+    sequence.observe(&ops[start..]);
+    result
+}
+
+fn lift_insn_inner(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    mode: CpuMode,
+    sequence: &mut mmx::Sequence,
 ) -> Result<bool, LiftError> {
     use Mnemonic::*;
+    if mmx::handles(insn) {
+        return mmx::lift(insn, ops, tg, sequence);
+    }
     match insn.mnemonic() {
         // CET markers / hints that are no-ops without shadow stacks: endbr, pause,
         // and rdssp (leaves its register — glibc's `xor eax; rdsspq rax; test`
@@ -2319,18 +2476,23 @@ pub(crate) fn lift_insn(
         Movq2dq => {
             let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
             let src_mm = reg_mmx(insn, 1).or_unsupported(insn)?;
+            sequence.enter(ops);
             ops.push(IrOp::Movq2dq { dst, src_mm });
             Ok(false)
         }
         Movdq2q => {
             let dst_mm = reg_mmx(insn, 0).or_unsupported(insn)?;
             let src_xmm = reg_xmm(insn, 1).or_unsupported(insn)?;
+            sequence.enter(ops);
             ops.push(IrOp::Movdq2q { dst_mm, src_xmm });
             Ok(false)
         }
-        // emms/femms mark the x87/MMX tag word empty; with no tag word modeled (and no
-        // register-data change on hardware), this is a no-op.
-        Emms | Femms => Ok(false),
+        // SDM Vol 3A §15.2 Table 15-2; AMD APM Vol 1 §5.6.2 (FEMMS).
+        // FEMMS feature gating belongs to the separate 3DNow! profile check.
+        Emms | Femms => {
+            ops.push(IrOp::MmxState { empty: true });
+            Ok(false)
+        }
         // --- SHA-NI. SSE 2-operand `sha... xmm1, xmm2/m128[, imm8]`
         // (in-place, a=dst); sha256rnds2 reads xmm0 implicitly at runtime. ---
         Sha256rnds2 => lift_sha(insn, ops, tg, ShaOp::Sha256Rnds2).map(|_| false),
@@ -4286,6 +4448,9 @@ fn memory_alignment(insn: &Instruction) -> Option<u8> {
     use Mnemonic::*;
     let size = insn.memory_size().size();
     match insn.mnemonic() {
+        // SDM Vol 3B §25.25.3 Table 25-4: these m128 forms have no XMM
+        // operand, so the general legacy-XMM alignment predicate misses them.
+        Cvtpd2pi | Cvttpd2pi => Some(16),
         // SDM Vol 2A, FXSAVE/FXRSTOR, Protected Mode Exceptions: 16 bytes.
         Fxsave | Fxsave64 | Fxrstor | Fxrstor64 => Some(16),
         // SDM Vol 1 §§14.9/15.7, Tables 14-22/15-6: every encoding.

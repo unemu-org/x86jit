@@ -4201,7 +4201,7 @@ pub(crate) fn exec_v_cvt_float<const DEFAULT: bool>(
 /// One 128-bit `cvt*p*` lane group: convert the packed lanes of `s` per
 /// `kind`. Shared by the 128-bit `VPackedCvt` and the lane-preserving 256-bit `VPackedCvt256`
 /// (applied to each half). The width-changing pd forms remain 128-bit-only callers.
-fn packed_cvt128_mode_specialized<const DEFAULT: bool>(
+pub(super) fn packed_cvt128_mode_specialized<const DEFAULT: bool>(
     s: u128,
     kind: &PackedCvtKind,
     mode: u32,

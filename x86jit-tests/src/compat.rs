@@ -258,7 +258,7 @@ fn nth<const N: usize>(regs: [Register; N], i: u32) -> Register {
 /// Set operand `i` of `instr` to a canonical value for `kind`. `Err(())` means the
 /// operand kind is exotic/unsupported by this templater (⇒ Unencodable). `mode`
 /// picks the memory base register width (RAX in long mode, EAX at bitness 32).
-fn template_operand(
+pub(crate) fn template_operand(
     instr: &mut Instruction,
     i: u32,
     kind: OpCodeOperandKind,
@@ -460,6 +460,25 @@ fn mode_coverage(mode: CpuMode) -> BTreeMap<String, GenCoverage> {
         gc.missing_mem_form.sort();
     }
     map
+}
+
+/// Encoding-level coverage for MM registers, independent of SSE mnemonic coverage.
+pub fn lifted_mmx_codes() -> BTreeSet<String> {
+    Code::values()
+        .filter(|&code| {
+            let info = code.op_code();
+            let mm = (0..info.op_count()).any(|n| {
+                matches!(
+                    info.op_kind(n),
+                    OpCodeOperandKind::mm_reg
+                        | OpCodeOperandKind::mm_rm
+                        | OpCodeOperandKind::mm_or_mem
+                )
+            });
+            (mm || code == Code::Emms) && probe_code(code) == Some(Probe::Lifted)
+        })
+        .map(|c| format!("{c:?}"))
+        .collect()
 }
 
 /// The set of x86 mnemonics the lifter actually handles, measured by the same probe

@@ -2283,20 +2283,6 @@ unsafe extern "C" fn pclmul_mem_helper(cpu: *mut u8, dst: u64, a: u64, lo: u64, 
     x86jit_core::interp::exec_pclmul_mem(cpu, dst as u8, a as u8, v, imm as u8);
 }
 
-/// MMX↔XMM bridge helper: `op` 0 = `movq2dq` (a=dst_xmm, b=src_mm), 1 =
-/// `movdq2q` (a=dst_mm, b=src_xmm). Touches `cpu.xmm`/`cpu.fpr` (memory-backed).
-///
-/// # Safety
-/// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn mmx_bridge_helper(cpu: *mut u8, op: u64, a: u64, b: u64) {
-    let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
-    if op == 0 {
-        x86jit_core::interp::exec_movq2dq(cpu, a as u8, b as u8);
-    } else {
-        x86jit_core::interp::exec_movdq2q(cpu, a as u8, b as u8);
-    }
-}
-
 /// Upper bound on distinct helpers, for the fixed call-counter array.
 /// Asserted against the real count when the table is built, so adding a helper past
 /// this fails loudly instead of writing out of bounds.
@@ -3109,7 +3095,6 @@ impl Shared {
         let gfni_mem_sig = params(7, false); // gfni_mem(cpu, dst, a, lo, hi, op, imm) -> ()
         let pclmul_sig = params(5, false); // pclmul(cpu, dst, a, b, imm) -> ()
         let pclmul_mem_sig = params(6, false); // pclmul_mem(cpu, dst, a, lo, hi, imm) -> ()
-        let mmx_bridge_sig = params(4, false); // mmx_bridge(cpu, op, a, b) -> ()
         let pcmpstr_sig = params(6, false); // pcmpstr(cpu, a, b, imm, explicit, out) -> ()
         let pcmpstr_mem_sig = params(7, false); // pcmpstr_mem(cpu, a, bv_lo, bv_hi, imm, explicit, out) -> ()
         let pcmpstrm_sig = params(6, false); // pcmpstrm(cpu, a, b, imm, explicit, out) -> ()
@@ -3245,7 +3230,6 @@ impl Shared {
                 gfni_mem: helper!(gfni_mem_sig, gfni_mem_helper),
                 pclmul: helper!(pclmul_sig, pclmul_helper),
                 pclmul_mem: helper!(pclmul_mem_sig, pclmul_mem_helper),
-                mmx_bridge: helper!(mmx_bridge_sig, mmx_bridge_helper),
                 pcmpstr: helper!(pcmpstr_sig, pcmpstr_helper),
                 pcmpstr_mem: helper!(pcmpstr_mem_sig, pcmpstr_mem_helper),
                 pcmpstrm: helper!(pcmpstrm_sig, pcmpstrm_helper),

@@ -118,6 +118,13 @@ pub fn all() -> Vec<Workload> {
             native: None, // hand-assembled snippet, no host binary to exec
             expect: HOTLOOP_EXPECT,
         },
+        Workload {
+            name: "mmx",
+            kind: "packed-integer",
+            guest: guest_mmx,
+            native: None,
+            expect: b"mmx=1000000",
+        },
         // Game-shaped kernels: the SIMD / streaming / indirect-dispatch shapes real
         // games hammer, which the corpus above does not exercise.
         Workload {
@@ -538,6 +545,50 @@ pub fn jit_regions(tier: TierCfg) -> Box<dyn Backend> {
         b.enable_icount();
     }
     Box::new(b)
+}
+
+/// SDM Vol 2B §4.3: hot MMX arithmetic with m64 loads and stores.
+pub fn guest_mmx(backend: Box<dyn Backend>, tier: TierCfg) -> (Vec<u8>, Counters) {
+    use iced_x86::code_asm::*;
+    const CODE: u64 = 0x1000;
+    const DATA: u64 = 0x8000;
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut top = a.create_label();
+    a.mov(ecx, 1_000_000u32).unwrap();
+    a.mov(eax, 1u32).unwrap();
+    a.movq(mm1, rax).unwrap();
+    a.pxor(mm0, mm0).unwrap();
+    a.jmp(top).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.movq(mm2, qword_ptr(DATA)).unwrap();
+    a.paddq(mm0, mm1).unwrap();
+    a.pxor(mm2, mm0).unwrap();
+    a.movq(qword_ptr(DATA), mm2).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.movq(rax, mm0).unwrap();
+    a.emms().unwrap();
+    a.hlt().unwrap();
+    let mut vm = Vm::with_backend(VmConfig::flat(0x1_0000), backend);
+    tier.apply(&mut vm);
+    vm.map(0, 0x1_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let calls = vm.backend.helper_calls();
+    let counters = Counters {
+        chained: vm.cache.chained(),
+        ibtc_filled: vm.cache.ibtc_filled(),
+        fast_hits: cpu.fast_hits(),
+        misses: vm.cache.misses(),
+        compile_ns: vm.backend.compile_ns(),
+        executed: cpu.executed_instructions(),
+        helper_calls: calls.iter().map(|(_, n)| n).sum(),
+        top_helper: calls.first().map(|(name, _)| *name).unwrap_or(""),
+        top_helper_calls: calls.first().map(|(_, n)| *n).unwrap_or(0),
+    };
+    (format!("mmx={}", cpu.reg(Reg::Rax)).into_bytes(), counters)
 }
 
 #[cfg(test)]

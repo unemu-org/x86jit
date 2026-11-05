@@ -1083,7 +1083,7 @@ impl Translator<'_, '_> {
         false
     }
 
-    fn shift_count_value(
+    pub(super) fn shift_count_value(
         &mut self,
         xa: Value,
         xc: Value,
@@ -3136,24 +3136,18 @@ impl Translator<'_, '_> {
         false
     }
 
-    // --- MMX↔XMM bridge. Both forms → the shared `mmx_bridge` helper
-    // (touches cpu.xmm/cpu.fpr, memory-backed). `op`: 0 = movq2dq, 1 = movdq2q. ---
-
+    // Physical MM slots: SDM Vol 3A §15.2.
     pub(crate) fn emit_movq2dq(&mut self, dst: &u8, src_mm: &u8) -> bool {
-        let cpu = self.cpu;
-        let op = self.iconst(0);
-        let a = self.iconst(*dst as u64);
-        let b = self.iconst(*src_mm as u64);
-        self.call_helper(self.helpers.mmx_bridge, &[cpu, op, a, b]);
+        let lo = self.mmx_read(*src_mm);
+        let v = self.builder.ins().uextend(types::I128, lo);
+        self.store_xmm(*dst, v);
         false
     }
 
     pub(crate) fn emit_movdq2q(&mut self, dst_mm: &u8, src_xmm: &u8) -> bool {
-        let cpu = self.cpu;
-        let op = self.iconst(1);
-        let a = self.iconst(*dst_mm as u64);
-        let b = self.iconst(*src_xmm as u64);
-        self.call_helper(self.helpers.mmx_bridge, &[cpu, op, a, b]);
+        let v = self.load_xmm(*src_xmm);
+        let lo = self.builder.ins().ireduce(types::I64, v);
+        self.mmx_write(*dst_mm, lo);
         false
     }
 
@@ -3163,7 +3157,7 @@ impl Translator<'_, '_> {
     /// Emit the psign transform on two i128 values at `lane`-byte granularity, returning
     /// the i128 result. Built from vector `icmp` masks + `bitselect`: pick `-src` where
     /// `ctrl < 0`, then zero where `ctrl == 0`, else keep `src`.
-    fn emit_psign(&mut self, src: Value, ctrl: Value, lane: u8) -> Value {
+    pub(super) fn emit_psign(&mut self, src: Value, ctrl: Value, lane: u8) -> Value {
         let ty = match lane {
             1 => types::I8X16,
             2 => types::I16X8,
@@ -4629,9 +4623,15 @@ impl Translator<'_, '_> {
     /// vector Cranelift ops (→ NEON); the two f64→i32 forms scalarise the 2 lanes
     /// (Cranelift has no f64x2→i32x2 convert). Every lane uses the scalar range/indefinite rule.
     pub(crate) fn emit_v_packed_cvt(&mut self, dst: &u8, src: &u8, kind: &PackedCvtKind) -> bool {
-        use PackedCvtKind::*;
         let x = self.load_xmm(*src);
-        let r = match kind {
+        let r = self.packed_cvt_value(x, kind);
+        self.store_xmm(*dst, r);
+        false
+    }
+
+    pub(super) fn packed_cvt_value(&mut self, x: Value, kind: &PackedCvtKind) -> Value {
+        use PackedCvtKind::*;
+        match kind {
             Dq2Ps => {
                 let iv = self.bitcast_v(x, types::I32X4);
                 let f = self.builder.ins().fcvt_from_sint(types::F32X4, iv);
@@ -4684,9 +4684,7 @@ impl Translator<'_, '_> {
                 }
                 self.bitcast_i128(acc)
             }
-        };
-        self.store_xmm(*dst, r);
-        false
+        }
     }
 
     /// VEX.256 width-changing packed convert. Lane-wise so the result is bit-identical

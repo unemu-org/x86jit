@@ -7,6 +7,8 @@
 //! Only pure computation — no syscalls/MMIO/branches to unmapped code — so runs
 //! are reproducible. Memory operands are confined to a mapped scratch region.
 
+pub mod mmx;
+
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::PathBuf;

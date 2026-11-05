@@ -1128,7 +1128,15 @@ const ALLOWLIST: &[&str] = &[
 #[test]
 fn every_lifted_op_has_correctness_coverage() {
     let lifted = lifted_mnemonics();
-    let fuzzed: BTreeSet<String> = FUZZER_COVERED.iter().map(|s| s.to_string()).collect();
+    let fuzzed: BTreeSet<String> = FUZZER_COVERED
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            x86jit_tests::fuzz::mmx::CODES
+                .iter()
+                .map(|c| format!("{:?}", c.mnemonic())),
+        )
+        .collect();
     let allowed: BTreeSet<String> = ALLOWLIST.iter().map(|s| s.to_string()).collect();
 
     let uncovered: Vec<String> = lifted
@@ -1165,4 +1173,20 @@ fn coverage_lists_have_no_stale_entries() {
         "stale coverage-list entries (not lifted — remove them):\n  {}",
         stale.join("\n  "),
     );
+}
+
+/// Encoding-level MMX coverage cannot be supplied by an SSE test of the same mnemonic.
+#[test]
+fn every_lifted_mmx_form_has_correctness_coverage() {
+    let lifted = x86jit_tests::compat::lifted_mmx_codes();
+    let fuzzed: BTreeSet<String> = x86jit_tests::fuzz::mmx::CODES
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect();
+    let missing: Vec<_> = lifted.difference(&fuzzed).collect();
+    assert!(
+        missing.is_empty(),
+        "MMX forms without differential coverage: {missing:?}"
+    );
+    assert_eq!(fuzzed.len(), 102);
 }

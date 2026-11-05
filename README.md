@@ -121,7 +121,8 @@ the `oracles/` submodule: witness tests pin the cited values in code.
 
 - **Missing instructions.** Anything the lifter does not handle returns
   `Exit::UnknownInstruction`. AVX-512 is partial: some EVEX handlers ignore the write mask, and
-  embedded broadcast is not yet read. MMX is minimal. The tests validate what is lifted, not
+  embedded broadcast is not yet read. Implicit-memory MASKMOVQ remains unsupported.
+  The tests validate what is lifted, not
   what is missing; read the [coverage map][coverage] as an upper bound.
 - **`Prot` is advisory.** A guest store into an `R` or `RX` region succeeds on both backends
   ([deferred.md](backlog/docs/deferred.md)).

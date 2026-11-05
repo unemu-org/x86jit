@@ -474,6 +474,34 @@ pub enum IrOp {
         len: u8,
     },
 
+    /// Physical MMn aliases R(n), independent of TOP (SDM Vol 3A §15.2).
+    MmxRead {
+        dst: Temp,
+        reg: u8,
+    },
+    /// A write also sets exponent bits 79:64 (SDM Vol 3A §15.2 Table 15-2).
+    MmxWrite {
+        reg: u8,
+        src: Val,
+    },
+    /// Commit after all fault-capable accesses (SDM Vol 1 §9.6.2).
+    MmxState {
+        empty: bool,
+    },
+    MmxConvert {
+        dst: u8,
+        lo: Val,
+        hi: Val,
+        kind: PackedCvtKind,
+        to_mmx: bool,
+    },
+    MmxCompute {
+        dst: Temp,
+        a: Val,
+        b: Val,
+        op: MmxOp,
+    },
+
     // --- SIMD (SSE, §3.1 M8). XMM registers by index (0..15), 128-bit values. ---
     // Load 16/8/4 bytes from memory into xmm `dst` (upper bytes zeroed for <16).
     VLoad {
@@ -2890,6 +2918,27 @@ impl BmiOp {
     pub fn writes_flags(self) -> bool {
         !matches!(self, BmiOp::Pdep | BmiOp::Pext)
     }
+}
+
+/// One 64-bit packed lane. Integer families share their SSE primitives.
+/// SDM Vol 1 §9.2–9.4, §11.4; Vol 2B §4.3 (packed integer instructions).
+#[derive(Copy, Clone, Debug)]
+pub enum MmxOp {
+    Packed { lane: u8, op: PackedBinOp },
+    Logic(VLogicOp),
+    Shift { lane: u8, right: bool, arith: bool },
+    Unpack { lane: u8, high: bool },
+    Pack { from: u8, signed: bool },
+    Madd { unsigned: bool },
+    Horizontal(HIntOp),
+    Abs { lane: u8 },
+    Sign { lane: u8 },
+    ShuffleBytes,
+    ShuffleWords(u8),
+    Align(u8),
+    Insert(u8),
+    Extract(u8),
+    Mask,
 }
 
 /// Packed integer arithmetic op (§3.1 M8).

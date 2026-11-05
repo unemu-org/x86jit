@@ -1,4 +1,4 @@
-//! `cargo xfuzz` — the AVX/VEX differential fuzz CLI.
+//! `cargo xfuzz` — VEX and MMX differential fuzzing.
 //!
 //! Point it at a specific instruction (or family, or the whole pool) without env-var
 //! incantations or editing source. Every leg (JIT-vs-interp, native-vs-interp) runs from a
@@ -10,6 +10,7 @@
 //! cargo xfuzz --ops vpaddsb,vpaddsw        # subset to several
 //! cargo xfuzz --family convert,fma         # subset by family
 //! cargo xfuzz --class vex --secs 3600 --len 12
+//! cargo xfuzz --class mmx --mem --seed 1 --len 102
 //! cargo xfuzz --seed 1964 --ops vcvtps2ph  # replay one program deterministically
 //! cargo xfuzz                              # bounded 60s smoke over everything
 //! ```
@@ -25,7 +26,7 @@ use x86jit_tests::fuzz::{
 };
 
 const USAGE: &str = "\
-cargo xfuzz — AVX/VEX differential fuzz CLI
+cargo xfuzz — VEX and MMX differential fuzz CLI
 
 USAGE:
   cargo xfuzz [OPTIONS]
@@ -33,7 +34,7 @@ USAGE:
 POOL SELECTION (subsets the pool BEFORE generation):
   --ops <a,b,..>      only these op names (see --list)
   --family <f,g,..>   only these families (see --list)
-  --class <vex>       instruction class (only 'vex' is supported; the default)
+  --class <vex|mmx>   instruction class (default vex)
 
 RUN:
   --secs <N>          time budget in seconds (default 60)
@@ -119,10 +120,17 @@ fn main() -> ExitCode {
         }
     }
 
-    // Only the `vex` class exists today (the AVX2 VEX pool). Accept it; reject others.
+    // MMX has an independent encoding-level menu.
     if let Some(c) = &class_arg {
+        if c == "mmx" {
+            if family_arg.is_some() || log_arg.is_some() {
+                eprintln!("MMX uses --ops for selection and reports findings on stderr");
+                return ExitCode::from(2);
+            }
+            return run_mmx(secs, len, start, seed, mem_forms, ops_arg.as_deref());
+        }
         if c != "vex" {
-            eprintln!("error: unknown --class {c:?} (only 'vex' is supported)");
+            eprintln!("error: unknown --class {c:?} (supported: 'vex', 'mmx')");
             return ExitCode::from(2);
         }
     }
@@ -239,4 +247,59 @@ fn print_list() {
         println!("  [{}] ({} ops)", fam.name(), ops.len());
         println!("    {}", ops.join(" "));
     }
+}
+
+fn run_mmx(
+    secs: u64,
+    len: usize,
+    start: u64,
+    single: Option<u64>,
+    memory: bool,
+    ops: Option<&str>,
+) -> ExitCode {
+    use x86jit_tests::fuzz::mmx;
+    let pool: Vec<_> = mmx::CODES
+        .iter()
+        .copied()
+        .filter(|code| {
+            ops.is_none_or(|names| {
+                names.split(',').any(|n| {
+                    format!("{code:?}").eq_ignore_ascii_case(n)
+                        || format!("{:?}", code.mnemonic()).eq_ignore_ascii_case(n)
+                })
+            })
+        })
+        .collect();
+    if len == 0 {
+        eprintln!("MMX program length must be positive");
+        return ExitCode::from(2);
+    }
+    if pool.is_empty() {
+        eprintln!("no matching MMX forms");
+        return ExitCode::from(2);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut seed = single.unwrap_or(start);
+    let mut checked = 0;
+    loop {
+        let codes: Vec<_> = (0..len)
+            .map(|n| pool[(seed as usize + n) % pool.len()])
+            .collect();
+        let input = mmx::input(&codes, seed, memory, x86jit_core::CpuMode::Long64);
+        if let Err(diff) = mmx::check(&input, x86jit_core::CpuMode::Long64) {
+            eprintln!("MMX seed {seed}, codes {codes:?}: {diff}");
+            return ExitCode::FAILURE;
+        }
+        checked += 1;
+        if single.is_some() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        seed = seed.wrapping_add(1);
+    }
+    println!(
+        "MMX: {checked} programs, {} forms, memory={memory}, native={}",
+        pool.len(),
+        x86jit_tests::fuzz::native_available()
+    );
+    ExitCode::SUCCESS
 }

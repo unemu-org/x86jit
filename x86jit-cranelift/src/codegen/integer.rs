@@ -373,6 +373,22 @@ impl Translator<'_, '_> {
         addr: &Val,
         sti: &u8,
     ) -> bool {
+        if *kind == x86jit_core::x87::FpuKind::Fwait {
+            // SDM Vol 1 §8.6: FWAIT tests ES before executing. Match
+            // x87::mf_pending_before; MMX sequences share this pending-#MF path.
+            let sw = self.builder.ins().load(
+                types::I16,
+                MemFlags::trusted(),
+                self.cpu,
+                self.offsets.fpu_sw,
+            );
+            let es = self.builder.ins().band_imm(sw, 1 << 7);
+            let pending = self.builder.ins().icmp_imm(IntCC::NotEqual, es, 0);
+            let ok = self.begin_trap_fork(pending);
+            self.emit_trap(&16, &0);
+            self.builder.switch_to_block(ok);
+            return false;
+        }
         let a = self.val(*addr);
         let kc = self.iconst(*kind as u16 as u64);
         let stic = self.iconst(*sti as u64);

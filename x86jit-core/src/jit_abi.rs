@@ -286,6 +286,10 @@ pub struct CpuOffsets {
     pub zmm_hi: i32,
     pub kmask: i32,
     pub mxcsr: i32,
+    pub fpr: i32,
+    pub fpu_top: i32,
+    pub fpu_empty: i32,
+    pub fpu_sw: i32,
 }
 
 impl CpuOffsets {
@@ -337,6 +341,10 @@ pub fn cpu_offsets() -> CpuOffsets {
         ymm_hi: off(s.ymm_hi.as_ptr() as *const u8),
         zmm_hi: off(s.zmm_hi.as_ptr() as *const u8),
         kmask: off(s.kmask.as_ptr() as *const u8),
+        fpr: off(s.fpr.as_ptr() as *const u8),
+        fpu_top: off(&s.fpu_top as *const u32 as *const u8),
+        fpu_empty: off(&s.fpu_empty as *const u8),
+        fpu_sw: off(&s.fpu_sw as *const u16 as *const u8),
         mxcsr: off(&s.mxcsr as *const u32 as *const u8),
     }
 }

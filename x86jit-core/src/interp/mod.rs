@@ -6,6 +6,7 @@
 //! is set to the FAULTING instruction (`cur_addr`, from `InsnStart`) so the user
 //! can map/handle and retry; after `syscall`/`hlt` RIP is PAST the instruction.
 
+mod mmx;
 pub mod softfloat;
 
 use crate::exit::{AccessKind, Exit, PortDir, StepResult};
@@ -287,6 +288,47 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if bracket.active() {
                     crate::lockstep::on_insn_start(&mut bracket, cpu, mem, *guest_addr);
                 }
+            }
+            IrOp::MmxConvert {
+                dst,
+                lo,
+                hi,
+                kind,
+                to_mmx,
+            } => {
+                let v = u128::from(read_val(*lo, temps)) | (u128::from(read_val(*hi, temps)) << 64);
+                let r = vector::packed_cvt128_mode_specialized::<DEFAULT>(
+                    v,
+                    kind,
+                    interp_mxcsr::<DEFAULT>(cpu),
+                );
+                if *to_mmx {
+                    let slot = &mut cpu.fpr[*dst as usize];
+                    slot[..8].copy_from_slice(&(r as u64).to_le_bytes());
+                    slot[8..].fill(0xff);
+                } else if matches!(kind, crate::ir::PackedCvtKind::Dq2Ps) {
+                    cpu.xmm[*dst as usize] =
+                        (cpu.xmm[*dst as usize] & (u128::MAX << 64)) | u128::from(r as u64);
+                } else {
+                    cpu.xmm[*dst as usize] = r;
+                }
+            }
+            IrOp::MmxRead { dst, reg } => {
+                temps[*dst as usize] =
+                    u64::from_le_bytes(cpu.fpr[*reg as usize][..8].try_into().unwrap());
+            }
+            IrOp::MmxWrite { reg, src } => {
+                let slot = &mut cpu.fpr[*reg as usize];
+                slot[..8].copy_from_slice(&read_val(*src, temps).to_le_bytes());
+                slot[8..].fill(0xff);
+            }
+            IrOp::MmxState { empty } => {
+                // SDM Vol 3A §15.2 Table 15-2: only TOP and tags change.
+                cpu.fpu_top = 0;
+                cpu.fpu_empty = if *empty { 0xff } else { 0 };
+            }
+            IrOp::MmxCompute { dst, a, b, op } => {
+                temps[*dst as usize] = mmx::compute(read_val(*a, temps), read_val(*b, temps), *op);
             }
             IrOp::ReadReg { dst, reg } => {
                 if let Some(r) = exec_read_reg(cpu, temps, dst, reg) {
@@ -5793,14 +5835,15 @@ pub fn exec_pclmul_mem(cpu: &mut CpuState, dst: u8, a: u8, v: u128, imm: u8) {
     cpu.xmm[dst as usize] = crate::pclmul::pclmul(x, v, imm);
 }
 
-/// `movq2dq dst_xmm, src_mm`: MMX → XMM, shared by interp and the JIT helper.
+/// `movq2dq dst_xmm, src_mm`: MMX → XMM.
+/// SDM Vol 2B §4.3 MOVQ2DQ; Vol 3A §15.2 Table 15-2.
 pub fn exec_movq2dq(cpu: &mut CpuState, dst: u8, src_mm: u8) {
     let lo = u64::from_le_bytes(cpu.fpr[src_mm as usize][0..8].try_into().unwrap());
     cpu.xmm[dst as usize] = lo as u128;
 }
 
-/// `movdq2q dst_mm, src_xmm`: XMM → MMX, shared by interp and the JIT helper.
-/// Sets the aliased x87 register's exponent field all-ones (MMX-in-use tag).
+/// `movdq2q dst_mm, src_xmm`: XMM → MMX.
+/// SDM Vol 2B §4.3 MOVDQ2Q; Vol 3A §15.2 Table 15-2: exponent bits become all ones.
 pub fn exec_movdq2q(cpu: &mut CpuState, dst_mm: u8, src_xmm: u8) {
     let lo = (cpu.xmm[src_xmm as usize] as u64).to_le_bytes();
     let slot = &mut cpu.fpr[dst_mm as usize];

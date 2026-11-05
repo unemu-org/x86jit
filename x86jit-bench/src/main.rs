@@ -49,12 +49,14 @@ fn main() {
                 .unwrap_or(2);
             gate(iters, warmup);
         }
+        "mmx" => measure_mmx(),
         "experiment" => experiment(),
         "dump" => dump(),
         _ => {
             eprintln!(
                 "usage:\n  record [--iters N] [--warmup W]   measure HEAD; write history + baseline + performance.md\n  \
                  gate [--iters N] [--warmup W]     compare HEAD vs the rolling-median reference; exit 1 on a regression past max(threshold, noise band)\n  \
+                 mmx                  measure only the MMX loop (9 samples, 2 warmups)\n  \
                  trend [N]            last N records' jit/interp ratio per workload\n  \
                  compare <refA> <refB>\n  show <ref>\n  list"
             );
@@ -766,5 +768,48 @@ fn trend() {
             print!(" {cell:>10}");
         }
         println!("  {}", r.subject);
+    }
+}
+
+/// Bounded MMX-only measurement; leaves the existing baseline untouched.
+fn measure_mmx() {
+    use x86jit_core::{Backend, InterpreterBackend, RegionCaps};
+    use x86jit_cranelift::JitBackend;
+    let baseline = report::load_baseline();
+    if let Some(ref b) = baseline {
+        println!("baseline host: {}", b.host);
+        if !b.workloads.iter().any(|w| w.name == "mmx") {
+            println!("baseline has no MMX workload; this run establishes its first measurement");
+        }
+    }
+    println!("measurement host: {}", report::host_label());
+    for mode in 0..3 {
+        let mut compile_ns = 0;
+        let mut helper_calls = 0;
+        let (stat, out) = time_stat(9, 2, || {
+            let backend: Box<dyn Backend> = match mode {
+                0 => Box::new(InterpreterBackend),
+                1 => Box::new(JitBackend::new()),
+                _ => Box::new(JitBackend::with_superblocks(RegionCaps {
+                    max_blocks: 16,
+                    max_icount: 256,
+                })),
+            };
+            let (out, counters) = workloads::guest_mmx(backend, workloads::TierCfg::EAGER);
+            compile_ns = counters.compile_ns;
+            helper_calls = counters.helper_calls;
+            out
+        });
+        assert_eq!(out, b"mmx=1000000");
+        println!(
+            "{}: median_ns={} min_ns={} mad_ns={} n={} compile_ns={} helper_calls={}",
+            ["interpreter", "JIT block inline", "JIT region inline"][mode],
+            stat.median_ns,
+            stat.min_ns,
+            stat.mad_ns,
+            stat.n,
+            compile_ns,
+            helper_calls
+        );
     }
 }

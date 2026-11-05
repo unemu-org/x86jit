@@ -7,6 +7,7 @@ mod control;
 mod gpr_sync;
 mod integer;
 mod memory;
+mod mmx;
 mod vector;
 
 #[cfg(test)]
@@ -148,7 +149,6 @@ pub struct Helpers {
     pub gfni_mem: (ir::SigRef, u64, u64),
     pub pclmul: (ir::SigRef, u64, u64),
     pub pclmul_mem: (ir::SigRef, u64, u64),
-    pub mmx_bridge: (ir::SigRef, u64, u64),
     pub vmasked_packed: (ir::SigRef, u64, u64),
     pub vmasked_shift: (ir::SigRef, u64, u64),
     pub var_shift: (ir::SigRef, u64, u64),
@@ -247,7 +247,6 @@ impl Helpers {
             gfni_mem: mk(),
             pclmul: mk(),
             pclmul_mem: mk(),
-            mmx_bridge: mk(),
             vmasked_packed: mk(),
             vmasked_shift: mk(),
             var_shift: mk(),
@@ -2002,6 +2001,55 @@ impl Translator<'_, '_> {
                 op,
                 ..
             } => self.emit_v_sha_m(dst, a, addr, imm, op),
+            IrOp::MmxConvert {
+                dst,
+                lo,
+                hi,
+                kind,
+                to_mmx,
+            } => {
+                let lo = self.val(*lo);
+                let hi = self.val(*hi);
+                let lo = self.builder.ins().uextend(types::I128, lo);
+                let hi = self.builder.ins().uextend(types::I128, hi);
+                let hi = self.builder.ins().ishl_imm(hi, 64);
+                let v = self.builder.ins().bor(lo, hi);
+                let r = self.packed_cvt_value(v, kind);
+                if *to_mmx {
+                    let lo = self.builder.ins().ireduce(types::I64, r);
+                    self.mmx_write(*dst, lo);
+                } else if matches!(kind, PackedCvtKind::Dq2Ps) {
+                    let old = self.load_xmm(*dst);
+                    let old = self.builder.ins().ushr_imm(old, 64);
+                    let old = self.builder.ins().ishl_imm(old, 64);
+                    let r = self.builder.ins().bor(old, r);
+                    self.store_xmm(*dst, r);
+                } else {
+                    self.store_xmm(*dst, r);
+                }
+                false
+            }
+            IrOp::MmxRead { dst, reg } => {
+                let v = self.mmx_read(*reg);
+                self.set(*dst, v);
+                false
+            }
+            IrOp::MmxWrite { reg, src } => {
+                let v = self.val(*src);
+                self.mmx_write(*reg, v);
+                false
+            }
+            IrOp::MmxState { empty } => {
+                self.mmx_state(*empty);
+                false
+            }
+            IrOp::MmxCompute { dst, a, b, op } => {
+                let a = self.val(*a);
+                let b = self.val(*b);
+                let r = self.mmx_compute(a, b, *op);
+                self.set(*dst, r);
+                false
+            }
             IrOp::Movq2dq { dst, src_mm } => self.emit_movq2dq(dst, src_mm),
             IrOp::Movdq2q { dst_mm, src_xmm } => self.emit_movdq2q(dst_mm, src_xmm),
             IrOp::VPclmul { dst, a, b, imm } => self.emit_v_pclmul(dst, a, b, imm),
