@@ -1,6 +1,9 @@
 //! Mangled, per-crate-instance landing stubs for compiled fault returns (§8.2).
 
-#[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
 #[unsafe(naked)]
 pub(super) unsafe extern "C" fn landing_stub() {
     core::arch::naked_asm!(
@@ -9,7 +12,10 @@ pub(super) unsafe extern "C" fn landing_stub() {
     );
 }
 
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
 #[unsafe(naked)]
 pub(super) unsafe extern "C" fn landing_stub() {
     // Intel SDM Vol 1 §10.2.3; x86-64 psABI §3.2.1: restore host MXCSR control.

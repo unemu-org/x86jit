@@ -25,7 +25,11 @@ pub(crate) fn recipe(
 fn extract(insts: &[(u32, UnwindInst)], bkey: bool) -> Option<FrameRecipe> {
     if !cfg!(all(
         any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos")
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd"
+        )
     )) {
         return None;
     }
@@ -134,7 +138,7 @@ fn extract(insts: &[(u32, UnwindInst)], bkey: bool) -> Option<FrameRecipe> {
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[path = "unwind_test_signal.rs"]
@@ -142,7 +146,7 @@ mod signal;
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[path = "unwind_test_call.rs"]
@@ -150,7 +154,7 @@ mod register_probe;
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod tests {

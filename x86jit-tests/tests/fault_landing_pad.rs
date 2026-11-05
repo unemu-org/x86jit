@@ -1,7 +1,7 @@
 //! Instruction-entry fault state: SDM Vol 3A §7.5. The interpreter supplies
 //! transfer splitting and access-base semantics for the public exit contract.
 #![cfg(all(
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
 
@@ -758,7 +758,11 @@ fn user_sent_sigsegv_is_not_a_guest_memory_fault() {
     );
     assert_eq!(
         fault_kind(libc::SIGBUS, libc::BUS_ADRERR),
-        HostFaultKind::Access
+        if cfg!(target_os = "freebsd") {
+            HostFaultKind::Unsupported
+        } else {
+            HostFaultKind::Access
+        }
     );
     assert_eq!(
         fault_kind(libc::SIGBUS, libc::BUS_ADRALN),

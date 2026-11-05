@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[path = "landing.rs"]
 mod landing;
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use landing::landing_stub;
@@ -157,7 +157,9 @@ impl EntryRecord {
 /// only PC and scratch change, and the routine returns normally to Rust. An
 /// Alignment fault in such a routine is NOT OURS. Other PCs require an active
 /// run, an exact guest trap site with a supported unwind recipe, an outermost
-/// compiled frame, and a data address inside the run's guest span. Unsupported
+/// compiled frame, and a data address inside the run's guest span. FreeBSD
+/// AArch64 Alignment recovery ignores `data_addr` and replays from guest RIP:
+/// that signal's `si_addr` names the host PC. Unsupported
 /// hosts answer NOT OURS. There is no allocation, lock, TLS, libc call or retry:
 /// a fixed table lookup, bounded AVL lookups, exact-site binary search and
 /// fixed-size stack reads. The landing stub restores host
@@ -172,8 +174,9 @@ impl EntryRecord {
 /// keep the shared guest mapping live throughout every transfer. Fixup recovery
 /// itself needs no record or CPU pointer.
 /// Supply the actual interrupted PC, SP, FP, preserved registers and `si_addr`.
-/// Derive `kind` from a verified OS fault cause: Linux signal/code or macOS
-/// AArch64's saved data-abort ESR. Ambiguous and user-sent signals are Unsupported.
+/// Derive `kind` from a verified OS fault cause: Linux/FreeBSD signal/code or
+/// macOS AArch64's saved data-abort ESR (decision-13). Ambiguous and user-sent
+/// signals are Unsupported.
 /// Alignment recovery replays the guest instruction; its locked-operation
 /// atomicity limitation is tracked in xj-0w3.5.
 /// Do not fabricate frames or handles, reenter execution, or modify guest state
@@ -187,7 +190,7 @@ pub unsafe fn classify(
     regs: &mut HostRegisters,
 ) -> bool {
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos"),
+        any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
@@ -215,11 +218,21 @@ pub unsafe fn classify(
         };
         let saved = &mut *record.snapshot.get();
         let ctx = &*saved.ctx;
-        let Some(offset) = (data_addr as u64).checked_sub(ctx.base) else {
-            return false;
-        };
-        let Some(addr) = ctx.guest_base.checked_add(offset).filter(|a| *a < ctx.size) else {
-            return false;
+        // FreeBSD 14.3 sys/arm64/arm64/trap.c, align_abort/call_trapsignal:
+        // alignment si_addr is tf_elr, not FAR (source unpinned in oracles/).
+        // Replay recomputes the operand; every other cause/host needs its address.
+        let addr = if cfg!(all(target_os = "freebsd", target_arch = "aarch64"))
+            && kind == HostFaultKind::Alignment
+        {
+            None
+        } else {
+            let Some(offset) = (data_addr as u64).checked_sub(ctx.base) else {
+                return false;
+            };
+            let Some(addr) = ctx.guest_base.checked_add(offset).filter(|a| *a < ctx.size) else {
+                return false;
+            };
+            Some(addr)
         };
         let Some(caller_sp) = regs.fp.checked_add_signed(i64::from(recipe.caller_sp)) else {
             return false;
@@ -294,14 +307,16 @@ pub unsafe fn classify(
         recovered.pc = landing_stub as *const () as u64;
         saved.kind = kind;
         (*saved.cpu).rip = site.guest_rip;
-        (*saved.ctx).fault_addr = addr;
+        if let Some(addr) = addr {
+            (*saved.ctx).fault_addr = addr;
+        }
         (*saved.ctx).fault_size = u64::from(site.width);
         (*saved.ctx).fault_access = u64::from(site.access != crate::GuestAccessKind::Read);
         *regs = recovered;
         true
     }
     #[cfg(not(all(
-        any(target_os = "linux", target_os = "macos"),
+        any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
@@ -312,11 +327,138 @@ pub unsafe fn classify(
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_with_pc_as_address_replays_only_on_freebsd_arm64() {
+        static CODE: [u8; 16] = [0; 16];
+        static NO_RECIPE: [u8; 16] = [0; 16];
+        let pc = CODE.as_ptr() as usize;
+        let site = crate::GuestTrapSite {
+            host_offset: 4,
+            guest_rip: 0x1000,
+            access: crate::GuestAccessKind::Read,
+            width: 4,
+        };
+        crate::codemap::register_with_recovery(
+            pc,
+            16,
+            Box::new([]),
+            Box::new([]),
+            vec![site],
+            Some(FrameRecipe {
+                prologue_end: 4,
+                return_auth: 0,
+                caller_sp: 16,
+                saved_fp: 0,
+                saved_return: 8,
+                gpr: [None; 10],
+                simd: [None; 8],
+            }),
+        )
+        .unwrap();
+        let missing = NO_RECIPE.as_ptr() as usize;
+        crate::codemap::register_with_traps(missing, 16, Box::new([]), Box::new([]), vec![site])
+            .unwrap();
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x4000));
+        vm.map(0x1000, 0x2000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        // MOV EAX, [RBX] (SDM Vol 2B, MOV, Operation): replay must recompute RBX.
+        vm.write_bytes(0x1000, &[0x8b, 0x03]).unwrap();
+        vm.write_bytes(0x2000, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        let mut cpu = CpuState::new();
+        cpu.gpr[crate::Reg::Rbx.gpr_index().unwrap()] = 0x2000;
+        let mut ctx = MemCtx::for_memory(&vm.mem);
+        ctx.fault_addr = u64::MAX;
+        assert!(!((ctx.base)..(ctx.base + ctx.size)).contains(&((pc + 4) as u64)));
+        let mut frame = [0u64, landing_stub as *const () as u64];
+        let original = HostRegisters {
+            pc: (pc + 4) as u64,
+            sp: frame.as_ptr() as u64,
+            fp: frame.as_ptr() as u64,
+            ..Default::default()
+        };
+        let mut record = EntryRecord::default();
+        let handle = record.handle().as_usize();
+        // SAFETY: all run pointers and synthetic frame slots are live in this thread.
+        unsafe {
+            record.activate(&mut cpu, &mut ctx);
+            for (candidate, live_handle, kind) in [
+                (pc + 3, handle, HostFaultKind::Alignment),
+                (missing + 4, handle, HostFaultKind::Alignment),
+                (pc + 4, 0, HostFaultKind::Alignment),
+                (pc + 4, handle, HostFaultKind::Access),
+                (pc + 4, handle, HostFaultKind::Unsupported),
+            ] {
+                let mut regs = HostRegisters {
+                    pc: candidate as u64,
+                    ..original
+                };
+                let before = regs;
+                assert!(!classify(
+                    live_handle,
+                    candidate,
+                    candidate,
+                    kind,
+                    &mut regs
+                ));
+                assert_eq!(regs, before);
+            }
+            frame[1] = (pc + 8) as u64;
+            let mut regs = original;
+            assert!(!classify(
+                handle,
+                pc + 4,
+                pc + 4,
+                HostFaultKind::Alignment,
+                &mut regs
+            ));
+            assert_eq!(regs, original);
+            frame[1] = landing_stub as *const () as u64;
+            std::hint::black_box(&frame);
+            let recovered = classify(handle, pc + 4, pc + 4, HostFaultKind::Alignment, &mut regs);
+            assert_eq!(
+                recovered,
+                cfg!(all(target_os = "freebsd", target_arch = "aarch64"))
+            );
+            // No fabricated data address is recorded, even for an accepted signal.
+            assert_eq!(ctx.fault_addr, u64::MAX);
+            if recovered {
+                assert_eq!(record.fault_kind(), HostFaultKind::Alignment);
+                assert_eq!(regs.pc, landing_stub as *const () as u64);
+                assert_eq!(cpu.rip, site.guest_rip);
+                // The dispatcher's Alignment path single-steps from this guest RIP.
+                let result = crate::interp::step_one(
+                    &vm.mem,
+                    &mut cpu,
+                    crate::CpuMode::Long64,
+                    &mut Vec::new(),
+                    &mut Default::default(),
+                );
+                assert!(matches!(result, crate::StepResult::Continue));
+                assert_eq!(cpu.gpr[crate::Reg::Rax.gpr_index().unwrap()], 0x1234_5678);
+                assert_eq!(cpu.rip, 0x1002);
+            } else {
+                assert_eq!(regs, original);
+                assert_eq!(cpu.rip, 0);
+            }
+            record.deactivate();
+            let mut regs = original;
+            assert!(!classify(
+                handle,
+                pc + 4,
+                pc + 4,
+                HostFaultKind::Alignment,
+                &mut regs
+            ));
+            assert_eq!(regs, original);
+        }
+    }
 
     #[test]
     fn classifier_requires_recipe_exact_site_outer_frame_and_live_run() {

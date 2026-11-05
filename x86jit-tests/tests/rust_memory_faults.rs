@@ -2,7 +2,7 @@
 //! Intel SDM Vol 3A §7.5; REP progress follows Vol 2B, REP—Repeat String Operation (Prefix),
 //! Description. Aligned scalar atomicity follows Vol 3A §11.1.1.
 #![cfg(all(
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 

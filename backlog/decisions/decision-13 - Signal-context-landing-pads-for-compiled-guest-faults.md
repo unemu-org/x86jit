@@ -102,6 +102,25 @@ embedder owns decoding; ambiguous or unknown reasons fail safe as NOT OURS.
 - Linux: SIGSEGV with SEGV_MAPERR/SEGV_ACCERR or SIGBUS with BUS_ADRERR is Access;
   SIGBUS with BUS_ADRALN is Alignment. Other causes, including si_code <= 0,
   must not enter recovery (or are passed as Unsupported).
+- FreeBSD amd64/arm64: SIGSEGV with SEGV_MAPERR=1 or SEGV_ACCERR=2 is Access.
+  SIGBUS with compatibility page-fault code UCODE_PAGEFLT=12 is also Access.
+  FreeBSD 14.3 `vm_fault_trap` normally reports a mapped protection failure as
+  SIGSEGV/SEGV_ACCERR for current FreeBSD binaries; an older or missing ELF ABI
+  tag, or `machdep.prot_fault_translation=1`, selects SIGBUS/code 12 instead.
+  The value is defined in `sys/vm/vm_fault.c`; `sys/sys/signal.h` has no
+  BUS_PAGE_FAULT constant. SIGBUS/BUS_ADRALN=1 is Alignment. BUS_ADRERR=2,
+  BUS_OBJERR=3, BUS_OOMERR=100 and all other causes are Unsupported. Explicitly
+  allowlist the supported pairs: FreeBSD's user-sent SI_USER/SI_QUEUE/SI_LWP
+  codes are positive, so excluding only si_code <= 0 is insufficient.
+  The release sources below are unpinned in `oracles/`.
+  On FreeBSD arm64 only, Alignment recovery ignores `si_addr`: `align_abort`
+  passes the interrupted `tf_elr` to `call_trapsignal`, which sets `ksi_addr`.
+  The classifier still requires the active owning handle, exact compiled guest
+  trap site, supported recipe and outermost frame. It leaves `fault_addr`
+  untouched and the interpreter recomputes the operand from guest RIP on replay.
+  Access recovery still validates/rebases `si_addr`; Linux, macOS and FreeBSD
+  amd64 require an in-span address for every kind. Fixup routines continue to
+  reject Alignment on every host.
 - macOS AArch64: first exclude user-sent and unsupported signals. Derive the kind
   from the saved exception-state ESR, because protection failures can arrive as
   SIGBUS/BUS_ADRALN too. EC=0x24/0x25 identifies a Data Abort; DFSC=0x21 is
@@ -125,8 +144,9 @@ call_block's caller**, after the signal handler has completed.
 
 For compiled PCs, OURS requires an active handle, an exact guest transfer site
 in a compiled function with a supported recipe, a return address outside
-**every** compiled range, and a data address within the run's guest span. Nested
-compiled calls are NOT OURS: this mechanism unwinds exactly one outermost
+**every** compiled range, and a data address within the run's guest span.
+The FreeBSD arm64 Alignment exception above drops only that address check.
+Nested compiled calls are NOT OURS: this mechanism unwinds exactly one outermost
 compiled frame. On OURS the classifier writes full-width guest RIP from the trap
 site and rebased address, transfer width and access into CpuState/MemCtx.
 ReadWrite maps to Write in the fallback exit. It restores the saved GPRs, FP and
@@ -186,11 +206,22 @@ Supported/tested host: macOS AArch64. Linux x86-64/AArch64 adapters are workspac
 cross-checked; macOS x86-64 is **compile-unverified**, with Alignment unsupported
 by its test adapter. The landing stub is a mangled Rust naked function using
 `naked_asm!`; each linked crate instance gets its own symbol on ELF/Mach-O.
-A link test builds two crate instances to pin that property. Other targets keep
-the direct compiled call and always classify NOT OURS. Test adapters cover Linux
-x86-64 greg arrays, Linux AArch64's bounded FPSIMD extension records (Linux v6.12
+A link test builds two crate instances to pin that property. Hosts outside Linux,
+macOS and FreeBSD keep the direct compiled call and always classify NOT OURS.
+Test adapters cover Linux x86-64 greg arrays, Linux AArch64's bounded FPSIMD extension records (Linux v6.12
 `arch/arm64/include/uapi/asm/sigcontext.h`), and macOS AArch64 and x86-64 mcontexts.
 Core dependencies remain **iced-x86 only**; no dependencies were added elsewhere.
+
+FreeBSD amd64 and arm64 use the same mangled naked ELF landing stubs and relative
+fixup descriptors as Linux. Their test adapters copy the complete recovery
+register set. The amd64 adapter uses `mc_rip`, `mc_rsp`, `mc_rbp`, `mc_rbx`,
+`mc_r12`–`mc_r15` and `mc_r11`. The arm64 adapter uses `mc_gpregs.gp_x[]`,
+`gp_lr`, `gp_sp`, `gp_elr` and the low halves of `mc_fpregs.fp_q[8..16]`, preserving
+the upper halves and unrelated fields. It requires `_MC_FP_VALID`. libc 0.2.186
+models `fp_q` as a single u128, truncating its arm64 mcontext; the test adapter
+uses a local `repr(C)` signal-image layout from the release header instead.
+FreeBSD amd64 execution of `fault_landing_pad` and `rust_memory_faults` remains
+pending on an embedder's FreeBSD host; arm64 execution is also pending.
 
 ## Validation and cost
 
@@ -230,10 +261,31 @@ caller register. Mutation controls independently remove each restoration.
 
 ## Host-source provenance
 
-The AArch64 host references cited here are **not pinned in `oracles/`**. No
-build-time manual dependency is required. The references and their verification
+The FreeBSD and AArch64 host references cited here are **not pinned in `oracles/`**.
+No build-time manual dependency is required. The references and their verification
 limits are:
 
+- FreeBSD 14.3, tag `release/14.3.0`:
+  [sys/sys/signal.h](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/sys/signal.h)
+  defines the signal-specific and SI_* values;
+  [sys/vm/vm_fault.c](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/vm/vm_fault.c),
+  `vm_fault_trap`, defines UCODE_PAGEFLT=12 and protection-fault translation.
+  [sys/amd64/amd64/trap.c](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/amd64/amd64/trap.c),
+  `trap`/`trap_pfault`, uses BUS_ADRALN for alignment and `vm_fault_trap` for
+  page faults.
+  [sys/arm64/arm64/trap.c](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/arm64/arm64/trap.c),
+  `align_abort`/`call_trapsignal`, supplies the host PC as Alignment's si_addr;
+  `data_abort` delegates access-fault classification to `vm_fault_trap`.
+- FreeBSD 14.3 signal images:
+  [sys/x86/include/ucontext.h](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/x86/include/ucontext.h)
+  and [sys/arm64/include/ucontext.h](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/arm64/include/ucontext.h)
+  define the recovery fields; the arm64 image contains 32 u128 vectors and
+  `_MC_FP_VALID=1`.
+  [sys/sys/_ucontext.h](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/sys/_ucontext.h)
+  puts mcontext after the signal mask, whose four u32 words are defined by
+  [sys/sys/_sigset.h](https://github.com/freebsd/freebsd-src/blob/release/14.3.0/sys/sys/_sigset.h).
+  Signal-code and arm64 layout/copy-back tests witness these source values;
+  FreeBSD runtime delivery, landing and fixup recovery remain unverified.
 - [AAPCS64 2024Q3 (5 September 2024)](https://github.com/ARM-software/abi-aa/blob/2024Q3/aapcs64/aapcs64.rst),
   §§6.1.1–6.1.2 (preserved registers), “The Frame Pointer”.
 - Arm ARM DDI0487J.a (2023), §C5.2.7 (FPCR, FZ and RMode),

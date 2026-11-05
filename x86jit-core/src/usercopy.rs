@@ -1330,7 +1330,7 @@ unsafe extern "sysv64" fn pair(_: *mut u8, _: usize, _: usize, _: usize) -> Stat
 }
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
 mod tests {

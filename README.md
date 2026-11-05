@@ -244,6 +244,16 @@ SIGSEGV/SIGBUS handler and copies the returned host registers into its signal
 context, including the scratch register the classifier sets (x9 / r11), and on
 AArch64 LR and d8–d15. The embedder derives `HostFaultKind` from the OS fault
 reason; macOS AArch64 needs the saved ESR to distinguish access from alignment.
+FreeBSD amd64/arm64 accepts SIGSEGV with SEGV_MAPERR (1) or SEGV_ACCERR (2),
+and SIGBUS with compatibility page-fault code 12 (UCODE_PAGEFLT), as Access;
+SIGBUS/BUS_ADRALN (1) is Alignment. Other codes, including user-sent signals,
+BUS_ADRERR (2), BUS_OBJERR (3) and BUS_OOMERR (100), are Unsupported. FreeBSD
+arm64 alignment recovery ignores `si_addr`, which names the host PC, and replays
+from guest RIP after validating the active handle, exact site and compiled frame.
+Access faults on that host, and every kind on the other hosts, require an address
+in the guest span. These facts follow FreeBSD 14.3 `sys/sys/signal.h`,
+`sys/vm/vm_fault.c` and the amd64/arm64 trap sources; they are not pinned in
+`oracles/`. See decision-13 below for source links and ucontext layouts.
 The handler must not depend on the interrupted FP mode. Returning from it reaches
 a mangled core landing stub, which restores host FP control before control returns
 to `call_block`'s caller. Access faults produce a resumable `Exit::UnmappedMemory`;
@@ -254,6 +264,9 @@ for supported hosts, signal safety, and the protected-mapped-page fallback.
 Compiled calls stay direct; recovery uses compiler-provided unwind recipes and
 one record published per run and cleared on return or panic. macOS x86-64 is
 compile-unverified.
+FreeBSD amd64/arm64 recovery and test adapters are implemented; runtime validation
+of `fault_landing_pad` and `rust_memory_faults` on both FreeBSD architectures is
+pending.
 
 Embedders that protect RAM independently of the region table enable
 `vm.mem.set_host_fault_recovery(true)` before execution;
