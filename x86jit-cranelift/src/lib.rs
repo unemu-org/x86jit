@@ -1607,8 +1607,8 @@ unsafe extern "C" fn vpack_helper(
 }
 
 /// Memory-source variant of [`vpack_helper`]: the 128-bit second source is
-/// passed as two i64 halves (loaded — and fault-checked — in JIT code). `dst` already
-/// holds source 1 (pre-copied by the lift), so this packs `dst = pack(dst, b)`.
+/// passed as two i64 halves after all guest loads succeed. Read source 1 from `a`
+/// at `lane`, so dst can alias it without losing any unread source lane.
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
@@ -1621,12 +1621,18 @@ unsafe extern "C" fn vpack_mem_helper(
     hi: u64,
     from_elem: u64,
     signed: u64,
+    lane: u64,
 ) {
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let b = (lo as u128) | ((hi as u128) << 64);
     // op1 by VALUE from `a`, not read back out of `dst` (§16).
-    let av = cpu.xmm[a as usize];
-    x86jit_core::interp::pack_wide_mem_from(cpu, dst as u8, av, b, from_elem as u8, signed != 0);
+    let av = cpu.vec_lanes(a as usize)[lane as usize];
+    let r = x86jit_core::interp::pack_lane(av, b, from_elem as u8, signed != 0);
+    if lane == 0 {
+        cpu.xmm[dst as usize] = r;
+    } else {
+        cpu.ymm_hi[dst as usize] = r;
+    }
 }
 
 /// SSE3 lane-combining packed float helper (register form): `haddp`/`hsubp`/
@@ -1736,6 +1742,89 @@ unsafe extern "C" fn cvtph2ps_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u6
     let (lo, hi) = x86jit_core::interp::cvtph2ps(cpu.xmm[src as usize], lanes as usize);
     cpu.xmm[dst as usize] = lo;
     cpu.ymm_hi[dst as usize] = hi;
+}
+
+/// Apply one already-loaded memory count lane after all guest reads succeed.
+/// # Safety
+/// `cpu` points to the active CpuState; `lane` is zero or one.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn var_shift_mem_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    lo: u64,
+    hi: u64,
+    lane: u64,
+    elem: u64,
+    right: u64,
+    arith: u64,
+) {
+    let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
+    let av = cpu.vec_lanes(a as usize)[lane as usize];
+    let count = u128::from(lo) | (u128::from(hi) << 64);
+    let r = x86jit_core::interp::var_shift_lane(av, count, elem as u8, right != 0, arith != 0);
+    if lane == 0 {
+        cpu.xmm[dst as usize] = r;
+    } else {
+        cpu.ymm_hi[dst as usize] = r;
+    }
+}
+
+/// Probe every destination page before a multi-transfer conversion store.
+/// # Safety
+/// `cpu` and `mem` retain the active CpuState and MemCtx for this call.
+unsafe extern "C" fn vstore_preflight_helper(
+    cpu: *mut u8,
+    mem: *mut u8,
+    addr: u64,
+    bytes: u64,
+    cur_addr: u64,
+) -> u64 {
+    use x86jit_core::interp::StrMem;
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
+    let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
+    let ctx = &mut *(mem as *mut MemCtx);
+    // SAFETY: mem_self retains the live Memory for this helper call.
+    let recover = unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }.host_fault_recovery();
+    let raw = x86jit_core::interp::RawStrMem {
+        base: ctx.base as *mut u8,
+        size: ctx.size,
+        guest_base: ctx.guest_base,
+        recover_host_faults: recover,
+    };
+    match raw.preflight_store(addr, u64::MAX, 1, bytes as u16) {
+        Ok(()) => RET_CONTINUE,
+        Err((at, _)) => {
+            cpu.rip = cur_addr;
+            ctx.record_helper_fault(at, 1, true, addr, bytes);
+            RET_UNMAPPED
+        }
+    }
+}
+
+/// Compute the packed half-precision value without changing guest registers.
+/// # Safety
+/// `cpu` points to the active CpuState and `out` to a writable 16-byte stack slot.
+unsafe extern "C" fn cvtps2ph_value_helper(
+    cpu: *mut u8,
+    src: u64,
+    lanes: u64,
+    rc: u64,
+    out: *mut u128,
+) {
+    let cpu = &*(cpu as *const x86jit_core::state::CpuState);
+    let rc = if rc & 4 != 0 {
+        ((cpu.mxcsr >> 13) & 3) as u8
+    } else {
+        rc as u8
+    };
+    *out = x86jit_core::interp::cvtps2ph_with_mxcsr(
+        cpu.xmm[src as usize],
+        cpu.ymm_hi[src as usize],
+        lanes as usize,
+        rc,
+        cpu.mxcsr,
+    );
 }
 
 /// F16C `vcvtps2ph` helper: convert `lanes` f32 lanes of the register `src` to
@@ -2993,12 +3082,15 @@ impl Shared {
         let vpshufb_wide_sig = params(8, false); // (cpu, dst, a, idx, bytes, k, masked, zeroing) -> ()
         let vshuffle32_wide_sig = params(8, false); // (cpu, dst, a, imm, bytes, k, masked, zeroing) -> ()
         let vpack_sig = params(7, false); // (cpu, dst, a, b, from_elem, signed, bytes) -> ()
-        let vpack_mem_sig = params(7, false); // (cpu, dst, a, lo, hi, from_elem, signed) -> ()
+        let vpack_mem_sig = params(8, false); // (cpu, dst, a, lo, hi, from_elem, signed, lane) -> ()
         let vhfloat_sig = params(7, false); // (cpu, dst, a, b, op, f64, bytes) -> ()
         let vhfloat_mem_sig = params(10, false); // (cpu, dst, a, lo0, hi0, lo1, hi1, op, f64, bytes) -> ()
         let vhint_sig = params(6, false); // (cpu, dst, a, b, op, bytes) -> ()
         let vhint_mem_sig = params(9, false); // (cpu, dst, a, lo0, hi0, lo1, hi1, op, bytes) -> ()
         let cvtph2ps_sig = params(4, false); // (cpu, dst, src, lanes) -> ()
+        let var_shift_mem_sig = params(9, false);
+        let vstore_preflight_sig = params(5, true);
+        let cvtps2ph_value_sig = params(5, false);
         let cvtps2ph_sig = params(5, false); // (cpu, dst, src, lanes, rc) -> ()
         let phminposuw_sig = params(3, false); // (cpu, dst, src) -> ()
         let mpsadbw_sig = params(7, false); // (cpu, dst, a, lo, hi, imm, half) -> ()
@@ -3126,6 +3218,9 @@ impl Shared {
                 vpshufb_wide: helper!(vpshufb_wide_sig, vpshufb_wide_helper),
                 vshuffle32_wide: helper!(vshuffle32_wide_sig, vshuffle32_wide_helper),
                 vpack: helper!(vpack_sig, vpack_helper),
+                var_shift_mem: helper!(var_shift_mem_sig, var_shift_mem_helper),
+                vstore_preflight: helper!(vstore_preflight_sig, vstore_preflight_helper),
+                cvtps2ph_value: helper!(cvtps2ph_value_sig, cvtps2ph_value_helper),
                 vpack_mem: helper!(vpack_mem_sig, vpack_mem_helper),
                 vhfloat: helper!(vhfloat_sig, vhfloat_helper),
                 vhfloat_mem: helper!(vhfloat_mem_sig, vhfloat_mem_helper),

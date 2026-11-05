@@ -121,6 +121,9 @@ pub struct Helpers {
     pub vpshufb_wide: (ir::SigRef, u64, u64),
     pub vshuffle32_wide: (ir::SigRef, u64, u64),
     pub vpack: (ir::SigRef, u64, u64),
+    pub var_shift_mem: (ir::SigRef, u64, u64),
+    pub vstore_preflight: (ir::SigRef, u64, u64),
+    pub cvtps2ph_value: (ir::SigRef, u64, u64),
     pub vpack_mem: (ir::SigRef, u64, u64),
     pub vhfloat: (ir::SigRef, u64, u64),
     pub vhfloat_mem: (ir::SigRef, u64, u64),
@@ -217,6 +220,9 @@ impl Helpers {
             vpshufb_wide: mk(),
             vshuffle32_wide: mk(),
             vpack: mk(),
+            var_shift_mem: mk(),
+            vstore_preflight: mk(),
+            cvtps2ph_value: mk(),
             vpack_mem: mk(),
             vhfloat: mk(),
             vhfloat_mem: mk(),
@@ -1815,13 +1821,21 @@ impl Translator<'_, '_> {
             } => self.emit_v_shuffle16_m(dst, addr, imm, high),
             IrOp::VShiftRegM {
                 dst,
+                a,
+                bytes,
                 addr,
                 elem,
                 right,
                 arith,
                 ..
-            } => self.emit_v_shift_reg_m(dst, addr, elem, right, arith),
-            IrOp::VPtestM { a, addr, .. } => self.emit_v_ptest_m(a, addr),
+            } => self.emit_v_shift_reg_m(dst, a, addr, elem, right, arith, bytes),
+            IrOp::VPtestM {
+                a,
+                addr,
+                bytes,
+                elem,
+                ..
+            } => self.emit_v_ptest_m(a, addr, bytes, elem),
             IrOp::VBlendWM {
                 dst,
                 a,
@@ -1903,8 +1917,9 @@ impl Translator<'_, '_> {
                 addr,
                 from_elem,
                 signed,
+                bytes,
                 ..
-            } => self.emit_v_pack_wide_m(dst, a, addr, from_elem, signed),
+            } => self.emit_v_pack_wide_m(dst, a, addr, from_elem, signed, bytes),
             IrOp::VShuffle32Wide {
                 dst,
                 a,
@@ -1951,7 +1966,14 @@ impl Translator<'_, '_> {
             IrOp::VAlignr {
                 dst, a, src, imm, ..
             } => self.emit_v_alignr(dst, a, src, imm),
-            IrOp::VAlignrM { dst, addr, imm, .. } => self.emit_v_alignr_m(dst, addr, imm),
+            IrOp::VAlignrM {
+                dst,
+                a,
+                addr,
+                imm,
+                bytes,
+                ..
+            } => self.emit_v_alignr_m(dst, a, addr, imm, bytes),
             IrOp::VAes { dst, a, b, op } => self.emit_v_aes(dst, a, b, op),
             IrOp::VAesM {
                 dst, a, addr, op, ..
@@ -2224,6 +2246,34 @@ impl Translator<'_, '_> {
                 ..
             } => self.emit_v_unpack256_m(dst, a, addr, lane, high),
             IrOp::VCvtPh2Ps { dst, src, lanes } => self.emit_v_cvt_ph2ps(dst, src, lanes),
+            IrOp::VPermilVarM {
+                dst,
+                src,
+                addr,
+                elem,
+                bytes,
+                ..
+            } => self.emit_v_permil_var_m(dst, src, addr, elem, bytes),
+            IrOp::VPerm2i128M {
+                dst, a, addr, imm, ..
+            } => self.emit_v_perm2i128_m(dst, a, addr, imm),
+            IrOp::VShiftVarM {
+                dst,
+                a,
+                addr,
+                elem,
+                right,
+                arith,
+                bytes,
+                ..
+            } => self.emit_v_shift_var_m(dst, a, addr, elem, right, arith, bytes),
+            IrOp::VCvtPs2PhM {
+                addr,
+                src,
+                lanes,
+                rc,
+                ..
+            } => self.emit_v_cvtps2ph_m(addr, src, lanes, rc),
             IrOp::VCvtPs2Ph {
                 dst,
                 src,

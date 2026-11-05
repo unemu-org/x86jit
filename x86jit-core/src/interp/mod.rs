@@ -1622,6 +1622,8 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             IrOp::VShiftRegM {
                 fault,
                 dst,
+                a,
+                bytes,
                 addr,
                 elem,
                 right,
@@ -1641,24 +1643,49 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     }
                 };
                 let count = (bv as u64).min(u64::from(*elem) * 8) as u8;
-                cpu.xmm[*dst as usize] =
-                    packed_shift(cpu.xmm[*dst as usize], count, *elem, *right, *arith);
+                let av = cpu.vec_lanes(*a as usize);
+                let mut r = [0; 4];
+                for i in 0..usize::from(*bytes) / 16 {
+                    r[i] = packed_shift(av[i], count, *elem, *right, *arith);
+                }
+                if *bytes == 16 {
+                    cpu.set_vec_low(*dst as usize, r, *bytes);
+                } else {
+                    cpu.set_vec(*dst as usize, r, *bytes);
+                }
             }
-            IrOp::VPtestM { fault, a, addr } => {
+            IrOp::VPtestM {
+                fault,
+                a,
+                addr,
+                bytes,
+                elem,
+            } => {
                 let ea = read_val(*addr, temps);
-                let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
                         return classify_access(
-                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
-                            read_val(*addr, temps),
+                            ea,
                             *fault,
                         )
                         .into()
                     }
                 };
-                ptest_value(cpu, cpu.xmm[*a as usize], bv, 0, 0);
+                let av = cpu.vec_lanes(*a as usize);
+                let mask = if *elem == 0 {
+                    u128::MAX
+                } else {
+                    fp_sign_mask(*elem)
+                };
+                let (ahi, bhi) = if *bytes == 32 {
+                    (av[1] & mask, bv[1] & mask)
+                } else {
+                    (0, 0)
+                };
+                ptest_value(cpu, av[0] & mask, bv[0] & mask, ahi, bhi);
             }
             IrOp::VBlendWM {
                 fault,
@@ -1807,12 +1834,27 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 addr,
                 from_elem,
                 signed,
+                bytes,
             } => {
-                if let Some(r) =
-                    exec_v_pack_wide_m(cpu, mem, temps, *cur_addr, dst, a, addr, from_elem, signed)
-                {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => {
+                        return classify_access(
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into()
+                    }
+                };
+                let av = cpu.vec_lanes(*a as usize);
+                let mut r = [0; 4];
+                for i in 0..usize::from(*bytes) / 16 {
+                    r[i] = pack_lane(av[i], bv[i], *from_elem, *signed);
                 }
+                cpu.set_vec_low(*dst as usize, r, *bytes);
             }
             IrOp::VShuffle32Wide {
                 dst,
@@ -2309,11 +2351,33 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             IrOp::VAlignrM {
                 fault,
                 dst,
+                a,
                 addr,
                 imm,
+                bytes,
             } => {
-                if let Some(r) = exec_v_alignr_m(cpu, mem, temps, *cur_addr, dst, addr, imm) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => {
+                        return classify_access(
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into()
+                    }
+                };
+                let av = cpu.vec_lanes(*a as usize);
+                let mut r = [0; 4];
+                for i in 0..usize::from(*bytes) / 16 {
+                    r[i] = palignr(av[i], bv[i], *imm);
+                }
+                if *bytes == 16 {
+                    cpu.set_vec_low(*dst as usize, r, *bytes);
+                } else {
+                    cpu.set_vec(*dst as usize, r, *bytes);
                 }
             }
             IrOp::VAes { dst, a, b, op } => {
@@ -2857,6 +2921,145 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let (lo, hi) = cvtph2ps(cpu.xmm[*src as usize], *lanes as usize);
                 cpu.xmm[*dst as usize] = lo;
                 cpu.ymm_hi[*dst as usize] = hi; // 0 for the 4-lane form
+            }
+            IrOp::VPermilVarM {
+                fault,
+                dst,
+                src,
+                addr,
+                elem,
+                bytes,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => {
+                        return classify_access(
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into()
+                    }
+                };
+                let av = cpu.vec_lanes(*src as usize);
+                let mut r = [0; 4];
+                for i in 0..usize::from(*bytes) / 16 {
+                    r[i] = permil_lane(av[i], bv[i], *elem);
+                }
+                cpu.set_vec(*dst as usize, r, *bytes);
+            }
+            IrOp::VPerm2i128M {
+                fault,
+                dst,
+                a,
+                addr,
+                imm,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, 32) {
+                    Ok(v) => v,
+                    Err(f) => {
+                        return classify_access(
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 32),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into()
+                    }
+                };
+                let av = cpu.vec_lanes(*a as usize);
+                let halves = [av[0], av[1], bv[0], bv[1]];
+                let r = perm2i128_values(halves, *imm);
+                cpu.set_vec(*dst as usize, [r[0], r[1], 0, 0], 32);
+            }
+            IrOp::VShiftVarM {
+                fault,
+                dst,
+                a,
+                addr,
+                elem,
+                right,
+                arith,
+                bytes,
+            } => {
+                let ea = read_val(*addr, temps);
+                let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
+                    Ok(v) => v,
+                    Err(f) => {
+                        return classify_access(
+                            vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into()
+                    }
+                };
+                let av = cpu.vec_lanes(*a as usize);
+                let mut r = [0; 4];
+                for i in 0..usize::from(*bytes) / 16 {
+                    r[i] = var_shift_lane(av[i], bv[i], *elem, *right, *arith);
+                }
+                cpu.set_vec(*dst as usize, r, *bytes);
+            }
+            IrOp::VCvtPs2PhM {
+                fault,
+                addr,
+                src,
+                lanes,
+                rc,
+            } => {
+                let ea = read_val(*addr, temps);
+                let mxcsr = interp_mxcsr::<DEFAULT>(cpu);
+                let rc = if rc & 4 != 0 {
+                    ((mxcsr >> 13) & 3) as u8
+                } else {
+                    *rc
+                };
+                let out = cvtps2ph_with_mxcsr(
+                    cpu.xmm[*src as usize],
+                    cpu.ymm_hi[*src as usize],
+                    usize::from(*lanes),
+                    rc,
+                    mxcsr,
+                );
+                let size = lanes * 2;
+                // SDM Vol 3A §7.5: check the whole destination before any RAM store.
+                for offset in (0..size).step_by(8) {
+                    let at = ea.wrapping_add(u64::from(offset));
+                    if let Err(
+                        t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault),
+                    ) = mem.probe_write(at, 8)
+                    {
+                        let at = if t == MemTrap::Unmapped {
+                            (0..8)
+                                .map(|i| at.wrapping_add(i))
+                                .find(|&b| matches!(mem.probe_write(b, 1), Err(MemTrap::Unmapped)))
+                                .unwrap_or(at)
+                        } else {
+                            t.fault_addr(at)
+                        };
+                        return classify_access(
+                            trap_out(cpu, *cur_addr, t, at, 8, AccessKind::Write, 0),
+                            *cur_addr,
+                            ea,
+                            *fault,
+                        )
+                        .into();
+                    }
+                }
+                if let Err(f) = vstore(cpu, mem, *cur_addr, ea, out, size) {
+                    return classify_access(
+                        vec_trap_out(cpu, *cur_addr, f, AccessKind::Write, ea, u16::from(size)),
+                        *cur_addr,
+                        ea,
+                        *fault,
+                    )
+                    .into();
+                }
             }
             IrOp::VCvtPs2Ph {
                 dst,
@@ -3958,15 +4161,9 @@ pub fn exec_vperm1(
     masked: bool,
     zeroing: bool,
 ) {
-    let n = bytes as usize / elem as usize;
     let index = cpu.vec_lanes(idx as usize);
     let table = cpu.vec_lanes(src as usize);
-    let sel = n - 1; // index masked to log2(n) bits
-    let mut res = [0u128; 4];
-    for i in 0..n {
-        let id = get_velem(&index, i, elem) as usize & sel;
-        set_velem(&mut res, i, elem, get_velem(&table, id, elem));
-    }
+    let res = permute1(&index, &table, elem, bytes);
     if masked {
         cpu.write_masked(dst as usize, res, k, elem, zeroing, bytes);
     } else {
@@ -4021,19 +4218,24 @@ pub fn vperm1_run<M: StrMem>(
         };
     }
     let index = cpu.vec_lanes(idx as usize);
-    let n = bytes as usize / elem as usize;
-    let sel = n - 1;
-    let mut res = [0u128; 4];
-    for i in 0..n {
-        let id = get_velem(&index, i, elem) as usize & sel;
-        set_velem(&mut res, i, elem, get_velem(&table, id, elem));
-    }
+    let res = permute1(&index, &table, elem, bytes);
     if masked {
         cpu.write_masked(dst as usize, res, k, elem, zeroing, bytes);
     } else {
         cpu.set_vec(dst as usize, res, bytes);
     }
     None
+}
+
+/// SDM Vol 2C §5.2, VPERMD/VPERMPS: each index selects across the whole table.
+fn permute1(index: &[u128; 4], table: &[u128; 4], elem: u8, bytes: u16) -> [u128; 4] {
+    let n = usize::from(bytes) / usize::from(elem);
+    let mut res = [0; 4];
+    for i in 0..n {
+        let id = get_velem(index, i, elem) as usize & (n - 1);
+        set_velem(&mut res, i, elem, get_velem(table, id, elem));
+    }
+    res
 }
 
 /// Two-table cross-lane permute core (shared by `vpermt2`/`vpermi2`, reg + memory src):
@@ -4343,13 +4545,9 @@ pub fn exec_var_shift(
 ) {
     let al = cpu.vec_lanes(a as usize);
     let cl = cpu.vec_lanes(count as usize);
-    let n = bytes as usize / elem as usize;
-    let bits = elem as u32 * 8;
     let mut r = [0u128; 4];
-    for i in 0..n {
-        let av = get_velem(&al, i, elem);
-        let cnt = get_velem(&cl, i, elem);
-        set_velem(&mut r, i, elem, var_shift_one(av, cnt, bits, right, arith));
+    for i in 0..usize::from(bytes) / 16 {
+        r[i] = var_shift_lane(al[i], cl[i], elem, right, arith);
     }
     if k == 0 {
         cpu.set_vec(dst as usize, r, bytes); // unmasked EVEX: full write, zero-upper
@@ -4446,6 +4644,23 @@ pub fn gf2p8_mem_run<M: StrMem>(
 
 /// One element of a variable shift: `av` (low `bits` bits significant) shifted by `cnt`.
 /// A count ≥ `bits` yields 0 (logical/left) or the smeared sign (arithmetic right).
+/// One variable-shift lane. SDM Vol 2C §5.2, VPSLLV/VPSRLV/VPSRAV, Operation.
+pub fn var_shift_lane(a: u128, count: u128, elem: u8, right: bool, arith: bool) -> u128 {
+    let mut r = 0;
+    let bits = u32::from(elem) * 8;
+    let mask = if elem == 8 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    for i in 0..16 / u32::from(elem) {
+        let av = (a >> (i * bits)) as u64 & mask;
+        let cv = (count >> (i * bits)) as u64 & mask;
+        r |= u128::from(var_shift_one(av, cv, bits, right, arith)) << (i * bits);
+    }
+    r
+}
+
 fn var_shift_one(av: u64, cnt: u64, bits: u32, right: bool, arith: bool) -> u64 {
     let mask = if bits == 64 {
         u64::MAX
@@ -5189,7 +5404,8 @@ fn unpack_low(a: u128, b: u128, lane: u8, high: bool) -> u128 {
 
 /// One 128-bit lane of `pack{ss,us}{wb,dw}`: saturate each `from`-byte source element
 /// (read as signed) to `from/2` bytes; `a`'s elements fill the low half, `b`'s the high.
-fn pack_lane(a: u128, b: u128, from: u8, signed: bool) -> u128 {
+/// Saturate and pack one lane. SDM Vol 2B §4.3, PACKSSWB/PACKSSDW and PACKUSWB/PACKUSDW.
+pub fn pack_lane(a: u128, b: u128, from: u8, signed: bool) -> u128 {
     let fb = from as u32 * 8;
     let tb = (from as u32 / 2) * 8; // result element bits
     let count = 16 / from as usize; // elements per source lane
@@ -6028,6 +6244,8 @@ fn vload<const ROUTED: bool>(
             Ok(lo | (hi << 64))
         }
         8 => Ok(vpart(cpu, mem, cur_addr, addr, 8)? as u128),
+        // SDM Vol 2B §4.3, PMOVSX/PMOVZX: XMM byte-to-qword sources are m16.
+        2 => Ok(vpart(cpu, mem, cur_addr, addr, 2)? as u128),
         _ => Ok(vpart(cpu, mem, cur_addr, addr, 4)? as u128),
     }
 }

@@ -21,7 +21,7 @@ created_date: '2026-07-06 11:25'
 | optional | 7 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 668 | 0 | 131 | 84% | 240 |
 | x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
-| x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
+| x86-64-v3 | 677 | 0 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
 | x87 | 141 | 0 | 13 | 92% | 6 |
 
@@ -35,7 +35,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | optional | 5 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 562 | 0 | 124 | 82% | 228 |
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
-| x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
+| x86-64-v3 | 638 | 0 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
 | x87 | 141 | 0 | 13 | 92% | 11 |
 
@@ -851,82 +851,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Frstor_m94byte`
 - `Fstpnce_sti`
 
-## long64 x86-64-v3 — register form lifts, memory form does not (73)
-
-- `VEX_Vcvtps2ph_xmmm128_ymm_imm8`
-- `VEX_Vcvtps2ph_xmmm64_xmm_imm8`
-- `VEX_Vpabsb_xmm_xmmm128`
-- `VEX_Vpabsb_ymm_ymmm256`
-- `VEX_Vpabsd_xmm_xmmm128`
-- `VEX_Vpabsd_ymm_ymmm256`
-- `VEX_Vpabsw_xmm_xmmm128`
-- `VEX_Vpabsw_ymm_ymmm256`
-- `VEX_Vpackssdw_ymm_ymm_ymmm256`
-- `VEX_Vpacksswb_ymm_ymm_ymmm256`
-- `VEX_Vpackusdw_ymm_ymm_ymmm256`
-- `VEX_Vpackuswb_ymm_ymm_ymmm256`
-- `VEX_Vpalignr_xmm_xmm_xmmm128_imm8`
-- `VEX_Vpalignr_ymm_ymm_ymmm256_imm8`
-- `VEX_Vpblendd_xmm_xmm_xmmm128_imm8`
-- `VEX_Vpblendd_ymm_ymm_ymmm256_imm8`
-- `VEX_Vperm2f128_ymm_ymm_ymmm256_imm8`
-- `VEX_Vperm2i128_ymm_ymm_ymmm256_imm8`
-- `VEX_Vpermd_ymm_ymm_ymmm256`
-- `VEX_Vpermilpd_xmm_xmm_xmmm128`
-- `VEX_Vpermilpd_ymm_ymm_ymmm256`
-- `VEX_Vpermilps_xmm_xmm_xmmm128`
-- `VEX_Vpermilps_ymm_ymm_ymmm256`
-- `VEX_Vpermps_ymm_ymm_ymmm256`
-- `VEX_Vpmovsxbd_ymm_xmmm64`
-- `VEX_Vpmovsxbq_ymm_xmmm32`
-- `VEX_Vpmovsxbw_ymm_xmmm128`
-- `VEX_Vpmovsxdq_ymm_xmmm128`
-- `VEX_Vpmovsxwd_ymm_xmmm128`
-- `VEX_Vpmovsxwq_ymm_xmmm64`
-- `VEX_Vpmovzxbd_ymm_xmmm64`
-- `VEX_Vpmovzxbq_ymm_xmmm32`
-- `VEX_Vpmovzxbw_ymm_xmmm128`
-- `VEX_Vpmovzxdq_ymm_xmmm128`
-- `VEX_Vpmovzxwd_ymm_xmmm128`
-- `VEX_Vpmovzxwq_ymm_xmmm64`
-- `VEX_Vpshufd_ymm_ymmm256_imm8`
-- `VEX_Vpshufhw_xmm_xmmm128_imm8`
-- `VEX_Vpshufhw_ymm_ymmm256_imm8`
-- `VEX_Vpshuflw_xmm_xmmm128_imm8`
-- `VEX_Vpshuflw_ymm_ymmm256_imm8`
-- `VEX_Vpslld_xmm_xmm_xmmm128`
-- `VEX_Vpslld_ymm_ymm_xmmm128`
-- `VEX_Vpsllq_xmm_xmm_xmmm128`
-- `VEX_Vpsllq_ymm_ymm_xmmm128`
-- `VEX_Vpsllvd_xmm_xmm_xmmm128`
-- `VEX_Vpsllvd_ymm_ymm_ymmm256`
-- `VEX_Vpsllvq_xmm_xmm_xmmm128`
-- `VEX_Vpsllvq_ymm_ymm_ymmm256`
-- `VEX_Vpsllw_xmm_xmm_xmmm128`
-- `VEX_Vpsllw_ymm_ymm_xmmm128`
-- `VEX_Vpsrad_xmm_xmm_xmmm128`
-- `VEX_Vpsrad_ymm_ymm_xmmm128`
-- `VEX_Vpsravd_xmm_xmm_xmmm128`
-- `VEX_Vpsravd_ymm_ymm_ymmm256`
-- `VEX_Vpsraw_xmm_xmm_xmmm128`
-- `VEX_Vpsraw_ymm_ymm_xmmm128`
-- `VEX_Vpsrld_xmm_xmm_xmmm128`
-- `VEX_Vpsrld_ymm_ymm_xmmm128`
-- `VEX_Vpsrlq_xmm_xmm_xmmm128`
-- `VEX_Vpsrlq_ymm_ymm_xmmm128`
-- `VEX_Vpsrlvd_xmm_xmm_xmmm128`
-- `VEX_Vpsrlvd_ymm_ymm_ymmm256`
-- `VEX_Vpsrlvq_xmm_xmm_xmmm128`
-- `VEX_Vpsrlvq_ymm_ymm_ymmm256`
-- `VEX_Vpsrlw_xmm_xmm_xmmm128`
-- `VEX_Vpsrlw_ymm_ymm_xmmm128`
-- `VEX_Vptest_xmm_xmmm128`
-- `VEX_Vptest_ymm_ymmm256`
-- `VEX_Vtestpd_xmm_xmmm128`
-- `VEX_Vtestpd_ymm_ymmm256`
-- `VEX_Vtestps_xmm_xmmm128`
-- `VEX_Vtestps_ymm_ymmm256`
-
 ## long64 x86-64-v4 — register form lifts, memory form does not (101)
 
 - `EVEX_Valignd_xmm_k1z_xmm_xmmm128b32_imm8`
@@ -1030,82 +954,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vpsrlw_ymm_k1z_ymm_xmmm128`
 - `EVEX_Vshuff32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshuff64x2_ymm_k1z_ymm_ymmm256b64_imm8`
-
-## compat32 x86-64-v3 — register form lifts, memory form does not (73)
-
-- `VEX_Vcvtps2ph_xmmm128_ymm_imm8`
-- `VEX_Vcvtps2ph_xmmm64_xmm_imm8`
-- `VEX_Vpabsb_xmm_xmmm128`
-- `VEX_Vpabsb_ymm_ymmm256`
-- `VEX_Vpabsd_xmm_xmmm128`
-- `VEX_Vpabsd_ymm_ymmm256`
-- `VEX_Vpabsw_xmm_xmmm128`
-- `VEX_Vpabsw_ymm_ymmm256`
-- `VEX_Vpackssdw_ymm_ymm_ymmm256`
-- `VEX_Vpacksswb_ymm_ymm_ymmm256`
-- `VEX_Vpackusdw_ymm_ymm_ymmm256`
-- `VEX_Vpackuswb_ymm_ymm_ymmm256`
-- `VEX_Vpalignr_xmm_xmm_xmmm128_imm8`
-- `VEX_Vpalignr_ymm_ymm_ymmm256_imm8`
-- `VEX_Vpblendd_xmm_xmm_xmmm128_imm8`
-- `VEX_Vpblendd_ymm_ymm_ymmm256_imm8`
-- `VEX_Vperm2f128_ymm_ymm_ymmm256_imm8`
-- `VEX_Vperm2i128_ymm_ymm_ymmm256_imm8`
-- `VEX_Vpermd_ymm_ymm_ymmm256`
-- `VEX_Vpermilpd_xmm_xmm_xmmm128`
-- `VEX_Vpermilpd_ymm_ymm_ymmm256`
-- `VEX_Vpermilps_xmm_xmm_xmmm128`
-- `VEX_Vpermilps_ymm_ymm_ymmm256`
-- `VEX_Vpermps_ymm_ymm_ymmm256`
-- `VEX_Vpmovsxbd_ymm_xmmm64`
-- `VEX_Vpmovsxbq_ymm_xmmm32`
-- `VEX_Vpmovsxbw_ymm_xmmm128`
-- `VEX_Vpmovsxdq_ymm_xmmm128`
-- `VEX_Vpmovsxwd_ymm_xmmm128`
-- `VEX_Vpmovsxwq_ymm_xmmm64`
-- `VEX_Vpmovzxbd_ymm_xmmm64`
-- `VEX_Vpmovzxbq_ymm_xmmm32`
-- `VEX_Vpmovzxbw_ymm_xmmm128`
-- `VEX_Vpmovzxdq_ymm_xmmm128`
-- `VEX_Vpmovzxwd_ymm_xmmm128`
-- `VEX_Vpmovzxwq_ymm_xmmm64`
-- `VEX_Vpshufd_ymm_ymmm256_imm8`
-- `VEX_Vpshufhw_xmm_xmmm128_imm8`
-- `VEX_Vpshufhw_ymm_ymmm256_imm8`
-- `VEX_Vpshuflw_xmm_xmmm128_imm8`
-- `VEX_Vpshuflw_ymm_ymmm256_imm8`
-- `VEX_Vpslld_xmm_xmm_xmmm128`
-- `VEX_Vpslld_ymm_ymm_xmmm128`
-- `VEX_Vpsllq_xmm_xmm_xmmm128`
-- `VEX_Vpsllq_ymm_ymm_xmmm128`
-- `VEX_Vpsllvd_xmm_xmm_xmmm128`
-- `VEX_Vpsllvd_ymm_ymm_ymmm256`
-- `VEX_Vpsllvq_xmm_xmm_xmmm128`
-- `VEX_Vpsllvq_ymm_ymm_ymmm256`
-- `VEX_Vpsllw_xmm_xmm_xmmm128`
-- `VEX_Vpsllw_ymm_ymm_xmmm128`
-- `VEX_Vpsrad_xmm_xmm_xmmm128`
-- `VEX_Vpsrad_ymm_ymm_xmmm128`
-- `VEX_Vpsravd_xmm_xmm_xmmm128`
-- `VEX_Vpsravd_ymm_ymm_ymmm256`
-- `VEX_Vpsraw_xmm_xmm_xmmm128`
-- `VEX_Vpsraw_ymm_ymm_xmmm128`
-- `VEX_Vpsrld_xmm_xmm_xmmm128`
-- `VEX_Vpsrld_ymm_ymm_xmmm128`
-- `VEX_Vpsrlq_xmm_xmm_xmmm128`
-- `VEX_Vpsrlq_ymm_ymm_xmmm128`
-- `VEX_Vpsrlvd_xmm_xmm_xmmm128`
-- `VEX_Vpsrlvd_ymm_ymm_ymmm256`
-- `VEX_Vpsrlvq_xmm_xmm_xmmm128`
-- `VEX_Vpsrlvq_ymm_ymm_ymmm256`
-- `VEX_Vpsrlw_xmm_xmm_xmmm128`
-- `VEX_Vpsrlw_ymm_ymm_xmmm128`
-- `VEX_Vptest_xmm_xmmm128`
-- `VEX_Vptest_ymm_ymmm256`
-- `VEX_Vtestpd_xmm_xmmm128`
-- `VEX_Vtestpd_ymm_ymmm256`
-- `VEX_Vtestps_xmm_xmmm128`
-- `VEX_Vtestps_ymm_ymmm256`
 
 ## compat32 x86-64-v4 — register form lifts, memory form does not (101)
 

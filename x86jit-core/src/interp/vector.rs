@@ -1937,29 +1937,6 @@ pub(crate) fn exec_v_pack_wide(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pack_wide_m<const ROUTED: bool>(
-    cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
-    temps: &mut [u64],
-    cur_addr: u64,
-    dst: &u8,
-    a: &u8,
-    addr: &Val,
-    from_elem: &u8,
-    signed: &bool,
-) -> Option<StepResult> {
-    let av = read_val(*addr, &*temps);
-    // Fault atomicity (§16): op1 comes from `a`, not from a lift-emitted copy
-    // into `dst`, so nothing has touched the destination if this load faults.
-    let av1 = cpu.xmm[*a as usize];
-    match vload(cpu, mem, cur_addr, av, 16) {
-        Ok(bv) => pack_wide_mem_from(cpu, *dst, av1, bv, *from_elem, *signed),
-        Err(f) => return Some(vec_trap_out(cpu, cur_addr, f, AccessKind::Read, av, 16)),
-    }
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_shuffle32_wide(
     cpu: &mut CpuState,
     dst: &u8,
@@ -2766,25 +2743,11 @@ pub(crate) fn exec_v_permd(
     ctrl: &u8,
     src: &u8,
 ) -> Option<StepResult> {
-    let (clo, chi) = (cpu.xmm[*ctrl as usize], cpu.ymm_hi[*ctrl as usize]);
-    let (slo, shi) = (cpu.xmm[*src as usize], cpu.ymm_hi[*src as usize]);
-    let dword = |v: (u128, u128), i: usize| -> u64 {
-        let w = if i < 4 { v.0 } else { v.1 };
-        ((w >> ((i % 4) * 32)) & 0xffff_ffff) as u64
-    };
-    let mut lo = 0u128;
-    let mut hi = 0u128;
-    for i in 0..8usize {
-        let idx = (dword((clo, chi), i) & 7) as usize;
-        let e = dword((slo, shi), idx) as u128;
-        if i < 4 {
-            lo |= e << (i * 32);
-        } else {
-            hi |= e << ((i - 4) * 32);
-        }
-    }
-    cpu.xmm[*dst as usize] = lo;
-    cpu.ymm_hi[*dst as usize] = hi;
+    let index = cpu.vec_lanes(*ctrl as usize);
+    let table = cpu.vec_lanes(*src as usize);
+    let r = permute1(&index, &table, 4, 32);
+    cpu.xmm[*dst as usize] = r[0];
+    cpu.ymm_hi[*dst as usize] = r[1];
     None
 }
 
@@ -2814,7 +2777,7 @@ pub(crate) fn exec_v_permil_var(
 /// In-lane `vpermil` on one 128-bit lane. `elem` = 4 (ps): the control dword's low 2 bits
 /// select one of the 4 dwords. `elem` = 8 (pd): the control qword's bit[1] selects one of
 /// the 2 qwords.
-fn permil_lane(src: u128, ctrl: u128, elem: u8) -> u128 {
+pub(super) fn permil_lane(src: u128, ctrl: u128, elem: u8) -> u128 {
     let n = 16 / elem as u32; // elements per 128-bit lane
     let ebits = elem as u32 * 8;
     let emask: u128 = if elem == 8 {
@@ -2852,16 +2815,22 @@ pub(crate) fn exec_v_perm2i128(
         cpu.xmm[*b as usize],
         cpu.ymm_hi[*b as usize],
     ];
-    let lane = |sel: u8| -> u128 {
-        if sel & 0x08 != 0 {
+    let r = perm2i128_values(halves, *imm);
+    cpu.xmm[*dst as usize] = r[0];
+    cpu.ymm_hi[*dst as usize] = r[1];
+    None
+}
+
+/// SDM Vol 2C §5.2, VPERM2I128/F128, Operation: select or zero each output half.
+pub(super) fn perm2i128_values(halves: [u128; 4], imm: u8) -> [u128; 2] {
+    let lane = |s: u8| {
+        if s & 8 != 0 {
             0
         } else {
-            halves[(sel & 3) as usize]
+            halves[usize::from(s & 3)]
         }
     };
-    cpu.xmm[*dst as usize] = lane(*imm);
-    cpu.ymm_hi[*dst as usize] = lane(*imm >> 4);
-    None
+    [lane(imm), lane(imm >> 4)]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2899,7 +2868,7 @@ pub(super) fn ptest_value(cpu: &mut CpuState, alo: u128, blo: u128, ahi: u128, b
 }
 
 /// Sign-bit mask for `vtestps`/`vtestpd`: MSB set in each `elem`-byte lane over 128 bits.
-fn fp_sign_mask(elem: u8) -> u128 {
+pub(super) fn fp_sign_mask(elem: u8) -> u128 {
     let mut m = 0u128;
     let bitw = elem as u32 * 8;
     let mut sh = bitw - 1;
@@ -2926,12 +2895,7 @@ pub(crate) fn exec_v_test_fp(
     } else {
         (0, 0)
     };
-    cpu.flags.zf = (blo & alo) == 0 && (bhi & ahi) == 0;
-    cpu.flags.cf = (blo & !alo & m) == 0 && (bhi & !ahi & m) == 0;
-    cpu.flags.of = false;
-    cpu.flags.sf = false;
-    cpu.flags.set_af(false);
-    cpu.flags.set_pf(false);
+    ptest_value(cpu, alo, blo, ahi, bhi);
     None
 }
 
@@ -2986,24 +2950,6 @@ pub(crate) fn exec_v_alignr(
     imm: &u8,
 ) -> Option<StepResult> {
     cpu.xmm[*dst as usize] = palignr(cpu.xmm[*a as usize], cpu.xmm[*src as usize], *imm);
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_alignr_m<const ROUTED: bool>(
-    cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
-    temps: &mut [u64],
-    cur_addr: u64,
-    dst: &u8,
-    addr: &Val,
-    imm: &u8,
-) -> Option<StepResult> {
-    let a = read_val(*addr, &*temps);
-    match vload(cpu, mem, cur_addr, a, 16) {
-        Ok(iv) => cpu.xmm[*dst as usize] = palignr(cpu.xmm[*dst as usize], iv, *imm),
-        Err(f) => return Some(vec_trap_out(cpu, cur_addr, f, AccessKind::Read, a, 16)),
-    }
     None
 }
 

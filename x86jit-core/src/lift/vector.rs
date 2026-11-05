@@ -176,10 +176,30 @@ pub(crate) fn lift_vpacked_shift_avx(
     arith: bool,
 ) -> Result<(), LiftError> {
     // Scalar register count `vp{sll,srl,sra}{w,d,q} v,v,xmm`: the low 64 bits of an xmm
-    // shift every lane uniformly. Memory-source count deferred.
+    // shift every lane uniformly. SDM Vol 2B §4.3, PSLL/PSRL/PSRA: m128 count.
     if !is_immediate(insn.op_kind(2)) {
         let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
         let (a, _) = vec_operand(insn, 1).or_unsupported(insn)?;
+        if insn.op_kind(2) == OpKind::Memory {
+            if insn.encoding() != iced_x86::EncodingKind::VEX {
+                return Err(unsupported_insn(insn));
+            }
+            let addr = effective_address(insn, ops, tg)?;
+            ops.push(IrOp::VShiftRegM {
+                fault: Default::default(),
+                dst,
+                a,
+                addr,
+                elem: lane,
+                right,
+                arith,
+                bytes,
+            });
+            if bytes == 16 {
+                ops.push(IrOp::VZeroUpper { reg: dst });
+            }
+            return Ok(());
+        }
         let count = vec_operand_reg(insn, 2).or_unsupported(insn)?;
         ops.push(IrOp::VShiftReg {
             dst,
@@ -270,17 +290,34 @@ pub(crate) fn lift_vpacked_shift_avx(
 }
 
 /// AVX2/AVX-512 per-element variable shift `vp{sll,srl,sra}v{w,d,q}`: shift each
-/// `elem`-byte lane of src1 by the count in the matching lane of src2 (register; memory-source
-/// count deferred). Any width (128/256/512) + optional EVEX write-masking via `VShiftVar`.
+/// `elem`-byte lane of src1 by the count in the matching lane of src2 (register or VEX memory). Any width (128/256/512) + optional EVEX write-masking via `VShiftVar`.
 pub(crate) fn lift_vshift_var(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     elem: u8,
     right: bool,
     arith: bool,
 ) -> Result<(), LiftError> {
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
     let (a, _) = vec_operand(insn, 1).or_unsupported(insn)?;
+    if insn.op_kind(2) == OpKind::Memory {
+        if insn.encoding() != iced_x86::EncodingKind::VEX {
+            return Err(unsupported_insn(insn));
+        }
+        let addr = effective_address(insn, ops, tg)?;
+        ops.push(IrOp::VShiftVarM {
+            fault: Default::default(),
+            dst,
+            a,
+            addr,
+            elem,
+            right,
+            arith,
+            bytes,
+        });
+        return Ok(());
+    }
     let count = vec_operand_reg(insn, 2).or_unsupported(insn)?; // mem count deferred
     ops.push(IrOp::VShiftVar {
         dst,
@@ -1658,6 +1695,41 @@ pub(crate) fn lift_pmovx(
     Ok(())
 }
 
+/// Materialize a VEX unary source only after its entire architectural operand loads.
+/// SDM Vol 2A §2.5: unaligned VEX operands use their instruction's memory width.
+fn vex_unary_source(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    dst: u8,
+    bytes: u16,
+) -> Result<u8, LiftError> {
+    if insn.op_kind(1) != OpKind::Memory {
+        return vec_operand_reg(insn, 1).or_unsupported(insn);
+    }
+    // EVEX masking/broadcast has separate access rules; keep its current support boundary.
+    if insn.encoding() != iced_x86::EncodingKind::VEX {
+        return Err(unsupported_insn(insn));
+    }
+    let addr = effective_address(insn, ops, tg)?;
+    if bytes < 16 {
+        ops.push(IrOp::VLoad {
+            fault: Default::default(),
+            dst,
+            addr,
+            size: bytes as u8,
+        });
+    } else {
+        ops.push(IrOp::VLoadWide {
+            fault: Default::default(),
+            dst,
+            addr,
+            bytes,
+        });
+    }
+    Ok(dst)
+}
+
 /// VEX/EVEX `vpmov{z,s}x*`: the SSE zero/sign-extend plus VEX's upper-zeroing on the 128-bit
 /// form. A wide (ymm/zmm) or masked destination routes to `VPMovExtendWide`.
 pub(crate) fn lift_vpmovx(
@@ -1669,11 +1741,18 @@ pub(crate) fn lift_vpmovx(
     signed: bool,
 ) -> Result<(), LiftError> {
     // Wide (ymm/zmm) dest — EVEX/VEX-256 — or a masked xmm dest: route to the shared
-    // widening helper (register src only; memory-src wide forms deferred). glibc's v4
+    // widening helper. VEX memory reads only the narrow source width; EVEX memory
+    // remains deferred. glibc's v4
     // routines use `vpmovsxdq zmm, ymm` to widen dword indices to qword.
     let (dst, dst_width) = vec_operand(insn, 0).or_unsupported(insn)?;
     if dst_width > 16 || evex_is_masked(insn) {
-        let src = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+        let src = vex_unary_source(
+            insn,
+            ops,
+            tg,
+            dst,
+            dst_width * u16::from(from) / u16::from(to),
+        )?;
         ops.push(IrOp::VPMovExtendWide {
             dst,
             src,
@@ -1693,15 +1772,16 @@ pub(crate) fn lift_vpmovx(
 }
 
 /// Packed absolute value `vpabs{b,w,d,q}` (VEX/EVEX): `dst = |src|` per `elem`-byte lane, any
-/// width, masked/zeroing. Register src only (memory-src deferred); `vec_operand` gives the dest
+/// width, masked/zeroing. VEX accepts register or memory sources; `vec_operand` gives the dest
 /// width (= VL), above which EVEX zeroes.
 pub(crate) fn lift_vpabs(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
     let (dst, dst_width) = vec_operand(insn, 0).or_unsupported(insn)?;
-    let src = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+    let src = vex_unary_source(insn, ops, tg, dst, dst_width)?;
     ops.push(IrOp::VPAbs {
         dst,
         src,
@@ -2325,6 +2405,8 @@ pub(crate) fn lift_vpacked_shift(
         if insn.op_kind(1) == OpKind::Memory {
             let addr = legacy_sse_memory(insn, ops, tg)?;
             ops.push(IrOp::VShiftRegM {
+                a: d,
+                bytes: 16,
                 fault: Default::default(),
                 dst: d,
                 addr,
@@ -2486,10 +2568,14 @@ pub(crate) fn lift_vpack(
 ) -> Result<(), LiftError> {
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
     let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
-    // Memory src2 is 128-bit only (`VPackWideM`); the wide (ymm) mem form is deferred.
-    if bytes == 16 && insn.op_kind(2) == OpKind::Memory {
+    // SDM Vol 2B §4.3, PACKSSWB/PACKSSDW and PACKUSWB/PACKUSDW: VEX m128/m256.
+    if insn.op_kind(2) == OpKind::Memory {
+        if insn.encoding() == iced_x86::EncodingKind::EVEX && bytes != 16 {
+            return Err(unsupported_insn(insn));
+        }
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPackWideM {
+            bytes,
             fault: Default::default(),
             dst,
             a,
@@ -2497,8 +2583,10 @@ pub(crate) fn lift_vpack(
             from_elem,
             signed,
         });
-        // VEX.128: VPackWideM writes only the low 128 bits; clear bits 255:128.
-        ops.push(IrOp::VZeroUpper { reg: dst });
+        // VEX.128 clears bits 255:128 after the operand has loaded.
+        if bytes == 16 {
+            ops.push(IrOp::VZeroUpper { reg: dst });
+        }
         return Ok(());
     }
     let b = vec_operand_reg(insn, 2).or_unsupported(insn)?;
@@ -2563,19 +2651,13 @@ pub(crate) fn lift_vpblendw(
     Ok(())
 }
 
-pub(crate) fn lift_vpblendd(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
-    let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
-    let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
-    let b = vec_operand_reg(insn, 2).or_unsupported(insn)?;
-    let imm = insn.immediate(3) as u8;
-    ops.push(IrOp::VBlendD {
-        dst,
-        a,
-        b,
-        imm,
-        bytes,
-    });
-    Ok(())
+pub(crate) fn lift_vpblendd(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
+    // SDM Vol 2C §5.2, VPBLENDD: the same bit selection as BLENDPS.
+    lift_vblendi(insn, ops, tg, 4)
 }
 
 /// VEX/EVEX `vpshufd`: the SSE dword shuffle plus VEX's upper-zeroing on the 128-bit form.
@@ -2584,11 +2666,10 @@ pub(crate) fn lift_vpshufd(
     ops: &mut Vec<IrOp>,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
-    // Wide (ymm/zmm) or masked → shared per-lane helper (register src only; memory src
-    // for the wide form is deferred).
+    // Wide (ymm/zmm) or masked → shared per-lane helper. VEX memory loads atomically.
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
     if bytes > 16 || evex_is_masked(insn) {
-        let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+        let a = vex_unary_source(insn, ops, tg, dst, bytes)?;
         let imm = insn.immediate(2) as u8;
         ops.push(IrOp::VShuffle32Wide {
             dst,
@@ -2889,15 +2970,30 @@ pub(crate) fn lift_vpermil_imm(
 
 /// AVX `vpermilps`/`vpermilpd` with a **variable** (register) control vector
 /// (VEX.128/256.66.0F38.W0 0C/0D): an IN-LANE permute. op0 = dst, op1 (`vvvv`) = src data, op2
-/// = control vector. `elem` = 4 (ps) / 8 (pd). Register control only; the memory-control form
-/// is deferred (mirrors the other permutes' deferred mem sources).
+/// = control vector. `elem` = 4 (ps) / 8 (pd). VEX memory controls are loaded before dst commits.
 pub(crate) fn lift_vpermil_var(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
     let src = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+    if insn.op_kind(2) == OpKind::Memory {
+        if insn.encoding() != iced_x86::EncodingKind::VEX {
+            return Err(unsupported_insn(insn));
+        }
+        let addr = effective_address(insn, ops, tg)?;
+        ops.push(IrOp::VPermilVarM {
+            fault: Default::default(),
+            dst,
+            src,
+            addr,
+            elem,
+            bytes,
+        });
+        return Ok(());
+    }
     let ctrl = vec_operand_reg(insn, 2).or_unsupported(insn)?;
     ops.push(IrOp::VPermilVar {
         dst,
@@ -2912,7 +3008,7 @@ pub(crate) fn lift_vpermil_var(
 /// `pshuflw`/`vpshuflw` (`high`=false) / `pshufhw`/`vpshufhw` (`high`=true): word permute of
 /// one 64-bit half. `vec_operand` gives the width (16 = xmm, 32 = the AVX2 ymm form) — the imm8
 /// shuffles the low/high 4 words within EACH 128-bit lane independently, NOT cross-lane.
-/// Register source only.
+/// Register or VEX memory source.
 pub(crate) fn lift_pshufw(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
@@ -2933,7 +3029,11 @@ pub(crate) fn lift_pshufw(
         });
         return Ok(());
     }
-    let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+    let a = if vex {
+        vex_unary_source(insn, ops, tg, d, bytes)?
+    } else {
+        vec_operand_reg(insn, 1).or_unsupported(insn)?
+    };
     let imm = insn.immediate(2) as u8;
     ops.push(IrOp::VShuffle16 {
         dst: d,
@@ -3481,6 +3581,7 @@ pub(crate) fn lift_packuswb(
     if insn.op_kind(1) == OpKind::Memory {
         let addr = legacy_sse_memory(insn, ops, tg)?;
         ops.push(IrOp::VPackWideM {
+            bytes: 16,
             fault: Default::default(),
             dst: d,
             a: d,
@@ -3520,6 +3621,7 @@ pub(crate) fn lift_pack_signed(
             bytes: 16,
         }),
         |addr| ops.push(IrOp::VPackWideM {
+            bytes: 16,
             fault: Default::default(),
             dst: d,
             a: d,
@@ -4930,7 +5032,7 @@ pub(crate) fn lift_vcvtph2ps(
 pub(crate) fn lift_vcvtps2ph(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
-    _tg: &mut TempGen,
+    tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (src, lanes) = if let Some(y) = reg_ymm(insn, 1) {
         (y, 8u8)
@@ -4941,8 +5043,21 @@ pub(crate) fn lift_vcvtps2ph(
     // imm8[2]=0 uses imm8[1:0] as the explicit rounding control (SDM VCVTPS2PH).
     let imm = insn.immediate(2) as u8;
     let rc = imm & 7;
-    // Memory-destination form needs a scratch vector register to stage the packed halves;
-    // there is no scratch-vec allocator, so it is deferred.
+    // SDM Vol 2C §5.2, VCVTPS2PH: write only the converted halves to memory.
+    if insn.op_kind(0) == OpKind::Memory {
+        if insn.encoding() != iced_x86::EncodingKind::VEX {
+            return Err(unsupported_insn(insn));
+        }
+        let addr = effective_address(insn, ops, tg)?;
+        ops.push(IrOp::VCvtPs2PhM {
+            fault: Default::default(),
+            addr,
+            src,
+            lanes,
+            rc,
+        });
+        return Ok(());
+    }
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
     ops.push(IrOp::VCvtPs2Ph {
         dst: d,

@@ -377,6 +377,10 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VPerm1M { .. }
             | VInsert128M { .. }
             | VPshufb256M { .. }
+            | VPermilVarM { .. }
+            | VPerm2i128M { .. }
+            | VShiftVarM { .. }
+            | VCvtPs2PhM { .. }
             | VPtestM { .. }
             | VFloatBinM { .. }
             | VFloatUnaryM { .. }
@@ -1456,6 +1460,10 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VPcmpStrMaskM { .. }
         | VKOrTest { .. }
         | VPtest { .. }
+        | VPermilVarM { .. }
+        | VPerm2i128M { .. }
+        | VShiftVarM { .. }
+        | VCvtPs2PhM { .. }
         | VPtestM { .. }
         | VTestFp { .. }
         | VFloatCmp { .. }
@@ -2237,8 +2245,8 @@ pub(crate) fn lift_insn(
         Vpermilpd if insn.op_kind(2) == OpKind::Immediate8 => {
             lift_vpermil_imm(insn, ops, tg, true).map(|_| false)
         }
-        Vpermilps => lift_vpermil_var(insn, ops, 4).map(|_| false),
-        Vpermilpd => lift_vpermil_var(insn, ops, 8).map(|_| false),
+        Vpermilps => lift_vpermil_var(insn, ops, tg, 4).map(|_| false),
+        Vpermilpd => lift_vpermil_var(insn, ops, tg, 8).map(|_| false),
         Pshufb => {
             let d = reg_xmm(insn, 0).or_unsupported(insn)?;
             vec_src_dispatch!(
@@ -2272,6 +2280,8 @@ pub(crate) fn lift_insn(
                     imm
                 }),
                 |addr| ops.push(IrOp::VAlignrM {
+                    a: d,
+                    bytes: 16,
                     fault: Default::default(),
                     dst: d,
                     addr,
@@ -2628,7 +2638,7 @@ pub(crate) fn lift_insn(
             Ok(false)
         }
         Vpblendw => lift_vpblendw(insn, ops, tg).map(|_| false),
-        Vpblendd => lift_vpblendd(insn, ops).map(|_| false),
+        Vpblendd => lift_vpblendd(insn, ops, tg).map(|_| false),
         Roundps => lift_round(insn, ops, tg, FPrec::F32, false).map(|_| false),
         Roundpd => lift_round(insn, ops, tg, FPrec::F64, false).map(|_| false),
         Roundss => lift_round(insn, ops, tg, FPrec::F32, true).map(|_| false),
@@ -2754,10 +2764,10 @@ pub(crate) fn lift_insn(
         // SSSE3 legacy `pmaddubsw`: the SSE 2-operand form (dst == src1).
         Pmaddubsw => lift_pmaddubsw(insn, ops, tg).map(|_| false),
         // Packed absolute value `vpabs{b,w,d,q}` (VEX/EVEX): any width, masked.
-        Vpabsb => lift_vpabs(insn, ops, 1).map(|_| false),
-        Vpabsw => lift_vpabs(insn, ops, 2).map(|_| false),
-        Vpabsd => lift_vpabs(insn, ops, 4).map(|_| false),
-        Vpabsq => lift_vpabs(insn, ops, 8).map(|_| false),
+        Vpabsb => lift_vpabs(insn, ops, tg, 1).map(|_| false),
+        Vpabsw => lift_vpabs(insn, ops, tg, 2).map(|_| false),
+        Vpabsd => lift_vpabs(insn, ops, tg, 4).map(|_| false),
+        Vpabsq => lift_vpabs(insn, ops, tg, 8).map(|_| false),
         // Masked EVEX unary lane ops: lzcnt / rotate-imm / conflict-detect.
         Vplzcntd => lift_vp_unary_lane(insn, ops, VpUnaryOp::Lzcnt, 4).map(|_| false),
         Vplzcntq => lift_vp_unary_lane(insn, ops, VpUnaryOp::Lzcnt, 8).map(|_| false),
@@ -2981,18 +2991,17 @@ pub(crate) fn lift_insn(
         // vpsraq: AVX-512 only (no VEX form) — arithmetic 64-bit right shift.
         Vpsraq => lift_vpacked_shift_avx(insn, ops, tg, 8, true, true).map(|_| false),
         // AVX2/AVX-512 per-element variable shifts `vp{sll,srl,sra}v{w,d,q}`.
-        Vpsllvw => lift_vshift_var(insn, ops, 2, false, false).map(|_| false),
-        Vpsllvd => lift_vshift_var(insn, ops, 4, false, false).map(|_| false),
-        Vpsllvq => lift_vshift_var(insn, ops, 8, false, false).map(|_| false),
-        Vpsrlvw => lift_vshift_var(insn, ops, 2, true, false).map(|_| false),
-        Vpsrlvd => lift_vshift_var(insn, ops, 4, true, false).map(|_| false),
-        Vpsrlvq => lift_vshift_var(insn, ops, 8, true, false).map(|_| false),
-        Vpsravw => lift_vshift_var(insn, ops, 2, true, true).map(|_| false),
-        Vpsravd => lift_vshift_var(insn, ops, 4, true, true).map(|_| false),
-        Vpsravq => lift_vshift_var(insn, ops, 8, true, true).map(|_| false),
+        Vpsllvw => lift_vshift_var(insn, ops, tg, 2, false, false).map(|_| false),
+        Vpsllvd => lift_vshift_var(insn, ops, tg, 4, false, false).map(|_| false),
+        Vpsllvq => lift_vshift_var(insn, ops, tg, 8, false, false).map(|_| false),
+        Vpsrlvw => lift_vshift_var(insn, ops, tg, 2, true, false).map(|_| false),
+        Vpsrlvd => lift_vshift_var(insn, ops, tg, 4, true, false).map(|_| false),
+        Vpsrlvq => lift_vshift_var(insn, ops, tg, 8, true, false).map(|_| false),
+        Vpsravw => lift_vshift_var(insn, ops, tg, 2, true, true).map(|_| false),
+        Vpsravd => lift_vshift_var(insn, ops, tg, 4, true, true).map(|_| false),
+        Vpsravq => lift_vshift_var(insn, ops, tg, 8, true, true).map(|_| false),
 
-        // AVX2 cross-lane permutes. Register forms; memory sources
-        // deferred (mirrors vinserti128).
+        // AVX2 cross-lane permutes, register or memory sources.
         Vpermq | Vpermpd if insn.op_kind(2) == OpKind::Immediate8 => {
             // imm8 4-qword cross-lane permute (vpermq and vpermpd are identical on the
             // 4×64-bit lanes). Register OR memory source — the mem form loads 256 bits
@@ -3024,7 +3033,11 @@ pub(crate) fn lift_insn(
         // 128-bit lanes — genuine 256-bit gather, not a two-half split.
         Vpermd | Vpermps => {
             // EVEX-512 or masked → the shared single-source permute; VEX.256 → ymm fast path.
-            if reg_zmm(insn, 0).is_some() || evex_is_masked(insn) {
+            if reg_zmm(insn, 0).is_some()
+                || evex_is_masked(insn)
+                || (insn.encoding() == iced_x86::EncodingKind::VEX
+                    && insn.op_kind(2) == OpKind::Memory)
+            {
                 return lift_vperm1(insn, ops, tg, 4).map(|_| false);
             }
             let dst = reg_ymm(insn, 0).or_unsupported(insn)?;
@@ -3036,19 +3049,36 @@ pub(crate) fn lift_insn(
         Vperm2i128 | Vperm2f128 => {
             let dst = reg_ymm(insn, 0).or_unsupported(insn)?;
             let a = reg_ymm(insn, 1).or_unsupported(insn)?;
+            if insn.op_kind(2) == OpKind::Memory {
+                let addr = effective_address(insn, ops, tg)?;
+                ops.push(IrOp::VPerm2i128M {
+                    fault: Default::default(),
+                    dst,
+                    a,
+                    addr,
+                    imm: insn.immediate(3) as u8,
+                });
+                return Ok(false);
+            }
             let b = reg_ymm(insn, 2).or_unsupported(insn)?;
             let imm = insn.immediate(3) as u8;
             ops.push(IrOp::VPerm2i128 { dst, a, b, imm });
             Ok(false)
         }
         // AVX `vptest` (+ legacy `ptest`): flags-only AND test. op0 = DEST, op1 =
-        // SRC. YMM → 256-bit form. Register src; memory deferred.
+        // SRC. YMM → 256-bit form; memory sources read the full operand.
         Ptest | Vptest => {
             // SDM Vol 2B, PTEST: legacy memory source is m128.
-            if insn.mnemonic() == Ptest && insn.op_kind(1) == OpKind::Memory {
-                let a = reg_xmm(insn, 0).or_unsupported(insn)?;
-                let addr = legacy_sse_memory(insn, ops, tg)?;
+            if insn.op_kind(1) == OpKind::Memory {
+                let (a, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
+                let addr = if insn.mnemonic() == Ptest {
+                    legacy_sse_memory(insn, ops, tg)?
+                } else {
+                    effective_address(insn, ops, tg)?
+                };
                 ops.push(IrOp::VPtestM {
+                    bytes,
+                    elem: 0,
                     fault: Default::default(),
                     a,
                     addr,
@@ -3078,6 +3108,17 @@ pub(crate) fn lift_insn(
             } else {
                 (reg_xmm(insn, 0).or_unsupported(insn)?, 16u16)
             };
+            if insn.op_kind(1) == OpKind::Memory {
+                let addr = effective_address(insn, ops, tg)?;
+                ops.push(IrOp::VPtestM {
+                    fault: Default::default(),
+                    a,
+                    addr,
+                    bytes,
+                    elem,
+                });
+                return Ok(false);
+            }
             let b = if bytes == 32 {
                 reg_ymm(insn, 1).or_unsupported(insn)?
             } else {
@@ -3088,6 +3129,26 @@ pub(crate) fn lift_insn(
         }
         Vpalignr => {
             let imm = insn.immediate(3) as u8;
+            if insn.op_kind(2) == OpKind::Memory {
+                if insn.encoding() != iced_x86::EncodingKind::VEX {
+                    return Err(unsupported_insn(insn));
+                }
+                let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
+                let a = vec_operand_reg(insn, 1).or_unsupported(insn)?;
+                let addr = effective_address(insn, ops, tg)?;
+                ops.push(IrOp::VAlignrM {
+                    fault: Default::default(),
+                    dst,
+                    a,
+                    addr,
+                    imm,
+                    bytes,
+                });
+                if bytes == 16 {
+                    ops.push(IrOp::VZeroUpper { reg: dst });
+                }
+                return Ok(false);
+            }
             // YMM → per-lane 256-bit form; VEX.128 → 3-operand in-place align.
             if let Some(dst) = reg_ymm(insn, 0) {
                 let a = reg_ymm(insn, 1).or_unsupported(insn)?;
@@ -3192,7 +3253,7 @@ pub(crate) fn lift_insn(
         Vcvtpd2dq => lift_packed_cvt(insn, ops, tg, PackedCvtKind::Pd2Dq, true).map(|_| false),
         Vcvttpd2dq => lift_packed_cvt(insn, ops, tg, PackedCvtKind::Tpd2Dq, true).map(|_| false),
         // F16C half↔single converts: vcvtph2ps (half→single, xmm/ymm dst),
-        // vcvtps2ph (single→half, imm8 rounding; register dst).
+        // vcvtps2ph (single→half, imm8 rounding; register or memory destination).
         Vcvtph2ps => lift_vcvtph2ps(insn, ops, tg).map(|_| false),
         Vcvtps2ph => lift_vcvtps2ph(insn, ops, tg).map(|_| false),
         // VEX scalar float convert: 3-operand — bits 127:32/64 from op1,

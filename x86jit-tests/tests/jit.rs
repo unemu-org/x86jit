@@ -840,7 +840,7 @@ fn int1_raises_db() {
 fn unknown_instruction_reports_real_bytes() {
     // An unsupported memory form must preserve the real opcode in lift errors.
     let mut asm = CodeAssembler::new(64).unwrap();
-    asm.vpermd(ymm0, ymm1, ymmword_ptr(rax)).unwrap();
+    asm.vexpandps(xmm0, xmmword_ptr(rax)).unwrap();
     let code = asm.assemble(CODE).unwrap();
 
     let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(InterpreterBackend));
@@ -853,7 +853,7 @@ fn unknown_instruction_reports_real_bytes() {
             assert_eq!(
                 &bytes[..len as usize],
                 &code[..len as usize],
-                "reported bytes must be the real vpermd opcode"
+                "reported bytes must be the real vexpandps opcode"
             );
         }
         other => panic!("expected Unsupported, got {other:?}"),

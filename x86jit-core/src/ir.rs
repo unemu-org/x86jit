@@ -791,8 +791,8 @@ pub enum IrOp {
         signed: bool,
         bytes: u16,
     },
-    /// As [`IrOp::VPackWide`] but the second source is a 128-bit memory operand:
-    /// `dst = pack(a, [addr])`. 128-bit (`bytes == 16`) only.
+    /// As [`IrOp::VPackWide`] with a `bytes`-wide memory operand: `dst = pack(a, [addr])`.
+    /// SDM Vol 2B §4.3, PACKSSWB/PACKSSDW and PACKUSWB/PACKUSDW: VEX m128/m256.
     ///
     /// `a` is carried EXPLICITLY, like [`IrOp::VHFloatM`]. Pre-copying it into `dst`
     /// instead would put a write to the destination BEFORE the load that can fault, so a
@@ -801,6 +801,7 @@ pub enum IrOp {
     /// requiring every future backend to get the same ordering right.
     VPackWideM {
         fault: MemoryAccess,
+        bytes: u16,
         dst: u8,
         a: u8,
         addr: Val,
@@ -930,6 +931,8 @@ pub enum IrOp {
     },
     VAlignrM {
         fault: MemoryAccess,
+        a: u8,
+        bytes: u16,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -1587,8 +1590,8 @@ pub enum IrOp {
     /// Packed shift by a **scalar register count** `vp{sll,srl,sra}{w,d,q} v,v,xmm`: every
     /// `elem`-byte lane of `a` is shifted by the low 64 bits of `count`'s xmm (uniform,
     /// runtime). A count ≥ the lane width yields 0 (logical/left) or the smeared sign
-    /// (arithmetic right). Optional EVEX write-masking under `k`. Register count only
-    /// (memory-source count deferred).
+    /// (arithmetic right). Optional EVEX write-masking under `k`.
+    /// VEX memory counts use [`IrOp::VShiftRegM`].
     VShiftReg {
         dst: u8,
         a: u8,
@@ -1600,11 +1603,14 @@ pub enum IrOp {
         zeroing: bool,
         bytes: u16,
     },
-    /// Legacy uniform packed shift. SDM Vol 2B, PSLLW/PSLLD/PSLLQ,
+    /// Memory-count uniform packed shift. `a` is explicit so a load cannot clobber dst.
+    /// SDM Vol 2B §4.3, PSLLW/PSLLD/PSLLQ,
     /// PSRLW/PSRLD/PSRLQ and PSRAW/PSRAD: the count operand is m128,
     /// even though only its low 64 bits determine the count.
     VShiftRegM {
         fault: MemoryAccess,
+        a: u8,
+        bytes: u16,
         dst: u8,
         addr: Val,
         elem: u8,
@@ -1616,8 +1622,7 @@ pub enum IrOp {
     /// `count` (unlike the imm/xmm-count shifts, the count is NOT reduced modulo the lane
     /// width — a count ≥ width yields 0 for logical/left and the smeared sign for arithmetic
     /// right). Optional EVEX write-masking under `k` (`k == 0` = unmasked, full-width write).
-    /// Register count only; memory-source count is deferred. openssl's AVX-512 crypto uses
-    /// `vpsllvd/vpsrlvd zmm,zmm,zmm`.
+    /// VEX memory counts use [`IrOp::VShiftVarM`].
     VShiftVar {
         dst: u8,
         a: u8,
@@ -2040,8 +2045,8 @@ pub enum IrOp {
     /// control `ctrl` selects **within the same 128-bit lane** — for ps the control dword's
     /// bits [1:0] pick one of the 4 dwords in that lane; for pd the control qword's bit [1]
     /// picks one of the 2 qwords. `bytes` (16/32) = xmm vs ymm; the control is a register
-    /// (`VPermilVar`) — the memory-control form pre-loads into a scratch. `set_vec` zeroes
-    /// above `bytes`.
+    /// (`VPermilVar`) or an explicitly loaded memory value ([`IrOp::VPermilVarM`]).
+    /// `set_vec` zeroes above `bytes`.
     VPermilVar {
         dst: u8,
         src: u8,
@@ -2073,9 +2078,12 @@ pub enum IrOp {
         b: u8,
         w256: bool,
     },
-    /// Flags-only legacy test. SDM Vol 2B, PTEST: m128.
+    /// Flags-only memory test. SDM Vol 2B §4.3, PTEST; Vol 2C §5.2, VTESTPS/PD: m128/m256.
     VPtestM {
         fault: MemoryAccess,
+        bytes: u16,
+        /// Zero tests all bits; 4/8 tests only the floating-point sign bits.
+        elem: u8,
         a: u8,
         addr: Val,
     },
@@ -2294,10 +2302,45 @@ pub enum IrOp {
         src: u8,
         lanes: u8,
     },
-    /// F16C `vcvtps2ph`: convert `lanes` f32 lanes of `src` (128/256-bit) to
-    /// binary16 under the imm8[2:0] rounding control `rc`, packed into the low bits. Written
-    /// to a register `dst` (upper cleared) — the memory-destination form is a `VStore` of
-    /// the computed value staged in a temp register.
+    /// VEX memory control for VPERMILPS/PD. SDM Vol 2C §5.2, VPERMILPS/PD.
+    VPermilVarM {
+        fault: MemoryAccess,
+        dst: u8,
+        src: u8,
+        addr: Val,
+        elem: u8,
+        bytes: u16,
+    },
+    /// VEX memory table for VPERM2I128/F128. SDM Vol 2C §5.2, VPERM2I128/F128.
+    VPerm2i128M {
+        fault: MemoryAccess,
+        dst: u8,
+        a: u8,
+        addr: Val,
+        imm: u8,
+    },
+    /// VEX per-element memory counts. SDM Vol 2C §5.2, VPSLLV/VPSRLV/VPSRAV.
+    VShiftVarM {
+        fault: MemoryAccess,
+        dst: u8,
+        a: u8,
+        addr: Val,
+        elem: u8,
+        right: bool,
+        arith: bool,
+        bytes: u16,
+    },
+    /// F16C memory destination: m64 for xmm source, m128 for ymm source.
+    /// SDM Vol 2C §5.2, VCVTPS2PH. Conversion commits no vector register.
+    VCvtPs2PhM {
+        fault: MemoryAccess,
+        addr: Val,
+        src: u8,
+        lanes: u8,
+        rc: u8,
+    },
+    /// F16C register destination: convert `lanes` f32 values under imm8[2:0] `rc`.
+    /// SDM Vol 2C §5.2, VCVTPS2PH; memory destination uses [`IrOp::VCvtPs2PhM`].
     VCvtPs2Ph {
         dst: u8,
         src: u8,
@@ -3271,6 +3314,10 @@ impl IrOp {
             Self::VPerm1M { fault, .. } => *fault,
             Self::VInsert128M { fault, .. } => *fault,
             Self::VPshufb256M { fault, .. } => *fault,
+            Self::VPermilVarM { fault, .. } => *fault,
+            Self::VPerm2i128M { fault, .. } => *fault,
+            Self::VShiftVarM { fault, .. } => *fault,
+            Self::VCvtPs2PhM { fault, .. } => *fault,
             Self::VPtestM { fault, .. } => *fault,
             Self::VFloatBinM { fault, .. } => *fault,
             Self::VHFloatM { fault, .. } => *fault,
@@ -3358,6 +3405,10 @@ impl IrOp {
             Self::VPerm1M { fault, .. } => *fault = value,
             Self::VInsert128M { fault, .. } => *fault = value,
             Self::VPshufb256M { fault, .. } => *fault = value,
+            Self::VPermilVarM { fault, .. } => *fault = value,
+            Self::VPerm2i128M { fault, .. } => *fault = value,
+            Self::VShiftVarM { fault, .. } => *fault = value,
+            Self::VCvtPs2PhM { fault, .. } => *fault = value,
             Self::VPtestM { fault, .. } => *fault = value,
             Self::VFloatBinM { fault, .. } => *fault = value,
             Self::VHFloatM { fault, .. } => *fault = value,

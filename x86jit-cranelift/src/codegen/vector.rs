@@ -1,6 +1,14 @@
 use super::*;
 
 impl Translator<'_, '_> {
+    fn load_vector_operand(&mut self, addr: Val, bytes: u16) -> Vec<Value> {
+        let base = self.val(addr);
+        let host = self.checked_addr(base, bytes as u8, 0);
+        (0..usize::from(bytes) / 16)
+            .map(|i| self.gload(types::I128, host, (i * 16) as i32))
+            .collect()
+    }
+
     pub(crate) fn emit_v_load(&mut self, dst: &u8, addr: &Val, size: &u8) -> bool {
         let a = self.val(*addr);
         let host = self.checked_addr(a, *size, 0);
@@ -1004,6 +1012,35 @@ impl Translator<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_v_shift_var_m(
+        &mut self,
+        dst: &u8,
+        a: &u8,
+        addr: &Val,
+        elem: &u8,
+        right: &bool,
+        arith: &bool,
+        bytes: &u16,
+    ) -> bool {
+        let counts = self.load_vector_operand(*addr, *bytes);
+        for (i, cv) in counts.into_iter().enumerate() {
+            let (lo, hi) = self.builder.ins().isplit(cv);
+            let d = self.iconst(u64::from(*dst));
+            let av = self.iconst(u64::from(*a));
+            let lane = self.iconst(i as u64);
+            let el = self.iconst(u64::from(*elem));
+            let r = self.iconst(u64::from(*right));
+            let ar = self.iconst(u64::from(*arith));
+            self.call_helper(
+                self.helpers.var_shift_mem,
+                &[self.cpu, d, av, lo, hi, lane, el, r, ar],
+            );
+        }
+        self.store_lanes_zeroed_above(*dst, usize::from(*bytes) / 16);
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_v_shift_reg(
         &mut self,
         dst: &u8,
@@ -1023,7 +1060,9 @@ impl Translator<'_, '_> {
         // count is the full unsigned low qword of `count`. Matches `exec_shift_reg`.
         if *k == 0 && !*zeroing && *bytes == 16 {
             let xc = self.load_xmm(*count);
-            self.emit_shift_count(*dst, *a, xc, *elem, *right, *arith);
+            let xa = self.load_xmm(*a);
+            let r = self.shift_count_value(xa, xc, *elem, *right, *arith);
+            self.store_xmm(*dst, r);
             return false;
         }
         // Scalar-register-count shift via the shared exec_shift_reg helper → jit == interp.
@@ -1044,10 +1083,16 @@ impl Translator<'_, '_> {
         false
     }
 
-    fn emit_shift_count(&mut self, dst: u8, a: u8, xc: Value, elem: u8, right: bool, arith: bool) {
+    fn shift_count_value(
+        &mut self,
+        xa: Value,
+        xc: Value,
+        elem: u8,
+        right: bool,
+        arith: bool,
+    ) -> Value {
         let vty = vec_ty(elem);
         let bits = elem as i64 * 8;
-        let xa = self.load_xmm(a);
         let va = self.bitcast_v(xa, vty);
         let cvec = self.bitcast_v(xc, types::I64X2);
         let cnt = self.builder.ins().extractlane(cvec, 0); // full 64-bit count
@@ -1075,22 +1120,29 @@ impl Translator<'_, '_> {
             let eff = self.builder.ins().select(over, wm1, amt);
             self.builder.ins().sshr(va, eff)
         };
-        let r = self.bitcast_i128(r);
-        self.store_xmm(dst, r);
+        self.bitcast_i128(r)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_v_shift_reg_m(
         &mut self,
         dst: &u8,
+        a: &u8,
         addr: &Val,
         elem: &u8,
         right: &bool,
         arith: &bool,
+        bytes: &u16,
     ) -> bool {
-        let base = self.val(*addr);
-        let host = self.checked_addr(base, 16, 0);
-        let xc = self.gload(types::I128, host, 0);
-        self.emit_shift_count(*dst, *dst, xc, *elem, *right, *arith);
+        let count = self.load_vector_operand(*addr, 16)[0];
+        for i in 0..usize::from(*bytes) / 16 {
+            let av = self.load_lane(*a, i);
+            let r = self.shift_count_value(av, count, *elem, *right, *arith);
+            self.store_lane(*dst, i, r);
+        }
+        if *bytes > 16 {
+            self.store_lanes_zeroed_above(*dst, usize::from(*bytes) / 16);
+        }
         false
     }
 
@@ -2336,52 +2388,73 @@ impl Translator<'_, '_> {
         elem: &u8,
         bytes: &u16,
     ) -> bool {
-        let n = *bytes as usize / 16;
-        let (vty, ety, esize, per_lane) = if *elem == 4 {
+        for i in 0..usize::from(*bytes) / 16 {
+            let av = self.load_lane(*src, i);
+            let cv = self.load_lane(*ctrl, i);
+            let r = self.permil_value(av, cv, *elem);
+            self.store_lane(*dst, i, r);
+        }
+        self.store_lanes_zeroed_above(*dst, usize::from(*bytes) / 16);
+        false
+    }
+
+    pub(crate) fn emit_v_permil_var_m(
+        &mut self,
+        dst: &u8,
+        src: &u8,
+        addr: &Val,
+        elem: &u8,
+        bytes: &u16,
+    ) -> bool {
+        let controls = self.load_vector_operand(*addr, *bytes);
+        for (i, cv) in controls.into_iter().enumerate() {
+            let av = self.load_lane(*src, i);
+            let r = self.permil_value(av, cv, *elem);
+            self.store_lane(*dst, i, r);
+        }
+        self.store_lanes_zeroed_above(*dst, usize::from(*bytes) / 16);
+        false
+    }
+
+    fn permil_value(&mut self, s: Value, ctrl: Value, elem: u8) -> Value {
+        let (vty, ety, esize, per_lane) = if elem == 4 {
             (types::I32X4, types::I32, 4i64, 4u8)
         } else {
             (types::I64X2, types::I64, 8i64, 2u8)
         };
         let flags = MemFlags::trusted();
-        for c in 0..n {
-            let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                16,
-                4,
-            ));
-            let s = self.load_lane(*src, c);
-            self.builder.ins().stack_store(s, ss, 0);
-            let base = self.builder.ins().stack_addr(types::I64, ss, 0);
-            let cl = self.load_lane(*ctrl, c);
-            let ctrl_v = self.bitcast_v(cl, vty);
-            let mut out = {
-                let z = self.builder.ins().iconst(ety, 0);
-                self.builder.ins().splat(vty, z)
+        let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        self.builder.ins().stack_store(s, ss, 0);
+        let base = self.builder.ins().stack_addr(types::I64, ss, 0);
+        let ctrl_v = self.bitcast_v(ctrl, vty);
+        let mut out = {
+            let z = self.builder.ins().iconst(ety, 0);
+            self.builder.ins().splat(vty, z)
+        };
+        for i in 0..per_lane {
+            let cw = self.builder.ins().extractlane(ctrl_v, i);
+            // ps: sel = control[1:0]; pd: sel = control bit[1].
+            let sel = if elem == 4 {
+                self.builder.ins().band_imm(cw, 3)
+            } else {
+                let sh = self.builder.ins().ushr_imm(cw, 1);
+                self.builder.ins().band_imm(sh, 1)
             };
-            for i in 0..per_lane {
-                let cw = self.builder.ins().extractlane(ctrl_v, i);
-                // ps: sel = control[1:0]; pd: sel = control bit[1].
-                let sel = if *elem == 4 {
-                    self.builder.ins().band_imm(cw, 3)
-                } else {
-                    let sh = self.builder.ins().ushr_imm(cw, 1);
-                    self.builder.ins().band_imm(sh, 1)
-                };
-                let sel64 = if *elem == 4 {
-                    self.builder.ins().uextend(types::I64, sel)
-                } else {
-                    sel
-                };
-                let off = self.builder.ins().imul_imm(sel64, esize);
-                let addr = self.builder.ins().iadd(base, off);
-                let v = self.builder.ins().load(ety, flags, addr, 0);
-                out = self.builder.ins().insertlane(out, v, i);
-            }
-            let r = self.bitcast_i128(out);
-            self.store_lane(*dst, c, r);
+            let sel64 = if elem == 4 {
+                self.builder.ins().uextend(types::I64, sel)
+            } else {
+                sel
+            };
+            let off = self.builder.ins().imul_imm(sel64, esize);
+            let addr = self.builder.ins().iadd(base, off);
+            let v = self.builder.ins().load(ety, flags, addr, 0);
+            out = self.builder.ins().insertlane(out, v, i);
         }
-        self.store_lanes_zeroed_above(*dst, n);
-        false
+        self.bitcast_i128(out)
     }
 
     pub(crate) fn emit_v_perm2i128(&mut self, dst: &u8, a: &u8, b: &u8, imm: &u8) -> bool {
@@ -2393,18 +2466,34 @@ impl Translator<'_, '_> {
             self.load_xmm(*b),
             self.load_ymm_hi(*b),
         ];
-        let lane = |sel: u8| {
-            if sel & 0x08 != 0 {
-                z128
+        let [lo, hi] = Self::perm2i128_values(halves, z128, *imm);
+        self.store_xmm(*dst, lo);
+        self.store_ymm_hi(*dst, hi);
+        false
+    }
+
+    pub(crate) fn emit_v_perm2i128_m(&mut self, dst: &u8, a: &u8, addr: &Val, imm: &u8) -> bool {
+        let bv = self.load_vector_operand(*addr, 32);
+        let halves = [self.load_xmm(*a), self.load_ymm_hi(*a), bv[0], bv[1]];
+        let zero = self.iconst(0);
+        let z128 = self.builder.ins().uextend(types::I128, zero);
+        let [lo, hi] = Self::perm2i128_values(halves, z128, *imm);
+        self.store_xmm(*dst, lo);
+        self.store_ymm_hi(*dst, hi);
+        // SDM Vol 1 §15.5: VEX.256 zeroes ZMM bits 511:256.
+        self.store_lanes_zeroed_above(*dst, 2);
+        false
+    }
+
+    fn perm2i128_values(halves: [Value; 4], zero: Value, imm: u8) -> [Value; 2] {
+        let lane = |s: u8| {
+            if s & 8 != 0 {
+                zero
             } else {
-                halves[(sel & 3) as usize]
+                halves[usize::from(s & 3)]
             }
         };
-        let rlo = lane(*imm);
-        let rhi = lane(*imm >> 4);
-        self.store_xmm(*dst, rlo);
-        self.store_ymm_hi(*dst, rhi);
-        false
+        [lane(imm), lane(imm >> 4)]
     }
 
     pub(crate) fn emit_v_palignr256(&mut self, dst: &u8, a: &u8, b: &u8, imm: &u8) -> bool {
@@ -2427,12 +2516,36 @@ impl Translator<'_, '_> {
         self.ptest_values(alo, blo, high)
     }
 
-    pub(crate) fn emit_v_ptest_m(&mut self, a: &u8, addr: &Val) -> bool {
-        let base = self.val(*addr);
-        let host = self.checked_addr(base, 16, 0);
-        let blo = self.gload(types::I128, host, 0);
+    pub(crate) fn emit_v_ptest_m(&mut self, a: &u8, addr: &Val, bytes: &u16, elem: &u8) -> bool {
+        let bv = self.load_vector_operand(*addr, *bytes);
+        let mask = self.test_mask(*elem);
         let alo = self.load_xmm(*a);
-        self.ptest_values(alo, blo, None)
+        let alo = self.builder.ins().band(alo, mask);
+        let blo = self.builder.ins().band(bv[0], mask);
+        let high = if *bytes == 32 {
+            let ahi = self.load_ymm_hi(*a);
+            let ahi = self.builder.ins().band(ahi, mask);
+            let bhi = self.builder.ins().band(bv[1], mask);
+            Some((ahi, bhi))
+        } else {
+            None
+        };
+        self.ptest_values(alo, blo, high)
+    }
+
+    fn test_mask(&mut self, elem: u8) -> Value {
+        if elem == 0 {
+            let ones = self.iconst(u64::MAX);
+            return self.builder.ins().iconcat(ones, ones);
+        }
+        let (vty, ety) = if elem == 8 {
+            (types::I64X2, types::I64)
+        } else {
+            (types::I32X4, types::I32)
+        };
+        let msb = self.builder.ins().iconst(ety, 1i64 << (elem * 8 - 1));
+        let mask = self.builder.ins().splat(vty, msb);
+        self.bitcast_i128(mask)
     }
 
     fn ptest_values(&mut self, alo: Value, blo: Value, high: Option<(Value, Value)>) -> bool {
@@ -2467,55 +2580,19 @@ impl Translator<'_, '_> {
     /// AVX `vtestps`/`vtestpd`: test only the per-element sign bits.
     /// `ZF = (a & b & signmask == 0)`, `CF = (b & !a & signmask == 0)`; others cleared.
     pub(crate) fn emit_v_test_fp(&mut self, a: &u8, b: &u8, elem: &u8, bytes: &u16) -> bool {
-        // Build the 128-bit sign-bit mask by splatting the lane's MSB (I32X4 for ps,
-        // I64X2 for pd), matching `fp_sign_mask` in the interp (jit == interp).
-        let (ty, lane_ty) = if *elem == 8 {
-            (types::I64X2, types::I64)
+        let mask = self.test_mask(*elem);
+        let (alo, blo) = (self.load_xmm(*a), self.load_xmm(*b));
+        let alo = self.builder.ins().band(alo, mask);
+        let blo = self.builder.ins().band(blo, mask);
+        let high = if *bytes == 32 {
+            let (ahi, bhi) = (self.load_ymm_hi(*a), self.load_ymm_hi(*b));
+            let ahi = self.builder.ins().band(ahi, mask);
+            let bhi = self.builder.ins().band(bhi, mask);
+            Some((ahi, bhi))
         } else {
-            (types::I32X4, types::I32)
+            None
         };
-        let msb = self
-            .builder
-            .ins()
-            .iconst(lane_ty, 1i64 << (*elem as i64 * 8 - 1));
-        let mask_v = self.builder.ins().splat(ty, msb);
-        let mask = self.bitcast_i128(mask_v);
-
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        let z128 = self.builder.ins().uextend(types::I128, zero);
-        let n = *bytes as usize / 16;
-        let mut zf = None;
-        let mut cf = None;
-        for i in 0..n {
-            let av0 = self.load_lane(*a, i);
-            let bv0 = self.load_lane(*b, i);
-            let av = self.builder.ins().band(av0, mask);
-            let bv = self.builder.ins().band(bv0, mask);
-            let and = self.builder.ins().band(bv, av);
-            let nav = self.builder.ins().bnot(av0);
-            let nav_m = self.builder.ins().band(nav, mask);
-            let andn = self.builder.ins().band(bv, nav_m);
-            let z = self.builder.ins().icmp(IntCC::Equal, and, z128);
-            let c = self.builder.ins().icmp(IntCC::Equal, andn, z128);
-            zf = Some(match zf {
-                None => z,
-                Some(prev) => self.builder.ins().band(prev, z),
-            });
-            cf = Some(match cf {
-                None => c,
-                Some(prev) => self.builder.ins().band(prev, c),
-            });
-        }
-        self.store_flag(self.offsets.zf, zf.unwrap());
-        self.store_flag(self.offsets.cf, cf.unwrap());
-        let z8 = self.builder.ins().iconst(types::I8, 0);
-        for off in [self.offsets.of, self.offsets.sf, self.offsets.af_src] {
-            self.store_flag(off, z8);
-        }
-        // A zero PF SOURCE would mean PF=1; clearing PF needs an odd-parity byte.
-        let pf0 = self.pf_src_const(false);
-        self.store_flag(self.offsets.pf_src, pf0);
-        false
+        self.ptest_values(alo, blo, high)
     }
 
     pub(crate) fn emit_v_pshufb256(&mut self, dst: &u8, a: &u8, idx: &u8) -> bool {
@@ -3174,21 +3251,21 @@ impl Translator<'_, '_> {
         addr: &Val,
         from_elem: &u8,
         signed: &bool,
+        bytes: &u16,
     ) -> bool {
-        // Source 1 is `a` (explicit, §16 — not pre-copied into `dst` by the lift, which
-        // would write the destination before this load can fault); the second source is
-        // the 128-bit memory operand. Load it (faults trap here) and run the shared pack
-        // helper (cold, jit == interp), passing the value as two i64 halves.
-        let base = self.val(*addr);
-        let host = self.checked_addr(base, 16, 0);
-        let lo = self.gload(types::I64, host, 0);
-        let hi = self.gload(types::I64, host, 8);
-        let cpu = self.cpu;
-        let d = self.iconst(*dst as u64);
-        let av = self.iconst(*a as u64);
-        let fe = self.iconst(*from_elem as u64);
-        let sg = self.iconst(*signed as u64);
-        self.call_helper(self.helpers.vpack_mem, &[cpu, d, av, lo, hi, fe, sg]);
+        let bv = self.load_vector_operand(*addr, *bytes);
+        for (i, b) in bv.into_iter().enumerate() {
+            let (lo, hi) = self.builder.ins().isplit(b);
+            let d = self.iconst(u64::from(*dst));
+            let av = self.iconst(u64::from(*a));
+            let fe = self.iconst(u64::from(*from_elem));
+            let sg = self.iconst(u64::from(*signed));
+            let lane = self.iconst(i as u64);
+            self.call_helper(
+                self.helpers.vpack_mem,
+                &[self.cpu, d, av, lo, hi, fe, sg, lane],
+            );
+        }
         false
     }
 
@@ -3460,13 +3537,23 @@ impl Translator<'_, '_> {
         false
     }
 
-    pub(crate) fn emit_v_alignr_m(&mut self, dst: &u8, addr: &Val, imm: &u8) -> bool {
-        let a = self.val(*addr);
-        let host = self.checked_addr(a, 16, 0);
-        let sv = self.gload(types::I128, host, 0);
-        let xd = self.load_xmm(*dst);
-        let r = self.emit_palignr(xd, sv, *imm);
-        self.store_xmm(*dst, r);
+    pub(crate) fn emit_v_alignr_m(
+        &mut self,
+        dst: &u8,
+        a: &u8,
+        addr: &Val,
+        imm: &u8,
+        bytes: &u16,
+    ) -> bool {
+        let bv = self.load_vector_operand(*addr, *bytes);
+        for (i, b) in bv.into_iter().enumerate() {
+            let av = self.load_lane(*a, i);
+            let r = self.emit_palignr(av, b, *imm);
+            self.store_lane(*dst, i, r);
+        }
+        if *bytes > 16 {
+            self.store_lanes_zeroed_above(*dst, usize::from(*bytes) / 16);
+        }
         false
     }
 
@@ -4708,6 +4795,36 @@ impl Translator<'_, '_> {
     }
 
     /// F16C `vcvtps2ph` via the shared `cvtps2ph` helper (jit == interp).
+    pub(crate) fn emit_v_cvtps2ph_m(&mut self, addr: &Val, src: &u8, lanes: &u8, rc: &u8) -> bool {
+        let base = self.val(*addr);
+        let size = lanes * 2;
+        let host = self.checked_addr(base, size, 1);
+        let nbytes = self.iconst(u64::from(size));
+        let cur = self.iconst(self.cur_addr);
+        self.flush_gprs();
+        let inst = self.call_memory_helper(
+            self.helpers.vstore_preflight,
+            &[self.cpu, self.mem, base, nbytes, cur],
+            Some(GuestAccessKind::Write),
+        );
+        self.trap_if_unmapped(inst);
+        let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        let out = self.builder.ins().stack_addr(types::I64, ss, 0);
+        let s = self.iconst(u64::from(*src));
+        let n = self.iconst(u64::from(*lanes));
+        let r = self.iconst(u64::from(*rc));
+        self.call_helper(self.helpers.cvtps2ph_value, &[self.cpu, s, n, r, out]);
+        let ty = if size == 8 { types::I64 } else { types::I128 };
+        let value = self.builder.ins().stack_load(ty, ss, 0);
+        self.gstore(value, host, 0);
+        self.note_store(base, size);
+        false
+    }
+
     pub(crate) fn emit_v_cvt_ps2ph(&mut self, dst: &u8, src: &u8, lanes: &u8, rc: &u8) -> bool {
         let cpu = self.cpu;
         let d = self.iconst(*dst as u64);

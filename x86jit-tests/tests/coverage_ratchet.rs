@@ -599,10 +599,10 @@ const ALLOWLIST: &[&str] = &[
     "Phminposuw",
     "Vphminposuw",
     "Vdpps",
-    "Vtestps",
-    "Vtestpd",
+    "Vtestps", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vtestpd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vcvtph2ps",
-    "Vcvtps2ph",
+    "Vcvtps2ph", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Pcmpestri64",
     "Pcmpestrm64",
     "Vpcmpestri64",
@@ -858,19 +858,19 @@ const ALLOWLIST: &[&str] = &[
     "Vmulss",
     "Vorpd",
     "Vorps",
-    "Vpabsb",
-    "Vpabsd",
+    "Vpabsb", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpabsd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpabsq",
-    "Vpabsw",
-    "Vpackssdw",
-    "Vpacksswb",
-    "Vpackusdw",
-    "Vpackuswb",
+    "Vpabsw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpackssdw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpacksswb", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpackusdw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpackuswb", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpaddb",
     "Vpaddd",
     "Vpaddq",
     "Vpaddw",
-    "Vpalignr",
+    "Vpalignr", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpand",
     "Vpandd",
     "Vpandn",
@@ -880,7 +880,7 @@ const ALLOWLIST: &[&str] = &[
     // AVX-512 masked EVEX ops: jit==interp + native bit-exact in native.rs/jit.rs.
     "Vpblendmd",
     "Vpblendmq",
-    "Vpblendd", // native+jit tests (native_vpblendd/vpblendd_match_interp)
+    "Vpblendd", // native+jit tests (native_vpblendd/vpblendd_match_interp) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpbroadcastb",
     "Vpbroadcastd",
     "Vpbroadcastq",
@@ -895,9 +895,9 @@ const ALLOWLIST: &[&str] = &[
     "Vpcmpistri",
     "Vpconflictd", // AVX-512 EVEX misc
     "Vpconflictq", // AVX-512 EVEX misc
-    "Vperm2f128",
-    "Vperm2i128",
-    "Vpermd",
+    "Vperm2f128", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vperm2i128", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpermd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpermi2d",
     "Vpermi2q",
     "Vpermi2w",
@@ -943,19 +943,19 @@ const ALLOWLIST: &[&str] = &[
     "Vpmovqb",
     "Vpmovqd",
     "Vpmovqw",
-    "Vpmovsxbd",
-    "Vpmovsxbq",
-    "Vpmovsxbw",
-    "Vpmovsxdq",
-    "Vpmovsxwd",
-    "Vpmovsxwq",
+    "Vpmovsxbd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovsxbq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovsxbw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovsxdq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovsxwd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovsxwq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpmovwb",
-    "Vpmovzxbd",
-    "Vpmovzxbq",
-    "Vpmovzxbw",
-    "Vpmovzxdq",
-    "Vpmovzxwd",
-    "Vpmovzxwq",
+    "Vpmovzxbd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovzxbq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovzxbw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovzxdq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovzxwd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpmovzxwq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpmullq",
     "Vpmuludq", // native+jit tests (native_vpmuludq/vpmuludq_match_interp)
     // TLS: packed multiplies — jit test packed_muls_match_interp.
@@ -982,49 +982,49 @@ const ALLOWLIST: &[&str] = &[
     "Vpcmpeqq",
     "Vpcmpgtq",
     // TLS: per-element variable shifts — jit test variable_shifts_match_interp.
-    "Vpsllvd",
-    "Vpsllvq",
+    "Vpsllvd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsllvq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsllvw",
-    "Vpsravd",
+    "Vpsravd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsravq",
     "Vpsravw",
-    "Vpsrlvd",
-    "Vpsrlvq",
+    "Vpsrlvd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsrlvq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsrlvw",
     "Vpor",
     "Vpord",
     "Vporq",
-    "Vpermilpd", // native+jit tests (native_vpermil/vpermil_imm_match_interp)
-    "Vpermilps", // native+jit tests (native_vpermil/vpermil_imm_match_interp)
-    "Vpermps",   // native+jit tests (native_avx2_lane_shuffles/avx2_vpermps_ymm)
+    "Vpermilpd", // native+jit tests (native_vpermil/vpermil_imm_match_interp) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpermilps", // native+jit tests (native_vpermil/vpermil_imm_match_interp) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpermps", // native+jit tests (native_avx2_lane_shuffles/avx2_vpermps_ymm) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpshufb",
-    "Vpshufd",
-    "Vpshufhw", // native+jit tests (native_avx2_lane_shuffles/avx2_vpshufhwlw_ymm)
-    "Vpshuflw", // native+jit tests (native_avx2_lane_shuffles/avx2_vpshufhwlw_ymm)
+    "Vpshufd", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpshufhw", // native+jit tests (native_avx2_lane_shuffles/avx2_vpshufhwlw_ymm) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpshuflw", // native+jit tests (native_avx2_lane_shuffles/avx2_vpshufhwlw_ymm) // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     // VEX.128 vpsign — see the psign* coverage note above.
     "Vpsignb",
     "Vpsignd",
     "Vpsignw",
     "Vprold", // AVX-512 EVEX misc
     "Vprolq", // AVX-512 EVEX misc
-    "Vpslld",
+    "Vpslld", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpslldq",
-    "Vpsllq",
-    "Vpsllw",
-    "Vpsrad",
+    "Vpsllq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsllw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsrad", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsraq", // native+jit tests (native_masked_shift/masked_shift_512_match_interp)
-    "Vpsraw",
-    "Vpsrld",
+    "Vpsraw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsrld", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsrldq",
-    "Vpsrlq",
-    "Vpsrlw",
+    "Vpsrlq", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
+    "Vpsrlw", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpsubb",
     "Vpsubd",
     "Vpsubq",
     "Vpsubw",
     "Vpternlogd",
     "Vpternlogq",
-    "Vptest",
+    "Vptest", // Memory: v3_memory_forms_match_register_and_jit; exact-width/fault/region and native cases in the same test module.
     "Vpunpckhbw",
     "Vpunpckhdq",
     "Vpunpckhqdq",
