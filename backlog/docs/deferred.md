@@ -206,6 +206,17 @@ as ordinary defects rather than listed here.
 - **Tracked in:** `xj-pi7.3`. The ordinary arithmetic and stack forms still
   missing from that bead are open implementation work, rather than a deferral.
 
+### Undocumented x87 FFREEP and FSTPNCE encodings
+
+- **Why deferred:** `FFREEP` (`DF C0+i`) and `FSTPNCE` (`D9 D8+i`) have no
+  instruction semantics in the pinned Intel SDM or AMD64 APM. A primary source
+  is needed before either form lifts. Native-oracle measurements alone cannot
+  establish the hardware contract. Both remain precise `Exit::UnknownInstruction`
+  exits, witnessed by `x87_rest::undocumented_x87_forms_remain_precise_unknown_instructions`.
+- **Revisit when:** a primary-source description is available, with witnesses for
+  the documented semantics, exceptions and stack effects.
+- **Tracked in:** `xj-562.7`.
+
 ### `lock adc` / `lock sbb`, and masked EVEX `vmovss`/`vmovsd`
 
 - **Why deferred:** both are now *rejected* rather than mislifted (task-322) — that

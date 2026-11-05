@@ -391,6 +391,20 @@ pub enum FpuKind {
     // push a constant
     Fld1,
     Fldz,
+    Fldpi,
+    Fldl2e,
+    Fldl2t,
+    Fldlg2,
+    Fldln2,
+    Frndint,
+    Fxtract,
+    Fnop,
+    Fwait,
+    Ffree,
+    Fincstp,
+    Fdecstp,
+    FistI16,
+    FistI32,
     // register/stack arithmetic (use `sti`)
     FaddP,   // ST(i) += ST(0); pop
     FsubP,   // ST(i) -= ST(0); pop
@@ -960,20 +974,45 @@ pub fn mf_pending_before(cpu: &CpuState, kind: FpuKind) -> bool {
     waits_for_pending(kind) && cpu.fpu_sw & (1 << 7) != 0
 }
 
+/// SDM Vol 1 §§4.9.2, 8.5.1–8.5.6: invalid, denormal and zero-divide
+/// are pre-operation exceptions; overflow, underflow and precision commit.
+fn arithmetic_exception(cpu: &mut CpuState, exc: Exc, den: bool) -> bool {
+    if exc.has(Exc::IE) {
+        return raise(cpu, Exc::IE);
+    }
+    // SDM Vol 1 §4.9.2: zero divide takes priority over denormal,
+    // including when ZE is masked; the lower-priority DE is suppressed.
+    if exc.has(Exc::ZE) {
+        return raise(cpu, Exc::ZE);
+    }
+    if den && raise(cpu, Exc::DE) {
+        return true;
+    }
+    let _ = raise(cpu, exc);
+    false
+}
+
+/// SDM Vol 1 §§8.5.4–8.5.6; Vol 2A §3.2 FADD/FSUB/FMUL/FDIV,
+/// FPU Flags Affected: C1 describes rounding for every committed result.
+fn set_arithmetic_result(cpu: &mut CpuState, sti: u8, r: F80, up: bool) {
+    cpu.fpu_sw = (cpu.fpu_sw & !(1 << 9)) | (u16::from(up) << 9);
+    set_st(cpu, sti, r);
+}
+
 /// ST(0)-destination arithmetic against a memory operand `m` (already widened to
 /// F80). The `r` variants reverse the operands.
-fn mem_arith(kind: FpuKind, a: F80, m: F80, c: Ctl) -> (F80, Exc) {
+fn mem_arith(kind: FpuKind, a: F80, m: F80, c: Ctl) -> (F80, Exc, bool) {
     use FpuKind::*;
     match kind {
-        FaddMemF64 | FaddMemF32 | FiaddMemI16 | FiaddMemI32 => F80::add_ctl(a, m, c),
-        FsubMemF64 | FsubMemF32 | FisubMemI16 | FisubMemI32 => F80::sub_ctl(a, m, c),
-        FsubrMemF64 | FsubrMemF32 | FisubrMemI16 | FisubrMemI32 => F80::sub_ctl(m, a, c),
-        FmulMemF64 | FmulMemF32 | FimulMemI16 | FimulMemI32 => F80::mul_ctl(a, m, c),
+        FaddMemF64 | FaddMemF32 | FiaddMemI16 | FiaddMemI32 => F80::add_rounded(a, m, c),
+        FsubMemF64 | FsubMemF32 | FisubMemI16 | FisubMemI32 => F80::sub_rounded(a, m, c),
+        FsubrMemF64 | FsubrMemF32 | FisubrMemI16 | FisubrMemI32 => F80::sub_rounded(m, a, c),
+        FmulMemF64 | FmulMemF32 | FimulMemI16 | FimulMemI32 => F80::mul_rounded(a, m, c),
         // A zero divisor raises ZE and yields a correctly-signed infinity (SDM) rather
         // than faulting — that is `F80::div`'s `(_, Zero) => inf(a.sign ^ b.sign)` arm,
         // shared with the float-memory forms.
-        FdivMemF64 | FdivMemF32 | FidivMemI16 | FidivMemI32 => F80::div_ctl(a, m, c),
-        _ => F80::div_ctl(m, a, c), // FdivrMem* / FidivrMemI*
+        FdivMemF64 | FdivMemF32 | FidivMemI16 | FidivMemI32 => F80::div_rounded(a, m, c),
+        _ => F80::div_rounded(m, a, c), // FdivrMem* / FidivrMemI*
     }
 }
 
@@ -988,8 +1027,8 @@ pub fn mem_write_bytes(kind: FpuKind) -> Option<usize> {
         FstpF32 | FstF32 => 4,
         FstpF64 | FstF64 => 8,
         FstpF80 => 10,
-        FistpI16 | FisttpI16 => 2,
-        FistpI32 | FisttpI32 => 4,
+        FistI16 | FistpI16 | FisttpI16 => 2,
+        FistI32 | FistpI32 | FisttpI32 => 4,
         FistpI64 | FisttpI64 => 8,
         // The control and status words are 16 bits; `fnstenv` writes the 28-byte
         // (32-bit-layout) environment image — see [`env28`].
@@ -1165,10 +1204,10 @@ fn exec_x87_inner<M: FpMem>(
             }
             pop(cpu);
         }
-        FistpI16 | FistpI32 | FistpI64 | FisttpI16 | FisttpI32 | FisttpI64 => {
+        FistI16 | FistI32 | FistpI16 | FistpI32 | FistpI64 | FisttpI16 | FisttpI32 | FisttpI64 => {
             // SDM Vol 2A §3.3 FIST/FISTP and FISTTP: invalid conversion stores
             // the destination-width indefinite only when IM is masked. FISTTP
-            // ignores RC and always clears C1; FISTP uses C1 for rounding.
+            // ignores RC and always clears C1; FIST/FISTP use C1 for rounding.
             let bytes = mem_write_bytes(kind).unwrap();
             let trunc = matches!(kind, FisttpI16 | FisttpI32 | FisttpI64);
             cpu.fpu_sw &= !(1 << 9);
@@ -1185,7 +1224,9 @@ fn exec_x87_inner<M: FpMem>(
             }
             // SDM Vol 1 §§4.9.1.6, 8.5.6: an unmasked precision exception
             // retains the rounded result, unlike an invalid conversion.
-            pop(cpu);
+            if !matches!(kind, FistI16 | FistI32) {
+                pop(cpu);
+            }
         }
         FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64 | FdivrMemF64 => {
             let Some(b) = read_n(mem, addr, 8) else {
@@ -1198,12 +1239,11 @@ fn exec_x87_inner<M: FpMem>(
             // operand is checked from the bytes just read; ST(0) from its raw register
             // image, since `operand!` returns an already-normalized `F80`.
             let den = float_bytes_denormal(&b, 8) || st_denormal(cpu, 0);
-            let (r, e) = mem_arith(kind, a, m, c);
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = mem_arith(kind, a, m, c);
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, 0, r);
+            set_arithmetic_result(cpu, 0, r, up);
         }
         FaddMemF32 | FsubMemF32 | FsubrMemF32 | FmulMemF32 | FdivMemF32 | FdivrMemF32 => {
             let Some(b) = read_n(mem, addr, 4) else {
@@ -1217,12 +1257,11 @@ fn exec_x87_inner<M: FpMem>(
             // operand is checked from the bytes just read; ST(0) from its raw register
             // image, since `operand!` returns an already-normalized `F80`.
             let den = float_bytes_denormal(&b, 4) || st_denormal(cpu, 0);
-            let (r, e) = mem_arith(kind, a, m, c);
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = mem_arith(kind, a, m, c);
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, 0, r);
+            set_arithmetic_result(cpu, 0, r, up);
         }
         // Integer-memory arithmetic. The operand is read at its architectural width,
         // sign-extended, and widened to F80 — exactly what `FildI16`/`FildI32` do, and
@@ -1238,12 +1277,11 @@ fn exec_x87_inner<M: FpMem>(
             // operand is checked from the bytes just read; ST(0) from its raw register
             // image, since `operand!` returns an already-normalized `F80`.
             let den = float_bytes_denormal(&b, 2) || st_denormal(cpu, 0);
-            let (r, e) = mem_arith(kind, a, m, c);
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = mem_arith(kind, a, m, c);
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, 0, r);
+            set_arithmetic_result(cpu, 0, r, up);
         }
         FiaddMemI32 | FisubMemI32 | FisubrMemI32 | FimulMemI32 | FidivMemI32 | FidivrMemI32 => {
             let Some(b) = read_n(mem, addr, 4) else {
@@ -1256,12 +1294,11 @@ fn exec_x87_inner<M: FpMem>(
             // operand is checked from the bytes just read; ST(0) from its raw register
             // image, since `operand!` returns an already-normalized `F80`.
             let den = float_bytes_denormal(&b, 4) || st_denormal(cpu, 0);
-            let (r, e) = mem_arith(kind, a, m, c);
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = mem_arith(kind, a, m, c);
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, 0, r);
+            set_arithmetic_result(cpu, 0, r, up);
         }
         FldSti => {
             let v = operand!(cpu, sti);
@@ -1269,6 +1306,81 @@ fn exec_x87_inner<M: FpMem>(
         }
         Fld1 => push(cpu, F80::from_i64(1)),
         Fldz => push(cpu, F80::zero(false)),
+        Fldpi | Fldl2e | Fldl2t | Fldlg2 | Fldln2 => {
+            // SDM Vol 1 §§8.3.4, 8.3.8; Vol 2A §3.2 FLD constants:
+            // round the internal constant to 64 bits using RC, without PE.
+            let (floor, exp, nearest_up) = match kind {
+                Fldpi => (0xc90f_daa2_2168_c234u64, 1, true),
+                Fldl2e => (0xb8aa_3b29_5c17_f0bb, 0, true),
+                Fldl2t => (0xd49a_784b_cd1b_8afe, 1, false),
+                Fldlg2 => (0x9a20_9a84_fbcf_f798, -2, true),
+                _ => (0xb172_17f7_d1cf_79ab, -1, true),
+            };
+            let up = match rc(cpu) {
+                0 => nearest_up,
+                2 => true,
+                _ => false,
+            };
+            push(
+                cpu,
+                F80 {
+                    sign: false,
+                    class: crate::f80::Class::Normal,
+                    exp,
+                    sig: floor + u64::from(up),
+                },
+            );
+        }
+        // SDM Vol 2A §3.2 FNOP, FFREE, FINCSTP, FDECSTP;
+        // Vol 2D §6.1 WAIT/FWAIT: pending #MF is checked before this helper.
+        Fnop | Fwait => {}
+        Ffree => cpu.fpu_empty |= 1 << ((cpu.fpu_top + sti as u32) & 7),
+        Fincstp | Fdecstp => {
+            cpu.fpu_top = (cpu.fpu_top + if kind == Fincstp { 1 } else { 7 }) & 7;
+            cpu.fpu_sw &= !(1 << 9);
+        }
+        Frndint => {
+            let den = st_denormal(cpu, 0);
+            let a = operand!(cpu, 0);
+            let (r, exc, up) = a.round_integral(ctl(cpu));
+            cpu.fpu_sw &= !(1 << 9);
+            if arithmetic_exception(cpu, exc, den) {
+                return None;
+            }
+            if up {
+                cpu.fpu_sw |= 1 << 9;
+            }
+            set_st(cpu, 0, r);
+        }
+        Fxtract => {
+            // SDM Vol 1 §8.5.1.1: a masked stack fault writes indefinite
+            // to both destinations; an unmasked fault leaves TOP and data intact.
+            cpu.fpu_sw &= !(1 << 9);
+            let src = cpu.fpu_top;
+            let dst = src.wrapping_sub(1) & 7;
+            let empty = cpu.fpu_empty & (1 << src) != 0;
+            let full = cpu.fpu_empty & (1 << dst) == 0;
+            if empty || full {
+                if full && !empty {
+                    cpu.fpu_sw |= 1 << 9;
+                }
+                if raise(cpu, Exc::IE.with(Exc::SF)) {
+                    return None;
+                }
+                set_st(cpu, 0, F80::indefinite());
+                cpu.fpu_top = dst;
+                set_st(cpu, 0, F80::indefinite());
+                return None;
+            }
+            let den = st_denormal(cpu, 0);
+            let a = operand!(cpu, 0);
+            let (sig, exp, exc) = a.extract();
+            if arithmetic_exception(cpu, exc, den) {
+                return None;
+            }
+            set_st(cpu, 0, exp);
+            push(cpu, sig);
+        }
         FaddP | FsubP | FsubrP | FmulP | FdivP | FdivrP => {
             let (s0, si) = (operand!(cpu, 0), operand!(cpu, sti));
             // #D on either arithmetic operand, from the raw register images — the
@@ -1276,21 +1388,18 @@ fn exec_x87_inner<M: FpMem>(
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
             let c = ctl(cpu);
             let r = match kind {
-                FaddP => F80::add_ctl(si, s0, c),
-                FsubP => F80::sub_ctl(si, s0, c),
-                FsubrP => F80::sub_ctl(s0, si, c),
-                FmulP => F80::mul_ctl(si, s0, c),
-                FdivP => F80::div_ctl(si, s0, c),
-                _ => F80::div_ctl(s0, si, c),
+                FaddP => F80::add_rounded(si, s0, c),
+                FsubP => F80::sub_rounded(si, s0, c),
+                FsubrP => F80::sub_rounded(s0, si, c),
+                FmulP => F80::mul_rounded(si, s0, c),
+                FdivP => F80::div_rounded(si, s0, c),
+                _ => F80::div_rounded(s0, si, c),
             };
-            let (r, e) = r;
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
-                // Unmasked: the instruction is abandoned, so ST(i) keeps its value and
-                // TOP does not move (SDM Vol 1 §8.6, and §8.5.1.1 for the stack cases).
+            let (r, e, up) = r;
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, sti, r);
+            set_arithmetic_result(cpu, sti, r, up);
             pop(cpu);
         }
         FstSti | FstpSti => {
@@ -1309,19 +1418,18 @@ fn exec_x87_inner<M: FpMem>(
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
             let c = ctl(cpu);
             let r = match kind {
-                FaddSti => F80::add_ctl(s0, si, c),
-                FsubSti => F80::sub_ctl(s0, si, c),
-                FsubrSti => F80::sub_ctl(si, s0, c),
-                FmulSti => F80::mul_ctl(s0, si, c),
-                FdivSti => F80::div_ctl(s0, si, c),
-                _ => F80::div_ctl(si, s0, c),
+                FaddSti => F80::add_rounded(s0, si, c),
+                FsubSti => F80::sub_rounded(s0, si, c),
+                FsubrSti => F80::sub_rounded(si, s0, c),
+                FmulSti => F80::mul_rounded(s0, si, c),
+                FdivSti => F80::div_rounded(s0, si, c),
+                _ => F80::div_rounded(si, s0, c),
             };
-            let (r, e) = r;
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = r;
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, 0, r);
+            set_arithmetic_result(cpu, 0, r, up);
         }
         FaddToSti | FsubToSti | FsubrToSti | FmulToSti | FdivToSti | FdivrToSti => {
             // Register-form arithmetic with ST(i) as the destination (no pop).
@@ -1331,19 +1439,18 @@ fn exec_x87_inner<M: FpMem>(
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
             let c = ctl(cpu);
             let r = match kind {
-                FaddToSti => F80::add_ctl(si, s0, c),
-                FsubToSti => F80::sub_ctl(si, s0, c),
-                FsubrToSti => F80::sub_ctl(s0, si, c),
-                FmulToSti => F80::mul_ctl(si, s0, c),
-                FdivToSti => F80::div_ctl(si, s0, c),
-                _ => F80::div_ctl(s0, si, c),
+                FaddToSti => F80::add_rounded(si, s0, c),
+                FsubToSti => F80::sub_rounded(si, s0, c),
+                FsubrToSti => F80::sub_rounded(s0, si, c),
+                FmulToSti => F80::mul_rounded(si, s0, c),
+                FdivToSti => F80::div_rounded(si, s0, c),
+                _ => F80::div_rounded(s0, si, c),
             };
-            let (r, e) = r;
-            let e = if den { e.with(Exc::DE) } else { e };
-            if raise(cpu, e) {
+            let (r, e, up) = r;
+            if arithmetic_exception(cpu, e, den) {
                 return None;
             }
-            set_st(cpu, sti, r);
+            set_arithmetic_result(cpu, sti, r, up);
         }
         Fxch => {
             let (a, b) = (operand!(cpu, 0), operand!(cpu, sti));

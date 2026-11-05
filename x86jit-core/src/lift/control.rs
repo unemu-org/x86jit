@@ -506,6 +506,15 @@ pub(crate) fn lift_x87(
             };
             emit(k, ops, tg)?;
         }
+        Fist => emit(
+            match msz {
+                2 => K::FistI16,
+                4 => K::FistI32,
+                _ => return Err(unsupported_insn(insn)),
+            },
+            ops,
+            tg,
+        )?,
         Fistp => emit(
             match msz {
                 2 => K::FistpI16,
@@ -655,6 +664,18 @@ pub(crate) fn lift_x87(
         }
         Fld1 => emit(K::Fld1, ops, tg)?,
         Fldz => emit(K::Fldz, ops, tg)?,
+        Fldpi => emit(K::Fldpi, ops, tg)?,
+        Fldl2e => emit(K::Fldl2e, ops, tg)?,
+        Fldl2t => emit(K::Fldl2t, ops, tg)?,
+        Fldlg2 => emit(K::Fldlg2, ops, tg)?,
+        Fldln2 => emit(K::Fldln2, ops, tg)?,
+        Frndint => emit(K::Frndint, ops, tg)?,
+        Fxtract => emit(K::Fxtract, ops, tg)?,
+        Fnop => emit(K::Fnop, ops, tg)?,
+        Wait => emit(K::Fwait, ops, tg)?,
+        Ffree => emit(K::Ffree, ops, tg)?,
+        Fincstp => emit(K::Fincstp, ops, tg)?,
+        Fdecstp => emit(K::Fdecstp, ops, tg)?,
         Fabs => emit(K::Fabs, ops, tg)?,
         Fchs => emit(K::Fchs, ops, tg)?,
         Fxch => emit(K::Fxch, ops, tg)?,

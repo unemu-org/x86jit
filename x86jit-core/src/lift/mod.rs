@@ -1807,9 +1807,7 @@ pub(crate) fn lift_insn(
         // and rdssp (leaves its register — glibc's `xor eax; rdsspq rax; test`
         // then correctly detects "no shadow stack"). Prefetch (`0F 18`, `0F 0D`) is a
         // pure cache hint with no architectural effect (Go's runtime memmove emits it).
-        // Wait (0x9B, FWAIT/WAIT) is an x87 sync barrier: with no pending unmasked x87
-        // exceptions modeled it is a no-op (a guest CRT emits it as padding).
-        Nop | Endbr64 | Endbr32 | Pause | Wait | Rdsspd | Rdsspq | Prefetchnta | Prefetcht0
+        Nop | Endbr64 | Endbr32 | Pause | Rdsspd | Rdsspq | Prefetchnta | Prefetcht0
         | Prefetcht1 | Prefetcht2 | Prefetchw | Prefetchwt1 => Ok(false),
 
         // Real-mode segment-register moves (§17.6): `mov Sreg, r/m16` / `mov r/m16,
@@ -1986,7 +1984,8 @@ pub(crate) fn lift_insn(
         | Fnstenv | Fstenv | Fldenv | Fiadd | Fimul | Fisub | Fisubr | Fidiv | Fidivr | Ficom
         | Ficomp | Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu
         | Fsqrt | Fprem1 | Fscale | Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ftst
-        | Fxam => lift_x87(insn, ops, tg).map(|_| false),
+        | Fxam | Frndint | Fxtract | Fldpi | Fldl2e | Fldl2t | Fldlg2 | Fldln2 | Fist | Fnop
+        | Wait | Ffree | Fincstp | Fdecstp => lift_x87(insn, ops, tg).map(|_| false),
         Bsf => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsf).map(|_| false),
         Bsr => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsr).map(|_| false),
         Tzcnt => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Tzcnt).map(|_| false),

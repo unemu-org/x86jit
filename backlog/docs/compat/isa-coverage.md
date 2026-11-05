@@ -23,7 +23,7 @@ created_date: '2026-07-06 11:25'
 | x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
 | x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
-| x87 | 128 | 0 | 26 | 83% | 6 |
+| x87 | 141 | 0 | 13 | 92% | 6 |
 
 ## 32-bit compat mode (Compat32)
 
@@ -37,7 +37,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
-| x87 | 128 | 0 | 26 | 83% | 11 |
+| x87 | 141 | 0 | 13 | 92% | 11 |
 
 ## long64 mmx — missing (59)
 
@@ -434,34 +434,21 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vshufi32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshufi64x2_ymm_k1z_ymm_ymmm256b64_imm8`
 
-## long64 x87 — missing (26)
+## long64 x87 — missing (13)
 
 - `Fbld_m80bcd`
 - `Fbstp_m80bcd`
-- `Fdecstp`
-- `Ffree_sti`
 - `Ffreep_sti`
-- `Fincstp`
-- `Fist_m16int`
-- `Fist_m32int`
 - `Fldenv_m14byte`
-- `Fldl2e`
-- `Fldl2t`
-- `Fldlg2`
-- `Fldln2`
-- `Fldpi`
 - `Fndisi`
 - `Fneni`
-- `Fnop`
 - `Fnsave_m108byte`
 - `Fnsave_m94byte`
 - `Fnsetpm`
 - `Fnstenv_m14byte`
-- `Frndint`
 - `Frstor_m108byte`
 - `Frstor_m94byte`
 - `Fstpnce_sti`
-- `Fxtract`
 
 ## compat32 mmx — missing (57)
 
@@ -848,34 +835,21 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vshufi32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshufi64x2_ymm_k1z_ymm_ymmm256b64_imm8`
 
-## compat32 x87 — missing (26)
+## compat32 x87 — missing (13)
 
 - `Fbld_m80bcd`
 - `Fbstp_m80bcd`
-- `Fdecstp`
-- `Ffree_sti`
 - `Ffreep_sti`
-- `Fincstp`
-- `Fist_m16int`
-- `Fist_m32int`
 - `Fldenv_m14byte`
-- `Fldl2e`
-- `Fldl2t`
-- `Fldlg2`
-- `Fldln2`
-- `Fldpi`
 - `Fndisi`
 - `Fneni`
-- `Fnop`
 - `Fnsave_m108byte`
 - `Fnsave_m94byte`
 - `Fnsetpm`
 - `Fnstenv_m14byte`
-- `Frndint`
 - `Frstor_m108byte`
 - `Frstor_m94byte`
 - `Fstpnce_sti`
-- `Fxtract`
 
 ## long64 x86-64-v3 — register form lifts, memory form does not (73)
 

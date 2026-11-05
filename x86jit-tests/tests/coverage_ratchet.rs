@@ -432,6 +432,30 @@ const ALLOWLIST: &[&str] = &[
     "Fsqrt",
     "Fprem1",
     "Fscale",
+    // x87_rest.rs: frndint_exact_rounding_classes_and_precision_independence,
+    // fxtract_exact_components_and_special_values, new_x87_stack_faults_and_constant_overflow,
+    // and frndint_fxtract_unmasked_exceptions_and_deferred_wait cover exact
+    // results, exceptions, stack faults and deferred #MF on every tier/native.
+    "Frndint",
+    "Fxtract",
+    // fld_constants_every_rc_and_pc_without_precision_exception covers all RC/PC
+    // combinations; new_x87_stack_faults_and_constant_overflow covers overflow.
+    "Fldpi",
+    "Fldl2e",
+    "Fldl2t",
+    "Fldlg2",
+    "Fldln2",
+    // fist_nonpop_widths_rounding_invalid_and_empty: both widths, RC, IE, C1,
+    // empty stack, unmasked suppression and unchanged TOP on every tier/native.
+    "Fist",
+    // fnop_ffree_and_stack_pointer_rotations: every register and TOP, physical
+    // tags/data, wraparound and empty stack. fwait_reports_pending_mf_at_its_own_rip
+    // also covers FNOP's implicit wait. FFREEP/FSTPNCE remain deliberately unlifted
+    // (the primary-source provenance gap is recorded in deferred.md).
+    "Fnop",
+    "Ffree",
+    "Fincstp",
+    "Fdecstp",
     "Fdiv",
     "Fdivp",
     "Fdivr",
@@ -1056,7 +1080,7 @@ const ALLOWLIST: &[&str] = &[
     "Vxorps",
     "Vzeroall",
     "Vzeroupper",
-    "Wait",
+    "Wait", // x87_rest::fwait_reports_pending_mf_at_its_own_rip, every tier
     "Xadd",
     "Xchg",
     "Xorpd",
