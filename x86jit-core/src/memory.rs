@@ -100,8 +100,9 @@ pub enum MemoryModel {
     /// reserve hundreds of GiB on a normal host the backing must be a `MAP_NORESERVE`
     /// mapping — which the guest-agnostic core can't allocate (no OS dep), so the
     /// embedder provides it via [`Memory::from_host_ram`]. Constructing this model
-    /// through [`Memory::new`] instead uses a plain `Vec` (fine only for a modest
-    /// span or a test). Forecloses per-page guest protections.
+    /// through [`Memory::new`] instead uses a plain allocation (fine only for a modest
+    /// span or a test). The exclusive span top may be at most 2^47, the lower
+    /// canonical half (SDM Vol 1 §3.3.7.1). Forecloses per-page guest protections.
     Reserved { span: u64 },
     /// Sparse address space via a page/region table. `map()` allocates pages.
     SoftMmu,
@@ -441,19 +442,14 @@ const CODE_PAGE_SIZE: u64 = 1 << CODE_PAGE_BITS;
 #[allow(dead_code)]
 const CODE_WINDOW: u64 = 4 << 30;
 
-/// Largest guest span the SMC machinery can serve: 2^32 pages, i.e. 16 TiB.
-///
-/// Not another `CODE_WINDOW`. The bitset itself is uncapped; this is the limit of the
-/// WATERMARK generated stores gate on, which packs `(lo_page, len_pages)` into one `u64`
-/// so a torn read cannot produce a NARROWED range — and a narrowed range silently skips
-/// a page. Two separate `u64`s would remove the limit and reintroduce that race: a code
-/// page a store lands on but SMC never invalidates, i.e. a stale translation executed
-/// after the guest has rewritten it.
-///
-/// Asserted at construction rather than degraded at runtime: a span this large is a
-/// configuration error (`Reserved` is documented up to 1 TiB, sixteen times under it),
-/// and the alternative is code above the line that quietly never invalidates.
-const MAX_TRACKED_SPAN: u64 = (u32::MAX as u64) << CODE_PAGE_BITS;
+/// Shift for the SMC watermark's 64 KiB granules. The precise bitmaps retain
+/// 4 KiB pages; this range is only a conservative pre-filter for generated stores.
+/// A 2^47-byte span occupies 2^31 granules, leaving room in each packed u32 for
+/// the preceding-granule skew. One atomic u64 holds both bounds: separate loads
+/// could combine old and new halves into a narrowed range and miss invalidation.
+/// The canonical span bound is enforced by both Memory constructors (SDM Vol 1
+/// §3.3.7.1); SMC imposes no smaller limit.
+pub const CODE_RANGE_BITS: u32 = 16;
 
 /// The code-page indices a `[addr, addr+len)` access touches.
 ///
@@ -491,13 +487,14 @@ fn zeroed_words(words: usize) -> Box<[AtomicU64]> {
 
 /// Embedder-registered DATA-range dirty tracking.
 ///
-/// Spans the WHOLE guest address space, one bit per 4 KiB page — 32 MiB of virtual
-/// address space for a 1 TiB span, of which only the touched words ever commit. It has
+/// Covers backed guest pages relative to the guest base, one bit per 4 KiB page.
+/// A full zero-based 2^47 span reserves 4 GiB per table, lazily committed. It has
 /// to reach that far: watched DATA is precisely the embedder's big buffers in the high
 /// heap (a downstream embedder watches GPU buffers around 41 GiB), and while this table
 /// borrowed the SMC code-page table's `CODE_WINDOW` cap, `watch_range` was a silent
 /// no-op there and `take_dirty_ranges` always empty.
 struct WatchPages {
+    base_page: u64,
     /// Bit set = page is a watched data page.
     watch: Box<[AtomicU64]>,
     /// Bit set = watched page written since the last drain.
@@ -511,14 +508,12 @@ struct WatchPages {
 }
 
 impl WatchPages {
-    /// `span` is the guest extent to cover: addresses are indexed by their raw
-    /// page number, so the table must reach `guest_base + backing len`.
-    fn new(span: u64) -> Self {
-        let pages = span.div_ceil(CODE_PAGE_SIZE);
-        let words = pages.div_ceil(64) as usize;
+    /// Only pages from `guest_base` to the exclusive guest `top` need bits.
+    fn new(guest_base: u64, top: u64) -> Self {
         Self {
-            watch: zeroed_words(words),
-            dirty: zeroed_words(words),
+            base_page: guest_base >> CODE_PAGE_BITS,
+            watch: fresh_code_pages(guest_base, top),
+            dirty: fresh_code_pages(guest_base, top),
             words: Mutex::new(BTreeSet::new()),
             count: AtomicUsize::new(0),
         }
@@ -526,7 +521,7 @@ impl WatchPages {
 
     #[inline]
     fn is_watched(&self, page: u64) -> bool {
-        let (w, m) = word_bit(page);
+        let (w, m) = word_bit(page.wrapping_sub(self.base_page));
         self.watch
             .get(w)
             .is_some_and(|x| x.load(Ordering::Relaxed) & m != 0)
@@ -552,7 +547,7 @@ impl WatchPages {
     /// before the swap (reported this epoch) or after it (reported the next).
     #[inline]
     fn mark_dirty(&self, page: u64) {
-        let (w, m) = word_bit(page);
+        let (w, m) = word_bit(page.wrapping_sub(self.base_page));
         if let Some(word) = self.dirty.get(w) {
             if word.load(Ordering::Relaxed) & m == 0 {
                 word.fetch_or(m, Ordering::Release);
@@ -561,7 +556,7 @@ impl WatchPages {
     }
 
     fn watch(&self, page: u64) {
-        let (w, m) = word_bit(page);
+        let (w, m) = word_bit(page.wrapping_sub(self.base_page));
         let Some(word) = self.watch.get(w) else {
             // Unreachable: the table spans the whole guest address space, and
             // `map()` bounds every guest address against that span. Assert rather
@@ -578,7 +573,7 @@ impl WatchPages {
     }
 
     fn unwatch(&self, page: u64) {
-        let (w, m) = word_bit(page);
+        let (w, m) = word_bit(page.wrapping_sub(self.base_page));
         let Some(word) = self.watch.get(w) else {
             return;
         };
@@ -605,7 +600,7 @@ impl WatchPages {
         for &w in words.iter() {
             let mut bits = self.dirty[w as usize].swap(0, Ordering::Acquire);
             while bits != 0 {
-                pages.push((w << 6) | bits.trailing_zeros() as u64);
+                pages.push(self.base_page + ((w << 6) | bits.trailing_zeros() as u64));
                 bits &= bits - 1;
             }
         }
@@ -640,10 +635,10 @@ pub struct Memory {
     // through `&self` at block-resolve time and read on every store — the same
     // shared-through-`&self` discipline as `backing`. `dirty` collects code pages
     // written since the last drain; `dirty_flag` lets the hot path skip the lock.
-    /// Bit set = page backs a translated block. Packed, and covering the WHOLE guest
-    /// span — see [`CODE_WINDOW`] for what it used to be and why that was wrong.
+    /// Bit set = page backs a translated block. Page indices are relative to
+    /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: Box<[AtomicU64]>,
-    // Packed `(lo << 32) | len` over `code_page` indices — the *watermark* the JIT's
+    // Packed `(lo << 32) | len` over 64 KiB granules — the *watermark* the JIT's
     // inlined stores gate on, so a store outside it skips the table entirely. See
     // `code_range_ptr` for why a watermark and not a table probe.
     code_range: AtomicU64,
@@ -693,8 +688,7 @@ impl Memory {
     ///
     /// # Panics
     /// Panics if a Flat/Reserved span exceeds `1 << 47`, since it would include
-    /// non-canonical addresses (SDM Vol 1 §3.3.7.1), or the span exceeds the
-    /// SMC-tracked limit [`MAX_TRACKED_SPAN`]. Backing allocation failure aborts
+    /// non-canonical addresses (SDM Vol 1 §3.3.7.1). Backing allocation failure aborts
     /// through `std::alloc::handle_alloc_error`; it is not a catchable panic.
     pub fn new(model: MemoryModel) -> Self {
         let span = match model {
@@ -753,14 +747,12 @@ impl Memory {
     fn from_backing(model: MemoryModel, backing: Backing) -> Self {
         // Owned storage is 16-byte aligned; host storage preserves guest alignment.
         let guest_base = backing.guest_base();
-        // Sized over the guest SPAN like the watch table, not the backing length: pages
-        // are indexed by raw page number, so an embedder identity-mapping at a non-zero
-        // `guest_base` still lands inside the table.
-        let code_page = fresh_code_pages(guest_base.saturating_add(backing.len() as u64));
-        // Page indices are raw guest page numbers, so the watch table must reach the
-        // TOP of the guest space, not just the backing length (they differ when the
-        // embedder identity-maps at a non-zero `guest_base`). See `WatchPages`.
-        let watch = WatchPages::new(guest_base.saturating_add(backing.len() as u64));
+        let top = match model {
+            MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => size,
+            MemoryModel::SoftMmu => 0,
+        };
+        let code_page = fresh_code_pages(guest_base, top);
+        let watch = WatchPages::new(guest_base, top);
         Self {
             model,
             backing: UnsafeCell::new(backing),
@@ -840,61 +832,36 @@ impl Memory {
         // The table covers the whole guest span, so every mappable page has a bit; a
         // page outside it no-ops (`code_page.get` → None) rather than aborting.
         for page in code_page_range(addr, len as u64) {
-            let (w, m) = word_bit(page);
+            let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
             if let Some(word) = self.code_page.get(w) {
                 word.fetch_or(m, Ordering::Relaxed);
-                self.widen_code_range(page);
+                self.widen_code_range((page << CODE_PAGE_BITS) >> CODE_RANGE_BITS);
             }
         }
     }
 
-    /// Grow the [`Self::code_range`] watermark to include page `p`.
+    /// Union the watermark with the code granule `p` and its predecessor.
     ///
-    /// Only ever widens — a page whose tag is later cleared stays inside the range, so
-    /// stores there keep taking the (cold) precise path and find the tag false. That
-    /// costs a helper call; shrinking would cost correctness, because a concurrent
-    /// `mark_code` on another vcpu could be undone by a narrowing CAS.
+    /// A generated store is at most 64 bytes, so it can cross at most one 64 KiB
+    /// boundary. Including the preceding granule lets the gate test only the first
+    /// byte, with one load and one unsigned compare. The precise helper still tests
+    /// 4 KiB pages. Union the stored ranges directly, including the low skew, so
+    /// marking a previously skew-only granule also covers its predecessor.
     ///
-    /// Stored as PAGE indices. Byte addresses would be one instruction cheaper in
-    /// generated code (no shift), and that is what this held while the `CODE_WINDOW` cap
-    /// confined code to the low 4 GiB — byte addresses only fit 32 bits there. Pages fit
-    /// any span up to `MAX_TRACKED_SPAN`, and the shift measured as noise against the
-    /// two loads that dominate this sequence.
-    ///
-    /// The stored `lo` is one page BELOW the lowest code page and `len` one page longer
-    /// than the true extent. That is what lets generated code decide a store with ONE
-    /// unsigned compare on its FIRST byte: a store is at most 64 bytes against a
-    /// 4096-byte page (`CODE_PAGE_BITS`), so it can only spill into the very next page,
-    /// and a store whose first byte sits one page below the range is the only way to
-    /// reach the range's first page without starting inside it.
+    /// CAS publishes both halves together and only widens the observed range, even
+    /// when another vcpu marks code concurrently. Clearing tags never resets this
+    /// watermark: that could undo a concurrent mark and skip a later invalidation.
     fn widen_code_range(&self, p: u64) {
         let mut cur = self.code_range.load(Ordering::Relaxed);
         loop {
-            let (lo, len) = ((cur >> 32), (cur & 0xffff_ffff));
-            // Already inside the stored range? Ask exactly the question generated code
-            // asks, and stop — rather than recomputing a range that is already correct.
-            //
-            // This is what makes re-marking idempotent, and it has to be its own check
-            // because the `packed == cur` guard below cannot do it. The one-page skew is
-            // `saturating_sub(1)`, whose inverse `lo + 1` is exact for every page except
-            // **0**, where the encode clamps and the decode does not: re-marking page 0
-            // then saw a "new" lower bound every time and grew `len` without limit —
-            // 2, 3, 4, … Correctness never depended on it (`is_code_page` reads the
-            // bitmap precisely), but the inline gate over-approximated further on every
-            // pass, sending more stores through the cold helper the barrier exists to
-            // avoid.
-            if len != 0 && p.wrapping_sub(lo) < len {
-                return;
-            }
-            let (want_lo, want_hi) = if len == 0 {
-                (p, p) // first code page ever: an empty range has no meaningful `lo`
+            let (lo, len) = (cur >> 32, cur & 0xffff_ffff);
+            let new_lo = if len == 0 {
+                p.saturating_sub(1)
             } else {
-                // Undo the one-page skew so it is not applied twice.
-                (lo + 1, lo + len - 1)
+                lo.min(p.saturating_sub(1))
             };
-            let new_lo = want_lo.min(p);
-            let new_hi = want_hi.max(p);
-            let packed = (new_lo.saturating_sub(1) << 32) | (new_hi - new_lo + 2);
+            let new_end = (lo + len).max(p + 1);
+            let packed = (new_lo << 32) | (new_end - new_lo);
             if packed == cur {
                 return;
             }
@@ -927,7 +894,7 @@ impl Memory {
     /// reverted. Stack and heap stores fall outside the code extent of any real image,
     /// so they pay a subtract and a compare and branch over the rest.
     ///
-    /// Layout: `(lo << 32) | len` over code-page indices, with the one-page low skew
+    /// Layout: `(lo << 32) | len` over 64 KiB granules, with the one-granule low skew
     /// documented on [`Self::widen_code_range`]. A single `u64` so generated code reads
     /// both halves in one load and can never see a torn `lo`/`len` pair — a narrowed
     /// pair would silently skip a page. `len == 0` means no code has been marked, and
@@ -938,7 +905,7 @@ impl Memory {
 
     /// Clear a page's code tag after its blocks have been invalidated (§10).
     pub fn clear_code_page(&self, page: u64) {
-        let (w, m) = word_bit(page);
+        let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
         if let Some(word) = self.code_page.get(w) {
             word.fetch_and(!m, Ordering::Relaxed);
         }
@@ -947,7 +914,21 @@ impl Memory {
     /// Clear every code-page tag — for a whole-cache invalidation (e.g. mapping a
     /// Trap region, §5.2 M4-T10), the bulk counterpart of [`Self::clear_code_page`].
     pub fn clear_all_code_pages(&self) {
-        for word in self.code_page.iter() {
+        let range = self.code_range.load(Ordering::Relaxed);
+        let (lo, len) = (range >> 32, range & 0xffff_ffff);
+        if len == 0 {
+            return;
+        }
+        let base_page = self.guest_base >> CODE_PAGE_BITS;
+        let first_page = (lo << (CODE_RANGE_BITS - CODE_PAGE_BITS)).max(base_page);
+        let end_page = (lo + len) << (CODE_RANGE_BITS - CODE_PAGE_BITS);
+        let first_word = ((first_page - base_page) >> 6) as usize;
+        let end_word = end_page.saturating_sub(base_page).div_ceil(64) as usize;
+        // An empty watermark touches nothing. Otherwise only words in the code
+        // extent are written, preserving lazy commit across a sparse guest span.
+        for word in &self.code_page
+            [first_word.min(self.code_page.len())..end_word.min(self.code_page.len())]
+        {
             word.store(0, Ordering::Relaxed);
         }
     }
@@ -1008,7 +989,7 @@ impl Memory {
     /// Whether page `p` currently backs translated code — the precise test behind the
     /// inline watermark, for callers that already know the exact page.
     pub fn is_code_page(&self, p: u64) -> bool {
-        let (w, m) = word_bit(p);
+        let (w, m) = word_bit(p.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
         self.code_page
             .get(w)
             .is_some_and(|word| word.load(Ordering::Relaxed) & m != 0)
@@ -1030,18 +1011,17 @@ impl Memory {
     /// their own page inline instead of calling [`Self::note_write`] only to discover
     /// the page is not watched.
     ///
-    /// The word for guest page `p` is at `base + (p >> 6) * 8`, bit `p & 63` — the
-    /// layout `word_bit` uses. Read live, like [`Self::watch_count_ptr`], and for the
-    /// same reason: a watch installed by another thread mid-run must be visible to
-    /// the next store.
+    /// Subtract `guest_base >> CODE_PAGE_BITS` from guest page `p`, then the word
+    /// is at `base + (p >> 6) * 8`, bit `p & 63` — the layout `word_bit` uses.
+    /// Read live, like [`Self::watch_count_ptr`]: a watch installed by another
+    /// thread mid-run must be visible to the next store.
     ///
     /// # Safety contract for the caller
     /// Generated code indexes this WITHOUT a bounds check, so the table must cover
     /// every address a store can reach. It does: `WatchPages::new` is sized over
-    /// `guest_base + backing len`, while inlined stores are bounds-checked against
-    /// [`Self::size`] first, and `from_host_ram` checks `size - guest_base <= backing
-    /// len`. [`Self::watch_bits_cover_size`] re-checks that chain at run start rather
-    /// than leaving it to three facts in two crates.
+    /// the pages intersecting `[guest_base, size)`, while inlined stores check both
+    /// bounds first. The first page may be partially backed.
+    /// [`Self::watch_bits_cover_size`] re-checks that chain at run start.
     pub fn watch_bits_ptr(&self) -> u64 {
         self.watch.watch.as_ptr() as u64
     }
@@ -1051,8 +1031,12 @@ impl Memory {
     /// this ever goes false the generated bit test would read out of bounds, which is
     /// host UB rather than a panic, so it must fail loudly instead.
     pub fn watch_bits_cover_size(&self) -> bool {
-        let top_page = self.size().saturating_sub(1) >> CODE_PAGE_BITS;
-        (top_page >> 6) < self.watch.watch.len() as u64
+        if self.size() == self.guest_base {
+            return true;
+        }
+        let top_page = (self.size() - 1) >> CODE_PAGE_BITS;
+        let relative = top_page - (self.guest_base >> CODE_PAGE_BITS);
+        (relative >> 6) < self.watch.watch.len() as u64
     }
 
     /// Register `[addr, addr + size)` as a watched DATA range: subsequent guest writes
@@ -2121,20 +2105,16 @@ pub(crate) unsafe fn atomic_store_le(ptr: *mut u8, val: u64, size: u8) {
     }
 }
 
-/// The SMC code-page bitset for a guest space of `span` bytes.
-///
-/// Sized over the span, not the backing length, and uncapped: addresses are indexed by
-/// their raw page number, so the table has to reach `guest_base + backing len` for the
-/// same reason `WatchPages::new` does.
-fn fresh_code_pages(span: u64) -> Box<[AtomicU64]> {
-    assert!(
-        span <= MAX_TRACKED_SPAN,
-        "guest span 0x{span:x} exceeds the SMC-tracked maximum 0x{MAX_TRACKED_SPAN:x}: \
-         the code-range watermark generated stores gate on packs two page indices into \
-         one u64, and a page above 2^32 has no representation. Refused here rather than \
-         silently leaving high code un-invalidated."
-    );
-    let pages = span.div_ceil(CODE_PAGE_SIZE);
+/// One bit per page intersecting `[guest_base, top)`, including partial pages.
+/// A high base with a small backing needs only a small table. A zero-based 2^47
+/// span reserves 4 GiB per bitmap (12 GiB for code/watch/dirty together), lazily
+/// committed by `zeroed_words`; hosts with strict allocation limits can refuse it.
+fn fresh_code_pages(guest_base: u64, top: u64) -> Box<[AtomicU64]> {
+    let pages = if top == guest_base {
+        0
+    } else {
+        top.div_ceil(CODE_PAGE_SIZE) - (guest_base >> CODE_PAGE_BITS)
+    };
     zeroed_words(pages.div_ceil(64) as usize)
 }
 
@@ -2746,6 +2726,155 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn smc_47bit_top_uses_backing_relative_bitmaps() {
+        // SDM Vol 1 §3.3.7.1: the lower 48-bit canonical half ends at 2^47.
+        const TOP: u64 = 1 << 47;
+        const LEN: usize = 2 << 20;
+        let base = TOP - LEN as u64;
+        let mut m = high_base_mem(base, LEN);
+        m.map(base, LEN, Prot::RWX, RegionKind::Ram).unwrap();
+        assert!(is_canonical(TOP - 1));
+        assert!(!is_canonical(TOP));
+        for table in [&m.code_page, &m.watch.watch, &m.watch.dirty] {
+            assert_eq!(table.len(), 8, "512 backed pages need eight bitmap words");
+        }
+        assert!(m.watch_bits_cover_size());
+        let code = TOP - CODE_PAGE_SIZE;
+        m.mark_code(code, 16);
+        m.watch_range(code, CODE_PAGE_SIZE);
+        m.write_bytes(code, &[0xaa]).unwrap();
+        assert_eq!(m.take_dirty_code(), vec![code >> CODE_PAGE_BITS]);
+        assert_eq!(m.take_dirty_ranges(), vec![(code, CODE_PAGE_SIZE)]);
+        m.clear_all_code_pages();
+        assert!(!m.is_code_page(code >> CODE_PAGE_BITS));
+    }
+
+    #[test]
+    fn smc_47bit_partial_first_page_keeps_bitmap_indices_aligned() {
+        const TOP: u64 = 1 << 47;
+        let base = TOP - 0x40000 + 16;
+        let mut m = high_base_mem(base, (TOP - base) as usize);
+        m.map(base, (TOP - base) as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        assert_eq!(m.code_page.len(), 1);
+        assert!(m.watch_bits_cover_size());
+        for addr in [base, TOP - 1] {
+            m.mark_code(addr, 1);
+            m.watch_range(addr, 1);
+            m.write_bytes(addr, &[1]).unwrap();
+            let page = addr >> CODE_PAGE_BITS;
+            assert_eq!(m.take_dirty_code(), vec![page]);
+            assert_eq!(
+                m.take_dirty_ranges(),
+                vec![(page << CODE_PAGE_BITS, CODE_PAGE_SIZE)]
+            );
+            m.clear_code_page(page);
+            assert!(!m.is_code_page(page));
+            m.unwatch_range(addr, 1);
+        }
+        assert_eq!(m.watch.count.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn smc_47bit_zero_based_tables_stay_sparse_when_cleared() {
+        const TOP: u64 = 1 << 47;
+        // Exercise the full-span metadata without reserving 128 TiB of host RAM.
+        // The backing is never accessed; mark/clear only touch the page tables.
+        let mut m = Memory::new(MemoryModel::SoftMmu);
+        m.code_page = fresh_code_pages(0, TOP);
+        m.watch = WatchPages::new(0, TOP);
+        assert_eq!(m.code_page.len() * 8, 4usize << 30);
+        m.clear_all_code_pages();
+        m.mark_code(TOP - CODE_PAGE_SIZE, 1);
+        m.watch.watch((TOP - CODE_PAGE_SIZE) >> CODE_PAGE_BITS);
+        m.clear_all_code_pages();
+        assert!(!m.is_code_page((TOP - CODE_PAGE_SIZE) >> CODE_PAGE_BITS));
+        assert_eq!(m.watch.watch.len() * 8, 4usize << 30);
+        assert_eq!(m.watch.dirty.len() * 8, 4usize << 30);
+    }
+
+    #[test]
+    fn smc_watermark_granule_edges_are_conservative_and_exact() {
+        let m = Memory::new(MemoryModel::Flat { size: 0x80000 });
+        let code = 0x40000;
+        m.mark_code(code, 1);
+        let gate = |addr: u64| {
+            let range = m.code_range.load(Ordering::Relaxed);
+            (addr >> 16).wrapping_sub(range >> 32) < (range & 0xffff_ffff)
+        };
+        assert!(gate(code));
+        assert!(
+            gate(code - 1),
+            "a wide store can cross into the first code page"
+        );
+        assert!(!gate(0x2ffff), "outside the preceding granule stays fast");
+        assert!(!gate(0x50000), "outside the last granule stays fast");
+        m.note_write(code - 1, 2);
+        assert_eq!(m.take_dirty_code(), vec![code >> CODE_PAGE_BITS]);
+        m.note_write(code + CODE_PAGE_SIZE, 1);
+        assert!(
+            m.take_dirty_code().is_empty(),
+            "the helper still tests 4 KiB pages"
+        );
+        // Marking the previously skew-only granule must also cover its predecessor.
+        m.mark_code(code - 0x10000, 1);
+        assert!(gate(code - 0x10001));
+        m.mark_code(0, 1);
+        let first = m.code_range.load(Ordering::Relaxed);
+        m.mark_code(0, 1);
+        assert_eq!(m.code_range.load(Ordering::Relaxed), first);
+        m.widen_code_range((1 << (47 - 16)) - 1);
+        assert_eq!(m.code_range.load(Ordering::Relaxed), 1 << 31);
+    }
+
+    #[test]
+    fn smc_47bit_concurrent_marks_never_narrow_the_store_gate() {
+        const TOP: u64 = 1 << 47;
+        let m = high_base_mem(TOP - (2 << 20), 2 << 20);
+        let published = AtomicU64::new(0);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for parity in 0..2 {
+                let (m, published, barrier) = (&m, &published, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in (parity..32).step_by(2) {
+                        let addr = TOP - ((i + 1) << 16);
+                        m.mark_code(addr, 1);
+                        published.fetch_or(1 << i, Ordering::Release);
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            barrier.wait();
+            let mut previous = 0;
+            loop {
+                let marked = published.load(Ordering::Acquire);
+                let range = m.code_range.load(Ordering::Relaxed);
+                let (lo, len) = (range >> 32, range & 0xffff_ffff);
+                if previous != 0 {
+                    let (old_lo, old_len) = (previous >> 32, previous & 0xffff_ffff);
+                    assert!(lo <= old_lo && lo + len >= old_lo + old_len);
+                }
+                previous = range;
+                for i in 0..32 {
+                    if marked & (1 << i) != 0 {
+                        let addr = TOP - ((i + 1) << 16);
+                        assert!((addr >> 16).wrapping_sub(lo) < len);
+                        assert!(((addr - 1) >> 16).wrapping_sub(lo) < len);
+                        m.note_write(addr, 1);
+                        assert!(m.take_dirty_code().contains(&(addr >> CODE_PAGE_BITS)));
+                    }
+                }
+                if marked == u32::MAX as u64 {
+                    break;
+                }
+            }
+        });
+    }
+
     // Embedder-registered watched data-range dirty tracking.
     fn watched_mem() -> Memory {
         let mut m = Memory::new(MemoryModel::Flat { size: 0x10_0000 });
@@ -2842,7 +2971,7 @@ mod tests {
         // A 1 TiB span: 268M pages -> 4.2M words -> 33.5 MiB per bitset.
         const SPAN: u64 = 1 << 40;
         let before = rss_bytes();
-        let w = WatchPages::new(SPAN);
+        let w = WatchPages::new(0, SPAN);
         for p in 0..64 {
             w.watch((SPAN >> 1 >> CODE_PAGE_BITS) + p);
         }
@@ -2926,24 +3055,11 @@ mod tests {
         );
     }
 
-    /// Re-marking the same page must not keep widening the SMC watermark.
-    ///
-    /// `widen_code_range` stores `lo` one page BELOW the lowest code page and undoes the
-    /// skew on decode with `lo + 1`. That inverse is exact for every page except **0**,
-    /// where `saturating_sub(1)` has nowhere to go: the encode clamps to 0 while the
-    /// decode still recovers 1, so each re-mark sees a "new" lower bound and grows `len`
-    /// by one — 2, 3, 4, … without limit. Correctness is unaffected (`is_code_page` still
-    /// consults the bitmap precisely), but the inline gate over-approximates further on
-    /// every pass, sending more stores through the cold helper the barrier exists to
-    /// avoid.
-    ///
-    /// Page 0 is the only one affected and no real loader puts code there, which is why
-    /// nothing in the corpus noticed. That makes it a nit, not a reason to leave an
-    /// unbounded loop in a hot-path input.
+    /// Re-marking code must not accumulate the conservative low skew.
     #[test]
     fn re_marking_a_code_page_converges() {
-        for page in [0u64, 1, 7] {
-            let m = Memory::new(MemoryModel::Flat { size: 0x10_000 });
+        for page in [0u64, 1, 7, 16, 31] {
+            let m = Memory::new(MemoryModel::Flat { size: 0x20_000 });
             let addr = page << CODE_PAGE_BITS;
             m.mark_code(addr, 16);
             let first = m.code_range.load(Ordering::Relaxed);

@@ -149,7 +149,9 @@ pub struct MemCtx {
     /// single page anywhere was watched — an embedder measured 388M such calls in 10 s
     /// and, later, 7.7% of a retail title's cycles in this write barrier.
     ///
-    /// Word for guest page `p` at `+ (p >> 6) * 8`, bit `p & 63`. Read live, like
+    /// The table starts at the backing's first page: guest page `p` is table index
+    /// `i = p - (guest_base >> CODE_PAGE_BITS)`, at word `+ (i >> 6) * 8`, bit
+    /// `i & 63`, and generated code subtracts the same base page. Read live, like
     /// `watch_count_ptr`, so a mid-run watch is seen by the next store.
     /// Indexed WITHOUT a bounds check, which is sound because inlined stores are
     /// bounds-checked against `size` first and the table covers that span —
@@ -171,10 +173,14 @@ pub struct MemCtx {
     /// A watermark keeps the hot path to a subtract and a compare that stack and heap
     /// stores fall straight through.
     ///
-    /// Packed `(lo << 32) | len` over code-page indices, read live like
+    /// Packed `(lo << 32) | len` over absolute 64 KiB granules (`addr >> 16`), read
+    /// live like
     /// `watch_count_ptr` so a page marked by a background compile mid-run is seen by the
     /// next store. One `u64` so both halves arrive in a single load: a torn read could
-    /// yield a NARROWED range, which would silently skip a page.
+    /// yield a NARROWED range, which would silently skip a page. Each marked granule
+    /// also widens the range to its predecessor, so a store of at most 64 bytes is
+    /// gated on its first byte alone (`Memory::widen_code_range`); the precise
+    /// note-write helper still tests 4 KiB pages.
     pub code_range_ptr: u64,
     /// In: live per-vcpu dispatch notification word (SMC | exit request).
     /// Points to an immutable zero atomic for standalone compiled calls. Rust polls

@@ -59,6 +59,235 @@ fn run_to_hlt(vm: &Vm, cpu: &mut x86jit_core::Vcpu) {
     }
 }
 
+fn vm_at_47bit_top(backend: Box<dyn Backend>) -> Vm {
+    // SDM Vol 1 §3.3.7.1: all bytes below 2^47 are in the lower canonical half.
+    const TOP: u64 = 1 << 47;
+    const LEN: usize = 2 << 20;
+    let base = TOP - LEN as u64;
+    let backing = vec![0u128; LEN / 16].into_boxed_slice();
+    let ram = x86jit_core::HostRam {
+        ptr: Box::into_raw(backing) as *mut u8,
+        len: LEN,
+        guest_base: base,
+        dtor: Box::new(|ptr, len| {
+            // SAFETY: the pointer and length describe the boxed u128 slice above.
+            drop(unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    ptr.cast::<u128>(),
+                    len / 16,
+                ))
+            });
+        }),
+        protect: None,
+    };
+    let mut vm = Vm::with_backend_host_ram(VmConfig::reserved(TOP), backend, ram).unwrap();
+    vm.map(base, LEN, Prot::RWX, RegionKind::Ram).unwrap();
+    vm
+}
+
+fn smc_at_47bit_top(backend: Box<dyn Backend>) {
+    const TOP: u64 = 1 << 47;
+    let vm = vm_at_47bit_top(backend);
+    let base = vm.mem.guest_base();
+    let main_addr = TOP - 0x20000;
+    let target = TOP - 0x1000;
+    let stack = TOP - 0x4000;
+    let data = base + 0x10000;
+    vm.mem.watch_range(data, 0x1000);
+    vm.write_bytes(
+        target,
+        &assemble(target, |a| {
+            a.mov(eax, 1i32).unwrap();
+            a.ret().unwrap();
+        }),
+    )
+    .unwrap();
+    vm.write_bytes(
+        main_addr,
+        &assemble(main_addr, |a| {
+            a.mov(r15, target).unwrap();
+            a.call(r15).unwrap();
+            a.mov(r14, target + 1).unwrap();
+            a.mov(dword_ptr(r14), 2i32).unwrap();
+            // End the patching block before calling the target again (§10).
+            let mut next = a.create_label();
+            a.jmp(next).unwrap();
+            a.set_label(&mut next).unwrap();
+            a.call(r15).unwrap();
+            // A watched store below the code extent exercises the cold bitmap probe.
+            a.mov(r14, data).unwrap();
+            a.mov(dword_ptr(r14), eax).unwrap();
+            a.hlt().unwrap();
+        }),
+    )
+    .unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, main_addr);
+    cpu.set_reg(Reg::Rsp, stack);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(
+        cpu.reg(Reg::Rax),
+        2,
+        "guest patch must invalidate high code"
+    );
+    assert_eq!(vm.mem.take_dirty_ranges(), vec![(data, 0x1000)]);
+    vm.write_bytes(target + 1, &42u32.to_le_bytes()).unwrap();
+    let call_only = assemble(main_addr, |a| {
+        a.mov(r15, target).unwrap();
+        a.call(r15).unwrap();
+        a.hlt().unwrap();
+    });
+    vm.write_bytes(main_addr, &call_only).unwrap();
+    cpu.set_reg(Reg::Rip, main_addr);
+    cpu.set_reg(Reg::Rsp, stack);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(
+        cpu.reg(Reg::Rax),
+        42,
+        "embedder patch must invalidate high code"
+    );
+}
+
+both_backends!(
+    smc_at_47bit_top,
+    smc_at_47bit_top_interp,
+    smc_at_47bit_top_jit
+);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn smc_47bit_top_trap_mapping_stays_sparse() {
+    fn peak_rss() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the rusage buffer on success.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        // SAFETY: the successful call initialized usage.
+        let rss = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            rss
+        } else {
+            rss * 1024
+        }
+    }
+    let before = peak_rss();
+    let mut vm = vm_at_47bit_top(Box::new(InterpreterBackend));
+    let fresh = peak_rss();
+    let code = (1 << 47) - 0x1000;
+    vm.unmap(vm.mem.guest_base(), 2 << 20).unwrap();
+    vm.mem.mark_code(code, 1);
+    vm.map(code - 0x10000, 0x1000, Prot::RW, RegionKind::Trap)
+        .unwrap();
+    let after = peak_rss();
+    assert!(!vm.mem.is_code_page(code >> 12));
+    println!("47-bit span peak RSS bytes: before={before}, fresh={fresh}, after Trap={after}");
+    assert!(fresh.saturating_sub(before) < 16 << 20);
+    assert!(after.saturating_sub(fresh) < 4 << 20);
+}
+
+#[test]
+fn smc_47bit_concurrent_marks_reach_compiled_store_gate() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use x86jit_core::jit_abi::run_compiled;
+    use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
+    use x86jit_core::{CachedBlock, StepResult};
+
+    const TOP: u64 = 1 << 47;
+    let vm = vm_at_47bit_top(Box::new(JitBackend::new()));
+    let entry_addr = TOP - 0x1000;
+    vm.write_bytes(entry_addr, &[0x89, 0x07, 0xf4]).unwrap(); // mov [rdi],eax; hlt
+    let ir = lift_block(&vm.mem, FetchAddr::flat(entry_addr), CpuMode::Long64).unwrap();
+    let CachedBlock::Compiled { entry } = vm.backend.materialize(
+        &ir,
+        vm.consistency,
+        vm.mem.trap_window(),
+        vm.mem.guest_base(),
+    ) else {
+        panic!("JIT backend must compile the store");
+    };
+    let published = AtomicU64::new(0);
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        for parity in 0..2 {
+            let (mem, published, barrier) = (&vm.mem, &published, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                for i in (parity..32).step_by(2) {
+                    let addr = TOP - ((i + 1) << 16);
+                    mem.mark_code(addr, 1);
+                    published.fetch_or(1 << i, Ordering::Release);
+                    std::thread::yield_now();
+                }
+            });
+        }
+        let mut cpu = vm.new_vcpu();
+        barrier.wait();
+        loop {
+            let marked = published.load(Ordering::Acquire);
+            for i in 0..32 {
+                if marked & (1 << i) != 0 {
+                    let addr = TOP - ((i + 1) << 16);
+                    cpu.set_reg(Reg::Rdi, addr);
+                    cpu.set_reg(Reg::Rip, entry_addr);
+                    // SAFETY: the entry remains owned by vm's backend; its backing
+                    // and context match the freshly materialized block.
+                    let result =
+                        unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) };
+                    assert!(matches!(result, StepResult::Exit(Exit::Hlt)));
+                    assert_eq!(vm.mem.take_dirty_code(), vec![addr >> 12]);
+                }
+            }
+            if marked == u32::MAX as u64 {
+                break;
+            }
+        }
+    });
+}
+
+#[test]
+fn smc_47bit_store_outside_watermark_granule_skips_helper() {
+    use x86jit_core::jit_abi::run_compiled;
+    use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
+    use x86jit_core::{CachedBlock, StepResult};
+
+    const TOP: u64 = 1 << 47;
+    let vm = vm_at_47bit_top(Box::new(JitBackend::new()));
+    let entry_addr = TOP - 0x1000;
+    let code = TOP - 0x10000;
+    vm.write_bytes(entry_addr, &[0x89, 0x07, 0xf4]).unwrap(); // mov [rdi],eax; hlt
+    let ir = lift_block(&vm.mem, FetchAddr::flat(entry_addr), CpuMode::Long64).unwrap();
+    let CachedBlock::Compiled { entry } = vm.backend.materialize(
+        &ir,
+        vm.consistency,
+        vm.mem.trap_window(),
+        vm.mem.guest_base(),
+    ) else {
+        panic!("JIT backend must compile the store");
+    };
+    vm.mem.mark_code(code, 1);
+    let mut cpu = vm.new_vcpu();
+    for (addr, calls, dirty) in [
+        (code - 0x10004, 0, false),
+        (code + 0x1000, 1, false),
+        (code, 2, true),
+    ] {
+        cpu.set_reg(Reg::Rdi, addr);
+        cpu.set_reg(Reg::Rip, entry_addr);
+        // SAFETY: the entry's owning backend, backing and context remain live.
+        let result = unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) };
+        assert!(matches!(result, StepResult::Exit(Exit::Hlt)));
+        let count: u64 = vm
+            .backend
+            .helper_calls()
+            .iter()
+            .map(|(_, count)| count)
+            .sum();
+        assert_eq!(count, calls, "helper count at {addr:#x}");
+        assert_eq!(vm.mem.has_dirty_code(), dirty);
+    }
+    assert_eq!(vm.mem.take_dirty_code(), vec![code >> 12]);
+}
+
 /// The guest overwrites its own code: it calls `target` (caching that block),
 /// patches `target`'s first instruction from `mov eax, 1` to `mov eax, 2`, then
 /// calls `target` again. Without SMC invalidation the second call would replay

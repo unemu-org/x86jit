@@ -28,7 +28,7 @@ use x86jit_core::jit_abi::{
     RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
     RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED,
 };
-use x86jit_core::memory::CODE_PAGE_BITS;
+use x86jit_core::memory::{CODE_PAGE_BITS, CODE_RANGE_BITS};
 use x86jit_core::GuestAccessKind;
 use x86jit_core::{
     AesOp, BitScanOp, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
@@ -3269,10 +3269,10 @@ impl Translator<'_, '_> {
         // The SMC watermark. Unlike the watch count there is no usually-zero gate to hide
         // behind — code pages exist as soon as anything has run — so the cheap test IS the
         // range test: a shift, a subtract and an unsigned compare against a
-        // `(lo << 32) | len` word of PAGE indices, loaded whole. Stack and heap stores
+        // `(lo << 32) | len` word of 64 KiB granule indices, loaded whole. Stack and heap stores
         // sit outside any real image's code extent and fall through it. `len == 0`
         // (nothing marked yet) makes the compare false for every address, so "no code"
-        // needs no separate branch. `Memory::widen_code_range` keeps `lo` one page low,
+        // needs no separate branch. `Memory::widen_code_range` keeps `lo` one granule low,
         // which is what lets this test the store's FIRST byte only and still catch one
         // that spills into the range's first page.
         let crp = self.load_mem(MEMCTX_CODE_RANGE_PTR); // -> &AtomicU64 code_range
@@ -3280,16 +3280,16 @@ impl Translator<'_, '_> {
             .builder
             .ins()
             .load(types::I64, MemFlags::trusted(), crp, 0);
-        let store_page = self
+        let store_granule = self
             .builder
             .ins()
-            .ushr_imm(guest_addr, CODE_PAGE_BITS as i64);
+            .ushr_imm(guest_addr, CODE_RANGE_BITS as i64);
         let code_lo = self.builder.ins().ushr_imm(cr, 32);
         // `ireduce`+`uextend` is a plain 32-bit move (zero-extending); `band_imm` with
         // 0xffff_ffff put the mask in the CONSTANT POOL and made this a memory operand.
         let code_len = self.builder.ins().ireduce(types::I32, cr);
         let code_len = self.builder.ins().uextend(types::I64, code_len);
-        let rel = self.builder.ins().isub(store_page, code_lo);
+        let rel = self.builder.ins().isub(store_granule, code_lo);
         let maybe_code = self
             .builder
             .ins()
@@ -3329,6 +3329,12 @@ impl Translator<'_, '_> {
             .builder
             .ins()
             .ushr_imm(guest_addr, CODE_PAGE_BITS as i64);
+        let page = if self.guest_base >> CODE_PAGE_BITS == 0 {
+            page
+        } else {
+            let base_page = self.iconst(self.guest_base >> CODE_PAGE_BITS);
+            self.builder.ins().isub(page, base_page)
+        };
         let word_idx = self.builder.ins().ushr_imm(page, 6);
         let byte_off = self.builder.ins().imul_imm(word_idx, 8);
         let bits = self.load_mem(MEMCTX_WATCH_BITS_PTR);
