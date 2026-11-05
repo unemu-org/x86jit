@@ -1528,23 +1528,38 @@ fn exec_x87_inner<M: FpMem>(
                 cpu.fpu_sw |= 1 << 9;
             }
         }
-        // SDM Vol 2A §3.2 FCOM/FUCOM/FTST: invalid precedes denormal,
-        // unmasked exceptions preserve the codes and suppress every pop.
+        // SDM Vol 2A §3.2 FCOM/FUCOM/FICOM/FTST/FCOMI/FUCOMI, Operation:
+        // the relation CASE is unconditional; only invalid operands gate it on IM.
+        // Vol 1 §8.5.2: an unmasked #D retains TOP and source operands, so the
+        // relation commits but every pop is suppressed. AMD APM Vol 5 §FCOMx,
+        // §FUCOMx, §FICOMx, §FTST, §FCOMIx and §FUCOMIx give the relation tables.
         Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ftst | FcomMemF32 | FcomMemF64
-        | FcompMemF32 | FcompMemF64 => {
-            let memory = matches!(kind, FcomMemF32 | FcomMemF64 | FcompMemF32 | FcompMemF64);
+        | FcompMemF32 | FcompMemF64 | FicomI16 | FicomI32 | FicompI16 | FicompI32 | Fcomi
+        | Fcomip | Fucomi | Fucomip => {
+            let integer = matches!(kind, FicomI16 | FicomI32 | FicompI16 | FicompI32);
+            let integer_flags = matches!(kind, Fcomi | Fcomip | Fucomi | Fucomip);
+            let memory =
+                integer || matches!(kind, FcomMemF32 | FcomMemF64 | FcompMemF32 | FcompMemF64);
             let mut den = st_denormal(cpu, 0);
             let b = if memory {
-                let width = if matches!(kind, FcomMemF32 | FcompMemF32) {
-                    4
-                } else {
-                    8
+                let width = match kind {
+                    FicomI16 | FicompI16 => 2,
+                    FicomI32 | FicompI32 | FcomMemF32 | FcompMemF32 => 4,
+                    _ => 8,
                 };
                 let Some(raw) = read_n(mem, addr, width) else {
                     return Some((mem.fault_addr(addr), false));
                 };
-                den |= float_bytes_denormal(&raw, width);
-                if width == 4 {
+                if !integer {
+                    den |= float_bytes_denormal(&raw, width);
+                }
+                if integer {
+                    F80::from_i64(if width == 2 {
+                        i16::from_le_bytes(raw[..2].try_into().unwrap()) as i64
+                    } else {
+                        i32::from_le_bytes(raw[..4].try_into().unwrap()) as i64
+                    })
+                } else if width == 4 {
                     // Preserve the signaling bit during widening (SDM Vol 1 §4.8.3.5).
                     let bits = u32::from_le_bytes(raw[..4].try_into().unwrap());
                     if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x7f_ffff != 0 {
@@ -1567,20 +1582,45 @@ fn exec_x87_inner<M: FpMem>(
                 operand!(cpu, sti)
             };
             let a = operand!(cpu, 0);
-            let ((c3, c2, c0), mut exc) =
-                F80::compare_x87(a, b, matches!(kind, Fucom | Fucomp | Fucompp));
+            let ((c3, c2, c0), mut exc) = F80::compare_x87(
+                a,
+                b,
+                matches!(kind, Fucom | Fucomp | Fucompp | Fucomi | Fucomip),
+            );
             cpu.fpu_sw &= !(1 << 9);
             // SDM Vol 1 §4.9.2: QNaN handling also precedes denormal operands.
             if !exc.has(Exc::IE) && !a.is_nan() && !b.is_nan() && den {
                 exc = exc.with(Exc::DE);
             }
-            if raise(cpu, exc) {
+            let unmasked = raise(cpu, exc);
+            if unmasked && exc.has(Exc::IE) {
                 return None;
             }
-            set_codes(cpu, c3, c2, c0);
+            if integer_flags {
+                cpu.flags.zf = c3;
+                cpu.flags.set_pf(c2);
+                cpu.flags.cf = c0;
+                cpu.flags.of = false;
+                cpu.flags.sf = false;
+                cpu.flags.set_af(false);
+            } else {
+                set_codes(cpu, c3, c2, c0);
+            }
+            if unmasked {
+                return None;
+            }
             if matches!(
                 kind,
-                Fcomp | Fcompp | Fucomp | Fucompp | FcompMemF32 | FcompMemF64
+                Fcomp
+                    | Fcompp
+                    | Fucomp
+                    | Fucompp
+                    | FcompMemF32
+                    | FcompMemF64
+                    | FicompI16
+                    | FicompI32
+                    | Fcomip
+                    | Fucomip
             ) {
                 pop(cpu);
             }
@@ -1648,64 +1688,6 @@ fn exec_x87_inner<M: FpMem>(
                 cpu.fpu_sw &= !(1 << 10);
             }
             set_st(cpu, 0, r);
-        }
-        Fucomi | Fucomip | Fcomi | Fcomip => {
-            let (zf, pf, cf) = F80::compare(operand!(cpu, 0), operand!(cpu, sti));
-            cpu.flags.zf = zf;
-            cpu.flags.set_pf(pf);
-            cpu.flags.cf = cf;
-            cpu.flags.of = false;
-            cpu.flags.sf = false;
-            cpu.flags.set_af(false);
-            if matches!(kind, Fucomip | Fcomip) {
-                pop(cpu);
-            }
-        }
-        // `ficom m16int` / `ficom m32int` and their popping forms.
-        //
-        // Unlike `fcomi`, these report through the status-word condition codes.
-        // SDM Vol 2A Table 3-28:
-        //
-        // | condition      | C3 | C2 | C0 |
-        // |----------------|----|----|----|
-        // | ST(0) > SRC    |  0 |  0 |  0 |
-        // | ST(0) < SRC    |  0 |  0 |  1 |
-        // | ST(0) = SRC    |  1 |  0 |  0 |
-        // | Unordered      |  1 |  1 |  1 |
-        //
-        // with C1 set to 0. This is an ORDERED compare: "#IA — One or both operands are
-        // NaN values or have unsupported formats", so a QUIET NaN raises invalid here
-        // where `fucom` would stay silent. The integer source cannot be a NaN, so only
-        // ST(0) can make it unordered.
-        FicomI16 | FicomI32 | FicompI16 | FicompI32 => {
-            let width = if matches!(kind, FicomI16 | FicompI16) {
-                2
-            } else {
-                4
-            };
-            let Some(b) = read_n(mem, addr, width) else {
-                return Some((mem.fault_addr(addr), false));
-            };
-            let m = if width == 2 {
-                F80::from_i64(i16::from_le_bytes(b[0..2].try_into().unwrap()) as i64)
-            } else {
-                F80::from_i64(i32::from_le_bytes(b[0..4].try_into().unwrap()) as i64)
-            };
-            let a = operand!(cpu, 0);
-            // `F80::compare` already returns exactly this triple. It is written as
-            // `(zf, pf, cf)` for `fcomi` because the architectural mapping IS
-            // ZF <- C3, PF <- C2, CF <- C0 (SDM Vol 1 §8.1.4, Figure 8-5) — the same
-            // three bits under two names, so there is one comparison rule and not two.
-            let (c3, c2, c0) = F80::compare(a, m);
-            // Unordered is the all-ones case, and for an ORDERED compare it is #IA. The
-            // integer source cannot be a NaN, so only ST(0) reaches it.
-            if c3 && c2 && c0 && raise(cpu, Exc::IE) {
-                return None;
-            }
-            set_codes(cpu, c3, c2, c0);
-            if matches!(kind, FicompI16 | FicompI32) {
-                pop(cpu);
-            }
         }
         Fabs => {
             let v = operand!(cpu, 0).abs();

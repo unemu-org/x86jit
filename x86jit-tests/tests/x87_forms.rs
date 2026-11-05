@@ -1020,7 +1020,10 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
         );
         assert_eq!(env(&observed).0 & EXCEPTIONS, expected | 0x8080);
         if comparison {
-            assert_eq!(env(&observed).0 & CODES, C0 | C2);
+            assert_eq!(
+                env(&observed).0 & CODES,
+                if unmask == 2 { 0 } else { C0 | C2 }
+            );
         }
         if let Some(result) = result {
             assert_eq!(observed.cpu.st[0], result);
@@ -1058,7 +1061,11 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
             let sw = u16::from_le_bytes([data[80], data[81]]);
             assert_eq!(sw & EXCEPTIONS, expected | 0x8080, "op={op:02x?}");
             if comparison {
-                assert_eq!(sw & CODES, C0 | C2, "op={op:02x?}");
+                assert_eq!(
+                    sw & CODES,
+                    if unmask == 2 { 0 } else { C0 | C2 },
+                    "op={op:02x?}"
+                );
             }
             if let Some(result) = result {
                 assert_eq!(out.cpu.st[0], result);
@@ -1078,4 +1085,152 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
             );
         }
     }
+}
+
+// SDM Vol 2A §3.2 FCOM/FUCOM/FICOM/FTST/FCOMI/FUCOMI, Operation:
+// the relation CASE is unconditional; only invalid operands gate it on IM.
+// Vol 1 §8.5.2 retains TOP and source operands on an unmasked #D, and §8.6
+// defers #MF. AMD APM Vol 5 §FCOMx/§FUCOMx/§FICOMx/§FTST/§FCOMIx/§FUCOMIx,
+// x87 Condition Code and rFLAGS Affected tables, give the same relation bits.
+fn check_unmasked_denormal_compares(jit: bool) {
+    let mut cases = Vec::new();
+    for op in [
+        [0xd8, 0xd1],
+        [0xd8, 0xd9],
+        [0xde, 0xd9], // FCOM/FCOMP/FCOMPP
+        [0xdd, 0xe1],
+        [0xdd, 0xe9],
+        [0xda, 0xe9], // FUCOM/FUCOMP/FUCOMPP
+        [0xdb, 0xf1],
+        [0xdf, 0xf1], // FCOMI/FCOMIP
+        [0xdb, 0xe9],
+        [0xdf, 0xe9], // FUCOMI/FUCOMIP
+    ] {
+        for (a, b, codes) in [
+            (number(1), enc(1, 0), 0),
+            (enc(1, 0), number(1), C0),
+            (enc(1, 0), enc(1, 0), C3),
+        ] {
+            cases.push((op.to_vec(), a, Some(b), codes, false));
+        }
+    }
+    for (a, codes) in [(enc(1, 0), 0), (enc(1, 0x8000), C0)] {
+        cases.push((vec![0xd9, 0xe4], a, None, codes, false)); // FTST
+        for byte in [0xda, 0xde, 0xd8, 0xdc] {
+            for modrm in [0x14, 0x1c] {
+                // FICOM/FICOMP and FCOM/FCOMP memory
+                let mut op = vec![byte, modrm, 0x25];
+                op.extend_from_slice(&((DATA + 32) as u32).to_le_bytes());
+                if matches!(byte, 0xd8 | 0xdc) && codes == 0 {
+                    cases.push((op.clone(), number(1), None, 0, true));
+                }
+                cases.push((op, a, None, codes, false));
+            }
+        }
+    }
+    for (op, a, b, codes, denormal_memory) in cases {
+        let integer_flags = matches!(op[..2], [0xdb | 0xdf, 0xe9 | 0xf1]);
+        let top = if b.is_some() { 6 } else { 7 };
+        let mut p = input(&op, Some(a), b, 0x037d, 0x45, 64);
+        if denormal_memory {
+            p.mem_init[1].bytes[32..40].copy_from_slice(&1u64.to_le_bytes());
+        }
+        seed_codes(&mut p, top, C0 | C1 | C2);
+        let run = |p: &VectorInput| {
+            let backend: Box<dyn x86jit_core::Backend> = if jit {
+                Box::new(x86jit_cranelift::JitBackend::new())
+            } else {
+                Box::new(InterpreterBackend)
+            };
+            x86jit_tests::oracle::run_with_backend(p, backend)
+        };
+        let verify = |out: &RunOutcome| {
+            assert_eq!(out.exit, ExitKind::Hlt, "op={op:02x?}");
+            let (sw, tw) = env(out);
+            assert_eq!(sw & EXCEPTIONS, 0x8082, "op={op:02x?}");
+            assert_eq!(sw & 0x3800, top << 11, "op={op:02x?}");
+            assert_eq!(
+                sw & CODES,
+                if integer_flags { C0 | C2 } else { codes },
+                "op={op:02x?}"
+            );
+            assert_eq!(out.cpu.st[0], a, "op={op:02x?}");
+            if let Some(b) = b {
+                assert_eq!(out.cpu.st[1], b, "op={op:02x?}");
+            }
+            // No pop may mark either input empty (SDM Vol 1 §8.5.2).
+            assert_ne!((tw >> (2 * top)) & 3, 3, "op={op:02x?}");
+            if b.is_some() {
+                assert_ne!((tw >> (2 * (top + 1))) & 3, 3, "op={op:02x?}");
+            }
+            if integer_flags {
+                assert_eq!(
+                    (out.cpu.flags.zf, out.cpu.flags.pf, out.cpu.flags.cf),
+                    (codes & C3 != 0, false, codes & C0 != 0),
+                    "op={op:02x?}"
+                );
+            }
+        };
+        verify(&run(&p));
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if !jit {
+            verify(&x86jit_tests::native::run_native(&p).expect("native unmasked #D compare"));
+        }
+
+        let code = &mut p.mem_init[0].bytes;
+        let mut decoder = iced_x86::Decoder::with_ip(64, code, CODE, 0);
+        let end = decoder
+            .iter()
+            .filter(|i| i.mnemonic() == iced_x86::Mnemonic::Fnstenv)
+            .last()
+            .unwrap()
+            .ip();
+        code.truncate((end - CODE) as usize);
+        let mut tail = CodeAssembler::new(64).unwrap();
+        tail.fnstsw(word_ptr(DATA + 80)).unwrap();
+        let marker = end + tail.assemble(end).unwrap().len() as u64;
+        tail.wait().unwrap();
+        tail.hlt().unwrap();
+        code.extend(tail.assemble(end).unwrap());
+        let out = run(&p);
+        assert_eq!(
+            out.exit,
+            ExitKind::Exception {
+                addr: marker,
+                vector: 16
+            },
+            "op={op:02x?}"
+        );
+        assert_eq!(out.cpu.rip, marker);
+        assert_eq!(out.cpu.fpu_top as u16, top, "op={op:02x?}");
+        assert_eq!(out.cpu.st[0], a, "op={op:02x?}");
+        if let Some(b) = b {
+            assert_eq!(out.cpu.st[1], b, "op={op:02x?}");
+        }
+        let data = &out.mem.iter().find(|m| m.addr == DATA).unwrap().bytes;
+        let sw = u16::from_le_bytes([data[80], data[81]]);
+        assert_eq!(sw & EXCEPTIONS, 0x8082, "op={op:02x?}");
+        assert_eq!(
+            sw & CODES,
+            if integer_flags { C0 | C2 } else { codes },
+            "op={op:02x?}"
+        );
+        if integer_flags {
+            assert_eq!(
+                (out.cpu.flags.zf, out.cpu.flags.pf, out.cpu.flags.cf),
+                (codes & C3 != 0, false, codes & C0 != 0),
+                "op={op:02x?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn x87_compare_unmasked_denormal_interp() {
+    check_unmasked_denormal_compares(false);
+}
+
+#[test]
+fn x87_compare_unmasked_denormal_jit() {
+    check_unmasked_denormal_compares(true);
 }
