@@ -125,7 +125,8 @@ Long64 data references enforce 48-bit canonical addressing: a non-canonical SS
 reference raises `Exit::Exception` vector 12, other references vector 13. Required
 SIMD and FXSAVE/FXRSTOR operand alignment raises vector 13 before any state commits;
 error code zero is implied. Legacy SSE follows the Intel alignment rule. AMD's
-optional MXCSR.MM relaxation is not modeled (MXCSR itself is not modeled).
+optional MXCSR.MM relaxation is not modeled. MXCSR storage and round trips are
+modeled; its arithmetic effects remain deferred.
 Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
 
 **Known gaps** (deliberately absent or partial today):
@@ -162,7 +163,7 @@ Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
 - Signals and fork/exec *after* a process spawns threads are not fully modeled (single-threaded fork/exec works; the threaded case returns a defined error rather than guessing).
 - OS emulation (syscalls, devices, loaders) is the embedder's job, not the core's — see [`unemulinux`](https://github.com/unemu-org/unemulinux) for a Linux userland built on this library.
 - **`Prot` is advisory — nothing enforces it.** A guest store into a region mapped `R` or `RX` succeeds and changes the bytes, on both backends; the engine models no permission fault (`TASK-330`). Map read-only expecting a trap and you get silent corruption instead.
-- **MXCSR governs nothing** on the SSE side — `stmxcsr` returns the reset value, `ldmxcsr` is a no-op, and no SSE floating-point exception is raised or reported (`deferred.md`). The x87 half is modelled: all six status-word flags, the stack-fault flag with C1, the condition codes, and `#MF` delivery, each validated against a real CPU.
+- **MXCSR is stored, not yet applied to arithmetic** — `ldmxcsr`/`stmxcsr` (including VEX forms) and `fxsave`/`fxrstor` round-trip per-vCPU state. Embedders can read/write it with `Vcpu::mxcsr`/`set_mxcsr` and seed new vCPUs with `Vm::new_vcpu_with_mxcsr`, including `0x9fc0`. RC/FTZ/DAZ and arithmetic sticky exception flags remain deferred to xj-pi7.2 (`deferred.md`). The x87 half is modelled: all six status-word flags, the stack-fault flag with C1, the condition codes, and `#MF` delivery, each validated against a real CPU.
 - **The x87 store and convert paths have known defects**, each measured against a real
   CPU: `fist`/`fistp` store 0 rather than the integer indefinite when the value does not
   fit, and raise no `IE` (`TASK-339`); `fst`/`fstp` to `m32`/`m64` ignore rounding

@@ -281,6 +281,7 @@ pub struct CpuOffsets {
     pub ymm_hi: i32,
     pub zmm_hi: i32,
     pub kmask: i32,
+    pub mxcsr: i32,
 }
 
 impl CpuOffsets {
@@ -332,6 +333,7 @@ pub fn cpu_offsets() -> CpuOffsets {
         ymm_hi: off(s.ymm_hi.as_ptr() as *const u8),
         zmm_hi: off(s.zmm_hi.as_ptr() as *const u8),
         kmask: off(s.kmask.as_ptr() as *const u8),
+        mxcsr: off(&s.mxcsr as *const u32 as *const u8),
     }
 }
 
@@ -490,6 +492,33 @@ pub unsafe fn run_compiled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mxcsr_is_appended_and_existing_cpu_offsets_are_unchanged() {
+        let o = cpu_offsets();
+        assert_eq!(o.gpr, 0);
+        assert_eq!(o.rip, 128);
+        assert_eq!(o.fs_base, 136);
+        assert_eq!(o.gs_base, 144);
+        assert_eq!(o.cf, 152);
+        assert_eq!(o.pf_src, 153);
+        assert_eq!(o.af_src, 154);
+        assert_eq!(o.zf, 155);
+        assert_eq!(o.sf, 156);
+        assert_eq!(o.of, 157);
+        assert_eq!(o.df, 158);
+        assert_eq!(o.xmm, 160);
+        assert_eq!(o.ymm_hi, 672);
+        assert_eq!(o.zmm_hi, 1184);
+        assert_eq!(o.kmask, 2208);
+        let s = CpuState::new();
+        let base = &s as *const CpuState as usize;
+        assert_eq!(o.mxcsr as usize, &s.mxcsr as *const u32 as usize - base);
+        assert!(o.mxcsr as usize >= &s.gs as *const u16 as usize - base + 2);
+        // SDM Vol 1 §11.6.4, Table 11-2; §11.6.6: our DAZ-capable mask.
+        assert_eq!(s.mxcsr, 0x1f80);
+        assert_eq!(crate::state::MXCSR_MASK, 0xffff);
+    }
 
     /// The real-mode IF flag (§17.6, sub-seam b) must sit in the pad byte at offset 159
     /// so `xmm` stays 16-byte-aligned at 160 and every `CpuOffsets` value is unchanged.

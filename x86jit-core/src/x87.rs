@@ -261,7 +261,7 @@ impl RawFpMem {
         cpu: &mut CpuState,
         addr: u64,
         restore: bool,
-    ) -> Option<(u64, bool)> {
+    ) -> Option<FpStateFault> {
         if self.recover_host_faults {
             fxstate_routed(cpu, self, addr, restore)
         } else {
@@ -302,7 +302,7 @@ fn fxstate_routed(
     raw: &RawFpMem,
     addr: u64,
     restore: bool,
-) -> Option<(u64, bool)> {
+) -> Option<FpStateFault> {
     exec_fxstate(cpu, FpAccess::<true>::new(raw), addr, restore)
 }
 
@@ -551,28 +551,40 @@ fn set_st(cpu: &mut CpuState, i: u8, v: F80) {
 
 // --- raw guest memory access (bounds-checked; matches the string helper) ---
 
-/// fxsave/fxrstor (§14): save or restore the 512-byte legacy FP/SSE area at `addr`.
-/// Returns `Some((fault_addr, is_write))` on a bounds fault, `None` on success.
-///
-/// Fidelity: XMM0-15 (offset 160) and FCW (offset 0) round-trip exactly. MXCSR
-/// (offset 24) is written as the default `0x1f80` and ignored on restore (vector
-/// rounding control is not modeled). x87 ST0-7 (offset 32, 80-bit slots) copy the raw
-/// `fpr[]` bytes verbatim — exact for the glibc dynamic loader, which fxsaves to
-/// preserve XMM across `_dl_runtime_resolve` and never touches x87.
-///
-/// # Safety
-/// As [`exec_x87`]: `base`/`size` describe the live guest buffer.
+/// Failure of a legacy FP/SSE image transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpStateFault {
+    Memory {
+        addr: u64,
+        write: bool,
+    },
+    /// Reserved MXCSR bits (SDM Vol 1 §10.2.3; Vol 2A §3.3 FXRSTOR).
+    GeneralProtection,
+}
+
+/// fxsave/fxrstor (§14): transfer the 512-byte legacy FP/SSE area at `addr`.
+/// XMM, x87 and MXCSR round-trip. MXCSR is stored but does not yet govern
+/// arithmetic. Reserved bits fault before any CPU state is restored
+/// (SDM Vol 2A §3.3 FXRSTOR, 64-Bit Mode Exceptions).
 pub fn exec_fxstate<M: FpMem>(
     cpu: &mut CpuState,
     mem: &M,
     addr: u64,
     restore: bool,
-) -> Option<(u64, bool)> {
+) -> Option<FpStateFault> {
     if restore {
         let mut buf = [0u8; 512];
         if !mem.load(addr, &mut buf) {
-            return Some((mem.fault_addr(addr), false));
+            return Some(FpStateFault::Memory {
+                addr: mem.fault_addr(addr),
+                write: false,
+            });
         }
+        let mxcsr = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        if mxcsr & !crate::state::MXCSR_MASK != 0 {
+            return Some(FpStateFault::GeneralProtection);
+        }
+        cpu.mxcsr = mxcsr;
         cpu.fpu_cw = normalize_cw(u16::from_le_bytes([buf[0], buf[1]]));
         let sw = u16::from_le_bytes([buf[2], buf[3]]);
         cpu.fpu_top = ((sw >> 11) & 7) as u32;
@@ -601,9 +613,10 @@ pub fn exec_fxstate<M: FpMem>(
         // Abridged FTW, physical-register indexed — see the restore path for the
         // measurement.
         buf[4] = !cpu.fpu_empty;
-        buf[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // MXCSR default
-        buf[28..32].copy_from_slice(&0xffffu32.to_le_bytes()); // MXCSR_MASK
-                                                               // ST slots are top-relative: slot j holds ST(j) = `fpr[(top + j) & 7]`.
+        // SDM Vol 2A §3.3 FXSAVE, Tables 3-48/3-49: MXCSR at 24, mask at 28.
+        buf[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
+        buf[28..32].copy_from_slice(&crate::state::MXCSR_MASK.to_le_bytes());
+        // ST slots are top-relative: slot j holds ST(j) = `fpr[(top + j) & 7]`.
         for j in 0..8u32 {
             let off = 32 + j as usize * 16;
             buf[off..off + 10].copy_from_slice(&cpu.fpr[((cpu.fpu_top + j) & 7) as usize]);
@@ -613,7 +626,10 @@ pub fn exec_fxstate<M: FpMem>(
             buf[off..off + 16].copy_from_slice(&cpu.xmm[i].to_le_bytes());
         }
         if !mem.store(addr, &buf) {
-            return Some((mem.fault_addr(addr), true));
+            return Some(FpStateFault::Memory {
+                addr: mem.fault_addr(addr),
+                write: true,
+            });
         }
     }
     None
@@ -767,8 +783,8 @@ fn status_word(cpu: &CpuState) -> u16 {
 /// loaded status word, which on hardware raises `#MF` on the next FP instruction. Here ES
 /// is recomputed only when something new is raised (see [`raise`]), so a newly-unmasked
 /// pending flag does not by itself trap; the next raise does see the new masks. The SSE
-/// half of the same `fenv_t` is a wider fiction: MXCSR is unmodeled — `ldmxcsr` is a
-/// no-op and `stmxcsr` a constant `0x1F80`.
+/// half of the same `fenv_t` uses LDMXCSR/STMXCSR: MXCSR is stored and round-trips,
+/// but does not yet govern arithmetic.
 ///
 /// `fnsave`/`frstor` stay unlifted. They move the eight data registers, and their image
 /// holds those in *stack* order `ST(0)..ST(7)` while `fpr[]` is indexed physically and

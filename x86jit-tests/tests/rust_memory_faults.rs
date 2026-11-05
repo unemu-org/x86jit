@@ -126,6 +126,7 @@ fn same_cpu(a: &CpuState, b: &CpuState) {
     assert_eq!(a.fpu_sw, b.fpu_sw);
     assert_eq!(a.fpu_cw, b.fpu_cw);
     assert_eq!(a.fpu_empty, b.fpu_empty);
+    assert_eq!(a.mxcsr, b.mxcsr);
 }
 fn transfer_case(kind: &str, tier: u8, straddle: bool, readonly: bool) {
     transfer_mode_case(kind, tier, straddle, readonly, true);
@@ -198,6 +199,11 @@ fn transfer_mode_case(kind: &str, tier: u8, straddle: bool, readonly: bool, rout
     for v in [&vm, &reference] {
         v.write_bytes(code_addr, &code).unwrap();
         v.write_bytes(guard - 512, &[0x53; 1024]).unwrap();
+        if kind == "fxrstor" {
+            // SDM Vol 2A §3.3 FXSAVE, Table 3-48: MXCSR at offset 24.
+            // Reserved bits must be clear (Vol 1 §10.2.3).
+            v.write_bytes(addr + 24, &0x9fc0u32.to_le_bytes()).unwrap();
+        }
     }
     if matches!(kind, "rep" | "rep_store") {
         for v in [&vm, &reference] {

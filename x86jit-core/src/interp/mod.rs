@@ -581,6 +581,18 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool>(
                     return classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
+            IrOp::GetMxcsr { dst } => temps[*dst as usize] = cpu.mxcsr as u64,
+            IrOp::SetMxcsr { src } => {
+                let mxcsr = read_val(*src, temps) as u32;
+                if mxcsr & !crate::state::MXCSR_MASK != 0 {
+                    cpu.rip = *cur_addr;
+                    return StepResult::Exit(Exit::Exception {
+                        addr: *cur_addr,
+                        vector: 13,
+                    });
+                }
+                cpu.mxcsr = mxcsr;
+            }
             IrOp::FxState {
                 fault,
                 addr,

@@ -370,10 +370,19 @@ pub enum IrOp {
         sti: u8,
     },
 
-    // fxsave/fxrstor (§14): save/restore the 512-byte legacy FP/SSE state at the
-    // effective address. `restore` = fxrstor. XMM + FCW round-trip faithfully; MXCSR
-    // is the default (not modeled), x87 via the f64-backed converters. Executed by
-    // the shared `exec_fxstate` in both backends; may trap on the memory access.
+    // Architectural MXCSR storage (SDM Vol 1 §10.2.3). Memory accesses remain
+    // ordinary Load/Store ops. SetMxcsr faults on reserved bits before committing.
+    // The stored mode does not yet govern arithmetic.
+    GetMxcsr {
+        dst: Temp,
+    },
+    SetMxcsr {
+        src: Val,
+    },
+
+    // fxsave/fxrstor (§14): the 512-byte legacy FP/SSE image, including MXCSR.
+    // MXCSR is stored and round-tripped but does not yet govern arithmetic.
+    // Shared exec_fxstate may fault on memory or reserved MXCSR bits.
     FxState {
         fault: MemoryAccess,
         addr: Val,

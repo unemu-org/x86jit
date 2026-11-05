@@ -363,7 +363,7 @@ unsafe extern "C" fn x87_helper(
 
 /// fxsave/fxrstor helper: runs the 512-byte save/restore via the shared
 /// `exec_fxstate`. On a memory fault it sets RIP + fault fields and returns
-/// `RET_UNMAPPED`.
+/// `RET_UNMAPPED`; reserved MXCSR bits return `RET_EXCEPTION` (#GP).
 ///
 /// # Safety
 /// `cpu`/`mem` are valid for the call; `mem` is a `*mut MemCtx`.
@@ -374,7 +374,7 @@ unsafe extern "C" fn fxstate_helper(
     restore: u64,
     cur_addr: u64,
 ) -> u64 {
-    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::x87::RawFpMem {
@@ -395,10 +395,15 @@ unsafe extern "C" fn fxstate_helper(
             }
             RET_CONTINUE
         }
-        Some((fault, write)) => {
+        Some(x86jit_core::x87::FpStateFault::Memory { addr: fault, write }) => {
             ctx.record_helper_fault(fault, 512, write, addr, 512);
             cpu.rip = cur_addr;
             RET_UNMAPPED
+        }
+        Some(x86jit_core::x87::FpStateFault::GeneralProtection) => {
+            cpu.rip = cur_addr;
+            ctx.exception_vector = 13;
+            RET_EXCEPTION
         }
     }
 }

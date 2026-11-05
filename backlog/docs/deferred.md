@@ -174,10 +174,9 @@ workload enters the corpus for another reason and can double as an end-to-end ch
 
 ### MXCSR and vector FP flag semantics
 
-- **Why deferred:** the SSE/AVX control-and-status register is modelled as storage, not as something that governs arithmetic — rounding control does not reach vector operations and the exception flags are not raised. `ldmxcsr` is a no-op and `stmxcsr` writes the reset value `0x1F80`. No program has demanded it: convert-to-int saturates, and the integer-indefinite result is deferred with it (testing.md §10).
-- **What is nonetheless measured (task-325):** the native oracle *captures* the real MXCSR out of the signal frame's FXSAVE area, and the comparator compares its **control** half (rounding control, the exception masks, FTZ/DAZ — everything but bits 5:0). So a guest that changes the control half and reaches the native leg now shows up as a divergence instead of being invisible. The six **sticky exception flags** are captured and printed in a divergence report but not compared: hardware sets PE on any inexact result, so comparing them would report *this* deferral on nearly every FP snippet rather than reporting instruction defects.
-- **Revisit when:** a guest sets a non-default rounding mode and reads the result, or inspects the exception flags. The x87 side has since diverged: **rounding and precision control now reach x87 arithmetic** (task-324), so `fldcw` works there; what x87 still lacks is *raising* an exception, which is its own entry below.
-- **Tracked in:** was task-82, closed into this entry; the oracle side is task-325.
+- **Stored, not yet applied:** MXCSR is architectural per-vCPU state. `ldmxcsr`/`stmxcsr` and their VEX forms round-trip its complete value, as do `fxsave`/`fxrstor` at image offset 24. Reserved bits fault before state commits. Embedders can save/restore the value and seed new vCPUs, including `0x9fc0`. RC, FTZ and DAZ do not yet govern SSE/AVX arithmetic, and arithmetic does not set sticky exception flags; guest-written flags are carried verbatim.
+- **What is measured:** the engine, native and Unicorn snapshots seed and capture MXCSR. The general comparator compares the control half (bits 31:6); arithmetic can change the native sticky exception flags, so those remain excluded there. Storage witnesses compare all 32 bits explicitly.
+- **Tracked in:** storage is xj-pi7.1; arithmetic mode and exception semantics remain in xj-pi7.2. Earlier deferral: task-82; oracle capture: task-325.
 
 ### x87 FP exceptions — NOT deferred, tracked
 

@@ -643,6 +643,19 @@ impl Vm {
         self.new_vcpu_with_cpuid_overrides(crate::features::CpuidOverrides::default())
     }
 
+    /// Create a vCPU with an embedder-selected initial guest MXCSR, for example
+    /// `0x9fc0` to preserve FTZ and DAZ across a thread's initial state.
+    /// The ordinary constructor uses the reset value `0x1f80` (SDM Vol 1 §11.6.4).
+    /// Mode bits are stored but do not yet govern SIMD arithmetic.
+    ///
+    /// # Panics
+    /// Panics if any reserved bit (31:16) is set; see [`Vcpu::set_mxcsr`].
+    pub fn new_vcpu_with_mxcsr(&self, mxcsr: u32) -> Vcpu {
+        let mut cpu = self.new_vcpu();
+        cpu.set_mxcsr(mxcsr);
+        cpu
+    }
+
     /// Create a vCPU with its logical-processor and runtime CPUID fields.
     /// Overrides are owned by `CpuState`, so cloning state preserves them.
     pub fn new_vcpu_with_cpuid_overrides(
@@ -1014,6 +1027,24 @@ impl Vcpu {
 
     pub fn set_fpu_cw(&mut self, cw: u16) {
         self.cpu.fpu_cw = cw;
+    }
+
+    /// Guest SSE control/status register, including the stored sticky flags
+    /// (SDM Vol 1 §10.2.3). Round-trips through LDMXCSR/STMXCSR and FXSAVE/FXRSTOR;
+    /// RC/FTZ/DAZ are not yet applied to arithmetic and arithmetic does not set flags.
+    pub fn mxcsr(&self) -> u32 {
+        self.cpu.mxcsr
+    }
+
+    /// Replace guest MXCSR between runs, for example when restoring thread state.
+    /// This does not change host floating-point control state.
+    ///
+    /// # Panics
+    /// Panics without changing MXCSR if any reserved bit (31:16) is set
+    /// (SDM Vol 1 §§10.2.3, 11.6.6). Guest instructions report #GP instead.
+    pub fn set_mxcsr(&mut self, mxcsr: u32) {
+        assert_eq!(mxcsr & !crate::state::MXCSR_MASK, 0, "reserved MXCSR bits");
+        self.cpu.mxcsr = mxcsr;
     }
 
     /// Deliver an MMIO read result after `Exit::MmioRead`, then resume (§5.2). The

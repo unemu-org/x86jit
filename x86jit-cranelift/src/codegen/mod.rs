@@ -1017,6 +1017,33 @@ impl Translator<'_, '_> {
             IrOp::X87 {
                 kind, addr, sti, ..
             } => self.emit_x87(kind, addr, sti),
+            IrOp::GetMxcsr { dst } => {
+                let value = self.builder.ins().load(
+                    types::I32,
+                    MemFlags::trusted(),
+                    self.cpu,
+                    self.offsets.mxcsr,
+                );
+                let value = self.builder.ins().uextend(types::I64, value);
+                self.set(*dst, value);
+                false
+            }
+            IrOp::SetMxcsr { src } => {
+                let value = self.val(*src);
+                let reserved = self
+                    .builder
+                    .ins()
+                    .band_imm(value, !i64::from(x86jit_core::state::MXCSR_MASK));
+                let invalid = self.builder.ins().icmp_imm(IntCC::NotEqual, reserved, 0);
+                let ok = self.begin_trap_fork(invalid);
+                self.emit_trap(&13, &0);
+                self.builder.switch_to_block(ok);
+                let value = self.builder.ins().ireduce(types::I32, value);
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, self.cpu, self.offsets.mxcsr);
+                false
+            }
             IrOp::FxState { addr, restore, .. } => self.emit_fx_state(addr, restore),
             IrOp::Popcnt { dst, src, size, .. } => self.emit_popcnt(dst, src, size),
             IrOp::Crc32 {

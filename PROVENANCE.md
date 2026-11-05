@@ -121,11 +121,13 @@ plausible-looking wrong answer:
   says otherwise — `fld qword` of a denormal, alone in a program, leaves the status word
   at `0x3802`. `fld m32/m64` *converts*, and the conversion is what meets the denormal.
   The manual was not wrong; the reading was, and only the oracle could say so.
-- **MXCSR** is not modelled as behaviour: `stmxcsr` stores the reset value `0x1F80` and
-  `ldmxcsr` is a no-op. It *is* measured — the native oracle captures the real register
-  and the comparator compares its control half, so a guest that changes rounding control
-  and reaches that leg is reported rather than silently accommodated. The six sticky
-  exception flags are captured but not compared; `deferred.md` says why.
+- **MXCSR** is stored as per-vCPU state and round-trips through `ldmxcsr`/`stmxcsr`
+  (including VEX forms) and `fxsave`/`fxrstor`. Reserved bits fault before state commits
+  (SDM Vol 1 §§10.2.3, 11.6.6; Vol 2A §3.3 LDMXCSR/FXRSTOR). The reset value is
+  `0x1F80` (§11.6.4, Table 11-2). RC/FTZ/DAZ are stored, not yet applied to arithmetic,
+  and arithmetic does not set sticky exception flags (xj-pi7.2). Oracles seed and capture
+  the real register; the general comparator excludes the six sticky flags, while storage
+  witnesses assert the complete value.
 
 ## 4. What we did not copy
 

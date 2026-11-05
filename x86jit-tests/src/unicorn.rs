@@ -244,6 +244,7 @@ fn load_regs(uc: &mut Unicorn<()>, snap: &CpuSnapshot, entry: u64, bits32: bool)
     for (reg, bytes) in ST_REGS.iter().zip(&snap.st) {
         uc.reg_write_long(*reg, bytes).unwrap();
     }
+    // Seed guest-written status bits as well as the control half (SDM Vol 1 §10.2.3).
     uc.reg_write(RegisterX86::MXCSR, snap.mxcsr as u64).unwrap();
 }
 

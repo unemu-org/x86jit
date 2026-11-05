@@ -11,7 +11,7 @@ use x86jit_core::{
     MemoryModel, PortDir, Prot, Reg, Vm, VmConfig,
 };
 
-use crate::vector::{Access, CpuSnapshot, ExitKind, MemChunk, RunSpec, MXCSR_RESET, VREGS};
+use crate::vector::{Access, CpuSnapshot, ExitKind, MemChunk, RunSpec, VREGS};
 
 /// Everything needed to execute, without the expectations.
 #[derive(Clone, Debug)]
@@ -201,6 +201,7 @@ fn load_snapshot(cpu: &mut x86jit_core::Vcpu, snap: &CpuSnapshot, entry: u64) {
     // (hardware-reset) value, then load the stack in architectural order — `st[i]`
     // is `ST(i)`, which lives at physical `fpr[(top + i) & 7]`.
     cpu.set_fpu_cw(snap.fpu_cw);
+    cpu.set_mxcsr(snap.mxcsr);
     cpu.set_fpu_top(snap.fpu_top as u32);
     let top = snap.fpu_top as u32;
     for (i, bytes) in snap.st.iter().enumerate() {
@@ -251,12 +252,7 @@ fn store_snapshot(cpu: &x86jit_core::Vcpu) -> CpuSnapshot {
         st,
         fpu_cw: cpu.fpu_cw(),
         fpu_top: (top & 7) as u8,
-        // The engine does not keep an MXCSR: `ldmxcsr` is a no-op and `stmxcsr` writes
-        // the reset value (`lift/mod.rs`, deferred.md "MXCSR and vector FP flag
-        // semantics"). Reporting that constant is what the model actually claims, so a
-        // guest that changes MXCSR and reaches the native oracle now shows up as a
-        // control-half divergence instead of being invisible.
-        mxcsr: MXCSR_RESET,
+        mxcsr: cpu.mxcsr(),
     }
 }
 

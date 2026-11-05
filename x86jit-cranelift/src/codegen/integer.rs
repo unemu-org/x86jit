@@ -362,7 +362,7 @@ impl Translator<'_, '_> {
         let args = [self.cpu, self.mem, a, rc, cur];
         self.flush_gprs(); // helper reads CpuState (XMM/x87)
         let inst = self.call_helper(self.helpers.fxstate, &args);
-        self.trap_if_unmapped(inst);
+        self.trap_if_unmapped_or_exception(inst);
         false
     }
 

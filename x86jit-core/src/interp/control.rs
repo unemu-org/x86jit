@@ -53,14 +53,20 @@ pub(crate) fn exec_fx_state<const ROUTED: bool>(
 ) -> Option<StepResult> {
     let a = read_val(*addr, &*temps);
     // Through `Memory` (RAM check + SMC note_write), like the x87 arm.
-    if let Some((fault, write)) = crate::x87::exec_fxstate(cpu, mem, a, *restore) {
+    if let Some(fault) = crate::x87::exec_fxstate(cpu, mem, a, *restore) {
         cpu.rip = cur_addr;
-        return Some(StepResult::Exit(Exit::UnmappedMemory {
-            addr: fault,
-            access: if write {
-                AccessKind::Write
-            } else {
-                AccessKind::Read
+        return Some(StepResult::Exit(match fault {
+            crate::x87::FpStateFault::Memory { addr, write } => Exit::UnmappedMemory {
+                addr,
+                access: if write {
+                    AccessKind::Write
+                } else {
+                    AccessKind::Read
+                },
+            },
+            crate::x87::FpStateFault::GeneralProtection => Exit::Exception {
+                addr: cur_addr,
+                vector: 13,
             },
         }));
     }

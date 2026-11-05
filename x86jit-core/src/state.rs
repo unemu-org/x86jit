@@ -431,6 +431,11 @@ pub struct CpuState {
     /// Visible FS/GS selectors, independent of the configured linear bases.
     pub fs: u16,
     pub gs: u16,
+    /// Guest SSE control/status image (SDM Vol 1 §10.2.3). Stored and round-tripped;
+    /// arithmetic does not yet apply RC/FTZ/DAZ or set sticky exception flags.
+    /// This is separate from host FPCR/MXCSR saved by the fault landing stub.
+    /// Appended to preserve every existing JIT ABI offset.
+    pub mxcsr: u32,
 }
 
 /// One atomic TSC/TSC_AUX sample (SDM Vol 3B §20.17.2).
@@ -485,8 +490,8 @@ pub enum X87Precision {
     Extended,
 }
 
-/// A reset x87/SSE CPU: every register zero except the control word, which is the
-/// post-`finit` `0x037F` — round to nearest even, 64-bit significand, all six exceptions
+/// A reset x87/SSE CPU: MXCSR is `0x1f80` (SDM Vol 1 §11.6.4, Table 11-2).
+/// The x87 control word is post-`finit` `0x037F` — round to nearest even, 64-bit significand, all six exceptions
 /// masked (SDM Vol 2A FINIT/FNINIT).
 ///
 /// `Default` is written out field by field rather than derived for two reasons: a derived
@@ -541,9 +546,16 @@ impl Default for CpuState {
             rflags_system: 0,
             fs: 0,
             gs: 0,
+            mxcsr: MXCSR_RESET,
         }
     }
 }
+
+/// SDM Vol 1 §11.6.4, Table 11-2: SIMD control/status after power-up or reset.
+pub const MXCSR_RESET: u32 = 0x1f80;
+/// Supported MXCSR bits, reported by FXSAVE (SDM Vol 1 §11.6.6).
+/// DAZ is supported as stored state; bits 31:16 are reserved (§10.2.3).
+pub const MXCSR_MASK: u32 = 0xffff;
 
 /// SDM Vol 1 §3.4.3: defined system bits carried outside the arithmetic flags.
 pub const RFLAGS_SYSTEM_MASK: u64 = 0x3f_7100;

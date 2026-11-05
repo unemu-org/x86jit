@@ -587,6 +587,8 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Fence { .. }
             | Hlt
             | Trap { .. }
+            | GetMxcsr { .. }
+            | SetMxcsr { .. }
             | PortIo { .. } => 0,
         })
         .sum()
@@ -1429,6 +1431,8 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | Mul { .. }
         | Div { .. }
         | FxState { .. }
+        | GetMxcsr { .. }
+        | SetMxcsr { .. }
         | Load { .. }
         | Store { .. }
         | Bt { .. }
@@ -2009,20 +2013,25 @@ pub(crate) fn lift_insn(
             emit_write(ops, tg, dst, Val::Temp(t));
             Ok(false)
         }
-        // MXCSR isn't modeled (default round-to-nearest, exceptions masked):
-        // stmxcsr writes that default; ldmxcsr is ignored.
+        // MXCSR is stored and round-tripped; it does not yet govern arithmetic.
         Stmxcsr | Vstmxcsr => {
             let addr = effective_address(insn, ops, tg)?;
+            let dst = tg.fresh();
+            ops.push(IrOp::GetMxcsr { dst });
             ops.push(IrOp::Store {
                 fault: Default::default(),
                 addr,
-                src: Val::Imm(0x1F80),
+                src: Val::Temp(dst),
                 size: 4,
                 order: MemOrder::None,
             });
             Ok(false)
         }
-        Ldmxcsr | Vldmxcsr => Ok(false),
+        Ldmxcsr | Vldmxcsr => {
+            let src = lower_read(insn, 0, ops, tg)?;
+            ops.push(IrOp::SetMxcsr { src });
+            Ok(false)
+        }
         // fxsave/fxrstor: 512-byte legacy FP/SSE save area. Shared exec_fxstate in
         // both backends. The default CPUID advertises XSAVE but supplies no leaf 0xD
         // sizes; XSAVE/XRSTOR still have no lift. A table exposing those sizes must

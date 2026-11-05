@@ -117,8 +117,8 @@ pub const VREGS: usize = 32;
 
 /// The MXCSR bits this project compares: everything except the six sticky
 /// exception-status flags in bits 5:0 (SDM Vol 1 §10.2.3, Figure 10-3). Those flags
-/// record that a SIMD FP exception *occurred*, which the engine deliberately does not
-/// model — see `deferred.md`, "MXCSR and vector FP flag semantics". The native oracle
+/// record that a SIMD FP exception *occurred*. The engine carries guest-written flags
+/// but does not yet set them through arithmetic — see `deferred.md`, "MXCSR and vector FP flag semantics". The native oracle
 /// captures them anyway (`native.rs`) so a divergence report can show them; masking
 /// them here keeps the compared half honest instead of red for a deferred reason.
 pub const MXCSR_CONTROL_MASK: u32 = !0x3F;

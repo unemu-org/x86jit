@@ -330,11 +330,8 @@ const ALLOWLIST: &[&str] = &[
     // Masked vector moves — differential vmaskmovps_wild_bytes and the native leg.
     "Vmaskmovpd",
     "Vmaskmovps",
-    // MXCSR load/store. NO COVERAGE, and deliberately so: the register is modelled as
-    // storage and does not govern vector arithmetic — rounding control does not reach
-    // the ops and the exception flags are not raised. See deferred.md, "MXCSR and
-    // vector FP flag semantics". Testing these against hardware would fail today, and
-    // it would be failing for the deferred reason rather than for these instructions.
+    // MXCSR storage: tests/mxcsr.rs witnesses legacy/VEX round trips, reserved-bit
+    // faults and the fenv round trip on both backends. Arithmetic mode is deferred.
     "Ldmxcsr",
     "Stmxcsr",
     "Vldmxcsr",
