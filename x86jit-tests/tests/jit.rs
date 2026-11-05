@@ -493,6 +493,72 @@ fn count0_runtime_shift_preserves_flags() {
     one_shift(|a| a.rcr(edx, cl).unwrap());
 }
 
+#[test]
+fn carry_rotate_all_cl_counts() {
+    // SDM Vol 2B §4.3, RCL/RCR/ROL/ROR, Operation: mask CL to 5/6 bits,
+    // reduce byte/word counts modulo 9/17, and rotate the operand together with CF.
+    for size in [1u8, 2, 4, 8] {
+        let width = u32::from(size) * 8;
+        let mask = (1u128 << width) - 1;
+        let ring_mask = (1u128 << (width + 1)) - 1;
+        for left in [false, true] {
+            let mut code = match size {
+                2 => vec![0x66],
+                8 => vec![0x48],
+                _ => vec![],
+            };
+            code.extend([
+                if size == 1 { 0xd2 } else { 0xd3 },
+                if left { 0xd0 } else { 0xd8 },
+                0xf4,
+            ]);
+            for backend in [
+                Box::new(InterpreterBackend) as Box<dyn x86jit_core::Backend>,
+                Box::new(JitBackend::with_opt_level(x86jit_cranelift::OptLevel::None)),
+                Box::new(JitBackend::with_opt_level(
+                    x86jit_cranelift::OptLevel::Speed,
+                )),
+            ] {
+                let mut vm = Vm::with_backend(VmConfig::flat(0x2000), backend);
+                vm.map(CODE, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(CODE, &code).unwrap();
+                for carry in [false, true] {
+                    for count in 0..=255u64 {
+                        let initial = 0x8192_a3b4_c5d6_e7f8u64;
+                        let n = (count as u32 & if size == 8 { 63 } else { 31 }) % (width + 1);
+                        let ring = ((u128::from(initial) & mask) << 1) | u128::from(carry);
+                        let rotated = if n == 0 {
+                            ring
+                        } else if left {
+                            ((ring << n) | (ring >> (width + 1 - n))) & ring_mask
+                        } else {
+                            ((ring >> n) | (ring << (width + 1 - n))) & ring_mask
+                        };
+                        let mut cpu = vm.new_vcpu();
+                        cpu.set_reg(Reg::Rip, CODE);
+                        cpu.set_reg(Reg::Rax, initial);
+                        cpu.set_reg(Reg::Rcx, count);
+                        cpu.set_flags(
+                            x86jit_tests::vector::SnapFlags::from_rflags(0x8d4 | u64::from(carry))
+                                .into(),
+                        );
+                        let flags = cpu.flags();
+                        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                        assert_eq!(
+                            (u128::from(cpu.reg(Reg::Rax)) & mask, cpu.flags().cf),
+                            (rotated >> 1, rotated & 1 != 0),
+                            "size={size}, left={left}, carry={carry}, count={count}"
+                        );
+                        if n == 0 {
+                            assert_eq!(cpu.flags(), flags);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A flag *read* AFTER a possibly-no-op variable-count shift. Here
 /// `cmp` is NOT the block's last flag writer, so plain dead-flag elision would treat the
 /// intervening `shl edx, cl` as a definite CF/SF/ZF/... clobber and drop `cmp`'s flags as

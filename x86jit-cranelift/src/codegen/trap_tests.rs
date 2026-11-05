@@ -181,7 +181,12 @@ fn compile_ir_for_isa(
     let cc = ctx.compiled_code().unwrap();
     let compile_ns = started.elapsed().as_nanos();
     let started = std::time::Instant::now();
-    let sites = crate::collect_guest_traps(cc, &metadata).unwrap();
+    let sites = crate::collect_guest_traps(cc, &metadata).unwrap_or_else(|()| {
+        panic!(
+            "unclassified machine traps: {:?}, bytes={bytes:02x?}",
+            cc.buffer.traps()
+        )
+    });
     if std::env::var_os("X86JIT_TRAP_TEST_TIMINGS").is_some() {
         eprintln!(
         "MEASURED: region={region}: {} code bytes, {} traps, {compile_ns} ns compile, {} record bytes, {} ns collect",
@@ -232,6 +237,35 @@ fn compile_ir_for_isa(
         );
     }
     (ctx, rips, original_accesses.len())
+}
+
+#[test]
+fn shifts_and_rotates_compile_with_guest_traps_on_both_isas() {
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for opt in [OptLevel::None, OptLevel::Speed] {
+            let mut flags = settings::builder();
+            flags.set("opt_level", opt.flag()).unwrap();
+            let isa = cranelift::codegen::isa::lookup(target.parse().unwrap())
+                .unwrap()
+                .finish(settings::Flags::new(flags))
+                .unwrap();
+            for region in [false, true] {
+                for prefix in [&[][..], &[0x66], &[0x48]] {
+                    for opcode in [0xd0, 0xd1, 0xd2, 0xd3, 0xc0, 0xc1] {
+                        for op in [0, 1, 2, 3, 4, 5, 7] {
+                            let mut bytes = prefix.to_vec();
+                            bytes.extend([opcode, 0xc0 | (op << 3)]);
+                            if matches!(opcode, 0xc0 | 0xc1) {
+                                bytes.push(1);
+                            }
+                            bytes.extend([0x48, 0x8b, 0x07, 0xf4]);
+                            compile_for_isa(&bytes, region, &*isa);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

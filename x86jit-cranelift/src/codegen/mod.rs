@@ -2584,8 +2584,24 @@ impl Translator<'_, '_> {
         let cf_in = self.load_flag_u64(self.offsets.cf); // I64, 0 or 1
         let countmask = if size == 8 { 0x3f } else { 0x1f };
         let nmasked = self.builder.ins().band_imm(b, countmask);
-        // Effective count in [0, w]: reduce the masked count mod (width including CF).
-        let n = self.builder.ins().urem_imm(nmasked, w + 1);
+        // SDM Vol 2B §4.3, RCL/RCR/ROL/ROR, Operation: only byte/word
+        // counts need reduction modulo 9/17 after masking to five bits.
+        // Bounded subtraction avoids x64's division trap records even at opt=None;
+        // those records cannot describe a recoverable guest memory access.
+        let reductions: &[i64] = match size {
+            1 => &[18, 9],
+            2 => &[17],
+            _ => &[],
+        };
+        let mut n = nmasked;
+        for &divisor in reductions {
+            let reduce = self
+                .builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, n, divisor);
+            let reduced = self.builder.ins().iadd_imm(n, -divisor);
+            n = self.builder.ins().select(reduce, reduced, n);
+        }
 
         // Loop header carries (v, cf, i); it has two preds (entry + body back-edge), so
         // seal it only after the back-edge is emitted.

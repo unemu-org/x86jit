@@ -6,8 +6,8 @@ use x86jit_tests::compare::compare;
 use x86jit_tests::oracle::{run_with_backend, RunOutcome, VectorInput};
 use x86jit_tests::vector::{CpuSnapshot, ExitKind, MemChunk, MemKind, RunSpec};
 
-const CODE: u64 = 0x1000;
-const DATA: u64 = 0x3000;
+const CODE: u64 = 0x21_0000;
+const DATA: u64 = 0x23_0000;
 
 struct CompiledBackend {
     jit: JitBackend,
@@ -75,6 +75,12 @@ fn input(asm: CodeAssembler, data: Vec<u8>) -> VectorInput {
         entry: CODE,
         run: RunSpec::UntilExit,
     }
+}
+
+#[test]
+fn guest_trap_sites_native_fixture_addresses_are_mappable() {
+    let program = input(CodeAssembler::new(64).unwrap(), vec![0; 128]);
+    assert!(program.mem_init.iter().all(|chunk| chunk.addr >= 0x10000));
 }
 
 fn matrix(input: &VectorInput, native: bool) -> RunOutcome {
@@ -425,8 +431,10 @@ fn guest_trap_sites_descriptor_limit_caps_multiblock_region() {
 
 fn budget_vm(backend: Box<dyn Backend>, code: &[u8]) -> x86jit_core::Vm {
     use x86jit_core::{Prot, RegionKind, Vm, VmConfig};
-    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
-    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+    let span = DATA + 0x10000;
+    let mut vm = Vm::with_backend(VmConfig::flat(span), backend);
+    vm.map(CODE, (span - CODE) as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
     vm.write_bytes(CODE, code).unwrap();
     vm
 }
