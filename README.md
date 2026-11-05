@@ -45,9 +45,9 @@ ever changes.
 
 Actively developed, with a strong oracle for the instructions it *does* implement. A
 hand-written instruction corpus and a fuzzer cross-check the **lifted** instructions three
-ways — interpreter vs JIT, and both against a real CPU (Unicorn + native execution) — on
-both an **x86-64 and an AArch64** CI runner, so the ARM host path is validated, not
-assumed.
+ways — interpreter vs JIT, and both against a real CPU (Unicorn + native execution). The
+suite runs on an **x86-64** CI runner and on an **AArch64** host before every merge that
+touches codegen or host-specific code, so the ARM host path is validated, not assumed.
 
 One limit on that, stated because it is easy to read past. The corpus validates *what's
 lifted*; it does **not** tell you what's missing — that surfaces only when real code hits

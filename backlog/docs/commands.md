@@ -81,8 +81,9 @@ cargo nextest run --release --features unicorn -E 'not binary(fuzz_robustness)'
 cargo nextest run --release -p x86jit-tests -E 'binary(jit) or binary(differential)'
 ```
 
-CI runs the second (narrower) form; the full release run is a local check worth doing
-before a release or after touching the softfloat and codegen paths.
+CI runs a narrower form (the second line plus the corpus, smc, mt and host-fault
+recovery binaries; see `.forgejo/workflows/ci.yml`); the full release run is a local
+check worth doing before a release or after touching the softfloat and codegen paths.
 
 ## AVX/VEX differential fuzz (`cargo xfuzz`)
 
@@ -167,7 +168,18 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 `origin` is the maintainer's private Forgejo; there is no GitHub remote and no `gh` flow. Push only
 to `origin`, only at the maintainer's request.
 
-- **x86-64**: a Forgejo Actions runner.
+- **x86-64**: a Forgejo Actions runner, workflow `.forgejo/workflows/ci.yml`. It is manual
+  only. Push the branch to `origin` first: the run checks out what is on the remote. Then
+  `fj actions dispatch ci.yml <branch-or-tag>`; `fj actions tasks` lists the runs. The
+  job runs the dev shell, the 80286 corpus (`SS286_REQUIRED=1`), fmt, the guest-agnostic
+  guard, clippy, cargo-deny, the workspace nextest without `fuzz_robustness`, a
+  release-profile subset and the Compat32 lane. Once the dev shell is up, every step runs
+  even after an earlier failure. The result is a commit status on the dispatched commit,
+  context `ci / x86_64`. On failure its description lists each failing step with its
+  failing tests or error lines. The forge writes no status of its own for dispatched
+  runs, and `fj` has no status command: read it with
+  `GET /api/v1/repos/<owner>/<repo>/commits/<sha>/status`. The full output is in the job
+  log the status links to.
 - **aarch64**: no CI runner. The gate runs locally on the maintainer's aarch64 macOS host — the
   full `cargo nextest` run, clippy, fmt. Changes to codegen, memory ordering or anything
   host-specific need that run before merge. That host is aarch64-apple-darwin, not Linux:
