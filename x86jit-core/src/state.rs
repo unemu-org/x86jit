@@ -34,12 +34,8 @@ pub enum Reg {
     Rip,
     FsBase,
     GsBase,
-    /// Real-mode segment selectors (§17.6). In real mode a segment's base is
-    /// `selector << 4` (no descriptor tables); these hold the raw 16-bit selector.
-    /// They are read-only from the lift/interp perspective in this sub-seam (no far
-    /// transfers or `mov sreg` writes are lifted yet), and are NOT part of the JIT ABI
-    /// (`jit_abi::CpuOffsets`) — only the interpreter reads them, so no compiled block
-    /// ever field-loads them.
+    /// Segment selectors used by Real16 addressing (§17.6) and configured
+    /// protected-mode selector images. Kept outside `jit_abi::CpuOffsets`.
     Cs,
     Ds,
     Es,
@@ -152,22 +148,9 @@ pub struct Flags {
     pub sf: bool,
     pub of: bool,
     pub df: bool,
-    /// Interrupt-enable flag (RFLAGS bit 9), real-mode only (§17.6). `cli` clears it,
-    /// `sti` sets it, `popf`/`iret` restore it, `int`/exception delivery clears it on
-    /// entry. Placed **after `df`** so it occupies the one pad byte the `#[repr(C)]`
-    /// layout already left between the 7 flag bools (offsets 152..158, `df` at 158) and
-    /// the 16-byte-aligned `xmm` field (offset 160): `if_` lands at the former pad byte
-    /// (offset 159), `xmm` stays at 160, and every `jit_abi::CpuOffsets` value is
-    /// byte-identical. Deliberately NOT in `jit_abi::CpuOffsets` — no compiled block
-    /// reads it (Long64/Compat32 never model IF; only the interpreter's real-mode path
-    /// does).
-    ///
-    /// TF (RFLAGS bit 8, single-step) is deliberately NOT modeled as a field: only one
-    /// pad byte is free, and no consumer exists (single-step trap delivery is out of
-    /// scope). The real-mode FLAGS image ([`to_flags16`](Self::to_flags16)) reads TF back
-    /// as 0, and `int`/exception delivery "clears TF" as a no-op. A guest that set TF via
-    /// `popf` would lose it on the next `pushf`; the differential corpus keeps TF clear so
-    /// this is invisible.
+    /// Interrupt-enable flag (SDM Vol 1 §3.4.3). Real16 CLI/STI and interrupt
+    /// delivery update it; user-mode POPF/IRET obey the configured IOPL. Stored
+    /// after DF to retain the established JIT ABI offsets.
     pub if_: bool,
 }
 
@@ -254,12 +237,10 @@ impl Flags {
     }
 
     /// Assemble the architectural RFLAGS word from the modeled flag fields
-    /// (the low bits + the always-set reserved bit 1). Only the arithmetic /
-    /// direction flags are modeled here (IF/TF/IOPL/… are not — see the `Flags`
-    /// docs), so the value carries exactly: CF(0), reserved(1), PF(2), AF(4),
-    /// ZF(6), SF(7), DF(10), OF(11). Used by `syscall` to latch R11 (the AMD64
-    /// syscall ABI copies RFLAGS into R11). The JIT's `emit_syscall` reproduces
-    /// this bit-for-bit.
+    /// (the low bits + the always-set reserved bit 1). This arithmetic/direction
+    /// image carries CF(0), reserved(1), PF(2), AF(4), ZF(6), SF(7), DF(10), OF(11).
+    /// `CpuState::rflags` adds the system flags for PUSHF and SYSCALL; the JIT's
+    /// `assemble_rflags` reproduces this arithmetic image.
     pub fn to_rflags(&self) -> u64 {
         (self.cf as u64)
             | (1 << 1) // reserved bit, always 1
@@ -277,10 +258,7 @@ impl Flags {
     /// TF (bit 8) is not modeled, so it reads back 0 (see the `Flags` docs). Returned as
     /// a `u16` since real-mode frames are 2 bytes wide.
     ///
-    /// This is a SEPARATE image from [`to_rflags`] on purpose: `to_rflags` feeds the
-    /// AMD64 `syscall` R11 latch (and the native/Unicorn differential's flag-compare
-    /// mask), which must stay bit-for-bit as it was — so IF is added only here, on the
-    /// real-mode path.
+    /// Protected modes use `CpuState::rflags`, which also carries system flags.
     pub fn to_flags16(&self) -> u16 {
         (self.cf as u16)
             | (1 << 1) // reserved bit, always 1
@@ -372,9 +350,9 @@ pub struct CpuState {
     /// every pre-existing `#[repr(C)]` field offset stays byte-identical — the JIT ABI
     /// (`jit_abi::CpuOffsets`) and its offset-assertion tests are untouched. In real
     /// mode a segment's base is `selector << 4`; the interpreter reads these to segment
-    /// data (`with_segment`) and stack (push/pop/call/ret) accesses. Only meaningful in
-    /// `CpuMode::Real16`; Long64/Compat32 never read them. Not in the JIT ABI because
-    /// no compiled block field-loads them in this sub-seam.
+    /// data (`with_segment`) and stack (push/pop/call/ret) accesses. Protected modes
+    /// expose these configured selectors through MOV and validate same-selector
+    /// IRET against CS/SS; descriptor tables are not modeled.
     pub cs: u16,
     pub ds: u16,
     pub es: u16,
@@ -445,6 +423,14 @@ pub struct CpuState {
     pub source_id: u64,
     /// Deterministic fallback stream, copied by CPU-state cloning.
     pub random_state: u64,
+    /// Protected-mode RFLAGS bits outside `Flags`: TF, IOPL, NT, RF, VM, AC,
+    /// VIF, VIP and ID (SDM Vol 1 §3.4.3). The embedder configures IOPL and
+    /// `flags.if_`; execution uses CPL 3. TF is stored without single-step delivery.
+    /// Appended to preserve every existing JIT ABI offset.
+    pub rflags_system: u64,
+    /// Visible FS/GS selectors, independent of the configured linear bases.
+    pub fs: u16,
+    pub gs: u16,
 }
 
 /// One atomic TSC/TSC_AUX sample (SDM Vol 3B §20.17.2).
@@ -552,11 +538,62 @@ impl Default for CpuState {
             cpu_source: None,
             source_id: 0,
             random_state: 0x4d59_5df4_d0f3_3173,
+            rflags_system: 0,
+            fs: 0,
+            gs: 0,
         }
     }
 }
 
+/// SDM Vol 1 §3.4.3: defined system bits carried outside the arithmetic flags.
+pub const RFLAGS_SYSTEM_MASK: u64 = 0x3f_7100;
+/// SDM Vol 2B §4.3 POPF, Table 4-20; Vol 2A §3.2 IRET, Operation:
+/// CPL 3 may write TF/NT, and wide forms also AC/ID (IRET also RF).
+pub const fn user_rflags_mask(size: u8, iret: bool) -> u64 {
+    0x4100
+        | if size > 2 {
+            0x24_0000 | if iret { 0x1_0000 } else { 0 }
+        } else {
+            0
+        }
+}
+
 impl CpuState {
+    /// Full configured user-mode image (SDM Vol 1 §3.4.3).
+    pub fn rflags(&self) -> u64 {
+        self.flags.to_rflags()
+            | ((self.flags.if_ as u64) << 9)
+            | (self.rflags_system & RFLAGS_SYSTEM_MASK)
+    }
+
+    /// CPL 3 POPF/IRET policy; privilege bits come from the old state.
+    /// SDM Vol 2B §4.3 POPF Table 4-20; Vol 2A §3.2 IRET, Operation.
+    pub fn set_user_rflags(&mut self, image: u64, size: u8, iret: bool) {
+        let old_if = self.flags.if_;
+        let can_set_if = self.rflags_system & 0x3000 == 0x3000;
+        self.flags.set_flags16(image as u16);
+        if !can_set_if {
+            self.flags.if_ = old_if;
+        }
+        let mask = user_rflags_mask(size, iret);
+        self.rflags_system = (self.rflags_system & !mask) | (image & mask);
+        if !iret {
+            self.rflags_system &= !(1 << 16);
+        }
+    }
+
+    /// Selector encoding follows the ModRM Sreg field (SDM Vol 2B §4.3 MOV).
+    pub fn selector(&self, segment: u8) -> u16 {
+        match segment {
+            0 => self.es,
+            1 => self.cs,
+            2 => self.ss,
+            3 => self.ds,
+            4 => self.fs,
+            5 => self.gs,
+            _ => unreachable!("segment encoding"),
+        }
+    }
     pub fn new() -> Self {
         Self::default()
     }

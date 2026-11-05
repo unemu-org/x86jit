@@ -19,7 +19,7 @@ created_date: '2026-07-06 11:25'
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 59 | 2% | 0 |
 | optional | 7 | 0 | 0 | 100% | 0 |
-| x86-64-v1 | 566 | 0 | 112 | 83% | 146 |
+| x86-64-v1 | 668 | 0 | 131 | 84% | 240 |
 | x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
 | x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
@@ -33,7 +33,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 57 | 2% | 0 |
 | optional | 5 | 0 | 0 | 100% | 0 |
-| x86-64-v1 | 551 | 0 | 131 | 81% | 232 |
+| x86-64-v1 | 562 | 0 | 124 | 82% | 228 |
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
@@ -101,16 +101,15 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## long64 x86-64-v1 — missing (112)
+## long64 x86-64-v1 — missing (131)
 
 - `Call_m1632`
+- `Call_m1664`
 - `Clac`
-- `Clc`
 - `Clflush_m8`
 - `Clflushopt_m8`
 - `Cli`
 - `Clts`
-- `Cmc`
 - `Cvtpd2pi_mm_xmmm128`
 - `Cvtpi2pd_xmm_mmm64`
 - `Cvtpi2ps_xmm_mmm64`
@@ -119,25 +118,37 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Cvttps2pi_mm_xmmm64`
 - `Invd`
 - `Invlpg_m`
-- `Iretd`
-- `Iretw`
 - `Jmp_m1632`
+- `Jmp_m1664`
 - `Lar_r16_rm16`
 - `Lar_r32_r32m16`
+- `Lar_r64_r64m16`
 - `Lfs_r16_m1616`
 - `Lfs_r32_m1632`
+- `Lfs_r64_m1664`
+- `Lgdt_m1664`
 - `Lgs_r16_m1616`
 - `Lgs_r32_m1632`
+- `Lgs_r64_m1664`
+- `Lidt_m1664`
 - `Lldt_r32m16`
+- `Lldt_r64m16`
 - `Lldt_rm16`
 - `Lmsw_r32m16`
+- `Lmsw_r64m16`
 - `Lmsw_rm16`
 - `Lsl_r16_rm16`
 - `Lsl_r32_r32m16`
+- `Lsl_r64_r64m16`
 - `Lss_r16_m1616`
 - `Lss_r32_m1632`
+- `Lss_r64_m1664`
 - `Ltr_r32m16`
+- `Ltr_r64m16`
 - `Ltr_rm16`
+- `Mov_Sreg_r32m16`
+- `Mov_Sreg_r64m16`
+- `Mov_Sreg_rm16`
 - `Movntq_m64_mm`
 - `Pavgb_mm_mmm64`
 - `Pavgw_mm_mmm64`
@@ -153,11 +164,9 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Pmovmskb_r64_mm`
 - `Pmulhuw_mm_mmm64`
 - `Pmuludq_mm_mmm64`
-- `Popfw`
 - `Psadbw_mm_mmm64`
 - `Pshufw_mm_mmm64_imm8`
 - `Psubq_mm_mmm64`
-- `Pushfw`
 - `Rcpps_xmm_xmmm128`
 - `Rcpss_xmm_xmmm32`
 - `Reservednop_rm16_r16_0F0D`
@@ -188,18 +197,24 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Reservednop_rm64_r64_0F1E`
 - `Reservednop_rm64_r64_0F1F`
 - `Retfd`
+- `Retfq`
 - `Retfw`
 - `Rsqrtps_xmm_xmmm128`
 - `Rsqrtss_xmm_xmmm32`
+- `Sgdt_m1664`
+- `Sidt_m1664`
 - `Sldt_r32m16`
+- `Sldt_r64m16`
 - `Sldt_rm16`
 - `Smsw_r32m16`
+- `Smsw_r64m16`
 - `Smsw_rm16`
 - `Stac`
-- `Stc`
 - `Sti`
 - `Str_r32m16`
+- `Str_r64m16`
 - `Str_rm16`
+- `Swapgs`
 - `Sysenter`
 - `Sysexitd`
 - `Sysexitq`
@@ -208,11 +223,15 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Ud0`
 - `Ud0_r16_rm16`
 - `Ud0_r32_rm32`
+- `Ud0_r64_rm64`
 - `Ud1_r16_rm16`
 - `Ud1_r32_rm32`
+- `Ud1_r64_rm64`
 - `Verr_r32m16`
+- `Verr_r64m16`
 - `Verr_rm16`
 - `Verw_r32m16`
+- `Verw_r64m16`
 - `Verw_rm16`
 - `Wbinvd`
 
@@ -530,7 +549,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Punpcklwd_mm_mmm32`
 - `Pxor_mm_mmm64`
 
-## compat32 x86-64-v1 — missing (131)
+## compat32 x86-64-v1 — missing (124)
 
 - `Aaa`
 - `Aad_imm8`
@@ -543,12 +562,10 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Call_m1632`
 - `Call_rm16`
 - `Clac`
-- `Clc`
 - `Clflush_m8`
 - `Clflushopt_m8`
 - `Cli`
 - `Clts`
-- `Cmc`
 - `Cvtpd2pi_mm_xmmm128`
 - `Cvtpi2pd_xmm_mmm64`
 - `Cvtpi2ps_xmm_mmm64`
@@ -560,8 +577,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Into`
 - `Invd`
 - `Invlpg_m`
-- `Iretd`
-- `Iretw`
 - `Jmp_m1632`
 - `Lar_r16_rm16`
 - `Lar_r32_r32m16`
@@ -588,6 +603,8 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Lss_r32_m1632`
 - `Ltr_r32m16`
 - `Ltr_rm16`
+- `Mov_Sreg_r32m16`
+- `Mov_Sreg_rm16`
 - `Movntq_m64_mm`
 - `Pavgb_mm_mmm64`
 - `Pavgw_mm_mmm64`
@@ -602,15 +619,11 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Pmuludq_mm_mmm64`
 - `Popad`
 - `Popaw`
-- `Popfd`
-- `Popfw`
 - `Psadbw_mm_mmm64`
 - `Pshufw_mm_mmm64_imm8`
 - `Psubq_mm_mmm64`
 - `Pushad`
 - `Pushaw`
-- `Pushfd`
-- `Pushfw`
 - `Rcpps_xmm_xmmm128`
 - `Rcpss_xmm_xmmm32`
 - `Reservednop_rm16_r16_0F0D`
@@ -646,7 +659,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Smsw_r32m16`
 - `Smsw_rm16`
 - `Stac`
-- `Stc`
 - `Sti`
 - `Str_r32m16`
 - `Str_rm16`

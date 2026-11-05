@@ -379,7 +379,9 @@ pub(crate) fn exec_syscall(
     // args in ECX/… (see `IrOp::Syscall`). The JIT's `emit_syscall` mirrors this.
     if is_amd64 {
         cpu.gpr[RCX] = block_end;
-        cpu.gpr[R11] = cpu.flags.to_rflags();
+        // SDM Vol 3B §20.3.1.1: RF clears at instruction start, before the
+        // RFLAGS snapshot in SDM Vol 2B §4.3 SYSCALL, Operation.
+        cpu.gpr[R11] = cpu.rflags() & !(1 << 16);
     }
     cpu.rip = block_end;
     Some(StepResult::Exit(Exit::Syscall))

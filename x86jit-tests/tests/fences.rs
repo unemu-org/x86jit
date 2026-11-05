@@ -260,12 +260,17 @@ fn fence_loop_costs() {
 fn serializing_instructions_lift_with_a_full_fence() {
     use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
     use x86jit_core::{FenceKind, IrOp};
-    // SDM Vol 3A §11.3: the supported serializing instructions are CPUID
-    // and Real16 IRET. Other listed instructions must remain unsupported.
+    // SDM Vol 3A §11.3: CPUID and IRET serialize execution. IRET orders prior
+    // memory accesses before its frame loads and completes those loads before return.
+    // Other listed instructions must remain unsupported.
     for (bytes, mode, supported) in [
         (&[0x0f, 0xa2, 0xf4][..], CpuMode::Long64, true),
         (&[0xcf][..], CpuMode::Real16, true),
-        (&[0x48, 0xcf][..], CpuMode::Long64, false),
+        (&[0x66, 0xcf][..], CpuMode::Long64, true),
+        (&[0xcf][..], CpuMode::Long64, true),
+        (&[0x48, 0xcf][..], CpuMode::Long64, true),
+        (&[0x66, 0xcf][..], CpuMode::Compat32, true),
+        (&[0xcf][..], CpuMode::Compat32, true),
         (&[0x0f, 0xaa][..], CpuMode::Long64, false), // RSM
         (&[0x0f, 0x01, 0xe8][..], CpuMode::Long64, false), // SERIALIZE
         (&[0x0f, 0x22, 0xc0][..], CpuMode::Long64, false), // MOV CR0,RAX
@@ -288,6 +293,52 @@ fn serializing_instructions_lift_with_a_full_fence() {
         let ir = lift_block(&vm.mem, FetchAddr::flat(CODE), mode);
         if supported {
             let ir = ir.unwrap();
+            if let Some(nt_check) = ir.ops.iter().position(|op| matches!(op, IrOp::CheckIretNt)) {
+                let fences: Vec<_> = ir
+                    .ops
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, op)| {
+                        matches!(
+                            op,
+                            IrOp::Fence {
+                                kind: FenceKind::Full
+                            }
+                        )
+                        .then_some(index)
+                    })
+                    .collect();
+                assert_eq!(fences.len(), 2, "{mode:?}/{bytes:x?}: {ir:?}");
+                let first_load = ir
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, IrOp::Load { .. }))
+                    .unwrap();
+                let last_load = ir
+                    .ops
+                    .iter()
+                    .rposition(|op| matches!(op, IrOp::Load { .. }))
+                    .unwrap();
+                let frame_check = ir
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, IrOp::CheckIret { .. }))
+                    .unwrap();
+                let restore = ir
+                    .ops
+                    .iter()
+                    .position(|op| matches!(op, IrOp::RestoreFlags { iret: true, .. }))
+                    .unwrap();
+                assert!(
+                    nt_check < fences[0]
+                        && fences[0] < first_load
+                        && last_load < frame_check
+                        && frame_check < fences[1]
+                        && fences[1] < restore,
+                    "{mode:?}/{bytes:x?}: {ir:?}"
+                );
+                continue;
+            }
             let position = ir
                 .ops
                 .iter()

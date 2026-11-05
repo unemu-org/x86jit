@@ -62,7 +62,7 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
         INTEL8086 | INTEL8086_ONLY | INTEL186 | INTEL286 | INTEL286_ONLY | INTEL386
         | INTEL386_ONLY | INTEL386_A0_ONLY | INTEL486 | INTEL486_A_ONLY | CMOV | CLFSH
         | CLFLUSHOPT | CX8 | CPUID | PAUSE | MULTIBYTENOP | FXSR | SSE | SSE2 | SYSCALL | SEP
-        | SMAP => Gen::V1,
+        | SMAP | X64 => Gen::V1,
         // psABI §3.1.1, Table 3.1 (Micro-Architecture Levels).
         RDTSCP | RDRAND | RDSEED => Gen::Optional,
         // x86-64-v2.
@@ -210,6 +210,15 @@ fn probe_encoded(code: Code, bytes: &[u8], mode: CpuMode) -> Option<Probe> {
     }
     match lift_block(&mem, FetchAddr::flat(SCRATCH_BASE), mode) {
         Ok(block) => {
+            // Descriptor-dependent forms decode to an exact embedder exit;
+            // count them as unsupported execution, despite successful lifting.
+            if block
+                .ops
+                .iter()
+                .any(|op| matches!(op, IrOp::Unsupported { .. }))
+            {
+                return Some(Probe::Unsupported);
+            }
             // A waiting x87 form can lift FWAIT alone and stop before its remainder.
             // Decode-failure IR also returns Ok, but does not implement the probed form.
             // Instructions whose purpose is an exception (e.g. UD2 or INT) still count.
@@ -290,6 +299,7 @@ fn template_operand(
         instr.set_op_register(i, r);
     };
     match kind {
+        seg_reg => reg(instr, Register::DS),
         r8_reg | r8_opcode | r8_or_mem => reg(
             instr,
             nth([Register::AL, Register::CL, Register::DL, Register::BL], i),

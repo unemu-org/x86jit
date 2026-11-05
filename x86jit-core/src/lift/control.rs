@@ -1062,3 +1062,152 @@ pub(crate) fn lift_leave_real16(
     });
     Ok(())
 }
+
+// Descriptor loads are delegated before reading even a memory source: the
+// embedder owns descriptor validation (SDM Vol 2B §4.3 MOV, Operation).
+pub(crate) fn lift_unsupported(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<bool, LiftError> {
+    let LiftError::Unsupported { bytes, len, .. } = unsupported_insn(insn) else {
+        unreachable!()
+    };
+    ops.push(IrOp::Unsupported { bytes, len });
+    Ok(true)
+}
+
+pub(crate) fn lift_mov_sreg_user(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<bool, LiftError> {
+    if insn.op_register(0).is_segment_register() {
+        return lift_unsupported(insn, ops);
+    }
+    let segment = (insn.op_register(1) as u32 - Register::ES as u32) as u8;
+    let dst = tg.fresh();
+    ops.push(IrOp::ReadSelector { dst, segment });
+    // SDM Vol 2B §4.3 MOV: the memory destination is always a word; the
+    // register destination follows operand size and zero extends at 32/64 bits.
+    let target = lower_write_target(insn, 0, ops, tg)?;
+    emit_write(ops, tg, target, Val::Temp(dst));
+    Ok(false)
+}
+
+fn flags_size(insn: &Instruction) -> u8 {
+    match insn.mnemonic() {
+        Mnemonic::Pushfq | Mnemonic::Popfq | Mnemonic::Iretq => 8,
+        Mnemonic::Pushfd | Mnemonic::Popfd | Mnemonic::Iretd => 4,
+        _ => 2,
+    }
+}
+
+pub(crate) fn lift_flag_stack(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    mode: CpuMode,
+    pop: bool,
+) -> Result<(), LiftError> {
+    let size = flags_size(insn);
+    if !pop {
+        ops.push(IrOp::PushFlags {
+            fault: Default::default(),
+            size,
+            wrap_sp: mode == CpuMode::Compat32,
+        });
+        return Ok(());
+    }
+    let rsp = read_reg(Reg::Rsp, ops, tg);
+    let image = tg.fresh();
+    ops.push(IrOp::Load {
+        fault: Default::default(),
+        dst: image,
+        addr: rsp,
+        size,
+    });
+    let next = alu_none(ops, tg, |dst| IrOp::Add {
+        dst,
+        a: rsp,
+        b: Val::Imm(size as u64),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    ops.push(IrOp::RestoreFlags {
+        src: Val::Temp(image),
+        size,
+        iret: false,
+    });
+    ops.push(IrOp::WriteReg {
+        reg: Reg::Rsp,
+        src: next,
+        size: sp_write_size(mode),
+    });
+    Ok(())
+}
+
+pub(crate) fn lift_iret_user(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    mode: CpuMode,
+) -> Result<(), LiftError> {
+    // SDM Vol 2A §3.2 IRET, Operation, IA-32e-MODE: reject NT before Pop().
+    ops.push(IrOp::CheckIretNt);
+    // SDM Vol 3A §11.3: serialize prior memory accesses before reading the frame.
+    ops.push(IrOp::Fence {
+        kind: FenceKind::Full,
+    });
+    let size = flags_size(insn);
+    // SDM Vol 2A §3.2 IRET; Vol 3A §7.14.3: Long64 always restores SS:RSP.
+    let count = if mode == CpuMode::Long64 { 5 } else { 3 };
+    let rsp = read_reg(Reg::Rsp, ops, tg);
+    let mut frame = Vec::new();
+    for index in 0..count {
+        let addr = tg.fresh();
+        ops.push(IrOp::Add {
+            dst: addr,
+            a: rsp,
+            b: Val::Imm(index * size as u64),
+            size: 8,
+            set_flags: FlagMask::NONE,
+        });
+        emit_sp_wrap(ops, addr, mode);
+        let value = tg.fresh();
+        ops.push(IrOp::Load {
+            fault: Default::default(),
+            dst: value,
+            addr: Val::Temp(addr),
+            size,
+        });
+        frame.push(Val::Temp(value));
+    }
+    ops.push(IrOp::CheckIret {
+        cs: frame[1],
+        ss: if count == 5 { Some(frame[4]) } else { None },
+        ip: frame[0],
+    });
+    let new_rsp = if count == 5 {
+        frame[3]
+    } else {
+        alu_none(ops, tg, |dst| IrOp::Add {
+            dst,
+            a: rsp,
+            b: Val::Imm(count * size as u64),
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    };
+    ops.push(IrOp::Fence {
+        kind: FenceKind::Full,
+    });
+    ops.push(IrOp::RestoreFlags {
+        src: frame[2],
+        size,
+        iret: true,
+    });
+    ops.push(IrOp::WriteReg {
+        reg: Reg::Rsp,
+        src: new_rsp,
+        size: sp_write_size(mode),
+    });
+    ops.push(IrOp::Jump { target: frame[0] });
+    Ok(())
+}

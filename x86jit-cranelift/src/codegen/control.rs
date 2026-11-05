@@ -143,11 +143,10 @@ impl Translator<'_, '_> {
         let end = self.iconst(self.guest_end);
         // The AMD64 `syscall` instruction latches RCX <- next-instruction RIP and
         // R11 <- RFLAGS (hardware). The i386 `int 0x80` gate must NOT (its ABI passes
-        // args in ECX/…). Mirrors the interpreter's `exec_syscall` and, for RFLAGS,
-        // `Flags::to_rflags` bit-for-bit.
+        // args in ECX/…). Mirrors the interpreter's `exec_syscall`.
         if is_amd64 {
             self.write_gpr(RCX, end, 8);
-            let rflags = self.assemble_rflags();
+            let rflags = self.user_rflags_image(false);
             self.write_gpr(R11, rflags, 8);
         }
         self.store_cpu(self.offsets.rip, end);
@@ -270,5 +269,166 @@ impl Translator<'_, '_> {
         self.store_cpu(self.offsets.rip, rip);
         self.ret(RET_PORTIO_DEFER);
         true
+    }
+}
+
+// CpuState fields are appended, preserving the existing fixed ABI offsets.
+const SYSTEM_FLAGS: i32 = core::mem::offset_of!(x86jit_core::CpuState, rflags_system) as i32;
+const IF_FLAG: i32 = (core::mem::offset_of!(x86jit_core::CpuState, flags)
+    + core::mem::offset_of!(x86jit_core::Flags, if_)) as i32;
+
+impl Translator<'_, '_> {
+    pub(crate) fn emit_set_cf(&mut self, value: Option<bool>) -> bool {
+        // SDM Vol 2A §3.2 CLC/CMC; Vol 2B §4.3 STC: preserve every other flag.
+        let cf = match value {
+            Some(v) => self.builder.ins().iconst(types::I8, v as i64),
+            None => {
+                let cf = self.load_flag(self.offsets.cf);
+                self.builder.ins().bxor_imm(cf, 1)
+            }
+        };
+        self.store_flag(self.offsets.cf, cf);
+        false
+    }
+
+    fn user_rflags_image(&mut self, push: bool) -> Value {
+        // SDM Vol 3B §20.3.1.1: RF clears before either image is captured.
+        // SDM Vol 2B §4.3 PUSHF additionally clears VM in its stack image.
+        let arithmetic = self.assemble_rflags();
+        let system = self.load_cpu(SYSTEM_FLAGS);
+        let system = self.builder.ins().band_imm(
+            system,
+            (x86jit_core::state::RFLAGS_SYSTEM_MASK & if push { !0x3_0000 } else { !0x1_0000 })
+                as i64,
+        );
+        let if_ = self.load_flag_u64(IF_FLAG);
+        let if_ = self.builder.ins().ishl_imm(if_, 9);
+        let image = self.builder.ins().bor(arithmetic, system);
+        self.builder.ins().bor(image, if_)
+    }
+
+    pub(crate) fn emit_push_flags(&mut self, size: u8, wrap_sp: bool) -> bool {
+        let image = self.user_rflags_image(true);
+        let rsp = self.read_gpr(RSP);
+        let mut sp = self.builder.ins().iadd_imm(rsp, -(size as i64));
+        if wrap_sp {
+            sp = self.builder.ins().band_imm(sp, 0xffff_ffff);
+        }
+        let host = self.checked_addr(sp, size, 1);
+        self.store_guest(host, image, size);
+        self.note_store(sp, size);
+        self.write_gpr(RSP, sp, if wrap_sp { 4 } else { 8 });
+        false
+    }
+
+    pub(crate) fn emit_restore_flags(&mut self, src: Val, size: u8, iret: bool) -> bool {
+        // SDM Vol 2B §4.3 POPF Table 4-20; Vol 2A §3.2 IRET, Operation.
+        let image = self.val(src);
+        for (offset, bit) in [
+            (self.offsets.cf, 0),
+            (self.offsets.zf, 6),
+            (self.offsets.sf, 7),
+            (self.offsets.df, 10),
+            (self.offsets.of, 11),
+        ] {
+            let shifted = self.builder.ins().ushr_imm(image, bit);
+            let value = self.builder.ins().band_imm(shifted, 1);
+            let value = self.builder.ins().ireduce(types::I8, value);
+            self.store_flag(offset, value);
+        }
+        // PF source is a parity byte; AF source carries the architectural bit 4.
+        let pf = self.builder.ins().ushr_imm(image, 2);
+        let pf = self.builder.ins().band_imm(pf, 1);
+        let pf = self.builder.ins().bxor_imm(pf, 1);
+        let pf = self.builder.ins().ireduce(types::I8, pf);
+        self.store_flag(self.offsets.pf_src, pf);
+        let af = self.builder.ins().band_imm(image, 0x10);
+        let af = self.builder.ins().ireduce(types::I8, af);
+        self.store_flag(self.offsets.af_src, af);
+        let system = self.load_cpu(SYSTEM_FLAGS);
+        let iopl = self.builder.ins().band_imm(system, 0x3000);
+        let permitted = self.builder.ins().icmp_imm(IntCC::Equal, iopl, 0x3000);
+        let old_if = self.load_flag(IF_FLAG);
+        let new_if = self.builder.ins().ushr_imm(image, 9);
+        let new_if = self.builder.ins().band_imm(new_if, 1);
+        let new_if = self.builder.ins().ireduce(types::I8, new_if);
+        let if_ = self.builder.ins().select(permitted, new_if, old_if);
+        self.store_flag(IF_FLAG, if_);
+        let mask = x86jit_core::state::user_rflags_mask(size, iret);
+        let preserved = self
+            .builder
+            .ins()
+            .band_imm(system, !(mask | if iret { 0 } else { 1 << 16 }) as i64);
+        let changed = self.builder.ins().band_imm(image, mask as i64);
+        let updated = self.builder.ins().bor(preserved, changed);
+        self.store_cpu(SYSTEM_FLAGS, updated);
+        false
+    }
+
+    fn selector_offset(segment: u8) -> i32 {
+        use x86jit_core::CpuState;
+        (match segment {
+            0 => core::mem::offset_of!(CpuState, es),
+            1 => core::mem::offset_of!(CpuState, cs),
+            2 => core::mem::offset_of!(CpuState, ss),
+            3 => core::mem::offset_of!(CpuState, ds),
+            4 => core::mem::offset_of!(CpuState, fs),
+            5 => core::mem::offset_of!(CpuState, gs),
+            _ => unreachable!("segment encoding"),
+        }) as i32
+    }
+
+    fn read_selector(&mut self, segment: u8) -> Value {
+        let value = self.builder.ins().load(
+            types::I16,
+            MemFlags::trusted(),
+            self.cpu,
+            Self::selector_offset(segment),
+        );
+        self.builder.ins().uextend(types::I64, value)
+    }
+
+    pub(crate) fn emit_read_selector(&mut self, dst: u32, segment: u8) -> bool {
+        let value = self.read_selector(segment);
+        self.set(dst, value);
+        false
+    }
+
+    pub(crate) fn emit_check_iret(&mut self, cs: Val, ss: Option<Val>, ip: Val) -> bool {
+        let cs = self.val(cs);
+        let cs = self.builder.ins().band_imm(cs, 0xffff);
+        let configured = self.read_selector(1);
+        let mut bad = self.builder.ins().icmp(IntCC::NotEqual, cs, configured);
+        if let Some(ss) = ss {
+            let ss = self.val(ss);
+            let ss = self.builder.ins().band_imm(ss, 0xffff);
+            let configured = self.read_selector(2);
+            let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ss, configured);
+            bad = self.builder.ins().bor(bad, mismatch);
+            let ip = self.val(ip);
+            let canonical = self.builder.ins().ishl_imm(ip, 16);
+            let canonical = self.builder.ins().sshr_imm(canonical, 16);
+            let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ip, canonical);
+            bad = self.builder.ins().bor(bad, mismatch);
+        }
+        self.iret_gp_if(bad)
+    }
+
+    pub(crate) fn emit_check_iret_nt(&mut self) -> bool {
+        let system = self.load_cpu(SYSTEM_FLAGS);
+        let nt = self.builder.ins().band_imm(system, 1 << 14);
+        let nt = self.builder.ins().icmp_imm(IntCC::NotEqual, nt, 0);
+        self.iret_gp_if(nt)
+    }
+
+    fn iret_gp_if(&mut self, bad: Value) -> bool {
+        let ok = self.begin_trap_fork(bad);
+        let rip = self.iconst(self.cur_addr);
+        self.store_cpu(self.offsets.rip, rip);
+        let vector = self.iconst(13);
+        self.store_mem(MEMCTX_EXCEPTION_VECTOR, vector);
+        self.ret(RET_EXCEPTION);
+        self.builder.switch_to_block(ok);
+        false
     }
 }

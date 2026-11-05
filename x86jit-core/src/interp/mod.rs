@@ -2888,6 +2888,62 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool>(
                 }
             }
             // --- real-mode interrupt-flag + IVT delivery (§17.6) ---
+            IrOp::PushFlags {
+                fault,
+                size,
+                wrap_sp,
+            } => {
+                let mut sp = cpu.gpr[RSP].wrapping_sub(*size as u64);
+                if *wrap_sp {
+                    sp &= 0xffff_ffff;
+                }
+                let image = cpu.rflags() & !0x3_0000;
+                if let Err(t) = mem.write(sp, image, *size) {
+                    return classify_access(
+                        trap_out(cpu, *cur_addr, t, sp, *size, AccessKind::Write, image),
+                        *cur_addr,
+                        sp,
+                        *fault,
+                    );
+                }
+                cpu.gpr[RSP] = sp;
+            }
+            IrOp::RestoreFlags { src, size, iret } => {
+                cpu.set_user_rflags(read_val(*src, temps), *size, *iret);
+            }
+            IrOp::ReadSelector { dst, segment } => {
+                temps[*dst as usize] = cpu.selector(*segment) as u64;
+            }
+            IrOp::CheckIretNt => {
+                if cpu.rflags_system & (1 << 14) != 0 {
+                    cpu.rip = *cur_addr;
+                    return StepResult::Exit(Exit::Exception {
+                        addr: *cur_addr,
+                        vector: 13,
+                    });
+                }
+            }
+            IrOp::CheckIret { cs, ss, ip } => {
+                let ip = read_val(*ip, temps);
+                if read_val(*cs, temps) as u16 != cpu.cs
+                    || ss.is_some_and(|v| read_val(v, temps) as u16 != cpu.ss)
+                    || (ss.is_some() && ((ip << 16) as i64 >> 16) as u64 != ip)
+                {
+                    cpu.rip = *cur_addr;
+                    return StepResult::Exit(Exit::Exception {
+                        addr: *cur_addr,
+                        vector: 13,
+                    });
+                }
+            }
+            IrOp::Unsupported { bytes, len } => {
+                cpu.rip = *cur_addr;
+                return StepResult::Exit(Exit::UnknownInstruction {
+                    addr: *cur_addr,
+                    bytes: *bytes,
+                    len: *len,
+                });
+            }
             IrOp::SetIf { value } => {
                 cpu.flags.if_ = *value;
                 // `sti` arms the one-instruction STI shadow (§17.6, sub-seam c); a plain

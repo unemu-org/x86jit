@@ -144,6 +144,21 @@ Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
   [deferred work](backlog/docs/deferred.md#real-mode-jit-tier-286-fidelity-and-protected-mode-segmentation).
 - Protected-mode segmentation has no full segment-descriptor model; `Compat32`
   uses flat segments with `FS`/`GS` bases. Real16 has segmented addressing.
+  `MOV r/m16|r32|r64, Sreg` reads the configured `CpuState` selector (including
+  FS/GS). Protected-mode `MOV Sreg, r/m` and `POP Sreg` lift on every tier and
+  return an exact `Exit::UnknownInstruction` before any state change or operand
+  access; the embedder validates descriptors and emulates these loads.
+- User-mode PUSHF/POPF and IRET run at CPL 3. The embedder configures valid
+  CPL 3 selectors, `flags.if_` and `rflags_system` (IOPL and other system bits); defaults are zero.
+  POPF preserves IOPL/VM/VIF/VIP, clears RF, and changes IF only when IOPL is 3;
+  AC/ID are writable only by wide forms. TF and NT are stored; single-step
+  and alignment-check delivery are absent. IRET accepts only the configured
+  same-mode CS/SS pair; Long64 restores RIP, CS, RFLAGS, RSP and SS, while Compat32 restores EIP, CS
+  and EFLAGS and advances ESP. Different selectors, a nested-task return or a
+  noncanonical Long64 RIP raise #GP before state commits. The exception exit
+  currently carries the vector and instruction address, without a selector error
+  code. Sources: Intel SDM Vol 2B §4.3 MOV, POP, PUSHF, POPF (Table 4-20);
+  Vol 2A §3.2 IRET; Vol 3A §7.14.3.
 - Signals and fork/exec *after* a process spawns threads are not fully modeled (single-threaded fork/exec works; the threaded case returns a defined error rather than guessing).
 - OS emulation (syscalls, devices, loaders) is the embedder's job, not the core's — see [`unemulinux`](https://github.com/unemu-org/unemulinux) for a Linux userland built on this library.
 - **`Prot` is advisory — nothing enforces it.** A guest store into a region mapped `R` or `RX` succeeds and changes the bytes, on both backends; the engine models no permission fault (`TASK-330`). Map read-only expecting a trap and you get silent corruption instead.

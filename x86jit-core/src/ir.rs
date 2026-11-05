@@ -2461,6 +2461,39 @@ pub enum IrOp {
         value: bool,
     },
 
+    /// User-mode image, SDM Vol 2B §4.3 PUSHF (RF/VM cleared in the image).
+    PushFlags {
+        fault: MemoryAccess,
+        size: u8,
+        wrap_sp: bool,
+    },
+    /// CPL 3 restore, SDM Vol 2B §4.3 POPF / Vol 2A §3.2 IRET.
+    RestoreFlags {
+        src: Val,
+        size: u8,
+        iret: bool,
+    },
+    /// Configured visible selector (ModRM encoding), SDM Vol 2B §4.3 MOV.
+    ReadSelector {
+        dst: Temp,
+        segment: u8,
+    },
+    /// SDM Vol 2A §3.2 IRET, Operation, IA-32e-MODE: NT raises #GP(0)
+    /// before any return-frame load, in Long64 and Compat32.
+    CheckIretNt,
+    /// Flat-model IRET validation, before any state commits. A different selector
+    /// or noncanonical long-mode RIP raises #GP.
+    CheckIret {
+        cs: Val,
+        ss: Option<Val>,
+        ip: Val,
+    },
+    /// A decoded descriptor-dependent form delegated exactly to the embedder.
+    Unsupported {
+        bytes: [u8; 15],
+        len: u8,
+    },
+
     // --- real-mode interrupt-flag + interrupt/exception delivery (§17.6, sub-seam b) ---
     // These are emitted ONLY when lifting under `CpuMode::Real16`; Long64/Compat32 never
     // produce them (so no compiled block ever sees them — they stay interpreter-only,
@@ -2532,7 +2565,7 @@ pub enum IrOp {
     IretReal,
     // `clc`/`stc`/`cmc` (§17.6): set/clear/complement CF only, no other flag touched.
     // `Some(false)` = `clc`, `Some(true)` = `stc`, `None` = `cmc` (complement). Emitted
-    // only under Real16 (interpreter-only, like every other real-mode op).
+    // in every execution mode.
     SetCf {
         value: Option<bool>,
     },
@@ -3245,6 +3278,7 @@ impl IrOp {
             Self::VLoadHalf { fault, .. } => *fault,
             Self::VStoreHalf { fault, .. } => *fault,
             Self::RepString { fault, .. } => *fault,
+            Self::PushFlags { fault, .. } => *fault,
             Self::Call { fault, .. } => *fault,
             Self::Ret { fault, .. } => *fault,
             _ => MemoryAccess::default(),
@@ -3331,6 +3365,7 @@ impl IrOp {
             Self::VLoadHalf { fault, .. } => *fault = value,
             Self::VStoreHalf { fault, .. } => *fault = value,
             Self::RepString { fault, .. } => *fault = value,
+            Self::PushFlags { fault, .. } => *fault = value,
             Self::Call { fault, .. } => *fault = value,
             Self::Ret { fault, .. } => *fault = value,
             _ => {}

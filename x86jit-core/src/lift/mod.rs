@@ -393,7 +393,8 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VLoadHalf { .. }
             | VStoreHalf { .. }
             | Call { .. }
-            | Ret { .. } => 1,
+            | Ret { .. }
+            | PushFlags { .. } => 1,
             InsnStart { .. }
             | CheckAlign { .. }
             | ReadReg { .. }
@@ -555,6 +556,11 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VMoveHalf { .. }
             | SetDf { .. }
             | SetIf { .. }
+            | RestoreFlags { .. }
+            | ReadSelector { .. }
+            | CheckIretNt
+            | CheckIret { .. }
+            | Unsupported { .. }
             | PushfReal
             | PopfReal
             | IntGate { .. }
@@ -690,6 +696,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
             }
         };
         mark_memory_accesses(&insn, mode, &mut ops[ops_start..]);
+        fill_ir_bytes(&insn, code, start, &mut ops[ops_start..]);
         let instruction_descriptors = guest_access_descriptors(&ops[ops_start..]);
         if icount > 0 && descriptors + instruction_descriptors > MAX_GUEST_ACCESS_DESCRIPTORS {
             ops.truncate(ops_start);
@@ -783,6 +790,7 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     lift_insn(&insn, &mut ops, &mut tg, mode)
         .map_err(|e| refill_unsupported_bytes(e, code, start))?;
     mark_memory_accesses(&insn, mode, &mut ops);
+    fill_ir_bytes(&insn, code, start, &mut ops);
 
     Ok(IrBlock {
         guest_start: start,
@@ -856,6 +864,14 @@ mod tests {
             assert_eq!(op_reads(&IrOp::Bcd { kind }), F_CF | F_AF);
         }
         assert_eq!(op_reads(&IrOp::PushfReal), FlagMask::ALL.0);
+        assert_eq!(
+            op_reads(&IrOp::PushFlags {
+                fault: Default::default(),
+                size: 8,
+                wrap_sp: false
+            }),
+            FlagMask::ALL.0
+        );
         assert_eq!(op_reads(&IrOp::SetCf { value: None }), F_CF);
         assert_eq!(op_reads(&IrOp::Lahf), F_CF | F_PF | F_AF | F_ZF | F_SF);
     }
@@ -1334,7 +1350,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         // SDM Vol 2A, LAHF, Operation.
         Lahf => F_CF | F_PF | F_AF | F_ZF | F_SF,
         // SDM Vol 2B, PUSHF/PUSHFD/PUSHFQ, Operation.
-        PushfReal => FlagMask::ALL.0,
+        PushfReal | PushFlags { .. } => FlagMask::ALL.0,
         // SDM Vol 2A, DAA / DAS, Operation: both old CF and AF are inputs.
         Bcd {
             kind: BcdKind::Daa | BcdKind::Das,
@@ -1374,6 +1390,10 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
             }
         }
         X87 { .. }
+        | RestoreFlags { .. }
+        | CheckIretNt
+        | CheckIret { .. }
+        | Unsupported { .. }
         | PopfReal
         | IntGate { .. }
         | IntoGate { .. }
@@ -1619,6 +1639,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VMoveHalf { .. }
         | VLoadHalf { .. }
         | VStoreHalf { .. }
+        | ReadSelector { .. }
         | SetDf { .. }
         | SetIf { .. }
         | FarJump { .. }
@@ -1796,6 +1817,16 @@ pub(crate) fn lift_insn(
             && (sreg_operand(insn, 0).is_some() || sreg_operand(insn, 1).is_some()) =>
         {
             lift_mov_sreg_real16(insn, ops, tg)
+        }
+
+        Mov if !mode.wraps_16()
+            && (insn.op_register(0).is_segment_register()
+                || insn.op_register(1).is_segment_register()) =>
+        {
+            lift_mov_sreg_user(insn, ops, tg)
+        }
+        Pop if !mode.wraps_16() && insn.op_register(0).is_segment_register() => {
+            lift_unsupported(insn, ops)
         }
 
         // SDM Vol 3A §11.2.2, §11.2.5: MOVNTI stores can need SFENCE.
@@ -3696,18 +3727,31 @@ pub(crate) fn lift_insn(
             Ok(true)
         }
 
+        Pushf | Pushfd | Pushfq if !mode.wraps_16() => {
+            lift_flag_stack(insn, ops, tg, mode, false)?;
+            Ok(false)
+        }
+        Popf | Popfd | Popfq if !mode.wraps_16() => {
+            lift_flag_stack(insn, ops, tg, mode, true)?;
+            Ok(false)
+        }
+        Iret | Iretd | Iretq if !mode.wraps_16() => {
+            lift_iret_user(insn, ops, tg, mode)?;
+            Ok(true)
+        }
+
         // Carry-flag ops (§17.6): `clc`/`stc`/`cmc`. (`cld`/`std` are handled above for
-        // all modes via `SetDf`; `cli`/`sti` by the `SetIf` arms.) Real16-gated so
-        // Long64/Compat32 keep returning `UnknownInstruction`.
-        Clc if mode.wraps_16() => {
+        // all modes via `SetDf`; `cli`/`sti` by the `SetIf` arms.)
+        // SDM Vol 2A §3.2 CLC/CMC; Vol 2B §4.3 STC: only CF changes.
+        Clc => {
             ops.push(IrOp::SetCf { value: Some(false) });
             Ok(false)
         }
-        Stc if mode.wraps_16() => {
+        Stc => {
             ops.push(IrOp::SetCf { value: Some(true) });
             Ok(false)
         }
-        Cmc if mode.wraps_16() => {
+        Cmc => {
             ops.push(IrOp::SetCf { value: None });
             Ok(false)
         }
@@ -4092,6 +4136,15 @@ pub(crate) fn effective_address(
     Ok(addr)
 }
 
+fn fill_ir_bytes(insn: &Instruction, code: &[u8], start: u64, ops: &mut [IrOp]) {
+    for op in ops {
+        if let IrOp::Unsupported { bytes, len } = op {
+            let offset = insn.ip().wrapping_sub(start) as usize;
+            bytes[..*len as usize].copy_from_slice(&code[offset..offset + *len as usize]);
+        }
+    }
+}
+
 fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
     // SDM Vol 1 §3.3.7.1: CS/DS/ES/SS overrides are ignored, including
     // ss:[rbx]. Only FS/GS replace RSP/RBP's default SS in Long64.
@@ -4103,15 +4156,31 @@ fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
     let long64 = mode == CpuMode::Long64;
     for op in ops {
         let (width, ss) = match op {
-            IrOp::Store { size, .. } if insn.mnemonic() == Mnemonic::Push => {
+            IrOp::Store { size, .. }
+                if matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Push | Mnemonic::Pushf | Mnemonic::Pushfd | Mnemonic::Pushfq
+                ) =>
+            {
                 (u16::from(*size), true)
             }
             IrOp::Load { size, .. }
-                if matches!(insn.mnemonic(), Mnemonic::Pop | Mnemonic::Leave) =>
+                if matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Pop
+                        | Mnemonic::Leave
+                        | Mnemonic::Popf
+                        | Mnemonic::Popfd
+                        | Mnemonic::Popfq
+                        | Mnemonic::Iret
+                        | Mnemonic::Iretd
+                        | Mnemonic::Iretq
+                ) =>
             {
                 (u16::from(*size), true)
             }
             IrOp::Call { slot, .. } | IrOp::Ret { slot, .. } => (u16::from(*slot), true),
+            IrOp::PushFlags { size, .. } => (u16::from(*size), true),
             IrOp::RepString { elem, .. } => (u16::from(*elem), false),
             IrOp::FxState { .. } => (512, stack),
             _ => (insn.memory_size().size() as u16, stack),

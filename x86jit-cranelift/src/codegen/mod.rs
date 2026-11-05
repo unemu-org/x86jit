@@ -800,6 +800,20 @@ impl Translator<'_, '_> {
                 self.check_alignment(low);
                 false
             }
+            IrOp::PushFlags { size, wrap_sp, .. } => self.emit_push_flags(*size, *wrap_sp),
+            IrOp::RestoreFlags { src, size, iret } => self.emit_restore_flags(*src, *size, *iret),
+            IrOp::ReadSelector { dst, segment } => self.emit_read_selector(*dst, *segment),
+            IrOp::CheckIretNt => self.emit_check_iret_nt(),
+            IrOp::CheckIret { cs, ss, ip } => self.emit_check_iret(*cs, *ss, *ip),
+            IrOp::Unsupported { .. } => {
+                // Use the precise single-instruction interpreter path, also used
+                // for MMIO, to return the original descriptor-dependent encoding.
+                let rip = self.iconst(self.cur_addr);
+                self.store_cpu(self.offsets.rip, rip);
+                self.ret(RET_MMIO_DEFER);
+                true
+            }
+            IrOp::SetCf { value } => self.emit_set_cf(*value),
             IrOp::ReadReg { dst, reg, .. } => self.emit_read_reg(dst, reg),
             IrOp::WriteReg { reg, src, size, .. } => self.emit_write_reg(reg, src, size),
             IrOp::Add {
@@ -2219,7 +2233,6 @@ impl Translator<'_, '_> {
             | IrOp::BoundGate { .. }
             | IrOp::SegLimitCheck { .. }
             | IrOp::IretReal
-            | IrOp::SetCf { .. }
             | IrOp::Bcd { .. }
             | IrOp::LoopCx { .. }
             | IrOp::FarJump { .. }

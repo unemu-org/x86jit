@@ -451,3 +451,50 @@ fn cpuid_checker_feature_positions_match_manual() {
         );
     }
 }
+
+#[test]
+fn user_flag_and_selector_forms_are_measured() {
+    use iced_x86::Code;
+    use x86jit_core::CpuMode;
+    use x86jit_tests::compat::{probe_code_in, Probe};
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        for code in [
+            Code::Clc,
+            Code::Stc,
+            Code::Cmc,
+            Code::Pushfw,
+            Code::Popfw,
+            Code::Mov_rm16_Sreg,
+            Code::Mov_r32m16_Sreg,
+        ] {
+            assert_eq!(
+                probe_code_in(code, mode),
+                Some(Probe::Lifted),
+                "{mode:?}/{code:?}"
+            );
+        }
+        assert_eq!(
+            probe_code_in(Code::Mov_Sreg_rm16, mode),
+            Some(Probe::Unsupported)
+        );
+    }
+    for code in [
+        Code::Pushfq,
+        Code::Popfq,
+        Code::Iretq,
+        Code::Mov_r64m16_Sreg,
+    ] {
+        assert_eq!(
+            probe_code_in(code, CpuMode::Long64),
+            Some(Probe::Lifted),
+            "{code:?}"
+        );
+    }
+    for code in [Code::Pushfd, Code::Popfd, Code::Iretd] {
+        assert_eq!(
+            probe_code_in(code, CpuMode::Compat32),
+            Some(Probe::Lifted),
+            "{code:?}"
+        );
+    }
+}

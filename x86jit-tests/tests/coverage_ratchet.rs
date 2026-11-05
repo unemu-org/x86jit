@@ -200,6 +200,23 @@ const FUZZER_COVERED: &[&str] = &[
 /// reason. Seeded with exactly the current `lifted − fuzzer_covered` set, so the test
 /// passes today.
 const ALLOWLIST: &[&str] = &[
+    // flag_stack.rs: interpreter/block/region flag images, privilege masks,
+    // carry-only effects, fault state, same-selector returns and native witnesses.
+    "Clc",
+    "Stc",
+    "Cmc",
+    "Pushf",
+    "Pushfq",
+    "Popf",
+    "Popfq",
+    "Iret",
+    "Iretd",
+    "Iretq",
+    // X64 scope also exposes these existing forms: jit.rs::extend_and_convert,
+    // differential.rs::{cbw_cwde_cdqe_match_unicorn,movsxd_and_cdqe,cqo_sign_fills_rdx}.
+    "Cdqe",
+    "Cqo",
+    "Movsxd",
     // cmpxchg_pair.rs: both tiers, conditional pair writes, preserved flags,
     // fault precision, write notifications, oracle comparisons and mixed-tier contention.
     // Register-only fuzzing cannot validate double-width memory CAS atomicity.
