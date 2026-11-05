@@ -3,7 +3,7 @@
   "commit_short": "e11a888",
   "subject": "docs: rewrite the republish handoff for where the work now is",
   "dirty": true,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1786628748,
   "iters": 15,

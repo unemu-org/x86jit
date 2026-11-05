@@ -29,7 +29,7 @@ The address is only examined AFTER the call, inside Memory::note_watched_write (
 
 Consequence for an embedder: watching ONE page anywhere in the process makes EVERY store out of compiled code a call into Rust, for the whole process, for as long as that page stays watched. The gate is all-or-nothing, so an embedder cannot reduce the traffic by watching less — only by watching nothing.
 
-MEASURED IN unemups4 (PS4 emulator, Celeste retail, x86jit at the then-current pin), using the helper counters from task-217:
+MEASURED IN the reporting embedder (x86jit at the then-current pin), using the helper counters from task-217:
 
   watching textures + index buffers + shader code ranges:
     helper calls: 392308578 per 10 s window
@@ -88,7 +88,7 @@ WHAT THIS RULES OUT. Guest-side counters — retired, helper_calls, chained — 
 
 REVERTED 2026-07-22 — the change was a net NEGATIVE once the real constraint was known.
 
-The embedder's perf stat (see TASK-216) showed Celeste is FRONTEND-bound: 51% of cycles stalled on the frontend, IPC 1.02, iTLB misses 0.94 per thousand host instructions, flat profile over 58,599 blocks. So the binding constraint is emitted-code FOOTPRINT, not dynamic work.
+The embedder's perf stat (see TASK-216) showed the reported workload is FRONTEND-bound: 51% of cycles stalled on the frontend, IPC 1.02, iTLB misses 0.94 per thousand host instructions, flat profile over 58,599 blocks. So the binding constraint is emitted-code FOOTPRINT, not dynamic work.
 
 Measured with the new density harness, host instructions emitted per guest store:
 
@@ -120,13 +120,13 @@ reasoned from — the distinction that made the earlier attributions wrong.
 
 Embedder confirmed what it watches: a few small textures + index buffers (KB each) per GPU resource,
 hundreds of them scattered across a ~41 GiB direct-memory heap; NOT code/SMC, NOT large regions.
-watch_count stays nonzero, so every guest store trampolines, and the guest (MonoGame) stores mostly
+watch_count stays nonzero, so every guest store trampolines, and the guest (managed vector workload) stores mostly
 to UNWATCHED pages (vertex ring, const buffers, general heap) — exactly the case the inline test
 short-circuits.
 
 THE FIX vs THE REVERT. task-217-v1 put the inline page-bit test in the HOT stream; the
 density harness measured a store's emitted code doubling 20.1 -> 41.3, which is why it was reverted
-for frontend-bound Celeste. This version marks BOTH the probe (inline test) and doit (helper call)
+for the frontend-bound workload. This version marks BOTH the probe (inline test) and doit (helper call)
 `set_cold_block`, so they are sunk past the epilogue. The HOT store path is the unchanged task-148
 gate: load watch_count, test, branch. A title that watches nothing (watch_count==0) never enters
 the cold blocks and its hot layout is untouched.
@@ -142,9 +142,9 @@ The +2 hot is an order of magnitude below the reverted version's +21, and the ga
 byte-identical. Not zero, so noted honestly: the cold probe raises register pressure enough to add a
 couple of callee-saved spills in the hot epilogue.
 
-PENDING: the pre-registered ceiling. Embedder to measure fps default vs UNEMUPS4_DIRTY=always (never
+PENDING: the pre-registered ceiling. Embedder to measure fps default vs forced buffer uploads (never
 calls watch_range, so watch_count==0 and the barrier is fully off). That delta is the maximum this
-change can recover; if it is noise, this is another Celeste and the change should be reverted rather
+change can recover; if it is noise, this is another measurement artifact and the change should be reverted rather
 than kept on faith. Do NOT mark Done until that number transfers.
 <!-- SECTION:NOTES:END -->
 

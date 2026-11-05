@@ -18,7 +18,7 @@ ordinal: 312000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Measured from the unemups4 embedder (Celeste, retail PS4 title) now that task-215 gives an executed-instruction count. Three consecutive gameplay windows, all counters sampled at the same frame boundary:
+Measured from the a measured guest workload now that task-215 gives an executed-instruction count. Three consecutive gameplay windows, all counters sampled at the same frame boundary:
 
     34.44 fps   guest_exec 20.184 ms/frame   2.92 M instr/frame   145 MIPS
     38.06 fps   guest_exec 20.308 ms/frame   2.63 M instr/frame   129 MIPS
@@ -28,7 +28,7 @@ Stable at 129-145 MIPS. That is roughly 7 ns per guest instruction, or about 30 
 
 Two things follow, and the second is the point.
 
-THE GUEST IS NOT DOING TOO MUCH WORK. 2.6-2.9 M instructions per frame at 60 fps is about 175 M instr/s, which a 1.6 GHz Jaguar handles without difficulty — and the real console does hold 60 fps on this title. The instruction count is ordinary. What is not ordinary is that we need 20 ms of a far stronger CPU to execute it.
+THE GUEST IS NOT DOING TOO MUCH WORK. 2.6-2.9 M instructions per frame at 60 fps is about 175 M instr/s, which a 1.6 GHz Jaguar handles without difficulty — and the original target does hold 60 fps on this workload. The instruction count is ordinary. What is not ordinary is that we need 20 ms of a far stronger CPU to execute it.
 
 THE COST IS PER INSTRUCTION, SO IT IS THE LIFT. Thirty cycles for an average x86 instruction is not a mid-end problem; a good JIT is 1-3 cycles for a simple one. It is how much host code the lifter emits per guest instruction: guest-state materialization at block boundaries, flag computation, memory-access lowering.
 
@@ -39,7 +39,7 @@ Worth measuring before choosing a direction, since the same embedder has repeate
 - what fraction is flag handling? state.rs:123 records lazy flags (Variant B) as deliberately deferred, with compile-time dead-flag elimination as the substitute (lift/mod.rs:767). Dead-flag elimination only removes what it can prove is unread, and superblock formation just widened the window it can see — measuring how much flag work survives inside a region would say whether Variant B is now the payoff it was expected to be.
 - how much is guest-state spill and reload at block boundaries, and how far does region formation already reduce it?
 
-The embedder-side numbers are in unemups4 task-163 and its commits; the instruction counter itself is task-215 here.
+The embedder-side numbers are in reporting embedder task-163 and its commits; the instruction counter itself is task-215 here.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -99,7 +99,7 @@ FOLLOW-UPS, in order, each gated on the previous:
 days of local reversible work. If the embedder measures no fps change from a 20% cut, the
 'frontend-bound = hot code size' model is wrong and TASK-220 must not be started.
 
-Still unexamined: SSE at 14-15 host instructions per op with 0% cold (MonoGame vector math), and
+Still unexamined: SSE at 14-15 host instructions per op with 0% cold (managed vector workload vector math), and
 huge pages for the JIT code arena against the 0.94 iTLB misses/kinstr.
 
 NEGATIVE TRANSFER 2026-07-23. That work cut a block's hot host instructions 28% (56.0 -> 40.3,
@@ -108,7 +108,7 @@ host code per guest instruction is the ceiling — is NOT the binding constraint
 or the 28% I removed was not on the hot path.
 
 The likely reason is in this task's own open thread: SSE. The density harness measured SSE at 14-15
-host instructions per op, 0% cold, no flags. task-218/219 optimized FLAG code; MonoGame/C# hot code
+host instructions per op, 0% cold, no flags. task-218/219 optimized FLAG code; managed vector workload/C# hot code
 is vector math that emits no flags. So the probe shrank code the hot blocks do not run.
 
 NEXT INSTRUMENT — the executed-instruction MIX of the embedder's hot blocks, not another emitted-

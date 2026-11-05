@@ -6,7 +6,7 @@ assignee: []
 created_date: '2026-07-10 16:13'
 updated_date: '2026-08-10 21:43'
 labels:
-  - unemups4-migration
+  - embedder-migration
 dependencies: []
 ordinal: 220000
 ---
@@ -14,7 +14,7 @@ ordinal: 220000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Let Linux `perf` symbolize compiled guest blocks so embedders (unemups4) can attribute samples to guest RIPs. Standard `/tmp/perf-<pid>.map` convention: one line per symbol, `<hex start> <hex size> <name>\n`, no `0x` prefixes.
+Let Linux `perf` symbolize compiled guest blocks so embedders (reporting embedder) can attribute samples to guest RIPs. Standard `/tmp/perf-<pid>.map` convention: one line per symbol, `<hex start> <hex size> <name>\n`, no `0x` prefixes.
 
 Design (decided; implement it):
 - New module `x86jit-cranelift/src/perfmap.rs` (NOT x86jit-core — core stays pure-data per the codemap.rs constraint).

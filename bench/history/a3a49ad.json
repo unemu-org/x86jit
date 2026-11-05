@@ -3,7 +3,7 @@
   "commit_short": "a3a49ad",
   "subject": "perf(bench): PB-3 native ratios + PB-4 rolling-median series & load-aware gate (doc-29)",
   "dirty": false,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783417232,
   "iters": 15,

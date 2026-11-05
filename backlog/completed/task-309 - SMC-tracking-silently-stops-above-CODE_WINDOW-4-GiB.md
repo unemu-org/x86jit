@@ -16,7 +16,7 @@ ordinal: 345000
 <!-- SECTION:DESCRIPTION:BEGIN -->
 memory.rs:287 — mark_code and note_write no-op for pages beyond the 4 GiB table, and the comment beside it acknowledges that code above the boundary, and blocks straddling it, are valid configurations.
 
-So for guest code placed high, a write never dirties the page, the cache epoch never bumps, and a stale translation stays executable indefinitely. Nothing reports it. The assumption 'guest code always lives low' holds for the current fixture set and is not an architectural guarantee — a PS4 or Go guest is free to break it.
+So for guest code placed high, a write never dirties the page, the cache epoch never bumps, and a stale translation stays executable indefinitely. Nothing reports it. The assumption 'guest code always lives low' holds for the current fixture set and is not an architectural guarantee — a guest with high code addresses is free to break it.
 
 Either track the whole address space sparsely (WatchPages already does), or refuse to translate outside the tracked range so the limitation is loud.
 <!-- SECTION:DESCRIPTION:END -->

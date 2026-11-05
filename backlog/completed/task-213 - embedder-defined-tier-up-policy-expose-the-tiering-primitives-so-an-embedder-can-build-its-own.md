@@ -29,7 +29,7 @@ Sketch (maintainer's call): a trait the embedder implements, consulted where the
 
 Watch out for: (1) it sits on the hot dispatch path, so the default must stay as cheap as the current integer compare — a virtual call per dispatch would be a regression; (2) the JIT's opt_level is baked into the ISA at first compile (task-210), so a policy that wants different codegen per block needs the two-module problem solved first; (3) whatever is exposed becomes API the core must keep working across the SoftMmu/AOT milestones, so keep the surface minimal.
 
-Raised by the unemups4 embedder while reviewing task-210: 'powinno się dać też zbudować customowy mechanizm tierowania bazując na naszych klockach'.
+Raised by the reporting embedder while reviewing task-210: 'it should also be possible to build a custom tiering mechanism from the existing primitives'.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

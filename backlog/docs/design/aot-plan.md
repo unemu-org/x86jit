@@ -10,7 +10,7 @@ created_date: '2026-07-06 11:25'
 Ready-to-execute plan for persisting compiled JIT code across runs, so a second
 run of the same guest skips compilation. Refines the `open-backlog.md` FD-AOT
 prereqs with exact code sites, decided after inspecting the backend. Co-authored
-with Fable 5 during the 2026-07-06 session; not started (a milestone-sized change
+during the 2026-07-06 architecture review; not started (a milestone-sized change
 deliberately deferred out of a long session — see the session handoff).
 
 ## Header decisions (settled — do not re-litigate)

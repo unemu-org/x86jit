@@ -3391,9 +3391,9 @@ impl Translator<'_, '_> {
         // Both the inline page test and the helper call are laid out cold, sunk past the
         // epilogue, leaving the HOT store path a count load and a branch. That layout is a
         // requirement, not an accident: putting the page test in the hot stream doubled a
-        // store's emitted code and regressed a frontend-bound title that watches nothing
+        // store's emitted code and regressed a frontend-bound workload that watches nothing
         // (`watched` is false, so neither cold block is entered or pulled into the hot
-        // cache lines). The win goes to a title that DOES watch (a retail UE4 game spent
+        // cache lines). The win goes to a workload that DOES watch (one measured workload spent
         // 7.7% of cycles in this barrier): its stores hit `probe`, and the ones to
         // UNWATCHED pages — the vast majority, since the embedder watches a few small
         // textures/index buffers scattered across a 41 GiB heap — return without the

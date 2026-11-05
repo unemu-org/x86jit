@@ -53,7 +53,7 @@ flush + a lower region opt-level. M5-T3 complete as an opt-in capability.
 > default-flip only if such a loop enters the shipped corpus (a region opt-level / a
 > dedicated region worker would then also be worth it).
 
-Authored by Fable 5 (Plan agent) from [`superblock-brief.md`](superblock-brief.md),
+Architecture plan from [`superblock-brief.md`](superblock-brief.md),
 grounded in the code. Load-bearing facts independently verified: the differential
 oracle runs `RunSpec::Blocks(n)` (`x86jit-tests/src/vector.rs`, `oracle.rs`) so it
 compares full state at block-budget exhaustion — exact in-region block accounting is

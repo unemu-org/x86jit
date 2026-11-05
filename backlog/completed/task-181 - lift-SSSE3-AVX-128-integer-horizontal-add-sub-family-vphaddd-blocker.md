@@ -16,7 +16,7 @@ ordinal: 276000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Mono managed/JIT'd code hits vphaddd %xmm0,%xmm0,%xmm0 (VEX.128.66.0F38 02 /r). Diagnosis: PHADDW/PHADDD/PHADDSW (0F38 01/02/03) and PHSUBW/PHSUBD/PHSUBSW (0F38 05/06/07), packed, are GENUINELY ABSENT — no dispatch, no IR op — for BOTH legacy SSSE3 and VEX. Add a shared VHInt/VHIntM IR op (operation enum {AddW,AddD,AddSW,SubW,SubD,SubSW}) mirroring the task-178 VHFloat/VHFloatM design, with interp + cranelift, and lift legacy (2-op in-place) + VEX.128 (3-op + upper-zero + 128-bit mem src). Semantics: horizontal pairwise add/sub of adjacent lanes within each source (w=16-bit, d=32-bit); the SW variants saturate signed words. Register + memory forms. Differential tests: legacy-vs-Unicorn, VEX via vex_eq_sse incl exact blocker vphaddd xmm0,xmm0,xmm0.
+managed runtime managed/JIT'd code hits vphaddd %xmm0,%xmm0,%xmm0 (VEX.128.66.0F38 02 /r). Diagnosis: PHADDW/PHADDD/PHADDSW (0F38 01/02/03) and PHSUBW/PHSUBD/PHSUBSW (0F38 05/06/07), packed, are GENUINELY ABSENT — no dispatch, no IR op — for BOTH legacy SSSE3 and VEX. Add a shared VHInt/VHIntM IR op (operation enum {AddW,AddD,AddSW,SubW,SubD,SubSW}) mirroring the task-178 VHFloat/VHFloatM design, with interp + cranelift, and lift legacy (2-op in-place) + VEX.128 (3-op + upper-zero + 128-bit mem src). Semantics: horizontal pairwise add/sub of adjacent lanes within each source (w=16-bit, d=32-bit); the SW variants saturate signed words. Register + memory forms. Differential tests: legacy-vs-Unicorn, VEX via vex_eq_sse incl exact blocker vphaddd xmm0,xmm0,xmm0.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Implementation Plan

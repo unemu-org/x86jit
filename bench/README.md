@@ -33,8 +33,11 @@ commit the JSON on your branch.
 
 ## Reading the numbers
 
-- **Timings only compare on the same machine.** Each record tags `host` + `cpu`;
-  `compare` warns if they differ.
+- **Timings only compare on the same machine.** The `host` field records
+  `CPU model / OS / architecture`, without a hostname; `cpu` keeps the CPU model.
+  `compare` warns when labels differ. Matching labels can describe several machines,
+  so use measurements from the same machine. Existing history retains its timings
+  with sanitized labels.
 - **JIT timing is end-to-end and cold** — load + compile + run, a fresh `Vm` each
   iteration. That's the honest one-shot cost (Cranelift compile included), which is
   why compile-bound one-shots can be *slower* than the interpreter.

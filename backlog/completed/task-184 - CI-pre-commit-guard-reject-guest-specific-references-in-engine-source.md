@@ -21,10 +21,10 @@ x86jit is a guest-AGNOSTIC x86-64 emulation engine. Downstream consumers (an emu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [x] #1 A grep-gate (pre-commit hook and/or CI step) scans tracked *.rs source (excluding backlog/ docs and this task) and FAILS if any guest/downstream term appears: case-insensitive match on a curated denylist (e.g. celeste, mono, doom, ps4, playstation, orbis, unemups4, sgen, monogame, fmod, homebrew) as whole-words where sensible
+- [x] #1 A grep-gate (pre-commit hook and/or CI step) scans tracked *.rs source (excluding backlog/ docs and this task) and FAILS if any guest/downstream term appears: case-insensitive match on a curated denylist (see `scripts/guest-agnostic-guard.sh` for the vocabulary) as whole-words where sensible
 - [x] #2 The denylist lives in one obvious place with a comment explaining the guest-agnostic rule and how to extend it
 - [x] #3 The gate is wired so it runs in the same place existing lint runs (mirror how clippy/fmt are gated) and documents the exact command to run locally
-- [x] #4 Running the gate on current HEAD passes (repo is clean today); a deliberately-inserted 'Celeste' comment makes it fail (proves it works)
+- [x] #4 Running the gate on current HEAD passes (repo is clean today); a deliberately inserted denylisted guest-name comment makes it fail (proves it works)
 - [ ] #5 Motivating-context for a lift is expressed generically (semantics + encoding + local x86jit task id only) — the guard does NOT block the word 'guest' itself or generic ISA terms
 <!-- AC:END -->
 
@@ -33,11 +33,11 @@ x86jit is a guest-AGNOSTIC x86-64 emulation engine. Downstream consumers (an emu
 <!-- SECTION:NOTES:BEGIN -->
 Landed as scripts/guest-agnostic-guard.sh, wired into pre-commit (per-commit — it is a grep) and into CI beside clippy. Documented in the script's own header.
 
-THE TASK'S PREMISE WAS FALSE and that is the result worth keeping. It said 'a scan today is clean; nothing prevents regression'. The first case-insensitive run found 63 references across 21 files, in x86jit-core and x86jit-cranelift as well as the tests: Celeste, Mono/MonoGame, Little Nightmares, Doom, Orbis, PS4. All rewritten to keep the technical fact and drop the name — 'the exact reported wall bytes c4 e3 79 21 d1 10' says everything the old comment said that a reader of this repository needs.
+THE TASK'S PREMISE WAS FALSE and that is the result worth keeping. It said 'a scan today is clean; nothing prevents regression'. The first case-insensitive run found 63 references across 21 files, in x86jit-core and x86jit-cranelift as well as the tests: guest titles, managed runtimes, platform names and embedder names. All rewritten to keep the technical fact and drop the name — 'the exact reported wall bytes c4 e3 79 21 d1 10' says everything the old comment said that a reader of this repository needs.
 
 Two defects in the guard itself, both found by running it rather than by reading it:
   - The denylist was wrong three ways: it listed `unemulinux` (the sibling embedder, which boundary.rs exists to name), `fmod` (C's remainder, cited legitimately in f80.rs), and `pkg` (matches pkg-config). Fixed, with the reasoning recorded in the script so the next person does not re-add them.
-  - The first version had no -i despite a comment claiming it did, so a planted 'Celeste' passed. That is the exact class this whole session has been finding: a gate that cannot fail. Caught by planting one; the negative control is now the proof it works.
+  - The first version had no -i despite a comment claiming it did, so a planted denylisted guest name passed. That is the exact class this whole session has been finding: a gate that cannot fail. Caught by planting one; the negative control is now the proof it works.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

@@ -1,7 +1,7 @@
 ---
 id: TASK-191
 title: >-
-  Lift VEX float-op sweep — vsqrtps/pd, vrsqrtss/vrcpss+ps (Celeste vrsqrtss
+  Lift VEX float-op sweep — vsqrtps/pd, vrsqrtss/vrcpss+ps (reported vrsqrtss
   blocker), vshufps/pd, unpck float bases + VEX unpck
 status: Done
 assignee: []
@@ -16,7 +16,7 @@ ordinal: 287000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Celeste (Mono+FNA, pervasively AVX/VEX) faults one 128-bit VEX float op at a time. Lift the missing xmm-only VEX float cluster that mechanically re-encodes SSE ops x86jit already supports, plus the genuinely-new reciprocal family the CONCRETE blocker (vrsqrtss, c5 fa 52 d0) needs. Groups: A packed sqrt (vsqrtps/vsqrtpd); B reciprocal (vrsqrtss/vrcpss scalar 3-op + vrsqrtps/vrcpps packed 2-op, new FloatUnOp::Rsqrt/Rcp, exact-IEEE semantics documented as an approximation of the hw ~12-bit estimate); C shuffles (vshufps/vshufpd 3-operand distinct-vvvv + m128); D float unpacks (SSE bases unpcklps/hps/lpd/hpd + VEX vunpck* reusing int-unpack helpers). 256-bit forms, FMA-addsub, vpermilps/pd, half-float, integer sat/avg ops are OUT of scope.
+A managed SIMD workload (pervasively AVX/VEX) faults one 128-bit VEX float op at a time. Lift the missing xmm-only VEX float cluster that mechanically re-encodes SSE ops x86jit already supports, plus the genuinely-new reciprocal family the CONCRETE blocker (vrsqrtss, c5 fa 52 d0) needs. Groups: A packed sqrt (vsqrtps/vsqrtpd); B reciprocal (vrsqrtss/vrcpss scalar 3-op + vrsqrtps/vrcpps packed 2-op, new FloatUnOp::Rsqrt/Rcp, exact-IEEE semantics documented as an approximation of the hw ~12-bit estimate); C shuffles (vshufps/vshufpd 3-operand distinct-vvvv + m128); D float unpacks (SSE bases unpcklps/hps/lpd/hpd + VEX vunpck* reusing int-unpack helpers). 256-bit forms, FMA-addsub, vpermilps/pd, half-float, integer sat/avg ops are OUT of scope.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -42,9 +42,9 @@ D SSE bases unpcklps/hps/lpd/hpd (reuse lift_vunpack) + VEX vunpcklps/hps/lpd/hp
 New IR: VFloatUnaryM, VShufpsM. New FloatUnOp: Rsqrt, Rcp.
 256-bit _ymm_ forms out of scope (reg_xmm returns None → clean deferral).
 
-The concrete Celeste blocker vrsqrtss (c5 fa 52 d0) decodes+runs: src.low 1.0 → 1.0, upper from op1, 255:128 zeroed (vrsqrtss_celeste_wild_bytes).
+The reported blocker vrsqrtss (c5 fa 52 d0) decodes+runs: src.low 1.0 → 1.0, upper from op1, 255:128 zeroed (vrsqrtss_wild_bytes).
 
-Tests: differential vsqrt/vshuf/vunpck_vex_eq_sse (VEX==trusted SSE) + vrsqrtss_celeste_wild_bytes; jit vsqrt/vshuf/vunpck/vrcp_rsqrt_match_interp (jit==interp incl m128/m32, dst==src2 alias, upper-zero); native_vex_float_sweep_matches_interp (bit-exact vs host AVX) + native_vex_rcp_rsqrt_within_tolerance (max rel-err 0.0, SDM bound 3.66e-4). coverage map + ratchet allowlist updated.
+Tests: differential vsqrt/vshuf/vunpck_vex_eq_sse (VEX==trusted SSE) + vrsqrtss_wild_bytes; jit vsqrt/vshuf/vunpck/vrcp_rsqrt_match_interp (jit==interp incl m128/m32, dst==src2 alias, upper-zero); native_vex_float_sweep_matches_interp (bit-exact vs host AVX) + native_vex_rcp_rsqrt_within_tolerance (max rel-err 0.0, SDM bound 3.66e-4). coverage map + ratchet allowlist updated.
 
 Gates: full nextest 757 passed / 3 skipped; clippy -D warnings clean; fmt clean.
 <!-- SECTION:NOTES:END -->

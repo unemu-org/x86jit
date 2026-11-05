@@ -4,7 +4,9 @@ Per-commit **native vs interpreter vs JIT** timing for [x86jit](../).
 
 Records each workload's runtime under the three execution modes as JSON under
 `bench/history/<short-sha>.json`, so results are comparable across commits —
-evidence of what each change buys, and where.
+evidence of what each change buys, and where. The `host` field stores a generic
+`CPU model / OS / architecture` label. Matching labels do not identify a unique
+machine; compare timings collected on the same machine.
 
 ## Usage
 

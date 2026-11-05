@@ -13,7 +13,7 @@ ordinal: 216000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Add guest_base:u64 (default 0) to HostRam/Memory so an embedder achieves host==guest identity mapping (host addr == guest addr). Translation host = host_ptr + (guest_addr - guest_base), computed as integer arithmetic (never materialize a null-adjacent pointer). map()/access reject guest addresses below guest_base. Cranelift bakes the base-relative offset (byte-identical codegen when guest_base==0). New reserve_at(guest_base,span) mmap helper (MAP_FIXED_NOREPLACE|NORESERVE). Enables unemups4 PS4 HLE identity mapping (task-2 of that migration).
+Add guest_base:u64 (default 0) to HostRam/Memory so an embedder achieves host==guest identity mapping (host addr == guest addr). Translation host = host_ptr + (guest_addr - guest_base), computed as integer arithmetic (never materialize a null-adjacent pointer). map()/access reject guest addresses below guest_base. Cranelift bakes the base-relative offset (byte-identical codegen when guest_base==0). New reserve_at(guest_base,span) mmap helper (MAP_FIXED_NOREPLACE|NORESERVE). Enables embedder identity mapping (task-2 of that migration).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

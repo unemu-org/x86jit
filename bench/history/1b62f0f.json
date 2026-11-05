@@ -3,7 +3,7 @@
   "commit_short": "1b62f0f",
   "subject": "bench: hotloop as a recorded workload + region-bg tiering column (task-100)",
   "dirty": false,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783438323,
   "iters": 15,

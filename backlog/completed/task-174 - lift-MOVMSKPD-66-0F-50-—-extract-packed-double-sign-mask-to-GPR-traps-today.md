@@ -19,7 +19,7 @@ ordinal: 269000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-UnknownInstruction trap hit while running real software (Doom/doomgeneric on the unemups4 PS4 emulator, in-gameplay). x86jit has no lift for MOVMSKPD. Concrete fault: 'movmskpd %xmm0,%esi', bytes 66 0F 50 F0, at guest rip 0x41fdf2. MOVMSKPD (SSE2) extracts the sign bit of each of the 2 packed doubles in the xmm source into the low 2 bits of a GPR (zero-extended). Semantics: dst[0]=src[63], dst[1]=src[127], dst[2+]=0. The sibling MOVMSKPS (0F 50, no 66 prefix) does the same for 4 packed singles (low 4 bits) and is very likely needed too — lift both while here. Encoding: reg field = GPR dest, r/m = xmm src (reg-reg form here). Relates to the SIMD-lowering perf work (task-171/173).
+UnknownInstruction trap hit while running real software (a software-rendering workload in the reporting embedder). x86jit has no lift for MOVMSKPD. Concrete fault: 'movmskpd %xmm0,%esi', bytes 66 0F 50 F0, at guest rip 0x41fdf2. MOVMSKPD (SSE2) extracts the sign bit of each of the 2 packed doubles in the xmm source into the low 2 bits of a GPR (zero-extended). Semantics: dst[0]=src[63], dst[1]=src[127], dst[2+]=0. The sibling MOVMSKPS (0F 50, no 66 prefix) does the same for 4 packed singles (low 4 bits) and is very likely needed too — lift both while here. Encoding: reg field = GPR dest, r/m = xmm src (reg-reg form here). Relates to the SIMD-lowering perf work (task-171/173).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -33,7 +33,7 @@ UnknownInstruction trap hit while running real software (Doom/doomgeneric on the
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Done. MOVMSKPS/MOVMSKPD lifted (SSE2 + VEX.128). New VMoveMaskFp{dst,src,elem} IR op mirroring VMoveMaskB (pmovmskb): vhigh_bits on I32X4(ps,elem=4)/I64X2(pd,elem=8) -> sign-mask into GPR, upper zeroed. lift movmskps/pd + VEX; native codegen + interp. YMM(256) source deferred (reg_xmm None). Exact Doom fault 'movmskpd %xmm0,%esi' (66 0F 50 F0) no longer traps. Tests: movmsk_ps_pd_match_unicorn (interp vs CPU: all-neg/all-pos/mixed, incl faulting encoding), movmsk_ps_pd_match_interp (jit==interp). Adversarial review: no bugs (incl -0.0/signed-NaN edges safe — raw sign bit). coverage.json regen; ratchet allowlist updated. DoD: nextest --features unicorn 671 passed; clippy+fmt clean.
+Done. MOVMSKPS/MOVMSKPD lifted (SSE2 + VEX.128). New VMoveMaskFp{dst,src,elem} IR op mirroring VMoveMaskB (pmovmskb): vhigh_bits on I32X4(ps,elem=4)/I64X2(pd,elem=8) -> sign-mask into GPR, upper zeroed. lift movmskps/pd + VEX; native codegen + interp. YMM(256) source deferred (reg_xmm None). Exact the sample workload fault 'movmskpd %xmm0,%esi' (66 0F 50 F0) no longer traps. Tests: movmsk_ps_pd_match_unicorn (interp vs CPU: all-neg/all-pos/mixed, incl faulting encoding), movmsk_ps_pd_match_interp (jit==interp). Adversarial review: no bugs (incl -0.0/signed-NaN edges safe — raw sign bit). coverage.json regen; ratchet allowlist updated. DoD: nextest --features unicorn 671 passed; clippy+fmt clean.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

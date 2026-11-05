@@ -1,7 +1,7 @@
 ---
 id: TASK-116.6
 title: >-
-  AVX: lift vextractps (VEX.128 map3 opcode 0x17) — Celeste scePlayStation4
+  AVX: lift vextractps (VEX.128 map3 opcode 0x17) — managed-runtime interop
   runtime
 status: Done
 assignee: []
@@ -17,7 +17,7 @@ ordinal: 277000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Retail bring-up (unemups4 Celeste, its task-113.4.1 — a *different* project's numbering) hit an unlifted AVX op in the scePlayStation4 managed-runtime interop module during boot, BEFORE any GNM graphics submit:
+Retail bring-up (the reporting embedder, its task-113.4.1 — a *different* project's numbering) hit an unlifted AVX op in the managed-runtime interop module during boot, BEFORE any graphics submit:
 
   unimplemented lift in x86jit for: vextractps $0x2,%xmm0,0x2c(%rsp)
   faulting bytes: c4 e3 79 17 44 24 2c 02
@@ -25,7 +25,7 @@ Retail bring-up (unemups4 Celeste, its task-113.4.1 — a *different* project's 
 
 VEXTRACTPS extracts one 32-bit float element (imm8[1:0]) from an XMM source to a GPR or memory dword. It is the VEX.128 form of SSE4.1 EXTRACTPS (66 0F 3A 17). Not covered by 116.1 (basic VEX.128 SSE ops) nor 116.3 (which does vextracti128 — a different, 128-bit-lane extract). AVX-128 only (no YMM state needed).
 
-Acceptance: vextractps reg and mem dst forms lift + execute interp == jit == unicorn; the unemups4 Celeste boot advances past scePlayStation4 +0x57ab (rip 0x15cb476).
+Acceptance: vextractps reg and mem dst forms lift + execute interp == jit == unicorn; the reporting embedder boot advances past managed-runtime interop +0x57ab (rip 0x15cb476).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Definition of Done

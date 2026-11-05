@@ -16,7 +16,7 @@ ordinal: 347000
 <!-- SECTION:DESCRIPTION:BEGIN -->
 fuzz.rs (~1358): the VEX pool's common shape emits YMM register operands, and the explicit entries follow it. So the campaign cannot falsify memory-source decoding, effective-address computation, load width, alignment or fault behaviour for any instruction it counts as covered.
 
-That matters more than it would in isolation, because compat.rs over-reports the same axis (task-312): the coverage map says a Code is lifted based on its register form, and the fuzzer only exercises register forms. Memory-form gaps are invisible to both, which is how vextract*'s memory destination survived until a real PS4 binary hit it.
+That matters more than it would in isolation, because compat.rs over-reports the same axis (task-312): the coverage map says a Code is lifted based on its register form, and the fuzzer only exercises register forms. Memory-form gaps are invisible to both, which is how vextract*'s memory destination survived until a real guest binary hit it.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

@@ -30,7 +30,7 @@ Emitted today for a 32-bit operand:
 
 Root cause is in the codegen helpers, not in Cranelift: `sign_bit(size)` (x86jit-cranelift/src/codegen/mod.rs) returns a 64-bit mask constant and the callers `band` with it, instead of `ireduce`-ing the value to the operand type and letting the backend select the subregister form. Same shape appears in store_flags' inputs and in `fn parity`.
 
-WHY IT MATTERS. task-216 established the embedder's workload (unemups4/Celeste) is FRONTEND-bound: IPC 1.02, 51% frontend stalls, 0.94 iTLB misses per kilo-instruction, flat profile across 58,599 blocks. Host instruction count and code footprint are static properties that compose, unlike latency — so cutting emitted instructions per block attacks the measured binding constraint directly. Flag materialization is 35 of the ~62 host instructions a real block emits (2.9 guest instructions per block on that title).
+WHY IT MATTERS. task-216 established the embedder's workload (a managed SIMD workload) is FRONTEND-bound: IPC 1.02, 51% frontend stalls, 0.94 iTLB misses per kilo-instruction, flat profile across 58,599 blocks. Host instruction count and code footprint are static properties that compose, unlike latency — so cutting emitted instructions per block attacks the measured binding constraint directly. Flag materialization is 35 of the ~62 host instructions a real block emits (2.9 guest instructions per block on that title).
 
 This is the cheapest of the three flag levers and is purely mechanical: it changes how a value is narrowed, not what is computed.
 <!-- SECTION:DESCRIPTION:END -->

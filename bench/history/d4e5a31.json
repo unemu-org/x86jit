@@ -3,7 +3,7 @@
   "commit_short": "d4e5a31",
   "subject": "bench: per-commit native vs interp vs JIT harness (x86jit-bench)",
   "dirty": false,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783229328,
   "iters": 5,

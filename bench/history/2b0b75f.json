@@ -3,7 +3,7 @@
   "commit_short": "2b0b75f",
   "subject": "feat(bench): pre-push perf regression gate + performance.md report",
   "dirty": false,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783339229,
   "iters": 7,

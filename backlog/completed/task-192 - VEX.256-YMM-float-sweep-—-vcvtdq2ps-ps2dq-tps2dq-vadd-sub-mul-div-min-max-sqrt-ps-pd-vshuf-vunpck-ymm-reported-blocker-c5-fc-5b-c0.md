@@ -2,7 +2,7 @@
 id: TASK-192
 title: >-
   VEX.256 YMM float sweep — vcvtdq2ps/ps2dq/tps2dq,
-  vadd/sub/mul/div/min/max/sqrt ps/pd, vshuf/vunpck ymm (Celeste blocker c5 fc
+  vadd/sub/mul/div/min/max/sqrt ps/pd, vshuf/vunpck ymm (reported blocker c5 fc
   5b c0)
 status: Done
 assignee: []
@@ -16,7 +16,7 @@ ordinal: 288000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Celeste (Mono+FNA) faults on 256-bit YMM VEX float ops. Concrete blocker: c5 fc 5b c0 = vcvtdq2ps ymm0,ymm0. Extend the existing 128-bit VEX float lifts to the upper 128-bit YMM lane (ymm_hi), all three tiers (decode/interp/cranelift). Bitwise ymm already done via VLogic256; cmpps/pd ymm already done via VFloatCmpMask256.
+A managed SIMD workload faults on 256-bit YMM VEX float ops. Concrete blocker: c5 fc 5b c0 = vcvtdq2ps ymm0,ymm0. Extend the existing 128-bit VEX float lifts to the upper 128-bit YMM lane (ymm_hi), all three tiers (decode/interp/cranelift). Bitwise ymm already done via VLogic256; cmpps/pd ymm already done via VFloatCmpMask256.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

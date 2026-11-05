@@ -1,29 +1,28 @@
 ---
 id: doc-25
-title: PS4-JIT performance roadmap
+title: SIMD workload JIT performance roadmap
 type: other
 created_date: '2026-07-12 20:20'
 ---
 
-# PS4-JIT performance roadmap
+# SIMD workload JIT performance roadmap
 
-**Milestone:** `ps4-perf`. **Goal:** squeeze max JIT throughput for the x86-64-on-ARM
-recompiler ahead of the PS4-emulator (`unemups4`) path — games are hot-loop + heavy-SIMD
-+ draw-call-generation workloads. PS4 guests are x86-64 user-mode (Jaguar / Orbis), so
-this is squarely x86jit's wheelhouse; no full-system work is required.
+**Milestone:** `guest-perf`. **Goal:** improve x86-64-on-ARM JIT throughput for
+workloads dominated by hot loops, SIMD arithmetic and indirect dispatch. These are
+user-mode instruction workloads; no full-system work is required.
 
-## Key principle: a running game is NOT a prerequisite
+## Key principle: a complete guest application is NOT a prerequisite
 
-~80% of JIT-perf work is **game-agnostic** — any x86-64 game stresses the same machinery
+~80% of JIT-perf work is **guest-agnostic** — many x86-64 workloads stresses the same machinery
 (SIMD float, dispatch, hot loops). Validated by:
 - **Correctness** → the unicorn oracle (real-CPU differential) — already in place.
-- **Speed** → **game-shaped microbenchmarks** we author (matrix/vec math, memcpy, tight
+- **Speed** → **SIMD and dispatch microbenchmarks** we author (matrix/vec math, memcpy, tight
   loops, vtable dispatch): deterministic, seconds-long, CI-gateable.
 
 We also already have **real SIMD-heavy binaries** to profile now: openssl (crypto SIMD),
-python, sqlite, bzip2, go_http. A game is the **last mile** (title-specific hot-spot
+python, sqlite, bzip2, go_http. A complete guest application is the **last mile** (workload-specific hot-spot
 discovery + end-to-end frame time), not the development driver — developing perf against a
-game is slower and noisier than microbench + oracle.
+complete guest application is slower and noisier than microbench + oracle.
 
 ## Current infrastructure (what exists)
 
@@ -35,12 +34,12 @@ game is slower and noisier than microbench + oracle.
 - `x86jit-bench` — per-commit native/interp/jit timing + baseline gate. **task-102 DONE**:
   bench v2 landed — native ratios (run/nat = honest "how far off native"), rolling-median
   series, load-aware gate (measures-but-doesn't-block under host load). Workloads today are
-  sha256/fib (dispatch-heavy tiny blocks) — NOT game-shaped yet (that gap is task-169).
+  sha256/fib (dispatch-heavy tiny blocks) — NOT SIMD and dispatch yet (that gap is task-169).
 
 ## Status note (already done)
 
 - **task-102 DONE** — the measurement framework (native ratios, compile/run split,
-  noise/load-aware gate) is in place. Tier 0 now only needs game-shaped *workloads*
+  noise/load-aware gate) is in place. Tier 0 now only needs SIMD and dispatch *workloads*
   (task-169), not more bench framework.
 - **task-101 DONE** — the "+19% bg-tier dispatch regression" was largely a *measurement
   artifact* (jit/interp ratio reads high under host load); closed by task-102's load-aware
@@ -50,26 +49,26 @@ game is slower and noisier than microbench + oracle.
 ## Tiers (priority order)
 
 ### Tier 0 — Measurement foundation (framework DONE via task-102)
-- **task-169** — game-shaped microbench suite (SIMD kernels, dispatch stress, hotloop sweep,
-  memcpy, vtable dispatch). The harness that unblocks everything without a game. This is the
+- **task-169** — SIMD and dispatch microbench suite (SIMD kernels, dispatch stress, hotloop sweep,
+  memcpy, vtable dispatch). The harness that unblocks everything without a complete guest application. This is the
   remaining Tier-0 item now that the bench framework (task-102) has landed.
 - Profile the real SIMD binaries (openssl/bzip2/python) via task-140 perfmap + `perf` to
   seed the hot-op list.
 
 ### Tier 1 — Biggest lever: SIMD lowering (the ~223 helper→interp fallbacks)
-- **task-170** — audit + rank the helper→interp SIMD fallbacks by games-hotness.
+- **task-170** — audit + rank the helper→interp SIMD fallbacks by workload hotness.
 - **task-171** — native-lower the hot AVX/SSE float ops (drop helper→interp on the hot
-  path) → NEON. Expect **2–10×** on SIMD-heavy loops. The single biggest games lever.
+  path) → NEON. Expect **2–10×** on SIMD-heavy loops. The single biggest SIMD lever.
 
 ### Tier 2 — Dispatch overhead
 - IBTC + block chaining already landed (task-62, R4). The task-101 "+19% regression" was a
-  load-artifact (see Status note), not a real cost. Revisit only if game-shaped profiling
-  (task-169) flags real per-dispatch overhead or computed-jump churn (game vtables /
+  load-artifact (see Status note), not a real cost. Revisit only if SIMD and dispatch profiling
+  (task-169) flags real per-dispatch overhead or computed-jump churn (guest vtables /
   function pointers) — file fresh with the profile.
 
 ### Tier 3 — Hot-region compilation (superblocks / traces)
 - **task-111** — compiled backedge counters → baseline→region **OSR** promotion (jump into
-  an optimized region mid-loop; games spend ~90% in a few loops).
+  an optimized region mid-loop; the measured workload spends ~90% in a few loops).
 - **task-108** — dedicated region-compile worker (heavy region compiles must not clog
   single-block tier-up).
 - **task-109** — adaptive tier thresholds (scale the region gate with queue/code-cache
@@ -77,7 +76,7 @@ game is slower and noisier than microbench + oracle.
 - **task-110** — hotloop-length sweep bench validating adaptive tier selection.
 
 ### Tier 4 — Persistent / AOT cache
-- **task-84** — AOT / persistent translation cache. Games re-run the same (huge) code
+- **task-84** — AOT / persistent translation cache. Large applications re-run the same (huge) code
   every launch; caching translations to disk kills cold-start re-JIT (first-run hitching).
 
 ### Tier 5 — Micro
@@ -88,7 +87,7 @@ game is slower and noisier than microbench + oracle.
 
 Bench framework (task-102) and the 146 "regression" are already resolved, so:
 
-1. **task-169** — game-shaped microbench workloads on the existing bench-v2 framework
+1. **task-169** — SIMD and dispatch microbench workloads on the existing bench-v2 framework
    (unblocks everything; also profile openssl/bzip2/python via task-140 to seed hot ops).
 2. **task-170 → task-171** — audit then native-lower hot AVX/SSE float (THE big lever, 2–10×).
 3. **task-111 / 157** — hot-region OSR + region worker.
@@ -96,6 +95,5 @@ Bench framework (task-102) and the 146 "regression" are already resolved, so:
 5. **task-172** — hot-path micro-opts (RAM bounds-elision, reg residency, flags).
 
 Every step: author/extend a microbench → measure (native ratio) → optimize → validate
-bit-exact vs unicorn → CI-gate. Minutes-long iterations, no game required. The game, once
-`unemups4` runs code, is added as a profiling source to discover title-specific hot spots
-that then become new microbench entries.
+bit-exact vs unicorn → CI-gate. Minutes-long iterations, no complete guest application required. Embedder workloads can later supply profiles
+whose hot spots become new microbench entries.

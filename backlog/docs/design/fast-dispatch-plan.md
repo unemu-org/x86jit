@@ -8,7 +8,7 @@ created_date: '2026-07-06 11:25'
 # fast-dispatch — phased implementation plan
 
 Branch: `feat/fast-dispatch`. Companion brief: [`fast-dispatch-brief.md`](fast-dispatch-brief.md).
-Authored by Fable 5 planning agent; implemented by Opus 4.8.
+Architecture plan and implementation record.
 
 ## 0. Ground truth from the code (what the plan builds on)
 

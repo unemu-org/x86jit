@@ -20,7 +20,7 @@ Three findings that share one consequence: a class of defect this project cannot
 
 **The AVX fuzz campaign generates no memory operands** (fuzz.rs ~1358). The VEX pool's common shape emits YMM registers and the explicit entries follow it, so the campaign cannot falsify memory-source decoding, effective-address computation, load width, alignment or fault behaviour for anything it counts as covered.
 
-Those two compound: the map says a Code is covered on the strength of its register form, and the fuzzer only exercises register forms. Memory-form gaps are invisible to both, which is how vextract*'s memory destination survived until a real PS4 binary trapped on it.
+Those two compound: the map says a Code is covered on the strength of its register form, and the fuzzer only exercises register forms. Memory-form gaps are invisible to both, which is how vextract*'s memory destination survived until a real guest binary trapped on it.
 
 **The native oracle captures a subset of architectural state** (native.rs ~541). x87 state is defaulted, the snapshot model has no MXCSR, and vector capture stops at register 15. A snippet can set the wrong rounding mode, raise the wrong FP exception flags, corrupt the x87 status or tag word, or write ZMM16-31 wrongly and still match every compared field. The README now states this narrowing (task-313).
 

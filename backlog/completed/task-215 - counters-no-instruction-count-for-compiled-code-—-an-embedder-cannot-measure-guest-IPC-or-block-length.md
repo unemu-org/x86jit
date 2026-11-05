@@ -22,16 +22,16 @@ Vcpu::retired_instructions ticks only on the interpreter path. The field docs in
 
 That is a defensible choice for the counter's stated purpose — a deterministic virtual-time base for a scheduler. But it leaves an embedder with no way to count the instructions that actually execute.
 
-Concretely, from unemups4 (Celeste, retail PS4 title): guest execution is about 25 ms of a 40 ms gameplay frame, 99% of it on-core, so it is genuine computation. Wiring up retired_instructions produced about 23 thousand instructions in a 10 s window — the interpreter single-steps — while chained block transitions ran roughly 1 million per FRAME. The counter is off by orders of magnitude from what executed, so it cannot answer either question that decides where optimization effort goes:
+Concretely, from a measured guest workload: guest execution is about 25 ms of a 40 ms gameplay frame, 99% of it on-core, so it is genuine computation. Wiring up retired_instructions produced about 23 thousand instructions in a 10 s window — the interpreter single-steps — while chained block transitions ran roughly 1 million per FRAME. The counter is off by orders of magnitude from what executed, so it cannot answer either question that decides where optimization effort goes:
 
-- how far from native are we per instruction? Celeste holds 60 fps on a 1.6 GHz Jaguar core; we need 25 ms per frame on a far stronger CPU. Without an instruction count that gap stays an inference from wall clock, and the two candidate explanations (poor codegen vs an abnormal amount of guest work) call for completely different work.
+- how far from native are we per instruction? the reported workload holds 60 fps on a 1.6 GHz Jaguar core; we need 25 ms per frame on a far stronger CPU. Without an instruction count that gap stays an inference from wall clock, and the two candidate explanations (poor codegen vs an abnormal amount of guest work) call for completely different work.
 - what is the average length of a compiled unit? retired divided by chained gives it directly, and that is the number that says whether superblock formation has anything to chew on and whether caps of max_blocks 16 / max_icount 256 are sized right.
 
 Note this does NOT require per-instruction accounting in compiled code, which is what the current docs rule out. Each block's instruction count is already known at lift time, so a single add of that constant on block entry is one increment per BLOCK, not per instruction — the standard approach. A region knows its own total the same way.
 
 Worth considering whether this belongs on the existing counter or on a separate one: retired_instructions is documented as a deterministic virtual-time base, and making it jump by a block's worth at a time changes its granularity for any scheduler relying on it. A separate executed-instruction counter, or an opt-in, may be the safer shape.
 
-Filed from unemups4, where the measurement is blocked. See unemups4 task-163.
+Filed from reporting embedder, where the measurement is blocked. See reporting embedder task-163.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

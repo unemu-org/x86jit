@@ -34,7 +34,7 @@ Work:
 - check the interaction with HostTarget::Baseline: that path pins off AVX/FMA for deterministic, portable codegen, so confirm the optimizer does not reintroduce a difference the Baseline mode exists to prevent (mul+add contraction is the obvious thing to check)
 - verify the differential suites still pass at the chosen level — an optimizer bug shows up as a semantic difference, which is precisely what those suites exist to catch
 
-Measured context from the unemups4 embedder (Celeste, retail title): guest x86 execution is about 62% of a gameplay frame at 22-25 fps, and slow-frame RIP sampling shows the flipping thread is 99% on-core, i.e. genuinely computing rather than blocked. Guest-code throughput is now that embedder's dominant cost, so an optimizer level change is directly measurable there. Sampling also concentrates 10.9% of slow-frame samples in a single 0x3c-byte loop, which is a good before/after target.
+Measured context from the reporting embedder: guest x86 execution is about 62% of a gameplay frame at 22-25 fps, and slow-frame RIP sampling shows the flipping thread is 99% on-core, i.e. genuinely computing rather than blocked. Guest-code throughput is now that embedder's dominant cost, so an optimizer level change is directly measurable there. Sampling also concentrates 10.9% of slow-frame samples in a single 0x3c-byte loop, which is a good before/after target.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

@@ -9,7 +9,7 @@ labels:
   - 'crate:core'
   - 'crate:cranelift'
   - 'goal:perf'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies:
   - TASK-107
 ordinal: 169000

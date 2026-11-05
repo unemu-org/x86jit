@@ -3,7 +3,7 @@
   "commit_short": "c18b941",
   "subject": "chore(backlog): task-101 — bg-tier dispatch regression (sha256 jit/interp ~+19%)",
   "dirty": true,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783412941,
   "iters": 3,

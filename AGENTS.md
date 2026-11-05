@@ -8,7 +8,7 @@ Repo-specific notes for coding agents (Claude Code, Cursor, Aider, Copilot, …)
 
 `x86jit` is a guest-agnostic x86-64 → host recompiler (JIT) delivered as a pure-Rust library. You feed it a memory map plus an entry point; it executes guest x86-64 instructions on any host (x86-64 or ARM64) and hands control back through `Exit` whenever it hits something it doesn't handle (syscall, MMIO, unknown instruction). File-format parsing, OS syscall emulation, and devices live in the embedder's code, not the core — a Linux userland built on this library is [`unemulinux`](https://github.com/unemu-org/unemulinux), which is where the syscall shim, the process model, the OCI/ELF runner and the whole-program test ladder (busybox, sqlite, CPython, Go servers) live. That boundary is enforced, not just documented: `x86jit-core`'s dependency set is exactly `{iced-x86}` and `x86jit-tests/tests/boundary.rs` fails the build if it changes. The authoritative design is [`spec.md`](backlog/docs/design/spec.md); where the engine's *behaviour* comes from is [`PROVENANCE.md`](PROVENANCE.md).
 
-Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. `origin` is the maintainer's private Forgejo; the bead database is pushed there too.
+Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. The bead database is pushed only to the configured `origin`.
 
 ## Where things live
 
@@ -43,7 +43,7 @@ Don't read every `backlog/docs/` file at session start. Pick the file matching t
 
 The roles, the path from a bead to `main`, the worker rules and the publication rule are beads memories — read them with `bd memories` (`bd recall <key>` for one; `bd prime` prints them too). Read [`backlog/docs/working-on-tasks.md`](backlog/docs/working-on-tasks.md) for statuses (`open` / `in_progress` / `closed`), epics, the Definition of Done and the git flow. The supervisor picks work with `bd ready --exclude-type epic`, claims it with `bd update <id> --claim` **before** code is written, and closes it only after it lands on `main`, with a reason that names the commit. Workers do not claim or close beads; they report to the supervisor. Append to notes with `--append-notes` — never `--notes` on an existing bead, which replaces the field. Where `bd prime`'s generic advice differs from these docs and the beads memories, these docs and the memories win. Text migrated from Backlog.md still says `TASK-NNN`: `bd list --external-ref backlog:TASK-NNN` finds the bead; no match means the task was already Done — read `backlog/completed/task-NNN - *.md`.
 
-**Cross-repository ids carry a tag.** `task-40 (unemulinux)`, `doc-7 (unemulinux)`, `decision-4 (unemups4)` name *that* project's numbering; an untagged `doc-22` or `decision-5` is ours. Every project involved keeps its own counter, so the tag is what makes a reference resolvable — a bare number is only unambiguous inside one repository. Tag it when you write it: retro-fitting the tag after two counters have drifted means guessing which one a reader meant.
+**Cross-repository ids carry a tag.** `task-40 (unemulinux)`, `doc-7 (unemulinux)`, `decision-4 (unemulinux)` name *that* project's numbering; an untagged `doc-22` or `decision-5` is ours. Every project involved keeps its own counter, so the tag is what makes a reference resolvable — a bare number is only unambiguous inside one repository. Tag it when you write it: retro-fitting the tag after two counters have drifted means guessing which one a reader meant.
 
 ## Session handoff
 
@@ -51,8 +51,8 @@ The roles, the path from a bead to `main`, the worker rules and the publication 
 > [`backlog/docs/doc-28 - Republish-handoff…`](backlog/docs/doc-28%20-%20Republish-handoff-%E2%80%94-state-known-defects-and-what-must-be-fixed-before-the-repo-is-created.md)
 > before touching it: it records what is done, the known defects, what blocks creating
 > the public repository, and the traps that already cost a session. **No public repository
-> has been created yet** — do not run `gh repo create`. `origin` is the maintainer's
-> private Forgejo; never push anywhere else.
+> has been created yet** — do not run `gh repo create`. `origin` is the
+> configured remote; never push anywhere else.
 
 Ending a session mid-task, leave the state on the bead itself:
 

@@ -163,7 +163,7 @@ workload enters the corpus for another reason and can double as an end-to-end ch
 ### IRQ injection and icount virtual time (Machine Exit surface)
 
 - **Why deferred:** an `Exit` for asynchronous interrupt injection, and an instruction-count budget that returns control on a virtual-time deadline, are what a *machine* emulator needs. This is a CPU engine; every consumer so far drives it with real syscall traps and wall time, and neither has been asked for.
-- **Revisit when:** an embedder emulates a device that raises interrupts, or needs deterministic virtual time across a run (a full-system PS4 or PC model would).
+- **Revisit when:** an embedder emulates a device that raises interrupts, or needs deterministic virtual time across a run (a full-system machine model would).
 - **Tracked in:** was task-144, closed into this entry.
 
 ### AOT / persistent translation cache

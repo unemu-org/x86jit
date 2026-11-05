@@ -7,7 +7,7 @@ date: '2026-07-06 18:45'
 status: accepted
 ---
 
-**Deciders:** Mikołaj Mikołajczyk (architect consult: Fable 5)
+**Deciders:** Mikołaj Mikołajczyk (architecture review)
 
 ## Context
 

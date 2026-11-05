@@ -60,7 +60,7 @@ Key observation: **operand lowering (7.1) is the foundation of the lift** — wi
 
 ## 1. Goal and scope
 
-`x86jit` is a pure-Rust library that **executes x86-64 code on any host** (x86-64 or ARM64), via JIT recompilation. The core is **guest-agnostic** — it knows nothing about the PS4, ELF, the syscalls of any particular OS, or the GPU. It is a "CPU engine" that receives memory + a starting point and executes instructions, handing back control every time it encounters something it can't handle on its own.
+`x86jit` is a pure-Rust library that **executes x86-64 code on any host** (x86-64 or ARM64), via JIT recompilation. The core is **guest-agnostic** — it knows nothing about guest platforms, ELF, the syscalls of any particular OS, or the GPU. It is a "CPU engine" that receives memory + a starting point and executes instructions, handing back control every time it encounters something it can't handle on its own.
 
 ### What is in scope (library core)
 

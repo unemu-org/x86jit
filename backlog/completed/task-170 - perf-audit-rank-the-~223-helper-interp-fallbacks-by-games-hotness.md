@@ -8,7 +8,7 @@ updated_date: '2026-07-13 08:20'
 labels:
   - 'crate:cranelift'
   - 'goal:perf'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies: []
 ordinal: 265000
 ---
@@ -27,7 +27,7 @@ Tier-1 (doc-25). x86jit-cranelift/src/lib.rs has ~223 helper-call sites; many SI
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Done. Audit doc: backlog/docs/doc-26. Two cross-verified inventory passes (native map + helper map) over codegen/{mod,vector}.rs + lift/interp + coverage.json. KEY FINDINGS (reshape doc-25 Tier-1): (1) game-hot float core is ALREADY native (add/sub/mul/div/min/max/sqrt/cmp + all packed-int + bitwise+ternlog + imm-shifts + common shuffles/blends/broadcasts/pshufb) -> task-171's 'native-lower vmulps/vaddps, 2-10x' is a no-op, reset expectation. (2) HIGHEST-VALUE GAP is a correctness hole not a lowering: packed float<->int converts (cvtps2dq/cvtdq2ps/cvttps2dq/cvtps2pd/cvtpd2ps) are UNIMPLEMENTED and TRAP -- in x86-64-v1(SSE2) missing list, universal + very hot in games -> filed as top ps4-perf task. (3) PS4=Jaguar=SSE4.2+AVX128, NO AVX2/FMA3/AVX512 -> most remaining helper ops (var-shift, cross-lane permute, EVEX-masked, even FMA) unreachable by PS4 guests. Ranked worklist in doc: #1 cvt-packed(MISSING,do-first), #2 shift_reg, #3 dpps (SSE, PS4-reachable), #6 FMA(general track not PS4). LEGIT-keep: crypto/string/maskmov/mmx-bridge. DoD: doc-only, no code touched since task-169 green (nextest 662 passed / clippy / fmt).
+Done. Audit doc: backlog/docs/doc-26. Two cross-verified inventory passes (native map + helper map) over codegen/{mod,vector}.rs + lift/interp + coverage.json. KEY FINDINGS (reshape doc-25 Tier-1): (1) game-hot float core is ALREADY native (add/sub/mul/div/min/max/sqrt/cmp + all packed-int + bitwise+ternlog + imm-shifts + common shuffles/blends/broadcasts/pshufb) -> task-171's 'native-lower vmulps/vaddps, 2-10x' is a no-op, reset expectation. (2) HIGHEST-VALUE GAP is a correctness hole not a lowering: packed float<->int converts (cvtps2dq/cvtdq2ps/cvttps2dq/cvtps2pd/cvtpd2ps) are UNIMPLEMENTED and TRAP -- in x86-64-v1(SSE2) missing list, universal + very hot in games -> filed as top guest-perf task. (3) audited workload profile=SSE4.2+AVX128, NO AVX2/FMA3/AVX512 -> most remaining helper ops (var-shift, cross-lane permute, EVEX-masked, even FMA) unreachable by SSE4.2/AVX-128-profile guests. Ranked worklist in doc: #1 cvt-packed(MISSING,do-first), #2 shift_reg, #3 dpps (SSE, SSE4.2/AVX-128-profile), #6 FMA(general track not SSE4.2/AVX-128 profile). LEGIT-keep: crypto/string/maskmov/mmx-bridge. DoD: doc-only, no code touched since task-169 green (nextest 662 passed / clippy / fmt).
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

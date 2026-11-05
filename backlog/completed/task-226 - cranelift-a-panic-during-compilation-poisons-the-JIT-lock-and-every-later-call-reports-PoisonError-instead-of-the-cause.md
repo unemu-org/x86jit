@@ -20,7 +20,7 @@ ordinal: 322000
 <!-- SECTION:DESCRIPTION:BEGIN -->
 JitBackend::jit() does self.inner.lock().unwrap() (x86jit-cranelift/src/lib.rs:2341). If anything panics while that mutex is held — build_jit, or a compile — the lock is poisoned, and from then on every JIT entry panics with PoisonError. The embedder sees the secondary symptom on a later slice; the primary panic is one line far earlier in the log, or gone.
 
-Reported by unemups4: eager mode (tier_up_after = None) dies at lib.rs:2341 on PoisonError with flips=0, and the primary panic was not recoverable from the log. Eager compiles every block on first execution, so it reaches codegen paths the tiered path never does — the primary is likely a real codegen defect that this masks.
+Reported by reporting embedder: eager mode (tier_up_after = None) dies at lib.rs:2341 on PoisonError with flips=0, and the primary panic was not recoverable from the log. Eager compiles every block on first execution, so it reaches codegen paths the tiered path never does — the primary is likely a real codegen defect that this masks.
 
 Poisoning here buys nothing: Jit is rebuildable, and the guard already handles the None case. Recovering (lock().unwrap_or_else(|e| e.into_inner())) would let the first panic stand as the only failure. Optionally keep a recorded cause so a later call can re-report it.
 <!-- SECTION:DESCRIPTION:END -->

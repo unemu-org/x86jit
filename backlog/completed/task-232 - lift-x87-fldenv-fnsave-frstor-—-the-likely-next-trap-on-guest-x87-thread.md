@@ -1,6 +1,6 @@
 ---
 id: TASK-232
-title: 'lift: x87 fldenv/fnsave/frstor — the likely next trap on LN''s x87 thread'
+title: 'lift: x87 fldenv/fnsave/frstor — the likely next trap on the guest''s x87 thread'
 status: Done
 assignee: []
 created_date: '2026-08-02 18:42'
@@ -15,7 +15,7 @@ ordinal: 328000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Follow-up to TASK-231 (fnstenv). FreeBSD's fenv.h — which PS4 titles link — always pairs fnstenv with fldenv: fegetenv does fnstenv then fldcw, and feclearexcept/fesetenv/feupdateenv use fldenv proper. TASK-231 deliberately left fldenv, fnsave and frstor UNLIFTED so that a guest round-tripping the x87 environment traps loudly rather than restoring the partly-fabricated image fnstenv writes (FIP/CS+FOP/FDP/FDS are not modeled). That is the right call, but it means Little Nightmares is expected to fault again on the same thread as soon as it hits the restore half of the pair.
+Follow-up to TASK-231 (fnstenv). FreeBSD's fenv.h — which guest programs link — always pairs fnstenv with fldenv: fegetenv does fnstenv then fldcw, and feclearexcept/fesetenv/feupdateenv use fldenv proper. TASK-231 deliberately left fldenv, fnsave and frstor UNLIFTED so that a guest round-tripping the x87 environment traps loudly rather than restoring the partly-fabricated image fnstenv writes (FIP/CS+FOP/FDP/FDS are not modeled). That is the right call, but it means the reported workload is expected to fault again on the same thread as soon as it hits the restore half of the pair.
 
 Doing this properly means deciding what fldenv should do with the environment fields we do not model. Options worth weighing before writing code: ignore the pointer block on load (consistent with never having produced a real one), or model FIP/FDP for real — the latter needs the last x87 opcode, which is not available at the helper, and note that modern CPUs only update FDP when an unmasked FP exception is pending (CPUID.07H:EBX[6], FDP_EXCPTN_ONLY) and we never raise one.
 

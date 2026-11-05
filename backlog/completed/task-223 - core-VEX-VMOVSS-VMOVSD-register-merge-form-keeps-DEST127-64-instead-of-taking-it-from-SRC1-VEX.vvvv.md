@@ -28,7 +28,7 @@ VMOVSD is the same with a 64-bit scalar: DEST[63:0] := SRC2[63:0]; DEST[127:64] 
 
 Observed: DEST[63:32] IS taken from SRC1 (correct), but DEST[127:64] is left holding the destination's previous contents. The merge appears to be done at 64-bit granularity with the upper half preserved rather than sourced from vvvv.
 
-MEASURED, both backends (default JIT and UNEMUPS4_BACKEND=interp equivalent), and through both Vcpu::run block execution and Vcpu::step_instruction:
+MEASURED, both backends (default JIT and an interpreter-only configuration), and through both Vcpu::run block execution and Vcpu::step_instruction:
 
   vmovss %xmm6,%xmm4,%xmm2   [c5 da 10 d6]
     xmm6 = [3fb6cd8e 00000000 00000000 00000000]   (SRC2)
@@ -45,7 +45,7 @@ The memory-source forms are CORRECT and are the control: vmovss (%rdi),%xmm2 [c5
 
 WHY IT SURVIVED: the defect is invisible whenever the destination's upper 64 bits already equal SRC1's — which is the common case right after a vxorps, and is why a differential suite can pass while real code breaks.
 
-FOUND VIA: a real title (UE4) composing its projection matrix. UE4's AdjustProjectionMatrixForRHI builds FScaleMatrix/FTranslationMatrix row 0 with this exact instruction, whose destination still holds the scale's row 2 from a vinsertps two instructions earlier. The stale 1.0 survives in lane 2, so row 0 becomes (1,0,1,0) instead of (1,0,0,0); the projection is multiplied by both matrices back to back, so its third column picks up its first column twice and M[0][2] comes out as exactly 2*M[0][0]. Clip-space Z becomes a function of screen X and 75% of every frame is Z-clipped. Encoding confirmed by reading the guest's own bytes at run time (c5 da 10 d6), not from a hand-assembled mnemonic.
+FOUND VIA: a graphics workload composing its projection matrix. Its matrix setup builds row 0 with this exact instruction, whose destination still holds the scale's row 2 from a vinsertps two instructions earlier. The stale 1.0 survives in lane 2, so row 0 becomes (1,0,1,0) instead of (1,0,0,0); the projection is multiplied by both matrices back to back, so its third column picks up its first column twice and M[0][2] comes out as exactly 2*M[0][0]. Clip-space Z becomes a function of screen X and 75% of every frame is Z-clipped. Encoding confirmed by reading the guest's own bytes at run time (c5 da 10 d6), not from a hand-assembled mnemonic.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

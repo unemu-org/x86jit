@@ -16,7 +16,7 @@ ordinal: 254000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Deferred from task-166 (Fable review). 'pop [mem]' reads [rsp], stores to [mem], then adds 8 to RSP — but the RSP commit currently happens even if the store to [mem] faults, leaving RSP already advanced. Hardware makes pop restartable: a faulting destination store must leave RSP unchanged (fault-before-commit). Fix in x86jit-core/src/lift/control.rs (lift_pop) — order the store before the RSP WriteReg, or otherwise ensure RSP is only committed after the store succeeds. Confirmed real by the 223 agent (interp: rsp=0x8008 after an UnmappedMemory{Write} fault). Verify interp==jit and add a faulting-pop-[mem] test. LOW severity (rare fault path).
+Deferred from task-166 (architecture review). 'pop [mem]' reads [rsp], stores to [mem], then adds 8 to RSP — but the RSP commit currently happens even if the store to [mem] faults, leaving RSP already advanced. Hardware makes pop restartable: a faulting destination store must leave RSP unchanged (fault-before-commit). Fix in x86jit-core/src/lift/control.rs (lift_pop) — order the store before the RSP WriteReg, or otherwise ensure RSP is only committed after the store succeeds. Confirmed real by the 223 agent (interp: rsp=0x8008 after an UnmappedMemory{Write} fault). Verify interp==jit and add a faulting-pop-[mem] test. LOW severity (rare fault path).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

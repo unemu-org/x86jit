@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Refuse engine source that names a downstream consumer.
 #
-# x86jit is a guest-agnostic x86-64 engine: it knows nothing about PS4, about any
-# particular game, or about the emulator embedding it. That is the project's central
+# x86jit is a guest-agnostic x86-64 engine: it knows nothing about a particular
+# guest or about the emulator embedding it. That is the project's central
 # claim, and it is the kind of claim that erodes one comment at a time — a lift driven
 # by a downstream trap gets a note saying which game hit it, and a year later the
-# "guest-agnostic" engine is full of Celeste.
+# engine is full of guest-specific references.
 #
 # It has happened: agents working a lift on a downstream project's behalf have left
 # game names, guest runtime names and that project's task ids in engine source. A scan

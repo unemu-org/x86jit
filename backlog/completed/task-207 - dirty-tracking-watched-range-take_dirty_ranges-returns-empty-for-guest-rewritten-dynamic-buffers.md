@@ -10,7 +10,7 @@ updated_date: '2026-07-20 07:17'
 labels:
   - dirty-tracking
   - smc
-  - embedder-unemups4
+  - embedder
 dependencies: []
 priority: high
 ordinal: 303000
@@ -19,7 +19,7 @@ ordinal: 303000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-The watched-range data dirty-tracking facility (x86jit-core/src/memory.rs: watch_range / note_watched_write / take_dirty_ranges, task-148/216/217) does not surface writes that guest code makes to a watched range. Observed from the unemups4 embedder (PS4 emulator): it watch_range()s a MonoGame DynamicVertexBuffer ring (~48000 B) and per-frame projection constant buffers (64 B), the guest rewrites them EVERY frame (managed SpriteBatch.SetData under interp+JIT), yet take_dirty_ranges() returns ZERO ranges every poll. The embedder's resource cache therefore served STALE bytes (66625 stale-hits measured over a run) — visually: Celeste title screen rendered frame-alternating garbage. Embedder worked around it by force-re-uploading all dynamic buffers (correct but not incremental); the proper fix is x86jit reporting these writes. Suspected: either the writes reach a path that skips note_watched_write / the JIT note_watched_store live watch_count gate, or watched pages are not re-armed after a take_dirty drain, or watch_range page-mapping misses the sub-page range. Needs a differential repro (watch a range, run guest stores into it via both interp and Cranelift tiers, assert take_dirty_ranges reports them).
+The watched-range data dirty-tracking facility (x86jit-core/src/memory.rs: watch_range / note_watched_write / take_dirty_ranges, task-148/216/217) does not surface writes that guest code makes to a watched range. Observed from the reporting embedder: it watch_range()s a dynamic vertex-buffer ring (~48000 B) and per-frame projection constant buffers (64 B), the guest rewrites them EVERY frame (managed buffer-upload routines under interp+JIT), yet take_dirty_ranges() returns ZERO ranges every poll. The embedder's resource cache therefore served STALE bytes (66625 stale-hits measured over a run) — visually: the guest output rendered frame-alternating garbage. Embedder worked around it by force-re-uploading all dynamic buffers (correct but not incremental); the proper fix is x86jit reporting these writes. Suspected: either the writes reach a path that skips note_watched_write / the JIT note_watched_store live watch_count gate, or watched pages are not re-armed after a take_dirty drain, or watch_range page-mapping misses the sub-page range. Needs a differential repro (watch a range, run guest stores into it via both interp and Cranelift tiers, assert take_dirty_ranges reports them).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -40,7 +40,7 @@ Root cause found + fixed (not yet committed). Audited EVERY guest-memory write i
   - emit_v_extract_lane_wide_m (vector.rs:~272) — vextracti32x4 to memory
   - emit_v_store_half (vector.rs:~3170) — movhps/movlps
   - emit_call (codegen/control.rs:93) — the return-address push
-That is exactly the symptom: MonoGame SetData / Mono memcpy copy the buffers with 16/32-byte SSE/AVX moves, which lower to VStore/VStoreWide, so take_dirty_ranges() saw nothing under the JIT while interp worked.
+That is exactly the symptom: managed buffer uploads / runtime memcpy copy the buffers with 16/32-byte SSE/AVX moves, which lower to VStore/VStoreWide, so take_dirty_ranges() saw nothing under the JIT while interp worked.
 
 Two of the three hypotheses in the description are DISPROVED: (a) re-arm is fine — take_dirty_ranges only clears dirty_data + the flag, watch_page/watch_count are untouched; (b) sub-page mapping is fine — watch_range covers 64 B and 48000 B correctly (reporting is page-granular, an over-approximation in the safe direction). The live watch_count gate (task-161) also works; it just was not reached from the vector paths.
 

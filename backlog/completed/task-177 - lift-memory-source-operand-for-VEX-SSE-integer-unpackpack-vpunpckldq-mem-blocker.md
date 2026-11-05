@@ -18,7 +18,7 @@ ordinal: 272000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 Mono/Celeste bring-up hits vpunpckldq 0x3a01e40,%xmm0,%xmm0 (c5 f9 62 05 aa 57 f5 01 — VEX.128.66.0F 62 /r, rip-relative memory src). The register VEX forms of the unpack/pack/shuffle family already lift (task-139); the gap is the MEMORY source operand: lift_vunpack / lift_vunpack_avx / lift_vpack reject a non-register src2 (reg_xmm returns None -> unsupported). Add memory-source support by adding _M IR variants (mirroring VPackedBinM: read a-reg pre-copied into dst, load 16 bytes from addr as b) + interp + cranelift, for the unpack family (0F 60/61/62/6A/68/69/6C/6D, both legacy and VEX.128) and pack family (0F 63/6B/67, 0F38 2B). VEX.128 upper-zeroing applies. Differential tests: legacy vs Unicorn (memory src), VEX via vex_eq_sse.
+Managed-runtime bring-up hits vpunpckldq 0x3a01e40,%xmm0,%xmm0 (c5 f9 62 05 aa 57 f5 01 — VEX.128.66.0F 62 /r, rip-relative memory src). The register VEX forms of the unpack/pack/shuffle family already lift (task-139); the gap is the MEMORY source operand: lift_vunpack / lift_vunpack_avx / lift_vpack reject a non-register src2 (reg_xmm returns None -> unsupported). Add memory-source support by adding _M IR variants (mirroring VPackedBinM: read a-reg pre-copied into dst, load 16 bytes from addr as b) + interp + cranelift, for the unpack family (0F 60/61/62/6A/68/69/6C/6D, both legacy and VEX.128) and pack family (0F 63/6B/67, 0F38 2B). VEX.128 upper-zeroing applies. Differential tests: legacy vs Unicorn (memory src), VEX via vex_eq_sse.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Implementation Plan

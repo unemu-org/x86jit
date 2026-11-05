@@ -15,7 +15,7 @@ ordinal: 282000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 (Celeste/PS4) traps on `vmovlhps %xmm0,%xmm1,%xmm0` (VEX.128.0F 16 /r). Legacy Movlhps/Movhlps are lifted (VMoveHalf) but the VEX 3-operand forms Vmovlhps/Vmovhlps are absent from dispatch. Both are exactly 64-bit-lane unpacks: vmovlhps dst=[op1.lo,op2.lo]==vpunpcklqdq(op1,op2); vmovhlps dst=[op2.hi,op1.hi]==vpunpckhqdq(op2,op1). Reuse the existing VUnpackLow op (reads both srcs before writing dst, so the dst==src2 alias in the wild shape is safe) + VZeroUpper. No new IR op.
+The reporting guest workload traps on `vmovlhps %xmm0,%xmm1,%xmm0` (VEX.128.0F 16 /r). Legacy Movlhps/Movhlps are lifted (VMoveHalf) but the VEX 3-operand forms Vmovlhps/Vmovhlps are absent from dispatch. Both are exactly 64-bit-lane unpacks: vmovlhps dst=[op1.lo,op2.lo]==vpunpcklqdq(op1,op2); vmovhlps dst=[op2.hi,op1.hi]==vpunpckhqdq(op2,op1). Reuse the existing VUnpackLow op (reads both srcs before writing dst, so the dst==src2 alias in the wild shape is safe) + VZeroUpper. No new IR op.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -27,7 +27,7 @@ unemups4 (Celeste/PS4) traps on `vmovlhps %xmm0,%xmm1,%xmm0` (VEX.128.0F 16 /r).
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Done. Lifted VEX.128 vmovlhps/vmovhlps via existing VUnpackLow (lane=8) + VZeroUpper — no new IR op. vmovlhps=unpcklqdq(op1,op2); vmovhlps=unpckhqdq(op2,op1) swapped. VUnpackLow reads both srcs before writing dst → the wild dst==src2 alias (vmovlhps %xmm0,%xmm1,%xmm0, Celeste) is safe. Tests: vmov_lhps_hlps_vex_eq_sse (semantics vs SSE lowering), vmovlhps_dst_aliases_src2 (hand oracle + upper-zero), vmovlhps_vmovhlps_match_interp (jit==interp, dirty ymm_hi). Ratchet allowlist + coverage regen (v3 +2). 725/725, clippy+fmt clean.
+Done. Lifted VEX.128 vmovlhps/vmovhlps via existing VUnpackLow (lane=8) + VZeroUpper — no new IR op. vmovlhps=unpcklqdq(op1,op2); vmovhlps=unpckhqdq(op2,op1) swapped. VUnpackLow reads both srcs before writing dst → the wild dst==src2 alias (vmovlhps %xmm0,%xmm1,%xmm0) is safe. Tests: vmov_lhps_hlps_vex_eq_sse (semantics vs SSE lowering), vmovlhps_dst_aliases_src2 (hand oracle + upper-zero), vmovlhps_vmovhlps_match_interp (jit==interp, dirty ymm_hi). Ratchet allowlist + coverage regen (v3 +2). 725/725, clippy+fmt clean.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

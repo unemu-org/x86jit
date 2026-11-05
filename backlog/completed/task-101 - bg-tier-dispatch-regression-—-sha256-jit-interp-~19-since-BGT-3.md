@@ -8,7 +8,7 @@ updated_date: '2026-07-12 20:22'
 labels:
   - bg-tier
   - 'crate:bench'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies: []
 priority: high
 ordinal: 155000

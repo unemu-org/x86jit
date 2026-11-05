@@ -33,7 +33,7 @@ The cap's justification is sound FOR CODE and is documented as such at memory.rs
 
 Consequence: in `watch_range`, `self.watch_page.get(page as usize)` returns `None` for those pages, so the registration is silently dropped — no error, no counter. `note_write` / `note_watched_write` then never find a set bit, and `take_dirty_ranges()` returns empty forever.
 
-MEASURED in unemups4 (PS4 emulator embedder, 64 GiB identity-mapped arena): guest GPU buffers live around 0x9afd52800 (~41.4 GiB). `take_dirty` returned 0 ranges on 3709 of 3709 GPU submits. The embedder cannot trust the dirty flag at all and carries a force-re-upload workaround for every dynamic vertex/index/const buffer.
+MEASURED in the reporting embedder (64 GiB identity-mapped arena): guest GPU buffers live around 0x9afd52800 (~41.4 GiB). `take_dirty` returned 0 ranges on 3709 of 3709 GPU submits. The embedder cannot trust the dirty flag at all and carries a force-re-upload workaround for every dynamic vertex/index/const buffer.
 
 Note this also explains why the change ('vector + call stores must feed watched-range dirty tracking') produced no observable change for this embedder: that fix repaired the store path, but the page bit is never registered in the first place, so the store path had nothing to find.
 

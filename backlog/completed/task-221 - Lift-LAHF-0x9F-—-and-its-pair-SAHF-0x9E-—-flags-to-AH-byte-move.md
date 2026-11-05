@@ -13,11 +13,11 @@ ordinal: 317000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-A retail UE4 title (unemups4 CUSA05952) faults with `UnknownInstruction` on `lahf` (single byte 0x9F) at guest rip 0x1c5c88c, inside what looks like a setjmp/unwind sequence: bytes are `9f 48 89 c1 58 48 83 c0 08` = lahf; mov rcx,rax; pop rax; add rax,8.
+A graphics workload faults with `UnknownInstruction` on `lahf` (single byte 0x9F) at guest rip 0x1c5c88c, inside what looks like a setjmp/unwind sequence: bytes are `9f 48 89 c1 58 48 83 c0 08` = lahf; mov rcx,rax; pop rax; add rax,8.
 
 LAHF loads AH with the low byte of RFLAGS: bit0=CF, bit1=1 (reserved, always set), bit2=PF, bit3=0, bit4=AF, bit5=0, bit6=ZF, bit7=SF. OF is NOT included. SAHF (0x9E) is the inverse — it writes CF/PF/AF/ZF/SF from AH and leaves OF untouched — and the two almost always appear together in save/restore pairs, so lifting only one leaves the other as the next wall.
 
-Both are valid in 64-bit mode on every AMD CPU (and on Intel since Nehalem); the Jaguar cores the PS4 uses set CPUID.80000001H:ECX.LAHF-SAHF[bit 0], so guest code compiled for this target may use them freely.
+Both are valid in 64-bit mode on every AMD CPU (and on Intel since Nehalem); the audited guest CPU profile sets CPUID.80000001H:ECX.LAHF-SAHF[bit 0], so guest code compiled for this target may use them freely.
 
 Note for the interpreter/JIT split: the reserved bit1 must read back as 1, and bits 3/5 as 0, otherwise a subsequent SAHF round-trip through AH will not reproduce the original flags.
 <!-- SECTION:DESCRIPTION:END -->
@@ -27,7 +27,7 @@ Note for the interpreter/JIT split: the reserved bit1 must read back as 1, and b
 - [ ] #1 `lahf` lifts in both interpreter and Cranelift backends and sets AH to CF | 0x02 | PF<<2 | AF<<4 | ZF<<6 | SF<<7, leaving OF and all other flags unchanged
 - [ ] #2 `sahf` lifts in both backends and restores CF/PF/AF/ZF/SF from AH while leaving OF unchanged
 - [ ] #3 A differential test (jit vs interp vs native) round-trips lahf/sahf over a set of flag states covering each of CF/PF/AF/ZF/SF set and clear
-- [ ] #4 unemups4 CUSA05952 passes guest rip 0x1c5c88c without an UnknownInstruction fault
+- [ ] #4 the reported guest passes guest rip 0x1c5c88c without an UnknownInstruction fault
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -88,9 +88,9 @@ Gates: cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)' 906
 the 6 new tests); clippy --all-targets --all-features -D warnings clean; fmt --check clean;
 cargo check --target aarch64-unknown-linux-gnu --tests clean.
 
-AC#4 OPEN: needs unemups4 CUSA05952 re-run past guest rip 0x1c5c88c. Cannot be checked from here.
+AC#4 OPEN: needs the reported guest re-run past guest rip 0x1c5c88c. Cannot be checked from here.
 
-AC#4 CONFIRMED by embedder 2026-07-23: unemups4 CUSA05952 passes guest rip 0x1c5c88c, no UnknownInstruction. All ACs met.
+AC#4 CONFIRMED by embedder 2026-07-23: the reported guest passes guest rip 0x1c5c88c, no UnknownInstruction. All ACs met.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

@@ -6,7 +6,7 @@ assignee: []
 created_date: '2026-07-09 18:04'
 updated_date: '2026-07-10 07:34'
 labels:
-  - unemups4-migration
+  - embedder-migration
 dependencies: []
 ordinal: 218000
 ---
@@ -14,9 +14,9 @@ ordinal: 218000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 x86jit migration (interpreter backend) hits Exit::UnknownInstruction on opcode 0x9B (FWAIT / WAIT) in the PS4 Orbis CRT __libc_start_main path.
+The reporting embedder x86jit migration (interpreter backend) hits Exit::UnknownInstruction on opcode 0x9B (FWAIT / WAIT) in the guest CRT __libc_start_main path.
 
-Repro: example ELF examples/ps4-helloworld/hello_world.elf (from unemups4), loaded at guest base 0x400000. Fault RIP 0x403146, byte [9b]. Surrounding disasm (ELF vaddr, +0x400000 at runtime):
+Repro: example ELF the reported ELF fixture, loaded at guest base 0x400000. Fault RIP 0x403146, byte [9b]. Surrounding disasm (ELF vaddr, +0x400000 at runtime):
   3133: 48 83 c7 08          add    $0x8,%rdi
   3137: 48 8b 32             mov    (%rdx),%rsi
   313a: e8 29 fe ff ff       call   2f68 <__init_libc>

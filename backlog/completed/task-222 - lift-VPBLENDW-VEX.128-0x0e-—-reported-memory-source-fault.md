@@ -1,6 +1,6 @@
 ---
 id: TASK-222
-title: lift VPBLENDW (VEX.128 0x0e) — Little Nightmares UE4 (unemups4 consumer)
+title: lift VPBLENDW (VEX.128 0x0e) — reported memory-source fault
 status: Done
 assignee: []
 created_date: '2026-07-24 05:30'
@@ -13,7 +13,7 @@ ordinal: 318000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 running Little Nightmares (PS4 UE4 title) faults with UnknownInstruction: 'vpblendw $0x3f,0x10(%r12),%xmm13,%xmm9', bytes c4 43 11 0e 4c 24 10 3f (VEX.128.66.0F3A.WIG 0E /r ib = VPBLENDW xmm, xmm, xmm/m128, imm8 — per-word blend controlled by imm8). Guest RIP 0x310e2be on the main thread; blocks LN boot after the RHI throttle deadlock was cleared upstream. Consumer: unemups4 feat/ue4-little-nightmares. After landing, unemups4 bumps its x86jit rev pin.
+A guest workload faults with UnknownInstruction: 'vpblendw $0x3f,0x10(%r12),%xmm13,%xmm9', bytes c4 43 11 0e 4c 24 10 3f (VEX.128.66.0F3A.WIG 0E /r ib = VPBLENDW xmm, xmm, xmm/m128, imm8 — per-word blend controlled by imm8). Guest RIP 0x310e2be on the main thread; blocks guest startup after an embedder throttle deadlock was cleared upstream. Consumer: the reporting embedder. After landing, reporting embedder bumps its x86jit rev pin.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

@@ -137,7 +137,7 @@ fn record(iters: u32, warmup: u32) {
         "recording {} \"{}\" on {} ({} iters)...",
         report::head_short(),
         report::head_subject(),
-        report::hostname(),
+        report::host_label(),
         iters
     );
 
@@ -162,7 +162,7 @@ fn record(iters: u32, warmup: u32) {
         commit_short: report::head_short(),
         subject: report::head_subject(),
         dirty,
-        host: report::hostname(),
+        host: report::host_label(),
         cpu: report::cpu_model(),
         timestamp_unix: report::now_unix(),
         iters,
@@ -300,11 +300,11 @@ fn gate(iters: u32, warmup: u32) {
         );
         return;
     };
-    if baseline.host != report::hostname() {
+    if baseline.host != report::host_label() {
         eprintln!(
             "perf-gate: baseline host ({}) != this host ({}) — timings not comparable, skipping.",
             baseline.host,
-            report::hostname()
+            report::host_label()
         );
         return;
     }
@@ -342,7 +342,7 @@ fn gate(iters: u32, warmup: u32) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    let window = report::clean_recent(&report::hostname(), win_k);
+    let window = report::clean_recent(&report::host_label(), win_k);
     println!(
         "{:<8} {:<10} {:>9} {:>9} {:>8} {:>8} {:>6}",
         "workload", "metric", "ref", "cur", "delta", "band", "src"

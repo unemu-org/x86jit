@@ -10,7 +10,7 @@ updated_date: '2026-08-11 11:03'
 labels:
   - 'crate:core'
   - 'goal:perf'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies:
   - TASK-107
 ordinal: 167000

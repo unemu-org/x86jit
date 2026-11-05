@@ -3,7 +3,7 @@
   "commit_short": "27e977d",
   "subject": "perf(cranelift): dedup the RMW load+store bound check (task-106)",
   "dirty": false,
-  "host": "miknix-laptop",
+  "host": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics / linux / x86_64",
   "cpu": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics",
   "timestamp_unix": 1783434073,
   "iters": 15,

@@ -1,13 +1,13 @@
 ---
 id: doc-26
-title: SIMD helper-fallback audit — games-hotness ranking (task-170)
+title: SIMD helper-fallback audit — workload-hotness ranking (task-170)
 type: other
 created_date: '2026-07-13 08:18'
 ---
 
-# SIMD helper-fallback audit — games-hotness ranking
+# SIMD helper-fallback audit — workload-hotness ranking
 
-**Task:** task-170 (ps4-perf / doc-25 Tier-1). **Method:** two cross-verified
+**Task:** task-170 (guest-perf / doc-25 Tier-1). **Method:** two cross-verified
 inventory passes over `x86jit-cranelift/src/codegen/{mod.rs,vector.rs}`,
 `x86jit-core/src/lift/`, `x86jit-core/src/interp/`, and `backlog/docs/compat/coverage.json`.
 Each SIMD op classified as **NATIVE** (`builder.ins().*` → host NEON/SSE) vs
@@ -16,7 +16,7 @@ Each SIMD op classified as **NATIVE** (`builder.ins().*` → host NEON/SSE) vs
 
 ## Headline (this reshapes doc-25 Tier-1 / task-171)
 
-1. **The game-hot float core is ALREADY native.** Packed/scalar
+1. **The SIMD-hot float core is ALREADY native.** Packed/scalar
    `add/sub/mul/div/min/max/sqrt/cmp` (ss/sd/ps/pd), *all* packed-integer arith,
    *all* bitwise incl. `vpternlog`, imm-count shifts, and the common
    shuffles/blends/broadcasts/`pshufb`/`palignr` lower to `builder.ins()` → real
@@ -29,20 +29,19 @@ Each SIMD op classified as **NATIVE** (`builder.ins().*` → host NEON/SSE) vs
    **Packed float↔int converts** — `cvtps2dq / cvtdq2ps / cvttps2dq / cvtps2pd /
    cvtpd2ps` (+ `cvtdq2pd / cvtpd2dq / cvttpd2dq`) — are **unimplemented and TRAP**.
    They sit in the **x86-64-*v1* (baseline SSE2) `missing` list** of coverage.json —
-   i.e. every x86-64 CPU including PS4's Jaguar has them, and they are ubiquitous in
-   game code (per-vertex int↔float, colour/normal packing, fixed-point). A game
+   i.e. baseline SSE2 coverage, used in SIMD code (per-vertex int↔float,
+   colour/normal packing, fixed-point). A guest
    hitting one traps as an unknown instruction *today*. **This is both hot and
    broken → do it first.** Native-lowerable directly: vector `fcvt_to_sint_sat` /
    `fcvt_from_sint` / `fpromote` / `fdemote` (the scalar `cvtsi2ss` etc. already use
    these — `vector.rs:2914-3016`).
 
-3. **PS4 = AMD Jaguar → SSE4.2 + AVX-128, but NO AVX2, NO FMA3, NO AVX-512.** So
-   most of the *remaining* HELPER ops (variable shifts `vpsllvd`, cross-lane
-   permutes `vpermd/vpermt2`, all EVEX-masked families, AVX-512 lane ops) **cannot
-   be emitted by a PS4 guest at all** — zero PS4 relevance. Even **FMA (`vfmadd*`),
-   the one clearly hot helper-backed op, is never emitted by Jaguar code.** FMA is a
-   real win for *other* (AVX2+) guests, but it does **not** belong on the ps4-perf
-   critical path. Rank accordingly below.
+3. **The audited workload profile uses SSE4.2 and 128-bit AVX, excluding AVX2,
+   FMA3 and AVX-512.** Remaining HELPER ops outside that profile include variable
+   shifts (`vpsllvd`), cross-lane permutes (`vpermd/vpermt2`), EVEX-masked families
+   and AVX-512 lane ops. FMA (`vfmadd*`) is a hot helper-backed operation for
+   workloads that use it, but falls outside this audit's initial profile. Rank
+   reachability against the workload's instruction profile below.
 
 ## What's already NATIVE (no work — reference)
 
@@ -69,20 +68,20 @@ Each SIMD op classified as **NATIVE** (`builder.ins().*` → host NEON/SSE) vs
 
 ## Ranked worklist — hot-first (currently HELPER or MISSING)
 
-Legend — **PS4?** = emitted by Jaguar (SSE4.2/AVX-128) code. **Verdict:** how hard to
-make native. Ordered by games-hotness × reachability.
+Legend — **SSE4.2/AVX-128 profile?** = included in the audited SSE4.2/AVX-128 workload profile. **Verdict:** how hard to
+make native. Ordered by workload-hotness × reachability.
 
-| # | Op(s) | Gen | PS4? | State | Games-hotness | Verdict | Notes |
+| # | Op(s) | Gen | SSE4.2/AVX-128 profile? | State | Workload hotness | Verdict | Notes |
 |---|-------|-----|------|-------|---------------|---------|-------|
 | 1 | **cvtps2dq / cvtdq2ps / cvttps2dq / cvtps2pd / cvtpd2ps** (+dq2pd/pd2dq/tpd2dq) | v1 (SSE2) | **yes** | **MISSING (traps)** | **very high** | **native, EASY** | vector `fcvt_to_sint_sat`/`fcvt_from_sint`/`fpromote`/`fdemote`; scalar forms already do this. **Hot AND broken → do first.** |
 | 2 | **shift_reg**: `psll/psrl/psra {w,d,q} xmm, xmm` (scalar xmm count) | v1 (SSE2) | **yes** | HELPER (`shift_reg`, V:772) | medium | native, EASY–MED | broadcast lane-0 count → vector `ishl/ushr/sshr`; clamp over-shift like the imm path. |
 | 3 | **dpps / dppd** | SSE4.1 | **yes** | HELPER (`dpps`, V:432/446) | medium (dot/lighting) | native, MEDIUM | `fmul` + imm src-mask + horizontal `faddv` + imm dst-mask. No single NEON op but a fixed sequence. |
 | 4 | **pmaddwd** | v1 (SSE2) | **yes** | HELPER (`pmaddwd`, V:2458) | low–med (audio/codec) | native, HARD | i16×i16 → adjacent-pair i32 hadd; needs deinterleave (`swiden`+`iadd_pairwise`-style). |
 | 5 | **packsswb / packssdw / packuswb / packusdw** (wide) | v1 (SSE2) | **yes** | HELPER (`vpack`, V:2446) | low–med (format) | native, HARD | interleaved saturating pack; 128-bit `packuswb` already native via clamp+shuffle — extend that. |
-| 6 | **vfmadd/vfmsub/vfnmadd/vfnmsub {132,213,231}{ss,sd,ps,pd}** | FMA3 | **NO** | HELPER (`fma`/`fma_mem`, V:2078/2122) | high (off-PS4) | native, EASY | `ins().fma` (single-rounding). **Big lever for AVX2+ guests; irrelevant to PS4.** Do for the general track, not ps4-perf. |
-| 7 | `vpsllvd/vpsrlvd/vpsravd/…` (per-lane variable) | AVX2 | **NO** | HELPER (`var_shift`, V:741) | med (off-PS4) | native, EASY | vector `ushr/sshr/ishl` with per-lane counts. |
-| 8 | `vpermd/vpermps/vpermq(var)/vpermt2*/vshufi32x4/vperm2f128-wide` | AVX2/512 | **NO** | HELPER (permute family) | med (off-PS4) | native, HARD | cross-lane gather; some (`vpermd`) already native, rest need spill/gather. |
-| 9 | EVEX-masked packed/logic/shift/blend (`{k}{z}`) | AVX-512 | **NO** | HELPER (`vmasked_*`, `vp_blendm`, …) | n/a for games | native, HARD | k-mask merge/zero over wide ALU. Deprioritize — no game guest emits AVX-512. |
+| 6 | **vfmadd/vfmsub/vfnmadd/vfnmsub {132,213,231}{ss,sd,ps,pd}** | FMA3 | **NO** | HELPER (`fma`/`fma_mem`, V:2078/2122) | high (outside the profile) | native, EASY | `ins().fma` (single-rounding). **Big lever for AVX2+ guests; irrelevant to SSE4.2/AVX-128 profile.** Do for the general track, not guest-perf. |
+| 7 | `vpsllvd/vpsrlvd/vpsravd/…` (per-lane variable) | AVX2 | **NO** | HELPER (`var_shift`, V:741) | med (outside the profile) | native, EASY | vector `ushr/sshr/ishl` with per-lane counts. |
+| 8 | `vpermd/vpermps/vpermq(var)/vpermt2*/vshufi32x4/vperm2f128-wide` | AVX2/512 | **NO** | HELPER (permute family) | med (outside the profile) | native, HARD | cross-lane gather; some (`vpermd`) already native, rest need spill/gather. |
+| 9 | EVEX-masked packed/logic/shift/blend (`{k}{z}`) | AVX-512 | **NO** | HELPER (`vmasked_*`, `vp_blendm`, …) | n/a for profile | native, HARD | k-mask merge/zero over wide ALU. Deprioritize — outside the audited workload profile. |
 
 ### LEGIT fallbacks — keep as helpers (do not lower)
 
@@ -94,20 +93,20 @@ separate, non-perf-critical track.
 
 ## Recommendations (feeds task-171 re-scope + new work)
 
-1. **New task, top of ps4-perf: implement packed float↔int converts** (worklist #1).
+1. **New task, top of guest-perf: implement packed float↔int converts** (worklist #1).
    It is a *v1/SSE2 coverage hole that traps*, not a perf tweak — higher impact than
    anything in task-171. Native-lowerable, bit-exact vs unicorn, add a microbench
    (int↔float per-lane) to task-169's suite.
 2. **Re-scope task-171.** Drop the "native-lower vmulps/vaddps/…" framing (already
    native) and the 2–10× claim. Retarget it at the *actually* helper-backed
-   PS4-reachable ops: worklist **#2 shift_reg, #3 dpps** (both SSE, both hit real
-   game code). Expect single-digit-% whole-program wins, not multiples — the hot
+   SSE4.2/AVX-128-profile ops: worklist **#2 shift_reg, #3 dpps** (both SSE, both hit real
+   SIMD code). Expect single-digit-% whole-program wins, not multiples — the hot
    float loops were never the helper cost.
-3. **FMA (worklist #6) → the general (non-PS4) perf track**, not ps4-perf. Cheap
-   (`ins().fma`) and high-value for AVX2+ guests, but a PS4 Jaguar guest never emits
+3. **FMA (worklist #6) → the general (wider-ISA) perf track**, not guest-perf. Cheap
+   (`ins().fma`) and high-value for AVX2+ guests, but the audited workload profile excludes
    it.
-4. **AVX2/AVX-512 helper ops (#7–#9): leave for now.** Zero PS4 reachability; only
-   worth lowering if a non-Jaguar guest workload appears.
+4. **AVX2/AVX-512 helper ops (#7–#9): leave for now.** Zero SSE4.2/AVX-128 profile reachability; only
+   worth lowering if a workload using those extensions appears.
 
 ## Provenance
 

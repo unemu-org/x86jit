@@ -165,8 +165,8 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 
 ## Git remote and CI
 
-`origin` is the maintainer's private Forgejo; there is no GitHub remote and no `gh` flow. Push only
-to `origin`, only at the maintainer's request.
+Push only to the configured `origin`, at the maintainer's request. The workflow uses
+Forgejo Actions; remote operations use `fj`.
 
 - **x86-64**: a Forgejo Actions runner, workflow `.forgejo/workflows/ci.yml`. It is manual
   only. Push the branch to `origin` first: the run checks out what is on the remote. Then
@@ -180,9 +180,9 @@ to `origin`, only at the maintainer's request.
   runs, and `fj` has no status command: read it with
   `GET /api/v1/repos/<owner>/<repo>/commits/<sha>/status`. The full output is in the job
   log the status links to.
-- **aarch64**: no CI runner. The gate runs locally on the maintainer's aarch64 macOS host — the
+- **aarch64**: no CI runner. The gate runs locally on an aarch64 macOS host — the
   full `cargo nextest` run, clippy, fmt. Changes to codegen, memory ordering or anything
-  host-specific need that run before merge. That host is aarch64-apple-darwin, not Linux:
+  host-specific need that run before merge. The local target is aarch64-apple-darwin:
   Linux-only paths (the real-program ladder, which builds `unemulinux`) do not run there.
 - The pre-push hook `ladder-smoke` builds `../unemulinux`, which does not compile on macOS. On that
   host the hook cannot pass; skipping it (`SKIP=ladder-smoke git push`, never `--no-verify`) is the

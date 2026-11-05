@@ -14,7 +14,7 @@ ordinal: 278000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Retail bring-up (unemups4 Celeste) hit an unlifted 8-bit DIV during boot: div %dil (bytes around 40 F6 F7, REX to access DIL). DIV r/m8 (F6 /6) and IDIV r/m8 (F6 /7) divide the 16-bit AX by the r/m8 divisor, packing quotient->AL and remainder->AH — distinct from the 16/32/64-bit forms that split RDX:RAX into two registers. lift_div rejected size<2, so both 8-bit forms were unlifted. (MUL/IMUL r/m8 were already done in task-133.) The Div IR op + interp divide() + cranelift div helper already support size=1; only the lift needed the AX-dividend / AL:AH-result wiring. Acceptance: div r/m8 + idiv r/m8 lift + execute interp == jit == unicorn (normal, signed-negative, div-by-zero #DE, quotient overflow, DIL via REX).
+Retail bring-up (the reporting embedder) hit an unlifted 8-bit DIV during boot: div %dil (bytes around 40 F6 F7, REX to access DIL). DIV r/m8 (F6 /6) and IDIV r/m8 (F6 /7) divide the 16-bit AX by the r/m8 divisor, packing quotient->AL and remainder->AH — distinct from the 16/32/64-bit forms that split RDX:RAX into two registers. lift_div rejected size<2, so both 8-bit forms were unlifted. (MUL/IMUL r/m8 were already done in task-133.) The Div IR op + interp divide() + cranelift div helper already support size=1; only the lift needed the AX-dividend / AL:AH-result wiring. Acceptance: div r/m8 + idiv r/m8 lift + execute interp == jit == unicorn (normal, signed-negative, div-by-zero #DE, quotient overflow, DIL via REX).
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

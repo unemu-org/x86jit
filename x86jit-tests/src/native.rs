@@ -4469,8 +4469,8 @@ mod tests {
         );
     }
 
-    /// `vpblendw` VEX.128 with an m128 src2 — the form a UE4 title (Little
-    /// Nightmares) hits as `vpblendw imm8, m128, xmm, xmm`, which the lifter rejected
+    /// `vpblendw` VEX.128 with an m128 src2 — the reported guest form
+    /// executed as `vpblendw imm8, m128, xmm, xmm`, which the lifter rejected
     /// before this. Validated against the real CPU over several imm8 masks including
     /// 0x3f (the reported one), each word distinct so a wrong per-word source selection
     /// diverges. Unicorn cannot be the oracle here: its QEMU drops VEX `vvvv`, so src1

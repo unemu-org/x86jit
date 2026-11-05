@@ -35,7 +35,7 @@ The shape is a CLIFF, not a slope: 1 -> 2 targets costs 2.6x, while 2 -> 16 adds
 
 Proposal: make the per-site IBTC N-way set-associative (4 or 8 entries per site), so a site with <= N hot targets chains instead of returning to the dispatcher. The inline sequence stays a load + compare per way, or a small tag-indexed probe; the miss path is unchanged.
 
-Relevance: this is the draw-call / virtual-dispatch shape (the workload's own doc comment says so). The unemups4 embedder runs Celeste, a MonoGame/C# title, where virtual dispatch is pervasive, and TASK-210 recorded that 10.9% of slow-frame samples sit in one 0x3c-byte loop. Guest throughput is that embedder's dominant cost.
+Relevance: this is the draw-call / virtual-dispatch shape (the workload's own doc comment says so). The reporting embedder runs a managed C# SIMD workload, where virtual dispatch is pervasive, and TASK-210 recorded that 10.9% of slow-frame samples sit in one 0x3c-byte loop. Guest throughput is that embedder's dominant cost.
 
 UNVERIFIED ASSUMPTION, resolve before building: the claim that 4 ways is enough rests on the general expectation that a real vtable call site has 1-4 hot targets, NOT on any measurement of real guest code. The bench's uniform-random pick over 16 is a deliberate worst case. Measure the actual per-site target distribution on a real workload first — if sites are genuinely highly polymorphic, an N-way cache buys much less than the table above suggests, and the answer may instead be a different miss path (e.g. a cheaper dispatcher return).
 

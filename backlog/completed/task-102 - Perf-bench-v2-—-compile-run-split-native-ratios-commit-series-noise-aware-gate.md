@@ -11,7 +11,7 @@ labels:
   - bg-tier
   - 'crate:bench'
   - 'crate:cranelift'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies: []
 priority: high
 ordinal: 156000

@@ -104,7 +104,7 @@ checkout. The supervisor squash-merges each bead into `main` as one commit: **Co
 pre-commit `gpg-uid-guard` refuses a sign-key/email mismatch). Commits and pushes happen only at the
 maintainer's request. Never bypass hooks. Details: `bd recall bead-to-main`.
 
-`origin` is the maintainer's private Forgejo. The issue database lives in `.beads/` (gitignored);
+The configured `origin` is the only push destination. The issue database lives in `.beads/` (gitignored);
 `bd dolt push` stores it in `refs/dolt/data` on `origin` (plus bd's `__dolt_remote_info__`
 branch) and it goes nowhere else. Push it after a batch of bead changes, with the maintainer's
 agreement like any push.

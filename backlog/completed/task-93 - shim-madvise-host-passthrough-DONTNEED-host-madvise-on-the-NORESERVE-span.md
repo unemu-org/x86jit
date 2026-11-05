@@ -18,7 +18,7 @@ ordinal: 140000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Fable-5 scope; LOW priority (footprint). P3 lands madvise->0 no-op (correct: advisory, Go does not rely on advice-zeroing). A host-passthrough (guest range -> base+addr madvise on the NORESERVE span) reclaims RSS for a long-running caddy. Footprint optimization, not correctness.
+Architecture-review scope; LOW priority (footprint). P3 lands madvise->0 no-op (correct: advisory, Go does not rely on advice-zeroing). A host-passthrough (guest range -> base+addr madvise on the NORESERVE span) reclaims RSS for a long-running caddy. Footprint optimization, not correctness.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Definition of Done

@@ -16,7 +16,7 @@ ordinal: 275000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 Mono/libc bring-up hits vmovntdq %xmm0,(%rdi) (VEX.128.66.0F E7 /r, non-temporal 128-bit store xmm->[mem]). Diagnosis: non-temporal is a cache HINT only — semantically a plain aligned move. Legacy Movntdq/Movntps/Movntpd already lift (route to lift_vmov, task-114) and Movnti already lifts; the gap is (a) legacy Movntdqa (66 0F38 2A, non-temporal LOAD [mem]->xmm) and (b) all VEX forms Vmovntdq (66 0F E7 store) / Vmovntps (0F 2B store) / Vmovntpd (66 0F 2B store) / Vmovntdqa (66 0F38 2A load) — none dispatched. Fix: route Movntdqa to lift_vmov(16) like Movdqa; route the VEX forms to lift_vmov_avx(4) like Vmovdqa (handles store/load + VEX.128 upper-zeroing on load). Pure decode-dispatch, no new IR. Differential tests: legacy-vs-Unicorn + VEX vex_eq_sse incl exact blocker vmovntdq [mem],xmm.
+The reporting embedder managed runtime/libc bring-up hits vmovntdq %xmm0,(%rdi) (VEX.128.66.0F E7 /r, non-temporal 128-bit store xmm->[mem]). Diagnosis: non-temporal is a cache HINT only — semantically a plain aligned move. Legacy Movntdq/Movntps/Movntpd already lift (route to lift_vmov, task-114) and Movnti already lifts; the gap is (a) legacy Movntdqa (66 0F38 2A, non-temporal LOAD [mem]->xmm) and (b) all VEX forms Vmovntdq (66 0F E7 store) / Vmovntps (0F 2B store) / Vmovntpd (66 0F 2B store) / Vmovntdqa (66 0F38 2A load) — none dispatched. Fix: route Movntdqa to lift_vmov(16) like Movdqa; route the VEX forms to lift_vmov_avx(4) like Vmovdqa (handles store/load + VEX.128 upper-zeroing on load). Pure decode-dispatch, no new IR. Differential tests: legacy-vs-Unicorn + VEX vex_eq_sse incl exact blocker vmovntdq [mem],xmm.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Implementation Plan

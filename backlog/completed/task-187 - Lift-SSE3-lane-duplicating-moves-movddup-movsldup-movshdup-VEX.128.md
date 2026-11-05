@@ -15,7 +15,7 @@ ordinal: 283000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-unemups4 (PS4) needs vmovddup; whole SSE3-dup splat family absent (legacy + VEX). Each is a fixed dword shuffle of one source, so they reuse the existing VShuffle32 op (no new IR op): movsldup=[0,0,2,2] imm 0xA0; movshdup=[1,1,3,3] imm 0xF5; movddup=[0,1,0,1] imm 0x44 (its mem form is an m64 8-byte load; the shuffle reads only dwords 0/1). VEX.128 appends VZeroUpper; ymm/256 defers via reg_xmm None.
+The reporting embedder (SSE4.2/AVX-128 profile) needs vmovddup; whole SSE3-dup splat family absent (legacy + VEX). Each is a fixed dword shuffle of one source, so they reuse the existing VShuffle32 op (no new IR op): movsldup=[0,0,2,2] imm 0xA0; movshdup=[1,1,3,3] imm 0xF5; movddup=[0,1,0,1] imm 0x44 (its mem form is an m64 8-byte load; the shuffle reads only dwords 0/1). VEX.128 appends VZeroUpper; ymm/256 defers via reg_xmm None.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

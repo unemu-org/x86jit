@@ -10,7 +10,7 @@ updated_date: '2026-08-11 11:03'
 labels:
   - 'crate:cranelift'
   - 'goal:perf'
-milestone: ps4-perf
+milestone: guest-perf
 dependencies:
   - TASK-100
 ordinal: 166000

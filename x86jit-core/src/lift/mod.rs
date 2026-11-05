@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     /// `fnstenv` lifts only as the 28-byte image. `D9 /6` with the default
-    /// operand size (the `d9 75 d8` a UE4 title faulted on) is the 32-bit-layout
+    /// operand size (the reported faulting bytes `d9 75 d8`) is the 32-bit-layout
     /// 28-byte environment; the same opcode under a `66` prefix is the 14-byte image,
     /// a different field layout with 16-bit pointer offsets, and is refused outright
     /// rather than written in the 32-bit shape.
@@ -1081,8 +1081,8 @@ mod tests {
         ));
     }
 
-    /// The exact 16 guest bytes a real guest faulted on inside
-    /// `libSceLibcInternal!powf` — a whole FreeBSD `<fenv.h>` restore sequence, not just
+    /// The exact 16 guest bytes that faulted inside a libm `powf` routine —
+    /// a whole FreeBSD `<fenv.h>` restore sequence, not just
     /// the one opcode. It has to lift as *one block*: an unsupported instruction
     /// anywhere in it fails the whole block, so this is what proves lifting `fldenv`
     /// unblocks the site rather than moving the trap one instruction along.

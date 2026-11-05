@@ -161,27 +161,27 @@ wrong with it.
 2. `TASK-236` or a conscious decision to publish without it, said in the README rather
    than left for a reader to discover. **Open question attached to it:** should this
    repository run `unemulinux`'s ladder at all? The maintainer's point is that
-   `unemups4` is a second embedder in exactly the same relationship and its tests are
+   another embedder is in exactly the same relationship and its tests are
    never run here — the asymmetry is historical, not principled, and this repo even has
    a hook named "no downstream consumer named in engine source". The counterweight is
    that the ladder has caught what the ISA corpus cannot: a default `fpu_cw` of 0 meant
    24-bit precision for every guest that never runs `fldcw`, 797 unit tests passed and
    busybox `awk` did not. Suggested resolution: keep the ~30 s smoke hook until
    `TASK-236` replaces it, then drop it — and design 236 for BOTH consumers, since the
-   missing `unemups4` trigger is a gap on that side rather than a reason to level down.
+   missing second-embedder trigger is a gap on that side rather than a reason to level down.
    Worth a `backlog decision`; the maintainer was asked and the session ended first.
 
-3. Decide `bench/history` — it carries a hostname and CPU model. So do `bench/baseline.json` and
-   `backlog/docs/performance.md`.
+3. Keep benchmark metadata publication-safe (xj-26z). `bench/history`,
+   `bench/baseline.json` and `backlog/docs/performance.md` use a generic
+   CPU-model / OS / architecture label. Matching labels do not identify a unique
+   machine; compare measurements taken on the same machine.
 
    *(Added 2026-11-04, after the move to beads and the private remote.)* The issue database
    travels with the repository as `refs/dolt/data`, and the orphan commit drops git history but
    not Dolt history: earlier bead and memory text (one epic description named a console before it
    was reworded) survives there. Before `refs/dolt/data` first goes to a public remote, squash it
    (`bd flatten`) and re-scan every bead and `bd memories` entry against the guest-agnostic guard's
-   terms plus private host and path names. Also restate as project facts the docs that describe
-   the maintainer's own machine and remote (`commands.md` § Git remote and CI, `status.md`, the
-   remote lines in `AGENTS.md` and `working-on-tasks.md`).
+   terms plus private host and path names. Keep machine and remote descriptions as project facts, without personal setup details.
 
 4. Re-run: `cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)'`
    (and the same with `--release`), `cargo clippy --all-targets --all-features -- -D
@@ -276,8 +276,8 @@ Tooling, still true:
 
 | | |
 |---|---|
-| x86jit | `~/src/x86jit`, `main` @ `621db28`, pushed to `github.com/mikolajmikolajczyk/x86jit` |
-| unemulinux | `~/src/unemulinux`, `main` @ `fbf275e` |
+| x86jit | project checkout, `main` @ `621db28` at this handoff |
+| unemulinux | sibling embedder checkout, `main` @ `fbf275e` at this handoff |
 | oracles | submodule in both, `unemu-org/oracles`. The SDM is **fetch-only** — `./oracles/fetch-oracles.sh fetch` before deriving a new hardware fact |
 | the LLVM bundle | `backlog/docs/llvm-i128-miscompile/` — `run.sh`, `UPSTREAM-REPORT.md` |
-| fixture + renumber archive | `~/src/x86jit-fixture-mirror` — **only copy**, do not delete |
+| fixture + renumber archive | external migration archive — retain until the republish is verified |

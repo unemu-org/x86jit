@@ -41,8 +41,9 @@ impl Stat {
 }
 
 /// One benchmark run's full result set, keyed by the commit it was taken at.
-/// `host` + `dirty` guard comparisons: timings only compare on the same machine, and
-/// a dirty tree means the numbers don't belong to the recorded commit. `loadavg1` +
+/// `host` describes the CPU model, OS and architecture; it is not a machine identity.
+/// Timings still require the same machine, and a dirty tree means the numbers don't
+/// belong to the recorded commit. `loadavg1` +
 /// `quality` let the gate discount a record taken under host load.
 #[derive(Serialize, Deserialize)]
 pub struct Record {
@@ -213,17 +214,49 @@ pub fn is_dirty() -> bool {
         .unwrap_or(false)
 }
 
-pub fn hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
+/// Publication-safe comparison label, without a machine or user name.
+pub fn host_label() -> String {
+    format!(
+        "{} / {} / {}",
+        cpu_model(),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
 }
 
-/// First `model name` line from /proc/cpuinfo, for context in the record.
+/// CPU model from the platform's hardware information, for context in the record.
 pub fn cpu_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/sbin/sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let out = Command::new("/usr/sbin/system_profiler")
+                    .arg("SPHardwareDataType")
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.trim();
+                        line.strip_prefix("Chip:")
+                            .or_else(|| line.strip_prefix("Processor Name:"))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    })
+            })
+            .unwrap_or_else(|| "unknown".into())
+    }
+    #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| {
@@ -505,4 +538,28 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 pub fn mad(xs: &[f64], med: f64) -> f64 {
     let dev: Vec<f64> = xs.iter().map(|x| (x - med).abs()).collect();
     median(&dev).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn host_label_records_cpu_os_and_arch() {
+        assert_eq!(
+            host_label(),
+            format!(
+                "{} / {} / {}",
+                cpu_model(),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_cpu_model_is_available() {
+        assert_ne!(cpu_model(), "unknown");
+    }
 }

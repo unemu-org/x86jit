@@ -1,0 +1,42 @@
+---
+id: TASK-175
+title: >-
+ REGRESSION: an x86jit pin bump freezes the sample workload (63fps -> ~1 flip/20s) — bisect
+ the SIMD lowerings
+status: Done
+assignee: []
+created_date: '2026-07-13 11:58'
+updated_date: '2026-07-13 12:30'
+labels:
+ - regression
+ - simd
+ - perf
+ - real-software
+ - sample-workload
+dependencies: []
+ordinal: 270000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+Bumping reporting embedder's x86jit pin across a ~60-change range catastrophically regresses sample workload running on the reporting embedder. A/B measured via flips/frames rendered in a fixed 20s wall-clock window (SubmitFlip count): at the old pin the sample workload runs ~63fps (1262 flips/20s, fully playable — menu, gameplay); at the new pin it drops to ~1 flip/20s = effectively frozen. The near-total freeze (not a gradual slowdown) points to a SIMD CORRECTNESS regression: a wrong result on an op the sample workload's software renderer runs every frame likely traps the guest in an infinite/near-infinite loop rather than a mere perf cliff. That range includes threading/linux work AND SIMD lifts; strongest suspects are the SIMD lowerings the sample workload renderer exercises per frame: task-171 (native-lower register-count packed shifts; native-lower dpps), task-173 (packed float<->int converts cvt*), task-139 (insertps/dpps/pcmpistrm), task-134 (SSE2 packed sat add/sub, pavg, signed packs, pmaddwd), and the task-159 SIMD lifts. The sample workload uses packed int (pmaddwd/packs/pavg), packed shifts, and float<->fixed cvt heavily. Bisect with the interp-vs-hardware differential tracer (task-159 tooling) + the task-169 game-shaped microbench — a lowering whose native path disagrees with interp/hardware is the culprit. Note: movmskps/pd (task-174, in the same range) is a NEW lift and unlikely to freeze; the regression is almost certainly a task-171/173/190/195/215 native-lowering.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 Root-cause change in that range identified (bisect); the failing SIMD op named with the wrong-result or perf-cliff evidence (interp-vs-hardware diff or microbench)
+- [ ] #2 Fix lands so a build carrying the MOVMSKPS/MOVMSKPD lift (task-174) also runs the sample workload at ~full speed in reporting embedder (>~50fps, i.e. hundreds of flips/20s)
+- [ ] #3 A regression test (differential or microbench) covers the specific op so this class doesn't silently recur
+<!-- AC:END -->
+
+## Definition of Done
+<!-- DOD:BEGIN -->
+- [ ] #1 cargo nextest run (--features unicorn) green, minus fuzz_robustness
+- [ ] #2 cargo clippy --all-targets --all-features -- -D warnings clean
+- [ ] #3 cargo fmt --check clean (nix-pinned rustfmt)
+<!-- DOD:END -->
+
+## Resolution — NOT an x86jit bug
+
+Bisected to x86jit the change (task-165, "SYSCALL RCX/R11 (amd64-only)"). That is a CORRECTNESS fix — real SYSCALL clobbers RCX(<-RIP)/R11(<-RFLAGS). The reporting embedder emulator relied on the old lift preserving RCX (it read a syscall 4th arg from RCX). The freeze is reporting embedder-side and fixed there (reporting embedder task-87: move the 4th arg via R10). No x86jit change needed. My earlier SIMD suspicion was wrong. Can be closed once reporting embedder lands task-87 + re-bumps.

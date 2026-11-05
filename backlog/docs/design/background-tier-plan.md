@@ -12,7 +12,7 @@ the vcpu's critical path: a hot block keeps running interpreted while a
 **background compiler thread** produces its compiled form, which is then
 atomically switched in through the existing `TranslationCache::upgrade`
 machinery. Standard concurrent tiering (V8 / HotSpot C1-C2 shape). Authored by
-Fable 5 (architect session, 2026-07-06), grounded in the code at the change; exact sites cited below.
+Architecture review (2026-07-06), grounded in the code at the change; exact sites cited below.
 
 **Framing.** This is a JIT-architecture improvement (§9 dispatcher, §8
 backends): it removes the inline-compile latency spike on the nth execution of
