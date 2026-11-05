@@ -85,6 +85,12 @@ $details"
     ;;
 esac
 
+# The native-oracle tests compare against this CPU, and x87 and SSE corner cases
+# differ by vendor: name the CPU model (never the machine) on the first line.
+cpu=$(sed -n 's/^model name[[:space:]]*: *//p' /proc/cpuinfo 2>/dev/null | head -n 1)
+desc="host CPU: ${cpu:-unknown}
+$desc"
+
 desc=$(printf '%s' "$desc" | tr -d '\r')
 if [ "${#desc}" -gt "$LIMIT" ]; then
   desc="$(printf '%s' "$desc" | head -c "$LIMIT")
