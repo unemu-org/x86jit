@@ -873,13 +873,15 @@ impl F80 {
             // SDM Vol 1 §8.5.4: an unmasked register overflow stores a result
             // biased downward by 24576; massive FSCALE overflow stores infinity.
             if ctl.0 & Exc::OE.0 == 0 {
-                let r = if exp - 24576 > EMAX {
-                    F80::inf(a.sign)
-                } else {
-                    F80 {
-                        exp: exp - 24576,
-                        ..a
-                    }
+                if exp - 24576 > EMAX {
+                    // SDM Vol 1 §§4.9.1.6, 8.5.6; AMD APM Vol 1
+                    // §§6.8.2.7, 6.8.4.2 Table 6-22; Vol 5 §FSCALE:
+                    // finite -> infinity is inexact and rounds up in magnitude.
+                    return (F80::inf(a.sign), base.with(Exc::OE).with(Exc::PE), true);
+                }
+                let r = F80 {
+                    exp: exp - 24576,
+                    ..a
                 };
                 return (r, base.with(Exc::OE), false);
             }
@@ -892,13 +894,15 @@ impl F80 {
         // SDM Vol 1 §8.5.5: register underflow uses the opposite bias, with
         // no significand loss. Massive FSCALE underflow stores signed zero.
         if !ctl.masks_underflow() {
-            let r = if exp + 24576 < EMIN {
-                F80::zero(a.sign)
-            } else {
-                F80 {
-                    exp: exp + 24576,
-                    ..a
-                }
+            if exp + 24576 < EMIN {
+                // SDM Vol 1 §§4.9.1.6, 8.5.6; AMD APM Vol 1
+                // §§6.8.2.7, 6.8.4.2 Table 6-22; Vol 5 §FSCALE:
+                // nonzero -> zero is inexact and rounds toward zero (C1=0).
+                return (F80::zero(a.sign), base.with(Exc::UE).with(Exc::PE), false);
+            }
+            let r = F80 {
+                exp: exp + 24576,
+                ..a
             };
             return (r, base.with(Exc::UE), false);
         }
@@ -1749,6 +1753,44 @@ mod tests {
     }
     fn back(a: F80) -> f64 {
         f64::from_bits(a.to_f64())
+    }
+
+    #[test]
+    fn scale_massive_overflow_is_inexact_and_rounds_up() {
+        // SDM Vol 1 §§8.5.4, 4.9.1.6; AMD APM Vol 1 §§6.8.2.7,
+        // 6.8.4.2 Table 6-22; Vol 5 §FSCALE: finite -> infinity loses
+        // precision and rounds upward in magnitude, even after exponent biasing.
+        for sign in [false, true] {
+            for rc in 0..4 {
+                for pm in [0, 0x20] {
+                    let ctl = Ctl((0x037f & !(0x08 | pm)) | rc << 10);
+                    let (r, exc, up) =
+                        F80::scale(f(if sign { -1.0 } else { 1.0 }), f(65536.0), ctl);
+                    assert_eq!(r.to_bytes(), F80::inf(sign).to_bytes());
+                    assert_eq!(exc.0, 0x28, "sign={sign}, cw={:04x}", ctl.0);
+                    assert!(up, "sign={sign}, cw={:04x}", ctl.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scale_massive_underflow_is_inexact_and_rounds_toward_zero() {
+        // SDM Vol 1 §§8.5.5, 4.9.1.6; AMD APM Vol 1 §§6.8.2.7,
+        // 6.8.4.2 Table 6-22; Vol 5 §FSCALE: nonzero -> zero loses
+        // precision and rounds toward zero, even after exponent biasing.
+        for sign in [false, true] {
+            for rc in 0..4 {
+                for pm in [0, 0x20] {
+                    let ctl = Ctl((0x037f & !(0x10 | pm)) | rc << 10);
+                    let (r, exc, up) =
+                        F80::scale(f(if sign { -1.0 } else { 1.0 }), f(-65536.0), ctl);
+                    assert_eq!(r.to_bytes(), F80::zero(sign).to_bytes());
+                    assert_eq!(exc.0, 0x30, "sign={sign}, cw={:04x}", ctl.0);
+                    assert!(!up, "sign={sign}, cw={:04x}", ctl.0);
+                }
+            }
+        }
     }
 
     /// f64 ULP distance (finite values).

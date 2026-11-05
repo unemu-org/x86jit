@@ -658,6 +658,67 @@ fn fscale_truncates_and_preserves_extended_precision() {
 }
 
 #[test]
+fn fscale_massive_range_exceptions_report_precision_and_rounding() {
+    // SDM Vol 1 §§4.9.1.4–4.9.1.6, 8.5.4–8.5.6; Vol 2A §3.2 FSCALE.
+    // AMD APM Vol 1 §§6.8.2.7, 6.8.4.1–6.8.4.2, Tables 6-21/6-22;
+    // Vol 5 §FSCALE: PE accompanies an inexact register result under either
+    // exception mask. Massive unmasked overflow stores infinity (C1=1),
+    // massive unmasked underflow stores zero (C1=0), regardless of RC/PC.
+    for pc in [0, 2, 3] {
+        for rc in 0..4 {
+            for sign in [false, true] {
+                let se = if sign { 0x8000 } else { 0 };
+                for (scale, range) in [(65536, 8), (-65536, 0x10)] {
+                    for unmask in [0, range, 0x20, range | 0x20] {
+                        let cw = (0x007f | pc << 8 | rc << 10) & !unmask;
+                        let out = check(
+                            input(
+                                &[0xd9, 0xfd],
+                                Some(number(if sign { -1 } else { 1 })),
+                                Some(number(scale)),
+                                cw,
+                                2,
+                                64,
+                            ),
+                            EXCEPTIONS | C1,
+                            CpuMode::Long64,
+                        );
+                        let range_unmasked = unmask & range != 0;
+                        let directed_up = (rc == 1 && sign) || (rc == 2 && !sign);
+                        let (result, up) = if scale > 0 {
+                            let inf = range_unmasked || rc == 0 || directed_up;
+                            (
+                                if inf {
+                                    enc(1 << 63, 0x7fff | se)
+                                } else {
+                                    enc(u64::MAX, 0x7ffe | se)
+                                },
+                                inf,
+                            )
+                        } else {
+                            let up = !range_unmasked && directed_up;
+                            (enc(u64::from(up), se), up)
+                        };
+                        let context = format!("scale={scale}, sign={sign}, cw={cw:04x}");
+                        assert_eq!(out.cpu.st[0], result, "{context}");
+                        assert_eq!(out.cpu.st[1], number(scale), "{context}");
+                        assert_eq!(out.cpu.fpu_top, 6, "{context}");
+                        assert_eq!(
+                            env(&out).0 & (EXCEPTIONS | C1),
+                            range
+                                | 0x20
+                                | if up { C1 } else { 0 }
+                                | if unmask != 0 { 0x8080 } else { 0 },
+                            "{context}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fcom_fucom_ftst_and_fxam_classes() {
     // SDM Vol 1 §4.9.2: invalid and QNaN responses precede denormal.
     for (op, nan, expected) in [
@@ -936,13 +997,13 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
         ),
         ([0xda, 0xe9], Some(number(1)), Some(enc(1, 0)), 2, 2),
         ([0xd9, 0xe4], None, None, 1, 0x41),
-        ([0xd9, 0xfd], Some(number(1)), Some(number(65536)), 8, 8),
+        ([0xd9, 0xfd], Some(number(1)), Some(number(65536)), 8, 0x28),
         (
             [0xd9, 0xfd],
             Some(number(1)),
             Some(number(-65536)),
             0x10,
-            0x10,
+            0x30,
         ),
         (
             [0xd9, 0xfd],
@@ -1040,6 +1101,9 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
         if exact_scale_overflow {
             assert_eq!(env(&observed).0 & C1, 0);
         }
+        if op == [0xd9, 0xfd] && matches!(b, Some(v) if v == number(65536) || v == number(-65536)) {
+            assert_eq!(env(&observed).0 & C1, if expected == 0x28 { C1 } else { 0 });
+        }
         if comparison {
             assert_eq!(
                 env(&observed).0 & CODES,
@@ -1083,6 +1147,11 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
             assert_eq!(sw & EXCEPTIONS, expected | 0x8080, "op={op:02x?}");
             if exact_scale_overflow {
                 assert_eq!(sw & C1, 0, "op={op:02x?}");
+            }
+            if op == [0xd9, 0xfd]
+                && matches!(b, Some(v) if v == number(65536) || v == number(-65536))
+            {
+                assert_eq!(sw & C1, if expected == 0x28 { C1 } else { 0 });
             }
             if comparison {
                 assert_eq!(
