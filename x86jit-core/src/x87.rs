@@ -580,6 +580,26 @@ macro_rules! operand {
     };
 }
 
+/// SDM Vol 1 §§4.9.2, 8.5.1.1: stack underflow precedes NaN handling.
+/// Substituting indefinite for only the empty input would let arithmetic select
+/// the other input's NaN payload instead of writing the required indefinite.
+/// `None` means the stack-fault response has completed the instruction.
+fn binary_stack_operands(cpu: &mut CpuState, sti: u8, dst: u8, pops: bool) -> Option<(F80, F80)> {
+    let top = cpu.fpu_top;
+    let other = (top + sti as u32) & 7;
+    if cpu.fpu_empty & ((1 << top) | (1 << other)) != 0 {
+        cpu.fpu_sw &= !(1 << 9);
+        if !raise(cpu, Exc::IE.with(Exc::SF)) {
+            set_st(cpu, dst, F80::indefinite());
+            if pops {
+                pop(cpu);
+            }
+        }
+        return None;
+    }
+    Some((st_operand(cpu, 0)?, st_operand(cpu, sti)?))
+}
+
 fn set_st(cpu: &mut CpuState, i: u8, v: F80) {
     let phys = ((cpu.fpu_top + i as u32) & 7) as usize;
     cpu.fpr[phys] = v.to_bytes();
@@ -1382,7 +1402,7 @@ fn exec_x87_inner<M: FpMem>(
             push(cpu, sig);
         }
         FaddP | FsubP | FsubrP | FmulP | FdivP | FdivrP => {
-            let (s0, si) = (operand!(cpu, 0), operand!(cpu, sti));
+            let (s0, si) = binary_stack_operands(cpu, sti, sti, true)?;
             // #D on either arithmetic operand, from the raw register images — the
             // working `F80` has already normalized a denormal away.
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
@@ -1412,7 +1432,7 @@ fn exec_x87_inner<M: FpMem>(
         }
         FaddSti | FsubSti | FsubrSti | FmulSti | FdivSti | FdivrSti => {
             // Register-form arithmetic with ST(0) as the destination (no pop).
-            let (s0, si) = (operand!(cpu, 0), operand!(cpu, sti));
+            let (s0, si) = binary_stack_operands(cpu, sti, 0, false)?;
             // #D on either arithmetic operand, from the raw register images — the
             // working `F80` has already normalized a denormal away.
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
@@ -1433,7 +1453,7 @@ fn exec_x87_inner<M: FpMem>(
         }
         FaddToSti | FsubToSti | FsubrToSti | FmulToSti | FdivToSti | FdivrToSti => {
             // Register-form arithmetic with ST(i) as the destination (no pop).
-            let (s0, si) = (operand!(cpu, 0), operand!(cpu, sti));
+            let (s0, si) = binary_stack_operands(cpu, sti, sti, false)?;
             // #D on either arithmetic operand, from the raw register images — the
             // working `F80` has already normalized a denormal away.
             let den = st_denormal(cpu, 0) || st_denormal(cpu, sti);
@@ -1592,8 +1612,7 @@ fn exec_x87_inner<M: FpMem>(
         }
         Fscale | Fprem1 => {
             let den = st_denormal(cpu, 0) || st_denormal(cpu, 1);
-            let a = operand!(cpu, 0);
-            let b = operand!(cpu, 1);
+            let (a, b) = binary_stack_operands(cpu, 1, 0, false)?;
             let (r, exc, partial, q, up) = if kind == Fscale {
                 let (r, e, up) = F80::scale(a, b, ctl(cpu));
                 (r, e, false, 0, up)
@@ -1764,7 +1783,7 @@ fn exec_x87_inner<M: FpMem>(
             cpu.fpu_sw &= !0b1000_0001_1111_1111;
         }
         Fprem => {
-            let (a, b) = (operand!(cpu, 0), operand!(cpu, 1));
+            let (a, b) = binary_stack_operands(cpu, 1, 0, false)?;
             set_st(cpu, 0, F80::rem(a, b));
         }
         // --- Transcendentals ---
@@ -1800,7 +1819,7 @@ fn exec_x87_inner<M: FpMem>(
             }
         }
         Fpatan => {
-            let (a, b) = (operand!(cpu, 1), operand!(cpu, 0));
+            let (b, a) = binary_stack_operands(cpu, 1, 1, true)?;
             let r = if ext {
                 F80::atan2_ext(a, b)
             } else {
@@ -1814,7 +1833,7 @@ fn exec_x87_inner<M: FpMem>(
             set_st(cpu, 0, if ext { x.exp2m1_ext() } else { x.exp2m1() });
         }
         Fyl2x => {
-            let (y, x) = (operand!(cpu, 1), operand!(cpu, 0));
+            let (x, y) = binary_stack_operands(cpu, 1, 1, true)?;
             let r = if ext {
                 F80::ylog2x_ext(y, x)
             } else {
@@ -1824,7 +1843,7 @@ fn exec_x87_inner<M: FpMem>(
             pop(cpu);
         }
         Fyl2xp1 => {
-            let (y, x) = (operand!(cpu, 1), operand!(cpu, 0));
+            let (x, y) = binary_stack_operands(cpu, 1, 1, true)?;
             let r = if ext {
                 F80::ylog2xp1_ext(y, x)
             } else {

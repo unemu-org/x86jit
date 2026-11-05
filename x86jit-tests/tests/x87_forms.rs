@@ -151,7 +151,17 @@ fn check(input: VectorInput, mask: u16, mode: CpuMode) -> RunOutcome {
     check_with_native(input, mask, mode, true)
 }
 
-fn check_with_native(input: VectorInput, mask: u16, mode: CpuMode, _native: bool) -> RunOutcome {
+fn check_with_native(input: VectorInput, mask: u16, mode: CpuMode, native: bool) -> RunOutcome {
+    check_with_native_mask(input, mask, mode, native, mask)
+}
+
+fn check_with_native_mask(
+    input: VectorInput,
+    mask: u16,
+    mode: CpuMode,
+    _native: bool,
+    _native_mask: u16,
+) -> RunOutcome {
     let interp = run_with_backend_mode(
         &input,
         Box::new(InterpreterBackend),
@@ -166,7 +176,7 @@ fn check_with_native(input: VectorInput, mask: u16, mode: CpuMode, _native: bool
         mode,
     );
     assert_eq!(jit.exit, ExitKind::Hlt);
-    let assert_same = |other: &RunOutcome| {
+    let assert_same = |other: &RunOutcome, mask: u16| {
         let data = &input.mem_init[1].bytes;
         let context = format!(
             "code={:02x?}, operands={:02x?}, cw={:02x?}",
@@ -188,11 +198,11 @@ fn check_with_native(input: VectorInput, mask: u16, mode: CpuMode, _native: bool
             }
         }
     };
-    assert_same(&jit);
+    assert_same(&jit, mask);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if _native && mode == CpuMode::Long64 {
         let native = x86jit_tests::native::run_native(&input).expect("native x87 witness");
-        assert_same(&native);
+        assert_same(&native, _native_mask);
     }
     interp
 }
@@ -244,17 +254,147 @@ fn fcmov_empty_sources_and_destination() {
         (None, None),
         (Some(number(7)), None),
         (None, Some(number(3))),
+        (Some(enc(0xc000_0000_0000_1234, 0x7fff)), None),
+        (None, Some(enc(0xc000_0000_0000_1234, 0x7fff))),
+        (Some(enc(0x8000_0000_0000_1234, 0x7fff)), None),
+        (None, Some(enc(0x8000_0000_0000_1234, 0x7fff))),
     ] {
-        for flags in [0, 1] {
-            let out = check(
-                input(&[0xda, 0xc1], a, b, 0x037f, flags, 64),
-                EXCEPTIONS | C1,
-                CpuMode::Long64,
-            );
-            assert_eq!(env(&out).0 & (EXCEPTIONS | C1), 0x41);
-            assert_eq!(out.cpu.st[0], enc(0xc000_0000_0000_0000, 0xffff));
+        for byte in [0xda, 0xdb] {
+            for base in [0xc1, 0xc9, 0xd1, 0xd9] {
+                for flags in [0, 0x45] {
+                    let out = check(
+                        input(&[byte, base], a, b, 0x037f, flags, 64),
+                        EXCEPTIONS | C1,
+                        CpuMode::Long64,
+                    );
+                    assert_eq!(env(&out).0 & (EXCEPTIONS | C1), 0x41);
+                    assert_eq!(out.cpu.st[0], enc(0xc000_0000_0000_0000, 0xffff));
+                    assert_eq!(out.cpu.flags.to_rflags(), flags | 2);
+                }
+            }
         }
     }
+}
+
+fn check_stack_underflow_compare_and_exchange_nan() {
+    // SDM Vol 1 §§4.9.2, 8.5.1.1; §8.5.1.2 Table 8-10: FXCH
+    // substitutes indefinite only for empty registers, then exchanges them.
+    // Vol 2A §3.2 FCOM/FUCOM/FCOMI: masked #IS reports unordered.
+    for nan in [
+        enc(0xc000_0000_0000_1234, 0x7fff),
+        enc(0x8000_0000_0000_1234, 0x7fff),
+    ] {
+        for (a, b) in [(Some(nan), None), (None, Some(nan))] {
+            for (op, pops, eflags) in [
+                ([0xd8, 0xd1], 0, false),
+                ([0xd8, 0xd9], 1, false),
+                ([0xde, 0xd9], 2, false),
+                ([0xdd, 0xe1], 0, false),
+                ([0xdd, 0xe9], 1, false),
+                ([0xda, 0xe9], 2, false),
+                ([0xdb, 0xe9], 0, true),
+                ([0xdf, 0xe9], 1, true),
+                ([0xdb, 0xf1], 0, true),
+                ([0xdf, 0xf1], 1, true),
+            ] {
+                let out = run(&op, a, b, if eflags { C1 } else { CODES });
+                assert_eq!(env(&out).0 & (EXCEPTIONS | C1), 0x41);
+                if eflags {
+                    assert_eq!(out.cpu.flags.to_rflags(), 0x47);
+                } else {
+                    assert_eq!(env(&out).0 & CODES, C0 | C2 | C3);
+                }
+                assert_eq!(
+                    out.cpu.fpu_top,
+                    (if a.is_some() { 7 } else { 6 } + pops) & 7
+                );
+            }
+            let out = run(&[0xd9, 0xc9], a, b, C1);
+            assert_eq!(env(&out).0 & (EXCEPTIONS | C1), 0x41);
+            let indefinite = enc(0xc000_0000_0000_0000, 0xffff);
+            assert_eq!(out.cpu.st[0], b.unwrap_or(indefinite));
+            assert_eq!(out.cpu.st[1], a.unwrap_or(indefinite));
+        }
+    }
+}
+
+#[test]
+fn binary_stack_underflow_precedes_nan_propagation() {
+    check_stack_underflow_compare_and_exchange_nan();
+    // SDM Vol 1 §4.9.2: #IS precedes SNaNs and QNaNs; §8.5.1.1:
+    // masked #IS writes indefinite, unmasked #IS preserves operands and TOP.
+    let mut forms = vec![
+        ([0xd9, 0xf8], 0, false), // fprem
+        ([0xd9, 0xf5], 0, false), // fprem1
+        ([0xd9, 0xfd], 0, false), // fscale
+        ([0xd9, 0xf3], 1, true),  // fpatan
+        ([0xd9, 0xf1], 1, true),  // fyl2x
+        ([0xd9, 0xf9], 1, true),  // fyl2xp1
+    ];
+    for group in [0, 1, 4, 5, 6, 7] {
+        // FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR, both destinations and pop forms.
+        for (prefix, dst, pop) in [(0xd8, 0, false), (0xdc, 1, false), (0xde, 1, true)] {
+            forms.push(([prefix, 0xc1 + group * 8], dst, pop));
+        }
+    }
+    let indefinite = enc(0xc000_0000_0000_0000, 0xffff);
+    let mut failures = Vec::new();
+    for (op, dst, pop) in forms {
+        for nan in [
+            enc(0xc000_0000_0000_1234, 0x7fff),
+            enc(0x8000_0000_0000_1234, 0x7fff),
+        ] {
+            for (a, b) in [(Some(nan), None), (None, Some(nan))] {
+                for masked in [true, false] {
+                    let p = input(&op, a, b, if masked { 0x037f } else { 0x037e }, 2, 64);
+                    for precision in [
+                        x86jit_core::state::X87Precision::Fast,
+                        x86jit_core::state::X87Precision::Extended,
+                    ] {
+                        for (tier, backend) in [
+                            (
+                                "interp",
+                                Box::new(InterpreterBackend) as Box<dyn x86jit_core::Backend>,
+                            ),
+                            ("jit", Box::new(x86jit_cranelift::JitBackend::new())),
+                        ] {
+                            let out =
+                                x86jit_tests::oracle::run_with_backend_x87(&p, backend, precision);
+                            let context = format!(
+                                "{tier} {precision:?} op={op:02x?} a={a:02x?} masked={masked}"
+                            );
+                            assert_eq!(out.exit, ExitKind::Hlt, "{context}");
+                            assert_eq!(
+                                env(&out).0 & (EXCEPTIONS | C1),
+                                if masked { 0x41 } else { 0x80c1 },
+                                "{context}"
+                            );
+                            let top = if a.is_some() { 7 } else { 6 };
+                            assert_eq!(
+                                out.cpu.fpu_top,
+                                (top + u8::from(masked && pop)) & 7,
+                                "{context}"
+                            );
+                            if masked {
+                                let result_slot = if pop { 0 } else { dst };
+                                if out.cpu.st[result_slot] != indefinite {
+                                    failures.push(format!(
+                                        "{context}: result={:02x?}",
+                                        out.cpu.st[result_slot]
+                                    ));
+                                }
+                            } else {
+                                let slot = usize::from(a.is_none());
+                                assert_eq!(out.cpu.st[slot], nan, "{context}");
+                                assert_eq!(env(&out).1, 0xbfff, "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -860,10 +1000,23 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
         };
         // FNSTENV saves pending status without waiting, so these unmasked
         // cases can also be witnessed natively without delivering SIGFPE.
-        let observed = check(
+        // SDM Vol 2A §3.2 FCOM/FUCOM, Operation gates unordered codes on
+        // IM=1, and Vol 1 §8.5.1.2 sets the codes only for a masked #IA;
+        // Vol 1 §§4.9.2, 8.6 abandon an unmasked pre-operation fault.
+        // Measured on an AMD Zen 4 CPU, whose APM Vol 5 FCOMx page states the
+        // unordered result without an IM condition: native FCOM QNaN, ST(1)=1,
+        // CW=0x037e, seeded TOP=6 and C0|C1|C2 gives SW=0xF581 versus the SDM
+        // response 0xB581. The engine follows the SDM. Exclude only
+        // native C0/C2/C3 for unmasked invalid comparisons; retain C1, all
+        // exception bits, TOP, tags, operands and the full interp/JIT checks.
+        // FUCOMPP's unmasked denormal case still compares all condition codes.
+        let native_codes = if comparison && unmask != 1 { CODES } else { C1 };
+        let observed = check_with_native_mask(
             p.clone(),
             EXCEPTIONS | if comparison { CODES } else { C1 },
             CpuMode::Long64,
+            true,
+            EXCEPTIONS | native_codes,
         );
         assert_eq!(env(&observed).0 & EXCEPTIONS, expected | 0x8080);
         if comparison {
@@ -904,6 +1057,9 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
             let data = &out.mem.iter().find(|m| m.addr == DATA).unwrap().bytes;
             let sw = u16::from_le_bytes([data[80], data[81]]);
             assert_eq!(sw & EXCEPTIONS, expected | 0x8080, "op={op:02x?}");
+            if comparison {
+                assert_eq!(sw & CODES, C0 | C2, "op={op:02x?}");
+            }
             if let Some(result) = result {
                 assert_eq!(out.cpu.st[0], result);
             }
