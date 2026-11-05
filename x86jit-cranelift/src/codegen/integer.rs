@@ -29,6 +29,36 @@ impl Translator<'_, '_> {
         false
     }
 
+    /// SDM Vol 2A §3.3 ADOX: OF carries unsigned overflow.
+    pub(crate) fn emit_adox(&mut self, dst: u32, a: Val, b: Val, size: u8, mask: FlagMask) -> bool {
+        let a = self.val(a);
+        let b = self.val(b);
+        let a = self.mask(a, size);
+        let b = self.mask(b, size);
+        let cin = self.load_flag_u64(self.offsets.of);
+        let sum = self.builder.ins().iadd(a, b);
+        let result = self.builder.ins().iadd(sum, cin);
+        let carry = if size == 8 {
+            let first = self.builder.ins().icmp(IntCC::UnsignedLessThan, sum, a);
+            let second = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, result, sum);
+            self.builder.ins().bor(first, second)
+        } else {
+            let high = self.builder.ins().ushr_imm(result, i64::from(size * 8));
+            self.builder.ins().ireduce(types::I8, high)
+        };
+        let result = self.mask(result, size);
+        self.set(dst, result);
+        self.flag_recipe = Some(FlagRecipe::Adox { carry });
+        self.record_omitted_flags(mask);
+        if mask.0 & 0b10_0000 != 0 {
+            self.store_flag(self.offsets.of, carry);
+        }
+        false
+    }
+
     pub(crate) fn emit_sub(
         &mut self,
         dst: &u32,

@@ -525,6 +525,9 @@ pub fn translate_region(
 /// flag computations alive in the hot block. Conditional writers are barriers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FlagRecipe {
+    Adox {
+        carry: Value,
+    },
     AddSub {
         a: Value,
         b: Value,
@@ -782,6 +785,7 @@ impl Translator<'_, '_> {
                 }
             }
             match writer {
+                FlagRecipe::Adox { carry } => self.store_flag(self.offsets.of, carry),
                 FlagRecipe::AddSub {
                     a,
                     b,
@@ -868,6 +872,13 @@ impl Translator<'_, '_> {
                 set_flags,
                 ..
             } => self.emit_adc(dst, a, b, size, set_flags),
+            IrOp::Adox {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } => self.emit_adox(*dst, *a, *b, *size, *set_flags),
             IrOp::Sub {
                 dst,
                 a,

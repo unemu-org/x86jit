@@ -5,16 +5,16 @@
 use x86jit_tests::compat::{compute_coverage, cpuid_lift_gaps, cpuid_waivers, Coverage};
 
 #[test]
-fn time_and_entropy_extensions_have_optional_coverage() {
+fn optional_extensions_have_complete_coverage() {
     let coverage = compute_coverage();
     for (mode, buckets, forms) in [
-        ("long64", &coverage.generations, 7),
-        ("compat32", &coverage.compat32, 5),
+        ("long64", &coverage.generations, 17),
+        ("compat32", &coverage.compat32, 13),
     ] {
         let optional = buckets.get("optional").expect("optional bucket present");
         assert_eq!(
             optional.lifted, forms,
-            "{mode}: RDTSCP and RDRAND/RDSEED forms"
+            "{mode}: RDTSCP, RDRAND/RDSEED, SSE4A and ADX forms"
         );
         assert_eq!(optional.unsupported, 0, "{mode}");
         assert_eq!(optional.unencodable, 0, "{mode}");
@@ -163,13 +163,8 @@ fn cpuid_checker_accepts_tables_and_sees_extended_and_leaf7_bits() {
         CpuidLeaf::Constant(R::new(0, 0, 1 << 6, 1 << 27)),
     );
     let gaps = cpuid_lift_gaps(|l, s| table.query(l, s));
-    for feature in [ADX, SSE4A, SHA512] {
-        assert!(
-            gaps.iter().any(|g| g.advertised.feature == feature),
-            "{feature:?}"
-        );
-    }
-    for feature in [CX8, RDRAND, RDSEED, RDTSCP] {
+    assert!(gaps.iter().any(|g| g.advertised.feature == SHA512));
+    for feature in [CX8, RDRAND, RDSEED, RDTSCP, ADX, SSE4A] {
         assert!(
             !gaps.iter().any(|g| g.advertised.feature == feature),
             "{feature:?}"
@@ -496,5 +491,60 @@ fn user_flag_and_selector_forms_are_measured() {
             Some(Probe::Lifted),
             "{code:?}"
         );
+    }
+}
+
+#[test]
+fn cpuid_sse4a_adx_opt_in_has_complete_lift_coverage() {
+    use x86jit_core::{Feature, GuestCpuFeatures};
+    // AMD APM Vol 3 §E.4.2: SSE4A is Fn8000_0001_ECX[6].
+    // SDM Vol 2A §3.3 ADCX/ADOX: ADX is CPUID.07H.00H:EBX[19].
+    for preset in [
+        GuestCpuFeatures::baseline(),
+        GuestCpuFeatures::v2(),
+        GuestCpuFeatures::v3(),
+        GuestCpuFeatures::v4(),
+        GuestCpuFeatures::default(),
+    ] {
+        assert!(!preset.has(Feature::Sse4a));
+        assert!(!preset.has(Feature::Adx));
+    }
+    let profile = GuestCpuFeatures::empty()
+        .with(Feature::Sse4a)
+        .with(Feature::Adx);
+    assert_eq!(profile.cpuid(0x8000_0001, 0).ecx & (1 << 6), 1 << 6);
+    assert_eq!(profile.cpuid(7, 0).ebx & (1 << 19), 1 << 19);
+    let gaps = cpuid_lift_gaps(|leaf, subleaf| profile.cpuid(leaf, subleaf));
+    assert!(!gaps.iter().any(|gap| matches!(
+        gap.advertised.feature,
+        iced_x86::CpuidFeature::SSE4A | iced_x86::CpuidFeature::ADX
+    )));
+    // Isolate the opt-in bits from the preset's existing scalar baseline waivers.
+    assert!(cpuid_lift_gaps(|leaf, subleaf| match leaf {
+        7 | 0x8000_0001 => profile.cpuid(leaf, subleaf),
+        _ => x86jit_core::CpuidRegisters::ZERO,
+    })
+    .is_empty());
+    for mode in [x86jit_core::CpuMode::Long64, x86jit_core::CpuMode::Compat32] {
+        for code in iced_x86::Code::values().filter(|code| {
+            let valid = if mode == x86jit_core::CpuMode::Long64 {
+                code.op_code().mode64()
+            } else {
+                code.op_code().mode32()
+            };
+            valid
+                && code.cpuid_features().iter().any(|f| {
+                    matches!(
+                        f,
+                        iced_x86::CpuidFeature::SSE4A | iced_x86::CpuidFeature::ADX
+                    )
+                })
+        }) {
+            assert_eq!(
+                x86jit_tests::compat::probe_code_in(code, mode),
+                Some(x86jit_tests::compat::Probe::Lifted),
+                "{mode:?}/{code:?}"
+            );
+        }
     }
 }

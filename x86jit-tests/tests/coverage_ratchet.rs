@@ -200,6 +200,18 @@ const FUZZER_COVERED: &[&str] = &[
 /// reason. Seeded with exactly the current `lifted − fuzzer_covered` set, so the test
 /// passes today.
 const ALLOWLIST: &[&str] = &[
+    // SSE4A uses manual-derived controls/edge/alias/undefined-policy witnesses in
+    // sse4a_adx.rs (sse4a_bitfields_controls_edges_and_undefined_policy and
+    // sse4a_streaming_scalar_store_width_and_fault), across both modes and all tiers.
+    "Extrq",
+    "Insertq",
+    "Movntsd",
+    "Movntss",
+    // Independent unsigned carry chains, partial flags and precise faults:
+    // sse4a_adx.rs, adx_single_partial_flags_and_interleaved_chains and
+    // adx_memory_fault_recovers_both_carries; native comparison is CPUID-gated.
+    "Adcx",
+    "Adox",
     // flag_stack.rs: interpreter/block/region flag images, privilege masks,
     // carry-only effects, fault state, same-selector returns and native witnesses.
     "Clc",

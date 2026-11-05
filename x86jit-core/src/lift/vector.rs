@@ -5146,3 +5146,81 @@ pub(crate) fn lift_mpsadbw(
     }
     Ok(())
 }
+
+/// AMD APM Vol 4, EXTRQ/INSERTQ: six-bit controls, zero length means 64.
+/// Undefined-result policy: preserve bits 127:64, and use 64-bit shifts/masks
+/// (truncating insertion at bit 63) even when index + length exceeds 64.
+pub(crate) fn lift_sse4a_bitfield(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
+    let insert = insn.mnemonic() == Mnemonic::Insertq;
+    let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
+    let immediate = insn.op_kind(insn.op_count() - 1) == OpKind::Immediate8_2nd;
+    let src = if insert || !immediate {
+        reg_xmm(insn, 1).or_unsupported(insn)?
+    } else {
+        dst
+    };
+    let data = tg.fresh();
+    ops.push(IrOp::VToGpr {
+        dst: data,
+        src: if insert { src } else { dst },
+        size: 8,
+    });
+    let old = if insert {
+        let old = tg.fresh();
+        ops.push(IrOp::VToGpr {
+            dst: old,
+            src: dst,
+            size: 8,
+        });
+        Val::Temp(old)
+    } else {
+        Val::Imm(0)
+    };
+    let controls = if immediate {
+        Val::Imm(u64::from(insn.immediate8()) | (u64::from(insn.immediate8_2nd()) << 8))
+    } else {
+        let controls = tg.fresh();
+        ops.push(IrOp::VExtractLane {
+            dst: controls,
+            src,
+            index: u8::from(insert),
+            size: 8,
+        });
+        Val::Temp(controls)
+    };
+    let mut binary = |op, a, b| {
+        let dst = tg.fresh();
+        ops.push(mk_binop(op, dst, a, b, 8, FlagMask::NONE));
+        Val::Temp(dst)
+    };
+    let length = binary(BinOp::And, controls, Val::Imm(63));
+    let index = binary(BinOp::Shr, controls, Val::Imm(8));
+    let index = binary(BinOp::And, index, Val::Imm(63));
+    // The central shift path masks counts to six bits: -0 means no shift,
+    // and -length gives 64-length for lengths 1..63.
+    let count = binary(BinOp::Sub, Val::Imm(0), length);
+    let mask = binary(BinOp::Shr, Val::Imm(u64::MAX), count);
+    let result = if insert {
+        let bits = binary(BinOp::And, Val::Temp(data), mask);
+        let bits = binary(BinOp::Shl, bits, index);
+        let mask = binary(BinOp::Shl, mask, index);
+        let keep = binary(BinOp::Xor, mask, Val::Imm(u64::MAX));
+        let kept = binary(BinOp::And, old, keep);
+        binary(BinOp::Or, kept, bits)
+    } else {
+        let shifted = binary(BinOp::Shr, Val::Temp(data), index);
+        binary(BinOp::And, shifted, mask)
+    };
+    ops.push(IrOp::VInsertLane {
+        dst,
+        base: dst,
+        src: result,
+        index: 0,
+        size: 8,
+    });
+    Ok(())
+}

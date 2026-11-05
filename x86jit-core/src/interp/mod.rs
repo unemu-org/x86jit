@@ -320,6 +320,24 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     return r.into();
                 }
             }
+            IrOp::Adox {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } => {
+                let r = alu_add(
+                    read_val(*a, temps),
+                    read_val(*b, temps),
+                    u64::from(cpu.flags.of),
+                    *size,
+                );
+                temps[*dst as usize] = r.res;
+                if set_flags.0 & 0b10_0000 != 0 {
+                    cpu.flags.of = r.cf;
+                }
+            }
             IrOp::Sub {
                 dst,
                 a,

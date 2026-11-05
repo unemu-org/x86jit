@@ -34,7 +34,7 @@ pub enum Gen {
     X87,
     /// Legacy MMX.
     Mmx,
-    /// Optional time/entropy extensions outside the psABI micro-architecture levels.
+    /// Optional extensions outside the psABI micro-architecture levels.
     Optional,
 }
 
@@ -64,7 +64,7 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
         | CLFLUSHOPT | CX8 | CPUID | PAUSE | MULTIBYTENOP | FXSR | SSE | SSE2 | SYSCALL | SEP
         | SMAP | X64 => Gen::V1,
         // psABI §3.1.1, Table 3.1 (Micro-Architecture Levels).
-        RDTSCP | RDRAND | RDSEED => Gen::Optional,
+        RDTSCP | RDRAND | RDSEED | SSE4A | ADX => Gen::Optional,
         // x86-64-v2.
         SSE3 | SSSE3 | SSE4_1 | SSE4_2 | POPCNT | CMPXCHG16B | MOVBE => Gen::V2,
         // x86-64-v3.
@@ -75,7 +75,7 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
         // x87 FPU (iced has no single X87 feature — the FPU* variants tag it).
         FPU | FPU287 | FPU287XL_ONLY | FPU387 | FPU387SL_ONLY => Gen::X87,
         MMX => Gen::Mmx,
-        // Everything else (AVX-512 family, SSE4A/FMA4 AMD, privileged, TSX, SHA, AES,
+        // Everything else (AVX-512 family, FMA4, privileged, TSX, SHA, AES,
         // vendor) is out of scope for this map.
         _ => return None,
     })
@@ -381,8 +381,15 @@ fn template_operand(
         }
         // Immediates.
         imm8 | imm8_const_1 | imm8sex16 | imm8sex32 | imm8sex64 | imm4_m2z => {
-            instr.set_op_kind(i, OpKind::Immediate8);
-            instr.set_immediate8(1);
+            // EXTRQ/INSERTQ carry two consecutive immediate bytes. iced stores
+            // the second separately and requires Immediate8_2nd for its operand.
+            if i > 0 && instr.op_kind(i - 1) == OpKind::Immediate8 {
+                instr.set_op_kind(i, OpKind::Immediate8_2nd);
+                instr.set_immediate8_2nd(1);
+            } else {
+                instr.set_op_kind(i, OpKind::Immediate8);
+                instr.set_immediate8(1);
+            }
         }
         // Anything else (mask regs, zmm, vsib, seg/cr/dr/tr/bnd, moffs, rel, wider
         // immediates, is4 for legacy) — exotic or out of our v1..v3 focus.
@@ -537,7 +544,7 @@ impl Coverage {
              `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; \
              `unencodable` are exotic operand shapes the probe can't synthesize (not counted). \
              Kept honest by the `compat_map_is_current` test. The `optional` bucket \
-             groups RDTSCP/RDRAND/RDSEED, which are not psABI level requirements \
+             groups RDTSCP/RDRAND/RDSEED, SSE4A and ADX, which are not psABI level requirements \
              (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).\n\n",
         );
         s.push_str("## 64-bit long mode (Long64)\n\n");

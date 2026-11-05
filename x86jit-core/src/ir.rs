@@ -166,6 +166,15 @@ pub enum IrOp {
         size: u8,
         set_flags: FlagMask,
     },
+    /// SDM Vol 2A §3.3 ADOX: unsigned add with OF as carry-in/out.
+    /// `set_flags` contains only OF (or NONE after dead-flag elision).
+    Adox {
+        dst: Temp,
+        a: Val,
+        b: Val,
+        size: u8,
+        set_flags: FlagMask,
+    },
     Sbb {
         dst: Temp,
         a: Val,

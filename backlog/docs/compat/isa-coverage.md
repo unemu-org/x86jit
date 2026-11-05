@@ -11,14 +11,14 @@ created_date: '2026-07-06 11:25'
 
 # ISA compatibility coverage
 
-**Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit by hand. Measured by probing the real lifter (`x86jit-tests/src/compat.rs`): a canonical instance of every in-scope `iced_x86::Code` is encoded and fed to `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; `unencodable` are exotic operand shapes the probe can't synthesize (not counted). Kept honest by the `compat_map_is_current` test. The `optional` bucket groups RDTSCP/RDRAND/RDSEED, which are not psABI level requirements (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).
+**Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit by hand. Measured by probing the real lifter (`x86jit-tests/src/compat.rs`): a canonical instance of every in-scope `iced_x86::Code` is encoded and fed to `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; `unencodable` are exotic operand shapes the probe can't synthesize (not counted). Kept honest by the `compat_map_is_current` test. The `optional` bucket groups RDTSCP/RDRAND/RDSEED, SSE4A and ADX, which are not psABI level requirements (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).
 
 ## 64-bit long mode (Long64)
 
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 59 | 2% | 0 |
-| optional | 7 | 0 | 0 | 100% | 0 |
+| optional | 17 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 668 | 0 | 131 | 84% | 240 |
 | x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
 | x86-64-v3 | 677 | 0 | 0 | 100% | 17 |
@@ -32,7 +32,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 1 | 0 | 57 | 2% | 0 |
-| optional | 5 | 0 | 0 | 100% | 0 |
+| optional | 13 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 562 | 0 | 124 | 82% | 228 |
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 638 | 0 | 0 | 100% | 17 |

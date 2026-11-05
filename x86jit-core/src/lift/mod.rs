@@ -406,6 +406,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Add { .. }
             | Sub { .. }
             | Adc { .. }
+            | Adox { .. }
             | Sbb { .. }
             | And { .. }
             | Or { .. }
@@ -1362,6 +1363,8 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         Branch { cond, .. } | GetCond { cond, .. } => cond_reads(*cond),
         // SDM Vol 1 Appendix A Table A-2: ADC/SBB test CF.
         Adc { .. } | Sbb { .. } => F_CF,
+        // SDM Vol 2A §3.3 ADOX, Operation: OF is the unsigned carry input.
+        Adox { .. } => F_OF,
         // SDM Vol 2A, LAHF, Operation.
         Lahf => F_CF | F_PF | F_AF | F_ZF | F_SF,
         // SDM Vol 2B, PUSHF/PUSHFD/PUSHFQ, Operation.
@@ -1729,6 +1732,7 @@ pub(crate) fn op_set_flags_mut(op: &mut IrOp) -> Option<&mut FlagMask> {
     match op {
         Add { set_flags, .. }
         | Adc { set_flags, .. }
+        | Adox { set_flags, .. }
         | Sub { set_flags, .. }
         | Sbb { set_flags, .. }
         | And { set_flags, .. }
@@ -1869,6 +1873,9 @@ pub(crate) fn lift_insn(
         }
 
         Add => lift_binop(insn, ops, tg, BinOp::Add, FlagMask::ALL, true).map(|_| false),
+        // SDM Vol 2A §3.3 ADCX/ADOX: independent partial flag writers.
+        Adcx => lift_binop(insn, ops, tg, BinOp::Adc, FlagMask(F_CF), true).map(|_| false),
+        Adox => lift_binop(insn, ops, tg, BinOp::Adox, FlagMask(F_OF), true).map(|_| false),
         Adc => lift_binop(insn, ops, tg, BinOp::Adc, FlagMask::ALL, true).map(|_| false),
         Sub => lift_binop(insn, ops, tg, BinOp::Sub, FlagMask::ALL, true).map(|_| false),
         Sbb => lift_binop(insn, ops, tg, BinOp::Sbb, FlagMask::ALL, true).map(|_| false),
@@ -3173,6 +3180,11 @@ pub(crate) fn lift_insn(
 
         // --- SSE/SSE2 floating point (§3.1 M8) ---
         // Scalar float move (xmm forms; the mem `Movsd` string form is handled above).
+        // AMD APM Vol 4, MOVNTSS/MOVNTSD: scalar stores. As with MOVNTI,
+        // the memory model currently uses ordinary sized stores for the hint.
+        Movntss => lift_scalar_fmove(insn, ops, tg, FPrec::F32).map(|_| false),
+        Movntsd => lift_scalar_fmove(insn, ops, tg, FPrec::F64).map(|_| false),
+        Extrq | Insertq => lift_sse4a_bitfield(insn, ops, tg).map(|_| false),
         Movss => lift_scalar_fmove(insn, ops, tg, FPrec::F32).map(|_| false),
         Movsd => lift_scalar_fmove(insn, ops, tg, FPrec::F64).map(|_| false),
         Vmovss => lift_vscalar_fmove(insn, ops, tg, FPrec::F32).map(|_| false),
@@ -3968,6 +3980,7 @@ pub(crate) fn lift_insn(
 pub(crate) enum BinOp {
     Add,
     Adc,
+    Adox,
     Sub,
     Sbb,
     And,
@@ -4006,7 +4019,7 @@ pub(crate) fn mk_binop(op: BinOp, dst: u32, a: Val, b: Val, size: u8, set_flags:
             }
         };
     }
-    dispatch!(Add, Adc, Sub, Sbb, And, Or, Xor, Shl, Shr, Sar, Rol, Ror, Rcl, Rcr)
+    dispatch!(Add, Adc, Adox, Sub, Sbb, And, Or, Xor, Shl, Shr, Sar, Rol, Ror, Rcl, Rcr)
 }
 
 /// Define a vector/opmask register-index extractor: `Some(index)` when operand
