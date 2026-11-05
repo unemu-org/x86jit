@@ -1,566 +1,158 @@
 # x86jit
 
-[![CI](https://github.com/unemu-org/x86jit/actions/workflows/ci.yml/badge.svg)](https://github.com/unemu-org/x86jit/actions/workflows/ci.yml)
+A guest-agnostic x86-64 → host recompiler (JIT), delivered as a pure-Rust library.
 
-An x86-64 → host recompiler (JIT), delivered as a pure-Rust library.
+You give it a memory map and an entry point. It runs the guest's x86-64 code on an AArch64
+host (the primary target) or an x86-64 host, and hands control back through an `Exit` whenever
+it meets something it does not handle itself: a syscall, an MMIO access, port I/O, a guest
+exception, or an instruction it cannot lift yet. File formats, operating-system emulation and
+devices belong to the embedder. A Linux userland built on this library is
+[`unemulinux`](https://github.com/unemu-org/unemulinux).
 
-> ⚠️ **Early-stage — not production quality.** Started July 2026, under active development.
-> It almost certainly has bugs and missing instructions. Be clear-eyed about what the
-> testing buys you: a differential oracle validates the instructions that **are** lifted
-> (interpreter vs JIT vs a real CPU), but it can't tell you what's *missing* — gaps surface
-> when real code hits an unimplemented instruction and traps. See [Status](#status).
->
-> **Need a production-grade x86 emulator today? Use [QEMU](https://www.qemu.org/) or
-> [Unicorn](https://www.unicorn-engine.org/).** x86jit is for people who want an
-> embeddable, hackable CPU core in pure Rust and can live with gaps.
+> **Early-stage.** x86jit is under active development and has bugs and missing instructions.
+> If you need a production-grade x86 emulator today, use [QEMU](https://www.qemu.org/) or
+> [Unicorn](https://www.unicorn-engine.org/). x86jit is for people who want an embeddable,
+> hackable CPU core in pure Rust and can live with gaps.
 
-`x86jit` executes x86-64 guest code on any host (x86-64 or ARM64) via JIT recompilation. The core is **guest-agnostic** — it knows nothing about PS4, ELF, the syscalls of any concrete OS, or GPUs. It's a "CPU engine": you give it memory plus an entry point, it runs instructions and yields control every time it hits something it doesn't handle itself.
+## What it does
 
-- **In scope:** x86-64 decoding (via `iced-x86`), lift to a custom IR, two backends (interpreter + Cranelift JIT), translation cache, dispatcher loop, guest memory + CPU state, return-based `Exit` API.
-- **Out of scope (the embedder's job):** file-format parsing (ELF/SELF/PE), OS syscall emulation (HLE), MMIO/devices/GPU, loaders, high-level thread scheduling.
-
-The full design lives in [`spec.md`](backlog/docs/design/spec.md).
+- **One IR, two backends.** Guest code is decoded with `iced-x86` and lifted to a small IR. A
+  portable interpreter and a Cranelift JIT both execute it and must agree bit for bit; the
+  interpreter is the JIT's oracle.
+- **Tiered execution.** Blocks start interpreted and compile once hot (`Vm::set_tier_up_after`),
+  optionally on a background compiler thread (`Vm::set_tier_up_background`). Hot loops can tier
+  up further into superblock regions (`JitBackend::with_superblocks`). Compiled blocks chain
+  directly and indirect branches are cached.
+- **x86-TSO memory-ordering tiers.** On weak hosts, `MemConsistency` (`Fast`, `AcqRel`,
+  `FullTso`) selects the barriers around JIT inline loads and stores. `mfence` is a full barrier
+  on both backends and locked operations stay atomic. Many vCPUs on host threads share one `Vm`.
+- **Precise faults, resumable exits.** A fault leaves RIP on the faulting instruction with
+  earlier instructions complete; handle the cause and call `run()` again. Host faults on guest
+  memory in compiled code are recovered through a signal-context landing pad, with the signal
+  handler owned by the embedder ([decision-13]). Another host thread can stop a running vCPU
+  through `Vcpu::exit_request()`.
+- **Self-modifying code.** Guest stores into translated code invalidate it on both backends. A
+  block that rewrites itself sees the change from the next block ([spec §10][spec]).
+- **Configurable guest CPU.** `Long64`, `Compat32` and `Real16` modes; feature presets
+  `GuestCpuFeatures::{baseline, v2, v3, v4}` or a complete CPUID table ([decision-11]);
+  embedder-supplied time and entropy sources ([decision-12]). x87 runs as true 80-bit arithmetic
+  in software, so its results are identical on every host.
+- **Guest-agnostic core.** `x86jit-core` depends on `iced-x86` and nothing else;
+  [`boundary.rs`](x86jit-tests/tests/boundary.rs) fails the build if that changes.
 
 ## Workspace
 
-The **core** is guest-agnostic; everything else is an embedder or tooling crate.
-
-```
-x86jit-core/        # Vm, Vcpu, IR, lift, cache, dispatcher, interpreter, x87/f80 — the engine
-x86jit-cranelift/   # Cranelift JIT backend (the second `Backend`)
-x86jit-elf/         # ELF loader helpers (static / static-PIE / dynamic + stack setup)
-x86jit-tests/       # differential testing (vs Unicorn + native), instruction corpus, fuzzing, harness
-x86jit-bench/       # workload timings (interp vs JIT vs native), recorded per commit
-```
-
-This repository is the **recompiler only** — it emulates no operating system. A
-Linux syscall shim, a process model, an OCI/ELF runner and the whole-program test
-ladder (busybox, sqlite, CPython, Go servers) live in
-[`unemulinux`](https://github.com/unemu-org/unemulinux), which embeds this library.
-That split is not aspirational: `x86jit-core`'s dependency set is exactly
-`{iced-x86}`, and a test (`x86jit-tests/tests/boundary.rs`) fails the build if that
-ever changes.
-
-## Status
-
-Actively developed, with a strong oracle for the instructions it *does* implement. A
-hand-written instruction corpus and a fuzzer cross-check the **lifted** instructions three
-ways — interpreter vs JIT, and both against a real CPU (Unicorn + native execution). The
-suite runs on an **x86-64** CI runner and on an **AArch64** host before every merge that
-touches codegen or host-specific code, so the ARM host path is validated, not assumed.
-
-One limit on that, stated because it is easy to read past. The corpus validates *what's
-lifted*; it does **not** tell you what's missing — that surfaces only when real code hits
-an unimplemented instruction.
-
-The native comparison covers general registers, flags, the whole vector file
-(XMM/YMM/ZMM**0–31**), the opmasks, the x87 register stack and control word, and MXCSR.
-Two things are captured but deliberately **not compared**, because the engine does not
-model them: the x87 status-word condition codes and tag word (`TASK-324`), and MXCSR's
-six sticky exception flags (`deferred.md`). Both show up in full in a divergence report.
-
-**Unmodified real programs run on this engine** — busybox applets (`sha256sum`, `wc`,
-`sort`, `awk`, gzip), sqlite3, lua, libjpeg-turbo `djpeg`, **CPython 3.13**, Go servers,
-static/static-PIE/dynamic executables against both musl and glibc, and multi-process shell
-pipelines out of a Docker/OCI image. Interpreter and JIT produce the same output as running
-them natively.
-
-Those tests **live in [`unemulinux`](https://github.com/unemu-org/unemulinux)**, not here,
-because running a real program needs an operating system and this repository deliberately
-has none. They still run — a lifter change is validated against that ladder before it is
-considered good; the check simply spans two repositories now, so it is a CI-plumbing
-problem rather than a coverage one. What runs *in this repository's own* CI is the
-ISA-level validation below.
-
-**Instruction coverage:** the full scalar integer set plus SSE/SSE2 up through the
-common AVX/AVX2 vector set — SSE3/SSSE3/SSE4.1/SSE4.2, AVX, AVX2, BMI1/BMI2,
-`tzcnt`/`lzcnt`/`movbe`, and **true 80-bit x87** computed in software (so x87 results
-are bit-identical on x86-64 and ARM64). AVX-512/EVEX is partial and growing. The
-guest CPU feature set is selectable per run (`baseline` / `v2` / `v3` / `v4`, the way
-`qemu -cpu` works) rather than hardcoded. The exact per-generation breakdown of which
-encodings lift is a generated, CI-checked artifact — see the
-[**instruction-coverage map**](backlog/docs/compat/isa-coverage.md). **Read it as an
-upper bound:** an instruction with both a register and a memory form is probed as the
-register form, so a missing memory-operand form can still be reported as lifted
-(`TASK-312`). That is how `vextract*`'s memory destination stayed invisible until a real
-binary trapped on it.
-
-**CPU modes:** `CpuMode::Long64` (64-bit long mode), `CpuMode::Compat32`
-(32-bit protected/compatibility mode with flat segments), and `CpuMode::Real16`
-(16-bit real mode). **Real16 always runs on the interpreter**, even when the VM is
-configured with a JIT backend, tier-up, or superblocks. Its interpreter is validated
-against the hardware-captured
-[SingleStepTests 80286 corpus](x86jit-tests/tests/ss286.rs), comparing final CPU and
-memory state and in-guest exception delivery. The corpus reports remaining gaps;
-it is not a claim of full 286 conformance. Targeted
-[Unicorn comparisons](x86jit-tests/tests/cf16.rs) also cover real-mode addressing
-and control flow.
-
-**Engine:** two interchangeable backends — a portable interpreter and a Cranelift
-JIT — over a single IR, with a translation cache, hotness-gated tier-up, superblock
-regions, and block chaining + indirect-branch caching for fast dispatch. Self-modifying
-code stays coherent and multiple guest threads share one VM. On weak (ARM) hosts,
-`MemConsistency` governs JIT **inline** loads/stores only: `Fast` uses bare
-LDR/STR; `AcqRel` adds DMB ISH before stores and after loads; `FullTso` adds
-DMB ISH after each load and store. Helper-executed accesses lack these tier
-barriers (xj-0w3.7). The interpreter, including cold blocks before tier-up and
-fallback execution, ignores the tier and leaves ordinary accesses Relaxed
-(xj-0w3.6); neither ordered tier currently guarantees interpreter TSO.
-
-Explicit `mfence` and the serializing instructions we lift (`cpuid` and Real16
-`iret`) execute a full host barrier on both backends in every tier. The JIT also
-emits DMB ISH for `lfence`/`sfence` in every aarch64 tier, covering helper accesses;
-they need no extra host barrier on x86-64 while guest non-temporal stores use
-ordinary host stores. Locked operations remain atomic in every tier, but full
-x86 locked-op ordering on aarch64 is not guaranteed: Cranelift's non-LSE LL/SC
-sequences have no trailing DMB, and memory `xchg` uses LL/SC even with LSE.
-
-**Performance.** Not yet optimized — expect roughly an **order of magnitude slower than
-native** for hot code (a tight scalar loop is ~20× native on the JIT; the interpreter is
-~40–250×), and worse for startup-heavy or run-once code, where the JIT pays to compile
-everything up front. Throughput work is ongoing. The `x86jit-bench` crate records
-interp/JIT/native timings per commit if you want real numbers.
-
-Long64 data references enforce 48-bit canonical addressing: a non-canonical SS
-reference raises `Exit::Exception` vector 12, other references vector 13. Required
-SIMD and FXSAVE/FXRSTOR operand alignment raises vector 13 before any state commits;
-error code zero is implied. Legacy SSE follows the Intel alignment rule. AMD's
-optional MXCSR.MM relaxation is not modeled. MXCSR storage and round trips are
-modeled; its arithmetic effects remain deferred.
-Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
-
-**Known gaps** (deliberately absent or partial today):
-
-- AVX-512 / EVEX is partial and growing; MMX is minimal (guests generally use SSE instead).
-- **EVEX prefix bits can be silently dropped**, because the lifter dispatches on the
-  mnemonic and a pre-AVX-512 handler for that mnemonic may never look at them. Measured by
-  encoding each form, re-decoding to confirm the bit survived, and diffing the lifted IR:
-  the **write mask** is ignored by 76 mnemonics (`{k1}` and `{k1}{z}` alike, `TASK-333`),
-  and **embedded broadcast `{1toN}`** by 139 — no handler in the engine reads it at all
-  (`TASK-334`). Broadcast is both a wrong result *and* a spurious fault, since the engine
-  reads the full operand width where hardware reads one element. Embedded rounding `{er}`
-  is likewise unread (`deferred.md` covers MXCSR.RC, which is a different thing). None of
-  this is visible to the compat map or the differential corpus: both probe the plain form.
-- Real16 has no JIT tier yet, and 286 fidelity gaps remain — see
-  [deferred work](backlog/docs/deferred.md#real-mode-jit-tier-286-fidelity-and-protected-mode-segmentation).
-- Protected-mode segmentation has no full segment-descriptor model; `Compat32`
-  uses flat segments with `FS`/`GS` bases. Real16 has segmented addressing.
-  `MOV r/m16|r32|r64, Sreg` reads the configured `CpuState` selector (including
-  FS/GS). Protected-mode `MOV Sreg, r/m` and `POP Sreg` lift on every tier and
-  return an exact `Exit::UnknownInstruction` before any state change or operand
-  access; the embedder validates descriptors and emulates these loads.
-- User-mode PUSHF/POPF and IRET run at CPL 3. The embedder configures valid
-  CPL 3 selectors, `flags.if_` and `rflags_system` (IOPL and other system bits); defaults are zero.
-  POPF preserves IOPL/VM/VIF/VIP, clears RF, and changes IF only when IOPL is 3;
-  AC/ID are writable only by wide forms. TF and NT are stored; single-step
-  and alignment-check delivery are absent. IRET accepts only the configured
-  same-mode CS/SS pair; Long64 restores RIP, CS, RFLAGS, RSP and SS, while Compat32 restores EIP, CS
-  and EFLAGS and advances ESP. Different selectors, a nested-task return or a
-  noncanonical Long64 RIP raise #GP before state commits. The exception exit
-  currently carries the vector and instruction address, without a selector error
-  code. Sources: Intel SDM Vol 2B §4.3 MOV, POP, PUSHF, POPF (Table 4-20);
-  Vol 2A §3.2 IRET; Vol 3A §7.14.3.
-- Signals and fork/exec *after* a process spawns threads are not fully modeled (single-threaded fork/exec works; the threaded case returns a defined error rather than guessing).
-- OS emulation (syscalls, devices, loaders) is the embedder's job, not the core's — see [`unemulinux`](https://github.com/unemu-org/unemulinux) for a Linux userland built on this library.
-- **`Prot` is advisory — nothing enforces it.** A guest store into a region mapped `R` or `RX` succeeds and changes the bytes, on both backends; the engine models no permission fault (`TASK-330`). Map read-only expecting a trap and you get silent corruption instead.
-- **MXCSR is stored, not yet applied to arithmetic** — `ldmxcsr`/`stmxcsr` (including VEX forms) and `fxsave`/`fxrstor` round-trip per-vCPU state. Embedders can read/write it with `Vcpu::mxcsr`/`set_mxcsr` and seed new vCPUs with `Vm::new_vcpu_with_mxcsr`, including `0x9fc0`. RC/FTZ/DAZ and arithmetic sticky exception flags remain deferred to xj-pi7.2 (`deferred.md`). The x87 half is modelled: all six status-word flags, the stack-fault flag with C1, the condition codes, and `#MF` delivery, each validated against a real CPU.
-- **The x87 store and convert paths have known defects**, each measured against a real
-  CPU: `fist`/`fistp` store 0 rather than the integer indefinite when the value does not
-  fit, and raise no `IE` (`TASK-339`); `fst`/`fstp` to `m32`/`m64` ignore rounding
-  control, never set `PE`, and double-round through `f64` (`TASK-340`); `fnstenv` leaves a
-  masked-off exception armed, so an `#MF` handler that opens with it can livelock
-  (`TASK-341`); `fprem` never writes `C2`, so the architectural reduction loop exits early
-  or spins (`TASK-342`).
-- **Remaining x87 forms:** `frndint`, `fxtract`, `fldpi`/`fldl2e`/`fldl2t`/
-  `fldlg2`/`fldln2`, non-popping `fist`, `fnop`, `ffree`/`ffreep`,
-  `fincstp`/`fdecstp`, and the `fstpnce` alias remain unlifted (`xj-pi7.3`).
-  `fwait` still ignores pending `#MF`. Packed BCD, legacy control encodings,
-  14-byte environments and `fnsave`/`frstor` remain refused; reasons are recorded
-  in [deferred.md](backlog/docs/deferred.md).
-- **Nothing reclaims a dropped translation.** A guest that repeatedly patches code — a
-  guest-level JIT rewriting an inline cache — was measured growing host RSS by about
-  8 KiB and 1.3 executable mappings per patch before the indexed CodeMap. The executable
-  arena and CodeMap metadata still grow with translations. The immutable CodeMap
-  index retains O(n log n) nodes across n registrations: measured index cost is
-  approximately 64 B × (log2 n + 1) per registration, about 1–1.4 KiB per compile
-  at the measured sizes, in addition to the per-patch growth above. Its 4,194,304-entry
-  capacity permits several GiB of retained index storage; this is a structural ceiling,
-  not a practical memory budget. Use the compile limit below to stop earlier.
-  IBTC descriptors continue growing per invalidation epoch per live indirect-branch
-  site, even after compilation stops. Reclaim is tracked separately in `xj-aau.4`.
-  Returned code-arena allocation errors, executable
-  memory finalization/protection resource failures (ENOMEM/EAGAIN, including Linux's
-  mapping-count limit), CodeMap capacity exhaustion, and failure to start the background
-  compiler now permanently stop new compilation. Each vcpu
-  returns `Exit::CodeSpaceExhausted { addr, .. }` once at a resumable block boundary;
-  call `run()` again to continue with interpreter fallback for uncompiled blocks.
-  Existing translations remain usable. `JitBackend::set_compile_limit` can cap
-  compilation attempts before host resources run out. On a weak host, interpreter
-  fallback provides only the interpreter's ordering for ordinary loads/stores and
-  does not honor `MemConsistency::AcqRel` or `FullTso` (xj-0w3.6). An embedder relying on either
-  tier for a multithreaded guest should treat `CodeSpaceExhausted` as fatal.
-  Other finalization/protection errors retain their diagnostic panic. Global allocator
-  failure retains Rust's process-abort behavior.
-- **Self-modifying code is observed one block late.** A block that writes into the page it is itself executing runs to the end of that block on the old bytes; the re-lift takes effect on the next dispatch. This matches QEMU and is the deviation `spec.md` §10 records. Everything else — another block's page, `rep stos`, an x87 store — invalidates on both backends.
-
-**API stability.** Pre-1.0 (`0.x`). The embedding API (`Vm`, `Vcpu`, `Exit`, …) is not
-frozen and will have breaking changes between releases.
-
-## Getting started
-
-With Nix (recommended — pins the whole toolchain):
-
-```sh
-nix develop            # or: direnv allow, then it auto-loads
-cargo build
-cargo nextest run
-```
-
-Neither the build nor the tests need the network. The `oracles/` submodule holds the
-pinned manuals the code cites (see [`PROVENANCE.md`](PROVENANCE.md)); it is only needed
-if you want to *read* a source, so a clone without it builds and tests fine:
-
-```sh
-git submodule update --init      # optional: the cited sources, for humans
-```
-
-Without Nix:
-
-```sh
-rustup toolchain install stable   # MSRV 1.75
-cargo build
-cargo test
-```
+| Crate | What it is |
+| --- | --- |
+| [`x86jit-core`](x86jit-core/) | The engine: `Vm`, `Vcpu`, lift, IR, interpreter, translation cache, dispatcher, x87. |
+| [`x86jit-cranelift`](x86jit-cranelift/) | The Cranelift JIT backend, `JitBackend` (default `jit` feature). |
+| [`x86jit-elf`](x86jit-elf/) | Optional ELF loader helpers: static, static-PIE and dynamic images, initial stack. |
+| [`x86jit-tests`](x86jit-tests/) | Differential harness: vectors, Unicorn and native (x86-64 Linux) oracles, fuzzers, the 80286 corpus, the ISA coverage map. |
+| [`x86jit-bench`](x86jit-bench/) | Interpreter and JIT workload timings, recorded per commit. |
 
 ## Embedding
 
-The core and JIT backend enable the `environment` Cargo feature by default. This
-only makes legacy diagnostic APIs available: constructing or running a VM never
-reads diagnostic environment variables or creates diagnostic files. Build each
-crate with `default-features = false` to remove those paths entirely (retain
-`features = ["jit"]` for the Cranelift backend). No dependencies are added.
-
-Use `JitBackend::set_flag_elision(bool)` before compiling, and
-`Vm::set_lockstep_trace(Some(Arc::new(lockstep::Trace::new(writer, options))))`
-for interpreter tracing to a supplied writer. The corresponding lift API is
-`lift::elide_dead_flags_with_options`. Compiled execution does not emit interpreter
-trace records.
-
-`JitBackend::set_compiled_code_observer` receives every compiled block and region
-with its host start, byte length, guest entry RIP, and unit kind. It runs on the
-compiling thread, including the tier-up worker, after registration and after the
-module lock is released. It may re-enter the backend; concurrent callbacks may
-overlap. An unwinding observer panic is reported and caught, that observer is
-disabled, and compilation continues. Panicking observer captures and panic-payload
-destructors are also isolated during cleanup outside backend locks; a secondary
-panic payload from cleanup is intentionally forgotten. Background queue completion
-and idle notification run during unwinding as well. Process aborts remain outside
-this guarantee. `perfmap::PerfMap::new(writer)` provides a perf-map
-observer without opening a file. Ranges stay allocated for the backend's lifetime;
-code release will require a matching observer event. Frame pointers are always
-preserved because fault recovery depends on them; `codegen_description` reports
-this setting.
-
-To opt into legacy variables explicitly, enable `environment` and call
-`JitBackend::enable_environment_diagnostics()` before compiling. It reads
-`X86JIT_NO_FLAG_ELISION` and `X86JIT_PERF_MAP`; the latter installs the perf-map
-observer when set to `1`, sharing one serialized process-wide append writer for
-`/tmp/perf-<pid>.map`. Later backends preserve earlier records. Install a combined observer
-afterward if another consumer also needs events. For legacy lockstep capture,
-call `lockstep::Trace::from_environment()` and pass the returned trace to the VM;
-this reads `X86JIT_LOCKSTEP`, `_LO`, `_HI`, and `_MAX`. These explicit API calls are
-the only production environment/file paths in the two crates.
-
-
-The core is a library. Give it a memory map and an entry point; it hands control
-back through `Exit` whenever it hits something you own (a syscall, an MMIO
-access, an unsupported instruction):
-
 ```rust
 use x86jit_core::{Exit, Prot, Reg, RegionKind, Vm, VmConfig};
+use x86jit_cranelift::JitBackend;
 
-let mut vm = Vm::new(VmConfig::flat(0x1_0000));   // flat guest space, interpreter backend
+// A 64 KiB flat guest on the Cranelift JIT; `Vm::new(config)` runs the interpreter.
+let mut vm = Vm::with_backend(VmConfig::flat(0x1_0000), Box::new(JitBackend::new()));
 vm.map(0, 0x1_0000, Prot::RWX, RegionKind::Ram).unwrap();
-vm.write_bytes(0x1000, &[0xB8, 0x05, 0x00, 0x00, 0x00, 0xF4]).unwrap(); // mov eax,5 ; hlt
+// mov eax, 1 ; syscall ; hlt
+vm.write_bytes(0x1000, &[0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xF4]).unwrap();
 
 let mut cpu = vm.new_vcpu();
 cpu.set_reg(Reg::Rip, 0x1000);
-assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
-assert_eq!(cpu.reg(Reg::Rax) as u32, 5);
-```
-
-`Memory::from_host_ram` and `Vm::with_backend_host_ram` return a `Result`.
-Host backing must preserve 16-byte guest alignment: `ram.ptr as usize % 16`
-must equal `ram.guest_base % 16`. Invalid alignment returns
-`HostRamError::Misaligned`; invalid extents also return a `HostRamError`.
-Page-aligned backing with a page-aligned guest base, and identity mappings
-(`guest_base == ptr as u64`), satisfy this requirement. Owned memory is allocated
-with 16-byte alignment. This lets interpreted and compiled `cmpxchg16b` use the
-same host atomic operation.
-
-Guard-backed JIT memory can recover inline guest-access host faults through
-`cpu.fault_handle()` and `jit_abi::fault::classify`. The embedder owns the
-SIGSEGV/SIGBUS handler and copies the returned host registers into its signal
-context, including the scratch register the classifier sets (x9 / r11), and on
-AArch64 LR and d8–d15. The embedder derives `HostFaultKind` from the OS fault
-reason; macOS AArch64 needs the saved ESR to distinguish access from alignment.
-FreeBSD amd64/arm64 accepts SIGSEGV with SEGV_MAPERR (1) or SEGV_ACCERR (2),
-and SIGBUS with compatibility page-fault code 12 (UCODE_PAGEFLT), as Access;
-SIGBUS/BUS_ADRALN (1) is Alignment. Other codes, including user-sent signals,
-BUS_ADRERR (2), BUS_OBJERR (3) and BUS_OOMERR (100), are Unsupported. FreeBSD
-arm64 alignment recovery ignores `si_addr`, which names the host PC, and replays
-from guest RIP after validating the active handle, exact site and compiled frame.
-Access faults on that host, and every kind on the other hosts, require an address
-in the guest span. These facts follow FreeBSD 14.3 `sys/sys/signal.h`,
-`sys/vm/vm_fault.c` and the amd64/arm64 trap sources; they are not pinned in
-`oracles/`. See decision-13 below for source links and ucontext layouts.
-The handler must not depend on the interrupted FP mode. Returning from it reaches
-a mangled core landing stub, which restores host FP control before control returns
-to `call_block`'s caller. Access faults produce a resumable `Exit::UnmappedMemory`;
-alignment faults replay in the interpreter. Handles must
-remain live, and a rejected fault must chain to the previous signal disposition.
-See [decision-13](backlog/decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md)
-for supported hosts, signal safety, and the protected-mapped-page fallback.
-Compiled calls stay direct; recovery uses compiler-provided unwind recipes and
-one record published per run and cleared on return or panic. macOS x86-64 is
-compile-unverified.
-FreeBSD amd64/arm64 recovery and test adapters are implemented; runtime validation
-of `fault_landing_pad` and `rust_memory_faults` on both FreeBSD architectures is
-pending.
-
-Embedders that protect RAM independently of the region table enable
-`vm.mem.set_host_fault_recovery(true)` before execution;
-`Memory::host_fault_recovery()` reads the setting. Default mode performs no Rust
-transfer routing: registered RAM must remain host-accessible to interpreter,
-helper and fetch accesses. Compiled-code faults recover in both modes through
-decision-13. Routed Rust transfers use the same classifier, including with a zero
-or inactive handle on threads with no active vCPU. Copy back PC and scratch and
-return normally from the handler; the routine returns its fault to Rust and
-ordinary destructors run. Alignment faults inside a fixup routine are rejected.
-
-Instruction decoding always uses a private snapshot. Fetch starts with at most
-128 bytes, bounded by the host page and region; it extends only when decoding
-needs more bytes. Single-step fetch needs at most 15 bytes. In default mode these
-copies use `ptr::copy_nonoverlapping`. A routed copy retains its readable prefix
-on a fault. No cache lock is held while copying.
-
-The public API changes are:
-
-- `MemTrap` is `#[non_exhaustive]` and includes payload-free `HostFault`.
-  Downstream matches need a wildcard. `MemTrap::fault_addr(transfer)`
-  returns the exact byte for a host fault; call it immediately on the accessing
-  thread, before another failing transfer can replace the thread's return slot.
-- `Memory::code_slice` returns `Result<Vec<u8>, MemTrap>`; callers borrow the
-  owned snapshot when decoding. `Memory::set_host_fault_recovery` and
-  `Memory::host_fault_recovery` select and inspect the opt-in policy.
-- `RawFpMem` and `RawStrMem` have a public `recover_host_faults: bool` field;
-  existing struct literals must initialize it. `RawFpMem::exec_fxstate` and
-  `RawFpMem::exec_x87` select the policy once per helper call.
-  `RawStrMem::probe_store` explicitly invokes a checked write probe.
-- `FpMem` provides `fault_addr`, `host_fault_recovery`, `load_checked` and
-  `store_checked` methods, with defaults for existing implementors.
-  `StrMem::preflight_store` provides a default no-op hook for selected store pages.
-  `interp::raw_string_run_interruptible` selects a raw string helper's policy
-  once per instruction.
-
-Routed Rust copies and vector stores preflight destination pages. A write probe
-atomically writes one byte's current value back on each touched host page: guest
-data is unchanged, but copy-on-write and dirty tracking are affected even if a
-later page faults. Serialize protection revocation with the complete transfer if
-all-or-nothing writes are required. Compiled split vector stores and AArch64
-misaligned scalar stores crossing a host page can retain completed writes on a
-fault and rewrite those bytes on resume; this gap is tracked in xj-obx.8. Routed
-REP MOVS/STOS remains per element and retains completed iterations. An x87
-memory fault restores instruction-entry status in both modes.
-
-`cpu.exit_request()` returns a cloneable, `Send + Sync` handle. Another host thread
-can call `handle.request_exit()` to make `run` return `Exit::Interrupted`, even
-without a block budget. The vCPU yields at its next checked instruction boundary:
-block/chain edges, region sub-block entries, or between REP string iterations.
-Guest state is precise; call `run` again to resume. Requests made outside `run`
-remain pending, and duplicate pending requests coalesce into one exit. Each handle
-targets one vCPU; a handle outliving that vCPU has no effect. Everything a thread
-wrote before `request_exit()` is visible to the caller once `run` returns the
-`Exit::Interrupted` that consumed that request. Compiled blocks charge their whole
-instruction count at entry, so an interrupted REP can over-charge that counter,
-like a mid-block fault.
-
-`Exit` and its struct-like variants are non-exhaustive: matches need a wildcard
-arm, and struct-like patterns need `..` to allow future exit reasons and fields.
-Replace struct literals with the stable constructors
-`Exit::unmapped_memory(addr, access)`, `Exit::mmio_read(addr, size)`,
-`Exit::mmio_write(addr, size, value)`, `Exit::unknown_instruction(addr, bytes, len)`,
-`Exit::exception(addr, vector)` and `Exit::port_io(port, size, dir, value)`;
-fields added later receive defaults through these constructors.
-
-Trap data accesses return `Exit::MmioRead` or `Exit::MmioWrite` with `addr` and
-`size` for the current transfer (at most 8 bytes), plus `total_size: u16` for the
-full memory operand width and `part: u8` for its zero-based transfer slot.
-For example, a 32-byte load returns four 8-byte reads at offsets 0, 8, 16 and 24,
-each with `total_size == 32` and `part` 0 through 3. RIP stays on the instruction
-until all transfers finish. Supply each read through `complete_mmio_read(value)`;
-perform each write's side effect and call `complete_mmio_write()` before resuming.
-
-`total_size` includes masked-off bytes, rather than counting active bytes, and
-describes the memory operand (the source chunk for a broadcast, the destination
-for a narrowing store). `part` is `addr.wrapping_sub(operand_base) / size`:
-per-element masked memory transfers and narrowing stores use element-sized slots,
-so inactive elements leave gaps in the indices. Whole-table reads, including
-masked VPERMD and GFNI affine memory forms, use 8-byte chunks, so a 32-byte table
-reports parts 0, 1, 2 and 3, regardless of the element width.
-Slots served by RAM also keep their indices when only part of an operand traps.
-Scalar loads/stores of 8 bytes or less and the existing MMIO constructors use
-`total_size == size` and `part == 0`.
-Both backends report the same metadata.
-
-Instruction fetch continues across adjacent mapped RAM/ROM regions. An unmapped
-byte or a `RegionKind::Trap` byte stops fetch, even when the Trap region is
-executable; Trap backing is never decoded. The resulting `Exit::UnmappedMemory`
-uses `AccessKind::Execute` and reports the first unavailable or first Trap byte
-as `addr`, while RIP stays on the attempted instruction's start. In Real16, `addr`
-is the physical fetch address and RIP is the instruction's IP offset within CS.
-Earlier instructions complete first; the faulting instruction has no effects.
-Trap data reads and writes use the MMIO exits and completion methods.
-
-In Long64 and Compat32, an invalid opcode raises `Exit::Exception` with vector 6
-(#UD); an instruction exceeding 15 bytes raises vector 13 (#GP). Both leave `addr`
-and RIP on the faulting instruction after earlier instructions complete (Intel SDM
-Vol 3A §7.15, Events 6 and 13; Vol 2A §2.3.11). A valid encoding the lifter does not
-handle returns `Exit::UnknownInstruction`.
-
-For a complete CPU identity, install a CPUID table before creating vCPUs:
-
-```rust
-use x86jit_core::{CpuidLeaf, CpuidOutOfRange, CpuidOverride, CpuidOverrides,
-                  CpuidRegisters as R, CpuidTable};
-
-let mut table = CpuidTable::new(CpuidOutOfRange::HighestBasicLeaf);
-// SDM Vol 1 Tables 21-4/6/8: vendor, signature, and leaf-1 fields.
-table.leaves.insert(0, CpuidLeaf::Constant(R::new(
-    1, 0x756e_6547, 0x6c65_746e, 0x4965_6e69)));
-table.leaves.insert(1, CpuidLeaf::Constant(R::new(0x0003_06c3, 0x0002_0800, 0, 0)));
-vm.set_cpuid_table(Some(table));
-
-let mut overrides = CpuidOverrides::default();
-// Initial APIC ID: SDM Vol 1 Table 21-8.
-overrides.leaves.insert((1, 0), CpuidOverride {
-    mask: R::new(0, 0xff00_0000, 0, 0),
-    value: R::new(0, 1 << 24, 0, 0),
-});
-let vcpu = vm.new_vcpu_with_cpuid_overrides(overrides);
-```
-
-This is a minimal API example, not a complete CPU profile. `CpuidLeaf::Indexed`
-holds a `(subleaf, registers)` map and an `invalid_subleaf` reply; `Constant` ignores
-input ECX. The table also specifies replies for missing leaves and queries outside
-the maxima in leaves 0 and 0x8000_0000. `HighestBasicLeaf` follows SDM Vol 1
-§21.1.3; `Fixed` supplies a profile-specific reply. Explicit entries can describe
-software-defined ranges. A table replaces all preset CPUID replies. Set `None`
-to restore the selected `GuestCpuFeatures` projection for new vCPUs; existing vCPUs
-retain their description. That legacy projection returns zeros outside its ranges,
-a compatibility deviation from the SDM rule.
-
-Overrides apply masked fields after lookup, keyed by the resolved leaf and subleaf
-(zero for leaves that ignore ECX). They can carry logical-processor IDs and runtime
-fields such as OSXSAVE, leaf 0xD sizes, 07H ECX[4] OSPKE and 19H EBX[0]
-AESKLE (SDM Vol 1 §21.1.5, Table 21-1), and 80000001H EDX[11] SYSCALL
-(Table 21-90). The legacy projection keeps SYSCALL set in every mode, a frozen
-deviation from Table 21-90, which specifies zero outside 64-bit mode.
-`CpuidOverrides::xcr0` supplies XGETBV(0); otherwise the feature preset supplies it.
-The embedder keeps those fields consistent and can update `vcpu.cpu.cpuid_overrides`
-when its modeled state changes. Tables and overrides survive CPU-state cloning;
-VM forks inherit the table.
-
-Advertising a bit does not implement its instructions. In development tooling,
-`x86jit_tests::compat::cpuid_lift_gaps(|leaf, subleaf| vcpu.cpu.cpuid(leaf, subleaf))`
-reports incomplete or unknown user-mode lift coverage for an effective CPU source.
-The same helper accepts a preset's `cpuid` or a table's `query`. It covers Intel/AMD
-instruction-feature bits understood by iced, not legacy vendor-specific leaves or
-CPU-description consistency. The preset tests carry explicit per-preset waivers,
-including CX8, XSAVE and CX16 gaps. In particular, supplying leaf 0xD sizes can
-select XSAVE/XRSTOR paths that currently trap. See
-[decision-11](backlog/decisions/decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md).
-
-Embedders can install time and entropy through a shared `CpuSource` handle:
-
-```rust
-use std::{sync::Arc, time::Instant};
-use x86jit_core::{CpuSource, RandomKind, TscSample};
-
-#[derive(Debug)]
-struct Source(Instant);
-
-impl CpuSource for Source {
-    fn read_tsc(&self, vcpu_id: u64) -> TscSample {
-        TscSample {
-            counter: self.0.elapsed().as_nanos() as u64,
-            aux: vcpu_id as u32,
+loop {
+    match cpu.run(&vm, None) {
+        // RIP is already past `syscall`: service the call, then run again.
+        Exit::Syscall => {
+            let number = cpu.reg(Reg::Rax);
+            cpu.set_reg(Reg::Rax, number + 41); // the call's return value
         }
-    }
-
-    fn read_random(&self, _vcpu_id: u64, _kind: RandomKind, _size: u8) -> Option<u64> {
-        None // Supply entropy here; None makes the instruction report CF=0.
+        Exit::Hlt => break,
+        // `Exit` is #[non_exhaustive]: keep a catch-all arm.
+        other => panic!("unhandled exit: {other:?}"),
     }
 }
-
-vm.set_cpu_source(Some(Arc::new(Source(Instant::now()))));
-let mut cpu = vm.new_vcpu();
+assert_eq!(cpu.reg(Reg::Rax), 42);
 ```
 
-The engine samples the source exactly once per executed RDTSC, RDTSCP, RDRAND
-or RDSEED. `source_id` identifies the requesting vCPU independently of CPUID IDs;
-RDTSCP returns the source's paired `aux` in ECX. The source owns rate, offset,
-cross-vCPU monotonicity and entropy quality. Its behavior must agree with any
-advertised invariant-TSC bit and CPUID frequency leaves 0x15/0x16 (SDM Vol 3B
-§20.17/§20.17.1; Vol 1 §21.3 CPUID.15H/16H). Installing a source does not
-advertise these instructions: select `Feature::Rdtscp`, `Rdrand` and `Rdseed`
-or supply a consistent CPUID table. They remain absent from the default preset.
-
-For RDTSCP, the engine guarantees that all earlier guest instructions have retired
-and their memory accesses are ordered by a host fence before calling `read_tsc`.
-A source reading a hardware counter must itself use an execution-synchronising
-read so that sampling cannot run ahead of earlier guest loads: on x86-64, RDTSCP
-or LFENCE;RDTSC (SDM Vol 2B RDTSCP/RDTSC, Description); on AArch64, ISB before
-CNTVCT_EL0, or the self-synchronising CNTVCTSS_EL0 with FEAT_ECV (see the Arm
-Architecture Reference Manual, generic timer). A memory fence alone does not
-synchronise the counter read. RDTSC has no ordering requirement (SDM Vol 2B
-RDTSC, Description). Both instructions call the same method, so hardware-counter
-sources must provide RDTSCP ordering on every call.
-
-With no source, RDTSC and RDTSCP return `0x12345678`, TSC_AUX is zero, and
-RDRAND/RDSEED share a deterministic per-vCPU sequence with CF=1. This fallback
-is test data and provides no cryptographic entropy. Existing vCPUs retain their
-handle when the VM setting changes; `CpuState::cpu_source` and
-`CpuState::source_id` can be replaced between runs. CPU-state clones retain the
-source identity and share the handle; VM forks share the handle and fresh-ID
-allocator. External source state is not snapshotted by either operation. Source
-methods must not panic or reenter
-execution across the JIT helper boundary. The accepted design is reflected in
-spec §1/§14; see
-[decision-12](backlog/decisions/decision-12%20-%20Shared-CPU-source-handles-for-time-and-entropy.md).
-
-Swap in the JIT with `Vm::with_backend(cfg, Box::new(JitBackend::new()))` — same
-API, identical guest state. Runnable examples:
+Runnable examples:
 
 ```sh
 cargo run -p x86jit-core      --example raw_bytes      # smallest embedding
 cargo run -p x86jit-core      --example mmio_device    # a trapped MMIO device
 cargo run -p x86jit-cranelift --example jit_vs_interp  # wiring in the JIT
-cargo run -p x86jit-elf       --example run_elf -- ELF # load + run a static ELF
+cargo run -p x86jit-elf       --example run_elf -- ELF # load and run a static ELF
 ```
 
 ## Documentation
 
-- [`spec.md`](backlog/docs/design/spec.md) — authoritative design spec (contract, IR, backends, semantics traps).
-- [`PROVENANCE.md`](PROVENANCE.md) — where the engine's behaviour comes from: what is authoritative (the Intel SDM, the AMD APM, the psABI), what is merely an oracle, what we deliberately do not model, and the licence surface.
-- [`backlog/`](backlog/) — load-on-demand knowledge tree (agent + user docs, ADRs, decision log).
-- [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) — pointer table for coding agents.
+- [`spec.md`][spec]: the authoritative design (contract, IR, backends, semantics traps).
+- [`architecture.md`](backlog/docs/architecture.md): workspace shape, data flow and module map.
+- [`backlog/decisions/`](backlog/decisions/): design decisions, including the embedder contracts
+  for host-fault recovery ([decision-13]), CPUID ([decision-11]) and time and entropy ([decision-12]).
+- [`status.md`](backlog/docs/status.md) and [`deferred.md`](backlog/docs/deferred.md): what
+  works, and what is deliberately left out.
+- [`isa-coverage.md`][coverage]: the generated map of which encodings lift, per x86-64 level.
+- [`commands.md`](backlog/docs/commands.md): build, test, fuzz, bench and lint commands.
+- [`PROVENANCE.md`](PROVENANCE.md): where the engine's behaviour comes from, and the licence surface.
+- [`AGENTS.md`](AGENTS.md): orientation for coding agents.
+
+## Building and testing
+
+```sh
+nix develop                   # pinned toolchain; or `direnv allow`
+git submodule update --init   # optional: the manuals the code cites (oracles/)
+cargo build
+cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)'
+cargo clippy --all-targets --all-features -- -D warnings
+cargo deny --all-features check licenses bans sources
+```
+
+`fuzz_robustness` runs for more than seven minutes by design, hence the filter. The `unicorn`
+feature (also enabled by `--all-features`) links the native Unicorn library from the dev shell;
+without Nix, use stable Rust 1.88 or newer and leave it out. Tests need neither the network nor
+the `oracles/` submodule: witness tests pin the cited values in code.
+
+## Known gaps
+
+- **Missing instructions.** Anything the lifter does not handle returns
+  `Exit::UnknownInstruction`. AVX-512 is partial: some EVEX handlers ignore the write mask, and
+  embedded broadcast is not yet read. MMX is minimal. The tests validate what is lifted, not
+  what is missing; read the [coverage map][coverage] as an upper bound.
+- **`Prot` is advisory.** A guest store into an `R` or `RX` region succeeds on both backends
+  ([deferred.md](backlog/docs/deferred.md)).
+- **FP control is partly modelled.** MXCSR round-trips, but RC, FTZ and DAZ do not yet govern
+  SSE/AVX arithmetic. Some x87 paths, such as stores to memory, ignore rounding control, and
+  legacy forms such as `fnsave`/`frstor` are refused.
+- **Memory ordering covers JIT inline accesses only.** Interpreter accesses and helper-executed
+  accesses (string ops, x87, FXSAVE, masked stores) get no tier barriers, and AArch64 LL/SC
+  locked operations lack full x86 ordering.
+- **Translations are never reclaimed.** A guest that keeps patching its code grows host memory
+  with every patch. When JIT code space runs out, each vCPU returns `Exit::CodeSpaceExhausted`
+  once and continues interpreted; `JitBackend::set_compile_limit` caps compilation earlier.
+- **`Real16` is interpreter-only**, and there is no protected-mode segment-descriptor model:
+  `Compat32` is flat apart from the FS/GS bases.
+- **Host-fault recovery depends on the host.** [decision-13] lists which hosts are
+  runtime-validated, cross-checked or pending, and the remaining partial-store gap.
+- **Real programs are tested elsewhere.** Whole programs (busybox, sqlite, CPython, Go servers)
+  run in `unemulinux`. [`scripts/ladder.sh`](scripts/ladder.sh) drives that ladder from here,
+  but this repository's CI does not gate on it yet.
+- **Pre-1.0 API.** Expect breaking changes between `0.x` releases.
 
 ## License
 
-Dual-licensed under either of:
+Dual-licensed under the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option. Every dependency of the library crates
+(`x86jit-core`, `x86jit-cranelift`, `x86jit-elf`) is permissively licensed; the GPL-2.0 Unicorn
+oracle is an optional, off-by-default feature of the unpublished test crate. `cargo deny`
+enforces this, and [`PROVENANCE.md`](PROVENANCE.md) §5 has the analysis.
 
-- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
-- MIT license ([`LICENSE-MIT`](LICENSE-MIT))
-
-at your option. All core dependencies are permissive (MIT/Apache), so there are no copyleft constraints (`spec.md` §15).
+[spec]: backlog/docs/design/spec.md
+[coverage]: backlog/docs/compat/isa-coverage.md
+[decision-11]: backlog/decisions/decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md
+[decision-12]: backlog/decisions/decision-12%20-%20Shared-CPU-source-handles-for-time-and-entropy.md
+[decision-13]: backlog/decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md

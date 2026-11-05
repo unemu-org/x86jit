@@ -129,8 +129,9 @@ otherwise have read as an engine bug.
 
 ## Known defects that are staying
 
-Recorded so nobody reads them as oversights. All are in the README's "Known gaps" with
-task numbers, which is the point — the project says what is wrong with it.
+Recorded so nobody reads them as oversights. Their standing records are `deferred.md`,
+`PROVENANCE.md` §3 and the coverage map, which is the point — the project says what is
+wrong with it.
 
 - x87 exception flags are set and validated against hardware, but **`#MF` is never
   delivered** — a guest that unmasks an exception gets ES set and a result, not a trap.
