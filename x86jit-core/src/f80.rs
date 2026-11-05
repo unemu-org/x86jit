@@ -485,44 +485,52 @@ impl F80 {
         }
     }
 
-    /// Round to a signed integer using x87 rounding mode `rc` (0=nearest,1=down,
-    /// 2=up,3=truncate). Saturates on overflow to the "integer indefinite" pattern
-    /// the caller masks to the destination width.
+    /// Round to a signed 64-bit integer using x87 rounding mode `rc`
+    /// (0=nearest, 1=down, 2=up, 3=truncate). Invalid conversion returns
+    /// `i64::MIN`, the 64-bit integer indefinite (SDM Vol 1 §8.2.1).
     pub fn to_i64_rc(&self, rc: u8) -> i64 {
+        self.to_int_rc(64, rc).0
+    }
+
+    /// SDM Vol 1 §§4.2.1.2, 8.2.1, 8.5.1.2 Table 8-10; Vol 2A §3.3
+    /// FIST/FISTP, FISTTP: round before checking the destination's signed range.
+    /// Returns the value, exceptions and whether the magnitude rounded upward
+    /// (C1 for FIST/FISTP, Vol 1 §8.5.6). Invalid takes priority over precision
+    /// (§4.9.2), and the indefinite has only the destination sign bit set.
+    pub(crate) fn to_int_rc(self, bits: u32, rc: u8) -> (i64, Exc, bool) {
+        let limit = 1u64 << (bits - 1);
+        let invalid = (apply_sign(limit, true), Exc::IE, false);
         match self.class {
-            Class::Zero => 0,
-            Class::Nan | Class::Inf | Class::Unsupported => i64::MIN,
+            Class::Zero => (0, Exc::NONE, false),
+            Class::Nan | Class::Inf | Class::Unsupported => invalid,
             Class::Normal => {
-                // value = sig * 2^(exp-63). If exp >= 63 it's a (large) integer already.
                 let e = self.exp;
-                if e >= 63 {
-                    // Would overflow i64 for e>62; saturate to the indefinite value.
-                    if e > 62 {
-                        return i64::MIN;
-                    }
-                    let m = self.sig >> (63 - e);
-                    return apply_sign(m, self.sign);
+                if e > 63 {
+                    return invalid;
                 }
-                if e < -1 {
-                    // |value| < 0.5 ... handle rounding of a pure fraction.
+                let (mag, inexact, up) = if e == 63 {
+                    (self.sig, false, false)
+                } else if e < -1 {
                     let up = round_fraction_up(self.sig, 0, self.sign, rc, true);
-                    return if up { apply_sign(1, self.sign) } else { 0 };
-                }
-                if e == -1 {
-                    // |value| in [0.5, 1): integer part 0, the whole significand is the
-                    // fraction, half-point = 2^63. (The shift path below would compute
-                    // `1u64 << 64` and panic.)
+                    (up as u64, true, up)
+                } else if e == -1 {
                     let up = decide_round(0, self.sig, 1u64 << 63, self.sign, rc);
-                    return apply_sign(up as u64, self.sign);
+                    (up as u64, true, up)
+                } else {
+                    let shift = (63 - e) as u32;
+                    let int = self.sig >> shift;
+                    let frac = self.sig & ((1u64 << shift) - 1);
+                    let up = decide_round(int, frac, 1u64 << (shift - 1), self.sign, rc);
+                    (int + up as u64, frac != 0, up)
+                };
+                if mag > limit || (mag == limit && !self.sign) {
+                    return invalid;
                 }
-                // 0 <= shift <= 63: integer part = sig >> (63 - e), fraction below.
-                let shift = (63 - e) as u32;
-                let int = self.sig >> shift;
-                let frac_mask = (1u64 << shift) - 1;
-                let frac = self.sig & frac_mask;
-                let half = 1u64 << (shift - 1);
-                let up = decide_round(int, frac, half, self.sign, rc);
-                apply_sign(int + up as u64, self.sign)
+                (
+                    apply_sign(mag, self.sign),
+                    if inexact { Exc::PE } else { Exc::NONE },
+                    up,
+                )
             }
         }
     }

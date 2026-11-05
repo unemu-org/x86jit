@@ -977,18 +977,11 @@ fn mem_arith(kind: FpuKind, a: F80, m: F80, c: Ctl) -> (F80, Exc) {
     }
 }
 
-/// Bytes this op writes to guest memory at its effective address, or `None` if it
-/// writes no memory at all.
+/// Memory-destination width for this op, or `None` for ops without one.
 ///
-/// The JIT runs x87 through a helper over a raw, bounds-checked-only view of guest RAM
-/// (`RawFpMem`), which by design does not go through `Memory` and so reaches neither the
-/// SMC code-page hook nor the embedder's watched ranges. The helper therefore has to
-/// report the write itself, and this is the width to report. A guest really does patch
-/// its own code this way — glibc's number formatting stores through `fistp`.
-///
-/// Kept beside `exec_x87` on purpose: a new memory-writing `FpuKind` added there and
-/// forgotten here would silently stop invalidating translations, so the two lists want
-/// to be read together.
+/// An unmasked exception can suppress the store (SDM Vol 1 §8.5.1.2), so this
+/// width does not imply a committed write. JIT write notifications follow
+/// successful [`FpMem::store`] calls.
 pub fn mem_write_bytes(kind: FpuKind) -> Option<usize> {
     use FpuKind::*;
     Some(match kind {
@@ -1172,48 +1165,26 @@ fn exec_x87_inner<M: FpMem>(
             }
             pop(cpu);
         }
-        FistpI16 => {
-            let v = operand!(cpu, 0).to_i64_rc(rc(cpu)) as i16;
-            if !mem.store(addr, &v.to_le_bytes()) {
+        FistpI16 | FistpI32 | FistpI64 | FisttpI16 | FisttpI32 | FisttpI64 => {
+            // SDM Vol 2A §3.3 FIST/FISTP and FISTTP: invalid conversion stores
+            // the destination-width indefinite only when IM is masked. FISTTP
+            // ignores RC and always clears C1; FISTP uses C1 for rounding.
+            let bytes = mem_write_bytes(kind).unwrap();
+            let trunc = matches!(kind, FisttpI16 | FisttpI32 | FisttpI64);
+            cpu.fpu_sw &= !(1 << 9);
+            let a = operand!(cpu, 0);
+            let (v, exc, up) = a.to_int_rc((bytes * 8) as u32, if trunc { 3 } else { rc(cpu) });
+            if raise(cpu, exc) && exc.has(Exc::IE) {
+                return None;
+            }
+            if !trunc && up {
+                cpu.fpu_sw |= 1 << 9;
+            }
+            if !mem.store(addr, &v.to_le_bytes()[..bytes]) {
                 return Some((mem.fault_addr(addr), true));
             }
-            pop(cpu);
-        }
-        FistpI32 => {
-            let v = operand!(cpu, 0).to_i64_rc(rc(cpu)) as i32;
-            if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((mem.fault_addr(addr), true));
-            }
-            pop(cpu);
-        }
-        FistpI64 => {
-            let v = operand!(cpu, 0).to_i64_rc(rc(cpu));
-            if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((mem.fault_addr(addr), true));
-            }
-            pop(cpu);
-        }
-        // fisttp: like fistp but always truncates toward zero (rc = 3), ignoring the
-        // FPU rounding control.
-        FisttpI16 => {
-            let v = operand!(cpu, 0).to_i64_rc(3) as i16;
-            if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((mem.fault_addr(addr), true));
-            }
-            pop(cpu);
-        }
-        FisttpI32 => {
-            let v = operand!(cpu, 0).to_i64_rc(3) as i32;
-            if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((mem.fault_addr(addr), true));
-            }
-            pop(cpu);
-        }
-        FisttpI64 => {
-            let v = operand!(cpu, 0).to_i64_rc(3);
-            if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((mem.fault_addr(addr), true));
-            }
+            // SDM Vol 1 §§4.9.1.6, 8.5.6: an unmasked precision exception
+            // retains the rounded result, unlike an invalid conversion.
             pop(cpu);
         }
         FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64 | FdivrMemF64 => {

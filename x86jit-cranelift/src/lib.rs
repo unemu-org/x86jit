@@ -33,6 +33,7 @@ use cranelift_module::{Linkage, Module, ModuleError};
 
 use x86jit_core::cache::CompiledPtr;
 use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets, MAX_GUEST_ACCESS_DESCRIPTORS};
+use x86jit_core::x87::{FpMem, RawFpMem};
 use x86jit_core::GuestTrapSite;
 use x86jit_core::{
     Backend, CachedBlock, IrBlock, IrRegion, MemConsistency, RegionCaps, TierUpFinished,
@@ -305,6 +306,41 @@ unsafe extern "C" fn cas_pair_helper(
     }
 }
 
+struct NotifyingFpMem<'a> {
+    raw: RawFpMem,
+    memory: &'a x86jit_core::Memory,
+}
+
+impl FpMem for NotifyingFpMem<'_> {
+    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.raw.load(addr, buf)
+    }
+
+    fn store(&self, addr: u64, bytes: &[u8]) -> bool {
+        self.store_checked(addr, bytes).is_ok()
+    }
+
+    fn load_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.raw.load_checked(addr, buf)
+    }
+
+    fn store_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.raw.store_checked(addr, bytes)?;
+        // An unmasked exception can suppress an x87 store (SDM Vol 1 §8.5.1.2).
+        // Notify only a committed transfer.
+        self.memory.note_write(addr, bytes.len());
+        Ok(())
+    }
+
+    fn fault_addr(&self, addr: u64) -> u64 {
+        self.raw.fault_addr(addr)
+    }
+
+    fn host_fault_recovery(&self) -> bool {
+        self.raw.host_fault_recovery()
+    }
+}
+
 /// x87 helper: runs one FPU op via the shared `exec_x87`. On a memory fault it
 /// writes the fault into `MemCtx`, sets RIP to the faulting instruction, and
 /// returns `RET_UNMAPPED`; otherwise `RET_CONTINUE`.
@@ -333,25 +369,19 @@ unsafe extern "C" fn x87_helper(
         cpu.rip = cur_addr;
         return x86jit_core::jit_abi::RET_EXCEPTION;
     }
-    let raw = x86jit_core::x87::RawFpMem {
-        // SAFETY: mem_self retains the live Memory for this helper call.
-        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
-            .host_fault_recovery(),
-        base: ctx.base as *mut u8,
-        size: ctx.size,
-        guest_base: ctx.guest_base,
+    // SAFETY: mem_self retains the live Memory for this helper call.
+    let memory = unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) };
+    let mem = NotifyingFpMem {
+        raw: RawFpMem {
+            recover_host_faults: memory.host_fault_recovery(),
+            base: ctx.base as *mut u8,
+            size: ctx.size,
+            guest_base: ctx.guest_base,
+        },
+        memory,
     };
-    match raw.exec_x87(cpu, kind, addr, sti as u8) {
-        None => {
-            // `RawFpMem` writes host RAM directly, so an x87 store reaches neither the
-            // SMC hook nor the watched ranges unless it is reported here.
-            // Only on the success path — a faulting op wrote nothing.
-            if let Some(n) = x86jit_core::x87::mem_write_bytes(kind) {
-                let mem = &*(ctx.mem_self as *const x86jit_core::memory::Memory);
-                mem.note_write(addr, n);
-            }
-            RET_CONTINUE
-        }
+    match x86jit_core::x87::exec_x87(cpu, &mem, kind, addr, sti as u8) {
+        None => RET_CONTINUE,
         Some((fault, write)) => {
             let width = x86jit_core::x87::mem_operand_bytes(kind);
             ctx.record_helper_fault(fault, width, write, addr, width);
