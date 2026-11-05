@@ -23,7 +23,7 @@ created_date: '2026-07-06 11:25'
 | x86-64-v2 | 91 | 0 | 26 | 78% | 0 |
 | x86-64-v3 | 604 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
-| x87 | 102 | 0 | 52 | 66% | 6 |
+| x87 | 128 | 0 | 26 | 83% | 6 |
 
 ## 32-bit compat mode (Compat32)
 
@@ -37,7 +37,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | x86-64-v2 | 78 | 0 | 25 | 76% | 0 |
 | x86-64-v3 | 565 | 73 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
-| x87 | 102 | 0 | 52 | 66% | 11 |
+| x87 | 128 | 0 | 26 | 83% | 11 |
 
 ## long64 mmx — missing (59)
 
@@ -434,28 +434,10 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vshufi32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshufi64x2_ymm_k1z_ymm_ymmm256b64_imm8`
 
-## long64 x87 — missing (52)
+## long64 x87 — missing (26)
 
 - `Fbld_m80bcd`
 - `Fbstp_m80bcd`
-- `Fcmovb_st0_sti`
-- `Fcmovbe_st0_sti`
-- `Fcmove_st0_sti`
-- `Fcmovnb_st0_sti`
-- `Fcmovnbe_st0_sti`
-- `Fcmovne_st0_sti`
-- `Fcmovnu_st0_sti`
-- `Fcmovu_st0_sti`
-- `Fcom_m32fp`
-- `Fcom_m64fp`
-- `Fcom_st0_sti`
-- `Fcom_st0_sti_DCD0`
-- `Fcomp_m32fp`
-- `Fcomp_m64fp`
-- `Fcomp_st0_sti`
-- `Fcomp_st0_sti_DCD8`
-- `Fcomp_st0_sti_DED0`
-- `Fcompp`
 - `Fdecstp`
 - `Ffree_sti`
 - `Ffreep_sti`
@@ -475,18 +457,10 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Fnsave_m94byte`
 - `Fnsetpm`
 - `Fnstenv_m14byte`
-- `Fprem1`
 - `Frndint`
 - `Frstor_m108byte`
 - `Frstor_m94byte`
-- `Fscale`
-- `Fsqrt`
 - `Fstpnce_sti`
-- `Ftst`
-- `Fucom_st0_sti`
-- `Fucomp_st0_sti`
-- `Fucompp`
-- `Fxam`
 - `Fxtract`
 
 ## compat32 mmx — missing (57)
@@ -874,28 +848,10 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `EVEX_Vshufi32x4_ymm_k1z_ymm_ymmm256b32_imm8`
 - `EVEX_Vshufi64x2_ymm_k1z_ymm_ymmm256b64_imm8`
 
-## compat32 x87 — missing (52)
+## compat32 x87 — missing (26)
 
 - `Fbld_m80bcd`
 - `Fbstp_m80bcd`
-- `Fcmovb_st0_sti`
-- `Fcmovbe_st0_sti`
-- `Fcmove_st0_sti`
-- `Fcmovnb_st0_sti`
-- `Fcmovnbe_st0_sti`
-- `Fcmovne_st0_sti`
-- `Fcmovnu_st0_sti`
-- `Fcmovu_st0_sti`
-- `Fcom_m32fp`
-- `Fcom_m64fp`
-- `Fcom_st0_sti`
-- `Fcom_st0_sti_DCD0`
-- `Fcomp_m32fp`
-- `Fcomp_m64fp`
-- `Fcomp_st0_sti`
-- `Fcomp_st0_sti_DCD8`
-- `Fcomp_st0_sti_DED0`
-- `Fcompp`
 - `Fdecstp`
 - `Ffree_sti`
 - `Ffreep_sti`
@@ -915,18 +871,10 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Fnsave_m94byte`
 - `Fnsetpm`
 - `Fnstenv_m14byte`
-- `Fprem1`
 - `Frndint`
 - `Frstor_m108byte`
 - `Frstor_m94byte`
-- `Fscale`
-- `Fsqrt`
 - `Fstpnce_sti`
-- `Ftst`
-- `Fucom_st0_sti`
-- `Fucomp_st0_sti`
-- `Fucompp`
-- `Fxam`
 - `Fxtract`
 
 ## long64 x86-64-v3 — register form lifts, memory form does not (73)

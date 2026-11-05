@@ -622,9 +622,8 @@ impl F80 {
         F80::sqrt_ctl(a, Ctl::RESET).0
     }
 
-    /// Square root under the guest's control word. `fsqrt` is not lifted today (nothing
-    /// in `lift/` reaches it); this exists so the operation is complete and correct when
-    /// it is, and so the F80 API has no arm that silently ignores precision control.
+    /// Square root under the guest's control word (SDM Vol 2A §3.2 FSQRT;
+    /// Vol 1 §8.1.5.2 for precision control).
     pub fn sqrt_ctl(a: F80, ctl: Ctl) -> (F80, Exc) {
         use Class::*;
         let base = if a.operand_raises_invalid() {
@@ -682,6 +681,180 @@ impl F80 {
                 F80::sub(a, F80::mul(F80::from_i64(q), b))
             }
         }
+    }
+
+    /// SDM Vol 2A §3.2 FPREM1, Operation: exact nearest-even quotient reduction,
+    /// independent of RC and PC. Partial reductions choose N = 32..63, as permitted
+    /// by the instruction. AMD64 APM Vol 5, FPREM1, Action specifies the N choice
+    /// used here where the SDM leaves it implementation dependent.
+    pub(crate) fn rem_nearest(a: F80, b: F80, ctl: Ctl) -> (F80, Exc, bool, u8) {
+        use Class::*;
+        let base = binary_operand_exc(a, b);
+        let finish = |mut r: F80, partial: bool, q: u8| {
+            // SDM Vol 1 §8.5.5: an unmasked register underflow stores the
+            // exact remainder with an exponent biased upward by 24576.
+            let exc = if r.class == Normal && r.exp < EMIN && !ctl.masks_underflow() {
+                r.exp += 24576;
+                base.with(Exc::UE)
+            } else {
+                base
+            };
+            (r, exc, partial, q)
+        };
+        if let Some(n) = F80::binary_nan(a, b) {
+            return (n, base, false, 0);
+        }
+        if a.class == Inf || b.class == Zero {
+            return (F80::indefinite(), base.with(Exc::IE), false, 0);
+        }
+        if a.class == Zero || b.class == Inf {
+            return finish(a, false, 0);
+        }
+        let d = a.exp - b.exp;
+        let partial = d >= 64;
+        let (mut q, remainder, exp, negative) = if d < -1 {
+            return finish(a, false, 0);
+        } else if d == -1 {
+            if a.sig <= b.sig {
+                return finish(a, false, 0);
+            }
+            (1, 2 * b.sig as u128 - a.sig as u128, a.exp, true)
+        } else {
+            let n = if partial { 32 + d % 32 } else { d };
+            let numerator = (a.sig as u128) << n;
+            let divisor = b.sig as u128;
+            let mut q = numerator / divisor;
+            let r = numerator % divisor;
+            let up = !partial && (2 * r > divisor || (2 * r == divisor && q & 1 != 0));
+            if up {
+                q += 1;
+            }
+            (q, if up { divisor - r } else { r }, b.exp + d - n, up)
+        };
+        // Quotient condition codes encode its magnitude (SDM Vol 1 §8.1.3.2,
+        // FPREM/FPREM1 quotient bits). The remainder's sign can change on rounding.
+        q &= 7;
+        let r = if remainder == 0 {
+            F80::zero(a.sign)
+        } else {
+            let shift = (remainder as u64).leading_zeros();
+            F80 {
+                sign: a.sign ^ negative,
+                class: Normal,
+                exp: exp - shift as i32,
+                sig: (remainder as u64) << shift,
+            }
+        };
+        finish(r, partial, q as u8)
+    }
+
+    /// SDM Vol 2A §3.2 FSCALE, Table 3-36 and FPU Flags Affected. Scaling does
+    /// not apply PC: it changes the exponent, rounding only on a range exception.
+    pub(crate) fn scale(a: F80, b: F80, ctl: Ctl) -> (F80, Exc, bool) {
+        use Class::*;
+        let base = binary_operand_exc(a, b);
+        if let Some(n) = F80::binary_nan(a, b) {
+            return (n, base, false);
+        }
+        if b.class == Inf {
+            return match (a.class, b.sign) {
+                (Zero, false) | (Inf, true) => (F80::indefinite(), base.with(Exc::IE), false),
+                (_, true) => (F80::zero(a.sign), base, false),
+                _ => (F80::inf(a.sign), base, false),
+            };
+        }
+        if matches!(a.class, Zero | Inf) {
+            return (a, base, false);
+        }
+        let scale = if b.class == Zero || b.exp < 0 {
+            0
+        } else if b.exp >= 16 {
+            if b.sign {
+                -65536
+            } else {
+                65536
+            }
+        } else {
+            b.to_i64_rc(3) as i32
+        };
+        let exp = a.exp + scale;
+        if exp > EMAX {
+            // SDM Vol 1 §8.5.4: an unmasked register overflow stores a result
+            // biased downward by 24576; massive FSCALE overflow stores infinity.
+            if ctl.0 & Exc::OE.0 == 0 {
+                let r = if exp - 24576 > EMAX {
+                    F80::inf(a.sign)
+                } else {
+                    F80 {
+                        exp: exp - 24576,
+                        ..a
+                    }
+                };
+                return (r, base.with(Exc::OE), false);
+            }
+            let (r, e) = finish_exc(a.sign, exp, a.sig, Ctl(ctl.0 | 0x300), false);
+            return (r, base.with(e), r.class == Inf);
+        }
+        if exp >= EMIN {
+            return (F80 { exp, ..a }, base, false);
+        }
+        // SDM Vol 1 §8.5.5: register underflow uses the opposite bias, with
+        // no significand loss. Massive FSCALE underflow stores signed zero.
+        if !ctl.masks_underflow() {
+            let r = if exp + 24576 < EMIN {
+                F80::zero(a.sign)
+            } else {
+                F80 {
+                    exp: exp + 24576,
+                    ..a
+                }
+            };
+            return (r, base.with(Exc::UE), false);
+        }
+        let drop = (EMIN - exp) as u32;
+        let kept = if drop >= 64 { 0 } else { a.sig >> drop };
+        let lost = if drop >= 64 {
+            a.sig
+        } else {
+            a.sig & ((1u64 << drop) - 1)
+        };
+        let cmp_half = if drop > 64 {
+            core::cmp::Ordering::Less
+        } else {
+            lost.cmp(&(1u64 << (drop - 1)))
+        };
+        let up = rounds_up(ctl.rc(), a.sign, kept & 1 != 0, cmp_half, lost != 0);
+        let kept = kept + u64::from(up);
+        let r = if kept == 0 {
+            F80::zero(a.sign)
+        } else {
+            let sh = kept.leading_zeros();
+            F80 {
+                sign: a.sign,
+                class: Normal,
+                exp: EMIN - sh as i32,
+                sig: kept << sh,
+            }
+        };
+        let e = if lost != 0 {
+            Exc::UE.with(Exc::PE)
+        } else {
+            Exc::NONE
+        };
+        (r, base.with(e), up)
+    }
+
+    /// SDM Vol 2A §3.2 FCOM and FUCOM: ordered compares reject any NaN;
+    /// unordered compares reject only SNaNs and unsupported formats.
+    pub(crate) fn compare_x87(a: F80, b: F80, unordered: bool) -> ((bool, bool, bool), Exc) {
+        let invalid =
+            binary_operand_exc(a, b).has(Exc::IE) || (!unordered && (a.is_nan() || b.is_nan()));
+        let codes = if a.is_nan() || b.is_nan() || invalid {
+            (true, true, true)
+        } else {
+            F80::compare(a, b)
+        };
+        (codes, if invalid { Exc::IE } else { Exc::NONE })
     }
 
     /// Compare for x87 `fcom`/`fucomi`: returns `(zf, pf, cf)` where unordered
@@ -1059,7 +1232,9 @@ fn ordered_key(a: F80) -> i128 {
         Class::Zero => 0,
         Class::Inf => i128::MAX / 2,
         Class::Nan | Class::Unsupported => 0,
-        Class::Normal => ((a.exp as i128) << 64) | a.sig as i128,
+        // Normalized denormals can reach EMIN-63. Bias every finite magnitude
+        // above zero before applying its sign (SDM Vol 2A §3.2 FCOM, Table 3-23).
+        Class::Normal => (((a.exp + BIAS + 64) as i128) << 64) | a.sig as i128,
     };
     if a.sign {
         -mag

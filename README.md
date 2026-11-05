@@ -171,6 +171,12 @@ Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
   masked-off exception armed, so an `#MF` handler that opens with it can livelock
   (`TASK-341`); `fprem` never writes `C2`, so the architectural reduction loop exits early
   or spins (`TASK-342`).
+- **Remaining x87 forms:** `frndint`, `fxtract`, `fldpi`/`fldl2e`/`fldl2t`/
+  `fldlg2`/`fldln2`, non-popping `fist`, `fnop`, `ffree`/`ffreep`,
+  `fincstp`/`fdecstp`, and the `fstpnce` alias remain unlifted (`xj-pi7.3`).
+  `fwait` still ignores pending `#MF`. Packed BCD, legacy control encodings,
+  14-byte environments and `fnsave`/`frstor` remain refused; reasons are recorded
+  in [deferred.md](backlog/docs/deferred.md).
 - **Nothing reclaims a dropped translation.** A guest that repeatedly patches code — a
   guest-level JIT rewriting an inline cache — was measured growing host RSS by about
   8 KiB and 1.3 executable mappings per patch before the indexed CodeMap. The executable

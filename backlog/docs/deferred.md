@@ -187,6 +187,25 @@ and the condition codes, and an unmasked exception is delivered as `#MF` on the 
 waiting FP instruction. It is not a deferral, and the gaps that remain in it are tracked
 as ordinary defects rather than listed here.
 
+### x87 legacy environment, save/restore, packed BCD and control forms
+
+- **Why deferred:** keep the 14-byte `fldenv`/`fnstenv` images refused: the
+  existing 28-byte path cannot express their different field offsets and 16-bit
+  pointers (Intel SDM Vol 1 §8.1.10, Figures 8-9 through 8-12). Both 94-byte and
+  108-byte `fnsave`/`frstor` remain refused: implementing their logical stack
+  ordering and environment together needs a separate save/restore witness suite;
+  the environment-only path must not stand in for a complete register image
+  (Intel SDM Vol 2A §3.2 FSAVE/FNSAVE and FRSTOR). `fbld`/`fbstp` need packed
+  decimal conversion, range/invalid handling and exception tests, which the
+  existing binary integer conversion does not supply (Intel SDM Vol 2A §3.2
+  FBLD and FBSTP). `fneni`/`fndisi`/`fnsetpm` are legacy encodings outside the
+  supported user-mode FPU control model; they stay rejected (Intel SDM Vol 1
+  §8.3.13).
+- **Revisit when:** an embedder needs one of these formats or legacy encodings,
+  with hardware witnesses for its complete state transfer or conversion.
+- **Tracked in:** `xj-pi7.3`. The ordinary arithmetic and stack forms still
+  missing from that bead are open implementation work, rather than a deferral.
+
 ### `lock adc` / `lock sbb`, and masked EVEX `vmovss`/`vmovsd`
 
 - **Why deferred:** both are now *rejected* rather than mislifted (task-322) — that

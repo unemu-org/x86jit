@@ -406,6 +406,29 @@ pub enum FpuKind {
     Fucomip,
     Fcomi,
     Fcomip,
+    Fcmovb,
+    Fcmove,
+    Fcmovbe,
+    Fcmovu,
+    Fcmovnb,
+    Fcmovne,
+    Fcmovnbe,
+    Fcmovnu,
+    Fcom,
+    Fcomp,
+    Fcompp,
+    Fucom,
+    Fucomp,
+    Fucompp,
+    FcomMemF32,
+    FcomMemF64,
+    FcompMemF32,
+    FcompMemF64,
+    Ftst,
+    Fxam,
+    Fsqrt,
+    Fscale,
+    Fprem1,
     // unary on ST(0)
     Fabs,
     Fchs,
@@ -826,11 +849,9 @@ fn load_env28(cpu: &mut CpuState, buf: &[u8; 28]) {
 /// but the next raise sees the new masks. B (bit 15) "reflects the contents of the ES
 /// flag" and is "included for 8087 compatibility only", so it simply mirrors it.
 ///
-/// **Returns whether the instruction must now be ABANDONED.** An unmasked exception
-/// "stops further execution of the floating-point instruction" (SDM Vol 1 §8.6), so the
-/// destination is not written and the stack is not popped — the handler is entitled to
-/// find the source operands and TOP as they were. A masked exception returns `false`:
-/// the FPU "always returns a masked result to the destination operand".
+/// Returns whether an exception is unmasked. Pre-operation exceptions abandon the
+/// instruction (SDM Vol 1 §4.9.2); register post-operation exceptions retain their
+/// result (§8.5.4–§8.5.6). The caller chooses the corresponding commit behaviour.
 #[must_use]
 fn raise(cpu: &mut CpuState, exc: Exc) -> bool {
     if exc.is_empty() {
@@ -996,10 +1017,10 @@ pub fn mem_operand_bytes(kind: FpuKind) -> u64 {
     match kind {
         FldF80 => 10,
         FldF64 | FildI64 | FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64
-        | FdivrMemF64 => 8,
+        | FdivrMemF64 | FcomMemF64 | FcompMemF64 => 8,
         FldF32 | FildI32 | FaddMemF32 | FsubMemF32 | FsubrMemF32 | FmulMemF32 | FdivMemF32
         | FdivrMemF32 | FicomI32 | FicompI32 | FiaddMemI32 | FisubMemI32 | FisubrMemI32
-        | FimulMemI32 | FidivMemI32 | FidivrMemI32 => 4,
+        | FimulMemI32 | FidivMemI32 | FidivrMemI32 | FcomMemF32 | FcompMemF32 => 4,
         FildI16 | Fldcw | FicomI16 | FicompI16 | FiaddMemI16 | FisubMemI16 | FisubrMemI16
         | FimulMemI16 | FidivMemI16 | FidivrMemI16 => 2,
         Fldenv => 28,
@@ -1357,6 +1378,179 @@ fn exec_x87_inner<M: FpMem>(
             let (a, b) = (operand!(cpu, 0), operand!(cpu, sti));
             set_st(cpu, 0, b);
             set_st(cpu, sti, a);
+        }
+        // SDM Vol 2A §3.2 FCMOVcc: only stack faults can signal; all 80 bits
+        // move unchanged, including SNaNs and unsupported encodings.
+        Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu => {
+            let dst = cpu.fpu_top as usize;
+            let src = (dst + sti as usize) & 7;
+            if cpu.fpu_empty & ((1 << src) | (1 << dst)) != 0 {
+                cpu.fpu_sw &= !(1 << 9);
+                if !raise(cpu, Exc::IE.with(Exc::SF)) {
+                    set_st(cpu, 0, F80::indefinite());
+                }
+                return None;
+            }
+            let take = match kind {
+                Fcmovb => cpu.flags.cf,
+                Fcmove => cpu.flags.zf,
+                Fcmovbe => cpu.flags.cf || cpu.flags.zf,
+                Fcmovu => cpu.flags.pf(),
+                Fcmovnb => !cpu.flags.cf,
+                Fcmovne => !cpu.flags.zf,
+                Fcmovnbe => !cpu.flags.cf && !cpu.flags.zf,
+                _ => !cpu.flags.pf(),
+            };
+            if take {
+                cpu.fpr[dst] = cpu.fpr[src];
+            }
+        }
+        // SDM Vol 2A §3.2 FXAM, Table 3-44. Classification and sign use the
+        // raw register even when its tag is empty; FXAM raises no FP exceptions.
+        Fxam => {
+            use crate::f80::Class;
+            let phys = cpu.fpu_top as usize;
+            let raw = cpu.fpr[phys];
+            let v = F80::from_bytes(&raw);
+            let (c3, c2, c0) = if cpu.fpu_empty & (1 << phys) != 0 {
+                (true, false, true)
+            } else if f80_bytes_denormal(&raw) {
+                (true, true, false)
+            } else {
+                match v.class {
+                    Class::Unsupported => (false, false, false),
+                    Class::Nan => (false, false, true),
+                    Class::Normal => (false, true, false),
+                    Class::Inf => (false, true, true),
+                    Class::Zero => (true, false, false),
+                }
+            };
+            set_codes(cpu, c3, c2, c0);
+            if raw[9] & 0x80 != 0 {
+                cpu.fpu_sw |= 1 << 9;
+            }
+        }
+        // SDM Vol 2A §3.2 FCOM/FUCOM/FTST: invalid precedes denormal,
+        // unmasked exceptions preserve the codes and suppress every pop.
+        Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ftst | FcomMemF32 | FcomMemF64
+        | FcompMemF32 | FcompMemF64 => {
+            let memory = matches!(kind, FcomMemF32 | FcomMemF64 | FcompMemF32 | FcompMemF64);
+            let mut den = st_denormal(cpu, 0);
+            let b = if memory {
+                let width = if matches!(kind, FcomMemF32 | FcompMemF32) {
+                    4
+                } else {
+                    8
+                };
+                let Some(raw) = read_n(mem, addr, width) else {
+                    return Some((mem.fault_addr(addr), false));
+                };
+                den |= float_bytes_denormal(&raw, width);
+                if width == 4 {
+                    // Preserve the signaling bit during widening (SDM Vol 1 §4.8.3.5).
+                    let bits = u32::from_le_bytes(raw[..4].try_into().unwrap());
+                    if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x7f_ffff != 0 {
+                        F80 {
+                            sign: bits >> 31 != 0,
+                            class: crate::f80::Class::Nan,
+                            exp: 0,
+                            sig: (1 << 63) | ((bits as u64 & 0x7f_ffff) << 40),
+                        }
+                    } else {
+                        F80::from_f64((f32::from_bits(bits) as f64).to_bits())
+                    }
+                } else {
+                    F80::from_f64(u64::from_le_bytes(raw[..8].try_into().unwrap()))
+                }
+            } else if kind == Ftst {
+                F80::ZERO
+            } else {
+                den |= st_denormal(cpu, sti);
+                operand!(cpu, sti)
+            };
+            let a = operand!(cpu, 0);
+            let ((c3, c2, c0), mut exc) =
+                F80::compare_x87(a, b, matches!(kind, Fucom | Fucomp | Fucompp));
+            cpu.fpu_sw &= !(1 << 9);
+            // SDM Vol 1 §4.9.2: QNaN handling also precedes denormal operands.
+            if !exc.has(Exc::IE) && !a.is_nan() && !b.is_nan() && den {
+                exc = exc.with(Exc::DE);
+            }
+            if raise(cpu, exc) {
+                return None;
+            }
+            set_codes(cpu, c3, c2, c0);
+            if matches!(
+                kind,
+                Fcomp | Fcompp | Fucomp | Fucompp | FcompMemF32 | FcompMemF64
+            ) {
+                pop(cpu);
+            }
+            if matches!(kind, Fcompp | Fucompp) {
+                pop(cpu);
+            }
+        }
+        Fsqrt => {
+            // SDM Vol 2A §3.2 FSQRT: RC/PC, DE, IE, PE and C1 rounding.
+            let den = st_denormal(cpu, 0);
+            let a = operand!(cpu, 0);
+            let (r, exc) = F80::sqrt_ctl(a, ctl(cpu));
+            cpu.fpu_sw &= !(1 << 9);
+            if !exc.has(Exc::IE) && den && raise(cpu, Exc::DE) {
+                return None;
+            }
+            // SDM Vol 1 §8.5.6: unmasked precision retains the rounded result.
+            if raise(cpu, exc) && exc.has(Exc::IE) {
+                return None;
+            }
+            if exc.has(Exc::PE) && r.class == crate::f80::Class::Normal {
+                let square = (r.sig as u128) * (r.sig as u128);
+                let exact = (a.sig as u128) << (63 + a.exp - 2 * r.exp);
+                if square > exact {
+                    cpu.fpu_sw |= 1 << 9;
+                }
+            }
+            set_st(cpu, 0, r);
+        }
+        Fscale | Fprem1 => {
+            let den = st_denormal(cpu, 0) || st_denormal(cpu, 1);
+            let a = operand!(cpu, 0);
+            let b = operand!(cpu, 1);
+            let (r, exc, partial, q, up) = if kind == Fscale {
+                let (r, e, up) = F80::scale(a, b, ctl(cpu));
+                (r, e, false, 0, up)
+            } else {
+                let (r, e, partial, q) = F80::rem_nearest(a, b, ctl(cpu));
+                (r, e, partial, q, false)
+            };
+            cpu.fpu_sw &= !(1 << 9);
+            if !exc.has(Exc::IE) && !r.is_nan() && den && raise(cpu, Exc::DE) {
+                return None;
+            }
+            // SDM Vol 1 §8.5.4–§8.5.6: post-operation register faults
+            // retain the rounded or biased result.
+            if raise(cpu, exc) && exc.has(Exc::IE) {
+                return None;
+            }
+            if kind == Fscale {
+                if up {
+                    cpu.fpu_sw |= 1 << 9;
+                }
+            }
+            // SDM Vol 3B §25.18.2.1: incomplete reductions clear C0/C1/C3.
+            else if partial {
+                set_codes(cpu, false, true, false);
+            } else if !r.is_nan() {
+                set_codes(cpu, q & 2 != 0, false, q & 4 != 0);
+                if q & 1 != 0 {
+                    cpu.fpu_sw |= 1 << 9;
+                }
+            }
+            // SDM Vol 1 §8.5.1.2 Table 8-10: invalid remainder clears C2.
+            else {
+                cpu.fpu_sw &= !(1 << 10);
+            }
+            set_st(cpu, 0, r);
         }
         Fucomi | Fucomip | Fcomi | Fcomip => {
             let (zf, pf, cf) = F80::compare(operand!(cpu, 0), operand!(cpu, sti));

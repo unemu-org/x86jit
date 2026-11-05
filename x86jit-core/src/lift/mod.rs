@@ -1984,7 +1984,9 @@ pub(crate) fn lift_insn(
         | Fucomi | Fucomip | Fcomi | Fcomip | Fldcw | Fnstcw | Fnstsw | Fprem | Fsin | Fcos
         | Fptan | Fpatan | F2xm1 | Fyl2x | Fyl2xp1 | Fsincos | Fninit | Finit | Fnclex | Fclex
         | Fnstenv | Fstenv | Fldenv | Fiadd | Fimul | Fisub | Fisubr | Fidiv | Fidivr | Ficom
-        | Ficomp => lift_x87(insn, ops, tg).map(|_| false),
+        | Ficomp | Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu
+        | Fsqrt | Fprem1 | Fscale | Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ftst
+        | Fxam => lift_x87(insn, ops, tg).map(|_| false),
         Bsf => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsf).map(|_| false),
         Bsr => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsr).map(|_| false),
         Tzcnt => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Tzcnt).map(|_| false),

@@ -401,6 +401,37 @@ const ALLOWLIST: &[&str] = &[
     "Fcos", // x87 transcendental
     "Fcomi",
     "Fcomip",
+    // The fuzz.rs menu has no x87 generators or stack/control setup. Dedicated
+    // tests in x87_forms.rs run both backends and, on x86-64 Linux, the native
+    // oracle, comparing live ST registers and saved status/tag words.
+    // fcmov_all_conditions_and_classes and fcmov_empty_sources_and_destination
+    // cover every condition, operand class and stack underflow.
+    "Fcmovb",
+    "Fcmovbe",
+    "Fcmove",
+    "Fcmovnb",
+    "Fcmovnbe",
+    "Fcmovne",
+    "Fcmovnu",
+    "Fcmovu",
+    // fcom_fucom_ftst_and_fxam_classes covers register/memory comparisons,
+    // NaN signaling, classification, condition codes, tags and pop counts.
+    "Fcom",
+    "Fcomp",
+    "Fcompp",
+    "Fucom",
+    "Fucomp",
+    "Fucompp",
+    "Ftst",
+    "Fxam",
+    // fsqrt_precision_rounding_and_exceptions,
+    // fprem1_nearest_even_quotient_and_exact_remainder and
+    // fscale_truncates_and_preserves_extended_precision cover rounding, range
+    // exceptions and reduction. new_x87_unmasked_exceptions_commit_per_class_and_defer_mf
+    // checks retained/committed results and deferred exceptions for these forms.
+    "Fsqrt",
+    "Fprem1",
+    "Fscale",
     "Fdiv",
     "Fdivp",
     "Fdivr",
