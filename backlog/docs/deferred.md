@@ -176,6 +176,7 @@ workload enters the corpus for another reason and can double as an end-to-end ch
 
 - **Deferred:** arithmetic does not set MXCSR's six sticky exception flags, and unmasked SIMD floating-point exceptions (`#XM`) are not delivered. Guest-written flags and masks round-trip unchanged. Host execution masks exceptions; masks and sticky flags are excluded from translation identity. This keeps result-mode support independent of precise SIMD exception reporting and delivery.
 - **Implemented:** RC, FTZ and DAZ govern SSE/AVX arithmetic and conversions in every tier. Translations specialise to those three controls, and MXCSR writes end blocks before dispatching in the new mode (SDM Vol 1 §§10.2.3.2–10.2.3.4).
+- **Conversion results:** SSE/AVX float-to-integer conversions return the integer indefinite for masked invalid inputs after rounding, on every tier (SDM Vol 2A §3.3, CVTSS2SI/CVTSD2SI/CVTPS2DQ/CVTPD2DQ and CVTT forms; Vol 2C §5.2, VCVTSS2USI/VCVTSD2USI and VCVTT forms). Sticky IE and unmasked `#XM` remain deferred.
 - **Comparison:** native snapshots capture sticky flags, but the general comparator excludes bits 5:0 until arithmetic flag reporting is implemented. Storage witnesses compare all 32 bits.
 - **History:** MXCSR storage: xj-pi7.1; numerical controls: xj-pi7.2; earlier deferral: task-82; oracle capture: task-325.
 

@@ -4572,7 +4572,7 @@ pub(crate) fn lift_cvt_to_int(
 }
 
 /// `cvt(t)s*2usi` (AVX-512): float → **unsigned** integer in a GPR. Same shape as the signed
-/// `*2si` form; `signed = false` picks the unsigned saturating cast.
+/// `*2si` form; `signed = false` picks the unsigned result and integer indefinite.
 pub(crate) fn lift_cvt_to_int_signed(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
@@ -4922,7 +4922,11 @@ pub(crate) fn lift_packed_cvt(
             | PackedCvtKind::Pd2Dq
             | PackedCvtKind::Tpd2Dq
     );
-    if width_changing && (reg_ymm(insn, 0).is_some() || reg_ymm(insn, 1).is_some()) {
+    if width_changing
+        && (reg_ymm(insn, 0).is_some()
+            || reg_ymm(insn, 1).is_some()
+            || (insn.op_kind(1) == OpKind::Memory && insn.memory_size().size() == 32))
+    {
         return lift_packed_cvt256(insn, ops, tg, kind);
     }
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;

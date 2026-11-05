@@ -3178,9 +3178,9 @@ pub enum HIntOp {
 }
 
 /// Packed SIMD float↔int conversion (SSE2/AVX `cvt*p*`). Each variant fixes
-/// the source/destination lane types, count, and rounding. Out-of-range/NaN follows the
-/// same saturating (Rust `as`) convention as the scalar `VCvtToInt` path — the x86
-/// integer-indefinite (`0x8000_0000`) result is deferred (see interp/codegen notes).
+/// the source/destination lane types, count, and rounding. Invalid float-to-integer
+/// results return the integer indefinite (`0x8000_0000`) per lane after rounding
+/// (SDM Vol 2A §3.3, CVTPS2DQ/CVTPD2DQ and CVTT forms).
 #[derive(Copy, Clone, Debug)]
 pub enum PackedCvtKind {
     /// `cvtdq2ps`: i32×4 → f32×4.

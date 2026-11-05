@@ -5976,6 +5976,21 @@ mod density_tests {
         LAST_DISASM.lock().unwrap().clone()
     }
 
+    #[test]
+    #[ignore = "conversion instruction measurement"]
+    fn dump_integer_conversions() {
+        for (name, body) in [
+            ("cvttsd2si r32", &[0xf2, 0x0f, 0x2c, 0xc1][..]),
+            ("cvttps2dq", &[0xf3, 0x0f, 0x5b, 0xc1][..]),
+        ] {
+            println!(
+                "{name}: {:?}\n{}",
+                measure(&block_of(body, 1)),
+                last_disasm()
+            );
+        }
+    }
+
     /// Build a block of `n` copies of `body` plus a terminator.
     ///
     /// `hlt` exits straight to the dispatcher, which is NOT how a real block ends — a

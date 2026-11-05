@@ -4094,20 +4094,53 @@ pub(crate) fn exec_v_cvt_to_int<const DEFAULT: bool>(
             f32::from_bits(raw as u32) as f64
         }
     } else if *trunc {
-        f.trunc()
+        f
     } else {
         round_ties_even(f)
     };
-    // Saturating cast to the destination width (Rust `as` clamps to the
-    // type's MIN/MAX); matches the JIT's `fcvt_to_{s,u}int_sat`. The x86
-    // integer-indefinite result on invalid operands is deferred.
-    temps[*dst as usize] = match (int_size, signed) {
-        (8, true) => f as i64 as u64,
-        (8, false) => f as u64,
-        (_, true) => f as i32 as u32 as u64,
-        (_, false) => f as u32 as u64,
-    };
+    temps[*dst as usize] = float_to_int(f, *int_size, *signed, *trunc);
     None
+}
+
+/// SDM Vol 2A §3.3, CVTSS2SI/CVTSD2SI/CVTPS2DQ/CVTPD2DQ (and CVTT forms):
+/// a masked invalid conversion returns the signed integer indefinite. Vol 2C
+/// §5.2, VCVTSS2USI/VCVTSD2USI (and VCVTT forms): unsigned returns all ones.
+/// Saturation already gives the indefinite for signed negative overflow and unsigned
+/// positive overflow. Repair only the opposite bound and NaNs. `f` is rounded unless
+/// `trunc`; the cast itself truncates, so unsigned inputs in (-1, 0) remain valid.
+#[inline]
+fn float_to_int(f: f64, int_size: u8, signed: bool, trunc: bool) -> u64 {
+    if signed {
+        let hi = if int_size == 8 {
+            9223372036854775808.0
+        } else {
+            2147483648.0
+        };
+        if f < hi {
+            if int_size == 8 {
+                f as i64 as u64
+            } else {
+                f as i32 as u32 as u64
+            }
+        } else if int_size == 8 {
+            1 << 63
+        } else {
+            1 << 31
+        }
+    } else {
+        let valid = if trunc { f > -1.0 } else { f >= 0.0 };
+        if valid {
+            if int_size == 8 {
+                f as u64
+            } else {
+                f as u32 as u64
+            }
+        } else if int_size == 8 {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4162,8 +4195,7 @@ pub(crate) fn exec_v_cvt_float<const DEFAULT: bool>(
     None
 }
 
-/// Packed float↔int convert `cvt*p*`. Per-lane Rust `as` casts (saturating,
-/// x86 integer-indefinite deferred — same convention as the scalar `VCvtToInt` path);
+/// Packed float↔int convert `cvt*p*`, using the scalar range/indefinite rule per lane.
 /// Non-truncating forms use MXCSR.RC; `cvtt*` always truncates (SDM Vol 2A §3.3 CVTPS2DQ/CVTTPS2DQ).
 /// The narrowing forms write the low lanes and zero the upper 64 bits, matching the JIT.
 /// One 128-bit `cvt*p*` lane group: convert the packed lanes of `s` per
@@ -4182,8 +4214,8 @@ fn packed_cvt128_mode_specialized<const DEFAULT: bool>(
     let f32_lane = |i: u32| f32::from_bits((s >> (32 * i)) as u32);
     let f64_lane = |i: u32| f64::from_bits((s >> (64 * i)) as u64);
     let to_i = |f: f64, trunc: bool| -> u128 {
-        let r = if trunc { f.trunc() } else { round_ties_even(f) };
-        (r as i32 as u32) as u128
+        let r = if trunc { f } else { round_ties_even(f) };
+        float_to_int(r, 4, true, trunc) as u128
     };
     let mut o = 0u128;
     match kind {
@@ -4365,7 +4397,7 @@ fn packed_cvt_soft(s: u128, kind: &PackedCvtKind, mode: u32) -> u128 {
                 } else {
                     f32::from_bits(rounded as u32) as f64
                 };
-                f as i32 as u32 as u64
+                float_to_int(f, 4, true, false)
             }
         };
         out |= (bits as u128) << (output_bits * i);

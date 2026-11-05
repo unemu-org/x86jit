@@ -3983,7 +3983,7 @@ impl Translator<'_, '_> {
                 } else {
                     f
                 };
-                let iv = self.builder.ins().fcvt_to_sint_sat(types::I32X4, f);
+                let iv = self.float_to_int(f, types::I32X4, true, matches!(kind, Tps2Dq));
                 self.bitcast_i128(iv)
             }
             _ => unreachable!("256-bit VPackedCvt256 only lifts the lane-preserving ps<->dq kinds"),
@@ -4509,6 +4509,53 @@ impl Translator<'_, '_> {
         false
     }
 
+    /// SDM Vol 2A §3.3, CVTSS2SI/CVTSD2SI/CVTPS2DQ/CVTPD2DQ (and CVTT forms);
+    /// Vol 2C §5.2, VCVTSS2USI/VCVTSD2USI (and VCVTT forms): masked invalid
+    /// conversions return the integer indefinite after rounding. Use identical IR
+    /// on every host. Saturation already gives the indefinite at one bound; repair
+    /// only signed positive overflow / unsigned negative overflow and NaNs. `f` is
+    /// rounded unless `trunc`; fcvt_to_*int_sat itself truncates toward zero.
+    fn float_to_int(&mut self, f: Value, ity: Type, signed: bool, trunc: bool) -> Value {
+        let fty = self.builder.func.dfg.value_type(f);
+        let bits = ity.lane_bits();
+        let (cc, bound) = if signed {
+            (FloatCC::LessThan, 2.0_f64.powi((bits - 1) as i32))
+        } else if trunc {
+            (FloatCC::GreaterThan, -1.0)
+        } else {
+            (FloatCC::GreaterThanOrEqual, 0.0)
+        };
+        let bound = if fty.lane_type() == types::F64 {
+            self.builder.ins().f64const(bound)
+        } else {
+            self.builder.ins().f32const(bound as f32)
+        };
+        let bound = if fty.is_vector() {
+            self.builder.ins().splat(fty, bound)
+        } else {
+            bound
+        };
+        // Use the ordered complement and swap select arms: Cranelift 0.115's
+        // AArch64 scalar lowering does not implement the unordered conditions.
+        let valid = self.builder.ins().fcmp(cc, f, bound);
+        let converted = if signed {
+            self.builder.ins().fcvt_to_sint_sat(ity, f)
+        } else {
+            self.builder.ins().fcvt_to_uint_sat(ity, f)
+        };
+        let indefinite = if signed { 1u64 << (bits - 1) } else { u64::MAX };
+        let mut indefinite = self
+            .builder
+            .ins()
+            .iconst(ity.lane_type(), indefinite as i64);
+        if ity.is_vector() {
+            indefinite = self.builder.ins().splat(ity, indefinite);
+            self.builder.ins().bitselect(valid, converted, indefinite)
+        } else {
+            self.builder.ins().select(valid, converted, indefinite)
+        }
+    }
+
     pub(crate) fn emit_v_cvt_to_int(
         &mut self,
         dst: &u32,
@@ -4529,20 +4576,12 @@ impl Translator<'_, '_> {
         let f = self.daz(f);
         // SDM Vol 2A §3.3 CVTSD2SI/CVTTSD2SI: MXCSR.RC versus truncation.
         let f = if *trunc { f } else { self.round_mxcsr(f) };
-        // Saturating convert matches the interpreter's Rust `as` cast (both
-        // clamp out-of-range to the destination's MIN/MAX; the x86
-        // integer-indefinite result on invalid operands is deferred). `signed`
-        // picks `*2si` vs the AVX-512 unsigned `*2usi` form.
         let ity = if *int_size == 8 {
             types::I64
         } else {
             types::I32
         };
-        let iv = if *signed {
-            self.builder.ins().fcvt_to_sint_sat(ity, f)
-        } else {
-            self.builder.ins().fcvt_to_uint_sat(ity, f)
-        };
+        let iv = self.float_to_int(f, ity, *signed, *trunc);
         let iv64 = if *int_size == 8 {
             iv
         } else {
@@ -4588,8 +4627,7 @@ impl Translator<'_, '_> {
 
     /// Packed float↔int convert `cvt*p*`. The 4-lane packed-single forms lower to native
     /// vector Cranelift ops (→ NEON); the two f64→i32 forms scalarise the 2 lanes
-    /// (Cranelift has no f64x2→i32x2 saturating convert). Saturating semantics match
-    /// the interpreter's Rust `as` cast (x86 integer-indefinite deferred, like scalar cvt).
+    /// (Cranelift has no f64x2→i32x2 convert). Every lane uses the scalar range/indefinite rule.
     pub(crate) fn emit_v_packed_cvt(&mut self, dst: &u8, src: &u8, kind: &PackedCvtKind) -> bool {
         use PackedCvtKind::*;
         let x = self.load_xmm(*src);
@@ -4607,7 +4645,7 @@ impl Translator<'_, '_> {
                 } else {
                     f
                 };
-                let iv = self.builder.ins().fcvt_to_sint_sat(types::I32X4, f);
+                let iv = self.float_to_int(f, types::I32X4, true, matches!(kind, Tps2Dq));
                 self.bitcast_i128(iv)
             }
             Dq2Pd => {
@@ -4641,7 +4679,7 @@ impl Translator<'_, '_> {
                     } else {
                         lane
                     };
-                    let iv = self.builder.ins().fcvt_to_sint_sat(types::I32, lane);
+                    let iv = self.float_to_int(lane, types::I32, true, matches!(kind, Tpd2Dq));
                     acc = self.builder.ins().insertlane(acc, iv, i);
                 }
                 self.bitcast_i128(acc)
@@ -4712,9 +4750,9 @@ impl Translator<'_, '_> {
                         }
                         Pd2Dq => {
                             let r = self.round_mxcsr(f);
-                            self.builder.ins().fcvt_to_sint_sat(types::I32, r)
+                            self.float_to_int(r, types::I32, true, false)
                         }
-                        _ => self.builder.ins().fcvt_to_sint_sat(types::I32, f),
+                        _ => self.float_to_int(f, types::I32, true, true),
                     };
                     acc = self.builder.ins().insertlane(acc, bits, i);
                 }

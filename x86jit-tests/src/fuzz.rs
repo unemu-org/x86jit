@@ -243,6 +243,50 @@ impl Rng {
             C[self.below(C.len())]
         }
     }
+    // SDM Vol 1 §4.8.3.4: retain distinct QNaN/SNaN encodings at each precision.
+    fn integer_conversion_lane(&mut self, lane_bytes: usize) -> u64 {
+        if self.below(4) == 0 {
+            return self.next();
+        }
+        let choice = self.below(13);
+        match (lane_bytes, choice) {
+            (4, 0) => 0x7fc0_0000,
+            (4, 1) => 0x7f80_0001,
+            (8, 0) => 0x7ff8_0000_0000_0000,
+            (8, 1) => 0x7ff0_0000_0000_0001,
+            _ => {
+                let f: f64 = [
+                    2147483648.0,
+                    -2147483648.0,
+                    9223372036854775808.0,
+                    -9223372036854775808.0,
+                    4294967296.0,
+                    18446744073709551616.0,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    -1.0,
+                    -0.5,
+                    2147483647.5,
+                ][choice - 2];
+                if lane_bytes == 4 {
+                    (f as f32).to_bits() as u64
+                } else {
+                    f.to_bits()
+                }
+            }
+        }
+    }
+
+    fn integer_conversion_bytes(&mut self, lane_bytes: usize, source_bytes: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(source_bytes);
+        for _ in 0..source_bytes / lane_bytes {
+            bytes.extend_from_slice(
+                &self.integer_conversion_lane(lane_bytes).to_le_bytes()[..lane_bytes],
+            );
+        }
+        bytes
+    }
+
     /// Pack 8 f16 corner lanes into a 128-bit vector.
     fn pack_fp16(&mut self) -> u128 {
         let mut v = 0u128;
@@ -677,6 +721,23 @@ pub fn gen_mode_ops(
             };
         }
     }
+    // A separate stream keeps conversion seeding from perturbing unrelated operands.
+    let mut conversion_rng = Rng::new(seed ^ 0x4356_545F_5352_4331);
+    for insn in &insns {
+        if let FuzzInsn::VVex { op, b, .. } = insn {
+            if let Some((lane_bytes, source_bytes)) =
+                V_VEX[*op as usize].integer_conversion_source()
+            {
+                let mut bytes = init.xmm[*b as usize].to_le_bytes().to_vec();
+                bytes.extend_from_slice(&init.ymm_hi[*b as usize].to_le_bytes());
+                bytes[..source_bytes].copy_from_slice(
+                    &conversion_rng.integer_conversion_bytes(lane_bytes, source_bytes),
+                );
+                init.xmm[*b as usize] = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+                init.ymm_hi[*b as usize] = u128::from_le_bytes(bytes[16..].try_into().unwrap());
+            }
+        }
+    }
     Prog {
         insns,
         init,
@@ -1026,9 +1087,23 @@ impl Prog {
             .iter()
             .any(|i| matches!(i, FuzzInsn::VVexMem { .. }))
         {
+            let mut bytes = vscratch_bytes();
+            let mut rng = Rng::new(self.seed ^ 0x4356_545F_4D45_4D31);
+            for insn in &self.insns {
+                if let FuzzInsn::VVexMem { op, off, .. } = insn {
+                    if let Some((lane_bytes, source_bytes)) =
+                        V_VEX[*op as usize].integer_conversion_source()
+                    {
+                        let off = *off as usize;
+                        bytes[off..off + source_bytes].copy_from_slice(
+                            &rng.integer_conversion_bytes(lane_bytes, source_bytes),
+                        );
+                    }
+                }
+            }
             mem_init.push(MemChunk {
                 addr: VSCRATCH,
-                bytes: vscratch_bytes(),
+                bytes,
                 kind: MemKind::Ram,
             });
         }
@@ -1407,6 +1482,19 @@ pub struct VexOp {
 }
 
 impl VexOp {
+    /// (Lane width, source width) in bytes for float-to-integer conversions.
+    fn integer_conversion_source(&self) -> Option<(usize, usize)> {
+        match self.name {
+            "vcvtps2dq" | "vcvttps2dq" => Some((4, 32)),
+            "vcvtpd2dq" | "vcvttpd2dq" => Some((8, 32)),
+            "cvtss2si" | "cvttss2si" | "vcvtss2si" | "vcvttss2si" | "vcvtss2usi"
+            | "vcvttss2usi" => Some((4, 4)),
+            "cvtsd2si" | "cvttsd2si" | "vcvtsd2si" | "vcvttsd2si" | "vcvtsd2usi"
+            | "vcvttsd2usi" => Some((8, 8)),
+            _ => None,
+        }
+    }
+
     /// True if this op interprets its operand bits as floating-point, so the fuzzer should
     /// bias register init toward FP corner values. The float-math families
     /// (float-horizontal, fma, width-changing float convert) plus the individually-float ops
@@ -1443,9 +1531,9 @@ impl VexOp {
             &[]
         } else if self.name.contains("ph") {
             &[2, 4]
-        } else if self.name.contains("pd") || self.name == "sqrtsd" {
+        } else if self.name.contains("pd") || self.name.contains("sd") {
             &[8]
-        } else if self.name.contains("ps") || self.name == "sqrtss" {
+        } else if self.name.contains("ps") || self.name.contains("ss") {
             &[4]
         } else {
             &[4, 8] // float lane-dup movers (vmovddup/sh/sl) — no ps/pd in the name
@@ -1489,9 +1577,8 @@ fn blend_mask(b: u8) -> AsmRegisterYmm {
 /// `gen_avx` draws op indices from it, so reordering it changes what every recorded seed
 /// means.
 ///
-/// Six converts (vcvtdq2pd/ps2pd/pd2ps/pd2dq/tpd2dq/ph2ps) are deliberately absent: they
-/// were unreachable in the pool's earlier positional form, and adding them as entries now
-/// would grow the pool and shift the seeds.
+/// New entries are appended so existing op IDs retain their meaning. Growing the
+/// full pool changes generated streams; explicit op subsets remain reproducible.
 /// A plain 3-operand ymm VEX op (`asm.OP(ymm(d), ymm(a), ymm(b))`) — the common shape.
 macro_rules! r3 {
     ($name:literal, $fam:expr, $op:ident) => {
@@ -1562,6 +1649,32 @@ macro_rules! maskmov_mem {
             },
             emit_mem: Some(|asm, _d, a, b, m, _imm| {
                 asm.$op($ptr(m), $reg(a), $reg(b)).unwrap();
+            }),
+        }
+    };
+}
+
+// The low immediate bit selects the GPR destination width without adding duplicate
+// mnemonic entries; both forms read the low scalar lane of source b.
+// SDM Vol 2A §3.3, CVTSS2SI/CVTSD2SI; Vol 2C §5.2, VCVTSS2USI/VCVTSD2USI.
+macro_rules! scalar_to_int {
+    ($name:literal, $op:ident, $ptr:ident) => {
+        VexOp {
+            name: $name,
+            family: Family::Convert,
+            emit: |asm, d, _a, b, imm| {
+                if imm & 1 == 0 {
+                    asm.$op(reg32(d), xmm(b)).unwrap();
+                } else {
+                    asm.$op(reg64(d), xmm(b)).unwrap();
+                }
+            },
+            emit_mem: Some(|asm, d, _a, _b, m, imm| {
+                if imm & 1 == 0 {
+                    asm.$op(reg32(d), $ptr(m)).unwrap();
+                } else {
+                    asm.$op(reg64(d), $ptr(m)).unwrap();
+                }
             }),
         }
     };
@@ -1899,6 +2012,58 @@ pub static V_VEX: &[VexOp] = &[
     maskmov_mem!("vpmaskmovd", vpmaskmovd, ymm, ymmword_ptr, store),
     maskmov_mem!("vpmaskmovq", vpmaskmovq, ymm, ymmword_ptr, load),
     maskmov_mem!("vpmaskmovq", vpmaskmovq, ymm, ymmword_ptr, store),
+    VexOp {
+        name: "vcvtps2dq",
+        family: Family::Convert,
+        emit: |asm, d, _a, b, _imm| {
+            asm.vcvtps2dq(ymm(d), ymm(b)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vcvtps2dq(ymm(d), ymmword_ptr(m)).unwrap();
+        }),
+    },
+    VexOp {
+        name: "vcvttps2dq",
+        family: Family::Convert,
+        emit: |asm, d, _a, b, _imm| {
+            asm.vcvttps2dq(ymm(d), ymm(b)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vcvttps2dq(ymm(d), ymmword_ptr(m)).unwrap();
+        }),
+    },
+    VexOp {
+        name: "vcvtpd2dq",
+        family: Family::Convert,
+        emit: |asm, d, _a, b, _imm| {
+            asm.vcvtpd2dq(xmm(d), ymm(b)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vcvtpd2dq(xmm(d), ymmword_ptr(m)).unwrap();
+        }),
+    },
+    VexOp {
+        name: "vcvttpd2dq",
+        family: Family::Convert,
+        emit: |asm, d, _a, b, _imm| {
+            asm.vcvttpd2dq(xmm(d), ymm(b)).unwrap();
+        },
+        emit_mem: Some(|asm, d, _a, _b, m, _imm| {
+            asm.vcvttpd2dq(xmm(d), ymmword_ptr(m)).unwrap();
+        }),
+    },
+    scalar_to_int!("cvtss2si", cvtss2si, dword_ptr),
+    scalar_to_int!("cvttss2si", cvttss2si, dword_ptr),
+    scalar_to_int!("cvtsd2si", cvtsd2si, qword_ptr),
+    scalar_to_int!("cvttsd2si", cvttsd2si, qword_ptr),
+    scalar_to_int!("vcvtss2si", vcvtss2si, dword_ptr),
+    scalar_to_int!("vcvttss2si", vcvttss2si, dword_ptr),
+    scalar_to_int!("vcvtsd2si", vcvtsd2si, qword_ptr),
+    scalar_to_int!("vcvttsd2si", vcvttsd2si, qword_ptr),
+    scalar_to_int!("vcvtss2usi", vcvtss2usi, dword_ptr),
+    scalar_to_int!("vcvttss2usi", vcvttss2usi, dword_ptr),
+    scalar_to_int!("vcvtsd2usi", vcvtsd2usi, qword_ptr),
+    scalar_to_int!("vcvttsd2usi", vcvttsd2usi, qword_ptr),
 ];
 
 /// Assemble one VEX/AVX2 op by direct index into [`V_VEX`] (no modulo). `op` is the id
@@ -2837,10 +3002,10 @@ mod campaign_tests {
     use super::*;
 
     #[test]
-    fn table_is_95_ops_and_names_resolve() {
+    fn table_is_111_ops_and_names_resolve() {
         assert_eq!(
             V_VEX.len(),
-            95,
+            111,
             "update the table witness when extending the pool"
         );
         // Every op resolves by name; families cover the whole pool.
@@ -3072,6 +3237,203 @@ mod campaign_tests {
             corner_hits > lanes / 20,
             "vec128_fp emitted only {corner_hits}/{lanes} f32-corner lanes — pool too sparse"
         );
+    }
+
+    #[test]
+    fn scalar_integer_conversion_forms_assemble() {
+        for name in [
+            "cvtss2si",
+            "cvttss2si",
+            "cvtsd2si",
+            "cvttsd2si",
+            "vcvtss2si",
+            "vcvttss2si",
+            "vcvtsd2si",
+            "vcvttsd2si",
+            "vcvtss2usi",
+            "vcvttss2usi",
+            "vcvtsd2usi",
+            "vcvttsd2usi",
+        ] {
+            let ops = resolve_ops(name).unwrap();
+            assert_eq!(ops.len(), 1);
+            let op = &V_VEX[ops[0]];
+            assert_eq!(
+                op.fp_widths(),
+                if name.contains("sd") { &[8] } else { &[4] }
+            );
+            for dst in 0..8 {
+                for imm in [0, 1] {
+                    for memory in [false, true] {
+                        let mut asm = CodeAssembler::new(64).unwrap();
+                        if memory {
+                            op.emit_mem.unwrap()(&mut asm, dst, 2, 3, VSCRATCH + 64, imm);
+                        } else {
+                            (op.emit)(&mut asm, dst, 2, 3, imm);
+                        }
+                        let bytes = asm.assemble(CODE).unwrap();
+                        let insn =
+                            iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE)
+                                .decode();
+                        assert!(!insn.is_invalid(), "{name}, imm={imm}, memory={memory}");
+                        assert_eq!(format!("{:?}", insn.mnemonic()).to_ascii_lowercase(), name);
+                        assert_eq!(insn.op0_register().is_gpr64(), imm == 1);
+                        assert_eq!(insn.op0_register().is_gpr32(), imm == 0);
+                        let encoding = if name.contains("usi") {
+                            iced_x86::EncodingKind::EVEX
+                        } else if name.starts_with('v') {
+                            iced_x86::EncodingKind::VEX
+                        } else {
+                            iced_x86::EncodingKind::Legacy
+                        };
+                        assert_eq!(insn.encoding(), encoding);
+                        if memory {
+                            assert_eq!(insn.op1_kind(), iced_x86::OpKind::Memory);
+                            assert_eq!(
+                                insn.memory_size().size(),
+                                if name.contains("sd") { 8 } else { 4 }
+                            );
+                        } else {
+                            assert_eq!(insn.op1_register(), iced_x86::Register::XMM3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conversion_pool_reaches_invalid_integer_inputs() {
+        // SDM Vol 2A §3.3, CVT(T)SS2SI/CVT(T)SD2SI/CVT(T)PS2DQ/CVT(T)PD2DQ;
+        // Vol 2C §5.2, VCVT(T)SS2USI/VCVT(T)SD2USI: exercise invalid inputs.
+        for name in [
+            "vcvtps2dq",
+            "vcvttps2dq",
+            "vcvtpd2dq",
+            "vcvttpd2dq",
+            "cvtss2si",
+            "cvttss2si",
+            "cvtsd2si",
+            "cvttsd2si",
+            "vcvtss2si",
+            "vcvttss2si",
+            "vcvtsd2si",
+            "vcvttsd2si",
+            "vcvtss2usi",
+            "vcvttss2usi",
+            "vcvtsd2usi",
+            "vcvttsd2usi",
+        ] {
+            let ops = resolve_ops(name).unwrap();
+            let scalar = name.contains("2si") || name.contains("2usi");
+            let lane_bytes = if name.contains("sd") || name.contains("pd") {
+                8
+            } else {
+                4
+            };
+            let source_bytes = if scalar { lane_bytes } else { 32 };
+            let required: HashSet<u64> = [
+                2147483648.0,
+                -2147483648.0,
+                9223372036854775808.0,
+                -9223372036854775808.0,
+                4294967296.0,
+                18446744073709551616.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                -1.0,
+                -0.5,
+                2147483647.5,
+            ]
+            .into_iter()
+            .map(|f| {
+                if lane_bytes == 8 {
+                    f.to_bits()
+                } else {
+                    (f as f32).to_bits() as u64
+                }
+            })
+            .chain(if lane_bytes == 8 {
+                [0x7ff8_0000_0000_0000, 0x7ff0_0000_0000_0001]
+            } else {
+                [0x7fc0_0000, 0x7f80_0001]
+            })
+            .collect();
+            for memory in [true, false] {
+                // Separate sets for r32/r64 prevent a live r32 path from hiding a dead r64 path.
+                let mut seen = [HashSet::new(), HashSet::new()];
+                let mut overflow = [false; 2];
+                let mut negative = [false; 2];
+                for seed in 0..20_000 {
+                    let mut p = gen_mode_ops(seed, 1, CpuMode::Long64, true, Some(&ops));
+                    if memory {
+                        to_mem_forms(&mut p);
+                    }
+                    let (op, b, off) = match p.insns.first() {
+                        Some(FuzzInsn::VVex { op, b, .. }) => (*op, *b, None),
+                        Some(FuzzInsn::VVexMem { op, b, off, .. }) => (*op, *b, Some(*off)),
+                        _ => continue,
+                    };
+                    assert!(ops.contains(&(op as usize)));
+                    assert_eq!(off.is_some(), memory, "{name}: memory form missing");
+                    let input = p.input();
+                    let mut decoder = iced_x86::Decoder::new(
+                        64,
+                        &input.mem_init[0].bytes,
+                        iced_x86::DecoderOptions::NONE,
+                    );
+                    let insn = decoder.decode();
+                    assert!(!insn.is_invalid(), "{name}");
+                    assert_eq!(format!("{:?}", insn.mnemonic()).to_ascii_lowercase(), name);
+                    let width = usize::from(scalar && insn.op0_register().is_gpr64());
+                    if scalar {
+                        assert!(insn.op0_register().is_gpr32() || insn.op0_register().is_gpr64());
+                    }
+                    let bytes = if let Some(off) = off {
+                        assert_eq!(insn.op1_kind(), iced_x86::OpKind::Memory);
+                        let chunk = input.mem_init.iter().find(|c| c.addr == VSCRATCH).unwrap();
+                        chunk.bytes[off as usize..off as usize + source_bytes].to_vec()
+                    } else {
+                        let mut bytes = p.init.xmm[b as usize].to_le_bytes().to_vec();
+                        bytes.extend_from_slice(&p.init.ymm_hi[b as usize].to_le_bytes());
+                        bytes[..source_bytes].to_vec()
+                    };
+                    let upper = match (name.contains("usi"), width) {
+                        (false, 0) => 2147483648.0,
+                        (false, _) => 9223372036854775808.0,
+                        (true, 0) => 4294967296.0,
+                        (true, _) => 18446744073709551616.0,
+                    };
+                    for lane in bytes.chunks_exact(lane_bytes) {
+                        let (bits, f) = if lane_bytes == 8 {
+                            let bits = u64::from_le_bytes(lane.try_into().unwrap());
+                            (bits, f64::from_bits(bits))
+                        } else {
+                            let bits = u32::from_le_bytes(lane.try_into().unwrap());
+                            (bits as u64, f32::from_bits(bits) as f64)
+                        };
+                        seen[width].insert(bits);
+                        overflow[width] |= f.is_finite() && f >= upper;
+                        negative[width] |= f <= -1.0;
+                    }
+                    if (0..if scalar { 2 } else { 1 })
+                        .all(|w| required.is_subset(&seen[w]) && overflow[w] && negative[w])
+                    {
+                        break;
+                    }
+                }
+                for w in 0..if scalar { 2 } else { 1 } {
+                    assert!(
+                        required.is_subset(&seen[w]) && overflow[w] && negative[w],
+                        "{name}, memory={memory}, r{}: missing {:x?}, overflow={}, negative={}",
+                        32 << w,
+                        required.difference(&seen[w]).collect::<Vec<_>>(),
+                        overflow[w],
+                        negative[w]
+                    );
+                }
+            }
+        }
     }
 
     /// The FP pool must be WIRED into generation: an AVX program built from a float-only op pool
