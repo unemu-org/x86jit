@@ -18,8 +18,9 @@ const WORD: u64 = 0xA000;
 const THREADS: u64 = 8;
 const ITERS: u64 = 50_000;
 
-fn vm_with(backend: Box<dyn Backend>, code: &[u8]) -> Arc<Vm> {
+fn vm_with(backend: Box<dyn Backend>, code: &[u8], routed: bool) -> Arc<Vm> {
     let mut vm = Vm::with_backend(VmConfig::flat(FLAT), backend);
+    vm.mem.set_host_fault_recovery(routed);
     vm.map(0, FLAT as usize, Prot::RW, RegionKind::Ram).unwrap();
     vm.write_bytes(CODE, code).unwrap();
     Arc::new(vm)
@@ -56,7 +57,7 @@ fn read_u64(vm: &Vm, addr: u64) -> u64 {
 /// lock excludes, exactly `THREADS * ITERS` increments land; a plain-store release that
 /// gets reordered or elided against the acquire CAS lets two vcpus into the critical
 /// section and the count comes out short.
-fn plain_store_release_spinlock(backend: Box<dyn Backend>) {
+fn plain_store_release_spinlock(backend: Box<dyn Backend>, routed: bool) {
     const LOCK: u64 = 0xB000;
     const CTR: u64 = 0xB008;
     let mut a = CodeAssembler::new(64).unwrap();
@@ -79,7 +80,7 @@ fn plain_store_release_spinlock(backend: Box<dyn Backend>) {
     a.jnz(top).unwrap();
     a.hlt().unwrap();
     let code = a.assemble(CODE).unwrap();
-    let vm = vm_with(backend, &code);
+    let vm = vm_with(backend, &code, routed);
     run_all(&vm, |_, _| {});
     assert_eq!(
         read_u64(&vm, CTR),
@@ -91,17 +92,17 @@ fn plain_store_release_spinlock(backend: Box<dyn Backend>) {
 
 #[test]
 fn plain_store_release_spinlock_excludes_interp() {
-    plain_store_release_spinlock(Box::new(InterpreterBackend));
+    plain_store_release_spinlock(Box::new(InterpreterBackend), false);
 }
 
 #[test]
 fn plain_store_release_spinlock_excludes_jit() {
-    plain_store_release_spinlock(Box::new(JitBackend::new()));
+    plain_store_release_spinlock(Box::new(JitBackend::new()), false);
 }
 
 /// Direct `lock cmpxchg` CAS-increment loop (the canonical lock-free counter): validates
 /// that AtomicCas is atomic with a correct ZF under contention on both backends.
-fn cas_increment_counter(backend: Box<dyn Backend>) {
+fn cas_increment_counter(backend: Box<dyn Backend>, routed: bool) {
     let mut a = CodeAssembler::new(64).unwrap();
     let mut retry = a.create_label();
     a.mov(rcx, ITERS).unwrap();
@@ -116,7 +117,7 @@ fn cas_increment_counter(backend: Box<dyn Backend>) {
     a.jnz(retry).unwrap();
     a.hlt().unwrap();
     let code = a.assemble(CODE).unwrap();
-    let vm = vm_with(backend, &code);
+    let vm = vm_with(backend, &code, routed);
     run_all(&vm, |_, _| {});
     assert_eq!(
         read_u64(&vm, WORD),
@@ -127,18 +128,18 @@ fn cas_increment_counter(backend: Box<dyn Backend>) {
 
 #[test]
 fn cas_increment_counter_interp() {
-    cas_increment_counter(Box::new(InterpreterBackend));
+    cas_increment_counter(Box::new(InterpreterBackend), false);
 }
 
 #[test]
 fn cas_increment_counter_jit() {
-    cas_increment_counter(Box::new(JitBackend::new()));
+    cas_increment_counter(Box::new(JitBackend::new()), false);
 }
 
 /// `lock xor [WORD], rdx` — the binary lock-ALU path (`lift_binop`, shared by lock
 /// and/or/xor/add/sub). Each vcpu XORs the same mask `ITERS` times; `THREADS * ITERS` is
 /// even, so an atomic composition returns the word to 0. A torn RMW drops an application.
-fn binary_lock_alu_atomic(backend: Box<dyn Backend>) {
+fn binary_lock_alu_atomic(backend: Box<dyn Backend>, routed: bool) {
     let mut a = CodeAssembler::new(64).unwrap();
     let mut top = a.create_label();
     a.mov(rbx, WORD).unwrap();
@@ -150,7 +151,7 @@ fn binary_lock_alu_atomic(backend: Box<dyn Backend>) {
     a.jnz(top).unwrap();
     a.hlt().unwrap();
     let code = a.assemble(CODE).unwrap();
-    let vm = vm_with(backend, &code);
+    let vm = vm_with(backend, &code, routed);
     run_all(&vm, |_, _| {});
     assert_eq!(
         read_u64(&vm, WORD),
@@ -161,10 +162,47 @@ fn binary_lock_alu_atomic(backend: Box<dyn Backend>) {
 
 #[test]
 fn binary_lock_alu_atomic_interp() {
-    binary_lock_alu_atomic(Box::new(InterpreterBackend));
+    binary_lock_alu_atomic(Box::new(InterpreterBackend), false);
 }
 
 #[test]
 fn binary_lock_alu_atomic_jit() {
-    binary_lock_alu_atomic(Box::new(JitBackend::new()));
+    binary_lock_alu_atomic(Box::new(JitBackend::new()), false);
+}
+
+#[test]
+fn plain_store_release_spinlock_routed_interp() {
+    plain_store_release_spinlock(Box::new(InterpreterBackend), true);
+}
+
+#[test]
+fn cas_increment_counter_routed_interp() {
+    cas_increment_counter(Box::new(InterpreterBackend), true);
+}
+
+#[test]
+fn binary_lock_alu_atomic_routed_interp() {
+    binary_lock_alu_atomic(Box::new(InterpreterBackend), true);
+}
+
+/// SDM Vol 3A §11.1.2.2: LOCK makes the entire update indivisible. The exact
+/// total detects any lost update in the routed interpreter's RMW CAS loop.
+#[test]
+fn lock_add_exact_total_routed_interp() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    let mut top = a.create_label();
+    a.mov(rbx, WORD).unwrap();
+    a.mov(rcx, ITERS).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.lock().add(qword_ptr(rbx), 1).unwrap();
+    a.dec(rcx).unwrap();
+    a.jnz(top).unwrap();
+    a.hlt().unwrap();
+    let vm = vm_with(
+        Box::new(InterpreterBackend),
+        &a.assemble(CODE).unwrap(),
+        true,
+    );
+    run_all(&vm, |_, _| {});
+    assert_eq!(read_u64(&vm, WORD), THREADS * ITERS);
 }

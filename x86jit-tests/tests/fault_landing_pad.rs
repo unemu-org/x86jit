@@ -155,6 +155,9 @@ fn same_cpu(a: &CpuState, b: &CpuState) {
 }
 
 fn case(kind: &str, region: bool, straddle: bool, mapped: bool) {
+    case_mode(kind, region, straddle, mapped, false);
+}
+fn case_mode(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bool) {
     // SAFETY: sysconf has no pointer argument.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let base = 0x1_0000_0000;
@@ -195,6 +198,7 @@ fn case(kind: &str, region: bool, straddle: bool, mapped: bool) {
         base,
         page,
     );
+    jit.mem.set_host_fault_recovery(routed);
     for vm in [&interp, &jit] {
         vm.write_bytes(code_addr, &code).unwrap();
         if straddle {
@@ -353,6 +357,15 @@ fn landing_mapped_protected_page_does_not_enter_rust_memory_access() {
                 0,
                 "{kind}, region={region}"
             );
+        }
+    }
+}
+
+#[test]
+fn landing_mapped_protected_page_with_recovery_returns_without_replay() {
+    for region in [false, true] {
+        for kind in ["load", "store", "locked"] {
+            assert_eq!(child(|| case_mode(kind, region, false, true, true)), 0);
         }
     }
 }

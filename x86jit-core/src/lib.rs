@@ -50,6 +50,7 @@ pub mod memory;
 pub mod pclmul;
 pub mod sha;
 pub mod state;
+mod usercopy;
 pub mod vm;
 pub mod x87;
 

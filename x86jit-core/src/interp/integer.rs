@@ -475,9 +475,9 @@ pub(crate) fn exec_get_cond(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_load(
+pub(crate) fn exec_load<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &Temp,
@@ -500,9 +500,9 @@ pub(crate) fn exec_load(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_store(
+pub(crate) fn exec_store<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -526,9 +526,9 @@ pub(crate) fn exec_store(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_atomic_rmw(
+pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,
@@ -547,9 +547,9 @@ pub(crate) fn exec_atomic_rmw(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_atomic_cas(
+pub(crate) fn exec_atomic_cas<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,

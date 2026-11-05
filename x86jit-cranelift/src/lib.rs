@@ -203,6 +203,9 @@ unsafe extern "C" fn string_helper(
     // Raw bounds-only view: the JIT's inlined stores skip SMC/region handling
     // (deferred, §10), so its string helper matches — no `Memory` in the ABI.
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -218,7 +221,7 @@ unsafe extern "C" fn string_helper(
     // itself.
     let track = matches!(op, StrOp::Movs | StrOp::Stos);
     let rdi0 = cpu.gpr[7];
-    let ret = match x86jit_core::interp::string_run_interruptible(
+    let ret = match x86jit_core::interp::raw_string_run_interruptible(
         cpu,
         &raw,
         op,
@@ -253,7 +256,7 @@ unsafe extern "C" fn string_helper(
 }
 
 /// Paired CAS helper; guest-memory accesses are checked by `Memory` before asm.
-/// This helper also needs helper fault-site coverage when that facility is added.
+/// Opted-in transfers recover through the core fixup table and return normally.
 ///
 /// # Safety
 /// `cpu` and `mem` point to the live CpuState and MemCtx for this call.
@@ -281,8 +284,8 @@ unsafe extern "C" fn cas_pair_helper(
             ctx.exception_vector = vector as u64;
             RET_EXCEPTION
         }
-        Some(x86jit_core::Exit::UnmappedMemory { .. }) => {
-            ctx.fault_addr = addr;
+        Some(x86jit_core::Exit::UnmappedMemory { addr: at, .. }) => {
+            ctx.fault_addr = at;
             ctx.fault_size = size;
             ctx.fault_access = 1;
             RET_UNMAPPED
@@ -323,11 +326,14 @@ unsafe extern "C" fn x87_helper(
         return x86jit_core::jit_abi::RET_EXCEPTION;
     }
     let raw = x86jit_core::x87::RawFpMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    match x86jit_core::x87::exec_x87(cpu, &raw, kind, addr, sti as u8) {
+    match raw.exec_x87(cpu, kind, addr, sti as u8) {
         None => {
             // `RawFpMem` writes host RAM directly, so an x87 store reaches neither the
             // SMC hook nor the watched ranges unless it is reported here.
@@ -364,11 +370,14 @@ unsafe extern "C" fn fxstate_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::x87::RawFpMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    match x86jit_core::x87::exec_fxstate(cpu, &raw, addr, restore != 0) {
+    match raw.exec_fxstate(cpu, addr, restore != 0) {
         None => {
             // As in `x87_helper`: `fxsave` writes 512 bytes of guest memory through the
             // raw view, so report it. `fxrstor` (restore != 0) only reads.
@@ -526,6 +535,9 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -589,6 +601,9 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -854,6 +869,9 @@ unsafe extern "C" fn gf2p8_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -1051,6 +1069,9 @@ unsafe extern "C" fn vpermt2_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -1133,6 +1154,9 @@ unsafe extern "C" fn vperm1_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -1212,6 +1236,9 @@ unsafe extern "C" fn vpmov_narrow_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -1798,6 +1825,9 @@ unsafe extern "C" fn broadcast_lane_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
@@ -1896,6 +1926,9 @@ unsafe extern "C" fn fma_mem_helper(
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
     let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,

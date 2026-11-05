@@ -96,6 +96,54 @@ pub enum WriteTarget {
     },
 }
 
+// Initialized prefix only: refills touch the next page/region only after iced
+// reports NoMoreBytes. An incomplete instruction is decoded again after refill.
+struct FetchWindow<const CAP: usize> {
+    bytes: std::mem::MaybeUninit<[u8; CAP]>,
+    len: usize,
+    stopped: bool,
+}
+impl<const CAP: usize> FetchWindow<CAP> {
+    fn new() -> Self {
+        Self {
+            bytes: std::mem::MaybeUninit::uninit(),
+            len: 0,
+            stopped: false,
+        }
+    }
+    fn code(&self) -> &[u8] {
+        // SAFETY: refill initializes exactly this prefix; no guest slice escapes.
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.len) }
+    }
+    fn refill(&mut self, mem: &Memory, start: u64) -> bool {
+        if self.stopped || self.len == CAP {
+            return false;
+        }
+        let at = start + self.len as u64;
+        let Ok(chunk) = mem.fetch_chunk_len(
+            at,
+            (CAP - self.len).min(if self.len == 0 { 128 } else { CAP }),
+        ) else {
+            self.stopped = true;
+            return false;
+        };
+        // SAFETY: this writable tail is disjoint from the initialized prefix.
+        // No reference to its uninitialized bytes is formed before the copy.
+        let out = unsafe { self.bytes.as_mut_ptr().cast::<u8>().add(self.len) };
+        match unsafe { mem.fetch_code_into(at, out, chunk) } {
+            Ok(copied) => {
+                self.len += copied;
+                self.stopped = copied < chunk;
+                copied > 0
+            }
+            Err(_) => {
+                self.stopped = true;
+                false
+            }
+        }
+    }
+}
+
 /// Lift errors are mapped to `Exit` in the dispatcher, never to a panic (§7.3).
 #[derive(Debug)]
 pub enum LiftError {
@@ -120,7 +168,7 @@ const BLOCK_FETCH_WINDOW: usize = 4096;
 /// In Real16 (§17.6) they differ: `rip` holds the 16-bit **IP** offset within CS, while
 /// code is fetched from the physical address `cs_base + (IP & 0xFFFF)`. Splitting them
 /// lets iced decode under the 16-bit IP (so `near_branch_target()` wraps correctly to a
-/// 16-bit offset) while `code_slice` reads the right physical bytes.
+/// 16-bit offset) while the private fetch window reads the right physical bytes.
 #[derive(Copy, Clone)]
 pub struct FetchAddr {
     /// Physical linear address the code bytes are read from.
@@ -549,9 +597,11 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
 /// physical fetch address.
 pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, LiftError> {
     let start = at.ip;
-    let code = mem
-        .code_slice(at.pa, BLOCK_FETCH_WINDOW)
-        .map_err(|_| LiftError::DecodeFault { addr: at.pa })?;
+    let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new();
+    if !window.refill(mem, at.pa) {
+        return Err(LiftError::DecodeFault { addr: at.pa });
+    }
+    let code = window.code();
     let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
 
     let mut ops = Vec::new();
@@ -561,8 +611,32 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
     let mut guest_len = 0u32;
     let mut insn = Instruction::default();
 
-    while decoder.can_decode() {
+    loop {
+        let position = decoder.position();
+        if !decoder.can_decode() {
+            if !window.refill(mem, at.pa) {
+                break;
+            }
+            decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
+            decoder.set_position(position).unwrap();
+            decoder.set_ip(start + position as u64);
+        }
+        let position = decoder.position();
         decoder.decode_out(&mut insn);
+        if insn.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
+            if window.refill(mem, at.pa) {
+                decoder =
+                    Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
+                decoder.set_position(position).unwrap();
+                decoder.set_ip(start + position as u64);
+                continue;
+            }
+            decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
+            decoder.set_position(position).unwrap();
+            decoder.set_ip(start + position as u64);
+            decoder.decode_out(&mut insn);
+        }
+        let code = window.code();
         if insn.is_invalid() {
             // Execute the complete prefix before retrying a truncated instruction
             // with a fresh fetch window (or reporting its unavailable fetch byte).
@@ -642,9 +716,11 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
 /// — then hands control back to compiled code.
 pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, LiftError> {
     let start = at.ip;
-    let code = mem
-        .code_slice(at.pa, BLOCK_FETCH_WINDOW)
-        .map_err(|_| LiftError::DecodeFault { addr: at.pa })?;
+    let mut window = FetchWindow::<15>::new();
+    if !window.refill(mem, at.pa) {
+        return Err(LiftError::DecodeFault { addr: at.pa });
+    }
+    let code = window.code();
     let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
 
     let mut ops = Vec::new();
@@ -653,7 +729,19 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     if !decoder.can_decode() {
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
-    decoder.decode_out(&mut insn);
+    loop {
+        decoder.decode_out(&mut insn);
+        if !insn.is_invalid() || decoder.last_error() != DecoderError::NoMoreBytes {
+            break;
+        }
+        if !window.refill(mem, at.pa) {
+            decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
+            decoder.decode_out(&mut insn);
+            break;
+        }
+        decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
+    }
+    let code = window.code();
     if insn.is_invalid() {
         if emit_decode_exception(
             &insn,

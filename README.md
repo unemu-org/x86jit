@@ -235,6 +235,51 @@ Compiled calls stay direct; recovery uses compiler-provided unwind recipes and
 one record published per run and cleared on return or panic. macOS x86-64 is
 compile-unverified.
 
+Embedders that protect RAM independently of the region table enable
+`vm.mem.set_host_fault_recovery(true)` before execution;
+`Memory::host_fault_recovery()` reads the setting. Default mode performs no Rust
+transfer routing: registered RAM must remain host-accessible to interpreter,
+helper and fetch accesses. Compiled-code faults recover in both modes through
+decision-13. Routed Rust transfers use the same classifier, including with a zero
+or inactive handle on threads with no active vCPU. Copy back PC and scratch and
+return normally from the handler; the routine returns its fault to Rust and
+ordinary destructors run. Alignment faults inside a fixup routine are rejected.
+
+Instruction decoding always uses a private snapshot. Fetch starts with at most
+128 bytes, bounded by the host page and region; it extends only when decoding
+needs more bytes. Single-step fetch needs at most 15 bytes. In default mode these
+copies use `ptr::copy_nonoverlapping`. A routed copy retains its readable prefix
+on a fault. No cache lock is held while copying.
+
+The public API changes are:
+
+- `MemTrap` is `#[non_exhaustive]` and includes payload-free `HostFault`.
+  Downstream matches need a wildcard. `MemTrap::fault_addr(transfer)`
+  returns the exact byte for a host fault; call it immediately on the accessing
+  thread, before another failing transfer can replace the thread's return slot.
+- `Memory::code_slice` returns `Result<Vec<u8>, MemTrap>`; callers borrow the
+  owned snapshot when decoding. `Memory::set_host_fault_recovery` and
+  `Memory::host_fault_recovery` select and inspect the opt-in policy.
+- `RawFpMem` and `RawStrMem` have a public `recover_host_faults: bool` field;
+  existing struct literals must initialize it. `RawFpMem::exec_fxstate` and
+  `RawFpMem::exec_x87` select the policy once per helper call.
+  `RawStrMem::probe_store` explicitly invokes a checked write probe.
+- `FpMem` provides `fault_addr`, `host_fault_recovery`, `load_checked` and
+  `store_checked` methods, with defaults for existing implementors.
+  `StrMem::preflight_store` provides a default no-op hook for selected store pages.
+  `interp::raw_string_run_interruptible` selects a raw string helper's policy
+  once per instruction.
+
+Routed Rust copies and vector stores preflight destination pages. A write probe
+atomically writes one byte's current value back on each touched host page: guest
+data is unchanged, but copy-on-write and dirty tracking are affected even if a
+later page faults. Serialize protection revocation with the complete transfer if
+all-or-nothing writes are required. Compiled split vector stores and AArch64
+misaligned scalar stores crossing a host page can retain completed writes on a
+fault and rewrite those bytes on resume; this gap is tracked in xj-obx.8. Routed
+REP MOVS/STOS remains per element and retains completed iterations. An x87
+memory fault restores instruction-entry status in both modes.
+
 `cpu.exit_request()` returns a cloneable, `Send + Sync` handle. Another host thread
 can call `handle.request_exit()` to make `run` return `Exit::Interrupted`, even
 without a block budget. The vCPU yields at its next checked instruction boundary:

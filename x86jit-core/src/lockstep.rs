@@ -123,10 +123,10 @@ pub fn on_insn_start(b: &mut Bracket, cpu: &CpuState, mem: &Memory, addr: u64) {
         }
         None => false,
     };
-    let mut dec = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
+    let mut dec = Decoder::with_ip(64, &code, addr, DecoderOptions::NONE);
     let mut insn = Instruction::default();
     dec.decode_out(&mut insn);
-    let Some(mem_op) = replayable_op(&insn, code, allow_scalar) else {
+    let Some(mem_op) = replayable_op(&insn, &code, allow_scalar) else {
         return;
     };
     // Resolve the effective address for a memory-operand op (source or store).

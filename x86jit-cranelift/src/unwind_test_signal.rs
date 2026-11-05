@@ -117,6 +117,7 @@ unsafe fn recover(context: *mut libc::c_void, addr: usize, kind: HostFaultKind) 
     let original = regs;
     let foreign = FOREIGN.load(Ordering::Relaxed);
     if foreign != 0
+        && x86jit_core::codemap::lookup_recovery(regs.pc as usize).is_some()
         && (checked_classify(foreign, regs.pc as usize, addr, kind, &mut regs) || regs != original)
     {
         libc::_exit(93);
@@ -139,10 +140,9 @@ unsafe fn recover(context: *mut libc::c_void, addr: usize, kind: HostFaultKind) 
         usize::from(kind == HostFaultKind::Alignment),
         Ordering::Relaxed,
     );
-    let recipe = x86jit_core::codemap::lookup_recovery(original.pc as usize)
-        .unwrap()
-        .1;
-    SIMD_SLOTS.store(recipe.simd.iter().flatten().count(), Ordering::Relaxed);
+    let slots = x86jit_core::codemap::lookup_recovery(original.pc as usize)
+        .map_or(0, |(_, recipe)| recipe.simd.iter().flatten().count());
+    SIMD_SLOTS.store(slots, Ordering::Relaxed);
     LR_CHANGED.store(original.lr != regs.lr, Ordering::Relaxed);
     WIDTH.store(
         x86jit_core::codemap::lookup_trap(original.pc as usize).map_or(0, |s| s.width as usize),

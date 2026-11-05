@@ -1117,7 +1117,11 @@ impl Vcpu {
             }
         }
         let fault_run = FaultRunGuard(&mut *self.fault_entry);
-        let exit = self.run_inner(vm, budget);
+        let exit = if vm.mem.host_fault_recovery() {
+            self.run_inner::<true>(vm, budget)
+        } else {
+            self.run_inner::<false>(vm, budget)
+        };
         drop(fault_run);
         self.cpu.finish_mmio_retry(Some(&exit));
         if matches!(exit, Exit::Interrupted) {
@@ -1160,7 +1164,7 @@ impl Vcpu {
         }
     }
 
-    fn run_inner(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+    fn run_inner<const ROUTED: bool>(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         let mut blocks_run: u64 = 0;
         let exit_word_owner = Arc::clone(&self.exit_request.word);
         let exit_word: &AtomicU64 = &exit_word_owner;
@@ -1226,7 +1230,7 @@ impl Vcpu {
             if self.cpu.mmio_retry_active {
                 // Finish the pending instruction before honouring a host request.
                 let mut info = crate::interp::RetireInfo::default();
-                let r = crate::interp::step_one(
+                let r = crate::interp::step_one_mode::<ROUTED>(
                     &vm.mem,
                     &mut self.cpu,
                     self.mode,
@@ -1322,7 +1326,7 @@ impl Vcpu {
                         exit_request: Some(exit_word),
                         ..Default::default()
                     };
-                    let r = crate::interp::interpret_block(
+                    let r = crate::interp::interpret_block_mode::<ROUTED>(
                         &ir,
                         &mut self.cpu,
                         &vm.mem,
@@ -1524,10 +1528,12 @@ impl Vcpu {
                             RET_HOST_FAULT
                                 if self.fault_entry.fault_kind()
                                     != crate::jit_abi::fault::HostFaultKind::Alignment
-                                    && vm.mem.probe_write(ctx.fault_addr, 1).is_ok() =>
+                                    && vm.mem.mapped_ram(ctx.fault_addr) =>
                             {
-                                // A mapped page protected by the embedder would fault
-                                // again inside the interpreter. Leave it to the embedder.
+                                // The landing record already names the protected RAM byte.
+                                // Both modes exit directly, retaining instruction-entry
+                                // register state. Split stores can already have committed
+                                // earlier host transfers (xj-obx.8); resuming rewrites them.
                                 return ctx.unmapped_exit();
                             }
                             RET_MMIO_DEFER | RET_HOST_FAULT => {
@@ -1535,6 +1541,7 @@ impl Vcpu {
                                 // Host faults reach replay only for unmapped addresses
                                 // or alignment faults. Misaligned locked operations
                                 // currently replay non-atomically (tracked in xj-0w3.5).
+                                // Replay uses this run's memory policy in both modes.
                                 // Interpreter single-step (not the hot compiled loop):
                                 // tick the retired counter for the one instruction it
                                 // may retire (§17.6, sub-seam c).
@@ -1542,7 +1549,7 @@ impl Vcpu {
                                     exit_request: Some(exit_word),
                                     ..Default::default()
                                 };
-                                let r = crate::interp::step_one(
+                                let r = crate::interp::step_one_mode::<ROUTED>(
                                     &vm.mem,
                                     &mut self.cpu,
                                     self.mode,
@@ -1563,7 +1570,7 @@ impl Vcpu {
                                     exit_request: Some(exit_word),
                                     ..Default::default()
                                 };
-                                let r = crate::interp::step_one(
+                                let r = crate::interp::step_one_mode::<ROUTED>(
                                     &vm.mem,
                                     &mut self.cpu,
                                     self.mode,

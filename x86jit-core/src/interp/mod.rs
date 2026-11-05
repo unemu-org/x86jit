@@ -13,7 +13,7 @@ use crate::ir::{
     Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, HFloatOp, HIntOp, IrBlock, IrOp, PackedBinOp,
     RepKind, StrOp, VLogicOp, Val,
 };
-use crate::memory::{MemTrap, Memory};
+use crate::memory::{Access, MemTrap, Memory};
 use crate::state::{CpuState, Flags, Reg};
 
 /// `gpr[]` slot for RSP (used by push/pop-style stack ops in Call/Ret).
@@ -52,6 +52,20 @@ pub fn step_one(
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> StepResult {
+    if mem.host_fault_recovery() {
+        step_one_mode::<true>(mem, cpu, mode, scratch, info)
+    } else {
+        step_one_mode::<false>(mem, cpu, mode, scratch, info)
+    }
+}
+
+pub(crate) fn step_one_mode<const ROUTED: bool>(
+    mem: &Memory,
+    cpu: &mut CpuState,
+    mode: crate::lift::CpuMode,
+    scratch: &mut Vec<u64>,
+    info: &mut RetireInfo,
+) -> StepResult {
     if cpu.mmio_retry_active && !cpu.owns_mmio_retry(cpu.rip) {
         cpu.clear_mmio_parts();
     }
@@ -60,7 +74,7 @@ pub fn step_one(
     // decoder still resolves against the IP (Long64/Compat32 are flat: pa == ip).
     let at = crate::lift::FetchAddr::for_mode(mode, cpu.rip, cpu.cs);
     let result = match crate::lift::lift_one(mem, at, mode) {
-        Ok(ir) => return interpret_block(&ir, cpu, mem, scratch, info),
+        Ok(ir) => return interpret_block_mode::<ROUTED>(&ir, cpu, mem, scratch, info),
         Err(crate::lift::LiftError::Unsupported { addr, bytes, len }) => {
             StepResult::Exit(Exit::UnknownInstruction { addr, bytes, len })
         }
@@ -84,19 +98,34 @@ pub fn interpret_block(
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> StepResult {
-    // One predictable retry-state branch per block. Const specialization removes
-    // retry cleanup from every instruction boundary and the end of a no-MMIO block.
-    if cpu.mmio_retry_active {
-        interpret_block_inner::<true>(ir, cpu, mem, scratch, info)
+    if mem.host_fault_recovery() {
+        interpret_block_mode::<true>(ir, cpu, mem, scratch, info)
     } else {
-        interpret_block_inner::<false>(ir, cpu, mem, scratch, info)
+        interpret_block_mode::<false>(ir, cpu, mem, scratch, info)
     }
 }
 
-fn interpret_block_inner<const RETRY: bool>(
+pub(crate) fn interpret_block_mode<const ROUTED: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
+    scratch: &mut Vec<u64>,
+    info: &mut RetireInfo,
+) -> StepResult {
+    let mem = Access::<ROUTED>::new(mem);
+    // One predictable retry-state branch per block. Const specialization removes
+    // retry cleanup from every instruction boundary and the end of a no-MMIO block.
+    if cpu.mmio_retry_active {
+        interpret_block_inner::<true, ROUTED>(ir, cpu, mem, scratch, info)
+    } else {
+        interpret_block_inner::<false, ROUTED>(ir, cpu, mem, scratch, info)
+    }
+}
+
+fn interpret_block_inner<const RETRY: bool, const ROUTED: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> StepResult {
@@ -124,7 +153,7 @@ fn interpret_block_inner<const RETRY: bool>(
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
     // `sti_shadow` are threaded by `&mut` and read afterwards.
-    let result = walk_ops::<RETRY>(
+    let result = walk_ops::<RETRY, ROUTED>(
         ir,
         cpu,
         mem,
@@ -170,10 +199,10 @@ fn interpret_block_inner<const RETRY: bool>(
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters (`cur_addr`/`retired`/`started`/`sti_shadow`).
 #[allow(clippy::too_many_arguments)]
-fn walk_ops<const RETRY: bool>(
+fn walk_ops<const RETRY: bool, const ROUTED: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: &mut u64,
     retired: &mut u64,
@@ -469,7 +498,7 @@ fn walk_ops<const RETRY: bool>(
             }
             IrOp::AtomicCasPair { addr, size, len } => {
                 let addr = read_val(*addr, temps);
-                if let Some(exit) = cmpxchg_pair_run(cpu, mem, *cur_addr, addr, *size, *len) {
+                if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
                     return StepResult::Exit(exit);
                 }
             }
@@ -5263,6 +5292,7 @@ fn vec_trap_out(
 /// and the second traps with nothing left — then the retry starts over and the first
 /// traps again. Measured before this existed: four `run` → `complete_mmio_read` rounds
 /// produced four identical exits.
+#[inline(always)]
 fn vpart<M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
@@ -5291,6 +5321,7 @@ fn vpart<M: StrMem>(
             }),
         },
         Err(trap) => {
+            let at = trap.fault_addr(at);
             // §16: refine only an unavailable transfer, preserving successful and
             // MMIO access widths. Unlike vpart, sload consumes no MMIO answer and
             // returns a Trap verdict without producing an MMIO exit.
@@ -5315,6 +5346,7 @@ fn vpart<M: StrMem>(
 /// The store counterpart of [`vpart`]. An acknowledgement is recorded the same way, with
 /// a zero value — only its presence matters, and sharing one table means a 16-byte store
 /// converges for the same reason a load does.
+#[inline(always)]
 fn vpart_store<M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
@@ -5343,7 +5375,7 @@ fn vpart_store<M: StrMem>(
             }
         }
         Err(trap) => Err(VecFault {
-            at,
+            at: trap.fault_addr(at),
             size,
             trap,
             value: v,
@@ -5358,9 +5390,9 @@ fn vpart_store<M: StrMem>(
 /// the embedder to map a page it already has — it maps it, retries, faults identically,
 /// and loops, with no way out because the information was gone before the `Exit` was
 /// built.
-fn vload(
+fn vload<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     addr: u64,
     size: u8,
@@ -5387,7 +5419,7 @@ fn vector_fault_probe_preserves_mmio_answers() {
         let mut cpu = CpuState::new();
         cpu.pending_mmio = answer;
         cpu.pending_mmio_write = true;
-        let Err(fault) = vload(&mut cpu, &mem, 0x1000, 0x4ffc, 8) else {
+        let Err(fault) = vload(&mut cpu, Access::<false>::new(&mem), 0x1000, 0x4ffc, 8) else {
             panic!("a transfer extending beyond Trap memory must fault");
         };
         assert!(matches!(fault.trap, MemTrap::Unmapped));
@@ -5401,9 +5433,9 @@ fn vector_fault_probe_preserves_mmio_answers() {
 
 /// Load a `width`-byte vector (`width/16` 128-bit lanes) from `base` into `[u128; 4]`,
 /// zero-filling lanes above `width`. On a fault, returns the faulting sub-transfer.
-fn vload_lanes(
+fn vload_lanes<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     base: u64,
     width: u16,
@@ -5438,14 +5470,26 @@ fn vpopcnt_lanes(a: [u128; 4], lane: u8) -> [u128; 4] {
 
 /// Store a 128-bit vector value. The error carries the faulting sub-transfer — see
 /// [`vload`].
-fn vstore(
+fn vstore<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     addr: u64,
     v: u128,
     size: u8,
 ) -> Result<(), VecFault> {
+    if ROUTED && size == 16 {
+        for at in [addr, addr.wrapping_add(8)] {
+            if let Err(t @ (MemTrap::Unmapped | MemTrap::HostFault)) = mem.probe_write(at, 8) {
+                return Err(VecFault {
+                    at: t.fault_addr(at),
+                    size: 8,
+                    trap: t,
+                    value: 0,
+                });
+            }
+        }
+    }
     match size {
         16 => {
             vpart_store(cpu, mem, cur_addr, addr, v as u64, 8)?;
@@ -5468,6 +5512,10 @@ fn trap_out(
 ) -> StepResult {
     cpu.rip = cur_addr;
     let exit = match (trap, access) {
+        (t @ MemTrap::HostFault, _) => Exit::UnmappedMemory {
+            addr: t.fault_addr(addr),
+            access,
+        },
         (MemTrap::Unmapped, _) => Exit::UnmappedMemory { addr, access },
         (MemTrap::Mmio, AccessKind::Read) => Exit::mmio_read(addr, size),
         (MemTrap::Mmio, _) => Exit::mmio_write(addr, size, value),
@@ -5575,9 +5623,96 @@ const R11: usize = 11;
 pub trait StrMem {
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap>;
     fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap>;
+    /// In recovery mode, preflight selected store pages before any element commits.
+    /// The default implementation adds no checks for custom memory providers.
+    fn preflight_store(
+        &self,
+        _base: u64,
+        _mask: u64,
+        _elem: u8,
+        _bytes: u16,
+    ) -> Result<(), (u64, MemTrap)> {
+        Ok(())
+    }
+}
+
+fn preflight_store_pages(
+    base: u64,
+    mask: u64,
+    elem: u8,
+    bytes: u16,
+    host_base: usize,
+    guest_base: u64,
+    checks: (
+        impl FnMut(u64, u8) -> Result<(), MemTrap>,
+        impl FnMut(u64, u8) -> Result<(), MemTrap>,
+    ),
+) -> Result<(), (u64, MemTrap)> {
+    let (mut region, mut probe) = checks;
+    // Guest regions can end inside a host page. Check every selected element
+    // before the host-page probes; neither check consumes an MMIO answer.
+    for i in 0..bytes as usize / elem as usize {
+        if mask & (1u64 << i) != 0 {
+            let ea = base.wrapping_add((i * elem as usize) as u64);
+            if let Err(MemTrap::Unmapped) = region(ea, elem) {
+                let at = (0..elem)
+                    .map(|j| ea.wrapping_add(u64::from(j)))
+                    .find(|&at| matches!(region(at, 1), Err(MemTrap::Unmapped)))
+                    .unwrap_or(ea);
+                return Err((at, MemTrap::Unmapped));
+            }
+        }
+    }
+    let page = crate::memory::host_page_size() as u64;
+    let mut previous = None;
+    for i in 0..bytes as usize / elem as usize {
+        if mask & (1u64 << i) == 0 {
+            continue;
+        }
+        let ea = base.wrapping_add((i * elem as usize) as u64);
+        let host = (host_base as u64).wrapping_add(ea.wrapping_sub(guest_base));
+        for j in 0..elem {
+            let at = host.wrapping_add(u64::from(j));
+            let this_page = at / page;
+            if previous != Some(this_page) {
+                let guest = ea.wrapping_add(u64::from(j));
+                match probe(guest, 1) {
+                    // MMIO keeps its existing per-element answer/retry path.
+                    Err(MemTrap::Mmio) => continue,
+                    Err(t) => return Err((t.fault_addr(guest), t)),
+                    Ok(()) => previous = Some(this_page),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl StrMem for Memory {
+    fn preflight_store(
+        &self,
+        base: u64,
+        mask: u64,
+        elem: u8,
+        bytes: u16,
+    ) -> Result<(), (u64, MemTrap)> {
+        if self.host_fault_recovery() {
+            preflight_store_pages(
+                base,
+                mask,
+                elem,
+                bytes,
+                self.host_base() as usize,
+                self.guest_base(),
+                (
+                    |a, n| self.probe_write_mode::<false>(a, n),
+                    |a, n| self.probe_write_mode::<true>(a, n),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         self.read(addr, elem)
     }
@@ -5586,8 +5721,43 @@ impl StrMem for Memory {
     }
 }
 
+impl<const ROUTED: bool> StrMem for Access<ROUTED> {
+    fn preflight_store(
+        &self,
+        base: u64,
+        mask: u64,
+        elem: u8,
+        bytes: u16,
+    ) -> Result<(), (u64, MemTrap)> {
+        if ROUTED {
+            preflight_store_pages(
+                base,
+                mask,
+                elem,
+                bytes,
+                self.host_base() as usize,
+                self.guest_base(),
+                (
+                    |a, n| self.probe_write_mode::<false>(a, n),
+                    |a, n| self.probe_write_mode::<true>(a, n),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+        self.read(addr, elem)
+    }
+    #[inline(always)]
+    fn sstore(&self, addr: u64, value: u64, elem: u8) -> Result<(), MemTrap> {
+        self.write(addr, value, elem)
+    }
+}
+
 /// Bounds-only raw guest view for the JIT string helper (deferred JIT-side SMC).
-/// OOB is the only failure it can report — no region info, so never MMIO.
+/// It reports bounds and opted-in host faults; without region info it never reports MMIO.
 ///
 /// `base` is the host address of guest `guest_base`; `size` is the exclusive top guest
 /// address (`guest_base + span`). A guest address `a` translates to `base + (a -
@@ -5599,9 +5769,21 @@ pub struct RawStrMem {
     pub base: *mut u8,
     pub size: u64,
     pub guest_base: u64,
+    /// Enable fixups when host protections are independently owned by the embedder.
+    pub recover_host_faults: bool,
 }
 
 impl RawStrMem {
+    /// Validate a store through the recovery routines, without committing a value.
+    /// The shared masked-store preflight calls this once per selected host page.
+    pub fn probe_store(&self, addr: u64, elem: u8) -> Result<(), MemTrap> {
+        let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
+        // SAFETY: off validates the full span within the live backing mapping.
+        unsafe { crate::usercopy::probe(self.base.add(off), elem as usize, true) }.map_err(|at| {
+            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
+        })
+    }
+
     /// Backing offset for `addr` if `[addr, addr+elem)` lies in `[guest_base, size)`.
     #[inline]
     fn off(&self, addr: u64, elem: u8) -> Option<usize> {
@@ -5613,25 +5795,159 @@ impl RawStrMem {
     }
 }
 
-impl StrMem for RawStrMem {
-    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+impl RawStrMem {
+    #[inline(always)]
+    fn load_mode<const ROUTED: bool>(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
-        let mut buf = [0u8; 8];
-        // SAFETY: bounds-checked into `[guest_base, size)`; `base` is guest `guest_base`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.base.add(off), buf.as_mut_ptr(), elem as usize);
+        // SAFETY: off validated the full guest range; default mode requires host accessibility.
+        if !ROUTED {
+            return Ok(unsafe { crate::memory::plain_read(self.base.add(off), elem) });
         }
-        Ok(u64::from_le_bytes(buf))
+        unsafe { crate::usercopy::load(self.base.add(off), elem) }.map_err(|at| {
+            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
+        })
     }
-    fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+    #[inline(always)]
+    fn store_mode<const ROUTED: bool>(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
         let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
-        let bytes = val.to_le_bytes();
-        // SAFETY: bounds-checked into `[guest_base, size)`; `base` is guest `guest_base`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), elem as usize);
+        // SAFETY: off validated the full guest range; default mode requires host accessibility.
+        if !ROUTED {
+            unsafe { crate::memory::plain_write(self.base.add(off), val, elem) };
+            return Ok(());
+        }
+        unsafe { crate::usercopy::store(self.base.add(off), val, elem) }.map_err(|at| {
+            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
+        })
+    }
+}
+impl StrMem for RawStrMem {
+    fn preflight_store(
+        &self,
+        base: u64,
+        mask: u64,
+        elem: u8,
+        bytes: u16,
+    ) -> Result<(), (u64, MemTrap)> {
+        if self.recover_host_faults {
+            preflight_store_pages(
+                base,
+                mask,
+                elem,
+                bytes,
+                self.base as usize,
+                self.guest_base,
+                (
+                    |a, n| self.off(a, n).map(|_| ()).ok_or(MemTrap::Unmapped),
+                    |a, n| self.probe_store(a, n),
+                ),
+            )?;
         }
         Ok(())
     }
+
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+        if self.recover_host_faults {
+            self.load_mode::<true>(addr, elem)
+        } else {
+            self.load_mode::<false>(addr, elem)
+        }
+    }
+    fn sstore(&self, addr: u64, value: u64, elem: u8) -> Result<(), MemTrap> {
+        if self.recover_host_faults {
+            self.store_mode::<true>(addr, value, elem)
+        } else {
+            self.store_mode::<false>(addr, value, elem)
+        }
+    }
+}
+#[repr(transparent)]
+struct RawStrAccess<const ROUTED: bool>(RawStrMem);
+impl<const ROUTED: bool> RawStrAccess<ROUTED> {
+    fn new(raw: &RawStrMem) -> &Self {
+        // SAFETY: transparent shared view; the returned reference retains the source lifetime.
+        unsafe { &*(raw as *const RawStrMem).cast::<Self>() }
+    }
+}
+impl<const ROUTED: bool> StrMem for RawStrAccess<ROUTED> {
+    #[inline(always)]
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+        self.0.load_mode::<ROUTED>(addr, elem)
+    }
+    #[inline(always)]
+    fn sstore(&self, addr: u64, value: u64, elem: u8) -> Result<(), MemTrap> {
+        self.0.store_mode::<ROUTED>(addr, value, elem)
+    }
+}
+
+/// Run a raw JIT string helper, selecting its protection mode once per instruction.
+#[allow(clippy::too_many_arguments)]
+pub fn raw_string_run_interruptible(
+    cpu: &mut CpuState,
+    mem: &RawStrMem,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+) -> Option<StringStop> {
+    if mem.recover_host_faults {
+        raw_string_routed(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+        )
+    } else {
+        string_run_interruptible(
+            cpu,
+            RawStrAccess::<false>::new(mem),
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+        )
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn raw_string_routed(
+    cpu: &mut CpuState,
+    mem: &RawStrMem,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+) -> Option<StringStop> {
+    string_run_interruptible(
+        cpu,
+        RawStrAccess::<true>::new(mem),
+        op,
+        elem,
+        rep,
+        cur_addr,
+        addr_bits,
+        src_base,
+        dst_base,
+        exit_request,
+    )
 }
 
 /// A string op stopped on a memory trap. Carries what the caller needs to build the
@@ -5866,6 +6182,10 @@ fn str_fault_exit(f: StrFault) -> Exit {
         AccessKind::Read
     };
     match (f.trap, access) {
+        (MemTrap::HostFault, _) => Exit::UnmappedMemory {
+            addr: f.addr,
+            access,
+        },
         (MemTrap::Unmapped, _) => Exit::UnmappedMemory {
             addr: f.addr,
             access,
@@ -5959,9 +6279,9 @@ pub fn masked_load_run<M: StrMem>(
 
 /// EVEX write-masked vector **store** to memory (`vmovdqu{8,16,32,64} [mem]{k}, v`).
 /// Element-wise, in order — active lanes are stored left to right, so a
-/// fault mid-way leaves the earlier active lanes committed (matches hardware; there is no
+/// fault mid-way can leave earlier active lanes committed in default mode (there is no
 /// zeroing form for stores). Fault suppression: inactive lanes never touch memory. Shared
-/// with the JIT helper via [`StrMem`].
+/// with the JIT helper via [`StrMem`]. Recovery mode preflights selected host pages.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_store_run<M: StrMem>(
     cpu: &mut CpuState,
@@ -5974,6 +6294,9 @@ pub fn masked_store_run<M: StrMem>(
     cur_addr: u64,
 ) -> Option<StrFault> {
     let n = bytes as usize / elem as usize;
+    if let Err((at, t)) = mem.preflight_store(base, k, elem, bytes) {
+        return trap(cpu, cur_addr, at, true, t, 0, elem);
+    }
     let lanes = cpu.vec_lanes(src as usize);
     for i in 0..n {
         if k & (1 << i) != 0 {
@@ -5989,8 +6312,8 @@ pub fn masked_store_run<M: StrMem>(
 
 /// Unmasked narrowing store `vpmov{q,d,w}{d,w,b} [mem], src`: truncate each of
 /// the `src_width/from` source lanes to `to` bytes and store them contiguously at `base`.
-/// A fault stops at the first faulting element (partial stores before it stand, matching
-/// hardware). Generic over [`StrMem`] so interp (`Memory`) and the JIT helper (`RawStrMem`)
+/// Default mode stops at the first faulting element; recovery mode first preflights
+/// selected host pages. Generic over [`StrMem`] so interp (`Memory`) and the JIT helper (`RawStrMem`)
 /// share it → jit == interp.
 #[allow(clippy::too_many_arguments)]
 pub fn narrow_store_run<M: StrMem>(
@@ -6004,6 +6327,9 @@ pub fn narrow_store_run<M: StrMem>(
     cur_addr: u64,
 ) -> Option<StrFault> {
     let n = src_width as usize / from as usize;
+    if let Err((at, t)) = mem.preflight_store(base, u64::MAX, to, (n * to as usize) as u16) {
+        return trap(cpu, cur_addr, at, true, t, 0, to);
+    }
     let lanes = cpu.vec_lanes(src as usize);
     for i in 0..n {
         let v = get_velem(&lanes, i, from); // sstore truncates to `to` bytes on write
@@ -6027,7 +6353,7 @@ fn trap(
 ) -> Option<StrFault> {
     cpu.rip = cur_addr;
     Some(StrFault {
-        addr,
+        addr: t.fault_addr(addr),
         write,
         trap: t,
         value,
@@ -6055,6 +6381,21 @@ pub fn crc32c(mut crc: u32, src: u64, bytes: u8) -> u32 {
 pub fn cmpxchg_pair_run(
     cpu: &mut CpuState,
     mem: &Memory,
+    cur_addr: u64,
+    addr: u64,
+    size: u8,
+    len: u8,
+) -> Option<Exit> {
+    if mem.host_fault_recovery() {
+        cmpxchg_pair_mode(cpu, Access::<true>::new(mem), cur_addr, addr, size, len)
+    } else {
+        cmpxchg_pair_mode(cpu, Access::<false>::new(mem), cur_addr, addr, size, len)
+    }
+}
+
+fn cmpxchg_pair_mode<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     addr: u64,
     size: u8,
@@ -6089,7 +6430,7 @@ pub fn cmpxchg_pair_run(
             cpu.rip = cur_addr;
             let mut bytes = [0; 15];
             if let Ok(code) = mem.code_slice(cur_addr, len as usize) {
-                bytes[..code.len()].copy_from_slice(code);
+                bytes[..code.len()].copy_from_slice(&code);
             }
             return Some(Exit::unknown_instruction(cur_addr, bytes, len));
         }
@@ -8250,6 +8591,41 @@ mod exit_request_tests {
             reference.gpr[RCX] = 5;
             assert_eq!(cpu.gpr, reference.gpr);
             assert_eq!(cpu.flags.to_rflags(), reference.flags.to_rflags());
+        }
+    }
+}
+
+#[cfg(test)]
+mod store_preflight_tests {
+    use super::preflight_store_pages;
+    #[test]
+    fn selected_store_probes_each_touched_page_once() {
+        let page = crate::memory::host_page_size() as u64;
+        for (mask, elem, expected) in [
+            (u64::MAX, 8, vec![page - 4, page]),
+            (1, 4, vec![page - 4]),
+            (0x10, 4, vec![page + 12]),
+            (0, 1, vec![]),
+        ] {
+            let mut probes = Vec::new();
+            preflight_store_pages(
+                page - 4,
+                mask,
+                elem,
+                32,
+                0,
+                0,
+                (
+                    |_, _| Ok(()),
+                    |at, n| {
+                        assert_eq!(n, 1);
+                        probes.push(at);
+                        Ok(())
+                    },
+                ),
+            )
+            .unwrap();
+            assert_eq!(probes, expected);
         }
     }
 }

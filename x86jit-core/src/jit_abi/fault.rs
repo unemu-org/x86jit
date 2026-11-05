@@ -1,7 +1,7 @@
 //! Signal-context recovery for inline compiled guest accesses (§8.2).
 //!
 //! The embedder owns signal installation and its per-thread handle slot. The
-//! classifier only reads immutable codemap metadata and the current run's record.
+//! classifier reads immutable transfer fixups, codemap metadata and run records.
 //! Compiled calls remain direct calls, with no recovery work on chain edges.
 
 use super::{CpuState, MemCtx};
@@ -153,11 +153,14 @@ impl EntryRecord {
 /// fields back into the ucontext and return from the handler. On NOT OURS
 /// (`false`), state and registers remain untouched; chain the prior disposition.
 ///
-/// Requires an active run, an exact guest trap PC with a supported unwind recipe,
-/// an outermost compiled frame, and a data address inside the run's guest span.
-/// Rust helpers and unsupported hosts always answer NOT OURS. There is no
-/// allocation, lock, TLS, libc call or retry: two bounded AVL lookups, one exact
-/// site binary search, and fixed-size stack reads. The landing stub restores host
+/// Access faults inside a transfer fixup range recover with no active run:
+/// only PC and scratch change, and the routine returns normally to Rust. An
+/// Alignment fault in such a routine is NOT OURS. Other PCs require an active
+/// run, an exact guest trap site with a supported unwind recipe, an outermost
+/// compiled frame, and a data address inside the run's guest span. Unsupported
+/// hosts answer NOT OURS. There is no allocation, lock, TLS, libc call or retry:
+/// a fixed table lookup, bounded AVL lookups, exact-site binary search and
+/// fixed-size stack reads. The landing stub restores host
 /// FP control before control returns to call_block's caller (MXCSR: Intel SDM
 /// Vol 1 §10.2.3; x86-64 psABI §3.2.1). The signal handler and classifier must
 /// not depend on the thread's interrupted FP mode.
@@ -165,7 +168,9 @@ impl EntryRecord {
 /// # Safety
 /// `handle` is zero or a live handle for this thread's currently executing vCPU
 /// (or an inactive live record). Never use another thread's active handle. Keep
-/// the record, CPU and memory alive and exclusively owned throughout the run.
+/// the record and CPU alive and exclusively borrowed throughout a compiled run;
+/// keep the shared guest mapping live throughout every transfer. Fixup recovery
+/// itself needs no record or CPU pointer.
 /// Supply the actual interrupted PC, SP, FP, preserved registers and `si_addr`.
 /// Derive `kind` from a verified OS fault cause: Linux signal/code or macOS
 /// AArch64's saved data-abort ESR. Ambiguous and user-sent signals are Unsupported.
@@ -186,7 +191,18 @@ pub unsafe fn classify(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        if kind == HostFaultKind::Unsupported || handle == 0 || regs.pc != host_pc as u64 {
+        if kind == HostFaultKind::Unsupported || regs.pc != host_pc as u64 {
+            return false;
+        }
+        if let Some(fixup) = crate::usercopy::lookup(host_pc) {
+            if kind != HostFaultKind::Access {
+                return false;
+            }
+            regs.pc = fixup as u64;
+            regs.scratch = data_addr as u64;
+            return true;
+        }
+        if handle == 0 {
             return false;
         }
         // SAFETY: the live record belongs to this thread under the caller's contract.

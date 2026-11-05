@@ -4,9 +4,9 @@ use super::*;
 use crate::ir::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_x87(
+pub(crate) fn exec_x87<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     kind: &crate::x87::FpuKind,
@@ -43,9 +43,9 @@ pub(crate) fn exec_x87(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_fx_state(
+pub(crate) fn exec_fx_state<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -74,9 +74,9 @@ pub(crate) fn exec_set_df(cpu: &mut CpuState, value: &bool) -> Option<StepResult
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_rep_string(
+pub(crate) fn exec_rep_string<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -116,9 +116,9 @@ pub(crate) fn exec_rep_string(
 /// size is always 16-bit. `string_run_interruptible` honours the ES destination
 /// base (the long/compat caller passes 0).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_rep_string_real(
+pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -175,9 +175,9 @@ pub(crate) fn exec_sahf(cpu: &mut CpuState) -> Option<StepResult> {
 /// (16-bit wraps; AX ends at the highest address, DI at the lowest). A store fault traps
 /// out (RIP left on the instruction; a partial-frame SP change is possible mid-push, as
 /// in IVT delivery).
-pub(crate) fn exec_pusha_real(
+pub(crate) fn exec_pusha_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
 ) -> Option<StepResult> {
     let orig_sp = cpu.gpr[RSP] as u16;
@@ -202,9 +202,9 @@ pub(crate) fn exec_pusha_real(
 /// `popa` (§17.6): pop DI, SI, BP, (discard the saved SP word), BX, DX, CX, AX off SS:SP
 /// (16-bit wraps, the inverse order of `pusha`). Each 16-bit register write preserves the
 /// upper GPR bits. A load fault traps out (RIP left on the instruction).
-pub(crate) fn exec_popa_real(
+pub(crate) fn exec_popa_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
 ) -> Option<StepResult> {
     // Reverse of `pusha`: DI, SI, BP, [SP slot — read and discarded], BX, DX, CX, AX.
@@ -235,9 +235,9 @@ pub(crate) fn exec_popa_real(
 /// saved frame pointers (the display) from the enclosing frames; push the new frame
 /// pointer; set BP to it; then subtract `alloc` from SP. All SS-relative with 16-bit
 /// wraps. A store or display-read fault traps out (RIP left on the instruction).
-pub(crate) fn exec_enter_real(
+pub(crate) fn exec_enter_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     alloc: u16,
     level: u8,
@@ -308,9 +308,9 @@ pub(crate) fn exec_branch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_call(
+pub(crate) fn exec_call<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
     target: &Val,
@@ -339,9 +339,9 @@ pub(crate) fn exec_call(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_ret(
+pub(crate) fn exec_ret<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     slot: &u8,
     pop_extra: &u16,
@@ -444,7 +444,12 @@ fn ss_addr(cpu: &CpuState, sp: u16) -> u64 {
 /// Push a 16-bit word onto the real-mode stack SS:SP: `SP -= 2` (16-bit wrap), then
 /// store at SS:SP. Returns the trap on a faulting store (RIP left on `cur_addr`), or
 /// `Ok(())` with SP committed. Used by `int`/`pushf`/IVT delivery.
-fn push16(cpu: &mut CpuState, mem: &Memory, cur_addr: u64, word: u16) -> Result<(), StepResult> {
+fn push16<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
+    cur_addr: u64,
+    word: u16,
+) -> Result<(), StepResult> {
     let sp = (cpu.gpr[RSP] as u16).wrapping_sub(2);
     let addr = ss_addr(cpu, sp);
     if let Err(t) = mem.write(addr, word as u64, 2) {
@@ -466,7 +471,11 @@ fn push16(cpu: &mut CpuState, mem: &Memory, cur_addr: u64, word: u16) -> Result<
 /// Pop a 16-bit word off the real-mode stack SS:SP: load at SS:SP, then `SP += 2`
 /// (16-bit wrap). Returns the trap on a faulting load (RIP left on `cur_addr`, SP
 /// un-advanced), or the popped word with SP committed. Used by `popf`/`iret`.
-fn pop16(cpu: &mut CpuState, mem: &Memory, cur_addr: u64) -> Result<u16, StepResult> {
+fn pop16<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
+    cur_addr: u64,
+) -> Result<u16, StepResult> {
     let sp = cpu.gpr[RSP] as u16;
     let addr = ss_addr(cpu, sp);
     match mem.read(addr, 2) {
@@ -480,9 +489,9 @@ fn pop16(cpu: &mut CpuState, mem: &Memory, cur_addr: u64) -> Result<u16, StepRes
 }
 
 /// `pushf` (16-bit, §17.6): push the real-mode FLAGS image (incl. IF) onto SS:SP.
-pub(crate) fn exec_pushf_real(
+pub(crate) fn exec_pushf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
 ) -> Option<StepResult> {
     let image = cpu.flags.to_flags16();
@@ -494,9 +503,9 @@ pub(crate) fn exec_pushf_real(
 
 /// `popf` (16-bit, §17.6): pop a FLAGS image off SS:SP and restore the modeled flags
 /// incl. IF.
-pub(crate) fn exec_popf_real(
+pub(crate) fn exec_popf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
 ) -> Option<StepResult> {
     match pop16(cpu, mem, cur_addr) {
@@ -520,6 +529,20 @@ pub(crate) fn exec_popf_real(
 pub(crate) fn deliver_interrupt(
     cpu: &mut CpuState,
     mem: &Memory,
+    cur_addr: u64,
+    vector: u8,
+    saved_ip: u64,
+) -> StepResult {
+    if mem.host_fault_recovery() {
+        deliver_interrupt_mode(cpu, Access::<true>::new(mem), cur_addr, vector, saved_ip)
+    } else {
+        deliver_interrupt_mode(cpu, Access::<false>::new(mem), cur_addr, vector, saved_ip)
+    }
+}
+
+fn deliver_interrupt_mode<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
@@ -555,7 +578,11 @@ pub(crate) fn deliver_interrupt(
 /// `iret` (16-bit real mode, §17.6): pop IP, CS, FLAGS off SS:SP (16-bit wraps),
 /// restoring IF etc., then resume at CS:IP. The pop order is the inverse of the
 /// `deliver_interrupt` push order. Ends the block.
-pub(crate) fn exec_iret_real(cpu: &mut CpuState, mem: &Memory, cur_addr: u64) -> StepResult {
+pub(crate) fn exec_iret_real<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED>,
+    cur_addr: u64,
+) -> StepResult {
     let ip = match pop16(cpu, mem, cur_addr) {
         Ok(v) => v,
         Err(e) => return e,
@@ -615,9 +642,9 @@ pub(crate) fn exec_far_jump(cpu: &mut CpuState, temps: &[u64], cs: &Val, ip: &Va
 /// wraps, CS at the higher address so `retf` pops IP then CS), then load the target
 /// CS:IP. May trap on a stack store (RIP left on the instruction; a partial-frame SP
 /// change is possible mid-push, as in IVT delivery). Ends the block.
-pub(crate) fn exec_far_call(
+pub(crate) fn exec_far_call<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     temps: &[u64],
     cur_addr: u64,
     cs: &Val,
@@ -640,9 +667,9 @@ pub(crate) fn exec_far_call(
 /// Far `ret` / `retf` (§17.6): pop IP then CS off SS:SP (16-bit wraps), then add
 /// `pop_extra` to SP (`retf imm16` caller cleanup, 16-bit wrap). May trap on a stack
 /// load. Ends the block.
-pub(crate) fn exec_far_ret(
+pub(crate) fn exec_far_ret<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    mem: &Access<ROUTED>,
     cur_addr: u64,
     pop_extra: &u16,
 ) -> StepResult {

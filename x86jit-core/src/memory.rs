@@ -190,29 +190,6 @@ impl Backing {
     fn is_host(&self) -> bool {
         matches!(self.owner, Owner::Host(_))
     }
-    /// # Safety: interior-mutability discipline (§8) — concurrent guest stores race.
-    unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    /// Copy `bytes` into the backing at `off`, WITHOUT materializing a `&mut [u8]`.
-    ///
-    /// A `&mut [u8]` covering the whole backing, handed out from a `&self` on a type
-    /// that is manually `Sync` and shared through `Arc<Vm>`, is undefined the moment any
-    /// other access overlaps — the normal case for a threaded guest, since the `&mut`
-    /// spans every byte, not just the ones being written. The TSO barriers fix the
-    /// guest's memory model; they cannot make the host program well-formed. A raw
-    /// `copy_nonoverlapping` writes exactly the bytes asked for and creates no reference
-    /// at all.
-    ///
-    /// # Safety
-    /// `[off, off + bytes.len())` must lie inside the backing; callers bounds-check it
-    /// against a mapped region first.
-    unsafe fn copy_in(&self, off: usize, bytes: &[u8]) {
-        debug_assert!(off.saturating_add(bytes.len()) <= self.len);
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len()) };
-    }
-
     /// Flip host protection on `[ptr+off, ptr+off+len)` via the embedder's guard-page
     /// hook, if this is a host mapping that installed one. A no-op for a `Vec` backing
     /// or a host mapping with no hook.
@@ -247,7 +224,7 @@ const HOST_PAGE: u64 = 4096;
 /// place it would think to look.
 ///
 /// The engine models no permission fault at all: `MemTrap` distinguishes only
-/// mapped/unmapped/MMIO, and `Exit` has no protection-fault variant. `map` uses this to
+/// mapped/unmapped/MMIO plus an opted-in host fault, and `Exit` has no protection-fault variant. `map` uses this to
 /// tag the region and to bound-check; `RegionKind` — not `Prot` — is what routes RAM
 /// versus MMIO.
 ///
@@ -300,9 +277,34 @@ pub enum RegionKind {
 /// Why a memory access could not complete inline (§8.1). The interpreter and
 /// codegen turn this into the appropriate `Exit`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum MemTrap {
     Unmapped,
+    /// Host protection fault at the exact guest byte.
+    HostFault,
     Mmio,
+}
+impl MemTrap {
+    /// Exact protected byte, or the caller's original transfer address.
+    /// Read this immediately after `HostFault` on the thread that made the access:
+    /// another failing access on that thread replaces the cold address slot.
+    pub fn fault_addr(self, transfer: u64) -> u64 {
+        match self {
+            Self::HostFault => last_host_fault(),
+            _ => transfer,
+        }
+    }
+}
+
+// Like errno, this cold return channel belongs to the calling thread. The signal
+// classifier never accesses TLS: the routine returns its address to Rust first.
+thread_local! { static HOST_FAULT_ADDRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub(crate) fn record_host_fault(at: u64) -> MemTrap {
+    HOST_FAULT_ADDRESS.with(|slot| slot.set(at));
+    MemTrap::HostFault
+}
+fn last_host_fault() -> u64 {
+    HOST_FAULT_ADDRESS.with(std::cell::Cell::get)
 }
 
 #[derive(Debug)]
@@ -579,6 +581,7 @@ pub struct Memory {
     // the common case (consecutive accesses to the same region). Interior-mutable
     // (`region_at` is `&self`); only ever a hint, so `Relaxed` and staleness are fine.
     last_region: AtomicUsize,
+    recover_host_faults: bool,
 }
 
 // SAFETY: concurrent guest stores are intended to race like real hardware; the
@@ -588,6 +591,20 @@ pub struct Memory {
 unsafe impl Sync for Memory {}
 
 impl Memory {
+    /// Route Rust guest transfers through signal-context fixups when the embedder
+    /// owns host protections. Disabled by default. Install a handler calling
+    /// `jit_abi::fault::classify` on every accessing thread before enabling this
+    /// mode. Configure before run. Wide-store atomicity across concurrent protection
+    /// revocation requires embedder synchronization across the entire transfer.
+    pub fn set_host_fault_recovery(&mut self, enabled: bool) {
+        self.recover_host_faults = enabled;
+    }
+
+    /// Whether Rust data transfers use host-fault fixups.
+    pub fn host_fault_recovery(&self) -> bool {
+        self.recover_host_faults
+    }
+
     pub fn new(model: MemoryModel) -> Self {
         // Huge sparse mappings are supplied by the embedder through from_host_ram.
         let len = match &model {
@@ -651,6 +668,7 @@ impl Memory {
             watch,
             guest_base,
             last_region: AtomicUsize::new(0),
+            recover_host_faults: false,
         }
     }
 
@@ -668,7 +686,6 @@ impl Memory {
         if self.guest_base != 0 {
             return None;
         }
-        let src = unsafe { (*self.backing.get()).as_slice() };
         let owner = &unsafe { &*self.backing.get() }.owner;
         let bytes: Box<[u8]> = match (self.model, owner) {
             // A host-backed (NORESERVE) `Reserved` span can't be re-allocated by the
@@ -689,16 +706,21 @@ impl Memory {
                 for r in &self.regions {
                     let s = r.start as usize;
                     let e = s + r.size;
-                    child[s..e].copy_from_slice(&src[s..e]);
+                    unsafe { self.copy_from_guest(self.host_base().add(s), &mut child[s..e]) }
+                        .ok()?;
                 }
                 child
             }
-            _ => src.to_vec().into_boxed_slice(),
+            _ => {
+                let mut child = vec![0; self.size() as usize].into_boxed_slice();
+                unsafe { self.copy_from_guest(self.host_base(), &mut child) }.ok()?;
+                child
+            }
         };
-        Some(
-            Memory::from_backing(self.model, Backing::boxed(&bytes))
-                .with_regions(self.regions.clone()),
-        )
+        let mut child = Memory::from_backing(self.model, Backing::boxed(&bytes))
+            .with_regions(self.regions.clone());
+        child.recover_host_faults = self.recover_host_faults;
+        Some(child)
     }
 
     fn with_regions(mut self, regions: Vec<Region>) -> Self {
@@ -1177,7 +1199,8 @@ impl Memory {
         // `Arc<Vm>` on a worker thread (M7 threaded embedder). The range sits inside a
         // mapped region `map()` bounds-checked.
         // SAFETY: the range is bounds-checked into a mapped region of the backing.
-        unsafe { (*self.backing.get()).copy_in(start, bytes) };
+        unsafe { self.copy_to_guest(self.host_base().cast_mut().add(start), bytes) }
+            .map_err(|_| MemError::Unmapped)?;
         // SMC: an embedder write (loader, syscall passthrough) over a code page
         // must invalidate too (§10).
         self.note_write(guest_addr, bytes.len());
@@ -1190,18 +1213,7 @@ impl Memory {
     /// into a fault, matching a scalar `read`. Used for f64/f80/fxsave loads whose
     /// width exceeds the 8-byte scalar path.
     pub fn read_ram_guest(&self, addr: u64, buf: &mut [u8]) -> bool {
-        match self.region_for(addr, buf.len()) {
-            // Rom reads like Ram (read-only executable memory, §4.2).
-            Some(r) if matches!(r.kind, RegionKind::Ram | RegionKind::Rom) => {
-                let start = self.host_off(addr);
-                // SAFETY: `region_for` bounds-checked the range into a mapped RAM
-                // region, hence inside the backing buffer; read-only view.
-                let backing = unsafe { (*self.backing.get()).as_slice() };
-                buf.copy_from_slice(&backing[start..start + buf.len()]);
-                true
-            }
-            _ => false,
-        }
+        self.read_ram_checked(addr, buf).is_ok()
     }
 
     /// Guest-side wide write for the x87 helpers: copy `bytes` into a mapped **RAM**
@@ -1211,20 +1223,7 @@ impl Memory {
     /// `Exit::MmioWrite` (its value exceeds 8 bytes), so it faults here rather than
     /// silently scribbling backing — MMIO for x87 stays deferred (§5.2, §10).
     pub fn write_ram_guest(&self, addr: u64, bytes: &[u8]) -> bool {
-        match self.region_for(addr, bytes.len()) {
-            // A masked ROM discards a wide (x87) store, just like a scalar one: report
-            // success but leave the backing untouched (no fault, no SMC note).
-            Some(r) if matches!(r.kind, RegionKind::Rom) => true,
-            Some(r) if matches!(r.kind, RegionKind::Ram) => {
-                let start = self.host_off(addr);
-                // SAFETY: the one deliberate interior-mutable write (§8); the range is
-                // bounds-checked into a mapped RAM region.
-                unsafe { (*self.backing.get()).copy_in(start, bytes) };
-                self.note_write(addr, bytes.len());
-                true
-            }
-            _ => false,
-        }
+        self.write_ram_checked(addr, bytes).is_ok()
     }
 
     /// Read bytes back out (inspection / HLE reading guest structures). (§4.2)
@@ -1235,8 +1234,8 @@ impl Memory {
         let start = self.host_off(guest_addr);
         // SAFETY: the range lies inside a mapped, bounds-checked region; this is a
         // host-side read with no concurrent guest store to the same bytes.
-        let backing = unsafe { (*self.backing.get()).as_slice() };
-        buf.copy_from_slice(&backing[start..start + buf.len()]);
+        unsafe { self.copy_from_guest(self.host_base().add(start), buf) }
+            .map_err(|_| MemError::Unmapped)?;
         Ok(())
     }
 
@@ -1304,8 +1303,11 @@ impl Memory {
         }
     }
 
-    /// Ask what a WRITE of `size` bytes at `addr` would fault as, without performing it
-    /// and without touching either MMIO answer channel.
+    /// Check a WRITE of `size` bytes at `addr` without consuming an MMIO answer.
+    /// In default mode this only checks region metadata. Recovery mode also performs
+    /// an atomic same-value write to one byte per touched host page: guest data is
+    /// unchanged, but this breaks copy-on-write and sets dirty/soft-dirty tracking
+    /// bits, including on earlier pages when a later page faults.
     ///
     /// The wide-store helpers pre-probe their whole destination so a fault leaves nothing
     /// committed. Probing with a load instead — on the reasoning that a load shares the
@@ -1314,10 +1316,40 @@ impl Memory {
     /// `MmioWrite` through `pending_mmio_write`, so the retry re-probes forever.
     /// Reporting the region's verdict without consuming anything is what the probe wants.
     pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
+        if self.recover_host_faults {
+            self.probe_write_mode::<true>(addr, size)
+        } else {
+            self.probe_write_mode::<false>(addr, size)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn probe_write_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
         match self.region_at(addr, size)?.kind {
             RegionKind::Trap => Err(MemTrap::Mmio),
-            _ => Ok(()),
+            RegionKind::Rom => Ok(()),
+            RegionKind::Ram if !ROUTED => Ok(()),
+            RegionKind::Ram => {
+                // SAFETY: region_at validated the entire range.
+                unsafe {
+                    crate::usercopy::probe(
+                        self.host_base().cast_mut().add(self.host_off(addr)),
+                        size as usize,
+                        true,
+                    )
+                }
+                .map_err(|at| self.host_fault(at))
+            }
         }
+    }
+
+    pub(crate) fn mapped_ram(&self, addr: u64) -> bool {
+        self.region_at(addr, 1)
+            .is_ok_and(|r| !matches!(r.kind, RegionKind::Trap))
     }
 
     /// The region containing `[addr, addr + size)`, or `Unmapped` if the range
@@ -1344,10 +1376,128 @@ impl Memory {
         }
     }
 
+    unsafe fn copy_from_guest(&self, ptr: *const u8, buf: &mut [u8]) -> Result<(), usize> {
+        // SAFETY: caller validates the whole span and local buffer. The default
+        // contract requires tagged RAM to stay accessible on the host.
+        unsafe {
+            if self.recover_host_faults {
+                crate::usercopy::copy_in(ptr, buf)
+            } else {
+                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len());
+                Ok(())
+            }
+        }
+    }
+
+    unsafe fn copy_to_guest(&self, ptr: *mut u8, buf: &[u8]) -> Result<(), usize> {
+        // SAFETY: same contract as copy_from_guest, with writable guest bytes.
+        unsafe {
+            if self.recover_host_faults {
+                crate::usercopy::copy_out(ptr, buf)
+            } else {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, buf.len());
+                Ok(())
+            }
+        }
+    }
+
+    fn host_fault(&self, at: usize) -> MemTrap {
+        record_host_fault(self.guest_base + (at - self.host_base() as usize) as u64)
+    }
+
+    /// Wide checked transfer retaining the faulting byte for the FP helpers.
+    pub(crate) fn read_ram_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        if self.recover_host_faults {
+            self.read_ram_checked_mode::<true>(addr, buf)
+        } else {
+            self.read_ram_checked_mode::<false>(addr, buf)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_ram_checked_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        buf: &mut [u8],
+    ) -> Result<(), u64> {
+        let region = self.region_for(addr, buf.len()).ok_or(addr)?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(addr);
+        }
+        // SAFETY: region_for validates the entire range; the local output is live.
+        unsafe {
+            let ptr = self.host_base().add(self.host_off(addr));
+            if ROUTED {
+                crate::usercopy::copy_in(ptr, buf)
+            } else {
+                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len());
+                Ok(())
+            }
+        }
+        .map_err(|at| {
+            let addr = self.guest_base + (at - self.host_base() as usize) as u64;
+            record_host_fault(addr);
+            addr
+        })
+    }
+
+    pub(crate) fn write_ram_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        if self.recover_host_faults {
+            self.write_ram_checked_mode::<true>(addr, bytes)
+        } else {
+            self.write_ram_checked_mode::<false>(addr, bytes)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_ram_checked_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+    ) -> Result<(), u64> {
+        let region = self.region_for(addr, bytes.len()).ok_or(addr)?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(addr);
+        }
+        if matches!(region.kind, RegionKind::Rom) {
+            return Ok(());
+        }
+        // SAFETY: region_for validates the entire range; the local source is live.
+        unsafe {
+            let ptr = self.host_base().cast_mut().add(self.host_off(addr));
+            if ROUTED {
+                crate::usercopy::copy_out(ptr, bytes)
+            } else {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                Ok(())
+            }
+        }
+        .map_err(|at| {
+            let addr = self.guest_base + (at - self.host_base() as usize) as u64;
+            record_host_fault(addr);
+            addr
+        })?;
+        self.note_write(addr, bytes.len());
+        Ok(())
+    }
+
     /// Scalar read used by the interpreter and trap-out path (§8.1). Little-endian.
     /// MUST bounds-check (§8.2.3) — an out-of-range addr is a MemTrap, never a panic/UB.
     /// A `Trap` region yields `MemTrap::Mmio` (routed out as `Exit::MmioRead`).
     pub fn read(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        if self.recover_host_faults {
+            self.read_mode::<true>(addr, size)
+        } else {
+            self.read_mode::<false>(addr, size)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn read_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        size: u8,
+    ) -> Result<u64, MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -1356,16 +1506,82 @@ impl Memory {
         // for a naturally-aligned access so a store racing on another vcpu can't tear it
         // (a plain byte copy could) — matching the guest `mov` and the JIT's host `mov`.
         let ptr = unsafe { (*self.backing.get()).as_ptr().add(self.host_off(addr)) };
-        Ok(unsafe { atomic_load_le(ptr, size) })
+        if ROUTED {
+            unsafe { crate::usercopy::load(ptr, size) }.map_err(|at| self.host_fault(at))
+        } else {
+            Ok(unsafe { atomic_load_le(ptr, size) })
+        }
     }
 
-    /// Contiguous code bytes for the iced `Decoder` (the lift, §7.3).
-    /// Scalar `read` can't feed a decoder — it needs a byte slice. Returns up to
+    /// Copy a decode window, retaining a valid prefix before the first host fault.
+    /// No live guest slice is passed to the decoder.
+    pub(crate) fn fetch_code(&self, addr: u64, buf: &mut [u8]) -> Result<usize, MemTrap> {
+        // SAFETY: the initialized output slice has this writable extent.
+        unsafe { self.fetch_code_into(addr, buf.as_mut_ptr(), buf.len()) }
+    }
+
+    /// Copy into a writable allocation without constructing references to uninitialized bytes.
+    pub(crate) unsafe fn fetch_code_into(
+        &self,
+        addr: u64,
+        out: *mut u8,
+        capacity: usize,
+    ) -> Result<usize, MemTrap> {
+        let len = self.code_len(addr, capacity)?;
+        // SAFETY: code_len validates the contiguous RAM/ROM window.
+        if !self.recover_host_faults {
+            // SAFETY: the requested chunk stays in registered accessible RAM.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.host_base().add(self.host_off(addr)), out, len);
+            }
+            return Ok(len);
+        }
+        match unsafe {
+            crate::usercopy::copy_in_raw(self.host_base().add(self.host_off(addr)), out, len)
+        } {
+            Ok(()) => Ok(len),
+            Err(at) => {
+                let copied = at - self.host_base() as usize - self.host_off(addr);
+                if copied == 0 {
+                    Err(self.host_fault(at))
+                } else {
+                    Ok(copied)
+                }
+            }
+        }
+    }
+
+    /// Owned code snapshot for inspection/decoding (§7.3).
+    ///
+    /// This returns `Vec<u8>` rather than a borrowed slice of live guest RAM.
+    /// Borrow the returned vector when passing it to iced. Concurrent guest stores
+    /// cannot alias a Rust reference to the backing. Returns up to
     /// `max_len` bytes from `addr`, continuing across adjacent RAM/ROM regions
     /// until the first gap or Trap region. `Unmapped` if
     /// `addr` isn't inside a mapped region. `Trap` regions return `Mmio` without
-    /// exposing backing bytes; the lift maps this to an execute fault.
-    pub fn code_slice(&self, addr: u64, max_len: usize) -> Result<&[u8], MemTrap> {
+    /// exposing backing bytes; the lift maps this to an execute fault. With host
+    /// fault recovery enabled, an inaccessible first byte returns `HostFault`;
+    /// a later inaccessible byte ends the returned readable prefix.
+    pub fn code_slice(&self, addr: u64, max_len: usize) -> Result<Vec<u8>, MemTrap> {
+        let mut code = vec![0; self.code_len(addr, max_len)?];
+        let len = self.fetch_code(addr, &mut code)?;
+        code.truncate(len);
+        Ok(code)
+    }
+
+    pub(crate) fn fetch_chunk_len(&self, addr: u64, max: usize) -> Result<usize, MemTrap> {
+        let region = self.region_at(addr, 1)?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(MemTrap::Mmio);
+        }
+        let host = self.host_base() as usize + self.host_off(addr);
+        let page = host_page_size();
+        Ok(max
+            .min(page - host % page)
+            .min((region.start + region.size as u64 - addr) as usize))
+    }
+
+    fn code_len(&self, addr: u64, max_len: usize) -> Result<usize, MemTrap> {
         let region = self
             .regions
             .iter()
@@ -1385,15 +1601,26 @@ impl Memory {
             region_end += next.size as u64;
         }
         let end = limit.min(region_end);
-        // SAFETY: read-only view; `[addr, end)` lies inside adjacent mapped RAM/ROM
-        // regions in the contiguous backing buffer. The borrow is tied to `&self`.
-        let backing = unsafe { (*self.backing.get()).as_slice() };
-        Ok(&backing[self.host_off(addr)..self.host_off(end)])
+        Ok((end - addr) as usize)
     }
 
     /// `&self`, not `&mut self` (§8 pitfall) — guest RAM is interior-mutable and shared.
     /// Little-endian. Bounds-checked; a `Trap` region yields `MemTrap::Mmio`.
     pub fn write(&self, addr: u64, val: u64, size: u8) -> Result<(), MemTrap> {
+        if self.recover_host_faults {
+            self.write_mode::<true>(addr, val, size)
+        } else {
+            self.write_mode::<false>(addr, val, size)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn write_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        val: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -1410,7 +1637,11 @@ impl Memory {
         // naturally-aligned access (like the guest `mov` and the JIT's host `mov`), so a
         // concurrent load on another vcpu never sees a torn word.
         let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(addr)) };
-        unsafe { atomic_store_le(ptr, val, size) };
+        if ROUTED {
+            unsafe { crate::usercopy::store(ptr, val, size) }.map_err(|at| self.host_fault(at))?;
+        } else {
+            unsafe { atomic_store_le(ptr, val, size) };
+        }
         self.note_write(addr, size as usize); // SMC: catch a store onto a code page (§10)
         Ok(())
     }
@@ -1422,6 +1653,21 @@ impl Memory {
     /// *value* is identical, only cross-thread atomicity is lost, which aligned
     /// guest atomics never hit.
     pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
+        if self.recover_host_faults {
+            self.atomic_rmw_mode::<true>(addr, src, size, op)
+        } else {
+            self.atomic_rmw_mode::<false>(addr, src, size, op)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn atomic_rmw_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        src: u64,
+        size: u8,
+        op: RmwOp,
+    ) -> Result<u64, MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -1432,9 +1678,26 @@ impl Memory {
         // A locked RMW on masked ROM discards the modify half; the read half still
         // returns the current (unchanged) value. No store, no fault, no SMC note.
         if matches!(region.kind, RegionKind::Rom) {
-            return Ok(unsafe { atomic_load_le(ptr, size) } & mask_bits(size));
+            return self
+                .read_mode::<ROUTED>(addr, size)
+                .map(|v| v & mask_bits(size));
         }
-        let old = unsafe { atomic_rmw_raw(ptr, src, size, op) };
+        if !ROUTED {
+            let old = unsafe { atomic_rmw_raw(ptr, src, size, op) };
+            self.note_write(addr, size as usize);
+            return Ok(old & mask_bits(size));
+        }
+        let mut old =
+            unsafe { crate::usercopy::load(ptr, size) }.map_err(|at| self.host_fault(at))?;
+        loop {
+            let new = apply_rmw(old, src, op, size);
+            let observed = unsafe { crate::usercopy::cas(ptr, old, new, size) }
+                .map_err(|at| self.host_fault(at))?;
+            if observed == old {
+                break;
+            }
+            old = observed;
+        }
         self.note_write(addr, size as usize);
         Ok(old & mask_bits(size))
     }
@@ -1442,6 +1705,20 @@ impl Memory {
     /// Aligned 16-byte CAS shared by interpreted and compiled CMPXCHG16B.
     /// The caller checks guest alignment before invoking this operation.
     pub fn atomic_cas128(&self, addr: u64, expected: u128, src: u128) -> Result<u128, MemTrap> {
+        if self.recover_host_faults {
+            self.atomic_cas128_mode::<true>(addr, expected, src)
+        } else {
+            self.atomic_cas128_mode::<false>(addr, expected, src)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn atomic_cas128_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        expected: u128,
+        src: u128,
+    ) -> Result<u128, MemTrap> {
         let region = self.region_at(addr, 16)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -1456,12 +1733,17 @@ impl Memory {
         if matches!(region.kind, RegionKind::Rom) {
             // ROM discards the write half, matching the scalar CAS policy.
             // SAFETY: the full read is in the checked region.
-            return Ok(unsafe {
-                atomic_load_le(ptr, 8) as u128 | ((atomic_load_le(ptr.add(8), 8) as u128) << 64)
-            });
+            let lo = self.read_mode::<ROUTED>(addr, 8)?;
+            let hi = self.read_mode::<ROUTED>(addr + 8, 8)?;
+            return Ok(u128::from(lo) | (u128::from(hi) << 64));
         }
         // SAFETY: ptr names 16 mapped, aligned, interior-mutable RAM bytes.
-        let old = unsafe { atomic_cas128_raw(ptr, expected, src) };
+        let old = if ROUTED {
+            unsafe { crate::usercopy::cas_pair(ptr, expected, src) }
+                .map_err(|at| self.host_fault(at))?
+        } else {
+            unsafe { atomic_cas128_raw(ptr, expected, src) }
+        };
         // SDM Vol 2A CMPXCHG8B/CMPXCHG16B, Description: failed compares write back too.
         self.note_write(addr, 16);
         Ok(old)
@@ -1470,6 +1752,21 @@ impl Memory {
     /// Atomic compare-exchange (`cmpxchg`, §8.2.3). If `[addr] == expected`, store
     /// `src`; return the prior value either way (size-masked).
     pub fn atomic_cas(&self, addr: u64, expected: u64, src: u64, size: u8) -> Result<u64, MemTrap> {
+        if self.recover_host_faults {
+            self.atomic_cas_mode::<true>(addr, expected, src, size)
+        } else {
+            self.atomic_cas_mode::<false>(addr, expected, src, size)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn atomic_cas_mode<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        expected: u64,
+        src: u64,
+        size: u8,
+    ) -> Result<u64, MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -1479,9 +1776,16 @@ impl Memory {
         // A `cmpxchg` against masked ROM never stores; it returns the current value
         // (so a matching `expected` reports success but leaves the ROM unchanged).
         if matches!(region.kind, RegionKind::Rom) {
-            return Ok(unsafe { atomic_load_le(ptr, size) } & mask_bits(size));
+            return self
+                .read_mode::<ROUTED>(addr, size)
+                .map(|v| v & mask_bits(size));
         }
-        let old = unsafe { atomic_cas_raw(ptr, expected & mask_bits(size), src, size) };
+        let old = if ROUTED {
+            unsafe { crate::usercopy::cas(ptr, expected & mask_bits(size), src, size) }
+                .map_err(|at| self.host_fault(at))?
+        } else {
+            unsafe { atomic_cas_raw(ptr, expected & mask_bits(size), src, size) }
+        };
         self.note_write(addr, size as usize);
         Ok(old & mask_bits(size))
     }
@@ -1550,31 +1854,6 @@ unsafe fn atomic_cas128_raw(ptr: *mut u8, expected: u128, src: u128) -> u128 {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 unsafe fn atomic_cas128_raw(_: *mut u8, _: u128, _: u128) -> u128 {
     unimplemented!("16-byte CAS requires an aarch64 or x86-64 host")
-}
-
-/// The SMC code-page bitset for a guest space of `span` bytes.
-///
-/// Sized over the span, not the backing length, and uncapped: addresses are indexed by
-/// their raw page number, so the table has to reach `guest_base + backing len` for the
-/// same reason `WatchPages::new` does.
-fn fresh_code_pages(span: u64) -> Box<[AtomicU64]> {
-    assert!(
-        span <= MAX_TRACKED_SPAN,
-        "guest span 0x{span:x} exceeds the SMC-tracked maximum 0x{MAX_TRACKED_SPAN:x}: \
-         the code-range watermark generated stores gate on packs two page indices into \
-         one u64, and a page above 2^32 has no representation. Refused here rather than \
-         silently leaving high code un-invalidated."
-    );
-    let pages = span.div_ceil(CODE_PAGE_SIZE);
-    zeroed_words(pages.div_ceil(64) as usize)
-}
-
-fn mask_bits(size: u8) -> u64 {
-    if size >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (size * 8)) - 1
-    }
 }
 
 /// Raw atomic RMW dispatch over a guest pointer. Aligned → real host atomic;
@@ -1659,13 +1938,13 @@ unsafe fn atomic_cas_raw(ptr: *mut u8, expected: u64, src: u64, size: u8) -> u64
     }
 }
 
-unsafe fn plain_read(ptr: *const u8, size: u8) -> u64 {
+pub(crate) unsafe fn plain_read(ptr: *const u8, size: u8) -> u64 {
     let mut buf = [0u8; 8];
     unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), size as usize) };
     u64::from_le_bytes(buf)
 }
 
-unsafe fn plain_write(ptr: *mut u8, val: u64, size: u8) {
+pub(crate) unsafe fn plain_write(ptr: *mut u8, val: u64, size: u8) {
     let bytes = val.to_le_bytes();
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, size as usize) };
 }
@@ -1682,7 +1961,7 @@ unsafe fn plain_write(ptr: *mut u8, val: u64, size: u8) {
 ///
 /// # Safety
 /// `ptr` must point to `size` valid, mapped bytes inside the backing buffer.
-unsafe fn atomic_load_le(ptr: *const u8, size: u8) -> u64 {
+pub(crate) unsafe fn atomic_load_le(ptr: *const u8, size: u8) -> u64 {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
     match size {
         1 => unsafe { (*(ptr as *const AtomicU8)).load(Relaxed) as u64 },
@@ -1706,7 +1985,7 @@ unsafe fn atomic_load_le(ptr: *const u8, size: u8) -> u64 {
 ///
 /// # Safety
 /// `ptr` must point to `size` valid, mapped bytes inside the backing buffer.
-unsafe fn atomic_store_le(ptr: *mut u8, val: u64, size: u8) {
+pub(crate) unsafe fn atomic_store_le(ptr: *mut u8, val: u64, size: u8) {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
     match size {
         1 => unsafe { (*(ptr as *const AtomicU8)).store(val as u8, Relaxed) },
@@ -1720,6 +1999,31 @@ unsafe fn atomic_store_le(ptr: *mut u8, val: u64, size: u8) {
             (*(ptr as *const AtomicU64)).store(val, Relaxed)
         },
         _ => unsafe { plain_write(ptr, val, size) },
+    }
+}
+
+/// The SMC code-page bitset for a guest space of `span` bytes.
+///
+/// Sized over the span, not the backing length, and uncapped: addresses are indexed by
+/// their raw page number, so the table has to reach `guest_base + backing len` for the
+/// same reason `WatchPages::new` does.
+fn fresh_code_pages(span: u64) -> Box<[AtomicU64]> {
+    assert!(
+        span <= MAX_TRACKED_SPAN,
+        "guest span 0x{span:x} exceeds the SMC-tracked maximum 0x{MAX_TRACKED_SPAN:x}: \
+         the code-range watermark generated stores gate on packs two page indices into \
+         one u64, and a page above 2^32 has no representation. Refused here rather than \
+         silently leaving high code un-invalidated."
+    );
+    let pages = span.div_ceil(CODE_PAGE_SIZE);
+    zeroed_words(pages.div_ceil(64) as usize)
+}
+
+fn mask_bits(size: u8) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
     }
 }
 
@@ -2477,5 +2781,75 @@ mod tests {
                 "page {page}: re-marking widened the range from {first:#x}"
             );
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn host_page_size() -> usize {
+    static PAGE: AtomicUsize = AtomicUsize::new(0);
+    let cached = PAGE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    unsafe extern "C" {
+        fn getpagesize() -> std::ffi::c_int;
+    }
+    // SAFETY: POSIX getpagesize has no pointer arguments; initialization precedes copying.
+    let page = unsafe { getpagesize() } as usize;
+    PAGE.store(page, Ordering::Relaxed);
+    page
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn host_page_size() -> usize {
+    4096
+}
+
+// A borrowed specialization has exactly Memory's representation, avoiding a
+// pointer-to-pointer on out-of-line interpreter helpers.
+#[repr(transparent)]
+pub(crate) struct Access<const ROUTED: bool>(pub Memory);
+impl<const ROUTED: bool> std::ops::Deref for Access<ROUTED> {
+    type Target = Memory;
+    fn deref(&self) -> &Memory {
+        &self.0
+    }
+}
+impl<const ROUTED: bool> Access<ROUTED> {
+    #[inline(always)]
+    pub fn new(mem: &Memory) -> &Self {
+        // SAFETY: transparent wrapper; shared borrowing retains Memory's lifetime
+        // and interior-mutability contract. No owned Access is constructed.
+        unsafe { &*(mem as *const Memory).cast::<Self>() }
+    }
+    #[inline(always)]
+    pub fn read(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        self.0.read_mode::<ROUTED>(addr, size)
+    }
+    #[inline(always)]
+    pub fn write(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        self.0.write_mode::<ROUTED>(addr, value, size)
+    }
+    #[inline(always)]
+    pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
+        self.0.probe_write_mode::<ROUTED>(addr, size)
+    }
+    pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
+        self.0.atomic_rmw_mode::<ROUTED>(addr, src, size, op)
+    }
+    pub fn atomic_cas128(&self, addr: u64, expected: u128, src: u128) -> Result<u128, MemTrap> {
+        self.0.atomic_cas128_mode::<ROUTED>(addr, expected, src)
+    }
+    pub fn atomic_cas(&self, addr: u64, expected: u64, src: u64, size: u8) -> Result<u64, MemTrap> {
+        self.0.atomic_cas_mode::<ROUTED>(addr, expected, src, size)
+    }
+}
+
+#[cfg(test)]
+mod fault_layout_tests {
+    use super::*;
+    #[test]
+    fn hot_fault_layouts_remain_compact() {
+        assert_eq!(std::mem::size_of::<MemTrap>(), 1);
+        assert_eq!(std::mem::size_of::<Result<(), MemTrap>>(), 1);
     }
 }

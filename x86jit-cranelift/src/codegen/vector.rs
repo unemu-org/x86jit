@@ -59,8 +59,11 @@ impl Translator<'_, '_> {
         let a = self.val(*addr);
         let host = self.checked_addr(a, *bytes as u8, 0);
         let n = *bytes as usize / 16;
-        for i in 0..n {
-            let v = self.gload(types::I128, host, (i * 16) as i32);
+        // §16: a protected high lane must fault before any destination commits.
+        let lanes: Vec<_> = (0..n)
+            .map(|i| self.gload(types::I128, host, (i * 16) as i32))
+            .collect();
+        for (i, v) in lanes.into_iter().enumerate() {
             self.store_lane(*dst, i, v);
         }
         self.store_lanes_zeroed_above(*dst, n);
@@ -627,11 +630,15 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let bv = self.gload(types::I128, host, (i * 16) as i32);
             let av = self.load_lane(*a, i);
             let r = self.dpps_native(av, bv, *imm);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         false
     }
@@ -1214,11 +1221,15 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let av = self.load_lane(*a, i);
             let bv = self.gload(types::I128, host, (i * 16) as i32);
             let r = self.emit_vlogic(av, bv, *op);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         self.store_lanes_zeroed_above(*dst, n);
         false
@@ -1239,10 +1250,14 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let v = self.gload(types::I128, host, (i * 16) as i32);
             let r = self.emit_vpopcnt(v, *lane);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         self.store_lanes_zeroed_above(*dst, n);
         false
@@ -1506,11 +1521,15 @@ impl Translator<'_, '_> {
         let av = self.val(*addr);
         let host = self.checked_addr(av, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for c in 0..n {
             let s = self.gload(types::I128, host, (c * 16) as i32);
             let (xa, m) = (self.load_lane(*a, c), self.load_lane(*mask, c));
             let r = self.emit_blendv(xa, s, m, *lane);
-            self.store_lane(*dst, c, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         self.store_lanes_zeroed_above(*dst, n);
         false
@@ -1562,11 +1581,15 @@ impl Translator<'_, '_> {
         let host = self.checked_addr(av, *bytes as u8, 0);
         let n = *bytes as usize / 16;
         let per_half = 16 / *lane;
+        let mut results = Vec::with_capacity(n);
         for c in 0..n {
             let xb = self.gload(types::I128, host, (c * 16) as i32);
             let xa = self.load_lane(*a, c);
             let r = self.blendi_shuffle(xa, xb, imm >> (c as u8 * per_half), *lane);
-            self.store_lane(*dst, c, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         if n > 1 {
             self.store_lanes_zeroed_above(*dst, n);
@@ -1647,11 +1670,15 @@ impl Translator<'_, '_> {
         // Packed: round each 128-bit lane loaded from memory.
         let host = self.checked_addr(av, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let s = self.gload(types::I128, host, (i * 16) as i32);
             let d = self.load_lane(*dst, i);
             let r = self.emit_round(d, s, *prec, *mode, false);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         false
     }
@@ -1690,13 +1717,17 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             // `dst` is also the first source; `c` comes from memory.
             let av = self.load_lane(*dst, i);
             let bv = self.load_lane(*b, i);
             let cv = self.gload(types::I128, host, (i * 16) as i32);
             let r = self.emit_ternlog(av, bv, cv, *imm);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         self.store_lanes_zeroed_above(*dst, n);
         false
@@ -1807,13 +1838,17 @@ impl Translator<'_, '_> {
         let host = self.checked_addr(base, *bytes as u8, 0);
         let vty = vec_ty(*lane);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let xa = self.load_lane(*a, i);
             let m = self.gload(types::I128, host, (i * 16) as i32);
             let (va, vm) = (self.bitcast_v(xa, vty), self.bitcast_v(m, vty));
             let r = self.emit_packed_bin(va, vm, *op);
             let r = self.bitcast_i128(r);
-            self.store_lane(*dst, i, r);
+            results.push(r);
+        }
+        for (i, result) in results.into_iter().enumerate() {
+            self.store_lane(*dst, i, result);
         }
         self.store_lanes_zeroed_above(*dst, n);
         false
@@ -3120,10 +3155,14 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let host = self.checked_addr(base, *bytes as u8, 0);
         let n = *bytes as usize / 16;
+        let mut results = Vec::with_capacity(n);
         for i in 0..n {
             let ctrl = self.gload(types::I128, host, (i * 16) as i32);
             let src = self.load_lane(*a, i);
             let r = self.emit_psign(src, ctrl, *lane);
+            results.push(r);
+        }
+        for (i, r) in results.into_iter().enumerate() {
             self.store_lane(*dst, i, r);
         }
         false
@@ -3229,11 +3268,17 @@ impl Translator<'_, '_> {
         // Low 128-bit lane (passed as two i64 halves, like vpack_mem).
         let llo = self.gload(types::I64, host, 0);
         let lhi = self.gload(types::I64, host, 8);
+        let high = if *bytes == 32 {
+            Some((
+                self.gload(types::I64, host, 16),
+                self.gload(types::I64, host, 24),
+            ))
+        } else {
+            None
+        };
         let half0 = self.iconst(0);
         self.call_helper(self.helpers.vpmadd_mem, &[cpu, d, av, llo, lhi, ub, half0]);
-        if *bytes == 32 {
-            let hlo = self.gload(types::I64, host, 16);
-            let hhi = self.gload(types::I64, host, 24);
+        if let Some((hlo, hhi)) = high {
             let half1 = self.iconst(1);
             self.call_helper(self.helpers.vpmadd_mem, &[cpu, d, av, hlo, hhi, ub, half1]);
         }

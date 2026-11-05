@@ -189,6 +189,13 @@ fn counter_code(iters: u64) -> Vec<u8> {
 
 #[test]
 fn cmpxchg16b_mixed_tier_contention() {
+    paired_contention(false);
+}
+#[test]
+fn cmpxchg16b_routed_mixed_tier_contention() {
+    paired_contention(true);
+}
+fn paired_contention(routed: bool) {
     use std::sync::{Arc, Barrier};
     use x86jit_core::{CachedBlock, MemConsistency, StepResult};
     // SDM Vol 3A §11.1.2, Bus Locking: locked instructions
@@ -200,6 +207,7 @@ fn cmpxchg16b_mixed_tier_contention() {
     ] {
         const ITERS: u64 = 4000;
         let mut vm = vm(Box::new(JitBackend::new()), true, true);
+        vm.mem.set_host_fault_recovery(routed);
         vm.consistency = consistency;
         vm.write_bytes(0x1000, &counter_code(ITERS)).unwrap();
         let initial = (3u128 << 64) | (u64::MAX - 100) as u128;

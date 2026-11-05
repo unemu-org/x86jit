@@ -759,7 +759,16 @@ Walks the list of `IrOp` in a loop and executes each operation with native Rust 
 Memory-access contract (used by both backends in the interpreter version and by the trap-out):
 
 ```rust
-pub enum MemTrap { Unmapped, Mmio }
+#[non_exhaustive]
+pub enum MemTrap { Unmapped, HostFault, Mmio }
+
+impl MemTrap {
+    // HostFault carries no payload, so MemTrap and Result<(), MemTrap> stay one
+    // byte on the hot path. The faulting byte's address lives in the accessing
+    // thread's return slot: call this on that thread, before its next failing
+    // routed access. Other variants return `transfer` unchanged.
+    pub fn fault_addr(self, transfer: u64) -> u64;
+}
 
 impl Memory {
     // Both take &self — guest RAM is interior-mutable (see §8 pitfall). `write`
@@ -767,12 +776,63 @@ impl Memory {
     pub fn read(&self,  addr: u64, size: u8) -> Result<u64, MemTrap>;
     pub fn write(&self, addr: u64, val: u64, size: u8) -> Result<(), MemTrap>;
 
-    // The lift (§7.3) decodes from a byte SLICE, not scalar reads — iced needs
-    // contiguous bytes. Returns up to `max_len` bytes from `addr`. Flat: a
-    // subslice; SoftMmu: capped at the page boundary (don't cross pages silently).
-    pub fn code_slice(&self, addr: u64, max_len: usize) -> Result<&[u8], MemTrap>;
+    // Opt-in host-fault recovery for Rust guest accesses (decision-13). Default off.
+    pub fn set_host_fault_recovery(&mut self, enabled: bool);
+    pub fn host_fault_recovery(&self) -> bool;
+
+    // An owned snapshot of up to `max_len` bytes from `addr`, never a borrowed
+    // view of live guest memory: a concurrent guest store into a slice iced is
+    // reading would be a data race. A readable prefix is returned when a later
+    // byte is unavailable. The lift (§7.3) does not call this: it decodes from
+    // its own private buffer, filled on demand (see below).
+    pub fn code_slice(&self, addr: u64, max_len: usize) -> Result<Vec<u8>, MemTrap>;
 }
 ```
+
+**Host faults inside Rust accesses.** By default the interpreter, the Rust helpers
+that compiled code calls (string, x87, FXSAVE/FXRSTOR, masked and narrowing
+stores, paired CAS) and the lifter's fetch access guest RAM directly. They check
+the region table, not host protections, so **registered RAM must stay
+host-accessible** to them. Compiled code is different: its host faults recover in
+both modes through the signal-context landing stub (decision-13).
+
+An embedder that owns host protections calls `set_host_fault_recovery(true)` before
+execution. Examples: PROT_NONE stack guards, write-protected pages for a GC barrier,
+`mprotect` from other threads. The setting routes every Rust guest access through
+small fault-fixup routines (`usercopy`), one per operation and host (x86-64,
+AArch64), listed in an immutable fixup table:
+- probes;
+- word-wise copies with byte retry;
+- single-copy-atomic 1/2/4/8-byte loads and stores;
+- CAS and paired CAS.
+
+The embedder's handler calls the same `jit_abi::fault::classify`. A PC inside a
+routine is OURS for an access fault even with no active vcpu run. The context is
+rewritten to the routine's fixup, which returns the faulting byte's address to
+its Rust caller as an ordinary return value. Nothing unwinds, every `Drop` runs,
+and the access becomes the resumable `Exit::UnmappedMemory` the interpreter
+gives for an unmapped page. The interpreter picks the access path once per run
+(const-generic), so the default path carries no per-access branch.
+
+Routed writes probe each touched host page before committing (one atomic
+same-value byte write per page). Under protections that stay stable, a faulting
+instruction therefore commits nothing. Known limits, recorded in decision-13:
+- protections revoked concurrently by another thread need the embedder's
+  serialisation;
+- routed REP MOVS/STOS keeps completed iterations and runs per element;
+- compiled stores the host splits can commit their completed parts (xj-obx.8).
+
+The opt-in exists because routing costs. Measured on AArch64 against no routing:
+interpreter memcpy +4.6%, routed FXSAVE/x87/REP helper loops +20–140%. The
+default path adds no per-access work. Against the version before recovery
+existed it measures between −20% and +3% by workload median; the differences
+are code layout. Decision-13 holds the tables.
+
+**Fetch.** The lifter always decodes a private copy. The first chunk is at most 128
+bytes, bounded by the host page and the guest region. Later chunks are copied
+only when the decoder asks for more bytes. A single step needs at most 15 bytes.
+A fetch fault is reported at the first unreadable byte, and the valid prefix
+still lifts. No lock is held across the copy.
 
 ```rust
 // `cur_addr` tracks the current guest instruction so a trap can set RIP to it.
@@ -788,10 +848,13 @@ IrOp::Add { dst, a, b, size, set_flags } => {
 IrOp::Store { addr, src, size, .. } => {
     // On a trap, RIP = the faulting instruction (cur_addr, from InsnStart) — NOT
     // block.guest_start + guest_len (that's the block end). Retry re-executes it.
-    match mem.write(read_val(addr, &temps), read_val(src, &temps), *size) {
+    // A HostFault's address is the faulting byte: read it on this thread, at once.
+    let a = read_val(addr, &temps);
+    match mem.write(a, read_val(src, &temps), *size) {
         Ok(())            => {}
-        Err(MemTrap::Unmapped) => { cpu.rip = cur_addr; return StepResult::Exit(Exit::UnmappedMemory { .. }); }
-        Err(MemTrap::Mmio)     => { cpu.rip = cur_addr; return StepResult::Exit(Exit::MmioWrite { .. }); }
+        Err(MemTrap::Mmio) => { cpu.rip = cur_addr; return StepResult::Exit(Exit::MmioWrite { .. }); }
+        Err(t)            => { cpu.rip = cur_addr; let addr = t.fault_addr(a);
+                               return StepResult::Exit(Exit::UnmappedMemory { addr, .. }); }
     }
 }
 IrOp::Jump { target } => {

@@ -33,18 +33,97 @@ pub trait FpMem {
     fn load(&self, addr: u64, buf: &mut [u8]) -> bool;
     /// Write `bytes` to guest memory (recording SMC); `false` on a fault.
     fn store(&self, addr: u64, bytes: &[u8]) -> bool;
+    fn fault_addr(&self, addr: u64) -> u64 {
+        addr
+    }
+    fn host_fault_recovery(&self) -> bool {
+        false
+    }
+    /// Checked form retaining an exact host-protection fault address.
+    fn load_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.load(addr, buf).then_some(()).ok_or(addr)
+    }
+    fn store_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.store(addr, bytes).then_some(()).ok_or(addr)
+    }
 }
 
 impl FpMem for crate::memory::Memory {
+    fn fault_addr(&self, addr: u64) -> u64 {
+        if self.host_fault_recovery() {
+            crate::memory::MemTrap::HostFault.fault_addr(addr)
+        } else {
+            addr
+        }
+    }
+    fn host_fault_recovery(&self) -> bool {
+        self.host_fault_recovery()
+    }
+
+    fn load_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.read_ram_checked(addr, buf)
+    }
+    fn store_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.write_ram_checked(addr, bytes)
+    }
+
     fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
-        self.read_ram_guest(addr, buf)
+        self.read_ram_checked(addr, buf)
+            .map_err(|at| {
+                if self.host_fault_recovery() {
+                    crate::memory::record_host_fault(at);
+                }
+            })
+            .is_ok()
     }
     fn store(&self, addr: u64, bytes: &[u8]) -> bool {
-        self.write_ram_guest(addr, bytes)
+        self.write_ram_checked(addr, bytes)
+            .map_err(|at| {
+                if self.host_fault_recovery() {
+                    crate::memory::record_host_fault(at);
+                }
+            })
+            .is_ok()
     }
 }
 
-/// Bounds-only raw guest view for the JIT x87/fxstate helpers (deferred JIT SMC).
+impl<const ROUTED: bool> FpMem for crate::memory::Access<ROUTED> {
+    #[inline(always)]
+    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.0
+            .read_ram_checked_mode::<ROUTED>(addr, buf)
+            .map_err(|at| {
+                if ROUTED {
+                    crate::memory::record_host_fault(at);
+                }
+            })
+            .is_ok()
+    }
+    #[inline(always)]
+    fn store(&self, addr: u64, buf: &[u8]) -> bool {
+        self.0
+            .write_ram_checked_mode::<ROUTED>(addr, buf)
+            .map_err(|at| {
+                if ROUTED {
+                    crate::memory::record_host_fault(at);
+                }
+            })
+            .is_ok()
+    }
+    fn fault_addr(&self, addr: u64) -> u64 {
+        if ROUTED {
+            crate::memory::MemTrap::HostFault.fault_addr(addr)
+        } else {
+            addr
+        }
+    }
+    fn host_fault_recovery(&self) -> bool {
+        ROUTED
+    }
+}
+
+/// Raw guest view for JIT x87/fxstate helpers: bounds plus optional host fixups
+/// (deferred JIT SMC).
 /// `base` is the host address of guest `guest_base`; `size` is the exclusive top guest
 /// address. A guest address `a` reads/writes `base + (a - guest_base)`, valid iff
 /// `guest_base <= a` and `a + len <= size` (see [`crate::interp::RawStrMem`]).
@@ -52,6 +131,8 @@ pub struct RawFpMem {
     pub base: *mut u8,
     pub size: u64,
     pub guest_base: u64,
+    /// Enable fixups when host protections are independently owned by the embedder.
+    pub recover_host_faults: bool,
 }
 
 impl RawFpMem {
@@ -67,26 +148,162 @@ impl RawFpMem {
 }
 
 impl FpMem for RawFpMem {
-    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
-        let Some(off) = self.off(addr, buf.len()) else {
-            return false;
-        };
-        // SAFETY: bounds-checked into `[guest_base, size)`; `base` is guest `guest_base`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.base.add(off), buf.as_mut_ptr(), buf.len());
+    fn host_fault_recovery(&self) -> bool {
+        self.recover_host_faults
+    }
+    fn fault_addr(&self, addr: u64) -> u64 {
+        if self.recover_host_faults {
+            crate::memory::MemTrap::HostFault.fault_addr(addr)
+        } else {
+            addr
         }
-        true
+    }
+
+    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.load_checked(addr, buf).is_ok()
     }
     fn store(&self, addr: u64, bytes: &[u8]) -> bool {
-        let Some(off) = self.off(addr, bytes.len()) else {
-            return false;
-        };
-        // SAFETY: bounds-checked into `[guest_base, size)`; `base` is guest `guest_base`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len());
-        }
-        true
+        self.store_checked(addr, bytes).is_ok()
     }
+    fn load_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        if self.recover_host_faults {
+            self.load_mode::<true>(addr, buf)
+        } else {
+            self.load_mode::<false>(addr, buf)
+        }
+    }
+    fn store_checked(&self, addr: u64, buf: &[u8]) -> Result<(), u64> {
+        if self.recover_host_faults {
+            self.store_mode::<true>(addr, buf)
+        } else {
+            self.store_mode::<false>(addr, buf)
+        }
+    }
+}
+impl RawFpMem {
+    #[inline(always)]
+    fn load_mode<const ROUTED: bool>(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        let off = self.off(addr, buf.len()).ok_or_else(|| {
+            if ROUTED {
+                crate::memory::record_host_fault(addr);
+            }
+            addr
+        })?;
+        // SAFETY: off checked the complete span; default mode requires host accessibility.
+        if !ROUTED {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.base.add(off), buf.as_mut_ptr(), buf.len())
+            };
+            return Ok(());
+        }
+        unsafe { crate::usercopy::copy_in(self.base.add(off), buf) }.map_err(|at| {
+            let addr = self.guest_base + (at - self.base as usize) as u64;
+            crate::memory::record_host_fault(addr);
+            addr
+        })
+    }
+    #[inline(always)]
+    fn store_mode<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        let off = self.off(addr, bytes.len()).ok_or_else(|| {
+            if ROUTED {
+                crate::memory::record_host_fault(addr);
+            }
+            addr
+        })?;
+        // SAFETY: off checked the complete span; default mode requires host accessibility.
+        if !ROUTED {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len())
+            };
+            return Ok(());
+        }
+        unsafe { crate::usercopy::copy_out(self.base.add(off), bytes) }.map_err(|at| {
+            let addr = self.guest_base + (at - self.base as usize) as u64;
+            crate::memory::record_host_fault(addr);
+            addr
+        })
+    }
+}
+
+// Select once per helper call so direct FXRSTOR is a visible full memcpy.
+#[repr(transparent)]
+struct FpAccess<const ROUTED: bool>(RawFpMem);
+impl<const ROUTED: bool> FpAccess<ROUTED> {
+    fn new(raw: &RawFpMem) -> &Self {
+        // SAFETY: transparent shared view, with the source borrow's lifetime.
+        unsafe { &*(raw as *const RawFpMem).cast::<Self>() }
+    }
+}
+impl<const ROUTED: bool> FpMem for FpAccess<ROUTED> {
+    #[inline(always)]
+    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.0.load_mode::<ROUTED>(addr, buf).is_ok()
+    }
+    #[inline(always)]
+    fn store(&self, addr: u64, buf: &[u8]) -> bool {
+        self.0.store_mode::<ROUTED>(addr, buf).is_ok()
+    }
+    fn host_fault_recovery(&self) -> bool {
+        ROUTED
+    }
+    fn fault_addr(&self, addr: u64) -> u64 {
+        if ROUTED {
+            crate::MemTrap::HostFault.fault_addr(addr)
+        } else {
+            addr
+        }
+    }
+}
+impl RawFpMem {
+    /// Run one FP state transfer, selecting its protection mode once on entry.
+    pub fn exec_fxstate(
+        &self,
+        cpu: &mut CpuState,
+        addr: u64,
+        restore: bool,
+    ) -> Option<(u64, bool)> {
+        if self.recover_host_faults {
+            fxstate_routed(cpu, self, addr, restore)
+        } else {
+            exec_fxstate(cpu, FpAccess::<false>::new(self), addr, restore)
+        }
+    }
+    /// Run one x87 operation, selecting its protection mode once on entry.
+    pub fn exec_x87(
+        &self,
+        cpu: &mut CpuState,
+        kind: FpuKind,
+        addr: u64,
+        sti: u8,
+    ) -> Option<(u64, bool)> {
+        if self.recover_host_faults {
+            x87_routed(cpu, self, kind, addr, sti)
+        } else {
+            exec_x87(cpu, FpAccess::<false>::new(self), kind, addr, sti)
+        }
+    }
+}
+
+#[inline(never)]
+fn x87_routed(
+    cpu: &mut CpuState,
+    raw: &RawFpMem,
+    kind: FpuKind,
+    addr: u64,
+    sti: u8,
+) -> Option<(u64, bool)> {
+    exec_x87(cpu, FpAccess::<true>::new(raw), kind, addr, sti)
+}
+
+// Keep the routed copy buffer and saved registers out of the default helper frame.
+#[inline(never)]
+fn fxstate_routed(
+    cpu: &mut CpuState,
+    raw: &RawFpMem,
+    addr: u64,
+    restore: bool,
+) -> Option<(u64, bool)> {
+    exec_fxstate(cpu, FpAccess::<true>::new(raw), addr, restore)
 }
 
 /// One x87 operation. Memory forms carry their access in `addr`/size via the op
@@ -354,7 +571,7 @@ pub fn exec_fxstate<M: FpMem>(
     if restore {
         let mut buf = [0u8; 512];
         if !mem.load(addr, &mut buf) {
-            return Some((addr, false));
+            return Some((mem.fault_addr(addr), false));
         }
         cpu.fpu_cw = normalize_cw(u16::from_le_bytes([buf[0], buf[1]]));
         let sw = u16::from_le_bytes([buf[2], buf[3]]);
@@ -396,7 +613,7 @@ pub fn exec_fxstate<M: FpMem>(
             buf[off..off + 16].copy_from_slice(&cpu.xmm[i].to_le_bytes());
         }
         if !mem.store(addr, &buf) {
-            return Some((addr, true));
+            return Some((mem.fault_addr(addr), true));
         }
     }
     None
@@ -762,13 +979,30 @@ pub fn exec_x87<M: FpMem>(
     addr: u64,
     sti: u8,
 ) -> Option<(u64, bool)> {
+    // SDM Vol 3A §7.5: a memory fault retains instruction-entry state. Operand
+    // conversion can set masked x87 status before its destination store faults.
+    let status = cpu.fpu_sw;
+    let fault = exec_x87_inner(cpu, mem, kind, addr, sti);
+    if fault.is_some() {
+        cpu.fpu_sw = status;
+    }
+    fault
+}
+
+fn exec_x87_inner<M: FpMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    kind: FpuKind,
+    addr: u64,
+    sti: u8,
+) -> Option<(u64, bool)> {
     use FpuKind::*;
     // Transcendental precision: Extended = full-80-bit F80 series, else f64.
     let ext = cpu.x87_precision == crate::state::X87Precision::Extended;
     match kind {
         FldF64 => {
             let Some(b) = read_n(mem, addr, 8) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             // #D on the LOAD, not just on later arithmetic. §4.9.1.2 says "arithmetic
             // instruction", which reads as excluding `fld` — MEASURED otherwise: `fld
@@ -786,7 +1020,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FldF32 => {
             let Some(b) = read_n(mem, addr, 4) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             // #D on the conversion — see `FldF64`.
             if float_bytes_denormal(&b, 4) && raise(cpu, Exc::DE) {
@@ -797,7 +1031,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FldF80 => {
             let Some(b) = read_n(mem, addr, 10) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             // The ten bytes go into the register VERBATIM — no decode/re-encode. `fld
             // m80` is a move, not a conversion: measured against hardware, an unnormal
@@ -808,7 +1042,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FildI16 => {
             let Some(b) = read_n(mem, addr, 2) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             push(
                 cpu,
@@ -817,7 +1051,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FildI32 => {
             let Some(b) = read_n(mem, addr, 4) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             push(
                 cpu,
@@ -826,7 +1060,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FildI64 => {
             let Some(b) = read_n(mem, addr, 8) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             push(
                 cpu,
@@ -836,7 +1070,7 @@ pub fn exec_x87<M: FpMem>(
         FstpF64 | FstF64 => {
             let v = operand!(cpu, 0).to_f64();
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             if kind == FstpF64 {
                 pop(cpu);
@@ -845,7 +1079,7 @@ pub fn exec_x87<M: FpMem>(
         FstpF32 | FstF32 => {
             let v = f64::from_bits(operand!(cpu, 0).to_f64()) as f32;
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             if kind == FstpF32 {
                 pop(cpu);
@@ -875,28 +1109,28 @@ pub fn exec_x87<M: FpMem>(
                 cpu.fpr[phys]
             };
             if !mem.store(addr, &bytes) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FistpI16 => {
             let v = operand!(cpu, 0).to_i64_rc(rc(cpu)) as i16;
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FistpI32 => {
             let v = operand!(cpu, 0).to_i64_rc(rc(cpu)) as i32;
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FistpI64 => {
             let v = operand!(cpu, 0).to_i64_rc(rc(cpu));
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
@@ -905,27 +1139,27 @@ pub fn exec_x87<M: FpMem>(
         FisttpI16 => {
             let v = operand!(cpu, 0).to_i64_rc(3) as i16;
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FisttpI32 => {
             let v = operand!(cpu, 0).to_i64_rc(3) as i32;
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FisttpI64 => {
             let v = operand!(cpu, 0).to_i64_rc(3);
             if !mem.store(addr, &v.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             pop(cpu);
         }
         FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64 | FdivrMemF64 => {
             let Some(b) = read_n(mem, addr, 8) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             let m = F80::from_f64(u64::from_le_bytes(b[0..8].try_into().unwrap()));
             let a = operand!(cpu, 0);
@@ -943,7 +1177,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FaddMemF32 | FsubMemF32 | FsubrMemF32 | FmulMemF32 | FdivMemF32 | FdivrMemF32 => {
             let Some(b) = read_n(mem, addr, 4) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             let v = f32::from_le_bytes(b[0..4].try_into().unwrap());
             let m = F80::from_f64((v as f64).to_bits());
@@ -965,7 +1199,7 @@ pub fn exec_x87<M: FpMem>(
         // exact for every i16/i32 — so the only rounding happens inside `mem_arith`.
         FiaddMemI16 | FisubMemI16 | FisubrMemI16 | FimulMemI16 | FidivMemI16 | FidivrMemI16 => {
             let Some(b) = read_n(mem, addr, 2) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             let m = F80::from_i64(i16::from_le_bytes(b[0..2].try_into().unwrap()) as i64);
             let a = operand!(cpu, 0);
@@ -983,7 +1217,7 @@ pub fn exec_x87<M: FpMem>(
         }
         FiaddMemI32 | FisubMemI32 | FisubrMemI32 | FimulMemI32 | FidivMemI32 | FidivrMemI32 => {
             let Some(b) = read_n(mem, addr, 4) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             let m = F80::from_i64(i32::from_le_bytes(b[0..4].try_into().unwrap()) as i64);
             let a = operand!(cpu, 0);
@@ -1121,7 +1355,7 @@ pub fn exec_x87<M: FpMem>(
                 4
             };
             let Some(b) = read_n(mem, addr, width) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             let m = if width == 2 {
                 F80::from_i64(i16::from_le_bytes(b[0..2].try_into().unwrap()) as i64)
@@ -1154,13 +1388,13 @@ pub fn exec_x87<M: FpMem>(
         }
         Fldcw => {
             let Some(b) = read_n(mem, addr, 2) else {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             };
             cpu.fpu_cw = normalize_cw(u16::from_le_bytes([b[0], b[1]]));
         }
         Fnstcw => {
             if !mem.store(addr, &cpu.fpu_cw.to_le_bytes()) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
         }
         Fnstsw | FnstswMem => {
@@ -1170,7 +1404,7 @@ pub fn exec_x87<M: FpMem>(
             if kind == FnstswMem {
                 // `fnstsw m16`: store the 16-bit status word to memory.
                 if !mem.store(addr, &sw.to_le_bytes()) {
-                    return Some((addr, true));
+                    return Some((mem.fault_addr(addr), true));
                 }
             } else {
                 // `fnstsw ax`: write it to AX.
@@ -1179,7 +1413,7 @@ pub fn exec_x87<M: FpMem>(
         }
         Fnstenv => {
             if !mem.store(addr, &env28(cpu)) {
-                return Some((addr, true));
+                return Some((mem.fault_addr(addr), true));
             }
             // SDM: "…and then masks all floating-point exceptions" — the store is
             // followed by setting all six exception-mask bits in the control word.
@@ -1189,7 +1423,7 @@ pub fn exec_x87<M: FpMem>(
         Fldenv => {
             let mut buf = [0u8; 28];
             if !mem.load(addr, &mut buf) {
-                return Some((addr, false));
+                return Some((mem.fault_addr(addr), false));
             }
             load_env28(cpu, &buf);
         }

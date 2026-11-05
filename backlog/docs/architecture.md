@@ -43,7 +43,8 @@ that changes.
 | Module | Purpose |
 |--------|---------|
 | `state` | `Reg`, `CpuState` (`#[repr(C)]`, flat GPR file), `Flags` (§3) |
-| `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap` (§4) |
+| `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap`; opt-in host-fault recovery, owned fetch snapshots (§4, §8.1) |
+| `usercopy` | x86-64/AArch64 naked transfer routines, bounded immutable relative fixup table, scalar load/store and CAS, copy and probe operations (§8.1, decision-13) |
 | `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen` (§6) |
 | `lift` | x86 → IR: `lift_block`, operand lowering, `CpuMode` seam, `LiftError` (§7) |
 | `interp` | IR interpreter: `interpret_block` over a Vcpu-reused temps buffer, Variant-A flags, RIP-on-trap; also the shared `string_run`/`divide`/`crc32c` helpers the JIT calls (§8.1) |
@@ -75,7 +76,18 @@ signal adapter derives Access/Alignment from the OS reason (saved ESR on macOS
 AArch64), restores the outermost compiled frame and returns through a mangled
 naked landing stub. Alignment faults replay in the interpreter; run-record cleanup
 also runs on panic. AArch64 adapters copy LR, scratch and d8–d15 as well as
-preserved GPRs; nested compiled frames and Rust helpers are rejected. See
+preserved GPRs. Nested compiled frames are rejected. An immutable fixup-table
+lookup precedes run-record validation: Access faults in opted-in Rust guest
+transfers resume at the routine's error return with the address in scratch,
+without unwinding a Rust frame or needing an active vCPU. The lifter copies its
+fetch window starting with at most 128 page/region-bounded bytes, extending it
+when decoding needs more bytes, outside cache locks; the decoder sees only
+local bytes.
+A const-generic access view selects direct or routed interpreter transfers once
+per run. Protected mapped-RAM compiled faults return directly in either mode;
+compiled split stores can retain completed host transfers (xj-obx.8). Routed Rust
+masked/narrow stores preflight selected host pages; routed FX/x87/REP helper
+instances stay out of the default helper frames. See
 [decision-13](../decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md).
 
 The KVM-style split: **`Vm`** owns shared state (memory + cache); **`Vcpu`** owns per-thread `CpuState` and its own `run()` loop. Many `Vcpu`s over one `Vm` is the path to multithreading (§2, §11).
