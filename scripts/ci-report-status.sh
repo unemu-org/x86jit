@@ -17,6 +17,7 @@ set -uo pipefail
 LIMIT=12000
 PER_STEP=40
 PANICS=24
+MESSAGE=240
 
 # nextest result words for a failed test: FAIL, FAIL + LEAK, LEAK-FAIL, TIMEOUT,
 # a named signal (SIGSEGV, SIGKILL, …) or ABORT / ABORT SIG <n>. Lines look like
@@ -58,11 +59,18 @@ case "${JOB_STATUS:-failure}" in
 … $((count - PER_STEP)) more"
         [ -n "$detail" ] || detail="(empty log)"
         # The first panic messages: the line after each "panicked at <file:line:col>:",
-        # which is where an assertion puts its values.
-        # One line per distinct message, with the first test that raised it.
-        panics=$(grep -A1 -E 'panicked at .*:[0-9]+:[0-9]+:$' "$log" \
+        # plus an assertion's "left:" and "right:" lines, which carry its values.
+        # One line per distinct message, with the first test that raised it. Each
+        # line is cut, so that a long context string cannot hide the values.
+        panics=$(grep -A3 -E 'panicked at .*:[0-9]+:[0-9]+:$' "$log" \
           | grep -vE '^--$' | sed -E 's/^\s+//' \
-          | awk '/panicked at/ { where = $2; next } !seen[$0]++ { print where ": " $0 }' \
+          | awk -v cut="$MESSAGE" '
+              function flush() { if (state && !seen[msg]++) print where ": " msg; state = 0 }
+              /panicked at/ { flush(); where = $2; state = 1; next }
+              state == 1 { msg = substr($0, 1, cut); state = 2; next }
+              state == 2 && /^(left|right):/ { msg = msg " | " substr($0, 1, cut); next }
+              { flush() }
+              END { flush() }' \
           | head -n "$PANICS")
         [ -z "$panics" ] || detail="$detail
 panics:
