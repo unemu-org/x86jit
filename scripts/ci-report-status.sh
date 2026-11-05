@@ -14,9 +14,9 @@
 set -uo pipefail
 
 # The forge stores the description as text; keep it bounded anyway.
-LIMIT=6000
-PER_STEP=15
-PANICS=16
+LIMIT=12000
+PER_STEP=40
+PANICS=24
 
 # nextest result words for a failed test: FAIL, FAIL + LEAK, LEAK-FAIL, TIMEOUT,
 # a named signal (SIGSEGV, SIGKILL, …) or ABORT / ABORT SIG <n>. Lines look like
@@ -59,8 +59,11 @@ case "${JOB_STATUS:-failure}" in
         [ -n "$detail" ] || detail="(empty log)"
         # The first panic messages: the line after each "panicked at <file:line:col>:",
         # which is where an assertion puts its values.
+        # One line per distinct message, with the first test that raised it.
         panics=$(grep -A1 -E 'panicked at .*:[0-9]+:[0-9]+:$' "$log" \
-          | grep -vE '^--$' | sed -E 's/^\s+//' | head -n "$PANICS")
+          | grep -vE '^--$' | sed -E 's/^\s+//' \
+          | awk '/panicked at/ { where = $2; next } !seen[$0]++ { print where ": " $0 }' \
+          | head -n "$PANICS")
         [ -z "$panics" ] || detail="$detail
 panics:
 $panics"
