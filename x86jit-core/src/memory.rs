@@ -1647,8 +1647,10 @@ impl Memory {
     }
 
     /// Atomic read-modify-write on a mapped RAM location (§8.2.3, §11). Returns the
-    /// prior value (size-masked). Sequentially consistent — a locked op is a full
-    /// sync point. A naturally-aligned access uses a real host atomic; a misaligned
+    /// prior value (size-masked). Uses Rust SeqCst host atomics. Full x86 locked-op
+    /// ordering (SDM Vol 3A §11.2.3.9) is not guaranteed for aarch64 LL/SC paths
+    /// without an additional full fence. A naturally-aligned access uses a real
+    /// host atomic; a misaligned
     /// one (rare; x86 permits it via a bus lock) falls back to a plain RMW — the
     /// *value* is identical, only cross-thread atomicity is lost, which aligned
     /// guest atomics never hit.

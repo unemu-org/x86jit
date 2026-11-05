@@ -63,9 +63,9 @@ pub use features::{
     GuestCpuFeatures,
 };
 pub use ir::{
-    AesOp, BitScanOp, BtOp, Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, GfniOp, HFloatOp, HIntOp,
-    IrBlock, IrOp, IrRegion, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps, RepKind, RmwOp,
-    ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
+    AesOp, BitScanOp, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
+    HFloatOp, HIntOp, IrBlock, IrOp, IrRegion, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps,
+    RepKind, RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
 pub use lift::CpuMode;
 pub use memory::{

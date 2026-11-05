@@ -10,6 +10,8 @@ mod memory;
 mod vector;
 
 #[cfg(test)]
+mod fence_tests;
+#[cfg(test)]
 mod trap_tests;
 
 use std::collections::HashMap;
@@ -29,9 +31,9 @@ use x86jit_core::jit_abi::{
 use x86jit_core::memory::CODE_PAGE_BITS;
 use x86jit_core::GuestAccessKind;
 use x86jit_core::{
-    AesOp, BitScanOp, BtOp, Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, GfniOp, HFloatOp, HIntOp,
-    IrBlock, IrOp, IrRegion, MemConsistency, PackedBinOp, PackedCvtKind, Reg, RepKind, RmwOp,
-    ShaOp, StrOp, VKLogicOp, VLogicOp, Val, VpUnaryOp, PF_SRC_ONE, PF_SRC_ZERO,
+    AesOp, BitScanOp, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
+    HFloatOp, HIntOp, IrBlock, IrOp, IrRegion, MemConsistency, PackedBinOp, PackedCvtKind, Reg,
+    RepKind, RmwOp, ShaOp, StrOp, VKLogicOp, VLogicOp, Val, VpUnaryOp, PF_SRC_ONE, PF_SRC_ZERO,
 };
 
 // Cranelift 0.115.1 src/ir/memflags.rs: trusted() promises both notrap and
@@ -264,6 +266,33 @@ pub fn translate_block(
     guest_base: u64,
     icount_on: bool,
 ) -> Box<[u64]> {
+    translate_block_for_target(
+        builder,
+        ir,
+        offsets,
+        alloc_slot,
+        helpers,
+        consistency,
+        mmio,
+        guest_base,
+        icount_on,
+        cfg!(target_arch = "aarch64"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_block_for_target(
+    builder: &mut FunctionBuilder,
+    ir: &IrBlock,
+    offsets: &CpuOffsets,
+    alloc_slot: &mut dyn FnMut() -> u64,
+    helpers: Helpers,
+    consistency: MemConsistency,
+    mmio: Option<(u64, u64)>,
+    guest_base: u64,
+    icount_on: bool,
+    aarch64: bool,
+) -> Box<[u64]> {
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
@@ -282,6 +311,7 @@ pub fn translate_block(
         alloc_slot,
         helpers,
         consistency,
+        aarch64,
         gpr_cache: [None; 16],
         gpr_vars: None,
         gpr_sync: gpr_sync::GprSync::default(),
@@ -372,6 +402,7 @@ pub fn translate_region(
         alloc_slot,
         helpers,
         consistency,
+        aarch64: cfg!(target_arch = "aarch64"),
         gpr_cache: [None; 16],
         gpr_vars: None,
         gpr_sync: gpr_sync::GprSync::default(),
@@ -515,6 +546,7 @@ struct Translator<'a, 'b> {
     /// Memory-consistency tier for ordinary guest loads/stores (§8.2.3). Only
     /// affects an ARM host; on x86 every tier emits identical (plain) code.
     consistency: MemConsistency,
+    aarch64: bool,
     /// Block-local cache of each GPR's current Cranelift value (`None` = not yet
     /// loaded). Writes are write-through (they still store to `CpuState`, so guest
     /// state is current at every trap/exit — no flush needed) *and* update the
@@ -893,6 +925,12 @@ impl Translator<'_, '_> {
                 ..
             } => self.emit_div_arm(quot, rem, hi, lo, divisor, size, signed),
             IrOp::GetCond { dst, cond, .. } => self.emit_get_cond(dst, cond),
+            IrOp::Fence { kind } => {
+                if *kind == FenceKind::Full || self.aarch64 {
+                    self.builder.ins().fence();
+                }
+                false
+            }
             IrOp::Load {
                 dst, addr, size, ..
             } => self.emit_load(dst, addr, size),
@@ -2977,10 +3015,10 @@ impl Translator<'_, '_> {
         host
     }
 
-    /// Ordinary guest-RAM load at `host` (a host pointer into guest memory),
-    /// applying the consistency tier's ordering (§8.2.3). On x86 (native TSO)
-    /// this is a plain load in every tier; on ARM, `AcqRel`/`FullTso` add an
-    /// acquire fence after the load (blocks Load→Load / Load→Store reordering).
+    /// Inline guest-RAM load at `host`, applying the JIT tier (§8.2.3).
+    /// On aarch64 AcqRel/FullTso emit LDR followed by a full DMB ISH;
+    /// Fast and x86 hosts use a plain load. Helper accesses bypass this path
+    /// and carry no tier barrier (xj-0w3.7).
     pub(crate) fn gload(&mut self, ty: Type, host: Value, off: i32) -> Value {
         self.sync_guest_fault_state();
         let v = if ty == types::I128 && cfg!(target_arch = "x86_64") {
@@ -2992,21 +3030,20 @@ impl Translator<'_, '_> {
             let flags = guest_mem_flags(GuestAccessKind::Read, ty.bytes() as u8);
             self.builder.ins().load(ty, flags, host, off)
         };
-        if cfg!(target_arch = "aarch64") && self.consistency != MemConsistency::Fast {
+        if self.aarch64 && self.consistency != MemConsistency::Fast {
             self.builder.ins().fence();
         }
         v
     }
 
-    /// Ordinary guest-RAM store of `val` at `host`, applying the tier's ordering.
-    /// `AcqRel` fences *before* the store (release — blocks Store→Store /
-    /// Load→Store, but permits the Store→Load reorder x86-TSO allows); `FullTso`
-    /// fences *after* it as well, additionally blocking Store→Load for full
-    /// sequential consistency (the over-strong "hammer"). x86 stays plain.
+    /// Inline guest-RAM store of `val` at `host`, applying the JIT tier.
+    /// On aarch64 AcqRel emits DMB ISH then STR; FullTso emits STR then
+    /// DMB ISH, with no leading fence. Fast and x86 hosts use a plain store.
+    /// Helper accesses bypass this path and carry no tier barrier (xj-0w3.7).
     pub(crate) fn gstore(&mut self, val: Value, host: Value, off: i32) {
         self.sync_guest_fault_state();
         let ty = self.builder.func.dfg.value_type(val);
-        let arm = cfg!(target_arch = "aarch64");
+        let arm = self.aarch64;
         if arm && self.consistency == MemConsistency::AcqRel {
             self.builder.ins().fence();
         }
@@ -4878,9 +4915,8 @@ fn int_ty(size: u8) -> Type {
     }
 }
 
-// Runs only on an aarch64 host: Cranelift builds just the host ISA backend, so
-// the aarch64 lowering is available for inspection only when we *are* aarch64 —
-// which is exactly the ARM CI runner this is meant to cover.
+// Native aarch64 tier regressions. The fence witnesses in `fence_tests` also
+// compile for both ISAs on every host using the dev-only cross-ISA features.
 #[cfg(all(test, target_arch = "aarch64"))]
 mod barrier_tests {
     //! Deterministic proof that the `MemConsistency` tiers actually emit the

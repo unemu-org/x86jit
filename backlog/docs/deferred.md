@@ -86,11 +86,11 @@ translation ran). What is still deferred:
   needed.
 - **Tracked in:** `TASK-330`.
 
-### Multithreading + TSO barriers
+### Leaner ARM memory barriers
 
-- **Why deferred:** first version is single-threaded. The `Vm`/`Vcpu` split and `CompiledPtr: Send + Sync` are in place so this doesn't require a rewrite (§9.1, §11).
-- **Revisit when:** M7. Needs cache synchronization + `MemConsistency` tiers (`Fast`/`AcqRel`/`FullTso`) in codegen (§8.2.3).
-- **Tracked in:** —
+- **Implemented:** shared-memory vcpus, translation-cache synchronization, explicit fences and JIT inline-access tiers (§8.2.3). AcqRel currently uses DMB ISH before stores and after loads; FullTso uses DMB ISH after each load and store, with no leading store fence.
+- **Why deferred:** STLR/LDAPR lowering, weaker load/store-only barriers and adjacent-fence merging need separate measurements and correctness evidence.
+- **Limits:** the interpreter leaves ordinary accesses Relaxed in every tier (xj-0w3.6), helper accesses bypass tier barriers (xj-0w3.7), and aarch64 LL/SC locked-op ordering remains incomplete. These are correctness gaps, not deliberate architectural deviations.
 
 ### SIMD (SSE/AVX)
 

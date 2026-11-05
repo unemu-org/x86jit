@@ -9,7 +9,7 @@ created_date: '2026-07-06 11:25'
 
 Working draft 0.4 · design document for implementation with Claude Code
 
-> **Changes 0.3 → 0.4 (implementation audit — holes that would break at build time):** IR gains flag-as-data (`GetCond`) and carry-consuming ops (`Adc`/`Sbb`) — without them `adc`/`sbb`/`setcc`/`cmovcc` cannot be lifted; `set_flags: bool` replaced by a `FlagMask` (`inc`/`dec` preserve CF; shift-by-0 leaves all flags untouched — a runtime-conditional update); added pitfall #0 **instruction atomicity** (every potential trap of an instruction must precede its first state commit, or the RIP-retry convention corrupts state — e.g. `push` moving RSP before a faulting store); `complete_mmio_read` redesigned as a **pending value consumed by the retried load** (the old "write into the temp" contradicted temps dying when a block returns, and could never work in the JIT); guest-RAM access contract switched to **interior mutability** (`&Memory` + `UnsafeCell`, manual `Sync`) — shared RAM written by multiple vcpus cannot flow through `&mut` (hits already in M1 as a borrow conflict); backend selection changed from a config enum to an **injected `Backend` trait object** (the core cannot name the downstream JIT crate — dependency direction); §8.2 gains a mandatory **memory-safety strategy for inlined access** (bounds/permission check vs guard pages) — raw `host_base+addr` without checks is host UB on any out-of-range guest address; notes added on budget-vs-block-chaining, the benign double-lift race, and same-block SMC; the native-oracle `hlt` caveat documented in testing.md (hlt is privileged); §14 gains open decisions (#DE representation, TSO tagging, breakpoint mechanism); `enforce_tso: bool` replaced by the three-tier **`MemConsistency`** knob (`Fast` bare STR/LDR · `AcqRel` STLR/LDAPR · `FullTso` STR+DMB) — a per-workload escalation ladder on weak hosts, identical code on x86 hosts, locked ops/`mfence` tier-independent, tier switch = cache flush (§4.1, §8.2.3).
+> **Changes 0.3 → 0.4 (implementation audit — holes that would break at build time):** IR gains flag-as-data (`GetCond`) and carry-consuming ops (`Adc`/`Sbb`) — without them `adc`/`sbb`/`setcc`/`cmovcc` cannot be lifted; `set_flags: bool` replaced by a `FlagMask` (`inc`/`dec` preserve CF; shift-by-0 leaves all flags untouched — a runtime-conditional update); added pitfall #0 **instruction atomicity** (every potential trap of an instruction must precede its first state commit, or the RIP-retry convention corrupts state — e.g. `push` moving RSP before a faulting store); `complete_mmio_read` redesigned as a **pending value consumed by the retried load** (the old "write into the temp" contradicted temps dying when a block returns, and could never work in the JIT); guest-RAM access contract switched to **interior mutability** (`&Memory` + `UnsafeCell`, manual `Sync`) — shared RAM written by multiple vcpus cannot flow through `&mut` (hits already in M1 as a borrow conflict); backend selection changed from a config enum to an **injected `Backend` trait object** (the core cannot name the downstream JIT crate — dependency direction); §8.2 gains a mandatory **memory-safety strategy for inlined access** (bounds/permission check vs guard pages) — raw `host_base+addr` without checks is host UB on any out-of-range guest address; notes added on budget-vs-block-chaining, the benign double-lift race, and same-block SMC; the native-oracle `hlt` caveat documented in testing.md (hlt is privileged); §14 gains open decisions (#DE representation, TSO tagging, breakpoint mechanism); `enforce_tso: bool` replaced by the three-tier **`MemConsistency`** knob (`Fast` bare STR/LDR · `AcqRel` DMB-before-store/after-load · `FullTso` STR+DMB) — a per-workload escalation ladder on weak hosts, identical code on x86 hosts, locked ops/`mfence` tier-independent, tier switch = cache flush (§4.1, §8.2.3).
 >
 > <details><summary>Changes 0.2 → 0.3 (structural review — minimizing surprises)</summary>
 >
@@ -208,12 +208,11 @@ pub enum MemConsistency {
     /// synchronize through memory: single-threaded guests, or multithreaded ones
     /// whose threads don't communicate via shared structures.
     Fast,
-    /// Stores → STLR, loads → LDAPR (RCpc, ARMv8.3; LDAR fallback pre-8.3).
-    /// The standard x86-TSO mapping — covers ~99% of correct multithreaded code.
-    /// Residual gap around store-load ordering in practice (see §8.2.3).
+    /// JIT inline stores: DMB ISH; STR. Inline loads: LDR; DMB ISH.
+    /// Helpers bypass the tier (xj-0w3.7); the interpreter ignores it (xj-0w3.6).
     AcqRel,
-    /// Full fences: STR+DMB ISH / LDR+DMB ISHLD. Slowest; restores the store-load
-    /// ordering AcqRel can miss. The hammer for workloads that still misbehave.
+    /// JIT inline stores: STR; DMB ISH. Inline loads: LDR; DMB ISH.
+    /// No leading store fence. Helpers and interpretation bypass the tier.
     FullTso,
 }
 
@@ -507,6 +506,7 @@ pub enum IrOp {
     // --- memory ---
     Load  { dst: Temp, addr: Val, size: u8 },
     Store { addr: Val, src: Val, size: u8, order: MemOrder },
+    Fence { kind: FenceKind },
 
     // --- control: EACH of these operations ENDS the block ---
     // Note: for jmp/jcc to a constant target, addresses are KNOWN statically at
@@ -519,7 +519,8 @@ pub enum IrOp {
     Hlt,
 }
 
-pub enum MemOrder { None, Release, Acquire }  // for TSO barriers
+pub enum MemOrder { None }  // ordinary accesses use the Vm consistency tier
+pub enum FenceKind { Full, Load, Store }  // IrOp::Fence carries explicit guest fences
 
 // NOTE — ReadReg(Rip) is forbidden in the IR: cpu.rip is updated only at block
 // end, so a mid-block read would see a stale value. Everything that "reads RIP"
@@ -929,19 +930,21 @@ IrOp::ReadReg { dst, reg } => {
 >
 > Corollary: in `Flat`, guest address `0` is a valid buffer offset, so a guest null-deref does **not** fault unless a per-page permission bit says "unmapped". If you want faithful `#GP`/`#PF` on null, you need that bitmap — the "one addition" hot path silently assumed checks that must actually exist.
 
-**Memory-consistency tiers (`MemConsistency`, §4.1):** the guest assumes x86-TSO; a weak host (ARM) doesn't give it. Three tiers trade speed for strictness — how ordinary guest loads/stores are emitted on an ARM host:
+**Memory-consistency tiers (`MemConsistency`, §4.1):** these policies govern **JIT inline** guest loads/stores on aarch64 hosts:
 
-| Tier | Ordinary store | Ordinary load | Speed | Correct for |
-|------|---------------|---------------|-------|-------------|
-| `Fast` | `STR` | `LDR` | fastest | code that never synchronizes through memory: single-threaded guests, or threads that don't share mutable structures |
-| `AcqRel` | `STLR` | `LDAPR` (RCpc, ARMv8.3 `FEAT_LRCPC`; fallback `LDAR` pre-8.3 — stronger, slightly slower) | fast | ~99% of correct multithreaded code — the standard x86-TSO mapping |
-| `FullTso` | `STR` + `DMB ISH` | `LDR` + `DMB ISHLD` | slowest | workloads that still misbehave under `AcqRel` — brute-force fences restore the store-load ordering it can miss |
+| Tier | Inline store | Inline load |
+|------|--------------|-------------|
+| `Fast` | `STR` | `LDR` |
+| `AcqRel` | `DMB ISH; STR` | `LDR; DMB ISH` |
+| `FullTso` | `STR; DMB ISH` | `LDR; DMB ISH` |
 
-On an **x86 host all three tiers emit identical code** (native TSO — barriers are free) — the knob only exists for weak hosts. Usage model is an **escalation ladder, per game/workload**: start `Fast`; a multithreaded guest glitches → `AcqRel`; still glitches → `FullTso`. This mirrors what mature translators do in the field (Box64's `STRONGMEM` levels, FEX's RCpc use).
+`FullTso` has no leading store fence. x86 hosts use plain loads/stores in every tier. A leaner STLR/LDAPR AcqRel mapping is a future optimization, not the current lowering.
 
-> **Theory vs practice on the `AcqRel` "gap".** With `LDAPR` (RCpc) the STLR/LDAPR mapping is *theoretically* the exact x86-TSO mapping — RCpc was added to ARMv8.3 precisely to permit the store→load reordering TSO allows while keeping everything else ordered. The `FullTso` tier exists because practice is messier than theory: pre-8.3 fallbacks, mixed-size accesses, unaligned/store-forwarding corner cases, and any future selective-tagging optimization all open real-world gaps. `FullTso` is over-strong (approaches sequential consistency) and slow — it's the diagnostic hammer and the last resort, not the default.
+**Coverage limits:** string operations, masked stores, x87, FXSAVE and other guest-memory helpers do not pass through `gload`/`gstore` and receive no tier barriers (xj-0w3.7). The interpreter ignores `MemConsistency` and leaves ordinary accesses Relaxed in every tier, including cold blocks before tier-up and fallback execution (xj-0w3.6). No tier currently guarantees interpreter TSO on weak hosts. The table describes inline compiled accesses, not complete guest TSO.
 
-> **What the tier does NOT govern:** locked instructions (`lock xadd`, `xchg`, `lock cmpxchg`) and explicit fences (`mfence`) always translate to real atomics / full barriers (`DMB ISH`), in **every** tier including `Fast` — they are explicit synchronization, not ordinary accesses. The tier governs ordinary loads/stores only. (`MemOrder` on an IR op is the per-op channel for these explicit cases; the tier is the blanket policy for `MemOrder::None` accesses, applied at codegen time.)
+**Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, because helper-executed accesses lack tier barriers, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
+
+**Locked operations:** atomicity is implemented on both backends in every tier. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.115.1 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
 
 > **Switching tiers = flushing the translation cache.** Barriers are baked into compiled blocks, so a block compiled under `Fast` is wrong under `FullTso`. The tier is per-`Vm` config; if you ever make it switchable at runtime, the switch must invalidate the whole cache (and it's the cheap, correct way to implement it — don't try to key the cache by tier). Decide the tagging mechanics (lift-tags vs codegen-applies-blanket) in M7 — the lift sketches emit `MemOrder::None` today on purpose, which makes codegen-applies-blanket the natural fit.
 
@@ -1051,7 +1054,7 @@ Because guest code lies in a *data* buffer (the guest may modify it), a write to
 
 **Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds the deferral below to one block, the same granularity the interpreter gets by construction. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
 
-**Cross-modifying code (another vcpu writes) is bounded by the guest's own protocol.** SDM Vol 3A §11.1.3 calls the *unsynchronized* form model-specific — real silicon may run stale bytes too, depending how far ahead of the executing processor the write landed — and defines the case that is guaranteed: the modifier stores the code then raises a flag, and the executing processor polls it, executes a serializing instruction, and only then runs the code. A guest following that is served correctly here, and `x86jit-tests/tests/cross_modifying.rs` pins it on both backends. Note what does the work: not the serializing instruction (this engine treats `cpuid` as an ordinary op) but the dirty-page chain leave above. Do **not** add a validity check at the chain transfer itself to make the unsynchronized case behave — it would put a load, a compare and a branch on the path fast dispatch exists to keep free, in exchange for a promise the architecture does not make.
+**Cross-modifying code (another vcpu writes) is bounded by the guest's own protocol.** SDM Vol 3A §11.1.3 calls the *unsynchronized* form model-specific — real silicon may run stale bytes too, depending how far ahead of the executing processor the write landed — and defines the case that is guaranteed: the modifier stores the code then raises a flag, and the executing processor polls it, executes a serializing instruction, and only then runs the code. A guest following that is served correctly here, and `x86jit-tests/tests/cross_modifying.rs` pins it on both backends. CPUID carries a full memory fence (SDM Vol 3A §11.3); the dirty-page chain leave above supplies translation invalidation, which a memory fence alone cannot provide. Do **not** add a validity check at the chain transfer itself to make the unsynchronized case behave — it would put a load, a compare and a branch on the path fast dispatch exists to keep free, in exchange for a promise the architecture does not make.
 
 > **Same-block SMC — the effect is deferred, and that's an accepted deviation.** If a block writes into *its own* page (or a page whose translation is currently executing), the running block keeps executing the *old* code to its end — the `Arc<IrBlock>`/`CompiledPtr` cloned out by the dispatcher (§9.2) keeps it alive even after the cache entry is dropped; the re-lift only takes effect on the *next* dispatch. Real x86 can observe a self-modifying store more eagerly. This deviation is standard (QEMU makes it too) and fine for the target workloads, but **write it down**: if you ever chase a bug where a program rewrites the instruction it is about to run, this is the reason. Making it faithful means bounding blocks at write-detected boundaries — a large, late refinement, not a day-one requirement.
 
@@ -1062,7 +1065,7 @@ Because guest code lies in a *data* buffer (the guest may modify it), a write to
 - **Per-vcpu:** `CpuState` (registers, flags, RIP), its own `run()` loop, its own host thread.
 - **Shared (behind an `Arc`):** guest memory and the translation cache.
 - **Cache:** translation happens once per block (whoever hits it first); synchronization via `RwLock` or a lock-free structure. Consider a per-vcpu cache for reading + a shared one for writing.
-- **Memory model:** the `MemConsistency` tier (§4.1) + barriers in codegen (§8.2.3). This is the proper solution to the problem that the guest assumes x86 TSO, while the ARM host has a weak model. Without it, multithreaded programs produce nondeterministic bugs. Escalation ladder per workload: `Fast` → `AcqRel` → `FullTso`.
+- **Memory model:** `MemConsistency` orders JIT inline accesses (§4.1, §8.2.3). Interpreter ordinary accesses remain Relaxed (xj-0w3.6), helper accesses bypass tier barriers (xj-0w3.7), and aarch64 LL/SC locked-op ordering is incomplete. Explicit fences apply on both backends.
 
 ---
 
@@ -1201,7 +1204,7 @@ One place gathering all the mines scattered across the document. Review it befor
 
 **Multithreading and memory (hits in M7, but prepare in M4):**
 - **`CompiledPtr` must be `Send + Sync`** manually, otherwise the cache won't go behind an `Arc` between threads. Make this type in M4, not in M7 (§9.1).
-- **The TSO memory model** — `MemConsistency` tiers in codegen (`Fast`/`AcqRel`/`FullTso`, §8.2.3). Without barriers, multithreaded programs produce nondeterministic bugs that aren't there single-threaded — the worst kind to chase. Escalate the tier before debugging "impossible" races. Locked ops/`mfence` get real atomics/fences in EVERY tier. Switching tiers flushes the translation cache (barriers are baked into blocks).
+- **The TSO memory model** — `MemConsistency` tiers in codegen (`Fast`/`AcqRel`/`FullTso`, §8.2.3). Without barriers, multithreaded programs produce nondeterministic bugs that aren't there single-threaded — the worst kind to chase. Escalate the tier before debugging "impossible" races. Locked ops remain atomic, with the aarch64 LL/SC ordering limitation in §8.2.3; explicit fences apply in every tier. The interpreter ignores ordinary-access tiers (xj-0w3.6), and helper accesses bypass them (xj-0w3.7). Switching tiers flushes the translation cache (barriers are baked into blocks).
 - **Ownership of code memory** — the arena lives with the `Vm`, `CompiledPtr` is a borrow; don't free it while the cache points to it (§9.1).
 
 **Guest memory model (hits in M0, then again at large addresses):**

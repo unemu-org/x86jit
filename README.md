@@ -99,8 +99,21 @@ and control flow.
 **Engine:** two interchangeable backends — a portable interpreter and a Cranelift
 JIT — over a single IR, with a translation cache, hotness-gated tier-up, superblock
 regions, and block chaining + indirect-branch caching for fast dispatch. Self-modifying
-code stays coherent, multiple guest threads share one VM, and x86-TSO memory-ordering
-is preserved on weak (ARM) hosts — all exercised on the AArch64 runner.
+code stays coherent and multiple guest threads share one VM. On weak (ARM) hosts,
+`MemConsistency` governs JIT **inline** loads/stores only: `Fast` uses bare
+LDR/STR; `AcqRel` adds DMB ISH before stores and after loads; `FullTso` adds
+DMB ISH after each load and store. Helper-executed accesses lack these tier
+barriers (xj-0w3.7). The interpreter, including cold blocks before tier-up and
+fallback execution, ignores the tier and leaves ordinary accesses Relaxed
+(xj-0w3.6); neither ordered tier currently guarantees interpreter TSO.
+
+Explicit `mfence` and the serializing instructions we lift (`cpuid` and Real16
+`iret`) execute a full host barrier on both backends in every tier. The JIT also
+emits DMB ISH for `lfence`/`sfence` in every aarch64 tier, covering helper accesses;
+they need no extra host barrier on x86-64 while guest non-temporal stores use
+ordinary host stores. Locked operations remain atomic in every tier, but full
+x86 locked-op ordering on aarch64 is not guaranteed: Cranelift's non-LSE LL/SC
+sequences have no trailing DMB, and memory `xchg` uses LL/SC even with LSE.
 
 **Performance.** Not yet optimized — expect roughly an **order of magnitude slower than
 native** for hot code (a tight scalar loop is ~20× native on the JIT; the interpreter is
@@ -155,7 +168,7 @@ interp/JIT/native timings per commit if you want real numbers.
   Existing translations remain usable. `JitBackend::set_compile_limit` can cap
   compilation attempts before host resources run out. On a weak host, interpreter
   fallback provides only the interpreter's ordering for ordinary loads/stores and
-  does not honor `MemConsistency::AcqRel` or `FullTso`. An embedder relying on either
+  does not honor `MemConsistency::AcqRel` or `FullTso` (xj-0w3.6). An embedder relying on either
   tier for a multithreaded guest should treat `CodeSpaceExhausted` as fatal.
   Other finalization/protection errors retain their diagnostic panic. Global allocator
   failure retains Rust's process-abort behavior.

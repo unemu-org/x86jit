@@ -243,22 +243,27 @@ impl Backend for InterpreterBackend {
     }
 }
 
-/// Memory-consistency tier for generated code on weak hosts (§4.1, §8.2.3).
-/// Escalation ladder per workload: `Fast` → `AcqRel` → `FullTso`. On an x86 host
-/// all tiers emit identical code (native TSO). Governs ORDINARY loads/stores only —
-/// locked ops (`lock`, `xchg`) and `mfence` get real atomics/fences in every tier.
-/// Distinct from `MemoryModel` (address-space layout): this is ordering.
-/// Baked into compiled blocks — changing it requires flushing the translation cache.
+/// Memory-consistency tier for JIT inline loads/stores on weak hosts (§8.2.3).
+/// aarch64 Fast uses LDR/STR; AcqRel places DMB ISH before stores and after
+/// loads; FullTso places DMB ISH after each store and load. x86 stays plain.
+/// Helper-executed accesses bypass those tier barriers (xj-0w3.7). The
+/// interpreter ignores the tier and leaves ordinary accesses Relaxed (xj-0w3.6).
+/// Explicit MFENCE is a full barrier in every tier, host and backend; the JIT
+/// emits LFENCE/SFENCE barriers in every aarch64 tier to cover helpers too.
+/// Locked operations are atomic in every tier, but aarch64 LL/SC paths lack
+/// full x86 locked-op ordering, including XCHG even on LSE-capable hosts.
+/// Distinct from `MemoryModel` (address-space layout). Baked into compiled
+/// blocks: changing it requires flushing the translation cache.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemConsistency {
     /// Bare STR/LDR, no barriers. Fastest. Correct only for code that doesn't
     /// synchronize through memory (single-threaded, or non-communicating threads).
     Fast,
-    /// STLR / LDAPR (RCpc, ARMv8.3; LDAR fallback). The standard x86-TSO mapping;
-    /// covers ~99% of correct multithreaded code (§8.2.3 theory-vs-practice note).
+    /// JIT inline stores: DMB ISH; STR. Inline loads: LDR; DMB ISH.
+    /// Helper and interpreter accesses do not follow the tier yet.
     AcqRel,
-    /// STR+DMB ISH / LDR+DMB ISHLD. Slowest; restores store-load ordering AcqRel
-    /// can miss in practice. The hammer for workloads that still misbehave.
+    /// JIT inline stores: STR; DMB ISH. Inline loads: LDR; DMB ISH.
+    /// No leading store fence. Helper and interpreter accesses bypass the tier.
     FullTso,
 }
 

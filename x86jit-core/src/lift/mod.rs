@@ -10,9 +10,9 @@ use iced_x86::{
 };
 
 use crate::ir::{
-    AesOp, BcdKind, BtOp, Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, GfniOp, HFloatOp, HIntOp,
-    IrBlock, IrOp, IrRegion, LoopKind, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps, RepKind,
-    RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
+    AesOp, BcdKind, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
+    HFloatOp, HIntOp, IrBlock, IrOp, IrRegion, LoopKind, MemOrder, PackedBinOp, PackedCvtKind,
+    RegionCaps, RepKind, RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
 use crate::jit_abi::MAX_GUEST_ACCESS_DESCRIPTORS;
 use crate::memory::Memory;
@@ -577,6 +577,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Jump { .. }
             | Branch { .. }
             | Syscall { .. }
+            | Fence { .. }
             | Hlt
             | Trap { .. }
             | PortIo { .. } => 0,
@@ -1621,6 +1622,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | Call { .. }
         | Ret { .. }
         | Syscall { .. }
+        | Fence { .. }
         | Hlt
         | Trap { .. } => 0,
     }
@@ -1792,9 +1794,11 @@ pub(crate) fn lift_insn(
             lift_mov_sreg_real16(insn, ops, tg)
         }
 
-        // `movnti` is a non-temporal GPR→mem store; the cache-bypass hint has no
-        // architectural effect in our coherent single-buffer model, so it lowers to a
-        // plain sized store, identical to `mov [mem], reg`.
+        // SDM Vol 3A §11.2.2, §11.2.5: MOVNTI stores can need SFENCE.
+        // We lower MOVNTI to an ordinary store. SFENCE still emits a full JIT
+        // barrier in every aarch64 tier, since preceding helper stores have no
+        // tier barrier (xj-0w3.7); it is a no-op for ordinary stores on x86.
+        // Host non-temporal lowering would require a real SFENCE on x86 too.
         Mov | Movnti => {
             let src = lower_read(insn, 1, ops, tg)?;
             let dst = lower_write_target(insn, 0, ops, tg)?;
@@ -1898,6 +1902,10 @@ pub(crate) fn lift_insn(
         Cmpxchg => lift_cmpxchg(insn, ops, tg).map(|_| false),
         Cmpxchg8b | Cmpxchg16b => lift_cmpxchg_pair(insn, ops, tg).map(|_| false),
         Cpuid => {
+            // SDM Vol 3A §11.3: serializing instructions drain prior writes.
+            ops.push(IrOp::Fence {
+                kind: FenceKind::Full,
+            });
             ops.push(IrOp::Cpuid);
             Ok(false)
         }
@@ -2000,8 +2008,27 @@ pub(crate) fn lift_insn(
             });
             Ok(false)
         }
-        // Fences: single-threaded ordering is already TSO; no-op (§8.2.3).
-        Mfence | Lfence | Sfence => Ok(false),
+        // SDM Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE; Vol 3A §11.2.2:
+        // MFENCE is a full host/compiler barrier in every tier and on every host.
+        // LFENCE/SFENCE emit DMB ISH in EVERY aarch64 JIT tier: string ops,
+        // masked stores, x87, FXSAVE and *_mem helpers bypass gload/gstore and
+        // carry no tier barriers (the unfenced helper gap is xj-0w3.7).
+        // On x86, ordinary loads/stores already have the needed ordering, so
+        // LFENCE/SFENCE are JIT no-ops. Non-temporal guest stores currently use
+        // ordinary stores; host non-temporal stores would need SFENCE on x86 too.
+        // The interpreter uses SeqCst/Acquire/Release; its ordinary accesses
+        // ignore MemConsistency in every tier (xj-0w3.6). Guest instructions
+        // retire in order, including LFENCE's instruction-stream ordering.
+        Mfence | Lfence | Sfence => {
+            let kind = match insn.mnemonic() {
+                Mfence => FenceKind::Full,
+                Lfence => FenceKind::Load,
+                Sfence => FenceKind::Store,
+                _ => unreachable!(),
+            };
+            ops.push(IrOp::Fence { kind });
+            Ok(false)
+        }
         Bt => lift_bt(insn, ops, tg, BtOp::Test).map(|_| false),
         Bts => lift_bt(insn, ops, tg, BtOp::Set).map(|_| false),
         Btr => lift_bt(insn, ops, tg, BtOp::Reset).map(|_| false),
@@ -2054,6 +2081,11 @@ pub(crate) fn lift_insn(
         // F2 0F F0) is an unaligned 128-bit load whose only difference from `movdqu` is
         // a microarchitectural hint about how the two halves may be fetched —
         // architecturally it loads the same 16 bytes (SDM Vol 2A, LDDQU).
+        // SDM Vol 3A §11.2.2, §11.2.5: MOVNTDQ/MOVNTPS/MOVNTPD stores
+        // lower to ordinary stores. SFENCE emits DMB ISH in every aarch64 tier
+        // to cover helper stores too (xj-0w3.7); host non-temporal lowering
+        // would require a real SFENCE on x86 as well. MOVNTDQA is a load
+        // (SDM Vol 2B §4.3 MOVNTDQA), not one of these stores.
         Movdqa | Movdqu | Lddqu | Movaps | Movups | Movapd | Movupd | Movntdq | Movntps
         | Movntpd | Movntdqa => lift_vmov(insn, ops, tg, 16).map(|_| false),
         Movq => lift_vmov(insn, ops, tg, 8).map(|_| false),
@@ -2341,6 +2373,11 @@ pub(crate) fn lift_insn(
         // (`vmovntdqa`, [mem] -> xmm, with VEX.128 upper-zeroing) lower exactly like the
         // aligned `vmovdqa`/`vmovaps` path. libc's memmove emits `vmovntdq [rdi], xmm0`.
         // SDM Vol 2A, LDDQU: VLDDQU loads unaligned m128/m256 like VMOVDQU.
+        // The MOVNTDQ/MOVNTPS/MOVNTPD store rule also applies to their VEX
+        // forms: ordinary stores today, SFENCE in every aarch64 tier because
+        // helpers lack tier barriers (xj-0w3.7), and a real SFENCE on x86 if
+        // host non-temporal stores are introduced (SDM Vol 3A §11.2.2, §11.2.5).
+        // VMOVNTDQA is a load (SDM Vol 2B §4.3 MOVNTDQA).
         Vmovdqa | Vmovdqu | Vlddqu | Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovntdq
         | Vmovntps | Vmovntpd | Vmovntdqa => lift_vmov_avx(insn, ops, tg, 4).map(|_| false),
         // EVEX data movement. The element suffix is the write-mask granularity:
@@ -3610,6 +3647,10 @@ pub(crate) fn lift_insn(
             Ok(false)
         }
         Iret if mode.wraps_16() => {
+            // SDM Vol 3A §11.3: IRET is serializing, including in real mode.
+            ops.push(IrOp::Fence {
+                kind: FenceKind::Full,
+            });
             ops.push(IrOp::IretReal);
             Ok(true)
         }

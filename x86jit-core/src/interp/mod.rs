@@ -10,8 +10,8 @@ use crate::exit::{AccessKind, Exit, PortDir, StepResult};
 use std::cmp::Ordering;
 
 use crate::ir::{
-    Cond, FPrec, FlagMask, FloatBinOp, FloatUnOp, HFloatOp, HIntOp, IrBlock, IrOp, PackedBinOp,
-    RepKind, StrOp, VLogicOp, Val,
+    Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, HFloatOp, HIntOp, IrBlock, IrOp,
+    PackedBinOp, RepKind, StrOp, VLogicOp, Val,
 };
 use crate::memory::{Access, MemTrap, Memory};
 use crate::state::{CpuState, Flags, Reg};
@@ -451,6 +451,25 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool>(
                 if let Some(r) = exec_get_cond(cpu, temps, dst, cond) {
                     return r;
                 }
+            }
+            IrOp::Fence { kind } => {
+                use std::sync::atomic::{fence, Ordering};
+                let order = match kind {
+                    FenceKind::Full => Ordering::SeqCst,
+                    FenceKind::Load => Ordering::Acquire,
+                    FenceKind::Store => Ordering::Release,
+                };
+                fence(order);
+                #[cfg(test)]
+                FENCE_ORDERS.with(|orders| {
+                    let mut values = orders.get();
+                    values[match kind {
+                        FenceKind::Full => 0,
+                        FenceKind::Load => 1,
+                        FenceKind::Store => 2,
+                    }] = Some(order);
+                    orders.set(values);
+                });
             }
             IrOp::Load { dst, addr, size } => {
                 if let Some(r) = exec_load(cpu, mem, temps, *cur_addr, dst, addr, size) {
@@ -8626,6 +8645,104 @@ mod store_preflight_tests {
             )
             .unwrap();
             assert_eq!(probes, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // Distinguish IRET completion from its lifted Full pre-fence.
+    static FENCE_ORDERS: std::cell::Cell<[Option<std::sync::atomic::Ordering>; 4]> = const { std::cell::Cell::new([None; 4]) };
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::FENCE_ORDERS;
+    use crate::{Exit, Prot, Reg, RegionKind, Vm, VmConfig};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn iret_completion_fence_follows_successful_stack_reads() {
+        use super::{control::exec_iret_real, Access, CpuState};
+        use crate::{Memory, MemoryModel, StepResult};
+
+        fn check<const ROUTED: bool>() {
+            // SDM Vol 3A §11.3: IRET must complete its stack reads before
+            // following guest instructions execute. Failed reads do not retire it.
+            for words in 0..=3 {
+                let mut mem = Memory::new(MemoryModel::Flat { size: 0x10000 });
+                if words != 0 {
+                    mem.map(0x8000, words * 2, Prot::RW, RegionKind::Ram)
+                        .unwrap();
+                    for (index, value) in
+                        [0x2000, 0x0010, 0x0202].into_iter().take(words).enumerate()
+                    {
+                        mem.write(0x8000 + index as u64 * 2, value, 2).unwrap();
+                    }
+                }
+                let mut cpu = CpuState::default();
+                cpu.gpr[4] = 0x8000;
+                FENCE_ORDERS.with(|orders| orders.set([None; 4]));
+                let result = exec_iret_real(&mut cpu, Access::<ROUTED>::new(&mem), 0x1000);
+                if words == 3 {
+                    assert!(matches!(result, StepResult::Continue));
+                    assert_eq!(cpu.rip, 0x2000);
+                    assert_eq!(cpu.cs, 0x10);
+                    assert_eq!(cpu.gpr[4], 0x8006);
+                    assert!(cpu.flags.if_);
+                } else {
+                    assert!(matches!(result, StepResult::Exit(_)));
+                }
+                FENCE_ORDERS.with(|orders| {
+                    assert_eq!(
+                        orders.get(),
+                        [
+                            None,
+                            None,
+                            None,
+                            if words == 3 {
+                                Some(Ordering::SeqCst)
+                            } else {
+                                None
+                            },
+                        ]
+                    )
+                });
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn fence_kinds_execute_expected_host_ordering() {
+        // SDM Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE.
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(
+            0x1000,
+            &[0x0f, 0xae, 0xf0, 0x0f, 0xae, 0xe8, 0x0f, 0xae, 0xf8, 0xf4],
+        )
+        .unwrap();
+        for routed in [false, true] {
+            vm.mem.set_host_fault_recovery(routed);
+            FENCE_ORDERS.with(|c| c.set([None; 4]));
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.set_reg(Reg::Rax, 42);
+            assert!(matches!(cpu.run(&vm, Some(1)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 42);
+            FENCE_ORDERS.with(|c| {
+                assert_eq!(
+                    c.get(),
+                    [
+                        Some(Ordering::SeqCst),
+                        Some(Ordering::Acquire),
+                        Some(Ordering::Release),
+                        None,
+                    ]
+                )
+            });
         }
     }
 }

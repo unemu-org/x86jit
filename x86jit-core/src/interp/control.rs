@@ -595,6 +595,16 @@ pub(crate) fn exec_iret_real<const ROUTED: bool>(
         Ok(v) => v,
         Err(e) => return e,
     };
+    // SDM Vol 3A §11.3: the serializing instruction completes its memory
+    // transactions before the next guest instruction, including these stack reads.
+    let order = std::sync::atomic::Ordering::SeqCst;
+    std::sync::atomic::fence(order);
+    #[cfg(test)]
+    super::FENCE_ORDERS.with(|orders| {
+        let mut values = orders.get();
+        values[3] = Some(order);
+        orders.set(values);
+    });
     cpu.flags.set_flags16(flags);
     cpu.cs = cs;
     cpu.rip = ip as u64;

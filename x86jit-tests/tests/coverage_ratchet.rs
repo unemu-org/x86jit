@@ -444,11 +444,14 @@ const ALLOWLIST: &[&str] = &[
     // (jit == interp).
     "Lahf",
     "Leave",
+    // fences.rs pins lifted kinds and SB+MFENCE; codegen::fence_tests checks
+    // optimized bytes and load placement; interp::fence_tests checks host Ordering.
     "Lfence",
     "Maxpd",
     "Maxps",
     "Maxsd",
     "Maxss",
+    // See the LFENCE coverage note above.
     "Mfence",
     "Minpd",
     "Minps",
@@ -588,6 +591,7 @@ const ALLOWLIST: &[&str] = &[
     "Sal",
     // See the "Lahf" entry above — same pair, same reason.
     "Sahf",
+    // See the LFENCE coverage note above.
     "Sfence",
     "Shufpd",
     "Shufps",

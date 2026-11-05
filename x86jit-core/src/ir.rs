@@ -10,15 +10,22 @@ pub enum Val {
     Imm(u64),
 }
 
-/// Per-op memory ordering (§6.2, §8.2.3). The lift emits `None` for ordinary
-/// accesses — the blanket policy for those comes from the Vm's `MemConsistency`
-/// tier, applied at codegen time. Explicit values are for EXPLICIT guest
-/// synchronization (locked ops, `mfence` lowering), honored in every tier.
+/// JIT inline stores use the Vm's `MemConsistency` policy at codegen time.
+/// Helper accesses bypass the tier (xj-0w3.7); the interpreter ignores it for
+/// ordinary accesses (xj-0w3.6).
+/// Explicit synchronization is carried by `Fence`, `AtomicRmw` and `AtomicCas`.
 #[derive(Copy, Clone, Debug)]
 pub enum MemOrder {
     None,
-    Release,
-    Acquire,
+}
+
+/// Explicit guest memory ordering (§8.2.3).
+/// SDM Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FenceKind {
+    Full,
+    Load,
+    Store,
 }
 
 /// jcc conditions. These map to flag combinations, distinguishing signed
@@ -263,6 +270,9 @@ pub enum IrOp {
     },
 
     // --- memory ---
+    Fence {
+        kind: FenceKind,
+    },
     Load {
         dst: Temp,
         addr: Val,
@@ -364,7 +374,11 @@ pub enum IrOp {
         op: BmiOp,
     },
 
-    // --- atomics (§8.2.3, §11). Fully ordered in every consistency tier. ---
+    // --- atomics (§8.2.3, §11). Atomic in every consistency tier. ---
+    // SDM Vol 3A §11.2.3.9 requires full locked-op ordering. This remains a
+    // limitation on aarch64 LL/SC paths: Cranelift emits no trailing DMB for
+    // non-LSE RMW/CAS, and XCHG uses LL/SC even with LSE. These ops do not
+    // themselves promise that full ordering; explicit Fence is tier-independent.
     // Atomic read-modify-write: `[addr] = op([addr], src)`, `old` <- prior value.
     // Sets NO flags — the lift emits a separate ALU op on `old`/`src` (reusing the
     // materialized-flag machinery) so locked ALU ops flag exactly like their plain
