@@ -395,6 +395,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Call { .. }
             | Ret { .. } => 1,
             InsnStart { .. }
+            | CheckAlign { .. }
             | ReadReg { .. }
             | WriteReg { .. }
             | Add { .. }
@@ -688,6 +689,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
                 return Err(refill_unsupported_bytes(e, code, start));
             }
         };
+        mark_memory_accesses(&insn, mode, &mut ops[ops_start..]);
         let instruction_descriptors = guest_access_descriptors(&ops[ops_start..]);
         if icount > 0 && descriptors + instruction_descriptors > MAX_GUEST_ACCESS_DESCRIPTORS {
             ops.truncate(ops_start);
@@ -780,6 +782,7 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     });
     lift_insn(&insn, &mut ops, &mut tg, mode)
         .map_err(|e| refill_unsupported_bytes(e, code, start))?;
+    mark_memory_accesses(&insn, mode, &mut ops);
 
     Ok(IrBlock {
         guest_start: start,
@@ -1393,6 +1396,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         // non-ZF inputs across the shared helper and its fault exits.
         AtomicCasPair { .. } => FlagMask::ALL.0,
         InsnStart { .. }
+        | CheckAlign { .. }
         | ReadReg { .. }
         | WriteReg { .. }
         | Add { .. }
@@ -1980,6 +1984,7 @@ pub(crate) fn lift_insn(
         Stmxcsr | Vstmxcsr => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::Store {
+                fault: Default::default(),
                 addr,
                 src: Val::Imm(0x1F80),
                 size: 4,
@@ -1995,6 +2000,7 @@ pub(crate) fn lift_insn(
         Fxsave | Fxsave64 => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::FxState {
+                fault: Default::default(),
                 addr,
                 restore: false,
             });
@@ -2003,6 +2009,7 @@ pub(crate) fn lift_insn(
         Fxrstor | Fxrstor64 => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::FxState {
+                fault: Default::default(),
                 addr,
                 restore: true,
             });
@@ -2192,7 +2199,11 @@ pub(crate) fn lift_insn(
                 reg_xmm,
                 1,
                 |idx| ops.push(IrOp::VPshufb { dst: d, a: d, idx }),
-                |addr| ops.push(IrOp::VPshufbM { dst: d, addr })
+                |addr| ops.push(IrOp::VPshufbM {
+                    fault: Default::default(),
+                    dst: d,
+                    addr
+                })
             );
             Ok(false)
         }
@@ -2211,7 +2222,12 @@ pub(crate) fn lift_insn(
                     src,
                     imm
                 }),
-                |addr| ops.push(IrOp::VAlignrM { dst: d, addr, imm })
+                |addr| ops.push(IrOp::VAlignrM {
+                    fault: Default::default(),
+                    dst: d,
+                    addr,
+                    imm
+                })
             );
             Ok(false)
         }
@@ -2542,6 +2558,7 @@ pub(crate) fn lift_insn(
             if insn.op_kind(1) == OpKind::Memory {
                 let addr = legacy_sse_memory(insn, ops, tg)?;
                 ops.push(IrOp::VBlendWM {
+                    fault: Default::default(),
                     dst,
                     a: dst,
                     addr,
@@ -2781,7 +2798,12 @@ pub(crate) fn lift_insn(
                     reg_ymm,
                     2,
                     |idx| ops.push(IrOp::VPshufb256 { dst: d, a, idx }),
-                    |addr| ops.push(IrOp::VPshufb256M { dst: d, a, addr })
+                    |addr| ops.push(IrOp::VPshufb256M {
+                        fault: Default::default(),
+                        dst: d,
+                        a,
+                        addr
+                    })
                 );
                 return Ok(false);
             }
@@ -2804,7 +2826,11 @@ pub(crate) fn lift_insn(
                     if d != a {
                         ops.push(IrOp::VMov { dst: d, src: a });
                     }
-                    ops.push(IrOp::VPshufbM { dst: d, addr });
+                    ops.push(IrOp::VPshufbM {
+                        fault: Default::default(),
+                        dst: d,
+                        addr,
+                    });
                 }
             );
             ops.push(IrOp::VZeroUpper { reg: d }); // VEX.128 clears bits 255:128
@@ -2854,7 +2880,13 @@ pub(crate) fn lift_insn(
             let hi = insn.immediate(3) & 1 != 0;
             if insn.op_kind(2) == OpKind::Memory {
                 let addr = effective_address(insn, ops, tg)?;
-                ops.push(IrOp::VInsert128M { dst, src, addr, hi });
+                ops.push(IrOp::VInsert128M {
+                    fault: Default::default(),
+                    dst,
+                    src,
+                    addr,
+                    hi,
+                });
                 return Ok(false);
             }
             let ins = reg_xmm(insn, 2).or_unsupported(insn)?;
@@ -2923,6 +2955,7 @@ pub(crate) fn lift_insn(
                 None if insn.op_kind(1) == OpKind::Memory => {
                     let addr = effective_address(insn, ops, tg)?;
                     ops.push(IrOp::VLoadWide {
+                        fault: Default::default(),
                         dst,
                         addr,
                         bytes: 32,
@@ -2966,7 +2999,11 @@ pub(crate) fn lift_insn(
             if insn.mnemonic() == Ptest && insn.op_kind(1) == OpKind::Memory {
                 let a = reg_xmm(insn, 0).or_unsupported(insn)?;
                 let addr = legacy_sse_memory(insn, ops, tg)?;
-                ops.push(IrOp::VPtestM { a, addr });
+                ops.push(IrOp::VPtestM {
+                    fault: Default::default(),
+                    a,
+                    addr,
+                });
                 return Ok(false);
             }
             if let Some(a) = reg_ymm(insn, 0) {
@@ -3443,6 +3480,7 @@ pub(crate) fn lift_insn(
             let slot = call_ret_slot(insn, mode)?;
             let target = branch_target(insn, ops, tg, mode)?;
             ops.push(IrOp::Call {
+                fault: Default::default(),
                 target,
                 return_addr: mask_pc(insn.next_ip(), mode),
                 slot,
@@ -3460,6 +3498,7 @@ pub(crate) fn lift_insn(
                 0
             };
             ops.push(IrOp::Ret {
+                fault: Default::default(),
                 slot,
                 pop_extra,
                 wrap_sp: mode.wraps_32(),
@@ -3481,8 +3520,10 @@ pub(crate) fn lift_insn(
                 stack_slot(mode)
             };
             let rbp = read_reg(Reg::Rbp, ops, tg);
+            let rbp = stack_addr(rbp, ops, tg, mode);
             let val = tg.fresh();
             ops.push(IrOp::Load {
+                fault: Default::default(),
                 dst: val,
                 addr: rbp,
                 size: stk,
@@ -3967,7 +4008,12 @@ pub(crate) fn lower_read(
             let addr = effective_address(insn, ops, tg)?;
             let size = scalar_mem_size(insn, op_idx)?;
             let t = tg.fresh();
-            ops.push(IrOp::Load { dst: t, addr, size });
+            ops.push(IrOp::Load {
+                fault: Default::default(),
+                dst: t,
+                addr,
+                size,
+            });
             Ok(Val::Temp(t))
         }
         kind if is_immediate(kind) => Ok(Val::Imm(insn.immediate(op_idx))),
@@ -4039,7 +4085,67 @@ pub(crate) fn effective_address(
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     let addr = effective_address_no_segment(insn, ops, tg)?;
-    Ok(with_segment(insn, addr, ops, tg))
+    let addr = with_segment(insn, addr, ops, tg);
+    if let Some(bytes) = memory_alignment(insn) {
+        ops.push(IrOp::CheckAlign { addr, bytes });
+    }
+    Ok(addr)
+}
+
+fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
+    // SDM Vol 1 §3.3.7.1: CS/DS/ES/SS overrides are ignored, including
+    // ss:[rbx]. Only FS/GS replace RSP/RBP's default SS in Long64.
+    let stack = !matches!(insn.segment_prefix(), Register::FS | Register::GS)
+        && matches!(
+            insn.memory_base(),
+            Register::RSP | Register::RBP | Register::ESP | Register::EBP
+        );
+    let long64 = mode == CpuMode::Long64;
+    for op in ops {
+        let (width, ss) = match op {
+            IrOp::Store { size, .. } if insn.mnemonic() == Mnemonic::Push => {
+                (u16::from(*size), true)
+            }
+            IrOp::Load { size, .. }
+                if matches!(insn.mnemonic(), Mnemonic::Pop | Mnemonic::Leave) =>
+            {
+                (u16::from(*size), true)
+            }
+            IrOp::Call { slot, .. } | IrOp::Ret { slot, .. } => (u16::from(*slot), true),
+            IrOp::RepString { elem, .. } => (u16::from(*elem), false),
+            IrOp::FxState { .. } => (512, stack),
+            _ => (insn.memory_size().size() as u16, stack),
+        };
+        op.set_memory_access(crate::ir::MemoryAccess::new(width, long64, ss));
+    }
+}
+
+fn memory_alignment(insn: &Instruction) -> Option<u8> {
+    use iced_x86::EncodingKind;
+    use Mnemonic::*;
+    let size = insn.memory_size().size();
+    match insn.mnemonic() {
+        // SDM Vol 2A, FXSAVE/FXRSTOR, Protected Mode Exceptions: 16 bytes.
+        Fxsave | Fxsave64 | Fxrstor | Fxrstor64 => Some(16),
+        // SDM Vol 1 §§14.9/15.7, Tables 14-22/15-6: every encoding.
+        Movaps | Movapd | Movdqa | Movntps | Movntpd | Movntdq | Movntdqa | Vmovaps | Vmovapd
+        | Vmovdqa | Vmovdqa32 | Vmovdqa64 | Vmovntps | Vmovntpd | Vmovntdq | Vmovntdqa => {
+            Some(size as u8)
+        }
+        // SDM Vol 2A §2.5 (exception classes), Vol 1 §14.9: legacy m128
+        // arithmetic requires alignment, except the explicitly unaligned forms
+        // and SSE4.2 string compares (Vol 2B, PCMPxSTRx exceptions).
+        Movups | Movupd | Movdqu | Lddqu | Pcmpestri | Pcmpestrm | Pcmpestri64 | Pcmpestrm64
+        | Pcmpistri | Pcmpistrm => None,
+        _ if insn.encoding() == EncodingKind::Legacy
+            && size == 16
+            && (0..insn.op_count())
+                .any(|i| insn.op_kind(i) == OpKind::Register && insn.op_register(i).is_xmm()) =>
+        {
+            Some(16)
+        }
+        _ => None,
+    }
 }
 
 /// The address arithmetic without the segment base — for `lea`, which computes the
@@ -4244,7 +4350,7 @@ pub(crate) fn iced_segment_reg(reg: Register) -> Option<Reg> {
 /// the mode (§17.6). In Real16 the stack lives at SS: the physical address is
 /// `ss_base + (offset & 0xFFFF)` with `ss_base = SS << 4`; the caller passes an
 /// already-16-bit-wrapped offset. In Long64/Compat32 the stack is flat, so the offset
-/// *is* the address and this is a no-op — keeping their IR byte-identical.
+/// *is* the address. `mark_memory_accesses` attaches Long64 SS metadata at lift time.
 pub(crate) fn stack_addr(offset: Val, ops: &mut Vec<IrOp>, tg: &mut TempGen, mode: CpuMode) -> Val {
     if !mode.wraps_16() {
         return offset;
@@ -4288,6 +4394,7 @@ pub(crate) fn emit_write(ops: &mut Vec<IrOp>, tg: &mut TempGen, target: WriteTar
             size,
         }),
         WriteTarget::Mem { addr, size } => ops.push(IrOp::Store {
+            fault: Default::default(),
             addr,
             src: value,
             size,

@@ -480,6 +480,7 @@ pub enum NativeFault {
     DivideError,
     InvalidOpcode,
     GeneralProtection,
+    StackFault,
 }
 
 /// Capture a designated fault's full register file, with RIP at the faulting
@@ -741,6 +742,22 @@ fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<R
                 Some(ExitKind::Exception {
                     addr: cap.rip,
                     vector: 13,
+                })
+            }
+            // SDM Vol 1 §3.3.7.1; Vol 3A §7.15, Event 12: #SS(0).
+            // ASSUMED: Linux maps #GP to SIGSEGV/SI_KERNEL and #SS to
+            // SIGBUS/SI_KERNEL (BUS_ADRERR is also accepted). The pinned Linux uapi
+            // siginfo.h defines the codes, not this mapping. REG_TRAPNO and ERR=0
+            // are authoritative for the captured exception.
+            Some(NativeFault::StackFault)
+                if cap.signal == libc::SIGBUS
+                    && matches!(cap.si_code, libc::BUS_ADRERR | libc::SI_KERNEL)
+                    && cap.trapno == 12
+                    && cap.error == 0 =>
+            {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 12,
                 })
             }
             _ => None,

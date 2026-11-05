@@ -969,6 +969,28 @@ pub fn mem_write_bytes(kind: FpuKind) -> Option<usize> {
     })
 }
 
+/// Whole memory operand width for the shared x87 fault path. Register forms
+/// return zero. Widths mirror the instruction forms in exec_x87 (SDM Vol 2A,
+/// FLD/FILD/FADD/FIADD/FLDCW/FLDENV, Description and Operation).
+pub fn mem_operand_bytes(kind: FpuKind) -> u64 {
+    use FpuKind::*;
+    if let Some(bytes) = mem_write_bytes(kind) {
+        return bytes as u64;
+    }
+    match kind {
+        FldF80 => 10,
+        FldF64 | FildI64 | FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64
+        | FdivrMemF64 => 8,
+        FldF32 | FildI32 | FaddMemF32 | FsubMemF32 | FsubrMemF32 | FmulMemF32 | FdivMemF32
+        | FdivrMemF32 | FicomI32 | FicompI32 | FiaddMemI32 | FisubMemI32 | FisubrMemI32
+        | FimulMemI32 | FidivMemI32 | FidivrMemI32 => 4,
+        FildI16 | Fldcw | FicomI16 | FicompI16 | FiaddMemI16 | FisubMemI16 | FisubrMemI16
+        | FimulMemI16 | FidivMemI16 | FidivrMemI16 => 2,
+        Fldenv => 28,
+        _ => 0,
+    }
+}
+
 /// Execute one x87 op. `mem` is the guest memory (see [`FpMem`]); `addr` is the
 /// (already computed) effective address for memory forms; `sti` selects `ST(i)`
 /// for register forms. Returns `Some((addr, is_write))` on a memory fault.

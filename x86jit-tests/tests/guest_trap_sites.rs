@@ -78,8 +78,12 @@ fn input(asm: CodeAssembler, data: Vec<u8>) -> VectorInput {
 }
 
 fn matrix(input: &VectorInput, native: bool) -> RunOutcome {
+    matrix_exit(input, native, ExitKind::Hlt)
+}
+
+fn matrix_exit(input: &VectorInput, native: bool, expected: ExitKind) -> RunOutcome {
     let interp = run_with_backend(input, Box::new(InterpreterBackend));
-    assert_eq!(interp.exit, ExitKind::Hlt, "witness must complete");
+    assert_eq!(interp.exit, expected, "architectural exit");
     for target in [HostTarget::Baseline, HostTarget::Native] {
         for region in [false, true] {
             for opt in [OptLevel::None, OptLevel::Speed] {
@@ -100,8 +104,15 @@ fn matrix(input: &VectorInput, native: bool) -> RunOutcome {
     }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if native {
-        let hardware =
-            x86jit_tests::native::run_native(input).expect("native alignment witness must run");
+        let hardware = if matches!(expected, ExitKind::Exception { vector: 13, .. }) {
+            x86jit_tests::native::run_native_fault(
+                input,
+                x86jit_tests::native::NativeFault::GeneralProtection,
+            )
+        } else {
+            x86jit_tests::native::run_native(input)
+        }
+        .expect("native alignment witness must run");
         assert!(
             compare(&hardware, &interp, &[]).is_none(),
             "{:?}",
@@ -157,15 +168,29 @@ fn arithmetic(vex: bool) {
         let values = [1f32, 2., 4., 8.].map(f32::to_le_bytes).concat();
         data[offset as usize..offset as usize + 16].copy_from_slice(&values);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        let native = vex && std::is_x86_feature_detected!("avx");
+        let native = !vex || std::is_x86_feature_detected!("avx");
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
         let native = false;
-        let outcome = matrix(&input(asm, data), native);
-        let expected: [u8; 16] = [2f32, 4., 8., 16.]
-            .map(f32::to_le_bytes)
-            .concat()
-            .try_into()
-            .unwrap();
+        let input = input(asm, data);
+        let exit = if vex {
+            ExitKind::Hlt
+        } else {
+            // ADDPS is the final three-byte instruction before HLT.
+            ExitKind::Exception {
+                addr: CODE + input.mem_init[0].bytes.len() as u64 - 4,
+                vector: 13,
+            }
+        };
+        let outcome = matrix_exit(&input, native, exit);
+        let expected: [u8; 16] = if vex {
+            [2f32, 4., 8., 16.]
+        } else {
+            [1f32, 2., 4., 8.]
+        }
+        .map(f32::to_le_bytes)
+        .concat()
+        .try_into()
+        .unwrap();
         assert_eq!(outcome.cpu.xmm[0], u128::from_le_bytes(expected));
     }
 }
@@ -177,10 +202,8 @@ fn guest_trap_sites_misaligned_vex_arithmetic() {
 }
 
 #[test]
-fn guest_trap_sites_misaligned_legacy_arithmetic_avoids_host_fault() {
+fn guest_trap_sites_misaligned_legacy_arithmetic_raises_gp() {
     // SDM Vol 1 §14.9, Table 14-21 requires guest #GP(0) for legacy ADDPS.
-    // Until the guest alignment check is implemented, pin interpreter parity and
-    // absence of a host fault; the native instruction cannot be this test's oracle.
     arithmetic(false);
 }
 

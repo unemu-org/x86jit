@@ -80,7 +80,9 @@ pub struct MemCtx {
     pub fault_addr: u64,
     /// Out: access width in bytes.
     pub fault_size: u64,
-    /// Out: 0 = read, 1 = write.
+    /// Out: bit 0 = write (zero means read), bit 1 = SS reference.
+    /// Inline cold misses may encode a decoded carrier width in bits 8..23 and
+    /// the original transfer width in bits 24..31 (embedded broadcast, xj-au4.2).
     pub fault_access: u64,
     /// Out: next block entry pointer, set on `RET_CHAIN`.
     pub next_entry: u64,
@@ -179,6 +181,14 @@ pub struct MemCtx {
     /// Relaxed, generated regions use Cranelift's SeqCst atomic_load, and only the
     /// dispatcher consumes requests (Acquire). Always non-null.
     pub dispatch_word_ptr: u64,
+    /// Cold helper-only operand base. Inline generated code never touches this.
+    /// Together with helper_operand_size this preserves the whole operand while
+    /// fault_addr continues to name the exact failing byte. Consumed on exit.
+    pub helper_operand_addr: u64,
+    /// Cold helper-only whole-operand width; zero selects fault_addr/fault_size.
+    /// Appended to preserve every pre-existing compiled-code field offset.
+    /// Only helper miss paths set it; unmapped_exit consumes and clears both fields.
+    pub helper_operand_size: u64,
 }
 
 /// Number of frames in the shadow return stack ring (R5). A power of two so the
@@ -336,6 +346,8 @@ impl MemCtx {
         MemCtx {
             base: mem.host_base() as u64,
             size: mem.size(),
+            helper_operand_addr: 0,
+            helper_operand_size: 0,
             fault_addr: 0,
             fault_size: 0,
             fault_access: 0,
@@ -354,16 +366,59 @@ impl MemCtx {
         }
     }
 
-    /// Decode an `RET_UNMAPPED` fault into the matching `Exit`.
-    pub fn unmapped_exit(&self) -> Exit {
-        Exit::UnmappedMemory {
-            addr: self.fault_addr,
-            access: if self.fault_access == 0 {
+    /// Record a helper miss without losing its whole operand or failing byte.
+    #[cold]
+    pub fn record_helper_fault(
+        &mut self,
+        addr: u64,
+        size: u64,
+        write: bool,
+        base: u64,
+        width: u64,
+    ) {
+        self.fault_addr = addr;
+        self.fault_size = size.max(1);
+        self.fault_access = u64::from(write);
+        self.helper_operand_addr = base;
+        self.helper_operand_size = width;
+    }
+
+    /// Consume an RET_UNMAPPED miss. Canonicality is classified only here in
+    /// cold Rust; host faults cannot be non-canonical because spans exclude it.
+    #[cold]
+    pub fn unmapped_exit(&mut self, cpu: &CpuState, mode: crate::lift::CpuMode) -> Exit {
+        let helper_addr = std::mem::take(&mut self.helper_operand_addr);
+        let helper_size = std::mem::take(&mut self.helper_operand_size);
+        let (base, size) = if helper_size != 0 {
+            (helper_addr, helper_size)
+        } else {
+            let carrier = (self.fault_access >> 8) & 0xffff;
+            if carrier != 0 {
+                // checked_addr names the exact failing byte and remaining tail.
+                // Recover the transfer's first address before using the decoded
+                // broadcast element width (SDM Vol 2A §2.7.7; xj-au4.2).
+                let transfer = (self.fault_access >> 24) & 0xff;
+                (
+                    self.fault_addr.wrapping_sub(transfer - self.fault_size),
+                    carrier,
+                )
+            } else {
+                (self.fault_addr, self.fault_size)
+            }
+        };
+        crate::memory::unmapped_exit(
+            cpu.rip,
+            base,
+            size,
+            mode == crate::lift::CpuMode::Long64,
+            self.fault_access & 2 != 0,
+            self.fault_addr,
+            if self.fault_access & 1 == 0 {
                 AccessKind::Read
             } else {
                 AccessKind::Write
             },
-        }
+        )
     }
 }
 
@@ -405,7 +460,7 @@ pub unsafe fn run_compiled(
         RET_SYSCALL => StepResult::Exit(Exit::Syscall),
         RET_HLT => StepResult::Exit(Exit::Hlt),
         RET_INTERRUPTED => StepResult::Exit(Exit::Interrupted),
-        RET_UNMAPPED => StepResult::Exit(ctx.unmapped_exit()),
+        RET_UNMAPPED => StepResult::Exit(ctx.unmapped_exit(cpu, mode)),
         // An inlined access hit a Trap region (M4-T10): single-step the faulting
         // instruction on the interpreter, which yields the MmioRead/Write exit.
         RET_MMIO_DEFER => {
@@ -455,6 +510,78 @@ mod tests {
         assert_eq!(o.xmm, 160);
     }
 
+    /// SDM Vol 2A §2.7.7: the broadcast carrier describes one element.
+    /// The wider transfer remains tracked separately in xj-au4.2.
+    #[test]
+    fn inline_broadcast_carrier_recovers_base_from_a_failing_tail() {
+        use crate::lift::CpuMode;
+        let mem = Memory::new(crate::memory::MemoryModel::Flat { size: 4096 });
+        let mut ctx = MemCtx::for_memory(&mem);
+        let mut cpu = CpuState::new();
+        cpu.rip = 0x1000;
+        let edge = 1u64 << 47;
+        ctx.fault_addr = edge;
+        ctx.fault_size = 12;
+        ctx.fault_access = (4 << 8) | (16 << 24);
+        assert!(matches!(
+            ctx.unmapped_exit(&cpu, CpuMode::Long64),
+            Exit::UnmappedMemory {
+                addr,
+                access: AccessKind::Read
+            } if addr == edge
+        ));
+        ctx.fault_size = 14;
+        assert!(matches!(
+            ctx.unmapped_exit(&cpu, CpuMode::Long64),
+            Exit::Exception {
+                addr,
+                vector: 13
+            } if addr == cpu.rip
+        ));
+    }
+
+    #[test]
+    fn helper_operand_is_consumed_before_a_later_inline_miss() {
+        use crate::lift::CpuMode;
+        let mem = Memory::new(crate::memory::MemoryModel::Flat { size: 0x1000 });
+        let cpu = CpuState {
+            rip: 0x120,
+            ..CpuState::default()
+        };
+        let mut ctx = MemCtx::for_memory(&mem);
+        ctx.record_helper_fault(0x7fff_ffff_fff8, 8, false, 0x7fff_ffff_fff8, 16);
+        ctx.fault_access |= 2;
+        assert!(matches!(
+            ctx.unmapped_exit(&cpu, CpuMode::Long64),
+            Exit::Exception {
+                addr: 0x120,
+                vector: 12,
+                ..
+            }
+        ));
+        assert_eq!((ctx.helper_operand_addr, ctx.helper_operand_size), (0, 0));
+        ctx.fault_addr = 0xffff_8000_0000_0000;
+        ctx.fault_size = 8;
+        ctx.fault_access = 0;
+        assert!(matches!(
+            ctx.unmapped_exit(&cpu, CpuMode::Long64),
+            Exit::UnmappedMemory {
+                addr: 0xffff_8000_0000_0000,
+                access: AccessKind::Read,
+                ..
+            }
+        ));
+        ctx.record_helper_fault(0x1010, 8, true, 0x1000, 32);
+        assert!(matches!(
+            ctx.unmapped_exit(&cpu, CpuMode::Long64),
+            Exit::UnmappedMemory {
+                addr: 0x1010,
+                access: AccessKind::Write,
+                ..
+            }
+        ));
+    }
+
     /// The `MEMCTX_*` offsets are a codegen contract (the JIT bakes them). Verify
     /// them against the real `#[repr(C)]` layout so a field reorder can't silently
     /// desync the backend. `fuel` (superblocks M5-T3) must sit at 56.
@@ -465,6 +592,9 @@ mod tests {
         }));
         let base = &m as *const MemCtx as usize;
         let off = |p: *const u64| (p as usize - base) as i32;
+        assert_eq!(off(&m.helper_operand_addr), 136);
+        assert_eq!(off(&m.helper_operand_size), 144);
+        assert_eq!(std::mem::size_of::<MemCtx>(), 152);
         assert_eq!(off(&m.dispatch_word_ptr), MEMCTX_DISPATCH_WORD_PTR);
         assert_eq!(MEMCTX_DISPATCH_WORD_PTR, 128);
         assert_eq!(m.dispatch_word_ptr, &NO_DISPATCH as *const _ as u64);

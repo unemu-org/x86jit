@@ -104,7 +104,9 @@ pub(crate) fn exec_v_store_wide<const ROUTED: bool>(
     // its acknowledgements through vpart_store without consuming them in the probe.
     for offset in (0..u64::from(*bytes)).step_by(8) {
         let ea = a.wrapping_add(offset);
-        if let Err(t @ (MemTrap::Unmapped | MemTrap::HostFault)) = mem.probe_write(ea, 8) {
+        if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
+            mem.probe_write(ea, 8)
+        {
             return Some(trap_out(cpu, cur_addr, t, ea, 8, AccessKind::Write, 0));
         }
     }
@@ -889,7 +891,9 @@ pub(crate) fn exec_v_extract_lane_wide_m<const ROUTED: bool>(
     // whereas aborting would reproduce that same loop.
     for i in 0..n {
         let ea = a.wrapping_add(i as u64 * 16);
-        if let Err(t @ (MemTrap::Unmapped | MemTrap::HostFault)) = mem.probe_write(ea, 16) {
+        if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
+            mem.probe_write(ea, 16)
+        {
             return Some(trap_out(cpu, cur_addr, t, ea, 16, AccessKind::Write, 0));
         }
     }

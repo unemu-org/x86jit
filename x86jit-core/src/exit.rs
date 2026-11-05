@@ -168,15 +168,20 @@ pub enum Exit {
     /// identify that instruction; earlier instructions have completed.
     #[non_exhaustive]
     UnknownInstruction { addr: u64, bytes: [u8; 15], len: u8 },
-    /// A guest CPU exception, NOT a lift failure: `#DE` divide-by-zero, `#UD`
-    /// (`ud2` or an invalid encoding), `#BP` (`int3`), `#DB` (`int1`), etc. HLE maps these to
-    /// SIGFPE/SIGILL/SIGTRAP. `vector` = x86 exception vector (§14 open decision).
-    /// `addr` is the guest **saved RIP** — the x86 fault/trap convention: a fault
-    /// (`#DE`/`#UD`) leaves it on the faulting instruction, a trap (`#BP`/`#DB`)
-    /// resumes past it. It always equals the vcpu's RIP at exit.
-    /// Invalid opcodes produce vector 6; in Long64/Compat32, instructions exceeding
-    /// 15 bytes produce vector 13. Earlier instructions complete first
-    /// (SDM Vol 3A §7.15, Events 6 and 13; Vol 2A §2.3.11).
+    /// A guest CPU exception, distinct from a lift failure. `vector` is the x86
+    /// exception vector; the embedder decides how to deliver it.
+    /// `addr` is the guest **saved RIP**: a fault leaves it on the faulting
+    /// instruction, a trap (`#BP`/`#DB`) resumes past it. It always equals the
+    /// vcpu's RIP at exit. Earlier instructions have completed.
+    ///
+    /// Non-canonical Long64 data operands raise #GP (13), or #SS (12) for SS
+    /// references; required operand alignment raises #GP (13). Error code zero
+    /// is implied for these exits. Registers, flags and memory retain their
+    /// instruction-entry values (SDM Vol 1 §3.3.7.1; Vol 2A §2.5;
+    /// Vol 3A §7.15, Events 12/13; AMD APM Vol 2 §5.3.1).
+    /// Invalid opcodes produce #UD (6); in Long64/Compat32, instructions exceeding
+    /// 15 bytes produce #GP (13). Divide errors produce #DE (0)
+    /// (SDM Vol 3A §7.15, Events 0/6/13; Vol 2A §2.3.11).
     #[non_exhaustive]
     Exception { addr: u64, vector: u8 },
     /// Guest executed a port-I/O instruction (`in`/`out`, §5.2) — the machine

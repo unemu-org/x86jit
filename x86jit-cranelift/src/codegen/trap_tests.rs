@@ -784,11 +784,13 @@ fn guest_trap_sites_repeated_read_counts_optimized_ir() {
                 guest_addr: HIGH_BASE,
             },
             IrOp::Load {
+                fault: Default::default(),
                 dst: 0,
                 addr: Val::Imm(0x8000),
                 size: 8,
             },
             IrOp::Load {
+                fault: Default::default(),
                 dst: 1,
                 addr: Val::Imm(0x8000),
                 size: 8,
@@ -856,6 +858,7 @@ fn guest_trap_sites_lifter_capped_blocks_never_overflow() {
 fn guest_trap_sites_oversized_synthetic_ir_is_refused_without_panicking() {
     let mut block = high_block(&[0x48, 0x8b, 0x07, 0xf4]);
     let load = IrOp::Load {
+        fault: Default::default(),
         dst: 0,
         addr: Val::Imm(0x8000),
         size: 8,
@@ -885,4 +888,125 @@ fn guest_trap_sites_oversized_synthetic_ir_is_refused_without_panicking() {
             CachedBlock::Compiled { .. }
         ));
     }
+}
+
+#[test]
+fn alignment_checks_share_one_cold_exception_tail() {
+    // Eight aligned accesses must not duplicate register/flag recovery exits.
+    // Address and state semantics are pinned by address_exceptions on every tier.
+    let mut bytes = [0x0f, 0x28, 0x03, 0x0f, 0x29, 0x07].repeat(4);
+    bytes.push(0xf4);
+    for region in [false, true] {
+        for target in [HostTarget::Baseline, HostTarget::Native] {
+            for opt in [OptLevel::None, OptLevel::Speed] {
+                let (ctx, _, _) = compile_at(&bytes, region, target, opt);
+                let tails = ctx
+                    .func
+                    .layout
+                    .blocks()
+                    .flat_map(|b| ctx.func.layout.block_insts(b))
+                    .filter(|inst| {
+                        matches!(ctx.func.dfg.insts[*inst],
+                        ir::InstructionData::Store { offset, .. }
+                            if i32::from(offset) == MEMCTX_EXCEPTION_VECTOR)
+                    })
+                    .count();
+                assert_eq!(tails, 1, "region={region}: {}", ctx.func.display());
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn alignment_hot_path_has_only_mask_and_branch() {
+    // Test actual encoded instructions, including a PIE-sized RIP and a region
+    // back-edge. RIP materialisation must not sit between AND and CBNZ.
+    let cases = [
+        (false, &[0x0f, 0x28, 0x06, 0x0f, 0x29, 0x07, 0xf4][..]),
+        (
+            true,
+            &[0x0f, 0x28, 0x06, 0x0f, 0x29, 0x07, 0xff, 0xc9, 0x75, 0xf6][..],
+        ),
+    ];
+    for (region, bytes) in cases {
+        for opt in [OptLevel::None, OptLevel::Speed] {
+            let mut block = high_block(bytes);
+            for op in &mut block.ops {
+                if let IrOp::Branch {
+                    taken, fallthrough, ..
+                } = op
+                {
+                    *taken += HIGH_BASE - BASE;
+                    *fallthrough += HIGH_BASE - BASE;
+                }
+            }
+            let mut control = block.clone();
+            control
+                .ops
+                .retain(|op| !matches!(op, IrOp::CheckAlign { .. }));
+            let jit = JitBackend::build_jit(HostTarget::Native, opt);
+            let (ctx, _, _) = compile_ir_for_isa(block, bytes, region, jit.module.isa());
+            let cc = ctx.compiled_code().unwrap();
+            let words: Vec<_> = cc
+                .code_buffer()
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let mut checks = 0;
+            for pair in words.windows(2) {
+                if pair[0] & 0xffff_fc00 == 0x9240_0c00 {
+                    // AND Xd,Xn,#15.
+                    checks += 1;
+                    assert_eq!(
+                        pair[1] & 0x7f00_0000,
+                        0x3500_0000,
+                        "AND must be followed immediately by CBNZ: {:?}",
+                        cc.vcode
+                    );
+                    assert_eq!(pair[0] & 31, pair[1] & 31);
+                }
+            }
+            assert_eq!(checks, 2, "{:?}", cc.vcode);
+            if region {
+                let (plain, _, _) = compile_ir_for_isa(control, bytes, true, jit.module.isa());
+                assert_eq!(
+                    loop_register_moves(cc.code_buffer()),
+                    loop_register_moves(plain.compiled_code().unwrap().code_buffer()),
+                    "alignment must add no loop register shuffles: {:?}",
+                    cc.vcode
+                );
+            }
+            if let Ok(dir) = std::env::var("X86JIT_ALIGNMENT_DUMP_DIR") {
+                std::fs::create_dir_all(&dir).unwrap();
+                let name = format!("{dir}/{}-{opt:?}", if region { "region" } else { "block" });
+                std::fs::write(format!("{name}.bin"), cc.code_buffer()).unwrap();
+                std::fs::write(format!("{name}.vcode"), cc.vcode.as_deref().unwrap()).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn loop_register_moves(code: &[u8]) -> usize {
+    let words: Vec<_> = code
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    for (i, word) in words.iter().enumerate() {
+        if word & 0xffff_0000 == 0xd65f_0000 {
+            break;
+        }
+        if word & 0xfc00_0000 == 0x1400_0000 {
+            let delta = ((*word << 6) as i32 >> 6) as isize;
+            if delta < 0 && i as isize + delta >= 0 {
+                let start = (i as isize + delta) as usize;
+                return words[start..=i]
+                    .iter()
+                    .filter(|w| **w & 0x7fe0_ffe0 == 0x2a00_03e0)
+                    .count();
+            }
+        }
+    }
+    panic!("expected a region back-edge");
 }

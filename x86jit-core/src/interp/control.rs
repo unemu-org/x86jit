@@ -323,14 +323,11 @@ pub(crate) fn exec_call<const ROUTED: bool>(
         sp &= 0xFFFF_FFFF;
     }
     if let Err(t) = mem.write(sp, *return_addr, *slot) {
-        return Some(trap_out(
-            cpu,
+        return Some(classify_access(
+            trap_out(cpu, cur_addr, t, sp, *slot, AccessKind::Write, *return_addr),
             cur_addr,
-            t,
             sp,
-            *slot,
-            AccessKind::Write,
-            *return_addr,
+            crate::ir::MemoryAccess::new(u16::from(*slot), !*wrap_sp, true),
         ));
     }
     cpu.gpr[RSP] = sp;
@@ -359,7 +356,14 @@ pub(crate) fn exec_ret<const ROUTED: bool>(
             cpu.gpr[RSP] = nsp;
             cpu.rip = ret;
         }
-        Err(t) => return Some(trap_out(cpu, cur_addr, t, sp, *slot, AccessKind::Read, 0)),
+        Err(t) => {
+            return Some(classify_access(
+                trap_out(cpu, cur_addr, t, sp, *slot, AccessKind::Read, 0),
+                cur_addr,
+                sp,
+                crate::ir::MemoryAccess::new(u16::from(*slot), !*wrap_sp, true),
+            ))
+        }
     }
     Some(StepResult::Continue)
 }

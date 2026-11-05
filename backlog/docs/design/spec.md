@@ -221,7 +221,8 @@ pub enum MemoryModel {
     /// address space [0, size). Address translation = host_base + guest_addr
     /// (one addition — fastest). `map()` in this model only assigns
     /// permissions/type (Ram/Trap) to regions and checks bounds; it does not
-    /// allocate separate blocks. Addresses >= size are UnmappedMemory.
+    /// allocate separate blocks. Canonical addresses >= size are UnmappedMemory;
+    /// see Data address exits for non-canonical Long64 operands.
     /// Good at the start and when the guest space is dense and fits in host RAM.
     Flat { size: u64 },
 
@@ -350,8 +351,10 @@ pub enum Exit {
     UnknownInstruction { addr: u64, bytes: [u8; 15], len: u8 },
 
     /// A guest CPU exception. Invalid encodings raise #UD (vector 6); an instruction
-    /// longer than 15 bytes raises #GP(0) (vector 13). addr and RIP are on the
-    /// failing instruction after the valid prefix completes.
+    /// longer than 15 bytes raises #GP(0) (vector 13). Long64 non-canonical data
+    /// operands raise #GP(0), or #SS(0) (vector 12) for SS references. Required
+    /// operand alignment raises #GP(0). Error code zero is implied for these
+    /// #GP/#SS exits; addr and RIP identify the failing instruction.
     Exception { addr: u64, vector: u8 },
 
     /// Hit a breakpoint set by the user (debug).
@@ -366,6 +369,27 @@ pub enum Exit {
 
 pub enum AccessKind { Read, Write, Execute }
 ```
+
+**Data address exits.** In Long64, every byte of a data operand must be canonical
+(SDM Vol 1 §3.3.7.1; AMD APM Vol 2 §5.3.1). A non-canonical operand raises
+`Exit::Exception { vector: 13, addr: RIP }`, or vector 12 for an implicit stack
+access or an RSP/RBP-based operand. CS/DS/ES/SS overrides are ignored; FS/GS
+references use vector 13 (SDM Vol 1 §3.3.7.1). Canonical misses, including the
+canonical upper half, remain `UnmappedMemory` with the exact failing byte.
+For forms with memory fault suppression, only active elements contribute to the
+reference (SDM Vol 1 §15.6.1; Vol 2C, VMASKMOV/VPMASKMOV). Embedded-broadcast
+fault carriers describe the decoded element (SDM Vol 2A §2.7.7); xj-au4.2 owns
+the existing broadcast transfer/value implementation gap.
+The lifter records mode, SS selection and whole operand width in access-op padding;
+classification runs only after a memory miss. Configured spans and regions exclude
+the canonical hole, so generated ordinary loads/stores need no canonicality test.
+`CheckAlign` precedes the first access of forms requiring explicit alignment:
+legacy SSE m128 except the unaligned and string-compare exceptions, aligned
+vector moves at vector width, and FXSAVE/FXRSTOR at 16 bytes (SDM Vol 2A §2.5,
+Tables 2-14/2-15/2-18/2-19/2-21; §2.8, Tables 2-45/2-46/2-47; FXSAVE/FXRSTOR).
+Alignment failures raise vector 13. These #GP/#SS exits imply error code zero and
+leave the instruction's registers, flags, memory and RIP uncommitted. This
+contract does not specify priority when an operand violates multiple conditions.
 
 **Decode and fetch exits.** In Long64 and Compat32, an architecturally invalid
 encoding produces `Exit::Exception { vector: 6, addr }` (#UD), with `addr` and the

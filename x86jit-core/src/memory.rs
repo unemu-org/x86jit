@@ -7,13 +7,92 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::ir::RmwOp;
 
+/// SDM Vol 1 §3.3.7.1: no LA57; bits 63:47 must all agree.
+pub fn is_canonical(addr: u64) -> bool {
+    ((addr as i64) << 16 >> 16) as u64 == addr
+}
+
+#[cold]
+fn address_miss(addr: u64, size: u8) -> MemTrap {
+    if !is_canonical(addr) || !is_canonical(addr.wrapping_add(u64::from(size).saturating_sub(1))) {
+        MemTrap::NonCanonical
+    } else {
+        MemTrap::Unmapped
+    }
+}
+
+/// Classify one cold memory miss, retaining its precise failing byte for paging.
+/// SDM Vol 1 §3.3.7.1; AMD APM Vol 2 §5.3.1: every byte of a
+/// Long64 reference must be canonical; SS selects #SS(0), otherwise #GP(0).
+#[cold]
+pub fn unmapped_exit(
+    rip: u64,
+    base: u64,
+    bytes: u64,
+    long64: bool,
+    stack: bool,
+    fault_addr: u64,
+    access: crate::exit::AccessKind,
+) -> crate::exit::Exit {
+    let last = base.wrapping_add(bytes.max(1) - 1);
+    if long64 && (!is_canonical(base) || !is_canonical(last)) {
+        crate::exit::Exit::Exception {
+            addr: rip,
+            vector: if stack { 12 } else { 13 },
+        }
+    } else {
+        crate::exit::Exit::UnmappedMemory {
+            addr: fault_addr,
+            access,
+        }
+    }
+}
+
+/// Cold span of the active memory elements of a vector reference.
+/// SDM Vol 1 §15.6.1; Vol 2A §§2.8.1/2.8.2/2.8.4; Vol 2C,
+/// VMASKMOV/VPMASKMOV: inactive elements suppress memory faults. Within a
+/// vector (at most 64 bytes), canonical endpoints also cover any selected
+/// elements between them. An all-ones mask retains the whole operand span.
+#[cold]
+pub fn active_operand_span(base: u64, bytes: u64, elem: u8, mask: u64) -> (u64, u64) {
+    let count = bytes / u64::from(elem);
+    let selected = mask & (u64::MAX >> (64 - count));
+    if selected == 0 {
+        return (base, 0);
+    }
+    let first = u64::from(selected.trailing_zeros());
+    let last = 63 - u64::from(selected.leading_zeros());
+    (
+        base.wrapping_add(first * u64::from(elem)),
+        (last - first + 1) * u64::from(elem),
+    )
+}
+
+/// Active source elements of an explicit chunk broadcast. Repeated output
+/// elements select the source modulo the chunk (SDM Vol 2A §2.8.6; Vol 2C,
+/// VBROADCAST, Operation). Read only on a cold miss.
+#[cold]
+pub fn active_broadcast_span(base: u64, chunk: u8, elem: u8, width: u16, mask: u64) -> (u64, u64) {
+    let elements = u32::from(chunk / elem);
+    let mut source = 0;
+    for i in 0..u32::from(width / u16::from(elem)) {
+        if mask & (1 << i) != 0 {
+            source |= 1 << (i % elements);
+        }
+    }
+    active_operand_span(base, u64::from(chunk), elem, source)
+}
+
 /// Memory model selection. Start with `Flat`; use `Reserved` when the guest wants a
 /// sparse, huge address space (Go's ~768 GiB arena hints) (§4.1).
 #[derive(Clone, Copy, Debug)]
 pub enum MemoryModel {
     /// One contiguous host buffer of `size` bytes representing guest space
     /// `[0, size)`. Translation is `host_base + guest_addr`. `map()` only
-    /// tags regions; it does not allocate. Addresses `>= size` are unmapped.
+    /// tags regions; it does not allocate. The span must fit below `1 << 47`.
+    /// Canonical addresses outside the span are unmapped. In Long64, a data
+    /// operand containing a non-canonical byte instead raises #GP/#SS
+    /// (SDM Vol 1 §3.3.7.1; AMD APM Vol 2 §5.3.1).
     Flat { size: u64 },
     /// A huge (`span`-byte) guest address space `[0, span)`, same one-add translation
     /// as `Flat` but sparsely committed: untouched guest VA (a `PROT_NONE`
@@ -34,6 +113,7 @@ pub enum HostRamError {
     Misaligned,
     GuestBaseOutOfBounds,
     BackingTooSmall,
+    NonCanonicalSpan,
 }
 
 impl std::fmt::Display for HostRamError {
@@ -41,6 +121,7 @@ impl std::fmt::Display for HostRamError {
         f.write_str(match self {
             Self::Misaligned => "host RAM pointer must equal guest_base modulo 16",
             Self::GuestBaseOutOfBounds => "host RAM guest_base exceeds the model span",
+            Self::NonCanonicalSpan => "guest backing overlaps non-canonical addresses",
             Self::BackingTooSmall => "host RAM backing is smaller than the guest extent",
         })
     }
@@ -280,6 +361,9 @@ pub enum RegionKind {
 #[non_exhaustive]
 pub enum MemTrap {
     Unmapped,
+    /// Non-canonical linear operand (SDM Vol 1 §3.3.7.1). The tier selects
+    /// #SS(0) for SS references and #GP(0) otherwise; error code zero is implied.
+    NonCanonical,
     /// Host protection fault at the exact guest byte.
     HostFault,
     Mmio,
@@ -605,7 +689,22 @@ impl Memory {
         self.recover_host_faults
     }
 
+    /// Allocate backing for the selected model; mapping regions is a separate step.
+    ///
+    /// # Panics
+    /// Panics if a Flat/Reserved span exceeds `1 << 47`, since it would include
+    /// non-canonical addresses (SDM Vol 1 §3.3.7.1), or the span exceeds the
+    /// SMC-tracked limit [`MAX_TRACKED_SPAN`]. Backing allocation failure aborts
+    /// through `std::alloc::handle_alloc_error`; it is not a catchable panic.
     pub fn new(model: MemoryModel) -> Self {
+        let span = match model {
+            MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => size,
+            MemoryModel::SoftMmu => 0,
+        };
+        assert!(
+            span <= 1 << 47,
+            "guest span overlaps non-canonical addresses"
+        );
         // Huge sparse mappings are supplied by the embedder through from_host_ram.
         let len = match &model {
             MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => *size as usize,
@@ -632,6 +731,12 @@ impl Memory {
             MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => *size,
             MemoryModel::SoftMmu => 0,
         };
+        // SDM Vol 1 §3.3.7.1: this engine implements 48-bit canonical addresses.
+        // Reject at configuration time so a non-canonical guest pointer can never
+        // reach a host access/trap record or the host-fault landing pad.
+        if span > 1 << 47 {
+            return Err(HostRamError::NonCanonicalSpan);
+        }
         if ram.guest_base > span {
             return Err(HostRamError::GuestBaseOutOfBounds);
         }
@@ -1148,6 +1253,15 @@ impl Memory {
         prot: Prot,
         kind: RegionKind,
     ) -> Result<(), MapError> {
+        if size != 0
+            && (!is_canonical(guest_addr)
+                || !guest_addr
+                    .checked_add(size as u64 - 1)
+                    .is_some_and(is_canonical)
+                || (guest_addr < 1 << 47 && guest_addr.saturating_add(size as u64) > 1 << 47))
+        {
+            return Err(MapError::OutOfBounds);
+        }
         match self.model {
             // `Reserved` tags and bounds-checks exactly like `Flat`; it only differs
             // in how the backing bytes are allocated (a sparse mmap vs a `Vec`).
@@ -1353,9 +1467,12 @@ impl Memory {
     }
 
     /// The region containing `[addr, addr + size)`, or `Unmapped` if the range
-    /// escapes every mapped region. Shared by scalar read/write.
+    /// escapes every mapped region; a non-canonical miss is `NonCanonical`.
+    /// Shared by scalar read/write.
     fn region_at(&self, addr: u64, size: u8) -> Result<&Region, MemTrap> {
-        let end = addr.checked_add(size as u64).ok_or(MemTrap::Unmapped)?;
+        let end = addr
+            .checked_add(size as u64)
+            .ok_or_else(|| address_miss(addr, size))?;
         let contains = |r: &Region| r.start <= addr && end <= r.start + r.size as u64;
         // Fast path: accesses are highly local, so the last region we hit usually
         // still contains this one — check it before the linear scan. The index stays
@@ -1372,7 +1489,7 @@ impl Memory {
                 self.last_region.store(i, Ordering::Relaxed);
                 Ok(&self.regions[i])
             }
-            None => Err(MemTrap::Unmapped),
+            None => Err(address_miss(addr, size)),
         }
     }
 
@@ -2083,6 +2200,62 @@ mod tests {
 
     fn flat(size: u64) -> Memory {
         Memory::new(MemoryModel::Flat { size })
+    }
+
+    // SDM Vol 1 §3.3.7.1: 48-bit canonicality, both boundaries by value.
+    #[test]
+    fn canonical_address_boundaries() {
+        for addr in [0, 0x0000_7fff_ffff_ffff, 0xffff_8000_0000_0000, u64::MAX] {
+            assert!(is_canonical(addr));
+        }
+        for addr in [0x0000_8000_0000_0000, 0xffff_7fff_ffff_ffff] {
+            assert!(!is_canonical(addr));
+            let mut mem = Memory::new(MemoryModel::Flat { size: 0x1000 });
+            assert!(matches!(
+                mem.map(addr, 1, Prot::RW, RegionKind::Ram),
+                Err(MapError::OutOfBounds)
+            ));
+            assert_eq!(mem.read(addr, 1), Err(MemTrap::NonCanonical));
+        }
+    }
+
+    #[test]
+    fn reserved_map_rejects_noncanonical_and_straddling_regions() {
+        let mut mem = Memory::new(MemoryModel::Reserved { span: 0x1000 });
+        // Exercise map's validation independently of constructor validation.
+        // No access is made through this synthetic oversized Reserved model.
+        mem.model = MemoryModel::Reserved { span: 1 << 48 };
+        for (addr, size) in [(1 << 47, 1), ((1 << 47) - 8, 16)] {
+            assert!(matches!(
+                mem.map(addr, size, Prot::RW, RegionKind::Ram),
+                Err(MapError::OutOfBounds)
+            ));
+        }
+        assert!(mem.regions.is_empty());
+    }
+
+    #[test]
+    fn noncanonical_span_rejected_before_allocation() {
+        assert!(std::panic::catch_unwind(|| Memory::new(MemoryModel::Flat {
+            size: (1 << 47) + 1
+        }))
+        .is_err());
+        let ram = HostRam {
+            ptr: std::ptr::NonNull::<u128>::dangling().as_ptr().cast(),
+            len: 0,
+            guest_base: 0,
+            dtor: Box::new(|_, _| {}),
+            protect: None,
+        };
+        assert!(matches!(
+            Memory::from_host_ram(
+                MemoryModel::Reserved {
+                    span: (1 << 47) + 1
+                },
+                ram
+            ),
+            Err(HostRamError::NonCanonicalSpan)
+        ));
     }
 
     fn reserved(span: u64) -> Memory {

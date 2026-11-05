@@ -71,6 +71,45 @@ impl FlagMask {
     }
 }
 
+/// Lift-time data read only on a memory miss. Width covers the entire operand,
+/// including pieces served by separate transfers. Long64 and SS fit in padding.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(transparent)]
+pub struct MemoryAccess(u16);
+
+impl MemoryAccess {
+    pub fn new(bytes: u16, long64: bool, stack: bool) -> Self {
+        Self((bytes << 2) | u16::from(long64) | (u16::from(stack) << 1))
+    }
+    pub fn bytes(self) -> u16 {
+        self.0 >> 2
+    }
+    pub fn stack(self) -> bool {
+        self.0 & 2 != 0
+    }
+    pub fn long64(self) -> bool {
+        self.0 & 1 != 0
+    }
+    #[cold]
+    pub fn unmapped_exit(
+        self,
+        rip: u64,
+        base: u64,
+        fault_addr: u64,
+        access: crate::exit::AccessKind,
+    ) -> crate::exit::Exit {
+        crate::memory::unmapped_exit(
+            rip,
+            base,
+            u64::from(self.bytes()),
+            self.long64(),
+            self.stack(),
+            fault_addr,
+            access,
+        )
+    }
+}
+
 /// IR operations. Extended as the lift grows (§6.2). Any control-flow op ends
 /// the block.
 #[derive(Clone, Debug)]
@@ -274,11 +313,13 @@ pub enum IrOp {
         kind: FenceKind,
     },
     Load {
+        fault: MemoryAccess,
         dst: Temp,
         addr: Val,
         size: u8,
     },
     Store {
+        fault: MemoryAccess,
         addr: Val,
         src: Val,
         size: u8,
@@ -323,6 +364,7 @@ pub enum IrOp {
     // otherwise); `sti` selects ST(i) for register forms. Executed by the shared
     // `exec_x87` in both backends. May trap on a memory access.
     X87 {
+        fault: MemoryAccess,
         kind: crate::x87::FpuKind,
         addr: Val,
         sti: u8,
@@ -333,6 +375,7 @@ pub enum IrOp {
     // is the default (not modeled), x87 via the f64-backed converters. Executed by
     // the shared `exec_fxstate` in both backends; may trap on the memory access.
     FxState {
+        fault: MemoryAccess,
         addr: Val,
         restore: bool,
     },
@@ -384,6 +427,7 @@ pub enum IrOp {
     // materialized-flag machinery) so locked ALU ops flag exactly like their plain
     // forms. Backs `lock add`/`and`/`or`/`xor`/`sub`/`inc`/`dec`, `xadd`, `xchg`.
     AtomicRmw {
+        fault: MemoryAccess,
         old: Temp,
         addr: Val,
         src: Val,
@@ -394,6 +438,7 @@ pub enum IrOp {
     // `[addr] = src`; `old` <- prior value either way. ZF/etc. come from a
     // separate `cmp expected, old` the lift emits.
     AtomicCas {
+        fault: MemoryAccess,
         old: Temp,
         addr: Val,
         expected: Val,
@@ -404,6 +449,7 @@ pub enum IrOp {
     /// Paired compare-exchange (CMPXCHG8B/16B): implicit accumulator/source
     /// register pairs and ZF only. `size` is 8 or 16 bytes.
     AtomicCasPair {
+        fault: MemoryAccess,
         addr: Val,
         size: u8,
         /// Decoded instruction length for an unsupported MMIO exit.
@@ -413,11 +459,13 @@ pub enum IrOp {
     // --- SIMD (SSE, §3.1 M8). XMM registers by index (0..15), 128-bit values. ---
     // Load 16/8/4 bytes from memory into xmm `dst` (upper bytes zeroed for <16).
     VLoad {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         size: u8,
     },
     VStore {
+        fault: MemoryAccess,
         addr: Val,
         src: u8,
         size: u8,
@@ -462,12 +510,14 @@ pub enum IrOp {
     },
     // Memory-source forms: `dst = op(dst, load128(addr))` (e.g. `paddd xmm,[mem]`).
     VPackedBinM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         lane: u8,
         op: PackedBinOp,
     },
     VLogicM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         op: VLogicOp,
@@ -517,6 +567,7 @@ pub enum IrOp {
     /// Word blend with a by-value memory source; no destination staging.
     /// SDM Vol 2B, PBLENDW: m128/m256 for VEX.128/256.
     VBlendWM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -560,6 +611,7 @@ pub enum IrOp {
     /// As [`VFma`] but one source (`mem_role`: 0=x, 1=y, 2=z) is a memory operand `[addr]`
     /// — the FMA3 memory form always puts it in op2. A load fault traps.
     VFmaM {
+        fault: MemoryAccess,
         dst: u8,
         x: u8,
         y: u8,
@@ -588,6 +640,7 @@ pub enum IrOp {
     },
     /// As [`VAes`] but the round key `b` is a memory operand `[addr]`. Load fault traps.
     VAesM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -601,6 +654,7 @@ pub enum IrOp {
     },
     /// As [`VAesImc`] with a memory source `[addr]`. Load fault traps.
     VAesImcM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
     },
@@ -613,6 +667,7 @@ pub enum IrOp {
     },
     /// As [`VAesKeygen`] with a memory source `[addr]`. Load fault traps.
     VAesKeygenM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -630,6 +685,7 @@ pub enum IrOp {
     },
     /// As [`VSha`] but op2 is a memory operand `[addr]`. Load fault traps.
     VShaM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -651,6 +707,7 @@ pub enum IrOp {
     },
     /// As [`VGfni`] but op2 is a memory operand `[addr]`. Load fault traps.
     VGfniM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -684,6 +741,7 @@ pub enum IrOp {
     },
     /// As [`VPclmul`] but op2 `b` is a memory operand `[addr]`. Load fault traps.
     VPclmulM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -704,6 +762,7 @@ pub enum IrOp {
     },
     /// As [`VPsign`] but the control operand is a memory operand `[addr]`. Load fault traps.
     VPsignM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -732,6 +791,7 @@ pub enum IrOp {
     /// nothing touches `dst` until the load has succeeded, and it stops the IR from
     /// requiring every future backend to get the same ordering right.
     VPackWideM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -766,6 +826,7 @@ pub enum IrOp {
     /// `dst = madd(a, [addr])`. Keeps `a` as a distinct field (like `VPackedBin256M`), so
     /// no pre-copy is needed and `dst == a` aliasing is safe.
     VPMaddM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -796,6 +857,7 @@ pub enum IrOp {
     },
     /// Memory-source word shuffle. SDM Vol 2B, PSHUFHW/PSHUFLW: m128.
     VShuffle16M {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -815,6 +877,7 @@ pub enum IrOp {
     /// `dst` is written, so `a` aliasing `dst` is safe; a fault on the load traps. The VEX
     /// caller appends `VZeroUpper`.
     VShufpsM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -830,6 +893,7 @@ pub enum IrOp {
         idx: u8,
     },
     VPshufbM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
     },
@@ -856,6 +920,7 @@ pub enum IrOp {
         imm: u8,
     },
     VAlignrM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -872,6 +937,7 @@ pub enum IrOp {
     /// As [`IrOp::VUnpackLow`] but the second source is a 128-bit memory operand:
     /// `dst = unpack(a, [addr])`. `a` is explicit — see [`IrOp::VPackWideM`] for why (§16).
     VUnpackLowM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -952,12 +1018,14 @@ pub enum IrOp {
     // semantics) stay separate above.
     /// Load `bytes` (32/64) from `[addr]` into the low lanes of vector `dst`.
     VLoadWide {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         bytes: u16,
     },
     /// Store `bytes` (32/64) from vector `src` to `[addr]`.
     VStoreWide {
+        fault: MemoryAccess,
         addr: Val,
         src: u8,
         bytes: u16,
@@ -985,6 +1053,7 @@ pub enum IrOp {
     /// memory (hardware fault suppression). glibc's AVX-512 string routines head/tail with
     /// this. Delegates to the shared `masked_load_run` (JIT == interp, fault-capable).
     VMaskLoadMem {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         k: u8,
@@ -996,6 +1065,7 @@ pub enum IrOp {
     /// store the active `k` lanes of `src` to `addr` element-wise (no zeroing form). Inactive
     /// lanes never touch memory. Delegates to the shared `masked_store_run`.
     VMaskStoreMem {
+        fault: MemoryAccess,
         src: u8,
         addr: Val,
         k: u8,
@@ -1011,6 +1081,7 @@ pub enum IrOp {
     /// the mask is a *vector register's* element MSBs, not an opmask `k`. Delegates to
     /// the shared `masked_load_run` after converting the MSBs to a bitfield.
     VVecMaskLoadMem {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         mask: u8,
@@ -1023,6 +1094,7 @@ pub enum IrOp {
     /// set; inactive lanes never touch memory (no zeroing form). Delegates to the shared
     /// `masked_store_run`.
     VVecMaskStoreMem {
+        fault: MemoryAccess,
         src: u8,
         addr: Val,
         mask: u8,
@@ -1038,6 +1110,7 @@ pub enum IrOp {
     },
     /// 256-bit logic with a 32-byte memory source: `dst = op(a, [addr..32])`.
     VLogic256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1057,6 +1130,7 @@ pub enum IrOp {
     /// Memory-source `src2` form of [`IrOp::VLogicWide`]: `b` is a `bytes`-wide
     /// vector at `addr` (`vpxorq xmm, xmm, [mem]`). glibc folds the second logic operand.
     VLogicWideM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1075,6 +1149,7 @@ pub enum IrOp {
     /// Memory-source form of [`IrOp::VPopcnt`]: `a` is a `bytes`-wide vector at
     /// `addr` (`vpopcntq zmm, [mem]`).
     VPopcntM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         lane: u8,
@@ -1105,6 +1180,7 @@ pub enum IrOp {
     /// (128-bit / 16 bytes, e.g. `vextracti32x4 [mem],zmm,imm`) or 2 (256-bit / 32 bytes).
     /// A fault on the store traps like any vector store.
     VExtractLaneWideM {
+        fault: MemoryAccess,
         src: u8,
         addr: Val,
         idx: u8,
@@ -1123,6 +1199,7 @@ pub enum IrOp {
     /// value is compared against `cpu.xmm[a]`. glibc's SSE4.2 `strchr`/`strstr`
     /// use `pcmpistri xmm, [mem], imm`. A fault on the load traps like any vector load.
     VPcmpStrM {
+        fault: MemoryAccess,
         a: u8,
         addr: Val,
         imm: u8,
@@ -1142,6 +1219,7 @@ pub enum IrOp {
     /// As [`VPcmpStrMask`] but source 2 is a memory operand `[addr]` loaded as a 128-bit
     /// value. A fault on the load traps like any vector load.
     VPcmpStrMaskM {
+        fault: MemoryAccess,
         a: u8,
         addr: Val,
         imm: u8,
@@ -1159,6 +1237,7 @@ pub enum IrOp {
     /// the `imm[7:6]` source-lane select is ignored (the memory dword is the source). A
     /// fault on the load traps like any vector load.
     VInsertPsM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -1179,6 +1258,7 @@ pub enum IrOp {
     /// read before `dst` is written, so `a` aliasing `dst` is safe. A fault on the load traps
     /// like any vector load.
     VInsertPsM3 {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1200,6 +1280,7 @@ pub enum IrOp {
     /// As [`VDpps`] but source 2 is a memory operand `[addr]` loaded as 128/256 bits. A
     /// fault on the load traps before writing `dst`.
     VDppsM {
+        fault: MemoryAccess,
         dst: u8,
         /// Source 1 (= `dst` for SSE, op1 for VEX). Read before writing.
         a: u8,
@@ -1230,6 +1311,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VPMovExtend`] but the `16/to * from` source bytes come from memory.
     VPMovExtendM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         from: u8,
@@ -1327,6 +1409,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VPBlendV`] but the blend source is a 128-bit memory operand.
     VPBlendVM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         lane: u8,
@@ -1350,6 +1433,7 @@ pub enum IrOp {
     /// are read before `dst` is written, so either aliasing `dst` is safe; a fault on the
     /// load traps like any vector load. Bits above `bytes` cleared.
     VPBlendVXM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1375,6 +1459,7 @@ pub enum IrOp {
     /// `a` is read before `dst` is written, so `a` aliasing `dst` is safe; a fault on the
     /// load traps like any vector load.
     VBlendIM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1394,6 +1479,7 @@ pub enum IrOp {
     /// As [`VDppd`] but source 2 is a memory operand `[addr]` loaded as 128 bits.
     /// A fault on the load traps like any vector load.
     VDppdM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         imm: u8,
@@ -1413,6 +1499,7 @@ pub enum IrOp {
     /// As [`VDp3`] but source 2 is a 128-bit memory operand `[addr]`. `a` is read
     /// before `dst` is written, so `a` aliasing `dst` is safe; a fault on the load traps.
     VDp3M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1436,6 +1523,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VPRound`] but the source is a memory operand.
     VPRoundM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         prec: FPrec,
@@ -1507,6 +1595,7 @@ pub enum IrOp {
     /// PSRLW/PSRLD/PSRLQ and PSRAW/PSRAD: the count operand is m128,
     /// even though only its low 64 bits determine the count.
     VShiftRegM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         elem: u8,
@@ -1552,6 +1641,7 @@ pub enum IrOp {
     /// aliasing case that the load-into-dst lowering can't. A fault on the load traps like
     /// any vector load.
     VGf2p8M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1575,6 +1665,7 @@ pub enum IrOp {
     /// Memory-source `src3` form of [`IrOp::VPTernlog`]: `c` is a `bytes`-wide
     /// vector at `addr` (`vpternlogd ymm, ymm, [mem], imm8`).
     VPTernlogM {
+        fault: MemoryAccess,
         dst: u8,
         b: u8,
         addr: Val,
@@ -1591,6 +1682,7 @@ pub enum IrOp {
     },
     /// 256-bit packed arithmetic with a 32-byte memory source.
     VPackedBin256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1611,6 +1703,7 @@ pub enum IrOp {
     /// Memory-source `src2` form of [`IrOp::VPackedWide`]: `b` is a `bytes`-wide
     /// vector at `addr` (`vpaddq zmm, zmm, [mem]`).
     VPackedWideM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1635,6 +1728,7 @@ pub enum IrOp {
     },
     /// `vpbroadcast{b,w,d,q}` from a memory scalar at `addr`.
     VBroadcastM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         elem: u8,
@@ -1664,6 +1758,7 @@ pub enum IrOp {
     /// As [`VBroadcastLane`] but the `chunk`-byte block is a memory operand `[addr]`.
     /// Load fault traps.
     VBroadcastLaneM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         chunk: u8,
@@ -1692,6 +1787,7 @@ pub enum IrOp {
     /// vector loaded from `addr`. glibc's AVX-512 string/memcmp routines fold the second
     /// operand as a memory load (`vpcmpeqb k, zmm, [rsi]`).
     VPCmpToMaskM {
+        fault: MemoryAccess,
         k: u8,
         a: u8,
         addr: Val,
@@ -1717,6 +1813,7 @@ pub enum IrOp {
     /// Memory-source `src2` form of [`IrOp::VPTestToMask`]: `b` is a `width`-byte
     /// vector loaded from `addr`.
     VPTestToMaskM {
+        fault: MemoryAccess,
         k: u8,
         a: u8,
         addr: Val,
@@ -1803,6 +1900,7 @@ pub enum IrOp {
     /// them contiguously at `addr`. A store fault traps like any vector store. Masked
     /// memory-dest forms (per-lane fault suppression) are deferred.
     VPmovNarrowMem {
+        fault: MemoryAccess,
         src: u8,
         addr: Val,
         from: u8,
@@ -1830,6 +1928,7 @@ pub enum IrOp {
     /// As [`VPermT2`] but table 1 is a memory operand `[addr]`. A load fault
     /// traps like any vector load; `imode` selects `vpermi2`/`vpermt2` as above.
     VPermT2M {
+        fault: MemoryAccess,
         dst: u8,
         idx: u8,
         addr: Val,
@@ -1856,6 +1955,7 @@ pub enum IrOp {
     /// `vpermq zmm, zmm, [mem]`. A load fault traps like any vector load. openssl's
     /// AVX-512 RSA folds the permute table as a memory operand.
     VPerm1M {
+        fault: MemoryAccess,
         dst: u8,
         idx: u8,
         addr: Val,
@@ -1875,6 +1975,7 @@ pub enum IrOp {
     /// As [`VInsert128`] but the inserted 128-bit lane comes from memory `[addr]`. A load
     /// fault traps like any vector load.
     VInsert128M {
+        fault: MemoryAccess,
         dst: u8,
         src: u8,
         addr: Val,
@@ -1896,6 +1997,7 @@ pub enum IrOp {
     },
     /// 256-bit `vpshufb` with a 32-byte memory index.
     VPshufb256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -1964,6 +2066,7 @@ pub enum IrOp {
     },
     /// Flags-only legacy test. SDM Vol 2B, PTEST: m128.
     VPtestM {
+        fault: MemoryAccess,
         a: u8,
         addr: Val,
     },
@@ -1993,6 +2096,7 @@ pub enum IrOp {
     // Memory-source form: `dst = op(dst, mem)`. Loads `prec` bytes when `scalar`,
     // else the full 16.
     VFloatBinM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         op: FloatBinOp,
@@ -2016,6 +2120,7 @@ pub enum IrOp {
     /// `a` is op1 (the register source); reading it explicitly avoids a full-ymm pre-copy.
     /// `bytes` = 16/32.
     VHFloatM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2037,6 +2142,7 @@ pub enum IrOp {
     /// As [`IrOp::VHInt`] but source 2 is a 128/256-bit memory operand:
     /// `dst = op(a, [addr])`. `a` is explicit — see [`IrOp::VPackWideM`] for why (§16).
     VHIntM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2077,6 +2183,7 @@ pub enum IrOp {
     // form, 16 for packed). `dst` is also the first source (`a`), matching the
     // 2-operand SSE encoding.
     VFloatCmpMaskM {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         prec: FPrec,
@@ -2097,6 +2204,7 @@ pub enum IrOp {
     // 256-bit `vcmp{ps,pd}` with a 32-byte memory second source: like `VFloatCmpMask256`
     // but the comparand `b` is a ymm-wide vector loaded from `[addr]`.
     VFloatCmpMask256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2162,6 +2270,7 @@ pub enum IrOp {
     /// Sum of absolute differences with a by-value memory source.
     /// SDM Vol 2B, MPSADBW: m128/m256 for VEX.128/256.
     VMpsadbwM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2215,6 +2324,7 @@ pub enum IrOp {
     /// aliasing `dst` is safe; a fault on the load traps like any vector load. VEX callers
     /// append `VZeroUpper`.
     VFloatUnaryM {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         src_addr: Val,
@@ -2238,6 +2348,7 @@ pub enum IrOp {
     /// (both 128-bit halves loaded, so a fault reports the exact faulting 16-byte access).
     /// `a` is read before `dst` is written, so `a` aliasing `dst` is safe.
     VFloatBin256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2255,6 +2366,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VFloatUnary256`] but the source is a 32-byte memory operand `[addr]`.
     VFloatUnary256M {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         op: FloatUnOp,
@@ -2274,6 +2386,7 @@ pub enum IrOp {
     /// As [`IrOp::VPackedCvt256`] but the source is a 32-byte memory operand `[addr]` (both
     /// 128-bit halves loaded, so a fault reports the exact faulting 16-byte access).
     VPackedCvt256M {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         kind: PackedCvtKind,
@@ -2293,6 +2406,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VShufps256`] but the second source is a 32-byte memory operand `[addr]`.
     VShufps256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2311,6 +2425,7 @@ pub enum IrOp {
     },
     /// As [`IrOp::VUnpack256`] but the second source is a 32-byte memory operand `[addr]`.
     VUnpack256M {
+        fault: MemoryAccess,
         dst: u8,
         a: u8,
         addr: Val,
@@ -2327,12 +2442,14 @@ pub enum IrOp {
     },
     // movhps/movlps load: 8 bytes from memory into the high/low half of `dst`.
     VLoadHalf {
+        fault: MemoryAccess,
         dst: u8,
         addr: Val,
         high: bool,
     },
     // movhps/movlps store: the high/low 8 bytes of `src` to memory.
     VStoreHalf {
+        fault: MemoryAccess,
         addr: Val,
         src: u8,
         high: bool,
@@ -2462,6 +2579,7 @@ pub enum IrOp {
     // (restartable) loop; updates RSI/RDI/RCX/flags. May trap on a memory access
     // (RIP left on the instruction for retry).
     RepString {
+        fault: MemoryAccess,
         op: StrOp,
         elem: u8,
         rep: RepKind,
@@ -2525,6 +2643,7 @@ pub enum IrOp {
         fallthrough: u64,
     }, // jcc — both targets known
     Call {
+        fault: MemoryAccess,
         target: Val,
         return_addr: u64,
         /// Stack-frame width in bytes: 8 in long mode, 4 for a 32-bit push of the
@@ -2535,6 +2654,7 @@ pub enum IrOp {
         wrap_sp: bool,
     },
     Ret {
+        fault: MemoryAccess,
         /// Bytes popped for the return address (8 long, 4 Compat32, 2 under 66h).
         slot: u8,
         /// Extra bytes added to the stack pointer after the pop (`ret imm16`).
@@ -2578,6 +2698,13 @@ pub enum IrOp {
         value: Val,
         size: u8,
         dir_out: bool,
+    },
+    // Append guards so ordinary-op dispatch discriminants match the base IR.
+    /// Raise #GP(0) before the first access if addr is not aligned to bytes.
+    /// SDM Vol 1 §§14.9, 15.7; Vol 2A §2.5 and FXSAVE/FXRSTOR exceptions.
+    CheckAlign {
+        addr: Val,
+        bytes: u8,
     },
 }
 
@@ -3035,6 +3162,182 @@ pub enum LoopKind {
     Jcxz,
 }
 
+impl IrOp {
+    /// Compile-time access metadata; non-memory operations have no fault class.
+    pub fn memory_access(&self) -> MemoryAccess {
+        match self {
+            Self::Load { fault, .. } => *fault,
+            Self::Store { fault, .. } => *fault,
+            Self::X87 { fault, .. } => *fault,
+            Self::FxState { fault, .. } => *fault,
+            Self::AtomicRmw { fault, .. } => *fault,
+            Self::AtomicCas { fault, .. } => *fault,
+            Self::AtomicCasPair { fault, .. } => *fault,
+            Self::VLoad { fault, .. } => *fault,
+            Self::VStore { fault, .. } => *fault,
+            Self::VPackedBinM { fault, .. } => *fault,
+            Self::VLogicM { fault, .. } => *fault,
+            Self::VBlendWM { fault, .. } => *fault,
+            Self::VFmaM { fault, .. } => *fault,
+            Self::VAesM { fault, .. } => *fault,
+            Self::VAesImcM { fault, .. } => *fault,
+            Self::VAesKeygenM { fault, .. } => *fault,
+            Self::VShaM { fault, .. } => *fault,
+            Self::VGfniM { fault, .. } => *fault,
+            Self::VPclmulM { fault, .. } => *fault,
+            Self::VPsignM { fault, .. } => *fault,
+            Self::VPackWideM { fault, .. } => *fault,
+            Self::VPMaddM { fault, .. } => *fault,
+            Self::VShuffle16M { fault, .. } => *fault,
+            Self::VShufpsM { fault, .. } => *fault,
+            Self::VPshufbM { fault, .. } => *fault,
+            Self::VAlignrM { fault, .. } => *fault,
+            Self::VUnpackLowM { fault, .. } => *fault,
+            Self::VLoadWide { fault, .. } => *fault,
+            Self::VStoreWide { fault, .. } => *fault,
+            Self::VMaskLoadMem { fault, .. } => *fault,
+            Self::VMaskStoreMem { fault, .. } => *fault,
+            Self::VVecMaskLoadMem { fault, .. } => *fault,
+            Self::VVecMaskStoreMem { fault, .. } => *fault,
+            Self::VLogic256M { fault, .. } => *fault,
+            Self::VLogicWideM { fault, .. } => *fault,
+            Self::VPopcntM { fault, .. } => *fault,
+            Self::VExtractLaneWideM { fault, .. } => *fault,
+            Self::VPcmpStrM { fault, .. } => *fault,
+            Self::VPcmpStrMaskM { fault, .. } => *fault,
+            Self::VInsertPsM { fault, .. } => *fault,
+            Self::VInsertPsM3 { fault, .. } => *fault,
+            Self::VDppsM { fault, .. } => *fault,
+            Self::VPMovExtendM { fault, .. } => *fault,
+            Self::VPBlendVM { fault, .. } => *fault,
+            Self::VPBlendVXM { fault, .. } => *fault,
+            Self::VBlendIM { fault, .. } => *fault,
+            Self::VDppdM { fault, .. } => *fault,
+            Self::VDp3M { fault, .. } => *fault,
+            Self::VPRoundM { fault, .. } => *fault,
+            Self::VShiftRegM { fault, .. } => *fault,
+            Self::VGf2p8M { fault, .. } => *fault,
+            Self::VPTernlogM { fault, .. } => *fault,
+            Self::VPackedBin256M { fault, .. } => *fault,
+            Self::VPackedWideM { fault, .. } => *fault,
+            Self::VBroadcastM { fault, .. } => *fault,
+            Self::VBroadcastLaneM { fault, .. } => *fault,
+            Self::VPCmpToMaskM { fault, .. } => *fault,
+            Self::VPTestToMaskM { fault, .. } => *fault,
+            Self::VPmovNarrowMem { fault, .. } => *fault,
+            Self::VPermT2M { fault, .. } => *fault,
+            Self::VPerm1M { fault, .. } => *fault,
+            Self::VInsert128M { fault, .. } => *fault,
+            Self::VPshufb256M { fault, .. } => *fault,
+            Self::VPtestM { fault, .. } => *fault,
+            Self::VFloatBinM { fault, .. } => *fault,
+            Self::VHFloatM { fault, .. } => *fault,
+            Self::VHIntM { fault, .. } => *fault,
+            Self::VFloatCmpMaskM { fault, .. } => *fault,
+            Self::VFloatCmpMask256M { fault, .. } => *fault,
+            Self::VMpsadbwM { fault, .. } => *fault,
+            Self::VFloatUnaryM { fault, .. } => *fault,
+            Self::VFloatBin256M { fault, .. } => *fault,
+            Self::VFloatUnary256M { fault, .. } => *fault,
+            Self::VPackedCvt256M { fault, .. } => *fault,
+            Self::VShufps256M { fault, .. } => *fault,
+            Self::VUnpack256M { fault, .. } => *fault,
+            Self::VLoadHalf { fault, .. } => *fault,
+            Self::VStoreHalf { fault, .. } => *fault,
+            Self::RepString { fault, .. } => *fault,
+            Self::Call { fault, .. } => *fault,
+            Self::Ret { fault, .. } => *fault,
+            _ => MemoryAccess::default(),
+        }
+    }
+    pub(crate) fn set_memory_access(&mut self, value: MemoryAccess) {
+        match self {
+            Self::Load { fault, .. } => *fault = value,
+            Self::Store { fault, .. } => *fault = value,
+            Self::X87 { fault, .. } => *fault = value,
+            Self::FxState { fault, .. } => *fault = value,
+            Self::AtomicRmw { fault, .. } => *fault = value,
+            Self::AtomicCas { fault, .. } => *fault = value,
+            Self::AtomicCasPair { fault, .. } => *fault = value,
+            Self::VLoad { fault, .. } => *fault = value,
+            Self::VStore { fault, .. } => *fault = value,
+            Self::VPackedBinM { fault, .. } => *fault = value,
+            Self::VLogicM { fault, .. } => *fault = value,
+            Self::VBlendWM { fault, .. } => *fault = value,
+            Self::VFmaM { fault, .. } => *fault = value,
+            Self::VAesM { fault, .. } => *fault = value,
+            Self::VAesImcM { fault, .. } => *fault = value,
+            Self::VAesKeygenM { fault, .. } => *fault = value,
+            Self::VShaM { fault, .. } => *fault = value,
+            Self::VGfniM { fault, .. } => *fault = value,
+            Self::VPclmulM { fault, .. } => *fault = value,
+            Self::VPsignM { fault, .. } => *fault = value,
+            Self::VPackWideM { fault, .. } => *fault = value,
+            Self::VPMaddM { fault, .. } => *fault = value,
+            Self::VShuffle16M { fault, .. } => *fault = value,
+            Self::VShufpsM { fault, .. } => *fault = value,
+            Self::VPshufbM { fault, .. } => *fault = value,
+            Self::VAlignrM { fault, .. } => *fault = value,
+            Self::VUnpackLowM { fault, .. } => *fault = value,
+            Self::VLoadWide { fault, .. } => *fault = value,
+            Self::VStoreWide { fault, .. } => *fault = value,
+            Self::VMaskLoadMem { fault, .. } => *fault = value,
+            Self::VMaskStoreMem { fault, .. } => *fault = value,
+            Self::VVecMaskLoadMem { fault, .. } => *fault = value,
+            Self::VVecMaskStoreMem { fault, .. } => *fault = value,
+            Self::VLogic256M { fault, .. } => *fault = value,
+            Self::VLogicWideM { fault, .. } => *fault = value,
+            Self::VPopcntM { fault, .. } => *fault = value,
+            Self::VExtractLaneWideM { fault, .. } => *fault = value,
+            Self::VPcmpStrM { fault, .. } => *fault = value,
+            Self::VPcmpStrMaskM { fault, .. } => *fault = value,
+            Self::VInsertPsM { fault, .. } => *fault = value,
+            Self::VInsertPsM3 { fault, .. } => *fault = value,
+            Self::VDppsM { fault, .. } => *fault = value,
+            Self::VPMovExtendM { fault, .. } => *fault = value,
+            Self::VPBlendVM { fault, .. } => *fault = value,
+            Self::VPBlendVXM { fault, .. } => *fault = value,
+            Self::VBlendIM { fault, .. } => *fault = value,
+            Self::VDppdM { fault, .. } => *fault = value,
+            Self::VDp3M { fault, .. } => *fault = value,
+            Self::VPRoundM { fault, .. } => *fault = value,
+            Self::VShiftRegM { fault, .. } => *fault = value,
+            Self::VGf2p8M { fault, .. } => *fault = value,
+            Self::VPTernlogM { fault, .. } => *fault = value,
+            Self::VPackedBin256M { fault, .. } => *fault = value,
+            Self::VPackedWideM { fault, .. } => *fault = value,
+            Self::VBroadcastM { fault, .. } => *fault = value,
+            Self::VBroadcastLaneM { fault, .. } => *fault = value,
+            Self::VPCmpToMaskM { fault, .. } => *fault = value,
+            Self::VPTestToMaskM { fault, .. } => *fault = value,
+            Self::VPmovNarrowMem { fault, .. } => *fault = value,
+            Self::VPermT2M { fault, .. } => *fault = value,
+            Self::VPerm1M { fault, .. } => *fault = value,
+            Self::VInsert128M { fault, .. } => *fault = value,
+            Self::VPshufb256M { fault, .. } => *fault = value,
+            Self::VPtestM { fault, .. } => *fault = value,
+            Self::VFloatBinM { fault, .. } => *fault = value,
+            Self::VHFloatM { fault, .. } => *fault = value,
+            Self::VHIntM { fault, .. } => *fault = value,
+            Self::VFloatCmpMaskM { fault, .. } => *fault = value,
+            Self::VFloatCmpMask256M { fault, .. } => *fault = value,
+            Self::VMpsadbwM { fault, .. } => *fault = value,
+            Self::VFloatUnaryM { fault, .. } => *fault = value,
+            Self::VFloatBin256M { fault, .. } => *fault = value,
+            Self::VFloatUnary256M { fault, .. } => *fault = value,
+            Self::VPackedCvt256M { fault, .. } => *fault = value,
+            Self::VShufps256M { fault, .. } => *fault = value,
+            Self::VUnpack256M { fault, .. } => *fault = value,
+            Self::VLoadHalf { fault, .. } => *fault = value,
+            Self::VStoreHalf { fault, .. } => *fault = value,
+            Self::RepString { fault, .. } => *fault = value,
+            Self::Call { fault, .. } => *fault = value,
+            Self::Ret { fault, .. } => *fault = value,
+            _ => {}
+        }
+    }
+}
+
 /// A lifted basic block, keyed by guest start address in the cache (§6.3).
 #[derive(Clone, Debug)]
 pub struct IrBlock {
@@ -3099,5 +3402,14 @@ impl TempGen {
 impl Default for TempGen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod memory_layout_tests {
+    #[test]
+    fn memory_access_metadata_uses_existing_ir_padding() {
+        assert_eq!(std::mem::size_of::<super::IrOp>(), 72);
+        assert_eq!(std::mem::size_of::<super::MemoryAccess>(), 2);
     }
 }

@@ -806,7 +806,7 @@ impl Translator<'_, '_> {
         let k = self.iconst(writemask.unwrap_or(0) as u64);
         let masked = self.iconst(writemask.is_some() as u64);
         let z = self.iconst(*zeroing as u64);
-        let by = self.iconst(*bytes as u64);
+        let by = self.memory_helper_bytes(*bytes);
         let im = self.iconst(*imode as u64);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
@@ -866,7 +866,7 @@ impl Translator<'_, '_> {
         let k = self.iconst(writemask.unwrap_or(0) as u64);
         let masked = self.iconst(writemask.is_some() as u64);
         let z = self.iconst(*zeroing as u64);
-        let by = self.iconst(*bytes as u64);
+        let by = self.memory_helper_bytes(*bytes);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
         let inst = self.call_helper(
@@ -1172,11 +1172,12 @@ impl Translator<'_, '_> {
         let m = self.iconst(*mode as u64);
         let kk = self.iconst(*k as u64);
         let z = self.iconst(*zeroing as u64);
-        let by = self.iconst(*bytes as u64);
+        let by = self.memory_helper_bytes(*bytes);
+        let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
         let inst = self.call_helper(
             self.helpers.gf2p8_mem,
-            &[cpu, mem, d, av, base, im, m, kk, z, by],
+            &[cpu, mem, d, av, base, im, m, kk, z, by, cur],
         );
         self.trap_if_unmapped(inst);
         false
@@ -2829,7 +2830,7 @@ impl Translator<'_, '_> {
         let sc = self.iconst(*scalar as u64);
         let np = self.iconst(*neg_prod as u64);
         let na = self.iconst(*neg_add as u64);
-        let by = self.iconst(*bytes as u64);
+        let by = self.memory_helper_bytes(*bytes);
         let alt = self.iconst(*alt_sign as u64);
         let cur = self.iconst(self.cur_addr);
         let k = self.iconst(writemask.unwrap_or(0) as u64);

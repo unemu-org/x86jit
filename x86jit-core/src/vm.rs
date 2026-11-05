@@ -1529,7 +1529,7 @@ impl Vcpu {
                             }
                             RET_SYSCALL => return Exit::Syscall,
                             RET_HLT => return Exit::Hlt,
-                            RET_UNMAPPED => return ctx.unmapped_exit(),
+                            RET_UNMAPPED => return ctx.unmapped_exit(&self.cpu, self.mode),
                             RET_HOST_FAULT
                                 if self.fault_entry.fault_kind()
                                     != crate::jit_abi::fault::HostFaultKind::Alignment
@@ -1539,7 +1539,7 @@ impl Vcpu {
                                 // Both modes exit directly, retaining instruction-entry
                                 // register state. Split stores can already have committed
                                 // earlier host transfers (xj-obx.8); resuming rewrites them.
-                                return ctx.unmapped_exit();
+                                return ctx.unmapped_exit(&self.cpu, self.mode);
                             }
                             RET_MMIO_DEFER | RET_HOST_FAULT => {
                                 // Trap-region accesses replay to produce MMIO exits.

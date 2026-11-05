@@ -512,10 +512,23 @@ fn boundary_run(
     let mut after_memory = vec![0; SPAN as usize];
     vm.read_bytes(0, &mut after_memory).unwrap();
     if fault {
-        assert!(
-            matches!(exit, Exit::UnmappedMemory { addr: SPAN, .. }),
-            "bits={bits} jit={jit} at={at:#x}: {exit:?}"
-        );
+        let insn = iced_x86::Decoder::new(bits, code, iced_x86::DecoderOptions::NONE).decode();
+        // SDM Vol 2A §2.5, Tables 2-15/2-19/2-21: these legacy m128 forms
+        // require alignment. Only the fully mapped case has a unique fault.
+        let alignment_fault =
+            insn.encoding() == iced_x86::EncodingKind::Legacy && insn.memory_size().size() == 16;
+        let expected = (!alignment_fault || at + insn.memory_size().size() as u64 > SPAN)
+            && matches!(exit, Exit::UnmappedMemory { addr: SPAN, .. })
+            || (alignment_fault
+                && matches!(
+                    exit,
+                    Exit::Exception {
+                        addr: CODE,
+                        vector: 13,
+                        ..
+                    }
+                ));
+        assert!(expected, "bits={bits} jit={jit} at={at:#x}: {exit:?}");
         assert_eq!(cpu.reg(Reg::Rip), CODE);
         assert_eq!(registers(&cpu), before, "registers changed on fault");
         assert_eq!(
@@ -533,10 +546,26 @@ fn sse_memory_forms_fault_without_committing() {
     for bits in [64, 32] {
         for case in cases().into_iter().chain(lddqu_cases()) {
             let code = encode(case, true, bits, 0xa5);
-            // Ensure the first transfer succeeds and the next transfer faults.
+            // Unaligned legacy m128 faults before the first transfer; other forms
+            // fault on the second transfer. Neither may commit its destination.
             let mapped = case.bytes / 2;
             for jit in [false, true] {
                 boundary_run(&code, SPAN - mapped as u64, bits, jit, (0, 0), true);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_m128_mapped_misalignment_raises_gp() {
+    // SDM Vol 2A §2.5, Tables 2-18/2-19/2-21: no paging-priority ambiguity.
+    for bits in [64, 32] {
+        for case in cases() {
+            if case.bytes == 16 && case.code.encoding() == iced_x86::EncodingKind::Legacy {
+                let code = encode(case, true, bits, 0xa5);
+                for jit in [false, true] {
+                    boundary_run(&code, SPAN - 63, bits, jit, (0, 0), true);
+                }
             }
         }
     }

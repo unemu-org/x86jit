@@ -1,7 +1,8 @@
 use super::*;
 
-/// Lower legacy m128 operands. The legacy-SSE alignment
-/// check belongs here once that check is available; scalar SQRTSS/SD bypass it.
+/// Lower legacy m128 operands through the central effective-address path,
+/// which emits the required alignment guard (SDM Vol 2A §2.5).
+/// Scalar SQRTSS/SD operands do not require explicit alignment.
 pub(crate) fn legacy_sse_memory(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
@@ -64,6 +65,7 @@ pub(crate) fn lift_broadcast(
         let addr = effective_address(insn, ops, tg)?;
         let t = tg.fresh();
         ops.push(IrOp::Load {
+            fault: Default::default(),
             dst: t,
             addr,
             size: elem,
@@ -111,6 +113,7 @@ pub(crate) fn lift_broadcast(
         None if insn.op_kind(1) == OpKind::Memory => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VBroadcastM {
+                fault: Default::default(),
                 dst,
                 addr,
                 elem,
@@ -138,6 +141,7 @@ pub(crate) fn lift_broadcast_lane(
     if insn.op_kind(1) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VBroadcastLaneM {
+            fault: Default::default(),
             dst,
             addr,
             chunk,
@@ -210,7 +214,12 @@ pub(crate) fn lift_vpacked_shift_avx(
             return Err(unsupported_insn(insn));
         }
         let addr = effective_address(insn, ops, tg)?;
-        ops.push(IrOp::VLoadWide { dst, addr, bytes });
+        ops.push(IrOp::VLoadWide {
+            fault: Default::default(),
+            dst,
+            addr,
+            bytes,
+        });
     }
     if bytes >= 64 || writemask.is_some() || insn.zeroing_masking() {
         let a = if mem_src {
@@ -312,6 +321,7 @@ fn lift_vgfni_wide(
     if insn.op_kind(2) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VGf2p8M {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -357,6 +367,7 @@ pub(crate) fn lift_vlogic_avx(
         2,
         |b| ops.push(IrOp::VLogic256 { dst: d, a, b, op }),
         |addr| ops.push(IrOp::VLogic256M {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -414,6 +425,7 @@ pub(crate) fn lift_vpacked_bin_avx(
                 bytes: 64
             }),
             |addr| ops.push(IrOp::VPackedWideM {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -442,6 +454,7 @@ pub(crate) fn lift_vpacked_bin_avx(
             op
         }),
         |addr| ops.push(IrOp::VPackedBin256M {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -485,6 +498,7 @@ pub(crate) fn lift_vmov_avx(
             (Some((dst, bytes)), None) if insn.op_kind(1) == OpKind::Memory => {
                 let addr = effective_address(insn, ops, tg)?;
                 ops.push(IrOp::VMaskLoadMem {
+                    fault: Default::default(),
                     dst,
                     addr,
                     k,
@@ -498,6 +512,7 @@ pub(crate) fn lift_vmov_avx(
             (None, Some((src, bytes))) if insn.op_kind(0) == OpKind::Memory => {
                 let addr = effective_address(insn, ops, tg)?;
                 ops.push(IrOp::VMaskStoreMem {
+                    fault: Default::default(),
                     src,
                     addr,
                     k,
@@ -517,6 +532,7 @@ pub(crate) fn lift_vmov_avx(
             if k1 == OpKind::Memory {
                 let addr = effective_address(insn, ops, tg)?;
                 ops.push(IrOp::VLoadWide {
+                    fault: Default::default(),
                     dst: d,
                     addr,
                     bytes: 64,
@@ -536,6 +552,7 @@ pub(crate) fn lift_vmov_avx(
             if k0 == OpKind::Memory {
                 let addr = effective_address(insn, ops, tg)?;
                 ops.push(IrOp::VStoreWide {
+                    fault: Default::default(),
                     addr,
                     src: s,
                     bytes: 64,
@@ -554,6 +571,7 @@ pub(crate) fn lift_vmov_avx(
         if k1 == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VLoadWide {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 bytes: 32,
@@ -573,6 +591,7 @@ pub(crate) fn lift_vmov_avx(
         if k0 == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VStoreWide {
+                fault: Default::default(),
                 addr,
                 src: s,
                 bytes: 32,
@@ -599,7 +618,12 @@ pub(crate) fn lift_vmov(
     if let Some(d) = x0 {
         if k1 == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VLoad { dst: d, addr, size });
+            ops.push(IrOp::VLoad {
+                fault: Default::default(),
+                dst: d,
+                addr,
+                size,
+            });
             return Ok(());
         }
         if let Some(s) = x1 {
@@ -634,7 +658,12 @@ pub(crate) fn lift_vmov(
     if let Some(s) = x1 {
         if k0 == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VStore { addr, src: s, size });
+            ops.push(IrOp::VStore {
+                fault: Default::default(),
+                addr,
+                src: s,
+                size,
+            });
             return Ok(());
         }
         if k0 == OpKind::Register {
@@ -673,7 +702,12 @@ pub(crate) fn lift_vlogic(
             b,
             op
         }),
-        |addr| ops.push(IrOp::VLogicM { dst: d, addr, op })
+        |addr| ops.push(IrOp::VLogicM {
+            fault: Default::default(),
+            dst: d,
+            addr,
+            op
+        })
     );
     Ok(())
 }
@@ -701,6 +735,7 @@ pub(crate) fn lift_vpacked_bin(
             op
         }),
         |addr| ops.push(IrOp::VPackedBinM {
+            fault: Default::default(),
             dst: d,
             addr,
             lane,
@@ -733,7 +768,12 @@ pub(crate) fn lift_vlogic_vex(
             if d != a {
                 ops.push(IrOp::VMov { dst: d, src: a });
             }
-            ops.push(IrOp::VLogicM { dst: d, addr, op });
+            ops.push(IrOp::VLogicM {
+                fault: Default::default(),
+                dst: d,
+                addr,
+                op,
+            });
         }
     );
     ops.push(IrOp::VZeroUpper { reg: d }); // VEX.128 clears bits 255:128
@@ -769,6 +809,7 @@ pub(crate) fn lift_vpacked_bin_vex(
                 ops.push(IrOp::VMov { dst: d, src: a });
             }
             ops.push(IrOp::VPackedBinM {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 lane,
@@ -815,6 +856,7 @@ pub(crate) fn lift_vextract_wide(
     if insn.op_kind(0) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VExtractLaneWideM {
+            fault: Default::default(),
             src,
             addr,
             idx,
@@ -900,7 +942,12 @@ pub(crate) fn lift_blendv(
         reg_xmm,
         1,
         |src| ops.push(IrOp::VPBlendV { dst, src, lane }),
-        |addr| ops.push(IrOp::VPBlendVM { dst, addr, lane })
+        |addr| ops.push(IrOp::VPBlendVM {
+            fault: Default::default(),
+            dst,
+            addr,
+            lane
+        })
     );
     Ok(())
 }
@@ -922,6 +969,7 @@ pub(crate) fn lift_vmaskmov(
         let (src, bytes) = vec_operand(insn, 2).or_unsupported(insn)?;
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VVecMaskStoreMem {
+            fault: Default::default(),
             src,
             addr,
             mask,
@@ -933,6 +981,7 @@ pub(crate) fn lift_vmaskmov(
         let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VVecMaskLoadMem {
+            fault: Default::default(),
             dst,
             addr,
             mask,
@@ -975,6 +1024,7 @@ pub(crate) fn lift_vblendv(
             bytes
         }),
         |addr| ops.push(IrOp::VPBlendVXM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -1012,6 +1062,7 @@ pub(crate) fn lift_blendi(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VBlendIM {
+            fault: Default::default(),
             dst,
             a: dst,
             addr,
@@ -1053,6 +1104,7 @@ pub(crate) fn lift_vblendi(
             bytes
         }),
         |addr| ops.push(IrOp::VBlendIM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -1094,6 +1146,7 @@ pub(crate) fn lift_round(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VPRoundM {
+            fault: Default::default(),
             dst,
             addr,
             prec,
@@ -1133,6 +1186,7 @@ pub(crate) fn lift_vround(
                 bytes: 32
             }),
             |addr| ops.push(IrOp::VPRoundM {
+                fault: Default::default(),
                 dst,
                 addr,
                 prec,
@@ -1160,6 +1214,7 @@ pub(crate) fn lift_vround(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VPRoundM {
+            fault: Default::default(),
             dst,
             addr,
             prec,
@@ -1208,6 +1263,7 @@ pub(crate) fn lift_vround_scalar(
                 ops.push(IrOp::VMov { dst, src: a });
             }
             ops.push(IrOp::VPRoundM {
+                fault: Default::default(),
                 dst,
                 addr,
                 prec,
@@ -1241,6 +1297,7 @@ pub(crate) fn lift_pcmpstr_idx(
     } else {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPcmpStrM {
+            fault: Default::default(),
             a,
             addr,
             imm,
@@ -1271,6 +1328,7 @@ pub(crate) fn lift_pcmpstr_mask(
     } else {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPcmpStrMaskM {
+            fault: Default::default(),
             a,
             addr,
             imm,
@@ -1297,7 +1355,12 @@ pub(crate) fn lift_insertps(
         reg_xmm,
         1,
         |src| ops.push(IrOp::VInsertPs { dst, src, imm }),
-        |addr| ops.push(IrOp::VInsertPsM { dst, addr, imm })
+        |addr| ops.push(IrOp::VInsertPsM {
+            fault: Default::default(),
+            dst,
+            addr,
+            imm
+        })
     );
     Ok(())
 }
@@ -1325,7 +1388,13 @@ pub(crate) fn lift_vinsertps(
         reg_xmm,
         2,
         |src| ops.push(IrOp::VInsertPs3 { dst, a, src, imm }),
-        |addr| ops.push(IrOp::VInsertPsM3 { dst, a, addr, imm })
+        |addr| ops.push(IrOp::VInsertPsM3 {
+            fault: Default::default(),
+            dst,
+            a,
+            addr,
+            imm
+        })
     );
     ops.push(IrOp::VZeroUpper { reg: dst }); // VEX.128 clears bits 255:128
     Ok(())
@@ -1354,6 +1423,7 @@ pub(crate) fn lift_dpps(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VDppsM {
+            fault: Default::default(),
             dst,
             a: dst,
             addr,
@@ -1380,7 +1450,12 @@ pub(crate) fn lift_dppd(
         reg_xmm,
         1,
         |b| ops.push(IrOp::VDppd { dst, b, imm }),
-        |addr| ops.push(IrOp::VDppdM { dst, addr, imm })
+        |addr| ops.push(IrOp::VDppdM {
+            fault: Default::default(),
+            dst,
+            addr,
+            imm
+        })
     );
     Ok(())
 }
@@ -1412,6 +1487,7 @@ pub(crate) fn lift_vdp(
             prec
         }),
         |addr| ops.push(IrOp::VDp3M {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -1449,6 +1525,7 @@ pub(crate) fn lift_vdpps(
                 bytes: 32
             }),
             |addr| ops.push(IrOp::VDppsM {
+                fault: Default::default(),
                 dst,
                 a,
                 addr,
@@ -1474,6 +1551,7 @@ pub(crate) fn lift_vdpps(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VDppsM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -1530,6 +1608,7 @@ pub(crate) fn lift_vrndscale(
                 ops.push(IrOp::VMov { dst, src: a });
             }
             ops.push(IrOp::VPRoundM {
+                fault: Default::default(),
                 dst,
                 addr,
                 prec,
@@ -1568,6 +1647,7 @@ pub(crate) fn lift_pmovx(
             signed
         }),
         |addr| ops.push(IrOp::VPMovExtendM {
+            fault: Default::default(),
             dst,
             addr,
             from,
@@ -1680,6 +1760,7 @@ pub(crate) fn lift_vp_blendm(
         None if insn.op_kind(2) == OpKind::Memory && dst != a => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VLoadWide {
+                fault: Default::default(),
                 dst,
                 addr,
                 bytes: dst_width,
@@ -1766,6 +1847,7 @@ pub(crate) fn lift_vpopcnt(
             bytes
         }),
         |addr| ops.push(IrOp::VPopcntM {
+            fault: Default::default(),
             dst,
             addr,
             lane,
@@ -1812,6 +1894,7 @@ pub(crate) fn lift_vperm2(
     if insn.op_kind(2) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPermT2M {
+            fault: Default::default(),
             dst,
             idx,
             addr,
@@ -1857,6 +1940,7 @@ pub(crate) fn lift_vpmov_narrow(
         }
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPmovNarrowMem {
+            fault: Default::default(),
             src,
             addr,
             from,
@@ -1991,6 +2075,7 @@ pub(crate) fn lift_evex_vlogic(
             bytes
         }),
         |addr| ops.push(IrOp::VLogicWideM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -2030,6 +2115,7 @@ pub(crate) fn lift_vpternlog(
             bytes
         }),
         |addr| ops.push(IrOp::VPTernlogM {
+            fault: Default::default(),
             dst,
             b,
             addr,
@@ -2112,6 +2198,7 @@ pub(crate) fn lift_vptest(
             writemask
         }),
         |addr| ops.push(IrOp::VPTestToMaskM {
+            fault: Default::default(),
             k,
             a,
             addr,
@@ -2155,6 +2242,7 @@ pub(crate) fn lift_vpcmp(
             writemask
         }),
         |addr| ops.push(IrOp::VPCmpToMaskM {
+            fault: Default::default(),
             k,
             a,
             addr,
@@ -2206,6 +2294,7 @@ pub(crate) fn lift_vpcmp_fixed_or_packed(
             writemask
         }),
         |addr| ops.push(IrOp::VPCmpToMaskM {
+            fault: Default::default(),
             k,
             a,
             addr,
@@ -2236,6 +2325,7 @@ pub(crate) fn lift_vpacked_shift(
         if insn.op_kind(1) == OpKind::Memory {
             let addr = legacy_sse_memory(insn, ops, tg)?;
             ops.push(IrOp::VShiftRegM {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 elem: lane,
@@ -2328,6 +2418,7 @@ pub(crate) fn lift_pshufd(
         None if insn.op_kind(1) == OpKind::Memory => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VLoad {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 size: 16,
@@ -2360,6 +2451,7 @@ pub(crate) fn lift_vperm1(
     if insn.op_kind(2) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPerm1M {
+            fault: Default::default(),
             dst,
             idx,
             addr,
@@ -2398,6 +2490,7 @@ pub(crate) fn lift_vpack(
     if bytes == 16 && insn.op_kind(2) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VPackWideM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -2444,6 +2537,7 @@ pub(crate) fn lift_vpblendw(
     if insn.op_kind(2) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VBlendWM {
+            fault: Default::default(),
             dst,
             a,
             addr,
@@ -2540,13 +2634,19 @@ pub(crate) fn lift_movdup(
             // shuffle pick the right dwords. A 32-byte load uses `VLoadWide`.
             if bytes > 16 {
                 ops.push(IrOp::VLoadWide {
+                    fault: Default::default(),
                     dst: d,
                     addr,
                     bytes,
                 });
             } else {
                 let size = if ddup { 8 } else { 16 };
-                ops.push(IrOp::VLoad { dst: d, addr, size });
+                ops.push(IrOp::VLoad {
+                    fault: Default::default(),
+                    dst: d,
+                    addr,
+                    size,
+                });
             }
             d
         }
@@ -2613,6 +2713,7 @@ pub(crate) fn lift_shufps(
             imm: imm32
         }),
         |addr| ops.push(IrOp::VShufpsM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -2666,6 +2767,7 @@ pub(crate) fn lift_vshufps(
                 imm_hi
             }),
             |addr| ops.push(IrOp::VShufps256M {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -2691,6 +2793,7 @@ pub(crate) fn lift_vshufps(
             imm: imm32
         }),
         |addr| ops.push(IrOp::VShufpsM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -2732,12 +2835,14 @@ pub(crate) fn lift_vpermil_imm(
             let addr = effective_address(insn, ops, tg)?;
             if bytes > 16 {
                 ops.push(IrOp::VLoadWide {
+                    fault: Default::default(),
                     dst: d,
                     addr,
                     bytes,
                 });
             } else {
                 ops.push(IrOp::VLoad {
+                    fault: Default::default(),
                     dst: d,
                     addr,
                     size: 16,
@@ -2820,6 +2925,7 @@ pub(crate) fn lift_pshufw(
     if !vex && insn.op_kind(1) == OpKind::Memory {
         let addr = legacy_sse_memory(insn, ops, tg)?;
         ops.push(IrOp::VShuffle16M {
+            fault: Default::default(),
             dst: d,
             addr,
             imm: insn.immediate(2) as u8,
@@ -2868,6 +2974,7 @@ pub(crate) fn lift_vunpack(
             high
         }),
         |addr| ops.push(IrOp::VUnpackLowM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -2907,6 +3014,7 @@ pub(crate) fn lift_vunpack_avx(
                 high
             }),
             |addr| ops.push(IrOp::VUnpack256M {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -2936,6 +3044,7 @@ pub(crate) fn lift_vunpack_avx(
         // Memory src2: `VUnpackLowM` reads `a` explicitly, so there is no pre-copy to
         // land on `dst` before the load that can fault (fault atomicity, spec.md §16).
         |addr| ops.push(IrOp::VUnpackLowM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -2969,6 +3078,7 @@ pub(crate) fn lift_aes(
             op
         }),
         |addr| ops.push(IrOp::VAesM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -2997,6 +3107,7 @@ pub(crate) fn lift_vaes(
         2,
         |b| ops.push(IrOp::VAes { dst: d, a, b, op }),
         |addr| ops.push(IrOp::VAesM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -3023,7 +3134,11 @@ pub(crate) fn lift_aes_imc(
         reg_xmm,
         1,
         |src| ops.push(IrOp::VAesImc { dst: d, src }),
-        |addr| ops.push(IrOp::VAesImcM { dst: d, addr })
+        |addr| ops.push(IrOp::VAesImcM {
+            fault: Default::default(),
+            dst: d,
+            addr
+        })
     );
     if vex {
         ops.push(IrOp::VZeroUpper { reg: d });
@@ -3048,7 +3163,12 @@ pub(crate) fn lift_aes_keygen(
         reg_xmm,
         1,
         |src| ops.push(IrOp::VAesKeygen { dst: d, src, imm }),
-        |addr| ops.push(IrOp::VAesKeygenM { dst: d, addr, imm })
+        |addr| ops.push(IrOp::VAesKeygenM {
+            fault: Default::default(),
+            dst: d,
+            addr,
+            imm
+        })
     );
     if vex {
         ops.push(IrOp::VZeroUpper { reg: d });
@@ -3078,6 +3198,7 @@ pub(crate) fn lift_pclmul(
             imm
         }),
         |addr| ops.push(IrOp::VPclmulM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3106,6 +3227,7 @@ pub(crate) fn lift_vpclmul(
         2,
         |b| ops.push(IrOp::VPclmul { dst: d, a, b, imm }),
         |addr| ops.push(IrOp::VPclmulM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -3147,6 +3269,7 @@ pub(crate) fn lift_sha(
             op
         }),
         |addr| ops.push(IrOp::VShaM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3187,6 +3310,7 @@ pub(crate) fn lift_gfni(
             op
         }),
         |addr| ops.push(IrOp::VGfniM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3234,6 +3358,7 @@ pub(crate) fn lift_vgfni(
             op
         }),
         |addr| ops.push(IrOp::VGfniM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -3269,6 +3394,7 @@ pub(crate) fn lift_psign(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VPsignM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3306,6 +3432,7 @@ pub(crate) fn lift_vpsign(
                 bytes: 32
             }),
             |addr| ops.push(IrOp::VPsignM {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -3331,6 +3458,7 @@ pub(crate) fn lift_vpsign(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VPsignM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -3353,6 +3481,7 @@ pub(crate) fn lift_packuswb(
     if insn.op_kind(1) == OpKind::Memory {
         let addr = legacy_sse_memory(insn, ops, tg)?;
         ops.push(IrOp::VPackWideM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3391,6 +3520,7 @@ pub(crate) fn lift_pack_signed(
             bytes: 16,
         }),
         |addr| ops.push(IrOp::VPackWideM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3413,6 +3543,7 @@ pub(crate) fn lift_pmaddwd(
     if insn.op_kind(1) == OpKind::Memory {
         let addr = legacy_sse_memory(insn, ops, tg)?;
         ops.push(IrOp::VPMaddM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3439,6 +3570,7 @@ pub(crate) fn lift_pmaddubsw(
     if insn.op_kind(1) == OpKind::Memory {
         let addr = legacy_sse_memory(insn, ops, tg)?;
         ops.push(IrOp::VPMaddM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3489,6 +3621,7 @@ pub(crate) fn lift_vpmadd(
             bytes
         }),
         |addr| ops.push(IrOp::VPMaddM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -3603,14 +3736,24 @@ pub(crate) fn lift_half_mem(
     if let Some(d) = reg_xmm(insn, 0) {
         if insn.op_kind(1) == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VLoadHalf { dst: d, addr, high });
+            ops.push(IrOp::VLoadHalf {
+                fault: Default::default(),
+                dst: d,
+                addr,
+                high,
+            });
             return Ok(());
         }
     }
     if let Some(s) = reg_xmm(insn, 1) {
         if insn.op_kind(0) == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VStoreHalf { addr, src: s, high });
+            ops.push(IrOp::VStoreHalf {
+                fault: Default::default(),
+                addr,
+                src: s,
+                high,
+            });
             return Ok(());
         }
     }
@@ -3640,7 +3783,12 @@ pub(crate) fn lift_vhalf_mem(
     if d != a {
         ops.push(IrOp::VMov { dst: d, src: a });
     }
-    ops.push(IrOp::VLoadHalf { dst: d, addr, high });
+    ops.push(IrOp::VLoadHalf {
+        fault: Default::default(),
+        dst: d,
+        addr,
+        high,
+    });
     ops.push(IrOp::VZeroUpper { reg: d }); // VEX.128 clears bits 255:128
     Ok(())
 }
@@ -3705,6 +3853,7 @@ pub(crate) fn read_scalar_float(
         let addr = effective_address(insn, ops, tg)?;
         let t = tg.fresh();
         ops.push(IrOp::Load {
+            fault: Default::default(),
             dst: t,
             addr,
             size: prec.bytes(),
@@ -3735,14 +3884,24 @@ pub(crate) fn lift_scalar_fmove(
         }
         if insn.op_kind(1) == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VLoad { dst: d, addr, size });
+            ops.push(IrOp::VLoad {
+                fault: Default::default(),
+                dst: d,
+                addr,
+                size,
+            });
             return Ok(());
         }
     }
     if let Some(s) = reg_xmm(insn, 1) {
         if insn.op_kind(0) == OpKind::Memory {
             let addr = effective_address(insn, ops, tg)?;
-            ops.push(IrOp::VStore { addr, src: s, size });
+            ops.push(IrOp::VStore {
+                fault: Default::default(),
+                addr,
+                src: s,
+                size,
+            });
             return Ok(());
         }
     }
@@ -3772,14 +3931,24 @@ pub(crate) fn lift_vscalar_fmove(
     if insn.op_kind(0) == OpKind::Memory {
         let s = reg_xmm(insn, 1).or_unsupported(insn)?;
         let addr = effective_address(insn, ops, tg)?;
-        ops.push(IrOp::VStore { addr, src: s, size });
+        ops.push(IrOp::VStore {
+            fault: Default::default(),
+            addr,
+            src: s,
+            size,
+        });
         return Ok(());
     }
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
     // 2-operand memory load: the scalar goes to the low element, all upper bits zero.
     if insn.op_kind(1) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
-        ops.push(IrOp::VLoad { dst: d, addr, size });
+        ops.push(IrOp::VLoad {
+            fault: Default::default(),
+            dst: d,
+            addr,
+            size,
+        });
         ops.push(IrOp::VZeroUpper { reg: d }); // VEX zeroes bits 255:128 (VLoad zeroes 127:size)
         return Ok(());
     }
@@ -3823,6 +3992,7 @@ pub(crate) fn lift_float_bin(
             scalar
         }),
         |addr| ops.push(IrOp::VFloatBinM {
+            fault: Default::default(),
             dst: d,
             addr,
             op,
@@ -3864,6 +4034,7 @@ pub(crate) fn lift_vfloat_bin(
                     prec
                 }),
                 |addr| ops.push(IrOp::VFloatBin256M {
+                    fault: Default::default(),
                     dst: d,
                     a,
                     addr,
@@ -3903,6 +4074,7 @@ pub(crate) fn lift_vfloat_bin(
                 ops.push(IrOp::VMov { dst: d, src: a });
             }
             ops.push(IrOp::VFloatBinM {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 op,
@@ -3941,6 +4113,7 @@ pub(crate) fn lift_hfloat(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VHFloatM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -3983,6 +4156,7 @@ pub(crate) fn lift_vhfloat(
         // Memory op2: `VHFloatM` reads op1 from `a` explicitly (no pre-copy needed).
         |addr| {
             ops.push(IrOp::VHFloatM {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -4023,6 +4197,7 @@ pub(crate) fn lift_hint(
             bytes: 16
         }),
         |addr| ops.push(IrOp::VHIntM {
+            fault: Default::default(),
             dst: d,
             a: d,
             addr,
@@ -4061,6 +4236,7 @@ pub(crate) fn lift_vhint(
                 bytes: 32
             }),
             |addr| ops.push(IrOp::VHIntM {
+                fault: Default::default(),
                 dst: d,
                 a,
                 addr,
@@ -4088,6 +4264,7 @@ pub(crate) fn lift_vhint(
         // Memory op2: `VHIntM` reads `a` explicitly — no pre-copy lands on `dst`
         // before the load that can fault (fault atomicity, spec.md §16).
         |addr| ops.push(IrOp::VHIntM {
+            fault: Default::default(),
             dst: d,
             a,
             addr,
@@ -4139,6 +4316,7 @@ pub(crate) fn lift_float_cmp_mask(
             pred
         }),
         |addr| ops.push(IrOp::VFloatCmpMaskM {
+            fault: Default::default(),
             dst: d,
             addr,
             prec,
@@ -4182,6 +4360,7 @@ pub(crate) fn lift_vfloat_cmp_mask(
                     pred
                 }),
                 |addr| ops.push(IrOp::VFloatCmpMask256M {
+                    fault: Default::default(),
                     dst: d,
                     a,
                     addr,
@@ -4216,6 +4395,7 @@ pub(crate) fn lift_vfloat_cmp_mask(
                 ops.push(IrOp::VMov { dst: d, src: a });
             }
             ops.push(IrOp::VFloatCmpMaskM {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 prec,
@@ -4334,6 +4514,7 @@ pub(crate) fn lift_float_unary(
             legacy_sse_memory(insn, ops, tg)?
         };
         ops.push(IrOp::VFloatUnaryM {
+            fault: Default::default(),
             dst: d,
             a: d,
             src_addr,
@@ -4398,6 +4579,7 @@ pub(crate) fn lift_fma(
     if mem {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VFmaM {
+            fault: Default::default(),
             dst,
             x,
             y,
@@ -4461,6 +4643,7 @@ pub(crate) fn lift_vfloat_unary_scalar(
             scalar: true
         }),
         |addr| ops.push(IrOp::VFloatUnaryM {
+            fault: Default::default(),
             dst: d,
             a,
             src_addr: addr,
@@ -4500,6 +4683,7 @@ pub(crate) fn lift_vfloat_unary_packed(
                 prec
             }),
             |addr| ops.push(IrOp::VFloatUnary256M {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 op,
@@ -4524,6 +4708,7 @@ pub(crate) fn lift_vfloat_unary_packed(
             scalar: false
         }),
         |addr| ops.push(IrOp::VFloatUnaryM {
+            fault: Default::default(),
             dst: d,
             a: d, // packed overwrites the whole dst → `a` unused
             src_addr: addr,
@@ -4612,7 +4797,12 @@ pub(crate) fn lift_packed_cvt(
                 }),
                 None if insn.op_kind(1) == OpKind::Memory => {
                     let addr = effective_address(insn, ops, tg)?;
-                    ops.push(IrOp::VPackedCvt256M { dst: d, addr, kind });
+                    ops.push(IrOp::VPackedCvt256M {
+                        fault: Default::default(),
+                        dst: d,
+                        addr,
+                        kind,
+                    });
                 }
                 None => return Err(unsupported_insn(insn)),
             }
@@ -4639,6 +4829,7 @@ pub(crate) fn lift_packed_cvt(
         None if insn.op_kind(1) == OpKind::Memory => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::VLoad {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 size: kind.mem_bytes(),
@@ -4675,6 +4866,7 @@ fn lift_packed_cvt256(
         if widening {
             // 128-bit source: load into dst's low lane; the convert reads it and expands.
             ops.push(IrOp::VLoad {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 size: 16,
@@ -4683,6 +4875,7 @@ fn lift_packed_cvt256(
             // 256-bit source: stage the full 256 bits in dst; the convert reads it and
             // writes back the 128-bit result (clearing dst[255:128]).
             ops.push(IrOp::VLoadWide {
+                fault: Default::default(),
                 dst: d,
                 addr,
                 bytes: 32,
@@ -4714,7 +4907,12 @@ pub(crate) fn lift_vcvtph2ps(
         // Materialise the m64 (4 halves) / m128 (8 halves) source into `dst`'s low half.
         let addr = effective_address(insn, ops, tg)?;
         let size = if lanes == 8 { 16 } else { 8 };
-        ops.push(IrOp::VLoad { dst: d, addr, size });
+        ops.push(IrOp::VLoad {
+            fault: Default::default(),
+            dst: d,
+            addr,
+            size,
+        });
         d
     } else {
         return Err(unsupported_insn(insn));
@@ -4770,6 +4968,7 @@ pub(crate) fn lift_phminposuw(
     } else if insn.op_kind(1) == OpKind::Memory {
         let addr = effective_address(insn, ops, tg)?;
         ops.push(IrOp::VLoad {
+            fault: Default::default(),
             dst: d,
             addr,
             size: 16,
@@ -4810,6 +5009,7 @@ pub(crate) fn lift_mpsadbw(
             legacy_sse_memory(insn, ops, tg)?
         };
         ops.push(IrOp::VMpsadbwM {
+            fault: Default::default(),
             dst,
             a,
             addr,

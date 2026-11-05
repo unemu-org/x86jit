@@ -82,6 +82,7 @@ pub(crate) fn lift_push(
     // `ss_base + (SP & 0xFFFF)`. The wrapped SP is the offset; add the SS base.
     let store_addr = stack_addr(Val::Temp(new_rsp), ops, tg, mode);
     ops.push(IrOp::Store {
+        fault: Default::default(),
         addr: store_addr,
         src,
         size,
@@ -122,6 +123,7 @@ pub(crate) fn lift_pop(
     let load_addr = stack_addr(rsp, ops, tg, mode);
     let val = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: val,
         addr: load_addr,
         size,
@@ -210,6 +212,7 @@ pub(crate) fn lift_call_real16(
     // Store the return IP at SS:(new SP), then commit SP, then jump.
     let store_addr = stack_addr(Val::Temp(new_sp), ops, tg, CpuMode::Real16);
     ops.push(IrOp::Store {
+        fault: Default::default(),
         addr: store_addr,
         src: Val::Imm(return_ip),
         size: 2,
@@ -244,6 +247,7 @@ pub(crate) fn lift_ret_real16(
     let load_addr = stack_addr(sp, ops, tg, CpuMode::Real16);
     let ip = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: ip,
         addr: load_addr,
         size: 2,
@@ -383,6 +387,7 @@ pub(crate) fn lift_string(
     };
 
     ops.push(IrOp::RepString {
+        fault: Default::default(),
         op,
         elem,
         rep,
@@ -448,7 +453,12 @@ pub(crate) fn lift_x87(
         } else {
             Val::Imm(0)
         };
-        ops.push(IrOp::X87 { kind, addr, sti });
+        ops.push(IrOp::X87 {
+            fault: Default::default(),
+            kind,
+            addr,
+            sti,
+        });
         Ok(())
     };
 
@@ -662,6 +672,7 @@ pub(crate) fn lift_x87(
                 emit(K::FnstswMem, ops, tg)?;
             } else {
                 ops.push(IrOp::X87 {
+                    fault: Default::default(),
                     kind: K::Fnstsw,
                     addr: Val::Imm(0),
                     sti: 0,
@@ -774,6 +785,7 @@ fn far_target(
             let addr = effective_address(insn, ops, tg)?;
             let ip_t = tg.fresh();
             ops.push(IrOp::Load {
+                fault: Default::default(),
                 dst: ip_t,
                 addr,
                 size: 2,
@@ -781,6 +793,7 @@ fn far_target(
             let cs_addr = add_addr(addr, Val::Imm(2), ops, tg);
             let cs_t = tg.fresh();
             ops.push(IrOp::Load {
+                fault: Default::default(),
                 dst: cs_t,
                 addr: cs_addr,
                 size: 2,
@@ -896,6 +909,7 @@ pub(crate) fn lift_xlat_real16(
     let addr = add_addr(base, off, ops, tg);
     let v = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: v,
         addr,
         size: 1,
@@ -929,6 +943,7 @@ pub(crate) fn lift_bound_real16(
     let addr = effective_address(insn, ops, tg)?;
     let lower = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: lower,
         addr,
         size: 2,
@@ -936,6 +951,7 @@ pub(crate) fn lift_bound_real16(
     let upper_addr = add_addr(addr, Val::Imm(2), ops, tg);
     let upper = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: upper,
         addr: upper_addr,
         size: 2,
@@ -974,6 +990,7 @@ pub(crate) fn lift_load_far_ptr_real16(
     let addr = effective_address(insn, ops, tg)?;
     let off = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: off,
         addr,
         size: 2,
@@ -981,6 +998,7 @@ pub(crate) fn lift_load_far_ptr_real16(
     let sel_addr = add_addr(addr, Val::Imm(2), ops, tg);
     let sel = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: sel,
         addr: sel_addr,
         size: 2,
@@ -1019,6 +1037,7 @@ pub(crate) fn lift_leave_real16(
     let load_addr = stack_addr(bp16, ops, tg, CpuMode::Real16);
     let val = tg.fresh();
     ops.push(IrOp::Load {
+        fault: Default::default(),
         dst: val,
         addr: load_addr,
         size: 2,

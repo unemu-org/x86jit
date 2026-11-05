@@ -37,6 +37,7 @@ pub(crate) fn lift_binop(
             let b = lower_read(insn, 1, ops, tg)?;
             let old = tg.fresh();
             ops.push(IrOp::AtomicRmw {
+                fault: Default::default(),
                 old,
                 addr,
                 src: b,
@@ -50,7 +51,12 @@ pub(crate) fn lift_binop(
 
         let a = {
             let t = tg.fresh();
-            ops.push(IrOp::Load { dst: t, addr, size });
+            ops.push(IrOp::Load {
+                fault: Default::default(),
+                dst: t,
+                addr,
+                size,
+            });
             Val::Temp(t)
         };
         let b = lower_read(insn, 1, ops, tg)?;
@@ -58,6 +64,7 @@ pub(crate) fn lift_binop(
         ops.push(mk_binop(op, res, a, b, size, flags));
         if write_back {
             ops.push(IrOp::Store {
+                fault: Default::default(),
                 addr,
                 src: Val::Temp(res),
                 size,
@@ -99,6 +106,7 @@ pub(crate) fn lift_unary_op0(
         if insn.has_lock_prefix() {
             let old = tg.fresh();
             ops.push(IrOp::AtomicRmw {
+                fault: Default::default(),
                 old,
                 addr,
                 src: rmw_src,
@@ -114,12 +122,18 @@ pub(crate) fn lift_unary_op0(
         }
         let a = {
             let t = tg.fresh();
-            ops.push(IrOp::Load { dst: t, addr, size });
+            ops.push(IrOp::Load {
+                fault: Default::default(),
+                dst: t,
+                addr,
+                size,
+            });
             Val::Temp(t)
         };
         let res = tg.fresh();
         emit(ops, res, a, size);
         ops.push(IrOp::Store {
+            fault: Default::default(),
             addr,
             src: Val::Temp(res),
             size,
@@ -183,7 +197,12 @@ pub(crate) fn lift_double_shift(
         let addr = effective_address(insn, ops, tg)?;
         let a = {
             let t = tg.fresh();
-            ops.push(IrOp::Load { dst: t, addr, size });
+            ops.push(IrOp::Load {
+                fault: Default::default(),
+                dst: t,
+                addr,
+                size,
+            });
             Val::Temp(t)
         };
         ops.push(IrOp::DoubleShift {
@@ -196,6 +215,7 @@ pub(crate) fn lift_double_shift(
             set_flags: FlagMask::SHIFT,
         });
         ops.push(IrOp::Store {
+            fault: Default::default(),
             addr,
             src: Val::Temp(res),
             size,
@@ -474,6 +494,7 @@ pub(crate) fn lift_xadd(
         let addr = effective_address(insn, ops, tg)?;
         let old = tg.fresh();
         ops.push(IrOp::AtomicRmw {
+            fault: Default::default(),
             old,
             addr,
             src,
@@ -529,6 +550,7 @@ pub(crate) fn lift_cmpxchg(
         let addr = effective_address(insn, ops, tg)?;
         let old = tg.fresh();
         ops.push(IrOp::AtomicCas {
+            fault: Default::default(),
             old,
             addr,
             expected: exp,
@@ -635,6 +657,7 @@ pub(crate) fn lift_cmpxchg_pair(
         8
     };
     ops.push(IrOp::AtomicCasPair {
+        fault: Default::default(),
         addr,
         size,
         len: insn.len() as u8,
@@ -792,6 +815,7 @@ pub(crate) fn emit_mem_bt(
         };
         let old = tg.fresh();
         ops.push(IrOp::AtomicRmw {
+            fault: Default::default(),
             old,
             addr: ea,
             src,
@@ -814,6 +838,7 @@ pub(crate) fn emit_mem_bt(
     let a = {
         let t = tg.fresh();
         ops.push(IrOp::Load {
+            fault: Default::default(),
             dst: t,
             addr: ea,
             size: esize,
@@ -830,6 +855,7 @@ pub(crate) fn emit_mem_bt(
     });
     if !matches!(op, BtOp::Test) {
         ops.push(IrOp::Store {
+            fault: Default::default(),
             addr: ea,
             src: Val::Temp(result),
             size: esize,
@@ -944,6 +970,7 @@ pub(crate) fn lift_movbe(
         // movbe reg, [mem]
         let loaded = tg.fresh();
         ops.push(IrOp::Load {
+            fault: Default::default(),
             dst: loaded,
             addr,
             size,
@@ -966,6 +993,7 @@ pub(crate) fn lift_movbe(
             size,
         });
         ops.push(IrOp::Store {
+            fault: Default::default(),
             addr,
             src: Val::Temp(swapped),
             size,
@@ -997,6 +1025,7 @@ pub(crate) fn lift_xchg(
         let reg_val = lower_read(insn, reg_idx, ops, tg)?;
         let old = tg.fresh();
         ops.push(IrOp::AtomicRmw {
+            fault: Default::default(),
             old,
             addr,
             src: reg_val,

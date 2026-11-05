@@ -121,6 +121,13 @@ native** for hot code (a tight scalar loop is ~20× native on the JIT; the inter
 everything up front. Throughput work is ongoing. The `x86jit-bench` crate records
 interp/JIT/native timings per commit if you want real numbers.
 
+Long64 data references enforce 48-bit canonical addressing: a non-canonical SS
+reference raises `Exit::Exception` vector 12, other references vector 13. Required
+SIMD and FXSAVE/FXRSTOR operand alignment raises vector 13 before any state commits;
+error code zero is implied. Legacy SSE follows the Intel alignment rule. AMD's
+optional MXCSR.MM relaxation is not modeled (MXCSR itself is not modeled).
+Sources: Intel SDM Vol 1 §§3.3.7.1, 14.9, 15.7; AMD64 APM Vol 1 §4.3.2.
+
 **Known gaps** (deliberately absent or partial today):
 
 - AVX-512 / EVEX is partial and growing; MMX is minimal (guests generally use SSE instead).

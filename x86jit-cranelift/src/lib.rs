@@ -237,8 +237,13 @@ unsafe extern "C" fn string_helper(
         None => RET_CONTINUE,
         Some(x86jit_core::interp::StringStop::Interrupted) => RET_INTERRUPTED,
         Some(x86jit_core::interp::StringStop::Fault(f)) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            ctx.record_helper_fault(
+                f.addr,
+                u64::from(f.elem),
+                f.write,
+                f.addr,
+                u64::from(f.elem),
+            );
             RET_UNMAPPED
         }
     };
@@ -285,9 +290,7 @@ unsafe extern "C" fn cas_pair_helper(
             RET_EXCEPTION
         }
         Some(x86jit_core::Exit::UnmappedMemory { addr: at, .. }) => {
-            ctx.fault_addr = at;
-            ctx.fault_size = size;
-            ctx.fault_access = 1;
+            ctx.record_helper_fault(at, size, true, addr, size);
             RET_UNMAPPED
         }
         // Re-execute in the interpreter so the dispatcher returns the precise
@@ -345,8 +348,8 @@ unsafe extern "C" fn x87_helper(
             RET_CONTINUE
         }
         Some((fault, write)) => {
-            ctx.fault_addr = fault;
-            ctx.fault_access = write as u64;
+            let width = x86jit_core::x87::mem_operand_bytes(kind);
+            ctx.record_helper_fault(fault, width, write, addr, width);
             cpu.rip = cur_addr;
             RET_UNMAPPED
         }
@@ -388,8 +391,7 @@ unsafe extern "C" fn fxstate_helper(
             RET_CONTINUE
         }
         Some((fault, write)) => {
-            ctx.fault_addr = fault;
-            ctx.fault_access = write as u64;
+            ctx.record_helper_fault(fault, 512, write, addr, 512);
             cpu.rip = cur_addr;
             RET_UNMAPPED
         }
@@ -509,6 +511,15 @@ unsafe extern "C" fn vmaskmov_helper(
     );
 }
 
+/// Decode a helper's cold operand carrier. The low word remains the transfer
+/// width; xj-au4.2 tracks embedded broadcast's transfer/value semantics.
+/// SDM Vol 2A §2.7.7: the architectural carrier is the one decoded element.
+#[cold]
+fn helper_operand_span(base: u64, packed_bytes: u64) -> (u64, u64) {
+    let carrier = packed_bytes >> 16;
+    (base, if carrier != 0 { carrier } else { packed_bytes })
+}
+
 /// EVEX write-masked vector **memory** move `vmovdqu{8,16,32,64} v{k}{z}, [mem]` (load)
 /// and `[mem]{k}, v` (store). Element-wise via the shared
 /// `masked_load_run`/`masked_store_run` so masked-off lanes never fault (hardware
@@ -570,8 +581,9 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     match fault {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (operand, width) =
+                x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -618,12 +630,14 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
                 let ea = addr.wrapping_add(i * elem);
                 if ea < raw.guest_base || ea.checked_add(elem).is_none_or(|end| end > raw.size) {
                     cpu.rip = cur_addr;
-                    ctx.fault_addr = if ea >= raw.guest_base && ea < raw.size {
+                    let at = if ea >= raw.guest_base && ea < raw.size {
                         raw.size
                     } else {
                         ea
                     };
-                    ctx.fault_access = 1;
+                    let (operand, width) =
+                        x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
+                    ctx.record_helper_fault(at, elem, true, operand, width);
                     return RET_UNMAPPED;
                 }
             }
@@ -656,8 +670,9 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
     match fault {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (operand, width) =
+                x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -864,6 +879,7 @@ unsafe extern "C" fn gf2p8_mem_helper(
     k: u64,
     zeroing: u64,
     bytes: u64,
+    cur_addr: u64,
 ) -> u64 {
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -890,8 +906,19 @@ unsafe extern "C" fn gf2p8_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            // SDM Vol 3A §6.5: faults save the owning instruction's RIP.
+            cpu.rip = cur_addr;
+            let (mut operand, mut width) = helper_operand_span(addr, bytes);
+            if k != 0
+                && matches!(
+                    x86jit_core::ir::GfniOp::from_u8(mode as u8),
+                    x86jit_core::ir::GfniOp::Mulb
+                )
+            {
+                (operand, width) =
+                    x86jit_core::memory::active_operand_span(addr, width, 1, cpu.kmask[k as usize]);
+            }
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -1092,8 +1119,8 @@ unsafe extern "C" fn vpermt2_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (operand, width) = helper_operand_span(addr, bytes);
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -1176,8 +1203,8 @@ unsafe extern "C" fn vperm1_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (operand, width) = helper_operand_span(addr, bytes);
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -1255,8 +1282,13 @@ unsafe extern "C" fn vpmov_narrow_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            ctx.record_helper_fault(
+                f.addr,
+                u64::from(f.elem),
+                f.write,
+                addr,
+                src_width / from * to,
+            );
             RET_UNMAPPED
         }
     }
@@ -1847,8 +1879,18 @@ unsafe extern "C" fn broadcast_lane_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (operand, width) = if masked != 0 {
+                x86jit_core::memory::active_broadcast_span(
+                    base,
+                    chunk as u8,
+                    elem as u8,
+                    dst_width as u16,
+                    cpu.kmask[k as usize],
+                )
+            } else {
+                (base, chunk)
+            };
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -1955,8 +1997,19 @@ unsafe extern "C" fn fma_mem_helper(
     ) {
         None => RET_CONTINUE,
         Some(f) => {
-            ctx.fault_addr = f.addr;
-            ctx.fault_access = f.write as u64;
+            let (mut operand, mut width) = helper_operand_span(base, bytes);
+            if scalar != 0 {
+                width = if prec_f64 != 0 { 8 } else { 4 };
+            }
+            if masked != 0 && bytes >> 16 == 0 {
+                (operand, width) = x86jit_core::memory::active_operand_span(
+                    base,
+                    width,
+                    if prec_f64 != 0 { 8 } else { 4 },
+                    cpu.kmask[k as usize],
+                );
+            }
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             RET_UNMAPPED
         }
     }
@@ -2842,7 +2895,7 @@ impl Shared {
         let var_shift_sig = params(10, false); // (cpu, dst, a, count, elem, right, arith, k, zeroing, bytes) -> ()
         let shift_reg_sig = params(10, false); // (cpu, dst, a, count, elem, right, arith, k, zeroing, bytes) -> ()
         let gf2p8_sig = params(9, false); // (cpu, dst, a, b, imm, mode, k, zeroing, bytes) -> ()
-        let gf2p8_mem_sig = params(10, true); // (cpu, mem, dst, a, addr, imm, mode, k, zeroing, bytes) -> ret
+        let gf2p8_mem_sig = params(11, true); // (cpu, mem, dst, a, addr, imm, mode, k, zeroing, bytes, cur_addr) -> ret
         let valign_sig = params(7, false); // valign(cpu, dst, a, b, shift, elem, bytes) -> ()
         let vpermt2_sig = params(10, false); // (cpu, dst, idx, tbl, elem, k, masked, zeroing, bytes, imode) -> ()
         let vpermt2_mem_sig = params(12, true); // (cpu, mem, dst, idx, addr, elem, k, masked, zeroing, bytes, imode, cur_addr) -> ret
@@ -3403,6 +3456,63 @@ impl Drop for JitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fma_scalar_helper_carriers_use_element_width() {
+        // SDM Vol 2C, VFMADD132SS/SD, Operation: m32/m64. Exercise the helper
+        // ABI's scalar branches directly, as scalar lifting can inline the load.
+        use x86jit_core::jit_abi::{MemCtx, RET_UNMAPPED};
+        use x86jit_core::{CpuMode, CpuState, Exit, Memory, MemoryModel};
+        let mem = Memory::new(MemoryModel::Flat { size: 0x8000 });
+        for (f64, width) in [(0, 4), (1, 8)] {
+            for tail in [width, width / 2] {
+                let base = (1u64 << 47) - tail;
+                let mut cpu = CpuState::default();
+                let mut ctx = MemCtx::for_memory(&mem);
+                // SAFETY: both ABI pointers refer to live state; the address
+                // misses the bounded guest backing before any host access.
+                let ret = unsafe {
+                    fma_mem_helper(
+                        (&mut cpu as *mut CpuState).cast(),
+                        (&mut ctx as *mut MemCtx).cast(),
+                        0,
+                        0,
+                        1,
+                        0,
+                        base,
+                        2,
+                        f64,
+                        1,
+                        0,
+                        0,
+                        16,
+                        0,
+                        0x1234,
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                assert_eq!(ret, RET_UNMAPPED);
+                assert_eq!(ctx.helper_operand_addr, base);
+                assert_eq!(ctx.helper_operand_size, width);
+                let exit = ctx.unmapped_exit(&cpu, CpuMode::Long64);
+                if tail == width {
+                    assert!(matches!(exit, Exit::UnmappedMemory { addr, .. } if addr == base));
+                } else {
+                    assert!(matches!(
+                        exit,
+                        Exit::Exception {
+                            addr: 0x1234,
+                            vector: 13,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
     use x86jit_core::jit_abi::run_compiled;
     use x86jit_core::lift::{lift_block, CpuMode};
     use x86jit_core::{CpuState, Memory, MemoryModel, Prot, RegionKind, StepResult};

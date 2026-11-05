@@ -118,6 +118,7 @@ impl Translator<'_, '_> {
             .ins()
             .icmp_imm(IntCC::NotEqual, code, RET_CONTINUE as i64);
         let ok = self.begin_trap_fork(stopped);
+        self.tag_stack_fault();
         if let Some(fv) = self.fuel_var {
             let fuel = self.builder.use_var(fv);
             self.builder

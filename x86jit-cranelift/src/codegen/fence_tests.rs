@@ -242,6 +242,7 @@ fn fence_clobbers_alias_analysis_loads() {
                         reg: Reg::Rbx,
                     },
                     IrOp::Load {
+                        fault: x86jit_core::ir::MemoryAccess::new(8, true, false),
                         dst: 1,
                         addr: Val::Temp(0),
                         size: 8,
@@ -254,6 +255,7 @@ fn fence_clobbers_alias_analysis_loads() {
                 }
                 ops.extend([
                     IrOp::Load {
+                        fault: x86jit_core::ir::MemoryAccess::new(8, true, false),
                         dst: 2,
                         addr: Val::Temp(0),
                         size: 8,

@@ -307,6 +307,8 @@ fn translate_block_for_target(
         mem,
         temps: vec![None; ir.temp_count as usize],
         cur_addr: ir.guest_start,
+        stack_access: false,
+        access_bytes: 0,
         guest_end: ir.guest_start + ir.guest_len as u64,
         alloc_slot,
         helpers,
@@ -328,6 +330,8 @@ fn translate_block_for_target(
         recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
+        alignment_tail: None,
+        alignment_recoveries: Vec::new(),
     };
 
     if !matches!(ir.ops.first(), Some(IrOp::InsnStart { .. })) {
@@ -352,6 +356,7 @@ fn translate_block_for_target(
         t.store_cpu(offsets.rip, end);
         t.ret(RET_CONTINUE);
     }
+    t.emit_alignment_tail();
     t.emit_exit_tails();
     t.builder.seal_all_blocks();
     t.gpr_sync.remove_clean_stores(t.builder.func);
@@ -398,6 +403,8 @@ pub fn translate_region(
         mem,
         temps: Vec::new(),
         cur_addr: region.entry,
+        stack_access: false,
+        access_bytes: 0,
         guest_end: region.entry,
         alloc_slot,
         helpers,
@@ -419,6 +426,8 @@ pub fn translate_region(
         recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
+        alignment_tail: None,
+        alignment_recoveries: Vec::new(),
     };
 
     // Carry the 16 GPRs as SSA Variables (§12 M5-T3e): declare them, seed each from
@@ -469,6 +478,7 @@ pub fn translate_region(
         t.emit_region_block(block, &clif);
     }
 
+    t.emit_alignment_tail();
     t.emit_exit_tails();
     t.builder.seal_all_blocks();
     t.gpr_sync.remove_clean_stores(t.builder.func);
@@ -538,6 +548,8 @@ struct Translator<'a, 'b> {
     mem: Value,
     temps: Vec<Option<Value>>,
     cur_addr: u64,
+    stack_access: bool,
+    access_bytes: u16,
     guest_end: u64,
     /// Full-width guest RIPs indexed by this function's SourceLocs.
     guest_rips: Vec<u64>,
@@ -607,6 +619,8 @@ struct Translator<'a, 'b> {
     /// One cold recovery tail per pending recipe epoch. Helpers enter after the
     /// optional region-register flush, preserving their authoritative CpuState.
     exit_tails: Vec<ExitTail>,
+    alignment_tail: Option<Block>,
+    alignment_recoveries: Vec<(Block, [Option<FlagRecipe>; 6])>,
 }
 
 impl Translator<'_, '_> {
@@ -776,8 +790,16 @@ impl Translator<'_, '_> {
 
     /// Translate one op; return `true` if it terminated the block.
     fn op(&mut self, op: &IrOp) -> bool {
+        self.stack_access = op.memory_access().stack();
+        self.access_bytes = op.memory_access().bytes();
         match op {
             IrOp::InsnStart { guest_addr, .. } => self.emit_insn_start(guest_addr),
+            IrOp::CheckAlign { addr, bytes } => {
+                let addr = self.val(*addr);
+                let low = self.builder.ins().band_imm(addr, i64::from(*bytes) - 1);
+                self.check_alignment(low);
+                false
+            }
             IrOp::ReadReg { dst, reg, .. } => self.emit_read_reg(dst, reg),
             IrOp::WriteReg { reg, src, size, .. } => self.emit_write_reg(reg, src, size),
             IrOp::Add {
@@ -953,7 +975,9 @@ impl Translator<'_, '_> {
                 size,
                 ..
             } => self.emit_atomic_cas(old, addr, expected, src, size),
-            IrOp::AtomicCasPair { addr, size, len } => self.emit_atomic_cas_pair(addr, *size, *len),
+            IrOp::AtomicCasPair {
+                addr, size, len, ..
+            } => self.emit_atomic_cas_pair(addr, *size, *len),
             IrOp::Bt {
                 result,
                 a,
@@ -1132,6 +1156,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 bytes,
+                ..
             } => self.emit_v_dpps_m(dst, a, addr, imm, bytes),
             IrOp::VDppd { dst, b, imm, .. } => self.emit_v_dppd(dst, b, imm),
             IrOp::VDppdM { dst, addr, imm, .. } => self.emit_v_dppd_m(dst, addr, imm),
@@ -1148,6 +1173,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 prec,
+                ..
             } => self.emit_v_dp3_m(dst, a, addr, imm, prec),
             IrOp::VAlign {
                 dst,
@@ -1198,6 +1224,7 @@ impl Translator<'_, '_> {
                 bytes,
                 writemask,
                 zeroing,
+                ..
             } => self.emit_v_perm1_m(dst, idx, addr, elem, bytes, writemask, zeroing),
             IrOp::VMaskedLogic {
                 dst,
@@ -1273,6 +1300,7 @@ impl Translator<'_, '_> {
                 k,
                 zeroing,
                 bytes,
+                ..
             } => self.emit_v_gf2p8_m(dst, a, addr, imm, mode, k, zeroing, bytes),
             IrOp::VLogic256 { dst, a, b, op, .. } => self.emit_v_logic256(dst, a, b, op),
             IrOp::VLogicWide {
@@ -1399,6 +1427,7 @@ impl Translator<'_, '_> {
                 mask,
                 lane,
                 bytes,
+                ..
             } => self.emit_v_p_blend_v_xm(dst, a, addr, mask, lane, bytes),
             IrOp::VBlendI {
                 dst,
@@ -1415,6 +1444,7 @@ impl Translator<'_, '_> {
                 imm,
                 lane,
                 bytes,
+                ..
             } => self.emit_v_blend_i_m(dst, a, addr, imm, lane, bytes),
             IrOp::VPRound {
                 dst,
@@ -1432,6 +1462,7 @@ impl Translator<'_, '_> {
                 mode,
                 scalar,
                 bytes,
+                ..
             } => self.emit_v_p_round_m(dst, addr, prec, mode, scalar, bytes),
             IrOp::VPTernlog {
                 dst,
@@ -1511,6 +1542,7 @@ impl Translator<'_, '_> {
                 dst_width,
                 writemask,
                 zeroing,
+                ..
             } => {
                 self.emit_v_broadcast_lane_m(dst, addr, chunk, elem, dst_width, writemask, zeroing)
             }
@@ -1695,6 +1727,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 high,
+                ..
             } => self.emit_v_shuffle16_m(dst, addr, imm, high),
             IrOp::VShiftRegM {
                 dst,
@@ -1702,14 +1735,16 @@ impl Translator<'_, '_> {
                 elem,
                 right,
                 arith,
+                ..
             } => self.emit_v_shift_reg_m(dst, addr, elem, right, arith),
-            IrOp::VPtestM { a, addr } => self.emit_v_ptest_m(a, addr),
+            IrOp::VPtestM { a, addr, .. } => self.emit_v_ptest_m(a, addr),
             IrOp::VBlendWM {
                 dst,
                 a,
                 addr,
                 imm,
                 bytes,
+                ..
             } => self.emit_v_blend_w_m(dst, a, addr, imm, bytes),
             IrOp::VMpsadbwM {
                 dst,
@@ -1717,6 +1752,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 bytes,
+                ..
             } => self.emit_v_mpsadbw_m(dst, a, addr, imm, bytes),
             IrOp::VBlendW {
                 dst,
@@ -1763,6 +1799,7 @@ impl Translator<'_, '_> {
                 alt_sign,
                 writemask,
                 zeroing,
+                ..
             } => self.emit_v_fma_m(
                 dst, x, y, z, addr, mem_role, prec, scalar, neg_prod, neg_add, bytes, alt_sign,
                 writemask, zeroing,
@@ -1832,11 +1869,13 @@ impl Translator<'_, '_> {
             } => self.emit_v_alignr(dst, a, src, imm),
             IrOp::VAlignrM { dst, addr, imm, .. } => self.emit_v_alignr_m(dst, addr, imm),
             IrOp::VAes { dst, a, b, op } => self.emit_v_aes(dst, a, b, op),
-            IrOp::VAesM { dst, a, addr, op } => self.emit_v_aes_m(dst, a, addr, op),
+            IrOp::VAesM {
+                dst, a, addr, op, ..
+            } => self.emit_v_aes_m(dst, a, addr, op),
             IrOp::VAesImc { dst, src } => self.emit_v_aes_imc(dst, src),
-            IrOp::VAesImcM { dst, addr } => self.emit_v_aes_imc_m(dst, addr),
+            IrOp::VAesImcM { dst, addr, .. } => self.emit_v_aes_imc_m(dst, addr),
             IrOp::VAesKeygen { dst, src, imm } => self.emit_v_aes_keygen(dst, src, imm),
-            IrOp::VAesKeygenM { dst, addr, imm } => self.emit_v_aes_keygen_m(dst, addr, imm),
+            IrOp::VAesKeygenM { dst, addr, imm, .. } => self.emit_v_aes_keygen_m(dst, addr, imm),
             IrOp::VSha { dst, a, b, imm, op } => self.emit_v_sha(dst, a, b, imm, op),
             IrOp::VShaM {
                 dst,
@@ -1844,11 +1883,14 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 op,
+                ..
             } => self.emit_v_sha_m(dst, a, addr, imm, op),
             IrOp::Movq2dq { dst, src_mm } => self.emit_movq2dq(dst, src_mm),
             IrOp::Movdq2q { dst_mm, src_xmm } => self.emit_movdq2q(dst_mm, src_xmm),
             IrOp::VPclmul { dst, a, b, imm } => self.emit_v_pclmul(dst, a, b, imm),
-            IrOp::VPclmulM { dst, a, addr, imm } => self.emit_v_pclmul_m(dst, a, addr, imm),
+            IrOp::VPclmulM {
+                dst, a, addr, imm, ..
+            } => self.emit_v_pclmul_m(dst, a, addr, imm),
             IrOp::VGfni { dst, a, b, imm, op } => self.emit_v_gfni(dst, a, b, imm, op),
             IrOp::VGfniM {
                 dst,
@@ -1856,6 +1898,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm,
                 op,
+                ..
             } => self.emit_v_gfni_m(dst, a, addr, imm, op),
             IrOp::VPsign {
                 dst,
@@ -1870,9 +1913,12 @@ impl Translator<'_, '_> {
                 addr,
                 lane,
                 bytes,
+                ..
             } => self.emit_v_psign_m(dst, a, addr, lane, bytes),
             IrOp::VShufps { dst, a, b, imm, .. } => self.emit_v_shufps(dst, a, b, imm),
-            IrOp::VShufpsM { dst, a, addr, imm } => self.emit_v_shufps_m(dst, a, addr, imm),
+            IrOp::VShufpsM {
+                dst, a, addr, imm, ..
+            } => self.emit_v_shufps_m(dst, a, addr, imm),
             IrOp::VShuffle16 {
                 dst,
                 a,
@@ -1911,6 +1957,7 @@ impl Translator<'_, '_> {
                 addr,
                 ubsw,
                 bytes,
+                ..
             } => self.emit_v_pmadd_m(dst, a, addr, ubsw, bytes),
             IrOp::VInsertW {
                 dst, src, index, ..
@@ -1958,6 +2005,7 @@ impl Translator<'_, '_> {
                 op,
                 prec,
                 bytes,
+                ..
             } => self.emit_v_h_float_m(dst, a, addr, op, prec, bytes),
             IrOp::VHInt {
                 dst,
@@ -1972,6 +2020,7 @@ impl Translator<'_, '_> {
                 addr,
                 op,
                 bytes,
+                ..
             } => self.emit_v_h_int_m(dst, a, addr, op, bytes),
             IrOp::VFloatCmp { a, b, prec, .. } => self.emit_v_float_cmp(a, b, prec),
             IrOp::VFloatCmpMask {
@@ -2041,6 +2090,7 @@ impl Translator<'_, '_> {
                 addr,
                 op,
                 prec,
+                ..
             } => self.emit_v_float_bin256_m(dst, a, addr, op, prec),
             IrOp::VFloatUnary256 { dst, src, op, prec } => {
                 self.emit_v_float_unary256(dst, src, op, prec)
@@ -2050,11 +2100,12 @@ impl Translator<'_, '_> {
                 addr,
                 op,
                 prec,
+                ..
             } => self.emit_v_float_unary256_m(dst, addr, op, prec),
             IrOp::VPackedCvt256 { dst, src, kind } => self.emit_v_packed_cvt256(dst, src, kind),
-            IrOp::VPackedCvt256M { dst, addr, kind } => {
-                self.emit_v_packed_cvt256_m(dst, addr, kind)
-            }
+            IrOp::VPackedCvt256M {
+                dst, addr, kind, ..
+            } => self.emit_v_packed_cvt256_m(dst, addr, kind),
             IrOp::VPackedCvtWide256 { dst, src, kind } => {
                 self.emit_v_packed_cvt_wide256(dst, src, kind)
             }
@@ -2071,6 +2122,7 @@ impl Translator<'_, '_> {
                 addr,
                 imm_lo,
                 imm_hi,
+                ..
             } => self.emit_v_shufps256_m(dst, a, addr, imm_lo, imm_hi),
             IrOp::VUnpack256 {
                 dst,
@@ -2085,6 +2137,7 @@ impl Translator<'_, '_> {
                 addr,
                 lane,
                 high,
+                ..
             } => self.emit_v_unpack256_m(dst, a, addr, lane, high),
             IrOp::VCvtPh2Ps { dst, src, lanes } => self.emit_v_cvt_ph2ps(dst, src, lanes),
             IrOp::VCvtPs2Ph {
@@ -2126,6 +2179,7 @@ impl Translator<'_, '_> {
                 rep,
                 addr_bits,
                 seg_base,
+                ..
             } => self.emit_rep_string(op, elem, rep, addr_bits, seg_base),
             IrOp::Jump { target, .. } => self.emit_jump(target),
             IrOp::Branch {
@@ -2990,7 +3044,20 @@ impl Translator<'_, '_> {
         let tail = self.builder.ins().isub(end, start);
         let szc2 = self.builder.ins().select(whole, szc2, tail);
         self.store_mem(MEMCTX_FAULT_SIZE, szc2);
-        let acc = self.iconst(access);
+        // SDM Vol 1 §3.3.7.1: SS classification is an immediate bit, with
+        // no added generated instructions. Spans exclude the non-canonical hole,
+        // so host-fault trap records and landing pads cannot observe such pointers.
+        // SDM Vol 2A §2.7.7: embedded broadcast's decoded operand is one
+        // element. xj-au4.2 owns the existing full-transfer/value bug; classify
+        // this miss by the decoded carrier without changing that transfer here.
+        // Encode only when the transfer exceeds the carrier. Inline code never
+        // writes helper fields; the access immediate has no hot-path cost.
+        let carrier = if self.access_bytes != 0 && self.access_bytes < u16::from(size) {
+            (u64::from(self.access_bytes) << 8) | (u64::from(size) << 24)
+        } else {
+            0
+        };
+        let acc = self.iconst(access | (u64::from(self.stack_access) << 1) | carrier);
         self.store_mem(MEMCTX_FAULT_ACCESS, acc);
         let rip = self.iconst(self.cur_addr);
         self.store_cpu(self.offsets.rip, rip);
@@ -3013,6 +3080,87 @@ impl Translator<'_, '_> {
         #[cfg(test)]
         trap_tests::record_checked_addr(host);
         host
+    }
+
+    // One architectural #GP tail per function; recipe epochs share recovery
+    // entries, while Cranelift SSA merges region GPRs at the common cold tail.
+    fn check_alignment(&mut self, low: Value) {
+        let tail = if let Some(tail) = self.alignment_tail {
+            tail
+        } else {
+            let tail = self.builder.create_block();
+            self.builder.set_cold_block(tail);
+            self.builder.append_block_param(tail, types::I64);
+            self.alignment_tail = Some(tail);
+            tail
+        };
+        let target = if self.pending_flags.iter().all(Option::is_none) {
+            tail
+        } else {
+            if let Some((block, _)) = self
+                .alignment_recoveries
+                .iter()
+                .find(|(_, pending)| *pending == self.pending_flags)
+            {
+                *block
+            } else {
+                let block = self.builder.create_block();
+                self.builder.set_cold_block(block);
+                self.builder.append_block_param(block, types::I64);
+                self.alignment_recoveries.push((block, self.pending_flags));
+                block
+            }
+        };
+        let ok = self.builder.create_block();
+        let edge = self.builder.create_block();
+        self.builder.set_cold_block(edge);
+        self.builder.ins().brif(low, edge, &[], ok, &[]);
+        self.builder.seal_block(edge);
+        self.builder.switch_to_block(edge);
+        // Keep RIP materialisation on the fault edge: hot code is and + cbnz.
+        let rip = self.iconst(self.cur_addr);
+        self.builder.ins().jump(target, &[rip]);
+        self.builder.seal_block(ok);
+        self.builder.switch_to_block(ok);
+    }
+
+    fn emit_alignment_tail(&mut self) {
+        let Some(tail) = self.alignment_tail else {
+            return;
+        };
+        for (block, pending) in std::mem::take(&mut self.alignment_recoveries) {
+            self.builder.switch_to_block(block);
+            self.pending_flags = pending;
+            self.recover_flags();
+            let rip = self.builder.block_params(block)[0];
+            self.builder.ins().jump(tail, &[rip]);
+        }
+        self.builder.switch_to_block(tail);
+        self.pending_flags = [None; 6];
+        let rip = self.builder.block_params(tail)[0];
+        self.store_cpu(self.offsets.rip, rip);
+        let vector = self.iconst(13);
+        self.store_mem(MEMCTX_EXCEPTION_VECTOR, vector);
+        self.ret(RET_EXCEPTION);
+    }
+
+    // The helper's low 16 bits retain its transfer width. A smaller decoded
+    // carrier is only consumed on a miss (embedded broadcast, xj-au4.2).
+    pub(crate) fn memory_helper_bytes(&mut self, bytes: u16) -> Value {
+        let carrier = if self.access_bytes != 0 && self.access_bytes < bytes {
+            u64::from(self.access_bytes) << 16
+        } else {
+            0
+        };
+        self.iconst(u64::from(bytes) | carrier)
+    }
+
+    pub(crate) fn tag_stack_fault(&mut self) {
+        if self.stack_access {
+            let access = self.load_mem(MEMCTX_FAULT_ACCESS);
+            let access = self.builder.ins().bor_imm(access, 2);
+            self.store_mem(MEMCTX_FAULT_ACCESS, access);
+        }
     }
 
     /// Inline guest-RAM load at `host`, applying the JIT tier (§8.2.3).
@@ -4418,6 +4566,7 @@ impl Translator<'_, '_> {
             .ins()
             .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
         let ok = self.begin_trap_fork(trapped);
+        self.tag_stack_fault();
         self.ret_no_flush(RET_UNMAPPED);
         self.builder.switch_to_block(ok);
     }
@@ -4435,6 +4584,7 @@ impl Translator<'_, '_> {
             .ins()
             .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
         let ok = self.begin_trap_fork(unmapped);
+        self.tag_stack_fault();
         self.ret_no_flush(RET_UNMAPPED);
         self.builder.switch_to_block(ok);
 
@@ -4959,17 +5109,20 @@ mod barrier_tests {
         let ir = IrBlock {
             ops: vec![
                 IrOp::Store {
+                    fault: Default::default(),
                     addr: Val::Imm(0x2000),
                     src: Val::Imm(42),
                     size: 8,
                     order: MemOrder::None,
                 },
                 IrOp::Load {
+                    fault: Default::default(),
                     dst: 0,
                     addr: Val::Imm(0x3000),
                     size: 8,
                 },
                 IrOp::Store {
+                    fault: Default::default(),
                     addr: Val::Imm(0x4000),
                     src: Val::Temp(0),
                     size: 8,
