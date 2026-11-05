@@ -37,6 +37,8 @@ pub mod aes;
 pub mod cache;
 pub mod codemap;
 pub mod disasm;
+#[cfg(feature = "environment")]
+mod environment;
 pub mod exit;
 pub mod f80;
 pub mod features;

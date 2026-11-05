@@ -296,6 +296,7 @@ impl VmConfig {
 
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
+    lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
     pub mem: Memory,
     pub cache: TranslationCache,
     pub backend: Box<dyn Backend>,
@@ -350,6 +351,12 @@ impl Vm {
     /// Construct with the default interpreter backend (lives in the core).
     pub fn new(config: VmConfig) -> Self {
         Self::with_backend(config, Box::new(InterpreterBackend))
+    }
+
+    /// Supply a lockstep trace writer for interpreted execution, including tier-up
+    /// warmup. Compiled execution does not produce interpreter trace records.
+    pub fn set_lockstep_trace(&mut self, trace: Option<Arc<crate::lockstep::Trace>>) {
+        self.lockstep_trace = trace;
     }
 
     /// Enable hotness-gated tier-up: interpret each block until it has run `n`
@@ -457,6 +464,7 @@ impl Vm {
             next_source_id: self.next_source_id.clone(),
             x87_precision: self.x87_precision,
             mode: self.mode,
+            lockstep_trace: self.lockstep_trace.clone(),
         })
     }
 
@@ -477,6 +485,7 @@ impl Vm {
             next_source_id: Arc::new(AtomicU64::new(0)),
             x87_precision: crate::state::X87Precision::default(),
             mode: CpuMode::Long64,
+            lockstep_trace: None,
         }
     }
 
@@ -1329,6 +1338,7 @@ impl Vcpu {
                 CachedBlock::Interpreted(ir) => {
                     let mut info = crate::interp::RetireInfo {
                         exit_request: Some(exit_word),
+                        trace: vm.lockstep_trace.as_deref(),
                         ..Default::default()
                     };
                     let r = crate::interp::interpret_block_mode::<ROUTED>(
@@ -1552,6 +1562,7 @@ impl Vcpu {
                                 // may retire (§17.6, sub-seam c).
                                 let mut info = crate::interp::RetireInfo {
                                     exit_request: Some(exit_word),
+                                    trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()
                                 };
                                 let r = crate::interp::step_one_mode::<ROUTED>(
@@ -1573,6 +1584,7 @@ impl Vcpu {
                             RET_PORTIO_DEFER => {
                                 let mut info = crate::interp::RetireInfo {
                                     exit_request: Some(exit_word),
+                                    trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()
                                 };
                                 let r = crate::interp::step_one_mode::<ROUTED>(

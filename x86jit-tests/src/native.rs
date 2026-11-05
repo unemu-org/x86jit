@@ -898,6 +898,10 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let file = std::fs::File::open(&path).expect("open trace file");
         let len = file.metadata().expect("stat trace").len() as usize;
+        assert!(
+            len > 0,
+            "lockstep trace is empty: capture traceable interpreter instructions first"
+        );
         let data: &[u8] = if len == 0 {
             &[]
         } else {

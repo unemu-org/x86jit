@@ -227,6 +227,44 @@ cargo test
 
 ## Embedding
 
+The core and JIT backend enable the `environment` Cargo feature by default. This
+only makes legacy diagnostic APIs available: constructing or running a VM never
+reads diagnostic environment variables or creates diagnostic files. Build each
+crate with `default-features = false` to remove those paths entirely (retain
+`features = ["jit"]` for the Cranelift backend). No dependencies are added.
+
+Use `JitBackend::set_flag_elision(bool)` before compiling, and
+`Vm::set_lockstep_trace(Some(Arc::new(lockstep::Trace::new(writer, options))))`
+for interpreter tracing to a supplied writer. The corresponding lift API is
+`lift::elide_dead_flags_with_options`. Compiled execution does not emit interpreter
+trace records.
+
+`JitBackend::set_compiled_code_observer` receives every compiled block and region
+with its host start, byte length, guest entry RIP, and unit kind. It runs on the
+compiling thread, including the tier-up worker, after registration and after the
+module lock is released. It may re-enter the backend; concurrent callbacks may
+overlap. An unwinding observer panic is reported and caught, that observer is
+disabled, and compilation continues. Panicking observer captures and panic-payload
+destructors are also isolated during cleanup outside backend locks; a secondary
+panic payload from cleanup is intentionally forgotten. Background queue completion
+and idle notification run during unwinding as well. Process aborts remain outside
+this guarantee. `perfmap::PerfMap::new(writer)` provides a perf-map
+observer without opening a file. Ranges stay allocated for the backend's lifetime;
+code release will require a matching observer event. Frame pointers are always
+preserved because fault recovery depends on them; `codegen_description` reports
+this setting.
+
+To opt into legacy variables explicitly, enable `environment` and call
+`JitBackend::enable_environment_diagnostics()` before compiling. It reads
+`X86JIT_NO_FLAG_ELISION` and `X86JIT_PERF_MAP`; the latter installs the perf-map
+observer when set to `1`, sharing one serialized process-wide append writer for
+`/tmp/perf-<pid>.map`. Later backends preserve earlier records. Install a combined observer
+afterward if another consumer also needs events. For legacy lockstep capture,
+call `lockstep::Trace::from_environment()` and pass the returned trace to the VM;
+this reads `X86JIT_LOCKSTEP`, `_LO`, `_HI`, and `_MAX`. These explicit API calls are
+the only production environment/file paths in the two crates.
+
+
 The core is a library. Give it a memory map and an entry point; it hands control
 back through `Exit` whenever it hits something you own (a syscall, an MMIO
 access, an unsupported instruction):

@@ -31,6 +31,11 @@ fn main() {
     let image = std::fs::read(&path).expect("read ELF file");
 
     let mut vm = Vm::new(VmConfig::flat(FLAT));
+    if std::env::var_os("X86JIT_LOCKSTEP").is_some() {
+        let trace = x86jit_core::lockstep::Trace::from_environment()
+            .expect("create requested lockstep trace");
+        vm.set_lockstep_trace(Some(std::sync::Arc::new(trace)));
+    }
     let entry = load_static_elf(&mut vm, &image).expect("load static ELF");
 
     let stack_base = STACK_TOP - STACK_SIZE;

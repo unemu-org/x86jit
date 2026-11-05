@@ -1726,25 +1726,24 @@ pub(crate) fn op_set_flags_mut(op: &mut IrOp) -> Option<&mut FlagMask> {
     }
 }
 
-/// `X86JIT_NO_FLAG_ELISION`, read once per process to avoid repeated environment
-/// lookups during JIT translation.
-fn flag_elision_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("X86JIT_NO_FLAG_ELISION").is_some())
-}
-
 /// Narrow a JIT copy of the architectural IR's ALU masks (spec §3.2).
 /// The interpreter uses the original masks. JIT translation retains them beside
 /// this copy to recover omitted flags at explicit mid-block exits. Flags remain
 /// live at block boundaries; helper and conditional-writer barriers use full flags.
 /// Returns the original mask for each op (NONE for ops without an ALU mask).
 pub fn elide_dead_flags(ops: &mut [IrOp]) -> Vec<FlagMask> {
+    elide_dead_flags_with_options(ops, true)
+}
+
+/// Narrow flag masks only when `enabled`; always return the original masks.
+/// This option affects a JIT copy, never the interpreter's architectural IR.
+pub fn elide_dead_flags_with_options(ops: &mut [IrOp], enabled: bool) -> Vec<FlagMask> {
     let original = ops
         .iter_mut()
         .map(|op| op_set_flags_mut(op).copied().unwrap_or(FlagMask::NONE))
         .collect();
-    if flag_elision_disabled() {
-        return original; // experiment: keep every ALU op's full flag mask
+    if !enabled {
+        return original;
     }
     let mut live: u8 = 0b11_1111; // all flags live-out at the block boundary
     for op in ops.iter_mut().rev() {

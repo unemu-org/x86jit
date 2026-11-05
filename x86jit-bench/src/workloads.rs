@@ -515,6 +515,7 @@ fn icount_on() -> bool {
 /// A fresh JIT backend for a run under `tier`.
 pub fn jit(tier: TierCfg) -> Box<dyn Backend> {
     let b = JitBackend::with_opt_level(opt_level(tier));
+    b.enable_environment_diagnostics();
     if icount_on() {
         b.enable_icount();
     }
@@ -532,8 +533,54 @@ pub fn jit_regions(tier: TierCfg) -> Box<dyn Backend> {
         HostTarget::Native,
         opt_level(tier),
     );
+    b.enable_environment_diagnostics();
     if icount_on() {
         b.enable_icount();
     }
     Box::new(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_jit_constructors_enable_requested_diagnostics() {
+        const CHILD: &str = "X86JIT_BENCH_DIAGNOSTICS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workloads::tests::bench_jit_constructors_enable_requested_diagnostics"
+                ])
+                .env(CHILD, "1")
+                .env("X86JIT_NO_FLAG_ELISION", "1")
+                .env("X86JIT_PERF_MAP", "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let path = std::path::PathBuf::from(format!("/tmp/perf-{}.map", std::process::id()));
+        assert!(!path.exists());
+        let mut vm = Vm::new(VmConfig::flat(0x4000));
+        vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0xf4]).unwrap();
+        let ir = x86jit_core::lift::lift_block(
+            &vm.mem,
+            x86jit_core::lift::FetchAddr::flat(0x1000),
+            x86jit_core::lift::CpuMode::Long64,
+        )
+        .unwrap();
+        for backend in [jit(TierCfg::EAGER), jit_regions(TierCfg::EAGER)] {
+            assert!(backend.codegen_description().contains("flag_elision=false"));
+            assert!(matches!(
+                backend.materialize(&ir, vm.consistency, None, 0),
+                x86jit_core::CachedBlock::Compiled { .. }
+            ));
+        }
+        let records = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(records.lines().count(), 2);
+    }
 }

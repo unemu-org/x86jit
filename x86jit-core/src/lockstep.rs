@@ -1,25 +1,11 @@
-//! Env-gated lockstep trace capture for the interpreter (debug/forensics only).
+//! Interpreter trace capture to an embedder-supplied writer.
 //!
-//! When `X86JIT_LOCKSTEP=<path>` is set, [`interpret_block`](crate::interp::interpret_block)
-//! records every vector instruction it executes — register-only *and* memory-source —
-//! as `(guest_addr, bytes, gprs, optional mem operand, pre/post ymm0-15)`. A native
-//! replay harness (`x86jit-tests`) re-runs each op on the real host CPU from the same
-//! pre-state and reports the first op whose result diverges from the captured
-//! (interpreter) post-state — i.e. the exact op, with openssl's real operands, that
-//! the interpreter gets wrong. This hunts an operand-specific bug in a composed routine
-//! (e.g. `rsaz_1024_*_avx2`) that per-op fuzzing can't reach.
-//!
-//! Zero cost unless the env var is set: [`begin`] returns an inert [`Bracket`] and
-//! every hook short-circuits on a disabled sink.
-//!
-//! Bracketing relies on a structural invariant: a block ends *at* control flow, so a
-//! vector instruction is never the last op of a block — its post-state is always the
-//! cpu state observed at the *next* `InsnStart`. Consecutive `InsnStart`s therefore
-//! bracket one instruction (`post_i == pre_{i+1}`) with no end-of-block flush needed.
+//! Captures replayable vector instructions and, with an address window, scalar
+//! instructions. Bracketing uses the next instruction's pre-state as the previous
+//! instruction's post-state. Tracing is disabled unless explicitly supplied.
 
-use std::fs::File;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use iced_x86::{Decoder, DecoderOptions, EncodingKind, Instruction, Mnemonic, OpKind, Register};
 
@@ -75,11 +61,12 @@ struct Pending {
 
 /// Per-`interpret_block`-call bracket state. `None` inner = capture disabled (the
 /// common case): all hooks are no-ops.
-pub struct Bracket {
+pub struct Bracket<'a> {
+    trace: Option<&'a Trace>,
     inner: Option<Option<Pending>>,
 }
 
-impl Bracket {
+impl Bracket<'_> {
     #[inline]
     pub fn active(&self) -> bool {
         self.inner.is_some()
@@ -89,9 +76,15 @@ impl Bracket {
 /// Start a bracket for one block. Cheap: returns an inert `Bracket` when the sink is
 /// disabled so the caller's hot loop pays only a branch.
 #[inline]
-pub fn begin() -> Bracket {
+pub fn begin() -> Bracket<'static> {
+    begin_with_trace(None)
+}
+
+/// Start one block's capture with an explicit trace sink.
+pub fn begin_with_trace(trace: Option<&Trace>) -> Bracket<'_> {
     Bracket {
-        inner: if sink().is_some() { Some(None) } else { None },
+        trace,
+        inner: trace.map(|_| None),
     }
 }
 
@@ -105,7 +98,7 @@ pub fn on_insn_start(b: &mut Bracket, cpu: &CpuState, mem: &Memory, addr: u64) {
     };
     if let Some(p) = pending.take() {
         let post = side_state(cpu, mem, p.ea);
-        write_record(&p, &post);
+        write_record(b.trace.expect("active trace"), &p, &post);
     }
     let Ok(code) = mem.code_slice(addr, 15) else {
         return;
@@ -114,7 +107,7 @@ pub fn on_insn_start(b: &mut Bracket, cpu: &CpuState, mem: &Memory, addr: u64) {
     // also cover scalar big-integer arithmetic there — e.g. openssl's rsaz-avx2 path,
     // whose scalar carry-chain glue (mul/mulx/adc/…) the vector-only capture can't see.
     // With no window, capture stays vector-only and any-address.
-    let allow_scalar = match window() {
+    let allow_scalar = match b.trace.expect("active trace").options.window {
         Some((lo, hi)) => {
             if addr < lo || addr >= hi {
                 return;
@@ -258,17 +251,16 @@ fn replayable_op(insn: &Instruction, code: &[u8], allow_scalar: bool) -> Option<
 
 /// v3 record: addr | blen | bytes | has_mem | ea | pre-side | post-side, where each
 /// side is gpr[16] | flags | mem[64] | vec-snap(xmm[16]+ymm_hi[16]).
-fn write_record(p: &Pending, post: &SideState) {
-    let Some(m) = sink() else { return };
-    // Optional cap (X86JIT_LOCKSTEP_MAX): stop writing after N records so an all-data-op
-    // capture stays bounded to the early rsaz calls, where a systematic op bug shows.
-    if let Some(max) = record_cap() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRITTEN: AtomicU64 = AtomicU64::new(0);
-        if WRITTEN.fetch_add(1, Ordering::Relaxed) >= max {
-            return;
-        }
+fn write_record(trace: &Trace, p: &Pending, post: &SideState) {
+    let mut sink = trace.sink.lock().unwrap_or_else(|e| e.into_inner());
+    if trace
+        .options
+        .max_records
+        .is_some_and(|max| sink.written >= max)
+    {
+        return;
     }
+    sink.written += 1;
     let mut buf = Vec::with_capacity(64 + p.bytes.len() + 2 * side_wire_len());
     buf.extend_from_slice(&p.addr.to_le_bytes());
     buf.push(p.bytes.len() as u8);
@@ -277,9 +269,7 @@ fn write_record(p: &Pending, post: &SideState) {
     buf.extend_from_slice(&p.ea.unwrap_or(0).to_le_bytes());
     write_side(&mut buf, &p.pre);
     write_side(&mut buf, post);
-    if let Ok(mut f) = m.lock() {
-        let _ = f.write_all(&buf);
-    }
+    let _ = sink.writer.write_all(&buf);
 }
 
 /// Bytes one `SideState` occupies on the wire.
@@ -333,35 +323,53 @@ fn replayable_scalar(insn: &Instruction) -> bool {
     )
 }
 
-/// Optional capture window `[lo, hi)` in guest VA, from `X86JIT_LOCKSTEP_LO`/`_HI`
-/// (hex). When set, capture is restricted to it and also covers scalar arithmetic.
-fn window() -> Option<(u64, u64)> {
-    static WIN: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    *WIN.get_or_init(|| {
-        let parse = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        };
-        Some((parse("X86JIT_LOCKSTEP_LO")?, parse("X86JIT_LOCKSTEP_HI")?))
-    })
+/// Optional address window and record cap. Without a window only vector
+/// instructions are captured. Write errors are ignored as diagnostic failures.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TraceOptions {
+    pub window: Option<(u64, u64)>,
+    pub max_records: Option<u64>,
 }
 
-/// Optional record cap from `X86JIT_LOCKSTEP_MAX` (decimal). `None` = unbounded.
-fn record_cap() -> Option<u64> {
-    static CAP: OnceLock<Option<u64>> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("X86JIT_LOCKSTEP_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    })
+struct Sink {
+    writer: Box<dyn Write + Send>,
+    written: u64,
 }
 
-fn sink() -> Option<&'static Mutex<File>> {
-    static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
-    SINK.get_or_init(|| {
-        let path = std::env::var_os("X86JIT_LOCKSTEP")?;
-        File::create(&path).ok().map(Mutex::new)
-    })
-    .as_ref()
+/// Records are completed at the following instruction boundary in the same
+/// block; single-instruction stepping does not complete a record.
+///
+/// Serialized trace writer, shareable by interpreter threads. No files are opened
+/// by this API. Pass through [`crate::interp::RetireInfo::trace`] or
+/// [`crate::Vm::set_lockstep_trace`].
+pub struct Trace {
+    options: TraceOptions,
+    sink: Mutex<Sink>,
+}
+
+impl std::fmt::Debug for Trace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trace")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Trace {
+    pub fn new(writer: impl Write + Send + 'static, options: TraceOptions) -> Self {
+        Self {
+            options,
+            sink: Mutex::new(Sink {
+                writer: Box::new(writer),
+                written: 0,
+            }),
+        }
+    }
+
+    /// Read legacy lockstep environment variables and create the requested file.
+    /// Only this explicit call consults the environment; requires `environment`.
+    #[cfg(feature = "environment")]
+    pub fn from_environment() -> Option<Self> {
+        crate::environment::lockstep_trace()
+    }
 }

@@ -26,6 +26,13 @@ Cranelift.
 Runnable example: `jit_vs_interp`
 (`cargo run -p x86jit-cranelift --example jit_vs_interp`).
 
+The default `environment` feature exposes explicit legacy diagnostic APIs;
+constructors never read diagnostic variables. Disable default features and enable
+`jit` to compile out environment/file diagnostics. Use
+`set_compiled_code_observer` for compiled host ranges, `perfmap::PerfMap` for a
+caller-owned writer, or `enable_environment_diagnostics` to opt into the legacy
+perf-map and flag-elision variables. Frame pointers are always preserved.
+
 ## License
 
 MIT OR Apache-2.0.

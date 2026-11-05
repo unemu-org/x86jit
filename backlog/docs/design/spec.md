@@ -1311,6 +1311,29 @@ The reason isn't only about time: **empty abstractions never validated by a seco
 
 The seam opens a path to the future; but today another mode must not "almost work", it must be clearly rejected — because silently mis-decoding 32-bit code in 64-bit mode yields garbage, not an error (the same bytes are a different instruction). The loader (outside the core) checks in the header that the file is 64-bit (ELF: `ELFCLASS64` + `EM_X86_64`; SELF analogously) and rejects others with a clear message "only x86-64 long mode supported". The library name communicates the contract, header validation enforces it, the seams leave a back door — three layers, each doing its job.
 
+### 17.8 Embedder diagnostics and compiled-code observation
+
+`environment` is a default-enabled Cargo feature in the core and Cranelift crates.
+It exposes explicitly invoked legacy diagnostic APIs; VM/backend construction and
+execution never enable them from environment variables. Disabling the feature
+compiles out diagnostic environment reads and file access. Flag elision has an
+explicit lift/JIT option, and interpreter lockstep accepts a caller-supplied writer
+through `lockstep::Trace` and `Vm::set_lockstep_trace`.
+
+`JitBackend::set_compiled_code_observer` receives each successfully compiled block
+or region's host range, guest entry RIP, and kind. Calls run synchronously on the
+compiling thread (vcpu or tier-up worker) after registration and releasing the
+module lock. Re-entry is supported, and callbacks on different threads may overlap.
+An unwinding observer panic is reported and caught, that observer is disabled, and
+compilation completes without stopping the worker. `perfmap::PerfMap` implements this seam with a
+supplied writer. Code is retained for the backend's lifetime; releasing or reusing
+translations requires adding a matching released event before that lifecycle
+changes. Frame pointers remain mandatory for fault recovery (decision-13).
+
+Cranelift libcalls resolve through a closed table of statically linked host
+addresses. Unknown names panic with the missing name before dynamic symbol lookup
+can run. Indirect Rust helpers are outside that table.
+
 ---
 
 - **Input:** an unpacked memory map + entry point. Format parsing OUTSIDE the core.

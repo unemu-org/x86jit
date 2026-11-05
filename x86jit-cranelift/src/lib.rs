@@ -12,7 +12,12 @@
 #![cfg(feature = "jit")]
 
 mod codegen;
-mod perfmap;
+#[cfg(test)]
+mod embedder_tests;
+#[cfg(feature = "environment")]
+mod environment;
+mod libcalls;
+pub mod perfmap;
 mod unwind;
 
 use std::collections::VecDeque;
@@ -23,7 +28,7 @@ use std::time::Instant;
 
 use cranelift::codegen::ir;
 use cranelift::prelude::*;
-use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module, ModuleError};
 
 use x86jit_core::cache::CompiledPtr;
@@ -2294,6 +2299,37 @@ fn lock_recovering<'a, T>(m: &'a std::sync::Mutex<T>, what: &str) -> std::sync::
     })
 }
 
+/// Kind of compiled translation unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompiledCodeKind {
+    Block,
+    Region,
+}
+
+/// Published executable host range and the guest entry that produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompiledCode {
+    pub host_start: usize,
+    pub host_len: u32,
+    pub guest_rip: u64,
+    pub kind: CompiledCodeKind,
+}
+
+type CodeObserver = Arc<dyn Fn(CompiledCode) + Send + Sync>;
+
+fn drop_observer_value<T>(value: T) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
+        // The destructor's panic payload may itself panic on drop. Forget that
+        // secondary payload so cleanup cannot unwind into compilation.
+        std::mem::forget(payload);
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "x86jit: compiled-code observer cleanup panicked; panic contained"
+        );
+    }
+}
+
 /// The JIT backend. Injected into a `Vm` via `Vm::with_backend` (§4.1) — the core
 /// never names this type. Owns the executable-memory arena (`JITModule`) and
 /// Cranelift context behind a `Mutex`, so `materialize(&self)` stays `Send + Sync`
@@ -2339,6 +2375,8 @@ struct Shared {
     /// block-transfer-heavy bench workloads, which is too much to charge every embedder
     /// for a diagnostic. Read when the module is built, like `tiered`.
     icount: AtomicBool,
+    flag_elision: AtomicBool,
+    observer: Mutex<Option<CodeObserver>>,
     offsets: CpuOffsets,
     /// Superblock caps (§12 M5-T3), or `None` to compile one block at a time.
     caps: Option<RegionCaps>,
@@ -2366,6 +2404,29 @@ struct Shared {
     fail_compile_stage: AtomicUsize,
     #[cfg(test)]
     fail_worker_spawn: AtomicBool,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let observer = self
+            .observer
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop_observer_value(observer);
+    }
+}
+
+struct CompileCompletion<'a>(&'a Shared);
+
+impl Drop for CompileCompletion<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.outstanding -= 1;
+        if queue.outstanding == 0 {
+            self.0.idle_cv.notify_all();
+        }
+    }
 }
 
 /// The background compile queue and its liveness counters (bg-tier).
@@ -2430,6 +2491,45 @@ impl JitBackend {
     /// this one can.
     pub fn with_options(caps: Option<RegionCaps>, target: HostTarget, opt: OptLevel) -> Self {
         Self::build(caps, target, Some(opt))
+    }
+
+    /// Choose whether the JIT narrows dead flag writes. Set before compiling.
+    pub fn set_flag_elision(&self, enabled: bool) {
+        self.shared.flag_elision.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Observe each successfully compiled block or region, including background
+    /// tier-up. Called on the compiling thread after code registration and after
+    /// releasing the module lock. The callback may re-enter `materialize` or
+    /// `invalidate_links`; callbacks on different threads may overlap. Installing an
+    /// observer replaces the previous one.
+    ///
+    /// With unwinding panics, the panic hook reports an observer panic and the
+    /// backend catches it, disables that observer, and completes the compilation.
+    /// Panicking observers, captured-state destructors, and panic-payload destructors
+    /// never stop compilation. Cleanup runs outside backend locks under its own
+    /// unwind guard; a secondary panic payload from cleanup is intentionally forgotten.
+    /// Already-started notifications may finish. A replacement installed by the callback
+    /// is retained. This does not intercept process aborts or double-panic aborts.
+    ///
+    /// Code ranges remain allocated for the backend's lifetime. Before code can be
+    /// released or reused, this API must gain a matching released event.
+    pub fn set_compiled_code_observer(
+        &self,
+        observer: impl Fn(CompiledCode) + Send + Sync + 'static,
+    ) {
+        let observer: CodeObserver = Arc::new(observer);
+        let previous = self.shared.observer.lock().unwrap().replace(observer);
+        drop_observer_value(previous);
+    }
+
+    /// Read legacy diagnostic environment variables explicitly. Requires the
+    /// `environment` feature; constructors never read them. Configures flag
+    /// elision and, when requested, installs a perf-map observer. Call before
+    /// compiling; install a combined observer afterward if other consumers need it.
+    #[cfg(feature = "environment")]
+    pub fn enable_environment_diagnostics(&self) {
+        environment::configure(self);
     }
 
     /// Limit the number of compilation attempts for this backend's lifetime.
@@ -2508,6 +2608,8 @@ impl JitBackend {
                 opt,
                 tiered: AtomicBool::new(false),
                 icount: AtomicBool::new(false),
+                flag_elision: AtomicBool::new(true),
+                observer: Mutex::new(None),
                 helper_counters: (0..MAX_HELPERS)
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>()
@@ -2555,6 +2657,7 @@ impl JitBackend {
         // Fault recovery unwinds exactly one compiled frame.
         flags.set("preserve_frame_pointers", "true").unwrap();
         flags.set("unwind_info", "true").unwrap();
+        flags.set("enable_probestack", "false").unwrap();
 
         // Set explicitly rather than inheriting Cranelift's default of `none` — see
         // `OptLevel` for why the mid-end passes are worth their compile time on
@@ -2601,86 +2704,7 @@ impl JitBackend {
             .finish(settings::Flags::new(flags))
             .expect("finish ISA");
         let return_address_bkey = unwind::uses_bkey(isa.as_ref());
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        builder.symbol("x86jit_div", div_helper as *const u8);
-        builder.symbol("x86jit_string", string_helper as *const u8);
-        builder.symbol("x86jit_cas_pair", cas_pair_helper as *const u8);
-        builder.symbol("x86jit_cpuid", cpuid_helper as *const u8);
-        builder.symbol("x86jit_tsc", tsc_helper as *const u8);
-        builder.symbol("x86jit_random", random_helper as *const u8);
-        builder.symbol("x86jit_xgetbv", xgetbv_helper as *const u8);
-        builder.symbol("x86jit_vmaskmov", vmaskmov_helper as *const u8);
-        builder.symbol("x86jit_vmasked_logic", vmasked_logic_helper as *const u8);
-        builder.symbol("x86jit_vmasked_packed", vmasked_packed_helper as *const u8);
-        builder.symbol("x86jit_vmasked_shift", vmasked_shift_helper as *const u8);
-        builder.symbol("x86jit_var_shift", var_shift_helper as *const u8);
-        builder.symbol("x86jit_shift_reg", shift_reg_helper as *const u8);
-        builder.symbol("x86jit_gf2p8", gf2p8_helper as *const u8);
-        builder.symbol("x86jit_gf2p8_mem", gf2p8_mem_helper as *const u8);
-        builder.symbol("x86jit_valign", valign_helper as *const u8);
-        builder.symbol("x86jit_vpermt2", vpermt2_helper as *const u8);
-        builder.symbol("x86jit_vpermt2_mem", vpermt2_mem_helper as *const u8);
-        builder.symbol("x86jit_vperm1", vperm1_helper as *const u8);
-        builder.symbol("x86jit_vperm1_mem", vperm1_mem_helper as *const u8);
-        builder.symbol("x86jit_vpmov_narrow", vpmov_narrow_helper as *const u8);
-        builder.symbol(
-            "x86jit_vpmov_narrow_mem",
-            vpmov_narrow_mem_helper as *const u8,
-        );
-        builder.symbol(
-            "x86jit_vpmov_extend_wide",
-            vpmov_extend_wide_helper as *const u8,
-        );
-        builder.symbol("x86jit_vpabs", vpabs_helper as *const u8);
-        builder.symbol("x86jit_vp_unary_lane", vp_unary_lane_helper as *const u8);
-        builder.symbol("x86jit_vp_blendm", vp_blendm_helper as *const u8);
-        builder.symbol("x86jit_vshuf_lane", vshuf_lane_helper as *const u8);
-        builder.symbol("x86jit_vp_multishift", vp_multishift_helper as *const u8);
-        builder.symbol("x86jit_vpshufb_wide", vpshufb_wide_helper as *const u8);
-        builder.symbol(
-            "x86jit_vshuffle32_wide",
-            vshuffle32_wide_helper as *const u8,
-        );
-        builder.symbol("x86jit_vpack", vpack_helper as *const u8);
-        builder.symbol("x86jit_vpack_mem", vpack_mem_helper as *const u8);
-        builder.symbol("x86jit_vhfloat", vhfloat_helper as *const u8);
-        builder.symbol("x86jit_vhfloat_mem", vhfloat_mem_helper as *const u8);
-        builder.symbol("x86jit_vhint", vhint_helper as *const u8);
-        builder.symbol("x86jit_vhint_mem", vhint_mem_helper as *const u8);
-        builder.symbol("x86jit_cvtph2ps", cvtph2ps_helper as *const u8);
-        builder.symbol("x86jit_cvtps2ph", cvtps2ph_helper as *const u8);
-        builder.symbol("x86jit_phminposuw", phminposuw_helper as *const u8);
-        builder.symbol("x86jit_mpsadbw", mpsadbw_helper as *const u8);
-        builder.symbol("x86jit_pmaddwd", pmaddwd_helper as *const u8);
-        builder.symbol("x86jit_vpmadd", vpmadd_helper as *const u8);
-        builder.symbol("x86jit_vpmadd_mem", vpmadd_mem_helper as *const u8);
-        builder.symbol("x86jit_fma", fma_helper as *const u8);
-
-        builder.symbol("x86jit_broadcast_lane", broadcast_lane_helper as *const u8);
-
-        builder.symbol(
-            "x86jit_broadcast_lane_mem",
-            broadcast_lane_mem_helper as *const u8,
-        );
-        builder.symbol("x86jit_fma_mem", fma_mem_helper as *const u8);
-        builder.symbol("x86jit_aes", aes_helper as *const u8);
-        builder.symbol("x86jit_aes_mem", aes_mem_helper as *const u8);
-        builder.symbol("x86jit_sha", sha_helper as *const u8);
-        builder.symbol("x86jit_sha_mem", sha_mem_helper as *const u8);
-        builder.symbol("x86jit_gfni", gfni_helper as *const u8);
-        builder.symbol("x86jit_gfni_mem", gfni_mem_helper as *const u8);
-        builder.symbol("x86jit_pclmul", pclmul_helper as *const u8);
-        builder.symbol("x86jit_pclmul_mem", pclmul_mem_helper as *const u8);
-        builder.symbol("x86jit_mmx_bridge", mmx_bridge_helper as *const u8);
-        builder.symbol("x86jit_pcmpstr", pcmpstr_helper as *const u8);
-        builder.symbol("x86jit_pcmpstr_mem", pcmpstr_mem_helper as *const u8);
-        builder.symbol("x86jit_pcmpstrm", pcmpstrm_helper as *const u8);
-        builder.symbol("x86jit_pcmpstrm_mem", pcmpstrm_mem_helper as *const u8);
-        builder.symbol("x86jit_bmi", bmi_helper as *const u8);
-        builder.symbol("x86jit_x87", x87_helper as *const u8);
-        builder.symbol("x86jit_fxstate", fxstate_helper as *const u8);
-        builder.symbol("x86jit_crc32", crc32_helper as *const u8);
-        builder.symbol("x86jit_note_watch", note_write_helper as *const u8);
+        let builder = libcalls::builder(isa);
         let module = JITModule::new(builder);
 
         Jit {
@@ -2771,7 +2795,7 @@ impl Shared {
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
-            perfmap::Kind::Block,
+            CompiledCodeKind::Block,
             ir.guest_start,
             |builder, helpers, alloc_slot| {
                 codegen::translate_block(
@@ -2799,7 +2823,7 @@ impl Shared {
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
-            perfmap::Kind::Region,
+            CompiledCodeKind::Region,
             region.entry,
             |builder, helpers, alloc_slot| {
                 codegen::translate_region(
@@ -2823,12 +2847,9 @@ impl Shared {
     /// the full-width RIP array indexed by the emitted SourceLocs.
     fn compile_with(
         &self,
-        // Perf-map symbol kind + guest entry PC, threaded through so the emitted
-        // symbol names the guest RIP this host code was compiled from. The
-        // guest PC is not otherwise in scope here (only the host entry is), so it's
-        // passed by the block/region callers.
-        perf_kind: perfmap::Kind,
-        perf_guest: u64,
+        // Observer metadata follows the real guest entry, before any source location.
+        kind: CompiledCodeKind,
+        guest_rip: u64,
         translate: impl FnOnce(
             &mut FunctionBuilder,
             codegen::Helpers,
@@ -2979,6 +3000,7 @@ impl Shared {
                 }};
             }
             let helpers = codegen::Helpers {
+                flag_elision: self.flag_elision.load(Ordering::Relaxed),
                 div: helper!(div_sig, div_helper),
                 string: helper!(str_sig, string_helper),
                 cas_pair: helper!(cas_pair_sig, cas_pair_helper),
@@ -3141,16 +3163,47 @@ impl Shared {
         {
             return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
-        // Mirror this range into `/tmp/perf-<pid>.map` iff X86JIT_PERF_MAP=1
-        // (no-op otherwise). Same host range as `codemap`, named by the guest RIP so
-        // `perf` attributes samples in JIT'd code to `jit_0x<guest_rip>`. The guest PC
-        // is the real block/region entry, which may precede the first source location.
-        perfmap::record(entry.0 as usize, code_len, perf_kind, perf_guest);
+        drop(jit);
+        self.observe(CompiledCode {
+            host_start: entry.0 as usize,
+            host_len: code_len,
+            guest_rip,
+            kind,
+        });
         // Account this compile's wall-time for the bench compile-vs-run split.
         // Includes the `inner` lock wait — that contention is real compile-path cost.
         self.compile_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(entry)
+    }
+
+    fn observe(&self, code: CompiledCode) {
+        let observer = self.observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(code)))
+            {
+                let disabled = {
+                    let mut current = self.observer.lock().unwrap();
+                    if current
+                        .as_ref()
+                        .is_some_and(|value| Arc::ptr_eq(value, &observer))
+                    {
+                        current.take()
+                    } else {
+                        None
+                    }
+                };
+                drop_observer_value(disabled);
+                drop_observer_value(payload);
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "x86jit: compiled-code observer panicked; that observer is disabled"
+                );
+            }
+            drop_observer_value(observer);
+        }
     }
 
     fn exhaust_code_space<T>(&self) -> Option<T> {
@@ -3231,6 +3284,7 @@ impl Shared {
                 }
                 q.items.pop_front().expect("non-empty queue")
             };
+            let _completion = CompileCompletion(self);
             // Compile OUTSIDE the queue lock (it takes `inner`); a concurrent submit
             // or foreground `materialize` isn't blocked by this block's compile.
             let block = self.compile_request(&req);
@@ -3244,11 +3298,6 @@ impl Shared {
                 });
                 // Keep the lock-free probe equal to `done.len()` (set under the lock).
                 self.ready.store(done.len(), Ordering::Release);
-            }
-            let mut q = self.queue.lock().unwrap();
-            q.outstanding -= 1;
-            if q.outstanding == 0 {
-                self.idle_cv.notify_all();
             }
         }
     }
@@ -3421,12 +3470,13 @@ impl Backend for JitBackend {
     /// the tier-up policy resolved to.
     fn codegen_description(&self) -> String {
         format!(
-            "cranelift opt_level={:?} host={:?} superblocks={} verifier={} icount={}",
+            "cranelift opt_level={:?} host={:?} superblocks={} verifier={} icount={} preserve_frame_pointers=true flag_elision={}",
             self.opt_level(),
             self.shared.target,
             self.shared.caps.is_some(),
             cfg!(debug_assertions),
             self.shared.icount.load(Ordering::Relaxed),
+            self.shared.flag_elision.load(Ordering::Relaxed),
         )
     }
 }
@@ -3555,7 +3605,7 @@ mod tests {
                     .jit
                     .shared
                     .compile_with(
-                        perfmap::Kind::Block,
+                        CompiledCodeKind::Block,
                         ir.guest_start,
                         |builder, mut helpers, alloc| {
                             helpers.note_watch.1 = paused_store as *const () as u64;
@@ -3595,7 +3645,7 @@ mod tests {
                     .jit
                     .shared
                     .compile_with(
-                        perfmap::Kind::Region,
+                        CompiledCodeKind::Region,
                         region.entry,
                         |builder, mut helpers, alloc| {
                             helpers.note_watch.1 = paused_store as *const () as u64;

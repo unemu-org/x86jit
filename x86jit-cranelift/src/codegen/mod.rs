@@ -87,6 +87,7 @@ const PAGE_MASK: i64 = PAGE_BYTES - 1;
 /// backlog/docs/design/aot-plan.md).
 #[derive(Copy, Clone)]
 pub struct Helpers {
+    pub flag_elision: bool,
     pub div: (ir::SigRef, u64, u64),
     pub string: (ir::SigRef, u64, u64),
     pub cas_pair: (ir::SigRef, u64, u64),
@@ -177,6 +178,7 @@ impl Helpers {
         note_watch: (ir::SigRef, u64, u64),
     ) -> Self {
         Helpers {
+            flag_elision: true,
             div: mk(),
             string: mk(),
             cas_pair: mk(),
@@ -341,7 +343,8 @@ fn translate_block_for_target(
 
     let mut terminated = false;
     let mut narrowed = ir.ops.clone();
-    let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
+    let masks =
+        x86jit_core::lift::elide_dead_flags_with_options(&mut narrowed, helpers.flag_elision);
     for (index, (original, op)) in masks.into_iter().zip(&narrowed).enumerate() {
         t.prepare_instruction_flags(&narrowed[index..], index == 0);
         if t.op_with_flags(original, op) {
@@ -4868,7 +4871,10 @@ impl Translator<'_, '_> {
             &block.ops[..]
         };
         let mut narrowed = body.to_vec();
-        let masks = x86jit_core::lift::elide_dead_flags(&mut narrowed);
+        let masks = x86jit_core::lift::elide_dead_flags_with_options(
+            &mut narrowed,
+            self.helpers.flag_elision,
+        );
         for (index, (original, op)) in masks.into_iter().zip(&narrowed).enumerate() {
             self.prepare_instruction_flags(&narrowed[index..], index == 0);
             if self.op_with_flags(original, op) {

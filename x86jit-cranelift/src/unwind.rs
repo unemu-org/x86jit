@@ -446,7 +446,7 @@ mod tests {
                 let entry = jit
                     .shared
                     .compile_with(
-                        crate::perfmap::Kind::Region,
+                        crate::CompiledCodeKind::Region,
                         region.entry,
                         |b, helpers, slots| {
                             let rips = crate::codegen::translate_region(

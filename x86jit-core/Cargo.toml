@@ -10,5 +10,10 @@ description = "Guest-agnostic x86-64 recompiler core: Vm/Vcpu, IR, lift, cache, 
 keywords = ["x86-64", "jit", "recompiler", "emulator", "interpreter"]
 categories = ["emulators", "virtualization", "development-tools"]
 
+[features]
+default = ["environment"]
+# Legacy diagnostic environment and file access, additionally opt-in through API.
+environment = []
+
 [dependencies]
 iced-x86.workspace = true

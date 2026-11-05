@@ -40,7 +40,7 @@ cheaper and pinpoint the same thing.
 
 Two halves.
 
-**Capture** (`x86jit-core/src/lockstep.rs`, env-gated, zero cost when off). Hooked into
+**Capture** (`x86jit-core/src/lockstep.rs`, explicitly enabled through the trace API). Hooked into
 the interpreter at each `IrOp::InsnStart`. It records the **full architectural
 side-state** around every instruction it runs — the 16 GP registers, arithmetic flags,
 a 64-byte window at the memory operand's effective address, and xmm/ymm 0–15 — both
@@ -66,10 +66,9 @@ earliest bug across shards is the one with the smallest index.
 Driver: [`scripts/lockstep.sh`](../../../scripts/lockstep.sh).
 
 ```sh
-# 1. Capture (MUST be --backend interp — the hook is in the interpreter).
+# 1. Capture a freestanding static ELF with the interpreter example.
 scripts/lockstep.sh capture -- \
- unemulinux-cli --backend interp --cpu v4 --entropy host \
-  /usr/bin/openssl dgst -sha256 -sign key.pem -out /tmp/sig data.bin
+ cargo run -p x86jit-elf --example run_elf -- program.elf
 
 # 2. Replay against the host CPU (auto-sharded across cores).
 scripts/lockstep.sh replay
@@ -81,6 +80,12 @@ divergence is what you want, and startup is almost always clean, so a cap that r
 the interesting phase is enough. Traces are tens of GB and land on real disk
 (`$XDG_CACHE_HOME`), not tmpfs. Narrow with `--lo/--hi` (guest address window) or
 `--max` if you know where to look; widen `--max 0` for unbounded.
+
+The command must install `lockstep::Trace::from_environment()` on its VM with
+`Vm::set_lockstep_trace` and run through the interpreter. The `run_elf` example
+does this explicitly. Other consumers must make the same API opt-in; setting
+variables alone never activates library tracing. Capture fails if the command
+produces no trace or an empty trace.
 
 Underlying env knobs (if driving the harness directly): `X86JIT_LOCKSTEP=<file>`,
 `X86JIT_LOCKSTEP_LO/_HI` (hex window), `X86JIT_LOCKSTEP_MAX` (record cap) on the capture

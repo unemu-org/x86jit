@@ -10,17 +10,17 @@
 #
 # Two steps:
 #
-#   # 1. Capture a trace while running some unemulinux runner invocation under the interpreter:
+#   # 1. Capture a freestanding static ELF through the interpreter example:
 #   scripts/lockstep.sh capture -- \
-#     unemulinux-cli --backend interp --cpu v4 --entropy host \
-#     /usr/bin/openssl dgst -sha256 -sign key.pem -out /tmp/sig data.bin
+#     cargo run -p x86jit-elf --example run_elf -- program.elf
 #
 #   # 2. Replay it against the host CPU (auto-sharded across cores); prints the first
 #   #    divergence, or "no divergence":
 #   scripts/lockstep.sh replay
 #
-# The capture MUST run under `--backend interp` (the hook lives in the interpreter;
-# JIT'd blocks bypass it). Traces are large (tens of GB) and land on real disk, not
+# The command must explicitly install lockstep::Trace::from_environment() on its
+# Vm and use the interpreter; the run_elf example does both. Other embedders must
+# wire that API themselves. JIT'd blocks bypass capture. Traces are large (tens of GB) and land on real disk, not
 # tmpfs — override with --out / $LOCKSTEP_TRACE.
 #
 # Blind spots (a clean replay does NOT prove these correct):
@@ -31,7 +31,7 @@
 #   - Flags: comparison is opt-in (--flags) and noisy — the interpreter elides dead
 #     flags, so a post-op flag snapshot legitimately differs from hardware.
 #
-# See backlog/docs/design/lockstep-tracer.md for the full method and rationale.
+# See backlog/docs/design/doc-24 - Lockstep-interp-vs-hardware-tracer.md for the full method and rationale.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -71,9 +71,10 @@ cmd_capture() {
   echo "lockstep: running: $*" >&2
   local envs=(X86JIT_LOCKSTEP="$TRACE" X86JIT_LOCKSTEP_LO="$lo" X86JIT_LOCKSTEP_HI="$hi")
   [ "$max" != 0 ] && envs+=(X86JIT_LOCKSTEP_MAX="$max")
-  env "${envs[@]}" "$@" || echo "lockstep: (command exited nonzero — trace may still be usable)" >&2
+  env -u X86JIT_LOCKSTEP_MAX "${envs[@]}" "$@" || echo "lockstep: (command exited nonzero — trace may still be usable)" >&2
+  [ -s "$TRACE" ] || die "capture produced no trace: the command must install lockstep::Trace::from_environment() and execute traceable interpreter instructions"
   local sz
-  sz=$(stat -c%s "$TRACE" 2>/dev/null || echo 0)
+  sz=$(wc -c < "$TRACE" | tr -d '[:space:]')
   echo "lockstep: trace is $(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"). Replay with: scripts/lockstep.sh replay" >&2
 }
 

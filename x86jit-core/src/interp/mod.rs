@@ -26,6 +26,8 @@ const RSP: usize = 4;
 /// RetireInfo::default()`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct RetireInfo<'a> {
+    /// In: optional interpreter trace sink. Never enabled from the environment.
+    pub trace: Option<&'a crate::lockstep::Trace>,
     /// In: optional per-vcpu notification word, polled by long string operations.
     pub exit_request: Option<&'a std::sync::atomic::AtomicU64>,
     /// Number of guest instructions that **retired** (completed) during this call. A
@@ -163,6 +165,7 @@ fn interpret_block_inner<const RETRY: bool, const ROUTED: bool>(
         &mut started,
         &mut sti_shadow,
         info.exit_request,
+        info.trace,
     );
 
     // Final-instruction retirement (§17.6, sub-seam c): the last started instruction
@@ -209,8 +212,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool>(
     started: &mut bool,
     sti_shadow: &mut bool,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
+    trace: Option<&crate::lockstep::Trace>,
 ) -> StepResult {
-    let mut bracket = crate::lockstep::begin();
+    let mut bracket = crate::lockstep::begin_with_trace(trace);
     let mut entry_flags = cpu.flags;
     for op in &ir.ops {
         match op {
