@@ -1,4 +1,4 @@
-//! Translation cache keyed by [`BlockKey`] — guest address plus decode mode (§9.1, §17.4).
+//! Translation cache keyed by [`BlockKey`] — guest address, decode mode and SIMD FP mode (§9.1, §17.4).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -8,20 +8,42 @@ use crate::ir::IrBlock;
 use crate::lift::CpuMode;
 
 /// Translation-cache key (§17.4): the same guest bytes decode and lift differently per
-/// decode mode (mode × CS.D), so a translation is identified by *both* its entry address
-/// and the [`CpuMode`] it was lifted under — never the address alone. A future protected
+/// decode mode (mode × CS.D), and numerical operations depend on MXCSR.RC/FTZ/DAZ.
+/// All three form the translation identity. A future protected
 /// mode adds a `CpuMode` variant, not a new key shape; segment bases stay out of the key
 /// (they are runtime `CpuState`, per the FS/GS pattern), so a segment reload never
 /// invalidates a translation.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct BlockKey {
     pub guest_addr: u64,
     pub mode: CpuMode,
+    /// RC | FTZ | DAZ assumed by this translation (SDM Vol 1 §10.2.3).
+    pub mxcsr_mode: u32,
+}
+
+impl std::hash::Hash for BlockKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.guest_addr.hash(state);
+        // Keep the two-word hash stream: the decode discriminator occupies the
+        // low byte, leaving the upper bits for the SIMD specialization.
+        ((u64::from(self.mxcsr_mode) << 8) | self.mode as u64).hash(state);
+    }
 }
 
 impl BlockKey {
     pub fn new(guest_addr: u64, mode: CpuMode) -> Self {
-        Self { guest_addr, mode }
+        Self {
+            guest_addr,
+            mode,
+            mxcsr_mode: 0,
+        }
+    }
+    pub fn with_mxcsr(guest_addr: u64, mode: CpuMode, mxcsr: u32) -> Self {
+        Self {
+            guest_addr,
+            mode,
+            mxcsr_mode: mxcsr & crate::interp::softfloat::MODE_MASK,
+        }
     }
 }
 
@@ -277,6 +299,7 @@ impl TranslationCache {
     }
 
     /// Look up a block, recording a hit (found) or miss (must lift).
+    #[inline(always)]
     pub fn get(&self, key: BlockKey) -> Option<CachedBlock> {
         let found = self.map.read().unwrap().get(&key).cloned();
         if found.is_some() {

@@ -9,9 +9,9 @@ use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 use crate::exit::{AccessKind, Exit, StepResult};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
-    call_block, MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_HOST_FAULT,
-    RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_SYSCALL,
-    RET_UNMAPPED,
+    MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_HOST_FAULT,
+    RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER,
+    RET_SYSCALL, RET_UNMAPPED,
 };
 use crate::lift::{lift_block, lift_region, CpuMode, FetchAddr, LiftError};
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
@@ -62,6 +62,37 @@ pub trait Backend: Send + Sync {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock;
+
+    /// Materialize a translation specialised to RC | FTZ | DAZ. Backends that
+    /// do not specialise compiled floating-point code interpret non-default modes.
+    fn materialize_with_mxcsr(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        if mxcsr_mode != 0 {
+            return CachedBlock::Interpreted(Arc::new(ir.clone()));
+        }
+        self.materialize(ir, consistency, mmio, guest_base)
+    }
+
+    /// Region counterpart of [`Self::materialize_with_mxcsr`].
+    fn materialize_region_with_mxcsr(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        if mxcsr_mode != 0 {
+            return CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()));
+        }
+        self.materialize_region(region, consistency, mmio, guest_base)
+    }
 
     /// Superblock caps if this backend forms regions (§12 M5), else `None`
     /// (the default). When `Some`, the dispatcher lifts a region and calls
@@ -167,6 +198,8 @@ pub trait Backend: Send + Sync {
 /// passes to [`Backend::materialize`], plus the `span`/`epoch` the dispatcher needs to
 /// publish the result safely.
 pub struct TierUpRequest {
+    /// RC | FTZ | DAZ assumed by the submitted translation.
+    pub mxcsr_mode: u32,
     /// Guest entry address of the block/region (its cache key).
     pub pc: u64,
     /// The already-lifted IR to compile — a single block, or a hotness-gated
@@ -203,6 +236,8 @@ pub enum TierUpUnit {
 /// everything `cache.upgrade` needs; the backend returns these from
 /// [`Backend::tier_up_finished`] and never writes the cache itself.
 pub struct TierUpFinished {
+    /// RC | FTZ | DAZ assumed by the submitted translation.
+    pub mxcsr_mode: u32,
     /// Guest entry address (cache key), echoing the request's `pc`.
     pub pc: u64,
     /// The compiled unit to swap in for the interpreted block. `Interpreted`
@@ -591,16 +626,6 @@ impl Vm {
         Ok(())
     }
 
-    /// Materialize a lifted block via the injected backend (§8).
-    fn materialize(&self, ir: &IrBlock) -> CachedBlock {
-        self.backend.materialize(
-            ir,
-            self.consistency,
-            self.mem.trap_window(),
-            self.mem.guest_base(),
-        )
-    }
-
     /// Process pending self-modifying-code writes (§10): for each code page a
     /// store landed on, drop every cached block overlapping it and clear the tag
     /// (re-execution re-lifts and re-tags). No-op unless a write actually hit a
@@ -683,6 +708,7 @@ impl Vm {
                 }; FAST_N],
             ),
             fast_epoch: self.cache.epoch(),
+            fast_mxcsr_mode: 0,
             ibtc_refills: HashMap::new(),
             ret_stack: Box::new(RetStack::new()),
             fault_entry: Box::default(),
@@ -768,6 +794,7 @@ pub struct Vcpu {
     fast: Box<[FastEntry; FAST_N]>,
     /// Snapshot of `TranslationCache::epoch` matching the current `fast` contents.
     fast_epoch: u64,
+    fast_mxcsr_mode: u32,
     /// Per-IBTC-slot refill count, keyed by slot address. Guards against a
     /// megamorphic indirect site churning the descriptor arena: once a slot hits
     /// [`IBTC_MEGAMORPHIC_CAP`] refills the dispatcher stops filling it. Cleared on
@@ -1031,7 +1058,7 @@ impl Vcpu {
 
     /// Guest SSE control/status register, including the stored sticky flags
     /// (SDM Vol 1 §10.2.3). Round-trips through LDMXCSR/STMXCSR and FXSAVE/FXRSTOR;
-    /// RC/FTZ/DAZ are not yet applied to arithmetic and arithmetic does not set flags.
+    /// RC/FTZ/DAZ govern SIMD arithmetic; arithmetic does not set sticky flags.
     pub fn mxcsr(&self) -> u32 {
         self.cpu.mxcsr
     }
@@ -1109,6 +1136,7 @@ impl Vcpu {
     /// (this primitive does not resume a deferred access — call [`Vcpu::run`] for
     /// that).
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
+        let _fp_mode = crate::jit_abi::fp::RunMode::new();
         let mut info = crate::interp::RetireInfo::default();
         let r = crate::interp::step_one(
             &vm.mem,
@@ -1151,6 +1179,7 @@ impl Vcpu {
     /// have made partial progress and resumes at the string instruction.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         self.fault_entry.prepare_run();
+        let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
         impl Drop for FaultRunGuard {
             fn drop(&mut self) {
@@ -1163,9 +1192,9 @@ impl Vcpu {
         }
         let fault_run = FaultRunGuard(&mut *self.fault_entry);
         let exit = if vm.mem.host_fault_recovery() {
-            self.run_inner::<true>(vm, budget)
+            self.run_inner::<true>(vm, budget, &mut fp_mode)
         } else {
-            self.run_inner::<false>(vm, budget)
+            self.run_inner::<false>(vm, budget, &mut fp_mode)
         };
         drop(fault_run);
         self.cpu.finish_mmio_retry(Some(&exit));
@@ -1209,7 +1238,42 @@ impl Vcpu {
         }
     }
 
-    fn run_inner<const ROUTED: bool>(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+    fn run_inner<const ROUTED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        fp_mode: &mut crate::jit_abi::fp::RunMode,
+    ) -> Exit {
+        let mut remaining = budget;
+        loop {
+            fp_mode.default();
+            let mode = self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK;
+            if self.fast_mxcsr_mode != mode {
+                self.fast_clear();
+                self.fast_mxcsr_mode = mode;
+            }
+            let result = if mode == 0 {
+                self.run_dispatch::<ROUTED, true>(vm, remaining, fp_mode)
+            } else {
+                self.run_dispatch::<ROUTED, false>(vm, remaining, fp_mode)
+            };
+            match result {
+                Ok(exit) => return exit,
+                Err(consumed) => remaining = remaining.map(|b| b - consumed),
+            }
+        }
+    }
+
+    // A mode write returns to run_inner to select a new specialization and flush
+    // private predictions. Default block transfers contain no FP guard checks.
+    #[inline(never)]
+    fn run_dispatch<const ROUTED: bool, const DEFAULT: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        fp_mode: &mut crate::jit_abi::fp::RunMode,
+    ) -> Result<Exit, u64> {
+        let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
         let mut blocks_run: u64 = 0;
         let exit_word_owner = Arc::clone(&self.exit_request.word);
         let exit_word: &AtomicU64 = &exit_word_owner;
@@ -1227,13 +1291,18 @@ impl Vcpu {
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
         loop {
+            // The outer dispatcher may invalidate code or invoke backend callbacks.
+            // Retain guest control only in the integer-only compiled chain below.
+            if !DEFAULT {
+                fp_mode.default();
+            }
             let dispatch = exit_word.load(Ordering::Relaxed);
             if dispatch & EXIT_REQUESTED != 0
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
                 && self.cpu.pending_port_in.is_none()
             {
-                return Exit::Interrupted;
+                return Ok(Exit::Interrupted);
             }
             // The sticky flag can be observed before the backend finishes its
             // broadcast. A late bit must not keep an already-notified vcpu in
@@ -1242,10 +1311,10 @@ impl Vcpu {
                 exit_word.fetch_and(!CODE_SPACE_EXHAUSTED, Ordering::Acquire);
             }
             if let Some(exit) = self.code_space_exit(vm) {
-                return exit;
+                return Ok(exit);
             }
             if budget.is_some_and(|b| blocks_run >= b) {
-                return Exit::BudgetExhausted;
+                return Ok(Exit::BudgetExhausted);
             }
 
             // SMC (§10): drop any cached block a prior block's store landed on,
@@ -1273,6 +1342,9 @@ impl Vcpu {
             // recorded transfers. Keep that retry on the interpreter until completion;
             // compiled blocks never inherit answers from a partially serviced operand.
             if self.cpu.mmio_retry_active {
+                if !DEFAULT {
+                    fp_mode.default();
+                }
                 // Finish the pending instruction before honouring a host request.
                 let mut info = crate::interp::RetireInfo::default();
                 let r = crate::interp::step_one_mode::<ROUTED>(
@@ -1287,9 +1359,12 @@ impl Vcpu {
                 match r {
                     StepResult::Continue => {
                         blocks_run += 1;
+                        if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != mxcsr_mode {
+                            return Err(blocks_run);
+                        }
                         continue;
                     }
-                    StepResult::Exit(exit) => return exit,
+                    StepResult::Exit(exit) => return Ok(exit),
                 }
             }
 
@@ -1310,6 +1385,9 @@ impl Vcpu {
                     && self.cpu.pending_port_in.is_none()
                     && !self.sti_shadow;
                 if deliverable {
+                    if !DEFAULT {
+                        fp_mode.default();
+                    }
                     self.pending_irq = None;
                     // Saved IP = current RIP (the maskable IRQ is an async trap; execution
                     // resumes at the next instruction, which is where RIP already points).
@@ -1329,7 +1407,7 @@ impl Vcpu {
                             blocks_run += 1;
                             continue;
                         }
-                        StepResult::Exit(exit) => return exit,
+                        StepResult::Exit(exit) => return Ok(exit),
                     }
                 }
             }
@@ -1351,28 +1429,41 @@ impl Vcpu {
                     self.fast_hits += 1;
                     CachedBlock::Compiled { entry }
                 }
-                None => match resolve(vm, fetch, self.mode) {
-                    Ok(b) => {
-                        if let CachedBlock::Compiled { entry, .. } = &b {
-                            self.fast_put(self.cpu.rip, *entry);
-                        }
-                        b
+                None => {
+                    if !DEFAULT {
+                        fp_mode.default();
                     }
-                    Err(exit) => return exit,
-                },
+                    match resolve::<DEFAULT>(
+                        vm,
+                        fetch,
+                        self.mode,
+                        if DEFAULT { 0 } else { self.cpu.mxcsr },
+                    ) {
+                        Ok(b) => {
+                            if let CachedBlock::Compiled { entry, .. } = &b {
+                                self.fast_put(self.cpu.rip, *entry);
+                            }
+                            b
+                        }
+                        Err(exit) => return Ok(exit),
+                    }
+                }
             };
 
             if let Some(exit) = self.code_space_exit(vm) {
-                return exit;
+                return Ok(exit);
             }
             match block {
                 CachedBlock::Interpreted(ir) => {
+                    if !DEFAULT {
+                        fp_mode.default();
+                    }
                     let mut info = crate::interp::RetireInfo {
                         exit_request: Some(exit_word),
                         trace: vm.lockstep_trace.as_deref(),
                         ..Default::default()
                     };
-                    let r = crate::interp::interpret_block_mode::<ROUTED>(
+                    let r = crate::interp::interpret_block_fp::<ROUTED, DEFAULT>(
                         &ir,
                         &mut self.cpu,
                         &vm.mem,
@@ -1388,7 +1479,8 @@ impl Vcpu {
                     self.executed += info.retired;
                     self.sti_shadow = info.sti_shadow;
                     match r {
-                        StepResult::Continue => blocks_run += 1,
+                        crate::interp::BlockResult::Continue => blocks_run += 1,
+                        crate::interp::BlockResult::ModeChange => return Err(blocks_run + 1),
                         // §17.6 (sub-seam b): in real mode a CPU exception is delivered
                         // in-guest through the IVT, not surfaced to the embedder. The
                         // only `Exit::Exception` that escapes an interpreted Real16 block
@@ -1397,7 +1489,7 @@ impl Vcpu {
                         // `addr` is the faulting instruction's IP (the saved IP for a
                         // fault), so re-deliver through the same IVT path and continue.
                         // Long64/Compat32 still return `Exit::Exception` unchanged.
-                        StepResult::Exit(Exit::Exception { addr, vector })
+                        crate::interp::BlockResult::Exit(Exit::Exception { addr, vector })
                             if self.mode == CpuMode::Real16 =>
                         {
                             match crate::interp::deliver_interrupt(
@@ -1408,10 +1500,10 @@ impl Vcpu {
                                 addr,
                             ) {
                                 StepResult::Continue => blocks_run += 1,
-                                StepResult::Exit(exit) => return exit,
+                                StepResult::Exit(exit) => return Ok(exit),
                             }
                         }
-                        StepResult::Exit(exit) => return exit,
+                        crate::interp::BlockResult::Exit(exit) => return Ok(exit),
                     }
                 }
                 CachedBlock::Compiled { entry, .. } => {
@@ -1435,10 +1527,19 @@ impl Vcpu {
                         ctx.fuel = quantum;
                         // SAFETY: `cur` is a block compiled to this ABI, alive in
                         // the JIT arena (owned by `vm`) for the call.
-                        let code = unsafe { call_block(cur, &mut self.cpu, &mut ctx) };
+                        if !DEFAULT {
+                            fp_mode.compiled(self.cpu.mxcsr);
+                        }
+                        let code = unsafe {
+                            crate::jit_abi::call_block_in_mode(cur, &mut self.cpu, &mut ctx)
+                        };
                         blocks_run += (quantum - ctx.fuel).max(1);
+                        if !DEFAULT && !matches!(code, RET_CHAIN | RET_LINK | RET_IBTC_MISS) {
+                            fp_mode.default();
+                        }
                         match code {
                             RET_CONTINUE | RET_INTERRUPTED => break,
+                            RET_MXCSR_CHANGED => return Err(blocks_run),
                             RET_CHAIN => {
                                 // Plain per-vcpu counter, flushed once per `run`
                                 // (see `TranslationCache::add_chained`): this fires
@@ -1453,10 +1554,17 @@ impl Vcpu {
                                 // an SMC drop that lands while we resolve cannot have its
                                 // slot-clearing undone by our store.
                                 let since_epoch = vm.cache.epoch();
-                                let resolved =
-                                    resolve(vm, FetchAddr::flat(self.cpu.rip), self.mode);
+                                if !DEFAULT {
+                                    fp_mode.default();
+                                }
+                                let resolved = resolve::<DEFAULT>(
+                                    vm,
+                                    FetchAddr::flat(self.cpu.rip),
+                                    self.mode,
+                                    if DEFAULT { 0 } else { self.cpu.mxcsr },
+                                );
                                 if let Some(exit) = self.code_space_exit(vm) {
-                                    return exit;
+                                    return Ok(exit);
                                 }
                                 match resolved {
                                     Ok(CachedBlock::Compiled { entry, .. }) => {
@@ -1486,7 +1594,7 @@ impl Vcpu {
                                     }
                                     // Mixed backend can't chain — fall back to dispatch.
                                     Ok(CachedBlock::Interpreted(_)) => break,
-                                    Err(exit) => return exit,
+                                    Err(exit) => return Ok(exit),
                                 }
                             }
                             // IBTC miss: an indirect edge whose per-site slot was
@@ -1512,10 +1620,17 @@ impl Vcpu {
                                         Some(entry)
                                     }
                                     None => {
-                                        let resolved =
-                                            resolve(vm, FetchAddr::flat(self.cpu.rip), self.mode);
+                                        if !DEFAULT {
+                                            fp_mode.default();
+                                        }
+                                        let resolved = resolve::<DEFAULT>(
+                                            vm,
+                                            FetchAddr::flat(self.cpu.rip),
+                                            self.mode,
+                                            if DEFAULT { 0 } else { self.cpu.mxcsr },
+                                        );
                                         if let Some(exit) = self.code_space_exit(vm) {
-                                            return exit;
+                                            return Ok(exit);
                                         }
                                         match resolved {
                                             Ok(CachedBlock::Compiled { entry }) => {
@@ -1524,10 +1639,14 @@ impl Vcpu {
                                             }
                                             // Indirect edge into an interpreted block.
                                             Ok(CachedBlock::Interpreted(_)) => None,
-                                            Err(exit) => return exit,
+                                            Err(exit) => return Ok(exit),
                                         }
                                     }
                                 };
+                                // Even a fast hit can allocate during refill bookkeeping.
+                                if !DEFAULT {
+                                    fp_mode.default();
+                                }
                                 match entry {
                                     Some(entry) => {
                                         let slot = ctx.link_slot;
@@ -1568,21 +1687,33 @@ impl Vcpu {
                                     None => break,
                                 }
                             }
-                            RET_SYSCALL => return Exit::Syscall,
-                            RET_HLT => return Exit::Hlt,
-                            RET_UNMAPPED => return ctx.unmapped_exit(&self.cpu, self.mode),
-                            RET_HOST_FAULT
-                                if self.fault_entry.fault_kind()
-                                    != crate::jit_abi::fault::HostFaultKind::Alignment
-                                    && vm.mem.mapped_ram(ctx.fault_addr) =>
-                            {
-                                // The landing record already names the protected RAM byte.
-                                // Both modes exit directly, retaining instruction-entry
-                                // register state. Split stores can already have committed
-                                // earlier host transfers (xj-obx.8); resuming rewrites them.
-                                return ctx.unmapped_exit(&self.cpu, self.mode);
-                            }
+                            RET_SYSCALL => return Ok(Exit::Syscall),
+                            RET_HLT => return Ok(Exit::Hlt),
+                            RET_UNMAPPED => return Ok(ctx.unmapped_exit(&self.cpu, self.mode)),
                             RET_MMIO_DEFER | RET_HOST_FAULT => {
+                                if code == RET_HOST_FAULT {
+                                    if DEFAULT {
+                                        // The landing stub may have restored non-default caller
+                                        // control. No guest mode was installed in this specialization.
+                                        // SAFETY: normalize before fault decoding and replay.
+                                        unsafe {
+                                            crate::jit_abi::fp::set_control(
+                                                crate::jit_abi::fp::default_control(),
+                                            )
+                                        };
+                                    } else {
+                                        fp_mode.host_fault();
+                                    }
+                                    if self.fault_entry.fault_kind()
+                                        != crate::jit_abi::fault::HostFaultKind::Alignment
+                                        && vm.mem.mapped_ram(ctx.fault_addr)
+                                    {
+                                        return Ok(ctx.unmapped_exit(&self.cpu, self.mode));
+                                    }
+                                }
+                                if !DEFAULT {
+                                    fp_mode.default();
+                                }
                                 // Trap-region accesses replay to produce MMIO exits.
                                 // Host faults reach replay only for unmapped addresses
                                 // or alignment faults. Misaligned locked operations
@@ -1605,14 +1736,24 @@ impl Vcpu {
                                 );
                                 self.retired += info.retired;
                                 match r {
-                                    StepResult::Continue => break,
-                                    StepResult::Exit(exit) => return exit,
+                                    StepResult::Continue => {
+                                        if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
+                                            != mxcsr_mode
+                                        {
+                                            return Err(blocks_run);
+                                        }
+                                        break;
+                                    }
+                                    StepResult::Exit(exit) => return Ok(exit),
                                 }
                             }
                             // A port-I/O instruction (`in`/`out`, §5.2): the block set
                             // RIP to the instruction; single-step it on the interpreter
                             // to produce the `Exit::PortIo` (same deferral as MMIO).
                             RET_PORTIO_DEFER => {
+                                if !DEFAULT {
+                                    fp_mode.default();
+                                }
                                 let mut info = crate::interp::RetireInfo {
                                     exit_request: Some(exit_word),
                                     trace: vm.lockstep_trace.as_deref(),
@@ -1628,7 +1769,7 @@ impl Vcpu {
                                 self.retired += info.retired;
                                 match r {
                                     StepResult::Continue => break,
-                                    StepResult::Exit(exit) => return exit,
+                                    StepResult::Exit(exit) => return Ok(exit),
                                 }
                             }
                             // A guest exception (`#DE` div, or a lifted `ud2`/`int3`/
@@ -1636,15 +1777,18 @@ impl Vcpu {
                             // instruction, trap: past it) and stored the vector in the
                             // MemCtx out-field.
                             RET_EXCEPTION => {
-                                return Exit::Exception {
+                                return Ok(Exit::Exception {
                                     addr: self.cpu.rip,
                                     vector: ctx.exception_vector as u8,
-                                }
+                                })
                             }
                             other => panic!("compiled block returned invalid ABI code {other}"),
                         }
                         if budget.is_some_and(|b| blocks_run >= b) {
-                            return Exit::BudgetExhausted;
+                            if !DEFAULT {
+                                fp_mode.default();
+                            }
+                            return Ok(Exit::BudgetExhausted);
                         }
                     }
                 }
@@ -1662,7 +1806,7 @@ fn drain_tier_up(vm: &Vm) {
     for fin in vm.backend.tier_up_finished() {
         // A Vm runs in a single mode (§17 scope fence), so the finished compile's
         // block key is its echoed pc under the Vm's mode (§17.4).
-        let key = BlockKey::new(fin.pc, vm.mode);
+        let key = BlockKey::with_mxcsr(fin.pc, vm.mode, fin.mxcsr_mode);
         if matches!(fin.block, CachedBlock::Interpreted(_)) {
             // A failed background compile leaves the already-cached interpreter
             // block in place; only clear its in-flight marker.
@@ -1695,14 +1839,23 @@ fn drain_tier_up(vm: &Vm) {
 
 /// Fetch a block from the cache or lift+materialize it (miss). Lift errors are legal
 /// exits (not `run()` failures) telling the user what to add (§9.2).
-fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
+fn resolve<const DEFAULT: bool>(
+    vm: &Vm,
+    at: FetchAddr,
+    mode: CpuMode,
+    mxcsr: u32,
+) -> Result<CachedBlock, Exit> {
     // §17.4: cache maps key on { physical-fetch-address, mode }. In Real16 the physical
     // fetch address (`cs_base + IP`) is what keys the cache and tags SMC pages, so
     // blocks never collide across segments; the IR's `guest_start` stays the decode IP
     // (`at.ip`) so fall-through / branch targets remain 16-bit IPs (§17.6). Outside
     // Real16 `at.pa == at.ip == pc`, so this is byte-identical to the old `pc` keying.
     let pc = at.pa;
-    let key = BlockKey::new(pc, mode);
+    let key = if DEFAULT {
+        BlockKey::new(pc, mode)
+    } else {
+        BlockKey::with_mxcsr(pc, mode, mxcsr)
+    };
     // §17.6: Real16 has no compiled tier. Bypass tier-up and region formation even
     // when the embedder injected a compiling backend.
     if mode == CpuMode::Real16 {
@@ -1796,6 +1949,7 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
                 )
             };
             let req = TierUpRequest {
+                mxcsr_mode: key.mxcsr_mode,
                 pc,
                 unit,
                 consistency: vm.consistency,
@@ -1818,7 +1972,13 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
                 TierUpSubmit::Unsupported => vm.cache.end_tier_up(key),
             }
         }
-        let compiled = vm.materialize(ir);
+        let compiled = vm.backend.materialize_with_mxcsr(
+            ir,
+            vm.consistency,
+            vm.mem.trap_window(),
+            vm.mem.guest_base(),
+            key.mxcsr_mode,
+        );
         if vm
             .cache
             .upgrade(key, compiled.clone(), (ir.guest_start, ir.guest_len), epoch)
@@ -1842,11 +2002,12 @@ fn resolve(vm: &Vm, at: FetchAddr, mode: CpuMode) -> Result<CachedBlock, Exit> {
             // (it amortizes over the iterations); everything else stays single-block.
             Ok(region) if region.blocks.len() > 1 && region.has_loop => {
                 let spans = region.spans();
-                let materialized = vm.backend.materialize_region(
+                let materialized = vm.backend.materialize_region_with_mxcsr(
                     &region,
                     vm.consistency,
                     vm.mem.trap_window(),
                     vm.mem.guest_base(),
+                    key.mxcsr_mode,
                 );
                 // §10: tag every sub-block's pages — under the spans lock (#12).
                 vm.cache.insert(key, materialized.clone(), spans, |sp| {
@@ -1887,7 +2048,13 @@ fn finish_single(vm: &Vm, key: BlockKey, span_start: u64, ir: IrBlock) -> Cached
     let materialized = if key.mode == CpuMode::Real16 || vm.tier_up_after.is_some() {
         CachedBlock::Interpreted(Arc::new(ir))
     } else {
-        vm.materialize(&ir)
+        vm.backend.materialize_with_mxcsr(
+            &ir,
+            vm.consistency,
+            vm.mem.trap_window(),
+            vm.mem.guest_base(),
+            key.mxcsr_mode,
+        )
     };
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared
     // by a concurrent SMC invalidation between insert and mark.

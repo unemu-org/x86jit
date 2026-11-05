@@ -1203,6 +1203,15 @@ mod tests {
 /// target, or a conditional branch's two arms. Indirect jumps / call / ret / etc.
 /// have no static successors (their edges leave the region).
 pub(crate) fn static_succs(block: &IrBlock) -> Vec<u64> {
+    if block.ops.iter().any(|op| {
+        matches!(
+            op,
+            IrOp::SetMxcsr { .. } | IrOp::FxState { restore: true, .. }
+        )
+    }) {
+        return Vec::new();
+    }
+
     match block.ops.last() {
         Some(IrOp::Jump {
             target: Val::Imm(t),
@@ -2014,7 +2023,7 @@ pub(crate) fn lift_insn(
             emit_write(ops, tg, dst, Val::Temp(t));
             Ok(false)
         }
-        // MXCSR is stored and round-tripped; it does not yet govern arithmetic.
+        // SDM Vol 1 §10.2.3: mode writes end the translation before the next instruction.
         Stmxcsr | Vstmxcsr => {
             let addr = effective_address(insn, ops, tg)?;
             let dst = tg.fresh();
@@ -2031,7 +2040,7 @@ pub(crate) fn lift_insn(
         Ldmxcsr | Vldmxcsr => {
             let src = lower_read(insn, 0, ops, tg)?;
             ops.push(IrOp::SetMxcsr { src });
-            Ok(false)
+            Ok(true)
         }
         // fxsave/fxrstor: 512-byte legacy FP/SSE save area. Shared exec_fxstate in
         // both backends. The default CPUID advertises XSAVE but supplies no leaf 0xD
@@ -2053,7 +2062,7 @@ pub(crate) fn lift_insn(
                 addr,
                 restore: true,
             });
-            Ok(false)
+            Ok(true)
         }
         // SDM Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE; Vol 3A §11.2.2:
         // MFENCE is a full host/compiler barrier in every tier and on every host.

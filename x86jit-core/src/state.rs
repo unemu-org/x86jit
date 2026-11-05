@@ -432,7 +432,7 @@ pub struct CpuState {
     pub fs: u16,
     pub gs: u16,
     /// Guest SSE control/status image (SDM Vol 1 §10.2.3). Stored and round-tripped;
-    /// arithmetic does not yet apply RC/FTZ/DAZ or set sticky exception flags.
+    /// arithmetic applies RC/FTZ/DAZ but does not set sticky exception flags.
     /// This is separate from host FPCR/MXCSR saved by the fault landing stub.
     /// Appended to preserve every existing JIT ABI offset.
     pub mxcsr: u32,

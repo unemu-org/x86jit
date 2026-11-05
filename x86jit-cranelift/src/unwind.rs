@@ -448,6 +448,7 @@ mod tests {
                     .compile_with(
                         crate::CompiledCodeKind::Region,
                         region.entry,
+                        0,
                         |b, helpers, slots| {
                             let rips = crate::codegen::translate_region(
                                 b,

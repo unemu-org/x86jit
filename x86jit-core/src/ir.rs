@@ -372,7 +372,7 @@ pub enum IrOp {
 
     // Architectural MXCSR storage (SDM Vol 1 §10.2.3). Memory accesses remain
     // ordinary Load/Store ops. SetMxcsr faults on reserved bits before committing.
-    // The stored mode does not yet govern arithmetic.
+    // RC | FTZ | DAZ govern SIMD arithmetic; mode writes end the block.
     GetMxcsr {
         dst: Temp,
     },
@@ -381,7 +381,7 @@ pub enum IrOp {
     },
 
     // fxsave/fxrstor (§14): the 512-byte legacy FP/SSE image, including MXCSR.
-    // MXCSR is stored and round-tripped but does not yet govern arithmetic.
+    // Restoring MXCSR ends the block so its successor is specialised to the new mode.
     // Shared exec_fxstate may fault on memory or reserved MXCSR bits.
     FxState {
         fault: MemoryAccess,
@@ -1517,7 +1517,7 @@ pub enum IrOp {
     },
     /// SSE4.1 `round{ps,pd,ss,sd}`: round each lane (or, when `scalar`,
     /// only lane 0, keeping the rest of `a`) per the imm8 `mode` — bits[1:0] select
-    /// nearest-even/floor/ceil/truncate; bit[2] (use MXCSR) is treated as nearest-even.
+    /// nearest-even/floor/ceil/truncate; bit[2] selects MXCSR.RC (SDM Vol 2B §4.3 ROUNDPS).
     /// `a` is the merge base (dst for SSE, op1 for the 3-operand VEX form) — explicit so
     /// a VEX `src` aliasing `dst` isn't clobbered by a pre-copy.
     VPRound {
@@ -2231,7 +2231,7 @@ pub enum IrOp {
         signed: bool,
     },
     // cvt(t)s{s,d}2{si,usi}: `prec`-wide float `src` (raw bits) -> `int_size`-byte integer
-    // in `dst`. `trunc` = toward zero (cvtt*), else round to nearest even. `signed` selects
+    // in `dst`. `trunc` = toward zero (cvtt*), else round according to MXCSR.RC. `signed` selects
     // the signed (`*2si`) vs the AVX-512 unsigned (`*2usi`) form.
     VCvtToInt {
         dst: Temp,
@@ -3074,7 +3074,7 @@ pub enum FloatBinOp {
 /// specified, so a bit-exact match against a host CPU is impossible. We therefore implement
 /// the **exact IEEE reciprocal** (`1.0/x` and `1.0/sqrt(x)`) in both the interpreter and the
 /// JIT. Per the Intel SDM the guaranteed relative error of the hardware estimate is
-/// `|approx − exact| / |exact| <= 1.5 * 2^-12 (~3.66e-4)`; our exact result trivially lies
+/// `|approx − exact| / |exact| <= 1.5 * 2^-12 (~3.66e-4)` (SDM Vol 2B §4.3 RCPPS/RSQRTPS); our exact result trivially lies
 /// inside that bound of the true reciprocal, so we validate against it with a tolerance test
 /// rather than a bit-exact native oracle.
 #[derive(Copy, Clone, Debug)]
@@ -3133,7 +3133,7 @@ pub enum HIntOp {
 pub enum PackedCvtKind {
     /// `cvtdq2ps`: i32×4 → f32×4.
     Dq2Ps,
-    /// `cvtps2dq`: f32×4 → i32×4, round to nearest even (MXCSR default).
+    /// `cvtps2dq`: f32×4 → i32×4, round according to MXCSR.RC.
     Ps2Dq,
     /// `cvttps2dq`: f32×4 → i32×4, truncate toward zero.
     Tps2Dq,
@@ -3143,7 +3143,7 @@ pub enum PackedCvtKind {
     Ps2Pd,
     /// `cvtpd2ps`: f64×2 → f32×2 (low 64), high 64 zeroed.
     Pd2Ps,
-    /// `cvtpd2dq`: f64×2 → i32×2 (low 64), round to nearest even; high 64 zeroed.
+    /// `cvtpd2dq`: f64×2 → i32×2 (low 64), round according to MXCSR.RC; high 64 zeroed.
     Pd2Dq,
     /// `cvttpd2dq`: f64×2 → i32×2 (low 64), truncate; high 64 zeroed.
     Tpd2Dq,

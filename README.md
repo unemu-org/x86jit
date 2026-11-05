@@ -125,9 +125,10 @@ the `oracles/` submodule: witness tests pin the cited values in code.
   what is missing; read the [coverage map][coverage] as an upper bound.
 - **`Prot` is advisory.** A guest store into an `R` or `RX` region succeeds on both backends
   ([deferred.md](backlog/docs/deferred.md)).
-- **FP control is partly modelled.** MXCSR round-trips, but RC, FTZ and DAZ do not yet govern
-  SSE/AVX arithmetic. Some x87 paths, such as stores to memory, ignore rounding control, and
-  legacy forms such as `fnsave`/`frstor` are refused.
+- **FP control is partly modelled.** MXCSR's RC, FTZ and DAZ govern SSE/AVX arithmetic on every
+  tier, but arithmetic does not set its sticky exception flags and unmasked SIMD exceptions are
+  not raised. Some x87 paths, such as stores to memory, ignore rounding control, and legacy forms
+  such as `fnsave`/`frstor` are refused.
 - **Memory ordering covers JIT inline accesses only.** Interpreter accesses and helper-executed
   accesses (string ops, x87, FXSAVE, masked stores) get no tier barriers, and AArch64 LL/SC
   locked operations lack full x86 ordering.

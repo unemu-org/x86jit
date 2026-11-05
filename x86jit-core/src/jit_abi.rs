@@ -16,6 +16,7 @@ use crate::memory::Memory;
 use crate::state::CpuState;
 
 pub mod fault;
+pub mod fp;
 
 /// Every compiled block shares this signature so the dispatcher jumps in
 /// uniformly (§8.2.1).
@@ -61,6 +62,9 @@ pub const RET_PORTIO_DEFER: u64 = 9;
 pub const RET_INTERRUPTED: u64 = 10;
 /// Returned only by the signal-context landing pad; see [`fault`].
 pub const RET_HOST_FAULT: u64 = 11;
+/// An MXCSR write completed. Dispatch selects the successor's FP specialization;
+/// ordinary transfers need no MXCSR load or comparison.
+pub const RET_MXCSR_CHANGED: u64 = 12;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -438,6 +442,29 @@ impl MemCtx {
 /// arena for the call. `cpu` is exclusive; `ctx` wraps the shared guest buffer.
 /// Recovery additionally requires the frame-pointer contract in [`fault::classify`].
 pub unsafe fn call_block(entry: CompiledPtr, cpu: &mut CpuState, ctx: &mut MemCtx) -> u64 {
+    let _fp_mode = fp::RunMode::new();
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if cpu.mxcsr & fp::MODE_MASK != 0 {
+        return fp::call(
+            cpu as *mut CpuState as *mut u8,
+            ctx as *mut MemCtx as *mut u8,
+            entry.0,
+            fp::control(cpu.mxcsr),
+        );
+    }
+    call_block_in_mode(entry, cpu, ctx)
+}
+
+/// Dispatcher entry: its run-scoped guard already installed the host mode.
+///
+/// # Safety
+/// As `call_block`, with host FP control matching the translation's mode.
+#[inline]
+pub(crate) unsafe fn call_block_in_mode(
+    entry: CompiledPtr,
+    cpu: &mut CpuState,
+    ctx: &mut MemCtx,
+) -> u64 {
     let f: CompiledFn = core::mem::transmute(entry.0);
     f(
         cpu as *mut CpuState as *mut u8,
@@ -457,6 +484,7 @@ pub unsafe fn run_compiled(
     mem: &Memory,
     mode: crate::lift::CpuMode,
 ) -> StepResult {
+    let _fp_mode = fp::RunMode::new();
     let mut ctx = MemCtx::for_memory(mem);
     // A block may push/pop the shadow return stack (R5); give it a live scratch ring
     // so the pointer is never null. Predictions here are inert — a single block is
@@ -464,7 +492,9 @@ pub unsafe fn run_compiled(
     let mut scratch = RetStack::new();
     ctx.ret_stack = &mut scratch as *mut RetStack as u64;
     match call_block(entry, cpu, &mut ctx) {
-        RET_CONTINUE | RET_CHAIN | RET_LINK | RET_IBTC_MISS => StepResult::Continue,
+        RET_CONTINUE | RET_CHAIN | RET_LINK | RET_IBTC_MISS | RET_MXCSR_CHANGED => {
+            StepResult::Continue
+        }
         RET_SYSCALL => StepResult::Exit(Exit::Syscall),
         RET_HLT => StepResult::Exit(Exit::Hlt),
         RET_INTERRUPTED => StepResult::Exit(Exit::Interrupted),

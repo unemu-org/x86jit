@@ -26,7 +26,8 @@ use x86jit_core::jit_abi::{
     MEMCTX_FUEL, MEMCTX_ICOUNT_PTR, MEMCTX_LINK_SLOT, MEMCTX_MEM_SELF, MEMCTX_NEXT_ENTRY,
     MEMCTX_RET_STACK, MEMCTX_SIZE, MEMCTX_WATCH_BITS_PTR, MEMCTX_WATCH_COUNT_PTR, RETSTACK_ENTRIES,
     RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
-    RET_LINK, RET_MMIO_DEFER, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED,
+    RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL,
+    RET_UNMAPPED,
 };
 use x86jit_core::memory::{CODE_PAGE_BITS, CODE_RANGE_BITS};
 use x86jit_core::GuestAccessKind;
@@ -87,6 +88,11 @@ const PAGE_MASK: i64 = PAGE_BYTES - 1;
 /// backlog/docs/design/aot-plan.md).
 #[derive(Copy, Clone)]
 pub struct Helpers {
+    pub mxcsr_mode: u32,
+    pub afp: bool,
+    pub fp_control: u64,
+    pub switch_fp: (ir::SigRef, u64),
+    pub fp_boundary: (ir::SigRef, u64, u64),
     pub flag_elision: bool,
     pub div: (ir::SigRef, u64, u64),
     pub string: (ir::SigRef, u64, u64),
@@ -178,6 +184,11 @@ impl Helpers {
         note_watch: (ir::SigRef, u64, u64),
     ) -> Self {
         Helpers {
+            mxcsr_mode: 0,
+            afp: false,
+            fp_control: 0,
+            switch_fp: (note_watch.0, 0),
+            fp_boundary: mk(),
             flag_elision: true,
             div: mk(),
             string: mk(),
@@ -336,6 +347,14 @@ fn translate_block_for_target(
         alignment_recoveries: Vec::new(),
     };
 
+    if helpers.mxcsr_mode != 0
+        && cfg!(target_arch = "aarch64")
+        && x86jit_core::jit_abi::fp::has_afp()
+        && !helpers.afp
+    {
+        t.switch_fp(helpers.fp_control);
+    }
+
     if !matches!(ir.ops.first(), Some(IrOp::InsnStart { .. })) {
         t.emit_insn_start(&ir.guest_start);
     }
@@ -432,6 +451,14 @@ pub fn translate_region(
         alignment_tail: None,
         alignment_recoveries: Vec::new(),
     };
+
+    if helpers.mxcsr_mode != 0
+        && cfg!(target_arch = "aarch64")
+        && x86jit_core::jit_abi::fp::has_afp()
+        && !helpers.afp
+    {
+        t.switch_fp(helpers.fp_control);
+    }
 
     // Carry the 16 GPRs as SSA Variables (§12 M5-T3e): declare them, seed each from
     // `CpuState` in the entry block (which dominates everything), and switch to
@@ -1042,9 +1069,22 @@ impl Translator<'_, '_> {
                 self.builder
                     .ins()
                     .store(MemFlags::trusted(), value, self.cpu, self.offsets.mxcsr);
-                false
+                let end = self.iconst(self.guest_end);
+                self.store_cpu(self.offsets.rip, end);
+                self.ret(RET_MXCSR_CHANGED);
+                true
             }
-            IrOp::FxState { addr, restore, .. } => self.emit_fx_state(addr, restore),
+            IrOp::FxState { addr, restore, .. } => {
+                let terminated = self.emit_fx_state(addr, restore);
+                if *restore && !terminated {
+                    let end = self.iconst(self.guest_end);
+                    self.store_cpu(self.offsets.rip, end);
+                    self.ret(RET_MXCSR_CHANGED);
+                    true
+                } else {
+                    terminated
+                }
+            }
             IrOp::Popcnt { dst, src, size, .. } => self.emit_popcnt(dst, src, size),
             IrOp::Crc32 {
                 dst,
@@ -3584,8 +3624,183 @@ impl Translator<'_, '_> {
             one,
         );
 
+        if self.helpers.mxcsr_mode != 0 {
+            self.switch_fp(x86jit_core::jit_abi::fp::default_control());
+        }
         let callee = self.iconst(addr);
-        self.builder.ins().call_indirect(sig, callee, args)
+        let call = self.builder.ins().call_indirect(sig, callee, args);
+        if self.helpers.mxcsr_mode != 0 {
+            self.switch_fp(self.helpers.fp_control);
+        }
+        call
+    }
+
+    fn switch_fp(&mut self, control: u64) {
+        let (sig, addr) = self.helpers.switch_fp;
+        let f = self.iconst(addr);
+        let value = self.iconst(control);
+        self.builder.ins().call_indirect(sig, f, &[value]);
+    }
+
+    // Arm ARM DDI0487J.a §C5.2.7, FPCR.FZ/AH/FIZ: without AFP keep FZ clear and
+    // flush with integer operations. Output classification is after rounding,
+    // including a carry from the largest subnormal into the smallest normal.
+    pub(crate) fn ftz_conversion(&mut self, source: Value, result: Value) -> Value {
+        let r = self.ftz(result);
+        if self.aarch64 && !self.helpers.afp && self.helpers.mxcsr_mode & 0x8000 != 0 {
+            let zero = self.iconst(0);
+            // fp_words expects a floating-point operand; the unused second
+            // operand has the source's type so scalar/vector ABIs stay uniform.
+            let zero = if self.builder.func.dfg.value_type(source).is_vector() {
+                let z = self.builder.ins().splat(types::I64X2, zero);
+                self.bitcast_v(z, types::F64X2)
+            } else {
+                self.bitcast_scalar(types::F64, zero)
+            };
+            self.fix_fp_boundary(source, zero, r, 4)
+        } else {
+            r
+        }
+    }
+
+    pub(crate) fn fix_fp_boundary(&mut self, a: Value, b: Value, result: Value, op: u64) -> Value {
+        let ty = self.builder.func.dfg.value_type(result);
+        let double = ty.lane_type() == types::F64;
+        let ity = match ty {
+            types::F32 => types::I32,
+            types::F64 => types::I64,
+            types::F32X4 => types::I32X4,
+            types::F64X2 => types::I64X2,
+            _ => unreachable!(),
+        };
+        let bits = self.bitcast_v(result, ity);
+        let mut abs_mask = self.builder.ins().iconst(
+            ity.lane_type(),
+            if double { i64::MAX } else { i32::MAX as i64 },
+        );
+        let mut minimum = self
+            .builder
+            .ins()
+            .iconst(ity.lane_type(), if double { 1i64 << 52 } else { 1 << 23 });
+        if ty.is_vector() {
+            abs_mask = self.builder.ins().splat(ity, abs_mask);
+            minimum = self.builder.ins().splat(ity, minimum);
+        }
+        let magnitude = self.builder.ins().band(bits, abs_mask);
+        let mut boundary = self.builder.ins().icmp(IntCC::Equal, magnitude, minimum);
+        if ty.is_vector() {
+            boundary = self.builder.ins().vany_true(boundary);
+        }
+        let slow = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, ty);
+        self.builder
+            .ins()
+            .brif(boundary, slow, &[], done, &[result]);
+        self.builder.switch_to_block(slow);
+        let (alo, ahi) = self.fp_words(a);
+        let (blo, bhi) = self.fp_words(b);
+        let code = self.iconst(op);
+        let format = self.iconst(u64::from(double));
+        let mode = self.iconst(u64::from(self.helpers.mxcsr_mode));
+        let (slot, _) = self.call_with_out_slot(
+            self.helpers.fp_boundary,
+            &[alo, ahi, blo, bhi, code, format, mode],
+        );
+        let r = self.builder.ins().stack_load(types::I128, slot, 0);
+        let r = if ty.is_vector() {
+            self.bitcast_v(r, ty)
+        } else {
+            let r = self.builder.ins().ireduce(ity, r);
+            self.bitcast_scalar(ty, r)
+        };
+        self.builder.ins().jump(done, &[r]);
+        self.builder.switch_to_block(done);
+        self.builder.block_params(done)[0]
+    }
+
+    fn fp_words(&mut self, f: Value) -> (Value, Value) {
+        let ty = self.builder.func.dfg.value_type(f);
+        if ty.is_vector() {
+            let v = self.bitcast_v(f, types::I64X2);
+            (
+                self.builder.ins().extractlane(v, 0),
+                self.builder.ins().extractlane(v, 1),
+            )
+        } else {
+            let ity = if ty == types::F64 {
+                types::I64
+            } else {
+                types::I32
+            };
+            let lo = self.bitcast_scalar(ity, f);
+            let lo = if ity == types::I32 {
+                self.builder.ins().uextend(types::I64, lo)
+            } else {
+                lo
+            };
+            let hi = self.iconst(0);
+            (lo, hi)
+        }
+    }
+
+    pub(crate) fn daz(&mut self, v: Value) -> Value {
+        if self.helpers.mxcsr_mode & 0x40 == 0 {
+            return v;
+        }
+        self.flush_subnormal(v)
+    }
+
+    pub(crate) fn ftz(&mut self, v: Value) -> Value {
+        if self.helpers.mxcsr_mode & 0x8000 == 0 || !self.aarch64 || self.helpers.afp {
+            return v;
+        }
+        self.flush_subnormal(v)
+    }
+
+    fn flush_subnormal(&mut self, v: Value) -> Value {
+        let ty = self.builder.func.dfg.value_type(v);
+        let double = ty.lane_type() == types::F64;
+        let ity = match ty {
+            types::F32 => types::I32,
+            types::F64 => types::I64,
+            types::F32X4 => types::I32X4,
+            types::F64X2 => types::I64X2,
+            _ => unreachable!("SIMD float type"),
+        };
+        let exp = if double {
+            0x7ff0_0000_0000_0000u64
+        } else {
+            0x7f80_0000
+        };
+        let sign = if double { 1u64 << 63 } else { 1u64 << 31 };
+        let i = self.bitcast_v(v, ity);
+        let mut e = self.builder.ins().iconst(ity.lane_type(), exp as i64);
+        let mut s = self.builder.ins().iconst(ity.lane_type(), sign as i64);
+        let mut zero = self.builder.ins().iconst(ity.lane_type(), 0);
+        if ity.is_vector() {
+            e = self.builder.ins().splat(ity, e);
+            s = self.builder.ins().splat(ity, s);
+            zero = self.builder.ins().splat(ity, zero);
+        }
+        let exponent = self.builder.ins().band(i, e);
+        let tiny = self.builder.ins().icmp(IntCC::Equal, exponent, zero);
+        let signed_zero = self.builder.ins().band(i, s);
+        let r = if ity.is_vector() {
+            self.builder.ins().bitselect(tiny, signed_zero, i)
+        } else {
+            self.builder.ins().select(tiny, signed_zero, i)
+        };
+        self.bitcast_v(r, ty)
+    }
+
+    pub(crate) fn round_mxcsr(&mut self, f: Value) -> Value {
+        match (self.helpers.mxcsr_mode >> 13) & 3 {
+            1 => self.builder.ins().floor(f),
+            2 => self.builder.ins().ceil(f),
+            3 => self.builder.ins().trunc(f),
+            _ => self.builder.ins().nearest(f),
+        }
     }
 
     /// Call a helper that writes two i64 results through a trailing out-pointer (div,
@@ -4079,7 +4294,12 @@ impl Translator<'_, '_> {
     ) -> Value {
         let fty = float_vec_ty(prec);
         let sv = self.bitcast_v(s, fty);
-        let m = if mode & 4 != 0 { 0 } else { mode & 3 };
+        let sv = self.daz(sv);
+        let m = if mode & 4 != 0 {
+            ((self.helpers.mxcsr_mode >> 13) & 3) as u8
+        } else {
+            mode & 3
+        };
         let rounded = match m {
             1 => self.builder.ins().floor(sv),
             2 => self.builder.ins().ceil(sv),
@@ -4248,7 +4468,32 @@ impl Translator<'_, '_> {
     /// (real hardware returns a ~12-bit approximation; see `FloatUnOp` docs) — the `1.0`
     /// numerator is built to match `x`'s type (scalar `f32const`, or a splat for the vector).
     pub(crate) fn emit_funary(&mut self, x: Value, op: FloatUnOp) -> Value {
-        match op {
+        if self.helpers.mxcsr_mode != 0 && matches!(op, FloatUnOp::Rcp | FloatUnOp::Rsqrt) {
+            let (lo, hi) = self.fp_words(x);
+            let zero = self.iconst(0);
+            let code = self.iconst(if matches!(op, FloatUnOp::Rcp) { 5 } else { 6 });
+            let format = self.iconst(0);
+            let mode = self.iconst(u64::from(self.helpers.mxcsr_mode));
+            let (slot, _) = self.call_with_out_slot(
+                self.helpers.fp_boundary,
+                &[lo, hi, zero, zero, code, format, mode],
+            );
+            let r = self.builder.ins().stack_load(types::I128, slot, 0);
+            let ty = self.builder.func.dfg.value_type(x);
+            return if ty.is_vector() {
+                self.bitcast_v(r, ty)
+            } else {
+                let i = self.builder.ins().ireduce(types::I32, r);
+                self.bitcast_scalar(types::F32, i)
+            };
+        }
+
+        let x = if self.aarch64 && !self.helpers.afp {
+            self.daz(x)
+        } else {
+            x
+        };
+        let r = match op {
             FloatUnOp::Sqrt => self.builder.ins().sqrt(x),
             FloatUnOp::Rcp => {
                 let one = self.f32_one_like(x);
@@ -4259,6 +4504,38 @@ impl Translator<'_, '_> {
                 let one = self.f32_one_like(x);
                 self.builder.ins().fdiv(one, s)
             }
+        };
+        let r = self.invalid_nan(x, None, r);
+        self.ftz(r)
+    }
+
+    fn invalid_nan(&mut self, a: Value, b: Option<Value>, r: Value) -> Value {
+        if self.helpers.mxcsr_mode == 0 || !self.aarch64 || self.helpers.afp {
+            return r;
+        }
+        // SDM Vol 1 §4.8.3.7: invalid arithmetic without a NaN source returns
+        // negative QNaN indefinite. Arm's default handling uses positive QNaN.
+        let nan = self.builder.ins().fcmp(FloatCC::Unordered, r, r);
+        let ordered = self.builder.ins().fcmp(FloatCC::Ordered, a, a);
+        let mut invalid = self.builder.ins().band(nan, ordered);
+        if let Some(b) = b {
+            let ordered = self.builder.ins().fcmp(FloatCC::Ordered, b, b);
+            invalid = self.builder.ins().band(invalid, ordered);
+        }
+        let ty = self.builder.func.dfg.value_type(r);
+        let indefinite = if ty.lane_type() == types::F64 {
+            self.builder
+                .ins()
+                .f64const(f64::from_bits(0xfff8000000000000))
+        } else {
+            self.builder.ins().f32const(f32::from_bits(0xffc00000))
+        };
+        if ty.is_vector() {
+            let indefinite = self.builder.ins().splat(ty, indefinite);
+            let mask = self.bitcast_v(invalid, ty);
+            self.builder.ins().bitselect(mask, indefinite, r)
+        } else {
+            self.builder.ins().select(invalid, indefinite, r)
         }
     }
 
@@ -4279,7 +4556,11 @@ impl Translator<'_, '_> {
     /// (`(a<b)?a:b` / `(a>b)?a:b`) that matches the interpreter bit-for-bit, rather
     /// than an IEEE `fmin`/`fmax` (which differ on NaN).
     pub(crate) fn emit_fbin(&mut self, a: Value, b: Value, op: FloatBinOp) -> Value {
-        match op {
+        let manual_daz =
+            matches!(op, FloatBinOp::Min | FloatBinOp::Max) || (self.aarch64 && !self.helpers.afp);
+        let a = if manual_daz { self.daz(a) } else { a };
+        let b = if manual_daz { self.daz(b) } else { b };
+        let r = match op {
             FloatBinOp::Add => {
                 let r = self.builder.ins().fadd(a, b);
                 self.x86_nan_from_src1(a, r)
@@ -4313,6 +4594,32 @@ impl Translator<'_, '_> {
                     self.builder.ins().select(cmp, a, b)
                 }
             }
+        };
+        let r = if matches!(op, FloatBinOp::Min | FloatBinOp::Max) {
+            r
+        } else {
+            self.invalid_nan(a, Some(b), r)
+        };
+        let r = if matches!(op, FloatBinOp::Min | FloatBinOp::Max) {
+            r
+        } else {
+            self.ftz(r)
+        };
+        if self.aarch64
+            && !self.helpers.afp
+            && self.helpers.mxcsr_mode & 0x8000 != 0
+            && !matches!(op, FloatBinOp::Min | FloatBinOp::Max)
+        {
+            let code = match op {
+                FloatBinOp::Add => 0,
+                FloatBinOp::Sub => 1,
+                FloatBinOp::Mul => 2,
+                FloatBinOp::Div => 3,
+                _ => unreachable!(),
+            };
+            self.fix_fp_boundary(a, b, r, code)
+        } else {
+            r
         }
     }
 
@@ -5117,6 +5424,50 @@ fn int_ty(size: u8) -> Type {
     }
 }
 
+// Cranelift 0.115's cprop rules evaluate floating-point constants in the
+// compiler's default environment. Bit reinterpretations are opaque to that pass
+// and lower to register copies; wrapping just these operands leaves integer
+// optimization and the default translation unchanged. The constant-conversion
+// witness must also pass when upgrading Cranelift.
+pub(crate) fn preserve_float_environment(func: &mut ir::Function) {
+    use cranelift::codegen::cursor::{Cursor, FuncCursor};
+    use cranelift::codegen::ir::Opcode;
+    let mut cursor = FuncCursor::new(func);
+    while let Some(_block) = cursor.next_block() {
+        while let Some(inst) = cursor.next_inst() {
+            if !matches!(
+                cursor.func.dfg.insts[inst].opcode(),
+                Opcode::Fadd
+                    | Opcode::Fsub
+                    | Opcode::Fmul
+                    | Opcode::Fdiv
+                    | Opcode::Sqrt
+                    | Opcode::FcvtFromSint
+                    | Opcode::FcvtFromUint
+            ) {
+                continue;
+            }
+            let value = cursor.func.dfg.inst_args(inst)[0];
+            let ty = cursor.func.dfg.value_type(value);
+            let via = match ty {
+                types::F32 => types::I32,
+                types::F64 => types::I64,
+                types::I32 => types::F32,
+                types::I64 => types::F64,
+                types::F32X4 => types::I32X4,
+                types::F64X2 => types::I64X2,
+                types::I32X4 => types::F32X4,
+                types::I64X2 => types::F64X2,
+                _ => continue,
+            };
+            cursor.use_srcloc(inst);
+            let bits = cursor.ins().bitcast(via, MemFlags::new(), value);
+            let opaque = cursor.ins().bitcast(ty, MemFlags::new(), bits);
+            cursor.func.dfg.inst_args_mut(inst)[0] = opaque;
+        }
+    }
+}
+
 // Native aarch64 tier regressions. The fence witnesses in `fence_tests` also
 // compile for both ISAs on every host using the dev-only cross-ISA features.
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -5648,5 +5999,56 @@ mod density_tests {
              chain fixed = hot instructions of a one-body block that exits by CHAINING \
              rather than `hlt`, which is how a real block ends.\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod float_environment_tests {
+    use super::*;
+    use cranelift::codegen::{
+        settings::{self, Configurable},
+        Context,
+    };
+
+    #[test]
+    fn vector_conversion_retains_float_environment() {
+        let mut flags = settings::builder();
+        flags.set("opt_level", "speed").unwrap();
+        let isa = cranelift_native::builder()
+            .unwrap()
+            .finish(settings::Flags::new(flags))
+            .unwrap();
+        for unsigned in [false, true] {
+            let mut ctx = Context::new();
+            ctx.func.signature.call_conv = isa.default_call_conv();
+            ctx.func.signature.returns.push(AbiParam::new(types::F32X4));
+            let mut fb = FunctionBuilderContext::new();
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb);
+            let block = b.create_block();
+            b.switch_to_block(block);
+            b.seal_block(block);
+            // SDM Vol 2A §3.3 CVTDQ2PS: 2^24 + 1 requires RC-sensitive rounding.
+            let i = b.ins().iconst(types::I32, 16_777_217);
+            let v = b.ins().splat(types::I32X4, i);
+            let r = if unsigned {
+                b.ins().fcvt_from_uint(types::F32X4, v)
+            } else {
+                b.ins().fcvt_from_sint(types::F32X4, v)
+            };
+            b.ins().return_(&[r]);
+            b.finalize();
+            preserve_float_environment(&mut ctx.func);
+            ctx.optimize(&*isa, &mut Default::default()).unwrap();
+            let text = ctx.func.display().to_string();
+            let opcode = if unsigned {
+                "fcvt_from_uint"
+            } else {
+                "fcvt_from_sint"
+            };
+            assert!(
+                text.contains(opcode),
+                "RC-sensitive vector conversion folded:\n{text}"
+            );
+        }
     }
 }

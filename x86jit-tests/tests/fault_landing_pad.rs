@@ -59,6 +59,36 @@ struct Compiled {
 }
 
 impl Backend for Compiled {
+    fn materialize_with_mxcsr(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        let block = self
+            .jit
+            .materialize_with_mxcsr(ir, consistency, mmio, guest_base, mxcsr_mode);
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        perturb_compiler_fp();
+        block
+    }
+    fn materialize_region_with_mxcsr(
+        &self,
+        ir: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        let block =
+            self.jit
+                .materialize_region_with_mxcsr(ir, consistency, mmio, guest_base, mxcsr_mode);
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        perturb_compiler_fp();
+        block
+    }
     fn region_caps(&self) -> Option<x86jit_core::RegionCaps> {
         self.region.then_some(x86jit_core::RegionCaps {
             max_blocks: 16,
@@ -158,6 +188,9 @@ fn case(kind: &str, region: bool, straddle: bool, mapped: bool) {
     case_mode(kind, region, straddle, mapped, false);
 }
 fn case_mode(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bool) {
+    case_mxcsr(kind, region, straddle, mapped, routed, 0x1f80);
+}
+fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bool, mxcsr: u32) {
     // SAFETY: sysconf has no pointer argument.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let base = 0x1_0000_0000;
@@ -205,7 +238,7 @@ fn case_mode(kind: &str, region: bool, straddle: bool, mapped: bool, routed: boo
             vm.write_bytes(addr, &[0x53; 4]).unwrap();
         }
     }
-    let mut expected = interp.new_vcpu();
+    let mut expected = interp.new_vcpu_with_mxcsr(mxcsr);
     expected.cpu.gpr = std::array::from_fn(|i| 0x8055_0000 + i as u64);
     expected.set_reg(Reg::Rdi, addr);
     expected.set_reg(Reg::Rip, code_addr);
@@ -841,4 +874,14 @@ fn data_abort_syndrome_distinguishes_access_and_alignment() {
         }
     }
     assert_eq!(esr_fault_kind((0x20 << 26) | 7), HostFaultKind::Unsupported);
+}
+
+#[test]
+fn landing_restores_nondefault_guest_mxcsr_mode() {
+    for mode in [0x9fc0, 0x3f80, 0x5f80, 0x7f80] {
+        for region in [false, true] {
+            let status = child(|| case_mxcsr("load", region, false, false, false, mode));
+            assert_eq!(status, 0, "mode={mode:x}, region={region}");
+        }
+    }
 }

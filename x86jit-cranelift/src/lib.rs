@@ -1746,11 +1746,16 @@ unsafe extern "C" fn cvtph2ps_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u6
 /// `cpu` is a valid pointer to a `CpuState` for the call.
 unsafe extern "C" fn cvtps2ph_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u64, rc: u64) {
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
-    let out = x86jit_core::interp::cvtps2ph(
+    let out = x86jit_core::interp::cvtps2ph_with_mxcsr(
         cpu.xmm[src as usize],
         cpu.ymm_hi[src as usize],
         lanes as usize,
-        rc as u8,
+        if rc & 4 != 0 {
+            ((cpu.mxcsr >> 13) & 3) as u8
+        } else {
+            rc as u8
+        },
+        cpu.mxcsr,
     );
     cpu.xmm[dst as usize] = out;
     cpu.ymm_hi[dst as usize] = 0;
@@ -2386,6 +2391,9 @@ struct Shared {
     /// bakes in `opt_level`, which may have to be derived from a tier-up policy the
     /// `Vm` reports after the backend is constructed. `None` until then.
     inner: Mutex<Option<Jit>>,
+    nondefault_inner: Mutex<Option<Jit>>,
+    compile_serial: Mutex<()>,
+    compile_attempts: AtomicU64,
     /// Codegen recipe, kept for the deferred build.
     target: HostTarget,
     /// Explicit [`OptLevel`], or `None` to derive it from `tiered` at build time.
@@ -2639,6 +2647,9 @@ impl JitBackend {
         Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(None),
+                nondefault_inner: Mutex::new(None),
+                compile_serial: Mutex::new(()),
+                compile_attempts: AtomicU64::new(0),
                 target,
                 opt,
                 tiered: AtomicBool::new(false),
@@ -2794,7 +2805,7 @@ impl Shared {
     /// `Speed` without the embedder asking. A tier-up policy set *after* the first
     /// compile cannot change the level: the module and every block already in it
     /// were built at the old one.
-    fn jit(&self) -> impl std::ops::DerefMut<Target = Jit> + '_ {
+    fn jit(&self, mxcsr_mode: u32) -> impl std::ops::DerefMut<Target = Jit> + '_ {
         struct Guard<'a>(std::sync::MutexGuard<'a, Option<Jit>>);
         impl std::ops::Deref for Guard<'_> {
             type Target = Jit;
@@ -2807,7 +2818,12 @@ impl Shared {
                 self.0.as_mut().expect("module built on lock")
             }
         }
-        let mut guard = lock_recovering(&self.inner, "JIT module");
+        let inner = if mxcsr_mode == 0 {
+            &self.inner
+        } else {
+            &self.nondefault_inner
+        };
+        let mut guard = lock_recovering(inner, "JIT module");
         if guard.is_none() {
             let opt = self
                 .opt
@@ -2827,11 +2843,13 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
+        mxcsr_mode: u32,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
             CompiledCodeKind::Block,
             ir.guest_start,
+            mxcsr_mode,
             |builder, helpers, alloc_slot| {
                 codegen::translate_block(
                     builder,
@@ -2855,11 +2873,13 @@ impl Shared {
         consistency: MemConsistency,
         mmio: Option<(u64, u64)>,
         guest_base: u64,
+        mxcsr_mode: u32,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with(
             CompiledCodeKind::Region,
             region.entry,
+            mxcsr_mode,
             |builder, helpers, alloc_slot| {
                 codegen::translate_region(
                     builder,
@@ -2885,6 +2905,7 @@ impl Shared {
         // Observer metadata follows the real guest entry, before any source location.
         kind: CompiledCodeKind,
         guest_rip: u64,
+        mxcsr_mode: u32,
         translate: impl FnOnce(
             &mut FunctionBuilder,
             codegen::Helpers,
@@ -2895,15 +2916,19 @@ impl Shared {
         if self.code_space_exhausted.load(Ordering::Acquire) {
             return Err(CompileError::Unavailable);
         }
-        let mut jit = self.jit();
+        let _serial = lock_recovering(&self.compile_serial, "JIT compilation");
+        let mut jit = self.jit(mxcsr_mode);
         // Serialized with every foreground/background compile. After an error the
         // module may contain unfinalized definitions; never retry or publish those.
         if self.code_space_exhausted.load(Ordering::Acquire) {
             return Err(CompileError::Unavailable);
         }
-        if jit.next_id >= self.compile_limit.load(Ordering::Relaxed) {
+        if self.compile_attempts.load(Ordering::Relaxed)
+            >= self.compile_limit.load(Ordering::Relaxed)
+        {
             return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
+        self.compile_attempts.fetch_add(1, Ordering::Relaxed);
         jit.next_id += 1;
         let name = format!("blk_{}", jit.next_id);
 
@@ -2999,6 +3024,7 @@ impl Shared {
         let pcmpstrm_mem_sig = params(7, false); // pcmpstrm_mem(cpu, a, bv_lo, bv_hi, imm, explicit, out) -> ()
         let bmi_sig = params(5, false); // bmi(a, b, op, size, out) -> () — result + CF via `out`
 
+        let fp_signatures = (mxcsr_mode != 0).then(|| (params(1, false), params(8, false)));
         let slots_start = jit.slots.len();
         let guest_rips = {
             let Jit { fbctx, slots, .. } = &mut *jit;
@@ -3034,7 +3060,38 @@ impl Shared {
                     )
                 }};
             }
+            let (switch_fp, fp_boundary) =
+                if let Some((switch_sig, fp_boundary_sig)) = fp_signatures {
+                    (
+                        (
+                            builder.import_signature(switch_sig),
+                            x86jit_core::jit_abi::fp::set_control as *const u8 as u64,
+                        ),
+                        helper!(fp_boundary_sig, fp_boundary_helper),
+                    )
+                } else {
+                    // Reserve the counter index in both modules, without importing
+                    // signatures that default translations cannot call.
+                    hnames[hidx] = "fp_boundary_helper";
+                    hidx += 1;
+                    (
+                        (ir::SigRef::from_u32(0), 0),
+                        (ir::SigRef::from_u32(0), 0, 0),
+                    )
+                };
+            let afp = mxcsr_mode != 0
+                && self.target != HostTarget::Baseline
+                && x86jit_core::jit_abi::fp::has_afp();
             let helpers = codegen::Helpers {
+                mxcsr_mode,
+                afp,
+                fp_control: if mxcsr_mode == 0 {
+                    x86jit_core::jit_abi::fp::default_control()
+                } else {
+                    x86jit_core::jit_abi::fp::control_with_afp(mxcsr_mode, afp)
+                },
+                switch_fp,
+                fp_boundary,
                 flag_elision: self.flag_elision.load(Ordering::Relaxed),
                 div: helper!(div_sig, div_helper),
                 string: helper!(str_sig, string_helper),
@@ -3109,6 +3166,9 @@ impl Shared {
             guest_rips
         };
 
+        if mxcsr_mode != 0 {
+            codegen::preserve_float_environment(&mut ctx.func);
+        }
         let trap_metadata = match prepare_guest_traps(&mut ctx.func, &guest_rips) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -3199,6 +3259,7 @@ impl Shared {
             return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
         drop(jit);
+        drop(_serial);
         self.observe(CompiledCode {
             host_start: entry.0 as usize,
             host_len: code_len,
@@ -3288,13 +3349,25 @@ impl Shared {
     fn compile_request(&self, req: &TierUpRequest) -> CachedBlock {
         match &req.unit {
             TierUpUnit::Block(ir) => self
-                .compile(ir, req.consistency, req.mmio, req.guest_base)
+                .compile(
+                    ir,
+                    req.consistency,
+                    req.mmio,
+                    req.guest_base,
+                    req.mxcsr_mode,
+                )
                 .map_or_else(
                     |_| CachedBlock::Interpreted(ir.clone()),
                     |entry| CachedBlock::Compiled { entry },
                 ),
             TierUpUnit::Region(region) => self
-                .compile_region(region, req.consistency, req.mmio, req.guest_base)
+                .compile_region(
+                    region,
+                    req.consistency,
+                    req.mmio,
+                    req.guest_base,
+                    req.mxcsr_mode,
+                )
                 .map_or_else(
                     |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                     |entry| CachedBlock::Compiled { entry },
@@ -3327,6 +3400,7 @@ impl Shared {
                 let mut done = self.done.lock().unwrap();
                 done.push(TierUpFinished {
                     pc: req.pc,
+                    mxcsr_mode: req.mxcsr_mode,
                     block,
                     spans: req.spans.clone(),
                     epoch: req.epoch,
@@ -3408,9 +3482,40 @@ impl Backend for JitBackend {
         guest_base: u64,
     ) -> CachedBlock {
         self.shared
-            .compile(ir, consistency, mmio, guest_base)
+            .compile(ir, consistency, mmio, guest_base, 0)
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
+    }
+
+    fn materialize_with_mxcsr(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        self.shared
+            .compile(ir, consistency, mmio, guest_base, mxcsr_mode)
+            .map_or_else(
+                |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
+    }
+    fn materialize_region_with_mxcsr(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+    ) -> CachedBlock {
+        self.shared
+            .compile_region(region, consistency, mmio, guest_base, mxcsr_mode)
+            .map_or_else(
+                |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                 |entry| CachedBlock::Compiled { entry },
             )
     }
@@ -3427,7 +3532,7 @@ impl Backend for JitBackend {
         guest_base: u64,
     ) -> CachedBlock {
         self.shared
-            .compile_region(region, consistency, mmio, guest_base)
+            .compile_region(region, consistency, mmio, guest_base, 0)
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                 |entry| CachedBlock::Compiled { entry },
@@ -3443,10 +3548,13 @@ impl Backend for JitBackend {
         // entry. Runs under the compiler mutex, off the hot path.
         // Raw lock, not `Shared::jit`: nothing has been compiled if the module was
         // never built, so there are no slots to clear and no reason to build it here.
-        let jit = lock_recovering(&self.shared.inner, "JIT module");
-        let Some(jit) = jit.as_ref() else { return };
-        for slot in &jit.slots {
-            slot.store(0, Ordering::Relaxed);
+        for inner in [&self.shared.inner, &self.shared.nondefault_inner] {
+            let jit = lock_recovering(inner, "JIT module");
+            if let Some(jit) = jit.as_ref() {
+                for slot in &jit.slots {
+                    slot.store(0, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -3536,6 +3644,67 @@ impl Drop for JitBackend {
             let _ = handle.join(); // swallow a worker panic
         }
     }
+}
+
+/// Rare normal/subnormal boundary recomputation under default host control.
+/// SDM Vol 1 §11.5.2.5 specifies tininess with an unbounded exponent.
+///
+/// # Safety
+/// `out` points at a writable 16-byte JIT stack slot.
+unsafe extern "C" fn fp_boundary_helper(
+    alo: u64,
+    ahi: u64,
+    blo: u64,
+    bhi: u64,
+    op: u64,
+    double: u64,
+    mode: u64,
+    out: *mut u128,
+) {
+    use x86jit_core::interp::softfloat;
+    let a = u128::from(alo) | (u128::from(ahi) << 64);
+    let b = u128::from(blo) | (u128::from(bhi) << 64);
+    let bits = if double != 0 { 64 } else { 32 };
+    let mut result = 0;
+    if op == 4 {
+        for i in 0..2 {
+            let r = softfloat::convert((a >> (i * 64)) as u64, true, false, mode as u32);
+            result |= u128::from(r) << (i * 32);
+        }
+        out.write_unaligned(result);
+        return;
+    }
+    for i in 0..128 / bits {
+        let x = (a >> (i * bits)) as u64;
+        let y = (b >> (i * bits)) as u64;
+        let r = if op >= 5 {
+            softfloat::unary(
+                x,
+                false,
+                if op == 5 {
+                    x86jit_core::FloatUnOp::Rcp
+                } else {
+                    x86jit_core::FloatUnOp::Rsqrt
+                },
+                mode as u32,
+            )
+        } else {
+            softfloat::binary(
+                x,
+                y,
+                double != 0,
+                match op {
+                    0 => x86jit_core::FloatBinOp::Add,
+                    1 => x86jit_core::FloatBinOp::Sub,
+                    2 => x86jit_core::FloatBinOp::Mul,
+                    _ => x86jit_core::FloatBinOp::Div,
+                },
+                mode as u32,
+            )
+        };
+        result |= u128::from(r) << (i * bits);
+    }
+    out.write_unaligned(result);
 }
 
 #[cfg(test)]
@@ -3642,6 +3811,7 @@ mod tests {
                     .compile_with(
                         CompiledCodeKind::Block,
                         ir.guest_start,
+                        0,
                         |builder, mut helpers, alloc| {
                             helpers.note_watch.1 = paused_store as *const () as u64;
                             codegen::translate_block(
@@ -3682,6 +3852,7 @@ mod tests {
                     .compile_with(
                         CompiledCodeKind::Region,
                         region.entry,
+                        0,
                         |builder, mut helpers, alloc| {
                             helpers.note_watch.1 = paused_store as *const () as u64;
                             codegen::translate_region(
@@ -3790,6 +3961,7 @@ mod tests {
         )
         .expect("lift the block");
         TierUpRequest {
+            mxcsr_mode: 0,
             pc: ENTRY,
             unit: TierUpUnit::Block(Arc::new(ir)),
             consistency: MemConsistency::Fast,
@@ -3840,7 +4012,7 @@ mod tests {
         assert_eq!(cpu.reg(Reg::Rax), 0);
         assert_eq!(cpu.reg(Reg::Rip), ENTRY);
         assert!(vm.backend.code_space_exhausted());
-        let compile_id = shared.jit().next_id;
+        let compile_id = shared.jit(0).next_id;
         shared.fail_compile_stage.store(0, Ordering::Relaxed);
         vm.write_bytes(ENTRY + 0x100, CODE).unwrap();
         let fresh = lift_block(
@@ -3855,7 +4027,7 @@ mod tests {
             CachedBlock::Interpreted(_)
         ));
         assert_eq!(
-            shared.jit().next_id,
+            shared.jit(0).next_id,
             compile_id,
             "no compile after exhaustion"
         );
@@ -4230,7 +4402,7 @@ mod tests {
             drop(q);
             drop(pause);
             handle.wait_idle();
-            assert_eq!(handle.shared.jit().next_id, 1, "failure hook was reached");
+            assert_eq!(handle.shared.jit(0).next_id, 1, "failure hook was reached");
             let done = handle.shared.done.lock().unwrap();
             assert_eq!(done.len(), 1);
             assert!(matches!(done[0].block, CachedBlock::Interpreted(_)));

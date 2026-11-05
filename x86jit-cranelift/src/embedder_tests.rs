@@ -125,7 +125,7 @@ fn embedder_observer_sees_blocks_and_background_regions() {
         .contains("preserve_frame_pointers=true"));
     assert!(jit
         .shared
-        .jit()
+        .jit(0)
         .module
         .isa()
         .flags()
@@ -141,7 +141,7 @@ fn embedder_observer_sees_blocks_and_background_regions() {
     let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     let region = lift_region(
         &mem,
@@ -155,6 +155,7 @@ fn embedder_observer_sees_blocks_and_background_regions() {
     .unwrap();
     let handle = jit.tier_up_handle();
     let request = TierUpRequest {
+        mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 6)],
         epoch: 0,
@@ -206,7 +207,7 @@ fn embedder_flag_elision_options_preserve_execution() {
         jit.set_compiled_code_observer(move |code| lengths.lock().unwrap().push(code.host_len));
         let entry = jit
             .shared
-            .compile(&ir, MemConsistency::Fast, None, 0)
+            .compile(&ir, MemConsistency::Fast, None, 0, 0)
             .unwrap();
         let mut actual = x86jit_core::CpuState::new();
         actual.rip = 0x1000;
@@ -256,7 +257,7 @@ fn embedder_legacy_jit_environment_requires_api_opt_in() {
     let mem = memory(&[0xf4]);
     let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     assert!(
         !path.exists(),
@@ -267,7 +268,7 @@ fn embedder_legacy_jit_environment_requires_api_opt_in() {
     assert!(jit.codegen_description().contains("flag_elision=false"));
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     let map = std::fs::read_to_string(&path).unwrap();
     assert!(map.starts_with(&format!("{:x} ", entry.0 as usize)));
@@ -289,7 +290,7 @@ fn embedder_baseline_swizzle_libcall_obeys_vector_abi() {
     *jit.shared.inner.lock().unwrap() = Some(state);
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     for base in (0..=255).step_by(16) {
         let mut cpu = x86jit_core::CpuState::new();
@@ -338,7 +339,7 @@ fn review_observer_is_outside_module_lock() {
         }
     });
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     assert_eq!(
         observed.load(Ordering::Relaxed),
@@ -359,6 +360,7 @@ fn review_observer_panic_does_not_strand_background_queue() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
         epoch: 0,
@@ -446,13 +448,13 @@ fn review_legacy_perfmap_multiple_backends_preserve_ranges() {
     jit1.enable_environment_diagnostics();
     let first = jit1
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     let jit2 = JitBackend::new();
     jit2.enable_environment_diagnostics();
     let second = jit2
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
         .unwrap();
     jit1.enable_environment_diagnostics();
     let map = std::fs::read_to_string(&path).unwrap();
@@ -489,6 +491,7 @@ fn review_panic_payload_drop_keeps_worker_alive() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
         epoch: 0,
@@ -544,6 +547,7 @@ fn review_observer_capture_drop_keeps_worker_alive() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
         epoch: 0,

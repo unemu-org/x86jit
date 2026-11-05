@@ -332,7 +332,20 @@ fn transfer_mode_case(kind: &str, tier: u8, straddle: bool, readonly: bool, rout
     reference.read_bytes(guard - 512, &mut ref_bytes).unwrap();
     assert_eq!(bytes, ref_bytes);
     if tier == 2 {
-        assert!(vm.cache.regions() > 0);
+        if kind == "fxrstor" {
+            // FXRSTOR writes MXCSR, ending its block and cutting this loop's
+            // static back edge. The faulting instruction still runs in a block.
+            assert_eq!(vm.cache.regions(), 0);
+            assert!(matches!(
+                vm.cache.get(x86jit_core::BlockKey::new(
+                    code_addr,
+                    x86jit_core::CpuMode::Long64
+                )),
+                Some(CachedBlock::Compiled { .. })
+            ));
+        } else {
+            assert!(vm.cache.regions() > 0, "{kind} must form a region");
+        }
     }
 }
 #[test]

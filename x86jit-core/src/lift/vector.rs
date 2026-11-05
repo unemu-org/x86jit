@@ -4937,10 +4937,10 @@ pub(crate) fn lift_vcvtps2ph(
     } else {
         (reg_xmm(insn, 1).or_unsupported(insn)?, 4u8)
     };
-    // imm8[2]=1 selects MXCSR rounding (modeled as the default round-to-nearest-even);
+    // SDM Vol 2C §5.2 VCVTPS2PH, Table 5-3: preserve imm8[2] for MXCSR.RC;
     // imm8[2]=0 uses imm8[1:0] as the explicit rounding control (SDM VCVTPS2PH).
     let imm = insn.immediate(2) as u8;
-    let rc = if imm & 0x4 != 0 { 0 } else { imm & 0x3 };
+    let rc = imm & 7;
     // Memory-destination form needs a scratch vector register to stage the packed halves;
     // there is no scratch-vec allocator, so it is deferred.
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;

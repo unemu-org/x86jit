@@ -549,6 +549,9 @@ impl Translator<'_, '_> {
 
     /// `fadd` with the architectural NaN result (SDM Vol 1 §4.8.3.5, Table 4-8).
     fn sse_fadd(&mut self, x: Value, y: Value) -> Value {
+        if self.helpers.mxcsr_mode != 0 {
+            return self.emit_fbin(x, y, FloatBinOp::Add);
+        }
         let r = self.builder.ins().fadd(x, y);
         self.sse_nan_result(x, y, r)
     }
@@ -585,7 +588,11 @@ impl Translator<'_, '_> {
     fn dpps_native(&mut self, a: Value, b: Value, imm: u8) -> Value {
         let af = self.bitcast_v(a, types::F32X4);
         let bf = self.bitcast_v(b, types::F32X4);
-        let prod = self.builder.ins().fmul(af, bf);
+        let prod = if self.helpers.mxcsr_mode != 0 {
+            self.emit_fbin(af, bf, FloatBinOp::Mul)
+        } else {
+            self.builder.ins().fmul(af, bf)
+        };
         // Per-lane products; a lane deselected by imm[7:4] contributes +0.0 (SDM).
         let zero_f = {
             let zi = self.builder.ins().iconst(types::I32, 0);
@@ -670,7 +677,11 @@ impl Translator<'_, '_> {
     fn dppd_native(&mut self, a: Value, b: Value, imm: u8) -> Value {
         let af = self.bitcast_v(a, types::F64X2);
         let bf = self.bitcast_v(b, types::F64X2);
-        let prod = self.builder.ins().fmul(af, bf);
+        let prod = if self.helpers.mxcsr_mode != 0 {
+            self.emit_fbin(af, bf, FloatBinOp::Mul)
+        } else {
+            self.builder.ins().fmul(af, bf)
+        };
         // Per-lane products; a lane deselected by imm[5:4] contributes +0.0 (SDM).
         let zero_f = {
             let zi = self.builder.ins().iconst(types::I64, 0);
@@ -682,7 +693,11 @@ impl Translator<'_, '_> {
                 *slot = self.builder.ins().extractlane(prod, i as u8);
             }
         }
-        let sum = self.builder.ins().fadd(p[0], p[1]);
+        let sum = if self.helpers.mxcsr_mode != 0 {
+            self.emit_fbin(p[0], p[1], FloatBinOp::Add)
+        } else {
+            self.builder.ins().fadd(p[0], p[1])
+        };
         let sum_bits = self.bitcast_scalar(types::I64, sum);
         // Broadcast the sum to output qwords selected by imm[1:0]; zero the rest.
         let zero_i = self.builder.ins().iconst(types::I64, 0);
@@ -3913,8 +3928,9 @@ impl Translator<'_, '_> {
             }
             Ps2Dq | Tps2Dq => {
                 let f = self.bitcast_v(x, types::F32X4);
+                let f = self.daz(f);
                 let f = if matches!(kind, Ps2Dq) {
-                    self.builder.ins().nearest(f)
+                    self.round_mxcsr(f)
                 } else {
                     f
                 };
@@ -4170,6 +4186,8 @@ impl Translator<'_, '_> {
                 )
             }
         };
+        let x = self.daz(x);
+        let y = self.daz(y);
         let un = self.builder.ins().fcmp(FloatCC::Unordered, x, y);
         let lt = self.builder.ins().fcmp(FloatCC::LessThan, x, y);
         let eq = self.builder.ins().fcmp(FloatCC::Equal, x, y);
@@ -4200,6 +4218,8 @@ impl Translator<'_, '_> {
     /// #IA-on-QNaN nuance, which our NaN-unaware model doesn't distinguish — so the 32
     /// predicates collapse to the eight boolean outcomes below (matching `float_pred`).
     fn build_float_cmp_mask(&mut self, va: Value, vb: Value, pred: u8) -> Value {
+        let va = self.daz(va);
+        let vb = self.daz(vb);
         let eq = |s: &mut Self| s.builder.ins().fcmp(FloatCC::Equal, va, vb);
         let lt = |s: &mut Self| s.builder.ins().fcmp(FloatCC::LessThan, va, vb);
         let le = |s: &mut Self| s.builder.ins().fcmp(FloatCC::LessThanOrEqual, va, vb);
@@ -4457,12 +4477,9 @@ impl Translator<'_, '_> {
                 self.bitcast_scalar(types::F32, i)
             }
         };
-        // Round to nearest even for cvt*2si; cvtt*2si truncates toward zero.
-        let f = if *trunc {
-            f
-        } else {
-            self.builder.ins().nearest(f)
-        };
+        let f = self.daz(f);
+        // SDM Vol 2A §3.3 CVTSD2SI/CVTTSD2SI: MXCSR.RC versus truncation.
+        let f = if *trunc { f } else { self.round_mxcsr(f) };
         // Saturating convert matches the interpreter's Rust `as` cast (both
         // clamp out-of-range to the destination's MIN/MAX; the x86
         // integer-indefinite result on invalid operands is deferred). `signed`
@@ -4501,9 +4518,15 @@ impl Translator<'_, '_> {
                 self.bitcast_scalar(types::F32, i)
             }
         };
+        let f = self.daz(f);
         let g = match to {
             FPrec::F64 => self.builder.ins().fpromote(types::F64, f),
             FPrec::F32 => self.builder.ins().fdemote(types::F32, f),
+        };
+        let g = if *to == FPrec::F32 {
+            self.ftz_conversion(f, g)
+        } else {
+            g
         };
         let gbits = self.bitcast_scalar(lane_int_ty(*to), g);
         let xd = self.load_xmm(*dst);
@@ -4529,8 +4552,9 @@ impl Translator<'_, '_> {
             }
             Ps2Dq | Tps2Dq => {
                 let f = self.bitcast_v(x, types::F32X4);
+                let f = self.daz(f);
                 let f = if matches!(kind, Ps2Dq) {
-                    self.builder.ins().nearest(f)
+                    self.round_mxcsr(f)
                 } else {
                     f
                 };
@@ -4545,22 +4569,26 @@ impl Translator<'_, '_> {
             }
             Ps2Pd => {
                 let f = self.bitcast_v(x, types::F32X4);
+                let f = self.daz(f);
                 let g = self.builder.ins().fvpromote_low(f); // low 2 f32 → f64x2
                 self.bitcast_i128(g)
             }
             Pd2Ps => {
                 let f = self.bitcast_v(x, types::F64X2);
-                let g = self.builder.ins().fvdemote(f); // f64x2 → f32x4, high 2 lanes zero
+                let f = self.daz(f);
+                let g = self.builder.ins().fvdemote(f);
+                let g = self.ftz_conversion(f, g); // f64x2 → f32x4, high 2 lanes zero
                 self.bitcast_i128(g)
             }
             Pd2Dq | Tpd2Dq => {
                 let f = self.bitcast_v(x, types::F64X2);
+                let f = self.daz(f);
                 let zero = self.builder.ins().iconst(types::I32, 0);
                 let mut acc = self.builder.ins().splat(types::I32X4, zero);
                 for i in 0..2u8 {
                     let lane = self.builder.ins().extractlane(f, i);
                     let lane = if matches!(kind, Pd2Dq) {
-                        self.builder.ins().nearest(lane)
+                        self.round_mxcsr(lane)
                     } else {
                         lane
                     };
@@ -4601,7 +4629,10 @@ impl Translator<'_, '_> {
                         } else {
                             let fv = s.bitcast_v(x, types::F32X4);
                             let e = s.builder.ins().extractlane(fv, i);
-                            s.builder.ins().fpromote(types::F64, e)
+                            {
+                                let e = s.daz(e);
+                                s.builder.ins().fpromote(types::F64, e)
+                            }
                         };
                         acc = s.builder.ins().insertlane(acc, f, lane);
                     }
@@ -4623,13 +4654,15 @@ impl Translator<'_, '_> {
                 for i in 0..4u8 {
                     let (v, lane) = if i < 2 { (flo, i) } else { (fhi, i - 2) };
                     let f = self.builder.ins().extractlane(v, lane);
+                    let f = self.daz(f);
                     let bits = match kind {
                         Pd2Ps => {
                             let g = self.builder.ins().fdemote(types::F32, f);
+                            let g = self.ftz_conversion(f, g);
                             self.bitcast_scalar(types::I32, g)
                         }
                         Pd2Dq => {
-                            let r = self.builder.ins().nearest(f);
+                            let r = self.round_mxcsr(f);
                             self.builder.ins().fcvt_to_sint_sat(types::I32, r)
                         }
                         _ => self.builder.ins().fcvt_to_sint_sat(types::I32, f),
@@ -4718,7 +4751,11 @@ impl Translator<'_, '_> {
         let d = self.iconst(*dst as u64);
         let s = self.iconst(*src as u64);
         let n = self.iconst(*lanes as u64);
-        let r = self.iconst(*rc as u64);
+        let r = self.iconst(if rc & 4 != 0 {
+            u64::from((self.helpers.mxcsr_mode >> 13) & 3)
+        } else {
+            u64::from(*rc)
+        });
         self.call_helper(self.helpers.cvtps2ph, &[cpu, d, s, n, r]);
         false
     }
