@@ -4522,7 +4522,11 @@ impl Translator<'_, '_> {
             };
         }
 
-        let x = if self.aarch64 && !self.helpers.afp {
+        // SDM Vol 2B §4.3 RCPPS/RSQRTPS: estimates always treat input
+        // denormals as signed zero, independently of MXCSR.DAZ.
+        let x = if matches!(op, FloatUnOp::Rcp | FloatUnOp::Rsqrt) {
+            self.flush_subnormal(x)
+        } else if self.aarch64 && !self.helpers.afp {
             self.daz(x)
         } else {
             x
@@ -4539,24 +4543,39 @@ impl Translator<'_, '_> {
                 self.builder.ins().fdiv(one, s)
             }
         };
-        let r = self.invalid_nan(x, None, r);
-        self.ftz(r)
+        let r = self.x86_nan_result(x, None, r);
+        if matches!(op, FloatUnOp::Rcp) {
+            // SDM Vol 2B §4.3 RCPPS: tiny results are always flushed.
+            self.flush_subnormal(r)
+        } else {
+            self.ftz(r)
+        }
     }
 
-    fn invalid_nan(&mut self, a: Value, b: Option<Value>, r: Value) -> Value {
-        if self.helpers.mxcsr_mode == 0 || !self.aarch64 || self.helpers.afp {
-            return r;
-        }
-        // SDM Vol 1 §4.8.3.7: invalid arithmetic without a NaN source returns
-        // negative QNaN indefinite. Arm's default handling uses positive QNaN.
-        let nan = self.builder.ins().fcmp(FloatCC::Unordered, r, r);
-        let ordered = self.builder.ins().fcmp(FloatCC::Ordered, a, a);
-        let mut invalid = self.builder.ins().band(nan, ordered);
-        if let Some(b) = b {
-            let ordered = self.builder.ins().fcmp(FloatCC::Ordered, b, b);
-            invalid = self.builder.ins().band(invalid, ordered);
-        }
+    /// SDM Vol 1 §§4.8.3.5 (Table 4-8), 4.8.3.7: preserve source NaNs
+    /// in operand order, otherwise deliver the negative QNaN indefinite.
+    /// Only the result test runs on the ordinary arithmetic path.
+    fn x86_nan_result(&mut self, a: Value, b: Option<Value>, r: Value) -> Value {
         let ty = self.builder.func.dfg.value_type(r);
+        let nan = self.builder.ins().fcmp(FloatCC::NotEqual, r, r);
+        let any_nan = if ty.is_vector() && self.aarch64 {
+            // Branch on the mask directly: vany_true materializes an I8 boolean
+            // before the branch on this target.
+            let mask = self.bitcast_v(nan, types::I64X2);
+            let lo = self.builder.ins().extractlane(mask, 0);
+            let hi = self.builder.ins().extractlane(mask, 1);
+            self.builder.ins().bor(lo, hi)
+        } else if ty.is_vector() {
+            self.builder.ins().vany_true(nan)
+        } else {
+            nan
+        };
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, ty);
+        self.builder.ins().brif(any_nan, slow, &[], done, &[r]);
+        self.builder.switch_to_block(slow);
         let indefinite = if ty.lane_type() == types::F64 {
             self.builder
                 .ins()
@@ -4564,13 +4583,20 @@ impl Translator<'_, '_> {
         } else {
             self.builder.ins().f32const(f32::from_bits(0xffc00000))
         };
-        if ty.is_vector() {
+        let mut fixed = if ty.is_vector() {
             let indefinite = self.builder.ins().splat(ty, indefinite);
-            let mask = self.bitcast_v(invalid, ty);
+            let mask = self.bitcast_v(nan, ty);
             self.builder.ins().bitselect(mask, indefinite, r)
         } else {
-            self.builder.ins().select(invalid, indefinite, r)
+            indefinite
+        };
+        if let Some(b) = b {
+            fixed = self.x86_nan_from_src1(b, fixed);
         }
+        fixed = self.x86_nan_from_src1(a, fixed);
+        self.builder.ins().jump(done, &[fixed]);
+        self.builder.switch_to_block(done);
+        self.builder.block_params(done)[0]
     }
 
     /// Build a `1.0f32` constant matching `x`'s value type: a scalar `f32const` for the scalar
@@ -4595,22 +4621,10 @@ impl Translator<'_, '_> {
         let a = if manual_daz { self.daz(a) } else { a };
         let b = if manual_daz { self.daz(b) } else { b };
         let r = match op {
-            FloatBinOp::Add => {
-                let r = self.builder.ins().fadd(a, b);
-                self.x86_nan_from_src1(a, r)
-            }
-            FloatBinOp::Sub => {
-                let r = self.builder.ins().fsub(a, b);
-                self.x86_nan_from_src1(a, r)
-            }
-            FloatBinOp::Mul => {
-                let r = self.builder.ins().fmul(a, b);
-                self.x86_nan_from_src1(a, r)
-            }
-            FloatBinOp::Div => {
-                let r = self.builder.ins().fdiv(a, b);
-                self.x86_nan_from_src1(a, r)
-            }
+            FloatBinOp::Add => self.builder.ins().fadd(a, b),
+            FloatBinOp::Sub => self.builder.ins().fsub(a, b),
+            FloatBinOp::Mul => self.builder.ins().fmul(a, b),
+            FloatBinOp::Div => self.builder.ins().fdiv(a, b),
             FloatBinOp::Min | FloatBinOp::Max => {
                 let cc = if matches!(op, FloatBinOp::Min) {
                     FloatCC::LessThan
@@ -4632,7 +4646,7 @@ impl Translator<'_, '_> {
         let r = if matches!(op, FloatBinOp::Min | FloatBinOp::Max) {
             r
         } else {
-            self.invalid_nan(a, Some(b), r)
+            self.x86_nan_result(a, Some(b), r)
         };
         let r = if matches!(op, FloatBinOp::Min | FloatBinOp::Max) {
             r
@@ -4657,21 +4671,7 @@ impl Translator<'_, '_> {
         }
     }
 
-    /// Force the x86 NaN result of a binary float op on a host whose own rule differs.
-    ///
-    /// x86: a NaN result is SRC1 quieted if SRC1 is a NaN, else SRC2 quieted (SDM Vol 1
-    /// §4.8.3.5, Table 4-8). AArch64's `FPProcessNaN` prefers a *signalling* NaN over the
-    /// first operand, so the two disagree in exactly one case — SRC1 quiet, SRC2
-    /// signalling, where x86 returns SRC1 and ARM returns quiet(SRC2). When SRC1 is not a
-    /// NaN the two rules coincide, so guarding SRC1 alone closes the gap; that is why
-    /// this touches one operand rather than both.
-    ///
-    /// Emitted on **every** host, including x86 where the underlying instruction already
-    /// does this. Gating it on `cfg!(target_arch = "aarch64")` would buy back a compare
-    /// and a select per float op on x86, at the price of shipping the aarch64 path
-    /// unexercised: Cranelift links only the host ISA backend and the ARM lane is a
-    /// manual CI job. Emitting it everywhere makes the same IR carry the same meaning on
-    /// both hosts, and the x86 suite exercises it.
+    /// Select the source's quiet NaN on the cold NaN-result path.
     fn x86_nan_from_src1(&mut self, src1: Value, r: Value) -> Value {
         let ty = self.builder.func.dfg.value_type(src1);
         // Quiet bit: the significand MSB, per element width. `as_truthy()` is the lane
@@ -5978,6 +5978,18 @@ mod density_tests {
             "hot instructions per store rose to {marginal_hot:.1}, past the recorded \
              budget; either the SMC code-range test grew or the watch-bit probe leaked \
              out of its cold block"
+        );
+    }
+
+    /// Keep packed arithmetic guards small and their repairs past the return.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn packed_float_nan_guard_instruction_budget() {
+        let (_, _, _, hot) = measure(&block_of(&[0x0f, 0x59, 0xc1], 2));
+        // VCode includes two fallthrough jumps removed during branch relaxation.
+        assert!(
+            hot <= 43,
+            "two MULPS plus HLT use {hot} ordinary-path instructions; budget is 43"
         );
     }
 

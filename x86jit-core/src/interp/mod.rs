@@ -3480,12 +3480,25 @@ fn quiet_f32(v: f32) -> f32 {
 /// turned the payload difference into a plain integer divergence the NaN-tolerant
 /// comparator could not see through.
 pub(crate) fn sse_binop_f32(src1: f32, src2: f32, op: impl FnOnce(f32, f32) -> f32) -> f32 {
+    let r = op(src1, src2);
+    if r.is_nan() {
+        repair_sse_nan_f32(src1, src2)
+    } else {
+        r
+    }
+}
+
+// Keep operand classification out of LLVM's ordinary arithmetic path.
+#[cold]
+#[inline(never)]
+fn repair_sse_nan_f32(src1: f32, src2: f32) -> f32 {
     if src1.is_nan() {
         quiet_f32(src1)
     } else if src2.is_nan() {
         quiet_f32(src2)
     } else {
-        op(src1, src2)
+        // SDM Vol 1 §4.8.3.7: invalid arithmetic without a NaN source.
+        f32::from_bits(F32_INDEFINITE)
     }
 }
 
@@ -3520,12 +3533,25 @@ pub(crate) fn f64_nan_to_f32(v: f64) -> f32 {
 
 /// [`sse_binop_f32`] at double precision. Same rule, same reason.
 pub(crate) fn sse_binop_f64(src1: f64, src2: f64, op: impl FnOnce(f64, f64) -> f64) -> f64 {
+    let r = op(src1, src2);
+    if r.is_nan() {
+        repair_sse_nan_f64(src1, src2)
+    } else {
+        r
+    }
+}
+
+// Keep operand classification out of LLVM's ordinary arithmetic path.
+#[cold]
+#[inline(never)]
+fn repair_sse_nan_f64(src1: f64, src2: f64) -> f64 {
     if src1.is_nan() {
         quiet_f64(src1)
     } else if src2.is_nan() {
         quiet_f64(src2)
     } else {
-        op(src1, src2)
+        // SDM Vol 1 §4.8.3.7: invalid arithmetic without a NaN source.
+        f64::from_bits(F64_INDEFINITE)
     }
 }
 
@@ -3566,7 +3592,8 @@ fn dpps_mode_specialized<const DEFAULT: bool>(a: u128, b: u128, imm: u8, mxcsr: 
 
 /// F16C `vcvtph2ps` half→single. Decode an IEEE-754 binary16 to f32 exactly
 /// (f32 has ≥ all f16 significand/exponent range, so every value — including subnormals,
-/// inf, NaN — maps without rounding). NaN payload's high bit is preserved (quieted).
+/// inf — maps without rounding). SDM Vol 2C §5.2 VCVTPH2PS and Vol 1
+/// §14.4, Table 14-9: NaNs retain sign/payload and signaling NaNs are quieted.
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = (h >> 15) & 1;
     let exp = (h >> 10) & 0x1f;
@@ -3582,8 +3609,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
             (v.to_bits() & 0x7fff_ffff) | sign_f
         }
     } else if exp == 0x1f {
-        // Inf / NaN: max single exponent, mantissa carried up (keeps quiet/signaling).
-        sign_f | (0xff << 23) | ((mant as u32) << 13)
+        sign_f | (0xff << 23) | ((mant as u32) << 13) | if mant != 0 { 0x0040_0000 } else { 0 }
     } else {
         // Normal: rebias exponent (127 - 15 = 112), left-align mantissa.
         let exp32 = (exp as u32) + 112;
@@ -7383,8 +7409,31 @@ fn float_bin_mode<const DEFAULT: bool>(
     mxcsr: u32,
 ) -> u128 {
     let mxcsr = if DEFAULT { 0 } else { mxcsr };
+    // A separate scalar path avoids lane-loop bookkeeping around the cold call.
+    if scalar {
+        return match prec {
+            FPrec::F32 => {
+                let z = apply_f32_mode::<DEFAULT>(
+                    f32::from_bits(a as u32),
+                    f32::from_bits(b as u32),
+                    op,
+                    mxcsr,
+                );
+                (a & !u128::from(u32::MAX)) | u128::from(z.to_bits())
+            }
+            FPrec::F64 => {
+                let z = apply_f64_mode::<DEFAULT>(
+                    f64::from_bits(a as u64),
+                    f64::from_bits(b as u64),
+                    op,
+                    mxcsr,
+                );
+                (a & !u128::from(u64::MAX)) | u128::from(z.to_bits())
+            }
+        };
+    }
     let bytes = prec.bytes() as u32;
-    let lanes = if scalar { 1 } else { 16 / bytes as usize };
+    let lanes = 16 / bytes as usize;
     let mut r = a;
     for i in 0..lanes {
         let sh = i as u32 * bytes * 8;
@@ -7740,9 +7789,14 @@ fn float_unary_mode<const DEFAULT: bool>(
 /// `llvm.sqrt` nor `1.0 / x` pins the payload, and `rsqrt` would launder it through two
 /// such operations. A negative operand is an invalid operation with no NaN source, so it
 /// yields the QNaN indefinite rather than whatever NaN the host produces (§4.8.3.7).
-fn apply_un_f32(x: f32, op: FloatUnOp) -> f32 {
+fn apply_un_f32(mut x: f32, op: FloatUnOp) -> f32 {
     if x.is_nan() {
         return quiet_f32(x);
+    }
+    // SDM Vol 2B §4.3 RCPPS/RCPSS/RSQRTPS/RSQRTSS: denormal inputs
+    // are signed zero regardless of MXCSR.DAZ, before the negative-input test.
+    if !matches!(op, FloatUnOp::Sqrt) && x.is_subnormal() {
+        x = f32::from_bits(x.to_bits() & 0x8000_0000);
     }
     let indefinite = f32::from_bits(F32_INDEFINITE);
     match op {
@@ -7763,7 +7817,15 @@ fn apply_un_f32(x: f32, op: FloatUnOp) -> f32 {
                 1.0f32 / x.sqrt()
             }
         }
-        FloatUnOp::Rcp => 1.0f32 / x,
+        FloatUnOp::Rcp => {
+            let r = 1.0f32 / x;
+            // SDM Vol 2B §4.3 RCPPS/RCPSS: flush tiny results even with FTZ clear.
+            if r.is_subnormal() {
+                f32::from_bits(r.to_bits() & 0x8000_0000)
+            } else {
+                r
+            }
+        }
     }
 }
 
@@ -7801,6 +7863,7 @@ fn apply_un_f64(x: f64, op: FloatUnOp) -> f64 {
 /// not returned" (SDM Vol 2 MINPS/MAXPS). `x < y` is false on a NaN either side, so `y`
 /// — SRC2, unquieted — falls out, which is exactly that. Routing these through
 /// `sse_binop_f32` would break them.
+#[inline(always)]
 fn apply_f32(x: f32, y: f32, op: FloatBinOp) -> f32 {
     match op {
         FloatBinOp::Add => sse_binop_f32(x, y, |p, q| p + q),
@@ -7828,6 +7891,7 @@ fn apply_f32(x: f32, y: f32, op: FloatBinOp) -> f32 {
 
 /// [`apply_f32`] at double precision — same split: the arithmetic four take the NaN rule,
 /// min and max keep theirs.
+#[inline(always)]
 fn apply_f64(x: f64, y: f64, op: FloatBinOp) -> f64 {
     match op {
         FloatBinOp::Add => sse_binop_f64(x, y, |p, q| p + q),
