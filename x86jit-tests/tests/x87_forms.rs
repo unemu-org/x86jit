@@ -1011,14 +1011,35 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
         // exception bits, TOP, tags, operands and the full interp/JIT checks.
         // FUCOMPP's unmasked denormal case still compares all condition codes.
         let native_codes = if comparison && unmask != 1 { CODES } else { C1 };
+        let exact_scale_overflow = op == [0xd9, 0xfd]
+            && unmask == 8
+            && a == Some(enc(u64::MAX, 0x7ffe))
+            && b == Some(number(1));
+        // SDM Vol 1 §§4.9.1.4, 8.5.4, 8.5.6; Vol 2A §3.2 FSCALE:
+        // the unmasked result is biased by 2^-24576 and rounded to 64 bits.
+        // Here only the exponent changes: enc(u64::MAX, 0x1fff) is exact,
+        // so PE=0 and C1=0. AMD APM Vol 1 §§6.8.2.7, 6.8.4.2, Table 6-22,
+        // and Vol 5 §FSCALE give the same rounding and precision rules.
+        // Measured on AMD Ryzen 7 7840HS (Zen 4): SW=0xB2A8 versus the
+        // manual response 0xB088. Exclude only native PE/C1 for this input;
+        // retain OE, ES/B, TOP, tags, operands and full interp/JIT checks.
+        let native_mask = (EXCEPTIONS | native_codes)
+            & if exact_scale_overflow {
+                !(0x20 | C1)
+            } else {
+                u16::MAX
+            };
         let observed = check_with_native_mask(
             p.clone(),
             EXCEPTIONS | if comparison { CODES } else { C1 },
             CpuMode::Long64,
             true,
-            EXCEPTIONS | native_codes,
+            native_mask,
         );
         assert_eq!(env(&observed).0 & EXCEPTIONS, expected | 0x8080);
+        if exact_scale_overflow {
+            assert_eq!(env(&observed).0 & C1, 0);
+        }
         if comparison {
             assert_eq!(
                 env(&observed).0 & CODES,
@@ -1060,6 +1081,9 @@ fn new_x87_unmasked_exceptions_commit_per_class_and_defer_mf() {
             let data = &out.mem.iter().find(|m| m.addr == DATA).unwrap().bytes;
             let sw = u16::from_le_bytes([data[80], data[81]]);
             assert_eq!(sw & EXCEPTIONS, expected | 0x8080, "op={op:02x?}");
+            if exact_scale_overflow {
+                assert_eq!(sw & C1, 0, "op={op:02x?}");
+            }
             if comparison {
                 assert_eq!(
                     sw & CODES,
@@ -1144,14 +1168,14 @@ fn check_unmasked_denormal_compares(jit: bool) {
             };
             x86jit_tests::oracle::run_with_backend(p, backend)
         };
-        let verify = |out: &RunOutcome| {
+        let verify = |out: &RunOutcome, codes_mask: u16| {
             assert_eq!(out.exit, ExitKind::Hlt, "op={op:02x?}");
             let (sw, tw) = env(out);
             assert_eq!(sw & EXCEPTIONS, 0x8082, "op={op:02x?}");
             assert_eq!(sw & 0x3800, top << 11, "op={op:02x?}");
             assert_eq!(
-                sw & CODES,
-                if integer_flags { C0 | C2 } else { codes },
+                sw & codes_mask,
+                (if integer_flags { C0 | C2 } else { codes }) & codes_mask,
                 "op={op:02x?}"
             );
             assert_eq!(out.cpu.st[0], a, "op={op:02x?}");
@@ -1171,10 +1195,20 @@ fn check_unmasked_denormal_compares(jit: bool) {
                 );
             }
         };
-        verify(&run(&p));
+        verify(&run(&p), CODES);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if !jit {
-            verify(&x86jit_tests::native::run_native(&p).expect("native unmasked #D compare"));
+            // SDM Vol 2A §3.2 FCOMI/FUCOMI, FPU Flags Affected: C1 is
+            // cleared, including on unmasked #D. Measured on AMD Ryzen 7
+            // 7840HS (Zen 4), FCOMI [db, f1], CW=0x037d, seeded C0|C1|C2:
+            // native CODES=0x700 versus the SDM/engine 0x500. AMD APM Vol 5
+            // §FCOMIx/§FUCOMIx only specifies C1=0 for stack underflow.
+            // Exclude only native C1 for the integer-flag compare family;
+            // retain relation flags, other codes, exceptions, TOP and operands.
+            verify(
+                &x86jit_tests::native::run_native(&p).expect("native unmasked #D compare"),
+                if integer_flags { CODES & !C1 } else { CODES },
+            );
         }
 
         let code = &mut p.mem_init[0].bytes;

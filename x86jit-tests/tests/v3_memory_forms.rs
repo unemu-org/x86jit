@@ -452,7 +452,39 @@ fn boundary_run(
             max_icount: 128,
         })),
     };
-    let mut vm = Vm::with_backend(VmConfig::flat(SPAN), backend);
+    let mut vm = if protected {
+        // Heap RAM guarantees only 16-byte alignment; mprotect requires a
+        // page-aligned address. Own an mmap so page protections cannot cover
+        // allocator metadata.
+        // SAFETY: HostRam owns the entire anonymous mapping until its destructor.
+        unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                SPAN as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            Vm::with_backend_host_ram(
+                VmConfig::flat(SPAN),
+                backend,
+                x86jit_core::HostRam {
+                    ptr: ptr.cast(),
+                    len: SPAN as usize,
+                    guest_base: 0,
+                    protect: None,
+                    dtor: Box::new(|ptr, len| {
+                        libc::munmap(ptr.cast(), len);
+                    }),
+                },
+            )
+            .unwrap()
+        }
+    } else {
+        Vm::with_backend(VmConfig::flat(SPAN), backend)
+    };
     // SAFETY: sysconf has no pointer arguments.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let end = if protected {
@@ -513,7 +545,9 @@ fn boundary_run(
                     libc::PROT_NONE,
                 )
             },
-            0
+            0,
+            "protect fixture page: {}",
+            std::io::Error::last_os_error()
         );
     }
     #[cfg(all(
@@ -537,7 +571,9 @@ fn boundary_run(
                     libc::PROT_READ | libc::PROT_WRITE,
                 )
             },
-            0
+            0,
+            "restore fixture page: {}",
+            std::io::Error::last_os_error()
         );
     }
     let mut after_mem = vec![0; 64];
