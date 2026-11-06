@@ -760,12 +760,23 @@ pub struct ExitRequest {
     word: Arc<AtomicU64>,
 }
 
+// `request_exit`'s async-signal-safety rests on a native, lock-free 64-bit RMW.
+#[cfg(not(target_has_atomic = "64"))]
+compile_error!("ExitRequest::request_exit needs a lock-free 64-bit atomic");
+
 impl ExitRequest {
     /// Ask the vcpu to return [`Exit::Interrupted`] with resumable guest state.
     /// Checks occur within one compiled block or chain edge, one region sub-block,
     /// or one REP iteration. A handle outliving its vcpu has no effect.
     /// Writes preceding this call are visible after `run` returns the
     /// [`Exit::Interrupted`] that consumes it.
+    ///
+    /// Async-signal-safe: this call is one lock-free atomic read-modify-write on
+    /// a word the handle already owns. It does not allocate, lock, touch the
+    /// reference count or call into libc, so a host signal handler may call it
+    /// on a handle obtained (and kept alive) before the signal can arrive.
+    /// Cloning or dropping an `ExitRequest` is not async-signal-safe: do both
+    /// outside the handler.
     pub fn request_exit(&self) {
         // Release publishes preceding writes; run's consuming Acquire pairs with
         // this RMW. Preserve SMC and leave requests after consumption pending.
