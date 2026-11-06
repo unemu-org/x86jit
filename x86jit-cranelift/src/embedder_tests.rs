@@ -657,8 +657,8 @@ fn telemetry_ir() -> IrBlock {
 
 fn assert_lock_sample(sample: &LockTelemetry, count: u64) {
     assert_eq!(sample.acquisitions, count);
-    assert!(sample.total_hold_ns > 0);
-    assert!(sample.max_hold_ns > 0);
+    // No lower bound on the hold time: a coarse monotonic clock (41.7 ns per
+    // tick at 24 MHz) can measure a short uncontended hold as 0 ns.
     assert!(sample.total_hold_ns >= sample.max_hold_ns);
     assert!(sample.total_wait_ns >= sample.max_wait_ns);
     assert_eq!(sample.hold_histogram.iter().sum::<u64>(), count);
