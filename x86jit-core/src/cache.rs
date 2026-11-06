@@ -95,6 +95,9 @@ pub struct TranslationCache {
     // and flushes when it changes — the coherence channel for state that cannot be
     // reached by the backend's `invalidate_links` (esp. cross-thread invalidation).
     epoch: AtomicU64,
+    // A policy may have approved bytes still being lifted, before a cache span
+    // exists. Such invalidations must also reject in-flight region publications.
+    pub(crate) invalidate_pending_fetches: bool,
     // IBTC descriptors (R4): immutable `[target, entry]` pairs published by pointer
     // into a per-site slot. Owned here (the dispatcher, in the core crate, allocates
     // them on a miss) and never freed before `Vm` drop, so a torn/late read of a
@@ -139,6 +142,7 @@ impl TranslationCache {
             chained: AtomicU64::new(0),
             regions: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            invalidate_pending_fetches: false,
             ibtc_descriptors: Mutex::new(Vec::new()),
             ibtc_filled: AtomicU64::new(0),
             hotness: RwLock::new(HashMap::new()),
@@ -292,8 +296,9 @@ impl TranslationCache {
     }
 
     /// Current invalidation epoch (R1). Monotonic; bumped whenever
-    /// `invalidate_overlapping` drops at least one unit. A vcpu snapshots this and
-    /// flushes its local predictor caches when the value changes.
+    /// `invalidate_overlapping` drops at least one unit, or invalidates an in-flight
+    /// fetch under an installed fetch policy. A vcpu snapshots this and flushes its
+    /// local predictor caches when the value changes.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
@@ -407,11 +412,27 @@ impl TranslationCache {
         spans: Vec<(u64, u32)>,
         on_mark: impl FnOnce(&[(u64, u32)]),
     ) {
+        self.insert_checked(key, block, spans, |sp| {
+            on_mark(sp);
+            true
+        });
+    }
+
+    pub(crate) fn insert_checked(
+        &self,
+        key: BlockKey,
+        block: CachedBlock,
+        spans: Vec<(u64, u32)>,
+        on_mark: impl FnOnce(&[(u64, u32)]) -> bool,
+    ) -> bool {
         let mut sp = self.spans.write().unwrap();
         let mut mp = self.map.write().unwrap();
-        on_mark(&spans);
+        if !on_mark(&spans) {
+            return false;
+        }
         mp.insert(key, block);
         sp.insert(key, spans);
+        true
     }
 
     /// SMC invalidation (§10): drop every cached unit *any* of whose guest spans
@@ -463,10 +484,11 @@ impl TranslationCache {
         // Every unit touching the page is now gone, so the tag is stale — clear it
         // here, still holding the spans lock.
         on_clear_page();
-        // Bump the epoch so vcpu-local predictors flush (R1). Only on a real drop —
-        // a write to a data page (no victims) must not perturb anything. `Release`
-        // pairs with the `Acquire` load in `epoch()`.
-        if !victims.is_empty() {
+        // With a policy, an uncached region successor may already be approved
+        // in an in-flight lift, so even a victim-free invalidation rejects it.
+        // Otherwise data writes retain the existing epoch. `Release` pairs with
+        // the `Acquire` load in `epoch()`.
+        if !victims.is_empty() || self.invalidate_pending_fetches {
             self.epoch.fetch_add(1, Ordering::Release);
         }
         victims

@@ -141,6 +141,19 @@ pub trait Backend: Send + Sync {
         TierUpSubmit::Unsupported
     }
 
+    /// Submit background work approved by an opt-in fetch policy. Backends that
+    /// support cancellation must check `permit` before compiling queued work.
+    /// The default declines, letting the dispatcher compile inline and retain
+    /// its invalidation checks. Existing backends need no changes when no policy
+    /// is installed.
+    fn tier_up_async_with_fetch_permit(
+        &self,
+        _req: TierUpRequest,
+        _permit: crate::FetchPermit,
+    ) -> TierUpSubmit {
+        TierUpSubmit::Unsupported
+    }
+
     /// Drain finished background compiles for the core dispatcher to publish via
     /// `cache.upgrade`; the backend never touches the cache. The default returns an
     /// empty `Vec` (no allocation) for a backend that never queues. Called at the top
@@ -397,6 +410,34 @@ impl Vm {
         self.lockstep_trace = trace;
     }
 
+    /// Install an optional instruction-fetch policy. `page` is the aligned guest
+    /// address of a 4 KiB page, regardless of the host page size. Allowed pages
+    /// are remembered until code-page invalidation; refusals are not cached.
+    /// Installing or replacing a policy invalidates existing translations.
+    ///
+    /// Calls occur on the fetching vCPU, never in signal context and with no
+    /// engine lock held. The callback may block or make syscalls. Different
+    /// vCPUs may call it concurrently; calls for the same page are coalesced.
+    /// Invalidation racing a call discards its verdict and asks again. Callbacks
+    /// must not recursively fetch code from this VM. As with code invalidation,
+    /// embedders must synchronize protection changes with running vCPUs; already
+    /// executing instructions are not recalled.
+    ///
+    /// This does not enforce advisory region `Prot` or model guest paging. A
+    /// refusal supplies the embedder's presence fact in the existing #PF
+    /// projection and sets `is_fetch`; other paging-control facts remain unknown.
+    /// With no policy, compiled execution and dispatch retain their existing paths.
+    pub fn set_fetch_policy(
+        &mut self,
+        policy: Box<dyn Fn(u64) -> crate::FetchVerdict + Send + Sync>,
+    ) {
+        self.cache.invalidate_pending_fetches = true;
+        self.cache
+            .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
+        self.backend.invalidate_links();
+        self.mem.set_fetch_policy(Arc::from(policy));
+    }
+
     /// Enable hotness-gated tier-up: interpret each block until it has run `n`
     /// times, then JIT-compile it. `None` restores eager compilation. Returns
     /// `self` for builder-style setup.
@@ -490,7 +531,11 @@ impl Vm {
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
             mem: self.mem.deep_copy()?,
-            cache: TranslationCache::new(),
+            cache: {
+                let mut cache = TranslationCache::new();
+                cache.invalidate_pending_fetches = self.mem.fetch_policy.is_some();
+                cache
+            },
             backend,
             consistency: self.consistency,
             tier_up_after: self.tier_up_after,
@@ -612,6 +657,14 @@ impl Vm {
         // `Exit::UnmappedMemory`.
         let lo = guest_addr;
         let hi = guest_addr.saturating_add(size as u64);
+        let (lo, hi) = if self.mem.fetch_policy.is_some() {
+            // Unmapping revokes approval for every touched guest page, including
+            // code in surviving regions that share a page with the removed one.
+            let mask = crate::memory::CODE_PAGE_SIZE - 1;
+            (lo & !mask, (hi.saturating_sub(1) | mask).saturating_add(1))
+        } else {
+            (lo, hi)
+        };
         let dropped = !self
             .cache
             .invalidate_overlapping(lo, hi, || {
@@ -1150,6 +1203,9 @@ impl Vcpu {
     /// (this primitive does not resume a deferred access — call [`Vcpu::run`] for
     /// that).
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
+        if vm.mem.fetch_policy.is_some() {
+            vm.handle_smc(&self.exit_request.word);
+        }
         let _fp_mode = crate::jit_abi::fp::RunMode::new();
         let mut info = crate::interp::RetireInfo::default();
         let r = crate::interp::step_one(
@@ -1932,6 +1988,9 @@ fn drain_tier_up(vm: &Vm) {
             // A failed background compile leaves the already-cached interpreter
             // block in place; only clear its in-flight marker.
             vm.cache.end_tier_up(key);
+            if vm.cache.epoch() != fin.epoch {
+                vm.cache.record_tier_bg_rejected();
+            }
             continue;
         }
         // Multi-span publish: a region carries one span per sub-block; a block carries
@@ -1960,12 +2019,32 @@ fn drain_tier_up(vm: &Vm) {
 
 /// Fetch a block from the cache or lift+materialize it (miss). Lift errors are legal
 /// exits (not `run()` failures) telling the user what to add (§9.2).
+enum ResolveFailure {
+    Retry,
+    Exit(Exit),
+}
+
 fn resolve<const DEFAULT: bool>(
     vm: &Vm,
     at: FetchAddr,
     mode: CpuMode,
     mxcsr: u32,
 ) -> Result<CachedBlock, Exit> {
+    loop {
+        match resolve_attempt::<DEFAULT>(vm, at, mode, mxcsr) {
+            Ok(block) => return Ok(block),
+            Err(ResolveFailure::Exit(exit)) => return Err(exit),
+            Err(ResolveFailure::Retry) => continue,
+        }
+    }
+}
+
+fn resolve_attempt<const DEFAULT: bool>(
+    vm: &Vm,
+    at: FetchAddr,
+    mode: CpuMode,
+    mxcsr: u32,
+) -> Result<CachedBlock, ResolveFailure> {
     // §17.4: cache maps key on { physical-fetch-address, mode }. In Real16 the physical
     // fetch address (`cs_base + IP`) is what keys the cache and tags SMC pages, so
     // blocks never collide across segments; the IR's `guest_start` stays the decode IP
@@ -1983,10 +2062,13 @@ fn resolve<const DEFAULT: bool>(
         if let Some(block) = vm.cache.get(key) {
             return Ok(block);
         }
+        let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
         return lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
-            .map(|ir| finish_single(vm, key, pc, ir))
-            .map_err(|e| lift_exit(e, fetch_failure, &vm.mem, at, mode));
+            .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
+            .and_then(|ir| {
+                finish_single(vm, key, pc, ir, permit.as_ref()).ok_or(ResolveFailure::Retry)
+            });
     }
     loop {
         // Publish any completed background compiles first, so a
@@ -2016,6 +2098,14 @@ fn resolve<const DEFAULT: bool>(
         let count = vm.cache.bump_hotness(key);
         if count < thr {
             return Ok(block);
+        }
+        let mut permit = None;
+        if vm.mem.fetch_policy.is_some()
+            && !vm
+                .cache
+                .publish_if_current(epoch, || permit = vm.mem.fetch_permit())
+        {
+            continue;
         }
         // Background tier-up: compile off the vcpu and keep interpreting
         // until the result lands (published by `drain_tier_up` above on a later
@@ -2071,6 +2161,10 @@ fn resolve<const DEFAULT: bool>(
                     vec![(ir.guest_start, ir.guest_len)],
                 )
             };
+            if permit.as_ref().is_some_and(|p| !p.is_current()) {
+                vm.cache.end_tier_up(key);
+                continue;
+            }
             let req = TierUpRequest {
                 mxcsr_mode: key.mxcsr_mode,
                 pc,
@@ -2081,7 +2175,12 @@ fn resolve<const DEFAULT: bool>(
                 spans,
                 epoch,
             };
-            match vm.backend.tier_up_async(req) {
+            let submitted = if let Some(permit) = permit.clone() {
+                vm.backend.tier_up_async_with_fetch_permit(req, permit)
+            } else {
+                vm.backend.tier_up_async(req)
+            };
+            match submitted {
                 // Off to the worker — this block stays interpreted for now.
                 TierUpSubmit::Queued => return Ok(block),
                 // Queue full: don't compile inline (that reintroduces the spike);
@@ -2094,6 +2193,9 @@ fn resolve<const DEFAULT: bool>(
                 // today's inline tier-up.
                 TierUpSubmit::Unsupported => vm.cache.end_tier_up(key),
             }
+        }
+        if permit.as_ref().is_some_and(|p| !p.is_current()) {
+            continue;
         }
         let compiled = vm.backend.materialize_with_mxcsr(
             ir,
@@ -2111,6 +2213,7 @@ fn resolve<const DEFAULT: bool>(
         // Lost the race: an SMC drop invalidated the block mid-tier-up. Loop to
         // re-fetch / re-lift from current memory rather than run a stale block.
     }
+    let permit = vm.mem.fetch_permit();
     // Region path (§12 M5): a region-forming backend lifts a superblock EAGERLY on
     // first sight. When background tier-up is on, skip this — regions then form only
     // for proven-hot loops, off-thread (in the hotness path above), never the heavy
@@ -2126,6 +2229,9 @@ fn resolve<const DEFAULT: bool>(
             // (it amortizes over the iterations); everything else stays single-block.
             Ok(region) if region.blocks.len() > 1 && region.has_loop => {
                 let spans = region.spans();
+                if permit.as_ref().is_some_and(|p| !p.is_current()) {
+                    return Err(ResolveFailure::Retry);
+                }
                 let materialized = vm.backend.materialize_region_with_mxcsr(
                     &region,
                     vm.consistency,
@@ -2134,31 +2240,56 @@ fn resolve<const DEFAULT: bool>(
                     key.mxcsr_mode,
                 );
                 // §10: tag every sub-block's pages — under the spans lock (#12).
-                vm.cache.insert(key, materialized.clone(), spans, |sp| {
-                    for (start, len) in sp {
-                        vm.mem.mark_code(*start, *len);
-                    }
-                });
+                if !vm
+                    .cache
+                    .insert_checked(key, materialized.clone(), spans, |sp| {
+                        if permit.as_ref().is_some_and(|p| !p.is_current()) {
+                            return false;
+                        }
+                        for (start, len) in sp {
+                            vm.mem.mark_code(*start, *len);
+                        }
+                        true
+                    })
+                {
+                    return Err(ResolveFailure::Retry);
+                }
                 if matches!(materialized, CachedBlock::Compiled { .. }) {
                     vm.cache.record_region();
                 }
                 return Ok(materialized);
             }
             Ok(region) => {
-                return Ok(finish_single(
+                return finish_single(
                     vm,
                     key,
                     pc,
                     region.blocks.into_iter().next().unwrap(),
-                ))
+                    permit.as_ref(),
+                )
+                .ok_or(ResolveFailure::Retry)
             }
-            Err(e) => return Err(lift_exit(e, fetch_failure, &vm.mem, at, mode)),
+            Err(e) => {
+                return Err(ResolveFailure::Exit(lift_exit(
+                    e,
+                    fetch_failure,
+                    &vm.mem,
+                    at,
+                    mode,
+                )))
+            }
         }
     }
     let mut fetch_failure = None;
     match lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure) {
-        Ok(ir) => Ok(finish_single(vm, key, pc, ir)),
-        Err(e) => Err(lift_exit(e, fetch_failure, &vm.mem, at, mode)),
+        Ok(ir) => finish_single(vm, key, pc, ir, permit.as_ref()).ok_or(ResolveFailure::Retry),
+        Err(e) => Err(ResolveFailure::Exit(lift_exit(
+            e,
+            fetch_failure,
+            &vm.mem,
+            at,
+            mode,
+        ))),
     }
 }
 
@@ -2166,7 +2297,16 @@ fn resolve<const DEFAULT: bool>(
 /// its pages. `span_start` is the physical fetch address (== `ir.guest_start` outside
 /// Real16, but the `cs_base + IP` physical address in Real16, where SMC page-tagging
 /// and the cache key must both be physical — see `resolve`).
-fn finish_single(vm: &Vm, key: BlockKey, span_start: u64, ir: IrBlock) -> CachedBlock {
+fn finish_single(
+    vm: &Vm,
+    key: BlockKey,
+    span_start: u64,
+    ir: IrBlock,
+    permit: Option<&crate::FetchPermit>,
+) -> Option<CachedBlock> {
+    if permit.is_some_and(|p| !p.is_current()) {
+        return None;
+    }
     let (start, len) = (span_start, ir.guest_len);
     // Real16 stays interpreted (§17.6); other modes defer compilation only until
     // the block proves hot under a tier-up policy (see `resolve`).
@@ -2184,16 +2324,20 @@ fn finish_single(vm: &Vm, key: BlockKey, span_start: u64, ir: IrBlock) -> Cached
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared
     // by a concurrent SMC invalidation between insert and mark.
     vm.cache
-        .insert(key, materialized.clone(), vec![(start, len)], |_| {
-            vm.mem.mark_code(start, len)
-        });
-    materialized
+        .insert_checked(key, materialized.clone(), vec![(start, len)], |_| {
+            if permit.is_some_and(|p| !p.is_current()) {
+                return false;
+            }
+            vm.mem.mark_code(start, len);
+            true
+        })
+        .then_some(materialized)
 }
 
 /// Map a lift error to its dispatcher exit (a legal exit, not a `run()` failure).
 fn lift_exit(
     e: LiftError,
-    details: Option<crate::MemTrap>,
+    details: Option<crate::lift::FetchFailure>,
     mem: &Memory,
     at: FetchAddr,
     mode: CpuMode,

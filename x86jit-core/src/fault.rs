@@ -1067,13 +1067,15 @@ pub(crate) fn fetch_exit(
     at: crate::lift::FetchAddr,
     mode: CpuMode,
     addr: u64,
-    trap: Option<crate::MemTrap>,
+    trap: Option<crate::lift::FetchFailure>,
 ) -> Exit {
+    use crate::lift::FetchFailure::{Memory, Policy};
     let mut m = FaultMetadata::unknown(at.ip);
     m.origin = match trap {
-        Some(crate::MemTrap::Mmio) => FaultOrigin::TrapFetch,
-        Some(crate::MemTrap::HostFault) => FaultOrigin::HostAccess,
-        Some(crate::MemTrap::Unmapped) => FaultOrigin::GuestMap,
+        Some(Memory(crate::MemTrap::Mmio)) => FaultOrigin::TrapFetch,
+        Some(Memory(crate::MemTrap::HostFault)) => FaultOrigin::HostAccess,
+        Some(Memory(crate::MemTrap::Unmapped)) => FaultOrigin::GuestMap,
+        Some(Policy(_)) => FaultOrigin::GuestMap,
         _ => FaultOrigin::Unknown,
     };
     m.instruction_rip = Knowledge::Known(at.ip);
@@ -1102,6 +1104,15 @@ pub(crate) fn fetch_exit(
     {
         m.projection = Some(PageFaultProjection {
             code: ErrorCode::bits(0, 1),
+            is_fetch: true,
+        });
+    }
+    if let Some(Policy(verdict)) = trap {
+        // SDM Vol 3A §5.7, Fig. 5-12: P=1 denotes protection, P=0 absence.
+        // I/D depends on guest paging controls, so only the independent fetch
+        // fact is asserted, as with the other fetch projections.
+        m.projection = Some(PageFaultProjection {
+            code: ErrorCode::bits(u32::from(verdict == crate::FetchVerdict::DenyProtection), 1),
             is_fetch: true,
         });
     }

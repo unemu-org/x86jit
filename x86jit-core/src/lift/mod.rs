@@ -98,13 +98,20 @@ pub enum WriteTarget {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FetchFailure {
+    Memory(crate::MemTrap),
+    Policy(crate::FetchVerdict),
+}
+
 // Initialized prefix only: refills touch the next page/region only after iced
 // reports NoMoreBytes. An incomplete instruction is decoded again after refill.
 struct FetchWindow<const CAP: usize> {
     bytes: std::mem::MaybeUninit<[u8; CAP]>,
     len: usize,
     stopped: bool,
-    failure: Option<crate::MemTrap>,
+    failure: Option<FetchFailure>,
+    approved_page: Option<u64>,
 }
 impl<const CAP: usize> FetchWindow<CAP> {
     fn new() -> Self {
@@ -113,6 +120,7 @@ impl<const CAP: usize> FetchWindow<CAP> {
             len: 0,
             stopped: false,
             failure: None,
+            approved_page: None,
         }
     }
     fn code(&self) -> &[u8] {
@@ -124,17 +132,32 @@ impl<const CAP: usize> FetchWindow<CAP> {
             return false;
         }
         let at = start + self.len as u64;
-        let chunk = match mem.fetch_chunk_len(
+        let mut chunk = match mem.fetch_chunk_len(
             at,
             (CAP - self.len).min(if self.len == 0 { 128 } else { CAP }),
         ) {
             Ok(chunk) => chunk,
             Err(trap) => {
-                self.failure = Some(trap);
+                self.failure = Some(FetchFailure::Memory(trap));
                 self.stopped = true;
                 return false;
             }
         };
+        if let Some(policy) = &mem.fetch_policy {
+            let page = at >> crate::memory::CODE_PAGE_BITS;
+            if self.approved_page != Some(page) {
+                let verdict = policy.approve(page, mem);
+                if verdict != crate::FetchVerdict::Allow {
+                    self.failure = Some(FetchFailure::Policy(verdict));
+                    self.stopped = true;
+                    return false;
+                }
+                self.approved_page = Some(page);
+            }
+            chunk = chunk.min(
+                (crate::memory::CODE_PAGE_SIZE - (at % crate::memory::CODE_PAGE_SIZE)) as usize,
+            );
+        }
         // SAFETY: this writable tail is disjoint from the initialized prefix.
         // No reference to its uninitialized bytes is formed before the copy.
         let out = unsafe { self.bytes.as_mut_ptr().cast::<u8>().add(self.len) };
@@ -143,12 +166,12 @@ impl<const CAP: usize> FetchWindow<CAP> {
                 self.len += copied;
                 self.stopped = copied < chunk;
                 if self.stopped {
-                    self.failure = Some(crate::MemTrap::HostFault);
+                    self.failure = Some(FetchFailure::Memory(crate::MemTrap::HostFault));
                 }
                 copied > 0
             }
             Err(trap) => {
-                self.failure = Some(trap);
+                self.failure = Some(FetchFailure::Memory(trap));
                 self.stopped = true;
                 false
             }
@@ -635,7 +658,23 @@ pub(crate) fn lift_block_with_fault(
     mem: &Memory,
     at: FetchAddr,
     mode: CpuMode,
-    details: &mut Option<crate::MemTrap>,
+    details: &mut Option<FetchFailure>,
+) -> Result<IrBlock, LiftError> {
+    loop {
+        let permit = mem.fetch_permit();
+        *details = None;
+        let result = lift_block_attempt(mem, at, mode, details);
+        if permit.as_ref().is_none_or(|p| p.is_current()) {
+            return result;
+        }
+    }
+}
+
+fn lift_block_attempt(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new();
@@ -768,7 +807,23 @@ pub(crate) fn lift_one_with_fault(
     mem: &Memory,
     at: FetchAddr,
     mode: CpuMode,
-    details: &mut Option<crate::MemTrap>,
+    details: &mut Option<FetchFailure>,
+) -> Result<IrBlock, LiftError> {
+    loop {
+        let permit = mem.fetch_permit();
+        *details = None;
+        let result = lift_one_attempt(mem, at, mode, details);
+        if permit.as_ref().is_none_or(|p| p.is_current()) {
+            return result;
+        }
+    }
+}
+
+fn lift_one_attempt(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<15>::new();
@@ -1416,7 +1471,24 @@ pub(crate) fn lift_region_with_fault(
     entry: u64,
     caps: RegionCaps,
     mode: CpuMode,
-    details: &mut Option<crate::MemTrap>,
+    details: &mut Option<FetchFailure>,
+) -> Result<IrRegion, LiftError> {
+    loop {
+        let permit = mem.fetch_permit();
+        *details = None;
+        let result = lift_region_attempt(mem, entry, caps, mode, details);
+        if permit.as_ref().is_none_or(|p| p.is_current()) {
+            return result;
+        }
+    }
+}
+
+fn lift_region_attempt(
+    mem: &Memory,
+    entry: u64,
+    caps: RegionCaps,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
 ) -> Result<IrRegion, LiftError> {
     use std::collections::HashMap;
 

@@ -2598,9 +2598,14 @@ impl Drop for CompileCompletion<'_> {
     }
 }
 
+struct QueuedCompile {
+    request: TierUpRequest,
+    fetch_permit: Option<x86jit_core::FetchPermit>,
+}
+
 /// The background compile queue and its liveness counters (bg-tier).
 struct Queue {
-    items: VecDeque<TierUpRequest>,
+    items: VecDeque<QueuedCompile>,
     /// Requests submitted but not yet completed (queued + the one compiling).
     /// `wait_idle` blocks until this reaches zero.
     outstanding: usize,
@@ -2915,6 +2920,37 @@ impl JitBackend {
 
     /// Spawn the background compiler thread if it isn't running yet (bg-tier).
     /// Lazy: eager/sync-only use never reaches here, so it never spawns.
+    fn submit_tier_up(
+        &self,
+        req: TierUpRequest,
+        fetch_permit: Option<x86jit_core::FetchPermit>,
+    ) -> TierUpSubmit {
+        if self.code_space_exhausted() {
+            return TierUpSubmit::Busy;
+        }
+        if self.ensure_worker().is_err() {
+            self.shared.exhaust_code_space::<()>();
+            return TierUpSubmit::Busy;
+        }
+        let mut q = self.shared.queue.lock().unwrap();
+        if q.shutdown {
+            // Racing `Drop` — decline; the caller stays interpreted (correct, slow).
+            return TierUpSubmit::Unsupported;
+        }
+        if q.items.len() >= TIER_QUEUE_CAP {
+            // Backpressure: never compile inline in response.
+            return TierUpSubmit::Busy;
+        }
+        q.items.push_back(QueuedCompile {
+            request: req,
+            fetch_permit,
+        });
+        q.outstanding += 1;
+        drop(q);
+        self.shared.work_cv.notify_one();
+        TierUpSubmit::Queued
+    }
+
     fn ensure_worker(&self) -> std::io::Result<()> {
         let mut w = lock_recovering(&self.worker, "compile worker");
         if w.is_none() {
@@ -3533,7 +3569,19 @@ impl Shared {
 
     /// Compile one background request's unit (bg-tier): a single block, or a
     /// hotness-gated superblock region — same off-thread path either way.
-    fn compile_request(&self, req: &TierUpRequest) -> CachedBlock {
+    fn compile_request(
+        &self,
+        req: &TierUpRequest,
+        permit: Option<&x86jit_core::FetchPermit>,
+    ) -> CachedBlock {
+        if permit.is_some_and(|p| !p.is_current()) {
+            return match &req.unit {
+                TierUpUnit::Block(ir) => CachedBlock::Interpreted(ir.clone()),
+                TierUpUnit::Region(region) => {
+                    CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()))
+                }
+            };
+        }
         match &req.unit {
             TierUpUnit::Block(ir) => self
                 .compile(
@@ -3568,7 +3616,10 @@ impl Shared {
     /// result to `done`, and repeat until `Drop` sets `shutdown`.
     fn worker_loop(&self) {
         loop {
-            let req = {
+            let QueuedCompile {
+                request: req,
+                fetch_permit,
+            } = {
                 let mut q = self.queue.lock().unwrap();
                 // Park while empty or paused; `shutdown` always wins so `Drop` joins.
                 while (q.items.is_empty() || q.paused) && !q.shutdown {
@@ -3582,7 +3633,7 @@ impl Shared {
             let _completion = CompileCompletion(self);
             // Compile OUTSIDE the queue lock (it takes `inner`); a concurrent submit
             // or foreground `materialize` isn't blocked by this block's compile.
-            let block = self.compile_request(&req);
+            let block = self.compile_request(&req, fetch_permit.as_ref());
             {
                 let mut done = self.done.lock().unwrap();
                 done.push(TierUpFinished {
@@ -3746,27 +3797,15 @@ impl Backend for JitBackend {
     }
 
     fn tier_up_async(&self, req: TierUpRequest) -> TierUpSubmit {
-        if self.code_space_exhausted() {
-            return TierUpSubmit::Busy;
-        }
-        if self.ensure_worker().is_err() {
-            self.shared.exhaust_code_space::<()>();
-            return TierUpSubmit::Busy;
-        }
-        let mut q = self.shared.queue.lock().unwrap();
-        if q.shutdown {
-            // Racing `Drop` — decline; the caller stays interpreted (correct, slow).
-            return TierUpSubmit::Unsupported;
-        }
-        if q.items.len() >= TIER_QUEUE_CAP {
-            // Backpressure: never compile inline in response.
-            return TierUpSubmit::Busy;
-        }
-        q.items.push_back(req);
-        q.outstanding += 1;
-        drop(q);
-        self.shared.work_cv.notify_one();
-        TierUpSubmit::Queued
+        self.submit_tier_up(req, None)
+    }
+
+    fn tier_up_async_with_fetch_permit(
+        &self,
+        req: TierUpRequest,
+        permit: x86jit_core::FetchPermit,
+    ) -> TierUpSubmit {
+        self.submit_tier_up(req, Some(permit))
     }
 
     fn tier_up_finished(&self) -> Vec<TierUpFinished> {
@@ -4584,8 +4623,11 @@ mod tests {
         if background {
             let q = handle.shared.queue.lock().unwrap();
             assert_eq!(q.items.len(), 1);
-            assert_eq!(matches!(q.items[0].unit, TierUpUnit::Region(_)), region);
-            assert_eq!(q.items[0].spans.len() > 1, region);
+            assert_eq!(
+                matches!(q.items[0].request.unit, TierUpUnit::Region(_)),
+                region
+            );
+            assert_eq!(q.items[0].request.spans.len() > 1, region);
             drop(q);
             drop(pause);
             handle.wait_idle();

@@ -98,7 +98,8 @@ pub use ir::{
 };
 pub use lift::CpuMode;
 pub use memory::{
-    HostRam, HostRamError, MapError, MemError, MemTrap, Memory, MemoryModel, Prot, RegionKind,
+    FetchPermit, FetchVerdict, HostRam, HostRamError, MapError, MemError, MemTrap, Memory,
+    MemoryModel, Prot, RegionKind,
 };
 pub use state::{
     CpuSource, CpuState, Flags, RandomKind, Reg, TscSample, X87Precision, AF_SRC_ONE, AF_SRC_ZERO,

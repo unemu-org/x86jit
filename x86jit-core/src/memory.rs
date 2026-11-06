@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::ir::RmwOp;
 
@@ -354,6 +354,122 @@ pub enum RegionKind {
     Rom,
 }
 
+/// Embedder verdict for an instruction fetch from a guest 4 KiB page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchVerdict {
+    Allow,
+    DenyProtection,
+    DenyNotPresent,
+}
+
+/// Cancellation witness for a translation approved under a fetch policy.
+/// Backends must check this before starting queued compilation. Invalidation
+/// during compilation is handled by the cache's publication epoch check.
+#[derive(Clone)]
+pub struct FetchPermit {
+    generation: Arc<AtomicU64>,
+    observed: u64,
+}
+impl FetchPermit {
+    pub fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.observed
+    }
+}
+
+pub(crate) struct FetchPolicy {
+    callback: Arc<dyn Fn(u64) -> FetchVerdict + Send + Sync>,
+    approved: Box<[AtomicU64]>,
+    generation: Arc<AtomicU64>,
+    state: Mutex<FetchPolicyState>,
+    wake: Condvar,
+}
+#[derive(Default)]
+struct FetchPolicyState {
+    pending: BTreeSet<(u64, u64)>,
+    touched_words: BTreeSet<usize>,
+}
+impl FetchPolicy {
+    fn new(callback: Arc<dyn Fn(u64) -> FetchVerdict + Send + Sync>, base: u64, top: u64) -> Self {
+        Self {
+            callback,
+            approved: fresh_code_pages(base, top),
+            generation: Arc::new(AtomicU64::new(0)),
+            state: Mutex::new(FetchPolicyState::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn approve(&self, page: u64, mem: &Memory) -> FetchVerdict {
+        let base_page = mem.guest_base >> CODE_PAGE_BITS;
+        let (w, mask) = word_bit(page.wrapping_sub(base_page));
+        let Some(word) = self.approved.get(w) else {
+            return FetchVerdict::DenyNotPresent;
+        };
+        if word.load(Ordering::Acquire) & mask != 0 {
+            return FetchVerdict::Allow;
+        }
+        loop {
+            let mut state = self.state.lock().unwrap();
+            let generation = self.generation.load(Ordering::Acquire);
+            if word.load(Ordering::Acquire) & mask != 0 {
+                return FetchVerdict::Allow;
+            }
+            let key = (generation, page);
+            if !state.pending.insert(key) {
+                drop(self.wake.wait(state).unwrap());
+                continue;
+            }
+            // Track in-flight and step/replay fetches before the callback.
+            // Clear and mark share this lock, so invalidation cannot wipe a
+            // new tag after a new approval has already started.
+            mem.mark_code(page << CODE_PAGE_BITS, 1);
+            drop(state);
+            // The guard also releases waiters if the embedder callback unwinds.
+            struct Pending<'a>(&'a FetchPolicy, (u64, u64));
+            impl Drop for Pending<'_> {
+                fn drop(&mut self) {
+                    self.0.state.lock().unwrap().pending.remove(&self.1);
+                    self.0.wake.notify_all();
+                }
+            }
+            let guard = Pending(self, key);
+            let verdict = (self.callback)(page << CODE_PAGE_BITS);
+            let mut state = self.state.lock().unwrap();
+            if self.generation.load(Ordering::Acquire) != generation {
+                drop(state);
+                drop(guard);
+                continue;
+            }
+            if verdict == FetchVerdict::Allow {
+                state.touched_words.insert(w);
+                word.fetch_or(mask, Ordering::Release);
+            }
+            drop(state);
+            drop(guard);
+            return verdict;
+        }
+    }
+
+    fn clear(&self, page: Option<u64>, base_page: u64, on_clear: impl FnOnce()) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(page) = page {
+            let (w, mask) = word_bit(page.wrapping_sub(base_page));
+            if let Some(word) = self.approved.get(w) {
+                word.fetch_and(!mask, Ordering::Release);
+            }
+        } else {
+            for w in std::mem::take(&mut state.touched_words) {
+                self.approved[w].store(0, Ordering::Release);
+            }
+        }
+        on_clear();
+        // Publish the generation only after both bitmaps are clear. Otherwise
+        // a new snapshot could observe the new generation with an old approval.
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wake.notify_all();
+    }
+}
+
 /// Why a memory access could not complete inline (§8.1). The interpreter and
 /// codegen turn this into the appropriate `Exit`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -420,7 +536,7 @@ struct Region {
 /// tagged "backs translated code" and at which a code-overlapping write triggers
 /// cache invalidation. Independent of any host page size.
 pub const CODE_PAGE_BITS: u32 = 12;
-const CODE_PAGE_SIZE: u64 = 1 << CODE_PAGE_BITS;
+pub(crate) const CODE_PAGE_SIZE: u64 = 1 << CODE_PAGE_BITS;
 
 /// Historical upper bound on the guest range the SMC code-page table tracked, kept
 /// only to explain why it is gone.
@@ -636,6 +752,7 @@ pub struct Memory {
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: Box<[AtomicU64]>,
+    pub(crate) fetch_policy: Option<FetchPolicy>,
     // Packed `(lo << 32) | len` over 64 KiB granules — the *watermark* the JIT's
     // inlined stores gate on, so a store outside it skips the table entirely. See
     // `code_range_ptr` for why a watermark and not a table probe.
@@ -756,6 +873,7 @@ impl Memory {
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
             code_page,
+            fetch_policy: None,
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
@@ -815,12 +933,29 @@ impl Memory {
         let mut child = Memory::from_backing(self.model, Backing::boxed(&bytes))
             .with_regions(self.regions.clone());
         child.recover_host_faults = self.recover_host_faults;
+        if let Some(policy) = &self.fetch_policy {
+            child.set_fetch_policy(policy.callback.clone());
+        }
         Some(child)
     }
 
     fn with_regions(mut self, regions: Vec<Region>) -> Self {
         self.regions = regions;
         self
+    }
+
+    pub(crate) fn set_fetch_policy(
+        &mut self,
+        callback: Arc<dyn Fn(u64) -> FetchVerdict + Send + Sync>,
+    ) {
+        self.fetch_policy = Some(FetchPolicy::new(callback, self.guest_base, self.size()));
+    }
+
+    pub(crate) fn fetch_permit(&self) -> Option<FetchPermit> {
+        self.fetch_policy.as_ref().map(|policy| FetchPermit {
+            generation: policy.generation.clone(),
+            observed: policy.generation.load(Ordering::Acquire),
+        })
     }
 
     /// Tag every page spanned by `[addr, addr+len)` as backing translated code
@@ -903,31 +1038,45 @@ impl Memory {
 
     /// Clear a page's code tag after its blocks have been invalidated (§10).
     pub fn clear_code_page(&self, page: u64) {
-        let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
-        if let Some(word) = self.code_page.get(w) {
-            word.fetch_and(!m, Ordering::Relaxed);
+        let clear = || {
+            let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
+            if let Some(word) = self.code_page.get(w) {
+                word.fetch_and(!m, Ordering::Relaxed);
+            }
+        };
+        if let Some(policy) = &self.fetch_policy {
+            policy.clear(Some(page), self.guest_base >> CODE_PAGE_BITS, clear);
+        } else {
+            clear();
         }
     }
 
     /// Clear every code-page tag — for a whole-cache invalidation (e.g. mapping a
     /// Trap region, §5.2 M4-T10), the bulk counterpart of [`Self::clear_code_page`].
     pub fn clear_all_code_pages(&self) {
-        let range = self.code_range.load(Ordering::Relaxed);
-        let (lo, len) = (range >> 32, range & 0xffff_ffff);
-        if len == 0 {
-            return;
-        }
-        let base_page = self.guest_base >> CODE_PAGE_BITS;
-        let first_page = (lo << (CODE_RANGE_BITS - CODE_PAGE_BITS)).max(base_page);
-        let end_page = (lo + len) << (CODE_RANGE_BITS - CODE_PAGE_BITS);
-        let first_word = ((first_page - base_page) >> 6) as usize;
-        let end_word = end_page.saturating_sub(base_page).div_ceil(64) as usize;
-        // An empty watermark touches nothing. Otherwise only words in the code
-        // extent are written, preserving lazy commit across a sparse guest span.
-        for word in &self.code_page
-            [first_word.min(self.code_page.len())..end_word.min(self.code_page.len())]
-        {
-            word.store(0, Ordering::Relaxed);
+        let clear = || {
+            let range = self.code_range.load(Ordering::Relaxed);
+            let (lo, len) = (range >> 32, range & 0xffff_ffff);
+            if len == 0 {
+                return;
+            }
+            let base_page = self.guest_base >> CODE_PAGE_BITS;
+            let first_page = (lo << (CODE_RANGE_BITS - CODE_PAGE_BITS)).max(base_page);
+            let end_page = (lo + len) << (CODE_RANGE_BITS - CODE_PAGE_BITS);
+            let first_word = ((first_page - base_page) >> 6) as usize;
+            let end_word = end_page.saturating_sub(base_page).div_ceil(64) as usize;
+            // An empty watermark touches nothing. Otherwise only words in the code
+            // extent are written, preserving lazy commit across a sparse guest span.
+            for word in &self.code_page
+                [first_word.min(self.code_page.len())..end_word.min(self.code_page.len())]
+            {
+                word.store(0, Ordering::Relaxed);
+            }
+        };
+        if let Some(policy) = &self.fetch_policy {
+            policy.clear(None, self.guest_base >> CODE_PAGE_BITS, clear);
+        } else {
+            clear();
         }
     }
 
@@ -1346,6 +1495,11 @@ impl Memory {
         {
             Some(pos) => {
                 self.regions.remove(pos);
+                if self.fetch_policy.is_some() {
+                    for page in code_page_range(guest_addr, size as u64) {
+                        self.clear_code_page(page);
+                    }
+                }
                 // Guard pages: close the region's host pages, except any page still
                 // touched by a surviving region.
                 self.reprotect(guest_addr, size, false);
