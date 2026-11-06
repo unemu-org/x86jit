@@ -262,10 +262,20 @@ impl RawFpMem {
         addr: u64,
         restore: bool,
     ) -> Option<FpStateFault> {
+        self.exec_fxstate_format(cpu, addr, restore, true)
+    }
+    /// Execute the REX.W or legacy pointer image (SDM Vol 1 §8.1.8).
+    pub fn exec_fxstate_format(
+        &self,
+        cpu: &mut CpuState,
+        addr: u64,
+        restore: bool,
+        wide: bool,
+    ) -> Option<FpStateFault> {
         if self.recover_host_faults {
-            fxstate_routed(cpu, self, addr, restore)
+            fxstate_routed(cpu, self, addr, restore, wide)
         } else {
-            exec_fxstate(cpu, FpAccess::<false>::new(self), addr, restore)
+            exec_fxstate_format(cpu, FpAccess::<false>::new(self), addr, restore, wide)
         }
     }
     /// Run one x87 operation, selecting its protection mode once on entry.
@@ -302,8 +312,9 @@ fn fxstate_routed(
     raw: &RawFpMem,
     addr: u64,
     restore: bool,
+    wide: bool,
 ) -> Option<FpStateFault> {
-    exec_fxstate(cpu, FpAccess::<true>::new(raw), addr, restore)
+    exec_fxstate_format(cpu, FpAccess::<true>::new(raw), addr, restore, wide)
 }
 
 /// One x87 operation. Memory forms carry their access in `addr`/size via the op
@@ -619,15 +630,27 @@ pub enum FpStateFault {
     GeneralProtection,
 }
 
-/// fxsave/fxrstor (§14): transfer the 512-byte legacy FP/SSE area at `addr`.
-/// XMM, x87 and MXCSR round-trip. MXCSR is stored but does not yet govern
-/// arithmetic. Reserved bits fault before any CPU state is restored
+/// Transfer the 512-byte REX.W FP/SSE image at `addr` (§14).
+/// XMM, x87 (including the 64-bit pointers) and MXCSR round-trip.
+/// Reserved MXCSR bits fault before any CPU state is restored
 /// (SDM Vol 2A §3.3 FXRSTOR, 64-Bit Mode Exceptions).
 pub fn exec_fxstate<M: FpMem>(
     cpu: &mut CpuState,
     mem: &M,
     addr: u64,
     restore: bool,
+) -> Option<FpStateFault> {
+    exec_fxstate_format(cpu, mem, addr, restore, true)
+}
+
+/// Transfer an FX image, selecting 64-bit offsets with `wide` (REX.W).
+/// SDM Vol 1 §8.1.8; §10.5.1.1, Table 10-2; Vol 2A FXSAVE, Tables 3-48/3-49.
+pub fn exec_fxstate_format<M: FpMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    addr: u64,
+    restore: bool,
+    wide: bool,
 ) -> Option<FpStateFault> {
     if restore {
         let mut buf = [0u8; 512];
@@ -640,6 +663,18 @@ pub fn exec_fxstate<M: FpMem>(
         let mxcsr = u32::from_le_bytes(buf[24..28].try_into().unwrap());
         if mxcsr & !crate::state::MXCSR_MASK != 0 {
             return Some(FpStateFault::GeneralProtection);
+        }
+        cpu.fpu_fop = u16::from_le_bytes(buf[6..8].try_into().unwrap()) & 0x7ff;
+        if wide {
+            cpu.fpu_fip = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            cpu.fpu_fdp = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            cpu.fpu_fcs = 0;
+            cpu.fpu_fds = 0;
+        } else {
+            cpu.fpu_fip = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as u64;
+            cpu.fpu_fdp = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as u64;
+            cpu.fpu_fcs = u16::from_le_bytes(buf[12..14].try_into().unwrap());
+            cpu.fpu_fds = u16::from_le_bytes(buf[20..22].try_into().unwrap());
         }
         cpu.mxcsr = mxcsr;
         cpu.fpu_cw = normalize_cw(u16::from_le_bytes([buf[0], buf[1]]));
@@ -670,6 +705,17 @@ pub fn exec_fxstate<M: FpMem>(
         // Abridged FTW, physical-register indexed — see the restore path for the
         // measurement.
         buf[4] = !cpu.fpu_empty;
+        buf[6..8].copy_from_slice(&(cpu.fpu_fop & 0x7ff).to_le_bytes());
+        if wide {
+            buf[8..16].copy_from_slice(&cpu.fpu_fip.to_le_bytes());
+            buf[16..24].copy_from_slice(&cpu.fpu_fdp.to_le_bytes());
+        } else {
+            buf[8..12].copy_from_slice(&(cpu.fpu_fip as u32).to_le_bytes());
+            buf[16..20].copy_from_slice(&(cpu.fpu_fdp as u32).to_le_bytes());
+            let (fcs, fds) = saved_selectors(cpu);
+            buf[12..14].copy_from_slice(&fcs.to_le_bytes());
+            buf[20..22].copy_from_slice(&fds.to_le_bytes());
+        }
         // SDM Vol 2A §3.3 FXSAVE, Tables 3-48/3-49: MXCSR at 24, mask at 28.
         buf[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
         buf[28..32].copy_from_slice(&crate::state::MXCSR_MASK.to_le_bytes());
@@ -774,33 +820,35 @@ fn tag_word(cpu: &CpuState) -> u16 {
     tw
 }
 
-/// The 28-byte x87 environment image `fnstenv m28byte` writes (SDM Vol 1 Figure 8-9,
-/// the 32-bit protected-mode layout — the one 64-bit mode uses at the default operand
-/// size). Each architectural 16-bit word occupies the low half of a dword whose
-/// reserved upper half hardware fills with `0xFFFF`, not zero.
-///
-/// Fidelity, field by field:
-///
-/// * `0` control word — exact (`fpu_cw`).
-/// * `4` status word — exact: TOP from `fpu_top`, the rest from `fpu_sw`, the same value
-///   `fnstsw` reports (see [`status_word`]).
-/// * `8` tag word — derived, see [`tag_word`].
-/// * `12` FPU instruction-pointer offset, `16` CS selector + last opcode, `20` FPU data
-///   -pointer offset, `24` data selector — **not modeled**. This FPU tracks no
-///   last-instruction pointer, selector or opcode, so the image carries their reset
-///   (post-`fninit`) value; that is the whole of what an unmodeled field can say here,
-///   since one store cannot partially refuse. [`load_env28`] ignores them symmetrically,
-///   so the round trip a `fenv` save/restore performs loses nothing observable.
-fn env28(cpu: &CpuState) -> [u8; 28] {
+/// The 28-byte protected/real-address environment (SDM Vol 1 §8.1.10,
+/// Figs. 8-9/8-10).
+fn env28(cpu: &CpuState, real: bool) -> [u8; 28] {
     let mut buf = [0u8; 28];
     buf[0..2].copy_from_slice(&cpu.fpu_cw.to_le_bytes());
     buf[4..6].copy_from_slice(&status_word(cpu).to_le_bytes());
     buf[8..10].copy_from_slice(&tag_word(cpu).to_le_bytes());
-    // FIP / CS+FOP / FDP / FDS: carried verbatim from whatever `fldenv` last loaded.
-    // Nothing updates them — this FPU tracks no last-instruction pointer — but keeping
-    // them makes a save/restore round trip exact instead of zeroing four fields the
-    // guest saved.
-    buf[12..28].copy_from_slice(&cpu.fpu_env_tail);
+    if real {
+        // SDM Vol 1 §8.1.10, Fig. 8-10: the real-address image packs
+        // linear pointers, unlike the offset/selector pair in an FX image.
+        let fip = (cpu.fpu_fip as u32).wrapping_add(u32::from(cpu.fpu_fcs) << 4);
+        let fdp = (cpu.fpu_fdp as u32).wrapping_add(u32::from(cpu.fpu_fds) << 4);
+        buf[12..16].copy_from_slice(&(fip & 0xffff).to_le_bytes());
+        buf[16..20].copy_from_slice(
+            &(((fip >> 4) & 0x0fff_f000) | u32::from(cpu.fpu_fop & 0x7ff)).to_le_bytes(),
+        );
+        buf[20..24].copy_from_slice(&(fdp & 0xffff).to_le_bytes());
+        buf[24..28].copy_from_slice(&((fdp >> 4) & 0x0fff_f000).to_le_bytes());
+        for off in [2, 6, 10] {
+            buf[off..off + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+        }
+        return buf;
+    }
+    buf[12..16].copy_from_slice(&(cpu.fpu_fip as u32).to_le_bytes());
+    let (fcs, fds) = saved_selectors(cpu);
+    buf[16..18].copy_from_slice(&fcs.to_le_bytes());
+    buf[18..20].copy_from_slice(&(cpu.fpu_fop & 0x7ff).to_le_bytes());
+    buf[20..24].copy_from_slice(&(cpu.fpu_fdp as u32).to_le_bytes());
+    buf[24..26].copy_from_slice(&fds.to_le_bytes());
     for off in [2, 6, 10, 26] {
         buf[off..off + 2].copy_from_slice(&0xffffu16.to_le_bytes());
     }
@@ -814,41 +862,9 @@ fn status_word(cpu: &CpuState) -> u16 {
     (cpu.fpu_sw & !0x3800) | ((cpu.fpu_top as u16 & 7) << 11)
 }
 
-/// Apply the 28-byte environment image `fldenv m28byte` reads — the inverse of
-/// [`env28`], and deliberately narrower than it.
-///
-/// `fldenv` loads the *environment only*: the eight data registers keep their contents
-/// (restoring those is `frstor`), and unlike `fnclex` it clears nothing — whatever the
-/// image holds is what lands.
-///
-/// Field by field, and what this FPU can act on:
-///
-/// * `0` control word — **honored in full**, the same assignment `fldcw` makes. It
-///   carries the rounding control [`rc`] reads for `fist`/`fistp`, so discarding it
-///   would be wrong arithmetic with no trap; FreeBSD's `fenv` restore around
-///   `powf`/`expf` exists precisely to put this word back.
-/// * `4` status word — **honored in full**: TOP goes to `fpu_top`, the rest to `fpu_sw`,
-///   so the `fnstenv`/`fldenv` pair a `fenv_t` restore performs is a lossless round trip.
-/// * `8` tag word — **only the `11`/empty tags**, into `fpu_empty`. The other three
-///   encodings are derived from the live `fpr[]` bytes at every store ([`tag_word`], and
-///   the abridged FTW in [`exec_fxstate`]), so there is no state for them to load into,
-///   and `fldenv` may not touch `fpr[]` to manufacture one.
-/// * `12` FIP, `16` CS selector + last opcode, `20` FDP, `24` data selector —
-///   **ignored**, symmetrically with [`env28`] never having produced a real one.
-///
-/// A loaded control word can **unmask** an exception whose flag is already set in the
-/// loaded status word, which on hardware raises `#MF` on the next FP instruction. Here ES
-/// is recomputed only when something new is raised (see [`raise`]), so a newly-unmasked
-/// pending flag does not by itself trap; the next raise does see the new masks. The SSE
-/// half of the same `fenv_t` uses LDMXCSR/STMXCSR: MXCSR is stored and round-trips,
-/// but does not yet govern arithmetic.
-///
-/// `fnsave`/`frstor` stay unlifted. They move the eight data registers, and their image
-/// holds those in *stack* order `ST(0)..ST(7)` while `fpr[]` is indexed physically and
-/// the only other register-image path here ([`exec_fxstate`]) copies it physically.
-/// Choosing a convention there is a register-file question with its own differential
-/// surface, not a consequence of the environment decision above, so they keep trapping.
-fn load_env28(cpu: &mut CpuState, buf: &[u8; 28]) {
+/// Load the environment without changing the register contents (SDM Vol 2A
+/// §3.3 FLDENV). Only the empty tags are retained; other tags derive from FPR bytes.
+fn load_env28(cpu: &mut CpuState, buf: &[u8; 28], real: bool) {
     cpu.fpu_cw = normalize_cw(u16::from_le_bytes([buf[0], buf[1]]));
     let sw = u16::from_le_bytes([buf[4], buf[5]]);
     cpu.fpu_top = ((sw >> 11) & 7) as u32;
@@ -866,7 +882,25 @@ fn load_env28(cpu: &mut CpuState, buf: &[u8; 28]) {
         }
     }
     cpu.fpu_empty = empty;
-    cpu.fpu_env_tail.copy_from_slice(&buf[12..28]);
+    if real {
+        // SDM Vol 1 §§8.1.8, 8.1.10, Fig. 8-10: load the packed linear
+        // pointers and clear selectors; upper pointer halves are zeroed.
+        let ip_hi_op = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let dp_hi = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        cpu.fpu_fip = u64::from(u16::from_le_bytes(buf[12..14].try_into().unwrap()))
+            | u64::from((ip_hi_op & 0x0fff_f000) << 4);
+        cpu.fpu_fdp = u64::from(u16::from_le_bytes(buf[20..22].try_into().unwrap()))
+            | u64::from((dp_hi & 0x0fff_f000) << 4);
+        cpu.fpu_fop = ip_hi_op as u16 & 0x7ff;
+        cpu.fpu_fcs = 0;
+        cpu.fpu_fds = 0;
+        return;
+    }
+    cpu.fpu_fip = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as u64;
+    cpu.fpu_fcs = u16::from_le_bytes(buf[16..18].try_into().unwrap());
+    cpu.fpu_fop = u16::from_le_bytes(buf[18..20].try_into().unwrap()) & 0x7ff;
+    cpu.fpu_fdp = u32::from_le_bytes(buf[20..24].try_into().unwrap()) as u64;
+    cpu.fpu_fds = u16::from_le_bytes(buf[24..26].try_into().unwrap());
 }
 
 /// Record the exceptions an operation raised into the status word.
@@ -1077,6 +1111,72 @@ pub fn mem_operand_bytes(kind: FpuKind) -> u64 {
         | FimulMemI16 | FidivMemI16 | FidivrMemI16 => 2,
         Fldenv => 28,
         _ => 0,
+    }
+}
+
+/// Lift-time descriptor flags. Bits 10:0 contain FOP, 29:16 the byte offset
+/// of the operand selector field within CpuState;
+/// control instructions carry zero.
+pub const X87_RECORD: u32 = 1 << 31;
+pub const X87_MEMORY: u32 = 1 << 30;
+
+/// Commit after successful memory accesses (SDM Vol 1 §§8.1.8–8.1.9).
+/// Register operands retain FDP (architecturally undefined); FOP changes only
+/// on an unmasked exception, without fopcode compatibility mode.
+#[inline(always)]
+pub fn record_x87_instruction(cpu: &mut CpuState, offset: u64, ip: u64, instruction: u32) {
+    if instruction & X87_RECORD != 0 {
+        cpu.fpu_fip = ip;
+        record_x87_operand(cpu, offset, instruction);
+    }
+}
+
+#[inline(always)]
+fn record_x87_operand(cpu: &mut CpuState, offset: u64, instruction: u32) {
+    cpu.fpu_fcs = cpu.cs;
+    // SDM Vol 1 §8.7.1: an unmasked exception sets ES. The waiting-op
+    // precheck excludes a preexisting ES before any non-control op runs.
+    if cpu.fpu_sw & (1 << 7) != 0 {
+        cpu.fpu_fop = instruction as u16 & 0x7ff;
+    }
+    if instruction & X87_MEMORY != 0 && updates_data_pointer(cpu) {
+        let segment = (instruction >> 16) & 0x3fff;
+        cpu.fpu_fds = match segment {
+            s if s == std::mem::offset_of!(CpuState, fs) as u32 => cpu.fs,
+            s if s == std::mem::offset_of!(CpuState, gs) as u32 => cpu.gs,
+            s if s == std::mem::offset_of!(CpuState, ss) as u32 => cpu.ss,
+            s if s == std::mem::offset_of!(CpuState, es) as u32 => cpu.es,
+            s if s == std::mem::offset_of!(CpuState, cs) as u32 => cpu.cs,
+            _ => cpu.ds,
+        };
+        cpu.fpu_fdp = offset;
+    }
+}
+
+/// SDM Vol 1 §§8.1.8, 8.7.1: exception-only FDP depends on the live
+/// per-vCPU CPUID identity and the exception summary after the operation.
+#[inline(always)]
+pub fn updates_data_pointer(cpu: &CpuState) -> bool {
+    pointer_features(cpu) & (1 << 6) == 0 || cpu.fpu_sw & (1 << 7) != 0
+}
+
+#[inline(always)]
+fn pointer_features(cpu: &CpuState) -> u32 {
+    // All built-in presets leave both bits clear. Avoid projecting CPUID on the
+    // ordinary x87 memory path; only explicit identities can change these bits.
+    if cpu.cpuid_table.is_none() && cpu.cpuid_overrides.leaves.is_empty() {
+        0
+    } else {
+        cpu.cpuid(7, 0).ebx
+    }
+}
+
+fn saved_selectors(cpu: &CpuState) -> (u16, u16) {
+    // SDM Vol 1 §8.1.8: deprecation affects saving, not loading, selectors.
+    if pointer_features(cpu) & (1 << 13) != 0 {
+        (0, 0)
+    } else {
+        (cpu.fpu_fcs, cpu.fpu_fds)
     }
 }
 
@@ -1723,7 +1823,7 @@ fn exec_x87_inner<M: FpMem>(
             }
         }
         Fnstenv => {
-            if !mem.store(addr, &env28(cpu)) {
+            if !mem.store(addr, &env28(cpu, sti & 0x80 != 0)) {
                 return Some((mem.fault_addr(addr), true));
             }
             // SDM: "…and then masks all floating-point exceptions" — the store is
@@ -1736,7 +1836,7 @@ fn exec_x87_inner<M: FpMem>(
             if !mem.load(addr, &mut buf) {
                 return Some((mem.fault_addr(addr), false));
             }
-            load_env28(cpu, &buf);
+            load_env28(cpu, &buf, sti & 0x80 != 0);
         }
         Fninit => {
             // Reinitialize the x87 unit: control word 0x037F (round-to-nearest,
@@ -1749,7 +1849,11 @@ fn exec_x87_inner<M: FpMem>(
             // FINIT/FNINIT).
             cpu.fpu_sw = 0;
             cpu.fpu_empty = 0xFF;
-            cpu.fpu_env_tail = [0; 16];
+            cpu.fpu_fip = 0;
+            cpu.fpu_fdp = 0;
+            cpu.fpu_fop = 0;
+            cpu.fpu_fcs = 0;
+            cpu.fpu_fds = 0;
         }
         Fnclex => {
             // "Clears the floating-point exception flags (PE, UE, OE, ZE, DE, and IE),

@@ -20,8 +20,10 @@ impl Sequence {
         let exempt = i.mnemonic() == Mnemonic::Cvtpi2pd && i.op_kind(1) == OpKind::Memory;
         if mmx && !exempt && !self.checked {
             ops.push(IrOp::X87 {
+                instruction: 0,
                 fault: Default::default(),
                 kind: crate::x87::FpuKind::Fwait,
+                operand_offset: Val::Imm(0),
                 addr: Val::Imm(0),
                 sti: 0,
             });

@@ -374,11 +374,13 @@ pub struct CpuState {
     /// is ever *set* by execution — it exists so an environment image survives
     /// `fnstenv`/`fldenv` unchanged, which is what a `fenv_t` save/restore needs.
     pub fpu_sw: u16,
-    /// Bytes 12..28 of the 28-byte environment image: FIP, CS selector + last opcode,
-    /// FDP, data selector. **Not modelled** — no instruction updates them — but carried
-    /// verbatim so a save/restore round trip is exact rather than silently zeroing four
-    /// fields the guest saved.
-    pub fpu_env_tail: [u8; 16],
+    /// x87 instruction/data offsets and opcode (SDM Vol 1 §§8.1.8–8.1.9).
+    pub fpu_fip: u64,
+    pub fpu_fdp: u64,
+    pub fpu_fop: u16,
+    /// Selectors are retained: the default CPUID does not deprecate FCS/FDS.
+    pub fpu_fcs: u16,
+    pub fpu_fds: u16,
     /// Sub-transfers of the currently-trapping instruction that the embedder has already
     /// answered, as `(guest address, value)`. Appended at the END like the
     /// fields above, so every pre-existing `#[repr(C)]` offset and the JIT ABI built on
@@ -532,7 +534,11 @@ impl Default for CpuState {
             // "The data registers ... are all tagged as empty").
             fpu_empty: 0xFF,
             fpu_sw: 0,
-            fpu_env_tail: [0; 16],
+            fpu_fip: 0,
+            fpu_fdp: 0,
+            fpu_fop: 0,
+            fpu_fcs: 0,
+            fpu_fds: 0,
             mmio_parts: [(0, 0); 64],
             mmio_parts_len: 0,
             mmio_parts_rip: 0,

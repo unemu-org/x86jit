@@ -685,13 +685,8 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     return r.into();
                 }
             }
-            IrOp::X87 {
-                fault,
-                kind,
-                addr,
-                sti,
-            } => {
-                if let Some(r) = exec_x87(cpu, mem, temps, *cur_addr, kind, addr, sti) {
+            IrOp::X87 { fault, addr, .. } => {
+                if let Some(r) = exec_x87(cpu, mem, temps, *cur_addr, op) {
                     return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
                 }
             }
@@ -713,8 +708,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 fault,
                 addr,
                 restore,
+                wide,
             } => {
-                if let Some(r) = exec_fx_state(cpu, mem, temps, *cur_addr, addr, restore) {
+                if let Some(r) = exec_fx_state(cpu, mem, temps, *cur_addr, addr, restore, wide) {
                     return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
                 }
                 if *restore {

@@ -3,16 +3,26 @@
 use super::*;
 use crate::ir::*;
 
-#[allow(clippy::too_many_arguments)]
+// Keep the descriptor commit in the interpreter dispatch, without a new frame.
+#[inline(always)]
 pub(crate) fn exec_x87<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     temps: &mut [u64],
     cur_addr: u64,
-    kind: &crate::x87::FpuKind,
-    addr: &Val,
-    sti: &u8,
+    op: &IrOp,
 ) -> Option<StepResult> {
+    let IrOp::X87 {
+        kind,
+        addr,
+        sti,
+        instruction,
+        operand_offset,
+        ..
+    } = op
+    else {
+        unreachable!("x87 dispatch requires an X87 op");
+    };
     let a = read_val(*addr, &*temps);
     // An unmasked exception raised by an EARLIER op is reported here, before this one
     // runs (SDM Vol 1 §8.6) — the architectural reporting point is the next waiting
@@ -39,6 +49,12 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
             access,
         }));
     }
+    crate::x87::record_x87_instruction(
+        cpu,
+        read_val(*operand_offset, temps),
+        cur_addr,
+        *instruction,
+    );
     None
 }
 
@@ -50,10 +66,11 @@ pub(crate) fn exec_fx_state<const ROUTED: bool>(
     cur_addr: u64,
     addr: &Val,
     restore: &bool,
+    wide: &bool,
 ) -> Option<StepResult> {
     let a = read_val(*addr, &*temps);
     // Through `Memory` (RAM check + SMC note_write), like the x87 arm.
-    if let Some(fault) = crate::x87::exec_fxstate(cpu, mem, a, *restore) {
+    if let Some(fault) = crate::x87::exec_fxstate_format(cpu, mem, a, *restore, *wide) {
         cpu.rip = cur_addr;
         return Some(StepResult::Exit(match fault {
             crate::x87::FpStateFault::Memory { addr, write } => Exit::UnmappedMemory {

@@ -161,6 +161,7 @@ pub struct Helpers {
     pub pcmpstrm_mem: (ir::SigRef, u64, u64),
     pub bmi: (ir::SigRef, u64, u64),
     pub x87: (ir::SigRef, u64, u64),
+    pub x87_mem: (ir::SigRef, u64, u64),
     pub fxstate: (ir::SigRef, u64, u64),
     pub crc32: (ir::SigRef, u64, u64),
     pub note_watch: (ir::SigRef, u64, u64),
@@ -259,6 +260,7 @@ impl Helpers {
             pcmpstrm_mem: mk(),
             bmi: mk(),
             x87: mk(),
+            x87_mem: mk(),
             fxstate: mk(),
             crc32: mk(),
             note_watch,
@@ -1058,8 +1060,13 @@ impl Translator<'_, '_> {
             } => self.emit_random(*dst, *kind, *size, *set_flags),
             IrOp::Xgetbv => self.emit_xgetbv(),
             IrOp::X87 {
-                kind, addr, sti, ..
-            } => self.emit_x87(kind, addr, sti),
+                kind,
+                addr,
+                sti,
+                instruction,
+                operand_offset,
+                ..
+            } => self.emit_x87(kind, addr, sti, instruction, operand_offset),
             IrOp::GetMxcsr { dst } => {
                 let value = self.builder.ins().load(
                     types::I32,
@@ -1090,8 +1097,13 @@ impl Translator<'_, '_> {
                 self.ret(RET_MXCSR_CHANGED);
                 true
             }
-            IrOp::FxState { addr, restore, .. } => {
-                let terminated = self.emit_fx_state(addr, restore);
+            IrOp::FxState {
+                addr,
+                restore,
+                wide,
+                ..
+            } => {
+                let terminated = self.emit_fx_state(addr, restore, wide);
                 if *restore && !terminated {
                     let end = self.iconst(self.guest_end);
                     self.store_cpu(self.offsets.rip, end);

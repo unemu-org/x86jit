@@ -355,14 +355,19 @@ impl FpMem for NotifyingFpMem<'_> {
     }
 }
 
+// A successful x87 memory helper can suppress FDP recording. Codegen consumes
+// this flag locally; it never reaches the compiled-block return-code ABI.
+const X87_SKIP_FDP: u64 = 1 << 63;
+
 /// x87 helper: runs one FPU op via the shared `exec_x87`. On a memory fault it
 /// writes the fault into `MemCtx`, sets RIP to the faulting instruction, and
-/// returns `RET_UNMAPPED`; otherwise `RET_CONTINUE`.
+/// returns `RET_UNMAPPED`. Success returns `RET_CONTINUE` or the private
+/// `X87_SKIP_FDP` flag, which codegen consumes before continuing.
 ///
 /// # Safety
 /// `cpu`/`mem` are valid pointers to a `CpuState` / `MemCtx` for the call; `kind`
-/// is a valid `FpuKind` discriminant (the lift only emits real ones).
-unsafe extern "C" fn x87_helper(
+/// is a valid FpuKind. `CHECK_FDP` is selected only for non-control memory ops.
+unsafe extern "C" fn x87_helper<const CHECK_FDP: bool>(
     cpu: *mut u8,
     mem: *mut u8,
     kind: u64,
@@ -373,7 +378,7 @@ unsafe extern "C" fn x87_helper(
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
-    // Safe: `kind` came from a real `FpuKind as u16` baked by the lift.
+    // Safe: `kind` came from a real FpuKind baked by the lift.
     let kind: x86jit_core::x87::FpuKind = std::mem::transmute(kind as u16);
     // The deferred #MF report (SDM Vol 1 §8.6), same rule as the interpreter's: an
     // unmasked exception raised earlier traps HERE, before this op runs. `RET_EXCEPTION`
@@ -395,7 +400,16 @@ unsafe extern "C" fn x87_helper(
         memory,
     };
     match x86jit_core::x87::exec_x87(cpu, &mem, kind, addr, sti as u8) {
-        None => RET_CONTINUE,
+        None => {
+            // Codegen consumes this private success flag before continuing.
+            // Keep all pointer stores in the generated success path; this helper
+            // only evaluates the live per-vCPU CPUID policy for memory forms.
+            if CHECK_FDP && !x86jit_core::x87::updates_data_pointer(cpu) {
+                X87_SKIP_FDP
+            } else {
+                RET_CONTINUE
+            }
+        }
         Some((fault, write)) => {
             let width = x86jit_core::x87::mem_operand_bytes(kind);
             ctx.record_helper_fault(fault, width, write, addr, width);
@@ -429,11 +443,11 @@ unsafe extern "C" fn fxstate_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    match raw.exec_fxstate(cpu, addr, restore != 0) {
+    match raw.exec_fxstate_format(cpu, addr, restore & 1 != 0, restore & 2 != 0) {
         None => {
             // As in `x87_helper`: `fxsave` writes 512 bytes of guest memory through the
             // raw view, so report it. `fxrstor` (restore != 0) only reads.
-            if restore == 0 {
+            if restore & 1 == 0 {
                 let mem = &*(ctx.mem_self as *const x86jit_core::memory::Memory);
                 mem.note_write(addr, 512);
             }
@@ -3084,7 +3098,7 @@ impl Shared {
         let div_sig = params(6, true); // div(hi, lo, divisor, size, signed, out) -> i64
         let cas_pair_sig = params(6, true);
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
-        let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> i64
+        let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> status + private FDP policy
         let fx_sig = params(5, true); // fxstate(cpu, mem, addr, restore, cur_addr) -> i64
         let crc_sig = params(3, true); // crc32(crc, src, bytes) -> i64
         let note_watch_sig = params(3, false); // note_watch(mem_self, addr, len) -> ()
@@ -3285,7 +3299,8 @@ impl Shared {
                 pcmpstrm: helper!(pcmpstrm_sig, pcmpstrm_helper),
                 pcmpstrm_mem: helper!(pcmpstrm_mem_sig, pcmpstrm_mem_helper),
                 bmi: helper!(bmi_sig, bmi_helper),
-                x87: helper!(x87_sig, x87_helper),
+                x87: helper!(x87_sig.clone(), x87_helper::<false>),
+                x87_mem: helper!(x87_sig, x87_helper::<true>),
                 fxstate: helper!(fx_sig, fxstate_helper),
                 crc32: helper!(crc_sig, crc32_helper),
                 note_watch: helper!(note_watch_sig, note_write_helper),

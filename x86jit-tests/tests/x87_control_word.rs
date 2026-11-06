@@ -30,6 +30,19 @@ use x86jit_tests::vector::{CpuSnapshot, MemChunk, MemKind, RunSpec};
 const CODE: u64 = 0x21_0000;
 const SCRATCH: u64 = 0x22_0000;
 
+fn host_is_amd() -> bool {
+    // AMD64 APM Vol 3 CPUID, Table 3-2: vendor string in EBX, EDX, ECX.
+    // SAFETY: CPUID leaf 0 is available on every x86-64 host.
+    #[allow(unused_unsafe)] // CPUID intrinsics are unsafe on the workspace MSRV.
+    let vendor = unsafe { std::arch::x86_64::__cpuid(0) };
+    (vendor.ebx, vendor.edx, vendor.ecx)
+        == (
+            u32::from_le_bytes(*b"Auth"),
+            u32::from_le_bytes(*b"enti"),
+            u32::from_le_bytes(*b"cAMD"),
+        )
+}
+
 /// RC field values (SDM Vol 1 §4.8.4.1, Table 4-9).
 const RC: [(u16, &str); 4] = [
     (0, "nearest-even"),
@@ -385,6 +398,17 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
         // both sides so the rest of the image is compared byte for byte rather than not
         // compared at all.
         b[128 + 28..128 + 32].fill(0);
+        if host_is_amd() {
+            // AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE/FXRSTOR: with ES=0,
+            // error pointers need not be saved/restored. Ryzen 7 7840HS (Zen 4)
+            // measured zero FOP/FIP/FDP in FXSAVE and the subsequent FNSTENV.
+            // Mask only these fields and their selectors in the native comparison;
+            // retain reserved bytes (SDM Vol 2A §3.3 FXSAVE, Table 3-49;
+            // Vol 1 §8.1.8). The engine's unmasked image is asserted below.
+            b[128 + 6..128 + 14].fill(0); // FOP, FIP, FCS
+            b[128 + 16..128 + 22].fill(0); // FDP, FDS
+            b[64 + 12..64 + 26].fill(0); // FNSTENV FIP, FCS, FOP, FDP, FDS
+        }
         b
     };
     assert_eq!(
@@ -392,7 +416,7 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
         page(&interp),
         "the fxsave image and everything after it, byte for byte"
     );
-    let ours = page(&interp);
+    let ours = &interp.mem.iter().find(|c| c.addr == SCRATCH).unwrap().bytes;
     // The abridged FTW hardware saved: one register occupied, so exactly one bit set.
     assert_eq!(
         ours[128 + 4].count_ones(),

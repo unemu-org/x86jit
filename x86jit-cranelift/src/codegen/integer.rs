@@ -372,6 +372,8 @@ impl Translator<'_, '_> {
         kind: &x86jit_core::x87::FpuKind,
         addr: &Val,
         sti: &u8,
+        instruction: &u32,
+        operand_offset: &Val,
     ) -> bool {
         if *kind == x86jit_core::x87::FpuKind::Fwait {
             // SDM Vol 1 §8.6: FWAIT tests ES before executing. Match
@@ -390,7 +392,15 @@ impl Translator<'_, '_> {
             return false;
         }
         let a = self.val(*addr);
-        let kc = self.iconst(*kind as u16 as u64);
+        let records_memory = instruction & x86jit_core::x87::X87_MEMORY != 0;
+        // Resolve the selector field once during compilation, not per operation.
+        let selector_offset = (instruction >> 16) & 0x3fff;
+        let offset = if records_memory {
+            Some(self.val(*operand_offset))
+        } else {
+            None
+        };
+        let kc = self.iconst(u64::from(*kind as u16));
         let stic = self.iconst(*sti as u64);
         let cur = self.iconst(self.cur_addr);
         let args = [self.cpu, self.mem, kc, a, stic, cur];
@@ -402,15 +412,71 @@ impl Translator<'_, '_> {
         } else {
             None
         };
-        let inst = self.call_memory_helper(self.helpers.x87, &args, access);
+        let helper = if records_memory {
+            self.helpers.x87_mem
+        } else {
+            self.helpers.x87
+        };
+        let inst = self.call_memory_helper(helper, &args, access);
         self.trap_if_unmapped_or_exception(inst);
+        // SDM Vol 3A §§7.5–7.6: commit only after fault/deferred-#MF exits.
+        // FIP is known at lift time; generated code only stores its constant.
+        if instruction & x86jit_core::x87::X87_RECORD != 0 {
+            self.store_cpu(self.offsets.fpu_fip, cur);
+            let cs =
+                self.builder
+                    .ins()
+                    .load(types::I16, MemFlags::trusted(), self.cpu, self.offsets.cs);
+            self.store_cpu(self.offsets.fpu_fcs, cs);
+            // SDM Vol 1 §§8.1.9, 8.7.1: FOP captures the constant opcode
+            // only when this operation sets ES for an unmasked exception.
+            let sw = self.builder.ins().load(
+                types::I16,
+                MemFlags::trusted(),
+                self.cpu,
+                self.offsets.fpu_sw,
+            );
+            let es = self.builder.ins().band_imm(sw, 1 << 7);
+            let raised = self.builder.ins().icmp_imm(IntCC::NotEqual, es, 0);
+            let commit = self.builder.create_block();
+            let next = self.builder.create_block();
+            self.builder.ins().brif(raised, commit, &[], next, &[]);
+            self.builder.switch_to_block(commit);
+            let fop = self
+                .builder
+                .ins()
+                .iconst(types::I16, i64::from(instruction & 0x7ff));
+            self.store_cpu(self.offsets.fpu_fop, fop);
+            self.builder.ins().jump(next, &[]);
+            self.builder.switch_to_block(next);
+        }
+        if let Some(offset) = offset {
+            // SDM Vol 1 §8.1.8: the helper checks FDP_EXCPTN_ONLY against
+            // this vCPU's live identity. Every pointer store remains here.
+            let status = self.builder.inst_results(inst)[0];
+            let skip = self.builder.ins().icmp_imm(IntCC::NotEqual, status, 0);
+            let commit = self.builder.create_block();
+            let next = self.builder.create_block();
+            self.builder.ins().brif(skip, next, &[], commit, &[]);
+            self.builder.switch_to_block(commit);
+            self.store_cpu(self.offsets.fpu_fdp, offset);
+            let selector = self.builder.ins().load(
+                types::I16,
+                MemFlags::trusted(),
+                self.cpu,
+                selector_offset as i32,
+            );
+            self.store_cpu(self.offsets.fpu_fds, selector);
+            self.builder.ins().jump(next, &[]);
+            self.builder.switch_to_block(next);
+        }
         self.reload_gprs(); // e.g. fnstsw wrote AX
         false
     }
 
-    pub(crate) fn emit_fx_state(&mut self, addr: &Val, restore: &bool) -> bool {
+    pub(crate) fn emit_fx_state(&mut self, addr: &Val, restore: &bool, wide: &bool) -> bool {
         let a = self.val(*addr);
-        let rc = self.iconst(*restore as u64);
+        let rc = self.iconst(u64::from(*restore) | (u64::from(*wide) << 1));
         let cur = self.iconst(self.cur_addr);
         let args = [self.cpu, self.mem, a, rc, cur];
         self.flush_gprs(); // helper reads CpuState (XMM/x87)

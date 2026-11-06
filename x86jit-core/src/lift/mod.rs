@@ -2224,6 +2224,7 @@ fn lift_insn_inner(
                 fault: Default::default(),
                 addr,
                 restore: false,
+                wide: insn.mnemonic() == Fxsave64,
             });
             Ok(false)
         }
@@ -2233,6 +2234,7 @@ fn lift_insn_inner(
                 fault: Default::default(),
                 addr,
                 restore: true,
+                wide: insn.mnemonic() == Fxrstor64,
             });
             Ok(true)
         }
@@ -4382,16 +4384,59 @@ pub(crate) fn effective_address(
     ops: &mut Vec<IrOp>,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
-    let addr = effective_address_no_segment(insn, ops, tg)?;
-    let addr = with_segment(insn, addr, ops, tg);
+    Ok(effective_address_parts(insn, ops, tg)?.0)
+}
+
+/// Keep the architectural offset alongside the linear address for x87 FDP.
+fn effective_address_parts(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(Val, Val), LiftError> {
+    let offset = effective_address_no_segment(insn, ops, tg)?;
+    let addr = with_segment(insn, offset, ops, tg);
     if let Some(bytes) = memory_alignment(insn) {
         ops.push(IrOp::CheckAlign { addr, bytes });
     }
-    Ok(addr)
+    Ok((addr, offset))
 }
 
 fn fill_ir_bytes(insn: &Instruction, code: &[u8], start: u64, ops: &mut [IrOp]) {
     for op in ops {
+        if let IrOp::X87 {
+            instruction, kind, ..
+        } = op
+        {
+            use crate::x87::{FpuKind::*, X87_MEMORY, X87_RECORD};
+            if matches!(
+                *kind,
+                Fldcw | Fnstcw | Fnstsw | FnstswMem | Fnstenv | Fldenv | Fninit | Fnclex | Fwait
+            ) {
+                continue;
+            }
+            // SDM Vol 1 §8.1.9, Fig. 8-8: prefixes are excluded from FOP.
+            let offset = insn.ip().wrapping_sub(start) as usize;
+            let bytes = &code[offset..offset + insn.len()];
+            if let Some(i) = bytes.iter().position(|b| (0xd8..=0xdf).contains(b)) {
+                *instruction = X87_RECORD
+                    | if crate::x87::mem_operand_bytes(*kind) != 0 {
+                        X87_MEMORY
+                    } else {
+                        0
+                    }
+                    | (u32::from(bytes[i] & 7) << 8)
+                    | u32::from(bytes[i + 1])
+                    | ((match insn.memory_segment() {
+                        Register::CS => std::mem::offset_of!(crate::state::CpuState, cs),
+                        Register::ES => std::mem::offset_of!(crate::state::CpuState, es),
+                        Register::SS => std::mem::offset_of!(crate::state::CpuState, ss),
+                        Register::FS => std::mem::offset_of!(crate::state::CpuState, fs),
+                        Register::GS => std::mem::offset_of!(crate::state::CpuState, gs),
+                        _ => std::mem::offset_of!(crate::state::CpuState, ds),
+                    } as u32)
+                        << 16);
+            }
+        }
         if let IrOp::Unsupported { bytes, len } = op {
             let offset = insn.ip().wrapping_sub(start) as usize;
             bytes[..*len as usize].copy_from_slice(&code[offset..offset + *len as usize]);

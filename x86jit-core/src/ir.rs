@@ -375,7 +375,12 @@ pub enum IrOp {
     X87 {
         fault: MemoryAccess,
         kind: crate::x87::FpuKind,
+        // Lift-time opcode/segment and update flags; see x87::X87_RECORD.
+        instruction: u32,
         addr: Val,
+        // Effective offset before segmentation (SDM Vol 1 §8.1.8).
+        operand_offset: Val,
+        // ST(i), or bit 7 for a real-address 28-byte environment.
         sti: u8,
     },
 
@@ -396,6 +401,7 @@ pub enum IrOp {
         fault: MemoryAccess,
         addr: Val,
         restore: bool,
+        wide: bool,
     },
 
     // popcnt: `dst` = set-bit count of `src`. ZF <- (src == 0); CF/OF/SF/AF/PF = 0.

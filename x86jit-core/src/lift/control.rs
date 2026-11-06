@@ -448,16 +448,26 @@ pub(crate) fn lift_x87(
 
     // Emit an X87 op with a freshly computed address (memory forms) or a dummy.
     let emit = |kind: K, ops: &mut Vec<IrOp>, tg: &mut TempGen| -> Result<(), LiftError> {
-        let addr = if mem {
-            effective_address(insn, ops, tg)?
+        let (addr, operand_offset) = if mem {
+            effective_address_parts(insn, ops, tg)?
         } else {
-            Val::Imm(0)
+            (Val::Imm(0), Val::Imm(0))
         };
         ops.push(IrOp::X87 {
+            operand_offset,
+            instruction: 0,
             fault: Default::default(),
             kind,
             addr,
-            sti,
+            // SDM Vol 1 §8.1.10: the accepted 28-byte environment has a
+            // separate real-address layout. Bit 7 selects it for these two ops.
+            sti: if insn.code_size() == iced_x86::CodeSize::Code16
+                && matches!(kind, K::Fldenv | K::Fnstenv)
+            {
+                0x80
+            } else {
+                sti
+            },
         });
         Ok(())
     };
@@ -723,8 +733,10 @@ pub(crate) fn lift_x87(
                 emit(K::FnstswMem, ops, tg)?;
             } else {
                 ops.push(IrOp::X87 {
+                    instruction: 0,
                     fault: Default::default(),
                     kind: K::Fnstsw,
+                    operand_offset: Val::Imm(0),
                     addr: Val::Imm(0),
                     sti: 0,
                 });

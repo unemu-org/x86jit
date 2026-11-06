@@ -290,6 +290,12 @@ pub struct CpuOffsets {
     pub fpu_top: i32,
     pub fpu_empty: i32,
     pub fpu_sw: i32,
+    pub fpu_fip: i32,
+    pub fpu_fdp: i32,
+    pub fpu_fds: i32,
+    pub fpu_fcs: i32,
+    pub fpu_fop: i32,
+    pub cs: i32,
 }
 
 impl CpuOffsets {
@@ -345,6 +351,12 @@ pub fn cpu_offsets() -> CpuOffsets {
         fpu_top: off(&s.fpu_top as *const u32 as *const u8),
         fpu_empty: off(&s.fpu_empty as *const u8),
         fpu_sw: off(&s.fpu_sw as *const u16 as *const u8),
+        fpu_fip: off(&s.fpu_fip as *const u64 as *const u8),
+        fpu_fdp: off(&s.fpu_fdp as *const u64 as *const u8),
+        fpu_fds: off(&s.fpu_fds as *const u16 as *const u8),
+        fpu_fcs: off(&s.fpu_fcs as *const u16 as *const u8),
+        fpu_fop: off(&s.fpu_fop as *const u16 as *const u8),
+        cs: off(&s.cs as *const u16 as *const u8),
         mxcsr: off(&s.mxcsr as *const u32 as *const u8),
     }
 }
