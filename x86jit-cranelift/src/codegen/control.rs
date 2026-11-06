@@ -399,35 +399,52 @@ impl Translator<'_, '_> {
         let cs = self.builder.ins().band_imm(cs, 0xffff);
         let configured = self.read_selector(1);
         let mut bad = self.builder.ins().icmp(IntCC::NotEqual, cs, configured);
+        let mut selector_bad = bad;
         if let Some(ss) = ss {
             let ss = self.val(ss);
             let ss = self.builder.ins().band_imm(ss, 0xffff);
             let configured = self.read_selector(2);
             let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ss, configured);
             bad = self.builder.ins().bor(bad, mismatch);
+            selector_bad = bad;
             let ip = self.val(ip);
             let canonical = self.builder.ins().ishl_imm(ip, 16);
             let canonical = self.builder.ins().sshr_imm(canonical, 16);
             let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ip, canonical);
             bad = self.builder.ins().bor(bad, mismatch);
         }
-        self.iret_gp_if(bad)
+        self.iret_gp_if(bad, Some(selector_bad))
     }
 
     pub(crate) fn emit_check_iret_nt(&mut self) -> bool {
         let system = self.load_cpu(SYSTEM_FLAGS);
         let nt = self.builder.ins().band_imm(system, 1 << 14);
         let nt = self.builder.ins().icmp_imm(IntCC::NotEqual, nt, 0);
-        self.iret_gp_if(nt)
+        self.iret_gp_if(nt, None)
     }
 
-    fn iret_gp_if(&mut self, bad: Value) -> bool {
+    fn iret_gp_if(&mut self, bad: Value, selector_bad: Option<Value>) -> bool {
         let ok = self.begin_trap_fork(bad);
         let rip = self.iconst(self.cur_addr);
         self.store_cpu(self.offsets.rip, rip);
         let vector = self.iconst(13);
         self.store_mem(MEMCTX_EXCEPTION_VECTOR, vector);
-        self.ret(RET_EXCEPTION);
+        self.store_mem(MEMCTX_NEXT_ENTRY, rip);
+        let cause = if let Some(selectors) = selector_bad {
+            let unknown = self.iconst(x86jit_core::fault::cause_to_wire(
+                x86jit_core::FaultCause::IretSelector,
+            ));
+            let zero = self.iconst(x86jit_core::fault::cause_to_wire(
+                x86jit_core::FaultCause::NonCanonical,
+            ));
+            self.builder.ins().select(selectors, unknown, zero)
+        } else {
+            self.iconst(x86jit_core::fault::cause_to_wire(
+                x86jit_core::FaultCause::IretNt,
+            ))
+        };
+        self.store_mem(MEMCTX_FAULT_ACCESS, cause);
+        self.ret(RET_EXCEPTION_DETAIL);
         self.builder.switch_to_block(ok);
         false
     }

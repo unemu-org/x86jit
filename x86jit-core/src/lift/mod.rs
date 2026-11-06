@@ -104,6 +104,7 @@ struct FetchWindow<const CAP: usize> {
     bytes: std::mem::MaybeUninit<[u8; CAP]>,
     len: usize,
     stopped: bool,
+    failure: Option<crate::MemTrap>,
 }
 impl<const CAP: usize> FetchWindow<CAP> {
     fn new() -> Self {
@@ -111,6 +112,7 @@ impl<const CAP: usize> FetchWindow<CAP> {
             bytes: std::mem::MaybeUninit::uninit(),
             len: 0,
             stopped: false,
+            failure: None,
         }
     }
     fn code(&self) -> &[u8] {
@@ -122,12 +124,16 @@ impl<const CAP: usize> FetchWindow<CAP> {
             return false;
         }
         let at = start + self.len as u64;
-        let Ok(chunk) = mem.fetch_chunk_len(
+        let chunk = match mem.fetch_chunk_len(
             at,
             (CAP - self.len).min(if self.len == 0 { 128 } else { CAP }),
-        ) else {
-            self.stopped = true;
-            return false;
+        ) {
+            Ok(chunk) => chunk,
+            Err(trap) => {
+                self.failure = Some(trap);
+                self.stopped = true;
+                return false;
+            }
         };
         // SAFETY: this writable tail is disjoint from the initialized prefix.
         // No reference to its uninitialized bytes is formed before the copy.
@@ -136,9 +142,13 @@ impl<const CAP: usize> FetchWindow<CAP> {
             Ok(copied) => {
                 self.len += copied;
                 self.stopped = copied < chunk;
+                if self.stopped {
+                    self.failure = Some(crate::MemTrap::HostFault);
+                }
                 copied > 0
             }
-            Err(_) => {
+            Err(trap) => {
+                self.failure = Some(trap);
                 self.stopped = true;
                 false
             }
@@ -618,9 +628,19 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
 /// Real16 they are the 16-bit IP the dispatcher writes back into `rip` — never the
 /// physical fetch address.
 pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, LiftError> {
+    lift_block_with_fault(mem, at, mode, &mut None)
+}
+
+pub(crate) fn lift_block_with_fault(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<crate::MemTrap>,
+) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new();
     if !window.refill(mem, at.pa) {
+        *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
     let code = window.code();
@@ -680,6 +700,7 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
             }
             // SDM Vol 3A §7.15, Event 14: CR2 names the unavailable byte,
             // while saved IP stays on the instruction that attempted the fetch.
+            *details = window.failure;
             return Err(LiftError::DecodeFault {
                 addr: at.pa + code.len() as u64,
             });
@@ -740,9 +761,19 @@ pub fn lift_block(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock,
 /// that instruction — trapping out, or consuming a pending MMIO value/ack on resume
 /// — then hands control back to compiled code.
 pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, LiftError> {
+    lift_one_with_fault(mem, at, mode, &mut None)
+}
+
+pub(crate) fn lift_one_with_fault(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<crate::MemTrap>,
+) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<15>::new();
     if !window.refill(mem, at.pa) {
+        *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
     let code = window.code();
@@ -752,6 +783,7 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
     let mut tg = TempGen::new();
     let mut insn = Instruction::default();
     if !decoder.can_decode() {
+        *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
     loop {
@@ -783,6 +815,7 @@ pub fn lift_one(mem: &Memory, at: FetchAddr, mode: CpuMode) -> Result<IrBlock, L
                 icount: 1,
             });
         }
+        *details = window.failure;
         return Err(LiftError::DecodeFault {
             addr: at.pa + code.len() as u64,
         });
@@ -1375,6 +1408,16 @@ pub fn lift_region(
     caps: RegionCaps,
     mode: CpuMode,
 ) -> Result<IrRegion, LiftError> {
+    lift_region_with_fault(mem, entry, caps, mode, &mut None)
+}
+
+pub(crate) fn lift_region_with_fault(
+    mem: &Memory,
+    entry: u64,
+    caps: RegionCaps,
+    mode: CpuMode,
+    details: &mut Option<crate::MemTrap>,
+) -> Result<IrRegion, LiftError> {
     use std::collections::HashMap;
 
     // DFS from the entry, lifting each block once, collecting a post-order.
@@ -1414,7 +1457,7 @@ pub fn lift_region(
         post.push(addr); // finished: post-order
     }
 
-    let first = lift_block(mem, FetchAddr::flat(entry), mode)?;
+    let first = lift_block_with_fault(mem, FetchAddr::flat(entry), mode, details)?;
     let mut descriptors = guest_access_descriptors(&first.ops);
     let mut icount = first.icount;
     let mut blocks = HashMap::from([(entry, first)]);

@@ -165,3 +165,32 @@ The maintainer accepted the recommended resolution of each open question (2026-1
 - **IRET selector failures:** an Unknown-code cause until descriptor support exists.
 
 Revisit this decision when paging/privilege/descriptor enforcement ships, xj-obx.8 changes store semantics, a consumer requires exact REP entry deltas, or fault-path allocation becomes measurably material. Acceptance of this design is followed by implementation and per-class tests; it is not acceptance of fabricated completeness.
+
+
+## Amendment 2026-11-06: raw host fault record
+
+Identity-mapped embedders can map their entire guest span as RWX RAM and keep
+protections only in the host page tables. The flat-map projection cannot observe
+those protections; the synchronous host signal carries the relevant evidence.
+
+`FaultMetadata::raw_host_fault()` optionally exposes a fixed-size `RawHostFault`,
+labelled with its host OS and architecture. Its fields are independently optional:
+trap number, host error code, fault address (CR2/FAR), ESR, signal number, signal
+code and signal address. Linux/FreeBSD x86-64 adapters copy the saved trap/error/
+CR2 fields. AArch64 adapters copy ESR and FAR where exposed; FreeBSD's current
+mcontext exposes neither and retains signal address/code only. The signal address
+is retained separately because it can name a PC for some host fault kinds.
+These are opaque, host-sourced values, **never a confirmed guest #PF code**.
+Neither the architectural-code accessor nor the flat-map projection interprets them.
+
+The additive `classify_with_raw_fault` entry point copies this record into the
+existing per-thread recovery snapshot on a compiled landing, with no allocation.
+The dispatcher attaches it to the exit-owned metadata after returning from the
+handler, including when replay produces the exit. Legacy `classify` leaves it
+absent; transfer fixups do not themselves produce compiled landing metadata.
+There is no successful-access instrumentation or per-run metadata reset.
+The guest linear address and, where reconstructible from the immutable lowered
+address operations, guest operand start remain separate from the host address;
+page-crossing splits can therefore report both addresses. Unavailable guest
+operand reconstruction remains explicitly Unknown. Signal adapters own ABI
+extraction; core retains its dependency boundary and does not install handlers.

@@ -126,7 +126,7 @@ impl Translator<'_, '_> {
                 .ins()
                 .store(MemFlags::trusted(), fuel, self.mem, MEMCTX_FUEL);
         }
-        self.builder.ins().return_(&[code]);
+        self.return_helper_status(code);
         self.builder.switch_to_block(ok);
         self.reload_gprs();
         // The helper changes ZF; a cold recovery recipe must not overwrite it.

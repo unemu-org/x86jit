@@ -9,7 +9,7 @@ pub(crate) fn exec_read_reg(
     temps: &mut [u64],
     dst: &Temp,
     reg: &crate::state::Reg,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     temps[*dst as usize] = read_reg(cpu, *reg);
     None
 }
@@ -21,7 +21,7 @@ pub(crate) fn exec_write_reg(
     reg: &crate::state::Reg,
     src: &Val,
     size: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let v = read_val(*src, &*temps);
     write_reg(cpu, *reg, v, *size);
     None
@@ -36,7 +36,7 @@ pub(crate) fn exec_add(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let r = alu_add(read_val(*a, &*temps), read_val(*b, &*temps), 0, *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
@@ -52,7 +52,7 @@ pub(crate) fn exec_adc(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let c = cpu.flags.cf as u64;
     let r = alu_add(read_val(*a, &*temps), read_val(*b, &*temps), c, *size);
     temps[*dst as usize] = r.res;
@@ -69,7 +69,7 @@ pub(crate) fn exec_sub(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let r = alu_sub(read_val(*a, &*temps), read_val(*b, &*temps), 0, *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
@@ -85,7 +85,7 @@ pub(crate) fn exec_sbb(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let c = cpu.flags.cf as u64;
     let r = alu_sub(read_val(*a, &*temps), read_val(*b, &*temps), c, *size);
     temps[*dst as usize] = r.res;
@@ -102,7 +102,7 @@ pub(crate) fn exec_and(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let r = alu_logic(read_val(*a, &*temps) & read_val(*b, &*temps), *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
@@ -118,7 +118,7 @@ pub(crate) fn exec_or(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let r = alu_logic(read_val(*a, &*temps) | read_val(*b, &*temps), *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
@@ -134,7 +134,7 @@ pub(crate) fn exec_xor(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let r = alu_logic(read_val(*a, &*temps) ^ read_val(*b, &*temps), *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
@@ -150,7 +150,7 @@ pub(crate) fn exec_shl(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let vm = read_val(*a, &*temps) & mask(*size);
     let cnt = read_val(*b, &*temps) & shift_mask(*size);
     let res = vm.wrapping_shl(cnt as u32) & mask(*size);
@@ -177,7 +177,7 @@ pub(crate) fn exec_shr(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let vm = read_val(*a, &*temps) & mask(*size);
     let cnt = read_val(*b, &*temps) & shift_mask(*size);
     let res = vm.wrapping_shr(cnt as u32);
@@ -205,7 +205,7 @@ pub(crate) fn exec_double_shift(
     size: &u8,
     left: &bool,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let n = (*size * 8) as u64;
     let av = read_val(*a, &*temps) & mask(*size);
     let bv = read_val(*b, &*temps) & mask(*size);
@@ -252,7 +252,7 @@ pub(crate) fn exec_sar(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let vm = read_val(*a, &*temps) & mask(*size);
     let cnt = read_val(*b, &*temps) & shift_mask(*size);
     let res = (sign_extend(vm, *size) as i64 >> cnt) as u64 & mask(*size);
@@ -272,13 +272,18 @@ pub(crate) fn exec_sar(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_sext(temps: &mut [u64], dst: &Temp, a: &Val, from: &u8) -> Option<StepResult> {
+pub(crate) fn exec_sext(temps: &mut [u64], dst: &Temp, a: &Val, from: &u8) -> Option<InterpResult> {
     temps[*dst as usize] = sign_extend(read_val(*a, &*temps), *from);
     None
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_bswap(temps: &mut [u64], dst: &Temp, a: &Val, size: &u8) -> Option<StepResult> {
+pub(crate) fn exec_bswap(
+    temps: &mut [u64],
+    dst: &Temp,
+    a: &Val,
+    size: &u8,
+) -> Option<InterpResult> {
     let v = read_val(*a, &*temps);
     // `size` is the operand width: 8/4 for real `bswap`, 2 for a 16-bit `movbe`
     // (which reuses this op). The swap must be over exactly `size` bytes — a 16-bit
@@ -301,7 +306,7 @@ pub(crate) fn exec_rol(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let vm = read_val(*a, &*temps) & mask(*size);
     let cnt = read_val(*b, &*temps) & shift_mask(*size);
     let res = rotl(vm, cnt as u32, *size);
@@ -323,7 +328,7 @@ pub(crate) fn exec_ror(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let vm = read_val(*a, &*temps) & mask(*size);
     let cnt = read_val(*b, &*temps) & shift_mask(*size);
     let res = rotr(vm, cnt as u32, *size);
@@ -346,7 +351,7 @@ pub(crate) fn exec_rcl(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // Rotate left through CF: a (size*8 + 1)-bit rotate including carry-in.
     let vm = read_val(*a, &*temps) & mask(*size);
     let bits = *size as u32 * 8;
@@ -370,7 +375,7 @@ pub(crate) fn exec_rcr(
     b: &Val,
     size: &u8,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // Rotate right through CF (Go's div-by-constant carry fold).
     let vm = read_val(*a, &*temps) & mask(*size);
     let bits = *size as u32 * 8;
@@ -397,7 +402,7 @@ pub(crate) fn exec_mul(
     size: &u8,
     signed: &bool,
     set_flags: &FlagMask,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let m = mask(*size);
     let n = *size * 8;
     let (va, vb) = (read_val(*a, &*temps) & m, read_val(*b, &*temps) & m);
@@ -442,7 +447,7 @@ pub(crate) fn exec_div(
     divisor: &Val,
     size: &u8,
     signed: &bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let hv = read_val(*hi, &*temps);
     let lv = read_val(*lo, &*temps);
     let dv = read_val(*divisor, &*temps);
@@ -454,10 +459,11 @@ pub(crate) fn exec_div(
         // #DE: RIP on the faulting div; nothing committed to registers yet.
         None => {
             cpu.rip = cur_addr;
-            return Some(StepResult::Exit(Exit::Exception {
-                addr: cur_addr,
-                vector: 0,
-            }));
+            return Some(InterpResult::exit(crate::fault::exception_exit(
+                cur_addr,
+                0,
+                crate::FaultCause::Divide,
+            )));
         }
     }
     None
@@ -469,7 +475,7 @@ pub(crate) fn exec_get_cond(
     temps: &mut [u64],
     dst: &Temp,
     cond: &Cond,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     temps[*dst as usize] = eval_cond(*cond, &cpu.flags) as u64;
     None
 }
@@ -483,7 +489,7 @@ pub(crate) fn exec_load<const ROUTED: bool>(
     dst: &Temp,
     addr: &Val,
     size: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let a = read_val(*addr, &*temps);
     // Resume after an MMIO read (§5.2): the block re-executes from the
     // faulting instruction, so this first load consumes the value the
@@ -508,7 +514,7 @@ pub(crate) fn exec_store<const ROUTED: bool>(
     addr: &Val,
     src: &Val,
     size: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let a = read_val(*addr, &*temps);
     let v = read_val(*src, &*temps);
     if let Err(t) = mem.write(a, v, *size) {
@@ -536,7 +542,7 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
     src: &Val,
     size: &u8,
     op: &RmwOp,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let a = read_val(*addr, &*temps);
     let s = read_val(*src, &*temps);
     match mem.atomic_rmw(a, s, *size, *op) {
@@ -557,7 +563,7 @@ pub(crate) fn exec_atomic_cas<const ROUTED: bool>(
     expected: &Val,
     src: &Val,
     size: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let a = read_val(*addr, &*temps);
     let (exp, s) = (read_val(*expected, &*temps), read_val(*src, &*temps));
     match mem.atomic_cas(a, exp, s, *size) {
@@ -576,7 +582,7 @@ pub(crate) fn exec_bt(
     bit: &Val,
     size: &u8,
     op: &BtOp,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let av = read_val(*a, &*temps);
     let b = read_val(*bit, &*temps) & (*size as u64 * 8 - 1);
     cpu.flags.cf = (av >> b) & 1 != 0;
@@ -592,13 +598,13 @@ pub(crate) fn exec_bt(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_cpuid(cpu: &mut CpuState) -> Option<StepResult> {
+pub(crate) fn exec_cpuid(cpu: &mut CpuState) -> Option<InterpResult> {
     cpuid_run(cpu);
     None
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_xgetbv(cpu: &mut CpuState) -> Option<StepResult> {
+pub(crate) fn exec_xgetbv(cpu: &mut CpuState) -> Option<InterpResult> {
     xgetbv_run(cpu);
     None
 }
@@ -610,7 +616,7 @@ pub(crate) fn exec_popcnt(
     dst: &Temp,
     src: &Val,
     size: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let s = read_val(*src, &*temps) & mask(*size);
     temps[*dst as usize] = s.count_ones() as u64;
     cpu.flags.zf = s == 0;
@@ -629,7 +635,7 @@ pub(crate) fn exec_crc32(
     crc: &Val,
     src: &Val,
     bytes: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let c = read_val(*crc, &*temps) as u32;
     let s = read_val(*src, &*temps);
     temps[*dst as usize] = crc32c(c, s, *bytes) as u64;
@@ -645,7 +651,7 @@ pub(crate) fn exec_bmi(
     b: &Val,
     size: &u8,
     op: &BmiOp,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let av = read_val(*a, &*temps);
     let bv = read_val(*b, &*temps);
     let (r, cf) = bmi_result(av, bv, *size, *op);
@@ -669,7 +675,7 @@ pub(crate) fn exec_bit_scan(
     old: &Val,
     size: &u8,
     op: &BitScanOp,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     use crate::ir::BitScanOp::*;
     let bits = *size as u64 * 8;
     let s = read_val(*src, &*temps) & mask(*size);
@@ -715,7 +721,7 @@ pub(crate) fn exec_bit_scan(
 /// does not compare flags — so only the defined flags and the AL/AH/AX result are
 /// pinned. `aam` with a zero base divides by zero and raises `#DE` (a fault: RIP stays
 /// on the instruction, delivered in-guest through the IVT by `step_instruction`).
-pub(crate) fn exec_bcd(cpu: &mut CpuState, cur_addr: u64, kind: &BcdKind) -> Option<StepResult> {
+pub(crate) fn exec_bcd(cpu: &mut CpuState, cur_addr: u64, kind: &BcdKind) -> Option<InterpResult> {
     let al = (cpu.gpr[RAX] & 0xFF) as u8;
     match kind {
         BcdKind::Daa | BcdKind::Das => {
@@ -773,10 +779,11 @@ pub(crate) fn exec_bcd(cpu: &mut CpuState, cur_addr: u64, kind: &BcdKind) -> Opt
             if *base == 0 {
                 // #DE (divide error): RIP on the faulting instruction (80286 fault).
                 cpu.rip = cur_addr;
-                return Some(StepResult::Exit(Exit::Exception {
-                    addr: cur_addr,
-                    vector: 0,
-                }));
+                return Some(InterpResult::exit(crate::fault::exception_exit(
+                    cur_addr,
+                    0,
+                    crate::FaultCause::Divide,
+                )));
             }
             let ah = al / base;
             let new_al = al % base;

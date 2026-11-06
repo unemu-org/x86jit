@@ -187,7 +187,12 @@ impl RawFpMem {
             if ROUTED {
                 crate::memory::record_host_fault(addr);
             }
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
         })?;
         // SAFETY: off checked the complete span; default mode requires host accessibility.
         if !ROUTED {
@@ -199,7 +204,12 @@ impl RawFpMem {
         unsafe { crate::usercopy::copy_in(self.base.add(off), buf) }.map_err(|at| {
             let addr = self.guest_base + (at - self.base as usize) as u64;
             crate::memory::record_host_fault(addr);
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
         })
     }
     #[inline(always)]
@@ -208,7 +218,12 @@ impl RawFpMem {
             if ROUTED {
                 crate::memory::record_host_fault(addr);
             }
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
         })?;
         // SAFETY: off checked the complete span; default mode requires host accessibility.
         if !ROUTED {
@@ -220,7 +235,12 @@ impl RawFpMem {
         unsafe { crate::usercopy::copy_out(self.base.add(off), bytes) }.map_err(|at| {
             let addr = self.guest_base + (at - self.base as usize) as u64;
             crate::memory::record_host_fault(addr);
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
         })
     }
 }

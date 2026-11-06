@@ -58,6 +58,7 @@ struct Entry {
     traps: *const GuestTrapSite,
     traps_len: usize,
     recipe: Option<&'static FrameRecipe>,
+    instructions: &'static [crate::fault::InstructionFaultInfo],
 }
 
 struct Counts {
@@ -206,6 +207,28 @@ impl CodeMap {
         traps: Vec<GuestTrapSite>,
         recipe: Option<FrameRecipe>,
     ) -> Result<(), CodeMapFull> {
+        self.register_with_fault_info(
+            start,
+            code_len,
+            table,
+            guest_rips,
+            traps,
+            recipe,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_with_fault_info(
+        &self,
+        start: usize,
+        code_len: u32,
+        table: Box<[(u32, u32)]>,
+        guest_rips: Box<[u64]>,
+        traps: Vec<GuestTrapSite>,
+        recipe: Option<FrameRecipe>,
+        instructions: Vec<crate::fault::InstructionFaultInfo>,
+    ) -> Result<(), CodeMapFull> {
         assert!(
             table.iter().all(|&(_, i)| (i as usize) < guest_rips.len()),
             "CodeMap RIP index out of bounds"
@@ -231,6 +254,7 @@ impl CodeMap {
             traps: traps.as_ptr(),
             traps_len: traps.len(),
             recipe: recipe.map(|r| &*Box::leak(Box::new(r))),
+            instructions: Box::leak(instructions.into_boxed_slice()),
         };
         std::mem::forget(traps);
         let root = Node::insert(self.root(), entry);
@@ -347,6 +371,42 @@ pub fn register_with_recovery(
     recipe: Option<FrameRecipe>,
 ) -> Result<(), CodeMapFull> {
     CODE_MAP.register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
+}
+
+/// Publish cold per-instruction descriptors with the function and transfer table.
+/// Existing registration APIs publish no descriptors and retain compatibility.
+#[allow(clippy::too_many_arguments)]
+pub fn register_with_fault_info(
+    start: usize,
+    code_len: u32,
+    table: Box<[(u32, u32)]>,
+    guest_rips: Box<[u64]>,
+    traps: Vec<GuestTrapSite>,
+    recipe: Option<FrameRecipe>,
+    instructions: Vec<crate::fault::InstructionFaultInfo>,
+) -> Result<(), CodeMapFull> {
+    CODE_MAP.register_with_fault_info(
+        start,
+        code_len,
+        table,
+        guest_rips,
+        traps,
+        recipe,
+        instructions,
+    )
+}
+
+/// Cold lookup by function/site PC and full-width instruction identity.
+#[doc(hidden)]
+pub fn lookup_fault_info(
+    pc: usize,
+    rip: u64,
+) -> Option<&'static crate::fault::InstructionFaultInfo> {
+    CODE_MAP
+        .find_entry(pc, &mut || {})?
+        .instructions
+        .iter()
+        .find(|i| i.rip == rip)
 }
 
 /// Exact transfer and one-frame unwind recipe, acquired from the immutable map.

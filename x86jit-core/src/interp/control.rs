@@ -11,7 +11,7 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
     temps: &mut [u64],
     cur_addr: u64,
     op: &IrOp,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let IrOp::X87 {
         kind,
         addr,
@@ -29,10 +29,11 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
     // floating-point instruction, not the one that caused it. Vector 16 is #MF.
     if crate::x87::mf_pending_before(cpu, *kind) {
         cpu.rip = cur_addr;
-        return Some(StepResult::Exit(Exit::Exception {
-            addr: cur_addr,
-            vector: 16,
-        }));
+        return Some(InterpResult::exit(crate::fault::exception_exit(
+            cur_addr,
+            16,
+            crate::FaultCause::PendingX87,
+        )));
     }
     // Through `Memory`: RAM region check + SMC `note_write` on stores, so
     // a self-modifying x87 store invalidates like a scalar `Store` (§10).
@@ -44,10 +45,12 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
         };
         // RIP already on the faulting instruction (cur_addr) via InsnStart.
         cpu.rip = cur_addr;
-        return Some(StepResult::Exit(Exit::UnmappedMemory {
-            addr: fault,
+        return Some(InterpResult::exit(crate::fault::fp_exit(
+            cur_addr,
+            fault,
+            crate::x87::mem_operand_bytes(*kind) as u16,
             access,
-        }));
+        )));
     }
     crate::x87::record_x87_instruction(
         cpu,
@@ -67,31 +70,32 @@ pub(crate) fn exec_fx_state<const ROUTED: bool>(
     addr: &Val,
     restore: &bool,
     wide: &bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let a = read_val(*addr, &*temps);
     // Through `Memory` (RAM check + SMC note_write), like the x87 arm.
     if let Some(fault) = crate::x87::exec_fxstate_format(cpu, mem, a, *restore, *wide) {
         cpu.rip = cur_addr;
-        return Some(StepResult::Exit(match fault {
-            crate::x87::FpStateFault::Memory { addr, write } => Exit::UnmappedMemory {
+        return Some(InterpResult::exit(match fault {
+            crate::x87::FpStateFault::Memory { addr, write } => crate::fault::fp_exit(
+                cur_addr,
                 addr,
-                access: if write {
+                512,
+                if write {
                     AccessKind::Write
                 } else {
                     AccessKind::Read
                 },
-            },
-            crate::x87::FpStateFault::GeneralProtection => Exit::Exception {
-                addr: cur_addr,
-                vector: 13,
-            },
+            ),
+            crate::x87::FpStateFault::GeneralProtection => {
+                crate::fault::exception_exit(cur_addr, 13, crate::FaultCause::InvalidMxcsr)
+            }
         }));
     }
     None
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_set_df(cpu: &mut CpuState, value: &bool) -> Option<StepResult> {
+pub(crate) fn exec_set_df(cpu: &mut CpuState, value: &bool) -> Option<InterpResult> {
     cpu.flags.df = *value;
     None
 }
@@ -108,7 +112,7 @@ pub(crate) fn exec_rep_string<const ROUTED: bool>(
     addr_bits: &u8,
     seg_base: &Val,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // Resolve the DS-source segment base (0, or the FS/GS base under an override).
     let seg_base = read_val(*seg_base, temps);
     // Route every element through `Memory` (region check + SMC `note_write`),
@@ -126,7 +130,7 @@ pub(crate) fn exec_rep_string<const ROUTED: bool>(
         0,
         exit_request,
     ) {
-        return Some(StepResult::Exit(match stop {
+        return Some(InterpResult::exit(match stop {
             StringStop::Fault(f) => str_fault_exit(f),
             StringStop::Interrupted => Exit::Interrupted,
         }));
@@ -150,7 +154,7 @@ pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
     ds_base: &Val,
     es_base: &Val,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let ds_base = read_val(*ds_base, temps);
     let es_base = read_val(*es_base, temps);
     if let Some(stop) = string_run_interruptible(
@@ -165,7 +169,7 @@ pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
         es_base,
         exit_request,
     ) {
-        return Some(StepResult::Exit(match stop {
+        return Some(InterpResult::exit(match stop {
             StringStop::Fault(f) => str_fault_exit(f),
             StringStop::Interrupted => Exit::Interrupted,
         }));
@@ -176,7 +180,7 @@ pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
 /// `lahf`: AH = the low byte of the FLAGS image (SF ZF 0 AF 0 PF 1 CF). `to_flags16`
 /// is the same word in every mode below bit 8, and the mask drops IF, so this is
 /// correct for Long64/Compat32 too. The JIT's `emit_lahf` mirrors it.
-pub(crate) fn exec_lahf(cpu: &mut CpuState) -> Option<StepResult> {
+pub(crate) fn exec_lahf(cpu: &mut CpuState) -> Option<InterpResult> {
     let ah = (cpu.flags.to_flags16() & 0xFF) as u64;
     cpu.gpr[RAX] = (cpu.gpr[RAX] & !0xFF00) | (ah << 8);
     None
@@ -184,7 +188,7 @@ pub(crate) fn exec_lahf(cpu: &mut CpuState) -> Option<StepResult> {
 
 /// `sahf`: set SF/ZF/AF/PF/CF from AH bits 7/6/4/2/0. OF, DF and IF are untouched.
 /// Valid in every mode; the JIT's `emit_sahf` mirrors it.
-pub(crate) fn exec_sahf(cpu: &mut CpuState) -> Option<StepResult> {
+pub(crate) fn exec_sahf(cpu: &mut CpuState) -> Option<InterpResult> {
     let ah = (cpu.gpr[RAX] >> 8) as u8;
     cpu.flags.cf = ah & (1 << 0) != 0;
     cpu.flags.set_pf(ah & (1 << 2) != 0);
@@ -202,7 +206,7 @@ pub(crate) fn exec_pusha_real<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let orig_sp = cpu.gpr[RSP] as u16;
     let words = [
         cpu.gpr[RAX] as u16,
@@ -229,7 +233,7 @@ pub(crate) fn exec_popa_real<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // Reverse of `pusha`: DI, SI, BP, [SP slot — read and discarded], BX, DX, CX, AX.
     // `None` marks the saved-SP slot: the word is read (advancing SP) but not written back.
     let order = [
@@ -264,7 +268,7 @@ pub(crate) fn exec_enter_real<const ROUTED: bool>(
     cur_addr: u64,
     alloc: u16,
     level: u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let level = level & 0x1F;
     // PUSH BP.
     if let Err(e) = push16(cpu, mem, cur_addr, cpu.gpr[RBP] as u16) {
@@ -310,9 +314,13 @@ pub(crate) fn exec_enter_real<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_jump(cpu: &mut CpuState, temps: &mut [u64], target: &Val) -> Option<StepResult> {
+pub(crate) fn exec_jump(
+    cpu: &mut CpuState,
+    temps: &mut [u64],
+    target: &Val,
+) -> Option<InterpResult> {
     cpu.rip = read_val(*target, &*temps);
-    Some(StepResult::Continue)
+    Some(InterpResult::Continue)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,13 +329,13 @@ pub(crate) fn exec_branch(
     cond: &Cond,
     taken: &u64,
     fallthrough: &u64,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     cpu.rip = if eval_cond(*cond, &cpu.flags) {
         *taken
     } else {
         *fallthrough
     };
-    Some(StepResult::Continue)
+    Some(InterpResult::Continue)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,7 +348,7 @@ pub(crate) fn exec_call<const ROUTED: bool>(
     return_addr: &u64,
     slot: &u8,
     wrap_sp: &bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let mut sp = cpu.gpr[RSP].wrapping_sub(*slot as u64);
     if *wrap_sp {
         sp &= 0xFFFF_FFFF;
@@ -355,7 +363,7 @@ pub(crate) fn exec_call<const ROUTED: bool>(
     }
     cpu.gpr[RSP] = sp;
     cpu.rip = read_val(*target, &*temps);
-    Some(StepResult::Continue)
+    Some(InterpResult::Continue)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,7 +374,7 @@ pub(crate) fn exec_ret<const ROUTED: bool>(
     slot: &u8,
     pop_extra: &u16,
     wrap_sp: &bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let sp = cpu.gpr[RSP];
     match mem.read(sp, *slot) {
         Ok(ret) => {
@@ -388,7 +396,7 @@ pub(crate) fn exec_ret<const ROUTED: bool>(
             ))
         }
     }
-    Some(StepResult::Continue)
+    Some(InterpResult::Continue)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,7 +404,7 @@ pub(crate) fn exec_syscall(
     cpu: &mut CpuState,
     block_end: u64,
     is_amd64: bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // The AMD64 `syscall` instruction latches RCX <- next-instruction RIP and
     // R11 <- RFLAGS (hardware). The i386 `int 0x80` gate must NOT — its ABI passes
     // args in ECX/… (see `IrOp::Syscall`). The JIT's `emit_syscall` mirrors this.
@@ -407,7 +415,7 @@ pub(crate) fn exec_syscall(
         cpu.gpr[R11] = cpu.rflags() & !(1 << 16);
     }
     cpu.rip = block_end;
-    Some(StepResult::Exit(Exit::Syscall))
+    Some(InterpResult::exit(Exit::Syscall))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,7 +427,7 @@ pub(crate) fn exec_port_io(
     value: &Val,
     size: &u8,
     dir_out: &bool,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let port = read_val(*port, &*temps) as u16;
     let value = read_val(*value, &*temps) & mask(*size);
     // RIP past the instruction (like `Syscall`): the embedder services the
@@ -432,7 +440,7 @@ pub(crate) fn exec_port_io(
         cpu.pending_port_in = Some(*size);
         PortDir::In
     };
-    Some(StepResult::Exit(Exit::PortIo {
+    Some(InterpResult::exit(Exit::PortIo {
         port,
         size: *size,
         dir,
@@ -441,9 +449,9 @@ pub(crate) fn exec_port_io(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_hlt(cpu: &mut CpuState, block_end: u64) -> Option<StepResult> {
+pub(crate) fn exec_hlt(cpu: &mut CpuState, block_end: u64) -> Option<InterpResult> {
     cpu.rip = block_end;
-    Some(StepResult::Exit(Exit::Hlt))
+    Some(InterpResult::exit(Exit::Hlt))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,14 +460,11 @@ pub(crate) fn exec_trap(
     cur_addr: u64,
     vector: &u8,
     advance: &u8,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     // x86 saved-RIP: a fault (advance 0) leaves RIP on the instruction, a
     // trap (advance = length) resumes past it. `addr` mirrors that RIP.
     cpu.rip = cur_addr + *advance as u64;
-    Some(StepResult::Exit(Exit::Exception {
-        addr: cpu.rip,
-        vector: *vector,
-    }))
+    Some(InterpResult::exit(Exit::exception(cpu.rip, *vector)))
 }
 
 // --- real-mode interrupt-flag + IVT delivery (§17.6, sub-seam b) ---
@@ -478,7 +483,7 @@ fn push16<const ROUTED: bool>(
     mem: &Access<ROUTED>,
     cur_addr: u64,
     word: u16,
-) -> Result<(), StepResult> {
+) -> Result<(), InterpResult> {
     let sp = (cpu.gpr[RSP] as u16).wrapping_sub(2);
     let addr = ss_addr(cpu, sp);
     if let Err(t) = mem.write(addr, word as u64, 2) {
@@ -504,7 +509,7 @@ fn pop16<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> Result<u16, StepResult> {
+) -> Result<u16, InterpResult> {
     let sp = cpu.gpr[RSP] as u16;
     let addr = ss_addr(cpu, sp);
     match mem.read(addr, 2) {
@@ -522,7 +527,7 @@ pub(crate) fn exec_pushf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     let image = cpu.flags.to_flags16();
     if let Err(e) = push16(cpu, mem, cur_addr, image) {
         return Some(e);
@@ -536,7 +541,7 @@ pub(crate) fn exec_popf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> Option<StepResult> {
+) -> Option<InterpResult> {
     match pop16(cpu, mem, cur_addr) {
         Ok(image) => {
             cpu.flags.set_flags16(image);
@@ -554,14 +559,14 @@ pub(crate) fn exec_popf_real<const ROUTED: bool>(
 /// popped order on `iret` is IP, CS, FLAGS — matching hardware. A store fault or an
 /// unmapped IVT word traps out (RIP left on the faulting instruction for a retry);
 /// partial SP damage is possible on a mid-push fault, but a mapped stack (the normal
-/// case) never hits it. Ends the block (returns a terminating `StepResult`).
+/// case) never hits it. Ends the block (returns a terminating `InterpResult`).
 pub(crate) fn deliver_interrupt(
     cpu: &mut CpuState,
     mem: &Memory,
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
-) -> StepResult {
+) -> InterpResult {
     if mem.host_fault_recovery() {
         deliver_interrupt_mode(cpu, Access::<true>::new(mem), cur_addr, vector, saved_ip)
     } else {
@@ -575,7 +580,7 @@ fn deliver_interrupt_mode<const ROUTED: bool>(
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
-) -> StepResult {
+) -> InterpResult {
     let flags = cpu.flags.to_flags16();
     // Frame: FLAGS, CS, IP (pushed in that order → highest address is FLAGS).
     if let Err(e) = push16(cpu, mem, cur_addr, flags) {
@@ -601,7 +606,7 @@ fn deliver_interrupt_mode<const ROUTED: bool>(
     };
     cpu.cs = new_cs;
     cpu.rip = new_ip as u64;
-    StepResult::Continue
+    InterpResult::Continue
 }
 
 /// `iret` (16-bit real mode, §17.6): pop IP, CS, FLAGS off SS:SP (16-bit wraps),
@@ -611,7 +616,7 @@ pub(crate) fn exec_iret_real<const ROUTED: bool>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED>,
     cur_addr: u64,
-) -> StepResult {
+) -> InterpResult {
     let ip = match pop16(cpu, mem, cur_addr) {
         Ok(v) => v,
         Err(e) => return e,
@@ -637,7 +642,7 @@ pub(crate) fn exec_iret_real<const ROUTED: bool>(
     cpu.flags.set_flags16(flags);
     cpu.cs = cs;
     cpu.rip = ip as u64;
-    StepResult::Continue
+    InterpResult::Continue
 }
 
 /// `loop`/`loope`/`loopne`/`jcxz` (§17.6): a CX-driven near branch. `loop*` predecrement
@@ -649,7 +654,7 @@ pub(crate) fn exec_loop_cx(
     kind: &LoopKind,
     taken: &u64,
     fallthrough: &u64,
-) -> StepResult {
+) -> InterpResult {
     let take = match kind {
         LoopKind::Jcxz => (cpu.gpr[RCX] as u16) == 0,
         _ => {
@@ -664,17 +669,17 @@ pub(crate) fn exec_loop_cx(
         }
     };
     cpu.rip = if take { *taken } else { *fallthrough };
-    StepResult::Continue
+    InterpResult::Continue
 }
 
 /// Far (inter-segment) `jmp` (§17.6): load CS:IP (both 16-bit-masked). For an `m16:16`
 /// operand the CS/IP `Val`s are `Temp`s the preceding `Load` ops filled; a faulting
 /// load already trapped before this op runs. Ends the block — the dispatcher recomputes
 /// the fetch address from the new CS:IP.
-pub(crate) fn exec_far_jump(cpu: &mut CpuState, temps: &[u64], cs: &Val, ip: &Val) -> StepResult {
+pub(crate) fn exec_far_jump(cpu: &mut CpuState, temps: &[u64], cs: &Val, ip: &Val) -> InterpResult {
     cpu.cs = (read_val(*cs, temps) & 0xFFFF) as u16;
     cpu.rip = read_val(*ip, temps) & 0xFFFF;
-    StepResult::Continue
+    InterpResult::Continue
 }
 
 /// Far `call` (§17.6): push the current CS then the 16-bit return IP onto SS:SP (16-bit
@@ -689,7 +694,7 @@ pub(crate) fn exec_far_call<const ROUTED: bool>(
     cs: &Val,
     ip: &Val,
     ret_ip: &u16,
-) -> StepResult {
+) -> InterpResult {
     let target_cs = (read_val(*cs, temps) & 0xFFFF) as u16;
     let target_ip = read_val(*ip, temps) & 0xFFFF;
     if let Err(e) = push16(cpu, mem, cur_addr, cpu.cs) {
@@ -700,7 +705,7 @@ pub(crate) fn exec_far_call<const ROUTED: bool>(
     }
     cpu.cs = target_cs;
     cpu.rip = target_ip;
-    StepResult::Continue
+    InterpResult::Continue
 }
 
 /// Far `ret` / `retf` (§17.6): pop IP then CS off SS:SP (16-bit wraps), then add
@@ -711,7 +716,7 @@ pub(crate) fn exec_far_ret<const ROUTED: bool>(
     mem: &Access<ROUTED>,
     cur_addr: u64,
     pop_extra: &u16,
-) -> StepResult {
+) -> InterpResult {
     let ip = match pop16(cpu, mem, cur_addr) {
         Ok(v) => v,
         Err(e) => return e,
@@ -726,5 +731,5 @@ pub(crate) fn exec_far_ret<const ROUTED: bool>(
     }
     cpu.cs = cs;
     cpu.rip = ip as u64;
-    StepResult::Continue
+    InterpResult::Continue
 }

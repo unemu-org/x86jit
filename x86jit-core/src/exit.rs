@@ -122,7 +122,12 @@ pub enum Exit {
     /// Fetch continues across adjacent mapped RAM/ROM regions.
     /// Earlier instructions have completed; the incomplete instruction has no effects.
     #[non_exhaustive]
-    UnmappedMemory { addr: u64, access: AccessKind },
+    UnmappedMemory {
+        addr: u64,
+        access: AccessKind,
+        /// Optional owned details; legacy constructors leave this absent.
+        metadata: Option<Box<crate::fault::FaultMetadata>>,
+    },
     /// READ from a Trap region (MMIO). Guest waits; user must call
     /// `complete_mmio_read` before the next `run()`.
     #[non_exhaustive]
@@ -183,7 +188,12 @@ pub enum Exit {
     /// 15 bytes produce #GP (13). Divide errors produce #DE (0)
     /// (SDM Vol 3A §7.15, Events 0/6/13; Vol 2A §2.3.11).
     #[non_exhaustive]
-    Exception { addr: u64, vector: u8 },
+    Exception {
+        addr: u64,
+        vector: u8,
+        /// Optional owned details; legacy constructors leave this absent.
+        metadata: Option<Box<crate::fault::FaultMetadata>>,
+    },
     /// Guest executed a port-I/O instruction (`in`/`out`, §5.2) — the machine
     /// counterpart of MMIO. RIP is already advanced past the instruction (like
     /// `Syscall`), so the embedder services it and re-enters `run()`. For
@@ -222,6 +232,27 @@ pub enum Exit {
 }
 
 impl Exit {
+    /// Details of this owned fault event, if the producer supplied them.
+    pub fn fault_metadata(&self) -> Option<&crate::fault::FaultMetadata> {
+        match self {
+            Self::UnmappedMemory { metadata, .. } | Self::Exception { metadata, .. } => {
+                metadata.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    /// Attach immutable metadata. Only memory and exception exits accept it.
+    /// Allocation occurs here, on the cold fault path, outside signal context.
+    #[must_use]
+    pub fn with_fault_metadata(mut self, details: crate::fault::FaultMetadata) -> Self {
+        if let Self::UnmappedMemory { metadata, .. } | Self::Exception { metadata, .. } = &mut self
+        {
+            *metadata = Some(Box::new(details));
+        }
+        self
+    }
+
     /// Construct an [`Exit::CodeSpaceExhausted`] at a resumable block boundary.
     #[must_use]
     pub const fn code_space_exhausted(addr: u64) -> Self {
@@ -234,7 +265,11 @@ impl Exit {
     /// fields added later receive defaults through this constructor.
     #[must_use]
     pub const fn unmapped_memory(addr: u64, access: AccessKind) -> Self {
-        Self::UnmappedMemory { addr, access }
+        Self::UnmappedMemory {
+            addr,
+            access,
+            metadata: None,
+        }
     }
 
     /// Construct an [`Exit::MmioRead`].
@@ -286,7 +321,11 @@ impl Exit {
     /// The arguments follow the [`Exit::Exception`] field contract.
     #[must_use]
     pub const fn exception(addr: u64, vector: u8) -> Self {
-        Self::Exception { addr, vector }
+        Self::Exception {
+            addr,
+            vector,
+            metadata: None,
+        }
     }
 
     /// Construct an [`Exit::PortIo`].

@@ -331,17 +331,14 @@ pub(crate) fn lift_string(
         }
     };
 
-    // Address size (§17.5): iced encodes it in the implicit RSI/RDI register width —
-    // RSI/RDI (8) = 64-bit, ESI/EDI (4) = 32-bit (a `67h` override in long mode or the
-    // default in Compat32), SI/DI (2) = 16-bit. The `string_run_interruptible` loop masks the
-    // pointer arithmetic and RCX to this width.
-    let idx_reg = match op {
-        StrOp::Stos | StrOp::Scas => insn.memory_base(), // ES:[RDI]-only
-        _ => insn.memory_base(),                         // movs/lods/cmps: DS:[RSI]
-    };
-    let addr_bits: u8 = match idx_reg.size() {
-        2 => 16,
-        4 => 32,
+    // SDM Vol 2B, REP, Description/Operation (pp. 4-563/564): the
+    // address-size attribute selects SI/ESI/RSI, DI/EDI/RDI and CX/ECX/RCX.
+    // iced stores implicit string addressing in OpKind, not memory_base().
+    let addr_bits: u8 = match (insn.op0_kind(), insn.op1_kind()) {
+        (OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI, _)
+        | (_, OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI) => 16,
+        (OpKind::MemorySegESI | OpKind::MemorySegEDI | OpKind::MemoryESEDI, _)
+        | (_, OpKind::MemorySegESI | OpKind::MemorySegEDI | OpKind::MemoryESEDI) => 32,
         _ => 64,
     };
 

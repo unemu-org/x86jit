@@ -469,7 +469,7 @@ fn assemble_stub(avx: bool, avx512: bool) -> Vec<u8> {
 /// Serialized process-wide: the fixed control/guest VAs can host only one run at a
 /// time. The whole body holds a mutex.
 pub fn run_native(input: &VectorInput) -> Option<RunOutcome> {
-    run_native_inner(input, None)
+    run_native_inner(input, None).map(|(outcome, _)| outcome)
 }
 
 /// A guest fault explicitly accepted by the native oracle. All other unexpected
@@ -481,15 +481,38 @@ pub enum NativeFault {
     InvalidOpcode,
     GeneralProtection,
     StackFault,
+    Breakpoint,
+    DebugTrap,
+    X87FloatingPoint,
 }
 
 /// Capture a designated fault's full register file, with RIP at the faulting
 /// instruction (SDM Vol 3A §7.5; AMD APM Vol 2 §8.1.3).
 pub fn run_native_fault(input: &VectorInput, fault: NativeFault) -> Option<RunOutcome> {
+    run_native_inner(input, Some(fault)).map(|(outcome, _)| outcome)
+}
+
+/// Raw exception evidence captured from Linux's x86 ucontext. For exceptions
+/// without a pushed error code REG_ERR is not architectural error-code evidence.
+/// Intel SDM Vol 3A §5.7, §7.13 and §7.15.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeExceptionEvidence {
+    pub vector: u64,
+    pub error_code: u64,
+    pub fault_address: u64,
+}
+
+pub fn run_native_fault_details(
+    input: &VectorInput,
+    fault: NativeFault,
+) -> Option<(RunOutcome, NativeExceptionEvidence)> {
     run_native_inner(input, Some(fault))
 }
 
-fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<RunOutcome> {
+fn run_native_inner(
+    input: &VectorInput,
+    fault: Option<NativeFault>,
+) -> Option<(RunOutcome, NativeExceptionEvidence)> {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -760,6 +783,26 @@ fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<R
                     vector: 12,
                 })
             }
+            Some(NativeFault::Breakpoint) if cap.signal == libc::SIGTRAP && cap.trapno == 3 => {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 3,
+                })
+            }
+            Some(NativeFault::DebugTrap) if cap.signal == libc::SIGTRAP && cap.trapno == 1 => {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 1,
+                })
+            }
+            Some(NativeFault::X87FloatingPoint)
+                if cap.signal == libc::SIGFPE && cap.trapno == 16 =>
+            {
+                Some(ExitKind::Exception {
+                    addr: cap.rip,
+                    vector: 16,
+                })
+            }
             _ => None,
         }
     } else {
@@ -799,7 +842,16 @@ fn run_native_inner(input: &VectorInput, fault: Option<NativeFault>) -> Option<R
     });
 
     // `guard` unmaps every region as it drops here.
-    outcome
+    outcome.map(|outcome| {
+        (
+            outcome,
+            NativeExceptionEvidence {
+                vector: cap.trapno,
+                error_code: cap.error,
+                fault_address: cap.fault_addr,
+            },
+        )
+    })
 }
 
 /// Join the low and high halves of the captured vector register file into one

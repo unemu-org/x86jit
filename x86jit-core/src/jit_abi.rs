@@ -65,6 +65,16 @@ pub const RET_HOST_FAULT: u64 = 11;
 /// An MXCSR write completed. Dispatch selects the successor's FP specialization;
 /// ordinary transfers need no MXCSR load or comparison.
 pub const RET_MXCSR_CHANGED: u64 = 12;
+/// Detailed cold miss: next_entry is instruction RIP, link_slot the transfer base.
+/// Original transfer width is in fault_access bits 24..31. Helper context, if
+/// nonzero, supplies the operand base/width. No chain meaning on this return.
+pub const RET_UNMAPPED_DETAIL: u64 = 13;
+/// Detailed exception: next_entry is reporting RIP, fault_access is FaultCause's
+/// private wire encoding. Legacy RET_EXCEPTION never reads these aliases.
+pub const RET_EXCEPTION_DETAIL: u64 = 14;
+/// Classifier initialized next_entry to exact host PC and link_slot to site intent.
+/// Alignment may have no valid fault_addr; replay must precede address publication.
+pub const RET_HOST_FAULT_DETAIL: u64 = 15;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -415,6 +425,29 @@ impl MemCtx {
         self.helper_operand_size = width;
     }
 
+    /// Preserve a helper's detailed reason without enlarging MemTrap/Result.
+    #[cold]
+    pub fn record_helper_trap(&mut self, trap: crate::MemTrap) {
+        self.fault_access |= match trap {
+            crate::MemTrap::HostFault => 1 << 40,
+            crate::MemTrap::Unmapped => 1 << 41,
+            _ => 0,
+        };
+    }
+
+    /// Consume the FP trait's detailed cold channel immediately after its error.
+    #[cold]
+    pub fn record_fp_failure(&mut self) {
+        if let Some(detail) = crate::fault::take_fp_fault() {
+            self.fault_size = u64::from(detail.size);
+            self.fault_access |= match detail.origin {
+                crate::FaultOrigin::HostAccess => 1 << 40,
+                crate::FaultOrigin::GuestMap => 1 << 41,
+                _ => 0,
+            };
+        }
+    }
+
     /// Consume an RET_UNMAPPED miss. Canonicality is classified only here in
     /// cold Rust; host faults cannot be non-canonical because spans exclude it.
     #[cold]
@@ -438,7 +471,7 @@ impl MemCtx {
                 (self.fault_addr, self.fault_size)
             }
         };
-        crate::memory::unmapped_exit(
+        let mut exit = crate::memory::unmapped_exit(
             cpu.rip,
             base,
             size,
@@ -450,7 +483,205 @@ impl MemCtx {
             } else {
                 AccessKind::Write
             },
+        );
+        if let Exit::UnmappedMemory {
+            metadata: Some(m), ..
+        } = &mut exit
+        {
+            m.origin = crate::FaultOrigin::Unknown;
+            m.transfer_size = crate::Knowledge::Unknown;
+        }
+        exit
+    }
+    /// Decode the tagged cold payload. No out-word aliases are read for legacy tags.
+    #[cold]
+    pub fn detailed_unmapped_exit(
+        &mut self,
+        cpu: &CpuState,
+        mem: &Memory,
+        mode: crate::CpuMode,
+        pc: usize,
+    ) -> Exit {
+        use crate::fault::*;
+        let reporting = self.next_entry;
+        let info = crate::codemap::lookup_fault_info(pc, reporting);
+        let helper = self.helper_operand_size != 0;
+        let operand = (self.helper_operand_addr, self.helper_operand_size);
+        let inline_width = (self.fault_access >> 24) & 0xff;
+        let request = if helper {
+            self.fault_size
+        } else {
+            inline_width
+        };
+        let base = self.link_slot;
+        let mut exit = self.unmapped_exit(cpu, mode);
+        if let Exit::UnmappedMemory {
+            metadata: Some(m), ..
+        }
+        | Exit::Exception {
+            metadata: Some(m), ..
+        } = &mut exit
+        {
+            m.instruction_rip = Knowledge::Known(reporting);
+            m.transfer_access = Knowledge::Known(if self.fault_access & 1 != 0 {
+                FaultAccess::Write
+            } else {
+                FaultAccess::Read
+            });
+            if m.origin == FaultOrigin::Unknown && (!helper || mem.absent_byte(self.fault_addr)) {
+                m.origin = FaultOrigin::GuestMap;
+            }
+            m.transfer_size = if request != 0 {
+                let width = if helper {
+                    request as u16
+                } else {
+                    info.and_then(|i| i.split_transfer_size)
+                        .map_or(request as u16, |piece| piece.min(request as u16))
+                };
+                Knowledge::Known(width)
+            } else {
+                Knowledge::Unknown
+            };
+            if helper {
+                m.operand_base = Knowledge::Known(operand.0);
+                m.operand_size = Knowledge::Known(operand.1 as u16);
+                // A helper can fail containment even when its reported byte is
+                // mapped. Do not promote that ambiguous failure to a host #PF.
+                if !matches!(m.origin, FaultOrigin::GuestException(_)) {
+                    m.origin = if self.fault_access & (1 << 40) != 0 {
+                        FaultOrigin::HostAccess
+                    } else if self.fault_access & (1 << 41) != 0 || mem.absent_byte(self.fault_addr)
+                    {
+                        FaultOrigin::GuestMap
+                    } else {
+                        FaultOrigin::Unknown
+                    };
+                }
+                if info.is_some_and(|i| i.operand_size != Knowledge::Known(operand.1 as u16)) {
+                    m.operand_base = Knowledge::Unknown;
+                }
+            } else if info.is_some_and(|i| i.operand_size == Knowledge::Known(request as u16)) {
+                m.operand_base = Knowledge::Known(base);
+            } else {
+                m.operand_size = Knowledge::Unknown;
+            }
+            if let Knowledge::Known(ref mut address) = m.address {
+                *address = FaultAddress::new(
+                    address.value(),
+                    if m.origin == FaultOrigin::HostAccess || mem.absent_byte(address.value()) {
+                        AddressPrecision::ExactByte
+                    } else {
+                        AddressPrecision::TransferAddress
+                    },
+                    AddressSpace::Linear,
+                );
+            }
+        }
+        crate::fault::finish(exit, info, cpu, mem, mode, true)
+    }
+
+    #[cold]
+    pub fn detailed_exception_exit(
+        &self,
+        cpu: &CpuState,
+        mem: &Memory,
+        mode: crate::CpuMode,
+        pc: usize,
+    ) -> Exit {
+        let reporting = self.next_entry;
+        let m = crate::fault::FaultMetadata::exception(
+            cpu.rip,
+            reporting,
+            self.exception_vector as u8,
+            crate::fault::cause_from_wire(self.fault_access),
+        );
+        let exit = Exit::exception(cpu.rip, self.exception_vector as u8).with_fault_metadata(m);
+        crate::fault::finish(
+            exit,
+            crate::codemap::lookup_fault_info(pc, reporting),
+            cpu,
+            mem,
+            mode,
+            true,
         )
+    }
+
+    #[cold]
+    pub(crate) fn preserve_host_replay(
+        &self,
+        mut exit: Exit,
+        info: Option<&crate::fault::InstructionFaultInfo>,
+        detailed: bool,
+    ) -> Exit {
+        use crate::fault::*;
+        if let Exit::UnmappedMemory {
+            metadata: Some(m), ..
+        }
+        | Exit::Exception {
+            metadata: Some(m), ..
+        } = &mut exit
+        {
+            m.progress.ram = match info {
+                Some(i) if !i.writes || (i.rmw && detailed && self.link_slot & 0xff == 0) => {
+                    MemoryEffects::None
+                }
+                Some(_) => MemoryEffects::PossiblyPartial,
+                None => MemoryEffects::Unknown,
+            };
+            if let Some(i) = info {
+                m.instruction_rip = Knowledge::Known(i.rip);
+                m.instruction_len = i.len;
+                m.operand_size = i.operand_size;
+                if i.rmw {
+                    m.access = Knowledge::Known(FaultAccess::ReadWrite);
+                    if let Some(projection) = &mut m.projection {
+                        if let ErrorCode::Bits { value, known_mask } = projection.code {
+                            projection.code = ErrorCode::bits(value & !2, known_mask & !2);
+                        }
+                    }
+                }
+            }
+            if detailed {
+                m.transfer_size = Knowledge::Known(self.fault_size as u16);
+                m.transfer_access = Knowledge::Known(match self.link_slot & 0xff {
+                    0 => FaultAccess::Read,
+                    1 => FaultAccess::Write,
+                    _ => FaultAccess::ReadWrite,
+                });
+            }
+        }
+        exit
+    }
+
+    /// Call only after a detailed Access landing, never before Alignment replay.
+    #[cold]
+    pub fn detailed_host_exit(&self, cpu: &CpuState, mem: &Memory, mode: crate::CpuMode) -> Exit {
+        use crate::fault::*;
+        let pc = self.next_entry as usize;
+        let info = crate::codemap::lookup_fault_info(pc, cpu.rip);
+        let mut exit = crate::fault::memory_exit(
+            cpu.rip,
+            self.fault_addr,
+            self.fault_size as u16,
+            if self.fault_access & 1 != 0 {
+                AccessKind::Write
+            } else {
+                AccessKind::Read
+            },
+            true,
+            true,
+        );
+        if let Exit::UnmappedMemory {
+            metadata: Some(m), ..
+        } = &mut exit
+        {
+            m.transfer_access = Knowledge::Known(match self.link_slot {
+                0 => FaultAccess::Read,
+                1 => FaultAccess::Write,
+                _ => FaultAccess::ReadWrite,
+            });
+        }
+        crate::fault::finish(exit, info, cpu, mem, mode, true)
     }
 }
 
@@ -519,6 +750,24 @@ pub unsafe fn run_compiled(
         RET_HLT => StepResult::Exit(Exit::Hlt),
         RET_INTERRUPTED => StepResult::Exit(Exit::Interrupted),
         RET_UNMAPPED => StepResult::Exit(ctx.unmapped_exit(cpu, mode)),
+        RET_UNMAPPED_DETAIL => {
+            StepResult::Exit(ctx.detailed_unmapped_exit(cpu, mem, mode, entry.0 as usize))
+        }
+        RET_EXCEPTION_DETAIL => {
+            StepResult::Exit(ctx.detailed_exception_exit(cpu, mem, mode, entry.0 as usize))
+        }
+        RET_HOST_FAULT_DETAIL if ctx.link_slot & 0x100 != 0 => {
+            let info = crate::codemap::lookup_fault_info(ctx.next_entry as usize, cpu.rip);
+            let mut scratch = Vec::new();
+            match crate::interp::step_one(mem, cpu, mode, &mut scratch, &mut Default::default()) {
+                StepResult::Exit(exit) => {
+                    StepResult::Exit(ctx.preserve_host_replay(exit, info, true))
+                }
+                other => other,
+            }
+        }
+        RET_HOST_FAULT => StepResult::Exit(ctx.unmapped_exit(cpu, mode)),
+        RET_HOST_FAULT_DETAIL => StepResult::Exit(ctx.detailed_host_exit(cpu, mem, mode)),
         // An inlined access hit a Trap region (M4-T10): single-step the faulting
         // instruction on the interpreter, which yields the MmioRead/Write exit.
         RET_MMIO_DEFER => {
@@ -531,10 +780,10 @@ pub unsafe fn run_compiled(
         // A compiled block raised a guest exception; the block set the saved RIP
         // (fault: on the instruction; trap: past it) and stored the vector (`#DE`→0,
         // `ud2`→6, `int3`→3, `int1`→1) into `ctx.exception_vector`.
-        RET_EXCEPTION => StepResult::Exit(Exit::Exception {
-            addr: cpu.rip,
-            vector: ctx.exception_vector as u8,
-        }),
+        RET_EXCEPTION => StepResult::Exit(
+            Exit::exception(cpu.rip, ctx.exception_vector as u8)
+                .with_fault_metadata(crate::FaultMetadata::unknown(cpu.rip)),
+        ),
         other => panic!("compiled block returned an invalid ABI code: {other}"),
     }
 }
@@ -613,7 +862,7 @@ mod tests {
             Exit::UnmappedMemory {
                 addr,
                 access: AccessKind::Read
-            } if addr == edge
+            , .. } if addr == edge
         ));
         ctx.fault_size = 14;
         assert!(matches!(
@@ -621,7 +870,7 @@ mod tests {
             Exit::Exception {
                 addr,
                 vector: 13
-            } if addr == cpu.rip
+            , .. } if addr == cpu.rip
         ));
     }
 

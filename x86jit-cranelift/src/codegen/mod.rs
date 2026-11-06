@@ -26,9 +26,9 @@ use x86jit_core::jit_abi::{
     MEMCTX_EXCEPTION_VECTOR, MEMCTX_FAULT_ACCESS, MEMCTX_FAULT_ADDR, MEMCTX_FAULT_SIZE,
     MEMCTX_FUEL, MEMCTX_ICOUNT_PTR, MEMCTX_LINK_SLOT, MEMCTX_MEM_SELF, MEMCTX_NEXT_ENTRY,
     MEMCTX_RET_STACK, MEMCTX_SIZE, MEMCTX_WATCH_BITS_PTR, MEMCTX_WATCH_COUNT_PTR, RETSTACK_ENTRIES,
-    RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_IBTC_MISS,
-    RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_STACK_LEN, RET_SYSCALL,
-    RET_UNMAPPED,
+    RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_EXCEPTION_DETAIL,
+    RET_HLT, RET_IBTC_MISS, RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER,
+    RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
 use x86jit_core::memory::{CODE_PAGE_BITS, CODE_RANGE_BITS};
 use x86jit_core::GuestAccessKind;
@@ -329,6 +329,7 @@ fn translate_block_for_target(
         cur_addr: ir.guest_start,
         stack_access: false,
         access_bytes: 0,
+        exception_cause: x86jit_core::FaultCause::Unknown,
         guest_end: ir.guest_start + ir.guest_len as u64,
         alloc_slot,
         helpers,
@@ -434,6 +435,7 @@ pub fn translate_region(
         cur_addr: region.entry,
         stack_access: false,
         access_bytes: 0,
+        exception_cause: x86jit_core::FaultCause::Unknown,
         guest_end: region.entry,
         alloc_slot,
         helpers,
@@ -590,6 +592,7 @@ struct Translator<'a, 'b> {
     cur_addr: u64,
     stack_access: bool,
     access_bytes: u16,
+    exception_cause: x86jit_core::FaultCause,
     guest_end: u64,
     /// Full-width guest RIPs indexed by this function's SourceLocs.
     guest_rips: Vec<u64>,
@@ -746,6 +749,26 @@ impl Translator<'_, '_> {
     }
 
     fn op_with_flags(&mut self, original: FlagMask, narrowed: &IrOp) -> bool {
+        self.exception_cause = match narrowed {
+            IrOp::Div { .. } => x86jit_core::FaultCause::Divide,
+            IrOp::X87 { .. } => x86jit_core::FaultCause::PendingX87,
+            IrOp::FxState { .. } | IrOp::SetMxcsr { .. } => x86jit_core::FaultCause::InvalidMxcsr,
+            IrOp::AtomicCasPair { .. } => x86jit_core::FaultCause::RequiredAlignment,
+            IrOp::Trap {
+                vector: 6,
+                advance: 0,
+            } => x86jit_core::FaultCause::InvalidOpcode,
+            IrOp::Trap { vector: 3, advance } if *advance != 0 => {
+                x86jit_core::FaultCause::Breakpoint
+            }
+            IrOp::Trap { vector: 1, advance } if *advance != 0 => {
+                x86jit_core::FaultCause::DebugTrap
+            }
+            IrOp::CheckIretNt => x86jit_core::FaultCause::IretNt,
+            IrOp::CheckIret { .. } => x86jit_core::FaultCause::IretSelector,
+            _ => x86jit_core::FaultCause::Unknown,
+        };
+
         self.full_flag_mask = original;
         self.op(narrowed)
     }
@@ -3273,15 +3296,20 @@ impl Translator<'_, '_> {
         // Encode only when the transfer exceeds the carrier. Inline code never
         // writes helper fields; the access immediate has no hot-path cost.
         let carrier = if self.access_bytes != 0 && self.access_bytes < u16::from(size) {
-            (u64::from(self.access_bytes) << 8) | (u64::from(size) << 24)
+            u64::from(self.access_bytes) << 8
         } else {
             0
         };
-        let acc = self.iconst(access | (u64::from(self.stack_access) << 1) | carrier);
+        let acc = self.iconst(
+            access | (u64::from(self.stack_access) << 1) | carrier | (u64::from(size) << 24),
+        );
         self.store_mem(MEMCTX_FAULT_ACCESS, acc);
         let rip = self.iconst(self.cur_addr);
         self.store_cpu(self.offsets.rip, rip);
-        self.ret(RET_UNMAPPED);
+        let base = addr;
+        self.store_mem(MEMCTX_LINK_SLOT, base);
+        self.store_mem(MEMCTX_NEXT_ENTRY, rip);
+        self.ret(RET_UNMAPPED_DETAIL);
 
         self.builder.switch_to_block(ok);
         self.defer_mmio(addr, size);
@@ -3361,7 +3389,12 @@ impl Translator<'_, '_> {
         self.store_cpu(self.offsets.rip, rip);
         let vector = self.iconst(13);
         self.store_mem(MEMCTX_EXCEPTION_VECTOR, vector);
-        self.ret(RET_EXCEPTION);
+        self.store_mem(MEMCTX_NEXT_ENTRY, rip);
+        let cause = self.iconst(x86jit_core::fault::cause_to_wire(
+            x86jit_core::FaultCause::RequiredAlignment,
+        ));
+        self.store_mem(MEMCTX_FAULT_ACCESS, cause);
+        self.ret(RET_EXCEPTION_DETAIL);
     }
 
     // The helper's low 16 bits retain its transfer width. A smaller decoded
@@ -5024,6 +5057,23 @@ impl Translator<'_, '_> {
     }
 
     fn exit(&mut self, code: u64, flush: bool) {
+        let code = if code == RET_EXCEPTION {
+            let reporting = self.iconst(self.cur_addr);
+            self.store_mem(MEMCTX_NEXT_ENTRY, reporting);
+            let cause = self.iconst(x86jit_core::fault::cause_to_wire(self.exception_cause));
+            self.store_mem(MEMCTX_FAULT_ACCESS, cause);
+            RET_EXCEPTION_DETAIL
+        } else if code == RET_UNMAPPED {
+            let reporting = self.iconst(self.cur_addr);
+            self.store_mem(MEMCTX_NEXT_ENTRY, reporting);
+            // Helper records retain the request width; zero means no inline base.
+            let no_base = self.iconst(0);
+            self.store_mem(MEMCTX_LINK_SLOT, no_base);
+            RET_UNMAPPED_DETAIL
+        } else {
+            code
+        };
+
         if self.pending_flags.iter().all(Option::is_none) {
             if flush {
                 self.flush_gprs();
@@ -5080,6 +5130,32 @@ impl Translator<'_, '_> {
             let code = self.builder.block_params(tail.block)[0];
             self.builder.ins().return_(&[code]);
         }
+    }
+
+    // Only called in an existing helper-failure block. Dynamic helper statuses
+    // keep Interrupted/MMIO intact and tag initialized aliases for memory/exception.
+    pub(crate) fn return_helper_status(&mut self, code: Value) {
+        let reporting = self.iconst(self.cur_addr);
+        self.store_mem(MEMCTX_NEXT_ENTRY, reporting);
+        let zero = self.iconst(0);
+        self.store_mem(MEMCTX_LINK_SLOT, zero);
+        let exception = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, code, RET_EXCEPTION as i64);
+        let previous = self.load_mem(MEMCTX_FAULT_ACCESS);
+        let cause = self.iconst(x86jit_core::fault::cause_to_wire(self.exception_cause));
+        let access = self.builder.ins().select(exception, cause, previous);
+        self.store_mem(MEMCTX_FAULT_ACCESS, access);
+        let unmapped = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
+        let mapped_tag = self.iconst(RET_UNMAPPED_DETAIL);
+        let exception_tag = self.iconst(RET_EXCEPTION_DETAIL);
+        let tagged = self.builder.ins().select(unmapped, mapped_tag, code);
+        let tagged = self.builder.ins().select(exception, exception_tag, tagged);
+        self.builder.ins().return_(&[tagged]);
     }
 
     /// Tail shared by the fault-capable helpers (x87 / fxstate / rep-string): `inst`'s

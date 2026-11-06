@@ -5269,6 +5269,14 @@ fn extract_lane_mem_dst_straddle_fault_match_interp() {
         }
         other => panic!("interp expected UnmappedMemory, got {other:?}"),
     }
+    for exit in [&interp_exit, &jit_exit] {
+        let metadata = exit.fault_metadata().unwrap();
+        assert!(
+            matches!(metadata.linear_address(), x86jit_core::Knowledge::Known(address)
+            if address.precision() == x86jit_core::AddressPrecision::ExactByte)
+        );
+        assert_eq!(metadata.transfer_size(), x86jit_core::Knowledge::Known(16));
+    }
     assert_eq!(
         format!("{interp_exit:?}"),
         format!("{jit_exit:?}"),
@@ -5330,6 +5338,14 @@ fn pop_mem_dst_fault_leaves_rsp_unchanged_match_interp() {
             assert_eq!(access, x86jit_core::AccessKind::Write);
         }
         other => panic!("interp expected UnmappedMemory{{Write}}, got {other:?}"),
+    }
+    for exit in [&interp_exit, &jit_exit] {
+        let metadata = exit.fault_metadata().unwrap();
+        assert!(
+            matches!(metadata.linear_address(), x86jit_core::Knowledge::Known(address)
+            if address.precision() == x86jit_core::AddressPrecision::ExactByte)
+        );
+        assert_eq!(metadata.transfer_size(), x86jit_core::Knowledge::Known(8));
     }
     assert_eq!(
         format!("{interp_exit:?}"),

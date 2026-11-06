@@ -385,7 +385,7 @@ mod tests {
         use cranelift::codegen::cursor::{Cursor, FuncCursor};
         use std::sync::atomic::Ordering;
         use x86jit_core::jit_abi::fault::EntryRecord;
-        use x86jit_core::jit_abi::{MemCtx, RET_HOST_FAULT};
+        use x86jit_core::jit_abi::{MemCtx, RET_HOST_FAULT_DETAIL};
         use x86jit_core::{
             CpuMode, CpuState, MemConsistency, MemoryModel, Prot, RegionCaps, RegionKind,
         };
@@ -539,7 +539,7 @@ mod tests {
                         patterns.as_ptr(),
                     );
                     record.deactivate();
-                    assert_eq!(result, RET_HOST_FAULT);
+                    assert_eq!(result, RET_HOST_FAULT_DETAIL);
                 }
                 assert_eq!(out[..register_probe::REGISTER_COUNT], patterns);
                 assert_eq!(signal::FAULTS.load(Ordering::Relaxed), 1);

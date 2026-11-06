@@ -5,6 +5,27 @@
 //! yielding control through [`Exit`] whenever it hits something it does not
 //! handle itself. See `backlog/docs/design/spec.md` for the full design.
 //!
+//! Fault exits optionally own [`FaultMetadata`], queried with
+//! [`Exit::fault_metadata`]. Engine faults retain reporting/saved RIP, available
+//! transfer widths, restart state and cause-specific error-code evidence. Legacy
+//! const constructors leave metadata absent; matches using `..` remain valid.
+//! [`ErrorCode::NoCode`] differs from a known zero code and [`Knowledge::Unknown`]
+//! never means zero. A [`PageFaultProjection`] describes only flat-map facts;
+//! [`FaultMetadata::architectural_error_code`] never accepts it as a complete #PF.
+//! Host protection failures do not establish a guest exception or paging bits.
+//! [`RawHostFault`] retains host-labelled signal/context values independently.
+//! Embedders copy them in their signal adapter and call
+//! [`jit_abi::fault::classify_with_raw_fault`]; compiled landings and transfer
+//! fixups carry them to [`FaultMetadata::raw_host_fault`] on vCPU fault returns,
+//! including helper, interpreter and fetch faults and instruction stepping.
+//! The handler copies only fixed-size records and never allocates.
+//! Its host fault address may differ from the guest [`FaultMetadata::operand_base`]
+//! and [`FaultMetadata::linear_address`] for split or aligned host accesses.
+//! The returned box survives retry, CPU mutation and unmap. It is allocated only
+//! on a fault, after signal recovery; successful execution has no metadata reset
+//! or allocation. REP exposes exact current restart registers, with unknown
+//! per-attempt iteration deltas; split stores may have partial memory effects.
+//!
 //! Module map mirrors the spec's dependency order:
 //! `state` + `memory` -> `ir` -> `lift` -> `interp` -> `cache`/`vm`.
 //!
@@ -41,6 +62,7 @@ pub mod disasm;
 mod environment;
 pub mod exit;
 pub mod f80;
+pub mod fault;
 pub mod features;
 pub mod gfni;
 pub mod interp;
@@ -60,6 +82,11 @@ pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 pub use codemap::{GuestAccessKind, GuestTrapSite};
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{AccessKind, Exit, PortDir, StepResult};
+pub use fault::{
+    AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,
+    FaultMetadata, FaultOrigin, FaultProgress, HostFaultPlatform, Knowledge, MemoryEffects,
+    PageFaultProjection, RawHostFault, RegisterProgress, RepRestart, TransferUnit,
+};
 pub use features::{
     CpuidLeaf, CpuidOutOfRange, CpuidOverride, CpuidOverrides, CpuidRegisters, CpuidTable, Feature,
     GuestCpuFeatures,

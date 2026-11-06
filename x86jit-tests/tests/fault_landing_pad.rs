@@ -207,7 +207,7 @@ fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bo
     asm.jnz(top).unwrap();
     match kind {
         "load" => asm.mov(rax, qword_ptr(rdi)).unwrap(),
-        "store" => asm.mov(qword_ptr(rdi), rax).unwrap(),
+        "store" | "readonly-store" => asm.mov(qword_ptr(rdi), rax).unwrap(),
         "locked" => asm.lock().add(qword_ptr(rdi), 1).unwrap(),
         "vector" => asm.movdqu(xmm0, xmmword_ptr(rdi)).unwrap(),
         _ => unreachable!(),
@@ -259,7 +259,11 @@ fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bo
                 libc::mprotect(
                     (jit.mem.host_base() as *mut u8).add(page * 4).cast(),
                     page,
-                    libc::PROT_NONE
+                    if kind == "readonly-store" {
+                        libc::PROT_READ
+                    } else {
+                        libc::PROT_NONE
+                    }
                 ),
                 0
             );
@@ -287,6 +291,79 @@ fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bo
     assert_eq!(jit.cache.regions() > 0, region);
     assert!(WIDTH.load(Ordering::Relaxed) > 0);
     assert_eq!(actual.reg(Reg::Rip), fault_rip);
+    let details = actual_exit
+        .fault_metadata()
+        .expect("landing lost its metadata");
+    assert_eq!(
+        details.instruction_rip(),
+        x86jit_core::Knowledge::Known(fault_rip)
+    );
+    let instruction = iced_x86::Decoder::with_ip(64, &code, code_addr, 0)
+        .into_iter()
+        .find(|i| i.ip() == fault_rip)
+        .unwrap();
+    assert_eq!(
+        details.instruction_len(),
+        x86jit_core::Knowledge::Known(instruction.len() as u8)
+    );
+    let raw = *details
+        .raw_host_fault()
+        .expect("landing lost raw signal facts");
+    let host_address = jit.mem.host_base() as u64 + guard - base;
+    assert_eq!(raw.fault_address.or(raw.signal_address), Some(host_address));
+    assert!(matches!(raw.signal, Some(libc::SIGSEGV | libc::SIGBUS)));
+    assert!(raw.signal_code.is_some_and(|code| code > 0));
+    assert_eq!(details.architectural_error_code(), None);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        assert_eq!(raw.platform, x86jit_core::HostFaultPlatform::MacOsAarch64);
+        assert!(raw.esr.is_some_and(|esr| esr != 0));
+        assert_eq!(raw.trap_number, None);
+        assert_eq!(raw.error_code, None);
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        assert_eq!(raw.platform, x86jit_core::HostFaultPlatform::LinuxX86_64);
+        assert_eq!(raw.trap_number, Some(14));
+        assert!(raw.error_code.is_some());
+        // SDM Vol 3A §5.7, Figure 5-12: CPU W/R describes the host access.
+        assert_eq!(
+            raw.error_code.unwrap() & 2 != 0,
+            kind.ends_with("store") || kind == "locked"
+        );
+        assert_eq!(raw.esr, None);
+    }
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    {
+        assert_eq!(raw.platform, x86jit_core::HostFaultPlatform::FreeBsdX86_64);
+        assert_eq!(raw.trap_number, Some(12));
+        assert!(raw.error_code.is_some());
+    }
+    if mapped {
+        assert_eq!(details.operand_base(), x86jit_core::Knowledge::Known(addr));
+        assert_eq!(details.origin(), x86jit_core::FaultOrigin::HostAccess);
+        assert_eq!(details.error_code(), x86jit_core::ErrorCode::Unknown);
+        assert_eq!(details.vector(), x86jit_core::Knowledge::Unknown);
+        assert_eq!(details.page_fault_projection(), None);
+        assert_eq!(details.architectural_error_code(), None);
+        assert_eq!(
+            details.transfer_size(),
+            x86jit_core::Knowledge::Known(WIDTH.load(Ordering::Relaxed) as u16)
+        );
+        assert!(
+            matches!(details.linear_address(), x86jit_core::Knowledge::Known(a) if a.value() == guard && a.precision() == x86jit_core::AddressPrecision::ExactByte)
+        );
+    }
+    if kind.ends_with("store") {
+        assert_eq!(
+            details.progress().ram(),
+            x86jit_core::MemoryEffects::PossiblyPartial
+        );
+        assert_eq!(
+            details.progress().had_partial_progress(),
+            x86jit_core::Knowledge::Unknown
+        );
+    }
     if !mapped {
         assert!(
             matches!((&actual_exit, &expected_exit),
@@ -305,7 +382,7 @@ fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bo
     } else {
         assert!(
             matches!(actual_exit, Exit::UnmappedMemory { addr: a, access, .. }
-            if a == guard && access == if kind == "load" { x86jit_core::AccessKind::Read } else { x86jit_core::AccessKind::Write })
+            if a == guard && access == if kind == "load" || kind == "vector" { x86jit_core::AccessKind::Read } else { x86jit_core::AccessKind::Write })
         );
         // SAFETY: restore access to the mapped page before retrying.
         unsafe {
@@ -330,6 +407,10 @@ fn case_mxcsr(kind: &str, region: bool, straddle: bool, mapped: bool, routed: bo
     assert!(matches!(expected.run(&interp, None), Exit::Hlt));
     assert!(matches!(actual.run(&jit, None), Exit::Hlt));
     same_cpu(&actual.cpu, &expected.cpu);
+    assert_eq!(
+        actual_exit.fault_metadata().unwrap().raw_host_fault(),
+        Some(&raw)
+    );
     let mut eb = [0; 32];
     let mut ab = [0; 32];
     for offset in [0usize, 16] {
@@ -615,7 +696,7 @@ fn landing_restores_host_fp_control_and_saved_registers_before_callers_resume() 
                 record.deactivate();
                 assert_eq!(after, before);
                 assert_eq!(observed[..register_probe::REGISTER_COUNT], patterns);
-                assert_eq!(result, x86jit_core::jit_abi::RET_HOST_FAULT);
+                assert_eq!(result, x86jit_core::jit_abi::RET_HOST_FAULT_DETAIL);
                 assert_eq!(cpu.rip, 0x1_0000_1234);
                 assert_eq!(ctx.fault_size, 8);
                 assert_eq!(ctx.fault_access, 0);
@@ -696,7 +777,7 @@ fn landing_restores_every_callee_saved_register_from_a_busy_region() {
                     patterns.as_ptr(),
                 );
                 record.deactivate();
-                assert_eq!(result, x86jit_core::jit_abi::RET_HOST_FAULT);
+                assert_eq!(result, x86jit_core::jit_abi::RET_HOST_FAULT_DETAIL);
             }
             assert_eq!(observed[..register_probe::REGISTER_COUNT], patterns);
             assert_eq!(FAULTS.load(Ordering::Relaxed), 1);
@@ -882,6 +963,346 @@ fn landing_restores_nondefault_guest_mxcsr_mode() {
         for region in [false, true] {
             let status = child(|| case_mxcsr("load", region, false, false, false, mode));
             assert_eq!(status, 0, "mode={mode:x}, region={region}");
+        }
+    }
+}
+
+#[test]
+fn landing_metadata_for_readonly_host_stores() {
+    for region in [false, true] {
+        for routed in [false, true] {
+            let status = child(|| case_mode("readonly-store", region, false, true, routed));
+            assert_eq!(status, 0, "region={region}, routed={routed}");
+        }
+    }
+}
+
+#[test]
+fn raw_host_fault_keeps_guest_operand_and_host_address_on_page_crossing() {
+    for region in [false, true] {
+        for kind in ["load", "store", "vector"] {
+            assert_eq!(
+                child(|| case(kind, region, true, true)),
+                0,
+                "{kind}, region={region}"
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn raw_host_fault_native_linux_x86_context() {
+    // Raw CPU W/R belongs to the host access (SDM Vol 3A §5.7, Figure 5-12).
+    // The common case checks CR2, signal fields, platform and trap number on
+    // actual recovered faults; it never promotes REG_ERR to a guest code.
+    for kind in ["load", "readonly-store"] {
+        assert_eq!(child(|| case(kind, false, false, true)), 0);
+    }
+}
+
+#[test]
+fn raw_host_fault_from_identity_mapped_rwx_ram() {
+    for write in [false, true] {
+        assert_eq!(
+            child(|| {
+                // SAFETY: child exclusively owns the mapping and signal handlers.
+                unsafe {
+                    let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                    let len = page * 2;
+                    let ptr = libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    );
+                    assert_ne!(ptr, libc::MAP_FAILED);
+                    let base = ptr as u64;
+                    let data = base + page as u64;
+                    let mut vm = Vm::with_backend_host_ram(
+                        VmConfig::flat(base + len as u64),
+                        Box::new(JitBackend::new()),
+                        HostRam {
+                            ptr: ptr.cast(),
+                            len,
+                            guest_base: base,
+                            protect: None,
+                            dtor: Box::new(|ptr, len| {
+                                libc::munmap(ptr.cast(), len);
+                            }),
+                        },
+                    )
+                    .unwrap();
+                    vm.map(base, len, Prot::RWX, RegionKind::Ram).unwrap();
+                    vm.write_bytes(
+                        base,
+                        if write {
+                            &[0x48, 0x89, 0x07, 0xf4]
+                        } else {
+                            &[0x48, 0x8b, 0x07, 0xf4]
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        libc::mprotect(
+                            data as *mut _,
+                            page,
+                            if write {
+                                libc::PROT_READ
+                            } else {
+                                libc::PROT_NONE
+                            }
+                        ),
+                        0
+                    );
+                    let mut cpu = vm.new_vcpu();
+                    cpu.set_reg(Reg::Rip, base);
+                    cpu.set_reg(Reg::Rdi, data);
+                    HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+                    install();
+                    let exit = cpu.run(&vm, None);
+                    let m = exit.fault_metadata().unwrap();
+                    let raw = *m.raw_host_fault().unwrap();
+                    assert_eq!(m.origin(), x86jit_core::FaultOrigin::HostAccess);
+                    assert_eq!(raw.fault_address.or(raw.signal_address), Some(data));
+                    assert_eq!(m.operand_base(), x86jit_core::Knowledge::Known(data));
+                    assert!(
+                        matches!(m.linear_address(), x86jit_core::Knowledge::Known(a) if a.value() == data)
+                    );
+                    assert_eq!(m.error_code(), x86jit_core::ErrorCode::Unknown);
+                    assert_eq!(m.architectural_error_code(), None);
+                    assert_eq!(m.page_fault_projection(), None);
+                    assert_eq!(CLASSIFIER_ALLOCS.load(Ordering::Relaxed), 0);
+                    assert_eq!(
+                        libc::mprotect(data as *mut _, page, libc::PROT_READ | libc::PROT_WRITE),
+                        0
+                    );
+                    let success = cpu.run(&vm, None);
+                    assert!(matches!(success, Exit::Hlt));
+                    assert!(success.fault_metadata().is_none());
+                    assert_eq!(exit.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+                }
+            }),
+            0,
+            "write={write}"
+        );
+    }
+}
+
+#[test]
+fn identity_mapped_helpers_keep_raw_fault_in_all_tiers() {
+    let mut results = Vec::new();
+    for tier in 0..4 {
+        for kind in ["x87", "fxsave", "fxrstor", "rep"] {
+            let status = child(|| unsafe {
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                let len = page * 3;
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let base = ptr as u64;
+                let data = base + page as u64;
+                let backend: Box<dyn Backend> = match tier {
+                    0 | 3 => Box::new(InterpreterBackend),
+                    1 => Box::new(JitBackend::new()),
+                    _ => Box::new(JitBackend::with_superblocks(x86jit_core::RegionCaps {
+                        max_blocks: 16,
+                        max_icount: 256,
+                    })),
+                };
+                let mut vm = Vm::with_backend_host_ram(
+                    VmConfig::flat(base + len as u64),
+                    backend,
+                    HostRam {
+                        ptr: ptr.cast(),
+                        len,
+                        guest_base: base,
+                        protect: None,
+                        dtor: Box::new(|ptr, len| {
+                            libc::munmap(ptr.cast(), len);
+                        }),
+                    },
+                )
+                .unwrap();
+                vm.set_tier_up_after(None);
+                vm.mem.set_host_fault_recovery(true);
+                vm.map(base, len, Prot::RWX, RegionKind::Ram).unwrap();
+                let mut bytes = if tier == 2 {
+                    vec![
+                        0x41, 0xb8, 2, 0, 0, 0, 0xeb, 0, 0x41, 0xff, 0xc8, 0x75, 0xfb,
+                    ]
+                } else {
+                    vec![]
+                };
+                bytes.extend_from_slice(match kind {
+                    "x87" => &[0xdd, 0x07, 0xf4][..],
+                    "fxsave" => &[0x0f, 0xae, 0x07, 0xf4][..],
+                    "fxrstor" => &[0x0f, 0xae, 0x0f, 0xf4][..],
+                    _ => &[0xf3, 0xa4, 0xf4][..],
+                });
+                vm.write_bytes(base, &bytes).unwrap();
+                assert_eq!(libc::mprotect(data as *mut _, page, libc::PROT_NONE), 0);
+                let mut cpu = vm.new_vcpu();
+                cpu.set_reg(Reg::Rip, base);
+                cpu.set_reg(Reg::Rdi, data);
+                cpu.set_reg(Reg::Rsi, data);
+                cpu.set_reg(Reg::Rcx, 1);
+                HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+                install();
+                let exit = if tier == 3 {
+                    match cpu.step_instruction(&vm) {
+                        x86jit_core::StepResult::Exit(exit) => exit,
+                        _ => panic!("expected helper fault"),
+                    }
+                } else {
+                    cpu.run(&vm, Some(100))
+                };
+                if tier == 2 {
+                    assert!(vm.cache.regions() > 0);
+                }
+                let m = exit.fault_metadata().unwrap();
+
+                assert_eq!(m.origin(), x86jit_core::FaultOrigin::HostAccess);
+                let raw = *m.raw_host_fault().expect("helper lost raw signal facts");
+                assert_eq!(raw.fault_address.or(raw.signal_address), Some(data));
+                assert!(matches!(raw.signal, Some(libc::SIGSEGV | libc::SIGBUS)));
+                assert!(raw.signal_code.is_some_and(|code| code > 0));
+                assert_eq!(m.architectural_error_code(), None);
+                assert_eq!(CLASSIFIER_ALLOCS.load(Ordering::Relaxed), 0);
+                // Owned evidence survives a successful retry and a subsequent map fault.
+                assert_eq!(
+                    libc::mprotect(data as *mut _, page, libc::PROT_READ | libc::PROT_WRITE),
+                    0
+                );
+                if kind == "fxrstor" {
+                    vm.mem.write(data + 24, 0x1f80, 4).unwrap();
+                }
+                assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+                cpu.set_reg(Reg::Rip, base + if tier == 2 { 13 } else { 0 });
+                cpu.set_reg(Reg::Rdi, base + len as u64);
+                cpu.set_reg(Reg::Rsi, base + len as u64);
+                cpu.set_reg(Reg::Rcx, 1);
+                let later = cpu.run(&vm, Some(100));
+                assert_eq!(later.fault_metadata().unwrap().raw_host_fault(), None);
+                assert_eq!(exit.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+                // A live inactive record accepts fixups without CPU/context pointers.
+                assert_eq!(libc::mprotect(data as *mut _, page, libc::PROT_NONE), 0);
+                HANDLE.store(0, Ordering::Relaxed);
+                assert!(vm.mem.read(data, 8).is_err());
+                HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+                assert!(vm.mem.read(data, 8).is_err());
+                // Legacy classification must overwrite that pending raw evidence
+                // with explicit absence, even at the same protected address.
+                LEGACY_CLASSIFIER.store(true, Ordering::Relaxed);
+                cpu.set_reg(Reg::Rip, base + if tier == 2 { 13 } else { 0 });
+                cpu.set_reg(Reg::Rdi, data);
+                cpu.set_reg(Reg::Rsi, data);
+                cpu.set_reg(Reg::Rcx, 1);
+                let legacy = cpu.run(&vm, Some(100));
+                assert_eq!(
+                    legacy.fault_metadata().unwrap().origin(),
+                    x86jit_core::FaultOrigin::HostAccess
+                );
+                assert_eq!(legacy.fault_metadata().unwrap().raw_host_fault(), None);
+                assert_eq!(exit.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+            });
+            results.push((tier, kind, status));
+        }
+    }
+    eprintln!("helper results: {results:?}");
+    assert!(results.iter().all(|r| r.2 == 0));
+}
+
+#[test]
+fn transfer_fetch_fault_keeps_raw_evidence_in_run_and_step() {
+    for tier in 0..3 {
+        for step in [false, true] {
+            assert_eq!(
+                child(|| {
+                    // SAFETY: mapping, protections and signal handlers belong to this child.
+                    unsafe {
+                        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                        let len = page * 2;
+                        let ptr = libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANON,
+                            -1,
+                            0,
+                        );
+                        assert_ne!(ptr, libc::MAP_FAILED);
+                        let backend: Box<dyn Backend> = match tier {
+                            0 => Box::new(InterpreterBackend),
+                            1 => Box::new(JitBackend::new()),
+                            _ => Box::new(JitBackend::with_superblocks(x86jit_core::RegionCaps {
+                                max_blocks: 16,
+                                max_icount: 256,
+                            })),
+                        };
+                        let mut vm = Vm::with_backend_host_ram(
+                            VmConfig::flat(len as u64),
+                            backend,
+                            HostRam {
+                                ptr: ptr.cast(),
+                                len,
+                                guest_base: 0,
+                                protect: None,
+                                dtor: Box::new(|ptr, len| {
+                                    libc::munmap(ptr.cast(), len);
+                                }),
+                            },
+                        )
+                        .unwrap();
+                        vm.mem.set_host_fault_recovery(true);
+                        vm.map(0, len, Prot::RWX, RegionKind::Ram).unwrap();
+                        let rip = page as u64 - 2;
+                        vm.write_bytes(rip, &[0x48, 0xb8]).unwrap(); // MOV imm64, incomplete before guard.
+                        assert_eq!(
+                            libc::mprotect(
+                                ptr.cast::<u8>().add(page).cast(),
+                                page,
+                                libc::PROT_NONE
+                            ),
+                            0
+                        );
+                        let mut cpu = vm.new_vcpu();
+                        cpu.set_reg(Reg::Rip, rip);
+                        HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+                        install();
+                        let exit = if step {
+                            match cpu.step_instruction(&vm) {
+                                x86jit_core::StepResult::Exit(exit) => exit,
+                                _ => panic!("expected fetch fault"),
+                            }
+                        } else {
+                            cpu.run(&vm, Some(10))
+                        };
+                        let m = exit.fault_metadata().unwrap();
+                        assert_eq!(m.origin(), x86jit_core::FaultOrigin::HostAccess);
+                        assert_eq!(m.instruction_rip(), x86jit_core::Knowledge::Known(rip));
+                        assert!(
+                            matches!(m.linear_address(), x86jit_core::Knowledge::Known(address) if address.value() == page as u64)
+                        );
+                        let raw = m.raw_host_fault().expect("fetch lost raw signal evidence");
+                        assert_eq!(
+                            raw.fault_address.or(raw.signal_address),
+                            Some(ptr as u64 + page as u64)
+                        );
+                        assert_eq!(CLASSIFIER_ALLOCS.load(Ordering::Relaxed), 0);
+                    }
+                }),
+                0,
+                "tier={tier}, step={step}"
+            );
         }
     }
 }

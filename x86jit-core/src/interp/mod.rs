@@ -7,6 +7,8 @@
 //! can map/handle and retry; after `syscall`/`hlt` RIP is PAST the instruction.
 
 mod mmx;
+mod result;
+use result::InterpExit;
 pub mod softfloat;
 
 use crate::exit::{AccessKind, Exit, PortDir, StepResult};
@@ -79,16 +81,29 @@ pub(crate) fn step_one_mode<const ROUTED: bool>(
     // `cs_base + IP`. `FetchAddr::for_mode` forms the physical fetch address while the
     // decoder still resolves against the IP (Long64/Compat32 are flat: pa == ip).
     let at = crate::lift::FetchAddr::for_mode(mode, cpu.rip, cpu.cs);
-    let result = match crate::lift::lift_one(mem, at, mode) {
-        Ok(ir) => return interpret_block_mode::<ROUTED>(&ir, cpu, mem, scratch, info),
+    let mut fetch_failure = None;
+    let result = match crate::lift::lift_one_with_fault(mem, at, mode, &mut fetch_failure) {
+        Ok(ir) => {
+            return match interpret_block_mode::<ROUTED>(&ir, cpu, mem, scratch, info) {
+                StepResult::Exit(exit @ Exit::Exception { .. }) => {
+                    let exit = qualify_lifted_exit(exit, &ir);
+                    StepResult::Exit(if mode == crate::CpuMode::Real16 {
+                        crate::fault::qualify_real16(exit, cpu)
+                    } else {
+                        exit
+                    })
+                }
+                StepResult::Exit(exit) if mode == crate::CpuMode::Real16 => {
+                    StepResult::Exit(crate::fault::qualify_real16(exit, cpu))
+                }
+                other => other,
+            }
+        }
         Err(crate::lift::LiftError::Unsupported { addr, bytes, len }) => {
             StepResult::Exit(Exit::UnknownInstruction { addr, bytes, len })
         }
         Err(crate::lift::LiftError::DecodeFault { addr }) => {
-            StepResult::Exit(Exit::UnmappedMemory {
-                addr,
-                access: AccessKind::Execute,
-            })
+            StepResult::Exit(crate::fault::fetch_exit(mem, at, mode, addr, fetch_failure))
         }
     };
     if let StepResult::Exit(exit) = &result {
@@ -112,29 +127,72 @@ pub fn interpret_block(
     }
 }
 
+// A private carrier suppresses implicit Drop guards in the successful op walk.
+// Every Exit is explicitly transferred to the public result on the cold return;
+// no metadata owner is stored or cleared at instruction/iteration entry.
+pub(crate) enum InterpResult {
+    Continue,
+    Exit(InterpExit),
+}
+impl InterpResult {
+    #[inline(always)]
+    fn exit(exit: Exit) -> Self {
+        Self::Exit(InterpExit::from_exit(exit))
+    }
+    pub(crate) fn into_step(self) -> StepResult {
+        match self {
+            Self::Continue => StepResult::Continue,
+            Self::Exit(exit) => StepResult::Exit(exit.into_exit()),
+        }
+    }
+}
+
 // Mode writes carry a distinct internal completion tag, so the dispatcher need
 // not reload MXCSR after ordinary interpreted blocks. The public result is unchanged.
 #[repr(u8)]
 pub(crate) enum BlockResult {
     Continue,
     ModeChange,
-    Exit(Exit),
+    Exit(InterpExit),
 }
 
-impl From<StepResult> for BlockResult {
-    fn from(result: StepResult) -> Self {
+// A fault tag contains no payload: the producer already initialized the cold
+// owned record. This keeps even argument copies out of the successful op walk.
+enum WalkResult {
+    Continue,
+    ModeChange,
+    Exit(InterpExit),
+    Fault,
+}
+impl From<InterpResult> for WalkResult {
+    #[inline(always)]
+    fn from(result: InterpResult) -> Self {
         match result {
-            StepResult::Continue => Self::Continue,
-            StepResult::Exit(exit) => Self::Exit(exit),
+            InterpResult::Continue => Self::Continue,
+            InterpResult::Exit(
+                InterpExit::DetailedUnmapped { .. } | InterpExit::DetailedException { .. },
+            ) => Self::Fault,
+            InterpResult::Exit(exit) => Self::Exit(exit),
         }
+    }
+}
+impl WalkResult {
+    #[inline(always)]
+    fn exit(exit: Exit) -> Self {
+        InterpResult::exit(exit).into()
     }
 }
 
 impl BlockResult {
+    #[inline(always)]
+    fn exit(exit: Exit) -> Self {
+        Self::Exit(InterpExit::from_exit(exit))
+    }
+
     fn into_step(self) -> StepResult {
         match self {
             Self::Continue | Self::ModeChange => StepResult::Continue,
-            Self::Exit(exit) => StepResult::Exit(exit),
+            Self::Exit(exit) => StepResult::Exit(exit.into_exit()),
         }
     }
 }
@@ -223,6 +281,17 @@ fn interpret_block_inner<const RETRY: bool, const ROUTED: bool, const DEFAULT: b
         info.trace,
     );
 
+    let result = match result {
+        WalkResult::Continue => BlockResult::Continue,
+        WalkResult::ModeChange => BlockResult::ModeChange,
+        WalkResult::Exit(exit) => BlockResult::Exit(exit),
+        WalkResult::Fault => {
+            let exit =
+                result::consume_current().expect("fault return must initialize its cold record");
+            BlockResult::exit(finish_fault(exit, ir, cur_addr, cpu, mem))
+        }
+    };
+
     // Final-instruction retirement (§17.6, sub-seam c): the last started instruction
     // retired iff RIP moved off it. A memory trap leaves RIP == cur_addr (not retired —
     // it retries and is counted once then); a clean terminator or block fall-through
@@ -232,25 +301,69 @@ fn interpret_block_inner<const RETRY: bool, const ROUTED: bool, const DEFAULT: b
     if started && cpu.rip != cur_addr {
         retired += 1;
     }
-    // MMIO can activate a retry only on exit, so the ordinary block walk needs
-    // no dynamic retry-state checks. An active retry can also survive a RAM fault.
-    if RETRY
+    // Retry cleanup already inspects results only on this existing cold route.
+    let result = if RETRY
         || matches!(
-            result,
-            BlockResult::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. })
-        )
-    {
-        cpu.finish_mmio_retry(match &result {
-            BlockResult::Exit(exit) => Some(exit),
-            BlockResult::Continue | BlockResult::ModeChange => None,
-        });
-    }
+            &result,
+            BlockResult::Exit(InterpExit::MmioRead { .. } | InterpExit::MmioWrite { .. })
+        ) {
+        match result {
+            BlockResult::Exit(exit) => {
+                let exit = exit.into_exit();
+                cpu.finish_mmio_retry(Some(&exit));
+                BlockResult::exit(exit)
+            }
+            other => {
+                cpu.finish_mmio_retry(None);
+                other
+            }
+        }
+    } else {
+        result
+    };
     info.retired = retired;
     // Report the STI shadow only when the last retiring instruction was `sti`. If that
     // `sti` did NOT retire (a self-trap is impossible for `sti`, but guard anyway), the
     // shadow is irrelevant.
     info.sti_shadow = sti_shadow && started && cpu.rip != cur_addr;
     result
+}
+
+#[cold]
+#[inline(never)]
+fn finish_fault(exit: Exit, ir: &IrBlock, rip: u64, cpu: &CpuState, mem: &Memory) -> Exit {
+    if !matches!(exit, Exit::Exception { .. } | Exit::UnmappedMemory { .. }) {
+        return exit;
+    }
+    let start = ir
+        .ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == rip))
+        .unwrap_or(0);
+    let end = ir.ops[start + 1..]
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { .. }))
+        .map_or(ir.ops.len(), |i| start + 1 + i);
+    let next = match ir.ops.get(end) {
+        Some(IrOp::InsnStart { guest_addr }) => Some(*guest_addr),
+        _ => ir.guest_start.checked_add(u64::from(ir.guest_len)),
+    };
+    let info = crate::fault::InstructionFaultInfo::from_ops(rip, next, &ir.ops[start..end]);
+    // Per-access classification retained Long64/SS evidence. The VM/step caller
+    // qualifies Real16 physical addresses with its explicit decode mode.
+    let mode = crate::CpuMode::Long64;
+    crate::fault::finish(exit, Some(&info), cpu, mem, mode, false)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
+    let rip = match exit.fault_metadata().map(|m| m.instruction_rip()) {
+        Some(crate::Knowledge::Known(rip)) => rip,
+        _ => return exit,
+    };
+    let infos = crate::fault::InstructionFaultInfo::for_block(ir);
+    crate::fault::qualify_lifted(exit, infos.iter().find(|i| i.rip == rip))
 }
 
 /// The per-op interpreter walk. Every early `return` here exits `walk_ops`; the caller
@@ -268,7 +381,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
     sti_shadow: &mut bool,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
     trace: Option<&crate::lockstep::Trace>,
-) -> BlockResult {
+) -> WalkResult {
     let mut bracket = crate::lockstep::begin_with_trace(trace);
     let mut entry_flags = cpu.flags;
     for op in &ir.ops {
@@ -596,7 +709,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
             } => {
                 if let Some(r) = exec_load(cpu, mem, temps, *cur_addr, dst, addr, size) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::Store {
@@ -612,7 +725,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let result = cpu.flags;
                 cpu.flags = entry_flags;
                 if let Some(r) = exec_store(cpu, mem, temps, *cur_addr, addr, src, size) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
                 cpu.flags = result;
             }
@@ -627,7 +740,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_atomic_rmw(cpu, mem, temps, *cur_addr, old, addr, src, size, op)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::AtomicCas {
@@ -641,7 +754,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_atomic_cas(cpu, mem, temps, *cur_addr, old, addr, expected, src, size)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::AtomicCasPair {
@@ -652,7 +765,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             } => {
                 let addr = read_val(*addr, temps);
                 if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
-                    return classify_access(StepResult::Exit(exit), *cur_addr, addr, *fault).into();
+                    return walk_classify_access(InterpResult::exit(exit), *cur_addr, addr, *fault);
                 }
             }
             IrOp::Bt {
@@ -687,7 +800,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             }
             IrOp::X87 { fault, addr, .. } => {
                 if let Some(r) = exec_x87(cpu, mem, temps, *cur_addr, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::GetMxcsr { dst } => temps[*dst as usize] = cpu.mxcsr as u64,
@@ -695,14 +808,16 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let mxcsr = read_val(*src, temps) as u32;
                 if mxcsr & !crate::state::MXCSR_MASK != 0 {
                     cpu.rip = *cur_addr;
-                    return BlockResult::Exit(Exit::Exception {
-                        addr: *cur_addr,
-                        vector: 13,
-                    });
+                    return InterpResult::exit(crate::fault::exception_exit(
+                        *cur_addr,
+                        13,
+                        crate::FaultCause::InvalidMxcsr,
+                    ))
+                    .into();
                 }
                 cpu.mxcsr = mxcsr;
                 cpu.rip = block_end(ir);
-                return BlockResult::ModeChange;
+                return WalkResult::ModeChange;
             }
             IrOp::FxState {
                 fault,
@@ -711,11 +826,11 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 wide,
             } => {
                 if let Some(r) = exec_fx_state(cpu, mem, temps, *cur_addr, addr, restore, wide) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
                 if *restore {
                     cpu.rip = block_end(ir);
-                    return BlockResult::ModeChange;
+                    return WalkResult::ModeChange;
                 }
             }
             IrOp::Popcnt { dst, src, size } => {
@@ -762,7 +877,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
             } => {
                 if let Some(r) = exec_v_load(cpu, mem, temps, *cur_addr, dst, addr, size) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VStore {
@@ -772,7 +887,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
             } => {
                 if let Some(r) = exec_v_store(cpu, mem, temps, *cur_addr, addr, src, size) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VMov { dst, src } => {
@@ -791,7 +906,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 bytes,
             } => {
                 if let Some(r) = exec_v_load_wide(cpu, mem, temps, *cur_addr, dst, addr, bytes) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VStoreWide {
@@ -801,7 +916,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 bytes,
             } => {
                 if let Some(r) = exec_v_store_wide(cpu, mem, temps, *cur_addr, addr, src, bytes) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VMovWide { dst, src, bytes } => {
@@ -833,15 +948,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_mask_load_mem(
                     cpu, mem, temps, *cur_addr, dst, addr, k, elem, zeroing, bytes,
                 ) {
-                    return classify_masked_access(
+                    return walk_classify_masked_access(
                         r,
                         *cur_addr,
                         read_val(*addr, temps),
                         *fault,
                         *elem,
                         fault_k_mask(cpu, *k),
-                    )
-                    .into();
+                    );
                 }
             }
             IrOp::VMaskStoreMem {
@@ -855,15 +969,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_mask_store_mem(cpu, mem, temps, *cur_addr, src, addr, k, elem, bytes)
                 {
-                    return classify_masked_access(
+                    return walk_classify_masked_access(
                         r,
                         *cur_addr,
                         read_val(*addr, temps),
                         *fault,
                         *elem,
                         fault_k_mask(cpu, *k),
-                    )
-                    .into();
+                    );
                 }
             }
             IrOp::VVecMaskLoadMem {
@@ -877,15 +990,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_vecmask_load_mem(
                     cpu, mem, temps, *cur_addr, dst, addr, mask, elem, bytes,
                 ) {
-                    return classify_masked_access(
+                    return walk_classify_masked_access(
                         r,
                         *cur_addr,
                         read_val(*addr, temps),
                         *fault,
                         *elem,
                         fault_vec_mask(cpu, *mask, *elem, *bytes),
-                    )
-                    .into();
+                    );
                 }
             }
             IrOp::VVecMaskStoreMem {
@@ -899,15 +1011,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_vecmask_store_mem(
                     cpu, mem, temps, *cur_addr, src, addr, mask, elem, bytes,
                 ) {
-                    return classify_masked_access(
+                    return walk_classify_masked_access(
                         r,
                         *cur_addr,
                         read_val(*addr, temps),
                         *fault,
                         *elem,
                         fault_vec_mask(cpu, *mask, *elem, *bytes),
-                    )
-                    .into();
+                    );
                 }
             }
             IrOp::VLogic256 { dst, a, b, op } => {
@@ -937,7 +1048,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_logic_wide_m(cpu, mem, temps, *cur_addr, dst, a, addr, op, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPopcnt {
@@ -959,7 +1070,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             } => {
                 if let Some(r) = exec_v_popcnt_m(cpu, mem, temps, *cur_addr, dst, addr, lane, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPMovExtend {
@@ -984,7 +1095,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_p_mov_extend_m(cpu, mem, temps, *cur_addr, dst, addr, from, to, signed)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPMovExtendWide {
@@ -1086,7 +1197,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 lane,
             } => {
                 if let Some(r) = exec_v_p_blend_v_m(cpu, mem, temps, *cur_addr, dst, addr, lane) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPBlendVX {
@@ -1113,7 +1224,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_p_blend_v_xm(cpu, mem, temps, *cur_addr, dst, a, addr, mask, lane, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VBlendI {
@@ -1140,7 +1251,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_blend_i_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm, lane, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPRound {
@@ -1170,7 +1281,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_p_round_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, addr, prec, mode, scalar, bytes,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VMaskedLogic {
@@ -1234,7 +1345,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_extract_lane_wide_m(
                     cpu, mem, temps, *cur_addr, src, addr, idx, num_lanes,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPcmpStr {
@@ -1257,7 +1368,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_pcmp_str_m(cpu, mem, temps, *cur_addr, a, addr, imm, explicit)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPcmpStrMask {
@@ -1280,7 +1391,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_pcmp_str_mask_m(cpu, mem, temps, *cur_addr, a, addr, imm, explicit)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VInsertPs { dst, src, imm } => {
@@ -1295,7 +1406,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 imm,
             } => {
                 if let Some(r) = exec_v_insert_ps_m(cpu, mem, temps, *cur_addr, dst, addr, imm) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VInsertPs3 { dst, a, src, imm } => {
@@ -1312,7 +1423,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             } => {
                 if let Some(r) = exec_v_insert_ps_m3(cpu, mem, temps, *cur_addr, dst, a, addr, imm)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VDpps {
@@ -1337,7 +1448,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_dpps_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, imm, bytes,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VDppd { dst, b, imm } => {
@@ -1354,7 +1465,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_dppd_m::<DEFAULT, ROUTED>(cpu, mem, temps, *cur_addr, dst, addr, imm)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VDp3 {
@@ -1379,7 +1490,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_dp3_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, imm, prec,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAlign {
@@ -1416,7 +1527,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_p_ternlog_m(cpu, mem, temps, *cur_addr, dst, b, addr, imm, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VLogic256M {
@@ -1427,7 +1538,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 op,
             } => {
                 if let Some(r) = exec_v_logic256_m(cpu, mem, temps, *cur_addr, dst, a, addr, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedBin256 {
@@ -1452,7 +1563,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_packed_bin256_m(cpu, mem, temps, *cur_addr, dst, a, addr, lane, op)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedWide {
@@ -1479,7 +1590,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_packed_wide_m(cpu, mem, temps, *cur_addr, dst, a, addr, lane, op, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VMoveMaskB256 { dst, src } => {
@@ -1523,7 +1634,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_packed_bin_m(cpu, mem, temps, *cur_addr, dst, addr, lane, op)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VLogicM {
@@ -1533,7 +1644,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 op,
             } => {
                 if let Some(r) = exec_v_logic_m(cpu, mem, temps, *cur_addr, dst, addr, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedShift {
@@ -1624,17 +1735,16 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     if *k != 0
                         && matches!(crate::ir::GfniOp::from_u8(*mode), crate::ir::GfniOp::Mulb)
                     {
-                        return classify_masked_access(
+                        return walk_classify_masked_access(
                             r,
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                             1,
                             fault_k_mask(cpu, *k),
-                        )
-                        .into();
+                        );
                     }
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VByteShift {
@@ -1664,13 +1774,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                         )
-                        .into()
                     }
                 };
                 cpu.xmm[*dst as usize] = shuffle16_128(bv, *imm, *high);
@@ -1689,13 +1798,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload(cpu, mem, *cur_addr, ea, 16) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 16),
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let count = (bv as u64).min(u64::from(*elem) * 8) as u8;
@@ -1721,13 +1829,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -1755,13 +1862,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                         )
-                        .into()
                     }
                 };
                 blend_w_value(cpu, *dst, cpu.vec_lanes(*a as usize), bv, *imm, *bytes);
@@ -1778,13 +1884,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -1858,17 +1963,16 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     neg_prod, neg_add, bytes, alt_sign, writemask, zeroing,
                 ) {
                     if let Some(k) = writemask {
-                        return classify_masked_access(
+                        return walk_classify_masked_access(
                             r,
                             *cur_addr,
                             read_val(*addr, temps),
                             *fault,
                             prec.bytes(),
                             fault_k_mask(cpu, *k),
-                        )
-                        .into();
+                        );
                     }
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackWide {
@@ -1896,13 +2000,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -1942,7 +2045,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 high,
             } => {
                 if let Some(r) = exec_v_load_half(cpu, mem, temps, *cur_addr, dst, addr, high) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VStoreHalf {
@@ -1952,7 +2055,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 high,
             } => {
                 if let Some(r) = exec_v_store_half(cpu, mem, temps, *cur_addr, addr, src, high) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VExtractW { dst, src, index } => {
@@ -2005,7 +2108,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_broadcast_m(cpu, mem, temps, *cur_addr, dst, addr, elem, w256)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VBroadcastGpr {
@@ -2056,7 +2159,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                             *dst_width,
                             fault_k_mask(cpu, *k),
                         );
-                        return classify_access(
+                        return walk_classify_access(
                             r,
                             *cur_addr,
                             operand,
@@ -2065,10 +2168,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                                 fault.long64(),
                                 fault.stack(),
                             ),
-                        )
-                        .into();
+                        );
                     }
-                    return classify_access(r, *cur_addr, base, *fault).into();
+                    return walk_classify_access(r, *cur_addr, base, *fault);
                 }
             }
             IrOp::VPCmpToMask {
@@ -2101,7 +2203,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_p_cmp_to_mask_m(
                     cpu, mem, temps, *cur_addr, k, a, addr, elem, width, pred, signed, writemask,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPTestToMask {
@@ -2130,7 +2232,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_p_test_to_mask_m(
                     cpu, mem, temps, *cur_addr, k, a, addr, elem, width, neg, writemask,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VKOrTest { a, b, width } => {
@@ -2211,7 +2313,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_pmov_narrow_mem(
                     cpu, mem, temps, *cur_addr, src, addr, from, to, src_width,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPermT2 {
@@ -2245,7 +2347,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     cpu, mem, temps, *cur_addr, dst, idx, addr, elem, writemask, zeroing, bytes,
                     imode,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPerm1 {
@@ -2274,7 +2376,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_perm1_m(
                     cpu, mem, temps, *cur_addr, dst, idx, addr, elem, bytes, writemask, zeroing,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VInsert128 { dst, src, ins, hi } => {
@@ -2291,7 +2393,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             } => {
                 if let Some(r) = exec_v_insert128_m(cpu, mem, temps, *cur_addr, dst, src, addr, hi)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VExtract128 { dst, src, hi } => {
@@ -2323,7 +2425,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 addr,
             } => {
                 if let Some(r) = exec_v_pshufb256_m(cpu, mem, temps, *cur_addr, dst, a, addr) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedShift256 {
@@ -2396,7 +2498,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             }
             IrOp::VPshufbM { fault, dst, addr } => {
                 if let Some(r) = exec_v_pshufb_m(cpu, mem, temps, *cur_addr, dst, addr) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAlignr { dst, a, src, imm } => {
@@ -2416,13 +2518,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -2449,7 +2550,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 op,
             } => {
                 if let Some(r) = exec_v_aes_m(cpu, mem, temps, *cur_addr, dst, a, addr, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAesImc { dst, src } => {
@@ -2459,7 +2560,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             }
             IrOp::VAesImcM { fault, dst, addr } => {
                 if let Some(r) = exec_v_aes_imc_m(cpu, mem, temps, *cur_addr, dst, addr) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAesKeygen { dst, src, imm } => {
@@ -2474,7 +2575,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 imm,
             } => {
                 if let Some(r) = exec_v_aes_keygen_m(cpu, mem, temps, *cur_addr, dst, addr, imm) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VSha { dst, a, b, imm, op } => {
@@ -2491,7 +2592,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 op,
             } => {
                 if let Some(r) = exec_v_sha_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VGfni { dst, a, b, imm, op } => {
@@ -2508,7 +2609,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 op,
             } => {
                 if let Some(r) = exec_v_gfni_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm, op) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::Movq2dq { dst, src_mm } => exec_movq2dq(cpu, *dst, *src_mm),
@@ -2526,7 +2627,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 imm,
             } => {
                 if let Some(r) = exec_v_pclmul_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPsign {
@@ -2551,7 +2652,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_psign_m(cpu, mem, temps, *cur_addr, dst, a, addr, lane, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VShufps { dst, a, b, imm } => {
@@ -2567,7 +2668,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 imm,
             } => {
                 if let Some(r) = exec_v_shufps_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VShuffle16 {
@@ -2603,7 +2704,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_unpack_low_m(cpu, mem, temps, *cur_addr, dst, a, addr, lane, high)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackUsWB { dst, a, b } => {
@@ -2634,7 +2735,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_pmadd_m(cpu, mem, temps, *cur_addr, dst, a, addr, ubsw, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::SetDf { value } => {
@@ -2662,7 +2763,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     seg_base,
                     exit_request,
                 ) {
-                    return classify_string_access(r, *cur_addr, *fault).into();
+                    return walk_classify_string_access(r, *cur_addr, *fault);
                 }
             }
             IrOp::VInsertW { dst, src, index } => {
@@ -2709,7 +2810,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_bin_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, addr, op, prec, scalar,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VHFloat {
@@ -2736,7 +2837,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_h_float_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, op, prec, bytes,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VHInt {
@@ -2760,7 +2861,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             } => {
                 if let Some(r) = exec_v_h_int_m(cpu, mem, temps, *cur_addr, dst, a, addr, op, bytes)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VFloatCmpMask {
@@ -2788,7 +2889,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_cmp_mask_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, addr, prec, scalar, pred,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VFloatCmpMask256 {
@@ -2813,7 +2914,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_cmp_mask256_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, prec, pred,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VFloatCmp { a, b, prec } => {
@@ -2880,7 +2981,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_bin256_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, op, prec,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VFloatUnary256 { dst, src, op, prec } => {
@@ -2898,7 +2999,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_unary256_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, addr, op, prec,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedCvt256 { dst, src, kind } => {
@@ -2915,7 +3016,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_packed_cvt256_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, addr, kind,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VPackedCvtWide256 { dst, src, kind } => {
@@ -2945,7 +3046,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_shufps256_m(cpu, mem, temps, *cur_addr, dst, a, addr, imm_lo, imm_hi)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VUnpack256 {
@@ -2970,7 +3071,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) =
                     exec_v_unpack256_m(cpu, mem, temps, *cur_addr, dst, a, addr, lane, high)
                 {
-                    return classify_access(r, *cur_addr, read_val(*addr, temps), *fault).into();
+                    return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VCvtPh2Ps { dst, src, lanes } => {
@@ -2990,13 +3091,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*src as usize);
@@ -3017,13 +3117,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, 32) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, 32),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -3045,13 +3144,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 let bv = match vload_lanes(cpu, mem, *cur_addr, ea, *bytes) {
                     Ok(v) => v,
                     Err(f) => {
-                        return classify_access(
+                        return walk_classify_access(
                             vec_trap_out(cpu, *cur_addr, f, AccessKind::Read, ea, *bytes),
                             *cur_addr,
                             ea,
                             *fault,
                         )
-                        .into()
                     }
                 };
                 let av = cpu.vec_lanes(*a as usize);
@@ -3098,23 +3196,21 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                         } else {
                             t.fault_addr(at)
                         };
-                        return classify_access(
+                        return walk_classify_access(
                             trap_out(cpu, *cur_addr, t, at, 8, AccessKind::Write, 0),
                             *cur_addr,
                             ea,
                             *fault,
-                        )
-                        .into();
+                        );
                     }
                 }
                 if let Err(f) = vstore(cpu, mem, *cur_addr, ea, out, size) {
-                    return classify_access(
+                    return walk_classify_access(
                         vec_trap_out(cpu, *cur_addr, f, AccessKind::Write, ea, u16::from(size)),
                         *cur_addr,
                         ea,
                         *fault,
-                    )
-                    .into();
+                    );
                 }
             }
             IrOp::VCvtPs2Ph {
@@ -3180,8 +3276,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_float_unary_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, a, src_addr, op, prec, scalar,
                 ) {
-                    return classify_access(r, *cur_addr, read_val(*src_addr, temps), *fault)
-                        .into();
+                    return walk_classify_access(r, *cur_addr, read_val(*src_addr, temps), *fault);
                 }
             }
             IrOp::Jump { target } => {
@@ -3199,7 +3294,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::Call {
-                fault: _,
+                fault,
                 target,
                 return_addr,
                 slot,
@@ -3215,17 +3310,27 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     slot,
                     wrap_sp,
                 ) {
-                    return r.into();
+                    return match r {
+                        InterpResult::Continue => WalkResult::Continue,
+                        _ => {
+                            let base = cpu.gpr[RSP].wrapping_sub(u64::from(*slot));
+                            let base = if *wrap_sp { base & 0xffff_ffff } else { base };
+                            stack_fault_return(*cur_addr, base, *fault)
+                        }
+                    };
                 }
             }
             IrOp::Ret {
-                fault: _,
+                fault,
                 slot,
                 pop_extra,
                 wrap_sp,
             } => {
                 if let Some(r) = exec_ret(cpu, mem, *cur_addr, slot, pop_extra, wrap_sp) {
-                    return r.into();
+                    return match r {
+                        InterpResult::Continue => WalkResult::Continue,
+                        _ => stack_fault_return(*cur_addr, cpu.gpr[RSP], *fault),
+                    };
                 }
             }
             IrOp::Syscall { is_amd64 } => {
@@ -3266,13 +3371,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
                 let image = cpu.rflags() & !0x3_0000;
                 if let Err(t) = mem.write(sp, image, *size) {
-                    return classify_access(
+                    return walk_classify_access(
                         trap_out(cpu, *cur_addr, t, sp, *size, AccessKind::Write, image),
                         *cur_addr,
                         sp,
                         *fault,
-                    )
-                    .into();
+                    );
                 }
                 cpu.gpr[RSP] = sp;
             }
@@ -3285,10 +3389,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             IrOp::CheckIretNt => {
                 if cpu.rflags_system & (1 << 14) != 0 {
                     cpu.rip = *cur_addr;
-                    return BlockResult::Exit(Exit::Exception {
-                        addr: *cur_addr,
-                        vector: 13,
-                    });
+                    return InterpResult::exit(crate::fault::exception_exit(
+                        *cur_addr,
+                        13,
+                        crate::FaultCause::IretNt,
+                    ))
+                    .into();
                 }
             }
             IrOp::CheckIret { cs, ss, ip } => {
@@ -3298,15 +3404,23 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     || (ss.is_some() && ((ip << 16) as i64 >> 16) as u64 != ip)
                 {
                     cpu.rip = *cur_addr;
-                    return BlockResult::Exit(Exit::Exception {
-                        addr: *cur_addr,
-                        vector: 13,
-                    });
+                    return InterpResult::exit(crate::fault::exception_exit(
+                        *cur_addr,
+                        13,
+                        if read_val(*cs, temps) as u16 != cpu.cs
+                            || ss.is_some_and(|v| read_val(v, temps) as u16 != cpu.ss)
+                        {
+                            crate::FaultCause::IretSelector
+                        } else {
+                            crate::FaultCause::NonCanonical
+                        },
+                    ))
+                    .into();
                 }
             }
             IrOp::Unsupported { bytes, len } => {
                 cpu.rip = *cur_addr;
-                return BlockResult::Exit(Exit::UnknownInstruction {
+                return WalkResult::exit(Exit::UnknownInstruction {
                     addr: *cur_addr,
                     bytes: *bytes,
                     len: *len,
@@ -3337,7 +3451,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     deliver_interrupt(cpu, mem, *cur_addr, 4, *next_ip).into()
                 } else {
                     cpu.rip = *next_ip;
-                    BlockResult::Continue
+                    WalkResult::Continue
                 };
             }
             IrOp::SegLimitCheck {
@@ -3370,7 +3484,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     deliver_interrupt(cpu, mem, *cur_addr, 5, *fault_ip).into()
                 } else {
                     cpu.rip = *next_ip;
-                    BlockResult::Continue
+                    WalkResult::Continue
                 };
             }
             IrOp::IretReal => return exec_iret_real(cpu, mem, *cur_addr).into(),
@@ -3448,10 +3562,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             IrOp::CheckAlign { addr, bytes } => {
                 if read_val(*addr, temps) & (u64::from(*bytes) - 1) != 0 {
                     cpu.rip = *cur_addr;
-                    return BlockResult::Exit(Exit::Exception {
-                        addr: *cur_addr,
-                        vector: 13,
-                    });
+                    return InterpResult::exit(crate::fault::exception_exit(
+                        *cur_addr,
+                        13,
+                        crate::FaultCause::RequiredAlignment,
+                    ))
+                    .into();
                 }
             }
         }
@@ -3460,7 +3576,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
     // Straight-line block with no control-flow terminator (code ran out): flow on
     // from just past the decoded bytes.
     cpu.rip = block_end(ir);
-    BlockResult::Continue
+    WalkResult::Continue
 }
 
 mod control;
@@ -6168,6 +6284,25 @@ fn vec_fault_exit(f: StrFault, base: u64, width: u16) -> Exit {
     exit
 }
 
+#[cold]
+#[inline(never)]
+fn vec_interp_fault(f: StrFault, base: u64, width: u16) -> Option<InterpResult> {
+    Some(InterpResult::exit(vec_fault_exit(f, base, width)))
+}
+
+#[cold]
+#[inline(never)]
+fn vec_trap_out_optional(
+    cpu: &mut CpuState,
+    cur_addr: u64,
+    f: VecFault,
+    access: AccessKind,
+    base: u64,
+    width: u16,
+) -> Option<InterpResult> {
+    Some(vec_trap_out(cpu, cur_addr, f, access, base, width))
+}
+
 fn vec_trap_out(
     cpu: &mut CpuState,
     cur_addr: u64,
@@ -6175,9 +6310,9 @@ fn vec_trap_out(
     access: AccessKind,
     base: u64,
     width: u16,
-) -> StepResult {
+) -> InterpResult {
     let f = f.into_str_fault(cpu, cur_addr, access == AccessKind::Write);
-    StepResult::Exit(vec_fault_exit(f, base, width))
+    InterpResult::exit(vec_fault_exit(f, base, width))
 }
 
 /// One 8-byte-or-narrower transfer of a vector access, with MMIO resumption.
@@ -6402,15 +6537,129 @@ fn vstore<const ROUTED: bool>(
 }
 
 #[cold]
-fn classify_access(
-    result: StepResult,
+#[inline(never)]
+fn stack_fault_return(rip: u64, base: u64, fault: crate::ir::MemoryAccess) -> WalkResult {
+    let exit = result::consume_current().expect("stack failure must initialize its cold record");
+    classify_access(InterpResult::exit(exit), rip, base, fault).into()
+}
+
+// Only scalar fault keys cross the cold boundary. Passing a whole carrier to
+// an out-of-line classifier gives each dispatch arm an escaping stack slot.
+#[inline(always)]
+fn walk_classify_access(
+    result: InterpResult,
     rip: u64,
     base: u64,
     fault: crate::ir::MemoryAccess,
-) -> StepResult {
+) -> WalkResult {
     match result {
-        StepResult::Exit(Exit::UnmappedMemory { addr, access }) => {
-            StepResult::Exit(fault.unmapped_exit(rip, base, addr, access))
+        InterpResult::Exit(InterpExit::DetailedUnmapped { addr, access }) => {
+            record_walk_access(addr, access, rip, base, fault);
+            WalkResult::Fault
+        }
+        other => other.into(),
+    }
+}
+#[cold]
+#[inline(never)]
+fn record_walk_access(
+    addr: u64,
+    access: AccessKind,
+    rip: u64,
+    base: u64,
+    fault: crate::ir::MemoryAccess,
+) {
+    let _ = classify_access(
+        InterpResult::Exit(InterpExit::DetailedUnmapped { addr, access }),
+        rip,
+        base,
+        fault,
+    );
+}
+#[inline(always)]
+fn walk_classify_masked_access(
+    result: InterpResult,
+    rip: u64,
+    base: u64,
+    fault: crate::ir::MemoryAccess,
+    elem: u8,
+    mask: u64,
+) -> WalkResult {
+    let key = match result {
+        InterpResult::Exit(InterpExit::DetailedUnmapped { addr, access }) => {
+            result::memory_key(addr, access)
+        }
+        InterpResult::Exit(InterpExit::DetailedException { addr, vector }) => {
+            (addr, u16::from(vector))
+        }
+        other => return other.into(),
+    };
+    record_walk_masked_access(key, rip, base, fault, elem, mask);
+    WalkResult::Fault
+}
+#[cold]
+#[inline(never)]
+fn record_walk_masked_access(
+    key: (u64, u16),
+    rip: u64,
+    base: u64,
+    fault: crate::ir::MemoryAccess,
+    elem: u8,
+    mask: u64,
+) {
+    let exit = result::consume(key).expect("fault return must initialize its cold record");
+    let _ = classify_masked_access(InterpResult::exit(exit), rip, base, fault, elem, mask);
+}
+#[inline(always)]
+fn walk_classify_string_access(
+    result: InterpResult,
+    rip: u64,
+    fault: crate::ir::MemoryAccess,
+) -> WalkResult {
+    let base = match &result {
+        InterpResult::Exit(InterpExit::DetailedUnmapped { addr, .. }) => *addr,
+        _ => 0,
+    };
+    walk_classify_access(result, rip, base, fault)
+}
+
+#[cold]
+#[inline(never)]
+fn classify_access(
+    result: InterpResult,
+    rip: u64,
+    base: u64,
+    fault: crate::ir::MemoryAccess,
+) -> InterpResult {
+    match result {
+        InterpResult::Exit(exit) if matches!(exit, InterpExit::DetailedUnmapped { .. }) => {
+            let mut exit = exit.into_exit();
+            let (addr, access, old) = match &mut exit {
+                Exit::UnmappedMemory {
+                    addr,
+                    access,
+                    metadata,
+                } => (*addr, *access, metadata.take()),
+                _ => unreachable!(),
+            };
+            let mut classified = fault.unmapped_exit(rip, base, addr, access);
+            if let Some(mut details) = old {
+                if matches!(classified, Exit::UnmappedMemory { .. }) {
+                    details.operand_base = crate::Knowledge::Known(base);
+                    details.operand_size = crate::Knowledge::Known(fault.bytes());
+                    classified = classified.with_fault_metadata(*details);
+                } else if let Exit::Exception {
+                    metadata: Some(m), ..
+                } = &mut classified
+                {
+                    m.operand_base = crate::Knowledge::Known(base);
+                    m.operand_size = crate::Knowledge::Known(fault.bytes());
+                    m.transfer_size = details.transfer_size;
+                    m.transfer_access = details.transfer_access;
+                    m.address = details.address;
+                }
+            }
+            InterpResult::exit(classified)
         }
         other => other,
     }
@@ -6431,14 +6680,15 @@ fn fault_k_mask(cpu: &CpuState, reg: u8) -> u64 {
 }
 
 #[cold]
+#[inline(never)]
 fn classify_masked_access(
-    result: StepResult,
+    result: InterpResult,
     rip: u64,
     base: u64,
     fault: crate::ir::MemoryAccess,
     elem: u8,
     mask: u64,
-) -> StepResult {
+) -> InterpResult {
     // A broadcast carrier is one element regardless of the selected output lane
     // (SDM Vol 2A §2.7.7); xj-au4.2 owns its existing transfer/value bug.
     let (operand, width) = if fault.bytes() == u16::from(elem) {
@@ -6446,28 +6696,34 @@ fn classify_masked_access(
     } else {
         crate::memory::active_operand_span(base, u64::from(fault.bytes()), elem, mask)
     };
-    classify_access(
+    let result = classify_access(
         result,
         rip,
         operand,
         crate::ir::MemoryAccess::new(width as u16, fault.long64(), fault.stack()),
-    )
-}
-
-#[cold]
-fn classify_string_access(
-    result: StepResult,
-    rip: u64,
-    fault: crate::ir::MemoryAccess,
-) -> StepResult {
-    let base = match &result {
-        StepResult::Exit(Exit::UnmappedMemory { addr, .. }) => *addr,
-        _ => 0,
-    };
-    classify_access(result, rip, base, fault)
+    );
+    match result {
+        InterpResult::Exit(exit) => {
+            let mut exit = exit.into_exit();
+            if let Exit::UnmappedMemory {
+                metadata: Some(m), ..
+            }
+            | Exit::Exception {
+                metadata: Some(m), ..
+            } = &mut exit
+            {
+                m.operand_base = crate::Knowledge::Known(base);
+                m.operand_size = crate::Knowledge::Known(fault.bytes());
+            }
+            InterpResult::exit(exit)
+        }
+        other => other,
+    }
 }
 
 /// Set RIP to the faulting instruction and turn a `MemTrap` into the matching Exit.
+#[cold]
+#[inline(never)]
 fn trap_out(
     cpu: &mut CpuState,
     cur_addr: u64,
@@ -6476,24 +6732,29 @@ fn trap_out(
     size: u8,
     access: AccessKind,
     value: u64,
-) -> StepResult {
+) -> InterpResult {
     cpu.rip = cur_addr;
     let exit = match (trap, access) {
-        (MemTrap::NonCanonical, _) => Exit::UnmappedMemory { addr, access },
-        (t @ MemTrap::HostFault, _) => Exit::UnmappedMemory {
-            addr: t.fault_addr(addr),
+        (MemTrap::NonCanonical | MemTrap::Unmapped, _) => {
+            crate::fault::memory_exit(cur_addr, addr, u16::from(size), access, false, false)
+        }
+        (t @ MemTrap::HostFault, _) => crate::fault::memory_exit(
+            cur_addr,
+            t.fault_addr(addr),
+            u16::from(size),
             access,
-        },
-        (MemTrap::Unmapped, _) => Exit::UnmappedMemory { addr, access },
+            true,
+            true,
+        ),
         (MemTrap::Mmio, AccessKind::Read) => Exit::mmio_read(addr, size),
         (MemTrap::Mmio, _) => Exit::mmio_write(addr, size, value),
     };
-    StepResult::Exit(exit)
+    InterpResult::exit(exit)
 }
 
 // --- register access ---
 
-fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
+pub(crate) fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
     match reg.gpr_index() {
         Some(i) => cpu.gpr[i],
         None => match reg {
@@ -7143,6 +7404,8 @@ pub fn string_run_interruptible<M: StrMem>(
 
 /// Build the `Exit` for a memory fault reported by a shared mem helper (`string_run_interruptible`,
 /// `masked_load_run`, `masked_store_run`). RIP is already set by the helper.
+#[cold]
+#[inline(never)]
 fn str_fault_exit(f: StrFault) -> Exit {
     let access = if f.write {
         AccessKind::Write
@@ -7150,14 +7413,12 @@ fn str_fault_exit(f: StrFault) -> Exit {
         AccessKind::Read
     };
     match (f.trap, access) {
-        (MemTrap::HostFault, _) => Exit::UnmappedMemory {
-            addr: f.addr,
-            access,
-        },
-        (MemTrap::Unmapped | MemTrap::NonCanonical, _) => Exit::UnmappedMemory {
-            addr: f.addr,
-            access,
-        },
+        (MemTrap::HostFault, _) => {
+            crate::fault::memory_exit(0, f.addr, u16::from(f.elem), access, true, true)
+        }
+        (MemTrap::Unmapped | MemTrap::NonCanonical, _) => {
+            crate::fault::memory_exit(0, f.addr, u16::from(f.elem), access, false, false)
+        }
         (MemTrap::Mmio, AccessKind::Read) => Exit::mmio_read(f.addr, f.elem),
         (MemTrap::Mmio, _) => Exit::mmio_write(f.addr, f.elem, f.value),
     }
@@ -7371,10 +7632,11 @@ fn cmpxchg_pair_mode<const ROUTED: bool>(
 ) -> Option<Exit> {
     if size == 16 && addr & 15 != 0 {
         cpu.rip = cur_addr;
-        return Some(Exit::Exception {
-            vector: 13,
-            addr: cur_addr,
-        });
+        return Some(crate::fault::exception_exit(
+            cur_addr,
+            13,
+            crate::FaultCause::RequiredAlignment,
+        ));
     }
     let bits = if size == 16 { 64 } else { 32 };
     let mask = if size == 16 {
@@ -7403,12 +7665,12 @@ fn cmpxchg_pair_mode<const ROUTED: bool>(
             return Some(Exit::unknown_instruction(cur_addr, bytes, len));
         }
         Err(t) => {
-            let StepResult::Exit(exit) =
+            let InterpResult::Exit(exit) =
                 trap_out(cpu, cur_addr, t, addr, size, AccessKind::Write, src as u64)
             else {
                 unreachable!()
             };
-            return Some(exit);
+            return Some(exit.into_exit());
         }
     };
     cpu.flags.zf = old == expected;
@@ -9760,8 +10022,8 @@ mod fence_tests {
 
     #[test]
     fn iret_completion_fence_follows_successful_stack_reads() {
-        use super::{control::exec_iret_real, Access, CpuState};
-        use crate::{Memory, MemoryModel, StepResult};
+        use super::{control::exec_iret_real, Access, CpuState, InterpResult};
+        use crate::{Memory, MemoryModel};
 
         fn check<const ROUTED: bool>() {
             // SDM Vol 3A §11.3: IRET must complete its stack reads before
@@ -9782,13 +10044,13 @@ mod fence_tests {
                 FENCE_ORDERS.with(|orders| orders.set([None; 4]));
                 let result = exec_iret_real(&mut cpu, Access::<ROUTED>::new(&mem), 0x1000);
                 if words == 3 {
-                    assert!(matches!(result, StepResult::Continue));
+                    assert!(matches!(result, InterpResult::Continue));
                     assert_eq!(cpu.rip, 0x2000);
                     assert_eq!(cpu.cs, 0x10);
                     assert_eq!(cpu.gpr[4], 0x8006);
                     assert!(cpu.flags.if_);
                 } else {
-                    assert!(matches!(result, StepResult::Exit(_)));
+                    assert!(matches!(result, InterpResult::Exit(_)));
                 }
                 FENCE_ORDERS.with(|orders| {
                     assert_eq!(

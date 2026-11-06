@@ -6,14 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
-use crate::exit::{AccessKind, Exit, StepResult};
+use crate::exit::{Exit, StepResult};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
-    MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_HLT, RET_HOST_FAULT,
-    RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER,
-    RET_SYSCALL, RET_UNMAPPED,
+    MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_EXCEPTION_DETAIL, RET_HLT,
+    RET_HOST_FAULT, RET_HOST_FAULT_DETAIL, RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK,
+    RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_SYSCALL, RET_UNMAPPED,
+    RET_UNMAPPED_DETAIL,
 };
-use crate::lift::{lift_block, lift_region, CpuMode, FetchAddr, LiftError};
+use crate::lift::{
+    lift_block_with_fault, lift_region, lift_region_with_fault, CpuMode, FetchAddr, LiftError,
+};
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
 use crate::state::{CpuState, Flags, Reg};
 
@@ -1161,8 +1164,23 @@ impl Vcpu {
         let result = match r {
             // §17.6 (sub-seam b): re-deliver a real-mode exception through the IVT,
             // mirroring the interpreted-block arm of `run`.
-            StepResult::Exit(Exit::Exception { addr, vector }) if self.mode == CpuMode::Real16 => {
+            StepResult::Exit(Exit::Exception { addr, vector, .. })
+                if self.mode == CpuMode::Real16 =>
+            {
                 crate::interp::deliver_interrupt(&mut self.cpu, &vm.mem, addr, vector, addr)
+                    .into_step()
+            }
+            other => other,
+        };
+        let result = match result {
+            StepResult::Exit(exit) if self.mode == CpuMode::Real16 => {
+                StepResult::Exit(crate::fault::qualify_real16(exit, &self.cpu))
+            }
+            other => other,
+        };
+        let result = match result {
+            StepResult::Exit(exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. })) => {
+                StepResult::Exit(self.fault_entry.finish_transfer_fault(exit, &vm.mem))
             }
             other => other,
         };
@@ -1208,6 +1226,12 @@ impl Vcpu {
             self.run_inner::<false>(vm, budget, &mut fp_mode)
         };
         drop(fault_run);
+        let exit = match exit {
+            exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
+                self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+            }
+            other => other,
+        };
         self.cpu.finish_mmio_retry(Some(&exit));
         if matches!(exit, Exit::Interrupted) {
             // Acquire the writes published by the consumed request. A later
@@ -1375,7 +1399,9 @@ impl Vcpu {
                         }
                         continue;
                     }
-                    StepResult::Exit(exit) => return Ok(exit),
+                    StepResult::Exit(exit) => {
+                        return Ok(crate::fault::qualify_real16(exit, &self.cpu))
+                    }
                 }
             }
 
@@ -1409,7 +1435,9 @@ impl Vcpu {
                         saved,
                         vector,
                         saved,
-                    ) {
+                    )
+                    .into_step()
+                    {
                         StepResult::Continue => {
                             // Delivery is itself an atomic hardware event, not a retired
                             // guest instruction — do not tick `retired`; do charge a block
@@ -1418,7 +1446,9 @@ impl Vcpu {
                             blocks_run += 1;
                             continue;
                         }
-                        StepResult::Exit(exit) => return Ok(exit),
+                        StepResult::Exit(exit) => {
+                            return Ok(crate::fault::qualify_real16(exit, &self.cpu))
+                        }
                     }
                 }
             }
@@ -1500,21 +1530,41 @@ impl Vcpu {
                         // `addr` is the faulting instruction's IP (the saved IP for a
                         // fault), so re-deliver through the same IVT path and continue.
                         // Long64/Compat32 still return `Exit::Exception` unchanged.
-                        crate::interp::BlockResult::Exit(Exit::Exception { addr, vector })
-                            if self.mode == CpuMode::Real16 =>
-                        {
-                            match crate::interp::deliver_interrupt(
-                                &mut self.cpu,
-                                &vm.mem,
-                                addr,
-                                vector,
-                                addr,
-                            ) {
-                                StepResult::Continue => blocks_run += 1,
-                                StepResult::Exit(exit) => return Ok(exit),
+                        crate::interp::BlockResult::Exit(exit) => {
+                            let exit = exit.into_exit();
+                            match exit {
+                                Exit::Exception { addr, vector, .. }
+                                    if self.mode == CpuMode::Real16 =>
+                                {
+                                    match crate::interp::deliver_interrupt(
+                                        &mut self.cpu,
+                                        &vm.mem,
+                                        addr,
+                                        vector,
+                                        addr,
+                                    )
+                                    .into_step()
+                                    {
+                                        StepResult::Continue => blocks_run += 1,
+                                        StepResult::Exit(exit) => {
+                                            return Ok(crate::fault::qualify_real16(
+                                                exit, &self.cpu,
+                                            ))
+                                        }
+                                    }
+                                }
+                                exit @ Exit::Exception { .. } => {
+                                    return Ok(crate::interp::qualify_lifted_exit(exit, &ir))
+                                }
+                                exit => {
+                                    return Ok(if self.mode == CpuMode::Real16 {
+                                        crate::fault::qualify_real16(exit, &self.cpu)
+                                    } else {
+                                        exit
+                                    })
+                                }
                             }
                         }
-                        crate::interp::BlockResult::Exit(exit) => return Ok(exit),
                     }
                 }
                 CachedBlock::Compiled { entry, .. } => {
@@ -1701,8 +1751,36 @@ impl Vcpu {
                             RET_SYSCALL => return Ok(Exit::Syscall),
                             RET_HLT => return Ok(Exit::Hlt),
                             RET_UNMAPPED => return Ok(ctx.unmapped_exit(&self.cpu, self.mode)),
-                            RET_MMIO_DEFER | RET_HOST_FAULT => {
-                                if code == RET_HOST_FAULT {
+                            RET_UNMAPPED_DETAIL => {
+                                return Ok(ctx.detailed_unmapped_exit(
+                                    &self.cpu,
+                                    &vm.mem,
+                                    self.mode,
+                                    cur.0 as usize,
+                                ))
+                            }
+                            RET_EXCEPTION_DETAIL => {
+                                let exit = ctx.detailed_exception_exit(
+                                    &self.cpu,
+                                    &vm.mem,
+                                    self.mode,
+                                    cur.0 as usize,
+                                );
+                                return Ok(crate::fault::qualify_lifted(
+                                    exit,
+                                    crate::codemap::lookup_fault_info(
+                                        cur.0 as usize,
+                                        ctx.next_entry,
+                                    ),
+                                ));
+                            }
+                            RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL => {
+                                let raw_fault = if code == RET_HOST_FAULT_DETAIL {
+                                    self.fault_entry.raw_fault()
+                                } else {
+                                    None
+                                };
+                                if code == RET_HOST_FAULT || code == RET_HOST_FAULT_DETAIL {
                                     if DEFAULT {
                                         // The landing stub may have restored non-default caller
                                         // control. No guest mode was installed in this specialization.
@@ -1719,7 +1797,14 @@ impl Vcpu {
                                         != crate::jit_abi::fault::HostFaultKind::Alignment
                                         && vm.mem.mapped_ram(ctx.fault_addr)
                                     {
-                                        return Ok(ctx.unmapped_exit(&self.cpu, self.mode));
+                                        let exit = if code == RET_HOST_FAULT_DETAIL {
+                                            ctx.detailed_host_exit(&self.cpu, &vm.mem, self.mode)
+                                        } else {
+                                            ctx.unmapped_exit(&self.cpu, self.mode)
+                                        };
+                                        return Ok(crate::fault::attach_raw_host_fault(
+                                            exit, raw_fault,
+                                        ));
                                     }
                                 }
                                 if !DEFAULT {
@@ -1738,6 +1823,14 @@ impl Vcpu {
                                     trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()
                                 };
+                                let original_info = if code == RET_HOST_FAULT_DETAIL {
+                                    crate::codemap::lookup_fault_info(
+                                        ctx.next_entry as usize,
+                                        self.cpu.rip,
+                                    )
+                                } else {
+                                    None
+                                };
                                 let r = crate::interp::step_one_mode::<ROUTED>(
                                     &vm.mem,
                                     &mut self.cpu,
@@ -1755,7 +1848,24 @@ impl Vcpu {
                                         }
                                         break;
                                     }
-                                    StepResult::Exit(exit) => return Ok(exit),
+                                    StepResult::Exit(exit) => {
+                                        return Ok(
+                                            if code == RET_HOST_FAULT
+                                                || code == RET_HOST_FAULT_DETAIL
+                                            {
+                                                crate::fault::attach_raw_host_fault(
+                                                    ctx.preserve_host_replay(
+                                                        exit,
+                                                        original_info,
+                                                        code == RET_HOST_FAULT_DETAIL,
+                                                    ),
+                                                    raw_fault,
+                                                )
+                                            } else {
+                                                exit
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             // A port-I/O instruction (`in`/`out`, §5.2): the block set
@@ -1788,10 +1898,10 @@ impl Vcpu {
                             // instruction, trap: past it) and stored the vector in the
                             // MemCtx out-field.
                             RET_EXCEPTION => {
-                                return Ok(Exit::Exception {
-                                    addr: self.cpu.rip,
-                                    vector: ctx.exception_vector as u8,
-                                })
+                                return Ok(Exit::exception(
+                                    self.cpu.rip,
+                                    ctx.exception_vector as u8,
+                                ))
                             }
                             other => panic!("compiled block returned invalid ABI code {other}"),
                         }
@@ -1873,9 +1983,10 @@ fn resolve<const DEFAULT: bool>(
         if let Some(block) = vm.cache.get(key) {
             return Ok(block);
         }
-        return lift_block(&vm.mem, at, mode)
+        let mut fetch_failure = None;
+        return lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
             .map(|ir| finish_single(vm, key, pc, ir))
-            .map_err(lift_exit);
+            .map_err(|e| lift_exit(e, fetch_failure, &vm.mem, at, mode));
     }
     loop {
         // Publish any completed background compiles first, so a
@@ -1939,7 +2050,8 @@ fn resolve<const DEFAULT: bool>(
                     return Ok(block); // a compile for this pc is already in flight
                 }
                 let caps = region_caps.expect("region candidate ⇒ region_caps");
-                match lift_region(&vm.mem, pc, caps, mode) {
+                let mut fetch_failure = None;
+                match lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure) {
                     Ok(region) if region.blocks.len() > 1 && region.has_loop => {
                         let spans = region.spans();
                         (TierUpUnit::Region(Arc::new(region)), spans)
@@ -2006,7 +2118,8 @@ fn resolve<const DEFAULT: bool>(
     // as one unit spanning all its sub-blocks; a one-block region falls through to the
     // single-block path (reusing the block already lifted, so no double lift).
     if let Some(caps) = vm.backend.region_caps().filter(|_| !vm.tier_up_background) {
-        match lift_region(&vm.mem, pc, caps, mode) {
+        let mut fetch_failure = None;
+        match lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure) {
             // NOTE: the region path is JIT-only (a region-forming backend); Real16 stays
             // on the interpreter and never reaches here, so `pc` (flat) is correct.
             // Only a multi-block region *with a loop* is worth its heavier compile
@@ -2039,12 +2152,13 @@ fn resolve<const DEFAULT: bool>(
                     region.blocks.into_iter().next().unwrap(),
                 ))
             }
-            Err(e) => return Err(lift_exit(e)),
+            Err(e) => return Err(lift_exit(e, fetch_failure, &vm.mem, at, mode)),
         }
     }
-    match lift_block(&vm.mem, at, mode) {
+    let mut fetch_failure = None;
+    match lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure) {
         Ok(ir) => Ok(finish_single(vm, key, pc, ir)),
-        Err(e) => Err(lift_exit(e)),
+        Err(e) => Err(lift_exit(e, fetch_failure, &vm.mem, at, mode)),
     }
 }
 
@@ -2077,15 +2191,18 @@ fn finish_single(vm: &Vm, key: BlockKey, span_start: u64, ir: IrBlock) -> Cached
 }
 
 /// Map a lift error to its dispatcher exit (a legal exit, not a `run()` failure).
-fn lift_exit(e: LiftError) -> Exit {
+fn lift_exit(
+    e: LiftError,
+    details: Option<crate::MemTrap>,
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+) -> Exit {
     match e {
         LiftError::Unsupported { addr, bytes, len } => {
             Exit::UnknownInstruction { addr, bytes, len }
         }
-        LiftError::DecodeFault { addr } => Exit::UnmappedMemory {
-            addr,
-            access: AccessKind::Execute,
-        },
+        LiftError::DecodeFault { addr } => crate::fault::fetch_exit(mem, at, mode, addr, details),
     }
 }
 

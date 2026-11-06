@@ -77,6 +77,16 @@ struct Snapshot {
     cpu: *mut CpuState,
     ctx: *mut MemCtx,
     kind: HostFaultKind,
+    raw_fault: Option<crate::RawHostFault>,
+}
+
+// Independent of compiled activation: fetches and Rust helpers can fault while
+// cpu/ctx are unpublished. The outer cold exit path consumes this once.
+#[derive(Default)]
+struct TransferFault {
+    pending: bool,
+    host_address: u64,
+    raw: Option<crate::RawHostFault>,
 }
 
 /// Per-run storage, boxed by the vCPU. Standalone compiled callers may use a
@@ -85,6 +95,7 @@ struct Snapshot {
 pub struct EntryRecord {
     active: AtomicBool,
     snapshot: UnsafeCell<Snapshot>,
+    transfer: UnsafeCell<TransferFault>,
 }
 
 // SAFETY: execution and synchronous signal access are confined to the owning
@@ -144,6 +155,45 @@ impl EntryRecord {
         unsafe { (*self.snapshot.get()).kind }
     }
 
+    /// Evidence from the latest compiled landing. Read only after a
+    /// `RET_HOST_FAULT_DETAIL` return, before another compiled call. Legacy
+    /// `classify` callers leave it absent. No allocation occurs here.
+    pub fn raw_fault(&mut self) -> Option<crate::RawHostFault> {
+        self.snapshot.get_mut().raw_fault
+    }
+
+    /// Consume only on the cold fault-return route, including interpreted steps
+    /// and decode faults. Successful transfers never touch the validity tag.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn finish_transfer_fault(
+        &mut self,
+        mut exit: crate::Exit,
+        mem: &crate::Memory,
+    ) -> crate::Exit {
+        let transfer = std::mem::take(self.transfer.get_mut());
+        if transfer.pending {
+            if let crate::Exit::UnmappedMemory {
+                metadata: Some(m), ..
+            } = &mut exit
+            {
+                let host_address = match m.linear_address() {
+                    crate::Knowledge::Known(address) => address
+                        .value()
+                        .checked_sub(mem.guest_base())
+                        .and_then(|offset| (mem.host_base() as u64).checked_add(offset)),
+                    _ => None,
+                };
+                if m.origin() == crate::FaultOrigin::HostAccess
+                    && host_address == Some(transfer.host_address)
+                {
+                    m.raw_host_fault = transfer.raw;
+                }
+            }
+        }
+        exit
+    }
+
     pub fn handle(&self) -> FaultHandle {
         FaultHandle(self as *const Self as usize)
     }
@@ -189,6 +239,36 @@ pub unsafe fn classify(
     kind: HostFaultKind,
     regs: &mut HostRegisters,
 ) -> bool {
+    classify_inner(handle, host_pc, data_addr, kind, regs, None)
+}
+
+/// Like [`classify`], additionally retaining an opaque raw signal record on a
+/// compiled landing or transfer fixup. Copy the context fields before calling:
+/// recovery rewrites the interrupted registers. Transfer evidence is attached
+/// when the vCPU returns the helper, interpreter or fetch fault.
+///
+/// # Safety
+/// All [`classify`]'s requirements apply. `raw` must describe this signal's
+/// actual host context, with unavailable fields left `None`.
+pub unsafe fn classify_with_raw_fault(
+    handle: usize,
+    host_pc: usize,
+    data_addr: usize,
+    kind: HostFaultKind,
+    regs: &mut HostRegisters,
+    raw: crate::RawHostFault,
+) -> bool {
+    classify_inner(handle, host_pc, data_addr, kind, regs, Some(raw))
+}
+
+unsafe fn classify_inner(
+    handle: usize,
+    host_pc: usize,
+    data_addr: usize,
+    kind: HostFaultKind,
+    regs: &mut HostRegisters,
+    raw: Option<crate::RawHostFault>,
+) -> bool {
     #[cfg(all(
         any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -200,6 +280,16 @@ pub unsafe fn classify(
         if let Some(fixup) = crate::usercopy::lookup(host_pc) {
             if kind != HostFaultKind::Access {
                 return false;
+            }
+            if handle != 0 {
+                // SAFETY: even an inactive handle names a live record on this
+                // thread. No CPU/context pointer is read on the fixup route.
+                let record = &*(handle as *const EntryRecord);
+                *record.transfer.get() = TransferFault {
+                    pending: true,
+                    host_address: data_addr as u64,
+                    raw,
+                };
             }
             regs.pc = fixup as u64;
             regs.scratch = data_addr as u64;
@@ -306,10 +396,21 @@ pub unsafe fn classify(
         recovered.scratch = saved as *const Snapshot as u64;
         recovered.pc = landing_stub as *const () as u64;
         saved.kind = kind;
+        saved.raw_fault = raw;
         (*saved.cpu).rip = site.guest_rip;
         if let Some(addr) = addr {
             (*saved.ctx).fault_addr = addr;
         }
+        (*saved.ctx).next_entry = host_pc as u64;
+        (*saved.ctx).link_slot = (match site.access {
+            crate::GuestAccessKind::Read => 0,
+            crate::GuestAccessKind::Write => 1,
+            crate::GuestAccessKind::ReadWrite => 2,
+        }) | if kind == HostFaultKind::Alignment {
+            0x100
+        } else {
+            0
+        };
         (*saved.ctx).fault_size = u64::from(site.width);
         (*saved.ctx).fault_access = u64::from(site.access != crate::GuestAccessKind::Read);
         *regs = recovered;
@@ -320,7 +421,7 @@ pub unsafe fn classify(
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (handle, host_pc, data_addr, kind, regs);
+        let _ = (handle, host_pc, data_addr, kind, regs, raw);
         false
     }
 }
@@ -332,6 +433,45 @@ pub unsafe fn classify(
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_evidence_is_consumed_once_and_requires_matching_host_address() {
+        let vm = crate::Vm::new(crate::VmConfig::flat(0x4000));
+        let mut record = EntryRecord::default();
+        let raw = crate::RawHostFault::new(crate::HostFaultPlatform::LinuxX86_64);
+        let fault =
+            || crate::fault::memory_exit(0x1000, 0x2000, 8, crate::AccessKind::Read, true, true);
+        *record.transfer.get_mut() = TransferFault {
+            pending: true,
+            host_address: vm.mem.host_base() as u64 + 0x2000,
+            raw: Some(raw),
+        };
+        let owned = record.finish_transfer_fault(fault(), &vm.mem);
+        assert_eq!(owned.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+        assert_eq!(
+            record
+                .finish_transfer_fault(fault(), &vm.mem)
+                .fault_metadata()
+                .unwrap()
+                .raw_host_fault(),
+            None
+        );
+        *record.transfer.get_mut() = TransferFault {
+            pending: true,
+            host_address: vm.mem.host_base() as u64 + 0x2001,
+            raw: Some(raw),
+        };
+        assert_eq!(
+            record
+                .finish_transfer_fault(fault(), &vm.mem)
+                .fault_metadata()
+                .unwrap()
+                .raw_host_fault(),
+            None
+        );
+        assert!(!record.transfer.get_mut().pending);
+        assert_eq!(owned.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+    }
 
     #[test]
     fn alignment_with_pc_as_address_replays_only_on_freebsd_arm64() {
@@ -587,13 +727,20 @@ mod tests {
             assert_eq!(cpu.rip, 0);
             assert_eq!(ctx.fault_size, 0);
             frame[19] = 0x3300;
-            assert!(classify(
+            let raw = crate::RawHostFault {
+                signal: Some(11),
+                fault_address: Some(addr as u64),
+                ..crate::RawHostFault::new(crate::HostFaultPlatform::LinuxX86_64)
+            };
+            assert!(classify_with_raw_fault(
                 handle,
                 pc + 4,
                 addr,
                 HostFaultKind::Access,
-                &mut regs
+                &mut regs,
+                raw
             ));
+            assert_eq!(record.raw_fault(), Some(raw));
             assert_eq!(regs.fp, frame[18]);
             assert_eq!(regs.callee_saved, frame[8..18]);
             assert_eq!(regs.simd, frame[..8]);
@@ -612,6 +759,19 @@ mod tests {
             assert_eq!(ctx.fault_addr, 0x1_0000_0004);
             assert_eq!(ctx.fault_size, 16);
             assert_eq!(ctx.fault_access, 1);
+            let mut legacy = original;
+            assert!(classify(
+                handle,
+                pc + 4,
+                addr,
+                HostFaultKind::Access,
+                &mut legacy
+            ));
+            assert_eq!(
+                record.raw_fault(),
+                None,
+                "legacy classification must not reuse evidence"
+            );
             record.deactivate();
             let mut regs = original;
             assert!(!classify(
@@ -753,7 +913,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("x86jit-landing-{}-{stamp}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let fixture = format!("pub mod jit_abi {{ pub const RET_HOST_FAULT: u64 = 11; pub mod fault {{ mod landing {{ {} }} pub fn address() -> usize {{ std::hint::black_box(landing::landing_stub as *const () as usize) }} }} }} pub fn address() -> usize {{ jit_abi::fault::address() }}", include_str!("landing.rs"));
+        let fixture = format!("pub mod jit_abi {{ pub const RET_HOST_FAULT_DETAIL: u64 = 15; pub mod fault {{ mod landing {{ {} }} pub fn address() -> usize {{ std::hint::black_box(landing::landing_stub as *const () as usize) }} }} }} pub fn address() -> usize {{ jit_abi::fault::address() }}", include_str!("landing.rs"));
         let source = dir.join("lib.rs");
         std::fs::write(&source, fixture).unwrap();
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());

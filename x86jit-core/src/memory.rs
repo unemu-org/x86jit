@@ -36,15 +36,13 @@ pub fn unmapped_exit(
 ) -> crate::exit::Exit {
     let last = base.wrapping_add(bytes.max(1) - 1);
     if long64 && (!is_canonical(base) || !is_canonical(last)) {
-        crate::exit::Exit::Exception {
-            addr: rip,
-            vector: if stack { 12 } else { 13 },
-        }
+        crate::fault::exception_exit(
+            rip,
+            if stack { 12 } else { 13 },
+            crate::fault::FaultCause::NonCanonical,
+        )
     } else {
-        crate::exit::Exit::UnmappedMemory {
-            addr: fault_addr,
-            access,
-        }
+        crate::fault::memory_exit(rip, fault_addr, bytes as u16, access, false, false)
     }
 }
 
@@ -1445,6 +1443,15 @@ impl Memory {
         }
     }
 
+    /// Cold evidence about one byte, independent of permissions and host VM state.
+    #[cold]
+    pub(crate) fn absent_byte(&self, addr: u64) -> bool {
+        !self
+            .regions
+            .iter()
+            .any(|r| r.start <= addr && addr - r.start < r.size as u64)
+    }
+
     pub(crate) fn mapped_ram(&self, addr: u64) -> bool {
         self.region_at(addr, 1)
             .is_ok_and(|r| !matches!(r.kind, RegionKind::Trap))
@@ -1521,9 +1528,21 @@ impl Memory {
         addr: u64,
         buf: &mut [u8],
     ) -> Result<(), u64> {
-        let region = self.region_for(addr, buf.len()).ok_or(addr)?;
+        let region = self.region_for(addr, buf.len()).ok_or_else(|| {
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
+        })?;
         if matches!(region.kind, RegionKind::Trap) {
-            return Err(addr);
+            return Err(crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::Unknown,
+                crate::AddressPrecision::TransferAddress,
+            ));
         }
         // SAFETY: region_for validates the entire range; the local output is live.
         unsafe {
@@ -1538,7 +1557,12 @@ impl Memory {
         .map_err(|at| {
             let addr = self.guest_base + (at - self.host_base() as usize) as u64;
             record_host_fault(addr);
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
         })
     }
 
@@ -1556,9 +1580,21 @@ impl Memory {
         addr: u64,
         bytes: &[u8],
     ) -> Result<(), u64> {
-        let region = self.region_for(addr, bytes.len()).ok_or(addr)?;
+        let region = self.region_for(addr, bytes.len()).ok_or_else(|| {
+            crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
+        })?;
         if matches!(region.kind, RegionKind::Trap) {
-            return Err(addr);
+            return Err(crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::Unknown,
+                crate::AddressPrecision::TransferAddress,
+            ));
         }
         if matches!(region.kind, RegionKind::Rom) {
             return Ok(());
@@ -1576,7 +1612,12 @@ impl Memory {
         .map_err(|at| {
             let addr = self.guest_base + (at - self.host_base() as usize) as u64;
             record_host_fault(addr);
-            addr
+            crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
         })?;
         self.note_write(addr, bytes.len());
         Ok(())

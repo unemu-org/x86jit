@@ -1,6 +1,10 @@
 //! Test-only signal adapter shared by compiled-frame and guest recovery tests.
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use x86jit_core::jit_abi::fault::{classify, HostFaultKind, HostRegisters};
+use x86jit_core::jit_abi::fault::{classify_with_raw_fault, HostFaultKind, HostRegisters};
+use x86jit_core::{HostFaultPlatform, RawHostFault};
+
+#[path = "unwind_test_fault_context.rs"]
+mod fault_context;
 // Darwin SDK 14.4 sys/signal.h, Linux v6.12 include/uapi/asm-generic/siginfo.h,
 // and FreeBSD 14.3 sys/sys/signal.h (not pinned in oracles/).
 // libc does not expose these names on every supported host.
@@ -128,6 +132,7 @@ mod freebsd_arm64 {
         assert_eq!(words, before);
     }
 }
+pub static LEGACY_CLASSIFIER: AtomicBool = AtomicBool::new(false);
 pub static IN_CLASSIFIER: AtomicBool = AtomicBool::new(false);
 pub static SIMD_SLOTS: AtomicUsize = AtomicUsize::new(0);
 pub static LR_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -139,11 +144,13 @@ pub unsafe fn checked_classify(
     addr: usize,
     kind: HostFaultKind,
     regs: &mut HostRegisters,
+    raw: RawHostFault,
 ) -> bool {
-    IN_CLASSIFIER.store(true, Ordering::Relaxed);
-    let result = classify(handle, pc, addr, kind, regs);
-    IN_CLASSIFIER.store(false, Ordering::Relaxed);
-    result
+    if LEGACY_CLASSIFIER.load(Ordering::Relaxed) {
+        x86jit_core::jit_abi::fault::classify(handle, pc, addr, kind, regs)
+    } else {
+        classify_with_raw_fault(handle, pc, addr, kind, regs, raw)
+    }
 }
 
 pub static HANDLE: AtomicUsize = AtomicUsize::new(0);
@@ -174,7 +181,12 @@ unsafe fn linux_fpsimd(context: *mut libc::ucontext_t) -> Option<*mut u128> {
     None
 }
 
-unsafe fn recover(context: *mut libc::c_void, addr: usize, kind: HostFaultKind) -> bool {
+unsafe fn recover(
+    context: *mut libc::c_void,
+    addr: usize,
+    kind: HostFaultKind,
+    raw: RawHostFault,
+) -> bool {
     // Keep the kernel's allocation provenance: arm64 libc's mcontext is too small.
     // FreeBSD 14.3 sys/sys/_ucontext.h places mcontext after the 16-byte sigset
     // (sys/sys/_sigset.h); its required alignment is 16.
@@ -270,7 +282,8 @@ unsafe fn recover(context: *mut libc::c_void, addr: usize, kind: HostFaultKind) 
     let foreign = FOREIGN.load(Ordering::Relaxed);
     if foreign != 0
         && x86jit_core::codemap::lookup_recovery(regs.pc as usize).is_some()
-        && (checked_classify(foreign, regs.pc as usize, addr, kind, &mut regs) || regs != original)
+        && (checked_classify(foreign, regs.pc as usize, addr, kind, &mut regs, raw)
+            || regs != original)
     {
         libc::_exit(93);
     }
@@ -280,6 +293,7 @@ unsafe fn recover(context: *mut libc::c_void, addr: usize, kind: HostFaultKind) 
         addr,
         kind,
         &mut regs,
+        raw,
     ) {
         return false;
     }
@@ -455,6 +469,7 @@ pub fn esr_fault_kind(esr: u32) -> HostFaultKind {
 extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // SAFETY: this test installs SA_SIGINFO only in children, with live handles.
     unsafe {
+        IN_CLASSIFIER.store(true, Ordering::Relaxed);
         let kind = fault_kind(signal, (*info).si_code);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let kind = if kind == HostFaultKind::Unsupported {
@@ -473,17 +488,18 @@ extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: 
         } else {
             kind
         };
-        if recover(
-            context,
-            if kind == HostFaultKind::Unsupported {
-                0
-            } else {
-                (*info).si_addr() as usize
-            },
-            kind,
-        ) {
+        if kind != HostFaultKind::Unsupported
+            && recover(
+                context,
+                (*info).si_addr() as usize,
+                kind,
+                fault_context::extract(signal, &*info, context),
+            )
+        {
+            IN_CLASSIFIER.store(false, Ordering::Relaxed);
             return;
         }
+        IN_CLASSIFIER.store(false, Ordering::Relaxed);
         // Restore default and return: the synchronous instruction faults again.
         libc::signal(signal, libc::SIG_DFL);
         if kind == HostFaultKind::Unsupported {

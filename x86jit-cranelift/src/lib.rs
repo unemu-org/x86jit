@@ -206,7 +206,7 @@ unsafe extern "C" fn string_helper(
     addr_bits: u64,
     seg_base: u64,
 ) -> u64 {
-    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_UNMAPPED};
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_UNMAPPED_DETAIL};
     use x86jit_core::{RepKind, StrOp};
 
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -264,7 +264,10 @@ unsafe extern "C" fn string_helper(
                 f.addr,
                 u64::from(f.elem),
             );
-            RET_UNMAPPED
+            ctx.record_helper_trap(f.trap);
+            ctx.next_entry = cur_addr;
+            ctx.link_slot = f.addr;
+            RET_UNMAPPED_DETAIL
         }
     };
     if track {
@@ -309,8 +312,15 @@ unsafe extern "C" fn cas_pair_helper(
             ctx.exception_vector = vector as u64;
             RET_EXCEPTION
         }
-        Some(x86jit_core::Exit::UnmappedMemory { addr: at, .. }) => {
+        Some(exit @ x86jit_core::Exit::UnmappedMemory { addr: at, .. }) => {
             ctx.record_helper_fault(at, size, true, addr, size);
+            if let Some(detail) = exit.fault_metadata() {
+                ctx.record_helper_trap(match detail.origin() {
+                    x86jit_core::FaultOrigin::HostAccess => x86jit_core::MemTrap::HostFault,
+                    x86jit_core::FaultOrigin::GuestMap => x86jit_core::MemTrap::Unmapped,
+                    _ => x86jit_core::MemTrap::NonCanonical,
+                });
+            }
             RET_UNMAPPED
         }
         // Re-execute in the interpreter so the dispatcher returns the precise
@@ -413,6 +423,7 @@ unsafe extern "C" fn x87_helper<const CHECK_FDP: bool>(
         Some((fault, write)) => {
             let width = x86jit_core::x87::mem_operand_bytes(kind);
             ctx.record_helper_fault(fault, width, write, addr, width);
+            ctx.record_fp_failure();
             cpu.rip = cur_addr;
             RET_UNMAPPED
         }
@@ -455,6 +466,7 @@ unsafe extern "C" fn fxstate_helper(
         }
         Some(x86jit_core::x87::FpStateFault::Memory { addr: fault, write }) => {
             ctx.record_helper_fault(fault, 512, write, addr, 512);
+            ctx.record_fp_failure();
             cpu.rip = cur_addr;
             RET_UNMAPPED
         }
@@ -652,6 +664,7 @@ unsafe extern "C" fn vmaskmov_mem_helper(
             let (operand, width) =
                 x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -741,6 +754,7 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
             let (operand, width) =
                 x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -987,6 +1001,7 @@ unsafe extern "C" fn gf2p8_mem_helper(
                     x86jit_core::memory::active_operand_span(addr, width, 1, cpu.kmask[k as usize]);
             }
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -1189,6 +1204,7 @@ unsafe extern "C" fn vpermt2_mem_helper(
         Some(f) => {
             let (operand, width) = helper_operand_span(addr, bytes);
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -1273,6 +1289,7 @@ unsafe extern "C" fn vperm1_mem_helper(
         Some(f) => {
             let (operand, width) = helper_operand_span(addr, bytes);
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -1357,6 +1374,7 @@ unsafe extern "C" fn vpmov_narrow_mem_helper(
                 addr,
                 src_width / from * to,
             );
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -2053,6 +2071,7 @@ unsafe extern "C" fn broadcast_lane_mem_helper(
                 (base, chunk)
             };
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -2172,6 +2191,7 @@ unsafe extern "C" fn fma_mem_helper(
                 );
             }
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
+            ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
         }
     }
@@ -2981,10 +3001,11 @@ impl Shared {
         mxcsr_mode: u32,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
-        self.compile_with(
+        self.compile_with_fault_info(
             CompiledCodeKind::Block,
             ir.guest_start,
             mxcsr_mode,
+            x86jit_core::fault::InstructionFaultInfo::for_block(ir),
             |builder, helpers, alloc_slot| {
                 codegen::translate_block(
                     builder,
@@ -3011,10 +3032,15 @@ impl Shared {
         mxcsr_mode: u32,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
-        self.compile_with(
+        self.compile_with_fault_info(
             CompiledCodeKind::Region,
             region.entry,
             mxcsr_mode,
+            region
+                .blocks
+                .iter()
+                .flat_map(x86jit_core::fault::InstructionFaultInfo::for_block)
+                .collect(),
             |builder, helpers, alloc_slot| {
                 codegen::translate_region(
                     builder,
@@ -3031,16 +3057,32 @@ impl Shared {
         )
     }
 
+    #[cfg(test)]
+    fn compile_with(
+        &self,
+        kind: CompiledCodeKind,
+        guest_rip: u64,
+        mxcsr_mode: u32,
+        translate: impl FnOnce(
+            &mut FunctionBuilder,
+            codegen::Helpers,
+            &mut dyn FnMut() -> u64,
+        ) -> Box<[u64]>,
+    ) -> Result<CompiledPtr, CompileError> {
+        self.compile_with_fault_info(kind, guest_rip, mxcsr_mode, Vec::new(), translate)
+    }
+
     /// Shared function-building spine: sets up the signature, imports the helpers,
     /// runs `translate` to emit the body, and finalizes. `translate` receives the
     /// builder, the imported helper refs, and the link-slot allocator, and returns
     /// the full-width RIP array indexed by the emitted SourceLocs.
-    fn compile_with(
+    fn compile_with_fault_info(
         &self,
         // Observer metadata follows the real guest entry, before any source location.
         kind: CompiledCodeKind,
         guest_rip: u64,
         mxcsr_mode: u32,
+        instructions: Vec<x86jit_core::fault::InstructionFaultInfo>,
         translate: impl FnOnce(
             &mut FunctionBuilder,
             codegen::Helpers,
@@ -3390,13 +3432,14 @@ impl Shared {
         #[cfg(not(test))]
         let fail_registration = false;
         if fail_registration
-            || x86jit_core::codemap::register_with_recovery(
+            || x86jit_core::codemap::register_with_fault_info(
                 entry.0 as usize,
                 code_len,
                 srcloc_table,
                 guest_rips,
                 trap_sites,
                 recipe,
+                instructions,
             )
             .is_err()
         {
