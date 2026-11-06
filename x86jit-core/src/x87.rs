@@ -725,16 +725,18 @@ pub fn exec_fxstate_format<M: FpMem>(
         // Abridged FTW, physical-register indexed — see the restore path for the
         // measurement.
         buf[4] = !cpu.fpu_empty;
-        buf[6..8].copy_from_slice(&(cpu.fpu_fop & 0x7ff).to_le_bytes());
-        if wide {
-            buf[8..16].copy_from_slice(&cpu.fpu_fip.to_le_bytes());
-            buf[16..24].copy_from_slice(&cpu.fpu_fdp.to_le_bytes());
-        } else {
-            buf[8..12].copy_from_slice(&(cpu.fpu_fip as u32).to_le_bytes());
-            buf[16..20].copy_from_slice(&(cpu.fpu_fdp as u32).to_le_bytes());
-            let (fcs, fds) = saved_selectors(cpu);
-            buf[12..14].copy_from_slice(&fcs.to_le_bytes());
-            buf[20..22].copy_from_slice(&fds.to_le_bytes());
+        if saves_fx_pointers(cpu) {
+            buf[6..8].copy_from_slice(&(cpu.fpu_fop & 0x7ff).to_le_bytes());
+            if wide {
+                buf[8..16].copy_from_slice(&cpu.fpu_fip.to_le_bytes());
+                buf[16..24].copy_from_slice(&cpu.fpu_fdp.to_le_bytes());
+            } else {
+                buf[8..12].copy_from_slice(&(cpu.fpu_fip as u32).to_le_bytes());
+                buf[16..20].copy_from_slice(&(cpu.fpu_fdp as u32).to_le_bytes());
+                let (fcs, fds) = saved_selectors(cpu);
+                buf[12..14].copy_from_slice(&fcs.to_le_bytes());
+                buf[20..22].copy_from_slice(&fds.to_le_bytes());
+            }
         }
         // SDM Vol 2A §3.3 FXSAVE, Tables 3-48/3-49: MXCSR at 24, mask at 28.
         buf[24..28].copy_from_slice(&cpu.mxcsr.to_le_bytes());
@@ -841,7 +843,8 @@ fn tag_word(cpu: &CpuState) -> u16 {
 }
 
 /// The 28-byte protected/real-address environment (SDM Vol 1 §8.1.10,
-/// Figs. 8-9/8-10).
+/// Figs. 8-9/8-10). AMD64 APM Vol 5 FSTENV/FNSTENV saves the current
+/// environment without an ES condition, unlike FXSAVE.
 fn env28(cpu: &CpuState, real: bool) -> [u8; 28] {
     let mut buf = [0u8; 28];
     buf[0..2].copy_from_slice(&cpu.fpu_cw.to_le_bytes());
@@ -1141,8 +1144,8 @@ pub const X87_RECORD: u32 = 1 << 31;
 pub const X87_MEMORY: u32 = 1 << 30;
 
 /// Commit after successful memory accesses (SDM Vol 1 §§8.1.8–8.1.9).
-/// Register operands retain FDP (architecturally undefined); FOP changes only
-/// on an unmasked exception, without fopcode compatibility mode.
+/// Register operands retain FDP (architecturally undefined). FOP recording
+/// follows the selected model (SDM Vol 1 §8.1.9.1; AMD64 APM Vol 1 §6.2.5.2).
 #[inline(always)]
 pub fn record_x87_instruction(cpu: &mut CpuState, offset: u64, ip: u64, instruction: u32) {
     if instruction & X87_RECORD != 0 {
@@ -1156,7 +1159,8 @@ fn record_x87_operand(cpu: &mut CpuState, offset: u64, instruction: u32) {
     cpu.fpu_fcs = cpu.cs;
     // SDM Vol 1 §8.7.1: an unmasked exception sets ES. The waiting-op
     // precheck excludes a preexisting ES before any non-control op runs.
-    if cpu.fpu_sw & (1 << 7) != 0 {
+    // AMD64 APM Vol 1 §6.2.5.2: record the last non-control opcode.
+    if cpu.x87_pointer_model == crate::state::X87PointerModel::Amd || cpu.fpu_sw & (1 << 7) != 0 {
         cpu.fpu_fop = instruction as u16 & 0x7ff;
     }
     if instruction & X87_MEMORY != 0 && updates_data_pointer(cpu) {
@@ -1189,6 +1193,13 @@ fn pointer_features(cpu: &CpuState) -> u32 {
     } else {
         cpu.cpuid(7, 0).ebx
     }
+}
+
+/// AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE: export error pointers only with
+/// ES set in FXSAVE images. FNSTENV is unconditional (Vol 5 FSTENV/FNSTENV).
+/// Apply the embedder's policy at save time, retaining the recorded state.
+fn saves_fx_pointers(cpu: &CpuState) -> bool {
+    cpu.x87_pointer_model == crate::state::X87PointerModel::Sdm || cpu.fpu_sw & (1 << 7) != 0
 }
 
 fn saved_selectors(cpu: &CpuState) -> (u16, u16) {

@@ -21,7 +21,7 @@
 use std::collections::BTreeSet;
 
 use iced_x86::code_asm::*;
-use x86jit_core::InterpreterBackend;
+use x86jit_core::{Exit, InterpreterBackend, Prot, Reg, Vm, VmConfig, X87PointerModel};
 use x86jit_tests::compare::compare;
 use x86jit_tests::native::run_native;
 use x86jit_tests::oracle::{run_with_backend, VectorInput};
@@ -383,7 +383,7 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
     let native = run_native(&input).expect("host runs fxsave/fxrstor");
     let interp = run_with_backend(&input, Box::new(InterpreterBackend));
 
-    let page = |o: &x86jit_tests::oracle::RunOutcome| {
+    let page = |o: &x86jit_tests::oracle::RunOutcome, policy: X87PointerModel| {
         let mut b = o
             .mem
             .iter()
@@ -398,10 +398,12 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
         // both sides so the rest of the image is compared byte for byte rather than not
         // compared at all.
         b[128 + 28..128 + 32].fill(0);
-        if host_is_amd() {
+        if host_is_amd() && policy == X87PointerModel::Sdm {
             // AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE/FXRSTOR: with ES=0,
             // error pointers need not be saved/restored. Ryzen 7 7840HS (Zen 4)
-            // measured zero FOP/FIP/FDP in FXSAVE and the subsequent FNSTENV.
+            // measured zero FOP/FIP/FDP in FXSAVE. After FNINIT and FXRSTOR
+            // of that zero image, FNSTENV also saves zero pointers; FNSTENV
+            // itself saves unconditionally (APM Vol 5 FSTENV/FNSTENV).
             // Mask only these fields and their selectors in the native comparison;
             // retain reserved bytes (SDM Vol 2A §3.3 FXSAVE, Table 3-49;
             // Vol 1 §8.1.8). The engine's unmasked image is asserted below.
@@ -412,8 +414,8 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
         b
     };
     assert_eq!(
-        page(&native),
-        page(&interp),
+        page(&native, X87PointerModel::Sdm),
+        page(&interp, X87PointerModel::Sdm),
         "the fxsave image and everything after it, byte for byte"
     );
     let ours = &interp.mem.iter().find(|c| c.addr == SCRATCH).unwrap().bytes;
@@ -426,4 +428,26 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
     // ...and after the restore the full tag word says the same: R7 valid, the rest empty.
     let tw = u16::from_le_bytes([ours[64 + 8], ours[64 + 9]]);
     assert_eq!(tw, 0x3fff, "tag word after fxrstor");
+
+    if host_is_amd() {
+        for backend in [
+            Box::new(InterpreterBackend) as Box<dyn x86jit_core::Backend>,
+            Box::new(x86jit_cranelift::JitBackend::new()),
+        ] {
+            let mut vm = Vm::with_backend(VmConfig::flat(SCRATCH + 0x1000), backend);
+            vm.set_x87_pointer_model(X87PointerModel::Amd);
+            for chunk in &input.mem_init {
+                vm.map(chunk.addr, chunk.bytes.len(), Prot::RWX, chunk.kind.into())
+                    .unwrap();
+                vm.write_bytes(chunk.addr, &chunk.bytes).unwrap();
+            }
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, CODE);
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+            let mut saved = vec![0; 0x1000];
+            vm.read_bytes(SCRATCH, &mut saved).unwrap();
+            saved[128 + 28..128 + 32].fill(0);
+            assert_eq!(saved, page(&native, X87PointerModel::Amd));
+        }
+    }
 }

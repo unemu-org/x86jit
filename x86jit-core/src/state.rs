@@ -438,6 +438,25 @@ pub struct CpuState {
     /// This is separate from host FPCR/MXCSR saved by the fault landing stub.
     /// Appended to preserve every existing JIT ABI offset.
     pub mxcsr: u32,
+    /// Pointer/opcode model, inherited from the VM and editable between runs.
+    /// Appended to preserve every existing JIT ABI offset.
+    pub x87_pointer_model: X87PointerModel,
+}
+
+/// Selects x87 opcode recording and pointer/opcode saving independently of CPUID.
+/// Environment loading is unchanged. FNSTENV saves the recorded environment in
+/// both models (AMD64 APM Vol 5 FSTENV/FNSTENV).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum X87PointerModel {
+    /// Record FOP on unmasked exceptions (SDM Vol 1 §8.1.9.1, without FOP
+    /// compatibility mode); always save recorded pointers/opcode.
+    #[default]
+    Sdm,
+    /// Record FOP for every non-control instruction (AMD64 APM Vol 1 §6.2.5.2).
+    /// FXSAVE and direct `exec_fxstate` export save pointers/opcode only with
+    /// FSW.ES set, otherwise zeros (AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE).
+    Amd,
 }
 
 /// One atomic TSC/TSC_AUX sample (SDM Vol 3B §20.17.2).
@@ -553,6 +572,7 @@ impl Default for CpuState {
             fs: 0,
             gs: 0,
             mxcsr: MXCSR_RESET,
+            x87_pointer_model: X87PointerModel::default(),
         }
     }
 }

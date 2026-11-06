@@ -3,12 +3,51 @@ use iced_x86::code_asm::*;
 use std::cell::RefCell;
 use x86jit_core::{
     x87::{exec_fxstate, FpMem},
-    Backend, CpuState, Exit, InterpreterBackend, Prot, Reg, RegionKind, Vm, VmConfig,
+    Backend, CpuMode, CpuState, Exit, InterpreterBackend, Prot, Reg, RegionKind, Vm, VmConfig,
+    X87PointerModel,
 };
 
 const CODE: u64 = 0x21_0000;
 const DATA: u64 = 0x22_0000;
 const OUT: u64 = 0x23_0000;
+
+// AMD64 APM Vol 1 §6.2.5.2; Vol 5 FSTENV/FNSTENV: last non-control
+// opcode is recorded and saved even when no unmasked exception is pending.
+fn opcode_models(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x30_0000), backend);
+    for addr in [CODE, DATA, OUT] {
+        vm.map(addr, 4096, Prot::RWX, RegionKind::Ram).unwrap();
+    }
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fld(qword_ptr(DATA)).unwrap(); // DD /0, absolute SIB: FOP=0x504.
+    a.fnstenv(ptr(OUT)).unwrap();
+    a.fld1().unwrap(); // D9 E8: register form also records FOP.
+    a.fnstenv(ptr(OUT + 32)).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    vm.write_bytes(DATA, &2f64.to_le_bytes()).unwrap();
+    for model in SAVE_POLICIES {
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.x87_pointer_model = model;
+        cpu.set_reg(Reg::Rip, CODE);
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        let mut out = [0; 60];
+        vm.read_bytes(OUT, &mut out).unwrap();
+        assert_eq!(cpu.cpu.fpu_sw & 0x80, 0);
+        let expected = if model == X87PointerModel::Amd {
+            [0x504u16, 0x1e8]
+        } else {
+            [0, 0]
+        };
+        for (base, opcode) in [0, 32].into_iter().zip(expected) {
+            assert_eq!(
+                u16::from_le_bytes(out[base + 18..base + 20].try_into().unwrap()),
+                opcode
+            );
+        }
+        assert_eq!(cpu.cpu.fpu_fop, expected[1]);
+    }
+}
 
 fn image() -> [u8; 512] {
     let mut b = [0; 512];
@@ -43,6 +82,153 @@ fn fxstate_helper_retains_edited_pointers() {
     assert_eq!(exec_fxstate(&mut cpu, &mem, 0, true), None);
     assert_eq!(exec_fxstate(&mut cpu, &mem, 0, false), None);
     assert_eq!(&mem.0.borrow()[6..24], &expected[6..24]);
+}
+
+// SDM Vol 1 §§8.1.8–8.1.9; AMD64 APM Vol 2 §11.4.4.3, Vol 5 FXSAVE:
+// the AMD-style save policy tests ES, not merely a sticky exception flag.
+const SAVE_POLICIES: [X87PointerModel; 2] = [X87PointerModel::Sdm, X87PointerModel::Amd];
+
+#[test]
+fn x87_pointer_model_policy_fxstate_export() {
+    struct Image(RefCell<[u8; 512]>);
+    impl FpMem for Image {
+        fn load(&self, _: u64, buf: &mut [u8]) -> bool {
+            buf.copy_from_slice(&*self.0.borrow());
+            true
+        }
+        fn store(&self, _: u64, buf: &[u8]) -> bool {
+            self.0.borrow_mut().copy_from_slice(buf);
+            true
+        }
+    }
+    for policy in SAVE_POLICIES {
+        for sw in [0u16, 1, 0x8081] {
+            let mut initial = image();
+            initial[2..4].copy_from_slice(&sw.to_le_bytes());
+            let mem = Image(RefCell::new(initial));
+            let mut cpu = CpuState {
+                x87_pointer_model: policy,
+                ..CpuState::default()
+            };
+            assert_eq!(exec_fxstate(&mut cpu, &mem, 0, true), None);
+            assert_eq!(cpu.fpu_fip, u64_at(&initial, 8));
+            assert_eq!(cpu.fpu_fdp, u64_at(&initial, 16));
+            assert_eq!(cpu.fpu_fop, 0x523);
+            assert_eq!(exec_fxstate(&mut cpu, &mem, 0, false), None);
+            let saved = mem.0.borrow();
+            if policy == X87PointerModel::Amd && sw & 0x80 == 0 {
+                assert_eq!(&saved[6..24], &[0; 18]);
+            } else {
+                assert_eq!(&saved[6..24], &initial[6..24]);
+            }
+            assert_eq!(&saved[..6], &initial[..6]);
+            assert_eq!(&saved[24..28], &initial[24..28]);
+        }
+    }
+}
+
+fn save_policy_images(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x30_0000), backend);
+    vm.map(0, 0x30_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        vm.set_cpu_mode(mode);
+        for policy in SAVE_POLICIES {
+            vm.set_x87_pointer_model(policy);
+            for sw in [0u16, 1, 0x8081] {
+                // Imports are deliberately tested even with ES clear: the policy
+                // filters exports without discarding restored state.
+                for import in 0..3 {
+                    if mode == CpuMode::Compat32 && import == 0 {
+                        continue;
+                    }
+                    let mut a =
+                        CodeAssembler::new(if mode == CpuMode::Long64 { 64 } else { 32 }).unwrap();
+                    if import == 2 {
+                        a.fldenv(ptr(DATA + 512)).unwrap();
+                    } else {
+                        fx(&mut a, true, import == 0, DATA);
+                    }
+                    fx(&mut a, false, mode == CpuMode::Long64, OUT);
+                    fx(&mut a, false, false, OUT + 512);
+                    a.fnstenv(ptr(OUT + 1024)).unwrap();
+                    a.hlt().unwrap();
+                    let mut initial = image().to_vec();
+                    initial[2..4].copy_from_slice(&sw.to_le_bytes());
+                    let fip = if import == 0 {
+                        u64_at(&initial, 8)
+                    } else {
+                        u64_at(&initial, 8) as u32 as u64
+                    };
+                    let fdp = if import == 0 {
+                        u64_at(&initial, 16)
+                    } else {
+                        u64_at(&initial, 16) as u32 as u64
+                    };
+                    let (fcs, fds) = if import == 0 {
+                        (0u16, 0u16)
+                    } else {
+                        (0x5678, 0x6789)
+                    };
+                    let mut env = [0u8; 28];
+                    env[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+                    env[4..6].copy_from_slice(&sw.to_le_bytes());
+                    env[8..10].copy_from_slice(&0xffffu16.to_le_bytes());
+                    env[12..16].copy_from_slice(&(fip as u32).to_le_bytes());
+                    env[16..18].copy_from_slice(&fcs.to_le_bytes());
+                    env[18..20].copy_from_slice(&0x0523u16.to_le_bytes());
+                    env[20..24].copy_from_slice(&(fdp as u32).to_le_bytes());
+                    env[24..26].copy_from_slice(&fds.to_le_bytes());
+                    initial.extend_from_slice(&env);
+                    vm.write_bytes(DATA, &initial).unwrap();
+                    let code = a.assemble(CODE).unwrap();
+                    vm.write_bytes(CODE, &code).unwrap();
+                    let mut cpu = vm.new_vcpu();
+                    cpu.set_reg(Reg::Rip, CODE);
+                    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                    assert_eq!(
+                        (cpu.cpu.fpu_fip, cpu.cpu.fpu_fdp, cpu.cpu.fpu_fop),
+                        (fip, fdp, 0x523)
+                    );
+                    assert_eq!((cpu.cpu.fpu_fcs, cpu.cpu.fpu_fds), (fcs, fds));
+                    let mut out = [0; 1536];
+                    vm.read_bytes(OUT, &mut out).unwrap();
+                    let visible = policy == X87PointerModel::Sdm || sw & 0x80 != 0;
+                    for base in [0, 512] {
+                        assert_eq!(&out[base + 2..base + 4], &sw.to_le_bytes());
+                        assert_eq!(
+                            &out[base + 6..base + 8],
+                            &(if visible { 0x523u16 } else { 0 }).to_le_bytes()
+                        );
+                        if base == 0 && mode == CpuMode::Long64 {
+                            assert_eq!(u64_at(&out, base + 8), if visible { fip } else { 0 });
+                            assert_eq!(u64_at(&out, base + 16), if visible { fdp } else { 0 });
+                        } else {
+                            assert_eq!(
+                                &out[base + 8..base + 12],
+                                &(if visible { fip as u32 } else { 0 }).to_le_bytes()
+                            );
+                            assert_eq!(
+                                &out[base + 16..base + 20],
+                                &(if visible { fdp as u32 } else { 0 }).to_le_bytes()
+                            );
+                            assert_eq!(
+                                &out[base + 12..base + 14],
+                                &(if visible { fcs } else { 0 }).to_le_bytes()
+                            );
+                            assert_eq!(
+                                &out[base + 20..base + 22],
+                                &(if visible { fds } else { 0 }).to_le_bytes()
+                            );
+                        }
+                    }
+                    assert_eq!(&out[1028..1030], &sw.to_le_bytes());
+                    // AMD64 APM Vol 5 FSTENV (FNSTENV): save the current
+                    // environment regardless of ES, unlike FXSAVE.
+                    assert_eq!(&out[1036..1050], &env[12..26]);
+                }
+            }
+        }
+    }
 }
 
 fn run(code: &[u8], data: &[u8], backend: Box<dyn Backend>) -> Vec<u8> {
@@ -92,6 +278,85 @@ macro_rules! tiers {
             $case(Box::new(x86jit_cranelift::JitBackend::new()));
         }
     };
+}
+tiers!(
+    x87_pointer_model_policy_images_interp,
+    x87_pointer_model_policy_images_jit,
+    save_policy_images
+);
+
+fn save_policy_retains_recording(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x30_0000), backend);
+    vm.map(0, 0x30_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    assert_eq!(vm.x87_pointer_model(), X87PointerModel::Sdm);
+    let original = vm.new_vcpu();
+    vm.set_x87_pointer_model(X87PointerModel::Amd);
+    assert_eq!(original.cpu.x87_pointer_model, X87PointerModel::Sdm);
+    let child = vm.fork_with_backend(Box::new(InterpreterBackend)).unwrap();
+    assert_eq!(child.new_vcpu().cpu.x87_pointer_model, X87PointerModel::Amd);
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fld(qword_ptr(DATA)).unwrap();
+    let save_ip = CODE + a.assemble(CODE).unwrap().len() as u64;
+    fx(&mut a, false, true, OUT);
+    a.hlt().unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    vm.write_bytes(DATA, &2f64.to_le_bytes()).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!((cpu.cpu.fpu_fip, cpu.cpu.fpu_fdp), (CODE, DATA));
+    let mut out = [0; 512];
+    vm.read_bytes(OUT, &mut out).unwrap();
+    assert_eq!(&out[6..24], &[0; 18]);
+    // The same recorded state becomes visible after either a policy change or ES.
+    for policy in SAVE_POLICIES {
+        cpu.cpu.x87_pointer_model = policy;
+        cpu.cpu.fpu_sw = if policy == X87PointerModel::Sdm {
+            0
+        } else {
+            0x80
+        };
+        cpu.set_reg(Reg::Rip, save_ip);
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        vm.read_bytes(OUT, &mut out).unwrap();
+        assert_eq!(u64_at(&out, 8), CODE);
+        assert_eq!(u64_at(&out, 16), DATA);
+    }
+}
+tiers!(
+    x87_pointer_model_policy_recording_interp,
+    x87_pointer_model_policy_recording_jit,
+    save_policy_retains_recording
+);
+
+#[test]
+fn x87_pointer_model_policy_real_environment() {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(InterpreterBackend));
+    vm.set_cpu_mode(CpuMode::Real16);
+    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x100, &[0x66, 0xd9, 0x36, 0x00, 0x08, 0xf4])
+        .unwrap();
+    for policy in SAVE_POLICIES {
+        vm.set_x87_pointer_model(policy);
+        for sw in [0u16, 1, 0x8081] {
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.fpu_sw = sw;
+            cpu.cpu.fpu_fip = 0x12345678;
+            cpu.cpu.fpu_fdp = 0x23456789;
+            cpu.cpu.fpu_fop = 0x523;
+            cpu.set_reg(Reg::Rip, 0x100);
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+            let mut out = [0; 28];
+            vm.read_bytes(0x800, &mut out).unwrap();
+            // AMD64 APM Vol 5 FSTENV (FNSTENV): no ES condition.
+            let expected = [0x5678u32, 0x01234523, 0x6789, 0x02345000];
+            for (offset, value) in [12, 16, 20, 24].into_iter().zip(expected) {
+                assert_eq!(&out[offset..offset + 4], &value.to_le_bytes());
+            }
+            assert_eq!(&out[4..6], &sw.to_le_bytes());
+        }
+    }
 }
 fn fx(asm: &mut CodeAssembler, restore: bool, wide: bool, addr: u64) {
     // SDM Vol 2A §3.3 FXSAVE/FXRSTOR: REX.W selects the 64-bit pointer image.
@@ -384,6 +649,55 @@ fn host_is_amd() -> bool {
             u32::from_le_bytes(*b"cAMD"),
         )
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn native_save_policy(backend: Box<dyn Backend>) {
+    if !host_is_amd() {
+        return;
+    }
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fld(qword_ptr(DATA)).unwrap();
+    fx(&mut a, false, true, OUT);
+    fx(&mut a, false, false, OUT + 512);
+    a.fnstenv(ptr(OUT + 480)).unwrap();
+    a.fldcw(word_ptr(DATA + 8)).unwrap();
+    a.fdiv(qword_ptr(DATA + 16)).unwrap();
+    fx(&mut a, false, true, OUT + 1024);
+    fx(&mut a, false, false, OUT + 1536);
+    a.fnstenv(ptr(OUT + 1504)).unwrap();
+    a.hlt().unwrap();
+    let code = a.assemble(CODE).unwrap();
+    let mut data = [0; 24];
+    data[..8].copy_from_slice(&2f64.to_le_bytes());
+    data[8..10].copy_from_slice(&0x037bu16.to_le_bytes());
+    let native = native_output(code.clone(), data.to_vec());
+    let ours = run_config(&code, &data, backend, CpuMode::Long64, |cpu| {
+        // SDM Vol 1 §8.1.8: live selectors are saved when EBX[13] is clear.
+        // Zen 4 CI measured native FCS=0x33; match its user CS rather than
+        // the vCPU's default CS=0, retaining exact selector comparisons below.
+        assert_eq!(cpu.cpuid(7, 0).ebx & (1 << 13), 0);
+        cpu.cs = 0x33;
+        cpu.x87_pointer_model = X87PointerModel::Amd;
+    });
+    // APM Vol 2 §11.4.4.3; Vol 5 FXSAVE: exact pointer/opcode comparisons
+    // on AMD for ES clear and set, without the default policy's exclusions.
+    // Vol 5 FSTENV (FNSTENV) saves the environment regardless of ES;
+    // Zen 4 measured nonzero FIP/FCS/FOP/FDP with ES clear.
+    for base in [0, 512, 1024, 1536] {
+        assert_eq!(&ours[base + 2..base + 4], &native[base + 2..base + 4]);
+        assert_eq!(&ours[base + 6..base + 24], &native[base + 6..base + 24]);
+    }
+    for base in [480, 1504] {
+        assert_eq!(&ours[base + 4..base + 6], &native[base + 4..base + 6]);
+        assert_eq!(&ours[base + 12..base + 26], &native[base + 12..base + 26]);
+    }
+}
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+tiers!(
+    x87_pointer_model_policy_native_interp,
+    x87_pointer_model_policy_native_jit,
+    native_save_policy
+);
 
 // AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE/FXRSTOR: error pointers are
 // saved/restored only with ES=1. Ryzen 7 7840HS (Zen 4) measured FOP/FIP/FDP
@@ -699,4 +1013,10 @@ tiers!(
     x87_pointer_sticky_flags_preserve_opcode_interp,
     x87_pointer_sticky_flags_preserve_opcode_jit,
     opcode_requires_a_new_unmasked_exception
+);
+
+tiers!(
+    x87_opcode_models_interp,
+    x87_opcode_models_jit,
+    opcode_models
 );

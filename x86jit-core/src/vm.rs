@@ -385,6 +385,7 @@ pub struct Vm {
     /// selects a different ISA level via [`Vm::set_guest_cpu_features`] before spawning
     /// vcpus.
     features: crate::features::GuestCpuFeatures,
+    x87_pointer_model: crate::state::X87PointerModel,
     cpuid_table: Option<Arc<crate::features::CpuidTable>>,
     cpu_source: Option<Arc<dyn crate::state::CpuSource>>,
     next_source_id: Arc<AtomicU64>,
@@ -476,6 +477,22 @@ impl Vm {
         self.features = features;
     }
 
+    /// Select the x87 pointer/opcode model inherited by new vCPUs.
+    /// Defaults to [`Sdm`](crate::state::X87PointerModel::Sdm); independent of
+    /// CPUID tables and overrides. Existing vCPUs retain their setting, which the
+    /// embedder can edit through [`CpuState::x87_pointer_model`]. VM forks inherit it.
+    /// Applies to FXSAVE (both widths) and direct `exec_fxstate` export.
+    /// The AMD model also records every non-control instruction opcode.
+    /// FNSTENV saves the recorded environment; restore operations are unchanged.
+    pub fn set_x87_pointer_model(&mut self, policy: crate::state::X87PointerModel) {
+        self.x87_pointer_model = policy;
+    }
+
+    /// The x87 pointer/opcode model new vCPUs inherit.
+    pub fn x87_pointer_model(&self) -> crate::state::X87PointerModel {
+        self.x87_pointer_model
+    }
+
     /// Install a complete CPUID table for new vCPUs. `None` restores the selected
     /// `GuestCpuFeatures` projection. Existing vCPUs retain their CPU description.
     /// A table replaces all CPUID replies; `set_guest_cpu_features` still selects
@@ -542,6 +559,7 @@ impl Vm {
             tier_up_background: self.tier_up_background,
             tier_up_region_after: self.tier_up_region_after,
             features: self.features,
+            x87_pointer_model: self.x87_pointer_model,
             cpuid_table: self.cpuid_table.clone(),
             cpu_source: self.cpu_source.clone(),
             next_source_id: self.next_source_id.clone(),
@@ -563,6 +581,7 @@ impl Vm {
             tier_up_background: false,
             tier_up_region_after: None,
             features: crate::features::GuestCpuFeatures::default(),
+            x87_pointer_model: crate::state::X87PointerModel::default(),
             cpuid_table: None,
             cpu_source: None,
             next_source_id: Arc::new(AtomicU64::new(0)),
@@ -745,6 +764,7 @@ impl Vm {
     ) -> Vcpu {
         let mut cpu = CpuState::new();
         cpu.features = self.features; // ISA level the embedder chose
+        cpu.x87_pointer_model = self.x87_pointer_model;
         cpu.cpuid_table = self.cpuid_table.clone();
         cpu.cpuid_overrides = overrides;
         cpu.cpu_source = self.cpu_source.clone();

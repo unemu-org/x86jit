@@ -429,7 +429,8 @@ impl Translator<'_, '_> {
                     .load(types::I16, MemFlags::trusted(), self.cpu, self.offsets.cs);
             self.store_cpu(self.offsets.fpu_fcs, cs);
             // SDM Vol 1 §§8.1.9, 8.7.1: FOP captures the constant opcode
-            // only when this operation sets ES for an unmasked exception.
+            // when this operation sets ES for an unmasked exception.
+            // AMD64 APM Vol 1 §6.2.5.2: AMD records every non-control opcode.
             let sw = self.builder.ins().load(
                 types::I16,
                 MemFlags::trusted(),
@@ -438,9 +439,21 @@ impl Translator<'_, '_> {
             );
             let es = self.builder.ins().band_imm(sw, 1 << 7);
             let raised = self.builder.ins().icmp_imm(IntCC::NotEqual, es, 0);
+            let model = self.builder.ins().load(
+                types::I8,
+                MemFlags::trusted(),
+                self.cpu,
+                std::mem::offset_of!(x86jit_core::CpuState, x87_pointer_model) as i32,
+            );
+            let amd = self.builder.ins().icmp_imm(
+                IntCC::Equal,
+                model,
+                x86jit_core::X87PointerModel::Amd as i64,
+            );
+            let records = self.builder.ins().bor(raised, amd);
             let commit = self.builder.create_block();
             let next = self.builder.create_block();
-            self.builder.ins().brif(raised, commit, &[], next, &[]);
+            self.builder.ins().brif(records, commit, &[], next, &[]);
             self.builder.switch_to_block(commit);
             let fop = self
                 .builder

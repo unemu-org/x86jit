@@ -102,8 +102,8 @@ pub use memory::{
     MemoryModel, Prot, RegionKind,
 };
 pub use state::{
-    CpuSource, CpuState, Flags, RandomKind, Reg, TscSample, X87Precision, AF_SRC_ONE, AF_SRC_ZERO,
-    PF_SRC_ONE, PF_SRC_ZERO,
+    CpuSource, CpuState, Flags, RandomKind, Reg, TscSample, X87PointerModel, X87Precision,
+    AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
 };
 pub use vm::{
     Backend, ExitRequest, InterpreterBackend, MemConsistency, TierUpFinished, TierUpRequest,
