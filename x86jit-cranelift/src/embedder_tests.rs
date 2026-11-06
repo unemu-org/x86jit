@@ -649,3 +649,313 @@ fn review_compile_completion_notifies_during_unwind() {
     waiter.join().unwrap();
     jit.tier_up_handle().wait_idle();
 }
+
+fn telemetry_ir() -> IrBlock {
+    let mem = memory(&[0xf4]);
+    lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap()
+}
+
+fn assert_lock_sample(sample: &LockTelemetry, count: u64) {
+    assert_eq!(sample.acquisitions, count);
+    assert!(sample.total_hold_ns > 0);
+    assert!(sample.max_hold_ns > 0);
+    assert!(sample.total_hold_ns >= sample.max_hold_ns);
+    assert!(sample.total_wait_ns >= sample.max_wait_ns);
+    assert_eq!(sample.hold_histogram.iter().sum::<u64>(), count);
+    assert_eq!(sample.wait_histogram.iter().sum::<u64>(), count);
+}
+
+fn wait_for_telemetry_waiters(jit: &JitBackend, expected: &[(LockKind, usize)]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !expected
+        .iter()
+        .all(|&(kind, count)| jit.shared.lock_telemetry.waiting(kind) == count)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed lock waiters did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn lock_telemetry_switch_modes_and_reset() {
+    let jit = JitBackend::new();
+    let ir = telemetry_ir();
+    for mode in [0, 1] {
+        jit.shared
+            .compile(&ir, MemConsistency::Fast, None, 0, mode)
+            .unwrap();
+    }
+    jit.invalidate_links();
+    assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
+    jit.set_lock_telemetry(true);
+    for mode in [0, 1, 0] {
+        jit.shared
+            .compile(&ir, MemConsistency::Fast, None, 0, mode)
+            .unwrap();
+    }
+    let snapshot = jit.lock_telemetry();
+    assert_lock_sample(&snapshot.compile_serial, 3);
+    assert_lock_sample(&snapshot.default_module, 2);
+    assert_lock_sample(&snapshot.nondefault_module, 1);
+    jit.set_lock_telemetry(false);
+    jit.shared
+        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .unwrap();
+    jit.invalidate_links();
+    assert_eq!(jit.lock_telemetry(), snapshot);
+    jit.reset_lock_telemetry();
+    assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
+    jit.set_lock_telemetry(true);
+    jit.shared
+        .compile(&ir, MemConsistency::Fast, None, 0, 1)
+        .unwrap();
+    assert_lock_sample(&jit.lock_telemetry().nondefault_module, 1);
+    assert_eq!(jit.lock_telemetry().default_module.acquisitions, 0);
+}
+
+#[test]
+fn lock_telemetry_invalidation_does_not_build_modules() {
+    let jit = JitBackend::new();
+    jit.set_lock_telemetry(true);
+    jit.invalidate_links();
+    let snapshot = jit.lock_telemetry();
+    assert_lock_sample(&snapshot.default_module, 1);
+    assert_lock_sample(&snapshot.nondefault_module, 1);
+    assert!(jit.shared.inner.try_lock().unwrap().is_none());
+    assert!(jit.shared.nondefault_inner.try_lock().unwrap().is_none());
+}
+
+#[test]
+fn lock_telemetry_compile_errors_release_guards() {
+    for stage in 1..=4 {
+        let jit = JitBackend::new();
+        jit.set_lock_telemetry(true);
+        jit.shared
+            .fail_compile_stage
+            .store(stage, Ordering::Relaxed);
+        assert!(jit
+            .shared
+            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+            .is_err());
+        assert_lock_sample(&jit.lock_telemetry().default_module, 1);
+        assert_lock_sample(&jit.lock_telemetry().compile_serial, 1);
+        assert!(jit.shared.compile_serial.try_lock().is_ok());
+        assert!(jit.shared.inner.try_lock().is_ok());
+        let snapshot = jit.lock_telemetry();
+        assert!(jit
+            .shared
+            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+            .is_err());
+        assert_eq!(jit.lock_telemetry(), snapshot);
+    }
+    let jit = JitBackend::new();
+    jit.set_lock_telemetry(true);
+    jit.set_compile_limit(0);
+    assert!(jit
+        .shared
+        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+        .is_err());
+    assert_lock_sample(&jit.lock_telemetry().default_module, 1);
+    assert_lock_sample(&jit.lock_telemetry().compile_serial, 1);
+}
+
+#[test]
+fn lock_telemetry_compile_unwind_and_poison_recovery() {
+    let jit = JitBackend::new();
+    jit.set_lock_telemetry(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = jit
+            .shared
+            .compile_with(CompiledCodeKind::Block, 0x1000, 0, |_, _, _| {
+                panic!("compile telemetry unwind probe");
+            });
+    }));
+    assert!(result.is_err());
+    assert!(jit.shared.inner.is_poisoned());
+    assert!(jit.shared.compile_serial.is_poisoned());
+    assert_lock_sample(&jit.lock_telemetry().default_module, 1);
+    assert_lock_sample(&jit.lock_telemetry().compile_serial, 1);
+    // Reacquire the poisoned compilation locks through their timed paths.
+    // The injected panic may also poison unrelated compiler state.
+    let serial = jit.shared.lock_telemetry.lock(
+        &jit.shared.compile_serial,
+        LockKind::CompileSerial,
+        "JIT compilation",
+    );
+    drop(jit.shared.jit(0));
+    drop(serial);
+    assert_lock_sample(&jit.lock_telemetry().default_module, 2);
+    assert_lock_sample(&jit.lock_telemetry().compile_serial, 2);
+}
+
+#[test]
+fn lock_telemetry_observer_runs_after_release() {
+    let jit = Arc::new(JitBackend::new());
+    jit.set_lock_telemetry(true);
+    let weak = Arc::downgrade(&jit);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let output = seen.clone();
+    jit.set_compiled_code_observer(move |_| {
+        let jit = weak.upgrade().unwrap();
+        if jit.shared.inner.try_lock().is_ok()
+            && jit.shared.nondefault_inner.try_lock().is_ok()
+            && jit.shared.compile_serial.try_lock().is_ok()
+            && jit.lock_telemetry().default_module.acquisitions == 1
+            && jit.lock_telemetry().compile_serial.acquisitions == 1
+        {
+            jit.reset_lock_telemetry();
+            output.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    jit.shared
+        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+        .unwrap();
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+    assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
+}
+
+#[test]
+fn lock_telemetry_compilers_wait_for_module() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let jit = Arc::new(JitBackend::new());
+    jit.set_lock_telemetry(true);
+    // Keep module ownership deterministic while both compiling threads start.
+    let held = jit.shared.jit(0);
+    let (started, ready) = channel();
+    let (finished, done) = channel();
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let jit = jit.clone();
+        let started = started.clone();
+        let finished = finished.clone();
+        workers.push(std::thread::spawn(move || {
+            let ir = telemetry_ir();
+            started.send(()).unwrap();
+            jit.shared
+                .compile(&ir, MemConsistency::Fast, None, 0, 0)
+                .unwrap();
+            finished.send(()).unwrap();
+        }));
+    }
+    for _ in 0..2 {
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+    // One compiler waits on the held module, keeping the other on serial.
+    wait_for_telemetry_waiters(
+        &jit,
+        &[(LockKind::DefaultModule, 1), (LockKind::CompileSerial, 1)],
+    );
+    assert!(done.recv_timeout(Duration::from_millis(30)).is_err());
+    drop(held);
+    for _ in 0..2 {
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let snapshot = jit.lock_telemetry();
+    assert_lock_sample(&snapshot.default_module, 3);
+    assert!(snapshot.default_module.max_wait_ns >= 10_000_000);
+    assert_lock_sample(&snapshot.compile_serial, 2);
+    assert!(snapshot.compile_serial.max_wait_ns >= 10_000_000);
+}
+
+#[test]
+fn lock_telemetry_switch_and_reset_with_active_guards() {
+    let jit = JitBackend::new();
+    jit.set_lock_telemetry(true);
+    let module = jit.shared.lock_module(0);
+    jit.reset_lock_telemetry();
+    assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
+    jit.set_lock_telemetry(false);
+    drop(module);
+    assert_lock_sample(&jit.lock_telemetry().default_module, 1);
+    let module = jit.shared.lock_module(1);
+    jit.set_lock_telemetry(true);
+    drop(module);
+    assert_eq!(jit.lock_telemetry().nondefault_module.acquisitions, 0);
+    jit.reset_lock_telemetry();
+    drop(jit.shared.lock_module(1));
+    assert_lock_sample(&jit.lock_telemetry().nondefault_module, 1);
+}
+
+#[test]
+fn lock_telemetry_compilers_wait_for_serial_separately() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let jit = Arc::new(JitBackend::new());
+    jit.set_lock_telemetry(true);
+    let (holding, held) = channel();
+    let (release, released) = channel();
+    let (compiler_finished, compiler_done) = channel();
+    let first = jit.clone();
+    let compiler = std::thread::spawn(move || {
+        first
+            .shared
+            .compile_with(
+                CompiledCodeKind::Block,
+                0x1000,
+                0,
+                |builder, helpers, slots| {
+                    holding.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(3)).unwrap();
+                    codegen::translate_block(
+                        builder,
+                        &telemetry_ir(),
+                        &first.shared.offsets,
+                        slots,
+                        helpers,
+                        MemConsistency::Fast,
+                        None,
+                        0,
+                        false,
+                    )
+                },
+            )
+            .unwrap();
+        compiler_finished.send(()).unwrap();
+    });
+    held.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(jit.shared.compile_serial.try_lock().is_err());
+    // The other mode's module is free while the first compiler holds serial.
+    assert!(jit.shared.nondefault_inner.try_lock().is_ok());
+    let second = jit.clone();
+    let (starting, started) = channel();
+    let (finished, done) = channel();
+    let waiter = std::thread::spawn(move || {
+        let ir = telemetry_ir();
+        starting.send(()).unwrap();
+        second
+            .shared
+            .compile(&ir, MemConsistency::Fast, None, 0, 1)
+            .unwrap();
+        finished.send(()).unwrap();
+    });
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+    wait_for_telemetry_waiters(&jit, &[(LockKind::CompileSerial, 1)]);
+    assert_eq!(
+        jit.shared
+            .lock_telemetry
+            .waiting(LockKind::NondefaultModule),
+        0
+    );
+    assert_eq!(jit.lock_telemetry().nondefault_module.acquisitions, 0);
+    let blocked = done.recv_timeout(Duration::from_millis(30)).is_err();
+    release.send(()).unwrap();
+    compiler_done.recv_timeout(Duration::from_secs(3)).unwrap();
+    done.recv_timeout(Duration::from_secs(3)).unwrap();
+    compiler.join().unwrap();
+    waiter.join().unwrap();
+    assert!(blocked);
+    let snapshot = jit.lock_telemetry();
+    assert_lock_sample(&snapshot.compile_serial, 2);
+    assert_lock_sample(&snapshot.default_module, 1);
+    assert_lock_sample(&snapshot.nondefault_module, 1);
+    assert!(snapshot.compile_serial.max_wait_ns >= 10_000_000);
+    assert!(snapshot.compile_serial.max_hold_ns >= 10_000_000);
+}

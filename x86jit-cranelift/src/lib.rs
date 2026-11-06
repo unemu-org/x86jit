@@ -8,6 +8,16 @@
 //!
 //! Build order (§8.2.3): offsets + ABI + a "returns Continue" block first, then
 //! `IrOp`s one at a time, each validated against the interpreter oracle.
+//!
+//! Optional compile-lock timing is available through
+//! [`JitBackend::set_lock_telemetry`], [`JitBackend::lock_telemetry`], and
+//! [`JitBackend::reset_lock_telemetry`]. It reports global compilation and module
+//! acquisitions, hold/wait totals and maxima in nanoseconds, and fixed log2
+//! histograms. Disabled by default, it reads one relaxed switch per acquisition
+//! without reading the clock. Hold time includes lazy module construction.
+//! Snapshots include released guards only; observers run after their release.
+//! [`LockTelemetrySnapshot`] documents lock order and what each entry measures.
+//! These are backend diagnostics, not guest state.
 
 #![cfg(feature = "jit")]
 
@@ -17,8 +27,12 @@ mod embedder_tests;
 #[cfg(feature = "environment")]
 mod environment;
 mod libcalls;
+mod lock_telemetry;
 pub mod perfmap;
 mod unwind;
+
+use lock_telemetry::{LockKind, Telemetry};
+pub use lock_telemetry::{LockTelemetry, LockTelemetrySnapshot};
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2404,7 +2418,9 @@ fn lock_recovering<'a, T>(m: &'a std::sync::Mutex<T>, what: &str) -> std::sync::
     m.lock().unwrap_or_else(|poisoned| {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
-            eprintln!(
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "x86jit: recovering the {what} lock — a previous holder panicked. THAT panic is \
                  the failure; look for it earlier in this log. Continuing so it is not buried \
                  under a cascade of PoisonError."
@@ -2467,6 +2483,7 @@ struct Shared {
     /// `Vm` reports after the backend is constructed. `None` until then.
     inner: Mutex<Option<Jit>>,
     nondefault_inner: Mutex<Option<Jit>>,
+    lock_telemetry: Telemetry,
     compile_serial: Mutex<()>,
     compile_attempts: AtomicU64,
     /// Codegen recipe, kept for the deferred build.
@@ -2616,6 +2633,30 @@ impl JitBackend {
         self.shared.flag_elision.store(enabled, Ordering::Relaxed);
     }
 
+    /// Enable or disable compile-lock timing at runtime (off by default).
+    /// Each acquisition samples this switch once: disabling does not discard
+    /// samples from guards that already started with timing enabled.
+    pub fn set_lock_telemetry(&self, enabled: bool) {
+        self.shared.lock_telemetry.set_enabled(enabled);
+    }
+
+    /// Snapshot completed compile/module lock acquisitions, including errors and unwinds.
+    /// Counts include link invalidation even when a module has not been built.
+    /// Module wait excludes `compile_serial` wait, which has its own entry.
+    /// Active guards and records still being published are not included.
+    /// Reading a snapshot never acquires a compile/module mutex or records a sample.
+    pub fn lock_telemetry(&self) -> LockTelemetrySnapshot {
+        self.shared.lock_telemetry.snapshot()
+    }
+
+    /// Clear all three locks' completed samples without changing the enable switch.
+    /// Guards still active, waiting, or publishing their sample may report their
+    /// entire acquisition after this reset. Quiesce compilation and invalidation
+    /// first when a strict interval boundary is needed.
+    pub fn reset_lock_telemetry(&self) {
+        self.shared.lock_telemetry.reset();
+    }
+
     /// Observe each successfully compiled block or region, including background
     /// tier-up. Called on the compiling thread after code registration and after
     /// releasing the module lock. The callback may re-enter `materialize` or
@@ -2723,6 +2764,7 @@ impl JitBackend {
             shared: Arc::new(Shared {
                 inner: Mutex::new(None),
                 nondefault_inner: Mutex::new(None),
+                lock_telemetry: Telemetry::default(),
                 compile_serial: Mutex::new(()),
                 compile_attempts: AtomicU64::new(0),
                 target,
@@ -2871,6 +2913,15 @@ impl JitBackend {
 }
 
 impl Shared {
+    fn lock_module(&self, mxcsr_mode: u32) -> lock_telemetry::Guard<'_, Option<Jit>> {
+        let (inner, kind) = if mxcsr_mode == 0 {
+            (&self.inner, LockKind::DefaultModule)
+        } else {
+            (&self.nondefault_inner, LockKind::NondefaultModule)
+        };
+        self.lock_telemetry.lock(inner, kind, "JIT module")
+    }
+
     /// Lock the Cranelift module, building it on first use.
     ///
     /// The ISA bakes in `opt_level`, so the module cannot exist until the level is
@@ -2881,7 +2932,7 @@ impl Shared {
     /// compile cannot change the level: the module and every block already in it
     /// were built at the old one.
     fn jit(&self, mxcsr_mode: u32) -> impl std::ops::DerefMut<Target = Jit> + '_ {
-        struct Guard<'a>(std::sync::MutexGuard<'a, Option<Jit>>);
+        struct Guard<'a>(lock_telemetry::Guard<'a, Option<Jit>>);
         impl std::ops::Deref for Guard<'_> {
             type Target = Jit;
             fn deref(&self) -> &Jit {
@@ -2893,12 +2944,7 @@ impl Shared {
                 self.0.as_mut().expect("module built on lock")
             }
         }
-        let inner = if mxcsr_mode == 0 {
-            &self.inner
-        } else {
-            &self.nondefault_inner
-        };
-        let mut guard = lock_recovering(inner, "JIT module");
+        let mut guard = self.lock_module(mxcsr_mode);
         if guard.is_none() {
             let opt = self
                 .opt
@@ -2991,7 +3037,11 @@ impl Shared {
         if self.code_space_exhausted.load(Ordering::Acquire) {
             return Err(CompileError::Unavailable);
         }
-        let _serial = lock_recovering(&self.compile_serial, "JIT compilation");
+        let _serial = self.lock_telemetry.lock(
+            &self.compile_serial,
+            LockKind::CompileSerial,
+            "JIT compilation",
+        );
         let mut jit = self.jit(mxcsr_mode);
         // Serialized with every foreground/background compile. After an error the
         // module may contain unfinalized definitions; never retry or publish those.
@@ -3625,10 +3675,10 @@ impl Backend for JitBackend {
         // simply re-links via `RET_LINK` on its next traversal. Relaxed stores pair
         // with the dispatcher's relaxed fill; compiled-code reads see 0 or a valid
         // entry. Runs under the compiler mutex, off the hot path.
-        // Raw lock, not `Shared::jit`: nothing has been compiled if the module was
+        // Do not use `Shared::jit`: nothing has been compiled if the module was
         // never built, so there are no slots to clear and no reason to build it here.
-        for inner in [&self.shared.inner, &self.shared.nondefault_inner] {
-            let jit = lock_recovering(inner, "JIT module");
+        for mode in [0, 1] {
+            let jit = self.shared.lock_module(mode);
             if let Some(jit) = jit.as_ref() {
                 for slot in &jit.slots {
                     slot.store(0, Ordering::Relaxed);
@@ -4717,7 +4767,7 @@ mod tests {
         );
 
         // The real assertion: the next entry works instead of panicking.
-        let guard = lock_recovering(&jit.shared.inner, "JIT module");
+        let guard = jit.shared.lock_module(0);
         drop(guard);
     }
 }
