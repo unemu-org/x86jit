@@ -19,7 +19,9 @@ fn compile(jit: &JitBackend, mode: u32) {
 fn assert_records(stats: &LockTelemetry, count: u64) {
     assert_eq!(stats.acquisitions, count);
     assert!(stats.total_hold_ns >= stats.max_hold_ns);
-    assert!(stats.max_hold_ns > 0);
+    // No lower bound on the hold time: with a coarse monotonic clock (a 24 MHz
+    // counter ticks every 41.7 ns) a short uncontended hold can measure 0 ns.
+    // The contended tests in embedder_tests.rs force a measurable hold.
     assert!(stats.total_wait_ns >= stats.max_wait_ns);
     assert_eq!(stats.hold_histogram.iter().sum::<u64>(), count);
     assert_eq!(stats.wait_histogram.iter().sum::<u64>(), count);
