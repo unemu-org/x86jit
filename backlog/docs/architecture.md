@@ -54,6 +54,7 @@ that changes.
 | `codemap` | immutable host ranges, source locations, exact transfer sites and compiler-derived unwind recipes, published together for signal-safe lookup (§8.2) |
 | `disasm` | decode-and-print helper: `disassemble`, `print_disassembly`, `DecodedInsn` (inspection only, §12 M0) |
 | `exit` | `Exit`, `AccessKind`, `StepResult` (§5, §8) |
+| `interruption` | Per-vCPU engine-section markers and host-request deferral evidence (§9.2) |
 | `cache` | `TranslationCache`, `CachedBlock`, `CompiledPtr`; `BlockKey` includes decode mode and MXCSR.RC/FTZ/DAZ; SMC page-tag mark/clear run through `insert`/`invalidate_overlapping` callbacks under the spans lock (§9) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop (§2, §9.2) |
 

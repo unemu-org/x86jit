@@ -28,6 +28,11 @@
 //! [`Vm::set_precise_split_stores`] opts into compiled crossing-store preflight
 //! (off by default); revocation after preflight can still leave partial effects.
 //!
+//! Host yield requests return [`Exit::Interrupted`]. After it returns,
+//! [`Vcpu::interruption_evidence`] reports whether engine work deferred the
+//! request, with the section kinds and count. The evidence is cleared when
+//! [`Vcpu::run`] is next entered; copy it to retain it across resumption.
+//!
 //! Module map mirrors the spec's dependency order:
 //! `state` + `memory` -> `ir` -> `lift` -> `interp` -> `cache`/`vm`.
 //!
@@ -68,6 +73,7 @@ pub mod fault;
 pub mod features;
 pub mod gfni;
 pub mod interp;
+pub mod interruption;
 pub mod ir;
 pub mod jit_abi;
 pub mod lift;
@@ -94,6 +100,7 @@ pub use features::{
     CpuidLeaf, CpuidOutOfRange, CpuidOverride, CpuidOverrides, CpuidRegisters, CpuidTable, Feature,
     GuestCpuFeatures,
 };
+pub use interruption::{CriticalSectionKind, InterruptionEvidence};
 pub use ir::{
     AesOp, BitScanOp, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
     HFloatOp, HIntOp, IrBlock, IrOp, IrRegion, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps,

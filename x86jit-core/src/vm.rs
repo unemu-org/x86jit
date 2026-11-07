@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 use crate::exit::{Exit, StepResult};
+use crate::interruption::{CriticalSectionKind, EngineSection};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
     MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_EXCEPTION_DETAIL, RET_HLT,
@@ -435,6 +436,7 @@ impl SourceIds {
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
     precise_split_stores: bool,
+    compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
     lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
     pub mem: Memory,
     pub cache: TranslationCache,
@@ -548,6 +550,28 @@ impl Vm {
             .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
         self.cache.invalidate_pending_fetches = pending;
         self.backend.invalidate_links();
+    }
+
+    /// Test support only; not for production. Hold each synchronous vCPU compile
+    /// section for `duration` (at most one second). The returned flag is true
+    /// during the hold, before the backend callback; poll it with Acquire.
+    /// Configure before running vCPUs. Zero disables the hold. Forks disable it.
+    pub fn test_support_hold_compile(
+        &mut self,
+        duration: std::time::Duration,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        assert!(duration <= std::time::Duration::from_secs(1));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.compile_hold = (!duration.is_zero()).then(|| (duration, entered.clone()));
+        entered
+    }
+
+    fn hold_compile(&self) {
+        if let Some((duration, entered)) = &self.compile_hold {
+            entered.store(true, Ordering::Release);
+            std::thread::sleep(*duration);
+            entered.store(false, Ordering::Release);
+        }
     }
 
     /// Test support only; not for production. Synchronously compile and cache a
@@ -735,6 +759,7 @@ impl Vm {
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
             precise_split_stores: self.precise_split_stores,
+            compile_hold: None,
             mem: self.mem.deep_copy()?,
             cache: {
                 let mut cache = TranslationCache::new();
@@ -762,6 +787,7 @@ impl Vm {
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
         Self {
             precise_split_stores: false,
+            compile_hold: None,
             mem,
             cache: TranslationCache::new(),
             backend,
@@ -1040,6 +1066,8 @@ impl Vm {
         Vcpu {
             cpu,
             exit_request: ExitRequest { word },
+            interruption_evidence: None,
+            engine_sections: AtomicU64::new(0),
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             fast: Box::new(
                 [FastEntry {
@@ -1109,7 +1137,8 @@ impl ExitRequest {
     /// Checks occur within one compiled block or chain edge, one region sub-block,
     /// or one REP iteration. A handle outliving its vcpu has no effect.
     /// Writes preceding this call are visible after `run` returns the
-    /// [`Exit::Interrupted`] that consumes it.
+    /// [`Exit::Interrupted`] that consumes it. Engine work defers the request until
+    /// its locks have been released; [`Vcpu::interruption_evidence`] reports this.
     ///
     /// Async-signal-safe: this call is one lock-free atomic read-modify-write on
     /// a word the handle already owns. It does not allocate, lock, touch the
@@ -1128,6 +1157,8 @@ impl ExitRequest {
 pub struct Vcpu {
     pub cpu: CpuState,
     exit_request: ExitRequest,
+    interruption_evidence: Option<crate::InterruptionEvidence>,
+    engine_sections: AtomicU64,
     code_space_reported: bool,
     /// Decode/lift mode (§17.3), inherited from the `Vm`: threaded into every
     /// `resolve`/`lift`/`step_one` call and combined with the guest RIP to form the
@@ -1209,6 +1240,15 @@ impl Vcpu {
     /// Obtain a handle that may request an exit from any host thread.
     pub fn exit_request(&self) -> ExitRequest {
         self.exit_request.clone()
+    }
+
+    /// Evidence for the [`Exit::Interrupted`] returned by the most recent [`Self::run`].
+    /// `None` before the first run, during a run, or after any other exit. Cleared
+    /// as soon as the next `run` is entered, even if it unwinds. The returned value
+    /// is a copy and can be retained across resumption. Deferred evidence for a
+    /// still-pending request survives unrelated exits internally.
+    pub fn interruption_evidence(&self) -> Option<crate::InterruptionEvidence> {
+        self.interruption_evidence
     }
 
     /// Fast-resolve cache hits served without a shared-cache lookup.
@@ -1545,8 +1585,10 @@ impl Vcpu {
     /// jumps straight there, skipping the cache lookup. The budget still ticks per
     /// block, so a tight chained loop yields `BudgetExhausted` (preemption, §9.2).
     /// A host request yields `Interrupted` at the next checked boundary; REP may
-    /// have made partial progress and resumes at the string instruction.
+    /// have made partial progress and resumes at the string instruction. Evidence
+    /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+        self.interruption_evidence = None;
         self.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
@@ -1576,9 +1618,10 @@ impl Vcpu {
         if matches!(exit, Exit::Interrupted) {
             // Acquire the writes published by the consumed request. A later
             // request remains pending; a concurrent SMC bit survives the mask.
-            self.exit_request
-                .word
-                .fetch_and(!EXIT_REQUESTED, Ordering::Acquire);
+            self.interruption_evidence = Some(crate::interruption::consume(
+                &self.exit_request.word,
+                &self.engine_sections,
+            ));
         }
         // Published here rather than at each of the inner loop's many exits, so no
         // path can forget it: one shared atomic per run instead of one per transfer.
@@ -1816,6 +1859,8 @@ impl Vcpu {
                     }
                     match resolve::<DEFAULT>(
                         vm,
+                        exit_word,
+                        &self.engine_sections,
                         fetch,
                         self.mode,
                         if DEFAULT { 0 } else { self.cpu.mxcsr },
@@ -1960,6 +2005,8 @@ impl Vcpu {
                                 }
                                 let resolved = resolve::<DEFAULT>(
                                     vm,
+                                    exit_word,
+                                    &self.engine_sections,
                                     FetchAddr::flat(self.cpu.rip),
                                     self.mode,
                                     if DEFAULT { 0 } else { self.cpu.mxcsr },
@@ -1975,11 +2022,17 @@ impl Vcpu {
                                         // torn value (aligned u64); it pairs with the
                                         // backend's `invalidate_links` clear.
                                         let slot = ctx.link_slot;
+                                        let _section = EngineSection::enter(
+                                            exit_word,
+                                            &self.engine_sections,
+                                            CriticalSectionKind::Publish,
+                                        );
                                         let published =
                                             vm.cache.publish_if_current(since_epoch, || unsafe {
                                                 (*(slot as *const AtomicU64))
                                                     .store(entry.0 as u64, Ordering::Relaxed)
                                             });
+                                        drop(_section);
                                         if !published {
                                             // Invalidated under us. Publishing now would
                                             // refill a slot the drop just cleared, and
@@ -2026,6 +2079,8 @@ impl Vcpu {
                                         }
                                         let resolved = resolve::<DEFAULT>(
                                             vm,
+                                            exit_word,
+                                            &self.engine_sections,
                                             FetchAddr::flat(self.cpu.rip),
                                             self.mode,
                                             if DEFAULT { 0 } else { self.cpu.mxcsr },
@@ -2054,6 +2109,11 @@ impl Vcpu {
                                         let count = self.ibtc_refills.entry(slot).or_insert(0);
                                         if *count < IBTC_MEGAMORPHIC_CAP {
                                             *count += 1;
+                                            let _section = EngineSection::enter(
+                                                exit_word,
+                                                &self.engine_sections,
+                                                CriticalSectionKind::Publish,
+                                            );
                                             let desc =
                                                 vm.cache.alloc_ibtc_descriptor(self.cpu.rip, entry);
                                             // SAFETY: `slot` is a live `Box<AtomicU64>` in
@@ -2263,7 +2323,8 @@ impl Vcpu {
 /// (a stale compile whose block was SMC-dropped is rejected); the in-flight marker is
 /// always cleared so a rejected block can be re-lifted and re-submitted.
 /// `tier_up_finished` short-circuits when idle.
-fn drain_tier_up(vm: &Vm) {
+fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
+    let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
     for fin in vm.backend.tier_up_finished() {
         // A Vm runs in a single mode (§17 scope fence), so the finished compile's
         // block key is its echoed pc under the Vm's mode (§17.4).
@@ -2280,6 +2341,7 @@ fn drain_tier_up(vm: &Vm) {
         // Multi-span publish: a region carries one span per sub-block; a block carries
         // one. `on_mark` re-tags the pages under the spans lock.
         let multi_span = fin.spans.len() > 1;
+        let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
         let published = vm
             .cache
             .upgrade_region(key, fin.block, fin.spans, fin.epoch, |sp| {
@@ -2310,12 +2372,14 @@ enum ResolveFailure {
 
 fn resolve<const DEFAULT: bool>(
     vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
     at: FetchAddr,
     mode: CpuMode,
     mxcsr: u32,
 ) -> Result<CachedBlock, Exit> {
     loop {
-        match resolve_attempt::<DEFAULT>(vm, at, mode, mxcsr) {
+        match resolve_attempt::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr) {
             Ok(block) => return Ok(block),
             Err(ResolveFailure::Exit(exit)) => return Err(exit),
             Err(ResolveFailure::Retry) => continue,
@@ -2325,6 +2389,8 @@ fn resolve<const DEFAULT: bool>(
 
 fn resolve_attempt<const DEFAULT: bool>(
     vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
     at: FetchAddr,
     mode: CpuMode,
     mxcsr: u32,
@@ -2348,10 +2414,15 @@ fn resolve_attempt<const DEFAULT: bool>(
         }
         let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
-        return lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
+        let lifted = {
+            let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
+            lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
+        };
+        return lifted
             .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
             .and_then(|ir| {
-                finish_single(vm, key, pc, ir, permit.as_ref()).ok_or(ResolveFailure::Retry)
+                finish_single(vm, exit_word, sections, key, pc, ir, permit.as_ref())
+                    .ok_or(ResolveFailure::Retry)
             });
     }
     loop {
@@ -2359,7 +2430,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         // freshly-landed unit is seen by the lookup below. Cheap when idle (the
         // backend's ready-probe short-circuits an empty drain).
         if vm.tier_up_background {
-            drain_tier_up(vm);
+            drain_tier_up(vm, exit_word, sections);
         }
         // Snapshot the invalidation epoch BEFORE the lookup: `upgrade` rejects the
         // tier-up if an SMC drop moved it in between. Otherwise a tier-up racing a
@@ -2384,12 +2455,14 @@ fn resolve_attempt<const DEFAULT: bool>(
             return Ok(block);
         }
         let mut permit = None;
-        if vm.mem.fetch_policy.is_some()
-            && !vm
+        if vm.mem.fetch_policy.is_some() {
+            let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
+            if !vm
                 .cache
                 .publish_if_current(epoch, || permit = vm.mem.fetch_permit())
-        {
-            continue;
+            {
+                continue;
+            }
         }
         // Background tier-up: compile off the vcpu and keep interpreting
         // until the result lands (published by `drain_tier_up` above on a later
@@ -2405,6 +2478,11 @@ fn resolve_attempt<const DEFAULT: bool>(
                 Some(caps) => match vm.cache.region_decision(key) {
                     Some(c) => c,
                     None => {
+                        let _section = EngineSection::enter(
+                            exit_word,
+                            sections,
+                            CriticalSectionKind::RegionBuild,
+                        );
                         let c = matches!(
                             lift_region(&vm.mem, pc, caps, mode),
                             Ok(r) if r.blocks.len() > 1 && r.has_loop
@@ -2425,7 +2503,12 @@ fn resolve_attempt<const DEFAULT: bool>(
                 }
                 let caps = region_caps.expect("region candidate ⇒ region_caps");
                 let mut fetch_failure = None;
-                match lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure) {
+                let lifted = {
+                    let _section =
+                        EngineSection::enter(exit_word, sections, CriticalSectionKind::RegionBuild);
+                    lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
+                };
+                match lifted {
                     Ok(region) if region.blocks.len() > 1 && region.has_loop => {
                         let spans = region.spans();
                         (TierUpUnit::Region(Arc::new(region)), spans)
@@ -2460,10 +2543,14 @@ fn resolve_attempt<const DEFAULT: bool>(
                 spans,
                 epoch,
             };
-            let submitted = if let Some(permit) = permit.clone() {
-                vm.backend.tier_up_async_with_fetch_permit(req, permit)
-            } else {
-                vm.backend.tier_up_async(req)
+            let submitted = {
+                let _section =
+                    EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
+                if let Some(permit) = permit.clone() {
+                    vm.backend.tier_up_async_with_fetch_permit(req, permit)
+                } else {
+                    vm.backend.tier_up_async(req)
+                }
             };
             match submitted {
                 // Off to the worker — this block stays interpreted for now.
@@ -2482,14 +2569,19 @@ fn resolve_attempt<const DEFAULT: bool>(
         if permit.as_ref().is_some_and(|p| !p.is_current()) {
             continue;
         }
-        let compiled = vm.backend.materialize_with_split_stores(
-            ir,
-            vm.consistency,
-            vm.mem.trap_window(),
-            vm.mem.guest_base(),
-            key.mxcsr_mode,
-            vm.precise_split_stores,
-        );
+        let compiled = {
+            let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Compile);
+            vm.hold_compile();
+            vm.backend.materialize_with_split_stores(
+                ir,
+                vm.consistency,
+                vm.mem.trap_window(),
+                vm.mem.guest_base(),
+                key.mxcsr_mode,
+                vm.precise_split_stores,
+            )
+        };
+        let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
         if vm
             .cache
             .upgrade(key, compiled.clone(), (ir.guest_start, ir.guest_len), epoch)
@@ -2508,7 +2600,12 @@ fn resolve_attempt<const DEFAULT: bool>(
     // single-block path (reusing the block already lifted, so no double lift).
     if let Some(caps) = vm.backend.region_caps().filter(|_| !vm.tier_up_background) {
         let mut fetch_failure = None;
-        match lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure) {
+        let lifted = {
+            let _section =
+                EngineSection::enter(exit_word, sections, CriticalSectionKind::RegionBuild);
+            lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
+        };
+        match lifted {
             // NOTE: the region path is JIT-only (a region-forming backend); Real16 stays
             // on the interpreter and never reaches here, so `pc` (flat) is correct.
             // Only a multi-block region *with a loop* is worth its heavier compile
@@ -2518,14 +2615,21 @@ fn resolve_attempt<const DEFAULT: bool>(
                 if permit.as_ref().is_some_and(|p| !p.is_current()) {
                     return Err(ResolveFailure::Retry);
                 }
-                let materialized = vm.backend.materialize_region_with_split_stores(
-                    &region,
-                    vm.consistency,
-                    vm.mem.trap_window(),
-                    vm.mem.guest_base(),
-                    key.mxcsr_mode,
-                    vm.precise_split_stores,
-                );
+                let materialized = {
+                    let _section =
+                        EngineSection::enter(exit_word, sections, CriticalSectionKind::Compile);
+                    vm.hold_compile();
+                    vm.backend.materialize_region_with_split_stores(
+                        &region,
+                        vm.consistency,
+                        vm.mem.trap_window(),
+                        vm.mem.guest_base(),
+                        key.mxcsr_mode,
+                        vm.precise_split_stores,
+                    )
+                };
+                let _section =
+                    EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
                 // §10: tag every sub-block's pages — under the spans lock (#12).
                 if !vm
                     .cache
@@ -2549,6 +2653,8 @@ fn resolve_attempt<const DEFAULT: bool>(
             Ok(region) => {
                 return finish_single(
                     vm,
+                    exit_word,
+                    sections,
                     key,
                     pc,
                     region.blocks.into_iter().next().unwrap(),
@@ -2568,8 +2674,13 @@ fn resolve_attempt<const DEFAULT: bool>(
         }
     }
     let mut fetch_failure = None;
-    match lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure) {
-        Ok(ir) => finish_single(vm, key, pc, ir, permit.as_ref()).ok_or(ResolveFailure::Retry),
+    let lifted = {
+        let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
+        lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
+    };
+    match lifted {
+        Ok(ir) => finish_single(vm, exit_word, sections, key, pc, ir, permit.as_ref())
+            .ok_or(ResolveFailure::Retry),
         Err(e) => Err(ResolveFailure::Exit(lift_exit(
             e,
             fetch_failure,
@@ -2586,6 +2697,8 @@ fn resolve_attempt<const DEFAULT: bool>(
 /// and the cache key must both be physical — see `resolve`).
 fn finish_single(
     vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
     key: BlockKey,
     span_start: u64,
     ir: IrBlock,
@@ -2600,6 +2713,8 @@ fn finish_single(
     let materialized = if key.mode == CpuMode::Real16 || vm.tier_up_after.is_some() {
         CachedBlock::Interpreted(Arc::new(ir))
     } else {
+        let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Compile);
+        vm.hold_compile();
         vm.backend.materialize_with_split_stores(
             &ir,
             vm.consistency,
@@ -2609,6 +2724,7 @@ fn finish_single(
             vm.precise_split_stores,
         )
     };
+    let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared
     // by a concurrent SMC invalidation between insert and mark.
     vm.cache

@@ -214,6 +214,8 @@ pub enum Exit {
     /// resumable; REP may have completed only some iterations.
     /// Like mid-block faults, this may over-charge the executed-instruction counter:
     /// compiled code charges the whole block at entry, including its unexecuted tail.
+    /// Evidence for this yield is available from [`crate::Vcpu::interruption_evidence`]
+    /// until the next call to [`crate::Vcpu::run`].
     Interrupted,
     /// JIT code storage could not grow or its background compiler could not start.
     /// Returned once per vcpu, at a block
