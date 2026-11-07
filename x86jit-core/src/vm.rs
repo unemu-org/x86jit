@@ -1,9 +1,9 @@
 //! `Vm` (shared) and `Vcpu` (per-thread) — the KVM-style split (§2), plus the
 //! dispatcher loop (§9.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 use crate::exit::{Exit, StepResult};
@@ -394,6 +394,44 @@ pub enum ForceRegionError {
     Invalidated,
 }
 
+/// Failure to allocate or seed a vCPU source identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceIdError {
+    /// This identity was already allocated, even if its vCPU has been dropped.
+    InUse(u64),
+    /// Seeding cannot move the automatic allocator backwards.
+    Rewind { current: u64, requested: u64 },
+    /// Automatic allocation has consumed `u64::MAX` and cannot wrap.
+    Exhausted,
+}
+
+struct SourceIds {
+    next: Option<u64>,
+    allocated: HashSet<u64>,
+}
+
+impl Default for SourceIds {
+    fn default() -> Self {
+        Self {
+            next: Some(0),
+            allocated: HashSet::new(),
+        }
+    }
+}
+
+impl SourceIds {
+    fn allocate(&mut self, explicit: Option<u64>) -> Result<u64, SourceIdError> {
+        let id = explicit.or(self.next).ok_or(SourceIdError::Exhausted)?;
+        if !self.allocated.insert(id) {
+            return Err(SourceIdError::InUse(id));
+        }
+        if self.next.is_some_and(|next| id >= next) {
+            self.next = id.checked_add(1);
+        }
+        Ok(id)
+    }
+}
+
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
     precise_split_stores: bool,
@@ -438,7 +476,7 @@ pub struct Vm {
     x87_pointer_model: crate::state::X87PointerModel,
     cpuid_table: Option<Arc<crate::features::CpuidTable>>,
     cpu_source: Option<Arc<dyn crate::state::CpuSource>>,
-    next_source_id: Arc<AtomicU64>,
+    source_ids: Arc<Mutex<SourceIds>>,
     /// x87 transcendental precision every new vcpu starts with. Default `Fast`
     /// (f64/libm); select `Extended` (full-80-bit) via [`Vm::set_x87_precision`].
     x87_precision: crate::state::X87Precision,
@@ -712,7 +750,7 @@ impl Vm {
             x87_pointer_model: self.x87_pointer_model,
             cpuid_table: self.cpuid_table.clone(),
             cpu_source: self.cpu_source.clone(),
-            next_source_id: self.next_source_id.clone(),
+            source_ids: self.source_ids.clone(),
             x87_precision: self.x87_precision,
             mode: self.mode,
             lockstep_trace: self.lockstep_trace.clone(),
@@ -735,7 +773,7 @@ impl Vm {
             x87_pointer_model: crate::state::X87PointerModel::default(),
             cpuid_table: None,
             cpu_source: None,
-            next_source_id: Arc::new(AtomicU64::new(0)),
+            source_ids: Arc::new(Mutex::new(SourceIds::default())),
             x87_precision: crate::state::X87Precision::default(),
             mode: CpuMode::Long64,
             lockstep_trace: None,
@@ -890,6 +928,9 @@ impl Vm {
     }
 
     /// One execution context per guest thread (§4.3). Shares this `Vm`.
+    ///
+    /// # Panics
+    /// Panics if automatic source identities are exhausted; identities never wrap.
     pub fn new_vcpu(&self) -> Vcpu {
         self.new_vcpu_with_cpuid_overrides(crate::features::CpuidOverrides::default())
     }
@@ -901,6 +942,7 @@ impl Vm {
     ///
     /// # Panics
     /// Panics if any reserved bit (31:16) is set; see [`Vcpu::set_mxcsr`].
+    /// Also panics if automatic source identities are exhausted.
     pub fn new_vcpu_with_mxcsr(&self, mxcsr: u32) -> Vcpu {
         let mut cpu = self.new_vcpu();
         cpu.set_mxcsr(mxcsr);
@@ -909,17 +951,88 @@ impl Vm {
 
     /// Create a vCPU with its logical-processor and runtime CPUID fields.
     /// Overrides are owned by `CpuState`, so cloning state preserves them.
+    /// For an explicit source identity, use [`Self::new_vcpu_with_source_id`]
+    /// and assign [`CpuState::cpuid_overrides`] before execution.
+    ///
+    /// # Panics
+    /// Panics if automatic source identities are exhausted; identities never wrap.
     pub fn new_vcpu_with_cpuid_overrides(
         &self,
         overrides: crate::features::CpuidOverrides,
     ) -> Vcpu {
+        let id = self.source_ids.lock().unwrap().allocate(None);
+        let id = id.expect("vCPU source identities exhausted");
+        self.make_vcpu(id, overrides)
+    }
+
+    /// Create a vCPU with an explicit [`CpuState::source_id`]. Rejects any ID
+    /// already allocated by this VM or a VM sharing its allocator through
+    /// [`Self::fork_with_backend`], including IDs whose vCPUs have been dropped.
+    /// Success advances automatic allocation past `id` if necessary. An unused
+    /// ID below the current automatic cursor is allowed, including after seeding.
+    /// All constructors serialize ID allocation; no bookkeeping runs during execution.
+    /// Direct changes to public CPU state and state clones are outside this registry.
+    ///
+    /// The ID is the key passed to both time and random methods on
+    /// [`CpuSource`](crate::state::CpuSource), whose
+    /// [`TscSample::aux`](crate::state::TscSample::aux) supplies RDTSCP's ECX
+    /// (SDM Vol 3B §20.17.2). Install the source with [`Self::set_cpu_source`]
+    /// before construction, or replace [`CpuState::cpu_source`] between runs.
+    /// The default source returns AUX zero regardless of the source ID.
+    /// [`Self::set_cpuid_table`] supplies the shared CPUID description;
+    /// [`Self::new_vcpu_with_cpuid_overrides`] or [`CpuState::cpuid_overrides`]
+    /// supplies per-vCPU IDs separately:
+    /// leaf 1 `EBX[31:24]` carries the 8-bit initial APIC ID; leaves 0xB/0x1F EDX
+    /// carry the 32-bit x2APIC ID on each configured subleaf (SDM Vol 1 §21.1.4,
+    /// §21.3, Tables 21-8/21-31/21-70). The embedder chooses the mapping from
+    /// the 64-bit source identity to those narrower fields and supplies topology.
+    /// RDPID also reads TSC_AUX (SDM Vol 2B §4.3, RDPID, Description), but is
+    /// currently unsupported by the lifter.
+    pub fn new_vcpu_with_source_id(&self, id: u64) -> Result<Vcpu, SourceIdError> {
+        self.source_ids.lock().unwrap().allocate(Some(id))?;
+        Ok(self.make_vcpu(id, crate::features::CpuidOverrides::default()))
+    }
+
+    /// Next automatic source ID, or `None` after consuming `u64::MAX`.
+    /// Quiesce vCPU creation before taking a snapshot for a rebuild.
+    pub fn next_source_id(&self) -> Option<u64> {
+        self.source_ids.lock().unwrap().next
+    }
+
+    /// Reserve the prefix below `next` from future automatic allocation.
+    /// Equal cursors are accepted; rewinds and exhaustion are reported without
+    /// changing the allocator. Explicit allocation of unused IDs below `next`
+    /// remains possible. VM forks share this cursor and the allocated-ID registry.
+    ///
+    /// To rebuild after a host fork, quiesce creation, save [`Self::next_source_id`]
+    /// and the surviving vCPU's source ID, then on a fresh VM call this method
+    /// with the saved cursor and [`Self::new_vcpu_with_source_id`] for the survivor.
+    /// Install the shared CPUID table and CPU source before construction, then
+    /// restore the survivor's CPU state (including CPUID overrides and source
+    /// handle) before execution. If replacing state wholesale, keep its source ID
+    /// equal to the ID registered by the constructor.
+    /// The next automatic vCPU then receives the saved cursor.
+    pub fn set_next_source_id(&self, next: u64) -> Result<(), SourceIdError> {
+        let mut ids = self.source_ids.lock().unwrap();
+        let current = ids.next.ok_or(SourceIdError::Exhausted)?;
+        if next < current {
+            return Err(SourceIdError::Rewind {
+                current,
+                requested: next,
+            });
+        }
+        ids.next = Some(next);
+        Ok(())
+    }
+
+    fn make_vcpu(&self, id: u64, overrides: crate::features::CpuidOverrides) -> Vcpu {
         let mut cpu = CpuState::new();
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_pointer_model = self.x87_pointer_model;
         cpu.cpuid_table = self.cpuid_table.clone();
         cpu.cpuid_overrides = overrides;
         cpu.cpu_source = self.cpu_source.clone();
-        cpu.source_id = self.next_source_id.fetch_add(1, Ordering::Relaxed);
+        cpu.source_id = id;
         cpu.x87_precision = self.x87_precision; // transcendental precision
         let word = Arc::new(AtomicU64::new(0));
         self.mem.register_dispatch_word(&word);
