@@ -5278,8 +5278,8 @@ fn extract_lane_mem_dst_straddle_fault_match_interp() {
         assert_eq!(metadata.transfer_size(), x86jit_core::Knowledge::Known(16));
     }
     assert_eq!(
-        format!("{interp_exit:?}"),
-        format!("{jit_exit:?}"),
+        without_fault_path(&interp_exit),
+        without_fault_path(&jit_exit),
         "interp and JIT must report the same fault"
     );
     // Lane 0's sentinel must be untouched on both backends (atomic store).
@@ -5348,8 +5348,8 @@ fn pop_mem_dst_fault_leaves_rsp_unchanged_match_interp() {
         assert_eq!(metadata.transfer_size(), x86jit_core::Knowledge::Known(8));
     }
     assert_eq!(
-        format!("{interp_exit:?}"),
-        format!("{jit_exit:?}"),
+        without_fault_path(&interp_exit),
+        without_fault_path(&jit_exit),
         "interp and JIT must report the same fault"
     );
     // RSP must NOT have advanced on either backend — the pop is restartable.
@@ -7159,4 +7159,32 @@ fn lddqu_loads_like_movdqu() {
         },
         &[],
     );
+}
+
+/// The exit's Debug text with the metadata's execution-path witness removed: the
+/// witness names the tier that raised the fault, so it differs by design between
+/// the interpreter and compiled code, while every other field must agree.
+fn without_fault_path(exit: &Exit) -> String {
+    let text = format!("{exit:?}");
+    let Some(start) = text.find("path: ") else {
+        return text;
+    };
+    let mut depth = 0i32;
+    let mut end = text.len();
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '{' | '(' => depth += 1,
+            '}' | ')' if depth == 0 => {
+                end = start + i;
+                break;
+            }
+            '}' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                end = start + i + 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    format!("{}{}", &text[..start], text[end..].trim_start())
 }

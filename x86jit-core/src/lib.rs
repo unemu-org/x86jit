@@ -86,8 +86,9 @@ pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{AccessKind, Exit, PortDir, StepResult};
 pub use fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,
-    FaultMetadata, FaultOrigin, FaultProgress, HostFaultPlatform, Knowledge, MemoryEffects,
-    PageFaultProjection, RawHostFault, RegisterProgress, RepRestart, TransferUnit,
+    FaultHelper, FaultMetadata, FaultOrigin, FaultPath, FaultProgress, HelperCaller,
+    HostFaultPlatform, Knowledge, MemoryEffects, PageFaultProjection, RawHostFault,
+    RegisterProgress, RepRestart, TransferUnit,
 };
 pub use features::{
     CpuidLeaf, CpuidOutOfRange, CpuidOverride, CpuidOverrides, CpuidRegisters, CpuidTable, Feature,
@@ -108,7 +109,7 @@ pub use state::{
     AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
 };
 pub use vm::{
-    Backend, ExitRequest, InterpreterBackend, MemConsistency, TierUpFinished, TierUpRequest,
-    TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
+    Backend, ExitRequest, ForceRegionError, InterpreterBackend, MemConsistency, TierUpFinished,
+    TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
 pub use x87::FpuKind;

@@ -3481,7 +3481,7 @@ impl Shared {
         #[cfg(not(test))]
         let fail_registration = false;
         if fail_registration
-            || x86jit_core::codemap::register_with_fault_info(
+            || x86jit_core::codemap::register_with_fault_path(
                 entry.0 as usize,
                 code_len,
                 srcloc_table,
@@ -3489,6 +3489,12 @@ impl Shared {
                 trap_sites,
                 recipe,
                 instructions,
+                match kind {
+                    CompiledCodeKind::Block => x86jit_core::codemap::FaultUnit::Block,
+                    CompiledCodeKind::Region => x86jit_core::codemap::FaultUnit::Region {
+                        entry_rip: guest_rip,
+                    },
+                },
             )
             .is_err()
         {

@@ -384,6 +384,16 @@ impl VmConfig {
     }
 }
 
+/// Failure to prepare a deterministic region fixture.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ForceRegionError {
+    UnsupportedMode,
+    Lift(Exit),
+    NotCompiled,
+    Invalidated,
+}
+
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
     precise_split_stores: bool,
@@ -500,6 +510,77 @@ impl Vm {
             .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
         self.cache.invalidate_pending_fetches = pending;
         self.backend.invalidate_links();
+    }
+
+    /// Test support only; not for production. Synchronously compile and cache a
+    /// region at `entry`, even for a single block or a non-loop, without warmup.
+    /// The next dispatch to this entry with the given MXCSR control mode uses it.
+    /// Compilation fallback is an error, never silent interpreter execution.
+    ///
+    /// Requires a region-forming backend. Call after writing fixture code and
+    /// before running vCPUs. This discards existing translations, links and
+    /// pending publications. Normal SMC/fetch
+    /// invalidation still applies; this does not pin a translation after changes.
+    /// No dispatch checks, counters or generated instructions are installed.
+    pub fn test_support_force_region(
+        &mut self,
+        entry: u64,
+        caps: RegionCaps,
+        mxcsr: u32,
+    ) -> Result<(), ForceRegionError> {
+        if self.mode == CpuMode::Real16 {
+            return Err(ForceRegionError::UnsupportedMode);
+        }
+        if self.backend.region_caps().is_none() {
+            return Err(ForceRegionError::NotCompiled);
+        }
+        let pending = self.cache.invalidate_pending_fetches;
+        self.cache.invalidate_pending_fetches = true;
+        self.cache
+            .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
+        self.cache.invalidate_pending_fetches = pending;
+        self.backend.invalidate_links();
+        let epoch = self.cache.epoch();
+        let permit = self.mem.fetch_permit();
+        let mut failure = None;
+        let region = lift_region_with_fault(&self.mem, entry, caps, self.mode, &mut failure)
+            .map_err(|e| {
+                ForceRegionError::Lift(lift_exit(
+                    e,
+                    failure,
+                    &self.mem,
+                    FetchAddr::flat(entry),
+                    self.mode,
+                ))
+            })?;
+        let key = BlockKey::with_mxcsr(entry, self.mode, mxcsr);
+        let compiled = self.backend.materialize_region_with_split_stores(
+            &region,
+            self.consistency,
+            self.mem.trap_window(),
+            self.mem.guest_base(),
+            key.mxcsr_mode,
+            self.precise_split_stores,
+        );
+        if !matches!(compiled, CachedBlock::Compiled { .. }) {
+            return Err(ForceRegionError::NotCompiled);
+        }
+        if !self
+            .cache
+            .insert_checked(key, compiled, region.spans(), |spans| {
+                if self.cache.epoch() != epoch || permit.as_ref().is_some_and(|p| !p.is_current()) {
+                    return false;
+                }
+                for &(start, len) in spans {
+                    self.mem.mark_code(start, len);
+                }
+                true
+            })
+        {
+            return Err(ForceRegionError::Invalidated);
+        }
+        self.cache.record_region();
+        Ok(())
     }
 
     /// Whether compiled split-store preflight is enabled (default: false).

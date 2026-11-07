@@ -314,10 +314,59 @@ impl PageFaultProjection {
     }
 }
 
+/// The execution tier that called a shared Rust faulting helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HelperCaller {
+    Interpreter,
+    CompiledBlock { host_pc: usize },
+    Region { entry_rip: u64, host_pc: usize },
+}
+
+/// Shared helper families represented by the lowered instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FaultHelper {
+    X87,
+    FxState,
+    String,
+    Divide,
+    CompareExchangePair,
+}
+
+/// Owned evidence of where a fault was raised. This describes engine execution,
+/// independently of the architectural cause and any underlying host signal.
+/// `host_pc` is a code-map lookup key: an exact transfer PC after host recovery,
+/// or the compiled function entry for a checked exit. A transfer `site` is present
+/// only when an exact code-map site is available; checked exits do not invent one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FaultPath {
+    Unknown,
+    Interpreter,
+    CompiledBlock {
+        host_pc: usize,
+        site: Option<crate::GuestTrapSite>,
+    },
+    Region {
+        entry_rip: u64,
+        host_pc: usize,
+        site: Option<crate::GuestTrapSite>,
+    },
+    Helper {
+        family: FaultHelper,
+        caller: HelperCaller,
+    },
+    LifterFetch {
+        first_unavailable: u64,
+    },
+}
+
 /// Immutable evidence owned by an [`Exit`]. Each unavailable field stays explicit.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct FaultMetadata {
+    pub(crate) path: FaultPath,
     pub(crate) origin: FaultOrigin,
     pub(crate) class: FaultClass,
     pub(crate) vector: Knowledge<u8>,
@@ -341,6 +390,7 @@ impl FaultMetadata {
     /// Unqualified evidence; useful to custom backends without a complete model.
     pub fn unknown(saved_rip: u64) -> Self {
         Self {
+            path: FaultPath::Unknown,
             origin: FaultOrigin::Unknown,
             class: FaultClass::Unknown,
             vector: Knowledge::Unknown,
@@ -427,6 +477,10 @@ impl FaultMetadata {
         m
     }
 
+    /// Execution evidence; legacy/custom exits without a witness remain Unknown.
+    pub fn path(&self) -> FaultPath {
+        self.path
+    }
     pub fn origin(&self) -> FaultOrigin {
         self.origin
     }
@@ -711,6 +765,8 @@ pub struct InstructionFaultInfo {
     pub(crate) rep: Option<(StrOp, u8, u8)>,
     pub(crate) trap: Option<(u8, u8)>,
     pub(crate) length_limit: bool,
+    pub(crate) helper: Option<FaultHelper>,
+    alignment_check: bool,
     operand_address: Option<OperandAddress>,
 }
 impl InstructionFaultInfo {
@@ -774,6 +830,15 @@ impl InstructionFaultInfo {
             rep: None,
             trap: None,
             length_limit: false,
+            alignment_check: ops.iter().any(|o| matches!(o, IrOp::CheckAlign { .. })),
+            helper: ops.iter().find_map(|op| match op {
+                IrOp::X87 { .. } => Some(FaultHelper::X87),
+                IrOp::FxState { .. } => Some(FaultHelper::FxState),
+                IrOp::RepString { .. } | IrOp::RepStringReal { .. } => Some(FaultHelper::String),
+                IrOp::Div { .. } => Some(FaultHelper::Divide),
+                IrOp::AtomicCasPair { .. } => Some(FaultHelper::CompareExchangePair),
+                _ => None,
+            }),
             operand_address: OperandAddress::from_ops(ops),
         };
         for op in ops {
@@ -928,6 +993,25 @@ pub(crate) fn finish(
             .unwrap_or_else(|| FaultMetadata::unknown(cpu.rip)),
         _ => unreachable!(),
     };
+    if !compiled {
+        let helper = info.and_then(|i| {
+            i.helper.filter(|family| {
+                // DIV's memory source is loaded before the arithmetic helper; an
+                // explicit alignment check also precedes its instruction's helper.
+                (*family != FaultHelper::Divide
+                    || m.origin == FaultOrigin::GuestException(FaultCause::Divide))
+                    && !(i.alignment_check
+                        && m.origin == FaultOrigin::GuestException(FaultCause::RequiredAlignment))
+            })
+        });
+        m.path = match helper {
+            Some(family) => FaultPath::Helper {
+                family,
+                caller: HelperCaller::Interpreter,
+            },
+            None => FaultPath::Interpreter,
+        };
+    }
     m.saved_rip = cpu.rip;
     if let Some(info) = info {
         m.instruction_rip = Knowledge::Known(info.rip);
@@ -1125,6 +1209,9 @@ pub(crate) fn fetch_exit(
 ) -> Exit {
     use crate::lift::FetchFailure::{Memory, Policy};
     let mut m = FaultMetadata::unknown(at.ip);
+    m.path = FaultPath::LifterFetch {
+        first_unavailable: addr,
+    };
     m.origin = match trap {
         Some(Memory(crate::MemTrap::Mmio)) => FaultOrigin::TrapFetch,
         Some(Memory(crate::MemTrap::HostFault)) => FaultOrigin::HostAccess,
@@ -1285,6 +1372,18 @@ pub(crate) fn qualify_lifted(mut exit: Exit, info: Option<&InstructionFaultInfo>
             m.error_code = ErrorCode::NoCode;
             m.progress.registers = RegisterProgress::CompletedInstruction;
         }
+    }
+    exit
+}
+
+#[cold]
+pub(crate) fn attach_compiled_path(mut exit: Exit, pc: usize, helper: bool) -> Exit {
+    let metadata = match &mut exit {
+        Exit::UnmappedMemory { metadata, .. } | Exit::Exception { metadata, .. } => metadata,
+        _ => return exit,
+    };
+    if let Some(m) = metadata {
+        m.path = crate::codemap::fault_path(pc, m.instruction_rip, helper);
     }
     exit
 }

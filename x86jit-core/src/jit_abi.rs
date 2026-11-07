@@ -577,7 +577,8 @@ impl MemCtx {
                 );
             }
         }
-        crate::fault::finish(exit, info, cpu, mem, mode, true)
+        let exit = crate::fault::finish(exit, info, cpu, mem, mode, true);
+        crate::fault::attach_compiled_path(exit, pc, helper)
     }
 
     #[cold]
@@ -596,14 +597,19 @@ impl MemCtx {
             crate::fault::cause_from_wire(self.fault_access),
         );
         let exit = Exit::exception(cpu.rip, self.exception_vector as u8).with_fault_metadata(m);
-        crate::fault::finish(
-            exit,
-            crate::codemap::lookup_fault_info(pc, reporting),
-            cpu,
-            mem,
-            mode,
-            true,
-        )
+        let info = crate::codemap::lookup_fault_info(pc, reporting);
+        let helper = info.is_some_and(|i| match i.helper {
+            Some(crate::FaultHelper::CompareExchangePair) => true,
+            Some(_) => matches!(
+                crate::fault::cause_from_wire(self.fault_access),
+                crate::FaultCause::Divide
+                    | crate::FaultCause::PendingX87
+                    | crate::FaultCause::InvalidMxcsr
+            ),
+            None => false,
+        });
+        let exit = crate::fault::finish(exit, info, cpu, mem, mode, true);
+        crate::fault::attach_compiled_path(exit, pc, helper)
     }
 
     #[cold]
@@ -658,7 +664,21 @@ impl MemCtx {
                 });
             }
         }
-        exit
+        if detailed {
+            crate::fault::attach_compiled_path(exit, self.next_entry as usize, false)
+        } else {
+            // Legacy recovery has no reliable compiled PC.
+            if let Exit::UnmappedMemory {
+                metadata: Some(m), ..
+            }
+            | Exit::Exception {
+                metadata: Some(m), ..
+            } = &mut exit
+            {
+                m.path = FaultPath::Unknown;
+            }
+            exit
+        }
     }
 
     /// Call only after a detailed Access landing, never before Alignment replay.
@@ -689,7 +709,8 @@ impl MemCtx {
                 _ => FaultAccess::ReadWrite,
             });
         }
-        crate::fault::finish(exit, info, cpu, mem, mode, true)
+        let exit = crate::fault::finish(exit, info, cpu, mem, mode, true);
+        crate::fault::attach_compiled_path(exit, pc, false)
     }
 }
 

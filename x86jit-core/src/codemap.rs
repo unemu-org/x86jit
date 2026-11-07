@@ -48,6 +48,14 @@ pub struct GuestTrapSite {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeMapFull;
 
+/// Identity of the compiled unit published with its immutable code-map entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum FaultUnit {
+    Block,
+    Region { entry_rip: u64 },
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     start: usize,
@@ -59,6 +67,7 @@ struct Entry {
     traps_len: usize,
     recipe: Option<&'static FrameRecipe>,
     instructions: &'static [crate::fault::InstructionFaultInfo],
+    unit: Option<FaultUnit>,
 }
 
 struct Counts {
@@ -229,6 +238,30 @@ impl CodeMap {
         recipe: Option<FrameRecipe>,
         instructions: Vec<crate::fault::InstructionFaultInfo>,
     ) -> Result<(), CodeMapFull> {
+        self.register_with_fault_path(
+            start,
+            code_len,
+            table,
+            guest_rips,
+            traps,
+            recipe,
+            instructions,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_with_fault_path(
+        &self,
+        start: usize,
+        code_len: u32,
+        table: Box<[(u32, u32)]>,
+        guest_rips: Box<[u64]>,
+        traps: Vec<GuestTrapSite>,
+        recipe: Option<FrameRecipe>,
+        instructions: Vec<crate::fault::InstructionFaultInfo>,
+        unit: Option<FaultUnit>,
+    ) -> Result<(), CodeMapFull> {
         assert!(
             table.iter().all(|&(_, i)| (i as usize) < guest_rips.len()),
             "CodeMap RIP index out of bounds"
@@ -248,6 +281,7 @@ impl CodeMap {
         let entry = Entry {
             start,
             end,
+            unit,
             table_len: table.len(),
             table: Box::into_raw(table) as *const (u32, u32),
             guest_rips: Box::into_raw(guest_rips) as *const u64,
@@ -394,6 +428,68 @@ pub fn register_with_fault_info(
         recipe,
         instructions,
     )
+}
+
+/// Publish execution identity alongside the existing fault descriptors and sites.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn register_with_fault_path(
+    start: usize,
+    code_len: u32,
+    table: Box<[(u32, u32)]>,
+    guest_rips: Box<[u64]>,
+    traps: Vec<GuestTrapSite>,
+    recipe: Option<FrameRecipe>,
+    instructions: Vec<crate::fault::InstructionFaultInfo>,
+    unit: FaultUnit,
+) -> Result<(), CodeMapFull> {
+    CODE_MAP.register_with_fault_path(
+        start,
+        code_len,
+        table,
+        guest_rips,
+        traps,
+        recipe,
+        instructions,
+        Some(unit),
+    )
+}
+
+#[cold]
+pub(crate) fn fault_path(pc: usize, rip: crate::Knowledge<u64>, helper: bool) -> crate::FaultPath {
+    use crate::{FaultPath, HelperCaller};
+    let Some(entry) = CODE_MAP.find_entry(pc, &mut || {}) else {
+        return FaultPath::Unknown;
+    };
+    let caller = match entry.unit {
+        Some(FaultUnit::Block) => HelperCaller::CompiledBlock { host_pc: pc },
+        Some(FaultUnit::Region { entry_rip }) => HelperCaller::Region {
+            entry_rip,
+            host_pc: pc,
+        },
+        None => return FaultPath::Unknown,
+    };
+    if helper {
+        let family = entry
+            .instructions
+            .iter()
+            .find(|i| crate::Knowledge::Known(i.rip) == rip)
+            .and_then(|i| i.helper);
+        return family.map_or(FaultPath::Unknown, |family| FaultPath::Helper {
+            family,
+            caller,
+        });
+    }
+    let site = CODE_MAP.lookup_trap(pc);
+    match caller {
+        HelperCaller::CompiledBlock { host_pc } => FaultPath::CompiledBlock { host_pc, site },
+        HelperCaller::Region { entry_rip, host_pc } => FaultPath::Region {
+            entry_rip,
+            host_pc,
+            site,
+        },
+        _ => unreachable!(),
+    }
 }
 
 /// Cold lookup by function/site PC and full-width instruction identity.
