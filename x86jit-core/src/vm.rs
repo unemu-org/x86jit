@@ -1718,13 +1718,14 @@ impl Vcpu {
             other => other,
         };
         self.cpu.finish_mmio_retry(Some(&exit));
-        if matches!(exit, Exit::Interrupted) {
+        if matches!(exit, Exit::Interrupted) && self.interruption_evidence.is_none() {
             // Acquire the writes published by the consumed request. A later
             // request remains pending; a concurrent SMC bit survives the mask.
-            self.interruption_evidence = Some(crate::interruption::consume(
-                &self.exit_request.word,
-                &self.engine_sections,
-            ));
+            self.interruption_evidence =
+                Some(
+                    crate::interruption::consume(&self.exit_request.word, &self.engine_sections)
+                        .at(crate::FaultPath::Unknown, false, self.cpu.rip),
+                );
         }
         // Published here rather than at each of the inner loop's many exits, so no
         // path can forget it: one shared atomic per run instead of one per transfer.
@@ -1745,6 +1746,34 @@ impl Vcpu {
     /// `TranslationCache::chained` it gives the average length of a compiled unit.
     pub fn executed_instructions(&self) -> u64 {
         self.executed
+    }
+
+    #[cold]
+    fn interrupted(&mut self, path: crate::FaultPath, chain_link: bool) -> Exit {
+        self.interruption_evidence = Some(
+            crate::interruption::consume(&self.exit_request.word, &self.engine_sections).at(
+                path,
+                chain_link,
+                self.cpu.rip,
+            ),
+        );
+        Exit::Interrupted
+    }
+
+    #[cold]
+    fn interrupted_compiled(&mut self, entry: CompiledPtr, code: u64) -> Exit {
+        if matches!(
+            code,
+            RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL | RET_PORTIO_DEFER
+        ) {
+            return self.interrupted(crate::FaultPath::Interpreter, false);
+        }
+        let path = crate::codemap::fault_path(
+            entry.0 as usize,
+            crate::Knowledge::Known(self.cpu.rip),
+            code == RET_INTERRUPTED,
+        );
+        self.interrupted(path, code == RET_CHAIN)
     }
 
     fn code_space_exit(&mut self, vm: &Vm) -> Option<Exit> {
@@ -1811,13 +1840,13 @@ impl Vcpu {
         // by blocks the backend chose to emit accounting into.
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
+        let mut dispatch = exit_word.load(Ordering::Relaxed);
         loop {
             // The outer dispatcher may invalidate code or invoke backend callbacks.
             // Retain guest control only in the integer-only compiled chain below.
             if !DEFAULT {
                 fp_mode.default();
             }
-            let dispatch = exit_word.load(Ordering::Relaxed);
             if dispatch & EXIT_REQUESTED != 0
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
@@ -1883,6 +1912,10 @@ impl Vcpu {
                         if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != mxcsr_mode {
                             return Err(blocks_run);
                         }
+                        dispatch = exit_word.load(Ordering::Relaxed);
+                        if dispatch & EXIT_REQUESTED != 0 {
+                            return Ok(self.interrupted(crate::FaultPath::Interpreter, false));
+                        }
                         continue;
                     }
                     StepResult::Exit(exit) => {
@@ -1930,6 +1963,7 @@ impl Vcpu {
                             // for §9.2 budget accounting. It also clears any stale shadow.
                             self.sti_shadow = false;
                             blocks_run += 1;
+                            dispatch = exit_word.load(Ordering::Relaxed);
                             continue;
                         }
                         StepResult::Exit(exit) => {
@@ -2021,6 +2055,15 @@ impl Vcpu {
                         crate::interp::BlockResult::Exit(exit) => {
                             let exit = exit.into_exit();
                             match exit {
+                                Exit::Interrupted => {
+                                    return Ok(self.interrupted(
+                                        crate::FaultPath::Helper {
+                                            family: crate::FaultHelper::String,
+                                            caller: crate::HelperCaller::Interpreter,
+                                        },
+                                        false,
+                                    ));
+                                }
                                 Exit::Exception { addr, vector, .. }
                                     if self.mode == CpuMode::Real16 =>
                                 {
@@ -2054,18 +2097,18 @@ impl Vcpu {
                             }
                         }
                     }
+                    dispatch = exit_word.load(Ordering::Relaxed);
+                    if dispatch & EXIT_REQUESTED != 0 {
+                        return Ok(self.interrupted(crate::FaultPath::Interpreter, false));
+                    }
                 }
                 CachedBlock::Compiled { entry, .. } => {
+                    dispatch = exit_word.load(Ordering::Relaxed);
+                    if dispatch != 0 {
+                        continue;
+                    }
                     let mut cur = entry;
-                    loop {
-                        // SMC (§10): leaving the chain bounds invalidation deferral
-                        // to one block while chaining.
-                        // One relaxed load folds SMC, exhaustion and exit notifications at
-                        // every chain/link/IBTC edge. The outer loop consumes exit
-                        // requests and handles SMC before re-entering compiled code.
-                        if exit_word.load(Ordering::Relaxed) != 0 {
-                            break;
-                        }
+                    let (stopped, stopped_code) = loop {
                         // Hand the block its remaining block quantum (superblocks,
                         // §12 M5): a compiled region spends 1 fuel per guest block and
                         // stops at 0; a single block ignores it. Charging the fuel it
@@ -2086,8 +2129,9 @@ impl Vcpu {
                         if !DEFAULT && !matches!(code, RET_CHAIN | RET_LINK | RET_IBTC_MISS) {
                             fp_mode.default();
                         }
+                        let next;
                         match code {
-                            RET_CONTINUE | RET_INTERRUPTED => break,
+                            RET_CONTINUE | RET_INTERRUPTED => break (cur, code),
                             RET_MXCSR_CHANGED => return Err(blocks_run),
                             RET_CHAIN => {
                                 // Plain per-vcpu counter, flushed once per `run`
@@ -2095,7 +2139,7 @@ impl Vcpu {
                                 // ~1M times per frame in a real game, so a shared
                                 // atomic here is a locked RMW on the hottest path.
                                 self.chained += 1;
-                                cur = CompiledPtr(ctx.next_entry as *const u8);
+                                next = CompiledPtr(ctx.next_entry as *const u8);
                             }
                             RET_LINK => {
                                 // Snapshot BEFORE resolving: the publish
@@ -2142,15 +2186,15 @@ impl Vcpu {
                                             // transferring would run a translation of code
                                             // the guest has rewritten. Back to the outer
                                             // loop, which runs `handle_smc` and re-resolves.
-                                            break;
+                                            break (cur, code);
                                         }
                                         // Seed the fast-resolve cache too: the next
                                         // outer-loop visit to this RIP skips `resolve`.
                                         self.fast_put(self.cpu.rip, entry);
-                                        cur = entry;
+                                        next = entry;
                                     }
                                     // Mixed backend can't chain — fall back to dispatch.
-                                    Ok(CachedBlock::Interpreted(_)) => break,
+                                    Ok(CachedBlock::Interpreted(_)) => break (cur, code),
                                     Err(exit) => return Ok(exit),
                                 }
                             }
@@ -2242,13 +2286,13 @@ impl Vcpu {
                                             );
                                             if !published {
                                                 // Invalidated under us — see RET_LINK.
-                                                break;
+                                                break (cur, code);
                                             }
                                         }
-                                        cur = entry;
+                                        next = entry;
                                     }
                                     // Interpreted target — leave the chain and dispatch.
-                                    None => break,
+                                    None => break (cur, code),
                                 }
                             }
                             RET_SYSCALL => return Ok(Exit::Syscall),
@@ -2349,7 +2393,16 @@ impl Vcpu {
                                         {
                                             return Err(blocks_run);
                                         }
-                                        break;
+                                        break (cur, code);
+                                    }
+                                    StepResult::Exit(Exit::Interrupted) => {
+                                        return Ok(self.interrupted(
+                                            crate::FaultPath::Helper {
+                                                family: crate::FaultHelper::String,
+                                                caller: crate::HelperCaller::Interpreter,
+                                            },
+                                            false,
+                                        ));
                                     }
                                     StepResult::Exit(exit) => {
                                         return Ok(
@@ -2392,7 +2445,7 @@ impl Vcpu {
                                 );
                                 self.retired += info.retired;
                                 match r {
-                                    StepResult::Continue => break,
+                                    StepResult::Continue => break (cur, code),
                                     StepResult::Exit(exit) => return Ok(exit),
                                 }
                             }
@@ -2414,6 +2467,19 @@ impl Vcpu {
                             }
                             return Ok(Exit::BudgetExhausted);
                         }
+                        // Poll before replacing the just-executed unit with its
+                        // successor. Only the cold edge needs its identity.
+                        if exit_word.load(Ordering::Relaxed) != 0 {
+                            break (cur, code);
+                        }
+                        cur = next;
+                    };
+                    dispatch = exit_word.load(Ordering::Relaxed);
+                    if dispatch & EXIT_REQUESTED != 0 {
+                        if !DEFAULT {
+                            fp_mode.default();
+                        }
+                        return Ok(self.interrupted_compiled(stopped, stopped_code));
                     }
                 }
             }

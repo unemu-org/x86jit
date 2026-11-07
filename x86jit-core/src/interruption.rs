@@ -33,13 +33,57 @@ const ACTIVE_MASK: u64 = KIND_MASK << ACTIVE_SHIFT;
 /// completed engine sections that deferred a pending request, not requester calls.
 /// A section entered with a request already pending also counts. Nested sections
 /// count separately, and the kind set is their union. Duration is not measured.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterruptionEvidence {
     kinds: u8,
     count: u64,
+    path: crate::FaultPath,
+    chain_link: bool,
+    rip: u64,
+}
+
+impl Default for InterruptionEvidence {
+    fn default() -> Self {
+        Self {
+            kinds: 0,
+            count: 0,
+            path: crate::FaultPath::Unknown,
+            chain_link: false,
+            rip: 0,
+        }
+    }
 }
 
 impl InterruptionEvidence {
+    /// Boundary where the exit request was checked and taken. A helper is
+    /// reported only for a check inside that helper (REP string iterations),
+    /// never for a helper that has already returned. Dispatcher checks before
+    /// selecting an execution unit report `FaultPath::Unknown`. Compiled
+    /// boundaries use the function entry as their code-map key; a site is
+    /// supplied only if that key has an exact code-map site.
+    pub const fn path(&self) -> crate::FaultPath {
+        self.path
+    }
+
+    /// Whether the checked boundary followed a resolved direct chain link,
+    /// including a self-link. Internal region edges, helper iteration checks,
+    /// and dispatcher resolution of an empty link do not count as chain links.
+    pub const fn chain_link(&self) -> bool {
+        self.chain_link
+    }
+
+    /// Architectural resume point, equal to the vCPU's RIP at this exit.
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    pub(crate) fn at(mut self, path: crate::FaultPath, chain_link: bool, rip: u64) -> Self {
+        self.path = path;
+        self.chain_link = chain_link;
+        self.rip = rip;
+        self
+    }
+
     pub const fn deferred(&self) -> bool {
         self.count != 0
     }
@@ -110,6 +154,7 @@ pub(crate) fn consume(dispatch: &AtomicU64, sections: &AtomicU64) -> Interruptio
     InterruptionEvidence {
         kinds: ((previous >> KINDS_SHIFT) & KIND_MASK) as u8,
         count: previous >> COUNT_SHIFT,
+        ..Default::default()
     }
 }
 

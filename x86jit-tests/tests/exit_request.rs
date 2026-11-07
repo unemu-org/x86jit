@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use x86jit_core::{
-    Backend, CpuState, Exit, ExitRequest, InterpreterBackend, Prot, Reg, RegionCaps, RegionKind,
-    Vcpu, Vm, VmConfig,
+    Backend, CpuState, Exit, ExitRequest, FaultHelper, FaultPath, HelperCaller, InterpreterBackend,
+    Prot, Reg, RegionCaps, RegionKind, Vcpu, Vm, VmConfig,
 };
 use x86jit_cranelift::JitBackend;
 
@@ -291,6 +291,36 @@ fn rep_interrupt_attempt(tier: Tier, movs: bool, count: u64) -> bool {
         remaining > 0 && remaining < count,
         "must stop part-way: {remaining}"
     );
+    let evidence = interrupted.interruption_evidence().unwrap();
+    assert_eq!(evidence.rip(), interrupted.cpu.rip);
+    assert!(!evidence.chain_link());
+    match (tier, evidence.path()) {
+        (
+            Tier::Interp,
+            FaultPath::Helper {
+                family: FaultHelper::String,
+                caller: HelperCaller::Interpreter,
+            },
+        ) => {}
+        (
+            Tier::Chained,
+            FaultPath::Helper {
+                family: FaultHelper::String,
+                caller: HelperCaller::CompiledBlock { host_pc },
+            },
+        ) => assert!(x86jit_core::codemap::contains(host_pc)),
+        (
+            Tier::Region,
+            FaultPath::Helper {
+                family: FaultHelper::String,
+                caller: HelperCaller::Region { entry_rip, host_pc },
+            },
+        ) => {
+            assert_eq!(entry_rip, CODE);
+            assert!(x86jit_core::codemap::contains(host_pc));
+        }
+        (_, path) => panic!("unexpected REP interruption boundary: {path:?}"),
+    }
     let completed = count - remaining;
     // SDM Vol 2B, REP/REPE/REPZ/REPNE/REPNZ—Repeat String Operation
     // Prefix, Description and Operation (REP pp. 4-563–4-564): interrupted repeats save the instruction RIP, next
@@ -545,6 +575,10 @@ fn finishes_pending_mmio(tier: Tier) {
     assert_eq!(target.reg(Reg::Rax), 0xdead_beef);
     assert_eq!(target.cpu.rip, CODE + 7);
     assert!(target.cpu.pending_mmio.is_none());
+    let evidence = target.interruption_evidence().unwrap();
+    assert_eq!(evidence.path(), FaultPath::Interpreter);
+    assert_eq!(evidence.rip(), CODE + 7);
+    assert!(!evidence.chain_link());
     assert!(matches!(target.run(&vm, None), Exit::Hlt));
 }
 
@@ -717,4 +751,143 @@ fn exit_request_legacy_string_helpers_remain_public() {
     assert_eq!(fault.addr, 0x10000);
     assert!(fault.write);
     assert_eq!(state.rip, CODE);
+}
+
+fn interruption_boundary(tier: Tier, x87: bool, self_link: bool) {
+    // Atomic XCHG publishes progress without racing the requester's read.
+    let mut code = REP_SIGNAL.to_vec();
+    if x87 {
+        // SDM Vol 2A §3.2, FNOP: no FPU operation is performed.
+        code.extend_from_slice(&[0xd9, 0xd0]); // fnop
+    }
+    if !self_link {
+        code.extend_from_slice(&[0xeb, 0x00]);
+    }
+    let displacement = -(code.len() as i8 + 2);
+    code.extend_from_slice(&[0xeb, displacement as u8]);
+    let mut vm = vm(tier, &code, 0x10000);
+    let mut initial = cpu(&vm);
+    assert!(matches!(initial.run(&vm, Some(64)), Exit::BudgetExhausted));
+    if matches!(tier, Tier::Region) {
+        Arc::get_mut(&mut vm)
+            .unwrap()
+            .test_support_force_region(
+                CODE,
+                RegionCaps {
+                    max_blocks: 8,
+                    max_icount: 128,
+                },
+                initial.cpu.mxcsr,
+            )
+            .unwrap();
+    }
+    initial.cpu = CpuState::new();
+    initial.cpu.rip = CODE;
+    vm.mem.write(SIGNAL, 0, 8).unwrap();
+    let mut interrupted = interrupt(Arc::clone(&vm), initial, SIGNAL).unwrap();
+    let evidence = interrupted.interruption_evidence().unwrap();
+    assert_eq!(evidence.rip(), interrupted.cpu.rip);
+    assert!(
+        evidence.rip() == CODE || (!self_link && evidence.rip() == CODE + code.len() as u64 - 2)
+    );
+    assert_eq!(evidence.chain_link(), matches!(tier, Tier::Chained));
+    match (tier, evidence.path()) {
+        (Tier::Interp, FaultPath::Interpreter) => {}
+        (Tier::Chained, FaultPath::CompiledBlock { host_pc, site }) => {
+            assert!(x86jit_core::codemap::contains(host_pc));
+            assert_eq!(site, x86jit_core::codemap::lookup_trap(host_pc));
+        }
+        (
+            Tier::Region,
+            FaultPath::Region {
+                entry_rip,
+                host_pc,
+                site,
+            },
+        ) => {
+            assert_eq!(entry_rip, CODE);
+            assert!(x86jit_core::codemap::contains(host_pc));
+            assert_eq!(site, x86jit_core::codemap::lookup_trap(host_pc));
+        }
+        (_, path) => panic!("unexpected interruption boundary: {path:?}"),
+    }
+    let saved = evidence;
+    assert!(matches!(
+        interrupted.run(&vm, Some(0)),
+        Exit::BudgetExhausted
+    ));
+    assert!(interrupted.interruption_evidence().is_none());
+    assert_ne!(saved.path(), FaultPath::Unknown);
+    assert_eq!(saved.rip(), interrupted.cpu.rip);
+}
+
+macro_rules! interruption_boundary_test {
+    ($name:ident, $tier:expr, $x87:expr, $self_link:expr) => {
+        #[test]
+        fn $name() {
+            interruption_boundary($tier, $x87, $self_link);
+        }
+    };
+}
+
+interruption_boundary_test!(
+    interruption_path_loop_interpreter,
+    Tier::Interp,
+    false,
+    false
+);
+interruption_boundary_test!(interruption_path_loop_block, Tier::Chained, false, false);
+interruption_boundary_test!(interruption_path_loop_region, Tier::Region, false, false);
+interruption_boundary_test!(
+    interruption_path_self_link_interpreter,
+    Tier::Interp,
+    false,
+    true
+);
+interruption_boundary_test!(
+    interruption_path_self_link_block,
+    Tier::Chained,
+    false,
+    true
+);
+interruption_boundary_test!(
+    interruption_path_self_link_region,
+    Tier::Region,
+    false,
+    true
+);
+interruption_boundary_test!(
+    interruption_path_returned_x87_interpreter,
+    Tier::Interp,
+    true,
+    false
+);
+interruption_boundary_test!(
+    interruption_path_returned_x87_block,
+    Tier::Chained,
+    true,
+    false
+);
+interruption_boundary_test!(
+    interruption_path_returned_x87_region,
+    Tier::Region,
+    true,
+    false
+);
+
+#[test]
+fn interruption_path_before_execution_and_owned_lifetime() {
+    for tier in [Tier::Interp, Tier::Chained, Tier::Region] {
+        let vm = vm(tier, &[0xeb, 0xfe], 0x10000);
+        let mut cpu = cpu(&vm);
+        cpu.exit_request().request_exit();
+        assert!(matches!(cpu.run(&vm, Some(0)), Exit::Interrupted));
+        let evidence = cpu.interruption_evidence().unwrap();
+        assert_eq!(evidence.rip(), CODE);
+        assert_eq!(evidence.path(), FaultPath::Unknown);
+        assert!(!evidence.chain_link());
+        assert!(matches!(cpu.run(&vm, Some(0)), Exit::BudgetExhausted));
+        assert!(cpu.interruption_evidence().is_none());
+        assert_eq!(evidence.rip(), CODE);
+    }
 }
