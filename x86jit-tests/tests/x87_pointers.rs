@@ -670,7 +670,20 @@ fn native_save_policy(backend: Box<dyn Backend>) {
     let mut data = [0; 24];
     data[..8].copy_from_slice(&2f64.to_le_bytes());
     data[8..10].copy_from_slice(&0x037bu16.to_le_bytes());
-    let native = native_output(code.clone(), data.to_vec());
+    // On AMD the state save and restore a kernel uses across a task switch do
+    // not carry the x87 pointer registers while ES is clear (APM Vol 2
+    // §11.4.4.3), so a capture preempted between the FLD and an FNSTENV can
+    // read zeros there. Preemption can only lose the pointers, never invent
+    // them: keep the first capture whose two FNSTENV images both carry a
+    // nonzero instruction pointer.
+    let native = (0..32)
+        .map(|_| native_output(code.clone(), data.to_vec()))
+        .find(|out| {
+            [480, 1504]
+                .iter()
+                .all(|&base| out[base + 12..base + 16].iter().any(|&b| b != 0))
+        })
+        .expect("a native capture that was not preempted inside the sequence");
     let ours = run_config(&code, &data, backend, CpuMode::Long64, |cpu| {
         // SDM Vol 1 §8.1.8: live selectors are saved when EBX[13] is clear.
         // Zen 4 CI measured native FCS=0x33; match its user CS rather than
