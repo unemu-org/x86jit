@@ -50,8 +50,8 @@ use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets, MAX_GUEST_ACCESS_DESCRIPTORS
 use x86jit_core::x87::{FpMem, RawFpMem};
 use x86jit_core::GuestTrapSite;
 use x86jit_core::{
-    Backend, CachedBlock, IrBlock, IrRegion, MemConsistency, RegionCaps, TierUpFinished,
-    TierUpRequest, TierUpSubmit, TierUpUnit,
+    Backend, CachedBlock, IrBlock, IrRegion, MemConsistency, RegionCaps, ShutdownError,
+    ShutdownReport, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit,
 };
 
 // User trap codes identify transfers independently of machine source locations:
@@ -2482,6 +2482,10 @@ pub struct CompiledCode {
 
 type CodeObserver = Arc<dyn Fn(CompiledCode) + Send + Sync>;
 
+/// Compiler entry point supplied to an embedder's worker spawner.
+pub type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
+type WorkerSpawner = Box<dyn Fn(WorkerTask) -> std::io::Result<JoinHandle<()>> + Send + Sync>;
+
 fn drop_observer_value<T>(value: T) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
         // The destructor's panic payload may itself panic on drop. Forget that
@@ -2506,11 +2510,14 @@ pub struct JitBackend {
     /// first [`tier_up_async`](Backend::tier_up_async) and joined on `Drop`. `None`
     /// until a background tier-up is first requested — eager/sync use never spawns.
     worker: Mutex<Option<JoinHandle<()>>>,
+    worker_spawner: WorkerSpawner,
+    shutdown_report: ShutdownReport,
+    worker_panicked: bool,
 }
 
 /// State shared between the vcpu threads (foreground `materialize`, submit, drain)
-/// and the background compiler worker (bg-tier). Behind `Arc` so a
-/// [`TierUpHandle`] clone can expose `wait_idle` without owning the worker thread.
+/// and the background compiler worker (bg-tier). Diagnostic handles share only
+/// the separate queue coordination state, never these compiler resources.
 struct Shared {
     /// The Cranelift module, built lazily on the first compile: its ISA
     /// bakes in `opt_level`, which may have to be derived from a tier-up policy the
@@ -2549,11 +2556,8 @@ struct Shared {
     offsets: CpuOffsets,
     /// Superblock caps (§12 M5-T3), or `None` to compile one block at a time.
     caps: Option<RegionCaps>,
-    /// Submitted-but-not-completed requests + worker coordination. The worker sleeps
-    /// on `work_cv`; `wait_idle` sleeps on `idle_cv`.
-    queue: Mutex<Queue>,
-    work_cv: Condvar,
-    idle_cv: Condvar,
+    stopped: AtomicBool,
+    background: Arc<CompilerQueue>,
     /// Finished compiles awaiting the core dispatcher's drain.
     done: Mutex<Vec<TierUpFinished>>,
     /// Lock-free "anything to drain?" probe, kept equal to `done.len()` under the
@@ -2590,10 +2594,15 @@ struct CompileCompletion<'a>(&'a Shared);
 
 impl Drop for CompileCompletion<'_> {
     fn drop(&mut self) {
-        let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self
+            .0
+            .background
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         queue.outstanding -= 1;
         if queue.outstanding == 0 {
-            self.0.idle_cv.notify_all();
+            self.0.background.idle_cv.notify_all();
         }
     }
 }
@@ -2603,13 +2612,22 @@ struct QueuedCompile {
     fetch_permit: Option<x86jit_core::FetchPermit>,
 }
 
+/// Diagnostics may upgrade this state during destruction without retaining a
+/// module, observer or completion. Shutdown empties the queue before counting
+/// resource-owning handles; only the inert coordination state can outlive it.
+struct CompilerQueue {
+    queue: Mutex<Queue>,
+    work_cv: Condvar,
+    idle_cv: Condvar,
+}
+
 /// The background compile queue and its liveness counters (bg-tier).
 struct Queue {
     items: VecDeque<QueuedCompile>,
     /// Requests submitted but not yet completed (queued + the one compiling).
     /// `wait_idle` blocks until this reaches zero.
     outstanding: usize,
-    /// Set by `Drop` to unblock and stop the worker.
+    /// Set by shutdown or `Drop` to unblock and stop the worker.
     shutdown: bool,
     /// Test lever: while true the worker parks without popping, so
     /// requests pile up in the queue. Toggled via `TierUpHandle::pause_compiler`;
@@ -2819,14 +2837,17 @@ impl JitBackend {
                 helper_names: Mutex::new(vec![""; MAX_HELPERS]),
                 offsets: cpu_offsets(),
                 caps,
-                queue: Mutex::new(Queue {
-                    items: VecDeque::new(),
-                    outstanding: 0,
-                    shutdown: false,
-                    paused: false,
+                stopped: AtomicBool::new(false),
+                background: Arc::new(CompilerQueue {
+                    queue: Mutex::new(Queue {
+                        items: VecDeque::new(),
+                        outstanding: 0,
+                        shutdown: false,
+                        paused: false,
+                    }),
+                    work_cv: Condvar::new(),
+                    idle_cv: Condvar::new(),
                 }),
-                work_cv: Condvar::new(),
-                idle_cv: Condvar::new(),
                 done: Mutex::new(Vec::new()),
                 ready: AtomicUsize::new(0),
                 compile_ns: AtomicU64::new(0),
@@ -2839,6 +2860,13 @@ impl JitBackend {
                 fail_worker_spawn: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
+            worker_spawner: Box::new(|task| {
+                std::thread::Builder::new()
+                    .name("x86jit-tier".into())
+                    .spawn(task)
+            }),
+            shutdown_report: ShutdownReport::default(),
+            worker_panicked: false,
         }
     }
 
@@ -2925,6 +2953,9 @@ impl JitBackend {
         req: TierUpRequest,
         fetch_permit: Option<x86jit_core::FetchPermit>,
     ) -> TierUpSubmit {
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return TierUpSubmit::Unsupported;
+        }
         if self.code_space_exhausted() {
             return TierUpSubmit::Busy;
         }
@@ -2932,7 +2963,7 @@ impl JitBackend {
             self.shared.exhaust_code_space::<()>();
             return TierUpSubmit::Busy;
         }
-        let mut q = self.shared.queue.lock().unwrap();
+        let mut q = self.shared.background.queue.lock().unwrap();
         if q.shutdown {
             // Racing `Drop` — decline; the caller stays interpreted (correct, slow).
             return TierUpSubmit::Unsupported;
@@ -2947,12 +2978,15 @@ impl JitBackend {
         });
         q.outstanding += 1;
         drop(q);
-        self.shared.work_cv.notify_one();
+        self.shared.background.work_cv.notify_one();
         TierUpSubmit::Queued
     }
 
     fn ensure_worker(&self) -> std::io::Result<()> {
         let mut w = lock_recovering(&self.worker, "compile worker");
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if w.is_none() {
             let shared = Arc::clone(&self.shared);
             #[cfg(test)]
@@ -2962,9 +2996,7 @@ impl JitBackend {
             let spawned = if fail {
                 Err(std::io::ErrorKind::WouldBlock.into())
             } else {
-                std::thread::Builder::new()
-                    .name("x86jit-tier".into())
-                    .spawn(move || shared.worker_loop())
+                (self.worker_spawner)(Box::new(move || shared.worker_loop()))
             };
             *w = Some(spawned?);
         }
@@ -2977,7 +3009,88 @@ impl JitBackend {
     /// backend into a `Vm`.
     pub fn tier_up_handle(&self) -> TierUpHandle {
         TierUpHandle {
-            shared: Arc::clone(&self.shared),
+            shared: Arc::downgrade(&self.shared.background),
+        }
+    }
+
+    /// Install a worker spawner before the first background submission. The
+    /// spawner must return the join handle of the thread executing `task`, or
+    /// return an error without starting it. Never detach or retain `task`.
+    /// Wrap `task` to configure the worker's signal mask, affinity, priority,
+    /// name or thread registration before it enters the compiler. No library
+    /// signal policy is installed. Spawn errors decline background tier-up and
+    /// enter the existing code-space-exhausted interpreter fallback.
+    pub fn set_worker_spawner(
+        &mut self,
+        spawner: impl Fn(WorkerTask) -> std::io::Result<JoinHandle<()>> + Send + Sync + 'static,
+    ) {
+        assert!(self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        self.worker_spawner = Box::new(spawner);
+    }
+
+    fn stop_worker(&mut self) -> Result<ShutdownReport, ShutdownError> {
+        self.shared.stopped.store(true, Ordering::Release);
+        {
+            let mut q = self
+                .shared
+                .background
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            q.shutdown = true;
+            let cancelled = q.items.len();
+            q.items.clear();
+            q.outstanding -= cancelled;
+            self.shutdown_report.jobs_cancelled += cancelled;
+        }
+        self.shared.background.work_cv.notify_all();
+        self.shared.background.idle_cv.notify_all();
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            if let Err(payload) = worker.join() {
+                self.worker_panicked = true;
+                drop_observer_value(payload);
+            }
+            self.shutdown_report.workers_joined += 1;
+        }
+        {
+            let mut q = self
+                .shared
+                .background
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // A worker panic may have abandoned a request before its completion guard.
+            self.shutdown_report.jobs_cancelled += q.outstanding;
+            q.outstanding = 0;
+        }
+        self.shared.background.idle_cv.notify_all();
+        self.shared
+            .done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.shared.ready.store(0, Ordering::Release);
+        self.shutdown_report.outstanding_handles = Arc::strong_count(&self.shared) - 1;
+        if self.shutdown_report.outstanding_handles != 0 {
+            Err(ShutdownError::LiveResources {
+                resource: "compiler state",
+                report: self.shutdown_report,
+            })
+        } else if self.worker_panicked {
+            Err(ShutdownError::WorkerPanicked {
+                report: self.shutdown_report,
+            })
+        } else {
+            Ok(self.shutdown_report)
         }
     }
 }
@@ -3138,7 +3251,8 @@ impl Shared {
         ) -> Box<[u64]>,
     ) -> Result<CompiledPtr, CompileError> {
         let started = Instant::now();
-        if self.code_space_exhausted.load(Ordering::Acquire) {
+        if self.stopped.load(Ordering::Acquire) || self.code_space_exhausted.load(Ordering::Acquire)
+        {
             return Err(CompileError::Unavailable);
         }
         let _serial = self.lock_telemetry.lock(
@@ -3641,10 +3755,10 @@ impl Shared {
                 request: req,
                 fetch_permit,
             } = {
-                let mut q = self.queue.lock().unwrap();
+                let mut q = self.background.queue.lock().unwrap();
                 // Park while empty or paused; `shutdown` always wins so `Drop` joins.
                 while (q.items.is_empty() || q.paused) && !q.shutdown {
-                    q = self.work_cv.wait(q).unwrap();
+                    q = self.background.work_cv.wait(q).unwrap();
                 }
                 if q.shutdown && q.items.is_empty() {
                     break;
@@ -3673,18 +3787,25 @@ impl Shared {
 
 /// A cloneable handle to a [`JitBackend`]'s background tier-up machinery (bg-tier),
 /// exposing `wait_idle` for deterministic tests without owning the worker thread.
+/// Operations retain only queue coordination, never compiler resources, and become
+/// inert after backend destruction.
+#[derive(Clone)]
 pub struct TierUpHandle {
-    shared: Arc<Shared>,
+    shared: Weak<CompilerQueue>,
 }
 
 impl TierUpHandle {
-    /// Block until every submitted background compile has completed and its result
-    /// is queued for drain (the completions are then observable via
-    /// `Backend::tier_up_finished`). No sleeps — waits on the worker's idle signal.
+    /// Block until every submitted background compile has completed or has been
+    /// cancelled by shutdown. Before shutdown, results are queued for
+    /// `Backend::tier_up_finished`. Returns immediately after backend destruction.
+    /// No sleeps — waits on the worker's idle signal.
     pub fn wait_idle(&self) {
-        let mut q = self.shared.queue.lock().unwrap();
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         while q.outstanding > 0 {
-            q = self.shared.idle_cv.wait(q).unwrap();
+            q = shared.idle_cv.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -3694,22 +3815,34 @@ impl TierUpHandle {
     /// does NOT hold the compiler mutex, so a vcpu can still invalidate/`materialize`
     /// on the same thread). Not for production use.
     pub fn pause_compiler(&self) -> CompilerPause {
-        self.shared.queue.lock().unwrap().paused = true;
+        if let Some(shared) = self.shared.upgrade() {
+            shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .paused = true;
+        }
         CompilerPause {
-            shared: Arc::clone(&self.shared),
+            shared: self.shared.clone(),
         }
     }
 }
 
 /// Guard from [`TierUpHandle::pause_compiler`]: releasing it unparks the worker.
 pub struct CompilerPause {
-    shared: Arc<Shared>,
+    shared: Weak<CompilerQueue>,
 }
 
 impl Drop for CompilerPause {
     fn drop(&mut self) {
-        self.shared.queue.lock().unwrap().paused = false;
-        self.shared.work_cv.notify_all();
+        if let Some(shared) = self.shared.upgrade() {
+            shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .paused = false;
+            shared.work_cv.notify_all();
+        }
     }
 }
 
@@ -3720,6 +3853,9 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn shutdown(&mut self) -> Result<ShutdownReport, ShutdownError> {
+        self.stop_worker()
+    }
     fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
         let mut words = self.shared.dispatch_words.lock().unwrap();
         words.retain(|weak| weak.strong_count() != 0);
@@ -3921,23 +4057,7 @@ impl Backend for JitBackend {
 
 impl Drop for JitBackend {
     fn drop(&mut self) {
-        // Signal shutdown and wake the worker so no thread outlives the module it
-        // compiles into (use-after-free guard). A worker that panicked poisons the
-        // queue mutex — recover the guard and still join; never re-panic in `Drop`
-        // (a dead worker just means blocks stay interpreted: slow, not unsound).
-        {
-            let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            q.shutdown = true;
-        }
-        self.shared.work_cv.notify_all();
-        if let Some(handle) = self
-            .worker
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let _ = handle.join(); // swallow a worker panic
-        }
+        let _ = self.stop_worker();
     }
 }
 
@@ -4572,7 +4692,7 @@ mod tests {
             shared.inner.lock().unwrap().is_none(),
             "never compiled inline"
         );
-        assert!(shared.queue.lock().unwrap().items.is_empty());
+        assert!(shared.background.queue.lock().unwrap().items.is_empty());
         shared.fail_worker_spawn.store(false, Ordering::Relaxed);
         assert!(matches!(cpu.run(&vm, Some(3)), Exit::BudgetExhausted));
         assert_eq!(cpu.reg(Reg::Rax), 42);
@@ -4661,6 +4781,7 @@ mod tests {
             .fail_compile_stage
             .store(stage, Ordering::Relaxed);
         let handle = jit.tier_up_handle();
+        let compiler = Arc::downgrade(&jit.shared);
         let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(jit));
         vm.set_tier_up_after(Some(1));
         vm.set_tier_up_background(background);
@@ -4691,7 +4812,8 @@ mod tests {
             }
         }
         if background {
-            let q = handle.shared.queue.lock().unwrap();
+            let shared = compiler.upgrade().unwrap();
+            let q = shared.background.queue.lock().unwrap();
             assert_eq!(q.items.len(), 1);
             assert_eq!(
                 matches!(q.items[0].request.unit, TierUpUnit::Region(_)),
@@ -4701,8 +4823,9 @@ mod tests {
             drop(q);
             drop(pause);
             handle.wait_idle();
-            assert_eq!(handle.shared.jit(0).next_id, 1, "failure hook was reached");
-            let done = handle.shared.done.lock().unwrap();
+            let shared = compiler.upgrade().unwrap();
+            assert_eq!(shared.jit(0).next_id, 1, "failure hook was reached");
+            let done = shared.done.lock().unwrap();
             assert_eq!(done.len(), 1);
             assert!(matches!(done[0].block, CachedBlock::Interpreted(_)));
             drop(done);
@@ -4794,6 +4917,226 @@ mod tests {
             jit.worker.lock().unwrap().is_some(),
             "the first request spawns the worker"
         );
+    }
+
+    #[test]
+    fn background_drop_releases_diagnostic_handles() {
+        let jit = JitBackend::new();
+        let shared = Arc::downgrade(&jit.shared);
+        let handle = jit.tier_up_handle();
+        let pause = handle.pause_compiler();
+        drop(jit);
+        assert!(
+            shared.upgrade().is_none(),
+            "diagnostics must not retain the compiler"
+        );
+        handle.wait_idle();
+        drop(pause);
+    }
+
+    #[test]
+    fn background_drop_cancels_queued_jobs() {
+        let jit = JitBackend::new();
+        let shared = jit.shared.clone();
+        let handle = jit.tier_up_handle();
+        let pause = handle.pause_compiler();
+        let mem = mem_with_code();
+        for _ in 0..3 {
+            assert_eq!(jit.tier_up_async(request(&mem)), TierUpSubmit::Queued);
+        }
+        drop(jit);
+        assert!(
+            shared.done.lock().unwrap().is_empty(),
+            "shutdown must discard completions"
+        );
+        assert_eq!(
+            shared.compile_attempts.load(Ordering::Relaxed),
+            0,
+            "queued jobs must be cancelled"
+        );
+        assert_eq!(shared.background.queue.lock().unwrap().outstanding, 0);
+        handle.wait_idle();
+        drop(pause);
+    }
+
+    #[test]
+    fn shutdown_destroys_compiler_with_active_diagnostic_operation() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct DelayedObserver {
+            destroyed: Arc<AtomicBool>,
+            owner: std::thread::ThreadId,
+        }
+        impl Drop for DelayedObserver {
+            fn drop(&mut self) {
+                if std::thread::current().id() != self.owner {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.destroyed.store(true, Ordering::Release);
+            }
+        }
+
+        for iteration in 0..1000 {
+            let jit = JitBackend::new();
+            let destroyed = Arc::new(AtomicBool::new(false));
+            let observer = DelayedObserver {
+                destroyed: destroyed.clone(),
+                owner: std::thread::current().id(),
+            };
+            jit.set_compiled_code_observer(move |_| {
+                std::hint::black_box(&observer);
+            });
+            let mem = mem_with_code();
+            let TierUpUnit::Block(ir) = request(&mem).unit else {
+                unreachable!()
+            };
+            assert!(matches!(
+                jit.materialize(&ir, MemConsistency::Fast, None, 0),
+                CachedBlock::Compiled { .. }
+            ));
+            let handle = jit.tier_up_handle();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let diagnostic = std::thread::spawn(move || {
+                // Hold the same upgraded state as wait_idle across all of shutdown.
+                let state = handle.shared.upgrade().unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(state.queue.lock().unwrap().shutdown);
+                drop(state);
+                handle.wait_idle();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let vm =
+                x86jit_core::Vm::with_backend(x86jit_core::VmConfig::flat(0x2000), Box::new(jit));
+            let result = vm.shutdown();
+            let destroyed_before_return = destroyed.load(Ordering::Acquire);
+            release_tx.send(()).unwrap();
+            diagnostic.join().unwrap();
+            assert_eq!(
+                result,
+                Ok(ShutdownReport::default()),
+                "iteration {iteration}"
+            );
+            assert!(destroyed_before_return, "iteration {iteration}");
+        }
+    }
+
+    #[test]
+    fn shutdown_joins_inflight_and_cancels_pending_compile() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let timeout = Duration::from_secs(5);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut jit = JitBackend::new();
+        jit.set_lock_telemetry(true);
+        jit.set_compiled_code_observer(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv_timeout(timeout).unwrap();
+        });
+        let weak = Arc::downgrade(&jit.shared);
+        let handle = jit.tier_up_handle();
+        let mem = mem_with_code();
+        assert_eq!(jit.tier_up_async(request(&mem)), TierUpSubmit::Queued);
+        entered_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(jit.tier_up_async(request(&mem)), TierUpSubmit::Queued);
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            let report = jit.shutdown();
+            assert!(jit.worker.lock().unwrap().is_none());
+            assert!(jit.tier_up_finished().is_empty());
+            assert_eq!(jit.tier_up_async(request(&mem)), TierUpSubmit::Unsupported);
+            assert!(
+                jit.worker.lock().unwrap().is_none(),
+                "shutdown cannot respawn"
+            );
+            assert!(jit.lock_telemetry().compile_serial.acquisitions > 0);
+            done_tx.send(report).unwrap();
+        });
+        let deadline = Instant::now() + timeout;
+        while !weak
+            .upgrade()
+            .unwrap()
+            .background
+            .queue
+            .lock()
+            .unwrap()
+            .shutdown
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(timeout).unwrap().unwrap(),
+            ShutdownReport {
+                workers_joined: 1,
+                jobs_cancelled: 1,
+                outstanding_handles: 0,
+            }
+        );
+        shutdown.join().unwrap();
+        assert!(weak.upgrade().is_none());
+        handle.wait_idle();
+    }
+
+    #[test]
+    fn shutdown_names_live_compiler_handles_and_is_idempotent() {
+        let mut jit = JitBackend::new();
+        let shared = jit.shared.clone();
+        let error = jit.shutdown().unwrap_err();
+        assert_eq!(
+            error,
+            ShutdownError::LiveResources {
+                resource: "compiler state",
+                report: ShutdownReport {
+                    outstanding_handles: 1,
+                    ..ShutdownReport::default()
+                },
+            }
+        );
+        assert!(error.to_string().contains("compiler state"));
+        drop(shared);
+        assert_eq!(jit.shutdown().unwrap(), ShutdownReport::default());
+        assert_eq!(jit.shutdown().unwrap(), ShutdownReport::default());
+        let mem = mem_with_code();
+        let TierUpUnit::Block(ir) = request(&mem).unit else {
+            unreachable!()
+        };
+        assert!(matches!(
+            jit.materialize(&ir, MemConsistency::Fast, None, 0),
+            CachedBlock::Interpreted(_)
+        ));
+        assert!(
+            jit.shared.inner.lock().unwrap().is_none(),
+            "shutdown cannot compile inline"
+        );
+    }
+
+    #[test]
+    fn shutdown_reports_worker_panic_after_join() {
+        let mut jit = JitBackend::new();
+        // Inject a failed worker without exposing a production panic lever.
+        *jit.worker.get_mut().unwrap() = Some(std::thread::spawn(|| panic!("compile failure")));
+        let error = jit.shutdown().unwrap_err();
+        assert_eq!(
+            error,
+            ShutdownError::WorkerPanicked {
+                report: ShutdownReport {
+                    workers_joined: 1,
+                    ..ShutdownReport::default()
+                },
+            }
+        );
+        assert!(jit.worker.lock().unwrap().is_none());
+        assert_eq!(jit.shutdown().unwrap_err(), error);
     }
 
     /// A full queue returns `Busy` (never an inline compile), and the queued
@@ -4908,7 +5251,7 @@ mod tests {
         let jit = JitBackend::new();
         let _ = jit.tier_up_async(request(&mem)); // spawn the worker
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = jit.shared.queue.lock().unwrap();
+            let _g = jit.shared.background.queue.lock().unwrap();
             panic!("poison the queue mutex");
         }));
         drop(jit); // must not re-panic despite the poisoned mutex

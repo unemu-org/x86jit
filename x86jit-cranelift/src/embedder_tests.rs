@@ -375,7 +375,7 @@ fn review_observer_panic_does_not_strand_background_queue() {
     for _ in 0..2 {
         assert!(matches!(jit.tier_up_async(request()), TierUpSubmit::Queued));
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
-        while jit.shared.queue.lock().unwrap().outstanding != 0 {
+        while jit.shared.background.queue.lock().unwrap().outstanding != 0 {
             assert!(
                 !jit.worker.lock().unwrap().as_ref().unwrap().is_finished(),
                 "observer panic terminated compiler"
@@ -507,11 +507,11 @@ fn review_panic_payload_drop_keeps_worker_alive() {
     for _ in 0..2 {
         assert!(matches!(jit.tier_up_async(request()), TierUpSubmit::Queued));
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
-        while jit.shared.queue.lock().unwrap().outstanding != 0 {
+        while jit.shared.background.queue.lock().unwrap().outstanding != 0 {
             assert!(
                 !jit.worker.lock().unwrap().as_ref().unwrap().is_finished(),
                 "observer panic terminated compiler; outstanding={}",
-                jit.shared.queue.lock().unwrap().outstanding
+                jit.shared.background.queue.lock().unwrap().outstanding
             );
             assert!(
                 Instant::now() < deadline,
@@ -564,11 +564,11 @@ fn review_observer_capture_drop_keeps_worker_alive() {
     for _ in 0..2 {
         assert!(matches!(jit.tier_up_async(request()), TierUpSubmit::Queued));
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
-        while jit.shared.queue.lock().unwrap().outstanding != 0 {
+        while jit.shared.background.queue.lock().unwrap().outstanding != 0 {
             assert!(
                 !jit.worker.lock().unwrap().as_ref().unwrap().is_finished(),
                 "observer panic terminated compiler; outstanding={}",
-                jit.shared.queue.lock().unwrap().outstanding
+                jit.shared.background.queue.lock().unwrap().outstanding
             );
             assert!(
                 Instant::now() < deadline,
@@ -629,13 +629,14 @@ fn review_observer_retirement_drops_outside_backend_locks() {
 #[test]
 fn review_compile_completion_notifies_during_unwind() {
     let jit = JitBackend::new();
-    jit.shared.queue.lock().unwrap().outstanding = 1;
+    jit.shared.background.queue.lock().unwrap().outstanding = 1;
     let shared = jit.shared.clone();
     let (started, ready) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
-        let queue = shared.queue.lock().unwrap();
+        let queue = shared.background.queue.lock().unwrap();
         started.send(()).unwrap();
         let (queue, timeout) = shared
+            .background
             .idle_cv
             .wait_timeout_while(queue, std::time::Duration::from_secs(3), |q| {
                 q.outstanding != 0
@@ -1068,7 +1069,8 @@ fn split_store_policy_rejects_pending_background_translations() {
             cpu.set_reg(Reg::Rcx, 10);
             assert!(matches!(cpu.run(&vm, Some(2)), Exit::BudgetExhausted));
             {
-                let queue = handle.shared.queue.lock().unwrap();
+                let shared = handle.shared.upgrade().unwrap();
+                let queue = shared.queue.lock().unwrap();
                 assert!(!queue.items.is_empty());
                 assert!(queue
                     .items

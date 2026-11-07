@@ -34,6 +34,15 @@ use crate::state::{CpuState, Flags, Reg};
 /// vcpus behind `Arc`. A JIT impl that needs a mutable compiler context wraps it
 /// in interior mutability (e.g. `Mutex`).
 pub trait Backend: Send + Sync {
+    /// Permanently stop admission, cancel queued work, join every owned worker,
+    /// and discard completions. Called before VM cache and memory destruction.
+    /// Implementations with workers must override this; the default owns none.
+    /// Repeated calls must be safe, including after an error. Never call from
+    /// a worker callback or a signal/atfork handler.
+    fn shutdown(&mut self) -> Result<ShutdownReport, ShutdownError> {
+        Ok(ShutdownReport::default())
+    }
+
     /// Whether code storage has exhausted its capacity. Once true, it stays true
     /// for this backend's lifetime: materialization falls back to interpretation.
     /// Each vcpu reports the transition through [`Exit::CodeSpaceExhausted`].
@@ -433,14 +442,54 @@ impl SourceIds {
     }
 }
 
+/// Resources accounted for by an ordered engine shutdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub workers_joined: usize,
+    pub jobs_cancelled: usize,
+    /// Resource-owning handles still live after joining workers; zero on success.
+    pub outstanding_handles: usize,
+}
+
+/// Shutdown completed its joins but could not certify a clean engine teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownError {
+    WorkerPanicked {
+        report: ShutdownReport,
+    },
+    LiveResources {
+        resource: &'static str,
+        report: ShutdownReport,
+    },
+}
+
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkerPanicked { .. } => {
+                write!(f, "background compiler panicked (worker joined)")
+            }
+            Self::LiveResources { resource, report } => write!(
+                f,
+                "{} outstanding handles to {resource}",
+                report.outstanding_handles
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownError {}
+
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
+    vcpu_lifetime: Arc<()>,
     precise_split_stores: bool,
     compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
     lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
-    pub mem: Memory,
-    pub cache: TranslationCache,
+    // Fields drop in declaration order, after Drop has joined backend workers.
     pub backend: Box<dyn Backend>,
+    pub cache: TranslationCache,
+    pub mem: Memory,
     pub consistency: MemConsistency,
     /// Hotness-gated tier-up: when `Some(n)`, a freshly-lifted block
     /// runs on the interpreter and is JIT-compiled only after it executes `n` times.
@@ -490,6 +539,49 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Consume the engine before a host fork, then build independent engines in
+    /// parent and child. No translations or worker state are reused afterward.
+    ///
+    /// First stop and join embedder-owned vCPU threads: request their exits with
+    /// [`ExitRequest`], wake any blocked outside `run`, and drop their vCPUs.
+    /// Recover exclusive VM ownership (e.g. `Arc::try_unwrap`) before calling.
+    /// This ownership boundary prevents new runs or foreground compilations.
+    /// Then the backend stops submissions, cancels queued compiles, finishes any
+    /// in-flight compile, joins its workers and discards completions. Finally the
+    /// backend, cache and memory views are destroyed, in that order, even on error.
+    /// A successful report guarantees no engine-owned worker remains.
+    /// A vCPU that was not dropped is reported as a live resource, even if idle.
+    ///
+    /// Diagnostic handles may outlive shutdown but must not retain engine state.
+    /// The report counts resource-owning handles, not inert diagnostic tokens.
+    /// This is a normal-thread operation, not a signal or `pthread_atfork` hook.
+    /// Shut down every VM in the process before the host fork. The embedder owns
+    /// signal routing, blocked vCPU wakeups and reconstruction in both processes.
+    /// Executable arenas and signal-safe code-map records retain their existing
+    /// process lifetime; translation reclamation is a separate contract.
+    pub fn shutdown(mut self) -> Result<ShutdownReport, ShutdownError> {
+        let live_vcpus = Arc::strong_count(&self.vcpu_lifetime) - 1;
+        let mut report = self.backend.shutdown();
+        if live_vcpus != 0 {
+            let (mut counts, resource) = match report {
+                Ok(counts) => (counts, "vCPUs"),
+                Err(ShutdownError::LiveResources { report, .. }) => {
+                    (report, "vCPUs and compiler state")
+                }
+                Err(ShutdownError::WorkerPanicked { report }) => {
+                    (report, "vCPUs (compiler worker panicked)")
+                }
+            };
+            counts.outstanding_handles += live_vcpus;
+            report = Err(ShutdownError::LiveResources {
+                resource,
+                report: counts,
+            });
+        }
+        drop(self);
+        report
+    }
+
     /// Construct with the default interpreter backend (lives in the core).
     pub fn new(config: VmConfig) -> Self {
         Self::with_backend(config, Box::new(InterpreterBackend))
@@ -758,6 +850,7 @@ impl Vm {
     /// The embedder surfaces that as a typed error to the guest rather than aborting.
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
+            vcpu_lifetime: Arc::new(()),
             precise_split_stores: self.precise_split_stores,
             compile_hold: None,
             mem: self.mem.deep_copy()?,
@@ -786,6 +879,7 @@ impl Vm {
     /// public constructors, holding the default tier-up policy and CPU features in one place.
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
         Self {
+            vcpu_lifetime: Arc::new(()),
             precise_split_stores: false,
             compile_hold: None,
             mem,
@@ -1064,6 +1158,7 @@ impl Vm {
         self.mem.register_dispatch_word(&word);
         self.backend.register_dispatch_word(&word);
         Vcpu {
+            _vm_lifetime: self.vcpu_lifetime.clone(),
             cpu,
             exit_request: ExitRequest { word },
             interruption_evidence: None,
@@ -1089,6 +1184,13 @@ impl Vm {
             sti_shadow: false,
             code_space_reported: false,
         }
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // Join before releasing either the cache or guest-memory views.
+        let _ = self.backend.shutdown();
     }
 }
 
@@ -1155,6 +1257,7 @@ impl ExitRequest {
 
 /// Per-guest-thread execution context: CPU state + its own `run()` loop (§2).
 pub struct Vcpu {
+    _vm_lifetime: Arc<()>,
     pub cpu: CpuState,
     exit_request: ExitRequest,
     interruption_evidence: Option<crate::InterruptionEvidence>,

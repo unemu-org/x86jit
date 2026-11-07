@@ -88,6 +88,21 @@ cargo run -p x86jit-cranelift --example jit_vs_interp  # wiring in the JIT
 cargo run -p x86jit-elf       --example run_elf -- ELF # load and run a static ELF
 ```
 
+For a host-process fork, first request running vCPUs to exit, wake blocked vCPU
+threads, join them and recover exclusive ownership of every `Vm`. Consume each
+with `Vm::shutdown()`: it stops background admission, cancels queued jobs, finishes
+in-flight compilation, joins workers and discards completions before releasing
+the translation cache, backend and guest-memory views. Its report counts joined
+workers, cancelled jobs and outstanding resource-owning handles (zero on success);
+an error identifies a worker panic or remaining live resources, including idle
+vCPUs that have not been dropped. Rebuild independent
+VMs in parent and child after the fork; translations and compiler state are never
+shared. No reset-after-fork hook or library atfork handler is needed for this
+drain-and-rebuild contract. The embedder owns process-wide fork safety and signal
+routing, and can configure compiler threads with `JitBackend::set_worker_spawner`.
+Diagnostic tier-up handles become inert after destruction. Executable arenas and
+signal-safe code-map records retain their existing process lifetime.
+
 ## Documentation
 
 - [`spec.md`][spec]: the authoritative design (contract, IR, backends, semantics traps).
