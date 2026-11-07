@@ -3035,14 +3035,19 @@ impl Shared {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
         mxcsr_mode: u32,
+        precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with_fault_info(
             CompiledCodeKind::Block,
             ir.guest_start,
             mxcsr_mode,
-            x86jit_core::fault::InstructionFaultInfo::for_block(ir),
-            |builder, helpers, alloc_slot| {
+            x86jit_core::fault::InstructionFaultInfo::for_block_with_split_stores(
+                ir,
+                precise_split_stores,
+            ),
+            |builder, mut helpers, alloc_slot| {
+                helpers.precise_split_stores = precise_split_stores;
                 codegen::translate_block(
                     builder,
                     ir,
@@ -3066,6 +3071,7 @@ impl Shared {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
         mxcsr_mode: u32,
+        precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
         let icount_on = self.icount_on();
         self.compile_with_fault_info(
@@ -3075,9 +3081,15 @@ impl Shared {
             region
                 .blocks
                 .iter()
-                .flat_map(x86jit_core::fault::InstructionFaultInfo::for_block)
+                .flat_map(|ir| {
+                    x86jit_core::fault::InstructionFaultInfo::for_block_with_split_stores(
+                        ir,
+                        precise_split_stores,
+                    )
+                })
                 .collect(),
-            |builder, helpers, alloc_slot| {
+            |builder, mut helpers, alloc_slot| {
+                helpers.precise_split_stores = precise_split_stores;
                 codegen::translate_region(
                     builder,
                     region,
@@ -3302,6 +3314,7 @@ impl Shared {
                 && self.target != HostTarget::Baseline
                 && x86jit_core::jit_abi::fp::has_afp();
             let helpers = codegen::Helpers {
+                precise_split_stores: false,
                 mxcsr_mode,
                 afp,
                 fp_control: if mxcsr_mode == 0 {
@@ -3590,6 +3603,7 @@ impl Shared {
                     req.mmio,
                     req.guest_base,
                     req.mxcsr_mode,
+                    req.precise_split_stores,
                 )
                 .map_or_else(
                     |_| CachedBlock::Interpreted(ir.clone()),
@@ -3602,6 +3616,7 @@ impl Shared {
                     req.mmio,
                     req.guest_base,
                     req.mxcsr_mode,
+                    req.precise_split_stores,
                 )
                 .map_or_else(
                     |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
@@ -3720,7 +3735,7 @@ impl Backend for JitBackend {
         guest_base: u64,
     ) -> CachedBlock {
         self.shared
-            .compile(ir, consistency, mmio, guest_base, 0)
+            .compile(ir, consistency, mmio, guest_base, 0, false)
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
                 |entry| CachedBlock::Compiled { entry },
@@ -3736,7 +3751,7 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
     ) -> CachedBlock {
         self.shared
-            .compile(ir, consistency, mmio, guest_base, mxcsr_mode)
+            .compile(ir, consistency, mmio, guest_base, mxcsr_mode, false)
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
                 |entry| CachedBlock::Compiled { entry },
@@ -3751,7 +3766,55 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
     ) -> CachedBlock {
         self.shared
-            .compile_region(region, consistency, mmio, guest_base, mxcsr_mode)
+            .compile_region(region, consistency, mmio, guest_base, mxcsr_mode, false)
+            .map_or_else(
+                |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
+    }
+
+    fn materialize_with_split_stores(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        self.shared
+            .compile(
+                ir,
+                consistency,
+                mmio,
+                guest_base,
+                mxcsr_mode,
+                precise_split_stores,
+            )
+            .map_or_else(
+                |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
+                |entry| CachedBlock::Compiled { entry },
+            )
+    }
+
+    fn materialize_region_with_split_stores(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        self.shared
+            .compile_region(
+                region,
+                consistency,
+                mmio,
+                guest_base,
+                mxcsr_mode,
+                precise_split_stores,
+            )
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                 |entry| CachedBlock::Compiled { entry },
@@ -3770,7 +3833,7 @@ impl Backend for JitBackend {
         guest_base: u64,
     ) -> CachedBlock {
         self.shared
-            .compile_region(region, consistency, mmio, guest_base, 0)
+            .compile_region(region, consistency, mmio, guest_base, 0, false)
             .map_or_else(
                 |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
                 |entry| CachedBlock::Compiled { entry },
@@ -4187,6 +4250,7 @@ mod tests {
         )
         .expect("lift the block");
         TierUpRequest {
+            precise_split_stores: false,
             mxcsr_mode: 0,
             pc: ENTRY,
             unit: TierUpUnit::Block(Arc::new(ir)),

@@ -97,6 +97,42 @@ pub trait Backend: Send + Sync {
         self.materialize_region(region, consistency, mmio, guest_base)
     }
 
+    /// Compile with the VM's split-store policy. The default preserves existing
+    /// backends when disabled and interprets when precision is requested. Wrapping
+    /// backends should forward this method to retain compiled execution.
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_with_split_stores(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        if precise_split_stores {
+            return CachedBlock::Interpreted(Arc::new(ir.clone()));
+        }
+        self.materialize_with_mxcsr(ir, consistency, mmio, guest_base, mxcsr_mode)
+    }
+
+    /// Region counterpart of [`Self::materialize_with_split_stores`].
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_region_with_split_stores(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        if precise_split_stores {
+            return CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()));
+        }
+        self.materialize_region_with_mxcsr(region, consistency, mmio, guest_base, mxcsr_mode)
+    }
+
     /// Superblock caps if this backend forms regions (§12 M5), else `None`
     /// (the default). When `Some`, the dispatcher lifts a region and calls
     /// [`materialize_region`](Backend::materialize_region); a one-block region
@@ -214,6 +250,9 @@ pub trait Backend: Send + Sync {
 /// passes to [`Backend::materialize`], plus the `span`/`epoch` the dispatcher needs to
 /// publish the result safely.
 pub struct TierUpRequest {
+    /// Split-store policy snapshotted when the request was submitted.
+    /// Backends must honor it or decline/interpret the request.
+    pub precise_split_stores: bool,
     /// RC | FTZ | DAZ assumed by the submitted translation.
     pub mxcsr_mode: u32,
     /// Guest entry address of the block/region (its cache key).
@@ -347,6 +386,7 @@ impl VmConfig {
 
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
+    precise_split_stores: bool,
     lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
     pub mem: Memory,
     pub cache: TranslationCache,
@@ -437,6 +477,34 @@ impl Vm {
             .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
         self.backend.invalidate_links();
         self.mem.set_fetch_policy(Arc::from(policy));
+    }
+
+    /// Opt into write preflight for compiled stores that can cross a host page.
+    /// Disabled by default, preserving the existing generated store paths and
+    /// their possibly partial RAM effects on a split host-transfer fault.
+    ///
+    /// When enabled, a failed probe commits no destination bytes. Protections
+    /// must remain stable through the actual stores; probes can trigger COW and
+    /// dirty tracking. Interpreter/helpers retain their existing policies.
+    /// All vCPUs use this VM policy, and forks inherit it. Changing it invalidates
+    /// translations, linked entries and pending background compilations.
+    pub fn set_precise_split_stores(&mut self, enabled: bool) {
+        if self.precise_split_stores == enabled {
+            return;
+        }
+        self.precise_split_stores = enabled;
+        // Advance even with no cached spans: a background compile may be pending.
+        let pending = self.cache.invalidate_pending_fetches;
+        self.cache.invalidate_pending_fetches = true;
+        self.cache
+            .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
+        self.cache.invalidate_pending_fetches = pending;
+        self.backend.invalidate_links();
+    }
+
+    /// Whether compiled split-store preflight is enabled (default: false).
+    pub fn precise_split_stores(&self) -> bool {
+        self.precise_split_stores
     }
 
     /// Enable hotness-gated tier-up: interpret each block until it has run `n`
@@ -547,6 +615,7 @@ impl Vm {
     /// The embedder surfaces that as a typed error to the guest rather than aborting.
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
+            precise_split_stores: self.precise_split_stores,
             mem: self.mem.deep_copy()?,
             cache: {
                 let mut cache = TranslationCache::new();
@@ -573,6 +642,7 @@ impl Vm {
     /// public constructors, holding the default tier-up policy and CPU features in one place.
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
         Self {
+            precise_split_stores: false,
             mem,
             cache: TranslationCache::new(),
             backend,
@@ -2186,6 +2256,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                 continue;
             }
             let req = TierUpRequest {
+                precise_split_stores: vm.precise_split_stores,
                 mxcsr_mode: key.mxcsr_mode,
                 pc,
                 unit,
@@ -2217,12 +2288,13 @@ fn resolve_attempt<const DEFAULT: bool>(
         if permit.as_ref().is_some_and(|p| !p.is_current()) {
             continue;
         }
-        let compiled = vm.backend.materialize_with_mxcsr(
+        let compiled = vm.backend.materialize_with_split_stores(
             ir,
             vm.consistency,
             vm.mem.trap_window(),
             vm.mem.guest_base(),
             key.mxcsr_mode,
+            vm.precise_split_stores,
         );
         if vm
             .cache
@@ -2252,12 +2324,13 @@ fn resolve_attempt<const DEFAULT: bool>(
                 if permit.as_ref().is_some_and(|p| !p.is_current()) {
                     return Err(ResolveFailure::Retry);
                 }
-                let materialized = vm.backend.materialize_region_with_mxcsr(
+                let materialized = vm.backend.materialize_region_with_split_stores(
                     &region,
                     vm.consistency,
                     vm.mem.trap_window(),
                     vm.mem.guest_base(),
                     key.mxcsr_mode,
+                    vm.precise_split_stores,
                 );
                 // §10: tag every sub-block's pages — under the spans lock (#12).
                 if !vm
@@ -2333,12 +2406,13 @@ fn finish_single(
     let materialized = if key.mode == CpuMode::Real16 || vm.tier_up_after.is_some() {
         CachedBlock::Interpreted(Arc::new(ir))
     } else {
-        vm.backend.materialize_with_mxcsr(
+        vm.backend.materialize_with_split_stores(
             &ir,
             vm.consistency,
             vm.mem.trap_window(),
             vm.mem.guest_base(),
             key.mxcsr_mode,
+            vm.precise_split_stores,
         )
     };
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared

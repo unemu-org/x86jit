@@ -702,6 +702,7 @@ pub struct InstructionFaultInfo {
     pub(crate) rmw: bool,
     pub(crate) writes: bool,
     pub(crate) single_scalar_store: bool,
+    pub(crate) preflighted_store: bool,
     pub(crate) single_scalar_transfer: bool,
     pub(crate) memory_ops: usize,
     // Bounds checks cover the operand; lane extraction transfers one 128-bit
@@ -715,6 +716,11 @@ pub struct InstructionFaultInfo {
 impl InstructionFaultInfo {
     /// Build per-instruction records, validating lengths within each basic block.
     pub fn for_block(block: &IrBlock) -> Vec<Self> {
+        Self::for_block_with_split_stores(block, false)
+    }
+
+    /// Build records for the exact split-store policy used by code generation.
+    pub fn for_block_with_split_stores(block: &IrBlock, precise_split_stores: bool) -> Vec<Self> {
         let mut infos = Vec::new();
         let mut start = 0;
         while start < block.ops.len() {
@@ -731,12 +737,26 @@ impl InstructionFaultInfo {
                 Some(IrOp::InsnStart { guest_addr }) => Some(*guest_addr),
                 _ => block.guest_start.checked_add(u64::from(block.guest_len)),
             };
-            infos.push(Self::from_ops(rip, next, &block.ops[start..end]));
+            let info = Self::from_ops_with_split_stores(
+                rip,
+                next,
+                &block.ops[start..end],
+                precise_split_stores,
+            );
+            infos.push(info);
             start = end;
         }
         infos
     }
     pub(crate) fn from_ops(rip: u64, next: Option<u64>, ops: &[IrOp]) -> Self {
+        Self::from_ops_with_split_stores(rip, next, ops, false)
+    }
+    fn from_ops_with_split_stores(
+        rip: u64,
+        next: Option<u64>,
+        ops: &[IrOp],
+        precise_split_stores: bool,
+    ) -> Self {
         let mut m = Self {
             rip,
             len: next
@@ -747,6 +767,7 @@ impl InstructionFaultInfo {
             rmw: false,
             writes: false,
             single_scalar_store: false,
+            preflighted_store: false,
             single_scalar_transfer: false,
             memory_ops: 0,
             split_transfer_size: None,
@@ -836,6 +857,30 @@ impl InstructionFaultInfo {
                     matches!(
                         o,
                         IrOp::Store { .. } | IrOp::Call { .. } | IrOp::PushFlags { .. }
+                    )
+                })
+                .count()
+                == 1;
+        // One destination, with a whole-operand bounds/region preflight and
+        // crossing compiled write probes. Multi-destination instructions and
+        // REP retain their separately qualified progress contracts.
+        m.preflighted_store = precise_split_stores
+            && m.memory_ops <= 2
+            && ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        IrOp::Store { .. }
+                            | IrOp::VStore { .. }
+                            | IrOp::VStoreWide { .. }
+                            | IrOp::VStoreHalf { .. }
+                            | IrOp::VExtractLaneWideM { .. }
+                            | IrOp::VCvtPs2PhM { .. }
+                            | IrOp::AtomicRmw { .. }
+                            | IrOp::AtomicCas { .. }
+                            | IrOp::Call { .. }
+                            | IrOp::PushFlags { .. }
                     )
                 })
                 .count()
@@ -951,7 +996,16 @@ pub(crate) fn finish(
             m.progress.ram = if (info.rmw
                 && info.memory_ops <= 2
                 && m.transfer_access == Knowledge::Known(FaultAccess::Read))
-                || (info.single_scalar_store && m.origin == FaultOrigin::GuestMap)
+                || ((info.single_scalar_store || info.preflighted_store)
+                    && m.origin == FaultOrigin::GuestMap)
+                // A compiled one-byte Write in a wider destination is a
+                // preflight site. Faults in actual wider stores remain uncertain
+                // if protections were revoked after successful preflight.
+                || (compiled && info.preflighted_store
+                    && m.origin == FaultOrigin::HostAccess
+                    && m.transfer_access == Knowledge::Known(FaultAccess::Write)
+                    && m.transfer_size == Knowledge::Known(1)
+                    && matches!(info.operand_size, Knowledge::Known(2..=64)))
             {
                 MemoryEffects::None
             } else if info.writes
@@ -1342,5 +1396,62 @@ mod host_address_tests {
             size: 8,
         });
         assert!(OperandAddress::from_ops(&ops).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_store_fault_is_not_mistaken_for_split_store_probe() {
+        let mut mem = Memory::new(crate::MemoryModel::Flat { size: 0x4000 });
+        mem.map(0, 0x4000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        mem.write_bytes(0x1000, &[0x88, 0x07, 0xf4]).unwrap();
+        let block =
+            crate::lift::lift_block(&mem, crate::lift::FetchAddr::flat(0x1000), CpuMode::Long64)
+                .unwrap();
+        let mut cpu = CpuState::new();
+        cpu.rip = 0x1000;
+        for precise in [false, true] {
+            let info = InstructionFaultInfo::for_block_with_split_stores(&block, precise);
+            let exit = memory_exit(cpu.rip, 0x2000, 1, crate::AccessKind::Write, true, true);
+            let exit = finish(exit, Some(&info[0]), &cpu, &mem, CpuMode::Long64, true);
+            assert_eq!(
+                exit.fault_metadata().unwrap().progress().ram(),
+                MemoryEffects::PossiblyPartial
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_probe_proves_no_bytes_but_transfer_fault_retains_uncertainty() {
+        let mut mem = Memory::new(crate::MemoryModel::Flat { size: 0x4000 });
+        mem.map(0, 0x4000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        mem.write_bytes(0x1000, &[0x0f, 0x11, 0x07, 0xf4]).unwrap();
+        let block =
+            crate::lift::lift_block(&mem, crate::lift::FetchAddr::flat(0x1000), CpuMode::Long64)
+                .unwrap();
+
+        let mut cpu = CpuState::new();
+        cpu.rip = 0x1000;
+        for precise in [false, true] {
+            let info = InstructionFaultInfo::for_block_with_split_stores(&block, precise);
+            for compiled in [false, true] {
+                for (width, host) in [(1, true), (16, true), (16, false)] {
+                    let exit =
+                        memory_exit(cpu.rip, 0x2000, width, crate::AccessKind::Write, host, true);
+                    let exit = finish(exit, Some(&info[0]), &cpu, &mem, CpuMode::Long64, compiled);
+                    let expected = if precise && (!host || (compiled && width == 1)) {
+                        MemoryEffects::None
+                    } else {
+                        MemoryEffects::PossiblyPartial
+                    };
+                    assert_eq!(exit.fault_metadata().unwrap().progress().ram(), expected);
+                }
+            }
+        }
     }
 }

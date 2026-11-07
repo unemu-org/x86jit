@@ -89,6 +89,7 @@ const PAGE_MASK: i64 = PAGE_BYTES - 1;
 /// backlog/docs/design/aot-plan.md).
 #[derive(Copy, Clone)]
 pub struct Helpers {
+    pub precise_split_stores: bool,
     pub mxcsr_mode: u32,
     pub afp: bool,
     pub fp_control: u64,
@@ -188,6 +189,7 @@ impl Helpers {
         note_watch: (ir::SigRef, u64, u64),
     ) -> Self {
         Helpers {
+            precise_split_stores: false,
             mxcsr_mode: 0,
             afp: false,
             fp_control: 0,
@@ -351,6 +353,8 @@ fn translate_block_for_target(
         recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
+        aligned_store_addrs: Vec::new(),
+        preflighted_stores: Vec::new(),
         alignment_tail: None,
         alignment_recoveries: Vec::new(),
     };
@@ -457,6 +461,8 @@ pub fn translate_region(
         recovering_flags: false,
         flag_recipe: None,
         exit_tails: Vec::new(),
+        aligned_store_addrs: Vec::new(),
+        preflighted_stores: Vec::new(),
         alignment_tail: None,
         alignment_recoveries: Vec::new(),
     };
@@ -509,6 +515,8 @@ pub fn translate_region(
         t.temps = vec![None; block.temp_count as usize];
         t.gpr_cache = [None; 16];
         t.checked_ea.clear(); // a checked pointer only dominates its own block
+        t.preflighted_stores.clear();
+        t.aligned_store_addrs.clear();
         t.cur_addr = block.guest_start;
         t.guest_end = block.guest_start + block.guest_len as u64;
         if !matches!(block.ops.first(), Some(IrOp::InsnStart { .. })) {
@@ -662,6 +670,9 @@ struct Translator<'a, 'b> {
     /// One cold recovery tail per pending recipe epoch. Helpers enter after the
     /// optional region-register flush, preserving their authoritative CpuState.
     exit_tails: Vec<ExitTail>,
+    aligned_store_addrs: Vec<(Value, u8)>,
+    /// Dominating probes, valid within one guest block while protections stay stable.
+    preflighted_stores: Vec<(Value, u8)>,
     alignment_tail: Option<Block>,
     alignment_recoveries: Vec<(Block, [Option<FlagRecipe>; 6])>,
 }
@@ -862,6 +873,7 @@ impl Translator<'_, '_> {
                 let addr = self.val(*addr);
                 let low = self.builder.ins().band_imm(addr, i64::from(*bytes) - 1);
                 self.check_alignment(low);
+                self.aligned_store_addrs.push((addr, *bytes));
                 false
             }
             IrOp::PushFlags { size, wrap_sp, .. } => self.emit_push_flags(*size, *wrap_sp),
@@ -3227,6 +3239,9 @@ impl Translator<'_, '_> {
             .iter()
             .find(|&&(a, s, _)| a == addr && s == size)
         {
+            if access == 1 {
+                self.preflight_crossing_store(addr, host, size);
+            }
             return host;
         }
         let memsize = self.load_mem(MEMCTX_SIZE);
@@ -3327,7 +3342,109 @@ impl Translator<'_, '_> {
         self.checked_ea.push((addr, size, host));
         #[cfg(test)]
         trap_tests::record_checked_addr(host);
+        if access == 1 {
+            self.preflight_crossing_store(addr, host, size);
+        }
         host
+    }
+
+    fn store_addr_aligned(&self, addr: Value, size: u8, depth: u8) -> bool {
+        let addr = self.builder.func.dfg.resolve_aliases(addr);
+        if self
+            .aligned_store_addrs
+            .iter()
+            .any(|&(a, n)| self.builder.func.dfg.resolve_aliases(a) == addr && n >= size)
+        {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let mask = i64::from(size) - 1;
+        let Some(inst) = self.builder.func.dfg.value_def(addr).inst() else {
+            return false;
+        };
+        use ir::{InstructionData, Opcode};
+        match self.builder.func.dfg.insts[inst] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => imm.bits() & mask == 0,
+            InstructionData::Binary { opcode, args } => {
+                let aligned = |v| self.store_addr_aligned(v, size, depth - 1);
+                match opcode {
+                    Opcode::Iadd | Opcode::Isub => aligned(args[0]) && aligned(args[1]),
+                    Opcode::Band | Opcode::Imul => aligned(args[0]) || aligned(args[1]),
+                    _ => false,
+                }
+            }
+            InstructionData::BinaryImm64 { opcode, arg, imm } => match opcode {
+                Opcode::IaddImm => {
+                    imm.bits() & mask == 0 && self.store_addr_aligned(arg, size, depth - 1)
+                }
+                Opcode::BandImm | Opcode::ImulImm => {
+                    imm.bits() & mask == 0 || self.store_addr_aligned(arg, size, depth - 1)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// SDM Vol 3A §§7.5–7.6: a faulting store must be restartable without
+    /// committed destination bytes. Probe before any of its host transfers.
+    fn preflight_crossing_store(&mut self, addr: Value, host: Value, size: u8) {
+        if !self.helpers.precise_split_stores || size == 1 || (!self.aarch64 && size < 16) {
+            return;
+        }
+        // HostRam requires equal host/guest offsets modulo 16. An architectural
+        // alignment check proves that an operand up to 16 bytes cannot cross.
+        if size <= 16 && self.store_addr_aligned(addr, size, 16) {
+            return;
+        }
+        if self
+            .preflighted_stores
+            .iter()
+            .any(|&(a, n)| a == addr && n >= size)
+        {
+            return;
+        }
+        self.preflighted_stores.push((addr, size));
+        // Use host addresses: externally supplied backing need not have the
+        // guest address's page offset. 4 KiB divides supported host page sizes.
+        let offset = self.builder.ins().band_imm(host, PAGE_MASK);
+        let crosses = self.builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThan,
+            offset,
+            PAGE_BYTES - i64::from(size),
+        );
+        let probe = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.set_cold_block(probe);
+        self.builder.ins().brif(crosses, probe, &[], done, &[]);
+        self.builder.seal_block(probe);
+        self.builder.switch_to_block(probe);
+        self.sync_guest_fault_state();
+        let next = self.builder.ins().band_imm(host, !PAGE_MASK);
+        let next = self.builder.ins().iadd_imm(next, PAGE_BYTES);
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        // Atomic add-zero cannot overwrite a concurrent writer's value. Both
+        // sites describe a one-byte Write, including the failed high-page probe.
+        // Probes can still break COW and dirty the page without changing bytes.
+        for address in [host, next] {
+            #[cfg(test)]
+            trap_tests::record_checked_addr(address);
+            self.builder.ins().atomic_rmw(
+                types::I8,
+                guest_mem_flags(GuestAccessKind::Write, 1),
+                ir::AtomicRmwOp::Add,
+                address,
+                zero,
+            );
+        }
+        self.builder.ins().jump(done, &[]);
+        self.builder.seal_block(done);
+        self.builder.switch_to_block(done);
     }
 
     // One architectural #GP tail per function; recipe epochs share recovery
@@ -3621,7 +3738,10 @@ impl Translator<'_, '_> {
         self.builder.switch_to_block(doit);
         let mem_self = self.load_mem(MEMCTX_MEM_SELF);
         let len = self.iconst(size as u64);
+        // note_write only records dirty pages; it cannot change protections.
+        let preflighted = std::mem::take(&mut self.preflighted_stores);
         self.call_helper(self.helpers.note_watch, &[mem_self, guest_addr, len]);
+        self.preflighted_stores = preflighted;
         self.builder.ins().jump(cont, &[]);
 
         self.builder.seal_block(cont);
@@ -3805,6 +3925,7 @@ impl Translator<'_, '_> {
         helper: (ir::SigRef, u64, u64),
         args: &[Value],
     ) -> ir::Inst {
+        self.preflighted_stores.clear();
         let (sig, addr, counter) = helper;
         // Count the call. Unlike the per-block instruction accounting this needs no
         // opt-in: a helper call is a C-ABI exit from compiled code running a whole

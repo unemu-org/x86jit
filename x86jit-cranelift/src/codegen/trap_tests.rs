@@ -43,11 +43,22 @@ fn audit_guest_accesses(func: &ir::Function, hosts: &[Value]) -> Vec<(u64, Guest
                 GuestAccessKind::Write,
                 func.dfg.value_type(args[0]),
             ),
-            AtomicRmw { args, .. } => (
-                args[0],
-                GuestAccessKind::ReadWrite,
-                func.dfg.value_type(args[1]),
-            ),
+            AtomicRmw { args, op, .. } => {
+                let ty = func.dfg.value_type(args[1]);
+                let probe = ty == types::I8
+                    && *op == ir::AtomicRmwOp::Add
+                    && matches!(func.dfg.insts[func.dfg.value_def(args[1]).unwrap_inst()],
+                        UnaryImm { imm, .. } if imm.bits() == 0);
+                (
+                    args[0],
+                    if probe {
+                        GuestAccessKind::Write
+                    } else {
+                        GuestAccessKind::ReadWrite
+                    },
+                    ty,
+                )
+            }
             AtomicCas { args, .. } => (
                 args[0],
                 GuestAccessKind::ReadWrite,
@@ -119,6 +130,16 @@ fn compile_ir_for_isa(
     region: bool,
     isa: &dyn cranelift::codegen::isa::TargetIsa,
 ) -> (Context, Box<[u64]>, usize) {
+    compile_ir_for_isa_with_split_stores(ir, bytes, region, isa, true)
+}
+
+fn compile_ir_for_isa_with_split_stores(
+    ir: IrBlock,
+    bytes: &[u8],
+    region: bool,
+    isa: &dyn cranelift::codegen::isa::TargetIsa,
+    precise: bool,
+) -> (Context, Box<[u64]>, usize) {
     CHECKED_HOSTS.with(|hosts| hosts.borrow_mut().clear());
     let mut ctx = Context::new();
     ctx.func
@@ -138,7 +159,9 @@ fn compile_ir_for_isa(
     };
     let dummy = builder.import_signature(sig(6, true));
     let watch = builder.import_signature(sig(3, false));
-    let helpers = Helpers::all_dummy(&mut || (dummy, 0, 0), (watch, 0, 0));
+    let mut helpers = Helpers::all_dummy(&mut || (dummy, 0, 0), (watch, 0, 0));
+    helpers.precise_split_stores = precise;
+    helpers.cpuid = (builder.import_signature(sig(1, true)), 0, 0);
     let offsets = cpu_offsets();
     let rips = if region {
         translate_region(
@@ -523,8 +546,25 @@ fn guest_trap_sites_aarch64_single_16_byte_transfer() {
         for region in [false, true] {
             let (ctx, _, _) = compile(bytes, region, HostTarget::Native);
             let cc = ctx.compiled_code().unwrap();
-            assert_eq!(cc.buffer.traps().len(), 1);
-            let trap = &cc.buffer.traps()[0];
+            let width16: Vec<_> = cc
+                .buffer
+                .traps()
+                .iter()
+                .filter(|trap| {
+                    let word = u32::from_le_bytes(
+                        cc.code_buffer()[trap.offset as usize..trap.offset as usize + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    word & 0xff00_0000 == 0xa900_0000 || word & 0xff80_0000 == 0x3d80_0000
+                })
+                .collect();
+            assert_eq!(
+                cc.buffer.traps().len(),
+                if bytes[1] == 0x11 { 3 } else { 1 }
+            );
+            assert_eq!(width16.len(), 1);
+            let trap = width16[0];
             let word = u32::from_le_bytes(
                 cc.code_buffer()[trap.offset as usize..trap.offset as usize + 4]
                     .try_into()
@@ -718,7 +758,12 @@ fn region_fault_flush_only_dirty_gprs() {
         }
         // A bounds-check exit before the first access also flushes RAX. The
         // successful path and subsequent exits must not store any clean GPR.
-        assert_eq!(stores[0], 2, "{opt:?}: {stores:?}");
+        // The first cold crossing probe also needs instruction-entry RAX.
+        assert_eq!(
+            stores[0],
+            if cfg!(target_arch = "aarch64") { 3 } else { 2 },
+            "{opt:?}: {stores:?}"
+        );
         assert_eq!(&stores[1..], &[0; 15]);
     }
 }
@@ -879,8 +924,16 @@ fn guest_trap_sites_lifter_capped_blocks_never_overflow() {
             let block = high_block(&bytes[offset..]);
             for target in [HostTarget::Baseline, HostTarget::Native] {
                 for region in [false, true] {
-                    // compile audits preparation and final records at None and Speed.
-                    compile(&bytes[offset..], region, target);
+                    for opt in [OptLevel::None, OptLevel::Speed] {
+                        let jit = JitBackend::build_jit(target, opt);
+                        compile_ir_for_isa_with_split_stores(
+                            high_block(&bytes[offset..]),
+                            &bytes[offset..],
+                            region,
+                            jit.module.isa(),
+                            false,
+                        );
+                    }
                 }
             }
             offset += block.guest_len as usize;
@@ -1043,4 +1096,253 @@ fn loop_register_moves(code: &[u8]) -> usize {
         }
     }
     panic!("expected a region back-edge");
+}
+
+#[test]
+#[ignore = "diagnostic dump"]
+fn dump_split_store_paths() {
+    let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::Speed);
+    for (name, store) in [
+        ("scalar8", &[0x48, 0x89, 0x07][..]),
+        ("vector16", &[0xf3, 0x0f, 0x7f, 0x07][..]),
+        ("vector32", &[0xc5, 0xfe, 0x7f, 0x07][..]),
+        ("vector64", &[0x62, 0xf1, 0x7e, 0x48, 0x7f, 0x07][..]),
+    ] {
+        for count in [1, 8] {
+            for looping in [false, true] {
+                let mut bytes = store.repeat(count);
+                if looping {
+                    bytes.extend_from_slice(&[0xff, 0xc9, 0x75, (-(bytes.len() as i8 + 4)) as u8]);
+                } else {
+                    bytes.push(0xf4);
+                }
+                for region in [false, true] {
+                    let mut block = high_block(&bytes);
+                    for op in &mut block.ops {
+                        if let IrOp::Branch {
+                            taken, fallthrough, ..
+                        } = op
+                        {
+                            *taken += HIGH_BASE - BASE;
+                            *fallthrough += HIGH_BASE - BASE;
+                        }
+                    }
+                    let (ctx, _, _) = compile_ir_for_isa(block, &bytes, region, jit.module.isa());
+                    let cc = ctx.compiled_code().unwrap();
+                    let dir = std::env::var("X86JIT_STORE_DUMP_DIR").unwrap();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let path = format!(
+                        "{dir}/{name}-{count}-{}{}",
+                        if region { "region" } else { "block" },
+                        if looping { "-loop" } else { "" }
+                    );
+                    std::fs::write(format!("{path}.clif"), ctx.func.display().to_string()).unwrap();
+                    std::fs::write(format!("{path}.vcode"), cc.vcode.as_deref().unwrap()).unwrap();
+                    std::fs::write(format!("{path}.bin"), cc.code_buffer()).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn split_store_preflight_reuses_only_dominating_proofs() {
+    let store = [0xf3, 0x0f, 0x7f, 0x07]; // movdqu [rdi],xmm0
+    let mut repeated = store.repeat(8);
+    repeated.push(0xf4);
+    let mut changed = store.to_vec();
+    changed.extend_from_slice(&[0x48, 0xff, 0xc7]); // inc rdi
+    changed.extend_from_slice(&store);
+    changed.push(0xf4);
+    let mut helper = store.to_vec();
+    helper.extend_from_slice(&[0x0f, 0xa2]); // cpuid: can reload guest registers
+    helper.extend_from_slice(&store);
+    helper.push(0xf4);
+    for region in [false, true] {
+        for opt in [OptLevel::None, OptLevel::Speed] {
+            for (bytes, expected) in [(&repeated, 2), (&changed, 4), (&helper, 4)] {
+                let (ctx, _, _) = compile_at(bytes, region, HostTarget::Native, opt);
+                let probes = ctx
+                    .func
+                    .layout
+                    .blocks()
+                    .flat_map(|b| ctx.func.layout.block_insts(b))
+                    .filter(|&i| {
+                        matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
+                            && ctx.func.dfg.insts[i]
+                                .memflags()
+                                .and_then(|f| f.trap_code())
+                                .is_some()
+                    })
+                    .count();
+                assert_eq!(
+                    probes,
+                    expected,
+                    "region={region}, {opt:?}: {}",
+                    ctx.func.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn split_store_preflight_omits_proven_alignment_only() {
+    // Backing preserves alignment modulo 16. No proof about 32/64-byte host alignment.
+    let cases: &[(&[u8], usize)] = &[
+        (&[0x88, 0x07, 0xf4], 0), // byte stores never cross
+        (
+            &[0x48, 0x83, 0xe7, 0xf0, 0xf3, 0x0f, 0x7f, 0x47, 0x10, 0xf4],
+            0,
+        ),
+        (
+            &[0x48, 0x83, 0xe7, 0xf0, 0xf3, 0x0f, 0x7f, 0x47, 0x11, 0xf4],
+            2,
+        ),
+        (&[0xbf, 0, 0x40, 0, 0, 0xf3, 0x0f, 0x7f, 0x07, 0xf4], 0),
+        (&[0xbf, 0, 0x40, 0, 0, 0xc5, 0xfe, 0x7f, 0x07, 0xf4], 2),
+        // A prior aligned load proves RDI aligned even across instruction boundaries.
+        (&[0x0f, 0x28, 0x07, 0xf3, 0x0f, 0x7f, 0x47, 0x10, 0xf4], 0),
+    ];
+    for region in [false, true] {
+        for opt in [OptLevel::None, OptLevel::Speed] {
+            for &(bytes, expected) in cases {
+                let (ctx, _, _) = compile_at(bytes, region, HostTarget::Native, opt);
+                let probes = ctx
+                    .func
+                    .layout
+                    .blocks()
+                    .flat_map(|b| ctx.func.layout.block_insts(b))
+                    .filter(|&i| {
+                        matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
+                            && ctx.func.dfg.insts[i]
+                                .memflags()
+                                .and_then(|f| f.trap_code())
+                                .is_some()
+                    })
+                    .count();
+                assert_eq!(
+                    probes,
+                    expected,
+                    "region={region}, {opt:?}, bytes={bytes:x?}: {}",
+                    ctx.func.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn split_store_policy_controls_probes_on_both_isas() {
+    use cranelift::codegen::{isa, settings};
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for opt in [OptLevel::None, OptLevel::Speed] {
+            let mut flags = settings::builder();
+            flags.set("opt_level", opt.flag()).unwrap();
+            flags.set("preserve_frame_pointers", "true").unwrap();
+            flags.set("enable_probestack", "false").unwrap();
+            let isa = isa::lookup(target.parse().unwrap())
+                .unwrap()
+                .finish(settings::Flags::new(flags))
+                .unwrap();
+            for (name, bytes) in [
+                ("scalar8", &[0x48, 0x89, 0x07, 0xf4][..]),
+                ("vector16", &[0xf3, 0x0f, 0x7f, 0x07, 0xf4][..]),
+                ("vector32", &[0xc5, 0xfe, 0x7f, 0x07, 0xf4][..]),
+                ("vector64", &[0x62, 0xf1, 0x7e, 0x48, 0x7f, 0x07, 0xf4][..]),
+            ] {
+                for region in [false, true] {
+                    for precise in [false, true] {
+                        let (ctx, _, _) = compile_ir_for_isa_with_split_stores(
+                            high_block(bytes),
+                            bytes,
+                            region,
+                            isa.as_ref(),
+                            precise,
+                        );
+                        let probes = ctx
+                            .func
+                            .layout
+                            .blocks()
+                            .flat_map(|b| ctx.func.layout.block_insts(b))
+                            .filter(|&i| {
+                                matches!(
+                                    ctx.func.dfg.insts[i],
+                                    ir::InstructionData::AtomicRmw { .. }
+                                ) && ctx.func.dfg.insts[i]
+                                    .memflags()
+                                    .and_then(|f| f.trap_code())
+                                    .is_some()
+                            })
+                            .count();
+                        // This diagnostic uses native-host lowering with two machine
+                        // encoders; runtime host selection is covered separately.
+                        assert_eq!(
+                            probes,
+                            if precise && (cfg!(target_arch = "aarch64") || name != "scalar8") {
+                                2
+                            } else {
+                                0
+                            }
+                        );
+                        if !precise {
+                            if let Some(dir) = std::env::var_os("X86JIT_STORE_DUMP_DIR") {
+                                let dir = std::path::PathBuf::from(dir);
+                                std::fs::create_dir_all(&dir).unwrap();
+                                let file = format!(
+                                    "{target}-{opt:?}-{name}-{}.bin",
+                                    if region { "region" } else { "block" }
+                                );
+                                std::fs::write(
+                                    dir.join(file),
+                                    ctx.compiled_code().unwrap().code_buffer(),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn precise_split_store_descriptor_limit_interprets_without_exhausting_code() {
+    let bytes = [0xc5, 0xfe, 0x7f, 0x07].repeat(249);
+    let ir = high_block(&bytes);
+    for region in [false, true] {
+        let jit = JitBackend::with_opt_level(OptLevel::None);
+        let materialize = |block: &IrBlock, precise| {
+            if region {
+                jit.materialize_region_with_split_stores(
+                    &IrRegion {
+                        entry: block.guest_start,
+                        blocks: vec![block.clone()],
+                        has_loop: false,
+                    },
+                    MemConsistency::Fast,
+                    None,
+                    0,
+                    0,
+                    precise,
+                )
+            } else {
+                jit.materialize_with_split_stores(block, MemConsistency::Fast, None, 0, 0, precise)
+            }
+        };
+        assert!(matches!(
+            materialize(&ir, false),
+            CachedBlock::Compiled { .. }
+        ));
+        assert!(matches!(
+            materialize(&ir, true),
+            CachedBlock::Interpreted(_)
+        ));
+        assert!(!jit.code_space_exhausted());
+        assert!(matches!(
+            materialize(&high_block(&[0xc5, 0xfe, 0x7f, 0x07, 0xf4]), true),
+            CachedBlock::Compiled { .. }
+        ));
+    }
 }

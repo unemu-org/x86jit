@@ -12,7 +12,7 @@ Accepted by the maintainer on 2026-11-06 for **xj-ir6.16**, with the four resolu
 
 An embedder needs the exception that ended execution and the state it can safely deliver or retry. Today `UnmappedMemory` reports address/access, `Exception` reports saved RIP/vector, and neither carries an error code. Saved RIP is already deliberately different for faults and traps (READ `x86jit-core/src/exit.rs:118`, `x86jit-core/src/exit.rs:171`). Spec §5.2 describes that boundary and §16 requires commit-last lowering (READ `backlog/docs/design/spec.md:373`, `backlog/docs/design/spec.md:1199`).
 
-Three qualifications constrain an honest API. `Prot` is advisory; region kind controls routing, ROM writes are discarded on interpreter paths, and Trap fetches are deliberately refused (READ `x86jit-core/src/memory.rs:294`, `x86jit-core/src/memory.rs:334`). Guest paging, descriptor enforcement and privilege-dependent access checks do not exist as a complete model. Permission enforcement and protected-mode segmentation remain deferred (READ `backlog/docs/deferred.md:67`, `backlog/docs/deferred.md:241`). Finally, decision-13 preserves precise register/flag state but explicitly allows completed pieces of compiled split stores to remain visible (READ `backlog/decisions/decision-13 - Signal-context-landing-pads-for-compiled-guest-faults.md:398`). Metadata cannot repair those semantics.
+Three qualifications constrain an honest API. `Prot` is advisory; region kind controls routing, ROM writes are discarded on interpreter paths, and Trap fetches are deliberately refused (READ `x86jit-core/src/memory.rs:294`, `x86jit-core/src/memory.rs:334`). Guest paging, descriptor enforcement and privilege-dependent access checks do not exist as a complete model. Permission enforcement and protected-mode segmentation remain deferred (READ `backlog/docs/deferred.md:67`, `backlog/docs/deferred.md:241`). Decision-13 now preflights crossing compiled stores before any destination bytes commit. Faults at probes prove no committed RAM bytes; faults in actual transfers remain qualified because concurrent protection revocation after preflight can still allow partial effects.
 
 ### Primary-source sections
 
@@ -95,7 +95,7 @@ For other exceptions, SDM Vol 3A §6.13 (§7.13) and §6.15 (§7.15) require cau
 | Interpreter | E saved and current instruction RIP; B valid length/class/cause retention | E scalar size, vector `VecFault.size`, REP `StrFault.elem`; B preserve trap origin and operand context before constructing Exit; address precision varies by miss | E implied zero/no-code for proven causes; B explicit encoding; U paging/privilege and unsupported causes | E architectural restart state; B cold effect summary; U REP entry-count delta, uninstrumented split effects |
 | JIT block, explicit cold exit | E saved RIP/vector and compile-time owner; B length/cause descriptor | E cold failed address/direction; B requested transfer width separately from unbacked tail, operand intent/base | Same cause rules; B cold ABI cause/bits | E recovered entry registers/flags for covered instructions; B summary; U untracked store pieces |
 | JIT region | Same as block **per sub-block/instruction**, not region entry/end | Same as block; B descriptors survive folding, merging and internal edges | Same as block | Same as block; region fuel/accounting is not a commit count |
-| Compiled host fault via decision-13 | E trap-site full-width guest RIP; B decoded length/cause; U guest vector for independent host access | E rebased host fault byte (Access), host transfer width and Read/Write/ReadWrite in table; B retain site identity and guest operand intent; U transfer base unless recoverable | U guest P/U/S/control bits; no host-code forwarding | E recovered registers/flags subject to existing recovery contract; U exact committed bytes within faulting host store |
+| Compiled host fault via decision-13 | E trap-site full-width guest RIP; B decoded length/cause; U guest vector for independent host access | E rebased host fault byte (Access), host transfer width and Read/Write/ReadWrite in table; B retain site identity and guest operand intent; U transfer base unless recoverable | U guest P/U/S/control bits; no host-code forwarding | E recovered registers/flags; opt-in probes prove no RAM bytes; U default split-store effects and actual-transfer faults after concurrent revocation |
 | Routed Rust helper / interpreter fixup | E reporting RIP from caller; B helper-specific cause/length | E fixup byte and caller request; B preserve size/origin through helpers that return address only | Same uncertainty as independent host-access failure | E preflight guarantee only under stable protections; B helper effect summary; U concurrent-revocation effects |
 | Decode/fetch failure, any tier | E attempted instruction start and first unavailable fetch byte; U complete length; U architectural vector for policy/host failures | E Execute; B reason/precision and explicit fetch-byte unit | B flat projection only for verified map absence; U fetch I/D controls and U/S | E no instruction effects, earlier completed prefix retained |
 
@@ -117,9 +117,40 @@ REP commits one completed iteration at a time. Report current RSI/RDI/RCX at the
 
 Masked/narrow stores can retain earlier active elements in default mode; routed mode preflights selected destinations. At a failing loop index, an ordered mask and the current operand/mask establish prior completed RAM slots without a per-element journal, provided no unknown fault occurred within one slot. Preflight failure means no new RAM value committed in that attempt, under stable protection; same-value write probes can still affect host dirty/COW tracking. Skip inactive slots and retain their indices. Do not count an MMIO exit as performed before the embedder acknowledges it, and do not lose acknowledgements from earlier retries (READ `x86jit-core/src/interp/mod.rs:7252`, `x86jit-core/src/interp/mod.rs:7291`, `x86jit-core/src/state.rs:626`). Default versus routed device-effect ordering and probe effects are documented separately (READ `backlog/decisions/decision-13 - Signal-context-landing-pads-for-compiled-guest-faults.md:383`). Capture the existing retry ledger before `finish_mmio_retry` can clear it (READ `x86jit-core/src/vm.rs:1211`).
 
-For **xj-obx.8**, identify split-store progress as possibly partial. Static host-site order alone does not prove the completed guest-byte set after optimization or within a faulting STP/page-crossing scalar store. Known earlier pieces may be reported only after finalized-code ordering is audited; the faulting transfer's committed bytes remain Unknown unless guaranteed by the host instruction contract. No memory reread can reconstruct writes under concurrency or identical old/new values. Replay may rewrite the same earlier bytes; preserve uncertainty across it. Resolving exact byte commitment everywhere requires separate store deferral/preflight/serialization or a justified host-state recovery mechanism, with a new cost decision. Do not silently declare xj-obx.8 fixed by adding fields (READ `backlog/decisions/decision-13 - Signal-context-landing-pads-for-compiled-guest-faults.md:398`, `x86jit-tests/tests/rust_memory_faults.rs:717`).
+Compiled split-store precision is **opt-in**, selected with
+`Vm::set_precise_split_stores(true)`, and **off by default** (decision-13).
+Disabled translations retain their existing partial-store behavior and
+`PossiblyPartial` metadata. Enabled translations preflight crossing destinations.
+Whole-operand map-check failures and one-byte compiled Write probe
+faults on ordinary single-destination stores report `MemoryEffects::None`, also
+when the dispatcher replays an unmapped probe. Guest instruction identity and
+operand width remain distinct from the one-byte Write transfer. The immutable
+instruction descriptor restricts this inference to supported single-destination
+store forms and the policy used to compile them; it does not apply to arbitrary
+multi-destination instructions. Ordinary one-byte stores are not probe sites.
+Actual scalar x86-64 transfers without probes retain conservative RAM-effect
+metadata. A policy change flushes translations, links and vCPU predictions and
+rejects stale background results; forks inherit the policy.
+
+A fault in an actual wider transfer still reports `PossiblyPartial`: another
+thread can revoke protection after preflight, including between stores reusing
+a dominating preflight within a guest block. Helpers invalidate that reuse except
+for dirty-page notification, which cannot change protections. Static site order and memory
+rereads cannot reconstruct the committed set under that race. Helper effects
+remain conservatively qualified unless the fault evidence proves preflight
+failure; REP still describes completed iterations and restart state. No new
+exact byte bitmap or device-history guarantee is claimed.
 
 ### 5. Cost on the non-faulting path
+
+Default-off split-store precision preserves main's emitted code byte for byte
+in the sampled store forms on both ISAs (decision-13). The separate opt-in
+preflight has a measured cost: aligned store loops add approximately **1–2.4%**
+retired instructions, sliding-address loops **5–9%**, and memcpy/SIMD/MMX remain
+within **0.15%**. These are historical measurements of the enabled lowering,
+not fresh timing measurements of policy selection. Metadata adds no extra hot
+bookkeeping in either mode; enabling execution precision explicitly accepts
+the crossing-test work.
 
 **Require zero additional per-access, per-instruction, REP-iteration or compiled-chain instructions/stores for this metadata feature.** Do not add instruction-entry snapshots, progress counters, inline permission lookups, dynamic descriptor stores or a per-call recovery trampoline. Existing checks, recovery routing and FP guards remain existing costs. Static tables grow at compilation; cold branches record cause/descriptor/transfer details only after failure. Preserve every existing ABI offset and its append-only extension rule (`x86jit-core/src/jit_abi.rs:73`, READ). Keep `MemTrap` small and use detailed cold error channels rather than widening every success `Result`.
 
@@ -129,7 +160,7 @@ The signal classifier remains bounded and allocation/lock/TLS free. It copies on
 
 MEASURED: current `Exit` is **32 bytes**, `MemTrap` **1 byte**; a payload-equivalent enum with the proposed optional boxes is also **32 bytes** on this host/compiler. This is a layout feasibility probe, not an ABI or latency guarantee. Existing decision-13 measures zero added compiled-call-edge instructions; its benchmark numbers are historical READ evidence, not new measurements here. Implementation acceptance requires generated-code comparison and representative timing: code layout/compiler changes can still affect performance even when no hot instruction is intentionally added.
 
-Strict zero added work and an exact journal of every partial write / REP entry delta cannot both be promised with current execution semantics. This proposal chooses exact restart state and explicit Unknown where history is absent. If “exact metadata” means a complete #PF code and exact committed bytes for every exit, implementation must wait for the missing guest model and a separate partial-store/cost decision; this record does not weaken that completion criterion silently.
+Strict zero added work and an exact journal of every partial write / REP entry delta cannot both be promised with current execution semantics. This proposal chooses exact restart state and explicit Unknown where history is absent. If “exact metadata” means a complete #PF code and exact committed bytes even under concurrent revocation, implementation must wait for the missing guest model and stronger synchronization; this record does not weaken that completion criterion silently.
 
 ## Consequences and migration for embedders
 
@@ -151,7 +182,7 @@ Required implementation tests, parameterized over interpreter/block/verified-reg
 
 1. **Exception classes:** #DE zero/overflow, #UD invalid encoding, overlength #GP(0), noncanonical #GP(0)/#SS(0), required-alignment #GP(0), #BP/#DB saved-versus-reporting RIP, pending #MF reporting instruction. Test NoCode versus Known(0), and Unknown for unsupported/synthetic #NP/#TS/#AC/selector-dependent #GP; do not invent producers to claim architectural coverage. Add cause-specific selector-code witnesses when descriptor support exists.
 2. **Memory:** known map holes, out-of-span and wrapping references, scalar/vector/helper and broadcast/narrow widths, instruction fetch split at region/page/Trap boundaries, mapped host PROT_NONE/read-only faults. Assert reported byte precision, requested transfer width versus operand width versus unbacked tail. Preserve all Unknown code bits; test the P projection independently from host reason and `Prot`. Test RMW guest intent, failed compare-exchange and source/destination sides of MOVS; obtain primary-source/native x86 witnesses before marking ambiguous W/R exact.
-3. **Progress:** read-before-write RMW fault; PUSH/POP/call state; first/later REP faults, source/destination fault, DF and address widths; masked holes, all-zero masks, RAM/MMIO mixtures and acknowledged retries. Split 16/32/64-byte and page-crossing scalar stores must report possible partial effects without a fabricated exact bitmap; test that replay preserves the original uncertainty. Exercise preflight before device writes and document stable-protection assumptions.
+3. **Progress:** read-before-write RMW fault; PUSH/POP/call state; first/later REP faults, source/destination fault, DF and address widths; masked holes, all-zero masks, RAM/MMIO mixtures and acknowledged retries. Split 16/32/64-byte and page-crossing scalar stores must report no RAM effects at a proven preflight fault; actual-transfer faults retain uncertainty, including across replay. Exercise preflight before device writes and document stable-protection assumptions.
 4. **Recovery:** exact sites versus adjacent PCs, optimized/folded accesses, RIP above 4 GiB, multiple sub-blocks, absent recipe, nested frame and unsupported signal rejection. Ensure classifier allocations stay zero and all host recovery state remains preserved. Run actual landing/fixup tests on each supported host/OS; cross-compilation alone does not validate delivery.
 5. **API and cost:** compile a downstream consumer using legacy patterns/constructors, including consts and custom backends; owned metadata remains valid across retry/unmap and no successful Exit inherits a prior fault. Check layout on supported targets; compare hot machine code and interpreter success loops, check no new allocation on success, then interleave representative dispatch/load/store/REP timings. Do not infer zero cost from timing noise alone.
 
@@ -161,10 +192,10 @@ The maintainer accepted the recommended resolution of each open question (2026-1
 
 - **Ownership:** metadata is owned by the exit, as optional boxed data on the existing variants, read through `Exit::fault_metadata()`. It is allocated only after fault recovery, never in signal context. No vCPU query with a lifetime rule.
 - **#PF bits:** partial facts now. Architectural bits the engine cannot know are reported as Unknown, and the flat-map projection is labelled separately from a confirmed architectural code. A guest privilege/paging/permission model is not a prerequisite.
-- **Partial progress:** exact restart state is enough. Per-attempt deltas and an inventory of committed bytes are out of scope; the xj-obx.8 contract stands.
+- **Partial progress:** exact restart state is enough. Per-attempt deltas and an inventory of committed bytes are out of scope; crossing compiled stores now use decision-13's preflight guarantee, with concurrent-revocation exceptions retained.
 - **IRET selector failures:** an Unknown-code cause until descriptor support exists.
 
-Revisit this decision when paging/privilege/descriptor enforcement ships, xj-obx.8 changes store semantics, a consumer requires exact REP entry deltas, or fault-path allocation becomes measurably material. Acceptance of this design is followed by implementation and per-class tests; it is not acceptance of fabricated completeness.
+Revisit this decision when paging/privilege/descriptor enforcement ships, store synchronization changes, a consumer requires exact REP entry deltas, or fault-path allocation becomes measurably material. Acceptance of this design is followed by implementation and per-class tests; it is not acceptance of fabricated completeness.
 
 
 ## Amendment 2026-11-06: raw host fault record

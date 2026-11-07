@@ -516,6 +516,53 @@ mod native {
         vector::{CpuSnapshot, MemChunk, MemKind, RunSpec},
     };
     #[test]
+    fn native_split_store_fault_preserves_readable_bytes() {
+        use iced_x86::code_asm::*;
+        // SDM Vol 3A §§7.5–7.6: a fault restores instruction-entry state.
+        const ENTRY: u64 = 0x21_0000;
+        const GUARD: u64 = 0x25_0000;
+        for width in [2, 4, 8, 16] {
+            let mut a = CodeAssembler::new(64).unwrap();
+            match width {
+                2 => a.mov(word_ptr(rdi), ax).unwrap(),
+                4 => a.mov(dword_ptr(rdi), eax).unwrap(),
+                8 => a.mov(qword_ptr(rdi), rax).unwrap(),
+                _ => a.movdqu(xmmword_ptr(rdi), xmm0).unwrap(),
+            }
+            a.hlt().unwrap();
+            let address = GUARD - width / 2;
+            let mut cpu = CpuSnapshot::default();
+            cpu.gpr[7] = address;
+            cpu.gpr[0] = 0x1212_1212_1212_1212;
+            cpu.xmm[0] = u128::from_le_bytes([0x12; 16]);
+            let prefix = MemChunk {
+                addr: address,
+                bytes: vec![0x35; width as usize / 2],
+                kind: MemKind::Ram,
+            };
+            let input = VectorInput {
+                cpu_init: cpu,
+                mem_init: vec![
+                    MemChunk {
+                        addr: ENTRY,
+                        bytes: a.assemble(ENTRY).unwrap(),
+                        kind: MemKind::Ram,
+                    },
+                    prefix.clone(),
+                ],
+                entry: ENTRY,
+                run: RunSpec::UntilExit,
+            };
+            let (out, evidence) =
+                run_native_fault_details(&input, NativeFault::PageFault { addr: GUARD })
+                    .expect("native split-store fault must be observable");
+            assert_eq!(evidence.vector, 14);
+            assert_eq!(out.cpu.rip, ENTRY);
+            assert_eq!(out.mem[1].bytes, prefix.bytes);
+        }
+    }
+
+    #[test]
     fn native_error_code_and_rmw_evidence() {
         const ENTRY: u64 = 0x21_0000;
         const UNMAPPED: u64 = 0x24_0000;
@@ -933,21 +980,30 @@ fn split_store_progress(tier: usize) {
     a.vmovdqu32(zmmword_ptr(rbx), zmm0).unwrap();
     forms.push((a.assemble(CODE).unwrap(), 64));
     for (bytes, width) in forms {
-        for routed in [false, true] {
+        for (routed, precise) in [(false, false), (false, true), (true, false), (true, true)] {
             let (mut vm, mut cpu, rip) = setup(tier, &bytes);
             vm.mem.set_host_fault_recovery(routed);
+            vm.set_precise_split_stores(precise);
             cpu.set_reg(Reg::Rbx, HOLE - width / 2);
             let exit = run(&vm, &mut cpu, tier);
             let m = exit.fault_metadata().unwrap();
             assert_eq!(m.instruction_rip(), Known(rip));
             assert_eq!(m.operand_size(), Known(width as u16));
             assert_eq!(m.progress().registers(), RegisterProgress::InstructionEntry);
-            assert_eq!(m.progress().ram(), MemoryEffects::PossiblyPartial);
+            assert_eq!(
+                m.progress().ram(),
+                if precise && tier != 0 {
+                    MemoryEffects::None
+                } else {
+                    MemoryEffects::PossiblyPartial
+                }
+            );
+            // Device history remains independently qualified.
             assert_eq!(m.progress().had_partial_progress(), Unknown);
         }
     }
 }
-tiers!(split_store_effects_remain_qualified, split_store_progress);
+tiers!(split_store_preflight_effects, split_store_progress);
 
 #[test]
 fn raw_host_record_does_not_qualify_guest_error_code() {

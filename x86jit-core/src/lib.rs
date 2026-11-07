@@ -25,6 +25,8 @@
 //! on a fault, after signal recovery; successful execution has no metadata reset
 //! or allocation. REP exposes exact current restart registers, with unknown
 //! per-attempt iteration deltas; split stores may have partial memory effects.
+//! [`Vm::set_precise_split_stores`] opts into compiled crossing-store preflight
+//! (off by default); revocation after preflight can still leave partial effects.
 //!
 //! Module map mirrors the spec's dependency order:
 //! `state` + `memory` -> `ir` -> `lift` -> `interp` -> `cache`/`vm`.

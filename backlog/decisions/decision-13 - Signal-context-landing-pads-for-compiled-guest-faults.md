@@ -187,9 +187,11 @@ the interpreter in both block and region modes and continue to HLT.
 For an Access fault in mapped RAM independently protected by the embedder,
 the dispatcher uses a region-only check and returns Exit::UnmappedMemory in
 both recovery modes, using rebased `si_addr` and the trap's
-access; MemCtx retains the transfer width. Compiled split stores can already have
-committed earlier host transfers (xj-obx.8); resuming rewrites those same bytes.
-This fallback cannot reconstruct a
+access; MemCtx retains the transfer width. With `Vm::set_precise_split_stores(true)`,
+crossing compiled stores preflight all destination pages before writing guest
+bytes, as specified below. This setting is off by default. A failure
+at a probe leaves guest bytes unchanged; its width is one byte and its access
+is Write. This fallback cannot reconstruct a
 straddling protected transfer's operand base. Exit::UnmappedMemory currently
 exposes address and access, without a size field.
 
@@ -395,19 +397,69 @@ faults on the unmapped element. Routed mode checks every selected region first
 and faults before issuing any device write. This commit-last behavior matches
 VMASKMOV's region preflight in default mode.
 
-Compiled split stores have a known gap, tracked in **xj-obx.8**. Their code is the
-same in both modes. On x86-64, 16-byte vector transfers are two 8-byte stores;
-32/64-byte vector and extract-lane stores contain multiple such transfers. On
-AArch64 a 16-byte transfer lowers to STP, and 32/64-byte and extract-lane stores
-contain multiple transfers. The AArch64 gap also covers misaligned scalar
-stores that cross a host page. Completed transfers can remain visible when a
-later transfer faults; no all-or-nothing promise is made for a faulting STP or
-page-crossing scalar store. The scalar-straddle witness records the measured
-host's behavior; it does not establish a guarantee for other implementations.
-Register/flag recovery still names the guest instruction, and resuming rewrites
-the same completed destination bytes before continuing. Intel SDM Vol 3A
-§11.1.1 permits partial wide-store visibility. No split-store deferral or inline
-atomic probe is emitted by this design.
+Precise split stores are **opt-in and disabled by default**. Enable them with
+`Vm::set_precise_split_stores(true)`; `Vm::precise_split_stores()` queries the
+policy. This is independent of routed host-fault recovery. All vCPUs execute
+under their VM's current policy, and `fork_with_backend` inherits it. Changing
+the policy flushes all translations and backend links, advances the cache epoch
+seen by vCPU predictors, and rejects pending background translations. Compile
+requests snapshot the policy, so a queued translation cannot silently change
+modes while compiling. Additive backend entry points forward the policy; a
+backend that does not implement the opt-in entry points safely interprets.
+External `TierUpRequest` literals must initialize `precise_split_stores`.
+
+With the setting **off**, generated code and the existing decision-13 contract
+remain unchanged: a split compiled store can commit earlier host transfers
+before a later transfer faults, and its RAM-effect metadata remains
+`PossiblyPartial`. No probe or crossing test is emitted. The lifter retains
+main's descriptor budget and block boundaries. With the setting on, probe
+metadata can exceed the existing descriptor limit for a long store-heavy
+translation; that unit falls back to interpretation rather than changing
+lifting boundaries in the default mode.
+
+With the setting **on**, compiled stores in both blocks and regions preflight
+a destination that can cross a 4 KiB host-address granule, in both recovery modes. This covers 16/32/64-byte
+vector and extract-lane stores on both hosts, and 2/4/8-byte scalar stores and
+inlined RMW stores on AArch64. The test uses the actual host address, including
+externally supplied backing whose page offset differs from the guest address.
+A checked or statically proved alignment of at least the operand width proves non-crossing for stores
+up to 16 bytes, because backing preserves guest/host alignment modulo 16. Such
+stores need no crossing test. One-byte stores and scalar x86-64 host stores also
+keep their existing path. All other non-crossing stores execute a crossing test
+and their ordinary inline stores, without a helper call or a probe. Within one
+guest block, a dominating successful preflight for the same SSA address and an
+equal or wider span is reused. Helpers invalidate this proof, except the dirty-page
+notification helper, which cannot change mappings or protections. Alignment proofs
+propagate through constants, masks and aligned arithmetic offsets, up to the
+backing contract’s 16-byte alignment; no wider backing alignment is assumed.
+
+On the cold crossing path, an atomic add-zero on one byte at the operand start
+and at the next granule boundary checks write accessibility in increasing address
+order. The maximum inline store is 64 bytes, so these two probes cover its full
+span. A 4 KiB granule divides all supported host page sizes, including 16 KiB;
+a granule crossing inside one host page merely probes that same page twice.
+Each potentially faulting host instruction of a probe has an exact trap site,
+with guest owner RIP, Write direction and width one. The normal whole-operand
+bounds check and MMIO deferral precede probes. RMW read-check reuse still runs
+the write preflight before the store. No guest destination bytes commit if a
+probe faults. Fixing protection and retrying executes the guest write once,
+matching Intel SDM Vol 3A §§7.5–7.6. This is fault restartability, independently
+of the concurrent-observer atomicity limits in Vol 3A §11.1.1.
+
+The opt-in guarantee assumes stable host mappings/protections from preflight through
+the last transfer, including later stores that reuse a preflight in that guest
+block. Concurrent unmap, revocation or backing changes after a
+successful preflight can still fault an actual transfer after earlier bytes
+committed; those faults retain PossiblyPartial metadata. Probes preserve guest
+byte values under concurrent writers, but can break copy-on-write and set
+host dirty/soft-dirty tracking before a later probe fails. The preflight does
+not make the whole guest operand one atomic transaction.
+
+Masked, narrowing, conversion, x87 and string helpers retain their existing
+preflight and recovery policies. Rust/interpreter accesses to independently
+protected host pages require opt-in host-fault recovery; default mode still
+requires their host backing accessible. Masked-off lanes remain unaccessed,
+REP remains per element, and paired CAS keeps its existing helper path.
 
 An x87 memory fault restores the entry status word in both modes (Intel SDM
 Vol 3A §7.5). REP MOVS/STOS remains per element in routed mode; completed
@@ -523,3 +575,221 @@ words containing embedded pointers.
 | cross16 | 0.2712 | 0.2770 | 0.2770 | +2.14% | +2.14% |
 | aligned16 | 0.2714 | 0.2770 | 0.2770 | +2.06% | +2.06% |
 | slide16 | 0.3179 | 0.3181 | 0.3166 | +0.06% | -0.41% |
+
+### Crossing-store preflight measurement (2026-11-06)
+
+MEASURED on AArch64 macOS with Rust 1.96.0, release builds, native target,
+Speed optimization: five interleaved reference/candidate rounds, alternating
+pair order. Reference is `main` at `bb9cc7e`; both binaries use identical
+`x86jit-bench/examples/split_store_probe.rs`. No other benchmark campaign was
+run. Each cell uses the median of the five process-local measurements, including
+VM creation and compilation. `proc_pid_rusage(RUSAGE_INFO_V4)` supplies retired
+host instructions; this is not the guest retirement counter. The example's
+aligned destinations are host-aligned to 64 bytes; sliding destinations advance
+one byte over an 8 KiB guest window and include crossing stores. Each custom
+loop performs 800,000 guest stores. Region mode is synchronous eager compilation.
+
+[Raw round data](decision-13-split-store-measurements.csv) retains every count
+and elapsed nanosecond value. Reproduce by building the example separately at
+the reference and candidate revisions, then alternating the two executables for
+five rounds with arguments `WORKLOAD jit|region default|routed`. Workloads are
+`mmx`, `simd`, `memcpy` (default policy), and
+`aligned-{2,4,8,16,32,64}` / `sliding-{2,4,8,16,32,64}` (both policies).
+
+| Workload / tier | Main retired | Preflight retired | Retired change | Main ms | Preflight ms |
+|---|---:|---:|---:|---:|---:|
+| mmx / jit | 213,778,957 | 217,896,800 | +1.93% | 6.234 | 6.584 |
+| mmx / region | 175,105,847 | 179,321,944 | +2.41% | 5.530 | 5.586 |
+| simd / jit | 120,430,297 | 120,453,914 | +0.02% | 9.839 | 9.808 |
+| simd / region | 79,569,102 | 79,547,895 | -0.03% | 9.843 | 9.822 |
+| memcpy / jit | 162,353,700 | 162,350,437 | -0.00% | 4.819 | 4.812 |
+| memcpy / region | 111,364,625 | 111,527,195 | +0.15% | 3.450 | 3.457 |
+
+For each custom loop, the following cells are **retired-instruction change /
+elapsed-time change**, relative to main. D = default, R = routed recovery.
+
+| Pattern / bytes | Block D | Block R | Region D | Region R |
+|---|---:|---:|---:|---:|
+| aligned / 2 | +7.82% / +10.56% | +8.03% / +7.08% | +13.41% / +12.96% | +13.57% / +14.03% |
+| aligned / 4 | +8.14% / +5.90% | +7.75% / +5.53% | +13.30% / +9.91% | +13.38% / +11.03% |
+| aligned / 8 | +7.49% / +5.51% | +7.48% / +10.20% | +11.33% / +12.66% | +11.50% / +9.04% |
+| aligned / 16 | +8.64% / +7.65% | +8.82% / +9.03% | +13.41% / +10.81% | +13.28% / +9.92% |
+| aligned / 32 | +8.61% / +3.32% | +8.83% / +4.87% | +11.93% / +8.36% | +11.85% / +5.87% |
+| aligned / 64 | +7.27% / +3.91% | +7.13% / +5.45% | +10.96% / +5.61% | +10.68% / +6.06% |
+| sliding / 2 | +7.08% / +4.15% | +7.16% / +5.25% | +8.39% / +7.16% | +8.16% / +3.87% |
+| sliding / 4 | +7.11% / +4.87% | +7.20% / +4.81% | +8.21% / +5.50% | +8.16% / +4.40% |
+| sliding / 8 | +7.19% / +4.41% | +7.21% / +7.41% | +7.83% / +9.73% | +7.79% / +8.65% |
+| sliding / 16 | +5.97% / +6.34% | +6.03% / +6.77% | +8.45% / +9.28% | +8.42% / +6.14% |
+| sliding / 32 | +6.13% / +5.25% | +5.97% / +4.67% | +7.74% / +5.88% | +7.85% / +6.98% |
+| sliding / 64 | +5.57% / +5.83% | +5.61% / +6.01% | +7.54% / +5.44% | +7.62% / +7.58% |
+
+The representative SIMD and memcpy counts stay within 0.15% of main; MMX adds
+1.93% in blocks and 2.41% in regions. The synthetic non-crossing loops add
+7.13–13.57% retired instructions, and their median elapsed times rise
+3.32–14.03%. **The non-crossing “within noise” target is not met by this
+implementation.** These results include cold-code layout/register-allocation
+and compilation effects as well as the crossing test. They do not isolate a
+per-store latency or establish cross-host costs. No store class is left with
+the stable-protection correctness gap; performance acceptance remains for
+maintainer review. The optimization and subsequent campaign below supersede
+these initial performance figures.
+
+MEASURED correctness witnesses cover interpreter recovery, compiled blocks and
+verified regions, identity backing and a 16-byte rebased backing, PROT_NONE and
+read-only low/high pages, 2/4/8/16/32/64-byte stores, extract, narrowing, masked,
+conversion, RMW, locked ADD, XCHG, CMPXCHG and first-element REP STOS. Each checks
+readable bytes at the fault, restores protection, retries and checks the final
+bytes; metadata witnesses retain uncertainty for actual-transfer faults. A
+native x86-64 Linux split-store witness is included but could not run here;
+the target standard library is unavailable for its requested cross-check.
+
+### Crossing-store optimization measurement (2026-11-07)
+
+MEASURED: one subsequent five-round interleaved campaign, using the same 54
+workload/tier/policy pairs and 540 process-local samples as the initial campaign.
+Reference: current `main` at `5638dda` (the intervening commit changes x87 pointer
+model selection). Candidate: the uncommitted optimization. Rust 1.96.0, AArch64
+macOS, release profile, native target, Speed optimization. Counts and times still
+include VM creation and compilation; each cell compares medians of five samples.
+The benchmark driver is unchanged. The reference was built from a Git archive in
+an isolated Cargo target directory. Project artifacts were rebuilt for the candidate;
+binary hashes were verified distinct before running any samples. The default-off policy was introduced after this campaign, without changing
+its opt-in probe lowering. Diagnostic tests and documentation were completed
+afterward. These are measurements of the opt-in path, not of the default path;
+they have not been remeasured after adding policy selection. The historical
+driver ran with unconditional preflight; reproducing the opt-in campaign on
+current code requires enabling the VM setting in each workload's VM setup.
+
+Reference binary SHA-256: `82e19ed18e875161f6462d90a8f61c3d55a9a948620ed3205f39df5a25217256`.
+Candidate binary SHA-256: `447fd45786122cdf0c137e574e35f08775a2688381d87963acbe975be3e0254c`.
+
+[Raw optimized round data](decision-13-split-store-optimized-measurements.csv).
+
+| Workload / tier | Main retired | Optimized retired | Retired change | Main ms | Optimized ms |
+|---|---:|---:|---:|---:|---:|
+| mmx / jit | 213,777,090 | 213,813,049 | +0.02% | 6.678 | 7.638 |
+| mmx / region | 175,118,143 | 175,243,533 | +0.07% | 5.739 | 5.856 |
+| simd / jit | 120,396,041 | 120,575,234 | +0.15% | 10.368 | 10.286 |
+| simd / region | 79,588,278 | 79,535,569 | -0.07% | 10.027 | 10.010 |
+| memcpy / jit | 162,525,015 | 162,511,180 | -0.01% | 5.873 | 4.972 |
+| memcpy / region | 111,454,025 | 111,422,418 | -0.03% | 3.652 | 3.573 |
+
+Cells below are **retired-instruction change / elapsed-time change** versus main.
+D = default, R = routed recovery.
+Both columns measure enabled split-store precision; D/R select host-fault
+recovery policy, independently of the new default-off split-store setting.
+
+| Pattern / bytes | Block D | Block R | Region D | Region R |
+|---|---:|---:|---:|---:|
+| aligned / 2 | +1.81% / +1.75% | +1.37% / -0.27% | +1.36% / +2.46% | +0.98% / -0.10% |
+| aligned / 4 | +1.36% / +1.34% | +1.35% / -0.51% | +1.69% / +1.46% | +1.82% / -1.43% |
+| aligned / 8 | +1.29% / +3.22% | +1.38% / -1.51% | +1.48% / +2.94% | +1.29% / +2.93% |
+| aligned / 16 | +1.08% / +3.37% | +1.05% / -3.85% | +1.36% / -0.13% | +1.40% / -1.24% |
+| aligned / 32 | +1.94% / +1.17% | +1.76% / -3.96% | +2.35% / +2.28% | +2.25% / -0.28% |
+| aligned / 64 | +1.33% / -1.41% | +1.24% / -3.64% | +2.38% / +4.89% | +2.29% / +0.93% |
+| sliding / 2 | +7.03% / +1.37% | +7.00% / +2.35% | +8.81% / +4.11% | +8.84% / +1.11% |
+| sliding / 4 | +6.95% / +1.60% | +6.95% / +4.16% | +8.90% / +4.69% | +8.96% / +1.96% |
+| sliding / 8 | +6.91% / +4.10% | +7.02% / +5.38% | +8.99% / +1.46% | +8.96% / +3.27% |
+| sliding / 16 | +5.70% / +3.30% | +5.67% / +3.81% | +8.08% / +6.91% | +8.08% / +8.23% |
+| sliding / 32 | +6.03% / +4.93% | +6.00% / +10.34% | +7.78% / +9.73% | +7.81% / +7.30% |
+| sliding / 64 | +5.39% / +3.50% | +5.44% / +5.06% | +7.38% / +6.13% | +7.53% / +6.72% |
+
+All aligned block cases and aligned 2/4/8/16-byte region cases are below 2%.
+Aligned 32/64-byte region cases remain at **2.25–2.38%**; the full campaign’s
+under-2% target is therefore **not fully met**. Sliding stores keep changing
+addresses, so dominating-preflight reuse does not apply; their increases remain
+5.39–8.99%. MMX is now within 0.08%, and all three representative bench workloads
+are within 0.15%.
+
+MEASURED emitted AArch64 instructions, disassembled from actual encoded bytes
+with LLVM 21.1.8. The single-store fixtures include the prologue, bounds checks,
+store barrier, HLT exit and epilogue. The region fixtures count one non-crossing
+back-edge iteration containing eight stores and DEC/JNZ, with fuel available,
+no dispatch request, no code-page hit and no watches. These are static path counts,
+independent of the process-wide retired counters above.
+
+| Fixture | Main | Initial preflight | Optimized |
+|---|---:|---:|---:|
+| Single 8-byte store, block hot path | 41 | 45 | 45 |
+| Single 16-byte vector store, block hot path | 42 | 47 | 47 |
+| Eight 8-byte stores, region loop iteration | 145 | 182 | 149 |
+| Eight 16-byte stores, region loop iteration | 152 | 171 | 155 |
+
+The standalone crossing test stays AND/CMP/B.HI; on a scalar store an additional
+ADD forms the host pointer because the ordinary STR uses base-plus-index addressing.
+The vector standalone fixture also retains allocator register moves. Repeated
+stores share the preflight instead of retaining eight compare/branch pairs.
+In the scalar region loop, hot stack accesses fall from 22 to 4, matching main;
+the vector loop falls from 4 to 2, also matching main. A single unknown address
+still pays its crossing check. There is no claim of zero overhead for that case.
+
+Reproduce encoded-code inspection with the ignored `dump_split_store_paths` test,
+setting `X86JIT_STORE_DUMP_DIR` and selecting `--ignored`. It saves encoded bytes,
+optimized CLIF and VCode for standalone and repeated stores in blocks and regions.
+
+READ: `codegen/mod.rs` keeps preflight and alignment proofs entirely in the compiler.
+Guest trap descriptors and lifter descriptor budgeting emit no runtime bookkeeping.
+Preflight reuse is bounded by guest blocks and invalidated at helper calls; the
+dirty-page helper preserves it because `Memory::note_write` only records dirty pages.
+One-byte stores remain exempt. Constants, masks, checked alignment and aligned
+offsets can prove non-crossing only within the backing alignment contract.
+
+MEASURED validation: two new compiler regressions failed against the initial
+implementation (16 probes instead of 2 for repeated stores; 2 instead of 0 for
+proved alignment), then passed after optimization. Targeted fault/atomicity,
+landing-pad, metadata, region-state and Rust-memory tests passed; all-feature
+Clippy with `-D warnings`, formatting and diff whitespace checks passed.
+
+ASSUMED / unverified: runtime performance and behavior on x86-64 and other hosts.
+The stable-protection requirement and COW/dirty-tracking effects remain as specified
+above; actual-transfer faults retain qualified metadata, including after reused
+preflights. The maintainer chose default-off opt-in precision because of this measured
+cost: aligned store loops add approximately **1–2.4%** retired instructions,
+sliding-address loops **5–9%**, and memcpy/SIMD/MMX stay within **0.15%**.
+These figures describe retired instructions, not uniform elapsed-time changes.
+The default path preserves the original partial-store contract and pays no
+crossing-test instructions.
+
+
+### Default-off policy validation (2026-11-07)
+
+MEASURED: exact comparison against archived `main` at `5638dda8f4d7ba3f9c1affb79a03bbd87231f2de`,
+Rust 1.96.0 and locked Cranelift 0.115.1: **all 32 encoded buffers match byte for
+byte**. Coverage is AArch64 and x86-64 encoders, None and Speed optimization,
+block and region lowering, and 8-byte scalar / 16-, 32-, 64-byte vector stores.
+The harness uses deterministic dummy helper addresses and includes the full
+function buffers, including cold paths. Both encoders ran on the AArch64 host;
+this is emitted-code evidence, not x86-64 runtime evidence.
+
+[Full buffer lengths and SHA-256 fingerprints](decision-13-split-store-default-code.csv)
+record the matching reference/candidate bytes. Speed block samples:
+
+| Encoder | Store bytes | Main bytes | Default-off bytes | Exact comparison |
+|---|---:|---:|---:|---|
+| AArch64 | 8 | 384 | 384 | Identical |
+| AArch64 | 16 | 384 | 384 | Identical |
+| AArch64 | 32 | 396 | 396 | Identical |
+| AArch64 | 64 | 420 | 420 | Identical |
+| x86-64 | 8 | 376 | 376 | Identical |
+| x86-64 | 16 | 392 | 392 | Identical |
+| x86-64 | 32 | 408 | 408 | Identical |
+| x86-64 | 64 | 456 | 456 | Identical |
+
+Reproduce candidate buffers with `split_store_policy_controls_probes_on_both_isas`
+and `X86JIT_STORE_DUMP_DIR`. In a read-only-revision archive of main, use the same
+compiler-test harness with the policy assignment removed and only the disabled
+policy case selected; compare the resulting `.bin` files directly. No linked
+helper addresses or runtime execution are involved in that comparison.
+
+MEASURED: both policies cover interpreter, blocks and verified regions, including
+masked/vector/string/RMW stores, protected low/high pages, fault inspection,
+protection repair and retry. The default path exposes the existing committed
+prefix for wide compiled stores; the opt-in path preserves all bytes at a
+failed probe. Additional witnesses cover existing vCPU predictors, forks,
+background policy snapshots and rejection of stale completions in both toggle
+directions. Probe faults alone gain the no-RAM-effects guarantee; actual-transfer
+faults keep their uncertainty, including native scalar transfers without probes.
+
+MEASURED: x86-64 Linux workspace/test type-check passed with installed Nix Rust
+1.96.1 target libraries. Native x86-64 execution and cross-host performance remain
+ASSUMED / unverified; no new performance campaign was run for policy selection.

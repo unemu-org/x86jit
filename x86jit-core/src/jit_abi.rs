@@ -622,7 +622,15 @@ impl MemCtx {
         } = &mut exit
         {
             m.progress.ram = match info {
-                Some(i) if !i.writes || (i.rmw && detailed && self.link_slot & 0xff == 0) => {
+                Some(i)
+                    if !i.writes
+                        || (i.rmw && detailed && self.link_slot & 0xff == 0)
+                        || (i.preflighted_store
+                            && detailed
+                            && self.link_slot & 0xff == 1
+                            && self.fault_size == 1
+                            && matches!(i.operand_size, Knowledge::Known(2..=64))) =>
+                {
                     MemoryEffects::None
                 }
                 Some(_) => MemoryEffects::PossiblyPartial,

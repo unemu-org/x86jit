@@ -22,6 +22,46 @@ struct Compiled {
     region: bool,
 }
 impl Backend for Compiled {
+    fn materialize_with_split_stores(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        let block = self.jit.materialize_with_split_stores(
+            ir,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+        );
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        block
+    }
+    fn materialize_region_with_split_stores(
+        &self,
+        ir: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        let block = self.jit.materialize_region_with_split_stores(
+            ir,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+        );
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        block
+    }
     fn region_caps(&self) -> Option<x86jit_core::RegionCaps> {
         self.region.then_some(x86jit_core::RegionCaps {
             max_blocks: 16,
@@ -133,6 +173,7 @@ fn transfer_case(kind: &str, tier: u8, straddle: bool, readonly: bool) {
 }
 fn transfer_mode_case(kind: &str, tier: u8, straddle: bool, readonly: bool, routed: bool) {
     let mut vm = vm(tier);
+    vm.set_precise_split_stores(true);
     vm.mem.set_host_fault_recovery(routed);
     let reference = self::vm(0);
     let code_addr = BASE + 0x1000;
@@ -314,13 +355,7 @@ fn transfer_mode_case(kind: &str, tier: u8, straddle: bool, readonly: bool, rout
     same_cpu(&actual.cpu, &before);
     let mut bytes = [0; 512];
     vm.read_bytes(guard - 512, &mut bytes).unwrap();
-    if kind == "vector_store" && tier != 0 && straddle {
-        // xj-obx.8: compiled 256-bit stores commit their first 128-bit transfer
-        // before the high transfer faults. Resume rewrites those same bytes.
-        expected_prefix[496..].copy_from_slice(&before.xmm[0].to_le_bytes());
-    }
-    // On AArch64 the compiled misaligned scalar straddle witnesses this host;
-    // whole-store fault atomicity on other implementations is under xj-obx.8.
+    // SDM Vol 3A §§7.5–7.6: crossing stores preflight before any bytes commit.
     assert_eq!(bytes, expected_prefix);
     protect(&vm, false);
     assert!(matches!(actual.run(&vm, None), Exit::Hlt));
@@ -714,7 +749,7 @@ fn default_x87_fault_restores_the_entry_status() {
 }
 
 #[test]
-fn compiled_split_stores_resume_by_rewriting_completed_bytes() {
+fn compiled_split_stores_commit_nothing_before_retry() {
     let _serial = FORK_TEST.lock().unwrap_or_else(|p| p.into_inner());
     for routed in [false, true] {
         for tier in 1..3 {

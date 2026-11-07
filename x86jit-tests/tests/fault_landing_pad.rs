@@ -89,6 +89,48 @@ impl Backend for Compiled {
         perturb_compiler_fp();
         block
     }
+    fn materialize_with_split_stores(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        let block = self.jit.materialize_with_split_stores(
+            ir,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+        );
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        perturb_compiler_fp();
+        block
+    }
+    fn materialize_region_with_split_stores(
+        &self,
+        ir: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+    ) -> CachedBlock {
+        let block = self.jit.materialize_region_with_split_stores(
+            ir,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+        );
+        assert!(matches!(block, CachedBlock::Compiled { .. }));
+        perturb_compiler_fp();
+        block
+    }
     fn region_caps(&self) -> Option<x86jit_core::RegionCaps> {
         self.region.then_some(x86jit_core::RegionCaps {
             max_blocks: 16,
@@ -1303,6 +1345,351 @@ fn transfer_fetch_fault_keeps_raw_evidence_in_run_and_step() {
                 0,
                 "tier={tier}, step={step}"
             );
+        }
+    }
+}
+
+// SDM Vol 3A §§7.5–7.6: a fault restores instruction-entry state and retry
+// executes the instruction once. REP preserves completed iterations (Vol 2B,
+// REP/REPE/REPNE); this fixture faults its first and only element.
+fn split_store_case(
+    kind: &str,
+    tier: usize,
+    routed: bool,
+    low: bool,
+    readonly: bool,
+    shift: usize,
+    precise: bool,
+) {
+    // SAFETY: each invocation runs in an isolated child owning its mapping,
+    // protection changes, signal handlers and live recovery handle.
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let len = page * 4;
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let base = ptr as u64;
+        let boundary = base + (page * 2 - shift) as u64;
+        let backend: Box<dyn Backend> = match tier {
+            0 => Box::new(InterpreterBackend),
+            _ => Box::new(Compiled {
+                jit: JitBackend::new(),
+                region: tier == 2,
+            }),
+        };
+        let mut vm = Vm::with_backend_host_ram(
+            VmConfig::flat(base + (len - shift) as u64),
+            backend,
+            HostRam {
+                ptr: ptr.cast::<u8>().add(shift),
+                len: len - shift,
+                guest_base: base,
+                protect: None,
+                dtor: Box::new(move |p, n| {
+                    libc::munmap(p.sub(shift).cast(), n + shift);
+                }),
+            },
+        )
+        .unwrap();
+        vm.set_tier_up_after(None);
+        vm.mem.set_host_fault_recovery(routed);
+        vm.map(base, len - shift, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        let mut a = CodeAssembler::new(64).unwrap();
+        if tier == 2 {
+            let mut top = a.create_label();
+            a.mov(r8d, 2).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.dec(r8d).unwrap();
+            a.jnz(top).unwrap();
+        }
+        let offset = a.assemble(base).unwrap().len();
+        let width = match kind {
+            "scalar2" => {
+                a.mov(word_ptr(rdi), ax).unwrap();
+                2
+            }
+            "scalar4" => {
+                a.mov(dword_ptr(rdi), eax).unwrap();
+                4
+            }
+            "scalar8" => {
+                a.mov(qword_ptr(rdi), rax).unwrap();
+                8
+            }
+            "vector16" => {
+                a.movdqu(xmmword_ptr(rdi), xmm0).unwrap();
+                16
+            }
+            "vector32" => {
+                a.vmovdqu(ymmword_ptr(rdi), ymm0).unwrap();
+                32
+            }
+            "vector64" => {
+                a.vmovdqu32(zmmword_ptr(rdi), zmm0).unwrap();
+                64
+            }
+            "extract32" => {
+                a.vextracti64x4(ymmword_ptr(rdi), zmm0, 0).unwrap();
+                32
+            }
+            "masked64" => {
+                a.vmovdqu32(zmmword_ptr(rdi).k1(), zmm0).unwrap();
+                64
+            }
+            "narrow16" => {
+                a.vpmovdb(xmmword_ptr(rdi), zmm0).unwrap();
+                16
+            }
+            "rmw" => {
+                a.add(qword_ptr(rdi), 1).unwrap();
+                8
+            }
+            "locked" => {
+                a.lock().add(qword_ptr(rdi), 1).unwrap();
+                8
+            }
+            "xchg" => {
+                a.xchg(qword_ptr(rdi), rax).unwrap();
+                8
+            }
+            "cas" => {
+                a.lock().cmpxchg(qword_ptr(rdi), rbx).unwrap();
+                8
+            }
+            "convert16" => {
+                a.vcvtps2ph(xmmword_ptr(rdi), ymm0, 0).unwrap();
+                16
+            }
+            "stos" => {
+                a.rep().stosq().unwrap();
+                8
+            }
+            _ => unreachable!(),
+        };
+        a.hlt().unwrap();
+        vm.write_bytes(base, &a.assemble(base).unwrap()).unwrap();
+        let address = boundary - (width / 2) as u64;
+        vm.write_bytes(address, &vec![0x35; width]).unwrap();
+        vm.set_precise_split_stores(precise);
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, base);
+        cpu.set_reg(Reg::Rdi, address);
+        cpu.set_reg(Reg::Rax, 0x1212_1212_1212_1212);
+        cpu.set_reg(Reg::Rcx, 1);
+        cpu.set_reg(Reg::Rbx, 0x1212_1212_1212_1212);
+        if kind == "cas" {
+            cpu.set_reg(Reg::Rax, 0x3535_3535_3535_3535);
+        }
+        cpu.cpu.xmm[0] = u128::from_le_bytes([0x12; 16]);
+        cpu.cpu.ymm_hi[0] = u128::from_le_bytes([0x12; 16]);
+        cpu.cpu.zmm_hi[0] = [u128::from_le_bytes([0x12; 16]); 2];
+        cpu.cpu.kmask[1] = 0xffff;
+        if kind == "convert16" {
+            cpu.cpu.xmm[0] =
+                u128::from_le_bytes(1.5f32.to_le_bytes().repeat(4).try_into().unwrap());
+            cpu.cpu.ymm_hi[0] = cpu.cpu.xmm[0];
+        }
+        HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+        install();
+        let protected = if low {
+            boundary - page as u64
+        } else {
+            boundary
+        };
+        assert_eq!(
+            libc::mprotect(
+                (protected + shift as u64) as *mut _,
+                page,
+                if readonly {
+                    libc::PROT_READ
+                } else {
+                    libc::PROT_NONE
+                }
+            ),
+            0
+        );
+        let exit = cpu.run(&vm, Some(100));
+        assert!(matches!(exit, Exit::UnmappedMemory { .. }), "{exit:?}");
+        assert_eq!(cpu.reg(Reg::Rip), base + offset as u64);
+        if tier == 2 {
+            assert!(vm.cache.regions() > 0);
+        }
+        if precise && tier != 0 && !matches!(kind, "masked64" | "narrow16" | "stos") {
+            let metadata = exit.fault_metadata().unwrap();
+            assert_eq!(
+                metadata.progress().ram(),
+                if cfg!(target_arch = "x86_64")
+                    && matches!(
+                        kind,
+                        "scalar2" | "scalar4" | "scalar8" | "rmw" | "locked" | "xchg" | "cas"
+                    )
+                {
+                    if metadata.transfer_access()
+                        == x86jit_core::Knowledge::Known(x86jit_core::FaultAccess::Read)
+                    {
+                        x86jit_core::MemoryEffects::None
+                    } else {
+                        x86jit_core::MemoryEffects::PossiblyPartial
+                    }
+                } else {
+                    x86jit_core::MemoryEffects::None
+                },
+                "probe fault must prove no committed bytes: {metadata:?}"
+            );
+            if matches!(kind, "vector16" | "vector32" | "vector64" | "extract32")
+                || (cfg!(target_arch = "aarch64") && !matches!(kind, "rmw"))
+            {
+                assert_eq!(metadata.transfer_size(), x86jit_core::Knowledge::Known(1));
+                assert_eq!(
+                    metadata.transfer_access(),
+                    x86jit_core::Knowledge::Known(x86jit_core::FaultAccess::Write)
+                );
+            }
+        }
+        let readable = if low { boundary } else { address };
+        let partial =
+            !precise && tier != 0 && !low && matches!(kind, "vector32" | "vector64" | "extract32");
+        if !precise && tier != 0 && matches!(kind, "vector32" | "vector64" | "extract32") {
+            assert_eq!(
+                exit.fault_metadata().unwrap().progress().ram(),
+                x86jit_core::MemoryEffects::PossiblyPartial
+            );
+        }
+        let visible = std::slice::from_raw_parts((readable + shift as u64) as *const u8, width / 2);
+        if partial {
+            assert_eq!(visible, vec![0x12; width / 2]);
+        } else if precise || tier == 0 || low || matches!(kind, "masked64" | "narrow16" | "stos") {
+            assert_eq!(
+                visible,
+                vec![0x35; width / 2],
+                "visible bytes changed before retry"
+            );
+        }
+        assert_eq!(
+            libc::mprotect(
+                (protected + shift as u64) as *mut _,
+                page,
+                libc::PROT_READ | libc::PROT_WRITE
+            ),
+            0
+        );
+        if precise || tier == 0 || low || matches!(kind, "masked64" | "narrow16" | "stos") {
+            assert_eq!(
+                std::slice::from_raw_parts((address + shift as u64) as *const u8, width),
+                vec![0x35; width]
+            );
+        }
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        let expected = if matches!(kind, "rmw" | "locked") {
+            (0x3535_3535_3535_3535u64 + 1).to_le_bytes().to_vec()
+        } else if kind == "convert16" {
+            0x3e00u16.to_le_bytes().repeat(8)
+        } else {
+            vec![0x12; width]
+        };
+        assert_eq!(
+            std::slice::from_raw_parts((address + shift as u64) as *const u8, width),
+            expected
+        );
+        if kind == "stos" {
+            assert_eq!(cpu.reg(Reg::Rcx), 0);
+            assert_eq!(cpu.reg(Reg::Rdi), address + width as u64);
+        }
+    }
+}
+
+#[test]
+fn split_stores_leave_no_bytes_and_retry_once() {
+    let mut failures = Vec::new();
+    for kind in [
+        "scalar2",
+        "scalar4",
+        "scalar8",
+        "vector16",
+        "vector32",
+        "vector64",
+        "extract32",
+        "masked64",
+        "narrow16",
+        "rmw",
+        "locked",
+        "xchg",
+        "cas",
+        "convert16",
+        "stos",
+    ] {
+        for tier in 0..3 {
+            for routed in [false, true] {
+                if !routed && (tier == 0 || matches!(kind, "masked64" | "narrow16" | "stos")) {
+                    continue;
+                }
+                for low in [false, true] {
+                    for readonly in [false, true] {
+                        let status =
+                            child(|| split_store_case(kind, tier, routed, low, readonly, 0, true));
+                        if status != 0 {
+                            failures.push((kind, tier, routed, low, readonly, status));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "split-store failures: {failures:?}");
+}
+
+#[test]
+fn split_store_preflight_uses_backing_page_offset() {
+    for tier in 1..3 {
+        for kind in ["scalar8", "vector16", "vector32", "vector64"] {
+            for low in [false, true] {
+                assert_eq!(
+                    child(|| split_store_case(kind, tier, false, low, true, 16, true)),
+                    0,
+                    "{kind}, tier={tier}, low={low}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn default_split_stores_preserve_existing_partial_effects_and_retry() {
+    for kind in [
+        "scalar2",
+        "scalar4",
+        "scalar8",
+        "vector16",
+        "vector32",
+        "vector64",
+        "extract32",
+        "masked64",
+        "narrow16",
+        "stos",
+        "rmw",
+        "locked",
+        "xchg",
+        "cas",
+        "convert16",
+    ] {
+        for tier in 0..3 {
+            for low in [false, true] {
+                for readonly in [false, true] {
+                    assert_eq!(
+                        child(|| split_store_case(kind, tier, true, low, readonly, 0, false)),
+                        0,
+                        "{kind}, tier={tier}, low={low}, readonly={readonly}"
+                    );
+                }
+            }
         }
     }
 }

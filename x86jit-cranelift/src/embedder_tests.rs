@@ -141,7 +141,7 @@ fn embedder_observer_sees_blocks_and_background_regions() {
     let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     let region = lift_region(
         &mem,
@@ -155,6 +155,7 @@ fn embedder_observer_sees_blocks_and_background_regions() {
     .unwrap();
     let handle = jit.tier_up_handle();
     let request = TierUpRequest {
+        precise_split_stores: false,
         mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 6)],
@@ -207,7 +208,7 @@ fn embedder_flag_elision_options_preserve_execution() {
         jit.set_compiled_code_observer(move |code| lengths.lock().unwrap().push(code.host_len));
         let entry = jit
             .shared
-            .compile(&ir, MemConsistency::Fast, None, 0, 0)
+            .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
             .unwrap();
         let mut actual = x86jit_core::CpuState::new();
         actual.rip = 0x1000;
@@ -257,7 +258,7 @@ fn embedder_legacy_jit_environment_requires_api_opt_in() {
     let mem = memory(&[0xf4]);
     let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     assert!(
         !path.exists(),
@@ -268,7 +269,7 @@ fn embedder_legacy_jit_environment_requires_api_opt_in() {
     assert!(jit.codegen_description().contains("flag_elision=false"));
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     let map = std::fs::read_to_string(&path).unwrap();
     assert!(map.starts_with(&format!("{:x} ", entry.0 as usize)));
@@ -290,7 +291,7 @@ fn embedder_baseline_swizzle_libcall_obeys_vector_abi() {
     *jit.shared.inner.lock().unwrap() = Some(state);
     let entry = jit
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     for base in (0..=255).step_by(16) {
         let mut cpu = x86jit_core::CpuState::new();
@@ -339,7 +340,7 @@ fn review_observer_is_outside_module_lock() {
         }
     });
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     assert_eq!(
         observed.load(Ordering::Relaxed),
@@ -360,6 +361,7 @@ fn review_observer_panic_does_not_strand_background_queue() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        precise_split_stores: false,
         mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
@@ -448,13 +450,13 @@ fn review_legacy_perfmap_multiple_backends_preserve_ranges() {
     jit1.enable_environment_diagnostics();
     let first = jit1
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     let jit2 = JitBackend::new();
     jit2.enable_environment_diagnostics();
     let second = jit2
         .shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     jit1.enable_environment_diagnostics();
     let map = std::fs::read_to_string(&path).unwrap();
@@ -491,6 +493,7 @@ fn review_panic_payload_drop_keeps_worker_alive() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        precise_split_stores: false,
         mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
@@ -547,6 +550,7 @@ fn review_observer_capture_drop_keeps_worker_alive() {
     let mem = memory(&[0xf4]);
     let ir = Arc::new(lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap());
     let request = || TierUpRequest {
+        precise_split_stores: false,
         mxcsr_mode: 0,
         pc: 0x1000,
         spans: vec![(0x1000, 1)],
@@ -685,7 +689,7 @@ fn lock_telemetry_switch_modes_and_reset() {
     let ir = telemetry_ir();
     for mode in [0, 1] {
         jit.shared
-            .compile(&ir, MemConsistency::Fast, None, 0, mode)
+            .compile(&ir, MemConsistency::Fast, None, 0, mode, false)
             .unwrap();
     }
     jit.invalidate_links();
@@ -693,7 +697,7 @@ fn lock_telemetry_switch_modes_and_reset() {
     jit.set_lock_telemetry(true);
     for mode in [0, 1, 0] {
         jit.shared
-            .compile(&ir, MemConsistency::Fast, None, 0, mode)
+            .compile(&ir, MemConsistency::Fast, None, 0, mode, false)
             .unwrap();
     }
     let snapshot = jit.lock_telemetry();
@@ -702,7 +706,7 @@ fn lock_telemetry_switch_modes_and_reset() {
     assert_lock_sample(&snapshot.nondefault_module, 1);
     jit.set_lock_telemetry(false);
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 0)
+        .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     jit.invalidate_links();
     assert_eq!(jit.lock_telemetry(), snapshot);
@@ -710,7 +714,7 @@ fn lock_telemetry_switch_modes_and_reset() {
     assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
     jit.set_lock_telemetry(true);
     jit.shared
-        .compile(&ir, MemConsistency::Fast, None, 0, 1)
+        .compile(&ir, MemConsistency::Fast, None, 0, 1, false)
         .unwrap();
     assert_lock_sample(&jit.lock_telemetry().nondefault_module, 1);
     assert_eq!(jit.lock_telemetry().default_module.acquisitions, 0);
@@ -738,7 +742,7 @@ fn lock_telemetry_compile_errors_release_guards() {
             .store(stage, Ordering::Relaxed);
         assert!(jit
             .shared
-            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0, false)
             .is_err());
         assert_lock_sample(&jit.lock_telemetry().default_module, 1);
         assert_lock_sample(&jit.lock_telemetry().compile_serial, 1);
@@ -747,7 +751,7 @@ fn lock_telemetry_compile_errors_release_guards() {
         let snapshot = jit.lock_telemetry();
         assert!(jit
             .shared
-            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+            .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0, false)
             .is_err());
         assert_eq!(jit.lock_telemetry(), snapshot);
     }
@@ -756,7 +760,7 @@ fn lock_telemetry_compile_errors_release_guards() {
     jit.set_compile_limit(0);
     assert!(jit
         .shared
-        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0, false)
         .is_err());
     assert_lock_sample(&jit.lock_telemetry().default_module, 1);
     assert_lock_sample(&jit.lock_telemetry().compile_serial, 1);
@@ -811,7 +815,7 @@ fn lock_telemetry_observer_runs_after_release() {
         }
     });
     jit.shared
-        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0)
+        .compile(&telemetry_ir(), MemConsistency::Fast, None, 0, 0, false)
         .unwrap();
     assert_eq!(seen.load(Ordering::Relaxed), 1);
     assert_eq!(jit.lock_telemetry(), LockTelemetrySnapshot::default());
@@ -836,7 +840,7 @@ fn lock_telemetry_compilers_wait_for_module() {
             let ir = telemetry_ir();
             started.send(()).unwrap();
             jit.shared
-                .compile(&ir, MemConsistency::Fast, None, 0, 0)
+                .compile(&ir, MemConsistency::Fast, None, 0, 0, false)
                 .unwrap();
             finished.send(()).unwrap();
         }));
@@ -932,7 +936,7 @@ fn lock_telemetry_compilers_wait_for_serial_separately() {
         starting.send(()).unwrap();
         second
             .shared
-            .compile(&ir, MemConsistency::Fast, None, 0, 1)
+            .compile(&ir, MemConsistency::Fast, None, 0, 1, false)
             .unwrap();
         finished.send(()).unwrap();
     });
@@ -958,4 +962,140 @@ fn lock_telemetry_compilers_wait_for_serial_separately() {
     assert_lock_sample(&snapshot.nondefault_module, 1);
     assert!(snapshot.compile_serial.max_wait_ns >= 10_000_000);
     assert!(snapshot.compile_serial.max_hold_ns >= 10_000_000);
+}
+
+#[test]
+fn split_store_policy_flushes_vcpu_predictions_and_forks() {
+    use x86jit_core::{Exit, Reg, Vm, VmConfig};
+    for region in [false, true] {
+        let jit = if region {
+            JitBackend::with_superblocks(RegionCaps {
+                max_blocks: 8,
+                max_icount: 128,
+            })
+        } else {
+            JitBackend::new()
+        };
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let seen = published.clone();
+        jit.set_compiled_code_observer(move |code| {
+            let probes = (code.host_start..code.host_start + code.host_len as usize)
+                .filter_map(x86jit_core::codemap::lookup_trap)
+                .filter(|site| {
+                    site.access == x86jit_core::GuestAccessKind::Write && site.width == 1
+                })
+                .count();
+            seen.lock().unwrap().push(probes);
+        });
+        let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(jit));
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        // movdqu [rdi],xmm0; dec ecx; jnz entry; hlt
+        vm.write_bytes(
+            0x1000,
+            &[0xf3, 0x0f, 0x7f, 0x07, 0xff, 0xc9, 0x75, 0xf8, 0xf4],
+        )
+        .unwrap();
+        let mut cpus = [vm.new_vcpu(), vm.new_vcpu()];
+        assert!(!vm.precise_split_stores());
+        for precise in [false, true, false] {
+            vm.set_precise_split_stores(precise);
+            let epoch = vm.cache.epoch();
+            vm.set_precise_split_stores(precise);
+            assert_eq!(vm.cache.epoch(), epoch, "same policy retains translations");
+            published.lock().unwrap().clear();
+            for cpu in &mut cpus {
+                cpu.set_reg(Reg::Rip, 0x1000);
+                cpu.set_reg(Reg::Rdi, 0x4000);
+                cpu.set_reg(Reg::Rcx, 2);
+                assert!(matches!(cpu.run(&vm, Some(20)), Exit::Hlt));
+            }
+            let counts = published.lock().unwrap();
+            assert!(
+                !counts.is_empty(),
+                "mode change must recompile even for existing vCPUs"
+            );
+            assert_eq!(counts.iter().any(|&n| n > 0), precise);
+            drop(counts);
+            let child = vm.fork_with_backend(Box::new(JitBackend::new())).unwrap();
+            assert_eq!(child.precise_split_stores(), precise);
+            let mut cpu = child.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.set_reg(Reg::Rdi, 0x4000);
+            cpu.set_reg(Reg::Rcx, 2);
+            assert!(matches!(cpu.run(&child, Some(20)), Exit::Hlt));
+        }
+    }
+}
+
+#[test]
+fn split_store_policy_rejects_pending_background_translations() {
+    use x86jit_core::{Exit, Reg, Vm, VmConfig};
+    for region in [false, true] {
+        for precise in [false, true] {
+            let jit = if region {
+                JitBackend::with_superblocks(RegionCaps {
+                    max_blocks: 8,
+                    max_icount: 128,
+                })
+            } else {
+                JitBackend::new()
+            };
+            let probes_seen = Arc::new(Mutex::new(Vec::new()));
+            let seen = probes_seen.clone();
+            jit.set_compiled_code_observer(move |code| {
+                let probes = (code.host_start..code.host_start + code.host_len as usize)
+                    .filter_map(x86jit_core::codemap::lookup_trap)
+                    .any(|site| {
+                        site.access == x86jit_core::GuestAccessKind::Write && site.width == 1
+                    });
+                seen.lock().unwrap().push(probes);
+            });
+            let handle = jit.tier_up_handle();
+            let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(jit));
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(
+                0x1000,
+                &[0xf3, 0x0f, 0x7f, 0x07, 0xff, 0xc9, 0x75, 0xf8, 0xf4],
+            )
+            .unwrap();
+            vm.set_precise_split_stores(precise);
+            vm.set_tier_up_after(Some(1));
+            vm.set_tier_up_background(true);
+            let pause = handle.pause_compiler();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.set_reg(Reg::Rdi, 0x4000);
+            cpu.set_reg(Reg::Rcx, 10);
+            assert!(matches!(cpu.run(&vm, Some(2)), Exit::BudgetExhausted));
+            {
+                let queue = handle.shared.queue.lock().unwrap();
+                assert!(!queue.items.is_empty());
+                assert!(queue
+                    .items
+                    .iter()
+                    .all(|item| item.request.precise_split_stores == precise));
+                assert_eq!(
+                    matches!(queue.items[0].request.unit, TierUpUnit::Region(_)),
+                    region
+                );
+            }
+            vm.set_precise_split_stores(!precise);
+            drop(pause);
+            handle.wait_idle();
+            let probes = probes_seen.lock().unwrap();
+            assert!(!probes.is_empty());
+            assert!(
+                probes.iter().all(|&present| present == precise),
+                "queued code must use its submitted policy"
+            );
+            drop(probes);
+            // Prevent a fresh background request from hiding the stale-result check.
+            vm.set_tier_up_after(Some(u32::MAX));
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.set_reg(Reg::Rcx, 2);
+            assert!(matches!(cpu.run(&vm, Some(20)), Exit::Hlt));
+            assert_eq!(vm.cache.tier_bg_published(), 0);
+            assert!(vm.cache.tier_bg_rejected() > 0);
+        }
+    }
 }
