@@ -20,7 +20,7 @@ created_date: '2026-07-06 11:25'
 | mmx | 60 | 0 | 0 | 100% | 0 |
 | optional | 17 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 692 | 0 | 107 | 87% | 240 |
-| x86-64-v2 | 107 | 0 | 10 | 91% | 0 |
+| x86-64-v2 | 117 | 0 | 0 | 100% | 0 |
 | x86-64-v3 | 677 | 0 | 0 | 100% | 17 |
 | x86-64-v4 | 535 | 101 | 167 | 76% | 591 |
 | x87 | 141 | 0 | 13 | 92% | 6 |
@@ -34,7 +34,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | mmx | 58 | 0 | 0 | 100% | 0 |
 | optional | 13 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 583 | 0 | 103 | 85% | 228 |
-| x86-64-v2 | 94 | 0 | 9 | 91% | 0 |
+| x86-64-v2 | 103 | 0 | 0 | 100% | 0 |
 | x86-64-v3 | 638 | 0 | 0 | 100% | 17 |
 | x86-64-v4 | 511 | 101 | 167 | 75% | 588 |
 | x87 | 141 | 0 | 13 | 92% | 11 |
@@ -148,19 +148,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Verw_r64m16`
 - `Verw_rm16`
 - `Wbinvd`
-
-## long64 x86-64-v2 — missing (10)
-
-- `Extractps_r64m32_xmm_imm8`
-- `Extractps_rm32_xmm_imm8`
-- `Pabsb_xmm_xmmm128`
-- `Pabsd_xmm_xmmm128`
-- `Pabsw_xmm_xmmm128`
-- `Packusdw_xmm_xmmm128`
-- `Pmaxsb_xmm_xmmm128`
-- `Pmaxuw_xmm_xmmm128`
-- `Pminsb_xmm_xmmm128`
-- `Pminuw_xmm_xmmm128`
 
 ## long64 x86-64-v4 — missing (167)
 
@@ -453,18 +440,6 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 - `Verw_r32m16`
 - `Verw_rm16`
 - `Wbinvd`
-
-## compat32 x86-64-v2 — missing (9)
-
-- `Extractps_rm32_xmm_imm8`
-- `Pabsb_xmm_xmmm128`
-- `Pabsd_xmm_xmmm128`
-- `Pabsw_xmm_xmmm128`
-- `Packusdw_xmm_xmmm128`
-- `Pmaxsb_xmm_xmmm128`
-- `Pmaxuw_xmm_xmmm128`
-- `Pminsb_xmm_xmmm128`
-- `Pminuw_xmm_xmmm128`
 
 ## compat32 x86-64-v4 — missing (167)
 

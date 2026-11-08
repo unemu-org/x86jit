@@ -1771,6 +1771,41 @@ pub(crate) fn lift_vpmovx(
     Ok(())
 }
 
+/// Legacy packed absolute value using the shared signed-lane primitive.
+pub(crate) fn lift_pabs(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    lane: u8,
+) -> Result<(), LiftError> {
+    let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
+    let src = match reg_xmm(insn, 1) {
+        Some(src) => src,
+        None if insn.op_kind(1) == OpKind::Memory => {
+            let addr = legacy_sse_memory(insn, ops, tg)?;
+            ops.push(IrOp::VLoad {
+                fault: Default::default(),
+                dst,
+                addr,
+                size: 16,
+            });
+            dst
+        }
+        None => return Err(unsupported_insn(insn)),
+    };
+    // SDM Vol 2B §4.3, PABSB/PABSW/PABSD/PABSQ and PSIGNB/PSIGNW/PSIGND:
+    // applying a lane's own sign computes its unsigned absolute value, including
+    // signed MIN. VPsign preserves bits above 127, as the legacy encoding requires.
+    ops.push(IrOp::VPsign {
+        dst,
+        a: src,
+        b: src,
+        lane,
+        bytes: 16,
+    });
+    Ok(())
+}
+
 /// Packed absolute value `vpabs{b,w,d,q}` (VEX/EVEX): `dst = |src|` per `elem`-byte lane, any
 /// width, masked/zeroing. VEX accepts register or memory sources; `vec_operand` gives the dest
 /// width (= VL), above which EVEX zeroes.
@@ -3596,13 +3631,14 @@ pub(crate) fn lift_packuswb(
     Ok(())
 }
 
-/// Legacy SSE2 signed pack `packsswb`/`packssdw`: 2-operand (dst == src1), register src2.
+/// Legacy saturating pack: 2-operand (dst == src1), register or memory src2.
 /// Reuses the shared `VPackWide` saturating-pack helper (jit == interp).
-pub(crate) fn lift_pack_signed(
+pub(crate) fn lift_pack(
     insn: &Instruction,
     ops: &mut Vec<IrOp>,
     tg: &mut TempGen,
     from_elem: u8,
+    signed: bool,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
     // In-place SSE form (`dst == a`); `VPackWide{M}` reads `a`=dst before writing dst.
@@ -3617,7 +3653,7 @@ pub(crate) fn lift_pack_signed(
             a: d,
             b,
             from_elem,
-            signed: true,
+            signed,
             bytes: 16,
         }),
         |addr| ops.push(IrOp::VPackWideM {
@@ -3627,7 +3663,7 @@ pub(crate) fn lift_pack_signed(
             a: d,
             addr,
             from_elem,
-            signed: true,
+            signed,
         })
     );
     Ok(())

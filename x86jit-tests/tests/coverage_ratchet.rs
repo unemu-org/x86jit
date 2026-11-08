@@ -1097,6 +1097,16 @@ const ALLOWLIST: &[&str] = &[
     "Xchg",
     "Xorpd",
     "Xorps",
+    // legacy_sse_integer.rs: literal witnesses, interpreter/JIT block/region,
+    // Unicorn/native differential cases, upper preservation and precise memory faults.
+    "Packusdw",
+    "Pminsb",
+    "Pminuw",
+    "Pmaxsb",
+    "Pmaxuw",
+    "Extractps",
+    // Pabsb/Pabsw/Pabsd also have legacy XMM coverage in that module; the
+    // mnemonic-level ratchet already credits their MMX fuzzer entries.
     // VEX packed-int sweep + SSSE3 pmulhrsw/pmaddubsw — covered by the
     // hand-written jit==interp test avx2_packed_int_sweep_match_interp (jit.rs) and the
     // native-oracle native_packed_int_sweep_matches_interp (native.rs), which exercise

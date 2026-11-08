@@ -525,7 +525,17 @@ pub(crate) fn exec_store<const ROUTED: bool>(
         if t == MemTrap::Mmio && cpu.pending_mmio_write {
             cpu.pending_mmio_write = false;
         } else {
-            return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Write, v));
+            // §16; SDM Vol 3A §7.5: a store crossing a mapping boundary reports the first
+            // unavailable byte after the whole transfer has failed atomically.
+            let at = if t == MemTrap::Unmapped {
+                (0..*size)
+                    .map(|i| a.wrapping_add(u64::from(i)))
+                    .find(|&at| matches!(mem.probe_write(at, 1), Err(MemTrap::Unmapped)))
+                    .unwrap_or(a)
+            } else {
+                a
+            };
+            return Some(trap_out(cpu, cur_addr, t, at, *size, AccessKind::Write, v));
         }
     }
     None

@@ -2668,8 +2668,10 @@ fn lift_insn_inner(
         Vunpckhpd => lift_vunpack_avx(insn, ops, tg, 8, true).map(|_| false),
         Packuswb => lift_packuswb(insn, ops, tg).map(|_| false),
         // Legacy SSE2 signed packs + pmaddwd.
-        Packsswb => lift_pack_signed(insn, ops, tg, 2).map(|_| false),
-        Packssdw => lift_pack_signed(insn, ops, tg, 4).map(|_| false),
+        Packsswb => lift_pack(insn, ops, tg, 2, true).map(|_| false),
+        Packssdw => lift_pack(insn, ops, tg, 4, true).map(|_| false),
+        // SDM Vol 2B §4.3, PACKUSDW: signed dwords to unsigned saturated words.
+        Packusdw => lift_pack(insn, ops, tg, 4, false).map(|_| false),
         Pmaddwd => lift_pmaddwd(insn, ops, tg).map(|_| false),
         // VEX/EVEX saturating pack `vpack{ss,us}{wb,dw}`: python3 hits vpackusdw.
         // Register src (any width) or a 128-bit memory src2. VEX upper-zeroing is
@@ -2685,7 +2687,8 @@ fn lift_insn_inner(
         // (imm8[1:0]) from the xmm source to a GPR32 (upper 32 bits zeroed) or a
         // dword in memory — semantically identical to vpextrd's 32-bit lane
         // extract, so it shares the same `VExtractLane { size: 4 }` path.
-        Pextrd | Vpextrd | Vextractps => lift_pextr(insn, ops, tg, 4).map(|_| false),
+        // SDM Vol 2A §3.3, EXTRACTPS: the same raw dword extraction and GPR zero-extension.
+        Pextrd | Vpextrd | Extractps | Vextractps => lift_pextr(insn, ops, tg, 4).map(|_| false),
         Pextrq | Vpextrq => lift_pextr(insn, ops, tg, 8).map(|_| false),
         // pinsrb/d/q + VEX vpinsr{b,w,d,q}.
         Pinsrb | Vpinsrb => lift_pinsr(insn, ops, tg, 1).map(|_| false),
@@ -3035,6 +3038,12 @@ fn lift_insn_inner(
         Vpminsb => lift_vpacked_bin_avx(insn, ops, tg, 1, PackedBinOp::MinS).map(|_| false),
         Vpminsw => lift_vpacked_bin_avx(insn, ops, tg, 2, PackedBinOp::MinS).map(|_| false),
         Vpminuw => lift_vpacked_bin_avx(insn, ops, tg, 2, PackedBinOp::MinU).map(|_| false),
+        // SDM Vol 2B §4.3, PMINSB/PMINSW, PMINUB/PMINUW,
+        // PMAXSB/PMAXSW/PMAXSD/PMAXSQ, PMAXUB/PMAXUW: legacy in-place forms.
+        Pminsb => lift_vpacked_bin(insn, ops, tg, 1, PackedBinOp::MinS).map(|_| false),
+        Pminuw => lift_vpacked_bin(insn, ops, tg, 2, PackedBinOp::MinU).map(|_| false),
+        Pmaxsb => lift_vpacked_bin(insn, ops, tg, 1, PackedBinOp::MaxS).map(|_| false),
+        Pmaxuw => lift_vpacked_bin(insn, ops, tg, 2, PackedBinOp::MaxU).map(|_| false),
         // SSSE3 rounded-high multiply `pmulhrsw`/`vpmulhrsw`: per signed word,
         // bits [16:1] of the product, rounded. New PackedBinOp primitive; SSE + VEX.
         Pmulhrsw => lift_vpacked_bin(insn, ops, tg, 2, PackedBinOp::MulHiRoundedS16).map(|_| false),
@@ -3050,6 +3059,9 @@ fn lift_insn_inner(
         // SSSE3 legacy `pmaddubsw`: the SSE 2-operand form (dst == src1).
         Pmaddubsw => lift_pmaddubsw(insn, ops, tg).map(|_| false),
         // Packed absolute value `vpabs{b,w,d,q}` (VEX/EVEX): any width, masked.
+        Pabsb => lift_pabs(insn, ops, tg, 1).map(|_| false),
+        Pabsw => lift_pabs(insn, ops, tg, 2).map(|_| false),
+        Pabsd => lift_pabs(insn, ops, tg, 4).map(|_| false),
         Vpabsb => lift_vpabs(insn, ops, tg, 1).map(|_| false),
         Vpabsw => lift_vpabs(insn, ops, tg, 2).map(|_| false),
         Vpabsd => lift_vpabs(insn, ops, tg, 4).map(|_| false),

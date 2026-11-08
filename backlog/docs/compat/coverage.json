@@ -133,21 +133,10 @@
       "missing_mem_form": []
     },
     "x86-64-v2": {
-      "lifted": 107,
-      "unsupported": 10,
+      "lifted": 117,
+      "unsupported": 0,
       "unencodable": 0,
-      "missing": [
-        "Extractps_r64m32_xmm_imm8",
-        "Extractps_rm32_xmm_imm8",
-        "Pabsb_xmm_xmmm128",
-        "Pabsd_xmm_xmmm128",
-        "Pabsw_xmm_xmmm128",
-        "Packusdw_xmm_xmmm128",
-        "Pmaxsb_xmm_xmmm128",
-        "Pmaxuw_xmm_xmmm128",
-        "Pminsb_xmm_xmmm128",
-        "Pminuw_xmm_xmmm128"
-      ],
+      "missing": [],
       "reg_only": 0,
       "missing_mem_form": []
     },
@@ -590,20 +579,10 @@
       "missing_mem_form": []
     },
     "x86-64-v2": {
-      "lifted": 94,
-      "unsupported": 9,
+      "lifted": 103,
+      "unsupported": 0,
       "unencodable": 0,
-      "missing": [
-        "Extractps_rm32_xmm_imm8",
-        "Pabsb_xmm_xmmm128",
-        "Pabsd_xmm_xmmm128",
-        "Pabsw_xmm_xmmm128",
-        "Packusdw_xmm_xmmm128",
-        "Pmaxsb_xmm_xmmm128",
-        "Pmaxuw_xmm_xmmm128",
-        "Pminsb_xmm_xmmm128",
-        "Pminuw_xmm_xmmm128"
-      ],
+      "missing": [],
       "reg_only": 0,
       "missing_mem_form": []
     },
