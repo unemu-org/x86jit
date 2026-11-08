@@ -1,5 +1,29 @@
 //! Return-based exit reasons and the backend execution result (§5.2, §8).
 
+/// Owned execution identity for a non-fault exit (§5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionEvidence {
+    path: crate::FaultPath,
+    rip: u64,
+}
+
+impl ExecutionEvidence {
+    /// Execution unit that produced the exit. Compiled paths use the function
+    /// entry as their code-map key; a site is supplied only for an exact match.
+    pub const fn path(&self) -> crate::FaultPath {
+        self.path
+    }
+
+    /// Guest instruction RIP for a syscall; resume RIP for an interruption.
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    pub(crate) const fn new(path: crate::FaultPath, rip: u64) -> Self {
+        Self { path, rip }
+    }
+}
+
 /// Direction of a memory access that could not complete inline.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AccessKind {
@@ -112,6 +136,8 @@ pub enum PortDir {
 #[non_exhaustive]
 pub enum Exit {
     /// Guest executed syscall/sysenter/int 0x80. Args are in guest registers.
+    /// Execution identity and instruction RIP are available through
+    /// [`crate::Vcpu::syscall_evidence`] until the next `run`.
     Syscall,
     /// Guest executed `hlt`.
     Hlt,

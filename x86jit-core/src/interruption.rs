@@ -37,9 +37,8 @@ const ACTIVE_MASK: u64 = KIND_MASK << ACTIVE_SHIFT;
 pub struct InterruptionEvidence {
     kinds: u8,
     count: u64,
-    path: crate::FaultPath,
+    execution: crate::ExecutionEvidence,
     chain_link: bool,
-    rip: u64,
 }
 
 impl Default for InterruptionEvidence {
@@ -47,9 +46,8 @@ impl Default for InterruptionEvidence {
         Self {
             kinds: 0,
             count: 0,
-            path: crate::FaultPath::Unknown,
+            execution: crate::ExecutionEvidence::new(crate::FaultPath::Unknown, 0),
             chain_link: false,
-            rip: 0,
         }
     }
 }
@@ -62,7 +60,7 @@ impl InterruptionEvidence {
     /// boundaries use the function entry as their code-map key; a site is
     /// supplied only if that key has an exact code-map site.
     pub const fn path(&self) -> crate::FaultPath {
-        self.path
+        self.execution.path()
     }
 
     /// Whether the checked boundary followed a resolved direct chain link,
@@ -74,13 +72,12 @@ impl InterruptionEvidence {
 
     /// Architectural resume point, equal to the vCPU's RIP at this exit.
     pub const fn rip(&self) -> u64 {
-        self.rip
+        self.execution.rip()
     }
 
     pub(crate) fn at(mut self, path: crate::FaultPath, chain_link: bool, rip: u64) -> Self {
-        self.path = path;
+        self.execution = crate::ExecutionEvidence::new(path, rip);
         self.chain_link = chain_link;
-        self.rip = rip;
         self
     }
 

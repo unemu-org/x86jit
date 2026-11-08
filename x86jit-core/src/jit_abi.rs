@@ -24,6 +24,7 @@ pub type CompiledFn = unsafe extern "C" fn(cpu: *mut u8, mem: *mut u8) -> u64;
 
 // --- return codes (§8.2.2). RIP is always written by the block. ---
 pub const RET_CONTINUE: u64 = 0;
+/// Syscall exit; [`MemCtx::next_entry`] contains the guest instruction RIP.
 pub const RET_SYSCALL: u64 = 1;
 pub const RET_HLT: u64 = 2;
 pub const RET_UNMAPPED: u64 = 3;
@@ -98,7 +99,7 @@ pub struct MemCtx {
     /// Inline cold misses may encode a decoded carrier width in bits 8..23 and
     /// the original transfer width in bits 24..31 (embedded broadcast, xj-au4.2).
     pub fault_access: u64,
-    /// Out: next block entry pointer, set on `RET_CHAIN`.
+    /// Out: next block entry pointer on `RET_CHAIN`; instruction RIP on `RET_SYSCALL`.
     pub next_entry: u64,
     /// Out: address of the link slot to fill, set on `RET_LINK`.
     pub link_slot: u64,

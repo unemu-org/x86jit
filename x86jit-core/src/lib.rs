@@ -89,7 +89,7 @@ pub mod x87;
 pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 pub use codemap::{GuestAccessKind, GuestTrapSite};
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
-pub use exit::{AccessKind, Exit, PortDir, StepResult};
+pub use exit::{AccessKind, ExecutionEvidence, Exit, PortDir, StepResult};
 pub use fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,
     FaultHelper, FaultMetadata, FaultOrigin, FaultPath, FaultProgress, HelperCaller,

@@ -1162,6 +1162,7 @@ impl Vm {
             cpu,
             exit_request: ExitRequest { word },
             interruption_evidence: None,
+            syscall_evidence: None,
             engine_sections: AtomicU64::new(0),
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             fast: Box::new(
@@ -1261,6 +1262,7 @@ pub struct Vcpu {
     pub cpu: CpuState,
     exit_request: ExitRequest,
     interruption_evidence: Option<crate::InterruptionEvidence>,
+    syscall_evidence: Option<crate::ExecutionEvidence>,
     engine_sections: AtomicU64,
     code_space_reported: bool,
     /// Decode/lift mode (§17.3), inherited from the `Vm`: threaded into every
@@ -1352,6 +1354,15 @@ impl Vcpu {
     /// still-pending request survives unrelated exits internally.
     pub fn interruption_evidence(&self) -> Option<crate::InterruptionEvidence> {
         self.interruption_evidence
+    }
+
+    /// Evidence for the [`Exit::Syscall`] returned by the most recent [`Self::run`].
+    /// The RIP identifies the syscall instruction, while `cpu.rip` points past it.
+    /// `None` before the first run or after any other exit. Cleared as soon as
+    /// the next `run` is entered, even if it unwinds; the copy can be retained.
+    /// Chain-link evidence is not collected for syscalls.
+    pub fn syscall_evidence(&self) -> Option<crate::ExecutionEvidence> {
+        self.syscall_evidence
     }
 
     /// Fast-resolve cache hits served without a shared-cache lookup.
@@ -1692,6 +1703,7 @@ impl Vcpu {
     /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         self.interruption_evidence = None;
+        self.syscall_evidence = None;
         self.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
@@ -1746,6 +1758,26 @@ impl Vcpu {
     /// `TranslationCache::chained` it gives the average length of a compiled unit.
     pub fn executed_instructions(&self) -> u64 {
         self.executed
+    }
+
+    #[cold]
+    fn syscall(&mut self, path: crate::FaultPath, rip: u64) -> Exit {
+        self.syscall_evidence = Some(crate::ExecutionEvidence::new(path, rip));
+        Exit::Syscall
+    }
+
+    #[cold]
+    fn syscall_interpreted(&mut self, ir: &crate::IrBlock) -> Exit {
+        let rip = ir
+            .ops
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                crate::IrOp::InsnStart { guest_addr } => Some(*guest_addr),
+                _ => None,
+            })
+            .unwrap_or(ir.guest_start);
+        self.syscall(crate::FaultPath::Interpreter, rip)
     }
 
     #[cold]
@@ -1897,6 +1929,7 @@ impl Vcpu {
                 }
                 // Finish the pending instruction before honouring a host request.
                 let mut info = crate::interp::RetireInfo::default();
+                let instruction_rip = self.cpu.rip;
                 let r = crate::interp::step_one_mode::<ROUTED>(
                     &vm.mem,
                     &mut self.cpu,
@@ -1917,6 +1950,9 @@ impl Vcpu {
                             return Ok(self.interrupted(crate::FaultPath::Interpreter, false));
                         }
                         continue;
+                    }
+                    StepResult::Exit(Exit::Syscall) => {
+                        return Ok(self.syscall(crate::FaultPath::Interpreter, instruction_rip));
                     }
                     StepResult::Exit(exit) => {
                         return Ok(crate::fault::qualify_real16(exit, &self.cpu))
@@ -2055,6 +2091,7 @@ impl Vcpu {
                         crate::interp::BlockResult::Exit(exit) => {
                             let exit = exit.into_exit();
                             match exit {
+                                Exit::Syscall => return Ok(self.syscall_interpreted(&ir)),
                                 Exit::Interrupted => {
                                     return Ok(self.interrupted(
                                         crate::FaultPath::Helper {
@@ -2295,7 +2332,14 @@ impl Vcpu {
                                     None => break (cur, code),
                                 }
                             }
-                            RET_SYSCALL => return Ok(Exit::Syscall),
+                            RET_SYSCALL => {
+                                let path = crate::codemap::fault_path(
+                                    cur.0 as usize,
+                                    crate::Knowledge::Known(ctx.next_entry),
+                                    false,
+                                );
+                                return Ok(self.syscall(path, ctx.next_entry));
+                            }
                             RET_HLT => return Ok(Exit::Hlt),
                             RET_UNMAPPED => return Ok(ctx.unmapped_exit(&self.cpu, self.mode)),
                             RET_UNMAPPED_DETAIL => {
@@ -2378,6 +2422,7 @@ impl Vcpu {
                                 } else {
                                     None
                                 };
+                                let instruction_rip = self.cpu.rip;
                                 let r = crate::interp::step_one_mode::<ROUTED>(
                                     &vm.mem,
                                     &mut self.cpu,
@@ -2394,6 +2439,12 @@ impl Vcpu {
                                             return Err(blocks_run);
                                         }
                                         break (cur, code);
+                                    }
+                                    StepResult::Exit(Exit::Syscall) => {
+                                        return Ok(self.syscall(
+                                            crate::FaultPath::Interpreter,
+                                            instruction_rip,
+                                        ));
                                     }
                                     StepResult::Exit(Exit::Interrupted) => {
                                         return Ok(self.interrupted(
@@ -2436,6 +2487,7 @@ impl Vcpu {
                                     trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()
                                 };
+                                let instruction_rip = self.cpu.rip;
                                 let r = crate::interp::step_one_mode::<ROUTED>(
                                     &vm.mem,
                                     &mut self.cpu,
@@ -2446,6 +2498,12 @@ impl Vcpu {
                                 self.retired += info.retired;
                                 match r {
                                     StepResult::Continue => break (cur, code),
+                                    StepResult::Exit(Exit::Syscall) => {
+                                        return Ok(self.syscall(
+                                            crate::FaultPath::Interpreter,
+                                            instruction_rip,
+                                        ));
+                                    }
                                     StepResult::Exit(exit) => return Ok(exit),
                                 }
                             }

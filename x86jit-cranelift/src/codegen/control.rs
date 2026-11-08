@@ -150,6 +150,8 @@ impl Translator<'_, '_> {
             self.write_gpr(R11, rflags, 8);
         }
         self.store_cpu(self.offsets.rip, end);
+        let rip = self.iconst(self.cur_addr);
+        self.store_mem(MEMCTX_NEXT_ENTRY, rip);
         self.ret(RET_SYSCALL);
         true
     }
