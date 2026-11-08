@@ -122,6 +122,123 @@ pub enum Probe {
 
 const SCRATCH_BASE: u64 = 0x1000;
 
+/// Re-decoded EVEX modifier probes, including extensions outside the coverage map.
+/// Every successful encoding is checked for the requested mask/broadcast bits.
+pub fn evex_modifier_forms() -> Vec<Instruction> {
+    use iced_x86::{Decoder, DecoderOptions, EncodingKind};
+    let mut forms = Vec::new();
+    for code in Code::values() {
+        let info = code.op_code();
+        if info.encoding() != EncodingKind::EVEX || !info.mode64() {
+            continue;
+        }
+        for memory in [false, true] {
+            for broadcast in [false, true] {
+                for masked in [false, true] {
+                    for zero in [false, true] {
+                        if (!broadcast && !masked)
+                            || (broadcast && (!memory || !info.can_broadcast()))
+                            || (masked && !info.can_use_op_mask_register())
+                            || (zero && (!masked || !info.can_use_zeroing_masking()))
+                        {
+                            continue;
+                        }
+                        let mut i = Instruction::default();
+                        i.set_code(code);
+                        let mut valid = true;
+                        let mut has_memory = false;
+                        for op in 0..info.op_count() {
+                            let kind = info.op_kind(op);
+                            use OpCodeOperandKind::*;
+                            if memory && matches!(kind, xmm_or_mem | ymm_or_mem | zmm_or_mem) {
+                                i.set_op_kind(op, OpKind::Memory);
+                                i.set_memory_base(Register::RAX);
+                                has_memory = true;
+                            } else if memory
+                                && matches!(
+                                    kind,
+                                    mem_vsib32x
+                                        | mem_vsib32y
+                                        | mem_vsib32z
+                                        | mem_vsib64x
+                                        | mem_vsib64y
+                                        | mem_vsib64z
+                                )
+                            {
+                                i.set_op_kind(op, OpKind::Memory);
+                                i.set_memory_base(Register::RAX);
+                                i.set_memory_index(match kind {
+                                    mem_vsib32x | mem_vsib64x => Register::XMM4,
+                                    mem_vsib32y | mem_vsib64y => Register::YMM4,
+                                    _ => Register::ZMM4,
+                                });
+                                has_memory = true;
+                            } else if kind == zmmp3_vvvv {
+                                i.set_op_register(op, Register::ZMM4);
+                            } else if matches!(kind, zmm_reg | zmm_rm | zmm_vvvv | zmm_or_mem) {
+                                i.set_op_register(
+                                    op,
+                                    Register::try_from(Register::ZMM0 as usize + op as usize)
+                                        .unwrap(),
+                                );
+                            } else if matches!(kind, k_reg | kp1_reg | k_rm | k_vvvv | k_or_mem) {
+                                i.set_op_register(
+                                    op,
+                                    Register::try_from(Register::K2 as usize + op as usize)
+                                        .unwrap(),
+                                );
+                            } else if template_operand(&mut i, op, kind, CpuMode::Long64, false)
+                                .is_err()
+                            {
+                                valid = false;
+                            }
+                        }
+                        has_memory |=
+                            (0..info.op_count()).any(|op| i.op_kind(op) == OpKind::Memory);
+                        if !valid || memory != has_memory {
+                            continue;
+                        }
+                        i.set_is_broadcast(broadcast);
+                        i.set_op_mask(if masked { Register::K1 } else { Register::None });
+                        i.set_zeroing_masking(zero);
+                        let mut encoder = Encoder::new(64);
+                        if encoder.encode(&i, SCRATCH_BASE).is_err() {
+                            continue;
+                        }
+                        let bytes = encoder.take_buffer();
+                        let decoded =
+                            Decoder::with_ip(64, &bytes, SCRATCH_BASE, DecoderOptions::NONE)
+                                .decode();
+                        if decoded.is_invalid() {
+                            continue;
+                        }
+                        assert_eq!(decoded.code(), code);
+                        assert_eq!(decoded.is_broadcast(), broadcast);
+                        assert_eq!(decoded.op_mask(), i.op_mask());
+                        assert_eq!(decoded.zeroing_masking(), zero);
+                        forms.push(decoded);
+                    }
+                }
+            }
+        }
+    }
+    forms
+}
+
+/// Mnemonics executed by the EVEX modifier differential campaign.
+pub fn evex_lifted_modifier_mnemonics() -> BTreeSet<String> {
+    evex_modifier_forms()
+        .into_iter()
+        .filter_map(|i| {
+            let mut encoder = Encoder::new(64);
+            encoder.encode(&i, SCRATCH_BASE).ok()?;
+            (probe_encoded(i.code(), &encoder.take_buffer(), CpuMode::Long64)
+                == Some(Probe::Lifted))
+            .then(|| format!("{:?}", i.mnemonic()))
+        })
+        .collect()
+}
+
 /// Synthesize + encode a canonical instance of `code`, lift it in 64-bit long mode,
 /// and classify. Returns `None` if the code is out of scope or invalid in the mode.
 pub fn probe_code(code: Code) -> Option<Probe> {
@@ -555,6 +672,7 @@ impl Coverage {
              caveat is `unencodable`: operand shapes this probe still cannot \
              synthesize are neither covered nor counted against coverage.\n\n",
         );
+        s.push_str("> **EVEX modifiers are probed separately.** These totals use canonical unmasked, non-broadcast operands. They do not claim support for `{k}`, `{z}`, or `{1toN}`. The `evex_modifiers` tests encode and re-decode those modifiers, sweep all EVEX opcode templates, and compare supported forms across execution tiers.\n\n");
         s.push_str("# ISA compatibility coverage\n\n");
         s.push_str(
             "**Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit \

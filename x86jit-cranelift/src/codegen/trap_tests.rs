@@ -162,6 +162,7 @@ fn compile_ir_for_isa_with_split_stores(
     let mut helpers = Helpers::all_dummy(&mut || (dummy, 0, 0), (watch, 0, 0));
     helpers.precise_split_stores = precise;
     helpers.cpuid = (builder.import_signature(sig(1, true)), 0, 0);
+    helpers.vmaskmov_mem = (builder.import_signature(sig(11, true)), 0, 0);
     let offsets = cpu_offsets();
     let rips = if region {
         translate_region(
@@ -347,9 +348,9 @@ fn guest_trap_sites_cover_access_shapes() {
         (&[0x0f, 0x17, 0x07, 0xf4], 1),
         (&[0x0f, 0x12, 0x07, 0xf4], 1),
         (&[0x0f, 0x13, 0x07, 0xf4], 1),
-        // Opmask compare/test memory sources with a writemask.
-        (&[0x62, 0xf3, 0x7d, 0x0a, 0x1f, 0x0f, 6, 0xf4], lane_sites),
-        (&[0x62, 0xf2, 0x7e, 0x0a, 0x26, 0x0f, 0xf4], lane_sites),
+        // Unmasked opmask compare/test sources use inline memory loads.
+        (&[0x62, 0xf3, 0x7d, 0x08, 0x1f, 0x0f, 6, 0xf4], lane_sites),
+        (&[0x62, 0xf2, 0x7e, 0x08, 0x26, 0x0f, 0xf4], lane_sites),
         // Repeated reads of an identical address.
         (&[0x48, 0x8b, 0x07, 0x48, 0x8b, 0x1f, 0xf4], 1),
         // Scalar FP loads, and an inline packed VEX memory operand.
@@ -367,6 +368,19 @@ fn guest_trap_sites_cover_access_shapes() {
                 {
                     missing.push((bytes, region, target));
                 }
+            }
+            // Masked sources use the fault-reporting memory helper, whose
+            // accesses have no inline guest trap sites in the compiled caller.
+            for bytes in [
+                &[0x62, 0xf3, 0x7d, 0x0a, 0x1f, 0x0f, 6, 0xf4][..],
+                &[0x62, 0xf2, 0x7e, 0x0a, 0x26, 0x0f, 0xf4],
+            ] {
+                assert!(high_block(bytes)
+                    .ops
+                    .iter()
+                    .any(|op| { matches!(op, IrOp::VMaskLoadMem { k: 2, .. }) }));
+                let (_, _, access_count) = compile(bytes, region, target);
+                assert_eq!(access_count, 0);
             }
         }
     }

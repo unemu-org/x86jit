@@ -1,6 +1,15 @@
 use super::*;
 
 impl Translator<'_, '_> {
+    pub(crate) fn vector_chunk_offset(&self, reg: u8, chunk: u8) -> i32 {
+        let base = match chunk / 2 {
+            0 => self.offsets.xmm(reg as usize),
+            1 => self.offsets.ymm_hi(reg as usize),
+            n => self.offsets.zmm_hi(reg as usize, n as usize - 2),
+        };
+        base + i32::from(chunk % 2) * 8
+    }
+
     fn load_vector_operand(&mut self, addr: Val, bytes: u16) -> Vec<Value> {
         let base = self.val(addr);
         let host = self.checked_addr(base, bytes as u8, 0);
@@ -123,6 +132,7 @@ impl Translator<'_, '_> {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_v_mask_load_mem(
         &mut self,
         dst: &u8,
@@ -131,6 +141,7 @@ impl Translator<'_, '_> {
         elem: &u8,
         zeroing: &bool,
         bytes: &u16,
+        broadcast: &Option<u8>,
     ) -> bool {
         // Masked memory move via the shared, fault-capable helper: element-wise so
         // masked-off lanes never fault, guaranteeing jit == interp. The helper writes
@@ -139,18 +150,31 @@ impl Translator<'_, '_> {
         let cpu = self.cpu;
         let mem = self.mem;
         let base = self.val(*addr);
-        self.defer_mmio(base, *bytes as u8);
+        self.defer_mmio(base, broadcast.unwrap_or(*bytes as u8));
         let reg = self.iconst(*dst as u64);
         let kk = self.iconst(*k as u64);
         let el = self.iconst(*elem as u64);
         let z = self.iconst(*zeroing as u64);
         let by = self.iconst(*bytes as u64);
         let is_store = self.iconst(0);
+        let broadcast_elem = self.iconst(u64::from(broadcast.unwrap_or(0)));
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs(); // helper's fault path reads the committed CpuState
         let inst = self.call_memory_helper(
             self.helpers.vmaskmov_mem,
-            &[cpu, mem, reg, base, kk, el, z, by, is_store, cur],
+            &[
+                cpu,
+                mem,
+                reg,
+                base,
+                kk,
+                el,
+                z,
+                by,
+                is_store,
+                cur,
+                broadcast_elem,
+            ],
             Some(GuestAccessKind::Read),
         );
         self.trap_if_unmapped(inst);
@@ -175,11 +199,24 @@ impl Translator<'_, '_> {
         let z = self.iconst(0);
         let by = self.iconst(*bytes as u64);
         let is_store = self.iconst(1);
+        let broadcast_elem = self.iconst(0);
         let cur = self.iconst(self.cur_addr);
         self.flush_gprs();
         let inst = self.call_memory_helper(
             self.helpers.vmaskmov_mem,
-            &[cpu, mem, reg, base, kk, el, z, by, is_store, cur],
+            &[
+                cpu,
+                mem,
+                reg,
+                base,
+                kk,
+                el,
+                z,
+                by,
+                is_store,
+                cur,
+                broadcast_elem,
+            ],
             Some(GuestAccessKind::Write),
         );
         self.trap_if_unmapped(inst);

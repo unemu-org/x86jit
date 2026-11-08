@@ -30,13 +30,13 @@
 //! on a host without AVX-512 → `SIGILL`) likewise degrades to `None`, so the caller
 //! simply skips that input rather than seeing a bogus divergence.
 //!
-//! Captures GPRs, RIP, RFLAGS, the 16 XMM registers, and — read from the extended XSAVE
-//! area of the signal frame — the YMM upper halves (AVX host) plus the ZMM upper
-//! halves (bits 511:256) and opmask `k` registers (AVX-512 host). The
+//! Captures GPRs, RIP, RFLAGS, XMM0–15, and — read from the extended XSAVE
+//! area of the signal frame — the YMM upper halves (AVX host), ZMM0–15 upper
+//! halves (bits 511:256), all of ZMM16–31, and opmask `k` registers (AVX-512 host;
+//! SDM Vol 1 §13.5.5). The
 //! stub first clears the corresponding registers (`vzeroall`, or `vpxorq zmm`/`kxorq` on
 //! AVX-512) so an untouched register/mask reads back zero — matching the interpreter's
-//! zero-init, not the child's inherited-dirty state. Registers 0–15 only (the snapshot
-//! width); `zmm16-31` are not captured.
+//! zero-init, not the child's inherited-dirty state.
 
 use iced_x86::code_asm::*;
 

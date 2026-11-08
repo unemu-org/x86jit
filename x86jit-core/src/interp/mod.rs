@@ -937,6 +937,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::VMaskLoadMem {
+                broadcast,
                 fault,
                 dst,
                 addr,
@@ -946,14 +947,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 bytes,
             } => {
                 if let Some(r) = exec_v_mask_load_mem(
-                    cpu, mem, temps, *cur_addr, dst, addr, k, elem, zeroing, bytes,
+                    cpu, mem, temps, *cur_addr, dst, addr, k, elem, zeroing, bytes, broadcast,
                 ) {
                     return walk_classify_masked_access(
                         r,
                         *cur_addr,
                         read_val(*addr, temps),
                         *fault,
-                        *elem,
+                        broadcast.unwrap_or(*elem),
                         fault_k_mask(cpu, *k),
                     );
                 }
@@ -1602,6 +1603,18 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 if let Some(r) = exec_v_from_gpr(cpu, temps, dst, src, size) {
                     return r.into();
                 }
+            }
+            IrOp::VReadChunk { dst, src, chunk } => {
+                temps[*dst as usize] = (cpu.vec_lanes(*src as usize)[*chunk as usize / 2]
+                    >> ((*chunk % 2) * 64)) as u64;
+            }
+            IrOp::VWriteChunk { dst, src, chunk } => {
+                let mut lanes = cpu.vec_lanes(*dst as usize);
+                let shift = (*chunk % 2) * 64;
+                let mask = (u64::MAX as u128) << shift;
+                lanes[*chunk as usize / 2] = (lanes[*chunk as usize / 2] & !mask)
+                    | ((read_val(*src, temps) as u128) << shift);
+                cpu.set_vec(*dst as usize, lanes, 64);
             }
             IrOp::VToGpr { dst, src, size } => {
                 if let Some(r) = exec_v_to_gpr(cpu, temps, dst, src, size) {
@@ -5076,7 +5089,12 @@ pub fn exec_vp_blendm(
     let n = dst_width as usize / elem as usize;
     let av = cpu.vec_lanes(a as usize);
     let bv = cpu.vec_lanes(b as usize);
-    let kmask = cpu.kmask[k as usize];
+    // SDM Vol 1 §15.6.1.1: encoded k0 selects the implicit all-ones mask.
+    let kmask = if k == 0 {
+        u64::MAX
+    } else {
+        cpu.kmask[k as usize]
+    };
     let mut res = [0u128; 4];
     for i in 0..n {
         let out = if (kmask >> i) & 1 != 0 {
@@ -6676,7 +6694,11 @@ fn fault_vec_mask(cpu: &CpuState, reg: u8, elem: u8, bytes: u16) -> u64 {
 #[cold]
 #[inline(never)]
 fn fault_k_mask(cpu: &CpuState, reg: u8) -> u64 {
-    cpu.kmask[reg as usize]
+    if reg == 0 {
+        u64::MAX
+    } else {
+        cpu.kmask[reg as usize]
+    }
 }
 
 #[cold]
@@ -6690,7 +6712,7 @@ fn classify_masked_access(
     mask: u64,
 ) -> InterpResult {
     // A broadcast carrier is one element regardless of the selected output lane
-    // (SDM Vol 2A §2.7.7); xj-au4.2 owns its existing transfer/value bug.
+    // (SDM Vol 2A §2.7.7).
     let (operand, width) = if fault.bytes() == u16::from(elem) {
         (base, u64::from(fault.bytes()))
     } else {
@@ -7501,6 +7523,38 @@ pub fn masked_load_run<M: StrMem>(
         } else if zeroing {
             set_velem(&mut lanes, i, elem, 0);
         }
+    }
+    cpu.set_vec(dst as usize, lanes, bytes);
+    None
+}
+
+/// SDM Vol 2 §2.7.7, Vol 1 §15.6.1: one broadcast element is read if
+/// any participating mask bit is set; otherwise the memory access is suppressed.
+#[allow(clippy::too_many_arguments)]
+pub fn masked_broadcast_load_run<M: StrMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    dst: u8,
+    base: u64,
+    k: u64,
+    elem: u8,
+    bytes: u16,
+    broadcast_elem: u8,
+    cur_addr: u64,
+) -> Option<StrFault> {
+    let count = bytes / u16::from(elem);
+    let active = k & (u64::MAX >> (64 - count));
+    let value = if active == 0 {
+        0
+    } else {
+        match vpart(cpu, mem, cur_addr, base, broadcast_elem) {
+            Ok(v) => v,
+            Err(f) => return Some(f.into_str_fault(cpu, cur_addr, false)),
+        }
+    };
+    let mut lanes = [0; 4];
+    for i in 0..usize::from(bytes) / usize::from(broadcast_elem) {
+        set_velem(&mut lanes, i, broadcast_elem, value);
     }
     cpu.set_vec(dst as usize, lanes, bytes);
     None

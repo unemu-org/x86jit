@@ -21,6 +21,7 @@ use crate::memory::Memory;
 use crate::state::{iced_gpr_index, Reg};
 
 mod control;
+mod evex;
 mod integer;
 mod vector;
 
@@ -472,6 +473,8 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VMov256 { .. }
             | VFromGpr { .. }
             | VToGpr { .. }
+            | VReadChunk { .. }
+            | VWriteChunk { .. }
             | VLogic { .. }
             | VPackedBin { .. }
             | VPackedShift { .. }
@@ -1729,6 +1732,8 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VMov256 { .. }
         | VFromGpr { .. }
         | VToGpr { .. }
+        | VReadChunk { .. }
+        | VWriteChunk { .. }
         | VLogic { .. }
         | VPackedBin { .. }
         | VPackedBinM { .. }
@@ -2077,7 +2082,11 @@ fn lift_insn(
 ) -> Result<bool, LiftError> {
     sequence.check(insn, ops);
     let start = ops.len();
-    let result = lift_insn_inner(insn, ops, tg, mode, sequence);
+    let result = if insn.is_broadcast() || evex_is_masked(insn) {
+        evex::lift(insn, ops, tg, mode, sequence)
+    } else {
+        lift_insn_inner(insn, ops, tg, mode, sequence)
+    };
     // Exclude our own FWAIT: it checks state without changing it. Every real
     // x87 op (including no-wait controls), FXRSTOR and EMMS ends the sequence.
     sequence.observe(&ops[start..]);
@@ -2731,7 +2740,6 @@ fn lift_insn_inner(
         // --- AVX (VEX.128). Reuse the u128 vector IR (already 3-operand `dst,a,b`); a
         // register destination also clears bits 255:128 of the YMM via `VZeroUpper`.
         // 256-bit/YMM forms fall through to `unsupported` (`reg_xmm` rejects YMM). ---
-        // VEX forms (no EVEX mask) — `elem` is unused on the unmasked path, pass 4.
         // VEX non-temporal moves: a cache-bypass hint is a no-op in our coherent
         // model, so the stores (`vmovntdq`/`vmovntps`/`vmovntpd`, xmm -> [mem]) and the load
         // (`vmovntdqa`, [mem] -> xmm, with VEX.128 upper-zeroing) lower exactly like the
@@ -2742,8 +2750,10 @@ fn lift_insn_inner(
         // helpers lack tier barriers (xj-0w3.7), and a real SFENCE on x86 if
         // host non-temporal stores are introduced (SDM Vol 3A §11.2.2, §11.2.5).
         // VMOVNTDQA is a load (SDM Vol 2B §4.3 MOVNTDQA).
-        Vmovdqa | Vmovdqu | Vlddqu | Vmovaps | Vmovups | Vmovapd | Vmovupd | Vmovntdq
-        | Vmovntps | Vmovntpd | Vmovntdqa => lift_vmov_avx(insn, ops, tg, 4).map(|_| false),
+        Vmovdqa | Vmovdqu | Vlddqu | Vmovaps | Vmovups | Vmovntdq | Vmovntps | Vmovntpd
+        | Vmovntdqa => lift_vmov_avx(insn, ops, tg, 4).map(|_| false),
+        // SDM Vol 2B §4.3, MOVAPD/MOVUPD: EVEX masks select 64-bit elements.
+        Vmovapd | Vmovupd => lift_vmov_avx(insn, ops, tg, 8).map(|_| false),
         // EVEX data movement. The element suffix is the write-mask granularity:
         // 8/16/32/64 → 1/2/4/8 bytes.
         Vmovdqu8 => lift_vmov_avx(insn, ops, tg, 1).map(|_| false),
@@ -4373,8 +4383,8 @@ pub(crate) fn vec_operand_reg(insn: &Instruction, op_idx: u32) -> Option<u8> {
     vec_operand(insn, op_idx).map(|(r, _)| r)
 }
 
-/// True if an EVEX instruction carries a write-mask (k1–k7) or zeroing. Such forms
-/// need per-element predication we don't yet lift — callers reject them for now.
+/// True if an EVEX instruction carries a write-mask (k1–k7) or zeroing.
+/// These forms pass through shared EVEX lowering before mnemonic dispatch.
 pub(crate) fn evex_is_masked(insn: &Instruction) -> bool {
     insn.op_mask() != Register::None || insn.zeroing_masking()
 }

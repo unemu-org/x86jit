@@ -9,6 +9,8 @@ created_date: '2026-07-06 11:25'
 >
 > The remaining caveat is `unencodable`: operand shapes this probe still cannot synthesize are neither covered nor counted against coverage.
 
+> **EVEX modifiers are probed separately.** These totals use canonical unmasked, non-broadcast operands. They do not claim support for `{k}`, `{z}`, or `{1toN}`. The `evex_modifiers` tests encode and re-decode those modifiers, sweep all EVEX opcode templates, and compare supported forms across execution tiers.
+
 # ISA compatibility coverage
 
 **Generated** by `cargo run -p x86jit-tests --bin compat -- --write` — do NOT edit by hand. Measured by probing the real lifter (`x86jit-tests/src/compat.rs`): a canonical instance of every in-scope `iced_x86::Code` is encoded and fed to `lift_block`, per CPU mode. `lifted`/`missing` are of the *encodable* forms; `unencodable` are exotic operand shapes the probe can't synthesize (not counted). Kept honest by the `compat_map_is_current` test. The `optional` bucket groups RDTSCP/RDRAND/RDSEED, SSE4A and ADX, which are not psABI level requirements (psABI §3.1.1, Table 3.1, Micro-Architecture Levels).

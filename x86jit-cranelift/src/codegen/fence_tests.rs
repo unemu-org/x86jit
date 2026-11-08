@@ -50,7 +50,7 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
     for (slot, params) in [
         (&mut helpers.x87, 6),
         (&mut helpers.fxstate, 5),
-        (&mut helpers.vmaskmov_mem, 10),
+        (&mut helpers.vmaskmov_mem, 11),
         (&mut helpers.vec_maskmov_mem, 9),
         (&mut helpers.vpermt2_mem, 12),
         (&mut helpers.vperm1_mem, 11),
@@ -430,6 +430,7 @@ fn guest_memory_helpers_follow_host_and_tier_rule() {
         (
             "masked-load",
             IrOp::VMaskLoadMem {
+                broadcast: None,
                 fault,
                 dst: 0,
                 addr,

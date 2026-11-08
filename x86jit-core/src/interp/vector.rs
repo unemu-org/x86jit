@@ -144,11 +144,21 @@ pub(crate) fn exec_v_mask_load_mem<const ROUTED: bool>(
     elem: &u8,
     zeroing: &bool,
     bytes: &u16,
+    broadcast: &Option<u8>,
 ) -> Option<InterpResult> {
     let base = read_val(*addr, &*temps);
-    let km = cpu.kmask[*k as usize];
-    if let Some(f) = masked_load_run(cpu, mem, *dst, base, km, *elem, *zeroing, *bytes, cur_addr) {
-        return vec_interp_fault(f, base, *bytes);
+    let km = if *k == 0 {
+        u64::MAX
+    } else {
+        cpu.kmask[*k as usize]
+    };
+    let fault = if let Some(width) = broadcast {
+        masked_broadcast_load_run(cpu, mem, *dst, base, km, *elem, *bytes, *width, cur_addr)
+    } else {
+        masked_load_run(cpu, mem, *dst, base, km, *elem, *zeroing, *bytes, cur_addr)
+    };
+    if let Some(f) = fault {
+        return vec_interp_fault(f, base, broadcast.map_or(*bytes, u16::from));
     }
     None
 }

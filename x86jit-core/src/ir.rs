@@ -545,6 +545,18 @@ pub enum IrOp {
         src: u8,
         size: u8,
     },
+    /// Preserve a vector's 64-bit chunk in an SSA temporary during operand lowering.
+    VReadChunk {
+        dst: Temp,
+        src: u8,
+        chunk: u8,
+    },
+    /// Restore a preserved chunk without changing any other part of the vector.
+    VWriteChunk {
+        dst: u8,
+        src: Val,
+        chunk: u8,
+    },
     // Bitwise vector logic: pxor/pand/por/pandn (and the *ps aliases).
     VLogic {
         dst: u8,
@@ -1106,7 +1118,9 @@ pub enum IrOp {
     /// load the low `bytes` of `dst` element-wise from `addr` under opmask `k` at `elem`-byte
     /// granularity — masked-off lanes are zeroed (`zeroing`) or kept (merge) and never touch
     /// memory (hardware fault suppression). glibc's AVX-512 string routines head/tail with
-    /// this. Delegates to the shared `masked_load_run` (JIT == interp, fault-capable).
+    /// this. `k == 0` selects all elements (SDM Vol 1 §15.6.1.1). An optional
+    /// broadcast reads one scalar if any mask bit participates. Shared helpers
+    /// keep interpreter and JIT accesses identical.
     VMaskLoadMem {
         fault: MemoryAccess,
         dst: u8,
@@ -1115,6 +1129,11 @@ pub enum IrOp {
         elem: u8,
         zeroing: bool,
         bytes: u16,
+        /// SDM Vol 2 §2.7.7: stage a replicated source operand from this many bytes.
+        /// The mask only gates the scalar read; all source lanes are filled for
+        /// the computation. Apply its destination mask afterwards. `elem` is the
+        /// destination mask granularity, which can differ from the source width.
+        broadcast: Option<u8>,
     },
     /// EVEX write-masked vector **store** `vmovdqu{8,16,32,64} [mem]{k}, v`:
     /// store the active `k` lanes of `src` to `addr` element-wise (no zeroing form). Inactive

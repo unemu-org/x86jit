@@ -621,6 +621,7 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     bytes: u64,
     is_store: u64,
     cur_addr: u64,
+    broadcast_elem: u64,
 ) -> u64 {
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -633,8 +634,12 @@ unsafe extern "C" fn vmaskmov_mem_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    let km = cpu.kmask[k as usize];
-    let fault = if is_store != 0 {
+    let km = if k == 0 {
+        u64::MAX
+    } else {
+        cpu.kmask[k as usize]
+    };
+    let fault = if is_store == 1 {
         x86jit_core::interp::masked_store_run(
             cpu,
             &raw,
@@ -643,6 +648,18 @@ unsafe extern "C" fn vmaskmov_mem_helper(
             km,
             elem as u8,
             bytes as u16,
+            cur_addr,
+        )
+    } else if broadcast_elem != 0 {
+        x86jit_core::interp::masked_broadcast_load_run(
+            cpu,
+            &raw,
+            reg as u8,
+            addr,
+            km,
+            elem as u8,
+            bytes as u16,
+            broadcast_elem as u8,
             cur_addr,
         )
     } else {
@@ -661,8 +678,11 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     match fault {
         None => RET_CONTINUE,
         Some(f) => {
-            let (operand, width) =
-                x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km);
+            let (operand, width) = if broadcast_elem != 0 {
+                (addr, broadcast_elem)
+            } else {
+                x86jit_core::memory::active_operand_span(addr, bytes, elem as u8, km)
+            };
             ctx.record_helper_fault(f.addr, u64::from(f.elem), f.write, operand, width);
             ctx.record_helper_trap(f.trap);
             RET_UNMAPPED
@@ -3311,7 +3331,7 @@ impl Shared {
         let random_sig = params(4, true); // random(cpu, seed, size, flags) -> i64
         let xgetbv_sig = params(1, false); // xgetbv(cpu) -> ()
         let vmaskmov_sig = params(7, false); // vmaskmov(cpu, dst, src, k, elem, zeroing, bytes) -> ()
-        let vmaskmov_mem_sig = params(10, true); // (cpu, mem, reg, addr, k, elem, zeroing, bytes, is_store, cur_addr) -> i64
+        let vmaskmov_mem_sig = params(11, true); // (cpu, mem, reg, addr, k, elem, zeroing, bytes, is_store, cur_addr, broadcast_elem) -> i64
         let vec_maskmov_mem_sig = params(9, true); // (cpu, mem, reg, addr, mask, elem, bytes, is_store, cur_addr) -> i64
         let vmasked_logic_sig = params(9, false); // (cpu, op, dst, a, b, k, elem, zeroing, bytes) -> ()
         let vmasked_packed_sig = params(9, false); // (cpu, op, dst, a, b, k, elem, zeroing, bytes) -> ()

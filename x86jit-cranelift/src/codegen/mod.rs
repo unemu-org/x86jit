@@ -1199,6 +1199,7 @@ impl Translator<'_, '_> {
                 ..
             } => self.emit_v_mask_mov(dst, src, k, elem, zeroing, bytes),
             IrOp::VMaskLoadMem {
+                broadcast,
                 dst,
                 addr,
                 k,
@@ -1206,7 +1207,7 @@ impl Translator<'_, '_> {
                 zeroing,
                 bytes,
                 ..
-            } => self.emit_v_mask_load_mem(dst, addr, k, elem, zeroing, bytes),
+            } => self.emit_v_mask_load_mem(dst, addr, k, elem, zeroing, bytes, broadcast),
             IrOp::VMaskStoreMem {
                 src,
                 addr,
@@ -1801,6 +1802,23 @@ impl Translator<'_, '_> {
             } => self.emit_v_insert128_m(dst, src, addr, hi),
             IrOp::VExtract128 { dst, src, hi, .. } => self.emit_v_extract128(dst, src, hi),
             IrOp::VFromGpr { dst, src, size, .. } => self.emit_v_from_gpr(dst, src, size),
+            IrOp::VReadChunk { dst, src, chunk } => {
+                let off = self.vector_chunk_offset(*src, *chunk);
+                let v = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), self.cpu, off);
+                self.set(*dst, v);
+                false
+            }
+            IrOp::VWriteChunk { dst, src, chunk } => {
+                let v = self.val(*src);
+                let off = self.vector_chunk_offset(*dst, *chunk);
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), v, self.cpu, off);
+                false
+            }
             IrOp::VToGpr { dst, src, size, .. } => self.emit_v_to_gpr(dst, src, size),
             IrOp::VLogic { dst, a, b, op, .. } => self.emit_v_logic(dst, a, b, op),
             IrOp::VPackedBin {

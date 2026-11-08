@@ -350,7 +350,6 @@ struct Setup {
     k1: Option<u64>,
     vector_mask: Option<[u128; 4]>,
     add_before: bool,
-    carrier_only: bool,
     retry_fault: bool,
 }
 
@@ -464,13 +463,6 @@ fn configured_operand(
         assert!(matches!(again, Exit::Exception { addr, vector, .. }
             if addr == rip && matches!(expected, Expected::Exception(v) if v == vector)));
         assert_eq!(cpu.reg(Reg::Rip), rip);
-    }
-    if setup.carrier_only {
-        // xj-au4.2 owns broadcast's pre-existing transfer/value effects.
-        if tier == 2 {
-            assert!(vm.cache.regions() > 0);
-        }
-        return;
     }
     assert_eq!(cpu.cpu.gpr, before.gpr, "GPRs committed: {code:02x?}");
     assert_eq!(cpu.cpu.flags.to_rflags(), before.flags.to_rflags());
@@ -1028,7 +1020,6 @@ tier_witnesses!(repeated_broadcast_mask_source, repeated_broadcast_mask);
 
 fn embedded_broadcast(tier: usize) {
     // SDM Vol 2A §2.7.7: {1toN} carries one decoded element.
-    // xj-au4.2 owns the pre-existing transfer/value bug; this pins only cold exits.
     let mut cases = vec![];
     macro_rules! form { ($method:ident($($arg:expr),*)) => {{
         let mut a = CodeAssembler::new(64).unwrap(); a.$method($($arg),*).unwrap();
@@ -1039,9 +1030,9 @@ fn embedded_broadcast(tier: usize) {
     form!(vpxord(zmm0, zmm1, dword_bcst(rbx)));
     form!(vfmadd231ps(zmm0, zmm1, dword_bcst(rbx)));
     form!(vfmadd231ps(ymm0, ymm1, dword_bcst(rbx)));
-    form!(vpternlogd(zmm0, zmm1, dword_bcst(rbx), 0x96));
+    form!(vaddps(xmm0, xmm1, dword_bcst(rbx)));
     form!(vpcmpeqd(k1, zmm1, dword_bcst(rbx)));
-    form!(vpermt2d(zmm0, zmm1, dword_bcst(rbx)));
+    form!(vpermilps(xmm0, dword_bcst(rbx), 0x1b));
     for routed in [false, true] {
         for code in &cases {
             for (address, expected) in [
@@ -1059,7 +1050,6 @@ fn embedded_broadcast(tier: usize) {
                     routed,
                     Setup {
                         add_before: true,
-                        carrier_only: true,
                         ..Default::default()
                     },
                 );

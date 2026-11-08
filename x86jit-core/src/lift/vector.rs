@@ -535,6 +535,7 @@ pub(crate) fn lift_vmov_avx(
             (Some((dst, bytes)), None) if insn.op_kind(1) == OpKind::Memory => {
                 let addr = effective_address(insn, ops, tg)?;
                 ops.push(IrOp::VMaskLoadMem {
+                    broadcast: None,
                     fault: Default::default(),
                     dst,
                     addr,
@@ -4678,7 +4679,7 @@ pub(crate) fn lift_float_unary(
 /// `x`/`y`/`z` roles (op0=dst, op1=vvvv, op2=reg/mem), then emit a fused multiply-add.
 /// `neg_prod`/`neg_add` pick the sign. `alt_sign` selects the alternating add/subtract family:
 /// 0 = plain FMA, 1 = `vfmaddsub`, 2 = `vfmsubadd` (packed-only, per-lane sign override).
-/// Masked EVEX forms are deferred.
+/// Packed EVEX masks and broadcasts use the shared EVEX lowering layer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lift_fma(
     insn: &Instruction,

@@ -759,6 +759,9 @@ const ALLOWLIST: &[&str] = &[
     // (vextractps_{reg,mem}_dst_all_lanes_match_unicorn, interp vs CPU across all
     // four lanes + both dst forms) + jit (vextractps_match_interp, jit == interp).
     "Vextractps",
+    // Packed EVEX FMA broadcasts/masks and all operand orders: independent
+    // accumulator/sign/width witnesses in evex_modifiers.rs on all three tiers,
+    // plus its modifier sweep and CPUID-gated native samples.
     "Vfmadd132pd",
     "Vfmadd132ps",
     "Vfmadd132sd",
@@ -1146,6 +1149,9 @@ fn every_lifted_op_has_correctness_coverage() {
                 .iter()
                 .map(|c| format!("{:?}", c.mnemonic())),
         )
+        // Every lifted modifier template is executed by evex_modifiers.rs with
+        // random masks, register contents and broadcast values, on both tiers.
+        .chain(x86jit_tests::compat::evex_lifted_modifier_mnemonics())
         .collect();
     let allowed: BTreeSet<String> = ALLOWLIST.iter().map(|s| s.to_string()).collect();
 
