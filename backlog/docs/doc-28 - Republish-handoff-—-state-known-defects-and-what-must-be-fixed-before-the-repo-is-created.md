@@ -227,6 +227,12 @@ wrong with it.
        public commit whose tree equals its current pin's tree (the orphan commit's tree is
        identical to `main` at the republish), then re-runs its own gate and its VM-backed
        acceptance suites.
+     - **unemupc98** (a PC/AT emulator that runs x86jit in `CpuMode::Real16` on the
+       interpreter backend) pins `x86jit-core` as a git dependency at an exact revision of
+       `main` (b0c9ae5 at registration), fetched from the private origin. After the
+       republish it re-pins to the public commit whose tree equals its pin, then re-runs
+       its unit tests and slow goldens (BIOS POST, DOS boot, directory listing, file write).
+       Registered by xj-39u.1.
   3. After publication, send each consumer the public commit and the archived revision it
      replaces.
 
