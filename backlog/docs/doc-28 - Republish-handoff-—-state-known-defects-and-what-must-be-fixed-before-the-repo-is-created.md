@@ -195,6 +195,41 @@ wrong with it.
 
 `unemulinux` is publishable on the same schedule; see its own `backlog/`.
 
+### Decisions of 2026-11-09 and the consumer pins (xj-39u, xj-8am, xj-6o4)
+
+- **Where:** the public repositories go under the `unemu-org` organisation on GitHub
+  (`unemu-org/x86jit`, `unemu-org/unemulinux`, and the `unemu-org/oracles` submodule, which
+  must be public first). The organisation is the emulator project's own scope; downstream
+  embedders only consume the JIT.
+- **unemulinux is published too**, on the same schedule, with its own checklist in its
+  `backlog/`.
+- **CI:** `.github/workflows/ci.yml` (x86-64 and aarch64 GitHub-hosted lanes, gate in
+  `scripts/ci-gate.sh`) is ready; it has not run on GitHub yet. The Forgejo workflow stays for
+  the private origin. Whether this repository also gates on unemulinux's ladder stays with
+  xj-jge.1; until then the README says so.
+- **Beads history (xj-6o4):** clean it before `refs/dolt/data` goes public: keep a private
+  archive of the current ref on the private origin, re-scan every bead and memory, then
+  `bd flatten` and re-scan. Bead owner fields carry the maintainer's own identity, the same
+  one the commits carry.
+- **Consumers and their pins.** The orphan commit discards history, so every consumer's pin
+  stops resolving publicly. Before the republish:
+  1. Tag the current `main` on the private origin as `archive/pre-republish` and never
+     force-push or delete history there; every existing pin stays fetchable from the
+     private origin.
+  2. Known consumers, and what they pin:
+     - **unemulinux** builds against `../x86jit` as a path dependency, and its CI checks
+       x86jit out beside it at the revision under test. It pins no revision; after the
+       republish it follows the public `main`. Re-validate: its unit tests and the
+       real-program ladder.
+     - **A downstream emulator embedder** pins exact x86jit revisions of the current history
+       (most recently the series that ends at the latest `main`), fetched from the private
+       origin and kept in local checkouts per pin. After the republish it re-pins to the
+       public commit whose tree equals its current pin's tree (the orphan commit's tree is
+       identical to `main` at the republish), then re-runs its own gate and its VM-backed
+       acceptance suites.
+  3. After publication, send each consumer the public commit and the archived revision it
+     replaces.
+
 ## Traps this work actually hit — do not relearn them
 
 **A guard scoped to one crate cannot see the others, and it stays green while they
