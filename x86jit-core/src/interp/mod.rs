@@ -648,9 +648,10 @@ fn finish_fault<const STEPPED: bool>(
         .map_or(ir.ops.len(), |i| start + 1 + i);
     let next = match ir.ops.get(end) {
         Some(IrOp::InsnStart { guest_addr }) => Some(*guest_addr),
-        _ => ir.guest_start.checked_add(u64::from(ir.guest_len)),
+        _ => Some(ir.next_ip()),
     };
-    let info = crate::fault::InstructionFaultInfo::from_ops(rip, next, &ir.ops[start..end]);
+    let info =
+        crate::fault::InstructionFaultInfo::from_ops(rip, next, &ir.ops[start..end], ir.mode);
     // Per-access classification retained Long64/SS evidence. The VM/step caller
     // qualifies Real16 physical addresses with its explicit decode mode.
     let mode = crate::CpuMode::Long64;
@@ -1265,7 +1266,7 @@ fn walk_ops<
                     .into();
                 }
                 cpu.mxcsr = mxcsr;
-                cpu.rip = block_end(ir);
+                cpu.rip = ir.next_ip();
                 return WalkResult::ModeChange;
             }
             IrOp::XState {
@@ -1291,7 +1292,7 @@ fn walk_ops<
                     return walk_classify_access(r, *cur_addr, a, *fault);
                 }
                 if *kind == crate::x87::xstate::XStateKind::Restore {
-                    cpu.rip = block_end(ir);
+                    cpu.rip = ir.next_ip();
                     return WalkResult::ModeChange;
                 }
             }
@@ -1313,7 +1314,7 @@ fn walk_ops<
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
                 if *restore {
-                    cpu.rip = block_end(ir);
+                    cpu.rip = ir.next_ip();
                     return WalkResult::ModeChange;
                 }
             }
@@ -3927,7 +3928,7 @@ fn walk_ops<
                 }
             }
             IrOp::Syscall { is_amd64 } => {
-                if let Some(r) = exec_syscall(cpu, block_end(ir), *is_amd64) {
+                if let Some(r) = exec_syscall(cpu, ir.next_ip(), *is_amd64) {
                     return r.into();
                 }
             }
@@ -3937,13 +3938,13 @@ fn walk_ops<
                 size,
                 dir_out,
             } => {
-                if let Some(r) = exec_port_io(cpu, temps, block_end(ir), port, value, size, dir_out)
+                if let Some(r) = exec_port_io(cpu, temps, ir.next_ip(), port, value, size, dir_out)
                 {
                     return r.into();
                 }
             }
             IrOp::Hlt => {
-                if let Some(r) = exec_hlt(cpu, block_end(ir)) {
+                if let Some(r) = exec_hlt(cpu, ir.next_ip()) {
                     return r.into();
                 }
             }
@@ -3958,7 +3959,7 @@ fn walk_ops<
                     mem.0.exception(*vector, cause, *advance);
                     return WalkResult::Continue;
                 }
-                if let Some(r) = exec_trap(cpu, *cur_addr, vector, advance) {
+                if let Some(r) = exec_trap(cpu, *cur_addr, ir.mode, vector, advance) {
                     return r.into();
                 }
             }
@@ -4293,7 +4294,7 @@ fn walk_ops<
 
     // Straight-line block with no control-flow terminator (code ran out): flow on
     // from just past the decoded bytes.
-    cpu.rip = block_end(ir);
+    cpu.rip = ir.next_ip();
     WalkResult::Continue
 }
 
@@ -4355,10 +4356,6 @@ mod vector;
 pub(crate) use control::*;
 pub(crate) use integer::*;
 pub(crate) use vector::*;
-
-fn block_end(ir: &IrBlock) -> u64 {
-    ir.guest_start + ir.guest_len as u64
-}
 
 /// The four-way SSE bitwise op (`pxor`/`pand`/`por`/`pandn`), shared by the
 /// register (`VLogic`) and memory (`VLogicM`) forms so `Andn`'s non-commutative

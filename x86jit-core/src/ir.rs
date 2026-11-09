@@ -3547,6 +3547,8 @@ impl IrOp {
 /// A lifted basic block, keyed by guest start address in the cache (§6.3).
 #[derive(Clone, Debug)]
 pub struct IrBlock {
+    /// Decode mode, including the width of the sequential instruction pointer.
+    pub mode: crate::CpuMode,
     pub guest_start: u64,
     pub ops: Vec<IrOp>,
     /// Number of temporaries allocated (backend reserves this many slots).
@@ -3555,6 +3557,19 @@ pub struct IrBlock {
     pub guest_len: u32,
     /// x86 instruction count (for budget/stats).
     pub icount: u32,
+}
+
+impl IrBlock {
+    /// Sequential successor, distinct from the byte span used for invalidation.
+    pub fn next_ip(&self) -> u64 {
+        let end = self.guest_start.wrapping_add(u64::from(self.guest_len));
+        // SDM Vol 1 §3.5; Vol 3B §23.1: real-mode IP advances in 16 bits.
+        if self.mode == crate::CpuMode::Real16 {
+            crate::lift::mask_pc(end, self.mode)
+        } else {
+            end
+        }
+    }
 }
 
 /// Bounds on how large a superblock region may grow (§12 M5-T3). Region formation

@@ -458,12 +458,13 @@ pub(crate) fn exec_hlt(cpu: &mut CpuState, block_end: u64) -> Option<InterpResul
 pub(crate) fn exec_trap(
     cpu: &mut CpuState,
     cur_addr: u64,
+    mode: crate::CpuMode,
     vector: &u8,
     advance: &u8,
 ) -> Option<InterpResult> {
     // x86 saved-RIP: a fault (advance 0) leaves RIP on the instruction, a
     // trap (advance = length) resumes past it. `addr` mirrors that RIP.
-    cpu.rip = cur_addr + *advance as u64;
+    cpu.rip = crate::lift::mask_pc(cur_addr.wrapping_add(*advance as u64), mode);
     Some(InterpResult::exit(Exit::exception(cpu.rip, *vector)))
 }
 

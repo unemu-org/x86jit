@@ -5950,6 +5950,7 @@ mod barrier_tests {
         // loaded value is stored back so it isn't dead-code-eliminated — either
         // would drop a fence and make the count wrong. Two stores + one load.
         let ir = IrBlock {
+            mode: x86jit_core::CpuMode::Long64,
             ops: vec![
                 IrOp::Store {
                     fault: Default::default(),
@@ -6073,6 +6074,7 @@ mod barrier_tests {
             has_loop: true,
             blocks: (0..2)
                 .map(|addr| IrBlock {
+                    mode: x86jit_core::CpuMode::Long64,
                     guest_start: addr,
                     guest_len: 1,
                     icount: 1,

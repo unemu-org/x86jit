@@ -564,6 +564,7 @@ fn cached_block_public_variants_remain_exhaustive() {
         }
     }
     let ir = IrBlock {
+        mode: x86jit_core::CpuMode::Long64,
         guest_start: CODE,
         ops: vec![],
         temp_count: 0,

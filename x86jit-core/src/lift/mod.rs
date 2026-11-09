@@ -144,15 +144,23 @@ pub(crate) enum FetchFailure {
 struct FetchWindow<const CAP: usize> {
     bytes: std::mem::MaybeUninit<[u8; CAP]>,
     len: usize,
+    limit: usize,
     stopped: bool,
     failure: Option<FetchFailure>,
     approved_page: Option<u64>,
 }
 impl<const CAP: usize> FetchWindow<CAP> {
-    fn new() -> Self {
+    fn new(mode: CpuMode, ip: u64) -> Self {
         Self {
             bytes: std::mem::MaybeUninit::uninit(),
             len: 0,
+            // SDM Vol 3A §7.15, Event 13; Vol 3B §23.1.4, Table 23-1: a fetch beyond
+            // the real-mode CS limit raises #GP, even if linear RAM exists there.
+            limit: if mode.wraps_16() {
+                CAP.min((0x1_0000 - ip) as usize)
+            } else {
+                CAP
+            },
             stopped: false,
             failure: None,
             approved_page: None,
@@ -163,13 +171,13 @@ impl<const CAP: usize> FetchWindow<CAP> {
         unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.len) }
     }
     fn refill(&mut self, mem: &Memory, start: u64) -> bool {
-        if self.stopped || self.len == CAP {
+        if self.stopped || self.len == self.limit {
             return false;
         }
         let at = start + self.len as u64;
         let mut chunk = match mem.fetch_chunk_len(
             at,
-            (CAP - self.len).min(if self.len == 0 { 128 } else { CAP }),
+            (self.limit - self.len).min(if self.len == 0 { 128 } else { CAP }),
         ) {
             Ok(chunk) => chunk,
             Err(trap) => {
@@ -329,7 +337,7 @@ fn exceeds_length_limit(code: &[u8], mode: CpuMode) -> bool {
 /// through the IVT (§17.6); flat modes surface the existing exception exit.
 /// SDM Vol 3A §7.15, Event 13: exceeding 15 bytes raises #GP(0),
 /// with saved IP on that instruction. A decoded lifter gap remains `Unsupported`;
-/// missing bytes remain `DecodeFault`.
+/// missing bytes remain `DecodeFault` unless they exceed the Real16 CS limit.
 fn emit_decode_exception(
     insn: &Instruction,
     last_error: DecoderError,
@@ -337,8 +345,14 @@ fn emit_decode_exception(
     mode: CpuMode,
     ops: &mut impl LiftBuffer,
 ) -> bool {
-    if last_error == DecoderError::InvalidInstruction {
-        let vector = if !mode.wraps_16() && insn.len() == 15 && exceeds_length_limit(code, mode) {
+    if mode.wraps_16() && last_error == DecoderError::NoMoreBytes && insn.next_ip() == 0x1_0000 {
+        // The bounded fetch window ended inside this instruction at CS:FFFF.
+        // SDM Vol 3A §7.15, Event 13; Vol 3B §23.1.4, Table 23-1:
+        // segment overrun is #GP through the IVT, saving the faulting IP.
+        push_real16_fault(insn, mode, 13, ops);
+        true
+    } else if last_error == DecoderError::InvalidInstruction {
+        let vector = if insn.len() == 15 && exceeds_length_limit(code, mode) {
             13
         } else {
             6
@@ -687,7 +701,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
 ///
 /// The block ends at the first control-flow instruction (per iced's flow-control
 /// classification, not a hand list), before the guest-access descriptor limit,
-/// or when the mapped code runs out. `TempGen`
+/// at the Real16 IP wrap, or when the mapped code runs out. `TempGen`
 /// grows across the whole block. Emits `IrOp::InsnStart` at each instruction
 /// boundary so a mid-block trap can set RIP to the faulting instruction (§8, §16).
 ///
@@ -721,7 +735,7 @@ fn lift_block_attempt(
     details: &mut Option<FetchFailure>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
-    let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new();
+    let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new(mode, start);
     if !window.refill(mem, at.pa) {
         *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
@@ -764,11 +778,6 @@ fn lift_block_attempt(
         }
         let code = window.code();
         if insn.is_invalid() {
-            // Execute the complete prefix before retrying a truncated instruction
-            // with a fresh fetch window (or reporting its unavailable fetch byte).
-            if decoder.last_error() == DecoderError::NoMoreBytes && guest_len > 0 {
-                break;
-            }
             let offset = decoder.position() - insn.len();
             if emit_decode_exception(
                 &insn,
@@ -779,6 +788,11 @@ fn lift_block_attempt(
             ) {
                 icount += 1;
                 guest_len += insn.len() as u32;
+                break;
+            }
+            // Execute the complete prefix before retrying a truncated instruction
+            // with a fresh fetch window (or reporting its unavailable fetch byte).
+            if decoder.last_error() == DecoderError::NoMoreBytes && guest_len > 0 {
                 break;
             }
             // SDM Vol 3A §7.15, Event 14: CR2 names the unavailable byte,
@@ -824,12 +838,13 @@ fn lift_block_attempt(
         descriptors += instruction_descriptors;
         icount += 1;
         guest_len += insn.len() as u32;
-        if terminated {
+        if terminated || (mode.wraps_16() && insn.next_ip() == 0x1_0000) {
             break;
         }
     }
 
     Ok(IrBlock {
+        mode,
         guest_start: start,
         ops,
         temp_count: tg.count(),
@@ -870,7 +885,7 @@ fn lift_one_attempt(
     details: &mut Option<FetchFailure>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
-    let mut window = FetchWindow::<15>::new();
+    let mut window = FetchWindow::<15>::new(mode, start);
     if !window.refill(mem, at.pa) {
         *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
@@ -907,6 +922,7 @@ fn lift_one_attempt(
             &mut ops,
         ) {
             return Ok(IrBlock {
+                mode,
                 guest_start: start,
                 ops,
                 temp_count: tg.count(),
@@ -924,6 +940,7 @@ fn lift_one_attempt(
     if mode.wraps_16() && insn.len() as u32 > MAX_INSN_LEN_286 {
         push_real16_fault(&insn, mode, 13, &mut ops);
         return Ok(IrBlock {
+            mode,
             guest_start: start,
             ops,
             temp_count: tg.count(),
@@ -934,6 +951,7 @@ fn lift_one_attempt(
     lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg)?;
 
     Ok(IrBlock {
+        mode,
         guest_start: start,
         ops,
         temp_count: tg.count(),
@@ -994,6 +1012,7 @@ pub(crate) fn lift_child(
     }
     let full = ops.full;
     ir.temp_count = tg.count();
+    ir.mode = mode;
     ir.guest_start = start;
     ir.guest_len = insn.len() as u32;
     ir.icount = 1;

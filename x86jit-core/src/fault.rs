@@ -825,32 +825,40 @@ impl InstructionFaultInfo {
                 .map_or(block.ops.len(), |n| start + 1 + n);
             let next = match block.ops.get(end) {
                 Some(IrOp::InsnStart { guest_addr }) => Some(*guest_addr),
-                _ => block.guest_start.checked_add(u64::from(block.guest_len)),
+                _ => Some(block.next_ip()),
             };
             let info = Self::from_ops_with_split_stores(
                 rip,
                 next,
                 &block.ops[start..end],
                 precise_split_stores,
+                block.mode,
             );
             infos.push(info);
             start = end;
         }
         infos
     }
-    pub(crate) fn from_ops(rip: u64, next: Option<u64>, ops: &[IrOp]) -> Self {
-        Self::from_ops_with_split_stores(rip, next, ops, false)
+    pub(crate) fn from_ops(rip: u64, next: Option<u64>, ops: &[IrOp], mode: CpuMode) -> Self {
+        Self::from_ops_with_split_stores(rip, next, ops, false, mode)
     }
     fn from_ops_with_split_stores(
         rip: u64,
         next: Option<u64>,
         ops: &[IrOp],
         precise_split_stores: bool,
+        mode: CpuMode,
     ) -> Self {
         let mut m = Self {
             rip,
             len: next
-                .and_then(|n| n.checked_sub(rip))
+                .and_then(|n| {
+                    if mode == CpuMode::Real16 {
+                        Some(n.wrapping_sub(rip) & 0xffff)
+                    } else {
+                        n.checked_sub(rip)
+                    }
+                })
                 .filter(|&n| (1..=15).contains(&n))
                 .map_or(Knowledge::Unknown, |n| Knowledge::Known(n as u8)),
             operand_size: Knowledge::Unknown,

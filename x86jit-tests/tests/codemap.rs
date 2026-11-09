@@ -97,6 +97,7 @@ fn codemap_preserves_noncontiguous_region_rips() {
     let second = 0x3_0000_2000;
     // Explicit IR connects blocks more than 4 GiB apart with identical low words.
     let block = |guest_start, target| IrBlock {
+        mode: x86jit_core::CpuMode::Long64,
         guest_start,
         guest_len: 1,
         icount: 1,
