@@ -164,6 +164,7 @@ pub(crate) enum BlockResult {
 enum WalkResult {
     Continue,
     ModeChange,
+    FaultDelivered,
     Exit(InterpExit),
     Fault,
 }
@@ -183,6 +184,13 @@ impl WalkResult {
     #[inline(always)]
     fn exit(exit: Exit) -> Self {
         InterpResult::exit(exit).into()
+    }
+
+    fn delivered_fault(result: InterpResult) -> Self {
+        match result {
+            InterpResult::Continue => Self::FaultDelivered,
+            other => other.into(),
+        }
     }
 }
 
@@ -296,10 +304,13 @@ fn interpret_block_inner<
     let mut cur_addr = ir.guest_start;
     // Retired-instruction accounting (§17.6, sub-seam c). `InsnStart` marks the start of
     // each guest instruction; when a *later* `InsnStart` runs, the previous instruction
-    // provably completed, so we retire it then. The final instruction is retired after
-    // the op walk iff RIP advanced off `cur_addr` — a memory trap leaves RIP on the
-    // faulting instruction (not retired; it retries and counts once next time), while a
-    // clean terminator / block fall-through moves RIP past it. `started` gates the
+    // provably completed, so we retire it then. The final instruction retires when the
+    // walk completes its terminator or falls through, including a branch to itself.
+    // SDM Vol 3A §7.5: delivering a fault leaves the instruction incomplete for
+    // restart, whereas a trap follows a completed instruction.
+    // Exit paths retain the saved-RIP convention: syscall/hlt/port I/O and advancing
+    // traps retire; faults, MMIO and interrupted REP leave RIP on the instruction for
+    // retry and do not retire it. `started` gates the
     // first `InsnStart` (nothing to retire yet). `sti_shadow` tracks whether the most
     // recent instruction was an `sti`: reset at every `InsnStart`, set by `SetIf{true}`;
     // if still set at block end, `sti` was the final instruction and its one-instruction
@@ -323,9 +334,14 @@ fn interpret_block_inner<
         info.exit_request,
         info.trace,
     );
+    let completed = match &result {
+        WalkResult::Continue | WalkResult::ModeChange => true,
+        WalkResult::FaultDelivered => false,
+        WalkResult::Exit(_) | WalkResult::Fault => cpu.rip != cur_addr,
+    };
 
     let result = match result {
-        WalkResult::Continue => BlockResult::Continue,
+        WalkResult::Continue | WalkResult::FaultDelivered => BlockResult::Continue,
         WalkResult::ModeChange => BlockResult::ModeChange,
         WalkResult::Exit(exit) => BlockResult::Exit(exit),
         WalkResult::Fault => {
@@ -335,13 +351,9 @@ fn interpret_block_inner<
         }
     };
 
-    // Final-instruction retirement (§17.6, sub-seam c): the last started instruction
-    // retired iff RIP moved off it. A memory trap leaves RIP == cur_addr (not retired —
-    // it retries and is counted once then); a clean terminator or block fall-through
-    // advances RIP past it. (A self-referential `jmp $` — RIP == cur_addr yet retired —
-    // is not counted; it is a degenerate 1-insn spin loop no consumer meters and would
-    // otherwise saturate the counter, so under-counting it by one is intentional.)
-    if started && cpu.rip != cur_addr {
+    // Final-instruction retirement (§17.6, sub-seam c) depends on completion, not
+    // whether the branch target differs from the instruction's own address.
+    if started && completed {
         retired += 1;
     }
     // Retry cleanup already inspects results only on this existing cold route.
@@ -368,7 +380,7 @@ fn interpret_block_inner<
     // Report the STI shadow only when the last retiring instruction was `sti`. If that
     // `sti` did NOT retire (a self-trap is impossible for `sti`, but guard anyway), the
     // shadow is irrelevant.
-    info.sti_shadow = sti_shadow && started && cpu.rip != cur_addr;
+    info.sti_shadow = sti_shadow && started && completed;
     result
 }
 
@@ -3707,8 +3719,16 @@ fn walk_ops<
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
-                // Terminator: delivers the frame + vectors (Continue) or traps out.
-                return deliver_interrupt_mode(cpu, mem, *cur_addr, *vector, *saved_ip).into();
+                // The IR's saved IP classifies the gate before delivery: faults save
+                // the instruction start; software INT/INT3 save the next IP (SDM
+                // Vol 3A §7.5). The handler's destination CS:IP is independent.
+                let fault = *saved_ip == *cur_addr;
+                let result = deliver_interrupt_mode(cpu, mem, *cur_addr, *vector, *saved_ip);
+                return if fault {
+                    WalkResult::delivered_fault(result)
+                } else {
+                    result.into()
+                };
             }
             IrOp::IntoGate { next_ip } => {
                 if CHILD {
@@ -3735,7 +3755,9 @@ fn walk_ops<
                 // fault in-guest; otherwise fall through to the Load/Store that follows.
                 let off = read_val(*offset, temps) & 0xFFFF;
                 if off + *size as u64 > 0x1_0000 {
-                    return deliver_interrupt_mode(cpu, mem, *cur_addr, *vector, *fault_ip).into();
+                    return WalkResult::delivered_fault(deliver_interrupt_mode(
+                        cpu, mem, *cur_addr, *vector, *fault_ip,
+                    ));
                 }
             }
             IrOp::BoundGate {
@@ -3754,7 +3776,9 @@ fn walk_ops<
                 let lo = read_val(*lower, temps) as u16 as i16;
                 let hi = read_val(*upper, temps) as u16 as i16;
                 return if idx < lo || idx > hi {
-                    deliver_interrupt_mode(cpu, mem, *cur_addr, 5, *fault_ip).into()
+                    WalkResult::delivered_fault(deliver_interrupt_mode(
+                        cpu, mem, *cur_addr, 5, *fault_ip,
+                    ))
                 } else {
                     cpu.rip = *next_ip;
                     WalkResult::Continue
@@ -3938,7 +3962,9 @@ pub(crate) fn walk_child<const ORDER: u8>(
     match result {
         WalkResult::Continue | WalkResult::ModeChange => StepResult::Continue,
         WalkResult::Exit(exit) => StepResult::Exit(exit.into_exit()),
-        WalkResult::Fault => unreachable!("child faults use arena records"),
+        WalkResult::Fault | WalkResult::FaultDelivered => {
+            unreachable!("child faults use arena records")
+        }
     }
 }
 
