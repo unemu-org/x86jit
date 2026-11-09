@@ -200,6 +200,16 @@ const FUZZER_COVERED: &[&str] = &[
 /// reason. Seeded with exactly the current `lifted − fuzzer_covered` set, so the test
 /// passes today.
 const ALLOWLIST: &[&str] = &[
+    // gathers.rs: all VEX widths and element/index sizes, interpreter/block/region,
+    // signed VSIB addresses, exact-width faults, progressive masks and restart.
+    "Vpgatherdd",
+    "Vpgatherqd",
+    "Vpgatherdq",
+    "Vpgatherqq",
+    "Vgatherdps",
+    "Vgatherqps",
+    "Vgatherdpd",
+    "Vgatherqpd",
     // SSE4A uses manual-derived controls/edge/alias/undefined-policy witnesses in
     // sse4a_adx.rs (sse4a_bitfields_controls_edges_and_undefined_policy and
     // sse4a_streaming_scalar_store_width_and_fault), across both modes and all tiers.

@@ -1146,6 +1146,22 @@ pub enum IrOp {
         elem: u8,
         bytes: u16,
     },
+    /// AVX2 VSIB gather. SDM Vol 2C §5.2, VPGATHERDD/VPGATHERQD and
+    /// VPGATHERDQ/VPGATHERQQ: completed elements commit independently and clear
+    /// their vector-mask elements; faults are delivered from low to high element.
+    VGather {
+        fault: MemoryAccess,
+        dst: u8,
+        mask: u8,
+        index: u8,
+        base: Val,
+        segment: Val,
+        elem: u8,
+        index_elem: u8,
+        bytes: u16,
+        scale: u8,
+        addr32: bool,
+    },
     /// AVX1 vector-mask conditional **load** `vmaskmovps/pd v, vmask, [mem]`
     /// (VEX.128/256.66.0F38.W0 2C/2D). Per `elem`-byte element across `bytes`
     /// (16/32), load from `addr` when the corresponding element of the vector register
@@ -3365,6 +3381,7 @@ impl IrOp {
             Self::VStoreWide { fault, .. } => *fault,
             Self::VMaskLoadMem { fault, .. } => *fault,
             Self::VMaskStoreMem { fault, .. } => *fault,
+            Self::VGather { fault, .. } => *fault,
             Self::VVecMaskLoadMem { fault, .. } => *fault,
             Self::VVecMaskStoreMem { fault, .. } => *fault,
             Self::VLogic256M { fault, .. } => *fault,
@@ -3456,6 +3473,7 @@ impl IrOp {
             Self::VStoreWide { fault, .. } => *fault = value,
             Self::VMaskLoadMem { fault, .. } => *fault = value,
             Self::VMaskStoreMem { fault, .. } => *fault = value,
+            Self::VGather { fault, .. } => *fault = value,
             Self::VVecMaskLoadMem { fault, .. } => *fault = value,
             Self::VVecMaskStoreMem { fault, .. } => *fault = value,
             Self::VLogic256M { fault, .. } => *fault = value,

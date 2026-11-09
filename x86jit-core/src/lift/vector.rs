@@ -5265,3 +5265,46 @@ pub(crate) fn lift_sse4a_bitfield(
     });
     Ok(())
 }
+
+/// SDM Vol 2C §5.2, VPGATHERDD/VPGATHERQD, VPGATHERDQ/VPGATHERQQ,
+/// VGATHERDPS/VGATHERQPS, VGATHERDPD/VGATHERQPD (VEX forms).
+pub(crate) fn lift_gather(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+    elem: u8,
+    index_elem: u8,
+) -> Result<bool, LiftError> {
+    if insn.encoding() != iced_x86::EncodingKind::VEX {
+        return Err(unsupported_insn(insn));
+    }
+    let (dst, dst_bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
+    let mask = reg_vec(insn, 2).or_unsupported(insn)?;
+    let index_reg = insn.memory_index();
+    let index = (index_reg.is_xmm() || index_reg.is_ymm())
+        .then(|| index_reg.number() as u8)
+        .or_unsupported(insn)?;
+    if dst == mask || dst == index || mask == index {
+        ops.push(IrOp::Trap {
+            vector: 6,
+            advance: 0,
+        });
+        return Ok(true);
+    }
+    let bytes = dst_bytes.max(index_reg.size() as u16);
+    let (base, segment, addr32) = effective_address_vsib(insn, ops, tg)?;
+    ops.push(IrOp::VGather {
+        fault: Default::default(),
+        dst,
+        mask,
+        index,
+        base,
+        segment,
+        elem,
+        index_elem,
+        bytes,
+        scale: insn.memory_index_scale() as u8,
+        addr32,
+    });
+    Ok(false)
+}

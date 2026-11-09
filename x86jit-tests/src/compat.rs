@@ -483,6 +483,19 @@ pub(crate) fn template_operand(
         rax => reg(instr, Register::RAX),
         st0 => reg(instr, Register::ST0),
         sti_opcode => reg(instr, Register::ST1),
+        // VSIB operands have a vector index distinct from destination 0 and mask 2.
+        mem_vsib32x | mem_vsib64x | mem_vsib32y | mem_vsib64y => {
+            if mode == CpuMode::Real16 {
+                return Err(());
+            }
+            as_mem(instr);
+            instr.set_memory_index(if matches!(kind, mem_vsib32y | mem_vsib64y) {
+                Register::YMM1
+            } else {
+                Register::XMM1
+            });
+            instr.set_memory_index_scale(4);
+        }
         // Pure memory operands.
         mem | mem_offs => {
             instr.set_op_kind(i, OpKind::Memory);
@@ -508,7 +521,7 @@ pub(crate) fn template_operand(
                 instr.set_immediate8(1);
             }
         }
-        // Anything else (mask regs, zmm, vsib, seg/cr/dr/tr/bnd, moffs, rel, wider
+        // Anything else (mask regs, zmm, seg/cr/dr/tr/bnd, moffs, rel, wider
         // immediates, is4 for legacy) — exotic or out of our v1..v3 focus.
         _ => return Err(()),
     }

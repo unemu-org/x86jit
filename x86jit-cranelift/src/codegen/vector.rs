@@ -234,6 +234,52 @@ impl Translator<'_, '_> {
         self.emit_v_vecmask_mem(*dst, addr, *mask, *elem, *bytes, 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_gather(
+        &mut self,
+        dst: u8,
+        mask: u8,
+        index: u8,
+        base: &Val,
+        segment: &Val,
+        elem: u8,
+        index_elem: u8,
+        bytes: u16,
+        scale: u8,
+        addr32: bool,
+    ) -> bool {
+        // VSIB elements can reach any address independently of the scalar base.
+        // RawStrMem checks each full element address, but cannot route Trap regions.
+        if self.mmio.is_some() {
+            let rip = self.iconst(self.cur_addr);
+            self.store_cpu(self.offsets.rip, rip);
+            self.ret(RET_MMIO_DEFER);
+            return true;
+        }
+        let base = self.val(*base);
+        let segment = self.val(*segment);
+        let dst = self.iconst(u64::from(dst));
+        let mask = self.iconst(u64::from(mask));
+        let index = self.iconst(u64::from(index));
+        let elem = self.iconst(u64::from(elem));
+        let index_elem = self.iconst(u64::from(index_elem));
+        let bytes = self.iconst(u64::from(bytes));
+        let scale = self.iconst(u64::from(scale));
+        let addr32 = self.iconst(u64::from(addr32));
+        let cur = self.iconst(self.cur_addr);
+        self.flush_gprs();
+        let inst = self.call_memory_helper(
+            self.helpers.gather,
+            &[
+                self.cpu, self.mem, dst, mask, index, base, segment, elem, index_elem, bytes,
+                scale, addr32, cur,
+            ],
+            Some(GuestAccessKind::Read),
+        );
+        self.trap_if_unmapped(inst);
+        false
+    }
+
     pub(crate) fn emit_v_vecmask_store_mem(
         &mut self,
         src: &u8,

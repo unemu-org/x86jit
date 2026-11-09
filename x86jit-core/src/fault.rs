@@ -766,6 +766,7 @@ pub struct InstructionFaultInfo {
     pub(crate) trap: Option<(u8, u8)>,
     pub(crate) length_limit: bool,
     pub(crate) helper: Option<FaultHelper>,
+    gather: bool,
     alignment_check: bool,
     operand_address: Option<OperandAddress>,
 }
@@ -830,6 +831,7 @@ impl InstructionFaultInfo {
             rep: None,
             trap: None,
             length_limit: false,
+            gather: ops.iter().any(|o| matches!(o, IrOp::VGather { .. })),
             alignment_check: ops.iter().any(|o| matches!(o, IrOp::CheckAlign { .. })),
             helper: ops.iter().find_map(|op| match op {
                 IrOp::X87 { .. } => Some(FaultHelper::X87),
@@ -1070,7 +1072,11 @@ pub(crate) fn finish(
                 MemoryEffects::None
             };
         } else {
-            m.progress.registers = if m.class == FaultClass::Trap {
+            m.progress.registers = if info.gather {
+                // SDM Vol 2C §5.2, gather Operation: completed elements and their
+                // cleared mask bits survive a fault; no entry snapshot is retained.
+                RegisterProgress::Unknown
+            } else if m.class == FaultClass::Trap {
                 RegisterProgress::CompletedInstruction
             } else if legacy_vector.is_none() || m.class == FaultClass::Fault {
                 RegisterProgress::InstructionEntry

@@ -141,9 +141,9 @@
       "missing_mem_form": []
     },
     "x86-64-v3": {
-      "lifted": 677,
+      "lifted": 693,
       "unsupported": 0,
-      "unencodable": 17,
+      "unencodable": 1,
       "missing": [],
       "reg_only": 0,
       "missing_mem_form": []
@@ -587,9 +587,9 @@
       "missing_mem_form": []
     },
     "x86-64-v3": {
-      "lifted": 638,
+      "lifted": 654,
       "unsupported": 0,
-      "unencodable": 17,
+      "unencodable": 1,
       "missing": [],
       "reg_only": 0,
       "missing_mem_form": []

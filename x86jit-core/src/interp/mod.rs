@@ -980,6 +980,42 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     );
                 }
             }
+            IrOp::VGather {
+                fault,
+                dst,
+                mask,
+                index,
+                base,
+                segment,
+                elem,
+                index_elem,
+                bytes,
+                scale,
+                addr32,
+            } => {
+                if let Some((f, ea)) = gather_run(
+                    cpu,
+                    mem,
+                    *dst,
+                    *mask,
+                    *index,
+                    read_val(*base, temps),
+                    read_val(*segment, temps),
+                    *elem,
+                    *index_elem,
+                    *bytes,
+                    *scale,
+                    *addr32,
+                    *cur_addr,
+                ) {
+                    return walk_classify_access(
+                        InterpResult::exit(str_fault_exit(f)),
+                        *cur_addr,
+                        ea,
+                        *fault,
+                    );
+                }
+            }
             IrOp::VVecMaskLoadMem {
                 fault,
                 dst,
@@ -7490,6 +7526,67 @@ pub fn vec_msb_mask(lanes: &[u128; 4], elem: u8, bytes: u16) -> u64 {
         }
     }
     k
+}
+
+/// SDM Vol 2C §5.2, VPGATHERDD/VPGATHERQD and VPGATHERDQ/VPGATHERQQ,
+/// Operation: sign-extend VSIB indices, normalize mask elements, then commit each
+/// loaded element and clear its mask. Ascending order delivers the lowest fault
+/// with all lower selected elements complete. Floating gathers use the same bits.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_run<M: StrMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    dst: u8,
+    mask_reg: u8,
+    index: u8,
+    base: u64,
+    segment: u64,
+    elem: u8,
+    index_elem: u8,
+    bytes: u16,
+    scale: u8,
+    addr32: bool,
+    cur_addr: u64,
+) -> Option<(StrFault, u64)> {
+    let count = bytes as usize / usize::from(elem.max(index_elem));
+    let result_bytes = (count * usize::from(elem)) as u16;
+    let indices = cpu.vec_lanes(index as usize);
+    let mut values = cpu.vec_lanes(dst as usize);
+    if result_bytes == 8 {
+        values[0] &= u64::MAX as u128;
+    }
+    let original_mask = cpu.vec_lanes(mask_reg as usize);
+    let mut masks = [0; 4];
+    for i in 0..count {
+        let active = get_velem(&original_mask, i, elem) >> (elem * 8 - 1) != 0;
+        set_velem(&mut masks, i, elem, if active { u64::MAX } else { 0 });
+    }
+    // The unused portions may be zeroed even if the first selected load faults.
+    cpu.set_vec(dst as usize, values, result_bytes.max(16));
+    cpu.set_vec(mask_reg as usize, masks, result_bytes.max(16));
+    for i in 0..count {
+        if get_velem(&masks, i, elem) == 0 {
+            continue;
+        }
+        let raw_index = get_velem(&indices, i, index_elem);
+        let signed_index = if index_elem == 4 {
+            raw_index as u32 as i32 as i64 as u64
+        } else {
+            raw_index
+        };
+        let offset = base.wrapping_add(signed_index.wrapping_mul(u64::from(scale)));
+        let ea = segment.wrapping_add(if addr32 { offset as u32 as u64 } else { offset });
+        match vpart(cpu, mem, cur_addr, ea, elem) {
+            Ok(value) => {
+                set_velem(&mut values, i, elem, value);
+                set_velem(&mut masks, i, elem, 0);
+                cpu.set_vec(dst as usize, values, result_bytes.max(16));
+                cpu.set_vec(mask_reg as usize, masks, result_bytes.max(16));
+            }
+            Err(f) => return Some((f.into_str_fault(cpu, cur_addr, false), ea)),
+        }
+    }
+    None
 }
 
 /// EVEX write-masked vector **load** from memory (`vmovdqu{8,16,32,64} v{k}{z}, [mem]`).

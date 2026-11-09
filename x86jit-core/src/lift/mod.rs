@@ -381,6 +381,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VStoreWide { .. }
             | VMaskLoadMem { .. }
             | VMaskStoreMem { .. }
+            | VGather { .. }
             | VVecMaskLoadMem { .. }
             | VVecMaskStoreMem { .. }
             | VLogic256M { .. }
@@ -1801,6 +1802,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | VMaskMov { .. }
         | VMaskLoadMem { .. }
         | VMaskStoreMem { .. }
+        | VGather { .. }
         | VVecMaskLoadMem { .. }
         | VVecMaskStoreMem { .. }
         | VLogic256 { .. }
@@ -2895,6 +2897,10 @@ fn lift_insn_inner(
         Vblendvps => lift_vblendv(insn, ops, tg, 4).map(|_| false),
         Vblendvpd => lift_vblendv(insn, ops, tg, 8).map(|_| false),
         Vpblendvb => lift_vblendv(insn, ops, tg, 1).map(|_| false),
+        Vpgatherdd | Vgatherdps => lift_gather(insn, ops, tg, 4, 4),
+        Vpgatherqd | Vgatherqps => lift_gather(insn, ops, tg, 4, 8),
+        Vpgatherdq | Vgatherdpd => lift_gather(insn, ops, tg, 8, 4),
+        Vpgatherqq | Vgatherqpd => lift_gather(insn, ops, tg, 8, 8),
         // AVX1 vector-mask conditional load/store: mask is a vector reg's
         // per-element sign bits; masked-off lanes never fault (a real-software blocker).
         // SDM Vol 2C, VPMASKMOV: element sign bits gate dword/qword accesses.
@@ -4524,6 +4530,23 @@ pub(crate) fn effective_address(
     Ok(effective_address_parts(insn, ops, tg)?.0)
 }
 
+/// §17.5 VSIB address parts: apply address-size wrapping after the vector index,
+/// then add the segment base (SDM Vol 2C §5.2, VPGATHERDD/VPGATHERQD).
+fn effective_address_vsib(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<(Val, Val, bool), LiftError> {
+    let addr32 = insn.code_size() == CodeSize::Code32
+        || insn.memory_base().size() == 4
+        || (insn.memory_base() == Register::None && insn.memory_displ_size() == 4);
+    let mut scalar = *insn;
+    scalar.set_memory_index(Register::None);
+    let base = effective_address_no_segment(&scalar, ops, tg)?;
+    let segment = with_segment(insn, Val::Imm(0), ops, tg);
+    Ok((base, segment, addr32))
+}
+
 /// Keep the architectural offset alongside the linear address for x87 FDP.
 fn effective_address_parts(
     insn: &Instruction,
@@ -4619,6 +4642,7 @@ fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
             IrOp::PushFlags { size, .. } => (u16::from(*size), true),
             IrOp::RepString { elem, .. } => (u16::from(*elem), false),
             IrOp::FxState { .. } => (512, stack),
+            IrOp::VGather { elem, .. } => (u16::from(*elem), stack),
             _ => (insn.memory_size().size() as u16, stack),
         };
         op.set_memory_access(crate::ir::MemoryAccess::new(width, long64, ss));

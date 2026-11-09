@@ -690,6 +690,63 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     }
 }
 
+/// AVX2 VSIB gathers share their restart state machine with the interpreter.
+///
+/// # Safety
+/// `cpu` and `mem` point to live CpuState and MemCtx values for this call.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn gather_helper(
+    cpu: *mut u8,
+    mem: *mut u8,
+    dst: u64,
+    mask: u64,
+    index: u64,
+    base: u64,
+    segment: u64,
+    elem: u64,
+    index_elem: u64,
+    bytes: u64,
+    scale: u64,
+    addr32: u64,
+    cur_addr: u64,
+) -> u64 {
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
+    // SAFETY: the compiled-block ABI supplies these live pointers.
+    let cpu = unsafe { &mut *cpu.cast::<x86jit_core::CpuState>() };
+    // SAFETY: mem is the live compiled-block memory context.
+    let ctx = unsafe { &mut *mem.cast::<MemCtx>() };
+    let raw = x86jit_core::interp::RawStrMem {
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
+            .host_fault_recovery(),
+        base: ctx.base as *mut u8,
+        size: ctx.size,
+        guest_base: ctx.guest_base,
+    };
+    match x86jit_core::interp::gather_run(
+        cpu,
+        &raw,
+        dst as u8,
+        mask as u8,
+        index as u8,
+        base,
+        segment,
+        elem as u8,
+        index_elem as u8,
+        bytes as u16,
+        scale as u8,
+        addr32 != 0,
+        cur_addr,
+    ) {
+        None => RET_CONTINUE,
+        Some((f, ea)) => {
+            ctx.record_helper_fault(f.addr, u64::from(f.elem), false, ea, elem);
+            ctx.record_helper_trap(f.trap);
+            RET_UNMAPPED
+        }
+    }
+}
+
 /// AVX1 vector-mask conditional memory move `vmaskmovps/pd`: like
 /// [`vmaskmov_mem_helper`], but the mask is a *vector register* whose per-element sign
 /// bits form the opmask (via `vec_msb_mask`), not an opmask `k`. Load form always zeroes
@@ -3332,6 +3389,7 @@ impl Shared {
         let xgetbv_sig = params(1, false); // xgetbv(cpu) -> ()
         let vmaskmov_sig = params(7, false); // vmaskmov(cpu, dst, src, k, elem, zeroing, bytes) -> ()
         let vmaskmov_mem_sig = params(11, true); // (cpu, mem, reg, addr, k, elem, zeroing, bytes, is_store, cur_addr, broadcast_elem) -> i64
+        let gather_sig = params(13, true);
         let vec_maskmov_mem_sig = params(9, true); // (cpu, mem, reg, addr, mask, elem, bytes, is_store, cur_addr) -> i64
         let vmasked_logic_sig = params(9, false); // (cpu, op, dst, a, b, k, elem, zeroing, bytes) -> ()
         let vmasked_packed_sig = params(9, false); // (cpu, op, dst, a, b, k, elem, zeroing, bytes) -> ()
@@ -3468,6 +3526,7 @@ impl Shared {
                 xgetbv: helper!(xgetbv_sig, xgetbv_helper),
                 vmaskmov: helper!(vmaskmov_sig, vmaskmov_helper),
                 vmaskmov_mem: helper!(vmaskmov_mem_sig, vmaskmov_mem_helper),
+                gather: helper!(gather_sig, gather_helper),
                 vec_maskmov_mem: helper!(vec_maskmov_mem_sig, vec_maskmov_mem_helper),
                 vmasked_logic: helper!(vmasked_logic_sig, vmasked_logic_helper),
                 vmasked_packed: helper!(vmasked_packed_sig, vmasked_packed_helper),
