@@ -7,7 +7,7 @@ use crate::ir::*;
 #[inline(always)]
 pub(crate) fn exec_x87<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     op: &IrOp,
@@ -64,7 +64,7 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_fx_state<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -103,7 +103,7 @@ pub(crate) fn exec_set_df(cpu: &mut CpuState, value: &bool) -> Option<InterpResu
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -145,7 +145,7 @@ pub(crate) fn exec_rep_string<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -204,7 +204,7 @@ pub(crate) fn exec_sahf(cpu: &mut CpuState) -> Option<InterpResult> {
 /// in IVT delivery).
 pub(crate) fn exec_pusha_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     let orig_sp = cpu.gpr[RSP] as u16;
@@ -231,7 +231,7 @@ pub(crate) fn exec_pusha_real<const ROUTED: bool>(
 /// upper GPR bits. A load fault traps out (RIP left on the instruction).
 pub(crate) fn exec_popa_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     // Reverse of `pusha`: DI, SI, BP, [SP slot — read and discarded], BX, DX, CX, AX.
@@ -264,7 +264,7 @@ pub(crate) fn exec_popa_real<const ROUTED: bool>(
 /// wraps. A store or display-read fault traps out (RIP left on the instruction).
 pub(crate) fn exec_enter_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     alloc: u16,
     level: u8,
@@ -341,7 +341,7 @@ pub(crate) fn exec_branch(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_call<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     target: &Val,
@@ -369,7 +369,7 @@ pub(crate) fn exec_call<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_ret<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     slot: &u8,
     pop_extra: &u16,
@@ -480,7 +480,7 @@ fn ss_addr(cpu: &CpuState, sp: u16) -> u64 {
 /// `Ok(())` with SP committed. Used by `int`/`pushf`/IVT delivery.
 fn push16<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     word: u16,
 ) -> Result<(), InterpResult> {
@@ -507,7 +507,7 @@ fn push16<const ROUTED: bool>(
 /// un-advanced), or the popped word with SP committed. Used by `popf`/`iret`.
 fn pop16<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Result<u16, InterpResult> {
     let sp = cpu.gpr[RSP] as u16;
@@ -525,7 +525,7 @@ fn pop16<const ROUTED: bool>(
 /// `pushf` (16-bit, §17.6): push the real-mode FLAGS image (incl. IF) onto SS:SP.
 pub(crate) fn exec_pushf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     let image = cpu.flags.to_flags16();
@@ -539,7 +539,7 @@ pub(crate) fn exec_pushf_real<const ROUTED: bool>(
 /// incl. IF.
 pub(crate) fn exec_popf_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     match pop16(cpu, mem, cur_addr) {
@@ -576,7 +576,7 @@ pub(crate) fn deliver_interrupt(
 
 fn deliver_interrupt_mode<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
@@ -614,7 +614,7 @@ fn deliver_interrupt_mode<const ROUTED: bool>(
 /// `deliver_interrupt` push order. Ends the block.
 pub(crate) fn exec_iret_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> InterpResult {
     let ip = match pop16(cpu, mem, cur_addr) {
@@ -688,7 +688,7 @@ pub(crate) fn exec_far_jump(cpu: &mut CpuState, temps: &[u64], cs: &Val, ip: &Va
 /// change is possible mid-push, as in IVT delivery). Ends the block.
 pub(crate) fn exec_far_call<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     cs: &Val,
@@ -713,7 +713,7 @@ pub(crate) fn exec_far_call<const ROUTED: bool>(
 /// load. Ends the block.
 pub(crate) fn exec_far_ret<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     pop_extra: &u16,
 ) -> InterpResult {

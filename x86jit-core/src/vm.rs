@@ -539,6 +539,38 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Snapshot child execution metadata before a shared-address-space fork.
+    /// Allocation and fetch-policy callbacks run here, in the parent. `mode`
+    /// selects decoding; Real16 helpers are outside the initial child scope.
+    /// The view holds only owned metadata and a lifetime marker, keeping this
+    /// VM's mapping alive and preventing safe unmap/remap until the view is dropped.
+    /// See the crate docs for the FFI and parent invalidation protocol.
+    pub fn child_view(&self, mode: CpuMode) -> crate::ChildView<'_> {
+        self.mem.child_view(self, mode)
+    }
+
+    /// Reconcile a finished child's written-page log with concurrent translation
+    /// and execution, using the ordinary address-scoped invalidation protocol.
+    /// Call after child exit/exec, while its view and backing still live. Watched
+    /// pages are also reported to the parent's normal dirty-range consumer.
+    pub fn invalidate_written_pages(&self, arena: &crate::ChildArena) {
+        let mut dropped = false;
+        for &page in arena.written_pages().iter() {
+            let lo = page << crate::memory::CODE_PAGE_BITS;
+            self.mem
+                .note_write(lo, crate::memory::CODE_PAGE_SIZE as usize);
+            dropped |= !self
+                .cache
+                .invalidate_child_written(lo, lo + crate::memory::CODE_PAGE_SIZE, || {
+                    self.mem.clear_code_page(page)
+                })
+                .is_empty();
+        }
+        if dropped {
+            self.backend.invalidate_links();
+        }
+    }
+
     /// Consume the engine before a host fork, then build independent engines in
     /// parent and child. No translations or worker state are reused afterward.
     ///
@@ -2021,7 +2053,7 @@ impl Vcpu {
                     if !DEFAULT {
                         fp_mode.default();
                     }
-                    match resolve::<DEFAULT>(
+                    match resolve_dispatch::<DEFAULT>(
                         vm,
                         exit_word,
                         &self.engine_sections,
@@ -2604,6 +2636,39 @@ enum ResolveFailure {
     Exit(Exit),
 }
 
+#[inline(always)]
+fn resolve_dispatch<const DEFAULT: bool>(
+    vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
+    at: FetchAddr,
+    mode: CpuMode,
+    mxcsr: u32,
+) -> Result<CachedBlock, Exit> {
+    // Keep compilation and publication state out of non-tiered cache hits.
+    if !vm.tier_up_background && vm.tier_up_after.is_none() && mode != CpuMode::Real16 {
+        let key = if DEFAULT {
+            BlockKey::new(at.pa, mode)
+        } else {
+            BlockKey::with_mxcsr(at.pa, mode, mxcsr)
+        };
+        loop {
+            if let Some(block) = vm.cache.get(key) {
+                return Ok(block);
+            }
+            // No IR exists on a miss; snapshot before fetching its bytes.
+            let epoch = vm.cache.epoch();
+            match resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, epoch) {
+                Ok(block) => return Ok(block),
+                Err(ResolveFailure::Exit(exit)) => return Err(exit),
+                Err(ResolveFailure::Retry) => continue,
+            }
+        }
+    }
+    resolve::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr)
+}
+
+#[inline(never)]
 fn resolve<const DEFAULT: bool>(
     vm: &Vm,
     exit_word: &AtomicU64,
@@ -2646,6 +2711,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         if let Some(block) = vm.cache.get(key) {
             return Ok(block);
         }
+        let compile_epoch = vm.cache.epoch();
         let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
         let lifted = {
@@ -2655,8 +2721,17 @@ fn resolve_attempt<const DEFAULT: bool>(
         return lifted
             .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
             .and_then(|ir| {
-                finish_single(vm, exit_word, sections, key, pc, ir, permit.as_ref())
-                    .ok_or(ResolveFailure::Retry)
+                finish_single(
+                    vm,
+                    exit_word,
+                    sections,
+                    key,
+                    pc,
+                    ir,
+                    permit.as_ref(),
+                    compile_epoch,
+                )
+                .ok_or(ResolveFailure::Retry)
             });
     }
     loop {
@@ -2672,7 +2747,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         // span — permanently uninvalidatable.
         let epoch = vm.cache.epoch();
         let Some(block) = vm.cache.get(key) else {
-            break;
+            return resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, epoch);
         };
         // Hotness-gated tier-up: a cached *interpreted* block that has
         // now run `tier_up_after` times gets JIT-compiled from its already-lifted
@@ -2825,6 +2900,25 @@ fn resolve_attempt<const DEFAULT: bool>(
         // Lost the race: an SMC drop invalidated the block mid-tier-up. Loop to
         // re-fetch / re-lift from current memory rather than run a stale block.
     }
+}
+
+#[cold]
+#[inline(never)]
+fn resolve_uncached<const DEFAULT: bool>(
+    vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
+    at: FetchAddr,
+    mode: CpuMode,
+    mxcsr: u32,
+    compile_epoch: u64,
+) -> Result<CachedBlock, ResolveFailure> {
+    let pc = at.pa;
+    let key = if DEFAULT {
+        BlockKey::new(pc, mode)
+    } else {
+        BlockKey::with_mxcsr(pc, mode, mxcsr)
+    };
     let permit = vm.mem.fetch_permit();
     // Region path (§12 M5): a region-forming backend lifts a superblock EAGERLY on
     // first sight. When background tier-up is on, skip this — regions then form only
@@ -2868,7 +2962,9 @@ fn resolve_attempt<const DEFAULT: bool>(
                 if !vm
                     .cache
                     .insert_checked(key, materialized.clone(), spans, |sp| {
-                        if permit.as_ref().is_some_and(|p| !p.is_current()) {
+                        if vm.cache.epoch() != compile_epoch
+                            || permit.as_ref().is_some_and(|p| !p.is_current())
+                        {
                             return false;
                         }
                         for (start, len) in sp {
@@ -2893,6 +2989,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                     pc,
                     region.blocks.into_iter().next().unwrap(),
                     permit.as_ref(),
+                    compile_epoch,
                 )
                 .ok_or(ResolveFailure::Retry)
             }
@@ -2913,8 +3010,17 @@ fn resolve_attempt<const DEFAULT: bool>(
         lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
     };
     match lifted {
-        Ok(ir) => finish_single(vm, exit_word, sections, key, pc, ir, permit.as_ref())
-            .ok_or(ResolveFailure::Retry),
+        Ok(ir) => finish_single(
+            vm,
+            exit_word,
+            sections,
+            key,
+            pc,
+            ir,
+            permit.as_ref(),
+            compile_epoch,
+        )
+        .ok_or(ResolveFailure::Retry),
         Err(e) => Err(ResolveFailure::Exit(lift_exit(
             e,
             fetch_failure,
@@ -2929,6 +3035,7 @@ fn resolve_attempt<const DEFAULT: bool>(
 /// its pages. `span_start` is the physical fetch address (== `ir.guest_start` outside
 /// Real16, but the `cs_base + IP` physical address in Real16, where SMC page-tagging
 /// and the cache key must both be physical — see `resolve`).
+#[allow(clippy::too_many_arguments)]
 fn finish_single(
     vm: &Vm,
     exit_word: &AtomicU64,
@@ -2937,6 +3044,7 @@ fn finish_single(
     span_start: u64,
     ir: IrBlock,
     permit: Option<&crate::FetchPermit>,
+    compile_epoch: u64,
 ) -> Option<CachedBlock> {
     if permit.is_some_and(|p| !p.is_current()) {
         return None;
@@ -2963,7 +3071,7 @@ fn finish_single(
     // by a concurrent SMC invalidation between insert and mark.
     vm.cache
         .insert_checked(key, materialized.clone(), vec![(start, len)], |_| {
-            if permit.is_some_and(|p| !p.is_current()) {
+            if vm.cache.epoch() != compile_epoch || permit.is_some_and(|p| !p.is_current()) {
                 return false;
             }
             vm.mem.mark_code(start, len);

@@ -18,7 +18,7 @@ use crate::ir::{
     Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, HFloatOp, HIntOp, IrBlock, IrOp,
     PackedBinOp, RepKind, StrOp, VLogicOp, Val,
 };
-use crate::memory::{Access, MemTrap, Memory};
+use crate::memory::{Access, InterpreterMemory, MemTrap, Memory};
 use crate::state::{CpuState, Flags, Reg};
 
 /// `gpr[]` slot for RSP (used by push/pop-style stack ops in Call/Ret).
@@ -268,7 +268,7 @@ fn interpret_block_inner<const RETRY: bool, const ROUTED: bool, const DEFAULT: b
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
     // `sti_shadow` are threaded by `&mut` and read afterwards.
-    let result = walk_ops::<RETRY, ROUTED, DEFAULT>(
+    let result = walk_ops::<RETRY, ROUTED, DEFAULT, false>(
         ir,
         cpu,
         mem,
@@ -370,10 +370,10 @@ pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters (`cur_addr`/`retired`/`started`/`sti_shadow`).
 #[allow(clippy::too_many_arguments)]
-fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
+fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CHILD: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: &mut u64,
     retired: &mut u64,
@@ -382,9 +382,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
     exit_request: Option<&std::sync::atomic::AtomicU64>,
     trace: Option<&crate::lockstep::Trace>,
 ) -> WalkResult {
-    let mut bracket = crate::lockstep::begin_with_trace(trace);
+    let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
     for op in &ir.ops {
+        if CHILD {
+            mem.0.begin_op(op, temps, cpu);
+        }
         match op {
             IrOp::InsnStart { guest_addr } => {
                 entry_flags = cpu.flags;
@@ -398,7 +401,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 *started = true;
                 *sti_shadow = false; // a new instruction clears any pending sti shadow
                 *cur_addr = *guest_addr;
-                if bracket.active() {
+                if !CHILD && bracket.active() {
                     crate::lockstep::on_insn_start(&mut bracket, cpu, mem, *guest_addr);
                 }
             }
@@ -672,6 +675,25 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
                 signed,
             } => {
+                if CHILD {
+                    match divide(
+                        read_val(*hi, temps),
+                        read_val(*lo, temps),
+                        read_val(*divisor, temps),
+                        *size,
+                        *signed,
+                    ) {
+                        Some((q, r)) => {
+                            temps[*quot as usize] = q;
+                            temps[*rem as usize] = r;
+                        }
+                        None => {
+                            mem.0.exception(0, crate::FaultCause::Divide, 0);
+                            return WalkResult::Continue;
+                        }
+                    }
+                    continue;
+                }
                 if let Some(r) = exec_div(
                     cpu, temps, *cur_addr, quot, rem, hi, lo, divisor, size, signed,
                 ) {
@@ -737,6 +759,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
                 op,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) =
                     exec_atomic_rmw(cpu, mem, temps, *cur_addr, old, addr, src, size, op)
                 {
@@ -751,6 +776,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 src,
                 size,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) =
                     exec_atomic_cas(cpu, mem, temps, *cur_addr, old, addr, expected, src, size)
                 {
@@ -763,6 +791,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 size,
                 len,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 let addr = read_val(*addr, temps);
                 if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
                     return walk_classify_access(InterpResult::exit(exit), *cur_addr, addr, *fault);
@@ -780,25 +811,42 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::Cpuid => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_cpuid(cpu) {
                     return r.into();
                 }
             }
-            IrOp::ReadTsc { aux } => tsc_run(cpu, *aux),
+            IrOp::ReadTsc { aux } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                tsc_run(cpu, *aux)
+            }
             IrOp::Random {
                 dst,
                 kind,
                 size,
                 set_flags,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 temps[*dst as usize] = random_run(cpu, *kind, *size, *set_flags);
             }
             IrOp::Xgetbv => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_xgetbv(cpu, *cur_addr) {
                     return r.into();
                 }
             }
             IrOp::X87 { fault, addr, .. } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_x87(cpu, mem, temps, *cur_addr, op) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
@@ -807,6 +855,10 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
             IrOp::SetMxcsr { src } => {
                 let mxcsr = read_val(*src, temps) as u32;
                 if mxcsr & !crate::state::MXCSR_MASK != 0 {
+                    if CHILD {
+                        mem.0.exception(13, crate::FaultCause::InvalidMxcsr, 0);
+                        return WalkResult::Continue;
+                    }
                     cpu.rip = *cur_addr;
                     return InterpResult::exit(crate::fault::exception_exit(
                         *cur_addr,
@@ -825,9 +877,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 kind,
                 wide,
             } => {
+                if CHILD {
+                    unreachable!("XSAVE family refused before child execution");
+                }
                 let a = read_val(*addr, temps);
                 if let Err(error) =
-                    crate::x87::xstate::exec_xstate(cpu, &mem.0, a, *kind, *wide, *fault)
+                    crate::x87::xstate::exec_xstate(cpu, mem.0.normal(), a, *kind, *wide, *fault)
                 {
                     cpu.rip = *cur_addr;
                     let r = InterpResult::exit(xstate_exit(*cur_addr, error));
@@ -844,6 +899,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 restore,
                 wide,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_fx_state(cpu, mem, temps, *cur_addr, addr, restore, wide) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
@@ -2819,6 +2877,20 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 addr_bits,
                 seg_base,
             } => {
+                if CHILD {
+                    mem.0.string::<ROUTED>(
+                        cpu,
+                        *op,
+                        *elem,
+                        *rep,
+                        *addr_bits,
+                        read_val(*seg_base, temps),
+                    );
+                    if mem.0.stopped() {
+                        return WalkResult::Continue;
+                    }
+                    continue;
+                }
                 if let Some(r) = exec_rep_string(
                     cpu,
                     mem,
@@ -3423,6 +3495,16 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::Trap { vector, advance } => {
+                if CHILD {
+                    let cause = match vector {
+                        3 => crate::FaultCause::Breakpoint,
+                        6 => crate::FaultCause::InvalidOpcode,
+                        13 => crate::FaultCause::InstructionLength,
+                        _ => crate::FaultCause::Unknown,
+                    };
+                    mem.0.exception(*vector, cause, *advance);
+                    return WalkResult::Continue;
+                }
                 if let Some(r) = exec_trap(cpu, *cur_addr, vector, advance) {
                     return r.into();
                 }
@@ -3455,6 +3537,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 temps[*dst as usize] = cpu.selector(*segment) as u64;
             }
             IrOp::CheckIretNt => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if cpu.rflags_system & (1 << 14) != 0 {
                     cpu.rip = *cur_addr;
                     return InterpResult::exit(crate::fault::exception_exit(
@@ -3466,6 +3551,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::CheckIret { cs, ss, ip } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 let ip = read_val(*ip, temps);
                 if read_val(*cs, temps) as u16 != cpu.cs
                     || ss.is_some_and(|v| read_val(v, temps) as u16 != cpu.ss)
@@ -3487,6 +3575,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::Unsupported { bytes, len } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 cpu.rip = *cur_addr;
                 return WalkResult::exit(Exit::UnknownInstruction {
                     addr: *cur_addr,
@@ -3501,20 +3592,32 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 *sti_shadow = *value;
             }
             IrOp::PushfReal => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_pushf_real(cpu, mem, *cur_addr) {
                     return r.into();
                 }
             }
             IrOp::PopfReal => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_popf_real(cpu, mem, *cur_addr) {
                     return r.into();
                 }
             }
             IrOp::IntGate { vector, saved_ip } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 // Terminator: delivers the frame + vectors (Continue) or traps out.
                 return deliver_interrupt(cpu, mem, *cur_addr, *vector, *saved_ip).into();
             }
             IrOp::IntoGate { next_ip } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 return if cpu.flags.of {
                     deliver_interrupt(cpu, mem, *cur_addr, 4, *next_ip).into()
                 } else {
@@ -3528,6 +3631,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 vector,
                 fault_ip,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 // 80286 real-mode segment-limit fault (§17.6): the access crosses the
                 // 0xFFFF byte limit iff offset + size overflows 64 KB. If so, vector the
                 // fault in-guest; otherwise fall through to the Load/Store that follows.
@@ -3543,6 +3649,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 fault_ip,
                 next_ip,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 // Signed 16-bit array-bounds check (§17.6). Out of range → #BR (vector 5),
                 // a fault whose saved IP is the `bound` instruction itself.
                 let idx = read_val(*index, temps) as u16 as i16;
@@ -3555,7 +3664,12 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                     WalkResult::Continue
                 };
             }
-            IrOp::IretReal => return exec_iret_real(cpu, mem, *cur_addr).into(),
+            IrOp::IretReal => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                return exec_iret_real(cpu, mem, *cur_addr).into();
+            }
             IrOp::SetCf { value } => {
                 // `clc`/`stc`/`cmc`: set/clear/complement CF, nothing else.
                 cpu.flags.cf = match value {
@@ -3564,6 +3678,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 };
             }
             IrOp::Bcd { kind } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_bcd(cpu, *cur_addr, kind) {
                     return r.into();
                 }
@@ -3573,12 +3690,23 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 taken,
                 fallthrough,
             } => return exec_loop_cx(cpu, kind, taken, fallthrough).into(),
-            IrOp::FarJump { cs, ip } => return exec_far_jump(cpu, temps, cs, ip).into(),
+            IrOp::FarJump { cs, ip } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                return exec_far_jump(cpu, temps, cs, ip).into();
+            }
             IrOp::FarCall { cs, ip, ret_ip } => {
-                return exec_far_call(cpu, mem, temps, *cur_addr, cs, ip, ret_ip).into()
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                return exec_far_call(cpu, mem, temps, *cur_addr, cs, ip, ret_ip).into();
             }
             IrOp::FarRet { pop_extra } => {
-                return exec_far_ret(cpu, mem, *cur_addr, pop_extra).into()
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                return exec_far_ret(cpu, mem, *cur_addr, pop_extra).into();
             }
             IrOp::RepStringReal {
                 op,
@@ -3587,6 +3715,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 ds_base,
                 es_base,
             } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_rep_string_real(
                     cpu,
                     mem,
@@ -3613,22 +3744,35 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
             IrOp::PushaReal => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_pusha_real(cpu, mem, *cur_addr) {
                     return r.into();
                 }
             }
             IrOp::PopaReal => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_popa_real(cpu, mem, *cur_addr) {
                     return r.into();
                 }
             }
             IrOp::EnterReal { alloc, level } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
                 if let Some(r) = exec_enter_real(cpu, mem, *cur_addr, *alloc, *level) {
                     return r.into();
                 }
             }
             IrOp::CheckAlign { addr, bytes } => {
                 if read_val(*addr, temps) & (u64::from(*bytes) - 1) != 0 {
+                    if CHILD {
+                        mem.0.exception(13, crate::FaultCause::RequiredAlignment, 0);
+                        return WalkResult::Continue;
+                    }
                     cpu.rip = *cur_addr;
                     return InterpResult::exit(crate::fault::exception_exit(
                         *cur_addr,
@@ -3639,12 +3783,62 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 }
             }
         }
+        if CHILD && mem.0.stopped() {
+            return WalkResult::Continue;
+        }
     }
 
     // Straight-line block with no control-flow terminator (code ran out): flow on
     // from just past the decoded bytes.
     cpu.rip = block_end(ir);
     WalkResult::Continue
+}
+
+pub(crate) fn walk_child(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &impl InterpreterMemory,
+    scratch: &mut Vec<u64>,
+) -> StepResult {
+    scratch.clear();
+    scratch.resize(ir.temp_count as usize, 0);
+    let mut cur = ir.guest_start;
+    let mut retired = 0;
+    let mut started = false;
+    let mut shadow = false;
+    let mem = Access::<false, _>::new(mem);
+    let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
+        walk_ops::<false, false, true, true>(
+            ir,
+            cpu,
+            mem,
+            scratch,
+            &mut cur,
+            &mut retired,
+            &mut started,
+            &mut shadow,
+            None,
+            None,
+        )
+    } else {
+        walk_ops::<false, false, false, true>(
+            ir,
+            cpu,
+            mem,
+            scratch,
+            &mut cur,
+            &mut retired,
+            &mut started,
+            &mut shadow,
+            None,
+            None,
+        )
+    };
+    match result {
+        WalkResult::Continue | WalkResult::ModeChange => StepResult::Continue,
+        WalkResult::Exit(exit) => StepResult::Exit(exit.into_exit()),
+        WalkResult::Fault => unreachable!("child faults use arena records"),
+    }
 }
 
 mod control;
@@ -6497,7 +6691,7 @@ fn vpart_store<M: StrMem>(
 /// built.
 fn vload<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     size: u8,
@@ -6542,7 +6736,7 @@ fn vector_fault_probe_preserves_mmio_answers() {
 /// zero-filling lanes above `width`. On a fault, returns the faulting sub-transfer.
 fn vload_lanes<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     base: u64,
     width: u16,
@@ -6579,7 +6773,7 @@ fn vpopcnt_lanes(a: [u128; 4], lane: u8) -> [u128; 4] {
 /// [`vload`].
 fn vstore<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     v: u128,
@@ -6942,7 +7136,7 @@ pub trait StrMem {
     }
 }
 
-fn preflight_store_pages(
+pub(crate) fn preflight_store_pages(
     base: u64,
     mask: u64,
     elem: u8,
@@ -7027,7 +7221,7 @@ impl StrMem for Memory {
     }
 }
 
-impl<const ROUTED: bool> StrMem for Access<ROUTED> {
+impl<const ROUTED: bool, M: InterpreterMemory> StrMem for Access<ROUTED, M> {
     fn preflight_store(
         &self,
         base: u64,
@@ -7035,21 +7229,7 @@ impl<const ROUTED: bool> StrMem for Access<ROUTED> {
         elem: u8,
         bytes: u16,
     ) -> Result<(), (u64, MemTrap)> {
-        if ROUTED {
-            preflight_store_pages(
-                base,
-                mask,
-                elem,
-                bytes,
-                self.host_base() as usize,
-                self.guest_base(),
-                (
-                    |a, n| self.probe_write_mode::<false>(a, n),
-                    |a, n| self.probe_write_mode::<true>(a, n),
-                ),
-            )?;
-        }
-        Ok(())
+        self.0.preflight_store::<ROUTED>(base, mask, elem, bytes)
     }
 
     #[inline(always)]
@@ -7329,6 +7509,33 @@ pub fn string_run_interruptible<M: StrMem>(
     dst_base: u64,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StringStop> {
+    string_run_mode::<false, M>(
+        cpu,
+        mem,
+        op,
+        elem,
+        rep,
+        cur_addr,
+        addr_bits,
+        src_base,
+        dst_base,
+        exit_request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+) -> Option<StringStop> {
     let step = if cpu.flags.df {
         (elem as i64).wrapping_neg() as u64
     } else {
@@ -7388,10 +7595,18 @@ pub fn string_run_interruptible<M: StrMem>(
                 let v = match mem.sload(sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
-                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                        if CHILD {
+                            cpu.rip = cur_addr;
+                            return Some(StringStop::Interrupted);
+                        }
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
                 if let Err(t) = mem.sstore(da, v, elem) {
+                    if CHILD {
+                        cpu.rip = cur_addr;
+                        return Some(StringStop::Interrupted);
+                    }
                     return trap(cpu, cur_addr, da, true, t, v, elem).map(StringStop::Fault);
                 }
                 cpu.gpr[RSI] = advance(cpu.gpr[RSI]);
@@ -7401,6 +7616,10 @@ pub fn string_run_interruptible<M: StrMem>(
                 let da = dst_lin(cpu.gpr[RDI]);
                 let v = cpu.gpr[RAX] & m;
                 if let Err(t) = mem.sstore(da, v, elem) {
+                    if CHILD {
+                        cpu.rip = cur_addr;
+                        return Some(StringStop::Interrupted);
+                    }
                     return trap(cpu, cur_addr, da, true, t, v, elem).map(StringStop::Fault);
                 }
                 cpu.gpr[RDI] = advance(cpu.gpr[RDI]);
@@ -7410,7 +7629,11 @@ pub fn string_run_interruptible<M: StrMem>(
                 let v = match mem.sload(sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
-                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                        if CHILD {
+                            cpu.rip = cur_addr;
+                            return Some(StringStop::Interrupted);
+                        }
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
                 cpu.write_gpr(RAX, v, elem);
@@ -7421,7 +7644,11 @@ pub fn string_run_interruptible<M: StrMem>(
                 let b = match mem.sload(da, elem) {
                     Ok(v) => v,
                     Err(t) => {
-                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault)
+                        if CHILD {
+                            cpu.rip = cur_addr;
+                            return Some(StringStop::Interrupted);
+                        }
+                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
                 let r = alu_sub(cpu.gpr[RAX] & m, b, 0, elem);
@@ -7434,13 +7661,21 @@ pub fn string_run_interruptible<M: StrMem>(
                 let a = match mem.sload(sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
-                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault)
+                        if CHILD {
+                            cpu.rip = cur_addr;
+                            return Some(StringStop::Interrupted);
+                        }
+                        return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
                 let b = match mem.sload(da, elem) {
                     Ok(v) => v,
                     Err(t) => {
-                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault)
+                        if CHILD {
+                            cpu.rip = cur_addr;
+                            return Some(StringStop::Interrupted);
+                        }
+                        return trap(cpu, cur_addr, da, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
                 let r = alu_sub(a, b, 0, elem);
@@ -7794,7 +8029,7 @@ pub fn cmpxchg_pair_run(
 
 fn cmpxchg_pair_mode<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     size: u8,

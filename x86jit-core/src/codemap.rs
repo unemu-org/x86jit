@@ -172,6 +172,11 @@ impl CodeMap {
     }
 
     fn root(&self) -> Option<&'static Node> {
+        #[cfg(test)]
+        assert!(
+            !CHILD_TEST_POISON.with(std::cell::Cell::get),
+            "child consulted parent code map"
+        );
         // SAFETY: Release publication initializes the whole immutable tree before
         // this Acquire. Every reachable node is leaked; even old roots stay valid.
         unsafe { self.root.load(Ordering::Acquire).as_ref() }
@@ -360,6 +365,21 @@ impl CodeMap {
         }
         None
     }
+}
+
+#[cfg(test)]
+std::thread_local! { static CHILD_TEST_POISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn with_child_test_poison<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CHILD_TEST_POISON.with(|v| v.set(false));
+        }
+    }
+    CHILD_TEST_POISON.with(|v| v.set(true));
+    let _reset = Reset;
+    f()
 }
 
 static CODE_MAP: CodeMap = CodeMap::new();

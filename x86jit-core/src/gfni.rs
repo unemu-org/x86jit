@@ -8,30 +8,31 @@
 //! an 8x8 GF(2) bit-matrix (one qword of the second operand per byte lane) followed
 //! by an XOR with `imm8`, per the Intel SDM `affine_byte` pseudocode.
 
-/// GF(2^8) multiplicative-inverse LUT (mod 0x11B), `inv(0) = 0` per GFNI/SDM.
-/// Built once at first use: GFNI drives the inverse over a full ZMM (64 bytes) in
-/// openssl's vectorized-AES hot loop, so a 256-entry table turns each inverse into one
-/// array index instead of an O(255) `gmul` search.
-fn gf_inv_lut() -> &'static [u8; 256] {
-    static LUT: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut t = [0u8; 256];
-        for (a, slot) in t.iter_mut().enumerate().skip(1) {
-            for b in 1u8..=255 {
-                if crate::aes::gmul(a as u8, b) == 1 {
-                    *slot = b;
-                    break;
-                }
+// SDM Vol 2A, GF2P8AFFINEINVQB, Table 3-52: inverse in GF(2^8) modulo 0x11B; inv(0) = 0.
+// Immutable process-wide data is safe even when a shared-address-space child
+// interrupts a parent thread executing the same instruction.
+static GF_INV: [u8; 256] = inverse_table();
+
+const fn inverse_table() -> [u8; 256] {
+    let mut table = [0; 256];
+    let mut a = 1;
+    while a < 256 {
+        let mut b = 1;
+        while b < 256 {
+            if crate::aes::gmul(a as u8, b as u8) == 1 {
+                table[a] = b as u8;
+                break;
             }
+            b += 1;
         }
-        t
-    })
+        a += 1;
+    }
+    table
 }
 
-/// GF(2^8) multiplicative inverse (mod 0x11B), with `inv(0) = 0` per GFNI/SDM.
 #[inline]
-fn gf_inv(a: u8) -> u8 {
-    gf_inv_lut()[a as usize]
+const fn gf_inv(a: u8) -> u8 {
+    GF_INV[a as usize]
 }
 
 /// `gf2p8mulb dst, src`: per byte, GF(2^8) multiply mod 0x11B.
@@ -106,6 +107,17 @@ mod tests {
         let a = 0x53u128;
         let b = 0xCAu128;
         assert_eq!(gf2p8mulb(a, b) & 0xff, 0x01);
+    }
+
+    #[test]
+    fn inverse_is_available_without_runtime_initialization() {
+        // SDM Vol 2A, GF2P8AFFINEINVQB, Table 3-52.
+        // Constant evaluation rejects any lazy initialization or atomic access.
+        const WITNESS: [u8; 3] = [gf_inv(0), gf_inv(1), gf_inv(0x53)];
+        assert_eq!(WITNESS, [0, 1, 0xca]);
+        for a in 1..=255 {
+            assert_eq!(crate::aes::gmul(a, gf_inv(a)), 1, "input {a:#x}");
+        }
     }
 
     #[test]

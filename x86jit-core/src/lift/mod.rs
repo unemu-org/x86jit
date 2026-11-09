@@ -29,6 +29,40 @@ use control::*;
 use integer::*;
 use vector::*;
 
+pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
+    fn push(&mut self, op: IrOp);
+}
+impl LiftBuffer for Vec<IrOp> {
+    #[inline(always)]
+    fn push(&mut self, op: IrOp) {
+        Vec::push(self, op);
+    }
+}
+struct BoundedOps<'a> {
+    ops: &'a mut Vec<IrOp>,
+    full: bool,
+}
+impl std::ops::Deref for BoundedOps<'_> {
+    type Target = [IrOp];
+    fn deref(&self) -> &[IrOp] {
+        self.ops
+    }
+}
+impl std::ops::DerefMut for BoundedOps<'_> {
+    fn deref_mut(&mut self) -> &mut [IrOp] {
+        self.ops
+    }
+}
+impl LiftBuffer for BoundedOps<'_> {
+    fn push(&mut self, op: IrOp) {
+        if self.ops.len() < self.ops.capacity() {
+            self.ops.push(op);
+        } else {
+            self.full = true;
+        }
+    }
+}
+
 /// Guest decode/lift context (§17.3): the effective operand/address-size default a
 /// block of bytes decodes and lifts under. This is a *decode context*, not the
 /// architectural mode register — a value threaded from Vm construction through the
@@ -267,7 +301,8 @@ fn exceeds_length_limit(code: &[u8], mode: CpuMode) -> bool {
             ) || (mode == CpuMode::Long64 && matches!(b, 0x40..=0x4f))
         })
         .count();
-    let mut probe = Vec::with_capacity(code.len());
+    let mut probe = [0; 15];
+    let mut probe_len = 0;
     for (i, &b) in code[..prefix_len].iter().enumerate() {
         let later = &code[i + 1..prefix_len];
         let keep = match b {
@@ -277,11 +312,14 @@ fn exceeds_length_limit(code: &[u8], mode: CpuMode) -> bool {
             _ => false, // LOCK and segment overrides do not change field lengths.
         };
         if keep {
-            probe.push(b);
+            probe[probe_len] = b;
+            probe_len += 1;
         }
     }
-    probe.extend_from_slice(&code[prefix_len..]);
-    let mut decoder = Decoder::new(mode.bits(), &probe, decoder_options(mode));
+    let suffix = &code[prefix_len..];
+    probe[probe_len..probe_len + suffix.len()].copy_from_slice(suffix);
+    probe_len += suffix.len();
+    let mut decoder = Decoder::new(mode.bits(), &probe[..probe_len], decoder_options(mode));
     let _ = decoder.decode();
     decoder.last_error() == DecoderError::NoMoreBytes
 }
@@ -297,7 +335,7 @@ fn emit_decode_exception(
     last_error: DecoderError,
     code: &[u8],
     mode: CpuMode,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
 ) -> bool {
     if last_error == DecoderError::InvalidInstruction {
         let vector = if !mode.wraps_16() && insn.len() == 15 && exceeds_length_limit(code, mode) {
@@ -329,7 +367,7 @@ const MAX_INSN_LEN_286: u32 = 10;
 /// Push a real-mode in-guest fault gate (`InsnStart` + `IntGate`) for `insn`, saving the
 /// faulting instruction itself as the return IP (these are all faults, restartable by
 /// `iret`). Shared by the #UD (invalid opcode) and 286 instruction-length #GP paths.
-fn push_real16_fault(insn: &Instruction, mode: CpuMode, vector: u8, ops: &mut Vec<IrOp>) {
+fn push_real16_fault(insn: &Instruction, mode: CpuMode, vector: u8, ops: &mut impl LiftBuffer) {
     ops.push(IrOp::InsnStart {
         guest_addr: insn.ip(),
     });
@@ -892,19 +930,7 @@ fn lift_one_attempt(
             icount: 1,
         });
     }
-    ops.push(IrOp::InsnStart {
-        guest_addr: insn.ip(),
-    });
-    lift_insn(
-        &insn,
-        &mut ops,
-        &mut tg,
-        mode,
-        &mut mmx::Sequence::default(),
-    )
-    .map_err(|e| refill_unsupported_bytes(e, code, start))?;
-    mark_memory_accesses(&insn, mode, &mut ops);
-    fill_ir_bytes(&insn, code, start, &mut ops);
+    lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg)?;
 
     Ok(IrBlock {
         guest_start: start,
@@ -913,6 +939,64 @@ fn lift_one_attempt(
         guest_len: insn.len() as u32,
         icount: 1,
     })
+}
+
+fn lower_one<const CHILD: bool>(
+    insn: &Instruction,
+    code: &[u8],
+    start: u64,
+    mode: CpuMode,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
+    // IRET lowering uses a temporary heap vector and descriptor helpers.
+    if CHILD
+        && matches!(
+            insn.mnemonic(),
+            Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq
+        )
+    {
+        return Err(unsupported_insn(insn));
+    }
+    ops.push(IrOp::InsnStart {
+        guest_addr: insn.ip(),
+    });
+    lift_insn(insn, ops, tg, mode, &mut mmx::Sequence::default())
+        .map_err(|e| refill_unsupported_bytes(e, code, start))?;
+    mark_memory_accesses(insn, mode, ops);
+    fill_ir_bytes(insn, code, start, ops);
+
+    Ok(())
+}
+
+/// Returns None while the decoder needs another fetch byte. Child fetch is
+/// incremental, so an inaccessible byte past a complete instruction is never read.
+pub(crate) fn lift_child(
+    code: &[u8],
+    start: u64,
+    mode: CpuMode,
+    ir: &mut IrBlock,
+) -> Result<Option<bool>, LiftError> {
+    let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
+    let insn = decoder.decode();
+    if insn.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
+        return Ok(None);
+    }
+    ir.ops.clear();
+    let mut ops = BoundedOps {
+        ops: &mut ir.ops,
+        full: false,
+    };
+    let mut tg = TempGen::new();
+    if !emit_decode_exception(&insn, decoder.last_error(), code, mode, &mut ops) {
+        lower_one::<true>(&insn, code, start, mode, &mut ops, &mut tg)?;
+    }
+    let full = ops.full;
+    ir.temp_count = tg.count();
+    ir.guest_start = start;
+    ir.guest_len = insn.len() as u32;
+    ir.icount = 1;
+    Ok(Some(full))
 }
 
 #[cfg(test)]
@@ -2084,7 +2168,7 @@ pub(crate) use vec_src_dispatch;
 /// Lift one instruction; returns `true` if it ends the block (control flow).
 fn lift_insn(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
     sequence: &mut mmx::Sequence,
@@ -2104,7 +2188,7 @@ fn lift_insn(
 
 fn lift_insn_inner(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
     sequence: &mut mmx::Sequence,
@@ -4440,7 +4524,7 @@ pub(crate) fn size_mask(size: u8) -> u64 {
 pub(crate) fn lower_read(
     insn: &Instruction,
     op_idx: u32,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     match insn.op_kind(op_idx) {
@@ -4502,7 +4586,7 @@ pub(crate) fn scalar_mem_size(insn: &Instruction, op_idx: u32) -> Result<u8, Lif
 pub(crate) fn lower_write_target(
     insn: &Instruction,
     op_idx: u32,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<WriteTarget, LiftError> {
     match insn.op_kind(op_idx) {
@@ -4544,7 +4628,7 @@ pub(crate) fn high_byte_parent(reg: Register) -> Option<Reg> {
 /// value (next-insn base) and adds FS/GS base when a segment prefix is present.
 pub(crate) fn effective_address(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     Ok(effective_address_parts(insn, ops, tg)?.0)
@@ -4554,7 +4638,7 @@ pub(crate) fn effective_address(
 /// then add the segment base (SDM Vol 2C §5.2, VPGATHERDD/VPGATHERQD).
 fn effective_address_vsib(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(Val, Val, bool), LiftError> {
     let addr32 = insn.code_size() == CodeSize::Code32
@@ -4570,7 +4654,7 @@ fn effective_address_vsib(
 /// Keep the architectural offset alongside the linear address for x87 FDP.
 fn effective_address_parts(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(Val, Val), LiftError> {
     let offset = effective_address_no_segment(insn, ops, tg)?;
@@ -4708,7 +4792,7 @@ fn memory_alignment(insn: &Instruction) -> Option<u8> {
 /// wraps this with [`with_segment`].
 pub(crate) fn effective_address_no_segment(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     let base = insn.memory_base();
@@ -4834,7 +4918,7 @@ pub(crate) fn effective_address_no_segment(
 pub(crate) fn with_segment(
     insn: &Instruction,
     addr: Val,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Val {
     if insn.code_size() == CodeSize::Code16 {
@@ -4905,7 +4989,12 @@ pub(crate) fn iced_segment_reg(reg: Register) -> Option<Reg> {
 /// `ss_base + (offset & 0xFFFF)` with `ss_base = SS << 4`; the caller passes an
 /// already-16-bit-wrapped offset. In Long64/Compat32 the stack is flat, so the offset
 /// *is* the address. `mark_memory_accesses` attaches Long64 SS metadata at lift time.
-pub(crate) fn stack_addr(offset: Val, ops: &mut Vec<IrOp>, tg: &mut TempGen, mode: CpuMode) -> Val {
+pub(crate) fn stack_addr(
+    offset: Val,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    mode: CpuMode,
+) -> Val {
     if !mode.wraps_16() {
         return offset;
     }
@@ -4921,7 +5010,7 @@ pub(crate) fn stack_addr(offset: Val, ops: &mut Vec<IrOp>, tg: &mut TempGen, mod
 }
 
 /// Emit a non-flag-setting 64-bit address addition.
-pub(crate) fn add_addr(a: Val, b: Val, ops: &mut Vec<IrOp>, tg: &mut TempGen) -> Val {
+pub(crate) fn add_addr(a: Val, b: Val, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
     let t = tg.fresh();
     ops.push(IrOp::Add {
         dst: t,
@@ -4934,13 +5023,18 @@ pub(crate) fn add_addr(a: Val, b: Val, ops: &mut Vec<IrOp>, tg: &mut TempGen) ->
 }
 
 /// Emit a `ReadReg` and return the temp holding the value.
-pub(crate) fn read_reg(reg: Reg, ops: &mut Vec<IrOp>, tg: &mut TempGen) -> Val {
+pub(crate) fn read_reg(reg: Reg, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
     let t = tg.fresh();
     ops.push(IrOp::ReadReg { dst: t, reg });
     Val::Temp(t)
 }
 
-pub(crate) fn emit_write(ops: &mut Vec<IrOp>, tg: &mut TempGen, target: WriteTarget, value: Val) {
+pub(crate) fn emit_write(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    target: WriteTarget,
+    value: Val,
+) {
     match target {
         WriteTarget::Reg { reg, size } => ops.push(IrOp::WriteReg {
             reg,
@@ -4995,7 +5089,11 @@ pub(crate) fn emit_write(ops: &mut Vec<IrOp>, tg: &mut TempGen, target: WriteTar
 }
 
 /// Emit a flag-free op producing a fresh temp, returning it as a `Val`.
-pub(crate) fn alu_none(ops: &mut Vec<IrOp>, tg: &mut TempGen, mk: impl FnOnce(u32) -> IrOp) -> Val {
+pub(crate) fn alu_none(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    mk: impl FnOnce(u32) -> IrOp,
+) -> Val {
     let t = tg.fresh();
     ops.push(mk(t));
     Val::Temp(t)
@@ -5005,7 +5103,7 @@ pub(crate) fn alu_none(ops: &mut Vec<IrOp>, tg: &mut TempGen, mk: impl FnOnce(u3
 /// value of the indirect register/memory operand.
 pub(crate) fn branch_target(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
 ) -> Result<Val, LiftError> {
@@ -5145,7 +5243,7 @@ pub(crate) fn mask_pc(addr: u64, mode: CpuMode) -> u64 {
 /// Emit a mask on a freshly-computed stack pointer temp so it is a valid pointer
 /// before it is used as a store address (§16): mod 2^32 in Compat32, mod 2^16 in
 /// Real16. Long mode passes through (RSP is already the full pointer).
-pub(crate) fn emit_sp_wrap(ops: &mut Vec<IrOp>, sp: Temp, mode: CpuMode) {
+pub(crate) fn emit_sp_wrap(ops: &mut impl LiftBuffer, sp: Temp, mode: CpuMode) {
     let mask = match mode {
         CpuMode::Compat32 => 0xFFFF_FFFFu64,
         CpuMode::Real16 => 0xFFFFu64,

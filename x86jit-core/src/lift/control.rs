@@ -8,7 +8,7 @@ use super::*;
 /// back via `complete_port_in`.
 pub(crate) fn lift_port_io(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     dir_out: bool,
 ) -> Result<(), LiftError> {
@@ -53,7 +53,7 @@ pub(crate) fn lift_port_io(
 /// a faulting store leaves RSP untouched for the retry (§16 pitfall #0).
 pub(crate) fn lift_push(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
 ) -> Result<(), LiftError> {
@@ -111,7 +111,7 @@ pub(crate) fn lift_push(
 ///   re-reads the same stack slot with the original RSP.
 pub(crate) fn lift_pop(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
 ) -> Result<(), LiftError> {
@@ -187,7 +187,7 @@ pub(crate) fn lift_pop(
 /// goes to [`lift_far_call_real16`], so reject it here rather than mis-execute.
 pub(crate) fn lift_call_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     if is_far_flow(insn) {
@@ -232,7 +232,7 @@ pub(crate) fn lift_call_real16(
 /// immediate. A far `ret` (`retf`) goes to [`lift_retf_real16`].
 pub(crate) fn lift_ret_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     if is_far_flow(insn) {
@@ -304,7 +304,7 @@ pub(crate) fn is_far_call(insn: &Instruction) -> bool {
 /// `repe`/`repne` (both share the F3/F2 prefix bytes with the instruction kind).
 pub(crate) fn lift_string(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: StrOp,
     elem: u8,
@@ -396,7 +396,7 @@ pub(crate) fn lift_string(
 
 /// Real-mode segment base `selector << 4` as a `Val` (§17.6): read the 16-bit selector
 /// and shift it left by 4. Used by string ops and far-pointer loads.
-fn seg_base_shl4(seg: Reg, ops: &mut Vec<IrOp>, tg: &mut TempGen) -> Val {
+fn seg_base_shl4(seg: Reg, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
     let sel = read_reg(seg, ops, tg);
     alu_none(ops, tg, |dst| IrOp::Shl {
         dst,
@@ -431,9 +431,9 @@ pub(crate) fn dst_is_st0(insn: &Instruction) -> bool {
 
 /// Lift one x87 FPU instruction to an `X87` IR op (§14). Memory operands are
 /// reduced to an effective address; register forms carry ST(i) in `sti`.
-pub(crate) fn lift_x87(
+pub(crate) fn lift_x87<B: LiftBuffer>(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut B,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     use crate::x87::FpuKind as K;
@@ -444,7 +444,7 @@ pub(crate) fn lift_x87(
     let sti = st_index(insn);
 
     // Emit an X87 op with a freshly computed address (memory forms) or a dummy.
-    let emit = |kind: K, ops: &mut Vec<IrOp>, tg: &mut TempGen| -> Result<(), LiftError> {
+    let emit = |kind: K, ops: &mut B, tg: &mut TempGen| -> Result<(), LiftError> {
         let (addr, operand_offset) = if mem {
             effective_address_parts(insn, ops, tg)?
         } else {
@@ -798,7 +798,7 @@ pub(crate) fn sreg_operand(insn: &Instruction, idx: u32) -> Option<Reg> {
 /// only for the `#UD` path.
 pub(crate) fn lift_mov_sreg_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<bool, LiftError> {
     if let Some(seg) = sreg_operand(insn, 0) {
@@ -833,7 +833,7 @@ pub(crate) fn lift_mov_sreg_real16(
 /// `effective_address`), off the pre-transfer stack for SS-relative forms.
 fn far_target(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(Val, Val), LiftError> {
     match insn.op_kind(0) {
@@ -868,7 +868,7 @@ fn far_target(
 /// Far `jmp` in real mode (§17.6): `jmp ptr16:16` (`EA`) or `jmp m16:16` (`FF /5`).
 pub(crate) fn lift_far_jmp_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (cs, ip) = far_target(insn, ops, tg)?;
@@ -881,7 +881,7 @@ pub(crate) fn lift_far_jmp_real16(
 /// is pushed, matching hardware.
 pub(crate) fn lift_far_call_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (cs, ip) = far_target(insn, ops, tg)?;
@@ -891,7 +891,10 @@ pub(crate) fn lift_far_call_real16(
 }
 
 /// Far `ret` / `retf` in real mode (§17.6): `retf` (`CB`) or `retf imm16` (`CA`).
-pub(crate) fn lift_retf_real16(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
+pub(crate) fn lift_retf_real16(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+) -> Result<(), LiftError> {
     let pop_extra = if insn.op_count() > 0 {
         insn.immediate16()
     } else {
@@ -907,7 +910,7 @@ pub(crate) fn lift_retf_real16(insn: &Instruction, ops: &mut Vec<IrOp>) -> Resul
 /// 286 (iced decodes them with a `NearBranch16` target).
 pub(crate) fn lift_loop_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     kind: LoopKind,
 ) -> Result<(), LiftError> {
     ops.push(IrOp::LoopCx {
@@ -924,7 +927,7 @@ pub(crate) fn lift_loop_real16(
 /// `selector << 4`.
 pub(crate) fn lift_xlat_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let seg = iced_segment_reg(insn.memory_segment()).unwrap_or(Reg::Ds);
@@ -990,7 +993,7 @@ pub(crate) fn lift_xlat_real16(
 /// 66h prefix is rejected as unsupported.
 pub(crate) fn lift_bound_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     // Index register (op0). A 32-bit operand size (66h override) is not a 286 form.
@@ -1034,7 +1037,7 @@ pub(crate) fn lift_bound_real16(
 /// fault, so the op is naturally restartable on a load fault.
 pub(crate) fn lift_load_far_ptr_real16(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     seg: Reg,
 ) -> Result<(), LiftError> {
@@ -1082,7 +1085,7 @@ pub(crate) fn lift_load_far_ptr_real16(
 /// fault) commits first; the BP load address was taken from the pre-`leave` BP.
 pub(crate) fn lift_leave_real16(
     _insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let bp = read_reg(Reg::Rbp, ops, tg);
@@ -1125,7 +1128,10 @@ pub(crate) fn lift_leave_real16(
 
 // Descriptor loads are delegated before reading even a memory source: the
 // embedder owns descriptor validation (SDM Vol 2B §4.3 MOV, Operation).
-pub(crate) fn lift_unsupported(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<bool, LiftError> {
+pub(crate) fn lift_unsupported(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+) -> Result<bool, LiftError> {
     let LiftError::Unsupported { bytes, len, .. } = unsupported_insn(insn) else {
         unreachable!()
     };
@@ -1135,7 +1141,7 @@ pub(crate) fn lift_unsupported(insn: &Instruction, ops: &mut Vec<IrOp>) -> Resul
 
 pub(crate) fn lift_mov_sreg_user(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<bool, LiftError> {
     if insn.op_register(0).is_segment_register() {
@@ -1161,7 +1167,7 @@ fn flags_size(insn: &Instruction) -> u8 {
 
 pub(crate) fn lift_flag_stack(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
     pop: bool,
@@ -1205,7 +1211,7 @@ pub(crate) fn lift_flag_stack(
 
 pub(crate) fn lift_iret_user(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
 ) -> Result<(), LiftError> {

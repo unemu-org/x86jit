@@ -10,7 +10,7 @@ pub(super) struct Sequence {
 }
 
 impl Sequence {
-    pub(super) fn check(&mut self, i: &Instruction, ops: &mut Vec<IrOp>) {
+    pub(super) fn check(&mut self, i: &Instruction, ops: &mut impl LiftBuffer) {
         // SDM Vol 3A §15.5.1; Vol 2A §3.3 CVTPI2PD: only xmm,m64 is exempt.
         let mmx = handles(i)
             || matches!(
@@ -31,7 +31,7 @@ impl Sequence {
         }
     }
 
-    pub(super) fn enter(&mut self, ops: &mut Vec<IrOp>) {
+    pub(super) fn enter(&mut self, ops: &mut impl LiftBuffer) {
         // SDM Vol 3A §15.2 Table 15-2: MMX cannot create pending x87 exceptions
         // or change their masks. Once checked/entered, integer/SIMD
         // work cannot invalidate either fact. Every entry starts with fresh knowledge.
@@ -70,7 +70,7 @@ fn read(
     i: &Instruction,
     n: u32,
     size: u8,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     if i.op_kind(n) == OpKind::Register && i.op_register(n).is_mm() {
@@ -98,7 +98,7 @@ fn read(
 fn write(
     i: &Instruction,
     value: Val,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     sequence: &mut Sequence,
 ) -> Result<(), LiftError> {
@@ -124,7 +124,7 @@ fn write(
 
 pub(super) fn lift(
     i: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     sequence: &mut Sequence,
 ) -> Result<bool, LiftError> {
@@ -280,7 +280,7 @@ pub(super) fn lift(
 
 fn lift_conversion(
     i: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     sequence: &mut Sequence,
 ) -> Result<bool, LiftError> {

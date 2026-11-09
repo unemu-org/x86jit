@@ -66,7 +66,7 @@ fn from_bytes(b: [u8; 16]) -> u128 {
 
 /// GF(2^8) multiply by 2 (`xtime`), reduced by the AES polynomial 0x11B.
 #[inline]
-fn xtime(a: u8) -> u8 {
+const fn xtime(a: u8) -> u8 {
     let hi = a & 0x80;
     let s = a << 1;
     if hi != 0 {
@@ -79,9 +79,11 @@ fn xtime(a: u8) -> u8 {
 /// GF(2^8) multiply of `a` by `b`, reduced by 0x11B (carryless mul + reduce).
 /// Shared with the GFNI primitives (`gfni.rs`).
 #[inline]
-pub(crate) fn gmul(mut a: u8, mut b: u8) -> u8 {
+pub(crate) const fn gmul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
-    for _ in 0..8 {
+    let mut i = 0;
+    while i < 8 {
+        i += 1;
         if b & 1 != 0 {
             p ^= a;
         }

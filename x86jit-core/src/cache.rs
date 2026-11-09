@@ -133,6 +133,17 @@ pub struct TranslationCache {
 }
 
 impl TranslationCache {
+    #[cfg(test)]
+    pub(crate) fn poison_for_child_test(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _map = self.map.write().unwrap();
+            let _spans = self.spans.write().unwrap();
+            panic!("poison parent translation cache");
+        }));
+        assert!(result.is_err());
+        assert!(self.map.is_poisoned() && self.spans.is_poisoned());
+    }
+
     pub fn new() -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
@@ -454,6 +465,24 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
+        self.invalidate_range::<false>(lo, hi, on_clear_page)
+    }
+
+    pub(crate) fn invalidate_child_written(
+        &self,
+        lo: u64,
+        hi: u64,
+        on_clear_page: impl FnOnce(),
+    ) -> Vec<BlockKey> {
+        self.invalidate_range::<true>(lo, hi, on_clear_page)
+    }
+
+    fn invalidate_range<const CHILD: bool>(
+        &self,
+        lo: u64,
+        hi: u64,
+        on_clear_page: impl FnOnce(),
+    ) -> Vec<BlockKey> {
         let mut spans = self.spans.write().unwrap();
         let mut map = self.map.write().unwrap();
         // SMC is address-scoped: a write to `[lo, hi)` drops every overlapping unit
@@ -486,9 +515,10 @@ impl TranslationCache {
         on_clear_page();
         // With a policy, an uncached region successor may already be approved
         // in an in-flight lift, so even a victim-free invalidation rejects it.
-        // Otherwise data writes retain the existing epoch. `Release` pairs with
+        // A child log also cancels a first publication still compiling without
+        // a cached span. Otherwise data writes retain the existing epoch. `Release` pairs with
         // the `Acquire` load in `epoch()`.
-        if !victims.is_empty() || self.invalidate_pending_fetches {
+        if CHILD || !victims.is_empty() || self.invalidate_pending_fetches {
             self.epoch.fetch_add(1, Ordering::Release);
         }
         victims

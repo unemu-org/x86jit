@@ -7,7 +7,7 @@ use super::*;
 /// retry is idempotent from the same inputs).
 pub(crate) fn lift_binop(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: BinOp,
     flags: FlagMask,
@@ -91,14 +91,14 @@ pub(crate) fn lift_binop(
 /// register → read/compute/write. The op-specific bits are the atomic `(rmw_op,
 /// rmw_src)`, whether it recomputes flags, and `emit`, which pushes the non-atomic
 /// compute `res = f(a)` (also reused for the atomic flag-recompute with `a = old`).
-pub(crate) fn lift_unary_op0(
+pub(crate) fn lift_unary_op0<B: LiftBuffer>(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut B,
     tg: &mut TempGen,
     rmw_op: RmwOp,
     rmw_src: Val,
     recompute_flags: bool,
-    mut emit: impl FnMut(&mut Vec<IrOp>, crate::ir::Temp, Val, u8),
+    mut emit: impl FnMut(&mut B, crate::ir::Temp, Val, u8),
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
     if insn.op_kind(0) == OpKind::Memory {
@@ -152,7 +152,7 @@ pub(crate) fn lift_unary_op0(
 /// `inc`/`dec`: `op0 ± 1`, flags set but CF preserved (§8.2.3).
 pub(crate) fn lift_incdec(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: BinOp,
 ) -> Result<(), LiftError> {
@@ -185,7 +185,7 @@ pub(crate) fn lift_incdec(
 /// source, op1 (r) supplies the fill bits, op2 (imm8 or CL) is the count.
 pub(crate) fn lift_double_shift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     left: bool,
 ) -> Result<(), LiftError> {
@@ -241,7 +241,7 @@ pub(crate) fn lift_double_shift(
 /// `neg`: `0 - op0`. Flags exactly as `sub` from zero (CF set iff operand ≠ 0).
 pub(crate) fn lift_neg(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     lift_unary_op0(
@@ -267,7 +267,7 @@ pub(crate) fn lift_neg(
 /// flag mask (the result is masked to the operand size by the interpreter).
 pub(crate) fn lift_not(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     lift_unary_op0(
@@ -293,7 +293,7 @@ pub(crate) fn lift_not(
 /// expressible), so it's rejected; 16/32/64-bit split into RAX (low) and RDX (high).
 pub(crate) fn lift_widening_mul(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     signed: bool,
 ) -> Result<(), LiftError> {
@@ -369,7 +369,7 @@ pub(crate) fn lift_widening_mul(
 /// CF/OF still flag overflow of the full signed product.
 pub(crate) fn lift_imul(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     match insn.op_count() {
@@ -405,7 +405,7 @@ pub(crate) fn lift_imul(
 /// retry sees clean state (§16).
 pub(crate) fn lift_div(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     signed: bool,
 ) -> Result<(), LiftError> {
@@ -484,7 +484,7 @@ pub(crate) fn lift_div(
 /// register receives the prior memory value.
 pub(crate) fn lift_xadd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
@@ -533,7 +533,7 @@ pub(crate) fn lift_xadd(
 /// on failure. Memory destinations use a single CAS (§8.2.3).
 pub(crate) fn lift_cmpxchg(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
@@ -616,7 +616,7 @@ pub(crate) fn lift_cmpxchg(
     Ok(())
 }
 
-fn cmpxchg_select(ops: &mut Vec<IrOp>, tg: &mut TempGen, a: Val, b: Val, mask: Val) -> Val {
+fn cmpxchg_select(ops: &mut impl LiftBuffer, tg: &mut TempGen, a: Val, b: Val, mask: Val) -> Val {
     let diff = alu_none(ops, tg, |dst| IrOp::Xor {
         dst,
         a,
@@ -644,7 +644,7 @@ fn cmpxchg_select(ops: &mut Vec<IrOp>, tg: &mut TempGen, a: Val, b: Val, mask: V
 /// Keep conditional pair writes and the faulting CAS in one operation.
 pub(crate) fn lift_cmpxchg_pair(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     if insn.op_kind(0) != OpKind::Memory {
@@ -668,7 +668,7 @@ pub(crate) fn lift_cmpxchg_pair(
 /// `bsf`/`bsr`: bit-scan the source into the destination register, setting ZF.
 pub(crate) fn lift_bitscan(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: crate::ir::BitScanOp,
 ) -> Result<(), LiftError> {
@@ -699,7 +699,7 @@ pub(crate) fn lift_bitscan(
 /// the plain operand-width load/store.
 pub(crate) fn lift_bt(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: BtOp,
 ) -> Result<(), LiftError> {
@@ -763,7 +763,7 @@ pub(crate) fn lift_bt(
 /// bitmap must not tear the read-modify-write); everything else keeps the plain
 /// load-modify-store. `bt` (test) never writes, so its single load is already atomic.
 pub(crate) fn emit_mem_bt(
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     ea: Val,
     esize: u8,
@@ -867,7 +867,7 @@ pub(crate) fn emit_mem_bt(
 /// `bswap`: reverse the byte order of a 32/64-bit register. No flags.
 pub(crate) fn lift_bswap(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
@@ -884,7 +884,7 @@ pub(crate) fn lift_bswap(
 /// `BmiOp` — one seam for the whole family.
 pub(crate) fn lift_bmi(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: crate::ir::BmiOp,
 ) -> Result<(), LiftError> {
@@ -913,7 +913,7 @@ pub(crate) fn lift_bmi(
 /// before `hi` gives the correct `hi` when the two destinations are the same register.
 pub(crate) fn lift_mulx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
@@ -942,7 +942,7 @@ pub(crate) fn lift_mulx(
 /// with `FlagMask::NONE`. `mk` builds the specific op.
 pub(crate) fn lift_bmi_shift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mk: impl Fn(crate::ir::Temp, Val, Val, u8, FlagMask) -> IrOp,
 ) -> Result<(), LiftError> {
@@ -961,7 +961,7 @@ pub(crate) fn lift_bmi_shift(
 /// swaps, writes the register; `movbe m, r` swaps the register, stores. No flags.
 pub(crate) fn lift_movbe(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let size = operand_size(insn, 0);
@@ -1009,7 +1009,7 @@ pub(crate) fn lift_movbe(
 /// form is a plain swap. No flags either way.
 pub(crate) fn lift_xchg(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let reg_idx = if insn.op_kind(0) == OpKind::Memory {
@@ -1049,7 +1049,7 @@ pub(crate) fn lift_xchg(
 /// `movzx`: zero-extend the source (mask to its width), write with the dst width.
 pub(crate) fn lift_movzx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let src_size = operand_size(insn, 1);
@@ -1070,7 +1070,7 @@ pub(crate) fn lift_movzx(
 /// `movsx`/`movsxd`: sign-extend the source to 64 bits, write with the dst width.
 pub(crate) fn lift_movsx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let src_size = operand_size(insn, 1);
@@ -1090,7 +1090,7 @@ pub(crate) fn lift_movsx(
 /// bytes (AL→AX, AX→EAX, EAX→RAX). Writing `to=4` zeroes RAX's upper 32 (x86);
 /// `to=2` merges into RAX, preserving bits above 16.
 pub(crate) fn lift_cbw_family(
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: u8,
     to: u8,
@@ -1114,7 +1114,7 @@ pub(crate) fn lift_cbw_family(
 /// (arithmetic shift by width-1). The DX write uses the operand width, so `cdq`
 /// zero-extends the upper 32 bits of RDX and `cwd` preserves the upper 48.
 pub(crate) fn lift_sign_into_dx(
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     size: u8,
 ) -> Result<(), LiftError> {
@@ -1138,7 +1138,7 @@ pub(crate) fn lift_sign_into_dx(
 /// `setcc r/m8`: materialize the condition as 0/1 into an 8-bit destination.
 pub(crate) fn lift_setcc(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     cond: Cond,
 ) -> Result<(), LiftError> {
@@ -1154,7 +1154,7 @@ pub(crate) fn lift_setcc(
 /// `dst ^ ((dst ^ src) & mask)` where `mask` is all-ones iff the condition holds.
 pub(crate) fn lift_cmovcc(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     cond: Cond,
 ) -> Result<(), LiftError> {

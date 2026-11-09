@@ -823,6 +823,76 @@ pub struct Memory {
 unsafe impl Sync for Memory {}
 
 impl Memory {
+    pub(crate) fn child_view<'vm>(
+        &self,
+        vm: &'vm crate::Vm,
+        mode: crate::CpuMode,
+    ) -> crate::ChildView<'vm> {
+        let regions: Vec<_> = self
+            .regions
+            .iter()
+            .map(|r| crate::child::Region {
+                start: r.start,
+                end: r.start + r.size as u64,
+                kind: r.kind,
+                _prot: r.prot,
+            })
+            .collect();
+        // Only the widened code extent can contain set bits. Retain nonzero words
+        // as plain data instead of copying the full sparse address-space bitmap.
+        let range = self.code_range.load(Ordering::Acquire);
+        let lo = (range >> 32) << CODE_RANGE_BITS;
+        let hi = ((range >> 32) + (range & 0xffff_ffff)) << CODE_RANGE_BITS;
+        let first_page = self.guest_base >> CODE_PAGE_BITS;
+        let first_word = ((lo >> CODE_PAGE_BITS).saturating_sub(first_page) >> 6) as usize;
+        let end_word = (((hi >> CODE_PAGE_BITS).saturating_sub(first_page) + 63) >> 6) as usize;
+        let code = (first_word..end_word.min(self.code_page.len()))
+            .filter_map(|i| {
+                let bits = self.code_page[i].load(Ordering::Acquire);
+                (bits != 0).then_some((i as u64, bits))
+            })
+            .collect();
+        let fetch = self.fetch_policy.as_ref().map(|policy| {
+            let mut pages = BTreeSet::new();
+            for r in &regions {
+                if r.end > r.start && r.kind != RegionKind::Trap {
+                    pages.extend((r.start >> CODE_PAGE_BITS)..=((r.end - 1) >> CODE_PAGE_BITS));
+                }
+            }
+            pages
+                .into_iter()
+                .map(|page| {
+                    let (w, mask) = word_bit(page.wrapping_sub(first_page));
+                    let allowed = policy
+                        .approved
+                        .get(w)
+                        .is_some_and(|v| v.load(Ordering::Acquire) & mask != 0);
+                    // Snapshot a verdict without marking untouched data pages as code.
+                    let verdict = if allowed {
+                        FetchVerdict::Allow
+                    } else {
+                        (policy.callback)(page << CODE_PAGE_BITS)
+                    };
+                    (page, verdict)
+                })
+                .collect()
+        });
+        crate::ChildView {
+            base: self.host_base() as usize,
+            guest_base: self.guest_base,
+            top: self.size(),
+            regions,
+            code,
+            fetch,
+            recover: self.recover_host_faults,
+            mode,
+            features: vm.guest_cpu_features(),
+            identity: vm.cpuid_table().cloned(),
+            x87_pointer_model: vm.x87_pointer_model(),
+            lifetime: std::marker::PhantomData,
+        }
+    }
+
     /// Route Rust guest transfers through signal-context fixups when the embedder
     /// owns host protections. Disabled by default. Install a handler calling
     /// `jit_abi::fault::classify` on every accessing thread before enabling this
@@ -3473,43 +3543,124 @@ pub(crate) fn host_page_size() -> usize {
     4096
 }
 
-// A borrowed specialization has exactly Memory's representation, avoiding a
-// pointer-to-pointer on out-of-line interpreter helpers.
+// A borrowed specialization retains its backing's representation, avoiding a
+// pointer-to-pointer on normal out-of-line interpreter helpers.
 #[repr(transparent)]
-pub(crate) struct Access<const ROUTED: bool>(pub Memory);
-impl<const ROUTED: bool> std::ops::Deref for Access<ROUTED> {
-    type Target = Memory;
-    fn deref(&self) -> &Memory {
-        &self.0
+pub(crate) struct Access<const ROUTED: bool, M = Memory>(pub M);
+
+pub(crate) trait InterpreterMemory {
+    fn normal(&self) -> &Memory;
+    fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap>;
+    fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap>;
+    fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap>;
+    fn preflight_store<const ROUTED: bool>(
+        &self,
+        base: u64,
+        mask: u64,
+        elem: u8,
+        bytes: u16,
+    ) -> Result<(), (u64, MemTrap)> {
+        if ROUTED {
+            crate::interp::preflight_store_pages(
+                base,
+                mask,
+                elem,
+                bytes,
+                self.normal().host_base() as usize,
+                self.normal().guest_base(),
+                (
+                    |a, n| self.probe_write::<false>(a, n),
+                    |a, n| self.probe_write::<true>(a, n),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+    fn stopped(&self) -> bool {
+        false
+    }
+    fn begin_op(&self, _op: &crate::IrOp, _temps: &[u64], _cpu: &crate::CpuState) {}
+    fn exception(&self, _vector: u8, _cause: crate::FaultCause, _advance: u8) {
+        unreachable!("child exception on normal memory")
+    }
+    fn string<const ROUTED: bool>(
+        &self,
+        _cpu: &mut crate::CpuState,
+        _op: crate::ir::StrOp,
+        _elem: u8,
+        _rep: crate::ir::RepKind,
+        _bits: u8,
+        _base: u64,
+    ) {
+        unreachable!("child string on normal memory")
     }
 }
-impl<const ROUTED: bool> Access<ROUTED> {
+impl InterpreterMemory for Memory {
     #[inline(always)]
-    pub fn new(mem: &Memory) -> &Self {
-        // SAFETY: transparent wrapper; shared borrowing retains Memory's lifetime
-        // and interior-mutability contract. No owned Access is constructed.
-        unsafe { &*(mem as *const Memory).cast::<Self>() }
+    fn normal(&self) -> &Memory {
+        self
+    }
+    #[inline(always)]
+    fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        self.read_mode::<ROUTED>(addr, size)
+    }
+    #[inline(always)]
+    fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        self.write_mode::<ROUTED>(addr, value, size)
+    }
+    #[inline(always)]
+    fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
+        self.probe_write_mode::<ROUTED>(addr, size)
+    }
+}
+impl<const ROUTED: bool, M: InterpreterMemory> std::ops::Deref for Access<ROUTED, M> {
+    type Target = Memory;
+    #[inline(always)]
+    fn deref(&self) -> &Memory {
+        self.0.normal()
+    }
+}
+impl<const ROUTED: bool, M: InterpreterMemory> Access<ROUTED, M> {
+    #[inline(always)]
+    pub fn new(mem: &M) -> &Self {
+        // SAFETY: transparent wrapper; shared borrowing retains the backing's
+        // lifetime and interior-mutability contract. No owned Access is constructed.
+        unsafe { &*(mem as *const M).cast::<Self>() }
     }
     #[inline(always)]
     pub fn read(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
-        self.0.read_mode::<ROUTED>(addr, size)
+        self.0.read::<ROUTED>(addr, size)
     }
     #[inline(always)]
     pub fn write(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
-        self.0.write_mode::<ROUTED>(addr, value, size)
+        self.0.write::<ROUTED>(addr, value, size)
     }
     #[inline(always)]
     pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
-        self.0.probe_write_mode::<ROUTED>(addr, size)
+        self.0.probe_write::<ROUTED>(addr, size)
+    }
+    #[inline(always)]
+    pub fn probe_write_mode<const RECOVER: bool>(
+        &self,
+        addr: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.0.probe_write::<RECOVER>(addr, size)
     }
     pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
-        self.0.atomic_rmw_mode::<ROUTED>(addr, src, size, op)
+        self.0
+            .normal()
+            .atomic_rmw_mode::<ROUTED>(addr, src, size, op)
     }
     pub fn atomic_cas128(&self, addr: u64, expected: u128, src: u128) -> Result<u128, MemTrap> {
-        self.0.atomic_cas128_mode::<ROUTED>(addr, expected, src)
+        self.0
+            .normal()
+            .atomic_cas128_mode::<ROUTED>(addr, expected, src)
     }
     pub fn atomic_cas(&self, addr: u64, expected: u64, src: u64, size: u8) -> Result<u64, MemTrap> {
-        self.0.atomic_cas_mode::<ROUTED>(addr, expected, src, size)
+        self.0
+            .normal()
+            .atomic_cas_mode::<ROUTED>(addr, expected, src, size)
     }
 }
 
@@ -3520,5 +3671,61 @@ mod fault_layout_tests {
     fn hot_fault_layouts_remain_compact() {
         assert_eq!(std::mem::size_of::<MemTrap>(), 1);
         assert_eq!(std::mem::size_of::<Result<(), MemTrap>>(), 1);
+    }
+}
+
+#[cfg(test)]
+mod child_isolation_tests {
+    use super::*;
+    use crate::{child, ChildArena, ChildStep, CpuMode, CpuState, Vm, VmConfig};
+
+    #[test]
+    fn child_step_does_not_consult_poisoned_parent_engine() {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x48, 0x89, 0x18, 0x0f, 0x05])
+            .unwrap();
+        vm.set_fetch_policy(Box::new(|_| FetchVerdict::Allow));
+        let view = vm.child_view(CpuMode::Long64);
+        vm.cache.poison_for_child_test();
+        // All these locks belong to the parent; poison them before child entry.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _dirty = vm.mem.dirty.lock().unwrap();
+            let _dispatch = vm.mem.dispatch_words.lock().unwrap();
+            let _watch = vm.mem.watch.words.lock().unwrap();
+            let _fetch = vm.mem.fetch_policy.as_ref().unwrap().state.lock().unwrap();
+            panic!("poison parent memory and policy");
+        }));
+        assert!(result.is_err());
+        assert!(vm.mem.dirty.is_poisoned() && vm.mem.dispatch_words.is_poisoned());
+        assert!(vm.mem.watch.words.is_poisoned());
+        assert!(vm.mem.fetch_policy.as_ref().unwrap().state.is_poisoned());
+        // Change live metadata after the snapshot; the child must use its copy.
+        vm.mem.mark_code(0x3000, 1);
+        vm.mem.last_region.store(usize::MAX, Ordering::Relaxed);
+        vm.mem.watch.count.store(1, Ordering::Relaxed);
+        vm.mem.watch.watch[0].store(u64::MAX, Ordering::Relaxed);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = 0x3000;
+        cpu.gpr[3] = 0x1234;
+        let mut arena = ChildArena::new(4);
+        crate::codemap::with_child_test_poison(|| {
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Continue
+            ));
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Syscall { .. }
+            ));
+        });
+        assert_eq!(vm.mem.last_region.load(Ordering::Relaxed), usize::MAX);
+        assert!(!vm.mem.dirty_flag.load(Ordering::Relaxed));
+        assert_eq!(vm.mem.watch.dirty[0].load(Ordering::Relaxed), 0);
+        assert_eq!(&*arena.written_pages(), &[3]);
     }
 }

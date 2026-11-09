@@ -89,10 +89,13 @@ impl FpMem for crate::memory::Memory {
     }
 }
 
-impl<const ROUTED: bool> FpMem for crate::memory::Access<ROUTED> {
+impl<const ROUTED: bool, M: crate::memory::InterpreterMemory> FpMem
+    for crate::memory::Access<ROUTED, M>
+{
     #[inline(always)]
     fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
         self.0
+            .normal()
             .read_ram_checked_mode::<ROUTED>(addr, buf)
             .map_err(|at| {
                 if ROUTED {
@@ -104,6 +107,7 @@ impl<const ROUTED: bool> FpMem for crate::memory::Access<ROUTED> {
     #[inline(always)]
     fn store(&self, addr: u64, buf: &[u8]) -> bool {
         self.0
+            .normal()
             .write_ram_checked_mode::<ROUTED>(addr, buf)
             .map_err(|at| {
                 if ROUTED {

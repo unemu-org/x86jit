@@ -637,6 +637,9 @@ impl CpuState {
     }
 
     /// The effective CPUID source used by both backends and coverage tools.
+    // Keep CPUID resolution out of the large interpreter dispatch loop: inlining
+    // it changes register allocation even for instruction arms that never use it.
+    #[inline(never)]
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> crate::features::CpuidRegisters {
         let (leaf, subleaf, regs) = match &self.cpuid_table {
             Some(table) => table.resolve(leaf, subleaf),

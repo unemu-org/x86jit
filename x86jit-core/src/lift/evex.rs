@@ -58,7 +58,7 @@ fn scratch(insn: &Instruction) -> impl Iterator<Item = u8> + '_ {
     })
 }
 
-fn save(reg: u8, ops: &mut Vec<IrOp>, tg: &mut TempGen) -> [Temp; 8] {
+fn save(reg: u8, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> [Temp; 8] {
     std::array::from_fn(|chunk| {
         let dst = tg.fresh();
         ops.push(IrOp::VReadChunk {
@@ -70,7 +70,7 @@ fn save(reg: u8, ops: &mut Vec<IrOp>, tg: &mut TempGen) -> [Temp; 8] {
     })
 }
 
-fn restore(reg: u8, saved: [Temp; 8], ops: &mut Vec<IrOp>) {
+fn restore(reg: u8, saved: [Temp; 8], ops: &mut impl LiftBuffer) {
     for (chunk, src) in saved.into_iter().enumerate() {
         ops.push(IrOp::VWriteChunk {
             dst: reg,
@@ -92,7 +92,7 @@ fn vector_register(reg: u8, bytes: u16) -> Register {
 
 pub(super) fn lift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
     sequence: &mut mmx::Sequence,
@@ -219,7 +219,7 @@ pub(super) fn lift(
 
 fn lift_existing(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     mode: CpuMode,
     sequence: &mut mmx::Sequence,

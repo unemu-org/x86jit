@@ -5,7 +5,7 @@ use super::*;
 /// Scalar SQRTSS/SD operands do not require explicit alignment.
 pub(crate) fn legacy_sse_memory(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<Val, LiftError> {
     effective_address(insn, ops, tg)
@@ -15,7 +15,7 @@ pub(crate) fn legacy_sse_memory(
 /// 255:128 of the YMM. A store (mem dest) writes no register.
 pub(crate) fn lift_vmov_vex(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     size: u8,
 ) -> Result<(), LiftError> {
@@ -30,7 +30,7 @@ pub(crate) fn lift_vmov_vex(
 /// source across the XMM/YMM destination.
 pub(crate) fn lift_broadcast(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -130,7 +130,7 @@ pub(crate) fn lift_broadcast(
 /// Register or memory chunk source.
 pub(crate) fn lift_broadcast_lane(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     chunk: u8,
     elem: u8,
@@ -169,7 +169,7 @@ pub(crate) fn lift_broadcast_lane(
 /// width. VEX.128 clears the dest's upper 128 bits.
 pub(crate) fn lift_vpacked_shift_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     right: bool,
@@ -293,7 +293,7 @@ pub(crate) fn lift_vpacked_shift_avx(
 /// `elem`-byte lane of src1 by the count in the matching lane of src2 (register or VEX memory). Any width (128/256/512) + optional EVEX write-masking via `VShiftVar`.
 pub(crate) fn lift_vshift_var(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     right: bool,
@@ -340,7 +340,7 @@ pub(crate) fn lift_vshift_var(
 /// scratch register. Shares the GF(2⁸) math with the VEX.128 path via `GfniOp`.
 fn lift_vgfni_wide(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: GfniOp,
     dst: u8,
@@ -388,7 +388,7 @@ fn lift_vgfni_wide(
 /// `VLogic256`/`VLogic256M`, else the VEX.128 path.
 pub(crate) fn lift_vlogic_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: VLogicOp,
 ) -> Result<(), LiftError> {
@@ -417,7 +417,7 @@ pub(crate) fn lift_vlogic_avx(
 /// VEX packed integer arithmetic dispatching on width: YMM → `VPackedBin256`.
 pub(crate) fn lift_vpacked_bin_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     op: PackedBinOp,
@@ -506,7 +506,7 @@ pub(crate) fn lift_vpacked_bin_avx(
 /// operand routes to the 256-bit ops, else the VEX.128 path.
 pub(crate) fn lift_vmov_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -645,7 +645,7 @@ pub(crate) fn lift_vmov_avx(
 /// upper part of the destination xmm.
 pub(crate) fn lift_vmov(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     size: u8,
 ) -> Result<(), LiftError> {
@@ -723,7 +723,7 @@ pub(crate) fn lift_vmov(
 /// register or memory source.
 pub(crate) fn lift_vlogic(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: VLogicOp,
 ) -> Result<(), LiftError> {
@@ -753,7 +753,7 @@ pub(crate) fn lift_vlogic(
 /// Packed integer arithmetic `dst = op(dst, src)`, register or memory source.
 pub(crate) fn lift_vpacked_bin(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     op: PackedBinOp,
@@ -788,7 +788,7 @@ pub(crate) fn lift_vpacked_bin(
 /// be memory.
 pub(crate) fn lift_vlogic_vex(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: VLogicOp,
 ) -> Result<(), LiftError> {
@@ -822,7 +822,7 @@ pub(crate) fn lift_vlogic_vex(
 /// reusing `VPackedBin`. YMM → unsupported.
 pub(crate) fn lift_vpacked_bin_vex(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     op: PackedBinOp,
@@ -864,7 +864,7 @@ pub(crate) fn lift_vpacked_bin_vex(
 /// 256/512 EVEX widths and masked forms are deferred.
 pub(crate) fn lift_evex_packed_bin_128(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     op: PackedBinOp,
@@ -881,7 +881,7 @@ pub(crate) fn lift_evex_packed_bin_128(
 /// deferred.
 pub(crate) fn lift_vextract_wide(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     extract_lanes: u8,
 ) -> Result<(), LiftError> {
@@ -917,7 +917,7 @@ pub(crate) fn lift_vextract_wide(
 /// `op0`. Masking deferred.
 pub(crate) fn lift_vinsert_wide(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     insert_lanes: u8,
 ) -> Result<(), LiftError> {
     if evex_is_masked(insn) {
@@ -943,7 +943,7 @@ pub(crate) fn lift_vinsert_wide(
 /// Register src2 only (memory deferred); masking deferred.
 pub(crate) fn lift_valign(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     elem: u8,
 ) -> Result<(), LiftError> {
     if evex_is_masked(insn) {
@@ -968,7 +968,7 @@ pub(crate) fn lift_valign(
 /// implicit XMM0; `dst = op0`, blend source `op1` (register or memory).
 pub(crate) fn lift_blendv(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -997,7 +997,7 @@ pub(crate) fn lift_blendv(
 /// inactive memory untouched. `elem` = 4 (ps) / 8 (pd).
 pub(crate) fn lift_vmaskmov(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1037,7 +1037,7 @@ pub(crate) fn lift_vmaskmov(
 /// exec/emit mirroring the register form's `ymm_hi[dst] = 0` (no trailing `VZeroUpper`).
 pub(crate) fn lift_vblendv(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -1079,7 +1079,7 @@ pub(crate) fn lift_vblendv(
 /// src2 when `imm8[lane_index]` is set, else keep `dst`. Register or m128 src2.
 pub(crate) fn lift_blendi(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -1120,7 +1120,7 @@ pub(crate) fn lift_blendi(
 /// nothing above 256.
 pub(crate) fn lift_vblendi(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -1161,7 +1161,7 @@ pub(crate) fn lift_vblendi(
 /// imm8 rounding mode.
 pub(crate) fn lift_round(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     scalar: bool,
@@ -1201,7 +1201,7 @@ pub(crate) fn lift_round(
 /// `dst` as `a`. VEX.128 also zeroes bits 255:128; VEX.256 rounds both 128-bit lanes.
 pub(crate) fn lift_vround(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -1270,7 +1270,7 @@ pub(crate) fn lift_vround(
 /// clear bits 255:128. Same shape as `vrndscale{ss,sd}` with M=0.
 pub(crate) fn lift_vround_scalar(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -1319,7 +1319,7 @@ pub(crate) fn lift_vround_scalar(
 /// the memory form, `[addr]` loaded as a 128-bit value.
 pub(crate) fn lift_pcmpstr_idx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     explicit: bool,
 ) -> Result<(), LiftError> {
@@ -1350,7 +1350,7 @@ pub(crate) fn lift_pcmpstr_idx(
 /// index in ECX. Source 2 is a register or, for the memory form, `[addr]` loaded as 128 bits.
 pub(crate) fn lift_pcmpstr_mask(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     explicit: bool,
 ) -> Result<(), LiftError> {
@@ -1381,7 +1381,7 @@ pub(crate) fn lift_pcmpstr_mask(
 /// form is a 32-bit load. Inlined in codegen (lane moves + zeroing).
 pub(crate) fn lift_insertps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -1413,7 +1413,7 @@ pub(crate) fn lift_insertps(
 /// source lane for the register form (the m32 form ignores it).
 pub(crate) fn lift_vinsertps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -1442,7 +1442,7 @@ pub(crate) fn lift_vinsertps(
 /// Register or m128 source 2. Horizontal FP sum → shared helper (jit == interp).
 pub(crate) fn lift_dpps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -1476,7 +1476,7 @@ pub(crate) fn lift_dpps(
 /// Register or m128 source 2. Horizontal FP sum → shared helper (jit == interp).
 pub(crate) fn lift_dppd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let dst = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -1504,7 +1504,7 @@ pub(crate) fn lift_dppd(
 /// `vdpps` uses the ymm-capable `lift_vdpps` below.)
 pub(crate) fn lift_vdp(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -1542,7 +1542,7 @@ pub(crate) fn lift_vdp(
 /// op1 (src1), `b`/mem = op2 (src2). VEX.128 zeroes bits 255:128.
 pub(crate) fn lift_vdpps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let imm = insn.immediate(3) as u8;
@@ -1607,7 +1607,7 @@ pub(crate) fn lift_vdpps(
 /// forms are deferred.
 pub(crate) fn lift_vrndscale(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -1664,7 +1664,7 @@ pub(crate) fn lift_vrndscale(
 /// `dst`. Source is a register (its low bytes) or memory.
 pub(crate) fn lift_pmovx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: u8,
     to: u8,
@@ -1700,7 +1700,7 @@ pub(crate) fn lift_pmovx(
 /// SDM Vol 2A §2.5: unaligned VEX operands use their instruction's memory width.
 fn vex_unary_source(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     dst: u8,
     bytes: u16,
@@ -1735,7 +1735,7 @@ fn vex_unary_source(
 /// form. A wide (ymm/zmm) or masked destination routes to `VPMovExtendWide`.
 pub(crate) fn lift_vpmovx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: u8,
     to: u8,
@@ -1775,7 +1775,7 @@ pub(crate) fn lift_vpmovx(
 /// Legacy packed absolute value using the shared signed-lane primitive.
 pub(crate) fn lift_pabs(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -1812,7 +1812,7 @@ pub(crate) fn lift_pabs(
 /// width (= VL), above which EVEX zeroes.
 pub(crate) fn lift_vpabs(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1834,7 +1834,7 @@ pub(crate) fn lift_vpabs(
 /// others have none. Register src only.
 pub(crate) fn lift_vp_unary_lane(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     op: crate::ir::VpUnaryOp,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1863,7 +1863,7 @@ pub(crate) fn lift_vp_unary_lane(
 /// `dst != a`, since it is staged through `dst`.
 pub(crate) fn lift_vp_blendm(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1901,7 +1901,7 @@ pub(crate) fn lift_vp_blendm(
 /// lanes from the two sources. `elem` (4/8) is the masking granularity. Register srcs only.
 pub(crate) fn lift_vshuf_lane(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     elem: u8,
 ) -> Result<(), LiftError> {
     let (dst, dst_width) = vec_operand(insn, 0).or_unsupported(insn)?;
@@ -1923,7 +1923,10 @@ pub(crate) fn lift_vshuf_lane(
 
 /// Masked EVEX `vpmultishiftqb` (AVX512-VBMI): per-qword unaligned byte gather. `ctrl` = src1
 /// (shift indices), `data` = src2. Masked at byte granularity. Register srcs only.
-pub(crate) fn lift_vp_multishift(insn: &Instruction, ops: &mut Vec<IrOp>) -> Result<(), LiftError> {
+pub(crate) fn lift_vp_multishift(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+) -> Result<(), LiftError> {
     let (dst, dst_width) = vec_operand(insn, 0).or_unsupported(insn)?;
     let ctrl = vec_operand_reg(insn, 1).or_unsupported(insn)?;
     let data = vec_operand_reg(insn, 2).or_unsupported(insn)?;
@@ -1942,7 +1945,7 @@ pub(crate) fn lift_vp_multishift(insn: &Instruction, ops: &mut Vec<IrOp>) -> Res
 /// or memory source. Masked forms are deferred.
 pub(crate) fn lift_vpopcnt(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -1977,7 +1980,7 @@ pub(crate) fn lift_vpopcnt(
 /// also table 0 (its old value). Register src only (memory deferred).
 pub(crate) fn lift_vpermt2(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1988,7 +1991,7 @@ pub(crate) fn lift_vpermt2(
 /// `src1`/`src2` are the two tables (t-mode swaps index and table 0).
 pub(crate) fn lift_vpermi2(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -1997,7 +2000,7 @@ pub(crate) fn lift_vpermi2(
 
 pub(crate) fn lift_vperm2(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     imode: bool,
@@ -2042,7 +2045,7 @@ pub(crate) fn lift_vperm2(
 /// deferred.
 pub(crate) fn lift_vpmov_narrow(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: u8,
     to: u8,
@@ -2082,7 +2085,7 @@ pub(crate) fn lift_vpmov_narrow(
 /// k[b]_low`. iced op order is (dst, src1=a, src2=b).
 pub(crate) fn lift_kunpck(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     half: u8,
 ) -> Result<(), LiftError> {
     let dst = reg_kmask(insn, 0).or_unsupported(insn)?;
@@ -2096,7 +2099,7 @@ pub(crate) fn lift_kunpck(
 /// low `width` bits. iced op order is (dst, src1=a, src2=b).
 pub(crate) fn lift_kbinop(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     op: VKLogicOp,
     width: u8,
 ) -> Result<(), LiftError> {
@@ -2116,7 +2119,7 @@ pub(crate) fn lift_kbinop(
 /// Opmask complement `knot{b,w,d,q}`: `k[dst] = ~k[a]` over `width` bits.
 pub(crate) fn lift_knot(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     width: u8,
 ) -> Result<(), LiftError> {
     let dst = reg_kmask(insn, 0).or_unsupported(insn)?;
@@ -2129,7 +2132,7 @@ pub(crate) fn lift_knot(
 /// bits. iced op order is (dst, src, imm8).
 pub(crate) fn lift_kshift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     width: u8,
     left: bool,
 ) -> Result<(), LiftError> {
@@ -2152,7 +2155,7 @@ pub(crate) fn lift_kshift(
 /// register-src2 only.
 pub(crate) fn lift_evex_vlogic(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: VLogicOp,
     elem: u8,
@@ -2207,7 +2210,7 @@ pub(crate) fn lift_evex_vlogic(
 /// are deferred.
 pub(crate) fn lift_vpternlog(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     if evex_is_masked(insn) {
@@ -2245,7 +2248,7 @@ pub(crate) fn lift_vpternlog(
 /// `kmov{b,w,d,q}` between opmask, GPR, and memory. `width` in bits.
 pub(crate) fn lift_kmov(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     width: u8,
 ) -> Result<(), LiftError> {
@@ -2277,7 +2280,7 @@ pub(crate) fn lift_kmov(
 /// `kortest{b,w,d,q}`: OR two opmasks and set ZF/CF.
 pub(crate) fn lift_kortest(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     width: u8,
 ) -> Result<(), LiftError> {
     let a = reg_kmask(insn, 0).or_unsupported(insn)?;
@@ -2290,7 +2293,7 @@ pub(crate) fn lift_kortest(
 /// negation for `nm`). Register or memory src2.
 pub(crate) fn lift_vptest(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     neg: bool,
@@ -2331,7 +2334,7 @@ pub(crate) fn lift_vptest(
 /// or memory), predicate = imm8.
 pub(crate) fn lift_vpcmp(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     signed: bool,
@@ -2381,7 +2384,7 @@ pub(crate) fn lift_vpcmp(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lift_vpcmp_fixed_or_packed(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     packed: PackedBinOp,
@@ -2428,7 +2431,7 @@ pub(crate) fn lift_vpcmp_fixed_or_packed(
 /// is arithmetic when `arith` (psra*). Register/m128 counts use the low qword.
 pub(crate) fn lift_vpacked_shift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     right: bool,
@@ -2482,7 +2485,7 @@ pub(crate) fn lift_vpacked_shift(
 /// right when `right` else left.
 pub(crate) fn lift_byteshift(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     right: bool,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -2503,7 +2506,7 @@ pub(crate) fn lift_byteshift(
 /// `width`.
 pub(crate) fn lift_byteshift_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     right: bool,
 ) -> Result<(), LiftError> {
     let (d, width) = vec_operand(insn, 0).or_unsupported(insn)?;
@@ -2525,7 +2528,7 @@ pub(crate) fn lift_byteshift_avx(
 /// `pshufd`: permute the four 32-bit lanes by imm8 (register or memory source).
 pub(crate) fn lift_pshufd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -2558,7 +2561,7 @@ pub(crate) fn lift_pshufd(
 /// width; register or memory table, masked/zeroing supported.
 pub(crate) fn lift_vperm1(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -2597,7 +2600,7 @@ pub(crate) fn lift_vperm1(
 /// helper's `set_vec` zeroes bits above the register (VEX/EVEX semantics).
 pub(crate) fn lift_vpack(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from_elem: u8,
     signed: bool,
@@ -2651,7 +2654,7 @@ pub(crate) fn lift_vpack(
 /// handles the (no-op) upper-clear.
 pub(crate) fn lift_vpblendw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (dst, bytes) = vec_operand(insn, 0).or_unsupported(insn)?;
@@ -2689,7 +2692,7 @@ pub(crate) fn lift_vpblendw(
 
 pub(crate) fn lift_vpblendd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     // SDM Vol 2C §5.2, VPBLENDD: the same bit selection as BLENDPS.
@@ -2699,7 +2702,7 @@ pub(crate) fn lift_vpblendd(
 /// VEX/EVEX `vpshufd`: the SSE dword shuffle plus VEX's upper-zeroing on the 128-bit form.
 pub(crate) fn lift_vpshufd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     // Wide (ymm/zmm) or masked → shared per-lane helper. VEX memory loads atomically.
@@ -2733,7 +2736,7 @@ pub(crate) fn lift_vpshufd(
 /// so the (absent) upper load bits are irrelevant.
 pub(crate) fn lift_movdup(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     imm: u8,
     ddup: bool,
@@ -2784,7 +2787,7 @@ pub(crate) fn lift_movdup(
 /// `VShuffle32` `set_vec` handles the (no-op) upper-clear.
 pub(crate) fn lift_vmovdup(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     imm: u8,
     ddup: bool,
@@ -2805,7 +2808,7 @@ pub(crate) fn lift_vmovdup(
 /// no trailing `VZeroUpper`.
 pub(crate) fn lift_shufps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -2848,7 +2851,7 @@ pub(crate) fn lift_shufps(
 /// `dst` is safe.
 pub(crate) fn lift_vshufps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let imm = insn.immediate(3) as u8;
@@ -2929,7 +2932,7 @@ pub(crate) fn lift_vshufps(
 /// openssl's rsaz keygen emits the VEX.128 memory-source `vpermilpd`.
 pub(crate) fn lift_vpermil_imm(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     is_pd: bool,
 ) -> Result<(), LiftError> {
@@ -3009,7 +3012,7 @@ pub(crate) fn lift_vpermil_imm(
 /// = control vector. `elem` = 4 (ps) / 8 (pd). VEX memory controls are loaded before dst commits.
 pub(crate) fn lift_vpermil_var(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
 ) -> Result<(), LiftError> {
@@ -3047,7 +3050,7 @@ pub(crate) fn lift_vpermil_var(
 /// Register or VEX memory source.
 pub(crate) fn lift_pshufw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     high: bool,
     vex: bool,
@@ -3089,7 +3092,7 @@ pub(crate) fn lift_pshufw(
 /// `punpckl*`: interleave the low halves of dst and src at `lane`-byte elements.
 pub(crate) fn lift_vunpack(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     high: bool,
@@ -3127,7 +3130,7 @@ pub(crate) fn lift_vunpack(
 /// a managed runtime emits `vpunpckldq [rip+…], xmm, xmm`).
 pub(crate) fn lift_vunpack_avx(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
     high: bool,
@@ -3196,7 +3199,7 @@ pub(crate) fn lift_vunpack_avx(
 /// `VAes`/`VAesM` read `a` (=dst) before writing dst, so the in-place form is safe.
 pub(crate) fn lift_aes(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: AesOp,
 ) -> Result<(), LiftError> {
@@ -3229,7 +3232,7 @@ pub(crate) fn lift_aes(
 /// aliases dst is safe — no pre-copy of op1 into dst.
 pub(crate) fn lift_vaes(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: AesOp,
 ) -> Result<(), LiftError> {
@@ -3258,7 +3261,7 @@ pub(crate) fn lift_vaes(
 /// The VEX form clears bits 255:128.
 pub(crate) fn lift_aes_imc(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     vex: bool,
 ) -> Result<(), LiftError> {
@@ -3286,7 +3289,7 @@ pub(crate) fn lift_aes_imc(
 /// The VEX form clears bits 255:128.
 pub(crate) fn lift_aes_keygen(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     vex: bool,
 ) -> Result<(), LiftError> {
@@ -3316,7 +3319,7 @@ pub(crate) fn lift_aes_keygen(
 /// `a` (=dst) and the reg/mem op2 before writing dst → in-place is safe.
 pub(crate) fn lift_pclmul(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3349,7 +3352,7 @@ pub(crate) fn lift_pclmul(
 /// op2 register that aliases dst is safe — no pre-copy of op1.
 pub(crate) fn lift_vpclmul(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3380,7 +3383,7 @@ pub(crate) fn lift_vpclmul(
 /// reads `a` (=dst) and the reg/mem source before writing dst → in-place is safe.
 pub(crate) fn lift_sha(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: ShaOp,
 ) -> Result<(), LiftError> {
@@ -3421,7 +3424,7 @@ pub(crate) fn lift_sha(
 /// and the reg/mem source before writing dst → the in-place form is safe.
 pub(crate) fn lift_gfni(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: GfniOp,
 ) -> Result<(), LiftError> {
@@ -3463,7 +3466,7 @@ pub(crate) fn lift_gfni(
 /// dst is safe (no pre-copy).
 pub(crate) fn lift_vgfni(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: GfniOp,
 ) -> Result<(), LiftError> {
@@ -3511,7 +3514,7 @@ pub(crate) fn lift_vgfni(
 /// `VPsign`/`VPsignM` read both sources before writing dst → the in-place form is safe.
 pub(crate) fn lift_psign(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -3547,7 +3550,7 @@ pub(crate) fn lift_psign(
 /// aliasing dst is safe (no pre-copy). VEX.128 zeroes bits 255:128.
 pub(crate) fn lift_vpsign(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     lane: u8,
 ) -> Result<(), LiftError> {
@@ -3609,7 +3612,7 @@ pub(crate) fn lift_vpsign(
 /// `packuswb`: pack dst+src 16-bit lanes to unsigned-saturated bytes.
 pub(crate) fn lift_packuswb(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3636,7 +3639,7 @@ pub(crate) fn lift_packuswb(
 /// Reuses the shared `VPackWide` saturating-pack helper (jit == interp).
 pub(crate) fn lift_pack(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from_elem: u8,
     signed: bool,
@@ -3674,7 +3677,7 @@ pub(crate) fn lift_pack(
 /// helper (jit == interp).
 pub(crate) fn lift_pmaddwd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3701,7 +3704,7 @@ pub(crate) fn lift_pmaddwd(
 /// interp).
 pub(crate) fn lift_pmaddubsw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3736,7 +3739,7 @@ pub(crate) fn lift_pmaddubsw(
 /// bits 255:128 (a trailing `VZeroUpper`); VEX.256 writes the full register.
 pub(crate) fn lift_vpmadd(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     ubsw: bool,
 ) -> Result<(), LiftError> {
@@ -3777,7 +3780,7 @@ pub(crate) fn lift_vpmadd(
 /// `pinsrw`: insert the low 16 bits of a GPR/memory source into a word lane.
 pub(crate) fn lift_pinsrw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3793,7 +3796,7 @@ pub(crate) fn lift_pinsrw(
 /// zeroes bits 255:128.
 pub(crate) fn lift_pinsr(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     size: u8,
 ) -> Result<(), LiftError> {
@@ -3822,7 +3825,7 @@ pub(crate) fn lift_pinsr(
 /// `movlhps`/`movhlps`: copy a 64-bit half between two xmm registers.
 pub(crate) fn lift_move_half(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     dst_high: bool,
     src_high: bool,
 ) -> Result<(), LiftError> {
@@ -3846,7 +3849,7 @@ pub(crate) fn lift_move_half(
 ///   operands swapped)
 pub(crate) fn lift_vmov_packed_half(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     high: bool,
 ) -> Result<(), LiftError> {
     let d = reg_xmm(insn, 0).or_unsupported(insn)?;
@@ -3868,7 +3871,7 @@ pub(crate) fn lift_vmov_packed_half(
 /// store it (`m64, xmm`). `high` selects the upper vs lower quadword.
 pub(crate) fn lift_half_mem(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     high: bool,
 ) -> Result<(), LiftError> {
@@ -3904,7 +3907,7 @@ pub(crate) fn lift_half_mem(
 /// `op2`, VEX zeroing bits 255:128).
 pub(crate) fn lift_vhalf_mem(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     high: bool,
 ) -> Result<(), LiftError> {
@@ -3935,7 +3938,7 @@ pub(crate) fn lift_vhalf_mem(
 /// `pextrw dst_gpr, xmm, imm8`: extract a word lane, zero-extended into the gpr.
 pub(crate) fn lift_pextrw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let src = reg_xmm(insn, 1).or_unsupported(insn)?;
@@ -3951,7 +3954,7 @@ pub(crate) fn lift_pextrw(
 /// into a gpr or written to memory.
 pub(crate) fn lift_pextr(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     size: u8,
 ) -> Result<(), LiftError> {
@@ -3975,7 +3978,7 @@ pub(crate) fn lift_pextr(
 pub(crate) fn read_scalar_float(
     insn: &Instruction,
     op_idx: u32,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<Val, LiftError> {
@@ -4006,7 +4009,7 @@ pub(crate) fn read_scalar_float(
 /// bytes; the mem forms zero-extend (load) / store the low lane.
 pub(crate) fn lift_scalar_fmove(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -4052,7 +4055,7 @@ pub(crate) fn lift_scalar_fmove(
 /// element from `op2`, bits 127:64 from `op1`, bits 255:128 zeroed).
 pub(crate) fn lift_vscalar_fmove(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -4109,7 +4112,7 @@ pub(crate) fn lift_vscalar_fmove(
 /// Scalar/packed float arithmetic `dst = op(dst, src)` (register or memory source).
 pub(crate) fn lift_float_bin(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: FloatBinOp,
     prec: FPrec,
@@ -4148,7 +4151,7 @@ pub(crate) fn lift_float_bin(
 /// and, for a scalar op, keeps bits 127:64 — and then zeroes bits 255:128.
 pub(crate) fn lift_vfloat_bin(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: FloatBinOp,
     prec: FPrec,
@@ -4231,7 +4234,7 @@ pub(crate) fn lift_vfloat_bin(
 /// `a`=dst before writing dst, so in-place is safe.
 pub(crate) fn lift_hfloat(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: HFloatOp,
     prec: FPrec,
@@ -4271,7 +4274,7 @@ pub(crate) fn lift_hfloat(
 /// VEX.256 writes the full 256 bits directly.
 pub(crate) fn lift_vhfloat(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: HFloatOp,
     prec: FPrec,
@@ -4317,7 +4320,7 @@ pub(crate) fn lift_vhfloat(
 /// before writing dst, so in-place is safe.
 pub(crate) fn lift_hint(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: HIntOp,
 ) -> Result<(), LiftError> {
@@ -4354,7 +4357,7 @@ pub(crate) fn lift_hint(
 /// first). VEX.128 zeroes bits 255:128.
 pub(crate) fn lift_vhint(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: HIntOp,
 ) -> Result<(), LiftError> {
@@ -4418,7 +4421,7 @@ pub(crate) fn lift_vhint(
 /// `ucomis*`/`comis*`: compare the low lanes and set the arithmetic flags.
 pub(crate) fn lift_float_cmp(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -4433,7 +4436,7 @@ pub(crate) fn lift_float_cmp(
 /// third operand in both encodings).
 pub(crate) fn lift_float_cmp_mask(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     scalar: bool,
@@ -4475,7 +4478,7 @@ pub(crate) fn lift_float_cmp_mask(
 /// ss/sd forms are 128-bit only, so `scalar` implies the 128-bit path.
 pub(crate) fn lift_vfloat_cmp_mask(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     scalar: bool,
@@ -4551,7 +4554,7 @@ pub(crate) fn lift_vfloat_cmp_mask(
 /// signed `cvtsi2s*` vs the AVX-512 unsigned `cvtusi2s*` form.
 pub(crate) fn lift_cvt_from_int(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
 ) -> Result<(), LiftError> {
@@ -4574,7 +4577,7 @@ pub(crate) fn lift_cvt_from_int(
 /// (which preserves the upper bits) leaves the right merge.
 pub(crate) fn lift_vcvt_from_int(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     signed: bool,
@@ -4600,7 +4603,7 @@ pub(crate) fn lift_vcvt_from_int(
 /// `cvt(t)s*2si`: float (xmm/mem) → signed integer in the destination GPR.
 pub(crate) fn lift_cvt_to_int(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     trunc: bool,
@@ -4612,7 +4615,7 @@ pub(crate) fn lift_cvt_to_int(
 /// `*2si` form; `signed = false` picks the unsigned result and integer indefinite.
 pub(crate) fn lift_cvt_to_int_signed(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     prec: FPrec,
     trunc: bool,
@@ -4638,7 +4641,7 @@ pub(crate) fn lift_cvt_to_int_signed(
 /// Register or memory source.
 pub(crate) fn lift_float_unary(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: FloatUnOp,
     prec: FPrec,
@@ -4683,7 +4686,7 @@ pub(crate) fn lift_float_unary(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lift_fma(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     order: u16,
     prec: FPrec,
@@ -4760,7 +4763,7 @@ pub(crate) fn lift_fma(
 /// so a src aliasing dst is safe — no pre-copy of op1 into dst.
 pub(crate) fn lift_vfloat_unary_scalar(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: FloatUnOp,
     prec: FPrec,
@@ -4801,7 +4804,7 @@ pub(crate) fn lift_vfloat_unary_scalar(
 /// memory operand. VEX.128 clears bits 255:128.
 pub(crate) fn lift_vfloat_unary_packed(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     op: FloatUnOp,
     prec: FPrec,
@@ -4863,7 +4866,7 @@ pub(crate) fn lift_vfloat_unary_packed(
 /// `cvtss2sd`/`cvtsd2ss`: convert the low-lane float between precisions.
 pub(crate) fn lift_cvt_float(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: FPrec,
     to: FPrec,
@@ -4884,7 +4887,7 @@ pub(crate) fn lift_cvt_float(
 /// `reg_xmm` on op0/op1 keeps this VEX.128-only.
 pub(crate) fn lift_vcvt_scalar(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     from: FPrec,
     to: FPrec,
@@ -4914,7 +4917,7 @@ pub(crate) fn lift_vcvt_scalar(
 /// ones via [`lift_packed_cvt256`].
 pub(crate) fn lift_packed_cvt(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     kind: PackedCvtKind,
     vex: bool,
@@ -4993,7 +4996,7 @@ pub(crate) fn lift_packed_cvt(
 /// source (reg or m256) and write a 128-bit xmm with the upper cleared.
 fn lift_packed_cvt256(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     kind: PackedCvtKind,
 ) -> Result<(), LiftError> {
@@ -5036,7 +5039,7 @@ fn lift_packed_cvt256(
 /// (m64), a ymm dst takes 8 (m128). VEX upper-zeroing on the xmm form.
 pub(crate) fn lift_vcvtph2ps(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (d, lanes, ymm) = if let Some(y) = reg_ymm(insn, 0) {
@@ -5072,7 +5075,7 @@ pub(crate) fn lift_vcvtph2ps(
 /// register (upper cleared) or memory.
 pub(crate) fn lift_vcvtps2ph(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let (src, lanes) = if let Some(y) = reg_ymm(insn, 1) {
@@ -5114,7 +5117,7 @@ pub(crate) fn lift_vcvtps2ph(
 /// register or m128 source. VEX form clears bits 255:128.
 pub(crate) fn lift_phminposuw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     vex: bool,
 ) -> Result<(), LiftError> {
@@ -5145,7 +5148,7 @@ pub(crate) fn lift_phminposuw(
 /// or memory src2. VEX.128 clears bits 255:128.
 pub(crate) fn lift_mpsadbw(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     vex: bool,
 ) -> Result<(), LiftError> {
@@ -5193,7 +5196,7 @@ pub(crate) fn lift_mpsadbw(
 /// (truncating insertion at bit 63) even when index + length exceeds 64.
 pub(crate) fn lift_sse4a_bitfield(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
     let insert = insn.mnemonic() == Mnemonic::Insertq;
@@ -5270,7 +5273,7 @@ pub(crate) fn lift_sse4a_bitfield(
 /// VGATHERDPS/VGATHERQPS, VGATHERDPD/VGATHERQPD (VEX forms).
 pub(crate) fn lift_gather(
     insn: &Instruction,
-    ops: &mut Vec<IrOp>,
+    ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
     elem: u8,
     index_elem: u8,

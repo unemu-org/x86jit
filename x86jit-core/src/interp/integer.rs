@@ -483,7 +483,7 @@ pub(crate) fn exec_get_cond(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_load<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &Temp,
@@ -508,7 +508,7 @@ pub(crate) fn exec_load<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_store<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -544,7 +544,7 @@ pub(crate) fn exec_store<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,
@@ -565,7 +565,7 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_atomic_cas<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,
