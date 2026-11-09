@@ -152,6 +152,10 @@ the `oracles/` submodule: witness tests pin the cited values in code.
 - **Translations are never reclaimed.** A guest that keeps patching its code grows host memory
   with every patch. When JIT code space runs out, each vCPU returns `Exit::CodeSpaceExhausted`
   once and continues interpreted; `JitBackend::set_compile_limit` caps compilation earlier.
+- **Shared code mappings must be declared.** `Memory::declare_code_alias` connects shared
+  guest views for SMC tracking on every tier. The embedder creates the host aliases and
+  reports writes made outside the engine with `note_write`. Undeclared aliases can execute
+  stale translations. Far-apart views widen the store barrier's conservative watermark.
 - **`Real16` is interpreter-only**, and there is no protected-mode segment-descriptor model:
   `Compat32` is flat apart from the FS/GS bases.
 - **Host-fault recovery depends on the host.** [decision-13] lists which hosts are

@@ -1074,6 +1074,28 @@ Because guest code lies in a *data* buffer (the guest may modify it), a write to
 - On a write to such a page → remove the affected entries from the cache (with the JIT: also mark the host code as dead).
 - On the next execution → miss → re-lift from the changed bytes.
 
+**Shared mappings.** The embedder creates the shared host mappings and declares each
+pair of corresponding guest ranges with `Memory::declare_code_alias(a, b, len)`.
+Declarations are symmetric and idempotent; overlapping declarations and multiple views
+are supported. `remove_code_alias` removes an exact pair in either order. `unmap`
+removes declarations overlapping the unmapped bytes in either view. The engine cannot
+discover undeclared host aliases; those can retain stale translations. External writers
+must still report completed writes with `note_write` on the view they wrote.
+
+The sorted page index connects all declared views at conservative 4 KiB granularity.
+Marking a translated page tags its connected views before widening the existing 64 KiB
+watermark. Stores use the same range gate; its atomic load acquires the published tags.
+Only a write hitting a tagged page expands aliases and reports the translated pages to
+the dispatcher. Clearing a translation preserves tags needed by other live views, and
+fetch approvals are forgotten with the corresponding translations. Whole-page unmap
+invalidation likewise prevents a surviving sub-page translation from losing tracking.
+The same cache spans cover interpreter blocks, compiled blocks, regions and background
+tier-up publication. Registration can occur during execution; the embedder synchronizes
+with the vCPU before relying on its completion. A store racing registration may precede
+it. Far-apart views stretch the watermark across intervening data, increasing helper
+traffic even when those data pages are not code. No alias lookup is added to ordinary
+stores outside tagged pages.
+
 **Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, x87 and fxsave helpers write through raw bounds-checked-only views of guest RAM for the same reason. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report explicitly after they run.
 
 **Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds the deferral below to one block, the same granularity the interpreter gets by construction. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".

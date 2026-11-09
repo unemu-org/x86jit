@@ -771,6 +771,28 @@ pub struct InstructionFaultInfo {
     operand_address: Option<OperandAddress>,
 }
 impl InstructionFaultInfo {
+    /// A compiled split store can land earlier transfers before recovery skips
+    /// its post-store barrier. Replay may preflight and fault without redoing
+    /// those transfers, so notify before either replay or returning the fault.
+    #[cold]
+    pub(crate) fn note_partial_store(&self, cpu: &CpuState, mem: &Memory, fault_addr: u64) {
+        if !self.writes {
+            return;
+        }
+        let Knowledge::Known(size) = self.operand_size else {
+            return;
+        };
+        let base = self
+            .operand_address
+            .as_ref()
+            .and_then(|a| a.evaluate(cpu))
+            .unwrap_or_else(|| fault_addr.saturating_sub(u64::from(size).saturating_sub(1)));
+        let len = fault_addr.saturating_sub(base).min(u64::from(size));
+        if len != 0 {
+            mem.note_write(base, len as usize);
+        }
+    }
+
     /// Build per-instruction records, validating lengths within each basic block.
     pub fn for_block(block: &IrBlock) -> Vec<Self> {
         Self::for_block_with_split_stores(block, false)

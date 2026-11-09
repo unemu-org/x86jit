@@ -3691,7 +3691,8 @@ impl Translator<'_, '_> {
         let cr = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), crp, 0);
+            // Acquire the precise tags published before widening the watermark.
+            .atomic_load(types::I64, MemFlags::trusted(), crp);
         let store_granule = self
             .builder
             .ins()

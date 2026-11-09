@@ -985,14 +985,10 @@ impl Vm {
         // `Exit::UnmappedMemory`.
         let lo = guest_addr;
         let hi = guest_addr.saturating_add(size as u64);
-        let (lo, hi) = if self.mem.fetch_policy.is_some() {
-            // Unmapping revokes approval for every touched guest page, including
-            // code in surviving regions that share a page with the removed one.
-            let mask = crate::memory::CODE_PAGE_SIZE - 1;
-            (lo & !mask, (hi.saturating_sub(1) | mask).saturating_add(1))
-        } else {
-            (lo, hi)
-        };
+        // Tags and fetch approvals are page-wide. Invalidate the same whole pages
+        // before clearing, including translations in surviving sub-page regions.
+        let mask = crate::memory::CODE_PAGE_SIZE - 1;
+        let (lo, hi) = (lo & !mask, (hi.saturating_sub(1) | mask).saturating_add(1));
         let dropped = !self
             .cache
             .invalidate_overlapping(lo, hi, || {
@@ -1015,13 +1011,8 @@ impl Vm {
     /// (re-execution re-lifts and re-tags). No-op unless a write actually hit a
     /// code page.
     ///
-    /// Complete for the interpreter, whose stores route through `Memory::write`,
-    /// and for embedder writes (loader / syscall passthrough) via `write_bytes`.
-    /// JIT-compiled stores write host RAM directly (§8.2.1) and are NOT observed
-    /// here; nor are the baked link slots of chained blocks patched. Faithful
-    /// JIT-side SMC — write-hooks or host page protection plus reverse-edge link
-    /// invalidation — is the deliberately deferred "mark the host code dead" step
-    /// (§10, §9.1).
+    /// Interpreter stores, compiled stores, helpers and embedder writes all report
+    /// through `Memory::note_write`, which expands declared aliases to code pages.
     fn handle_smc(&self, word: &AtomicU64) {
         self.mem.dispatch_smc(word, |dirty| {
             let mut invalidated = false;
@@ -2366,6 +2357,22 @@ impl Vcpu {
                                 ));
                             }
                             RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL => {
+                                // Alignment recovery has no reliable data address.
+                                if code == RET_MMIO_DEFER
+                                    || self.fault_entry.fault_kind()
+                                        != crate::jit_abi::fault::HostFaultKind::Alignment
+                                {
+                                    let pc = if code == RET_HOST_FAULT_DETAIL {
+                                        ctx.next_entry as usize
+                                    } else {
+                                        cur.0 as usize
+                                    };
+                                    if let Some(info) =
+                                        crate::codemap::lookup_fault_info(pc, self.cpu.rip)
+                                    {
+                                        info.note_partial_store(&self.cpu, &vm.mem, ctx.fault_addr);
+                                    }
+                                }
                                 let raw_fault = if code == RET_HOST_FAULT_DETAIL {
                                     self.fault_entry.raw_fault()
                                 } else {

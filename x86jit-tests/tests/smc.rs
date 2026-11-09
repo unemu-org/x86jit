@@ -1003,3 +1003,683 @@ both_backends!(
     smc_tracks_code_above_the_old_window_interp,
     smc_tracks_code_above_the_old_window_jit
 );
+
+fn unmap_shared_code_page(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(FLAT), backend);
+    vm.map(0x1000, 0x400, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x1400, 0x400, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1400, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1400);
+    run_to_hlt(&vm, &mut cpu);
+    vm.unmap(0x1000, 0x400).unwrap();
+    vm.write_bytes(0x1401, &2u32.to_le_bytes()).unwrap();
+    cpu.set_reg(Reg::Rip, 0x1400);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(cpu.reg(Reg::Rax), 2);
+}
+both_backends!(
+    unmap_shared_code_page,
+    unmap_shared_code_page_interp,
+    unmap_shared_code_page_jit
+);
+
+#[cfg(unix)]
+fn alias_vm(backend: Box<dyn Backend>) -> Vm {
+    use std::os::fd::AsRawFd;
+    const LEN: usize = 0x20_000;
+    let file = tempfile_shared_page();
+    // SAFETY: reserve a fresh writable anonymous range; MAP_FIXED below replaces
+    // only pages inside this owned reservation with two views of the same file.
+    let ptr = unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED);
+        for offset in [0x4000, 0x18000] {
+            assert_eq!(
+                libc::mmap(
+                    ptr.cast::<u8>().add(offset).cast(),
+                    0x4000,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    file.as_raw_fd(),
+                    0
+                ),
+                ptr.cast::<u8>().add(offset).cast()
+            );
+        }
+        ptr.cast::<u8>()
+    };
+    let ram = x86jit_core::HostRam {
+        ptr,
+        len: LEN,
+        guest_base: 0,
+        dtor: Box::new(|ptr, len| {
+            // SAFETY: this is the reservation allocated above, including its views.
+            assert_eq!(unsafe { libc::munmap(ptr.cast(), len) }, 0);
+        }),
+        protect: None,
+    };
+    let mut vm = Vm::with_backend_host_ram(VmConfig::reserved(LEN as u64), backend, ram).unwrap();
+    vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x4000, 0x4000, Prot::RX, RegionKind::Ram).unwrap();
+    vm.map(0x18000, 0x4000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.map(0x8000, 0x10000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.map(0x1c000, 0x4000, Prot::RW, RegionKind::Ram).unwrap();
+    vm
+}
+
+#[cfg(unix)]
+fn tempfile_shared_page() -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    let mut name = std::env::temp_dir()
+        .join("x86jit-smc-XXXXXX")
+        .as_os_str()
+        .as_encoded_bytes()
+        .to_vec();
+    name.push(0);
+    // SAFETY: mkstemp receives a writable NUL-terminated template; on success
+    // ownership of its descriptor moves to File, and unlink removes only its name.
+    unsafe {
+        let fd = libc::mkstemp(name.as_mut_ptr().cast());
+        assert!(fd >= 0);
+        assert_eq!(libc::unlink(name.as_ptr().cast()), 0);
+        let file = std::fs::File::from_raw_fd(fd);
+        file.set_len(0x4000).unwrap();
+        file
+    }
+}
+
+#[cfg(unix)]
+fn declared_alias_patches(backend: Box<dyn Backend>) {
+    let vm = alias_vm(backend);
+    vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+    vm.write_bytes(0x4000, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x4000);
+    run_to_hlt(&vm, &mut cpu);
+    for patch in 0u32..4 {
+        let value = patch + 2;
+        vm.write_bytes(0x3000, &value.to_le_bytes()).unwrap();
+        let code = assemble(MAIN, |a| {
+            match patch {
+                0 => a.mov(dword_ptr(0x18001u64), value as i32).unwrap(),
+                1 => {
+                    a.mov(esi, 0x3000).unwrap();
+                    a.mov(edi, 0x18001).unwrap();
+                    a.mov(ecx, 4).unwrap();
+                    a.rep().movsb().unwrap();
+                }
+                2 => {
+                    a.lock().add(byte_ptr(0x18001u64), 1).unwrap();
+                }
+                _ => {}
+            }
+            // SDM Vol 3A §§11.1.3, 11.3: serialize after modifying code.
+            a.xor(eax, eax).unwrap();
+            a.cpuid().unwrap();
+            a.hlt().unwrap();
+        });
+        vm.write_bytes(MAIN, &code).unwrap();
+        if patch == 3 {
+            // An external writer must explicitly report its completed write.
+            // SAFETY: the shared view is inside this VM's live host reservation;
+            // the vCPU is stopped and these four bytes have no concurrent readers.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    value.to_le_bytes().as_ptr(),
+                    vm.mem.host_base().add(0x18001).cast_mut(),
+                    4,
+                );
+            }
+            vm.mem.note_write(0x18001, 4);
+        }
+        cpu.set_reg(Reg::Rip, MAIN);
+        run_to_hlt(&vm, &mut cpu);
+        cpu.set_reg(Reg::Rip, 0x4000);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), value as u64, "patch path {patch}");
+        assert!(
+            vm.mem.is_code_page(0x18),
+            "alias must be re-tagged after invalidation"
+        );
+    }
+}
+#[cfg(unix)]
+both_backends!(
+    declared_alias_patches,
+    declared_alias_patches_interp,
+    declared_alias_patches_jit
+);
+
+#[cfg(unix)]
+#[test]
+fn declared_alias_invalidation_every_tier() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use x86jit_core::{FetchVerdict, RegionCaps};
+    let caps = RegionCaps {
+        max_blocks: 16,
+        max_icount: 256,
+    };
+    for tier in 0..6 {
+        for precise in [false, true] {
+            let jit = if tier == 2 || tier == 5 {
+                JitBackend::with_superblocks(caps)
+            } else {
+                JitBackend::new()
+            };
+            let handle = jit.tier_up_handle();
+            let backend: Box<dyn Backend> = if tier == 0 {
+                Box::new(InterpreterBackend)
+            } else {
+                Box::new(jit)
+            };
+            let mut vm = alias_vm(backend);
+            vm.set_precise_split_stores(precise);
+            if tier >= 3 {
+                vm.set_tier_up_after(Some(1));
+            }
+            if tier >= 4 {
+                vm.set_tier_up_background(true);
+            }
+            let approvals = Arc::new(AtomicUsize::new(0));
+            vm.set_fetch_policy(Box::new({
+                let approvals = approvals.clone();
+                move |page| {
+                    if page == 0x4000 {
+                        approvals.fetch_add(1, Ordering::Relaxed);
+                    }
+                    FetchVerdict::Allow
+                }
+            }));
+            // A small loop forms an actual multi-block region when requested.
+            vm.write_bytes(
+                0x4000,
+                &[
+                    0xb8, 1, 0, 0, 0, 0xb9, 3, 0, 0, 0, 0xeb, 0, 0xff, 0xc9, 0x75, 0xfc, 0xf4,
+                ],
+            )
+            .unwrap();
+            let mut cpu = vm.new_vcpu();
+            for _ in 0..6 {
+                cpu.set_reg(Reg::Rip, 0x4000);
+                run_to_hlt(&vm, &mut cpu);
+                handle.wait_idle();
+            }
+            if tier == 2 {
+                vm.test_support_force_region(0x4000, caps, 0x1f80).unwrap();
+            }
+            if tier >= 4 {
+                assert!(vm.cache.tier_bg_published() > 0);
+            }
+            if tier == 2 || tier == 5 {
+                assert!(vm.cache.regions() > 0);
+            }
+            // Registration after translation must tag the existing code's other view.
+            vm.mem.declare_code_alias(0x18000, 0x4000, 0x4000).unwrap();
+            let approved = approvals.load(Ordering::Relaxed);
+            vm.write_bytes(
+                MAIN,
+                &assemble(MAIN, |a| {
+                    a.mov(dword_ptr(0x18001u64), 9i32).unwrap();
+                    a.xor(eax, eax).unwrap();
+                    a.cpuid().unwrap();
+                    a.hlt().unwrap();
+                }),
+            )
+            .unwrap();
+            cpu.set_reg(Reg::Rip, MAIN);
+            run_to_hlt(&vm, &mut cpu);
+            cpu.set_reg(Reg::Rip, 0x4000);
+            run_to_hlt(&vm, &mut cpu);
+            assert_eq!(cpu.reg(Reg::Rax), 9, "tier={tier}, precise={precise}");
+            assert!(
+                approvals.load(Ordering::Relaxed) > approved,
+                "alias invalidation must forget the RX fetch approval"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_alias_rejects_pending_background_translation() {
+    use x86jit_core::RegionCaps;
+    for regions in [false, true] {
+        let jit = if regions {
+            JitBackend::with_superblocks(RegionCaps {
+                max_blocks: 16,
+                max_icount: 256,
+            })
+        } else {
+            JitBackend::new()
+        };
+        let handle = jit.tier_up_handle();
+        let pause = handle.pause_compiler();
+        let mut vm = alias_vm(Box::new(jit));
+        vm.set_tier_up_after(Some(1));
+        vm.set_tier_up_background(true);
+        vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+        vm.write_bytes(
+            0x4000,
+            &[
+                0xb8, 1, 0, 0, 0, 0xb9, 3, 0, 0, 0, 0xeb, 0, 0xff, 0xc9, 0x75, 0xfc, 0xf4,
+            ],
+        )
+        .unwrap();
+        let mut cpu = vm.new_vcpu();
+        for _ in 0..3 {
+            cpu.set_reg(Reg::Rip, 0x4000);
+            run_to_hlt(&vm, &mut cpu);
+        }
+        vm.write_bytes(0x18001, &7u32.to_le_bytes()).unwrap();
+        vm.write_bytes(MAIN, &[0xf4]).unwrap();
+        cpu.set_reg(Reg::Rip, MAIN);
+        run_to_hlt(&vm, &mut cpu);
+        drop(pause);
+        handle.wait_idle();
+        cpu.set_reg(Reg::Rip, MAIN);
+        run_to_hlt(&vm, &mut cpu);
+        assert!(vm.cache.tier_bg_rejected() > 0);
+        cpu.set_reg(Reg::Rip, 0x4000);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), 7);
+    }
+}
+
+#[test]
+fn code_alias_lifecycle_preserves_other_views() {
+    let mut vm = new_vm(Box::new(InterpreterBackend));
+    let mem = &vm.mem;
+    mem.mark_code(0x4000, 1);
+    mem.mark_code(0x9000, 1);
+    mem.declare_code_alias(0x8000, 0x4000, 0x1000).unwrap();
+    mem.declare_code_alias(0x9000, 0x8000, 0x1000).unwrap();
+    mem.declare_code_alias(0x4000, 0x8000, 0x1000).unwrap(); // idempotent
+    mem.note_write(0x8000, 1);
+    assert_eq!(mem.take_dirty_code(), vec![4, 9]);
+    mem.clear_code_page(4);
+    assert!(
+        mem.is_code_page(8),
+        "the other translation still needs the alias tag"
+    );
+    mem.note_write(0x4000, 1);
+    assert_eq!(mem.take_dirty_code(), vec![9]);
+    assert!(mem.remove_code_alias(0x8000, 0x4000, 0x1000));
+    assert!(!mem.is_code_page(4));
+    assert!(mem.is_code_page(8));
+    assert!(!mem.remove_code_alias(0x8000, 0x4000, 0x1000));
+    mem.clear_code_page(9);
+    assert!(!mem.is_code_page(8));
+    mem.mark_code(0x9000, 1);
+    assert!(mem.is_code_page(8));
+    mem.clear_all_code_pages();
+    assert!(!mem.is_code_page(8));
+    mem.mark_code(0x9000, 1);
+    assert!(mem.remove_code_alias(0x9000, 0x8000, 0x1000));
+    assert!(!mem.is_code_page(8));
+    assert!(mem.is_code_page(9));
+    assert!(mem.declare_code_alias(0, 0x4000, 0).is_err());
+    assert!(mem.declare_code_alias(0x4000, u64::MAX, 1).is_err());
+    // Unmap removes declarations, including pairs whose other view survives.
+    mem.declare_code_alias(0x8000, 0x4000, 0x1000).unwrap();
+    vm.unmap(0, FLAT as usize).unwrap();
+    assert!(!vm.mem.remove_code_alias(0x8000, 0x4000, 0x1000));
+}
+
+#[test]
+fn code_alias_subpage_overlap_and_split_write() {
+    let vm = new_vm(Box::new(InterpreterBackend));
+    let mem = &vm.mem;
+    mem.declare_code_alias(0x4001, 0x8fff, 4).unwrap();
+    mem.declare_code_alias(0x4002, 0x8fff, 2).unwrap();
+    mem.mark_code(0x4000, 1);
+    assert!(mem.is_code_page(8));
+    assert!(mem.is_code_page(9));
+    assert!(mem.remove_code_alias(0x4001, 0x8fff, 4));
+    assert!(mem.is_code_page(8));
+    assert!(mem.is_code_page(9));
+    mem.note_write(0x8fff, 2);
+    let mut dirty = mem.take_dirty_code();
+    dirty.sort_unstable();
+    dirty.dedup();
+    assert_eq!(dirty, vec![4]);
+    mem.remove_code_alias(0x4002, 0x8fff, 2);
+    assert!(!mem.is_code_page(8));
+    assert!(!mem.is_code_page(9));
+    assert!(mem.is_code_page(4));
+}
+
+#[cfg(unix)]
+#[test]
+fn code_alias_unmap_preserves_unrelated_subpage_declaration() {
+    let mut vm = Vm::with_backend(VmConfig::flat(FLAT), Box::new(InterpreterBackend));
+    vm.map(0x1000, 0x400, Prot::RW, RegionKind::Ram).unwrap();
+    vm.map(0x1400, 0x400, Prot::RW, RegionKind::Ram).unwrap();
+    vm.mem.declare_code_alias(0x1400, 0x4000, 0x400).unwrap();
+    vm.mem.declare_code_alias(0x1000, 0x8000, 0x400).unwrap();
+    vm.unmap(0x1000, 0x400).unwrap();
+    assert!(!vm.mem.remove_code_alias(0x1000, 0x8000, 0x400));
+    assert!(vm.mem.remove_code_alias(0x1400, 0x4000, 0x400));
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_alias_concurrent_registration_reaches_next_compiled_store() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use x86jit_core::jit_abi::run_compiled;
+    use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
+    use x86jit_core::{CachedBlock, StepResult};
+    let vm = alias_vm(Box::new(JitBackend::new()));
+    vm.mem.mark_code(0x4000, 1);
+    vm.write_bytes(MAIN, &[0x89, 0x07, 0xf4]).unwrap(); // mov [rdi],eax; hlt
+    let ir = lift_block(&vm.mem, FetchAddr::flat(MAIN), CpuMode::Long64).unwrap();
+    let CachedBlock::Compiled { entry } = vm.backend.materialize(
+        &ir,
+        vm.consistency,
+        vm.mem.trap_window(),
+        vm.mem.guest_base(),
+    ) else {
+        panic!("compiled store required")
+    };
+    let before = alias_watermark(&vm);
+    let published = AtomicBool::new(false);
+    let started = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !started.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+            published.store(true, Ordering::Release);
+        });
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rdi, 0xc000);
+        started.store(true, Ordering::Release);
+        while !published.load(Ordering::Acquire) {
+            // SAFETY: vm owns the compiled entry and its matching memory/context.
+            assert!(matches!(
+                unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+                StepResult::Exit(Exit::Hlt)
+            ));
+        }
+        assert_ne!(
+            before,
+            alias_watermark(&vm),
+            "registration must widen the gate"
+        );
+        cpu.set_reg(Reg::Rdi, 0x18000);
+        // SAFETY: vm still owns the entry and backing; registration has completed.
+        assert!(matches!(
+            unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+            StepResult::Exit(Exit::Hlt)
+        ));
+        assert_eq!(vm.mem.take_dirty_code(), vec![4]);
+    });
+}
+
+#[cfg(unix)]
+fn declared_alias_split_store(backend: Box<dyn Backend>) {
+    let mut vm = alias_vm(backend);
+    vm.set_precise_split_stores(true);
+    vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+    // The immediate crosses a guest code-page boundary in both views.
+    vm.write_bytes(0x4ffc, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    vm.write_bytes(
+        MAIN,
+        &assemble(MAIN, |a| {
+            a.mov(dword_ptr(0x18ffdu64), 2i32).unwrap();
+            // SDM Vol 3A §§11.1.3, 11.3: serialize before executing patched code.
+            a.xor(eax, eax).unwrap();
+            a.cpuid().unwrap();
+            a.hlt().unwrap();
+        }),
+    )
+    .unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x4ffc);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(cpu.reg(Reg::Rax), 1);
+    cpu.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut cpu);
+    cpu.set_reg(Reg::Rip, 0x4ffc);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(cpu.reg(Reg::Rax), 2);
+}
+#[cfg(unix)]
+both_backends!(
+    declared_alias_split_store,
+    declared_alias_split_store_interp,
+    declared_alias_split_store_jit
+);
+
+#[cfg(unix)]
+fn alias_watermark(vm: &Vm) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: Memory owns the live, aligned atomic exposed by this ABI pointer.
+    unsafe { (&*(vm.mem.code_range_ptr() as *const AtomicU64)).load(Ordering::Acquire) }
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_alias_early_registration_widens_precompiled_store_gate() {
+    alias_registration_widens_precompiled_store_gate(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_alias_late_registration_widens_precompiled_store_gate() {
+    alias_registration_widens_precompiled_store_gate(false);
+}
+
+#[cfg(unix)]
+fn alias_registration_widens_precompiled_store_gate(early: bool) {
+    use x86jit_core::jit_abi::run_compiled;
+    use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
+    use x86jit_core::{CachedBlock, StepResult};
+    {
+        let vm = alias_vm(Box::new(JitBackend::new()));
+        vm.write_bytes(0x4000, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+        vm.write_bytes(MAIN, &[0x89, 0x07, 0xf4]).unwrap();
+        let ir = lift_block(&vm.mem, FetchAddr::flat(MAIN), CpuMode::Long64).unwrap();
+        let CachedBlock::Compiled { entry } = vm.backend.materialize(
+            &ir,
+            vm.consistency,
+            vm.mem.trap_window(),
+            vm.mem.guest_base(),
+        ) else {
+            panic!("compiled store required")
+        };
+        vm.mem.mark_code(MAIN, 1);
+        let before = alias_watermark(&vm);
+        assert!((0x18000u64 >> 16).wrapping_sub(before >> 32) >= (before & 0xffff_ffff));
+        if early {
+            vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+        }
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, 0x4000);
+        run_to_hlt(&vm, &mut cpu);
+        if !early {
+            assert_eq!(before, alias_watermark(&vm));
+            vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+        }
+        assert_ne!(
+            before,
+            alias_watermark(&vm),
+            "registration/marking must widen the gate"
+        );
+        cpu.set_reg(Reg::Rdi, 0x18001);
+        cpu.set_reg(Reg::Rax, 2);
+        // SAFETY: vm owns the compiled entry and its matching memory/context.
+        assert!(matches!(
+            unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+            StepResult::Exit(Exit::Hlt)
+        ));
+        assert!(vm.mem.has_dirty_code());
+        cpu.set_reg(Reg::Rip, 0x4000);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), 2, "early={early}");
+    }
+}
+
+#[cfg(unix)]
+#[path = "../../x86jit-cranelift/src/unwind_test_signal.rs"]
+mod smc_signal;
+
+#[cfg(unix)]
+#[test]
+fn faulting_split_store_invalidates_code_every_tier() {
+    use x86jit_core::RegionCaps;
+    // Fork only in a fresh process: other tests can hold global JIT locks.
+    if std::env::var_os("X86JIT_SMC_FAULT_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "faulting_split_store_invalidates_code_every_tier",
+                "--nocapture",
+            ])
+            .env("X86JIT_SMC_FAULT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let caps = RegionCaps {
+        max_blocks: 16,
+        max_icount: 256,
+    };
+    let mut failures = Vec::new();
+    for tier in 0..6 {
+        for alias in [false, true] {
+            for replay in [false, true] {
+                for precise in [false, true] {
+                    let status = smc_signal::child(|| {
+                        let jit = if tier == 2 || tier == 5 {
+                            JitBackend::with_superblocks(caps)
+                        } else {
+                            JitBackend::new()
+                        };
+                        let handle = jit.tier_up_handle();
+                        let backend: Box<dyn Backend> = if tier == 0 {
+                            Box::new(InterpreterBackend)
+                        } else {
+                            Box::new(jit)
+                        };
+                        let mut vm = alias_vm(backend);
+                        vm.set_precise_split_stores(precise);
+                        vm.mem.set_host_fault_recovery(true);
+                        if tier >= 3 {
+                            vm.set_tier_up_after(Some(1));
+                        }
+                        if tier >= 4 {
+                            vm.set_tier_up_background(true);
+                        }
+                        if alias {
+                            vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+                        }
+                        let target = if alias { 0x7ff0 } else { 0x1bff0 };
+                        vm.write_bytes(target, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+                        vm.write_bytes(0x2000, &[0x31, 0xc0, 0x0f, 0xa2, 0xf4])
+                            .unwrap();
+                        vm.write_bytes(
+                            MAIN,
+                            &assemble(MAIN, |a| {
+                                let mut top = a.create_label();
+                                a.mov(ecx, 3).unwrap();
+                                a.set_label(&mut top).unwrap();
+                                a.dec(ecx).unwrap();
+                                a.jnz(top).unwrap();
+                                a.vmovdqu(ymmword_ptr(rdi), ymm0).unwrap();
+                                a.hlt().unwrap();
+                            }),
+                        )
+                        .unwrap();
+                        let mut cpu = vm.new_vcpu();
+                        // Warm the writer on RAM so tier-up happens before its fault.
+                        cpu.set_reg(Reg::Rdi, 0xc000);
+                        for _ in 0..6 {
+                            cpu.set_reg(Reg::Rip, MAIN);
+                            run_to_hlt(&vm, &mut cpu);
+                            cpu.set_reg(Reg::Rip, target);
+                            run_to_hlt(&vm, &mut cpu);
+                            handle.wait_idle();
+                        }
+                        if tier == 2 {
+                            vm.test_support_force_region(MAIN, caps, 0x1f80).unwrap();
+                            // Forcing a region discards earlier translations.
+                            cpu.set_reg(Reg::Rip, target);
+                            run_to_hlt(&vm, &mut cpu);
+                        }
+                        if tier >= 4 {
+                            assert!(vm.cache.tier_bg_published() > 0);
+                        }
+                        if tier == 2 || tier == 5 {
+                            assert!(vm.cache.regions() > 0);
+                        }
+                        let mut payload = [0u8; 16];
+                        payload[..6].copy_from_slice(&[0xb8, 2, 0, 0, 0, 0xf4]);
+                        cpu.set_xmm(0, u128::from_le_bytes(payload));
+                        cpu.set_ymm_hi(0, 0);
+                        cpu.set_reg(Reg::Rdi, 0x1bff0);
+                        cpu.set_reg(Reg::Rip, MAIN);
+                        if replay {
+                            vm.unmap(0x1c000, 0x4000).unwrap();
+                        }
+                        smc_signal::HANDLE.store(
+                            cpu.fault_handle().as_usize(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        // SAFETY: the child owns this aligned mapping and recovery handle.
+                        unsafe {
+                            smc_signal::install();
+                            assert_eq!(
+                                libc::mprotect(
+                                    vm.mem.host_base().add(0x1c000).cast_mut().cast(),
+                                    0x4000,
+                                    libc::PROT_NONE
+                                ),
+                                0
+                            );
+                        }
+                        let exit = cpu.run(&vm, None);
+                        assert!(matches!(exit, Exit::UnmappedMemory { .. }), "{exit:?}");
+                        let mut actual = [0u8; 6];
+                        vm.read_bytes(target, &mut actual).unwrap();
+                        let expected = u32::from_le_bytes(actual[1..5].try_into().unwrap()) as u64;
+                        if tier != 0 && !precise {
+                            assert_eq!(expected, 2, "compiled low half must have landed");
+                        }
+                        // SDM Vol 3A §§11.1.3, 11.3: serialize before executing patched code.
+                        cpu.set_reg(Reg::Rip, 0x2000);
+                        run_to_hlt(&vm, &mut cpu);
+                        cpu.set_reg(Reg::Rip, target);
+                        run_to_hlt(&vm, &mut cpu);
+                        assert_eq!(
+                            cpu.reg(Reg::Rax),
+                            expected,
+                            "tier={tier}, alias={alias}, replay={replay}, precise={precise}"
+                        );
+                    });
+                    if status != 0 {
+                        failures.push((tier, alias, replay, precise, status));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed cases: {failures:?}");
+}

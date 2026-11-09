@@ -1,7 +1,7 @@
 //! Guest memory model (§4.1, §4.2, §8.1).
 
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -724,6 +724,43 @@ impl WatchPages {
 
 pub(crate) const DISPATCH_DIRTY: u64 = 1;
 
+#[derive(Default)]
+struct CodeAliases {
+    pairs: BTreeSet<(u64, u64, usize)>,
+    registrations: BTreeMap<u64, BTreeSet<(u64, u64, usize)>>,
+    // Reference counts retain an edge shared by several sub-page declarations.
+    pages: BTreeMap<u64, BTreeMap<u64, usize>>,
+    translated: BTreeSet<u64>,
+}
+
+impl CodeAliases {
+    fn connected(&self, page: u64) -> BTreeSet<u64> {
+        let mut found = BTreeSet::from([page]);
+        let mut pending = vec![page];
+        while let Some(page) = pending.pop() {
+            if let Some(neighbors) = self.pages.get(&page) {
+                for &other in neighbors.keys() {
+                    if found.insert(other) {
+                        pending.push(other);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn edges(a: u64, b: u64, len: usize, mut visit: impl FnMut(u64, u64)) {
+        let mut offset = 0;
+        while offset < len as u64 {
+            let (a, b) = (a + offset, b + offset);
+            visit(a >> CODE_PAGE_BITS, b >> CODE_PAGE_BITS);
+            offset += (CODE_PAGE_SIZE - a % CODE_PAGE_SIZE)
+                .min(CODE_PAGE_SIZE - b % CODE_PAGE_SIZE)
+                .min(len as u64 - offset);
+        }
+    }
+}
+
 /// Guest memory. Owns the host-side backing buffer and region metadata.
 ///
 /// The `host_base` of the backing buffer is what the JIT adds to a guest
@@ -752,6 +789,7 @@ pub struct Memory {
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: Box<[AtomicU64]>,
+    code_aliases: Mutex<CodeAliases>,
     pub(crate) fetch_policy: Option<FetchPolicy>,
     // Packed `(lo << 32) | len` over 64 KiB granules — the *watermark* the JIT's
     // inlined stores gate on, so a store outside it skips the table entirely. See
@@ -873,6 +911,7 @@ impl Memory {
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
             code_page,
+            code_aliases: Mutex::new(CodeAliases::default()),
             fetch_policy: None,
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
@@ -962,12 +1001,121 @@ impl Memory {
     /// (§10). Called through `&self` when a block is cached, so a later store to
     /// the page is caught. Idempotent.
     pub fn mark_code(&self, addr: u64, len: u32) {
+        let mut aliases = self.code_aliases.lock().unwrap();
         // The table covers the whole guest span, so every mappable page has a bit; a
         // page outside it no-ops (`code_page.get` → None) rather than aborting.
         for page in code_page_range(addr, len as u64) {
             let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
             if let Some(word) = self.code_page.get(w) {
+                aliases.translated.insert(page);
                 word.fetch_or(m, Ordering::Relaxed);
+                self.refresh_code_aliases(&aliases, &aliases.connected(page));
+            }
+        }
+    }
+
+    /// Declare that corresponding bytes of two guest ranges share host storage (§10).
+    /// The embedder must create the actual shared mappings and report every pair;
+    /// undeclared aliases cannot be discovered by the engine. Either view may execute
+    /// or be written. Duplicate declarations are idempotent; overlapping declarations
+    /// and multiple views are supported. Tracking is conservative at 4 KiB granularity.
+    ///
+    /// Both nonempty ranges must fit the backing. Registration is safe during guest
+    /// execution; synchronize with the vCPU before relying on completion, as with
+    /// publishing the code bytes themselves. This does not synchronize guest bytes.
+    pub fn declare_code_alias(&self, a: u64, b: u64, len: usize) -> Result<(), MapError> {
+        for start in [a, b] {
+            if len == 0
+                || start < self.guest_base
+                || start
+                    .checked_add(len as u64)
+                    .is_none_or(|end| end > self.size())
+            {
+                return Err(MapError::OutOfBounds);
+            }
+        }
+        let mut aliases = self.code_aliases.lock().unwrap();
+        let pair = (a.min(b), a.max(b), len);
+        if !aliases.pairs.insert(pair) {
+            return Ok(());
+        }
+        let mut affected = BTreeSet::new();
+        CodeAliases::edges(a, b, len, |a, b| {
+            *aliases.pages.entry(a).or_default().entry(b).or_default() += 1;
+            *aliases.pages.entry(b).or_default().entry(a).or_default() += 1;
+            aliases.registrations.entry(a).or_default().insert(pair);
+            aliases.registrations.entry(b).or_default().insert(pair);
+            affected.extend([a, b]);
+        });
+        let mut connected = BTreeSet::new();
+        for page in affected {
+            if !connected.contains(&page) {
+                let component = aliases.connected(page);
+                self.refresh_code_aliases(&aliases, &component);
+                connected.extend(component);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an exact declaration, accepting either order of its views. Returns
+    /// whether it existed. Other declarations and direct code tags remain active.
+    pub fn remove_code_alias(&self, a: u64, b: u64, len: usize) -> bool {
+        let mut aliases = self.code_aliases.lock().unwrap();
+        let pair = (a.min(b), a.max(b), len);
+        if !aliases.pairs.remove(&pair) {
+            return false;
+        }
+        let mut affected = BTreeSet::new();
+        CodeAliases::edges(a, b, len, |a, b| {
+            affected.extend([a, b]);
+            for (from, to) in [(a, b), (b, a)] {
+                let neighbors = aliases.pages.get_mut(&from).unwrap();
+                let count = neighbors.get_mut(&to).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    neighbors.remove(&to);
+                }
+                if neighbors.is_empty() {
+                    aliases.pages.remove(&from);
+                }
+            }
+        });
+        let mut refreshed = BTreeSet::new();
+        for page in affected {
+            let registrations = aliases.registrations.get_mut(&page).unwrap();
+            registrations.remove(&pair);
+            if registrations.is_empty() {
+                aliases.registrations.remove(&page);
+            }
+            if !refreshed.contains(&page) {
+                let component = aliases.connected(page);
+                self.refresh_code_aliases(&aliases, &component);
+                refreshed.extend(component);
+            }
+        }
+        true
+    }
+
+    fn refresh_code_aliases(&self, aliases: &CodeAliases, pages: &BTreeSet<u64>) {
+        let live = pages.iter().any(|p| aliases.translated.contains(p));
+        for &page in pages {
+            let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
+            if let Some(word) = self.code_page.get(w) {
+                if live {
+                    word.fetch_or(m, Ordering::Relaxed);
+                } else {
+                    word.fetch_and(!m, Ordering::Relaxed);
+                }
+            }
+        }
+        // Publish all precise tags before any widened gate. Generated stores acquire
+        // the watermark before probing tags, including on AArch64. The alias mutex
+        // serializes registration, marking, clearing and dirty-page expansion. When
+        // the watermark already covers a new alias, the caller's vCPU synchronization
+        // publishes completion; a store racing registration may precede it.
+        if live {
+            for &page in pages {
                 self.widen_code_range((page << CODE_PAGE_BITS) >> CODE_RANGE_BITS);
             }
         }
@@ -1001,7 +1149,7 @@ impl Memory {
             match self.code_range.compare_exchange_weak(
                 cur,
                 packed,
-                Ordering::Relaxed,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return,
@@ -1039,10 +1187,9 @@ impl Memory {
     /// Clear a page's code tag after its blocks have been invalidated (§10).
     pub fn clear_code_page(&self, page: u64) {
         let clear = || {
-            let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
-            if let Some(word) = self.code_page.get(w) {
-                word.fetch_and(!m, Ordering::Relaxed);
-            }
+            let mut aliases = self.code_aliases.lock().unwrap();
+            aliases.translated.remove(&page);
+            self.refresh_code_aliases(&aliases, &aliases.connected(page));
         };
         if let Some(policy) = &self.fetch_policy {
             policy.clear(Some(page), self.guest_base >> CODE_PAGE_BITS, clear);
@@ -1055,6 +1202,8 @@ impl Memory {
     /// Trap region, §5.2 M4-T10), the bulk counterpart of [`Self::clear_code_page`].
     pub fn clear_all_code_pages(&self) {
         let clear = || {
+            let mut aliases = self.code_aliases.lock().unwrap();
+            aliases.translated.clear();
             let range = self.code_range.load(Ordering::Relaxed);
             let (lo, len) = (range >> 32, range & 0xffff_ffff);
             if len == 0 {
@@ -1094,26 +1243,41 @@ impl Memory {
         let watched = self.watch.count.load(Ordering::Relaxed) != 0;
         for page in code_page_range(addr, len as u64) {
             if self.is_code_page(page) {
-                // Serialize notification and clearing with the drain. Exit bits in
-                // these words are independent and must survive every SMC update.
-                let mut words = self.dispatch_words.lock().unwrap();
-                self.dirty.lock().unwrap().push(page);
-                self.dirty_flag.store(true, Ordering::Relaxed);
-                words.retain(|weak| {
-                    if let Some(word) = weak.upgrade() {
-                        if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 {
-                            word.fetch_or(DISPATCH_DIRTY, Ordering::Relaxed);
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                });
+                self.note_code_write(page);
             }
             if watched && self.watch.is_watched(page) {
                 self.watch.mark_dirty(page);
             }
         }
+    }
+
+    // Keep alias expansion, allocation and notification locks out of data stores'
+    // frame and register allocation, even when the code-page branch is never taken.
+    #[cold]
+    #[inline(never)]
+    fn note_code_write(&self, page: u64) {
+        let aliases = self.code_aliases.lock().unwrap();
+        let dirty: Vec<_> = aliases
+            .connected(page)
+            .into_iter()
+            .filter(|p| aliases.translated.contains(p))
+            .collect();
+        drop(aliases);
+        // Serialize notification and clearing with the drain. Exit bits in
+        // these words are independent and must survive every SMC update.
+        let mut words = self.dispatch_words.lock().unwrap();
+        self.dirty.lock().unwrap().extend(dirty);
+        self.dirty_flag.store(true, Ordering::Relaxed);
+        words.retain(|weak| {
+            if let Some(word) = weak.upgrade() {
+                if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 {
+                    word.fetch_or(DISPATCH_DIRTY, Ordering::Relaxed);
+                }
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub(crate) fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
@@ -1495,6 +1659,25 @@ impl Memory {
         {
             Some(pos) => {
                 self.regions.remove(pos);
+                let end = guest_addr.saturating_add(size as u64);
+                let pages = code_page_range(guest_addr, size as u64);
+                let removed: BTreeSet<_> = self
+                    .code_aliases
+                    .lock()
+                    .unwrap()
+                    .registrations
+                    .range(pages)
+                    .flat_map(|(_, pairs)| pairs)
+                    .copied()
+                    .filter(|&(a, b, len)| {
+                        [a, b]
+                            .into_iter()
+                            .any(|start| start < end && guest_addr < start + len as u64)
+                    })
+                    .collect();
+                for (a, b, len) in removed {
+                    self.remove_code_alias(a, b, len);
+                }
                 if self.fetch_policy.is_some() {
                     for page in code_page_range(guest_addr, size as u64) {
                         self.clear_code_page(page);
