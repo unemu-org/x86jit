@@ -187,7 +187,11 @@ impl StepContext {
 }
 
 /// Cached Real16 walk with instruction/iteration boundaries (decision-16 §3).
-pub(crate) fn interpret_block_steps<const ROUTED: bool, const DEFAULT: bool>(
+pub(crate) fn interpret_block_steps<
+    const ROUTED: bool,
+    const DEFAULT: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -198,21 +202,28 @@ pub(crate) fn interpret_block_steps<const ROUTED: bool, const DEFAULT: bool>(
     #[cfg(target_arch = "aarch64")]
     match info.consistency {
         crate::MemConsistency::AcqRel => {
-            return interpret_steps_ordered::<ROUTED, DEFAULT, 1>(
+            return interpret_steps_ordered::<ROUTED, DEFAULT, 1, STOP_WHEN_IRQ_READY>(
                 ir, cpu, mem, scratch, info, steps,
             )
         }
         crate::MemConsistency::FullTso => {
-            return interpret_steps_ordered::<ROUTED, DEFAULT, 2>(
+            return interpret_steps_ordered::<ROUTED, DEFAULT, 2, STOP_WHEN_IRQ_READY>(
                 ir, cpu, mem, scratch, info, steps,
             )
         }
         crate::MemConsistency::Fast => {}
     }
-    interpret_steps_ordered::<ROUTED, DEFAULT, 0>(ir, cpu, mem, scratch, info, steps)
+    interpret_steps_ordered::<ROUTED, DEFAULT, 0, STOP_WHEN_IRQ_READY>(
+        ir, cpu, mem, scratch, info, steps,
+    )
 }
 
-fn interpret_steps_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER: u8>(
+fn interpret_steps_ordered<
+    const ROUTED: bool,
+    const DEFAULT: bool,
+    const ORDER: u8,
+    const STOP_WHEN_IRQ_READY: bool,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -222,11 +233,11 @@ fn interpret_steps_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
 ) -> BlockResult {
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, true>(
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, true, STOP_WHEN_IRQ_READY>(
             ir, cpu, mem, scratch, info, steps,
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, true>(
+        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, true, STOP_WHEN_IRQ_READY>(
             ir, cpu, mem, scratch, info, steps,
         )
     }
@@ -451,7 +462,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
 ) -> BlockResult {
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false>(
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false>(
             ir,
             cpu,
             mem,
@@ -460,7 +471,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
             &mut StepContext::default(),
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false>(
+        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false>(
             ir,
             cpu,
             mem,
@@ -486,6 +497,7 @@ fn interpret_block_inner<
     const DEFAULT: bool,
     const ORDER: u8,
     const STEPPED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -523,7 +535,7 @@ fn interpret_block_inner<
         steps.cut = false;
     }
     let result = if STEPPED {
-        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED>(
+        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED, STOP_WHEN_IRQ_READY>(
             ir,
             cpu,
             mem,
@@ -537,7 +549,7 @@ fn interpret_block_inner<
             &mut *steps,
         )
     } else {
-        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED>(
+        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED, STOP_WHEN_IRQ_READY>(
             ir,
             cpu,
             mem,
@@ -707,6 +719,7 @@ fn walk_ops<
     const CHILD: bool,
     const ORDER: u8,
     const STEPPED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -745,6 +758,11 @@ fn walk_ops<
                     if let Some(stop) = steps.boundary(cpu, shadows, exit_request) {
                         steps.cut = true;
                         return stop;
+                    }
+                    if STOP_WHEN_IRQ_READY && *started {
+                        // Poll Vcpu::irq_ready only after exporting the completed shadows.
+                        steps.cut = true;
+                        return WalkResult::Continue;
                     }
                     steps.rep_counted = false;
                 }
@@ -3297,7 +3315,7 @@ fn walk_ops<
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
                 }));
                 if STEPPED {
-                    let stop = string_run_bounded::<ROUTED, _>(
+                    let stop = string_run_bounded::<ROUTED, STOP_WHEN_IRQ_READY, _>(
                         cpu,
                         mem,
                         *op,
@@ -4180,7 +4198,7 @@ fn walk_ops<
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
                 }));
                 if STEPPED {
-                    let stop = string_run_bounded::<ROUTED, _>(
+                    let stop = string_run_bounded::<ROUTED, STOP_WHEN_IRQ_READY, _>(
                         cpu,
                         mem,
                         *op,
@@ -4293,7 +4311,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
     let mut shadows = ShadowState::default();
     let mem = Access::<false, ORDER, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        walk_ops::<false, false, true, true, ORDER, false>(
+        walk_ops::<false, false, true, true, ORDER, false, false>(
             ir,
             cpu,
             mem,
@@ -4307,7 +4325,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             (),
         )
     } else {
-        walk_ops::<false, false, false, true, ORDER, false>(
+        walk_ops::<false, false, false, true, ORDER, false, false>(
             ir,
             cpu,
             mem,
@@ -8031,7 +8049,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
     dst_base: u64,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StringStop> {
-    string_run_specialized::<CHILD, false, M>(
+    string_run_specialized::<CHILD, false, false, M>(
         cpu,
         mem,
         op,
@@ -8050,7 +8068,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
 // Bounded REP shares the operations and restart-register updates with the
 // unbounded specialization. A returned boundary is checked before any next access.
 #[allow(clippy::too_many_arguments)]
-fn string_run_bounded<const ROUTED: bool, M: InterpreterMemory>(
+fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: InterpreterMemory>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, 0, M>,
     op: StrOp,
@@ -8066,7 +8084,7 @@ fn string_run_bounded<const ROUTED: bool, M: InterpreterMemory>(
     retired: u64,
 ) -> Option<WalkResult> {
     shadows.complete_before(retired);
-    match string_run_specialized::<false, true, _>(
+    match string_run_specialized::<false, true, STOP_WHEN_IRQ_READY, _>(
         cpu,
         mem,
         op,
@@ -8084,6 +8102,12 @@ fn string_run_bounded<const ROUTED: bool, M: InterpreterMemory>(
         Some(StringStop::Fault(f)) => Some(WalkResult::exit(str_fault_exit(f))),
         Some(StringStop::Interrupted) => {
             let stop = steps.boundary(cpu, shadows, exit_request);
+            let stop = if STOP_WHEN_IRQ_READY && stop.is_none() {
+                steps.cut = true;
+                Some(WalkResult::Continue)
+            } else {
+                stop
+            };
             steps.string_interrupted =
                 matches!(stop, Some(WalkResult::Exit(InterpExit::Interrupted)));
             stop
@@ -8147,7 +8171,12 @@ fn string_store<const STEPPED: bool, M: StrMem>(
 // The unbounded public helpers instantiate false: no per-iteration ledger,
 // answer handling, countdown, or boundary polling is added to their loops.
 #[allow(clippy::too_many_arguments)]
-fn string_run_specialized<const CHILD: bool, const STEPPED: bool, M: StrMem>(
+fn string_run_specialized<
+    const CHILD: bool,
+    const STEPPED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+    M: StrMem,
+>(
     cpu: &mut CpuState,
     mem: &M,
     op: StrOp,
@@ -8198,15 +8227,17 @@ fn string_run_specialized<const CHILD: bool, const STEPPED: bool, M: StrMem>(
     if STEPPED && !matches!(rep, RepKind::None) && cpu.gpr[RCX] & amask != 0 {
         budget.get().rep_counted = true;
     }
+    let mut completed_iteration = false;
     loop {
         if !matches!(rep, RepKind::None) && cpu.gpr[RCX] & amask == 0 {
             break;
         }
         if STEPPED
-            && budget
+            && (budget
                 .get()
                 .boundary(cpu, inhibition.get(), exit_request)
                 .is_some()
+                || (STOP_WHEN_IRQ_READY && completed_iteration))
         {
             cpu.rip = cur_addr;
             return Some(StringStop::Interrupted);
@@ -8330,6 +8361,9 @@ fn string_run_specialized<const CHILD: bool, const STEPPED: bool, M: StrMem>(
             cpu.clear_mmio_parts();
             if !matches!(rep, RepKind::None) {
                 steps.charge();
+                if STOP_WHEN_IRQ_READY {
+                    completed_iteration = true;
+                }
                 if shadows.bits != 0 {
                     shadows.complete();
                 }

@@ -795,6 +795,24 @@ fn rep_recorded_read_survives_ram_fault_without_answer_slot() {
     assert_eq!(restart.element_size(), 1);
     assert_eq!(restart.address_bits(), 16);
     let saved = format!("{metadata:?}");
+    // The read answer is now recorded in the ledger, with no scalar answer pending.
+    assert!(!cpu.irq_ready());
+    let retry = run_ready(&vm, &mut cpu, 1);
+    assert_eq!(retry.steps(), 0);
+    let StepStop::Exit(ready_fault @ Exit::UnmappedMemory { addr: 0x8000, .. }) = retry.into_stop()
+    else {
+        panic!("expected destination fault before readiness")
+    };
+    assert_eq!(
+        format!("{:?}", ready_fault.fault_metadata().unwrap()),
+        saved
+    );
+    assert!(!cpu.irq_ready());
+    assert_eq!(cpu.reg(Reg::Rip), 0);
+    assert_eq!(cpu.reg(Reg::Rsi), 0x7000);
+    assert_eq!(cpu.reg(Reg::Rdi), 0x8000);
+    assert_eq!(cpu.reg(Reg::Rcx), 1);
+    assert_eq!(cpu.retired_instructions(), 0);
     cpu.exit_request().request_exit();
     cpu.inject_irq(0x40);
     budget(&vm, &mut cpu, 0);
@@ -1580,4 +1598,408 @@ fn failed_irq_delivery_and_faulted_pop_ss_add_no_unit() {
     let r = run(&vm, &mut cpu, 1);
     assert_eq!(r.steps(), 1);
     assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+}
+
+fn run_ready(vm: &Vm, cpu: &mut Vcpu, n: u64) -> StepRun {
+    let r = cpu
+        .run_steps(vm, n, StepOptions::default().with_stop_when_irq_ready(true))
+        .unwrap();
+    assert!(r.steps() <= n, "budget={n}, {r:?}");
+    r
+}
+
+fn ready(vm: &Vm, cpu: &mut Vcpu, n: u64, expected_steps: u64) {
+    let r = run_ready(vm, cpu, n);
+    assert!(matches!(r.stop(), StepStop::IrqReady), "{r:?}");
+    assert_eq!(r.steps(), expected_steps);
+    assert!(cpu.irq_ready());
+}
+
+#[test]
+fn ready_stop_on_entry_is_level_triggered_and_precedes_fetch() {
+    let (mut vm, mut cpu) = setup(&[0x40, 0xf4]);
+    flags(&mut cpu, true, false);
+    vm.unmap(0x1000, 4096).unwrap();
+    for n in [1, 10, 1] {
+        ready(&vm, &mut cpu, n, 0);
+        assert_eq!(cpu.reg(Reg::Rip), 0);
+        assert_eq!(cpu.reg(Reg::Rax), 0);
+        assert_eq!(cpu.retired_instructions(), 0);
+        assert!(!cpu.has_pending_irq());
+    }
+}
+
+#[test]
+fn ready_stop_budget_and_host_request_precede_queued_irq_and_readiness() {
+    let (mut vm, mut cpu) = setup(&[0x40, 0xf4]);
+    handler(&mut vm, 0x40, &[0x43, 0xf4]); // inc bx; hlt
+    flags(&mut cpu, true, false);
+    cpu.inject_irq(0x40);
+    cpu.exit_request().request_exit();
+    let r = run_ready(&vm, &mut cpu, 0);
+    assert_eq!(r.steps(), 0);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert!(cpu.has_pending_irq());
+    assert!(cpu.irq_ready());
+    let r = run_ready(&vm, &mut cpu, 10);
+    assert_eq!(r.steps(), 0);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::Interrupted)));
+    assert!(cpu.interruption_evidence().is_some());
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), 0x100);
+    let r = run_ready(&vm, &mut cpu, 1);
+    assert_eq!(r.steps(), 1); // delivery itself costs zero
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert!(!cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), 0x600);
+    assert_eq!(cpu.reg(Reg::Rip), 1);
+    assert_eq!(cpu.reg(Reg::Rbx), 1);
+    assert_eq!(cpu.reg(Reg::Rax), 0);
+    assert_eq!(cpu.retired_instructions(), 1);
+    // Host requests also precede readiness with no queued vector.
+    flags(&mut cpu, true, false);
+    cpu.exit_request().request_exit();
+    let r = run_ready(&vm, &mut cpu, 10);
+    assert_eq!(r.steps(), 0);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::Interrupted)));
+    ready(&vm, &mut cpu, 10, 0);
+}
+
+#[test]
+fn ready_stop_after_sti_protected_instruction_and_budget_tie() {
+    // SDM Vol 3A §7.8.1; Vol 2B §4.3 STI: IF=0 STI protects its successor.
+    for n in [2, 10] {
+        let (vm, mut cpu) = setup(&[0xfb, 0x40, 0x43, 0xf4]);
+        flags(&mut cpu, false, false);
+        let r = run_ready(&vm, &mut cpu, n);
+        assert_eq!(r.steps(), 2);
+        if n == 2 {
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        } else {
+            assert!(matches!(r.stop(), StepStop::IrqReady));
+        }
+        assert!(cpu.irq_ready());
+        assert_eq!(cpu.reg(Reg::Rip), 2);
+        assert_eq!(cpu.reg(Reg::Rax), 1);
+        assert_eq!(cpu.reg(Reg::Rbx), 0);
+        assert_eq!(cpu.retired_instructions(), 2);
+    }
+    let (vm, mut cpu) = setup(&[0xfb, 0xf4]);
+    let r = run_ready(&vm, &mut cpu, 2);
+    assert_eq!(r.steps(), 2);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+}
+
+#[test]
+fn ready_stop_after_mov_ss_or_pop_ss_protected_instruction() {
+    // SDM Vol 3A §7.8.3; Vol 2B §4.3 MOV/POP: SS loads protect the successor.
+    for load in [&[0x8e, 0xd0][..], &[0x17][..]] {
+        let mut code = load.to_vec();
+        code.extend_from_slice(&[0x89, 0xdc, 0x40, 0xf4]); // mov sp,bx; inc ax; hlt
+        let (vm, mut cpu) = setup(&code);
+        flags(&mut cpu, true, false);
+        cpu.set_reg(Reg::Rax, 0x300);
+        cpu.set_reg(Reg::Rbx, 0x900);
+        vm.write_bytes(0x3800, &[0, 3]).unwrap();
+        budget(&vm, &mut cpu, 1); // arm the shadow before enabling the option
+        assert!(!cpu.irq_ready());
+        ready(&vm, &mut cpu, 10, 1);
+        assert_eq!(cpu.reg(Reg::Rip), load.len() as u64 + 2);
+        assert_eq!(cpu.reg(Reg::Rsp), 0x900);
+        assert_eq!(cpu.reg(Reg::Rax), 0x300);
+        assert_eq!(cpu.retired_instructions(), 2);
+    }
+}
+
+#[test]
+fn ready_stop_between_rep_iterations_after_shadow_expiry() {
+    // SDM Vol 3A §§7.6, 7.8.1, 7.8.3; Vol 2B §4.3 REP:
+    // the first completed iteration ends the incoming shadow, retaining REP IP.
+    for load in [&[0xfb][..], &[0x8e, 0xd0][..], &[0x17][..]] {
+        for (count, n) in [(1, 1), (1, 10), (3, 1), (3, 10)] {
+            let mut code = load.to_vec();
+            code.extend_from_slice(&[0xf3, 0xaa, 0x40, 0xf4]);
+            let (mut vm, mut cpu) = setup(&code);
+            handler(&mut vm, 0x40, &[0x43, 0xf4]);
+            flags(&mut cpu, load != [0xfb], false);
+            cpu.set_reg(Reg::Rax, 0x300);
+            vm.write_bytes(0x3800, &[0, 3]).unwrap();
+            cpu.set_reg(Reg::Rdi, 0x8000);
+            cpu.set_reg(Reg::Rcx, count);
+            budget(&vm, &mut cpu, 1);
+            cpu.set_reg(Reg::Rax, 0x55);
+            let r = run_ready(&vm, &mut cpu, n);
+            assert_eq!(r.steps(), 1);
+            if n == 1 {
+                assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            } else {
+                assert!(matches!(r.stop(), StepStop::IrqReady));
+            }
+            assert!(cpu.irq_ready());
+            let expected_ip = load.len() as u64 + if count == 1 { 2 } else { 0 };
+            assert_eq!(cpu.reg(Reg::Rip), expected_ip);
+            assert_eq!(cpu.reg(Reg::Rcx), count - 1);
+            assert_eq!(cpu.reg(Reg::Rdi), 0x8001);
+            assert_eq!(byte(&vm, 0x8000), 0x55);
+            assert_eq!(byte(&vm, 0x8001), 0);
+            assert_eq!(cpu.retired_instructions(), 1 + u64::from(count == 1));
+            ready(&vm, &mut cpu, 10, 0);
+            cpu.inject_irq(0x40);
+            let r = run_ready(&vm, &mut cpu, 1);
+            assert_eq!(r.steps(), 1);
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            assert_eq!(cpu.reg(Reg::Rbx), 1);
+            assert_eq!(cpu.reg(Reg::Rdi), 0x8001);
+            assert_eq!(byte(&vm, 0x3000 + cpu.reg(Reg::Rsp)), expected_ip as u8);
+        }
+    }
+}
+
+#[test]
+fn ready_stop_acknowledge_inject_resume_loop_runs_handler_first() {
+    let (mut vm, mut cpu) = setup(&[0xfb, 0x40, 0x40, 0xf4]);
+    handler(&mut vm, 0x40, &[0x43, 0xcf]); // inc bx; iret
+    ready(&vm, &mut cpu, 10, 2);
+    for acknowledged in 1..=3 {
+        cpu.inject_irq(0x40);
+        let before = cpu.retired_instructions();
+        let r = run_ready(&vm, &mut cpu, 1);
+        assert_eq!(r.steps(), 1);
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert!(!cpu.has_pending_irq());
+        assert_eq!(cpu.retired_instructions() - before, 1);
+        assert_eq!(cpu.reg(Reg::Cs), 0x600);
+        assert_eq!(cpu.reg(Reg::Rip), 1);
+        assert_eq!(cpu.reg(Reg::Rbx), acknowledged);
+        assert_eq!(cpu.reg(Reg::Rax), 1);
+        ready(&vm, &mut cpu, 10, 1); // IRET restores IF and returns to the ready boundary
+        assert_eq!(cpu.reg(Reg::Cs), 0x100);
+        assert_eq!(cpu.reg(Reg::Rip), 2);
+        assert_eq!(cpu.reg(Reg::Rsp), 0x800);
+        assert_eq!(cpu.reg(Reg::Rax), 1);
+    }
+    let r = run(&vm, &mut cpu, 10);
+    assert_eq!(r.steps(), 2);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+    assert_eq!(cpu.reg(Reg::Rax), 2);
+}
+
+#[test]
+fn ready_stop_lost_readiness_keeps_vector_queued() {
+    // SDM Vol 3A §7.8.1: IF=0 masks a queued maskable vector.
+    let (mut vm, mut cpu) = setup(&[0x40, 0xf4]);
+    handler(&mut vm, 0x40, &[0x43, 0xf4]);
+    flags(&mut cpu, true, false);
+    ready(&vm, &mut cpu, 10, 0);
+    cpu.inject_irq(0x40);
+    flags(&mut cpu, false, false);
+    let r = run_ready(&vm, &mut cpu, 1);
+    assert_eq!(r.steps(), 1);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert_eq!(cpu.reg(Reg::Rax), 1);
+    assert!(cpu.has_pending_irq());
+    flags(&mut cpu, true, false);
+    let r = run_ready(&vm, &mut cpu, 1);
+    assert_eq!(r.steps(), 1);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert_eq!(cpu.reg(Reg::Rbx), 1);
+    assert_eq!(cpu.reg(Reg::Rax), 1);
+    assert!(!cpu.has_pending_irq());
+}
+
+#[test]
+fn ready_stop_waits_for_in_and_entire_mmio_completion() {
+    let (vm, mut cpu) = setup(&[0xe4, 0x80, 0x40, 0xf4]);
+    flags(&mut cpu, true, false);
+    let r = run(&vm, &mut cpu, 10);
+    assert_eq!(r.steps(), 1);
+    assert!(matches!(
+        r.stop(),
+        StepStop::Exit(Exit::PortIo {
+            dir: PortDir::In,
+            ..
+        })
+    ));
+    assert!(!cpu.irq_ready());
+    let r = run_ready(&vm, &mut cpu, 0);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert_eq!(
+        cpu.run_steps(
+            &vm,
+            10,
+            StepOptions::default().with_stop_when_irq_ready(true)
+        )
+        .unwrap_err(),
+        StepRunError::PendingPortIn
+    );
+    cpu.complete_port_in(0x55);
+    ready(&vm, &mut cpu, 10, 0);
+    assert_eq!(cpu.reg(Reg::Rax), 0x55);
+    assert_eq!(cpu.reg(Reg::Rip), 2);
+
+    for request_host_exit in [false, true] {
+        let (mut vm, mut cpu) = setup(&[0xfb, 0xf3, 0xa4, 0x40, 0xf4]);
+        trap(&mut vm, 0x7000);
+        trap(&mut vm, 0x8000);
+        cpu.set_reg(Reg::Rsi, 0x7000);
+        cpu.set_reg(Reg::Rdi, 0x8000);
+        cpu.set_reg(Reg::Rcx, 2);
+        let r = run_ready(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 1);
+        assert!(matches!(
+            r.stop(),
+            StepStop::Exit(Exit::MmioRead { addr: 0x7000, .. })
+        ));
+        assert!(!cpu.irq_ready());
+        if request_host_exit {
+            cpu.exit_request().request_exit();
+        }
+        cpu.complete_mmio_read(0x66);
+        assert!(!cpu.irq_ready());
+        let r = run_ready(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 0);
+        assert!(matches!(
+            r.stop(),
+            StepStop::Exit(Exit::MmioWrite {
+                addr: 0x8000,
+                value: 0x66,
+                ..
+            })
+        ));
+        assert!(!cpu.irq_ready());
+        cpu.complete_mmio_write();
+        assert!(!cpu.irq_ready());
+        let r = run_ready(&vm, &mut cpu, 0);
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert_eq!(cpu.reg(Reg::Rcx), 2);
+        let r = run_ready(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 1);
+        if request_host_exit {
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::Interrupted)));
+            assert!(cpu.interruption_evidence().is_some());
+        } else {
+            assert!(matches!(r.stop(), StepStop::IrqReady));
+        }
+        assert!(cpu.irq_ready());
+        assert_eq!(cpu.reg(Reg::Rip), 1);
+        assert_eq!(cpu.reg(Reg::Rcx), 1);
+        assert_eq!(cpu.reg(Reg::Rsi), 0x7001);
+        assert_eq!(cpu.reg(Reg::Rdi), 0x8001);
+        ready(&vm, &mut cpu, 10, 0);
+    }
+    for write in [false, true] {
+        let (mut vm, mut cpu) = setup(&[if write { 0xa2 } else { 0xa0 }, 0, 0x70, 0x40]);
+        trap(&mut vm, 0x7000);
+        flags(&mut cpu, true, false);
+        let r = run(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 0);
+        assert!(matches!(
+            r.stop(),
+            StepStop::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+        ));
+        assert!(!cpu.irq_ready());
+        let r = run_ready(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 0);
+        assert!(matches!(
+            r.stop(),
+            StepStop::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+        ));
+        if write {
+            cpu.complete_mmio_write();
+        } else {
+            cpu.complete_mmio_read(0x55);
+        }
+        assert!(!cpu.irq_ready());
+        ready(&vm, &mut cpu, 10, 1);
+        assert_eq!(cpu.reg(Reg::Rip), 3);
+        assert_eq!(cpu.reg(Reg::Rax), if write { 0 } else { 0x55 });
+        assert_eq!(cpu.retired_instructions(), 1);
+    }
+}
+
+#[test]
+fn ready_stop_disabled_or_masked_keeps_existing_execution() {
+    for code in [
+        &[0x40, 0xf3, 0xaa, 0xf4][..],
+        &[0xfb, 0x40, 0xf3, 0xaa, 0xf4][..],
+    ] {
+        for options in [
+            StepOptions::default(),
+            StepOptions::default().with_stop_when_irq_ready(false),
+            StepOptions::default()
+                .with_stop_when_irq_ready(true)
+                .with_stop_when_irq_ready(false),
+        ] {
+            let (vm, mut cpu) = setup(code);
+            flags(&mut cpu, true, false);
+            cpu.set_reg(Reg::Rdi, 0x8000);
+            cpu.set_reg(Reg::Rcx, 3);
+            let r = cpu.run_steps(&vm, 10, options).unwrap();
+            assert_eq!(r.steps(), if code[0] == 0xfb { 6 } else { 5 });
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+            assert_eq!(cpu.reg(Reg::Rax), 1);
+            assert_eq!(cpu.reg(Reg::Rdi), 0x8003);
+            assert_eq!(cpu.retired_instructions(), code.len() as u64 - 1);
+        }
+    }
+    let (vm, mut cpu) = setup(&[0x40, 0xf3, 0xaa, 0xf4]);
+    flags(&mut cpu, false, false);
+    cpu.set_reg(Reg::Rdi, 0x8000);
+    cpu.set_reg(Reg::Rcx, 3);
+    let r = run_ready(&vm, &mut cpu, 10);
+    assert_eq!(r.steps(), 5);
+    assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+    assert!(!cpu.irq_ready());
+}
+
+#[test]
+fn ready_stop_specializations_and_mode_scope() {
+    use x86jit_core::MemConsistency;
+    for consistency in [
+        MemConsistency::Fast,
+        MemConsistency::AcqRel,
+        MemConsistency::FullTso,
+    ] {
+        for routed in [false, true] {
+            for mxcsr in [0x1f80, 0x3f80] {
+                let mut config = VmConfig::flat(0x4000);
+                config.consistency = consistency;
+                let mut vm = Vm::with_backend(config, Box::new(JitBackend::new()));
+                vm.set_cpu_mode(CpuMode::Real16);
+                vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x1000, &[0xfb, 0xf3, 0xaa, 0x40, 0xf4])
+                    .unwrap();
+                vm.mem.set_host_fault_recovery(routed);
+                let mut cpu = vm.new_vcpu_with_mxcsr(mxcsr);
+                cpu.set_reg(Reg::Cs, 0x100);
+                cpu.set_reg(Reg::Rdi, 0x2000);
+                cpu.set_reg(Reg::Rcx, 3);
+                ready(&vm, &mut cpu, 10, 2);
+                assert_eq!(cpu.reg(Reg::Rip), 1);
+                assert_eq!(cpu.reg(Reg::Rcx), 2);
+                assert_eq!(cpu.reg(Reg::Rdi), 0x2001);
+                assert_eq!(cpu.retired_instructions(), 1);
+                assert_eq!(cpu.mxcsr(), mxcsr);
+            }
+        }
+    }
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        let mut vm = Vm::new(VmConfig::flat(0x4000));
+        vm.set_cpu_mode(mode);
+        let mut cpu = vm.new_vcpu();
+        flags(&mut cpu, true, false);
+        for n in [0, 10] {
+            assert_eq!(
+                cpu.run_steps(
+                    &vm,
+                    n,
+                    StepOptions::default().with_stop_when_irq_ready(true)
+                )
+                .unwrap_err(),
+                StepRunError::UnsupportedMode
+            );
+            assert_eq!(cpu.retired_instructions(), 0);
+            assert!(!cpu.irq_ready());
+        }
+    }
 }

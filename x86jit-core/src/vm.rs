@@ -25,7 +25,17 @@ use crate::state::{CpuState, Flags, Reg};
 /// Default execution stops on the budget or an ordinary exit.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepOptions {
-    _private: (),
+    stop_when_irq_ready: bool,
+}
+
+impl StepOptions {
+    /// Stop at the first boundary where [`Vcpu::irq_ready`] is true.
+    /// A queued eligible IRQ is delivered first; delivery costs no step.
+    /// This is a level check: resuming without injection can return ready again.
+    pub fn with_stop_when_irq_ready(mut self, enabled: bool) -> Self {
+        self.stop_when_irq_ready = enabled;
+        self
+    }
 }
 
 /// Completed accounting units and the reason execution stopped.
@@ -51,7 +61,7 @@ impl StepRun {
 #[non_exhaustive]
 pub enum StepStop {
     Exit(Exit),
-    /// Reserved for the interrupt-readiness stopping option.
+    /// No unit is in flight and [`Vcpu::irq_ready`] is true.
     IrqReady,
 }
 
@@ -1821,7 +1831,8 @@ impl Vcpu {
     /// completion, changing shadows, clearing retries, or consuming host requests.
     ///
     /// Instruction exits win over exhaustion. At other boundaries: budget, host
-    /// request (after pending completion), queued eligible IRQ, then execution.
+    /// request (after pending completion), queued eligible IRQ, optional readiness
+    /// stop, then execution.
     /// Delivery costs no unit. An incomplete instruction/iteration contributes zero;
     /// its already-permitted partial effects remain. The next unit never begins.
     /// `steps = delta(retired_instructions) + completed_rep_iterations
@@ -1832,7 +1843,7 @@ impl Vcpu {
         &mut self,
         vm: &Vm,
         max_steps: u64,
-        _options: StepOptions,
+        options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
         if self.mode != CpuMode::Real16 {
             return Err(StepRunError::UnsupportedMode);
@@ -1862,33 +1873,40 @@ impl Vcpu {
         }
         let guard = FaultRunGuard(&mut *self.fault_entry);
         let mut steps = crate::interp::StepContext::new(max_steps);
-        let exit = if vm.mem.host_fault_recovery() {
-            self.run_steps_inner::<true>(vm, &mut steps, &mut fp_mode)
-        } else {
-            self.run_steps_inner::<false>(vm, &mut steps, &mut fp_mode)
+        let stop = match (vm.mem.host_fault_recovery(), options.stop_when_irq_ready) {
+            (true, true) => self.run_steps_inner::<true, true>(vm, &mut steps, &mut fp_mode),
+            (true, false) => self.run_steps_inner::<true, false>(vm, &mut steps, &mut fp_mode),
+            (false, true) => self.run_steps_inner::<false, true>(vm, &mut steps, &mut fp_mode),
+            (false, false) => self.run_steps_inner::<false, false>(vm, &mut steps, &mut fp_mode),
         };
         drop(guard);
-        let exit = crate::fault::qualify_real16(exit, &self.cpu);
-        let exit = match exit {
-            exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
-                self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+        let stop = match stop {
+            StepStop::Exit(exit) => {
+                let exit = crate::fault::qualify_real16(exit, &self.cpu);
+                let exit = match exit {
+                    exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
+                        self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+                    }
+                    other => other,
+                };
+                self.cpu.finish_mmio_retry(Some(&exit));
+                StepStop::Exit(exit)
             }
-            other => other,
+            StepStop::IrqReady => StepStop::IrqReady,
         };
-        self.cpu.finish_mmio_retry(Some(&exit));
         vm.cache.add_chained(std::mem::take(&mut self.chained));
         Ok(StepRun {
             steps: steps.steps,
-            stop: StepStop::Exit(exit),
+            stop,
         })
     }
 
-    fn run_steps_inner<const ROUTED: bool>(
+    fn run_steps_inner<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool>(
         &mut self,
         vm: &Vm,
         steps: &mut crate::interp::StepContext,
         fp_mode: &mut crate::jit_abi::fp::RunMode,
-    ) -> Exit {
+    ) -> StepStop {
         let exit_word_owner = Arc::clone(&self.exit_request.word);
         let exit_word: &AtomicU64 = &exit_word_owner;
         let mut ctx = MemCtx::for_memory(&vm.mem);
@@ -1896,17 +1914,17 @@ impl Vcpu {
         loop {
             fp_mode.default();
             if steps.remaining == 0 {
-                return Exit::BudgetExhausted;
+                return StepStop::Exit(Exit::BudgetExhausted);
             }
             let pending = self.cpu.mmio_retry_active
                 || self.cpu.pending_mmio.is_some()
                 || self.cpu.pending_mmio_write
                 || self.cpu.pending_port_in.is_some();
             if !pending && exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0 {
-                return self.interrupted(crate::FaultPath::Interpreter, false);
+                return StepStop::Exit(self.interrupted(crate::FaultPath::Interpreter, false));
             }
             if let Some(exit) = self.code_space_exit(vm) {
-                return exit;
+                return StepStop::Exit(exit);
             }
             vm.handle_smc(exit_word);
             if self.pending_irq.is_some() && self.irq_ready() {
@@ -1927,8 +1945,11 @@ impl Vcpu {
                         self.ss_shadow = false;
                         continue;
                     }
-                    StepResult::Exit(exit) => return exit,
+                    StepResult::Exit(exit) => return StepStop::Exit(exit),
                 }
+            }
+            if STOP_WHEN_IRQ_READY && self.irq_ready() {
+                return StepStop::IrqReady;
             }
             let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
             let block = match resolve_dispatch::<true>(
@@ -1940,7 +1961,7 @@ impl Vcpu {
                 0,
             ) {
                 Ok(block) => block,
-                Err(exit) => return exit,
+                Err(exit) => return StepStop::Exit(exit),
             };
             let CachedBlock::Interpreted(ir) = block else {
                 unreachable!("Real16 resolution always interprets");
@@ -1955,7 +1976,7 @@ impl Vcpu {
             };
             steps.pending_irq = self.pending_irq.is_some();
             let result = if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0 {
-                crate::interp::interpret_block_steps::<ROUTED, true>(
+                crate::interp::interpret_block_steps::<ROUTED, true, STOP_WHEN_IRQ_READY>(
                     &ir,
                     &mut self.cpu,
                     &vm.mem,
@@ -1964,7 +1985,7 @@ impl Vcpu {
                     steps,
                 )
             } else {
-                crate::interp::interpret_block_steps::<ROUTED, false>(
+                crate::interp::interpret_block_steps::<ROUTED, false, STOP_WHEN_IRQ_READY>(
                     &ir,
                     &mut self.cpu,
                     &vm.mem,
@@ -1980,7 +2001,7 @@ impl Vcpu {
             match result {
                 crate::interp::BlockResult::Continue | crate::interp::BlockResult::ModeChange => {}
                 crate::interp::BlockResult::Exit(exit) => match exit.into_exit() {
-                    Exit::Syscall => return self.syscall_interpreted(&ir),
+                    Exit::Syscall => return StepStop::Exit(self.syscall_interpreted(&ir)),
                     Exit::Interrupted => {
                         let path = if steps.string_interrupted {
                             crate::FaultPath::Helper {
@@ -1990,7 +2011,7 @@ impl Vcpu {
                         } else {
                             crate::FaultPath::Interpreter
                         };
-                        return self.interrupted(path, false);
+                        return StepStop::Exit(self.interrupted(path, false));
                     }
                     Exit::Exception { addr, vector, .. } => match crate::interp::deliver_interrupt(
                         &mut self.cpu,
@@ -2006,9 +2027,9 @@ impl Vcpu {
                             self.sti_shadow = false;
                             self.ss_shadow = false;
                         }
-                        StepResult::Exit(exit) => return exit,
+                        StepResult::Exit(exit) => return StepStop::Exit(exit),
                     },
-                    exit => return exit,
+                    exit => return StepStop::Exit(exit),
                 },
             }
         }
