@@ -239,6 +239,18 @@ fn cpuid_vcpus_override_ids_and_runtime_fields_on_both_backends() {
             }
             cpu.set_reg(Reg::Rip, 0x1010);
             cpu.set_reg(Reg::Rcx, 0);
+            assert!(matches!(
+                cpu.run(&vm, None),
+                Exit::Exception { vector: 6, .. }
+            ));
+            cpu.cpu
+                .cpuid_overrides
+                .leaves
+                .get_mut(&(1, 0))
+                .unwrap()
+                .value
+                .ecx |= 1 << 27;
+            cpu.set_reg(Reg::Rip, 0x1010);
             assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
             assert_eq!(cpu.reg(Reg::Rax), 3);
             assert_eq!(cpu.reg(Reg::Rdx), 1);
@@ -467,7 +479,16 @@ fn cpuid_runtime_updates_and_xcr0_are_per_vcpu_on_cached_code() {
                         .leaves
                         .insert((leaf, 0), CpuidOverride { mask, value });
                 }
-                assert_eq!(read_xcr0(&vm, cpu), xcr0);
+                if osxsave != 0 {
+                    assert_eq!(read_xcr0(&vm, cpu), xcr0);
+                } else {
+                    cpu.set_reg(Reg::Rip, 0x1010);
+                    cpu.set_reg(Reg::Rcx, 0);
+                    assert!(matches!(
+                        cpu.run(&vm, None),
+                        Exit::Exception { vector: 6, .. }
+                    ));
+                }
                 assert_eq!(read_cpuid(&vm, cpu, 1, 99).ecx & (1 << 27), osxsave);
                 for subleaf in [0, 1] {
                     assert_eq!(read_cpuid(&vm, cpu, 0xd, subleaf).ebx, bytes);
@@ -478,6 +499,14 @@ fn cpuid_runtime_updates_and_xcr0_are_per_vcpu_on_cached_code() {
             }
         }
         first.cpu.cpuid_overrides.xcr0 = None;
+        first
+            .cpu
+            .cpuid_overrides
+            .leaves
+            .get_mut(&(1, 0))
+            .unwrap()
+            .value
+            .ecx |= 1 << 27;
         assert_eq!(
             read_xcr0(&vm, &mut first),
             GuestCpuFeatures::default().xcr0()
@@ -515,18 +544,18 @@ fn cpuid_syscall_bit_is_a_frozen_deviation_outside_long_mode() {
 }
 
 #[test]
-fn cpuid_legacy_replies_remain_frozen_on_both_backends() {
+fn cpuid_default_replies_include_extended_state_layout() {
     // Frozen engine policy; layouts are SDM Vol 1 Tables 21-4/6/8/9/10/17/19/90.
     // Out-of-range zeros intentionally deviate from SDM Vol 1 §21.1.3.
     let replies = [
-        (0, 99, R::new(7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69)),
+        (0, 99, R::new(0xd, 0x756e_6547, 0x6c65_746e, 0x4965_6e69)),
         (1, 99, R::new(0x0003_06c3, 0, 0x1c80_0201, 0x0780_8111)),
         (7, 0, R::new(0, 0x20, 0, 0)),
         (7, 1, R::ZERO),
         (0x8000_0000, 99, R::new(0x8000_0001, 0, 0, 0)),
         (0x8000_0001, 99, R::new(0, 0, 1, 0x2000_0800)),
         (8, 0, R::ZERO),
-        (0xd, 0, R::ZERO),
+        (0xd, 0, R::new(7, 832, 832, 0)),
         (0x8000_0002, 0, R::ZERO),
         (u32::MAX, 0, R::ZERO),
     ];

@@ -548,7 +548,15 @@ fn mxcsr_modes_restore_host_and_default_helpers_on_exits() {
                     2 => matches!(exit, Exit::Exception { .. }),
                     3 => matches!(exit, Exit::UnmappedMemory { .. }),
                     4 => matches!(exit, Exit::PortIo { .. }),
-                    5 => matches!(exit, Exit::UnknownInstruction { .. }),
+                    // XSAVE reads XSTATE_BV before saving into the trap-backed area.
+                    5 => matches!(
+                        exit,
+                        Exit::UnmappedMemory {
+                            addr: 0x18200,
+                            access: x86jit_core::AccessKind::Read,
+                            ..
+                        }
+                    ),
                     6 => matches!(exit, Exit::MmioRead { .. }),
                     7 => matches!(exit, Exit::MmioWrite { .. }),
                     8 => matches!(exit, Exit::BudgetExhausted),

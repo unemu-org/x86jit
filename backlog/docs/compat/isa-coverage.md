@@ -20,7 +20,7 @@ created_date: '2026-07-06 11:25'
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 60 | 0 | 0 | 100% | 0 |
-| optional | 17 | 0 | 0 | 100% | 0 |
+| optional | 26 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 692 | 0 | 107 | 87% | 240 |
 | x86-64-v2 | 117 | 0 | 0 | 100% | 0 |
 | x86-64-v3 | 693 | 0 | 0 | 100% | 1 |
@@ -34,7 +34,7 @@ Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Push
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|
 | mmx | 58 | 0 | 0 | 100% | 0 |
-| optional | 13 | 0 | 0 | 100% | 0 |
+| optional | 18 | 0 | 0 | 100% | 0 |
 | x86-64-v1 | 583 | 0 | 103 | 85% | 228 |
 | x86-64-v2 | 103 | 0 | 0 | 100% | 0 |
 | x86-64-v3 | 654 | 0 | 0 | 100% | 1 |

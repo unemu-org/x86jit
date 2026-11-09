@@ -432,9 +432,34 @@ impl GuestCpuFeatures {
     /// leaf rule in SDM Vol 1 §21.1.3 to preserve the frozen default profile.
     pub fn cpuid(self, leaf: u32, subleaf: u32) -> CpuidRegisters {
         match leaf {
-            0 => CpuidRegisters::new(7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+            0 => CpuidRegisters::new(
+                if self.has(Feature::Xsave) { 0xd } else { 7 },
+                0x756e_6547,
+                0x6c65_746e,
+                0x4965_6e69,
+            ),
             1 => CpuidRegisters::new(0x0003_06c3, 0, self.leaf1_ecx(), self.leaf1_edx()),
             7 if subleaf == 0 => CpuidRegisters::new(0, self.leaf7_ebx(), self.leaf7_ecx(), 0),
+            0xd if self.has(Feature::Xsave) => {
+                let mask = self.xcr0();
+                match subleaf {
+                    // SDM Vol 1 §13.2: supported mask, enabled and maximum area sizes.
+                    0 => CpuidRegisters::new(
+                        mask as u32,
+                        crate::x87::xstate::area_size(mask),
+                        crate::x87::xstate::area_size(mask),
+                        0,
+                    ),
+                    // SDM Vol 1 §§13.2, 13.6: XSAVEOPT and XSAVEC, no XGETBV(1).
+                    1 => CpuidRegisters::new(3, crate::x87::xstate::area_size(mask), 0, 0),
+                    bit => crate::x87::xstate::COMPONENTS
+                        .iter()
+                        .find(|&&(b, _, _)| b == bit && mask & (1 << b) != 0)
+                        .map_or(CpuidRegisters::ZERO, |&(_, size, off)| {
+                            CpuidRegisters::new(size, off, 0, 0)
+                        }),
+                }
+            }
             0x8000_0000 => CpuidRegisters::new(0x8000_0001, 0, 0, 0),
             0x8000_0001 => CpuidRegisters::new(0, 0, self.ext_leaf1_ecx(), self.ext_leaf1_edx()),
             _ => CpuidRegisters::ZERO,

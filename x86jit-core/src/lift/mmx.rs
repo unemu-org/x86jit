@@ -48,6 +48,10 @@ impl Sequence {
                 op,
                 IrOp::X87 { .. }
                     | IrOp::FxState { restore: true, .. }
+                    | IrOp::XState {
+                        kind: crate::x87::xstate::XStateKind::Restore,
+                        ..
+                    }
                     | IrOp::MmxState { empty: true }
             )
         }) {

@@ -8,13 +8,13 @@ use x86jit_tests::compat::{compute_coverage, cpuid_lift_gaps, cpuid_waivers, Cov
 fn optional_extensions_have_complete_coverage() {
     let coverage = compute_coverage();
     for (mode, buckets, forms) in [
-        ("long64", &coverage.generations, 17),
-        ("compat32", &coverage.compat32, 13),
+        ("long64", &coverage.generations, 26),
+        ("compat32", &coverage.compat32, 18),
     ] {
         let optional = buckets.get("optional").expect("optional bucket present");
         assert_eq!(
             optional.lifted, forms,
-            "{mode}: RDTSCP, RDRAND/RDSEED, SSE4A and ADX forms"
+            "{mode}: RDTSCP, RDRAND/RDSEED, SSE4A, ADX and user XSAVE forms"
         );
         assert_eq!(optional.unsupported, 0, "{mode}");
         assert_eq!(optional.unencodable, 0, "{mode}");
@@ -106,7 +106,7 @@ fn cpuid_waivers_are_not_stale() {
 
 /// Regression for gaps the old generation buckets and leaf-1-only check hid.
 #[test]
-fn cpuid_checker_finds_scalar_xsave_and_richer_preset_gaps() {
+fn cpuid_checker_accepts_scalar_and_xsave_lifts() {
     use iced_x86::{Code, CpuidFeature};
     use x86jit_tests::compat::{probe_code, Probe};
     for (name, features) in presets() {
@@ -120,13 +120,22 @@ fn cpuid_checker_finds_scalar_xsave_and_richer_preset_gaps() {
         );
         assert_eq!(probe_code(Code::Cmpxchg8b_m64), Some(Probe::Lifted));
         assert_eq!(probe_code(Code::Cmpxchg16b_m128), Some(Probe::Lifted));
-        if name != "v2" {
-            let xsave = gaps
-                .iter()
-                .find(|g| g.advertised.feature == CpuidFeature::XSAVE)
-                .expect("XSAVE gap");
-            assert!(xsave.missing.contains(&Code::Xsave_mem));
-            assert!(!xsave.missing.contains(&Code::Xsetbv), "CPL 0 excluded");
+        assert!(
+            gaps.iter()
+                .all(|g| g.advertised.feature != CpuidFeature::XSAVE),
+            "{name}/XSAVE"
+        );
+        for code in [
+            Code::Xsave_mem,
+            Code::Xsave64_mem,
+            Code::Xrstor_mem,
+            Code::Xrstor64_mem,
+            Code::Xsaveopt_mem,
+            Code::Xsaveopt64_mem,
+            Code::Xsavec_mem,
+            Code::Xsavec64_mem,
+        ] {
+            assert_eq!(probe_code(code), Some(Probe::Lifted));
         }
     }
 }

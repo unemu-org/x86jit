@@ -614,7 +614,11 @@ pub(crate) fn exec_cpuid(cpu: &mut CpuState) -> Option<InterpResult> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_xgetbv(cpu: &mut CpuState) -> Option<InterpResult> {
+pub(crate) fn exec_xgetbv(cpu: &mut CpuState, cur_addr: u64) -> Option<InterpResult> {
+    if let Some(error) = crate::x87::xstate::xgetbv_fault(cpu) {
+        cpu.rip = cur_addr;
+        return Some(InterpResult::exit(xstate_exit(cur_addr, error)));
+    }
     xgetbv_run(cpu);
     None
 }

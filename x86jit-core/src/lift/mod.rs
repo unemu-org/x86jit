@@ -354,6 +354,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Store { .. }
             | X87 { .. }
             | FxState { .. }
+            | XState { .. }
             | AtomicRmw { .. }
             | AtomicCas { .. }
             | AtomicCasPair { .. }
@@ -1435,7 +1436,12 @@ pub(crate) fn static_succs(block: &IrBlock) -> Vec<u64> {
     if block.ops.iter().any(|op| {
         matches!(
             op,
-            IrOp::SetMxcsr { .. } | IrOp::FxState { restore: true, .. }
+            IrOp::SetMxcsr { .. }
+                | IrOp::FxState { restore: true, .. }
+                | IrOp::XState {
+                    kind: crate::x87::xstate::XStateKind::Restore,
+                    ..
+                }
         )
     }) {
         return Vec::new();
@@ -1698,6 +1704,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | Mul { .. }
         | Div { .. }
         | FxState { .. }
+        | XState { .. }
         | GetMxcsr { .. }
         | SetMxcsr { .. }
         | Load { .. }
@@ -2340,10 +2347,23 @@ fn lift_insn_inner(
             ops.push(IrOp::SetMxcsr { src });
             Ok(true)
         }
-        // fxsave/fxrstor: 512-byte legacy FP/SSE save area. Shared exec_fxstate in
-        // both backends. The default CPUID advertises XSAVE but supplies no leaf 0xD
-        // sizes; XSAVE/XRSTOR still have no lift. A table exposing those sizes must
-        // account for that gap (see the per-preset compat waivers).
+        Xsave | Xsave64 | Xrstor | Xrstor64 | Xsaveopt | Xsaveopt64 | Xsavec | Xsavec64 => {
+            use crate::x87::xstate::XStateKind;
+            let kind = match insn.mnemonic() {
+                Xrstor | Xrstor64 => XStateKind::Restore,
+                Xsaveopt | Xsaveopt64 => XStateKind::SaveOpt,
+                Xsavec | Xsavec64 => XStateKind::SaveCompact,
+                _ => XStateKind::Save,
+            };
+            let addr = effective_address(insn, ops, tg)?;
+            ops.push(IrOp::XState {
+                fault: Default::default(),
+                addr,
+                kind,
+                wide: matches!(insn.mnemonic(), Xsave64 | Xrstor64 | Xsaveopt64 | Xsavec64),
+            });
+            Ok(kind == XStateKind::Restore)
+        }
         Fxsave | Fxsave64 => {
             let addr = effective_address(insn, ops, tg)?;
             ops.push(IrOp::FxState {
@@ -4643,6 +4663,8 @@ fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
             IrOp::RepString { elem, .. } => (u16::from(*elem), false),
             IrOp::FxState { .. } => (512, stack),
             IrOp::VGather { elem, .. } => (u16::from(*elem), stack),
+            // The helper validates the dynamically selected component spans.
+            IrOp::XState { .. } => (1, stack),
             _ => (insn.memory_size().size() as u16, stack),
         };
         op.set_memory_access(crate::ir::MemoryAccess::new(width, long64, ss));

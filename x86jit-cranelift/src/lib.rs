@@ -478,6 +478,55 @@ unsafe extern "C" fn fxstate_helper(
     }
 }
 
+/// Extended-state helper; shared checked transfers retain precise fault addresses.
+///
+/// # Safety
+/// `cpu` and `mem` are the live compiled-block ABI arguments.
+unsafe extern "C" fn xstate_helper(
+    cpu: *mut u8,
+    mem: *mut u8,
+    addr: u64,
+    kind: u64,
+    format: u64,
+    cur_addr: u64,
+) -> u64 {
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION_DETAIL, RET_UNMAPPED};
+    use x86jit_core::x87::xstate::{exec_xstate, XStateFault, XStateKind};
+    // SAFETY: the compiled-block ABI supplies exclusive CPU and live memory context.
+    let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
+    let ctx = unsafe { &mut *(mem as *mut MemCtx) };
+    let memory = unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) };
+    let kind = match kind {
+        0 => XStateKind::Save,
+        1 => XStateKind::Restore,
+        2 => XStateKind::SaveOpt,
+        _ => XStateKind::SaveCompact,
+    };
+    match exec_xstate(
+        cpu,
+        memory,
+        addr,
+        kind,
+        format & 1 != 0,
+        x86jit_core::ir::MemoryAccess::new(1, format & 2 != 0, format & 4 != 0),
+    ) {
+        Ok(()) => RET_CONTINUE,
+        Err(XStateFault::Exception { vector, cause }) => {
+            cpu.rip = cur_addr;
+            ctx.exception_vector = vector as u64;
+            ctx.next_entry = cur_addr;
+            ctx.fault_access = x86jit_core::fault::cause_to_wire(cause);
+            RET_EXCEPTION_DETAIL
+        }
+        Err(XStateFault::Memory { addr: fault, write }) => {
+            ctx.record_helper_fault(fault, 1, write, addr, 1);
+            ctx.record_fp_failure();
+            cpu.rip = cur_addr;
+            RET_UNMAPPED
+        }
+    }
+}
+
 /// `cpuid` helper: delegates to the shared `cpuid_run` so both backends report the
 /// same features.
 ///
@@ -514,9 +563,22 @@ unsafe extern "C" fn random_helper(cpu: *mut u8, seed: u64, size: u64, flags: u6
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn xgetbv_helper(cpu: *mut u8) {
-    let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
+unsafe extern "C" fn xgetbv_helper(cpu: *mut u8, mem: *mut u8, cur_addr: u64) -> u64 {
+    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION_DETAIL};
+    // SAFETY: the compiled-block ABI supplies exclusive CPU and live memory context.
+    let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
+    if let Some(x86jit_core::x87::xstate::XStateFault::Exception { vector, cause }) =
+        x86jit_core::x87::xstate::xgetbv_fault(cpu)
+    {
+        let ctx = unsafe { &mut *(mem as *mut MemCtx) };
+        cpu.rip = cur_addr;
+        ctx.exception_vector = vector as u64;
+        ctx.next_entry = cur_addr;
+        ctx.fault_access = x86jit_core::fault::cause_to_wire(cause);
+        return RET_EXCEPTION_DETAIL;
+    }
     x86jit_core::interp::xgetbv_run(cpu);
+    RET_CONTINUE
 }
 
 /// Record a JIT-inlined guest store against BOTH page facilities: the SMC code-page
@@ -3365,7 +3427,7 @@ impl Shared {
         // signature here; `import_signature` + the fn address are wired into
         // `Helpers` below, inside the builder scope.
         // `n` I64 params, plus an I64 return when `ret` (the value-returning helpers);
-        // the void helpers (cpuid/xgetbv/vmaskmov/bmi write through a `cpu`/`out` pointer).
+        // the void helpers (cpuid/vmaskmov/bmi write through a `cpu`/`out` pointer).
         let params = |n: usize, ret: bool| {
             let mut s = jit.module.make_signature();
             for _ in 0..n {
@@ -3380,13 +3442,14 @@ impl Shared {
         let cas_pair_sig = params(6, true);
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
         let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> status + private FDP policy
+        let xstate_sig = params(6, true);
         let fx_sig = params(5, true); // fxstate(cpu, mem, addr, restore, cur_addr) -> i64
         let crc_sig = params(3, true); // crc32(crc, src, bytes) -> i64
         let note_watch_sig = params(3, false); // note_watch(mem_self, addr, len) -> ()
         let cpuid_sig = params(1, false); // cpuid(cpu) -> ()
         let tsc_sig = params(2, false); // tsc(cpu, aux) -> ()
         let random_sig = params(4, true); // random(cpu, seed, size, flags) -> i64
-        let xgetbv_sig = params(1, false); // xgetbv(cpu) -> ()
+        let xgetbv_sig = params(3, true); // xgetbv(cpu, mem, cur_addr) -> status
         let vmaskmov_sig = params(7, false); // vmaskmov(cpu, dst, src, k, elem, zeroing, bytes) -> ()
         let vmaskmov_mem_sig = params(11, true); // (cpu, mem, reg, addr, k, elem, zeroing, bytes, is_store, cur_addr, broadcast_elem) -> i64
         let gather_sig = params(13, true);
@@ -3586,6 +3649,7 @@ impl Shared {
                 x87: helper!(x87_sig.clone(), x87_helper::<false>),
                 x87_mem: helper!(x87_sig, x87_helper::<true>),
                 fxstate: helper!(fx_sig, fxstate_helper),
+                xstate: helper!(xstate_sig, xstate_helper),
                 crc32: helper!(crc_sig, crc32_helper),
                 note_watch: helper!(note_watch_sig, note_write_helper),
             };

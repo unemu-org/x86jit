@@ -63,6 +63,10 @@ fn fault_code(kind: &str, region: bool) -> Vec<u8> {
         a.nop().unwrap();
         a.set_label(&mut body).unwrap();
     }
+    if region && kind == "xrstor" {
+        a.test(r11, r11).unwrap();
+        a.jne(top).unwrap();
+    }
     if kind == "mf" {
         // SDM Vol 1 §8.6: unmasked #Z is delivered on the next waiting x87 op.
         a.fldcw(word_ptr(0x3000)).unwrap();
@@ -78,6 +82,12 @@ fn fault_code(kind: &str, region: bool) -> Vec<u8> {
         "string" => a.movsb().unwrap(),
         "x87" => a.fld(qword_ptr(rsi)).unwrap(),
         "fxsave" => a.fxsave(ptr(rsi)).unwrap(),
+        "xsave" => a.xsave(ptr(rsi)).unwrap(),
+        "xrstor" => a.xrstor(ptr(rsi)).unwrap(),
+        "xgetbv" => {
+            a.mov(ecx, 1).unwrap();
+            a.xgetbv().unwrap();
+        }
         "mf" => a.fld1().unwrap(),
         _ => unreachable!(),
     }
@@ -114,8 +124,12 @@ fn fault_flags(kind: &str, tier: usize) {
         cpu.set_reg(Reg::Rbx, 1);
         cpu.set_reg(Reg::Rsi, if mmio { 0x8000 } else { SPAN });
         cpu.set_reg(Reg::Rdi, 0x9000);
-        let exit = cpu.run(&vm, None);
+        let exit = cpu.run(&vm, Some(1000));
         match kind {
+            "xgetbv" => assert!(
+                matches!(exit, Exit::Exception { vector: 13, .. }),
+                "{exit:?}"
+            ),
             "mf" => assert!(
                 matches!(exit, Exit::Exception { vector: 16, .. }),
                 "{exit:?}"
@@ -233,6 +247,15 @@ faults! {
     flags_fault_fxsave_interp: "fxsave", 0;
     flags_fault_fxsave_jit: "fxsave", 1;
     flags_fault_fxsave_region: "fxsave", 2;
+    flags_fault_xsave_interp: "xsave", 0;
+    flags_fault_xsave_jit: "xsave", 1;
+    flags_fault_xsave_region: "xsave", 2;
+    flags_fault_xrstor_interp: "xrstor", 0;
+    flags_fault_xrstor_jit: "xrstor", 1;
+    flags_fault_xrstor_region: "xrstor", 2;
+    flags_fault_xgetbv_interp: "xgetbv", 0;
+    flags_fault_xgetbv_jit: "xgetbv", 1;
+    flags_fault_xgetbv_region: "xgetbv", 2;
     flags_fault_mf_interp: "mf", 0;
     flags_fault_mf_jit: "mf", 1;
     flags_fault_mf_region: "mf", 2;

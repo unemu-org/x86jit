@@ -616,6 +616,7 @@ impl OperandAddress {
                 | IrOp::Store { addr, .. }
                 | IrOp::X87 { addr, .. }
                 | IrOp::FxState { addr, .. }
+                | IrOp::XState { addr, .. }
                 | IrOp::AtomicRmw { addr, .. }
                 | IrOp::AtomicCas { addr, .. }
                 | IrOp::AtomicCasPair { addr, .. }
@@ -857,7 +858,7 @@ impl InstructionFaultInfo {
             alignment_check: ops.iter().any(|o| matches!(o, IrOp::CheckAlign { .. })),
             helper: ops.iter().find_map(|op| match op {
                 IrOp::X87 { .. } => Some(FaultHelper::X87),
-                IrOp::FxState { .. } => Some(FaultHelper::FxState),
+                IrOp::FxState { .. } | IrOp::XState { .. } => Some(FaultHelper::FxState),
                 IrOp::RepString { .. } | IrOp::RepStringReal { .. } => Some(FaultHelper::String),
                 IrOp::Div { .. } => Some(FaultHelper::Divide),
                 IrOp::AtomicCasPair { .. } => Some(FaultHelper::CompareExchangePair),
@@ -899,6 +900,9 @@ impl InstructionFaultInfo {
                 | IrOp::PushFlags { .. } => m.writes = true,
                 IrOp::X87 { kind, .. } => m.writes |= crate::x87::mem_write_bytes(*kind).is_some(),
                 IrOp::FxState { restore, .. } => m.writes |= !restore,
+                IrOp::XState { kind, .. } => {
+                    m.writes |= *kind != crate::x87::xstate::XStateKind::Restore
+                }
                 IrOp::RepString {
                     op,
                     elem,

@@ -50,6 +50,8 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
     for (slot, params) in [
         (&mut helpers.x87, 6),
         (&mut helpers.fxstate, 5),
+        (&mut helpers.xstate, 6),
+        (&mut helpers.xgetbv, 3),
         (&mut helpers.vmaskmov_mem, 11),
         (&mut helpers.vec_maskmov_mem, 9),
         (&mut helpers.gather, 13),
@@ -405,6 +407,10 @@ fn guest_memory_helpers_follow_host_and_tier_rule() {
         ("fstp", &[0xd9, 0x1b][..], false, true),
         ("fld1", &[0xd9, 0xe8][..], false, false),
         ("fxsave", &[0x0f, 0xae, 0x03][..], false, true),
+        ("xsave", &[0x0f, 0xae, 0x23][..], true, true),
+        ("xsaveopt", &[0x0f, 0xae, 0x33][..], true, true),
+        ("xsavec", &[0x0f, 0xc7, 0x23][..], false, true),
+        ("xrstor", &[0x0f, 0xae, 0x2b][..], true, false),
         ("fxrstor", &[0x0f, 0xae, 0x0b][..], true, false),
         (
             "gather",

@@ -9,7 +9,7 @@
       "missing_mem_form": []
     },
     "optional": {
-      "lifted": 17,
+      "lifted": 26,
       "unsupported": 0,
       "unencodable": 0,
       "missing": [],
@@ -459,7 +459,7 @@
       "missing_mem_form": []
     },
     "optional": {
-      "lifted": 13,
+      "lifted": 18,
       "unsupported": 0,
       "unencodable": 0,
       "missing": [],

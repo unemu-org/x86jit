@@ -794,7 +794,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 temps[*dst as usize] = random_run(cpu, *kind, *size, *set_flags);
             }
             IrOp::Xgetbv => {
-                if let Some(r) = exec_xgetbv(cpu) {
+                if let Some(r) = exec_xgetbv(cpu, *cur_addr) {
                     return r.into();
                 }
             }
@@ -818,6 +818,25 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
                 cpu.mxcsr = mxcsr;
                 cpu.rip = block_end(ir);
                 return WalkResult::ModeChange;
+            }
+            IrOp::XState {
+                fault,
+                addr,
+                kind,
+                wide,
+            } => {
+                let a = read_val(*addr, temps);
+                if let Err(error) =
+                    crate::x87::xstate::exec_xstate(cpu, &mem.0, a, *kind, *wide, *fault)
+                {
+                    cpu.rip = *cur_addr;
+                    let r = InterpResult::exit(xstate_exit(*cur_addr, error));
+                    return walk_classify_access(r, *cur_addr, a, *fault);
+                }
+                if *kind == crate::x87::xstate::XStateKind::Restore {
+                    cpu.rip = block_end(ir);
+                    return WalkResult::ModeChange;
+                }
             }
             IrOp::FxState {
                 fault,
@@ -7961,6 +7980,24 @@ pub fn bmi_result(a: u64, b: u64, size: u8, op: crate::ir::BmiOp) -> (u64, bool)
             }
             (r & m, false)
         }
+    }
+}
+
+pub(crate) fn xstate_exit(cur_addr: u64, error: crate::x87::xstate::XStateFault) -> Exit {
+    match error {
+        crate::x87::xstate::XStateFault::Exception { vector, cause } => {
+            crate::fault::exception_exit(cur_addr, vector, cause)
+        }
+        crate::x87::xstate::XStateFault::Memory { addr, write } => crate::fault::fp_exit(
+            cur_addr,
+            addr,
+            1,
+            if write {
+                AccessKind::Write
+            } else {
+                AccessKind::Read
+            },
+        ),
     }
 }
 

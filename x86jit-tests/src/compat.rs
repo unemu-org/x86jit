@@ -64,7 +64,7 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
         | CLFLUSHOPT | CX8 | CPUID | PAUSE | MULTIBYTENOP | FXSR | SSE | SSE2 | SYSCALL | SEP
         | SMAP | X64 => Gen::V1,
         // psABI §3.1.1, Table 3.1 (Micro-Architecture Levels).
-        RDTSCP | RDRAND | RDSEED | SSE4A | ADX => Gen::Optional,
+        RDTSCP | RDRAND | RDSEED | SSE4A | ADX | XSAVE | XSAVEOPT | XSAVEC => Gen::Optional,
         // x86-64-v2.
         SSE3 | SSSE3 | SSE4_1 | SSE4_2 | POPCNT | CMPXCHG16B | MOVBE => Gen::V2,
         // x86-64-v3.
@@ -86,6 +86,10 @@ fn feature_gen(f: CpuidFeature) -> Option<Gen> {
 /// also lists SSE2 is v2). MOVBE is v2 but pairs with a baseline feature — the max
 /// rule handles it. Returns `None` for out-of-scope instructions.
 fn code_gen(code: Code) -> Option<Gen> {
+    // SDM Vol 1 §13.3: XSETBV requires CPL 0, outside this user-mode map.
+    if code == Code::Xsetbv {
+        return None;
+    }
     let feats = code.cpuid_features();
     if feats.is_empty() {
         return None;

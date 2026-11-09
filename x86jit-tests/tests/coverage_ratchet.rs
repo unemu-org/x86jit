@@ -210,6 +210,17 @@ const ALLOWLIST: &[&str] = &[
     "Vgatherqps",
     "Vgatherdpd",
     "Vgatherqpd",
+    // xsave.rs: component layouts, selective/initial state, exact faults, native
+    // comparison and all interpreter/block/region save/restore forms.
+    "Xgetbv",
+    "Xsave",
+    "Xsave64",
+    "Xrstor",
+    "Xrstor64",
+    "Xsaveopt",
+    "Xsaveopt64",
+    "Xsavec",
+    "Xsavec64",
     // SSE4A uses manual-derived controls/edge/alias/undefined-policy witnesses in
     // sse4a_adx.rs (sse4a_bitfields_controls_edges_and_undefined_policy and
     // sse4a_streaming_scalar_store_width_and_fault), across both modes and all tiers.

@@ -2,7 +2,6 @@
 // count as coverage gaps. These exceptions preserve existing presets and never
 // claim complete execution support. Remove an entry when its gap closes.
 [
-    ("default", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
     ("default", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
     ("default", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
     ("default", "SSE", "Some scalar/vector square roots, reciprocal approximations remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
@@ -12,13 +11,11 @@
     ("v2", "SSE", "Some scalar/vector square roots, reciprocal approximations remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
     ("v2", "SSE2", "Some square roots, conversions remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
     ("v2", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
-    ("v3", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
     ("v3", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
     ("v3", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
     ("v3", "SSE", "Some scalar/vector square roots, reciprocal approximations remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),
     ("v3", "SSE2", "Some square roots, conversions remain unlifted; implicit-memory MASKMOVDQU is unencodable by the probe. Preserve the baseline."),
     ("v3", "X64", "Long-mode availability is broader than supported instructions: far control transfers and some flag/stack forms remain unlifted. Fixed-register/implicit-operand forms also exceed the probe templates."),
-    ("v4", "XSAVE", "XSAVE/XRSTOR have no lift (xj-6vd.16). The legacy projection supplies no leaf 0xD sizes; a custom table exposing save-area sizes can select an instruction that traps."),
     ("v4", "AVX", "Some VEX shifts, shuffles and arithmetic forms remain unlifted; implicit-memory maskmov probes are also unencodable. Keep the selected preset while exposing these gaps."),
     ("v4", "FPU", "Some x87 comparisons and environment/save forms remain unlifted; obsolete and short environment probes are partly unencodable. The FPU baseline remains advertised."),
     ("v4", "SSE", "Some scalar/vector square roots, reciprocal approximations remain unlifted; implicit-memory MASKMOVQ is unencodable by the probe. Preserve the baseline."),

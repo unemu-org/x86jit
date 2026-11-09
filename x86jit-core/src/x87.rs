@@ -13,6 +13,8 @@
 //! bounds-only view; a fault returns `Some((addr, is_write))` so the caller traps
 //! with RIP on the instruction (§8, §16), exactly like the string helper.
 
+pub mod xstate;
+
 use crate::f80::{Ctl, Exc, F80};
 use crate::state::CpuState;
 

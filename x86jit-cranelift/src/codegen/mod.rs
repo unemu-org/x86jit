@@ -165,6 +165,7 @@ pub struct Helpers {
     pub x87: (ir::SigRef, u64, u64),
     pub x87_mem: (ir::SigRef, u64, u64),
     pub fxstate: (ir::SigRef, u64, u64),
+    pub xstate: (ir::SigRef, u64, u64),
     pub crc32: (ir::SigRef, u64, u64),
     pub note_watch: (ir::SigRef, u64, u64),
 }
@@ -266,6 +267,7 @@ impl Helpers {
             x87: mk(),
             x87_mem: mk(),
             fxstate: mk(),
+            xstate: mk(),
             crc32: mk(),
             note_watch,
         }
@@ -1133,6 +1135,21 @@ impl Translator<'_, '_> {
                 self.store_cpu(self.offsets.rip, end);
                 self.ret(RET_MXCSR_CHANGED);
                 true
+            }
+            IrOp::XState {
+                addr,
+                kind,
+                wide,
+                fault,
+            } => {
+                let restore = *kind == x86jit_core::x87::xstate::XStateKind::Restore;
+                self.emit_x_state(addr, *kind, *wide, *fault);
+                if restore {
+                    let end = self.iconst(self.guest_end);
+                    self.store_cpu(self.offsets.rip, end);
+                    self.ret(RET_MXCSR_CHANGED);
+                }
+                restore
             }
             IrOp::FxState {
                 addr,
@@ -5340,7 +5357,7 @@ impl Translator<'_, '_> {
         self.builder.switch_to_block(ok);
     }
 
-    /// As [`Self::trap_if_unmapped`], but also forwards `RET_EXCEPTION` — a helper that
+    /// As [`Self::trap_if_unmapped`], but also forwards exception statuses — a helper that
     /// raises a guest CPU exception rather than a memory fault (the x87 helper reports a
     /// pending unmasked FP exception as `#MF`).
     ///
@@ -5364,6 +5381,15 @@ impl Translator<'_, '_> {
         let ok = self.begin_trap_fork(exc);
         // The helper already stored RIP and `MemCtx.exception_vector`.
         self.ret_no_flush(RET_EXCEPTION);
+        self.builder.switch_to_block(ok);
+
+        let detailed = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, code, RET_EXCEPTION_DETAIL as i64);
+        let ok = self.begin_trap_fork(detailed);
+        // The helper supplied the dynamic cause and reporting RIP; preserve both.
+        self.ret_no_flush(RET_EXCEPTION_DETAIL);
         self.builder.switch_to_block(ok);
     }
 

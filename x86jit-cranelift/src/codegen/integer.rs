@@ -330,10 +330,11 @@ impl Translator<'_, '_> {
     }
 
     pub(crate) fn emit_xgetbv(&mut self) -> bool {
-        self.flush_gprs(); // preserve pending region writes before reloading GPRs
-        let cpu = self.cpu;
-        self.call_helper(self.helpers.xgetbv, &[cpu]);
-        self.reload_gprs(); // helper wrote RAX/RDX (XCR0)
+        self.flush_gprs();
+        let cur = self.iconst(self.cur_addr);
+        let inst = self.call_helper(self.helpers.xgetbv, &[self.cpu, self.mem, cur]);
+        self.trap_if_unmapped_or_exception(inst);
+        self.reload_gprs();
         false
     }
 
@@ -501,6 +502,33 @@ impl Translator<'_, '_> {
         let inst = self.call_memory_helper(self.helpers.fxstate, &args, Some(access));
         self.trap_if_unmapped_or_exception(inst);
         false
+    }
+
+    pub(crate) fn emit_x_state(
+        &mut self,
+        addr: &Val,
+        kind: x86jit_core::x87::xstate::XStateKind,
+        wide: bool,
+        fault: x86jit_core::ir::MemoryAccess,
+    ) {
+        let a = self.val(*addr);
+        let k = self.iconst(kind as u64);
+        let format = self.iconst(
+            u64::from(wide) | (u64::from(fault.long64()) << 1) | (u64::from(fault.stack()) << 2),
+        );
+        let cur = self.iconst(self.cur_addr);
+        self.flush_gprs();
+        let access = match kind {
+            x86jit_core::x87::xstate::XStateKind::Restore => GuestAccessKind::Read,
+            x86jit_core::x87::xstate::XStateKind::SaveCompact => GuestAccessKind::Write,
+            _ => GuestAccessKind::ReadWrite,
+        };
+        let inst = self.call_memory_helper(
+            self.helpers.xstate,
+            &[self.cpu, self.mem, a, k, format, cur],
+            Some(access),
+        );
+        self.trap_if_unmapped_or_exception(inst);
     }
 
     pub(crate) fn emit_popcnt(&mut self, dst: &u32, src: &Val, size: &u8) -> bool {

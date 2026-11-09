@@ -642,10 +642,20 @@ impl CpuState {
             Some(table) => table.resolve(leaf, subleaf),
             None => (
                 leaf,
-                if leaf == 7 { subleaf } else { 0 },
+                if matches!(leaf, 7 | 0xd) { subleaf } else { 0 },
                 self.features.cpuid(leaf, subleaf),
             ),
         };
+        let mut regs = regs;
+        if self.cpuid_table.is_none()
+            && leaf == 0xd
+            && subleaf <= 1
+            && self.features.has(crate::Feature::Xsave)
+        {
+            regs.ebx = crate::x87::xstate::area_size(
+                crate::x87::xstate::xcr0(self) & self.features.xcr0(),
+            );
+        }
         self.cpuid_overrides.apply(leaf, subleaf, regs)
     }
 

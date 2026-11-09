@@ -404,6 +404,14 @@ pub enum IrOp {
         wide: bool,
     },
 
+    // SDM Vol 1 §§13.7–13.10: selective extended-state image transfer.
+    XState {
+        fault: MemoryAccess,
+        addr: Val,
+        kind: crate::x87::xstate::XStateKind,
+        wide: bool,
+    },
+
     // popcnt: `dst` = set-bit count of `src`. ZF <- (src == 0); CF/OF/SF/AF/PF = 0.
     Popcnt {
         dst: Temp,
@@ -3353,7 +3361,7 @@ impl IrOp {
             Self::Load { fault, .. } => *fault,
             Self::Store { fault, .. } => *fault,
             Self::X87 { fault, .. } => *fault,
-            Self::FxState { fault, .. } => *fault,
+            Self::FxState { fault, .. } | Self::XState { fault, .. } => *fault,
             Self::AtomicRmw { fault, .. } => *fault,
             Self::AtomicCas { fault, .. } => *fault,
             Self::AtomicCasPair { fault, .. } => *fault,
@@ -3445,7 +3453,7 @@ impl IrOp {
             Self::Load { fault, .. } => *fault = value,
             Self::Store { fault, .. } => *fault = value,
             Self::X87 { fault, .. } => *fault = value,
-            Self::FxState { fault, .. } => *fault = value,
+            Self::FxState { fault, .. } | Self::XState { fault, .. } => *fault = value,
             Self::AtomicRmw { fault, .. } => *fault = value,
             Self::AtomicCas { fault, .. } => *fault = value,
             Self::AtomicCasPair { fault, .. } => *fault = value,
