@@ -151,8 +151,7 @@ pub(crate) fn lift_pop(
     };
     // `pop Sreg` (DS/ES/SS — `pop cs` is not decodable on the 286) pops a 16-bit
     // selector into the segment register. A segment write can't fault, so it takes the
-    // register path below (commit SP first). Loading SS should inhibit interrupts for
-    // one instruction — not modeled (no async source observes the shadow) (§17.6).
+    // register path below (commit SP first).
     let dst = match sreg_operand(insn, 0) {
         Some(seg) => WriteTarget::Reg { reg: seg, size: 2 },
         None => lower_write_target(insn, 0, ops, tg)?,
@@ -177,6 +176,9 @@ pub(crate) fn lift_pop(
             ops.push(rsp_writeback);
             emit_write(ops, tg, dst, Val::Temp(val));
         }
+    }
+    if sreg_operand(insn, 0) == Some(Reg::Ss) {
+        ops.push(IrOp::SetSsShadow);
     }
     Ok(())
 }
@@ -793,9 +795,9 @@ pub(crate) fn sreg_operand(insn: &Instruction, idx: u32) -> Option<Reg> {
 /// segment selector; later accesses recompute the base as `selector << 4` at access
 /// time, so nothing else is needed here. `mov CS, r/m16` (`8E /1`) is invalid on the
 /// 80286 and raises `#UD` — the 8086 loaded CS, but we target the 286 (matches
-/// Unicorn/QEMU `MODE_16`, which also `#UD`s it). Loading SS (`mov ss`) should inhibit
-/// interrupts for one instruction — not modeled. Returns `true` (block-terminating)
-/// only for the `#UD` path.
+/// Unicorn/QEMU `MODE_16`, which also `#UD`s it). Loading SS inhibits interrupts through
+/// the next instruction (SDM Vol 3A §7.8.3; Vol 2B §4.3 MOV). Returns `true`
+/// (block-terminating) only for the `#UD` path.
 pub(crate) fn lift_mov_sreg_real16(
     insn: &Instruction,
     ops: &mut impl LiftBuffer,
@@ -816,6 +818,9 @@ pub(crate) fn lift_mov_sreg_real16(
             src,
             size: 2,
         });
+        if seg == Reg::Ss {
+            ops.push(IrOp::SetSsShadow);
+        }
         return Ok(false);
     }
     // mov r/m16, Sreg

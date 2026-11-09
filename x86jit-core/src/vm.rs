@@ -1209,6 +1209,7 @@ impl Vm {
             retired: 0,
             sti_shadow: false,
             code_space_reported: false,
+            ss_shadow: false,
         }
     }
 }
@@ -1340,7 +1341,7 @@ pub struct Vcpu {
     interp_scratch: Vec<u64>,
     /// Pending maskable hardware-interrupt vector (§17.6, sub-seam c). Set by
     /// [`Vcpu::inject_irq`]; delivered at a `run()` boundary through the real-mode IVT
-    /// once IF is set, no memory/port completion is outstanding, and the STI shadow has
+    /// once IF is set, no memory/port completion is outstanding, and both shadows have
     /// elapsed (see [`Vcpu::run`]). A plain `Vcpu` field, NOT in `#[repr(C)] CpuState`:
     /// it is embedder-facing async state, never read by compiled code, so it stays off
     /// the `jit_abi` layout entirely. Real-mode only (Long64/Compat32 never inject).
@@ -1356,14 +1357,12 @@ pub struct Vcpu {
     /// only the occasional interpreter single-step (MMIO retry). Read via
     /// [`Vcpu::retired_instructions`].
     retired: u64,
-    /// STI-shadow latch (§17.6, sub-seam c). `sti` masks interrupt delivery for the
-    /// duration of the *following* instruction, so `sti; hlt` and `sti; cli` behave
-    /// atomically on real hardware. Set true when the just-run interpreted block ended
-    /// with `sti` as its final retired instruction (the interpreter reports this); while
-    /// set, a pending IRQ is held for one more block-dispatch boundary. Cleared once the
-    /// next block runs an instruction (which clears the shadow). Delivery at a boundary is
-    /// blocked while this is set. See [`Vcpu::run`].
+    /// STI inhibition persists through incomplete successors and is consumed at
+    /// completion or event delivery (SDM Vol 3A §7.8.1; Vol 2B §4.3 STI).
     sti_shadow: bool,
+    /// MOV/POP SS inhibition, kept distinct for consecutive-load policy
+    /// (SDM Vol 3A §7.8.3; decision-16 §4). Interpreter-only, outside `CpuState`.
+    ss_shadow: bool,
 }
 
 impl Vcpu {
@@ -1648,6 +1647,10 @@ impl Vcpu {
         if let Some(size) = self.cpu.pending_port_in.take() {
             self.cpu
                 .write_gpr(Reg::Rax.gpr_index().unwrap(), value, size);
+            // Retirement counts the port handoff; inhibition lasts through the
+            // pending architectural result (decision-16 §§2, 4).
+            self.sti_shadow = false;
+            self.ss_shadow = false;
         }
     }
 
@@ -1672,6 +1675,8 @@ impl Vcpu {
         let _fp_mode = crate::jit_abi::fp::RunMode::new();
         let mut info = crate::interp::RetireInfo {
             consistency: vm.consistency,
+            sti_shadow: self.sti_shadow,
+            ss_shadow: self.ss_shadow,
             ..Default::default()
         };
         let r = crate::interp::step_one(
@@ -1683,13 +1688,14 @@ impl Vcpu {
         );
         self.retired += info.retired;
         self.sti_shadow = info.sti_shadow;
+        self.ss_shadow = info.ss_shadow;
         let result = match r {
             // §17.6 (sub-seam b): re-deliver a real-mode exception through the IVT,
             // mirroring the interpreted-block arm of `run`.
             StepResult::Exit(Exit::Exception { addr, vector, .. })
                 if self.mode == CpuMode::Real16 =>
             {
-                crate::interp::deliver_interrupt(
+                let result = crate::interp::deliver_interrupt(
                     &mut self.cpu,
                     &vm.mem,
                     addr,
@@ -1697,7 +1703,12 @@ impl Vcpu {
                     addr,
                     vm.consistency,
                 )
-                .into_step()
+                .into_step();
+                if matches!(result, StepResult::Continue) {
+                    self.sti_shadow = false;
+                    self.ss_shadow = false;
+                }
+                result
             }
             other => other,
         };
@@ -1965,6 +1976,8 @@ impl Vcpu {
                 // Finish the pending instruction before honouring a host request.
                 let mut info = crate::interp::RetireInfo {
                     consistency: vm.consistency,
+                    sti_shadow: self.sti_shadow,
+                    ss_shadow: self.ss_shadow,
                     ..Default::default()
                 };
                 let instruction_rip = self.cpu.rip;
@@ -1977,6 +1990,7 @@ impl Vcpu {
                 );
                 self.retired += info.retired;
                 self.sti_shadow = info.sti_shadow;
+                self.ss_shadow = info.ss_shadow;
                 match r {
                     StepResult::Continue => {
                         blocks_run += 1;
@@ -2001,7 +2015,7 @@ impl Vcpu {
             // §17.6 (sub-seam c): hardware-interrupt injection is delivered here, at a
             // run() boundary — never mid-block. Gate: a vector is pending, IF is set, no
             // memory/port completion is outstanding (a partially-serviced MMIO/`in` must
-            // finish first), and the one-instruction STI shadow has elapsed. All false-
+            // finish first), and the one-instruction STI/SS shadow has elapsed. All false-
             // gating leaves the vector queued (never dropped) for a later boundary — this
             // is also the point that services a post-`hlt` wakeup: after an `Exit::Hlt`
             // the embedder injects and re-enters, and RIP already sits past the `hlt`, so
@@ -2013,7 +2027,8 @@ impl Vcpu {
                     && self.cpu.pending_mmio.is_none()
                     && !self.cpu.pending_mmio_write
                     && self.cpu.pending_port_in.is_none()
-                    && !self.sti_shadow;
+                    && !self.sti_shadow
+                    && !self.ss_shadow;
                 if deliverable {
                     if !DEFAULT {
                         fp_mode.default();
@@ -2037,6 +2052,7 @@ impl Vcpu {
                             // guest instruction — do not tick `retired`; do charge a block
                             // for §9.2 budget accounting. It also clears any stale shadow.
                             self.sti_shadow = false;
+                            self.ss_shadow = false;
                             blocks_run += 1;
                             dispatch = exit_word.load(Ordering::Relaxed);
                             continue;
@@ -2098,6 +2114,8 @@ impl Vcpu {
                     }
                     let mut info = crate::interp::RetireInfo {
                         consistency: vm.consistency,
+                        sti_shadow: self.sti_shadow,
+                        ss_shadow: self.ss_shadow,
                         exit_request: Some(exit_word),
                         trace: vm.lockstep_trace.as_deref(),
                         ..Default::default()
@@ -2110,13 +2128,14 @@ impl Vcpu {
                         &mut info,
                     );
                     // §17.6 (sub-seam c): tick the retired-instruction counter and latch
-                    // the STI shadow from this interpreted block (Real16 is all
+                    // the STI/SS shadow from this interpreted block (Real16 is all
                     // interpreter, so this is the whole real-mode instruction stream).
                     self.retired += info.retired;
                     // Same counter as compiled code charges, so the total
                     // covers whichever tier actually ran the guest.
                     self.executed += info.retired;
                     self.sti_shadow = info.sti_shadow;
+                    self.ss_shadow = info.ss_shadow;
                     match r {
                         crate::interp::BlockResult::Continue => blocks_run += 1,
                         crate::interp::BlockResult::ModeChange => return Err(blocks_run + 1),
@@ -2154,7 +2173,11 @@ impl Vcpu {
                                     )
                                     .into_step()
                                     {
-                                        StepResult::Continue => blocks_run += 1,
+                                        StepResult::Continue => {
+                                            self.sti_shadow = false;
+                                            self.ss_shadow = false;
+                                            blocks_run += 1;
+                                        }
                                         StepResult::Exit(exit) => {
                                             return Ok(crate::fault::qualify_real16(
                                                 exit, &self.cpu,

@@ -2513,6 +2513,7 @@ impl Translator<'_, '_> {
             // the interpreter (the JIT/region tier is never reached in real mode), so no
             // compiled block ever contains them. Reject loudly rather than emit wrong code.
             IrOp::SetIf { .. }
+            | IrOp::SetSsShadow
             | IrOp::PushfReal
             | IrOp::PopfReal
             | IrOp::IntGate { .. }

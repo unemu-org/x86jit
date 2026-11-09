@@ -28,8 +28,9 @@ const RSP: usize = 4;
 /// Per-block interpreter bookkeeping the dispatcher needs but that must NOT live on
 /// `CpuState` (ABI-frozen, §17.6 sub-seam c). Filled by [`interpret_block`]/[`step_one`]
 /// and consumed by [`crate::vm::Vcpu::run`] for the retired-instruction counter and the
-/// STI-shadow interrupt-injection gate. Callers must set `consistency` to the
-/// execution tier; other inputs may use `RetireInfo::default()`.
+/// STI/SS-shadow interrupt-injection gate. Callers must set `consistency` to the
+/// execution tier and carry both shadow fields across calls; other inputs may use
+/// `RetireInfo::default()`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct RetireInfo<'a> {
     /// In: optional interpreter trace sink. Never enabled from the environment.
@@ -43,10 +44,76 @@ pub struct RetireInfo<'a> {
     /// NOT count it — on the retry it retires and is counted once. Straight-line no-trap
     /// blocks count exactly one per decoded instruction.
     pub retired: u64,
-    /// True iff the final retired instruction of this block was `sti` (it set IF and no
-    /// later instruction executed): the one-instruction STI shadow is still in effect, so
-    /// the dispatcher must hold any pending IRQ for one more boundary (§17.6).
+    /// In/out: STI inhibition at the current instruction boundary. An incomplete
+    /// successor preserves it (SDM Vol 3A §7.8.1; Vol 2B §4.3 STI).
     pub sti_shadow: bool,
+    /// In/out: MOV/POP SS inhibition, distinct from STI for consecutive-load policy
+    /// (SDM Vol 3A §7.8.3; Vol 2B §4.3 MOV/POP).
+    pub ss_shadow: bool,
+}
+
+#[derive(Default)]
+struct ShadowState {
+    // Bits 0..2 hold incoming STI/SS; bits 2..4 hold newly armed STI/SS.
+    bits: u8,
+    observed_retired: u64,
+}
+
+impl ShadowState {
+    const STI: u8 = 1;
+    const SS: u8 = 2;
+    const ARM_SHIFT: u8 = 2;
+
+    fn new(sti: bool, ss: bool) -> Self {
+        Self {
+            bits: u8::from(sti) | (u8::from(ss) << 1),
+            observed_retired: 0,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.bits >>= Self::ARM_SHIFT;
+    }
+
+    // Observe completion lazily, using the existing retirement counter. No
+    // shadow state needs to be loaded or stored at ordinary InsnStart markers.
+    fn complete_before(&mut self, retired: u64) {
+        self.bits >>= u64::from(Self::ARM_SHIFT) * (retired - self.observed_retired).min(2);
+        self.observed_retired = retired;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish(&mut self, retired: u64, delivered: bool, completed: bool) {
+        self.complete_before(retired);
+        if delivered {
+            // SDM Vol 3A §§7.8.1, 7.8.3: delivered exceptions end inhibition even
+            // though the faulting instruction did not retire. A host exit does not.
+            self.bits = 0;
+        } else if completed {
+            self.complete();
+        }
+    }
+
+    fn arm_sti(&mut self, value: bool, entry_if: bool) {
+        let mask = Self::STI << Self::ARM_SHIFT;
+        self.bits = (self.bits & !mask) | (u8::from(value && !entry_if) << Self::ARM_SHIFT);
+    }
+
+    fn arm_ss(&mut self) {
+        let mask = Self::SS << Self::ARM_SHIFT;
+        self.bits = (self.bits & !mask) | (u8::from(self.bits & Self::SS == 0) * mask);
+    }
+
+    fn complete_rep_prefix(&mut self, before: u64, cpu: &CpuState, retired: u64) {
+        // Decision-16 §4: the first completed REP iteration consumes inhibition
+        // (SDM Vol 3A §§7.6, 7.8.1, 7.8.3). Sample the committed counter once
+        // per helper call, adding no bookkeeping to the iteration loop.
+        if cpu.gpr[1] != before {
+            self.complete_before(retired);
+            self.complete();
+        }
+    }
 }
 
 /// Single-step the interpreter over exactly one instruction at `cpu.rip` (§5.2,
@@ -310,18 +377,16 @@ fn interpret_block_inner<
     // restart, whereas a trap follows a completed instruction.
     // Exit paths retain the saved-RIP convention: syscall/hlt/port I/O and advancing
     // traps retire; faults, MMIO and interrupted REP leave RIP on the instruction for
-    // retry and do not retire it. `started` gates the
-    // first `InsnStart` (nothing to retire yet). `sti_shadow` tracks whether the most
-    // recent instruction was an `sti`: reset at every `InsnStart`, set by `SetIf{true}`;
-    // if still set at block end, `sti` was the final instruction and its one-instruction
-    // shadow is still live.
+    // retry and do not retire it. `started` gates the first `InsnStart` (nothing
+    // to retire yet). Shadows retain the incoming inhibition until completion;
+    // shadow-producing ops stage new inhibition separately from that input.
     let mut retired: u64 = 0;
     let mut started = false;
-    let mut sti_shadow = false;
+    let mut shadows = ShadowState::new(info.sti_shadow, info.ss_shadow);
 
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
-    // `sti_shadow` are threaded by `&mut` and read afterwards.
+    // `shadows` are threaded by `&mut` and read afterwards.
     let result = walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER>(
         ir,
         cpu,
@@ -330,7 +395,7 @@ fn interpret_block_inner<
         &mut cur_addr,
         &mut retired,
         &mut started,
-        &mut sti_shadow,
+        &mut shadows,
         info.exit_request,
         info.trace,
     );
@@ -339,6 +404,13 @@ fn interpret_block_inner<
         WalkResult::FaultDelivered => false,
         WalkResult::Exit(_) | WalkResult::Fault => cpu.rip != cur_addr,
     };
+    if shadows.bits != 0 {
+        shadows.finish(
+            retired,
+            matches!(&result, WalkResult::FaultDelivered),
+            started && completed && cpu.pending_port_in.is_none(),
+        );
+    }
 
     let result = match result {
         WalkResult::Continue | WalkResult::FaultDelivered => BlockResult::Continue,
@@ -377,10 +449,8 @@ fn interpret_block_inner<
         result
     };
     info.retired = retired;
-    // Report the STI shadow only when the last retiring instruction was `sti`. If that
-    // `sti` did NOT retire (a self-trap is impossible for `sti`, but guard anyway), the
-    // shadow is irrelevant.
-    info.sti_shadow = sti_shadow && started && completed;
+    info.sti_shadow = shadows.bits & ShadowState::STI != 0;
+    info.ss_shadow = shadows.bits & ShadowState::SS != 0;
     result
 }
 
@@ -423,7 +493,7 @@ pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
 
 /// The per-op interpreter walk. Every early `return` here exits `walk_ops`; the caller
 /// then applies the single final-instruction retirement, reading the post-walk values of
-/// the `&mut` retirement counters (`cur_addr`/`retired`/`started`/`sti_shadow`).
+/// the `&mut` retirement counters and shadow state.
 #[allow(clippy::too_many_arguments)]
 fn walk_ops<
     const RETRY: bool,
@@ -439,7 +509,7 @@ fn walk_ops<
     cur_addr: &mut u64,
     retired: &mut u64,
     started: &mut bool,
-    sti_shadow: &mut bool,
+    shadows: &mut ShadowState,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
     trace: Option<&crate::lockstep::Trace>,
 ) -> WalkResult {
@@ -460,7 +530,6 @@ fn walk_ops<
                     *retired += 1; // the previous instruction completed
                 }
                 *started = true;
-                *sti_shadow = false; // a new instruction clears any pending sti shadow
                 *cur_addr = *guest_addr;
                 if !CHILD && bracket.active() {
                     crate::lockstep::on_insn_start(&mut bracket, cpu, mem, *guest_addr);
@@ -2993,7 +3062,8 @@ fn walk_ops<
                     StrOp::Stos => ordering::Direction::Write,
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
                 }));
-                if let Some(r) = exec_rep_string(
+                let before = cpu.gpr[1];
+                let result = exec_rep_string(
                     cpu,
                     mem,
                     temps,
@@ -3004,7 +3074,9 @@ fn walk_ops<
                     addr_bits,
                     seg_base,
                     exit_request,
-                ) {
+                );
+                shadows.complete_rep_prefix(before, cpu, *retired);
+                if let Some(r) = result {
                     return walk_classify_string_access(r, *cur_addr, *fault);
                 }
             }
@@ -3694,10 +3766,19 @@ fn walk_ops<
                 });
             }
             IrOp::SetIf { value } => {
+                // SDM Vol 2B §4.3 STI: only an execution beginning with IF=0
+                // inhibits the following instruction boundary.
+                // SetIf is the only op of CLI/STI, so IF still has its entry value.
+                shadows.complete_before(*retired);
+                shadows.arm_sti(*value, cpu.flags.if_);
                 cpu.flags.if_ = *value;
-                // `sti` arms the one-instruction STI shadow (§17.6, sub-seam c); a plain
-                // `cli` (value=false) does not. Any following `InsnStart` clears it.
-                *sti_shadow = *value;
+            }
+            IrOp::SetSsShadow => {
+                // SDM Vol 3A §7.8.3; Vol 2B §4.3 MOV/POP: the next instruction
+                // consumes inhibition without changing IF. Decision-16 §4 chooses
+                // not to rearm an incoming SS shadow on consecutive SS loads.
+                shadows.complete_before(*retired);
+                shadows.arm_ss();
             }
             IrOp::PushfReal => {
                 if CHILD {
@@ -3843,7 +3924,8 @@ fn walk_ops<
                     StrOp::Stos => ordering::Direction::Write,
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
                 }));
-                if let Some(r) = exec_rep_string_real(
+                let before = cpu.gpr[1];
+                let result = exec_rep_string_real(
                     cpu,
                     mem,
                     temps,
@@ -3854,7 +3936,9 @@ fn walk_ops<
                     ds_base,
                     es_base,
                     exit_request,
-                ) {
+                );
+                shadows.complete_rep_prefix(before, cpu, *retired);
+                if let Some(r) = result {
                     return r.into();
                 }
             }
@@ -3930,7 +4014,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
     let mut cur = ir.guest_start;
     let mut retired = 0;
     let mut started = false;
-    let mut shadow = false;
+    let mut shadows = ShadowState::default();
     let mem = Access::<false, ORDER, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
         walk_ops::<false, false, true, true, ORDER>(
@@ -3941,7 +4025,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             &mut cur,
             &mut retired,
             &mut started,
-            &mut shadow,
+            &mut shadows,
             None,
             None,
         )
@@ -3954,7 +4038,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             &mut cur,
             &mut retired,
             &mut started,
-            &mut shadow,
+            &mut shadows,
             None,
             None,
         )

@@ -1184,6 +1184,7 @@ fn refusal(op: &IrOp) -> Option<ChildRefusal> {
         | IrOp::RestoreFlags { .. }
         | IrOp::ReadSelector { .. }
         | IrOp::SetIf { .. }
+        | IrOp::SetSsShadow
         | IrOp::SetCf { .. }
         | IrOp::LoopCx { .. }
         | IrOp::RepString { .. }

@@ -2637,13 +2637,15 @@ pub enum IrOp {
     // produce them (so no compiled block ever sees them — they stay interpreter-only,
     // like all of Real16).
     //
-    // `cli`/`sti`: set/clear IF. The one-instruction "STI shadow" (IF only becoming
-    // deliverable after the instruction *following* `sti`) is not modeled — we have no
-    // asynchronous interrupt source that would observe the shadow, so a plain set is
-    // architecturally indistinguishable here (documented deferral).
+    // `cli`/`sti`: set/clear IF; STI arms inhibition only if entry IF=0
+    // (SDM Vol 2B §4.3 STI).
     SetIf {
         value: bool,
     },
+    // After a successful MOV/POP SS commit, inhibit IRQs through the next instruction
+    // (SDM Vol 3A §7.8.3; Vol 2B §4.3 MOV/POP). Does not change IF.
+    // Decision-16 §4: an incoming SS shadow is consumed without rearming.
+    SetSsShadow,
     // `pushf` (16-bit): push the real-mode FLAGS image (`Flags::to_flags16`, incl. IF)
     // onto SS:SP with a 16-bit SP wrap. May trap on the stack store.
     PushfReal,

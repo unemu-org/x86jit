@@ -644,6 +644,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | VMoveHalf { .. }
             | SetDf { .. }
             | SetIf { .. }
+            | SetSsShadow
             | RestoreFlags { .. }
             | ReadSelector { .. }
             | CheckIretNt
@@ -2016,6 +2017,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | ReadSelector { .. }
         | SetDf { .. }
         | SetIf { .. }
+        | SetSsShadow
         | FarJump { .. }
         | Jump { .. }
         | Call { .. }
