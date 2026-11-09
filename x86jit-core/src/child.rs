@@ -88,6 +88,10 @@ pub enum ChildRefusal {
     Helper,
     Mmio,
     CodeStore,
+    /// Split cache-line/page operands, or alignment unsupported by the host.
+    AtomicAlignment,
+    /// Host lacks a required atomic instruction.
+    AtomicUnavailable,
     ArenaFull,
     UnsupportedInstruction,
 }
@@ -224,6 +228,7 @@ pub struct ChildArena {
     cpu: CpuState,
     memory: RefCell<StepMemory>,
     recovery: UnsafeCell<transfer::Record>,
+    atomics: transfer::AtomicFeatures,
 }
 impl ChildArena {
     pub fn new(capacity: usize) -> Self {
@@ -254,11 +259,19 @@ impl ChildArena {
                 partial: false,
             }),
             recovery: UnsafeCell::new(transfer::Record::default()),
+            atomics: transfer::AtomicFeatures::detect(),
         }
     }
     /// Guest 4 KiB page numbers; valid until the parent drops the arena.
     pub fn written_pages(&self) -> std::cell::Ref<'_, [u64]> {
         std::cell::Ref::map(self.memory.borrow(), |m| m.written.as_slice())
+    }
+
+    /// Use the exclusive-loop atomic fallback even when the host supports LSE.
+    /// Configure in the parent before entering the child.
+    #[cfg(target_arch = "aarch64")]
+    pub fn disable_lse_atomics(&mut self) {
+        self.atomics.lse = false;
     }
 }
 
@@ -266,6 +279,7 @@ struct ChildMemory<'a, 'vm> {
     view: &'a ChildView<'vm>,
     state: &'a RefCell<StepMemory>,
     recovery: &'a UnsafeCell<transfer::Record>,
+    atomics: &'a transfer::AtomicFeatures,
 }
 impl ChildMemory<'_, '_> {
     fn refuse(&self, why: ChildRefusal) {
@@ -428,6 +442,123 @@ impl ChildMemory<'_, '_> {
             }
         }
     }
+    fn compare_exchange(&self, addr: u64, expected: u128, src: u128, size: u8) -> Option<u128> {
+        let kind = self.check(addr, size, FaultAccess::Write)?;
+        if kind != RegionKind::Ram {
+            self.refuse(ChildRefusal::Mmio);
+            return None;
+        }
+        let ptr = self.view.base + (addr - self.view.guest_base) as usize;
+        if (addr & 63) + u64::from(size) > 64
+            || (ptr & 63) + usize::from(size) > 64
+            || ((cfg!(target_arch = "aarch64") || size == 16) && ptr & (usize::from(size) - 1) != 0)
+        {
+            self.refuse(ChildRefusal::AtomicAlignment);
+            return None;
+        }
+        if size == 16 && !self.atomics.pair {
+            self.refuse(ChildRefusal::AtomicUnavailable);
+            return None;
+        }
+        let written_len = self.state.borrow().written.len();
+        if !self.reserve_write(addr, size) {
+            return None;
+        }
+        // SAFETY: checked RAM backing, alignment and feature support; the arena's
+        // recovery record remains live through the dedicated atomic fixup range.
+        match unsafe {
+            transfer::compare_exchange(ptr, expected, src, size, self.recovery.get(), self.atomics)
+        } {
+            Ok(old) => Some(old),
+            Err(()) => {
+                self.state.borrow_mut().written.truncate(written_len);
+                self.fault(addr, size, FaultAccess::Write, true, true);
+                None
+            }
+        }
+    }
+
+    fn atomic(&self, op: &IrOp, temps: &mut [u64], cpu: &mut CpuState) {
+        self.state.borrow_mut().rmw = true;
+        match *op {
+            IrOp::AtomicRmw {
+                old,
+                addr,
+                src,
+                size,
+                op,
+                ..
+            } => {
+                let addr = read_value(addr, temps);
+                let src = read_value(src, temps);
+                let mask = u64::MAX >> (64 - size * 8);
+                let mut expected = 0u64;
+                loop {
+                    use crate::ir::RmwOp;
+                    let next = match op {
+                        RmwOp::Add => expected.wrapping_add(src),
+                        RmwOp::Sub => expected.wrapping_sub(src),
+                        RmwOp::Rsub => src.wrapping_sub(expected),
+                        RmwOp::And => expected & src,
+                        RmwOp::Or => expected | src,
+                        RmwOp::Xor => expected ^ src,
+                        RmwOp::Xchg => src,
+                    } & mask;
+                    let Some(observed) =
+                        self.compare_exchange(addr, expected.into(), next.into(), size)
+                    else {
+                        return;
+                    };
+                    let observed = observed as u64;
+                    if observed == expected {
+                        temps[old as usize] = observed;
+                        break;
+                    }
+                    expected = observed;
+                }
+            }
+            IrOp::AtomicCas {
+                old,
+                addr,
+                expected,
+                src,
+                size,
+                ..
+            } => {
+                let mask = u64::MAX >> (64 - size * 8);
+                if let Some(observed) = self.compare_exchange(
+                    read_value(addr, temps),
+                    (read_value(expected, temps) & mask).into(),
+                    read_value(src, temps).into(),
+                    size,
+                ) {
+                    temps[old as usize] = observed as u64;
+                }
+            }
+            IrOp::AtomicCasPair { addr, size, .. } => {
+                let addr = read_value(addr, temps);
+                // SDM Vol 2A §3.2, CMPXCHG8B/CMPXCHG16B, 64-Bit Mode
+                // Exceptions and Operation: 16-byte alignment; only ZF changes.
+                if size == 16 && addr & 15 != 0 {
+                    self.exception_fault(13, FaultCause::RequiredAlignment, 0);
+                    return;
+                }
+                let bits = size * 4;
+                let mask = u64::MAX >> (64 - bits);
+                let expected =
+                    (u128::from(cpu.gpr[2] & mask) << bits) | u128::from(cpu.gpr[0] & mask);
+                let src = (u128::from(cpu.gpr[1] & mask) << bits) | u128::from(cpu.gpr[3] & mask);
+                if let Some(old) = self.compare_exchange(addr, expected, src, size) {
+                    cpu.flags.zf = old == expected;
+                    if old != expected {
+                        cpu.write_gpr(0, old as u64, size / 2);
+                        cpu.write_gpr(2, (old >> bits) as u64, size / 2);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
     fn store(&self, addr: u64, value: u64, size: u8) {
         let Some(kind) = self.check(addr, size, FaultAccess::Write) else {
             return;
@@ -435,6 +566,7 @@ impl ChildMemory<'_, '_> {
         if kind == RegionKind::Rom {
             return;
         }
+        let written_len = self.state.borrow().written.len();
         if !self.reserve_write(addr, size) {
             return;
         }
@@ -457,29 +589,34 @@ impl ChildMemory<'_, '_> {
             s.stores_len += 1;
             return;
         }
-        s.partial = true;
         drop(s);
+        let ptr = self.view.base + (addr - self.view.guest_base) as usize;
         // SAFETY: validated live backing; the recovery record is exclusive to this step.
-        match unsafe {
-            transfer::store(
-                self.view.base + (addr - self.view.guest_base) as usize,
-                value,
-                size,
-                self.recovery.get(),
-            )
-        } {
+        match unsafe { transfer::store(ptr, value, size, self.recovery.get()) } {
             Ok(()) => self.state.borrow_mut().partial = true,
-            Err(at) => self.fault(
-                self.view.guest_base + (at - self.view.base) as u64,
-                size,
-                FaultAccess::Write,
-                true,
-                true,
-            ),
+            Err(at) => {
+                self.state.borrow_mut().written.truncate(written_len);
+                // Cross-page transfers write bytewise; retain only their completed prefix.
+                if at > ptr {
+                    self.reserve_write(addr, (at - ptr) as u8);
+                    self.state.borrow_mut().partial = true;
+                }
+                self.fault(
+                    self.view.guest_base + (at - self.view.base) as u64,
+                    size,
+                    FaultAccess::Write,
+                    true,
+                    true,
+                );
+            }
         }
     }
 }
 impl InterpreterMemory for ChildMemory<'_, '_> {
+    fn child_atomic(&self, op: &IrOp, temps: &mut [u64], cpu: &mut CpuState) {
+        self.atomic(op, temps, cpu);
+    }
+
     fn normal(&self) -> &Memory {
         panic!("parent memory reached by child execution")
     }
@@ -676,6 +813,7 @@ impl InterpreterMemory for ChildMemory<'_, '_> {
             cpu.gpr[1] & mask
         };
         if matches!(op, StrOp::Movs | StrOp::Stos) {
+            let written_len = self.state.borrow().written.len();
             // Check every potential refusal before the first committed iteration.
             // Faults remain per-iteration so restart registers retain completed work.
             let delta = if cpu.flags.df {
@@ -708,6 +846,8 @@ impl InterpreterMemory for ChildMemory<'_, '_> {
                     return;
                 }
             }
+            // Preflight reserves capacity; execution logs only completed transfers.
+            self.state.borrow_mut().written.truncate(written_len);
         }
         self.state.borrow_mut().writing = true;
         let rip = self.state.borrow().rip;
@@ -1033,9 +1173,7 @@ fn refusal(op: &IrOp) -> Option<ChildRefusal> {
         IrOp::FxState { .. } => Some(ChildRefusal::FxState),
         IrOp::XState { .. } => Some(ChildRefusal::FxState),
         IrOp::VGather { .. } => Some(ChildRefusal::Gather),
-        IrOp::AtomicRmw { .. } => Some(ChildRefusal::Helper),
-        IrOp::AtomicCas { .. } => Some(ChildRefusal::Helper),
-        IrOp::AtomicCasPair { .. } => Some(ChildRefusal::Helper),
+        IrOp::AtomicRmw { .. } | IrOp::AtomicCas { .. } | IrOp::AtomicCasPair { .. } => None,
         IrOp::CheckIretNt => Some(ChildRefusal::Helper),
         IrOp::CheckIret { .. } => Some(ChildRefusal::Helper),
         IrOp::Unsupported { .. } => Some(ChildRefusal::UnsupportedInstruction),
@@ -1076,6 +1214,7 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
         cpu: work,
         memory,
         recovery,
+        atomics,
     } = arena;
     let entry_log = memory.get_mut().written.len();
     {
@@ -1095,6 +1234,7 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
         view,
         state: memory,
         recovery,
+        atomics,
     };
     let mut bytes = [0; 15];
     let mut decoded = false;
@@ -1203,8 +1343,14 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
     copy_cpu(work, cpu);
     let result = crate::interp::walk_child(ir, work, &mem, temps);
     if !mem.stopped() && !memory.borrow().writing {
-        memory.borrow_mut().writing = true;
         let len = memory.borrow().stores_len;
+        {
+            let mut s = memory.borrow_mut();
+            if len != 0 {
+                s.written.truncate(entry_log);
+            }
+            s.writing = true;
+        }
         for i in 0..len {
             let store = memory.borrow().stores[i];
             {
@@ -1226,6 +1372,9 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
             ChildStep::Refused(why)
         }
         Some(ChildStep::Fault(mut f)) => {
+            if !memory.borrow().writing {
+                memory.borrow_mut().written.truncate(entry_log);
+            }
             f.instruction_len = Knowledge::Known(ir.guest_len as u8);
             if f.rep.is_some() {
                 copy_cpu(cpu, work);

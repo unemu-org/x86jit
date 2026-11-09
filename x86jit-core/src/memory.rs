@@ -3576,6 +3576,9 @@ pub(crate) trait InterpreterMemory {
         }
         Ok(())
     }
+    fn child_atomic(&self, _op: &crate::IrOp, _temps: &mut [u64], _cpu: &mut crate::CpuState) {
+        unreachable!("child atomic on normal memory")
+    }
     fn stopped(&self) -> bool {
         false
     }

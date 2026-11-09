@@ -806,13 +806,12 @@ fn walk_ops<
                 addr,
                 src,
                 size,
-                op,
+                op: rmw,
             } => {
                 if CHILD {
-                    unreachable!("helper refused before child execution");
-                }
-                if let Some(r) =
-                    exec_atomic_rmw(cpu, mem, temps, *cur_addr, old, addr, src, size, op)
+                    mem.0.child_atomic(op, temps, cpu);
+                } else if let Some(r) =
+                    exec_atomic_rmw(cpu, mem, temps, *cur_addr, old, addr, src, size, rmw)
                 {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
@@ -826,9 +825,8 @@ fn walk_ops<
                 size,
             } => {
                 if CHILD {
-                    unreachable!("helper refused before child execution");
-                }
-                if let Some(r) =
+                    mem.0.child_atomic(op, temps, cpu);
+                } else if let Some(r) =
                     exec_atomic_cas(cpu, mem, temps, *cur_addr, old, addr, expected, src, size)
                 {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -841,12 +839,18 @@ fn walk_ops<
                 len,
             } => {
                 if CHILD {
-                    unreachable!("helper refused before child execution");
-                }
-                let (mem, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
-                let addr = read_val(*addr, temps);
-                if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
-                    return walk_classify_access(InterpResult::exit(exit), *cur_addr, addr, *fault);
+                    mem.0.child_atomic(op, temps, cpu);
+                } else {
+                    let (mem, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
+                    let addr = read_val(*addr, temps);
+                    if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
+                        return walk_classify_access(
+                            InterpResult::exit(exit),
+                            *cur_addr,
+                            addr,
+                            *fault,
+                        );
+                    }
                 }
             }
             IrOp::Bt {

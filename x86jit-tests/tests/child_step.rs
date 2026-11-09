@@ -254,23 +254,174 @@ mod protected {
                     let view = vm.child_view(CpuMode::Long64);
                     let mut arena = ChildArena::new(16);
                     let hole = base + 2 * page as u64;
-                    for code in [
-                        &[0x48, 0x8b, 0x00][..],
-                        &[0x48, 0x89, 0x18],
-                        &[0xc5, 0xfc, 0x10, 0x00],
-                        &[0xf3, 0xaa],
+                    // SDM Vol 2A §3.2, CMPXCHG and CMPXCHG8B/CMPXCHG16B:
+                    // write permission is required even when comparison fails.
+                    #[cfg(target_arch = "aarch64")]
+                    let paths: &[bool] = if std::arch::is_aarch64_feature_detected!("lse") {
+                        &[false, true]
+                    } else {
+                        &[true]
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let paths = &[false];
+                    for &exclusive in paths {
+                        for (code, size) in [
+                            (&[0xf0, 0x00, 0x18][..], 1),
+                            (&[0xf0, 0x66, 0x01, 0x18], 2),
+                            (&[0xf0, 0x01, 0x18], 4),
+                            (&[0xf0, 0x48, 0x0f, 0xc1, 0x18], 8),
+                            (&[0xf0, 0x48, 0x0f, 0xb1, 0x18], 8),
+                            (&[0xf0, 0x0f, 0xc7, 0x08], 8),
+                            (&[0xf0, 0x48, 0x0f, 0xc7, 0x08], 16),
+                        ] {
+                            for protection in [libc::PROT_NONE, libc::PROT_READ, -1] {
+                                let mut arena = ChildArena::new(1);
+                                #[cfg(target_arch = "aarch64")]
+                                if exclusive {
+                                    arena.disable_lse_atomics();
+                                }
+                                #[cfg(not(target_arch = "aarch64"))]
+                                let _ = exclusive;
+                                std::ptr::copy_nonoverlapping(
+                                    code.as_ptr(),
+                                    ptr.cast::<u8>(),
+                                    code.len(),
+                                );
+                                std::ptr::write_bytes(hole as *mut u8, 0xa5, 16);
+                                if protection == -1 {
+                                    assert_eq!(libc::munmap(hole as *mut _, page), 0);
+                                } else {
+                                    assert_eq!(libc::mprotect(hole as *mut _, page, protection), 0);
+                                }
+                                let mut cpu = core_tests::initial_cpu();
+                                cpu.rip = base;
+                                cpu.gpr[0] = hole;
+                                let before = format!("{cpu:?}");
+                                let ChildStep::Fault(f) = core_tests::no_alloc(|| {
+                                    child::step(&view, &mut cpu, &mut arena)
+                                }) else {
+                                    panic!("{code:x?}");
+                                };
+                                assert!(
+                                    arena.written_pages().is_empty(),
+                                    "{code:x?} exclusive={exclusive} protection={protection}"
+                                );
+                                assert_eq!(f.origin, FaultOrigin::HostAccess);
+                                assert!(f.raw_host_fault.is_some());
+                                assert_eq!(
+                                    f.address,
+                                    Knowledge::Known(x86jit_core::FaultAddress::new(
+                                        hole,
+                                        x86jit_core::AddressPrecision::ExactByte,
+                                        x86jit_core::AddressSpace::Linear
+                                    ))
+                                );
+                                assert_eq!(f.operand_base, Knowledge::Known(hole));
+                                assert_eq!(f.operand_size, Knowledge::Known(size));
+                                assert_eq!(f.transfer_size, Knowledge::Known(size));
+                                assert_eq!(
+                                    f.access,
+                                    Knowledge::Known(x86jit_core::FaultAccess::ReadWrite)
+                                );
+                                assert_eq!(
+                                    f.transfer_access,
+                                    Knowledge::Known(x86jit_core::FaultAccess::Write)
+                                );
+                                assert_eq!(f.ram, x86jit_core::MemoryEffects::None);
+                                assert_eq!(before, format!("{cpu:?}"));
+                                cpu.gpr[0] = hole + page as u64;
+                                assert!(matches!(
+                                    core_tests::no_alloc(|| child::step(
+                                        &view, &mut cpu, &mut arena
+                                    )),
+                                    ChildStep::Continue
+                                ));
+                                assert_eq!(&*arena.written_pages(), &[(hole + page as u64) >> 12]);
+                                // Fault again on an already logged page; preserve its earlier entry.
+                                cpu.rip = base;
+                                cpu.gpr[0] = hole + page as u64;
+                                assert_eq!(
+                                    libc::mprotect(
+                                        (hole + page as u64) as *mut _,
+                                        page,
+                                        libc::PROT_READ
+                                    ),
+                                    0
+                                );
+                                let retry_before = format!("{cpu:?}");
+                                let prior_memory =
+                                    std::slice::from_raw_parts(cpu.gpr[0] as *const u8, 16)
+                                        .to_vec();
+                                let ChildStep::Fault(retry) = core_tests::no_alloc(|| {
+                                    child::step(&view, &mut cpu, &mut arena)
+                                }) else {
+                                    panic!()
+                                };
+                                assert!(retry.raw_host_fault.is_some());
+                                assert_eq!(retry.ram, x86jit_core::MemoryEffects::None);
+                                assert_eq!(format!("{cpu:?}"), retry_before);
+                                assert_eq!(
+                                    std::slice::from_raw_parts(cpu.gpr[0] as *const u8, 16),
+                                    prior_memory
+                                );
+                                assert_eq!(&*arena.written_pages(), &[(hole + page as u64) >> 12]);
+                                assert_eq!(
+                                    libc::mprotect(
+                                        (hole + page as u64) as *mut _,
+                                        page,
+                                        libc::PROT_READ | libc::PROT_WRITE
+                                    ),
+                                    0
+                                );
+                                if protection == -1 {
+                                    assert_eq!(
+                                        libc::mmap(
+                                            hole as *mut _,
+                                            page,
+                                            libc::PROT_READ | libc::PROT_WRITE,
+                                            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                                            -1,
+                                            0
+                                        ),
+                                        hole as *mut _
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        libc::mprotect(
+                                            hole as *mut _,
+                                            page,
+                                            libc::PROT_READ | libc::PROT_WRITE
+                                        ),
+                                        0
+                                    );
+                                    assert_eq!(
+                                        std::slice::from_raw_parts(hole as *const u8, 16),
+                                        &[0xa5; 16]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for (code, prefix) in [
+                        (&[0x48, 0x8b, 0x00][..], 0),
+                        (&[0x48, 0x89, 0x18][..], 0),
+                        (&[0xc5, 0xfc, 0x10, 0x00][..], 0),
+                        (&[0xc5, 0xfc, 0x11, 0x00][..], 0),
+                        (&[0x48, 0x89, 0x18][..], 4),
+                        (&[0xc5, 0xfc, 0x11, 0x00][..], 16),
+                        (&[0xf3, 0xaa][..], 2),
                     ] {
-                        // Install code directly: parent Memory's normal classifier is not installed here.
+                        let mut arena = ChildArena::new(if prefix == 0 { 1 } else { 2 });
+                        // Install code directly: the parent's normal classifier is not installed here.
                         std::ptr::copy_nonoverlapping(code.as_ptr(), ptr.cast::<u8>(), code.len());
-                        assert_eq!(
-                            libc::mprotect((hole as usize) as *mut _, page, libc::PROT_NONE),
-                            0
-                        );
+                        std::ptr::write_bytes((hole - 32) as *mut u8, 0xa5, 64);
+                        assert_eq!(libc::mprotect(hole as *mut _, page, libc::PROT_NONE), 0);
                         let mut cpu = core_tests::initial_cpu();
                         cpu.rip = base;
-                        cpu.gpr[0] = hole;
-                        cpu.gpr[7] = hole - 2;
+                        cpu.gpr[0] = hole - prefix;
+                        cpu.gpr[7] = hole - prefix;
                         cpu.gpr[1] = 5;
+                        let before = format!("{cpu:?}");
                         let ChildStep::Fault(f) =
                             core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena))
                         else {
@@ -286,20 +437,57 @@ mod protected {
                                 x86jit_core::AddressSpace::Linear
                             ))
                         );
+                        if prefix == 0 {
+                            assert!(arena.written_pages().is_empty(), "{code:x?}");
+                        } else {
+                            assert_eq!(&*arena.written_pages(), &[(hole - 1) >> 12]);
+                        }
                         assert_eq!(cpu.rip, base);
                         if code == [0xf3, 0xaa] {
                             assert_eq!(cpu.gpr[1], 3);
                             assert_eq!(cpu.gpr[7], hole);
+                        } else {
+                            assert_eq!(format!("{cpu:?}"), before);
                         }
                         assert_eq!(
                             libc::mprotect(
-                                (hole as usize) as *mut _,
+                                hole as *mut _,
                                 page,
                                 libc::PROT_READ | libc::PROT_WRITE
                             ),
                             0
                         );
+                        assert_eq!(
+                            std::slice::from_raw_parts(hole as *const u8, 32),
+                            &[0xa5; 32]
+                        );
+                        if prefix != 0 {
+                            let expected = if code == [0xf3, 0xaa] {
+                                vec![(hole - prefix) as u8; prefix as usize]
+                            } else if prefix == 4 {
+                                7u32.to_le_bytes().to_vec()
+                            } else {
+                                core_tests::initial_cpu().xmm[0].to_le_bytes().to_vec()
+                            };
+                            assert_eq!(
+                                std::slice::from_raw_parts(
+                                    (hole - prefix) as *const u8,
+                                    prefix as usize
+                                ),
+                                expected
+                            );
+                        }
+                        // A fault with no writes must leave room for a different page.
+                        if prefix == 0 && code.last() == Some(&0x18) {
+                            cpu.gpr[0] = hole + page as u64;
+                            assert!(matches!(
+                                core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+                                ChildStep::Continue
+                            ));
+                            assert_eq!(&*arena.written_pages(), &[(hole + page as u64) >> 12]);
+                        }
                     }
+
                     // Each signal recovers into the record belonging to its own thread.
                     std::ptr::copy_nonoverlapping([0x48, 0x8b, 0x00].as_ptr(), ptr.cast::<u8>(), 3);
                     assert_eq!(
@@ -328,6 +516,7 @@ mod protected {
                                     ))
                                 );
                                 assert!(f.raw_host_fault.is_some());
+                                assert!(arena.written_pages().is_empty());
                             });
                         }
                     });
@@ -362,6 +551,7 @@ mod protected {
                         Knowledge::Known(x86jit_core::FaultAccess::Execute)
                     );
                     assert!(f.raw_host_fault.is_some());
+                    assert!(arena.written_pages().is_empty());
                     // The classifier is inert on an unrelated PC, even with no record.
                     let mut regs = HostRegisters::default();
                     let old = regs;
@@ -621,6 +811,77 @@ fn child_masked_vectors_suppress_inactive_noncanonical_lanes() {
             let mut actual = [0; 16];
             vm.read_bytes(top - 16, &mut actual).unwrap();
             assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn child_locked_forms_match_both_backends() {
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        let mut forms = core_tests::locked_code_forms(mode);
+        forms.push(vec![0xf0, 0x0f, 0xc7, 0x0e]);
+        if mode == CpuMode::Long64 {
+            forms.push(vec![0xf0, 0x48, 0x0f, 0xc7, 0x0e]);
+        }
+        for code in forms {
+            for jit in [false, true] {
+                for success in [false, true] {
+                    let backend: Box<dyn Backend> = if jit {
+                        Box::new(JitBackend::new())
+                    } else {
+                        Box::new(InterpreterBackend)
+                    };
+                    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
+                    vm.set_cpu_mode(mode);
+                    vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+                    vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+                    let mut text = code.clone();
+                    text.push(0xf4);
+                    vm.write_bytes(0x1000, &text).unwrap();
+                    let data = [0x12; 16];
+                    vm.write_bytes(0x3100, &data).unwrap();
+                    let mut normal = vm.new_vcpu();
+                    normal.cpu = core_tests::initial_cpu();
+                    normal.cpu.gpr[0] = if success {
+                        0x1212_1212_1212_1212
+                    } else {
+                        0x1234
+                    };
+                    normal.cpu.gpr[2] = if success {
+                        0x1212_1212_1212_1212
+                    } else {
+                        0x5678
+                    };
+                    normal.cpu.gpr[3] = 1;
+                    normal.cpu.flags.cf = true;
+                    let mut cpu = normal.cpu.clone();
+                    assert!(
+                        matches!(normal.run(&vm, Some(100)), Exit::Hlt),
+                        "{mode:?} jit={jit} {code:x?}"
+                    );
+                    let mut expected = [0; 16];
+                    vm.read_bytes(0x3100, &mut expected).unwrap();
+                    vm.write_bytes(0x3100, &data).unwrap();
+                    let view = vm.child_view(mode);
+                    let mut arena = ChildArena::new(4);
+                    assert!(matches!(
+                        core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+                        ChildStep::Continue
+                    ));
+                    assert!(matches!(
+                        core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+                        ChildStep::Hlt
+                    ));
+                    assert_eq!(
+                        format!("{:?}", normal.cpu),
+                        format!("{cpu:?}"),
+                        "{mode:?} jit={jit} {code:x?}"
+                    );
+                    let mut actual = [0; 16];
+                    vm.read_bytes(0x3100, &mut actual).unwrap();
+                    assert_eq!(expected, actual, "{mode:?} jit={jit} {code:x?}");
+                }
+            }
         }
     }
 }

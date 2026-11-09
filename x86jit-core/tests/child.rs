@@ -243,6 +243,9 @@ fn child_inline_corpus_matches_step_one_without_allocation() {
                 ) => {}
                 _ => panic!("unexpected child result {mode:?} {code:x?}: {child_result:?}"),
             }
+            if matches!(child_result, ChildStep::Fault(_)) {
+                assert!(arena.written_pages().is_empty());
+            }
             let mut child_data = [0; 0x3000];
             vm.mem.read_bytes(0x3000, &mut child_data).unwrap();
             assert_eq!(
@@ -264,7 +267,31 @@ fn child_refusals_preserve_cpu_and_memory() {
         (&[0x0f, 0xc7, 0x20], 0x3100, 8, ChildRefusal::FxState),
         (&[0x0f, 0x01, 0xd0], 0x3100, 8, ChildRefusal::Helper),
         (&[0x0f, 0xa2], 0x3100, 8, ChildRefusal::Helper),
-        (&[0xf0, 0x48, 0x01, 0x18], 0x3100, 8, ChildRefusal::Helper),
+        (
+            &[0xf0, 0x48, 0x01, 0x18],
+            0x313f,
+            8,
+            ChildRefusal::AtomicAlignment,
+        ),
+        (
+            &[0xf0, 0x48, 0x01, 0x18],
+            0x3fff,
+            8,
+            ChildRefusal::AtomicAlignment,
+        ),
+        (&[0xf0, 0x48, 0x01, 0x18], 0x7100, 8, ChildRefusal::Mmio),
+        (
+            &[0xf0, 0x48, 0x01, 0x18],
+            0x1000,
+            8,
+            ChildRefusal::CodeStore,
+        ),
+        (
+            &[0xf0, 0x48, 0x01, 0x18],
+            0x3100,
+            0,
+            ChildRefusal::ArenaFull,
+        ),
         (&[0x48, 0x8b, 0x00], 0x7100, 8, ChildRefusal::Mmio),
         (&[0x48, 0x89, 0x18], 0x1000, 8, ChildRefusal::CodeStore),
         (&[0x48, 0x89, 0x18], 0x3100, 0, ChildRefusal::ArenaFull),
@@ -299,6 +326,102 @@ fn child_refusals_preserve_cpu_and_memory() {
         assert_eq!(before_data, after_data);
         assert!(arena.written_pages().is_empty());
     }
+}
+
+#[test]
+fn child_locked_unaligned_operand_within_one_cache_line() {
+    let vm = vm(&[0xf0, 0x01, 0x18]);
+    vm.mem.write_bytes(0x3100, &[0xa5; 16]).unwrap();
+    let view = vm.child_view(CpuMode::Long64);
+    let mut cpu = initial_cpu();
+    cpu.gpr[0] = 0x3101;
+    let before = cpu.clone();
+    let mut arena = ChildArena::new(1);
+    let result = no_alloc(|| child::step(&view, &mut cpu, &mut arena));
+    let mut bytes = [0; 16];
+    vm.mem.read_bytes(0x3100, &mut bytes).unwrap();
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(
+            result,
+            ChildStep::Refused(ChildRefusal::AtomicAlignment)
+        ));
+        assert_eq!(format!("{cpu:?}"), format!("{before:?}"));
+        assert_eq!(bytes, [0xa5; 16]);
+        assert!(arena.written_pages().is_empty());
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(matches!(result, ChildStep::Continue));
+        vm.mem.write_bytes(0x3100, &[0xa5; 16]).unwrap();
+        let mut expected = before;
+        assert!(matches!(
+            interp::step_one(
+                &vm.mem,
+                &mut expected,
+                CpuMode::Long64,
+                &mut Vec::new(),
+                &mut Default::default()
+            ),
+            x86jit_core::StepResult::Continue
+        ));
+        let mut expected_bytes = [0; 16];
+        vm.mem.read_bytes(0x3100, &mut expected_bytes).unwrap();
+        assert_eq!(format!("{cpu:?}"), format!("{expected:?}"));
+        assert_eq!(bytes, expected_bytes);
+        assert_eq!(&*arena.written_pages(), &[3]);
+    }
+}
+
+#[test]
+fn child_fault_before_store_commit_discards_reservations() {
+    // A faulting vector store must not retain a destination reservation.
+    let vm = vm(&[0xc5, 0xfc, 0x11, 0x00]);
+    let view = vm.child_view(CpuMode::Long64);
+    let mut cpu = initial_cpu();
+    cpu.gpr[0] = 0x5ff0;
+    let before = format!("{cpu:?}");
+    let mut arena = ChildArena::new(1);
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Fault(_)
+    ));
+    assert_eq!(format!("{cpu:?}"), before);
+    assert_eq!(vm.mem.read(0x5ff0, 8).unwrap(), 0);
+    assert!(arena.written_pages().is_empty());
+    cpu.gpr[0] = 0x3100;
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Continue
+    ));
+    assert_eq!(&*arena.written_pages(), &[3]);
+}
+
+#[test]
+fn child_rep_source_fault_discards_unwritten_destination_pages() {
+    let vm = vm(&[0xf3, 0xa4]);
+    let view = vm.child_view(CpuMode::Long64);
+    let mut cpu = initial_cpu();
+    cpu.gpr[6] = 0x8000;
+    cpu.gpr[7] = 0x3fff;
+    cpu.gpr[1] = 3;
+    let before = format!("{cpu:?}");
+    let mut arena = ChildArena::new(2);
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Fault(_)
+    ));
+    assert_eq!(format!("{cpu:?}"), before);
+    assert_eq!(vm.mem.read(0x3fff, 2).unwrap(), 0);
+    assert!(arena.written_pages().is_empty());
+    cpu.gpr[6] = 0x3100;
+    cpu.gpr[7] = 0x5100;
+    cpu.gpr[1] = 1;
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Continue
+    ));
+    assert_eq!(&*arena.written_pages(), &[5]);
 }
 
 #[test]
@@ -372,6 +495,7 @@ fn child_faults_are_unboxed_and_precise() {
         let ChildStep::Fault(f) = no_alloc(|| child::step(&view, &mut cpu, &mut arena)) else {
             panic!("{code:x?}")
         };
+        assert!(arena.written_pages().is_empty());
         assert_eq!(f.origin, FaultOrigin::GuestException(cause));
         assert_eq!(f.vector, Knowledge::Known(vector));
         assert_eq!(f.instruction_rip, 0x1000);
@@ -398,6 +522,7 @@ fn child_faults_are_unboxed_and_precise() {
     assert_eq!(f.operand_base, Knowledge::Known(0x5ff0));
     assert_eq!(f.operand_size, Knowledge::Known(32));
     assert_eq!(cpu.xmm, before);
+    assert!(arena.written_pages().is_empty());
 }
 
 #[test]
@@ -422,6 +547,7 @@ fn child_rep_restart_overlap_and_late_refusal() {
     let ChildStep::Fault(f) = no_alloc(|| child::step(&view, &mut cpu, &mut arena)) else {
         panic!()
     };
+    assert_eq!(&*arena.written_pages(), &[3, 5]);
     assert_eq!(cpu.gpr[1], 3);
     assert_eq!(cpu.gpr[7], 0x6000);
     assert_eq!(cpu.rip, 0x1000);
@@ -443,6 +569,7 @@ fn child_rep_restart_overlap_and_late_refusal() {
     vm.mem.read_bytes(0x4ffe, &mut after_data).unwrap();
     assert_eq!(before, format!("{cpu:?}"));
     assert_eq!(before_data, after_data);
+    assert_eq!(&*arena.written_pages(), &[3, 5]);
 }
 
 #[test]
@@ -489,6 +616,7 @@ fn child_fetch_snapshot_and_syscall_evidence() {
         no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
         ChildStep::Fault(_)
     ));
+    assert!(arena.written_pages().is_empty());
 }
 
 #[test]
@@ -579,6 +707,333 @@ fn child_nondefault_mxcsr_and_saved_identity_survive() {
             assert!(
                 matches!(result, ChildStep::Fault(f) if f.origin == FaultOrigin::GuestException(FaultCause::InvalidMxcsr))
             );
+            assert!(arena.written_pages().is_empty());
         }
     }
+}
+
+pub(crate) fn locked_code_forms(mode: CpuMode) -> Vec<Vec<u8>> {
+    let forms: &[&[u8]] = &[
+        &[0x01, 0x1e],
+        &[0x29, 0x1e],
+        &[0x21, 0x1e],
+        &[0x09, 0x1e],
+        &[0x31, 0x1e],
+        &[0x87, 0x1e],
+        &[0x0f, 0xc1, 0x1e],
+        &[0xff, 0x06],
+        &[0xff, 0x0e],
+        &[0xf7, 0x1e],
+        &[0xf7, 0x16],
+        &[0x0f, 0xab, 0x1e],
+        &[0x0f, 0xb3, 0x1e],
+        &[0x0f, 0xbb, 0x1e],
+        &[0x0f, 0xb1, 0x1e],
+    ];
+    let mut result = Vec::new();
+    for size in [1, 2, 4, 8] {
+        if size == 8 && mode == CpuMode::Compat32 {
+            continue;
+        }
+        for (form, bytes) in forms.iter().enumerate() {
+            if size == 1 && (11..14).contains(&form) {
+                continue;
+            }
+            let mut code = vec![0xf0];
+            if size == 2 {
+                code.push(0x66);
+            }
+            if size == 8 {
+                code.push(0x48);
+            }
+            let mut bytes = bytes.to_vec();
+            if size == 1 {
+                let i = bytes.len() - 2;
+                bytes[i] -= 1;
+            }
+            code.extend(bytes);
+            result.push(code);
+        }
+    }
+    result
+}
+
+// SDM Vol 2A §3.2, ADD, INC, DEC, CMPXCHG and CMPXCHG8B/CMPXCHG16B;
+// Vol 2B §4.2, NEG, NOT; Vol 2D §6.2, XADD, XCHG, XOR, Flags Affected.
+#[test]
+fn child_locked_forms_match_step_one_without_allocation() {
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        for code in locked_code_forms(mode) {
+            for value in [0u64, 1, 0x7f, 0x80, 0x7fff_ffff, u64::MAX] {
+                let vm = vm(&code);
+                vm.mem.write(0x3100, value, 8).unwrap();
+                let mut normal = initial_cpu();
+                normal.gpr[0] = value;
+                normal.gpr[3] = 1;
+                normal.flags.cf = true;
+                normal.flags.of = true;
+                let mut actual = normal.clone();
+                assert!(
+                    matches!(
+                        interp::step_one(
+                            &vm.mem,
+                            &mut normal,
+                            mode,
+                            &mut Vec::new(),
+                            &mut Default::default()
+                        ),
+                        x86jit_core::StepResult::Continue
+                    ),
+                    "{mode:?} {code:x?}"
+                );
+                let expected = vm.mem.read(0x3100, 8).unwrap();
+                vm.mem.write(0x3100, value, 8).unwrap();
+                let view = vm.child_view(mode);
+                let mut arena = ChildArena::new(4);
+                let result = no_alloc(|| child::step(&view, &mut actual, &mut arena));
+                assert!(
+                    matches!(result, ChildStep::Continue),
+                    "{mode:?} {code:x?}: {result:?}"
+                );
+                assert_eq!(format!("{normal:?}"), format!("{actual:?}"), "{code:x?}");
+                assert_eq!(expected, vm.mem.read(0x3100, 8).unwrap(), "{code:x?}");
+                assert_eq!(&*arena.written_pages(), &[3]);
+            }
+        }
+        for size in [8, 16] {
+            if size == 16 && mode == CpuMode::Compat32 {
+                continue;
+            }
+            let code: &[u8] = if size == 16 {
+                &[0xf0, 0x48, 0x0f, 0xc7, 0x0e]
+            } else {
+                &[0xf0, 0x0f, 0xc7, 0x0e]
+            };
+            for success in [false, true] {
+                let vm = vm(code);
+                vm.mem.write(0x3100, 0x1234, 8).unwrap();
+                vm.mem.write(0x3108, 0x5678, 8).unwrap();
+                let mut normal = initial_cpu();
+                normal.gpr[0] = if success { 0x1234 } else { 0xabcd };
+                normal.gpr[2] = if size == 16 { 0x5678 } else { 0 };
+                normal.flags.cf = true;
+                normal.flags.of = true;
+                let mut actual = normal.clone();
+                assert!(matches!(
+                    interp::step_one(
+                        &vm.mem,
+                        &mut normal,
+                        mode,
+                        &mut Vec::new(),
+                        &mut Default::default()
+                    ),
+                    x86jit_core::StepResult::Continue
+                ));
+                let mut expected = [0; 16];
+                vm.mem.read_bytes(0x3100, &mut expected).unwrap();
+                vm.mem.write(0x3100, 0x1234, 8).unwrap();
+                vm.mem.write(0x3108, 0x5678, 8).unwrap();
+                let view = vm.child_view(mode);
+                let mut arena = ChildArena::new(4);
+                let result = no_alloc(|| child::step(&view, &mut actual, &mut arena));
+                assert!(
+                    matches!(result, ChildStep::Continue),
+                    "{code:x?}: {result:?}"
+                );
+                assert_eq!(format!("{normal:?}"), format!("{actual:?}"));
+                let mut bytes = [0; 16];
+                vm.mem.read_bytes(0x3100, &mut bytes).unwrap();
+                assert_eq!(expected, bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn child_locked_counters_are_atomic_against_host_threads() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Barrier,
+    };
+    const THREADS: usize = 8;
+    const ITERATIONS: u64 = 2000;
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        for cas in [false, true] {
+            // Both modes use a 32-bit operand; the counter cannot overflow.
+            let vm = vm(if cas {
+                &[0xf0, 0x0f, 0xb1, 0x1e]
+            } else {
+                &[0xf0, 0x0f, 0xc1, 0x1e]
+            });
+            let view = vm.child_view(mode);
+            // SAFETY: aligned RAM retained by vm; all concurrent data accesses
+            // use atomics (host u32, or the child's host atomic instructions).
+            let word = unsafe {
+                std::sync::atomic::AtomicU32::from_ptr(
+                    vm.mem.host_base().add(0x3100).cast_mut().cast(),
+                )
+            };
+            let barrier = Barrier::new(THREADS);
+            let attempts = AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (view, barrier, attempts) = (&view, &barrier, &attempts);
+                    scope.spawn(move || {
+                        let mut arena = ChildArena::new(4);
+                        let mut cpu = initial_cpu();
+                        cpu.gpr[0] = 0;
+                        barrier.wait();
+                        if thread < THREADS / 2 {
+                            for _ in 0..ITERATIONS {
+                                loop {
+                                    cpu.rip = 0x1000;
+                                    cpu.gpr[3] = if cas { cpu.gpr[0] + 1 } else { 1 };
+                                    let result =
+                                        no_alloc(|| child::step(view, &mut cpu, &mut arena));
+                                    assert!(matches!(result, ChildStep::Continue));
+                                    attempts.fetch_add(1, Ordering::Relaxed);
+                                    if !cas || cpu.flags.zf {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            for _ in 0..ITERATIONS {
+                                word.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                word.load(Ordering::SeqCst),
+                (THREADS as u64 * ITERATIONS) as u32
+            );
+            assert!(attempts.load(Ordering::Relaxed) >= THREADS as u64 / 2 * ITERATIONS);
+        }
+    }
+}
+
+// SDM Vol 3A §11.2.3.9: earlier stores and later loads cannot cross a
+// locked instruction. The two threads must not both read the initial zero.
+#[test]
+fn child_locked_operations_are_full_barriers() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Barrier,
+    };
+    let vm = vm(&[0xf0, 0x48, 0x87, 0x1e]);
+    let view = vm.child_view(CpuMode::Long64);
+    // SAFETY: live, aligned RAM; only atomic accesses until both threads join.
+    let words = unsafe {
+        [0x3100, 0x3180].map(|at| AtomicU64::from_ptr(vm.mem.host_base().add(at).cast_mut().cast()))
+    };
+    let barrier = Barrier::new(2);
+    let results = [AtomicU64::new(0), AtomicU64::new(0)];
+    std::thread::scope(|scope| {
+        for thread in 0..2 {
+            let (view, barrier, results, words) = (&view, &barrier, &results, &words);
+            scope.spawn(move || {
+                let mut arena = ChildArena::new(4);
+                let mut cpu = initial_cpu();
+                cpu.gpr[6] = 0x3300 + thread as u64 * 128;
+                for _ in 0..2000 {
+                    words[thread].store(0, Ordering::Relaxed);
+                    barrier.wait();
+                    words[thread].store(1, Ordering::Relaxed);
+                    cpu.rip = 0x1000;
+                    assert!(matches!(
+                        no_alloc(|| child::step(view, &mut cpu, &mut arena)),
+                        ChildStep::Continue
+                    ));
+                    results[thread]
+                        .store(words[1 - thread].load(Ordering::Relaxed), Ordering::Relaxed);
+                    barrier.wait();
+                    assert!(
+                        results[0].load(Ordering::Relaxed) != 0
+                            || results[1].load(Ordering::Relaxed) != 0
+                    );
+                    barrier.wait();
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn child_locked_architectural_witnesses() {
+    // SDM Vol 2A §3.2, INC/DEC, Flags Affected: CF is preserved;
+    // the other arithmetic flags describe the increment/decrement result.
+    for (code, input, output, sign) in [
+        (&[0xf0, 0xfe, 0x06][..], 0x7f, 0x80, true),
+        (&[0xf0, 0xfe, 0x0e], 0x80, 0x7f, false),
+    ] {
+        let vm = vm(code);
+        vm.mem.write(0x3100, input, 1).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        let mut arena = ChildArena::new(4);
+        let mut cpu = initial_cpu();
+        cpu.flags.cf = true;
+        assert!(matches!(
+            no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+            ChildStep::Continue
+        ));
+        assert_eq!(vm.mem.read(0x3100, 1).unwrap(), output);
+        assert!(cpu.flags.cf);
+        assert!(cpu.flags.of);
+        assert!(cpu.flags.af());
+        assert!(!cpu.flags.pf());
+        assert!(!cpu.flags.zf);
+        assert_eq!(cpu.flags.sf, sign);
+    }
+    // SDM Vol 2A §3.2, CMPXCHG, Operation; Vol 1 §3.4.1.1:
+    // success preserves RAX, failure writes and zero-extends EAX.
+    for success in [false, true] {
+        let vm = vm(&[0xf0, 0x0f, 0xb1, 0x1e]);
+        vm.mem.write(0x3100, 0x1122_3344, 4).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        let mut arena = ChildArena::new(4);
+        let mut cpu = initial_cpu();
+        cpu.gpr[0] = if success {
+            0xfeed_beef_1122_3344
+        } else {
+            0xfeed_beef_0000_0001
+        };
+        assert!(matches!(
+            no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+            ChildStep::Continue
+        ));
+        assert_eq!(
+            cpu.gpr[0],
+            if success {
+                0xfeed_beef_1122_3344
+            } else {
+                0x1122_3344
+            }
+        );
+        assert_eq!(cpu.flags.zf, success);
+        assert_eq!(
+            vm.mem.read(0x3100, 4).unwrap(),
+            if success { 7 } else { 0x1122_3344 }
+        );
+    }
+    // SDM Vol 2A §3.2, CMPXCHG8B/CMPXCHG16B, 64-Bit Mode
+    // Exceptions: CMPXCHG16B requires 16-byte alignment and raises #GP(0).
+    let vm = vm(&[0xf0, 0x48, 0x0f, 0xc7, 0x0e]);
+    let view = vm.child_view(CpuMode::Long64);
+    let mut arena = ChildArena::new(4);
+    let mut cpu = initial_cpu();
+    cpu.gpr[6] = 0x3108;
+    let before = format!("{cpu:?}");
+    let ChildStep::Fault(f) = no_alloc(|| child::step(&view, &mut cpu, &mut arena)) else {
+        panic!();
+    };
+    assert_eq!(f.vector, Knowledge::Known(13));
+    assert_eq!(
+        f.origin,
+        FaultOrigin::GuestException(FaultCause::RequiredAlignment)
+    );
+    assert_eq!(f.error_code, x86jit_core::ErrorCode::bits(0, u32::MAX));
+    assert_eq!(before, format!("{cpu:?}"));
+    assert!(arena.written_pages().is_empty());
 }
