@@ -1,7 +1,7 @@
 ---
 title: Instruction-exact step budget and interrupt acceptance for the Real16 interpreter
 date: '2026-11-09'
-status: proposed
+status: accepted
 ---
 
 # Instruction-exact step budget and interrupt acceptance for the Real16 interpreter
@@ -12,7 +12,7 @@ A Real16 embedder needs bounded execution for device scheduling and an interrupt
 acceptance boundary at which it can acknowledge its interrupt controller. The request
 comes from **decision-15 (unemupc98)**; that is the embedder's record, distinct from our
 [decision-15](decision-15%20-%20Allocation-free-child-step-for-shared-address-space-children.md).
-This proposal describes an additive API, not an implementation or acceptance of it.
+This record describes an additive API; the maintainer accepted it on 2026-11-09 with the recommended choices below, after the requesting embedder checked it against its own design record (no conflicts).
 Source inspection is against `34ceea8`; no execution measurements were made.
 
 Today `Vcpu::run(vm, Option<u64>)` budgets dispatch blocks, including interrupt delivery
@@ -287,7 +287,7 @@ IRQs at acceptance boundaries without a callback. Instruction retirement remains
 from REP scheduling units and from device completion. Small slices can create suffix
 cache entries and incur extra dispatch; stepped specialization increases code size. Device
 replay and shadows must survive cuts and exits, so this is more than a loop around `step`.
-No implementation, commit, or publication is implied by proposing this record.
+Implementation is tracked by the epic xj-d7d (xj-d7d.1 step-budget run, xj-d7d.3 readiness query, xj-d7d.4 stop-when-ready); xj-5c2 and xj-d7d.2 are its prerequisites.
 
 ## Witness tests required before implementation acceptance
 
