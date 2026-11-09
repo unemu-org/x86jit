@@ -607,3 +607,216 @@ fn descriptor_loads_remain_delegated_in_user_modes() {
         }
     }
 }
+
+#[test]
+fn irq_ready_at_ordinary_boundary_is_read_only_and_delivers_before_execution() {
+    let (vm, mut cpu) = setup(&[0x43, 0xf4]); // inc bx; hlt
+    cpu.set_reg(Reg::Ss, SS);
+    for _ in 0..2 {
+        assert!(cpu.irq_ready());
+        assert!(!cpu.has_pending_irq());
+        assert_eq!(cpu.reg(Reg::Rip), 0);
+        assert_eq!(cpu.retired_instructions(), 0);
+        assert!(cpu.flags().if_);
+    }
+    cpu.inject_irq(VECTOR);
+    assert!(cpu.irq_ready());
+    assert!(cpu.has_pending_irq());
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert!(!cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), HANDLER_CS);
+    assert_eq!(cpu.reg(Reg::Rip), 0);
+    assert_eq!(cpu.reg(Reg::Rbx), 0);
+    assert_eq!(cpu.retired_instructions(), 0);
+    assert!(!cpu.irq_ready()); // Delivery clears IF (SDM Vol 3A §7.8.1).
+}
+
+#[test]
+fn irq_ready_requires_if() {
+    let (vm, mut cpu) = setup(&[0xeb, 0, 0xf4]);
+    cpu.set_reg(Reg::Ss, SS);
+    let mut flags = cpu.flags();
+    flags.if_ = false;
+    cpu.set_flags(flags);
+    assert!(!cpu.irq_ready());
+    cpu.inject_irq(VECTOR);
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), CS);
+    assert_eq!(cpu.reg(Reg::Rip), 2);
+    flags.if_ = true;
+    cpu.set_flags(flags);
+    assert!(cpu.irq_ready());
+    delivered_at(&vm, &mut cpu, 2);
+}
+
+fn check_irq_ready_shadow(producer: &[u8], initial_if: bool) {
+    let mut code = producer.to_vec();
+    code.extend_from_slice(&[0xeb, 0, 0xf4]);
+    let (vm, mut cpu) = setup(&code);
+    if producer == [0xfb] {
+        cpu.set_reg(Reg::Ss, SS);
+    }
+    let mut flags = cpu.flags();
+    flags.if_ = initial_if;
+    cpu.set_flags(flags);
+    step(&vm, &mut cpu);
+    assert!(cpu.flags().if_);
+    assert!(!cpu.irq_ready());
+    cpu.inject_irq(VECTOR);
+    assert!(!cpu.irq_ready());
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), CS);
+    assert_eq!(cpu.reg(Reg::Rip), producer.len() as u64 + 2);
+    assert!(cpu.irq_ready());
+    delivered_at(&vm, &mut cpu, producer.len() as u16 + 2);
+}
+
+#[test]
+fn irq_ready_requires_sti_shadow_to_expire() {
+    check_irq_ready_shadow(&[0xfb], false);
+}
+
+#[test]
+fn irq_ready_requires_mov_ss_shadow_to_expire() {
+    check_irq_ready_shadow(&[0x8e, 0xd0], true);
+}
+
+#[test]
+fn irq_ready_requires_pop_ss_shadow_to_expire() {
+    check_irq_ready_shadow(&[0x17], true);
+}
+
+#[test]
+fn irq_ready_after_sti_hlt_with_pending_vector() {
+    // SDM Vol 3A §7.8.1; Vol 2A §3.3 HLT: save the IP after HLT on wakeup.
+    let (vm, mut cpu) = setup(&[0xfb, 0xf4, 0x43]);
+    cpu.set_reg(Reg::Ss, SS);
+    let mut flags = cpu.flags();
+    flags.if_ = false;
+    cpu.set_flags(flags);
+    cpu.inject_irq(VECTOR);
+    step(&vm, &mut cpu);
+    assert!(!cpu.irq_ready());
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::Hlt));
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), CS);
+    assert_eq!(cpu.reg(Reg::Rip), 2);
+    assert!(cpu.irq_ready());
+    delivered_at(&vm, &mut cpu, 2);
+    assert_eq!(cpu.reg(Reg::Rbx), 0);
+}
+
+#[test]
+fn irq_ready_waits_for_port_in_completion() {
+    let (vm, mut cpu) = setup(&[0xe4, 0x80, 0xeb, 0, 0xf4]); // in al,0x80
+    cpu.set_reg(Reg::Ss, SS);
+    assert!(cpu.irq_ready());
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::PortIo { .. }));
+    assert!(!cpu.irq_ready());
+    cpu.inject_irq(VECTOR);
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), CS);
+    assert_eq!(cpu.reg(Reg::Rip), 4);
+    assert!(!cpu.irq_ready());
+    cpu.complete_port_in(0x42);
+    assert_eq!(cpu.reg(Reg::Rax) & 0xff, 0x42);
+    assert!(cpu.irq_ready());
+    delivered_at(&vm, &mut cpu, 4);
+}
+
+#[test]
+fn irq_ready_waits_for_mmio_request_and_answered_replay() {
+    // Decision-16 §4: both outstanding reads/writes and supplied answers block IRQs.
+    for write in [false, true] {
+        let (mut vm, mut cpu) = setup(&[if write { 0xa3 } else { 0xa1 }, 0, 0x70, 0xf4]);
+        cpu.set_reg(Reg::Ss, SS);
+        vm.unmap(0x7000, 4096).unwrap();
+        vm.map(0x7000, 4096, Prot::RW, RegionKind::Trap).unwrap();
+        assert!(cpu.irq_ready());
+        let request = |exit| {
+            if write {
+                assert!(matches!(exit, Exit::MmioWrite { addr: 0x7000, .. }));
+            } else {
+                assert!(matches!(exit, Exit::MmioRead { addr: 0x7000, .. }));
+            }
+        };
+        request(cpu.run(&vm, Some(1)));
+        assert!(!cpu.irq_ready());
+        cpu.inject_irq(VECTOR);
+        request(cpu.run(&vm, Some(1)));
+        assert!(cpu.has_pending_irq());
+        assert_eq!(cpu.reg(Reg::Cs), CS);
+        assert_eq!(cpu.reg(Reg::Rip), 0);
+        if write {
+            cpu.complete_mmio_write();
+        } else {
+            cpu.complete_mmio_read(0x42);
+        }
+        assert!(!cpu.irq_ready());
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        assert!(cpu.has_pending_irq());
+        assert_eq!(cpu.reg(Reg::Cs), CS);
+        assert_eq!(cpu.reg(Reg::Rip), 3);
+        assert!(cpu.irq_ready());
+        delivered_at(&vm, &mut cpu, 3);
+    }
+}
+
+#[test]
+fn irq_ready_waits_for_recorded_mmio_parts_with_no_pending_answer() {
+    // Decision-16 §§3, 4: a consumed answer remains owned by an unfinished access.
+    let (mut vm, mut cpu) = setup(&[0xf3, 0x0f, 0x6f, 0x06, 0xf8, 0x7f, 0xf4]);
+    // movdqu xmm0,[0x7ff8]: one MMIO transfer, then an unmapped RAM transfer.
+    cpu.set_reg(Reg::Ss, SS);
+    vm.unmap(0x7000, 4096).unwrap();
+    vm.map(0x7000, 4096, Prot::RW, RegionKind::Trap).unwrap();
+    vm.unmap(0x8000, 4096).unwrap();
+    assert!(matches!(
+        cpu.run(&vm, Some(1)),
+        Exit::MmioRead {
+            addr: 0x7ff8,
+            size: 8,
+            ..
+        }
+    ));
+    cpu.complete_mmio_read(0x42);
+    assert!(matches!(
+        cpu.run(&vm, Some(1)),
+        Exit::UnmappedMemory { addr: 0x8000, .. }
+    ));
+    assert!(!cpu.irq_ready());
+    cpu.inject_irq(VECTOR);
+    assert!(matches!(
+        cpu.run(&vm, Some(1)),
+        Exit::UnmappedMemory { addr: 0x8000, .. }
+    ));
+    assert!(cpu.has_pending_irq());
+    assert_eq!(cpu.reg(Reg::Cs), CS);
+    assert_eq!(cpu.reg(Reg::Rip), 0);
+    assert!(!cpu.irq_ready());
+    vm.map(0x8000, 4096, Prot::RW, RegionKind::Ram).unwrap();
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert_eq!(cpu.xmm(0), 0x42);
+    assert!(cpu.has_pending_irq());
+    assert!(cpu.irq_ready());
+    delivered_at(&vm, &mut cpu, 6);
+}
+
+#[test]
+fn irq_ready_is_false_outside_real16() {
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x1000), Box::new(InterpreterBackend));
+        vm.set_cpu_mode(mode);
+        let mut cpu = vm.new_vcpu();
+        let mut flags = cpu.flags();
+        flags.if_ = true;
+        cpu.set_flags(flags);
+        assert!(!cpu.irq_ready());
+        flags.if_ = false;
+        cpu.set_flags(flags);
+        assert!(!cpu.irq_ready());
+    }
+}

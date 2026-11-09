@@ -1418,6 +1418,29 @@ impl Vcpu {
         self.pending_irq.is_some()
     }
 
+    /// Whether a Real16 maskable IRQ could be accepted at this boundary.
+    /// Independent of whether a vector is queued; does not acknowledge or deliver.
+    /// False outside Real16. Pending IN completion and the entire MMIO retry
+    /// (including answered but unfinished transfers) also prevent acceptance.
+    ///
+    /// IF and the STI/SS shadows follow SDM Vol 3A §7.8.1 and §7.8.3;
+    /// device-completion blocking follows decision-16 §§1, 4.
+    pub fn irq_ready(&self) -> bool {
+        self.mode == CpuMode::Real16 && !self.cpu.mmio_retry_active && self.irq_delivery_ready()
+    }
+
+    // The dispatcher handles active MMIO retries before reaching its IRQ gate;
+    // irq_ready checks that latch explicitly because it can be called during a retry.
+    #[inline]
+    fn irq_delivery_ready(&self) -> bool {
+        self.cpu.flags.if_
+            && self.cpu.pending_mmio.is_none()
+            && !self.cpu.pending_mmio_write
+            && self.cpu.pending_port_in.is_none()
+            && !self.sti_shadow
+            && !self.ss_shadow
+    }
+
     /// The retired-instruction counter (§17.6, sub-seam c): guest instructions that have
     /// **retired** (completed) on the interpreter path since this vcpu was created. This
     /// is a deterministic, wall-clock-free virtual-time base for the embedder's scheduler.
@@ -2023,13 +2046,7 @@ impl Vcpu {
             // embedder owns the PIC: it must have run INTA / updated the ISR before
             // `inject_irq`. Real-mode only (Long64/Compat32 never set `pending_irq`).
             if let Some(vector) = self.pending_irq {
-                let deliverable = self.cpu.flags.if_
-                    && self.cpu.pending_mmio.is_none()
-                    && !self.cpu.pending_mmio_write
-                    && self.cpu.pending_port_in.is_none()
-                    && !self.sti_shadow
-                    && !self.ss_shadow;
-                if deliverable {
+                if self.irq_delivery_ready() {
                     if !DEFAULT {
                         fp_mode.default();
                     }
