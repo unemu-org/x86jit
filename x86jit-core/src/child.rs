@@ -6,6 +6,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::marker::PhantomData;
 
 use crate::fault::*;
+use crate::interp::ordering::{Barrier, Direction};
 use crate::ir::{MemoryAccess, RepKind, StrOp};
 use crate::memory::{InterpreterMemory, CODE_PAGE_BITS};
 use crate::{CpuMode, CpuState, FetchVerdict, IrBlock, IrOp, MemTrap, Memory, RegionKind, Vm};
@@ -21,6 +22,20 @@ pub(crate) struct Region {
     pub _prot: crate::Prot,
 }
 
+pub(crate) struct CodeSnapshot {
+    pages: Vec<(u64, u64)>,
+    pub(crate) consistency: crate::MemConsistency,
+}
+
+impl FromIterator<(u64, u64)> for CodeSnapshot {
+    fn from_iter<T: IntoIterator<Item = (u64, u64)>>(iter: T) -> Self {
+        Self {
+            pages: iter.into_iter().collect(),
+            consistency: crate::MemConsistency::Fast,
+        }
+    }
+}
+
 /// Owned metadata snapshot borrowing only the lifetime of its VM. The marker
 /// prevents safe Rust from dropping the VM or unmapping/remapping its backing.
 /// No runtime reference into the VM, its memory metadata or its caches is kept.
@@ -31,7 +46,7 @@ pub struct ChildView<'vm> {
     pub(crate) guest_base: u64,
     pub(crate) top: u64,
     pub(crate) regions: Vec<Region>,
-    pub(crate) code: Vec<(u64, u64)>,
+    pub(crate) code: CodeSnapshot,
     pub(crate) fetch: Option<Vec<(u64, FetchVerdict)>>,
     pub(crate) recover: bool,
     pub(crate) mode: CpuMode,
@@ -47,6 +62,9 @@ impl ChildView<'_> {
     }
     pub fn cpu_mode(&self) -> CpuMode {
         self.mode
+    }
+    pub fn mem_consistency(&self) -> crate::MemConsistency {
+        self.code.consistency
     }
     pub fn guest_cpu_features(&self) -> crate::GuestCpuFeatures {
         self.features
@@ -70,9 +88,10 @@ impl ChildView<'_> {
     fn code_page(&self, page: u64) -> bool {
         let relative = page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS);
         self.code
+            .pages
             .binary_search_by_key(&(relative >> 6), |&(word, _)| word)
             .ok()
-            .is_some_and(|i| self.code[i].1 & (1 << (relative & 63)) != 0)
+            .is_some_and(|i| self.code.pages[i].1 & (1 << (relative & 63)) != 0)
     }
 }
 
@@ -275,13 +294,13 @@ impl ChildArena {
     }
 }
 
-struct ChildMemory<'a, 'vm> {
+struct ChildMemory<'a, 'vm, const ORDER: u8> {
     view: &'a ChildView<'vm>,
     state: &'a RefCell<StepMemory>,
     recovery: &'a UnsafeCell<transfer::Record>,
     atomics: &'a transfer::AtomicFeatures,
 }
-impl ChildMemory<'_, '_> {
+impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
     fn refuse(&self, why: ChildRefusal) {
         let mut s = self.state.borrow_mut();
         if s.outcome.is_none() {
@@ -591,6 +610,8 @@ impl ChildMemory<'_, '_> {
         }
         drop(s);
         let ptr = self.view.base + (addr - self.view.guest_base) as usize;
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("commit"));
         // SAFETY: validated live backing; the recovery record is exclusive to this step.
         match unsafe { transfer::store(ptr, value, size, self.recovery.get()) } {
             Ok(()) => self.state.borrow_mut().partial = true,
@@ -612,7 +633,7 @@ impl ChildMemory<'_, '_> {
         }
     }
 }
-impl InterpreterMemory for ChildMemory<'_, '_> {
+impl<const ORDER: u8> InterpreterMemory for ChildMemory<'_, '_, ORDER> {
     fn child_atomic(&self, op: &IrOp, temps: &mut [u64], cpu: &mut CpuState) {
         self.atomic(op, temps, cpu);
     }
@@ -851,6 +872,14 @@ impl InterpreterMemory for ChildMemory<'_, '_> {
         }
         self.state.borrow_mut().writing = true;
         let rip = self.state.borrow().rip;
+        let _ordering = Barrier::<ORDER>::new(
+            Some(match op {
+                StrOp::Movs => Direction::ReadWrite,
+                StrOp::Stos => Direction::Write,
+                StrOp::Lods | StrOp::Scas | StrOp::Cmps => Direction::Read,
+            }),
+            true,
+        );
         crate::interp::string_run_mode::<true, _>(
             cpu, self, op, elem, rep, rip, bits, base, 0, None,
         );
@@ -873,7 +902,7 @@ impl InterpreterMemory for ChildMemory<'_, '_> {
         }
     }
 }
-impl crate::interp::StrMem for ChildMemory<'_, '_> {
+impl<const ORDER: u8> crate::interp::StrMem for ChildMemory<'_, '_, ORDER> {
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         {
             let mut s = self.state.borrow_mut();
@@ -881,6 +910,8 @@ impl crate::interp::StrMem for ChildMemory<'_, '_> {
             s.canonical = None;
         }
         let v = self.load(addr, elem);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("read"));
         if self.stopped() {
             Err(MemTrap::Unmapped)
         } else {
@@ -894,6 +925,8 @@ impl crate::interp::StrMem for ChildMemory<'_, '_> {
             s.canonical = None;
         }
         self.store(addr, val, elem);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
         if self.stopped() {
             Err(MemTrap::Unmapped)
         } else {
@@ -1201,6 +1234,20 @@ fn refusal(op: &IrOp) -> Option<ChildRefusal> {
 /// Install a child handler calling [`classify`] before entering a view configured
 /// for host-fault recovery. Keep mappings live for the view's entire lifetime.
 pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) -> ChildStep {
+    #[cfg(target_arch = "aarch64")]
+    match view.mem_consistency() {
+        crate::MemConsistency::AcqRel => return step_ordered::<1>(view, cpu, arena),
+        crate::MemConsistency::FullTso => return step_ordered::<2>(view, cpu, arena),
+        crate::MemConsistency::Fast => {}
+    }
+    step_ordered::<0>(view, cpu, arena)
+}
+
+fn step_ordered<const ORDER: u8>(
+    view: &ChildView<'_>,
+    cpu: &mut CpuState,
+    arena: &mut ChildArena,
+) -> ChildStep {
     let _fp = crate::jit_abi::fp::RunMode::new();
     if view.mode == CpuMode::Real16 {
         return ChildStep::Refused(ChildRefusal::Helper);
@@ -1230,7 +1277,7 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
         s.rmw = false;
     }
     recovery.get_mut().raw = None;
-    let mem = ChildMemory {
+    let mem = ChildMemory::<ORDER> {
         view,
         state: memory,
         recovery,
@@ -1341,7 +1388,7 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
         )
     }) && ir.ops.iter().any(|op| matches!(op, IrOp::Load { .. }));
     copy_cpu(work, cpu);
-    let result = crate::interp::walk_child(ir, work, &mem, temps);
+    let result = crate::interp::walk_child::<ORDER>(ir, work, &mem, temps);
     if !mem.stopped() && !memory.borrow().writing {
         let len = memory.borrow().stores_len;
         {
@@ -1351,6 +1398,12 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
             }
             s.writing = true;
         }
+        // The walk's store barriers surround staging, not the actual transfers.
+        // Fence each commit so wide stores retain ordering between vector lanes.
+        // SDM Vol 3A §11.2.2, §11.2.4.1: order the committed writes too.
+        // classify resumes inside transfer::store and returns normally, so Drop
+        // retains the post-fence even on a fault with a partially written prefix,
+        // just as the ordinary interpreter's access/helper guards do.
         for i in 0..len {
             let store = memory.borrow().stores[i];
             {
@@ -1359,6 +1412,7 @@ pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) ->
                 s.operand = Some(store.base);
                 s.canonical = store.canonical;
             }
+            let _ordering = Barrier::<ORDER>::new(Some(Direction::Write), false);
             mem.store(store.addr, store.value, store.size);
             if mem.stopped() {
                 break;

@@ -185,6 +185,7 @@ fn child_inline_corpus_matches_step_one_without_allocation() {
         &[0x66, 0x0f, 0xfc, 0x00],
         &[0xc5, 0xfc, 0x10, 0x00],
         &[0xc5, 0xfc, 0x11, 0x00],
+        &[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x00],
         &[0xc5, 0xfc, 0x58, 0xc1],
         &[0xc5, 0xf8, 0x77],
         &[0xf3, 0xa4],
@@ -206,9 +207,21 @@ fn child_inline_corpus_matches_step_one_without_allocation() {
         &[0xe6, 0x80],
         &[0xe4, 0x80],
     ];
-    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+    for (mode, tier) in [CpuMode::Long64, CpuMode::Compat32]
+        .into_iter()
+        .flat_map(|mode| {
+            [
+                x86jit_core::MemConsistency::Fast,
+                x86jit_core::MemConsistency::AcqRel,
+                x86jit_core::MemConsistency::FullTso,
+            ]
+            .into_iter()
+            .map(move |tier| (mode, tier))
+        })
+    {
         for &code in cases {
-            let vm = vm(code);
+            let mut vm = vm(code);
+            vm.consistency = tier;
             let data = [0x12; 0x3000];
             vm.mem.write_bytes(0x3000, &data).unwrap();
             let mut normal = initial_cpu();
@@ -218,12 +231,16 @@ fn child_inline_corpus_matches_step_one_without_allocation() {
                 &mut normal,
                 mode,
                 &mut Vec::new(),
-                &mut Default::default(),
+                &mut interp::RetireInfo {
+                    consistency: tier,
+                    ..Default::default()
+                },
             );
             let mut normal_data = [0; 0x3000];
             vm.mem.read_bytes(0x3000, &mut normal_data).unwrap();
             vm.mem.write_bytes(0x3000, &data).unwrap();
             let view = vm.child_view(mode);
+            assert_eq!(view.mem_consistency(), tier);
             let mut arena = ChildArena::new(16);
             let child_result = no_alloc(|| child::step(&view, &mut child_cpu, &mut arena));
             match (normal_result, &child_result) {

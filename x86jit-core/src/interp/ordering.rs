@@ -101,6 +101,474 @@ mod tests {
     }
 
     #[test]
+    fn child_steps_use_configured_tier() {
+        use crate::{child, ChildArena, ChildStep, CpuMode, CpuState};
+        // SDM Vol 3A §11.2.2, §11.2.4.1: ordinary and string accesses
+        // retain ordering with other threads sharing the guest bytes.
+        let cases: &[(&[u8], &[&str], &[&str])] = &[
+            (&[0x48, 0x8b, 0x03], &["read", "fence"], &["read", "fence"]),
+            (
+                &[0x48, 0x89, 0x03],
+                &["fence", "write", "fence", "commit"],
+                &["write", "fence", "commit", "fence"],
+            ),
+            (
+                &[0x48, 0x83, 0x03, 1],
+                &["read", "fence", "fence", "write", "fence", "commit"],
+                &["read", "fence", "write", "fence", "commit", "fence"],
+            ),
+            (
+                &[0xf3, 0xa4],
+                &[
+                    "fence", "read", "commit", "write", "read", "commit", "write", "fence",
+                ],
+                &[
+                    "fence", "read", "commit", "write", "read", "commit", "write", "fence",
+                ],
+            ),
+            (
+                &[0xf3, 0xaa],
+                &["fence", "commit", "write", "commit", "write"],
+                &["commit", "write", "commit", "write", "fence"],
+            ),
+            (
+                &[0x0f, 0x10, 0x03],
+                &["read", "read", "fence"],
+                &["read", "read", "fence"],
+            ),
+            (
+                &[0x0f, 0x11, 0x03],
+                &[
+                    "fence", "write", "write", "fence", "commit", "fence", "commit",
+                ],
+                &[
+                    "write", "write", "fence", "commit", "fence", "commit", "fence",
+                ],
+            ),
+        ];
+        for tier in [
+            MemConsistency::Fast,
+            MemConsistency::AcqRel,
+            MemConsistency::FullTso,
+        ] {
+            for &(code, acqrel, fulltso) in cases {
+                let vm = fixture(tier, code);
+                let view = vm.child_view(CpuMode::Long64);
+                let mut arena = ChildArena::new(4);
+                let mut cpu = CpuState {
+                    rip: 0x1000,
+                    ..CpuState::default()
+                };
+                cpu.gpr[1] = 2;
+                cpu.gpr[3] = 0x8000;
+                cpu.gpr[6] = 0x8000;
+                cpu.gpr[7] = 0x8100;
+                let mut expected = if tier == MemConsistency::FullTso {
+                    fulltso
+                } else {
+                    acqrel
+                }
+                .to_vec();
+                if !cfg!(target_arch = "aarch64") || tier == MemConsistency::Fast {
+                    expected.retain(|&event| event != "fence");
+                }
+                take_events();
+                assert!(matches!(
+                    child::step(&view, &mut cpu, &mut arena),
+                    ChildStep::Continue
+                ));
+                assert_eq!(take_events(), expected, "{tier:?} {code:x?}");
+            }
+        }
+    }
+
+    fn check_child_wide_store_commits(tier: MemConsistency, code: &[u8], lanes: usize) {
+        use crate::{child, ChildArena, ChildStep, CpuMode, CpuState};
+        // The commit guard is per transfer, conservatively fencing both halves
+        // of each vstore lane (the ordinary interpreter fences once per lane).
+        let vm = fixture(tier, code);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[3] = 0x8000;
+        let mut normal = cpu.clone();
+        take_events();
+        assert!(matches!(
+            crate::interp::step_one(
+                &vm.mem,
+                &mut normal,
+                CpuMode::Long64,
+                &mut Vec::new(),
+                &mut crate::interp::RetireInfo {
+                    consistency: tier,
+                    ..Default::default()
+                },
+            ),
+            StepResult::Continue
+        ));
+        let normal_events = take_events();
+        let view = vm.child_view(CpuMode::Long64);
+        let mut arena = ChildArena::new(4);
+        take_events();
+        assert!(matches!(
+            child::step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        let events = take_events();
+        let first_commit = events.iter().position(|&e| e == "commit").unwrap();
+        let ordered = cfg!(target_arch = "aarch64") && tier != MemConsistency::Fast;
+        let start = first_commit - usize::from(ordered && tier == MemConsistency::AcqRel);
+        let commits = &events[start..];
+        let transfer: &[&str] = match (ordered, tier) {
+            (true, MemConsistency::AcqRel) => &["fence", "commit"],
+            (true, MemConsistency::FullTso) => &["commit", "fence"],
+            _ => &["commit"],
+        };
+        assert_eq!(commits, transfer.repeat(lanes * 2), "{tier:?} {code:x?}");
+        // Remove only the extra intra-lane fences, then compare the
+        // actual writes and lane boundaries with the normal interpreter.
+        let mut lane_events = Vec::new();
+        for lane in commits.chunks_exact(transfer.len() * 2) {
+            let extra = match tier {
+                MemConsistency::AcqRel => 2,
+                MemConsistency::FullTso => 1,
+                _ => usize::MAX,
+            };
+            for (i, &event) in lane.iter().enumerate() {
+                if !ordered || i != extra {
+                    lane_events.push(if event == "commit" { "write" } else { event });
+                }
+            }
+        }
+        assert_eq!(lane_events, normal_events, "{tier:?} {code:x?}");
+    }
+
+    #[test]
+    fn child_256_store_commits_fast() {
+        check_child_wide_store_commits(MemConsistency::Fast, &[0xc5, 0xfc, 0x11, 0x03], 2);
+    }
+
+    #[test]
+    fn child_256_store_commits_acqrel() {
+        check_child_wide_store_commits(MemConsistency::AcqRel, &[0xc5, 0xfc, 0x11, 0x03], 2);
+    }
+
+    #[test]
+    fn child_256_store_commits_fulltso() {
+        check_child_wide_store_commits(MemConsistency::FullTso, &[0xc5, 0xfc, 0x11, 0x03], 2);
+    }
+
+    #[test]
+    fn child_512_store_commits_fast() {
+        check_child_wide_store_commits(
+            MemConsistency::Fast,
+            &[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x03],
+            4,
+        );
+    }
+
+    #[test]
+    fn child_512_store_commits_acqrel() {
+        check_child_wide_store_commits(
+            MemConsistency::AcqRel,
+            &[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x03],
+            4,
+        );
+    }
+
+    #[test]
+    fn child_512_store_commits_fulltso() {
+        check_child_wide_store_commits(
+            MemConsistency::FullTso,
+            &[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x03],
+            4,
+        );
+    }
+
+    #[test]
+    fn child_faulting_store_keeps_access_barriers() {
+        use crate::{child, ChildArena, ChildStep, CpuMode, CpuState};
+        for tier in [MemConsistency::AcqRel, MemConsistency::FullTso] {
+            let mut vm = fixture(tier, &[0x48, 0x89, 0x03]);
+            vm.mem.unmap(0x9000, 0x1000).unwrap();
+            let view = vm.child_view(CpuMode::Long64);
+            let mut arena = ChildArena::new(4);
+            let mut cpu = CpuState {
+                rip: 0x1000,
+                ..CpuState::default()
+            };
+            cpu.gpr[3] = 0x9000;
+            take_events();
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Fault(_)
+            ));
+            let mut expected = if tier == MemConsistency::AcqRel {
+                vec!["fence", "write"]
+            } else {
+                vec!["write", "fence"]
+            };
+            if !cfg!(target_arch = "aarch64") {
+                expected.retain(|&event| event != "fence");
+            }
+            assert_eq!(take_events(), expected, "{tier:?}");
+            assert_eq!(cpu.rip, 0x1000);
+            assert!(arena.written_pages().is_empty());
+        }
+    }
+
+    // Keep the signal adapter in tests: production core depends only on iced-x86.
+    // Darwin layouts: sys/signal.h, sys/_types/_ucontext.h, arm/_mcontext.h
+    // and mach/arm/_structs.h. The mcontext prefix stops before the NEON state.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod child_host_fault {
+        use super::*;
+        use crate::jit_abi::fault::HostRegisters;
+        use crate::{
+            child, ChildArena, ChildStep, CpuMode, CpuState, HostFaultPlatform, HostRam,
+            RawHostFault,
+        };
+        use std::ffi::c_void;
+
+        #[repr(C)]
+        struct Action {
+            handler: usize,
+            mask: u32,
+            flags: i32,
+        }
+        #[repr(C)]
+        struct SignalInfo {
+            signal: i32,
+            errno: i32,
+            code: i32,
+        }
+        #[repr(C)]
+        struct Stack {
+            ptr: *mut c_void,
+            size: usize,
+            flags: i32,
+        }
+        #[repr(C)]
+        struct Context {
+            on_stack: i32,
+            mask: u32,
+            stack: Stack,
+            link: *mut c_void,
+            size: usize,
+            machine: *mut Machine,
+        }
+        #[repr(C)]
+        struct Machine {
+            far: u64,
+            esr: u32,
+            exception: u32,
+            x: [u64; 29],
+            fp: u64,
+            lr: u64,
+            sp: u64,
+            pc: u64,
+            cpsr: u32,
+            pad: u32,
+        }
+        extern "C" {
+            fn fork() -> i32;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            fn _exit(status: i32) -> !;
+            fn alarm(seconds: u32) -> u32;
+            fn getpagesize() -> i32;
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut c_void;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+            fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+            fn sigaction(signal: i32, action: *const Action, old: *mut Action) -> i32;
+        }
+        extern "C" fn handler(signal: i32, info: *mut SignalInfo, context: *mut Context) {
+            // SAFETY: SA_SIGINFO supplies this accessing thread's Darwin context.
+            unsafe {
+                let machine = &mut *(*context).machine;
+                // Arm ARM DDI0487I.a §D17.2.37: synchronous data-access abort.
+                if (*info).code <= 0
+                    || ![0x24, 0x25].contains(&(machine.esr >> 26))
+                    || !(4..=15).contains(&(machine.esr & 63))
+                {
+                    _exit(91);
+                }
+                let mut raw = RawHostFault::new(HostFaultPlatform::MacOsAarch64);
+                raw.signal = Some(signal);
+                raw.signal_code = Some((*info).code);
+                raw.fault_address = Some(machine.far);
+                raw.esr = Some(u64::from(machine.esr));
+                let mut regs = HostRegisters {
+                    pc: machine.pc,
+                    scratch: machine.x[9],
+                    ..HostRegisters::default()
+                };
+                if !child::classify(regs.pc as usize, &mut regs, raw) {
+                    _exit(92);
+                }
+                machine.pc = regs.pc;
+            }
+        }
+
+        #[test]
+        fn child_host_fault_store_keeps_post_fence() {
+            // Mirror the protected child_step setup, with the unit fence recorder
+            // enabled. SDM Vol 3A §11.2.2, §11.2.4.1: retain ordering of any
+            // completed store prefix before reporting the fault to the embedder.
+            // SAFETY: faults and signal handlers are isolated in a reaped child.
+            unsafe {
+                let pid = fork();
+                assert!(pid >= 0);
+                if pid == 0 {
+                    alarm(10);
+                    let result = std::panic::catch_unwind(|| {
+                        let action = Action {
+                            handler: handler as *const () as usize,
+                            mask: 0,
+                            flags: 0x40,
+                        };
+                        for signal in [10, 11] {
+                            assert_eq!(sigaction(signal, &action, std::ptr::null_mut()), 0);
+                        }
+                        let page = getpagesize() as usize;
+                        for tier in [MemConsistency::FullTso, MemConsistency::AcqRel] {
+                            for (code, prefix, lanes) in [
+                                (&[0x48, 0x89, 0x03][..], 0, 0),
+                                (&[0x48, 0x89, 0x03][..], 4, 0),
+                                (&[0x0f, 0x11, 0x03][..], 8, 1),
+                                (&[0xc5, 0xfc, 0x11, 0x03][..], 24, 2),
+                                (&[0xc5, 0xfc, 0x11, 0x03][..], 20, 2),
+                                (&[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x03][..], 56, 4),
+                                (&[0x62, 0xf1, 0x7c, 0x48, 0x11, 0x03][..], 52, 4),
+                                (&[0xf3, 0xaa][..], 2, 0),
+                            ] {
+                                let ptr = mmap(std::ptr::null_mut(), 2 * page, 3, 0x1002, -1, 0);
+                                assert_ne!(ptr as usize, usize::MAX);
+                                let base = ptr as u64;
+                                let hole = base + page as u64;
+                                let mut config = VmConfig::flat(base + 2 * page as u64);
+                                config.consistency = tier;
+                                let ram = HostRam {
+                                    ptr: ptr.cast(),
+                                    len: 2 * page,
+                                    guest_base: base,
+                                    protect: None,
+                                    dtor: Box::new(|p, n| {
+                                        munmap(p.cast(), n);
+                                    }),
+                                };
+                                let mut vm = Vm::with_backend_host_ram(
+                                    config,
+                                    Box::new(crate::InterpreterBackend),
+                                    ram,
+                                )
+                                .unwrap();
+                                vm.map(base, 2 * page, Prot::RWX, RegionKind::Ram).unwrap();
+                                vm.mem.set_host_fault_recovery(true);
+                                vm.write_bytes(base, code).unwrap();
+                                let view = vm.child_view(CpuMode::Long64);
+                                let mut arena = ChildArena::new(2);
+                                let mut cpu = CpuState {
+                                    rip: base,
+                                    ..CpuState::default()
+                                };
+                                cpu.gpr[1] = 3;
+                                cpu.gpr[3] = hole - prefix;
+                                cpu.gpr[7] = hole - prefix;
+                                assert_eq!(mprotect(hole as *mut _, page, 0), 0);
+                                take_events();
+                                let ChildStep::Fault(fault) =
+                                    child::step(&view, &mut cpu, &mut arena)
+                                else {
+                                    panic!("expected recovered host fault")
+                                };
+                                let events = take_events();
+                                assert!(fault.raw_host_fault.is_some());
+                                assert_eq!(fault.origin, crate::FaultOrigin::HostAccess);
+                                let expected = if lanes != 0 {
+                                    let staging = if tier == MemConsistency::AcqRel {
+                                        ["fence", "write", "write"]
+                                    } else {
+                                        ["write", "write", "fence"]
+                                    };
+                                    let commit = if tier == MemConsistency::AcqRel {
+                                        ["fence", "commit"]
+                                    } else {
+                                        ["commit", "fence"]
+                                    };
+                                    let mut expected = staging.repeat(lanes);
+                                    // Include the faulting transfer, even when only
+                                    // its bytewise prefix reaches the writable page.
+                                    expected.extend(commit.repeat((prefix / 8 + 1) as usize));
+                                    expected
+                                } else {
+                                    let expected: &[&str] = match (tier, code) {
+                                        (MemConsistency::AcqRel, [0xf3, 0xaa]) => &[
+                                            "fence", "commit", "write", "commit", "write",
+                                            "commit", "write",
+                                        ],
+                                        (_, [0xf3, 0xaa]) => &[
+                                            "commit", "write", "commit", "write", "commit",
+                                            "write", "fence",
+                                        ],
+                                        (MemConsistency::AcqRel, _) => {
+                                            &["fence", "write", "fence", "commit"]
+                                        }
+                                        _ => &["write", "fence", "commit", "fence"],
+                                    };
+                                    expected.to_vec()
+                                };
+                                assert_eq!(events, expected, "{tier:?} {code:x?}, prefix={prefix}");
+                                assert_eq!(mprotect(hole as *mut _, page, 3), 0);
+                            }
+                        }
+                    });
+                    _exit(i32::from(result.is_err()));
+                }
+                let mut status = 0;
+                assert_eq!(waitpid(pid, &mut status, 0), pid);
+                assert_eq!(status, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn child_partial_string_fault_keeps_post_fence() {
+        use crate::{child, ChildArena, ChildStep, CpuMode, CpuState};
+        for tier in [MemConsistency::AcqRel, MemConsistency::FullTso] {
+            let mut vm = fixture(tier, &[0xf3, 0xa4]);
+            vm.mem.unmap(0x9000, 0x1000).unwrap();
+            let view = vm.child_view(CpuMode::Long64);
+            let mut arena = ChildArena::new(4);
+            let mut cpu = CpuState {
+                rip: 0x1000,
+                ..CpuState::default()
+            };
+            cpu.gpr[1] = 2;
+            cpu.gpr[6] = 0x8fff;
+            cpu.gpr[7] = 0x8100;
+            take_events();
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Fault(_)
+            ));
+            let mut expected = vec!["fence", "read", "commit", "write", "read", "fence"];
+            if !cfg!(target_arch = "aarch64") {
+                expected.retain(|&event| event != "fence");
+            }
+            assert_eq!(take_events(), expected, "{tier:?}");
+            assert_eq!(cpu.gpr[1], 1);
+        }
+    }
+
+    #[test]
     fn vm_entries_use_configured_tier() {
         // mov [rbx],rax; mov rax,[rbx]; hlt. InterpreterBackend never tiers up.
         for tier in [

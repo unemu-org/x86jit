@@ -202,6 +202,16 @@ mod protected {
     }
     #[test]
     fn child_identity_mapped_host_faults_recover_without_allocation() {
+        for tier in [
+            x86jit_core::MemConsistency::Fast,
+            x86jit_core::MemConsistency::AcqRel,
+            x86jit_core::MemConsistency::FullTso,
+        ] {
+            child_host_faults_for_tier(tier);
+        }
+    }
+
+    fn child_host_faults_for_tier(tier: x86jit_core::MemConsistency) {
         // Deliberate host faults and signal dispositions stay in an isolated process.
         // SAFETY: parent waits for its child; child exits without engine destructors.
         unsafe {
@@ -243,12 +253,11 @@ mod protected {
                             libc::munmap(p.cast(), n);
                         }),
                     };
-                    let mut vm = Vm::with_backend_host_ram(
-                        VmConfig::flat(base + len as u64),
-                        Box::new(InterpreterBackend),
-                        ram,
-                    )
-                    .unwrap();
+                    let mut config = VmConfig::flat(base + len as u64);
+                    config.consistency = tier;
+                    let mut vm =
+                        Vm::with_backend_host_ram(config, Box::new(InterpreterBackend), ram)
+                            .unwrap();
                     vm.map(base, len, Prot::RWX, RegionKind::Ram).unwrap();
                     vm.mem.set_host_fault_recovery(true);
                     let view = vm.child_view(CpuMode::Long64);

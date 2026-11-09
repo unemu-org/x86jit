@@ -3895,7 +3895,7 @@ fn walk_ops<
     WalkResult::Continue
 }
 
-pub(crate) fn walk_child(
+pub(crate) fn walk_child<const ORDER: u8>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &impl InterpreterMemory,
@@ -3907,10 +3907,9 @@ pub(crate) fn walk_child(
     let mut retired = 0;
     let mut started = false;
     let mut shadow = false;
-    // Child ordering remains unordered until xj-ir6.24.
-    let mem = Access::<false, 0, _>::new(mem);
+    let mem = Access::<false, ORDER, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        walk_ops::<false, false, true, true, 0>(
+        walk_ops::<false, false, true, true, ORDER>(
             ir,
             cpu,
             mem,
@@ -3923,7 +3922,7 @@ pub(crate) fn walk_child(
             None,
         )
     } else {
-        walk_ops::<false, false, false, true, 0>(
+        walk_ops::<false, false, false, true, ORDER>(
             ir,
             cpu,
             mem,

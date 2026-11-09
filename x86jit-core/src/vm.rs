@@ -546,7 +546,9 @@ impl Vm {
     /// VM's mapping alive and preventing safe unmap/remap until the view is dropped.
     /// See the crate docs for the FFI and parent invalidation protocol.
     pub fn child_view(&self, mode: CpuMode) -> crate::ChildView<'_> {
-        self.mem.child_view(self, mode)
+        let mut view = self.mem.child_view(self, mode);
+        view.code.consistency = self.consistency;
+        view
     }
 
     /// Reconcile a finished child's written-page log with concurrent translation
