@@ -21,6 +21,57 @@ use crate::lift::{
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
 use crate::state::{CpuState, Flags, Reg};
 
+/// Options for instruction-exact Real16 execution (decision-16 §1).
+/// Default execution stops on the budget or an ordinary exit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepOptions {
+    _private: (),
+}
+
+/// Completed accounting units and the reason execution stopped.
+#[derive(Debug)]
+pub struct StepRun {
+    steps: u64,
+    stop: StepStop,
+}
+impl StepRun {
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+    pub fn stop(&self) -> &StepStop {
+        &self.stop
+    }
+    pub fn into_stop(self) -> StepStop {
+        self.stop
+    }
+}
+
+/// A step limit uses `Exit::BudgetExhausted`; instruction exits take precedence.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StepStop {
+    Exit(Exit),
+    /// Reserved for the interrupt-readiness stopping option.
+    IrqReady,
+}
+
+/// Refusal before any execution or completion consumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StepRunError {
+    UnsupportedMode,
+    PendingPortIn,
+}
+impl std::fmt::Display for StepRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedMode => "instruction-exact execution requires Real16",
+            Self::PendingPortIn => "complete the pending port input before execution",
+        })
+    }
+}
+impl std::error::Error for StepRunError {}
+
 /// Materializes IR into an executable `CachedBlock` (§8). The ONLY
 /// backend-dependent operation; execution is uniform.
 ///
@@ -1371,19 +1422,19 @@ impl Vcpu {
         self.exit_request.clone()
     }
 
-    /// Evidence for the [`Exit::Interrupted`] returned by the most recent [`Self::run`].
+    /// Evidence for the [`Exit::Interrupted`] returned by the most recent [`Self::run`] or positive [`Self::run_steps`].
     /// `None` before the first run, during a run, or after any other exit. Cleared
-    /// as soon as the next `run` is entered, even if it unwinds. The returned value
+    /// as soon as the next `run` or positive `run_steps` is entered, even if it unwinds. The returned value
     /// is a copy and can be retained across resumption. Deferred evidence for a
     /// still-pending request survives unrelated exits internally.
     pub fn interruption_evidence(&self) -> Option<crate::InterruptionEvidence> {
         self.interruption_evidence
     }
 
-    /// Evidence for the [`Exit::Syscall`] returned by the most recent [`Self::run`].
+    /// Evidence for the [`Exit::Syscall`] returned by the most recent [`Self::run`] or positive [`Self::run_steps`].
     /// The RIP identifies the syscall instruction, while `cpu.rip` points past it.
     /// `None` before the first run or after any other exit. Cleared as soon as
-    /// the next `run` is entered, even if it unwinds; the copy can be retained.
+    /// the next `run` or positive `run_steps` is entered, even if it unwinds; the copy can be retained.
     /// Chain-link evidence is not collected for syscalls.
     pub fn syscall_evidence(&self) -> Option<crate::ExecutionEvidence> {
         self.syscall_evidence
@@ -1758,6 +1809,209 @@ impl Vcpu {
     /// dropped, including across moves. See `jit_abi::fault::classify` for safety.
     pub fn fault_handle(&self) -> crate::jit_abi::fault::FaultHandle {
         self.fault_entry.handle()
+    }
+
+    /// Execute at most `max_steps` units on the Real16 interpreter, including
+    /// when the VM has a compiling backend (decision-16 §§1–4).
+    ///
+    /// A unit is one completed instruction or one completed REP iteration. Empty
+    /// REP counts once. IN/OUT count at handoff; supplying an IN value adds no unit.
+    /// A positive call with pending IN is refused. Other modes are always refused.
+    /// Zero returns budget exhaustion without fetching, delivering, consuming a
+    /// completion, changing shadows, clearing retries, or consuming host requests.
+    ///
+    /// Instruction exits win over exhaustion. At other boundaries: budget, host
+    /// request (after pending completion), queued eligible IRQ, then execution.
+    /// Delivery costs no unit. An incomplete instruction/iteration contributes zero;
+    /// its already-permitted partial effects remain. The next unit never begins.
+    /// `steps = delta(retired_instructions) + completed_rep_iterations
+    /// - completed_nonempty_rep_instructions`, local to this call.
+    /// Repeated zero-retirement fault delivery is not wall-clock bounded; a host
+    /// exit request remains the escape. As with `run`, this vCPU must belong to `vm`.
+    pub fn run_steps(
+        &mut self,
+        vm: &Vm,
+        max_steps: u64,
+        _options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        if self.mode != CpuMode::Real16 {
+            return Err(StepRunError::UnsupportedMode);
+        }
+        if max_steps == 0 {
+            return Ok(StepRun {
+                steps: 0,
+                stop: StepStop::Exit(Exit::BudgetExhausted),
+            });
+        }
+        if self.cpu.pending_port_in.is_some() {
+            return Err(StepRunError::PendingPortIn);
+        }
+        self.interruption_evidence = None;
+        self.syscall_evidence = None;
+        self.fault_entry.prepare_run();
+        let mut fp_mode = crate::jit_abi::fp::RunMode::new();
+        // As in run(), deactivate publication even if an embedder callback unwinds.
+        struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
+        impl Drop for FaultRunGuard {
+            fn drop(&mut self) {
+                // SAFETY: the boxed record stays fixed for the exclusive vCPU borrow.
+                unsafe {
+                    (*self.0).deactivate();
+                }
+            }
+        }
+        let guard = FaultRunGuard(&mut *self.fault_entry);
+        let mut steps = crate::interp::StepContext::new(max_steps);
+        let exit = if vm.mem.host_fault_recovery() {
+            self.run_steps_inner::<true>(vm, &mut steps, &mut fp_mode)
+        } else {
+            self.run_steps_inner::<false>(vm, &mut steps, &mut fp_mode)
+        };
+        drop(guard);
+        let exit = crate::fault::qualify_real16(exit, &self.cpu);
+        let exit = match exit {
+            exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
+                self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+            }
+            other => other,
+        };
+        self.cpu.finish_mmio_retry(Some(&exit));
+        vm.cache.add_chained(std::mem::take(&mut self.chained));
+        Ok(StepRun {
+            steps: steps.steps,
+            stop: StepStop::Exit(exit),
+        })
+    }
+
+    fn run_steps_inner<const ROUTED: bool>(
+        &mut self,
+        vm: &Vm,
+        steps: &mut crate::interp::StepContext,
+        fp_mode: &mut crate::jit_abi::fp::RunMode,
+    ) -> Exit {
+        let exit_word_owner = Arc::clone(&self.exit_request.word);
+        let exit_word: &AtomicU64 = &exit_word_owner;
+        let mut ctx = MemCtx::for_memory(&vm.mem);
+        self.fault_entry.publish(&mut self.cpu, &mut ctx);
+        loop {
+            fp_mode.default();
+            if steps.remaining == 0 {
+                return Exit::BudgetExhausted;
+            }
+            let pending = self.cpu.mmio_retry_active
+                || self.cpu.pending_mmio.is_some()
+                || self.cpu.pending_mmio_write
+                || self.cpu.pending_port_in.is_some();
+            if !pending && exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0 {
+                return self.interrupted(crate::FaultPath::Interpreter, false);
+            }
+            if let Some(exit) = self.code_space_exit(vm) {
+                return exit;
+            }
+            vm.handle_smc(exit_word);
+            if self.pending_irq.is_some() && self.irq_ready() {
+                let vector = self.pending_irq.take().unwrap();
+                let ip = self.cpu.rip;
+                match crate::interp::deliver_interrupt(
+                    &mut self.cpu,
+                    &vm.mem,
+                    ip,
+                    vector,
+                    ip,
+                    vm.consistency,
+                )
+                .into_step()
+                {
+                    StepResult::Continue => {
+                        self.sti_shadow = false;
+                        self.ss_shadow = false;
+                        continue;
+                    }
+                    StepResult::Exit(exit) => return exit,
+                }
+            }
+            let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
+            let block = match resolve_dispatch::<true>(
+                vm,
+                exit_word,
+                &self.engine_sections,
+                fetch,
+                self.mode,
+                0,
+            ) {
+                Ok(block) => block,
+                Err(exit) => return exit,
+            };
+            let CachedBlock::Interpreted(ir) = block else {
+                unreachable!("Real16 resolution always interprets");
+            };
+            let mut info = crate::interp::RetireInfo {
+                consistency: vm.consistency,
+                sti_shadow: self.sti_shadow,
+                ss_shadow: self.ss_shadow,
+                exit_request: Some(exit_word),
+                trace: vm.lockstep_trace.as_deref(),
+                ..Default::default()
+            };
+            steps.pending_irq = self.pending_irq.is_some();
+            let result = if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0 {
+                crate::interp::interpret_block_steps::<ROUTED, true>(
+                    &ir,
+                    &mut self.cpu,
+                    &vm.mem,
+                    &mut self.interp_scratch,
+                    &mut info,
+                    steps,
+                )
+            } else {
+                crate::interp::interpret_block_steps::<ROUTED, false>(
+                    &ir,
+                    &mut self.cpu,
+                    &vm.mem,
+                    &mut self.interp_scratch,
+                    &mut info,
+                    steps,
+                )
+            };
+            self.retired += info.retired;
+            self.executed += info.retired;
+            self.sti_shadow = info.sti_shadow;
+            self.ss_shadow = info.ss_shadow;
+            match result {
+                crate::interp::BlockResult::Continue | crate::interp::BlockResult::ModeChange => {}
+                crate::interp::BlockResult::Exit(exit) => match exit.into_exit() {
+                    Exit::Syscall => return self.syscall_interpreted(&ir),
+                    Exit::Interrupted => {
+                        let path = if steps.string_interrupted {
+                            crate::FaultPath::Helper {
+                                family: crate::FaultHelper::String,
+                                caller: crate::HelperCaller::Interpreter,
+                            }
+                        } else {
+                            crate::FaultPath::Interpreter
+                        };
+                        return self.interrupted(path, false);
+                    }
+                    Exit::Exception { addr, vector, .. } => match crate::interp::deliver_interrupt(
+                        &mut self.cpu,
+                        &vm.mem,
+                        addr,
+                        vector,
+                        addr,
+                        vm.consistency,
+                    )
+                    .into_step()
+                    {
+                        StepResult::Continue => {
+                            self.sti_shadow = false;
+                            self.ss_shadow = false;
+                        }
+                        StepResult::Exit(exit) => return exit,
+                    },
+                    exit => return exit,
+                },
+            }
+        }
     }
 
     /// Execute until an exit event or budget exhaustion (§5.1, §9.2).

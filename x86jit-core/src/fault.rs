@@ -555,6 +555,16 @@ impl FaultMetadata {
     pub fn progress(&self) -> &FaultProgress {
         &self.progress
     }
+
+    pub(crate) fn resolve_string_transfer_addresses(&mut self, addresses: [u64; 2]) {
+        // Stepped string replay keys transfers by operand slot so same-address
+        // operands remain distinct. Decision-14 exposes guest addresses instead.
+        for (slot, _) in self.progress.acknowledged.iter_mut() {
+            if let Some(&address) = usize::try_from(*slot).ok().and_then(|i| addresses.get(i)) {
+                *slot = address;
+            }
+        }
+    }
 }
 
 #[cold]

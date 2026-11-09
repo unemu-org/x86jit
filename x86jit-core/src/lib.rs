@@ -183,7 +183,7 @@ pub use state::{
 };
 pub use vm::{
     Backend, ExitRequest, ForceRegionError, InterpreterBackend, MemConsistency, ShutdownError,
-    ShutdownReport, SourceIdError, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu,
-    Vm, VmConfig,
+    ShutdownReport, SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished,
+    TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
 pub use x87::FpuKind;
