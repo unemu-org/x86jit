@@ -82,7 +82,7 @@ cargo nextest run --release -p x86jit-tests -E 'binary(jit) or binary(differenti
 ```
 
 CI runs a narrower form (the second line plus the corpus, smc, mt and host-fault
-recovery binaries; see `.forgejo/workflows/ci.yml`); the full release run is a local
+recovery binaries; see `scripts/ci-gate.sh` and `.forgejo/workflows/ci.yml`); the full release run is a local
 check worth doing before a release or after touching the softfloat and codegen paths.
 
 ## AVX/VEX differential fuzz (`cargo xfuzz`)
@@ -165,10 +165,39 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 
 ## Git remote and CI
 
-Push only to the configured `origin`, at the maintainer's request. The workflow uses
-Forgejo Actions; remote operations use `fj`.
+Push only to the configured `origin`, at the maintainer's request. GitHub Actions and
+Forgejo Actions have separate workflows; neither publishes the repository.
 
-- **x86-64**: a Forgejo Actions runner, workflow `.forgejo/workflows/ci.yml`. It is manual
+- **GitHub**: `.github/workflows/ci.yml` runs on pushes, pull requests (including forks),
+  and manual dispatches. Its two independent jobs use GitHub-hosted `ubuntu-24.04`
+  (x86-64) and `ubuntu-24.04-arm` (aarch64) runners. Both install pinned Nix and use
+  the devShell from `flake.lock`. Each runs fmt, the guest-agnostic guard, clippy with
+  all features and `-D warnings`, cargo-deny, the workspace nextest run with Unicorn
+  and without `fuzz_robustness`, the release subset, the Compat32 lane, workspace
+  doctests with all features, and a workspace/test type-check for the opposite Linux
+  architecture. The cross-check uses default features because the cross architecture's
+  Unicorn library is unavailable; each native lane tests Unicorn. The x86-64 Linux
+  job also exercises the cfg-gated native oracle.
+  After the devShell succeeds, later gates run even if an earlier gate fails; either
+  job's failure fails the workflow, without cancelling the other architecture.
+  GitHub supplies the job checks; this workflow does not post Forgejo commit statuses.
+  Combined gate logs are retained as `ci-logs-x86_64` / `ci-logs-aarch64` artifacts for
+  seven days. Installer and cache diagnostics remain in the Actions job log.
+  All actions are pinned to commit SHAs, checkout does not persist credentials, and
+  the only repository permission is `contents: read`. No configured secrets or
+  self-hosted runners are needed.
+  Cargo caches are separated by OS, architecture, Nix inputs, gate script and Cargo
+  lockfile; the pinned 80286 corpus cache is shared between architectures. Only push
+  runs save caches; pull requests can restore them. A corpus cache miss fetches the
+  corpus, and `SS286_REQUIRED=1` makes an absent corpus fail the test gate.
+  The `oracles` submodule is deliberately not checked out: these gates use in-code
+  witness values, while `vendor/80286/fetch.sh` fetches its pinned corpus separately.
+  Manuals remain necessary when deriving new hardware facts.
+  Allow roughly 20–40 minutes per lane with cold caches and 10–25 minutes with warm
+  caches. These are planning estimates pending the first hosted run; each job has a
+  90-minute timeout. Runner provisioning, Nix binary-cache availability, disk use,
+  corpus downloads and native-oracle results must be checked on that first run.
+- **Forgejo**: `.forgejo/workflows/ci.yml` keeps its existing x86-64 job. It is manual
   only. Push the branch to `origin` first: the run checks out what is on the remote. Then
   `fj actions dispatch ci.yml <branch-or-tag>`; `fj actions tasks` lists the runs. The
   job runs the dev shell, the 80286 corpus (`SS286_REQUIRED=1`), fmt, the guest-agnostic
@@ -180,10 +209,32 @@ Forgejo Actions; remote operations use `fj`.
   runs, and `fj` has no status command: read it with
   `GET /api/v1/repos/<owner>/<repo>/commits/<sha>/status`. The full output is in the job
   log the status links to.
-- **aarch64**: no CI runner. The gate runs locally on an aarch64 macOS host — the
-  full `cargo nextest` run, clippy, fmt. Changes to codegen, memory ordering or anything
-  host-specific need that run before merge. The local target is aarch64-apple-darwin:
-  Linux-only paths (the real-program ladder, which builds `unemulinux`) do not run there.
+- **Local macOS**: `cargo nextest`, clippy and fmt additionally cover
+  aarch64-apple-darwin. The Linux hosted lanes do not replace checks of Darwin-specific
+  code. The native x86-64 Linux oracle and the real-program ladder do not run on macOS.
 - The pre-push hook `ladder-smoke` builds `../unemulinux`, which does not compile on macOS. On that
   host the hook cannot pass; skipping it (`SKIP=ladder-smoke git push`, never `--no-verify`) is the
   maintainer's call for each push, after the other pre-push hooks have passed.
+
+Run an individual GitHub gate from the repository root (the script enters the Nix
+devShell for Cargo commands and writes `ci-logs/<step>.log`):
+
+```sh
+bash scripts/ci-gate.sh fmt
+bash scripts/ci-gate.sh clippy
+bash scripts/ci-gate.sh deny
+bash scripts/ci-gate.sh corpus       # fetch the corpus before the full test gate
+bash scripts/ci-gate.sh tests
+bash scripts/ci-gate.sh release
+bash scripts/ci-gate.sh lane32
+bash scripts/ci-gate.sh doctests
+bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu   # on x86-64
+bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu    # on aarch64
+python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v  # no builds/downloads
+nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
+```
+
+`CI_LOG_DIR` overrides the log directory; the script preserves the failing command's
+exit status through `tee`. The script tests stub external commands, checking dispatch,
+required corpus settings, both cross-targets and failure propagation without running
+the full gate.

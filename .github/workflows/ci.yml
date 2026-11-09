@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            cross-target: aarch64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            cross-target: x86_64-unknown-linux-gnu
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          # The gates use in-code witness values, not the manual PDFs or tables.
+          submodules: false
+
+      - name: Gate script tests
+        run: python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        with:
+          nix_version: "2.29.2"
+          github_access_token: ""
+          enable_kvm: false
+
+      - name: Dev shell
+        id: devshell
+        run: bash scripts/ci-gate.sh devshell
+
+      # Separate architectures and toolchains; reuse dependencies across source edits.
+      - name: Restore cargo cache
+        id: cargo_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-v1-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'scripts/ci-gate.sh') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-v1-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'scripts/ci-gate.sh') }}-
+
+      # The corpus is architecture independent and pinned inside fetch.sh.
+      - name: Restore 80286 corpus cache
+        id: corpus_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: x86jit-tests/vendor/80286/v1_real_mode
+          key: ss286-${{ hashFiles('x86jit-tests/vendor/80286/fetch.sh') }}
+
+      - name: Fetch 80286 corpus
+        id: corpus
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' && steps.corpus_cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-gate.sh corpus
+
+      # Keep collecting failures after setup succeeds; a failed gate still fails the job.
+      - name: Formatting
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh fmt
+
+      - name: Guest-agnostic guard
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh guard
+
+      - name: Clippy
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh clippy
+
+      - name: Licences (cargo-deny)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh deny
+
+      - name: Tests (Unicorn, excluding fuzz_robustness)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh tests
+
+      - name: Tests (release profile)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh release
+
+      - name: 32-bit differential lane (Compat32)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh lane32
+
+      - name: Documentation tests
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh doctests
+
+      - name: Cross-target check
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        env:
+          CROSS_TARGET: ${{ matrix.cross-target }}
+        run: bash scripts/ci-gate.sh cross "$CROSS_TARGET"
+
+      # Only push runs populate caches; pull requests can restore them. Explicit saves
+      # keep dependency caches warm even when a gate fails.
+      - name: Save cargo cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.devshell.outcome == 'success' && steps.cargo_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+
+      - name: Save 80286 corpus cache
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.corpus.outcome == 'success' && steps.corpus_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: x86jit-tests/vendor/80286/v1_real_mode
+          key: ${{ steps.corpus_cache.outputs.cache-primary-key }}
+
+      # GitHub supplies job checks, so the Forgejo status-posting script is not used.
+      - name: Upload gate logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-logs-${{ matrix.arch }}
+          path: ci-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
