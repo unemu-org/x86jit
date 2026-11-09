@@ -343,27 +343,27 @@ impl Backend for InterpreterBackend {
     }
 }
 
-/// Memory-consistency tier for JIT inline loads/stores on weak hosts (§8.2.3).
+/// Memory-consistency tier for guest accesses on weak hosts (§8.2.3).
 /// aarch64 Fast uses LDR/STR; AcqRel places DMB ISH before stores and after
 /// loads; FullTso places DMB ISH after each store and load. x86 stays plain.
-/// Helper-executed accesses bypass those tier barriers (xj-0w3.7). The
-/// interpreter ignores the tier and leaves ordinary accesses Relaxed (xj-0w3.6).
+/// Memory helpers are bracketed by direction: AcqRel fences before writes and
+/// after reads; FullTso fences before reads and after reads or writes.
 /// Explicit MFENCE is a full barrier in every tier, host and backend; the JIT
 /// emits LFENCE/SFENCE barriers in every aarch64 tier to cover helpers too.
 /// Locked operations are atomic in every tier, but aarch64 LL/SC paths lack
 /// full x86 locked-op ordering, including XCHG even on LSE-capable hosts.
 /// Distinct from `MemoryModel` (address-space layout). Baked into compiled
 /// blocks: changing it requires flushing the translation cache.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemConsistency {
     /// Bare STR/LDR, no barriers. Fastest. Correct only for code that doesn't
     /// synchronize through memory (single-threaded, or non-communicating threads).
+    #[default]
     Fast,
-    /// JIT inline stores: DMB ISH; STR. Inline loads: LDR; DMB ISH.
-    /// Helper and interpreter accesses do not follow the tier yet.
+    /// Inline interpreter/JIT stores: DMB ISH; STR. Inline loads: LDR; DMB ISH.
     AcqRel,
-    /// JIT inline stores: STR; DMB ISH. Inline loads: LDR; DMB ISH.
-    /// No leading store fence. Helper and interpreter accesses bypass the tier.
+    /// Inline interpreter/JIT stores: STR; DMB ISH. Inline loads: LDR; DMB ISH.
+    /// No leading inline-store fence.
     FullTso,
 }
 
@@ -1668,7 +1668,10 @@ impl Vcpu {
             vm.handle_smc(&self.exit_request.word);
         }
         let _fp_mode = crate::jit_abi::fp::RunMode::new();
-        let mut info = crate::interp::RetireInfo::default();
+        let mut info = crate::interp::RetireInfo {
+            consistency: vm.consistency,
+            ..Default::default()
+        };
         let r = crate::interp::step_one(
             &vm.mem,
             &mut self.cpu,
@@ -1684,8 +1687,15 @@ impl Vcpu {
             StepResult::Exit(Exit::Exception { addr, vector, .. })
                 if self.mode == CpuMode::Real16 =>
             {
-                crate::interp::deliver_interrupt(&mut self.cpu, &vm.mem, addr, vector, addr)
-                    .into_step()
+                crate::interp::deliver_interrupt(
+                    &mut self.cpu,
+                    &vm.mem,
+                    addr,
+                    vector,
+                    addr,
+                    vm.consistency,
+                )
+                .into_step()
             }
             other => other,
         };
@@ -1951,7 +1961,10 @@ impl Vcpu {
                     fp_mode.default();
                 }
                 // Finish the pending instruction before honouring a host request.
-                let mut info = crate::interp::RetireInfo::default();
+                let mut info = crate::interp::RetireInfo {
+                    consistency: vm.consistency,
+                    ..Default::default()
+                };
                 let instruction_rip = self.cpu.rip;
                 let r = crate::interp::step_one_mode::<ROUTED>(
                     &vm.mem,
@@ -2013,6 +2026,7 @@ impl Vcpu {
                         saved,
                         vector,
                         saved,
+                        vm.consistency,
                     )
                     .into_step()
                     {
@@ -2081,6 +2095,7 @@ impl Vcpu {
                         fp_mode.default();
                     }
                     let mut info = crate::interp::RetireInfo {
+                        consistency: vm.consistency,
                         exit_request: Some(exit_word),
                         trace: vm.lockstep_trace.as_deref(),
                         ..Default::default()
@@ -2133,6 +2148,7 @@ impl Vcpu {
                                         addr,
                                         vector,
                                         addr,
+                                        vm.consistency,
                                     )
                                     .into_step()
                                     {
@@ -2449,6 +2465,7 @@ impl Vcpu {
                                 // tick the retired counter for the one instruction it
                                 // may retire (§17.6, sub-seam c).
                                 let mut info = crate::interp::RetireInfo {
+                                    consistency: vm.consistency,
                                     exit_request: Some(exit_word),
                                     trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()
@@ -2522,6 +2539,7 @@ impl Vcpu {
                                     fp_mode.default();
                                 }
                                 let mut info = crate::interp::RetireInfo {
+                                    consistency: vm.consistency,
                                     exit_request: Some(exit_word),
                                     trace: vm.lockstep_trace.as_deref(),
                                     ..Default::default()

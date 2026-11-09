@@ -3546,7 +3546,7 @@ pub(crate) fn host_page_size() -> usize {
 // A borrowed specialization retains its backing's representation, avoiding a
 // pointer-to-pointer on normal out-of-line interpreter helpers.
 #[repr(transparent)]
-pub(crate) struct Access<const ROUTED: bool, M = Memory>(pub M);
+pub(crate) struct Access<const ROUTED: bool, const ORDER: u8 = 0, M = Memory>(pub M);
 
 pub(crate) trait InterpreterMemory {
     fn normal(&self) -> &Memory;
@@ -3613,14 +3613,16 @@ impl InterpreterMemory for Memory {
         self.probe_write_mode::<ROUTED>(addr, size)
     }
 }
-impl<const ROUTED: bool, M: InterpreterMemory> std::ops::Deref for Access<ROUTED, M> {
+impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> std::ops::Deref
+    for Access<ROUTED, ORDER, M>
+{
     type Target = Memory;
     #[inline(always)]
     fn deref(&self) -> &Memory {
         self.0.normal()
     }
 }
-impl<const ROUTED: bool, M: InterpreterMemory> Access<ROUTED, M> {
+impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, ORDER, M> {
     #[inline(always)]
     pub fn new(mem: &M) -> &Self {
         // SAFETY: transparent wrapper; shared borrowing retains the backing's
@@ -3629,11 +3631,42 @@ impl<const ROUTED: bool, M: InterpreterMemory> Access<ROUTED, M> {
     }
     #[inline(always)]
     pub fn read(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
-        self.0.read::<ROUTED>(addr, size)
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Read),
+            false,
+        );
+        let result = self.0.read::<ROUTED>(addr, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("read"));
+        result
     }
     #[inline(always)]
     pub fn write(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
-        self.0.write::<ROUTED>(addr, value, size)
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Write),
+            false,
+        );
+        let result = self.0.write::<ROUTED>(addr, value, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
+        result
+    }
+    #[inline(always)]
+    pub(crate) fn unordered(&self) -> &Access<ROUTED, 0, M> {
+        Access::new(&self.0)
+    }
+    #[inline(always)]
+    pub(crate) fn helper(
+        &self,
+        direction: Option<crate::interp::ordering::Direction>,
+    ) -> (
+        &Access<ROUTED, 0, M>,
+        crate::interp::ordering::Barrier<ORDER>,
+    ) {
+        (
+            self.unordered(),
+            crate::interp::ordering::Barrier::new(direction, true),
+        )
     }
     #[inline(always)]
     pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {

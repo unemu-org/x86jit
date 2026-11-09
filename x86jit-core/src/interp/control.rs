@@ -7,7 +7,7 @@ use crate::ir::*;
 #[inline(always)]
 pub(crate) fn exec_x87<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     op: &IrOp,
@@ -64,7 +64,7 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_fx_state<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -103,7 +103,7 @@ pub(crate) fn exec_set_df(cpu: &mut CpuState, value: &bool) -> Option<InterpResu
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -145,7 +145,7 @@ pub(crate) fn exec_rep_string<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     op: &StrOp,
@@ -202,9 +202,9 @@ pub(crate) fn exec_sahf(cpu: &mut CpuState) -> Option<InterpResult> {
 /// (16-bit wraps; AX ends at the highest address, DI at the lowest). A store fault traps
 /// out (RIP left on the instruction; a partial-frame SP change is possible mid-push, as
 /// in IVT delivery).
-pub(crate) fn exec_pusha_real<const ROUTED: bool>(
+pub(crate) fn exec_pusha_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     let orig_sp = cpu.gpr[RSP] as u16;
@@ -229,9 +229,9 @@ pub(crate) fn exec_pusha_real<const ROUTED: bool>(
 /// `popa` (§17.6): pop DI, SI, BP, (discard the saved SP word), BX, DX, CX, AX off SS:SP
 /// (16-bit wraps, the inverse order of `pusha`). Each 16-bit register write preserves the
 /// upper GPR bits. A load fault traps out (RIP left on the instruction).
-pub(crate) fn exec_popa_real<const ROUTED: bool>(
+pub(crate) fn exec_popa_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     // Reverse of `pusha`: DI, SI, BP, [SP slot — read and discarded], BX, DX, CX, AX.
@@ -262,9 +262,9 @@ pub(crate) fn exec_popa_real<const ROUTED: bool>(
 /// saved frame pointers (the display) from the enclosing frames; push the new frame
 /// pointer; set BP to it; then subtract `alloc` from SP. All SS-relative with 16-bit
 /// wraps. A store or display-read fault traps out (RIP left on the instruction).
-pub(crate) fn exec_enter_real<const ROUTED: bool>(
+pub(crate) fn exec_enter_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     alloc: u16,
     level: u8,
@@ -339,9 +339,9 @@ pub(crate) fn exec_branch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_call<const ROUTED: bool>(
+pub(crate) fn exec_call<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     target: &Val,
@@ -367,9 +367,9 @@ pub(crate) fn exec_call<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_ret<const ROUTED: bool>(
+pub(crate) fn exec_ret<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     slot: &u8,
     pop_extra: &u16,
@@ -478,9 +478,9 @@ fn ss_addr(cpu: &CpuState, sp: u16) -> u64 {
 /// Push a 16-bit word onto the real-mode stack SS:SP: `SP -= 2` (16-bit wrap), then
 /// store at SS:SP. Returns the trap on a faulting store (RIP left on `cur_addr`), or
 /// `Ok(())` with SP committed. Used by `int`/`pushf`/IVT delivery.
-fn push16<const ROUTED: bool>(
+fn push16<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     word: u16,
 ) -> Result<(), InterpResult> {
@@ -505,9 +505,9 @@ fn push16<const ROUTED: bool>(
 /// Pop a 16-bit word off the real-mode stack SS:SP: load at SS:SP, then `SP += 2`
 /// (16-bit wrap). Returns the trap on a faulting load (RIP left on `cur_addr`, SP
 /// un-advanced), or the popped word with SP committed. Used by `popf`/`iret`.
-fn pop16<const ROUTED: bool>(
+fn pop16<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Result<u16, InterpResult> {
     let sp = cpu.gpr[RSP] as u16;
@@ -523,9 +523,9 @@ fn pop16<const ROUTED: bool>(
 }
 
 /// `pushf` (16-bit, §17.6): push the real-mode FLAGS image (incl. IF) onto SS:SP.
-pub(crate) fn exec_pushf_real<const ROUTED: bool>(
+pub(crate) fn exec_pushf_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     let image = cpu.flags.to_flags16();
@@ -537,9 +537,9 @@ pub(crate) fn exec_pushf_real<const ROUTED: bool>(
 
 /// `popf` (16-bit, §17.6): pop a FLAGS image off SS:SP and restore the modeled flags
 /// incl. IF.
-pub(crate) fn exec_popf_real<const ROUTED: bool>(
+pub(crate) fn exec_popf_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> Option<InterpResult> {
     match pop16(cpu, mem, cur_addr) {
@@ -553,6 +553,7 @@ pub(crate) fn exec_popf_real<const ROUTED: bool>(
 
 /// Deliver a software interrupt / in-guest exception through the real-mode IVT (§17.6).
 ///
+/// SDM Vol 3B §23.1.4: real-address interrupt frames and IVT entries.
 /// Pushes FLAGS(2), CS(2), `saved_ip`(2) onto SS:SP (16-bit wraps), clears IF+TF, then
 /// loads CS:IP from the IVT (new IP = word at physical `vector*4`, new CS = word at
 /// `vector*4 + 2`). The pushes are ordered high-to-low (FLAGS, then CS, then IP) so the
@@ -566,17 +567,52 @@ pub(crate) fn deliver_interrupt(
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
+    consistency: crate::MemConsistency,
+) -> InterpResult {
+    #[cfg(target_arch = "aarch64")]
+    match consistency {
+        crate::MemConsistency::AcqRel => {
+            return deliver_interrupt_ordered::<1>(cpu, mem, cur_addr, vector, saved_ip);
+        }
+        crate::MemConsistency::FullTso => {
+            return deliver_interrupt_ordered::<2>(cpu, mem, cur_addr, vector, saved_ip);
+        }
+        crate::MemConsistency::Fast => {}
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = consistency;
+    deliver_interrupt_ordered::<0>(cpu, mem, cur_addr, vector, saved_ip)
+}
+
+fn deliver_interrupt_ordered<const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    cur_addr: u64,
+    vector: u8,
+    saved_ip: u64,
 ) -> InterpResult {
     if mem.host_fault_recovery() {
-        deliver_interrupt_mode(cpu, Access::<true>::new(mem), cur_addr, vector, saved_ip)
+        deliver_interrupt_mode(
+            cpu,
+            Access::<true, ORDER>::new(mem),
+            cur_addr,
+            vector,
+            saved_ip,
+        )
     } else {
-        deliver_interrupt_mode(cpu, Access::<false>::new(mem), cur_addr, vector, saved_ip)
+        deliver_interrupt_mode(
+            cpu,
+            Access::<false, ORDER>::new(mem),
+            cur_addr,
+            vector,
+            saved_ip,
+        )
     }
 }
 
-fn deliver_interrupt_mode<const ROUTED: bool>(
+pub(crate) fn deliver_interrupt_mode<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     vector: u8,
     saved_ip: u64,
@@ -612,9 +648,9 @@ fn deliver_interrupt_mode<const ROUTED: bool>(
 /// `iret` (16-bit real mode, §17.6): pop IP, CS, FLAGS off SS:SP (16-bit wraps),
 /// restoring IF etc., then resume at CS:IP. The pop order is the inverse of the
 /// `deliver_interrupt` push order. Ends the block.
-pub(crate) fn exec_iret_real<const ROUTED: bool>(
+pub(crate) fn exec_iret_real<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
 ) -> InterpResult {
     let ip = match pop16(cpu, mem, cur_addr) {
@@ -686,9 +722,9 @@ pub(crate) fn exec_far_jump(cpu: &mut CpuState, temps: &[u64], cs: &Val, ip: &Va
 /// wraps, CS at the higher address so `retf` pops IP then CS), then load the target
 /// CS:IP. May trap on a stack store (RIP left on the instruction; a partial-frame SP
 /// change is possible mid-push, as in IVT delivery). Ends the block.
-pub(crate) fn exec_far_call<const ROUTED: bool>(
+pub(crate) fn exec_far_call<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &[u64],
     cur_addr: u64,
     cs: &Val,
@@ -711,9 +747,9 @@ pub(crate) fn exec_far_call<const ROUTED: bool>(
 /// Far `ret` / `retf` (§17.6): pop IP then CS off SS:SP (16-bit wraps), then add
 /// `pop_extra` to SP (`retf imm16` caller cleanup, 16-bit wrap). May trap on a stack
 /// load. Ends the block.
-pub(crate) fn exec_far_ret<const ROUTED: bool>(
+pub(crate) fn exec_far_ret<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     pop_extra: &u16,
 ) -> InterpResult {

@@ -956,7 +956,15 @@ fn run_compiled_decodes_exception_not_panic() {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, CODE);
     // SAFETY: `entry` is a freshly compiled block for `vm`'s memory, run once.
-    match unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) } {
+    match unsafe {
+        run_compiled(
+            entry,
+            &mut cpu.cpu,
+            &vm.mem,
+            CpuMode::Long64,
+            vm.consistency,
+        )
+    } {
         StepResult::Exit(Exit::Exception { vector, .. }) => {
             assert_eq!(vector, 0, "#DE is vector 0")
         }

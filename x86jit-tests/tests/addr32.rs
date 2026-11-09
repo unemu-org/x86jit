@@ -101,7 +101,15 @@ fn diff32_bytes(code: &[u8], init: Init) {
                 _ => panic!("JIT backend must compile the block"),
             };
             // SAFETY: freshly compiled block for `vm`'s memory, run once.
-            unsafe { run_compiled(entry, &mut vcpu.cpu, &vm.mem, CpuMode::Compat32) }
+            unsafe {
+                run_compiled(
+                    entry,
+                    &mut vcpu.cpu,
+                    &vm.mem,
+                    CpuMode::Compat32,
+                    vm.consistency,
+                )
+            }
         } else {
             let mut scratch = Vec::new();
             x86jit_core::interp::interpret_block(

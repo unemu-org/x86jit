@@ -5,9 +5,9 @@ use crate::ir::*;
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) fn exec_v_load<const ROUTED: bool>(
+pub(crate) fn exec_v_load<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -26,9 +26,9 @@ pub(crate) fn exec_v_load<const ROUTED: bool>(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) fn exec_v_store<const ROUTED: bool>(
+pub(crate) fn exec_v_store<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -50,9 +50,9 @@ pub(crate) fn exec_v_mov(cpu: &mut CpuState, dst: &u8, src: &u8) -> Option<Inter
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_load_wide<const ROUTED: bool>(
+pub(crate) fn exec_v_load_wide<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -74,9 +74,9 @@ pub(crate) fn exec_v_load_wide<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_store_wide<const ROUTED: bool>(
+pub(crate) fn exec_v_store_wide<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -135,7 +135,7 @@ pub(crate) fn exec_v_mask_mov(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_mask_load_mem<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -166,7 +166,7 @@ pub(crate) fn exec_v_mask_load_mem<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_mask_store_mem<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     src: &u8,
@@ -186,7 +186,7 @@ pub(crate) fn exec_v_mask_store_mem<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_vecmask_load_mem<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -207,7 +207,7 @@ pub(crate) fn exec_v_vecmask_load_mem<const ROUTED: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_vecmask_store_mem<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     src: &u8,
@@ -278,9 +278,9 @@ pub(crate) fn exec_v_logic_wide(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_logic_wide_m<const ROUTED: bool>(
+pub(crate) fn exec_v_logic_wide_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -318,9 +318,9 @@ pub(crate) fn exec_v_popcnt(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_popcnt_m<const ROUTED: bool>(
+pub(crate) fn exec_v_popcnt_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -352,9 +352,9 @@ pub(crate) fn exec_v_p_mov_extend(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_mov_extend_m<const ROUTED: bool>(
+pub(crate) fn exec_v_p_mov_extend_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -558,9 +558,9 @@ pub(crate) fn exec_v_p_blend_v_x(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_blend_v_m<const ROUTED: bool>(
+pub(crate) fn exec_v_p_blend_v_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -580,9 +580,9 @@ pub(crate) fn exec_v_p_blend_v_m<const ROUTED: bool>(
 /// register before writing `dst` so either aliasing `dst` is safe; a fault on the load traps.
 /// Each 128-bit lane blends independently; `set_vec` clears bits above `bytes`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_blend_v_xm<const ROUTED: bool>(
+pub(crate) fn exec_v_p_blend_v_xm<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -635,9 +635,9 @@ pub(crate) fn exec_v_blend_i(
 /// As [`exec_v_blend_i`] but src2 is an m128/m256 memory operand. `a` is read
 /// before `dst` is written so `a` aliasing `dst` is safe; a fault on the load traps.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_blend_i_m<const ROUTED: bool>(
+pub(crate) fn exec_v_blend_i_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -696,9 +696,9 @@ pub(crate) fn exec_v_p_round<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_round_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_p_round_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -827,9 +827,9 @@ pub(crate) fn exec_v_extract_lane_wide(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_extract_lane_wide_m<const ROUTED: bool>(
+pub(crate) fn exec_v_extract_lane_wide_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     src: &u8,
@@ -902,9 +902,9 @@ pub(crate) fn exec_v_pcmp_str(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pcmp_str_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pcmp_str_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     a: &u8,
@@ -955,9 +955,9 @@ pub(crate) fn exec_v_pcmp_str_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pcmp_str_mask_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pcmp_str_mask_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     a: &u8,
@@ -991,9 +991,9 @@ pub(crate) fn exec_v_insert_ps(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_insert_ps_m<const ROUTED: bool>(
+pub(crate) fn exec_v_insert_ps_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1035,9 +1035,9 @@ pub(crate) fn exec_v_insert_ps3(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_insert_ps_m3<const ROUTED: bool>(
+pub(crate) fn exec_v_insert_ps_m3<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1093,9 +1093,9 @@ pub(crate) fn exec_v_dpps<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_dpps_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_dpps_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1148,9 +1148,9 @@ pub(crate) fn exec_v_dppd<const DEFAULT: bool>(
 
 /// SSE4.1 `dppd xmm, m128, imm8`: source 2 is loaded from memory; a fault traps.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_dppd_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_dppd_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1194,9 +1194,9 @@ pub(crate) fn exec_v_dp3<const DEFAULT: bool>(
 /// As [`exec_v_dp3`] but src2 is a 128-bit memory operand. `a` is read before
 /// `dst` is written so `a` aliasing `dst` is safe; a fault on the load traps.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_dp3_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_dp3_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1262,9 +1262,9 @@ pub(crate) fn exec_v_p_ternlog(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_ternlog_m<const ROUTED: bool>(
+pub(crate) fn exec_v_p_ternlog_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1289,9 +1289,9 @@ pub(crate) fn exec_v_p_ternlog_m<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_logic256_m<const ROUTED: bool>(
+pub(crate) fn exec_v_logic256_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1335,9 +1335,9 @@ pub(crate) fn exec_v_packed_bin256(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_packed_bin256_m<const ROUTED: bool>(
+pub(crate) fn exec_v_packed_bin256_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1368,9 +1368,9 @@ pub(crate) fn exec_v_packed_bin256_m<const ROUTED: bool>(
 /// clears bits 255:128) or 32 (VEX.256). `a` is read before `dst` is written, so `dst == a`
 /// aliasing is safe.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pmadd_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pmadd_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1422,9 +1422,9 @@ pub(crate) fn exec_v_packed_wide(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_packed_wide_m<const ROUTED: bool>(
+pub(crate) fn exec_v_packed_wide_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1513,9 +1513,9 @@ pub(crate) fn exec_v_packed_bin(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_packed_bin_m<const ROUTED: bool>(
+pub(crate) fn exec_v_packed_bin_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1532,9 +1532,9 @@ pub(crate) fn exec_v_packed_bin_m<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_logic_m<const ROUTED: bool>(
+pub(crate) fn exec_v_logic_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1755,7 +1755,7 @@ pub(crate) fn exec_v_fma<const DEFAULT: bool>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_fma_m<const DEFAULT: bool, const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1834,7 +1834,7 @@ pub(crate) fn exec_v_broadcast_lane(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_broadcast_lane_m<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1925,9 +1925,9 @@ pub(crate) fn exec_v_move_half(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_load_half<const ROUTED: bool>(
+pub(crate) fn exec_v_load_half<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -1960,9 +1960,9 @@ pub(crate) fn exec_v_load_half<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_store_half<const ROUTED: bool>(
+pub(crate) fn exec_v_store_half<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
@@ -2074,9 +2074,9 @@ pub(crate) fn exec_v_broadcast(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_broadcast_m<const ROUTED: bool>(
+pub(crate) fn exec_v_broadcast_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2143,9 +2143,9 @@ pub(crate) fn exec_v_p_cmp_to_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_cmp_to_mask_m<const ROUTED: bool>(
+pub(crate) fn exec_v_p_cmp_to_mask_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     k: &u8,
@@ -2193,9 +2193,9 @@ pub(crate) fn exec_v_p_test_to_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_p_test_to_mask_m<const ROUTED: bool>(
+pub(crate) fn exec_v_p_test_to_mask_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     k: &u8,
@@ -2369,7 +2369,7 @@ pub(crate) fn exec_v_pmov_narrow(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_pmov_narrow_mem<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     src: &u8,
@@ -2415,7 +2415,7 @@ pub(crate) fn exec_v_perm_t2(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_perm_t2_m<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2475,7 +2475,7 @@ pub(crate) fn exec_v_perm1(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_perm1_m<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2529,9 +2529,9 @@ pub(crate) fn exec_v_insert128(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_insert128_m<const ROUTED: bool>(
+pub(crate) fn exec_v_insert128_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2610,9 +2610,9 @@ pub(crate) fn exec_v_pshufb_wide(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pshufb256_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pshufb256_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2865,9 +2865,9 @@ pub(crate) fn exec_v_pshufb(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pshufb_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pshufb_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2909,9 +2909,9 @@ pub(crate) fn exec_v_aes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_aes_m<const ROUTED: bool>(
+pub(crate) fn exec_v_aes_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2933,9 +2933,9 @@ pub(crate) fn exec_v_aes_imc(cpu: &mut CpuState, dst: &u8, src: &u8) -> Option<I
     None
 }
 
-pub(crate) fn exec_v_aes_imc_m<const ROUTED: bool>(
+pub(crate) fn exec_v_aes_imc_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2960,9 +2960,9 @@ pub(crate) fn exec_v_aes_keygen(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_aes_keygen_m<const ROUTED: bool>(
+pub(crate) fn exec_v_aes_keygen_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -2997,9 +2997,9 @@ pub(crate) fn exec_v_sha(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_sha_m<const ROUTED: bool>(
+pub(crate) fn exec_v_sha_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3038,7 +3038,7 @@ pub(crate) fn exec_v_gfni(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_v_gf2p8_m<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3064,9 +3064,9 @@ pub(crate) fn exec_v_gf2p8_m<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_gfni_m<const ROUTED: bool>(
+pub(crate) fn exec_v_gfni_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3100,9 +3100,9 @@ pub(crate) fn exec_v_pclmul(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_pclmul_m<const ROUTED: bool>(
+pub(crate) fn exec_v_pclmul_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3173,9 +3173,9 @@ pub(crate) fn exec_v_psign(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_psign_m<const ROUTED: bool>(
+pub(crate) fn exec_v_psign_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3233,9 +3233,9 @@ pub(crate) fn exec_v_shufps(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_shufps_m<const ROUTED: bool>(
+pub(crate) fn exec_v_shufps_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3306,9 +3306,9 @@ pub(crate) fn exec_v_unpack_low(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_unpack_low_m<const ROUTED: bool>(
+pub(crate) fn exec_v_unpack_low_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3412,9 +3412,9 @@ pub(crate) fn exec_v_float_bin<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_bin_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_bin_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3467,9 +3467,9 @@ pub(crate) fn exec_v_float_bin256<const DEFAULT: bool>(
 /// 256-bit `v{add,…}{ps,pd}` with a 32-byte memory second source. The halves load
 /// independently so a fault reports the exact faulting 16-byte access.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_bin256_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_bin256_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3519,9 +3519,9 @@ pub(crate) fn exec_v_float_unary256<const DEFAULT: bool>(
 
 /// 256-bit `vsqrt{ps,pd}` with a 32-byte memory source.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_unary256_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_unary256_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3566,9 +3566,9 @@ pub(crate) fn exec_v_packed_cvt256<const DEFAULT: bool>(
 
 /// 256-bit lane-preserving `vcvt{dq2ps,ps2dq,tps2dq}` with a 32-byte memory source.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_packed_cvt256_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_packed_cvt256_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3615,9 +3615,9 @@ pub(crate) fn exec_v_shufps256(
 
 /// 256-bit `vshuf{ps,pd}` with a 32-byte memory src2.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_shufps256_m<const ROUTED: bool>(
+pub(crate) fn exec_v_shufps256_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3662,9 +3662,9 @@ pub(crate) fn exec_v_unpack256(
 
 /// 256-bit `vunpck{l,h}p{s,d}` with a 32-byte memory src2.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_unpack256_m<const ROUTED: bool>(
+pub(crate) fn exec_v_unpack256_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3705,9 +3705,9 @@ pub(crate) fn exec_v_h_float<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_h_float_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_h_float_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3746,9 +3746,9 @@ pub(crate) fn exec_v_h_int(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_h_int_m<const ROUTED: bool>(
+pub(crate) fn exec_v_h_int_m<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3809,9 +3809,9 @@ pub(crate) fn exec_v_float_cmp_mask<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_cmp_mask_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_cmp_mask_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -3878,9 +3878,13 @@ pub(crate) fn exec_v_float_cmp_mask256<const DEFAULT: bool>(
 /// 256-bit `vcmp{ps,pd}` with a 32-byte memory second source. The two halves load
 /// independently so a fault reports the exact faulting 16-byte access.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_cmp_mask256_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_cmp_mask256_m<
+    const DEFAULT: bool,
+    const ROUTED: bool,
+    const ORDER: u8,
+>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,
@@ -4260,9 +4264,9 @@ pub(crate) fn exec_v_float_unary<const DEFAULT: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_v_float_unary_m<const DEFAULT: bool, const ROUTED: bool>(
+pub(crate) fn exec_v_float_unary_m<const DEFAULT: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &u8,

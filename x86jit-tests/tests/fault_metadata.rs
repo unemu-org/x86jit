@@ -781,8 +781,15 @@ fn generic_ir_does_not_prove_a_decode_cause() {
             panic!("must compile")
         };
         // SAFETY: entry is live in jit and was compiled for this CPU/context ABI.
-        let result =
-            unsafe { x86jit_core::jit_abi::run_compiled(entry, &mut cpu, &mem, CpuMode::Long64) };
+        let result = unsafe {
+            x86jit_core::jit_abi::run_compiled(
+                entry,
+                &mut cpu,
+                &mem,
+                CpuMode::Long64,
+                x86jit_core::MemConsistency::Fast,
+            )
+        };
         let x86jit_core::StepResult::Exit(exit) = result else {
             panic!("expected exception")
         };
@@ -836,6 +843,7 @@ fn layout_and_legacy_abi_validity() {
             &mut cpu,
             &mem,
             CpuMode::Long64,
+            x86jit_core::MemConsistency::Fast,
         )
     };
     let x86jit_core::StepResult::Exit(exit) = result else {

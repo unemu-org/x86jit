@@ -10,9 +10,9 @@ pub enum Val {
     Imm(u64),
 }
 
-/// JIT inline stores use the Vm's `MemConsistency` policy at codegen time.
-/// Helper accesses bypass the tier (xj-0w3.7); the interpreter ignores it for
-/// ordinary accesses (xj-0w3.6).
+/// Guest accesses use the Vm's `MemConsistency` policy (§8.2.3): at codegen
+/// time for JIT inline accesses and helper calls, and at execution time for
+/// interpreter accesses and helpers on aarch64.
 /// Explicit synchronization is carried by `Fence`, `AtomicRmw` and `AtomicCas`.
 #[derive(Copy, Clone, Debug)]
 pub enum MemOrder {

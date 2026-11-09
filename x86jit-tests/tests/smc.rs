@@ -231,8 +231,15 @@ fn smc_47bit_concurrent_marks_reach_compiled_store_gate() {
                     cpu.set_reg(Reg::Rip, entry_addr);
                     // SAFETY: the entry remains owned by vm's backend; its backing
                     // and context match the freshly materialized block.
-                    let result =
-                        unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) };
+                    let result = unsafe {
+                        run_compiled(
+                            entry,
+                            &mut cpu.cpu,
+                            &vm.mem,
+                            CpuMode::Long64,
+                            vm.consistency,
+                        )
+                    };
                     assert!(matches!(result, StepResult::Exit(Exit::Hlt)));
                     assert_eq!(vm.mem.take_dirty_code(), vec![addr >> 12]);
                 }
@@ -274,7 +281,15 @@ fn smc_47bit_store_outside_watermark_granule_skips_helper() {
         cpu.set_reg(Reg::Rdi, addr);
         cpu.set_reg(Reg::Rip, entry_addr);
         // SAFETY: the entry's owning backend, backing and context remain live.
-        let result = unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) };
+        let result = unsafe {
+            run_compiled(
+                entry,
+                &mut cpu.cpu,
+                &vm.mem,
+                CpuMode::Long64,
+                vm.consistency,
+            )
+        };
         assert!(matches!(result, StepResult::Exit(Exit::Hlt)));
         let count: u64 = vm
             .backend
@@ -1408,7 +1423,15 @@ fn declared_alias_concurrent_registration_reaches_next_compiled_store() {
         while !published.load(Ordering::Acquire) {
             // SAFETY: vm owns the compiled entry and its matching memory/context.
             assert!(matches!(
-                unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+                unsafe {
+                    run_compiled(
+                        entry,
+                        &mut cpu.cpu,
+                        &vm.mem,
+                        CpuMode::Long64,
+                        vm.consistency,
+                    )
+                },
                 StepResult::Exit(Exit::Hlt)
             ));
         }
@@ -1420,7 +1443,15 @@ fn declared_alias_concurrent_registration_reaches_next_compiled_store() {
         cpu.set_reg(Reg::Rdi, 0x18000);
         // SAFETY: vm still owns the entry and backing; registration has completed.
         assert!(matches!(
-            unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+            unsafe {
+                run_compiled(
+                    entry,
+                    &mut cpu.cpu,
+                    &vm.mem,
+                    CpuMode::Long64,
+                    vm.consistency,
+                )
+            },
             StepResult::Exit(Exit::Hlt)
         ));
         assert_eq!(vm.mem.take_dirty_code(), vec![4]);
@@ -1521,7 +1552,15 @@ fn alias_registration_widens_precompiled_store_gate(early: bool) {
         cpu.set_reg(Reg::Rax, 2);
         // SAFETY: vm owns the compiled entry and its matching memory/context.
         assert!(matches!(
-            unsafe { run_compiled(entry, &mut cpu.cpu, &vm.mem, CpuMode::Long64) },
+            unsafe {
+                run_compiled(
+                    entry,
+                    &mut cpu.cpu,
+                    &vm.mem,
+                    CpuMode::Long64,
+                    vm.consistency,
+                )
+            },
             StepResult::Exit(Exit::Hlt)
         ));
         assert!(vm.mem.has_dirty_code());

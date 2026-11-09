@@ -1101,6 +1101,7 @@ fn standalone_default_rounding(raw_call: bool) {
                 &mut cpu,
                 &vm.mem,
                 x86jit_core::CpuMode::Long64,
+                x86jit_core::MemConsistency::Fast,
             )
         }
     };
@@ -1152,6 +1153,7 @@ fn mxcsr_modes_standalone_mmio_replay_uses_default_fp() {
             &mut cpu.cpu,
             &vm.mem,
             x86jit_core::CpuMode::Long64,
+            vm.consistency,
         )
     };
     drop(restore);

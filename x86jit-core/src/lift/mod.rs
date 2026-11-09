@@ -2227,8 +2227,8 @@ fn lift_insn_inner(
 
         // SDM Vol 3A §11.2.2, §11.2.5: MOVNTI stores can need SFENCE.
         // We lower MOVNTI to an ordinary store. SFENCE still emits a full JIT
-        // barrier in every aarch64 tier, since preceding helper stores have no
-        // tier barrier (xj-0w3.7); it is a no-op for ordinary stores on x86.
+        // barrier in every aarch64 tier to enforce explicit store ordering
+        // independently of the tier; it is a no-op for ordinary stores on x86.
         // Host non-temporal lowering would require a real SFENCE on x86 too.
         Mov | Movnti => {
             let src = lower_read(insn, 1, ops, tg)?;
@@ -2470,15 +2470,14 @@ fn lift_insn_inner(
         }
         // SDM Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE; Vol 3A §11.2.2:
         // MFENCE is a full host/compiler barrier in every tier and on every host.
-        // LFENCE/SFENCE emit DMB ISH in EVERY aarch64 JIT tier: string ops,
-        // masked stores, x87, FXSAVE and *_mem helpers bypass gload/gstore and
-        // carry no tier barriers (the unfenced helper gap is xj-0w3.7).
+        // LFENCE/SFENCE conservatively emit a full DMB ISH in every aarch64
+        // JIT tier to enforce explicit ordering independently of the tier.
         // On x86, ordinary loads/stores already have the needed ordering, so
         // LFENCE/SFENCE are JIT no-ops. Non-temporal guest stores currently use
         // ordinary stores; host non-temporal stores would need SFENCE on x86 too.
-        // The interpreter uses SeqCst/Acquire/Release; its ordinary accesses
-        // ignore MemConsistency in every tier (xj-0w3.6). Guest instructions
-        // retire in order, including LFENCE's instruction-stream ordering.
+        // The interpreter uses SeqCst/Acquire/Release for explicit fences;
+        // ordinary accesses and helpers honour MemConsistency on aarch64. Guest
+        // instructions retire in order, including LFENCE's instruction-stream ordering.
         Mfence | Lfence | Sfence => {
             let kind = match insn.mnemonic() {
                 Mfence => FenceKind::Full,
@@ -2543,8 +2542,8 @@ fn lift_insn_inner(
         // architecturally it loads the same 16 bytes (SDM Vol 2A, LDDQU).
         // SDM Vol 3A §11.2.2, §11.2.5: MOVNTDQ/MOVNTPS/MOVNTPD stores
         // lower to ordinary stores. SFENCE emits DMB ISH in every aarch64 tier
-        // to cover helper stores too (xj-0w3.7); host non-temporal lowering
-        // would require a real SFENCE on x86 as well. MOVNTDQA is a load
+        // for explicit store ordering independently of the tier. Host non-temporal
+        // lowering would require a real SFENCE on x86 as well. MOVNTDQA is a load
         // (SDM Vol 2B §4.3 MOVNTDQA), not one of these stores.
         Movdqa | Movdqu | Lddqu | Movaps | Movups | Movapd | Movupd | Movntdq | Movntps
         | Movntpd | Movntdqa => lift_vmov(insn, ops, tg, 16).map(|_| false),
@@ -2852,8 +2851,8 @@ fn lift_insn_inner(
         // aligned `vmovdqa`/`vmovaps` path. libc's memmove emits `vmovntdq [rdi], xmm0`.
         // SDM Vol 2A, LDDQU: VLDDQU loads unaligned m128/m256 like VMOVDQU.
         // The MOVNTDQ/MOVNTPS/MOVNTPD store rule also applies to their VEX
-        // forms: ordinary stores today, SFENCE in every aarch64 tier because
-        // helpers lack tier barriers (xj-0w3.7), and a real SFENCE on x86 if
+        // forms: ordinary stores today, a conservative full SFENCE barrier in
+        // every aarch64 tier for explicit ordering, and a real SFENCE on x86 if
         // host non-temporal stores are introduced (SDM Vol 3A §11.2.2, §11.2.5).
         // VMOVNTDQA is a load (SDM Vol 2B §4.3 MOVNTDQA).
         Vmovdqa | Vmovdqu | Vlddqu | Vmovaps | Vmovups | Vmovntdq | Vmovntps | Vmovntpd

@@ -481,15 +481,17 @@ pub(crate) fn exec_get_cond(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_load<const ROUTED: bool>(
+pub(crate) fn exec_load<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     dst: &Temp,
     addr: &Val,
     size: &u8,
 ) -> Option<InterpResult> {
+    let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Read), false);
+    let mem = mem.unordered();
     let a = read_val(*addr, &*temps);
     // Resume after an MMIO read (§5.2): the block re-executes from the
     // faulting instruction, so this first load consumes the value the
@@ -506,15 +508,17 @@ pub(crate) fn exec_load<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_store<const ROUTED: bool>(
+pub(crate) fn exec_store<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     addr: &Val,
     src: &Val,
     size: &u8,
 ) -> Option<InterpResult> {
+    let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+    let mem = mem.unordered();
     let a = read_val(*addr, &*temps);
     let v = read_val(*src, &*temps);
     if let Err(t) = mem.write(a, v, *size) {
@@ -542,9 +546,9 @@ pub(crate) fn exec_store<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
+pub(crate) fn exec_atomic_rmw<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,
@@ -563,9 +567,9 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_atomic_cas<const ROUTED: bool>(
+pub(crate) fn exec_atomic_cas<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
     old: &Temp,

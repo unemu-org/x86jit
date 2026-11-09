@@ -4535,7 +4535,15 @@ mod tests {
     fn run_rax(entry: CompiledPtr, mem: &Memory) -> u64 {
         let mut cpu = CpuState::new();
         cpu.rip = ENTRY;
-        let step = unsafe { run_compiled(entry, &mut cpu, mem, CpuMode::Long64) };
+        let step = unsafe {
+            run_compiled(
+                entry,
+                &mut cpu,
+                mem,
+                CpuMode::Long64,
+                x86jit_core::MemConsistency::Fast,
+            )
+        };
         assert!(matches!(step, StepResult::Continue), "block continues");
         cpu.gpr[0]
     }

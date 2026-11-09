@@ -199,7 +199,7 @@ pub struct VmConfig {
     pub consistency: MemConsistency,
 }
 
-/// How faithfully generated code reproduces x86-TSO ordering on a weak host.
+/// How faithfully guest accesses reproduce x86-TSO ordering on a weak host.
 /// Escalation ladder: run Fast; if a multithreaded workload misbehaves, bump one
 /// tier. Distinct from `MemoryModel` (address-space layout) — this is ORDERING.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -209,10 +209,11 @@ pub enum MemConsistency {
     /// whose threads don't communicate via shared structures.
     Fast,
     /// JIT inline stores: DMB ISH; STR. Inline loads: LDR; DMB ISH.
-    /// Helpers bypass the tier (xj-0w3.7); the interpreter ignores it (xj-0w3.6).
+    /// Interpreter accesses and guest-memory helpers use matching barriers (§8.2.3).
     AcqRel,
     /// JIT inline stores: STR; DMB ISH. Inline loads: LDR; DMB ISH.
-    /// No leading store fence. Helpers and interpretation bypass the tier.
+    /// No leading store fence. Interpreter accesses match; read helpers are fenced
+    /// before and after the call (§8.2.3).
     FullTso,
 }
 
@@ -762,12 +763,21 @@ pub trait Backend {
 /// Execution is uniform — the dispatcher calls it on a CachedBlock regardless of the backend.
 /// NOTE: `mem` is `&Memory`, NOT `&mut Memory` — guest RAM uses interior mutability
 /// (see the pitfall below). Stores go through `&self` methods.
-fn execute(block: &CachedBlock, cpu: &mut CpuState, mem: &Memory) -> StepResult {
+fn execute(
+    block: &CachedBlock,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    mode: CpuMode,
+    consistency: MemConsistency,
+) -> StepResult {
     match block {
-        CachedBlock::Interpreted(ir) => interpret_block(ir, cpu, mem),
+        CachedBlock::Interpreted(ir) => {
+            let mut info = RetireInfo { consistency, ..Default::default() };
+            interpret_block(ir, cpu, mem, &mut Vec::new(), &mut info)
+        },
         CachedBlock::Compiled { entry, .. } => {
             // compiled block ABI — see 8.2.
-            unsafe { run_compiled(*entry, cpu, mem) }
+            unsafe { run_compiled(*entry, cpu, mem, mode, consistency) }
         }
     }
 }
@@ -954,7 +964,7 @@ IrOp::ReadReg { dst, reg } => {
 >
 > Corollary: in `Flat`, guest address `0` is a valid buffer offset, so a guest null-deref does **not** fault unless a per-page permission bit says "unmapped". If you want faithful `#GP`/`#PF` on null, you need that bitmap — the "one addition" hot path silently assumed checks that must actually exist.
 
-**Memory-consistency tiers (`MemConsistency`, §4.1):** these policies govern **JIT inline** guest loads/stores on aarch64 hosts:
+**Memory-consistency tiers (`MemConsistency`, §4.1):** these policies govern guest loads/stores on aarch64 hosts. JIT inline lowering:
 
 | Tier | Inline store | Inline load |
 |------|--------------|-------------|
@@ -964,9 +974,9 @@ IrOp::ReadReg { dst, reg } => {
 
 `FullTso` has no leading store fence. x86 hosts use plain loads/stores in every tier. A leaner STLR/LDAPR AcqRel mapping is a future optimization, not the current lowering.
 
-**Coverage limits:** string operations, masked stores, x87, FXSAVE and other guest-memory helpers do not pass through `gload`/`gstore` and receive no tier barriers (xj-0w3.7). The interpreter ignores `MemConsistency` and leaves ordinary accesses Relaxed in every tier, including cold blocks before tier-up and fallback execution (xj-0w3.6). No tier currently guarantees interpreter TSO on weak hosts. The table describes inline compiled accesses, not complete guest TSO.
+**Coverage:** JIT guest-memory helpers (string operations, masked stores, x87, FXSAVE and other memory helpers) receive tier barriers through `call_memory_helper`. On aarch64, `AcqRel` fences before write calls and after read calls; `FullTso` fences before read calls and after all memory calls; `Fast` adds none. Post-call barriers precede fault/exit handling, including partial progress. The interpreter honours `MemConsistency` for ordinary accesses and helpers with matching SeqCst fences on aarch64, including cold blocks, fallback execution and MMIO replay; x86-64 execution adds no tier barriers. These boundaries preserve ordering across helper calls (SDM Vol 3A §11.2.2, §11.2.4.1). The locked-op limitation below remains.
 
-**Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, because helper-executed accesses lack tier barriers, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
+**Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, using a conservative full fence to enforce explicit ordering independently of the ordinary-access tier, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
 
 **Locked operations:** atomicity is implemented on both backends in every tier. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.115.1 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
 
@@ -1111,7 +1121,7 @@ stores outside tagged pages.
 - **Per-vcpu:** `CpuState` (registers, flags, RIP), its own `run()` loop, its own host thread.
 - **Shared (behind an `Arc`):** guest memory and the translation cache.
 - **Cache:** translation happens once per block (whoever hits it first); synchronization via `RwLock` or a lock-free structure. Consider a per-vcpu cache for reading + a shared one for writing.
-- **Memory model:** `MemConsistency` orders JIT inline accesses (§4.1, §8.2.3). Interpreter ordinary accesses remain Relaxed (xj-0w3.6), helper accesses bypass tier barriers (xj-0w3.7), and aarch64 LL/SC locked-op ordering is incomplete. Explicit fences apply on both backends.
+- **Memory model:** `MemConsistency` orders JIT inline accesses, guest-memory helper calls and interpreter accesses on aarch64 (§4.1, §8.2.3). aarch64 LL/SC locked-op ordering remains incomplete. Explicit fences apply on both backends.
 
 ---
 
@@ -1250,7 +1260,7 @@ One place gathering all the mines scattered across the document. Review it befor
 
 **Multithreading and memory (hits in M7, but prepare in M4):**
 - **`CompiledPtr` must be `Send + Sync`** manually, otherwise the cache won't go behind an `Arc` between threads. Make this type in M4, not in M7 (§9.1).
-- **The TSO memory model** — `MemConsistency` tiers in codegen (`Fast`/`AcqRel`/`FullTso`, §8.2.3). Without barriers, multithreaded programs produce nondeterministic bugs that aren't there single-threaded — the worst kind to chase. Escalate the tier before debugging "impossible" races. Locked ops remain atomic, with the aarch64 LL/SC ordering limitation in §8.2.3; explicit fences apply in every tier. The interpreter ignores ordinary-access tiers (xj-0w3.6), and helper accesses bypass them (xj-0w3.7). Switching tiers flushes the translation cache (barriers are baked into blocks).
+- **The TSO memory model** — `MemConsistency` tiers in codegen and interpretation (`Fast`/`AcqRel`/`FullTso`, §8.2.3). Without barriers, multithreaded programs produce nondeterministic bugs that aren't there single-threaded — the worst kind to chase. Escalate the tier before debugging "impossible" races. Locked ops remain atomic, with the aarch64 LL/SC ordering limitation in §8.2.3; explicit fences apply in every tier. Interpreter accesses and JIT guest-memory helper calls honour the tier on aarch64. Switching tiers flushes the translation cache (barriers are baked into blocks).
 - **Ownership of code memory** — the arena lives with the `Vm`, `CompiledPtr` is a borrow; don't free it while the cache points to it (§9.1).
 
 **Guest memory model (hits in M0, then again at large addresses):**

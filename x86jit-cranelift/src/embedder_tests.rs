@@ -215,7 +215,13 @@ fn embedder_flag_elision_options_preserve_execution() {
         // SAFETY: entry uses the compiled-block ABI and both state and memory
         // remain live throughout execution.
         let exit = unsafe {
-            x86jit_core::jit_abi::run_compiled(entry, &mut actual, &mem, CpuMode::Long64)
+            x86jit_core::jit_abi::run_compiled(
+                entry,
+                &mut actual,
+                &mem,
+                CpuMode::Long64,
+                x86jit_core::MemConsistency::Fast,
+            )
         };
         assert!(matches!(
             exit,
@@ -307,7 +313,15 @@ fn embedder_baseline_swizzle_libcall_obeys_vector_abi() {
             }
         }));
         // SAFETY: native-ISA entry with live CpuState and Memory, compiled-block ABI.
-        unsafe { x86jit_core::jit_abi::run_compiled(entry, &mut cpu, &mem, CpuMode::Long64) };
+        unsafe {
+            x86jit_core::jit_abi::run_compiled(
+                entry,
+                &mut cpu,
+                &mem,
+                CpuMode::Long64,
+                x86jit_core::MemConsistency::Fast,
+            )
+        };
         assert_eq!(cpu.xmm[0], expected);
     }
 }

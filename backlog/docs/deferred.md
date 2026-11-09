@@ -90,7 +90,7 @@ translation ran). What is still deferred:
 
 - **Implemented:** shared-memory vcpus, translation-cache synchronization, explicit fences and JIT inline-access tiers (§8.2.3). AcqRel currently uses DMB ISH before stores and after loads; FullTso uses DMB ISH after each load and store, with no leading store fence.
 - **Why deferred:** STLR/LDAPR lowering, weaker load/store-only barriers and adjacent-fence merging need separate measurements and correctness evidence.
-- **Limits:** the interpreter leaves ordinary accesses Relaxed in every tier (xj-0w3.6), helper accesses bypass tier barriers (xj-0w3.7), and aarch64 LL/SC locked-op ordering remains incomplete. These are correctness gaps, not deliberate architectural deviations.
+- **Limits:** aarch64 LL/SC locked-op ordering remains incomplete. This is a correctness gap, not a deliberate architectural deviation. Interpreter accesses and JIT guest-memory helpers now honour the tier (§8.2.3).
 
 ### SIMD (SSE/AVX)
 

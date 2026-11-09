@@ -79,7 +79,7 @@ fn run(code: &[u8], init: &Init, mode: CpuMode, jit: bool) -> Outcome {
             _ => panic!("JIT backend must compile the block"),
         };
         // SAFETY: freshly compiled block for `vm`'s memory, run once.
-        unsafe { run_compiled(entry, &mut vcpu.cpu, &vm.mem, mode) }
+        unsafe { run_compiled(entry, &mut vcpu.cpu, &vm.mem, mode, vm.consistency) }
     } else {
         let mut scratch = Vec::new();
         x86jit_core::interp::interpret_block(

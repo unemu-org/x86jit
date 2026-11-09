@@ -7,6 +7,7 @@
 //! can map/handle and retry; after `syscall`/`hlt` RIP is PAST the instruction.
 
 mod mmx;
+pub(crate) mod ordering;
 mod result;
 use result::InterpExit;
 pub mod softfloat;
@@ -27,12 +28,14 @@ const RSP: usize = 4;
 /// Per-block interpreter bookkeeping the dispatcher needs but that must NOT live on
 /// `CpuState` (ABI-frozen, §17.6 sub-seam c). Filled by [`interpret_block`]/[`step_one`]
 /// and consumed by [`crate::vm::Vcpu::run`] for the retired-instruction counter and the
-/// STI-shadow interrupt-injection gate. Callers that don't care pass `&mut
-/// RetireInfo::default()`.
+/// STI-shadow interrupt-injection gate. Callers must set `consistency` to the
+/// execution tier; other inputs may use `RetireInfo::default()`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct RetireInfo<'a> {
     /// In: optional interpreter trace sink. Never enabled from the environment.
     pub trace: Option<&'a crate::lockstep::Trace>,
+    /// Guest ordering tier; selected once before entering the op walk.
+    pub consistency: crate::MemConsistency,
     /// In: optional per-vcpu notification word, polled by long string operations.
     pub exit_request: Option<&'a std::sync::atomic::AtomicU64>,
     /// Number of guest instructions that **retired** (completed) during this call. A
@@ -220,11 +223,46 @@ pub(crate) fn interpret_block_fp<const ROUTED: bool, const DEFAULT: bool>(
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> BlockResult {
-    let mem = Access::<ROUTED>::new(mem);
+    #[cfg(target_arch = "aarch64")]
+    if info.consistency != crate::MemConsistency::Fast {
+        return interpret_block_nonfast::<ROUTED, DEFAULT>(ir, cpu, mem, scratch, info);
+    }
+    interpret_block_ordered::<ROUTED, DEFAULT, 0>(ir, cpu, mem, scratch, info)
+}
+
+// Keep ordered-tier setup out of the Fast block wrapper.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn interpret_block_nonfast<const ROUTED: bool, const DEFAULT: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    scratch: &mut Vec<u64>,
+    info: &mut RetireInfo,
+) -> BlockResult {
+    match info.consistency {
+        crate::MemConsistency::AcqRel => {
+            interpret_block_ordered::<ROUTED, DEFAULT, 1>(ir, cpu, mem, scratch, info)
+        }
+        crate::MemConsistency::FullTso => {
+            interpret_block_ordered::<ROUTED, DEFAULT, 2>(ir, cpu, mem, scratch, info)
+        }
+        crate::MemConsistency::Fast => unreachable!(),
+    }
+}
+
+fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    scratch: &mut Vec<u64>,
+    info: &mut RetireInfo,
+) -> BlockResult {
+    let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT>(ir, cpu, mem, scratch, info)
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER>(ir, cpu, mem, scratch, info)
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT>(ir, cpu, mem, scratch, info)
+        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER>(ir, cpu, mem, scratch, info)
     }
 }
 
@@ -237,10 +275,15 @@ fn interp_mxcsr<const DEFAULT: bool>(cpu: &CpuState) -> u32 {
     }
 }
 
-fn interpret_block_inner<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool>(
+fn interpret_block_inner<
+    const RETRY: bool,
+    const ROUTED: bool,
+    const DEFAULT: bool,
+    const ORDER: u8,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
-    mem: &Access<ROUTED>,
+    mem: &Access<ROUTED, ORDER>,
     scratch: &mut Vec<u64>,
     info: &mut RetireInfo,
 ) -> BlockResult {
@@ -268,7 +311,7 @@ fn interpret_block_inner<const RETRY: bool, const ROUTED: bool, const DEFAULT: b
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
     // `sti_shadow` are threaded by `&mut` and read afterwards.
-    let result = walk_ops::<RETRY, ROUTED, DEFAULT, false>(
+    let result = walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER>(
         ir,
         cpu,
         mem,
@@ -370,10 +413,16 @@ pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters (`cur_addr`/`retired`/`started`/`sti_shadow`).
 #[allow(clippy::too_many_arguments)]
-fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CHILD: bool>(
+fn walk_ops<
+    const RETRY: bool,
+    const ROUTED: bool,
+    const DEFAULT: bool,
+    const CHILD: bool,
+    const ORDER: u8,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: &mut u64,
     retired: &mut u64,
@@ -794,6 +843,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
                 let addr = read_val(*addr, temps);
                 if let Some(exit) = cmpxchg_pair_mode(cpu, mem, *cur_addr, addr, *size, *len) {
                     return walk_classify_access(InterpResult::exit(exit), *cur_addr, addr, *fault);
@@ -843,10 +893,20 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                     return r.into();
                 }
             }
-            IrOp::X87 { fault, addr, .. } => {
+            IrOp::X87 {
+                fault, addr, kind, ..
+            } => {
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
+                let (mem, _ordering) =
+                    mem.helper(if crate::x87::mem_write_bytes(*kind).is_some() {
+                        Some(ordering::Direction::Write)
+                    } else if crate::x87::mem_operand_bytes(*kind) != 0 {
+                        Some(ordering::Direction::Read)
+                    } else {
+                        None
+                    });
                 if let Some(r) = exec_x87(cpu, mem, temps, *cur_addr, op) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
@@ -880,6 +940,11 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 if CHILD {
                     unreachable!("XSAVE family refused before child execution");
                 }
+                let (mem, _ordering) = mem.helper(Some(match kind {
+                    crate::x87::xstate::XStateKind::Restore => ordering::Direction::Read,
+                    crate::x87::xstate::XStateKind::SaveCompact => ordering::Direction::Write,
+                    _ => ordering::Direction::ReadWrite,
+                }));
                 let a = read_val(*addr, temps);
                 if let Err(error) =
                     crate::x87::xstate::exec_xstate(cpu, mem.0.normal(), a, *kind, *wide, *fault)
@@ -902,6 +967,11 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
+                let (mem, _ordering) = mem.helper(Some(if *restore {
+                    ordering::Direction::Read
+                } else {
+                    ordering::Direction::Write
+                }));
                 if let Some(r) = exec_fx_state(cpu, mem, temps, *cur_addr, addr, restore, wide) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
@@ -1023,6 +1093,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 zeroing,
                 bytes,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_mask_load_mem(
                     cpu, mem, temps, *cur_addr, dst, addr, k, elem, zeroing, bytes, broadcast,
                 ) {
@@ -1044,6 +1115,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 elem,
                 bytes,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) =
                     exec_v_mask_store_mem(cpu, mem, temps, *cur_addr, src, addr, k, elem, bytes)
                 {
@@ -1070,6 +1142,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 scale,
                 addr32,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some((f, ea)) = gather_run(
                     cpu,
                     mem,
@@ -1101,6 +1174,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 elem,
                 bytes,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_vecmask_load_mem(
                     cpu, mem, temps, *cur_addr, dst, addr, mask, elem, bytes,
                 ) {
@@ -1122,6 +1196,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 elem,
                 bytes,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) = exec_v_vecmask_store_mem(
                     cpu, mem, temps, *cur_addr, src, addr, mask, elem, bytes,
                 ) {
@@ -1392,7 +1467,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 scalar,
                 bytes,
             } => {
-                if let Some(r) = exec_v_p_round_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_p_round_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, addr, prec, mode, scalar, bytes,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -1559,7 +1634,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 imm,
                 bytes,
             } => {
-                if let Some(r) = exec_v_dpps_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_dpps_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, imm, bytes,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -1576,9 +1651,9 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 addr,
                 imm,
             } => {
-                if let Some(r) =
-                    exec_v_dppd_m::<DEFAULT, ROUTED>(cpu, mem, temps, *cur_addr, dst, addr, imm)
-                {
+                if let Some(r) = exec_v_dppd_m::<DEFAULT, ROUTED, ORDER>(
+                    cpu, mem, temps, *cur_addr, dst, addr, imm,
+                ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
                 }
             }
@@ -1601,7 +1676,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 imm,
                 prec,
             } => {
-                if let Some(r) = exec_v_dp3_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_dp3_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, imm, prec,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -1855,6 +1930,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 zeroing,
                 bytes,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_gf2p8_m(
                     cpu, mem, temps, *cur_addr, dst, a, addr, imm, mode, k, zeroing, bytes,
                 ) {
@@ -2084,6 +2160,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 writemask,
                 zeroing,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_fma_m::<DEFAULT, ROUTED>(
                     cpu, mem, temps, *cur_addr, dst, x, y, z, addr, mem_role, prec, scalar,
                     neg_prod, neg_add, bytes, alt_sign, writemask, zeroing,
@@ -2272,6 +2349,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 writemask,
                 zeroing,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_broadcast_lane_m(
                     cpu, mem, temps, *cur_addr, dst, addr, chunk, elem, dst_width, writemask,
                     zeroing,
@@ -2436,6 +2514,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 to,
                 src_width,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) = exec_v_pmov_narrow_mem(
                     cpu, mem, temps, *cur_addr, src, addr, from, to, src_width,
                 ) {
@@ -2469,6 +2548,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 bytes,
                 imode,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_perm_t2_m(
                     cpu, mem, temps, *cur_addr, dst, idx, addr, elem, writemask, zeroing, bytes,
                     imode,
@@ -2499,6 +2579,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 writemask,
                 zeroing,
             } => {
+                let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_perm1_m(
                     cpu, mem, temps, *cur_addr, dst, idx, addr, elem, bytes, writemask, zeroing,
                 ) {
@@ -2891,6 +2972,11 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                     }
                     continue;
                 }
+                let (mem, _ordering) = mem.helper(Some(match op {
+                    StrOp::Movs => ordering::Direction::ReadWrite,
+                    StrOp::Stos => ordering::Direction::Write,
+                    StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
+                }));
                 if let Some(r) = exec_rep_string(
                     cpu,
                     mem,
@@ -2947,7 +3033,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 prec,
                 scalar,
             } => {
-                if let Some(r) = exec_v_float_bin_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_bin_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, addr, op, prec, scalar,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -2974,7 +3060,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 prec,
                 bytes,
             } => {
-                if let Some(r) = exec_v_h_float_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_h_float_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, op, prec, bytes,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3026,7 +3112,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 scalar,
                 pred,
             } => {
-                if let Some(r) = exec_v_float_cmp_mask_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_cmp_mask_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, addr, prec, scalar, pred,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3051,7 +3137,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 prec,
                 pred,
             } => {
-                if let Some(r) = exec_v_float_cmp_mask256_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_cmp_mask256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, prec, pred,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3118,7 +3204,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 op,
                 prec,
             } => {
-                if let Some(r) = exec_v_float_bin256_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_bin256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, addr, op, prec,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3136,7 +3222,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 op,
                 prec,
             } => {
-                if let Some(r) = exec_v_float_unary256_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_unary256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, addr, op, prec,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3153,7 +3239,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 addr,
                 kind,
             } => {
-                if let Some(r) = exec_v_packed_cvt256_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_packed_cvt256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, addr, kind,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*addr, temps), *fault);
@@ -3321,27 +3407,33 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                     mxcsr,
                 );
                 let size = lanes * 2;
-                // SDM Vol 3A §7.5: check the whole destination before any RAM store.
-                for offset in (0..size).step_by(8) {
-                    let at = ea.wrapping_add(u64::from(offset));
-                    if let Err(
-                        t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault),
-                    ) = mem.probe_write(at, 8)
-                    {
-                        let at = if t == MemTrap::Unmapped {
-                            (0..8)
-                                .map(|i| at.wrapping_add(i))
-                                .find(|&b| matches!(mem.probe_write(b, 1), Err(MemTrap::Unmapped)))
-                                .unwrap_or(at)
-                        } else {
-                            t.fault_addr(at)
-                        };
-                        return walk_classify_access(
-                            trap_out(cpu, *cur_addr, t, at, 8, AccessKind::Write, 0),
-                            *cur_addr,
-                            ea,
-                            *fault,
-                        );
+                {
+                    // Match the JIT's separate vstore_preflight helper boundary.
+                    let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
+                    // SDM Vol 3A §7.5: check the whole destination before any RAM store.
+                    for offset in (0..size).step_by(8) {
+                        let at = ea.wrapping_add(u64::from(offset));
+                        if let Err(
+                            t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault),
+                        ) = mem.probe_write(at, 8)
+                        {
+                            let at = if t == MemTrap::Unmapped {
+                                (0..8)
+                                    .map(|i| at.wrapping_add(i))
+                                    .find(|&b| {
+                                        matches!(mem.probe_write(b, 1), Err(MemTrap::Unmapped))
+                                    })
+                                    .unwrap_or(at)
+                            } else {
+                                t.fault_addr(at)
+                            };
+                            return walk_classify_access(
+                                trap_out(cpu, *cur_addr, t, at, 8, AccessKind::Write, 0),
+                                *cur_addr,
+                                ea,
+                                *fault,
+                            );
+                        }
                     }
                 }
                 if let Err(f) = vstore(cpu, mem, *cur_addr, ea, out, size) {
@@ -3413,7 +3505,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 prec,
                 scalar,
             } => {
-                if let Some(r) = exec_v_float_unary_m::<DEFAULT, ROUTED>(
+                if let Some(r) = exec_v_float_unary_m::<DEFAULT, ROUTED, ORDER>(
                     cpu, mem, temps, *cur_addr, dst, a, src_addr, op, prec, scalar,
                 ) {
                     return walk_classify_access(r, *cur_addr, read_val(*src_addr, temps), *fault);
@@ -3612,14 +3704,14 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                     unreachable!("helper refused before child execution");
                 }
                 // Terminator: delivers the frame + vectors (Continue) or traps out.
-                return deliver_interrupt(cpu, mem, *cur_addr, *vector, *saved_ip).into();
+                return deliver_interrupt_mode(cpu, mem, *cur_addr, *vector, *saved_ip).into();
             }
             IrOp::IntoGate { next_ip } => {
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
                 return if cpu.flags.of {
-                    deliver_interrupt(cpu, mem, *cur_addr, 4, *next_ip).into()
+                    deliver_interrupt_mode(cpu, mem, *cur_addr, 4, *next_ip).into()
                 } else {
                     cpu.rip = *next_ip;
                     WalkResult::Continue
@@ -3639,7 +3731,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 // fault in-guest; otherwise fall through to the Load/Store that follows.
                 let off = read_val(*offset, temps) & 0xFFFF;
                 if off + *size as u64 > 0x1_0000 {
-                    return deliver_interrupt(cpu, mem, *cur_addr, *vector, *fault_ip).into();
+                    return deliver_interrupt_mode(cpu, mem, *cur_addr, *vector, *fault_ip).into();
                 }
             }
             IrOp::BoundGate {
@@ -3658,7 +3750,7 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 let lo = read_val(*lower, temps) as u16 as i16;
                 let hi = read_val(*upper, temps) as u16 as i16;
                 return if idx < lo || idx > hi {
-                    deliver_interrupt(cpu, mem, *cur_addr, 5, *fault_ip).into()
+                    deliver_interrupt_mode(cpu, mem, *cur_addr, 5, *fault_ip).into()
                 } else {
                     cpu.rip = *next_ip;
                     WalkResult::Continue
@@ -3718,6 +3810,11 @@ fn walk_ops<const RETRY: bool, const ROUTED: bool, const DEFAULT: bool, const CH
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
+                let (mem, _ordering) = mem.helper(Some(match op {
+                    StrOp::Movs => ordering::Direction::ReadWrite,
+                    StrOp::Stos => ordering::Direction::Write,
+                    StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
+                }));
                 if let Some(r) = exec_rep_string_real(
                     cpu,
                     mem,
@@ -3806,9 +3903,10 @@ pub(crate) fn walk_child(
     let mut retired = 0;
     let mut started = false;
     let mut shadow = false;
-    let mem = Access::<false, _>::new(mem);
+    // Child ordering remains unordered until xj-ir6.24.
+    let mem = Access::<false, 0, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        walk_ops::<false, false, true, true>(
+        walk_ops::<false, false, true, true, 0>(
             ir,
             cpu,
             mem,
@@ -3821,7 +3919,7 @@ pub(crate) fn walk_child(
             None,
         )
     } else {
-        walk_ops::<false, false, false, true>(
+        walk_ops::<false, false, false, true, 0>(
             ir,
             cpu,
             mem,
@@ -6689,13 +6787,15 @@ fn vpart_store<M: StrMem>(
 /// the embedder to map a page it already has — it maps it, retries, faults identically,
 /// and loops, with no way out because the information was gone before the `Exit` was
 /// built.
-fn vload<const ROUTED: bool>(
+fn vload<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     size: u8,
 ) -> Result<u128, VecFault> {
+    let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Read), false);
+    let mem = mem.unordered();
     match size {
         16 => {
             let lo = vpart(cpu, mem, cur_addr, addr, 8)? as u128;
@@ -6734,9 +6834,9 @@ fn vector_fault_probe_preserves_mmio_answers() {
 
 /// Load a `width`-byte vector (`width/16` 128-bit lanes) from `base` into `[u128; 4]`,
 /// zero-filling lanes above `width`. On a fault, returns the faulting sub-transfer.
-fn vload_lanes<const ROUTED: bool>(
+fn vload_lanes<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     base: u64,
     width: u16,
@@ -6771,14 +6871,16 @@ fn vpopcnt_lanes(a: [u128; 4], lane: u8) -> [u128; 4] {
 
 /// Store a 128-bit vector value. The error carries the faulting sub-transfer — see
 /// [`vload`].
-fn vstore<const ROUTED: bool>(
+fn vstore<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     v: u128,
     size: u8,
 ) -> Result<(), VecFault> {
+    let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+    let mem = mem.unordered();
     if ROUTED && size == 16 {
         for at in [addr, addr.wrapping_add(8)] {
             if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
@@ -7221,7 +7323,9 @@ impl StrMem for Memory {
     }
 }
 
-impl<const ROUTED: bool, M: InterpreterMemory> StrMem for Access<ROUTED, M> {
+impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> StrMem
+    for Access<ROUTED, ORDER, M>
+{
     fn preflight_store(
         &self,
         base: u64,
@@ -8029,7 +8133,7 @@ pub fn cmpxchg_pair_run(
 
 fn cmpxchg_pair_mode<const ROUTED: bool>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, impl InterpreterMemory>,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
     cur_addr: u64,
     addr: u64,
     size: u8,

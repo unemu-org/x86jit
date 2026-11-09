@@ -756,6 +756,8 @@ pub(crate) unsafe fn call_block_in_mode(
 /// Convenience: run a single compiled block and decode to a `StepResult` (used
 /// where chaining isn't wired). Chain/link codes are treated as `Continue` — the
 /// RIP is set either way, so the dispatcher re-resolves.
+/// `consistency` must match the tier used to compile the block; interpreter replays
+/// for deferred MMIO and host alignment faults use the same tier.
 ///
 /// # Safety
 /// As [`call_block`].
@@ -764,6 +766,7 @@ pub unsafe fn run_compiled(
     cpu: &mut CpuState,
     mem: &Memory,
     mode: crate::lift::CpuMode,
+    consistency: crate::MemConsistency,
 ) -> StepResult {
     let _fp_mode = fp::RunMode::new();
     let mut ctx = MemCtx::for_memory(mem);
@@ -787,11 +790,15 @@ pub unsafe fn run_compiled(
             StepResult::Exit(ctx.detailed_exception_exit(cpu, mem, mode, entry.0 as usize))
         }
         RET_HOST_FAULT_DETAIL if ctx.link_slot & 0x100 != 0 => {
-            let info = crate::codemap::lookup_fault_info(ctx.next_entry as usize, cpu.rip);
+            let fault_info = crate::codemap::lookup_fault_info(ctx.next_entry as usize, cpu.rip);
             let mut scratch = Vec::new();
-            match crate::interp::step_one(mem, cpu, mode, &mut scratch, &mut Default::default()) {
+            let mut info = crate::interp::RetireInfo {
+                consistency,
+                ..Default::default()
+            };
+            match crate::interp::step_one(mem, cpu, mode, &mut scratch, &mut info) {
                 StepResult::Exit(exit) => {
-                    StepResult::Exit(ctx.preserve_host_replay(exit, info, true))
+                    StepResult::Exit(ctx.preserve_host_replay(exit, fault_info, true))
                 }
                 other => other,
             }
@@ -804,8 +811,12 @@ pub unsafe fn run_compiled(
             let mut temps = Vec::new();
             // This standalone helper has no `Vcpu` to tick; the retired-instruction
             // counter (§17.6, sub-seam c) is maintained only on `Vcpu::run`, so discard
-            // the per-step `RetireInfo` here.
-            crate::interp::step_one(mem, cpu, mode, &mut temps, &mut Default::default())
+            // the per-step retirement outputs here while retaining the ordering input.
+            let mut info = crate::interp::RetireInfo {
+                consistency,
+                ..Default::default()
+            };
+            crate::interp::step_one(mem, cpu, mode, &mut temps, &mut info)
         }
         // A compiled block raised a guest exception; the block set the saved RIP
         // (fault: on the instruction; trap: past it) and stored the vector (`#DE`→0,

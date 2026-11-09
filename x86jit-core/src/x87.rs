@@ -90,7 +90,7 @@ impl FpMem for crate::memory::Memory {
 }
 
 impl<const ROUTED: bool, M: crate::memory::InterpreterMemory> FpMem
-    for crate::memory::Access<ROUTED, M>
+    for crate::memory::Access<ROUTED, 0, M>
 {
     #[inline(always)]
     fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
