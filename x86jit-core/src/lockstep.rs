@@ -88,6 +88,18 @@ pub fn begin_with_trace(trace: Option<&Trace>) -> Bracket<'_> {
     }
 }
 
+/// Flush the previous instruction's pending capture without arming a new one, for a
+/// walk that stops at an instruction boundary and redispatches (same-block SMC).
+pub fn flush(b: &mut Bracket, cpu: &CpuState, mem: &Memory) {
+    let Some(pending) = b.inner.as_mut() else {
+        return;
+    };
+    if let Some(p) = pending.take() {
+        let post = side_state(cpu, mem, p.ea);
+        write_record(b.trace.expect("active trace"), &p, &post);
+    }
+}
+
 /// Called at each `IrOp::InsnStart`. The cpu now holds the *post*-state of the
 /// previous instruction (== *pre*-state of the one at `addr`). Flush the previous
 /// capture if any, then arm a fresh one when the upcoming instruction is a replayable

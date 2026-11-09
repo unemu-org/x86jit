@@ -106,9 +106,7 @@ impl<const ROUTED: bool, M: crate::memory::InterpreterMemory> FpMem
     }
     #[inline(always)]
     fn store(&self, addr: u64, buf: &[u8]) -> bool {
-        self.0
-            .normal()
-            .write_ram_checked_mode::<ROUTED>(addr, buf)
+        self.write_ram(addr, buf)
             .map_err(|at| {
                 if ROUTED {
                     crate::memory::record_host_fault(at);

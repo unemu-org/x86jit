@@ -1967,6 +1967,7 @@ impl Vcpu {
                 unreachable!("Real16 resolution always interprets");
             };
             let mut info = crate::interp::RetireInfo {
+                code_base: fetch.pa - fetch.ip,
                 consistency: vm.consistency,
                 sti_shadow: self.sti_shadow,
                 ss_shadow: self.ss_shadow,
@@ -2405,6 +2406,7 @@ impl Vcpu {
                         fp_mode.default();
                     }
                     let mut info = crate::interp::RetireInfo {
+                        code_base: fetch.pa - fetch.ip,
                         consistency: vm.consistency,
                         sti_shadow: self.sti_shadow,
                         ss_shadow: self.ss_shadow,

@@ -127,6 +127,35 @@ pub fn exec_xstate(
     wide: bool,
     fault: crate::ir::MemoryAccess,
 ) -> Result<(), XStateFault> {
+    if mem.host_fault_recovery() {
+        exec_xstate_access(
+            cpu,
+            crate::memory::Access::<true>::new(mem),
+            base,
+            kind,
+            wide,
+            fault,
+        )
+    } else {
+        exec_xstate_access(
+            cpu,
+            crate::memory::Access::<false>::new(mem),
+            base,
+            kind,
+            wide,
+            fault,
+        )
+    }
+}
+
+pub(crate) fn exec_xstate_access<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &crate::memory::Access<ROUTED, 0, impl crate::memory::InterpreterMemory>,
+    base: u64,
+    kind: XStateKind,
+    wide: bool,
+    fault: crate::ir::MemoryAccess,
+) -> Result<(), XStateFault> {
     let long = fault.long64();
     let ecx = cpu.cpuid(1, 0).ecx;
     let extra = cpu.cpuid(0xd, 1).eax;
@@ -422,7 +451,7 @@ pub fn exec_xstate(
     for (off, buf) in writes {
         for (i, byte) in buf.iter().enumerate() {
             let at = base + (off + i) as u64;
-            mem.write_ram_checked(at, std::slice::from_ref(byte))
+            mem.write_ram(at, std::slice::from_ref(byte))
                 .map_err(|addr| XStateFault::Memory { addr, write: true })?;
         }
     }

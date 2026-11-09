@@ -141,9 +141,22 @@ wrong with it.
   map by design, so enforcing it interpreter-side would manufacture a divergence).
 - MXCSR governs nothing — `deferred.md`. It is now *captured* by the native oracle and its
   control half compared; the sticky flags are captured and deliberately not compared.
-- Self-modifying code is observed **one block late** for the same-block case, the
-  deviation `spec.md` §10 records and QEMU shares. Everything else invalidates on both
-  backends, including across vcpus.
+- Compiled self-modifying code is observed **one block late** for the same-block
+  case (`spec.md` §10). The interpreter now finishes the storing instruction and
+  refetches when a direct store writes later instruction bytes in its block, in
+  every decode mode. Declared aliases are expanded at conservative 4 KiB page
+  granularity before the overlap check; the serialized cross-alias case is served
+  within one block (SDM Vol 3A §14.6). Undeclared host aliases are not covered.
+  Direct detection uses a walk-local span independently of shared code-page tags,
+  including when another vCPU clears the running block's tag before its patching
+  store. Declared-alias detection relies on the alias page still being tagged;
+  its page expansion can conservatively end unaffected blocks. Cache invalidation
+  alone does not cut a running walk. The unsynchronized cross-vCPU case retains
+  the architecture's model-specific contract (`spec.md` §10). Witnesses, including
+  deterministic two-vCPU invalidation, are in `same_block_smc.rs`. Other blocks
+  invalidate on both backends, including across vcpus. The compiled follow-up
+  needs instruction-boundary exits, region-state
+  flushing and completed-prefix accounting, preserving the non-code store gates.
 - 194 codes lift their register form but not their memory form — now listed by name in the
   coverage map's `reg_only` sections, and `cargo xfuzz --mem` reports them as
   `UnknownInstruction`, which is that leg's expected output rather than a regression.

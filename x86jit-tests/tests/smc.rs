@@ -13,8 +13,8 @@
 //! guest never takes. A one-backend assertion on a two-backend property is how that
 //! hides; hence `both_backends!`.
 //!
-//! What stays deferred is only §10's same-block case: a block that writes into the
-//! page it is itself executing runs to the end of that block on the old bytes.
+//! Compiled same-block modification remains deferred (§10). Interpreter witnesses
+//! for refetching later instructions in the current block live in same_block_smc.rs.
 
 use iced_x86::code_asm::*;
 use x86jit_core::{Backend, Exit, InterpreterBackend, Prot, Reg, RegionKind, Vm, VmConfig};

@@ -1108,11 +1108,53 @@ stores outside tagged pages.
 
 **Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, x87 and fxsave helpers write through raw bounds-checked-only views of guest RAM for the same reason. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report explicitly after they run.
 
-**Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds the deferral below to one block, the same granularity the interpreter gets by construction. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
+**Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds its deferral below to one block. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
 
 **Cross-modifying code (another vcpu writes) is bounded by the guest's own protocol.** SDM Vol 3A §11.1.3 calls the *unsynchronized* form model-specific — real silicon may run stale bytes too, depending how far ahead of the executing processor the write landed — and defines the case that is guaranteed: the modifier stores the code then raises a flag, and the executing processor polls it, executes a serializing instruction, and only then runs the code. A guest following that is served correctly here, and `x86jit-tests/tests/cross_modifying.rs` pins it on both backends. CPUID carries a full memory fence (SDM Vol 3A §11.3); the dirty-page chain leave above supplies translation invalidation, which a memory fence alone cannot provide. Do **not** add a validity check at the chain transfer itself to make the unsynchronized case behave — it would put a load, a compare and a branch on the path fast dispatch exists to keep free, in exchange for a promise the architecture does not make.
 
-> **Same-block SMC — the effect is deferred, and that's an accepted deviation.** If a block writes into *its own* page (or a page whose translation is currently executing), the running block keeps executing the *old* code to its end — the `Arc<IrBlock>`/`CompiledPtr` cloned out by the dispatcher (§9.2) keeps it alive even after the cache entry is dropped; the re-lift only takes effect on the *next* dispatch. Real x86 can observe a self-modifying store more eagerly. This deviation is standard (QEMU makes it too) and fine for the target workloads, but **write it down**: if you ever chase a bug where a program rewrites the instruction it is about to run, this is the reason. Making it faithful means bounding blocks at write-detected boundaries — a large, late refinement, not a day-one requirement.
+**Same-block SMC on the interpreter.** SDM Vol 3A §14.6, *Self-Modifying Code*,
+describes invalidating prefetched/decoded instructions
+affected by a write. In every decode mode, a same-linear-address interpreter store
+overlapping bytes of a later instruction ends the block after the storing
+instruction completes and retires. Dispatch invalidates and re-lifts at the next
+RIP, so `run_steps` budgets and block formation cannot change the observed bytes.
+Direct writes confined to already executed instructions, the storing instruction,
+or bytes outside the block do not end it.
+
+A per-walk memory view carries the running block's linear and host-address spans. Every successful
+interpreter store checks that span independently of the shared code-page tag,
+including bulk FP/state transfers, string iterations, vector lanes and locked
+stores. A direct overlap takes a cold path that checks whether any later instruction
+bytes were touched and zeros the walk's packed instruction state. Its other values
+encode the first marker and an instruction in flight, supplying retirement accounting
+with a shift. At the next marker, a single zero test recognizes the cut, finishes
+retirement of the storing instruction and returns to dispatch. This replaces the
+existing started-flag test; it adds no TLS access or shared atomic load.
+
+The code-page cold path expands declared aliases before checking overlap, at
+conservative 4 KiB page granularity. It can end a block whose remaining bytes were
+not changed. This alias check relies on the store's alias page still being tagged;
+direct same-linear-address detection does not. SDM Vol 3A §14.6 guarantees the
+cross-alias case when a serializing operation, such as CPUID, precedes execution
+of the modified instruction; the interpreter serves that case within a single block.
+Undeclared host aliases remain outside this guarantee.
+
+Another vCPU clearing the running block's tag cannot hide a subsequent direct
+self-modifying store: the local span check still detects it. Cache invalidation alone
+does not cut the walk, preserving the unsynchronized cross-vCPU contract above.
+Real16 converts CS:IP to linear addresses for overlap while retaining IP for
+retirement and refetch. `same_block_smc.rs` pins these properties without Unicorn,
+including deterministic two-vCPU invalidation and shared host alias views.
+
+> **Compiled same-block SMC remains deferred to the next dispatch.** A compiled
+> block keeps executing old translations through its end, including the remainder
+> of a region sub-block. A follow-up needs per-vcpu pending refetch state set by
+> inline and helper stores, then an exit at the next instruction marker after all
+> register/flag updates. That exit must flush region state, save the next RIP and
+> account for the completed prefix instead of charging the whole block's instruction
+> count. Returning directly from the store notification would skip part of the
+> storing instruction. The existing watermark and non-code store gates must stay
+> unchanged.
 
 ---
 

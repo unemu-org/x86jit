@@ -1,6 +1,6 @@
 //! Guest memory model (§4.1, §4.2, §8.1).
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -1308,12 +1308,35 @@ impl Memory {
     /// watched page. Both halves are precise here; the inline test is not, and is not
     /// meant to be.
     pub fn note_write(&self, addr: u64, len: usize) {
+        self.note_write_observed(addr, len, self);
+    }
+
+    #[inline(always)]
+    fn note_write_observed(&self, addr: u64, len: usize, observer: &impl InterpreterMemory) {
+        let host = (self.host_base() as u64).wrapping_add(addr.wrapping_sub(self.guest_base));
+        observer.note_host_block_write(host, addr, len);
         // One relaxed load gates the (rare) data-watch path: an unwatched memory pays
         // nothing beyond this branch.
         let watched = self.watch.count.load(Ordering::Relaxed) != 0;
         for page in code_page_range(addr, len as u64) {
             if self.is_code_page(page) {
-                self.note_code_write(page);
+                return self.note_code_write_range(addr, len, observer);
+            }
+            if watched && self.watch.is_watched(page) {
+                self.watch.mark_dirty(page);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_code_write_range(&self, addr: u64, len: usize, observer: &impl InterpreterMemory) {
+        // Finish the whole range here so the non-code path need not preserve
+        // addr/len across a cold call. Repeated watch marks are idempotent.
+        let watched = self.watch.count.load(Ordering::Relaxed) != 0;
+        for page in code_page_range(addr, len as u64) {
+            if self.is_code_page(page) {
+                self.note_code_write(page, observer);
             }
             if watched && self.watch.is_watched(page) {
                 self.watch.mark_dirty(page);
@@ -1325,10 +1348,18 @@ impl Memory {
     // frame and register allocation, even when the code-page branch is never taken.
     #[cold]
     #[inline(never)]
-    fn note_code_write(&self, page: u64) {
+    fn note_code_write(&self, page: u64, observer: &impl InterpreterMemory) {
         let aliases = self.code_aliases.lock().unwrap();
-        let dirty: Vec<_> = aliases
-            .connected(page)
+        let connected = aliases.connected(page);
+        // Direct writes retain byte precision. Alias declarations connect pages
+        // conservatively, including sub-page or differently aligned views (§10).
+        // Expand them before checking overlap with the executing block.
+        for &view in &connected {
+            if view != page {
+                observer.note_block_write(view << CODE_PAGE_BITS, CODE_PAGE_SIZE as usize);
+            }
+        }
+        let dirty: Vec<_> = connected
             .into_iter()
             .filter(|p| aliases.translated.contains(p))
             .collect();
@@ -1987,6 +2018,16 @@ impl Memory {
         addr: u64,
         bytes: &[u8],
     ) -> Result<(), u64> {
+        self.write_ram_checked_mode_observed::<ROUTED>(addr, bytes, self)
+    }
+
+    #[inline(always)]
+    fn write_ram_checked_mode_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        observer: &impl InterpreterMemory,
+    ) -> Result<(), u64> {
         let region = self.region_for(addr, bytes.len()).ok_or_else(|| {
             crate::fault::record_fp_fault(
                 addr,
@@ -2026,7 +2067,7 @@ impl Memory {
                 crate::AddressPrecision::ExactByte,
             )
         })?;
-        self.note_write(addr, bytes.len());
+        self.note_write_observed(addr, bytes.len(), observer);
         Ok(())
     }
 
@@ -2170,6 +2211,17 @@ impl Memory {
         val: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
+        self.write_mode_observed::<ROUTED>(addr, val, size, self)
+    }
+
+    #[inline(always)]
+    fn write_mode_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        val: u64,
+        size: u8,
+        observer: &impl InterpreterMemory,
+    ) -> Result<(), MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -2191,7 +2243,7 @@ impl Memory {
         } else {
             unsafe { atomic_store_le(ptr, val, size) };
         }
-        self.note_write(addr, size as usize); // SMC: catch a store onto a code page (§10)
+        self.note_write_observed(addr, size as usize, observer); // SMC: catch a store onto a code page (§10)
         Ok(())
     }
 
@@ -2219,6 +2271,18 @@ impl Memory {
         size: u8,
         op: RmwOp,
     ) -> Result<u64, MemTrap> {
+        self.atomic_rmw_mode_observed::<ROUTED>(addr, src, size, op, self)
+    }
+
+    #[inline(always)]
+    fn atomic_rmw_mode_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        src: u64,
+        size: u8,
+        op: RmwOp,
+        observer: &impl InterpreterMemory,
+    ) -> Result<u64, MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -2235,7 +2299,7 @@ impl Memory {
         }
         if !ROUTED {
             let old = unsafe { atomic_rmw_raw(ptr, src, size, op) };
-            self.note_write(addr, size as usize);
+            self.note_write_observed(addr, size as usize, observer);
             return Ok(old & mask_bits(size));
         }
         let mut old =
@@ -2249,7 +2313,7 @@ impl Memory {
             }
             old = observed;
         }
-        self.note_write(addr, size as usize);
+        self.note_write_observed(addr, size as usize, observer);
         Ok(old & mask_bits(size))
     }
 
@@ -2269,6 +2333,17 @@ impl Memory {
         addr: u64,
         expected: u128,
         src: u128,
+    ) -> Result<u128, MemTrap> {
+        self.atomic_cas128_mode_observed::<ROUTED>(addr, expected, src, self)
+    }
+
+    #[inline(always)]
+    fn atomic_cas128_mode_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        expected: u128,
+        src: u128,
+        observer: &impl InterpreterMemory,
     ) -> Result<u128, MemTrap> {
         let region = self.region_at(addr, 16)?;
         if matches!(region.kind, RegionKind::Trap) {
@@ -2296,7 +2371,7 @@ impl Memory {
             unsafe { atomic_cas128_raw(ptr, expected, src) }
         };
         // SDM Vol 2A CMPXCHG8B/CMPXCHG16B, Description: failed compares write back too.
-        self.note_write(addr, 16);
+        self.note_write_observed(addr, 16, observer);
         Ok(old)
     }
 
@@ -2318,6 +2393,18 @@ impl Memory {
         src: u64,
         size: u8,
     ) -> Result<u64, MemTrap> {
+        self.atomic_cas_mode_observed::<ROUTED>(addr, expected, src, size, self)
+    }
+
+    #[inline(always)]
+    fn atomic_cas_mode_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        expected: u64,
+        src: u64,
+        size: u8,
+        observer: &impl InterpreterMemory,
+    ) -> Result<u64, MemTrap> {
         let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
@@ -2337,7 +2424,7 @@ impl Memory {
         } else {
             unsafe { atomic_cas_raw(ptr, expected & mask_bits(size), src, size) }
         };
-        self.note_write(addr, size as usize);
+        self.note_write_observed(addr, size as usize, observer);
         Ok(old & mask_bits(size))
     }
 }
@@ -3550,6 +3637,8 @@ pub(crate) struct Access<const ROUTED: bool, const ORDER: u8 = 0, M = Memory>(pu
 
 pub(crate) trait InterpreterMemory {
     fn normal(&self) -> &Memory;
+    fn note_block_write(&self, _addr: u64, _len: usize) {}
+    fn note_host_block_write(&self, _host: u64, _addr: u64, _len: usize) {}
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap>;
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap>;
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap>;
@@ -3598,6 +3687,67 @@ pub(crate) trait InterpreterMemory {
         unreachable!("child string on normal memory")
     }
 }
+pub(crate) struct RunningMemory<'a> {
+    pub memory: &'a Memory,
+    pub ir: &'a crate::IrBlock,
+    pub start: u64,
+    pub end: u64,
+    pub host_start: u64,
+    pub host_end: u64,
+    pub current: &'a Cell<u64>,
+    pub started: &'a Cell<u8>,
+}
+
+impl RunningMemory<'_> {
+    #[cold]
+    #[inline(never)]
+    fn overlap(&self, addr: u64, len: usize) {
+        // SDM Vol 3A §14.6: discard decoded bytes after the storing instruction.
+        // Scan only after an overlap; ordinary instruction markers do no extra work.
+        let next = self.ir.ops.iter().find_map(|op| match op {
+            crate::IrOp::InsnStart { guest_addr } if *guest_addr > self.current.get() => {
+                Some(self.start - self.ir.guest_start + guest_addr)
+            }
+            _ => None,
+        });
+        if next.is_some_and(|next| addr.saturating_add(len as u64) > next) {
+            self.started.set(0);
+        }
+    }
+}
+
+impl InterpreterMemory for RunningMemory<'_> {
+    #[inline(always)]
+    fn normal(&self) -> &Memory {
+        self.memory
+    }
+    #[inline(always)]
+    fn note_block_write(&self, addr: u64, len: usize) {
+        if addr < self.end && addr.saturating_add(len as u64) > self.start {
+            self.overlap(addr, len);
+        }
+    }
+    #[inline(always)]
+    fn note_host_block_write(&self, host: u64, addr: u64, len: usize) {
+        if host < self.host_end && host.saturating_add(len as u64) > self.host_start {
+            self.overlap(addr, len);
+        }
+    }
+    #[inline(always)]
+    fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        self.memory.read_mode::<ROUTED>(addr, size)
+    }
+    #[inline(always)]
+    fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        self.memory
+            .write_mode_observed::<ROUTED>(addr, value, size, self)
+    }
+    #[inline(always)]
+    fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
+        self.memory.probe_write_mode::<ROUTED>(addr, size)
+    }
+}
+
 impl InterpreterMemory for Memory {
     #[inline(always)]
     fn normal(&self) -> &Memory {
@@ -3683,20 +3833,25 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, O
     ) -> Result<(), MemTrap> {
         self.0.probe_write::<RECOVER>(addr, size)
     }
+    pub(crate) fn write_ram(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.0
+            .normal()
+            .write_ram_checked_mode_observed::<ROUTED>(addr, bytes, &self.0)
+    }
     pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
         self.0
             .normal()
-            .atomic_rmw_mode::<ROUTED>(addr, src, size, op)
+            .atomic_rmw_mode_observed::<ROUTED>(addr, src, size, op, &self.0)
     }
     pub fn atomic_cas128(&self, addr: u64, expected: u128, src: u128) -> Result<u128, MemTrap> {
         self.0
             .normal()
-            .atomic_cas128_mode::<ROUTED>(addr, expected, src)
+            .atomic_cas128_mode_observed::<ROUTED>(addr, expected, src, &self.0)
     }
     pub fn atomic_cas(&self, addr: u64, expected: u64, src: u64, size: u8) -> Result<u64, MemTrap> {
         self.0
             .normal()
-            .atomic_cas_mode::<ROUTED>(addr, expected, src, size)
+            .atomic_cas_mode_observed::<ROUTED>(addr, expected, src, size, &self.0)
     }
 }
 
