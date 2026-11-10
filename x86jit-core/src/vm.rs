@@ -2834,7 +2834,8 @@ impl Vcpu {
                                     crate::codemap::lookup_fault_info(
                                         cur.0 as usize,
                                         ctx.next_entry,
-                                    ),
+                                    )
+                                    .as_ref(),
                                 ));
                             }
                             RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL => {
@@ -2952,7 +2953,7 @@ impl Vcpu {
                                                 crate::fault::attach_raw_host_fault(
                                                     ctx.preserve_host_replay(
                                                         exit,
-                                                        original_info,
+                                                        original_info.as_ref(),
                                                         code == RET_HOST_FAULT_DETAIL,
                                                     ),
                                                     raw_fault,

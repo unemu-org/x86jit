@@ -43,6 +43,7 @@ fn sample(phase: &str, vm: &Vm) {
         rss_bytes(),
         vm.memory_stats()
     );
+    println!("codemap: {:#?}", x86jit_core::codemap::memory_stats());
 }
 
 fn main() {

@@ -45,7 +45,7 @@ pub struct HostRegisters {
 /// Immutable one-frame recipe, extracted from the compiler's unwind description.
 /// All offsets are signed byte distances from the interrupted frame pointer.
 /// A missing register slot means that register retains its interrupted value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FrameRecipe {
     pub prologue_end: u32,
     /// AArch64 return-address authentication: 0 = unsigned, 1 = A key, 2 = B key.
@@ -210,9 +210,10 @@ impl EntryRecord {
 /// compiled frame, and a data address inside the run's guest span. FreeBSD
 /// AArch64 Alignment recovery ignores `data_addr` and replays from guest RIP:
 /// that signal's `si_addr` names the host PC. Unsupported
-/// hosts answer NOT OURS. There is no allocation, lock, TLS, libc call or retry:
-/// a fixed table lookup, bounded AVL lookups, exact-site binary search and
-/// fixed-size stack reads. The landing stub restores host
+/// hosts answer NOT OURS. There is no allocation, lock, TLS or libc call: a fixed
+/// table lookup, a code-map reader-count increment and decrement (atomic RMWs,
+/// which may retry under contention where the host lowers them to LL/SC loops),
+/// bounded AVL lookups, exact-site binary search and fixed-size stack reads. The landing stub restores host
 /// FP control before control returns to call_block's caller (MXCSR: Intel SDM
 /// Vol 1 §10.2.3; x86-64 psABI §3.2.1). The signal handler and classifier must
 /// not depend on the thread's interrupted FP mode.

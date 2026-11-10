@@ -66,8 +66,9 @@ pub struct VcpuMemoryStats {
 /// Standalone ChildArena storage belongs to the embedder and is excluded;
 /// vCPUs own no child arenas. Compiler contexts, cache hash tables/span indices,
 /// link slots and allocator bookkeeping are also excluded.
-/// No compiler lock or cache traversal is required. vCPU registry and background
-/// queue locks are held briefly. Fields can reflect different concurrent instants.
+/// No compiler lock or cache traversal is required. The vCPU registry, background
+/// queue and code-map writer locks are acquired. Code-map sampling also collects
+/// obsolete versions after reader quiescence. Fields can reflect different instants.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct MemoryStats {
@@ -77,9 +78,10 @@ pub struct MemoryStats {
     pub cache: CacheMemoryStats,
     /// Per-vCPU state summed over live registered vCPUs.
     pub vcpus: VcpuMemoryStats,
-    /// Process-wide retained code-map/fault metadata, including copied AVL paths,
-    /// tables, trap capacity, recipes and instruction records. Includes other VMs
-    /// and dropped backends; never decreases. Excludes allocator overhead.
+    /// Process-wide retained code-map/fault metadata, including live/deferred AVL
+    /// nodes, dense tables, shared recipes and instruction records. Includes other
+    /// VMs and dropped backends. Decreases on reclamation/removal, but invalidation
+    /// alone does not retire executable ranges. Excludes allocator overhead.
     pub codemap_bytes: u64,
     /// Guest backing extent, including any spare embedder-supplied backing bytes.
     pub guest_ram_reserved: u64,

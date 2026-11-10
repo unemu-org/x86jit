@@ -782,6 +782,59 @@ pub struct InstructionFaultInfo {
     operand_address: Option<OperandAddress>,
 }
 impl InstructionFaultInfo {
+    // Exact key for address-free descriptors, excluding the per-unit RIP. Four
+    // words preserve every field without a lossy hash or narrowing memory_ops.
+    pub(crate) fn shared_key(&self) -> Option<[u64; 4]> {
+        if self.operand_address.is_some() {
+            return None;
+        }
+        let len = match self.len {
+            Knowledge::Unknown => 0,
+            Knowledge::NotApplicable => 1,
+            Knowledge::Known(n) => 2 | (u64::from(n) << 2),
+        };
+        let operand = match self.operand_size {
+            Knowledge::Unknown => 0,
+            Knowledge::NotApplicable => 1,
+            Knowledge::Known(n) => 2 | (u64::from(n) << 2),
+        };
+        let split = self
+            .split_transfer_size
+            .map_or(0, |n| 1 | (u64::from(n) << 1));
+        let rep = self.rep.map_or(0, |(op, elem, bits)| {
+            1 | ((op as u64) << 1) | (u64::from(elem) << 8) | (u64::from(bits) << 16)
+        });
+        let trap = self
+            .trap
+            .map_or(0, |(v, n)| 1 | (u64::from(v) << 1) | (u64::from(n) << 9));
+        let helper = self.helper.map_or(0, |h| 1 + h as u64);
+        let flags = [
+            self.rmw,
+            self.writes,
+            self.single_scalar_store,
+            self.preflighted_store,
+            self.single_scalar_transfer,
+            self.length_limit,
+            self.gather,
+            self.alignment_check,
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (i, flag)| bits | (u64::from(flag) << i));
+        Some([
+            self.memory_ops as u64,
+            operand | (len << 32),
+            split | (rep << 24),
+            trap | (helper << 24) | (flags << 32),
+        ])
+    }
+
+    pub(crate) fn retained_address_bytes(&self) -> usize {
+        self.operand_address
+            .as_ref()
+            .map_or(0, |a| std::mem::size_of_val(&*a.prefix))
+    }
+
     /// A compiled split store can land earlier transfers before recovery skips
     /// its post-store barrier. Replay may preflight and fault without redoing
     /// those transfers, so notify before either replay or returning the fault.

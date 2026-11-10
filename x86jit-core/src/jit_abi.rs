@@ -505,7 +505,8 @@ impl MemCtx {
     ) -> Exit {
         use crate::fault::*;
         let reporting = self.next_entry;
-        let info = crate::codemap::lookup_fault_info(pc, reporting);
+        let owned_info = crate::codemap::lookup_fault_info(pc, reporting);
+        let info = owned_info.as_ref();
         let helper = self.helper_operand_size != 0;
         let operand = (self.helper_operand_addr, self.helper_operand_size);
         let inline_width = (self.fault_access >> 24) & 0xff;
@@ -598,7 +599,8 @@ impl MemCtx {
             crate::fault::cause_from_wire(self.fault_access),
         );
         let exit = Exit::exception(cpu.rip, self.exception_vector as u8).with_fault_metadata(m);
-        let info = crate::codemap::lookup_fault_info(pc, reporting);
+        let owned_info = crate::codemap::lookup_fault_info(pc, reporting);
+        let info = owned_info.as_ref();
         let helper = info.is_some_and(|i| match i.helper {
             Some(crate::FaultHelper::CompareExchangePair) => true,
             Some(_) => matches!(
@@ -687,7 +689,8 @@ impl MemCtx {
     pub fn detailed_host_exit(&self, cpu: &CpuState, mem: &Memory, mode: crate::CpuMode) -> Exit {
         use crate::fault::*;
         let pc = self.next_entry as usize;
-        let info = crate::codemap::lookup_fault_info(pc, cpu.rip);
+        let owned_info = crate::codemap::lookup_fault_info(pc, cpu.rip);
+        let info = owned_info.as_ref();
         let mut exit = crate::fault::memory_exit(
             cpu.rip,
             self.fault_addr,
@@ -798,7 +801,7 @@ pub unsafe fn run_compiled(
             };
             match crate::interp::step_one(mem, cpu, mode, &mut scratch, &mut info) {
                 StepResult::Exit(exit) => {
-                    StepResult::Exit(ctx.preserve_host_replay(exit, fault_info, true))
+                    StepResult::Exit(ctx.preserve_host_replay(exit, fault_info.as_ref(), true))
                 }
                 other => other,
             }
