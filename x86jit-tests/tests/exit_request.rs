@@ -23,6 +23,20 @@ const REP_SIGNAL: [u8; 15] = [
     0x49, 0xc7, 0xc3, 0x00, 0x01, 0x00, 0x00, 0x4c, 0x87, 0x1c, 0x25, 0x00, 0x70, 0x00, 0x00,
 ];
 const TIMEOUT: Duration = Duration::from_secs(10);
+// A request that lands before or after the run is retried with a larger count,
+// which widens the window for a descheduled requester. The cap bounds guest
+// memory (the REP fixtures map about twice `count` bytes) and run time under load.
+const MAX_ATTEMPTS: u32 = 64;
+const MAX_COUNT: u64 = 1 << 24;
+
+fn retry_larger(count: &mut u64, attempts: &mut u32) {
+    *attempts += 1;
+    assert!(
+        *attempts < MAX_ATTEMPTS,
+        "the exit request never landed mid-run in {MAX_ATTEMPTS} attempts"
+    );
+    *count = (*count * 2).min(MAX_COUNT);
+}
 
 #[derive(Clone, Copy)]
 enum Tier {
@@ -130,6 +144,7 @@ fn loop_interrupt(tier: Tier) {
     ];
     let vm = vm(tier, &code, 0x10000);
     let mut count = 16_384;
+    let mut attempts = 0;
     let mut initial = cpu(&vm);
     initial.set_reg(Reg::Rcx, count);
     initial.cpu.flags.cf = true;
@@ -147,7 +162,7 @@ fn loop_interrupt(tier: Tier) {
                 break (interrupted, seed);
             }
         }
-        count *= 2;
+        retry_larger(&mut count, &mut attempts);
     };
     assert!(
         interrupted.reg(Reg::Rax) > 0,
@@ -234,11 +249,9 @@ fn exit_request_infinite_region() {
 
 fn rep_interrupt(tier: Tier, movs: bool) {
     let mut count = 65_536;
-    loop {
-        if rep_interrupt_attempt(tier, movs, count) {
-            return;
-        }
-        count *= 2;
+    let mut attempts = 0;
+    while !rep_interrupt_attempt(tier, movs, count) {
+        retry_larger(&mut count, &mut attempts);
     }
 }
 
@@ -458,6 +471,7 @@ fn exit_request_survives_smc_drain_region() {
 
 fn mid_block_rep(tier: Tier, later_flags: bool) {
     let mut count = 65_536;
+    let mut attempts = 0;
     loop {
         // add edx,1; rep stosb; [add ebx,1]; hlt. In region mode the
         // statically cyclic suffix exits at runtime because R8 is zero.
@@ -485,11 +499,11 @@ fn mid_block_rep(tier: Tier, later_flags: bool) {
         initial.cpu.flags.zf = true;
         let seed = initial.cpu.clone();
         let Some(mut interrupted) = interrupt(Arc::clone(&vm), initial, SIGNAL) else {
-            count *= 2;
+            retry_larger(&mut count, &mut attempts);
             continue;
         };
         if interrupted.reg(Reg::Rcx) == 0 || interrupted.reg(Reg::Rcx) == count {
-            count *= 2;
+            retry_larger(&mut count, &mut attempts);
             continue;
         }
         let mut prefix = seed.clone();
