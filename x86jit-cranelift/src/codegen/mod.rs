@@ -28,7 +28,7 @@ use x86jit_core::jit_abi::{
     MEMCTX_RET_STACK, MEMCTX_SIZE, MEMCTX_WATCH_BITS_PTR, MEMCTX_WATCH_COUNT_PTR, RETSTACK_ENTRIES,
     RETSTACK_SP, RETSTACK_STRIDE, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_EXCEPTION_DETAIL,
     RET_HLT, RET_IBTC_MISS, RET_LINK, RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER,
-    RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED, RET_UNMAPPED_DETAIL,
+    RET_RETURN_MISS, RET_STACK_LEN, RET_SYSCALL, RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
 use x86jit_core::memory::{CODE_PAGE_BITS, CODE_RANGE_BITS};
 use x86jit_core::GuestAccessKind;
@@ -182,7 +182,7 @@ impl Helpers {
     /// `note_watch` is the one entry that cannot use the shared shape: every guest
     /// store emits a (gated) call to it, so it is reached by almost any block and
     /// Cranelift asserts on the argument count. The caller supplies its real
-    /// 3-parameter, no-return signature via `note_watch`. Any OTHER helper the block
+    /// 4-parameter, no-return signature via `note_watch`. Any OTHER helper the block
     /// actually calls needs the same treatment — `mk()` is only sound for entries that
     /// are never invoked.
     #[cfg(test)]
@@ -4019,7 +4019,15 @@ impl Translator<'_, '_> {
             self.switch_fp(x86jit_core::jit_abi::fp::default_control());
         }
         let callee = self.iconst(addr);
-        let call = self.builder.ins().call_indirect(sig, callee, args);
+        let enabled = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.mem,
+            std::mem::offset_of!(x86jit_core::jit_abi::MemCtx, time_enabled) as i32,
+        );
+        let mut args = args.to_vec();
+        args.push(enabled);
+        let call = self.builder.ins().call_indirect(sig, callee, &args);
         if self.helpers.mxcsr_mode != 0 {
             self.switch_fp(self.helpers.fp_control);
         }
@@ -5550,7 +5558,7 @@ impl Translator<'_, '_> {
     /// guest return target (already popped off the guest stack and stored to RIP).
     /// Pop the shadow ring; if the frame's predicted address equals `actual`, chain
     /// to the caller's continuation via its slot (filled → `RET_CHAIN`, empty →
-    /// `RET_LINK`); on underflow or a mismatch, fall back to `RET_CONTINUE`.
+    /// `RET_LINK`); on underflow or a mismatch, request `RET_RETURN_MISS`.
     /// Correctness never depends on the ring — only the addr compare gates a hit.
     pub(crate) fn emit_ret_predict(&mut self, actual: Value) {
         let rs = self.ret_stack_ptr();
@@ -5609,9 +5617,9 @@ impl Translator<'_, '_> {
 
         // Mispredict or underflow: the plain dispatch path.
         self.builder.switch_to_block(miss);
-        self.ret(RET_CONTINUE);
+        self.ret(RET_RETURN_MISS);
         self.builder.switch_to_block(underflow);
-        self.ret(RET_CONTINUE);
+        self.ret(RET_RETURN_MISS);
     }
 
     /// Gate before a region sub-block (§12 M5-T3): spent fuel or a dispatch notice
@@ -6014,10 +6022,10 @@ mod barrier_tests {
 
         // `note_store` emits a real call to `note_watch` for EVERY store, so unlike the
         // never-called dummies below its signature must match the actual helper:
-        // note_watch(mem_self, addr, len) -> () — 3 params, no return.
+        // note_watch(mem_self, addr, len, time_enabled) -> () — 4 params, no return.
         let note_watch = {
             let mut sig = Signature::new(isa.default_call_conv());
-            for _ in 0..3 {
+            for _ in 0..4 {
                 sig.params.push(AbiParam::new(types::I64));
             }
             (
@@ -6280,9 +6288,9 @@ mod density_tests {
         };
         let dummy_sig = builder.import_signature(sig_n(6, true));
         // Every store emits a gated call to `note_watch`, so it needs its real
-        // signature — `(mem_self, addr, len) -> ()` — or Cranelift asserts on the
+        // signature — `(mem_self, addr, len, time_enabled) -> ()` — or Cranelift asserts on the
         // argument count. Any other helper a case actually calls needs the same.
-        let nw_sig = builder.import_signature(sig_n(3, false));
+        let nw_sig = builder.import_signature(sig_n(4, false));
         let mut mk = || (dummy_sig, 0u64, counter);
         let helpers = Helpers::all_dummy(&mut mk, (nw_sig, 0u64, counter));
         let mut slot = 0u64;

@@ -188,6 +188,17 @@ fn collect_guest_traps(
     Ok(sites)
 }
 
+// Keep the disabled path to one flag branch, without constructing or dropping
+// a sample guard. The timed invocation runs the same helper body with its flag off.
+macro_rules! account_helper {
+    ($enabled:expr, $call:expr) => {
+        if $enabled != 0 {
+            let _time_helper = x86jit_core::time_stats::HelperTimer::enter();
+            return $call;
+        }
+    };
+}
+
 /// Division helper called from compiled code (div isn't hot, so a call is fine and
 /// avoids 128-bit codegen). Reuses the interpreter's `divide` so both agree.
 /// `out` points at `[quot, rem]`; returns 0 on success, 1 on `#DE`.
@@ -202,7 +213,12 @@ unsafe extern "C" fn div_helper(
     size: u64,
     signed: u64,
     out: *mut u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        div_helper(hi, lo, divisor, size, signed, out, 0)
+    );
     match x86jit_core::interp::divide(hi, lo, divisor, size as u8, signed != 0) {
         Some((q, r)) => {
             *out = q;
@@ -230,7 +246,12 @@ unsafe extern "C" fn string_helper(
     cur_addr: u64,
     addr_bits: u64,
     seg_base: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        string_helper(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_UNMAPPED_DETAIL};
     use x86jit_core::{RepKind, StrOp};
 
@@ -320,7 +341,12 @@ unsafe extern "C" fn cas_pair_helper(
     size: u64,
     cur: u64,
     len: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        cas_pair_helper(cpu, mem, addr, size, cur, len, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION, RET_MMIO_DEFER, RET_UNMAPPED};
     // SAFETY: the compiled-block ABI supplies these live, per-vcpu pointers.
     let (cpu, ctx) = unsafe {
@@ -409,7 +435,12 @@ unsafe extern "C" fn x87_helper<const CHECK_FDP: bool>(
     addr: u64,
     sti: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        x87_helper::<CHECK_FDP>(cpu, mem, kind, addr, sti, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -467,7 +498,12 @@ unsafe extern "C" fn fxstate_helper(
     addr: u64,
     restore: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        fxstate_helper(cpu, mem, addr, restore, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -514,7 +550,12 @@ unsafe extern "C" fn xstate_helper(
     kind: u64,
     format: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        xstate_helper(cpu, mem, addr, kind, format, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION_DETAIL, RET_UNMAPPED};
     use x86jit_core::x87::xstate::{exec_xstate, XStateFault, XStateKind};
     // SAFETY: the compiled-block ABI supplies exclusive CPU and live memory context.
@@ -557,14 +598,16 @@ unsafe extern "C" fn xstate_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn cpuid_helper(cpu: *mut u8) {
+unsafe extern "C" fn cpuid_helper(cpu: *mut u8, time_enabled: u64) {
+    account_helper!(time_enabled, cpuid_helper(cpu, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::cpuid_run(cpu);
 }
 
 /// # Safety
 /// `cpu` is a valid exclusive pointer to a `CpuState` for this call.
-unsafe extern "C" fn tsc_helper(cpu: *mut u8, aux: u64) {
+unsafe extern "C" fn tsc_helper(cpu: *mut u8, aux: u64, time_enabled: u64) {
+    account_helper!(time_enabled, tsc_helper(cpu, aux, 0));
     // SAFETY: the compiled-block ABI supplies the live vCPU exclusively.
     let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
     x86jit_core::interp::tsc_run(cpu, aux != 0);
@@ -572,7 +615,14 @@ unsafe extern "C" fn tsc_helper(cpu: *mut u8, aux: u64) {
 
 /// # Safety
 /// `cpu` is a valid exclusive pointer to a `CpuState` for this call.
-unsafe extern "C" fn random_helper(cpu: *mut u8, seed: u64, size: u64, flags: u64) -> u64 {
+unsafe extern "C" fn random_helper(
+    cpu: *mut u8,
+    seed: u64,
+    size: u64,
+    flags: u64,
+    time_enabled: u64,
+) -> u64 {
+    account_helper!(time_enabled, random_helper(cpu, seed, size, flags, 0));
     // SAFETY: the compiled-block ABI supplies the live vCPU exclusively.
     let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
     let kind = if seed != 0 {
@@ -588,7 +638,13 @@ unsafe extern "C" fn random_helper(cpu: *mut u8, seed: u64, size: u64, flags: u6
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn xgetbv_helper(cpu: *mut u8, mem: *mut u8, cur_addr: u64) -> u64 {
+unsafe extern "C" fn xgetbv_helper(
+    cpu: *mut u8,
+    mem: *mut u8,
+    cur_addr: u64,
+    time_enabled: u64,
+) -> u64 {
+    account_helper!(time_enabled, xgetbv_helper(cpu, mem, cur_addr, 0));
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_EXCEPTION_DETAIL};
     // SAFETY: the compiled-block ABI supplies exclusive CPU and live memory context.
     let cpu = unsafe { &mut *(cpu as *mut x86jit_core::CpuState) };
@@ -616,13 +672,15 @@ unsafe extern "C" fn xgetbv_helper(cpu: *mut u8, mem: *mut u8, cur_addr: u64) ->
 ///
 /// # Safety
 /// `mem_self` is the live `*const Memory` for this run (set by `MemCtx::for_memory`).
-unsafe extern "C" fn note_write_helper(mem_self: u64, addr: u64, len: u64) {
+unsafe extern "C" fn note_write_helper(mem_self: u64, addr: u64, len: u64, time_enabled: u64) {
+    account_helper!(time_enabled, note_write_helper(mem_self, addr, len, 0));
     let mem = &*(mem_self as *const x86jit_core::memory::Memory);
     mem.note_write(addr, len as usize);
 }
 
 /// `crc32` helper: CRC-32C folding via the shared `crc32c` so both backends agree.
-extern "C" fn crc32_helper(crc: u64, src: u64, bytes: u64) -> u64 {
+extern "C" fn crc32_helper(crc: u64, src: u64, bytes: u64, time_enabled: u64) -> u64 {
+    account_helper!(time_enabled, crc32_helper(crc, src, bytes, 0));
     x86jit_core::interp::crc32c(crc as u32, src, bytes as u8) as u64
 }
 
@@ -633,7 +691,15 @@ extern "C" fn crc32_helper(crc: u64, src: u64, bytes: u64) -> u64 {
 ///
 /// # Safety
 /// `out` points to two writable `u64`s for the call.
-unsafe extern "C" fn bmi_helper(a: u64, b: u64, op: u64, size: u64, out: *mut u64) {
+unsafe extern "C" fn bmi_helper(
+    a: u64,
+    b: u64,
+    op: u64,
+    size: u64,
+    out: *mut u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, bmi_helper(a, b, op, size, out, 0));
     use x86jit_core::ir::BmiOp::*;
     let bmiop = match op {
         0 => Andn,
@@ -665,7 +731,12 @@ unsafe extern "C" fn vmaskmov_helper(
     elem: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vmaskmov_helper(cpu, dst, src, k, elem, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let newval = cpu.vec_lanes(src as usize);
     cpu.write_masked(
@@ -709,7 +780,25 @@ unsafe extern "C" fn vmaskmov_mem_helper(
     is_store: u64,
     cur_addr: u64,
     broadcast_elem: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vmaskmov_mem_helper(
+            cpu,
+            mem,
+            reg,
+            addr,
+            k,
+            elem,
+            zeroing,
+            bytes,
+            is_store,
+            cur_addr,
+            broadcast_elem,
+            0
+        )
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -796,7 +885,15 @@ unsafe extern "C" fn gather_helper(
     scale: u64,
     addr32: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        gather_helper(
+            cpu, mem, dst, mask, index, base, segment, elem, index_elem, bytes, scale, addr32,
+            cur_addr, 0
+        )
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     // SAFETY: the compiled-block ABI supplies these live pointers.
     let cpu = unsafe { &mut *cpu.cast::<x86jit_core::CpuState>() };
@@ -853,7 +950,12 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
     bytes: u64,
     is_store: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vec_maskmov_mem_helper(cpu, mem, reg, addr, mask, elem, bytes, is_store, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -937,7 +1039,12 @@ unsafe extern "C" fn vmasked_logic_helper(
     elem: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vmasked_logic_helper(cpu, op_code, dst, a, b, k, elem, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_masked_logic(
         cpu,
@@ -965,7 +1072,12 @@ unsafe extern "C" fn vmasked_packed_helper(
     elem: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vmasked_packed_helper(cpu, op_code, dst, a, b, k, elem, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_masked_packed(
         cpu,
@@ -995,7 +1107,12 @@ unsafe extern "C" fn vmasked_shift_helper(
     k: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vmasked_shift_helper(cpu, dst, a, imm, elem, right, arith, k, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_masked_shift(
         cpu,
@@ -1028,7 +1145,12 @@ unsafe extern "C" fn var_shift_helper(
     k: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        var_shift_helper(cpu, dst, a, count, elem, right, arith, k, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_var_shift(
         cpu,
@@ -1061,7 +1183,12 @@ unsafe extern "C" fn shift_reg_helper(
     k: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        shift_reg_helper(cpu, dst, a, count, elem, right, arith, k, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_shift_reg(
         cpu,
@@ -1093,7 +1220,12 @@ unsafe extern "C" fn gf2p8_helper(
     k: u64,
     zeroing: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        gf2p8_helper(cpu, dst, a, b, imm, mode, k, zeroing, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_gf2p8(
         cpu,
@@ -1126,7 +1258,12 @@ unsafe extern "C" fn gf2p8_mem_helper(
     zeroing: u64,
     bytes: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        gf2p8_mem_helper(cpu, mem, dst, a, addr, imm, mode, k, zeroing, bytes, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -1184,7 +1321,12 @@ unsafe extern "C" fn pcmpstr_helper(
     imm: u64,
     explicit: u64,
     out: *mut u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        pcmpstr_helper(cpu, a, b, imm, explicit, out, 0)
+    );
     let cpu = &*(cpu as *const x86jit_core::state::CpuState);
     let (ecx, cf, zf, sf, of) =
         x86jit_core::interp::pcmpstr_run(cpu, a as u8, b as u8, imm as u8, explicit != 0);
@@ -1208,7 +1350,12 @@ unsafe extern "C" fn pcmpstr_mem_helper(
     imm: u64,
     explicit: u64,
     out: *mut u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        pcmpstr_mem_helper(cpu, a, bv_lo, bv_hi, imm, explicit, out, 0)
+    );
     let cpu = &*(cpu as *const x86jit_core::state::CpuState);
     let bv = (bv_lo as u128) | ((bv_hi as u128) << 64);
     let (ecx, cf, zf, sf, of) =
@@ -1230,7 +1377,12 @@ unsafe extern "C" fn pcmpstrm_helper(
     imm: u64,
     explicit: u64,
     out: *mut u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        pcmpstrm_helper(cpu, a, b, imm, explicit, out, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let (mask, cf, zf, sf, of) =
         x86jit_core::interp::pcmpstrm_run(cpu, a as u8, b as u8, imm as u8, explicit != 0);
@@ -1252,7 +1404,12 @@ unsafe extern "C" fn pcmpstrm_mem_helper(
     imm: u64,
     explicit: u64,
     out: *mut u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        pcmpstrm_mem_helper(cpu, a, bv_lo, bv_hi, imm, explicit, out, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let bv = (bv_lo as u128) | ((bv_hi as u128) << 64);
     let (mask, cf, zf, sf, of) =
@@ -1271,7 +1428,12 @@ unsafe extern "C" fn valign_helper(
     shift: u64,
     elem: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        valign_helper(cpu, dst, a, b, shift, elem, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_valign(
         cpu,
@@ -1302,7 +1464,12 @@ unsafe extern "C" fn vpermt2_helper(
     zeroing: u64,
     bytes: u64,
     imode: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpermt2_helper(cpu, dst, idx, tbl, elem, k, masked, zeroing, bytes, imode, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpermt2(
         cpu,
@@ -1338,7 +1505,14 @@ unsafe extern "C" fn vpermt2_mem_helper(
     bytes: u64,
     imode: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vpermt2_mem_helper(
+            cpu, mem, dst, idx, addr, elem, k, masked, zeroing, bytes, imode, cur_addr, 0
+        )
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -1390,7 +1564,12 @@ unsafe extern "C" fn vperm1_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vperm1_helper(cpu, dst, idx, src, elem, bytes, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vperm1(
         cpu,
@@ -1424,7 +1603,12 @@ unsafe extern "C" fn vperm1_mem_helper(
     zeroing: u64,
     bytes: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vperm1_mem_helper(cpu, mem, dst, idx, addr, elem, k, masked, zeroing, bytes, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -1476,7 +1660,12 @@ unsafe extern "C" fn vpmov_narrow_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpmov_narrow_helper(cpu, dst, src, from, to, src_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpmov_narrow(
         cpu,
@@ -1507,7 +1696,12 @@ unsafe extern "C" fn vpmov_narrow_mem_helper(
     to: u64,
     src_width: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vpmov_narrow_mem_helper(cpu, mem, src, addr, from, to, src_width, cur_addr, 0)
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -1562,7 +1756,12 @@ unsafe extern "C" fn vpmov_extend_wide_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpmov_extend_wide_helper(cpu, dst, src, from, to, signed, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpmov_extend_wide(
         cpu,
@@ -1593,7 +1792,12 @@ unsafe extern "C" fn vpabs_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpabs_helper(cpu, dst, src, elem, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpabs(
         cpu,
@@ -1625,7 +1829,12 @@ unsafe extern "C" fn vp_unary_lane_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vp_unary_lane_helper(cpu, dst, src, op, imm, elem, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vp_unary_lane(
         cpu,
@@ -1656,7 +1865,12 @@ unsafe extern "C" fn vp_blendm_helper(
     elem: u64,
     dst_width: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vp_blendm_helper(cpu, dst, a, b, k, elem, dst_width, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vp_blendm(
         cpu,
@@ -1687,7 +1901,12 @@ unsafe extern "C" fn vshuf_lane_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vshuf_lane_helper(cpu, dst, a, b, imm, elem, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vshuf_lane(
         cpu,
@@ -1718,7 +1937,12 @@ unsafe extern "C" fn vp_multishift_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vp_multishift_helper(cpu, dst, ctrl, data, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vp_multishift(
         cpu,
@@ -1747,7 +1971,12 @@ unsafe extern "C" fn vpshufb_wide_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpshufb_wide_helper(cpu, dst, a, idx, bytes, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpshufb_wide(
         cpu,
@@ -1776,7 +2005,12 @@ unsafe extern "C" fn vshuffle32_wide_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vshuffle32_wide_helper(cpu, dst, a, imm, bytes, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vshuffle32_wide(
         cpu,
@@ -1803,7 +2037,12 @@ unsafe extern "C" fn vpack_helper(
     from_elem: u64,
     signed: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpack_helper(cpu, dst, a, b, from_elem, signed, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_vpack(
         cpu,
@@ -1832,7 +2071,12 @@ unsafe extern "C" fn vpack_mem_helper(
     from_elem: u64,
     signed: u64,
     lane: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpack_mem_helper(cpu, dst, a, lo, hi, from_elem, signed, lane, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let b = (lo as u128) | ((hi as u128) << 64);
     // op1 by VALUE from `a`, not read back out of `dst` (§16).
@@ -1859,7 +2103,12 @@ unsafe extern "C" fn vhfloat_helper(
     op: u64,
     f64_prec: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vhfloat_helper(cpu, dst, a, b, op, f64_prec, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let prec = if f64_prec != 0 {
         x86jit_core::FPrec::F64
@@ -1888,7 +2137,12 @@ unsafe extern "C" fn vhfloat_mem_helper(
     op: u64,
     f64_prec: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vhfloat_mem_helper(cpu, dst, a, lo0, hi0, lo1, hi1, op, f64_prec, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let b = [
         (lo0 as u128) | ((hi0 as u128) << 64),
@@ -1910,7 +2164,16 @@ unsafe extern "C" fn vhfloat_mem_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn vhint_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, op: u64, bytes: u64) {
+unsafe extern "C" fn vhint_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    op: u64,
+    bytes: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, vhint_helper(cpu, dst, a, b, op, bytes, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let op = x86jit_core::interp::hint_op_from_code(op as u8);
     x86jit_core::interp::hint_reg(cpu, dst as u8, a as u8, b as u8, op, bytes as u16);
@@ -1933,7 +2196,12 @@ unsafe extern "C" fn vhint_mem_helper(
     hi1: u64,
     op: u64,
     bytes: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vhint_mem_helper(cpu, dst, a, lo0, hi0, lo1, hi1, op, bytes, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let blo = (lo0 as u128) | ((hi0 as u128) << 64);
     let bhi = (lo1 as u128) | ((hi1 as u128) << 64);
@@ -1947,7 +2215,14 @@ unsafe extern "C" fn vhint_mem_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn cvtph2ps_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u64) {
+unsafe extern "C" fn cvtph2ps_helper(
+    cpu: *mut u8,
+    dst: u64,
+    src: u64,
+    lanes: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, cvtph2ps_helper(cpu, dst, src, lanes, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let (lo, hi) = x86jit_core::interp::cvtph2ps(cpu.xmm[src as usize], lanes as usize);
     cpu.xmm[dst as usize] = lo;
@@ -1968,7 +2243,12 @@ unsafe extern "C" fn var_shift_mem_helper(
     elem: u64,
     right: u64,
     arith: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        var_shift_mem_helper(cpu, dst, a, lo, hi, lane, elem, right, arith, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let av = cpu.vec_lanes(a as usize)[lane as usize];
     let count = u128::from(lo) | (u128::from(hi) << 64);
@@ -1989,7 +2269,12 @@ unsafe extern "C" fn vstore_preflight_helper(
     addr: u64,
     bytes: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        vstore_preflight_helper(cpu, mem, addr, bytes, cur_addr, 0)
+    );
     use x86jit_core::interp::StrMem;
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -2021,7 +2306,12 @@ unsafe extern "C" fn cvtps2ph_value_helper(
     lanes: u64,
     rc: u64,
     out: *mut u128,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        cvtps2ph_value_helper(cpu, src, lanes, rc, out, 0)
+    );
     let cpu = &*(cpu as *const x86jit_core::state::CpuState);
     let rc = if rc & 4 != 0 {
         ((cpu.mxcsr >> 13) & 3) as u8
@@ -2043,7 +2333,15 @@ unsafe extern "C" fn cvtps2ph_value_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn cvtps2ph_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u64, rc: u64) {
+unsafe extern "C" fn cvtps2ph_helper(
+    cpu: *mut u8,
+    dst: u64,
+    src: u64,
+    lanes: u64,
+    rc: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, cvtps2ph_helper(cpu, dst, src, lanes, rc, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let out = x86jit_core::interp::cvtps2ph_with_mxcsr(
         cpu.xmm[src as usize],
@@ -2064,7 +2362,8 @@ unsafe extern "C" fn cvtps2ph_helper(cpu: *mut u8, dst: u64, src: u64, lanes: u6
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn phminposuw_helper(cpu: *mut u8, dst: u64, src: u64) {
+unsafe extern "C" fn phminposuw_helper(cpu: *mut u8, dst: u64, src: u64, time_enabled: u64) {
+    account_helper!(time_enabled, phminposuw_helper(cpu, dst, src, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     cpu.xmm[dst as usize] = x86jit_core::interp::phminposuw(cpu.xmm[src as usize]);
 }
@@ -2083,7 +2382,12 @@ unsafe extern "C" fn mpsadbw_helper(
     hi: u64,
     imm: u64,
     half: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        mpsadbw_helper(cpu, dst, a, lo, hi, imm, half, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let b = lo as u128 | ((hi as u128) << 64);
     let av = if half == 0 {
@@ -2104,7 +2408,8 @@ unsafe extern "C" fn mpsadbw_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn pmaddwd_helper(cpu: *mut u8, dst: u64, a: u64, b: u64) {
+unsafe extern "C" fn pmaddwd_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, time_enabled: u64) {
+    account_helper!(time_enabled, pmaddwd_helper(cpu, dst, a, b, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_pmaddwd(cpu, dst as u8, a as u8, b as u8);
 }
@@ -2114,7 +2419,16 @@ unsafe extern "C" fn pmaddwd_helper(cpu: *mut u8, dst: u64, a: u64, b: u64) {
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn vpmadd_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, ubsw: u64, bytes: u64) {
+unsafe extern "C" fn vpmadd_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    ubsw: u64,
+    bytes: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, vpmadd_helper(cpu, dst, a, b, ubsw, bytes, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_v_pmadd(cpu, dst as u8, a as u8, b as u8, ubsw != 0, bytes as u16);
 }
@@ -2133,7 +2447,12 @@ unsafe extern "C" fn vpmadd_mem_helper(
     hi: u64,
     ubsw: u64,
     hi_half: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        vpmadd_mem_helper(cpu, dst, a, lo, hi, ubsw, hi_half, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let memv = (lo as u128) | ((hi as u128) << 64);
     x86jit_core::interp::exec_v_pmadd_mem_lane(
@@ -2162,7 +2481,12 @@ unsafe extern "C" fn broadcast_lane_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        broadcast_lane_helper(cpu, dst, src, chunk, elem, dst_width, k, masked, zeroing, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_broadcast_lane(
         cpu,
@@ -2196,7 +2520,14 @@ unsafe extern "C" fn broadcast_lane_mem_helper(
     masked: u64,
     zeroing: u64,
     cur_addr: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        broadcast_lane_mem_helper(
+            cpu, mem, dst, base, chunk, elem, dst_width, k, masked, zeroing, cur_addr, 0
+        )
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -2262,7 +2593,15 @@ unsafe extern "C" fn fma_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        fma_helper(
+            cpu, dst, x, y, z, prec_f64, scalar, neg_prod, neg_add, bytes, alt_sign, k, masked,
+            zeroing, 0
+        )
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_fma(
         cpu,
@@ -2308,7 +2647,15 @@ unsafe extern "C" fn fma_mem_helper(
     k: u64,
     masked: u64,
     zeroing: u64,
+    time_enabled: u64,
 ) -> u64 {
+    account_helper!(
+        time_enabled,
+        fma_mem_helper(
+            cpu, mem, dst, x, y, z, base, mem_role, prec_f64, scalar, neg_prod, neg_add, bytes,
+            alt_sign, cur_addr, k, masked, zeroing, 0
+        )
+    );
     use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let ctx = &mut *(mem as *mut MemCtx);
@@ -2369,7 +2716,16 @@ unsafe extern "C" fn fma_mem_helper(
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn aes_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, op: u64, imm: u64) {
+unsafe extern "C" fn aes_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    op: u64,
+    imm: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, aes_helper(cpu, dst, a, b, op, imm, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     match op {
         4 => x86jit_core::interp::exec_aes_imc(cpu, dst as u8, a as u8),
@@ -2394,7 +2750,12 @@ unsafe extern "C" fn aes_mem_helper(
     hi: u64,
     op: u64,
     imm: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        aes_mem_helper(cpu, dst, a, lo, hi, op, imm, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let v = (lo as u128) | ((hi as u128) << 64);
     match op {
@@ -2412,7 +2773,16 @@ unsafe extern "C" fn aes_mem_helper(
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn sha_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, op: u64, imm: u64) {
+unsafe extern "C" fn sha_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    op: u64,
+    imm: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, sha_helper(cpu, dst, a, b, op, imm, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_sha(cpu, dst as u8, a as u8, b as u8, imm as u8, op as u8);
 }
@@ -2432,7 +2802,12 @@ unsafe extern "C" fn sha_mem_helper(
     hi: u64,
     op: u64,
     imm: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        sha_mem_helper(cpu, dst, a, lo, hi, op, imm, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let v = (lo as u128) | ((hi as u128) << 64);
     x86jit_core::interp::exec_sha_mem(cpu, dst as u8, a as u8, v, imm as u8, op as u8);
@@ -2446,7 +2821,16 @@ unsafe extern "C" fn sha_mem_helper(
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn gfni_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, op: u64, imm: u64) {
+unsafe extern "C" fn gfni_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    op: u64,
+    imm: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, gfni_helper(cpu, dst, a, b, op, imm, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_gfni(cpu, dst as u8, a as u8, b as u8, imm as u8, op as u8);
 }
@@ -2466,7 +2850,12 @@ unsafe extern "C" fn gfni_mem_helper(
     hi: u64,
     op: u64,
     imm: u64,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        gfni_mem_helper(cpu, dst, a, lo, hi, op, imm, 0)
+    );
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let v = (lo as u128) | ((hi as u128) << 64);
     x86jit_core::interp::exec_gfni_mem(cpu, dst as u8, a as u8, v, imm as u8, op as u8);
@@ -2478,7 +2867,15 @@ unsafe extern "C" fn gfni_mem_helper(
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn pclmul_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, imm: u64) {
+unsafe extern "C" fn pclmul_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    b: u64,
+    imm: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, pclmul_helper(cpu, dst, a, b, imm, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     x86jit_core::interp::exec_pclmul(cpu, dst as u8, a as u8, b as u8, imm as u8);
 }
@@ -2489,7 +2886,16 @@ unsafe extern "C" fn pclmul_helper(cpu: *mut u8, dst: u64, a: u64, b: u64, imm: 
 ///
 /// # Safety
 /// `cpu` is a valid pointer to a `CpuState` for the call.
-unsafe extern "C" fn pclmul_mem_helper(cpu: *mut u8, dst: u64, a: u64, lo: u64, hi: u64, imm: u64) {
+unsafe extern "C" fn pclmul_mem_helper(
+    cpu: *mut u8,
+    dst: u64,
+    a: u64,
+    lo: u64,
+    hi: u64,
+    imm: u64,
+    time_enabled: u64,
+) {
+    account_helper!(time_enabled, pclmul_mem_helper(cpu, dst, a, lo, hi, imm, 0));
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
     let v = (lo as u128) | ((hi as u128) << 64);
     x86jit_core::interp::exec_pclmul_mem(cpu, dst as u8, a as u8, v, imm as u8);
@@ -2792,6 +3198,8 @@ struct Shared {
     /// compile), for the bench's compile-vs-run split. Relaxed:
     /// a monotone accumulator, not a synchronization channel.
     compile_ns: AtomicU64,
+    time_enabled: AtomicBool,
+    background_ns: AtomicU64,
     /// Sticky: a failed module is never finalized or allocated from again.
     code_space_exhausted: AtomicBool,
     /// Registration and the exhaustion broadcast share a lock, so neither a
@@ -3175,6 +3583,8 @@ impl JitBackend {
                 done: Mutex::new(Vec::new()),
                 ready: AtomicUsize::new(0),
                 compile_ns: AtomicU64::new(0),
+                time_enabled: AtomicBool::new(false),
+                background_ns: AtomicU64::new(0),
                 code_space_exhausted: AtomicBool::new(false),
                 dispatch_words: Mutex::new(Vec::new()),
                 compile_limit: AtomicU64::new(u64::MAX),
@@ -3821,7 +4231,11 @@ impl Shared {
                         hidx += 1;
                     }
                     (
-                        builder.import_signature($sig),
+                        {
+                            let mut sig = $sig;
+                            sig.params.push(AbiParam::new(types::I64));
+                            builder.import_signature(sig)
+                        },
                         $f as *const u8 as u64,
                         counter,
                     )
@@ -4263,6 +4677,10 @@ impl Shared {
                     break;
                 }
             }
+            let time_batch = self
+                .time_enabled
+                .load(Ordering::Relaxed)
+                .then(x86jit_core::time_stats::MonotonicTime::now);
             loop {
                 let queued = {
                     let mut q = self.background.queue.lock().unwrap();
@@ -4389,6 +4807,14 @@ impl Shared {
             }
             self.ready.store(done.len(), Ordering::Release);
             drop(done);
+            if let Some(start) = time_batch {
+                let ns = start.elapsed_ns();
+                self.background_ns
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        Some(old.saturating_add(ns))
+                    })
+                    .ok();
+            }
             drop(batch); // completion guards notify wait_idle only after publication
         }
     }
@@ -4462,6 +4888,16 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn time_stats(&self) -> x86jit_core::BackendTimeStats {
+        let mut stats = x86jit_core::BackendTimeStats::default();
+        stats.background_compile_ns = self.shared.background_ns.load(Ordering::Relaxed);
+        stats
+    }
+
+    fn set_time_accounting(&self, enabled: bool) {
+        self.shared.time_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     fn memory_stats(&self) -> x86jit_core::BackendMemoryStats {
         let mut stats = self.shared.memory.snapshot();
         let queue = self
@@ -4498,6 +4934,7 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(ir, consistency, mmio, guest_base, 0, false)
             .map_or_else(
@@ -4514,6 +4951,7 @@ impl Backend for JitBackend {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(ir, consistency, mmio, guest_base, mxcsr_mode, false)
             .map_or_else(
@@ -4529,6 +4967,7 @@ impl Backend for JitBackend {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(region, consistency, mmio, guest_base, mxcsr_mode, false)
             .map_or_else(
@@ -4546,6 +4985,7 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(
                 ir,
@@ -4570,6 +5010,7 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(
                 region,
@@ -4596,6 +5037,7 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(region, consistency, mmio, guest_base, 0, false)
             .map_or_else(
@@ -4697,7 +5139,12 @@ unsafe extern "C" fn fp_boundary_helper(
     double: u64,
     mode: u64,
     out: *mut u128,
+    time_enabled: u64,
 ) {
+    account_helper!(
+        time_enabled,
+        fp_boundary_helper(alo, ahi, blo, bhi, op, double, mode, out, 0)
+    );
     use x86jit_core::interp::softfloat;
     let a = u128::from(alo) | (u128::from(ahi) << 64);
     let b = u128::from(blo) | (u128::from(bhi) << 64);
@@ -4782,6 +5229,7 @@ mod tests {
                         0,
                         0,
                         0,
+                        0,
                     )
                 };
                 assert_eq!(ret, RET_UNMAPPED);
@@ -4816,10 +5264,10 @@ mod tests {
         )>> = const { std::cell::RefCell::new(None) };
     }
 
-    unsafe extern "C" fn paused_store(mem: u64, addr: u64, len: u64) {
+    unsafe extern "C" fn paused_store(mem: u64, addr: u64, len: u64, time_enabled: u64) {
         // SAFETY: the generated store passes the same live Memory pointer and
         // checked range as the normal note_write helper.
-        unsafe { note_write_helper(mem, addr, len) };
+        unsafe { note_write_helper(mem, addr, len, time_enabled) };
         SMC_PAUSE.with(|slot| {
             if let Some((entered, resume)) = slot.borrow_mut().take() {
                 let _ = entered.send(());

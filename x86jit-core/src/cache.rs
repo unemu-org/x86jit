@@ -80,6 +80,7 @@ struct SpanIndex {
 }
 
 struct PendingTierUp {
+    queued_at: Option<crate::time_stats::MonotonicTime>,
     id: u64,
     spans: Option<Vec<(u64, u32)>>,
     cancelled: bool,
@@ -233,6 +234,8 @@ pub struct TranslationCache {
     // Background tier-up "fires" counters: a completion published into the cache, or
     // rejected (epoch moved / block gone) at publish time.
     tier_bg_published: AtomicU64,
+    tier_up_latency_ns: AtomicU64,
+    tier_up_latency_count: AtomicU64,
     tier_bg_rejected: AtomicU64,
 }
 
@@ -349,6 +352,8 @@ impl TranslationCache {
             hotness: RwLock::new(HashMap::new()),
             region_decision: RwLock::new(HashMap::new()),
             tier_bg_published: AtomicU64::new(0),
+            tier_up_latency_ns: AtomicU64::new(0),
+            tier_up_latency_count: AtomicU64::new(0),
             tier_bg_rejected: AtomicU64::new(0),
         }
     }
@@ -519,7 +524,7 @@ impl TranslationCache {
     /// Look up a block, recording a hit (found) or miss (must lift).
     #[inline(always)]
     pub fn get(&self, key: BlockKey) -> Option<CachedBlock> {
-        let found = self.map.read().unwrap().get(&key).cloned();
+        let found = self.get_for_dispatch(key);
         if found.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -528,13 +533,37 @@ impl TranslationCache {
         found
     }
 
-    /// Blocks served from the cache (no re-lift).
+    // Keep lookup temporaries out of the compiled chaining loop's register set.
+    #[inline(never)]
+    pub(crate) fn get_for_dispatch(&self, key: BlockKey) -> Option<CachedBlock> {
+        self.map.read().unwrap().get(&key).cloned()
+    }
+
+    pub(crate) fn add_dispatch_counts(&self, hits: u64, misses: u64) {
+        if hits != 0 {
+            self.hits.fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses != 0 {
+            self.misses.fetch_add(misses, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn tier_up_time_stats(&self) -> (u64, u64) {
+        (
+            self.tier_up_latency_ns.load(Ordering::Relaxed),
+            self.tier_up_latency_count.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Blocks served from the cache (no re-lift). Dispatcher activity is
+    /// published at run return; direct `get` calls are counted immediately.
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
 
     /// Blocks that had to be lifted (distinct addresses, plus any re-lift after
-    /// invalidation).
+    /// invalidation). Dispatcher activity is published at run return; direct
+    /// `get` calls are counted immediately.
     pub fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
     }
@@ -600,6 +629,7 @@ impl TranslationCache {
         spans.pending.insert(
             key,
             PendingTierUp {
+                queued_at: None,
                 id,
                 spans: None,
                 cancelled: false,
@@ -634,6 +664,8 @@ impl TranslationCache {
         }
         on_mark(&source_spans);
         pending.spans = Some(source_spans);
+        pending.queued_at =
+            crate::time_stats::enabled().then(crate::time_stats::MonotonicTime::now);
         Some(pending.id)
     }
 
@@ -697,6 +729,19 @@ impl TranslationCache {
         spans.insert(key, source_spans);
         self.hotness.write().unwrap().remove(&key);
         self.record_tier_bg_published();
+        if let Some(start) = pending.queued_at {
+            let ns = start.elapsed_ns();
+            self.tier_up_latency_ns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old.saturating_add(ns))
+                })
+                .ok();
+            self.tier_up_latency_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old.saturating_add(1))
+                })
+                .ok();
+        }
         true
     }
 

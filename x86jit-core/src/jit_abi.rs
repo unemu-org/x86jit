@@ -76,6 +76,9 @@ pub const RET_EXCEPTION_DETAIL: u64 = 14;
 /// Classifier initialized next_entry to exact host PC and link_slot to site intent.
 /// Alignment may have no valid fault_addr; replay must precede address publication.
 pub const RET_HOST_FAULT_DETAIL: u64 = 15;
+/// Return prediction mismatch/underflow. RIP already holds the popped target;
+/// redispatch as RET_CONTINUE while accounting for an indirect resolve.
+pub const RET_RETURN_MISS: u64 = 16;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -210,6 +213,8 @@ pub struct MemCtx {
     /// Appended to preserve every pre-existing compiled-code field offset.
     /// Only helper miss paths set it; unmapped_exit consumes and clears both fields.
     pub helper_operand_size: u64,
+    /// In: detailed helper accounting enabled for this run; zero for standalone calls.
+    pub time_enabled: u64,
 }
 
 /// Number of frames in the shadow return stack ring (R5). A power of two so the
@@ -403,6 +408,7 @@ impl MemCtx {
             watch_count_ptr: mem.watch_count_ptr(),
             mem_self: mem as *const Memory as u64,
             icount_ptr: 0,
+            time_enabled: 0,
             watch_bits_ptr: mem.watch_bits_ptr(),
             code_range_ptr: mem.code_range_ptr(),
             dispatch_word_ptr: &NO_DISPATCH as *const std::sync::atomic::AtomicU64 as u64,
@@ -834,9 +840,8 @@ pub unsafe fn run_compiled(
     let mut scratch = RetStack::new();
     ctx.ret_stack = &mut scratch as *mut RetStack as u64;
     match call_block(entry, cpu, &mut ctx) {
-        RET_CONTINUE | RET_CHAIN | RET_LINK | RET_IBTC_MISS | RET_MXCSR_CHANGED => {
-            StepResult::Continue
-        }
+        RET_CONTINUE | RET_CHAIN | RET_LINK | RET_IBTC_MISS | RET_RETURN_MISS
+        | RET_MXCSR_CHANGED => StepResult::Continue,
         RET_SYSCALL => StepResult::Exit(Exit::Syscall),
         RET_HLT => StepResult::Exit(Exit::Hlt),
         RET_INTERRUPTED => StepResult::Exit(Exit::Interrupted),
@@ -1027,7 +1032,7 @@ mod tests {
         let off = |p: *const u64| (p as usize - base) as i32;
         assert_eq!(off(&m.helper_operand_addr), 136);
         assert_eq!(off(&m.helper_operand_size), 144);
-        assert_eq!(std::mem::size_of::<MemCtx>(), 152);
+        assert_eq!(std::mem::size_of::<MemCtx>(), 160);
         assert_eq!(off(&m.dispatch_word_ptr), MEMCTX_DISPATCH_WORD_PTR);
         assert_eq!(MEMCTX_DISPATCH_WORD_PTR, 128);
         assert_eq!(m.dispatch_word_ptr, &NO_DISPATCH as *const _ as u64);

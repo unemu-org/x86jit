@@ -150,9 +150,9 @@ fn compile_ir_for_isa_with_split_stores(
     ctx.func.signature.returns.push(AbiParam::new(types::I64));
     let mut fbctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
-    let sig = |n, returns| {
+    let sig = |n: usize, returns| {
         let mut sig = ir::Signature::new(isa.default_call_conv());
-        sig.params = vec![AbiParam::new(types::I64); n];
+        sig.params = vec![AbiParam::new(types::I64); n + 1];
         if returns {
             sig.returns.push(AbiParam::new(types::I64));
         }

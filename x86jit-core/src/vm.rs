@@ -12,8 +12,8 @@ use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
     MemCtx, RetStack, RET_CHAIN, RET_CONTINUE, RET_EXCEPTION, RET_EXCEPTION_DETAIL, RET_HLT,
     RET_HOST_FAULT, RET_HOST_FAULT_DETAIL, RET_IBTC_MISS, RET_INTERRUPTED, RET_LINK,
-    RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_SYSCALL, RET_UNMAPPED,
-    RET_UNMAPPED_DETAIL,
+    RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_RETURN_MISS, RET_SYSCALL,
+    RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
 use crate::lift::{
     lift_block_with_fault, lift_region, lift_region_with_fault, CpuMode, FetchAddr, LiftError,
@@ -95,6 +95,15 @@ impl std::error::Error for StepRunError {}
 /// vcpus behind `Arc`. A JIT impl that needs a mutable compiler context wraps it
 /// in interior mutability (e.g. `Mutex`).
 pub trait Backend: Send + Sync {
+    /// Worker timing snapshot; must not acquire a compiler lock. Wrappers forward it.
+    fn time_stats(&self) -> crate::BackendTimeStats {
+        crate::BackendTimeStats::default()
+    }
+
+    /// Enable detailed worker timing. Counts remain enabled independently.
+    /// Wrappers should forward this setting.
+    fn set_time_accounting(&self, _enabled: bool) {}
+
     /// Backend allocation counters. Implementations with no tracked storage use
     /// zeroes; wrappers should forward this method. Must not take compiler locks.
     fn memory_stats(&self) -> crate::BackendMemoryStats {
@@ -123,6 +132,8 @@ pub trait Backend: Send + Sync {
     /// to SMC and host exit requests and must be preserved.
     fn register_dispatch_word(&self, _word: &Arc<AtomicU64>) {}
 
+    /// Compiling backends wrap materialization in
+    /// [`crate::time_stats::ForegroundCompileTimer`] for per-vCPU timing.
     /// Compile `ir` for the given consistency tier. `consistency` only affects a
     /// JIT on a weak host (it picks the barrier strategy for ordinary guest
     /// loads/stores, §8.2.3); the interpreter and x86 hosts ignore it.
@@ -576,6 +587,8 @@ impl std::error::Error for ShutdownError {}
 
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
+    time_enabled: bool,
+    time_registry: Mutex<crate::time_stats::Registry>,
     vcpu_lifetime: Arc<()>,
     vcpu_memory: Mutex<Vec<std::sync::Weak<VcpuAllocations>>>,
     precise_split_stores: bool,
@@ -634,6 +647,27 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Sum cumulative vCPU counters without a compiler lock. See [`crate::TimeStats`]
+    /// for units, timing methods, snapshot lag and overlapping categories.
+    pub fn time_stats(&self) -> crate::TimeStats {
+        let mut stats = self.time_registry.lock().unwrap().snapshot();
+        stats.background_compile_ns = self.backend.time_stats().background_compile_ns;
+        let (ns, count) = self.cache.tier_up_time_stats();
+        stats.tier_up_latency_ns = ns;
+        stats.tier_up_latency_count = count;
+        stats
+    }
+
+    /// Enable transition timing and detailed helper accounting (default false).
+    /// Dispatch and exit counters remain enabled; helper counts and samples are
+    /// collected only while enabled. Existing totals are retained; subsequent run
+    /// entries use the new setting. Outside intervals spanning a disabled run are excluded.
+    /// Does not change generated code. See [`crate::TimeStats`] for precision.
+    pub fn set_time_accounting(&mut self, enabled: bool) {
+        self.time_enabled = enabled;
+        self.backend.set_time_accounting(enabled);
+    }
+
     /// Snapshot allocation categories without stopping execution. See
     /// [`crate::MemoryStats`] for precision, scope and omitted allocations.
     pub fn memory_stats(&self) -> crate::MemoryStats {
@@ -648,7 +682,8 @@ impl Vm {
                 + std::mem::size_of::<crate::jit_abi::fault::EntryRecord>()
                 + std::mem::size_of::<AtomicU64>()
                 + std::mem::size_of::<VcpuAllocations>()
-                + 4 * std::mem::size_of::<usize>()) as u64;
+                + std::mem::size_of::<crate::time_stats::Record>()
+                + 6 * std::mem::size_of::<usize>()) as u64;
             vcpus.fast_resolve_bytes += std::mem::size_of::<[FastEntry; FAST_N]>() as u64;
             vcpus.scratch_bytes += allocation.scratch.load(Ordering::Relaxed);
             vcpus.refill_bytes += allocation.refills.load(Ordering::Relaxed);
@@ -1019,6 +1054,8 @@ impl Vm {
     /// The embedder surfaces that as a typed error to the guest rather than aborting.
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
+            time_enabled: false,
+            time_registry: Mutex::default(),
             vcpu_lifetime: Arc::new(()),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: self.precise_split_stores,
@@ -1049,6 +1086,8 @@ impl Vm {
     /// public constructors, holding the default tier-up policy and CPU features in one place.
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
         Self {
+            time_enabled: false,
+            time_registry: Mutex::default(),
             vcpu_lifetime: Arc::new(()),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: false,
@@ -1333,6 +1372,9 @@ impl Vm {
         registry.push(Arc::downgrade(&allocations));
         drop(registry);
         Vcpu {
+            time_dispatch: crate::time_stats::DispatchCounts::default(),
+            time_record: self.time_registry.lock().unwrap().register(),
+            time_outside: None,
             allocations: allocations.clone(),
             _vm_lifetime: self.vcpu_lifetime.clone(),
             cpu,
@@ -1473,6 +1515,9 @@ impl crate::interp::ScratchBuffer for VcpuScratch {
 
 /// Per-guest-thread execution context: CPU state + its own `run()` loop (§2).
 pub struct Vcpu {
+    time_dispatch: crate::time_stats::DispatchCounts,
+    time_record: Arc<crate::time_stats::Record>,
+    time_outside: crate::time_stats::Outside,
     allocations: Arc<VcpuAllocations>,
     _vm_lifetime: Arc<()>,
     pub cpu: CpuState,
@@ -1553,6 +1598,32 @@ pub struct Vcpu {
     /// MOV/POP SS inhibition, kept distinct for consecutive-load policy
     /// (SDM Vol 3A §7.8.3; decision-16 §4). Interpreter-only, outside `CpuState`.
     ss_shadow: bool,
+}
+
+struct DispatchGuard<'a> {
+    cpu: &'a mut Vcpu,
+    vm: &'a Vm,
+    fast_before: u64,
+}
+
+impl<'a> DispatchGuard<'a> {
+    fn new(cpu: &'a mut Vcpu, vm: &'a Vm) -> Self {
+        let fast_before = cpu.fast_hits;
+        Self {
+            cpu,
+            vm,
+            fast_before,
+        }
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        let counts = self.cpu.finish_dispatch_counts(self.vm, self.fast_before);
+        let chains = std::mem::take(&mut self.cpu.chained);
+        self.vm.cache.add_chained(chains);
+        crate::time_stats::dispatch_counts(chains, counts);
+    }
 }
 
 impl Vcpu {
@@ -2021,6 +2092,13 @@ impl Vcpu {
             return Err(StepRunError::UnsupportedMode);
         }
         if max_steps == 0 {
+            let time_run = crate::time_stats::RunGuard::enter(
+                self.time_record.clone(),
+                vm.time_enabled,
+                self.time_outside.take(),
+            );
+            drop(DispatchGuard::new(self, vm));
+            self.time_outside = time_run.finish(Some(&Exit::BudgetExhausted));
             return Ok(StepRun {
                 steps: 0,
                 stop: StepStop::Exit(Exit::BudgetExhausted),
@@ -2029,9 +2107,16 @@ impl Vcpu {
         if self.cpu.pending_port_in.is_some() {
             return Err(StepRunError::PendingPortIn);
         }
-        self.interruption_evidence = None;
-        self.syscall_evidence = None;
-        self.fault_entry.prepare_run();
+        let time_run = crate::time_stats::RunGuard::enter(
+            self.time_record.clone(),
+            vm.time_enabled,
+            self.time_outside.take(),
+        );
+        let dispatch = DispatchGuard::new(self, vm);
+        let cpu = &mut *dispatch.cpu;
+        cpu.interruption_evidence = None;
+        cpu.syscall_evidence = None;
+        cpu.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         // As in run(), deactivate publication even if an embedder callback unwinds.
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
@@ -2043,30 +2128,34 @@ impl Vcpu {
                 }
             }
         }
-        let guard = FaultRunGuard(&mut *self.fault_entry);
+        let guard = FaultRunGuard(&mut *cpu.fault_entry);
         let mut steps = crate::interp::StepContext::new(max_steps);
         let stop = match (vm.mem.host_fault_recovery(), options.stop_when_irq_ready) {
-            (true, true) => self.run_steps_inner::<true, true>(vm, &mut steps, &mut fp_mode),
-            (true, false) => self.run_steps_inner::<true, false>(vm, &mut steps, &mut fp_mode),
-            (false, true) => self.run_steps_inner::<false, true>(vm, &mut steps, &mut fp_mode),
-            (false, false) => self.run_steps_inner::<false, false>(vm, &mut steps, &mut fp_mode),
+            (true, true) => cpu.run_steps_inner::<true, true>(vm, &mut steps, &mut fp_mode),
+            (true, false) => cpu.run_steps_inner::<true, false>(vm, &mut steps, &mut fp_mode),
+            (false, true) => cpu.run_steps_inner::<false, true>(vm, &mut steps, &mut fp_mode),
+            (false, false) => cpu.run_steps_inner::<false, false>(vm, &mut steps, &mut fp_mode),
         };
         drop(guard);
         let stop = match stop {
             StepStop::Exit(exit) => {
-                let exit = crate::fault::qualify_real16(exit, &self.cpu);
+                let exit = crate::fault::qualify_real16(exit, &cpu.cpu);
                 let exit = match exit {
                     exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
-                        self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+                        cpu.fault_entry.finish_transfer_fault(exit, &vm.mem)
                     }
                     other => other,
                 };
-                self.cpu.finish_mmio_retry(Some(&exit));
+                cpu.cpu.finish_mmio_retry(Some(&exit));
                 StepStop::Exit(exit)
             }
             StepStop::IrqReady => StepStop::IrqReady,
         };
-        vm.cache.add_chained(std::mem::take(&mut self.chained));
+        drop(dispatch);
+        self.time_outside = time_run.finish(match &stop {
+            StepStop::Exit(exit) => Some(exit),
+            StepStop::IrqReady => None,
+        });
         Ok(StepRun {
             steps: steps.steps,
             stop,
@@ -2082,6 +2171,7 @@ impl Vcpu {
         let exit_word_owner = Arc::clone(&self.exit_request.word);
         let exit_word: &AtomicU64 = &exit_word_owner;
         let mut ctx = MemCtx::for_memory(&vm.mem);
+        ctx.time_enabled = u64::from(vm.time_enabled);
         self.fault_entry.publish(&mut self.cpu, &mut ctx);
         if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
             return StepStop::Exit(exit);
@@ -2129,6 +2219,7 @@ impl Vcpu {
             let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
             let block = match resolve_dispatch::<true>(
                 vm,
+                &mut self.time_dispatch,
                 exit_word,
                 &self.engine_sections,
                 fetch,
@@ -2222,9 +2313,16 @@ impl Vcpu {
     /// have made partial progress and resumes at the string instruction. Evidence
     /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
-        self.interruption_evidence = None;
-        self.syscall_evidence = None;
-        self.fault_entry.prepare_run();
+        let time_run = crate::time_stats::RunGuard::enter(
+            self.time_record.clone(),
+            vm.time_enabled,
+            self.time_outside.take(),
+        );
+        let dispatch = DispatchGuard::new(self, vm);
+        let cpu = &mut *dispatch.cpu;
+        cpu.interruption_evidence = None;
+        cpu.syscall_evidence = None;
+        cpu.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
         impl Drop for FaultRunGuard {
@@ -2236,35 +2334,48 @@ impl Vcpu {
                 }
             }
         }
-        let fault_run = FaultRunGuard(&mut *self.fault_entry);
+        let fault_run = FaultRunGuard(&mut *cpu.fault_entry);
         let exit = if vm.mem.host_fault_recovery() {
-            self.run_inner::<true>(vm, budget, &mut fp_mode)
+            cpu.run_inner::<true>(vm, budget, &mut fp_mode)
         } else {
-            self.run_inner::<false>(vm, budget, &mut fp_mode)
+            cpu.run_inner::<false>(vm, budget, &mut fp_mode)
         };
         drop(fault_run);
         let exit = match exit {
             exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
-                self.fault_entry.finish_transfer_fault(exit, &vm.mem)
+                cpu.fault_entry.finish_transfer_fault(exit, &vm.mem)
             }
             other => other,
         };
-        self.cpu.finish_mmio_retry(Some(&exit));
-        if matches!(exit, Exit::Interrupted) && self.interruption_evidence.is_none() {
+        cpu.cpu.finish_mmio_retry(Some(&exit));
+        if matches!(exit, Exit::Interrupted) && cpu.interruption_evidence.is_none() {
             // Acquire the writes published by the consumed request. A later
             // request remains pending; a concurrent SMC bit survives the mask.
-            self.interruption_evidence =
-                Some(
-                    crate::interruption::consume(&self.exit_request.word, &self.engine_sections)
-                        .at(crate::FaultPath::Unknown, false, self.cpu.rip),
-                );
+            cpu.interruption_evidence = Some(
+                crate::interruption::consume(&cpu.exit_request.word, &cpu.engine_sections).at(
+                    crate::FaultPath::Unknown,
+                    false,
+                    cpu.cpu.rip,
+                ),
+            );
         }
-        // Published here rather than at each of the inner loop's many exits, so no
-        // path can forget it: one shared atomic per run instead of one per transfer.
-        // (`executed` needs no flush — compiled code updates it live through
-        // `MemCtx.icount_ptr`.)
-        vm.cache.add_chained(std::mem::take(&mut self.chained));
+        drop(dispatch);
+        self.time_outside = time_run.finish(Some(&exit));
         exit
+    }
+
+    fn finish_dispatch_counts(
+        &mut self,
+        vm: &Vm,
+        fast_before: u64,
+    ) -> crate::time_stats::DispatchCounts {
+        let mut counts = std::mem::take(&mut self.time_dispatch);
+        vm.cache
+            .add_dispatch_counts(counts.lookups.saturating_sub(counts.misses), counts.misses);
+        counts.lookups = counts
+            .lookups
+            .saturating_add(self.fast_hits.saturating_sub(fast_before));
+        counts
     }
 
     /// Guest x86 instructions executed by this vcpu, counting compiled blocks and
@@ -2354,10 +2465,12 @@ impl Vcpu {
                 self.fast_clear();
                 self.fast_mxcsr_mode = mode;
             }
-            let result = if mode == 0 {
-                self.run_dispatch::<ROUTED, true>(vm, remaining, fp_mode)
-            } else {
-                self.run_dispatch::<ROUTED, false>(vm, remaining, fp_mode)
+            let limit = remaining.unwrap_or(u64::MAX);
+            let result = match (mode == 0, remaining.is_some()) {
+                (true, true) => self.run_dispatch::<ROUTED, true, true>(vm, limit, fp_mode),
+                (true, false) => self.run_dispatch::<ROUTED, true, false>(vm, limit, fp_mode),
+                (false, true) => self.run_dispatch::<ROUTED, false, true>(vm, limit, fp_mode),
+                (false, false) => self.run_dispatch::<ROUTED, false, false>(vm, limit, fp_mode),
             };
             match result {
                 Ok(exit) => return exit,
@@ -2369,10 +2482,11 @@ impl Vcpu {
     // A mode write returns to run_inner to select a new specialization and flush
     // private predictions. Default block transfers contain no FP guard checks.
     #[inline(never)]
-    fn run_dispatch<const ROUTED: bool, const DEFAULT: bool>(
+    // Unlimited runs keep budget state out of the compiled chain loop's registers.
+    fn run_dispatch<const ROUTED: bool, const DEFAULT: bool, const BOUNDED: bool>(
         &mut self,
         vm: &Vm,
-        budget: Option<u64>,
+        budget: u64,
         fp_mode: &mut crate::jit_abi::fp::RunMode,
     ) -> Result<Exit, u64> {
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
@@ -2382,6 +2496,7 @@ impl Vcpu {
         // Deliberately a LOCAL: taking it as a `&mut` parameter instead measured +5.4%
         // on the dispatch-micro bench, because the compiler stops treating it as one.
         let mut ctx = MemCtx::for_memory(&vm.mem);
+        ctx.time_enabled = u64::from(vm.time_enabled);
         self.fault_entry.publish(&mut self.cpu, &mut ctx);
         ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
         // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
@@ -2392,7 +2507,7 @@ impl Vcpu {
         // by blocks the backend chose to emit accounting into.
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
-        if budget != Some(0) {
+        if !BOUNDED || budget != 0 {
             if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
                 return Ok(exit);
             }
@@ -2421,7 +2536,7 @@ impl Vcpu {
             if let Some(exit) = self.code_space_exit(vm) {
                 return Ok(exit);
             }
-            if budget.is_some_and(|b| blocks_run >= b) {
+            if BOUNDED && blocks_run >= budget {
                 return Ok(Exit::BudgetExhausted);
             }
 
@@ -2473,7 +2588,9 @@ impl Vcpu {
                 self.ss_shadow = info.ss_shadow;
                 match r {
                     StepResult::Continue => {
-                        blocks_run += 1;
+                        if BOUNDED {
+                            blocks_run += 1;
+                        }
                         if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != mxcsr_mode {
                             return Err(blocks_run);
                         }
@@ -2527,7 +2644,9 @@ impl Vcpu {
                             // for §9.2 budget accounting. It also clears any stale shadow.
                             self.sti_shadow = false;
                             self.ss_shadow = false;
-                            blocks_run += 1;
+                            if BOUNDED {
+                                blocks_run += 1;
+                            }
                             dispatch = exit_word.load(Ordering::Relaxed);
                             continue;
                         }
@@ -2552,7 +2671,7 @@ impl Vcpu {
                 Some(entry) => {
                     // Plain (non-atomic) per-vcpu counter — the whole point of the
                     // private probe is to avoid the shared atomic bumps on this path.
-                    self.fast_hits += 1;
+                    self.fast_hits = self.fast_hits.saturating_add(1);
                     CachedBlock::Compiled { entry }
                 }
                 None => {
@@ -2561,6 +2680,7 @@ impl Vcpu {
                     }
                     match resolve_dispatch::<DEFAULT>(
                         vm,
+                        &mut self.time_dispatch,
                         exit_word,
                         &self.engine_sections,
                         fetch,
@@ -2583,6 +2703,9 @@ impl Vcpu {
             }
             match block {
                 CachedBlock::Interpreted(ir) => {
+                    if vm.time_enabled {
+                        crate::time_stats::interpreted();
+                    }
                     if !DEFAULT {
                         fp_mode.default();
                     }
@@ -2612,8 +2735,14 @@ impl Vcpu {
                     self.sti_shadow = info.sti_shadow;
                     self.ss_shadow = info.ss_shadow;
                     match r {
-                        crate::interp::BlockResult::Continue => blocks_run += 1,
-                        crate::interp::BlockResult::ModeChange => return Err(blocks_run + 1),
+                        crate::interp::BlockResult::Continue => {
+                            if BOUNDED {
+                                blocks_run += 1;
+                            }
+                        }
+                        crate::interp::BlockResult::ModeChange => {
+                            return Err(if BOUNDED { blocks_run + 1 } else { 0 })
+                        }
                         // §17.6 (sub-seam b): in real mode a CPU exception is delivered
                         // in-guest through the IVT, not surfaced to the embedder. The
                         // only `Exit::Exception` that escapes an interpreted Real16 block
@@ -2651,7 +2780,9 @@ impl Vcpu {
                                         StepResult::Continue => {
                                             self.sti_shadow = false;
                                             self.ss_shadow = false;
-                                            blocks_run += 1;
+                                            if BOUNDED {
+                                                blocks_run += 1;
+                                            }
                                         }
                                         StepResult::Exit(exit) => {
                                             return Ok(crate::fault::qualify_real16(
@@ -2683,6 +2814,9 @@ impl Vcpu {
                     if dispatch != 0 {
                         continue;
                     }
+                    if vm.time_enabled {
+                        crate::time_stats::compiled();
+                    }
                     let mut cur = entry;
                     let (stopped, stopped_code) = loop {
                         // Hand the block its remaining block quantum (superblocks,
@@ -2691,7 +2825,11 @@ impl Vcpu {
                         // consumed (min 1) keeps `blocks_run` an exact guest-block
                         // count — identical to the interpreter, preserving §9.2 and
                         // the `RunSpec::Blocks(n)` oracle.
-                        let quantum = budget.map_or(u64::MAX, |b| b - blocks_run);
+                        let quantum = if BOUNDED {
+                            budget - blocks_run
+                        } else {
+                            u64::MAX
+                        };
                         ctx.fuel = quantum;
                         // SAFETY: `cur` is a block compiled to this ABI, alive in
                         // the JIT arena (owned by `vm`) for the call.
@@ -2701,20 +2839,27 @@ impl Vcpu {
                         let code = unsafe {
                             crate::jit_abi::call_block_in_mode(cur, &mut self.cpu, &mut ctx)
                         };
-                        blocks_run += (quantum - ctx.fuel).max(1);
+                        if BOUNDED {
+                            blocks_run += (quantum - ctx.fuel).max(1);
+                        }
                         if !DEFAULT && !matches!(code, RET_CHAIN | RET_LINK | RET_IBTC_MISS) {
                             fp_mode.default();
                         }
                         let next;
                         match code {
                             RET_CONTINUE | RET_INTERRUPTED => break (cur, code),
+                            RET_RETURN_MISS => {
+                                self.time_dispatch.indirect =
+                                    self.time_dispatch.indirect.saturating_add(1);
+                                break (cur, code);
+                            }
                             RET_MXCSR_CHANGED => return Err(blocks_run),
                             RET_CHAIN => {
                                 // Plain per-vcpu counter, flushed once per `run`
                                 // (see `TranslationCache::add_chained`): this fires
                                 // ~1M times per frame in a real game, so a shared
                                 // atomic here is a locked RMW on the hottest path.
-                                self.chained += 1;
+                                self.chained = self.chained.saturating_add(1);
                                 next = CompiledPtr(ctx.next_entry as *const u8);
                             }
                             RET_LINK => {
@@ -2728,6 +2873,7 @@ impl Vcpu {
                                 }
                                 let resolved = resolve::<DEFAULT>(
                                     vm,
+                                    &mut self.time_dispatch,
                                     exit_word,
                                     &self.engine_sections,
                                     FetchAddr::flat(self.cpu.rip),
@@ -2779,6 +2925,8 @@ impl Vcpu {
                             // RIP and refill the slot with a fresh {target, entry}
                             // descriptor, unless the site is megamorphic.
                             RET_IBTC_MISS => {
+                                self.time_dispatch.indirect =
+                                    self.time_dispatch.indirect.saturating_add(1);
                                 // Snapshot before resolving, as for RET_LINK.
                                 let since_epoch = vm.cache.epoch();
                                 // Probe the vcpu-private fast cache before `resolve`.
@@ -2793,7 +2941,7 @@ impl Vcpu {
                                 // it skips the tier-up drain exactly as that one does.
                                 let entry = match self.fast_get(self.cpu.rip) {
                                     Some(entry) => {
-                                        self.fast_hits += 1;
+                                        self.fast_hits = self.fast_hits.saturating_add(1);
                                         Some(entry)
                                     }
                                     None => {
@@ -2802,6 +2950,7 @@ impl Vcpu {
                                         }
                                         let resolved = resolve::<DEFAULT>(
                                             vm,
+                                            &mut self.time_dispatch,
                                             exit_word,
                                             &self.engine_sections,
                                             FetchAddr::flat(self.cpu.rip),
@@ -2995,12 +3144,17 @@ impl Vcpu {
                                     None
                                 };
                                 let instruction_rip = self.cpu.rip;
-                                let r = crate::interp::step_one_mode::<ROUTED>(
-                                    &vm.mem,
-                                    &mut self.cpu,
-                                    self.mode,
-                                    &mut self.interp_scratch,
-                                    &mut info,
+                                let r = crate::time_stats::HelperTimer::measure(
+                                    vm.time_enabled,
+                                    || {
+                                        crate::interp::step_one_mode::<ROUTED>(
+                                            &vm.mem,
+                                            &mut self.cpu,
+                                            self.mode,
+                                            &mut self.interp_scratch,
+                                            &mut info,
+                                        )
+                                    },
                                 );
                                 self.retired += info.retired;
                                 match r {
@@ -3061,12 +3215,17 @@ impl Vcpu {
                                     ..Default::default()
                                 };
                                 let instruction_rip = self.cpu.rip;
-                                let r = crate::interp::step_one_mode::<ROUTED>(
-                                    &vm.mem,
-                                    &mut self.cpu,
-                                    self.mode,
-                                    &mut self.interp_scratch,
-                                    &mut info,
+                                let r = crate::time_stats::HelperTimer::measure(
+                                    vm.time_enabled,
+                                    || {
+                                        crate::interp::step_one_mode::<ROUTED>(
+                                            &vm.mem,
+                                            &mut self.cpu,
+                                            self.mode,
+                                            &mut self.interp_scratch,
+                                            &mut info,
+                                        )
+                                    },
                                 );
                                 self.retired += info.retired;
                                 match r {
@@ -3092,7 +3251,7 @@ impl Vcpu {
                             }
                             other => panic!("compiled block returned invalid ABI code {other}"),
                         }
-                        if budget.is_some_and(|b| blocks_run >= b) {
+                        if BOUNDED && blocks_run >= budget {
                             if !DEFAULT {
                                 fp_mode.default();
                             }
@@ -3159,6 +3318,7 @@ enum ResolveFailure {
 #[inline(always)]
 fn resolve_dispatch<const DEFAULT: bool>(
     vm: &Vm,
+    stats: &mut crate::time_stats::DispatchCounts,
     exit_word: &AtomicU64,
     sections: &AtomicU64,
     at: FetchAddr,
@@ -3167,15 +3327,21 @@ fn resolve_dispatch<const DEFAULT: bool>(
 ) -> Result<CachedBlock, Exit> {
     // Keep compilation and publication state out of non-tiered cache hits.
     if !vm.tier_up_background && vm.tier_up_after.is_none() && mode != CpuMode::Real16 {
+        stats.fetch_calls = stats.fetch_calls.saturating_add(1);
+        let _time_fetch = vm
+            .time_enabled
+            .then(|| crate::time_stats::SampleGuard::fetch(stats.fetch_calls));
         let key = if DEFAULT {
             BlockKey::new(at.pa, mode)
         } else {
             BlockKey::with_mxcsr(at.pa, mode, mxcsr)
         };
         loop {
-            if let Some(block) = vm.cache.get(key) {
+            stats.lookups = stats.lookups.saturating_add(1);
+            if let Some(block) = vm.cache.get_for_dispatch(key) {
                 return Ok(block);
             }
+            stats.misses = stats.misses.saturating_add(1);
             // No IR exists on a miss; snapshot before fetching its bytes.
             let generation = vm.cache.publication_generation();
             match resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, generation)
@@ -3186,20 +3352,25 @@ fn resolve_dispatch<const DEFAULT: bool>(
             }
         }
     }
-    resolve::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr)
+    resolve::<DEFAULT>(vm, stats, exit_word, sections, at, mode, mxcsr)
 }
 
 #[inline(never)]
 fn resolve<const DEFAULT: bool>(
     vm: &Vm,
+    stats: &mut crate::time_stats::DispatchCounts,
     exit_word: &AtomicU64,
     sections: &AtomicU64,
     at: FetchAddr,
     mode: CpuMode,
     mxcsr: u32,
 ) -> Result<CachedBlock, Exit> {
+    stats.fetch_calls = stats.fetch_calls.saturating_add(1);
+    let _time_fetch = vm
+        .time_enabled
+        .then(|| crate::time_stats::SampleGuard::fetch(stats.fetch_calls));
     loop {
-        match resolve_attempt::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr) {
+        match resolve_attempt::<DEFAULT>(vm, stats, exit_word, sections, at, mode, mxcsr) {
             Ok(block) => return Ok(block),
             Err(ResolveFailure::Exit(exit)) => return Err(exit),
             Err(ResolveFailure::Retry) => continue,
@@ -3209,6 +3380,7 @@ fn resolve<const DEFAULT: bool>(
 
 fn resolve_attempt<const DEFAULT: bool>(
     vm: &Vm,
+    stats: &mut crate::time_stats::DispatchCounts,
     exit_word: &AtomicU64,
     sections: &AtomicU64,
     at: FetchAddr,
@@ -3229,9 +3401,11 @@ fn resolve_attempt<const DEFAULT: bool>(
     // §17.6: Real16 has no compiled tier. Bypass tier-up and region formation even
     // when the embedder injected a compiling backend.
     if mode == CpuMode::Real16 {
-        if let Some(block) = vm.cache.get(key) {
+        stats.lookups = stats.lookups.saturating_add(1);
+        if let Some(block) = vm.cache.get_for_dispatch(key) {
             return Ok(block);
         }
+        stats.misses = stats.misses.saturating_add(1);
         let compile_generation = vm.cache.publication_generation();
         let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
@@ -3266,7 +3440,9 @@ fn resolve_attempt<const DEFAULT: bool>(
         // even a victim-free write must cancel source publication.
         let generation = vm.cache.publication_generation();
         let dispatch_epoch = vm.cache.epoch();
-        let Some(block) = vm.cache.get(key) else {
+        stats.lookups = stats.lookups.saturating_add(1);
+        let Some(block) = vm.cache.get_for_dispatch(key) else {
+            stats.misses = stats.misses.saturating_add(1);
             return resolve_uncached::<DEFAULT>(
                 vm, exit_word, sections, at, mode, mxcsr, generation,
             );

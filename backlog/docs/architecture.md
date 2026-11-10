@@ -58,6 +58,7 @@ that changes.
 | `exit` | `Exit`, `AccessKind`, `StepResult` (§5, §8) |
 | `interruption` | Per-vCPU engine-section markers and host-request deferral evidence (§9.2) |
 | `cache` | `TranslationCache`, `CachedBlock`, `CompiledPtr`; `BlockKey` includes decode mode and MXCSR.RC/FTZ/DAZ; SMC page-tag mark/clear run through `insert`/`invalidate_overlapping` callbacks under the spans lock (§9) |
+| `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop (§2, §9.2) |
 
 ## Data flow
@@ -92,6 +93,16 @@ compiled split stores can retain completed host transfers (xj-obx.8). Routed Rus
 masked/narrow stores preflight selected host pages; routed FX/x87/REP helper
 instances stay out of the default helper frames. See
 [decision-13](../decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md).
+
+`Vm::time_stats()` sums cumulative per-vCPU diagnostics, retaining totals after a
+vCPU is dropped. Counts are always collected; `Vm::set_time_accounting(true)`
+enables detailed elapsed-time measurements. Interpreter/compiled segments use
+transition timing, helper and fetch/translate calls use deterministic 1-in-64
+sampling, and compilation uses call/batch boundaries. Outside intervals close at
+the next accepted run entry. AArch64 uses CNTVCT_EL0/CNTFRQ_EL0; other hosts use
+`Instant`. These are elapsed durations including host descheduling. Running vCPUs
+publish at run exit, so a snapshot may lag a whole run. Field docs specify which
+categories overlap and which generated fast paths are excluded.
 
 The KVM-style split: **`Vm`** owns shared state (memory + cache); **`Vcpu`** owns per-thread `CpuState` and its own `run()` loop. Many `Vcpu`s over one `Vm` is the path to multithreading (§2, §11).
 

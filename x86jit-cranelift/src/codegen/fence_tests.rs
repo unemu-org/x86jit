@@ -33,19 +33,19 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
     let mut fbctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
     let mut signature = ir::Signature::new(isa.default_call_conv());
-    signature.params = vec![AbiParam::new(types::I64); 6];
+    signature.params = vec![AbiParam::new(types::I64); 7];
     signature.returns.push(AbiParam::new(types::I64));
     let dummy = builder.import_signature(signature);
     let mut signature = ir::Signature::new(isa.default_call_conv());
-    signature.params = vec![AbiParam::new(types::I64); 3];
+    signature.params = vec![AbiParam::new(types::I64); 4];
     let watch = builder.import_signature(signature);
     let mut helpers = Helpers::all_dummy(&mut || (dummy, 0, 0), (watch, 0, 0));
     let mut signature = ir::Signature::new(isa.default_call_conv());
-    signature.params = vec![AbiParam::new(types::I64); 8];
+    signature.params = vec![AbiParam::new(types::I64); 9];
     signature.returns.push(AbiParam::new(types::I64));
     helpers.string = (builder.import_signature(signature), 0, 0);
     let mut signature = ir::Signature::new(isa.default_call_conv());
-    signature.params.push(AbiParam::new(types::I64));
+    signature.params.extend([AbiParam::new(types::I64); 2]);
     helpers.cpuid = (builder.import_signature(signature), 0, 0);
     for (slot, params) in [
         (&mut helpers.x87, 6),
@@ -63,7 +63,7 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
         (&mut helpers.broadcast_lane_mem, 11),
     ] {
         let mut signature = ir::Signature::new(isa.default_call_conv());
-        signature.params = vec![AbiParam::new(types::I64); params];
+        signature.params = vec![AbiParam::new(types::I64); params + 1];
         signature.returns.push(AbiParam::new(types::I64));
         *slot = (builder.import_signature(signature), 0, 0);
     }
