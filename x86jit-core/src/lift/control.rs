@@ -1282,3 +1282,57 @@ pub(crate) fn lift_iret_user(
     ops.push(IrOp::Jump { target: frame[0] });
     Ok(())
 }
+
+/// SDM Vol 2A §3.3 INS (pp. 3-464–466); Vol 2B §4.3 OUTS
+/// (pp. 4-173–176), REP (pp. 4-563–564): DX, address-sized indices/count,
+/// fixed ES destination, overridable DS source, and byte/word/dword elements.
+pub(crate) fn lift_port_string(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    mode: CpuMode,
+    dir_out: bool,
+    elem: u8,
+) -> Result<bool, LiftError> {
+    // Only F3 REP is defined for port strings (SDM Vol 2B §4.3 REP).
+    if insn.has_repne_prefix() {
+        return Err(unsupported_insn(insn));
+    }
+    let memory = insn.op_kind(if dir_out { 1 } else { 0 });
+    let addr_bits = match memory {
+        OpKind::MemorySegSI | OpKind::MemoryESDI => 16,
+        OpKind::MemorySegESI | OpKind::MemoryESEDI => 32,
+        _ => 64,
+    };
+    // Real16 follows the engine's 80286 address/operand-size scope (§17.6).
+    if mode.wraps_16() && (addr_bits != 16 || elem > 2) {
+        return Err(unsupported_insn(insn));
+    }
+    let base = if mode.wraps_16() {
+        let seg = if dir_out {
+            iced_segment_reg(insn.memory_segment()).unwrap_or(Reg::Ds)
+        } else {
+            Reg::Es
+        };
+        seg_base_shl4(seg, ops, tg)
+    } else if dir_out {
+        match insn.segment_prefix() {
+            Register::FS => read_reg(Reg::FsBase, ops, tg),
+            Register::GS => read_reg(Reg::GsBase, ops, tg),
+            _ => Val::Imm(0),
+        }
+    } else {
+        Val::Imm(0)
+    };
+    ops.push(IrOp::PortString {
+        elem,
+        rep: insn.has_rep_prefix(),
+        addr_bits,
+        base,
+        dir_out,
+        // SDM Vol 1 §3.3.7.1: in 64-bit mode an SS override on a non-stack reference is
+        // ignored, so a non-canonical OUTS source raises #GP, not #SS.
+        stack: dir_out && mode != CpuMode::Long64 && insn.memory_segment() == Register::SS,
+    });
+    Ok(true)
+}

@@ -333,10 +333,10 @@ pub struct CpuState {
     /// performed the write's side effect, so the retried store consumes this and
     /// continues instead of re-trapping (the write counterpart of `pending_mmio`).
     pub pending_mmio_write: bool,
-    /// After an `Exit::PortIo { dir: In, .. }`, the access width (1/2/4) of the port
-    /// read awaiting a value. `Vcpu::complete_port_in` consumes it, merging the
-    /// embedder's value into the accumulator (`al`/`ax`/`eax`) with x86 sub-register
-    /// semantics. `None` when no `in` is outstanding.
+    /// Width (1/2/4) of a port input awaiting an embedder answer.
+    /// `Vcpu::complete_port_in` writes IN's accumulator using sub-register
+    /// semantics, or retains INS's answer in `port_string_in` for its store.
+    /// `None` after the answer is supplied; an INS store can still be pending.
     pub pending_port_in: Option<u8>,
     /// Guest CPU feature set the embedder selected. Read by `cpuid_run` and
     /// the `xgetbv` handler when no table / XCR0 override is installed. Kept out of
@@ -441,6 +441,10 @@ pub struct CpuState {
     /// Pointer/opcode model, inherited from the VM and editable between runs.
     /// Appended to preserve every existing JIT ABI offset.
     pub x87_pointer_model: X87PointerModel,
+    /// An INS handoff, including an answered value awaiting its faultable store.
+    /// Appended to preserve existing JIT ABI offsets.
+    #[doc(hidden)]
+    pub port_string_in: Option<PortStringIn>,
 }
 
 /// Selects x87 opcode recording and pointer/opcode saving independently of CPUID.
@@ -457,6 +461,23 @@ pub enum X87PointerModel {
     /// FXSAVE and direct `exec_fxstate` export save pointers/opcode only with
     /// FSW.ES set, otherwise zeros (AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE).
     Amd,
+}
+
+/// Captured at handoff so a store retry never repeats a device read.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct PortStringIn {
+    pub rip: u64,
+    pub next_ip: u64,
+    pub instruction_end: u64,
+    pub base: u64,
+    pub offset: u64,
+    pub next_index: u64,
+    pub next_count: u64,
+    pub addr_bits: u8,
+    pub elem: u8,
+    pub rep: bool,
+    pub value: Option<u64>,
 }
 
 /// One atomic TSC/TSC_AUX sample (SDM Vol 3B §20.17.2).
@@ -573,6 +594,7 @@ impl Default for CpuState {
             gs: 0,
             mxcsr: MXCSR_RESET,
             x87_pointer_model: X87PointerModel::default(),
+            port_string_in: None,
         }
     }
 }

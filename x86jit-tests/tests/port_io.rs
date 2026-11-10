@@ -4,9 +4,7 @@
 //! writes, then re-enters. Pinned under BOTH backends — the JIT defers port I/O to
 //! the interpreter, so interp and JIT must agree on port/size/direction/value.
 //!
-//! `ins`/`outs` (string port I/O, incl. `rep`) are deliberately NOT lifted: no
-//! consumer exists and a correct per-element trap-out needs its own restartable
-//! loop. They surface as `Exit::UnknownInstruction`, pinned below.
+//! String port-I/O witnesses live in `port_string.rs`.
 
 use iced_x86::code_asm::*;
 use x86jit_core::{
@@ -214,41 +212,5 @@ fn port_register_round_trip() {
             0x1000_0042,
             "guest observed the device status (jit={jit})"
         );
-    }
-}
-
-/// `ins`/`outs` (+`rep`) are documented-rejected — they lift to
-/// `Exit::UnknownInstruction`, never to a `PortIo`, under both backends.
-#[test]
-fn ins_outs_are_rejected() {
-    // Encoded directly: iced's `insb`/`outsw` code_asm helpers return `&mut Self`
-    // for the `rep` prefix, which complicates a table of builders. The opcodes are
-    // stable and short.
-    let cases: &[(&str, &[u8])] = &[
-        ("insb", &[0x6c]),
-        ("insw", &[0x66, 0x6d]),
-        ("insd", &[0x6d]),
-        ("outsb", &[0x6e]),
-        ("outsw", &[0x66, 0x6f]),
-        ("outsd", &[0x6f]),
-        ("rep outsw", &[0xf3, 0x66, 0x6f]),
-    ];
-    for (name, bytes) in cases {
-        let mut code = bytes.to_vec();
-        code.push(0xf4); // hlt
-
-        for jit in [false, true] {
-            let mut vm = Vm::with_backend(VmConfig::flat(0x2000), backend(jit));
-            vm.map(CODE, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
-            vm.write_bytes(CODE, &code).unwrap();
-            let mut cpu = vm.new_vcpu();
-            cpu.set_reg(Reg::Rip, CODE);
-            match cpu.run(&vm, Some(1000)) {
-                Exit::UnknownInstruction { addr, .. } => {
-                    assert_eq!(addr, CODE, "{name} rejected at its address (jit={jit})")
-                }
-                other => panic!("{name} should be rejected (jit={jit}), got {other:?}"),
-            }
-        }
     }
 }

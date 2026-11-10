@@ -1624,6 +1624,7 @@ impl Vcpu {
             && self.cpu.pending_mmio.is_none()
             && !self.cpu.pending_mmio_write
             && self.cpu.pending_port_in.is_none()
+            && self.cpu.port_string_in.is_none()
             && !self.sti_shadow
             && !self.ss_shadow
     }
@@ -1690,6 +1691,8 @@ impl Vcpu {
             None => match reg {
                 Reg::Rip => {
                     self.cpu.clear_mmio_parts();
+                    self.cpu.port_string_in = None;
+                    self.cpu.pending_port_in = None;
                     self.cpu.rip = val;
                 }
                 Reg::FsBase => self.cpu.fs_base = val,
@@ -1846,21 +1849,50 @@ impl Vcpu {
         self.cpu.pending_mmio_write = true;
     }
 
-    /// Deliver the value read from a port after `Exit::PortIo { dir: In, .. }`, then
-    /// resume (§5.2). Unlike MMIO, RIP already advanced past the `in` (as for a
-    /// syscall), so this only writes the accumulator — the next `run()` continues
-    /// from the following instruction. The write honours x86 sub-register semantics
-    /// (32-bit zeroes the upper 32; 16/8-bit merge), reusing the central GPR write
-    /// path. Only the low `size` bytes of `value` are used. Calling this without an
-    /// outstanding `in` (e.g. after an `out`) is a no-op.
+    /// Supply the value for an outstanding IN or INS (§5.2).
+    /// IN writes AL/AX/EAX immediately, using the central sub-register policy.
+    /// INS retains the value until the next execution call attempts its faultable
+    /// ES destination store, then advances DI/EDI/RDI and the REP count. No new
+    /// step is charged. A failed store retains the answer, so retry never reads
+    /// the port again. IRQ acceptance stays blocked until the store completes.
+    /// Calling this without an outstanding input request is a no-op.
     pub fn complete_port_in(&mut self, value: u64) {
         if let Some(size) = self.cpu.pending_port_in.take() {
-            self.cpu
-                .write_gpr(Reg::Rax.gpr_index().unwrap(), value, size);
-            // Retirement counts the port handoff; inhibition lasts through the
-            // pending architectural result (decision-16 §§2, 4).
-            self.sti_shadow = false;
-            self.ss_shadow = false;
+            if let Some(p) = &mut self.cpu.port_string_in {
+                p.value = Some(value & (u64::MAX >> (64 - u32::from(size) * 8)));
+            } else {
+                self.cpu
+                    .write_gpr(Reg::Rax.gpr_index().unwrap(), value, size);
+                self.sti_shadow = false;
+                self.ss_shadow = false;
+            }
+        }
+    }
+
+    fn finish_port_string_in<const ROUTED: bool>(&mut self, vm: &Vm) -> Result<(), Exit> {
+        if self.cpu.port_string_in.is_none() {
+            return Ok(());
+        }
+        match crate::interp::finish_port_string_in::<ROUTED>(
+            &mut self.cpu,
+            &vm.mem,
+            self.mode,
+            vm.consistency,
+        ) {
+            Ok(()) => {
+                self.sti_shadow = false;
+                self.ss_shadow = false;
+                Ok(())
+            }
+            Err(exit) => {
+                let exit = if self.mode == CpuMode::Real16 {
+                    crate::fault::qualify_real16(exit, &self.cpu)
+                } else {
+                    exit
+                };
+                self.cpu.finish_mmio_retry(Some(&exit));
+                Err(self.fault_entry.finish_transfer_fault(exit, &vm.mem))
+            }
         }
     }
 
@@ -1876,9 +1908,20 @@ impl Vcpu {
     /// handler — it does NOT escape as `Exit::Exception`. In Long64/Compat32 an
     /// exception still surfaces as `Exit::Exception`. An unsupported opcode returns
     /// `Exit::UnknownInstruction`; a memory/MMIO/port trap returns its usual exit
-    /// (this primitive does not resume a deferred access — call [`Vcpu::run`] for
-    /// that).
+    /// (resume deferred MMIO through [`Vcpu::run`]). An answered INS first
+    /// attempts its pending store and returns without executing another element.
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
+        if self.cpu.port_string_in.is_some() {
+            let result = if vm.mem.host_fault_recovery() {
+                self.finish_port_string_in::<true>(vm)
+            } else {
+                self.finish_port_string_in::<false>(vm)
+            };
+            return match result {
+                Ok(()) => StepResult::Continue,
+                Err(exit) => StepResult::Exit(exit),
+            };
+        }
         if vm.mem.fetch_policy.is_some() {
             vm.handle_smc(&self.exit_request.word);
         }
@@ -2037,6 +2080,9 @@ impl Vcpu {
         let exit_word: &AtomicU64 = &exit_word_owner;
         let mut ctx = MemCtx::for_memory(&vm.mem);
         self.fault_entry.publish(&mut self.cpu, &mut ctx);
+        if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
+            return StepStop::Exit(exit);
+        }
         loop {
             fp_mode.default();
             if steps.remaining == 0 {
@@ -2343,6 +2389,11 @@ impl Vcpu {
         // by blocks the backend chose to emit accounting into.
         ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
 
+        if budget != Some(0) {
+            if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
+                return Ok(exit);
+            }
+        }
         let mut dispatch = exit_word.load(Ordering::Relaxed);
         loop {
             // The outer dispatcher may invalidate code or invoke backend callbacks.
@@ -2354,6 +2405,7 @@ impl Vcpu {
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
                 && self.cpu.pending_port_in.is_none()
+                && self.cpu.port_string_in.is_none()
             {
                 return Ok(Exit::Interrupted);
             }

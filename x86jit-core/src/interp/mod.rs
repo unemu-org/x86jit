@@ -175,7 +175,8 @@ impl StepContext {
         let pending = cpu.mmio_retry_active
             || cpu.pending_mmio.is_some()
             || cpu.pending_mmio_write
-            || cpu.pending_port_in.is_some();
+            || cpu.pending_port_in.is_some()
+            || cpu.port_string_in.is_some();
         if !pending
             && exit_request.is_some_and(|word| {
                 word.load(std::sync::atomic::Ordering::Relaxed) & crate::vm::EXIT_REQUESTED != 0
@@ -3591,6 +3592,7 @@ fn walk_ops<
                     continue;
                 }
                 let (mem, _ordering) = mem.helper(Some(match op {
+                    StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
                     StrOp::Movs => ordering::Direction::ReadWrite,
                     StrOp::Stos => ordering::Direction::Write,
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
@@ -4296,6 +4298,121 @@ fn walk_ops<
                     return r.into();
                 }
             }
+            IrOp::PortString {
+                elem,
+                rep,
+                addr_bits,
+                base,
+                dir_out,
+                stack,
+            } => {
+                if CHILD {
+                    unreachable!("helper refused before child execution");
+                }
+                let amask = mask(*addr_bits / 8);
+                let count = cpu.gpr[RCX] & amask;
+                if *rep && count == 0 {
+                    cpu.rip = ir.next_ip();
+                    return WalkResult::Continue;
+                }
+                let index = if *dir_out { RSI } else { RDI };
+                let offset = cpu.gpr[index] & amask;
+                let base = read_val(*base, temps);
+                // SDM Vol 3B §23.1.4, Table 23-1: real-mode operands
+                // crossing the 64 KiB segment limit raise #GP (or #SS).
+                if ir.mode == crate::CpuMode::Real16 && offset + u64::from(*elem) > 0x10000 {
+                    return WalkResult::delivered_fault(deliver_interrupt_mode(
+                        cpu,
+                        mem,
+                        cur_addr.get(),
+                        if *stack { 12 } else { 13 },
+                        cur_addr.get(),
+                    ));
+                }
+                let delta = if cpu.flags.df {
+                    0u64.wrapping_sub(u64::from(*elem))
+                } else {
+                    u64::from(*elem)
+                };
+                let next_index = offset.wrapping_add(delta) & amask;
+                let next_count = count.wrapping_sub(1) & amask;
+                let last = !*rep || next_count == 0;
+                let next_ip = if last { ir.next_ip() } else { cur_addr.get() };
+                let value = if *dir_out {
+                    let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
+                    match string_load::<true, _>(
+                        cpu,
+                        mem,
+                        cur_addr.get(),
+                        0,
+                        base.wrapping_add(offset),
+                        *elem,
+                    ) {
+                        Ok(value) => value & mask(*elem),
+                        Err(t) => {
+                            // SDM Vol 2B §4.3 OUTS, 64-Bit Mode Exceptions.
+                            if matches!(t, MemTrap::Unmapped | MemTrap::NonCanonical) {
+                                return WalkResult::exit(crate::memory::unmapped_exit(
+                                    cur_addr.get(),
+                                    base.wrapping_add(offset),
+                                    u64::from(*elem),
+                                    ir.mode == crate::CpuMode::Long64,
+                                    *stack,
+                                    t.fault_addr(base.wrapping_add(offset)),
+                                    AccessKind::Read,
+                                ));
+                            }
+                            return WalkResult::exit(str_fault_exit(StrFault {
+                                addr: t.fault_addr(base.wrapping_add(offset)),
+                                write: false,
+                                trap: t,
+                                value: 0,
+                                elem: *elem,
+                            }));
+                        }
+                    }
+                } else {
+                    0
+                };
+                // Decision-16 §2: the handoff owns one step, even with a pending
+                // input result. Whole-instruction retirement occurs at the final handoff.
+                if STEPPED {
+                    budget.get().charge();
+                }
+                *retired += u64::from(last);
+                started.set(1);
+                if *dir_out {
+                    cpu.write_gpr(index, next_index, *addr_bits / 8);
+                    if *rep {
+                        cpu.write_gpr(RCX, next_count, *addr_bits / 8);
+                    }
+                    cpu.rip = next_ip;
+                    cpu.clear_mmio_parts();
+                    shadows.complete();
+                } else {
+                    cpu.pending_port_in = Some(*elem);
+                    cpu.port_string_in = Some(crate::state::PortStringIn {
+                        rip: cur_addr.get(),
+                        next_ip,
+                        instruction_end: ir.next_ip(),
+                        base,
+                        offset,
+                        next_index,
+                        next_count,
+                        addr_bits: *addr_bits,
+                        elem: *elem,
+                        rep: *rep,
+                        value: None,
+                    });
+                    cpu.rip = cur_addr.get();
+                }
+                return WalkResult::exit(Exit::PortIo {
+                    port: cpu.gpr[2] as u16,
+                    size: *elem,
+                    dir: if *dir_out { PortDir::Out } else { PortDir::In },
+                    value,
+                });
+            }
             IrOp::PortIo {
                 port,
                 value,
@@ -4566,6 +4683,7 @@ fn walk_ops<
                     unreachable!("helper refused before child execution");
                 }
                 let (mem, _ordering) = mem.helper(Some(match op {
+                    StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
                     StrOp::Movs => ordering::Direction::ReadWrite,
                     StrOp::Stos => ordering::Direction::Write,
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
@@ -8627,6 +8745,7 @@ fn string_run_specialized<
             return Some(StringStop::Interrupted);
         }
         match op {
+            StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
             StrOp::Movs => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);

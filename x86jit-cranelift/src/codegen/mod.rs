@@ -2507,7 +2507,7 @@ impl Translator<'_, '_> {
             IrOp::Trap {
                 vector, advance, ..
             } => self.emit_trap(vector, advance),
-            IrOp::PortIo { .. } => self.emit_port_io(),
+            IrOp::PortIo { .. } | IrOp::PortString { .. } => self.emit_port_io(),
             // Real-mode (§17.6, sub-seam b) interrupt-flag + IVT-delivery ops. These are
             // emitted only when lifting under `CpuMode::Real16`, which stays entirely on
             // the interpreter (the JIT/region tier is never reached in real mode), so no
@@ -5865,6 +5865,7 @@ fn lane_int_ty(prec: FPrec) -> Type {
 /// Encodings shared with the string helper's decode arrays.
 fn str_op_code(op: StrOp) -> u64 {
     match op {
+        StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
         StrOp::Movs => 0,
         StrOp::Stos => 1,
         StrOp::Scas => 2,

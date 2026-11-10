@@ -770,3 +770,89 @@ pub(crate) fn exec_far_ret<const ROUTED: bool, const ORDER: u8>(
     cpu.rip = ip as u64;
     InterpResult::Continue
 }
+
+/// Finish an answered INS without another port access or accounting unit.
+/// The public completion method has no memory argument; execution entry performs
+/// the faultable store. SDM Vol 2A §3.3 INS, p. 3-465 permits the port read
+/// to precede a failing write; the captured answer survives until that write succeeds.
+pub(crate) fn finish_port_string_in<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    mode: crate::CpuMode,
+    consistency: crate::MemConsistency,
+) -> Result<(), Exit> {
+    match consistency {
+        crate::MemConsistency::Fast => finish_port_string_in_ordered::<ROUTED, 0>(cpu, mem, mode),
+        crate::MemConsistency::AcqRel => finish_port_string_in_ordered::<ROUTED, 1>(cpu, mem, mode),
+        crate::MemConsistency::FullTso => {
+            finish_port_string_in_ordered::<ROUTED, 2>(cpu, mem, mode)
+        }
+    }
+}
+fn finish_port_string_in_ordered<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    mode: crate::CpuMode,
+) -> Result<(), Exit> {
+    let Some(p) = cpu.port_string_in else {
+        return Ok(());
+    };
+    let Some(value) = p.value else {
+        return Err(Exit::port_io(cpu.gpr[2] as u16, p.elem, PortDir::In, 0));
+    };
+    let access = Access::<ROUTED, ORDER>::new(mem);
+    let (access, _ordering) = access.helper(Some(ordering::Direction::Write));
+    let addr = p.base.wrapping_add(p.offset);
+    if let Err(t) = string_store::<true, _>(cpu, access, p.rip, addr, value, p.elem) {
+        // SDM Vol 2A §3.3 INS, 64-Bit Mode Exceptions: ES is never SS.
+        let exit = if matches!(t, MemTrap::Unmapped | MemTrap::NonCanonical) {
+            crate::memory::unmapped_exit(
+                p.rip,
+                addr,
+                u64::from(p.elem),
+                mode == crate::CpuMode::Long64,
+                false,
+                t.fault_addr(addr),
+                AccessKind::Write,
+            )
+        } else {
+            str_fault_exit(StrFault {
+                addr: t.fault_addr(addr),
+                write: true,
+                trap: t,
+                value,
+                elem: p.elem,
+            })
+        };
+        let op = IrOp::PortString {
+            elem: p.elem,
+            rep: p.rep,
+            addr_bits: p.addr_bits,
+            base: Val::Imm(p.base),
+            dir_out: false,
+            stack: false,
+        };
+        let info = crate::fault::InstructionFaultInfo::from_ops(
+            p.rip,
+            Some(p.instruction_end),
+            &[op],
+            mode,
+        );
+        return Err(crate::fault::finish(
+            exit,
+            Some(&info),
+            cpu,
+            mem,
+            mode,
+            false,
+        ));
+    }
+    cpu.write_gpr(RDI, p.next_index, p.addr_bits / 8);
+    if p.rep {
+        cpu.write_gpr(RCX, p.next_count, p.addr_bits / 8);
+    }
+    cpu.rip = p.next_ip;
+    cpu.port_string_in = None;
+    cpu.clear_mmio_parts();
+    Ok(())
+}

@@ -2864,13 +2864,23 @@ pub enum IrOp {
     /// is unused and the embedder answers by writing the result into the accumulator
     /// via `Vcpu::complete_port_in` (which honours 32-bit-zero / 16/8-bit-merge).
     /// `port` is the 16-bit port (`Imm` for imm8, a `Temp` holding `dx` otherwise);
-    /// `size` is the access width (1/2/4). `ins`/`outs` are deliberately rejected as
-    /// `UnknownInstruction` (see `lift.rs`).
+    /// `size` is the access width (1/2/4). String I/O uses `PortString`.
     PortIo {
         port: Val,
         value: Val,
         size: u8,
         dir_out: bool,
+    },
+    /// One string port-I/O element (§5.2). SDM Vol 2A §3.3 INS;
+    /// Vol 2B §4.3 OUTS/REP. Ends the block at every port handoff.
+    PortString {
+        elem: u8,
+        rep: bool,
+        addr_bits: u8,
+        base: Val,
+        dir_out: bool,
+        /// OUTS selected SS for its source (segment-limit fault classification).
+        stack: bool,
     },
     // Append guards so ordinary-op dispatch discriminants match the base IR.
     /// Raise #GP(0) before the first access if addr is not aligned to bytes.
@@ -3319,6 +3329,10 @@ pub enum StrOp {
     Scas,
     Cmps,
     Lods,
+    /// INS restart metadata; execution uses `IrOp::PortString`.
+    Ins,
+    /// OUTS restart metadata; execution uses `IrOp::PortString`.
+    Outs,
 }
 
 /// Repeat prefix on a string op (§10).

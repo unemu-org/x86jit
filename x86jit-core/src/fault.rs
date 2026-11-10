@@ -930,7 +930,9 @@ impl InstructionFaultInfo {
             helper: ops.iter().find_map(|op| match op {
                 IrOp::X87 { .. } => Some(FaultHelper::X87),
                 IrOp::FxState { .. } | IrOp::XState { .. } => Some(FaultHelper::FxState),
-                IrOp::RepString { .. } | IrOp::RepStringReal { .. } => Some(FaultHelper::String),
+                IrOp::RepString { .. } | IrOp::RepStringReal { .. } | IrOp::PortString { .. } => {
+                    Some(FaultHelper::String)
+                }
                 IrOp::Div { .. } => Some(FaultHelper::Divide),
                 IrOp::AtomicCasPair { .. } => Some(FaultHelper::CompareExchangePair),
                 _ => None,
@@ -991,6 +993,23 @@ impl InstructionFaultInfo {
                     m.operand_size = Knowledge::Known(u16::from(*elem));
                     if !matches!(rep, RepKind::None) {
                         m.rep = Some((*op, *elem, 16));
+                    }
+                }
+                IrOp::PortString {
+                    elem,
+                    rep,
+                    addr_bits,
+                    dir_out,
+                    ..
+                } => {
+                    m.writes = !dir_out;
+                    m.operand_size = Knowledge::Known(u16::from(*elem));
+                    if *rep {
+                        m.rep = Some((
+                            if *dir_out { StrOp::Outs } else { StrOp::Ins },
+                            *elem,
+                            *addr_bits,
+                        ));
                     }
                 }
                 IrOp::Trap { vector, advance } => {

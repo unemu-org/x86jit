@@ -692,6 +692,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
             | Trap { .. }
             | GetMxcsr { .. }
             | SetMxcsr { .. }
+            | PortString { .. }
             | PortIo { .. } => 0,
         })
         .sum()
@@ -1346,10 +1347,8 @@ mod tests {
         ));
 
         // A valid-decoding opcode the lifter does not implement must remain a reported gap.
-        // `insb` (6C) is a legal 286 instruction (string port input) deliberately left
-        // unlifted, so it stays `Unsupported` (→ `Exit::UnknownInstruction`) — NOT masked
-        // as #UD.
-        let mem = mem_with(&[0x6C]);
+        // `lar ax, ax` (0F 02 C0) decodes but is outside this engine's mode model.
+        let mem = mem_with(&[0x0F, 0x02, 0xC0]);
         assert!(matches!(
             lift_one(&mem, FetchAddr::real16(0, BASE as u16), CpuMode::Real16),
             Err(LiftError::Unsupported { .. })
@@ -1791,6 +1790,7 @@ pub(crate) fn op_reads(op: &IrOp) -> u8 {
         | PushaReal
         | PopaReal
         | EnterReal { .. }
+        | PortString { .. }
         | PortIo { .. } => FlagMask::ALL.0,
         // SDM Vol 2B RDRAND/RDSEED, Flags Affected. Keep a helper barrier so
         // omitted ALU recipes cannot overwrite its flags at a later fault exit.
@@ -4116,17 +4116,15 @@ fn lift_insn_inner(
             Ok(true)
         }
 
-        // Port I/O — trap out to the embedder (§5.2), the machine counterpart of
-        // MMIO. `in`/`out` in both the imm8 and `dx` forms and all three access
-        // widths (1/2/4). `ins`/`outs` (string port I/O, incl. `rep` forms, opcodes
-        // 6C–6F) are deliberately NOT lifted: the 80286 corpus oracle mounts no port
-        // device, so — exactly like `in`/`out`, which surface as `Exit::PortIo` and are
-        // excluded from the decided-pass-rate — they are not executable there, and a
-        // correct per-element restartable trap-out is its own seam (a real BIOS block
-        // driver `rep insw` will want it). They fall through to `UnknownInstruction`,
-        // which names the exact opcode to add if one ever surfaces.
+        // Port I/O follows the embedder-owned permission/device policy (§5.2).
         In => lift_port_io(insn, ops, tg, false).map(|_| true),
         Out => lift_port_io(insn, ops, tg, true).map(|_| true),
+        Insb => lift_port_string(insn, ops, tg, mode, false, 1),
+        Insw => lift_port_string(insn, ops, tg, mode, false, 2),
+        Insd => lift_port_string(insn, ops, tg, mode, false, 4),
+        Outsb => lift_port_string(insn, ops, tg, mode, true, 1),
+        Outsw => lift_port_string(insn, ops, tg, mode, true, 2),
+        Outsd => lift_port_string(insn, ops, tg, mode, true, 4),
 
         // Instructions that architecturally *raise an exception* rather than
         // executing: they are not lift gaps (so must NOT become

@@ -16,7 +16,7 @@ const CAPS: RegionCaps = RegionCaps {
 };
 const INVALID: &[u8] = &[0xf0, 0x90]; // LOCK NOP: iced-invalid in both flat modes.
 const GAPS: &[&[u8]] = &[
-    &[0x6c],                         // INSB: decoded, but not lifted.
+    &[0x0f, 0x08],                   // INVD: decoded, but not lifted.
     &[0xf0, 0x11, 0x54, 0x88, 0x08], // LOCK ADC [RAX+RCX*4+8], EDX: emits EA ops before failing.
 ];
 

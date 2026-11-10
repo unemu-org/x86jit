@@ -875,6 +875,7 @@ impl<const ORDER: u8> InterpreterMemory for ChildMemory<'_, '_, ORDER> {
         let rip = self.state.borrow().rip;
         let _ordering = Barrier::<ORDER>::new(
             Some(match op {
+                StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
                 StrOp::Movs => Direction::ReadWrite,
                 StrOp::Stos => Direction::Write,
                 StrOp::Lods | StrOp::Scas | StrOp::Cmps => Direction::Read,
@@ -1223,7 +1224,7 @@ fn refusal(op: &IrOp) -> Option<ChildRefusal> {
         IrOp::FarJump { .. } => Some(ChildRefusal::Helper),
         IrOp::FarCall { .. } => Some(ChildRefusal::Helper),
         IrOp::FarRet { .. } => Some(ChildRefusal::Helper),
-        IrOp::RepStringReal { .. } => Some(ChildRefusal::Helper),
+        IrOp::RepStringReal { .. } | IrOp::PortString { .. } => Some(ChildRefusal::Helper),
         IrOp::PushaReal => Some(ChildRefusal::Helper),
         IrOp::PopaReal => Some(ChildRefusal::Helper),
         IrOp::EnterReal { .. } => Some(ChildRefusal::Helper),
@@ -1493,6 +1494,7 @@ fn copy_cpu(dst: &mut CpuState, src: &CpuState) {
         pending_mmio,
         pending_mmio_write,
         pending_port_in,
+        port_string_in,
         features,
         x87_precision,
         cs,

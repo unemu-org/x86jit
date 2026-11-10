@@ -155,6 +155,7 @@ impl Translator<'_, '_> {
         let args = [self.cpu, self.mem, op_code, elem, rep, cur, abits, seg];
         self.flush_gprs(); // helper reads/advances RSI/RDI/RCX in CpuState
         let access = match op {
+            StrOp::Ins | StrOp::Outs => unreachable!("port strings use PortString"),
             StrOp::Movs => GuestAccessKind::ReadWrite,
             StrOp::Stos => GuestAccessKind::Write,
             StrOp::Lods | StrOp::Scas | StrOp::Cmps => GuestAccessKind::Read,

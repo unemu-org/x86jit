@@ -220,13 +220,12 @@ pub enum Exit {
         /// Optional owned details; legacy constructors leave this absent.
         metadata: Option<Box<crate::fault::FaultMetadata>>,
     },
-    /// Guest executed a port-I/O instruction (`in`/`out`, §5.2) — the machine
-    /// counterpart of MMIO. RIP is already advanced past the instruction (like
-    /// `Syscall`), so the embedder services it and re-enters `run()`. For
-    /// `PortDir::Out`, `value` holds the low `size` bytes the guest wrote. For
-    /// `PortDir::In`, the embedder must call `complete_port_in` with the port's
-    /// value before the next `run()`; `value` is 0. `port` is the 16-bit port
-    /// number, `size` the access width (1/2/4 bytes).
+    /// Guest handed one port access to the embedder (§5.2).
+    /// IN/OUT advance RIP. INS/OUTS retain the instruction RIP while a REP
+    /// has more elements; INS also retains it until its pending store succeeds.
+    /// OUT/OUTS carry the low `size` bytes in `value`. For IN/INS, `value` is
+    /// zero and the embedder must call `complete_port_in` before resuming.
+    /// `port` is DX's low 16 bits (or IN/OUT's immediate), `size` is 1/2/4.
     #[non_exhaustive]
     PortIo {
         port: u16,
