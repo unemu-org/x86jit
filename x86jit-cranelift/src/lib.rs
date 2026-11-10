@@ -5251,7 +5251,11 @@ mod tests {
         assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
         assert_eq!(vm.cache.tier_pending_len(), 0, "failed completion cleared");
         assert_eq!(vm.cache.tier_bg_published(), 0);
-        assert_eq!(vm.cache.tier_bg_rejected(), 0);
+        assert_eq!(vm.cache.tier_bg_rejected(), u64::from(background));
+        assert_eq!(
+            vm.memory_stats().cache.tier_bg_rejected_compile_failed,
+            u64::from(background)
+        );
         assert_eq!(vm.cache.regions(), 0);
         let CachedBlock::Interpreted(retained) = vm.cache.get(key).unwrap() else {
             panic!("failed compilation must leave the interpreted cache entry");

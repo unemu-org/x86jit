@@ -68,12 +68,20 @@ pub enum CachedBlock {
     Compiled { entry: CompiledPtr },
 }
 
-// One lock protects both directions, preserving spans -> map -> hotness ->
-// tier_pending ordering and atomic page-tag publication (§10, §17.4).
+// One lock protects both span indices and pending sources. Lock order is
+// spans -> map -> hotness, with atomic page-tag publication (§10, §17.4).
 #[derive(Default)]
 struct SpanIndex {
     units: HashMap<BlockKey, Vec<(u64, u32)>>,
     pages: HashMap<u64, HashSet<BlockKey>>,
+    pending: HashMap<BlockKey, PendingTierUp>,
+    next_request: u64,
+}
+
+struct PendingTierUp {
+    id: u64,
+    spans: Option<Vec<(u64, u32)>>,
+    cancelled: bool,
 }
 
 fn span_pages(start: u64, len: u32) -> std::ops::RangeInclusive<u64> {
@@ -155,6 +163,15 @@ impl SpanIndex {
 /// across block execution (which may mutate memory -> SMC invalidation) (§9.2).
 pub struct TranslationCache {
     memory_counts: [AtomicU64; 4],
+    invalidation_calls: AtomicU64,
+    invalidation_blocks_dropped: AtomicU64,
+    tier_bg_submitted: AtomicU64,
+    tier_bg_completed: AtomicU64,
+    tier_bg_duplicates_skipped: AtomicU64,
+    tier_bg_rejected_generation: AtomicU64,
+    tier_bg_rejected_compile_failed: AtomicU64,
+    tier_bg_superseded: AtomicU64,
+
     // §17.4: keyed by BlockKey { guest_addr, mode } — the same bytes lift differently
     // per decode mode, so translations never alias across modes.
     map: RwLock<HashMap<BlockKey, CachedBlock>>,
@@ -206,13 +223,6 @@ pub struct TranslationCache {
     // Perf-only (both tiers are correct); a stale entry after SMC just re-decides on the
     // fresh block. Keyed by entry address.
     region_decision: RwLock<HashMap<BlockKey, bool>>,
-    // Blocks whose background tier-up compile is in flight: a hot block is submitted
-    // to the backend's compiler thread once and stays here until the completion is
-    // published (or rejected), so a block running many times before its compile lands
-    // isn't re-submitted every dispatch. Cleared on invalidation so a dropped block's
-    // marker never wedges a re-lift. Lock order: spans -> map -> hotness ->
-    // tier_pending (this is the innermost).
-    tier_pending: Mutex<HashSet<BlockKey>>,
     // Background tier-up "fires" counters: a completion published into the cache, or
     // rejected (epoch moved / block gone) at publish time.
     tier_bg_published: AtomicU64,
@@ -277,12 +287,33 @@ impl TranslationCache {
             compiled_entries,
             region_entries,
             interpreted_ir_bytes,
+            invalidation_calls: self.invalidation_calls.load(Ordering::Relaxed),
+            invalidation_blocks_dropped: self.invalidation_blocks_dropped.load(Ordering::Relaxed),
+            tier_bg_submitted: self.tier_bg_submitted.load(Ordering::Relaxed),
+            tier_bg_completed: self.tier_bg_completed.load(Ordering::Relaxed),
+            tier_bg_duplicates_skipped: self.tier_bg_duplicates_skipped.load(Ordering::Relaxed),
+            tier_bg_rejected_generation: self.tier_bg_rejected_generation.load(Ordering::Relaxed),
+            tier_bg_rejected_compile_failed: self
+                .tier_bg_rejected_compile_failed
+                .load(Ordering::Relaxed),
+            tier_bg_superseded: self.tier_bg_superseded.load(Ordering::Relaxed),
+            tier_bg_published: self.tier_bg_published(),
+            tier_bg_rejected: self.tier_bg_rejected(),
         }
     }
 
     pub fn new() -> Self {
         Self {
             memory_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            invalidation_calls: AtomicU64::new(0),
+            invalidation_blocks_dropped: AtomicU64::new(0),
+            tier_bg_submitted: AtomicU64::new(0),
+            tier_bg_completed: AtomicU64::new(0),
+            tier_bg_duplicates_skipped: AtomicU64::new(0),
+            tier_bg_rejected_generation: AtomicU64::new(0),
+            tier_bg_rejected_compile_failed: AtomicU64::new(0),
+            tier_bg_superseded: AtomicU64::new(0),
+
             map: RwLock::new(HashMap::new()),
             spans: RwLock::new(SpanIndex::default()),
             hits: AtomicU64::new(0),
@@ -296,7 +327,6 @@ impl TranslationCache {
             ibtc_filled: AtomicU64::new(0),
             hotness: RwLock::new(HashMap::new()),
             region_decision: RwLock::new(HashMap::new()),
-            tier_pending: Mutex::new(HashSet::new()),
             tier_bg_published: AtomicU64::new(0),
             tier_bg_rejected: AtomicU64::new(0),
         }
@@ -518,27 +548,121 @@ impl TranslationCache {
         self.regions.load(Ordering::Relaxed)
     }
 
-    /// Claim `pc` for a background tier-up. Returns
-    /// `true` if this caller now owns the in-flight slot (submit the compile);
-    /// `false` if a compile for `pc` is already pending (skip — don't re-submit).
-    /// Pairs with [`end_tier_up`](Self::end_tier_up) once the completion is
-    /// published, rejected, or the block is invalidated.
+    /// Claim a background slot. Invalidation cancels its source snapshot but
+    /// retains ownership until completion, preventing duplicate queued work.
     pub fn try_begin_tier_up(&self, key: BlockKey) -> bool {
-        self.tier_pending.lock().unwrap().insert(key)
+        let mut spans = self.spans.write().unwrap();
+        if spans.pending.contains_key(&key) {
+            self.tier_bg_duplicates_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        spans.next_request = spans
+            .next_request
+            .checked_add(1)
+            .expect("tier-up request IDs exhausted");
+        let id = spans.next_request;
+        spans.pending.insert(
+            key,
+            PendingTierUp {
+                id,
+                spans: None,
+                cancelled: false,
+            },
+        );
+        true
     }
 
-    /// Release `pc`'s in-flight marker (idempotent — a no-op if already clear, so a
-    /// publish and a racing invalidation can both call it). See
-    /// [`try_begin_tier_up`](Self::try_begin_tier_up).
+    /// Release an unsubmitted request's slot, or explicitly abandon ownership.
     pub fn end_tier_up(&self, key: BlockKey) {
-        self.tier_pending.lock().unwrap().remove(&key);
+        self.spans.write().unwrap().pending.remove(&key);
     }
 
-    /// Number of background tier-up compiles currently in flight (observability /
-    /// test invariant: this must return to 0 once the queue drains — no stuck
-    /// marker after a race).
+    /// Requests still awaiting a completion, including canceled source snapshots.
     pub fn tier_pending_len(&self) -> usize {
-        self.tier_pending.lock().unwrap().len()
+        self.spans.read().unwrap().pending.len()
+    }
+
+    // Source reads precede registration, so this short window still uses the
+    // global generation. Once registered, only overlapping writes cancel a request.
+    pub(crate) fn prepare_tier_up(
+        &self,
+        key: BlockKey,
+        source_spans: Vec<(u64, u32)>,
+        generation: u64,
+        on_mark: impl FnOnce(&[(u64, u32)]),
+    ) -> Option<u64> {
+        let mut spans = self.spans.write().unwrap();
+        let pending = spans.pending.get_mut(&key)?;
+        if pending.cancelled || self.publication_generation() != generation {
+            return None;
+        }
+        on_mark(&source_spans);
+        pending.spans = Some(source_spans);
+        Some(pending.id)
+    }
+
+    pub(crate) fn publish_tier_up(
+        &self,
+        key: BlockKey,
+        block: CachedBlock,
+        request_id: u64,
+        on_mark: impl FnOnce(&[(u64, u32)]),
+    ) -> bool {
+        let mut spans = self.spans.write().unwrap();
+        if spans.pending.get(&key).is_none_or(|p| p.id != request_id) {
+            self.record_tier_bg_rejected();
+            self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let pending = spans.pending.remove(&key).unwrap();
+        if pending.cancelled {
+            self.record_tier_bg_rejected_generation();
+            return false;
+        }
+        if matches!(block, CachedBlock::Interpreted(_)) {
+            self.record_tier_bg_compile_failed();
+            return false;
+        }
+        let mut map = self.map.write().unwrap();
+        if !matches!(map.get(&key), Some(CachedBlock::Interpreted(_))) {
+            self.record_tier_bg_rejected();
+            self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let source_spans = pending.spans.expect("submitted tier-up has source spans");
+        on_mark(&source_spans);
+        self.account_replace(
+            map.get(&key),
+            spans.units.get(&key).map_or(0, Vec::len),
+            Some(&block),
+            source_spans.len(),
+        );
+        map.insert(key, block);
+        spans.insert(key, source_spans);
+        self.hotness.write().unwrap().remove(&key);
+        self.record_tier_bg_published();
+        true
+    }
+
+    pub(crate) fn record_tier_bg_submitted(&self) {
+        self.tier_bg_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tier_bg_completed(&self) {
+        self.tier_bg_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tier_bg_rejected_generation(&self) {
+        self.record_tier_bg_rejected();
+        self.tier_bg_rejected_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tier_bg_compile_failed(&self) {
+        self.record_tier_bg_rejected();
+        self.tier_bg_rejected_compile_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a background tier-up completion published into the cache.
@@ -551,8 +675,7 @@ impl TranslationCache {
         self.tier_bg_published.load(Ordering::Relaxed)
     }
 
-    /// Record a background tier-up completion rejected at publish (generation moved or
-    /// the block was invalidated while its compile was in flight).
+    /// Record a background completion discarded at publication.
     pub fn record_tier_bg_rejected(&self) {
         self.tier_bg_rejected.fetch_add(1, Ordering::Relaxed);
     }
@@ -652,6 +775,7 @@ impl TranslationCache {
         hi: u64,
         on_write: impl FnOnce(bool),
     ) -> Vec<BlockKey> {
+        self.invalidation_calls.fetch_add(1, Ordering::Relaxed);
         let mut spans = self.spans.write().unwrap();
         // SMC is address-scoped: a write to `[lo, hi)` drops every overlapping unit
         // regardless of the mode it was lifted under (§17.4 — the key carries the mode,
@@ -667,11 +791,9 @@ impl TranslationCache {
             .collect();
         let mut map = (!victims.is_empty()).then(|| self.map.write().unwrap());
         if let Some(map) = map.as_mut() {
+            self.invalidation_blocks_dropped
+                .fetch_add(victims.len() as u64, Ordering::Relaxed);
             let mut hotness = self.hotness.write().unwrap();
-            // Innermost lock (spans -> map -> hotness -> tier_pending): drop any
-            // in-flight background tier-up marker for a victim so a later completion
-            // is rejected and the block can be freely re-lifted.
-            let mut pending = self.tier_pending.lock().unwrap();
             for entry in &victims {
                 self.account_replace(
                     map.get(entry),
@@ -682,10 +804,37 @@ impl TranslationCache {
                 spans.remove(entry);
                 map.remove(entry);
                 hotness.remove(entry);
-                pending.remove(entry);
             }
         }
-        on_write(!spans.has_units(lo, hi));
+        // No extra lock or source scan when there is no in-flight request.
+        let mut pending_on_page = false;
+        if lo < hi && !spans.pending.is_empty() {
+            for pending in spans.pending.values_mut() {
+                if pending.cancelled {
+                    continue;
+                }
+                match &pending.spans {
+                    Some(source_spans) => {
+                        pending.cancelled |= source_spans.iter().any(|&(start, len)| {
+                            start < hi && lo < start.saturating_add(u64::from(len))
+                        });
+                        // Live uncached successors still need write notifications.
+                        // Canceled requests must allow fetch approvals to be cleared.
+                        pending_on_page |= !pending.cancelled
+                            && source_spans.iter().any(|&(start, len)| {
+                                len != 0
+                                    && (start >> crate::memory::CODE_PAGE_BITS)
+                                        <= ((hi - 1) >> crate::memory::CODE_PAGE_BITS)
+                                    && (lo >> crate::memory::CODE_PAGE_BITS)
+                                        <= (start.saturating_add(u64::from(len) - 1)
+                                            >> crate::memory::CODE_PAGE_BITS)
+                            });
+                    }
+                    None => pending.cancelled = true,
+                }
+            }
+        }
+        on_write(!pending_on_page && !spans.has_units(lo, hi));
         // A source span may have been read but not cached yet. Reject its
         // publication even when all currently cached spans survive this write.
         self.publication_generation.fetch_add(1, Ordering::Release);
@@ -816,8 +965,7 @@ mod tests {
 
     /// The background tier-up in-flight set. A pc is claimable
     /// once; a second claim while pending is rejected (no double-submit); `end_tier_up`
-    /// releases it and is idempotent (a publish and a racing invalidation may both
-    /// call it).
+    /// releases it and is idempotent.
     #[test]
     fn tier_pending_set_transitions() {
         let c = TranslationCache::new();
@@ -846,12 +994,10 @@ mod tests {
         c.end_tier_up(k(0x2000));
     }
 
-    /// An SMC drop clears a victim's in-flight marker, so a background
-    /// compile that lands afterward finds no marker (its publish is separately
-    /// epoch-rejected) and the pc is freely re-claimable — a dropped block never
-    /// wedges its pending slot.
+    /// A canceled request retains its slot until completion, so re-lifting cannot
+    /// enqueue duplicate work while the old compile is still running.
     #[test]
-    fn invalidate_clears_pending_marker() {
+    fn invalidate_retains_pending_marker_until_completion() {
         let c = TranslationCache::new();
         c.insert(k(0x1000), compiled(), vec![(0x1000, 4)], |_| {});
         assert!(c.try_begin_tier_up(k(0x1000)), "claim the in-flight slot");
@@ -862,10 +1008,11 @@ mod tests {
         );
 
         assert!(
-            c.try_begin_tier_up(k(0x1000)),
-            "invalidation cleared the marker, so the slot is free again"
+            !c.try_begin_tier_up(k(0x1000)),
+            "canceled request still owns the slot"
         );
         c.end_tier_up(k(0x1000));
+        assert!(c.try_begin_tier_up(k(0x1000)));
     }
 
     /// The background tier-up "fires" counters start at zero and count monotonically.
@@ -975,5 +1122,120 @@ mod tests {
         assert!(v.is_empty());
         assert_eq!(c.epoch(), since);
         assert!(c.publish_if_current(since, || {}));
+    }
+
+    fn pending_region(c: &TranslationCache) -> u64 {
+        let ir = Arc::new(IrBlock {
+            mode: CpuMode::Long64,
+            guest_start: 0x1000,
+            guest_len: 4,
+            icount: 1,
+            temp_count: 0,
+            ops: Vec::new(),
+        });
+        c.insert(
+            k(0x1000),
+            CachedBlock::Interpreted(ir),
+            vec![(0x1000, 4)],
+            |_| {},
+        );
+        let generation = c.publication_generation();
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        c.prepare_tier_up(
+            k(0x1000),
+            vec![(0x1000, 4), (0x3000, 4)],
+            generation,
+            |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_sources_cancel_only_on_overlap() {
+        for (lo, hi, publish) in [
+            (0x1800, 0x1801, true),
+            (0x3800, 0x3801, true),
+            (0x1003, 0x1004, false),
+            (0x3001, 0x3002, false),
+        ] {
+            let c = TranslationCache::new();
+            let id = pending_region(&c);
+            c.invalidate_overlapping(lo, hi, || {});
+            assert_eq!(c.tier_pending_len(), 1);
+            assert!(!c.try_begin_tier_up(k(0x1000)));
+            assert_eq!(
+                c.publish_tier_up(k(0x1000), compiled(), id, |_| {}),
+                publish
+            );
+            assert_eq!(c.tier_pending_len(), 0);
+            assert_eq!(
+                c.memory_stats().tier_bg_rejected_generation,
+                u64::from(!publish)
+            );
+        }
+    }
+
+    #[test]
+    fn pending_uncached_successor_preserves_page_tracking() {
+        let c = TranslationCache::new();
+        let id = pending_region(&c);
+        c.invalidate_overlapping(0x3800, 0x3801, || {
+            panic!("pending successor needs its page tag")
+        });
+        c.invalidate_child_written(0x3000, 0x4000, || {});
+        assert!(!c.publish_tier_up(k(0x1000), compiled(), id, |_| panic!("canceled")));
+        assert_eq!(c.memory_stats().tier_bg_rejected_generation, 1);
+    }
+
+    #[test]
+    fn old_completion_does_not_release_new_request() {
+        let c = TranslationCache::new();
+        let old = pending_region(&c);
+        c.end_tier_up(k(0x1000));
+        let new = pending_region(&c);
+        assert_ne!(old, new);
+        assert!(!c.publish_tier_up(k(0x1000), compiled(), old, |_| panic!("superseded")));
+        assert_eq!(c.tier_pending_len(), 1);
+        assert!(c.publish_tier_up(k(0x1000), compiled(), new, |_| {}));
+        assert_eq!(c.memory_stats().tier_bg_superseded, 1);
+        assert_eq!(c.tier_pending_len(), 0);
+    }
+
+    #[test]
+    fn invalidation_before_slot_claim_prevents_registration_by_generation() {
+        let c = TranslationCache::new();
+        let generation = c.publication_generation();
+        let source_spans = vec![(0x1000, 4), (0x3000, 4)];
+        let epoch = c.epoch();
+
+        // No pending slot exists for invalidation to cancel during the source read.
+        c.invalidate_overlapping(0x3000, 0x3001, || {});
+        assert_eq!(c.epoch(), epoch);
+        assert_ne!(c.publication_generation(), generation);
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        assert!(!c.spans.read().unwrap().pending[&k(0x1000)].cancelled);
+        assert!(c
+            .prepare_tier_up(k(0x1000), source_spans, generation, |_| {})
+            .is_none());
+        c.end_tier_up(k(0x1000));
+        assert_eq!(c.tier_pending_len(), 0);
+    }
+
+    #[test]
+    fn invalidation_during_source_read_prevents_registration() {
+        let c = TranslationCache::new();
+        let generation = c.publication_generation();
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        c.invalidate_overlapping(0x3000, 0x3001, || {});
+        assert!(c
+            .prepare_tier_up(
+                k(0x1000),
+                vec![(0x1000, 4), (0x3000, 4)],
+                generation,
+                |_| panic!("stale source")
+            )
+            .is_none());
+        c.end_tier_up(k(0x1000));
+        assert_eq!(c.tier_pending_len(), 0);
     }
 }

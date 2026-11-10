@@ -86,3 +86,24 @@ fn cache_replacements_and_stale_upgrades_preserve_accounting() {
     assert!(!cache.upgrade(key, compiled, (0x1000, 1), generation));
     assert_eq!(cache.memory_stats().compiled_entries, 0);
 }
+
+#[test]
+fn invalidation_activity_counts_calls_and_victims() {
+    let mut vm = Vm::new(VmConfig::flat(0x4000));
+    vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, &[0xf4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let before = vm.memory_stats().cache;
+    vm.cache.invalidate_overlapping(0x1800, 0x1801, || {});
+    vm.cache.invalidate_overlapping(0x1000, 0x1001, || {});
+    let after = vm.memory_stats().cache;
+    assert_eq!(after.invalidation_calls - before.invalidation_calls, 2);
+    assert_eq!(
+        after.invalidation_blocks_dropped - before.invalidation_blocks_dropped,
+        1
+    );
+    assert_eq!(after.tier_bg_submitted, 0);
+    assert_eq!(after.tier_bg_completed, 0);
+}

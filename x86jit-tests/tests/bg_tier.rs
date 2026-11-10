@@ -324,95 +324,62 @@ fn trap_map_midflight_rejects_stale() {
     assert_eq!(vm.cache.tier_pending_len(), 0);
 }
 
-/// An invalidation of an *unrelated* block bumps the epoch without dropping our
-/// hot block. The pending compile's `upgrade` is still rejected (epoch moved), the
-/// drain's `end_tier_up` frees the marker, and the surviving block resubmits and
-/// publishes on the next heat.
+/// An unrelated block can be invalidated without discarding this request's work.
 #[test]
-fn unrelated_invalidation_rejects_then_resubmits() {
+fn unrelated_invalidation_preserves_pending_completion() {
     const DECOY: u64 = 0x3000;
     let jit = JitBackend::new();
     let handle = jit.tier_up_handle();
+    let pause = handle.pause_compiler();
     let mut vm = vm_with_flat(Box::new(jit), 3, true, &single_block_val(42), 0x4000);
     vm.map(DECOY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
-    let decoy = {
-        let mut a = CodeAssembler::new(64).unwrap();
-        a.mov(eax, 9i32).unwrap();
-        a.hlt().unwrap();
-        a.assemble(DECOY).unwrap()
-    };
-    vm.write_bytes(DECOY, &decoy).unwrap();
-
-    // Cache the decoy block (a victim for the later invalidation).
+    vm.write_bytes(DECOY, &[0xf4]).unwrap();
     let mut dcpu = vm.new_vcpu();
     dcpu.set_reg(Reg::Rip, DECOY);
     assert!(matches!(dcpu.run(&vm, Some(1_000)), Exit::Hlt));
-
-    // Heat + submit our block, let the worker finish.
     let mut cpu = vm.new_vcpu();
     heat_to_submit(&vm, &mut cpu, 42);
-    handle.wait_idle();
-
-    // SMC the DECOY page: on the next dispatch `handle_smc` drops the decoy (a victim
-    // → epoch bump) but not our block, whose in-flight marker survives.
-    vm.write_bytes(DECOY, &decoy).unwrap();
-
-    assert_eq!(one_pass(&vm, &mut cpu), 42); // drain rejects (epoch moved), block survives
-    assert_eq!(vm.cache.tier_bg_rejected(), 1);
-    assert_eq!(vm.cache.tier_bg_published(), 0);
-
-    // Our block is still cached interpreted (hotness intact) → resubmits, publishes.
-    assert_eq!(one_pass(&vm, &mut cpu), 42); // re-submit (hotness already ≥ threshold)
+    vm.write_bytes(DECOY, &[0xf4]).unwrap();
+    assert_eq!(one_pass(&vm, &mut cpu), 42);
+    assert_eq!(vm.memory_stats().cache.tier_bg_submitted, 1);
+    drop(pause);
     handle.wait_idle();
     assert_eq!(one_pass(&vm, &mut cpu), 42);
-    assert_eq!(vm.cache.tier_bg_published(), 1, "resubmit published");
+    let stats = vm.memory_stats().cache;
+    assert_eq!(stats.tier_bg_completed, 1);
+    assert_eq!(stats.tier_bg_published, 1);
+    assert_eq!(stats.tier_bg_rejected, 0);
     assert_eq!(vm.cache.tier_pending_len(), 0);
 }
 
-/// Two completions land for one pc (the old request still queued when an SMC
-/// invalidates and the re-lifted block resubmits). The compiler is paused so both
-/// requests queue; on release both compile. The epoch check rejects the stale one and
-/// publishes the fresh one regardless of drain order.
+/// Even overlapping SMC cannot enqueue a replacement until the old request drains.
 #[test]
-fn duplicate_completions_epoch_picks_the_fresh_one() {
+fn overlapping_write_cancels_without_duplicate_submission() {
     let jit = JitBackend::new();
     let handle = jit.tier_up_handle();
+    let pause = handle.pause_compiler();
     let vm = vm_with(Box::new(jit), 3, true, &single_block_val(42));
     let mut cpu = vm.new_vcpu();
-
-    let pause = handle.pause_compiler(); // stall the worker: nothing compiles yet
-
-    // R1 (v1, epoch e0) queues but can't compile.
     heat_to_submit(&vm, &mut cpu, 42);
-    assert_eq!(vm.cache.tier_pending_len(), 1);
-
-    // SMC to v2 → next dispatch invalidates (epoch e1, clears the marker, drops the
-    // block); the drain is empty (worker paused), so v2 just re-lifts.
     vm.write_bytes(CODE, &single_block_val(7)).unwrap();
-    assert_eq!(one_pass(&vm, &mut cpu), 7);
-
-    // Re-heat v2 → R2 (epoch e1) queues behind the still-uncompiled R1.
-    for _ in 0..3 {
+    for _ in 0..10 {
         assert_eq!(one_pass(&vm, &mut cpu), 7);
     }
     assert_eq!(vm.cache.tier_pending_len(), 1);
-
-    // Release: the worker compiles R1 (stale) then R2 → two completions for CODE.
+    assert_eq!(vm.memory_stats().cache.tier_bg_submitted, 1);
+    assert!(vm.memory_stats().cache.tier_bg_duplicates_skipped > 0);
     drop(pause);
     handle.wait_idle();
-
     assert_eq!(one_pass(&vm, &mut cpu), 7);
-    assert_eq!(
-        vm.cache.tier_bg_published(),
-        1,
-        "only the fresh compile published"
-    );
-    assert_eq!(
-        vm.cache.tier_bg_rejected(),
-        1,
-        "the stale duplicate rejected"
-    );
-    assert_eq!(vm.cache.tier_pending_len(), 0, "no stuck marker");
+    assert_eq!(vm.memory_stats().cache.tier_bg_rejected_generation, 1);
+    handle.wait_idle();
+    assert_eq!(one_pass(&vm, &mut cpu), 7);
+    let stats = vm.memory_stats().cache;
+    assert_eq!(stats.tier_bg_submitted, 2);
+    assert_eq!(stats.tier_bg_completed, 2);
+    assert_eq!(stats.tier_bg_published, 1);
+    assert_eq!(stats.tier_bg_superseded, 0);
+    assert_eq!(vm.cache.tier_pending_len(), 0);
 }
 
 // Shutdown consumes exclusive VM ownership. Stopping vCPU host threads, including
@@ -1064,4 +1031,59 @@ fn victim_free_drain_rejects_background_region_with_uncached_successor() {
         Some(CachedBlock::Compiled { .. })
     ));
     assert_eq!(vm.cache.tier_pending_len(), 0);
+}
+
+fn disjoint_guest_store_preserves_completion(different_page: bool) {
+    let jit = JitBackend::new();
+    let handle = jit.tier_up_handle();
+    let pause = handle.pause_compiler();
+    let mut vm = Vm::with_backend(VmConfig::flat(0x5000), Box::new(jit));
+    vm.set_tier_up_after(Some(32));
+    vm.set_tier_up_background(true);
+    vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(CODE, &single_block()).unwrap();
+    vm.write_bytes(0x3000, &[0xf4]).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(byte_ptr(rdi), 42).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(0x4000, &a.assemble(0x4000).unwrap())
+        .unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x3000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    for _ in 0..33 {
+        assert_eq!(one_pass(&vm, &mut cpu), 42);
+    }
+    assert_eq!(vm.memory_stats().cache.tier_bg_submitted, 1);
+    let before = vm.memory_stats().cache;
+    cpu.set_reg(Reg::Rip, 0x4000);
+    cpu.set_reg(Reg::Rdi, if different_page { 0x3800 } else { 0x1800 });
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(one_pass(&vm, &mut cpu), 42);
+    let after = vm.memory_stats().cache;
+    assert_eq!(after.invalidation_calls - before.invalidation_calls, 1);
+    assert_eq!(
+        after.invalidation_blocks_dropped,
+        before.invalidation_blocks_dropped
+    );
+    assert_eq!(after.tier_bg_submitted, 1);
+    assert!(after.tier_bg_duplicates_skipped > 0);
+    drop(pause);
+    handle.wait_idle();
+    assert_eq!(one_pass(&vm, &mut cpu), 42);
+    let stats = vm.memory_stats().cache;
+    assert_eq!(stats.tier_bg_completed, 1);
+    assert_eq!(stats.tier_bg_published, 1);
+    assert_eq!(stats.tier_bg_rejected, 0);
+    assert_eq!(vm.cache.tier_pending_len(), 0);
+}
+
+#[test]
+fn disjoint_guest_store_on_same_code_page_preserves_completion() {
+    disjoint_guest_store_preserves_completion(false);
+}
+
+#[test]
+fn disjoint_guest_store_on_different_code_page_preserves_completion() {
+    disjoint_guest_store_preserves_completion(true);
 }

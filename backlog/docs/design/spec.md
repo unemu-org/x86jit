@@ -1088,9 +1088,20 @@ Invalidation uses a page index to find candidate units, then compares their sour
 byte spans with the accumulated write ranges. Disjoint writes preserve cached units,
 page tags and the dispatch epoch, so per-vCPU predictors remain warm. Every drained
 range advances a separate source-publication generation under the cache spans lock.
-Lifts and tier-ups snapshot it before reading source bytes or IR and reject publication
-if it changes, including when an uncached region successor was written and no cached
-unit overlapped. This conservatively retries unrelated in-flight work.
+Synchronous lifts and tier-ups snapshot it before reading source bytes or IR and reject
+publication if it changes, including when an uncached region successor was written and
+no cached unit overlapped. Background requests use that check only until their source
+spans are registered under the same lock; subsequent invalidation cancels only requests
+whose source spans overlap the write. Uncached region successors are tagged at
+registration and retain write tracking while pending. Canceled requests keep their
+pending slot until the matching completion drains, preventing duplicate compilation.
+An opaque request identity prevents a stale completion from releasing a newer slot.
+
+`Vm::memory_stats().cache` exposes lifetime invalidation calls and blocks dropped,
+background requests accepted, duplicate attempts skipped, completions received and
+published, and rejections split by source invalidation, backend compilation failure,
+and supersession. These relaxed counters are independent snapshots; a region counts
+as one cache entry and one background request.
 
 With an installed fetch policy, write notifications invalidate the whole 4 KiB page:
 approval is page-wide, and `note_write` also reports protection changes. Surviving

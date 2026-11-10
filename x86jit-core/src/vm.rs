@@ -348,8 +348,8 @@ pub struct TierUpRequest {
     /// publish — one for a block, one per sub-block for a region (matches
     /// [`TranslationCache::insert`]'s span list).
     pub spans: Vec<(u64, u32)>,
-    /// Source-publication generation snapshotted before reading the unit; checked
-    /// against `TranslationCache::publication_generation` when publishing.
+    /// Opaque request identity echoed in the completion. The dispatcher tracks
+    /// this request's source spans and cancels it on overlapping invalidation.
     pub epoch: u64,
 }
 
@@ -378,7 +378,7 @@ pub struct TierUpFinished {
     pub block: CachedBlock,
     /// The guest byte span(s) `(start, len)` — one per sub-block for a region.
     pub spans: Vec<(u64, u32)>,
-    /// The source-publication generation from the request, checked at publication.
+    /// The opaque request identity, echoed unchanged from the request.
     pub epoch: u64,
 }
 
@@ -3037,46 +3037,30 @@ impl Vcpu {
 }
 
 /// Publish every completed background compile into the cache: the dispatcher
-/// publishes, the backend never touches the cache. Each is generation-checked by
-/// `upgrade_region`, including writes to uncached successors; the in-flight marker is
-/// always cleared so a rejected block can be re-lifted and re-submitted.
+/// publishes, the backend never touches the cache. Source-span validation includes
+/// writes to uncached successors. Only the matching completion releases a slot,
+/// so an old completion cannot clear a newer request's ownership.
 /// `tier_up_finished` short-circuits when idle.
 fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
     let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
     for fin in vm.backend.tier_up_finished() {
+        vm.cache.record_tier_bg_completed();
         // A Vm runs in a single mode (§17 scope fence), so the finished compile's
         // block key is its echoed pc under the Vm's mode (§17.4).
         let key = BlockKey::with_mxcsr(fin.pc, vm.mode, fin.mxcsr_mode);
-        if matches!(fin.block, CachedBlock::Interpreted(_)) {
-            // A failed background compile leaves the already-cached interpreter
-            // block in place; only clear its in-flight marker.
-            vm.cache.end_tier_up(key);
-            if vm.cache.publication_generation() != fin.epoch {
-                vm.cache.record_tier_bg_rejected();
-            }
-            continue;
-        }
-        // Multi-span publish: a region carries one span per sub-block; a block carries
-        // one. `on_mark` re-tags the pages under the spans lock.
         let multi_span = fin.spans.len() > 1;
         let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
-        let published = vm
-            .cache
-            .upgrade_region(key, fin.block, fin.spans, fin.epoch, |sp| {
-                for (start, len) in sp {
-                    vm.mem.mark_code(*start, *len);
-                }
-            });
-        vm.cache.end_tier_up(key);
+        let published = vm.cache.publish_tier_up(key, fin.block, fin.epoch, |sp| {
+            for (start, len) in sp {
+                vm.mem.mark_code(*start, *len);
+            }
+        });
         if published {
-            vm.cache.record_tier_bg_published();
             // A multi-span unit is a superblock region — count it like the
             // eager region path does, so `cache.regions()` reflects background regions.
             if multi_span {
                 vm.cache.record_region();
             }
-        } else {
-            vm.cache.record_tier_bg_rejected();
         }
     }
 }
@@ -3295,6 +3279,17 @@ fn resolve_attempt<const DEFAULT: bool>(
                 vm.cache.end_tier_up(key);
                 continue;
             }
+            let Some(request_id) = vm
+                .cache
+                .prepare_tier_up(key, spans.clone(), generation, |sp| {
+                    for &(start, len) in sp {
+                        vm.mem.mark_code(start, len);
+                    }
+                })
+            else {
+                vm.cache.end_tier_up(key);
+                continue;
+            };
             let req = TierUpRequest {
                 precise_split_stores: vm.precise_split_stores,
                 mxcsr_mode: key.mxcsr_mode,
@@ -3304,7 +3299,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                 mmio: vm.mem.trap_window(),
                 guest_base: vm.mem.guest_base(),
                 spans,
-                epoch: generation,
+                epoch: request_id,
             };
             let submitted = {
                 let _section =
@@ -3317,7 +3312,10 @@ fn resolve_attempt<const DEFAULT: bool>(
             };
             match submitted {
                 // Off to the worker — this block stays interpreted for now.
-                TierUpSubmit::Queued => return Ok(block),
+                TierUpSubmit::Queued => {
+                    vm.cache.record_tier_bg_submitted();
+                    return Ok(block);
+                }
                 // Queue full: don't compile inline (that reintroduces the spike);
                 // drop the marker so hotness re-submits on a later dispatch.
                 TierUpSubmit::Busy => {

@@ -26,7 +26,8 @@ pub struct BackendMemoryStats {
     pub background_in_flight: u64,
 }
 
-/// Current translation-cache publications. Independently sampled relaxed counters;
+/// Current translation-cache publications and lifetime activity counters.
+/// Independently sampled relaxed counters;
 /// concurrent replacement can temporarily expose parts of two snapshots.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
@@ -41,6 +42,26 @@ pub struct CacheMemoryStats {
     /// plus `ops.capacity() * size_of::<IrOp>()`. Counts shared IR per cache key;
     /// excludes queued IR, executing clones, and nested operation allocations.
     pub interpreted_ir_bytes: u64,
+    /// Calls to cache invalidation, including victim-free writes and explicit flushes.
+    pub invalidation_calls: u64,
+    /// Cache entries removed by invalidation (regions count once).
+    pub invalidation_blocks_dropped: u64,
+    /// Background requests accepted by the backend (excludes Busy/Unsupported).
+    pub tier_bg_submitted: u64,
+    /// Submission attempts skipped because the key already has a pending request.
+    pub tier_bg_duplicates_skipped: u64,
+    /// Background completions received by the dispatcher, including compile failures.
+    pub tier_bg_completed: u64,
+    /// Background completions installed into the cache.
+    pub tier_bg_published: u64,
+    /// Background completions discarded; sum of the rejection reasons below.
+    pub tier_bg_rejected: u64,
+    /// Completions rejected because their source publication snapshot was invalidated.
+    pub tier_bg_rejected_generation: u64,
+    /// Completions returning interpreted IR because compilation/publication in the backend failed.
+    pub tier_bg_rejected_compile_failed: u64,
+    /// Completions discarded because their request no longer owns the pending slot or a compiled entry superseded it.
+    pub tier_bg_superseded: u64,
 }
 
 /// Estimated storage summed over live vCPUs, excluding allocator overhead.
