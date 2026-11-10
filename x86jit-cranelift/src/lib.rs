@@ -23,6 +23,8 @@
 
 #[cfg(test)]
 mod batch_tests;
+#[cfg(feature = "jit")]
+mod code_memory;
 mod codegen;
 #[cfg(test)]
 mod embedder_tests;
@@ -2739,6 +2741,7 @@ pub struct JitBackend {
 /// and the background compiler worker (bg-tier). Diagnostic handles share only
 /// the separate queue coordination state, never these compiler resources.
 struct Shared {
+    system_memory: bool,
     memory: Arc<memory_stats::CodeCounters>,
     /// The Cranelift module, built lazily on the first compile: its ISA
     /// bakes in `opt_level`, which may have to be derived from a tier-up policy the
@@ -2956,6 +2959,26 @@ impl JitBackend {
         Self::build(caps, target, Some(opt))
     }
 
+    /// Use Cranelift's default memory provider for tests and fork-heavy embedders.
+    /// Call immediately after construction, before sharing or compiling. Code is
+    /// inherited with the system provider's policy; engine workers and VM state
+    /// still require the shutdown/rebuild protocol around host fork. Dense arena
+    /// mapping bounds and provider storage counters do not apply to this mode.
+    /// The first code registration in a fork child replaces the whole inherited
+    /// code map, hiding all inherited entries, including still-mapped code from
+    /// the system provider. The parent's entries are unaffected.
+    pub fn with_system_memory_provider(mut self) -> Self {
+        let shared =
+            Arc::get_mut(&mut self.shared).expect("configure memory before sharing the backend");
+        assert!(
+            shared.inner.get_mut().unwrap().is_none()
+                && shared.nondefault_inner.get_mut().unwrap().is_none(),
+            "configure memory before compiling"
+        );
+        shared.system_memory = true;
+        self
+    }
+
     /// Choose whether the JIT narrows dead flag writes. Set before compiling.
     pub fn set_flag_elision(&self, enabled: bool) {
         self.shared.flag_elision.store(enabled, Ordering::Relaxed);
@@ -3116,6 +3139,7 @@ impl JitBackend {
     fn build(caps: Option<RegionCaps>, target: HostTarget, opt: Option<OptLevel>) -> Self {
         Self {
             shared: Arc::new(Shared {
+                system_memory: false,
                 inner: Mutex::new(None),
                 nondefault_inner: Mutex::new(None),
                 lock_telemetry: Telemetry::default(),
@@ -3180,7 +3204,22 @@ impl JitBackend {
         self.shared.icount.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn build_jit(target: HostTarget, opt: OptLevel) -> Jit {
+        Self::build_jit_with_memory(
+            target,
+            opt,
+            Arc::new(memory_stats::CodeCounters::default()),
+            false,
+        )
+    }
+
+    fn build_jit_with_memory(
+        target: HostTarget,
+        opt: OptLevel,
+        memory: Arc<memory_stats::CodeCounters>,
+        system_memory: bool,
+    ) -> Jit {
         let mut flags = settings::builder();
         flags.set("use_colocated_libcalls", "false").unwrap();
         flags.set("is_pic", "false").unwrap();
@@ -3234,7 +3273,12 @@ impl JitBackend {
             .finish(settings::Flags::new(flags))
             .expect("finish ISA");
         let return_address_bkey = unwind::uses_bkey(isa.as_ref());
-        let builder = libcalls::builder(isa);
+        let mut builder = libcalls::builder(isa);
+        builder.memory_provider(if system_memory {
+            Box::new(cranelift_jit::SystemMemoryProvider::new())
+        } else {
+            code_memory::provider(memory)
+        });
         let module = JITModule::new(builder);
 
         Jit {
@@ -3433,7 +3477,12 @@ impl Shared {
             let opt = self
                 .opt
                 .unwrap_or_else(|| OptLevel::for_tiering(self.tiered.load(Ordering::Relaxed)));
-            *guard = Some(JitBackend::build_jit(self.target, opt));
+            *guard = Some(JitBackend::build_jit_with_memory(
+                self.target,
+                opt,
+                self.memory.clone(),
+                self.system_memory,
+            ));
         }
         Guard(guard)
     }
@@ -3914,11 +3963,7 @@ impl Shared {
         self.compile_result(jit.module.define_function(id, &mut ctx))
             .ok_or(CompileError::Unavailable)?;
         let cc = ctx.compiled_code().expect("compiled code present");
-        let align = (cc.buffer.alignment as u64)
-            .max(jit.module.isa().function_alignment().minimum as u64)
-            .max(jit.module.isa().symbol_alignment());
-        jit.allocations
-            .define(cc.code_info().total_size as usize, align as usize);
+        jit.allocations.define(cc.code_info().total_size as usize);
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
@@ -4204,8 +4249,8 @@ impl Shared {
     /// Drain only work already queued, at most TIER_FINALIZE_BATCH definitions.
     /// Release compilation locks between definitions: a foreground compile can
     /// finalize immediately (including any pending definitions in its module).
-    /// Neither path writes a previously sealed page. Cranelift 0.135.8
-    /// backend.rs::finalize_definitions owns relocation and cache synchronization.
+    /// Writes use the provider's write scope and RW view. Dense tails remain
+    /// available after finalization; publication follows cache synchronization.
     fn worker_loop(&self) {
         loop {
             let mut batch = Vec::with_capacity(TIER_FINALIZE_BATCH);

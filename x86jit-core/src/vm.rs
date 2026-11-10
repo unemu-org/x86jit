@@ -719,8 +719,11 @@ impl Vm {
     /// This is a normal-thread operation, not a signal or `pthread_atfork` hook.
     /// Shut down every VM in the process before the host fork. The embedder owns
     /// signal routing, blocked vCPU wakeups and reconstruction in both processes.
-    /// Executable arenas and signal-safe code-map records retain their existing
-    /// process lifetime; translation reclamation is a separate contract.
+    /// Dense JIT arenas are excluded from host-fork inheritance: compiled entries
+    /// and provider state from the parent are unavailable in the child. A new
+    /// backend reserves fresh storage there. The first child code registration
+    /// starts a fresh signal-safe code map; parent records remain retained but
+    /// inactive. Translation reclamation is a separate contract.
     pub fn shutdown(mut self) -> Result<ShutdownReport, ShutdownError> {
         let live_vcpus = Arc::strong_count(&self.vcpu_lifetime) - 1;
         let mut report = self.backend.shutdown();

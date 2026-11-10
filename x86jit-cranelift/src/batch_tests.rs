@@ -66,10 +66,23 @@ fn queued_small_units_share_pages_in_both_modules_and_publish_in_order() {
     }
     let stats = jit.memory_stats();
     assert_eq!(stats.compiled_units_total, TIER_QUEUE_CAP as u64);
-    assert_eq!(
-        stats.code_bytes_reserved,
-        (pages.iter().map(|pages| pages.len()).sum::<usize>() * region::page::size()) as u64
-    );
+    #[cfg(target_os = "macos")]
+    // SAFETY: pthread capability query has no preconditions.
+    let dense = unsafe { libc::pthread_jit_write_protect_supported_np() != 0 };
+    #[cfg(not(target_os = "macos"))]
+    let dense = true;
+    if dense {
+        assert_eq!(stats.code_regions, 2);
+        assert_eq!(stats.code_bytes_reserved, 2 * (128 << 20));
+        assert_eq!(
+            stats.code_bytes_committed,
+            (pages.iter().map(|pages| pages.len()).sum::<usize>() * region::page::size()) as u64
+        );
+    } else {
+        assert_eq!(stats.code_regions, 0);
+        assert_eq!(stats.code_bytes_reserved, 0);
+        assert_eq!(stats.code_bytes_committed, 0);
+    }
     for pages in pages {
         assert!(
             pages.len() <= TIER_QUEUE_CAP.div_ceil(TIER_FINALIZE_BATCH),

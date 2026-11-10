@@ -718,6 +718,59 @@ impl MemCtx {
     }
 }
 
+/// Announce completed instruction-cache maintenance before publishing a code
+/// pointer (decision-17). On macOS, FreeBSD and Linux arm64, each executing
+/// thread acknowledges the generation at the shared entry boundary. Linux keeps
+/// this protocol enabled even when SYNC_CORE registration succeeds, so modules
+/// whose registration fails can safely share executing threads with other modules.
+/// This is instruction visibility only, never an execution/reclamation grace period.
+pub fn code_publication_barrier() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "freebsd", target_os = "linux")
+    ))]
+    {
+        CODE_PUBLICATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Order this generation before subsequent relaxed link-slot stores.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "freebsd", target_os = "linux")
+))]
+static CODE_PUBLICATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Synchronize this thread before entering a newly published compiled range.
+/// Every dispatcher/chain entry uses this boundary; static helpers do not
+/// acquire pointers to other compiled functions. The compiler clears caches
+/// before the release generation, and the acquire precedes this thread's ISB.
+#[inline]
+pub fn synchronize_instruction_stream() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "freebsd", target_os = "linux")
+    ))]
+    {
+        std::thread_local! { static SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+        // Link/return predictors use relaxed pointer loads. Order those loads
+        // before observing the publisher's generation.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let generation = CODE_PUBLICATION.load(std::sync::atomic::Ordering::Acquire);
+        SEEN.with(|seen| {
+            if seen.get() != generation {
+                // SAFETY: Arm ARM DDI0487J.a §B2.2.5, instruction synchronization
+                // after another PE's cache maintenance and pointer publication.
+                unsafe {
+                    core::arch::asm!("isb", options(nostack, preserves_flags));
+                }
+                seen.set(generation);
+            }
+        });
+    }
+}
+
 /// Call one compiled block; returns its raw ABI code (chain/link details land in
 /// `ctx`). The dispatcher's chain loop (§9.2, §12 M5) interprets the code.
 ///
@@ -729,6 +782,7 @@ pub unsafe fn call_block(entry: CompiledPtr, cpu: &mut CpuState, ctx: &mut MemCt
     let _fp_mode = fp::RunMode::new();
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if cpu.mxcsr & fp::MODE_MASK != 0 {
+        synchronize_instruction_stream();
         return fp::call(
             cpu as *mut CpuState as *mut u8,
             ctx as *mut MemCtx as *mut u8,
@@ -749,6 +803,7 @@ pub(crate) unsafe fn call_block_in_mode(
     cpu: &mut CpuState,
     ctx: &mut MemCtx,
 ) -> u64 {
+    synchronize_instruction_stream();
     let f: CompiledFn = core::mem::transmute(entry.0);
     f(
         cpu as *mut CpuState as *mut u8,

@@ -262,27 +262,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41eef45b50970e024d673e3fc4a0703e4fee75ca31d63b26566eb0f142300179"
 
 [[package]]
-name = "cranelift-jit"
-version = "0.135.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31d67d6c6a02ffd860599e55b03d4f37c6cf9be678c1d68dbfa6d1f61946e4ae"
-dependencies = [
- "anyhow",
- "cranelift-codegen",
- "cranelift-control",
- "cranelift-entity",
- "cranelift-module",
- "cranelift-native",
- "libc",
- "log",
- "memmap2",
- "region",
- "target-lexicon",
- "wasmtime-internal-jit-icache-coherence",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "cranelift-module"
 version = "0.135.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -923,13 +902,33 @@ version = "0.3.0"
 dependencies = [
  "cranelift",
  "cranelift-codegen",
- "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
  "libc",
  "memmap2",
  "region",
+ "wasmtime-internal-jit-icache-coherence",
  "x86jit-core",
+ "x86jit-cranelift-jit",
+]
+
+[[package]]
+name = "x86jit-cranelift-jit"
+version = "0.135.8"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-entity",
+ "cranelift-module",
+ "cranelift-native",
+ "libc",
+ "log",
+ "memmap2",
+ "region",
+ "target-lexicon",
+ "wasmtime-internal-jit-icache-coherence",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

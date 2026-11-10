@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/cranelift-jit"]
 members = [
     "x86jit-core",
     "x86jit-cranelift",
@@ -21,7 +22,7 @@ rust-version = "1.95"
 iced-x86 = "1.21"
 # JIT backend — feature-gated in x86jit-cranelift (§15).
 cranelift = "=0.135.8"
-cranelift-jit = "=0.135.8"
+cranelift-jit = { package = "x86jit-cranelift-jit", version = "=0.135.8", path = "vendor/cranelift-jit" }
 cranelift-module = "=0.135.8"
 cranelift-native = "=0.135.8"
 # Executable memory arena for the JIT code cache (W^X) (§15).

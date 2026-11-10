@@ -110,6 +110,9 @@ pub(crate) fn builder(isa: OwnedTargetIsa) -> JITBuilder {
     // Lookup functions run in reverse registration order. Never return None:
     // that would allow Cranelift's built-in dlsym lookup to run next.
     builder.symbol_lookup_fn(Box::new(|name| panic!("unregistered JIT symbol: {name}")));
+    builder.memory_provider(crate::code_memory::provider(std::sync::Arc::new(
+        crate::memory_stats::CodeCounters::default(),
+    )));
     builder
 }
 

@@ -14,12 +14,31 @@ pub struct BackendMemoryStats {
     pub compiled_units_total: u64,
     /// Sum of finalized unit lengths, including constant pools, excluding padding.
     pub code_bytes_emitted: u64,
-    /// Executable allocation bytes, including alignment padding and page tails,
-    /// charged at finalize attempts. Modeled from the pinned cranelift-jit
-    /// 0.135.8 default SystemMemoryProvider's page-rounded anonymous mappings;
-    /// finalized tails are not reused. Includes failed finalize allocations,
-    /// excludes definitions not yet submitted to finalize. Not RSS.
+    /// Logical code-region capacity, including padding and unused tails.
+    /// Exact provider accounting, including pending/failed definitions. On macOS
+    /// these are slices of code_process_reservation_bytes. Never an RSS estimate.
     pub code_bytes_reserved: u64,
+    /// Logical code regions owned by this backend (128 MiB or larger).
+    pub code_regions: u64,
+    /// Distinct OS views covering those regions: two aliases per Unix region,
+    /// one shared process-wide MAP_JIT view on macOS. Not physical allocations.
+    pub code_mapping_views: u64,
+    /// Process-wide macOS MAP_JIT virtual reservation (shared across backends;
+    /// do not sum across VMs). Zero on other systems.
+    pub code_process_reservation_bytes: u64,
+    /// Page-rounded high-water extents of allocated code, counted once per
+    /// backing object. Demand-paged allocator commitment, not physical residency.
+    pub code_bytes_committed: u64,
+    /// Code allocation extents, including alignment padding and veneer capacity.
+    pub code_bytes_used: u64,
+    /// Unused region tails. No retired extents are reusable before phase 3.
+    pub code_bytes_free: u64,
+    /// Largest currently unused contiguous region tail.
+    pub code_largest_free_extent: u64,
+    /// Provider allocation/finalization failures, including OS reservation errors.
+    pub code_allocation_failures: u64,
+    /// Allocation-handle and region-vector capacities, excluding allocator overhead.
+    pub code_allocation_metadata_bytes: u64,
     /// Requests waiting in the background queue, excluding the active batch.
     pub background_queue_len: u64,
     /// Requests removed from the queue whose batch has not completed publication.
@@ -100,9 +119,10 @@ pub struct VcpuMemoryStats {
 /// Standalone ChildArena storage belongs to the embedder and is excluded;
 /// vCPUs own no child arenas. Compiler contexts, cache hash tables/span indices,
 /// link slots and allocator bookkeeping are also excluded.
-/// No compiler lock or cache traversal is required. The vCPU registry, background
-/// queue and code-map writer locks are acquired. Code-map sampling also collects
-/// obsolete versions after reader quiescence. Fields can reflect different instants.
+/// No compiler lock or cache traversal is required. The provider registry, vCPU
+/// registry, background queue and code-map writer locks are acquired briefly.
+/// Code-map sampling also collects obsolete versions after reader quiescence.
+/// Fields can reflect different instants.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct MemoryStats {

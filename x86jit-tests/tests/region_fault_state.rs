@@ -15,6 +15,33 @@ use x86jit_cranelift::{HostTarget, JitBackend, OptLevel};
 
 const CODE: u64 = 0x1000;
 
+fn wait_for_child(pid: libc::pid_t) -> libc::c_int {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is our child and status is writable; WNOHANG bounds polling.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result == pid {
+            return status;
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                panic!("waitpid failed for fault-state child: {error}");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: the child remains unreaped, so its PID cannot be reused.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            panic!("fault-state child exceeded 20 seconds and was killed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct Capture {
@@ -180,7 +207,9 @@ fn write_fault(kind: &str, tier: usize) -> Vec<String> {
             mem.write_bytes(data, &value.to_le_bytes()).unwrap();
             let fault_addr = data + if after { page as u64 } else { 0 };
             for opt in [OptLevel::None, OptLevel::Speed] {
-                let jit = JitBackend::with_options(None, HostTarget::Native, opt);
+                // This fixture deliberately executes a parent-compiled entry after fork.
+                let jit = JitBackend::with_options(None, HostTarget::Native, opt)
+                    .with_system_memory_provider();
                 let region = lift_region(
                     &mem,
                     CODE,
@@ -255,8 +284,7 @@ fn write_fault(kind: &str, tier: usize) -> Vec<String> {
                         }
                         libc::_exit(92);
                     }
-                    let mut status = 0;
-                    assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+                    let status = wait_for_child(pid);
                     let actual = capture.read();
                     libc::munmap(capture.cast(), page);
                     assert_eq!(status, 0, "{kind}, tier={tier}, {opt:?}");
@@ -522,7 +550,9 @@ fn region_guard_fault_recovers_gprs_and_flags() {
                 "diamond must join"
             );
             for opt in [OptLevel::None, OptLevel::Speed] {
-                let jit = JitBackend::with_options(None, HostTarget::Native, opt);
+                // This fixture deliberately executes a parent-compiled entry after fork.
+                let jit = JitBackend::with_options(None, HostTarget::Native, opt)
+                    .with_system_memory_provider();
                 let CachedBlock::Compiled { entry } =
                     jit.materialize_region(&region, MemConsistency::Fast, None, 0)
                 else {
@@ -566,8 +596,7 @@ fn region_guard_fault_recovers_gprs_and_flags() {
                         x86jit_core::jit_abi::call_block(entry, &mut cpu, &mut ctx);
                         libc::_exit(92);
                     }
-                    let mut status = 0;
-                    assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+                    let status = wait_for_child(pid);
                     assert_eq!(status, 0, "site={site}, offset={offset}, opt={opt:?}");
                     let actual = capture.read();
                     libc::munmap(capture.cast(), page);

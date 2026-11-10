@@ -801,21 +801,126 @@ pub(crate) fn with_child_test_poison<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-static CODE_MAP: CodeMap = CodeMap::new();
+/// Identity shared by process-owned JIT storage and metadata.
+///
+/// The fork generation changes in every child, including children that never
+/// access the JIT. PID reuse in a later descendant cannot revive inherited state.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pid: u32,
+    generation: u64,
+}
+
+impl ProcessIdentity {
+    /// Initialize fork tracking before publishing any process-owned state.
+    pub fn current() -> Self {
+        static GENERATION: AtomicU64 = AtomicU64::new(0);
+        #[cfg(unix)]
+        {
+            static REGISTER: std::sync::Once = std::sync::Once::new();
+            extern "C" fn child() {
+                // Only a lock-free atomic operation is permitted in this handler.
+                GENERATION.fetch_add(1, Ordering::Relaxed);
+            }
+            REGISTER.call_once(|| {
+                unsafe extern "C" {
+                    fn pthread_atfork(
+                        prepare: Option<extern "C" fn()>,
+                        parent: Option<extern "C" fn()>,
+                        child: Option<extern "C" fn()>,
+                    ) -> std::ffi::c_int;
+                }
+                // SAFETY: the child callback has static lifetime and touches only
+                // an AtomicU64; no locks, allocation, or inherited runtime state.
+                let result = unsafe { pthread_atfork(None, None, Some(child)) };
+                assert_eq!(result, 0, "could not register JIT fork generation handler");
+            });
+        }
+        Self {
+            pid: std::process::id(),
+            generation: GENERATION.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static EMPTY_CODE_MAP: CodeMap = CodeMap::new();
+struct ProcessCodeMap {
+    owner: ProcessIdentity,
+    map: CodeMap,
+}
+static CODE_MAP: AtomicPtr<ProcessCodeMap> = AtomicPtr::new(ptr::null_mut());
+
+// Signal readers only load a retained snapshot. Inherited default-provider code
+// can still use its metadata until the child starts registering new code.
+fn code_map() -> &'static CodeMap {
+    let current = CODE_MAP.load(Ordering::Acquire);
+    if current.is_null() {
+        &EMPTY_CODE_MAP
+    } else {
+        // SAFETY: published process maps are retained for the process lifetime.
+        unsafe { &(*current).map }
+    }
+}
+
+// Cold APIs must reject inherited maps before touching their writer mutex.
+fn owned_code_map(slot: &AtomicPtr<ProcessCodeMap>) -> Option<&'static CodeMap> {
+    let current = slot.load(Ordering::Acquire);
+    if current.is_null() {
+        return None;
+    }
+    let owner = ProcessIdentity::current();
+    // SAFETY: published maps and their immutable identities are retained.
+    unsafe { ((*current).owner == owner).then(|| &(*current).map) }
+}
+
+fn writer_code_map() -> &'static CodeMap {
+    writer_code_map_in(&CODE_MAP)
+}
+
+// New engines can reuse addresses from non-inherited arenas. Replace the whole
+// map without carrying parent locks or reader counts into the child's writer.
+fn writer_code_map_in(slot: &AtomicPtr<ProcessCodeMap>) -> &'static CodeMap {
+    let owner = ProcessIdentity::current();
+    loop {
+        let old = slot.load(Ordering::Acquire);
+        // SAFETY: published maps and their immutable identities are retained.
+        if !old.is_null() && unsafe { (*old).owner == owner } {
+            // SAFETY: the map remains live for every reader/writer.
+            return unsafe { &(*old).map };
+        }
+        let new = Box::into_raw(Box::new(ProcessCodeMap {
+            owner,
+            map: CodeMap::new(),
+        }));
+        if slot
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // SAFETY: the winning map is published and retained permanently.
+            return unsafe { &(*new).map };
+        }
+        // SAFETY: this losing candidate was never published.
+        unsafe { drop(Box::from_raw(new)) };
+    }
+}
 
 /// Process-wide retained allocations, including deferred reader versions.
+/// Inherited maps contribute zero bytes in a fork child.
 pub fn memory_bytes() -> u64 {
-    CODE_MAP.memory_stats().total()
+    memory_stats().total()
 }
 
 /// Process-wide retained allocation breakdown.
+/// A fork child sees an empty map until its first registration.
 pub fn memory_stats() -> MemoryStats {
-    CODE_MAP.memory_stats()
+    owned_code_map(&CODE_MAP).map_or_else(MemoryStats::default, CodeMap::memory_stats)
 }
 
 /// Remove a retired unit after execution quiescence (see [`CodeMap::unregister`]).
+/// Inherited entries are left alone in a fork child; returns false for them.
 pub fn unregister(start: usize, code_len: u32) -> bool {
-    CODE_MAP.unregister(start, code_len)
+    owned_code_map(&CODE_MAP).is_some_and(|map| map.unregister(start, code_len))
 }
 
 /// Register a compiled function in the process-global map (see [`CodeMap::register`]).
@@ -825,12 +930,12 @@ pub fn register(
     table: Box<[(u32, u32)]>,
     guest_rips: Box<[u64]>,
 ) -> Result<(), CodeMapFull> {
-    CODE_MAP.register(start, code_len, table, guest_rips)
+    writer_code_map().register(start, code_len, table, guest_rips)
 }
 
 /// Look a host PC up in the process-global map (see [`CodeMap::lookup`]).
 pub fn lookup(pc: usize) -> Option<u64> {
-    CODE_MAP.lookup(pc)
+    code_map().lookup(pc)
 }
 
 /// Register a function and its guest trap sites in the process-global map.
@@ -841,12 +946,12 @@ pub fn register_with_traps(
     guest_rips: Box<[u64]>,
     traps: Vec<GuestTrapSite>,
 ) -> Result<(), CodeMapFull> {
-    CODE_MAP.register_with_traps(start, code_len, table, guest_rips, traps)
+    writer_code_map().register_with_traps(start, code_len, table, guest_rips, traps)
 }
 
 /// Resolve an exact faulting PC in the process-global map.
 pub fn lookup_trap(pc: usize) -> Option<GuestTrapSite> {
-    CODE_MAP.lookup_trap(pc)
+    code_map().lookup_trap(pc)
 }
 
 /// Register immutable recovery metadata alongside a compiled function.
@@ -858,7 +963,7 @@ pub fn register_with_recovery(
     traps: Vec<GuestTrapSite>,
     recipe: Option<FrameRecipe>,
 ) -> Result<(), CodeMapFull> {
-    CODE_MAP.register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
+    writer_code_map().register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
 }
 
 /// Publish cold per-instruction descriptors with the function and transfer table.
@@ -873,7 +978,7 @@ pub fn register_with_fault_info(
     recipe: Option<FrameRecipe>,
     instructions: Vec<crate::fault::InstructionFaultInfo>,
 ) -> Result<(), CodeMapFull> {
-    CODE_MAP.register_with_fault_info(
+    writer_code_map().register_with_fault_info(
         start,
         code_len,
         table,
@@ -897,7 +1002,7 @@ pub fn register_with_fault_path(
     instructions: Vec<crate::fault::InstructionFaultInfo>,
     unit: FaultUnit,
 ) -> Result<(), CodeMapFull> {
-    CODE_MAP.register_with_fault_path(
+    writer_code_map().register_with_fault_path(
         start,
         code_len,
         table,
@@ -912,7 +1017,7 @@ pub fn register_with_fault_path(
 #[cold]
 pub(crate) fn fault_path(pc: usize, rip: crate::Knowledge<u64>, helper: bool) -> crate::FaultPath {
     use crate::{FaultPath, HelperCaller};
-    let guard = CODE_MAP.read();
+    let guard = code_map().read();
     let Some(entry) = guard.find_entry(pc, &mut || {}) else {
         return FaultPath::Unknown;
     };
@@ -935,7 +1040,7 @@ pub(crate) fn fault_path(pc: usize, rip: crate::Knowledge<u64>, helper: bool) ->
             caller,
         });
     }
-    let site = CODE_MAP.lookup_trap(pc);
+    let site = code_map().lookup_trap(pc);
     match caller {
         HelperCaller::CompiledBlock { host_pc } => FaultPath::CompiledBlock { host_pc, site },
         HelperCaller::Region { entry_rip, host_pc } => FaultPath::Region {
@@ -952,7 +1057,7 @@ pub(crate) fn fault_path(pc: usize, rip: crate::Knowledge<u64>, helper: bool) ->
 /// clone can allocate; unlike recovery lookup, this is not a signal-handler API.
 #[doc(hidden)]
 pub fn lookup_fault_info(pc: usize, rip: u64) -> Option<crate::fault::InstructionFaultInfo> {
-    CODE_MAP
+    code_map()
         .read()
         .find_entry(pc, &mut || {})?
         .instructions
@@ -967,13 +1072,13 @@ pub fn lookup_fault_info(pc: usize, rip: u64) -> Option<crate::fault::Instructio
 
 /// Exact transfer and one-frame unwind recipe, acquired from the immutable map.
 pub fn lookup_recovery(pc: usize) -> Option<(GuestTrapSite, FrameRecipe)> {
-    CODE_MAP.lookup_recovery(pc)
+    code_map().lookup_recovery(pc)
 }
 
 /// Whether an address belongs to any registered compiled function, even one with
 /// no source locations, transfer records, or supported unwind recipe.
 pub fn contains(pc: usize) -> bool {
-    CODE_MAP.read().find_entry(pc, &mut || {}).is_some()
+    code_map().read().find_entry(pc, &mut || {}).is_some()
 }
 
 #[cfg(test)]
@@ -989,6 +1094,41 @@ mod tests {
             saved_return: 8,
             gpr: [None; 10],
             simd: [None; 8],
+        }
+    }
+
+    #[test]
+    fn skipped_fork_generations_with_reused_pid_replace_locked_map() {
+        let owner = ProcessIdentity::current();
+        let inherited = Box::into_raw(Box::new(ProcessCodeMap {
+            owner: ProcessIdentity {
+                pid: owner.pid,
+                generation: owner.generation.wrapping_sub(2),
+            },
+            map: CodeMap::new(),
+        }));
+        // SAFETY: this test retains the inherited map for all local operations.
+        let inherited_map = unsafe { &(*inherited).map };
+        inherited_map
+            .register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        let slot = AtomicPtr::new(inherited);
+        let guard = inherited_map.len.lock().unwrap();
+        // Cold APIs must reject this identity before trying the inherited lock.
+        assert!(owned_code_map(&slot).is_none());
+        let fresh = writer_code_map_in(&slot);
+        assert!(!std::ptr::eq(fresh, inherited_map));
+        assert_eq!(fresh.lookup(0x1000), None);
+        fresh
+            .register(0x2000, 16, Box::new([(0, 0)]), Box::new([9]))
+            .unwrap();
+        assert_eq!(owned_code_map(&slot).unwrap().lookup(0x2000), Some(9));
+        assert_eq!(inherited_map.lookup(0x1000), Some(7));
+        drop(guard);
+        // SAFETY: no readers or references are used after these local maps drop.
+        unsafe {
+            drop(Box::from_raw(inherited));
+            drop(Box::from_raw(slot.load(Ordering::Relaxed)));
         }
     }
 

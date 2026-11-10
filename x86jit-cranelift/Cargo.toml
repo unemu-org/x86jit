@@ -15,7 +15,7 @@ categories = ["emulators", "virtualization", "development-tools"]
 default = ["jit", "environment"]
 # Legacy diagnostic environment and file access, additionally opt-in through API.
 environment = ["x86jit-core/environment"]
-jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:memmap2", "dep:region"]
+jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:memmap2", "dep:region", "dep:libc", "dep:wasmtime-jit-icache-coherence"]
 
 [dependencies]
 x86jit-core = { path = "../x86jit-core", version = "0.3.0", default-features = false }
@@ -25,6 +25,9 @@ cranelift-module = { workspace = true, optional = true }
 cranelift-native = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
 region = { version = "=3.0.2", optional = true }
+
+libc = { workspace = true, optional = true }
+wasmtime-jit-icache-coherence = { package = "wasmtime-internal-jit-icache-coherence", version = "=48.0.8", optional = true }
 
 [dev-dependencies]
 # Cross-host machine-code witnesses; production builds retain the host ISA only.

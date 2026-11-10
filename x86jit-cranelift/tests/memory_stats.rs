@@ -22,9 +22,14 @@ fn eager_units_stay_allocated_after_invalidation() {
     assert_eq!(compiled.backend.compiled_units_live, 1);
     assert_eq!(compiled.backend.compiled_units_total, 1);
     assert!(compiled.backend.code_bytes_emitted > 0);
+    #[cfg(target_os = "macos")]
+    // SAFETY: pthread capability query has no preconditions.
+    let dense = unsafe { libc::pthread_jit_write_protect_supported_np() != 0 };
+    #[cfg(not(target_os = "macos"))]
+    let dense = true;
     assert_eq!(
         compiled.backend.code_bytes_reserved,
-        region::page::size() as u64
+        if dense { 128 << 20 } else { 0 }
     );
     assert_eq!(compiled.cache.compiled_entries, 1);
     assert_eq!(compiled.cache.interpreted_entries, 0);

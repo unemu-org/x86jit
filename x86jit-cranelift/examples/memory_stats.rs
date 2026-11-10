@@ -1,5 +1,8 @@
 //! Synthetic allocation/RSS probe: cargo run --release -p x86jit-cranelift
 //! --example memory_stats -- 10000 102
+#[path = "../tests/support/code_memory.rs"]
+mod probe;
+use std::sync::{Arc, Mutex};
 use x86jit_core::{Exit, Prot, Reg, RegionKind, Vm, VmConfig};
 use x86jit_cranelift::JitBackend;
 
@@ -63,6 +66,14 @@ fn main() {
         region::page::size()
     );
     let jit = JitBackend::new();
+    let ranges = Arc::new(Mutex::new(Vec::with_capacity(units)));
+    let observed = ranges.clone();
+    jit.set_compiled_code_observer(move |code| {
+        observed
+            .lock()
+            .unwrap()
+            .push((code.host_start, code.host_len))
+    });
     let handle = jit.tier_up_handle();
     let size = 0x1000 + units * 16;
     let mut vm = Vm::with_backend(VmConfig::flat(size as u64), Box::new(jit));
@@ -104,6 +115,7 @@ fn main() {
     }
     handle.wait_idle();
     sample("compiled", &vm);
+    probe::snapshot("compiled", &ranges.lock().unwrap());
     vm.cache.invalidate_overlapping(0, u64::MAX, || {});
     sample("invalidated", &vm);
     drop(cpus);

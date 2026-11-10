@@ -149,10 +149,20 @@ This project is `MIT OR Apache-2.0`. The dependency graph, by crate:
 | Crate | Direct dependencies | Licence |
 |---|---|---|
 | `x86jit-core` | `iced-x86` | MIT |
-| `x86jit-cranelift` | `x86jit-core`, `cranelift{,-jit,-module,-native}`, `memmap2` | Apache-2.0 WITH LLVM-exception; MIT OR Apache-2.0 |
+| `x86jit-cranelift` | `x86jit-core`, `cranelift{,-module,-native}`, `x86jit-cranelift-jit`, `memmap2`, `region`, `libc`, `wasmtime-internal-jit-icache-coherence` | Apache-2.0 WITH LLVM-exception; MIT OR Apache-2.0 |
 | `x86jit-elf` | `x86jit-core`, `goblin` | MIT |
 | `x86jit-tests` | `serde`, `ron`, `hex`, `serde_json`, `flate2`, `iced-x86`, `libc`, **`unicorn-engine`** | permissive, except as below |
 | `x86jit-bench` | `serde`, `serde_json`, `iced-x86` | permissive |
+
+`vendor/cranelift-jit` retains Cranelift JIT 0.135.8 under its original
+Apache-2.0 WITH LLVM-exception licence (the complete licence is alongside the
+sources). Its upstream crate checksum is
+`31d67d6c6a02ffd860599e55b03d4f37c6cf9be678c1d68dbfa6d1f61946e4ae`.
+The package is named `x86jit-cranelift-jit` so embedders also resolve the explicit
+path dependency when this workspace is consumed as a dependency; a root-only
+Cargo patch would not propagate. The local changes add dual addresses, scoped
+writes and provider relocation validation (decision-17); allocation policy stays
+in `x86jit-cranelift`. This compiler integration supplies no x86 hardware semantics.
 
 **`unicorn-engine` is GPL-2.0**, and this needs stating plainly because `spec.md §15` said
 for a long time that "all core dependencies are permissive", which stopped being true when

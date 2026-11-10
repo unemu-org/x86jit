@@ -23,7 +23,10 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # vendor/ holds byte-identical upstream sources plus a reviewed patch.
+        exclude: '^vendor/'
       - id: end-of-file-fixer
+        exclude: '^vendor/'
       - id: check-merge-conflict
       - id: check-yaml
       - id: check-json
