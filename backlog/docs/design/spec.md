@@ -791,6 +791,18 @@ fn execute(
 
 Walks the list of `IrOp` in a loop and executes each operation with native Rust code. Slow, but simple, fully debuggable, and on an x86 host comparable with native execution (oracle).
 
+A pure store wholly within one host page needs no host-access preflight.
+Crossing stores retain same-value RMW probes once per touched host page before
+committing bytes (decision-13). Only a probe's read fault queries host VM write
+permission; a writable verdict permits the store without that read. In this cold
+fallback, all-or-nothing relies on page protection as for a single-page store;
+VM metadata cannot rule out guard, backing-file or thread-local protection faults.
+A negative or failed query preserves the original access fault. The embedder must
+keep host protections stable through commit. Compiled crossing preflight remains
+opt-in through precise split stores and uses the real host page size. Ordering
+stays in the existing access barriers. XSAVE and XSAVEOPT retain their architectural
+XSTATE_BV read (SDM Vol 1 §§13.7, 13.9); XSAVEC is a pure store (§13.10).
+
 Memory-access contract (used by both backends in the interpreter version and by the trap-out):
 
 ```rust

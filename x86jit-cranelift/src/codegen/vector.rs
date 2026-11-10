@@ -4918,15 +4918,9 @@ impl Translator<'_, '_> {
         let base = self.val(*addr);
         let size = lanes * 2;
         let host = self.checked_addr(base, size, 1);
-        let nbytes = self.iconst(u64::from(size));
-        let cur = self.iconst(self.cur_addr);
-        self.flush_gprs();
-        let inst = self.call_memory_helper(
-            self.helpers.vstore_preflight,
-            &[self.cpu, self.mem, base, nbytes, cur],
-            Some(GuestAccessKind::Write),
-        );
-        self.trap_if_unmapped(inst);
+        // Conversion stores retain recovery preflight independently of the
+        // optional split-store policy: gstore(I128) can emit two host stores.
+        let host = self.preflight_split_store(base, host, size);
         let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             16,

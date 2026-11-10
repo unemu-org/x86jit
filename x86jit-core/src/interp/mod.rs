@@ -4122,13 +4122,16 @@ fn walk_ops<
                         let at = ea.wrapping_add(u64::from(offset));
                         if let Err(
                             t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault),
-                        ) = mem.probe_write(at, 8)
+                        ) = mem.probe_write_mode::<false>(at, 8)
                         {
                             let at = if t == MemTrap::Unmapped {
                                 (0..8)
                                     .map(|i| at.wrapping_add(i))
                                     .find(|&b| {
-                                        matches!(mem.probe_write(b, 1), Err(MemTrap::Unmapped))
+                                        matches!(
+                                            mem.probe_write_mode::<false>(b, 1),
+                                            Err(MemTrap::Unmapped)
+                                        )
                                     })
                                     .unwrap_or(at)
                             } else {
@@ -4142,8 +4145,28 @@ fn walk_ops<
                             );
                         }
                     }
+                    if mem.store_crosses_host_page(ea, usize::from(size)) {
+                        if let Err((at, t)) = mem.preflight_store(ea, u64::MAX, 8, u16::from(size))
+                        {
+                            return walk_classify_access(
+                                trap_out(cpu, cur_addr.get(), t, at, 8, AccessKind::Write, 0),
+                                cur_addr.get(),
+                                ea,
+                                *fault,
+                            );
+                        }
+                    }
                 }
-                if let Err(f) = vstore(cpu, mem, cur_addr.get(), ea, out, size) {
+                let _ordering =
+                    ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+                if let Err(f) = vstore_parts(
+                    cpu,
+                    &Preflighted(mem.unordered()),
+                    cur_addr.get(),
+                    ea,
+                    out,
+                    size,
+                ) {
                     return walk_classify_access(
                         vec_trap_out(
                             cpu,
@@ -7636,6 +7659,17 @@ fn vpart<M: StrMem>(
     }
 }
 
+struct Preflighted<'a, M>(&'a M);
+impl<M: StrMem> StrMem for Preflighted<'_, M> {
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+        self.0.sload(addr, elem)
+    }
+    #[inline(always)]
+    fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        self.0.sstore_preflighted(addr, val, elem)
+    }
+}
+
 /// The store counterpart of [`vpart`]. An acknowledgement is recorded the same way, with
 /// a zero value — only its presence matters, and sharing one table means a 16-byte store
 /// converges for the same reason a load does.
@@ -7778,21 +7812,60 @@ fn vstore<const ROUTED: bool, const ORDER: u8>(
     let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
     let mem = mem.unordered();
     if ROUTED && size == 16 {
-        for at in [addr, addr.wrapping_add(8)] {
-            if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
-                mem.probe_write(at, 8)
-            {
-                return Err(VecFault {
-                    at: t.fault_addr(at),
-                    size: 8,
-                    trap: t,
-                    value: 0,
-                });
+        if mem.region_kind(addr, 16) == Ok(crate::RegionKind::Ram) {
+            if mem.store_crosses_host_page(addr, 16) {
+                // Keep the whole value available so the copy can commit an unproven
+                // page first, before either of the ordinary eight-byte transfers.
+                return vstore_crossing_ram(mem, addr, &[v]);
             }
+        } else if let Err((at, trap)) = mem.preflight_store(addr, u64::MAX, 8, u16::from(size)) {
+            return Err(VecFault {
+                at,
+                size: 8,
+                trap,
+                value: 0,
+            });
         }
     }
+    vstore_parts(cpu, mem, cur_addr, addr, v, size)
+}
+
+#[cold]
+fn vstore_crossing_ram<const ROUTED: bool>(
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
+    addr: u64,
+    lanes: &[u128],
+) -> Result<(), VecFault> {
+    let mut bytes = [0; 64];
+    for (lane, out) in lanes.iter().zip(bytes.chunks_exact_mut(16)) {
+        out.copy_from_slice(&lane.to_le_bytes());
+    }
+    // The caller validated one contiguous RAM region. Keep the entire payload
+    // together so copy_out can order transfers after its actual-access probes.
+    mem.write_ram(addr, &bytes[..lanes.len() * 16])
+        .map_err(|at| {
+            let offset = (at - addr) as usize;
+            VecFault {
+                at,
+                size: 8,
+                trap: MemTrap::HostFault,
+                value: (lanes[offset / 16] >> (offset % 16 / 8 * 64)) as u64,
+            }
+        })
+}
+
+#[inline(always)]
+fn vstore_parts<M: StrMem>(
+    cpu: &mut CpuState,
+    mem: &M,
+    cur_addr: u64,
+    addr: u64,
+    v: u128,
+    size: u8,
+) -> Result<(), VecFault> {
     match size {
         16 => {
+            let mem = &Preflighted(mem);
             vpart_store(cpu, mem, cur_addr, addr, v as u64, 8)?;
             vpart_store(cpu, mem, cur_addr, addr + 8, (v >> 64) as u64, 8)
         }
@@ -8121,6 +8194,11 @@ const R11: usize = 11;
 pub trait StrMem {
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap>;
     fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap>;
+    /// Store after a successful whole-destination preflight, without repeating it.
+    /// Custom providers retain their ordinary store behavior by default.
+    fn sstore_preflighted(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        self.sstore(addr, val, elem)
+    }
     /// In recovery mode, preflight selected store pages before any element commits.
     /// The default implementation adds no checks for custom memory providers.
     fn preflight_store(
@@ -8143,7 +8221,7 @@ pub(crate) fn preflight_store_pages(
     guest_base: u64,
     checks: (
         impl FnMut(u64, u8) -> Result<(), MemTrap>,
-        impl FnMut(u64, u8) -> Result<(), MemTrap>,
+        impl FnMut(u64, u8) -> Result<u64, MemTrap>,
     ),
 ) -> Result<(), (u64, MemTrap)> {
     let (mut region, mut probe) = checks;
@@ -8152,35 +8230,59 @@ pub(crate) fn preflight_store_pages(
     for i in 0..bytes as usize / elem as usize {
         if mask & (1u64 << i) != 0 {
             let ea = base.wrapping_add((i * elem as usize) as u64);
-            if let Err(MemTrap::Unmapped) = region(ea, elem) {
-                let at = (0..elem)
-                    .map(|j| ea.wrapping_add(u64::from(j)))
-                    .find(|&at| matches!(region(at, 1), Err(MemTrap::Unmapped)))
-                    .unwrap_or(ea);
-                return Err((at, MemTrap::Unmapped));
+            if let Err(trap @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
+                region(ea, elem)
+            {
+                let at = if trap == MemTrap::Unmapped {
+                    (0..elem)
+                        .map(|j| ea.wrapping_add(u64::from(j)))
+                        .find(|&at| matches!(region(at, 1), Err(MemTrap::Unmapped)))
+                        .unwrap_or(ea)
+                } else {
+                    trap.fault_addr(ea)
+                };
+                return Err((at, trap));
             }
         }
     }
     let page = crate::memory::host_page_size() as u64;
-    let mut previous = None;
-    for i in 0..bytes as usize / elem as usize {
-        if mask & (1u64 << i) == 0 {
+    let count = bytes as usize / elem as usize;
+    if count == 0 {
+        return Ok(());
+    }
+    let selected = mask & (u64::MAX >> (64 - count));
+    if selected == 0 {
+        return Ok(());
+    }
+    let first = selected.trailing_zeros() as usize * elem as usize;
+    let last = (64 - selected.leading_zeros() as usize) * elem as usize - 1;
+    let host = (host_base as u64).wrapping_add(base.wrapping_sub(guest_base));
+    if (host.wrapping_add(first as u64) ^ host.wrapping_add(last as u64)) & !(page - 1) == 0 {
+        return Ok(());
+    }
+    let mut checked_until = 0u64;
+    for i in 0..count {
+        if selected & (1u64 << i) == 0 {
             continue;
         }
         let ea = base.wrapping_add((i * elem as usize) as u64);
         let host = (host_base as u64).wrapping_add(ea.wrapping_sub(guest_base));
-        for j in 0..elem {
-            let at = host.wrapping_add(u64::from(j));
-            let this_page = at / page;
-            if previous != Some(this_page) {
-                let guest = ea.wrapping_add(u64::from(j));
-                match probe(guest, 1) {
-                    // MMIO keeps its existing per-element answer/retry path.
-                    Err(MemTrap::Mmio) => continue,
-                    Err(t) => return Err((t.fault_addr(guest), t)),
-                    Ok(()) => previous = Some(this_page),
+        let mut j = checked_until.saturating_sub(host);
+        while j < u64::from(elem) {
+            let at = host.wrapping_add(j);
+            let guest = ea.wrapping_add(j);
+            let mut next = at + (page - (at & (page - 1)));
+            match probe(guest, 1) {
+                // MMIO keeps its existing per-element answer/retry path.
+                Err(MemTrap::Mmio) => {}
+                Err(t) => return Err((t.fault_addr(guest), t)),
+                Ok(region_end) => {
+                    // A ROM probe cannot prove access to RAM sharing its host page.
+                    next = at + (region_end - guest).min(next - at);
+                    checked_until = next;
                 }
             }
+            j += next - at;
         }
     }
     Ok(())
@@ -8204,13 +8306,23 @@ impl StrMem for Memory {
                 self.guest_base(),
                 (
                     |a, n| self.probe_write_mode::<false>(a, n),
-                    |a, n| self.probe_write_mode::<true>(a, n),
+                    |a, n| {
+                        self.probe_write_mode::<true>(a, n)?;
+                        self.region_end(a)
+                    },
                 ),
             )?;
         }
         Ok(())
     }
 
+    fn sstore_preflighted(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        if self.host_fault_recovery() {
+            crate::memory::InterpreterMemory::write_preflighted::<true>(self, addr, val, elem)
+        } else {
+            self.write(addr, val, elem)
+        }
+    }
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         self.read(addr, elem)
     }
@@ -8222,6 +8334,7 @@ impl StrMem for Memory {
 impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> StrMem
     for Access<ROUTED, ORDER, M>
 {
+    #[inline(always)]
     fn preflight_store(
         &self,
         base: u64,
@@ -8232,6 +8345,10 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> StrMem
         self.0.preflight_store::<ROUTED>(base, mask, elem, bytes)
     }
 
+    #[inline(always)]
+    fn sstore_preflighted(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        self.write_preflighted(addr, val, elem)
+    }
     #[inline(always)]
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         self.read(addr, elem)
@@ -8324,13 +8441,23 @@ impl StrMem for RawStrMem {
                 self.guest_base,
                 (
                     |a, n| self.off(a, n).map(|_| ()).ok_or(MemTrap::Unmapped),
-                    |a, n| self.probe_store(a, n),
+                    |a, n| self.probe_store(a, n).map(|()| self.size),
                 ),
             )?;
         }
         Ok(())
     }
 
+    fn sstore_preflighted(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        if !self.recover_host_faults {
+            return self.sstore(addr, val, elem);
+        }
+        let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
+        // SAFETY: off validates the range; the caller preflighted selected pages.
+        unsafe { crate::usercopy::store_preflighted(self.base.add(off), val, elem) }.map_err(|at| {
+            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
+        })
+    }
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         if self.recover_host_faults {
             self.load_mode::<true>(addr, elem)
@@ -9104,6 +9231,7 @@ pub fn masked_store_run<M: StrMem>(
     if let Err((at, t)) = mem.preflight_store(base, k, elem, bytes) {
         return trap(cpu, cur_addr, at, true, t, 0, elem);
     }
+    let mem = &Preflighted(mem);
     let lanes = cpu.vec_lanes(src as usize);
     for i in 0..n {
         if k & (1 << i) != 0 {
@@ -9137,6 +9265,7 @@ pub fn narrow_store_run<M: StrMem>(
     if let Err((at, t)) = mem.preflight_store(base, u64::MAX, to, (n * to as usize) as u16) {
         return trap(cpu, cur_addr, at, true, t, 0, to);
     }
+    let mem = &Preflighted(mem);
     let lanes = cpu.vec_lanes(src as usize);
     for i in 0..n {
         let v = get_velem(&lanes, i, from); // sstore truncates to `to` bytes on write
@@ -11573,12 +11702,31 @@ mod exit_request_tests {
 mod store_preflight_tests {
     use super::preflight_store_pages;
     #[test]
+    fn later_region_fault_precedes_all_host_probes() {
+        for trap in [crate::MemTrap::Unmapped, crate::MemTrap::NonCanonical] {
+            let fault = preflight_store_pages(
+                0x1000,
+                u64::MAX,
+                8,
+                16,
+                0,
+                0,
+                (
+                    |at, _| if at >= 0x1008 { Err(trap) } else { Ok(()) },
+                    |_, _| panic!("region failure must precede host probes"),
+                ),
+            );
+            assert_eq!(fault, Err((0x1008, trap)));
+        }
+    }
+
+    #[test]
     fn selected_store_probes_each_touched_page_once() {
         let page = crate::memory::host_page_size() as u64;
         for (mask, elem, expected) in [
             (u64::MAX, 8, vec![page - 4, page]),
-            (1, 4, vec![page - 4]),
-            (0x10, 4, vec![page + 12]),
+            (1, 4, vec![]),
+            (0x10, 4, vec![]),
             (0, 1, vec![]),
         ] {
             let mut probes = Vec::new();
@@ -11594,7 +11742,7 @@ mod store_preflight_tests {
                     |at, n| {
                         assert_eq!(n, 1);
                         probes.push(at);
-                        Ok(())
+                        Ok(page * 2)
                     },
                 ),
             )

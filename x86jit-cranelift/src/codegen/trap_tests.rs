@@ -67,8 +67,8 @@ fn audit_guest_accesses(func: &ir::Function, hosts: &[Value]) -> Vec<(u64, Guest
             ),
             _ => unreachable!(),
         };
-        // Membership comes only from checked_addr, independently of the flags
-        // under test. In particular, making a guest access trusted cannot hide it.
+        // Membership comes from checked_addr and its preflight merges, independently
+        // of the flags under test. Making a guest access trusted cannot hide it.
         if hosts
             .iter()
             .any(|h| func.dfg.resolve_aliases(*h) == func.dfg.resolve_aliases(host))
@@ -162,6 +162,12 @@ fn compile_ir_for_isa_with_split_stores(
     let watch = builder.import_signature(sig(3, false));
     let mut helpers = Helpers::all_dummy(&mut || (dummy, 0, 0), (watch, 0, 0));
     helpers.precise_split_stores = precise;
+    helpers.vstore_preflight = (
+        builder.import_signature(sig(3, true)),
+        crate::vstore_preflight_helper as *const () as u64,
+        0,
+    );
+    helpers.cvtps2ph_value = (builder.import_signature(sig(5, false)), 0, 0);
     helpers.cpuid = (builder.import_signature(sig(1, true)), 0, 0);
     helpers.vmaskmov_mem = (builder.import_signature(sig(11, true)), 0, 0);
     let offsets = cpu_offsets();
@@ -575,10 +581,7 @@ fn guest_trap_sites_aarch64_single_16_byte_transfer() {
                     word & 0xff00_0000 == 0xa900_0000 || word & 0xff80_0000 == 0x3d80_0000
                 })
                 .collect();
-            assert_eq!(
-                cc.buffer.traps().len(),
-                if bytes[1] == 0x11 { 3 } else { 1 }
-            );
+            assert_eq!(cc.buffer.traps().len(), 1);
             assert_eq!(width16.len(), 1);
             let trap = width16[0];
             let word = u32::from_le_bytes(
@@ -1056,8 +1059,10 @@ fn alignment_hot_path_has_only_mask_and_branch() {
             let cc = ctx.compiled_code().unwrap();
             let words: Vec<_> = cc
                 .code_buffer()
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect();
             let mut checks = 0;
             for pair in words.windows(2) {
@@ -1096,8 +1101,10 @@ fn alignment_hot_path_has_only_mask_and_branch() {
 #[cfg(target_arch = "aarch64")]
 fn loop_register_moves(code: &[u8]) -> usize {
     let words: Vec<_> = code
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     for (i, word) in words.iter().enumerate() {
         if word & 0xffff_0000 == 0xd65f_0000 {
@@ -1164,6 +1171,16 @@ fn dump_split_store_paths() {
     }
 }
 
+fn write_preflights(func: &ir::Function) -> usize {
+    func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).filter(|&i| {
+        let ir::InstructionData::CallIndirect { args, .. } = func.dfg.insts[i] else { return false; };
+        let callee = args.as_slice(&func.dfg.value_lists)[0];
+        let Some(def) = func.dfg.value_def(callee).inst() else { return false; };
+        matches!(func.dfg.insts[def], ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm, .. }
+            if imm.bits() as u64 == crate::vstore_preflight_helper as *const () as u64)
+    }).count()
+}
+
 #[test]
 fn split_store_preflight_reuses_only_dominating_proofs() {
     let store = [0xf3, 0x0f, 0x7f, 0x07]; // movdqu [rdi],xmm0
@@ -1179,21 +1196,9 @@ fn split_store_preflight_reuses_only_dominating_proofs() {
     helper.push(0xf4);
     for region in [false, true] {
         for opt in [OptLevel::None, OptLevel::Speed] {
-            for (bytes, expected) in [(&repeated, 2), (&changed, 4), (&helper, 4)] {
+            for (bytes, expected) in [(&repeated, 1), (&changed, 2), (&helper, 2)] {
                 let (ctx, _, _) = compile_at(bytes, region, HostTarget::Native, opt);
-                let probes = ctx
-                    .func
-                    .layout
-                    .blocks()
-                    .flat_map(|b| ctx.func.layout.block_insts(b))
-                    .filter(|&i| {
-                        matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
-                            && ctx.func.dfg.insts[i]
-                                .memflags()
-                                .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
-                                .is_some()
-                    })
-                    .count();
+                let probes = write_preflights(&ctx.func);
                 assert_eq!(
                     probes,
                     expected,
@@ -1216,10 +1221,10 @@ fn split_store_preflight_omits_proven_alignment_only() {
         ),
         (
             &[0x48, 0x83, 0xe7, 0xf0, 0xf3, 0x0f, 0x7f, 0x47, 0x11, 0xf4],
-            2,
+            1,
         ),
         (&[0xbf, 0, 0x40, 0, 0, 0xf3, 0x0f, 0x7f, 0x07, 0xf4], 0),
-        (&[0xbf, 0, 0x40, 0, 0, 0xc5, 0xfe, 0x7f, 0x07, 0xf4], 2),
+        (&[0xbf, 0, 0x40, 0, 0, 0xc5, 0xfe, 0x7f, 0x07, 0xf4], 1),
         // A prior aligned load proves RDI aligned even across instruction boundaries.
         (&[0x0f, 0x28, 0x07, 0xf3, 0x0f, 0x7f, 0x47, 0x10, 0xf4], 0),
     ];
@@ -1227,19 +1232,7 @@ fn split_store_preflight_omits_proven_alignment_only() {
         for opt in [OptLevel::None, OptLevel::Speed] {
             for &(bytes, expected) in cases {
                 let (ctx, _, _) = compile_at(bytes, region, HostTarget::Native, opt);
-                let probes = ctx
-                    .func
-                    .layout
-                    .blocks()
-                    .flat_map(|b| ctx.func.layout.block_insts(b))
-                    .filter(|&i| {
-                        matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
-                            && ctx.func.dfg.insts[i]
-                                .memflags()
-                                .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
-                                .is_some()
-                    })
-                    .count();
+                let probes = write_preflights(&ctx.func);
                 assert_eq!(
                     probes,
                     expected,
@@ -1279,38 +1272,25 @@ fn split_store_policy_controls_probes_on_both_isas() {
                             isa.as_ref(),
                             precise,
                         );
-                        let probes = ctx
-                            .func
-                            .layout
-                            .blocks()
-                            .flat_map(|b| ctx.func.layout.block_insts(b))
-                            .filter(|&i| {
-                                matches!(
-                                    ctx.func.dfg.insts[i],
-                                    ir::InstructionData::AtomicRmw { .. }
-                                ) && ctx.func.dfg.insts[i]
-                                    .memflags()
-                                    .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
-                                    .is_some()
-                            })
-                            .count();
+                        let probes = write_preflights(&ctx.func);
                         // This diagnostic uses native-host lowering with two machine
                         // encoders; runtime host selection is covered separately.
                         assert_eq!(
                             probes,
                             if precise && (cfg!(target_arch = "aarch64") || name != "scalar8") {
-                                2
+                                1
                             } else {
                                 0
                             }
                         );
-                        if !precise {
+                        {
                             if let Some(dir) = std::env::var_os("X86JIT_STORE_DUMP_DIR") {
                                 let dir = std::path::PathBuf::from(dir);
                                 std::fs::create_dir_all(&dir).unwrap();
                                 let file = format!(
-                                    "{target}-{opt:?}-{name}-{}.bin",
-                                    if region { "region" } else { "block" }
+                                    "{target}-{opt:?}-{name}-{}-{}.bin",
+                                    if region { "region" } else { "block" },
+                                    if precise { "precise" } else { "default" }
                                 );
                                 std::fs::write(
                                     dir.join(file),
@@ -1327,7 +1307,7 @@ fn split_store_policy_controls_probes_on_both_isas() {
 }
 
 #[test]
-fn precise_split_store_descriptor_limit_interprets_without_exhausting_code() {
+fn precise_split_store_helpers_leave_guest_trap_descriptor_capacity() {
     let bytes = [0xc5, 0xfe, 0x7f, 0x07].repeat(249);
     let ir = high_block(&bytes);
     for region in [false, true] {
@@ -1356,12 +1336,71 @@ fn precise_split_store_descriptor_limit_interprets_without_exhausting_code() {
         ));
         assert!(matches!(
             materialize(&ir, true),
-            CachedBlock::Interpreted(_)
+            CachedBlock::Compiled { .. }
         ));
         assert!(!jit.code_space_exhausted());
         assert!(matches!(
             materialize(&high_block(&[0xc5, 0xfe, 0x7f, 0x07, 0xf4]), true),
             CachedBlock::Compiled { .. }
         ));
+    }
+}
+
+#[test]
+fn pure_store_preflight_never_loads_guest_memory() {
+    for bytes in [
+        &[0x48, 0x89, 0x07, 0xf4][..],
+        &[0xc5, 0xfa, 0x7f, 0x07, 0xf4][..],
+        &[0xc5, 0xfe, 0x7f, 0x07, 0xf4][..],
+        &[0x62, 0xf1, 0x7e, 0x48, 0x7f, 0x07, 0xf4][..],
+    ] {
+        for region in [false, true] {
+            let (ctx, _, _) = compile_at(bytes, region, HostTarget::Native, OptLevel::Speed);
+            for block in ctx.func.layout.blocks() {
+                for inst in ctx.func.layout.block_insts(block) {
+                    let data = &ctx.func.dfg.insts[inst];
+                    if data
+                        .memflags()
+                        .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
+                        .is_some()
+                    {
+                        assert!(
+                            matches!(
+                                data,
+                                ir::InstructionData::Store { .. }
+                                    | ir::InstructionData::StoreNoOffset { .. }
+                            ),
+                            "pure store accessed guest memory with {data:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conversion_store_preflight_is_independent_of_split_policy() {
+    let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::Speed);
+    for bytes in [
+        &[0xc4, 0xe3, 0x79, 0x1d, 0x07, 0, 0xf4][..],
+        &[0xc4, 0xe3, 0x7d, 0x1d, 0x07, 0, 0xf4][..],
+    ] {
+        for region in [false, true] {
+            for precise in [false, true] {
+                let (ctx, _, _) = compile_ir_for_isa_with_split_stores(
+                    high_block(bytes),
+                    bytes,
+                    region,
+                    jit.module.isa(),
+                    precise,
+                );
+                let size = if bytes[2] == 0x79 { 8 } else { 16 };
+                assert_eq!(
+                    write_preflights(&ctx.func),
+                    usize::from(cfg!(target_arch = "aarch64") || size == 16)
+                );
+            }
+        }
     }
 }

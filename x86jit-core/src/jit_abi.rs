@@ -586,7 +586,10 @@ impl MemCtx {
             }
         }
         let exit = crate::fault::finish(exit, info, cpu, mem, mode, true);
-        crate::fault::attach_compiled_path(exit, pc, helper)
+        // Crossing-store preflight carries a helper operand record but belongs
+        // to the inline store, which has no semantic helper family or trap site.
+        let helper_path = helper && info.is_some_and(|i| i.helper.is_some());
+        crate::fault::attach_compiled_path(exit, pc, helper_path)
     }
 
     #[cold]

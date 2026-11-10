@@ -12,7 +12,7 @@ categories = ["emulators", "virtualization", "development-tools"]
 
 [features]
 default = ["environment"]
-# Legacy diagnostic environment and file access, additionally opt-in through API.
+# Legacy diagnostics (opt-in through API) and cold host-permission file queries.
 environment = []
 
 [dependencies]

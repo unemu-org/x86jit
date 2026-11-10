@@ -49,6 +49,7 @@ that changes.
 | `usercopy` | x86-64/AArch64 naked transfer routines, bounded immutable relative fixup table, scalar load/store and CAS, copy and probe operations (§8.1, decision-13) |
 | `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen`; `MemoryAccess` occupies access-op padding and selects cold #SS/#GP exits on a miss; `CheckAlign` raises #GP for required alignment (§6) |
 | `lift` | x86 → IR: `lift_block`, operand lowering, `CpuMode` seam, `LiftError` (§7) |
+| `host_write` | Cold host VM write-permission queries after a crossing-store read probe faults (§8.1, decision-13) |
 | `interp` | IR interpreter: `interpret_block` over a Vcpu-reused temps buffer, Variant-A flags, RIP-on-trap; also the shared `string_run`/`divide`/`crc32c` helpers the JIT calls; `interp::softfloat` implements non-default SIMD numerical modes with integer arithmetic (§8.1) |
 | `x87` | x87 FPU exec (`exec_x87`/`exec_fxstate`), shared by both backends; register file is `[F80; 8]` (§14) |
 | `f80` | software 80-bit extended float (`F80`) — true x87 precision, rounds each op to a 64-bit significand; pure Rust (portable across x86/ARM) (§14) |

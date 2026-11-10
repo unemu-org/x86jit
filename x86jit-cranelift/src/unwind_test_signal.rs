@@ -1,5 +1,5 @@
 //! Test-only signal adapter shared by compiled-frame and guest recovery tests.
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use x86jit_core::jit_abi::fault::{classify_with_raw_fault, HostFaultKind, HostRegisters};
 use x86jit_core::{HostFaultPlatform, RawHostFault};
 
@@ -157,6 +157,7 @@ pub static HANDLE: AtomicUsize = AtomicUsize::new(0);
 pub static FOREIGN: AtomicUsize = AtomicUsize::new(0);
 pub static FAULTS: AtomicUsize = AtomicUsize::new(0);
 pub static WIDTH: AtomicUsize = AtomicUsize::new(0);
+pub static LAST_RAW_SYNDROME: AtomicU64 = AtomicU64::new(0);
 // The adapters intentionally live in tests: core neither depends on libc nor
 // knows an OS ucontext layout. Every write matches a field read below.
 // Linux v6.12 arch/arm64/include/uapi/asm/sigcontext.h: __reserved is
@@ -297,6 +298,7 @@ unsafe fn recover(
     ) {
         return false;
     }
+    LAST_RAW_SYNDROME.store(raw.esr.or(raw.error_code).unwrap_or(0), Ordering::Relaxed);
     FAULTS.fetch_add(1, Ordering::Relaxed);
     ACCESS_FAULTS.fetch_add(
         usize::from(kind == HostFaultKind::Access),

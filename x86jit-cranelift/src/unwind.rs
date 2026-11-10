@@ -251,7 +251,9 @@ mod tests {
             let mut layer = floats.clone();
             while layer.len() > 1 {
                 layer = layer
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| b.ins().fadd(pair[0], pair[1]))
                     .collect();
             }
@@ -485,7 +487,9 @@ mod tests {
                             let mut tree = values.clone();
                             while tree.len() > 1 {
                                 tree = tree
-                                    .chunks_exact(2)
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
                                     .map(|p| c.ins().fadd(p[0], p[1]))
                                     .collect();
                             }
@@ -506,7 +510,9 @@ mod tests {
                                 let mut tree = values.clone();
                                 while tree.len() > 1 {
                                     tree = tree
-                                        .chunks_exact(2)
+                                        .as_chunks::<2>()
+                                        .0
+                                        .iter()
                                         .map(|p| c.ins().fadd(p[0], p[1]))
                                         .collect();
                                 }

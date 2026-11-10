@@ -186,6 +186,8 @@ impl EntryRecord {
                 };
                 if m.origin() == crate::FaultOrigin::HostAccess
                     && host_address == Some(transfer.host_address)
+                    // A compiled landing can carry newer evidence than an accepted probe.
+                    && m.raw_host_fault().is_none()
                 {
                     m.raw_host_fault = transfer.raw;
                 }

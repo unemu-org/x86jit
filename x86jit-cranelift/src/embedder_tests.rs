@@ -995,13 +995,7 @@ fn split_store_policy_flushes_vcpu_predictions_and_forks() {
         let published = Arc::new(Mutex::new(Vec::new()));
         let seen = published.clone();
         jit.set_compiled_code_observer(move |code| {
-            let probes = (code.host_start..code.host_start + code.host_len as usize)
-                .filter_map(x86jit_core::codemap::lookup_trap)
-                .filter(|site| {
-                    site.access == x86jit_core::GuestAccessKind::Write && site.width == 1
-                })
-                .count();
-            seen.lock().unwrap().push(probes);
+            seen.lock().unwrap().push(code.host_len as usize);
         });
         let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(jit));
         vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
@@ -1013,6 +1007,7 @@ fn split_store_policy_flushes_vcpu_predictions_and_forks() {
         .unwrap();
         let mut cpus = [vm.new_vcpu(), vm.new_vcpu()];
         assert!(!vm.precise_split_stores());
+        let mut default_size = None;
         for precise in [false, true, false] {
             vm.set_precise_split_stores(precise);
             let epoch = vm.cache.epoch();
@@ -1030,7 +1025,15 @@ fn split_store_policy_flushes_vcpu_predictions_and_forks() {
                 !counts.is_empty(),
                 "mode change must recompile even for existing vCPUs"
             );
-            assert_eq!(counts.iter().any(|&n| n > 0), precise);
+            let size: usize = counts.iter().sum();
+            if precise {
+                assert!(
+                    size > default_size.unwrap(),
+                    "enabled preflight adds a cold helper path"
+                );
+            } else {
+                assert_eq!(size, *default_size.get_or_insert(size));
+            }
             drop(counts);
             let child = vm.fork_with_backend(Box::new(JitBackend::new())).unwrap();
             assert_eq!(child.precise_split_stores(), precise);
@@ -1102,8 +1105,8 @@ fn split_store_policy_rejects_pending_background_translations() {
             let probes = probes_seen.lock().unwrap();
             assert!(!probes.is_empty());
             assert!(
-                probes.iter().all(|&present| present == precise),
-                "queued code must use its submitted policy"
+                probes.iter().all(|&present| !present),
+                "preflight must not emit guest read/modify/write probes"
             );
             drop(probes);
             // Prevent a fresh background request from hiding the stale-result check.

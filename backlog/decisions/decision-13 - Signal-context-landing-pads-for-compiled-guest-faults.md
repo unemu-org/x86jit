@@ -380,15 +380,17 @@ opmask elements and narrowing stores. Interpreter selected-element preflights
 check every guest region span and refine an unmapped span to its first unmapped
 byte, separately from the host-page probes. VMASKMOV uses its local per-element
 region preflight in default mode and the shared preflight in routed mode, once
-per selected element. Routed stores then probe each touched host page;
-guest region boundaries need not align to host pages. Inactive mask elements
-cause no probes; each selected host page receives one write probe. A write probe
-is an atomic same-value write of one byte: guest data is unchanged, but it
-breaks copy-on-write and sets dirty/soft-dirty tracking even on earlier pages
-when a later page faults. Preflight prevents partial Rust writes under stable
-protections; it cannot exclude concurrent protection revocation between probe
-and commit. An embedder requiring all-or-nothing writes must serialize
-revocation with the whole transfer.
+per selected element. A destination within one host page needs no host probe;
+guest region checks still apply. Crossing destinations receive one same-value
+RMW probe per selected host page before committing bytes. Probes can dirty a page
+or break copy-on-write. Only a failed probe read takes the cold host write-permission
+query; a writable verdict permits the store without that read. Query failure or
+a negative verdict returns the original probe fault and address. A failed probe
+write never queries metadata. In the read-denied fallback, all-or-nothing relies
+on page protection as for a single-page store; VM metadata cannot exclude guard
+regions, backing-file SIGBUS or thread-local protection failures. Stable backing
+and protections remain the embedder's responsibility throughout the transfer.
+Inactive mask elements cause no accesses.
 
 Selected MMIO elements before an unmapped element deliberately differ by mode
 for EVEX k-masked stores, including byte-element stores, and VPMOVQD narrowing
@@ -412,13 +414,11 @@ With the setting **off**, generated code and the existing decision-13 contract
 remain unchanged: a split compiled store can commit earlier host transfers
 before a later transfer faults, and its RAM-effect metadata remains
 `PossiblyPartial`. No probe or crossing test is emitted. The lifter retains
-main's descriptor budget and block boundaries. With the setting on, probe
-metadata can exceed the existing descriptor limit for a long store-heavy
-translation; that unit falls back to interpretation rather than changing
-lifting boundaries in the default mode.
+main's descriptor budget and block boundaries. Crossing preflight runs in a
+helper and does not consume guest machine-trap descriptors.
 
 With the setting **on**, compiled stores in both blocks and regions preflight
-a destination that can cross a 4 KiB host-address granule, in both recovery modes. This covers 16/32/64-byte
+a destination that crosses a real host page, in both recovery modes. This covers 16/32/64-byte
 vector and extract-lane stores on both hosts, and 2/4/8-byte scalar stores and
 inlined RMW stores on AArch64. The test uses the actual host address, including
 externally supplied backing whose page offset differs from the guest address.
@@ -433,26 +433,34 @@ notification helper, which cannot change mappings or protections. Alignment proo
 propagate through constants, masks and aligned arithmetic offsets, up to the
 backing contract’s 16-byte alignment; no wider backing alignment is assumed.
 
-On the cold crossing path, an atomic add-zero on one byte at the operand start
-and at the next granule boundary checks write accessibility in increasing address
-order. The maximum inline store is 64 bytes, so these two probes cover its full
-span. A 4 KiB granule divides all supported host page sizes, including 16 KiB;
-a granule crossing inside one host page merely probes that same page twice.
-Each potentially faulting host instruction of a probe has an exact trap site,
-with guest owner RIP, Write direction and width one. The normal whole-operand
-bounds check and MMIO deferral precede probes. RMW read-check reuse still runs
-the write preflight before the store. No guest destination bytes commit if a
-probe faults. Fixing protection and retrying executes the guest write once,
-matching Intel SDM Vol 3A §§7.5–7.6. This is fault restartability, independently
-of the concurrent-observer atomicity limits in Vol 3A §11.1.1.
+On the crossing path, the shared helper probes actual access before any
+destination transfer. Only a read fault queries host write permissions. The
+whole-operand bounds check and MMIO deferral precede preflight. A failed preflight
+retains the original fault address, reporting RIP, whole operand and one-byte
+Write transfer used by decision-14. Its origin is HostAccess; query failures
+never synthesize a new fault.
+Actual faulting stores still use their exact machine trap sites and retain
+conservative partial-effect evidence. RMW read-check reuse still runs the write
+preflight before the store. Fixing protection and retrying executes the guest
+write once. Concurrent-observer atomicity is separate (SDM Vol 3A §11.1.1):
+VMOVDQU can be split; aligned MOVAPS/MOVAPD/MOVDQA have stronger guarantees on
+AVX processors. This change does not alter the existing transfer decomposition.
+
+The read-denied fallback uses Mach VM region information on macOS, the kernel's
+`/proc/self/maps` on Linux, and `KERN_PROC_VMMAP` on FreeBSD. A missing query
+facility preserves the original read fault. Ordinary single-page stores and
+successful RMW probes perform no permission queries. XSAVE/XSAVEOPT retain their
+architectural XSTATE_BV read (SDM Vol 1 §§13.7, 13.9); XSAVEC (§13.10) is a pure
+store. State saves probe selected pages once rather than probing every byte.
+Ordering fences remain at the ordinary access/helper boundaries. LOCK and
+CMPXCHG16B retain their architectural reads.
 
 The opt-in guarantee assumes stable host mappings/protections from preflight through
 the last transfer, including later stores that reuse a preflight in that guest
 block. Concurrent unmap, revocation or backing changes after a
 successful preflight can still fault an actual transfer after earlier bytes
-committed; those faults retain PossiblyPartial metadata. Probes preserve guest
-byte values under concurrent writers, but can break copy-on-write and set
-host dirty/soft-dirty tracking before a later probe fails. The preflight does
+committed; those faults retain PossiblyPartial metadata. Same-value probes
+preserve guest bytes but can change host dirty/COW tracking. Preflight does
 not make the whole guest operand one atomic transaction.
 
 Masked, narrowing, conversion, x87 and string helpers retain their existing

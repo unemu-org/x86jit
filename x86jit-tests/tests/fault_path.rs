@@ -535,8 +535,23 @@ fn path_memory_units_and_split_store_policy() {
                     let expected = cpu.cpu.clone();
                     f.protect(libc::PROT_NONE);
                     let exit = f.run(&mut cpu);
-                    path(&exit, tier, BASE, None, tier != 0);
+                    let checked_preflight = tier != 0 && kind == "split" && precise;
+                    path(&exit, tier, BASE, None, tier != 0 && !checked_preflight);
                     state(&cpu.cpu, &expected);
+                    if checked_preflight {
+                        // Decision-14: the shared preflight returns a checked exit;
+                        // its fixup PC is outside the compiled unit's transfer sites.
+                        let m = exit.fault_metadata().unwrap();
+                        assert!(matches!(
+                            m.path(),
+                            FaultPath::CompiledBlock { site: None, .. }
+                                | FaultPath::Region { site: None, .. }
+                        ));
+                        assert_eq!(m.operand_size(), Known(16));
+                        assert_eq!(m.transfer_size(), Known(1));
+                        assert_eq!(m.transfer_access(), Known(x86jit_core::FaultAccess::Write));
+                        assert_eq!(m.progress().ram(), MemoryEffects::None);
+                    }
                     if kind == "split" {
                         let mut visible = [0; 8];
                         f.vm.read_bytes(f.hole() - 8, &mut visible).unwrap();
@@ -616,9 +631,9 @@ fn path_forced_region_loop_fault_iteration() {
             state(&cpu.cpu, &expected);
             let mut completed = [0; 160];
             f.vm.read_bytes(initial.gpr[6], &mut completed).unwrap();
-            for (i, bytes) in completed.chunks_exact(8).enumerate() {
+            for (i, bytes) in completed.as_chunks::<8>().0.iter().enumerate() {
                 assert_eq!(
-                    u64::from_le_bytes(bytes.try_into().unwrap()),
+                    u64::from_le_bytes(*bytes),
                     initial.gpr[0] + (i as u64 + 1) * initial.gpr[3]
                 );
             }

@@ -91,14 +91,29 @@ pub(crate) fn exec_v_store_wide<const ROUTED: bool, const ORDER: u8>(
     for offset in (0..u64::from(*bytes)).step_by(8) {
         let ea = a.wrapping_add(offset);
         if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
-            mem.probe_write(ea, 8)
+            mem.probe_write_mode::<false>(ea, 8)
         {
             return Some(trap_out(cpu, cur_addr, t, ea, 8, AccessKind::Write, 0));
         }
     }
+    if mem.store_crosses_host_page(a, usize::from(*bytes)) {
+        if mem.region_kind(a, *bytes as u8) == Ok(crate::RegionKind::Ram) {
+            let _ordering =
+                ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+            return vstore_crossing_ram(mem.unordered(), a, &lanes[..*bytes as usize / 16])
+                .err()
+                .and_then(|f| {
+                    vec_trap_out_optional(cpu, cur_addr, f, AccessKind::Write, a, *bytes)
+                });
+        }
+        if let Err((at, t)) = mem.preflight_store(a, u64::MAX, 8, *bytes) {
+            return Some(trap_out(cpu, cur_addr, t, at, 8, AccessKind::Write, 0));
+        }
+    }
     for (i, v) in lanes.into_iter().enumerate().take(*bytes as usize / 16) {
         let ea = a.wrapping_add(i as u64 * 16);
-        if let Err(f) = vstore(cpu, mem, cur_addr, ea, v, 16) {
+        let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+        if let Err(f) = vstore_parts(cpu, mem.unordered(), cur_addr, ea, v, 16) {
             return vec_trap_out_optional(cpu, cur_addr, f, AccessKind::Write, a, *bytes);
         }
     }
@@ -859,16 +874,22 @@ pub(crate) fn exec_v_extract_lane_wide_m<const ROUTED: bool, const ORDER: u8>(
     for i in 0..n {
         let ea = a.wrapping_add(i as u64 * 16);
         if let Err(t @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
-            mem.probe_write(ea, 16)
+            mem.probe_write_mode::<false>(ea, 16)
         {
             return Some(trap_out(cpu, cur_addr, t, ea, 16, AccessKind::Write, 0));
+        }
+    }
+    if mem.store_crosses_host_page(a, n * 16) {
+        if let Err((at, t)) = mem.preflight_store(a, u64::MAX, 8, (n * 16) as u16) {
+            return Some(trap_out(cpu, cur_addr, t, at, 8, AccessKind::Write, 0));
         }
     }
     for (i, &v) in srcl[base..base + n].iter().enumerate() {
         let ea = a.wrapping_add(i as u64 * 16);
         // Unmapped was ruled out above; an MMIO transfer trapping here is expected and
         // resumable, and carries its own bytes.
-        if let Err(f) = vstore(cpu, mem, cur_addr, ea, v, 16) {
+        let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Write), false);
+        if let Err(f) = vstore_parts(cpu, mem.unordered(), cur_addr, ea, v, 16) {
             return vec_trap_out_optional(
                 cpu,
                 cur_addr,

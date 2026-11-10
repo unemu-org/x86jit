@@ -679,10 +679,8 @@ fn oracle_input(kind: usize, mask: u32) -> x86jit_tests::oracle::VectorInput {
             cpu.kmask[i] = 0x8765 + i as u64;
         }
     }
-    for st in &mut cpu.st {
-        // SDM Vol 1 §4.2.2: explicit integer bit and exponent bias encode 1.0.
-        *st = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f];
-    }
+    // SDM Vol 1 §4.2.2: explicit integer bit and exponent bias encode 1.0.
+    cpu.st.fill([0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
     let zmms = [
         zmm0, zmm1, zmm2, zmm3, zmm4, zmm5, zmm6, zmm7, zmm8, zmm9, zmm10, zmm11, zmm12, zmm13,
         zmm14, zmm15, zmm16, zmm17, zmm18, zmm19, zmm20, zmm21, zmm22, zmm23, zmm24, zmm25, zmm26,

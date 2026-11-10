@@ -3312,7 +3312,7 @@ impl Translator<'_, '_> {
             .find(|&&(a, s, _)| a == addr && s == size)
         {
             if access == 1 {
-                self.preflight_crossing_store(addr, host, size);
+                return self.preflight_crossing_store(addr, host, size);
             }
             return host;
         }
@@ -3338,8 +3338,30 @@ impl Translator<'_, '_> {
         }
 
         let fault = self.builder.create_block();
+        if self.helpers.precise_split_stores && access == 1 {
+            self.builder.set_cold_block(fault);
+        }
         let ok = self.builder.create_block();
-        self.builder.ins().brif(oob, fault, &[], ok, &[]);
+        if self.helpers.precise_split_stores && access == 1 && self.guest_base == 0 {
+            // Subtracting the width checks address wrap without materializing
+            // two boolean comparisons on the ordinary precise-store path.
+            let short =
+                self.builder
+                    .ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, memsize, i64::from(size));
+            let limit = self.builder.ins().iadd_imm_s(memsize, -i64::from(size));
+            let compare = self.builder.create_block();
+            self.builder.ins().brif(short, fault, &[], compare, &[]);
+            self.builder.seal_block(compare);
+            self.builder.switch_to_block(compare);
+            let beyond = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, addr, limit);
+            self.builder.ins().brif(beyond, fault, &[], ok, &[]);
+        } else {
+            self.builder.ins().brif(oob, fault, &[], ok, &[]);
+        }
         self.builder.seal_block(fault);
         self.builder.seal_block(ok);
 
@@ -3411,12 +3433,14 @@ impl Translator<'_, '_> {
             let off = self.builder.ins().isub(addr, gb);
             self.builder.ins().iadd(base, off)
         };
+        let host = if access == 1 {
+            self.preflight_crossing_store(addr, host, size)
+        } else {
+            host
+        };
         self.checked_ea.push((addr, size, host));
         #[cfg(test)]
         trap_tests::record_checked_addr(host);
-        if access == 1 {
-            self.preflight_crossing_store(addr, host, size);
-        }
         host
     }
 
@@ -3456,58 +3480,75 @@ impl Translator<'_, '_> {
 
     /// SDM Vol 3A §§7.5–7.6: a faulting store must be restartable without
     /// committed destination bytes. Probe before any of its host transfers.
-    fn preflight_crossing_store(&mut self, addr: Value, host: Value, size: u8) {
-        if !self.helpers.precise_split_stores || size == 1 || (!self.aarch64 && size < 16) {
-            return;
+    fn preflight_crossing_store(&mut self, addr: Value, host: Value, size: u8) -> Value {
+        if !self.helpers.precise_split_stores {
+            return host;
+        }
+        self.preflight_split_store(addr, host, size)
+    }
+
+    fn preflight_split_store(&mut self, addr: Value, host: Value, size: u8) -> Value {
+        if size == 1 || (!self.aarch64 && size < 16) {
+            return host;
         }
         // HostRam requires equal host/guest offsets modulo 16. An architectural
         // alignment check proves that an operand up to 16 bytes cannot cross.
         if size <= 16 && self.store_addr_aligned(addr, size, 16) {
-            return;
+            return host;
         }
         if self
             .preflighted_stores
             .iter()
             .any(|&(a, n)| a == addr && n >= size)
         {
-            return;
+            return host;
         }
         self.preflighted_stores.push((addr, size));
         // Use host addresses: externally supplied backing need not have the
-        // guest address's page offset. 4 KiB divides supported host page sizes.
-        let offset = self.builder.ins().band_imm_s(host, PAGE_MASK);
-        let crosses = self.builder.ins().icmp_imm_s(
-            IntCC::UnsignedGreaterThan,
-            offset,
-            PAGE_BYTES - i64::from(size),
-        );
+        // guest address's page offset.
+        let page = x86jit_core::memory::host_page_size() as i64;
+        // A negative biased offset fits every supported host page size. The
+        // sign test avoids materializing a large page-size-minus-width constant.
+        let offset = self.builder.ins().bor_imm_s(host, -page);
+        let end = self.builder.ins().iadd_imm_s(offset, i64::from(size) - 1);
+        let sign = self.builder.ins().band_imm_s(end, i64::MIN);
+        let crosses = self.builder.ins().icmp_imm_s(IntCC::Equal, sign, 0);
         let probe = self.builder.create_block();
         let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
         self.builder.set_cold_block(probe);
-        self.builder.ins().brif(crosses, probe, &[], done, &[]);
+        self.builder
+            .ins()
+            .brif(crosses, probe, &[], done, &[host.into()]);
         self.builder.seal_block(probe);
         self.builder.switch_to_block(probe);
         self.sync_guest_fault_state();
-        let next = self.builder.ins().band_imm_s(host, !PAGE_MASK);
-        let next = self.builder.ins().iadd_imm_s(next, PAGE_BYTES);
-        let zero = self.builder.ins().iconst(types::I8, 0);
-        // Atomic add-zero cannot overwrite a concurrent writer's value. Both
-        // sites describe a one-byte Write, including the failed high-page probe.
-        // Probes can still break COW and dirty the page without changing bytes.
-        for address in [host, next] {
-            #[cfg(test)]
-            trap_tests::record_checked_addr(address);
-            self.builder.ins().atomic_rmw(
-                types::I8,
-                guest_mem_flags(GuestAccessKind::Write, 1),
-                ir::AtomicRmwOp::Add,
-                address,
-                zero,
-            );
-        }
-        self.builder.ins().jump(done, &[]);
+        let proofs = std::mem::take(&mut self.preflighted_stores);
+        let bytes = self.iconst(u64::from(size));
+        let cur = self.iconst(self.cur_addr);
+        self.flush_gprs();
+        self.store_cpu(self.offsets.rip, cur);
+        // Actual-access preflight; read-denied pages use the cold permission fallback.
+        // This integer-only check commits no guest bytes. Keep access ordering
+        // at the actual store, and avoid turning a probe into a counted operation.
+        let (sig, helper, _) = self.helpers.vstore_preflight;
+        let helper = self.iconst(helper);
+        let enabled =
+            self.load_mem(std::mem::offset_of!(x86jit_core::jit_abi::MemCtx, time_enabled) as i32);
+        let inst = self
+            .builder
+            .ins()
+            .call_indirect(sig, helper, &[self.mem, bytes, addr, enabled]);
+        self.trap_if_unmapped(inst);
+        self.preflighted_stores = proofs;
+        let host = self.builder.inst_results(inst)[0];
+        self.builder.ins().jump(done, &[host.into()]);
         self.builder.seal_block(done);
         self.builder.switch_to_block(done);
+        let host = self.builder.block_params(done)[0];
+        #[cfg(test)]
+        trap_tests::record_checked_addr(host);
+        host
     }
 
     // One architectural #GP tail per function; recipe epochs share recovery

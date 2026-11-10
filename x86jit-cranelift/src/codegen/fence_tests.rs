@@ -351,11 +351,11 @@ fn helper_accesses_are_ordered_by_lfence_and_sfence() {
             // BLR Xn: ignore the register field. The string helper is the last
             // indirect call before the following inline guest access.
             let call = code[..access]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
-                .filter(|(_, bytes)| {
-                    u32::from_le_bytes((*bytes).try_into().unwrap()) & 0xffff_fc1f == 0xd63f_0000
-                })
+                .filter(|(_, bytes)| u32::from_le_bytes(**bytes) & 0xffff_fc1f == 0xd63f_0000)
                 .map(|(index, _)| index * 4)
                 .next_back()
                 .unwrap();
@@ -620,10 +620,12 @@ fn guest_memory_helpers_follow_host_and_tier_rule() {
                 assert_eq!(code.windows(3).filter(|w| *w == MFENCE).count(), 0);
                 if arm {
                     let calls: Vec<_> = code
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .enumerate()
                         .filter_map(|(i, w)| {
-                            let instruction = u32::from_le_bytes(w.try_into().unwrap());
+                            let instruction = u32::from_le_bytes(*w);
                             (instruction & 0xffff_fc1f == 0xd63f_0000).then_some(i * 4)
                         })
                         .collect();

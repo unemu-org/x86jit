@@ -2,6 +2,7 @@
 
 use cranelift::codegen::{ir::LibCall, isa::OwnedTargetIsa};
 use cranelift_jit::JITBuilder;
+use std::ffi::c_void;
 
 macro_rules! unary {
     ($name:ident, $ty:ty, $method:ident) => {
@@ -28,10 +29,10 @@ extern "C" fn fma_f64(a: f64, b: f64, c: f64) -> f64 {
 
 // Link these addresses into the host binary, including when it is static.
 unsafe extern "C" {
-    fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> *mut u8;
-    fn memmove(dst: *mut u8, src: *const u8, len: usize) -> *mut u8;
-    fn memset(dst: *mut u8, byte: i32, len: usize) -> *mut u8;
-    fn memcmp(a: *const u8, b: *const u8, len: usize) -> i32;
+    fn memcpy(dst: *mut c_void, src: *const c_void, len: usize) -> *mut c_void;
+    fn memmove(dst: *mut c_void, src: *const c_void, len: usize) -> *mut c_void;
+    fn memset(dst: *mut c_void, byte: i32, len: usize) -> *mut c_void;
+    fn memcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
 }
 
 // Cranelift 0.135.8's X86Pshufb signature passes two i8x16 values in xmm0/xmm1

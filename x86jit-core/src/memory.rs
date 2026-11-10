@@ -134,8 +134,10 @@ impl std::error::Error for HostRamError {}
 /// [`Memory::from_host_ram`]. `dtor(ptr, len)` frees it when the `Memory` drops.
 ///
 /// # Safety
-/// `ptr` must be valid for reads and writes over `[ptr, ptr+len)` for the lifetime
+/// `ptr` must retain its reserved address span `[ptr, ptr+len)` for the lifetime
 /// of the `Memory` it backs, and `dtor` must correctly release exactly that region.
+/// RAM must permit each performed host access. With host-fault recovery enabled,
+/// host protections may reject accesses; a pure store requires only write access.
 /// Guard-page hook: `protect(page_ptr, len, accessible)` `mprotect`s a page-aligned
 /// sub-range of a [`HostRam`] mapping RW (`true`) or `PROT_NONE` (`false`).
 pub type ProtectFn = Box<dyn Fn(*mut u8, usize, bool) + Send + Sync>;
@@ -1917,10 +1919,10 @@ impl Memory {
     }
 
     /// Check a WRITE of `size` bytes at `addr` without consuming an MMIO answer.
-    /// In default mode this only checks region metadata. Recovery mode also performs
-    /// an atomic same-value write to one byte per touched host page: guest data is
-    /// unchanged, but this breaks copy-on-write and sets dirty/soft-dirty tracking
-    /// bits, including on earlier pages when a later page faults.
+    /// In default mode this only checks region metadata. Recovery mode probes
+    /// actual access; only a denied read takes the cold VM-permission fallback.
+    /// Callers must skip host probes for a single-page destination and keep
+    /// protections stable until the store commits.
     ///
     /// The wide-store helpers pre-probe their whole destination so a fault leaves nothing
     /// committed. Probing with a load instead — on the reasoning that a load shares the
@@ -1972,6 +1974,14 @@ impl Memory {
     pub(crate) fn mapped_ram(&self, addr: u64) -> bool {
         self.region_at(addr, 1)
             .is_ok_and(|r| !matches!(r.kind, RegionKind::Trap))
+    }
+
+    pub(crate) fn region_kind(&self, addr: u64, size: u8) -> Result<RegionKind, MemTrap> {
+        self.region_at(addr, size).map(|r| r.kind)
+    }
+
+    pub(crate) fn region_end(&self, addr: u64) -> Result<u64, MemTrap> {
+        self.region_at(addr, 1).map(|r| r.start + r.size as u64)
     }
 
     /// The region containing `[addr, addr + size)`, or `Unmapped` if the range
@@ -2290,11 +2300,11 @@ impl Memory {
         val: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED>(addr, val, size, self)
+        self.write_mode_observed::<ROUTED, false>(addr, val, size, self)
     }
 
     #[inline(always)]
-    fn write_mode_observed<const ROUTED: bool>(
+    fn write_mode_observed<const ROUTED: bool, const PREFLIGHTED: bool>(
         &self,
         addr: u64,
         val: u64,
@@ -2318,7 +2328,16 @@ impl Memory {
         // concurrent load on another vcpu never sees a torn word.
         let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(addr)) };
         if ROUTED {
-            unsafe { crate::usercopy::store(ptr, val, size) }.map_err(|at| self.host_fault(at))?;
+            // SAFETY: region_at validates the full span; PREFLIGHTED is set only
+            // after a whole-destination probe, with stable host protections.
+            unsafe {
+                if PREFLIGHTED {
+                    crate::usercopy::store_preflighted(ptr, val, size)
+                } else {
+                    crate::usercopy::store(ptr, val, size)
+                }
+            }
+            .map_err(|at| self.host_fault(at))?;
         } else {
             unsafe { atomic_store_le(ptr, val, size) };
         }
@@ -3717,8 +3736,13 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn host_page_size() -> usize {
+/// Host protection granule, shared by recovery routines and compiled crossing checks.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+pub fn host_page_size() -> usize {
+    #[cfg(test)]
+    if let Some(page) = TEST_HOST_PAGE_SIZE.with(Cell::get) {
+        return page;
+    }
     static PAGE: AtomicUsize = AtomicUsize::new(0);
     let cached = PAGE.load(Ordering::Relaxed);
     if cached != 0 {
@@ -3732,9 +3756,33 @@ pub(crate) fn host_page_size() -> usize {
     PAGE.store(page, Ordering::Relaxed);
     page
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn host_page_size() -> usize {
+/// Host protection granule on platforms without host-fault recovery.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+pub fn host_page_size() -> usize {
+    #[cfg(test)]
+    if let Some(page) = TEST_HOST_PAGE_SIZE.with(Cell::get) {
+        return page;
+    }
     4096
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_HOST_PAGE_SIZE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Only for simulated faults over writable backing; OS protections still use real pages.
+#[cfg(test)]
+pub(crate) fn with_host_page_size_for_test<T>(page: usize, run: impl FnOnce() -> T) -> T {
+    assert!(page.is_power_of_two() && page >= 4096);
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_HOST_PAGE_SIZE.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_HOST_PAGE_SIZE.with(|value| value.replace(Some(page))));
+    run()
 }
 
 // A borrowed specialization retains its backing's representation, avoiding a
@@ -3748,7 +3796,16 @@ pub(crate) trait InterpreterMemory {
     fn note_host_block_write(&self, _host: u64, _addr: u64, _len: usize) {}
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap>;
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap>;
+    fn write_preflighted<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.write::<ROUTED>(addr, value, size)
+    }
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap>;
+    #[inline(always)]
     fn preflight_store<const ROUTED: bool>(
         &self,
         base: u64,
@@ -3757,6 +3814,33 @@ pub(crate) trait InterpreterMemory {
         bytes: u16,
     ) -> Result<(), (u64, MemTrap)> {
         if ROUTED {
+            // A contiguous operand in one region needs one metadata check and
+            // one recovery-routine call, regardless of its number of transfers.
+            let memory = self.normal();
+            if mask == u64::MAX && bytes <= u16::from(u8::MAX) {
+                if let Ok(region) = memory.region_at(base, bytes as u8) {
+                    match region.kind {
+                        RegionKind::Rom => return Ok(()),
+                        RegionKind::Trap => {}
+                        RegionKind::Ram => {
+                            let host = (memory.host_base() as usize)
+                                .wrapping_add(base.wrapping_sub(memory.guest_base()) as usize);
+                            let page = host_page_size();
+                            if usize::from(bytes) <= page - (host & (page - 1)) {
+                                return Ok(());
+                            }
+                            // SAFETY: region_at validated the whole RAM destination.
+                            return unsafe {
+                                crate::usercopy::probe(host as *mut u8, usize::from(bytes), true)
+                            }
+                            .map_err(|at| {
+                                let trap = memory.host_fault(at);
+                                (trap.fault_addr(base), trap)
+                            });
+                        }
+                    }
+                }
+            }
             crate::interp::preflight_store_pages(
                 base,
                 mask,
@@ -3766,7 +3850,10 @@ pub(crate) trait InterpreterMemory {
                 self.normal().guest_base(),
                 (
                     |a, n| self.probe_write::<false>(a, n),
-                    |a, n| self.probe_write::<true>(a, n),
+                    |a, n| {
+                        self.probe_write::<true>(a, n)?;
+                        memory.region_end(a)
+                    },
                 ),
             )?;
         }
@@ -3847,7 +3934,17 @@ impl InterpreterMemory for RunningMemory<'_> {
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
         self.memory
-            .write_mode_observed::<ROUTED>(addr, value, size, self)
+            .write_mode_observed::<ROUTED, false>(addr, value, size, self)
+    }
+    #[inline(always)]
+    fn write_preflighted<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.memory
+            .write_mode_observed::<ROUTED, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
@@ -3867,6 +3964,15 @@ impl InterpreterMemory for Memory {
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
         self.write_mode::<ROUTED>(addr, value, size)
+    }
+    #[inline(always)]
+    fn write_preflighted<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.write_mode_observed::<ROUTED, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
@@ -3927,6 +4033,31 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, O
             self.unordered(),
             crate::interp::ordering::Barrier::new(direction, true),
         )
+    }
+    #[inline(always)]
+    pub fn write_preflighted(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Write),
+            false,
+        );
+        let result = self.0.write_preflighted::<ROUTED>(addr, value, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
+        result
+    }
+    #[inline(always)]
+    pub fn store_crosses_host_page(&self, addr: u64, bytes: usize) -> bool {
+        if !ROUTED {
+            return false;
+        }
+        let memory = self.0.normal();
+        let host = (memory.host_base() as usize)
+            .wrapping_add(addr.wrapping_sub(memory.guest_base()) as usize);
+        if bytes <= 4096 - (host & 4095) {
+            return false;
+        }
+        let page = host_page_size();
+        bytes > page - (host & (page - 1))
     }
     #[inline(always)]
     pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {

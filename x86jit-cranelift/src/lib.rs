@@ -2262,36 +2262,30 @@ unsafe extern "C" fn var_shift_mem_helper(
 
 /// Probe every destination page before a multi-transfer conversion store.
 /// # Safety
-/// `cpu` and `mem` retain the active CpuState and MemCtx for this call.
+/// `mem` retains the active MemCtx; generated code has synchronized CpuState.
 unsafe extern "C" fn vstore_preflight_helper(
-    cpu: *mut u8,
     mem: *mut u8,
-    addr: u64,
     bytes: u64,
-    cur_addr: u64,
+    addr: u64,
     time_enabled: u64,
 ) -> u64 {
-    account_helper!(
-        time_enabled,
-        vstore_preflight_helper(cpu, mem, addr, bytes, cur_addr, 0)
-    );
+    account_helper!(time_enabled, vstore_preflight_helper(mem, bytes, addr, 0));
     use x86jit_core::interp::StrMem;
-    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_UNMAPPED};
-    let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
+    use x86jit_core::jit_abi::{MemCtx, RET_UNMAPPED};
     let ctx = &mut *(mem as *mut MemCtx);
-    // SAFETY: mem_self retains the live Memory for this helper call.
-    let recover = unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }.host_fault_recovery();
+    // Called by crossing split stores and conversion stores. Actual-access probes
+    // use transfer fixups even when ordinary Rust transfer recovery is disabled.
     let raw = x86jit_core::interp::RawStrMem {
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
-        recover_host_faults: recover,
+        recover_host_faults: true,
     };
     match raw.preflight_store(addr, u64::MAX, 1, bytes as u16) {
-        Ok(()) => RET_CONTINUE,
-        Err((at, _)) => {
-            cpu.rip = cur_addr;
+        Ok(()) => ctx.base + (addr - ctx.guest_base),
+        Err((at, trap)) => {
             ctx.record_helper_fault(at, 1, true, addr, bytes);
+            ctx.record_helper_trap(trap);
             RET_UNMAPPED
         }
     }
@@ -4174,7 +4168,7 @@ impl Shared {
         let vhint_mem_sig = params(9, false); // (cpu, dst, a, lo0, hi0, lo1, hi1, op, bytes) -> ()
         let cvtph2ps_sig = params(4, false); // (cpu, dst, src, lanes) -> ()
         let var_shift_mem_sig = params(9, false);
-        let vstore_preflight_sig = params(5, true);
+        let vstore_preflight_sig = params(3, true);
         let cvtps2ph_value_sig = params(5, false);
         let cvtps2ph_sig = params(5, false); // (cpu, dst, src, lanes, rc) -> ()
         let phminposuw_sig = params(3, false); // (cpu, dst, src) -> ()

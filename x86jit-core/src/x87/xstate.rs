@@ -186,6 +186,8 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
     if restore {
         load(mem, base, 512, &mut header, fault)?;
     } else if !compact_save {
+        // SDM Vol 1 §§13.7, 13.9: XSAVE/XSAVEOPT read XSTATE_BV to
+        // preserve unrequested bits. XSAVEC (§13.10) has no header read.
         load(mem, base, 512, &mut header[..8], fault)?;
     }
     let bv = u64::from_le_bytes(header[..8].try_into().unwrap());
@@ -428,11 +430,15 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
     if compact_save {
         writes.push((520, ((1u64 << 63) | requested).to_le_bytes().to_vec()));
     }
-    // Probe each exact destination byte before any store, including discontiguous components.
+    // Validate exact guest destinations, including discontiguous components.
+    // Only crossing saves need actual-access preflight. ROM representatives do
+    // not touch backing memory, so each host page also needs a RAM representative.
+    let page = crate::memory::host_page_size();
+    let mut pages = Vec::new();
     for (off, buf) in &writes {
         for i in 0..buf.len() {
             let at = address(base, off + i, fault)?;
-            mem.probe_write(at, 1).map_err(|trap| {
+            mem.probe_write_mode::<false>(at, 1).map_err(|trap| {
                 if matches!(trap, crate::MemTrap::HostFault) {
                     let addr = trap.fault_addr(at);
                     crate::fault::record_fp_fault(
@@ -445,6 +451,29 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
                 } else {
                     memory_fault(at, true)
                 }
+            })?;
+            if mem.host_fault_recovery() {
+                let host = (mem.host_base() as usize)
+                    .wrapping_add(at.wrapping_sub(mem.guest_base()) as usize);
+                let host_page = host / page;
+                let kind = mem.region_kind(at, 1).map_err(|_| memory_fault(at, true))?;
+                if !pages.iter().any(|&(p, k, _)| p == host_page && k == kind) {
+                    pages.push((host_page, kind, at));
+                }
+            }
+        }
+    }
+    if pages.len() > 1 {
+        for (_, _, at) in pages {
+            mem.probe_write(at, 1).map_err(|trap| {
+                let addr = trap.fault_addr(at);
+                crate::fault::record_fp_fault(
+                    addr,
+                    1,
+                    crate::FaultOrigin::HostAccess,
+                    crate::AddressPrecision::ExactByte,
+                );
+                XStateFault::Memory { addr, write: true }
             })?;
         }
     }

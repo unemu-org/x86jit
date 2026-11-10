@@ -79,10 +79,12 @@ fn table() -> (CpuidTable, Vec<(u32, u32, R)>) {
     ];
     let mut brand = [0u8; 48];
     brand[..16].copy_from_slice(b"x86jit table CPU");
-    for (i, bytes) in brand.chunks_exact(16).enumerate() {
+    for (i, bytes) in brand.as_chunks::<16>().0.iter().enumerate() {
         let words: Vec<_> = bytes
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         rows.push((
             0x8000_0002 + i as u32,

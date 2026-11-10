@@ -534,7 +534,9 @@ pub(crate) fn exec_store<const ROUTED: bool, const ORDER: u8>(
             let at = if t == MemTrap::Unmapped {
                 (0..*size)
                     .map(|i| a.wrapping_add(u64::from(i)))
-                    .find(|&at| matches!(mem.probe_write(at, 1), Err(MemTrap::Unmapped)))
+                    .find(|&at| {
+                        matches!(mem.probe_write_mode::<false>(at, 1), Err(MemTrap::Unmapped))
+                    })
                     .unwrap_or(a)
             } else {
                 a

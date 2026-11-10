@@ -137,6 +137,7 @@ pub mod f80;
 pub mod fault;
 pub mod features;
 pub mod gfni;
+mod host_write;
 pub mod interp;
 pub mod interruption;
 pub mod ir;
