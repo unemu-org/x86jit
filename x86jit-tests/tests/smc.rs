@@ -1722,3 +1722,388 @@ fn faulting_split_store_invalidates_code_every_tier() {
     }
     assert!(failures.is_empty(), "failed cases: {failures:?}");
 }
+
+fn byte_precise_code_page(backend: Box<dyn Backend>) {
+    use x86jit_core::{BlockKey, CpuMode};
+    let vm = new_vm(backend);
+    for pc in [TARGET, TARGET + 0x100] {
+        vm.write_bytes(pc, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    }
+    // A different page runs the store, so the instruction stream is untouched.
+    vm.write_bytes(
+        MAIN,
+        &assemble(MAIN, |a| {
+            a.mov(byte_ptr(rdi), 2).unwrap();
+            let mut done = a.create_label();
+            a.jmp(done).unwrap();
+            a.set_label(&mut done).unwrap();
+            a.hlt().unwrap();
+        }),
+    )
+    .unwrap();
+    let mut cpu = vm.new_vcpu();
+    for pc in [TARGET, TARGET + 0x100, MAIN] {
+        cpu.set_reg(Reg::Rip, pc);
+        cpu.set_reg(Reg::Rdi, TARGET + 0xf00);
+        run_to_hlt(&vm, &mut cpu);
+    }
+    let before = vm.cache.misses();
+    let epoch = vm.cache.epoch();
+    for offset in [6, 0xf00] {
+        cpu.set_reg(Reg::Rdi, TARGET + offset);
+        for _ in 0..10 {
+            for pc in [MAIN, TARGET, TARGET + 0x100] {
+                cpu.set_reg(Reg::Rip, pc);
+                run_to_hlt(&vm, &mut cpu);
+            }
+        }
+    }
+    assert_eq!(
+        vm.cache.misses(),
+        before,
+        "data writes must not re-lift code"
+    );
+    assert_eq!(vm.cache.epoch(), epoch);
+    assert!(vm.mem.is_code_page(TARGET >> 12));
+    cpu.set_reg(Reg::Rdi, TARGET + 1);
+    cpu.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut cpu);
+    assert!(vm
+        .cache
+        .get(BlockKey::new(TARGET, CpuMode::Long64))
+        .is_none());
+    assert!(vm
+        .cache
+        .get(BlockKey::new(TARGET + 0x100, CpuMode::Long64))
+        .is_some());
+    assert!(vm.mem.is_code_page(TARGET >> 12));
+    let before = vm.cache.misses();
+    cpu.set_reg(Reg::Rip, TARGET + 0x100);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(vm.cache.misses(), before);
+    cpu.set_reg(Reg::Rip, TARGET);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(cpu.reg(Reg::Rax), 2);
+    assert_eq!(vm.cache.misses(), before + 1);
+}
+both_backends!(
+    byte_precise_code_page,
+    data_bytes_preserve_cached_code_interp,
+    data_bytes_preserve_cached_code_jit
+);
+
+#[test]
+fn concurrent_data_store_and_same_page_publication_preserve_code() {
+    use std::sync::Barrier;
+    use x86jit_core::{BlockKey, CpuMode};
+    let vm = new_vm(Box::new(InterpreterBackend));
+    for i in 0..100u64 {
+        vm.write_bytes(TARGET + i * 16, &[0xb8, i as u8, 0, 0, 0, 0xf4])
+            .unwrap();
+    }
+    vm.write_bytes(
+        MAIN,
+        &assemble(MAIN, |a| {
+            let mut top = a.create_label();
+            a.mov(ecx, 10000).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.mov(byte_ptr(TARGET + 0xf00), 42).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(top).unwrap();
+            a.hlt().unwrap();
+        }),
+    )
+    .unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, TARGET);
+    run_to_hlt(&vm, &mut cpu);
+    let start = Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut writer = vm.new_vcpu();
+            writer.set_reg(Reg::Rip, MAIN);
+            start.wait();
+            run_to_hlt(&vm, &mut writer);
+        });
+        start.wait();
+        for i in 1..100u64 {
+            cpu.set_reg(Reg::Rip, TARGET + i * 16);
+            run_to_hlt(&vm, &mut cpu);
+            assert_eq!(cpu.reg(Reg::Rax), i);
+        }
+    });
+    assert!(vm.mem.is_code_page(TARGET >> 12));
+    for i in 0..100u64 {
+        assert!(vm
+            .cache
+            .get(BlockKey::new(TARGET + i * 16, CpuMode::Long64))
+            .is_some());
+    }
+    let before = vm.cache.misses();
+    for i in 0..100u64 {
+        cpu.set_reg(Reg::Rip, TARGET + i * 16);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), i);
+    }
+    assert_eq!(vm.cache.misses(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn alias_data_offsets_preserve_neighboring_translations() {
+    use x86jit_core::{BlockKey, CpuMode};
+    for jit in [false, true] {
+        let backend: Box<dyn Backend> = if jit {
+            Box::new(JitBackend::new())
+        } else {
+            Box::new(InterpreterBackend)
+        };
+        let vm = alias_vm(backend);
+        vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+        for pc in [0x4000, 0x4100] {
+            vm.write_bytes(pc, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+        }
+        vm.write_bytes(MAIN, &[0xf4]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        for pc in [0x4000, 0x4100, MAIN] {
+            cpu.set_reg(Reg::Rip, pc);
+            run_to_hlt(&vm, &mut cpu);
+        }
+        let before = vm.cache.misses();
+        vm.write_bytes(0x18f00, &[42]).unwrap();
+        for pc in [MAIN, 0x4000, 0x4100] {
+            cpu.set_reg(Reg::Rip, pc);
+            run_to_hlt(&vm, &mut cpu);
+        }
+        assert_eq!(vm.cache.misses(), before);
+        vm.write_bytes(0x18001, &[2]).unwrap();
+        cpu.set_reg(Reg::Rip, MAIN);
+        run_to_hlt(&vm, &mut cpu);
+        assert!(vm
+            .cache
+            .get(BlockKey::new(0x4000, CpuMode::Long64))
+            .is_none());
+        assert!(vm
+            .cache
+            .get(BlockKey::new(0x4100, CpuMode::Long64))
+            .is_some());
+        assert!(vm.mem.is_code_page(4) && vm.mem.is_code_page(0x18));
+        cpu.set_reg(Reg::Rip, 0x4000);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), 2);
+    }
+}
+
+fn crossing_block_byte_precision(backend: Box<dyn Backend>) {
+    use x86jit_core::{BlockKey, CpuMode};
+    let vm = new_vm(backend);
+    vm.write_bytes(0x2ffd, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    vm.write_bytes(0x3100, &[0xf4]).unwrap();
+    vm.write_bytes(MAIN, &[0xf4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    for pc in [0x2ffd, 0x3100, MAIN] {
+        cpu.set_reg(Reg::Rip, pc);
+        run_to_hlt(&vm, &mut cpu);
+    }
+    vm.write_bytes(0x2fff, &[2, 0]).unwrap();
+    cpu.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut cpu);
+    assert!(vm
+        .cache
+        .get(BlockKey::new(0x2ffd, CpuMode::Long64))
+        .is_none());
+    assert!(vm
+        .cache
+        .get(BlockKey::new(0x3100, CpuMode::Long64))
+        .is_some());
+    assert!(vm.mem.is_code_page(3));
+    cpu.set_reg(Reg::Rip, 0x2ffd);
+    run_to_hlt(&vm, &mut cpu);
+    assert_eq!(cpu.reg(Reg::Rax), 0x201);
+}
+both_backends!(
+    crossing_block_byte_precision,
+    crossing_block_bytes_interp,
+    crossing_block_bytes_jit
+);
+
+// Pause after decoding, before the cache owns any span of the new unit.
+struct PausedPublicationBackend {
+    jit: JitBackend,
+    regions: bool,
+    pause: std::sync::Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+}
+impl PausedPublicationBackend {
+    fn pause(&self, pc: u64) {
+        if pc == TARGET + 0x100 {
+            if let Some((entered, resume)) = self.pause.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
+        }
+    }
+}
+impl Backend for PausedPublicationBackend {
+    fn materialize(
+        &self,
+        ir: &x86jit_core::IrBlock,
+        consistency: x86jit_core::MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+    ) -> x86jit_core::CachedBlock {
+        self.pause(ir.guest_start);
+        self.jit.materialize(ir, consistency, mmio, guest_base)
+    }
+    fn region_caps(&self) -> Option<x86jit_core::RegionCaps> {
+        self.regions.then_some(x86jit_core::RegionCaps {
+            max_blocks: 8,
+            max_icount: 128,
+        })
+    }
+    fn materialize_region(
+        &self,
+        region: &x86jit_core::IrRegion,
+        consistency: x86jit_core::MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+    ) -> x86jit_core::CachedBlock {
+        self.pause(region.entry);
+        self.jit
+            .materialize_region(region, consistency, mmio, guest_base)
+    }
+    fn invalidate_links(&self) {
+        self.jit.invalidate_links();
+    }
+}
+
+fn victim_free_drain_rejects_first_publication(regions: bool) {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use x86jit_core::{BlockKey, CpuMode};
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    let vm = new_vm(Box::new(PausedPublicationBackend {
+        jit: JitBackend::new(),
+        regions,
+        pause: std::sync::Mutex::new(Some((entered_tx, resume_rx))),
+    }));
+    vm.write_bytes(TARGET, &[0xf4]).unwrap();
+    vm.write_bytes(MAIN, &[0xf4]).unwrap();
+    let entry = TARGET + 0x100;
+    let successor = TARGET + 0x180;
+    if regions {
+        vm.write_bytes(
+            entry,
+            &assemble(entry, |a| {
+                a.jmp(successor).unwrap();
+            }),
+        )
+        .unwrap();
+        vm.write_bytes(
+            successor,
+            &assemble(successor, |a| {
+                a.mov(eax, 1).unwrap();
+                a.dec(ecx).unwrap();
+                a.jnz(entry).unwrap();
+                a.hlt().unwrap();
+            }),
+        )
+        .unwrap();
+    } else {
+        vm.write_bytes(entry, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+    }
+    let mut drain = vm.new_vcpu();
+    drain.set_reg(Reg::Rip, TARGET);
+    run_to_hlt(&vm, &mut drain);
+    let vm = Arc::new(vm);
+    let runner_vm = vm.clone();
+    let worker = std::thread::spawn(move || {
+        let mut cpu = runner_vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, entry);
+        cpu.set_reg(Reg::Rcx, 2);
+        let exit = cpu.run(&runner_vm, Some(100));
+        (exit, cpu.reg(Reg::Rax))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(vm
+        .cache
+        .get(BlockKey::new(entry, CpuMode::Long64))
+        .is_none());
+    assert!(vm
+        .cache
+        .get(BlockKey::new(successor, CpuMode::Long64))
+        .is_none());
+    let epoch = vm.cache.epoch();
+    vm.write_bytes(if regions { successor + 1 } else { entry + 1 }, &[2])
+        .unwrap();
+    drain.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut drain);
+    assert!(!vm.mem.has_dirty_code());
+    assert_eq!(
+        vm.cache.epoch(),
+        epoch,
+        "surviving code keeps dispatch predictors"
+    );
+    assert!(vm
+        .cache
+        .get(BlockKey::new(TARGET, CpuMode::Long64))
+        .is_some());
+    resume_tx.send(()).unwrap();
+    let (exit, value) = worker.join().unwrap();
+    assert!(matches!(exit, Exit::Hlt), "{exit:?}");
+    assert_eq!(value, 2, "stale first publication must be retried");
+    if regions {
+        assert!(vm.cache.regions() > 0, "exercise region publication");
+    }
+}
+#[test]
+fn victim_free_drain_rejects_first_block_publication() {
+    victim_free_drain_rejects_first_publication(false);
+}
+#[test]
+fn victim_free_drain_rejects_first_region_publication() {
+    victim_free_drain_rejects_first_publication(true);
+}
+
+fn accumulated_code_writes(backend: Box<dyn Backend>) {
+    use x86jit_core::{BlockKey, CpuMode};
+    let vm = new_vm(backend);
+    let entries = [TARGET, TARGET + 0x100, TARGET + 0x200];
+    vm.write_bytes(MAIN, &[0xf4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    for pc in entries {
+        vm.write_bytes(pc, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+        cpu.set_reg(Reg::Rip, pc);
+        run_to_hlt(&vm, &mut cpu);
+    }
+    // Overlapping writes and disjoint spans accumulate before a single drain.
+    vm.write_bytes(TARGET + 1, &[2, 0]).unwrap();
+    vm.write_bytes(TARGET + 2, &[0]).unwrap();
+    vm.write_bytes(TARGET + 0x101, &[3]).unwrap();
+    vm.write_bytes(TARGET + 0xf00, &[9]).unwrap();
+    cpu.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut cpu);
+    for pc in &entries[..2] {
+        assert!(vm.cache.get(BlockKey::new(*pc, CpuMode::Long64)).is_none());
+    }
+    assert!(vm
+        .cache
+        .get(BlockKey::new(entries[2], CpuMode::Long64))
+        .is_some());
+    assert!(vm.mem.is_code_page(TARGET >> 12));
+    for (pc, expected) in entries.into_iter().zip([2, 3, 1]) {
+        cpu.set_reg(Reg::Rip, pc);
+        run_to_hlt(&vm, &mut cpu);
+        assert_eq!(cpu.reg(Reg::Rax), expected);
+    }
+}
+both_backends!(
+    accumulated_code_writes,
+    accumulated_code_writes_interp,
+    accumulated_code_writes_jit
+);

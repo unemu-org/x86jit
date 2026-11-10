@@ -75,6 +75,40 @@ fn fetch_policy_refusal_every_tier() {
     }
 }
 #[test]
+fn fetch_policy_revocation_evicts_disjoint_same_page_code() {
+    for tier in 0..6 {
+        let mut vm = vm(tier);
+        let entry = PAGE + 0x100;
+        vm.write_bytes(entry, &[0xb8, 42, 0, 0, 0, 0xf4]).unwrap();
+        let allow = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        vm.set_fetch_policy(Box::new({
+            let allow = allow.clone();
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if allow.load(Ordering::Acquire) {
+                    FetchVerdict::Allow
+                } else {
+                    FetchVerdict::DenyProtection
+                }
+            }
+        }));
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, entry);
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        allow.store(false, Ordering::Release);
+        // The notification is disjoint from every cached instruction byte.
+        vm.mem.note_write(PAGE, 1);
+        cpu.set_reg(Reg::Rip, entry);
+        cpu.set_reg(Reg::Rax, 99);
+        refused(&cpu.run(&vm, Some(100)), entry, entry, true);
+        assert_eq!(cpu.reg(Reg::Rax), 99);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+}
+#[test]
 fn fetch_policy_crossing_retains_prefix_every_tier() {
     for tier in 0..6 {
         for crossing in [false, true] {

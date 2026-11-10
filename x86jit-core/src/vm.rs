@@ -264,8 +264,8 @@ pub trait Backend: Send + Sync {
     /// Drain finished background compiles for the core dispatcher to publish via
     /// `cache.upgrade`; the backend never touches the cache. The default returns an
     /// empty `Vec` (no allocation) for a backend that never queues. Called at the top
-    /// of the dispatch loop; each result carries the epoch snapshot taken at submit, so
-    /// a stale compile is rejected on publish.
+    /// of the dispatch loop; each result carries the source-publication generation
+    /// from its request, so a stale compile is rejected on publish.
     /// An `Interpreted` completion means compilation failed: the dispatcher
     /// publishes nothing and clears the request's in-flight marker.
     fn tier_up_finished(&self) -> Vec<TierUpFinished> {
@@ -342,8 +342,8 @@ pub struct TierUpRequest {
     /// publish — one for a block, one per sub-block for a region (matches
     /// [`TranslationCache::insert`]'s span list).
     pub spans: Vec<(u64, u32)>,
-    /// Invalidation epoch snapshotted at submit; a publish is rejected if the cache
-    /// epoch has moved past it (an SMC drop invalidated the unit mid-compile).
+    /// Source-publication generation snapshotted before reading the unit; checked
+    /// against `TranslationCache::publication_generation` when publishing.
     pub epoch: u64,
 }
 
@@ -372,7 +372,7 @@ pub struct TierUpFinished {
     pub block: CachedBlock,
     /// The guest byte span(s) `(start, len)` — one per sub-block for a region.
     pub spans: Vec<(u64, u32)>,
-    /// The epoch snapshotted at submit, checked against the live cache epoch.
+    /// The source-publication generation from the request, checked at publication.
     pub epoch: u64,
 }
 
@@ -704,7 +704,9 @@ impl Vm {
     /// This does not enforce advisory region `Prot` or model guest paging. A
     /// refusal supplies the embedder's presence fact in the existing #PF
     /// projection and sets `is_fetch`; other paging-control facts remain unknown.
-    /// With no policy, compiled execution and dispatch retain their existing paths.
+    /// Write notifications revoke page-wide approval and evict every translation
+    /// on the notified page. Without a policy, writes invalidate only overlapping
+    /// source bytes; compiled execution and dispatch retain their existing paths.
     pub fn set_fetch_policy(
         &mut self,
         policy: Box<dyn Fn(u64) -> crate::FetchVerdict + Send + Sync>,
@@ -789,7 +791,7 @@ impl Vm {
             .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
         self.cache.invalidate_pending_fetches = pending;
         self.backend.invalidate_links();
-        let epoch = self.cache.epoch();
+        let generation = self.cache.publication_generation();
         let permit = self.mem.fetch_permit();
         let mut failure = None;
         let region = lift_region_with_fault(&self.mem, entry, caps, self.mode, &mut failure)
@@ -817,7 +819,9 @@ impl Vm {
         if !self
             .cache
             .insert_checked(key, compiled, region.spans(), |spans| {
-                if self.cache.epoch() != epoch || permit.as_ref().is_some_and(|p| !p.is_current()) {
+                if self.cache.publication_generation() != generation
+                    || permit.as_ref().is_some_and(|p| !p.is_current())
+                {
                     return false;
                 }
                 for &(start, len) in spans {
@@ -1101,28 +1105,36 @@ impl Vm {
         Ok(())
     }
 
-    /// Process pending self-modifying-code writes (§10): for each code page a
-    /// store landed on, drop every cached block overlapping it and clear the tag
-    /// (re-execution re-lifts and re-tags). No-op unless a write actually hit a
-    /// code page.
+    /// Process pending self-modifying-code writes (§10): drop units overlapping
+    /// written bytes, retaining page tags while any cached unit remains. With a
+    /// fetch policy, invalidate whole pages because fetch approvals are page-wide.
     ///
     /// Interpreter stores, compiled stores, helpers and embedder writes all report
-    /// through `Memory::note_write`, which expands declared aliases to code pages.
+    /// through `Memory::note_write`, which expands written byte ranges through declared aliases.
     fn handle_smc(&self, word: &AtomicU64) {
         self.mem.dispatch_smc(word, |dirty| {
             let mut invalidated = false;
-            for page in dirty {
-                let lo = page << crate::memory::CODE_PAGE_BITS;
-                let hi = lo + (1 << crate::memory::CODE_PAGE_BITS);
+            for (lo, hi) in dirty {
+                let page = lo >> crate::memory::CODE_PAGE_BITS;
+                let (lo, hi) = if self.mem.fetch_policy.is_some() {
+                    let start = page << crate::memory::CODE_PAGE_BITS;
+                    (start, start.saturating_add(crate::memory::CODE_PAGE_SIZE))
+                } else {
+                    (lo, hi)
+                };
                 // A dropped unit's inbound link slots (in other, surviving blocks) still
                 // point at its now-stale compiled code. Note whether anything was
                 // dropped so we can clear the backend's slots once, below.
-                // The page tag is cleared *inside* `invalidate_overlapping`, under the
+                // The page tag is cleared *inside* `invalidate_written`, under the
                 // spans lock and only if no block still spans the page — so it can't race
                 // a concurrent insert's mark.
                 invalidated |= !self
                     .cache
-                    .invalidate_overlapping(lo, hi, || self.mem.clear_code_page(page))
+                    .invalidate_written(lo, hi, |empty| {
+                        if empty {
+                            self.mem.clear_code_page(page);
+                        }
+                    })
                     .is_empty();
             }
             // Clear all backend-owned cached code pointers so no surviving block chains
@@ -2922,8 +2934,8 @@ impl Vcpu {
 }
 
 /// Publish every completed background compile into the cache: the dispatcher
-/// publishes, the backend never touches the cache. Each is epoch-checked by `upgrade`
-/// (a stale compile whose block was SMC-dropped is rejected); the in-flight marker is
+/// publishes, the backend never touches the cache. Each is generation-checked by
+/// `upgrade_region`, including writes to uncached successors; the in-flight marker is
 /// always cleared so a rejected block can be re-lifted and re-submitted.
 /// `tier_up_finished` short-circuits when idle.
 fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
@@ -2936,7 +2948,7 @@ fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
             // A failed background compile leaves the already-cached interpreter
             // block in place; only clear its in-flight marker.
             vm.cache.end_tier_up(key);
-            if vm.cache.epoch() != fin.epoch {
+            if vm.cache.publication_generation() != fin.epoch {
                 vm.cache.record_tier_bg_rejected();
             }
             continue;
@@ -2994,8 +3006,9 @@ fn resolve_dispatch<const DEFAULT: bool>(
                 return Ok(block);
             }
             // No IR exists on a miss; snapshot before fetching its bytes.
-            let epoch = vm.cache.epoch();
-            match resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, epoch) {
+            let generation = vm.cache.publication_generation();
+            match resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, generation)
+            {
                 Ok(block) => return Ok(block),
                 Err(ResolveFailure::Exit(exit)) => return Err(exit),
                 Err(ResolveFailure::Retry) => continue,
@@ -3048,7 +3061,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         if let Some(block) = vm.cache.get(key) {
             return Ok(block);
         }
-        let compile_epoch = vm.cache.epoch();
+        let compile_generation = vm.cache.publication_generation();
         let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
         let lifted = {
@@ -3066,7 +3079,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                     pc,
                     ir,
                     permit.as_ref(),
-                    compile_epoch,
+                    compile_generation,
                 )
                 .ok_or(ResolveFailure::Retry)
             });
@@ -3078,13 +3091,14 @@ fn resolve_attempt<const DEFAULT: bool>(
         if vm.tier_up_background {
             drain_tier_up(vm, exit_word, sections);
         }
-        // Snapshot the invalidation epoch BEFORE the lookup: `upgrade` rejects the
-        // tier-up if an SMC drop moved it in between. Otherwise a tier-up racing a
-        // concurrent `invalidate_overlapping` would resurrect a stale block with no
-        // span — permanently uninvalidatable.
-        let epoch = vm.cache.epoch();
+        // Snapshot before reading cached IR or fetching uncached successors:
+        // even a victim-free write must cancel source publication.
+        let generation = vm.cache.publication_generation();
+        let dispatch_epoch = vm.cache.epoch();
         let Some(block) = vm.cache.get(key) else {
-            return resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, epoch);
+            return resolve_uncached::<DEFAULT>(
+                vm, exit_word, sections, at, mode, mxcsr, generation,
+            );
         };
         // Hotness-gated tier-up: a cached *interpreted* block that has
         // now run `tier_up_after` times gets JIT-compiled from its already-lifted
@@ -3105,7 +3119,7 @@ fn resolve_attempt<const DEFAULT: bool>(
             let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
             if !vm
                 .cache
-                .publish_if_current(epoch, || permit = vm.mem.fetch_permit())
+                .publish_if_current(dispatch_epoch, || permit = vm.mem.fetch_permit())
             {
                 continue;
             }
@@ -3187,7 +3201,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                 mmio: vm.mem.trap_window(),
                 guest_base: vm.mem.guest_base(),
                 spans,
-                epoch,
+                epoch: generation,
             };
             let submitted = {
                 let _section =
@@ -3228,10 +3242,12 @@ fn resolve_attempt<const DEFAULT: bool>(
             )
         };
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
-        if vm
-            .cache
-            .upgrade(key, compiled.clone(), (ir.guest_start, ir.guest_len), epoch)
-        {
+        if vm.cache.upgrade(
+            key,
+            compiled.clone(),
+            (ir.guest_start, ir.guest_len),
+            generation,
+        ) {
             return Ok(compiled);
         }
         // Lost the race: an SMC drop invalidated the block mid-tier-up. Loop to
@@ -3248,7 +3264,7 @@ fn resolve_uncached<const DEFAULT: bool>(
     at: FetchAddr,
     mode: CpuMode,
     mxcsr: u32,
-    compile_epoch: u64,
+    compile_generation: u64,
 ) -> Result<CachedBlock, ResolveFailure> {
     let pc = at.pa;
     let key = if DEFAULT {
@@ -3299,7 +3315,7 @@ fn resolve_uncached<const DEFAULT: bool>(
                 if !vm
                     .cache
                     .insert_checked(key, materialized.clone(), spans, |sp| {
-                        if vm.cache.epoch() != compile_epoch
+                        if vm.cache.publication_generation() != compile_generation
                             || permit.as_ref().is_some_and(|p| !p.is_current())
                         {
                             return false;
@@ -3326,7 +3342,7 @@ fn resolve_uncached<const DEFAULT: bool>(
                     pc,
                     region.blocks.into_iter().next().unwrap(),
                     permit.as_ref(),
-                    compile_epoch,
+                    compile_generation,
                 )
                 .ok_or(ResolveFailure::Retry)
             }
@@ -3355,7 +3371,7 @@ fn resolve_uncached<const DEFAULT: bool>(
             pc,
             ir,
             permit.as_ref(),
-            compile_epoch,
+            compile_generation,
         )
         .ok_or(ResolveFailure::Retry),
         Err(e) => Err(ResolveFailure::Exit(lift_exit(
@@ -3381,7 +3397,7 @@ fn finish_single(
     span_start: u64,
     ir: IrBlock,
     permit: Option<&crate::FetchPermit>,
-    compile_epoch: u64,
+    compile_generation: u64,
 ) -> Option<CachedBlock> {
     if permit.is_some_and(|p| !p.is_current()) {
         return None;
@@ -3408,7 +3424,9 @@ fn finish_single(
     // by a concurrent SMC invalidation between insert and mark.
     vm.cache
         .insert_checked(key, materialized.clone(), vec![(start, len)], |_| {
-            if vm.cache.epoch() != compile_epoch || permit.is_some_and(|p| !p.is_current()) {
+            if vm.cache.publication_generation() != compile_generation
+                || permit.is_some_and(|p| !p.is_current())
+            {
                 return false;
             }
             vm.mem.mark_code(start, len);

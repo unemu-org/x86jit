@@ -364,7 +364,8 @@ pub enum FetchVerdict {
 
 /// Cancellation witness for a translation approved under a fetch policy.
 /// Backends must check this before starting queued compilation. Invalidation
-/// during compilation is handled by the cache's publication epoch check.
+/// during compilation is handled by the cache's publication generation, which
+/// every invalidation advances, including one that drops no cached block.
 #[derive(Clone)]
 pub struct FetchPermit {
     generation: Arc<AtomicU64>,
@@ -533,8 +534,10 @@ struct Region {
 }
 
 /// Guest page size for SMC tracking (§10): the granularity at which a page is
-/// tagged "backs translated code" and at which a code-overlapping write triggers
-/// cache invalidation. Independent of any host page size.
+/// tagged "backs translated code". Invalidation within a tagged page is byte-precise,
+/// except that with a fetch policy installed a write notification invalidates the whole
+/// page, so revoked execute approval cannot leave a cached block runnable. Independent of
+/// any host page size.
 pub const CODE_PAGE_BITS: u32 = 12;
 pub(crate) const CODE_PAGE_SIZE: u64 = 1 << CODE_PAGE_BITS;
 
@@ -749,6 +752,66 @@ impl CodeAliases {
         found
     }
 
+    fn written_ranges(&self, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+        let page = lo >> CODE_PAGE_BITS;
+        if !self.registrations.contains_key(&page) {
+            return vec![(lo, hi)];
+        }
+        let mut seen: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+        let mut pending = vec![(lo, hi)];
+        while let Some((lo, hi)) = pending.pop() {
+            for page in code_page_range(lo, hi - lo) {
+                let lo = lo.max(page << CODE_PAGE_BITS);
+                let hi = hi.min((page + 1) << CODE_PAGE_BITS);
+                let covered = seen.entry(page).or_default();
+                let mut missing = Vec::new();
+                let mut cursor = lo;
+                for &(start, end) in covered.iter() {
+                    if cursor < start.min(hi) {
+                        missing.push((cursor, start.min(hi)));
+                    }
+                    cursor = cursor.max(end);
+                    if cursor >= hi {
+                        break;
+                    }
+                }
+                if cursor < hi {
+                    missing.push((cursor, hi));
+                }
+                if missing.is_empty() {
+                    continue;
+                }
+                covered.push((lo, hi));
+                covered.sort_unstable();
+                let mut merged: Vec<(u64, u64)> = Vec::new();
+                for &(start, end) in covered.iter() {
+                    if let Some(last) = merged.last_mut() {
+                        if start <= last.1 {
+                            last.1 = last.1.max(end);
+                            continue;
+                        }
+                    }
+                    merged.push((start, end));
+                }
+                *covered = merged;
+                if let Some(pairs) = self.registrations.get(&page) {
+                    for &(a, b, len) in pairs {
+                        for (from, to) in [(a, b), (b, a)] {
+                            for &(start, end) in &missing {
+                                let start = start.max(from);
+                                let end = end.min(from + len as u64);
+                                if start < end {
+                                    pending.push((to + (start - from), to + (end - from)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.into_values().flatten().collect()
+    }
+
     fn edges(a: u64, b: u64, len: usize, mut visit: impl FnMut(u64, u64)) {
         let mut offset = 0;
         while offset < len as u64 {
@@ -784,8 +847,8 @@ pub struct Memory {
     // SMC tracking (§10). `code_page[p]` = page `p` backs a translated block, so a
     // write to it must invalidate the cache. Atomic (not `&mut`) because it's set
     // through `&self` at block-resolve time and read on every store — the same
-    // shared-through-`&self` discipline as `backing`. `dirty` collects code pages
-    // written since the last drain; `dirty_flag` lets the hot path skip the lock.
+    // shared-through-`&self` discipline as `backing`. `dirty` collects page-bounded
+    // byte ranges written since the last drain; `dirty_flag` lets the hot path skip the lock.
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: Box<[AtomicU64]>,
@@ -795,7 +858,7 @@ pub struct Memory {
     // inlined stores gate on, so a store outside it skips the table entirely. See
     // `code_range_ptr` for why a watermark and not a table probe.
     code_range: AtomicU64,
-    dirty: Mutex<Vec<u64>>,
+    dirty: Mutex<Vec<(u64, u64)>>,
     dirty_flag: AtomicBool,
     dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
     // Embedder-registered DATA-range dirty tracking — a parallel facility to the SMC
@@ -1088,7 +1151,8 @@ impl Memory {
     /// The embedder must create the actual shared mappings and report every pair;
     /// undeclared aliases cannot be discovered by the engine. Either view may execute
     /// or be written. Duplicate declarations are idempotent; overlapping declarations
-    /// and multiple views are supported. Tracking is conservative at 4 KiB granularity.
+    /// and multiple views are supported. Page tags are conservative; written ranges
+    /// retain their byte offsets in every declared view.
     ///
     /// Both nonempty ranges must fit the backing. Registration is safe during guest
     /// execution; synchronize with the vCPU before relying on completion, as with
@@ -1300,7 +1364,7 @@ impl Memory {
     }
 
     /// Note a store of `size` bytes at `addr`: if it lands on a code page, record
-    /// the page(s) as dirty for the dispatcher to invalidate (§10). The common
+    /// the written byte ranges for the dispatcher to invalidate (§10). The common
     /// case (a non-code page) costs one relaxed atomic load and returns.
     ///
     /// `pub` because generated code reaches it too, through the helper the inlined
@@ -1336,7 +1400,11 @@ impl Memory {
         let watched = self.watch.count.load(Ordering::Relaxed) != 0;
         for page in code_page_range(addr, len as u64) {
             if self.is_code_page(page) {
-                self.note_code_write(page, observer);
+                let lo = addr.max(page << CODE_PAGE_BITS);
+                let hi = addr
+                    .saturating_add(len.max(1) as u64)
+                    .min((page + 1) << CODE_PAGE_BITS);
+                self.note_code_write(lo, hi, observer);
             }
             if watched && self.watch.is_watched(page) {
                 self.watch.mark_dirty(page);
@@ -1348,22 +1416,17 @@ impl Memory {
     // frame and register allocation, even when the code-page branch is never taken.
     #[cold]
     #[inline(never)]
-    fn note_code_write(&self, page: u64, observer: &impl InterpreterMemory) {
+    fn note_code_write(&self, lo: u64, hi: u64, observer: &impl InterpreterMemory) {
         let aliases = self.code_aliases.lock().unwrap();
-        let connected = aliases.connected(page);
-        // Direct writes retain byte precision. Alias declarations connect pages
-        // conservatively, including sub-page or differently aligned views (§10).
-        // Expand them before checking overlap with the executing block.
-        for &view in &connected {
-            if view != page {
-                observer.note_block_write(view << CODE_PAGE_BITS, CODE_PAGE_SIZE as usize);
-            }
-        }
-        let dirty: Vec<_> = connected
-            .into_iter()
-            .filter(|p| aliases.translated.contains(p))
-            .collect();
+        let mut dirty = aliases.written_ranges(lo, hi);
+        dirty.retain(|&(lo, hi)| {
+            observer.note_block_write(lo, (hi - lo) as usize);
+            aliases.translated.contains(&(lo >> CODE_PAGE_BITS))
+        });
         drop(aliases);
+        if dirty.is_empty() {
+            return;
+        }
         // Serialize notification and clearing with the drain. Exit bits in
         // these words are independent and must survive every SMC update.
         let mut words = self.dispatch_words.lock().unwrap();
@@ -1505,12 +1568,15 @@ impl Memory {
         }
         let _words = self.dispatch_words.lock().unwrap();
         self.take_dirty_code_locked()
+            .into_iter()
+            .map(|(lo, _)| lo >> CODE_PAGE_BITS)
+            .collect()
     }
 
     /// Serialize invalidation and this vcpu's acknowledgement with notifications
     /// and other dispatchers. A running vcpu must retain its own notice until it
     /// reaches dispatch, even if another vcpu already drained the global list.
-    pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(Vec<u64>)) {
+    pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(Vec<(u64, u64)>)) {
         if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 && !self.has_dirty_code() {
             return;
         }
@@ -1522,7 +1588,7 @@ impl Memory {
     }
 
     // Caller holds dispatch_words through any invalidation and acknowledgement.
-    fn take_dirty_code_locked(&self) -> Vec<u64> {
+    fn take_dirty_code_locked(&self) -> Vec<(u64, u64)> {
         // Something's dirty: claim it. A racing vcpu may have drained it already.
         if !self.dirty_flag.swap(false, Ordering::Relaxed) {
             return Vec::new();
@@ -2691,7 +2757,7 @@ mod tests {
         m.note_write(0x1000, 1);
         let pending = DISPATCH_DIRTY | other_notices;
         m.dispatch_smc(&b, |pages| {
-            assert_eq!(pages, vec![1]);
+            assert_eq!(pages, vec![(0x1000, 0x1001)]);
             assert_eq!(a.load(Ordering::Relaxed), pending);
             assert_eq!(b.load(Ordering::Relaxed), pending);
             assert!(m.dispatch_words.try_lock().is_err());
@@ -2711,6 +2777,34 @@ mod tests {
         assert_eq!(m.take_dirty_code(), vec![1]);
         assert_eq!(a.load(Ordering::Relaxed), pending);
         assert_eq!(b.load(Ordering::Relaxed), pending);
+    }
+
+    #[test]
+    fn dirty_bytes_expand_unaligned_transitive_aliases_without_losing_offsets() {
+        let m = Memory::new(MemoryModel::Flat { size: 0x10000 });
+        m.declare_code_alias(0x1003, 0x4ffe, 8).unwrap();
+        m.declare_code_alias(0x5000, 0x8007, 4).unwrap();
+        for addr in [0x1000, 0x4000, 0x5000, 0x8000] {
+            m.mark_code(addr, 1);
+        }
+        let word = Arc::new(AtomicU64::new(0));
+        m.register_dispatch_word(&word);
+        m.note_write(0x1004, 4);
+        m.dispatch_smc(&word, |ranges| {
+            assert_eq!(
+                ranges,
+                vec![
+                    (0x1004, 0x1008),
+                    (0x4fff, 0x5000),
+                    (0x5000, 0x5003),
+                    (0x8007, 0x800a)
+                ]
+            );
+        });
+        m.note_write(0x4ffe, 1);
+        m.dispatch_smc(&word, |ranges| {
+            assert_eq!(ranges, vec![(0x1003, 0x1004), (0x4ffe, 0x4fff)]);
+        });
     }
 
     fn flat(size: u64) -> Memory {

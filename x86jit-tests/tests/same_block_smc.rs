@@ -238,7 +238,9 @@ fn another_vcpu_clears_tag_before_running_block_patches_itself() {
             0xc6, 0x03, 0x17, 0xc6, 0x07, 0x42, 0x0f, 0xa2, 0xb0, 0, 0xf4,
         ],
     );
-    a.set_reg(Reg::Rbx, START + 0x100);
+    // Rewriting the first store's already-executed immediate evicts this unit
+    // under byte-precise invalidation, without touching its later instructions.
+    a.set_reg(Reg::Rbx, START + 2);
     a.set_reg(Reg::Rdi, START + 9);
     vm.write_bytes(0x9000, &[0xf4]).unwrap();
     let mut b = vm.new_vcpu();

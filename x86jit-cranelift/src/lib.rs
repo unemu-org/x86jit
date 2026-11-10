@@ -4457,6 +4457,14 @@ mod tests {
         vm.write_bytes(ENTRY, &code).unwrap();
         vm.write_bytes(0x4000, &[0xf4]).unwrap();
         vm.watch_range(0x8000, 8);
+        if !regions {
+            // Byte-precise invalidation needs an actual cached target. Without
+            // this warmup, only first is cached and the write is victim-free.
+            let mut warm = vm.new_vcpu();
+            warm.set_reg(Reg::Rip, ENTRY + 13);
+            warm.set_reg(Reg::Rax, 3);
+            assert!(matches!(warm.run(&vm, Some(32)), Exit::Hlt));
+        }
         let vm = Arc::new(vm);
         let mut a = vm.new_vcpu();
         a.set_reg(Reg::Rip, ENTRY);

@@ -1084,6 +1084,19 @@ Because guest code lies in a *data* buffer (the guest may modify it), a write to
 - On a write to such a page → remove the affected entries from the cache (with the JIT: also mark the host code as dead).
 - On the next execution → miss → re-lift from the changed bytes.
 
+Invalidation uses a page index to find candidate units, then compares their source
+byte spans with the accumulated write ranges. Disjoint writes preserve cached units,
+page tags and the dispatch epoch, so per-vCPU predictors remain warm. Every drained
+range advances a separate source-publication generation under the cache spans lock.
+Lifts and tier-ups snapshot it before reading source bytes or IR and reject publication
+if it changes, including when an uncached region successor was written and no cached
+unit overlapped. This conservatively retries unrelated in-flight work.
+
+With an installed fetch policy, write notifications invalidate the whole 4 KiB page:
+approval is page-wide, and `note_write` also reports protection changes. Surviving
+same-page cached code must not bypass a revoked approval. Byte precision applies only
+without a fetch policy. Unmap and child write-log invalidation remain conservative.
+
 **Shared mappings.** The embedder creates the shared host mappings and declares each
 pair of corresponding guest ranges with `Memory::declare_code_alias(a, b, len)`.
 Declarations are symmetric and idempotent; overlapping declarations and multiple views

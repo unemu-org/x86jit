@@ -68,6 +68,89 @@ pub enum CachedBlock {
     Compiled { entry: CompiledPtr },
 }
 
+// One lock protects both directions, preserving spans -> map -> hotness ->
+// tier_pending ordering and atomic page-tag publication (§10, §17.4).
+#[derive(Default)]
+struct SpanIndex {
+    units: HashMap<BlockKey, Vec<(u64, u32)>>,
+    pages: HashMap<u64, HashSet<BlockKey>>,
+}
+
+fn span_pages(start: u64, len: u32) -> std::ops::RangeInclusive<u64> {
+    (start >> crate::memory::CODE_PAGE_BITS)
+        ..=(start.saturating_add(u64::from(len).saturating_sub(1)) >> crate::memory::CODE_PAGE_BITS)
+}
+
+impl SpanIndex {
+    fn insert(&mut self, key: BlockKey, spans: Vec<(u64, u32)>) {
+        self.remove(&key);
+        for &(start, len) in &spans {
+            if len != 0 {
+                for page in span_pages(start, len) {
+                    self.pages.entry(page).or_default().insert(key);
+                }
+            }
+        }
+        self.units.insert(key, spans);
+    }
+
+    fn remove(&mut self, key: &BlockKey) {
+        if let Some(spans) = self.units.remove(key) {
+            for (start, len) in spans {
+                if len != 0 {
+                    for page in span_pages(start, len) {
+                        if let Some(keys) = self.pages.get_mut(&page) {
+                            keys.remove(key);
+                            if keys.is_empty() {
+                                self.pages.remove(&page);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn has_units(&self, lo: u64, hi: u64) -> bool {
+        if lo >= hi {
+            return false;
+        }
+        let first = lo >> crate::memory::CODE_PAGE_BITS;
+        let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
+        if last - first < self.pages.len() as u64 {
+            (first..=last).any(|page| self.pages.contains_key(&page))
+        } else {
+            self.pages
+                .keys()
+                .any(|page| first <= *page && *page <= last)
+        }
+    }
+
+    fn candidates(&self, lo: u64, hi: u64) -> HashSet<BlockKey> {
+        let mut keys = HashSet::new();
+        if lo >= hi {
+            return keys;
+        }
+        let first = lo >> crate::memory::CODE_PAGE_BITS;
+        let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
+        // Whole-cache/unmap requests can cover a sparse 64-bit address space.
+        if last - first < self.pages.len() as u64 {
+            for page in first..=last {
+                if let Some(entries) = self.pages.get(&page) {
+                    keys.extend(entries);
+                }
+            }
+        } else {
+            for (&page, entries) in &self.pages {
+                if first <= page && page <= last {
+                    keys.extend(entries);
+                }
+            }
+        }
+        keys
+    }
+}
+
 /// Shared translation cache. Cloned-out on `get` so no lock guard is held
 /// across block execution (which may mutate memory -> SMC invalidation) (§9.2).
 pub struct TranslationCache {
@@ -79,7 +162,7 @@ pub struct TranslationCache {
     // possibly non-contiguous. A write overlapping ANY span drops the whole unit
     // (§10) — SMC is address-scoped, so `invalidate_overlapping` matches spans by
     // address across every mode. Kept in lockstep with `map`.
-    spans: RwLock<HashMap<BlockKey, Vec<(u64, u32)>>>,
+    spans: RwLock<SpanIndex>,
     // Dispatcher stats (§12 M3): a miss means the block had to be lifted. `Relaxed`
     // — these are counters, not synchronization.
     hits: AtomicU64,
@@ -95,8 +178,11 @@ pub struct TranslationCache {
     // and flushes when it changes — the coherence channel for state that cannot be
     // reached by the backend's `invalidate_links` (esp. cross-thread invalidation).
     epoch: AtomicU64,
-    // A policy may have approved bytes still being lifted, before a cache span
-    // exists. Such invalidations must also reject in-flight region publications.
+    // Every invalidation cancels source reads still in flight, even if no cached
+    // span overlaps. Keep this separate so data writes preserve dispatch predictors.
+    publication_generation: AtomicU64,
+    // Policy/configuration changes also advance the dispatch epoch without
+    // victims; source publication is always canceled independently.
     pub(crate) invalidate_pending_fetches: bool,
     // IBTC descriptors (R4): immutable `[target, entry]` pairs published by pointer
     // into a per-site slot. Owned here (the dispatcher, in the core crate, allocates
@@ -147,12 +233,13 @@ impl TranslationCache {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
-            spans: RwLock::new(HashMap::new()),
+            spans: RwLock::new(SpanIndex::default()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             chained: AtomicU64::new(0),
             regions: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            publication_generation: AtomicU64::new(0),
             invalidate_pending_fetches: false,
             ibtc_descriptors: Mutex::new(Vec::new()),
             ibtc_filled: AtomicU64::new(0),
@@ -195,29 +282,25 @@ impl TranslationCache {
         self.region_decision.write().unwrap().insert(key, candidate);
     }
 
-    /// Replace a cached block's materialization (interpreted → compiled) in place,
-    /// re-establishing its guest `span` so SMC invalidation still finds it and
-    /// dropping the now-useless hotness counter. Returns `false` (and changes
-    /// nothing) if an `invalidate_overlapping` dropped the unit since the caller
-    /// snapshotted `since_epoch` — that means the block's page was written under us,
-    /// so the freshly compiled block is already stale. Resurrecting it here (map
-    /// entry with no span) would make it permanently invisible to future
-    /// invalidation; the caller must re-lift instead.
+    /// Replace a cached block's materialization (interpreted → compiled), retaining
+    /// its span and dropping its hotness counter. `since_generation` must be read
+    /// from [`Self::publication_generation`] before fetching source bytes or IR.
+    /// Returns `false` without changes if an invalidation has intervened; the
+    /// caller must re-lift rather than resurrect a stale translation.
     #[must_use]
     pub fn upgrade(
         &self,
         key: BlockKey,
         block: CachedBlock,
         span: (u64, u32),
-        since_epoch: u64,
+        since_generation: u64,
     ) -> bool {
         // Lock order matches `invalidate_overlapping` (spans → map → hotness) so the
-        // two can't deadlock. Holding spans+map write locks serializes this against a
-        // concurrent SMC drop, which bumps `epoch` while holding those same locks —
-        // so the epoch check below cannot race a half-completed invalidation.
+        // two can't deadlock. The spans lock keeps the generation check and
+        // publication atomic with respect to invalidation.
         let mut spans = self.spans.write().unwrap();
         let mut map = self.map.write().unwrap();
-        if self.epoch.load(Ordering::Acquire) != since_epoch {
+        if self.publication_generation.load(Ordering::Acquire) != since_generation {
             return false;
         }
         spans.insert(key, vec![span]);
@@ -226,25 +309,22 @@ impl TranslationCache {
         true
     }
 
-    /// Publish a background-compiled unit that may span **multiple** sub-blocks:
-    /// [`upgrade`](Self::upgrade)'s epoch-reject + hotness-drop, but storing a span
-    /// *list* and re-tagging every span's pages via `on_mark` (as
-    /// [`insert`](Self::insert) does) under the spans lock. A block finish passes a
-    /// one-element list; `mark_code` is idempotent, so re-tagging its already-tagged page
-    /// is harmless. Returns `false` (changing nothing) if an SMC drop moved the epoch
-    /// since `since_epoch` — the caller must re-lift instead of resurrecting a stale unit.
+    /// Publish a background-compiled unit with one source span per sub-block.
+    /// Uses [`Self::upgrade`]'s generation check and hotness removal, re-tagging
+    /// every span's pages via `on_mark` under the spans lock. Returns `false`
+    /// without changes if invalidation advanced `since_generation`.
     #[must_use]
     pub fn upgrade_region(
         &self,
         key: BlockKey,
         block: CachedBlock,
         spans: Vec<(u64, u32)>,
-        since_epoch: u64,
+        since_generation: u64,
         on_mark: impl FnOnce(&[(u64, u32)]),
     ) -> bool {
         let mut sp = self.spans.write().unwrap();
         let mut mp = self.map.write().unwrap();
-        if self.epoch.load(Ordering::Acquire) != since_epoch {
+        if self.publication_generation.load(Ordering::Acquire) != since_generation {
             return false;
         }
         on_mark(&spans);
@@ -312,6 +392,14 @@ impl TranslationCache {
     /// local predictor caches when the value changes.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Source-publication generation. Snapshot before fetching source bytes or
+    /// cached IR; insertion and upgrades check it under the spans lock. Every
+    /// invalidation advances it, including writes with no overlapping cached unit.
+    /// This does not flush vCPU dispatch predictors (see [`Self::epoch`]).
+    pub fn publication_generation(&self) -> u64 {
+        self.publication_generation.load(Ordering::Acquire)
     }
 
     /// Look up a block, recording a hit (found) or miss (must lift).
@@ -400,7 +488,7 @@ impl TranslationCache {
         self.tier_bg_published.load(Ordering::Relaxed)
     }
 
-    /// Record a background tier-up completion rejected at publish (epoch moved or
+    /// Record a background tier-up completion rejected at publish (generation moved or
     /// the block was invalidated while its compile was in flight).
     pub fn record_tier_bg_rejected(&self) {
         self.tier_bg_rejected.fetch_add(1, Ordering::Relaxed);
@@ -447,25 +535,23 @@ impl TranslationCache {
     }
 
     /// SMC invalidation (§10): drop every cached unit *any* of whose guest spans
-    /// overlaps `[lo, hi)` and report their entry addresses. A linear scan — only
-    /// run when a write actually lands on a code page (rare), so no index needed.
+    /// overlaps `[lo, hi)` and report their entry addresses. Only units indexed on
+    /// the touched pages are checked, across every decode/FP mode.
     ///
-    /// `[lo, hi)` is one guest page. `on_clear_page` clears that page's SMC tag
-    /// (§10) and runs **under the spans lock**, right after the overlapping units are
-    /// removed. Because it removes *every* span overlapping the page before clearing,
-    /// no live block's page is ever left cleared, and because both this clear and
-    /// `insert`'s `on_mark` hold the spans lock, a concurrent insert can't interleave
-    /// — it either publishes its span before us (we then drop it as a victim) or marks
-    /// the tag after us (so the tag survives). A two-step `invalidate` then
-    /// `clear_code_page` would leave a window where the insert's mark lands in between
-    /// and gets wiped.
+    /// `on_clear_page` runs under the spans lock, only when no unit remains on
+    /// any page touched by `[lo, hi)`. Thus byte-precise writes preserve live page
+    /// tags, and a concurrent insert cannot have its mark wiped by a late clear.
     pub fn invalidate_overlapping(
         &self,
         lo: u64,
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<false>(lo, hi, on_clear_page)
+        self.invalidate_range::<false>(lo, hi, |empty| {
+            if empty {
+                on_clear_page();
+            }
+        })
     }
 
     pub(crate) fn invalidate_child_written(
@@ -474,30 +560,44 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<true>(lo, hi, on_clear_page)
+        self.invalidate_range::<true>(lo, hi, |empty| {
+            if empty {
+                on_clear_page();
+            }
+        })
+    }
+
+    // Drained writes serialize with source publication, including victim-free writes.
+    pub(crate) fn invalidate_written(
+        &self,
+        lo: u64,
+        hi: u64,
+        on_write: impl FnOnce(bool),
+    ) -> Vec<BlockKey> {
+        self.invalidate_range::<false>(lo, hi, on_write)
     }
 
     fn invalidate_range<const CHILD: bool>(
         &self,
         lo: u64,
         hi: u64,
-        on_clear_page: impl FnOnce(),
+        on_write: impl FnOnce(bool),
     ) -> Vec<BlockKey> {
         let mut spans = self.spans.write().unwrap();
-        let mut map = self.map.write().unwrap();
         // SMC is address-scoped: a write to `[lo, hi)` drops every overlapping unit
         // regardless of the mode it was lifted under (§17.4 — the key carries the mode,
         // but invalidation matches by span address across all modes).
         let victims: Vec<BlockKey> = spans
-            .iter()
-            .filter(|(_, ranges)| {
-                ranges
+            .candidates(lo, hi)
+            .into_iter()
+            .filter(|key| {
+                spans.units[key]
                     .iter()
-                    .any(|(start, len)| *start < hi && lo < *start + *len as u64)
+                    .any(|(start, len)| *start < hi && lo < start.saturating_add(u64::from(*len)))
             })
-            .map(|(entry, _)| *entry)
             .collect();
-        if !victims.is_empty() {
+        let mut map = (!victims.is_empty()).then(|| self.map.write().unwrap());
+        if let Some(map) = map.as_mut() {
             let mut hotness = self.hotness.write().unwrap();
             // Innermost lock (spans -> map -> hotness -> tier_pending): drop any
             // in-flight background tier-up marker for a victim so a later completion
@@ -510,14 +610,10 @@ impl TranslationCache {
                 pending.remove(entry);
             }
         }
-        // Every unit touching the page is now gone, so the tag is stale — clear it
-        // here, still holding the spans lock.
-        on_clear_page();
-        // With a policy, an uncached region successor may already be approved
-        // in an in-flight lift, so even a victim-free invalidation rejects it.
-        // A child log also cancels a first publication still compiling without
-        // a cached span. Otherwise data writes retain the existing epoch. `Release` pairs with
-        // the `Acquire` load in `epoch()`.
+        on_write(!spans.has_units(lo, hi));
+        // A source span may have been read but not cached yet. Reject its
+        // publication even when all currently cached spans survive this write.
+        self.publication_generation.fetch_add(1, Ordering::Release);
         if CHILD || !victims.is_empty() || self.invalidate_pending_fetches {
             self.epoch.fetch_add(1, Ordering::Release);
         }
@@ -546,13 +642,67 @@ mod tests {
         BlockKey::new(addr, CpuMode::Long64)
     }
 
-    /// No race: a tier-up whose epoch snapshot still matches commits, and the block
+    #[test]
+    fn byte_overlap_keeps_other_modes_and_crossing_page_tags() {
+        let c = TranslationCache::new();
+        let crossing = k(0x1ffe);
+        let modes = [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16];
+        c.insert(crossing, compiled(), vec![(0x1ffe, 4)], |_| {});
+        for mode in modes {
+            for mxcsr in [0, 0x2000] {
+                let key = BlockKey::with_mxcsr(0x2100, mode, mxcsr);
+                c.insert(key, compiled(), vec![(0x2100, 8)], |_| {});
+            }
+        }
+        let epoch = c.epoch();
+        assert!(c
+            .invalidate_overlapping(0x2f00, 0x2f01, || panic!("live page"))
+            .is_empty());
+        assert_eq!(c.epoch(), epoch);
+        assert_eq!(
+            c.invalidate_overlapping(0x2000, 0x2001, || panic!("live page")),
+            vec![crossing]
+        );
+        let spans = c.spans.read().unwrap();
+        assert!(!spans.pages.contains_key(&1));
+        assert_eq!(spans.pages[&2].len(), 6);
+        drop(spans);
+        let victims = c.invalidate_overlapping(0x2107, 0x2108, || {});
+        assert_eq!(victims.len(), 6);
+        assert!(c.spans.read().unwrap().pages.is_empty());
+    }
+
+    #[test]
+    fn replacement_and_region_upgrade_update_every_page() {
+        let c = TranslationCache::new();
+        let key = k(0x1000);
+        c.insert(key, compiled(), vec![(0x1000, 4), (0x3ffe, 4)], |_| {});
+        c.insert(key, compiled(), vec![(0x5000, 2)], |_| {});
+        assert!(c.invalidate_overlapping(0x1000, 0x5000, || {}).is_empty());
+        assert!(c.upgrade(key, compiled(), (0x6000, 2), c.publication_generation()));
+        assert!(c.invalidate_overlapping(0x5000, 0x6000, || {}).is_empty());
+        assert!(c.upgrade_region(
+            key,
+            compiled(),
+            vec![(0x7fff, 2), (0xa000, 4)],
+            c.publication_generation(),
+            |_| {}
+        ));
+        assert!(c.invalidate_overlapping(0x6000, 0x7000, || {}).is_empty());
+        assert_eq!(c.invalidate_overlapping(0x8000, 0x8001, || {}), vec![key]);
+        assert!(c.spans.read().unwrap().pages.is_empty());
+        c.insert(key, compiled(), vec![(0x1000, 4), (0xffff_0000, 4)], |_| {});
+        assert_eq!(c.invalidate_overlapping(0, u64::MAX, || {}), vec![key]);
+        assert!(c.spans.read().unwrap().pages.is_empty());
+    }
+
+    /// No race: a tier-up whose generation still matches commits, and the block
     /// stays invalidatable (its span is present).
     #[test]
     fn tier_up_commits_and_keeps_span() {
         let c = TranslationCache::new();
         c.insert(k(0x1000), compiled(), vec![(0x1000, 4)], |_| {});
-        let e = c.epoch();
+        let e = c.publication_generation();
         assert!(c.upgrade(k(0x1000), compiled(), (0x1000, 4), e));
         // A later write to the block's page must still find it via its span.
         assert_eq!(
@@ -561,15 +711,15 @@ mod tests {
         );
     }
 
-    /// An `invalidate_overlapping` drops the unit (bumping the epoch)
-    /// between the tier-up's epoch snapshot and its `upgrade`. `upgrade` must reject
+    /// An `invalidate_overlapping` drops the unit between the tier-up's generation
+    /// snapshot and its `upgrade`. `upgrade` must reject
     /// the stale compile rather than resurrect a spanless — permanently
     /// uninvalidatable — block.
     #[test]
     fn tier_up_rejected_when_invalidated_mid_upgrade() {
         let c = TranslationCache::new();
         c.insert(k(0x1000), compiled(), vec![(0x1000, 4)], |_| {});
-        let e = c.epoch(); // snapshot BEFORE the racing invalidation
+        let e = c.publication_generation(); // snapshot BEFORE the racing invalidation
 
         // Concurrent SMC drop: removes the unit and bumps the epoch.
         assert_eq!(
@@ -578,7 +728,7 @@ mod tests {
         );
         assert!(c.get(k(0x1000)).is_none(), "invalidation dropped the block");
 
-        // The stale tier-up now tries to commit with the pre-drop epoch.
+        // The stale tier-up now tries to commit with the pre-drop generation.
         assert!(
             !c.upgrade(k(0x1000), compiled(), (0x1000, 4), e),
             "upgrade must reject a compile the SMC drop raced past"

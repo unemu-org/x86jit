@@ -940,3 +940,128 @@ fn shutdown_wait_idle_race_finishes_compiler_destruction() {
     );
     assert_eq!(clean_but_retained, 0, "Ok(0 outstanding handles) returned before Shared destruction completed on diagnostic thread");
 }
+
+#[test]
+fn victim_free_drain_rejects_background_region_with_uncached_successor() {
+    use std::sync::Arc;
+    use x86jit_core::{BlockKey, CachedBlock, CpuMode, TierUpUnit};
+    const SUCCESSOR: u64 = CODE + 0x100;
+    // Observe that this request really contains the uncached successor's old IR.
+    struct ObservedRegionBackend {
+        jit: JitBackend,
+        submitted: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Backend for ObservedRegionBackend {
+        fn materialize(
+            &self,
+            ir: &x86jit_core::IrBlock,
+            c: x86jit_core::MemConsistency,
+            m: Option<(u64, u64)>,
+            b: u64,
+        ) -> CachedBlock {
+            self.jit.materialize(ir, c, m, b)
+        }
+        fn region_caps(&self) -> Option<RegionCaps> {
+            self.jit.region_caps()
+        }
+        fn tier_up_async(&self, req: x86jit_core::TierUpRequest) -> x86jit_core::TierUpSubmit {
+            if req.pc == CODE {
+                assert!(
+                    matches!(&req.unit, TierUpUnit::Region(r) if r.blocks.iter().any(|b| b.guest_start == SUCCESSOR))
+                );
+                self.submitted
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.jit.tier_up_async(req)
+        }
+        fn tier_up_finished(&self) -> Vec<x86jit_core::TierUpFinished> {
+            self.jit.tier_up_finished()
+        }
+        fn invalidate_links(&self) {
+            self.jit.invalidate_links();
+        }
+    }
+    let jit = JitBackend::with_superblocks(RegionCaps {
+        max_blocks: 8,
+        max_icount: 128,
+    });
+    let handle = jit.tier_up_handle();
+    let pause = handle.pause_compiler();
+    let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut vm = Vm::with_backend(
+        VmConfig::flat(0x5000),
+        Box::new(ObservedRegionBackend {
+            jit,
+            submitted: submitted.clone(),
+        }),
+    );
+    vm.set_tier_up_after(Some(1));
+    vm.set_tier_up_background(true);
+    vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.jmp(SUCCESSOR).unwrap();
+    vm.write_bytes(CODE, &a.assemble(CODE).unwrap()).unwrap();
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(eax, 1).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(CODE).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(SUCCESSOR, &a.assemble(SUCCESSOR).unwrap())
+        .unwrap();
+    vm.write_bytes(0x4000, &[0xf4]).unwrap();
+    let ir = x86jit_core::lift::lift_block(
+        &vm.mem,
+        x86jit_core::lift::FetchAddr::flat(CODE),
+        CpuMode::Long64,
+    )
+    .unwrap();
+    let span = (CODE, ir.guest_len);
+    vm.cache.insert(
+        BlockKey::new(CODE, CpuMode::Long64),
+        CachedBlock::Interpreted(Arc::new(ir)),
+        vec![span],
+        |_| vm.mem.mark_code(span.0, span.1),
+    );
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rcx, 2);
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    assert!(submitted.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(vm.cache.tier_pending_len(), 1);
+    assert!(vm
+        .cache
+        .get(BlockKey::new(SUCCESSOR, CpuMode::Long64))
+        .is_none());
+    let epoch = vm.cache.epoch();
+    vm.write_bytes(SUCCESSOR + 1, &[2]).unwrap();
+    let mut drain = vm.new_vcpu();
+    drain.set_reg(Reg::Rip, 0x4000);
+    assert!(matches!(drain.run(&vm, Some(10)), Exit::Hlt));
+    assert!(!vm.mem.has_dirty_code());
+    assert_eq!(vm.cache.epoch(), epoch, "the cached entry survives");
+    drop(pause);
+    handle.wait_idle();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rcx, 2);
+    assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+    assert_eq!(
+        cpu.reg(Reg::Rax),
+        2,
+        "stale successor IR must not be published"
+    );
+    assert!(vm.cache.tier_bg_rejected() > 0);
+    handle.wait_idle();
+    cpu.set_reg(Reg::Rip, CODE);
+    cpu.set_reg(Reg::Rcx, 2);
+    assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+    assert_eq!(cpu.reg(Reg::Rax), 2);
+    assert!(
+        vm.cache.tier_bg_published() > 0,
+        "fresh region can still publish"
+    );
+    assert!(matches!(
+        vm.cache.get(BlockKey::new(CODE, CpuMode::Long64)),
+        Some(CachedBlock::Compiled { .. })
+    ));
+    assert_eq!(vm.cache.tier_pending_len(), 0);
+}
