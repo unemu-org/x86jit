@@ -72,6 +72,20 @@ struct GuestTrap {
 enum CompileError {
     DescriptorLimit,
     Unavailable,
+    BackendError,
+    /// A caught panic: the payload does not say whether the unit caused it.
+    Panicked,
+}
+
+impl CompileError {
+    fn reason(self) -> x86jit_core::CompileFailureReason {
+        match self {
+            Self::DescriptorLimit => x86jit_core::CompileFailureReason::DescriptorLimit,
+            Self::Unavailable => x86jit_core::CompileFailureReason::CodeSpace,
+            Self::BackendError => x86jit_core::CompileFailureReason::OtherBackendError,
+            Self::Panicked => x86jit_core::CompileFailureReason::Unclassified,
+        }
+    }
 }
 
 fn prepare_guest_traps(
@@ -102,13 +116,13 @@ fn prepare_guest_traps(
                 continue;
             };
             let Some((access, width)) = codegen::guest_trap_access(code) else {
-                return Err(CompileError::Unavailable);
+                return Err(CompileError::BackendError);
             };
             let source = func.srcloc(inst);
             let guest_rip = *guest_rips
                 .get(source.bits() as usize)
                 .filter(|_| !source.is_default())
-                .ok_or(CompileError::Unavailable)?;
+                .ok_or(CompileError::BackendError)?;
             let descriptor = GuestTrap {
                 guest_rip,
                 access,
@@ -146,19 +160,19 @@ fn prepare_guest_traps(
 fn collect_guest_traps(
     code: &cranelift::codegen::CompiledCode,
     metadata: &[GuestTrap],
-) -> Result<Vec<GuestTrapSite>, ()> {
+) -> Result<Vec<GuestTrapSite>, CompileError> {
     // Validate before reserving: no unclassified traps may be silently dropped.
     // Reserve exactly the records retained by the code map.
     for trap in code.buffer.traps() {
         let index = trap.code.as_raw().get() as usize - 1;
         if metadata.get(index).is_none() {
-            return Err(());
+            return Err(CompileError::BackendError);
         }
     }
     let mut sites = Vec::new();
     sites
         .try_reserve_exact(code.buffer.traps().len())
-        .map_err(|_| ())?;
+        .map_err(|_| CompileError::Unavailable)?;
     for trap in code.buffer.traps() {
         let descriptor = metadata[trap.code.as_raw().get() as usize - 1];
         sites.push(GuestTrapSite {
@@ -2633,7 +2647,60 @@ pub struct CompiledCode {
     pub kind: CompiledCodeKind,
 }
 
-type CodeObserver = Arc<dyn Fn(CompiledCode) + Send + Sync>;
+type Observer<T> = Arc<dyn Fn(T) + Send + Sync>;
+type CodeObserver = Observer<CompiledCode>;
+
+/// A failed block or region compilation, including its input size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileFailure {
+    pub guest_rip: u64,
+    pub kind: CompiledCodeKind,
+    pub reason: x86jit_core::CompileFailureReason,
+    /// Sum of the unit's source byte spans.
+    pub guest_bytes: u64,
+    pub instructions: u64,
+    pub ir_ops: usize,
+    pub blocks: usize,
+}
+
+impl CompileFailure {
+    fn for_blocks<'a>(
+        guest_rip: u64,
+        kind: CompiledCodeKind,
+        error: CompileError,
+        blocks: impl IntoIterator<Item = &'a IrBlock>,
+    ) -> Self {
+        let mut event = Self {
+            guest_rip,
+            kind,
+            reason: error.reason(),
+            guest_bytes: 0,
+            instructions: 0,
+            ir_ops: 0,
+            blocks: 0,
+        };
+        for block in blocks {
+            event.guest_bytes += u64::from(block.guest_len);
+            event.instructions += u64::from(block.icount);
+            event.ir_ops += block.ops.len();
+            event.blocks += 1;
+        }
+        event
+    }
+
+    fn for_request(req: &TierUpRequest, error: CompileError) -> Self {
+        match &req.unit {
+            TierUpUnit::Block(block) => {
+                Self::for_blocks(req.pc, CompiledCodeKind::Block, error, [block.as_ref()])
+            }
+            TierUpUnit::Region(region) => {
+                Self::for_blocks(req.pc, CompiledCodeKind::Region, error, &region.blocks)
+            }
+        }
+    }
+}
+
+type FailureObserver = Observer<CompileFailure>;
 
 /// Compiler entry point supplied to an embedder's worker spawner.
 pub type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
@@ -2707,6 +2774,7 @@ struct Shared {
     icount: AtomicBool,
     flag_elision: AtomicBool,
     observer: Mutex<Option<CodeObserver>>,
+    failure_observer: Mutex<Option<FailureObserver>>,
     offsets: CpuOffsets,
     /// Superblock caps (§12 M5-T3), or `None` to compile one block at a time.
     caps: Option<RegionCaps>,
@@ -2737,6 +2805,12 @@ impl Drop for Shared {
     fn drop(&mut self) {
         let observer = self
             .observer
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop_observer_value(observer);
+        let observer = self
+            .failure_observer
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .take();
@@ -2924,6 +2998,8 @@ impl JitBackend {
     /// unwind guard; a secondary panic payload from cleanup is intentionally forgotten.
     /// Already-started notifications may finish. A replacement installed by the callback
     /// is retained. This does not intercept process aborts or double-panic aborts.
+    /// A background callback must not call [`TierUpHandle::wait_idle`] on the same
+    /// backend: its own compilation is not yet done, so the call never returns.
     ///
     /// Code ranges remain allocated for the backend's lifetime. Before code can be
     /// released or reused, this API must gain a matching released event.
@@ -2933,6 +3009,30 @@ impl JitBackend {
     ) {
         let observer: CodeObserver = Arc::new(observer);
         let previous = self.shared.observer.lock().unwrap().replace(observer);
+        drop_observer_value(previous);
+    }
+
+    /// Observe failed foreground and background compilations, including publication
+    /// failures. The event includes the guest entry, unit kind, reason and input size.
+    /// Called on the compiling thread outside compiler, queue and observer locks.
+    /// Callbacks may overlap and re-enter the backend. The panic containment and
+    /// replacement rules are the same as [`Self::set_compiled_code_observer`].
+    /// Stale fetch permits are cancellations and produce no failure event.
+    ///
+    /// A background callback runs before its own compilation is counted as done,
+    /// so it must not call [`TierUpHandle::wait_idle`] on the same backend: that
+    /// call would wait for the callback itself and never return.
+    pub fn set_compile_failure_observer(
+        &self,
+        observer: impl Fn(CompileFailure) + Send + Sync + 'static,
+    ) {
+        let observer: FailureObserver = Arc::new(observer);
+        let previous = self
+            .shared
+            .failure_observer
+            .lock()
+            .unwrap()
+            .replace(observer);
         drop_observer_value(previous);
     }
 
@@ -3028,6 +3128,7 @@ impl JitBackend {
                 icount: AtomicBool::new(false),
                 flag_elision: AtomicBool::new(true),
                 observer: Mutex::new(None),
+                failure_observer: Mutex::new(None),
                 helper_counters: (0..MAX_HELPERS)
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>()
@@ -3359,6 +3460,14 @@ impl Shared {
             precise_split_stores,
             self.foreground_publication(),
         )
+        .inspect_err(|error| {
+            self.observe_failure(CompileFailure::for_blocks(
+                ir.guest_start,
+                CompiledCodeKind::Block,
+                *error,
+                [ir],
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3418,6 +3527,14 @@ impl Shared {
             precise_split_stores,
             self.foreground_publication(),
         )
+        .inspect_err(|error| {
+            self.observe_failure(CompileFailure::for_blocks(
+                region.entry,
+                CompiledCodeKind::Region,
+                *error,
+                &region.blocks,
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3814,13 +3931,16 @@ impl Shared {
                 sites
                     .try_reserve_exact(usize::MAX)
                     .map(|()| sites)
-                    .map_err(|_| ())
+                    .map_err(|_| CompileError::Unavailable)
             } else {
                 trap_sites
             };
             let trap_sites = match trap_sites {
                 Ok(sites) => sites,
-                Err(_) => return self.exhaust_code_space().ok_or(CompileError::Unavailable),
+                Err(CompileError::Unavailable) => {
+                    return self.exhaust_code_space().ok_or(CompileError::Unavailable)
+                }
+                Err(error) => return Err(error),
             };
             let table: Vec<(u32, u32)> = cc
                 .buffer
@@ -3955,13 +4075,21 @@ impl Shared {
     }
 
     fn observe(&self, code: CompiledCode) {
-        let observer = self.observer.lock().unwrap().clone();
+        Self::notify_observer(&self.observer, code);
+    }
+
+    fn observe_failure(&self, event: CompileFailure) {
+        Self::notify_observer(&self.failure_observer, event);
+    }
+
+    fn notify_observer<T>(slot: &Mutex<Option<Observer<T>>>, event: T) {
+        let observer = slot.lock().unwrap().clone();
         if let Some(observer) = observer {
             if let Err(payload) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(code)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(event)))
             {
                 let disabled = {
-                    let mut current = self.observer.lock().unwrap();
+                    let mut current = slot.lock().unwrap();
                     if current
                         .as_ref()
                         .is_some_and(|value| Arc::ptr_eq(value, &observer))
@@ -3976,7 +4104,7 @@ impl Shared {
                 use std::io::Write as _;
                 let _ = writeln!(
                     std::io::stderr(),
-                    "x86jit: compiled-code observer panicked; that observer is disabled"
+                    "x86jit: compiler observer panicked; that observer is disabled"
                 );
             }
             drop_observer_value(observer);
@@ -4034,6 +4162,12 @@ impl Shared {
     ) -> Result<PendingCode, CompileError> {
         if permit.is_some_and(|p| !p.is_current()) {
             return Err(CompileError::Unavailable);
+        }
+        #[cfg(test)]
+        if self.fail_compile_stage.load(Ordering::Relaxed) == 5 {
+            self.compile_result(Err(ModuleError::Backend(
+                std::io::Error::from_raw_os_error(libc::EACCES).into(),
+            )));
         }
         let defer = |_: &Self, _: &mut Jit, code| Ok((code, None));
         match &req.unit {
@@ -4095,7 +4229,15 @@ impl Shared {
                 };
                 let Some(queued) = queued else { break };
                 let completion = CompileCompletion(self);
-                let code = self.define_request(&queued.request, queued.fetch_permit.as_ref());
+                let code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.define_request(&queued.request, queued.fetch_permit.as_ref())
+                })) {
+                    Ok(code) => code,
+                    Err(payload) => {
+                        drop_observer_value(payload);
+                        Err(CompileError::Panicked)
+                    }
+                };
                 let block = Self::interpreted_request(&queued.request);
                 batch.push((queued, code, block, completion));
                 if batch.len() == TIER_FINALIZE_BATCH {
@@ -4107,6 +4249,7 @@ impl Shared {
             // all remaining definitions, exactly as on the synchronous path.
             let started = Instant::now();
             let mut finalized_entries = Vec::with_capacity(batch.len());
+            let mut panic_payloads = Vec::new();
             {
                 let _serial = self.lock_telemetry.lock(
                     &self.compile_serial,
@@ -4120,41 +4263,80 @@ impl Shared {
                         continue;
                     }
                     let mut jit = self.jit(u32::from(nondefault));
-                    let finalized = self.finalize_module(&mut jit).is_ok();
+                    let finalized =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.finalize_module(&mut jit)
+                        })) {
+                            Ok(result) => result,
+                            Err(payload) => {
+                                panic_payloads.push(payload);
+                                Err(CompileError::Panicked)
+                            }
+                        };
                     for (index, (queued, code, _, _)) in batch.iter_mut().enumerate() {
                         if (queued.request.mxcsr_mode != 0) != nondefault {
                             continue;
                         }
-                        let code = std::mem::replace(code, Err(CompileError::Unavailable));
-                        if let Ok(code) = code {
-                            if finalized && !self.code_space_exhausted.load(Ordering::Acquire) {
-                                let entry = CompiledPtr(jit.module.get_finalized_function(code.id));
-                                finalized_entries.push((index, entry, code));
+                        if code.is_ok() {
+                            let pending = std::mem::replace(
+                                code,
+                                Err(finalized.err().unwrap_or(CompileError::Unavailable)),
+                            )
+                            .unwrap();
+                            if finalized.is_ok()
+                                && !self.code_space_exhausted.load(Ordering::Acquire)
+                            {
+                                let entry =
+                                    CompiledPtr(jit.module.get_finalized_function(pending.id));
+                                finalized_entries.push((index, entry, pending));
                             }
                         }
                     }
                 }
+            }
+            for payload in panic_payloads {
+                drop_observer_value(payload);
             }
             // Registration can allocate O(log n) codemap nodes per definition;
             // keep that batch work outside the compiler locks so foreground
             // compilation waits only for a definition or module finalization.
             for (index, entry, code) in finalized_entries {
                 if !self.code_space_exhausted.load(Ordering::Acquire) {
-                    if let Ok((entry, event)) = self.publish(entry, code) {
-                        batch[index].2 = CachedBlock::Compiled { entry };
-                        self.observe(event);
+                    match self.publish(entry, code) {
+                        Ok((entry, event)) => {
+                            batch[index].2 = CachedBlock::Compiled { entry };
+                            self.observe(event);
+                        }
+                        Err(error) => batch[index].1 = Err(error),
                     }
                 }
             }
             self.compile_ns
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            for (queued, code, block, _) in &batch {
+                if matches!(block, CachedBlock::Interpreted(_))
+                    && queued.fetch_permit.as_ref().is_none_or(|p| p.is_current())
+                {
+                    self.observe_failure(CompileFailure::for_request(
+                        &queued.request,
+                        *code.as_ref().err().expect("failed compile has a reason"),
+                    ));
+                }
+            }
             let mut done = self.done.lock().unwrap();
-            for (queued, _, block, _) in &mut batch {
+            for (queued, code, block, _) in &mut batch {
                 let req = &mut queued.request;
                 let block = std::mem::replace(block, Self::interpreted_request(req));
                 done.push(TierUpFinished {
                     pc: req.pc,
                     mxcsr_mode: req.mxcsr_mode,
+                    compile_failure: if matches!(block, CachedBlock::Interpreted(_))
+                        && queued.fetch_permit.as_ref().is_none_or(|p| p.is_current())
+                    {
+                        code.as_ref().err().copied().map(CompileError::reason)
+                    } else {
+                        None
+                    },
                     block,
                     spans: std::mem::take(&mut req.spans),
                     epoch: req.epoch,
@@ -5191,6 +5373,9 @@ mod tests {
         jit.shared
             .fail_compile_stage
             .store(stage, Ordering::Relaxed);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        jit.set_compile_failure_observer(move |event| observed.lock().unwrap().push(event));
         let handle = jit.tier_up_handle();
         let compiler = Arc::downgrade(&jit.shared);
         let mut vm = Vm::with_backend(VmConfig::flat(0x2000), Box::new(jit));
@@ -5256,6 +5441,28 @@ mod tests {
             vm.memory_stats().cache.tier_bg_rejected_compile_failed,
             u64::from(background)
         );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].reason,
+            x86jit_core::CompileFailureReason::CodeSpace
+        );
+        assert_eq!(events[0].guest_rip, ENTRY);
+        assert_eq!(
+            events[0].kind,
+            if region {
+                CompiledCodeKind::Region
+            } else {
+                CompiledCodeKind::Block
+            }
+        );
+        assert!(events[0].guest_bytes > 0 && events[0].instructions > 0);
+        drop(events);
+        let stats = vm.memory_stats().cache;
+        assert_eq!(stats.tier_bg_failed_code_space, u64::from(background));
+        assert_eq!(stats.tier_bg_failed_descriptor_limit, 0);
+        assert_eq!(stats.tier_bg_failed_other_backend, 0);
+        assert_eq!(stats.tier_bg_interpreter_only, 0);
         assert_eq!(vm.cache.regions(), 0);
         let CachedBlock::Interpreted(retained) = vm.cache.get(key).unwrap() else {
             panic!("failed compilation must leave the interpreted cache entry");
@@ -5293,6 +5500,94 @@ mod tests {
         for stage in 1..=3 {
             assert_tier_failure_recovers(stage, true, true);
         }
+    }
+
+    #[test]
+    fn background_backend_panic_is_not_suppressed_and_worker_survives() {
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+        let jit = JitBackend::new();
+        jit.shared.fail_compile_stage.store(5, Ordering::Relaxed);
+        let compiler = Arc::downgrade(&jit.shared);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let weak = compiler.clone();
+        jit.set_compile_failure_observer(move |event| {
+            let compiler = weak.upgrade().unwrap();
+            assert!(compiler.compile_serial.try_lock().is_ok());
+            assert!(compiler.inner.try_lock().is_ok());
+            assert!(compiler.background.queue.try_lock().is_ok());
+            observed.lock().unwrap().push(event);
+        });
+        let handle = jit.tier_up_handle();
+        let mut vm = Vm::with_backend(VmConfig::flat(0x4000), Box::new(jit));
+        vm.set_tier_up_after(Some(1));
+        vm.set_tier_up_background(true);
+        vm.map(ENTRY, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+        vm.write_bytes(ENTRY, CODE).unwrap();
+        let mut cpu = vm.new_vcpu();
+        for _ in 0..5 {
+            cpu.set_reg(Reg::Rip, ENTRY);
+            assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+            handle.wait_idle();
+        }
+        // A caught panic does not prove the unit is at fault (here a host EACCES),
+        // so later runs resubmit it rather than suppressing it. The newest failure
+        // may still wait in the completion queue for the next dispatch.
+        let stats = vm.memory_stats().cache;
+        assert!(stats.tier_bg_submitted >= 2, "{stats:?}");
+        assert!(stats.tier_bg_failed_other_backend + 1 >= stats.tier_bg_submitted);
+        assert_eq!(stats.tier_bg_interpreter_only, 0);
+        assert_eq!(stats.tier_bg_failed_code_space, 0);
+        assert!(!vm.backend.code_space_exhausted());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len() as u64, stats.tier_bg_submitted);
+        assert!(events
+            .iter()
+            .all(|e| e.reason == x86jit_core::CompileFailureReason::Unclassified));
+        drop(events);
+        compiler
+            .upgrade()
+            .unwrap()
+            .fail_compile_stage
+            .store(0, Ordering::Relaxed);
+        vm.write_bytes(ENTRY, CODE).unwrap();
+        for _ in 0..3 {
+            cpu.set_reg(Reg::Rip, ENTRY);
+            assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+            handle.wait_idle();
+        }
+        assert_eq!(vm.memory_stats().cache.tier_bg_published, 1);
+        assert_eq!(vm.cache.tier_pending_len(), 0);
+    }
+
+    #[test]
+    fn failure_observer_replacement_survives_panicking_callback() {
+        let jit = Arc::new(JitBackend::new());
+        let weak = Arc::downgrade(&jit);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        jit.set_compile_failure_observer(move |_| {
+            let observed = observed.clone();
+            weak.upgrade()
+                .unwrap()
+                .set_compile_failure_observer(move |_| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                });
+            panic!("failure observer fixture");
+        });
+        jit.set_compile_limit(0);
+        let mem = mem_with_code();
+        let req = request(&mem);
+        let TierUpUnit::Block(ir) = req.unit else {
+            unreachable!()
+        };
+        for _ in 0..3 {
+            assert!(matches!(
+                jit.materialize(&ir, MemConsistency::Fast, None, 0),
+                CachedBlock::Interpreted(_)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// A background-compiled block is drained as a `Compiled` unit and runs correctly

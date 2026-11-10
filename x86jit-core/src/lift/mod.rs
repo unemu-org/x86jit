@@ -1150,7 +1150,7 @@ mod tests {
             (&[0xf0, 0x48, 0xf7, 0x1f][..], 124),
             (&[0x48, 0x83, 0x07, 1][..], 124),
         ] {
-            let mut bytes = insn.repeat(250);
+            let mut bytes = insn.repeat(320);
             bytes.push(0xf4);
             let mem = mem_with(&bytes);
             let first = lift_block(&mem, FetchAddr::flat(BASE), CpuMode::Long64).unwrap();
@@ -1160,6 +1160,10 @@ mod tests {
             let next = BASE + u64::from(first.guest_len);
             let second = lift_block(&mem, FetchAddr::flat(next), CpuMode::Long64).unwrap();
             assert_eq!(second.guest_start, next);
+            // The remainder is preserved exactly, including the final HLT.
+            if count == 249 {
+                assert_eq!(first.icount + second.icount, 321);
+            }
             assert!(
                 matches!(second.ops.first(), Some(IrOp::InsnStart { guest_addr }) if *guest_addr == next)
             );

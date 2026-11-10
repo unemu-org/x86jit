@@ -60,6 +60,19 @@ pub struct CacheMemoryStats {
     pub tier_bg_rejected_generation: u64,
     /// Completions returning interpreted IR because compilation/publication in the backend failed.
     pub tier_bg_rejected_compile_failed: u64,
+    /// Compile-failed completions exceeding the guest-access descriptor capacity.
+    pub tier_bg_failed_descriptor_limit: u64,
+    /// Compile-failed completions due to code space, storage budget or allocation.
+    pub tier_bg_failed_code_space: u64,
+    /// Other backend failures, including failures with no classification.
+    /// These three reason counters sum to `tier_bg_rejected_compile_failed`.
+    pub tier_bg_failed_other_backend: u64,
+    /// Units marked interpreter-only after a deterministic background failure.
+    /// Lifetime count; invalidation permits the changed unit to tier up again.
+    pub tier_bg_interpreter_only: u64,
+    /// Tier-up attempts suppressed for interpreter-only units, including after
+    /// switching from background to inline tier-up.
+    pub tier_bg_interpreter_only_skipped: u64,
     /// Completions discarded because their request no longer owns the pending slot or a compiled entry superseded it.
     pub tier_bg_superseded: u64,
 }

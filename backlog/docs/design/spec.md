@@ -1428,6 +1428,33 @@ supplied writer. Code is retained for the backend's lifetime; releasing or reusi
 translations requires adding a matching released event before that lifecycle
 changes. Frame pointers remain mandatory for fault recovery (decision-13).
 
+`JitBackend::set_compile_failure_observer` reports unsuccessful compilations with
+`CompileFailure`: guest entry RIP, block/region kind, `CompileFailureReason`, guest
+byte count, instruction count, IR operation count and block count. Callbacks run
+outside compiler, queue and observer locks with the same re-entry, replacement and
+panic-containment contract as the compiled-code observer. Canceled fetch permits
+are not compile errors. Background backend panics retain the panic-hook diagnostic
+and become `OtherBackendError` completions so the worker can continue.
+
+`MemoryStats.cache.tier_bg_rejected_compile_failed` is split into
+`tier_bg_failed_descriptor_limit`, `tier_bg_failed_code_space` (including allocation
+and compile-budget failures), and `tier_bg_failed_other_backend` (including backends
+that return no classification). These reason counters sum to the aggregate;
+invalidated and superseded completions remain separate rejections. Deterministic
+failures (`DescriptorLimit` or `OtherBackendError`) mark the unit interpreter-only.
+`tier_bg_interpreter_only` counts these lifetime decisions and
+`tier_bg_interpreter_only_skipped` counts suppressed tier-up attempts. Unknown
+failures do not suppress retries; code-space exhaustion uses the backend's existing
+sticky exhaustion state. All failed region source spans remain indexed and tagged,
+including uncached successors, so invalidating any source byte releases suppression.
+A stale failure cannot suppress a new source snapshot or a newer pending request.
+
+The shared lifter bounds blocks at instruction boundaries and regions before adding
+a successor using a conservative count of guest-access descriptors. The limit is
+`jit_abi::MAX_GUEST_ACCESS_DESCRIPTORS` (249). This keeps decision-13's exact trap
+ownership and host-PC recovery mapping intact; synthetic oversized IR is refused
+and reported through the failure seam.
+
 Cranelift libcalls resolve through a closed table of statically linked host
 addresses. Unknown names panic with the missing name before dynamic symbol lookup
 can run. Indirect Rust helpers are outside that table.

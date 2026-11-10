@@ -364,6 +364,28 @@ pub enum TierUpUnit {
     Region(Arc<IrRegion>),
 }
 
+/// Why a backend could not compile or publish a translation unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompileFailureReason {
+    /// The unit exceeds the backend's guest-access descriptor capacity.
+    DescriptorLimit,
+    /// Executable storage, metadata allocation, or code-space budget exhausted.
+    CodeSpace,
+    /// Invalid backend metadata or another deterministic backend error.
+    OtherBackendError,
+    /// A failure the backend cannot attribute to the unit, such as a panic on a
+    /// host error during compilation or publication. Counted with other backend
+    /// errors, but never suppresses a later request for the same unit.
+    Unclassified,
+}
+
+impl CompileFailureReason {
+    /// These failures cannot be repaired by compiling the same source again.
+    pub fn is_deterministic(self) -> bool {
+        matches!(self, Self::DescriptorLimit | Self::OtherBackendError)
+    }
+}
+
 /// A finished background compile, ready for the core dispatcher to publish. Carries
 /// everything `cache.upgrade` needs; the backend returns these from
 /// [`Backend::tier_up_finished`] and never writes the cache itself.
@@ -374,8 +396,13 @@ pub struct TierUpFinished {
     pub pc: u64,
     /// The compiled unit to swap in for the interpreted block. `Interpreted`
     /// means compilation failed: nothing is published and the in-flight marker
-    /// is cleared.
+    /// is cleared. A classified deterministic failure suppresses further tier-up
+    /// attempts until any of the unit's source bytes are invalidated.
     pub block: CachedBlock,
+    /// Failure reason when `block` is interpreted. `None` supports backends that
+    /// cannot classify failures, and canceled fetch permits. Unknown failures are
+    /// counted as other backend errors but do not suppress future requests.
+    pub compile_failure: Option<CompileFailureReason>,
     /// The guest byte span(s) `(start, len)` — one per sub-block for a region.
     pub spans: Vec<(u64, u32)>,
     /// The opaque request identity, echoed unchanged from the request.
@@ -3050,11 +3077,13 @@ fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
         let key = BlockKey::with_mxcsr(fin.pc, vm.mode, fin.mxcsr_mode);
         let multi_span = fin.spans.len() > 1;
         let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
-        let published = vm.cache.publish_tier_up(key, fin.block, fin.epoch, |sp| {
-            for (start, len) in sp {
-                vm.mem.mark_code(*start, *len);
-            }
-        });
+        let published =
+            vm.cache
+                .publish_tier_up(key, fin.block, fin.compile_failure, fin.epoch, |sp| {
+                    for (start, len) in sp {
+                        vm.mem.mark_code(*start, *len);
+                    }
+                });
         if published {
             // A multi-span unit is a superblock region — count it like the
             // eager region path does, so `cache.regions()` reflects background regions.
@@ -3199,6 +3228,9 @@ fn resolve_attempt<const DEFAULT: bool>(
         }
         let count = vm.cache.bump_hotness(key);
         if count < thr {
+            return Ok(block);
+        }
+        if !vm.tier_up_background && vm.cache.tier_up_interpreter_only(key) {
             return Ok(block);
         }
         let mut permit = None;

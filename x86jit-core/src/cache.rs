@@ -76,6 +76,7 @@ struct SpanIndex {
     pages: HashMap<u64, HashSet<BlockKey>>,
     pending: HashMap<BlockKey, PendingTierUp>,
     next_request: u64,
+    interpreter_only: HashSet<BlockKey>,
 }
 
 struct PendingTierUp {
@@ -103,6 +104,7 @@ impl SpanIndex {
     }
 
     fn remove(&mut self, key: &BlockKey) {
+        self.interpreter_only.remove(key);
         if let Some(spans) = self.units.remove(key) {
             for (start, len) in spans {
                 if len != 0 {
@@ -170,6 +172,11 @@ pub struct TranslationCache {
     tier_bg_duplicates_skipped: AtomicU64,
     tier_bg_rejected_generation: AtomicU64,
     tier_bg_rejected_compile_failed: AtomicU64,
+    tier_bg_failed_descriptor_limit: AtomicU64,
+    tier_bg_failed_code_space: AtomicU64,
+    tier_bg_failed_other_backend: AtomicU64,
+    tier_bg_interpreter_only: AtomicU64,
+    tier_bg_interpreter_only_skipped: AtomicU64,
     tier_bg_superseded: AtomicU64,
 
     // §17.4: keyed by BlockKey { guest_addr, mode } — the same bytes lift differently
@@ -296,6 +303,15 @@ impl TranslationCache {
             tier_bg_rejected_compile_failed: self
                 .tier_bg_rejected_compile_failed
                 .load(Ordering::Relaxed),
+            tier_bg_failed_descriptor_limit: self
+                .tier_bg_failed_descriptor_limit
+                .load(Ordering::Relaxed),
+            tier_bg_failed_code_space: self.tier_bg_failed_code_space.load(Ordering::Relaxed),
+            tier_bg_failed_other_backend: self.tier_bg_failed_other_backend.load(Ordering::Relaxed),
+            tier_bg_interpreter_only: self.tier_bg_interpreter_only.load(Ordering::Relaxed),
+            tier_bg_interpreter_only_skipped: self
+                .tier_bg_interpreter_only_skipped
+                .load(Ordering::Relaxed),
             tier_bg_superseded: self.tier_bg_superseded.load(Ordering::Relaxed),
             tier_bg_published: self.tier_bg_published(),
             tier_bg_rejected: self.tier_bg_rejected(),
@@ -312,6 +328,11 @@ impl TranslationCache {
             tier_bg_duplicates_skipped: AtomicU64::new(0),
             tier_bg_rejected_generation: AtomicU64::new(0),
             tier_bg_rejected_compile_failed: AtomicU64::new(0),
+            tier_bg_failed_descriptor_limit: AtomicU64::new(0),
+            tier_bg_failed_code_space: AtomicU64::new(0),
+            tier_bg_failed_other_backend: AtomicU64::new(0),
+            tier_bg_interpreter_only: AtomicU64::new(0),
+            tier_bg_interpreter_only_skipped: AtomicU64::new(0),
             tier_bg_superseded: AtomicU64::new(0),
 
             map: RwLock::new(HashMap::new()),
@@ -548,10 +569,24 @@ impl TranslationCache {
         self.regions.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn tier_up_interpreter_only(&self, key: BlockKey) -> bool {
+        let blocked = self.spans.read().unwrap().interpreter_only.contains(&key);
+        if blocked {
+            self.tier_bg_interpreter_only_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        blocked
+    }
+
     /// Claim a background slot. Invalidation cancels its source snapshot but
     /// retains ownership until completion, preventing duplicate queued work.
     pub fn try_begin_tier_up(&self, key: BlockKey) -> bool {
         let mut spans = self.spans.write().unwrap();
+        if spans.interpreter_only.contains(&key) {
+            self.tier_bg_interpreter_only_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         if spans.pending.contains_key(&key) {
             self.tier_bg_duplicates_skipped
                 .fetch_add(1, Ordering::Relaxed);
@@ -606,6 +641,7 @@ impl TranslationCache {
         &self,
         key: BlockKey,
         block: CachedBlock,
+        compile_failure: Option<crate::CompileFailureReason>,
         request_id: u64,
         on_mark: impl FnOnce(&[(u64, u32)]),
     ) -> bool {
@@ -620,10 +656,6 @@ impl TranslationCache {
             self.record_tier_bg_rejected_generation();
             return false;
         }
-        if matches!(block, CachedBlock::Interpreted(_)) {
-            self.record_tier_bg_compile_failed();
-            return false;
-        }
         let mut map = self.map.write().unwrap();
         if !matches!(map.get(&key), Some(CachedBlock::Interpreted(_))) {
             self.record_tier_bg_rejected();
@@ -631,6 +663,29 @@ impl TranslationCache {
             return false;
         }
         let source_spans = pending.spans.expect("submitted tier-up has source spans");
+        if matches!(block, CachedBlock::Interpreted(_)) {
+            self.record_tier_bg_compile_failed();
+            let reason = compile_failure.unwrap_or(crate::CompileFailureReason::OtherBackendError);
+            let counter = match reason {
+                crate::CompileFailureReason::DescriptorLimit => {
+                    &self.tier_bg_failed_descriptor_limit
+                }
+                crate::CompileFailureReason::CodeSpace => &self.tier_bg_failed_code_space,
+                crate::CompileFailureReason::OtherBackendError
+                | crate::CompileFailureReason::Unclassified => &self.tier_bg_failed_other_backend,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            if compile_failure.is_some_and(crate::CompileFailureReason::is_deterministic) {
+                // Index all failed region sources, including uncached successors:
+                // a write to any of them must release the suppression marker.
+                on_mark(&source_spans);
+                spans.insert(key, source_spans);
+                spans.interpreter_only.insert(key);
+                self.tier_bg_interpreter_only
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
         on_mark(&source_spans);
         self.account_replace(
             map.get(&key),
@@ -1151,6 +1206,105 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_failure_stays_suppressed_until_any_source_is_invalidated() {
+        for reason in [
+            crate::CompileFailureReason::DescriptorLimit,
+            crate::CompileFailureReason::OtherBackendError,
+        ] {
+            for (lo, hi) in [(0x1001, 0x1002), (0x3001, 0x3002)] {
+                let c = TranslationCache::new();
+                let id = pending_region(&c);
+                let interpreted = c.get(k(0x1000)).unwrap();
+                assert!(!c.publish_tier_up(
+                    k(0x1000),
+                    interpreted,
+                    Some(reason),
+                    id,
+                    |spans| assert_eq!(spans.len(), 2)
+                ));
+                assert_eq!(c.tier_pending_len(), 0);
+                for _ in 0..32 {
+                    assert!(!c.try_begin_tier_up(k(0x1000)));
+                }
+                let stats = c.memory_stats();
+                assert_eq!(stats.tier_bg_interpreter_only, 1);
+                assert_eq!(stats.tier_bg_interpreter_only_skipped, 32);
+                assert_eq!(stats.tier_bg_rejected_compile_failed, 1);
+                assert_eq!(
+                    stats.tier_bg_failed_descriptor_limit + stats.tier_bg_failed_other_backend,
+                    1
+                );
+                assert!(c.invalidate_overlapping(0x3800, 0x3801, || {}).is_empty());
+                assert!(!c.try_begin_tier_up(k(0x1000)));
+                assert_eq!(c.invalidate_overlapping(lo, hi, || {}), vec![k(0x1000)]);
+                assert!(c.try_begin_tier_up(k(0x1000)));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_failure_cannot_suppress_new_bytes() {
+        let c = TranslationCache::new();
+        let id = pending_region(&c);
+        c.invalidate_overlapping(0x3000, 0x3001, || {});
+        let interpreted = c.get(k(0x1000)).unwrap();
+        assert!(!c.publish_tier_up(
+            k(0x1000),
+            interpreted,
+            Some(crate::CompileFailureReason::DescriptorLimit),
+            id,
+            |_| panic!("stale failure")
+        ));
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        assert_eq!(c.memory_stats().tier_bg_interpreter_only, 0);
+        assert_eq!(c.memory_stats().tier_bg_rejected_generation, 1);
+    }
+
+    #[test]
+    fn superseded_failure_cannot_suppress_a_newer_pending_request() {
+        let c = TranslationCache::new();
+        let old = pending_region(&c);
+        let interpreted = c.get(k(0x1000)).unwrap();
+        c.end_tier_up(k(0x1000));
+        let new = pending_region(&c);
+        assert!(!c.publish_tier_up(
+            k(0x1000),
+            interpreted,
+            Some(crate::CompileFailureReason::DescriptorLimit),
+            old,
+            |_| panic!("superseded failure")
+        ));
+        assert_eq!(c.tier_pending_len(), 1);
+        assert_eq!(c.memory_stats().tier_bg_interpreter_only, 0);
+        assert_eq!(c.memory_stats().tier_bg_superseded, 1);
+        assert!(c.publish_tier_up(k(0x1000), compiled(), None, new, |_| {}));
+    }
+
+    #[test]
+    fn unclassified_failure_is_counted_without_permanent_suppression() {
+        let c = TranslationCache::new();
+        let id = pending_region(&c);
+        let interpreted = c.get(k(0x1000)).unwrap();
+        assert!(!c.publish_tier_up(k(0x1000), interpreted, None, id, |_| {}));
+        assert_eq!(c.memory_stats().tier_bg_failed_other_backend, 1);
+        assert_eq!(c.memory_stats().tier_bg_interpreter_only, 0);
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        c.end_tier_up(k(0x1000));
+        let id = pending_region(&c);
+        let interpreted = c.get(k(0x1000)).unwrap();
+        assert!(!c.publish_tier_up(
+            k(0x1000),
+            interpreted,
+            Some(crate::CompileFailureReason::Unclassified),
+            id,
+            |_| {}
+        ));
+        assert_eq!(c.memory_stats().tier_bg_failed_other_backend, 2);
+        assert_eq!(c.memory_stats().tier_bg_interpreter_only, 0);
+        assert!(c.try_begin_tier_up(k(0x1000)));
+    }
+
+    #[test]
     fn pending_sources_cancel_only_on_overlap() {
         for (lo, hi, publish) in [
             (0x1800, 0x1801, true),
@@ -1164,7 +1318,7 @@ mod tests {
             assert_eq!(c.tier_pending_len(), 1);
             assert!(!c.try_begin_tier_up(k(0x1000)));
             assert_eq!(
-                c.publish_tier_up(k(0x1000), compiled(), id, |_| {}),
+                c.publish_tier_up(k(0x1000), compiled(), None, id, |_| {}),
                 publish
             );
             assert_eq!(c.tier_pending_len(), 0);
@@ -1183,7 +1337,7 @@ mod tests {
             panic!("pending successor needs its page tag")
         });
         c.invalidate_child_written(0x3000, 0x4000, || {});
-        assert!(!c.publish_tier_up(k(0x1000), compiled(), id, |_| panic!("canceled")));
+        assert!(!c.publish_tier_up(k(0x1000), compiled(), None, id, |_| panic!("canceled")));
         assert_eq!(c.memory_stats().tier_bg_rejected_generation, 1);
     }
 
@@ -1194,9 +1348,9 @@ mod tests {
         c.end_tier_up(k(0x1000));
         let new = pending_region(&c);
         assert_ne!(old, new);
-        assert!(!c.publish_tier_up(k(0x1000), compiled(), old, |_| panic!("superseded")));
+        assert!(!c.publish_tier_up(k(0x1000), compiled(), None, old, |_| panic!("superseded")));
         assert_eq!(c.tier_pending_len(), 1);
-        assert!(c.publish_tier_up(k(0x1000), compiled(), new, |_| {}));
+        assert!(c.publish_tier_up(k(0x1000), compiled(), None, new, |_| {}));
         assert_eq!(c.memory_stats().tier_bg_superseded, 1);
         assert_eq!(c.tier_pending_len(), 0);
     }

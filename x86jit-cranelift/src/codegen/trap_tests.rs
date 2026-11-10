@@ -207,9 +207,9 @@ fn compile_ir_for_isa_with_split_stores(
     crate::libcalls::assert_supported_relocations(cc);
     let compile_ns = started.elapsed().as_nanos();
     let started = std::time::Instant::now();
-    let sites = crate::collect_guest_traps(cc, &metadata).unwrap_or_else(|()| {
+    let sites = crate::collect_guest_traps(cc, &metadata).unwrap_or_else(|error| {
         panic!(
-            "unclassified machine traps: {:?}, bytes={bytes:02x?}",
+            "unclassified machine traps: {:?}, bytes={bytes:02x?}, error={error:?}",
             cc.buffer.traps()
         )
     });
@@ -790,7 +790,7 @@ fn guest_trap_sites_refuse_missing_owner_without_panicking() {
     let mut ctx = memory_fixture(jit.module.isa(), guest_mem_flags(GuestAccessKind::Read, 8));
     assert_eq!(
         crate::prepare_guest_traps(&mut ctx.func, &[]),
-        Err(crate::CompileError::Unavailable)
+        Err(crate::CompileError::BackendError)
     );
     for inst in ctx
         .func
@@ -803,7 +803,7 @@ fn guest_trap_sites_refuse_missing_owner_without_panicking() {
     }
     assert_eq!(
         crate::prepare_guest_traps(&mut ctx.func, &[HIGH_BASE]),
-        Err(crate::CompileError::Unavailable)
+        Err(crate::CompileError::BackendError)
     );
 }
 
@@ -820,7 +820,10 @@ fn guest_trap_sites_reject_unknown_machine_codes() {
         let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::collect_guest_traps(ctx.compiled_code().unwrap(), &[])
         }));
-        assert_eq!(refusal.expect("unknown trap codes must not panic"), Err(()));
+        assert_eq!(
+            refusal.expect("unknown trap codes must not panic"),
+            Err(crate::CompileError::BackendError)
+        );
     }
 }
 
@@ -833,7 +836,7 @@ fn guest_trap_sites_reject_unknown_preparation_codes_without_panicking() {
     );
     assert_eq!(
         crate::prepare_guest_traps(&mut ctx.func, &[HIGH_BASE]),
-        Err(crate::CompileError::Unavailable)
+        Err(crate::CompileError::BackendError)
     );
 }
 

@@ -245,7 +245,7 @@ fn descriptor_overflow_case(shape: usize) {
     asm.mov(rdi, DATA).unwrap();
     match shape {
         0 => {
-            for _ in 0..250 {
+            for _ in 0..320 {
                 asm.mov(rax, qword_ptr(rdi)).unwrap();
             }
         }
@@ -304,7 +304,7 @@ fn descriptor_overflow_case(shape: usize) {
 }
 
 #[test]
-fn guest_trap_sites_descriptor_overflow_250_loads_compiles() {
+fn guest_trap_sites_descriptor_overflow_320_loads_compiles() {
     descriptor_overflow_case(0);
 }
 

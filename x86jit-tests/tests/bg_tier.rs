@@ -1087,3 +1087,229 @@ fn disjoint_guest_store_on_same_code_page_preserves_completion() {
 fn disjoint_guest_store_on_different_code_page_preserves_completion() {
     disjoint_guest_store_preserves_completion(true);
 }
+
+/// Deliberately bypass the shared lifter's descriptor cap to exercise the
+/// backend's defensive refusal and the dispatcher's retry policy.
+fn oversized_background_unit(region: bool) {
+    use std::sync::Arc;
+    use x86jit_core::{BlockKey, CachedBlock, CpuMode, IrBlock, IrRegion, TierUpUnit};
+    struct OversizedBackend {
+        jit: JitBackend,
+        blocks: Vec<IrBlock>,
+        region: bool,
+    }
+    impl Backend for OversizedBackend {
+        fn materialize(
+            &self,
+            ir: &IrBlock,
+            c: x86jit_core::MemConsistency,
+            m: Option<(u64, u64)>,
+            b: u64,
+        ) -> CachedBlock {
+            self.jit.materialize(ir, c, m, b)
+        }
+        fn tier_up_async(&self, mut req: x86jit_core::TierUpRequest) -> x86jit_core::TierUpSubmit {
+            if self.region {
+                req.unit = TierUpUnit::Region(Arc::new(IrRegion {
+                    entry: CODE,
+                    blocks: self.blocks.clone(),
+                    has_loop: false,
+                }));
+                req.spans = self
+                    .blocks
+                    .iter()
+                    .map(|b| (b.guest_start, b.guest_len))
+                    .collect();
+            }
+            self.jit.tier_up_async(req)
+        }
+        fn tier_up_finished(&self) -> Vec<x86jit_core::TierUpFinished> {
+            self.jit.tier_up_finished()
+        }
+    }
+    let mut a = CodeAssembler::new(64).unwrap();
+    for _ in 0..160 {
+        a.mov(rax, qword_ptr(rdi)).unwrap();
+    }
+    let successor = CODE + 160 * 3 + 2;
+    a.jmp(successor).unwrap();
+    for _ in 0..160 {
+        a.mov(rax, qword_ptr(rdi)).unwrap();
+    }
+    a.hlt().unwrap();
+    let code = a.assemble(CODE).unwrap();
+    let jit = JitBackend::new();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = events.clone();
+    jit.set_compile_failure_observer(move |event| observed.lock().unwrap().push(event));
+    let handle = jit.tier_up_handle();
+    let mut mem = x86jit_core::Memory::new(x86jit_core::MemoryModel::Flat { size: 0x4000 });
+    mem.map(CODE, 0x1000, Prot::RX, RegionKind::Ram).unwrap();
+    mem.write_bytes(CODE, &code).unwrap();
+    let blocks = if region {
+        [CODE, successor]
+            .into_iter()
+            .map(|pc| {
+                x86jit_core::lift::lift_block(
+                    &mem,
+                    x86jit_core::lift::FetchAddr::flat(pc),
+                    CpuMode::Long64,
+                )
+                .unwrap()
+            })
+            .collect()
+    } else {
+        // A straight-line block with 320 distinct instruction owners.
+        let mut code = [0x48, 0x8b, 0x07].repeat(320);
+        code.push(0xf4);
+        mem.write_bytes(CODE, &code).unwrap();
+        let mut block = x86jit_core::lift::lift_one(
+            &mem,
+            x86jit_core::lift::FetchAddr::flat(CODE),
+            CpuMode::Long64,
+        )
+        .unwrap();
+        for i in 1..=320 {
+            let next = x86jit_core::lift::lift_one(
+                &mem,
+                x86jit_core::lift::FetchAddr::flat(CODE + i * 3),
+                CpuMode::Long64,
+            )
+            .unwrap();
+            block.ops.extend(next.ops);
+            block.guest_len += next.guest_len;
+            block.icount += 1;
+            block.temp_count = block.temp_count.max(next.temp_count);
+        }
+        vec![block]
+    };
+    let first = Arc::new(blocks[0].clone());
+    let mut vm = vm_with_flat(
+        Box::new(OversizedBackend {
+            jit,
+            blocks,
+            region,
+        }),
+        1,
+        true,
+        &code,
+        0x4000,
+    );
+    if !region {
+        let mut code = [0x48, 0x8b, 0x07].repeat(320);
+        code.push(0xf4);
+        vm.write_bytes(CODE, &code).unwrap();
+    }
+    vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x3000, &42u64.to_le_bytes()).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rdi, 0x3000);
+    let pass = |vm: &Vm, cpu: &mut x86jit_core::Vcpu| {
+        cpu.set_reg(Reg::Rip, CODE);
+        let exit = cpu.run(vm, Some(if region { 1 } else { 1_000_000 }));
+        assert!(if region {
+            matches!(exit, Exit::BudgetExhausted)
+        } else {
+            matches!(exit, Exit::Hlt)
+        });
+        cpu.reg(Reg::Rax)
+    };
+    // Drain setup writes before injecting synthetic cached IR.
+    assert_eq!(pass(&vm, &mut cpu), 42);
+    vm.cache.insert(
+        BlockKey::new(CODE, CpuMode::Long64),
+        CachedBlock::Interpreted(first.clone()),
+        vec![(CODE, first.guest_len)],
+        |_| vm.mem.mark_code(CODE, first.guest_len),
+    );
+    for _ in 0..3 {
+        assert_eq!(pass(&vm, &mut cpu), 42);
+        handle.wait_idle();
+    }
+    let stats = vm.memory_stats().cache;
+    println!(
+        "MEASURED oversized region={region}: submitted={}, failed={}, published={}",
+        stats.tier_bg_submitted, stats.tier_bg_rejected_compile_failed, stats.tier_bg_published
+    );
+    assert_eq!(stats.tier_bg_rejected_compile_failed, 1);
+    assert_eq!(stats.tier_bg_failed_descriptor_limit, 1);
+    assert_eq!(stats.tier_bg_failed_code_space, 0);
+    assert_eq!(stats.tier_bg_failed_other_backend, 0);
+    assert_eq!(stats.tier_bg_interpreter_only, 1);
+    assert!(stats.tier_bg_interpreter_only_skipped > 0);
+    assert_eq!(stats.tier_bg_submitted, 1);
+    assert_eq!(stats.tier_bg_published, 0);
+    assert_eq!(vm.cache.tier_pending_len(), 0);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    let event = events[0];
+    assert_eq!(event.guest_rip, CODE);
+    assert_eq!(
+        event.reason,
+        x86jit_core::CompileFailureReason::DescriptorLimit
+    );
+    assert_eq!(
+        event.kind,
+        if region {
+            x86jit_cranelift::CompiledCodeKind::Region
+        } else {
+            x86jit_cranelift::CompiledCodeKind::Block
+        }
+    );
+    assert_eq!(event.blocks, if region { 2 } else { 1 });
+    assert_eq!(event.instructions, if region { 322 } else { 321 });
+    assert_eq!(event.guest_bytes, if region { 963 } else { 961 });
+    assert!(event.ir_ops > 640);
+    drop(events);
+    vm.set_tier_up_background(false);
+    for _ in 0..3 {
+        assert_eq!(pass(&vm, &mut cpu), 42);
+    }
+    assert_eq!(vm.memory_stats().cache.tier_bg_submitted, 1);
+    assert_eq!(vm.memory_stats().backend.compiled_units_total, 0);
+    vm.set_tier_up_background(true);
+    // A byte invalidation releases suppression and the ordinary lifter supplies
+    // capped blocks again. The forced-region fixture remains intentionally oversized.
+    vm.write_bytes(CODE, &[0x48]).unwrap();
+    assert_eq!(pass(&vm, &mut cpu), 42);
+    assert_eq!(pass(&vm, &mut cpu), 42);
+    handle.wait_idle();
+    assert!(vm.memory_stats().cache.tier_bg_submitted > stats.tier_bg_submitted);
+}
+
+#[test]
+fn oversized_background_block_retry_policy() {
+    oversized_background_unit(false);
+}
+
+#[test]
+fn oversized_background_region_retry_policy() {
+    oversized_background_unit(true);
+}
+
+#[test]
+fn background_320_access_program_compiles_as_bounded_blocks() {
+    let mut code = [0x48, 0x8b, 0x07].repeat(320);
+    code.push(0xf4);
+    let jit = JitBackend::new();
+    let handle = jit.tier_up_handle();
+    let mut vm = vm_with_flat(Box::new(jit), 32, true, &code, 0x4000);
+    vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x3000, &42u64.to_le_bytes()).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rdi, 0x3000);
+    for _ in 0..33 {
+        assert_eq!(one_pass(&vm, &mut cpu), 42);
+    }
+    handle.wait_idle();
+    assert_eq!(one_pass(&vm, &mut cpu), 42);
+    let stats = vm.memory_stats().cache;
+    println!(
+        "MEASURED normal 320-access program: submitted={}, failed={}, published={}",
+        stats.tier_bg_submitted, stats.tier_bg_rejected_compile_failed, stats.tier_bg_published
+    );
+    assert_eq!(stats.tier_bg_submitted, 2);
+    assert_eq!(stats.tier_bg_published, 2);
+    assert_eq!(stats.tier_bg_rejected_compile_failed, 0);
+    assert_eq!(vm.cache.tier_pending_len(), 0);
+}

@@ -184,8 +184,9 @@ pub use state::{
     AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
 };
 pub use vm::{
-    Backend, ExitRequest, ForceRegionError, InterpreterBackend, MemConsistency, ShutdownError,
-    ShutdownReport, SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished,
-    TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
+    Backend, CompileFailureReason, ExitRequest, ForceRegionError, InterpreterBackend,
+    MemConsistency, ShutdownError, ShutdownReport, SourceIdError, StepOptions, StepRun,
+    StepRunError, StepStop, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu, Vm,
+    VmConfig,
 };
 pub use x87::FpuKind;
