@@ -34,7 +34,7 @@ unsafe extern "C" {
     fn memcmp(a: *const u8, b: *const u8, len: usize) -> i32;
 }
 
-// Cranelift 0.115's X86Pshufb signature passes two i8x16 values in xmm0/xmm1
+// Cranelift 0.135.8's X86Pshufb signature passes two i8x16 values in xmm0/xmm1
 // and returns i8x16 in xmm0. Stable Rust cannot express that vector signature.
 // This leaf uses only baseline SSE2 and caller-saved integer registers. It
 // implements PSHUFB: SDM Vol 2B, PSHUFB, Operation (128-bit SSE), p. 4-423.
@@ -114,6 +114,23 @@ pub(crate) fn builder(isa: OwnedTargetIsa) -> JITBuilder {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_supported_relocations(code: &cranelift::codegen::CompiledCode) {
+    use cranelift::codegen::{binemit::Reloc, ir::ExternalName, FinalizedRelocTarget};
+    for reloc in code.buffer.relocs() {
+        assert_eq!(
+            reloc.kind,
+            Reloc::Abs8,
+            "unexpected JIT relocation: {reloc:?}"
+        );
+        let FinalizedRelocTarget::ExternalName(ExternalName::LibCall(call)) = &reloc.target else {
+            panic!("unexpected JIT relocation target: {reloc:?}");
+        };
+        assert_eq!(reloc.addend, 0, "unexpected libcall addend: {reloc:?}");
+        assert!(!address(*call).is_null());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cranelift::codegen::ir;
@@ -146,6 +163,7 @@ mod tests {
                     name: ir::ExternalName::LibCall(call),
                     signature: ext,
                     colocated: false,
+                    patchable: false,
                 });
                 let mut fbctx = FunctionBuilderContext::new();
                 let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
@@ -157,7 +175,7 @@ mod tests {
                 let results = b.inst_results(inst).to_vec();
                 b.ins().return_(&results);
                 b.seal_all_blocks();
-                b.finalize();
+                b.finalize(module.isa().frontend_config());
                 let id = module
                     .declare_function(
                         &format!("test_{call}"),
@@ -166,6 +184,7 @@ mod tests {
                     )
                     .unwrap();
                 module.define_function(id, &mut ctx).unwrap();
+                assert_supported_relocations(ctx.compiled_code().unwrap());
                 module.finalize_definitions().unwrap();
                 if (host.starts_with("aarch64") && cfg!(target_arch = "aarch64"))
                     || (host.starts_with("x86_64") && cfg!(target_arch = "x86_64"))
@@ -269,7 +288,7 @@ mod tests {
         let results = b.inst_results(inst).to_vec();
         b.ins().return_(&results);
         b.seal_all_blocks();
-        b.finalize();
+        b.finalize(module.isa().frontend_config());
         module.define_function(id, &mut ctx).unwrap();
         module.finalize_definitions().unwrap();
     }

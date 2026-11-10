@@ -79,7 +79,7 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
         false,
         target.starts_with("aarch64"),
     );
-    builder.finalize();
+    builder.finalize(isa.frontend_config());
     ctx.set_disasm(true);
     ctx.compile(&*isa, &mut Default::default()).unwrap();
     ctx

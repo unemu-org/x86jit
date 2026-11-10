@@ -55,7 +55,9 @@ impl GprSync {
                     .layout
                     .last_inst(block)
                     .expect("terminated codegen block");
-                for dest in func.dfg.insts[last].branch_destination(&func.dfg.jump_tables) {
+                for dest in func.dfg.insts[last]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let input = incoming
                         .get_mut(&dest.block(&func.dfg.value_lists))
                         .unwrap();
@@ -110,19 +112,23 @@ mod tests {
             for block in [left, right] {
                 builder.switch_to_block(block);
                 if block == left || both_paths {
-                    let inst = builder.ins().store(MemFlags::trusted(), value, cpu, 0);
+                    let inst = builder.ins().store(MemFlagsData::trusted(), value, cpu, 0);
                     sync.store(block, 16, inst);
                 }
                 builder.ins().jump(join, &[]);
             }
             builder.switch_to_block(join);
-            let at_join = builder.ins().store(MemFlags::trusted(), value, cpu, 0);
+            let at_join = builder.ins().store(MemFlagsData::trusted(), value, cpu, 0);
             sync.store(join, 16, at_join);
-            let repeated = builder.ins().store(MemFlags::trusted(), value, cpu, 0);
+            let repeated = builder.ins().store(MemFlagsData::trusted(), value, cpu, 0);
             sync.store(join, 16, repeated);
             builder.ins().return_(&[]);
             builder.seal_all_blocks();
-            builder.finalize();
+            let isa = cranelift_native::builder()
+                .unwrap()
+                .finish(settings::Flags::new(settings::builder()))
+                .unwrap();
+            builder.finalize(isa.frontend_config());
             sync.remove_clean_stores(&mut func);
             assert_eq!(func.layout.inst_block(at_join).is_none(), both_paths);
             assert!(func.layout.inst_block(repeated).is_none());

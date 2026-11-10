@@ -88,7 +88,7 @@ impl Translator<'_, '_> {
         let delta = self.iconst(*slot as u64);
         let mut newsp = self.builder.ins().isub(rsp, delta);
         if *wrap_sp {
-            newsp = self.builder.ins().band_imm(newsp, 0xffff_ffff);
+            newsp = self.builder.ins().band_imm_s(newsp, 0xffff_ffff);
         }
         let host = self.checked_addr(newsp, *slot, 1);
         let ra = self.iconst(*return_addr);
@@ -128,7 +128,7 @@ impl Translator<'_, '_> {
         let delta = self.iconst(*slot as u64 + *pop_extra as u64);
         let mut newsp = self.builder.ins().iadd(rsp, delta);
         if *wrap_sp {
-            newsp = self.builder.ins().band_imm(newsp, 0xffff_ffff);
+            newsp = self.builder.ins().band_imm_s(newsp, 0xffff_ffff);
         }
         self.write_gpr(RSP, newsp, if *wrap_sp { 4 } else { 8 });
         self.store_cpu(self.offsets.rip, ret);
@@ -168,7 +168,7 @@ impl Translator<'_, '_> {
         // kept at all.
         for (v, shift) in [(self.load_pf(), 2), (self.load_af(), 4)] {
             let w = self.builder.ins().uextend(types::I64, v);
-            let shifted = self.builder.ins().ishl_imm(w, shift);
+            let shifted = self.builder.ins().ishl_imm_s(w, shift);
             acc = self.builder.ins().bor(acc, shifted);
         }
         for (off, shift) in [
@@ -179,7 +179,7 @@ impl Translator<'_, '_> {
             (self.offsets.of, 11),
         ] {
             let b = self.load_flag_u64(off); // I64, 0 or 1
-            let shifted = self.builder.ins().ishl_imm(b, shift);
+            let shifted = self.builder.ins().ishl_imm_s(b, shift);
             acc = self.builder.ins().bor(acc, shifted);
         }
         acc
@@ -201,12 +201,12 @@ impl Translator<'_, '_> {
             (self.load_flag(sf_off), 7),
         ] {
             let w = self.builder.ins().uextend(types::I64, v);
-            let shifted = self.builder.ins().ishl_imm(w, shift);
+            let shifted = self.builder.ins().ishl_imm_s(w, shift);
             byte = self.builder.ins().bor(byte, shifted);
         }
-        let ah = self.builder.ins().ishl_imm(byte, 8);
+        let ah = self.builder.ins().ishl_imm_s(byte, 8);
         let rax = self.read_gpr(RAX);
-        let keep = self.builder.ins().band_imm(rax, !0xff00i64);
+        let keep = self.builder.ins().band_imm_s(rax, !0xff00i64);
         let new = self.builder.ins().bor(keep, ah);
         self.write_gpr(RAX, new, 8);
         false
@@ -216,10 +216,10 @@ impl Translator<'_, '_> {
     /// untouched. Mirrors `interp::control::exec_sahf`.
     pub(crate) fn emit_sahf(&mut self) -> bool {
         let rax = self.read_gpr(RAX);
-        let ah = self.builder.ins().ushr_imm(rax, 8);
+        let ah = self.builder.ins().ushr_imm_s(rax, 8);
         let bit = |t: &mut Self, n: i64| {
-            let s = t.builder.ins().ushr_imm(ah, n);
-            let b = t.builder.ins().band_imm(s, 1);
+            let s = t.builder.ins().ushr_imm_s(ah, n);
+            let b = t.builder.ins().band_imm_s(s, 1);
             t.builder.ins().ireduce(types::I8, b)
         };
         let cf = bit(self, 0);
@@ -227,7 +227,7 @@ impl Translator<'_, '_> {
         let zf = bit(self, 6);
         let sf = bit(self, 7);
         // AF's source encoding IS bit 4 of a byte, so AH masked to 0x10 is already it.
-        let af_masked = self.builder.ins().band_imm(ah, 0x10);
+        let af_masked = self.builder.ins().band_imm_s(ah, 0x10);
         let af_src = self.builder.ins().ireduce(types::I8, af_masked);
         let pf_src = self.pf_src_from_bool(pf);
         let (cf_off, zf_off, sf_off) = (self.offsets.cf, self.offsets.zf, self.offsets.sf);
@@ -286,7 +286,7 @@ impl Translator<'_, '_> {
             Some(v) => self.builder.ins().iconst(types::I8, v as i64),
             None => {
                 let cf = self.load_flag(self.offsets.cf);
-                self.builder.ins().bxor_imm(cf, 1)
+                self.builder.ins().bxor_imm_s(cf, 1)
             }
         };
         self.store_flag(self.offsets.cf, cf);
@@ -298,13 +298,13 @@ impl Translator<'_, '_> {
         // SDM Vol 2B §4.3 PUSHF additionally clears VM in its stack image.
         let arithmetic = self.assemble_rflags();
         let system = self.load_cpu(SYSTEM_FLAGS);
-        let system = self.builder.ins().band_imm(
+        let system = self.builder.ins().band_imm_s(
             system,
             (x86jit_core::state::RFLAGS_SYSTEM_MASK & if push { !0x3_0000 } else { !0x1_0000 })
                 as i64,
         );
         let if_ = self.load_flag_u64(IF_FLAG);
-        let if_ = self.builder.ins().ishl_imm(if_, 9);
+        let if_ = self.builder.ins().ishl_imm_s(if_, 9);
         let image = self.builder.ins().bor(arithmetic, system);
         self.builder.ins().bor(image, if_)
     }
@@ -312,9 +312,9 @@ impl Translator<'_, '_> {
     pub(crate) fn emit_push_flags(&mut self, size: u8, wrap_sp: bool) -> bool {
         let image = self.user_rflags_image(true);
         let rsp = self.read_gpr(RSP);
-        let mut sp = self.builder.ins().iadd_imm(rsp, -(size as i64));
+        let mut sp = self.builder.ins().iadd_imm_s(rsp, -(size as i64));
         if wrap_sp {
-            sp = self.builder.ins().band_imm(sp, 0xffff_ffff);
+            sp = self.builder.ins().band_imm_s(sp, 0xffff_ffff);
         }
         let host = self.checked_addr(sp, size, 1);
         self.store_guest(host, image, size);
@@ -333,26 +333,26 @@ impl Translator<'_, '_> {
             (self.offsets.df, 10),
             (self.offsets.of, 11),
         ] {
-            let shifted = self.builder.ins().ushr_imm(image, bit);
-            let value = self.builder.ins().band_imm(shifted, 1);
+            let shifted = self.builder.ins().ushr_imm_s(image, bit);
+            let value = self.builder.ins().band_imm_s(shifted, 1);
             let value = self.builder.ins().ireduce(types::I8, value);
             self.store_flag(offset, value);
         }
         // PF source is a parity byte; AF source carries the architectural bit 4.
-        let pf = self.builder.ins().ushr_imm(image, 2);
-        let pf = self.builder.ins().band_imm(pf, 1);
-        let pf = self.builder.ins().bxor_imm(pf, 1);
+        let pf = self.builder.ins().ushr_imm_s(image, 2);
+        let pf = self.builder.ins().band_imm_s(pf, 1);
+        let pf = self.builder.ins().bxor_imm_s(pf, 1);
         let pf = self.builder.ins().ireduce(types::I8, pf);
         self.store_flag(self.offsets.pf_src, pf);
-        let af = self.builder.ins().band_imm(image, 0x10);
+        let af = self.builder.ins().band_imm_s(image, 0x10);
         let af = self.builder.ins().ireduce(types::I8, af);
         self.store_flag(self.offsets.af_src, af);
         let system = self.load_cpu(SYSTEM_FLAGS);
-        let iopl = self.builder.ins().band_imm(system, 0x3000);
-        let permitted = self.builder.ins().icmp_imm(IntCC::Equal, iopl, 0x3000);
+        let iopl = self.builder.ins().band_imm_s(system, 0x3000);
+        let permitted = self.builder.ins().icmp_imm_s(IntCC::Equal, iopl, 0x3000);
         let old_if = self.load_flag(IF_FLAG);
-        let new_if = self.builder.ins().ushr_imm(image, 9);
-        let new_if = self.builder.ins().band_imm(new_if, 1);
+        let new_if = self.builder.ins().ushr_imm_s(image, 9);
+        let new_if = self.builder.ins().band_imm_s(new_if, 1);
         let new_if = self.builder.ins().ireduce(types::I8, new_if);
         let if_ = self.builder.ins().select(permitted, new_if, old_if);
         self.store_flag(IF_FLAG, if_);
@@ -360,8 +360,8 @@ impl Translator<'_, '_> {
         let preserved = self
             .builder
             .ins()
-            .band_imm(system, !(mask | if iret { 0 } else { 1 << 16 }) as i64);
-        let changed = self.builder.ins().band_imm(image, mask as i64);
+            .band_imm_s(system, !(mask | if iret { 0 } else { 1 << 16 }) as i64);
+        let changed = self.builder.ins().band_imm_s(image, mask as i64);
         let updated = self.builder.ins().bor(preserved, changed);
         self.store_cpu(SYSTEM_FLAGS, updated);
         false
@@ -383,7 +383,7 @@ impl Translator<'_, '_> {
     fn read_selector(&mut self, segment: u8) -> Value {
         let value = self.builder.ins().load(
             types::I16,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             self.cpu,
             Self::selector_offset(segment),
         );
@@ -398,20 +398,20 @@ impl Translator<'_, '_> {
 
     pub(crate) fn emit_check_iret(&mut self, cs: Val, ss: Option<Val>, ip: Val) -> bool {
         let cs = self.val(cs);
-        let cs = self.builder.ins().band_imm(cs, 0xffff);
+        let cs = self.builder.ins().band_imm_s(cs, 0xffff);
         let configured = self.read_selector(1);
         let mut bad = self.builder.ins().icmp(IntCC::NotEqual, cs, configured);
         let mut selector_bad = bad;
         if let Some(ss) = ss {
             let ss = self.val(ss);
-            let ss = self.builder.ins().band_imm(ss, 0xffff);
+            let ss = self.builder.ins().band_imm_s(ss, 0xffff);
             let configured = self.read_selector(2);
             let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ss, configured);
             bad = self.builder.ins().bor(bad, mismatch);
             selector_bad = bad;
             let ip = self.val(ip);
-            let canonical = self.builder.ins().ishl_imm(ip, 16);
-            let canonical = self.builder.ins().sshr_imm(canonical, 16);
+            let canonical = self.builder.ins().ishl_imm_s(ip, 16);
+            let canonical = self.builder.ins().sshr_imm_s(canonical, 16);
             let mismatch = self.builder.ins().icmp(IntCC::NotEqual, ip, canonical);
             bad = self.builder.ins().bor(bad, mismatch);
         }
@@ -420,8 +420,8 @@ impl Translator<'_, '_> {
 
     pub(crate) fn emit_check_iret_nt(&mut self) -> bool {
         let system = self.load_cpu(SYSTEM_FLAGS);
-        let nt = self.builder.ins().band_imm(system, 1 << 14);
-        let nt = self.builder.ins().icmp_imm(IntCC::NotEqual, nt, 0);
+        let nt = self.builder.ins().band_imm_s(system, 1 << 14);
+        let nt = self.builder.ins().icmp_imm_s(IntCC::NotEqual, nt, 0);
         self.iret_gp_if(nt, None)
     }
 

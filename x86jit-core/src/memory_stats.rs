@@ -14,9 +14,11 @@ pub struct BackendMemoryStats {
     pub compiled_units_total: u64,
     /// Sum of finalized unit lengths, including constant pools, excluding padding.
     pub code_bytes_emitted: u64,
-    /// Executable allocation bytes, including page tails, charged at finalize
-    /// attempts. Modeled from the pinned cranelift-jit 0.115.1 allocator; includes failed finalize
-    /// allocations, excludes definitions not yet submitted to finalize. Not RSS.
+    /// Executable allocation bytes, including alignment padding and page tails,
+    /// charged at finalize attempts. Modeled from the pinned cranelift-jit
+    /// 0.135.8 default SystemMemoryProvider's page-rounded anonymous mappings;
+    /// finalized tails are not reused. Includes failed finalize allocations,
+    /// excludes definitions not yet submitted to finalize. Not RSS.
     pub code_bytes_reserved: u64,
     /// Requests waiting in the background queue, excluding the active batch.
     pub background_queue_len: u64,

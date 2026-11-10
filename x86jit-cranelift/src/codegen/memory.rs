@@ -42,7 +42,7 @@ impl Translator<'_, '_> {
             );
             let loop_hdr = self.builder.create_block();
             let cur = self.builder.append_block_param(loop_hdr, ty);
-            self.builder.ins().jump(loop_hdr, &[cur0]);
+            self.builder.ins().jump(loop_hdr, &[cur0.into()]);
             self.builder.switch_to_block(loop_hdr);
             let new = self.builder.ins().isub(s, cur);
             let seen = self.builder.ins().atomic_cas(
@@ -54,7 +54,9 @@ impl Translator<'_, '_> {
             let ok = self.builder.ins().icmp(IntCC::Equal, seen, cur);
             let done = self.builder.create_block();
             // Retry (back-edge) on a lost race; `seen` is the old value on success.
-            self.builder.ins().brif(ok, done, &[], loop_hdr, &[seen]);
+            self.builder
+                .ins()
+                .brif(ok, done, &[], loop_hdr, &[seen.into()]);
             self.builder.seal_block(loop_hdr);
             self.builder.switch_to_block(done);
             self.builder.seal_block(done);
@@ -117,14 +119,14 @@ impl Translator<'_, '_> {
         let stopped = self
             .builder
             .ins()
-            .icmp_imm(IntCC::NotEqual, code, RET_CONTINUE as i64);
+            .icmp_imm_s(IntCC::NotEqual, code, RET_CONTINUE as i64);
         let ok = self.begin_trap_fork(stopped);
         self.tag_stack_fault();
         if let Some(fv) = self.fuel_var {
             let fuel = self.builder.use_var(fv);
             self.builder
                 .ins()
-                .store(MemFlags::trusted(), fuel, self.mem, MEMCTX_FUEL);
+                .store(MemFlagsData::trusted(), fuel, self.mem, MEMCTX_FUEL);
         }
         self.return_helper_status(code);
         self.builder.switch_to_block(ok);
@@ -162,7 +164,7 @@ impl Translator<'_, '_> {
         let stopped = self
             .builder
             .ins()
-            .icmp_imm(IntCC::NotEqual, code, RET_CONTINUE as i64);
+            .icmp_imm_s(IntCC::NotEqual, code, RET_CONTINUE as i64);
         let ok = self.begin_trap_fork(stopped);
         // The helper committed partial progress; stale register Variables must
         // not overwrite it. Regions must still write back their live fuel.
@@ -170,7 +172,7 @@ impl Translator<'_, '_> {
             let fuel = self.builder.use_var(fv);
             self.builder
                 .ins()
-                .store(MemFlags::trusted(), fuel, self.mem, MEMCTX_FUEL);
+                .store(MemFlagsData::trusted(), fuel, self.mem, MEMCTX_FUEL);
         }
         self.builder.ins().return_(&[code]);
         self.builder.switch_to_block(ok);

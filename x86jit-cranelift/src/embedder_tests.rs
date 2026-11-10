@@ -83,11 +83,12 @@ fn embedder_libcall_lowerings_finalize_on_both_isas() {
                 0,
                 false,
             );
-            builder.finalize();
+            builder.finalize(module.isa().frontend_config());
             let id = module
                 .declare_function(&format!("form_{i}"), Linkage::Export, &ctx.func.signature)
                 .unwrap();
             module.define_function(id, &mut ctx).unwrap();
+            libcalls::assert_supported_relocations(ctx.compiled_code().unwrap());
             for reloc in ctx.compiled_code().unwrap().buffer.relocs() {
                 if let cranelift::codegen::FinalizedRelocTarget::ExternalName(
                     ir::ExternalName::LibCall(call),

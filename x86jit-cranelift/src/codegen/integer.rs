@@ -46,7 +46,7 @@ impl Translator<'_, '_> {
                 .icmp(IntCC::UnsignedLessThan, result, sum);
             self.builder.ins().bor(first, second)
         } else {
-            let high = self.builder.ins().ushr_imm(result, i64::from(size * 8));
+            let high = self.builder.ins().ushr_imm_s(result, i64::from(size * 8));
             self.builder.ins().ireduce(types::I8, high)
         };
         let result = self.mask(result, size);
@@ -299,10 +299,10 @@ impl Translator<'_, '_> {
         let av = self.val(*a);
         let bits = (*size as i64) * 8;
         let b = self.val(*bit);
-        let b = self.builder.ins().band_imm(b, bits - 1);
+        let b = self.builder.ins().band_imm_s(b, bits - 1);
         // CF = (a >> b) & 1
         let sh = self.builder.ins().ushr(av, b);
-        let cf = self.builder.ins().band_imm(sh, 1);
+        let cf = self.builder.ins().band_imm_s(sh, 1);
         let cf = self.builder.ins().ireduce(types::I8, cf);
         self.store_flag(self.offsets.cf, cf);
         // result = a with the bit set / cleared / toggled
@@ -381,12 +381,12 @@ impl Translator<'_, '_> {
             // x87::mf_pending_before; MMX sequences share this pending-#MF path.
             let sw = self.builder.ins().load(
                 types::I16,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 self.cpu,
                 self.offsets.fpu_sw,
             );
-            let es = self.builder.ins().band_imm(sw, 1 << 7);
-            let pending = self.builder.ins().icmp_imm(IntCC::NotEqual, es, 0);
+            let es = self.builder.ins().band_imm_s(sw, 1 << 7);
+            let pending = self.builder.ins().icmp_imm_s(IntCC::NotEqual, es, 0);
             let ok = self.begin_trap_fork(pending);
             self.emit_trap(&16, &0);
             self.builder.switch_to_block(ok);
@@ -424,29 +424,31 @@ impl Translator<'_, '_> {
         // FIP is known at lift time; generated code only stores its constant.
         if instruction & x86jit_core::x87::X87_RECORD != 0 {
             self.store_cpu(self.offsets.fpu_fip, cur);
-            let cs =
-                self.builder
-                    .ins()
-                    .load(types::I16, MemFlags::trusted(), self.cpu, self.offsets.cs);
+            let cs = self.builder.ins().load(
+                types::I16,
+                MemFlagsData::trusted(),
+                self.cpu,
+                self.offsets.cs,
+            );
             self.store_cpu(self.offsets.fpu_fcs, cs);
             // SDM Vol 1 §§8.1.9, 8.7.1: FOP captures the constant opcode
             // when this operation sets ES for an unmasked exception.
             // AMD64 APM Vol 1 §6.2.5.2: AMD records every non-control opcode.
             let sw = self.builder.ins().load(
                 types::I16,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 self.cpu,
                 self.offsets.fpu_sw,
             );
-            let es = self.builder.ins().band_imm(sw, 1 << 7);
-            let raised = self.builder.ins().icmp_imm(IntCC::NotEqual, es, 0);
+            let es = self.builder.ins().band_imm_s(sw, 1 << 7);
+            let raised = self.builder.ins().icmp_imm_s(IntCC::NotEqual, es, 0);
             let model = self.builder.ins().load(
                 types::I8,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 self.cpu,
                 std::mem::offset_of!(x86jit_core::CpuState, x87_pointer_model) as i32,
             );
-            let amd = self.builder.ins().icmp_imm(
+            let amd = self.builder.ins().icmp_imm_s(
                 IntCC::Equal,
                 model,
                 x86jit_core::X87PointerModel::Amd as i64,
@@ -468,7 +470,7 @@ impl Translator<'_, '_> {
             // SDM Vol 1 §8.1.8: the helper checks FDP_EXCPTN_ONLY against
             // this vCPU's live identity. Every pointer store remains here.
             let status = self.builder.inst_results(inst)[0];
-            let skip = self.builder.ins().icmp_imm(IntCC::NotEqual, status, 0);
+            let skip = self.builder.ins().icmp_imm_s(IntCC::NotEqual, status, 0);
             let commit = self.builder.create_block();
             let next = self.builder.create_block();
             self.builder.ins().brif(skip, next, &[], commit, &[]);
@@ -476,7 +478,7 @@ impl Translator<'_, '_> {
             self.store_cpu(self.offsets.fpu_fdp, offset);
             let selector = self.builder.ins().load(
                 types::I16,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 self.cpu,
                 selector_offset as i32,
             );
@@ -582,7 +584,8 @@ impl Translator<'_, '_> {
                 self.store_flag(self.offsets.zf, is_zero); // only ZF defined
                 let idx = if matches!(op, BitScanOp::Bsr) {
                     let clz = self.builder.ins().clz(s);
-                    self.builder.ins().irsub_imm(clz, 63) // 63 - clz
+                    let top = self.builder.ins().iconst(types::I64, 63);
+                    self.builder.ins().isub(top, clz)
                 } else {
                     self.builder.ins().ctz(s)
                 };
@@ -596,16 +599,16 @@ impl Translator<'_, '_> {
                 let bc = self.iconst(bits as u64);
                 let r = self.builder.ins().select(is_zero, bc, ctz);
                 self.store_flag(self.offsets.cf, is_zero);
-                let rz = self.builder.ins().icmp_imm(IntCC::Equal, r, 0);
+                let rz = self.builder.ins().icmp_imm_s(IntCC::Equal, r, 0);
                 self.store_flag(self.offsets.zf, rz);
                 r
             }
             BitScanOp::Lzcnt => {
                 // clz over the full I64 minus the padding above `bits`.
                 let clz = self.builder.ins().clz(s);
-                let r = self.builder.ins().iadd_imm(clz, -(64 - bits));
+                let r = self.builder.ins().iadd_imm_s(clz, -(64 - bits));
                 self.store_flag(self.offsets.cf, is_zero);
-                let rz = self.builder.ins().icmp_imm(IntCC::Equal, r, 0);
+                let rz = self.builder.ins().icmp_imm_s(IntCC::Equal, r, 0);
                 self.store_flag(self.offsets.zf, rz);
                 r
             }
@@ -629,19 +632,19 @@ impl Translator<'_, '_> {
         let opc = self.iconst(*op as u64);
         let sz = self.iconst(*size as u64);
         let (ss, _) = self.call_with_out_slot(self.helpers.bmi, &[av, bv, opc, sz]);
-        let r = self.builder.ins().stack_load(types::I64, ss, 0);
-        let cf = self.builder.ins().stack_load(types::I64, ss, 8);
+        let r = self.builder.ins().stack_load(types::I64, types::I64, ss, 0);
+        let cf = self.builder.ins().stack_load(types::I64, types::I64, ss, 8);
         self.set(*dst, r);
         if op.writes_flags() {
-            let cfb = self.builder.ins().icmp_imm(IntCC::NotEqual, cf, 0);
+            let cfb = self.builder.ins().icmp_imm_s(IntCC::NotEqual, cf, 0);
             self.store_flag(self.offsets.cf, cfb);
             let zero = self.iconst(0);
             let zf = self.builder.ins().icmp(IntCC::Equal, r, zero);
             self.store_flag(self.offsets.zf, zf);
             let bits = *size as i64 * 8;
-            let top = self.builder.ins().ushr_imm(r, bits - 1);
-            let sfv = self.builder.ins().band_imm(top, 1);
-            let sf = self.builder.ins().icmp_imm(IntCC::NotEqual, sfv, 0);
+            let top = self.builder.ins().ushr_imm_s(r, bits - 1);
+            let sfv = self.builder.ins().band_imm_s(top, 1);
+            let sf = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sfv, 0);
             self.store_flag(self.offsets.sf, sf);
             let z8 = self.builder.ins().iconst(types::I8, 0);
             self.store_flag(self.offsets.of, z8);

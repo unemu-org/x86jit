@@ -97,7 +97,8 @@ fn prepare_guest_traps(
             let Some(flags) = func.dfg.insts[inst].memflags() else {
                 continue;
             };
-            let Some(code) = flags.trap_code() else {
+            let flags_data = func.dfg.mem_flags[flags];
+            let Some(code) = flags_data.trap_code() else {
                 continue;
             };
             let Some((access, width)) = codegen::guest_trap_access(code) else {
@@ -121,6 +122,11 @@ fn prepare_guest_traps(
                 }
                 None => return Err(CompileError::DescriptorLimit),
             };
+            let owner_flags = func
+                .dfg
+                .mem_flags
+                .insert(flags_data.with_trap_code(ir::TrapCode::user(index as u8 + 1)))
+                .map_err(|_| CompileError::Unavailable)?;
             use ir::InstructionData::*;
             let flags = match &mut func.dfg.insts[inst] {
                 Load { flags, .. }
@@ -131,7 +137,7 @@ fn prepare_guest_traps(
                 | AtomicRmw { flags, .. } => flags,
                 _ => unreachable!("memflags only exists on memory instructions"),
             };
-            *flags = flags.with_trap_code(ir::TrapCode::user(index as u8 + 1));
+            *flags = owner_flags;
         }
     }
     Ok(metadata)
@@ -2483,8 +2489,8 @@ const MAX_HELPERS: usize = 128;
 /// compile spike under peak pressure.
 const TIER_QUEUE_CAP: usize = 64;
 
-// Bound publication latency without waiting for more work. Cranelift 0.115.1
-// memory.rs::set_readable_and_executable seals the current allocation, so only
+// Bound publication latency without waiting for more work. Cranelift 0.135.8
+// memory/system.rs::set_readable_and_executable seals the current mapping, so only
 // definitions before the same finalize can share its unused page tail.
 const TIER_FINALIZE_BATCH: usize = TIER_QUEUE_CAP;
 
@@ -3621,6 +3627,7 @@ impl Shared {
         let fp_signatures = (mxcsr_mode != 0).then(|| (params(1, false), params(8, false)));
         let slots_start = jit.slots.len();
         let guest_rips = {
+            let frontend_config = jit.module.isa().frontend_config();
             let Jit { fbctx, slots, .. } = &mut *jit;
             let mut alloc_slot = || {
                 let b = Box::new(AtomicU64::new(0));
@@ -3762,7 +3769,7 @@ impl Shared {
                 note_watch: helper!(note_watch_sig, note_write_helper),
             };
             let guest_rips = translate(&mut builder, helpers, &mut alloc_slot);
-            builder.finalize();
+            builder.finalize(frontend_config);
             guest_rips
         };
 
@@ -3783,7 +3790,6 @@ impl Shared {
         #[cfg(test)]
         if self.fail_compile_stage.load(Ordering::Relaxed) == 1 {
             self.compile_result(Err(ModuleError::Allocation {
-                message: "injected code arena exhaustion",
                 err: std::io::ErrorKind::OutOfMemory.into(),
             }))
             .ok_or(CompileError::Unavailable)?;
@@ -4064,7 +4070,7 @@ impl Shared {
     /// Drain only work already queued, at most TIER_FINALIZE_BATCH definitions.
     /// Release compilation locks between definitions: a foreground compile can
     /// finalize immediately (including any pending definitions in its module).
-    /// Neither path writes a previously sealed page. Cranelift 0.115.1
+    /// Neither path writes a previously sealed page. Cranelift 0.135.8
     /// backend.rs::finalize_definitions owns relocation and cache synchronization.
     fn worker_loop(&self) {
         loop {

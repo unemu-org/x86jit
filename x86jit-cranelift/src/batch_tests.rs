@@ -1,4 +1,4 @@
-//! Publication witnesses for the Cranelift 0.115 background finalization batch.
+//! Publication witnesses for the Cranelift 0.135.8 background finalization batch.
 use super::*;
 use x86jit_core::jit_abi::run_compiled;
 use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};

@@ -12,16 +12,19 @@ impl Translator<'_, '_> {
             .iconst(types::I8, if empty { 255 } else { 0 });
         self.builder
             .ins()
-            .store(MemFlags::trusted(), z, self.cpu, self.offsets.fpu_top);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), tags, self.cpu, self.offsets.fpu_empty);
+            .store(MemFlagsData::trusted(), z, self.cpu, self.offsets.fpu_top);
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            tags,
+            self.cpu,
+            self.offsets.fpu_empty,
+        );
     }
 
     pub(super) fn mmx_read(&mut self, reg: u8) -> Value {
         self.builder.ins().load(
             types::I64,
-            MemFlags::new().with_notrap(),
+            MemFlagsData::new().with_notrap(),
             self.cpu,
             self.offsets.fpr + i32::from(reg) * 10,
         )
@@ -32,14 +35,14 @@ impl Translator<'_, '_> {
         let exp = self.builder.ins().iconst(types::I16, -1);
         self.builder
             .ins()
-            .store(MemFlags::new().with_notrap(), src, self.cpu, off);
+            .store(MemFlagsData::new().with_notrap(), src, self.cpu, off);
         self.builder
             .ins()
-            .store(MemFlags::new().with_notrap(), exp, self.cpu, off + 8);
+            .store(MemFlagsData::new().with_notrap(), exp, self.cpu, off + 8);
     }
 
     fn mmx_elem(&mut self, v: Value, n: u8, lane: u8, signed: bool) -> Value {
-        let shifted = self.builder.ins().ushr_imm(v, i64::from(n * lane * 8));
+        let shifted = self.builder.ins().ushr_imm_s(v, i64::from(n * lane * 8));
         let ty = match lane {
             1 => types::I8,
             2 => types::I16,
@@ -56,8 +59,8 @@ impl Translator<'_, '_> {
 
     fn mmx_insert(&mut self, acc: Value, v: Value, n: u8, lane: u8) -> Value {
         let mask = u64::MAX >> (64 - lane * 8);
-        let v = self.builder.ins().band_imm(v, mask as i64);
-        let v = self.builder.ins().ishl_imm(v, i64::from(n * lane * 8));
+        let v = self.builder.ins().band_imm_s(v, mask as i64);
+        let v = self.builder.ins().ishl_imm_s(v, i64::from(n * lane * 8));
         self.builder.ins().bor(acc, v)
     }
 
@@ -101,14 +104,17 @@ impl Translator<'_, '_> {
                 }
                 let av = self.builder.ins().uextend(types::I128, a);
                 let bv = self.builder.ins().uextend(types::I128, b);
-                let av = self.builder.ins().ishl_imm(av, 64);
+                let av = self.builder.ins().ishl_imm_s(av, 64);
                 let v = self.builder.ins().bor(av, bv);
-                let r = self.builder.ins().ushr_imm(v, i64::from(imm) * 8);
+                let r = self.builder.ins().ushr_imm_s(v, i64::from(imm) * 8);
                 self.builder.ins().ireduce(types::I64, r)
             }
             MmxOp::Extract(index) => self.mmx_elem(a, index, 2, false),
             MmxOp::Insert(index) => {
-                let v = self.builder.ins().band_imm(a, !(0xffffi64 << (index * 16)));
+                let v = self
+                    .builder
+                    .ins()
+                    .band_imm_s(a, !(0xffffi64 << (index * 16)));
                 self.mmx_insert(v, b, index, 2)
             }
             MmxOp::Mask => {
@@ -122,7 +128,7 @@ impl Translator<'_, '_> {
                 let b = self
                     .builder
                     .ins()
-                    .band_imm(b, 0x8787_8787_8787_8787u64 as i64);
+                    .band_imm_s(b, 0x8787_8787_8787_8787u64 as i64);
                 let b = self.builder.ins().uextend(types::I128, b);
                 let v = self.emit_pshufb(a, b);
                 self.builder.ins().ireduce(types::I64, v)

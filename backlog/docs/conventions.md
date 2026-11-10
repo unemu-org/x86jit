@@ -115,7 +115,7 @@ is where they live.
 
 ## Stack-specific (Rust)
 
-- **Edition:** 2021. **MSRV:** 1.75 (workspace `rust-version`).
+- **Edition:** 2021. **MSRV:** 1.95 (workspace `rust-version`).
 - **Lints:** `cargo clippy --all-targets --all-features -- -D warnings` must pass. No warnings in committed code.
 - **Error handling:** typed enums per layer (`LiftError`, `MapError`, `MemError`, `MemTrap`, `FaultKind`) — **no `anyhow`/`thiserror` in the core**. The public failure surface is `Exit` (§5.2); lift errors map to `Exit`, they never panic (§7.3).
 - **`unsafe`:** confined to the JIT boundary — the compiled-block ABI (§8.2.1) and `CompiledPtr`'s manual `Send + Sync` (§9.1). Every `unsafe` block carries a `// SAFETY:` note. No `unsafe` in the interpreter path.

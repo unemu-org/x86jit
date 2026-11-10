@@ -32,6 +32,7 @@ fn audit_guest_accesses(func: &ir::Function, hosts: &[Value]) -> Vec<(u64, Guest
         let Some(flags) = data.memflags() else {
             continue;
         };
+        let flags = func.dfg.mem_flags[flags];
         let (host, access, ty) = match data {
             Load { arg, .. } | LoadNoOffset { arg, .. } => (
                 *arg,
@@ -193,7 +194,7 @@ fn compile_ir_for_isa_with_split_stores(
             false,
         )
     };
-    builder.finalize();
+    builder.finalize(isa.frontend_config());
     ctx.set_disasm(true);
     let hosts = CHECKED_HOSTS.with(|hosts| std::mem::take(&mut *hosts.borrow_mut()));
     let original_accesses = audit_guest_accesses(&ctx.func, &hosts);
@@ -203,6 +204,7 @@ fn compile_ir_for_isa_with_split_stores(
     let started = std::time::Instant::now();
     ctx.compile(isa, &mut Default::default()).unwrap();
     let cc = ctx.compiled_code().unwrap();
+    crate::libcalls::assert_supported_relocations(cc);
     let compile_ns = started.elapsed().as_nanos();
     let started = std::time::Instant::now();
     let sites = crate::collect_guest_traps(cc, &metadata).unwrap_or_else(|()| {
@@ -238,7 +240,7 @@ fn compile_ir_for_isa_with_split_stores(
             if !data.opcode().can_load() && !data.opcode().can_store() {
                 return None;
             }
-            let code = data.memflags()?.trap_code()?;
+            let code = ctx.func.dfg.mem_flags[data.memflags()?].trap_code()?;
             let descriptor = metadata[code.as_raw().get() as usize - 1];
             Some((descriptor.guest_rip, descriptor.access, descriptor.width))
         })
@@ -653,7 +655,7 @@ fn guest_trap_sites_x64_merged_load_keeps_owner() {
     }
 }
 
-fn memory_fixture(isa: &dyn cranelift::codegen::isa::TargetIsa, flags: MemFlags) -> Context {
+fn memory_fixture(isa: &dyn cranelift::codegen::isa::TargetIsa, flags: MemFlagsData) -> Context {
     let mut ctx = Context::new();
     ctx.func.signature.call_conv = isa.default_call_conv();
     ctx.func
@@ -673,7 +675,7 @@ fn memory_fixture(isa: &dyn cranelift::codegen::isa::TargetIsa, flags: MemFlags)
     let result = builder.ins().bor(params[1], value);
     builder.ins().return_(&[result]);
     builder.seal_all_blocks();
-    builder.finalize();
+    builder.finalize(isa.frontend_config());
     ctx
 }
 
@@ -808,8 +810,8 @@ fn guest_trap_sites_refuse_missing_owner_without_panicking() {
 #[test]
 fn guest_trap_sites_reject_unknown_machine_codes() {
     for flags in [
-        MemFlags::new(),
-        MemFlags::new().with_trap_code(ir::TrapCode::user(250)),
+        MemFlagsData::new(),
+        MemFlagsData::new().with_trap_code(ir::TrapCode::user(250)),
     ] {
         let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::None);
         let mut ctx = memory_fixture(jit.module.isa(), flags);
@@ -827,7 +829,7 @@ fn guest_trap_sites_reject_unknown_preparation_codes_without_panicking() {
     let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::None);
     let mut ctx = memory_fixture(
         jit.module.isa(),
-        MemFlags::new().with_trap_code(ir::TrapCode::user(250)),
+        MemFlagsData::new().with_trap_code(ir::TrapCode::user(250)),
     );
     assert_eq!(
         crate::prepare_guest_traps(&mut ctx.func, &[HIGH_BASE]),
@@ -838,7 +840,7 @@ fn guest_trap_sites_reject_unknown_preparation_codes_without_panicking() {
 #[test]
 fn guest_trap_sites_audit_detects_trusted_guest_access() {
     let jit = JitBackend::build_jit(HostTarget::Native, OptLevel::None);
-    let ctx = memory_fixture(jit.module.isa(), MemFlags::trusted());
+    let ctx = memory_fixture(jit.module.isa(), MemFlagsData::trusted());
     let host = ctx
         .func
         .dfg
@@ -1185,7 +1187,7 @@ fn split_store_preflight_reuses_only_dominating_proofs() {
                         matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
                             && ctx.func.dfg.insts[i]
                                 .memflags()
-                                .and_then(|f| f.trap_code())
+                                .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
                                 .is_some()
                     })
                     .count();
@@ -1231,7 +1233,7 @@ fn split_store_preflight_omits_proven_alignment_only() {
                         matches!(ctx.func.dfg.insts[i], ir::InstructionData::AtomicRmw { .. })
                             && ctx.func.dfg.insts[i]
                                 .memflags()
-                                .and_then(|f| f.trap_code())
+                                .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
                                 .is_some()
                     })
                     .count();
@@ -1285,7 +1287,7 @@ fn split_store_policy_controls_probes_on_both_isas() {
                                     ir::InstructionData::AtomicRmw { .. }
                                 ) && ctx.func.dfg.insts[i]
                                     .memflags()
-                                    .and_then(|f| f.trap_code())
+                                    .and_then(|f| ctx.func.dfg.mem_flags[f].trap_code())
                                     .is_some()
                             })
                             .count();

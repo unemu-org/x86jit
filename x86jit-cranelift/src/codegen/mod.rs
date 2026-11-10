@@ -38,11 +38,11 @@ use x86jit_core::{
     RepKind, RmwOp, ShaOp, StrOp, VKLogicOp, VLogicOp, Val, VpUnaryOp, PF_SRC_ONE, PF_SRC_ZERO,
 };
 
-// Cranelift 0.115.1 src/ir/memflags.rs: trusted() promises both notrap and
+// Cranelift 0.135.8 src/ir/memflags.rs: trusted() promises both notrap and
 // aligned; with_trap_code(Some(..)) retains a trapping, unaligned access.
 // src/ir/trapcode.rs allows user codes 1..=250. Encode direction and transfer
 // width during translation; prepare_guest_traps replaces these with owner codes.
-pub(crate) fn guest_mem_flags(access: GuestAccessKind, width: u8) -> MemFlags {
+pub(crate) fn guest_mem_flags(access: GuestAccessKind, width: u8) -> MemFlagsData {
     let direction = match access {
         GuestAccessKind::Read => 0,
         GuestAccessKind::Write => 1,
@@ -56,7 +56,7 @@ pub(crate) fn guest_mem_flags(access: GuestAccessKind, width: u8) -> MemFlags {
         16 => 4,
         _ => unreachable!("guest transfer must be split to at most sixteen bytes"),
     };
-    MemFlags::new().with_trap_code(ir::TrapCode::user(1 + direction * 5 + size))
+    MemFlagsData::new().with_trap_code(ir::TrapCode::user(1 + direction * 5 + size))
 }
 
 pub(crate) fn guest_trap_access(code: ir::TrapCode) -> Option<(GuestAccessKind, u8)> {
@@ -483,9 +483,8 @@ pub fn translate_region(
     // `CpuState` in the entry block (which dominates everything), and switch to
     // Variable mode. `ret` flushes them back at every exit.
     let mut gpr_vars = [Variable::new(0); 16];
-    for (i, slot) in gpr_vars.iter_mut().enumerate() {
-        let var = Variable::new(i);
-        t.builder.declare_var(var, types::I64);
+    for slot in &mut gpr_vars {
+        let var = t.builder.declare_var(types::I64);
         *slot = var;
     }
     for (i, &var) in gpr_vars.iter().enumerate() {
@@ -496,8 +495,7 @@ pub fn translate_region(
 
     // Fuel is likewise a carried Variable (seeded from MemCtx), so the per-block
     // gate is a register decrement, not a load+store.
-    let fuel_var = Variable::new(16);
-    t.builder.declare_var(fuel_var, types::I64);
+    let fuel_var = t.builder.declare_var(types::I64);
     let init_fuel = t.load_mem(MEMCTX_FUEL);
     t.builder.def_var(fuel_var, init_fuel);
     t.fuel_var = Some(fuel_var);
@@ -716,8 +714,7 @@ impl Translator<'_, '_> {
         });
         let mut vars = [Variable::new(0); 6];
         for (i, off) in self.flag_offsets().into_iter().enumerate() {
-            let var = Variable::new(17 + self.guest_rips.len() * 6 + i);
-            self.builder.declare_var(var, types::I8);
+            let var = self.builder.declare_var(types::I8);
             if conditional {
                 let old = self.load_flag(off);
                 self.builder.def_var(var, old);
@@ -875,7 +872,7 @@ impl Translator<'_, '_> {
             IrOp::InsnStart { guest_addr, .. } => self.emit_insn_start(guest_addr),
             IrOp::CheckAlign { addr, bytes } => {
                 let addr = self.val(*addr);
-                let low = self.builder.ins().band_imm(addr, i64::from(*bytes) - 1);
+                let low = self.builder.ins().band_imm_s(addr, i64::from(*bytes) - 1);
                 self.check_alignment(low);
                 self.aligned_store_addrs.push((addr, *bytes));
                 false
@@ -1109,7 +1106,7 @@ impl Translator<'_, '_> {
             IrOp::GetMxcsr { dst } => {
                 let value = self.builder.ins().load(
                     types::I32,
-                    MemFlags::trusted(),
+                    MemFlagsData::trusted(),
                     self.cpu,
                     self.offsets.mxcsr,
                 );
@@ -1122,15 +1119,18 @@ impl Translator<'_, '_> {
                 let reserved = self
                     .builder
                     .ins()
-                    .band_imm(value, !i64::from(x86jit_core::state::MXCSR_MASK));
-                let invalid = self.builder.ins().icmp_imm(IntCC::NotEqual, reserved, 0);
+                    .band_imm_s(value, !i64::from(x86jit_core::state::MXCSR_MASK));
+                let invalid = self.builder.ins().icmp_imm_s(IntCC::NotEqual, reserved, 0);
                 let ok = self.begin_trap_fork(invalid);
                 self.emit_trap(&13, &0);
                 self.builder.switch_to_block(ok);
                 let value = self.builder.ins().ireduce(types::I32, value);
-                self.builder
-                    .ins()
-                    .store(MemFlags::trusted(), value, self.cpu, self.offsets.mxcsr);
+                self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    value,
+                    self.cpu,
+                    self.offsets.mxcsr,
+                );
                 let end = self.iconst(self.guest_end);
                 self.store_cpu(self.offsets.rip, end);
                 self.ret(RET_MXCSR_CHANGED);
@@ -1850,7 +1850,7 @@ impl Translator<'_, '_> {
                 let v = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlags::trusted(), self.cpu, off);
+                    .load(types::I64, MemFlagsData::trusted(), self.cpu, off);
                 self.set(*dst, v);
                 false
             }
@@ -1859,7 +1859,7 @@ impl Translator<'_, '_> {
                 let off = self.vector_chunk_offset(*dst, *chunk);
                 self.builder
                     .ins()
-                    .store(MemFlags::trusted(), v, self.cpu, off);
+                    .store(MemFlagsData::trusted(), v, self.cpu, off);
                 false
             }
             IrOp::VToGpr { dst, src, size, .. } => self.emit_v_to_gpr(dst, src, size),
@@ -2120,7 +2120,7 @@ impl Translator<'_, '_> {
                 let hi = self.val(*hi);
                 let lo = self.builder.ins().uextend(types::I128, lo);
                 let hi = self.builder.ins().uextend(types::I128, hi);
-                let hi = self.builder.ins().ishl_imm(hi, 64);
+                let hi = self.builder.ins().ishl_imm_s(hi, 64);
                 let v = self.builder.ins().bor(lo, hi);
                 let r = self.packed_cvt_value(v, kind);
                 if *to_mmx {
@@ -2128,8 +2128,8 @@ impl Translator<'_, '_> {
                     self.mmx_write(*dst, lo);
                 } else if matches!(kind, PackedCvtKind::Dq2Ps) {
                     let old = self.load_xmm(*dst);
-                    let old = self.builder.ins().ushr_imm(old, 64);
-                    let old = self.builder.ins().ishl_imm(old, 64);
+                    let old = self.builder.ins().ushr_imm_s(old, 64);
+                    let old = self.builder.ins().ishl_imm_s(old, 64);
                     let r = self.builder.ins().bor(old, r);
                     self.store_xmm(*dst, r);
                 } else {
@@ -2569,13 +2569,13 @@ impl Translator<'_, '_> {
         } else {
             let s0 = self.builder.ins().iadd(am, bm);
             let s = self.builder.ins().iadd(s0, cin);
-            let shifted = self.builder.ins().ushr_imm(s, (size * 8) as i64);
-            let cf_bit = self.builder.ins().band_imm(shifted, 1);
+            let shifted = self.builder.ins().ushr_imm_s(s, (size * 8) as i64);
+            let cf_bit = self.builder.ins().band_imm_s(shifted, 1);
             let cf = self.builder.ins().ireduce(types::I8, cf_bit);
             let res = self.mask(s, size);
             (res, cf)
         };
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
 
@@ -2646,7 +2646,7 @@ impl Translator<'_, '_> {
         } else {
             let cont = self.builder.create_block();
             let doflags = self.builder.create_block();
-            let iszero = self.builder.ins().icmp_imm(IntCC::Equal, cnt, 0);
+            let iszero = self.builder.ins().icmp_imm_s(IntCC::Equal, cnt, 0);
             self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
             self.builder.seal_block(doflags);
             self.builder.switch_to_block(doflags);
@@ -2660,10 +2660,12 @@ impl Translator<'_, '_> {
                 let le = self
                     .builder
                     .ins()
-                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, cnt, n);
-                let nsub = self.builder.ins().irsub_imm(cnt, n);
+                    .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, cnt, n);
+                let cnt_ty = self.builder.func.dfg.value_type(cnt);
+                let nval = self.builder.ins().iconst(cnt_ty, n);
+                let nsub = self.builder.ins().isub(nval, cnt);
                 let bit = self.builder.ins().ushr(vm, nsub);
-                let bit = self.builder.ins().band_imm(bit, 1);
+                let bit = self.builder.ins().band_imm_s(bit, 1);
                 let bit = self.builder.ins().ireduce(types::I8, bit);
                 let cf = self.builder.ins().select(le, bit, zero8);
                 let msb = self.msb(res, size);
@@ -2672,9 +2674,9 @@ impl Translator<'_, '_> {
             }
             ShiftKind::Shr => {
                 // CF = bit(cnt-1) of the original; OF = original MSB.
-                let cm1 = self.builder.ins().iadd_imm(cnt, -1);
+                let cm1 = self.builder.ins().iadd_imm_s(cnt, -1);
                 let bit = self.builder.ins().ushr(vm, cm1);
-                let bit = self.builder.ins().band_imm(bit, 1);
+                let bit = self.builder.ins().band_imm_s(bit, 1);
                 let cf = self.builder.ins().ireduce(types::I8, bit);
                 let of = self.msb(vm, size);
                 (cf, of)
@@ -2684,15 +2686,15 @@ impl Translator<'_, '_> {
                 // read it from the sign-extended value (not the masked `vm`, which is 0 past its
                 // top bit). Mirrors exec_sar in the interpreter.
                 let se = self.sign_extend(vm, size);
-                let cm1 = self.builder.ins().iadd_imm(cnt, -1);
+                let cm1 = self.builder.ins().iadd_imm_s(cnt, -1);
                 let bit = self.builder.ins().ushr(se, cm1);
-                let bit = self.builder.ins().band_imm(bit, 1);
+                let bit = self.builder.ins().band_imm_s(bit, 1);
                 let cf = self.builder.ins().ireduce(types::I8, bit);
                 (cf, zero8)
             }
             ShiftKind::Rol => {
                 // CF = LSB(res); OF = MSB(res) ^ CF.
-                let lsb = self.builder.ins().band_imm(res, 1);
+                let lsb = self.builder.ins().band_imm_s(res, 1);
                 let cf = self.builder.ins().ireduce(types::I8, lsb);
                 let msb = self.msb(res, size);
                 let of = self.builder.ins().bxor(msb, cf);
@@ -2702,14 +2704,14 @@ impl Translator<'_, '_> {
                 // CF = MSB(res); OF = MSB(res) ^ bit(n-2).
                 let cf = self.msb(res, size);
                 let n = (size * 8) as i64;
-                let below = self.builder.ins().ushr_imm(res, n - 2);
-                let below = self.builder.ins().band_imm(below, 1);
+                let below = self.builder.ins().ushr_imm_s(res, n - 2);
+                let below = self.builder.ins().band_imm_s(below, 1);
                 let below = self.builder.ins().ireduce(types::I8, below);
                 let of = self.builder.ins().bxor(cf, below);
                 (cf, of)
             }
         };
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf, pf_src, zero8, zf, sf, of);
@@ -2740,7 +2742,7 @@ impl Translator<'_, '_> {
         let x = self.mask(a, size);
         let cf_in = self.load_flag_u64(self.offsets.cf); // I64, 0 or 1
         let countmask = if size == 8 { 0x3f } else { 0x1f };
-        let nmasked = self.builder.ins().band_imm(b, countmask);
+        let nmasked = self.builder.ins().band_imm_s(b, countmask);
         // SDM Vol 2B §4.3, RCL/RCR/ROL/ROR, Operation: only byte/word
         // counts need reduction modulo 9/17 after masking to five bits.
         // Bounded subtraction avoids x64's division trap records even at opt=None;
@@ -2752,11 +2754,11 @@ impl Translator<'_, '_> {
         };
         let mut n = nmasked;
         for &divisor in reductions {
-            let reduce = self
-                .builder
-                .ins()
-                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, n, divisor);
-            let reduced = self.builder.ins().iadd_imm(n, -divisor);
+            let reduce =
+                self.builder
+                    .ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, n, divisor);
+            let reduced = self.builder.ins().iadd_imm_s(n, -divisor);
             n = self.builder.ins().select(reduce, reduced, n);
         }
 
@@ -2772,31 +2774,37 @@ impl Translator<'_, '_> {
         self.builder.append_block_param(exit, types::I64); // final cf
 
         let zero = self.iconst(0);
-        self.builder.ins().jump(header, &[x, cf_in, zero]);
+        self.builder
+            .ins()
+            .jump(header, &[x.into(), cf_in.into(), zero.into()]);
         self.builder.switch_to_block(header);
         let hp = self.builder.block_params(header).to_vec();
         let (v, cf, i) = (hp[0], hp[1], hp[2]);
         let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, i, n);
-        self.builder.ins().brif(more, body, &[], exit, &[v, cf]);
+        self.builder
+            .ins()
+            .brif(more, body, &[], exit, &[v.into(), cf.into()]);
 
         self.builder.switch_to_block(body);
         self.builder.seal_block(body);
         let (nv, ncf) = if left {
             // msb out to CF; shift left, bring old CF into bit 0.
-            let top = self.builder.ins().ushr_imm(v, w - 1);
-            let msb = self.builder.ins().band_imm(top, 1);
-            let sh = self.builder.ins().ishl_imm(v, 1);
+            let top = self.builder.ins().ushr_imm_s(v, w - 1);
+            let msb = self.builder.ins().band_imm_s(top, 1);
+            let sh = self.builder.ins().ishl_imm_s(v, 1);
             let orr = self.builder.ins().bor(sh, cf);
             (self.mask(orr, size), msb)
         } else {
             // lsb out to CF; shift right, bring old CF into the top bit.
-            let lsb = self.builder.ins().band_imm(v, 1);
-            let sh = self.builder.ins().ushr_imm(v, 1);
-            let cfhi = self.builder.ins().ishl_imm(cf, w - 1);
+            let lsb = self.builder.ins().band_imm_s(v, 1);
+            let sh = self.builder.ins().ushr_imm_s(v, 1);
+            let cfhi = self.builder.ins().ishl_imm_s(cf, w - 1);
             (self.builder.ins().bor(sh, cfhi), lsb)
         };
-        let ni = self.builder.ins().iadd_imm(i, 1);
-        self.builder.ins().jump(header, &[nv, ncf, ni]);
+        let ni = self.builder.ins().iadd_imm_s(i, 1);
+        self.builder
+            .ins()
+            .jump(header, &[nv.into(), ncf.into(), ni.into()]);
         self.builder.seal_block(header);
 
         self.builder.switch_to_block(exit);
@@ -2818,7 +2826,7 @@ impl Translator<'_, '_> {
         // Flags only when the effective count is non-zero.
         let cont = self.builder.create_block();
         let doflags = self.builder.create_block();
-        let iszero = self.builder.ins().icmp_imm(IntCC::Equal, n, 0);
+        let iszero = self.builder.ins().icmp_imm_s(IntCC::Equal, n, 0);
         self.builder.ins().brif(iszero, cont, &[], doflags, &[]);
         self.builder.seal_block(doflags);
         self.builder.switch_to_block(doflags);
@@ -2845,13 +2853,13 @@ impl Translator<'_, '_> {
             self.builder.ins().bxor(msb, cf8)
         } else {
             // OF = XOR of the top two result bits (defined for count 1).
-            let below = self.builder.ins().ushr_imm(res, w - 2);
-            let below = self.builder.ins().band_imm(below, 1);
+            let below = self.builder.ins().ushr_imm_s(res, w - 2);
+            let below = self.builder.ins().band_imm_s(below, 1);
             let below = self.builder.ins().ireduce(types::I8, below);
             self.builder.ins().bxor(msb, below)
         };
         let zero8 = self.builder.ins().iconst(types::I8, 0);
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf8, pf_src, zero8, zf, sf, of);
@@ -2874,7 +2882,9 @@ impl Translator<'_, '_> {
         let vb = self.mask(b, size);
         let cnt = self.shift_count(count, size);
         let n = (size * 8) as i64;
-        let nsub = self.builder.ins().irsub_imm(cnt, n); // n - cnt
+        let cnt_ty = self.builder.func.dfg.value_type(cnt);
+        let nval = self.builder.ins().iconst(cnt_ty, n);
+        let nsub = self.builder.ins().isub(nval, cnt); // n - cnt
         let shifted = if left {
             let lo = self.builder.ins().ishl(va, cnt);
             let hi = self.builder.ins().ushr(vb, nsub);
@@ -2886,7 +2896,7 @@ impl Translator<'_, '_> {
         };
         let shifted = self.mask(shifted, size);
         // A masked count of 0 is a no-op (and `n - 0` would wrap the shift); keep `a`.
-        let iszero = self.builder.ins().icmp_imm(IntCC::Equal, cnt, 0);
+        let iszero = self.builder.ins().icmp_imm_s(IntCC::Equal, cnt, 0);
         let res = self.builder.ins().select(iszero, va, shifted);
         self.set(dst, res);
         self.flag_recipe = Some(FlagRecipe::DoubleShift {
@@ -2916,19 +2926,19 @@ impl Translator<'_, '_> {
         // CF = last bit shifted out of `a`: bit(n-cnt) for SHLD, bit(cnt-1) for SHRD.
         let cf = if left {
             let bit = self.builder.ins().ushr(va, nsub);
-            let bit = self.builder.ins().band_imm(bit, 1);
+            let bit = self.builder.ins().band_imm_s(bit, 1);
             self.builder.ins().ireduce(types::I8, bit)
         } else {
-            let cm1 = self.builder.ins().iadd_imm(cnt, -1);
+            let cm1 = self.builder.ins().iadd_imm_s(cnt, -1);
             let bit = self.builder.ins().ushr(va, cm1);
-            let bit = self.builder.ins().band_imm(bit, 1);
+            let bit = self.builder.ins().band_imm_s(bit, 1);
             self.builder.ins().ireduce(types::I8, bit)
         };
         // OF (count==1): the result's sign bit flipped vs the source's.
         let rmsb = self.msb(res, size);
         let amsb = self.msb(va, size);
         let of = self.builder.ins().bxor(rmsb, amsb);
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.store_flags(mask, cf, pf_src, zero8, zf, sf, of);
@@ -2960,19 +2970,19 @@ impl Translator<'_, '_> {
                 (self.sign_extend(a, size), self.sign_extend(b, size))
             } else {
                 (
-                    self.builder.ins().band_imm(a, m),
-                    self.builder.ins().band_imm(b, m),
+                    self.builder.ins().band_imm_s(a, m),
+                    self.builder.ins().band_imm_s(b, m),
                 )
             };
             let prod = self.builder.ins().imul(va, vb);
-            let lo = self.builder.ins().band_imm(prod, m);
-            let hi_sh = self.builder.ins().ushr_imm(prod, n);
-            let hi = self.builder.ins().band_imm(hi_sh, m);
+            let lo = self.builder.ins().band_imm_s(prod, m);
+            let hi_sh = self.builder.ins().ushr_imm_s(prod, n);
+            let hi = self.builder.ins().band_imm_s(hi_sh, m);
             let of = if signed {
                 let sl = self.sign_extend(lo, size);
                 self.builder.ins().icmp(IntCC::NotEqual, prod, sl)
             } else {
-                self.builder.ins().icmp_imm(IntCC::NotEqual, hi, 0)
+                self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
             };
             (lo, hi, of)
         } else {
@@ -2983,10 +2993,10 @@ impl Translator<'_, '_> {
                 self.builder.ins().umulhi(a, b)
             };
             let of = if signed {
-                let sl = self.builder.ins().sshr_imm(lo, 63);
+                let sl = self.builder.ins().sshr_imm_s(lo, 63);
                 self.builder.ins().icmp(IntCC::NotEqual, hi, sl)
             } else {
-                self.builder.ins().icmp_imm(IntCC::NotEqual, hi, 0)
+                self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
             };
             (lo, hi, of)
         };
@@ -3029,8 +3039,8 @@ impl Translator<'_, '_> {
         self.ret(RET_EXCEPTION);
 
         self.builder.switch_to_block(ok);
-        let q = self.builder.ins().stack_load(types::I64, ss, 0);
-        let r = self.builder.ins().stack_load(types::I64, ss, 8);
+        let q = self.builder.ins().stack_load(types::I64, types::I64, ss, 0);
+        let r = self.builder.ins().stack_load(types::I64, types::I64, ss, 8);
         self.set(quot_t, q);
         self.set(rem_t, r);
     }
@@ -3065,7 +3075,7 @@ impl Translator<'_, '_> {
     pub(crate) fn logic(&mut self, dst: u32, r: Value, size: u8, mask: FlagMask) {
         let res = self.mask(r, size);
         let zero8 = self.builder.ins().iconst(types::I8, 0);
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
         let sf = self.msb(res, size);
         let pf_src = self.pf_src(res);
         self.set(dst, res);
@@ -3099,7 +3109,7 @@ impl Translator<'_, '_> {
     /// A `pf_src` byte encoding PF equal to the 0/1 value `v`: the byte's parity is
     /// even exactly when `v` is 1.
     pub(crate) fn pf_src_from_bool(&mut self, v: Value) -> Value {
-        self.builder.ins().bxor_imm(v, 1)
+        self.builder.ins().bxor_imm_s(v, 1)
     }
 
     /// Architectural PF, derived from the stored source byte. Only `jp`/`setp`,
@@ -3113,17 +3123,17 @@ impl Translator<'_, '_> {
     /// and `lahf` — x86 has no conditional branch on AF.
     pub(crate) fn load_af(&mut self) -> Value {
         let s = self.load_flag_u64(self.offsets.af_src);
-        let b = self.builder.ins().ushr_imm(s, 4);
-        let b = self.builder.ins().band_imm(b, 1);
+        let b = self.builder.ins().ushr_imm_s(s, 4);
+        let b = self.builder.ins().band_imm_s(b, 1);
         self.builder.ins().ireduce(types::I8, b)
     }
 
     pub(crate) fn parity(&mut self, res: Value) -> Value {
-        let low = self.builder.ins().band_imm(res, 0xff);
+        let low = self.builder.ins().band_imm_s(res, 0xff);
         let pc = self.builder.ins().popcnt(low);
-        let lsb = self.builder.ins().band_imm(pc, 1);
+        let lsb = self.builder.ins().band_imm_s(pc, 1);
         // Even parity → PF set.
-        self.builder.ins().icmp_imm(IntCC::Equal, lsb, 0)
+        self.builder.ins().icmp_imm_s(IntCC::Equal, lsb, 0)
     }
 
     /// Store the flags `mask` selects.
@@ -3253,7 +3263,7 @@ impl Translator<'_, '_> {
     }
 
     pub(crate) fn not(&mut self, b: Value) -> Value {
-        self.builder.ins().bxor_imm(b, 1)
+        self.builder.ins().bxor_imm_s(b, 1)
     }
 
     /// Defer before any access overlapping the Trap window (§5.2). Masked operands
@@ -3440,15 +3450,6 @@ impl Translator<'_, '_> {
                     _ => false,
                 }
             }
-            InstructionData::BinaryImm64 { opcode, arg, imm } => match opcode {
-                Opcode::IaddImm => {
-                    imm.bits() & mask == 0 && self.store_addr_aligned(arg, size, depth - 1)
-                }
-                Opcode::BandImm | Opcode::ImulImm => {
-                    imm.bits() & mask == 0 || self.store_addr_aligned(arg, size, depth - 1)
-                }
-                _ => false,
-            },
             _ => false,
         }
     }
@@ -3474,8 +3475,8 @@ impl Translator<'_, '_> {
         self.preflighted_stores.push((addr, size));
         // Use host addresses: externally supplied backing need not have the
         // guest address's page offset. 4 KiB divides supported host page sizes.
-        let offset = self.builder.ins().band_imm(host, PAGE_MASK);
-        let crosses = self.builder.ins().icmp_imm(
+        let offset = self.builder.ins().band_imm_s(host, PAGE_MASK);
+        let crosses = self.builder.ins().icmp_imm_s(
             IntCC::UnsignedGreaterThan,
             offset,
             PAGE_BYTES - i64::from(size),
@@ -3487,8 +3488,8 @@ impl Translator<'_, '_> {
         self.builder.seal_block(probe);
         self.builder.switch_to_block(probe);
         self.sync_guest_fault_state();
-        let next = self.builder.ins().band_imm(host, !PAGE_MASK);
-        let next = self.builder.ins().iadd_imm(next, PAGE_BYTES);
+        let next = self.builder.ins().band_imm_s(host, !PAGE_MASK);
+        let next = self.builder.ins().iadd_imm_s(next, PAGE_BYTES);
         let zero = self.builder.ins().iconst(types::I8, 0);
         // Atomic add-zero cannot overwrite a concurrent writer's value. Both
         // sites describe a one-byte Write, including the failed high-page probe.
@@ -3546,7 +3547,7 @@ impl Translator<'_, '_> {
         self.builder.switch_to_block(edge);
         // Keep RIP materialisation on the fault edge: hot code is and + cbnz.
         let rip = self.iconst(self.cur_addr);
-        self.builder.ins().jump(target, &[rip]);
+        self.builder.ins().jump(target, &[rip.into()]);
         self.builder.seal_block(ok);
         self.builder.switch_to_block(ok);
     }
@@ -3560,7 +3561,7 @@ impl Translator<'_, '_> {
             self.pending_flags = pending;
             self.recover_flags();
             let rip = self.builder.block_params(block)[0];
-            self.builder.ins().jump(tail, &[rip]);
+            self.builder.ins().jump(tail, &[rip.into()]);
         }
         self.builder.switch_to_block(tail);
         self.pending_flags = [None; 6];
@@ -3590,7 +3591,7 @@ impl Translator<'_, '_> {
     pub(crate) fn tag_stack_fault(&mut self) {
         if self.stack_access {
             let access = self.load_mem(MEMCTX_FAULT_ACCESS);
-            let access = self.builder.ins().bor_imm(access, 2);
+            let access = self.builder.ins().bor_imm_s(access, 2);
             self.store_mem(MEMCTX_FAULT_ACCESS, access);
         }
     }
@@ -3710,12 +3711,12 @@ impl Translator<'_, '_> {
             .builder
             .ins()
             // Acquire the precise tags published before widening the watermark.
-            .atomic_load(types::I64, MemFlags::trusted(), crp);
+            .atomic_load(types::I64, MemFlagsData::trusted(), crp);
         let store_granule = self
             .builder
             .ins()
-            .ushr_imm(guest_addr, CODE_RANGE_BITS as i64);
-        let code_lo = self.builder.ins().ushr_imm(cr, 32);
+            .ushr_imm_s(guest_addr, CODE_RANGE_BITS as i64);
+        let code_lo = self.builder.ins().ushr_imm_s(cr, 32);
         // `ireduce`+`uextend` is a plain 32-bit move (zero-extending); `band_imm` with
         // 0xffff_ffff put the mask in the CONSTANT POOL and made this a memory operand.
         let code_len = self.builder.ins().ireduce(types::I32, cr);
@@ -3734,8 +3735,8 @@ impl Translator<'_, '_> {
         let wc = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), wcp, 0); // live count
-        let watched = self.builder.ins().icmp_imm(IntCC::NotEqual, wc, 0);
+            .load(types::I64, MemFlagsData::trusted(), wcp, 0); // live count
+        let watched = self.builder.ins().icmp_imm_s(IntCC::NotEqual, wc, 0);
         self.builder.ins().brif(watched, probe, &[], cont, &[]);
         self.builder.seal_block(probe);
         // Both the inline page test and the helper call are laid out cold, sunk past the
@@ -3759,15 +3760,15 @@ impl Translator<'_, '_> {
         let page = self
             .builder
             .ins()
-            .ushr_imm(guest_addr, CODE_PAGE_BITS as i64);
+            .ushr_imm_s(guest_addr, CODE_PAGE_BITS as i64);
         let page = if self.guest_base >> CODE_PAGE_BITS == 0 {
             page
         } else {
             let base_page = self.iconst(self.guest_base >> CODE_PAGE_BITS);
             self.builder.ins().isub(page, base_page)
         };
-        let word_idx = self.builder.ins().ushr_imm(page, 6);
-        let byte_off = self.builder.ins().imul_imm(word_idx, 8);
+        let word_idx = self.builder.ins().ushr_imm_s(page, 6);
+        let byte_off = self.builder.ins().imul_imm_s(word_idx, 8);
         let bits = self.load_mem(MEMCTX_WATCH_BITS_PTR);
         let wptr = self.builder.ins().iadd(bits, byte_off);
         // No bounds check: the store was bounds-checked against `MemCtx.size` above and
@@ -3776,10 +3777,10 @@ impl Translator<'_, '_> {
         let word = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), wptr, 0);
-        let shift = self.builder.ins().band_imm(page, 63);
+            .load(types::I64, MemFlagsData::trusted(), wptr, 0);
+        let shift = self.builder.ins().band_imm_s(page, 63);
         let bit = self.builder.ins().ushr(word, shift);
-        let hit = self.builder.ins().band_imm(bit, 1);
+        let hit = self.builder.ins().band_imm_s(bit, 1);
 
         // A store can straddle two pages, and the watched one may be the SECOND — the
         // page of the first byte alone would silently lose it, which is the shape of the
@@ -3787,12 +3788,12 @@ impl Translator<'_, '_> {
         // both pages inline, fall back to the helper whenever the store crosses a
         // boundary; it walks every page the store touches. Crossing is rare, and the
         // inline path stays a single test.
-        let off_in_page = self.builder.ins().band_imm(guest_addr, PAGE_MASK);
-        let end = self.builder.ins().iadd_imm(off_in_page, size as i64);
+        let off_in_page = self.builder.ins().band_imm_s(guest_addr, PAGE_MASK);
+        let end = self.builder.ins().iadd_imm_s(off_in_page, size as i64);
         let crosses = self
             .builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, end, PAGE_BYTES);
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, end, PAGE_BYTES);
         let crosses = self.builder.ins().uextend(types::I64, crosses);
         let need = self.builder.ins().bor(hit, crosses);
         self.builder.ins().brif(need, doit, &[], cont, &[]);
@@ -3843,17 +3844,17 @@ impl Translator<'_, '_> {
         let off = self.offsets.gpr(index);
         let new = match size {
             8 => val,
-            4 => self.builder.ins().band_imm(val, 0xffff_ffff),
+            4 => self.builder.ins().band_imm_s(val, 0xffff_ffff),
             2 => {
                 let cur = self.read_gpr(index); // cached current value (no reload)
-                let hi = self.builder.ins().band_imm(cur, !0xffffi64);
-                let lo = self.builder.ins().band_imm(val, 0xffff);
+                let hi = self.builder.ins().band_imm_s(cur, !0xffffi64);
+                let lo = self.builder.ins().band_imm_s(val, 0xffff);
                 self.builder.ins().bor(hi, lo)
             }
             1 => {
                 let cur = self.read_gpr(index);
-                let hi = self.builder.ins().band_imm(cur, !0xffi64);
-                let lo = self.builder.ins().band_imm(val, 0xff);
+                let hi = self.builder.ins().band_imm_s(cur, !0xffi64);
+                let lo = self.builder.ins().band_imm_s(val, 0xff);
                 self.builder.ins().bor(hi, lo)
             }
             _ => unreachable!("gpr write size 1/2/4/8"),
@@ -3875,10 +3876,12 @@ impl Translator<'_, '_> {
         if let Some(vars) = self.gpr_vars {
             for (i, &var) in vars.iter().enumerate() {
                 let v = self.builder.use_var(var);
-                let inst =
-                    self.builder
-                        .ins()
-                        .store(MemFlags::trusted(), v, self.cpu, self.offsets.gpr(i));
+                let inst = self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    v,
+                    self.cpu,
+                    self.offsets.gpr(i),
+                );
                 self.gpr_sync
                     .store(self.builder.current_block().unwrap(), i, inst);
             }
@@ -4006,7 +4009,7 @@ impl Translator<'_, '_> {
         let one = self.iconst(1);
         self.builder.ins().atomic_rmw(
             types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             ir::AtomicRmwOp::Add,
             cptr,
             one,
@@ -4084,7 +4087,7 @@ impl Translator<'_, '_> {
         self.builder.append_block_param(done, ty);
         self.builder
             .ins()
-            .brif(boundary, slow, &[], done, &[result]);
+            .brif(boundary, slow, &[], done, &[result.into()]);
         self.builder.switch_to_block(slow);
         let (alo, ahi) = self.fp_words(a);
         let (blo, bhi) = self.fp_words(b);
@@ -4095,14 +4098,17 @@ impl Translator<'_, '_> {
             self.helpers.fp_boundary,
             &[alo, ahi, blo, bhi, code, format, mode],
         );
-        let r = self.builder.ins().stack_load(types::I128, slot, 0);
+        let r = self
+            .builder
+            .ins()
+            .stack_load(types::I64, types::I128, slot, 0);
         let r = if ty.is_vector() {
             self.bitcast_v(r, ty)
         } else {
             let r = self.builder.ins().ireduce(ity, r);
             self.bitcast_scalar(ty, r)
         };
-        self.builder.ins().jump(done, &[r]);
+        self.builder.ins().jump(done, &[r.into()]);
         self.builder.switch_to_block(done);
         self.builder.block_params(done)[0]
     }
@@ -4225,7 +4231,7 @@ impl Translator<'_, '_> {
             }
             _ => {
                 let m = (1i64 << (size * 8)) - 1;
-                self.builder.ins().band_imm(v, m)
+                self.builder.ins().band_imm_s(v, m)
             }
         }
     }
@@ -4238,11 +4244,11 @@ impl Translator<'_, '_> {
     /// `v` need not be masked to `size`: the trailing `band` drops whatever sits
     /// above the sign bit.
     pub(crate) fn msb(&mut self, v: Value, size: u8) -> Value {
-        let sh = self.builder.ins().ushr_imm(v, (size * 8 - 1) as i64);
+        let sh = self.builder.ins().ushr_imm_s(v, (size * 8 - 1) as i64);
         let bit = if size >= 8 {
             sh // shifting by 63 already leaves 0 or 1
         } else {
-            self.builder.ins().band_imm(sh, 1)
+            self.builder.ins().band_imm_s(sh, 1)
         };
         self.builder.ins().ireduce(types::I8, bit)
     }
@@ -4252,43 +4258,43 @@ impl Translator<'_, '_> {
             return v;
         }
         let shift = (64 - from * 8) as i64;
-        let up = self.builder.ins().ishl_imm(v, shift);
-        self.builder.ins().sshr_imm(up, shift)
+        let up = self.builder.ins().ishl_imm_s(v, shift);
+        self.builder.ins().sshr_imm_s(up, shift)
     }
 
     pub(crate) fn shift_count(&mut self, b: Value, size: u8) -> Value {
         let m = if size == 8 { 63 } else { 31 };
-        self.builder.ins().band_imm(b, m)
+        self.builder.ins().band_imm_s(b, m)
     }
 
     pub(crate) fn load_cpu(&mut self, off: i32) -> Value {
         self.builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), self.cpu, off)
+            .load(types::I64, MemFlagsData::trusted(), self.cpu, off)
     }
 
     pub(crate) fn store_cpu(&mut self, off: i32, v: Value) {
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.cpu, off);
+            .store(MemFlagsData::trusted(), v, self.cpu, off);
     }
 
     /// Reinterpret an I128 as a vector type (same bits). Cranelift requires an
     /// endianness for a lane-count-changing bitcast; the guest is little-endian.
     pub(crate) fn bitcast_v(&mut self, v: Value, ty: Type) -> Value {
-        let flags = MemFlags::new().with_endianness(ir::Endianness::Little);
+        let flags = MemFlagsData::new().with_endianness(ir::Endianness::Little);
         self.builder.ins().bitcast(ty, flags, v)
     }
 
     pub(crate) fn bitcast_i128(&mut self, v: Value) -> Value {
-        let flags = MemFlags::new().with_endianness(ir::Endianness::Little);
+        let flags = MemFlagsData::new().with_endianness(ir::Endianness::Little);
         self.builder.ins().bitcast(types::I128, flags, v)
     }
 
     /// Reinterpret a scalar of the same bit width (int<->float). No lane count
     /// changes, so no endianness specifier is needed.
     pub(crate) fn bitcast_scalar(&mut self, ty: Type, v: Value) -> Value {
-        self.builder.ins().bitcast(ty, MemFlags::new(), v)
+        self.builder.ins().bitcast(ty, MemFlagsData::new(), v)
     }
 
     /// Keep the low `width` bits of an I64 opmask value (`width` ∈ {8,16,32,64}).
@@ -4296,7 +4302,9 @@ impl Translator<'_, '_> {
         if width >= 64 {
             v
         } else {
-            self.builder.ins().band_imm(v, ((1u64 << width) - 1) as i64)
+            self.builder
+                .ins()
+                .band_imm_s(v, ((1u64 << width) - 1) as i64)
         }
     }
 
@@ -4342,13 +4350,13 @@ impl Translator<'_, '_> {
         } else if shift == 0 {
             src
         } else if shift < 128 {
-            let lo = self.builder.ins().ushr_imm(src, shift);
-            let hi = self.builder.ins().ishl_imm(dst, 128 - shift);
+            let lo = self.builder.ins().ushr_imm_s(src, shift);
+            let hi = self.builder.ins().ishl_imm_s(dst, 128 - shift);
             self.builder.ins().bor(lo, hi)
         } else if shift == 128 {
             dst
         } else {
-            self.builder.ins().ushr_imm(dst, shift - 128)
+            self.builder.ins().ushr_imm_s(dst, shift - 128)
         }
     }
 
@@ -4406,7 +4414,7 @@ impl Translator<'_, '_> {
             let shifted = self
                 .builder
                 .ins()
-                .ishl_imm(wide, (c as u32 * lanes_per_128) as i64);
+                .ishl_imm_s(wide, (c as u32 * lanes_per_128) as i64);
             acc = self.builder.ins().bor(acc, shifted);
         }
         if let Some(wk) = writemask {
@@ -4503,7 +4511,7 @@ impl Translator<'_, '_> {
             let shifted = self
                 .builder
                 .ins()
-                .ishl_imm(wide, (c as u32 * lanes_per_128) as i64);
+                .ishl_imm_s(wide, (c as u32 * lanes_per_128) as i64);
             acc = self.builder.ins().bor(acc, shifted);
         }
         if let Some(wk) = writemask {
@@ -4525,8 +4533,8 @@ impl Translator<'_, '_> {
         ));
         let slo = self.load_xmm(src);
         let shi = self.load_ymm_hi(src);
-        self.builder.ins().stack_store(slo, ss, 0);
-        self.builder.ins().stack_store(shi, ss, 16);
+        self.builder.ins().stack_store(types::I64, slo, ss, 0);
+        self.builder.ins().stack_store(types::I64, shi, ss, 16);
         let base = self.builder.ins().stack_addr(types::I64, ss, 0);
         let xclo = self.load_xmm(ctrl);
         let xchi = self.load_ymm_hi(ctrl);
@@ -4535,13 +4543,13 @@ impl Translator<'_, '_> {
         let zero = self.builder.ins().iconst(types::I32, 0);
         let mut lo = self.builder.ins().splat(types::I32X4, zero);
         let mut hi = self.builder.ins().splat(types::I32X4, zero);
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         for i in 0..8u8 {
             let cvec = if i < 4 { clo } else { chi };
             let c = self.builder.ins().extractlane(cvec, i % 4);
-            let idx = self.builder.ins().band_imm(c, 7);
+            let idx = self.builder.ins().band_imm_s(c, 7);
             let idx64 = self.builder.ins().uextend(types::I64, idx);
-            let off = self.builder.ins().imul_imm(idx64, 4);
+            let off = self.builder.ins().imul_imm_s(idx64, 4);
             let addr = self.builder.ins().iadd(base, off);
             let v = self.builder.ins().load(types::I32, flags, addr, 0);
             if i < 4 {
@@ -4650,7 +4658,7 @@ impl Translator<'_, '_> {
             self.bitcast_v(s, vty),
             self.bitcast_v(mask, vty),
         );
-        let lanemask = self.builder.ins().sshr_imm(mv, (lane as i64 * 8) - 1);
+        let lanemask = self.builder.ins().sshr_imm_s(mv, (lane as i64 * 8) - 1);
         let r = self.builder.ins().bitselect(lanemask, sv, dv);
         self.bitcast_i128(r)
     }
@@ -4866,7 +4874,10 @@ impl Translator<'_, '_> {
                 self.helpers.fp_boundary,
                 &[lo, hi, zero, zero, code, format, mode],
             );
-            let r = self.builder.ins().stack_load(types::I128, slot, 0);
+            let r = self
+                .builder
+                .ins()
+                .stack_load(types::I64, types::I128, slot, 0);
             let ty = self.builder.func.dfg.value_type(x);
             return if ty.is_vector() {
                 self.bitcast_v(r, ty)
@@ -4928,7 +4939,9 @@ impl Translator<'_, '_> {
         self.builder.set_cold_block(slow);
         let done = self.builder.create_block();
         self.builder.append_block_param(done, ty);
-        self.builder.ins().brif(any_nan, slow, &[], done, &[r]);
+        self.builder
+            .ins()
+            .brif(any_nan, slow, &[], done, &[r.into()]);
         self.builder.switch_to_block(slow);
         let indefinite = if ty.lane_type() == types::F64 {
             self.builder
@@ -4948,7 +4961,7 @@ impl Translator<'_, '_> {
             fixed = self.x86_nan_from_src1(b, fixed);
         }
         fixed = self.x86_nan_from_src1(a, fixed);
-        self.builder.ins().jump(done, &[fixed]);
+        self.builder.ins().jump(done, &[fixed.into()]);
         self.builder.switch_to_block(done);
         self.builder.block_params(done)[0]
     }
@@ -5087,14 +5100,14 @@ impl Translator<'_, '_> {
         let off = self.offsets.xmm(index as usize);
         self.builder
             .ins()
-            .load(types::I128, MemFlags::trusted(), self.cpu, off)
+            .load(types::I128, MemFlagsData::trusted(), self.cpu, off)
     }
 
     pub(crate) fn store_xmm(&mut self, index: u8, v: Value) {
         let off = self.offsets.xmm(index as usize);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.cpu, off);
+            .store(MemFlagsData::trusted(), v, self.cpu, off);
     }
 
     /// Load / store the upper 128 bits of YMM `index`.
@@ -5102,14 +5115,14 @@ impl Translator<'_, '_> {
         let off = self.offsets.ymm_hi(index as usize);
         self.builder
             .ins()
-            .load(types::I128, MemFlags::trusted(), self.cpu, off)
+            .load(types::I128, MemFlagsData::trusted(), self.cpu, off)
     }
 
     pub(crate) fn store_ymm_hi(&mut self, index: u8, v: Value) {
         let off = self.offsets.ymm_hi(index as usize);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.cpu, off);
+            .store(MemFlagsData::trusted(), v, self.cpu, off);
     }
 
     /// Bits 511:256 of ZMM `index`; `half` 0 = 383:256, 1 = 511:384.
@@ -5117,14 +5130,14 @@ impl Translator<'_, '_> {
         let off = self.offsets.zmm_hi(index as usize, half);
         self.builder
             .ins()
-            .load(types::I128, MemFlags::trusted(), self.cpu, off)
+            .load(types::I128, MemFlagsData::trusted(), self.cpu, off)
     }
 
     pub(crate) fn store_zmm_hi(&mut self, index: u8, half: usize, v: Value) {
         let off = self.offsets.zmm_hi(index as usize, half);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.cpu, off);
+            .store(MemFlagsData::trusted(), v, self.cpu, off);
     }
 
     /// 128-bit lane `i` (0=xmm, 1=ymm_hi, 2/3=zmm_hi.0/.1) of vector `reg` — the
@@ -5172,28 +5185,28 @@ impl Translator<'_, '_> {
         let z = self.builder.ins().iconst(types::I64, 0);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), z, self.cpu, off);
+            .store(MemFlagsData::trusted(), z, self.cpu, off);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), z, self.cpu, off + 8);
+            .store(MemFlagsData::trusted(), z, self.cpu, off + 8);
     }
 
     pub(crate) fn load_mem(&mut self, off: i32) -> Value {
         self.builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), self.mem, off)
+            .load(types::I64, MemFlagsData::trusted(), self.mem, off)
     }
 
     pub(crate) fn store_mem(&mut self, off: i32, v: Value) {
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.mem, off);
+            .store(MemFlagsData::trusted(), v, self.mem, off);
     }
 
     pub(crate) fn load_flag(&mut self, off: i32) -> Value {
         self.builder
             .ins()
-            .load(types::I8, MemFlags::trusted(), self.cpu, off)
+            .load(types::I8, MemFlagsData::trusted(), self.cpu, off)
     }
 
     pub(crate) fn load_flag_u64(&mut self, off: i32) -> Value {
@@ -5218,14 +5231,14 @@ impl Translator<'_, '_> {
             let inst = self
                 .builder
                 .ins()
-                .store(MemFlags::trusted(), v, self.cpu, off);
+                .store(MemFlagsData::trusted(), v, self.cpu, off);
             self.gpr_sync
                 .store(self.builder.current_block().unwrap(), 16 + i, inst);
             return;
         }
         self.builder
             .ins()
-            .store(MemFlags::trusted(), v, self.cpu, off);
+            .store(MemFlagsData::trusted(), v, self.cpu, off);
     }
 
     /// Return to the dispatcher, flushing region GPRs first so `CpuState` is current
@@ -5297,7 +5310,7 @@ impl Translator<'_, '_> {
             self.exit_tails[index].block
         };
         let v = self.iconst(code);
-        self.builder.ins().jump(block, &[v]);
+        self.builder.ins().jump(block, &[v.into()]);
     }
 
     fn emit_exit_tails(&mut self) {
@@ -5306,7 +5319,7 @@ impl Translator<'_, '_> {
                 self.builder.switch_to_block(entry);
                 self.flush_gprs();
                 let code = self.builder.block_params(entry)[0];
-                self.builder.ins().jump(tail.block, &[code]);
+                self.builder.ins().jump(tail.block, &[code.into()]);
             }
             self.builder.switch_to_block(tail.block);
             self.pending_flags = tail.pending;
@@ -5326,7 +5339,7 @@ impl Translator<'_, '_> {
         let exception = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, code, RET_EXCEPTION as i64);
+            .icmp_imm_s(IntCC::Equal, code, RET_EXCEPTION as i64);
         let previous = self.load_mem(MEMCTX_FAULT_ACCESS);
         let cause = self.iconst(x86jit_core::fault::cause_to_wire(self.exception_cause));
         let access = self.builder.ins().select(exception, cause, previous);
@@ -5334,7 +5347,7 @@ impl Translator<'_, '_> {
         let unmapped = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
+            .icmp_imm_s(IntCC::Equal, code, RET_UNMAPPED as i64);
         let mapped_tag = self.iconst(RET_UNMAPPED_DETAIL);
         let exception_tag = self.iconst(RET_EXCEPTION_DETAIL);
         let tagged = self.builder.ins().select(unmapped, mapped_tag, code);
@@ -5351,7 +5364,7 @@ impl Translator<'_, '_> {
         let trapped = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
+            .icmp_imm_s(IntCC::Equal, code, RET_UNMAPPED as i64);
         let ok = self.begin_trap_fork(trapped);
         self.tag_stack_fault();
         self.ret_no_flush(RET_UNMAPPED);
@@ -5369,7 +5382,7 @@ impl Translator<'_, '_> {
         let unmapped = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, code, RET_UNMAPPED as i64);
+            .icmp_imm_s(IntCC::Equal, code, RET_UNMAPPED as i64);
         let ok = self.begin_trap_fork(unmapped);
         self.tag_stack_fault();
         self.ret_no_flush(RET_UNMAPPED);
@@ -5378,16 +5391,16 @@ impl Translator<'_, '_> {
         let exc = self
             .builder
             .ins()
-            .icmp_imm(IntCC::Equal, code, RET_EXCEPTION as i64);
+            .icmp_imm_s(IntCC::Equal, code, RET_EXCEPTION as i64);
         let ok = self.begin_trap_fork(exc);
         // The helper already stored RIP and `MemCtx.exception_vector`.
         self.ret_no_flush(RET_EXCEPTION);
         self.builder.switch_to_block(ok);
 
-        let detailed = self
-            .builder
-            .ins()
-            .icmp_imm(IntCC::Equal, code, RET_EXCEPTION_DETAIL as i64);
+        let detailed =
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::Equal, code, RET_EXCEPTION_DETAIL as i64);
         let ok = self.begin_trap_fork(detailed);
         // The helper supplied the dynamic cause and reporting RIP; preserve both.
         self.ret_no_flush(RET_EXCEPTION_DETAIL);
@@ -5411,9 +5424,11 @@ impl Translator<'_, '_> {
         let cur = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), ptr, 0);
-        let next = self.builder.ins().iadd_imm(cur, n as i64);
-        self.builder.ins().store(MemFlags::trusted(), next, ptr, 0);
+            .load(types::I64, MemFlagsData::trusted(), ptr, 0);
+        let next = self.builder.ins().iadd_imm_s(cur, n as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), next, ptr, 0);
     }
 
     /// Terminate a direct edge: load the link slot; if filled, hand the next entry back
@@ -5424,7 +5439,7 @@ impl Translator<'_, '_> {
         let entry = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), slot, 0);
+            .load(types::I64, MemFlagsData::trusted(), slot, 0);
         let chain = self.builder.create_block();
         let link = self.builder.create_block();
         self.builder.ins().brif(entry, chain, &[], link, &[]);
@@ -5451,7 +5466,7 @@ impl Translator<'_, '_> {
         let desc = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), slot, 0);
+            .load(types::I64, MemFlagsData::trusted(), slot, 0);
         let hit = self.builder.create_block();
         let miss = self.builder.create_block();
         // Empty slot (desc == 0) -> miss; else check the cached target.
@@ -5462,11 +5477,11 @@ impl Translator<'_, '_> {
         let cached = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), desc, 0);
+            .load(types::I64, MemFlagsData::trusted(), desc, 0);
         let entry = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), desc, 8);
+            .load(types::I64, MemFlagsData::trusted(), desc, 8);
         let same = self.builder.ins().icmp(IntCC::Equal, cached, target);
         let chain = self.builder.create_block();
         // Target mismatch falls into the same `miss` block (second predecessor).
@@ -5485,16 +5500,25 @@ impl Translator<'_, '_> {
 
     /// Load this vcpu's shadow return stack pointer from `MemCtx` (R5).
     pub(crate) fn ret_stack_ptr(&mut self) -> Value {
-        self.builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), self.mem, MEMCTX_RET_STACK)
+        self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.mem,
+            MEMCTX_RET_STACK,
+        )
     }
 
     /// Byte address of ring frame `sp & (LEN-1)` given the ring base and a `sp`.
     pub(crate) fn ret_frame_addr(&mut self, rs: Value, sp: Value) -> Value {
-        let idx = self.builder.ins().band_imm(sp, (RET_STACK_LEN - 1) as i64);
-        let stride = self.builder.ins().imul_imm(idx, RETSTACK_STRIDE as i64);
-        let off = self.builder.ins().iadd_imm(stride, RETSTACK_ENTRIES as i64);
+        let idx = self
+            .builder
+            .ins()
+            .band_imm_s(sp, (RET_STACK_LEN - 1) as i64);
+        let stride = self.builder.ins().imul_imm_s(idx, RETSTACK_STRIDE as i64);
+        let off = self
+            .builder
+            .ins()
+            .iadd_imm_s(stride, RETSTACK_ENTRIES as i64);
         self.builder.ins().iadd(rs, off)
     }
 
@@ -5506,18 +5530,20 @@ impl Translator<'_, '_> {
         let sp = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), rs, RETSTACK_SP);
+            .load(types::I64, MemFlagsData::trusted(), rs, RETSTACK_SP);
         let addr = self.ret_frame_addr(rs, sp);
         let ra = self.iconst(return_addr);
         let cs = self.iconst(cont_slot_addr);
-        self.builder.ins().store(MemFlags::trusted(), ra, addr, 0);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), cs, addr, RETSTACK_STRIDE / 2);
-        let sp1 = self.builder.ins().iadd_imm(sp, 1);
+            .store(MemFlagsData::trusted(), ra, addr, 0);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), sp1, rs, RETSTACK_SP);
+            .store(MemFlagsData::trusted(), cs, addr, RETSTACK_STRIDE / 2);
+        let sp1 = self.builder.ins().iadd_imm_s(sp, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), sp1, rs, RETSTACK_SP);
     }
 
     /// Terminate a `ret` with return-address prediction (R5). `actual` is the real
@@ -5531,8 +5557,8 @@ impl Translator<'_, '_> {
         let sp = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), rs, RETSTACK_SP);
-        let empty = self.builder.ins().icmp_imm(IntCC::Equal, sp, 0);
+            .load(types::I64, MemFlagsData::trusted(), rs, RETSTACK_SP);
+        let empty = self.builder.ins().icmp_imm_s(IntCC::Equal, sp, 0);
         let has = self.builder.create_block();
         let underflow = self.builder.create_block();
         self.builder.ins().brif(empty, underflow, &[], has, &[]);
@@ -5541,19 +5567,21 @@ impl Translator<'_, '_> {
 
         // Non-empty: pop and compare.
         self.builder.switch_to_block(has);
-        let spdec = self.builder.ins().iadd_imm(sp, -1);
+        let spdec = self.builder.ins().iadd_imm_s(sp, -1);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), spdec, rs, RETSTACK_SP);
+            .store(MemFlagsData::trusted(), spdec, rs, RETSTACK_SP);
         let addr = self.ret_frame_addr(rs, spdec);
         let pred = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), addr, 0);
-        let cont_slot =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), addr, RETSTACK_STRIDE / 2);
+            .load(types::I64, MemFlagsData::trusted(), addr, 0);
+        let cont_slot = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            addr,
+            RETSTACK_STRIDE / 2,
+        );
         let same = self.builder.ins().icmp(IntCC::Equal, pred, actual);
         let hit = self.builder.create_block();
         let miss = self.builder.create_block();
@@ -5566,7 +5594,7 @@ impl Translator<'_, '_> {
         let slotval = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), cont_slot, 0);
+            .load(types::I64, MemFlagsData::trusted(), cont_slot, 0);
         let chain = self.builder.create_block();
         let link = self.builder.create_block();
         self.builder.ins().brif(slotval, chain, &[], link, &[]);
@@ -5592,7 +5620,7 @@ impl Translator<'_, '_> {
     pub(crate) fn emit_fuel_gate(&mut self, block_addr: u64) {
         let fv = self.fuel_var.expect("fuel Variable in region mode");
         let fuel = self.builder.use_var(fv);
-        let spent = self.builder.ins().icmp_imm(IntCC::Equal, fuel, 0);
+        let spent = self.builder.ins().icmp_imm_s(IntCC::Equal, fuel, 0);
         let exit = self.builder.create_block();
         let poll = self.builder.create_block();
         let cont = self.builder.create_block();
@@ -5607,7 +5635,7 @@ impl Translator<'_, '_> {
         let word = self
             .builder
             .ins()
-            .atomic_load(types::I64, MemFlags::trusted(), ptr);
+            .atomic_load(types::I64, MemFlagsData::trusted(), ptr);
         self.builder.ins().brif(word, exit, &[], cont, &[]);
         // Blocks are sealed en masse by `translate_region` after the whole CFG is
         // built (a DAG/loop may add predecessors as later blocks are emitted).
@@ -5618,7 +5646,7 @@ impl Translator<'_, '_> {
         self.ret(RET_CONTINUE); // flushes the fuel Variable back to MemCtx
 
         self.builder.switch_to_block(cont);
-        let dec = self.builder.ins().iadd_imm(fuel, -1);
+        let dec = self.builder.ins().iadd_imm_s(fuel, -1);
         self.builder.def_var(fv, dec); // stays in a register across the loop
     }
 
@@ -5901,8 +5929,8 @@ pub(crate) fn preserve_float_environment(func: &mut ir::Function) {
                 _ => continue,
             };
             cursor.use_srcloc(inst);
-            let bits = cursor.ins().bitcast(via, MemFlags::new(), value);
-            let opaque = cursor.ins().bitcast(ty, MemFlags::new(), bits);
+            let bits = cursor.ins().bitcast(via, MemFlagsData::new(), value);
+            let opaque = cursor.ins().bitcast(ty, MemFlagsData::new(), bits);
             cursor.func.dfg.inst_args_mut(inst)[0] = opaque;
         }
     }
@@ -6039,7 +6067,7 @@ mod barrier_tests {
             0,
             false, // no icount accounting: this test counts barriers, not instructions
         );
-        builder.finalize();
+        builder.finalize(isa.frontend_config());
 
         let code = ctx.compile(&*isa, &mut Default::default()).unwrap();
         code.code_buffer()
@@ -6101,7 +6129,7 @@ mod barrier_tests {
             0,
             false,
         );
-        builder.finalize();
+        builder.finalize(isa.frontend_config());
         let entry = ctx.func.layout.entry_block().unwrap();
         let mem = ctx.func.dfg.block_params(entry)[1];
         let mut pointer_loads = 0;
@@ -6272,7 +6300,7 @@ mod density_tests {
             0,
             false,
         );
-        builder.finalize();
+        builder.finalize(isa.frontend_config());
 
         let out = ctx
             .compile(&*isa, &mut Default::default())
@@ -6505,7 +6533,7 @@ mod float_environment_tests {
                 b.ins().fcvt_from_sint(types::F32X4, v)
             };
             b.ins().return_(&[r]);
-            b.finalize();
+            b.finalize(isa.frontend_config());
             preserve_float_environment(&mut ctx.func);
             ctx.optimize(&*isa, &mut Default::default()).unwrap();
             let text = ctx.func.display().to_string();

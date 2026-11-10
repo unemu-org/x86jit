@@ -62,7 +62,7 @@ fn extract(insts: &[(u32, UnwindInst)], bkey: bool) -> Option<FrameRecipe> {
                 let caller_sp = i32::try_from(offset_upward_to_caller_sp).ok()?;
                 let saved_fp = caller_sp.checked_sub(pushed?)?;
                 clobbers = i32::try_from(offset_downward_to_clobbers).ok()?;
-                // Interpret PushFrameRegs exactly as Cranelift 0.115.1's
+                // Interpret PushFrameRegs exactly as Cranelift 0.135.8's
                 // isa/unwind/systemv.rs create_unwind_info_from_insts: saved FP
                 // is CFA - push_size. AArch64's RegisterMapper::lr_offset() is
                 // 8; x64's CIE places its hardware-pushed RA at CFA - 8.
@@ -231,10 +231,13 @@ mod tests {
             let mut integers = Vec::new();
             let mut floats = Vec::new();
             for i in 0..32 {
-                integers.push(b.ins().load(types::I64, MemFlags::trusted(), data, i * 8));
+                integers.push(
+                    b.ins()
+                        .load(types::I64, MemFlagsData::trusted(), data, i * 8),
+                );
                 floats.push(
                     b.ins()
-                        .load(types::F64, MemFlags::trusted(), data, 256 + i * 8),
+                        .load(types::F64, MemFlagsData::trusted(), data, 256 + i * 8),
                 );
             }
             let mut sig = jit.module.make_signature();
@@ -252,22 +255,22 @@ mod tests {
                     .map(|pair| b.ins().fadd(pair[0], pair[1]))
                     .collect();
             }
-            b.ins().store(MemFlags::trusted(), layer[0], data, 0);
+            b.ins().store(MemFlagsData::trusted(), layer[0], data, 0);
             let call = b.ins().call_indirect(sig, target, &[fp, probe]);
             let result = b.inst_results(call)[0];
             // Consume all values after the call to require real callee saves.
             for (i, value) in integers.into_iter().enumerate() {
-                let value = b.ins().iadd_imm(value, 1);
+                let value = b.ins().iadd_imm_s(value, 1);
                 b.ins()
-                    .store(MemFlags::trusted(), value, data, i as i32 * 8);
+                    .store(MemFlagsData::trusted(), value, data, i as i32 * 8);
             }
             for (i, value) in floats.into_iter().enumerate() {
                 let value = b.ins().fadd(value, value);
                 b.ins()
-                    .store(MemFlags::trusted(), value, data, 256 + i as i32 * 8);
+                    .store(MemFlagsData::trusted(), value, data, 256 + i as i32 * 8);
             }
             b.ins().return_(&[result]);
-            b.finalize();
+            b.finalize(jit.module.isa().frontend_config());
         }
         let id = jit
             .module
@@ -474,7 +477,10 @@ mod tests {
                             c.insert_block(prelude);
                             let data = c.ins().iconst(types::I64, pressure_ptr as i64);
                             let values: Vec<_> = (0..32)
-                                .map(|i| c.ins().load(types::F64, MemFlags::trusted(), data, i * 8))
+                                .map(|i| {
+                                    c.ins()
+                                        .load(types::F64, MemFlagsData::trusted(), data, i * 8)
+                                })
                                 .collect();
                             let mut tree = values.clone();
                             while tree.len() > 1 {
@@ -483,8 +489,8 @@ mod tests {
                                     .map(|p| c.ins().fadd(p[0], p[1]))
                                     .collect();
                             }
-                            c.ins().store(MemFlags::trusted(), tree[0], data, 0);
-                            c.ins().jump(old_entry, &[cpu, ctx]);
+                            c.ins().store(MemFlagsData::trusted(), tree[0], data, 0);
+                            c.ins().jump(old_entry, &[cpu.into(), ctx.into()]);
                             let returns: Vec<_> = c
                                 .func
                                 .layout
@@ -504,7 +510,7 @@ mod tests {
                                         .map(|p| c.ins().fadd(p[0], p[1]))
                                         .collect();
                                 }
-                                c.ins().store(MemFlags::trusted(), tree[0], data, 0);
+                                c.ins().store(MemFlagsData::trusted(), tree[0], data, 0);
                             }
                             rips
                         },

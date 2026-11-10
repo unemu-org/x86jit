@@ -400,8 +400,8 @@ impl Translator<'_, '_> {
         let im = self.iconst(*imm as u64);
         let ex = self.iconst(*explicit as u64);
         let (ss, _) = self.call_with_out_slot(self.helpers.pcmpstr, &[cpu, av, bv, im, ex]);
-        let ecx = self.builder.ins().stack_load(types::I64, ss, 0);
-        let flags = self.builder.ins().stack_load(types::I64, ss, 8);
+        let ecx = self.builder.ins().stack_load(types::I64, types::I64, ss, 0);
+        let flags = self.builder.ins().stack_load(types::I64, types::I64, ss, 8);
         self.write_gpr(1, ecx, 4); // ECX (zero-extends RCX)
         for (bit, off) in [
             (0i64, self.offsets.cf),
@@ -409,9 +409,9 @@ impl Translator<'_, '_> {
             (2, self.offsets.sf),
             (3, self.offsets.of),
         ] {
-            let shifted = self.builder.ins().ushr_imm(flags, bit);
-            let one = self.builder.ins().band_imm(shifted, 1);
-            let fb = self.builder.ins().icmp_imm(IntCC::NotEqual, one, 0);
+            let shifted = self.builder.ins().ushr_imm_s(flags, bit);
+            let one = self.builder.ins().band_imm_s(shifted, 1);
+            let fb = self.builder.ins().icmp_imm_s(IntCC::NotEqual, one, 0);
             self.store_flag(off, fb);
         }
         let z8 = self.builder.ins().iconst(types::I8, 0);
@@ -440,8 +440,8 @@ impl Translator<'_, '_> {
         let im = self.iconst(*imm as u64);
         let ex = self.iconst(*explicit as u64);
         let (ss, _) = self.call_with_out_slot(self.helpers.pcmpstr_mem, &[cpu, av, lo, hi, im, ex]);
-        let ecx = self.builder.ins().stack_load(types::I64, ss, 0);
-        let flags = self.builder.ins().stack_load(types::I64, ss, 8);
+        let ecx = self.builder.ins().stack_load(types::I64, types::I64, ss, 0);
+        let flags = self.builder.ins().stack_load(types::I64, types::I64, ss, 8);
         self.write_gpr(1, ecx, 4); // ECX (zero-extends RCX)
         for (bit, off) in [
             (0i64, self.offsets.cf),
@@ -449,9 +449,9 @@ impl Translator<'_, '_> {
             (2, self.offsets.sf),
             (3, self.offsets.of),
         ] {
-            let shifted = self.builder.ins().ushr_imm(flags, bit);
-            let one = self.builder.ins().band_imm(shifted, 1);
-            let fb = self.builder.ins().icmp_imm(IntCC::NotEqual, one, 0);
+            let shifted = self.builder.ins().ushr_imm_s(flags, bit);
+            let one = self.builder.ins().band_imm_s(shifted, 1);
+            let fb = self.builder.ins().icmp_imm_s(IntCC::NotEqual, one, 0);
             self.store_flag(off, fb);
         }
         let z8 = self.builder.ins().iconst(types::I8, 0);
@@ -506,16 +506,16 @@ impl Translator<'_, '_> {
     /// `out[0]` unused — the helper wrote XMM0 directly). AF/PF cleared. Shared by the
     /// register and memory arms.
     fn store_pcmpstrm_flags(&mut self, ss: ir::StackSlot) {
-        let flags = self.builder.ins().stack_load(types::I64, ss, 8);
+        let flags = self.builder.ins().stack_load(types::I64, types::I64, ss, 8);
         for (bit, off) in [
             (0i64, self.offsets.cf),
             (1, self.offsets.zf),
             (2, self.offsets.sf),
             (3, self.offsets.of),
         ] {
-            let shifted = self.builder.ins().ushr_imm(flags, bit);
-            let one = self.builder.ins().band_imm(shifted, 1);
-            let fb = self.builder.ins().icmp_imm(IntCC::NotEqual, one, 0);
+            let shifted = self.builder.ins().ushr_imm_s(flags, bit);
+            let one = self.builder.ins().band_imm_s(shifted, 1);
+            let fb = self.builder.ins().icmp_imm_s(IntCC::NotEqual, one, 0);
             self.store_flag(off, fb);
         }
         let z8 = self.builder.ins().iconst(types::I8, 0);
@@ -1971,7 +1971,7 @@ impl Translator<'_, '_> {
         let hi = self.load_ymm_hi(*src);
         let vhi = self.bitcast_v(hi, types::I8X16);
         let mhi = self.builder.ins().vhigh_bits(types::I32, vhi);
-        let mhi = self.builder.ins().ishl_imm(mhi, 16);
+        let mhi = self.builder.ins().ishl_imm_s(mhi, 16);
         let combined = self.builder.ins().bor(mlo, mhi);
         let r = self.builder.ins().uextend(types::I64, combined);
         self.set(*dst, r);
@@ -2128,7 +2128,7 @@ impl Translator<'_, '_> {
         let vb = self.load_cpu(self.offsets.kmask(*b as usize));
         let lo = self.mask_kwidth(vb, *half);
         let hi_masked = self.mask_kwidth(va, *half);
-        let hi = self.builder.ins().ishl_imm(hi_masked, *half as i64);
+        let hi = self.builder.ins().ishl_imm_s(hi_masked, *half as i64);
         let r = self.builder.ins().bor(hi, lo);
         self.store_cpu(self.offsets.kmask(*dst as usize), r);
         false
@@ -2182,10 +2182,10 @@ impl Translator<'_, '_> {
         let r = if *amount >= 64 {
             self.iconst(0)
         } else if *left {
-            let sh = self.builder.ins().ishl_imm(s, *amount as i64);
+            let sh = self.builder.ins().ishl_imm_s(s, *amount as i64);
             self.mask_kwidth(sh, *width)
         } else {
-            self.builder.ins().ushr_imm(s, *amount as i64)
+            self.builder.ins().ushr_imm_s(s, *amount as i64)
         };
         self.store_cpu(self.offsets.kmask(*dst as usize), r);
         false
@@ -2505,13 +2505,13 @@ impl Translator<'_, '_> {
         } else {
             (types::I64X2, types::I64, 8i64, 2u8)
         };
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             16,
             4,
         ));
-        self.builder.ins().stack_store(s, ss, 0);
+        self.builder.ins().stack_store(types::I64, s, ss, 0);
         let base = self.builder.ins().stack_addr(types::I64, ss, 0);
         let ctrl_v = self.bitcast_v(ctrl, vty);
         let mut out = {
@@ -2522,17 +2522,17 @@ impl Translator<'_, '_> {
             let cw = self.builder.ins().extractlane(ctrl_v, i);
             // ps: sel = control[1:0]; pd: sel = control bit[1].
             let sel = if elem == 4 {
-                self.builder.ins().band_imm(cw, 3)
+                self.builder.ins().band_imm_s(cw, 3)
             } else {
-                let sh = self.builder.ins().ushr_imm(cw, 1);
-                self.builder.ins().band_imm(sh, 1)
+                let sh = self.builder.ins().ushr_imm_s(cw, 1);
+                self.builder.ins().band_imm_s(sh, 1)
             };
             let sel64 = if elem == 4 {
                 self.builder.ins().uextend(types::I64, sel)
             } else {
                 sel
             };
-            let off = self.builder.ins().imul_imm(sel64, esize);
+            let off = self.builder.ins().imul_imm_s(sel64, esize);
             let addr = self.builder.ins().iadd(base, off);
             let v = self.builder.ins().load(ety, flags, addr, 0);
             out = self.builder.ins().insertlane(out, v, i);
@@ -2744,9 +2744,9 @@ impl Translator<'_, '_> {
             let r = if *shift >= 16 {
                 self.zero_i128()
             } else if *right {
-                self.builder.ins().ushr_imm(v, *shift as i64 * 8)
+                self.builder.ins().ushr_imm_s(v, *shift as i64 * 8)
             } else {
-                self.builder.ins().ishl_imm(v, *shift as i64 * 8)
+                self.builder.ins().ishl_imm_s(v, *shift as i64 * 8)
             };
             self.store_lane(*dst, c, r);
         }
@@ -3547,7 +3547,7 @@ impl Translator<'_, '_> {
             let vhi = self.bitcast_v(hi, vec_ty(*elem));
             let mhi = self.builder.ins().vhigh_bits(types::I32, vhi);
             let mhi64 = self.builder.ins().uextend(types::I64, mhi);
-            let shifted = self.builder.ins().ishl_imm(mhi64, per_lane as i64);
+            let shifted = self.builder.ins().ishl_imm_s(mhi64, per_lane as i64);
             r = self.builder.ins().bor(r, shifted);
         }
         self.set(*dst, r);
@@ -3581,10 +3581,10 @@ impl Translator<'_, '_> {
                 let off = self.offsets.xmm(r as usize);
                 self.builder
                     .ins()
-                    .store(MemFlags::trusted(), z, self.cpu, off);
+                    .store(MemFlagsData::trusted(), z, self.cpu, off);
                 self.builder
                     .ins()
-                    .store(MemFlags::trusted(), z, self.cpu, off + 8);
+                    .store(MemFlagsData::trusted(), z, self.cpu, off + 8);
             }
         }
         false
@@ -4573,7 +4573,7 @@ impl Translator<'_, '_> {
             let uv = if *int_size == 8 {
                 raw
             } else {
-                self.builder.ins().band_imm(raw, 0xffff_ffff)
+                self.builder.ins().band_imm_s(raw, 0xffff_ffff)
             };
             self.builder.ins().fcvt_from_uint(scalar_fty(*prec), uv)
         };
@@ -4894,7 +4894,7 @@ impl Translator<'_, '_> {
         let av = self.iconst(a as u64);
         for (c, v) in bv.iter().enumerate() {
             let lo = self.builder.ins().ireduce(types::I64, *v);
-            let hi = self.builder.ins().ushr_imm(*v, 64);
+            let hi = self.builder.ins().ushr_imm_s(*v, 64);
             let hi = self.builder.ins().ireduce(types::I64, hi);
             let im = self.iconst(if c == 0 { imm } else { (imm >> 3) & 7 } as u64);
             let half = self.iconst(c as u64);
@@ -4938,7 +4938,7 @@ impl Translator<'_, '_> {
         let r = self.iconst(u64::from(*rc));
         self.call_helper(self.helpers.cvtps2ph_value, &[self.cpu, s, n, r, out]);
         let ty = if size == 8 { types::I64 } else { types::I128 };
-        let value = self.builder.ins().stack_load(ty, ss, 0);
+        let value = self.builder.ins().stack_load(types::I64, ty, ss, 0);
         self.gstore(value, host, 0);
         self.note_store(base, size);
         false

@@ -28,5 +28,5 @@ region = { version = "=3.0.2", optional = true }
 
 [dev-dependencies]
 # Cross-host machine-code witnesses; production builds retain the host ISA only.
-cranelift-codegen = { version = "0.115", default-features = false, features = ["x86", "arm64"] }
+cranelift-codegen = { version = "=0.135.8", default-features = false, features = ["x86", "arm64"] }
 libc.workspace = true

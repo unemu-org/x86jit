@@ -129,7 +129,7 @@ cargo deny --all-features check licenses bans sources
 
 `fuzz_robustness` runs for more than seven minutes by design, hence the filter. The `unicorn`
 feature (also enabled by `--all-features`) links the native Unicorn library from the dev shell;
-without Nix, use stable Rust 1.88 or newer and leave it out. Tests need neither the network nor
+without Nix, use stable Rust 1.95 or newer and leave it out. Tests need neither the network nor
 the `oracles/` submodule: witness tests pin the cited values in code.
 
 ## Known gaps

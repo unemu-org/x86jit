@@ -13,18 +13,17 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unemu-org/x86jit"
-# 1.88: naked functions (the fault landing stub, decision-13) and Default for
-# raw pointers. cranelift-codegen 0.115 already needs 1.81.
-rust-version = "1.88"
+# Cranelift 0.135.8 requires Rust 1.95 (decision-17, phase 1).
+rust-version = "1.95"
 
 [workspace.dependencies]
 # x86-64 decoder — core dependency (§15).
 iced-x86 = "1.21"
 # JIT backend — feature-gated in x86jit-cranelift (§15).
-cranelift = "0.115"
-cranelift-jit = "0.115"
-cranelift-module = "0.115"
-cranelift-native = "0.115"
+cranelift = "=0.135.8"
+cranelift-jit = "=0.135.8"
+cranelift-module = "=0.135.8"
+cranelift-native = "=0.135.8"
 # Executable memory arena for the JIT code cache (W^X) (§15).
 memmap2 = "0.9"
 # ELF parsing for the loader helper (x86jit-elf) (§4.2).
