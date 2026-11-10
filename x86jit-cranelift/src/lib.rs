@@ -21,6 +21,8 @@
 
 #![cfg(feature = "jit")]
 
+#[cfg(test)]
+mod batch_tests;
 mod codegen;
 #[cfg(test)]
 mod embedder_tests;
@@ -43,7 +45,7 @@ use std::time::Instant;
 use cranelift::codegen::ir;
 use cranelift::prelude::*;
 use cranelift_jit::JITModule;
-use cranelift_module::{Linkage, Module, ModuleError};
+use cranelift_module::{FuncId, Linkage, Module, ModuleError};
 
 use x86jit_core::cache::CompiledPtr;
 use x86jit_core::jit_abi::{cpu_offsets, CpuOffsets, MAX_GUEST_ACCESS_DESCRIPTORS};
@@ -2480,6 +2482,11 @@ const MAX_HELPERS: usize = 128;
 /// compile spike under peak pressure.
 const TIER_QUEUE_CAP: usize = 64;
 
+// Bound publication latency without waiting for more work. Cranelift 0.115.1
+// memory.rs::set_readable_and_executable seals the current allocation, so only
+// definitions before the same finalize can share its unused page tail.
+const TIER_FINALIZE_BATCH: usize = TIER_QUEUE_CAP;
+
 /// Which *host* instruction set Cranelift may emit for the guest IR — the
 /// host-codegen axis, orthogonal to the guest ISA (`GuestCpuFeatures`).
 /// Lives on [`JitBackend`], not `VmConfig`: the interpreter has no codegen target (it
@@ -2746,6 +2753,29 @@ impl Drop for CompileCompletion<'_> {
     }
 }
 
+struct ForegroundCompile<'a>(&'a CompilerQueue);
+
+impl<'a> ForegroundCompile<'a> {
+    fn new(queue: &'a CompilerQueue) -> Self {
+        queue
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .foreground += 1;
+        Self(queue)
+    }
+}
+
+impl Drop for ForegroundCompile<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.foreground -= 1;
+        if queue.foreground == 0 {
+            self.0.work_cv.notify_one();
+        }
+    }
+}
+
 struct QueuedCompile {
     request: TierUpRequest,
     fetch_permit: Option<x86jit_core::FetchPermit>,
@@ -2763,9 +2793,12 @@ struct CompilerQueue {
 /// The background compile queue and its liveness counters (bg-tier).
 struct Queue {
     items: VecDeque<QueuedCompile>,
-    /// Requests submitted but not yet completed (queued + the one compiling).
+    /// Requests submitted but not yet completed (queued + the active batch).
     /// `wait_idle` blocks until this reaches zero.
     outstanding: usize,
+    /// Foreground compiles waiting or holding the compiler lock. The worker parks
+    /// between definitions so a queued wave cannot repeatedly overtake a vCPU.
+    foreground: usize,
     /// Set by shutdown or `Drop` to unblock and stop the worker.
     shutdown: bool,
     /// Test lever: while true the worker parks without popping, so
@@ -2773,6 +2806,22 @@ struct Queue {
     /// `shutdown` still wins so `Drop` never hangs. Never set in production.
     paused: bool,
 }
+
+// A definition is not callable until finalization and fault-map registration.
+// Keep compiler metadata across clear_context, without exposing an entry pointer.
+struct PendingCode {
+    id: FuncId,
+    code_len: u32,
+    srcloc_table: Box<[(u32, u32)]>,
+    guest_rips: Box<[u64]>,
+    trap_sites: Vec<GuestTrapSite>,
+    recipe: Option<x86jit_core::jit_abi::fault::FrameRecipe>,
+    instructions: Vec<x86jit_core::fault::InstructionFaultInfo>,
+    guest_rip: u64,
+    kind: CompiledCodeKind,
+}
+
+type Publication<T> = Result<(T, Option<CompiledCode>), CompileError>;
 
 struct Jit {
     module: JITModule,
@@ -2981,6 +3030,7 @@ impl JitBackend {
                     queue: Mutex::new(Queue {
                         items: VecDeque::new(),
                         outstanding: 0,
+                        foreground: 0,
                         shutdown: false,
                         paused: false,
                     }),
@@ -3289,8 +3339,30 @@ impl Shared {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
+        self.compile_block_with(
+            ir,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+            self.foreground_publication(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_block_with<T>(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+        finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
+    ) -> Result<T, CompileError> {
         let icount_on = self.icount_on();
-        self.compile_with_fault_info(
+        self.define_with_fault_info(
             CompiledCodeKind::Block,
             ir.guest_start,
             mxcsr_mode,
@@ -3312,6 +3384,7 @@ impl Shared {
                     icount_on,
                 )
             },
+            finish,
         )
     }
 
@@ -3325,8 +3398,30 @@ impl Shared {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
+        self.compile_region_with(
+            region,
+            consistency,
+            mmio,
+            guest_base,
+            mxcsr_mode,
+            precise_split_stores,
+            self.foreground_publication(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_region_with<T>(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+        mxcsr_mode: u32,
+        precise_split_stores: bool,
+        finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
+    ) -> Result<T, CompileError> {
         let icount_on = self.icount_on();
-        self.compile_with_fault_info(
+        self.define_with_fault_info(
             CompiledCodeKind::Region,
             region.entry,
             mxcsr_mode,
@@ -3354,6 +3449,7 @@ impl Shared {
                     icount_on,
                 )
             },
+            finish,
         )
     }
 
@@ -3369,14 +3465,20 @@ impl Shared {
             &mut dyn FnMut() -> u64,
         ) -> Box<[u64]>,
     ) -> Result<CompiledPtr, CompileError> {
-        self.compile_with_fault_info(kind, guest_rip, mxcsr_mode, Vec::new(), translate)
+        self.define_with_fault_info(
+            kind,
+            guest_rip,
+            mxcsr_mode,
+            Vec::new(),
+            translate,
+            self.foreground_publication(),
+        )
     }
 
-    /// Shared function-building spine: sets up the signature, imports the helpers,
-    /// runs `translate` to emit the body, and finalizes. `translate` receives the
-    /// builder, the imported helper refs, and the link-slot allocator, and returns
-    /// the full-width RIP array indexed by the emitted SourceLocs.
-    fn compile_with_fault_info(
+    /// Build a definition and save its metadata before clearing the compiler
+    /// context. `finish` either finalizes now or retains it for the worker batch.
+    #[allow(clippy::too_many_arguments)]
+    fn define_with_fault_info<T>(
         &self,
         // Observer metadata follows the real guest entry, before any source location.
         kind: CompiledCodeKind,
@@ -3388,7 +3490,8 @@ impl Shared {
             codegen::Helpers,
             &mut dyn FnMut() -> u64,
         ) -> Box<[u64]>,
-    ) -> Result<CompiledPtr, CompileError> {
+        finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
+    ) -> Result<T, CompileError> {
         let started = Instant::now();
         if self.stopped.load(Ordering::Acquire) || self.code_space_exhausted.load(Ordering::Acquire)
         {
@@ -3722,6 +3825,35 @@ impl Shared {
             )
         };
         jit.module.clear_context(&mut ctx);
+        let (result, observed) = finish(
+            self,
+            &mut jit,
+            PendingCode {
+                id,
+                code_len,
+                srcloc_table,
+                guest_rips,
+                trap_sites,
+                recipe,
+                instructions,
+                guest_rip,
+                kind,
+            },
+        )?;
+        drop(jit);
+        drop(_serial);
+        if let Some(code) = observed {
+            self.observe(code);
+        }
+        self.compile_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    fn finalize_module(&self, jit: &mut Jit) -> Result<(), CompileError> {
+        if self.code_space_exhausted.load(Ordering::Acquire) {
+            return Err(CompileError::Unavailable);
+        }
         #[cfg(test)]
         if self.fail_compile_stage.load(Ordering::Relaxed) == 2 {
             self.compile_result(Err(ModuleError::Backend(
@@ -3730,9 +3862,45 @@ impl Shared {
             .ok_or(CompileError::Unavailable)?;
         }
         self.compile_result(jit.module.finalize_definitions())
-            .ok_or(CompileError::Unavailable)?;
+            .ok_or(CompileError::Unavailable)
+    }
 
-        let entry = CompiledPtr(jit.module.get_finalized_function(id));
+    fn foreground_publication(
+        &self,
+    ) -> impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<CompiledPtr> + '_ {
+        let foreground = ForegroundCompile::new(&self.background);
+        move |shared, jit, code| {
+            let result = shared.finalize_one(jit, code);
+            // Observer callbacks run after publication and may wait for the worker.
+            drop(foreground);
+            result
+        }
+    }
+
+    fn finalize_one(&self, jit: &mut Jit, code: PendingCode) -> Publication<CompiledPtr> {
+        self.finalize_module(jit)?;
+        let entry = CompiledPtr(jit.module.get_finalized_function(code.id));
+        self.publish(entry, code)
+            .map(|(entry, observed)| (entry, Some(observed)))
+    }
+
+    // Caller has finalized this definition. Register metadata before exposing its entry.
+    fn publish(
+        &self,
+        entry: CompiledPtr,
+        code: PendingCode,
+    ) -> Result<(CompiledPtr, CompiledCode), CompileError> {
+        let PendingCode {
+            id: _,
+            code_len,
+            srcloc_table,
+            guest_rips,
+            trap_sites,
+            recipe,
+            instructions,
+            guest_rip,
+            kind,
+        } = code;
         #[cfg(test)]
         let fail_registration = self.fail_compile_stage.load(Ordering::Relaxed) == 3;
         #[cfg(not(test))]
@@ -3757,19 +3925,15 @@ impl Shared {
         {
             return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
-        drop(jit);
-        drop(_serial);
-        self.observe(CompiledCode {
-            host_start: entry.0 as usize,
-            host_len: code_len,
-            guest_rip,
-            kind,
-        });
-        // Account this compile's wall-time for the bench compile-vs-run split.
-        // Includes the `inner` lock wait — that contention is real compile-path cost.
-        self.compile_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(entry)
+        Ok((
+            entry,
+            CompiledCode {
+                host_start: entry.0 as usize,
+                host_len: code_len,
+                guest_rip,
+                kind,
+            },
+        ))
     }
 
     fn observe(&self, code: CompiledCode) {
@@ -3845,85 +4009,142 @@ impl Shared {
 
     /// Compile one background request's unit (bg-tier): a single block, or a
     /// hotness-gated superblock region — same off-thread path either way.
-    fn compile_request(
+    fn define_request(
         &self,
         req: &TierUpRequest,
         permit: Option<&x86jit_core::FetchPermit>,
-    ) -> CachedBlock {
+    ) -> Result<PendingCode, CompileError> {
         if permit.is_some_and(|p| !p.is_current()) {
-            return match &req.unit {
-                TierUpUnit::Block(ir) => CachedBlock::Interpreted(ir.clone()),
-                TierUpUnit::Region(region) => {
-                    CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()))
-                }
-            };
+            return Err(CompileError::Unavailable);
         }
+        let defer = |_: &Self, _: &mut Jit, code| Ok((code, None));
         match &req.unit {
-            TierUpUnit::Block(ir) => self
-                .compile(
-                    ir,
-                    req.consistency,
-                    req.mmio,
-                    req.guest_base,
-                    req.mxcsr_mode,
-                    req.precise_split_stores,
-                )
-                .map_or_else(
-                    |_| CachedBlock::Interpreted(ir.clone()),
-                    |entry| CachedBlock::Compiled { entry },
-                ),
-            TierUpUnit::Region(region) => self
-                .compile_region(
-                    region,
-                    req.consistency,
-                    req.mmio,
-                    req.guest_base,
-                    req.mxcsr_mode,
-                    req.precise_split_stores,
-                )
-                .map_or_else(
-                    |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
-                    |entry| CachedBlock::Compiled { entry },
-                ),
+            TierUpUnit::Block(ir) => self.compile_block_with(
+                ir,
+                req.consistency,
+                req.mmio,
+                req.guest_base,
+                req.mxcsr_mode,
+                req.precise_split_stores,
+                defer,
+            ),
+            TierUpUnit::Region(region) => self.compile_region_with(
+                region,
+                req.consistency,
+                req.mmio,
+                req.guest_base,
+                req.mxcsr_mode,
+                req.precise_split_stores,
+                defer,
+            ),
         }
     }
 
-    /// The background compiler loop (bg-tier): pull a request, compile it
-    /// under the shared JIT mutex (so `JITModule`'s `!Sync`/`&mut finalize` is
-    /// satisfied exactly as the foreground path, serialized against it), publish the
-    /// result to `done`, and repeat until `Drop` sets `shutdown`.
+    fn interpreted_request(req: &TierUpRequest) -> CachedBlock {
+        match &req.unit {
+            TierUpUnit::Block(ir) => CachedBlock::Interpreted(ir.clone()),
+            TierUpUnit::Region(region) => {
+                CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()))
+            }
+        }
+    }
+
+    /// Drain only work already queued, at most TIER_FINALIZE_BATCH definitions.
+    /// Release compilation locks between definitions: a foreground compile can
+    /// finalize immediately (including any pending definitions in its module).
+    /// Neither path writes a previously sealed page. Cranelift 0.115.1
+    /// backend.rs::finalize_definitions owns relocation and cache synchronization.
     fn worker_loop(&self) {
         loop {
-            let QueuedCompile {
-                request: req,
-                fetch_permit,
-            } = {
+            let mut batch = Vec::with_capacity(TIER_FINALIZE_BATCH);
+            {
                 let mut q = self.background.queue.lock().unwrap();
-                // Park while empty or paused; `shutdown` always wins so `Drop` joins.
-                while (q.items.is_empty() || q.paused) && !q.shutdown {
+                while (q.items.is_empty() || q.paused || q.foreground != 0) && !q.shutdown {
                     q = self.background.work_cv.wait(q).unwrap();
                 }
                 if q.shutdown && q.items.is_empty() {
                     break;
                 }
-                q.items.pop_front().expect("non-empty queue")
-            };
-            let _completion = CompileCompletion(self);
-            // Compile OUTSIDE the queue lock (it takes `inner`); a concurrent submit
-            // or foreground `materialize` isn't blocked by this block's compile.
-            let block = self.compile_request(&req, fetch_permit.as_ref());
+            }
+            loop {
+                let queued = {
+                    let mut q = self.background.queue.lock().unwrap();
+                    if q.shutdown || q.paused || q.foreground != 0 {
+                        None
+                    } else {
+                        q.items.pop_front()
+                    }
+                };
+                let Some(queued) = queued else { break };
+                let completion = CompileCompletion(self);
+                let code = self.define_request(&queued.request, queued.fetch_permit.as_ref());
+                let block = Self::interpreted_request(&queued.request);
+                batch.push((queued, code, block, completion));
+                if batch.len() == TIER_FINALIZE_BATCH {
+                    break;
+                }
+            }
+            // Finalize each used MXCSR module once, never exposing unsealed code.
+            // If any resource operation failed, the sticky exhaustion state rejects
+            // all remaining definitions, exactly as on the synchronous path.
+            let started = Instant::now();
+            let mut finalized_entries = Vec::with_capacity(batch.len());
             {
-                let mut done = self.done.lock().unwrap();
+                let _serial = self.lock_telemetry.lock(
+                    &self.compile_serial,
+                    LockKind::CompileSerial,
+                    "JIT batch publication",
+                );
+                for nondefault in [false, true] {
+                    if !batch.iter().any(|(queued, code, _, _)| {
+                        (queued.request.mxcsr_mode != 0) == nondefault && code.is_ok()
+                    }) {
+                        continue;
+                    }
+                    let mut jit = self.jit(u32::from(nondefault));
+                    let finalized = self.finalize_module(&mut jit).is_ok();
+                    for (index, (queued, code, _, _)) in batch.iter_mut().enumerate() {
+                        if (queued.request.mxcsr_mode != 0) != nondefault {
+                            continue;
+                        }
+                        let code = std::mem::replace(code, Err(CompileError::Unavailable));
+                        if let Ok(code) = code {
+                            if finalized && !self.code_space_exhausted.load(Ordering::Acquire) {
+                                let entry = CompiledPtr(jit.module.get_finalized_function(code.id));
+                                finalized_entries.push((index, entry, code));
+                            }
+                        }
+                    }
+                }
+            }
+            // Registration can allocate O(log n) codemap nodes per definition;
+            // keep that batch work outside the compiler locks so foreground
+            // compilation waits only for a definition or module finalization.
+            for (index, entry, code) in finalized_entries {
+                if !self.code_space_exhausted.load(Ordering::Acquire) {
+                    if let Ok((entry, event)) = self.publish(entry, code) {
+                        batch[index].2 = CachedBlock::Compiled { entry };
+                        self.observe(event);
+                    }
+                }
+            }
+            self.compile_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut done = self.done.lock().unwrap();
+            for (queued, _, block, _) in &mut batch {
+                let req = &mut queued.request;
+                let block = std::mem::replace(block, Self::interpreted_request(req));
                 done.push(TierUpFinished {
                     pc: req.pc,
                     mxcsr_mode: req.mxcsr_mode,
                     block,
-                    spans: req.spans.clone(),
+                    spans: std::mem::take(&mut req.spans),
                     epoch: req.epoch,
                 });
-                // Keep the lock-free probe equal to `done.len()` (set under the lock).
-                self.ready.store(done.len(), Ordering::Release);
             }
+            self.ready.store(done.len(), Ordering::Release);
+            drop(done);
+            drop(batch); // completion guards notify wait_idle only after publication
         }
     }
 }
