@@ -193,6 +193,23 @@ impl StepContext {
     }
 }
 
+/// Reusable interpreter temporaries. The VM supplies an allocation-tracked buffer;
+/// direct callers can continue to use `Vec<u64>`.
+#[doc(hidden)]
+pub trait ScratchBuffer {
+    /// Return `count` zeroed temporary slots, growing storage only when necessary.
+    fn zeroed(&mut self, count: usize) -> &mut [u64];
+}
+
+impl ScratchBuffer for Vec<u64> {
+    #[inline]
+    fn zeroed(&mut self, count: usize) -> &mut [u64] {
+        self.clear();
+        self.resize(count, 0);
+        self
+    }
+}
+
 /// Cached Real16 walk with instruction/iteration boundaries (decision-16 §3).
 pub(crate) fn interpret_block_steps<
     const ROUTED: bool,
@@ -202,7 +219,7 @@ pub(crate) fn interpret_block_steps<
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
     steps: &mut StepContext,
 ) -> BlockResult {
@@ -234,7 +251,7 @@ fn interpret_steps_ordered<
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
     steps: &mut StepContext,
 ) -> BlockResult {
@@ -260,7 +277,7 @@ pub fn step_one(
     mem: &Memory,
     cpu: &mut CpuState,
     mode: crate::lift::CpuMode,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
     let _fp_mode = crate::jit_abi::fp::RunMode::new();
@@ -275,7 +292,7 @@ pub(crate) fn step_one_mode<const ROUTED: bool>(
     mem: &Memory,
     cpu: &mut CpuState,
     mode: crate::lift::CpuMode,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
     if cpu.mmio_retry_active && !cpu.owns_mmio_retry(cpu.rip) {
@@ -321,7 +338,7 @@ pub fn interpret_block(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
     let _fp_mode = crate::jit_abi::fp::RunMode::new();
@@ -414,7 +431,7 @@ pub(crate) fn interpret_block_mode<const ROUTED: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
     if cpu.mxcsr & softfloat::MODE_MASK == 0 {
@@ -430,7 +447,7 @@ pub(crate) fn interpret_block_fp<const ROUTED: bool, const DEFAULT: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> BlockResult {
     #[cfg(target_arch = "aarch64")]
@@ -447,7 +464,7 @@ fn interpret_block_nonfast<const ROUTED: bool, const DEFAULT: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> BlockResult {
     match info.consistency {
@@ -465,7 +482,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> BlockResult {
     let mem = Access::<ROUTED, ORDER>::new(mem);
@@ -510,16 +527,11 @@ fn interpret_block_inner<
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    scratch: &mut Vec<u64>,
+    scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
     steps: &mut StepContext,
 ) -> BlockResult {
-    // Reuse the caller's scratch buffer across blocks instead of allocating a fresh
-    // temps vector every dispatch (hot path). `clear` + `resize(_, 0)` keeps the
-    // allocation and zero-fills all slots.
-    scratch.clear();
-    scratch.resize(ir.temp_count as usize, 0);
-    let temps: &mut [u64] = scratch;
+    let temps = scratch.zeroed(ir.temp_count as usize);
     let cur_addr = Cell::new(ir.guest_start);
     let started = Cell::new(1u8);
     // Retired-instruction accounting (§17.6, sub-seam c). `InsnStart` marks the start of

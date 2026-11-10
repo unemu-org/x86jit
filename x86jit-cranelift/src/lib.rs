@@ -30,6 +30,7 @@ mod embedder_tests;
 mod environment;
 mod libcalls;
 mod lock_telemetry;
+mod memory_stats;
 pub mod perfmap;
 mod unwind;
 
@@ -2665,6 +2666,7 @@ pub struct JitBackend {
 /// and the background compiler worker (bg-tier). Diagnostic handles share only
 /// the separate queue coordination state, never these compiler resources.
 struct Shared {
+    memory: Arc<memory_stats::CodeCounters>,
     /// The Cranelift module, built lazily on the first compile: its ISA
     /// bakes in `opt_level`, which may have to be derived from a tier-up policy the
     /// `Vm` reports after the backend is constructed. `None` until then.
@@ -2824,6 +2826,7 @@ struct PendingCode {
 type Publication<T> = Result<(T, Option<CompiledCode>), CompileError>;
 
 struct Jit {
+    allocations: memory_stats::PendingAllocations,
     module: JITModule,
     return_address_bkey: bool,
     fbctx: FunctionBuilderContext,
@@ -3011,6 +3014,7 @@ impl JitBackend {
                 nondefault_inner: Mutex::new(None),
                 lock_telemetry: Telemetry::default(),
                 compile_serial: Mutex::new(()),
+                memory: Arc::default(),
                 compile_attempts: AtomicU64::new(0),
                 target,
                 opt,
@@ -3127,6 +3131,7 @@ impl JitBackend {
         let module = JITModule::new(builder);
 
         Jit {
+            allocations: memory_stats::PendingAllocations::default(),
             module,
             return_address_bkey,
             fbctx: FunctionBuilderContext::new(),
@@ -3785,6 +3790,12 @@ impl Shared {
         }
         self.compile_result(jit.module.define_function(id, &mut ctx))
             .ok_or(CompileError::Unavailable)?;
+        let cc = ctx.compiled_code().expect("compiled code present");
+        let align = (cc.buffer.alignment as u64)
+            .max(jit.module.isa().function_alignment().minimum as u64)
+            .max(jit.module.isa().symbol_alignment());
+        jit.allocations
+            .define(cc.code_info().total_size as usize, align as usize);
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
         // `clear_context` wipes it, to register in the process-global `CodeMap` once
         // the host entry address is known below.
@@ -3861,8 +3872,9 @@ impl Shared {
             )))
             .ok_or(CompileError::Unavailable)?;
         }
-        self.compile_result(jit.module.finalize_definitions())
-            .ok_or(CompileError::Unavailable)
+        let result = jit.module.finalize_definitions();
+        jit.allocations.finalize(&self.memory, result.is_ok());
+        self.compile_result(result).ok_or(CompileError::Unavailable)
     }
 
     fn foreground_publication(
@@ -4217,6 +4229,19 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn memory_stats(&self) -> x86jit_core::BackendMemoryStats {
+        let mut stats = self.shared.memory.snapshot();
+        let queue = self
+            .shared
+            .background
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        stats.background_queue_len = queue.items.len() as u64;
+        stats.background_in_flight = (queue.outstanding - queue.items.len()) as u64;
+        stats
+    }
+
     fn shutdown(&mut self) -> Result<ShutdownReport, ShutdownError> {
         self.stop_worker()
     }

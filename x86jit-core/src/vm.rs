@@ -95,6 +95,12 @@ impl std::error::Error for StepRunError {}
 /// vcpus behind `Arc`. A JIT impl that needs a mutable compiler context wraps it
 /// in interior mutability (e.g. `Mutex`).
 pub trait Backend: Send + Sync {
+    /// Backend allocation counters. Implementations with no tracked storage use
+    /// zeroes; wrappers should forward this method. Must not take compiler locks.
+    fn memory_stats(&self) -> crate::BackendMemoryStats {
+        crate::BackendMemoryStats::default()
+    }
+
     /// Permanently stop admission, cancel queued work, join every owned worker,
     /// and discard completions. Called before VM cache and memory destruction.
     /// Implementations with workers must override this; the default owns none.
@@ -544,6 +550,7 @@ impl std::error::Error for ShutdownError {}
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
     vcpu_lifetime: Arc<()>,
+    vcpu_memory: Mutex<Vec<std::sync::Weak<VcpuAllocations>>>,
     precise_split_stores: bool,
     compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
     lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
@@ -600,6 +607,39 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Snapshot allocation categories without stopping execution. See
+    /// [`crate::MemoryStats`] for precision, scope and omitted allocations.
+    pub fn memory_stats(&self) -> crate::MemoryStats {
+        let mut vcpus = crate::VcpuMemoryStats::default();
+        self.vcpu_memory.lock().unwrap().retain(|weak| {
+            let Some(allocation) = weak.upgrade() else {
+                return false;
+            };
+            vcpus.count += 1;
+            vcpus.state_bytes += (std::mem::size_of::<Vcpu>()
+                + std::mem::size_of::<RetStack>()
+                + std::mem::size_of::<crate::jit_abi::fault::EntryRecord>()
+                + std::mem::size_of::<AtomicU64>()
+                + std::mem::size_of::<VcpuAllocations>()
+                + 4 * std::mem::size_of::<usize>()) as u64;
+            vcpus.fast_resolve_bytes += std::mem::size_of::<[FastEntry; FAST_N]>() as u64;
+            vcpus.scratch_bytes += allocation.scratch.load(Ordering::Relaxed);
+            vcpus.refill_bytes += allocation.refills.load(Ordering::Relaxed);
+            true
+        });
+        let (guest_ram_reserved, guest_ram_committed, memory_tracking_bytes) =
+            self.mem.allocation_stats();
+        crate::MemoryStats {
+            backend: self.backend.memory_stats(),
+            cache: self.cache.memory_stats(),
+            vcpus,
+            codemap_bytes: crate::codemap::memory_bytes(),
+            guest_ram_reserved,
+            guest_ram_committed,
+            memory_tracking_bytes,
+        }
+    }
+
     /// Snapshot child execution metadata before a shared-address-space fork.
     /// Allocation and fetch-policy callbacks run here, in the parent. `mode`
     /// selects decoding; Real16 helpers are outside the initial child scope.
@@ -950,6 +990,7 @@ impl Vm {
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
             vcpu_lifetime: Arc::new(()),
+            vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: self.precise_split_stores,
             compile_hold: None,
             mem: self.mem.deep_copy()?,
@@ -979,6 +1020,7 @@ impl Vm {
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
         Self {
             vcpu_lifetime: Arc::new(()),
+            vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: false,
             compile_hold: None,
             mem,
@@ -1255,7 +1297,13 @@ impl Vm {
         let word = Arc::new(AtomicU64::new(0));
         self.mem.register_dispatch_word(&word);
         self.backend.register_dispatch_word(&word);
+        let allocations = Arc::new(VcpuAllocations::default());
+        let mut registry = self.vcpu_memory.lock().unwrap();
+        registry.retain(|weak| weak.strong_count() != 0);
+        registry.push(Arc::downgrade(&allocations));
+        drop(registry);
         Vcpu {
+            allocations: allocations.clone(),
             _vm_lifetime: self.vcpu_lifetime.clone(),
             cpu,
             exit_request: ExitRequest { word },
@@ -1277,7 +1325,10 @@ impl Vm {
             fast_hits: 0,
             chained: 0,
             executed: 0,
-            interp_scratch: Vec::new(),
+            interp_scratch: VcpuScratch {
+                values: Box::default(),
+                allocations,
+            },
             pending_irq: None,
             retired: 0,
             sti_shadow: false,
@@ -1355,8 +1406,44 @@ impl ExitRequest {
     }
 }
 
+#[derive(Default)]
+struct VcpuAllocations {
+    scratch: AtomicU64,
+    refills: AtomicU64,
+}
+
+struct VcpuScratch {
+    values: Box<[u64]>,
+    allocations: Arc<VcpuAllocations>,
+}
+
+impl VcpuScratch {
+    #[cold]
+    fn grow(&mut self, count: usize) {
+        let capacity = count.max(self.values.len() * 2).max(4);
+        self.values = vec![0; capacity].into_boxed_slice();
+        self.allocations.scratch.store(
+            (capacity * std::mem::size_of::<u64>()) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl crate::interp::ScratchBuffer for VcpuScratch {
+    #[inline]
+    fn zeroed(&mut self, count: usize) -> &mut [u64] {
+        if count > self.values.len() {
+            self.grow(count);
+        }
+        let temps = &mut self.values[..count];
+        temps.fill(0);
+        temps
+    }
+}
+
 /// Per-guest-thread execution context: CPU state + its own `run()` loop (§2).
 pub struct Vcpu {
+    allocations: Arc<VcpuAllocations>,
     _vm_lifetime: Arc<()>,
     pub cpu: CpuState,
     exit_request: ExitRequest,
@@ -1411,7 +1498,7 @@ pub struct Vcpu {
     chained: u64,
     /// Reused temps buffer for `interpret_block` — grows to the largest block's
     /// `temp_count` and is zero-filled per block, avoiding a per-dispatch allocation.
-    interp_scratch: Vec<u64>,
+    interp_scratch: VcpuScratch,
     /// Pending maskable hardware-interrupt vector (§17.6, sub-seam c). Set by
     /// [`Vcpu::inject_irq`]; delivered at a `run()` boundary through the real-mode IVT
     /// once IF is set, no memory/port completion is outstanding, and both shadows have
@@ -2660,9 +2747,24 @@ impl Vcpu {
                                 match entry {
                                     Some(entry) => {
                                         let slot = ctx.link_slot;
+                                        // A full map reallocates on insert: account only then,
+                                        // not on every new refill entry.
+                                        let full =
+                                            self.ibtc_refills.len() >= self.ibtc_refills.capacity();
                                         let count = self.ibtc_refills.entry(slot).or_insert(0);
-                                        if *count < IBTC_MEGAMORPHIC_CAP {
+                                        let under_cap = *count < IBTC_MEGAMORPHIC_CAP;
+                                        if under_cap {
                                             *count += 1;
+                                        }
+                                        if full {
+                                            self.allocations.refills.store(
+                                                (self.ibtc_refills.capacity()
+                                                    * std::mem::size_of::<(u64, u32)>())
+                                                    as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                        if under_cap {
                                             let _section = EngineSection::enter(
                                                 exit_word,
                                                 &self.engine_sections,

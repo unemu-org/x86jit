@@ -18,8 +18,10 @@
 use crate::jit_abi::fault::FrameRecipe;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+static NODE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 const MAX_ENTRIES: usize = 1024 * 4096;
 const MAX_TRAP_SITES: usize = 64 * 1024 * 1024;
@@ -92,6 +94,7 @@ impl Node {
         left: Option<&'static Self>,
         right: Option<&'static Self>,
     ) -> &'static Self {
+        NODE_BYTES.fetch_add(std::mem::size_of::<Self>() as u64, Ordering::Relaxed);
         Box::leak(Box::new(Self {
             entry,
             left,
@@ -148,6 +151,7 @@ impl Node {
 /// Append-only host-PC → guest-RIP map (see module docs for signal safety).
 pub struct CodeMap {
     root: AtomicPtr<Node>,
+    payload_bytes: AtomicU64,
     /// Only writers read or update the count; readers never take this mutex.
     len: Mutex<Counts>,
     capacity: usize,
@@ -162,6 +166,7 @@ impl CodeMap {
     const fn with_capacity(capacity: usize) -> Self {
         Self {
             root: AtomicPtr::new(ptr::null_mut()),
+            payload_bytes: AtomicU64::new(0),
             len: Mutex::new(Counts {
                 entries: 0,
                 traps: 0,
@@ -283,6 +288,15 @@ impl CodeMap {
         if len.entries >= self.capacity || retained_traps > self.trap_capacity - len.traps {
             return Err(CodeMapFull);
         }
+        let payload = std::mem::size_of_val(&*table)
+            + std::mem::size_of_val(&*guest_rips)
+            + traps.capacity() * std::mem::size_of::<GuestTrapSite>()
+            + recipe
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<FrameRecipe>())
+            + instructions.len() * std::mem::size_of::<crate::fault::InstructionFaultInfo>();
+        self.payload_bytes
+            .fetch_add(payload as u64, Ordering::Relaxed);
         let entry = Entry {
             start,
             end,
@@ -383,6 +397,12 @@ pub(crate) fn with_child_test_poison<T>(f: impl FnOnce() -> T) -> T {
 }
 
 static CODE_MAP: CodeMap = CodeMap::new();
+
+/// Process-wide retained allocation bytes, excluding allocator bookkeeping.
+/// Includes every leaked AVL path and recovery payload (also after backend drop).
+pub fn memory_bytes() -> u64 {
+    NODE_BYTES.load(Ordering::Relaxed) + CODE_MAP.payload_bytes.load(Ordering::Relaxed)
+}
 
 /// Register a compiled function in the process-global map (see [`CodeMap::register`]).
 pub fn register(

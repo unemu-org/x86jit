@@ -886,6 +886,19 @@ pub struct Memory {
 unsafe impl Sync for Memory {}
 
 impl Memory {
+    pub(crate) fn allocation_stats(&self) -> (u64, Option<u64>, u64) {
+        // SAFETY: only immutable allocation metadata is read; guest writes mutate bytes.
+        let backing = unsafe { &*self.backing.get() };
+        let reserved = backing.len as u64;
+        let committed = match backing.owner {
+            Owner::Boxed { .. } => Some(reserved),
+            _ => None,
+        };
+        let tracking = (self.code_page.len() + self.watch.watch.len() + self.watch.dirty.len())
+            * std::mem::size_of::<AtomicU64>();
+        (reserved, committed, tracking as u64)
+    }
+
     pub(crate) fn child_view<'vm>(
         &self,
         vm: &'vm crate::Vm,

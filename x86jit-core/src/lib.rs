@@ -144,6 +144,7 @@ pub mod jit_abi;
 pub mod lift;
 pub mod lockstep;
 pub mod memory;
+mod memory_stats;
 pub mod pclmul;
 pub mod sha;
 pub mod state;
@@ -177,6 +178,7 @@ pub use memory::{
     FetchPermit, FetchVerdict, HostRam, HostRamError, MapError, MemError, MemTrap, Memory,
     MemoryModel, Prot, RegionKind,
 };
+pub use memory_stats::{BackendMemoryStats, CacheMemoryStats, MemoryStats, VcpuMemoryStats};
 pub use state::{
     CpuSource, CpuState, Flags, RandomKind, Reg, TscSample, X87PointerModel, X87Precision,
     AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,

@@ -64,6 +64,12 @@ fn queued_small_units_share_pages_in_both_modules_and_publish_in_order() {
         let module = usize::from(finished.mxcsr_mode != 0);
         pages[module].insert(execute(finished.block, &mem) / region::page::size());
     }
+    let stats = jit.memory_stats();
+    assert_eq!(stats.compiled_units_total, TIER_QUEUE_CAP as u64);
+    assert_eq!(
+        stats.code_bytes_reserved,
+        (pages.iter().map(|pages| pages.len()).sum::<usize>() * region::page::size()) as u64
+    );
     for pages in pages {
         assert!(
             pages.len() <= TIER_QUEUE_CAP.div_ceil(TIER_FINALIZE_BATCH),

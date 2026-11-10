@@ -154,6 +154,7 @@ impl SpanIndex {
 /// Shared translation cache. Cloned-out on `get` so no lock guard is held
 /// across block execution (which may mutate memory -> SMC invalidation) (§9.2).
 pub struct TranslationCache {
+    memory_counts: [AtomicU64; 4],
     // §17.4: keyed by BlockKey { guest_addr, mode } — the same bytes lift differently
     // per decode mode, so translations never alias across modes.
     map: RwLock<HashMap<BlockKey, CachedBlock>>,
@@ -230,8 +231,58 @@ impl TranslationCache {
         assert!(self.map.is_poisoned() && self.spans.is_poisoned());
     }
 
+    fn account_replace(
+        &self,
+        old: Option<&CachedBlock>,
+        old_spans: usize,
+        new: Option<&CachedBlock>,
+        new_spans: usize,
+    ) {
+        fn values(block: Option<&CachedBlock>, spans: usize) -> [u64; 4] {
+            match block {
+                Some(CachedBlock::Interpreted(ir)) => [
+                    1,
+                    0,
+                    0,
+                    (std::mem::size_of::<IrBlock>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + ir.ops.capacity() * std::mem::size_of::<crate::IrOp>())
+                        as u64,
+                ],
+                Some(CachedBlock::Compiled { .. }) if spans > 1 => [0, 0, 1, 0],
+                Some(CachedBlock::Compiled { .. }) => [0, 1, 0, 0],
+                None => [0; 4],
+            }
+        }
+        for ((counter, old), new) in self
+            .memory_counts
+            .iter()
+            .zip(values(old, old_spans))
+            .zip(values(new, new_spans))
+        {
+            if new > old {
+                counter.fetch_add(new - old, Ordering::Relaxed);
+            } else if old > new {
+                counter.fetch_sub(old - new, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Allocation diagnostics without walking or locking the cache.
+    pub fn memory_stats(&self) -> crate::CacheMemoryStats {
+        let [interpreted_entries, compiled_entries, region_entries, interpreted_ir_bytes] =
+            std::array::from_fn(|i| self.memory_counts[i].load(Ordering::Relaxed));
+        crate::CacheMemoryStats {
+            interpreted_entries,
+            compiled_entries,
+            region_entries,
+            interpreted_ir_bytes,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
+            memory_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             map: RwLock::new(HashMap::new()),
             spans: RwLock::new(SpanIndex::default()),
             hits: AtomicU64::new(0),
@@ -303,6 +354,12 @@ impl TranslationCache {
         if self.publication_generation.load(Ordering::Acquire) != since_generation {
             return false;
         }
+        self.account_replace(
+            map.get(&key),
+            spans.units.get(&key).map_or(0, Vec::len),
+            Some(&block),
+            1,
+        );
         spans.insert(key, vec![span]);
         map.insert(key, block);
         self.hotness.write().unwrap().remove(&key);
@@ -328,6 +385,12 @@ impl TranslationCache {
             return false;
         }
         on_mark(&spans);
+        self.account_replace(
+            mp.get(&key),
+            sp.units.get(&key).map_or(0, Vec::len),
+            Some(&block),
+            spans.len(),
+        );
         mp.insert(key, block);
         sp.insert(key, spans);
         self.hotness.write().unwrap().remove(&key);
@@ -529,6 +592,12 @@ impl TranslationCache {
         if !on_mark(&spans) {
             return false;
         }
+        self.account_replace(
+            mp.get(&key),
+            sp.units.get(&key).map_or(0, Vec::len),
+            Some(&block),
+            spans.len(),
+        );
         mp.insert(key, block);
         sp.insert(key, spans);
         true
@@ -604,6 +673,12 @@ impl TranslationCache {
             // is rejected and the block can be freely re-lifted.
             let mut pending = self.tier_pending.lock().unwrap();
             for entry in &victims {
+                self.account_replace(
+                    map.get(entry),
+                    spans.units.get(entry).map_or(0, Vec::len),
+                    None,
+                    0,
+                );
                 spans.remove(entry);
                 map.remove(entry);
                 hotness.remove(entry);
