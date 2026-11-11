@@ -940,6 +940,7 @@ impl<const ORDER: u8> crate::interp::StrMem for ChildMemory<'_, '_, ORDER> {
 
 fn refusal(op: &IrOp) -> Option<ChildRefusal> {
     match op {
+        IrOp::Legacy(_) => Some(ChildRefusal::Helper),
         IrOp::InsnStart { .. }
         | IrOp::ReadReg { .. }
         | IrOp::WriteReg { .. }

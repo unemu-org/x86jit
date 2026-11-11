@@ -1,0 +1,117 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        ReadReg {
+            dst: 0,
+            reg: Rax,
+        },
+        WriteReg {
+            reg: Ds,
+            src: Temp(
+                0,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4098,
+        },
+        ReadReg {
+            dst: 1,
+            reg: Rax,
+        },
+        WriteReg {
+            reg: Ss,
+            src: Temp(
+                1,
+            ),
+            size: 2,
+        },
+        SetSsShadow,
+        InsnStart {
+            guest_addr: 4100,
+        },
+        ReadReg {
+            dst: 2,
+            reg: Rbp,
+        },
+        And {
+            dst: 3,
+            a: Temp(
+                2,
+            ),
+            b: Imm(
+                65535,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        SegLimitCheck {
+            offset: Temp(
+                3,
+            ),
+            size: 2,
+            vector: 13,
+            fault_ip: 4100,
+        },
+        ReadReg {
+            dst: 4,
+            reg: Ss,
+        },
+        Shl {
+            dst: 5,
+            a: Temp(
+                4,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 6,
+            a: Temp(
+                3,
+            ),
+            b: Temp(
+                5,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Load {
+            fault: MemoryAccess(
+                8,
+            ),
+            dst: 7,
+            addr: Temp(
+                6,
+            ),
+            size: 2,
+        },
+        WriteReg {
+            reg: Rax,
+            src: Temp(
+                7,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4103,
+        },
+        Hlt,
+    ],
+    temp_count: 8,
+    guest_len: 8,
+    icount: 4,
+}

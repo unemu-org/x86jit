@@ -47,6 +47,10 @@ pub enum PortDir {
 pub enum UnsupportedSystemOperation {
     LegacyExecution,
     LegacyStepping,
+    LegacyEventDelivery,
+    LegacyInstruction,
+    LegacyTaskReturn,
+    LegacyEntryFacility,
     ApplicationIrqDelivery,
     InvalidLegacyContext(crate::legacy::LegacyContextError),
 }

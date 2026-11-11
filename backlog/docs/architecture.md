@@ -42,7 +42,7 @@ that changes.
 
 | Module | Purpose |
 |--------|---------|
-| `legacy` | Application/system execution profiles, shared legacy model boundary, pure context derivation and appended system/descriptor storage; execution currently refused (decision-18 §§1–2) |
+| `legacy` | Application/system execution profiles, shared legacy model boundary, pure context derivation, appended system/descriptor storage, checked real-address accesses and model-aware flag images (decision-18 §§1–2) |
 | `state` | `Reg`, `CpuState` (`#[repr(C)]`, flat GPR file), `Flags` (§3) |
 | `memory_stats` | Public non-exhaustive allocation snapshots: VM/cache/backend categories and live vCPU gauges; page-rounding model for the pinned Cranelift allocator, process-wide retained fault metadata (§4.1, §9.1) |
 | `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap`; opt-in host-fault recovery, owned fetch snapshots (§4, §8.1) |
@@ -51,6 +51,7 @@ that changes.
 | `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen`; `MemoryAccess` occupies access-op padding and selects cold #SS/#GP exits on a miss; `CheckAlign` raises #GP for required alignment (§6) |
 | `lift` | x86 → IR: `lift_block`, operand lowering, `CpuMode` seam, `LiftError` (§7) |
 | `host_write` | Cold host VM write-permission queries after a crossing-store read probe faults (§8.1, decision-13) |
+| `lift::legacy`, `interp::legacy`, `vm::legacy` | Explicit-context I386 real lowering and interpreter, centralized stack/segmented accesses, private per-vCPU cache/epoch; protected execution and event delivery remain refused (decision-18 §§1, 3–4) |
 | `interp` | IR interpreter: `interpret_block` over a Vcpu-reused temps buffer, Variant-A flags, RIP-on-trap; also the shared `string_run`/`divide`/`crc32c` helpers the JIT calls; `interp::softfloat` implements non-default SIMD numerical modes with integer arithmetic (§8.1) |
 | `x87` | x87 FPU exec (`exec_x87`/`exec_fxstate`), shared by both backends; register file is `[F80; 8]` (§14) |
 | `f80` | software 80-bit extended float (`F80`) — true x87 precision, rounds each op to a 64-bit significand; pure Rust (portable across x86/ARM) (§14) |

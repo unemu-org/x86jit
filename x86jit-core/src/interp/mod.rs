@@ -6,6 +6,7 @@
 //! is set to the FAULTING instruction (`cur_addr`, from `InsnStart`) so the user
 //! can map/handle and retry; after `syscall`/`hlt` RIP is PAST the instruction.
 
+pub(crate) mod legacy;
 mod mmx;
 pub(crate) mod ordering;
 mod result;
@@ -805,6 +806,12 @@ fn walk_ops<
             mem.0.begin_op(op, temps, cpu);
         }
         match op {
+            IrOp::Legacy(_) => {
+                return WalkResult::exit(Exit::UnsupportedSystemContext {
+                    addr: cpu.rip,
+                    operation: crate::UnsupportedSystemOperation::LegacyExecution,
+                })
+            }
             IrOp::InsnStart { guest_addr } => {
                 if !CHILD && started.get() == 0 {
                     // The store completed; leave cur_addr on it for retirement.

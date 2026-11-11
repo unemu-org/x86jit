@@ -1,0 +1,29 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        PushfReal,
+        InsnStart {
+            guest_addr: 4097,
+        },
+        PopfReal,
+        InsnStart {
+            guest_addr: 4098,
+        },
+        PushaReal,
+        InsnStart {
+            guest_addr: 4099,
+        },
+        PopaReal,
+        InsnStart {
+            guest_addr: 4100,
+        },
+        Hlt,
+    ],
+    temp_count: 0,
+    guest_len: 5,
+    icount: 5,
+}

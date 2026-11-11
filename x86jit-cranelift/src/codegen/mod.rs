@@ -2529,7 +2529,8 @@ impl Translator<'_, '_> {
             | IrOp::RepStringReal { .. }
             | IrOp::PushaReal
             | IrOp::PopaReal
-            | IrOp::EnterReal { .. } => {
+            | IrOp::EnterReal { .. }
+            | IrOp::Legacy(_) => {
                 unreachable!("real-mode (Real16) IR ops never reach the JIT (§17.6)")
             }
         }

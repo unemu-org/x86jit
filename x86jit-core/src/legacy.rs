@@ -1,5 +1,5 @@
 //! Legacy execution-context and inline-state contract (decision-18 §§1–2;
-//! spec.md §§3, 17). Execution support is supplied separately.
+//! spec.md §§3, 17). Real execution is interpreted separately from Application.
 use crate::{CpuMode, CpuState};
 
 /// Fixed application contexts and explicitly opted-in system execution.
@@ -104,7 +104,7 @@ pub struct SystemSegment {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SegmentId {
     Cs,
     Ds,
@@ -114,7 +114,7 @@ pub enum SegmentId {
     Gs,
 }
 
-/// Reserved inline state; Application execution never consumes these values.
+/// Inline legacy state; Application execution never consumes these values.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LegacyCpuState {
@@ -534,5 +534,181 @@ mod tests {
         );
         assert_eq!(offset_of!(LegacyCpuState, segments), 60);
         assert_eq!(offset_of!(LegacyCpuState, cpl), 132);
+    }
+}
+
+/// Interpreter-only operations (decision-18 §§1, 3–4). Widths are bytes;
+/// address widths are bits. Application lifting never emits these operations.
+#[derive(Clone, Debug)]
+pub enum LegacyOp {
+    Address {
+        dst: crate::ir::Temp,
+        segment: SegmentId,
+        offset: crate::ir::Val,
+        bytes: u8,
+    },
+    ReadSelector {
+        dst: crate::ir::Temp,
+        segment: SegmentId,
+    },
+    LoadSegment {
+        segment: SegmentId,
+        value: crate::ir::Val,
+        /// SDM Vol 3A §7.8.3: MOV/POP SS inhibit events; LSS does not.
+        inhibit: bool,
+    },
+    Push {
+        value: crate::ir::Val,
+        size: u8,
+    },
+    Pop {
+        dst: crate::ir::Temp,
+        size: u8,
+    },
+    AdjustStack {
+        bytes: u32,
+    },
+    Flags {
+        size: u8,
+        pop: bool,
+    },
+    All {
+        size: u8,
+        pop: bool,
+    },
+    Transfer {
+        cs: Option<crate::ir::Val>,
+        ip: crate::ir::Val,
+        size: u8,
+        return_ip: Option<u32>,
+    },
+    Return {
+        size: u8,
+        far: bool,
+        pop_extra: u16,
+    },
+    Loop {
+        kind: crate::ir::LoopKind,
+        count_bits: u8,
+        taken: u32,
+        next: u32,
+    },
+    String {
+        kind: crate::ir::StrOp,
+        elem: u8,
+        rep: crate::ir::RepKind,
+        address_bits: u8,
+        source: SegmentId,
+    },
+    Leave {
+        size: u8,
+    },
+    CheckTaskReturn,
+    Refuse {
+        operation: crate::UnsupportedSystemOperation,
+    },
+}
+
+/// SDM Vol 3B §23.1.1: check the complete effective offset before forming
+/// the linear address, including 67h offsets above FFFFh. Retained cache limits
+/// follow decision-18 §1 (SDM Vol 3A §§3.4.3, 12.9.2; AMD64 APM Vol 2 §4.1).
+/// Paging/A20 activation belongs to later phases; this physical boundary is identity.
+pub(crate) fn access(
+    cpu: &CpuState,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+) -> Result<u64, crate::Exit> {
+    let cache = cpu.legacy.segments[segment as usize];
+    let last = offset.checked_add(u64::from(bytes.saturating_sub(1)));
+    if cache.unusable != 0 || last.is_none_or(|last| last > u64::from(cache.limit)) {
+        // SDM Vol 3B §23.1.4, Table 23-1: SS overrun is #SS; other
+        // segment overruns are #GP, with the faulting instruction incomplete.
+        let vector = if segment == SegmentId::Ss { 12 } else { 13 };
+        // Real-address pseudo-protection faults carry no error code (80386
+        // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5).
+        let mut details = crate::fault::FaultMetadata::architectural_exception(
+            cpu.rip,
+            cpu.rip,
+            vector,
+            crate::fault::FaultClass::Fault,
+            crate::fault::ErrorCode::NoCode,
+        );
+        details.path = crate::fault::FaultPath::Interpreter;
+        details.operand_base = crate::fault::Knowledge::Known(offset);
+        details.operand_size = crate::fault::Knowledge::Known(u16::from(bytes));
+        return Err(crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details));
+    }
+    Ok(u64::from(cache.base.wrapping_add(offset as u32)))
+}
+
+/// SDM Vol 1 §21.1.2: 8086 high FLAGS bits are one, 286 real high
+/// bits zero, and 386 IOPL/NT writable with bit 15 zero; AC/ID are absent.
+/// 80386 PRM §2.3.4, Fig. 2-8, p. 2-11: reserved EFLAGS bits are zero/one
+/// as pictured (verified against the scan); §§4.1.1, 17 POPF, p. 17-130:
+/// POPFD leaves RF/VM unchanged and real mode has privilege zero.
+pub(crate) fn flags_image(cpu: &CpuState, generation: CpuGeneration) -> u32 {
+    let low = u32::from(cpu.flags.to_flags16()) & 0x0fd7;
+    match generation {
+        CpuGeneration::I8086 => low | 0xf000,
+        CpuGeneration::I286 => low,
+        CpuGeneration::I386 => low | (cpu.rflags_system as u32 & 0x0003_7000),
+    }
+}
+
+pub(crate) fn restore_flags(
+    cpu: &mut CpuState,
+    generation: CpuGeneration,
+    image: u32,
+) -> Result<(), crate::Exit> {
+    // Decision-18 §2: stored TF is not debug execution support. Refuse before
+    // popping the stack or changing flags. VM/RF are unaffected by POPF/POPFD.
+    if image & 0x100 != 0 {
+        return Err(crate::Exit::UnsupportedSystemContext {
+            addr: cpu.rip,
+            operation: crate::UnsupportedSystemOperation::InvalidLegacyContext(
+                LegacyContextError::DebugTrapUnsupported,
+            ),
+        });
+    }
+    cpu.flags.set_flags16((image & 0x0ed7) as u16);
+    let system = if generation == CpuGeneration::I386 {
+        image & 0x7000
+    } else {
+        0
+    };
+    cpu.rflags_system = (cpu.rflags_system & 0x30000) | u64::from(system);
+    Ok(())
+}
+
+#[cfg(test)]
+mod real_flags_tests {
+    use super::*;
+    #[test]
+    fn identification_images_and_pop_masks_are_generation_values() {
+        // SDM Vol 1 §21.1.2; 80386 PRM §2.3.4 Fig. 2-8 p. 2-11
+        // and §17 POPF p. 17-130 (verified page images).
+        for (generation, expected) in [
+            (CpuGeneration::I8086, 0xfed7),
+            (CpuGeneration::I286, 0x0ed7),
+            (CpuGeneration::I386, 0x7ed7),
+        ] {
+            let mut cpu = CpuState::legacy_real_entry([0; 6]);
+            restore_flags(&mut cpu, generation, 0xffff_feff).unwrap();
+            assert_eq!(flags_image(&cpu, generation), expected);
+            assert_eq!(
+                cpu.rflags_system,
+                if generation == CpuGeneration::I386 {
+                    0x7000
+                } else {
+                    0
+                }
+            );
+        }
+        let mut cpu = CpuState::legacy_real_entry([0; 6]);
+        cpu.rflags_system = 0x30000;
+        restore_flags(&mut cpu, CpuGeneration::I386, 0).unwrap();
+        assert_eq!(cpu.rflags_system, 0x30000);
+        assert_eq!(flags_image(&cpu, CpuGeneration::I386), 0x30002);
     }
 }

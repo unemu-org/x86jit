@@ -5,6 +5,7 @@
 //! before an op is emitted; memory operands expand to effective-address arithmetic
 //! (the single `effective_address` helper, §17.5) plus `Load`/`Store`.
 
+pub(crate) mod legacy;
 mod mmx;
 
 use iced_x86::{
@@ -31,6 +32,9 @@ use vector::*;
 
 pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
     fn push(&mut self, op: IrOp);
+    fn legacy_context(&self) -> Option<crate::LegacyDecodeContext> {
+        None
+    }
 }
 impl LiftBuffer for Vec<IrOp> {
     #[inline(always)]
@@ -399,6 +403,7 @@ fn guest_access_descriptors(ops: &[IrOp]) -> usize {
     use IrOp::*;
     ops.iter()
         .map(|op| match op {
+            IrOp::Legacy(_) => 0,
             AtomicRmw {
                 op: RmwOp::Rsub, ..
             } => 2,
@@ -1731,6 +1736,7 @@ pub(crate) fn cond_reads(cond: Cond) -> u8 {
 pub(crate) fn op_reads(op: &IrOp) -> u8 {
     use IrOp::*;
     match op {
+        Legacy(_) => 0b11_1111,
         // SDM Vol 1 Appendix A Table A-2: Jcc/SETcc/CMOVcc test condition flags.
         Branch { cond, .. } | GetCond { cond, .. } => cond_reads(*cond),
         // SDM Vol 1 Appendix A Table A-2: ADC/SBB test CF.
@@ -2206,6 +2212,9 @@ fn lift_insn(
     mode: CpuMode,
     sequence: &mut mmx::Sequence,
 ) -> Result<bool, LiftError> {
+    if ops.legacy_context().is_some() {
+        return legacy::lower(insn, ops, tg);
+    }
     sequence.check(insn, ops);
     let start = ops.len();
     let result = if insn.is_broadcast() || evex_is_masked(insn) {
@@ -4940,19 +4949,28 @@ pub(crate) fn effective_address_no_segment(
 ///   16-bit offset wrap was already applied by the address-size mask in
 ///   [`effective_address_no_segment`] (2-byte base/index registers).
 ///
-/// The Real16 branch is gated on `insn.code_size() == Code16`, which is true *iff* the
-/// instruction was decoded under a 16-bit (Real16) decoder — a 66h/67h override in
-/// Long64/Compat32 changes the operand/address size but never the decode `code_size()`.
-/// This keeps the Long64/Compat32 path byte-identical without threading `CpuMode`
-/// through the ~60 `effective_address` call sites.
+/// Legacy lowering supplies its context explicitly through LiftBuffer and emits
+/// a segment-identified access without discarding the effective offset. Only after
+/// excluding LegacySystem does Code16 identify Application Real16; application
+/// prefixes never change the fixed decoder's CodeSize.
 pub(crate) fn with_segment(
     insn: &Instruction,
     addr: Val,
     ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Val {
+    if ops.legacy_context().is_some() {
+        let dst = tg.fresh();
+        ops.push(IrOp::Legacy(crate::legacy::LegacyOp::Address {
+            dst,
+            segment: legacy::segment(insn.memory_segment()).expect("memory segment"),
+            offset: addr,
+            bytes: insn.memory_size().size() as u8,
+        }));
+        return Val::Temp(dst);
+    }
     if insn.code_size() == CodeSize::Code16 {
-        // Real mode: fold in `effective_segment_base = memory_segment() << 4`.
+        // Application Real16: fold in `effective_segment_base = memory_segment() << 4`.
         let seg = match iced_segment_reg(insn.memory_segment()) {
             Some(r) => r,
             // A memory operand with no resolvable segment is a decoder invariant break

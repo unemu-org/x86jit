@@ -15,6 +15,7 @@ use crate::jit_abi::{
     RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_RETURN_MISS, RET_SYSCALL,
     RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
+mod legacy;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
     lift_block_with_fault, lift_region, lift_region_with_fault, CpuMode, FetchAddr, LiftError,
@@ -1469,6 +1470,8 @@ impl Vm {
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             profile: self.profile,
             legacy_model: self.legacy_model,
+            legacy_execution: (self.profile == ExecutionProfile::LegacySystem)
+                .then(|| Box::new(legacy::Execution::new())),
             fast: Box::new(
                 [FastEntry {
                     rip: 0,
@@ -1619,6 +1622,7 @@ pub struct Vcpu {
     mode: CpuMode,
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
+    legacy_execution: Option<Box<legacy::Execution>>,
     /// Fast-resolve cache: a vcpu-private, direct-mapped RIP→compiled
     /// entry map that replaces the shared `RwLock<HashMap>` lookup (plus its two
     /// atomic counter bumps) for the transfers the chain loop can't chain — returns,
@@ -1803,7 +1807,7 @@ impl Vcpu {
     /// Queueing neither acknowledges a controller nor constructs a delivery frame.
     /// Application Real16 retains its existing delivery/readiness contract.
     /// Application Long64/Compat32 positive runs refuse with the vector retained;
-    /// legacy execution/delivery is currently unavailable.
+    /// legacy real execution refuses eligible delivery until its event seam lands.
     pub fn inject_irq(&mut self, vector: u8) {
         self.pending_irq = Some(vector);
     }
@@ -2123,11 +2127,20 @@ impl Vcpu {
     /// `Exit::UnknownInstruction`; a memory/MMIO/port trap returns its usual exit
     /// (resume deferred MMIO through [`Vcpu::run`]). An answered INS first
     /// attempts its pending store and returns without executing another element.
+    /// Legacy real execution performs one run_steps unit, including one REP iteration.
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
         if self.profile == ExecutionProfile::LegacySystem {
-            return StepResult::Exit(
-                self.unsupported_legacy(UnsupportedSystemOperation::LegacyStepping),
-            );
+            return match self.run_steps(vm, 1, StepOptions::default()) {
+                Ok(run) => match run.stop {
+                    StepStop::Exit(Exit::BudgetExhausted) | StepStop::IrqReady => {
+                        StepResult::Continue
+                    }
+                    StepStop::Exit(exit) => StepResult::Exit(exit),
+                },
+                Err(_) => StepResult::Exit(
+                    self.unsupported_legacy(UnsupportedSystemOperation::LegacyStepping),
+                ),
+            };
         }
         if self.cpu.port_string_in.is_some() {
             let result = if vm.mem.host_fault_recovery() {
@@ -2212,9 +2225,10 @@ impl Vcpu {
     /// with [`CpuMode::Real16`], including when the VM has a compiling backend
     /// (decision-16 §§1–4). Application Long64/Compat32 return
     /// [`StepRunError::UnsupportedMode`], including with a zero budget.
-    /// [`ExecutionProfile::LegacySystem`] returns a zero-step typed
-    /// [`Exit::UnsupportedSystemContext`] refusal, including with a zero budget;
-    /// it never executes or delivers events.
+    /// [`ExecutionProfile::LegacySystem`] also supports I386 real execution,
+    /// using derived code/stack sizes and a private interpreter cache. Protected
+    /// contexts and unavailable event delivery return typed unsupported exits.
+    /// No legacy context enters a compiling backend.
     ///
     /// A unit is one completed instruction or one completed REP iteration. Empty
     /// REP counts once. IN/OUT count at handoff; supplying an IN value adds no unit.
@@ -2238,12 +2252,7 @@ impl Vcpu {
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
         if self.profile == ExecutionProfile::LegacySystem {
-            return Ok(StepRun {
-                steps: 0,
-                stop: StepStop::Exit(
-                    self.unsupported_legacy(UnsupportedSystemOperation::LegacyStepping),
-                ),
-            });
+            return self.run_legacy(vm, Some(max_steps), options, true);
         }
         if self.mode != CpuMode::Real16 {
             return Err(StepRunError::UnsupportedMode);
@@ -2473,7 +2482,13 @@ impl Vcpu {
         self.interruption_evidence = None;
         self.syscall_evidence = None;
         if self.profile == ExecutionProfile::LegacySystem {
-            return self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution);
+            return match self.run_legacy(vm, budget, StepOptions::default(), false) {
+                Ok(run) => match run.stop {
+                    StepStop::Exit(exit) => exit,
+                    StepStop::IrqReady => unreachable!(),
+                },
+                Err(_) => self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution),
+            };
         }
         if self.mode != CpuMode::Real16 && budget != Some(0) && self.pending_irq.is_some() {
             return Exit::UnsupportedSystemContext {

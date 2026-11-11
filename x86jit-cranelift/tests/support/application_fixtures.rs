@@ -73,6 +73,10 @@ pub fn real16() -> Vec<(&'static str, IrBlock)> {
         ("memory", &b"\x8b\x00\x89\x06\x00\x20\xf4"[..]),
         ("rep", &b"\xf3\xa5\xf4"[..]),
         ("sizes", &b"\x66\x8b\x03\x67\x8b\x03\xf4"[..]),
+        ("flags-all", &b"\x9c\x9d\x60\x61\xf4"[..]),
+        ("far-call", &b"\x9a\x00\x20\x00\x01"[..]),
+        ("segments", &b"\x8e\xd8\x8e\xd0\x8b\x46\x00\xf4"[..]),
+        ("prefix-combination", &b"\x66\x67\x8b\x03\xf4"[..]),
     ]
     .into_iter()
     .map(|(name, code)| (name, block(code, CpuMode::Real16)))

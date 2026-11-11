@@ -2889,6 +2889,8 @@ pub enum IrOp {
         addr: Val,
         bytes: u8,
     },
+    /// Interpreter-only legacy operation; requires authoritative legacy_context.
+    Legacy(crate::legacy::LegacyOp),
 }
 
 /// Bitwise vector logic op (§3.1 M8).
