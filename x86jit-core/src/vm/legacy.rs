@@ -61,6 +61,7 @@ struct InstructionRetry {
 enum EventSource {
     SingleStep,
     Irq(u8),
+    Exception { vector: u8, error_code: Option<u32> },
 }
 #[derive(Clone, Copy)]
 struct PendingEvent {
@@ -68,6 +69,37 @@ struct PendingEvent {
     ip: u32,
     cs: u16,
 }
+fn exception_source(exit: &Exit) -> Option<EventSource> {
+    let Exit::Exception { vector, .. } = exit else {
+        return None;
+    };
+    let error_code = exit.fault_metadata().and_then(|m| match m.error_code() {
+        crate::fault::ErrorCode::Bits { value, .. } => Some(value),
+        _ => None,
+    });
+    Some(EventSource::Exception {
+        vector: *vector,
+        error_code,
+    })
+}
+
+fn double_fault(generation: CpuGeneration, first: EventSource, second: EventSource) -> bool {
+    let EventSource::Exception { vector: first, .. } = first else {
+        return false;
+    };
+    let EventSource::Exception { vector: second, .. } = second else {
+        return false;
+    };
+    // I286 PRM §9.6.2 p. 9-10 excludes #9 from the first-fault set;
+    // I386 PRM §9.8.8 Table 9-3 p. 9-13 includes it as contributory.
+    if generation == CpuGeneration::I286 {
+        return matches!(first, 0 | 10..=13);
+    }
+    let contributory = |vector| matches!(vector, 0 | 9..=13);
+    (contributory(first) && contributory(second))
+        || (first == 14 && (contributory(second) || second == 14))
+}
+
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
@@ -83,6 +115,7 @@ pub(super) struct Execution {
     event_retry: Option<PendingEvent>,
     // Port handoffs must reach the embedder before the post-instruction trap.
     port_debug: bool,
+    shutdown: bool,
     pub(super) pending_a20_enabled: Option<bool>,
 }
 impl Execution {
@@ -103,13 +136,18 @@ impl Execution {
             lifts: 0,
             event_retry: None,
             port_debug: false,
+            shutdown: false,
             pending_a20_enabled: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
         self.port_debug = false;
+        self.shutdown = false;
         self.instruction_retry = None;
+    }
+    pub(super) fn is_shutdown(&self) -> bool {
+        self.shutdown
     }
     pub(super) fn has_continuation(&self) -> bool {
         self.instruction_retry.is_some() || self.event_retry.is_some()
@@ -351,6 +389,12 @@ impl Vcpu {
                 stop: StepStop::Exit(Exit::BudgetExhausted),
             });
         }
+        if self.legacy_execution.as_ref().unwrap().shutdown {
+            return Ok(StepRun {
+                steps: 0,
+                stop: StepStop::Exit(Exit::Shutdown { addr: self.cpu.rip }),
+            });
+        }
         // Decision-16 §§1,3: validate CS:RIP ownership before execution,
         // while leaving every completion slot untouched at zero budget.
         if self.cpu.mmio_retry_active && !self.cpu.owns_mmio_retry(self.cpu.rip) {
@@ -441,12 +485,24 @@ impl Vcpu {
         &mut self,
         vm: &Vm,
         context: LegacyDecodeContext,
-        event: PendingEvent,
+        mut event: PendingEvent,
     ) -> Result<(), Exit> {
-        let vector = match event.source {
-            EventSource::SingleStep => 1,
-            EventSource::Irq(vector) => vector,
-        };
+        // Decision-23 §5: processor exceptions can be exposed without delivery.
+        if context.regime == LegacyRegime::Protected
+            && self.exception_delivery == crate::ExceptionDelivery::Outward
+            && matches!(event.source, EventSource::SingleStep)
+        {
+            self.legacy_execution.as_mut().unwrap().event_retry = None;
+            let mut metadata = crate::fault::FaultMetadata::architectural_exception(
+                self.cpu.rip,
+                u64::from(event.ip),
+                1,
+                crate::fault::FaultClass::Trap,
+                crate::fault::ErrorCode::NoCode,
+            );
+            metadata.path = crate::fault::FaultPath::Interpreter;
+            return Err(Exit::exception(self.cpu.rip, 1).with_fault_metadata(metadata));
+        }
         // Event priority, highest first (debug-register events remain unimplemented):
         // I286 PRM §5.2.1.1, Table 5-1 p. 5-4: instruction exception,
         // single step, NMI, processor-extension segment overrun, INTR.
@@ -457,25 +513,85 @@ impl Vcpu {
         // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
         // finish single-step delivery before examining lower-priority external
         // interrupts, which may be serviced before the first handler instruction.
-        // Real IVT delivery clears IF, so INTR remains pending until enabled.
+        // Interrupt gates clear IF; trap gates retain its prior value.
         // NMI input/delivery is deferred. A future NMI path must check eligible
         // NMIs after this delivery and before handler execution, independently
         // of IF (80386 PRM §9.2.2 p. 9-3);
         // MOV/POP SS inhibit its load boundary (I286 PRM Appendix B MOV
         // p. B-73, POP p. B-83; 80386 PRM §9.2.4 pp. 9-3–4).
-        let result = crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
-            &mut self.cpu,
-            &vm.mem,
-            context,
-            vector,
-            event.ip,
-        );
-        self.legacy_execution.as_mut().unwrap().event_retry = matches!(
-            &result,
-            Err(Exit::MmioRead { .. } | Exit::MmioWrite { .. } | Exit::UnmappedMemory { .. })
-        )
-        .then_some(event);
-        result?;
+        loop {
+            let (vector, error_code, fault) = match event.source {
+                EventSource::SingleStep => (1, None, false),
+                EventSource::Irq(vector) => (vector, None, false),
+                EventSource::Exception { vector, error_code } => (vector, error_code, true),
+            };
+            let delivery = crate::legacy::LegacyEvent {
+                vector,
+                saved_ip: event.ip,
+                software: false,
+                external: true,
+                error_code,
+                fault,
+            };
+            match crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                delivery,
+            ) {
+                Ok(()) => break,
+                Err(exit) => {
+                    self.cpu.finish_mmio_retry(Some(&exit));
+                    // Only a resumable bus transfer keeps the event continuation;
+                    // an architectural fault abandons it, so IF is consulted again
+                    // and a queued A20 change applies (xj-srh.20).
+                    self.legacy_execution.as_mut().unwrap().event_retry = matches!(
+                        &exit,
+                        Exit::MmioRead { .. }
+                            | Exit::MmioWrite { .. }
+                            | Exit::UnmappedMemory { .. }
+                    )
+                    .then_some(event);
+                    if !matches!(exit, Exit::Exception { .. }) {
+                        // Accepted delivery owns its inputs through bus handoffs.
+                        return Err(exit);
+                    }
+                    self.apply_pending_a20();
+                    if context.regime == LegacyRegime::Real
+                        && self.exception_delivery == crate::ExceptionDelivery::Outward
+                    {
+                        // Real-address Outward contract: the fault is returned and a
+                        // pending IRQ stays queued for the next IF check.
+                        return Err(exit);
+                    }
+                    if let EventSource::Irq(irq) = event.source {
+                        if self.pending_irq == Some(irq) {
+                            self.pending_irq = None;
+                        }
+                    }
+                    if self.exception_delivery == crate::ExceptionDelivery::Outward {
+                        return Err(exit);
+                    }
+                    let next = exception_source(&exit).expect("architectural exception");
+                    // I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8,
+                    // Tables 9-3/9-4 p. 9-13 (scan checked): delivery of #DF
+                    // that faults stops the processor until reset.
+                    if matches!(event.source, EventSource::Exception { vector: 8, .. }) {
+                        self.legacy_execution.as_mut().unwrap().shutdown = true;
+                        return Err(Exit::Shutdown { addr: self.cpu.rip });
+                    }
+                    event.source = if double_fault(context.generation, event.source, next) {
+                        EventSource::Exception {
+                            vector: 8,
+                            error_code: Some(0),
+                        }
+                    } else {
+                        next
+                    };
+                }
+            }
+        }
+        self.legacy_execution.as_mut().unwrap().event_retry = None;
         if let EventSource::Irq(vector) = event.source {
             if self.pending_irq == Some(vector) {
                 self.pending_irq = None;
@@ -490,6 +606,34 @@ impl Vcpu {
             .unwrap()
             .sync(&self.cpu, self.legacy_model.unwrap(), true);
         Ok(())
+    }
+
+    fn route_legacy_exception<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        context: LegacyDecodeContext,
+        exit: Exit,
+    ) -> Result<(), Exit> {
+        if self.exception_delivery != crate::ExceptionDelivery::InGuest {
+            return Err(exit);
+        }
+        let Some(source) = exception_source(&exit) else {
+            return Err(exit);
+        };
+        self.cpu.finish_mmio_retry(Some(&exit));
+        self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+        self.apply_pending_a20();
+        self.deliver_legacy_event::<ROUTED, ORDER>(
+            vm,
+            context,
+            PendingEvent {
+                source,
+                ip: exit
+                    .fault_metadata()
+                    .map_or(self.cpu.rip, |m| m.saved_rip()) as u32,
+                cs: self.cpu.cs,
+            },
+        )
     }
 
     fn legacy_loop<const ROUTED: bool, const ORDER: u8>(
@@ -598,9 +742,14 @@ impl Vcpu {
             {
                 Ok(ir) => ir,
                 Err(exit) => {
-                    return StepRun {
-                        steps,
-                        stop: StepStop::Exit(exit),
+                    match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
+                        Ok(()) => continue,
+                        Err(exit) => {
+                            return StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            }
+                        }
                     }
                 }
             };
@@ -687,6 +836,17 @@ impl Vcpu {
                         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
                         self.apply_pending_a20();
                     }
+                    if matches!(exit, Exit::Exception { .. }) {
+                        match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
+                            Ok(()) => continue,
+                            Err(exit) => {
+                                return StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                }
+                            }
+                        }
+                    }
                     return StepRun {
                         steps,
                         stop: StepStop::Exit(exit),
@@ -700,6 +860,63 @@ impl Vcpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_fault_classes_follow_each_generation() {
+        // I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8 Tables 9-3/9-4 p. 9-13.
+        let exception = |vector| EventSource::Exception {
+            vector,
+            error_code: None,
+        };
+        let benign = [1, 3, 4, 5, 6, 7, 16];
+        for first in benign {
+            for second in [0, 9, 10, 11, 12, 13, 14] {
+                for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+                    assert!(!double_fault(
+                        generation,
+                        exception(first),
+                        exception(second)
+                    ));
+                }
+            }
+        }
+        for first in [0, 10, 11, 12, 13] {
+            for second in [0, 10, 11, 12, 13] {
+                for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+                    assert!(double_fault(
+                        generation,
+                        exception(first),
+                        exception(second)
+                    ));
+                }
+            }
+        }
+        assert!(!double_fault(
+            CpuGeneration::I286,
+            exception(9),
+            exception(13)
+        ));
+        assert!(double_fault(
+            CpuGeneration::I386,
+            exception(9),
+            exception(13)
+        ));
+        assert!(!double_fault(
+            CpuGeneration::I386,
+            exception(13),
+            exception(14)
+        ));
+        for second in [0, 9, 10, 11, 12, 13, 14] {
+            assert!(double_fault(
+                CpuGeneration::I386,
+                exception(14),
+                exception(second)
+            ));
+        }
+        for first in [EventSource::SingleStep, EventSource::Irq(0)] {
+            assert!(!double_fault(CpuGeneration::I386, first, exception(13)));
+        }
+    }
 
     #[test]
     fn a20_toggles_reuse_only_the_matching_retained_blocks() {

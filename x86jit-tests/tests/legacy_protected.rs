@@ -494,7 +494,7 @@ fn far_transfer_faults_leave_frame_and_context_unchanged() {
 }
 
 #[test]
-fn ldt_gates_outer_returns_events_and_nonzero_cpl_are_typed_refusals() {
+fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
     // Decision-18 §4: unsupported delivery/transitions never construct an IVT frame.
     for (bytes, operation) in [
         (
@@ -517,10 +517,6 @@ fn ldt_gates_outer_returns_events_and_nonzero_cpl_are_typed_refusals() {
             &b"\xcf"[..],
             UnsupportedSystemOperation::LegacyPrivilegeTransition,
         ),
-        (
-            &b"\xcd\x20"[..],
-            UnsupportedSystemOperation::LegacyEventDelivery,
-        ),
     ] {
         let (vm, mut cpu) = setup(bytes, false, false);
         cpu.cpu.gpr[0] = 12;
@@ -531,20 +527,24 @@ fn ldt_gates_outer_returns_events_and_nonzero_cpl_are_typed_refusals() {
     let (vm, mut cpu) = setup(b"\x90", false, false);
     cpu.cpu.flags.if_ = true;
     cpu.inject_irq(0x20);
-    assert!(!cpu.irq_ready());
+    assert!(cpu.irq_ready());
     let stack = value(&vm, 0x7ffa, 6);
-    refused(
-        &mut cpu,
-        &vm,
-        UnsupportedSystemOperation::LegacyEventDelivery,
+    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    let StepStop::Exit(exit @ Exit::Exception { vector: 13, .. }) = run.stop() else {
+        panic!("{:?}", run.stop())
+    };
+    assert_eq!(
+        exit.fault_metadata().unwrap().error_code(),
+        ErrorCode::bits(0x103, 0xffff)
     );
-    assert!(cpu.has_pending_irq());
+    assert!(!cpu.has_pending_irq());
     assert_eq!(value(&vm, 0x7ffa, 6), stack);
+    cpu.inject_irq(0x20);
     cpu.cpu.legacy.cr0 = 0;
     vm.write_bytes(0x80, b"\x00\x12\x00\x00").unwrap();
     vm.write_bytes(0x1200, b"\x90").unwrap();
     steps(&mut cpu, &vm, 1);
-    assert_eq!(cpu.cpu.rip, 0x1201); // pending vector survived refusal
+    assert_eq!(cpu.cpu.rip, 0x1201); // explicitly requeued vector uses real delivery
     cpu.cpu.legacy.cr0 = 1;
     cpu.cpu.legacy.cpl = 1;
     refused(
@@ -660,7 +660,7 @@ fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary() {
 }
 
 #[test]
-fn iret_refuses_task_v86_and_debug_before_changing_the_frame() {
+fn iret_refuses_task_and_v86_before_changing_the_frame() {
     // Decision-18 §2; SDM Vol 2A §3.3 IRET; PRM §17 pp. 17-74, 17-78.
     let (vm, mut cpu) = setup(b"\xcf", true, false);
     descriptor(&vm, 8, 0, 0xffff, 0x9a);
@@ -671,13 +671,6 @@ fn iret_refuses_task_v86_and_debug_before_changing_the_frame() {
             0x20002,
             UnsupportedSystemOperation::InvalidLegacyContext(
                 x86jit_core::LegacyContextError::Virtual8086Unsupported,
-            ),
-        ),
-        (
-            0,
-            0x102,
-            UnsupportedSystemOperation::InvalidLegacyContext(
-                x86jit_core::LegacyContextError::DebugTrapUnsupported,
             ),
         ),
     ] {

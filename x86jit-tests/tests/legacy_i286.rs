@@ -493,9 +493,9 @@ fn real_coprocessor_execution_and_deferred_system_forms() {
 }
 
 #[test]
-fn protected_tf_images_and_entry_remain_typed_refusals() {
-    // I286 PRM §9.7.1 p. 9-14 describes IDT delivery; the protected
-    // event-delivery implementation is deferred (decision-18 §4).
+fn protected_tf_images_and_entry_are_supported() {
+    // I286 PRM §9.7.1 p. 9-14: a flag load enables the following instruction's
+    // trap. Protected #DB delivery is witnessed in legacy_idt.rs.
     for iret in [false, true] {
         let (vm, mut cpu) = setup(if iret { b"\xcf" } else { b"\x9d" }, true);
         if iret {
@@ -503,24 +503,10 @@ fn protected_tf_images_and_entry_remain_typed_refusals() {
         } else {
             vm.write_bytes(0x8000, b"\x02\x01").unwrap();
         }
-        let before = format!("{:?}", cpu.cpu);
-        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert_eq!(run.steps(), 0);
-        assert!(matches!(
-            run.stop(),
-            StepStop::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    LegacyContextError::DebugTrapUnsupported
-                ),
-                ..
-            })
-        ));
-        assert_eq!(format!("{:?}", cpu.cpu), before);
-        cpu.cpu.rflags_system = 0x100;
-        assert_eq!(
-            derive_legacy_context(MODEL, &cpu.cpu),
-            Err(LegacyContextError::DebugTrapUnsupported)
-        );
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rflags_system & 0x100, 0x100);
+        assert_eq!(cpu.cpu.gpr[4] & 0xffff, if iret { 0x8006 } else { 0x8002 });
+        assert!(derive_legacy_context(MODEL, &cpu.cpu).is_ok());
     }
 }
 

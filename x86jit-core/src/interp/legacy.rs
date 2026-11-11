@@ -572,32 +572,154 @@ fn target(cpu: &CpuState, context: LegacyDecodeContext, value: u64, size: u8) ->
     Ok(offset)
 }
 
-/// Shared real-address delivery for software INT, single stepping and queued IRQs.
-/// Faults remain outward until the exception-routing seam (decision-18 §4).
+/// Shared delivery for software INT, processor exceptions and queued IRQs.
 pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     memory: &Memory,
     context: LegacyDecodeContext,
-    vector: u8,
-    saved_ip: u32,
+    event: legacy::LegacyEvent,
 ) -> Result<(), Exit> {
     let mem = Access::<ROUTED, ORDER>::new(memory);
-    deliver(cpu, mem, context, vector, saved_ip)
+    deliver(cpu, mem, context, event)
+}
+
+fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    context: LegacyDecodeContext,
+    event: legacy::LegacyEvent,
+) -> Result<(), Exit> {
+    // I286 PRM §9.4 Fig. 9-3, Table 9-1 pp. 9-4–6;
+    // I386 PRM §§9.5–9.7 pp. 9-6–10; §17 INT pp. 17-70–72 (scan checked).
+    let offset = u32::from(event.vector) * 8;
+    let ext = u16::from(event.external);
+    let idt_code = offset as u16 | 2 | ext;
+    if offset + 7 > u32::from(cpu.legacy.idtr.limit) {
+        return Err(fault(cpu, 13, idt_code));
+    }
+    let address = cpu.legacy.idtr.base.wrapping_add(offset);
+    let key = DESCRIPTOR_RETRY | (1 << 34) | u64::from(address);
+    let low = if let Some(value) = cpu.mmio_part(cpu.rip, key) {
+        value as u32
+    } else {
+        read(cpu, mem, u64::from(address), 4)? as u32
+    };
+    let high = if let Some(value) = cpu.mmio_part(cpu.rip, key | (1 << 32)) {
+        value as u32
+    } else {
+        read(cpu, mem, u64::from(address.wrapping_add(4)), 4)? as u32
+    };
+    let attr = (high >> 8) as u8;
+    let kind = attr & 0x1f;
+    let valid = matches!(kind, 5..=7)
+        || (context.generation == crate::CpuGeneration::I386 && matches!(kind, 14 | 15));
+    if !valid || (event.software && (attr >> 5) & 3 < context.cpl) {
+        return Err(fault(cpu, 13, idt_code));
+    }
+    if attr & 0x80 == 0 {
+        return Err(fault(cpu, 11, idt_code));
+    }
+    if kind == 5 {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
+        ));
+    }
+    let cs = (low >> 16) as u16;
+    let selector_code = (cs & !3) | ext;
+    if cs & !3 == 0 {
+        return Err(fault(cpu, 13, ext));
+    }
+    let mut d = descriptor(cpu, mem, cs, context.generation).map_err(|exit| {
+        // Table bounds failures name the selector with the delivery's EXT bit.
+        if matches!(exit, Exit::Exception { vector: 13, .. }) {
+            fault(cpu, 13, selector_code)
+        } else {
+            exit
+        }
+    })?;
+    let dpl = ((d.cache.attributes >> 5) & 3) as u8;
+    if d.cache.attributes & 0x18 != 0x18 || dpl > context.cpl {
+        return Err(fault(cpu, 13, selector_code));
+    }
+    if d.cache.attributes & 0x80 == 0 {
+        return Err(fault(cpu, 11, selector_code));
+    }
+    if d.cache.attributes & 4 == 0 && dpl < context.cpl {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyPrivilegeTransition,
+        ));
+    }
+    supported_descriptor(cpu, d.cache.attributes)?;
+    let size = if kind & 8 != 0 { 4 } else { 2 };
+    let ip = u64::from((low & 0xffff) | if size == 4 { high & 0xffff0000 } else { 0 });
+    // I386 PRM §17 INT p. 17-72 checks stack space before the target offset,
+    // reporting #SS(0)/#GP(0). Follow SDM Vol 2A §3.3 INT n/INTO/INT3/INT1,
+    // Operation, INTRA-PRIVILEGE-LEVEL-INTERRUPT p. 3-478 for the error codes:
+    // #SS(EXT) for insufficient stack space, #GP(EXT) for an invalid target offset.
+    push_addresses(
+        cpu,
+        mem,
+        context,
+        3 + usize::from(event.error_code.is_some()),
+        size,
+    )
+    .map_err(|exit| {
+        if matches!(exit, Exit::Exception { vector: 12, .. }) {
+            fault(cpu, 12, ext)
+        } else {
+            exit
+        }
+    })?;
+    if ip > u64::from(d.cache.limit) {
+        return Err(fault(cpu, 13, ext));
+    }
+    cpu.record_mmio_part(cpu.rip, key, u64::from(low));
+    cpu.record_mmio_part(cpu.rip, key | (1 << 32), u64::from(high));
+    accessed(cpu, mem, &mut d)?;
+    let mut flags = legacy::flags_image(cpu, context.generation);
+    // I386 PRM §12.3.1.1 p. 12-7: fault frames set RF; traps and INT do not.
+    if context.generation == crate::CpuGeneration::I386 && event.fault {
+        flags |= 1 << 16;
+    }
+    let mut frame = vec![
+        u64::from(flags),
+        u64::from(cpu.cs),
+        u64::from(event.saved_ip),
+    ];
+    if let Some(code) = event.error_code {
+        frame.push(u64::from(code));
+    }
+    push(cpu, mem, context, &frame, size)?;
+    if kind & 1 == 0 {
+        cpu.flags.if_ = false;
+    }
+    // I286 PRM §9.4 pp. 9-3–5; I386 PRM §17 INT p. 17-72:
+    // both gate kinds clear TF/NT after saving their old values.
+    // SDM Vol 3A §7.12.1.3 also clears RF in the live handler flags.
+    cpu.rflags_system &= !0x14100;
+    install(
+        cpu,
+        SegmentId::Cs,
+        (cs & !3) | u16::from(context.cpl),
+        d.cache,
+    );
+    cpu.rip = ip;
+    Ok(())
 }
 
 fn deliver<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
     context: LegacyDecodeContext,
-    vector: u8,
-    saved_ip: u32,
+    event: legacy::LegacyEvent,
 ) -> Result<(), Exit> {
     if context.regime == legacy::LegacyRegime::Protected {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyEventDelivery,
-        ));
+        return deliver_protected(cpu, mem, context, event);
     }
+    let vector = event.vector;
+    let saved_ip = event.saved_ip;
     // SDM Vol 3B §23.1.4; Vol 2A §3.3 INT, REAL-ADDRESS-MODE:
     // four-byte IDTR-relative entries, inclusive limit, six-byte frame,
     // no error code. Validate/read the target before committing the frame.
@@ -1460,13 +1582,39 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // SDM Vol 2A §3.3 CLTS; 80386 PRM §17 p. 17-48.
                         outcome.context_changed = write_cr0(cpu, cpu.legacy.cr0 & !8)?;
                     }
+                    L::Bound {
+                        index,
+                        lower,
+                        upper,
+                        size,
+                    } => {
+                        let signed = |value| sign_extend(value, *size) as i64;
+                        let index = signed(read_val(*index, temps));
+                        if index < signed(read_val(*lower, temps))
+                            || index > signed(read_val(*upper, temps))
+                        {
+                            return Err(exception(cpu, 5));
+                        }
+                    }
                     L::Interrupt {
                         vector,
                         saved_ip,
                         overflow_only,
                     } => {
                         if !overflow_only || cpu.flags.of {
-                            deliver(cpu, mem, context, *vector, *saved_ip)?;
+                            deliver(
+                                cpu,
+                                mem,
+                                context,
+                                legacy::LegacyEvent {
+                                    vector: *vector,
+                                    saved_ip: *saved_ip,
+                                    software: true,
+                                    external: false,
+                                    error_code: None,
+                                    fault: false,
+                                },
+                            )?;
                             // I286 PRM §9.7.1 p. 9-14, Appendix B INT/INTO
                             // p. B-48; 80386 PRM §12.3.1.4 p. 12-8,
                             // §17 INT/INTO p. 17-69: both models save then
@@ -1723,15 +1871,14 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 .map_or(cpu.legacy.segments[0], |d| d.cache),
                             ip,
                         )?;
-                        // Validate unsupported TF before any descriptor write.
+                        if let Some(d) = &mut descriptor {
+                            accessed(cpu, mem, d)?;
+                        }
                         legacy::restore_flags(cpu, context.generation, image)?;
                         // IRET restores RF in a 32-bit frame; POPFD does not.
                         if *size == 4 {
                             cpu.rflags_system =
                                 (cpu.rflags_system & !(1 << 16)) | u64::from(image & (1 << 16));
-                        }
-                        if let Some(d) = &mut descriptor {
-                            accessed(cpu, mem, d)?;
                         }
                         adjust(cpu, context, 3 * u32::from(*size));
                         if let Some(d) = descriptor {
@@ -1977,4 +2124,139 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
     }
     cpu.rip = next;
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::{CpuGeneration, LegacyCpuModel, Prot, RegionKind, Vm, VmConfig};
+
+    #[test]
+    fn every_supported_exception_vector_uses_its_gate_width_and_error_code() {
+        // I286 PRM §§9.4–9.6 pp. 9-4–10; I386 PRM §§9.6–9.8,
+        // Tables 9-6/9-7 pp. 9-20–21: vectors, error codes and frame slots.
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            for size in [2u8, 4] {
+                if generation == CpuGeneration::I286 && size == 4 {
+                    continue;
+                }
+                let mut vm = Vm::new(VmConfig::flat(0x10000));
+                vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x2008, &[0xff, 0xff, 0, 0, 0, 0x9b, 0, 0])
+                    .unwrap();
+                for vector in [0, 1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 16] {
+                    let error_code = match vector {
+                        8 => Some(0),
+                        10..=13 => Some(24),
+                        _ => None,
+                    };
+                    let mut cpu = CpuState::legacy_real_entry([8, 0, 0, 16, 0, 0]);
+                    cpu.rip = 0x1000;
+                    cpu.gpr[RSP] = 0x8000;
+                    cpu.flags.if_ = true;
+                    cpu.rflags_system = 0x4100;
+                    cpu.legacy.cr0 = 1;
+                    cpu.legacy.segments[SegmentId::Cs as usize].base = 0;
+                    cpu.legacy.segments[SegmentId::Ss as usize].base = 0;
+                    cpu.legacy.gdtr.base = 0x2000;
+                    cpu.legacy.gdtr.limit = 15;
+                    cpu.legacy.idtr.base = 0x3000;
+                    cpu.legacy.idtr.limit = 0x7ff;
+                    let context = legacy::derive_legacy_context(
+                        LegacyCpuModel {
+                            generation,
+                            model_semantics_id: 0,
+                        },
+                        &cpu,
+                    )
+                    .unwrap();
+                    vm.write_bytes(
+                        0x3000 + u64::from(vector) * 8,
+                        &[0, 0x18, 8, 0, 0, if size == 4 { 0x8e } else { 0x86 }, 0, 0],
+                    )
+                    .unwrap();
+                    deliver_interrupt::<false, 0>(
+                        &mut cpu,
+                        &vm.mem,
+                        context,
+                        legacy::LegacyEvent {
+                            vector,
+                            saved_ip: 0x1000,
+                            software: false,
+                            external: true,
+                            error_code,
+                            fault: !matches!(vector, 1 | 3 | 4),
+                        },
+                    )
+                    .unwrap();
+                    let sp = 0x8000 - u64::from(size) * (3 + u64::from(error_code.is_some()));
+                    assert_eq!((cpu.cs, cpu.rip, cpu.gpr[RSP]), (8, 0x1800, sp));
+                    let mut image = [0; 4];
+                    vm.read_bytes(sp, &mut image[..size as usize]).unwrap();
+                    assert_eq!(u32::from_le_bytes(image), error_code.unwrap_or(0x1000));
+                    assert!(!cpu.flags.if_);
+                    assert_eq!(cpu.rflags_system & 0x14100, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn software_gate_dpl_check_precedes_presence_and_external_delivery_bypasses_dpl() {
+        // I286 PRM §9.4 Table 9-1 p. 9-6; I386 PRM §17 INT p. 17-70.
+        // The public dispatcher restricts CPL to zero. Exercise the gate check
+        // directly at CPL 3, where a lower gate DPL is representable.
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            let mut cpu = CpuState::legacy_real_entry([3, 0, 0, 3, 0, 0]);
+            cpu.rip = 0x1000;
+            cpu.legacy.cr0 = 1;
+            cpu.legacy.cpl = 3;
+            cpu.legacy.idtr.base = 0x3000;
+            cpu.legacy.idtr.limit = 0x7ff;
+            let context = legacy::derive_legacy_context(
+                LegacyCpuModel {
+                    generation,
+                    model_semantics_id: 0,
+                },
+                &cpu,
+            )
+            .unwrap();
+            let event = legacy::LegacyEvent {
+                vector: 0x30,
+                saved_ip: 0x1002,
+                software: true,
+                external: false,
+                error_code: None,
+                fault: false,
+            };
+            for (attr, software, external, expected, code) in [
+                (0xc6, true, false, 13, 0x182),
+                (0x46, true, false, 13, 0x182),
+                (0x46, false, true, 11, 0x183),
+                (0x66, true, false, 11, 0x182),
+            ] {
+                vm.write_bytes(0x3180, &[0, 0x18, 8, 0, 0, attr, 0, 0])
+                    .unwrap();
+                let exit = deliver_interrupt::<false, 0>(
+                    &mut cpu,
+                    &vm.mem,
+                    context,
+                    legacy::LegacyEvent {
+                        software,
+                        external,
+                        ..event
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(exit, Exit::Exception { vector, .. } if vector == expected));
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    crate::fault::ErrorCode::bits(code, 0xffff)
+                );
+                assert_eq!(cpu.rip, 0x1000);
+            }
+        }
+    }
 }

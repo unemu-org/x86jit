@@ -700,6 +700,7 @@ pub struct Vm {
     mode: CpuMode,
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
+    exception_delivery: crate::ExceptionDelivery,
     profile_locked: std::sync::atomic::AtomicBool,
 }
 
@@ -1195,7 +1196,8 @@ impl Vm {
 
     /// Select system execution and an immutable model before any vCPU is created.
     /// Panics after vCPU creation, including after all such vCPUs are dropped.
-    /// Execution currently returns a typed unsupported-system exit.
+    /// Selects `ExceptionDelivery::Outward` for compatibility. Call
+    /// `set_exception_delivery` afterwards to opt into in-guest exceptions.
     pub fn set_legacy_cpu_model(&mut self, model: LegacyCpuModel) {
         assert!(
             !self.profile_locked.load(Ordering::Relaxed),
@@ -1203,6 +1205,22 @@ impl Vm {
         );
         self.profile = ExecutionProfile::LegacySystem;
         self.legacy_model = Some(model);
+        self.exception_delivery = crate::ExceptionDelivery::Outward;
+    }
+
+    /// Select processor-exception routing before creating any vCPU.
+    /// Applies to LegacySystem in both real and protected mode (decision-23 §5).
+    /// Software INT always uses the guest table. Application profiles ignore it.
+    pub fn set_exception_delivery(&mut self, delivery: crate::ExceptionDelivery) {
+        assert!(
+            !self.profile_locked.load(Ordering::Relaxed),
+            "select exception delivery before vCPU creation"
+        );
+        self.exception_delivery = delivery;
+    }
+
+    pub fn exception_delivery(&self) -> crate::ExceptionDelivery {
+        self.exception_delivery
     }
 
     pub fn execution_profile(&self) -> ExecutionProfile {
@@ -1257,6 +1275,7 @@ impl Vm {
             mode: self.mode,
             profile: self.profile,
             legacy_model: self.legacy_model,
+            exception_delivery: self.exception_delivery,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: self.lockstep_trace.clone(),
         })
@@ -1290,6 +1309,7 @@ impl Vm {
             mode: CpuMode::Long64,
             profile: ExecutionProfile::Application(CpuMode::Long64),
             legacy_model: None,
+            exception_delivery: crate::ExceptionDelivery::Outward,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: None,
         }
@@ -1577,6 +1597,7 @@ impl Vm {
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             profile: self.profile,
             legacy_model: self.legacy_model,
+            exception_delivery: self.exception_delivery,
             legacy_execution: (self.profile == ExecutionProfile::LegacySystem)
                 .then(|| Box::new(legacy::Execution::new())),
             fast: Box::new(
@@ -1758,6 +1779,7 @@ pub struct Vcpu {
     mode: CpuMode,
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
+    exception_delivery: crate::ExceptionDelivery,
     legacy_execution: Option<Box<legacy::Execution>>,
     /// Fast-resolve cache: a vcpu-private, two-way RIP→compiled entry map
     /// that replaces the shared lookup for transfers the chain loop can't chain — returns,
@@ -2041,9 +2063,9 @@ impl Vcpu {
         self.pending_irq.is_some()
     }
 
-    /// Whether a real-address maskable IRQ could be accepted at this boundary.
+    /// Whether a maskable IRQ could be accepted at this boundary.
     /// Independent of whether a vector is queued; does not acknowledge or deliver.
-    /// Supported for Application Real16 and LegacySystem I286/I386 real execution.
+    /// Supported for Application Real16 and LegacySystem I286/I386 execution.
     /// Pending IN completion and the entire MMIO retry
     /// (including answered but unfinished transfers) also prevent acceptance.
     ///
@@ -2052,9 +2074,8 @@ impl Vcpu {
     pub fn irq_ready(&self) -> bool {
         (self.profile == ExecutionProfile::Application(CpuMode::Real16)
             || (self.profile == ExecutionProfile::LegacySystem
-                && self
-                    .legacy_context_for_run()
-                    .is_ok_and(|c| c.regime == crate::LegacyRegime::Real)))
+                && self.legacy_context_for_run().is_ok()
+                && !self.legacy_execution.as_ref().unwrap().is_shutdown()))
             && !self.cpu.mmio_retry_active
             && self.irq_delivery_ready()
     }

@@ -279,6 +279,11 @@ pub enum Exit {
         addr: u64,
         operation: UnsupportedSystemOperation,
     },
+    /// The processor faulted while invoking #DF. Execution remains stopped until
+    /// `Vcpu::reset_execution_state`; the embedder supplies the reset image.
+    /// I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8 p. 9-13.
+    #[non_exhaustive]
+    Shutdown { addr: u64 },
 }
 
 impl Exit {

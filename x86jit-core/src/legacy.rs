@@ -9,6 +9,26 @@ pub enum ExecutionProfile {
     LegacySystem,
 }
 
+/// Per-VM routing of processor exceptions (decision-23 §5). Software INT
+/// instructions always execute guest delivery, independently of this option.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExceptionDelivery {
+    InGuest,
+    #[default]
+    Outward,
+}
+
+/// Inputs retained across an accepted delivery's device handoffs.
+#[derive(Clone, Copy)]
+pub(crate) struct LegacyEvent {
+    pub vector: u8,
+    pub saved_ip: u32,
+    pub software: bool,
+    pub external: bool,
+    pub error_code: Option<u32>,
+    pub fault: bool,
+}
+
 /// Generation is independent of decoder width and CPUID enumeration.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -205,9 +225,6 @@ pub fn derive_legacy_context(
     // SDM Vol 1 §3.4.3.3: VM and TF are stored separately from arithmetic flags.
     if cpu.rflags_system & (1 << 17) != 0 {
         return Err(Virtual8086Unsupported);
-    }
-    if protected && cpu.rflags_system & (1 << 8) != 0 {
-        return Err(DebugTrapUnsupported);
     }
     let bits = if cs.attributes & (1 << 14) != 0 {
         32
@@ -531,13 +548,6 @@ mod tests {
                 |c| c.rflags_system = 1 << 17,
                 LegacyContextError::Virtual8086Unsupported,
             ),
-            (
-                |c| {
-                    c.legacy.cr0 |= 1;
-                    c.rflags_system = 1 << 8;
-                },
-                LegacyContextError::DebugTrapUnsupported,
-            ),
         ];
         for (edit, error) in cases {
             let mut cpu = CpuState::legacy_real_entry([0; 6]);
@@ -669,6 +679,12 @@ pub enum LegacyOp {
         vector: u8,
         saved_ip: u32,
         overflow_only: bool,
+    },
+    Bound {
+        index: crate::ir::Val,
+        lower: crate::ir::Val,
+        upper: crate::ir::Val,
+        size: u8,
     },
     CheckTaskReturn,
     Iret {
@@ -818,17 +834,6 @@ pub(crate) fn restore_flags(
     generation: CpuGeneration,
     image: u32,
 ) -> Result<(), crate::Exit> {
-    // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
-    // flag-image loads can enable single stepping. Protected delivery awaits
-    // the IDT path; refuse before changing flags or consuming the frame.
-    if cpu.legacy.cr0 & 1 != 0 && image & 0x100 != 0 {
-        return Err(crate::Exit::UnsupportedSystemContext {
-            addr: cpu.rip,
-            operation: crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                LegacyContextError::DebugTrapUnsupported,
-            ),
-        });
-    }
     cpu.flags.set_flags16((image & 0x0ed7) as u16);
     // I286 PRM Appendix B IRET pp. B-51–52; §10.1 p. 10-1.
     // Execution is currently limited to CPL 0, where IOPL is writable.

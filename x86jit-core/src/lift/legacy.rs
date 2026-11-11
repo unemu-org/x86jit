@@ -566,6 +566,24 @@ pub(super) fn lower(
             emit(ops, L::CheckTaskReturn);
             emit(ops, L::Iret { size });
         }
+        Bound => {
+            // I286 PRM Appendix B BOUND p. B-22; I386 PRM §17 BOUND
+            // p. 17-26: signed, inclusive bounds; #BR restarts BOUND.
+            let index = lower_read(insn, 0, ops, tg)?;
+            let a = address(insn, ops, tg)?;
+            let lower = load(ops, tg, a, size);
+            let b = add_addr(a, Val::Imm(u64::from(size)), ops, tg);
+            let upper = load(ops, tg, b, size);
+            emit(
+                ops,
+                L::Bound {
+                    index,
+                    lower,
+                    upper,
+                    size,
+                },
+            );
+        }
         Int | Int3 | Int1 | Into => emit(
             ops,
             L::Interrupt {

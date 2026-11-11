@@ -373,6 +373,12 @@ impl IrBlock {
                     crate::legacy::LegacyOp::WriteControl { value, .. } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::ClearTs => {}
+                    crate::legacy::LegacyOp::Bound {
+                        index,
+                        lower,
+                        upper,
+                        size: _,
+                    } => check(&[*index, *lower, *upper], &[])?,
                     crate::legacy::LegacyOp::Interrupt { .. } => {}
                     crate::legacy::LegacyOp::AdjustStack { .. }
                     | crate::legacy::LegacyOp::Flags { .. }
@@ -445,6 +451,28 @@ mod tests {
                 temp: 1,
             })
         );
+    }
+
+    #[test]
+    fn legacy_bound_checks_each_input_without_defining_a_destination() {
+        for input in 0..3 {
+            let mut values = [Val::Imm(0); 3];
+            values[input] = Val::Temp(3);
+            let ir = block(vec![IrOp::Legacy(crate::legacy::LegacyOp::Bound {
+                index: values[0],
+                lower: values[1],
+                upper: values[2],
+                size: 4,
+            })]);
+            assert_eq!(
+                ir.verify_temp_defs(),
+                Err(UndefinedTemp {
+                    op_index: 0,
+                    guest_addr: 0x100,
+                    temp: 3,
+                })
+            );
+        }
     }
 
     #[test]

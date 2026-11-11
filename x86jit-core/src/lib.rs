@@ -212,9 +212,9 @@ pub use ir::{
     RepKind, RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
 pub use legacy::{
-    derive_legacy_context, CpuGeneration, ExecutionProfile, LegacyContextError, LegacyCpuModel,
-    LegacyCpuState, LegacyDecodeContext, LegacyRegime, SegmentCache, SegmentId, SystemSegment,
-    TableRegister,
+    derive_legacy_context, CpuGeneration, ExceptionDelivery, ExecutionProfile, LegacyContextError,
+    LegacyCpuModel, LegacyCpuState, LegacyDecodeContext, LegacyRegime, SegmentCache, SegmentId,
+    SystemSegment, TableRegister,
 };
 pub use lift::CpuMode;
 pub use memory::{

@@ -118,7 +118,7 @@ fn every_legacy_probe_defines_temps_before_use() {
                     paging_enabled: false,
                 };
                 let mut checked = 0;
-                let mut system_ops = [false; 7];
+                let mut system_ops = [false; 8];
                 for code in Code::values().filter(|code| {
                     let info = code.op_code();
                     *code != Code::INVALID
@@ -163,6 +163,7 @@ fn every_legacy_probe_defines_temps_before_use() {
                                 IrOp::Legacy(LegacyOp::ClearTs) => 4,
                                 IrOp::Legacy(LegacyOp::Interrupt { .. }) => 5,
                                 IrOp::Legacy(LegacyOp::Iret { .. }) => 6,
+                                IrOp::Legacy(LegacyOp::Bound { .. }) => 7,
                                 _ => continue,
                             };
                             system_ops[index] = true;

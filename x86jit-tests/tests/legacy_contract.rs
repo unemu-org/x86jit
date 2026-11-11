@@ -90,9 +90,18 @@ fn profile_selection_preserves_application_defaults_and_forks() {
     let mut legacy = setup(Box::new(NoBackend));
     legacy.set_cpu_mode(CpuMode::Real16);
     legacy.set_legacy_cpu_model(MODEL);
+    assert_eq!(
+        legacy.exception_delivery(),
+        x86jit_core::ExceptionDelivery::Outward
+    );
+    legacy.set_exception_delivery(x86jit_core::ExceptionDelivery::InGuest);
     let child = legacy.fork_with_backend(Box::new(NoBackend)).unwrap();
     assert_eq!(child.execution_profile(), ExecutionProfile::LegacySystem);
     assert_eq!(child.legacy_cpu_model(), Some(MODEL));
+    assert_eq!(
+        child.exception_delivery(),
+        x86jit_core::ExceptionDelivery::InGuest
+    );
     let cpu = child.new_vcpu();
     assert_eq!(cpu.execution_profile(), ExecutionProfile::LegacySystem);
     assert_eq!(cpu.legacy_cpu_model(), Some(MODEL));
@@ -100,6 +109,10 @@ fn profile_selection_preserves_application_defaults_and_forks() {
     assert_ne!(cpu.cpu.legacy, LegacyCpuState::default());
     drop(cpu);
     let mut child = child;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || child.set_exception_delivery(x86jit_core::ExceptionDelivery::Outward)
+    ))
+    .is_err());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || child.set_cpu_mode(CpuMode::Long64)
     ))
