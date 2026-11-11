@@ -18,6 +18,20 @@ pub mod xstate;
 use crate::f80::{Ctl, Exc, F80};
 use crate::state::CpuState;
 
+/// SDM Vol 2A §3.3, FINIT/FNINIT: initialize the environment and tag every data
+/// register empty, preserving the data register contents.
+pub(crate) fn fninit(cpu: &mut CpuState) {
+    cpu.fpu_cw = 0x037F;
+    cpu.fpu_top = 0;
+    cpu.fpu_sw = 0;
+    cpu.fpu_empty = 0xFF;
+    cpu.fpu_fip = 0;
+    cpu.fpu_fdp = 0;
+    cpu.fpu_fop = 0;
+    cpu.fpu_fcs = 0;
+    cpu.fpu_fds = 0;
+}
+
 /// Guest-memory access for the x87 helpers. Two implementors give the two backends
 /// the memory semantics each already uses for a scalar store:
 ///
@@ -1873,23 +1887,7 @@ fn exec_x87_inner<M: FpMem>(
             }
             load_env28(cpu, &buf, sti & 0x80 != 0);
         }
-        Fninit => {
-            // Reinitialize the x87 unit: control word 0x037F (round-to-nearest,
-            // all exceptions masked, 64-bit precision), status word 0, tag word
-            // all-empty, TOP 0.
-            cpu.fpu_cw = 0x037F;
-            cpu.fpu_top = 0;
-            // "The status word is cleared ... The data registers in the register stack
-            // are left unchanged, but they are all tagged as empty" (SDM Vol 2A
-            // FINIT/FNINIT).
-            cpu.fpu_sw = 0;
-            cpu.fpu_empty = 0xFF;
-            cpu.fpu_fip = 0;
-            cpu.fpu_fdp = 0;
-            cpu.fpu_fop = 0;
-            cpu.fpu_fcs = 0;
-            cpu.fpu_fds = 0;
-        }
+        Fninit => fninit(cpu),
         Fnclex => {
             // "Clears the floating-point exception flags (PE, UE, OE, ZE, DE, and IE),
             // the exception summary status flag (ES), the stack fault flag (SF), and the

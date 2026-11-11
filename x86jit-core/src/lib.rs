@@ -199,8 +199,8 @@ pub use time_stats::{
 };
 pub use vm::{
     Backend, CompileFailureReason, ExitRequest, ForceRegionError, InterpreterBackend,
-    MemConsistency, ShutdownError, ShutdownReport, SourceIdError, StepOptions, StepRun,
-    StepRunError, StepStop, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu, Vm,
-    VmConfig,
+    MemConsistency, ResetOptions, ShutdownError, ShutdownReport, SourceIdError, StepOptions,
+    StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu,
+    Vm, VmConfig,
 };
 pub use x87::FpuKind;

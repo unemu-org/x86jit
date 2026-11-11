@@ -106,6 +106,28 @@ unsafe impl Send for EntryRecord {}
 unsafe impl Sync for EntryRecord {}
 
 impl EntryRecord {
+    #[cfg(test)]
+    pub(crate) fn seed_reset_witness(&mut self) {
+        let raw = crate::RawHostFault::new(crate::HostFaultPlatform::LinuxX86_64);
+        self.snapshot.get_mut().raw_fault = Some(raw);
+        *self.transfer.get_mut() = TransferFault {
+            pending: true,
+            host_address: 0x1234,
+            raw: Some(raw),
+        };
+        assert!(self.raw_fault().is_some());
+        assert!(self.transfer.get_mut().pending);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_reset_witness_cleared(&mut self) {
+        assert!(self.raw_fault().is_none());
+        let transfer = self.transfer.get_mut();
+        assert!(!transfer.pending);
+        assert!(transfer.raw.is_none());
+        assert_eq!(transfer.host_address, 0);
+    }
+
     pub(crate) fn prepare_run(&mut self) {
         let saved = self.snapshot.get_mut();
         #[cfg(target_arch = "aarch64")]

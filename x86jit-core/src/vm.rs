@@ -22,6 +22,21 @@ use crate::lift::{
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
 use crate::state::{CpuState, Flags, Reg};
 
+/// Options for [`Vcpu::reset_execution_state`]. By default x87 state is preserved.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResetOptions {
+    x87_init: bool,
+}
+
+impl ResetOptions {
+    /// Also initialize the x87 environment as FNINIT does (SDM Vol 2A §3.3,
+    /// FINIT/FNINIT). The x87 data registers and MXCSR are preserved.
+    pub fn with_x87_init(mut self, enabled: bool) -> Self {
+        self.x87_init = enabled;
+        self
+    }
+}
+
 /// Options for instruction-exact Real16 execution (decision-16 §1).
 /// Default execution stops on the budget or an ordinary exit.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1697,6 +1712,43 @@ impl Drop for DispatchGuard<'_> {
 }
 
 impl Vcpu {
+    /// Abandon pending execution and device completions between runs, in any
+    /// application mode. Clears queued IRQs, STI/SS interrupt shadows, IN/INS and
+    /// MMIO handoffs, host exit requests and their evidence, syscall evidence,
+    /// host-fault records, and per-vCPU fast lookup, IBTC refill and return-stack
+    /// predictions. Shared translations and their validated links are retained.
+    ///
+    /// Call this first, then write the CPU model's reset registers into [`Self::cpu`]
+    /// (including CS and IP), then resume execution. This method supplies no CPU-model
+    /// reset register table. Architectural state is preserved except for the optional
+    /// FNINIT environment selected by [`ResetOptions::with_x87_init`].
+    /// Retirement, step/execution and diagnostic accounting, source identity and
+    /// configuration, memory mappings, and code caches are preserved. Existing exit
+    /// and fault handles remain valid. An exit request racing with this call is
+    /// discarded if it precedes the atomic request clear; later requests remain pending.
+    pub fn reset_execution_state(&mut self, options: ResetOptions) {
+        crate::interruption::consume(&self.exit_request.word, &self.engine_sections);
+        self.interruption_evidence = None;
+        self.syscall_evidence = None;
+        self.pending_irq = None;
+        self.sti_shadow = false;
+        self.ss_shadow = false;
+        self.cpu.pending_port_in = None;
+        self.cpu.port_string_in = None;
+        self.cpu.pending_mmio = None;
+        self.cpu.pending_mmio_write = false;
+        self.cpu.mmio_parts.fill((0, 0));
+        self.cpu.mmio_parts_len = 0;
+        self.cpu.mmio_parts_rip = 0;
+        self.cpu.mmio_retry_active = false;
+        self.cpu.mmio_retry_cs = 0;
+        *self.fault_entry = Default::default();
+        self.fast_clear();
+        if options.x87_init {
+            crate::x87::fninit(&mut self.cpu);
+        }
+    }
+
     /// Obtain a handle that may request an exit from any host thread.
     pub fn exit_request(&self) -> ExitRequest {
         self.exit_request.clone()
@@ -4142,6 +4194,61 @@ mod tests {
             consistency: MemConsistency::Fast,
         });
         vm.new_vcpu()
+    }
+
+    #[test]
+    fn reset_drops_private_predictors_and_deferrals_but_keeps_lifetime_state() {
+        let mut cpu = vcpu();
+        cpu.fast_put(0x1234, CompiledPtr(std::ptr::dangling()));
+        cpu.ibtc_refills.insert(0x5678, IBTC_MEGAMORPHIC_CAP);
+        cpu.ret_stack.sp = 1;
+        cpu.ret_stack.entries[0] = [0x1234, 0x5678];
+        cpu.fast_epoch = 42;
+        cpu.fast_mxcsr_mode = 0x2000;
+        cpu.fast_hits = 13;
+        cpu.retired = 17;
+        cpu.executed = 19;
+        cpu.chained = 23;
+        cpu.time_dispatch.lookups = 29;
+        cpu.code_space_reported = true;
+        let handle = cpu.fault_handle().as_usize();
+        cpu.fault_entry.seed_reset_witness();
+        cpu.exit_request
+            .word
+            .store(1 | CODE_SPACE_EXHAUSTED, Ordering::Relaxed);
+        let section = EngineSection::enter(
+            &cpu.exit_request.word,
+            &cpu.engine_sections,
+            CriticalSectionKind::Lift,
+        );
+        cpu.exit_request.request_exit();
+        drop(section);
+        assert_ne!(cpu.engine_sections.load(Ordering::Relaxed), 0);
+        // Public state may contain completions without an active retry owner.
+        cpu.cpu.pending_mmio = Some(0x55);
+        cpu.cpu.pending_mmio_write = true;
+        assert!(!cpu.cpu.mmio_retry_active);
+        cpu.reset_execution_state(ResetOptions::default());
+        assert!(cpu.fast.iter().all(|e| e.entry.0.is_null()));
+        assert!(cpu.ibtc_refills.is_empty());
+        assert_eq!(cpu.ret_stack.sp, 0);
+        assert_eq!(cpu.engine_sections.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            cpu.exit_request.word.load(Ordering::Relaxed),
+            1 | CODE_SPACE_EXHAUSTED
+        );
+        assert!(cpu.cpu.pending_mmio.is_none());
+        assert!(!cpu.cpu.pending_mmio_write);
+        assert_eq!(cpu.fault_handle().as_usize(), handle);
+        cpu.fault_entry.assert_reset_witness_cleared();
+        assert_eq!(cpu.fast_epoch, 42);
+        assert_eq!(cpu.fast_mxcsr_mode, 0x2000);
+        assert_eq!(cpu.fast_hits, 13);
+        assert_eq!(cpu.retired, 17);
+        assert_eq!(cpu.executed, 19);
+        assert_eq!(cpu.chained, 23);
+        assert_eq!(cpu.time_dispatch.lookups, 29);
+        assert!(cpu.code_space_reported);
     }
 
     /// A fresh Vm defaults to long mode; vcpus inherit it (§17.3).
