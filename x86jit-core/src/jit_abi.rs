@@ -787,7 +787,12 @@ pub fn synchronize_instruction_stream() {
 ///
 /// # Safety
 /// `entry` must point at a block compiled to this exact ABI, alive in the JIT
-/// arena for the call. `cpu` is exclusive; `ctx` wraps the shared guest buffer.
+/// arena for the call. With a reclaiming backend, announce execution participation
+/// before resolving `entry`, discard predictions from older epochs, and retain
+/// the guard through chaining and cold fault decoding. Direct callers must use
+/// `ExecutionGuard::admits` before entering a saved entry; cache publication does
+/// this identity validation for the dispatcher. A copied `CompiledPtr` does
+/// not pin its generation. `cpu` is exclusive; `ctx` wraps the shared guest buffer.
 /// Recovery additionally requires the frame-pointer contract in [`fault::classify`].
 pub unsafe fn call_block(entry: CompiledPtr, cpu: &mut CpuState, ctx: &mut MemCtx) -> u64 {
     let _fp_mode = fp::RunMode::new();

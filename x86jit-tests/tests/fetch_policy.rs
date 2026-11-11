@@ -803,6 +803,12 @@ fn fetch_policy_invalidation_before_first_publication_retries() {
         release: Mutex<mpsc::Receiver<()>>,
     }
     impl Backend for PausedBackend {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.inner.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &IrBlock,
@@ -893,6 +899,12 @@ fn fetch_policy_backend_without_cancellation_compiles_inline() {
     use x86jit_core::{ir::IrBlock, CachedBlock, MemConsistency, TierUpRequest, TierUpSubmit};
     struct LegacyBackend(JitBackend);
     impl Backend for LegacyBackend {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.0.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &IrBlock,

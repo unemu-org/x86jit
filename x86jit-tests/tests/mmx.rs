@@ -442,6 +442,12 @@ fn mmx_all_forms_execute_inside_regions() {
         count: Arc<AtomicUsize>,
     }
     impl Backend for Regions {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn region_caps(&self) -> Option<RegionCaps> {
             Some(RegionCaps {
                 max_blocks: 8,

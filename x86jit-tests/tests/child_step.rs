@@ -721,6 +721,12 @@ fn child_invalidation_rejects_first_publication_already_compiling() {
         release: Arc<Barrier>,
     }
     impl Backend for PausedCompile {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &x86jit_core::IrBlock,

@@ -151,6 +151,10 @@ struct LockedBackend {
 // Receiver is protected by the backend's outer mutex below.
 struct BlockingBackend(Mutex<LockedBackend>);
 impl Backend for BlockingBackend {
+    fn code_lifetime(&self) -> Option<Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        InterpreterBackend.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &IrBlock,
@@ -237,6 +241,10 @@ fn deferred_exit_survives_another_exit_without_stale_metadata() {
 struct SubmitBackend(Arc<Mutex<Option<x86jit_core::ExitRequest>>>);
 
 impl Backend for SubmitBackend {
+    fn code_lifetime(&self) -> Option<Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        InterpreterBackend.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &IrBlock,

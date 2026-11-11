@@ -19,6 +19,10 @@ const BASE: u64 = 0x2_0000_0000;
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct Compiled(JitBackend);
 impl Backend for Compiled {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.0.code_lifetime()
+    }
+
     fn materialize_with_split_stores(
         &self,
         ir: &IrBlock,

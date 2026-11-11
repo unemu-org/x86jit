@@ -6,9 +6,20 @@
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct BackendMemoryStats {
-    /// Finalized units whose executable storage is retained. The current JIT
-    /// never reclaims code, so invalidation does not decrease this count.
+    /// Cumulative finalized units (legacy field; use code_units_live for a gauge).
     pub compiled_units_live: u64,
+    /// Registered executable bytes, excluding alignment and veneer capacity.
+    pub code_bytes_live: u64,
+    /// Unlinked executable bytes awaiting both grace periods and collection.
+    pub code_bytes_retired: u64,
+    /// Registered units eligible for publication/execution.
+    pub code_units_live: u64,
+    /// Unlinked units awaiting collection.
+    pub code_units_retired: u64,
+    /// Coalesced quiescent holes available for allocation, excluding unused tails.
+    pub code_bytes_reusable: u64,
+    /// Immutable indirect-branch descriptors, active and awaiting execution grace.
+    pub code_ibtc_descriptors: u64,
     /// Units successfully finalized over the backend's lifetime, including
     /// completions rejected by cache publication and fault-map registration.
     pub compiled_units_total: u64,
@@ -33,9 +44,9 @@ pub struct BackendMemoryStats {
     /// Code allocation extents, including alignment padding, veneer capacity and
     /// sealed partial-page tails in anonymous W^X mode.
     pub code_bytes_used: u64,
-    /// Unused region tails. No retired extents are reusable before phase 3.
+    /// Reusable holes plus unused region tails.
     pub code_bytes_free: u64,
-    /// Largest currently unused contiguous region tail.
+    /// Largest reusable hole or unused contiguous region tail.
     pub code_largest_free_extent: u64,
     /// Provider allocation/finalization failures, including OS reservation errors.
     pub code_allocation_failures: u64,
@@ -52,7 +63,8 @@ pub struct BackendMemoryStats {
     pub code_last_failure_op: u32,
     /// Raw errno for the most recent failure, or zero if unavailable.
     pub code_last_failure_errno: i32,
-    /// Allocation-handle and region-vector capacities, excluding allocator overhead.
+    /// Allocation-handle, address-index element and region-vector capacities,
+    /// excluding hash control bytes and allocator overhead.
     pub code_allocation_metadata_bytes: u64,
     /// Requests waiting in the background queue, excluding the active batch.
     pub background_queue_len: u64,
@@ -122,8 +134,8 @@ pub struct CacheMemoryStats {
 pub struct VcpuMemoryStats {
     /// Number of live vCPUs created by this VM.
     pub count: u64,
-    /// Inline Vcpu plus return stack, fault record, dispatch word and accounting
-    /// record allocations (including their Arc headers).
+    /// Inline Vcpu plus return stack, fault record, dispatch word, execution
+    /// announcement and accounting record allocations (including Arc headers).
     /// Excludes CPU configuration/override trees, evidence payloads and embedder storage.
     pub state_bytes: u64,
     /// Heap bytes in the fixed fast-resolve arrays.

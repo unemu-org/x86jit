@@ -144,6 +144,10 @@ impl TestJit {
     }
 }
 impl x86jit_core::Backend for TestJit {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &x86jit_core::ir::IrBlock,
@@ -1029,6 +1033,12 @@ fn x87_rest_executes_inside_a_multiblock_region() {
         compiled: Arc<AtomicUsize>,
     }
     impl Backend for Regions {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn region_caps(&self) -> Option<RegionCaps> {
             Some(RegionCaps {
                 max_blocks: 16,

@@ -287,6 +287,17 @@ pub trait Backend: Send + Sync {
     /// which is rare (a write landing on a code page).
     fn invalidate_links(&self) {}
 
+    /// Lifetime domain for compiled entries and link slots. A wrapping backend
+    /// must forward this method to its wrapped backend along with materialization.
+    /// Without forwarding, the VM cache uses a separate domain and refuses the
+    /// wrapped backend's tracked compiled entries. Cold resolution instead caches
+    /// and executes the original single-block IR (or the first block of an eager
+    /// region) through the interpreter; rejected tier-up leaves the existing
+    /// interpreted block in place. No signal-handler use.
+    fn code_lifetime(&self) -> Option<Arc<crate::code_lifetime::CodeLifetime>> {
+        None
+    }
+
     /// Submit a hot block for **background** compilation off the vcpu's critical
     /// path. The default is [`TierUpSubmit::Unsupported`] — a backend that doesn't run
     /// a compiler thread (the interpreter, or the JIT with background tier-up disabled)
@@ -589,6 +600,7 @@ impl SourceIds {
 /// Resources accounted for by an ordered engine shutdown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShutdownReport {
+    /// Compiler workers joined (legacy counter; maintenance joins are excluded).
     pub workers_joined: usize,
     pub jobs_cancelled: usize,
     /// Resource-owning handles still live after joining workers; zero on success.
@@ -726,10 +738,10 @@ impl Vm {
             vcpus.state_bytes += (std::mem::size_of::<Vcpu>()
                 + std::mem::size_of::<RetStack>()
                 + std::mem::size_of::<crate::jit_abi::fault::EntryRecord>()
-                + std::mem::size_of::<AtomicU64>()
+                + 2 * std::mem::size_of::<AtomicU64>()
                 + std::mem::size_of::<VcpuAllocations>()
                 + std::mem::size_of::<crate::time_stats::Record>()
-                + 6 * std::mem::size_of::<usize>()) as u64;
+                + 8 * std::mem::size_of::<usize>()) as u64;
             vcpus.fast_resolve_bytes += std::mem::size_of::<[FastEntry; FAST_N]>() as u64;
             vcpus.scratch_bytes += allocation.scratch.load(Ordering::Relaxed);
             vcpus.refill_bytes += allocation.refills.load(Ordering::Relaxed);
@@ -821,6 +833,35 @@ impl Vm {
     pub fn shutdown(mut self) -> Result<ShutdownReport, ShutdownError> {
         let live_vcpus = Arc::strong_count(&self.vcpu_lifetime) - 1;
         let mut report = self.backend.shutdown();
+        if let Err(error) = self.cache.join_reclamation_workers() {
+            let counted = matches!(
+                report,
+                Err(ShutdownError::LiveResources {
+                    resource: "code reclamation",
+                    ..
+                })
+            );
+            let mut counts = match report {
+                Ok(counts)
+                | Err(ShutdownError::LiveResources { report: counts, .. })
+                | Err(ShutdownError::WorkerPanicked { report: counts }) => counts,
+            };
+            report = Err(match error {
+                ShutdownError::LiveResources { resource, .. } => {
+                    // The backend may already have counted this same domain.
+                    if !counted {
+                        counts.outstanding_handles += 1;
+                    }
+                    ShutdownError::LiveResources {
+                        resource,
+                        report: counts,
+                    }
+                }
+                ShutdownError::WorkerPanicked { .. } => {
+                    ShutdownError::WorkerPanicked { report: counts }
+                }
+            });
+        }
         if live_vcpus != 0 {
             let (mut counts, resource) = match report {
                 Ok(counts) => (counts, "vCPUs"),
@@ -1166,7 +1207,7 @@ impl Vm {
             source_read_hook: Mutex::new(None),
             mem: self.mem.deep_copy()?,
             cache: {
-                let mut cache = TranslationCache::new();
+                let mut cache = TranslationCache::with_code_lifetime(backend.code_lifetime());
                 cache.invalidate_pending_fetches = self.mem.fetch_policy.is_some();
                 cache
             },
@@ -1202,7 +1243,7 @@ impl Vm {
             #[cfg(test)]
             source_read_hook: Mutex::new(None),
             mem,
-            cache: TranslationCache::new(),
+            cache: TranslationCache::with_code_lifetime(backend.code_lifetime()),
             backend,
             consistency,
             tier_up_after: None,
@@ -1509,10 +1550,12 @@ impl Vm {
             fast: Box::new(
                 [FastEntry {
                     rip: 0,
-                    entry: CompiledPtr(std::ptr::null()),
+                    entry: CompiledPtr::new(std::ptr::null()),
                 }; FAST_N],
             ),
             fast_epoch: self.cache.epoch(),
+            fast_lifetime: self.cache.code_lifetime().clone(),
+            execution_participant: self.cache.code_lifetime().participant(),
             fast_mxcsr_mode: 0,
             ibtc_refills: HashMap::new(),
             ret_stack: Box::new(RetStack::new()),
@@ -1668,6 +1711,8 @@ pub struct Vcpu {
     fast: Box<[FastEntry; FAST_N]>,
     /// Snapshot of `TranslationCache::epoch` matching the current `fast` contents.
     fast_epoch: u64,
+    fast_lifetime: Arc<crate::code_lifetime::CodeLifetime>,
+    execution_participant: crate::code_lifetime::ExecutionParticipant,
     fast_mxcsr_mode: u32,
     /// Per-IBTC-slot refill count, keyed by slot address. Guards against a
     /// megamorphic indirect site churning the descriptor arena: once a slot hits
@@ -1928,12 +1973,11 @@ impl Vcpu {
     /// re-cache against the rewritten code.
     fn fast_clear(&mut self) {
         for e in self.fast.iter_mut() {
-            e.entry = CompiledPtr(std::ptr::null());
+            e.entry = CompiledPtr::new(std::ptr::null());
         }
         self.ibtc_refills.clear();
-        // Drop return predictions too (R5). Not required for correctness — the
-        // `ret` addr-compare already guards every prediction — but it keeps the ring
-        // from carrying frames whose continuation slots were just zeroed.
+        // Return predictions carry continuation-slot pointers. They must be
+        // discarded before resolving again in a later execution epoch.
         self.ret_stack.sp = 0;
     }
 }
@@ -2565,6 +2609,16 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::ApplicationIrqDelivery,
             };
         }
+        if !vm.cache.code_lifetime().is_open() {
+            if let Some(next) = vm.backend.code_lifetime() {
+                if vm
+                    .cache
+                    .reconcile_code_lifetime(next, |page| vm.mem.clear_code_page(page))
+                {
+                    vm.backend.invalidate_links();
+                }
+            }
+        }
         let time_run = crate::time_stats::RunGuard::enter(
             self.time_record.clone(),
             vm.time_enabled,
@@ -2739,6 +2793,16 @@ impl Vcpu {
         budget: u64,
         fp_mode: &mut crate::jit_abi::fp::RunMode,
     ) -> Result<Exit, u64> {
+        // Epoch numbers belong to a domain. A vCPU used with another VM must
+        // not carry predictions whose equal epoch names a different backend.
+        let lifetime = vm.cache.code_lifetime();
+        if !Arc::ptr_eq(&self.fast_lifetime, &lifetime) {
+            self.fast_clear();
+            self.execution_participant = lifetime.participant();
+            self.fast_epoch = lifetime.epoch();
+            self.fast_lifetime = lifetime;
+        }
+        let mut participant = self.execution_participant.for_dispatch();
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
         let mut blocks_run: u64 = 0;
         let exit_word_owner = Arc::clone(&self.exit_request.word);
@@ -2794,11 +2858,16 @@ impl Vcpu {
             // before fetching the next one, so re-execution re-lifts fresh bytes.
             vm.handle_smc(exit_word);
 
+            // Participation precedes resolving or probing any executable pointer.
+            // Its scope includes cold fault decoding and every chain transfer;
+            // continue/return/unwind all announce quiescence through RAII.
+            let execution = participant.enter();
+
             // Flush the fast-resolve cache if any invalidation happened since we
             // last synced — covers same-thread SMC (just handled above) and
             // cross-thread SMC (another vcpu bumped the epoch). Ordered after
             // `handle_smc` so a probe never predates its own invalidation.
-            let epoch = vm.cache.epoch();
+            let epoch = self.fast_lifetime.epoch();
             if epoch != self.fast_epoch {
                 self.fast_clear();
                 self.fast_epoch = epoch;
@@ -2965,6 +3034,9 @@ impl Vcpu {
             }
             match block {
                 CachedBlock::Interpreted(ir) => {
+                    // Owned IR needs no execution grace. A request deferred by
+                    // resolution is delivered by the existing execution boundary.
+                    drop(execution);
                     if vm.time_enabled {
                         crate::time_stats::interpreted();
                     }
@@ -3122,14 +3194,17 @@ impl Vcpu {
                                 // ~1M times per frame in a real game, so a shared
                                 // atomic here is a locked RMW on the hottest path.
                                 self.chained = self.chained.saturating_add(1);
-                                next = CompiledPtr(ctx.next_entry as *const u8);
+                                next = CompiledPtr::new(ctx.next_entry as *const u8);
                             }
                             RET_LINK => {
                                 // Snapshot BEFORE resolving: the publish
                                 // below only happens if the epoch is still this one, so
                                 // an SMC drop that lands while we resolve cannot have its
                                 // slot-clearing undone by our store.
-                                let since_epoch = vm.cache.epoch();
+                                let since_epoch = self.fast_lifetime.epoch();
+                                if since_epoch != execution.epoch() {
+                                    break (cur, code);
+                                }
                                 if !DEFAULT {
                                     fp_mode.default();
                                 }
@@ -3147,7 +3222,7 @@ impl Vcpu {
                                 }
                                 match resolved {
                                     Ok(CachedBlock::Compiled { entry, .. }) => {
-                                        // SAFETY: `link_slot` is a live `Box<AtomicU64>`
+                                        // SAFETY: `link_slot` is a live `Arc<AtomicU64>`
                                         // in the JIT arena. Relaxed store: another vcpu
                                         // reading the slot sees 0 or a valid entry, never a
                                         // torn value (aligned u64); it pairs with the
@@ -3158,11 +3233,14 @@ impl Vcpu {
                                             &self.engine_sections,
                                             CriticalSectionKind::Publish,
                                         );
-                                        let published =
-                                            vm.cache.publish_if_current(since_epoch, || unsafe {
+                                        let published = vm.cache.publish_entry_if_current(
+                                            since_epoch,
+                                            entry,
+                                            || unsafe {
                                                 (*(slot as *const AtomicU64))
                                                     .store(entry.0 as u64, Ordering::Relaxed)
-                                            });
+                                            },
+                                        );
                                         drop(_section);
                                         if !published {
                                             // Invalidated under us. Publishing now would
@@ -3190,7 +3268,10 @@ impl Vcpu {
                                 self.time_dispatch.indirect =
                                     self.time_dispatch.indirect.saturating_add(1);
                                 // Snapshot before resolving, as for RET_LINK.
-                                let since_epoch = vm.cache.epoch();
+                                let since_epoch = self.fast_lifetime.epoch();
+                                if since_epoch != execution.epoch() {
+                                    break (cur, code);
+                                }
                                 // Probe the vcpu-private fast cache before `resolve`.
                                 // The per-site IBTC holds ONE target, so a site
                                 // with several live targets misses here on nearly every
@@ -3267,7 +3348,7 @@ impl Vcpu {
                                                 vm.cache.alloc_ibtc_descriptor(self.cpu.rip, entry);
                                             // SAFETY: `slot` is a live `Box<AtomicU64>` in
                                             // the JIT arena; the published descriptor is
-                                            // immutable and never freed.
+                                            // immutable and retained through execution grace.
                                             // Release (not Relaxed): unlike the RET_LINK
                                             // slot — a single scalar entry — this publishes
                                             // a POINTER to a multi-field {target, entry}
@@ -3279,8 +3360,9 @@ impl Vcpu {
                                             // giving release/consume ordering; a plain
                                             // Relaxed store would let a weakly-ordered host
                                             // (AArch64) expose the pointer before the fields.
-                                            let published = vm.cache.publish_if_current(
+                                            let published = vm.cache.publish_entry_if_current(
                                                 since_epoch,
+                                                entry,
                                                 || unsafe {
                                                     (*(slot as *const AtomicU64))
                                                         .store(desc, Ordering::Release)
@@ -3521,7 +3603,9 @@ impl Vcpu {
                         }
                         // Poll before replacing the just-executed unit with its
                         // successor. Only the cold edge needs its identity.
-                        if exit_word.load(Ordering::Relaxed) != 0 {
+                        if exit_word.load(Ordering::Relaxed) != 0
+                            || self.fast_lifetime.epoch() != execution.epoch()
+                        {
                             break (cur, code);
                         }
                         cur = next;
@@ -3555,15 +3639,20 @@ fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
         let multi_span = fin.spans.len() > 1;
         let source_spans = fin.spans;
         let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
-        let published =
-            vm.cache
-                .publish_tier_up(key, fin.block, fin.compile_failure, fin.epoch, |sp| {
-                    for (start, len) in sp {
-                        vm.mem.mark_code(*start, *len);
-                    }
-                });
+        let published = vm.cache.publish_tier_up(
+            key,
+            fin.block.clone(),
+            fin.compile_failure,
+            fin.epoch,
+            |sp| {
+                for (start, len) in sp {
+                    vm.mem.mark_code(*start, *len);
+                }
+            },
+        );
         if !published {
             vm.cache.release_source_tags(&vm.mem, &source_spans);
+            discard_materialized(vm, &fin.block);
         }
         if published {
             // A multi-span unit is a superblock region — count it like the
@@ -3735,7 +3824,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         let (Some(thr), CachedBlock::Interpreted(ir)) = (vm.tier_up_after, &block) else {
             return Ok(block);
         };
-        if vm.backend.code_space_exhausted() {
+        if !vm.cache.code_lifetime().is_open() || vm.backend.code_space_exhausted() {
             return Ok(block);
         }
         let count = vm.cache.bump_hotness(key);
@@ -3913,8 +4002,13 @@ fn resolve_attempt<const DEFAULT: bool>(
         ) {
             return Ok(compiled);
         }
-        // Lost the race: an SMC drop invalidated the block mid-tier-up. Loop to
-        // re-fetch / re-lift from current memory rather than run a stale block.
+        discard_materialized(vm, &compiled);
+        if vm.cache.publication_generation() == generation
+            && permit.as_ref().is_none_or(|p| p.is_current())
+        {
+            return Ok(block);
+        }
+        // An SMC drop invalidated the source mid-tier-up. Re-fetch fresh bytes.
     }
 }
 
@@ -3943,7 +4037,11 @@ fn resolve_uncached<const DEFAULT: bool>(
     // inline compile T3f flagged. A multi-block region compiles
     // as one unit spanning all its sub-blocks; a one-block region falls through to the
     // single-block path (reusing the block already lifted, so no double lift).
-    if let Some(caps) = vm.backend.region_caps().filter(|_| !vm.tier_up_background) {
+    if let Some(caps) = vm
+        .backend
+        .region_caps()
+        .filter(|_| !vm.tier_up_background && vm.cache.code_lifetime().is_open())
+    {
         let mut fetch_failure = None;
         let lifted = {
             let _section =
@@ -4002,7 +4100,23 @@ fn resolve_uncached<const DEFAULT: bool>(
                         true
                     })
                 {
-                    return Err(ResolveFailure::Retry);
+                    discard_materialized(vm, &materialized);
+                    let ir = region.blocks.into_iter().next().unwrap();
+                    let len = ir.guest_len;
+                    let fallback = CachedBlock::Interpreted(Arc::new(ir));
+                    return vm
+                        .cache
+                        .insert_checked(key, fallback.clone(), vec![(pc, len)], |_| {
+                            if vm.cache.publication_generation() != compile_generation
+                                || permit.as_ref().is_some_and(|p| !p.is_current())
+                            {
+                                return false;
+                            }
+                            vm.mem.mark_code(pc, len);
+                            true
+                        })
+                        .then_some(fallback)
+                        .ok_or(ResolveFailure::Retry);
                 }
                 if matches!(materialized, CachedBlock::Compiled { .. }) {
                     vm.cache.record_region();
@@ -4065,6 +4179,14 @@ fn resolve_uncached<const DEFAULT: bool>(
     }
 }
 
+fn discard_materialized(vm: &Vm, block: &CachedBlock) {
+    // The cache may belong to a replaced backend. Only the allocator's domain
+    // can retire an unpublished entry rejected by that cache.
+    if let Some(lifetime) = vm.backend.code_lifetime() {
+        lifetime.discard(block);
+    }
+}
+
 /// Materialize a single block, cache it under its `key` with its one span, and tag
 /// its pages. `span_start` is the physical fetch address (== `ir.guest_start` outside
 /// Real16, but the `cs_base + IP` physical address in Real16, where SMC page-tagging
@@ -4096,13 +4218,17 @@ fn finish_single(
     let (start, len) = (span_start, ir.guest_len);
     // Real16 stays interpreted (§17.6); other modes defer compilation only until
     // the block proves hot under a tier-up policy (see `resolve`).
-    let materialized = if key.mode == CpuMode::Real16 || vm.tier_up_after.is_some() {
-        CachedBlock::Interpreted(Arc::new(ir))
+    let mut ir = Some(ir);
+    let materialized = if key.mode == CpuMode::Real16
+        || vm.tier_up_after.is_some()
+        || !vm.cache.code_lifetime().is_open()
+    {
+        CachedBlock::Interpreted(Arc::new(ir.take().unwrap()))
     } else {
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Compile);
         vm.hold_compile();
         vm.backend.materialize_with_split_stores(
-            &ir,
+            ir.as_ref().unwrap(),
             vm.consistency,
             vm.mem.trap_window(),
             vm.mem.guest_base(),
@@ -4114,17 +4240,28 @@ fn finish_single(
     vm.handle_smc(exit_word);
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared
     // by a concurrent SMC invalidation between insert and mark.
+    let publish = |_: &[(u64, u32)]| {
+        if vm.cache.publication_generation() != compile_generation
+            || permit.is_some_and(|p| !p.is_current())
+        {
+            return false;
+        }
+        vm.mem.mark_code(start, len);
+        true
+    };
+    if vm
+        .cache
+        .insert_checked(key, materialized.clone(), vec![(start, len)], publish)
+    {
+        return Some(materialized);
+    }
+    discard_materialized(vm, &materialized);
+    // A domain mismatch is permanent for this run. Publish valid source as
+    // interpreted once, rather than repeatedly allocating rejected machine code.
+    let fallback = CachedBlock::Interpreted(Arc::new(ir?));
     vm.cache
-        .insert_checked(key, materialized.clone(), vec![(start, len)], |_| {
-            if vm.cache.publication_generation() != compile_generation
-                || permit.is_some_and(|p| !p.is_current())
-            {
-                return false;
-            }
-            vm.mem.mark_code(start, len);
-            true
-        })
-        .then_some(materialized)
+        .insert_checked(key, fallback.clone(), vec![(start, len)], publish)
+        .then_some(fallback)
 }
 
 /// Map a lift error to its dispatcher exit (a legal exit, not a `run()` failure).
@@ -4338,7 +4475,7 @@ mod tests {
                 .expect("fixture writes a constant result");
             self.values.lock().unwrap().push(value);
             CachedBlock::Compiled {
-                entry: CompiledPtr(match value {
+                entry: CompiledPtr::new(match value {
                     1 => source_one as *const u8,
                     2 => source_two as *const u8,
                     _ => panic!("unexpected fixture result"),
@@ -4801,6 +4938,105 @@ mod tests {
     }
 
     #[test]
+    fn closed_domain_without_a_replacement_interprets_with_budget_and_exit() {
+        struct ClosedBackend(Arc<crate::code_lifetime::CodeLifetime>);
+        impl Backend for ClosedBackend {
+            fn code_lifetime(&self) -> Option<Arc<crate::code_lifetime::CodeLifetime>> {
+                Some(self.0.clone())
+            }
+            fn materialize(
+                &self,
+                _: &IrBlock,
+                _: MemConsistency,
+                _: Option<(u64, u64)>,
+                _: u64,
+            ) -> CachedBlock {
+                panic!("closed domain must not compile");
+            }
+        }
+        for tiered in [false, true] {
+            let domain = Arc::new(crate::code_lifetime::CodeLifetime::managed());
+            let mut vm = Vm::with_backend(
+                VmConfig::flat(0x2000),
+                Box::new(ClosedBackend(domain.clone())),
+            );
+            vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, &[0x48, 0xff, 0xc0, 0xeb, 0xfb])
+                .unwrap();
+            if tiered {
+                vm.set_tier_up_after(Some(1));
+            }
+            // SAFETY: no compilation or executable allocation has occurred.
+            unsafe { domain.retire_all() };
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            assert!(matches!(cpu.run(&vm, Some(0)), Exit::BudgetExhausted));
+            assert_eq!(cpu.reg(Reg::Rax), 0);
+            for expected in 1..=2 {
+                assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+                assert_eq!(cpu.reg(Reg::Rax), expected);
+            }
+            cpu.exit_request().request_exit();
+            assert!(matches!(cpu.run(&vm, None), Exit::Interrupted));
+            assert_eq!(cpu.reg(Reg::Rax), 2);
+        }
+    }
+
+    #[test]
+    fn indirect_miss_after_retirement_does_not_probe_or_refill() {
+        struct Fixture<'a> {
+            cache: &'a TranslationCache,
+            slot: Arc<AtomicU64>,
+        }
+        unsafe extern "C" fn source(cpu: *mut u8, mem: *mut u8) -> u64 {
+            // SAFETY: this test retains Fixture and the VM throughout the ABI call.
+            unsafe {
+                let cpu = &mut *(cpu as *mut CpuState);
+                let fixture = &*(cpu.gpr[15] as *const Fixture<'_>);
+                fixture.cache.invalidate_overlapping(0x2000, 0x2001, || {});
+                cpu.rip = 0x2000;
+                (*(mem as *mut MemCtx)).link_slot = Arc::as_ptr(&fixture.slot) as u64;
+            }
+            RET_IBTC_MISS
+        }
+        unsafe extern "C" fn target(_: *mut u8, _: *mut u8) -> u64 {
+            RET_HLT
+        }
+        let mut vm = Vm::new(VmConfig::flat(0x4000));
+        vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+        let domain = vm.cache.code_lifetime();
+        let source = domain
+            .register(CompiledPtr::new(source as *const u8), 1)
+            .entry();
+        let target = domain
+            .register(CompiledPtr::new(target as *const u8), 1)
+            .entry();
+        for (rip, entry) in [(0x1000, source), (0x2000, target)] {
+            vm.cache.insert(
+                BlockKey::new(rip, CpuMode::Long64),
+                CachedBlock::Compiled { entry },
+                vec![(rip, 1)],
+                |_| {},
+            );
+        }
+        let fixture = Fixture {
+            cache: &vm.cache,
+            slot: Arc::new(AtomicU64::new(0)),
+        };
+        domain.register_slot(&fixture.slot);
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.gpr[15] = &fixture as *const Fixture<'_> as u64;
+        cpu.cpu.rip = 0x1000;
+        cpu.fast_put(0x2000, target);
+        let hits = cpu.fast_hits;
+        assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+        assert_eq!(cpu.fast_hits, hits);
+        assert!(cpu.ibtc_refills.is_empty());
+        assert_eq!(vm.cache.ibtc_filled(), 0);
+        assert_eq!(fixture.slot.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn compiled_chain_does_not_probe_exhaustion_per_edge() {
         struct ChainBackend(Arc<AtomicU64>);
         unsafe extern "C" fn chain(cpu: *mut u8, mem: *mut u8) -> u64 {
@@ -4825,7 +5061,7 @@ mod tests {
                 _: u64,
             ) -> CachedBlock {
                 CachedBlock::Compiled {
-                    entry: CompiledPtr(chain as *const u8),
+                    entry: CompiledPtr::new(chain as *const u8),
                 }
             }
         }
@@ -4859,7 +5095,7 @@ mod tests {
     #[test]
     fn reset_drops_private_predictors_and_deferrals_but_keeps_lifetime_state() {
         let mut cpu = vcpu();
-        cpu.fast_put(0x1234, CompiledPtr(std::ptr::dangling()));
+        cpu.fast_put(0x1234, CompiledPtr::new(std::ptr::dangling()));
         cpu.ibtc_refills.insert(0x5678, IBTC_MEGAMORPHIC_CAP);
         cpu.ret_stack.sp = 1;
         cpu.ret_stack.entries[0] = [0x1234, 0x5678];

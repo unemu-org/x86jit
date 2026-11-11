@@ -135,6 +135,7 @@
 pub mod aes;
 pub mod cache;
 pub mod child;
+pub mod code_lifetime;
 pub mod codemap;
 pub mod disasm;
 #[cfg(feature = "environment")]

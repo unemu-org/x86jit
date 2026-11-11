@@ -59,6 +59,10 @@ struct Compiled {
 }
 
 impl Backend for Compiled {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn materialize_with_mxcsr(
         &self,
         ir: &IrBlock,
@@ -566,7 +570,7 @@ fn landing_fault_inside_rust_helper_still_dies() {
             HANDLE.store(record.handle().as_usize(), Ordering::Relaxed);
             install();
             x86jit_core::jit_abi::call_block(
-                x86jit_core::CompiledPtr(helper as *const u8),
+                x86jit_core::CompiledPtr::new(helper as *const u8),
                 &mut cpu,
                 &mut ctx,
             );

@@ -62,6 +62,7 @@ that changes.
 | `exit` | `Exit`, `AccessKind`, `StepResult` (§5, §8) |
 | `interruption` | Per-vCPU engine-section markers and host-request deferral evidence (§9.2) |
 | `cache` | `TranslationCache`, `CachedBlock`, `CompiledPtr`; `BlockKey` includes decode mode and MXCSR.RC/FTZ/DAZ; SMC page-tag mark/clear run through `insert`/`invalidate_overlapping` callbacks under the spans lock (§9) |
+| `code_lifetime` | Published-unit generations, cache publication ownership, retirement tickets and dispatcher execution participation; shared slots clear before epoch advance. Execution grace is separate from signal-reader grace; storage remains retained (decision-17 phase 3) |
 | `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop (§2, §9.2) |
 
@@ -118,6 +119,13 @@ The KVM-style split: **`Vm`** owns shared state (memory + cache); **`Vcpu`** own
 - **Tier-up is core-driven; background tier-up adds a backend worker (bg-tier, doc-22).** A block starts interpreted and is JIT-compiled once hot (`Vm::set_tier_up_after`). With `set_tier_up_background`, the dispatcher submits the hot block via `Backend::tier_up_async` to a compiler thread the `JitBackend` owns (all threading stays in `x86jit-cranelift`; core stays `{iced-x86}`); the vcpu keeps interpreting and the dispatcher drains completions and publishes each via `cache.upgrade`, guarded by the cache's publication generation (advanced by every invalidation) — the backend never touches the cache (decision-4).
 - **`StepResult`, not `Exit`, from the execution layer** — distinguishes "continue" from "trap out" (§8).
 - **Operand lowering (§7.1) sits *beneath* per-mnemonic lift.** Every operand reduces to a `Val`; memory operands expand to effective-address arithmetic + `Load`/`Store`. This is the load-bearing layer — nothing lifts without it.
+
+`x86jit-core::code_lifetime` owns generation identities, execution participants,
+shared prediction slots and immutable IBTC descriptors. The Cranelift backend's
+`reclamation` module polls retirement on a separate maintenance thread, removes
+code-map ranges after execution grace, and releases compiler/provider storage
+after signal-reader grace. Deferred teardown retains compiler and helper state
+until both complete. See [the code-memory contract](design/code-memory-provider.md#final-phase-3-ownership-and-maintenance).
 
 ## Layering rules
 

@@ -15,6 +15,10 @@ struct CompiledBackend {
 }
 
 impl Backend for CompiledBackend {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &IrBlock,
@@ -324,6 +328,10 @@ struct RegionOverflowBackend {
 }
 
 impl Backend for RegionOverflowBackend {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn tier_up_async(&self, req: x86jit_core::TierUpRequest) -> x86jit_core::TierUpSubmit {
         assert!(matches!(
             &req.unit,

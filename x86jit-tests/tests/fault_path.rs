@@ -659,9 +659,13 @@ fn path_force_region_replaces_cached_block_and_obeys_invalidation() {
             .unwrap();
         let region = f.run(&mut cpu);
         path(&region, 2, BASE, None, true);
+        let owned = region.fault_metadata().unwrap().clone();
         f.vm.write_bytes(BASE, &[0xf4]).unwrap();
         assert!(matches!(f.run(&mut cpu), Exit::Hlt));
-        path(&region, 2, BASE, None, true);
+        // Owned evidence survives retirement; the live code-map range may be gone.
+        let retained = region.fault_metadata().unwrap();
+        assert_eq!(retained.path(), owned.path());
+        assert_eq!(retained.instruction_rip(), owned.instruction_rip());
     });
 }
 
@@ -769,3 +773,77 @@ fn native(f: &Fixture, code: &[u8], initial: &CpuState, actual: &CpuState, fault
 }
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 fn native(_: &Fixture, _: &[u8], _: &CpuState, _: &CpuState, _: u64) {}
+
+#[test]
+fn live_fault_classification_survives_concurrent_retirement_and_address_reuse() {
+    child(|| {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc, Barrier,
+        };
+        use std::time::{Duration, Instant};
+        let mut f = Fixture::new(1, BASE);
+        // SDM Vol 2B, MOV: a faulting source load leaves the destination unchanged.
+        f.vm.write_bytes(BASE, &[0x48, 0x8b, 0x06, 0xf4]).unwrap();
+        f.prepare(1, BASE);
+        f.protect(libc::PROT_NONE);
+        let mut cpu = f.vm.new_vcpu();
+        seed(&mut cpu, BASE, f.hole());
+        let expected = cpu.cpu.clone();
+        let first = f.run(&mut cpu);
+        path(&first, 1, BASE, None, true);
+
+        let ready = Arc::new(Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let ready = ready.clone();
+            let done = done.clone();
+            let retired = retired.clone();
+            std::thread::spawn(move || {
+                let jit = JitBackend::new();
+                let mut memory =
+                    x86jit_core::Memory::new(x86jit_core::MemoryModel::Flat { size: 0x2000 });
+                memory.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+                memory
+                    .write_bytes(0x1000, &[0xb8, 7, 0, 0, 0, 0xf4])
+                    .unwrap();
+                let ir = x86jit_core::lift::lift_block(
+                    &memory,
+                    x86jit_core::lift::FetchAddr::flat(0x1000),
+                    x86jit_core::CpuMode::Long64,
+                )
+                .unwrap();
+                let domain = jit.code_lifetime().unwrap();
+                ready.wait();
+                for _ in 0..16 {
+                    let block = jit.materialize(&ir, x86jit_core::MemConsistency::Fast, None, 0);
+                    assert!(matches!(block, x86jit_core::CachedBlock::Compiled { .. }));
+                    domain.discard(&block);
+                    retired.fetch_add(1, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !domain.retired_units().is_empty() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        ready.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut faults = 0;
+        while !done.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            cpu.cpu = expected.clone();
+            let exit = f.run(&mut cpu);
+            path(&exit, 1, BASE, None, true);
+            state(&cpu.cpu, &expected);
+            faults += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().unwrap();
+        assert_eq!(retired.load(Ordering::Acquire), 16);
+        assert!(faults > 0);
+    });
+}

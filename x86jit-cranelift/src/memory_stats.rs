@@ -10,6 +10,7 @@ pub(crate) struct RegionCounters {
     pub committed: AtomicU64,
     pub used: AtomicU64,
     pub free: AtomicU64,
+    pub reusable: AtomicU64,
     pub largest: AtomicU64,
     pub failures: AtomicU64,
     pub allocation_metadata: AtomicU64,
@@ -80,6 +81,7 @@ impl CodeCounters {
             stats.code_bytes_committed += c.committed.load(Ordering::Relaxed);
             stats.code_bytes_used += c.used.load(Ordering::Relaxed);
             stats.code_bytes_free += c.free.load(Ordering::Relaxed);
+            stats.code_bytes_reusable += c.reusable.load(Ordering::Relaxed);
             stats.code_largest_free_extent = stats
                 .code_largest_free_extent
                 .max(c.largest.load(Ordering::Relaxed));

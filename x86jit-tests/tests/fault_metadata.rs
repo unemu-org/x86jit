@@ -841,7 +841,7 @@ fn layout_and_legacy_abi_validity() {
     // SAFETY: this leaf implements the documented legacy compiled-block ABI.
     let result = unsafe {
         x86jit_core::jit_abi::run_compiled(
-            x86jit_core::CompiledPtr(old_backend as *const u8),
+            x86jit_core::CompiledPtr::new(old_backend as *const u8),
             &mut cpu,
             &mem,
             CpuMode::Long64,

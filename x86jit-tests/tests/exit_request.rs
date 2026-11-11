@@ -641,6 +641,10 @@ struct RequestOnExitBackend {
     interpreted: bool,
 }
 impl Backend for RequestOnExitBackend {
+    fn code_lifetime(&self) -> Option<Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        InterpreterBackend.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &x86jit_core::IrBlock,
@@ -653,7 +657,7 @@ impl Backend for RequestOnExitBackend {
             InterpreterBackend.materialize(ir, consistency, mmio, guest_base)
         } else {
             x86jit_core::CachedBlock::Compiled {
-                entry: x86jit_core::CompiledPtr(request_then_return as *const () as *const u8),
+                entry: x86jit_core::CompiledPtr::new(request_then_return as *const () as *const u8),
             }
         }
     }
@@ -689,6 +693,37 @@ fn survives_other_exit(interpreted: bool, code: u64) {
     assert!(matches!(target.run(&vm, Some(0)), Exit::Interrupted));
     assert_eq!(target.cpu.rip, rip);
     assert!(matches!(target.run(&vm, Some(0)), Exit::BudgetExhausted));
+    DURING_RUN.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[test]
+fn exit_request_during_interpreted_materialization_is_deferred_through_hlt() {
+    use x86jit_core::CriticalSectionKind;
+
+    let mut vm = Vm::with_backend(
+        VmConfig::flat(0x10000),
+        Box::new(RequestOnExitBackend { interpreted: true }),
+    );
+    vm.map(CODE, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(CODE, &[0x48, 0xff, 0xc0, 0xf4]).unwrap();
+    let mut target = cpu(&vm);
+    DURING_RUN.with(|slot| *slot.borrow_mut() = Some(target.exit_request()));
+    assert!(matches!(target.run(&vm, Some(1)), Exit::Hlt));
+    assert_eq!(target.reg(Reg::Rax), 1);
+    assert_eq!(target.cpu.rip, CODE + 4);
+    assert!(target.interruption_evidence().is_none());
+    let rip = target.cpu.rip;
+    assert!(matches!(target.run(&vm, Some(0)), Exit::Interrupted));
+    assert_eq!(target.reg(Reg::Rax), 1);
+    assert_eq!(target.cpu.rip, rip);
+    let evidence = target.interruption_evidence().unwrap();
+    assert!(evidence.deferred());
+    assert!(evidence.contains(CriticalSectionKind::Compile));
+    assert!(evidence.contains(CriticalSectionKind::Publish));
+    assert_eq!(evidence.path(), FaultPath::Unknown);
+    assert_eq!(evidence.rip(), rip);
+    assert!(matches!(target.run(&vm, Some(0)), Exit::BudgetExhausted));
+    assert!(target.interruption_evidence().is_none());
     DURING_RUN.with(|slot| *slot.borrow_mut() = None);
 }
 

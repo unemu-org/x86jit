@@ -1,15 +1,23 @@
 //! Process-global host-PC → guest-RIP side table for guard-page fault recovery.
 //! Writers publish immutable AVL roots (§8.2; decision-13). Only writers own
-//! reference counts. A reader enters a sequentially consistent counter before
-//! loading the root and leaves after copying its result. Writers retain old roots
-//! until a zero-reader observation after publication. Thus a reader that can load
-//! an old root is counted before reclamation; a later reader can only load the
-//! new root. All three operations must be SeqCst, including on weakly ordered hosts.
+//! reference counts. A reader selects one of two counters, increments it and
+//! validates the selection before loading a root. After one failed validation it
+//! also enters the other counter, then loads a root without retrying validation.
+//! Writers publish a new root, switch new readers to the other counter and
+//! retain obsolete roots until the previous counter drains. Later publications
+//! remain pending until that batch drains, so only one switch can be outstanding.
+//! Validated new readers cannot
+//! extend an old batch's grace period; fallback readers briefly pin both counters.
+//! Index, counter and root operations are all SeqCst;
+//! see design/code-memory-provider.md, Phase 3 lifetime protocol, for the proof.
 //!
 //! A signal interrupting publication can finish on either root, even when the
 //! interrupted thread holds the writer mutex or is freeing an older tree. Readers
 //! never lock, allocate, free, touch reference counts, or wait for a writer. Nested
 //! handlers are counted independently. Only writer/cold maintenance paths reclaim.
+//! Reader entry performs at most one validation and two counter increments.
+//! Atomic RMWs may retry on LL/SC hosts, so signal safety does not imply bounded
+//! wall-clock reader-entry latency.
 //! Returned values own their data; no reference escapes a reader critical section.
 //! Normal signal return/unwinding must run the guard's destructor; abandoning a
 //! handler with a nonlocal jump would pin the grace period (and is unsupported).
@@ -309,6 +317,11 @@ struct Counts {
     traps: usize,
     root: Option<Arc<Node>>,
     retired: Vec<Arc<Node>>,
+    draining: Vec<Arc<Node>>,
+    draining_epoch: Option<usize>,
+    publication: u64,
+    draining_through: u64,
+    completed_through: u64,
     recipes: Vec<Arc<FrameRecipe>>,
     instructions: Vec<Arc<Instruction>>,
 }
@@ -431,7 +444,12 @@ impl Node {
     }
 }
 
-struct ReadGuard<'a>(&'a CodeMap);
+struct ReadGuard<'a> {
+    map: &'a CodeMap,
+    epoch: usize,
+    both: bool,
+    root: *const Node,
+}
 impl ReadGuard<'_> {
     fn root(&self) -> Option<&Node> {
         #[cfg(test)]
@@ -441,7 +459,7 @@ impl ReadGuard<'_> {
         );
         // SAFETY: this reference cannot outlive the guard. The current root
         // and every root retired since reader entry still have writer owners.
-        unsafe { self.0.root.load(Ordering::SeqCst).as_ref() }
+        unsafe { self.root.as_ref() }
     }
 
     fn find_entry(&self, pc: usize, visit: &mut impl FnMut()) -> Option<&Entry> {
@@ -462,19 +480,50 @@ impl ReadGuard<'_> {
 }
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
-        self.0.readers.fetch_sub(1, Ordering::SeqCst);
+        self.map.readers[self.epoch].fetch_sub(1, Ordering::SeqCst);
+        if self.both {
+            self.map.readers[self.epoch ^ 1].fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
 /// Host-PC → guest-RIP map (see module docs for signal safety).
 pub struct CodeMap {
     root: AtomicPtr<Node>,
-    readers: AtomicUsize,
+    reader_epoch: AtomicUsize,
+    readers: [AtomicUsize; 2],
     accounting: OnceLock<Arc<Accounting>>,
     /// Only writers read or update the count; readers never take this mutex.
     len: Mutex<Counts>,
     capacity: usize,
     trap_capacity: usize,
+}
+
+/// Completion of one range removal's signal-reader grace period. This token
+/// borrows its map and cannot be applied to another map or a later generation
+/// at the same address. It does not establish execution grace or authorize
+/// release of compiler/module records or executable storage.
+#[must_use = "poll signal-reader completion before releasing removed metadata or code"]
+pub struct RangeRemoval<'a> {
+    map: &'a CodeMap,
+    owner: ProcessIdentity,
+    publication: u64,
+}
+
+impl RangeRemoval<'_> {
+    /// Cold maintenance under the writer mutex: poll the specific removal batch
+    /// without waiting for readers and prune unreferenced shared metadata. New
+    /// publications cannot postpone a completed token. An inherited token returns
+    /// false before touching a parent mutex.
+    pub fn is_complete(&self) -> bool {
+        if self.owner != ProcessIdentity::current() {
+            return false;
+        }
+        let mut len = self.map.len.lock().unwrap();
+        self.map.reclaim(&mut len);
+        CodeMap::prune_pools(&mut len);
+        len.completed_through >= self.publication
+    }
 }
 
 impl CodeMap {
@@ -485,13 +534,19 @@ impl CodeMap {
     const fn with_capacity(capacity: usize) -> Self {
         Self {
             root: AtomicPtr::new(ptr::null_mut()),
-            readers: AtomicUsize::new(0),
+            reader_epoch: AtomicUsize::new(0),
+            readers: [AtomicUsize::new(0), AtomicUsize::new(0)],
             accounting: OnceLock::new(),
             len: Mutex::new(Counts {
                 entries: 0,
                 traps: 0,
                 root: None,
                 retired: Vec::new(),
+                draining: Vec::new(),
+                draining_epoch: None,
+                publication: 0,
+                draining_through: 0,
+                completed_through: 0,
                 recipes: Vec::new(),
                 instructions: Vec::new(),
             }),
@@ -664,8 +719,31 @@ impl CodeMap {
     }
 
     fn read(&self) -> ReadGuard<'_> {
-        self.readers.fetch_add(1, Ordering::SeqCst);
-        ReadGuard(self)
+        self.read_probed(|_| {})
+    }
+
+    fn read_probed(&self, mut probe: impl FnMut(usize)) -> ReadGuard<'_> {
+        let epoch = self.reader_epoch.load(Ordering::SeqCst);
+        probe(0);
+        self.readers[epoch].fetch_add(1, Ordering::SeqCst);
+        probe(1);
+        let both = self.reader_epoch.load(Ordering::SeqCst) != epoch;
+        if both {
+            // Retain the first announcement while acquiring the other. Once
+            // both are held no subsequent retirement batch can drain, regardless
+            // of how many switches preceded the second increment. Load no root
+            // until then: repeated validation could starve under publication.
+            probe(3);
+            self.readers[epoch ^ 1].fetch_add(1, Ordering::SeqCst);
+            probe(4);
+        }
+        probe(2);
+        ReadGuard {
+            map: self,
+            epoch,
+            both,
+            root: self.root.load(Ordering::SeqCst),
+        }
     }
 
     fn publish(&self, len: &mut Counts, root: Option<Arc<Node>>) {
@@ -673,6 +751,10 @@ impl CodeMap {
     }
 
     fn publish_probed(&self, len: &mut Counts, root: Option<Arc<Node>>, mut probe: impl FnMut()) {
+        len.publication = len
+            .publication
+            .checked_add(1)
+            .expect("code-map publication versions exhausted");
         let raw = root
             .as_ref()
             .map_or(ptr::null_mut(), |n| Arc::as_ptr(n).cast_mut());
@@ -689,29 +771,66 @@ impl CodeMap {
     }
 
     fn reclaim(&self, len: &mut Counts) {
-        if self.readers.load(Ordering::SeqCst) == 0 {
-            len.retired.clear();
-            len.retired.shrink_to(4);
+        self.reclaim_probed(len, || {});
+    }
+
+    fn reclaim_probed(&self, len: &mut Counts, mut probe: impl FnMut()) {
+        // A pending root may have been seen by readers in either counter. Drain
+        // the previous batch before switching again, so those older readers
+        // cannot outlive a second batch that only checks the other counter.
+        if let Some(epoch) = len.draining_epoch {
+            if self.readers[epoch].load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            len.draining.clear();
+            len.draining.shrink_to(4);
+            len.completed_through = len.draining_through;
+            len.draining_epoch = None;
+        }
+        if !len.retired.is_empty() {
+            std::mem::swap(&mut len.retired, &mut len.draining);
+            len.draining_through = len.publication;
+            let epoch = self.reader_epoch.load(Ordering::SeqCst);
+            len.draining_epoch = Some(epoch);
+            probe();
+            self.reader_epoch.store(epoch ^ 1, Ordering::SeqCst);
+            probe();
+            if self.readers[epoch].load(Ordering::SeqCst) == 0 {
+                len.draining.clear();
+                len.draining.shrink_to(4);
+                len.completed_through = len.draining_through;
+                len.draining_epoch = None;
+            }
+            probe();
         }
     }
 
     /// Remove exactly one unit range. The caller must first prevent new execution
     /// and wait for existing executions (including their cold fault paths) to end.
     /// Removed metadata stays deferred until a subsequent write or memory_stats
-    /// observes signal-reader quiescence. This does not establish execution
-    /// quiescence and is deliberately unused by invalidation. Returns false for
-    /// a missing range or a length mismatch.
+    /// observes completion of its signal-reader batch. A true result only means
+    /// range removal, not grace completion or permission to reuse code storage.
+    /// This does not establish execution quiescence and is deliberately unused by
+    /// invalidation. Returns false for a missing range or a length mismatch.
     pub fn unregister(&self, start: usize, code_len: u32) -> bool {
-        let Some(end) = start.checked_add(code_len as usize) else {
-            return false;
-        };
+        self.unregister_with_completion(start, code_len).is_some()
+    }
+
+    /// Remove exactly one range under the execution-quiescence prerequisites of
+    /// [`Self::unregister`], returning a token for its signal-reader grace period.
+    /// A missing range or length mismatch returns None. Keep the allocation
+    /// generation separately: this token describes only the removed map version.
+    pub fn unregister_with_completion(
+        &self,
+        start: usize,
+        code_len: u32,
+    ) -> Option<RangeRemoval<'_>> {
+        let end = start.checked_add(code_len as usize)?;
         let mut len = self.len.lock().unwrap();
         let guard = self.read();
-        let Some(entry) = guard.find_entry(start, &mut || {}) else {
-            return false;
-        };
+        let entry = guard.find_entry(start, &mut || {})?;
         if entry.start != start || entry.end != end {
-            return false;
+            return None;
         }
         let traps = entry.metadata.traps as usize;
         drop(guard);
@@ -720,7 +839,11 @@ impl CodeMap {
         len.entries -= 1;
         len.traps -= traps;
         Self::prune_pools(&mut len);
-        true
+        Some(RangeRemoval {
+            map: self,
+            owner: ProcessIdentity::current(),
+            publication: len.publication,
+        })
     }
 
     fn prune_pools(len: &mut Counts) {
@@ -747,6 +870,7 @@ impl CodeMap {
             recipes: (len.recipes.len() * arc_bytes::<FrameRecipe>()) as u64,
             instructions: a.instructions.load(Ordering::Relaxed),
             writer_storage: ((len.retired.capacity()
+                + len.draining.capacity()
                 + len.recipes.capacity()
                 + len.instructions.capacity())
                 * std::mem::size_of::<Arc<Node>>()
@@ -1164,6 +1288,13 @@ pub fn memory_stats() -> MemoryStats {
 /// Inherited entries are left alone in a fork child; returns false for them.
 pub fn unregister(start: usize, code_len: u32) -> bool {
     owned_code_map(&CODE_MAP).is_some_and(|map| map.unregister(start, code_len))
+}
+
+/// Remove a retired range and obtain its signal-reader completion token.
+/// Execution quiescence is a caller prerequisite (see [`CodeMap::unregister`]).
+/// Inherited entries are left alone in a fork child.
+pub fn unregister_with_completion(start: usize, code_len: u32) -> Option<RangeRemoval<'static>> {
+    owned_code_map(&CODE_MAP)?.unregister_with_completion(start, code_len)
 }
 
 /// Register a compiled function in the process-global map (see [`CodeMap::register`]).
@@ -1770,6 +1901,349 @@ mod tests {
                 + stats.instructions,
             0
         );
+    }
+
+    #[test]
+    fn overlapping_readers_reclaim_retired_metadata_without_global_quiescence() {
+        let map = CodeMap::new();
+        map.register_with_recovery(
+            0x2000,
+            16,
+            Box::new([(0, 0)]),
+            Box::new([42]),
+            vec![GuestTrapSite {
+                host_offset: 4,
+                guest_rip: 42,
+                access: GuestAccessKind::Read,
+                width: 8,
+            }],
+            Some(recipe()),
+        )
+        .unwrap();
+        let live_bytes = map.memory_stats();
+        let mut reader = map.read();
+        for generation in 0..128 {
+            map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([generation]))
+                .unwrap();
+            let next = map.read();
+            drop(reader);
+            reader = next;
+            map.memory_stats();
+            let old = reader.find_entry(0x1000, &mut || {}).unwrap();
+            assert!(map.unregister(0x1000, 16));
+            let next = map.read();
+            assert!(next.find_entry(0x1000, &mut || {}).is_none());
+            assert_eq!(old.metadata.source(0), Some(generation));
+            assert!(map.memory_stats().entries > live_bytes.entries);
+            drop(reader);
+            reader = next;
+            // At least one guard has existed throughout the cycle. Fresh readers
+            // in the new epoch must not retain the preceding generation.
+            let stats = map.memory_stats();
+            assert_eq!(stats.nodes, live_bytes.nodes);
+            assert_eq!(stats.entries, live_bytes.entries);
+            assert_eq!(stats.sources, live_bytes.sources);
+            assert_eq!(stats.traps, live_bytes.traps);
+            assert_eq!(stats.recipes, live_bytes.recipes);
+            let (site, frame) = map.lookup_recovery(0x2004).unwrap();
+            assert_eq!(site.guest_rip, 42);
+            assert_eq!(frame, recipe());
+        }
+    }
+
+    #[test]
+    fn reader_entry_tolerates_publication_at_each_handshake_boundary() {
+        for boundary in 0..3 {
+            let map = CodeMap::new();
+            map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+                .unwrap();
+            let mut interrupted = false;
+            let guard = map.read_probed(|at| {
+                if at == boundary && !interrupted {
+                    interrupted = true;
+                    assert!(map.unregister(0x1000, 16));
+                    map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([99]))
+                        .unwrap();
+                }
+            });
+            assert!(interrupted);
+            assert_eq!(
+                guard
+                    .find_entry(0x1000, &mut || {})
+                    .unwrap()
+                    .metadata
+                    .source(0),
+                Some(99)
+            );
+            assert!(map.unregister(0x1000, 16));
+            assert!(map.memory_stats().entries > 0);
+            drop(guard);
+            assert_eq!(map.memory_stats().entries, 0);
+            assert!(map.readers.iter().all(|c| c.load(Ordering::SeqCst) == 0));
+        }
+    }
+
+    #[test]
+    fn reader_entry_falls_back_once_under_continuous_publication() {
+        for boundary in 0..2 {
+            let map = CodeMap::new();
+            map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+                .unwrap();
+            let mut probes = Vec::new();
+            let mut next = 0x2000;
+            let guard = map.read_probed(|at| {
+                probes.push(at);
+                assert_eq!(probes.iter().filter(|&&at| at == 0).count(), 1);
+                if at == boundary || at == 3 || at == 4 {
+                    for _ in 0..16 {
+                        // One publication at the handshake forces a switch;
+                        // churn during fallback cannot force another validation.
+                        map.register(next, 16, Box::new([(0, 0)]), Box::new([next as u64]))
+                            .unwrap();
+                        next += 0x20;
+                        if at == boundary {
+                            break;
+                        }
+                    }
+                }
+                if at == 4 {
+                    assert!(map.readers.iter().all(|c| c.load(Ordering::SeqCst) == 1));
+                }
+            });
+            assert_eq!(probes, [0, 1, 3, 4, 2]);
+            assert!(guard.both);
+            let latest = next - 0x20;
+            let entry = guard.find_entry(latest, &mut || {}).unwrap();
+            assert_eq!(entry.metadata.source(0), Some(latest as u64));
+            let removal = map.unregister_with_completion(latest, 16).unwrap();
+            assert!(!removal.is_complete());
+            assert_eq!(map.lookup(latest), None);
+            let retained = map.memory_stats().entries;
+            assert_eq!(entry.metadata.source(0), Some(latest as u64));
+            drop(guard);
+            assert!(removal.is_complete());
+            assert_eq!(
+                map.memory_stats().entries,
+                retained - arc_bytes::<Entry>() as u64
+            );
+            assert!(map.readers.iter().all(|c| c.load(Ordering::SeqCst) == 0));
+        }
+    }
+
+    #[test]
+    fn delayed_reader_selection_can_cross_multiple_epoch_switches() {
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([0]))
+            .unwrap();
+        let initial_epoch = map.reader_epoch.load(Ordering::SeqCst);
+        let mut interrupted = false;
+        let guard = map.read_probed(|at| {
+            if at == 0 && !interrupted {
+                interrupted = true;
+                for generation in 1..5 {
+                    assert!(map.unregister(0x1000, 16));
+                    map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([generation]))
+                        .unwrap();
+                }
+                assert_eq!(map.reader_epoch.load(Ordering::SeqCst), initial_epoch);
+            }
+        });
+        let entry = guard.find_entry(0x1000, &mut || {}).unwrap();
+        assert_eq!(entry.metadata.source(0), Some(4));
+        assert!(map.unregister(0x1000, 16));
+        assert_eq!(entry.metadata.source(0), Some(4));
+        drop(guard);
+        assert_eq!(map.memory_stats().entries, 0);
+    }
+
+    #[test]
+    fn reader_of_pending_root_is_protected_by_the_preceding_batch() {
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        map.register(0x2000, 16, Box::new([(0, 0)]), Box::new([42]))
+            .unwrap();
+        let guard = map.read_probed(|at| {
+            if at == 2 {
+                assert!(map.unregister(0x1000, 16));
+                map.register(0x3000, 16, Box::new([(0, 0)]), Box::new([99]))
+                    .unwrap();
+            }
+        });
+        // This guard selected the old counter but loaded a root published after
+        // the switch. Its root must survive retirement into the pending batch.
+        let entry = guard.find_entry(0x3000, &mut || {}).unwrap();
+        assert!(map.unregister(0x3000, 16));
+        assert_eq!(map.memory_stats().entries, 3 * arc_bytes::<Entry>() as u64);
+        assert_eq!(entry.metadata.source(0), Some(99));
+        assert_eq!(map.lookup(0x3000), None);
+        drop(guard);
+        assert_eq!(map.memory_stats().entries, arc_bytes::<Entry>() as u64);
+    }
+
+    #[test]
+    fn nested_signal_like_lookup_at_each_reader_epoch_switch_boundary() {
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        map.register(0x2000, 16, Box::new([(0, 0)]), Box::new([42]))
+            .unwrap();
+        let reader = map.read();
+        assert!(map.unregister(0x1000, 16));
+        // Queue another publication while the old counter is still pinned.
+        map.register(0x3000, 16, Box::new([(0, 0)]), Box::new([99]))
+            .unwrap();
+        drop(reader);
+        let mut writer = map.len.lock().unwrap();
+        let mut calls = 0;
+        map.reclaim_probed(&mut writer, || {
+            calls += 1;
+            let outer = map.read();
+            assert_eq!(map.lookup(0x1000), None);
+            assert_eq!(map.lookup(0x2000), Some(42));
+            assert_eq!(map.lookup(0x3000), Some(99));
+            assert!(outer.find_entry(0x2000, &mut || {}).is_some());
+        });
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn removal_completion_covers_pending_roots_and_ignores_later_readers() {
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        let old = map.read();
+        map.register(0x2000, 16, Box::new([(0, 0)]), Box::new([42]))
+            .unwrap();
+        let pending = map.read();
+        let removed = pending.find_entry(0x2000, &mut || {}).unwrap();
+        let token = map.unregister_with_completion(0x2000, 16).unwrap();
+        assert!(!token.is_complete());
+        drop(old);
+        assert!(!token.is_complete(), "the second batch still has a reader");
+        let later = map.read();
+        assert!(later.find_entry(0x2000, &mut || {}).is_none());
+        assert_eq!(removed.metadata.source(0), Some(42));
+        drop(pending);
+        assert!(
+            token.is_complete(),
+            "later readers cannot extend this batch"
+        );
+        assert_eq!(map.memory_stats().entries, arc_bytes::<Entry>() as u64);
+
+        // Reuse the metadata range while keeping the old token. It identifies
+        // the removal version, not the address or a subsequent removal batch.
+        map.register(0x2000, 16, Box::new([(0, 0)]), Box::new([99]))
+            .unwrap();
+        let replacement_reader = map.read();
+        let next = map.unregister_with_completion(0x2000, 16).unwrap();
+        assert!(token.is_complete());
+        assert!(!next.is_complete());
+        assert_eq!(
+            replacement_reader
+                .find_entry(0x2000, &mut || {})
+                .unwrap()
+                .metadata
+                .source(0),
+            Some(99)
+        );
+        drop(later);
+        assert!(!next.is_complete());
+        drop(replacement_reader);
+        assert!(next.is_complete());
+        assert!(token.is_complete());
+    }
+
+    #[test]
+    fn removal_completion_releases_metadata_with_bounded_bookkeeping() {
+        let map = CodeMap::new();
+        assert!(map.unregister_with_completion(0x1000, 16).is_none());
+        let mut retained = None;
+        for generation in 0..256 {
+            map.register_with_fault_info(
+                0x1000,
+                16,
+                Box::new([(0, 0)]),
+                Box::new([generation]),
+                vec![GuestTrapSite {
+                    host_offset: 4,
+                    guest_rip: generation,
+                    access: GuestAccessKind::Read,
+                    width: 8,
+                }],
+                Some(recipe()),
+                vec![crate::fault::InstructionFaultInfo::from_ops(
+                    generation,
+                    Some(generation + 1),
+                    &[],
+                    crate::CpuMode::Long64,
+                )],
+            )
+            .unwrap();
+            assert!(map.unregister_with_completion(0x1000, 15).is_none());
+            assert!(map.unregister_with_completion(usize::MAX, 16).is_none());
+            assert_eq!(map.lookup_recovery(0x1004).unwrap().0.guest_rip, generation);
+            let ticket = map.unregister_with_completion(0x1000, 16).unwrap();
+            assert!(ticket.is_complete());
+            let stats = map.memory_stats();
+            assert_eq!(stats.total(), stats.writer_storage);
+            // Warm both alternating vectors before comparing retained capacity.
+            if generation == 2 {
+                retained = Some(stats.total());
+            } else if generation > 2 {
+                assert_eq!(Some(stats.total()), retained);
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_removal_completion_rejects_before_locking() {
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        let mut token = map.unregister_with_completion(0x1000, 16).unwrap();
+        assert!(token.is_complete());
+        token.owner.generation = token.owner.generation.wrapping_sub(1);
+        let _locked = map.len.lock().unwrap();
+        assert!(!token.is_complete());
+    }
+
+    #[test]
+    fn retirement_consumption_follows_execution_and_signal_reader_grace() {
+        use crate::cache::{CachedBlock, CompiledPtr};
+        use crate::code_lifetime::CodeLifetime;
+        let domain = Arc::new(CodeLifetime::managed());
+        let map = CodeMap::new();
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([7]))
+            .unwrap();
+        let old = domain.register(CompiledPtr::new(0x1000 as *const u8), 16);
+        let mut participant = domain.participant();
+        let execution = participant.enter();
+        let reader = map.read();
+        domain.discard(&CachedBlock::Compiled { entry: old.entry() });
+        let ticket = domain.retired_units()[0];
+        assert!(!domain.execution_complete(ticket));
+        drop(execution);
+        assert!(domain.execution_complete(ticket));
+        let removal = map
+            .unregister_with_completion(old.host_start, old.host_len)
+            .unwrap();
+        assert!(!removal.is_complete());
+        assert_eq!(domain.retired_units().len(), 1);
+        assert!(reader.find_entry(0x1000, &mut || ()).is_some());
+        drop(reader);
+        assert!(removal.is_complete());
+        // SAFETY: both grace periods completed; the fixture owns no executable
+        // or compiler storage and the removed payload has been collected.
+        unsafe { domain.finish_retirement(ticket) };
+        assert!(domain.retired_units().is_empty());
+        map.register(0x1000, 16, Box::new([(0, 0)]), Box::new([99]))
+            .unwrap();
+        let new = domain.register(CompiledPtr::new(0x1000 as *const u8), 16);
+        let execution = participant.enter();
+        assert!(!execution.admits(old.entry()));
+        assert!(execution.admits(new.entry()));
+        assert_eq!(map.lookup(0x1000), Some(99));
     }
 
     #[test]

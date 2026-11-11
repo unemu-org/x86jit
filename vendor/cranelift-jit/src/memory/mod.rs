@@ -60,6 +60,23 @@ pub trait JITMemoryProvider {
         writable
     }
 
+    /// Identity of the allocation starting at this executable address, when
+    /// provided by an allocator with per-allocation lifetime tracking. The ID
+    /// must remain stable through finalization and never identify another extent.
+    fn allocation_generation(&self, _executable: *const u8) -> Option<u64> {
+        None
+    }
+
+    /// Release an exact allocation after unlinking it and completing execution
+    /// and fault-reader grace periods. Return false for an unsupported provider
+    /// or a stale address/generation pair. The default retains storage.
+    ///
+    /// # Safety
+    /// No execution, reader, compiler record or relocation may still use it.
+    unsafe fn release_allocation(&mut self, _executable: *const u8, _generation: u64) -> bool {
+        false
+    }
+
     /// Perform copying/relocation with thread-local JIT write access enabled.
     /// Implementations must restore the caller's protection even on unwind.
     fn with_write_access(&self, action: &mut dyn FnMut()) -> io::Result<()> {

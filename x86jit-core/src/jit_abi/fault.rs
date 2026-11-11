@@ -235,12 +235,14 @@ impl EntryRecord {
 /// AArch64 Alignment recovery ignores `data_addr` and replays from guest RIP:
 /// that signal's `si_addr` names the host PC. Unsupported
 /// hosts answer NOT OURS. There is no allocation, lock, TLS or libc call: a fixed
-/// table lookup, a code-map reader-count increment and decrement (atomic RMWs,
-/// which may retry under contention where the host lowers them to LL/SC loops),
-/// bounded AVL lookups, exact-site binary search and fixed-size stack reads. The landing stub restores host
-/// FP control before control returns to call_block's caller (MXCSR: Intel SDM
-/// Vol 1 §10.2.3; x86-64 psABI §3.2.1). The signal handler and classifier must
-/// not depend on the thread's interrupted FP mode.
+/// table lookup, one code-map reader-epoch validation with a two-counter fallback,
+/// and counter RMWs (which may retry under contention where the host lowers them
+/// to LL/SC loops), bounded AVL lookups, exact-site binary search and fixed-size
+/// stack reads. Publication cannot force repeated entry validation; atomic RMWs
+/// still prevent a bounded wall-clock latency guarantee. The landing stub
+/// restores host FP control before control returns to call_block's caller
+/// (MXCSR: Intel SDM Vol 1 §10.2.3; x86-64 psABI §3.2.1). The signal handler and
+/// classifier must not depend on the thread's interrupted FP mode.
 ///
 /// # Safety
 /// `handle` is zero or a live handle for this thread's currently executing vCPU

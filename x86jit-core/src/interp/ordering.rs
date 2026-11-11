@@ -872,7 +872,7 @@ mod tests {
                         .write(0x8000, if load { 0x42 } else { 0 }, 8)
                         .unwrap();
                     let mut cpu = crate::CpuState::new();
-                    let entry = crate::CompiledPtr(entry);
+                    let entry = crate::CompiledPtr::new(entry);
                     let ordered = cfg!(target_arch = "aarch64");
                     let before = ordered && !load && tier == MemConsistency::AcqRel;
                     let after = ordered && (load || tier == MemConsistency::FullTso);

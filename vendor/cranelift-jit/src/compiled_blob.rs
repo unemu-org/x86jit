@@ -64,11 +64,12 @@ impl CompiledBlob {
 
         // SAFETY: allocate supplied a writable extent covering the source;
         // the provider's scope enables per-thread writes for the copy.
-        memory
-            .with_write_access(&mut || unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            })
-            .map_err(|err| ModuleError::Allocation { err })?;
+        if let Err(err) = memory.with_write_access(&mut || unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }) {
+            Self::discard_allocation(memory, ptr);
+            return Err(ModuleError::Allocation { err });
+        }
 
         Ok(CompiledBlob {
             executable: memory.executable_ptr(ptr),
@@ -105,9 +106,12 @@ impl CompiledBlob {
 
         // SAFETY: allocate supplied size writable bytes, with the provider's
         // write protection disabled only for this initialization.
-        memory
-            .with_write_access(&mut || unsafe { ptr::write_bytes(ptr, 0, size) })
-            .map_err(|err| ModuleError::Allocation { err })?;
+        if let Err(err) =
+            memory.with_write_access(&mut || unsafe { ptr::write_bytes(ptr, 0, size) })
+        {
+            Self::discard_allocation(memory, ptr);
+            return Err(ModuleError::Allocation { err });
+        }
 
         Ok(CompiledBlob {
             executable: memory.executable_ptr(ptr),
@@ -118,6 +122,14 @@ impl CompiledBlob {
             #[cfg(feature = "wasmtime-unwinder")]
             wasmtime_exception_data,
         })
+    }
+
+    fn discard_allocation(memory: &mut dyn JITMemoryProvider, ptr: *mut u8) {
+        let executable = memory.executable_ptr(ptr);
+        if let Some(generation) = memory.allocation_generation(executable) {
+            // SAFETY: copying failed before any blob or address was published.
+            unsafe { memory.release_allocation(executable, generation) };
+        }
     }
 
     pub(crate) fn ptr(&self) -> *const u8 {

@@ -22,6 +22,10 @@ struct Compiled {
     region: bool,
 }
 impl Backend for Compiled {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn materialize_with_split_stores(
         &self,
         ir: &IrBlock,

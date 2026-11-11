@@ -95,7 +95,7 @@ fn anonymous_batched_units_have_bounded_mappings_and_residency() {
 
 #[test]
 fn anonymous_policies_keep_mapping_entries_bounded_and_execute() {
-    use x86jit_core::{cache::CompiledPtr, jit_abi::run_compiled, CpuState};
+    use x86jit_core::{jit_abi::run_compiled, CpuState};
     let mut memory = Memory::new(MemoryModel::Flat { size: 65536 });
     memory.map(0, 65536, Prot::RWX, RegionKind::Ram).unwrap();
     memory
@@ -126,7 +126,7 @@ fn anonymous_policies_keep_mapping_entries_bounded_and_execute() {
             // SAFETY: finalized entries remain retained by this backend.
             unsafe {
                 run_compiled(
-                    CompiledPtr(entry.0),
+                    entry,
                     &mut cpu,
                     &memory,
                     CpuMode::Long64,
@@ -184,7 +184,7 @@ fn relaxed_cross_thread_publication_executes_each_new_unit() {
                 // the pointer is published only after cache/metadata completion.
                 unsafe {
                     run_compiled(
-                        CompiledPtr(pointer as *const u8),
+                        CompiledPtr::new(pointer as *const u8),
                         &mut cpu,
                         memory,
                         CpuMode::Long64,

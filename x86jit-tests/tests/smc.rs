@@ -2008,6 +2008,10 @@ impl PausedPublicationBackend {
     }
 }
 impl Backend for PausedPublicationBackend {
+    fn code_lifetime(&self) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        self.jit.code_lifetime()
+    }
+
     fn materialize(
         &self,
         ir: &x86jit_core::IrBlock,

@@ -197,6 +197,67 @@ impl JITModule {
         self.memory.free_memory();
     }
 
+    /// Remove a finalized definition's blob, relocations, symbol cache and PC
+    /// index. Keep its declaration so the same ID and signature can be defined
+    /// again without growing the declaration table. Executable storage remains
+    /// owned by the memory provider.
+    ///
+    /// # Safety
+    /// The caller must unlink the definition and exclude execution and fault
+    /// readers before calling this method. No remaining or future relocation may
+    /// refer to this definition, including through its declaration's name.
+    pub unsafe fn retire_function_definition(&mut self, id: FuncId) {
+        assert!(
+            !self.functions_to_finalize.contains(&id),
+            "function not yet finalized"
+        );
+        let blob = self.compiled_functions[id]
+            .take()
+            .expect("function must have a definition");
+        self.code_ranges.remove(&blob.ptr().addr());
+        if let Some(name) = &self.declarations.get_function_decl(id).name {
+            self.symbols.get_mut().remove(name);
+        }
+    }
+
+    /// Number of retained executable definitions, including pending finalization.
+    pub fn defined_function_count(&self) -> usize {
+        self.code_ranges.len()
+    }
+
+    /// Discard a definition which has never been published, including a pending
+    /// or failed finalization. Keep its declaration available for reuse.
+    ///
+    /// # Safety
+    /// No execution, code-map reader, symbol consumer or other definition's
+    /// relocation may refer to this function. The caller owns publication.
+    pub unsafe fn discard_unpublished_function(&mut self, id: FuncId) {
+        self.functions_to_finalize.retain(|pending| *pending != id);
+        if let Some(blob) = self.compiled_functions[id].take() {
+            self.code_ranges.remove(&blob.ptr().addr());
+            if let Some(name) = &self.declarations.get_function_decl(id).name {
+                self.symbols.get_mut().remove(name);
+            }
+            if let Some(generation) = self.memory.allocation_generation(blob.ptr()) {
+                // SAFETY: this unpublished allocation has no external users.
+                unsafe { self.memory.release_allocation(blob.ptr(), generation) };
+            }
+        }
+    }
+
+    /// Release a retired definition's provider allocation, if supported.
+    ///
+    /// # Safety
+    /// The definition must have been retired with `retire_function_definition`;
+    /// the provider's execution, reader and relocation exclusions must hold.
+    pub unsafe fn release_function_allocation(
+        &mut self,
+        entry: *const u8,
+        generation: u64,
+    ) -> bool {
+        unsafe { self.memory.release_allocation(entry, generation) }
+    }
+
     fn lookup_symbol(&self, name: &str) -> Option<*const u8> {
         match self.symbols.borrow_mut().entry(name.to_owned()) {
             std::collections::hash_map::Entry::Occupied(occ) => Some(occ.get().0),
@@ -267,6 +328,13 @@ impl JITModule {
             }
             name => panic!("invalid name {name:?}"),
         }
+    }
+
+    /// Return the provider's allocation identity for a finalized function.
+    /// Providers without per-allocation tracking return `None`.
+    pub fn get_finalized_function_generation(&self, func_id: FuncId) -> Option<u64> {
+        let entry = self.get_finalized_function(func_id);
+        self.memory.allocation_generation(entry)
     }
 
     /// Returns the address of a finalized function.

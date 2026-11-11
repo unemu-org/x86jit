@@ -63,7 +63,7 @@ fn cache_replacements_and_stale_upgrades_preserve_accounting() {
     });
     let interpreted = CachedBlock::Interpreted(ir);
     let compiled = CachedBlock::Compiled {
-        entry: CompiledPtr(std::ptr::null()),
+        entry: CompiledPtr::new(std::ptr::null()),
     };
     cache.insert(key, interpreted.clone(), vec![(0x1000, 1)], |_| {});
     let bytes = cache.memory_stats().interpreted_ir_bytes;

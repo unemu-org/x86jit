@@ -1,11 +1,11 @@
-//! Dense retained code storage (spec §8.2; decision-17, phase 2).
-//!
-//! Allocation records deliberately outlive invalidation. Reuse/free lists and
-//! execution/signal-reader grace periods belong to decision-17 phase 3.
+//! Dense code storage with generation-checked reclamation (spec §8.2; decision-17).
+//! The backend excludes execution and signal readers before releasing an extent.
 use crate::memory_stats::{CodeCounters, ProviderChoice};
 use cranelift_jit::{BranchProtection, JITMemoryKind, JITMemoryProvider};
 use cranelift_module::{ModuleError, ModuleResult};
+use std::collections::HashMap;
 use std::io;
+use std::ops::Range;
 use std::sync::{atomic::Ordering, Arc};
 
 use x86jit_core::codemap::ProcessIdentity;
@@ -70,6 +70,8 @@ pub enum CodeMemoryFailureOp {
     SystemProtectExecutable = 19,
     /// Protect system-provider data read-only.
     SystemProtectReadOnly = 20,
+    /// Discard wholly free backing pages without changing live protections.
+    DecommitPages = 21,
 }
 
 /// A provider failure, retained even when automatic fallback succeeds.
@@ -106,6 +108,7 @@ impl CodeMemoryFailure {
             18 => SystemAllocate,
             19 => SystemProtectExecutable,
             20 => SystemProtectReadOnly,
+            21 => DecommitPages,
             _ => return None,
         };
         let errno = value as i32;
@@ -129,7 +132,7 @@ pub(crate) fn provider(counters: Arc<CodeCounters>) -> Box<dyn JITMemoryProvider
     }
     if *choice == ProviderChoice::Undecided {
         match memory.reserve_region(REGION_BYTES, Kind::Code, 16) {
-            Ok(()) => *choice = ProviderChoice::Dense,
+            Ok(_) => *choice = ProviderChoice::Dense,
             Err(_) => {
                 memory.counters.failures.fetch_add(1, Ordering::Relaxed);
                 counters.fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -359,25 +362,86 @@ struct Region {
     rx: usize,
     len: usize,
     used: usize,
-    flushed: usize,
+    // Disjoint, coalesced holes below the bump watermark.
+    free: Vec<Range<usize>>,
+    // Dirty writes can lie below that watermark after reuse.
+    dirty: Vec<Range<usize>>,
+    // Page-aligned holes whose backing was successfully discarded.
+    decommitted: Vec<Range<usize>>,
+    live: usize,
+    // Retained for shared-object hole punching behind both views.
+    backing: Option<std::os::fd::OwnedFd>,
     // Anonymous mappings have [0, sealed) immutable RX/R, [sealed, committed)
-    // writable, and [committed, len) PROT_NONE. Reclamation may reopen an extent
-    // only after every page in it is free of executable users (decision-17).
+    // writable, and [committed, len) PROT_NONE. A sealed page never becomes RW
+    // again in this reservation, even after execution and reader grace. Reuse
+    // requires fresh reservations; only the RW frontier accepts new writes.
     sealed: usize,
     committed: usize,
     no_fd: bool,
     kind: Kind,
 }
 
-/// Stable identity for a retained allocation: region index, offset and length.
-/// Indices are never reused; the monotonically increasing record index is its
-/// generation until phase 3 supplies retirement notifications and recycling.
+/// Provider-owned extent, including definitions that fail before publication.
+/// Generation identity is independent of both record and region indices.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct Allocation {
     region: usize,
     offset: usize,
+    // Include bump-alignment padding in the allocation's reclaimable extent.
+    start: usize,
     len: usize,
+    generation: u64,
+}
+
+// Sorted disjoint intervals; insertion coalesces adjacency, subtraction splits.
+// Their storage scales with fragmentation, rather than the number of retirements.
+fn insert_range(ranges: &mut Vec<Range<usize>>, mut range: Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let first = ranges.partition_point(|r| r.end < range.start);
+    let mut last = first;
+    while last < ranges.len() && ranges[last].start <= range.end {
+        range.start = range.start.min(ranges[last].start);
+        range.end = range.end.max(ranges[last].end);
+        last += 1;
+    }
+    ranges.splice(first..last, [range]);
+}
+
+fn subtract_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
+    let mut i = 0;
+    while i < ranges.len() {
+        let old = ranges[i].clone();
+        if old.start >= range.end {
+            break;
+        }
+        if old.end <= range.start {
+            i += 1;
+            continue;
+        }
+        ranges.remove(i);
+        if old.start < range.start {
+            ranges.insert(i, old.start..range.start);
+            i += 1;
+        }
+        if old.end > range.end {
+            ranges.insert(i, range.end..old.end);
+            break;
+        }
+    }
+}
+
+fn range_bytes(ranges: &[Range<usize>]) -> usize {
+    ranges.iter().map(|r| r.len()).sum()
+}
+
+impl Region {
+    fn reusable(&self) -> bool {
+        // Descriptor-free reservations are reclaimed as a whole. In particular,
+        // sealed RX/R pages never become writable in the same reservation.
+        !self.no_fd
+    }
 }
 
 pub(crate) struct CodeMemory {
@@ -385,6 +449,7 @@ pub(crate) struct CodeMemory {
     diagnostics: Arc<CodeCounters>,
     regions: Vec<Region>,
     allocations: Vec<Allocation>,
+    allocation_by_rx: HashMap<usize, usize>,
     counters: Arc<crate::memory_stats::RegionCounters>,
     no_fd: Option<CodeMemoryPolicy>,
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -397,6 +462,7 @@ impl CodeMemory {
             owner: ProcessIdentity::current(),
             regions: Vec::new(),
             allocations: Vec::new(),
+            allocation_by_rx: HashMap::new(),
             counters: counters.register(),
             diagnostics: counters,
             no_fd: None,
@@ -405,29 +471,43 @@ impl CodeMemory {
         }
     }
 
-    fn reserve_region(&mut self, len: usize, kind: Kind, align: usize) -> io::Result<()> {
-        self.regions.try_reserve(1).map_err(io::Error::other)?;
-        let (rw, rx) = if self.no_fd.is_some() {
-            // Alignment is handled inside the reservation by the common bump
-            // allocator, so placement never requires MAP_FIXED or extra views.
+    fn reserve_region(&mut self, len: usize, kind: Kind, align: usize) -> io::Result<usize> {
+        // Vacant region indices are stable: another live allocation can retain
+        // its index when an empty neighbor is unmapped.
+        let index = self.regions.iter().position(|r| r.len == 0);
+        if index.is_none() {
+            self.regions.try_reserve(1).map_err(io::Error::other)?;
+        }
+        let (rw, rx, backing) = if self.no_fd.is_some() {
             let address = os::reserve_anonymous(len, &self.diagnostics)?;
-            (address, address)
+            (address, address, None)
         } else {
             os::reserve(len, kind, align, &self.diagnostics)?
         };
-        self.regions.push(Region {
+        let region = Region {
             rw,
             rx,
             len,
             used: 0,
-            flushed: 0,
+            free: Vec::new(),
+            dirty: Vec::new(),
+            decommitted: Vec::new(),
+            live: 0,
+            backing,
             sealed: 0,
             committed: 0,
             no_fd: self.no_fd.is_some(),
             kind,
-        });
+        };
+        let index = if let Some(index) = index {
+            self.regions[index] = region;
+            index
+        } else {
+            self.regions.push(region);
+            self.regions.len() - 1
+        };
         self.update_counters();
-        Ok(())
+        Ok(index)
     }
 
     #[cfg(any(test, target_os = "linux", target_os = "freebsd"))]
@@ -451,7 +531,6 @@ impl CodeMemory {
             return Err(err);
         }
         r.used = page;
-        r.flushed = page;
         r.sealed = page;
         r.committed = page;
         self.update_counters();
@@ -473,21 +552,38 @@ impl CodeMemory {
         if size == 0 || !align.is_power_of_two() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let host_len = u32::try_from(size).map_err(|_| io::ErrorKind::InvalidInput)?;
         // Reserve the bookkeeping before consuming an extent. Allocation failure
         // must use the same sticky CodeSpaceExhausted path as mmap failure.
         self.allocations.try_reserve(1).map_err(io::Error::other)?;
+        self.allocation_by_rx
+            .try_reserve(1)
+            .map_err(io::Error::other)?;
         let fits = |r: &Region| {
             let offset = r.rw.checked_add(r.used)?.checked_add(align - 1)? & !(align - 1);
             let offset = offset.checked_sub(r.rw)?;
             (offset.checked_add(size)? <= r.len && (r.rx.checked_add(offset)? & (align - 1)) == 0)
                 .then_some(offset)
         };
-        let found = self
-            .regions
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, r)| (r.kind == kind).then(|| fits(r)).flatten().map(|p| (i, p)));
+        let hole = self.regions.iter().enumerate().find_map(|(i, r)| {
+            if r.kind != kind || !r.reusable() {
+                return None;
+            }
+            r.free.iter().find_map(|hole| {
+                let offset = r.rw.checked_add(hole.start)?.checked_add(align - 1)? & !(align - 1);
+                let offset = offset.checked_sub(r.rw)?;
+                let end = if hole.end == r.used { r.len } else { hole.end };
+                (offset.checked_add(size)? <= end && (r.rx + offset) & (align - 1) == 0)
+                    .then_some((i, offset))
+            })
+        });
+        let found = hole.or_else(|| {
+            self.regions
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, r)| (r.kind == kind).then(|| fits(r)).flatten().map(|p| (i, p)))
+        });
         let (index, offset) = match found {
             Some(found) => found,
             None => {
@@ -497,8 +593,7 @@ impl CodeMemory {
                     .and_then(|v| v.checked_add(page - 1))
                     .map(|v| (v & !(page - 1)).max(REGION_BYTES))
                     .ok_or(io::ErrorKind::OutOfMemory)?;
-                self.reserve_region(len, kind, align)?;
-                let index = self.regions.len() - 1;
+                let index = self.reserve_region(len, kind, align)?;
                 (
                     index,
                     fits(&self.regions[index]).expect("new region accommodates alignment"),
@@ -521,13 +616,33 @@ impl CodeMemory {
                 )?;
                 r.committed = end;
             }
-            debug_assert!(offset >= r.sealed);
+            debug_assert!(r.reusable() || offset >= r.sealed);
         }
-        r.used = offset + size;
+        let start = if hole.is_some() {
+            offset.min(r.used)
+        } else {
+            r.used
+        };
+        if hole.is_some() {
+            subtract_range(&mut r.free, offset..offset + size);
+        }
+        r.used = r.used.max(offset + size);
+        r.live += 1;
+        insert_range(&mut r.dirty, offset..offset + size);
+        let page = region::page::size();
+        subtract_range(
+            &mut r.decommitted,
+            offset / page * page..(offset + size).div_ceil(page) * page,
+        );
+        let unit = x86jit_core::code_lifetime::CodeUnit::new(r.rx + offset, host_len);
+        self.allocation_by_rx
+            .insert(unit.host_start, self.allocations.len());
         self.allocations.push(Allocation {
             region: index,
             offset,
+            start,
             len: size,
+            generation: unit.generation,
         });
         let ptr = (r.rw + offset) as *mut u8;
         self.update_counters();
@@ -553,16 +668,37 @@ impl CodeMemory {
         let mut used = 0;
         let mut committed = 0;
         let mut largest = 0;
-        for r in self.regions.iter().filter(|r| r.kind == Kind::Code) {
+        for r in self
+            .regions
+            .iter()
+            .filter(|r| r.kind == Kind::Code && r.len != 0)
+        {
             regions += 1;
             reserved += r.len as u64;
-            used += r.used as u64;
-            committed += if r.no_fd {
+            let holes = if r.reusable() {
+                range_bytes(&r.free)
+            } else {
+                0
+            };
+            used += (r.used - holes) as u64;
+            committed += (if r.no_fd {
                 r.committed as u64
             } else {
                 (r.used.div_ceil(region::page::size()) * region::page::size()) as u64
-            };
+            }) - range_bytes(&r.decommitted) as u64;
             largest = largest.max((r.len - r.used) as u64);
+            if r.reusable() {
+                largest = largest.max(
+                    r.free
+                        .iter()
+                        .map(|hole| {
+                            let end = if hole.end == r.used { r.len } else { hole.end };
+                            (end - hole.start) as u64
+                        })
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
         }
         c.regions.store(regions, Ordering::Relaxed);
         c.views.store(
@@ -579,16 +715,120 @@ impl CodeMemory {
         c.used.store(used, Ordering::Relaxed);
         c.committed.store(committed, Ordering::Relaxed);
         c.free.store(reserved - used, Ordering::Relaxed);
+        c.reusable.store(
+            self.regions
+                .iter()
+                .filter(|r| r.reusable())
+                .map(|r| range_bytes(&r.free) as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
         c.largest.store(largest, Ordering::Relaxed);
         c.allocation_metadata.store(
             (self.allocations.capacity() * std::mem::size_of::<Allocation>()
-                + self.regions.capacity() * std::mem::size_of::<Region>()) as u64,
+                + self.allocation_by_rx.capacity() * 2 * std::mem::size_of::<usize>()
+                + self.regions.capacity() * std::mem::size_of::<Region>()
+                + self
+                    .regions
+                    .iter()
+                    .map(|r| {
+                        (r.free.capacity() + r.dirty.capacity() + r.decommitted.capacity())
+                            * std::mem::size_of::<Range<usize>>()
+                    })
+                    .sum::<usize>()) as u64,
             Ordering::Relaxed,
         );
     }
 }
 
 impl JITMemoryProvider for CodeMemory {
+    unsafe fn release_allocation(&mut self, executable: *const u8, generation: u64) -> bool {
+        if self.check_process().is_err() {
+            return false;
+        }
+        let address = executable as usize;
+        let Some(&index) = self.allocation_by_rx.get(&address) else {
+            return false;
+        };
+        if self.allocations[index].generation != generation {
+            return false;
+        }
+        let allocation = self.allocations.swap_remove(index);
+        self.allocation_by_rx.remove(&address);
+        if let Some(moved) = self.allocations.get(index) {
+            let address = self.regions[moved.region].rx + moved.offset;
+            *self.allocation_by_rx.get_mut(&address).unwrap() = index;
+        }
+        let r = &mut self.regions[allocation.region];
+        r.live -= 1;
+        insert_range(
+            &mut r.free,
+            allocation.start..allocation.offset + allocation.len,
+        );
+        subtract_range(
+            &mut r.dirty,
+            allocation.offset..allocation.offset + allocation.len,
+        );
+        if r.live == 0 && !(cfg!(target_os = "macos") && !r.no_fd && r.kind == Kind::Code) {
+            // SAFETY: every allocation in these views has passed both grace
+            // periods. Do not shift another region's stable allocation index.
+            unsafe { os::release(r) };
+            r.backing = None;
+            r.len = 0;
+            r.used = 0;
+            r.committed = 0;
+            r.sealed = 0;
+            r.free.clear();
+            r.dirty.clear();
+            r.decommitted.clear();
+        } else if r.reusable() {
+            // Only pages wholly inside coalesced free extents may be discarded.
+            // Include the unwritten tail of the last touched page. No protection
+            // change, backing operation or write touches a live unit's page.
+            let page = region::page::size();
+            for hole in &r.free {
+                let start = hole.start.div_ceil(page) * page;
+                let end = if hole.end == r.used {
+                    hole.end.div_ceil(page) * page
+                } else {
+                    hole.end / page * page
+                };
+                if start >= end {
+                    continue;
+                }
+                let mut pending = std::iter::once(start..end).collect::<Vec<_>>();
+                for old in &r.decommitted {
+                    subtract_range(&mut pending, old.clone());
+                }
+                for pages in pending {
+                    match operation(
+                        &self.diagnostics,
+                        CodeMemoryFailureOp::DecommitPages,
+                        || os::decommit(r, pages.clone()),
+                    ) {
+                        Ok(()) => insert_range(&mut r.decommitted, pages),
+                        Err(_) => {
+                            // Failed decommit retains commitment. The extent is
+                            // still safe to reuse after the caller's grace periods.
+                            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        self.update_counters();
+        true
+    }
+
+    fn allocation_generation(&self, executable: *const u8) -> Option<u64> {
+        self.check_process().ok()?;
+        let allocation = &self.allocations[*self.allocation_by_rx.get(&(executable as usize))?];
+        let region = &self.regions[allocation.region];
+        debug_assert_eq!(region.rx + allocation.offset, executable as usize);
+        debug_assert!(allocation.offset + allocation.len <= region.used);
+        Some(allocation.generation)
+    }
+
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> io::Result<*mut u8> {
         self.check_process()?;
         let result = self.allocate_inner(size, align, kind);
@@ -652,12 +892,14 @@ impl JITMemoryProvider for CodeMemory {
                 ));
             }
             for r in &self.regions {
-                if r.kind == Kind::Code && r.used > r.flushed {
-                    operation(
-                        &self.diagnostics,
-                        CodeMemoryFailureOp::CacheMaintenance,
-                        || os::clear_cache(r.rw + r.flushed, r.rx + r.flushed, r.used - r.flushed),
-                    )?;
+                if r.kind == Kind::Code {
+                    for dirty in &r.dirty {
+                        operation(
+                            &self.diagnostics,
+                            CodeMemoryFailureOp::CacheMaintenance,
+                            || os::clear_cache(r.rw + dirty.start, r.rx + dirty.start, dirty.len()),
+                        )?;
+                    }
                 }
             }
             for r in &mut self.regions {
@@ -705,21 +947,24 @@ impl JITMemoryProvider for CodeMemory {
         }
         x86jit_core::jit_abi::code_publication_barrier();
         for r in &mut self.regions {
-            r.flushed = r.used;
+            r.dirty.clear();
         }
         Ok(())
     }
 
     unsafe fn free_memory(&mut self) {
         // SAFETY: the caller must exclude execution and signal readers. Normal
-        // backend drop intentionally retains all addresses until phase 3.
+        // backend teardown calls this only after both grace periods.
         if self.check_process().is_err() {
             return;
         }
         for r in self.regions.drain(..) {
-            unsafe { os::release(&r) };
+            if r.len != 0 {
+                unsafe { os::release(&r) };
+            }
         }
         self.allocations.clear();
+        self.allocation_by_rx.clear();
         self.update_counters();
     }
 }
@@ -815,7 +1060,7 @@ mod os {
         kind: Kind,
         align: usize,
         counters: &CodeCounters,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<(usize, usize, Option<std::os::fd::OwnedFd>)> {
         #[cfg(test)]
         if TEST_ALIAS_PROVIDER.with(|slot| slot.get()) {
             return operation(counters, CodeMemoryFailureOp::ObjectCreate, || {
@@ -824,11 +1069,12 @@ mod os {
         }
         #[cfg(target_os = "macos")]
         {
-            if kind == Kind::Code {
-                mac::reserve(len, align, counters)
+            let (rw, rx) = if kind == Kind::Code {
+                mac::reserve(len, align, counters)?
             } else {
-                mac::reserve_data(len, kind, align, counters)
-            }
+                mac::reserve_data(len, kind, align, counters)?
+            };
+            Ok((rw, rx, None))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -849,56 +1095,54 @@ mod os {
                     Ok(fd)
                 }
             })?;
-            // SAFETY: fd is uniquely owned here; the successful views own the backing
-            // after close. Every partial failure unmaps already created views.
+            use std::os::fd::FromRawFd;
+            // SAFETY: the newly opened descriptor is uniquely owned here.
+            let backing = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            // SAFETY: mapping calls use this owned backing. Every partial
+            // failure unmaps already created views and drops the descriptor.
             unsafe {
-                let result = (|| {
-                    let length =
-                        libc::off_t::try_from(len).map_err(|_| io::ErrorKind::OutOfMemory)?;
-                    operation(counters, CodeMemoryFailureOp::ObjectSize, || {
-                        if libc::ftruncate(fd, length) != 0 {
-                            Err(io::Error::last_os_error())
-                        } else {
-                            Ok(())
-                        }
-                    })?;
-                    let rw = map_aligned(
-                        len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_SHARED,
-                        fd,
-                        align,
-                        counters,
-                        CodeMemoryFailureOp::MapWritable,
-                    )?;
-                    if kind == Kind::Writable {
-                        return Ok((rw as usize, rw as usize));
+                let length = libc::off_t::try_from(len).map_err(|_| io::ErrorKind::OutOfMemory)?;
+                operation(counters, CodeMemoryFailureOp::ObjectSize, || {
+                    if libc::ftruncate(fd, length) != 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
                     }
-                    let prot = libc::PROT_READ
-                        | if kind == Kind::Code {
-                            libc::PROT_EXEC
-                        } else {
-                            0
-                        };
-                    let rx = match map_aligned(
-                        len,
-                        prot,
-                        libc::MAP_SHARED,
-                        fd,
-                        align,
-                        counters,
-                        CodeMemoryFailureOp::MapExecutable,
-                    ) {
-                        Ok(rx) => rx,
-                        Err(error) => {
-                            libc::munmap(rw, len);
-                            return Err(error);
-                        }
+                })?;
+                let rw = map_aligned(
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    align,
+                    counters,
+                    CodeMemoryFailureOp::MapWritable,
+                )?;
+                if kind == Kind::Writable {
+                    return Ok((rw as usize, rw as usize, Some(backing)));
+                }
+                let prot = libc::PROT_READ
+                    | if kind == Kind::Code {
+                        libc::PROT_EXEC
+                    } else {
+                        0
                     };
-                    Ok((rw as usize, rx as usize))
-                })();
-                libc::close(fd);
-                result
+                let rx = match map_aligned(
+                    len,
+                    prot,
+                    libc::MAP_SHARED,
+                    fd,
+                    align,
+                    counters,
+                    CodeMemoryFailureOp::MapExecutable,
+                ) {
+                    Ok(rx) => rx,
+                    Err(error) => {
+                        libc::munmap(rw, len);
+                        return Err(error);
+                    }
+                };
+                Ok((rw as usize, rx as usize, Some(backing)))
             }
         }
     }
@@ -1068,11 +1312,86 @@ mod os {
         Ok(())
     }
 
+    pub(super) fn decommit(r: &Region, pages: Range<usize>) -> io::Result<()> {
+        debug_assert!(!r.no_fd);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Linux fallocate(2), FALLOC_FL_PUNCH_HOLE | KEEP_SIZE: remove
+            // backing pages, invalidating mappings of that object in both views.
+            // https://man7.org/linux/man-pages/man2/fallocate.2.html
+            // SAFETY: the owned file backs the page-aligned, wholly free range.
+            let result = unsafe {
+                libc::fallocate(
+                    r.backing.as_ref().unwrap().as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    pages.start as libc::off_t,
+                    pages.len() as libc::off_t,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            use std::os::fd::AsRawFd;
+            // FreeBSD releng/15.0 sys/kern/uipc_shm.c, shm_deallocate:
+            // removes full pages from the shared VM object and its mappings.
+            // https://cgit.freebsd.org/src/tree/sys/kern/uipc_shm.c?h=releng/15.0
+            let mut remaining = libc::spacectl_range {
+                r_offset: pages.start as libc::off_t,
+                r_len: pages.len() as libc::off_t,
+            };
+            while remaining.r_len != 0 {
+                let request = remaining;
+                // SAFETY: owned shm descriptor and initialized in/out ranges.
+                let result = unsafe {
+                    libc::fspacectl(
+                        r.backing.as_ref().unwrap().as_raw_fd(),
+                        libc::SPACECTL_DEALLOC,
+                        &request,
+                        0,
+                        &mut remaining,
+                    )
+                };
+                if result != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if remaining.r_len >= request.r_len {
+                    return Err(io::Error::other("backing decommit made no progress"));
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if r.rw != r.rx {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+            // XNU vm_map.c, VM_BEHAVIOR_FREE -> VM_SYNC_KILLPAGES, and
+            // vm_object_deactivate_pages: discard pages while keeping MAP_JIT.
+            // Dirty backing is surrendered; clean pages may remain resident until
+            // kernel reclamation. DONTNEED only deactivates dirty pages.
+            // https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/vm/vm_map.c
+            // SAFETY: page-aligned, wholly free pages in our retained mapping.
+            let result = unsafe {
+                libc::madvise((r.rw + pages.start) as *mut _, pages.len(), libc::MADV_FREE)
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) unsafe fn release(r: &Region) {
         #[cfg(target_os = "macos")]
         if r.kind == Kind::Code && !r.no_fd {
+            // SAFETY: this logical region has no remaining execution or readers.
+            unsafe { libc::madvise(r.rw as *mut _, r.len, libc::MADV_FREE) };
+            mac::release(r.rw, r.len);
             return;
-        } // process reservation is never reused
+        } // retain the process reservation; logical regions pass to other backends
           // SAFETY: inherited from free_memory; exact original views and lengths.
         unsafe {
             libc::munmap(r.rw as *mut _, r.len);
@@ -1091,7 +1410,7 @@ mod os {
         const RESERVATION: usize = 1 << 40;
         struct Arena {
             owner: ProcessIdentity,
-            state: Mutex<(usize, usize)>,
+            state: Mutex<(usize, usize, Vec<Range<usize>>)>,
         }
         static ARENA: AtomicPtr<Arena> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -1108,7 +1427,7 @@ mod os {
                 // may be locked by a thread that does not exist in the child.
                 let new = Box::into_raw(Box::new(Arena {
                     owner,
-                    state: Mutex::new((0, 0)),
+                    state: Mutex::new((0, 0, Vec::new())),
                 }));
                 if ARENA
                     .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
@@ -1120,6 +1439,11 @@ mod os {
                 // SAFETY: this unpublished candidate is owned only by us.
                 unsafe { drop(Box::from_raw(new)) };
             }
+        }
+
+        pub(super) fn release(start: usize, len: usize) {
+            let mut state = arena().state.lock().unwrap();
+            insert_range(&mut state.2, start..start + len);
         }
 
         #[cfg(test)]
@@ -1174,6 +1498,14 @@ mod os {
                     return Err(error);
                 }
                 arena.0 = ptr as usize;
+            }
+            for index in 0..arena.2.len() {
+                let hole = arena.2[index].clone();
+                let start = (hole.start + align - 1) & !(align - 1);
+                if start.checked_add(len).is_some_and(|end| end <= hole.end) {
+                    subtract_range(&mut arena.2, start..start + len);
+                    return Ok((start, start));
+                }
             }
             let offset = (arena.0 + arena.1)
                 .checked_add(align - 1)
@@ -1327,7 +1659,7 @@ mod os {
         _: Kind,
         _: usize,
         counters: &CodeCounters,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<(usize, usize, Option<std::os::fd::OwnedFd>)> {
         operation(counters, CodeMemoryFailureOp::ReserveAddressSpace, || {
             Err(io::ErrorKind::Unsupported.into())
         })
@@ -1339,12 +1671,30 @@ mod os {
     pub(super) fn clear_cache(_: usize, _: usize, _: usize) -> io::Result<()> {
         Ok(())
     }
+    pub(super) fn decommit(_: &Region, _: Range<usize>) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     pub(super) unsafe fn release(_: &Region) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_map_jit_logical_regions_pass_between_provider_owners() {
+        let mut first = CodeMemory::new(Arc::default());
+        first.allocate(16, 16, JITMemoryKind::Executable).unwrap();
+        let region = first.regions[0].rx;
+        // SAFETY: this provider's allocation was never exposed to execution or readers.
+        unsafe { first.free_memory() };
+        let mut next = CodeMemory::new(Arc::default());
+        next.allocate(16, 16, JITMemoryKind::Executable).unwrap();
+        assert_eq!(next.regions[0].rx, region);
+        // SAFETY: the replacement allocation also remains unpublished.
+        unsafe { next.free_memory() };
+    }
+
     use cranelift::codegen::binemit::Reloc;
     use cranelift_jit::JITModule;
     use cranelift_module::{Linkage, Module, ModuleReloc, ModuleRelocTarget};
@@ -2666,6 +3016,278 @@ mod tests {
         assert_eq!(cpu.reg(Reg::Rax), 7);
     }
 
+    // These raw-provider witnesses publish no callable pointer or fault range.
+    // Their release calls therefore meet both grace periods without participants.
+    fn release(memory: &mut CodeMemory, rw: *mut u8) -> (usize, u64) {
+        let rx = memory.executable_ptr(rw);
+        let generation = memory.allocation_generation(rx).unwrap();
+        // SAFETY: the raw extent has never escaped or executed.
+        assert!(unsafe { memory.release_allocation(rx, generation) });
+        (rx as usize, generation)
+    }
+
+    fn page_states(address: usize, len: usize) -> Vec<u8> {
+        let mut pages = vec![0u8; len.div_ceil(region::page::size())];
+        // SAFETY: mincore only inspects the retained mapping; the vector covers
+        // every page. It does not read discarded bytes back into physical memory.
+        assert_eq!(
+            unsafe { libc::mincore(address as *mut _, len, pages.as_mut_ptr().cast()) },
+            0
+        );
+        pages
+    }
+
+    fn resident(address: usize, len: usize) -> usize {
+        page_states(address, len)
+            .iter()
+            .filter(|page| **page & 1 != 0)
+            .count()
+    }
+
+    fn assert_discarded(address: usize, len: usize) {
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(resident(address, len), 0, "shared backing must be removed");
+        #[cfg(target_os = "macos")]
+        {
+            // XNU MADV_FREE surrenders dirty backing; clean resident pages can
+            // remain until the kernel reclaims them. Do not equate this with RSS.
+            let dirty = (libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER) as u8;
+            assert!(page_states(address, len)
+                .iter()
+                .all(|page| page & dirty == 0));
+        }
+    }
+
+    #[test]
+    fn released_extents_coalesce_discard_backing_and_republish_below_watermark() {
+        #[cfg(target_os = "macos")]
+        if !os::jit_write_protection_supported() {
+            return;
+        }
+        let counters = Arc::new(CodeCounters::default());
+        let mut memory = CodeMemory::new(counters.clone());
+        let page = region::page::size();
+        let first = memory
+            .allocate(page, page as u64, JITMemoryKind::Executable)
+            .unwrap();
+        let second = memory
+            .allocate(page, page as u64, JITMemoryKind::Executable)
+            .unwrap();
+        let live = memory
+            .allocate(page, page as u64, JITMemoryKind::Executable)
+            .unwrap();
+        let rx = memory.executable_ptr(first) as usize;
+        memory
+            .with_write_access(&mut || {
+                // SAFETY: all three contiguous pages belong to this write window.
+                unsafe { first.write_bytes(0xa5, 3 * page) };
+            })
+            .unwrap();
+        memory.finalize(BranchProtection::None).unwrap();
+        assert_eq!(resident(first as usize, 2 * page), 2);
+        #[cfg(target_os = "macos")]
+        {
+            let dirty = (libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER) as u8;
+            assert!(page_states(first as usize, 2 * page)
+                .iter()
+                .all(|page| page & dirty != 0));
+        }
+        // Fault in the RX view too: decommit must remove shared backing rather
+        // than just one view's page-table entries.
+        // SAFETY: finalized readable pages; neither has been released yet.
+        assert_eq!(unsafe { (rx as *const u8).read_volatile() }, 0xa5);
+        let (_, generation) = release(&mut memory, first);
+        release(&mut memory, second);
+        assert_eq!(memory.regions[0].free.len(), 1);
+        assert_eq!(memory.regions[0].free[0], 0..2 * page);
+        assert_discarded(first as usize, 2 * page);
+        assert_discarded(rx, 2 * page);
+        assert_eq!(counters.snapshot().code_bytes_committed, page as u64);
+        // SAFETY: a live page outside the discarded ranges remains readable.
+        assert_eq!(unsafe { live.read_volatile() }, 0xa5);
+        let reused = memory
+            .allocate(2 * page, page as u64, JITMemoryKind::Executable)
+            .unwrap();
+        assert_eq!(reused, first);
+        assert_ne!(
+            memory.allocation_generation(rx as *const u8),
+            Some(generation)
+        );
+        // SAFETY: an obsolete handle must not free its replacement.
+        assert!(!unsafe { memory.release_allocation(rx as *const u8, generation) });
+        assert_eq!(memory.regions[0].dirty.len(), 1);
+        assert_eq!(memory.regions[0].dirty[0], 0..2 * page);
+        memory
+            .with_write_access(&mut || {
+                // SAFETY: the new generation owns the reused writable extent.
+                unsafe { reused.write_bytes(0x5a, 2 * page) };
+            })
+            .unwrap();
+        inject(CodeMemoryFailureOp::CacheMaintenance, libc::EIO);
+        assert!(
+            memory.finalize(BranchProtection::None).is_err(),
+            "reused code needs cache maintenance"
+        );
+        memory.finalize(BranchProtection::None).unwrap();
+        assert_eq!(counters.snapshot().code_bytes_committed, (3 * page) as u64);
+        release(&mut memory, reused);
+        release(&mut memory, live);
+        assert_eq!(counters.snapshot().code_bytes_committed, 0);
+        assert!(memory.allocations.is_empty());
+        assert!(memory.allocation_by_rx.is_empty());
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            assert_eq!(counters.snapshot().code_regions, 0);
+            assert_eq!(counters.snapshot().code_bytes_reserved, 0);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(counters.snapshot().code_regions, 1);
+            assert_discarded(rx, 3 * page);
+            assert!(
+                region::query(rx as *const u8).is_ok(),
+                "MAP_JIT reservation retained"
+            );
+        }
+        // SAFETY: no published pointers; releases remaining non-code views, if any.
+        unsafe { memory.free_memory() };
+    }
+
+    #[test]
+    fn decommit_failure_retains_commitment_but_allows_safe_reuse() {
+        #[cfg(target_os = "macos")]
+        if !os::jit_write_protection_supported() {
+            return;
+        }
+        let counters = Arc::new(CodeCounters::default());
+        let mut memory = CodeMemory::new(counters.clone());
+        let page = region::page::size();
+        let old = memory
+            .allocate(page, 16, JITMemoryKind::Executable)
+            .unwrap();
+        memory
+            .allocate(page, 16, JITMemoryKind::Executable)
+            .unwrap();
+        inject(CodeMemoryFailureOp::DecommitPages, libc::EIO);
+        release(&mut memory, old);
+        assert_eq!(counters.snapshot().code_bytes_committed, (2 * page) as u64);
+        assert_eq!(counters.snapshot().code_allocation_failures, 1);
+        assert_failure(&counters, CodeMemoryFailureOp::DecommitPages, libc::EIO);
+        assert!(memory.regions[0].decommitted.is_empty());
+        assert_eq!(
+            memory
+                .allocate(page, 16, JITMemoryKind::Executable)
+                .unwrap(),
+            old
+        );
+        // SAFETY: raw allocations have never escaped.
+        unsafe { memory.free_memory() };
+    }
+
+    #[test]
+    fn aligned_hole_splitting_preserves_neighbors_and_stable_region_indices() {
+        #[cfg(target_os = "macos")]
+        if !os::jit_write_protection_supported() {
+            return;
+        }
+        let mut memory = CodeMemory::new(Arc::new(CodeCounters::default()));
+        let a = memory.allocate(7, 1, JITMemoryKind::Executable).unwrap();
+        let hole = memory.allocate(200, 1, JITMemoryKind::Executable).unwrap();
+        let neighbor = memory.allocate(9, 1, JITMemoryKind::Executable).unwrap();
+        let huge = memory
+            .allocate(REGION_BYTES + 1, 16, JITMemoryKind::Executable)
+            .unwrap();
+        let neighbor_rx = memory.executable_ptr(neighbor);
+        let neighbor_gen = memory.allocation_generation(neighbor_rx);
+        let huge_rx = memory.executable_ptr(huge);
+        let huge_gen = memory.allocation_generation(huge_rx);
+        release(&mut memory, hole);
+        let aligned = memory.allocate(32, 64, JITMemoryKind::Executable).unwrap();
+        assert_eq!(aligned as usize % 64, 0);
+        assert_eq!(memory.executable_ptr(aligned) as usize % 64, 0);
+        assert!(aligned as usize >= hole as usize && (aligned as usize) < neighbor as usize);
+        assert_eq!(memory.regions[0].free.len(), 2);
+        release(&mut memory, aligned);
+        release(&mut memory, a);
+        assert_eq!(memory.regions[0].free.len(), 1);
+        assert_eq!(memory.regions[0].free[0], 0..207);
+        release(&mut memory, neighbor);
+        assert_eq!(memory.allocation_generation(huge_rx), huge_gen);
+        assert_eq!(memory.allocation_generation(neighbor_rx), None);
+        assert!(neighbor_gen.is_some());
+        // Reuse the vacant region record without changing the huge unit's index.
+        let ro = memory.allocate(8, 8, JITMemoryKind::ReadOnly).unwrap();
+        assert_eq!(memory.allocation_generation(huge_rx), huge_gen);
+        release(&mut memory, ro);
+        release(&mut memory, huge);
+        assert!(memory.allocations.is_empty());
+        // SAFETY: no raw pointer has escaped.
+        unsafe { memory.free_memory() };
+    }
+
+    #[test]
+    fn anonymous_release_only_replaces_wholly_free_reservations() {
+        let (counters, mut memory) = anonymous_memory(CodeMemoryPolicy::WriteXorExecute);
+        let page = region::page::size();
+        let first = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        memory.finalize(BranchProtection::None).unwrap();
+        let live = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        memory.finalize(BranchProtection::None).unwrap();
+        let old_rx = memory.executable_ptr(first);
+        let old_generation = memory.allocation_generation(old_rx).unwrap();
+        release(&mut memory, first);
+        assert_eq!(
+            region::query(old_rx).unwrap().protection(),
+            region::Protection::READ_EXECUTE
+        );
+        let third = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        assert!(third as usize >= first as usize + 2 * page);
+        memory.finalize(BranchProtection::None).unwrap();
+        release(&mut memory, live);
+        release(&mut memory, third);
+        assert_eq!(counters.snapshot().code_regions, 0);
+        assert_eq!(counters.snapshot().code_bytes_committed, 0);
+        assert!(memory.allocations.is_empty());
+        assert!(
+            region::query(old_rx).is_err(),
+            "the old anonymous reservation was unmapped"
+        );
+        let fresh = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        let fresh_rx = memory.executable_ptr(fresh);
+        assert_ne!(memory.allocation_generation(fresh_rx), Some(old_generation));
+        // SAFETY: the old identity cannot release storage even if mmap reused its address.
+        assert!(!unsafe { memory.release_allocation(old_rx, old_generation) });
+        release(&mut memory, fresh);
+    }
+
+    #[test]
+    fn allocation_generations_include_unpublished_and_failed_extents() {
+        #[cfg(target_os = "macos")]
+        if !os::jit_write_protection_supported() {
+            return;
+        }
+        let counters = Arc::new(CodeCounters::default());
+        let mut memory = CodeMemory::new(counters);
+        let rw = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        let rx = memory.executable_ptr(rw);
+        let generation = memory.allocation_generation(rx).unwrap();
+        assert_ne!(generation, 0);
+        assert_eq!(generation, memory.allocations[0].generation);
+        assert_eq!(memory.allocation_generation(rx.wrapping_add(1)), None);
+        assert!(memory.finalize(BranchProtection::BTI).is_err());
+        assert_eq!(memory.allocation_generation(rx), Some(generation));
+        let next_rw = memory.allocate(40, 16, JITMemoryKind::Executable).unwrap();
+        let next_rx = memory.executable_ptr(next_rw);
+        assert_ne!(memory.allocation_generation(next_rx), Some(generation));
+        memory.finalize(BranchProtection::None).unwrap();
+        assert_eq!(memory.allocation_generation(rx), Some(generation));
+        assert_eq!(memory.allocations.len(), 2);
+        // SAFETY: no entry was executed or registered in the code map.
+        unsafe { memory.free_memory() };
+        assert_eq!(memory.allocation_generation(rx), None);
+        assert!(memory.allocation_by_rx.is_empty());
+    }
+
     #[test]
     fn dense_tails_growth_kinds_and_failure_accounting() {
         #[cfg(target_os = "macos")]
@@ -2728,6 +3350,7 @@ mod tests {
     #[derive(Default)]
     struct Observed {
         pairs: Mutex<Vec<(usize, usize)>>,
+        generations: Mutex<Vec<u64>>,
         failure: AtomicU8,
         writes: AtomicUsize,
         finalizations: AtomicUsize,
@@ -2754,7 +3377,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((rw as usize, region.rx + allocation.offset));
+            self.observed
+                .generations
+                .lock()
+                .unwrap()
+                .push(allocation.generation);
             Ok(rw)
+        }
+        fn allocation_generation(&self, executable: *const u8) -> Option<u64> {
+            self.memory.allocation_generation(executable)
         }
         fn supports_relocation(&self, kind: Reloc) -> bool {
             self.memory.supports_relocation(kind)
@@ -2951,6 +3582,10 @@ mod tests {
         let pairs = observed.pairs.lock().unwrap();
         let (rw, rx) = pairs[0];
         assert_eq!(m.get_finalized_function(f) as usize, rx);
+        assert_eq!(
+            m.get_finalized_function_generation(f),
+            Some(observed.generations.lock().unwrap()[0])
+        );
         if cfg!(target_os = "macos") {
             assert_eq!(rw, rx);
         } else {

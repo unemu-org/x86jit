@@ -58,7 +58,7 @@ fn key(i: u64) -> BlockKey {
 
 fn block() -> CachedBlock {
     CachedBlock::Compiled {
-        entry: CompiledPtr(std::ptr::null()),
+        entry: CompiledPtr::new(std::ptr::null()),
     }
 }
 

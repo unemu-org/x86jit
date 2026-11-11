@@ -42,14 +42,17 @@ mod libcalls;
 mod lock_telemetry;
 mod memory_stats;
 pub mod perfmap;
+mod reclamation;
 mod unwind;
+
+pub use reclamation::{CodeLifecycleEvent, CodeLifecycleKind};
 
 pub use code_memory::{CodeMemoryFailure, CodeMemoryFailureOp, CodeMemoryPolicy};
 
 use lock_telemetry::{LockKind, Telemetry};
 pub use lock_telemetry::{LockTelemetry, LockTelemetrySnapshot};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -3167,7 +3170,7 @@ impl CompileFailure {
 
 type FailureObserver = Observer<CompileFailure>;
 
-/// Compiler entry point supplied to an embedder's worker spawner.
+/// Engine worker entry point supplied to an embedder's worker spawner.
 pub type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
 type WorkerSpawner = Box<dyn Fn(WorkerTask) -> std::io::Result<JoinHandle<()>> + Send + Sync>;
 
@@ -3205,6 +3208,7 @@ pub struct JitBackend {
     /// until a background tier-up is first requested — eager/sync use never spawns.
     worker: Mutex<Option<JoinHandle<()>>>,
     worker_spawner: WorkerSpawner,
+    maintenance: Mutex<Option<JoinHandle<()>>>,
     shutdown_report: ShutdownReport,
     worker_panicked: bool,
 }
@@ -3213,8 +3217,15 @@ pub struct JitBackend {
 /// and the background compiler worker (bg-tier). Diagnostic handles share only
 /// the separate queue coordination state, never these compiler resources.
 struct Shared {
+    owner: x86jit_core::codemap::ProcessIdentity,
     system_memory: bool,
     memory: Arc<memory_stats::CodeCounters>,
+    lifetime: Arc<x86jit_core::code_lifetime::CodeLifetime>,
+    maintenance_stop: AtomicBool,
+    collecting: AtomicBool,
+    retirement_announced: Mutex<std::collections::HashSet<u64>>,
+    lifecycle_observer: Mutex<Option<Observer<CodeLifecycleEvent>>>,
+    retired_metadata: Mutex<HashMap<u64, x86jit_core::codemap::RangeRemoval<'static>>>,
     /// The Cranelift module, built lazily on the first compile: its ISA
     /// bakes in `opt_level`, which may have to be derived from a tier-up policy the
     /// `Vm` reports after the backend is constructed. `None` until then.
@@ -3249,6 +3260,9 @@ struct Shared {
     icount: AtomicBool,
     flag_elision: AtomicBool,
     observer: Mutex<Option<CodeObserver>>,
+    // The existing publication observer promises backend-lifetime code ranges.
+    // Keep that contract until an embedder opts into a lifecycle observer API.
+    retain_observed_code: AtomicBool,
     failure_observer: Mutex<Option<FailureObserver>>,
     offsets: CpuOffsets,
     /// Superblock caps (§12 M5-T3), or `None` to compile one block at a time.
@@ -3292,6 +3306,24 @@ impl Drop for Shared {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         drop_observer_value(observer);
+        let observer = self
+            .lifecycle_observer
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop_observer_value(observer);
+        if self.owner == x86jit_core::codemap::ProcessIdentity::current()
+            && self.lifetime.live_units().is_empty()
+            && self.lifetime.retired_units().is_empty()
+        {
+            for inner in [&mut self.inner, &mut self.nondefault_inner] {
+                if let Some(jit) = inner.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+                    // SAFETY: all units and fault readers completed retirement;
+                    // no compiler owner remains. Also releases retained system storage.
+                    unsafe { jit.module.free_memory() };
+                }
+            }
+        }
     }
 }
 
@@ -3388,10 +3420,14 @@ struct Jit {
     return_address_bkey: bool,
     fbctx: FunctionBuilderContext,
     next_id: u64,
-    // Link slots for block chaining (§12 M5). Each `Box<AtomicU64>` holds a
+    reusable_functions: Vec<FuncId>,
+    pending_slots: HashMap<FuncId, Vec<Arc<AtomicU64>>>,
+    functions: HashMap<u64, FunctionRecord>,
+    // Slots for the current definition (§12 M5), transferred to pending_slots
+    // and then FunctionRecord. Each `Arc<AtomicU64>` holds a
     // compiled entry pointer (0 = unlinked); its heap address is baked into the
-    // code and filled by the dispatcher. Owned here so it lives as long as the Vm.
-    // The `Box` is load-bearing: a bare `Vec` would move its elements on growth,
+    // code and filled by the dispatcher. Retained through both grace periods.
+    // The `Arc` is load-bearing: a bare `Vec` would move its elements on growth,
     // invalidating the addresses already baked into compiled code.
     //
     // `AtomicU64` (not plain `u64`): the dispatcher fill and the SMC-driven clear
@@ -3399,11 +3435,28 @@ struct Jit {
     // from compiled code sees 0 or a valid entry, never a torn value. Compiled-code
     // loads are plain machine loads (aligned u64 is naturally atomic on the hosts
     // we target); only the Rust-side writes need the atomic type.
-    #[allow(clippy::vec_box)]
-    slots: Vec<Box<AtomicU64>>,
+    slots: Vec<Arc<AtomicU64>>,
+}
+
+struct FunctionRecord {
+    id: FuncId,
+    code: CompiledCode,
+    slots: Vec<Arc<AtomicU64>>,
 }
 
 impl JitBackend {
+    /// Poll execution and signal-reader grace without waiting for active users.
+    /// Remove completed units' fault metadata and compiler records, and recycle
+    /// their function declarations. Acquires the compiler locks. Inherited
+    /// backends return zero before touching parent locks. Returns the number of
+    /// collected units (at most 64 candidates per call). Dense providers reclaim executable extents when no legacy
+    /// code observer has been installed; the system provider retains them. Sealed
+    /// anonymous pages remain immutable: only an
+    /// entirely free anonymous reservation is released.
+    pub fn collect_retired_metadata(&self) -> usize {
+        self.shared.collect_retired_metadata()
+    }
+
     /// A JIT whose [`OptLevel`] follows the VM's tier-up policy: the
     /// `Vm` reports it through [`Backend::set_tiering`] and the Cranelift module is
     /// built lazily on the first compile, by which point the policy is known. Pass
@@ -3452,6 +3505,7 @@ impl JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> Result<CachedBlock, x86jit_core::CompileFailureReason> {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(ir, consistency, mmio, guest_base, 0, false)
@@ -3468,6 +3522,7 @@ impl JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> Result<CachedBlock, x86jit_core::CompileFailureReason> {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(region, consistency, mmio, guest_base, 0, false)
@@ -3587,13 +3642,19 @@ impl JitBackend {
     /// A background callback must not call [`TierUpHandle::wait_idle`] on the same
     /// backend: its own compilation is not yet done, so the call never returns.
     ///
-    /// Code ranges remain allocated for the backend's lifetime. Before code can be
-    /// released or reused, this API must gain a matching released event.
+    /// Code ranges remain allocated for the backend's lifetime. Installing this
+    /// legacy observer permanently pins this backend's executable storage, even
+    /// if an observer panic later disables notifications. Metadata collection and
+    /// declaration recycling still work. A lifecycle observer with release events
+    /// is required before observed executable storage can be reclaimed.
     pub fn set_compiled_code_observer(
         &self,
         observer: impl Fn(CompiledCode) + Send + Sync + 'static,
     ) {
         let observer: CodeObserver = Arc::new(observer);
+        self.shared
+            .retain_observed_code
+            .store(true, Ordering::Release);
         let previous = self.shared.observer.lock().unwrap().replace(observer);
         drop_observer_value(previous);
     }
@@ -3702,12 +3763,19 @@ impl JitBackend {
     fn build(caps: Option<RegionCaps>, target: HostTarget, opt: Option<OptLevel>) -> Self {
         Self {
             shared: Arc::new(Shared {
+                owner: x86jit_core::codemap::ProcessIdentity::current(),
                 system_memory: false,
                 inner: Mutex::new(None),
                 nondefault_inner: Mutex::new(None),
                 lock_telemetry: Telemetry::default(),
                 compile_serial: Mutex::new(()),
                 memory: Arc::default(),
+                lifetime: Arc::new(x86jit_core::code_lifetime::CodeLifetime::managed()),
+                retired_metadata: Mutex::new(HashMap::new()),
+                maintenance_stop: AtomicBool::new(false),
+                collecting: AtomicBool::new(false),
+                retirement_announced: Mutex::default(),
+                lifecycle_observer: Mutex::new(None),
                 compile_attempts: AtomicU64::new(0),
                 target,
                 opt,
@@ -3715,6 +3783,7 @@ impl JitBackend {
                 icount: AtomicBool::new(false),
                 flag_elision: AtomicBool::new(true),
                 observer: Mutex::new(None),
+                retain_observed_code: AtomicBool::new(false),
                 failure_observer: Mutex::new(None),
                 helper_counters: (0..MAX_HELPERS)
                     .map(|_| AtomicU64::new(0))
@@ -3749,6 +3818,7 @@ impl JitBackend {
                 fail_worker_spawn: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
+            maintenance: Mutex::new(None),
             worker_spawner: Box::new(|task| {
                 std::thread::Builder::new()
                     .name("x86jit-tier".into())
@@ -3854,6 +3924,9 @@ impl JitBackend {
             return_address_bkey,
             fbctx: FunctionBuilderContext::new(),
             next_id: 0,
+            reusable_functions: Vec::new(),
+            pending_slots: HashMap::new(),
+            functions: HashMap::new(),
             slots: Vec::new(),
         }
     }
@@ -3865,6 +3938,7 @@ impl JitBackend {
         req: TierUpRequest,
         fetch_permit: Option<x86jit_core::FetchPermit>,
     ) -> TierUpSubmit {
+        self.ensure_maintenance();
         if let Err(error) = check_compile_allowed() {
             self.shared
                 .observe_failure(CompileFailure::for_request(&req, error));
@@ -3930,11 +4004,12 @@ impl JitBackend {
         }
     }
 
-    /// Install a worker spawner before the first background submission. The
+    /// Install a policy for compiler, maintenance and deferred-reclamation threads
+    /// before the first compilation or background submission. The
     /// spawner must return the join handle of the thread executing `task`, or
     /// return an error without starting it. Never detach or retain `task`.
     /// Wrap `task` to configure the worker's signal mask, affinity, priority,
-    /// name or thread registration before it enters the compiler. No library
+    /// name or thread registration before it runs engine work or callbacks. No library
     /// signal policy is installed. Spawn errors decline background tier-up and
     /// enter the existing code-space-exhausted interpreter fallback.
     pub fn set_worker_spawner(
@@ -3946,6 +4021,12 @@ impl JitBackend {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .is_none());
+        assert!(self
+            .maintenance
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        assert_eq!(self.shared.compile_attempts.load(Ordering::Relaxed), 0);
         self.worker_spawner = Box::new(spawner);
     }
 
@@ -3990,12 +4071,26 @@ impl JitBackend {
             q.outstanding = 0;
         }
         self.shared.background.idle_cv.notify_all();
-        self.shared
-            .done
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut done = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+        for completion in done.iter() {
+            self.shared.lifetime.discard(&completion.block);
+        }
+        done.clear();
+        drop(done);
         self.shared.ready.store(0, Ordering::Release);
+        self.shared.maintenance_stop.store(true, Ordering::Release);
+        self.shared.lifetime.wake_maintenance();
+        if let Some(worker) = self
+            .maintenance
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            if let Err(payload) = worker.join() {
+                self.worker_panicked = true;
+                drop_observer_value(payload);
+            }
+        }
         self.shutdown_report.outstanding_handles = Arc::strong_count(&self.shared) - 1;
         if self.shutdown_report.outstanding_handles != 0 {
             Err(ShutdownError::LiveResources {
@@ -4265,7 +4360,8 @@ impl Shared {
             LockKind::CompileSerial,
             "JIT compilation",
         );
-        let mut jit = self.jit(mxcsr_mode);
+        let mut module_guard = self.jit(mxcsr_mode);
+        let mut jit = reclamation::Definition::new(&mut module_guard);
         // Serialized with every foreground/background compile. After an error the
         // module may contain unfinalized definitions; never retry or publish those.
         if self.code_space_exhausted.load(Ordering::Acquire) {
@@ -4382,8 +4478,9 @@ impl Shared {
             let frontend_config = jit.module.isa().frontend_config();
             let Jit { fbctx, slots, .. } = &mut *jit;
             let mut alloc_slot = || {
-                let b = Box::new(AtomicU64::new(0));
-                let addr = &*b as *const AtomicU64 as u64;
+                let b = Arc::new(AtomicU64::new(0));
+                let addr = Arc::as_ptr(&b) as u64;
+                self.lifetime.register_slot(&b);
                 slots.push(b);
                 addr
             };
@@ -4539,10 +4636,14 @@ impl Shared {
                 return Err(error);
             }
         };
-        let id = jit
-            .module
-            .declare_function(&name, Linkage::Export, &ctx.func.signature)
-            .expect("declare function");
+        let id = match jit.reusable_functions.pop() {
+            Some(id) => id,
+            None => jit
+                .module
+                .declare_function(&name, Linkage::Export, &ctx.func.signature)
+                .expect("declare function"),
+        };
+        jit.id = Some(id);
         #[cfg(test)]
         if self.fail_compile_stage.load(Ordering::Relaxed) == 1 {
             self.compile_result(Err(ModuleError::Allocation {
@@ -4552,6 +4653,8 @@ impl Shared {
         }
         self.compile_result(jit.module.define_function(id, &mut ctx))
             .ok_or(CompileError::Unavailable)?;
+        let slots = jit.slots.split_off(slots_start);
+        assert!(jit.pending_slots.insert(id, slots).is_none());
         let cc = ctx.compiled_code().expect("compiled code present");
         jit.allocations.define(cc.code_info().total_size as usize);
         // Capture the code size + sorted `(host_off, rip_index)` srcloc table before
@@ -4612,7 +4715,9 @@ impl Shared {
                 kind,
             },
         )?;
+        jit.keep = true;
         drop(jit);
+        drop(module_guard);
         drop(_serial);
         if let Some(code) = observed {
             self.observe(code);
@@ -4653,9 +4758,43 @@ impl Shared {
 
     fn finalize_one(&self, jit: &mut Jit, code: PendingCode) -> Publication<CompiledPtr> {
         self.finalize_module(jit)?;
-        let entry = CompiledPtr(jit.module.get_finalized_function(code.id));
+        let entry = Self::finalized_entry(jit, &code);
         self.publish(entry, code)
             .map(|(entry, observed)| (entry, Some(observed)))
+    }
+
+    fn finalized_entry(jit: &mut Jit, code: &PendingCode) -> CompiledPtr {
+        let address = jit.module.get_finalized_function(code.id);
+        let unit = match jit.module.get_finalized_function_generation(code.id) {
+            Some(generation) => x86jit_core::code_lifetime::CodeUnit {
+                generation,
+                host_start: address as usize,
+                host_len: code.code_len,
+            },
+            // The system provider retains code and has no per-extent identity.
+            None => x86jit_core::code_lifetime::CodeUnit::new(address as usize, code.code_len),
+        };
+        let slots = jit
+            .pending_slots
+            .remove(&code.id)
+            .expect("defined function slots");
+        assert!(jit
+            .functions
+            .insert(
+                unit.generation,
+                FunctionRecord {
+                    id: code.id,
+                    code: CompiledCode {
+                        host_start: address as usize,
+                        host_len: code.code_len,
+                        guest_rip: code.guest_rip,
+                        kind: code.kind,
+                    },
+                    slots,
+                }
+            )
+            .is_none());
+        unit.entry()
     }
 
     // Caller has finalized this definition. Register metadata before exposing its entry.
@@ -4700,6 +4839,19 @@ impl Shared {
         {
             return self.exhaust_code_space().ok_or(CompileError::Unavailable);
         }
+        let entry = if entry.generation() == 0 {
+            self.lifetime.register(entry, code_len).entry()
+        } else {
+            let unit = x86jit_core::code_lifetime::CodeUnit {
+                generation: entry.generation(),
+                host_start: entry.0 as usize,
+                host_len: code_len,
+            };
+            // SAFETY: finalized_entry obtained this fresh provider-owned identity;
+            // each PendingCode is consumed exactly once, after registration.
+            unsafe { self.lifetime.register_unit(unit) };
+            entry
+        };
         Ok((
             entry,
             CompiledCode {
@@ -4712,6 +4864,16 @@ impl Shared {
     }
 
     fn observe(&self, code: CompiledCode) {
+        if let Some(unit) = self.lifetime.unit_at(code.host_start) {
+            Self::notify_observer(
+                &self.lifecycle_observer,
+                CodeLifecycleEvent {
+                    unit,
+                    code,
+                    kind: CodeLifecycleKind::Publish,
+                },
+            );
+        }
         Self::notify_observer(&self.observer, code);
     }
 
@@ -4928,9 +5090,10 @@ impl Shared {
                             if finalized.is_ok()
                                 && !self.code_space_exhausted.load(Ordering::Acquire)
                             {
-                                let entry =
-                                    CompiledPtr(jit.module.get_finalized_function(pending.id));
+                                let entry = Self::finalized_entry(&mut jit, &pending);
                                 finalized_entries.push((index, entry, pending));
+                            } else {
+                                reclamation::discard_definition(&mut jit, pending.id);
                             }
                         }
                     }
@@ -4949,8 +5112,13 @@ impl Shared {
                             batch[index].2 = CachedBlock::Compiled { entry };
                             self.observe(event);
                         }
-                        Err(error) => batch[index].1 = Err(error),
+                        Err(error) => {
+                            batch[index].1 = Err(error);
+                            self.discard_unpublished_entry(entry);
+                        }
                     }
+                } else {
+                    self.discard_unpublished_entry(entry);
                 }
             }
             self.compile_ns
@@ -5079,6 +5247,12 @@ impl Backend for JitBackend {
 
     fn memory_stats(&self) -> x86jit_core::BackendMemoryStats {
         let mut stats = self.shared.memory.snapshot();
+        let (live, retired, live_units, retired_units) = self.shared.lifetime.unit_stats();
+        stats.code_bytes_live = live;
+        stats.code_bytes_retired = retired;
+        stats.code_units_live = live_units;
+        stats.code_units_retired = retired_units;
+        stats.code_ibtc_descriptors = self.shared.lifetime.ibtc_descriptor_count() as u64;
         let queue = self
             .shared
             .background
@@ -5091,7 +5265,21 @@ impl Backend for JitBackend {
     }
 
     fn shutdown(&mut self) -> Result<ShutdownReport, ShutdownError> {
-        self.stop_worker()
+        let report = self.stop_worker();
+        // SAFETY: submissions stopped and the compiler joined. Closing the
+        // lifetime domain rejects subsequent cache resolution/publication;
+        // direct ABI callers must stop using this backend before shutdown.
+        unsafe { self.shared.lifetime.retire_all() };
+        while self.shared.collect_retired_metadata() != 0 {}
+        if self.shared.lifetime.has_pending_reclamation() {
+            let mut counts = report.as_ref().copied().unwrap_or(self.shutdown_report);
+            counts.outstanding_handles += 1;
+            return Err(ShutdownError::LiveResources {
+                resource: "code reclamation",
+                report: counts,
+            });
+        }
+        report
     }
     fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
         let mut words = self.shared.dispatch_words.lock().unwrap();
@@ -5125,6 +5313,7 @@ impl Backend for JitBackend {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(ir, consistency, mmio, guest_base, mxcsr_mode, false)
@@ -5141,6 +5330,7 @@ impl Backend for JitBackend {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(region, consistency, mmio, guest_base, mxcsr_mode, false)
@@ -5159,6 +5349,7 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile(
@@ -5184,6 +5375,7 @@ impl Backend for JitBackend {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        self.ensure_maintenance();
         let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
         self.shared
             .compile_region(
@@ -5230,8 +5422,21 @@ impl Backend for JitBackend {
                 for slot in &jit.slots {
                     slot.store(0, Ordering::Relaxed);
                 }
+                for slots in jit
+                    .pending_slots
+                    .values()
+                    .chain(jit.functions.values().map(|f| &f.slots))
+                {
+                    for slot in slots {
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                }
             }
         }
+    }
+
+    fn code_lifetime(&self) -> Option<Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+        Some(self.shared.lifetime.clone())
     }
 
     fn tier_up_async(&self, req: TierUpRequest) -> TierUpSubmit {
@@ -5291,6 +5496,11 @@ impl Backend for JitBackend {
 impl Drop for JitBackend {
     fn drop(&mut self) {
         let _ = self.stop_worker();
+        // SAFETY: closing the domain excludes future compiled cache resolution
+        // and publication; submissions stopped and the worker joined. ABI callers must keep
+        // the backend alive through calls, chains and cold fault decoding.
+        unsafe { self.shared.lifetime.retire_all() };
+        self.defer_reclamation();
     }
 }
 
@@ -5565,6 +5775,12 @@ mod tests {
     }
 
     impl Backend for PausedStoreBackend {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &IrBlock,
@@ -6185,6 +6401,12 @@ mod tests {
             armed: Arc<AtomicBool>,
         }
         impl Backend for ExhaustOnCaps {
+            fn code_lifetime(
+                &self,
+            ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+                self.jit.code_lifetime()
+            }
+
             fn code_space_exhausted(&self) -> bool {
                 self.jit.code_space_exhausted()
             }
@@ -6667,6 +6889,121 @@ mod tests {
         shutdown.join().unwrap();
         assert!(weak.upgrade().is_none());
         handle.wait_idle();
+    }
+
+    #[test]
+    fn vm_shutdown_drains_multiple_teardown_batches_before_success() {
+        let mut jit = JitBackend::new();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_starts = starts.clone();
+        let worker_active = active.clone();
+        jit.set_worker_spawner(move |task| {
+            worker_starts.fetch_add(1, Ordering::SeqCst);
+            let active = worker_active.clone();
+            std::thread::Builder::new().spawn(move || {
+                active.fetch_add(1, Ordering::SeqCst);
+                task();
+                active.fetch_sub(1, Ordering::SeqCst);
+            })
+        });
+        let released = Arc::new(AtomicUsize::new(0));
+        let releases = released.clone();
+        jit.set_code_lifecycle_observer(move |event| {
+            if event.kind == CodeLifecycleKind::Release {
+                releases.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let mut vm =
+            x86jit_core::Vm::with_backend(x86jit_core::VmConfig::flat(0x4000), Box::new(jit));
+        vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0xf4]).unwrap();
+        let mut ir = lift_block(
+            &vm.mem,
+            x86jit_core::lift::FetchAddr::flat(0x1000),
+            CpuMode::Long64,
+        )
+        .unwrap();
+        for i in 0..130 {
+            ir.guest_start = 0x1000 + i;
+            let block = vm.backend.materialize(&ir, MemConsistency::Fast, None, 0);
+            assert!(matches!(block, CachedBlock::Compiled { .. }));
+            vm.cache.insert(
+                x86jit_core::BlockKey::new(ir.guest_start, CpuMode::Long64),
+                block,
+                vec![(ir.guest_start, 1)],
+                |_| {},
+            );
+        }
+        assert_eq!(vm.cache.code_lifetime().live_units().len(), 130);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert_eq!(vm.shutdown().unwrap().outstanding_handles, 0);
+        assert_eq!(released.load(Ordering::SeqCst), 130);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "teardown must not start a deferred thread after success"
+        );
+    }
+
+    #[test]
+    fn worker_policy_covers_maintenance_and_deferred_reclamation() {
+        use std::cell::Cell;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        thread_local! { static REGISTERED: Cell<bool> = const { Cell::new(false) }; }
+        let owner = std::thread::current().id();
+        let mut jit = JitBackend::new();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let worker_starts = starts.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        jit.set_worker_spawner(move |task| {
+            worker_starts.fetch_add(1, Ordering::SeqCst);
+            let done = done_tx.clone();
+            std::thread::Builder::new().spawn(move || {
+                REGISTERED.set(true);
+                task();
+                done.send(()).unwrap();
+            })
+        });
+        let (release_tx, release_rx) = mpsc::channel();
+        jit.set_code_lifecycle_observer(move |event| {
+            if std::thread::current().id() != owner {
+                assert!(REGISTERED.get(), "engine thread bypassed registration");
+            }
+            if event.kind == CodeLifecycleKind::Release {
+                release_tx.send(()).unwrap();
+            }
+        });
+        let mem = mem_with_code();
+        let TierUpUnit::Block(ir) = request(&mem).unit else {
+            unreachable!()
+        };
+        assert!(matches!(
+            jit.materialize(&ir, MemConsistency::Fast, None, 0),
+            CachedBlock::Compiled { .. }
+        ));
+        let domain = jit.shared.lifetime.clone();
+        let mut participant = domain.participant();
+        let held = participant.enter();
+        // Explicit shutdown must report pending grace instead of certifying a
+        // fork boundary that would require a deferred worker after destruction.
+        assert!(matches!(
+            jit.shutdown(),
+            Err(ShutdownError::LiveResources {
+                resource: "code reclamation",
+                ..
+            })
+        ));
+        drop(jit);
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert!(release_rx.try_recv().is_err());
+        drop(held);
+        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
     }
 
     #[test]

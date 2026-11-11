@@ -47,14 +47,30 @@ impl BlockKey {
     }
 }
 
-/// A raw pointer into the JIT code arena.
+/// A compiled entry address and its allocation generation.
 ///
 /// Manually `Send + Sync`: compiled code is read-only and executable from any
-/// thread; its lifetime is owned by the JIT arena, which lives as long as the
-/// `Vm` (§9.1). Declaring this in M4 (not M7) avoids reworking signatures once
-/// threads arrive — the M7 trap.
+/// thread. This identity does not own storage (§9.1). Execution must be protected
+/// by the backend's code-lifetime domain before pointer resolution
+/// through the final call and cold fault handling.
 #[derive(Copy, Clone)]
-pub struct CompiledPtr(pub *const u8);
+pub struct CompiledPtr(pub *const u8, u64);
+
+impl CompiledPtr {
+    /// An entry owned by a backend which retains code indefinitely. Reclaiming
+    /// backends must instead return the entry from `CodeLifetime::register`'s unit.
+    pub const fn new(address: *const u8) -> Self {
+        Self(address, 0)
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.1
+    }
+
+    pub(crate) const fn with_generation(address: *const u8, generation: u64) -> Self {
+        Self(address, generation)
+    }
+}
 
 // SAFETY: see the type-level comment.
 unsafe impl Send for CompiledPtr {}
@@ -663,21 +679,14 @@ pub struct TranslationCache {
     // (fast-resolve array, return ring) snapshots this in the dispatcher outer loop
     // and flushes when it changes — the coherence channel for state that cannot be
     // reached by the backend's `invalidate_links` (esp. cross-thread invalidation).
-    epoch: AtomicU64,
+    lifetime: RwLock<Arc<crate::code_lifetime::CodeLifetime>>,
+    previous_lifetimes: Mutex<Vec<Arc<crate::code_lifetime::CodeLifetime>>>,
     // Every invalidation cancels source reads still in flight, even if no cached
     // span overlaps. Keep this separate so data writes preserve dispatch predictors.
     publication_generation: AtomicU64,
     // Policy/configuration changes also advance the dispatch epoch without
     // victims; source publication is always canceled independently.
     pub(crate) invalidate_pending_fetches: bool,
-    // IBTC descriptors (R4): immutable `[target, entry]` pairs published by pointer
-    // into a per-site slot. Owned here (the dispatcher, in the core crate, allocates
-    // them on a miss) and never freed before `Vm` drop, so a torn/late read of a
-    // slot pointer can never dangle. The `Box` keeps each descriptor's address
-    // stable across pushes. Only appended to; growth on a megamorphic site is capped
-    // by the dispatcher, not here.
-    #[allow(clippy::vec_box)]
-    ibtc_descriptors: Mutex<Vec<Box<[u64; 2]>>>,
     // IBTC "fires" counter: descriptors published (§12 M5-style stat).
     ibtc_filled: AtomicU64,
     // Per-block execution counts for hotness-gated tier-up (FD tiering): a block
@@ -712,6 +721,20 @@ impl TranslationCache {
     }
 
     fn account_replace(
+        &self,
+        old: Option<&CachedBlock>,
+        old_spans: usize,
+        new: Option<&CachedBlock>,
+        new_spans: usize,
+    ) -> bool {
+        if !self.code_lifetime().replace(old, new) {
+            return false;
+        }
+        self.account_memory_replace(old, old_spans, new, new_spans);
+        true
+    }
+
+    fn account_memory_replace(
         &self,
         old: Option<&CachedBlock>,
         old_spans: usize,
@@ -806,10 +829,10 @@ impl TranslationCache {
             misses: AtomicU64::new(0),
             chained: AtomicU64::new(0),
             regions: AtomicU64::new(0),
-            epoch: AtomicU64::new(0),
+            lifetime: RwLock::default(),
+            previous_lifetimes: Mutex::default(),
             publication_generation: AtomicU64::new(0),
             invalidate_pending_fetches: false,
-            ibtc_descriptors: Mutex::new(Vec::new()),
             ibtc_filled: AtomicU64::new(0),
             hotness: RwLock::new(HashMap::new()),
             region_decision: RwLock::new(HashMap::new()),
@@ -855,7 +878,8 @@ impl TranslationCache {
     /// its span and dropping its hotness counter. `since_generation` must be read
     /// from [`Self::publication_generation`] before fetching source bytes or IR.
     /// Returns `false` without changes if an invalidation has intervened; the
-    /// caller must re-lift rather than resurrect a stale translation.
+    /// caller must re-lift rather than resurrect a stale translation. Tracked
+    /// entries must also name a live generation in this cache's lifetime domain.
     #[must_use]
     pub fn upgrade(
         &self,
@@ -870,14 +894,17 @@ impl TranslationCache {
         let mut spans = self.spans.write().unwrap();
         let mut map = self.map.write().unwrap();
         if self.publication_generation.load(Ordering::Acquire) != since_generation {
+            self.code_lifetime().discard(&block);
             return false;
         }
-        self.account_replace(
+        if !self.account_replace(
             map.get(&key),
             spans.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             1,
-        );
+        ) {
+            return false;
+        }
         spans.insert(key, vec![span]);
         self.coverage_bytes
             .store(spans.coverage_bytes(), Ordering::Relaxed);
@@ -902,15 +929,18 @@ impl TranslationCache {
         let mut sp = self.spans.write().unwrap();
         let mut mp = self.map.write().unwrap();
         if self.publication_generation.load(Ordering::Acquire) != since_generation {
+            self.code_lifetime().discard(&block);
             return false;
         }
         on_mark(&spans);
-        self.account_replace(
+        if !self.account_replace(
             mp.get(&key),
             sp.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             spans.len(),
-        );
+        ) {
+            return false;
+        }
         mp.insert(key, block);
         sp.insert(key, spans);
         self.coverage_bytes
@@ -921,17 +951,16 @@ impl TranslationCache {
 
     /// Allocate an immutable IBTC descriptor `{target, entry}` (R4) and return its
     /// stable heap address for the compiled code to load. The descriptor is never
-    /// mutated (a new target gets a new descriptor) and never freed before `Vm`
-    /// drop. The pointer publication into the slot must be a **`Release`** store (see
+    /// mutated (a new target gets a new descriptor). Execution grace after slot
+    /// clearing protects every reader before reclamation. The pointer publication
+    /// into the slot must be a **`Release`** store (see
     /// the `RET_IBTC_MISS` site in `vm.rs`): the two field writes above happen-before
     /// the pointer becomes visible, pairing with the reader's address dependency
     /// (release/consume). A `Relaxed` publish would let a weakly-ordered host expose
     /// the pointer before the `{target, entry}` fields — a torn payload, not just a
     /// torn scalar.
     pub fn alloc_ibtc_descriptor(&self, target: u64, entry: CompiledPtr) -> u64 {
-        let b = Box::new([target, entry.0 as u64]);
-        let addr = &*b as *const [u64; 2] as u64;
-        self.ibtc_descriptors.lock().unwrap().push(b);
+        let addr = self.code_lifetime().alloc_ibtc_descriptor(target, entry);
         self.ibtc_filled.fetch_add(1, Ordering::Relaxed);
         addr
     }
@@ -957,18 +986,105 @@ impl TranslationCache {
     /// takes, in the same order (spans → map), so the two serialize. That is the shape
     /// [`upgrade`](Self::upgrade) already uses for the same reason.
     ///
-    /// Cost is one uncontended write-lock pair per SLOT FILL, not per transfer: a direct
+    /// The lifetime registry serializes the store with retirement in other caches
+    /// sharing this backend. The closure must not reenter the engine.
+    ///
+    /// Cost is a write-lock pair and registry mutex per slot fill: a direct
     /// edge fills once and is then followed with no dispatcher involvement at all, and
     /// IBTC refills stop at `IBTC_MEGAMORPHIC_CAP`.
     #[must_use]
     pub fn publish_if_current(&self, since_epoch: u64, publish: impl FnOnce()) -> bool {
         let _spans = self.spans.write().unwrap();
         let _map = self.map.write().unwrap();
-        if self.epoch.load(Ordering::Acquire) != since_epoch {
+        self.code_lifetime()
+            .publish_if_current(since_epoch, publish)
+    }
+
+    /// Validate the target generation under the retirement lock before exposing
+    /// any link or descriptor. A current epoch alone cannot validate a private
+    /// prediction obtained before that epoch.
+    #[must_use]
+    pub fn publish_entry_if_current(
+        &self,
+        since_epoch: u64,
+        entry: CompiledPtr,
+        publish: impl FnOnce(),
+    ) -> bool {
+        let _spans = self.spans.write().unwrap();
+        let _map = self.map.write().unwrap();
+        self.code_lifetime()
+            .publish_entry_if_current(since_epoch, entry, publish)
+    }
+
+    /// Execution and predictor lifetime shared with the compiling backend.
+    pub fn code_lifetime(&self) -> Arc<crate::code_lifetime::CodeLifetime> {
+        self.lifetime.read().unwrap().clone()
+    }
+
+    /// Rebind a closed cache at run entry, serialized with source publication.
+    pub(crate) fn reconcile_code_lifetime(
+        &self,
+        next: Arc<crate::code_lifetime::CodeLifetime>,
+        clear_page: impl Fn(u64),
+    ) -> bool {
+        let mut spans = self.spans.write().unwrap();
+        let mut map = self.map.write().unwrap();
+        let mut lifetime = self.lifetime.write().unwrap();
+        if lifetime.is_open() || !next.is_open() || Arc::ptr_eq(&lifetime, &next) {
             return false;
         }
-        publish();
+        lifetime.remove_publications(map.values());
+        for (key, block) in map.iter() {
+            self.account_memory_replace(
+                Some(block),
+                spans.cached.units.get(key).map_or(0, Vec::len),
+                None,
+                0,
+            );
+        }
+        map.clear();
+        for page in spans
+            .cached
+            .pages
+            .keys()
+            .chain(spans.pending_sources.pages.keys())
+        {
+            clear_page(*page);
+        }
+        let next_request = spans.next_request;
+        *spans = SpanIndex {
+            next_request,
+            ..Default::default()
+        };
+        self.coverage_bytes.store(0, Ordering::Relaxed);
+        self.hotness.write().unwrap().clear();
+        self.region_decision.write().unwrap().clear();
+        self.publication_generation.fetch_add(1, Ordering::Release);
+        // Closed domains can still own deferred teardown workers. Keep them
+        // reachable so VM shutdown joins every replaced backend's workers.
+        self.previous_lifetimes
+            .lock()
+            .unwrap()
+            .push(std::mem::replace(&mut lifetime, next));
         true
+    }
+
+    pub(crate) fn join_reclamation_workers(&self) -> Result<(), crate::ShutdownError> {
+        let mut result = self.code_lifetime().join_reclamation_workers();
+        for lifetime in self.previous_lifetimes.lock().unwrap().iter() {
+            if let Err(error) = lifetime.join_reclamation_workers() {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    pub(crate) fn with_code_lifetime(
+        lifetime: Option<Arc<crate::code_lifetime::CodeLifetime>>,
+    ) -> Self {
+        let mut cache = Self::new();
+        *cache.lifetime.get_mut().unwrap() = lifetime.unwrap_or_default();
+        cache
     }
 
     /// Current invalidation epoch (R1). Monotonic; bumped whenever
@@ -976,7 +1092,7 @@ impl TranslationCache {
     /// fetch under an installed fetch policy. A vcpu snapshots this and flushes its
     /// local predictor caches when the value changes.
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.code_lifetime().epoch()
     }
 
     /// Source-publication generation. Snapshot before fetching source bytes or
@@ -1002,7 +1118,14 @@ impl TranslationCache {
     // Keep lookup temporaries out of the compiled chaining loop's register set.
     #[inline(never)]
     pub(crate) fn get_for_dispatch(&self, key: BlockKey) -> Option<CachedBlock> {
-        self.map.read().unwrap().get(&key).cloned()
+        self.map
+            .read()
+            .unwrap()
+            .get(&key)
+            .filter(|block| {
+                !matches!(block, CachedBlock::Compiled { .. }) || self.code_lifetime().is_open()
+            })
+            .cloned()
     }
 
     pub(crate) fn add_dispatch_counts(&self, hits: u64, misses: u64) {
@@ -1203,6 +1326,7 @@ impl TranslationCache {
         if spans.pending.get(&key).is_none_or(|p| p.id != request_id) {
             self.record_tier_bg_rejected();
             self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
+            self.code_lifetime().discard(&block);
             return false;
         }
         let pending = spans.pending.remove(&key).unwrap();
@@ -1217,12 +1341,14 @@ impl TranslationCache {
             || (source_spans.is_none() && pending.generation != self.publication_generation())
         {
             self.record_tier_bg_rejected_generation();
+            self.code_lifetime().discard(&block);
             return false;
         }
         let mut map = self.map.write().unwrap();
         if !matches!(map.get(&key), Some(CachedBlock::Interpreted(_))) {
             self.record_tier_bg_rejected();
             self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
+            self.code_lifetime().discard(&block);
             return false;
         }
         let source_spans = source_spans.expect("submitted tier-up has source spans");
@@ -1254,15 +1380,19 @@ impl TranslationCache {
                 self.tier_bg_interpreter_only
                     .fetch_add(1, Ordering::Relaxed);
             }
+            self.code_lifetime().discard(&block);
             return false;
         }
         on_mark(&source_spans);
-        self.account_replace(
+        if !self.account_replace(
             map.get(&key),
             spans.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             source_spans.len(),
-        );
+        ) {
+            self.record_tier_bg_rejected();
+            return false;
+        }
         map.insert(key, block);
         spans.insert(key, source_spans);
         self.coverage_bytes
@@ -1353,14 +1483,17 @@ impl TranslationCache {
         let mut sp = self.spans.write().unwrap();
         let mut mp = self.map.write().unwrap();
         if !on_mark(&spans) {
+            self.code_lifetime().discard(&block);
             return false;
         }
-        self.account_replace(
+        if !self.account_replace(
             mp.get(&key),
             sp.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             spans.len(),
-        );
+        ) {
+            return false;
+        }
         mp.insert(key, block);
         sp.insert(key, spans);
         self.coverage_bytes
@@ -1439,7 +1572,7 @@ impl TranslationCache {
                 on_write(!on_page && !pending_on_page);
                 self.publication_generation.fetch_add(1, Ordering::Release);
                 if CHILD || self.invalidate_pending_fetches {
-                    self.epoch.fetch_add(1, Ordering::Release);
+                    self.code_lifetime().flush_predictions();
                 }
                 return Vec::new();
             }
@@ -1452,8 +1585,10 @@ impl TranslationCache {
             self.invalidation_blocks_dropped
                 .fetch_add(victims.len() as u64, Ordering::Relaxed);
             let mut hotness = self.hotness.write().unwrap();
+            self.code_lifetime()
+                .remove_publications(victims.iter().filter_map(|key| map.get(key)));
             for entry in &victims {
-                self.account_replace(
+                self.account_memory_replace(
                     map.get(entry),
                     spans.cached.units.get(entry).map_or(0, Vec::len),
                     None,
@@ -1484,9 +1619,20 @@ impl TranslationCache {
         // publication even when all currently cached spans survive this write.
         self.publication_generation.fetch_add(1, Ordering::Release);
         if CHILD || !victims.is_empty() || self.invalidate_pending_fetches {
-            self.epoch.fetch_add(1, Ordering::Release);
+            self.code_lifetime().flush_predictions();
         }
         victims
+    }
+}
+
+impl Drop for TranslationCache {
+    fn drop(&mut self) {
+        self.code_lifetime().remove_publications(
+            self.map
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .values(),
+        );
     }
 }
 
@@ -1502,7 +1648,7 @@ mod tests {
 
     fn compiled() -> CachedBlock {
         CachedBlock::Compiled {
-            entry: CompiledPtr(std::ptr::null()),
+            entry: CompiledPtr::new(std::ptr::null()),
         }
     }
 

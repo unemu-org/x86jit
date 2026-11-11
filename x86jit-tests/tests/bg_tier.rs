@@ -289,6 +289,14 @@ fn smc_while_pending_rejects_then_reheats() {
     assert_eq!(one_pass(&vm, &mut cpu), 7); // handle_smc → reject stale → re-lift v2
     assert_eq!(vm.cache.tier_bg_rejected(), 1, "stale compile rejected");
     assert_eq!(vm.cache.tier_bg_published(), 0);
+    let lifetime = vm.cache.code_lifetime();
+    let retired = lifetime.retired_units();
+    assert_eq!(
+        retired.len(),
+        1,
+        "the rejected completion transfers ownership"
+    );
+    assert!(lifetime.execution_complete(retired[0]));
 
     // New block re-tiers and publishes.
     heat_to_submit(&vm, &mut cpu, 7);
@@ -617,7 +625,7 @@ fn shutdown_fork_boundary(jit_enabled: bool) {
     }
     assert_eq!(
         process_thread_count(),
-        baseline + 2 + usize::from(jit_enabled)
+        baseline + 2 + 2 * usize::from(jit_enabled)
     );
     request.request_exit();
     let (exit, mut spinning) = done_rx.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
@@ -919,6 +927,12 @@ fn victim_free_drain_rejects_background_region_with_uncached_successor() {
         submitted: Arc<std::sync::atomic::AtomicBool>,
     }
     impl Backend for ObservedRegionBackend {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &x86jit_core::IrBlock,
@@ -1099,6 +1113,12 @@ fn oversized_background_unit(region: bool) {
         region: bool,
     }
     impl Backend for OversizedBackend {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.jit.code_lifetime()
+        }
+
         fn materialize(
             &self,
             ir: &IrBlock,
