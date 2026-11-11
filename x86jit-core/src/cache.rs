@@ -1,6 +1,11 @@
 //! Translation cache keyed by [`BlockKey`] — guest address, decode mode and SIMD FP mode (§9.1, §17.4).
 
 use std::collections::{HashMap, HashSet};
+#[path = "cache_hash.rs"]
+pub(crate) mod cache_hash;
+#[path = "cache_shards.rs"]
+mod cache_shards;
+use cache_shards::DispatchMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -658,7 +663,7 @@ pub struct TranslationCache {
 
     // §17.4: keyed by BlockKey { guest_addr, mode } — the same bytes lift differently
     // per decode mode, so translations never alias across modes.
-    map: RwLock<HashMap<BlockKey, CachedBlock>>,
+    map: DispatchMap,
     // Guest byte spans of each cached unit, keyed by its `BlockKey`. A single
     // block has one `(start, len)`; a superblock (M5-T3) has one per sub-block,
     // possibly non-contiguous. A write overlapping ANY span drops the whole unit
@@ -712,8 +717,8 @@ impl TranslationCache {
     #[cfg(test)]
     pub(crate) fn poison_for_child_test(&self) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _map = self.map.write().unwrap();
             let _spans = self.spans.write().unwrap();
+            let _map = self.map.write();
             panic!("poison parent translation cache");
         }));
         assert!(result.is_err());
@@ -823,7 +828,7 @@ impl TranslationCache {
             tier_bg_interpreter_only_skipped: AtomicU64::new(0),
             tier_bg_superseded: AtomicU64::new(0),
 
-            map: RwLock::new(HashMap::new()),
+            map: DispatchMap::new(),
             spans: RwLock::new(SpanIndex::default()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -888,11 +893,11 @@ impl TranslationCache {
         span: (u64, u32),
         since_generation: u64,
     ) -> bool {
-        // Lock order matches `invalidate_overlapping` (spans → map → hotness) so the
-        // two can't deadlock. The spans lock keeps the generation check and
+        // Lock order matches `invalidate_overlapping` (spans → publication →
+        // shards → lifetime registry). The spans lock keeps the generation check and
         // publication atomic with respect to invalidation.
         let mut spans = self.spans.write().unwrap();
-        let mut map = self.map.write().unwrap();
+        let mut map = self.map.write();
         if self.publication_generation.load(Ordering::Acquire) != since_generation {
             self.code_lifetime().discard(&block);
             return false;
@@ -927,7 +932,7 @@ impl TranslationCache {
         on_mark: impl FnOnce(&[(u64, u32)]),
     ) -> bool {
         let mut sp = self.spans.write().unwrap();
-        let mut mp = self.map.write().unwrap();
+        let mut mp = self.map.write();
         if self.publication_generation.load(Ordering::Acquire) != since_generation {
             self.code_lifetime().discard(&block);
             return false;
@@ -983,8 +988,10 @@ impl TranslationCache {
     ///
     /// Checking the epoch before the store would not be enough — the invalidation could
     /// land in between. The publish happens while HOLDING the locks `invalidate_overlapping`
-    /// takes, in the same order (spans → map), so the two serialize. That is the shape
-    /// [`upgrade`](Self::upgrade) already uses for the same reason.
+    /// takes, in the same order (spans → publication), so the two serialize.
+    /// Map mutations then acquire the shards in index order; slot-only publication
+    /// never acquires shard locks. Readers acquire just one shard and never the gate.
+    /// [`upgrade`](Self::upgrade) uses the same order for map mutations.
     ///
     /// The lifetime registry serializes the store with retirement in other caches
     /// sharing this backend. The closure must not reenter the engine.
@@ -995,7 +1002,7 @@ impl TranslationCache {
     #[must_use]
     pub fn publish_if_current(&self, since_epoch: u64, publish: impl FnOnce()) -> bool {
         let _spans = self.spans.write().unwrap();
-        let _map = self.map.write().unwrap();
+        let _publication = self.map.publication();
         self.code_lifetime()
             .publish_if_current(since_epoch, publish)
     }
@@ -1011,7 +1018,7 @@ impl TranslationCache {
         publish: impl FnOnce(),
     ) -> bool {
         let _spans = self.spans.write().unwrap();
-        let _map = self.map.write().unwrap();
+        let _publication = self.map.publication();
         self.code_lifetime()
             .publish_entry_if_current(since_epoch, entry, publish)
     }
@@ -1028,7 +1035,7 @@ impl TranslationCache {
         clear_page: impl Fn(u64),
     ) -> bool {
         let mut spans = self.spans.write().unwrap();
-        let mut map = self.map.write().unwrap();
+        let mut map = self.map.write();
         let mut lifetime = self.lifetime.write().unwrap();
         if lifetime.is_open() || !next.is_open() || Arc::ptr_eq(&lifetime, &next) {
             return false;
@@ -1106,7 +1113,7 @@ impl TranslationCache {
     /// Look up a block, recording a hit (found) or miss (must lift).
     #[inline(always)]
     pub fn get(&self, key: BlockKey) -> Option<CachedBlock> {
-        let found = self.get_for_dispatch(key);
+        let found = self.get_for_dispatch(key, false);
         if found.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1117,15 +1124,16 @@ impl TranslationCache {
 
     // Keep lookup temporaries out of the compiled chaining loop's register set.
     #[inline(never)]
-    pub(crate) fn get_for_dispatch(&self, key: BlockKey) -> Option<CachedBlock> {
-        self.map
-            .read()
-            .unwrap()
-            .get(&key)
-            .filter(|block| {
-                !matches!(block, CachedBlock::Compiled { .. }) || self.code_lifetime().is_open()
-            })
-            .cloned()
+    pub(crate) fn get_for_dispatch(&self, key: BlockKey, accounted: bool) -> Option<CachedBlock> {
+        // Snapshot before cloning: reconciliation must not validate an old
+        // shard entry against a newly opened lifetime domain.
+        let lifetime = self.code_lifetime();
+        let block = if accounted {
+            self.map.get_accounted(&key)
+        } else {
+            self.map.get(&key)
+        };
+        block.filter(|block| !matches!(block, CachedBlock::Compiled { .. }) || lifetime.is_open())
     }
 
     pub(crate) fn add_dispatch_counts(&self, hits: u64, misses: u64) {
@@ -1344,7 +1352,7 @@ impl TranslationCache {
             self.code_lifetime().discard(&block);
             return false;
         }
-        let mut map = self.map.write().unwrap();
+        let mut map = self.map.write();
         if !matches!(map.get(&key), Some(CachedBlock::Interpreted(_))) {
             self.record_tier_bg_rejected();
             self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
@@ -1481,7 +1489,7 @@ impl TranslationCache {
         on_mark: impl FnOnce(&[(u64, u32)]) -> bool,
     ) -> bool {
         let mut sp = self.spans.write().unwrap();
-        let mut mp = self.map.write().unwrap();
+        let mut mp = self.map.write();
         if !on_mark(&spans) {
             self.code_lifetime().discard(&block);
             return false;
@@ -1580,7 +1588,7 @@ impl TranslationCache {
         // Recompute after upgrading the lock: publication may have intervened.
         let mut spans = self.spans.write().unwrap();
         let victims = spans.cached.victims(lo, hi);
-        let mut map = (!victims.is_empty()).then(|| self.map.write().unwrap());
+        let mut map = (!victims.is_empty()).then(|| self.map.write());
         if let Some(map) = map.as_mut() {
             self.invalidation_blocks_dropped
                 .fetch_add(victims.len() as u64, Ordering::Relaxed);
@@ -1627,12 +1635,8 @@ impl TranslationCache {
 
 impl Drop for TranslationCache {
     fn drop(&mut self) {
-        self.code_lifetime().remove_publications(
-            self.map
-                .get_mut()
-                .unwrap_or_else(|e| e.into_inner())
-                .values(),
-        );
+        self.code_lifetime()
+            .remove_publications(self.map.exclusive_values());
     }
 }
 
@@ -1655,6 +1659,29 @@ mod tests {
     /// A Long64 key at `addr` — the shape most cache tests key by.
     fn k(addr: u64) -> BlockKey {
         BlockKey::new(addr, CpuMode::Long64)
+    }
+
+    #[test]
+    fn dispatch_hash_spreads_aligned_addresses_and_keys_all_modes() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hasher = BuildHasherDefault::<cache_hash::BlockHasher>::default();
+        for stride in [1, 16, 32, 4096, 65536] {
+            let mut buckets = [0; 4096];
+            let mut hashes = HashSet::new();
+            for i in 0..4096 {
+                let hash = hasher.hash_one(k(0x10000 + i * stride));
+                assert!(hashes.insert(hash));
+                buckets[hash as usize & 4095] += 1;
+            }
+            assert!(buckets.iter().filter(|&&n| n != 0).count() > 2300);
+            assert!(buckets.into_iter().max().unwrap() < 12);
+        }
+        let mut hashes = HashSet::new();
+        for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+            for mxcsr in [0, 0x2000, 0x4000, 0x6000, 0x8000, 0x40, 0xe040] {
+                assert!(hashes.insert(hasher.hash_one(BlockKey::with_mxcsr(0, mode, mxcsr))));
+            }
+        }
     }
 
     #[test]

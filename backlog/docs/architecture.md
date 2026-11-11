@@ -63,8 +63,10 @@ that changes.
 | `interruption` | Per-vCPU engine-section markers and host-request deferral evidence (§9.2) |
 | `cache` | `TranslationCache`, `CachedBlock`, `CompiledPtr`; `BlockKey` includes decode mode and MXCSR.RC/FTZ/DAZ; SMC page-tag mark/clear run through `insert`/`invalidate_overlapping` callbacks under the spans lock (§9) |
 | `code_lifetime` | Published-unit generations, cache publication ownership, retirement tickets and dispatcher execution participation; shared slots clear before epoch advance. Execution grace is separate from signal-reader grace; storage remains retained (decision-17 phase 3) |
+| `cache::cache_hash` | Local integer hasher for shared translation keys; guest address keys use no HashDoS protection (§9.1) |
+| `cache::cache_shards` | Sixteen independent reader maps; map mutations take spans → publication gate → all shards → lifetime registry; slot fills omit shards (§9.1, §10) |
 | `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
-| `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop (§2, §9.2) |
+| `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop; 48 KiB two-way private compiled cache with epoch/MXCSR flushes (§2, §9.2) |
 
 ## Data flow
 

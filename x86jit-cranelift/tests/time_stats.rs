@@ -33,6 +33,7 @@ fn eager_compiler_compiled_chains_and_sampled_helpers() {
     assert!(first.helpers.sample_ns > 0);
     assert_eq!(first.chain_hits, vm.cache.chained());
     assert!(first.chain_hits >= 127);
+    assert!(first.fetch_from_direct_link > 0);
     cpu.set_reg(Reg::Rip, 0x1000);
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     let second = vm.time_stats();
@@ -105,6 +106,7 @@ fn indirect_branch_misses_are_counted() {
     cpu.set_reg(Reg::Rip, 0x1000);
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     assert_eq!(vm.time_stats().indirect_branch_resolves, 1);
+    assert_eq!(vm.time_stats().fetch_from_ibtc_miss, 1);
 }
 
 #[test]
@@ -227,4 +229,261 @@ fn return_prediction_underflow_is_an_indirect_resolve() {
     cpu.set_reg(Reg::Rsp, 0x1800);
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     assert_eq!(vm.time_stats().indirect_branch_resolves, 1);
+    assert_eq!(vm.time_stats().fetch_from_return_miss, 1);
+}
+
+fn shared_partitions(s: x86jit_core::TimeStats) -> (u64, u64) {
+    (
+        s.fetch_from_entry
+            + s.fetch_from_budget_resume
+            + s.fetch_from_exit_request_resume
+            + s.fetch_from_boundary
+            + s.fetch_from_return_miss
+            + s.fetch_from_direct_link
+            + s.fetch_from_ibtc_miss
+            + s.fetch_from_interpreter
+            + s.fetch_from_mode_restart,
+        s.fetch_private_cold
+            + s.fetch_private_collision
+            + s.fetch_private_epoch
+            + s.fetch_private_mode
+            + s.fetch_private_bypass,
+    )
+}
+
+#[test]
+fn shared_reasons_partition_resolves_and_survive_invalidation() {
+    let mut vm = vm(JitBackend::new(), &[0xb8, 7, 0x10, 0, 0, 0xff, 0xe0, 0xf4]);
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let first = vm.time_stats();
+    assert_eq!(first.fetch_from_entry, 1);
+    assert_eq!(first.fetch_from_ibtc_miss, 1);
+    assert_eq!(shared_partitions(first), (2, 2));
+    vm.write_bytes(0x1007, &[0x90, 0xf4]).unwrap();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let invalidated = vm.time_stats();
+    assert!(invalidated.fetch_private_epoch > 0);
+    assert_eq!(
+        shared_partitions(invalidated),
+        (
+            invalidated.fetch_translate.calls,
+            invalidated.fetch_translate.calls
+        )
+    );
+    vm.set_time_accounting(false);
+    vm.write_bytes(0x1007, &[0xf4]).unwrap();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let disabled = vm.time_stats();
+    assert_eq!(shared_partitions(disabled), shared_partitions(invalidated));
+}
+
+#[test]
+fn budget_and_request_resumptions_are_attributed_only_on_shared_resolve() {
+    let vm = vm(JitBackend::new(), &[0xf4, 0xf4]);
+    let mut cpu = vm.new_vcpu();
+    assert!(matches!(cpu.run(&vm, Some(0)), Exit::BudgetExhausted));
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(vm.time_stats().fetch_from_budget_resume, 1);
+    cpu.exit_request().request_exit();
+    assert!(matches!(cpu.run(&vm, None), Exit::Interrupted));
+    cpu.set_reg(Reg::Rip, 0x1001);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(vm.time_stats().fetch_from_exit_request_resume, 1);
+    let count = vm.time_stats().fetch_translate.calls;
+    cpu.set_reg(Reg::Rip, 0x1001);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(
+        vm.time_stats().fetch_translate.calls,
+        count,
+        "private hit has no shared reason"
+    );
+}
+
+#[test]
+fn private_conflict_and_mode_flush_are_distinct() {
+    let vm = vm(JitBackend::new(), &[0xf4]);
+    // Three RIPs in one set: the third must evict from the two-way cache.
+    for pc in [0x2db, 0xfde] {
+        vm.write_bytes(pc, &[0xf4]).unwrap();
+    }
+    let mut cpu = vm.new_vcpu();
+    for pc in [0x1000, 0x2db, 0xfde, 0x1000] {
+        cpu.set_reg(Reg::Rip, pc);
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    }
+    assert_eq!(vm.time_stats().fetch_private_cold, 2);
+    assert_eq!(vm.time_stats().fetch_private_collision, 2);
+    cpu.cpu.mxcsr ^= 1 << 13;
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(vm.time_stats().fetch_private_mode, 1);
+    let s = vm.time_stats();
+    assert_eq!(
+        shared_partitions(s),
+        (s.fetch_translate.calls, s.fetch_translate.calls)
+    );
+}
+
+#[test]
+fn accounting_enabled_after_a_disabled_epoch_flush_keeps_the_flush_reason() {
+    let mut vm = vm(JitBackend::new(), &[0xf4, 0xf4]);
+    vm.set_time_accounting(false);
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    vm.write_bytes(0x1000, &[0xf4]).unwrap();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    assert_eq!(shared_partitions(vm.time_stats()), (0, 0));
+    vm.set_time_accounting(true);
+    cpu.set_reg(Reg::Rip, 0x1001);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let s = vm.time_stats();
+    assert_eq!(s.fetch_private_epoch, 1);
+    assert_eq!(
+        shared_partitions(s),
+        (
+            s.fetch_hits.calls + s.fetch_misses,
+            s.fetch_hits.calls + s.fetch_misses
+        )
+    );
+}
+
+#[test]
+fn held_shard_counts_contention_only_while_enabled() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+    use x86jit_core::{BlockKey, CpuMode};
+
+    let mut vm = vm(JitBackend::new(), &[0xf4]);
+    vm.set_time_accounting(false);
+    let mut warm = vm.new_vcpu();
+    warm.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(warm.run(&vm, None), Exit::Hlt));
+    let key = BlockKey::new(0x1000, CpuMode::Long64);
+    let block = vm.cache.get(key).unwrap();
+    for enabled in [false, true] {
+        vm.set_time_accounting(enabled);
+        let held = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                vm.cache.insert(key, block.clone(), vec![(0x1000, 1)], |_| {
+                    held.wait();
+                    release.wait();
+                });
+            });
+            held.wait();
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                release.wait();
+            });
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, 0x1000);
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        });
+        let stats = vm.time_stats();
+        let contention = stats.fetch_shard_read_contention;
+        if enabled {
+            assert_eq!(contention.calls, 1);
+            assert_eq!(contention.samples, 1);
+            assert!(contention.sample_ns >= 10_000_000, "{stats:?}");
+            assert_eq!(stats.fetch_hits.samples, 1);
+            assert_eq!(stats.fetch_hit_slow_samples, 1);
+            assert_eq!(stats.fetch_hit_slow_ns, stats.fetch_hits.sample_ns);
+            assert_eq!(stats.fetch_hit_publication_ns, 0);
+        } else {
+            assert_eq!(contention.calls, 0);
+            assert_eq!(contention.samples, 0);
+            assert_eq!(contention.sample_ns, 0);
+            assert_eq!(stats.fetch_hit_slow_samples, 0);
+            assert_eq!(stats.fetch_hit_slow_ns, 0);
+        }
+    }
+}
+
+#[test]
+fn sleeping_hit_drain_is_slow_and_publication_overlaps_hit_time() {
+    use std::time::Duration;
+    use x86jit_core::{Backend, CachedBlock, IrBlock, MemConsistency, TierUpFinished};
+    struct SleepingDrain(JitBackend);
+    impl Backend for SleepingDrain {
+        fn code_lifetime(
+            &self,
+        ) -> Option<std::sync::Arc<x86jit_core::code_lifetime::CodeLifetime>> {
+            self.0.code_lifetime()
+        }
+
+        fn materialize(
+            &self,
+            ir: &IrBlock,
+            order: MemConsistency,
+            mmio: Option<(u64, u64)>,
+            base: u64,
+        ) -> CachedBlock {
+            self.0.materialize(ir, order, mmio, base)
+        }
+        fn tier_up_finished(&self) -> Vec<TierUpFinished> {
+            std::thread::sleep(Duration::from_millis(5));
+            Vec::new()
+        }
+    }
+    let mut vm = Vm::with_backend(
+        VmConfig::flat(0x4000),
+        Box::new(SleepingDrain(JitBackend::new())),
+    );
+    vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, &[0xf4]).unwrap();
+    vm.set_tier_up_background(true);
+    vm.set_time_accounting(true);
+    let mut cold = vm.new_vcpu();
+    cold.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cold.run(&vm, None), Exit::Hlt));
+    let missed = vm.time_stats();
+    assert_eq!(
+        missed.fetch_hit_publication_ns, 0,
+        "miss drains are excluded"
+    );
+    let mut hit = vm.new_vcpu();
+    hit.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(hit.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(stats.fetch_hits.calls, 1);
+    assert_eq!(stats.fetch_hits.samples, 1);
+    assert_eq!(stats.fetch_hit_slow_samples, 1);
+    assert_eq!(stats.fetch_hit_slow_ns, stats.fetch_hits.sample_ns);
+    assert!(stats.fetch_hit_publication_ns >= 4_000_000, "{stats:?}");
+    assert!(stats.fetch_hits.sample_ns >= stats.fetch_hit_publication_ns);
+    assert_eq!(stats.fetch_shard_read_contention.calls, 0);
+    vm.set_time_accounting(false);
+    let mut disabled = vm.new_vcpu();
+    disabled.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(disabled.run(&vm, None), Exit::Hlt));
+    let after = vm.time_stats();
+    assert_eq!(
+        after.fetch_hit_publication_ns,
+        stats.fetch_hit_publication_ns
+    );
+    assert_eq!(after.fetch_hit_slow_samples, stats.fetch_hit_slow_samples);
+    assert_eq!(after.fetch_hit_slow_ns, stats.fetch_hit_slow_ns);
+}
+
+#[test]
+fn internal_mxcsr_restart_has_its_own_origin() {
+    // Load a different supported mode, then continue in a new specialization.
+    let vm = vm(JitBackend::new(), &[0x0f, 0xae, 0x15, 0xf9, 7, 0, 0, 0xf4]);
+    vm.write_bytes(0x1800, &0x3f80_u32.to_le_bytes()).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(stats.fetch_from_entry, 1);
+    assert_eq!(stats.fetch_from_mode_restart, 1);
+    assert_eq!(stats.fetch_from_budget_resume, 0);
+    assert_eq!(shared_partitions(stats), (2, 2));
 }

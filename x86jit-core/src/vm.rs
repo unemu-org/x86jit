@@ -22,6 +22,7 @@ use crate::lift::{
 };
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
 use crate::state::{CpuState, Flags, Reg};
+use crate::time_stats::{PrivateMiss, SharedReason};
 
 /// Options for [`Vcpu::reset_execution_state`]. By default x87 state is preserved.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1577,10 +1578,13 @@ impl Vm {
                     entry: CompiledPtr::new(std::ptr::null()),
                 }; FAST_N],
             ),
+            #[cfg(test)]
+            ibtc_test_hook: None,
             fast_epoch: self.cache.epoch(),
             fast_lifetime: self.cache.code_lifetime().clone(),
             execution_participant: self.cache.code_lifetime().participant(),
             fast_mxcsr_mode: 0,
+            fast_empty_reason: PrivateMiss::Cold,
             ibtc_refills: HashMap::new(),
             ret_stack: Box::new(RetStack::new()),
             fault_entry: Box::default(),
@@ -1607,10 +1611,9 @@ impl Drop for Vm {
     }
 }
 
-/// Number of slots in the per-vcpu fast-resolve cache. A power of two so the
-/// index is a mask. 1024 entries × 16 bytes = 16 KiB per vcpu — cheap.
+/// Two ways in each of 1024 sets: 2048 entries × 24 bytes = 48 KiB per vcpu.
 const FAST_BITS: u32 = 10;
-const FAST_N: usize = 1 << FAST_BITS;
+const FAST_N: usize = 2 << FAST_BITS;
 
 /// After this many IBTC refills a site is treated as megamorphic: the
 /// dispatcher stops refilling its slot (it stays empty → the site pays the
@@ -1618,7 +1621,7 @@ const FAST_N: usize = 1 << FAST_BITS;
 /// descriptor arena without bound.
 const IBTC_MEGAMORPHIC_CAP: u32 = 8;
 
-/// One direct-mapped fast-resolve entry: a guest RIP tag and its compiled entry.
+/// One fast-resolve entry: a guest RIP tag and its compiled entry.
 /// A null `CompiledPtr` marks the slot empty (guest RIP 0 never collides with a
 /// real block because an empty slot's pointer is null, checked first).
 #[derive(Copy, Clone)]
@@ -1724,20 +1727,22 @@ pub struct Vcpu {
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
     legacy_execution: Option<Box<legacy::Execution>>,
-    /// Fast-resolve cache: a vcpu-private, direct-mapped RIP→compiled
-    /// entry map that replaces the shared `RwLock<HashMap>` lookup (plus its two
-    /// atomic counter bumps) for the transfers the chain loop can't chain — returns,
+    /// Fast-resolve cache: a vcpu-private, two-way RIP→compiled entry map
+    /// that replaces the shared lookup for transfers the chain loop can't chain — returns,
     /// indirect jumps, and cold outer-loop re-dispatch. Only `Compiled` entries are
     /// cached; interpreted blocks always route through `resolve` (so the cache
     /// counters stay meaningful). Flushed whenever the cache invalidation epoch
     /// moves — the coherence channel for cross-thread SMC that `invalidate_links`
     /// (backend-owned slots) cannot reach.
     fast: Box<[FastEntry; FAST_N]>,
+    #[cfg(test)]
+    ibtc_test_hook: Option<Box<dyn FnMut(bool) + Send>>,
     /// Snapshot of `TranslationCache::epoch` matching the current `fast` contents.
     fast_epoch: u64,
     fast_lifetime: Arc<crate::code_lifetime::CodeLifetime>,
     execution_participant: crate::code_lifetime::ExecutionParticipant,
     fast_mxcsr_mode: u32,
+    fast_empty_reason: PrivateMiss,
     /// Per-IBTC-slot refill count, keyed by slot address. Guards against a
     /// megamorphic indirect site churning the descriptor arena: once a slot hits
     /// [`IBTC_MEGAMORPHIC_CAP`] refills the dispatcher stops filling it. Cleared on
@@ -1965,30 +1970,56 @@ impl Vcpu {
         self.retired
     }
 
-    /// Direct-mapped index for `rip` (Fibonacci hash — one multiply, good spread
-    /// even for densely-packed short blocks).
+    // Fold alignment and page bits into the set index: short aligned thunks
+    // must not all compete for the same few sets. Full RIP tags decide hits.
     #[inline]
     fn fast_index(rip: u64) -> usize {
-        (rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - FAST_BITS)) as usize
+        let folded = crate::cache::cache_hash::dispatch_hash(rip);
+        (folded as usize & ((1 << FAST_BITS) - 1)) * 2
     }
 
-    /// Probe the fast-resolve cache; `Some(entry)` on a hit.
     #[inline]
-    fn fast_get(&self, rip: u64) -> Option<CompiledPtr> {
-        let e = self.fast[Self::fast_index(rip)];
-        if !e.entry.0.is_null() && e.rip == rip {
-            Some(e.entry)
-        } else {
-            None
+    fn fast_get(&mut self, rip: u64) -> Option<CompiledPtr> {
+        let index = Self::fast_index(rip);
+        let first = self.fast[index];
+        if !first.entry.0.is_null() && first.rip == rip {
+            return Some(first.entry);
         }
+        let second = self.fast[index + 1];
+        if !second.entry.0.is_null() && second.rip == rip {
+            self.fast.swap(index, index + 1);
+            return Some(second.entry);
+        }
+        None
     }
 
-    /// Install a compiled entry for `rip` (overwrites any collision — a stale tag
-    /// can only cost a miss, never a wrong transfer, and within an epoch a RIP maps
-    /// to a stable compiled entry).
+    // A set is cold only while it has an empty way; a full-set miss is a collision.
+    fn record_shared_resolve(&self, reason: SharedReason, rip: u64) {
+        let index = Self::fast_index(rip);
+        let private =
+            if self.fast[index].entry.0.is_null() || self.fast[index + 1].entry.0.is_null() {
+                self.fast_empty_reason
+            } else {
+                PrivateMiss::Collision
+            };
+        crate::time_stats::shared_resolve(reason, private);
+    }
+
+    // Replace the least recently used way once full.
+    // Way zero is MRU; a way-one hit promotes it. Epoch/mode flushes clear both.
     #[inline]
     fn fast_put(&mut self, rip: u64, entry: CompiledPtr) {
-        self.fast[Self::fast_index(rip)] = FastEntry { rip, entry };
+        let index = Self::fast_index(rip);
+        if self.fast[index].rip == rip && !self.fast[index].entry.0.is_null() {
+            self.fast[index].entry = entry;
+            return;
+        }
+        if self.fast[index + 1].rip == rip && !self.fast[index + 1].entry.0.is_null() {
+            self.fast.swap(index, index + 1);
+        } else {
+            self.fast[index + 1] = self.fast[index];
+        }
+        self.fast[index] = FastEntry { rip, entry };
     }
 
     /// Drop every fast-resolve entry and reset the IBTC refill counts (on an
@@ -1996,6 +2027,7 @@ impl Vcpu {
     /// (`invalidate_links`), so a previously-capped site gets a fresh chance to
     /// re-cache against the rewritten code.
     fn fast_clear(&mut self) {
+        self.fast_empty_reason = PrivateMiss::Cold;
         for e in self.fast.iter_mut() {
             e.entry = CompiledPtr::new(std::ptr::null());
         }
@@ -2786,23 +2818,36 @@ impl Vcpu {
         fp_mode: &mut crate::jit_abi::fp::RunMode,
     ) -> Exit {
         let mut remaining = budget;
+        let mut origin = SharedReason::Entry;
         loop {
             fp_mode.default();
             let mode = self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK;
             if self.fast_mxcsr_mode != mode {
                 self.fast_clear();
                 self.fast_mxcsr_mode = mode;
+                self.fast_empty_reason = PrivateMiss::Mode;
             }
             let limit = remaining.unwrap_or(u64::MAX);
             let result = match (mode == 0, remaining.is_some()) {
-                (true, true) => self.run_dispatch::<ROUTED, true, true>(vm, limit, fp_mode),
-                (true, false) => self.run_dispatch::<ROUTED, true, false>(vm, limit, fp_mode),
-                (false, true) => self.run_dispatch::<ROUTED, false, true>(vm, limit, fp_mode),
-                (false, false) => self.run_dispatch::<ROUTED, false, false>(vm, limit, fp_mode),
+                (true, true) => self.run_dispatch::<ROUTED, true, true>(vm, limit, fp_mode, origin),
+                (true, false) => {
+                    self.run_dispatch::<ROUTED, true, false>(vm, limit, fp_mode, origin)
+                }
+                (false, true) => {
+                    self.run_dispatch::<ROUTED, false, true>(vm, limit, fp_mode, origin)
+                }
+                (false, false) => {
+                    self.run_dispatch::<ROUTED, false, false>(vm, limit, fp_mode, origin)
+                }
             };
             match result {
                 Ok(exit) => return exit,
-                Err(consumed) => remaining = remaining.map(|b| b - consumed),
+                Err(consumed) => {
+                    remaining = remaining.map(|b| b - consumed);
+                    if vm.time_enabled {
+                        origin = SharedReason::ModeRestart;
+                    }
+                }
             }
         }
     }
@@ -2816,6 +2861,7 @@ impl Vcpu {
         vm: &Vm,
         budget: u64,
         fp_mode: &mut crate::jit_abi::fp::RunMode,
+        origin: SharedReason,
     ) -> Result<Exit, u64> {
         // Epoch numbers belong to a domain. A vCPU used with another VM must
         // not carry predictions whose equal epoch names a different backend.
@@ -2828,6 +2874,7 @@ impl Vcpu {
         }
         let mut participant = self.execution_participant.for_dispatch();
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
+        let mut shared_reason = origin;
         let mut blocks_run: u64 = 0;
         let exit_word_owner = Arc::clone(&self.exit_request.word);
         let exit_word: &AtomicU64 = &exit_word_owner;
@@ -2895,6 +2942,7 @@ impl Vcpu {
             if epoch != self.fast_epoch {
                 self.fast_clear();
                 self.fast_epoch = epoch;
+                self.fast_empty_reason = PrivateMiss::Epoch;
             }
 
             // Resume after an MMIO trap the JIT deferred (§5.2): once the
@@ -3019,6 +3067,9 @@ impl Vcpu {
                     CachedBlock::Compiled { entry }
                 }
                 None => {
+                    if vm.time_enabled {
+                        self.record_shared_resolve(shared_reason, self.cpu.rip);
+                    }
                     if !DEFAULT {
                         fp_mode.default();
                     }
@@ -3061,6 +3112,9 @@ impl Vcpu {
                     // Owned IR needs no execution grace. A request deferred by
                     // resolution is delivered by the existing execution boundary.
                     drop(execution);
+                    if vm.time_enabled {
+                        shared_reason = SharedReason::Interpreter;
+                    }
                     if vm.time_enabled {
                         crate::time_stats::interpreted();
                     }
@@ -3232,6 +3286,12 @@ impl Vcpu {
                                 if !DEFAULT {
                                     fp_mode.default();
                                 }
+                                if vm.time_enabled {
+                                    crate::time_stats::shared_resolve(
+                                        SharedReason::DirectLink,
+                                        PrivateMiss::Bypass,
+                                    );
+                                }
                                 let resolved = resolve::<DEFAULT>(
                                     vm,
                                     &mut self.time_dispatch,
@@ -3291,17 +3351,26 @@ impl Vcpu {
                             RET_IBTC_MISS => {
                                 self.time_dispatch.indirect =
                                     self.time_dispatch.indirect.saturating_add(1);
-                                // Snapshot before resolving, as for RET_LINK.
+                                #[cfg(test)]
+                                if let Some(hook) = self.ibtc_test_hook.as_mut() {
+                                    hook(false);
+                                }
+                                // Generation validation rejects retired tracked entries,
+                                // but retaining backends may use generation-zero pointers.
+                                // Keep the private fill epoch check for those entries and
+                                // for capped refills that skip slot publication entirely.
                                 let since_epoch = self.fast_lifetime.epoch();
-                                if since_epoch != execution.epoch() {
+                                if since_epoch != execution.epoch()
+                                    || since_epoch != self.fast_epoch
+                                {
                                     break (cur, code);
                                 }
                                 // Probe the vcpu-private fast cache before `resolve`.
                                 // The per-site IBTC holds ONE target, so a site
                                 // with several live targets misses here on nearly every
                                 // call — and `resolve` is an RwLock read plus a hash
-                                // lookup, a clone and two shared atomic bumps, where
-                                // this is a direct-mapped array index and a compare.
+                                // lookup and a clone, where this probes two private
+                                // tags without synchronization.
                                 // Same key, same epoch invariant and same "compiled
                                 // blocks only" content as the probe the outer dispatch
                                 // loop already trusts, so a hit here is equally sound;
@@ -3312,6 +3381,12 @@ impl Vcpu {
                                         Some(entry)
                                     }
                                     None => {
+                                        if vm.time_enabled {
+                                            self.record_shared_resolve(
+                                                SharedReason::IbtcMiss,
+                                                self.cpu.rip,
+                                            );
+                                        }
                                         if !DEFAULT {
                                             fp_mode.default();
                                         }
@@ -3338,6 +3413,10 @@ impl Vcpu {
                                         }
                                     }
                                 };
+                                #[cfg(test)]
+                                if let Some(hook) = self.ibtc_test_hook.as_mut() {
+                                    hook(true);
+                                }
                                 // Even a fast hit can allocate during refill bookkeeping.
                                 if !DEFAULT {
                                     fp_mode.default();
@@ -3396,6 +3475,9 @@ impl Vcpu {
                                                 // Invalidated under us — see RET_LINK.
                                                 break (cur, code);
                                             }
+                                        }
+                                        if !under_cap && vm.cache.epoch() != since_epoch {
+                                            break (cur, code);
                                         }
                                         next = entry;
                                     }
@@ -3634,6 +3716,14 @@ impl Vcpu {
                         }
                         cur = next;
                     };
+                    if vm.time_enabled {
+                        shared_reason = match stopped_code {
+                            RET_RETURN_MISS => SharedReason::ReturnMiss,
+                            RET_LINK => SharedReason::DirectLink,
+                            RET_IBTC_MISS => SharedReason::IbtcMiss,
+                            _ => SharedReason::Boundary,
+                        };
+                    }
                     dispatch = exit_word.load(Ordering::Relaxed);
                     if dispatch & EXIT_REQUESTED != 0 {
                         if !DEFAULT {
@@ -3718,7 +3808,7 @@ fn resolve_dispatch<const DEFAULT: bool>(
         };
         loop {
             stats.lookups = stats.lookups.saturating_add(1);
-            if let Some(block) = vm.cache.get_for_dispatch(key) {
+            if let Some(block) = vm.cache.get_for_dispatch(key, vm.time_enabled) {
                 return Ok(block);
             }
             stats.misses = stats.misses.saturating_add(1);
@@ -3786,7 +3876,7 @@ fn resolve_attempt<const DEFAULT: bool>(
     // when the embedder injected a compiling backend.
     if mode == CpuMode::Real16 {
         stats.lookups = stats.lookups.saturating_add(1);
-        if let Some(block) = vm.cache.get_for_dispatch(key) {
+        if let Some(block) = vm.cache.get_for_dispatch(key, vm.time_enabled) {
             return Ok(block);
         }
         stats.misses = stats.misses.saturating_add(1);
@@ -3825,6 +3915,9 @@ fn resolve_attempt<const DEFAULT: bool>(
         // freshly-landed unit is seen by the lookup below. Cheap when idle (the
         // backend's ready-probe short-circuits an empty drain).
         if vm.tier_up_background {
+            let _publication_time = vm
+                .time_enabled
+                .then(crate::time_stats::PublicationTimer::enter);
             drain_tier_up(vm, exit_word, sections);
         }
         // Snapshot before reading cached IR or fetching uncached successors:
@@ -3832,7 +3925,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         let generation = vm.cache.publication_generation();
         let dispatch_epoch = vm.cache.epoch();
         stats.lookups = stats.lookups.saturating_add(1);
-        let Some(block) = vm.cache.get_for_dispatch(key) else {
+        let Some(block) = vm.cache.get_for_dispatch(key, vm.time_enabled) else {
             stats.misses = stats.misses.saturating_add(1);
             if vm.time_enabled {
                 crate::time_stats::ResolveTimer::miss();
@@ -4306,6 +4399,127 @@ fn lift_exit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_strides_spread_across_sets() {
+        for base in [0x10000_u64, 0xffff_8000_0001_0000] {
+            for stride in [16, 4096, 65536, 1 << 20, 4 << 20, 16 << 20] {
+                let spread: std::collections::HashSet<_> = (0..64)
+                    .map(|i| Vcpu::fast_index(base + i * stride))
+                    .collect();
+                assert!(
+                    spread.len() >= 48,
+                    "base={base:x} stride={stride} spread={}",
+                    spread.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalidation_before_private_probe_or_publication_never_resurrects_ibtc() {
+        struct IndirectBackend;
+        unsafe extern "C" fn indirect(cpu: *mut u8, mem: *mut u8) -> u64 {
+            // SAFETY: the dispatcher supplies live CpuState/MemCtx pointers.
+            unsafe {
+                let cpu = &mut *(cpu as *mut CpuState);
+                let mem = &mut *(mem as *mut MemCtx);
+                mem.link_slot = cpu.gpr[1];
+                cpu.rip = 0x2000;
+            }
+            RET_IBTC_MISS
+        }
+        impl Backend for IndirectBackend {
+            fn materialize(
+                &self,
+                ir: &IrBlock,
+                _: MemConsistency,
+                _: Option<(u64, u64)>,
+                _: u64,
+            ) -> CachedBlock {
+                CachedBlock::Compiled {
+                    entry: CompiledPtr::new(if ir.guest_start == 0x1000 {
+                        indirect as *const u8
+                    } else {
+                        source_two as *const u8
+                    }),
+                }
+            }
+        }
+        for after_probe in [false, true] {
+            let mut vm = Vm::with_backend(VmConfig::flat(0x4000), Box::new(IndirectBackend));
+            vm.map(0x1000, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, &[0xf4]).unwrap();
+            vm.write_bytes(0x2000, &[0xf4]).unwrap();
+            let key = BlockKey::new(0x2000, CpuMode::Long64);
+            let old = CompiledPtr::new(source_one as *const u8);
+            vm.cache.insert(
+                key,
+                CachedBlock::Compiled { entry: old },
+                vec![(0x2000, 1)],
+                |_| {},
+            );
+            let vm = Arc::new(vm);
+            let slot = Arc::new(AtomicU64::new(0));
+            let mut cpu = vm.new_vcpu();
+            cpu.fast_put(0x2000, old);
+            cpu.set_reg(Reg::Rcx, Arc::as_ptr(&slot) as u64);
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.ibtc_test_hook = Some(Box::new({
+                let vm = vm.clone();
+                let slot = slot.clone();
+                move |probed| {
+                    if probed == after_probe {
+                        assert_eq!(
+                            vm.cache.invalidate_overlapping(0x2000, 0x2001, || {}),
+                            vec![key]
+                        );
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                }
+            }));
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 2, "stale target executed");
+            assert_eq!(
+                slot.load(Ordering::Acquire),
+                0,
+                "stale descriptor republished"
+            );
+            cpu.fast_clear();
+            assert_eq!(slot.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn private_two_way_replacement_promotes_hits_and_flushes_both_ways() {
+        let vm = Vm::new(VmConfig::flat(4096));
+        let mut cpu = vm.new_vcpu();
+        let keys: Vec<_> = (0..0x10000)
+            .filter(|&rip| Vcpu::fast_index(rip) == Vcpu::fast_index(0))
+            .take(3)
+            .collect();
+        assert_eq!(keys.len(), 3);
+        let entry = CompiledPtr::new(std::ptr::dangling());
+        assert!(cpu.fast_get(0).is_none());
+        cpu.fast_put(keys[0], entry);
+        cpu.fast_put(keys[1], entry);
+        cpu.fast_put(keys[1], entry); // Reinstalling must not consume a second way.
+        assert!(cpu.fast_get(keys[1]).is_some());
+        cpu.fast_put(keys[2], entry);
+        assert!(cpu.fast_get(keys[0]).is_none());
+        for _ in 0..1000 {
+            assert!(cpu.fast_get(keys[1]).is_some());
+            assert!(cpu.fast_get(keys[2]).is_some());
+        }
+        cpu.fast_put(keys[1], entry); // Reinstalling MRU preserves the other way.
+        assert!(cpu.fast_get(keys[2]).is_some());
+        cpu.fast_clear();
+        for key in keys {
+            assert!(cpu.fast_get(key).is_none());
+        }
+        assert!(cpu.fast.iter().all(|e| e.entry.0.is_null()));
+        assert_eq!(std::mem::size_of_val(&*cpu.fast), 48 * 1024);
+    }
+
     #[test]
     fn legacy_ir_is_rejected_before_application_backend_and_region_formation() {
         use crate::legacy::{CpuGeneration, LegacyCpuModel};

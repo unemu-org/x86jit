@@ -79,6 +79,10 @@ pub struct ExitsTimeStats {
 /// (or resolve entry when an entry sample timestamp is available);
 /// their sum requires no sampling extrapolation. Whole-resolve callback/lift
 /// totals also include work during hit-path tier-up and overlap those buckets.
+/// `fetch_from_*` and `fetch_private_*` are two independent partitions of enabled
+/// resolves: each group sums to `fetch_hits.calls + fetch_misses`. Retries count
+/// once. Private miss attribution describes slots, not previously seen RIPs;
+/// indirect jumps/calls share an ABI reason, as do block/region boundaries.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct TimeStats {
@@ -114,6 +118,45 @@ pub struct TimeStats {
     /// accounting is enabled. Retries and failed/unwound calls count once;
     /// `fetch_hits.calls + fetch_misses` counts all enabled resolves.
     pub fetch_misses: u64,
+    /// Shared resolves at run entry (except the budget/request resumptions below).
+    /// Counted only with time accounting enabled.
+    pub fetch_from_entry: u64,
+    /// Shared resolves at the first dispatch after an accounted budget return.
+    /// Counted only with time accounting enabled.
+    pub fetch_from_budget_resume: u64,
+    /// Shared resolves at the first dispatch after an accounted host exit request.
+    /// Counted only with time accounting enabled.
+    pub fetch_from_exit_request_resume: u64,
+    /// Shared resolves after an unchained compiled block/region boundary (RET_CONTINUE or RET_INTERRUPTED).
+    /// Counted only with time accounting enabled.
+    pub fetch_from_boundary: u64,
+    /// Shared resolves after a compiled return prediction mismatch or underflow.
+    /// Counted only with time accounting enabled.
+    pub fetch_from_return_miss: u64,
+    /// Shared resolves for an unfilled direct or return-continuation link slot (RET_LINK).
+    /// Counted only with time accounting enabled.
+    pub fetch_from_direct_link: u64,
+    /// Shared resolves after a compiled indirect jump/call IBTC miss.
+    /// Counted only with time accounting enabled.
+    pub fetch_from_ibtc_miss: u64,
+    /// Shared resolves after interpreted execution.
+    /// Counted only with time accounting enabled.
+    pub fetch_from_interpreter: u64,
+    /// Shared resolves whose slot was empty since construction or explicit reset.
+    /// Counted only with time accounting enabled.
+    pub fetch_private_cold: u64,
+    /// Shared resolves whose private-cache slot held a different RIP.
+    /// Counted only with time accounting enabled.
+    pub fetch_private_collision: u64,
+    /// Shared resolves whose slot was still empty after an invalidation-epoch flush.
+    /// Counted only with time accounting enabled.
+    pub fetch_private_epoch: u64,
+    /// Shared resolves whose slot was still empty after an MXCSR-mode flush.
+    /// Counted only with time accounting enabled.
+    pub fetch_private_mode: u64,
+    /// Shared resolves without a private probe (unfilled link slots).
+    /// Counted only with time accounting enabled.
+    pub fetch_private_bypass: u64,
     /// Nanoseconds inside embedder fetch-policy callbacks during enabled resolves,
     /// timed on every outermost callback, including denial, retries and unwinding.
     /// Nested callbacks are included once in their outer callback. Includes
@@ -164,6 +207,27 @@ pub struct TimeStats {
     /// Exact number of successful publications contributing to tier_up_latency_ns.
     /// Zero for submissions made while detailed timing was disabled.
     pub tier_up_latency_count: u64,
+    /// Shared resolves after an internal MXCSR specialization restart, rather
+    /// than a run entry/resume. Counted only with detailed accounting enabled.
+    pub fetch_from_mode_restart: u64,
+    /// Shard read acquisitions that failed their first `try_read`, counted exactly
+    /// only with detailed accounting. First contended acquisition per run and
+    /// every 64th thereafter time the blocking read; `sample_ns` includes elapsed
+    /// wait and descheduling. Uncontended reads contribute to none of these fields.
+    pub fetch_shard_read_contention: SampledTimeStats,
+    /// Timed hit samples exceeding [`SLOW_HIT_THRESHOLD_NS`]. Subset of
+    /// `fetch_hits.samples`; zero without detailed accounting. Subtract these
+    /// samples and `fetch_hit_slow_ns` to compute the remaining sample mean.
+    pub fetch_hit_slow_samples: u64,
+    /// Total nanoseconds of the slow samples counted by `fetch_hit_slow_samples`.
+    /// Subset of `fetch_hits.sample_ns`, with the same compilation exclusion.
+    pub fetch_hit_slow_ns: u64,
+    /// Nanoseconds draining/publishing completed background compiles within
+    /// resolves that finish as hits, timed on every enabled drain (including
+    /// empty drains). Includes backend completion polling and publication waits.
+    /// Excluded from no other field: sampled hit windows include this work,
+    /// whereas this total includes unsampled hits too. Never extrapolate it.
+    pub fetch_hit_publication_ns: u64,
 }
 
 /// Backend worker timing, sampled without compiler locks. Wrappers should forward
@@ -246,7 +310,30 @@ const FETCH_LIFT: usize = FETCH_APPROVAL + 1;
 const FETCH_MISS_APPROVAL: usize = FETCH_LIFT + 1;
 const FETCH_MISS_LIFT: usize = FETCH_MISS_APPROVAL + 1;
 const FETCH_MISS_OTHER: usize = FETCH_MISS_LIFT + 1;
-const FIELDS: usize = FETCH_MISS_OTHER + 1;
+const ENTRY: usize = FETCH_MISS_OTHER + 1;
+const BUDGET_RESUME: usize = ENTRY + 1;
+const REQUEST_RESUME: usize = BUDGET_RESUME + 1;
+const BOUNDARY: usize = REQUEST_RESUME + 1;
+const RETURN_MISS: usize = BOUNDARY + 1;
+const DIRECT_LINK: usize = RETURN_MISS + 1;
+const IBTC_MISS: usize = DIRECT_LINK + 1;
+const INTERPRETER_EDGE: usize = IBTC_MISS + 1;
+const PRIVATE_COLD: usize = INTERPRETER_EDGE + 1;
+const PRIVATE_COLLISION: usize = PRIVATE_COLD + 1;
+const PRIVATE_EPOCH: usize = PRIVATE_COLLISION + 1;
+const PRIVATE_MODE: usize = PRIVATE_EPOCH + 1;
+const PRIVATE_BYPASS: usize = PRIVATE_MODE + 1;
+const MODE_RESTART: usize = PRIVATE_BYPASS + 1;
+const SHARD_CONTENTION: usize = MODE_RESTART + 1;
+const HIT_SLOW_SAMPLES: usize = SHARD_CONTENTION + 3;
+const HIT_SLOW_NS: usize = HIT_SLOW_SAMPLES + 1;
+const HIT_PUBLICATION: usize = HIT_SLOW_NS + 1;
+const FIELDS: usize = HIT_PUBLICATION + 1;
+
+/// Elapsed hit samples above 20 microseconds are also recorded as slow samples.
+/// This fixed threshold separates long scheduling/lock/publication delays for
+/// consumers computing a trimmed mean; it does not identify their cause.
+pub const SLOW_HIT_THRESHOLD_NS: u64 = 20_000;
 
 pub(crate) struct Record([AtomicU64; FIELDS]);
 impl Default for Record {
@@ -305,6 +392,24 @@ impl Registry {
             fetch_translate: sampled(FETCH),
             fetch_hits: sampled(FETCH_HITS),
             fetch_misses: sum[FETCH_MISSES],
+            fetch_from_mode_restart: sum[MODE_RESTART],
+            fetch_shard_read_contention: sampled(SHARD_CONTENTION),
+            fetch_hit_slow_samples: sum[HIT_SLOW_SAMPLES],
+            fetch_hit_slow_ns: sum[HIT_SLOW_NS],
+            fetch_hit_publication_ns: sum[HIT_PUBLICATION],
+            fetch_from_entry: sum[ENTRY],
+            fetch_from_budget_resume: sum[BUDGET_RESUME],
+            fetch_from_exit_request_resume: sum[REQUEST_RESUME],
+            fetch_from_boundary: sum[BOUNDARY],
+            fetch_from_return_miss: sum[RETURN_MISS],
+            fetch_from_direct_link: sum[DIRECT_LINK],
+            fetch_from_ibtc_miss: sum[IBTC_MISS],
+            fetch_from_interpreter: sum[INTERPRETER_EDGE],
+            fetch_private_cold: sum[PRIVATE_COLD],
+            fetch_private_collision: sum[PRIVATE_COLLISION],
+            fetch_private_epoch: sum[PRIVATE_EPOCH],
+            fetch_private_mode: sum[PRIVATE_MODE],
+            fetch_private_bypass: sum[PRIVATE_BYPASS],
             fetch_approval_ns: sum[FETCH_APPROVAL],
             fetch_lift_ns: sum[FETCH_LIFT],
             fetch_miss_approval_ns: sum[FETCH_MISS_APPROVAL],
@@ -329,9 +434,40 @@ impl Registry {
     }
 }
 
-#[derive(Clone, Copy)]
+// Disabled runs initialize and publish only the original always-on counters.
+// Detailed storage is allocated/reset/scanned solely for enabled runs.
+struct DetailedCounters {
+    values: [u64; FIELDS - FETCH_HITS],
+    publication_ns: u64,
+}
+struct Counters {
+    basic: [u64; FETCH_HITS],
+    detailed: Option<Box<DetailedCounters>>,
+}
+impl std::ops::Index<usize> for Counters {
+    type Output = u64;
+    fn index(&self, index: usize) -> &u64 {
+        if index < FETCH_HITS {
+            &self.basic[index]
+        } else {
+            self.detailed
+                .as_ref()
+                .map_or(&0, |v| &v.values[index - FETCH_HITS])
+        }
+    }
+}
+impl std::ops::IndexMut<usize> for Counters {
+    fn index_mut(&mut self, index: usize) -> &mut u64 {
+        if index < FETCH_HITS {
+            &mut self.basic[index]
+        } else {
+            &mut self.detailed.as_mut().unwrap().values[index - FETCH_HITS]
+        }
+    }
+}
 struct Local {
-    values: [u64; FIELDS],
+    values: Counters,
+    resume: SharedReason,
     active: bool,
     enabled: bool,
     segment: usize,
@@ -345,7 +481,11 @@ struct Local {
 }
 impl Local {
     const EMPTY: Self = Self {
-        values: [0; FIELDS],
+        values: Counters {
+            basic: [0; FETCH_HITS],
+            detailed: None,
+        },
+        resume: SharedReason::Entry,
         active: false,
         enabled: false,
         segment: INTERPRETER,
@@ -365,7 +505,7 @@ impl Default for Local {
 }
 thread_local! { static LOCAL: RefCell<Local> = const { RefCell::new(Local::EMPTY) }; }
 
-fn add(values: &mut [u64; FIELDS], i: usize, value: u64) {
+fn add(values: &mut Counters, i: usize, value: u64) {
     values[i] = values[i].saturating_add(value);
 }
 fn switch(local: &mut Local, segment: usize) {
@@ -386,6 +526,41 @@ pub(crate) fn compiled() {
 pub(crate) fn enabled() -> bool {
     LOCAL.with(|l| l.borrow().enabled)
 }
+/// Orthogonal partitions of enabled shared resolves: source edge and private probe.
+#[derive(Clone, Copy)]
+pub(crate) enum SharedReason {
+    Entry = ENTRY as isize,
+    BudgetResume = BUDGET_RESUME as isize,
+    RequestResume = REQUEST_RESUME as isize,
+    Boundary = BOUNDARY as isize,
+    ReturnMiss = RETURN_MISS as isize,
+    DirectLink = DIRECT_LINK as isize,
+    IbtcMiss = IBTC_MISS as isize,
+    Interpreter = INTERPRETER_EDGE as isize,
+    ModeRestart = MODE_RESTART as isize,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum PrivateMiss {
+    Cold = PRIVATE_COLD as isize,
+    Collision = PRIVATE_COLLISION as isize,
+    Epoch = PRIVATE_EPOCH as isize,
+    Mode = PRIVATE_MODE as isize,
+    Bypass = PRIVATE_BYPASS as isize,
+}
+/// Call only behind the VM accounting flag. No disabled-path TLS or counters.
+pub(crate) fn shared_resolve(reason: SharedReason, private: PrivateMiss) {
+    LOCAL.with(|local| {
+        let mut l = local.borrow_mut();
+        let reason = if matches!(reason, SharedReason::Entry) {
+            l.resume
+        } else {
+            reason
+        };
+        add(&mut l.values, reason as usize, 1);
+        add(&mut l.values, private as usize, 1);
+    });
+}
+
 #[derive(Default)]
 pub(crate) struct DispatchCounts {
     pub lookups: u64,
@@ -408,6 +583,15 @@ impl RunGuard {
             ..Local::default()
         };
         if enabled {
+            current.resume = match outside.map(|(kind, _)| kind) {
+                Some(6) => SharedReason::BudgetResume,
+                Some(2) => SharedReason::RequestResume,
+                _ => SharedReason::Entry,
+            };
+            current.values.detailed = Some(Box::new(DetailedCounters {
+                values: [0; FIELDS - FETCH_HITS],
+                publication_ns: 0,
+            }));
             if let Some((kind, start)) = outside {
                 add(
                     &mut current.values,
@@ -450,11 +634,18 @@ pub(crate) fn dispatch_counts(chains: u64, counts: DispatchCounts) {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let mut current = LOCAL.with(|l| l.replace(self.previous));
+        let previous = std::mem::replace(&mut self.previous, Local::EMPTY);
+        let mut current = LOCAL.with(|l| l.replace(previous));
         if let Some(start) = current.since {
             add(&mut current.values, current.segment, start.elapsed_ns());
         }
-        for (counter, value) in self.record.0.iter().zip(current.values) {
+        for (counter, value) in self.record.0.iter().zip(
+            current
+                .values
+                .basic
+                .into_iter()
+                .chain(current.values.detailed.into_iter().flat_map(|v| v.values)),
+        ) {
             if value == 0 {
                 continue;
             }
@@ -539,6 +730,7 @@ impl ResolveTimer {
                 lift: l.values[FETCH_LIFT],
             });
             l.miss = None;
+            l.values.detailed.as_mut().unwrap().publication_ns = 0;
             Self { _mixed: mixed }
         })
     }
@@ -575,6 +767,8 @@ impl Drop for ResolveTimer {
                 add(&mut l.values, FETCH_MISS_LIFT, lift);
                 add(&mut l.values, FETCH_MISS_OTHER, ns);
             } else {
+                let publication_ns = l.values.detailed.as_ref().unwrap().publication_ns;
+                add(&mut l.values, HIT_PUBLICATION, publication_ns);
                 add(&mut l.values, FETCH_HITS, 1);
                 if let Some(hit) = l.hit_start {
                     let ns = hit
@@ -583,9 +777,56 @@ impl Drop for ResolveTimer {
                         .saturating_sub(l.values[COMPILER].saturating_sub(hit.compiler));
                     add(&mut l.values, FETCH_HITS + 1, 1);
                     add(&mut l.values, FETCH_HITS + 2, ns);
+                    if ns > SLOW_HIT_THRESHOLD_NS {
+                        add(&mut l.values, HIT_SLOW_SAMPLES, 1);
+                        add(&mut l.values, HIT_SLOW_NS, ns);
+                    }
                 }
             }
             l.resolving = false;
+        });
+    }
+}
+
+/// Internal shared-cache instrumentation, called only behind the accounting flag.
+#[doc(hidden)]
+pub struct ShardReadTimer(Option<MonotonicTime>);
+impl ShardReadTimer {
+    /// Count a first-try failure and sample its blocking acquisition.
+    pub fn contended() -> Self {
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            add(&mut l.values, SHARD_CONTENTION, 1);
+            Self((l.values[SHARD_CONTENTION] % 64 == 1).then(MonotonicTime::now))
+        })
+    }
+}
+impl Drop for ShardReadTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.0 {
+            let ns = start.elapsed_ns();
+            LOCAL.with(|local| {
+                let mut l = local.borrow_mut();
+                add(&mut l.values, SHARD_CONTENTION + 1, 1);
+                add(&mut l.values, SHARD_CONTENTION + 2, ns);
+            });
+        }
+    }
+}
+
+pub(crate) struct PublicationTimer(MonotonicTime);
+impl PublicationTimer {
+    pub(crate) fn enter() -> Self {
+        Self(MonotonicTime::now())
+    }
+}
+impl Drop for PublicationTimer {
+    fn drop(&mut self) {
+        let ns = self.0.elapsed_ns();
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            let detailed = l.values.detailed.as_mut().unwrap();
+            detailed.publication_ns = detailed.publication_ns.saturating_add(ns);
         });
     }
 }
@@ -725,6 +966,29 @@ impl Drop for SampleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_run_has_no_detailed_counter_storage() {
+        let mut registry = Registry::default();
+        let run = RunGuard::enter(registry.register(), false, None);
+        LOCAL.with(|local| assert!(local.borrow().values.detailed.is_none()));
+        run.finish(Some(&crate::Exit::Hlt));
+        drop(run);
+        assert_eq!(registry.snapshot().exits.hlt.count, 1);
+    }
+
+    #[test]
+    fn contention_sampling_is_first_then_every_64th() {
+        let mut registry = Registry::default();
+        let run = RunGuard::enter(registry.register(), true, None);
+        for _ in 0..130 {
+            drop(ShardReadTimer::contended());
+        }
+        drop(run);
+        let stats = registry.snapshot();
+        assert_eq!(stats.fetch_shard_read_contention.calls, 130);
+        assert_eq!(stats.fetch_shard_read_contention.samples, 3);
+    }
 
     #[test]
     fn disabled_helper_never_borrows_local_accounting() {
