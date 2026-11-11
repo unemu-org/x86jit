@@ -1,6 +1,6 @@
 //! Explicit-context legacy lowering (decision-18 §1; spec.md §§7, 17).
 use super::*;
-use crate::legacy::{LegacyDecodeContext, LegacyOp as L, SegmentId};
+use crate::legacy::{ControlRegister, LegacyDecodeContext, LegacyOp as L, SegmentId};
 
 struct Ops {
     values: Vec<IrOp>,
@@ -66,7 +66,22 @@ pub(crate) fn instruction(
     ops.push(IrOp::InsnStart {
         guest_addr: u64::from(ip),
     });
-    if insn.is_invalid() {
+    // SDM Vol 2A §3.3 LGDT/LIDT; 80386 PRM §17 pp. 17-95,
+    // 17-154: /0../3 require memory. Newer instruction aliases in these
+    // ModRM register slots do not make them legal on the I386 generation.
+    let opcode = code;
+    let prefix_bytes = opcode
+        .iter()
+        .take_while(|b| {
+            matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .count();
+    let table_register_operand = matches!(&opcode[prefix_bytes..],
+        [0x0f, 0x01, modrm, ..] if modrm & 0xe0 == 0xc0);
+    if insn.is_invalid() || table_register_operand {
         // SDM Vol 3A §7.15, Events 6/13: #UD or an overlong instruction.
         let vector = if code.len() == 15 && exceeds_length_limit(code, mode) {
             13
@@ -164,11 +179,95 @@ pub(super) fn lower(
     };
     let next = insn.next_ip() as u32;
     match insn.mnemonic() {
-        // Decision-18 §4: later phases own system-register reads and writes.
-        // Keep these out of scalar MOV lowering, which cannot represent them.
-        Mov if insn.op_register(0).is_cr()
-            || insn.op_register(1).is_cr()
-            || insn.op_register(0).is_dr()
+        Lgdt | Lidt | Sgdt | Sidt => {
+            let addr = address(insn, ops, tg)?;
+            emit(
+                ops,
+                L::Table {
+                    addr,
+                    idtr: matches!(insn.mnemonic(), Lidt | Sidt),
+                    load: matches!(insn.mnemonic(), Lgdt | Lidt),
+                    size,
+                },
+            );
+        }
+        Smsw => {
+            let dst = tg.fresh();
+            emit(
+                ops,
+                L::ReadControl {
+                    dst,
+                    register: ControlRegister::Cr0,
+                },
+            );
+            let target = lower_write_target(insn, 0, ops, tg)?;
+            // SDM Vol 2B §4.3 SMSW; 80386 PRM §17 p. 17-160:
+            // memory is always a word. For r32, undefined bits 31:16 retain
+            // their prior value as engine policy; the GPR write is still 32-bit.
+            let value = if let WriteTarget::Reg { reg, size: 4 } = target {
+                let old = read_reg(reg, ops, tg);
+                let high = alu_none(ops, tg, |dst| IrOp::And {
+                    dst,
+                    a: old,
+                    b: Val::Imm(0xffff_0000),
+                    size: 4,
+                    set_flags: FlagMask::NONE,
+                });
+                let low = alu_none(ops, tg, |out| IrOp::And {
+                    dst: out,
+                    a: Val::Temp(dst),
+                    b: Val::Imm(0xffff),
+                    size: 4,
+                    set_flags: FlagMask::NONE,
+                });
+                alu_none(ops, tg, |dst| IrOp::Or {
+                    dst,
+                    a: high,
+                    b: low,
+                    size: 4,
+                    set_flags: FlagMask::NONE,
+                })
+            } else {
+                Val::Temp(dst)
+            };
+            emit_write(ops, tg, target, value);
+        }
+
+        Lmsw => {
+            let value = lower_read(insn, 0, ops, tg)?;
+            emit(ops, L::LoadMsw { value });
+        }
+        Clts => emit(ops, L::ClearTs),
+        Mov if insn.op_register(0).is_cr() || insn.op_register(1).is_cr() => {
+            let writing = insn.op_register(0).is_cr();
+            let register = match insn.op_register(u32::from(!writing)) {
+                Register::CR0 => ControlRegister::Cr0,
+                Register::CR2 => ControlRegister::Cr2,
+                Register::CR3 => ControlRegister::Cr3,
+                // 80386 PRM §4.1.3 Fig. 4-2 p. 4-3 (scan checked):
+                // CR1 is reserved; CR4 and later controls are not I386.
+                _ => {
+                    ops.push(IrOp::Trap {
+                        vector: 6,
+                        advance: 0,
+                    });
+                    return Ok(true);
+                }
+            };
+            // SDM Vol 2B §4.3 MOV CR; 80386 PRM §17 p. 17-111:
+            // always a 32-bit GPR transfer, including with a 66h prefix.
+            if writing {
+                let value = lower_read(insn, 1, ops, tg)?;
+                emit(ops, L::WriteControl { register, value });
+            } else {
+                let dst = tg.fresh();
+                emit(ops, L::ReadControl { dst, register });
+                let target = lower_write_target(insn, 0, ops, tg)?;
+                emit_write(ops, tg, target, Val::Temp(dst));
+            }
+        }
+        // Debug/test-register execution remains outside the activated system seam.
+        Mov if insn.op_register(0).is_dr()
             || insn.op_register(1).is_dr()
             || insn.op_register(0).is_tr()
             || insn.op_register(1).is_tr() =>
@@ -347,8 +446,14 @@ pub(super) fn lower(
         }
         Int | Int3 | Into => emit(
             ops,
-            L::Refuse {
-                operation: crate::UnsupportedSystemOperation::LegacyEventDelivery,
+            L::Interrupt {
+                vector: match insn.mnemonic() {
+                    Int => insn.immediate8(),
+                    Int3 => 3,
+                    _ => 4,
+                },
+                saved_ip: next,
+                overflow_only: insn.mnemonic() == Into,
             },
         ),
         Loop | Loope | Loopne | Jcxz | Jecxz => {
@@ -505,7 +610,7 @@ pub(super) fn lower(
             }
             return result;
         }
-        // Descriptor/CR primitives and event delivery are activated by later phases.
+        // Other system facilities are activated by later phases.
         _ => emit(
             ops,
             L::Refuse {

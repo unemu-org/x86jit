@@ -603,10 +603,45 @@ pub enum LegacyOp {
     Leave {
         size: u8,
     },
+    Table {
+        addr: crate::ir::Val,
+        idtr: bool,
+        load: bool,
+        size: u8,
+    },
+    ReadControl {
+        dst: crate::ir::Temp,
+        register: ControlRegister,
+    },
+    WriteControl {
+        register: ControlRegister,
+        value: crate::ir::Val,
+    },
+    LoadMsw {
+        value: crate::ir::Val,
+    },
+    ClearTs,
+    Interrupt {
+        vector: u8,
+        saved_ip: u32,
+        overflow_only: bool,
+    },
     CheckTaskReturn,
     Refuse {
         operation: crate::UnsupportedSystemOperation,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRegister {
+    Cr0,
+    Cr2,
+    Cr3,
+}
+
+// SDM Vol 2A §3.3 LMSW: only PE/MP/EM/TS are loaded; PE is sticky.
+pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
+    (cr0 & !0xe) | u32::from(source & 0xf)
 }
 
 /// SDM Vol 3B §23.1.1: check the complete effective offset before forming
@@ -684,6 +719,18 @@ pub(crate) fn restore_flags(
 #[cfg(test)]
 mod real_flags_tests {
     use super::*;
+    #[test]
+    fn lmsw_preserves_pe_and_every_bit_above_the_low_four() {
+        // SDM Vol 2A §3.3 LMSW: PE cannot be cleared; only bits 3:0 load.
+        for (cr0, source, expected) in [
+            (0x8000_001f, 0, 0x8000_0011),
+            (0x10, 0xfffe, 0x1e),
+            (0x10, 0xffff, 0x1f),
+            (0x8000_0011, 0x8000, 0x8000_0011),
+        ] {
+            assert_eq!(lmsw_value(cr0, source), expected);
+        }
+    }
     #[test]
     fn identification_images_and_pop_masks_are_generation_values() {
         // SDM Vol 1 §21.1.2; 80386 PRM §2.3.4 Fig. 2-8 p. 2-11

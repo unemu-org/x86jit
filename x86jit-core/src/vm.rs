@@ -1751,10 +1751,11 @@ impl Drop for DispatchGuard<'_> {
 
 impl Vcpu {
     /// Abandon pending execution and device completions between runs, in any
-    /// application mode. Clears queued IRQs, STI/SS interrupt shadows, IN/INS and
-    /// MMIO handoffs, host exit requests and their evidence, syscall evidence,
-    /// host-fault records, and per-vCPU fast lookup, IBTC refill and return-stack
-    /// predictions. Shared translations and their validated links are retained.
+    /// execution profile. Clears queued IRQs, STI/SS interrupt shadows, IN/INS and
+    /// MMIO handoffs, accepted legacy IRQ deliveries, host exit requests and their
+    /// evidence, syscall evidence, host-fault records, and per-vCPU fast lookup,
+    /// IBTC refill and return-stack predictions. Shared translations and their
+    /// validated links are retained.
     ///
     /// Call this first, then write the CPU model's reset registers into [`Self::cpu`]
     /// (including CS and IP), then resume execution. This method supplies no CPU-model
@@ -1769,6 +1770,9 @@ impl Vcpu {
         self.interruption_evidence = None;
         self.syscall_evidence = None;
         self.pending_irq = None;
+        if let Some(execution) = &mut self.legacy_execution {
+            execution.reset_execution_state();
+        }
         self.sti_shadow = false;
         self.ss_shadow = false;
         self.cpu.pending_port_in = None;
@@ -1838,7 +1842,7 @@ impl Vcpu {
     /// Queueing neither acknowledges a controller nor constructs a delivery frame.
     /// Application Real16 retains its existing delivery/readiness contract.
     /// Application Long64/Compat32 positive runs refuse with the vector retained;
-    /// legacy real execution refuses eligible delivery until its event seam lands.
+    /// Legacy I386 real execution delivers through its current IDTR.
     pub fn inject_irq(&mut self, vector: u8) {
         self.pending_irq = Some(vector);
     }
@@ -1851,15 +1855,18 @@ impl Vcpu {
         self.pending_irq.is_some()
     }
 
-    /// Whether a Real16 maskable IRQ could be accepted at this boundary.
+    /// Whether a real-address maskable IRQ could be accepted at this boundary.
     /// Independent of whether a vector is queued; does not acknowledge or deliver.
-    /// False outside Real16. Pending IN completion and the entire MMIO retry
+    /// Supported for Application Real16 and LegacySystem I386 real execution.
+    /// Pending IN completion and the entire MMIO retry
     /// (including answered but unfinished transfers) also prevent acceptance.
     ///
     /// IF and the STI/SS shadows follow SDM Vol 3A §7.8.1 and §7.8.3;
     /// device-completion blocking follows decision-16 §§1, 4.
     pub fn irq_ready(&self) -> bool {
-        self.profile == ExecutionProfile::Application(CpuMode::Real16)
+        (self.profile == ExecutionProfile::Application(CpuMode::Real16)
+            || (self.profile == ExecutionProfile::LegacySystem
+                && self.legacy_context_for_run().is_ok()))
             && !self.cpu.mmio_retry_active
             && self.irq_delivery_ready()
     }

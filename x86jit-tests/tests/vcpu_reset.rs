@@ -1,8 +1,8 @@
 //! In-place reset witnesses for engine state, independent of a CPU-model reset table.
 
 use x86jit_core::{
-    Backend, CpuMode, Exit, InterpreterBackend, PortDir, Prot, Reg, RegionKind, ResetOptions,
-    StepOptions, StepStop, Vcpu, Vm, VmConfig,
+    Backend, CpuGeneration, CpuMode, Exit, InterpreterBackend, LegacyCpuModel, PortDir, Prot, Reg,
+    RegionKind, ResetOptions, StepOptions, StepStop, Vcpu, Vm, VmConfig,
 };
 use x86jit_cranelift::JitBackend;
 
@@ -111,6 +111,75 @@ fn real16_discards_queued_irq_and_both_interrupt_shadows() {
         cpu.inject_irq(0x40);
         assert!(cpu.has_pending_irq());
         reset_and_resume(&vm, &mut cpu, CpuMode::Real16);
+    }
+}
+
+#[test]
+fn legacy_reset_abandons_accepted_irq_delivery_and_its_mmio_reads() {
+    for stepped in [false, true] {
+        for answered_reads in 0..=2 {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_legacy_cpu_model(LegacyCpuModel {
+                generation: CpuGeneration::I386,
+                model_semantics_id: 0x386,
+            });
+            vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(0x7000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+            vm.write_bytes(0x1000, b"\x43\xf4").unwrap(); // inc bx; hlt
+            vm.write_bytes(0x1800, b"\xf4").unwrap(); // abandoned IRQ handler
+            vm.write_bytes(0x4ffa, &[0xaa; 6]).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.gpr[Reg::Rsp.gpr_index().unwrap()] = 0x5000;
+            cpu.cpu.gpr[Reg::Rbx.gpr_index().unwrap()] = 0x10;
+            cpu.cpu.legacy.idtr.base = 0x7000;
+            cpu.cpu.flags.if_ = true;
+            cpu.inject_irq(0x20);
+            for (part, answer) in [0x1800, 0].into_iter().enumerate() {
+                let exit = if stepped {
+                    let run = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 0);
+                    let StepStop::Exit(exit) = run.stop() else {
+                        panic!("IRQ delivery must exit through MMIO");
+                    };
+                    exit.clone()
+                } else {
+                    cpu.run(&vm, None)
+                };
+                assert!(matches!(
+                    exit,
+                    Exit::MmioRead { addr, size: 2, .. } if addr == 0x7080 + part as u64 * 2
+                ));
+                if part >= answered_reads {
+                    break;
+                }
+                cpu.complete_mmio_read(answer);
+            }
+            assert_eq!(cpu.cpu.rip, 0x1000);
+            assert!(cpu.has_pending_irq());
+            assert!(cpu.cpu.mmio_retry_active);
+            // Retain the same CS:IP so changing retry ownership cannot hide a
+            // stale private delivery continuation. IF alone cannot revoke it.
+            cpu.cpu.flags.if_ = false;
+            cpu.reset_execution_state(ResetOptions::default());
+            assert!(!cpu.has_pending_irq());
+            assert!(!cpu.cpu.mmio_retry_active);
+            assert!(!cpu.cpu.flags.if_);
+            if stepped {
+                let run = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 2);
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+            } else {
+                let exit = cpu.run(&vm, Some(2));
+                assert!(matches!(exit, Exit::Hlt), "{exit:?}");
+            }
+            assert_eq!(cpu.cpu.rip, 0x1002);
+            assert_eq!(cpu.reg(Reg::Rbx), 0x11);
+            assert_eq!(cpu.reg(Reg::Rsp), 0x5000);
+            let mut frame = [0; 6];
+            vm.read_bytes(0x4ffa, &mut frame).unwrap();
+            assert_eq!(frame, [0xaa; 6]);
+        }
     }
 }
 

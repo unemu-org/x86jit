@@ -1,7 +1,7 @@
 //! Legacy real interpreter, selected before the op loop (decision-18 §§1, 4;
 //! spec.md §§8.1, 17). Shared scalar helpers retain their existing flag semantics.
 use super::*;
-use crate::legacy::{self, LegacyDecodeContext, LegacyOp as L, SegmentId};
+use crate::legacy::{self, ControlRegister, LegacyDecodeContext, LegacyOp as L, SegmentId};
 
 #[derive(Default)]
 pub(crate) struct Outcome {
@@ -31,6 +31,23 @@ fn exception(cpu: &CpuState, vector: u8) -> Exit {
     );
     details.path = crate::fault::FaultPath::Interpreter;
     Exit::exception(cpu.rip, vector).with_fault_metadata(details)
+}
+
+fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
+    // SDM Vol 3A §2.5: PG without PE is illegal, independently of whether
+    // this engine can execute the proposed regime (decision-18 §4).
+    if value & 0x8000_0001 == 0x8000_0000 {
+        return Err(exception(cpu, 13));
+    }
+    if value & !cpu.legacy.cr0 & 0x8000_0001 != 0 {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyExecution,
+        ));
+    }
+    let changed = cpu.legacy.cr0 != value;
+    cpu.legacy.cr0 = value;
+    Ok(changed)
 }
 
 fn selector(cpu: &CpuState, segment: SegmentId) -> u16 {
@@ -193,6 +210,64 @@ fn target(cpu: &CpuState, value: u64, size: u8) -> Result<u64, Exit> {
     let offset = value & mask(size);
     legacy::access(cpu, SegmentId::Cs, offset, 1)?;
     Ok(offset)
+}
+
+/// Shared real-address delivery for software INT and queued maskable IRQs.
+/// Faults remain outward until the exception-routing seam (decision-18 §4).
+pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: LegacyDecodeContext,
+    vector: u8,
+    saved_ip: u32,
+) -> Result<(), Exit> {
+    let mem = Access::<ROUTED, ORDER>::new(memory);
+    deliver(cpu, mem, context, vector, saved_ip)
+}
+
+fn deliver<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    context: LegacyDecodeContext,
+    vector: u8,
+    saved_ip: u32,
+) -> Result<(), Exit> {
+    // SDM Vol 3B §23.1.4; Vol 2A §3.3 INT, REAL-ADDRESS-MODE:
+    // four-byte IDTR-relative entries, inclusive limit, six-byte frame,
+    // no error code. Validate/read the target before committing the frame.
+    let offset = u32::from(vector) * 4;
+    if offset + 3 > u32::from(cpu.legacy.idtr.limit) {
+        // 80386 PRM §14.3 p.14-3, §14.6 Table 14-1 p.14-5, Table 14-2 p.14-8:
+        // I386 raises vector 8 here, diverging from the current SDM Vol 2A
+        // §3.3 INT's #GP. Report the fault outward; escalation/shutdown are
+        // deferred to the exception-routing seam (decision-18 §4).
+        let fault = if context.generation == crate::CpuGeneration::I386 {
+            8
+        } else {
+            13
+        };
+        return Err(exception(cpu, fault));
+    }
+    let address = u64::from(cpu.legacy.idtr.base.wrapping_add(offset));
+    let ip = read(cpu, mem, address, 2)?;
+    let cs = read(cpu, mem, u64::from((address as u32).wrapping_add(2)), 2)?;
+    if ip > u64::from(cpu.legacy.segments[SegmentId::Cs as usize].limit) {
+        return Err(exception(cpu, 13));
+    }
+    let flags = legacy::flags_image(cpu, context.generation);
+    push(
+        cpu,
+        mem,
+        context,
+        &[u64::from(flags), u64::from(cpu.cs), u64::from(saved_ip)],
+        2,
+    )?;
+    cpu.flags.if_ = false;
+    // SDM Vol 3B §23.1.4: clear TF/RF/AC on entry.
+    cpu.rflags_system &= !0x50100;
+    reload(cpu, SegmentId::Cs, cs as u16);
+    cpu.rip = ip;
+    Ok(())
 }
 
 fn supported(op: &IrOp) -> bool {
@@ -521,6 +596,99 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
             }
             IrOp::Legacy(op) => {
                 match op {
+                    L::Table {
+                        addr,
+                        idtr,
+                        load,
+                        size,
+                    } => {
+                        let addr = read_val(*addr, temps);
+                        let high = u64::from((addr as u32).wrapping_add(2));
+                        if *load {
+                            let limit = read(cpu, mem, addr, 2)? as u16;
+                            let base = read(cpu, mem, high, 4)? as u32;
+                            let table = legacy::TableRegister {
+                                base: if *size == 2 { base & 0x00ff_ffff } else { base },
+                                limit,
+                                reserved: 0,
+                            };
+                            // SDM Vol 2A §3.3 LGDT/LIDT; 80386 PRM §17
+                            // pp. 17-94–95 (page images checked): 16+24 or 16+32.
+                            let destination = if *idtr {
+                                &mut cpu.legacy.idtr
+                            } else {
+                                &mut cpu.legacy.gdtr
+                            };
+                            outcome.context_changed = *destination != table;
+                            *destination = table;
+                        } else {
+                            let table = if *idtr {
+                                cpu.legacy.idtr
+                            } else {
+                                cpu.legacy.gdtr
+                            };
+                            // SDM Vol 2B §4.3 SGDT/SIDT, IA-32 Architecture
+                            // Compatibility; 80386 PRM §17 p. 17-154 compatibility
+                            // note (scan checked): I386's 16-bit high byte is zero.
+                            let base = if *size == 2 {
+                                table.base & 0x00ff_ffff
+                            } else {
+                                table.base
+                            };
+                            probe(cpu, mem, addr, 2)?;
+                            probe(cpu, mem, high, 4)?;
+                            write(cpu, mem, addr, 2, u64::from(table.limit))?;
+                            write(cpu, mem, high, 4, u64::from(base))?;
+                        }
+                    }
+                    L::ReadControl { dst, register } => {
+                        temps[*dst as usize] = u64::from(match register {
+                            ControlRegister::Cr0 => cpu.legacy.cr0,
+                            ControlRegister::Cr2 => cpu.legacy.cr2,
+                            ControlRegister::Cr3 => cpu.legacy.cr3,
+                        });
+                    }
+                    L::WriteControl { register, value } => {
+                        let value = read_val(*value, temps) as u32;
+                        // SDM Vol 3A §2.5; 80386 PRM §4.1.3 Fig. 4-2
+                        // p. 4-3 (scan checked): I386 has CR0.PG/ET/TS/EM/MP/PE,
+                        // CR2[31:0], and CR3[31:12]. Ignore reserved write bits;
+                        // later CR0 controls and CR3.PCD/PWT are not I386 fields.
+                        // ET is writable on I386 (PRM §11.1.1 p. 11-1, scan checked).
+                        // MOV CR's arithmetic flags are undefined (SDM Vol 2B
+                        // §4.3); retaining them is the engine's deterministic policy.
+                        match register {
+                            ControlRegister::Cr0 => {
+                                outcome.context_changed = write_cr0(cpu, value & 0x8000_001f)?;
+                            }
+                            ControlRegister::Cr2 => cpu.legacy.cr2 = value,
+                            ControlRegister::Cr3 => {
+                                cpu.legacy.cr3 = value & 0xffff_f000;
+                                // Decision-18 §3: even an equal CR3 write invalidates.
+                                outcome.context_changed = true;
+                            }
+                        }
+                    }
+                    L::LoadMsw { value } => {
+                        let value =
+                            legacy::lmsw_value(cpu.legacy.cr0, read_val(*value, temps) as u16);
+                        outcome.context_changed = write_cr0(cpu, value)?;
+                    }
+                    L::ClearTs => {
+                        // SDM Vol 2A §3.3 CLTS; 80386 PRM §17 p. 17-48.
+                        outcome.context_changed = write_cr0(cpu, cpu.legacy.cr0 & !8)?;
+                    }
+                    L::Interrupt {
+                        vector,
+                        saved_ip,
+                        overflow_only,
+                    } => {
+                        if !overflow_only || cpu.flags.of {
+                            deliver(cpu, mem, context, *vector, *saved_ip)?;
+                            outcome.context_changed = true;
+                            return Ok(outcome);
+                        }
+                    }
                     L::Address {
                         dst,
                         segment,

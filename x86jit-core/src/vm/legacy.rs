@@ -47,6 +47,9 @@ pub(super) struct Execution {
     context_epoch: u64,
     stamp: Option<LegacyContextStamp>,
     blocks: HashMap<LegacyBlockKey, Block>,
+    // Accepted IRQ delivery can itself hand off an MMIO transfer. Its retry
+    // must complete before executing the interrupted instruction (decision-16 §3).
+    irq_retry: Option<(u8, u32, u16)>,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -59,7 +62,11 @@ impl Execution {
             context_epoch: 0,
             stamp: None,
             blocks: HashMap::new(),
+            irq_retry: None,
         }
+    }
+    pub(super) fn reset_execution_state(&mut self) {
+        self.irq_retry = None;
     }
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {
         let stamp = LegacyContextStamp::new(cpu, model);
@@ -160,7 +167,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8
 }
 
 impl Vcpu {
-    fn legacy_context_for_run(&self) -> Result<LegacyDecodeContext, Exit> {
+    pub(super) fn legacy_context_for_run(&self) -> Result<LegacyDecodeContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
         let context = derive_legacy_context(model, &self.cpu).map_err(|e| {
             Exit::UnsupportedSystemContext {
@@ -205,6 +212,13 @@ impl Vcpu {
         // while leaving every completion slot untouched at zero budget.
         if self.cpu.mmio_retry_active && !self.cpu.owns_mmio_retry(self.cpu.rip) {
             self.cpu.clear_mmio_parts();
+        }
+        let execution = self.legacy_execution.as_mut().unwrap();
+        if execution
+            .irq_retry
+            .is_some_and(|(_, ip, cs)| u64::from(ip) != self.cpu.rip || cs != self.cpu.cs)
+        {
+            execution.irq_retry = None;
         }
         if stepped && self.cpu.pending_port_in.is_some() {
             return Err(StepRunError::PendingPortIn);
@@ -277,7 +291,7 @@ impl Vcpu {
         &mut self,
         vm: &Vm,
         limit: Option<u64>,
-        _options: StepOptions,
+        options: StepOptions,
         _stepped: bool,
     ) -> StepRun {
         let model = self.legacy_model.unwrap();
@@ -311,15 +325,55 @@ impl Vcpu {
                     }
                 }
             };
-            if self.pending_irq.is_some()
-                && self.irq_delivery_ready()
-                && !self.cpu.mmio_retry_active
-            {
+            let irq = self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .irq_retry
+                .or_else(|| {
+                    self.pending_irq
+                        .filter(|_| self.irq_delivery_ready() && !self.cpu.mmio_retry_active)
+                        .map(|vector| (vector, self.cpu.rip as u32, self.cpu.cs))
+                });
+            if let Some((vector, saved_ip, saved_cs)) = irq {
+                if let Err(exit) = crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
+                    &mut self.cpu,
+                    &vm.mem,
+                    context,
+                    vector,
+                    saved_ip,
+                ) {
+                    self.legacy_execution.as_mut().unwrap().irq_retry = if matches!(
+                        exit,
+                        Exit::MmioRead { .. }
+                            | Exit::MmioWrite { .. }
+                            | Exit::UnmappedMemory { .. }
+                    ) {
+                        Some((vector, saved_ip, saved_cs))
+                    } else {
+                        None
+                    };
+                    return StepRun {
+                        steps,
+                        stop: StepStop::Exit(exit),
+                    };
+                }
+                self.legacy_execution.as_mut().unwrap().irq_retry = None;
+                if self.pending_irq == Some(vector) {
+                    self.pending_irq = None;
+                }
+                self.cpu.finish_mmio_retry(None);
+                self.legacy_execution
+                    .as_mut()
+                    .unwrap()
+                    .sync(&self.cpu, model, true);
+                // Delivery costs no instruction unit. Re-derive after the CS reload.
+                continue;
+            }
+            if options.stop_when_irq_ready && self.irq_ready() {
                 return StepRun {
                     steps,
-                    stop: StepStop::Exit(
-                        self.unsupported_legacy(UnsupportedSystemOperation::LegacyEventDelivery),
-                    ),
+                    stop: StepStop::IrqReady,
                 };
             }
             self.legacy_execution
@@ -380,6 +434,92 @@ impl Vcpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_delivery_advances_epoch_before_the_handler_can_execute() {
+        for irq in [false, true] {
+            let model = LegacyCpuModel {
+                generation: CpuGeneration::I386,
+                model_semantics_id: 1,
+            };
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_legacy_cpu_model(model);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, b"\xcd\x20\x43").unwrap();
+            vm.write_bytes(0x2080, b"\x00\x02\x00\x01").unwrap();
+            vm.write_bytes(0x1200, b"\xf4").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.gpr[4] = 0x8000;
+            cpu.cpu.legacy.idtr.base = 0x2000;
+            cpu.cpu.flags.if_ = true;
+            if irq {
+                cpu.inject_irq(0x20);
+            }
+            cpu.legacy_execution
+                .as_mut()
+                .unwrap()
+                .sync(&cpu.cpu, model, false);
+            let before = cpu.legacy_execution.as_ref().unwrap().context_epoch;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!(
+                cpu.legacy_execution.as_ref().unwrap().context_epoch,
+                before + 1
+            );
+            assert_eq!(cpu.cpu.cs, 0x100);
+            assert_eq!(cpu.cpu.rip, if irq { 0x201 } else { 0x200 });
+            assert_eq!(cpu.cpu.gpr[3], 0);
+        }
+    }
+
+    #[test]
+    fn system_writes_end_the_block_and_advance_only_the_required_epochs() {
+        let model = LegacyCpuModel {
+            generation: CpuGeneration::I386,
+            model_semantics_id: 1,
+        };
+        for (code, cr0, eax, advances) in [
+            (&b"\x0f\x22\xd8"[..], 0, 0, true), // equal CR3 still invalidates
+            (&b"\x0f\x22\xd0"[..], 0, 0x1234, false), // live CR2
+            (&b"\x0f\x22\xc0"[..], 0, 0x10, true),
+            (&b"\x0f\x22\xc0"[..], 0, 0, false),
+            (&b"\x0f\x01\xf0"[..], 0x10, 0xe, true),
+            (&b"\x0f\x06"[..], 0x18, 0, true),
+            (&b"\x0f\x01\x16\x00\x20"[..], 0, 0, true),
+            (&b"\x0f\x01\x1e\x00\x20"[..], 0, 0, true),
+        ] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_legacy_cpu_model(model);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, code).unwrap();
+            vm.write_bytes(0x1000 + code.len() as u64, b"\x43").unwrap();
+            vm.write_bytes(0x2000, b"\xff\x03\x00\x30\x00\x00").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.legacy.cr0 = cr0;
+            cpu.cpu.gpr[0] = eax;
+            cpu.legacy_execution
+                .as_mut()
+                .unwrap()
+                .sync(&cpu.cpu, model, false);
+            let before = cpu.legacy_execution.as_ref().unwrap().context_epoch;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1, "{code:02x?}: {:?}", run.stop());
+            assert_eq!(cpu.cpu.gpr[3], 0);
+            assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64);
+            assert_eq!(
+                cpu.legacy_execution.as_ref().unwrap().context_epoch,
+                before + u64::from(advances)
+            );
+            if advances {
+                assert!(cpu.legacy_execution.as_ref().unwrap().blocks.is_empty());
+            }
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!(cpu.cpu.gpr[3], 1);
+        }
+    }
+
     #[test]
     fn epoch_stamp_guards_context_but_not_live_outputs_and_rolls_over_empty() {
         let model = LegacyCpuModel {

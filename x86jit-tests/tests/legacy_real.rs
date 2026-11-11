@@ -1,9 +1,9 @@
 //! Legacy I386 real-address witnesses. Expected values are derived from the
 //! cited manuals; no emulator supplies instruction semantics.
 use x86jit_core::{
-    Backend, CachedBlock, CpuGeneration, CpuState, Exit, IrBlock, LegacyCpuModel, MemConsistency,
-    Prot, RegionKind, SegmentId, StepOptions, StepRunError, StepStop, UnsupportedSystemOperation,
-    Vcpu, Vm, VmConfig,
+    Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, Exit, IrBlock, LegacyCpuModel,
+    MemConsistency, Prot, RegionKind, SegmentId, StepOptions, StepRunError, StepStop,
+    UnsupportedSystemOperation, Vcpu, Vm, VmConfig,
 };
 
 const MODEL: LegacyCpuModel = LegacyCpuModel {
@@ -265,23 +265,19 @@ fn strings_step_by_iteration_with_effective_indices_and_limits() {
 
 #[test]
 fn zero_steps_port_completion_and_sti_ss_shadows() {
-    // Decision-16 §§1,4; SDM Vol 3A §§7.8.1,7.8.3. Unavailable legacy
-    // event delivery is a typed refusal at acceptance, retaining the vector.
+    // Decision-16 §§1,4; SDM Vol 3A §§7.8.1,7.8.3: a queued IRQ waits
+    // through STI and one completed instruction, then delivery costs zero steps.
     let (vm, mut cpu) = setup(b"\xfb\x66\x60\x90");
+    vm.write_bytes(0x80, b"\x00\x18\x00\x00").unwrap();
+    vm.write_bytes(0x1800, b"\xf4").unwrap();
     cpu.inject_irq(0x20);
     steps(&mut cpu, &vm, 0);
     steps(&mut cpu, &vm, 1);
     steps(&mut cpu, &vm, 1);
     let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-    assert_eq!(run.steps(), 0);
-    assert!(matches!(
-        run.stop(),
-        StepStop::Exit(Exit::UnsupportedSystemContext {
-            operation: UnsupportedSystemOperation::LegacyEventDelivery,
-            ..
-        })
-    ));
-    assert!(cpu.has_pending_irq());
+    assert_eq!(run.steps(), 1);
+    assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+    assert!(!cpu.has_pending_irq());
     assert!(!cpu.irq_ready());
     let (vm, mut cpu) = setup(b"\xe4\x20\xf4");
     let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
@@ -589,6 +585,8 @@ fn lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit() {
         let (vm, mut cpu) = setup(code);
         vm.write_bytes(0x2000, b"\x34\x12\x00\x00").unwrap();
         vm.write_bytes(0x8000, b"\x00\x00").unwrap();
+        vm.write_bytes(0x80, b"\x00\x18\x00\x00").unwrap();
+        vm.write_bytes(0x1800, b"\xf4").unwrap();
         cpu.cpu.flags.if_ = true;
         steps(&mut cpu, &vm, 1);
         cpu.inject_irq(0x20);
@@ -599,17 +597,12 @@ fn lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit() {
         }
         let rip = cpu.cpu.rip;
         let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert_eq!(run.steps(), 0);
-        assert!(matches!(
-            run.stop(),
-            StepStop::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::LegacyEventDelivery,
-                ..
-            })
-        ));
-        assert_eq!(cpu.cpu.rip, rip);
+        assert_eq!(run.steps(), 1);
+        assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+        assert_eq!(cpu.cpu.rip, 0x1801);
+        assert_eq!(value(&vm, cpu.cpu.gpr[4], 2), rip);
         assert_eq!(cpu.cpu.gpr[0], ax + u64::from(shadow));
-        assert!(cpu.has_pending_irq());
+        assert!(!cpu.has_pending_irq());
     }
 }
 
@@ -748,9 +741,8 @@ fn deferred_system_register_accesses_have_effect_free_typed_refusals() {
     // Decision-18 §4: system-register operations owned by later phases use a
     // typed engine refusal. SDM Vol 2B §4.3 MOV to/from Control/Debug Registers;
     // 80386 PRM §17 MOV to/from Special Registers, pp. 17-111 (page image checked).
-    for opcode in [0x20, 0x21, 0x22, 0x23, 0x24, 0x26] {
+    for opcode in [0x21, 0x23, 0x24, 0x26] {
         let registers: &[u8] = match opcode {
-            0x20 | 0x22 => &[0, 2, 3, 4],
             0x21 | 0x23 => &[0, 1, 2, 3, 6, 7],
             _ => &[6, 7],
         };
@@ -777,4 +769,464 @@ fn deferred_system_register_accesses_have_effect_free_typed_refusals() {
             assert_eq!(cpu.retired_instructions(), 0);
         }
     }
+}
+
+#[test]
+fn descriptor_table_operand_images_and_flags_for_both_sizes() {
+    // SDM 325462-092US Vol 2A §3.3 LGDT/LIDT; Vol 2B §4.3 SGDT/SIDT.
+    // 80386 PRM §17 pp. 17-94–95, 17-154 (page images checked).
+    // Narrow reading: the explicit SGDT/SIDT compatibility paragraphs prescribe
+    // zero in byte 5 of the 16-bit store. PRM p. 17-94 says full base for both
+    // stores and p. 17-154's description swaps widths; the compatibility rule
+    // agrees with the primary SDM and governs this generation-specific image.
+    // The 286's undefined/ones byte is not an I386 rule or activated generation.
+    for default32 in [false, true] {
+        for op32 in [false, true] {
+            for idtr in [false, true] {
+                let mut code = vec![];
+                if default32 {
+                    code.push(0x67);
+                }
+                if op32 != default32 {
+                    code.push(0x66);
+                }
+                code.extend([0x0f, 0x01, if idtr { 0x1e } else { 0x16 }, 0, 0x20]);
+                let (vm, mut cpu) = setup(&code);
+                if default32 {
+                    cpu.cpu.legacy.segments[0].attributes |= 1 << 14;
+                }
+                cpu.cpu.flags.set_flags16(0x7ed7);
+                cpu.cpu.rflags_system = 0x7000;
+                let flags = cpu.cpu.flags;
+                vm.write_bytes(0x2000, &[0x45, 0x23, 0x78, 0x56, 0x34, 0x92])
+                    .unwrap();
+                steps(&mut cpu, &vm, 1);
+                let table = if idtr {
+                    cpu.cpu.legacy.idtr
+                } else {
+                    cpu.cpu.legacy.gdtr
+                };
+                assert_eq!(table.limit, 0x2345);
+                assert_eq!(table.base, if op32 { 0x92345678 } else { 0x345678 });
+                assert_eq!(cpu.cpu.flags, flags);
+                assert_eq!(cpu.cpu.rflags_system, 0x7000);
+                // Store a nonzero upper base even in the 16-bit case so this tests
+                // the store image independently of the preceding load's truncation.
+                if idtr {
+                    cpu.cpu.legacy.idtr.base = 0x92345678;
+                } else {
+                    cpu.cpu.legacy.gdtr.base = 0x92345678;
+                }
+                code.clear();
+                if default32 {
+                    code.push(0x67);
+                }
+                if op32 != default32 {
+                    code.push(0x66);
+                }
+                code.extend([0x0f, 0x01, if idtr { 0x0e } else { 0x06 }, 0, 0x20]);
+                vm.write_bytes(0x1000, &code).unwrap();
+                cpu.cpu.rip = 0x1000;
+                vm.write_bytes(0x2000, &[0xaa; 8]).unwrap();
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(
+                    value(&vm, 0x2000, 8),
+                    if op32 {
+                        0xaaaa923456782345
+                    } else {
+                        0xaaaa003456782345
+                    }
+                );
+                assert_eq!(cpu.cpu.flags, flags);
+                assert_eq!(cpu.cpu.rflags_system, 0x7000);
+            }
+        }
+    }
+}
+
+#[test]
+fn table_operands_check_all_six_bytes_before_effects_and_retry_mmio() {
+    // SDM Vol 2A §3.3 LGDT/LIDT; Vol 2B §4.3 SGDT/SIDT:
+    // memory-only, six bytes, unchanged flags; segment-limit #GP/#SS.
+    for prefix in [&b""[..], &b"\x66"[..]] {
+        for extension in [0, 1, 2, 3] {
+            for ss in [false, true] {
+                let mut code = prefix.to_vec();
+                if ss {
+                    code.push(0x36);
+                }
+                code.extend([0x0f, 0x01, 0x06 | (extension << 3), 0xfb, 0xff]);
+                let (vm, mut cpu) = setup(&code);
+                vm.write_bytes(0xfffb, &[0xaa; 6]).unwrap();
+                let before = format!("{:?}", cpu.cpu);
+                exception(&mut cpu, &vm, if ss { 12 } else { 13 });
+                assert_eq!(format!("{:?}", cpu.cpu), before);
+                assert_eq!(value(&vm, 0xfffb, 6), 0xaaaaaaaaaaaa);
+            }
+        }
+    }
+    for extension in [0, 1, 2, 3] {
+        let (mut vm, mut cpu) = setup(&[0x66, 0x0f, 0x01, 0x06 | (extension << 3), 0xfe, 0x2f]);
+        vm.unmap(0, 0x40000).unwrap();
+        vm.map(0, 0x3000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(
+            0x1000,
+            &[0x66, 0x0f, 0x01, 0x06 | (extension << 3), 0xfe, 0x2f],
+        )
+        .unwrap();
+        vm.write_bytes(0x2ffe, &[0x78, 0x56]).unwrap();
+        let before = cpu.cpu.legacy;
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(matches!(
+            run.stop(),
+            StepStop::Exit(Exit::UnmappedMemory { addr: 0x3000, .. })
+        ));
+        assert_eq!(cpu.cpu.legacy, before);
+        assert_eq!(value(&vm, 0x2ffe, 2), 0x5678);
+        vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        if extension >= 2 {
+            assert!(matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioRead {
+                    addr: 0x3000,
+                    size: 4,
+                    ..
+                })
+            ));
+            assert_eq!(cpu.cpu.legacy, before);
+            cpu.complete_mmio_read(0x92345678);
+            steps(&mut cpu, &vm, 1);
+            let table = if extension == 3 {
+                cpu.cpu.legacy.idtr
+            } else {
+                cpu.cpu.legacy.gdtr
+            };
+            assert_eq!((table.base, table.limit), (0x92345678, 0x5678));
+        } else {
+            assert!(matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr: 0x3000,
+                    size: 4,
+                    ..
+                })
+            ));
+            cpu.complete_mmio_write();
+            steps(&mut cpu, &vm, 1);
+        }
+    }
+}
+
+#[test]
+fn control_registers_have_386_masks_fixed_width_and_real_privilege() {
+    // SDM Vol 3A §2.5; Vol 2B §4.3 MOV CR (reserved CR0 bits ignored;
+    // arithmetic flags undefined). 80386 PRM §4.1.3 Fig. 4-2 p. 4-3;
+    // §17 p. 17-111 (page images checked): PG + low five CR0 bits, full
+    // CR2, CR3[31:12], fixed 32-bit transfers. Deterministic undefined flags
+    // retain their input; this is an engine policy, not an architectural value.
+    for prefix in [&b""[..], &b"\x66"[..]] {
+        for (register, source, expected) in [
+            (0, 0x7ffffffe, 0x1e),
+            (0, 0, 0),
+            (2, 0x87654321, 0x87654321),
+            (3, 0x12345fff, 0x12345000),
+        ] {
+            let mut code = prefix.to_vec();
+            code.extend([0x0f, 0x22, 0xc0 | (register << 3)]);
+            code.extend(prefix);
+            code.extend([0x0f, 0x20, 0xc3 | (register << 3)]);
+            let (vm, mut cpu) = setup(&code);
+            // PRM §11.1.1 p. 11-1 (scan checked): MOV can also clear ET.
+            if register == 0 && source == 0 {
+                cpu.cpu.legacy.cr0 = 0x1e;
+            }
+            cpu.cpu.gpr[0] = 0xdead00000000 | source;
+            cpu.cpu.gpr[3] = u64::MAX;
+            cpu.cpu.flags.set_flags16(0x7ed7);
+            cpu.cpu.rflags_system = 0x7000;
+            // A real selector's low bits are not CPL; real mode executes at 0.
+            cpu.cpu.cs = 3;
+            let flags = cpu.cpu.flags;
+            steps(&mut cpu, &vm, 2);
+            assert_eq!(cpu.cpu.gpr[3], expected);
+            assert_eq!(cpu.cpu.flags, flags);
+            assert_eq!(cpu.cpu.rflags_system, 0x7000);
+        }
+    }
+}
+
+#[test]
+fn msw_and_clts_use_only_their_documented_bits_and_preserve_flags() {
+    // SDM Vol 2A §3.3 LMSW/CLTS; Vol 2B §4.3 SMSW. 80386 PRM §17
+    // pp. 17-48, 17-99, 17-160 (page images checked). SMSW r32 upper
+    // half is undefined; retaining it is our policy. Memory is always m16.
+    for prefix in [&b""[..], &b"\x66"[..]] {
+        for memory in [false, true] {
+            let mut code = prefix.to_vec();
+            code.extend(if memory {
+                &b"\x0f\x01\x36\x00\x20"[..]
+            } else {
+                &b"\x0f\x01\xf0"[..]
+            });
+            code.extend(prefix);
+            code.extend(b"\x0f\x01\xe3"); // SMSW (E)BX
+            code.extend(prefix);
+            code.extend(b"\x0f\x01\x26\x02\x20"); // SMSW m16
+            code.extend(b"\x0f\x06");
+            let (vm, mut cpu) = setup(&code);
+            cpu.cpu.legacy.cr0 = 0x10;
+            cpu.cpu.gpr[0] = 0xfffe;
+            cpu.cpu.gpr[3] = 0xfeedbeef12345678;
+            cpu.cpu.flags.set_flags16(0x7ed7);
+            let flags = cpu.cpu.flags;
+            vm.write_bytes(0x2000, &[0xfe, 0xff, 0xaa, 0xaa, 0xaa, 0xaa])
+                .unwrap();
+            steps(&mut cpu, &vm, 3);
+            assert_eq!(cpu.cpu.legacy.cr0, 0x1e);
+            assert_eq!(
+                cpu.cpu.gpr[3],
+                if prefix.is_empty() {
+                    0xfeedbeef1234001e
+                } else {
+                    0x1234001e
+                }
+            );
+            assert_eq!(value(&vm, 0x2002, 4), 0xaaaa001e);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.legacy.cr0, 0x16);
+            assert_eq!(cpu.cpu.flags, flags);
+        }
+    }
+}
+
+#[test]
+fn enabling_pe_or_pg_refuses_atomically_but_pg_without_pe_faults() {
+    // SDM Vol 3A §2.5; decision-18 §4: legality precedes an engine refusal.
+    for prefix in [&b""[..], &b"\x66"[..]] {
+        for (code, value, gp) in [
+            (&b"\x0f\x22\xc0"[..], 1, false),
+            (&b"\x0f\x22\xc0"[..], 0x80000001, false),
+            (&b"\x0f\x22\xc0"[..], 0x80000000, true),
+            (&b"\x0f\x01\xf0"[..], 0xffff, false),
+            (&b"\x0f\x01\x36\x00\x20"[..], 0xffff, false),
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend(code);
+            bytes.push(0x43);
+            let (vm, mut cpu) = setup(&bytes);
+            cpu.cpu.gpr[0] = value;
+            cpu.cpu.rflags_system = 0x10000;
+            vm.write_bytes(0x2000, &[0xff, 0xff]).unwrap();
+            let before = format!("{:?}", cpu.cpu);
+            let run = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            if gp {
+                assert!(matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::Exception { vector: 13, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::LegacyExecution,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(format!("{:?}", cpu.cpu), before);
+            assert_eq!(cpu.retired_instructions(), 0);
+        }
+    }
+}
+
+#[test]
+fn illegal_system_encodings_and_word_memory_limits_fault_without_effects() {
+    // SDM Vol 2A §3.3 LGDT/LIDT/LMSW/CLTS; Vol 2B §4.3
+    // SGDT/SIDT/SMSW/MOV CR: LOCK is #UD, table operands are memory-only.
+    // 80386 PRM §4.1.3 p. 4-3: CR1 reserved, no CR4 on I386.
+    for code in [
+        &b"\xf0\x0f\x06"[..],
+        &b"\xf0\x0f\x22\xc0"[..],
+        &b"\xf0\x0f\x20\xc0"[..],
+        &b"\xf0\x0f\x01\xe0"[..],
+        &b"\xf0\x0f\x01\xf0"[..],
+        &b"\xf0\x0f\x01\x16\x00\x20"[..],
+        &b"\xf0\x0f\x01\x06\x00\x20"[..],
+        &b"\x0f\x20\xc8"[..],
+        &b"\x0f\x22\xc8"[..],
+        &b"\x0f\x20\xe0"[..],
+        &b"\x0f\x22\xe0"[..],
+        &b"\x0f\x01\xcb"[..],
+        &b"\x0f\x01\xdb"[..],
+    ] {
+        let (vm, mut cpu) = setup(code);
+        let before = format!("{:?}", cpu.cpu);
+        exception(&mut cpu, &vm, 6);
+        assert_eq!(format!("{:?}", cpu.cpu), before);
+    }
+    for prefix in [&b""[..], &b"\x66"[..]] {
+        for extension in 0..4 {
+            for register in 0..8 {
+                let mut code = prefix.to_vec();
+                code.extend([0x0f, 0x01, 0xc0 | (extension << 3) | register]);
+                let (vm, mut cpu) = setup(&code);
+                exception(&mut cpu, &vm, 6);
+            }
+        }
+    }
+    for code in [
+        &b"\x0f\x01\x26\xff\xff"[..],
+        &b"\x66\x0f\x01\x36\xff\xff"[..],
+    ] {
+        let (vm, mut cpu) = setup(code);
+        exception(&mut cpu, &vm, 13);
+    }
+}
+
+#[test]
+fn real_delivery_uses_idtr_base_limit_and_exact_six_byte_frame() {
+    // SDM Vol 3B §23.1.4; Vol 2A §3.3 INT real-address operation:
+    // four-byte IDTR-relative entry, inclusive limit, word FLAGS/CS/IP frame.
+    // 80386 PRM §14.3 p.14-3, §14.6 Table 14-1 p.14-5, Table 14-2 p.14-8:
+    // an entry beyond IDTR.limit faults with vector 8 on I386, diverging from
+    // the current SDM Vol 2A §3.3 INT's #GP. Delivery faults remain outward.
+    for (code, vector, saved) in [
+        (&b"\xcd\x20"[..], 0x20, 0x1002),
+        (&b"\x66\xcd\x20"[..], 0x20, 0x1003),
+        (&b"\xcc"[..], 3, 0x1001),
+        (&b"\xce"[..], 4, 0x1001),
+        (&b"\x90"[..], 0x20, 0x1000),
+    ] {
+        for short_limit in [false, true] {
+            let (vm, mut cpu) = setup(code);
+            cpu.cpu.legacy.idtr.base = 0x2000;
+            cpu.cpu.legacy.segments[1].base = 0x9000;
+            cpu.cpu.legacy.idtr.limit = vector * 4 + if short_limit { 2 } else { 3 };
+            cpu.cpu.flags.set_flags16(0x0ed7);
+            cpu.cpu.rflags_system = 0x7000;
+            vm.write_bytes(0x2000 + u64::from(vector) * 4, b"\x00\x02\x00\x01")
+                .unwrap();
+            vm.write_bytes(0x1200, b"\xf4").unwrap();
+            vm.write_bytes(0x7ffa, &[0xaa; 6]).unwrap();
+            let irq = code == b"\x90";
+            if irq {
+                cpu.inject_irq(vector as u8);
+            }
+            let before = format!("{:?}", cpu.cpu);
+            steps(&mut cpu, &vm, 0);
+            assert_eq!(format!("{:?}", cpu.cpu), before);
+            if short_limit {
+                exception(&mut cpu, &vm, 8);
+                assert_eq!(format!("{:?}", cpu.cpu), before);
+                assert_eq!(value(&vm, 0x7ffa, 6), 0xaaaaaaaaaaaa);
+                assert_eq!(cpu.has_pending_irq(), irq);
+            } else {
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1);
+                assert_eq!(cpu.retired_instructions(), 1);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip),
+                    (0x100, if irq { 0x201 } else { 0x200 })
+                );
+                assert_eq!(cpu.cpu.legacy.segments[0].base, 0x1000);
+                assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+                assert_eq!(value(&vm, 0x7ffa, 6), (0x7ed7 << 32) | saved);
+                assert!(!cpu.cpu.flags.if_);
+                assert_eq!(cpu.cpu.rflags_system, 0x7000);
+                assert!(!cpu.has_pending_irq());
+            }
+        }
+    }
+    let (vm, mut cpu) = setup(b"\xce\x90");
+    steps(&mut cpu, &vm, 1); // INTO with OF=0 does not access even a short IDTR.
+    assert_eq!(cpu.cpu.rip, 0x1001);
+}
+
+#[test]
+fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction() {
+    // Decision-16 §§1,3; SDM Vol 3B §23.1.4. A device answer belongs to
+    // delivery, and neither accepting nor retrying delivery consumes a step.
+    let (mut vm, mut cpu) = setup(b"\x43");
+    vm.unmap(0, 0x40000).unwrap();
+    vm.map(0, 0x30000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x30000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+    vm.write_bytes(0x1000, b"\x43").unwrap();
+    vm.write_bytes(0x1800, b"\xf4").unwrap();
+    cpu.cpu.legacy.idtr.base = 0x30000;
+    cpu.cpu.flags.if_ = true;
+    cpu.inject_irq(0x20);
+    for (address, answer) in [(0x30080, 0x1800), (0x30082, 0)] {
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(
+            matches!(run.stop(), StepStop::Exit(Exit::MmioRead { addr, size: 2, .. }) if *addr == address)
+        );
+        assert_eq!(cpu.cpu.rip, 0x1000);
+        assert_eq!(cpu.cpu.gpr[3], 0);
+        assert_eq!(cpu.cpu.gpr[4], 0x8000);
+        assert!(cpu.has_pending_irq());
+        cpu.complete_mmio_read(answer);
+        steps(&mut cpu, &vm, 0);
+    }
+    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    assert_eq!(run.steps(), 1);
+    assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+    assert_eq!(cpu.cpu.gpr[3], 0);
+    assert_eq!(value(&vm, 0x7ffa, 2), 0x1000);
+    assert!(!cpu.has_pending_irq());
+}
+
+#[test]
+fn application_real16_delivery_ignores_all_legacy_table_and_control_storage() {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(NoBackend));
+    vm.set_cpu_mode(CpuMode::Real16);
+    vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, b"\xcd\x20").unwrap();
+    vm.write_bytes(0x80, b"\x00\x18\x00\x00").unwrap();
+    vm.write_bytes(0x2080, b"\x00\x28\x00\x00").unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.gpr[4] = 0x8000;
+    cpu.cpu.legacy.idtr.base = 0x2000;
+    cpu.cpu.legacy.idtr.limit = 0;
+    cpu.cpu.legacy.cr0 = u32::MAX;
+    cpu.cpu.legacy.cpl = 255;
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.rip, 0x1800);
+    assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+    assert_eq!(value(&vm, 0x7ffa, 2), 0x1002);
+}
+
+#[test]
+fn application_real16_ir_matches_frozen_parent_snapshots() {
+    // Measured at parent 9958575 with the same Rust 1.95 toolchain. Real16
+    // never materializes; compare its actual application IR, including metadata.
+    let mut snapshot = String::new();
+    for (name, code) in [
+        ("alu", &b"\x01\xd8\x46\x31\xc2\x75\xfa"[..]),
+        ("stack", &b"\x50\x5b\xf4"[..]),
+        ("rep", &b"\xf3\xa5\xf4"[..]),
+        ("fs", &b"\x64\x8b\x07\xf4"[..]),
+        ("int", &b"\xcd\x20"[..]),
+    ] {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x100000), Box::new(NoBackend));
+        vm.set_cpu_mode(CpuMode::Real16);
+        vm.map(0, 0x100000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, code).unwrap();
+        let ir = x86jit_core::lift::lift_block(
+            &vm.mem,
+            x86jit_core::lift::FetchAddr {
+                pa: 0x1000,
+                ip: 0x1000,
+            },
+            CpuMode::Real16,
+        )
+        .unwrap();
+        snapshot.push_str(&format!("{name}\n{ir:?}\n"));
+    }
+    assert_eq!(snapshot, include_str!("fixtures/real16_parent_ir.snap"));
 }
