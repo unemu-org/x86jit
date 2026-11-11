@@ -637,6 +637,7 @@ struct WatchPages {
     dirty: Box<[AtomicU64]>,
     /// Indices of `watch` words holding at least one watched page — the drain's
     /// scan list, so a drain costs O(watched pages / 64) rather than O(span).
+    /// Registration changes and scan-list updates share this lock.
     words: Mutex<BTreeSet<u64>>,
     /// Number of watched pages. Gates the store path (and is what the JIT loads
     /// through `watch_count_ptr`), so an unwatched memory pays one relaxed load.
@@ -701,10 +702,11 @@ impl WatchPages {
             debug_assert!(false, "watch_range page {page:#x} outside the guest span");
             return;
         };
+        let mut words = self.words.lock().unwrap();
         // Count only unwatched->watched transitions, so `count` is exact.
         if word.fetch_or(m, Ordering::Relaxed) & m == 0 {
             self.count.fetch_add(1, Ordering::Relaxed);
-            self.words.lock().unwrap().insert(w as u64);
+            words.insert(w as u64);
         }
     }
 
@@ -713,13 +715,14 @@ impl WatchPages {
         let Some(word) = self.watch.get(w) else {
             return;
         };
+        let mut words = self.words.lock().unwrap();
         if word.fetch_and(!m, Ordering::Relaxed) & m != 0 {
             self.count.fetch_sub(1, Ordering::Relaxed);
             // Drop any pending dirty bit: an unwatched page must not surface in a
             // later drain, nor come back stale if the range is watched again.
             self.dirty[w].fetch_and(!m, Ordering::Relaxed);
             if word.load(Ordering::Relaxed) == 0 {
-                self.words.lock().unwrap().remove(&(w as u64));
+                words.remove(&(w as u64));
             }
         }
     }
@@ -3854,6 +3857,55 @@ mod tests {
         m.unwatch_range(0x2000, 16);
         m.write_bytes(0x2000, &[1; 4]).unwrap();
         assert!(m.take_dirty_ranges().is_empty(), "unwatched → no record");
+    }
+
+    #[test]
+    fn concurrent_watch_unwatch_keeps_dirty_word_scannable() {
+        use std::sync::{atomic::AtomicBool, Barrier};
+        use std::time::{Duration, Instant};
+
+        // Different pages in one word: only page 2 is written or drained.
+        // Keeping page 3 watched is the control: the word can never reach zero.
+        for keep_word_nonzero in [true, false] {
+            let m = watched_mem();
+            if keep_word_nonzero {
+                m.watch_range(0x3000, CODE_PAGE_SIZE);
+            }
+            let start = Barrier::new(2);
+            let stop = AtomicBool::new(false);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut lost = 0;
+            let mut drains = 0;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        m.watch_range(0x1000, CODE_PAGE_SIZE);
+                        m.unwatch_range(0x1000, CODE_PAGE_SIZE);
+                    }
+                });
+                start.wait();
+                for i in 0..200_000 {
+                    if i % 1024 == 0 && Instant::now() >= deadline {
+                        break;
+                    }
+                    m.watch_range(0x2000, CODE_PAGE_SIZE);
+                    m.note_write(0x2000, 1);
+                    if m.take_dirty_ranges() != [(0x2000, CODE_PAGE_SIZE)] {
+                        lost += 1;
+                    }
+                    m.unwatch_range(0x2000, CODE_PAGE_SIZE);
+                    drains += 1;
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            eprintln!("keep_word_nonzero={keep_word_nonzero}: {lost} lost / {drains} drains");
+            assert!(
+                drains > 0,
+                "the stress probe must perform writes and drains"
+            );
+            assert_eq!(lost, 0, "keep_word_nonzero={keep_word_nonzero}");
+        }
     }
 
     #[test]
