@@ -1945,7 +1945,7 @@ impl Vcpu {
     /// Queueing neither acknowledges a controller nor constructs a delivery frame.
     /// Application Real16 retains its existing delivery/readiness contract.
     /// Application Long64/Compat32 positive runs refuse with the vector retained;
-    /// Legacy I386 real execution delivers through its current IDTR.
+    /// Legacy I286/I386 real execution delivers through its current IDTR.
     pub fn inject_irq(&mut self, vector: u8) {
         self.pending_irq = Some(vector);
     }
@@ -1960,7 +1960,7 @@ impl Vcpu {
 
     /// Whether a real-address maskable IRQ could be accepted at this boundary.
     /// Independent of whether a vector is queued; does not acknowledge or deliver.
-    /// Supported for Application Real16 and LegacySystem I386 real execution.
+    /// Supported for Application Real16 and LegacySystem I286/I386 real execution.
     /// Pending IN completion and the entire MMIO retry
     /// (including answered but unfinished transfers) also prevent acceptance.
     ///
@@ -2416,7 +2416,7 @@ impl Vcpu {
     /// with [`CpuMode::Real16`], including when the VM has a compiling backend
     /// (decision-16 §§1–4). Application Long64/Compat32 return
     /// [`StepRunError::UnsupportedMode`], including with a zero budget.
-    /// [`ExecutionProfile::LegacySystem`] also supports same-CPL I386 real and
+    /// [`ExecutionProfile::LegacySystem`] also supports same-CPL I286/I386 real and
     /// protected execution, using derived code/stack sizes and a private
     /// interpreter cache. Unavailable event delivery returns typed unsupported exits.
     /// No legacy context enters a compiling backend.

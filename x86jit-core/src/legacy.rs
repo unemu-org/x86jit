@@ -183,6 +183,13 @@ pub fn derive_legacy_context(
         if model.generation != CpuGeneration::I386 && cache.attributes & (1 << 14) != 0 {
             return Err(SizeRequires386);
         }
+        // I286 PRM §6.3 Fig. 6-3 p. 6-5: hidden descriptors have a
+        // 24-bit base, 16-bit limit and only the access byte as attributes.
+        if model.generation == CpuGeneration::I286
+            && (cache.base > 0x00ff_ffff || cache.limit > 0xffff || cache.attributes & 0xf000 != 0)
+        {
+            return Err(InvalidStorage);
+        }
     }
     if cs.unusable != 0 || ss.unusable != 0 {
         return Err(UnusableCodeOrStack);
@@ -326,10 +333,23 @@ mod tests {
                                     cpu.ss |= u16::from(cpl);
                                 }
                                 // Give retained caches bases/limits that a selector rebuild would lose.
-                                cpu.legacy.segments[0].base = 0x1234_5678;
-                                cpu.legacy.segments[0].limit = 0x1234_ffff;
+                                cpu.legacy.segments[0].base = if generation == CpuGeneration::I286 {
+                                    0x12_5678
+                                } else {
+                                    0x1234_5678
+                                };
+                                cpu.legacy.segments[0].limit = if generation == CpuGeneration::I286
+                                {
+                                    0xabcd
+                                } else {
+                                    0x1234_ffff
+                                };
                                 cpu.legacy.segments[0].attributes |= u16::from(cs_d) << 14;
-                                cpu.legacy.segments[3].base = 0x7654_3210;
+                                cpu.legacy.segments[3].base = if generation == CpuGeneration::I286 {
+                                    0x54_3210
+                                } else {
+                                    0x7654_3210
+                                };
                                 cpu.legacy.segments[3].attributes |= u16::from(ss_b) << 14;
                                 let retained = cpu.legacy;
                                 let result = derive_legacy_context(model(generation), &cpu);
@@ -648,7 +668,8 @@ pub enum ControlRegister {
     Cr3,
 }
 
-// SDM Vol 2A §3.3 LMSW: only PE/MP/EM/TS are loaded; PE is sticky.
+// SDM Vol 2A §3.3 LMSW; I286 PRM §10.2.2 Table 10-1 p. 10-4,
+// Appendix B LMSW p. B-67 (scan checked): only PE/MP/EM/TS load; PE is sticky.
 pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
     (cr0 & !0xe) | u32::from(source & 0xf)
 }
@@ -662,11 +683,14 @@ pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
 /// Paging/A20 activation belongs to later phases; this physical boundary is identity.
 pub(crate) fn access(
     cpu: &CpuState,
+    generation: CpuGeneration,
     segment: SegmentId,
     offset: u64,
     bytes: u8,
     access: crate::AccessKind,
 ) -> Result<u64, crate::Exit> {
+    // I286 PRM §§7.4.1–7.4.2 pp. 7-12–13: whole-operand limits,
+    // access rights and a 16-bit expand-down bound use this same boundary.
     let cache = cpu.legacy.segments[segment as usize];
     let last = offset.checked_add(u64::from(bytes.saturating_sub(1)));
     let protected = cpu.legacy.cr0 & 1 != 0;
@@ -693,9 +717,20 @@ pub(crate) fn access(
             crate::AccessKind::Write => !code && cache.attributes & 2 != 0,
         };
     if cache.unusable != 0 || !within_limit || !permitted {
-        // SDM Vol 3B §23.1.4, Table 23-1: SS overrun is #SS; other
-        // segment overruns are #GP, with the faulting instruction incomplete.
-        let vector = if segment == SegmentId::Ss { 12 } else { 13 };
+        let vector = if generation == CpuGeneration::I286 && !protected {
+            // I286 PRM Appendix B MOV p. B-74: real-mode word operands
+            // at FFFFh raise interrupt 13, including accesses through SS.
+            13
+        } else if segment == SegmentId::Ss {
+            // I286 PRM Appendix B MOV p. B-74 (protected): SS violations
+            // raise #SS(0). I386 real/protected: SDM Vol 3B §23.1.4
+            // Table 23-1; Vol 3A §§6.3–6.4; 80386 PRM §14.6 Table 14-1 p. 14-5.
+            12
+        } else {
+            // I286 PRM Appendix B MOV p. B-74 (protected): CS/DS/ES
+            // violations raise #GP(0). I386: the same SDM/80386 PRM tables.
+            13
+        };
         // Real-address pseudo-protection faults carry no error code (80386
         // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5). Protected codes
         // define only bits 15:0 on I386 (PRM §9.7 Fig. 9-7, scan checked).
@@ -728,6 +763,9 @@ pub(crate) fn flags_image(cpu: &CpuState, generation: CpuGeneration) -> u32 {
     let low = u32::from(cpu.flags.to_flags16()) & 0x0fd7;
     match generation {
         CpuGeneration::I8086 => low | 0xf000,
+        // I286 PRM §10.1 p. 10-1; Appendix B IRET
+        // pp. B-51–52: protected FLAGS includes IOPL and NT.
+        CpuGeneration::I286 if cpu.legacy.cr0 & 1 != 0 => low | (cpu.rflags_system as u32 & 0x7000),
         CpuGeneration::I286 => low,
         CpuGeneration::I386 => low | (cpu.rflags_system as u32 & 0x0003_7000),
     }
@@ -749,7 +787,11 @@ pub(crate) fn restore_flags(
         });
     }
     cpu.flags.set_flags16((image & 0x0ed7) as u16);
-    let system = if generation == CpuGeneration::I386 {
+    // I286 PRM Appendix B IRET pp. B-51–52; §10.1 p. 10-1.
+    // Execution is currently limited to CPL 0, where IOPL is writable.
+    let system = if generation == CpuGeneration::I386
+        || (generation == CpuGeneration::I286 && cpu.legacy.cr0 & 1 != 0)
+    {
         image & 0x7000
     } else {
         0

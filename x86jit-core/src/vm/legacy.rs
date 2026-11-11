@@ -148,9 +148,14 @@ impl Execution {
         model: LegacyCpuModel,
         context: LegacyDecodeContext,
     ) -> Result<Arc<IrBlock>, Exit> {
-        let linear_fetch =
-            crate::legacy::access(cpu, SegmentId::Cs, cpu.rip, 1, crate::AccessKind::Execute)?
-                as u32;
+        let linear_fetch = crate::legacy::access(
+            cpu,
+            context.generation,
+            SegmentId::Cs,
+            cpu.rip,
+            1,
+            crate::AccessKind::Execute,
+        )? as u32;
         let key = LegacyBlockKey {
             owner_id: self.owner_id,
             context_id: self.context_id,
@@ -214,9 +219,16 @@ impl Execution {
 
 fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
-    for i in 0..15 {
+    // I286 PRM Appendix B #GP p. B-9: instructions are at most ten bytes.
+    let length_limit = if context.generation == CpuGeneration::I286 {
+        10
+    } else {
+        15
+    };
+    for i in 0..length_limit {
         let addr = crate::legacy::access(
             cpu,
+            context.generation,
             SegmentId::Cs,
             cpu.rip + i,
             1,
@@ -242,6 +254,11 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8
             ));
         }
         bytes.push(byte[0]);
+        if context.generation == CpuGeneration::I286
+            && crate::lift::legacy::unavailable_i286_opcode(&bytes)
+        {
+            break;
+        }
         let mut decoder = Decoder::with_ip(
             u32::from(context.default_operand_bits),
             &bytes,
@@ -268,10 +285,11 @@ impl Vcpu {
         if context.paging_enabled || context.cpl != 0 {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
-        // Other generations, A20 gating and reset-origin execution are not activated by the real-forms phase.
-        if model.generation != CpuGeneration::I386
+        // I286 PRM §10.4 p. 10-6: reset may fetch through the retained high CS base.
+        // A20 gating and the I8086 system personality remain deferred.
+        if !matches!(model.generation, CpuGeneration::I286 | CpuGeneration::I386)
             || self.cpu.legacy.a20_enabled == 0
-            || self.cpu.legacy.reset_fetch != 0
+            || (self.cpu.legacy.reset_fetch != 0 && model.generation != CpuGeneration::I286)
             || self.cpu.rip > u64::from(u32::MAX)
         {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));

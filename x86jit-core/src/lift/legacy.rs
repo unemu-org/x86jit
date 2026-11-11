@@ -38,6 +38,32 @@ pub(crate) fn segment(r: Register) -> Option<SegmentId> {
     })
 }
 
+/// Check opcode availability even when the instruction is not fully fetched.
+pub(crate) fn unavailable_i286_opcode(code: &[u8]) -> bool {
+    let mut opcode = code
+        .iter()
+        .skip_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3));
+    // I286 PRM Appendix B #UD p. B-12: invalid first or second opcode bytes
+    // suffice for #UD. Appendix B encodings (CLTS p. B-31, LAR p. B-60,
+    // LGDT/LIDT p. B-65, LSL p. B-71, LTR p. B-72) use only 0F 00–03/06.
+    match opcode.next() {
+        Some(0x64..=0x67) => true,
+        Some(0x0f) => match opcode.next() {
+            // Appendix B SLDT/STR/LLDT/LTR/VERR/VERW pp. B-66, B-72,
+            // B-102, B-108, B-111: 0F 00 has only extensions /0–/5.
+            Some(0x00) => opcode.next().is_some_and(|b| b & 0x38 >= 0x30),
+            // Appendix B LGDT/LIDT, LMSW, SGDT/SIDT, SMSW pp. B-65,
+            // B-67, B-101, B-103: /5 and /7 are absent; /0–/3 need memory.
+            Some(0x01) => opcode.next().is_some_and(|b| {
+                matches!(b & 0x38, 0x28 | 0x38) || (b & 0xc0 == 0xc0 && b & 0x38 <= 0x18)
+            }),
+            Some(0x02 | 0x03 | 0x06) | None => false,
+            Some(_) => true,
+        },
+        _ => false,
+    }
+}
+
 /// Decode exactly the fetched instruction; callers fetch incrementally and check CS.
 pub(crate) fn instruction(
     code: &[u8],
@@ -81,9 +107,35 @@ pub(crate) fn instruction(
         .count();
     let table_register_operand = matches!(&opcode[prefix_bytes..],
         [0x0f, 0x01, modrm, ..] if modrm & 0xe0 == 0xc0);
-    if insn.is_invalid() || table_register_operand {
+    // I286 PRM §6.2 p. 6-2; Appendix B #UD p. B-12 and MOV p. B-73;
+    // §9.6.1 p. 9-10: unavailable opcodes/operands fault at their prefixes.
+    // Iced's generation tags classify encodings, not individual Sreg operands.
+    let unavailable_286 = context.generation == crate::CpuGeneration::I286
+        && (unavailable_i286_opcode(code)
+            || (0..insn.op_count())
+                .any(|i| matches!(insn.op_register(i), Register::FS | Register::GS))
+            || !insn.cpuid_features().iter().all(|feature| {
+                matches!(
+                    feature,
+                    iced_x86::CpuidFeature::INTEL8086
+                        | iced_x86::CpuidFeature::INTEL8086_ONLY
+                        | iced_x86::CpuidFeature::INTEL186
+                        | iced_x86::CpuidFeature::INTEL286
+                        | iced_x86::CpuidFeature::INTEL286_ONLY
+                        // I286/287 PRM Part II Ch. 2, Processor Control Instructions, p. 2-16: these
+                        // coprocessor forms keep the existing explicit refusal.
+                        | iced_x86::CpuidFeature::FPU
+                        | iced_x86::CpuidFeature::FPU287
+                )
+            }));
+    if insn.is_invalid() || table_register_operand || unavailable_286 {
         // SDM Vol 3A §7.15, Events 6/13: #UD or an overlong instruction.
-        let vector = if code.len() == 15 && exceeds_length_limit(code, mode) {
+        // I286 PRM Appendix B #GP p. B-9: incomplete at ten bytes is overlong.
+        let overlong_286 = context.generation == crate::CpuGeneration::I286
+            && code.len() == 10
+            && decoder.last_error() == iced_x86::DecoderError::NoMoreBytes
+            && !unavailable_286;
+        let vector = if overlong_286 || (code.len() == 15 && exceeds_length_limit(code, mode)) {
             13
         } else {
             6
@@ -186,8 +238,8 @@ pub(super) fn lower(
 ) -> Result<bool, LiftError> {
     use Mnemonic::*;
     let context = ops.legacy_context().expect("legacy lowering context");
-    // SDM Vol 1 §21.1.2; Vol 3B §§23.1.2–23.1.3. This path implements
-    // the I386 instruction generation; Application Real16 retains its 286 policy.
+    // Generation availability is checked before lowering; decoder width alone
+    // never grants the 286 any 386 forms (I286 PRM §6.2 p. 6-2, Appendix B).
     let mode = if context.default_operand_bits == 16 {
         CpuMode::Real16
     } else {

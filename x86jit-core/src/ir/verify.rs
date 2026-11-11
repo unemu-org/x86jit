@@ -374,11 +374,11 @@ impl IrBlock {
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::ClearTs => {}
                     crate::legacy::LegacyOp::Interrupt { .. } => {}
-                    crate::legacy::LegacyOp::Iret { size: _ } => check(&[], &[])?,
                     crate::legacy::LegacyOp::AdjustStack { .. }
                     | crate::legacy::LegacyOp::Flags { .. }
                     | crate::legacy::LegacyOp::All { .. }
                     | crate::legacy::LegacyOp::Return { .. }
+                    | crate::legacy::LegacyOp::Iret { .. }
                     | crate::legacy::LegacyOp::Loop { .. }
                     | crate::legacy::LegacyOp::String { .. }
                     | crate::legacy::LegacyOp::Leave { .. }

@@ -201,6 +201,7 @@ fn descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
     value: u16,
+    generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
     // SDM Vol 3A §§3.4.2, 3.4.5; 80386 PRM §§5.1.1–5.1.2,
     // 6.3.1.2: selectors index eight-byte descriptors, including their last byte.
@@ -232,6 +233,13 @@ fn descriptor<const ROUTED: bool, const ORDER: u8>(
     }
     let low = read(cpu, mem, u64::from(address), 4)? as u32;
     let high = read(cpu, mem, u64::from(address.wrapping_add(4)), 4)? as u32;
+    // I286 PRM §6.3 Fig. 6-3 p. 6-5 (scan checked): bytes 6/7 are
+    // reserved; they supply no limit, size, granularity or high base bits.
+    let high = if generation == crate::CpuGeneration::I286 {
+        high & 0xffff
+    } else {
+        high
+    };
     let limit = (low & 0xffff) | (high & 0x000f_0000);
     let attributes = ((high >> 8) & 0xf0ff) as u16;
     Ok(Descriptor {
@@ -270,6 +278,7 @@ fn accessed<const ROUTED: bool, const ORDER: u8>(
     }
     // SDM Vol 3A §3.4.5.1; 80386 PRM §5.1.1 p. 5-4 (scan checked):
     // successful segment loads set A in memory as well as in the hidden cache.
+    // I286 PRM §7.4 p. 7-11 specifies the same accessed-bit update.
     if descriptor.cache.attributes & 1 == 0 {
         if let Some(address) = descriptor.access_address {
             write(
@@ -295,6 +304,7 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER>,
     segment: SegmentId,
     value: u16,
+    generation: crate::CpuGeneration,
 ) -> Result<(), Exit> {
     if cpu.legacy.cr0 & 1 == 0 {
         reload(cpu, segment, value);
@@ -302,6 +312,7 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
     }
     // SDM Vol 2B §4.3 MOV; Vol 3A §§6.3, 6.6, 6.7;
     // 80386 PRM §17 MOV pp. 17-109–110 (scan checked).
+    // I286 PRM §7.4.1 p. 7-12; Appendix B MOV pp. B-73–74.
     if value & !3 == 0 {
         if segment == SegmentId::Ss {
             return Err(fault(cpu, 13, 0));
@@ -317,7 +328,7 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
         );
         return Ok(());
     }
-    let mut d = descriptor(cpu, mem, value)?;
+    let mut d = descriptor(cpu, mem, value, generation)?;
     let attr = d.cache.attributes;
     let code = attr & 8 != 0;
     let dpl = ((attr >> 5) & 3) as u8;
@@ -350,9 +361,12 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER>,
     value: u16,
     returning: bool,
+    generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
     // SDM Vol 3A §6.8; Vol 2A §3.3 CALL/IRET/JMP; Vol 2B §4.3 RET;
     // 80386 PRM §17 pp. 17-39, 17-76–77, 17-85, 17-142–143 (scan checked).
+    // I286 PRM §§7.4.2–7.5 pp. 7-13–15; Appendix B IRET pp. B-51–52,
+    // RET pp. B-94–95: same-CPL code descriptor checks.
     if value & !3 == 0 {
         return Err(fault(cpu, 13, 0));
     }
@@ -367,7 +381,7 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
             crate::UnsupportedSystemOperation::LegacyPrivilegeTransition,
         ));
     }
-    let d = descriptor(cpu, mem, value)?;
+    let d = descriptor(cpu, mem, value, generation)?;
     let attr = d.cache.attributes;
     if attr & 0x10 == 0 {
         if !returning && matches!(attr & 0xf, 1 | 3 | 4 | 5 | 9 | 11 | 12) {
@@ -428,12 +442,26 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     let old = sp(cpu, context);
     let bytes = count as u8 * size;
     let start = old.wrapping_sub(u64::from(bytes)) & mask(context.stack_address_bits / 8);
-    legacy::access(cpu, SegmentId::Ss, start, bytes, AccessKind::Write)?;
+    legacy::access(
+        cpu,
+        context.generation,
+        SegmentId::Ss,
+        start,
+        bytes,
+        AccessKind::Write,
+    )?;
     let mut addresses = Vec::with_capacity(count);
     for i in 1..=count {
         let offset =
             old.wrapping_sub(i as u64 * u64::from(size)) & mask(context.stack_address_bits / 8);
-        let address = legacy::access(cpu, SegmentId::Ss, offset, size, AccessKind::Write)?;
+        let address = legacy::access(
+            cpu,
+            context.generation,
+            SegmentId::Ss,
+            offset,
+            size,
+            AccessKind::Write,
+        )?;
         probe(cpu, mem, address, size)?;
         addresses.push(address);
     }
@@ -468,12 +496,26 @@ fn peek<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<u64, Exit> {
     let offset = sp(cpu, context).wrapping_add(index * u64::from(size))
         & mask(context.stack_address_bits / 8);
-    let addr = legacy::access(cpu, SegmentId::Ss, offset, size, AccessKind::Read)?;
+    let addr = legacy::access(
+        cpu,
+        context.generation,
+        SegmentId::Ss,
+        offset,
+        size,
+        AccessKind::Read,
+    )?;
     read(cpu, mem, addr, size)
 }
-fn target(cpu: &CpuState, value: u64, size: u8) -> Result<u64, Exit> {
+fn target(cpu: &CpuState, context: LegacyDecodeContext, value: u64, size: u8) -> Result<u64, Exit> {
     let offset = value & mask(size);
-    legacy::access(cpu, SegmentId::Cs, offset, 1, AccessKind::Execute)?;
+    legacy::access(
+        cpu,
+        context.generation,
+        SegmentId::Cs,
+        offset,
+        1,
+        AccessKind::Execute,
+    )?;
     Ok(offset)
 }
 
@@ -822,7 +864,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 None
             }
             IrOp::Jump { target: ip } => {
-                cpu.rip = target(cpu, read_val(*ip, temps), 4)?;
+                cpu.rip = target(cpu, context, read_val(*ip, temps), 4)?;
                 return Ok(outcome);
             }
             IrOp::Branch {
@@ -833,7 +875,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 // SDM Vol 2A §3.3 Jcc: only a taken target is checked here;
                 // sequential fallthrough is checked by the following fetch.
                 cpu.rip = if eval_cond(*cond, &cpu.flags) {
-                    target(cpu, *taken, 4)?
+                    target(cpu, context, *taken, 4)?
                 } else {
                     *fallthrough
                 };
@@ -894,6 +936,8 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             };
                             // SDM Vol 2A §3.3 LGDT/LIDT; 80386 PRM §17
                             // pp. 17-94–95 (page images checked): 16+24 or 16+32.
+                            // I286 PRM Appendix B LGDT/LIDT p. B-65: 16+24,
+                            // with the last byte of the six-byte input ignored.
                             let destination = if *idtr {
                                 &mut cpu.legacy.idtr
                             } else {
@@ -910,7 +954,12 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             // SDM Vol 2B §4.3 SGDT/SIDT, IA-32 Architecture
                             // Compatibility; 80386 PRM §17 p. 17-154 compatibility
                             // note (scan checked): I386's 16-bit high byte is zero.
-                            let base = if *size == 2 {
+                            // I286 PRM Appendix B SGDT/SIDT p. B-101 leaves
+                            // byte 5 undefined. SDM Vol 2B §4.3 SGDT/SIDT,
+                            // IA-32 Architecture Compatibility specifies 286 ones.
+                            let base = if context.generation == crate::CpuGeneration::I286 {
+                                (table.base & 0x00ff_ffff) | 0xff00_0000
+                            } else if *size == 2 {
                                 table.base & 0x00ff_ffff
                             } else {
                                 table.base
@@ -923,6 +972,14 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     }
                     L::ReadControl { dst, register } => {
                         temps[*dst as usize] = u64::from(match register {
+                            // I286 PRM §10.2.2 p. 10-4; §10.4 p. 10-6:
+                            // MSW has four controls. Keep the reset high image of
+                            // ones as the engine's fixed reserved-bit policy.
+                            ControlRegister::Cr0
+                                if context.generation == crate::CpuGeneration::I286 =>
+                            {
+                                (cpu.legacy.cr0 & 0xf) | 0xfff0
+                            }
                             ControlRegister::Cr0 => cpu.legacy.cr0,
                             ControlRegister::Cr2 => cpu.legacy.cr2,
                             ControlRegister::Cr3 => cpu.legacy.cr3,
@@ -979,6 +1036,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     } => {
                         temps[*dst as usize] = legacy::access(
                             cpu,
+                            context.generation,
                             *segment,
                             read_val(*offset, temps),
                             *bytes,
@@ -993,7 +1051,13 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         value,
                         inhibit,
                     } => {
-                        load_segment(cpu, mem, *segment, read_val(*value, temps) as u16)?;
+                        load_segment(
+                            cpu,
+                            mem,
+                            *segment,
+                            read_val(*value, temps) as u16,
+                            context.generation,
+                        )?;
                         outcome.context_changed = true;
                         outcome.arm_ss = *inhibit;
                     }
@@ -1068,7 +1132,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 as u16
                         });
                         let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
-                            cs.map(|cs| code_descriptor(cpu, mem, cs, false))
+                            cs.map(|cs| code_descriptor(cpu, mem, cs, false, context.generation))
                                 .transpose()?
                         } else {
                             None
@@ -1079,7 +1143,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             }
                             code_limit(cpu, d.cache, ip)?;
                         } else {
-                            target(cpu, ip, *size)?;
+                            target(cpu, context, ip, *size)?;
                         }
                         if let Some(d) = &mut descriptor {
                             if return_ip.is_some() {
@@ -1123,6 +1187,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     } => {
                         legacy::access(
                             cpu,
+                            context.generation,
                             SegmentId::Ss,
                             sp(cpu, context),
                             *size * if *far { 2 } else { 1 },
@@ -1136,7 +1201,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         };
                         let ip = ip & mask(*size);
                         let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
-                            cs.map(|cs| code_descriptor(cpu, mem, cs, true))
+                            cs.map(|cs| code_descriptor(cpu, mem, cs, true, context.generation))
                                 .transpose()?
                         } else {
                             None
@@ -1145,7 +1210,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             code_limit(cpu, d.cache, ip)?;
                             accessed(cpu, mem, d)?;
                         } else {
-                            target(cpu, ip, *size)?;
+                            target(cpu, context, ip, *size)?;
                         }
                         adjust(
                             cpu,
@@ -1168,6 +1233,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // 17-76–78 (scan checked): same-CPL frame, independent SS.B.
                         legacy::access(
                             cpu,
+                            context.generation,
                             SegmentId::Ss,
                             sp(cpu, context),
                             3 * *size,
@@ -1191,7 +1257,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             ));
                         }
                         let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
-                            Some(code_descriptor(cpu, mem, cs, true)?)
+                            Some(code_descriptor(cpu, mem, cs, true, context.generation)?)
                         } else {
                             None
                         };
@@ -1246,7 +1312,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // SDM Vol 2A §3.3 LOOP: an untaken loop completes its
                         // decrement before the next sequential fetch can fault.
                         let ip = if take {
-                            target(cpu, u64::from(*taken), 4)?
+                            target(cpu, context, u64::from(*taken), 4)?
                         } else {
                             u64::from(*next)
                         };
@@ -1273,7 +1339,14 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             let si = cpu.gpr[6] & mask(width);
                             let di = cpu.gpr[7] & mask(width);
                             let src = if matches!(kind, StrOp::Movs | StrOp::Cmps | StrOp::Lods) {
-                                let a = legacy::access(cpu, *source, si, *elem, AccessKind::Read)?;
+                                let a = legacy::access(
+                                    cpu,
+                                    context.generation,
+                                    *source,
+                                    si,
+                                    *elem,
+                                    AccessKind::Read,
+                                )?;
                                 Some(read(cpu, mem, a, *elem)?)
                             } else {
                                 None
@@ -1284,6 +1357,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             ) {
                                 Some(legacy::access(
                                     cpu,
+                                    context.generation,
                                     SegmentId::Es,
                                     di,
                                     *elem,
@@ -1342,8 +1416,14 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     }
                     L::Leave { size } => {
                         let offset = cpu.gpr[5] & mask(context.stack_address_bits / 8);
-                        let a =
-                            legacy::access(cpu, SegmentId::Ss, offset, *size, AccessKind::Read)?;
+                        let a = legacy::access(
+                            cpu,
+                            context.generation,
+                            SegmentId::Ss,
+                            offset,
+                            *size,
+                            AccessKind::Read,
+                        )?;
                         let value = read(cpu, mem, a, *size)?;
                         cpu.write_gpr(
                             4,

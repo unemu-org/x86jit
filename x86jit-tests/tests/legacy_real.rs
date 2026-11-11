@@ -87,6 +87,20 @@ fn exception(cpu: &mut Vcpu, vm: &Vm, vector: u8) {
 }
 
 #[test]
+fn real_word_at_ffff_faults_with_ss_for_stack_and_gp_for_data() {
+    // 80386 PRM §14.6 Table 14-1 p. 14-5; SDM Vol 3B §23.1.4 Table 23-1:
+    // real-mode SS overruns raise #SS; other segment overruns raise #GP.
+    for (code, vector) in [(b"\x36\xa1\xff\xff", 12), (b"\x3e\xa1\xff\xff", 13)] {
+        let (vm, mut cpu) = setup(code);
+        vm.write_bytes(0xffff, b"\x34\x12").unwrap();
+        cpu.cpu.gpr[0] = 0xabcd;
+        let before = format!("{:?}", cpu.cpu);
+        exception(&mut cpu, &vm, vector);
+        assert_eq!(format!("{:?}", cpu.cpu), before);
+    }
+}
+
+#[test]
 fn operand_and_address_prefix_combinations_and_full_offsets() {
     // SDM Vol 3B §§23.1.1–23.1.2: operand and address prefixes are
     // independent; 32-bit offsets are checked in full against the real limit.
