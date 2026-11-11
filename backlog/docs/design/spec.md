@@ -916,6 +916,31 @@ IrOp::Syscall => {
 
 ### 8.2 JIT via Cranelift (build SECOND)
 
+Process-owned JIT storage and the process code map use PID plus fork generation.
+For a raw host fork that shares the address space, the embedder calls
+`x86jit_core::mark_shared_address_space_child()` on child entry, before engine use
+or starting child threads. A fixed lock-free table retains up to 1024 marked PIDs;
+marks are permanent and repeated marking is idempotent. PID reuse conservatively
+refuses JIT. If the table is full, the child must exit/exec without engine use.
+The PID key distinguishes the child from its parent despite their shared statics,
+and covers every thread in the child without relying on inherited TLS or locks.
+
+`JitBackend` constructors and `Default` are infallible and defer executable storage
+until compilation. New and inherited backends are inert in a marked PID: compilation
+refuses before parent queue/compiler locks, reports the existing typed reason
+`CompileFailureReason::OtherBackendError` to the failure observer, and retains the
+`Backend` interpreted fallback. Reusing this reason preserves exhaustive downstream
+matches. Observer callbacks still run and must be safe to invoke in the child.
+The additive `try_new` detects the mark before constructing backend state;
+`try_materialize` and `try_materialize_region` return typed compilation failures.
+Code-memory operations refuse allocation, finalization, write access and release.
+Process-global code registration retains `Result<(), CodeMapFull>`, refusing with
+`CodeMapFull` before replacing the map or entering its writer. Unregistration
+refuses as well. Signal lookup, fault classification and the step-one child
+interpreter remain available. The marker is admission control, not a substitute
+for the child stack/TLS and
+no-inherited-destructors contract in `child`.
+
 #### 8.2.1 Compiled block ABI and access to guest state — READ BEFORE M4
 
 > **This is the black box that has to be opened before you write the JIT backend.** The "baked-in base address" from section 1 is not enough — you must decide exactly *how* the generated host code reads and writes guest registers and memory. Without this you won't move.

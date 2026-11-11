@@ -33,6 +33,18 @@ constructors never read diagnostic variables. Disable default features and enabl
 caller-owned writer, or `enable_environment_diagnostics` to opt into the legacy
 perf-map and flag-elision variables. Frame pointers are always preserved.
 
+Constructors and `Default` remain infallible. In a PID marked with
+`x86jit_core::mark_shared_address_space_child()`, new and inherited backends
+refuse compilation without touching code storage, compiler locks or queues.
+`try_new()` optionally detects the mark before constructing a backend.
+`try_materialize` and `try_materialize_region` return the existing typed reason
+`CompileFailureReason::OtherBackendError`; all compile refusals notify the failure
+observer. Trait materialization keeps its interpreter fallback. Observer callbacks
+still run, so inherited callbacks must be safe to invoke. Mark on child entry before
+engine use, and exit/exec if the fixed PID table is full. Marks cover all threads of
+that PID and leave the parent enabled. The child stack/TLS and no-inherited-destructors
+contract still applies.
+
 ## License
 
 MIT OR Apache-2.0.

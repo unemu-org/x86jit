@@ -464,7 +464,6 @@ impl CodeMemory {
         align: u64,
         kind: JITMemoryKind,
     ) -> io::Result<*mut u8> {
-        self.check_process()?;
         let kind = match kind {
             JITMemoryKind::Executable => Kind::Code,
             JITMemoryKind::ReadOnly => Kind::ReadOnly,
@@ -536,6 +535,8 @@ impl CodeMemory {
     }
 
     fn check_process(&self) -> io::Result<()> {
+        x86jit_core::codemap::check_jit_allowed()
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
         if self.owner != ProcessIdentity::current() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -589,6 +590,7 @@ impl CodeMemory {
 
 impl JITMemoryProvider for CodeMemory {
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> io::Result<*mut u8> {
+        self.check_process()?;
         let result = self.allocate_inner(size, align, kind);
         if result.is_err() {
             self.counters.failures.fetch_add(1, Ordering::Relaxed);
@@ -638,8 +640,9 @@ impl JITMemoryProvider for CodeMemory {
     }
 
     fn finalize(&mut self, branch_protection: BranchProtection) -> ModuleResult<()> {
+        self.check_process()
+            .map_err(|err| ModuleError::Allocation { err })?;
         let result = (|| -> io::Result<()> {
-            self.check_process()?;
             // BTI is not enabled by x86jit's ISA. Reject rather than silently
             // publishing mappings without a requested protection policy.
             if branch_protection != BranchProtection::None {
@@ -2057,6 +2060,256 @@ mod tests {
         drop(jit.shared.jit(0));
         assert_eq!(jit.shared.memory.snapshot().code_provider_fallback, 0);
         assert_eq!(jit.code_first_failure(), None);
+    }
+
+    #[test]
+    fn shared_child_marker_refuses_jit_and_preserves_code() {
+        const TEST: &str = "code_memory::tests::shared_child_marker_refuses_jit_and_preserves_code";
+        const WORKER: &str = "X86JIT_SHARED_CHILD_MARKER_WORKER";
+        if std::env::var_os(WORKER).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads", "2", "--nocapture"])
+                .env(WORKER, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "shared-child marker worker: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("shared-child marker worker exceeded 20 seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        use crate::{CompileError, HostTarget, JitBackend, OptLevel};
+        use x86jit_core::{Backend, MemConsistency, RegionCaps, SharedAddressSpaceChild};
+        let caps = RegionCaps {
+            max_blocks: 8,
+            max_icount: 128,
+        };
+        let jit = std::mem::ManuallyDrop::new(JitBackend::try_new().unwrap());
+        let mut mem = x86jit_core::Memory::new(x86jit_core::MemoryModel::Flat { size: 0x4000 });
+        mem.map(
+            0x1000,
+            0x1000,
+            x86jit_core::Prot::RWX,
+            x86jit_core::RegionKind::Ram,
+        )
+        .unwrap();
+        mem.write_bytes(0x1000, &[0xb8, 42, 0, 0, 0, 0xf4]).unwrap();
+        let ir = x86jit_core::lift::lift_block(
+            &mem,
+            x86jit_core::lift::FetchAddr::flat(0x1000),
+            x86jit_core::CpuMode::Long64,
+        )
+        .unwrap();
+        let region = x86jit_core::IrRegion {
+            entry: ir.guest_start,
+            blocks: vec![ir.clone()],
+            has_loop: false,
+        };
+        let x86jit_core::CachedBlock::Compiled { entry } = jit
+            .try_materialize(&ir, MemConsistency::Fast, None, 0)
+            .unwrap()
+        else {
+            panic!("checked compilation must produce code")
+        };
+        assert!(matches!(
+            jit.try_materialize_region(&region, MemConsistency::Fast, None, 0)
+                .unwrap(),
+            x86jit_core::CachedBlock::Compiled { .. }
+        ));
+        assert!(x86jit_core::codemap::contains(entry.0 as usize));
+        let mut memory = CodeMemory::new(Arc::default());
+        let address = memory.allocate(16, 16, JITMemoryKind::Executable).unwrap();
+        memory
+            .with_write_access(&mut || {
+                // SAFETY: this provider owns the writable allocation and no code executes it.
+                unsafe { address.write(0x7f) };
+            })
+            .unwrap();
+        memory.finalize(BranchProtection::None).unwrap();
+        let regions = memory.regions.len();
+        let used = memory.regions[0].used;
+        let allocations = memory.allocations.len();
+        let request = || x86jit_core::TierUpRequest {
+            precise_split_stores: false,
+            mxcsr_mode: 0,
+            pc: ir.guest_start,
+            spans: vec![(ir.guest_start, ir.guest_len)],
+            epoch: 0,
+            unit: x86jit_core::TierUpUnit::Block(Arc::new(ir.clone())),
+            consistency: MemConsistency::Fast,
+            mmio: None,
+            guest_base: 0,
+        };
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let observed = failures.clone();
+        jit.set_compile_failure_observer(move |event| observed.lock().unwrap().push(event));
+        let _serial = jit.shared.compile_serial.lock().unwrap();
+        let _queue = jit.shared.background.queue.lock().unwrap();
+        x86jit_core::mark_shared_address_space_child().unwrap();
+        assert!(matches!(
+            JitBackend::try_new(),
+            Err(SharedAddressSpaceChild)
+        ));
+        assert!(matches!(
+            jit.shared
+                .compile(&ir, MemConsistency::Fast, None, 0, 0, false),
+            Err(CompileError::SharedAddressSpaceChild)
+        ));
+        assert!(matches!(
+            jit.shared
+                .compile_region(&region, MemConsistency::Fast, None, 0, 0, false),
+            Err(CompileError::SharedAddressSpaceChild)
+        ));
+        assert!(matches!(
+            jit.shared.define_request(&request(), None),
+            Err(CompileError::SharedAddressSpaceChild)
+        ));
+        assert!(matches!(
+            jit.try_materialize(&ir, MemConsistency::Fast, None, 0),
+            Err(x86jit_core::CompileFailureReason::OtherBackendError)
+        ));
+        assert!(matches!(
+            jit.try_materialize_region(&region, MemConsistency::Fast, None, 0),
+            Err(x86jit_core::CompileFailureReason::OtherBackendError)
+        ));
+        assert_eq!(
+            jit.tier_up_async(request()),
+            x86jit_core::TierUpSubmit::Unsupported
+        );
+        assert!(matches!(
+            jit.materialize(&ir, MemConsistency::Fast, None, 0),
+            x86jit_core::CachedBlock::Interpreted(_)
+        ));
+        assert_eq!(
+            CompileError::SharedAddressSpaceChild.reason(),
+            x86jit_core::CompileFailureReason::OtherBackendError
+        );
+        assert_eq!(failures.lock().unwrap().len(), 6);
+        assert!(failures.lock().unwrap().iter().all(|event| {
+            event.reason == x86jit_core::CompileFailureReason::OtherBackendError
+                && event.guest_rip == ir.guest_start
+                && event.blocks == 1
+        }));
+        for backend in [
+            JitBackend::new(),
+            JitBackend::default(),
+            JitBackend::with_superblocks(caps),
+            JitBackend::with_opt_level(OptLevel::Speed),
+            JitBackend::with_host_target(HostTarget::Native),
+            JitBackend::with_options(Some(caps), HostTarget::Native, OptLevel::Speed),
+            JitBackend::new().with_system_memory_provider(),
+        ] {
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let observed = failures.clone();
+            backend.set_compile_failure_observer(move |event| {
+                observed.lock().unwrap().push(event);
+            });
+            let publications = Arc::new(AtomicUsize::new(0));
+            let observed = publications.clone();
+            backend.set_compiled_code_observer(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+            });
+            assert!(matches!(
+                backend.try_materialize(&ir, MemConsistency::Fast, None, 0),
+                Err(x86jit_core::CompileFailureReason::OtherBackendError)
+            ));
+            assert!(matches!(
+                backend.try_materialize_region(&region, MemConsistency::Fast, None, 0),
+                Err(x86jit_core::CompileFailureReason::OtherBackendError)
+            ));
+            for block in [
+                backend.materialize(&ir, MemConsistency::Fast, None, 0),
+                backend.materialize_with_mxcsr(&ir, MemConsistency::Fast, None, 0, 1),
+                backend.materialize_with_split_stores(&ir, MemConsistency::Fast, None, 0, 1, true),
+                backend.materialize_region(&region, MemConsistency::Fast, None, 0),
+                backend.materialize_region_with_mxcsr(&region, MemConsistency::Fast, None, 0, 1),
+                backend.materialize_region_with_split_stores(
+                    &region,
+                    MemConsistency::Fast,
+                    None,
+                    0,
+                    1,
+                    true,
+                ),
+            ] {
+                assert!(matches!(block, x86jit_core::CachedBlock::Interpreted(_)));
+            }
+            assert_eq!(
+                backend.tier_up_async(request()),
+                x86jit_core::TierUpSubmit::Unsupported
+            );
+            let mut region_request = request();
+            region_request.unit = x86jit_core::TierUpUnit::Region(Arc::new(region.clone()));
+            assert_eq!(
+                backend.tier_up_async(region_request),
+                x86jit_core::TierUpSubmit::Unsupported
+            );
+            let failures = failures.lock().unwrap();
+            assert_eq!(failures.len(), 10);
+            assert!(failures.iter().all(|event| {
+                event.reason == x86jit_core::CompileFailureReason::OtherBackendError
+            }));
+            assert_eq!(backend.shared.compile_attempts.load(Ordering::Relaxed), 0);
+            assert!(backend.shared.inner.lock().unwrap().is_none());
+            assert!(backend.shared.nondefault_inner.lock().unwrap().is_none());
+            assert!(backend.worker.lock().unwrap().is_none());
+            assert_eq!(backend.memory_stats().code_bytes_reserved, 0);
+            assert_eq!(publications.load(Ordering::Relaxed), 0);
+        }
+        let mut vm = x86jit_core::Vm::with_backend(
+            x86jit_core::VmConfig::flat(0x4000),
+            Box::new(JitBackend::default()),
+        );
+        vm.map(
+            0x1000,
+            0x1000,
+            x86jit_core::Prot::RWX,
+            x86jit_core::RegionKind::Ram,
+        )
+        .unwrap();
+        vm.write_bytes(0x1000, &[0xb8, 42, 0, 0, 0, 0xf4]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(x86jit_core::Reg::Rip, 0x1000);
+        assert!(matches!(cpu.run(&vm, Some(10)), x86jit_core::Exit::Hlt));
+        assert_eq!(cpu.reg(x86jit_core::Reg::Rax), 42);
+        assert_eq!(vm.cache.memory_stats().compiled_entries, 0);
+        for kind in [
+            JITMemoryKind::Executable,
+            JITMemoryKind::ReadOnly,
+            JITMemoryKind::Writable,
+        ] {
+            let error = memory.allocate(16, 16, kind).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.get_ref().unwrap().is::<SharedAddressSpaceChild>());
+        }
+        assert!(memory
+            .with_write_access(&mut || panic!("child must not enter write access"))
+            .is_err());
+        assert!(memory.finalize(BranchProtection::None).is_err());
+        // SAFETY: the provider must refuse before releasing any live mapping.
+        unsafe { memory.free_memory() };
+        assert_eq!(memory.regions.len(), regions);
+        assert_eq!(memory.regions[0].used, used);
+        assert_eq!(memory.allocations.len(), allocations);
+        assert_eq!(memory.counters.failures.load(Ordering::Relaxed), 0);
+        assert!(!jit.shared.code_space_exhausted.load(Ordering::Relaxed));
+        // SAFETY: refusal left the existing mapping readable and unchanged.
+        assert_eq!(unsafe { address.read() }, 0x7f);
+        assert!(x86jit_core::codemap::contains(entry.0 as usize));
+        assert_eq!(
+            x86jit_core::codemap::register(0x1000, 8, Box::new([]), Box::new([])),
+            Err(x86jit_core::codemap::CodeMapFull)
+        );
+        assert!(!x86jit_core::codemap::unregister(entry.0 as usize, 1));
+        assert!(x86jit_core::codemap::contains(entry.0 as usize));
     }
 
     #[test]

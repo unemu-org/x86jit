@@ -83,6 +83,7 @@ struct GuestTrap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompileError {
     DescriptorLimit,
+    SharedAddressSpaceChild,
     Unavailable,
     BackendError,
     /// A caught panic: the payload does not say whether the unit caused it.
@@ -93,11 +94,16 @@ impl CompileError {
     fn reason(self) -> x86jit_core::CompileFailureReason {
         match self {
             Self::DescriptorLimit => x86jit_core::CompileFailureReason::DescriptorLimit,
+            Self::SharedAddressSpaceChild => x86jit_core::CompileFailureReason::OtherBackendError,
             Self::Unavailable => x86jit_core::CompileFailureReason::CodeSpace,
             Self::BackendError => x86jit_core::CompileFailureReason::OtherBackendError,
             Self::Panicked => x86jit_core::CompileFailureReason::Unclassified,
         }
     }
+}
+
+fn check_compile_allowed() -> Result<(), CompileError> {
+    x86jit_core::codemap::check_jit_allowed().map_err(|_| CompileError::SharedAddressSpaceChild)
 }
 
 fn prepare_guest_traps(
@@ -3136,6 +3142,15 @@ fn drop_observer_value<T>(value: T) {
 /// Cranelift context behind a `Mutex`, so `materialize(&self)` stays `Send + Sync`
 /// for a shared `Vm`. With background tier-up it also owns a compiler worker thread
 /// and the queues feeding it.
+///
+/// Constructors are infallible and defer executable storage until compilation.
+/// In a PID marked by [`x86jit_core::mark_shared_address_space_child`], a new or
+/// inherited backend is inert: compilation refuses before compiler or queue
+/// locks, reports [`x86jit_core::CompileFailureReason::OtherBackendError`] to the
+/// failure observer, and `Backend` materialization falls back to interpretation.
+/// Code storage cannot be allocated, finalized, registered or unmapped there.
+/// Observer callbacks still run; the marker does not make inherited callbacks,
+/// other backend operations or destructors safe in a child.
 pub struct JitBackend {
     shared: Arc<Shared>,
     /// The background compiler thread (bg-tier), spawned lazily on the
@@ -3350,6 +3365,14 @@ impl JitBackend {
         Self::build(None, HostTarget::Native, None)
     }
 
+    /// Like [`Self::new`], but detect a marked shared-address-space child before
+    /// allocating backend state. Infallible constructors remain available and
+    /// produce an inert backend in that process.
+    pub fn try_new() -> Result<Self, x86jit_core::SharedAddressSpaceChild> {
+        x86jit_core::codemap::check_jit_allowed()?;
+        Ok(Self::new())
+    }
+
     /// A JIT that forms superblocks (§12 M5-T3): the dispatcher lifts a region and
     /// compiles it as one function, up to `caps`. Opt-in until M5-T3f flips the
     /// default on.
@@ -3369,6 +3392,40 @@ impl JitBackend {
     /// this one can.
     pub fn with_options(caps: Option<RegionCaps>, target: HostTarget, opt: OptLevel) -> Self {
         Self::build(caps, target, Some(opt))
+    }
+
+    /// Compile a block synchronously and report a typed failure instead of
+    /// falling back to interpretation. In a marked shared-address-space child,
+    /// returns [`x86jit_core::CompileFailureReason::OtherBackendError`] before
+    /// taking compiler or queue locks. All failures notify the failure observer.
+    pub fn try_materialize(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+    ) -> Result<CachedBlock, x86jit_core::CompileFailureReason> {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
+        self.shared
+            .compile(ir, consistency, mmio, guest_base, 0, false)
+            .map(|entry| CachedBlock::Compiled { entry })
+            .map_err(CompileError::reason)
+    }
+
+    /// Compile a region synchronously with the same refusal contract as
+    /// [`Self::try_materialize`].
+    pub fn try_materialize_region(
+        &self,
+        region: &IrRegion,
+        consistency: MemConsistency,
+        mmio: Option<(u64, u64)>,
+        guest_base: u64,
+    ) -> Result<CachedBlock, x86jit_core::CompileFailureReason> {
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
+        self.shared
+            .compile_region(region, consistency, mmio, guest_base, 0, false)
+            .map(|entry| CachedBlock::Compiled { entry })
+            .map_err(CompileError::reason)
     }
 
     /// Use Cranelift's default memory provider for tests and fork-heavy embedders.
@@ -3761,6 +3818,11 @@ impl JitBackend {
         req: TierUpRequest,
         fetch_permit: Option<x86jit_core::FetchPermit>,
     ) -> TierUpSubmit {
+        if let Err(error) = check_compile_allowed() {
+            self.shared
+                .observe_failure(CompileFailure::for_request(&req, error));
+            return TierUpSubmit::Unsupported;
+        }
         if self.shared.stopped.load(Ordering::Acquire) {
             return TierUpSubmit::Unsupported;
         }
@@ -3963,23 +4025,26 @@ impl Shared {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
-        self.compile_block_with(
-            ir,
-            consistency,
-            mmio,
-            guest_base,
-            mxcsr_mode,
-            precise_split_stores,
-            self.foreground_publication(),
-        )
-        .inspect_err(|error| {
-            self.observe_failure(CompileFailure::for_blocks(
-                ir.guest_start,
-                CompiledCodeKind::Block,
-                *error,
-                [ir],
-            ))
-        })
+        check_compile_allowed()
+            .and_then(|()| {
+                self.compile_block_with(
+                    ir,
+                    consistency,
+                    mmio,
+                    guest_base,
+                    mxcsr_mode,
+                    precise_split_stores,
+                    self.foreground_publication(),
+                )
+            })
+            .inspect_err(|error| {
+                self.observe_failure(CompileFailure::for_blocks(
+                    ir.guest_start,
+                    CompiledCodeKind::Block,
+                    *error,
+                    [ir],
+                ))
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4033,23 +4098,26 @@ impl Shared {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> Result<CompiledPtr, CompileError> {
-        self.compile_region_with(
-            region,
-            consistency,
-            mmio,
-            guest_base,
-            mxcsr_mode,
-            precise_split_stores,
-            self.foreground_publication(),
-        )
-        .inspect_err(|error| {
-            self.observe_failure(CompileFailure::for_blocks(
-                region.entry,
-                CompiledCodeKind::Region,
-                *error,
-                &region.blocks,
-            ))
-        })
+        check_compile_allowed()
+            .and_then(|()| {
+                self.compile_region_with(
+                    region,
+                    consistency,
+                    mmio,
+                    guest_base,
+                    mxcsr_mode,
+                    precise_split_stores,
+                    self.foreground_publication(),
+                )
+            })
+            .inspect_err(|error| {
+                self.observe_failure(CompileFailure::for_blocks(
+                    region.entry,
+                    CompiledCodeKind::Region,
+                    *error,
+                    &region.blocks,
+                ))
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4111,6 +4179,7 @@ impl Shared {
             &mut dyn FnMut() -> u64,
         ) -> Box<[u64]>,
     ) -> Result<CompiledPtr, CompileError> {
+        check_compile_allowed()?;
         self.define_with_fault_info(
             kind,
             guest_rip,
@@ -4138,6 +4207,7 @@ impl Shared {
         ) -> Box<[u64]>,
         finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
     ) -> Result<T, CompileError> {
+        check_compile_allowed()?;
         let started = Instant::now();
         if self.stopped.load(Ordering::Acquire) || self.code_space_exhausted.load(Ordering::Acquire)
         {
@@ -4506,6 +4576,7 @@ impl Shared {
     }
 
     fn finalize_module(&self, jit: &mut Jit) -> Result<(), CompileError> {
+        check_compile_allowed()?;
         if self.code_space_exhausted.load(Ordering::Acquire) {
             return Err(CompileError::Unavailable);
         }
@@ -4546,6 +4617,7 @@ impl Shared {
         entry: CompiledPtr,
         code: PendingCode,
     ) -> Result<(CompiledPtr, CompiledCode), CompileError> {
+        check_compile_allowed()?;
         let PendingCode {
             id: _,
             code_len,
@@ -4678,6 +4750,7 @@ impl Shared {
         req: &TierUpRequest,
         permit: Option<&x86jit_core::FetchPermit>,
     ) -> Result<PendingCode, CompileError> {
+        check_compile_allowed()?;
         if permit.is_some_and(|p| !p.is_current()) {
             return Err(CompileError::Unavailable);
         }
@@ -4993,13 +5066,8 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
-        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
-        self.shared
-            .compile(ir, consistency, mmio, guest_base, 0, false)
-            .map_or_else(
-                |_| CachedBlock::Interpreted(Arc::new(ir.clone())),
-                |entry| CachedBlock::Compiled { entry },
-            )
+        self.try_materialize(ir, consistency, mmio, guest_base)
+            .unwrap_or_else(|_| CachedBlock::Interpreted(Arc::new(ir.clone())))
     }
 
     fn materialize_with_mxcsr(
@@ -5096,13 +5164,8 @@ impl Backend for JitBackend {
         mmio: Option<(u64, u64)>,
         guest_base: u64,
     ) -> CachedBlock {
-        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
-        self.shared
-            .compile_region(region, consistency, mmio, guest_base, 0, false)
-            .map_or_else(
-                |_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())),
-                |entry| CachedBlock::Compiled { entry },
-            )
+        self.try_materialize_region(region, consistency, mmio, guest_base)
+            .unwrap_or_else(|_| CachedBlock::Interpreted(Arc::new(region.blocks[0].clone())))
     }
 
     fn invalidate_links(&self) {

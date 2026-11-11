@@ -20,7 +20,7 @@
 
 use crate::jit_abi::fault::FrameRecipe;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Default)]
@@ -89,7 +89,10 @@ pub struct GuestTrapSite {
     pub width: u8,
 }
 
-/// The process-global code map has reached its function or trap-site capacity.
+/// The code map cannot accept a registration: its function or trap-site capacity
+/// is exhausted, or process-global registration is disabled by the shared-child
+/// marker. The existing error type covers both cases for API compatibility;
+/// [`check_jit_allowed`] distinguishes process admission refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeMapFull;
 
@@ -801,6 +804,88 @@ pub(crate) fn with_child_test_poison<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// JIT use was refused in a marked shared-address-space child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedAddressSpaceChild;
+
+impl std::fmt::Display for SharedAddressSpaceChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JIT is unavailable in a shared-address-space child")
+    }
+}
+impl std::error::Error for SharedAddressSpaceChild {}
+
+/// No slot remains for another shared-address-space child PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedChildTableFull;
+
+impl std::fmt::Display for SharedChildTableFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shared-address-space child PID table is full")
+    }
+}
+impl std::error::Error for SharedChildTableFull {}
+
+const SHARED_CHILD_SLOTS: usize = 1024;
+static SHARED_CHILDREN: [AtomicU32; SHARED_CHILD_SLOTS] =
+    [const { AtomicU32::new(0) }; SHARED_CHILD_SLOTS];
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn current_pid() -> u32 {
+    #[cfg(test)]
+    if let Some(pid) = TEST_PID.with(|p| p.get()) {
+        return pid;
+    }
+    std::process::id()
+}
+
+fn mark_pid(slots: &[AtomicU32], pid: u32) -> Result<(), SharedChildTableFull> {
+    // Slots never clear: no inherited lock, allocation, or reclamation protocol.
+    // A failed CAS returns the winner, making concurrent repeated marks idempotent.
+    for slot in slots {
+        match slot.compare_exchange(0, pid, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(marked) if marked == pid => return Ok(()),
+            Err(_) => {}
+        }
+    }
+    Err(SharedChildTableFull)
+}
+
+/// Permanently disable JIT code allocation, compilation and registration for the
+/// calling PID, across all its threads, without disabling its shared-VM parent.
+/// Call immediately on child entry, before any engine use or child thread starts.
+/// The child must have its own host stack and TLS; it must not run inherited
+/// engine destructors. Lookups and the step-one interpreter remain available.
+///
+/// Uses a fixed lock-free table, with no allocation, TLS access, fork-handler
+/// registration or inherited mutex in production. At most 1024 distinct PIDs can
+/// be marked per address space. Repeated calls for a marked PID succeed. Marks
+/// are never removed, so PID reuse conservatively refuses JIT as well. On table
+/// exhaustion, exit/exec the child without engine use; the parent is unaffected.
+/// Marking must precede JIT use, rather than racing an already active compiler.
+pub fn mark_shared_address_space_child() -> Result<(), SharedChildTableFull> {
+    mark_pid(&SHARED_CHILDREN, current_pid())
+}
+
+/// Check admission before touching any process-owned JIT storage or locks.
+#[doc(hidden)]
+pub fn check_jit_allowed() -> Result<(), SharedAddressSpaceChild> {
+    let pid = current_pid();
+    if SHARED_CHILDREN
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == pid)
+    {
+        Err(SharedAddressSpaceChild)
+    } else {
+        Ok(())
+    }
+}
+
 /// Identity shared by process-owned JIT storage and metadata.
 ///
 /// The fork generation changes in every child, including children that never
@@ -838,7 +923,7 @@ impl ProcessIdentity {
             });
         }
         Self {
-            pid: std::process::id(),
+            pid: current_pid(),
             generation: GENERATION.load(Ordering::Relaxed),
         }
     }
@@ -865,6 +950,7 @@ fn code_map() -> &'static CodeMap {
 
 // Cold APIs must reject inherited maps before touching their writer mutex.
 fn owned_code_map(slot: &AtomicPtr<ProcessCodeMap>) -> Option<&'static CodeMap> {
+    check_jit_allowed().ok()?;
     let current = slot.load(Ordering::Acquire);
     if current.is_null() {
         return None;
@@ -874,20 +960,21 @@ fn owned_code_map(slot: &AtomicPtr<ProcessCodeMap>) -> Option<&'static CodeMap> 
     unsafe { ((*current).owner == owner).then(|| &(*current).map) }
 }
 
-fn writer_code_map() -> &'static CodeMap {
+fn writer_code_map() -> Result<&'static CodeMap, CodeMapFull> {
     writer_code_map_in(&CODE_MAP)
 }
 
 // New engines can reuse addresses from non-inherited arenas. Replace the whole
 // map without carrying parent locks or reader counts into the child's writer.
-fn writer_code_map_in(slot: &AtomicPtr<ProcessCodeMap>) -> &'static CodeMap {
+fn writer_code_map_in(slot: &AtomicPtr<ProcessCodeMap>) -> Result<&'static CodeMap, CodeMapFull> {
+    check_jit_allowed().map_err(|_| CodeMapFull)?;
     let owner = ProcessIdentity::current();
     loop {
         let old = slot.load(Ordering::Acquire);
         // SAFETY: published maps and their immutable identities are retained.
         if !old.is_null() && unsafe { (*old).owner == owner } {
             // SAFETY: the map remains live for every reader/writer.
-            return unsafe { &(*old).map };
+            return Ok(unsafe { &(*old).map });
         }
         let new = Box::into_raw(Box::new(ProcessCodeMap {
             owner,
@@ -898,7 +985,7 @@ fn writer_code_map_in(slot: &AtomicPtr<ProcessCodeMap>) -> &'static CodeMap {
             .is_ok()
         {
             // SAFETY: the winning map is published and retained permanently.
-            return unsafe { &(*new).map };
+            return Ok(unsafe { &(*new).map });
         }
         // SAFETY: this losing candidate was never published.
         unsafe { drop(Box::from_raw(new)) };
@@ -930,7 +1017,7 @@ pub fn register(
     table: Box<[(u32, u32)]>,
     guest_rips: Box<[u64]>,
 ) -> Result<(), CodeMapFull> {
-    writer_code_map().register(start, code_len, table, guest_rips)
+    writer_code_map()?.register(start, code_len, table, guest_rips)
 }
 
 /// Look a host PC up in the process-global map (see [`CodeMap::lookup`]).
@@ -946,7 +1033,7 @@ pub fn register_with_traps(
     guest_rips: Box<[u64]>,
     traps: Vec<GuestTrapSite>,
 ) -> Result<(), CodeMapFull> {
-    writer_code_map().register_with_traps(start, code_len, table, guest_rips, traps)
+    writer_code_map()?.register_with_traps(start, code_len, table, guest_rips, traps)
 }
 
 /// Resolve an exact faulting PC in the process-global map.
@@ -963,7 +1050,7 @@ pub fn register_with_recovery(
     traps: Vec<GuestTrapSite>,
     recipe: Option<FrameRecipe>,
 ) -> Result<(), CodeMapFull> {
-    writer_code_map().register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
+    writer_code_map()?.register_with_recovery(start, code_len, table, guest_rips, traps, recipe)
 }
 
 /// Publish cold per-instruction descriptors with the function and transfer table.
@@ -978,7 +1065,7 @@ pub fn register_with_fault_info(
     recipe: Option<FrameRecipe>,
     instructions: Vec<crate::fault::InstructionFaultInfo>,
 ) -> Result<(), CodeMapFull> {
-    writer_code_map().register_with_fault_info(
+    writer_code_map()?.register_with_fault_info(
         start,
         code_len,
         table,
@@ -1002,7 +1089,7 @@ pub fn register_with_fault_path(
     instructions: Vec<crate::fault::InstructionFaultInfo>,
     unit: FaultUnit,
 ) -> Result<(), CodeMapFull> {
-    writer_code_map().register_with_fault_path(
+    writer_code_map()?.register_with_fault_path(
         start,
         code_len,
         table,
@@ -1097,6 +1184,177 @@ mod tests {
         }
     }
 
+    fn with_test_pid<T>(pid: u32, f: impl FnOnce() -> T) -> T {
+        struct Reset(Option<u32>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_PID.with(|p| p.set(self.0));
+            }
+        }
+        let _reset = Reset(TEST_PID.with(|p| p.replace(Some(pid))));
+        f()
+    }
+
+    #[test]
+    fn shared_child_marker_preserves_parent_map_and_step_interpreter() {
+        let parent = ProcessIdentity::current();
+        let start = usize::MAX / 2;
+        let site = GuestTrapSite {
+            host_offset: 4,
+            guest_rip: 7,
+            access: GuestAccessKind::Read,
+            width: 8,
+        };
+        register_with_fault_path(
+            start,
+            16,
+            Box::new([(0, 0)]),
+            Box::new([7]),
+            vec![site],
+            Some(recipe()),
+            Vec::new(),
+            FaultUnit::Block,
+        )
+        .unwrap();
+        let pointer = CODE_MAP.load(Ordering::Acquire);
+        let map = writer_code_map().unwrap();
+        let root = map.root.load(Ordering::SeqCst);
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x4000));
+        vm.map(0x1000, 0x1000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x1000, &[0xb8, 42, 0, 0, 0, 0x0f, 0x05])
+            .unwrap();
+        let view = vm.child_view(crate::CpuMode::Long64);
+        let mut arena = crate::ChildArena::new(16);
+        // A PID outside the host's signed pid_t range cannot mark a real test process.
+        let child_pid = u32::MAX;
+        let marked = std::sync::Barrier::new(2);
+        let checked_parent = std::sync::Barrier::new(2);
+        // Refusal must precede even a locked parent writer, including registration
+        // with invalid inputs that would panic if it reached the normal writer.
+        let lock = map.len.lock().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                with_test_pid(child_pid, || {
+                    let child = ProcessIdentity::current();
+                    assert_ne!(child.pid, parent.pid);
+                    assert_eq!(child.generation, parent.generation);
+                    mark_shared_address_space_child().unwrap();
+                    mark_shared_address_space_child().unwrap();
+                    assert_eq!(check_jit_allowed(), Err(SharedAddressSpaceChild));
+                    marked.wait();
+                    checked_parent.wait();
+                    assert!(matches!(writer_code_map(), Err(CodeMapFull)));
+                    assert_eq!(
+                        register(start + 32, 16, Box::new([(0, 9)]), Box::new([])),
+                        Err(CodeMapFull)
+                    );
+                    assert_eq!(
+                        register_with_traps(start + 32, 16, Box::new([]), Box::new([]), vec![]),
+                        Err(CodeMapFull)
+                    );
+                    assert_eq!(
+                        register_with_recovery(
+                            start + 32,
+                            16,
+                            Box::new([]),
+                            Box::new([]),
+                            vec![],
+                            None
+                        ),
+                        Err(CodeMapFull)
+                    );
+                    assert_eq!(
+                        register_with_fault_info(
+                            start + 32,
+                            16,
+                            Box::new([]),
+                            Box::new([]),
+                            vec![],
+                            None,
+                            vec![]
+                        ),
+                        Err(CodeMapFull)
+                    );
+                    assert_eq!(
+                        register_with_fault_path(
+                            start + 32,
+                            16,
+                            Box::new([]),
+                            Box::new([]),
+                            vec![],
+                            None,
+                            vec![],
+                            FaultUnit::Block
+                        ),
+                        Err(CodeMapFull)
+                    );
+                    assert!(!unregister(start, 16));
+                    assert_eq!(memory_bytes(), 0);
+                    assert_eq!(lookup(start + 4), Some(7));
+                    assert_eq!(lookup_recovery(start + 4), Some((site, recipe())));
+                    assert!(contains(start + 4));
+                    assert!(
+                        matches!(fault_path(start + 4, crate::Knowledge::Known(7), false),
+                    crate::FaultPath::CompiledBlock { host_pc, site: Some(found) }
+                    if host_pc == start + 4 && found == site)
+                    );
+                    let mut cpu = crate::CpuState {
+                        rip: 0x1000,
+                        ..Default::default()
+                    };
+                    assert!(matches!(
+                        crate::child::step(&view, &mut cpu, &mut arena),
+                        crate::ChildStep::Continue
+                    ));
+                    assert_eq!(cpu.gpr[0], 42);
+                    assert!(matches!(
+                        crate::child::step(&view, &mut cpu, &mut arena),
+                        crate::ChildStep::Syscall { .. }
+                    ));
+                })
+            });
+            marked.wait();
+            assert_eq!(check_jit_allowed(), Ok(()));
+            assert_eq!(ProcessIdentity::current(), parent);
+            assert_eq!(lookup_trap(start + 4), Some(site));
+            checked_parent.wait();
+        });
+        drop(lock);
+        // Another thread reporting the same child PID sees the permanent mark.
+        std::thread::spawn(move || {
+            with_test_pid(child_pid, || {
+                assert_eq!(check_jit_allowed(), Err(SharedAddressSpaceChild));
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(CODE_MAP.load(Ordering::Acquire), pointer);
+        assert_eq!(map.root.load(Ordering::SeqCst), root);
+        assert_eq!(lookup(start + 32), None);
+        assert_eq!(check_jit_allowed(), Ok(()));
+        register(start + 32, 16, Box::new([(0, 0)]), Box::new([9])).unwrap();
+        assert_eq!(lookup(start + 32), Some(9));
+        assert_eq!(lookup(start + 4), Some(7));
+        assert!(unregister(start, 16));
+        assert!(unregister(start + 32, 16));
+    }
+
+    #[test]
+    fn shared_child_table_is_idempotent_and_exhaustion_preserves_entries() {
+        let slots = [AtomicU32::new(0), AtomicU32::new(0)];
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| assert_eq!(mark_pid(&slots, 1), Ok(())));
+            }
+        });
+        assert_eq!(mark_pid(&slots, 2), Ok(()));
+        assert_eq!(mark_pid(&slots, 3), Err(SharedChildTableFull));
+        assert_eq!(mark_pid(&slots, 1), Ok(()));
+        assert_eq!(mark_pid(&slots, 2), Ok(()));
+        assert_eq!(slots.map(|slot| slot.load(Ordering::Relaxed)), [1, 2]);
+    }
+
     #[test]
     fn skipped_fork_generations_with_reused_pid_replace_locked_map() {
         let owner = ProcessIdentity::current();
@@ -1116,7 +1374,7 @@ mod tests {
         let guard = inherited_map.len.lock().unwrap();
         // Cold APIs must reject this identity before trying the inherited lock.
         assert!(owned_code_map(&slot).is_none());
-        let fresh = writer_code_map_in(&slot);
+        let fresh = writer_code_map_in(&slot).unwrap();
         assert!(!std::ptr::eq(fresh, inherited_map));
         assert_eq!(fresh.lookup(0x1000), None);
         fresh

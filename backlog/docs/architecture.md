@@ -55,7 +55,7 @@ that changes.
 | `x87` | x87 FPU exec (`exec_x87`/`exec_fxstate`), shared by both backends; register file is `[F80; 8]` (§14) |
 | `f80` | software 80-bit extended float (`F80`) — true x87 precision, rounds each op to a 64-bit significand; pure Rust (portable across x86/ARM) (§14) |
 | `jit_abi` | compiled-block ABI (shared with the JIT crate): `MemCtx`, `CpuOffsets`, result codes, `run_compiled`; `jit_abi::fp` owns host FP-control transitions around compiled code and helpers; `jit_abi::fault` owns per-run records, one-frame unwind recipes, mangled naked landing stubs and signal-context classification (§8.2.1-2) |
-| `codemap` | immutable host ranges, source locations, exact transfer sites and compiler-derived unwind recipes, published together for signal-safe lookup (§8.2) |
+| `codemap` | immutable host ranges, source locations, exact transfer sites and compiler-derived unwind recipes, published together for signal-safe lookup; PID-scoped shared-child JIT admission marker (§8.2) |
 | `disasm` | decode-and-print helper: `disassemble`, `print_disassembly`, `DecodedInsn` (inspection only, §12 M0) |
 | `exit` | `Exit`, `AccessKind`, `StepResult` (§5, §8) |
 | `interruption` | Per-vCPU engine-section markers and host-request deferral evidence (§9.2) |

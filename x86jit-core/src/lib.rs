@@ -40,7 +40,9 @@
 //!
 //! Before forwarding a fork that shares guest RAM, call [`Vm::child_view`] and
 //! [`ChildArena::new`] in the parent, and copy the child's [`CpuState`]. Give each
-//! child its own CPU, arena, host stack and TLS. In the child call [`child::step`]
+//! child its own CPU, arena, host stack and TLS. On child entry call
+//! [`mark_shared_address_space_child`] before any engine use, handling table
+//! exhaustion by exiting or execing. Then call [`child::step`]
 //! until exec, exit or a refusal. Integer/SSE/AVX inline IR and string operations
 //! reuse the normal interpreter; gathers, x87/state-save, source callbacks, locked
 //! memory operations and other unsupported helpers return [`ChildStep::Refused`]. A
@@ -48,8 +50,9 @@
 //! are refused; other writes enter the bounded arena page log. REP faults retain
 //! completed iterations; host split stores can leave a partial memory effect.
 //!
-//! The child never consults parent memory metadata, caches, code maps, policies
-//! or shared engine atomics. It does not allocate or run parent-owned destructors.
+//! The child step path never consults parent memory metadata, caches, code maps,
+//! policies or shared engine atomics. It does not allocate or run parent-owned
+//! destructors.
 //! Keep the inherited view, arena and CPU alive and exit/exec without dropping
 //! them in the child. After the child has exited or exec'd, call
 //! [`Vm::invalidate_written_pages`] in the parent before releasing the view and
@@ -158,7 +161,10 @@ pub mod x87;
 
 pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 pub use child::{ChildArena, ChildFault, ChildRefusal, ChildStep, ChildView};
-pub use codemap::{GuestAccessKind, GuestTrapSite};
+pub use codemap::{
+    mark_shared_address_space_child, GuestAccessKind, GuestTrapSite, SharedAddressSpaceChild,
+    SharedChildTableFull,
+};
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{
     AccessKind, ExecutionEvidence, Exit, PortDir, StepResult, UnsupportedSystemOperation,

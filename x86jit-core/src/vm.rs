@@ -415,7 +415,8 @@ pub enum CompileFailureReason {
     DescriptorLimit,
     /// Executable storage, metadata allocation, or code-space budget exhausted.
     CodeSpace,
-    /// Invalid backend metadata or another deterministic backend error.
+    /// Invalid backend metadata or another deterministic backend error, including
+    /// JIT admission refused for a marked shared-address-space child PID.
     OtherBackendError,
     /// A failure the backend cannot attribute to the unit, such as a panic on a
     /// host error during compilation or publication. Counted with other backend
