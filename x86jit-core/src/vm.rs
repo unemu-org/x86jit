@@ -1993,6 +1993,7 @@ impl Vcpu {
     fn legacy_memory_in_flight(&self) -> bool {
         self.legacy_execution.as_ref().is_some_and(|e| {
             self.cpu.mmio_retry_active
+                || self.cpu.port_string_in.is_some()
                 || self.cpu.mmio_parts_len != 0
                 || self.cpu.pending_mmio.is_some()
                 || self.cpu.pending_mmio_write

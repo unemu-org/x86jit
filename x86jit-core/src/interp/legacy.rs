@@ -161,6 +161,7 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
+    let value = value & mask(size);
     let (physical, part) = legacy::physical_span(cpu, addr, size);
     if part == size {
         return write_physical(cpu, mem, addr, physical, size, value);
@@ -634,6 +635,133 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+// x87 retains its existing RAM-only transfer contract. Segment checks happen in
+// Legacy::Address; this adapter splits each actual RAM transfer at the A20 gate.
+struct PhysicalFpMemory<'a, const ROUTED: bool> {
+    memory: &'a Memory,
+    a20_enabled: bool,
+    fault: std::cell::Cell<Option<u64>>,
+}
+impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
+    fn load(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.load_checked(addr, buf)
+            .map_err(|at| self.fault.set(Some(at)))
+            .is_ok()
+    }
+    fn store(&self, addr: u64, bytes: &[u8]) -> bool {
+        self.store_checked(addr, bytes)
+            .map_err(|at| self.fault.set(Some(at)))
+            .is_ok()
+    }
+    fn fault_addr(&self, addr: u64) -> u64 {
+        self.fault.get().unwrap_or(addr)
+    }
+    fn host_fault_recovery(&self) -> bool {
+        ROUTED
+    }
+    fn load_checked(&self, mut addr: u64, mut buf: &mut [u8]) -> Result<(), u64> {
+        while !buf.is_empty() {
+            let (physical, part) =
+                legacy::physical_span_with_gate(self.a20_enabled, addr, buf.len().min(255) as u8);
+            let (head, tail) = buf.split_at_mut(usize::from(part));
+            self.memory
+                .read_ram_checked_mode::<ROUTED>(physical, head)
+                .map_err(|at| addr + at.saturating_sub(physical))?;
+            addr = u64::from((addr as u32).wrapping_add(u32::from(part)));
+            buf = tail;
+        }
+        Ok(())
+    }
+    fn store_checked(&self, mut addr: u64, mut bytes: &[u8]) -> Result<(), u64> {
+        // Check every physical destination before the first RAM commit.
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let linear = u64::from((addr as u32).wrapping_add(offset as u32));
+            let (physical, part) = legacy::physical_span_with_gate(
+                self.a20_enabled,
+                linear,
+                (bytes.len() - offset).min(255) as u8,
+            );
+            if let Err(trap) = self.memory.probe_write_mode::<ROUTED>(physical, part) {
+                let at = trap.fault_addr(physical);
+                crate::fault::record_fp_fault(
+                    at,
+                    usize::from(part),
+                    if matches!(trap, MemTrap::HostFault) {
+                        crate::FaultOrigin::HostAccess
+                    } else {
+                        crate::FaultOrigin::GuestMap
+                    },
+                    crate::AddressPrecision::TransferAddress,
+                );
+                return Err(linear + at.saturating_sub(physical));
+            }
+            offset += usize::from(part);
+        }
+        while !bytes.is_empty() {
+            let (physical, part) =
+                legacy::physical_span_with_gate(self.a20_enabled, addr, bytes.len().min(255) as u8);
+            let (head, tail) = bytes.split_at(usize::from(part));
+            self.memory
+                .write_ram_checked_mode::<ROUTED>(physical, head)
+                .map_err(|at| addr + at.saturating_sub(physical))?;
+            addr = u64::from((addr as u32).wrapping_add(u32::from(part)));
+            bytes = tail;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    memory: &Memory,
+) -> Result<(), Exit> {
+    let Some(p) = cpu.port_string_in else {
+        return Ok(());
+    };
+    let Some(value) = p.value else {
+        return Err(Exit::port_io(cpu.gpr[RDX] as u16, p.elem, PortDir::In, 0));
+    };
+    // The handoff already checked the complete ES operand and owns its A20 line.
+    write(
+        cpu,
+        Access::<ROUTED, ORDER>::new(memory),
+        u64::from((p.base as u32).wrapping_add(p.offset as u32)),
+        p.elem,
+        value,
+    )?;
+    cpu.write_gpr(RDI, p.next_index, p.addr_bits / 8);
+    if p.rep {
+        cpu.write_gpr(RCX, p.next_count, p.addr_bits / 8);
+    }
+    cpu.rip = p.next_ip;
+    cpu.port_string_in = None;
+    cpu.clear_mmio_parts();
+    Ok(())
+}
+
+fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
+    cpu: &CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    ir: &IrBlock,
+) -> Exit {
+    // Locked device operands require whole-instruction embedder emulation,
+    // including an operand split by the board's physical gate (§5.2).
+    let mut bytes = [0; 15];
+    for i in 0..ir.guest_len as usize {
+        let linear = u64::from(
+            cpu.legacy.segments[SegmentId::Cs as usize]
+                .base
+                .wrapping_add((cpu.rip as u32).wrapping_add(i as u32)),
+        );
+        let (physical, _) = legacy::physical_span(cpu, linear, 1);
+        if mem.fetch_code(physical, &mut bytes[i..i + 1]).is_err() {
+            break;
+        }
+    }
+    Exit::unknown_instruction(cpu.rip, bytes, ir.guest_len as u8)
+}
+
 fn supported(op: &IrOp) -> bool {
     matches!(
         op,
@@ -673,6 +801,12 @@ fn supported(op: &IrOp) -> bool {
             | IrOp::Hlt
             | IrOp::PortIo { .. }
             | IrOp::Trap { .. }
+            | IrOp::Bcd { .. }
+            | IrOp::Bt { .. }
+            | IrOp::BoundGate { .. }
+            | IrOp::X87 { .. }
+            | IrOp::AtomicRmw { .. }
+            | IrOp::Unsupported { .. }
     )
 }
 
@@ -896,6 +1030,144 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 size,
                 op,
             } => exec_bit_scan(cpu, temps, dst, src, old, size, op),
+            IrOp::Bcd { kind } => exec_bcd(cpu, cpu.rip, kind),
+            IrOp::Bt {
+                result,
+                a,
+                bit,
+                size,
+                op,
+            } => exec_bt(cpu, temps, result, a, bit, size, op),
+            IrOp::BoundGate {
+                index,
+                lower,
+                upper,
+                ..
+            } => {
+                let index = read_val(*index, temps) as i16;
+                if index < read_val(*lower, temps) as i16 || index > read_val(*upper, temps) as i16
+                {
+                    return Err(exception(cpu, 5));
+                }
+                None
+            }
+            IrOp::AtomicRmw {
+                old,
+                addr,
+                src,
+                size,
+                op,
+                ..
+            } => {
+                let linear = read_val(*addr, temps);
+                let (physical, part) = legacy::physical_span(cpu, linear, *size);
+                if part == *size {
+                    match mem.atomic_rmw(physical, read_val(*src, temps), *size, *op) {
+                        Ok(value) => temps[*old as usize] = value,
+                        Err(MemTrap::Mmio) => return Err(atomic_device_exit(cpu, mem, ir)),
+                        Err(trap) => {
+                            if let StepResult::Exit(exit) = trap_out(
+                                cpu,
+                                cpu.rip,
+                                trap,
+                                physical,
+                                *size,
+                                AccessKind::Write,
+                                read_val(*src, temps),
+                            )
+                            .into_step()
+                            {
+                                return Err(crate::fault::qualify_legacy_bus(
+                                    exit, linear, physical,
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    if (0..*size).any(|byte| {
+                        let linear = u64::from((linear as u32).wrapping_add(u32::from(byte)));
+                        let (physical, _) = legacy::physical_span(cpu, linear, 1);
+                        matches!(mem.0.region_kind(physical, 1), Ok(crate::RegionKind::Trap))
+                    }) {
+                        return Err(atomic_device_exit(cpu, mem, ir));
+                    }
+                    // As with the memory layer's unaligned RMW fallback, this
+                    // discontinuous bus operand has no single host atomic address.
+                    probe(cpu, mem, linear, *size)?;
+                    let value = read(cpu, mem, linear, *size)?;
+                    let src = read_val(*src, temps);
+                    let updated = match op {
+                        crate::ir::RmwOp::Add => value.wrapping_add(src),
+                        crate::ir::RmwOp::Sub => value.wrapping_sub(src),
+                        crate::ir::RmwOp::Rsub => src.wrapping_sub(value),
+                        crate::ir::RmwOp::And => value & src,
+                        crate::ir::RmwOp::Or => value | src,
+                        crate::ir::RmwOp::Xor => value ^ src,
+                        crate::ir::RmwOp::Xchg => src,
+                    };
+                    write(cpu, mem, linear, *size, updated)?;
+                    temps[*old as usize] = value;
+                }
+                None
+            }
+            IrOp::Unsupported { bytes, len } => {
+                if cpu.fpu_model != crate::FpuModel::None {
+                    return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
+                }
+                None
+            }
+            IrOp::X87 {
+                kind,
+                addr,
+                sti,
+                instruction,
+                operand_offset,
+                ..
+            } => {
+                if cpu.fpu_model == crate::FpuModel::None {
+                    continue;
+                }
+                if crate::x87::mf_pending_before(cpu, *kind) {
+                    return Err(exception(cpu, 16));
+                }
+                let address = read_val(*addr, temps);
+                let fp = PhysicalFpMemory::<ROUTED> {
+                    memory: &mem.0,
+                    a20_enabled: cpu.legacy.a20_enabled != 0,
+                    fault: std::cell::Cell::new(None),
+                };
+                let _ordering = ordering::Barrier::<ORDER>::new(
+                    if crate::x87::mem_write_bytes(*kind).is_some() {
+                        Some(ordering::Direction::Write)
+                    } else if crate::x87::mem_operand_bytes(*kind) != 0 {
+                        Some(ordering::Direction::Read)
+                    } else {
+                        None
+                    },
+                    false,
+                );
+                if let Some((at, writing)) = crate::x87::exec_x87(cpu, &fp, *kind, address, *sti) {
+                    let (physical, _) = legacy::physical_span(cpu, at, 1);
+                    let exit = crate::fault::fp_exit(
+                        cpu.rip,
+                        physical,
+                        crate::x87::mem_operand_bytes_format(*kind, *sti) as u16,
+                        if writing {
+                            AccessKind::Write
+                        } else {
+                            AccessKind::Read
+                        },
+                    );
+                    return Err(crate::fault::qualify_legacy_bus(exit, at, physical));
+                }
+                crate::x87::record_x87_instruction(
+                    cpu,
+                    read_val(*operand_offset, temps),
+                    ir.guest_start,
+                    *instruction,
+                );
+                None
+            }
             IrOp::Load {
                 dst, addr, size, ..
             } => {
@@ -969,6 +1241,126 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
             }
             IrOp::Legacy(op) => {
                 match op {
+                    L::Coprocessor { bytes, len, wait } => {
+                        // SDM Vol 3A §2.5 Table 2-2; 80386 PRM §§11.1.2–11.1.4:
+                        // ESC tests EM/TS before operand checks; WAIT tests MP && TS.
+                        let msw = cpu.legacy.cr0;
+                        if if *wait {
+                            msw & 0xa == 0xa
+                        } else {
+                            msw & 0xc != 0
+                        } {
+                            return Err(exception(cpu, 7));
+                        }
+                        // Generation/decoder #UD follows the MSW gate, before
+                        // the absent-output handoff (decision-21; §17.9).
+                        if !*wait
+                            && cpu.fpu_model == crate::FpuModel::None
+                            && !ir
+                                .ops
+                                .iter()
+                                .any(|op| matches!(op, IrOp::Trap { vector: 6, .. }))
+                            && crate::x87::esc_output(&bytes[..usize::from(*len)])
+                        {
+                            return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
+                        }
+                    }
+                    L::Enter { size, alloc, level } => {
+                        // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
+                        // selects frame values independently of stack address size.
+                        let stack_mask = mask(context.stack_address_bits / 8);
+                        let frame_sp = sp(cpu, context).wrapping_sub(u64::from(*size)) & stack_mask;
+                        let frame = if *size == 4 && context.stack_address_bits == 16 {
+                            (cpu.gpr[RSP] & 0xffff_0000) | frame_sp
+                        } else {
+                            frame_sp & mask(*size)
+                        };
+                        let pushes = if *level == 0 {
+                            1
+                        } else {
+                            usize::from(*level) + 1
+                        };
+                        let final_sp = sp(cpu, context)
+                            .wrapping_sub(pushes as u64 * u64::from(*size))
+                            .wrapping_sub(u64::from(*alloc))
+                            & stack_mask;
+                        legacy::access(
+                            cpu,
+                            context.generation,
+                            SegmentId::Ss,
+                            final_sp,
+                            1,
+                            AccessKind::Write,
+                        )
+                        .map_err(|_| exception(cpu, 12))?;
+                        let addresses = push_addresses(cpu, mem, context, pushes, *size)?;
+                        let mut values = vec![cpu.gpr[RBP] & mask(*size)];
+                        let mut overlay = Vec::new();
+                        for i in 1..*level {
+                            // Display reads see earlier frame pushes, even if
+                            // BP aliases SP or the A20 gate aliases their backing.
+                            // Stage those bytes until every faultable read succeeds.
+                            let value = values[usize::from(i - 1)];
+                            let pushed = addresses[usize::from(i - 1)];
+                            for byte in 0..*size {
+                                let linear =
+                                    u64::from((pushed as u32).wrapping_add(u32::from(byte)));
+                                let (physical, _) = legacy::physical_span(cpu, linear, 1);
+                                overlay.push((physical, (value >> (byte * 8)) as u8));
+                            }
+                            let offset = cpu.gpr[RBP].wrapping_sub(u64::from(i) * u64::from(*size))
+                                & stack_mask;
+                            let address = legacy::access(
+                                cpu,
+                                context.generation,
+                                SegmentId::Ss,
+                                offset,
+                                *size,
+                                AccessKind::Read,
+                            )?;
+                            let physical = (0..*size)
+                                .map(|byte| {
+                                    legacy::physical_span(
+                                        cpu,
+                                        u64::from((address as u32).wrapping_add(u32::from(byte))),
+                                        1,
+                                    )
+                                    .0
+                                })
+                                .collect::<Vec<_>>();
+                            let value = if physical
+                                .iter()
+                                .any(|at| overlay.iter().any(|(p, _)| p == at))
+                            {
+                                let mut value = 0;
+                                for (byte, at) in physical.into_iter().enumerate() {
+                                    let part = if let Some((_, value)) =
+                                        overlay.iter().rev().find(|(p, _)| *p == at)
+                                    {
+                                        u64::from(*value)
+                                    } else {
+                                        read(
+                                            cpu,
+                                            mem,
+                                            u64::from((address as u32).wrapping_add(byte as u32)),
+                                            1,
+                                        )?
+                                    };
+                                    value |= part << (byte * 8);
+                                }
+                                value
+                            } else {
+                                read(cpu, mem, address, *size)?
+                            };
+                            values.push(value);
+                        }
+                        if *level != 0 {
+                            values.push(frame);
+                        }
+                        push(cpu, mem, context, &values, *size)?;
+                        cpu.write_gpr(RBP, frame, *size);
+                        adjust(cpu, context, 0u32.wrapping_sub(u32::from(*alloc)));
+                    }
                     L::Table {
                         addr,
                         idtr,
@@ -1380,6 +1772,74 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         address_bits,
                         source,
                     } => {
+                        if matches!(kind, StrOp::Ins | StrOp::Outs) {
+                            let width = address_bits / 8;
+                            let repeating = !matches!(rep, RepKind::None);
+                            let count = cpu.gpr[RCX] & mask(width);
+                            if repeating && count == 0 {
+                                continue;
+                            }
+                            let output = matches!(kind, StrOp::Outs);
+                            let index = if output { RSI } else { RDI };
+                            let offset = cpu.gpr[index] & mask(width);
+                            let segment = if output { *source } else { SegmentId::Es };
+                            let address = legacy::access(
+                                cpu,
+                                context.generation,
+                                segment,
+                                offset,
+                                *elem,
+                                if output {
+                                    AccessKind::Read
+                                } else {
+                                    AccessKind::Write
+                                },
+                            )?;
+                            let value = if output {
+                                read(cpu, mem, address, *elem)?
+                            } else {
+                                0
+                            };
+                            let delta = if cpu.flags.df {
+                                0u64.wrapping_sub(u64::from(*elem))
+                            } else {
+                                u64::from(*elem)
+                            };
+                            let next_index = offset.wrapping_add(delta) & mask(width);
+                            let next_count = count.wrapping_sub(1) & mask(width);
+                            let last = !repeating || next_count == 0;
+                            let next_ip = if last { next } else { ir.guest_start };
+                            outcome.retired = last;
+                            if output {
+                                cpu.write_gpr(index, next_index, width);
+                                if repeating {
+                                    cpu.write_gpr(RCX, next_count, width);
+                                }
+                                cpu.rip = next_ip;
+                            } else {
+                                cpu.pending_port_in = Some(*elem);
+                                cpu.port_string_in = Some(crate::state::PortStringIn {
+                                    rip: ir.guest_start,
+                                    next_ip,
+                                    instruction_end: next,
+                                    base: u64::from(cpu.legacy.segments[segment as usize].base),
+                                    offset,
+                                    next_index,
+                                    next_count,
+                                    addr_bits: *address_bits,
+                                    elem: *elem,
+                                    rep: repeating,
+                                    value: None,
+                                });
+                            }
+                            outcome.exit = Some(Exit::PortIo {
+                                port: cpu.gpr[RDX] as u16,
+                                size: *elem,
+                                dir: if output { PortDir::Out } else { PortDir::In },
+                                value,
+                            });
+                            return Ok(outcome);
+                        }
                         // SDM Vol 2B §4.3 MOVS/CMPS/STOS/LODS/SCAS/REP:
                         // address size selects indices and count; operand size selects
                         // element width. ES destination cannot be overridden.

@@ -122,13 +122,53 @@ pub(crate) fn instruction(
                         | iced_x86::CpuidFeature::INTEL186
                         | iced_x86::CpuidFeature::INTEL286
                         | iced_x86::CpuidFeature::INTEL286_ONLY
-                        // I286/287 PRM Part II Ch. 2, Processor Control Instructions, p. 2-16: these
-                        // coprocessor forms keep the existing explicit refusal.
+                        // I286/287 PRM Part II Ch. 2, Processor Control
+                        // Instructions, p. 2-16: available coprocessor forms.
                         | iced_x86::CpuidFeature::FPU
                         | iced_x86::CpuidFeature::FPU287
                 )
             }));
-    if insn.is_invalid() || table_register_operand || unavailable_286 {
+    let esc = crate::x87::is_esc(code);
+    let wait = insn.mnemonic() == Mnemonic::Wait;
+    if esc || wait {
+        let mut bytes = [0; 15];
+        bytes[..code.len()].copy_from_slice(code);
+        emit(
+            &mut ops,
+            L::Coprocessor {
+                bytes,
+                len: code.len() as u8,
+                wait,
+            },
+        );
+    }
+    // SDM Vol 1 §§2.1.1–2.1.3; 80386 PRM §17: sharing lowering
+    // does not grant instructions introduced after the selected generation.
+    // 80386 PRM §17 MOV to/from Special Registers, p. 17-111:
+    // TR6/TR7 are I386. Iced also tags the shared encoding with 486-only
+    // test registers; that alternative must not hide the I386 operands.
+    let i386_test_register = matches!(insn.code(), Code::Mov_r32_tr | Code::Mov_tr_r32)
+        && (0..insn.op_count())
+            .any(|i| matches!(insn.op_register(i), Register::TR6 | Register::TR7));
+    let unavailable_386 = context.generation == crate::CpuGeneration::I386
+        && !i386_test_register
+        && !insn.cpuid_features().iter().all(|feature| {
+            matches!(
+                feature,
+                iced_x86::CpuidFeature::INTEL8086
+                    | iced_x86::CpuidFeature::INTEL8086_ONLY
+                    | iced_x86::CpuidFeature::INTEL186
+                    | iced_x86::CpuidFeature::INTEL286
+                    | iced_x86::CpuidFeature::INTEL286_ONLY
+                    | iced_x86::CpuidFeature::INTEL386
+                    | iced_x86::CpuidFeature::INTEL386_ONLY
+                    | iced_x86::CpuidFeature::INTEL386_A0_ONLY
+                    | iced_x86::CpuidFeature::FPU
+                    | iced_x86::CpuidFeature::FPU287
+                    | iced_x86::CpuidFeature::FPU387
+            )
+        });
+    if insn.is_invalid() || table_register_operand || unavailable_286 || unavailable_386 {
         // SDM Vol 3A §7.15, Events 6/13: #UD or an overlong instruction.
         // I286 PRM Appendix B #GP p. B-9: incomplete at ten bytes is overlong.
         let overlong_286 = context.generation == crate::CpuGeneration::I286
@@ -142,8 +182,22 @@ pub(crate) fn instruction(
         };
         ops.push(IrOp::Trap { vector, advance: 0 });
     } else {
-        lower(&insn, &mut ops, &mut tg)
-            .map_err(|e| refill_unsupported_bytes(e, code, u64::from(ip)))?;
+        let first = ops.values.len();
+        if let Err(error) = lower(&insn, &mut ops, &mut tg) {
+            if !esc {
+                return Err(refill_unsupported_bytes(error, code, u64::from(ip)));
+            }
+            ops.values.truncate(first);
+            let mut bytes = [0; 15];
+            bytes[..code.len()].copy_from_slice(code);
+            ops.push(IrOp::Unsupported {
+                bytes,
+                len: code.len() as u8,
+            });
+            if insn.op_kinds().any(|k| k == OpKind::Memory) {
+                effective_address(&insn, &mut ops, &mut tg)?;
+            }
+        }
         // Decoder access intent includes RMW operands, which require a writable
         // segment type (SDM Vol 3A §6.4).
         let mut factory = iced_x86::InstructionInfoFactory::new();
@@ -168,6 +222,7 @@ pub(crate) fn instruction(
             }
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
+        fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
     }
     Ok(IrBlock {
         mode,
@@ -407,18 +462,15 @@ pub(super) fn lower(
                     },
                 );
             } else {
-                // Memory EA for POP uses post-increment ESP (SDM Vol 2B §4.3 POP).
-                // Defer this uncommon form rather than commit ESP before a fault.
-                if insn.op_kind(0) != OpKind::Register {
-                    return Err(unsupported_insn(insn));
-                }
-                let target = lower_write_target(insn, 0, ops, tg)?;
                 emit(
                     ops,
                     L::AdjustStack {
                         bytes: u32::from(size),
                     },
                 );
+                // SDM Vol 2B §4.3 POP: a memory EA uses the incremented ESP.
+                // The legacy interpreter restores SP if the destination faults.
+                let target = lower_write_target(insn, 0, ops, tg)?;
                 emit_write(ops, tg, target, Val::Temp(dst));
             }
         }
@@ -506,7 +558,7 @@ pub(super) fn lower(
                 advance: 0,
             });
         }
-        Cpuid => ops.push(IrOp::Trap {
+        Cpuid | Ud2 => ops.push(IrOp::Trap {
             vector: 6,
             advance: 0,
         }),
@@ -514,12 +566,13 @@ pub(super) fn lower(
             emit(ops, L::CheckTaskReturn);
             emit(ops, L::Iret { size });
         }
-        Int | Int3 | Into => emit(
+        Int | Int3 | Int1 | Into => emit(
             ops,
             L::Interrupt {
                 vector: match insn.mnemonic() {
                     Int => insn.immediate8(),
                     Int3 => 3,
+                    Int1 => 1,
                     _ => 4,
                 },
                 saved_ip: next,
@@ -555,7 +608,7 @@ pub(super) fn lower(
             );
         }
         Movsb | Movsw | Movsd | Stosb | Stosw | Stosd | Lodsb | Lodsw | Lodsd | Cmpsb | Cmpsw
-        | Cmpsd | Scasb | Scasw | Scasd
+        | Cmpsd | Scasb | Scasw | Scasd | Insb | Insw | Insd | Outsb | Outsw | Outsd
             if insn.op_kinds().any(|k| {
                 matches!(
                     k,
@@ -571,11 +624,13 @@ pub(super) fn lower(
                 Stosb | Stosw | Stosd => StrOp::Stos,
                 Lodsb | Lodsw | Lodsd => StrOp::Lods,
                 Cmpsb | Cmpsw | Cmpsd => StrOp::Cmps,
-                _ => StrOp::Scas,
+                Scasb | Scasw | Scasd => StrOp::Scas,
+                Insb | Insw | Insd => StrOp::Ins,
+                _ => StrOp::Outs,
             };
             let elem = match insn.mnemonic() {
-                Movsb | Stosb | Lodsb | Cmpsb | Scasb => 1,
-                Movsw | Stosw | Lodsw | Cmpsw | Scasw => 2,
+                Movsb | Stosb | Lodsb | Cmpsb | Scasb | Insb | Outsb => 1,
+                Movsw | Stosw | Lodsw | Cmpsw | Scasw | Insw | Outsw => 2,
                 _ => 4,
             };
             let address_bits = if insn
@@ -587,7 +642,11 @@ pub(super) fn lower(
                 32
             };
             let rep = if insn.has_repne_prefix() {
-                RepKind::Repne
+                if matches!(kind, StrOp::Cmps | StrOp::Scas) {
+                    RepKind::Repne
+                } else {
+                    RepKind::Rep
+                }
             } else if insn.has_rep_prefix() {
                 if matches!(kind, StrOp::Cmps | StrOp::Scas) {
                     RepKind::Repe
@@ -657,6 +716,82 @@ pub(super) fn lower(
                 value,
             );
         }
+        Bt | Bts | Btr | Btc
+            if insn.op_kind(0) == OpKind::Memory && insn.op_kind(1) == OpKind::Register =>
+        {
+            // SDM Vol 2A §3.3 BT/BTC/BTR/BTS: a register bit index
+            // contributes a signed byte displacement before segment checks.
+            let bit = lower_read(insn, 1, ops, tg)?;
+            let signed = tg.fresh();
+            ops.push(IrOp::Sext {
+                dst: signed,
+                a: bit,
+                from: operand_size(insn, 1),
+            });
+            let displacement = alu_none(ops, tg, |dst| IrOp::Sar {
+                dst,
+                a: Val::Temp(signed),
+                b: Val::Imm(3),
+                size: 8,
+                set_flags: FlagMask::NONE,
+            });
+            let base = effective_address_no_segment(insn, ops, tg)?;
+            let offset = add_addr(base, displacement, ops, tg);
+            let bits = if insn.memory_base().size() == 2
+                || insn.memory_index().size() == 2
+                || (insn.memory_base() == Register::None
+                    && insn.memory_index() == Register::None
+                    && insn.memory_displ_size() == 2)
+            {
+                16
+            } else {
+                32
+            };
+            let offset = alu_none(ops, tg, |dst| IrOp::And {
+                dst,
+                a: offset,
+                b: Val::Imm(if bits == 16 { 0xffff } else { 0xffff_ffff }),
+                size: 8,
+                set_flags: FlagMask::NONE,
+            });
+            let dst = tg.fresh();
+            emit(
+                ops,
+                L::Address {
+                    dst,
+                    segment: segment(insn.memory_segment()).unwrap(),
+                    offset,
+                    bytes: 1,
+                    access: if insn.mnemonic() == Bt {
+                        crate::AccessKind::Read
+                    } else {
+                        crate::AccessKind::Write
+                    },
+                },
+            );
+            emit_mem_bt(
+                ops,
+                tg,
+                Val::Temp(dst),
+                1,
+                bit,
+                match insn.mnemonic() {
+                    Bt => BtOp::Test,
+                    Bts => BtOp::Set,
+                    Btr => BtOp::Reset,
+                    _ => BtOp::Complement,
+                },
+                insn.has_lock_prefix(),
+            );
+        }
+        Enter => emit(
+            ops,
+            L::Enter {
+                size,
+                alloc: insn.immediate16(),
+                level: insn.immediate8_2nd() & 31,
+            },
+        ),
         Leave => emit(ops, L::Leave { size }),
         Cli => ops.push(IrOp::SetIf { value: false }),
         Sti => ops.push(IrOp::SetIf { value: true }),
@@ -680,6 +815,32 @@ pub(super) fn lower(
                 }
             }
             return result;
+        }
+        _ if context.regime == crate::legacy::LegacyRegime::Real => {
+            // Share application instruction semantics; effective_address still
+            // emits Legacy::Address and every bus access remains legacy-owned.
+            let mut application = *insn;
+            if insn.cpuid_features().iter().any(|feature| {
+                matches!(
+                    feature,
+                    iced_x86::CpuidFeature::FPU
+                        | iced_x86::CpuidFeature::FPU287
+                        | iced_x86::CpuidFeature::FPU387
+                )
+            }) {
+                // SDM Vol 1 §8.1.10: PE selects the real environment image,
+                // independently of retained CS.D. Decoded operand/address
+                // widths remain in Code and the operand registers; the shared
+                // Real16 helper uses CodeSize only to choose this personality.
+                application.set_code_size(CodeSize::Code16);
+            }
+            return lift_insn_inner(
+                &application,
+                ops,
+                tg,
+                CpuMode::Real16,
+                &mut mmx::Sequence::default(),
+            );
         }
         // Other system facilities are activated by later phases.
         _ => emit(

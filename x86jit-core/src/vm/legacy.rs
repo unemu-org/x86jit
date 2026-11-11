@@ -451,6 +451,21 @@ impl Vcpu {
                     stop: StepStop::Exit(exit),
                 };
             }
+            if self.cpu.port_string_in.is_some() {
+                if let Err(exit) = crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
+                    &mut self.cpu,
+                    &vm.mem,
+                ) {
+                    return StepRun {
+                        steps,
+                        stop: StepStop::Exit(exit),
+                    };
+                }
+                self.sti_shadow = false;
+                self.ss_shadow = false;
+                self.cpu.finish_mmio_retry(None);
+                self.apply_pending_a20();
+            }
             let context = match self.legacy_context_for_run() {
                 Ok(c) => c,
                 Err(exit) => {
@@ -540,8 +555,10 @@ impl Vcpu {
                     steps += 1;
                     self.retired += u64::from(outcome.retired);
                     self.executed += u64::from(outcome.retired);
-                    self.sti_shadow = outcome.arm_sti;
-                    self.ss_shadow = outcome.arm_ss && !self.ss_shadow;
+                    if self.cpu.port_string_in.is_none() {
+                        self.sti_shadow = outcome.arm_sti;
+                        self.ss_shadow = outcome.arm_ss && !self.ss_shadow;
+                    }
                     self.cpu.finish_mmio_retry(None);
                     // SDM Vol 2B REP, p. 4-564: a completed iteration is an
                     // interruption window with updated registers (decision-22).

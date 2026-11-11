@@ -631,6 +631,16 @@ pub enum LegacyOp {
         address_bits: u8,
         source: SegmentId,
     },
+    Enter {
+        size: u8,
+        alloc: u16,
+        level: u8,
+    },
+    Coprocessor {
+        bytes: [u8; 15],
+        len: u8,
+        wait: bool,
+    },
     Leave {
         size: u8,
     },
@@ -767,7 +777,15 @@ pub(crate) fn access(
 /// item 2 (p. C-3), prescribe external gating of A20 for real-mode wrapping;
 /// 80386 PRM §14.7 item 18 describes the unmasked address above 1 MiB.
 pub(crate) fn physical_span(cpu: &CpuState, address: u64, bytes: u8) -> (u64, u8) {
-    if cpu.legacy.a20_enabled != 0 {
+    physical_span_with_gate(cpu.legacy.a20_enabled != 0, address, bytes)
+}
+
+pub(crate) fn physical_span_with_gate(enabled: bool, address: u64, bytes: u8) -> (u64, u8) {
+    // SDM Vol 3A §3.4: wrap each linear part before applying the bus gate,
+    // and split transfers that cross the end of the 32-bit linear space.
+    let address = u64::from(address as u32);
+    let bytes = u64::from(bytes).min((1u64 << 32) - address) as u8;
+    if enabled {
         (address, bytes)
     } else {
         let remaining = (1 << 20) - (address & ((1 << 20) - 1));

@@ -381,6 +381,16 @@ impl IrBlock {
                     | crate::legacy::LegacyOp::Iret { .. }
                     | crate::legacy::LegacyOp::Loop { .. }
                     | crate::legacy::LegacyOp::String { .. }
+                    | crate::legacy::LegacyOp::Enter {
+                        size: _,
+                        alloc: _,
+                        level: _,
+                    }
+                    | crate::legacy::LegacyOp::Coprocessor {
+                        bytes: _,
+                        len: _,
+                        wait: _,
+                    }
                     | crate::legacy::LegacyOp::Leave { .. }
                     | crate::legacy::LegacyOp::CheckTaskReturn
                     | crate::legacy::LegacyOp::Refuse { .. } => {}

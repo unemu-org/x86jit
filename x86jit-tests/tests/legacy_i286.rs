@@ -463,19 +463,30 @@ fn i286_instruction_length_is_ten_bytes_in_both_regimes() {
 }
 
 #[test]
-fn available_coprocessor_forms_keep_the_explicit_unsupported_exit() {
+fn real_coprocessor_execution_and_deferred_system_forms() {
     // I286/287 PRM Part II Ch. 2, Processor Control Instructions, p. 2-16: FNINIT and FSETPM exist.
-    // Coprocessor execution on LegacySystem remains outside this activation.
+    // Real execution shares the Application FPU engine. Protected execution
+    // and FSETPM's coprocessor mode change remain deferred (decision-18 §4).
     for protected in [false, true] {
         for code in [b"\xdb\xe3", b"\xdb\xe4"] {
             let (vm, mut cpu) = setup(code, protected);
-            assert!(matches!(
-                cpu.run(&vm, Some(1)),
-                Exit::UnsupportedSystemContext {
-                    operation: UnsupportedSystemOperation::LegacyInstruction,
-                    ..
-                }
-            ));
+            let exit = cpu.run(&vm, Some(1));
+            if protected {
+                assert!(matches!(
+                    exit,
+                    Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::LegacyInstruction,
+                        ..
+                    }
+                ));
+            } else if code == b"\xdb\xe3" {
+                assert!(matches!(exit, Exit::BudgetExhausted));
+                assert_eq!(cpu.cpu.rip, 0x1002);
+                assert_eq!((cpu.cpu.fpu_cw, cpu.cpu.fpu_empty), (0x37f, 0xff));
+                continue;
+            } else {
+                assert!(matches!(exit, Exit::UnknownInstruction { .. }));
+            }
             assert_eq!(cpu.cpu.rip, 0x1000);
         }
     }

@@ -401,6 +401,179 @@ fn probe_encoded_with(
     }
 }
 
+/// Executable Real16 register/memory probes, derived from the coverage templater.
+/// Includes legacy operand shapes outside the long-mode coverage map.
+pub fn real16_forms() -> Vec<(Code, Vec<u8>)> {
+    use iced_x86::OpCodeOperandKind::*;
+    let mut forms = Vec::new();
+    for code in Code::values().filter(|c| *c != Code::INVALID && c.op_code().mode16()) {
+        for memory in [false, true] {
+            let mut insn = Instruction::default();
+            insn.set_code(code);
+            let mut valid = true;
+            for i in 0..code.op_code().op_count() {
+                let kind = code.op_code().op_kind(i);
+                if i > 0 && kind == imm8 && insn.op_kind(i - 1) == OpKind::Immediate16 {
+                    insn.set_op_kind(i, OpKind::Immediate8_2nd);
+                    insn.set_immediate8_2nd(2);
+                    continue;
+                }
+                if kind == mem_offs {
+                    insn.set_op_kind(i, OpKind::Memory);
+                    insn.set_memory_base(Register::None);
+                    insn.set_memory_displacement64(0x4040);
+                    insn.set_memory_displ_size(2);
+                    continue;
+                }
+                let has_memory = matches!(
+                    kind,
+                    r8_or_mem
+                        | r16_or_mem
+                        | r32_or_mem
+                        | r64_or_mem
+                        | mm_or_mem
+                        | xmm_or_mem
+                        | ymm_or_mem
+                        | mem
+                        | mem_offs
+                );
+                if template_operand(&mut insn, i, kind, CpuMode::Real16, memory && has_memory)
+                    .is_ok()
+                {
+                    continue;
+                }
+                match kind {
+                    imm16 => {
+                        insn.set_op_kind(i, OpKind::Immediate16);
+                        insn.set_immediate16(0x20);
+                    }
+                    imm32 | imm32sex64 => {
+                        insn.set_op_kind(i, OpKind::Immediate32);
+                        insn.set_immediate32(0x20);
+                    }
+                    seg_reg | es | cs | ss | ds | fs | gs => insn.set_op_register(
+                        i,
+                        match kind {
+                            es => Register::ES,
+                            cs => Register::CS,
+                            ss => Register::SS,
+                            fs => Register::FS,
+                            gs => Register::GS,
+                            _ => Register::DS,
+                        },
+                    ),
+                    br16_1 | br16_2 => {
+                        insn.set_op_kind(i, OpKind::NearBranch16);
+                        insn.set_near_branch16(0x1020);
+                    }
+                    br32_1 | br32_4 => {
+                        insn.set_op_kind(i, OpKind::NearBranch32);
+                        insn.set_near_branch32(0x1020);
+                    }
+                    farbr2_2 | farbr4_2 => {
+                        insn.set_op_kind(
+                            i,
+                            if kind == farbr2_2 {
+                                OpKind::FarBranch16
+                            } else {
+                                OpKind::FarBranch32
+                            },
+                        );
+                        insn.set_far_branch_selector(0);
+                        insn.set_far_branch32(0x1020);
+                    }
+                    seg_rSI => insn.set_op_kind(i, OpKind::MemorySegSI),
+                    es_rDI => insn.set_op_kind(i, OpKind::MemoryESDI),
+                    seg_rBX_al => {
+                        insn.set_op_kind(i, OpKind::Memory);
+                        insn.set_memory_base(Register::BX);
+                    }
+                    _ => valid = false,
+                }
+            }
+            if !valid {
+                continue;
+            }
+            add_real16_form(&mut forms, code, &insn);
+            let mut addr32 = insn;
+            let mut address_operand = false;
+            for i in 0..insn.op_count() {
+                match insn.op_kind(i) {
+                    OpKind::Memory => {
+                        if insn.memory_base() == Register::BX {
+                            addr32.set_memory_base(Register::EBX);
+                            address_operand = true;
+                        } else if insn.memory_base() == Register::None && kind_is_moffs(code) {
+                            addr32.set_memory_displ_size(4);
+                            address_operand = true;
+                        }
+                    }
+                    OpKind::MemorySegSI => {
+                        addr32.set_op_kind(i, OpKind::MemorySegESI);
+                        address_operand = true;
+                    }
+                    OpKind::MemoryESDI => {
+                        addr32.set_op_kind(i, OpKind::MemoryESEDI);
+                        address_operand = true;
+                    }
+                    _ => {}
+                }
+            }
+            if address_operand {
+                add_real16_form(&mut forms, code, &addr32);
+            }
+        }
+    }
+    forms
+}
+
+fn kind_is_moffs(code: Code) -> bool {
+    (0..code.op_code().op_count())
+        .any(|i| code.op_code().op_kind(i) == iced_x86::OpCodeOperandKind::mem_offs)
+}
+fn add_real16_form(forms: &mut Vec<(Code, Vec<u8>)>, code: Code, insn: &Instruction) {
+    let mut enc = Encoder::new(16);
+    if enc.encode(insn, SCRATCH_BASE).is_err() {
+        return;
+    }
+    let bytes = enc.take_buffer();
+    let probe = probe_encoded(code, &bytes, CpuMode::Real16);
+    // Absent-coprocessor inputs retain CPU operand checks even when
+    // the Present engine leaves the ESC form to the embedder (§17.9).
+    let esc = bytes
+        .iter()
+        .find(|b| {
+            !matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .is_some_and(|b| (0xd8..=0xdf).contains(b));
+    if !bytes.is_empty()
+        && (probe == Some(Probe::Lifted) || esc && probe == Some(Probe::Unsupported))
+        && !forms.iter().any(|(_, b)| *b == bytes)
+    {
+        forms.push((code, bytes.clone()));
+        if insn.op_kinds().any(|k| {
+            matches!(
+                k,
+                OpKind::MemorySegSI
+                    | OpKind::MemoryESDI
+                    | OpKind::MemorySegESI
+                    | OpKind::MemoryESEDI
+            )
+        }) {
+            for prefix in [0xf2, 0xf3] {
+                let mut prefixed = vec![prefix];
+                prefixed.extend(&bytes);
+                if probe_encoded(code, &prefixed, CpuMode::Real16) == Some(Probe::Lifted) {
+                    forms.push((code, prefixed));
+                }
+            }
+        }
+    }
+}
+
 /// Verify every block synthesized by the ISA probe, including partial lifts.
 /// Register and memory forms use the coverage probe's scope and selection rules.
 #[cfg(debug_assertions)]

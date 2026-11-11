@@ -5219,14 +5219,17 @@ pub(crate) fn stack_addr(
     add_addr(offset, base, ops, tg)
 }
 
-/// Emit a non-flag-setting 64-bit address addition.
+/// Emit a non-flag-setting address addition for the execution context.
 pub(crate) fn add_addr(a: Val, b: Val, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
+    // SDM Vol 3A §3.4: legacy linear addresses are 32 bits, including
+    // subsequent parts of a segmented memory operand.
+    let size = if ops.legacy_context().is_some() { 4 } else { 8 };
     let t = tg.fresh();
     ops.push(IrOp::Add {
         dst: t,
         a,
         b,
-        size: 8,
+        size,
         set_flags: FlagMask::NONE,
     });
     Val::Temp(t)
