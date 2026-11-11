@@ -1097,6 +1097,47 @@ fn alias_vm(backend: Box<dyn Backend>) -> Vm {
 }
 
 #[cfg(unix)]
+#[test]
+fn child_store_invalidates_an_alias_removed_before_dispatch() {
+    use x86jit_core::{child, ChildArena, ChildStep, CpuMode, CpuState};
+
+    for jit in [false, true] {
+        let backend: Box<dyn Backend> = if jit {
+            Box::new(JitBackend::new())
+        } else {
+            Box::new(InterpreterBackend)
+        };
+        let vm = alias_vm(backend);
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        vm.write_bytes(0x4000, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
+        let mut parent = vm.new_vcpu();
+        parent.cpu.rip = 0x4000;
+        assert!(matches!(parent.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(parent.cpu.gpr[0], 1);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = 0x18001;
+        cpu.gpr[3] = 2;
+        let mut arena = ChildArena::new(2);
+        assert!(matches!(
+            child::step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        assert!(vm.mem.has_dirty_code());
+        assert!(vm.mem.remove_code_alias(0x4000, 0x18000, 0x4000));
+        assert!(vm.mem.is_code_page(0x18));
+        parent.cpu.rip = 0x4000;
+        assert!(matches!(parent.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(parent.cpu.gpr[0], 2, "jit={jit}");
+        assert!(!vm.mem.has_dirty_code());
+    }
+}
+
+#[cfg(unix)]
 fn tempfile_shared_page() -> std::fs::File {
     use std::os::fd::FromRawFd;
     let mut name = std::env::temp_dir()

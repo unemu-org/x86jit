@@ -6,6 +6,9 @@ status: accepted
 
 # Allocation-free child step for shared-address-space children
 
+The frozen-tag SMC contract and prohibition on all shared engine atomics below
+are amended by [decision-19](decision-19%20-%20Live-child-stores-use-an-atomic-SMC-bridge.md).
+
 ## Context
 
 An embedder runs a guest that calls `rfork(RFPROC | RFMEM | ...)` (or `vfork`). The

@@ -761,7 +761,8 @@ impl Vm {
     /// Snapshot child execution metadata before a shared-address-space fork.
     /// Allocation and fetch-policy callbacks run here, in the parent. `mode`
     /// selects decoding; Real16 helpers are outside the initial child scope.
-    /// The view holds only owned metadata and a lifetime marker, keeping this
+    /// The view owns mapping/CPU metadata and borrows stable atomic code tags and
+    /// a store-notification bridge. Its lifetime keeps this
     /// VM's mapping alive and preventing safe unmap/remap until the view is dropped.
     /// See the crate docs for the FFI and parent invalidation protocol.
     pub fn child_view(&self, mode: CpuMode) -> crate::ChildView<'_> {
@@ -1329,8 +1330,8 @@ impl Vm {
     /// written bytes, retaining page tags while any cached unit remains. With a
     /// fetch policy, invalidate whole pages because fetch approvals are page-wide.
     ///
-    /// Interpreter stores, compiled stores, helpers and embedder writes all report
-    /// through `Memory::note_write`, which expands written byte ranges through declared aliases.
+    /// Ordinary stores report through `Memory::note_write`; child stores use the
+    /// atomic journal. Both expand writes through declared aliases when drained.
     /// Registration/publication also drain here: a queued notification has not yet
     /// advanced the source generation or canceled pending source spans.
     fn handle_smc(&self, word: &AtomicU64) {

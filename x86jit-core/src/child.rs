@@ -4,6 +4,8 @@
 
 use std::cell::{RefCell, UnsafeCell};
 use std::marker::PhantomData;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::fault::*;
 use crate::interp::ordering::{Barrier, Direction};
@@ -22,6 +24,130 @@ pub(crate) struct Region {
     pub _prot: crate::Prot,
 }
 
+pub(crate) const DISPATCH_CHILD_DIRTY: u64 = 1 << 3;
+
+/// Stable, append-only dispatch targets: a child cannot borrow the parent's
+/// mutable registry or upgrade/drop weak owners. Reclaimed with Memory.
+#[derive(Default)]
+pub(crate) struct ChildDispatch {
+    enabled: AtomicBool,
+    head: OnceLock<Arc<ChildDispatchNode>>,
+    nodes: Mutex<Vec<Arc<ChildDispatchNode>>>,
+    pub(crate) dirty: AtomicBool,
+}
+
+struct ChildDispatchNode {
+    word: Arc<AtomicU64>,
+    epoch: AtomicU64,
+    next: OnceLock<Arc<ChildDispatchNode>>,
+}
+
+impl ChildDispatch {
+    pub(crate) fn enable(&self) -> bool {
+        !self.enabled.swap(true, Ordering::Relaxed)
+    }
+
+    pub(crate) fn register(&self, word: &Arc<AtomicU64>) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut nodes = self.nodes.lock().unwrap();
+        let node = Arc::new(ChildDispatchNode {
+            word: word.clone(),
+            epoch: AtomicU64::new(0),
+            next: OnceLock::new(),
+        });
+        let link = nodes.last().map_or(&self.head, |tail| &tail.next);
+        assert!(link.set(node.clone()).is_ok());
+        nodes.push(node);
+        // Pair with notify's fence: after publishing this link, the caller
+        // reads dirty. Either that read sees the notification or notify's
+        // link read sees this node; both reads cannot miss publication.
+        fence(Ordering::SeqCst);
+    }
+
+    pub(crate) fn notify(&self) {
+        self.dirty.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
+        let mut next = self.head.get();
+        // OnceLock::get never blocks, including during parent registration.
+        while let Some(node) = next {
+            node.epoch.fetch_add(1, Ordering::Release);
+            node.word.fetch_or(DISPATCH_CHILD_DIRTY, Ordering::Release);
+            next = node.next.get();
+        }
+    }
+
+    pub(crate) fn epoch(&self, word: &AtomicU64) -> Option<&AtomicU64> {
+        let mut next = self.head.get();
+        while let Some(node) = next {
+            if std::ptr::eq(&*node.word, word) {
+                return Some(&node.epoch);
+            }
+            next = node.next.get();
+        }
+        // Publication drains also use temporary, unregistered words.
+        None
+    }
+}
+
+impl Drop for ChildDispatch {
+    fn drop(&mut self) {
+        // Unlink iteratively in the parent, independent of Vec's drop order.
+        // No child borrows remain; nodes have no owners outside this registry.
+        self.head.take();
+        let nodes = self.nodes.get_mut().unwrap_or_else(|e| e.into_inner());
+        for node in nodes {
+            Arc::get_mut(node).unwrap().next.take();
+        }
+    }
+}
+
+pub(crate) struct ChildWrites {
+    pages: Vec<(u64, Box<[AtomicU64]>)>,
+}
+
+impl ChildWrites {
+    pub(crate) fn new(regions: &[Region]) -> Self {
+        Self {
+            pages: regions
+                .iter()
+                .filter(|r| r.kind == RegionKind::Ram && r.end > r.start)
+                .map(|r| {
+                    let first = r.start >> CODE_PAGE_BITS;
+                    let count = ((r.end - 1) >> CODE_PAGE_BITS) - first + 1;
+                    let words = (0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+                    (first, words)
+                })
+                .collect(),
+        }
+    }
+
+    fn mark(&self, page: u64) {
+        for (first, words) in &self.pages {
+            if let Some(relative) = page.checked_sub(*first) {
+                if let Some(word) = words.get((relative >> 6) as usize) {
+                    word.fetch_or(1 << (relative & 63), Ordering::Release);
+                    return;
+                }
+            }
+        }
+        unreachable!("child write outside snapshotted RAM")
+    }
+
+    pub(crate) fn drain(&self, mut visit: impl FnMut(u64)) {
+        for (first, words) in &self.pages {
+            for (i, word) in words.iter().enumerate() {
+                let mut bits = word.swap(0, Ordering::Acquire);
+                while bits != 0 {
+                    visit(first + (i as u64 * 64) + u64::from(bits.trailing_zeros()));
+                    bits &= bits - 1;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct CodeSnapshot {
     pages: Vec<(u64, u64)>,
     pub(crate) consistency: crate::MemConsistency,
@@ -36,17 +162,27 @@ impl FromIterator<(u64, u64)> for CodeSnapshot {
     }
 }
 
-/// Owned metadata snapshot borrowing only the lifetime of its VM. The marker
+/// Metadata snapshot borrowing its VM's stable atomic store bridge. The marker
 /// prevents safe Rust from dropping the VM or unmapping/remapping its backing.
-/// No runtime reference into the VM, its memory metadata or its caches is kept.
+/// Stepping borrows only the live code-tag bitmap and atomic store-notification
+/// bridge from the VM; mapping, fetch policy and CPU metadata are owned snapshots.
 /// Guest bytes remain shared; mapping changes require external synchronization.
-/// Drop this owned snapshot in the parent, after the child has exited or exec'd.
+/// Drop it in the parent after child exit/exec and written-page reconciliation.
+/// Parent-side drop uses Memory to release deferred alias tags and history.
 pub struct ChildView<'vm> {
     pub(crate) base: usize,
     pub(crate) guest_base: u64,
     pub(crate) top: u64,
     pub(crate) regions: Vec<Region>,
     pub(crate) code: CodeSnapshot,
+    pub(crate) live_code: &'vm [AtomicU64],
+    pub(crate) parent: &'vm Memory,
+    pub(crate) writes: Arc<ChildWrites>,
+    pub(crate) dispatch: &'vm ChildDispatch,
+    #[cfg(test)]
+    pub(crate) before_tag_read: Option<&'vm (dyn Fn() + Sync)>,
+    #[cfg(test)]
+    pub(crate) before_journal: Option<&'vm (dyn Fn() + Sync)>,
     pub(crate) fetch: Option<Vec<(u64, FetchVerdict)>>,
     pub(crate) recover: bool,
     pub(crate) mode: CpuMode,
@@ -54,6 +190,12 @@ pub struct ChildView<'vm> {
     pub(crate) identity: Option<crate::CpuidTable>,
     pub(crate) x87_pointer_model: crate::X87PointerModel,
     pub(crate) lifetime: PhantomData<&'vm Vm>,
+}
+
+impl Drop for ChildView<'_> {
+    fn drop(&mut self) {
+        self.parent.release_child_view(&self.writes);
+    }
 }
 
 impl ChildView<'_> {
@@ -92,6 +234,33 @@ impl ChildView<'_> {
             .binary_search_by_key(&(relative >> 6), |&(word, _)| word)
             .ok()
             .is_some_and(|i| self.code.pages[i].1 & (1 << (relative & 63)) != 0)
+    }
+
+    fn note_write(&self, addr: u64, size: u8) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_journal {
+            hook();
+        }
+        let first = addr >> CODE_PAGE_BITS;
+        let last = (addr + u64::from(size) - 1) >> CODE_PAGE_BITS;
+        for page in first..=last {
+            self.writes.mark(page);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.before_tag_read {
+            hook();
+        }
+        // §10: store -> journal -> full fence -> live tag check. A shared-VM
+        // child can be a separate process, outside PRIVATE_EXPEDITED's scope.
+        fence(Ordering::SeqCst);
+        if (first..=last).any(|page| {
+            let relative = page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS);
+            self.live_code
+                .get((relative >> 6) as usize)
+                .is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (relative & 63)) != 0)
+        }) {
+            self.dispatch.notify();
+        }
     }
 }
 
@@ -490,7 +659,10 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         match unsafe {
             transfer::compare_exchange(ptr, expected, src, size, self.recovery.get(), self.atomics)
         } {
-            Ok(old) => Some(old),
+            Ok(old) => {
+                self.view.note_write(addr, size);
+                Some(old)
+            }
             Err(()) => {
                 self.state.borrow_mut().written.truncate(written_len);
                 self.fault(addr, size, FaultAccess::Write, true, true);
@@ -616,12 +788,16 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("commit"));
         // SAFETY: validated live backing; the recovery record is exclusive to this step.
         match unsafe { transfer::store(ptr, value, size, self.recovery.get()) } {
-            Ok(()) => self.state.borrow_mut().partial = true,
+            Ok(()) => {
+                self.view.note_write(addr, size);
+                self.state.borrow_mut().partial = true;
+            }
             Err(at) => {
                 self.state.borrow_mut().written.truncate(written_len);
                 // Cross-page transfers write bytewise; retain only their completed prefix.
                 if at > ptr {
                     self.reserve_write(addr, (at - ptr) as u8);
+                    self.view.note_write(addr, (at - ptr) as u8);
                     self.state.borrow_mut().partial = true;
                 }
                 self.fault(
@@ -1234,8 +1410,9 @@ fn refusal(op: &IrOp) -> Option<ChildRefusal> {
 }
 
 /// Execute exactly one instruction using only this view, CPU and arena.
-/// No allocation, lock, shared engine atomic, cache access, callback or parent-owned
+/// No allocation, lock, cache access, callback or parent-owned
 /// destructor runs here. Snapshot/arena creation and metadata conversion belong in the parent.
+/// Committed stores use the live code tags and atomic notification bridge (§10).
 /// Install a child handler calling [`classify`] before entering a view configured
 /// for host-fault recovery. Keep mappings live for the view's entire lifetime.
 pub fn step(view: &ChildView<'_>, cpu: &mut CpuState, arena: &mut ChildArena) -> ChildStep {

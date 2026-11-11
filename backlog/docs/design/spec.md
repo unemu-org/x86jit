@@ -1021,7 +1021,7 @@ IrOp::ReadReg { dst, reg } => {
 
 `FullTso` has no leading store fence. x86 hosts use plain loads/stores in every tier. A leaner STLR/LDAPR AcqRel mapping is a future optimization, not the current lowering.
 
-**Coverage:** JIT guest-memory helpers (string operations, masked stores, x87, FXSAVE and other memory helpers) receive tier barriers through `call_memory_helper`. On aarch64, `AcqRel` fences before write calls and after read calls; `FullTso` fences before read calls and after all memory calls; `Fast` adds none. Post-call barriers precede fault/exit handling, including partial progress. The interpreter honours `MemConsistency` for ordinary accesses and helpers with matching SeqCst fences on aarch64, including cold blocks, fallback execution, MMIO replay and the allocation-free child step; x86-64 execution adds no tier barriers. The child snapshots the VM's tier and selects its ORDER specialization once per step. Each actual transfer in its deferred scalar/vector store batch receives the tier's write guard, in addition to the walk's staging barriers. This conservatively fences both 8-byte halves of a 128-bit vector lane and preserves the normal interpreter's barriers between lanes; Fast and x86-64 remain fence-free. REP transfers commit directly under direction-specific helper barriers, bypassing the deferred batch. Host-fault classification resumes within the transfer routine and returns through the same Drop guards, retaining post-fences even when a fault leaves partial writes. These boundaries preserve ordering across helper calls (SDM Vol 3A §11.2.2, §11.2.4.1). The locked-op limitation below remains.
+**Coverage:** JIT guest-memory helpers (string operations, masked stores, x87, FXSAVE and other memory helpers) receive tier barriers through `call_memory_helper`. On aarch64, `AcqRel` fences before write calls and after read calls; `FullTso` fences before read calls and after all memory calls; `Fast` adds none. Post-call barriers precede fault/exit handling, including partial progress. The interpreter honours `MemConsistency` for ordinary accesses and helpers with matching SeqCst fences on aarch64, including cold blocks, fallback execution, MMIO replay and the allocation-free child step; x86-64 execution adds no tier barriers. The child snapshots the VM's tier and selects its ORDER specialization once per step. Each actual transfer in its deferred scalar/vector store batch receives the tier's write guard, in addition to the walk's staging barriers. This conservatively fences both 8-byte halves of a 128-bit vector lane and preserves the normal interpreter's barriers between lanes; Fast and x86-64 add no tier barriers; child code-tag fences remain independent (§10). REP transfers commit directly under direction-specific helper barriers, bypassing the deferred batch. Host-fault classification resumes within the transfer routine and returns through the same Drop guards, retaining post-fences even when a fault leaves partial writes. These boundaries preserve ordering across helper calls (SDM Vol 3A §11.2.2, §11.2.4.1). The locked-op limitation below remains.
 
 **Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, using a conservative full fence to enforce explicit ordering independently of the ordinary-access tier, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
 
@@ -1208,8 +1208,33 @@ a later process-barrier failure).
   Translation and interpretation remain available after a failed probe. Compiled
   masked, narrowing and REP helpers notify each committed element through the
   same fenced writer hook; x87/FXSAVE notify committed images and XSAVE uses
-  notifying `Memory` transfers. Child-view stores retain a frozen tag snapshot;
-  live-tag coverage for children remains separate work (xj-aau.5).
+  notifying `Memory` transfers.
+
+**Shared-address-space children (decision-19):** guest bytes remain shared with
+live parent vCPUs. The frozen code snapshot is only a preflight refusal set, not
+the SMC notification source. Every committed scalar/vector/REP/atomic transfer,
+including a partially completed host store, journals its written pages into a
+preallocated atomic bitmap, executes a SeqCst fence, then checks the live code
+tags. A hit sets the bridge's dirty flag and notifies every registered dispatch
+word. Children always use the full writer fence: a separate host process sharing
+the address space is outside a private process barrier's scope. Thus a missed
+tag leaves bytes visible for the lifter's fenced source re-read, and an observed
+tag queues normal invalidation before the child can publish a guest signal.
+
+The child only accesses stable atomic tags, journal words and append-only dispatch
+nodes. It neither allocates nor takes parent locks. Nodes cover existing and newly
+created vCPUs and retain their dispatch words until Memory drops. The parent
+drains the atomic journals under its ordinary SMC serialization, expands active
+and per-view retired alias declarations, and conservatively invalidates whole
+written pages. Removed declarations remain in parent-side journal history until
+the view is dropped and its journal pruned, covering deferred and racing writes.
+Notification fences between publishing the bridge-global dirty flag and reading
+dispatch links; registration fences between publishing its link and reading the
+flag. These paired SeqCst fences prevent both sides from missing publication.
+Per-vCPU child notice epochs bracket drain/acknowledgement, preserving racing
+notifications provided fewer than 2^64 notifications reach the node between
+samples; independent exit/exhaustion bits survive.
+The post-exit arena log remains required for watched data and final reconciliation.
 
 **macOS:** no sibling is suspended or enumerated. `mach_thread_self()` is checked
 against MACH_PORT_NULL/MACH_PORT_DEAD and its acquired right is released before
@@ -1409,7 +1434,7 @@ it. Far-apart views stretch the watermark across intervening data, increasing he
 traffic even when those data pages are not code. No alias lookup is added to ordinary
 stores outside tagged pages.
 
-**Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, masked/narrowing vector, x87 and fxsave helpers write through raw bounds-checked views of guest RAM. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report each committed transfer through notifying memory views. Child-view stores with frozen tag snapshots are outside this live-tag coverage (xj-aau.5).
+**Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, masked/narrowing vector, x87 and fxsave helpers write through raw bounds-checked views of guest RAM. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report each committed transfer through notifying memory views. Child-view stores use the atomic journal and live-tag protocol above.
 
 **Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds its deferral below to one block. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
 

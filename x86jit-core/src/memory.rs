@@ -749,15 +749,22 @@ impl WatchPages {
 
 pub(crate) const DISPATCH_DIRTY: u64 = 1;
 
+type AliasRegistrations = BTreeMap<u64, BTreeSet<(u64, u64, usize)>>;
+
 #[derive(Default)]
 struct CodeAliases {
     pairs: BTreeSet<(u64, u64, usize)>,
-    registrations: BTreeMap<u64, BTreeSet<(u64, u64, usize)>>,
+    registrations: AliasRegistrations,
     // Reference counts retain an edge shared by several sub-page declarations.
     pages: BTreeMap<u64, BTreeMap<u64, usize>>,
     translated: BTreeSet<u64>,
     lifting: BTreeMap<u64, usize>,
     fetching: BTreeSet<u64>,
+    live_children: usize,
+    // Removed relationships and their live tags survive every drain/clear until
+    // the last view drops: a child can pause before publishing its journal bit.
+    retired_aliases: AliasRegistrations,
+    retained_code: BTreeSet<u64>,
 }
 
 impl CodeAliases {
@@ -777,8 +784,17 @@ impl CodeAliases {
     }
 
     fn written_ranges(&self, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+        self.written_ranges_with_retired(lo, hi, &BTreeMap::new())
+    }
+
+    fn written_ranges_with_retired(
+        &self,
+        lo: u64,
+        hi: u64,
+        retired: &AliasRegistrations,
+    ) -> Vec<(u64, u64)> {
         let page = lo >> CODE_PAGE_BITS;
-        if !self.registrations.contains_key(&page) {
+        if !self.registrations.contains_key(&page) && !retired.contains_key(&page) {
             return vec![(lo, hi)];
         }
         let mut seen: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
@@ -818,7 +834,12 @@ impl CodeAliases {
                     merged.push((start, end));
                 }
                 *covered = merged;
-                if let Some(pairs) = self.registrations.get(&page) {
+                for pairs in self
+                    .registrations
+                    .get(&page)
+                    .into_iter()
+                    .chain(retired.get(&page))
+                {
                     for &(a, b, len) in pairs {
                         for (from, to) in [(a, b), (b, a)] {
                             for &(start, end) in &missing {
@@ -893,6 +914,8 @@ pub struct Memory {
     dirty: Mutex<Vec<(u64, u64)>>,
     dirty_flag: AtomicBool,
     dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
+    child_dispatch: crate::child::ChildDispatch,
+    child_writes: Mutex<Vec<Weak<crate::child::ChildWrites>>>,
     // Embedder-registered DATA-range dirty tracking — a parallel facility to the SMC
     // code-page mechanism above, independent of it (a watched page need not be code).
     // See `WatchPages`.
@@ -1046,7 +1069,7 @@ impl Memory {
     }
 
     pub(crate) fn child_view<'vm>(
-        &self,
+        &'vm self,
         vm: &'vm crate::Vm,
         mode: crate::CpuMode,
     ) -> crate::ChildView<'vm> {
@@ -1060,20 +1083,7 @@ impl Memory {
                 _prot: r.prot,
             })
             .collect();
-        // Only the widened code extent can contain set bits. Retain nonzero words
-        // as plain data instead of copying the full sparse address-space bitmap.
-        let range = self.code_range.load(Ordering::Acquire);
-        let lo = (range >> 32) << CODE_RANGE_BITS;
-        let hi = ((range >> 32) + (range & 0xffff_ffff)) << CODE_RANGE_BITS;
         let first_page = self.guest_base >> CODE_PAGE_BITS;
-        let first_word = ((lo >> CODE_PAGE_BITS).saturating_sub(first_page) >> 6) as usize;
-        let end_word = (((hi >> CODE_PAGE_BITS).saturating_sub(first_page) + 63) >> 6) as usize;
-        let code = (first_word..end_word.min(self.code_page.len()))
-            .filter_map(|i| {
-                let bits = self.code_page[i].load(Ordering::Acquire);
-                (bits != 0).then_some((i as u64, bits))
-            })
-            .collect();
         let fetch = self.fetch_policy.as_ref().map(|policy| {
             let mut pages = BTreeSet::new();
             for r in &regions {
@@ -1102,12 +1112,47 @@ impl Memory {
                 })
                 .collect()
         });
+        let writes = Arc::new(crate::child::ChildWrites::new(&regions));
+        {
+            let words = self.dispatch_words.lock().unwrap();
+            if self.child_dispatch.enable() {
+                for word in words.iter().filter_map(Weak::upgrade) {
+                    self.child_dispatch.register(&word);
+                }
+            }
+        }
+        let mut aliases = self.code_aliases.lock().unwrap();
+        // Only the widened code extent can contain set bits. Retain nonzero words
+        // as plain data instead of copying the full sparse address-space bitmap.
+        let range = self.code_range.load(Ordering::Acquire);
+        let lo = (range >> 32) << CODE_RANGE_BITS;
+        let hi = ((range >> 32) + (range & 0xffff_ffff)) << CODE_RANGE_BITS;
+        let first_word = ((lo >> CODE_PAGE_BITS).saturating_sub(first_page) >> 6) as usize;
+        let end_word = (((hi >> CODE_PAGE_BITS).saturating_sub(first_page) + 63) >> 6) as usize;
+        let code = (first_word..end_word.min(self.code_page.len()))
+            .filter_map(|i| {
+                let bits = self.code_page[i].load(Ordering::Acquire);
+                (bits != 0).then_some((i as u64, bits))
+            })
+            .collect();
+        let mut journals = self.child_writes.lock().unwrap();
+        journals.retain(|journal| journal.strong_count() != 0);
+        journals.push(Arc::downgrade(&writes));
+        aliases.live_children += 1;
         crate::ChildView {
             base: self.host_base() as usize,
             guest_base: self.guest_base,
             top: self.size(),
             regions,
             code,
+            live_code: &self.code_page,
+            parent: self,
+            writes,
+            dispatch: &self.child_dispatch,
+            #[cfg(test)]
+            before_tag_read: None,
+            #[cfg(test)]
+            before_journal: None,
             fetch,
             recover: self.recover_host_faults,
             mode,
@@ -1115,6 +1160,25 @@ impl Memory {
             identity: vm.cpuid_table().cloned(),
             x87_pointer_model: vm.x87_pointer_model(),
             lifetime: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn release_child_view(&self, writes: &Arc<crate::child::ChildWrites>) {
+        let mut aliases = self.code_aliases.lock().unwrap();
+        let mut journals = self.child_writes.lock().unwrap();
+        journals.retain(|journal| journal.as_ptr() != Arc::as_ptr(writes));
+        aliases.live_children -= 1;
+        if aliases.live_children == 0 {
+            let retained = std::mem::take(&mut aliases.retained_code);
+            let mut refreshed = BTreeSet::new();
+            for page in retained {
+                if !refreshed.contains(&page) {
+                    let component = aliases.connected(page);
+                    self.refresh_code_aliases(&aliases, &component);
+                    refreshed.extend(component);
+                }
+            }
+            aliases.retired_aliases.clear();
         }
     }
 
@@ -1221,6 +1285,8 @@ impl Memory {
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
             dispatch_words: Mutex::new(Vec::new()),
+            child_dispatch: crate::child::ChildDispatch::default(),
+            child_writes: Mutex::new(Vec::new()),
             watch,
             guest_base,
             last_region: AtomicUsize::new(0),
@@ -1364,6 +1430,9 @@ impl Memory {
 
     /// Remove an exact declaration, accepting either order of its views. Returns
     /// whether it existed. Other declarations and direct code tags remain active.
+    /// While any child view lives, retain the removed relationship and its live
+    /// tags for deferred writes. The last view's parent-side drop clears them;
+    /// child notifications and invalidation may be conservative until then.
     pub fn remove_code_alias(&self, a: u64, b: u64, len: usize) -> bool {
         let mut aliases = self.code_aliases.lock().unwrap();
         let pair = (a.min(b), a.max(b), len);
@@ -1373,6 +1442,30 @@ impl Memory {
         let mut affected = BTreeSet::new();
         CodeAliases::edges(a, b, len, |a, b| {
             affected.extend([a, b]);
+            if aliases.live_children != 0 {
+                for page in [a, b] {
+                    aliases
+                        .retired_aliases
+                        .entry(page)
+                        .or_default()
+                        .insert(pair);
+                }
+            }
+        });
+        if aliases.live_children != 0 {
+            let mut connected = BTreeSet::new();
+            for &page in &affected {
+                if !connected.contains(&page) {
+                    connected.extend(aliases.connected(page));
+                }
+            }
+            aliases.retained_code.extend(
+                connected
+                    .into_iter()
+                    .filter(|&page| self.is_code_page(page)),
+            );
+        }
+        CodeAliases::edges(a, b, len, |a, b| {
             for (from, to) in [(a, b), (b, a)] {
                 let neighbors = aliases.pages.get_mut(&from).unwrap();
                 let count = neighbors.get_mut(&to).unwrap();
@@ -1426,7 +1519,7 @@ impl Memory {
             if let Some(word) = self.code_page.get(w) {
                 if live {
                     transitioned |= word.fetch_or(m, Ordering::Release) & m == 0;
-                } else {
+                } else if !aliases.retained_code.contains(&page) {
                     word.fetch_and(!m, Ordering::Relaxed);
                 }
             }
@@ -1570,10 +1663,19 @@ impl Memory {
             let end_word = end_page.saturating_sub(base_page).div_ceil(64) as usize;
             // An empty watermark touches nothing. Otherwise only words in the code
             // extent are written, preserving lazy commit across a sparse guest span.
-            for word in &self.code_page
-                [first_word.min(self.code_page.len())..end_word.min(self.code_page.len())]
+            for (i, word) in self
+                .code_page
+                .iter()
+                .enumerate()
+                .take(end_word)
+                .skip(first_word)
             {
-                word.store(0, Ordering::Relaxed);
+                let first = base_page + (i as u64 * 64);
+                let retained = aliases
+                    .retained_code
+                    .range(first..first + 64)
+                    .fold(0, |mask, &page| mask | (1 << (page - first)));
+                word.fetch_and(retained, Ordering::Relaxed);
             }
             for &page in aliases.lifting.keys() {
                 self.refresh_code_page(&aliases, page);
@@ -1672,6 +1774,9 @@ impl Memory {
 
     pub(crate) fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {
         let mut words = self.dispatch_words.lock().unwrap();
+        self.child_dispatch.register(word);
+        // register's SeqCst fence precedes this pending read, paired with the
+        // child's dirty-store/fence/link-read handshake (decision-19).
         words.retain(|weak| weak.strong_count() != 0);
         if self.has_dirty_code() {
             word.fetch_or(DISPATCH_DIRTY, Ordering::Relaxed);
@@ -1681,10 +1786,10 @@ impl Memory {
 
     /// Whether any code page has been written since the last `take_dirty_code` — the
     /// cheap global SMC test. Compiled chain edges poll their per-vcpu notification
-    /// word, which folds this condition with exit requests. One relaxed load; false
+    /// word, which folds this condition with exit requests. Atomic polls; false
     /// for every guest that does not modify its own code.
     pub fn has_dirty_code(&self) -> bool {
-        self.dirty_flag.load(Ordering::Relaxed)
+        self.dirty_flag.load(Ordering::Relaxed) || self.child_dispatch.dirty.load(Ordering::Acquire)
     }
 
     /// Whether page `p` currently backs translated code — the precise test behind the
@@ -1787,9 +1892,9 @@ impl Memory {
     /// Drain the set of code pages written since the last call (§10). Empty and
     /// lock-free in the common case (nothing self-modified).
     pub fn take_dirty_code(&self) -> Vec<u64> {
-        // Common case (nothing self-modified): a shared `load`, not a `swap` — the
+        // Common case (nothing self-modified): shared loads, not a swap — the
         // latter takes the cache line exclusive on every dispatch even when clean.
-        if !self.dirty_flag.load(Ordering::Relaxed) {
+        if !self.has_dirty_code() {
             return Vec::new();
         }
         let _words = self.dispatch_words.lock().unwrap();
@@ -1803,23 +1908,54 @@ impl Memory {
     /// and other dispatchers. A running vcpu must retain its own notice until it
     /// reaches dispatch, even if another vcpu already drained the global list.
     pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(Vec<(u64, u64)>)) {
-        if word.load(Ordering::Relaxed) & DISPATCH_DIRTY == 0 && !self.has_dirty_code() {
+        let notices = DISPATCH_DIRTY | crate::child::DISPATCH_CHILD_DIRTY;
+        if word.load(Ordering::Acquire) & notices == 0 && !self.has_dirty_code() {
             return;
         }
         let _words = self.dispatch_words.lock().unwrap();
+        let child_epoch = self.child_dispatch.epoch(word);
+        let before = child_epoch.map(|epoch| epoch.load(Ordering::Acquire));
         invalidate(self.take_dirty_code_locked());
-        // The lock makes prior invalidation visible before acknowledging this
-        // notice and prevents a new write from losing its notification here.
-        word.fetch_and(!DISPATCH_DIRTY, Ordering::Relaxed);
+        // The lock makes prior invalidation visible before acknowledgement and
+        // serializes ordinary writers; child writers use the epoch check below.
+        word.fetch_and(!notices, Ordering::AcqRel);
+        // Children cannot take dispatch_words. If one notified while we drained,
+        // retain a notice even when its fetch_or preceded our acknowledgement.
+        // Assumes fewer than 2^64 notifications to this node between epoch
+        // samples: a single wrap differs, but a full modulus restores equality.
+        if child_epoch.map(|epoch| epoch.load(Ordering::Acquire)) != before {
+            word.fetch_or(crate::child::DISPATCH_CHILD_DIRTY, Ordering::Release);
+        }
     }
 
     // Caller holds dispatch_words through any invalidation and acknowledgement.
     fn take_dirty_code_locked(&self) -> Vec<(u64, u64)> {
         // Something's dirty: claim it. A racing vcpu may have drained it already.
-        if !self.dirty_flag.swap(false, Ordering::Relaxed) {
-            return Vec::new();
+        let mut ranges = if self.dirty_flag.swap(false, Ordering::Relaxed) {
+            std::mem::take(&mut *self.dirty.lock().unwrap())
+        } else {
+            Vec::new()
+        };
+        if self.child_dispatch.dirty.swap(false, Ordering::AcqRel) {
+            let aliases = self.code_aliases.lock().unwrap();
+            let mut journals = self.child_writes.lock().unwrap();
+            journals.retain(|journal| {
+                if let Some(writes) = journal.upgrade() {
+                    writes.drain(|page| {
+                        let lo = page << CODE_PAGE_BITS;
+                        ranges.extend(aliases.written_ranges_with_retired(
+                            lo,
+                            lo + CODE_PAGE_SIZE,
+                            &aliases.retired_aliases,
+                        ));
+                    });
+                    true
+                } else {
+                    false
+                }
+            });
         }
-        std::mem::take(&mut *self.dirty.lock().unwrap())
+        ranges
     }
 
     /// Highest mapped guest address (exclusive end of the top region) at or below
@@ -4437,6 +4573,359 @@ mod child_isolation_tests {
     use crate::{child, ChildArena, ChildStep, CpuMode, CpuState, Vm, VmConfig};
 
     #[test]
+    fn alias_removal_before_child_journal_publication() {
+        alias_removal_during_child_store(true);
+    }
+
+    #[test]
+    fn alias_removal_after_child_journal_before_tag_read() {
+        alias_removal_during_child_store(false);
+    }
+
+    fn alias_removal_during_child_store(before_journal: bool) {
+        for drain_in_hook in [false, true] {
+            let mut vm = Vm::new(VmConfig::flat(0x6000));
+            vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+            vm.write_bytes(0x4000, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+            let key = crate::cache::BlockKey::new(0x4000, CpuMode::Long64);
+            let other = crate::vm::EXIT_REQUESTED | crate::vm::CODE_SPACE_EXHAUSTED;
+            let a = Arc::new(AtomicU64::new(other));
+            let b = Arc::new(AtomicU64::new(other));
+            let invalidate = |ranges: Vec<(u64, u64)>| {
+                for (lo, hi) in ranges {
+                    vm.cache.invalidate_written(lo, hi, |empty| {
+                        if empty {
+                            vm.mem.clear_code_page(lo >> CODE_PAGE_BITS);
+                        }
+                    });
+                }
+            };
+            let remove = || {
+                assert_eq!(vm.mem.read(0x3000, 4), Ok(2), "guest store committed");
+                assert!(!vm.mem.has_dirty_code(), "child has not read its tag yet");
+                assert!(vm.mem.remove_code_alias(0x3000, 0x4000, 0x1000));
+                assert!(vm.mem.is_code_page(3), "removal retains the live tag");
+                assert!(!vm.mem.has_dirty_code(), "removal needs no forced drain");
+                assert!(!vm
+                    .mem
+                    .code_aliases
+                    .lock()
+                    .unwrap()
+                    .pairs
+                    .contains(&(0x3000, 0x4000, 0x1000)));
+                for word in [&a, &b] {
+                    assert_eq!(word.load(Ordering::Acquire), other);
+                }
+                if drain_in_hook {
+                    // An unrelated notice lets dispatch drain/acknowledge while
+                    // this child is paused, possibly with its journal still empty.
+                    vm.mem.child_dispatch.notify();
+                    vm.mem.dispatch_smc(&a, |ranges| {
+                        let expected = if before_journal {
+                            vec![(0x5000, 0x6000)]
+                        } else {
+                            vec![(0x3000, 0x4000), (0x4000, 0x5000), (0x5000, 0x6000)]
+                        };
+                        assert_eq!(ranges, expected);
+                        invalidate(ranges);
+                    });
+                    assert_eq!(a.load(Ordering::Acquire), other);
+                    assert!(!vm.mem.has_dirty_code());
+                    if before_journal {
+                        assert!(
+                            vm.cache.get(key).is_some(),
+                            "empty journal cannot evict the translation"
+                        );
+                    }
+                }
+            };
+            let mut view = vm.child_view(CpuMode::Long64);
+            let sibling_view = vm.child_view(CpuMode::Long64);
+            vm.mem.register_dispatch_word(&a);
+            vm.mem.register_dispatch_word(&b);
+            let mut cpu = CpuState {
+                rip: 0x1000,
+                ..CpuState::default()
+            };
+            cpu.gpr[0] = 0x5000;
+            cpu.gpr[3] = 1;
+            let mut arena = ChildArena::new(4);
+            assert!(matches!(
+                child::step(&sibling_view, &mut cpu, &mut arena),
+                ChildStep::Continue
+            ));
+            vm.mem.declare_code_alias(0x3000, 0x4000, 0x1000).unwrap();
+            let mut parent = vm.new_vcpu();
+            parent.cpu.rip = 0x4000;
+            assert!(matches!(parent.run(&vm, Some(100)), crate::Exit::Hlt));
+            assert!(
+                vm.cache.get(key).is_some(),
+                "formerly aliased translation is cached"
+            );
+            if before_journal {
+                view.before_journal = Some(&remove);
+            } else {
+                view.before_tag_read = Some(&remove);
+            }
+            cpu.rip = 0x1000;
+            cpu.gpr[0] = 0x3000;
+            cpu.gpr[3] = 2;
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Continue
+            ));
+            for word in [&a, &b] {
+                assert_eq!(
+                    word.load(Ordering::Acquire),
+                    other | child::DISPATCH_CHILD_DIRTY
+                );
+                assert_eq!(
+                    vm.mem
+                        .child_dispatch
+                        .epoch(word)
+                        .unwrap()
+                        .load(Ordering::Acquire),
+                    if drain_in_hook { 2 } else { 1 },
+                    "the resumed child always notifies"
+                );
+            }
+            vm.mem.dispatch_smc(&b, |ranges| {
+                let expected = if !drain_in_hook {
+                    vec![(0x3000, 0x4000), (0x4000, 0x5000), (0x5000, 0x6000)]
+                } else if before_journal {
+                    vec![(0x3000, 0x4000), (0x4000, 0x5000)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(ranges, expected);
+                invalidate(ranges);
+            });
+            assert!(
+                vm.cache.get(key).is_none(),
+                "no formerly aliased translation survives"
+            );
+            vm.mem.dispatch_smc(&a, |ranges| assert!(ranges.is_empty()));
+            assert!(!vm.mem.has_dirty_code());
+            assert_eq!(a.load(Ordering::Acquire), other);
+            assert_eq!(b.load(Ordering::Acquire), other);
+        }
+    }
+
+    #[test]
+    fn removed_alias_tags_and_history_survive_until_the_last_view_drops() {
+        let mut vm = Vm::new(VmConfig::flat(0x7000));
+        vm.map(0, 0x7000, Prot::RWX, RegionKind::Ram).unwrap();
+        let first = vm.child_view(CpuMode::Long64);
+        let second = vm.child_view(CpuMode::Long64);
+        vm.mem.declare_code_alias(0x3000, 0x4000, 0x1000).unwrap();
+        vm.mem.declare_code_alias(0x4000, 0x5000, 0x1000).unwrap();
+        vm.mem.mark_code(0x5000, 1);
+        assert!(vm.mem.remove_code_alias(0x3000, 0x4000, 0x1000));
+        // All tag-clear paths must honor the deferred clear, not just removal.
+        vm.mem.clear_code_page(5);
+        vm.mem.release_code_registration(4);
+        vm.mem.clear_all_code_pages();
+        for page in 3..=5 {
+            assert!(vm.mem.is_code_page(page));
+        }
+        drop(first);
+        let third = vm.child_view(CpuMode::Long64);
+        drop(second);
+        assert!(
+            vm.mem.is_code_page(3),
+            "a later view also holds the deferred clear"
+        );
+        assert!(!vm
+            .mem
+            .code_aliases
+            .lock()
+            .unwrap()
+            .retired_aliases
+            .is_empty());
+        vm.mem.mark_code(0x6000, 1);
+        drop(third);
+        for page in 3..=5 {
+            assert!(!vm.mem.is_code_page(page));
+        }
+        assert!(vm.mem.is_code_page(6), "unrelated active tag survives");
+        let aliases = vm.mem.code_aliases.lock().unwrap();
+        assert_eq!(aliases.live_children, 0);
+        assert!(aliases.retired_aliases.is_empty());
+        assert!(aliases.retained_code.is_empty());
+        assert!(vm.mem.child_writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn alias_removal_after_all_views_drop_clears_tags_immediately() {
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        let first = vm.child_view(CpuMode::Long64);
+        let second = vm.child_view(CpuMode::Long64);
+        vm.mem.declare_code_alias(0x3000, 0x4000, 0x1000).unwrap();
+        vm.mem.mark_code(0x4000, 1);
+        drop(first);
+        drop(second);
+        assert!(vm.mem.is_code_page(3));
+        assert!(vm.mem.remove_code_alias(0x3000, 0x4000, 0x1000));
+        assert!(!vm.mem.is_code_page(3));
+        assert!(vm.mem.is_code_page(4), "direct translation stays tagged");
+        assert!(!vm.mem.has_dirty_code());
+        assert!(vm
+            .mem
+            .code_aliases
+            .lock()
+            .unwrap()
+            .retired_aliases
+            .is_empty());
+    }
+
+    #[test]
+    fn child_notice_survives_a_store_during_parent_acknowledgement() {
+        child_notice_during_parent_acknowledgement(1);
+    }
+
+    #[test]
+    fn child_notice_survives_epoch_wrap_during_parent_acknowledgement() {
+        child_notice_during_parent_acknowledgement(u64::MAX);
+    }
+
+    fn child_notice_during_parent_acknowledgement(epoch: u64) {
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        let other = crate::vm::EXIT_REQUESTED | crate::vm::CODE_SPACE_EXHAUSTED;
+        let a = Arc::new(AtomicU64::new(other));
+        let b = Arc::new(AtomicU64::new(other));
+        vm.mem.register_dispatch_word(&a);
+        vm.mem.register_dispatch_word(&b);
+        vm.mem.mark_code(0x3000, 1);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = 0x3000;
+        cpu.gpr[3] = 1;
+        let mut arena = ChildArena::new(4);
+        assert!(matches!(
+            child::step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        let pending = other | crate::child::DISPATCH_CHILD_DIRTY;
+        assert_eq!(a.load(Ordering::Acquire), pending);
+        assert_eq!(b.load(Ordering::Acquire), pending);
+        let child_epoch = vm.mem.child_dispatch.epoch(&b).unwrap();
+        child_epoch.store(epoch, Ordering::Release);
+        vm.mem.dispatch_smc(&b, |ranges| {
+            assert_eq!(ranges, vec![(0x3000, 0x4000)]);
+            assert!(vm.mem.dispatch_words.try_lock().is_err());
+            cpu.rip = 0x1000;
+            cpu.gpr[3] = 2;
+            assert!(matches!(
+                child::step(&view, &mut cpu, &mut arena),
+                ChildStep::Continue
+            ));
+        });
+        assert_eq!(child_epoch.load(Ordering::Acquire), epoch.wrapping_add(1));
+        assert_eq!(b.load(Ordering::Acquire), pending, "racing notice retained");
+        vm.mem
+            .dispatch_smc(&a, |ranges| assert_eq!(ranges, vec![(0x3000, 0x4000)]));
+        assert_eq!(a.load(Ordering::Acquire), other);
+        vm.mem.dispatch_smc(&b, |ranges| assert!(ranges.is_empty()));
+        assert_eq!(b.load(Ordering::Acquire), other);
+    }
+
+    #[test]
+    fn child_store_notifies_a_concurrently_registered_dispatch_word() {
+        use std::sync::Barrier;
+
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        vm.mem.mark_code(0x3000, 1);
+        let start = Barrier::new(2);
+        let done = Barrier::new(2);
+        let other = crate::vm::EXIT_REQUESTED | crate::vm::CODE_SPACE_EXHAUSTED;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut cpu = CpuState::default();
+                cpu.gpr[0] = 0x3000;
+                let mut arena = ChildArena::new(2);
+                for value in 1..=128 {
+                    cpu.rip = 0x1000;
+                    cpu.gpr[3] = value;
+                    start.wait();
+                    assert!(matches!(
+                        child::step(&view, &mut cpu, &mut arena),
+                        ChildStep::Continue
+                    ));
+                    done.wait();
+                }
+            });
+            for _ in 0..128 {
+                let sibling = Arc::new(AtomicU64::new(other));
+                start.wait();
+                vm.mem.register_dispatch_word(&sibling);
+                done.wait();
+                assert_ne!(
+                    sibling.load(Ordering::Acquire)
+                        & (DISPATCH_DIRTY | crate::child::DISPATCH_CHILD_DIRTY),
+                    0,
+                    "registration or notification must set a notice"
+                );
+                vm.mem.dispatch_smc(&sibling, |ranges| {
+                    assert_eq!(ranges, vec![(0x3000, 0x4000)]);
+                });
+                assert_eq!(sibling.load(Ordering::Acquire), other);
+            }
+        });
+    }
+
+    #[test]
+    fn child_journal_preserves_removed_transitive_aliases() {
+        let mut vm = Vm::new(VmConfig::flat(0x6000));
+        vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        vm.mem.declare_code_alias(0x3000, 0x4000, 0x1000).unwrap();
+        vm.mem.declare_code_alias(0x4000, 0x5000, 0x1000).unwrap();
+        vm.mem.mark_code(0x5000, 1);
+        let word = Arc::new(AtomicU64::new(0));
+        vm.mem.register_dispatch_word(&word);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = 0x3000;
+        cpu.gpr[3] = 1;
+        let mut arena = ChildArena::new(2);
+        assert!(matches!(
+            child::step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        assert!(vm.mem.remove_code_alias(0x3000, 0x4000, 0x1000));
+        assert!(vm.mem.remove_code_alias(0x4000, 0x5000, 0x1000));
+        assert!(vm.mem.is_code_page(3));
+        vm.mem.dispatch_smc(&word, |ranges| {
+            assert_eq!(
+                ranges,
+                vec![(0x3000, 0x4000), (0x4000, 0x5000), (0x5000, 0x6000)]
+            );
+        });
+        assert!(!vm.mem.has_dirty_code());
+        assert_eq!(word.load(Ordering::Acquire), 0);
+        drop(view);
+        assert!(!vm.mem.is_code_page(3));
+        assert!(!vm.mem.is_code_page(4));
+        assert!(
+            vm.mem.is_code_page(5),
+            "direct translated owner survives last drop"
+        );
+    }
+
+    #[test]
     fn child_step_does_not_consult_poisoned_parent_engine() {
         let mut vm = Vm::new(VmConfig::flat(0x10000));
         vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
@@ -4458,7 +4947,7 @@ mod child_isolation_tests {
         assert!(vm.mem.dirty.is_poisoned() && vm.mem.dispatch_words.is_poisoned());
         assert!(vm.mem.watch.words.is_poisoned());
         assert!(vm.mem.fetch_policy.as_ref().unwrap().state.is_poisoned());
-        // Change live metadata after the snapshot; the child must use its copy.
+        // Late tags use the atomic bridge; unrelated parent metadata stays untouched.
         vm.mem.mark_code(0x3000, 1);
         vm.mem.last_region.store(usize::MAX, Ordering::Relaxed);
         vm.mem.watch.count.store(1, Ordering::Relaxed);
@@ -4482,6 +4971,7 @@ mod child_isolation_tests {
         });
         assert_eq!(vm.mem.last_region.load(Ordering::Relaxed), usize::MAX);
         assert!(!vm.mem.dirty_flag.load(Ordering::Relaxed));
+        assert!(vm.mem.child_dispatch.dirty.load(Ordering::Acquire));
         assert_eq!(vm.mem.watch.dirty[0].load(Ordering::Relaxed), 0);
         assert_eq!(&*arena.written_pages(), &[3]);
     }

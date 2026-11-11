@@ -47,20 +47,23 @@
 //! reuse the normal interpreter; gathers, x87/state-save, source callbacks, locked
 //! memory operations and other unsupported helpers return [`ChildStep::Refused`]. A
 //! refusal changes neither CPU nor guest bytes. Stores to snapshotted code pages
-//! are refused; other writes enter the bounded arena page log. REP faults retain
+//! are refused; other writes enter the bounded arena page log. Committed stores
+//! also journal dirty pages, execute a full fence and check live code tags. A hit
+//! notifies every parent vCPU before the child can signal a guest peer. REP faults retain
 //! completed iterations; host split stores can leave a partial memory effect.
 //!
-//! The child step path never consults parent memory metadata, caches, code maps,
-//! policies or shared engine atomics. It does not allocate or run parent-owned
-//! destructors.
+//! The child step path uses only the live atomic code tags and store-notification
+//! bridge from the parent. It never takes parent locks or consults mutable mapping
+//! metadata, caches, code maps or policies, and does not allocate or run parent-owned
+//! destructors. The bridge also covers vCPUs created after the view.
 //! Keep the inherited view, arena and CPU alive and exit/exec without dropping
 //! them in the child. After the child has exited or exec'd, call
 //! [`Vm::invalidate_written_pages`] in the parent before releasing the view and
 //! backing. This also reconciles watched data pages. Each arena belongs to one
 //! child and one VM; never submit its log to a different VM.
 //!
-//! [`ChildView<'vm>`] owns copied metadata with only a `PhantomData` lifetime
-//! borrow of the VM. Safe Rust therefore keeps the VM and its backing alive and
+//! [`ChildView<'vm>`] owns copied metadata and borrows the VM's stable atomic
+//! store bridge and code tags. Safe Rust therefore keeps the VM and its backing alive and
 //! prevents unmap/remap while the view survives. An embedder crossing an FFI
 //! boundary must preserve that contract externally: keep the VM alive and its
 //! span mapped with the same routing, without unmap/remap, until the child has

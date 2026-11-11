@@ -132,6 +132,131 @@ fn child_parent_invalidation_drops_later_translations_during_execution() {
     });
 }
 
+#[test]
+fn child_store_races_sibling_registration() {
+    use std::sync::Barrier;
+
+    for jit in [false, true] {
+        let backend: Box<dyn Backend> = if jit {
+            Box::new(JitBackend::new())
+        } else {
+            Box::new(InterpreterBackend)
+        };
+        let mut vm = Vm::with_backend(VmConfig::flat(0x5000), backend);
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        vm.write_bytes(0x3000, &[0xb8, 0, 0, 0, 0, 0xf4]).unwrap();
+        let view = vm.child_view(CpuMode::Long64);
+        let mut parent = vm.new_vcpu();
+        parent.cpu.rip = 0x3000;
+        assert!(matches!(parent.run(&vm, Some(100)), Exit::Hlt));
+        let start = Barrier::new(2);
+        let stored = Barrier::new(2);
+        let checked = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for value in 1..=32 {
+                    start.wait();
+                    let mut sibling = vm.new_vcpu();
+                    stored.wait();
+                    sibling.cpu.rip = 0x3000;
+                    assert!(matches!(sibling.run(&vm, Some(100)), Exit::Hlt));
+                    assert_eq!(sibling.cpu.gpr[0], value, "jit={jit}");
+                    checked.wait();
+                }
+            });
+            let mut cpu = core_tests::initial_cpu();
+            cpu.gpr[0] = 0x3001;
+            let mut arena = ChildArena::new(2);
+            for value in 1..=32 {
+                cpu.rip = 0x1000;
+                cpu.gpr[3] = value;
+                start.wait();
+                assert!(matches!(
+                    core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+                    ChildStep::Continue
+                ));
+                stored.wait();
+                checked.wait();
+            }
+        });
+    }
+}
+
+#[test]
+fn child_store_notifies_late_tagged_code_before_parent_reconciliation() {
+    use std::sync::mpsc;
+
+    for jit in [false, true] {
+        // Scalar, deferred vector, REP and locked stores all commit through the
+        // child protocol, including a transfer straddling two source pages.
+        for code in [
+            &[0x89, 0x18][..],
+            &[0x0f, 0x11, 0x00],
+            &[0xf3, 0xaa],
+            &[0xf0, 0x09, 0x18],
+        ] {
+            let backend: Box<dyn Backend> = if jit {
+                Box::new(JitBackend::new())
+            } else {
+                Box::new(InterpreterBackend)
+            };
+            let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
+            vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(0x3000, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, code).unwrap();
+            let entry = if code[0] == 0xf0 { 0x3ffb } else { 0x3ffe };
+            vm.write_bytes(entry, &[0xb8, 0, 0, 0, 0, 0xf4]).unwrap();
+            assert!(!vm.mem.is_code_page(3));
+            assert!(!vm.mem.is_code_page(4));
+            let mut parent = vm.new_vcpu();
+            let view = vm.child_view(CpuMode::Long64);
+            // Register a sibling after view creation and warm its cached path.
+            let mut sibling = vm.new_vcpu();
+            for cpu in [&mut parent, &mut sibling] {
+                cpu.cpu.rip = entry;
+                assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+                assert_eq!(cpu.cpu.gpr[0], 0);
+            }
+            assert!(vm.mem.is_code_page(3));
+            assert!(vm.mem.is_code_page(4));
+            let (patched, ready) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let vm = &vm;
+                scope.spawn(move || {
+                    ready
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    sibling.cpu.rip = entry;
+                    assert!(matches!(sibling.run(vm, Some(100)), Exit::Hlt));
+                    assert_eq!(sibling.cpu.gpr[0], 2, "jit={jit} code={code:x?}");
+                });
+                let mut cpu = core_tests::initial_cpu();
+                cpu.gpr[0] = entry + 1;
+                cpu.gpr[3] = 2;
+                cpu.gpr[7] = entry + 1;
+                cpu.gpr[1] = 1;
+                cpu.xmm[0] = 2 | (0xf4 << 32);
+                if code == [0xf3, 0xaa] {
+                    cpu.gpr[0] = 2;
+                }
+                let mut arena = ChildArena::new(4);
+                assert!(matches!(
+                    core_tests::no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+                    ChildStep::Continue
+                ));
+                patched.send(()).unwrap();
+                // This vCPU may drain first; the sibling must retain its notice.
+                parent.cpu.rip = entry;
+                assert!(matches!(parent.run(vm, Some(100)), Exit::Hlt));
+                assert_eq!(parent.cpu.gpr[0], 2, "jit={jit} code={code:x?}");
+                // No invalidate_written_pages: the child/view/arena remain live
+                // while both parent vCPUs must already observe the patch.
+            });
+        }
+    }
+}
+
 #[cfg(all(
     any(target_os = "linux", target_os = "macos"),
     any(target_arch = "aarch64", target_arch = "x86_64")
