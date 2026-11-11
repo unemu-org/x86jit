@@ -146,6 +146,14 @@ pub struct VcpuMemoryStats {
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct MemoryStats {
+    /// Source-publication ordering protocol, selected before any guest writers.
+    pub source_barrier_mode: crate::SourceBarrierMode,
+    /// Failed barrier/registration attempts for this memory, including the probe.
+    pub source_barrier_failures: u64,
+    /// Last host errno; None if no attempt failed. Retained after a successful retry.
+    pub source_barrier_last_errno: Option<i32>,
+    /// Blocks dispatched once without caching after a publication barrier failed.
+    pub source_barrier_uncached_executions: u64,
     /// Backend counters; the interpreter returns zero.
     pub backend: BackendMemoryStats,
     /// Current cache publications, distinct from retained backend allocations.

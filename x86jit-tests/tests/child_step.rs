@@ -894,3 +894,32 @@ fn child_locked_forms_match_both_backends() {
         }
     }
 }
+
+#[test]
+fn discarded_source_probe_does_not_refuse_child_data_store() {
+    let mut vm = Vm::new(VmConfig::flat(0x5000));
+    vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, &[0xc6, 0x07, 2, 0xf4]).unwrap();
+    vm.write_bytes(0x3000, &[0xf4]).unwrap();
+    let probe = x86jit_core::lift::lift_block(
+        &vm.mem,
+        x86jit_core::lift::FetchAddr::flat(0x3000),
+        CpuMode::Long64,
+    )
+    .unwrap();
+    drop(probe);
+    assert!(!vm.mem.is_code_page(3));
+    let mut normal = vm.new_vcpu();
+    normal.set_reg(x86jit_core::Reg::Rip, 0x1000);
+    normal.set_reg(x86jit_core::Reg::Rdi, 0x3000);
+    let mut cpu = normal.cpu.clone();
+    let view = vm.child_view(CpuMode::Long64);
+    let mut arena = ChildArena::new(16);
+    assert!(matches!(
+        child::step(&view, &mut cpu, &mut arena),
+        ChildStep::Continue
+    ));
+    let mut byte = [0];
+    vm.read_bytes(0x3000, &mut byte).unwrap();
+    assert_eq!(byte, [2]);
+}

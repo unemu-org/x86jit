@@ -252,7 +252,7 @@ fn smc_47bit_concurrent_marks_reach_compiled_store_gate() {
 }
 
 #[test]
-fn smc_47bit_store_outside_watermark_granule_skips_helper() {
+fn smc_47bit_store_outside_watermark_follows_source_protocol() {
     use x86jit_core::jit_abi::run_compiled;
     use x86jit_core::lift::{lift_block, CpuMode, FetchAddr};
     use x86jit_core::{CachedBlock, StepResult};
@@ -273,11 +273,17 @@ fn smc_47bit_store_outside_watermark_granule_skips_helper() {
     };
     vm.mem.mark_code(code, 1);
     let mut cpu = vm.new_vcpu();
-    for (addr, calls, dirty) in [
+    let degraded =
+        vm.memory_stats().source_barrier_mode == x86jit_core::SourceBarrierMode::Degraded;
+    for (index, (addr, calls, dirty)) in [
         (code - 0x10004, 0, false),
         (code + 0x1000, 1, false),
         (code, 2, true),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let calls = if degraded { index as u64 + 1 } else { calls };
         cpu.set_reg(Reg::Rdi, addr);
         cpu.set_reg(Reg::Rip, entry_addr);
         // SAFETY: the entry's owning backend, backing and context remain live.
@@ -1435,11 +1441,17 @@ fn declared_alias_concurrent_registration_reaches_next_compiled_store() {
                 StepResult::Exit(Exit::Hlt)
             ));
         }
-        assert_ne!(
-            before,
-            alias_watermark(&vm),
-            "registration must widen the gate"
-        );
+        let after = alias_watermark(&vm);
+        if vm.memory_stats().source_barrier_mode == x86jit_core::SourceBarrierMode::Process {
+            assert_ne!(before, after, "registration must widen the gate");
+        } else {
+            assert_eq!(
+                before,
+                1 << 31,
+                "degraded gate covers all RAM from construction"
+            );
+        }
+        assert!((0x18000u64 >> 16).wrapping_sub(after >> 32) < (after & 0xffff_ffff));
         cpu.set_reg(Reg::Rdi, 0x18000);
         // SAFETY: vm still owns the entry and backing; registration has completed.
         assert!(matches!(
@@ -1532,7 +1544,11 @@ fn alias_registration_widens_precompiled_store_gate(early: bool) {
         };
         vm.mem.mark_code(MAIN, 1);
         let before = alias_watermark(&vm);
-        assert!((0x18000u64 >> 16).wrapping_sub(before >> 32) >= (before & 0xffff_ffff));
+        assert_eq!(
+            (0x18000u64 >> 16).wrapping_sub(before >> 32) < (before & 0xffff_ffff),
+            vm.memory_stats().source_barrier_mode == x86jit_core::SourceBarrierMode::Degraded,
+            "only degraded mode starts with an always-open store gate"
+        );
         if early {
             vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
         }
@@ -1543,11 +1559,13 @@ fn alias_registration_widens_precompiled_store_gate(early: bool) {
             assert_eq!(before, alias_watermark(&vm));
             vm.mem.declare_code_alias(0x4000, 0x18000, 0x4000).unwrap();
         }
-        assert_ne!(
-            before,
-            alias_watermark(&vm),
-            "registration/marking must widen the gate"
-        );
+        let after = alias_watermark(&vm);
+        if vm.memory_stats().source_barrier_mode == x86jit_core::SourceBarrierMode::Process {
+            assert_ne!(before, after, "registration/marking must widen the gate");
+        } else {
+            assert_eq!(before, after, "degraded gate remains open");
+        }
+        assert!((0x18000u64 >> 16).wrapping_sub(after >> 32) < (after & 0xffff_ffff));
         cpu.set_reg(Reg::Rdi, 0x18001);
         cpu.set_reg(Reg::Rax, 2);
         // SAFETY: vm owns the compiled entry and its matching memory/context.
@@ -2107,3 +2125,38 @@ both_backends!(
     accumulated_code_writes_interp,
     accumulated_code_writes_jit
 );
+
+/// Race the generated store's watermark gate against first translation of each
+/// target page. The writer stays compiled; every target starts out untagged.
+#[test]
+fn compiled_writer_races_first_source_tag() {
+    const PAGES: u64 = 128;
+    let size = 0x10_0000;
+    let mut vm = Vm::with_backend(VmConfig::flat(size), Box::new(JitBackend::new()));
+    vm.map(0, size as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.write_bytes(MAIN, &[0xc6, 0x07, 2, 0xf4]).unwrap(); // mov byte [rdi],2; hlt
+    let mut writer = vm.new_vcpu();
+    writer.set_reg(Reg::Rdi, 0xf0000);
+    writer.set_reg(Reg::Rip, MAIN);
+    run_to_hlt(&vm, &mut writer);
+    let mut reader = vm.new_vcpu();
+    for page in 0..PAGES {
+        let target = 0x2_0000 + page * 0x1000;
+        vm.write_bytes(target, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+        assert!(!vm.mem.is_code_page(target >> 12));
+        writer.set_reg(Reg::Rdi, target + 1);
+        writer.set_reg(Reg::Rip, MAIN);
+        std::thread::scope(|scope| {
+            let write = scope.spawn(|| run_to_hlt(&vm, &mut writer));
+            reader.set_reg(Reg::Rip, target);
+            run_to_hlt(&vm, &mut reader);
+            write.join().unwrap();
+        });
+        // Whether the initial read won or lost the race, the completed write
+        // must prevent permanent reuse of a stale source snapshot.
+        reader.set_reg(Reg::Rip, target);
+        run_to_hlt(&vm, &mut reader);
+        assert_eq!(reader.reg(Reg::Rax), 2, "target page {page}");
+    }
+}

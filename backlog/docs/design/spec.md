@@ -1149,8 +1149,230 @@ no cached unit overlapped. Background requests use that check only until their s
 spans are registered under the same lock; subsequent invalidation cancels only requests
 whose source spans overlap the write. Unregistered requests also retain their claim
 generation, so cancellation during source reads needs no pending-map mutation.
-Uncached region successors are tagged at registration and retain write tracking while
-pending. Canceled requests keep their
+Every block lift tags its fetch pages before
+copying source bytes, including uncached region successors. These tags have counted
+**temporary lift owners**, held through registration/publication. Dropping a failed or
+speculative lift releases its tags, including rejected successors and unused lookahead;
+cached units, registered requests, fetch approvals and interpreter-only suppression
+retain their independent ownership. Retired request sources are reconciled under the
+spans lock; the normal publication path does not scan existing units.
+
+The untagged-to-tagged transition requires ordering on **both** sides:
+a writer's byte store can remain buffered while its post-store tag/watermark load
+observes the old clear value (SDM 325462-092US Vol 3A §11.2.3.4, Example 11-3).
+A lift batches all new tags, orders writers, and validates its copied bytes by
+re-reading them afterwards; a mismatch retries the lift. Tag and barrier epochs
+cover concurrent lifters too. Already synchronized tags need no new barrier.
+Dropping speculative tags allows the same page to transition again: repeated
+rejected successors or unused lookahead can therefore cost one barrier per lift.
+There is no negative cache: a rejection can depend on the entry/decode mode or
+mutable source bytes, and cannot safely suppress the next page's synchronization.
+
+`Memory` selects its source protocol during construction, before guest writes or
+vCPU execution. The mode remains fixed for that memory's lifetime, independently
+of the guest consistency tier. `Vm::memory_stats()` exposes `source_barrier_mode`,
+`source_barrier_failures` (failed attempts, including probing/registration),
+`source_barrier_last_errno` (retained even after a successful retry), and
+`source_barrier_uncached_executions` (blocks dispatched without publication after
+a later process-barrier failure).
+
+- **Process mode (Linux/FreeBSD):** probe private registration and an actual
+  `membarrier(PRIVATE_EXPEDITED)` before choosing this mode. Only registration
+  success is cached process-wide. ENOSYS/EINVAL/EPERM select degraded immediately;
+  other errors, including ENOMEM and an interposed EINTR, get at most three attempts
+  per probe operation. A later VM can retry registration after an earlier failure.
+  Interpreter/embedder stores use a compiler barrier before checking tags;
+  compiled stores retain their ordered IR store and live atomic watermark load.
+  A newly tagged source uses a process barrier plus local full fences.
+  [Linux membarrier(2), DESCRIPTION and RETURN VALUE](https://man7.org/linux/man-pages/man2/membarrier.2.html)
+  guarantees full ordering on running siblings; non-running threads already meet
+  the condition, and the result for fixed zero-flag commands is invariant after
+  a successful probe under unchanged calling conditions. A per-thread filter can
+  still reject a later invocation. Each publication barrier gets at most three
+  attempts; persistent failure leaves the synchronized tag epoch unchanged and
+  executes only the entry block once in the interpreter, without compiling or
+  caching it. The next execution re-lifts current bytes. Failed region lifts
+  cannot publish or enter the background queue. The VM keeps its original mode:
+  changing an active VM to degraded would leave earlier unfenced stores uncovered. [FreeBSD membarrier(2)](https://man.freebsd.org/cgi/man.cgi?query=membarrier&sektion=2)
+  provides the corresponding private expedited operation (14.1 and later).
+- **Degraded mode (probe failure, macOS, other hosts):** ordinary interpreter/embedder
+  memory stores reach a hardware SeqCst fence before its precise tag check.
+  The JIT receives a constant always-open watermark covering all valid RAM below
+  2^47, so every compiled store calls the same fenced notifier, even on untagged
+  data pages. The precise code extent stays separate for sparse metadata walks.
+  The lifter's local full fence and source re-read now have matching writer-side
+  fences. If the writer misses the tag, its preceding byte store is visible at
+  re-read; if it observes the tag, ordinary dirty-range/publication validation
+  handles the write. Cost: a hardware fence on every store and a Rust helper call
+  on every compiled inline store; store-heavy guests can be substantially slower.
+  Translation and interpretation remain available after a failed probe. Compiled
+  masked, narrowing and REP helpers notify each committed element through the
+  same fenced writer hook; x87/FXSAVE notify committed images and XSAVE uses
+  notifying `Memory` transfers. Child-view stores retain a frozen tag snapshot;
+  live-tag coverage for children remains separate work (xj-aau.5).
+
+**macOS:** no sibling is suspended or enumerated. `mach_thread_self()` is checked
+against MACH_PORT_NULL/MACH_PORT_DEAD and its acquired right is released before
+choosing degraded mode (EINVAL for failed self-identification, ENOTSUP otherwise).
+
+**Register-query investigation: Outcome B (ordering proof incomplete).** The
+following is READ evidence from Apple's **XNU `xnu-12377.1.9`**, not an assertion
+about every shipping kernel. The question is whether, for every sibling, successful
+query completion orders its preceding guest stores before the caller's source
+re-read, and orders the caller's preceding tag stores before the sibling's later
+tag loads. Both directions are required. A passing race witness or another
+runtime's use of the operation cannot establish that contract.
+
+- [libsyscall/wrappers/thread_register_state.c, thread_get_register_pointer_values](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/libsyscall/wrappers/thread_register_state.c#L32):
+  on arm64 the wrapper requests `ARM_THREAD_STATE64` with `thread_get_state`, then
+  extracts pointer-shaped register values. It adds no explicit memory barrier.
+  Zero output capacity still performs the query but returns
+  `KERN_INSUFFICIENT_BUFFER_SIZE`; that return must not be confused with a failed
+  kernel query in an experiment. The
+  [Mach interface, osfmk/mach/thread_act.defs](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/mach/thread_act.defs#L116)
+  allows stale state for an executing target, including the old-style
+  `thread_get_state` operation. That wording is not a memory-ordering promise;
+  it also does not prove that this implementation skips stopping a running target.
+- [osfmk/kern/thread_act.c, thread_get_state_internal](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/thread_act.c#L612):
+  a live remote target is held, its mutex is dropped, and
+  `thread_stop(thread, FALSE)` is called. Success reacquires the mutex, reads
+  machine state, and calls `thread_unstop`; both success and interruption call
+  `thread_release` before returning. The read path does not call `act_set_state`;
+  the setter shares hold/stop machinery but is a separate operation. An inactive
+  non-inspection target returns `KERN_TERMINATED`. The current-thread branch only
+  reads machine state and does not stop the caller.
+- [osfmk/kern/thread_act.c, thread_hold, thread_set_apc_ast_locked and thread_apc_ast](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/thread_act.c#L351):
+  the first hold sets `AST_APC`; an active remote processor receives an AST check.
+  The target's APC handler parks it while the hold count is positive.
+  [osfmk/kern/sched_prim.c, thread_stop](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/sched_prim.c#L1424)
+  sets `TH_SUSP`, requests another AST check while the target is on CPU, and waits
+  on `wake_active`. `FALSE` means it need not wait for the target to become
+  non-runnable. `thread_dispatch` updates the outgoing thread's state and wakes
+  waiters after the context switch.
+- [osfmk/arm64/machine_routines.c, cause_ast_check](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm64/machine_routines.c#L1745)
+  sends `SIGPast`.
+  [osfmk/arm/cpu_common.c, cpu_signal_internal and cpu_signal_handler_internal](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm/cpu_common.c#L409)
+  publishes the signal with release ordering and executes `DSB ISHST` on the
+  **sending** CPU before signaling. The receiving handler uses acquire operations
+  and invokes `ast_check`. This supplies a caller-to-target ordering edge when
+  that IPI path is taken. The sender's DSB does not drain the target's stores.
+
+**Apple silicon ordering:** exception entry/return and ISB synchronize execution
+context; they do not by themselves promise completion of preceding ordinary RAM
+stores. DMB orders accesses; DSB additionally requires completion within its
+specified domain. A software context switch must be examined for these operations,
+not treated as an additional architectural barrier by name. The selected
+[osfmk/arm64/cswitch.s, Switch_context and set_process_dependent_keys_and_sync_context](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm64/cswitch.s#L227)
+saves/restores registers and conditionally uses ISB; it does not contain an
+unconditional target-side DMB/DSB. Architectural distinctions: Arm
+[102336_0100_01_en, version 1.0 (2022), §§5–6, 10–11](https://documentation-service.arm.com/static/62a304f231ea212bb662321d).
+Visibility here means visibility to coherent CPU observers, not writeback to DRAM.
+
+**The missing step is universal scheduler-handshake coverage.** A target-side DSB
+is not the only possible proof: a release/acquire acknowledgement chain can also
+order stores. For the ordinary switch-out path, the candidate chain is guest store
+→ outgoing-thread scheduler-lock release on its old CPU → caller's acquisition of
+that lock → caller's source re-read. In the opposite direction the candidate is
+tag store → caller's lock/signal publication → target's acquire before returning
+to guest loads. The locks are real ordering operations:
+[osfmk/kern/thread.h, thread_lock and wake_lock](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/thread.h#L1180)
+map through
+[osfmk/arm/simple_lock.h](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm/simple_lock.h#L119)
+and [osfmk/arm/locks_arm.c](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/arm/locks_arm.c#L219)
+to hardware locks or, when configured, ticket locks.
+[osfmk/kern/locks.c, hw_lock atomic acquisition and hw_lock_unlock_internal](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/locks.c#L340)
+and [osfmk/kern/lock_ticket.c, hw_lck_ticket_reserve_orig and hw_lck_ticket_unlock_inner](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/lock_ticket.c#L422)
+use acquire and release ordering. It would be incorrect to dismiss these
+chains merely because there is no explicit DSB in `Switch_context`.
+
+What is **not established** is that every successful register query necessarily
+crosses those two chains, including the already-off-CPU, run-queue, handoff and
+migration branches. In particular,
+[osfmk/kern/sched_prim.c, thread_isoncpu](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/sched_prim.c#L1376)
+can return false without requesting a new target interrupt; its run-queue test has
+explicit TODOs concerning dequeue-before-context-switch and handoff cases.
+Proving the relevant old-core release was observed, and the future target acquire
+cannot bypass the caller's publication, is still necessary on these paths. The
+public register-state interface supplies no substitute guarantee. Thus the
+argument stops at that quantified step, rather than claiming that exception entry
+flushes a store buffer. This is an incomplete proof, not a measured counterexample
+or a claim that the scheduler's locking is broken. Applying the inspected source
+to an uninspected kernel version would be a further ASSUMED premise. macOS keeps
+paired fences until these premises are discharged.
+
+**Enumeration and lifecycle:**
+[osfmk/kern/task.c, task_threads_internal](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/task.c#L3954)
+takes a reference to each listed thread under the task lock. Port rights keep the
+objects identifiable but do not prevent exit. A query that loses an exit race can
+fail; failure is not a remote ordering acknowledgement. Treating a disappearing
+thread as covered would require tracing termination's final release as well.
+A thread omitted because it is inserted after the snapshot is different: the
+caller stores the tag and fences **before** taking and releasing the enumeration
+task lock. In
+[osfmk/kern/thread.c, thread_create_internal](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/thread.c#L1436),
+insertion into the task list takes that same lock before the thread is started.
+The release/acquire handoff propagates the tag to the creating CPU. Its
+`thread_create_running_internal2` calls `thread_start` before releasing the task
+lock; `thread_start` uses `clear_wait` to make the new thread eligible to run.
+The scheduler's
+[osfmk/kern/sched_prim.c, thread_invoke](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/kern/sched_prim.c#L2928)
+acquires the new thread's scheduling lock before switching to it. These lock
+handoffs explain publication to the new thread's first tag check, rather than
+relying on elapsed wall time. A thread inserted before the snapshot is
+enumerated even if it has not started. A blocked kernel thread need not receive a
+fresh IPI; its prior switch-out and eventual resume must satisfy the scheduler
+chains above. Neither enumeration nor creation resolves that outstanding proof.
+
+**Caller and signals:** retain full local fences before enumeration and after all
+queries; querying the caller itself supplies no remote barrier and can be skipped.
+In the inspected read path, the kernel removes its temporary stop and hold before
+returning to user space, including interruption cleanup. Therefore a normal signal
+handler on the caller cannot run in a user-space suspend/resume window introduced
+by this operation. This establishes the desired absence of that deadlock window,
+not general async-signal safety of enumeration, allocation or embedding code.
+The implemented degraded protocol holds no sibling at all. A future process-mode
+implementation must also resolve errors after construction: simply switching an
+active VM to degraded cannot retroactively fence its earlier compiled stores.
+
+**Timing evidence (MEASURED, not ordering evidence):** a separate macOS arm64
+experiment on Darwin 27.0.0, kernel `xnu-13432.1.9`, timed 101 passes after five
+warmups, one process at a time. Each pass fenced locally, enumerated threads,
+queried every sibling with capacity for 64 register pointers, released all rights
+and the list, and fenced locally. Counts include the caller, whose query was
+skipped. For 1/8/32 total threads, median pass times were 2.25/7.38/24.79 µs with
+condition-variable-blocked siblings and 2.38/129.50/302.67 µs with spinning
+siblings. Mean remote-query times were 0.585/0.576 µs (7/31 blocked siblings) and
+28.03/32.22 µs (7/31 spinning siblings); active-pass p95 was 646.17/4852.21 µs.
+This is the cost of the proposed operation sequence, not a supported normal-mode
+barrier or a guaranteed latency bound. The measured kernel's source was not
+available at that version tag; its equivalence to the inspected version is not
+assumed. No normal-mode performance claim follows from this experiment.
+
+A fresh seven-process-sample comparison of the unchanged automatic degraded mode
+against the previously built, instrumented `55b9a49` baseline gave median Real16
+cold-pass times of 3.357/3.593 ms and 8M compiled-store times of 37.043/10.071 ms
+(current/baseline). Scoped process instructions retired, read with
+`proc_pid_rusage(RUSAGE_INFO_V4)` including VM setup, were 66,249,053/65,938,207
+and 809,378,823/330,283,127 respectively. Each workload ran in its own process,
+serially, with alternating variant order. These short-run timings describe this
+measurement only; the compiled-store instruction increase remains about 145%.
+
+**Stopped, exited and newly created threads:** degraded mode needs no enumeration.
+A stopped writer cannot pass its next tag check without first passing its fence;
+a writer that already missed the tag has ordered its byte store before that check.
+An exited writer has no future check/store, and its completed checks have the same
+ordering. Threads created after a tag store start after its publication and pass
+their first store/check through the same fence. In process mode a hypothetical
+thread created after barrier enumeration starts after the tag store: kernel
+thread creation/start synchronization orders its first tag load after publication,
+so it either sees that tag (or a later ownership update) or its earlier source
+write was already covered by the barrier. Existing sleeping/exited threads are
+covered by the private expedited contract's non-running-thread guarantee. No
+assumption that a thread list remains fixed is needed.
+
+Registration and publication drain pending write notifications before checking source validity;
+registered successors retain write tracking while pending. Single-instruction
+step/replay lifts are transient and need no additional tags. Canceled requests keep their
 pending slot until the matching completion drains, preventing duplicate compilation.
 An opaque request identity prevents a stale completion from releasing a newer slot.
 
@@ -1187,7 +1409,7 @@ it. Far-apart views stretch the watermark across intervening data, increasing he
 traffic even when those data pages are not code. No alias lookup is added to ordinary
 stores outside tagged pages.
 
-**Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, x87 and fxsave helpers write through raw bounds-checked-only views of guest RAM for the same reason. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report explicitly after they run.
+**Who has to report the write.** The bullet above says "a write to such a page", and the trap is that a *write* is not one code path. The interpreter's stores go through `Memory::write*`, which calls `note_write`; but compiled code inlines stores as raw host writes, and the string, masked/narrowing vector, x87 and fxsave helpers write through raw bounds-checked views of guest RAM. Each of those has to report its own write or it silently invalidates nothing. That is not hypothetical — the JIT shipped for a long time reporting **none** of them, so a guest that patched another block and called it ran the stale translation, and the suite was green because every JIT-backed SMC test wrote from the *embedder* side instead of the guest's (task-329). The compiled store path reports through an inline range test against a code watermark; the helpers report each committed transfer through notifying memory views. Child-view stores with frozen tag snapshots are outside this live-tag coverage (xj-aau.5).
 
 **Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds its deferral below to one block. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
 

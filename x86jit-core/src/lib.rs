@@ -151,6 +151,13 @@ pub mod lockstep;
 pub mod memory;
 mod memory_stats;
 pub mod pclmul;
+mod process_barrier;
+pub use process_barrier::SourceBarrierMode;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use process_barrier::{
+    with_barrier_flush_failure, with_barrier_success, with_barrier_unavailable,
+};
 pub mod sha;
 pub mod state;
 #[doc(hidden)]

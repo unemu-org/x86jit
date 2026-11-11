@@ -46,6 +46,7 @@ that changes.
 | `state` | `Reg`, `CpuState` (`#[repr(C)]`, flat GPR file), `Flags` (§3) |
 | `memory_stats` | Public non-exhaustive allocation snapshots: VM/cache/backend categories and live vCPU gauges; page-rounding model for the pinned Cranelift allocator, process-wide retained fault metadata (§4.1, §9.1) |
 | `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap`; opt-in host-fault recovery, owned fetch snapshots (§4, §8.1) |
+| `process_barrier` | Fixed per-VM source ordering: Linux/FreeBSD private expedited membarrier; probe failure (including macOS) selects fenced stores and an always-open compiled-store notification gate. Later process-barrier failure runs one lifted block uncached after bounded retries (§10) |
 | `child` | Owned VM snapshot with a lifetime marker, preallocated per-child arena, const-specialized shared lift/interpreter, transactional refusals, written-page reconciliation and static host-fault fixups (decision-15) |
 | `usercopy` | x86-64/AArch64 naked transfer routines, bounded immutable relative fixup table, scalar load/store and CAS, copy and probe operations (§8.1, decision-13) |
 | `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen`; `MemoryAccess` occupies access-op padding and selects cold #SS/#GP exits on a miss; `CheckAlign` raises #GP for required alignment (§6) |
@@ -93,8 +94,10 @@ local bytes.
 A const-generic access view selects direct or routed interpreter transfers once
 per run. Protected mapped-RAM compiled faults return directly in either mode;
 compiled split stores can retain completed host transfers (xj-obx.8). Routed Rust
-masked/narrow stores preflight selected host pages; routed FX/x87/REP helper
-instances stay out of the default helper frames. See
+masked/narrow stores preflight selected host pages. Compiled masked/narrow,
+FX/x87 and REP helpers notify each committed element or image through the fenced
+writer hook. Child-view stores still use a frozen tag snapshot; live-tag source
+ordering for children is tracked separately (xj-aau.5). See
 [decision-13](../decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md).
 
 `Vm::time_stats()` sums cumulative per-vCPU diagnostics, retaining totals after a

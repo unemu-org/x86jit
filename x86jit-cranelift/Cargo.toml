@@ -30,6 +30,8 @@ libc = { workspace = true, optional = true }
 wasmtime-jit-icache-coherence = { package = "wasmtime-internal-jit-icache-coherence", version = "=48.0.8", optional = true }
 
 [dev-dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }
+x86jit-core = { path = "../x86jit-core", version = "0.3.0", default-features = false, features = ["test-hooks"] }
 # Cross-host machine-code witnesses; production builds retain the host ISA only.
 cranelift-codegen = { version = "=0.135.8", default-features = false, features = ["x86", "arm64"] }
 libc.workspace = true

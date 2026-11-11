@@ -14,6 +14,8 @@ categories = ["emulators", "virtualization", "development-tools"]
 default = ["environment"]
 # Legacy diagnostics (opt-in through API) and cold host-permission file queries.
 environment = []
+# Deterministic barrier injection for cross-crate witnesses and cost probes.
+test-hooks = []
 
 [dependencies]
 iced-x86.workspace = true

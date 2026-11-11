@@ -282,8 +282,6 @@ unsafe extern "C" fn string_helper(
     ][op as usize];
     let rep = [RepKind::None, RepKind::Rep, RepKind::Repe, RepKind::Repne][rep as usize];
 
-    // Raw bounds-only view: the JIT's inlined stores skip SMC/region handling
-    // (deferred, §10), so its string helper matches — no `Memory` in the ABI.
     let raw = x86jit_core::interp::RawStrMem {
         // SAFETY: mem_self retains the live Memory for this helper call.
         recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
@@ -292,18 +290,12 @@ unsafe extern "C" fn string_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    // rep movs/stos are the string ops that WRITE guest memory (to RDI); record the
-    // destination span so JIT'd string stores show up in `take_dirty_ranges` like
-    // interpreter ones. RDI (gpr[7]) bounds the written region; snapshot it around the
-    // run and mark [min,max)+elem — an over-approximation by at most one element, which
-    // is safe (conservative) for dirty tracking. Unconditional, not gated on the
-    // embedder watching anything: `note_write` also carries the SMC code-page check, and
-    // a `rep stos` over a translated page must invalidate it just as the interpreter's
-    // does. One call per string op, not per element, so this is noise against the op
-    // itself.
-    let track = matches!(op, StrOp::Movs | StrOp::Stos);
-    let rdi0 = cpu.gpr[7];
-    let ret = match x86jit_core::interp::raw_string_run_interruptible(
+    let raw = NotifyingStrMem {
+        raw,
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
+    };
+    match x86jit_core::interp::string_run_interruptible(
         cpu,
         &raw,
         op,
@@ -331,18 +323,7 @@ unsafe extern "C" fn string_helper(
             ctx.link_slot = f.addr;
             RET_UNMAPPED_DETAIL
         }
-    };
-    if track {
-        let rdi1 = cpu.gpr[7];
-        if rdi1 != rdi0 {
-            let lo = rdi0.min(rdi1);
-            let hi = rdi0.max(rdi1).saturating_add(elem);
-            // SAFETY: `mem_self` is the live `&Memory` for this run (set by for_memory).
-            let mem = &*(ctx.mem_self as *const x86jit_core::memory::Memory);
-            mem.note_write(lo, (hi - lo) as usize);
-        }
     }
-    ret
 }
 
 /// Paired CAS helper; guest-memory accesses are checked by `Memory` before asm.
@@ -394,6 +375,45 @@ unsafe extern "C" fn cas_pair_helper(
         // unsupported-operation exit without requesting a device transfer.
         Some(x86jit_core::Exit::UnknownInstruction { .. }) => RET_MMIO_DEFER,
         Some(_) => unreachable!("paired CAS only raises memory/alignment faults or rejects MMIO"),
+    }
+}
+
+struct NotifyingStrMem<'a> {
+    raw: x86jit_core::interp::RawStrMem,
+    memory: &'a x86jit_core::Memory,
+}
+
+impl x86jit_core::interp::StrMem for NotifyingStrMem<'_> {
+    fn preflight_store(
+        &self,
+        base: u64,
+        mask: u64,
+        elem: u8,
+        bytes: u16,
+    ) -> Result<(), (u64, x86jit_core::MemTrap)> {
+        self.raw.preflight_store(base, mask, elem, bytes)
+    }
+
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, x86jit_core::MemTrap> {
+        self.raw.sload(addr, elem)
+    }
+
+    fn sstore_preflighted(
+        &self,
+        addr: u64,
+        value: u64,
+        elem: u8,
+    ) -> Result<(), x86jit_core::MemTrap> {
+        self.raw.sstore_preflighted(addr, value, elem)?;
+        self.memory.note_write(addr, elem as usize);
+        Ok(())
+    }
+
+    fn sstore(&self, addr: u64, value: u64, elem: u8) -> Result<(), x86jit_core::MemTrap> {
+        self.raw.sstore(addr, value, elem)?;
+        // note_write fences before inspecting live source tags (§10).
+        self.memory.note_write(addr, elem as usize);
+        Ok(())
     }
 }
 
@@ -531,16 +551,14 @@ unsafe extern "C" fn fxstate_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    match raw.exec_fxstate_format(cpu, addr, restore & 1 != 0, restore & 2 != 0) {
-        None => {
-            // As in `x87_helper`: `fxsave` writes 512 bytes of guest memory through the
-            // raw view, so report it. `fxrstor` (restore != 0) only reads.
-            if restore & 1 == 0 {
-                let mem = &*(ctx.mem_self as *const x86jit_core::memory::Memory);
-                mem.note_write(addr, 512);
-            }
-            RET_CONTINUE
-        }
+    let raw = NotifyingFpMem {
+        raw,
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
+    };
+    match x86jit_core::x87::exec_fxstate_format(cpu, &raw, addr, restore & 1 != 0, restore & 2 != 0)
+    {
+        None => RET_CONTINUE,
         Some(x86jit_core::x87::FpStateFault::Memory { addr: fault, write }) => {
             ctx.record_helper_fault(fault, 512, write, addr, 512);
             ctx.record_fp_failure();
@@ -826,6 +844,11 @@ unsafe extern "C" fn vmaskmov_mem_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
+    let raw = NotifyingStrMem {
+        raw,
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
+    };
     let km = if k == 0 {
         u64::MAX
     } else {
@@ -983,6 +1006,11 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
+    let raw = NotifyingStrMem {
+        raw,
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
+    };
     let km =
         x86jit_core::interp::vec_msb_mask(&cpu.vec_lanes(mask as usize), elem as u8, bytes as u16);
     // §16 commit-last: validate all selected stores before the shared writer.
@@ -991,10 +1019,12 @@ unsafe extern "C" fn vec_maskmov_mem_helper(
         for i in 0..bytes / elem {
             if km & (1 << i) != 0 {
                 let ea = addr.wrapping_add(i * elem);
-                if ea < raw.guest_base || ea.checked_add(elem).is_none_or(|end| end > raw.size) {
+                if ea < raw.raw.guest_base
+                    || ea.checked_add(elem).is_none_or(|end| end > raw.raw.size)
+                {
                     cpu.rip = cur_addr;
-                    let at = if ea >= raw.guest_base && ea < raw.size {
-                        raw.size
+                    let at = if ea >= raw.raw.guest_base && ea < raw.raw.size {
+                        raw.raw.size
                     } else {
                         ea
                     };
@@ -1728,6 +1758,11 @@ unsafe extern "C" fn vpmov_narrow_mem_helper(
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
+    };
+    let raw = NotifyingStrMem {
+        raw,
+        // SAFETY: mem_self retains the live Memory for this helper call.
+        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
     };
     match x86jit_core::interp::narrow_store_run(
         cpu,
@@ -5381,6 +5416,7 @@ mod tests {
     // Pause inside a real compiled sub-block, after its watched scalar store.
     // Taking the hook makes later loop iterations run without another handshake.
     thread_local! {
+        static STORE_NOTICES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static SMC_PAUSE: std::cell::RefCell<Option<(
             std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>
         )>> = const { std::cell::RefCell::new(None) };
@@ -5390,6 +5426,7 @@ mod tests {
         // SAFETY: the generated store passes the same live Memory pointer and
         // checked range as the normal note_write helper.
         unsafe { note_write_helper(mem, addr, len, time_enabled) };
+        STORE_NOTICES.with(|count| count.set(count.get() + 1));
         SMC_PAUSE.with(|slot| {
             if let Some((entered, resume)) = slot.borrow_mut().take() {
                 let _ = entered.send(());
@@ -5481,6 +5518,102 @@ mod tests {
 
         fn invalidate_links(&self) {
             self.jit.invalidate_links();
+        }
+    }
+
+    fn compiled_helper_patches_cached_translation() {
+        use iced_x86::code_asm::*;
+        use x86jit_core::{Exit, Reg, Vm, VmConfig};
+        for kind in ["vmaskmovps", "kstore", "vpmovqd"] {
+            let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(JitBackend::new()));
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.set_guest_cpu_features(x86jit_core::GuestCpuFeatures::v4());
+            let mut asm = CodeAssembler::new(64).unwrap();
+            // SDM Vol 2C, VMASKMOV/VMOVDQU32/VPMOVQD, Operation:
+            // selected dwords commit their low 32 bits to the destination.
+            match kind {
+                "vmaskmovps" => asm.vmaskmovps(ymmword_ptr(rdi), ymm1, ymm0).unwrap(),
+                "kstore" => asm.vmovdqu32(ymmword_ptr(rdi).k1(), ymm0).unwrap(),
+                "vpmovqd" => asm.vpmovqd(qword_ptr(rdi), xmm0).unwrap(),
+                _ => unreachable!(),
+            }
+            asm.hlt().unwrap();
+            vm.write_bytes(ENTRY, &asm.assemble(ENTRY).unwrap())
+                .unwrap();
+            let target = 0x4000;
+            vm.write_bytes(target, &[0xb8, 1, 0, 0, 0, 0xf4]).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, target);
+            assert!(matches!(cpu.run(&vm, Some(16)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 1);
+            assert_eq!(vm.memory_stats().cache.compiled_entries, 1);
+            // Only the immediate dword is selected by the masks. Narrowing
+            // also rewrites the following dword, preserving the HLT byte.
+            cpu.set_xmm(0, 2 | (0xf4 << 64));
+            cpu.set_xmm(1, 1 << 31);
+            cpu.cpu.kmask[1] = 1;
+            cpu.set_reg(Reg::Rdi, target + 1);
+            cpu.set_reg(Reg::Rip, ENTRY);
+            assert!(matches!(cpu.run(&vm, Some(16)), Exit::Hlt));
+            assert!(vm.memory_stats().backend.compiled_units_total >= 2);
+            cpu.set_reg(Reg::Rip, target);
+            assert!(matches!(cpu.run(&vm, Some(16)), Exit::Hlt), "{kind}");
+            assert_eq!(cpu.reg(Reg::Rax), 2, "{kind}");
+        }
+    }
+
+    #[test]
+    fn compiled_masked_and_narrow_stores_notify_in_process_mode() {
+        // macOS has no host process barrier. Model successful commands for this
+        // single-threaded notifier witness; it makes no remote-ordering claim.
+        x86jit_core::with_barrier_success(compiled_helper_patches_cached_translation);
+    }
+
+    #[test]
+    fn compiled_masked_and_narrow_stores_notify_in_degraded_mode() {
+        x86jit_core::with_barrier_unavailable(compiled_helper_patches_cached_translation);
+    }
+
+    #[test]
+    fn unavailable_barrier_runs_jit_and_notifies_untagged_stores() {
+        use x86jit_core::{Exit, Reg, SourceBarrierMode, Vm, VmConfig};
+        for regions in [false, true] {
+            let mut vm = x86jit_core::with_barrier_unavailable(|| {
+                Vm::with_backend(
+                    VmConfig::flat(0x80000),
+                    Box::new(PausedStoreBackend {
+                        jit: JitBackend::new(),
+                        regions,
+                    }),
+                )
+            });
+            vm.map(0, 0x80000, Prot::RWX, RegionKind::Ram).unwrap();
+            // mov [0x40000],42; jmp next; next: mov eax,[0x40000]; hlt.
+            // The data is outside the code watermark and has never been watched.
+            vm.write_bytes(
+                ENTRY,
+                &[
+                    0xc7, 0x04, 0x25, 0, 0, 4, 0, 42, 0, 0, 0, 0xeb, 0, 0x8b, 0x04, 0x25, 0, 0, 4,
+                    0, 0xf4,
+                ],
+            )
+            .unwrap();
+            assert!(!vm.mem.is_code_page(0x40));
+            STORE_NOTICES.with(|count| count.set(0));
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, ENTRY);
+            assert!(matches!(cpu.run(&vm, Some(32)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 42);
+            assert!(
+                vm.memory_stats().cache.compiled_entries + vm.memory_stats().cache.region_entries
+                    > 0
+            );
+            STORE_NOTICES.with(|count| assert_eq!(count.get(), 1));
+            assert!(!vm.mem.is_code_page(0x40));
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_mode, SourceBarrierMode::Degraded);
+            assert_eq!(stats.source_barrier_failures, 1);
+            assert_eq!(stats.source_barrier_last_errno, Some(1));
         }
     }
 

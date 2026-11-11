@@ -1111,6 +1111,39 @@ impl TranslationCache {
         true
     }
 
+    /// Reconcile only retired request sources. Publication keeps its existing
+    /// indexed insertion path; speculative lift tags have separate counted owners.
+    pub(crate) fn release_source_tags(&self, mem: &crate::Memory, source: &[(u64, u32)]) {
+        let spans = self.spans.read().unwrap();
+        for &(start, len) in source {
+            for page in span_pages(start, len) {
+                if !spans.cached.pages.contains_key(&page)
+                    && !spans.pending_sources.pages.contains_key(&page)
+                {
+                    mem.release_code_registration(page);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn abandon_tier_up(&self, key: BlockKey, mem: &crate::Memory) {
+        let source = {
+            let mut spans = self.spans.write().unwrap();
+            spans.pending.remove(&key);
+            if spans.pending.is_empty() {
+                spans.pending = HashMap::new();
+                spans.pending_bytes = 0;
+            }
+            let source = spans.pending_sources.remove(&key);
+            self.coverage_bytes
+                .store(spans.coverage_bytes(), Ordering::Relaxed);
+            source
+        };
+        if let Some(source) = source {
+            self.release_source_tags(mem, &source);
+        }
+    }
+
     /// Release an unsubmitted request's slot, or explicitly abandon ownership.
     pub fn end_tier_up(&self, key: BlockKey) {
         let mut spans = self.spans.write().unwrap();
@@ -1395,7 +1428,14 @@ impl TranslationCache {
                 // advances the generation before releasing the read lock, so the
                 // publisher rejects source bytes read before the store. Concurrent
                 // victim-free writers may share this lock; fetch_add preserves all
-                // generation advances. Page-tag clears also remain under the lock.
+                // generation advances. Temporary lift tags precede source reads and
+                // survive this clear even though they have no coverage bits yet.
+                // Registration/publication drains queued tagged-store notifications
+                // before checking the pre-read generation under the exclusive lock;
+                // a miss drained by another vCPU still bumps that generation here.
+                // Thus an unregistered lift cannot publish its pre-store snapshot.
+                // After registration, coverage overlap cancels the request instead.
+                // Page-tag clears also remain under the lock.
                 on_write(!on_page && !pending_on_page);
                 self.publication_generation.fetch_add(1, Ordering::Release);
                 if CHILD || self.invalidate_pending_fetches {
@@ -1826,6 +1866,56 @@ mod tests {
         assert!(!c.publish_tier_up(k(0x1000), compiled(), None, id, |_| {}));
         c.invalidate_overlapping(0x1000, 0x1004, || {});
         assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+    }
+
+    #[test]
+    fn abandoning_request_releases_index_and_tags_but_preserves_lift_owner() {
+        let mem = crate::Memory::new(crate::MemoryModel::Flat { size: 0x6000 });
+        let cache = TranslationCache::new();
+        let lift = crate::memory::LiftSource::new(&mem);
+        lift.watch(0x3000, 4);
+        assert!(cache.try_begin_tier_up(k(0x1000)));
+        cache
+            .prepare_tier_up(
+                k(0x1000),
+                vec![(0x3000, 4)],
+                cache.publication_generation(),
+                |_| mem.mark_code(0x3000, 4),
+            )
+            .unwrap();
+        cache.abandon_tier_up(k(0x1000), &mem);
+        assert_eq!(cache.tier_pending_len(), 0);
+        assert_eq!(cache.memory_stats().coverage_index_bytes, 0);
+        assert!(mem.is_code_page(3));
+        drop(lift);
+        assert!(!mem.is_code_page(3));
+    }
+
+    #[test]
+    fn retiring_request_tags_preserves_other_owners() {
+        let mem = crate::Memory::new(crate::MemoryModel::Flat { size: 0x6000 });
+        let cache = TranslationCache::new();
+        let source = vec![(0x3000, 4), (0x4000, 4)];
+        for key in [k(0x1000), k(0x2000)] {
+            assert!(cache.try_begin_tier_up(key));
+            cache
+                .prepare_tier_up(key, source.clone(), cache.publication_generation(), |sp| {
+                    for &(start, len) in sp {
+                        mem.mark_code(start, len);
+                    }
+                })
+                .unwrap();
+        }
+        cache.end_tier_up(k(0x1000));
+        cache.release_source_tags(&mem, &source);
+        assert!(mem.is_code_page(3)); // the other registered request
+        cache.insert(k(0x4000), compiled(), vec![(0x4000, 4)], |_| {
+            mem.mark_code(0x4000, 4)
+        });
+        cache.end_tier_up(k(0x2000));
+        cache.release_source_tags(&mem, &source);
+        assert!(!mem.is_code_page(3));
+        assert!(mem.is_code_page(4)); // a cached owner on the same page
     }
 
     #[test]

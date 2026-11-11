@@ -38,8 +38,9 @@ pub(crate) fn fninit(cpu: &mut CpuState) {
 /// * The interpreter passes `&Memory` — reads/writes go through a mapped-RAM region
 ///   check and, on a write, the SMC `note_write` (§10), so a self-modifying x87
 ///   store onto a code page invalidates just like `IrOp::Store`.
-/// * The JIT passes [`RawFpMem`] — a bounds-only raw view matching its inlined
-///   stores; JIT-side SMC is the deferred "mark host code dead" step (§10, §9.1).
+/// * Compiled x87/FXSAVE helpers wrap [`RawFpMem`]'s bounds-only accesses with
+///   notification through the live `Memory`, fencing committed transfers before
+///   checking source tags (§10).
 ///
 /// A `Trap` (MMIO) region faults as unmapped here: an x87 store's value (up to a
 /// 10-byte f80 / 512-byte fxsave) can't fit `Exit::MmioWrite`, so x87→MMIO is

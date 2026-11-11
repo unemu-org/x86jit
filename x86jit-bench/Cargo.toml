@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Per-commit native vs interpreter vs JIT benchmark harness for x86jit."
 publish = false
 
+[features]
+test-hooks = ["x86jit-core/test-hooks"]
+
 [dependencies]
 x86jit-core.workspace = true
 x86jit-cranelift.workspace = true

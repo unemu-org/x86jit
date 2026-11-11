@@ -8224,10 +8224,9 @@ const R11: usize = 11;
 ///   check + SMC `note_write` as `IrOp::Store`, so `rep stos` onto a code page is
 ///   caught (§10), a `Trap` region yields MMIO, and an unmapped-but-in-bounds
 ///   address traps instead of silently scribbling the backing buffer.
-/// * The JIT passes [`RawStrMem`] — a bounds-only raw view matching its inlined
-///   stores, whose SMC/region handling is the deliberately deferred JIT-side step
-///   (§10, §9.1). This keeps the two callers behavior-compatible without pulling
-///   the (unavailable) `Memory` into the compiled ABI.
+/// * Compiled store helpers wrap [`RawStrMem`]'s bounds-only accesses with
+///   notification through the live `Memory`, fencing each committed transfer
+///   before checking source tags (§10).
 pub trait StrMem {
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap>;
     fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap>;
@@ -8396,7 +8395,7 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> StrMem
     }
 }
 
-/// Bounds-only raw guest view for the JIT string helper (deferred JIT-side SMC).
+/// Bounds-only raw guest view; compiled store helpers wrap it with SMC notification.
 /// It reports bounds and opted-in host faults; without region info it never reports MMIO.
 ///
 /// `base` is the host address of guest `guest_base`; `size` is the exclusive top guest
@@ -9285,8 +9284,8 @@ pub fn masked_store_run<M: StrMem>(
 /// Unmasked narrowing store `vpmov{q,d,w}{d,w,b} [mem], src`: truncate each of
 /// the `src_width/from` source lanes to `to` bytes and store them contiguously at `base`.
 /// Default mode stops at the first faulting element; recovery mode first preflights
-/// selected host pages. Generic over [`StrMem`] so interp (`Memory`) and the JIT helper (`RawStrMem`)
-/// share it → jit == interp.
+/// selected host pages. Generic over [`StrMem`] so the interpreter and compiled
+/// helper share it; the compiled helper wraps raw accesses with SMC notification.
 #[allow(clippy::too_many_arguments)]
 pub fn narrow_store_run<M: StrMem>(
     cpu: &mut CpuState,

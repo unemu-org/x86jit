@@ -18,7 +18,7 @@ use crate::jit_abi::{
 mod legacy;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
-    lift_block_with_fault, lift_region, lift_region_with_fault, CpuMode, FetchAddr, LiftError,
+    lift_block_watched, lift_region, lift_region_watched, CpuMode, FetchAddr, LiftError,
 };
 use crate::memory::{HostRam, MapError, MemError, Memory, MemoryModel, Prot, RegionKind};
 use crate::state::{CpuState, Flags, Reg};
@@ -632,6 +632,8 @@ pub struct Vm {
     vcpu_memory: Mutex<Vec<std::sync::Weak<VcpuAllocations>>>,
     precise_split_stores: bool,
     compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
+    #[cfg(test)]
+    source_read_hook: Mutex<Option<fn(&Vm)>>,
     lockstep_trace: Option<Arc<crate::lockstep::Trace>>,
     // Fields drop in declaration order, after Drop has joined backend workers.
     pub backend: Box<dyn Backend>,
@@ -735,7 +737,17 @@ impl Vm {
         });
         let (guest_ram_reserved, guest_ram_committed, memory_tracking_bytes) =
             self.mem.allocation_stats();
+        let (source_barrier_mode, source_barrier_failures, source_barrier_last_errno) =
+            self.mem.source_barrier.stats();
         crate::MemoryStats {
+            source_barrier_mode,
+            source_barrier_failures,
+            source_barrier_last_errno,
+            source_barrier_uncached_executions: self
+                .mem
+                .source_barrier
+                .uncached_executions
+                .load(Ordering::Relaxed),
             backend: self.backend.memory_stats(),
             cache: self.cache.memory_stats(),
             vcpus,
@@ -912,6 +924,14 @@ impl Vm {
         }
     }
 
+    #[cfg(test)]
+    fn after_source_read(&self) {
+        let hook = self.source_read_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
     /// Test support only; not for production. Synchronously compile and cache a
     /// region at `entry`, even for a single block or a non-loop, without warmup.
     /// The next dispatch to this entry with the given MXCSR control mode uses it.
@@ -943,7 +963,8 @@ impl Vm {
         let generation = self.cache.publication_generation();
         let permit = self.mem.fetch_permit();
         let mut failure = None;
-        let region = lift_region_with_fault(&self.mem, entry, caps, self.mode, &mut failure)
+        let source = crate::memory::LiftSource::new(&self.mem);
+        let region = lift_region_watched(&self.mem, entry, caps, self.mode, &mut failure, &source)
             .map_err(|e| {
                 ForceRegionError::Lift(lift_exit(
                     e,
@@ -953,6 +974,9 @@ impl Vm {
                     self.mode,
                 ))
             })?;
+        if !source.publishable() {
+            return Err(ForceRegionError::Invalidated);
+        }
         let key = BlockKey::with_mxcsr(entry, self.mode, mxcsr);
         let compiled = self.backend.materialize_region_with_split_stores(
             &region,
@@ -965,6 +989,7 @@ impl Vm {
         if !matches!(compiled, CachedBlock::Compiled { .. }) {
             return Err(ForceRegionError::NotCompiled);
         }
+        self.handle_smc(&AtomicU64::new(0));
         if !self
             .cache
             .insert_checked(key, compiled, region.spans(), |spans| {
@@ -1134,6 +1159,8 @@ impl Vm {
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: self.precise_split_stores,
             compile_hold: None,
+            #[cfg(test)]
+            source_read_hook: Mutex::new(None),
             mem: self.mem.deep_copy()?,
             cache: {
                 let mut cache = TranslationCache::new();
@@ -1169,6 +1196,8 @@ impl Vm {
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: false,
             compile_hold: None,
+            #[cfg(test)]
+            source_read_hook: Mutex::new(None),
             mem,
             cache: TranslationCache::new(),
             backend,
@@ -1302,6 +1331,8 @@ impl Vm {
     ///
     /// Interpreter stores, compiled stores, helpers and embedder writes all report
     /// through `Memory::note_write`, which expands written byte ranges through declared aliases.
+    /// Registration/publication also drain here: a queued notification has not yet
+    /// advanced the source generation or canceled pending source spans.
     fn handle_smc(&self, word: &AtomicU64) {
         self.mem.dispatch_smc(word, |dirty| {
             let mut invalidated = false;
@@ -3467,11 +3498,13 @@ impl Vcpu {
 fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
     let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
     for fin in vm.backend.tier_up_finished() {
+        vm.handle_smc(exit_word);
         vm.cache.record_tier_bg_completed();
         // A Vm runs in a single mode (§17 scope fence), so the finished compile's
         // block key is its echoed pc under the Vm's mode (§17.4).
         let key = BlockKey::with_mxcsr(fin.pc, vm.mode, fin.mxcsr_mode);
         let multi_span = fin.spans.len() > 1;
+        let source_spans = fin.spans;
         let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
         let published =
             vm.cache
@@ -3480,6 +3513,9 @@ fn drain_tier_up(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
                         vm.mem.mark_code(*start, *len);
                     }
                 });
+        if !published {
+            vm.cache.release_source_tags(&vm.mem, &source_spans);
+        }
         if published {
             // A multi-span unit is a superblock region — count it like the
             // eager region path does, so `cache.regions()` reflects background regions.
@@ -3577,6 +3613,7 @@ fn resolve_attempt<const DEFAULT: bool>(
     // blocks never collide across segments; the IR's `guest_start` stays the decode IP
     // (`at.ip`) so fall-through / branch targets remain 16-bit IPs (§17.6). Outside
     // Real16 `at.pa == at.ip == pc`, so this is byte-identical to the old `pc` keying.
+    let source = crate::memory::LiftSource::new(&vm.mem);
     let pc = at.pa;
     let key = if DEFAULT {
         BlockKey::new(pc, mode)
@@ -3602,13 +3639,14 @@ fn resolve_attempt<const DEFAULT: bool>(
             let _time_lift = vm
                 .time_enabled
                 .then(crate::time_stats::FetchPhaseTimer::lift);
-            lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
+            lift_block_watched(&vm.mem, at, mode, &mut fetch_failure, &source)
         };
         return lifted
             .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
             .and_then(|ir| {
                 finish_single(
                     vm,
+                    &source,
                     exit_word,
                     sections,
                     key,
@@ -3718,7 +3756,7 @@ fn resolve_attempt<const DEFAULT: bool>(
                     let _time_lift = vm
                         .time_enabled
                         .then(crate::time_stats::FetchPhaseTimer::lift);
-                    lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
+                    lift_region_watched(&vm.mem, pc, caps, mode, &mut fetch_failure, &source)
                 };
                 match lifted {
                     Ok(region) if region.blocks.len() > 1 && region.has_loop => {
@@ -3740,6 +3778,13 @@ fn resolve_attempt<const DEFAULT: bool>(
                     vec![(ir.guest_start, ir.guest_len)],
                 )
             };
+            if !source.publishable() {
+                vm.cache.end_tier_up(key);
+                return Ok(block);
+            }
+            #[cfg(test)]
+            vm.after_source_read();
+            vm.handle_smc(exit_word);
             if permit.as_ref().is_some_and(|p| !p.is_current()) {
                 vm.cache.end_tier_up(key);
                 continue;
@@ -3784,12 +3829,14 @@ fn resolve_attempt<const DEFAULT: bool>(
                 // Queue full: don't compile inline (that reintroduces the spike);
                 // drop the marker so hotness re-submits on a later dispatch.
                 TierUpSubmit::Busy => {
-                    vm.cache.end_tier_up(key);
+                    vm.cache.abandon_tier_up(key, &vm.mem);
                     return Ok(block);
                 }
                 // No worker (interpreter, or the JIT with bg off): fall through to
                 // today's inline tier-up.
-                TierUpSubmit::Unsupported => vm.cache.end_tier_up(key),
+                TierUpSubmit::Unsupported => {
+                    vm.cache.abandon_tier_up(key, &vm.mem);
+                }
             }
         }
         if permit.as_ref().is_some_and(|p| !p.is_current()) {
@@ -3808,6 +3855,7 @@ fn resolve_attempt<const DEFAULT: bool>(
             )
         };
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
+        vm.handle_smc(exit_word);
         if vm.cache.upgrade(
             key,
             compiled.clone(),
@@ -3832,6 +3880,7 @@ fn resolve_uncached<const DEFAULT: bool>(
     mxcsr: u32,
     compile_generation: u64,
 ) -> Result<CachedBlock, ResolveFailure> {
+    let source = crate::memory::LiftSource::new(&vm.mem);
     let pc = at.pa;
     let key = if DEFAULT {
         BlockKey::new(pc, mode)
@@ -3853,7 +3902,7 @@ fn resolve_uncached<const DEFAULT: bool>(
             let _time_lift = vm
                 .time_enabled
                 .then(crate::time_stats::FetchPhaseTimer::lift);
-            lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
+            lift_region_watched(&vm.mem, pc, caps, mode, &mut fetch_failure, &source)
         };
         match lifted {
             // NOTE: the region path is JIT-only (a region-forming backend); Real16 stays
@@ -3861,7 +3910,15 @@ fn resolve_uncached<const DEFAULT: bool>(
             // Only a multi-block region *with a loop* is worth its heavier compile
             // (it amortizes over the iterations); everything else stays single-block.
             Ok(region) if region.blocks.len() > 1 && region.has_loop => {
+                if !source.publishable() {
+                    if permit.as_ref().is_some_and(|p| !p.is_current()) {
+                        return Err(ResolveFailure::Retry);
+                    }
+                    return Ok(source.uncached(region.blocks.into_iter().next().unwrap()));
+                }
                 let spans = region.spans();
+                #[cfg(test)]
+                vm.after_source_read();
                 if permit.as_ref().is_some_and(|p| !p.is_current()) {
                     return Err(ResolveFailure::Retry);
                 }
@@ -3880,6 +3937,7 @@ fn resolve_uncached<const DEFAULT: bool>(
                 };
                 let _section =
                     EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
+                vm.handle_smc(exit_word);
                 // §10: tag every sub-block's pages — under the spans lock (#12).
                 if !vm
                     .cache
@@ -3905,6 +3963,7 @@ fn resolve_uncached<const DEFAULT: bool>(
             Ok(region) => {
                 return finish_single(
                     vm,
+                    &source,
                     exit_word,
                     sections,
                     key,
@@ -3932,11 +3991,12 @@ fn resolve_uncached<const DEFAULT: bool>(
         let _time_lift = vm
             .time_enabled
             .then(crate::time_stats::FetchPhaseTimer::lift);
-        lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
+        lift_block_watched(&vm.mem, at, mode, &mut fetch_failure, &source)
     };
     match lifted {
         Ok(ir) => finish_single(
             vm,
+            &source,
             exit_word,
             sections,
             key,
@@ -3963,6 +4023,7 @@ fn resolve_uncached<const DEFAULT: bool>(
 #[allow(clippy::too_many_arguments)]
 fn finish_single(
     vm: &Vm,
+    source: &crate::memory::LiftSource<'_>,
     exit_word: &AtomicU64,
     sections: &AtomicU64,
     key: BlockKey,
@@ -3975,8 +4036,13 @@ fn finish_single(
         ir.legacy_context.is_none(),
         "legacy IR cannot enter application materialization"
     );
+    #[cfg(test)]
+    vm.after_source_read();
     if permit.is_some_and(|p| !p.is_current()) {
         return None;
+    }
+    if !source.publishable() {
+        return Some(source.uncached(ir));
     }
     let (start, len) = (span_start, ir.guest_len);
     // Real16 stays interpreted (§17.6); other modes defer compilation only until
@@ -3996,6 +4062,7 @@ fn finish_single(
         )
     };
     let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
+    vm.handle_smc(exit_word);
     // §10: tag the block's pages under the spans lock, so the tag can't be cleared
     // by a concurrent SMC invalidation between insert and mark.
     vm.cache
@@ -4183,6 +4250,506 @@ mod tests {
     }
 
     use super::*;
+
+    const SOURCE_ENTRY: u64 = 0x1000;
+    const SOURCE_SUCCESSOR: u64 = 0x3000;
+
+    // A deterministic compiler for the fixture's result. Executing a stale
+    // publication returns 1, while a fresh publication returns 2.
+    unsafe extern "C" fn source_one(cpu: *mut u8, _: *mut u8) -> u64 {
+        // SAFETY: the dispatcher supplies a live CpuState per the compiled ABI.
+        unsafe { (*(cpu as *mut CpuState)).gpr[0] = 1 };
+        RET_HLT
+    }
+
+    unsafe extern "C" fn source_two(cpu: *mut u8, _: *mut u8) -> u64 {
+        // SAFETY: the dispatcher supplies a live CpuState per the compiled ABI.
+        unsafe { (*(cpu as *mut CpuState)).gpr[0] = 2 };
+        RET_HLT
+    }
+
+    struct SourceBackend {
+        regions: bool,
+        values: Arc<Mutex<Vec<u64>>>,
+        ready: Mutex<Vec<TierUpFinished>>,
+    }
+
+    impl SourceBackend {
+        fn compile<'a>(&self, blocks: impl Iterator<Item = &'a IrBlock>) -> CachedBlock {
+            let value = blocks
+                .flat_map(|b| &b.ops)
+                .find_map(|op| match op {
+                    crate::IrOp::WriteReg {
+                        reg: Reg::Rax,
+                        src: crate::Val::Imm(v),
+                        ..
+                    } => Some(*v),
+                    _ => None,
+                })
+                .expect("fixture writes a constant result");
+            self.values.lock().unwrap().push(value);
+            CachedBlock::Compiled {
+                entry: CompiledPtr(match value {
+                    1 => source_one as *const u8,
+                    2 => source_two as *const u8,
+                    _ => panic!("unexpected fixture result"),
+                }),
+            }
+        }
+    }
+
+    impl Backend for SourceBackend {
+        fn region_caps(&self) -> Option<RegionCaps> {
+            self.regions.then_some(RegionCaps {
+                max_blocks: 8,
+                max_icount: 128,
+            })
+        }
+
+        fn materialize(
+            &self,
+            ir: &IrBlock,
+            _: MemConsistency,
+            _: Option<(u64, u64)>,
+            _: u64,
+        ) -> CachedBlock {
+            self.compile(std::iter::once(ir))
+        }
+
+        fn materialize_region(
+            &self,
+            region: &IrRegion,
+            _: MemConsistency,
+            _: Option<(u64, u64)>,
+            _: u64,
+        ) -> CachedBlock {
+            self.compile(region.blocks.iter())
+        }
+
+        fn tier_up_async(&self, req: TierUpRequest) -> TierUpSubmit {
+            let block = match &req.unit {
+                TierUpUnit::Block(ir) => self.compile(std::iter::once(ir.as_ref())),
+                TierUpUnit::Region(region) => {
+                    assert!(region
+                        .blocks
+                        .iter()
+                        .any(|b| b.guest_start == SOURCE_SUCCESSOR));
+                    self.compile(region.blocks.iter())
+                }
+            };
+            self.ready.lock().unwrap().push(TierUpFinished {
+                pc: req.pc,
+                mxcsr_mode: req.mxcsr_mode,
+                block,
+                compile_failure: None,
+                spans: req.spans,
+                epoch: req.epoch,
+            });
+            TierUpSubmit::Queued
+        }
+
+        fn tier_up_finished(&self) -> Vec<TierUpFinished> {
+            std::mem::take(&mut *self.ready.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn persistent_barrier_failure_runs_uncached_and_refetches() {
+        for regions in [false, true] {
+            let values = Arc::new(Mutex::new(Vec::new()));
+            // Model a successful construction probe on every host, followed by
+            // a thread-local EPERM (e.g. a filter installed on the lifting thread).
+            let mut vm = crate::with_barrier_success(|| {
+                Vm::with_backend(
+                    VmConfig::flat(0x5000),
+                    Box::new(SourceBackend {
+                        regions,
+                        values: values.clone(),
+                        ready: Mutex::new(Vec::new()),
+                    }),
+                )
+            });
+            vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+            let mut cpu = vm.new_vcpu();
+            let before = vm.memory_stats().source_barrier_failures;
+            crate::with_barrier_flush_failure(|| {
+                for value in 1..=3 {
+                    vm.write_bytes(SOURCE_ENTRY, &[0xb8, value, 0, 0, 0, 0xf4])
+                        .unwrap();
+                    cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+                    assert!(matches!(cpu.run(&vm, Some(16)), Exit::Hlt));
+                    assert_eq!(cpu.reg(Reg::Rax), u64::from(value));
+                    let stats = vm.memory_stats();
+                    assert_eq!(stats.source_barrier_mode, crate::SourceBarrierMode::Process);
+                    assert_eq!(stats.source_barrier_failures - before, u64::from(value) * 3);
+                    assert_eq!(stats.source_barrier_last_errno, Some(1));
+                    assert_eq!(stats.source_barrier_uncached_executions, u64::from(value));
+                    assert_eq!(stats.cache.interpreted_entries, 0);
+                    assert_eq!(stats.cache.compiled_entries, 0);
+                    assert_eq!(stats.cache.region_entries, 0);
+                    assert!(!vm.mem.is_code_page(1));
+                }
+            });
+            assert!(values.lock().unwrap().is_empty(), "fallback never compiles");
+        }
+    }
+
+    #[test]
+    fn failed_region_barrier_neither_compiles_nor_submits_successors() {
+        for background in [false, true] {
+            let values = Arc::new(Mutex::new(Vec::new()));
+            let mut vm = crate::with_barrier_success(|| {
+                Vm::with_backend(
+                    VmConfig::flat(0x5000),
+                    Box::new(SourceBackend {
+                        regions: true,
+                        values: values.clone(),
+                        ready: Mutex::new(Vec::new()),
+                    }),
+                )
+            });
+            vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(SOURCE_ENTRY, &[0xe9, 0xfb, 0x1f, 0, 0])
+                .unwrap();
+            vm.write_bytes(
+                SOURCE_SUCCESSOR,
+                &[
+                    0xb8, 2, 0, 0, 0, 0xff, 0xc9, 0x0f, 0x85, 0xf3, 0xdf, 0xff, 0xff, 0xf4,
+                ],
+            )
+            .unwrap();
+            if background {
+                vm.set_tier_up_after(Some(1));
+                vm.set_tier_up_background(true);
+                crate::with_barrier_success(|| {
+                    let ir = crate::lift::lift_block(
+                        &vm.mem,
+                        FetchAddr::flat(SOURCE_ENTRY),
+                        CpuMode::Long64,
+                    )
+                    .unwrap();
+                    let span = (SOURCE_ENTRY, ir.guest_len);
+                    vm.cache.insert(
+                        BlockKey::new(SOURCE_ENTRY, CpuMode::Long64),
+                        CachedBlock::Interpreted(Arc::new(ir)),
+                        vec![span],
+                        |_| vm.mem.mark_code(span.0, span.1),
+                    );
+                });
+            }
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+            cpu.set_reg(Reg::Rcx, 2);
+            crate::with_barrier_flush_failure(|| {
+                assert!(matches!(cpu.run(&vm, Some(32)), Exit::Hlt));
+            });
+            assert_eq!(cpu.reg(Reg::Rax), 2);
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_mode, crate::SourceBarrierMode::Process);
+            assert!(stats.source_barrier_uncached_executions > 0);
+            assert_eq!(stats.cache.interpreted_entries, u64::from(background));
+            assert_eq!(stats.cache.compiled_entries + stats.cache.region_entries, 0);
+            assert_eq!(stats.cache.tier_bg_submitted, 0);
+            assert!(!vm.mem.is_code_page(SOURCE_SUCCESSOR >> 12));
+            assert!(values.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn buffered_store_missed_tag_is_validated_before_execution() {
+        buffered_store_missed_tag(false);
+    }
+
+    #[test]
+    fn degraded_buffered_store_missed_tag_is_validated_before_execution() {
+        crate::with_barrier_unavailable(|| buffered_store_missed_tag(true));
+    }
+
+    fn buffered_store_missed_tag(degraded: bool) {
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        if degraded {
+            let stats = vm.memory_stats();
+            assert_eq!(
+                stats.source_barrier_mode,
+                crate::SourceBarrierMode::Degraded
+            );
+            assert_eq!(stats.source_barrier_failures, 1);
+            assert_eq!(stats.source_barrier_last_errno, Some(1));
+        }
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(SOURCE_ENTRY, &[0xb8, 1, 0, 0, 0, 0xf4])
+            .unwrap();
+        // Rust synchronization cannot keep a real store buffered across a
+        // deterministic handshake. Model that visibility separately: the writer's
+        // post-store check runs while untagged, while its byte becomes visible
+        // only when the process barrier drains the modeled store buffer.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(!vm.mem.is_code_page(1));
+                    vm.mem.note_write(SOURCE_ENTRY + 1, 1);
+                    assert!(!vm.mem.has_dirty_code());
+                    *vm.mem.source_barrier_hook.lock().unwrap() = Some(|mem| {
+                        assert!(mem.is_code_page(1));
+                        // SAFETY: one mapped byte, no concurrent access during this hook.
+                        unsafe {
+                            crate::memory::atomic_store_le(
+                                mem.host_base().add(SOURCE_ENTRY as usize + 1).cast_mut(),
+                                2,
+                                1,
+                            );
+                        }
+                    });
+                })
+                .join()
+                .unwrap();
+        });
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(cpu.reg(Reg::Rax), 2);
+        assert_eq!(vm.mem.source_barriers.load(Ordering::Relaxed), 1);
+        cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(cpu.reg(Reg::Rax), 2);
+    }
+
+    #[test]
+    fn source_publication_races_repeated_writes() {
+        source_publication_writes();
+    }
+
+    #[test]
+    fn degraded_source_publication_races_repeated_writes() {
+        crate::with_barrier_unavailable(source_publication_writes);
+    }
+
+    fn source_publication_writes() {
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(SOURCE_ENTRY, &[0xb8, 1, 0, 0, 0, 0xf4])
+            .unwrap();
+        let mut cpu = vm.new_vcpu();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 0..10_000 {
+                    vm.write_bytes(SOURCE_ENTRY + 1, &[1 + (i & 1) as u8])
+                        .unwrap();
+                    if i % 16 == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            for _ in 0..1_000 {
+                cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+                assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+                assert!((1..=2).contains(&cpu.reg(Reg::Rax)));
+            }
+            writer.join().unwrap();
+        });
+        for _ in 0..3 {
+            cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+            assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 2);
+        }
+    }
+
+    #[test]
+    fn discarded_region_successors_and_lookahead_release_tags() {
+        let mut vm = Vm::new(VmConfig::flat(0x5000));
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        // A conditional entry has a valid successor and an unsupported WBINVD.
+        vm.write_bytes(SOURCE_ENTRY, &[0x0f, 0x84, 0xfa, 0x1f, 0, 0])
+            .unwrap();
+        vm.write_bytes(SOURCE_ENTRY + 6, &[0xf4]).unwrap();
+        vm.write_bytes(SOURCE_SUCCESSOR, &[0x0f, 0x09]).unwrap();
+        {
+            let source = crate::memory::LiftSource::new(&vm.mem);
+            let region = lift_region_watched(
+                &vm.mem,
+                SOURCE_ENTRY,
+                RegionCaps {
+                    max_blocks: 8,
+                    max_icount: 100,
+                },
+                CpuMode::Long64,
+                &mut None,
+                &source,
+            )
+            .unwrap();
+            assert!(vm.mem.is_code_page(3));
+            assert!(!region
+                .blocks
+                .iter()
+                .any(|b| b.guest_start == SOURCE_SUCCESSOR));
+            for (start, len) in region.spans() {
+                vm.mem.mark_code(start, len);
+            }
+            // A multi-page lift batches all new tags behind one barrier.
+            assert_eq!(vm.mem.source_barriers.load(Ordering::Relaxed), 1);
+        }
+        assert!(vm.mem.is_code_page(1));
+        assert!(!vm.mem.is_code_page(3));
+        vm.write_bytes(SOURCE_SUCCESSOR, &[0x90]).unwrap();
+        assert!(!vm.mem.has_dirty_code());
+        // Candidacy probes have no persistent owner, even on success.
+        let mut fresh = Memory::new(MemoryModel::Flat { size: 0x5000 });
+        fresh.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        fresh.write_bytes(0x1fff, &[0xf4, 0x90]).unwrap();
+        crate::lift::lift_block(&fresh, FetchAddr::flat(0x1fff), CpuMode::Long64).unwrap();
+        assert!(!fresh.is_code_page(1));
+        assert!(!fresh.is_code_page(2));
+    }
+
+    #[test]
+    fn overlapping_lifts_keep_tags_until_last_owner() {
+        let mem = Memory::new(MemoryModel::Flat { size: 0x5000 });
+        let first = crate::memory::LiftSource::new(&mem);
+        let second = crate::memory::LiftSource::new(&mem);
+        first.watch(SOURCE_SUCCESSOR, 1);
+        second.watch(SOURCE_SUCCESSOR, 1);
+        drop(first);
+        assert!(mem.is_code_page(3));
+        mem.clear_code_page(3);
+        assert!(mem.is_code_page(3));
+        drop(second);
+        assert!(!mem.is_code_page(3));
+    }
+
+    fn source_race(background: bool, regions: bool, drain: bool) {
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(0x5000),
+            Box::new(SourceBackend {
+                regions,
+                values: values.clone(),
+                ready: Mutex::new(Vec::new()),
+            }),
+        );
+        vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        if background {
+            vm.set_tier_up_after(Some(1));
+            vm.set_tier_up_background(true);
+        }
+        if regions {
+            // Entry jumps to a different, initially untagged page. The successor
+            // sets the result, decrements ECX and loops to the entry, then halts.
+            vm.write_bytes(SOURCE_ENTRY, &[0xe9, 0xfb, 0x1f, 0, 0])
+                .unwrap();
+            vm.write_bytes(
+                SOURCE_SUCCESSOR,
+                &[
+                    0xb8, 1, 0, 0, 0, 0xff, 0xc9, 0x0f, 0x85, 0xf3, 0xdf, 0xff, 0xff, 0xf4,
+                ],
+            )
+            .unwrap();
+        } else {
+            vm.write_bytes(SOURCE_ENTRY, &[0xb8, 1, 0, 0, 0, 0xf4])
+                .unwrap();
+        }
+        let source = if regions {
+            SOURCE_SUCCESSOR
+        } else {
+            SOURCE_ENTRY
+        };
+        if background {
+            let ir =
+                crate::lift::lift_block(&vm.mem, FetchAddr::flat(SOURCE_ENTRY), CpuMode::Long64)
+                    .unwrap();
+            let span = (SOURCE_ENTRY, ir.guest_len);
+            vm.cache.insert(
+                BlockKey::new(SOURCE_ENTRY, CpuMode::Long64),
+                CachedBlock::Interpreted(Arc::new(ir)),
+                vec![span],
+                |_| vm.mem.mark_code(span.0, span.1),
+            );
+        }
+        if regions || !background {
+            assert!(!vm.mem.is_code_page(source >> crate::memory::CODE_PAGE_BITS));
+        }
+        fn write_source(vm: &Vm) {
+            let source = if vm.backend.region_caps().is_some() {
+                SOURCE_SUCCESSOR
+            } else {
+                SOURCE_ENTRY
+            };
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| vm.write_bytes(source + 1, &[2]).unwrap())
+                    .join()
+                    .unwrap();
+            });
+        }
+        *vm.source_read_hook.lock().unwrap() = Some(if drain {
+            |vm| {
+                let generation = vm.cache.publication_generation();
+                write_source(vm);
+                vm.handle_smc(&AtomicU64::new(0));
+                assert!(vm.cache.publication_generation() > generation);
+            }
+        } else {
+            write_source
+        });
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+        cpu.set_reg(Reg::Rcx, 2);
+        assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+        assert_eq!(cpu.reg(Reg::Rax), 2, "stale source must never execute");
+        // Background registration rejects the old source before submitting it.
+        // Foreground compilation may finish, but publication must retry it.
+        assert_eq!(
+            *values.lock().unwrap(),
+            match (background, regions) {
+                (true, true) => vec![2],
+                (true, false) => vec![],
+                (false, _) => vec![1, 2],
+            }
+        );
+        for _ in 0..2 {
+            cpu.set_reg(Reg::Rip, SOURCE_ENTRY);
+            cpu.set_reg(Reg::Rcx, 2);
+            assert!(matches!(cpu.run(&vm, Some(100)), Exit::Hlt));
+            assert_eq!(cpu.reg(Reg::Rax), 2);
+        }
+        if background {
+            assert_eq!(vm.cache.tier_bg_published(), 1);
+        }
+    }
+
+    #[test]
+    fn background_region_watches_successor_before_registration() {
+        source_race(true, true, false);
+    }
+
+    #[test]
+    fn background_region_rejects_successor_write_drained_before_registration() {
+        source_race(true, true, true);
+    }
+
+    #[test]
+    fn foreground_region_watches_successor_before_publication() {
+        source_race(false, true, false);
+    }
+
+    #[test]
+    fn foreground_region_rejects_coverage_miss_drained_before_publication() {
+        source_race(false, true, true);
+    }
+
+    #[test]
+    fn foreground_block_rejects_coverage_miss_drained_before_publication() {
+        source_race(false, false, true);
+    }
+
+    #[test]
+    fn foreground_block_watches_source_before_publication() {
+        source_race(false, false, false);
+    }
+
+    #[test]
+    fn background_block_rejects_source_write_before_registration() {
+        source_race(true, false, false);
+    }
 
     #[test]
     fn compiled_chain_does_not_probe_exhaustion_per_edge() {

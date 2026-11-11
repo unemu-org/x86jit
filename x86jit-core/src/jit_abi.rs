@@ -199,6 +199,8 @@ pub struct MemCtx {
     /// also widens the range to its predecessor, so a store of at most 64 bytes is
     /// gated on its first byte alone (`Memory::widen_code_range`); the precise
     /// note-write helper still tests 4 KiB pages.
+    /// Degraded source ordering supplies an always-open range, so every store
+    /// calls the notifier and fences before checking precise tags (§10).
     pub code_range_ptr: u64,
     /// In: live per-vcpu dispatch notification word (SMC | exit request).
     /// Points to an immutable zero atomic for standalone compiled calls. Rust polls

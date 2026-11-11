@@ -1,6 +1,6 @@
 //! Guest memory model (§4.1, §4.2, §8.1).
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -428,17 +428,26 @@ impl FetchPolicy {
             // Track in-flight and step/replay fetches before the callback.
             // Clear and mark share this lock, so invalidation cannot wipe a
             // new tag after a new approval has already started.
-            mem.mark_code(page << CODE_PAGE_BITS, 1);
+            mem.mark_fetch_code(page, true);
             drop(state);
             // The guard also releases waiters if the embedder callback unwinds.
-            struct Pending<'a>(&'a FetchPolicy, (u64, u64));
+            struct Pending<'a>(&'a FetchPolicy, (u64, u64), &'a Memory);
             impl Drop for Pending<'_> {
                 fn drop(&mut self) {
-                    self.0.state.lock().unwrap().pending.remove(&self.1);
+                    let mut state = self.0.state.lock().unwrap();
+                    state.pending.remove(&self.1);
+                    let (generation, page) = self.1;
+                    let (w, mask) =
+                        word_bit(page.wrapping_sub(self.2.guest_base >> CODE_PAGE_BITS));
+                    if self.0.generation.load(Ordering::Acquire) == generation
+                        && self.0.approved[w].load(Ordering::Acquire) & mask == 0
+                    {
+                        self.2.mark_fetch_code(page, false);
+                    }
                     self.0.wake.notify_all();
                 }
             }
-            let guard = Pending(self, key);
+            let guard = Pending(self, key, mem);
             let verdict = {
                 let _time = mem
                     .time_enabled
@@ -744,6 +753,8 @@ struct CodeAliases {
     // Reference counts retain an edge shared by several sub-page declarations.
     pages: BTreeMap<u64, BTreeMap<u64, usize>>,
     translated: BTreeSet<u64>,
+    lifting: BTreeMap<u64, usize>,
+    fetching: BTreeSet<u64>,
 }
 
 impl CodeAliases {
@@ -863,6 +874,13 @@ pub struct Memory {
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: Box<[AtomicU64]>,
     code_aliases: Mutex<CodeAliases>,
+    code_tag_epoch: AtomicU64,
+    code_barrier_epoch: AtomicU64,
+    pub(crate) source_barrier: crate::process_barrier::ProcessBarrier,
+    #[cfg(test)]
+    pub(crate) source_barrier_hook: Mutex<Option<fn(&Memory)>>,
+    #[cfg(test)]
+    pub(crate) source_barriers: AtomicUsize,
     pub(crate) fetch_policy: Option<FetchPolicy>,
     pub(crate) time_enabled: bool,
     // Packed `(lo << 32) | len` over 64 KiB granules — the *watermark* the JIT's
@@ -895,6 +913,120 @@ pub struct Memory {
 // aliasing rules. No host-side invariant is broken by concurrent access to the
 // flat byte buffer (bounds-checked per access).
 unsafe impl Sync for Memory {}
+
+/// Temporary source ownership lasts through registration/publication. It is
+/// separate from durable cache/request/fetch-policy tags, so discarded lookahead
+/// and failed speculative successors cannot leave permanent code pages (§10).
+pub(crate) struct LiftSource<'a> {
+    mem: &'a Memory,
+    pages: RefCell<BTreeSet<u64>>,
+    copies: RefCell<Vec<(u64, Vec<u8>)>>,
+    epoch: Cell<u64>,
+    needs_validation: Cell<bool>,
+    publishable: Cell<bool>,
+}
+
+impl<'a> LiftSource<'a> {
+    pub(crate) fn new(mem: &'a Memory) -> Self {
+        Self {
+            mem,
+            pages: RefCell::new(BTreeSet::new()),
+            copies: RefCell::new(Vec::new()),
+            epoch: Cell::new(0),
+            needs_validation: Cell::new(false),
+            publishable: Cell::new(true),
+        }
+    }
+
+    pub(crate) fn watch(&self, addr: u64, len: usize) {
+        let mut pages = self.pages.borrow_mut();
+        let mut aliases = self.mem.code_aliases.lock().unwrap();
+        for page in code_page_range(addr, len as u64) {
+            if pages.insert(page) {
+                *aliases.lifting.entry(page).or_default() += 1;
+                self.mem.refresh_code_page(&aliases, page);
+            }
+        }
+        // Also cover a transition owned by another lifter whose barrier has not
+        // completed yet. The mutex orders tag publication and this epoch snapshot.
+        let epoch = self.mem.code_tag_epoch.load(Ordering::Acquire);
+        self.epoch.set(epoch);
+        if self.mem.code_barrier_epoch.load(Ordering::Acquire) < epoch {
+            self.needs_validation.set(true);
+        }
+    }
+
+    pub(crate) fn record(&self, addr: u64, bytes: &[u8]) {
+        if self.needs_validation.get() {
+            self.copies.borrow_mut().push((addr, bytes.to_vec()));
+        }
+    }
+
+    pub(crate) fn validate(&self) -> bool {
+        let epoch = self.epoch.get();
+        let copies = self.copies.take();
+        if !self.needs_validation.replace(false) {
+            return true;
+        }
+        // One process barrier covers every newly tagged page in this lift,
+        // including successors. Re-read after it: a writer that missed both the
+        // watermark and tag must now have made its earlier byte store visible.
+        // Writers observing a tag still record dirty ranges before publication's
+        // generation check; no cache-coverage rejection is assumed here.
+        if self.mem.code_barrier_epoch.load(Ordering::Acquire) < epoch {
+            if !self.mem.source_barrier.flush() {
+                self.publishable.set(false);
+                // This snapshot can run once in the interpreter. It must never
+                // enter a cache or synchronize tags for another lifter.
+                return true;
+            }
+            #[cfg(test)]
+            {
+                self.mem.source_barriers.fetch_add(1, Ordering::Relaxed);
+                let hook = self.mem.source_barrier_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook(self.mem);
+                }
+            }
+            self.mem
+                .code_barrier_epoch
+                .fetch_max(epoch, Ordering::Release);
+        }
+        copies.into_iter().all(|(addr, bytes)| {
+            let mut current = vec![0; bytes.len()];
+            self.mem.fetch_code(addr, &mut current) == Ok(bytes.len()) && current == bytes
+        })
+    }
+
+    pub(crate) fn publishable(&self) -> bool {
+        self.publishable.get()
+    }
+
+    pub(crate) fn uncached(&self, ir: crate::IrBlock) -> crate::CachedBlock {
+        self.mem
+            .source_barrier
+            .uncached_executions
+            .fetch_add(1, Ordering::Relaxed);
+        crate::CachedBlock::Interpreted(std::sync::Arc::new(ir))
+    }
+}
+
+impl Drop for LiftSource<'_> {
+    fn drop(&mut self) {
+        if self.pages.get_mut().is_empty() {
+            return;
+        }
+        let mut aliases = self.mem.code_aliases.lock().unwrap();
+        for &page in self.pages.get_mut().iter() {
+            let count = aliases.lifting.get_mut(&page).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                aliases.lifting.remove(&page);
+                self.mem.refresh_code_page(&aliases, page);
+            }
+        }
+    }
+}
 
 impl Memory {
     pub(crate) fn allocation_stats(&self) -> (u64, Option<u64>, u64) {
@@ -1066,12 +1198,20 @@ impl Memory {
         };
         let code_page = fresh_code_pages(guest_base, top);
         let watch = WatchPages::new(guest_base, top);
+        let source_barrier = crate::process_barrier::ProcessBarrier::new();
         Self {
             model,
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
             code_page,
             code_aliases: Mutex::new(CodeAliases::default()),
+            code_tag_epoch: AtomicU64::new(0),
+            code_barrier_epoch: AtomicU64::new(0),
+            source_barrier,
+            #[cfg(test)]
+            source_barrier_hook: Mutex::new(None),
+            #[cfg(test)]
+            source_barriers: AtomicUsize::new(0),
             fetch_policy: None,
             time_enabled: false,
             code_range: AtomicU64::new(0),
@@ -1166,15 +1306,10 @@ impl Memory {
         // The table covers the whole guest span, so every mappable page has a bit; a
         // page outside it no-ops (`code_page.get` → None) rather than aborting.
         for page in code_page_range(addr, len as u64) {
-            let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
-            if let Some(word) = self.code_page.get(w) {
+            let (w, _) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
+            if self.code_page.get(w).is_some() {
                 aliases.translated.insert(page);
-                word.fetch_or(m, Ordering::Relaxed);
-                if aliases.pages.contains_key(&page) {
-                    self.refresh_code_aliases(&aliases, &aliases.connected(page));
-                } else {
-                    self.widen_code_range((page << CODE_PAGE_BITS) >> CODE_RANGE_BITS);
-                }
+                self.refresh_code_page(&aliases, page);
             }
         }
     }
@@ -1263,13 +1398,31 @@ impl Memory {
         true
     }
 
-    fn refresh_code_aliases(&self, aliases: &CodeAliases, pages: &BTreeSet<u64>) {
-        let live = pages.iter().any(|p| aliases.translated.contains(p));
+    fn refresh_code_page(&self, aliases: &CodeAliases, page: u64) {
+        if aliases.pages.contains_key(&page) {
+            self.refresh_code_aliases(aliases, &aliases.connected(page));
+        } else {
+            // Keep ordinary registration and coverage-miss clears allocation-free.
+            self.refresh_code_aliases(aliases, &[page]);
+        }
+    }
+
+    fn refresh_code_aliases<'p>(
+        &self,
+        aliases: &CodeAliases,
+        pages: impl IntoIterator<Item = &'p u64> + Copy,
+    ) {
+        let live = pages.into_iter().any(|p| {
+            aliases.translated.contains(p)
+                || aliases.lifting.contains_key(p)
+                || aliases.fetching.contains(p)
+        });
+        let mut transitioned = false;
         for &page in pages {
             let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
             if let Some(word) = self.code_page.get(w) {
                 if live {
-                    word.fetch_or(m, Ordering::Relaxed);
+                    transitioned |= word.fetch_or(m, Ordering::Release) & m == 0;
                 } else {
                     word.fetch_and(!m, Ordering::Relaxed);
                 }
@@ -1284,6 +1437,9 @@ impl Memory {
             for &page in pages {
                 self.widen_code_range((page << CODE_PAGE_BITS) >> CODE_RANGE_BITS);
             }
+        }
+        if transitioned {
+            self.code_tag_epoch.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -1346,8 +1502,35 @@ impl Memory {
     /// both halves in one load and can never see a torn `lo`/`len` pair — a narrowed
     /// pair would silently skip a page. `len == 0` means no code has been marked, and
     /// `(page - 0) < 0` is false for every page, so an empty range needs no special case.
+    ///
+    /// Degraded source ordering returns an always-open range covering all valid
+    /// RAM, forcing every compiled store through the fenced notifier (§10).
     pub fn code_range_ptr(&self) -> u64 {
-        &self.code_range as *const AtomicU64 as u64
+        // All valid RAM lies below 2^47. Keeping a separate always-open JIT gate
+        // avoids inflating the precise extent used by sparse metadata walks.
+        static FENCED_STORES: AtomicU64 = AtomicU64::new(1 << (47 - CODE_RANGE_BITS));
+        let range = if self.source_barrier.mode == crate::SourceBarrierMode::Degraded {
+            &FENCED_STORES
+        } else {
+            &self.code_range
+        };
+        range as *const AtomicU64 as u64
+    }
+
+    fn mark_fetch_code(&self, page: u64, live: bool) {
+        let mut aliases = self.code_aliases.lock().unwrap();
+        if live {
+            aliases.fetching.insert(page);
+        } else {
+            aliases.fetching.remove(&page);
+        }
+        self.refresh_code_page(&aliases, page);
+    }
+
+    pub(crate) fn release_code_registration(&self, page: u64) {
+        let mut aliases = self.code_aliases.lock().unwrap();
+        aliases.translated.remove(&page);
+        self.refresh_code_page(&aliases, page);
     }
 
     /// Clear a page's code tag after its blocks have been invalidated (§10).
@@ -1355,14 +1538,8 @@ impl Memory {
         let clear = || {
             let mut aliases = self.code_aliases.lock().unwrap();
             aliases.translated.remove(&page);
-            if aliases.pages.contains_key(&page) {
-                self.refresh_code_aliases(&aliases, &aliases.connected(page));
-            } else {
-                let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
-                if let Some(word) = self.code_page.get(w) {
-                    word.fetch_and(!m, Ordering::Relaxed);
-                }
-            }
+            aliases.fetching.remove(&page);
+            self.refresh_code_page(&aliases, page);
         };
         if let Some(policy) = &self.fetch_policy {
             policy.clear(Some(page), self.guest_base >> CODE_PAGE_BITS, clear);
@@ -1377,6 +1554,7 @@ impl Memory {
         let clear = || {
             let mut aliases = self.code_aliases.lock().unwrap();
             aliases.translated.clear();
+            aliases.fetching.clear();
             let range = self.code_range.load(Ordering::Relaxed);
             let (lo, len) = (range >> 32, range & 0xffff_ffff);
             if len == 0 {
@@ -1393,6 +1571,9 @@ impl Memory {
                 [first_word.min(self.code_page.len())..end_word.min(self.code_page.len())]
             {
                 word.store(0, Ordering::Relaxed);
+            }
+            for &page in aliases.lifting.keys() {
+                self.refresh_code_page(&aliases, page);
             }
         };
         if let Some(policy) = &self.fetch_policy {
@@ -1416,6 +1597,7 @@ impl Memory {
 
     #[inline(always)]
     fn note_write_observed(&self, addr: u64, len: usize, observer: &impl InterpreterMemory) {
+        self.source_barrier.writer_fence();
         let host = (self.host_base() as u64).wrapping_add(addr.wrapping_sub(self.guest_base));
         observer.note_host_block_write(host, addr, len);
         // One relaxed load gates the (rare) data-watch path: an unwatched memory pays
@@ -1461,6 +1643,8 @@ impl Memory {
         dirty.retain(|&(lo, hi)| {
             observer.note_block_write(lo, (hi - lo) as usize);
             aliases.translated.contains(&(lo >> CODE_PAGE_BITS))
+                || aliases.lifting.contains_key(&(lo >> CODE_PAGE_BITS))
+                || aliases.fetching.contains(&(lo >> CODE_PAGE_BITS))
         });
         drop(aliases);
         if dirty.is_empty() {
@@ -2814,6 +2998,30 @@ fn apply_rmw(old: u64, src: u64, op: RmwOp, size: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_barrier_does_not_synchronize_other_lifters() {
+        crate::with_barrier_success(|| {
+            let mut mem = Memory::new(MemoryModel::Flat { size: 0x5000 });
+            mem.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+            let first = LiftSource::new(&mem);
+            first.watch(0x1000, 1);
+            first.record(0x1000, &[0]);
+            crate::with_barrier_flush_failure(|| assert!(first.validate()));
+            assert!(!first.publishable());
+            assert_eq!(mem.code_barrier_epoch.load(Ordering::Relaxed), 0);
+            let second = LiftSource::new(&mem);
+            second.watch(0x1000, 1);
+            second.record(0x1000, &[0]);
+            assert!(second.validate());
+            assert!(second.publishable());
+            assert!(mem.code_barrier_epoch.load(Ordering::Relaxed) > 0);
+            assert!(
+                !first.publishable(),
+                "another lifter cannot license the failed snapshot"
+            );
+        });
+    }
 
     #[test]
     fn smc_dispatch_acknowledges_only_its_own_notice_after_invalidation() {

@@ -904,6 +904,7 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-module",
  "cranelift-native",
+ "iced-x86",
  "libc",
  "memmap2",
  "region",

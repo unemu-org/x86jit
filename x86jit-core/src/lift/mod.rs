@@ -174,7 +174,12 @@ impl<const CAP: usize> FetchWindow<CAP> {
         // SAFETY: refill initializes exactly this prefix; no guest slice escapes.
         unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.len) }
     }
-    fn refill(&mut self, mem: &Memory, start: u64) -> bool {
+    fn refill<const WATCH: bool>(
+        &mut self,
+        mem: &Memory,
+        start: u64,
+        source: Option<&crate::memory::LiftSource<'_>>,
+    ) -> bool {
         if self.stopped || self.len == self.limit {
             return false;
         }
@@ -205,11 +210,20 @@ impl<const CAP: usize> FetchWindow<CAP> {
                 (crate::memory::CODE_PAGE_SIZE - (at % crate::memory::CODE_PAGE_SIZE)) as usize,
             );
         }
+        if WATCH {
+            source.unwrap().watch(at, chunk);
+        }
         // SAFETY: this writable tail is disjoint from the initialized prefix.
         // No reference to its uninitialized bytes is formed before the copy.
         let out = unsafe { self.bytes.as_mut_ptr().cast::<u8>().add(self.len) };
         match unsafe { mem.fetch_code_into(at, out, chunk) } {
             Ok(copied) => {
+                if WATCH {
+                    // SAFETY: the copy initialized exactly this prefix of the tail.
+                    source
+                        .unwrap()
+                        .record(at, unsafe { std::slice::from_raw_parts(out, copied) });
+                }
                 self.len += copied;
                 self.stopped = copied < chunk;
                 if self.stopped {
@@ -724,11 +738,23 @@ pub(crate) fn lift_block_with_fault(
     mode: CpuMode,
     details: &mut Option<FetchFailure>,
 ) -> Result<IrBlock, LiftError> {
+    let source = crate::memory::LiftSource::new(mem);
+    lift_block_watched(mem, at, mode, details, &source)
+}
+
+pub(crate) fn lift_block_watched(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
+) -> Result<IrBlock, LiftError> {
     loop {
         let permit = mem.fetch_permit();
         *details = None;
-        let result = lift_block_attempt(mem, at, mode, details);
-        if permit.as_ref().is_none_or(|p| p.is_current()) {
+        let result = lift_block_attempt(mem, at, mode, details, source);
+        let valid = source.validate();
+        if valid && permit.as_ref().is_none_or(|p| p.is_current()) {
             return result;
         }
     }
@@ -739,10 +765,11 @@ fn lift_block_attempt(
     at: FetchAddr,
     mode: CpuMode,
     details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new(mode, start);
-    if !window.refill(mem, at.pa) {
+    if !window.refill::<true>(mem, at.pa, Some(source)) {
         *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
@@ -760,7 +787,7 @@ fn lift_block_attempt(
     loop {
         let position = decoder.position();
         if !decoder.can_decode() {
-            if !window.refill(mem, at.pa) {
+            if !window.refill::<true>(mem, at.pa, Some(source)) {
                 break;
             }
             decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
@@ -770,7 +797,7 @@ fn lift_block_attempt(
         let position = decoder.position();
         decoder.decode_out(&mut insn);
         if insn.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
-            if window.refill(mem, at.pa) {
+            if window.refill::<true>(mem, at.pa, Some(source)) {
                 decoder =
                     Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
                 decoder.set_position(position).unwrap();
@@ -893,7 +920,7 @@ fn lift_one_attempt(
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<15>::new(mode, start);
-    if !window.refill(mem, at.pa) {
+    if !window.refill::<false>(mem, at.pa, None) {
         *details = window.failure;
         return Err(LiftError::DecodeFault { addr: at.pa });
     }
@@ -912,7 +939,7 @@ fn lift_one_attempt(
         if !insn.is_invalid() || decoder.last_error() != DecoderError::NoMoreBytes {
             break;
         }
-        if !window.refill(mem, at.pa) {
+        if !window.refill::<false>(mem, at.pa, None) {
             decoder = Decoder::with_ip(mode.bits(), window.code(), start, decoder_options(mode));
             decoder.decode_out(&mut insn);
             break;
@@ -1178,6 +1205,52 @@ mod tests {
                 matches!(second.ops.first(), Some(IrOp::InsnStart { guest_addr }) if *guest_addr == next)
             );
         }
+    }
+
+    #[test]
+    fn budget_discarded_successor_releases_its_page() {
+        let mut mem = Memory::new(crate::MemoryModel::Flat { size: 0x6000 });
+        mem.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+        for (at, target) in [(0x1000, 0x3000), (0x3000, 0x5000)] {
+            let mut bytes = [0x48, 0x8b, 0x07].repeat(100);
+            let next = at + bytes.len() as u64 + 5;
+            bytes.push(0xe9);
+            bytes.extend_from_slice(&((target as i64 - next as i64) as i32).to_le_bytes());
+            mem.write_bytes(at, &bytes).unwrap();
+        }
+        let mut last = [0x48, 0x8b, 0x07].repeat(100);
+        last.push(0xf4);
+        mem.write_bytes(0x5000, &last).unwrap();
+        {
+            let source = crate::memory::LiftSource::new(&mem);
+            let region = lift_region_watched(
+                &mem,
+                0x1000,
+                RegionCaps {
+                    max_blocks: 8,
+                    max_icount: 1000,
+                },
+                CpuMode::Long64,
+                &mut None,
+                &source,
+            )
+            .unwrap();
+            assert_eq!(region.blocks.len(), 2);
+            assert!(mem.is_code_page(5));
+            for (start, len) in region.spans() {
+                mem.mark_code(start, len);
+            }
+            assert_eq!(
+                mem.source_barriers
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+        assert!(mem.is_code_page(1));
+        assert!(mem.is_code_page(3));
+        assert!(!mem.is_code_page(5));
+        mem.write_bytes(0x5000, &[0x90]).unwrap();
+        assert!(!mem.has_dirty_code());
     }
 
     #[test]
@@ -1603,11 +1676,24 @@ pub(crate) fn lift_region_with_fault(
     mode: CpuMode,
     details: &mut Option<FetchFailure>,
 ) -> Result<IrRegion, LiftError> {
+    let source = crate::memory::LiftSource::new(mem);
+    lift_region_watched(mem, entry, caps, mode, details, &source)
+}
+
+pub(crate) fn lift_region_watched(
+    mem: &Memory,
+    entry: u64,
+    caps: RegionCaps,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
+) -> Result<IrRegion, LiftError> {
     loop {
         let permit = mem.fetch_permit();
         *details = None;
-        let result = lift_region_attempt(mem, entry, caps, mode, details);
-        if permit.as_ref().is_none_or(|p| p.is_current()) {
+        let result = lift_region_attempt(mem, entry, caps, mode, details, source);
+        let valid = source.validate();
+        if valid && permit.as_ref().is_none_or(|p| p.is_current()) {
             return result;
         }
     }
@@ -1619,6 +1705,7 @@ fn lift_region_attempt(
     caps: RegionCaps,
     mode: CpuMode,
     details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
 ) -> Result<IrRegion, LiftError> {
     use std::collections::HashMap;
 
@@ -1633,6 +1720,7 @@ fn lift_region_attempt(
         post: &mut Vec<u64>,
         icount: &mut u32,
         descriptors: &mut usize,
+        source: &crate::memory::LiftSource<'_>,
     ) {
         for s in static_succs(&blocks[&addr]) {
             if blocks.contains_key(&s) {
@@ -1643,7 +1731,7 @@ fn lift_region_attempt(
             }
             // Region compilation is a JIT tier-up path; Real16 never JITs (§17.6, it
             // stays on the interpreter), so successor addresses are flat here.
-            if let Ok(b) = lift_block(mem, FetchAddr::flat(s), mode) {
+            if let Ok(b) = lift_block_attempt(mem, FetchAddr::flat(s), mode, &mut None, source) {
                 let count = guest_access_descriptors(&b.ops);
                 if *descriptors + count > MAX_GUEST_ACCESS_DESCRIPTORS {
                     continue;
@@ -1651,7 +1739,17 @@ fn lift_region_attempt(
                 *descriptors += count;
                 *icount += b.icount;
                 blocks.insert(s, b);
-                dfs(mem, s, caps, mode, blocks, post, icount, descriptors);
+                dfs(
+                    mem,
+                    s,
+                    caps,
+                    mode,
+                    blocks,
+                    post,
+                    icount,
+                    descriptors,
+                    source,
+                );
             }
             // An unliftable first instruction stays an exit edge at `s`. A valid
             // prefix is retained as a block, so it executes before that exit.
@@ -1659,7 +1757,7 @@ fn lift_region_attempt(
         post.push(addr); // finished: post-order
     }
 
-    let first = lift_block_with_fault(mem, FetchAddr::flat(entry), mode, details)?;
+    let first = lift_block_attempt(mem, FetchAddr::flat(entry), mode, details, source)?;
     let mut descriptors = guest_access_descriptors(&first.ops);
     let mut icount = first.icount;
     let mut blocks = HashMap::from([(entry, first)]);
@@ -1673,6 +1771,7 @@ fn lift_region_attempt(
         &mut post,
         &mut icount,
         &mut descriptors,
+        source,
     );
 
     // Reverse post-order (entry first). Remove from the map in this order so each
