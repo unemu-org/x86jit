@@ -1221,9 +1221,18 @@ fn walk_ops<
             } => {
                 if CHILD {
                     mem.0.child_atomic(op, temps, cpu);
-                } else if let Some(r) =
-                    exec_atomic_rmw(cpu, mem, temps, cur_addr.get(), old, addr, src, size, rmw)
-                {
+                } else if let Some(r) = exec_atomic_rmw(
+                    cpu,
+                    mem,
+                    temps,
+                    cur_addr.get(),
+                    ir,
+                    old,
+                    addr,
+                    src,
+                    size,
+                    rmw,
+                ) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
@@ -1242,6 +1251,7 @@ fn walk_ops<
                     mem,
                     temps,
                     cur_addr.get(),
+                    ir,
                     old,
                     addr,
                     expected,

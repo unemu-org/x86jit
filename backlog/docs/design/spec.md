@@ -433,6 +433,16 @@ impl Vcpu {
 >
 > This works identically in the interpreter and the JIT (the retried load is a fresh execution in both), costs one `Option` check on the Trap-slow-path only, and never requires resuming a half-executed block.
 
+**Atomic operations on Trap regions:** memory CMPXCHG, XADD, XCHG,
+CMPXCHG8B/CMPXCHG16B and supported LOCK-prefixed ALU/bit modifications return
+`Exit::UnknownInstruction` with the instruction's exact bytes and length, leaving
+RIP on that instruction and its guest state unchanged. No device transfer is
+requested. Separate MMIO read/write exits cannot express a locked transaction
+(SDM Vol 3A §§11.1.2–11.1.2.2). The embedder emulates the instruction and advances
+RIP; `complete_mmio_read`/`complete_mmio_write` do not acknowledge this exit.
+Memory CMPXCHG and XADD use this policy with or without an explicit LOCK prefix,
+matching their atomic IR lowering.
+
 > **Note on MMIO vs JIT:** in generated code, ordinary RAM is inlined, but access to a Trap region must leave the block. This complicates codegen (the JIT must generate a check "is this address a Trap" or know it statically). At the start (interpreter) this is trivial. With the JIT, consider: either a runtime check on accesses that may hit a Trap, or keeping MMIO out of the hot path and accepting that accesses to unknown addresses go the slow route. Resolve this in M4 together with the inline-access safety check (§8.2.3) — one range/permission check can serve both.
 
 ### 5.3 Inspecting and modifying state between calls

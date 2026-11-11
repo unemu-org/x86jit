@@ -553,6 +553,7 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
+    ir: &IrBlock,
     old: &Temp,
     addr: &Val,
     src: &Val,
@@ -563,6 +564,7 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool, const ORDER: u8>(
     let s = read_val(*src, &*temps);
     match mem.atomic_rmw(a, s, *size, *op) {
         Ok(prev) => temps[*old as usize] = prev,
+        Err(MemTrap::Mmio) => return Some(atomic_mmio_exit(cpu, mem, cur_addr, ir)),
         Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Write, s)),
     }
     None
@@ -574,6 +576,7 @@ pub(crate) fn exec_atomic_cas<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
     cur_addr: u64,
+    ir: &IrBlock,
     old: &Temp,
     addr: &Val,
     expected: &Val,
@@ -584,9 +587,41 @@ pub(crate) fn exec_atomic_cas<const ROUTED: bool, const ORDER: u8>(
     let (exp, s) = (read_val(*expected, &*temps), read_val(*src, &*temps));
     match mem.atomic_cas(a, exp, s, *size) {
         Ok(prev) => temps[*old as usize] = prev,
+        Err(MemTrap::Mmio) => return Some(atomic_mmio_exit(cpu, mem, cur_addr, ir)),
         Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Write, s)),
     }
     None
+}
+
+#[cold]
+fn atomic_mmio_exit<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    cur_addr: u64,
+    ir: &IrBlock,
+) -> InterpResult {
+    // Engine policy (§5.2): separate device exits cannot implement an atomic
+    // RMW/CAS. Leave emulation to the embedder, as for paired compare-exchange.
+    let next = ir.ops.iter().find_map(|op| match op {
+        IrOp::InsnStart { guest_addr } if *guest_addr > cur_addr => Some(*guest_addr),
+        _ => None,
+    });
+    let len = (next.unwrap_or(ir.guest_start + u64::from(ir.guest_len)) - cur_addr) as u8;
+    let at = crate::lift::FetchAddr::for_mode(ir.mode, cur_addr, cpu.cs).pa;
+    let mut bytes = [0; 15];
+    let mut copied = 0;
+    while copied < usize::from(len) {
+        let Ok(code) = mem.code_slice(at + copied as u64, usize::from(len) - copied) else {
+            break;
+        };
+        if code.is_empty() {
+            break;
+        }
+        bytes[copied..copied + code.len()].copy_from_slice(&code);
+        copied += code.len();
+    }
+    cpu.rip = cur_addr;
+    InterpResult::exit(Exit::unknown_instruction(cur_addr, bytes, len))
 }
 
 #[allow(clippy::too_many_arguments)]

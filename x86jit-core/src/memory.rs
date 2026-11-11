@@ -2022,6 +2022,26 @@ impl Memory {
         }
     }
 
+    fn atomic_region_at(&self, addr: u64, size: u8) -> Result<&Region, MemTrap> {
+        let region = self.region_at(addr, size).map_err(|fault| {
+            // §5.2: even a partial device operand requires embedder emulation.
+            if let Some(end) = addr.checked_add(u64::from(size)) {
+                if self.regions.iter().any(|r| {
+                    matches!(r.kind, RegionKind::Trap)
+                        && r.start < end
+                        && addr < r.start + r.size as u64
+                }) {
+                    return MemTrap::Mmio;
+                }
+            }
+            fault
+        })?;
+        if matches!(region.kind, RegionKind::Trap) {
+            return Err(MemTrap::Mmio);
+        }
+        Ok(region)
+    }
+
     unsafe fn copy_from_guest(&self, ptr: *const u8, buf: &mut [u8]) -> Result<(), usize> {
         // SAFETY: caller validates the whole span and local buffer. The default
         // contract requires tagged RAM to stay accessible on the host.
@@ -2392,10 +2412,7 @@ impl Memory {
         op: RmwOp,
         observer: &impl InterpreterMemory,
     ) -> Result<u64, MemTrap> {
-        let region = self.region_at(addr, size)?;
-        if matches!(region.kind, RegionKind::Trap) {
-            return Err(MemTrap::Mmio);
-        }
+        let region = self.atomic_region_at(addr, size)?;
         // SAFETY: bounds-checked into a mapped RAM region; `ptr` is inside the
         // backing buffer. Interior-mutable shared access is the intended model (§8).
         let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(addr)) };
@@ -2514,10 +2531,7 @@ impl Memory {
         size: u8,
         observer: &impl InterpreterMemory,
     ) -> Result<u64, MemTrap> {
-        let region = self.region_at(addr, size)?;
-        if matches!(region.kind, RegionKind::Trap) {
-            return Err(MemTrap::Mmio);
-        }
+        let region = self.atomic_region_at(addr, size)?;
         // SAFETY: as in `atomic_rmw`.
         let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(addr)) };
         // A `cmpxchg` against masked ROM never stores; it returns the current value
@@ -3293,6 +3307,19 @@ mod tests {
         // Last valid 4-byte read starts at 0x10c; 0x10e straddles the end.
         assert!(m.read(0x10c, 4).is_ok());
         assert!(matches!(m.read(0x10e, 4), Err(MemTrap::Unmapped)));
+    }
+
+    #[test]
+    fn atomic_operand_crossing_into_gap_stays_unmapped() {
+        let mut m = flat(0x1000);
+        m.map(0x100, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.write(0x10c, 7, 4).unwrap();
+        assert_eq!(
+            m.atomic_rmw(0x10e, 9, 4, RmwOp::Add),
+            Err(MemTrap::Unmapped)
+        );
+        assert_eq!(m.atomic_cas(0x10e, 7, 9, 4), Err(MemTrap::Unmapped));
+        assert_eq!(m.read(0x10c, 4), Ok(7));
     }
 
     #[test]
