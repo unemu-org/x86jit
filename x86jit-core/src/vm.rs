@@ -766,6 +766,8 @@ impl Vm {
     /// VM's mapping alive and preventing safe unmap/remap until the view is dropped.
     /// See the crate docs for the FFI and parent invalidation protocol.
     pub fn child_view(&self, mode: CpuMode) -> crate::ChildView<'_> {
+        // Register atfork in the parent, never on the allocation-free child path.
+        let _ = crate::codemap::ProcessIdentity::current();
         let mut view = self.mem.child_view(self, mode);
         view.code.consistency = self.consistency;
         view

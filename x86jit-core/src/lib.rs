@@ -58,8 +58,9 @@
 //! destructors. The bridge also covers vCPUs created after the view.
 //! Keep the inherited view, arena and CPU alive and exit/exec without dropping
 //! them in the child. After the child has exited or exec'd, call
-//! [`Vm::invalidate_written_pages`] in the parent before releasing the view and
-//! backing. This also reconciles watched data pages. Each arena belongs to one
+//! [`retire_shared_address_space_child`] in the parent once detachment is confirmed.
+//! Call [`Vm::invalidate_written_pages`] in the parent before releasing the view
+//! and backing. This also reconciles watched data pages. Each arena belongs to one
 //! child and one VM; never submit its log to a different VM.
 //!
 //! [`ChildView<'vm>`] owns copied metadata and borrows the VM's stable atomic
@@ -175,8 +176,8 @@ pub mod x87;
 pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 pub use child::{ChildArena, ChildFault, ChildRefusal, ChildStep, ChildView};
 pub use codemap::{
-    mark_shared_address_space_child, GuestAccessKind, GuestTrapSite, SharedAddressSpaceChild,
-    SharedChildTableFull,
+    mark_shared_address_space_child, retire_shared_address_space_child, GuestAccessKind,
+    GuestTrapSite, SharedAddressSpaceChild, SharedChildRetirement, SharedChildTableFull,
 };
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{

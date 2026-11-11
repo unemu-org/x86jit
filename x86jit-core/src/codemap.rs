@@ -20,7 +20,7 @@
 
 use crate::jit_abi::fault::FrameRecipe;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Default)]
@@ -827,8 +827,97 @@ impl std::fmt::Display for SharedChildTableFull {
 impl std::error::Error for SharedChildTableFull {}
 
 const SHARED_CHILD_SLOTS: usize = 1024;
-static SHARED_CHILDREN: [AtomicU32; SHARED_CHILD_SLOTS] =
-    [const { AtomicU32::new(0) }; SHARED_CHILD_SLOTS];
+static SHARED_CHILDREN: [SharedChildSlot; SHARED_CHILD_SLOTS] =
+    [const { SharedChildSlot::new() }; SHARED_CHILD_SLOTS];
+static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Outcome of retiring a shared-address-space child's marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedChildRetirement {
+    Retired,
+    NotFound,
+}
+
+struct SharedChildSlot {
+    // Low 32 bits: PID (zero means vacant). High 32 bits: slot incarnation.
+    // Never wrap: a spent counter stays vacant.
+    version: AtomicU64,
+    fork_generation: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct SharedChildSnapshot {
+    version: u64,
+    identity: ProcessIdentity,
+}
+
+impl SharedChildSlot {
+    const fn new() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            fork_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> Option<SharedChildSnapshot> {
+        self.snapshot_probed(|| {})
+    }
+
+    fn snapshot_probed(&self, probe: impl FnOnce()) -> Option<SharedChildSnapshot> {
+        // SeqCst orders the generation read between the version reads. Retirement
+        // changes the version before reuse, so a reader never accepts a new
+        // generation paired with an old PID, even across retirement and reuse.
+        let version = self.version.load(Ordering::SeqCst);
+        let pid = version as u32;
+        if pid == 0 {
+            return None;
+        }
+        let identity = ProcessIdentity {
+            pid,
+            generation: self.fork_generation.load(Ordering::SeqCst),
+        };
+        probe();
+        (self.version.load(Ordering::SeqCst) == version)
+            .then_some(SharedChildSnapshot { version, identity })
+    }
+
+    fn insert(&self, identity: ProcessIdentity) -> bool {
+        self.insert_probed(identity, || {})
+    }
+
+    fn insert_probed(&self, identity: ProcessIdentity, probe: impl FnOnce()) -> bool {
+        let version = self.version.load(Ordering::SeqCst);
+        if version as u32 != 0 || version >> 32 == u32::MAX as u64 {
+            return false;
+        }
+        // All publishers sharing an address space have the same fork generation:
+        // atfork changes only a copying child's private memory. Competing stores
+        // therefore agree, even if a publisher loses the CAS. Publish the PID
+        // last, with no reservation that a killed child could leave stranded.
+        self.fork_generation
+            .store(identity.generation, Ordering::SeqCst);
+        probe();
+        self.version
+            .compare_exchange(
+                version,
+                version | u64::from(identity.pid),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn retire(&self, snapshot: SharedChildSnapshot) -> bool {
+        self.version
+            .compare_exchange(
+                snapshot.version,
+                ((snapshot.version >> 32) + 1) << 32,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -843,42 +932,56 @@ fn current_pid() -> u32 {
     std::process::id()
 }
 
-fn mark_pid(slots: &[AtomicU32], pid: u32) -> Result<(), SharedChildTableFull> {
-    // Slots never clear: no inherited lock, allocation, or reclamation protocol.
-    // A failed CAS returns the winner, making concurrent repeated marks idempotent.
+fn mark_identity(
+    slots: &[SharedChildSlot],
+    identity: ProcessIdentity,
+) -> Result<(), SharedChildTableFull> {
+    if check_identity(slots, identity).is_err() {
+        return Ok(());
+    }
     for slot in slots {
-        match slot.compare_exchange(0, pid, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(()),
-            Err(marked) if marked == pid => return Ok(()),
-            Err(_) => {}
+        if let Some(snapshot) = slot.snapshot() {
+            if snapshot.identity == identity {
+                return Ok(());
+            }
+            // A different fork generation belongs to an inherited copying-fork
+            // snapshot, never a child still sharing this address space. Reclaim
+            // it so an inherited full table cannot exhaust the descendant.
+            if snapshot.identity.generation != identity.generation {
+                slot.retire(snapshot);
+            }
+        }
+        if slot.insert(identity) {
+            return Ok(());
+        }
+        if slot.snapshot().is_some_and(|s| s.identity == identity) {
+            return Ok(());
         }
     }
     Err(SharedChildTableFull)
 }
 
-/// Permanently disable JIT code allocation, compilation and registration for the
-/// calling PID, across all its threads, without disabling its shared-VM parent.
-/// Call immediately on child entry, before any engine use or child thread starts.
-/// The child must have its own host stack and TLS; it must not run inherited
-/// engine destructors. Lookups and the step-one interpreter remain available.
-///
-/// Uses a fixed lock-free table, with no allocation, TLS access, fork-handler
-/// registration or inherited mutex in production. At most 1024 distinct PIDs can
-/// be marked per address space. Repeated calls for a marked PID succeed. Marks
-/// are never removed, so PID reuse conservatively refuses JIT as well. On table
-/// exhaustion, exit/exec the child without engine use; the parent is unaffected.
-/// Marking must precede JIT use, rather than racing an already active compiler.
-pub fn mark_shared_address_space_child() -> Result<(), SharedChildTableFull> {
-    mark_pid(&SHARED_CHILDREN, current_pid())
+fn retire_identity(slots: &[SharedChildSlot], identity: ProcessIdentity) -> SharedChildRetirement {
+    let mut result = SharedChildRetirement::NotFound;
+    for slot in slots {
+        if let Some(snapshot) = slot.snapshot() {
+            if snapshot.identity == identity && slot.retire(snapshot) {
+                // Concurrent marks can choose separate vacant slots if other
+                // children retire during the scan. Retire every copy after detachment.
+                result = SharedChildRetirement::Retired;
+            }
+        }
+    }
+    result
 }
 
-/// Check admission before touching any process-owned JIT storage or locks.
-#[doc(hidden)]
-pub fn check_jit_allowed() -> Result<(), SharedAddressSpaceChild> {
-    let pid = current_pid();
-    if SHARED_CHILDREN
+fn check_identity(
+    slots: &[SharedChildSlot],
+    identity: ProcessIdentity,
+) -> Result<(), SharedAddressSpaceChild> {
+    if slots
         .iter()
-        .any(|slot| slot.load(Ordering::Relaxed) == pid)
+        .any(|slot| slot.snapshot().is_some_and(|s| s.identity == identity))
     {
         Err(SharedAddressSpaceChild)
     } else {
@@ -886,10 +989,60 @@ pub fn check_jit_allowed() -> Result<(), SharedAddressSpaceChild> {
     }
 }
 
+/// Disable JIT code allocation, compilation and registration for the calling
+/// process identity, across all its threads, without disabling its shared-VM parent.
+/// Call immediately on child entry, before any engine use or child thread starts.
+/// The child must have its own host stack and TLS; it must not run inherited
+/// engine destructors. Lookups and the step-one interpreter remain available.
+///
+/// Uses a fixed lock-free table, with no allocation, TLS access, fork-handler
+/// registration or inherited mutex in production. The parent must initialize
+/// fork tracking through [`crate::Vm::child_view`] before creating the child. At most
+/// 1024 markers can be live per address space. Repeated calls for a marked child
+/// succeed. After definitive child exit/detachment, the parent must call
+/// [`retire_shared_address_space_child`] to reclaim its slot before PID reuse.
+/// Copying-fork descendants ignore inherited markers through their fork generation.
+/// On table exhaustion, exit/exec the child without engine use; the parent is unaffected.
+/// Marking must precede JIT use, rather than racing an already active compiler.
+pub fn mark_shared_address_space_child() -> Result<(), SharedChildTableFull> {
+    // Raw-syscall shared-VM children do not run pthread_atfork handlers. Their
+    // generation is the parent's unchanged shared atomic, both when marking and
+    // checking admission (ordinary fork handlers change only the copying child's
+    // private address space). Thus the parent can also retire using its generation.
+    mark_identity(&SHARED_CHILDREN, ProcessIdentity::untracked())
+}
+
+/// Retire the marker for `pid` in the calling parent's fork generation.
+/// Call from the parent only after definitive child exit or detachment from the
+/// shared address space, and before reusing the PID. The child must first call
+/// [`mark_shared_address_space_child`] before any engine use. Do not race retirement
+/// with child marking or engine use: retirement permits JIT admission again.
+///
+/// Returns [`SharedChildRetirement::Retired`] if a marker was removed, or
+/// [`SharedChildRetirement::NotFound`] if none matched. Slot versions prevent a
+/// stale snapshot from retiring a reused slot. Lock-free, allocation-free and
+/// async-signal-safe; no TLS access or fork-handler registration in production.
+pub fn retire_shared_address_space_child(pid: u32) -> SharedChildRetirement {
+    retire_identity(
+        &SHARED_CHILDREN,
+        ProcessIdentity {
+            pid,
+            ..ProcessIdentity::untracked()
+        },
+    )
+}
+
+/// Check admission before touching any process-owned JIT storage or locks.
+#[doc(hidden)]
+pub fn check_jit_allowed() -> Result<(), SharedAddressSpaceChild> {
+    check_identity(&SHARED_CHILDREN, ProcessIdentity::untracked())
+}
+
 /// Identity shared by process-owned JIT storage and metadata.
 ///
-/// The fork generation changes in every child, including children that never
-/// access the JIT. PID reuse in a later descendant cannot revive inherited state.
+/// The fork generation changes in every copying-fork child, including children
+/// that never access the JIT. PID reuse in a later descendant cannot revive
+/// inherited state. Raw-syscall shared-address-space children retain it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -900,13 +1053,12 @@ pub struct ProcessIdentity {
 impl ProcessIdentity {
     /// Initialize fork tracking before publishing any process-owned state.
     pub fn current() -> Self {
-        static GENERATION: AtomicU64 = AtomicU64::new(0);
         #[cfg(unix)]
         {
             static REGISTER: std::sync::Once = std::sync::Once::new();
             extern "C" fn child() {
                 // Only a lock-free atomic operation is permitted in this handler.
-                GENERATION.fetch_add(1, Ordering::Relaxed);
+                FORK_GENERATION.fetch_add(1, Ordering::Relaxed);
             }
             REGISTER.call_once(|| {
                 unsafe extern "C" {
@@ -922,9 +1074,13 @@ impl ProcessIdentity {
                 assert_eq!(result, 0, "could not register JIT fork generation handler");
             });
         }
+        Self::untracked()
+    }
+
+    fn untracked() -> Self {
         Self {
             pid: current_pid(),
-            generation: GENERATION.load(Ordering::Relaxed),
+            generation: FORK_GENERATION.load(Ordering::Relaxed),
         }
     }
 }
@@ -1321,7 +1477,7 @@ mod tests {
             checked_parent.wait();
         });
         drop(lock);
-        // Another thread reporting the same child PID sees the permanent mark.
+        // Another thread reporting the same child identity sees the live mark.
         std::thread::spawn(move || {
             with_test_pid(child_pid, || {
                 assert_eq!(check_jit_allowed(), Err(SharedAddressSpaceChild));
@@ -1329,6 +1485,15 @@ mod tests {
         })
         .join()
         .unwrap();
+        assert_eq!(
+            retire_shared_address_space_child(child_pid),
+            SharedChildRetirement::Retired
+        );
+        assert_eq!(
+            retire_shared_address_space_child(child_pid),
+            SharedChildRetirement::NotFound
+        );
+        with_test_pid(child_pid, || assert_eq!(check_jit_allowed(), Ok(())));
         assert_eq!(CODE_MAP.load(Ordering::Acquire), pointer);
         assert_eq!(map.root.load(Ordering::SeqCst), root);
         assert_eq!(lookup(start + 32), None);
@@ -1341,18 +1506,154 @@ mod tests {
     }
 
     #[test]
-    fn shared_child_table_is_idempotent_and_exhaustion_preserves_entries() {
-        let slots = [AtomicU32::new(0), AtomicU32::new(0)];
+    fn shared_child_table_exhaustion_then_retirement_allows_new_child() {
+        let slots = [const { SharedChildSlot::new() }; SHARED_CHILD_SLOTS];
+        let identity = |pid| ProcessIdentity { pid, generation: 7 };
+        for pid in 1..=SHARED_CHILD_SLOTS as u32 {
+            assert_eq!(mark_identity(&slots, identity(pid)), Ok(()));
+        }
+        let next = identity(SHARED_CHILD_SLOTS as u32 + 1);
+        assert_eq!(mark_identity(&slots, next), Err(SharedChildTableFull));
+        assert_eq!(mark_identity(&slots, identity(1)), Ok(()));
+        assert_eq!(
+            retire_identity(&slots, next),
+            SharedChildRetirement::NotFound
+        );
+        assert_eq!(
+            retire_identity(&slots, identity(1)),
+            SharedChildRetirement::Retired
+        );
+        assert_eq!(mark_identity(&slots, next), Ok(()));
+        assert_eq!(check_identity(&slots, next), Err(SharedAddressSpaceChild));
+        assert_eq!(check_identity(&slots, identity(1)), Ok(()));
+        for pid in 2..=SHARED_CHILD_SLOTS as u32 {
+            assert_eq!(
+                check_identity(&slots, identity(pid)),
+                Err(SharedAddressSpaceChild)
+            );
+        }
+        // A full inherited table must also leave room for a descendant's child.
+        let descendant_child = ProcessIdentity {
+            generation: 8,
+            ..next
+        };
+        assert_eq!(check_identity(&slots, descendant_child), Ok(()));
+        assert_eq!(mark_identity(&slots, descendant_child), Ok(()));
+        assert_eq!(
+            check_identity(&slots, descendant_child),
+            Err(SharedAddressSpaceChild)
+        );
+    }
+
+    #[test]
+    fn shared_child_concurrent_marks_are_all_retired() {
+        let slots = [const { SharedChildSlot::new() }; 2];
+        let identity = ProcessIdentity {
+            pid: 1,
+            generation: 7,
+        };
         std::thread::scope(|scope| {
             for _ in 0..2 {
-                scope.spawn(|| assert_eq!(mark_pid(&slots, 1), Ok(())));
+                scope.spawn(|| assert_eq!(mark_identity(&slots, identity), Ok(())));
             }
         });
-        assert_eq!(mark_pid(&slots, 2), Ok(()));
-        assert_eq!(mark_pid(&slots, 3), Err(SharedChildTableFull));
-        assert_eq!(mark_pid(&slots, 1), Ok(()));
-        assert_eq!(mark_pid(&slots, 2), Ok(()));
-        assert_eq!(slots.map(|slot| slot.load(Ordering::Relaxed)), [1, 2]);
+        assert_eq!(
+            check_identity(&slots, identity),
+            Err(SharedAddressSpaceChild)
+        );
+        assert_eq!(
+            retire_identity(&slots, identity),
+            SharedChildRetirement::Retired
+        );
+        assert!(slots.iter().all(|slot| slot.snapshot().is_none()));
+    }
+
+    #[test]
+    fn copying_descendant_pid_reuse_ignores_inherited_shared_child_marker() {
+        let slots = [SharedChildSlot::new()];
+        let rfmem_child = ProcessIdentity {
+            pid: 42,
+            generation: 7,
+        };
+        mark_identity(&slots, rfmem_child).unwrap();
+        // RFMEM bypasses atfork and observes the parent's generation unchanged.
+        assert_eq!(
+            check_identity(&slots, rfmem_child),
+            Err(SharedAddressSpaceChild)
+        );
+        // A copying fork's atfork child handler bumps its private generation.
+        let descendant = ProcessIdentity {
+            generation: 8,
+            ..rfmem_child
+        };
+        assert_eq!(check_identity(&slots, descendant), Ok(()));
+        assert_eq!(
+            retire_identity(&slots, descendant),
+            SharedChildRetirement::NotFound
+        );
+        assert_eq!(
+            check_identity(&slots, rfmem_child),
+            Err(SharedAddressSpaceChild)
+        );
+    }
+
+    #[test]
+    fn shared_child_slot_versions_reject_aba_reads_and_retirements() {
+        let slots = [SharedChildSlot::new()];
+        let identity = ProcessIdentity {
+            pid: 42,
+            generation: 7,
+        };
+        mark_identity(&slots, identity).unwrap();
+        let stale = slots[0].snapshot().unwrap();
+        let read = slots[0].snapshot_probed(|| {
+            assert_eq!(
+                retire_identity(&slots, identity),
+                SharedChildRetirement::Retired
+            );
+            // Reuse with the exact same identity still has a different slot version.
+            mark_identity(&slots, identity).unwrap();
+        });
+        assert!(read.is_none());
+        assert!(!slots[0].retire(stale));
+        assert_ne!(slots[0].snapshot().unwrap().version, stale.version);
+        assert_eq!(
+            check_identity(&slots, identity),
+            Err(SharedAddressSpaceChild)
+        );
+    }
+
+    #[test]
+    fn interrupted_shared_child_publication_leaves_slot_available() {
+        let slot = SharedChildSlot::new();
+        let interrupted = ProcessIdentity {
+            pid: 42,
+            generation: 7,
+        };
+        let other = ProcessIdentity {
+            pid: 43,
+            ..interrupted
+        };
+        assert!(!slot.insert_probed(interrupted, || {
+            assert!(slot.snapshot().is_none());
+            assert!(slot.insert(other));
+        }));
+        assert_eq!(slot.snapshot().unwrap().identity, other);
+    }
+
+    #[test]
+    fn shared_child_slot_version_never_wraps() {
+        let slot = SharedChildSlot::new();
+        slot.version
+            .store((u32::MAX as u64 - 1) << 32, Ordering::SeqCst);
+        let identity = ProcessIdentity {
+            pid: 42,
+            generation: 7,
+        };
+        assert!(slot.insert(identity));
+        assert!(slot.retire(slot.snapshot().unwrap()));
+        assert!(!slot.insert(identity));
+        assert!(slot.snapshot().is_none());
     }
 
     #[test]

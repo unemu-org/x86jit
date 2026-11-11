@@ -929,10 +929,17 @@ IrOp::Syscall => {
 Process-owned JIT storage and the process code map use PID plus fork generation.
 For a raw host fork that shares the address space, the embedder calls
 `x86jit_core::mark_shared_address_space_child()` on child entry, before engine use
-or starting child threads. A fixed lock-free table retains up to 1024 marked PIDs;
-marks are permanent and repeated marking is idempotent. PID reuse conservatively
-refuses JIT. If the table is full, the child must exit/exec without engine use.
-The PID key distinguishes the child from its parent despite their shared statics,
+or starting child threads. A fixed lock-free table retains up to 1024 live markers,
+keyed by PID plus fork generation; repeated marking is idempotent. After definitive
+child exit/detachment and before PID reuse, the parent calls
+`x86jit_core::retire_shared_address_space_child(pid)` to reclaim the marker.
+Slot versions prevent stale reads or retirements from matching a reused slot.
+Copying-fork descendants ignore inherited markers and reclaim their slots on
+marking because their atfork handler bumps the fork generation.
+Raw-syscall shared-VM children bypass that handler and
+retain the parent's generation. `Vm::child_view` initializes fork tracking in the
+parent. If the table is full, the child must exit/exec without engine use.
+The identity distinguishes the child from its parent despite their shared statics,
 and covers every thread in the child without relying on inherited TLS or locks.
 
 `JitBackend` constructors and `Default` are infallible and defer executable storage
