@@ -319,6 +319,12 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
     memory: &Memory,
     scratch: &mut impl ScratchBuffer,
 ) -> Result<Outcome, Exit> {
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        ir.verify_temp_defs().is_ok(),
+        "undefined interpreter temporary: {:?}",
+        ir.verify_temp_defs()
+    );
     let context = ir.legacy_context.expect("legacy interpreter context");
     if !ir.ops.iter().all(supported) {
         return Err(refusal(

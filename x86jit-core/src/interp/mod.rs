@@ -201,6 +201,12 @@ impl StepContext {
 pub trait ScratchBuffer {
     /// Return `count` zeroed temporary slots, growing storage only when necessary.
     fn zeroed(&mut self, count: usize) -> &mut [u64];
+
+    /// Return initialized slots whose previous values may be retained. The walk
+    /// must define each temporary before reading it (§6, §7.2).
+    fn reused(&mut self, count: usize) -> &mut [u64] {
+        self.zeroed(count)
+    }
 }
 
 impl ScratchBuffer for Vec<u64> {
@@ -561,7 +567,17 @@ fn interpret_block_inner<
     info: &mut RetireInfo,
     steps: &mut StepContext,
 ) -> BlockResult {
-    let temps = scratch.zeroed(ir.temp_count as usize);
+    let temps = if ir.mode == crate::CpuMode::Real16 {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            ir.verify_temp_defs().is_ok(),
+            "undefined interpreter temporary: {:?}",
+            ir.verify_temp_defs()
+        );
+        scratch.reused(ir.temp_count as usize)
+    } else {
+        scratch.zeroed(ir.temp_count as usize)
+    };
     let cur_addr = Cell::new(ir.guest_start);
     let started = Cell::new(1u8);
     // Retired-instruction accounting (§17.6, sub-seam c). `InsnStart` marks the start of
@@ -8184,6 +8200,7 @@ fn trap_out(
 
 // --- register access ---
 
+#[inline(always)]
 pub(crate) fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
     match reg.gpr_index() {
         Some(i) => cpu.gpr[i],
@@ -8202,6 +8219,7 @@ pub(crate) fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
     }
 }
 
+#[inline(always)]
 fn write_reg(cpu: &mut CpuState, reg: Reg, val: u64, size: u8) {
     match reg.gpr_index() {
         Some(i) => cpu.write_gpr(i, val, size),

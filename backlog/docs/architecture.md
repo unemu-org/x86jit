@@ -49,7 +49,7 @@ that changes.
 | `process_barrier` | Fixed per-VM source ordering: Linux/FreeBSD private expedited membarrier; probe failure (including macOS) selects fenced stores and an always-open compiled-store notification gate. Later process-barrier failure runs one lifted block uncached after bounded retries (§10) |
 | `child` | Owned VM snapshot with a lifetime marker, preallocated per-child arena, const-specialized shared lift/interpreter, transactional refusals, written-page reconciliation and static host-fault fixups (decision-15) |
 | `usercopy` | x86-64/AArch64 naked transfer routines, bounded immutable relative fixup table, scalar load/store and CAS, copy and probe operations (§8.1, decision-13) |
-| `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen`; `MemoryAccess` occupies access-op padding and selects cold #SS/#GP exits on a miss; `CheckAlign` raises #GP for required alignment (§6) |
+| `ir` | `IrOp`, `Val`, `Temp`, `Cond`, `MemOrder`, `IrBlock`, `TempGen`; debug/test-only `ir::verify` checks temp definitions before use; `MemoryAccess` occupies access-op padding and selects cold #SS/#GP exits on a miss; `CheckAlign` raises #GP for required alignment (§6) |
 | `lift` | x86 → IR: `lift_block`, operand lowering, `CpuMode` seam, `LiftError` (§7) |
 | `host_write` | Cold host VM write-permission queries after a crossing-store read probe faults (§8.1, decision-13) |
 | `lift::legacy`, `interp::legacy`, `vm::legacy` | Explicit-context I386 real lowering and interpreter, centralized stack/segmented accesses, private per-vCPU cache/epoch; protected execution and event delivery remain refused (decision-18 §§1, 3–4) |

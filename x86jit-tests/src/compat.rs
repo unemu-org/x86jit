@@ -15,7 +15,7 @@ use iced_x86::{
     Code, CpuidFeature, Encoder, FlowControl, Instruction, OpCodeOperandKind, OpKind, Register,
 };
 use serde::{Deserialize, Serialize};
-use x86jit_core::ir::IrOp;
+use x86jit_core::ir::{IrBlock, IrOp};
 use x86jit_core::lift::{lift_block, CpuMode, FetchAddr, LiftError};
 use x86jit_core::{Memory, MemoryModel, Prot, RegionKind};
 
@@ -260,6 +260,14 @@ pub fn probe_code_in(code: Code, mode: CpuMode) -> Option<Probe> {
 }
 
 fn probe_instruction(code: Code, mode: CpuMode) -> Option<Probe> {
+    probe_instruction_with(code, mode, &mut |_, _| {})
+}
+
+fn probe_instruction_with(
+    code: Code,
+    mode: CpuMode,
+    observe: &mut impl FnMut(&IrBlock, Option<u32>),
+) -> Option<Probe> {
     let info = code.op_code();
     let valid_in_mode = match mode {
         CpuMode::Long64 => info.mode64(),
@@ -274,24 +282,36 @@ fn probe_instruction(code: Code, mode: CpuMode) -> Option<Probe> {
     // alternative — the memory form. iced files both under one `Code`, so a probe that
     // only builds the register form reports the whole `Code` as covered even when the
     // lifter rejects `[mem]`.
-    let reg_form = probe_form(code, info.op_count(), mode, None)?;
+    let reg_form = probe_form_with(code, info.op_count(), mode, None, &mut |block| {
+        observe(block, None)
+    })?;
     let mem_idx = (0..info.op_count()).find(|&i| {
         let mut probe = Instruction::default();
         template_operand(&mut probe, i, info.op_kind(i), mode, true).is_ok()
     });
     match (reg_form, mem_idx) {
-        (Probe::Lifted, Some(idx)) => match probe_form(code, info.op_count(), mode, Some(idx)) {
-            // A memory form the encoder rejects is not a gap: this `Code` has none.
-            Some(Probe::Unencodable) | None => Some(Probe::Lifted),
-            Some(Probe::Lifted) => Some(Probe::Lifted),
-            Some(_) => Some(Probe::LiftedRegOnly),
-        },
+        (Probe::Lifted, Some(idx)) => {
+            match probe_form_with(code, info.op_count(), mode, Some(idx), &mut |block| {
+                observe(block, Some(idx))
+            }) {
+                // A memory form the encoder rejects is not a gap: this `Code` has none.
+                Some(Probe::Unencodable) | None => Some(Probe::Lifted),
+                Some(Probe::Lifted) => Some(Probe::Lifted),
+                Some(_) => Some(Probe::LiftedRegOnly),
+            }
+        }
         (other, _) => Some(other),
     }
 }
 
 /// One probe of `code`: every operand a register, except `mem_at` if given.
-fn probe_form(code: Code, op_count: u32, mode: CpuMode, mem_at: Option<u32>) -> Option<Probe> {
+fn probe_form_with(
+    code: Code,
+    op_count: u32,
+    mode: CpuMode,
+    mem_at: Option<u32>,
+    observe: &mut impl FnMut(&IrBlock),
+) -> Option<Probe> {
     let info = code.op_code();
     let mut instr = Instruction::default();
     instr.set_code(code);
@@ -312,10 +332,19 @@ fn probe_form(code: Code, op_count: u32, mode: CpuMode, mem_at: Option<u32>) -> 
         return Some(Probe::Unencodable);
     }
 
-    probe_encoded(code, &bytes, mode)
+    probe_encoded_with(code, &bytes, mode, observe)
 }
 
 fn probe_encoded(code: Code, bytes: &[u8], mode: CpuMode) -> Option<Probe> {
+    probe_encoded_with(code, bytes, mode, &mut |_| {})
+}
+
+fn probe_encoded_with(
+    code: Code,
+    bytes: &[u8],
+    mode: CpuMode,
+    observe: &mut impl FnMut(&IrBlock),
+) -> Option<Probe> {
     // Append a `ret` (0xC3) so a non-terminator probe instruction still closes the
     // block; a terminator probe (jmp/ret/…) ends it itself.
     let mut prog = bytes.to_vec();
@@ -331,6 +360,7 @@ fn probe_encoded(code: Code, bytes: &[u8], mode: CpuMode) -> Option<Probe> {
     }
     match lift_block(&mem, FetchAddr::flat(SCRATCH_BASE), mode) {
         Ok(block) => {
+            observe(&block);
             // Descriptor-dependent forms decode to an exact embedder exit;
             // count them as unsupported execution, despite successful lifting.
             if block
@@ -368,6 +398,30 @@ fn probe_encoded(code: Code, bytes: &[u8], mode: CpuMode) -> Option<Probe> {
         // Unsupported past the probe insn (shouldn't happen with a plain ret), or a
         // decode error on our own bytes: treat as unencodable noise, not a gap.
         Err(_) => Some(Probe::Unencodable),
+    }
+}
+
+/// Verify every block synthesized by the ISA probe, including partial lifts.
+/// Register and memory forms use the coverage probe's scope and selection rules.
+#[cfg(debug_assertions)]
+pub fn verify_probe_temp_defs_in(mode: CpuMode) -> Result<usize, Vec<String>> {
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for code in Code::values().filter(|&code| code_gen(code).is_some()) {
+        probe_instruction_with(code, mode, &mut |block, mem_at| {
+            checked += 1;
+            if let Err(error) = block.verify_temp_defs() {
+                failures.push(format!(
+                    "{mode:?}/{code:?} memory_operand={mem_at:?}: {error:?}, op={:?}",
+                    block.ops[error.op_index]
+                ));
+            }
+        });
+    }
+    if failures.is_empty() {
+        Ok(checked)
+    } else {
+        Err(failures)
     }
 }
 

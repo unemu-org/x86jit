@@ -1594,6 +1594,10 @@ impl Vm {
             interp_scratch: VcpuScratch {
                 values: Box::default(),
                 allocations,
+                #[cfg(test)]
+                fill_before_block: None,
+                #[cfg(test)]
+                block_entries: 0,
             },
             pending_irq: None,
             retired: 0,
@@ -1680,6 +1684,10 @@ struct VcpuAllocations {
 struct VcpuScratch {
     values: Box<[u64]>,
     allocations: Arc<VcpuAllocations>,
+    #[cfg(test)]
+    fill_before_block: Option<u64>,
+    #[cfg(test)]
+    block_entries: u64,
 }
 
 impl VcpuScratch {
@@ -1697,12 +1705,29 @@ impl VcpuScratch {
 impl crate::interp::ScratchBuffer for VcpuScratch {
     #[inline]
     fn zeroed(&mut self, count: usize) -> &mut [u64] {
+        let temps = self.reused(count);
+        temps.fill(0);
+        temps
+    }
+
+    #[inline]
+    fn reused(&mut self, count: usize) -> &mut [u64] {
         if count > self.values.len() {
             self.grow(count);
         }
-        let temps = &mut self.values[..count];
-        temps.fill(0);
-        temps
+        #[cfg(test)]
+        if let Some(pattern) = self.fill_before_block {
+            self.block_entries += 1;
+            for (index, slot) in self.values[..count].iter_mut().enumerate() {
+                *slot = if pattern == 0 {
+                    0
+                } else {
+                    pattern.rotate_left((self.block_entries as u32) % 64)
+                        ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                };
+            }
+        }
+        &mut self.values[..count]
     }
 }
 
@@ -1772,7 +1797,8 @@ pub struct Vcpu {
     /// must not touch a shared line. `run` flushes it into the shared counter.
     chained: u64,
     /// Reused temps buffer for `interpret_block` — grows to the largest block's
-    /// `temp_count` and is zero-filled per block, avoiding a per-dispatch allocation.
+    /// `temp_count`, avoiding a per-dispatch allocation. Real16 blocks define temps
+    /// before use and retain scratch values; other modes zero the buffer per block.
     interp_scratch: VcpuScratch,
     /// Pending maskable hardware-interrupt vector (§17.6, sub-seam c). Set by
     /// [`Vcpu::inject_irq`]; delivered at a `run()` boundary through the real-mode IVT
@@ -4399,6 +4425,232 @@ fn lift_exit(
 
 #[cfg(test)]
 mod tests {
+    use crate::AccessKind;
+
+    #[test]
+    fn real16_slices_ignore_previous_scratch_values() {
+        fn setup() -> (Vm, Vcpu) {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_mode(CpuMode::Real16);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            let mut code = vec![
+                0xb8, 0x34, 0x12, // mov ax,0x1234
+                0xb4, 0xab, // mov ah,0xab
+                0x01, 0xd8, // add ax,bx
+                0xd1, 0xe0, // shl ax,1
+                0xa3, 0, 0x30, // mov [0x3000],ax
+                0x50, 0x5b, // push ax; pop bx
+                0xbe, 0, 0x30, // mov si,0x3000
+                0xbf, 0, 0x40, // mov di,0x4000
+                0xb9, 4, 0, // mov cx,4
+                0xf3, 0xa5, // rep movsw
+            ];
+            let back = (-(code.len() as i16 + 3)).to_le_bytes();
+            code.extend_from_slice(&[0xe9, back[0], back[1]]);
+            vm.write_bytes(0x1000, &code).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Cs, 0x100);
+            cpu.set_reg(Reg::Rsp, 0x8000);
+            cpu.set_reg(Reg::Rax, 0xdead_beef_0000_0000);
+            cpu.set_reg(Reg::Rbx, 0xcafe_babe_0000_0000);
+            cpu.interp_scratch.grow(4096);
+            (vm, cpu)
+        }
+        let (zero_vm, mut zero) = setup();
+        let (dirty_vm, mut dirty) = setup();
+        zero.interp_scratch.fill_before_block = Some(0);
+        dirty.interp_scratch.fill_before_block = Some(0xa5a5_5a5a_dead_beef);
+        for budget in [0, 1, 7, 64, 256].into_iter().cycle().take(100) {
+            let a = zero
+                .run_steps(&zero_vm, budget, StepOptions::default())
+                .unwrap();
+            let b = dirty
+                .run_steps(&dirty_vm, budget, StepOptions::default())
+                .unwrap();
+            assert_eq!(a.steps(), budget);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            assert_eq!(format!("{:?}", zero.cpu), format!("{:?}", dirty.cpu));
+            assert_eq!(zero.retired_instructions(), dirty.retired_instructions());
+            let mut a = [0; 0x6000];
+            let mut b = [0; 0x6000];
+            zero_vm.read_bytes(0x2000, &mut a).unwrap();
+            dirty_vm.read_bytes(0x2000, &mut b).unwrap();
+            assert_eq!(a, b);
+        }
+        assert!(dirty.interp_scratch.block_entries > 100);
+        assert_eq!(
+            zero.interp_scratch.block_entries,
+            dirty.interp_scratch.block_entries
+        );
+    }
+
+    fn scratch_pair(code: &[u8]) -> [(Vm, Vcpu); 2] {
+        [0, 0xa5a5_5a5a_dead_beef].map(|pattern| {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_mode(CpuMode::Real16);
+            for page in (0..0x10000).step_by(4096) {
+                vm.map(page, 4096, Prot::RWX, RegionKind::Ram).unwrap();
+            }
+            vm.write_bytes(0x1000, code).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Cs, 0x100);
+            cpu.set_reg(Reg::Ss, 0x200);
+            cpu.set_reg(Reg::Rsp, 0x800);
+            cpu.interp_scratch.fill_before_block = Some(pattern);
+            (vm, cpu)
+        })
+    }
+
+    fn compare_scratch_steps(pair: &mut [(Vm, Vcpu); 2], budget: u64) -> StepRun {
+        let [(a_vm, a), (b_vm, b)] = pair;
+        let left = a.run_steps(a_vm, budget, StepOptions::default()).unwrap();
+        let right = b.run_steps(b_vm, budget, StepOptions::default()).unwrap();
+        assert_eq!(format!("{left:?}"), format!("{right:?}"));
+        assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu));
+        assert_eq!(a.retired_instructions(), b.retired_instructions());
+        assert_eq!((a.sti_shadow, a.ss_shadow), (b.sti_shadow, b.ss_shadow));
+        assert_eq!(
+            a.interp_scratch.block_entries,
+            b.interp_scratch.block_entries
+        );
+        left
+    }
+
+    fn compare_scratch_memory(pair: &[(Vm, Vcpu); 2], addr: u64, len: usize) {
+        let mut left = vec![0; len];
+        let mut right = vec![0; len];
+        pair[0].0.read_bytes(addr, &mut left).unwrap();
+        pair[1].0.read_bytes(addr, &mut right).unwrap();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn poisoned_scratch_fault_retry_and_x87() {
+        // Fault atomicity/restart: SDM Vol 3A §7.5; x87 memory and pointer
+        // state: Vol 1 §§8.1.8, 8.6. Compare zeroed and poisoned block entries.
+        for (code, ip, access) in [
+            (
+                &[0xb8, 0x34, 0x12, 0xa3, 0, 0x70, 0x43, 0xf4][..],
+                3,
+                AccessKind::Write,
+            ),
+            // fld1; fadd dword [0x7000]; fstp dword [0x6000]; hlt
+            (
+                &[0xd9, 0xe8, 0xd8, 6, 0, 0x70, 0xd9, 0x1e, 0, 0x60, 0xf4],
+                2,
+                AccessKind::Read,
+            ),
+            // fld1; fstp dword [0x7000]; hlt
+            (
+                &[0xd9, 0xe8, 0xd9, 0x1e, 0, 0x70, 0xf4],
+                2,
+                AccessKind::Write,
+            ),
+            // fld1; o32 fnstenv [0x7000]; hlt
+            (
+                &[0xd9, 0xe8, 0x66, 0xd9, 0x36, 0, 0x70, 0xf4],
+                2,
+                AccessKind::Write,
+            ),
+        ] {
+            let mut pair = scratch_pair(code);
+            for (vm, _) in &mut pair {
+                vm.unmap(0x7000, 4096).unwrap();
+            }
+            for attempt in 0..2 {
+                let result = compare_scratch_steps(&mut pair, 16);
+                assert_eq!(result.steps(), u64::from(attempt == 0));
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::UnmappedMemory {
+                    addr: 0x7000, access: actual, ..
+                }) if *actual == access),
+                    "{result:?}"
+                );
+                assert_eq!(pair[0].1.reg(Reg::Rip), ip);
+            }
+            for (vm, _) in &mut pair {
+                vm.map(0x7000, 4096, Prot::RW, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x7000, &2.0_f32.to_le_bytes()).unwrap();
+            }
+            let result = compare_scratch_steps(&mut pair, 16);
+            assert!(matches!(result.stop(), StepStop::Exit(Exit::Hlt)));
+            compare_scratch_memory(&pair, 0x6000, 0x1000);
+            compare_scratch_memory(&pair, 0x7000, 0x1000);
+            if access == AccessKind::Read {
+                let mut value = [0; 4];
+                pair[0].0.read_bytes(0x6000, &mut value).unwrap();
+                assert_eq!(f32::from_le_bytes(value), 3.0);
+            }
+            assert!(pair[1].1.interp_scratch.block_entries >= 3);
+        }
+    }
+
+    #[test]
+    fn poisoned_scratch_mmio_read_write_retries() {
+        // mov ax,[0x7000]; add ax,1; mov [0x7002],ax; hlt
+        let mut pair = scratch_pair(&[0xa1, 0, 0x70, 0x83, 0xc0, 1, 0xa3, 2, 0x70, 0xf4]);
+        for (vm, _) in &mut pair {
+            vm.unmap(0x7000, 4096).unwrap();
+            vm.map(0x7000, 4096, Prot::RW, RegionKind::Trap).unwrap();
+        }
+        let result = compare_scratch_steps(&mut pair, 16);
+        assert_eq!(result.steps(), 0);
+        assert!(matches!(
+            result.stop(),
+            StepStop::Exit(Exit::MmioRead {
+                addr: 0x7000,
+                size: 2,
+                ..
+            })
+        ));
+        for (_, cpu) in &mut pair {
+            cpu.complete_mmio_read(0x1234);
+        }
+        compare_scratch_steps(&mut pair, 0);
+        let result = compare_scratch_steps(&mut pair, 16);
+        assert_eq!(result.steps(), 2);
+        assert!(matches!(
+            result.stop(),
+            StepStop::Exit(Exit::MmioWrite {
+                addr: 0x7002,
+                size: 2,
+                value: 0x1235,
+                ..
+            })
+        ));
+        for (_, cpu) in &mut pair {
+            cpu.complete_mmio_write();
+        }
+        compare_scratch_steps(&mut pair, 0);
+        let result = compare_scratch_steps(&mut pair, 16);
+        assert_eq!(result.steps(), 2);
+        assert!(matches!(result.stop(), StepStop::Exit(Exit::Hlt)));
+        assert_eq!(pair[0].1.reg(Reg::Rax), 0x1235);
+        assert!(pair[1].1.interp_scratch.block_entries >= 3);
+    }
+
+    #[test]
+    fn poisoned_scratch_delivered_divide_and_x87_faults() {
+        // SDM Vol 3A §7.5; Vol 1 §8.6: #DE and pending #MF delivery.
+        for (code, vector) in [(&[0xf6, 0xf3][..], 0), (&[0x9b][..], 16)] {
+            let mut pair = scratch_pair(code);
+            for (vm, cpu) in &mut pair {
+                vm.write_bytes(vector * 4, &[0, 0, 0, 3]).unwrap();
+                vm.write_bytes(0x3000, &[0x43, 0xf4]).unwrap(); // inc bx; hlt
+                if vector == 16 {
+                    cpu.cpu.fpu_cw &= !1;
+                    cpu.cpu.fpu_sw = 0x81;
+                }
+            }
+            let result = compare_scratch_steps(&mut pair, 16);
+            assert!(matches!(result.stop(), StepStop::Exit(Exit::Hlt)));
+            assert_eq!(result.steps(), 2);
+            assert_eq!(pair[0].1.reg(Reg::Rbx), 1);
+            compare_scratch_memory(&pair, 0x2000, 0x1000);
+            assert!(pair[1].1.interp_scratch.block_entries >= 2);
+        }
+    }
+
     #[test]
     fn private_strides_spread_across_sets() {
         for base in [0x10000_u64, 0xffff_8000_0001_0000] {

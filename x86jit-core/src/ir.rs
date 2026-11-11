@@ -1,6 +1,11 @@
 //! Intermediate representation: three-address code over temporaries (§6).
 
-/// A block-local temporary value. Reset per block (§7.2).
+#[cfg(any(debug_assertions, test))]
+mod verify;
+#[cfg(any(debug_assertions, test))]
+pub use verify::UndefinedTemp;
+
+/// A block-local temporary value. Defined before use within each block (§7.2).
 pub type Temp = u32;
 
 /// An IR operand: a prior temporary or a constant.

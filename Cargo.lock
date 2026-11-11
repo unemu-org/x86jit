@@ -881,6 +881,7 @@ name = "x86jit-bench"
 version = "0.3.0"
 dependencies = [
  "iced-x86",
+ "libc",
  "serde",
  "serde_json",
  "x86jit-core",

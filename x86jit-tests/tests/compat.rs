@@ -557,3 +557,23 @@ fn cpuid_sse4a_adx_opt_in_has_complete_lift_coverage() {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn every_probed_block_defines_temps_before_use() {
+    let mut failures = Vec::new();
+    for mode in [
+        x86jit_core::CpuMode::Real16,
+        x86jit_core::CpuMode::Compat32,
+        x86jit_core::CpuMode::Long64,
+    ] {
+        match x86jit_tests::compat::verify_probe_temp_defs_in(mode) {
+            Ok(checked) => {
+                assert!(checked > 1000, "{mode:?}: only {checked} blocks checked");
+                eprintln!("{mode:?}: verified {checked} probe blocks");
+            }
+            Err(errors) => failures.extend(errors),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

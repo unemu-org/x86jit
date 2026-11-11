@@ -18,3 +18,6 @@ x86jit-tests.workspace = true
 iced-x86 = { workspace = true, features = ["code_asm"] }
 serde = { workspace = true }
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

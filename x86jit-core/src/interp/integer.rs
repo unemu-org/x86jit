@@ -4,6 +4,7 @@ use super::*;
 use crate::ir::*;
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_read_reg(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -15,6 +16,7 @@ pub(crate) fn exec_read_reg(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_write_reg(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -28,6 +30,7 @@ pub(crate) fn exec_write_reg(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_add(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -44,6 +47,7 @@ pub(crate) fn exec_add(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_adc(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -61,6 +65,7 @@ pub(crate) fn exec_adc(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_sub(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -77,6 +82,7 @@ pub(crate) fn exec_sub(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_sbb(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -94,6 +100,7 @@ pub(crate) fn exec_sbb(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_and(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -110,6 +117,7 @@ pub(crate) fn exec_and(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_or(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -126,6 +134,7 @@ pub(crate) fn exec_or(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_xor(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -142,6 +151,7 @@ pub(crate) fn exec_xor(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_shl(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -169,6 +179,7 @@ pub(crate) fn exec_shl(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_shr(
     cpu: &mut CpuState,
     temps: &mut [u64],
@@ -244,6 +255,7 @@ pub(crate) fn exec_double_shift(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn exec_sar(
     cpu: &mut CpuState,
     temps: &mut [u64],
