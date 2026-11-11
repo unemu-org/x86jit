@@ -2777,12 +2777,14 @@ pub enum IrOp {
     // compat op hardcodes the ES destination base to 0 and threads only one source
     // base. `ds_base` is the DS-relative *source* base (`selector<<4`, honouring a
     // segment override on the read side of movs/lods/cmps); `es_base` is the ES
-    // *destination* base (`es<<4`, never overridable). Address size is always 16-bit.
+    // *destination* base (`es<<4`, never overridable).
     // Interpreter-only (real mode never reaches the JIT); may trap on a memory access.
     RepStringReal {
         op: StrOp,
         elem: u8,
         rep: RepKind,
+        /// 16 by default, 32 under 67h (ECX/ESI/EDI, wrapping mod 2^32).
+        addr_bits: u8,
         ds_base: Val,
         es_base: Val,
     },

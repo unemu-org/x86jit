@@ -256,7 +256,7 @@ unsafe extern "C" fn div_helper(
 /// # Safety
 /// `cpu`/`mem` are valid pointers to a `CpuState` / `MemCtx` for the call.
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn string_helper(
+unsafe extern "C" fn string_helper<const CHECK_TRAPS: bool>(
     cpu: *mut u8,
     mem: *mut u8,
     op: u64,
@@ -269,9 +269,11 @@ unsafe extern "C" fn string_helper(
 ) -> u64 {
     account_helper!(
         time_enabled,
-        string_helper(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base, 0)
+        string_helper::<CHECK_TRAPS>(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base, 0)
     );
-    use x86jit_core::jit_abi::{MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_UNMAPPED_DETAIL};
+    use x86jit_core::jit_abi::{
+        MemCtx, RET_CONTINUE, RET_INTERRUPTED, RET_MMIO_DEFER, RET_UNMAPPED_DETAIL,
+    };
     use x86jit_core::{RepKind, StrOp};
 
     let cpu = &mut *(cpu as *mut x86jit_core::state::CpuState);
@@ -285,19 +287,31 @@ unsafe extern "C" fn string_helper(
     ][op as usize];
     let rep = [RepKind::None, RepKind::Rep, RepKind::Repe, RepKind::Repne][rep as usize];
 
+    // SAFETY: mem_self retains the live Memory for this helper call.
+    let memory = &*(ctx.mem_self as *const x86jit_core::Memory);
+    if CHECK_TRAPS
+        && x86jit_core::interp::string_touches_trap(
+            cpu,
+            memory,
+            op,
+            elem as u8,
+            rep,
+            addr_bits as u8,
+            seg_base,
+            0,
+        )
+    {
+        cpu.rip = cur_addr;
+        return RET_MMIO_DEFER;
+    }
+
     let raw = x86jit_core::interp::RawStrMem {
-        // SAFETY: mem_self retains the live Memory for this helper call.
-        recover_host_faults: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) }
-            .host_fault_recovery(),
+        recover_host_faults: memory.host_fault_recovery(),
         base: ctx.base as *mut u8,
         size: ctx.size,
         guest_base: ctx.guest_base,
     };
-    let raw = NotifyingStrMem {
-        raw,
-        // SAFETY: mem_self retains the live Memory for this helper call.
-        memory: unsafe { &*(ctx.mem_self as *const x86jit_core::Memory) },
-    };
+    let raw = NotifyingStrMem { raw, memory };
     match x86jit_core::interp::string_run_interruptible(
         cpu,
         &raw,
@@ -4549,7 +4563,7 @@ impl Shared {
                 fp_boundary,
                 flag_elision: self.flag_elision.load(Ordering::Relaxed),
                 div: helper!(div_sig, div_helper),
-                string: helper!(str_sig, string_helper),
+                string: helper!(str_sig, string_helper::<true>),
                 cas_pair: helper!(cas_pair_sig, cas_pair_helper),
                 cpuid: helper!(cpuid_sig, cpuid_helper),
                 tsc: helper!(tsc_sig, tsc_helper),

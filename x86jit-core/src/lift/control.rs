@@ -333,7 +333,9 @@ pub(crate) fn lift_string(
         }
     };
 
-    // SDM Vol 2B, REP, Description/Operation (pp. 4-563/564): the
+    // SDM Vol 2B §4.3, REP Description/Operation (pp. 4-563–4-564),
+    // STOS Description/Operation (pp. 4-676–4-677), MOVS Description/Operation
+    // (pp. 4-104–4-105): in every mode, the
     // address-size attribute selects SI/ESI/RSI, DI/EDI/RDI and CX/ECX/RCX.
     // iced stores implicit string addressing in OpKind, not memory_base().
     let addr_bits: u8 = match (insn.op0_kind(), insn.op1_kind()) {
@@ -369,6 +371,7 @@ pub(crate) fn lift_string(
             op,
             elem,
             rep,
+            addr_bits,
             ds_base,
             es_base,
         });

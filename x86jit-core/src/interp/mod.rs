@@ -762,10 +762,21 @@ fn finish_fault<const STEPPED: bool>(
                 ])
             }
             IrOp::RepStringReal {
-                ds_base, es_base, ..
+                ds_base,
+                es_base,
+                addr_bits,
+                ..
             } => Some([
-                read_val(*ds_base, temps).wrapping_add(cpu.gpr[RSI] & 0xffff),
-                read_val(*es_base, temps).wrapping_add(cpu.gpr[RDI] & 0xffff),
+                string_linear(
+                    cpu.gpr[RSI],
+                    read_val(*ds_base, temps),
+                    string_address_mask(*addr_bits),
+                ),
+                string_linear(
+                    cpu.gpr[RDI],
+                    read_val(*es_base, temps),
+                    string_address_mask(*addr_bits),
+                ),
             ]),
             _ => None,
         });
@@ -4803,6 +4814,7 @@ fn walk_ops<
                 op,
                 elem,
                 rep,
+                addr_bits,
                 ds_base,
                 es_base,
             } => {
@@ -4823,7 +4835,7 @@ fn walk_ops<
                         *elem,
                         *rep,
                         cur_addr.get(),
-                        16,
+                        *addr_bits,
                         read_val(*ds_base, temps),
                         read_val(*es_base, temps),
                         exit_request,
@@ -4845,6 +4857,7 @@ fn walk_ops<
                     op,
                     elem,
                     rep,
+                    addr_bits,
                     ds_base,
                     es_base,
                     exit_request,
@@ -8717,6 +8730,214 @@ fn raw_string_routed(
     )
 }
 
+#[inline(always)]
+fn string_address_mask(addr_bits: u8) -> u64 {
+    match addr_bits {
+        16 => 0xffff,
+        32 => 0xffff_ffff,
+        _ => u64::MAX,
+    }
+}
+
+#[inline(always)]
+fn string_step(elem: u8, df: bool) -> u64 {
+    if df {
+        0u64.wrapping_sub(u64::from(elem))
+    } else {
+        u64::from(elem)
+    }
+}
+
+#[inline(always)]
+fn string_linear(reg: u64, base: u64, amask: u64) -> u64 {
+    base.wrapping_add(reg & amask)
+}
+
+/// Check the potential byte ranges of a string instruction once before its raw
+/// JIT helper. The interpreter and raw helper share the address mask, stride and
+/// linear-address calculation (§16). No guest memory is read or changed here.
+///
+/// SDM Vol 2B §4.3, REP Description/Operation (pp. 4-563–4-564),
+/// MOVS/STOS/LODS/CMPS/SCAS Operation: address size selects indices and count;
+/// DF selects the stride, and only element-start offsets wrap to address size.
+#[allow(clippy::too_many_arguments)]
+pub fn string_touches_trap(
+    cpu: &CpuState,
+    mem: &Memory,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+) -> bool {
+    let amask = string_address_mask(addr_bits);
+    let count = if matches!(rep, RepKind::None) {
+        1
+    } else {
+        cpu.gpr[RCX] & amask
+    };
+    if count == 0 || mem.trap_window().is_none() {
+        return false;
+    }
+    let touches = |reg, base| {
+        string_range_touches_trap(
+            mem,
+            reg,
+            base,
+            amask,
+            elem,
+            count,
+            string_step(elem, cpu.flags.df),
+        )
+    };
+    (matches!(op, StrOp::Movs | StrOp::Lods | StrOp::Cmps) && touches(cpu.gpr[RSI], src_base))
+        || (matches!(op, StrOp::Movs | StrOp::Stos | StrOp::Cmps | StrOp::Scas)
+            && touches(cpu.gpr[RDI], dst_base))
+}
+
+fn string_range_touches_trap(
+    mem: &Memory,
+    reg: u64,
+    base: u64,
+    amask: u64,
+    elem: u8,
+    count: u64,
+    step: u64,
+) -> bool {
+    // Widen only the range arithmetic: a 64-bit REP can cover 2^64 bytes,
+    // and an unaligned last element can extend past the masked offset space.
+    let modulus = u128::from(amask) + 1;
+    let elem = u128::from(elem);
+    let offset = u128::from(string_linear(reg, 0, amask));
+    let residue = offset & (elem - 1);
+    let linear = |lo: u128, end: u128| {
+        let len = end - lo;
+        let first = string_linear(lo as u64, base, u64::MAX);
+        let last = u128::from(first) + len - 1;
+        if len >= 1u128 << 64 {
+            true // At least one device exists; every linear byte is covered.
+        } else if last <= u128::from(u64::MAX) {
+            mem.intersects_trap(first, last as u64)
+        } else {
+            mem.intersects_trap(first, u64::MAX) || mem.intersects_trap(0, last as u64)
+        }
+    };
+    let bytes = u128::from(count) * elem;
+    if bytes >= modulus {
+        return linear(residue, residue + modulus);
+    }
+    let distance = bytes - elem;
+    if step == elem as u64 {
+        let last_start = offset + distance;
+        if last_start < modulus {
+            linear(offset, last_start + elem)
+        } else {
+            linear(offset, modulus + residue) || linear(residue, last_start - modulus + elem)
+        }
+    } else if distance <= offset {
+        linear(offset - distance, offset + elem)
+    } else {
+        linear(residue, offset + elem) || linear(modulus + offset - distance, modulus + residue)
+    }
+}
+
+#[cfg(test)]
+mod string_range_tests {
+    use super::*;
+    use crate::{MemoryModel, Prot, RegionKind};
+
+    #[test]
+    fn trap_ranges_match_individual_transfers_across_wraps() {
+        // SDM Vol 2B §4.3, REP/MOVS Operation: wrap each next index to
+        // address size, then add the segment base; element bytes stay contiguous.
+        let intervals = [(0, 4), (0x20, 0x25), (0xfffe, 0x10002)];
+        let mut mem = Memory::new(MemoryModel::Flat { size: 0x20000 });
+        for (first, end) in intervals {
+            mem.map(first, (end - first) as usize, Prot::RW, RegionKind::Trap)
+                .unwrap();
+        }
+        for bits in [16, 32, 64] {
+            let mask = u64::MAX >> (64 - bits);
+            for elem in [1, 2, 4, 8] {
+                for start in [0, 1, 0x10, 0x1f, 0x25, 0xfffd, mask - 8, mask - 1, mask] {
+                    for base in [0, 0x20, u64::MAX - 0x10] {
+                        for df in [false, true] {
+                            for count in [0, 1, 2, 3, 9] {
+                                let mut cpu = CpuState::new();
+                                cpu.gpr[RCX] = count;
+                                cpu.gpr[RSI] = start;
+                                cpu.flags.df = df;
+                                let mut index = start & mask;
+                                let mut expected = false;
+                                for _ in 0..count {
+                                    let at = base.wrapping_add(index);
+                                    for byte in 0..elem {
+                                        let a = at.wrapping_add(u64::from(byte));
+                                        expected |=
+                                            intervals.iter().any(|&(lo, end)| lo <= a && a < end);
+                                    }
+                                    index = if df {
+                                        index.wrapping_sub(u64::from(elem))
+                                    } else {
+                                        index.wrapping_add(u64::from(elem))
+                                    } & mask;
+                                }
+                                assert_eq!(string_touches_trap(&cpu, &mem, StrOp::Lods, elem, RepKind::Rep, bits, base, 0), expected, "bits={bits} elem={elem} start={start:x} base={base:x} df={df} count={count}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_offset_cycles_and_non_repeated_zero_count() {
+        let mut mem = Memory::new(MemoryModel::Flat { size: 0x10000 });
+        mem.map(0x1234, 1, Prot::RW, RegionKind::Trap).unwrap();
+        let mut cpu = CpuState::new();
+        for bits in [16, 32, 64] {
+            cpu.gpr[RCX] = u64::MAX;
+            for df in [false, true] {
+                cpu.flags.df = df;
+                assert!(string_touches_trap(
+                    &cpu,
+                    &mem,
+                    StrOp::Stos,
+                    8,
+                    RepKind::Rep,
+                    bits,
+                    0,
+                    0
+                ));
+            }
+        }
+        cpu.gpr[RCX] = 0;
+        cpu.gpr[RDI] = 0x1234;
+        assert!(!string_touches_trap(
+            &cpu,
+            &mem,
+            StrOp::Stos,
+            1,
+            RepKind::Rep,
+            64,
+            0,
+            0
+        ));
+        assert!(string_touches_trap(
+            &cpu,
+            &mem,
+            StrOp::Stos,
+            1,
+            RepKind::None,
+            64,
+            0,
+            0
+        ));
+    }
+}
+
 /// A string op stopped on a memory trap. Carries what the caller needs to build the
 /// matching `Exit` (`value`/`elem` matter only for an MMIO write).
 pub struct StrFault {
@@ -8817,7 +9038,23 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
     dst_base: u64,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StringStop> {
-    string_run_specialized::<CHILD, false, false, M>(
+    if !CHILD && cpu.mmio_retry_active {
+        return string_run_specialized::<false, false, true, false, M>(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+            (),
+            (),
+        );
+    }
+    string_run_specialized::<CHILD, false, false, false, M>(
         cpu,
         mem,
         op,
@@ -8852,7 +9089,7 @@ fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: In
     retired: u64,
 ) -> Option<WalkResult> {
     shadows.complete_before(retired);
-    match string_run_specialized::<false, true, STOP_WHEN_IRQ_READY, _>(
+    match string_run_specialized::<false, true, true, STOP_WHEN_IRQ_READY, _>(
         cpu,
         mem,
         op,
@@ -8887,7 +9124,7 @@ fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: In
 // at the same physical address are distinct device obligations. The ordinary
 // vector ledger remains address-keyed; these paths cannot share an owner.
 #[inline(always)]
-fn string_load<const STEPPED: bool, M: StrMem>(
+fn string_load<const MMIO: bool, M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
     rip: u64,
@@ -8895,13 +9132,13 @@ fn string_load<const STEPPED: bool, M: StrMem>(
     addr: u64,
     elem: u8,
 ) -> Result<u64, MemTrap> {
-    if STEPPED {
+    if MMIO {
         if let Some(v) = cpu.mmio_part(rip, slot) {
             return Ok(v);
         }
     }
     match mem.sload(addr, elem) {
-        Err(MemTrap::Mmio) if STEPPED => {
+        Err(MemTrap::Mmio) if MMIO => {
             if let Some(v) = cpu.pending_mmio.take() {
                 let v = v & mask(elem);
                 cpu.record_mmio_part(rip, slot, v);
@@ -8915,7 +9152,7 @@ fn string_load<const STEPPED: bool, M: StrMem>(
 }
 
 #[inline(always)]
-fn string_store<const STEPPED: bool, M: StrMem>(
+fn string_store<const MMIO: bool, M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
     rip: u64,
@@ -8923,11 +9160,11 @@ fn string_store<const STEPPED: bool, M: StrMem>(
     value: u64,
     elem: u8,
 ) -> Result<(), MemTrap> {
-    if STEPPED && cpu.mmio_part(rip, 1).is_some() {
+    if MMIO && cpu.mmio_part(rip, 1).is_some() {
         return Ok(());
     }
     match mem.sstore(addr, value, elem) {
-        Err(MemTrap::Mmio) if STEPPED && cpu.pending_mmio_write => {
+        Err(MemTrap::Mmio) if MMIO && cpu.pending_mmio_write => {
             cpu.pending_mmio_write = false;
             cpu.record_mmio_part(rip, 1, 0);
             Ok(())
@@ -8936,12 +9173,13 @@ fn string_store<const STEPPED: bool, M: StrMem>(
     }
 }
 
-// The unbounded public helpers instantiate false: no per-iteration ledger,
-// answer handling, countdown, or boundary polling is added to their loops.
+// RAM-only execution has no per-iteration ledger or countdown. MMIO retries
+// share the stepped path's transfer slots and end ownership at each element.
 #[allow(clippy::too_many_arguments)]
 fn string_run_specialized<
     const CHILD: bool,
     const STEPPED: bool,
+    const MMIO: bool,
     const STOP_WHEN_IRQ_READY: bool,
     M: StrMem,
 >(
@@ -8958,27 +9196,19 @@ fn string_run_specialized<
     mut budget: impl BudgetState<StepContext>,
     mut inhibition: impl BudgetState<ShadowState>,
 ) -> Option<StringStop> {
-    let step = if cpu.flags.df {
-        (elem as i64).wrapping_neg() as u64
-    } else {
-        elem as u64
-    };
+    let step = string_step(elem, cpu.flags.df);
     let m = mask(elem);
     // Address-size (§17.5): 64-bit (default) uses full RSI/RDI/RCX; a `67h` prefix
     // selects the 32-bit E-regs (mask 0xFFFF_FFFF, upper bits zeroed on write-back)
     // or 16-bit (mask 0xFFFF, upper bits preserved). `amask` bounds the pointer
     // arithmetic and the RCX counter.
-    let amask: u64 = match addr_bits {
-        16 => 0xFFFF,
-        32 => 0xFFFF_FFFF,
-        _ => u64::MAX,
-    };
+    let amask = string_address_mask(addr_bits);
     // Effective linear address of a pointer register at its current (masked) offset:
     // DS-side reads add `src_base` (the FS/GS base under an override in long/compat, or
     // `ds<<4` / the override selector`<<4` in real mode); ES-side (destination) adds
     // `dst_base` (0 in long/compat, `es<<4` in real mode). Offset truncated to width.
-    let src_lin = |reg: u64| src_base.wrapping_add(reg & amask);
-    let dst_lin = |reg: u64| dst_base.wrapping_add(reg & amask);
+    let src_lin = |reg: u64| string_linear(reg, src_base, amask);
+    let dst_lin = |reg: u64| string_linear(reg, dst_base, amask);
     // Advance a pointer register by `step`, wrapping within the address width and
     // writing the result back with the right upper-bits policy: 64-bit → whole reg;
     // 32-bit → zero-extend (upper 32 cleared); 16-bit → merge (upper 48 preserved).
@@ -9018,6 +9248,7 @@ fn string_run_specialized<
         // Relaxed polls only detect requests; the dispatcher consumes with Acquire.
         if !STEPPED
             && !matches!(rep, RepKind::None)
+            && (!MMIO || !cpu.mmio_retry_active)
             && exit_request.is_some_and(|word| {
                 word.load(std::sync::atomic::Ordering::Relaxed) & crate::vm::EXIT_REQUESTED != 0
             })
@@ -9030,7 +9261,7 @@ fn string_run_specialized<
             StrOp::Movs => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);
-                let v = match string_load::<STEPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let v = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -9040,7 +9271,7 @@ fn string_run_specialized<
                         return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
-                if let Err(t) = string_store::<STEPPED, M>(cpu, mem, cur_addr, da, v, elem) {
+                if let Err(t) = string_store::<MMIO, M>(cpu, mem, cur_addr, da, v, elem) {
                     if CHILD {
                         cpu.rip = cur_addr;
                         return Some(StringStop::Interrupted);
@@ -9053,7 +9284,7 @@ fn string_run_specialized<
             StrOp::Stos => {
                 let da = dst_lin(cpu.gpr[RDI]);
                 let v = cpu.gpr[RAX] & m;
-                if let Err(t) = string_store::<STEPPED, M>(cpu, mem, cur_addr, da, v, elem) {
+                if let Err(t) = string_store::<MMIO, M>(cpu, mem, cur_addr, da, v, elem) {
                     if CHILD {
                         cpu.rip = cur_addr;
                         return Some(StringStop::Interrupted);
@@ -9064,7 +9295,7 @@ fn string_run_specialized<
             }
             StrOp::Lods => {
                 let sa = src_lin(cpu.gpr[RSI]);
-                let v = match string_load::<STEPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let v = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -9079,7 +9310,7 @@ fn string_run_specialized<
             }
             StrOp::Scas => {
                 let da = dst_lin(cpu.gpr[RDI]);
-                let b = match string_load::<STEPPED, M>(cpu, mem, cur_addr, 1, da, elem) {
+                let b = match string_load::<MMIO, M>(cpu, mem, cur_addr, 1, da, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -9096,7 +9327,7 @@ fn string_run_specialized<
             StrOp::Cmps => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);
-                let a = match string_load::<STEPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let a = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -9106,7 +9337,7 @@ fn string_run_specialized<
                         return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
-                let b = match string_load::<STEPPED, M>(cpu, mem, cur_addr, 1, da, elem) {
+                let b = match string_load::<MMIO, M>(cpu, mem, cur_addr, 1, da, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -9122,12 +9353,14 @@ fn string_run_specialized<
                 cpu.gpr[RDI] = advance(cpu.gpr[RDI]);
             }
         }
-        if STEPPED {
-            let steps = budget.get();
-            let shadows = inhibition.get();
+        if MMIO {
             // Decision-16 §3: iteration ownership ends even at unchanged REP IP.
             // The two transfer slots distinguish MOVS/CMPS operands at equal addresses.
             cpu.clear_mmio_parts();
+        }
+        if STEPPED {
+            let steps = budget.get();
+            let shadows = inhibition.get();
             if !matches!(rep, RepKind::None) {
                 steps.charge();
                 if STOP_WHEN_IRQ_READY {

@@ -43,6 +43,7 @@ IrBlock {
             op: Movs,
             elem: 2,
             rep: Rep,
+            addr_bits: 16,
             ds_base: Temp(
                 1,
             ),

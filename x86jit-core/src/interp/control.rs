@@ -203,7 +203,7 @@ pub(crate) fn exec_rep_string<const ROUTED: bool>(
 
 /// Real-mode (§17.6) string op: like [`exec_rep_string`] but with both segment bases
 /// resolved (`ds<<4` source, `es<<4` dest, already computed into the temps). Address
-/// size is always 16-bit. `string_run_interruptible` honours the ES destination
+/// size follows the decoded instruction. `string_run_interruptible` honours the ES destination
 /// base (the long/compat caller passes 0).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
@@ -214,6 +214,7 @@ pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
     op: &StrOp,
     elem: &u8,
     rep: &RepKind,
+    addr_bits: &u8,
     ds_base: &Val,
     es_base: &Val,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
@@ -227,7 +228,7 @@ pub(crate) fn exec_rep_string_real<const ROUTED: bool>(
         *elem,
         *rep,
         cur_addr,
-        16,
+        *addr_bits,
         ds_base,
         es_base,
         exit_request,

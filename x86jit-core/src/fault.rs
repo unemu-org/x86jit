@@ -988,11 +988,17 @@ impl InstructionFaultInfo {
                         m.rep = Some((*op, *elem, *addr_bits));
                     }
                 }
-                IrOp::RepStringReal { op, elem, rep, .. } => {
+                IrOp::RepStringReal {
+                    op,
+                    elem,
+                    rep,
+                    addr_bits,
+                    ..
+                } => {
                     m.writes |= matches!(op, StrOp::Movs | StrOp::Stos);
                     m.operand_size = Knowledge::Known(u16::from(*elem));
                     if !matches!(rep, RepKind::None) {
-                        m.rep = Some((*op, *elem, 16));
+                        m.rep = Some((*op, *elem, *addr_bits));
                     }
                 }
                 IrOp::PortString {

@@ -932,6 +932,8 @@ pub struct Memory {
     // (`region_at` is `&self`); only ever a hint, so `Relaxed` and staleness are fine.
     last_region: AtomicUsize,
     recover_host_faults: bool,
+    // Sorted, non-overlapping [start, end) device intervals, built at map time.
+    trap_intervals: Vec<(u64, u64)>,
 }
 
 // SAFETY: concurrent guest stores are intended to race like real hardware; the
@@ -1410,6 +1412,7 @@ impl Memory {
             model,
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
+            trap_intervals: Vec::new(),
             code_page,
             code_aliases: Mutex::new(CodeAliases::default()),
             code_tag_epoch: AtomicU64::new(0),
@@ -1489,6 +1492,12 @@ impl Memory {
     }
 
     fn with_regions(mut self, regions: Vec<Region>) -> Self {
+        self.trap_intervals = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::Trap && r.size != 0)
+            .map(|r| (r.start, r.start + r.size as u64))
+            .collect();
+        self.trap_intervals.sort_unstable();
         self.regions = regions;
         self
     }
@@ -2196,15 +2205,25 @@ impl Memory {
     /// (the interpreter handles RAM), only slightly slower. `None` means zero
     /// per-access cost, the common case.
     pub fn trap_window(&self) -> Option<(u64, u64)> {
-        let mut lo = u64::MAX;
-        let mut hi = 0u64;
-        for r in &self.regions {
-            if matches!(r.kind, RegionKind::Trap) {
-                lo = lo.min(r.start);
-                hi = hi.max(r.start.saturating_add(r.size as u64));
-            }
+        Some((
+            self.trap_intervals.first()?.0,
+            self.trap_intervals.last()?.1,
+        ))
+    }
+
+    /// Whether the inclusive, non-wrapping byte range intersects a device.
+    /// O(log T) comparisons over T sorted Trap intervals; no allocation or lock.
+    pub fn intersects_trap(&self, first: u64, last: u64) -> bool {
+        debug_assert!(first <= last);
+        if self.trap_intervals.is_empty() {
+            return false;
         }
-        (lo < hi).then_some((lo, hi))
+        let i = self
+            .trap_intervals
+            .partition_point(|&(_, end)| end <= first);
+        self.trap_intervals
+            .get(i)
+            .is_some_and(|&(start, _)| start <= last)
     }
 
     /// Reserve a region. In `Flat` this only tags `[guest_addr, guest_addr+size)`
@@ -2255,6 +2274,12 @@ impl Memory {
                     prot,
                     kind,
                 });
+                if kind == RegionKind::Trap && size != 0 {
+                    let i = self
+                        .trap_intervals
+                        .partition_point(|&(start, _)| start < guest_addr);
+                    self.trap_intervals.insert(i, (guest_addr, end));
+                }
                 // Guard pages: open the region's host pages. No-op unless the backing
                 // installed a protect hook.
                 self.reprotect(guest_addr, size, true);
@@ -2331,7 +2356,13 @@ impl Memory {
             .position(|r| r.start == guest_addr && r.size == size)
         {
             Some(pos) => {
-                self.regions.remove(pos);
+                let region = self.regions.remove(pos);
+                if region.kind == RegionKind::Trap && size != 0 {
+                    let i = self
+                        .trap_intervals
+                        .partition_point(|&(start, _)| start < guest_addr);
+                    self.trap_intervals.remove(i);
+                }
                 let end = guest_addr.saturating_add(size as u64);
                 let pages = code_page_range(guest_addr, size as u64);
                 let removed: BTreeSet<_> = self
@@ -3845,6 +3876,34 @@ mod tests {
         m.map(0x200, 0x10, Prot::RW, RegionKind::Trap).unwrap();
         assert!(matches!(m.read(0x200, 4), Err(MemTrap::Mmio)));
         assert!(matches!(m.write(0x200, 0, 4), Err(MemTrap::Mmio)));
+    }
+
+    #[test]
+    fn trap_intervals_track_mapping_clone_and_unmap() {
+        let mut m = flat(0x1000);
+        m.map(0x600, 0x10, Prot::RW, RegionKind::Trap).unwrap();
+        m.map(0x200, 0x10, Prot::RW, RegionKind::Trap).unwrap();
+        m.map(0x400, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x800, 0, Prot::RW, RegionKind::Trap).unwrap();
+        assert_eq!(m.trap_window(), Some((0x200, 0x610)));
+        for (first, last, expected) in [
+            (0, 0x1ff, false),
+            (0x1ff, 0x200, true),
+            (0x20f, 0x20f, true),
+            (0x210, 0x5ff, false),
+            (0x210, 0x600, true),
+            (0x610, u64::MAX, false),
+        ] {
+            assert_eq!(m.intersects_trap(first, last), expected);
+        }
+        let copy = m.deep_copy().unwrap();
+        assert!(copy.intersects_trap(0x200, 0x200));
+        m.unmap(0x200, 0x10).unwrap();
+        assert!(!m.intersects_trap(0x200, 0x200));
+        assert_eq!(m.trap_window(), Some((0x600, 0x610)));
+        m.unmap(0x600, 0x10).unwrap();
+        assert!(m.trap_window().is_none());
+        assert!(!m.intersects_trap(0, u64::MAX));
     }
 
     #[test]

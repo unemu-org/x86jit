@@ -2985,11 +2985,14 @@ impl Vcpu {
                 if !DEFAULT {
                     fp_mode.default();
                 }
-                // Finish the pending instruction before honouring a host request.
+                // Finish the pending transfer before honouring a host request at
+                // an instruction or REP element boundary (SDM Vol 2B §4.3,
+                // REP Description/Operation, pp. 4-563–4-564).
                 let mut info = crate::interp::RetireInfo {
                     consistency: vm.consistency,
                     sti_shadow: self.sti_shadow,
                     ss_shadow: self.ss_shadow,
+                    exit_request: Some(exit_word),
                     ..Default::default()
                 };
                 let instruction_rip = self.cpu.rip;
@@ -3019,6 +3022,15 @@ impl Vcpu {
                     }
                     StepResult::Exit(Exit::Syscall) => {
                         return Ok(self.syscall(crate::FaultPath::Interpreter, instruction_rip));
+                    }
+                    StepResult::Exit(Exit::Interrupted) => {
+                        return Ok(self.interrupted(
+                            crate::FaultPath::Helper {
+                                family: crate::FaultHelper::String,
+                                caller: crate::HelperCaller::Interpreter,
+                            },
+                            false,
+                        ));
                     }
                     StepResult::Exit(exit) => {
                         return Ok(crate::fault::qualify_real16(exit, &self.cpu))

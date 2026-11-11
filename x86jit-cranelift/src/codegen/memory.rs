@@ -160,6 +160,7 @@ impl Translator<'_, '_> {
             StrOp::Stos => GuestAccessKind::Write,
             StrOp::Lods | StrOp::Scas | StrOp::Cmps => GuestAccessKind::Read,
         };
+        // Memory-level remapping can change Trap intervals after compilation.
         let inst = self.call_memory_helper(self.helpers.string, &args, Some(access));
         let code = self.builder.inst_results(inst)[0];
         let stopped = self
