@@ -33,6 +33,9 @@ application_codegen::relocated_codegen_witnesses!();
 mod batch_tests;
 #[cfg(feature = "jit")]
 mod code_memory;
+#[cfg(test)]
+#[path = "../tests/support/code_memory.rs"]
+mod code_memory_probe;
 mod codegen;
 #[cfg(test)]
 mod embedder_tests;
@@ -43,6 +46,9 @@ mod lock_telemetry;
 mod memory_stats;
 pub mod perfmap;
 mod reclamation;
+#[cfg(test)]
+#[path = "../tests/support/stress.rs"]
+mod stress;
 mod unwind;
 
 pub use reclamation::{CodeLifecycleEvent, CodeLifecycleKind};

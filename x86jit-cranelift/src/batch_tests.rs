@@ -794,62 +794,70 @@ fn deferred_teardown_owns_code_until_held_execution_releases() {
 
 #[test]
 fn repeated_automatic_reclamation_bounds_all_metadata_including_ibtc() {
-    let (mem, _) = fixture();
-    mem.write_bytes(0x1000, &[0x48, 0x8b, 0x04, 0x25, 0, 0x30, 0, 0, 0xff, 0xe0])
-        .unwrap();
-    let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
-    let jit = JitBackend::new();
-    let mut bounds = None;
-    for cycle in 0..64 {
-        let block = jit.materialize(&ir, MemConsistency::Fast, None, 0);
-        let CachedBlock::Compiled { entry } = block.clone() else {
-            panic!("compiled unit")
-        };
-        let mut participant = jit.shared.lifetime.participant();
-        let held = participant.enter();
-        let slot = jit.shared.jit(0).functions[&entry.generation()].slots[0].clone();
-        let descriptor = jit.shared.lifetime.alloc_ibtc_descriptor(0x1000, entry);
-        slot.store(descriptor, Ordering::Release);
-        jit.shared.lifetime.discard(&block);
-        assert_eq!(slot.load(Ordering::SeqCst), 0);
-        assert_eq!(jit.memory_stats().code_ibtc_descriptors, 1);
-        // SAFETY: the held participant pins the immutable descriptor after unlinking.
-        assert_eq!(
-            unsafe { *(descriptor as *const [u64; 2]) },
-            [0x1000, entry.0 as u64]
-        );
-        drop(held);
-        wait_reclaimed(&jit.shared);
-        let stats = jit.memory_stats();
-        assert_eq!(stats.code_bytes_used, 0, "cycle {cycle}");
-        assert_eq!(stats.code_ibtc_descriptors, 0);
-        assert_eq!(stats.code_units_live + stats.code_units_retired, 0);
-        let metadata = x86jit_core::codemap::memory_stats();
-        assert_eq!(
-            metadata.nodes
-                + metadata.entries
-                + metadata.sources
-                + metadata.traps
-                + metadata.recipes
-                + metadata.instructions,
-            0
-        );
-        let retained = (
-            metadata.writer_storage,
-            stats.code_allocation_metadata_bytes,
-        );
-        if cycle > 3 {
-            assert_eq!(Some(retained), bounds, "cycle {cycle}");
-        }
-        bounds = Some(retained);
-        let module = jit.shared.jit(0);
-        assert!(module.functions.is_empty());
-        assert!(module.pending_slots.is_empty());
-        assert!(module.slots.is_empty());
-        assert_eq!(module.module.declarations().get_functions().count(), 1);
-        assert!(jit.shared.retirement_announced.lock().unwrap().is_empty());
-        assert!(jit.shared.retired_metadata.lock().unwrap().is_empty());
-    }
+    // This witness asserts process-global code-map totals. Other libtest cases
+    // may own live code, so use the same isolated process as the stress suite.
+    crate::stress::isolated(
+        "batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc",
+        |deadline| {
+            let (mem, _) = fixture();
+            mem.write_bytes(0x1000, &[0x48, 0x8b, 0x04, 0x25, 0, 0x30, 0, 0, 0xff, 0xe0])
+                .unwrap();
+            let ir = lift_block(&mem, FetchAddr::flat(0x1000), CpuMode::Long64).unwrap();
+            let jit = JitBackend::new();
+            let mut bounds = None;
+            for cycle in 0..64 {
+                crate::stress::remaining(deadline);
+                let block = jit.materialize(&ir, MemConsistency::Fast, None, 0);
+                let CachedBlock::Compiled { entry } = block.clone() else {
+                    panic!("compiled unit")
+                };
+                let mut participant = jit.shared.lifetime.participant();
+                let held = participant.enter();
+                let slot = jit.shared.jit(0).functions[&entry.generation()].slots[0].clone();
+                let descriptor = jit.shared.lifetime.alloc_ibtc_descriptor(0x1000, entry);
+                slot.store(descriptor, Ordering::Release);
+                jit.shared.lifetime.discard(&block);
+                assert_eq!(slot.load(Ordering::SeqCst), 0);
+                assert_eq!(jit.memory_stats().code_ibtc_descriptors, 1);
+                // SAFETY: the held participant pins the immutable descriptor after unlinking.
+                assert_eq!(
+                    unsafe { *(descriptor as *const [u64; 2]) },
+                    [0x1000, entry.0 as u64]
+                );
+                drop(held);
+                wait_reclaimed(&jit.shared);
+                let stats = jit.memory_stats();
+                assert_eq!(stats.code_bytes_used, 0, "cycle {cycle}");
+                assert_eq!(stats.code_ibtc_descriptors, 0);
+                assert_eq!(stats.code_units_live + stats.code_units_retired, 0);
+                let metadata = x86jit_core::codemap::memory_stats();
+                assert_eq!(
+                    metadata.nodes
+                        + metadata.entries
+                        + metadata.sources
+                        + metadata.traps
+                        + metadata.recipes
+                        + metadata.instructions,
+                    0
+                );
+                let retained = (
+                    metadata.writer_storage,
+                    stats.code_allocation_metadata_bytes,
+                );
+                if cycle > 3 {
+                    assert_eq!(Some(retained), bounds, "cycle {cycle}");
+                }
+                bounds = Some(retained);
+                let module = jit.shared.jit(0);
+                assert!(module.functions.is_empty());
+                assert!(module.pending_slots.is_empty());
+                assert!(module.slots.is_empty());
+                assert_eq!(module.module.declarations().get_functions().count(), 1);
+                assert!(jit.shared.retirement_announced.lock().unwrap().is_empty());
+                assert!(jit.shared.retired_metadata.lock().unwrap().is_empty());
+            }
+        },
+    );
 }
 
 #[test]

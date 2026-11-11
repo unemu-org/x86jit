@@ -33,6 +33,8 @@ case "$step" in
     deny) gate_command+=(cargo deny --all-features check licenses bans sources) ;;
     tests)
         export SS286_REQUIRED=1
+        # nextest.toml serializes code-memory campaigns and reserves the global
+        # test budget while each runs; the soak and 100,000-unit bound are ignored.
         gate_command+=(cargo nextest run --locked --workspace --features x86jit-tests/unicorn
             --no-fail-fast --success-output final -E 'not binary(fuzz_robustness)')
         ;;

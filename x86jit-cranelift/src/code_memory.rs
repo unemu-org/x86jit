@@ -973,6 +973,22 @@ impl JITMemoryProvider for CodeMemory {
 mod os {
     use super::*;
 
+    // mach/vm_statistics.h: application-specific VM tag, preserved in region
+    // queries even when an allocation fails before it reaches provider accounting.
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    const ANONYMOUS_FD: i32 = libc::VM_MEMORY_APPLICATION_SPECIFIC_16 << 24;
+    #[cfg(not(target_os = "macos"))]
+    const ANONYMOUS_FD: i32 = -1;
+
+    #[cfg(all(test, not(target_os = "macos")))]
+    fn observe_mapping(ptr: *mut libc::c_void, len: usize) {
+        crate::code_memory_probe::observe_mapping(ptr as usize, len);
+    }
+
+    #[cfg(any(not(test), target_os = "macos"))]
+    fn observe_mapping(_: *mut libc::c_void, _: usize) {}
+
     pub(super) fn reserve_anonymous(len: usize, counters: &CodeCounters) -> io::Result<usize> {
         let ptr = operation(counters, CodeMemoryFailureOp::ReserveAddressSpace, || {
             // SAFETY: the kernel chooses a fresh address; no descriptor or fixed
@@ -986,13 +1002,14 @@ mod os {
                     // mergeable without per-frontier private COW identities.
                     // No descriptor is created in the process descriptor table.
                     libc::MAP_SHARED | libc::MAP_ANON,
-                    -1,
+                    ANONYMOUS_FD,
                     0,
                 )
             };
             if ptr == libc::MAP_FAILED {
                 Err(io::Error::last_os_error())
             } else {
+                observe_mapping(ptr, len);
                 Ok(ptr)
             }
         })?;
@@ -1167,6 +1184,7 @@ mod os {
                     if ptr == libc::MAP_FAILED {
                         Err(io::Error::last_os_error())
                     } else {
+                        observe_mapping(ptr, len);
                         Ok(ptr)
                     }
                 })?;
@@ -1180,12 +1198,13 @@ mod os {
                         total,
                         libc::PROT_NONE,
                         libc::MAP_PRIVATE | libc::MAP_ANON,
-                        -1,
+                        ANONYMOUS_FD,
                         0,
                     );
                     if reservation == libc::MAP_FAILED {
                         Err(io::Error::last_os_error())
                     } else {
+                        observe_mapping(reservation, total);
                         Ok(reservation)
                     }
                 })?;
@@ -1480,7 +1499,7 @@ mod os {
                             RESERVATION,
                             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                             libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                            -1,
+                            ANONYMOUS_FD,
                             0,
                         )
                     };
@@ -1582,7 +1601,7 @@ mod os {
                     len,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_SHARED | libc::MAP_ANON,
-                    -1,
+                    ANONYMOUS_FD,
                     align,
                     counters,
                     CodeMemoryFailureOp::MapWritable,
@@ -1680,6 +1699,7 @@ mod os {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stress;
     #[cfg(target_os = "macos")]
     #[test]
     fn empty_map_jit_logical_regions_pass_between_provider_owners() {
@@ -1720,6 +1740,227 @@ mod tests {
         let stats = counters.snapshot();
         assert_eq!(stats.code_last_failure_op, op as u32);
         assert_eq!(stats.code_last_failure_errno, errno);
+    }
+
+    #[test]
+    fn repeated_provider_step_failures_leave_no_allocations() {
+        stress::isolated(
+            "code_memory::tests::repeated_provider_step_failures_leave_no_allocations",
+            |deadline| {
+                #[cfg(target_os = "macos")]
+                if !os::jit_write_protection_supported() {
+                    eprintln!("SKIP dense failure witness: per-thread JIT write protection unsupported; system-provider fallback applies");
+                    return;
+                }
+                let mut mapping_ops = vec![
+                    CodeMemoryFailureOp::ReserveAddressSpace,
+                    CodeMemoryFailureOp::MapWritable,
+                    CodeMemoryFailureOp::ExcludeFromFork,
+                ];
+                #[cfg(target_os = "macos")]
+                mapping_ops.extend([
+                    CodeMemoryFailureOp::RemapReadOnly,
+                    CodeMemoryFailureOp::ProtectReadOnly,
+                ]);
+                #[cfg(not(target_os = "macos"))]
+                mapping_ops.extend([
+                    CodeMemoryFailureOp::ObjectCreate,
+                    CodeMemoryFailureOp::ObjectSize,
+                    CodeMemoryFailureOp::MapExecutable,
+                ]);
+                let page = region::page::size();
+                let mut unrelated = memmap2::MmapMut::map_anon(27 * page).unwrap();
+                let unrelated_ptr = unrelated.as_mut_ptr();
+                let _mapping_watch = crate::code_memory_probe::MappingWatch::new();
+                let before = crate::code_memory_probe::resources();
+                let mut warmed = None;
+                for cycle in 0..13 {
+                    // Split unrelated memory into more VM entries after every
+                    // sample, reproducing lazy allocator/thread mapping noise.
+                    // SAFETY: a page wholly inside the retained unrelated map;
+                    // no references access it after its protection changes.
+                    assert_eq!(
+                        unsafe {
+                            libc::mprotect(
+                                unrelated_ptr.add(2 * cycle * page).cast(),
+                                page,
+                                libc::PROT_READ,
+                            )
+                        },
+                        0
+                    );
+                    for op in mapping_ops.iter().copied() {
+                        stress::remaining(deadline);
+                        let counters = Arc::new(CodeCounters::default());
+                        let mut memory = CodeMemory::new(counters.clone());
+                        let errno = [libc::ENOMEM, libc::EMFILE, libc::EACCES][cycle % 3];
+                        inject(op, errno);
+                        assert!(memory
+                            .allocate(
+                                64,
+                                (4 * region::page::size()) as u64,
+                                JITMemoryKind::ReadOnly
+                            )
+                            .is_err());
+                        assert_failure(&counters, op, errno);
+                        assert!(memory.regions.is_empty());
+                        assert!(memory.allocations.is_empty());
+                        assert!(memory.allocation_by_rx.is_empty());
+                        // A subsequent allocation must survive the failed attempt's
+                        // cleanup and remain usable, including its final alias.
+                        let rw = memory.allocate(64, 16, JITMemoryKind::ReadOnly).unwrap();
+                        memory
+                            .with_write_access(&mut || {
+                                // SAFETY: writable extent owned by this raw provider.
+                                unsafe {
+                                    rw.write_bytes(cycle as u8, 64);
+                                }
+                            })
+                            .unwrap();
+                        memory.finalize(BranchProtection::None).unwrap();
+                        if cycle == 0 {
+                            let live = crate::code_memory_probe::resources();
+                            assert!(
+                                live.mappings >= 2,
+                                "both provider aliases must be visible: {live:?}"
+                            );
+                        }
+                        // SAFETY: finalized readable alias of the owned allocation.
+                        assert_eq!(
+                            unsafe { memory.executable_ptr(rw).read_volatile() },
+                            cycle as u8
+                        );
+                        release(&mut memory, rw);
+                        // SAFETY: no pointers escaped or code was registered.
+                        unsafe {
+                            memory.free_memory();
+                        }
+                        assert_eq!(counters.snapshot().code_bytes_used, 0);
+                        assert_eq!(counters.snapshot().code_bytes_committed, 0);
+                        assert_eq!(counters.snapshot().code_bytes_reserved, 0);
+                    }
+                    for op in [
+                        CodeMemoryFailureOp::ReserveAddressSpace,
+                        CodeMemoryFailureOp::ExcludeFromFork,
+                        CodeMemoryFailureOp::CommitAnonymous,
+                        CodeMemoryFailureOp::SealAnonymous,
+                        CodeMemoryFailureOp::CacheMaintenance,
+                        CodeMemoryFailureOp::PipelineSync,
+                    ] {
+                        stress::remaining(deadline);
+                        let (counters, mut memory) =
+                            anonymous_memory(CodeMemoryPolicy::WriteXorExecute);
+                        inject(op, libc::ENOMEM);
+                        match memory.allocate(64, 16, JITMemoryKind::Executable) {
+                            Ok(rw) => {
+                                assert!(memory.finalize(BranchProtection::None).is_err());
+                                assert_failure(&counters, op, libc::ENOMEM);
+                                release(&mut memory, rw);
+                            }
+                            Err(_) => assert_failure(&counters, op, libc::ENOMEM),
+                        }
+                        // SAFETY: failed raw allocations never escape to execution.
+                        unsafe {
+                            memory.free_memory();
+                        }
+                        assert!(memory.allocations.is_empty());
+                        assert!(memory.allocation_by_rx.is_empty());
+                        let stats = counters.snapshot();
+                        assert_eq!(stats.code_allocation_failures, 1);
+                        assert_eq!(
+                            stats.code_bytes_used
+                                + stats.code_bytes_committed
+                                + stats.code_bytes_reserved,
+                            0
+                        );
+                    }
+                    if cycle == 0 {
+                        warmed = Some(crate::code_memory_probe::resources());
+                    }
+                }
+                let after = crate::code_memory_probe::resources();
+                let warmed = warmed.unwrap();
+                eprintln!(
+                    "MEASURED OS resources before={before:?} warmed={warmed:?} after={after:?}"
+                );
+                assert_eq!(after.descriptors, warmed.descriptors, "descriptor leak");
+                assert!(
+                    after.mappings <= warmed.mappings,
+                    "mapping leak: {warmed:?} -> {after:?}"
+                );
+                assert!(
+                    after.mapped_bytes <= warmed.mapped_bytes,
+                    "mapped-byte leak: {warmed:?} -> {after:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn repeated_decommit_failures_reuse_and_eventually_discard_pages() {
+        stress::isolated(
+            "code_memory::tests::repeated_decommit_failures_reuse_and_eventually_discard_pages",
+            |deadline| {
+                #[cfg(target_os = "macos")]
+                if !os::jit_write_protection_supported() {
+                    eprintln!("SKIP dense decommit witness: per-thread JIT write protection unsupported; system-provider fallback applies");
+                    return;
+                }
+                let counters = Arc::new(CodeCounters::default());
+                let mut memory = CodeMemory::new(counters.clone());
+                let page = region::page::size();
+                let anchor = memory
+                    .allocate(page, page as u64, JITMemoryKind::Executable)
+                    .unwrap();
+                for cycle in 0..48 {
+                    stress::remaining(deadline);
+                    let rw = memory
+                        .allocate(page, page as u64, JITMemoryKind::Executable)
+                        .unwrap();
+                    memory
+                        .with_write_access(&mut || {
+                            // SAFETY: unpublished page within this provider's write window.
+                            unsafe {
+                                rw.write_bytes(cycle as u8, page);
+                            }
+                        })
+                        .unwrap();
+                    memory.finalize(BranchProtection::None).unwrap();
+                    inject(CodeMemoryFailureOp::DecommitPages, libc::EIO);
+                    release(&mut memory, rw);
+                    assert_failure(&counters, CodeMemoryFailureOp::DecommitPages, libc::EIO);
+                    assert_eq!(counters.snapshot().code_bytes_committed, (2 * page) as u64);
+                    let reused = memory
+                        .allocate(page, page as u64, JITMemoryKind::Executable)
+                        .unwrap();
+                    assert_eq!(reused, rw);
+                    memory
+                        .with_write_access(&mut || {
+                            // SAFETY: fresh identity owns this reused page.
+                            unsafe {
+                                reused.write_bytes(0x5a, page);
+                            }
+                        })
+                        .unwrap();
+                    memory.finalize(BranchProtection::None).unwrap();
+                    // SAFETY: finalized readable executable alias.
+                    assert_eq!(
+                        unsafe { memory.executable_ptr(reused).read_volatile() },
+                        0x5a
+                    );
+                    release(&mut memory, reused);
+                    assert_discarded(rw as usize, page);
+                    assert_eq!(counters.snapshot().code_bytes_committed, page as u64);
+                }
+                release(&mut memory, anchor);
+                assert_eq!(counters.snapshot().code_bytes_committed, 0);
+                assert_eq!(counters.snapshot().code_allocation_failures, 48);
+                // SAFETY: every never-published allocation has been returned.
+                unsafe {
+                    memory.free_memory();
+                }
+            },
+        );
     }
 
     fn fixture(jit: crate::JitBackend) -> x86jit_core::Vm {
@@ -3387,6 +3628,10 @@ mod tests {
         fn allocation_generation(&self, executable: *const u8) -> Option<u64> {
             self.memory.allocation_generation(executable)
         }
+        unsafe fn release_allocation(&mut self, executable: *const u8, generation: u64) -> bool {
+            // SAFETY: forwarded module retirement contract; these fixtures never execute.
+            unsafe { self.memory.release_allocation(executable, generation) }
+        }
         fn supports_relocation(&self, kind: Reloc) -> bool {
             self.memory.supports_relocation(kind)
         }
@@ -3489,6 +3734,122 @@ mod tests {
             );
             m.free_memory();
         }
+    }
+
+    #[test]
+    fn byte_definitions_are_counted_through_retirement_and_redefinition() {
+        let (mut m, _) = module(true);
+        let sig = m.make_signature();
+        let anchor = m.declare_function("anchor", Linkage::Local, &sig).unwrap();
+        let reused = m.declare_function("reused", Linkage::Local, &sig).unwrap();
+        m.define_function_bytes(anchor, 16, &[0; 16], &[]).unwrap();
+        assert_eq!(m.defined_function_count(), 1, "pending anchor definition");
+        m.finalize_definitions().unwrap();
+        for _ in 0..32 {
+            m.define_function_bytes(reused, 16, &[0; 16], &[]).unwrap();
+            assert_eq!(m.defined_function_count(), 2, "pending replacement");
+            m.finalize_definitions().unwrap();
+            assert_eq!(m.defined_function_count(), 2, "finalized replacement");
+            let entry = m.get_finalized_function(reused);
+            let generation = m.get_finalized_function_generation(reused).unwrap();
+            // SAFETY: fixture bytes are never executed or registered, and no
+            // relocation or external consumer refers to the retired definition.
+            unsafe {
+                m.retire_function_definition(reused);
+                assert_eq!(
+                    m.defined_function_count(),
+                    1,
+                    "live anchor after retirement"
+                );
+                assert!(m.release_function_allocation(entry, generation));
+            }
+            assert_eq!(m.declarations().get_functions().count(), 2);
+        }
+        // SAFETY: neither fixture definition has any execution or readers.
+        unsafe { m.free_memory() };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn native_alias_relocations_survive_retirement_and_reuse() {
+        stress::isolated(
+            "code_memory::tests::native_alias_relocations_survive_retirement_and_reuse",
+            |deadline| {
+                // Unlike the read-only dual-view byte fixtures, this path uses the
+                // production executable alias and its actual publication protocol.
+                let (mut m, observed) = module(false);
+                let sig = m.make_signature();
+                let anchor = m.declare_function("anchor", Linkage::Local, &sig).unwrap();
+                let target = m.declare_function("target", Linkage::Local, &sig).unwrap();
+                let caller = m.declare_function("caller", Linkage::Local, &sig).unwrap();
+                m.define_function_bytes(anchor, 16, &[0; 16], &[]).unwrap();
+                m.finalize_definitions().unwrap();
+                let mut previous = None;
+                for cycle in 0..32 {
+                    stress::remaining(deadline);
+                    m.define_function_bytes(target, 16, &[0; 16], &[]).unwrap();
+                    let name = ModuleRelocTarget::user(0, target.as_u32());
+                    m.define_function_bytes(
+                        caller,
+                        16,
+                        &[0; 16],
+                        &[
+                            ModuleReloc {
+                                offset: 0,
+                                kind: Reloc::Abs8,
+                                name: name.clone(),
+                                addend: cycle,
+                            },
+                            ModuleReloc {
+                                offset: 8,
+                                kind: Reloc::X86PCRel4,
+                                name,
+                                addend: -4,
+                            },
+                        ],
+                    )
+                    .unwrap();
+                    m.finalize_definitions().unwrap();
+                    let target_rx = m.get_finalized_function(target);
+                    let caller_rx = m.get_finalized_function(caller);
+                    let target_generation = m.get_finalized_function_generation(target).unwrap();
+                    let caller_generation = m.get_finalized_function_generation(caller).unwrap();
+                    let pairs = observed.pairs.lock().unwrap();
+                    let pair = pairs[pairs.len() - 1];
+                    assert_ne!(pair.0, pair.1);
+                    assert_eq!(pair.1, caller_rx as usize);
+                    drop(pairs);
+                    if let Some((address, generation)) = previous {
+                        assert_eq!(caller_rx as usize, address);
+                        assert_ne!(caller_generation, generation);
+                    }
+                    previous = Some((caller_rx as usize, caller_generation));
+                    // SAFETY: finalized readable bytes; no fixture code is executed.
+                    unsafe {
+                        assert_eq!(
+                            caller_rx.cast::<u64>().read_unaligned(),
+                            target_rx as u64 + cycle as u64
+                        );
+                        assert_eq!(
+                            caller_rx.add(8).cast::<i32>().read_unaligned() as isize,
+                            target_rx as isize - 4 - (caller_rx as isize + 8)
+                        );
+                        // Clear both records before releasing either relocation target.
+                        m.retire_function_definition(caller);
+                        m.retire_function_definition(target);
+                        assert!(m.release_function_allocation(caller_rx, caller_generation));
+                        assert!(m.release_function_allocation(target_rx, target_generation));
+                        assert!(!m.release_function_allocation(caller_rx, caller_generation));
+                    }
+                    assert_eq!(m.defined_function_count(), 1);
+                    assert_eq!(m.declarations().get_functions().count(), 3);
+                }
+                // SAFETY: anchor also has no execution, readers or external consumers.
+                unsafe {
+                    m.free_memory();
+                }
+            },
+        );
     }
 
     #[test]

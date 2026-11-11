@@ -1,0 +1,10 @@
+# These tests spawn bounded subprocess workloads. Reserve the global thread
+# budget as well as serializing the group, so other workspace tests cannot load
+# a running campaign. This also covers test-only raw-provider campaigns.
+[test-groups.code-memory-stress]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(x86jit-cranelift) & (binary(code_memory_stress) | binary(code_memory_fault_stress) | binary(code_memory_bound) | test(code_memory::tests::repeated_) | test(batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc))'
+test-group = 'code-memory-stress'
+threads-required = 'num-test-threads'

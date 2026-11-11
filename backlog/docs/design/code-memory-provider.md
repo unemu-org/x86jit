@@ -1,12 +1,13 @@
-# Dense JIT code memory — decision-17 phases 2 and 3
+# Dense JIT code memory — decision-17 phases 2–4
 
-Implementation and validation on 2026-11-10. Phase 1 baseline: `c161085`.
+Implementation and validation on 2026-11-10–11. Phase 1 baseline: `c161085`.
 **MEASURED** means executed locally; **READ** means checked in source or API
 contracts; **ASSUMED** identifies platform behavior still requiring native coverage.
 
 **Current contract:** [Final phase 3 ownership and maintenance](#final-phase-3-ownership-and-maintenance)
 supersedes the incremental boundaries and remaining-work lists in the historical
-handoffs below. Phase 4 stress/platform validation belongs to `xj-2jb.5`.
+handoffs below. [Phase 4 stress/platform evidence](#phase-4-bounded-stress-and-platform-coverage-2026-11-11)
+records the bounded campaigns and the remaining native platform gaps for `xj-2jb.5`.
 
 ## Provider startup fallback and diagnostics (READ)
 
@@ -1605,3 +1606,202 @@ original baseline thread count after shutdown, before forking and after rebuild.
 Deferred teardown witnesses wait for provider counters as well as weak-owner
 expiry: a weak upgrade can fail while the final destructor is still releasing
 its logical regions. A 129-unit witness covers more than one 64-candidate batch.
+
+## Phase 4 bounded stress and platform coverage (2026-11-11)
+
+**READ — test contract.** The new `code_memory_stress` and
+`code_memory_fault_stress` binaries isolate campaigns with a fresh executable
+process. Normal cases have both fixed iteration limits and an 80-second
+cooperative deadline; the parent kills/reaps a stuck child after 90 seconds,
+including a compiler/collector deadlock. This leaves margin for loaded CI
+containers. Each child has at most four threads, including the idle libtest
+driver. Commands run one binary at a time with one parent test thread (at most
+six parent/child threads), two Cargo build jobs and `timeout 180`. Nextest's
+`code-memory-stress` group has `max-threads = 1`; each member reserves the global
+`num-test-threads` budget, excluding concurrent workspace tests. The ignored
+`dense_reclamation_soak` uses 2,048 cycles and a 120-second watchdog; the packed
+100,000-unit bound is also ignored because its standalone debug run took 40.88 s.
+The normal gate retains the 512-unit packed bound. Commands and CI notes are in
+[commands.md](../commands.md#bounded-code-memory-campaigns).
+
+The multi-vCPU campaigns retain an execution participant through calls while
+the other vCPU compiles and publishes a replacement, modifies guest instruction
+bytes, dispatches the new generation, and retires the old entries. They check
+fresh results, stale-generation rejection, ordered Publish/Retire/Release events,
+actual dense address reuse, automatic collection, final zero commitment and
+Linux/FreeBSD region release. Both vCPU dispatchers reuse their fast caches
+across SMC epochs. Foreground tier replacement shares the backend
+with a second executing CPU; a separate background campaign deterministically
+invalidates the source generation before admitting each completed compilation.
+A release/acquire gate deterministically starts an admitted old-generation call
+after that generation's retirement. Dense-only campaigns print a skip when macOS
+per-thread JIT write protection is unavailable; the fault campaign still checks
+recovery through the system fallback and skips its dense-reuse assertion.
+Anonymous W^X campaigns quiesce the last unit each cycle so the sealed reservation
+can release as a whole; they do not assume individual anonymous holes are reusable.
+The public no-fd option still uses MAP_JIT on macOS, as required by its contract.
+
+Mapping/RSS samples at sixteenth-window intervals after the first quarter use
+the OS probe, independently of provider counters. Bounds are: at most two
+logical regions, used code below
+1 MiB, commitment below 4 MiB, resident code below 8 MiB, code views no greater
+than `2 * provider_mapping_views + 2`, and process mapping entries/RSS no greater
+than the first warmed sample plus 64 entries/32 MiB. The process-entry bound also
+catches growth outside the current live code ranges. Linux additionally checks
+code PSS against commitment plus two host pages, including shared backing aliases.
+The last quarter's mean process RSS and mapping count must also stay within
+1 MiB and four entries of the preceding quarter's means. Lifecycle accounting
+removes each released generation immediately, asserts at most 16 outstanding
+phases, and retains only the last 16 publication addresses plus scalar totals;
+its storage does not grow with cycle count. These small-live-set churn bounds
+complement the optional 100,000-unit packed allocation bound; they are not
+estimates for an embedder's working set.
+
+The relaxed publication witness recompiles 128 distinct return values into the
+same executable address. The fixed executable address is handed off before the
+consumer starts; only each reuse's version notification uses a relaxed atomic.
+Acknowledgment precedes retirement. It tests the provider/entry instruction
+visibility protocol without an acquire handoff on reuse masking stale instructions.
+
+The recovery campaign faults 48 times inside changing guest instructions in
+reused executable storage while a foreground compiler performs 192 independent
+retirement cycles on the same backend. It checks the current guest RIP, preserved
+registers, raw host address, landing-pad return and successful retry. Each cycle
+also delivers SIGUSR1 with a nested SIGUSR2; both handlers query the signal-safe
+code map. This exercises nested handlers, but does not deterministically interrupt
+another reader inside its atomic validation sequence or simulate nonlocal escape.
+A separate deterministic witness uses a test-only traversal hook to hold an outer
+code-map reader across a nested signal handler's reader. While both remain held,
+the driver retires the sampled unit and removes its range. Automatic maintenance
+is parked by the worker policy, allowing 32 complete explicit collector passes;
+none may emit Release or reduce that unit's allocated bytes. After both readers
+exit, explicit collection must release the storage. No execution participant is
+held in this witness.
+
+Raw-provider campaigns repeat mapping-step failures with ENOMEM/EMFILE/EACCES,
+anonymous reserve/commit/seal/cache/pipeline failures, and decommit EIO followed
+by safe reuse and a successful discard. They verify hook consumption, original
+errno, empty allocation indexes, zero retained commitment/reservation after
+cleanup and successful allocation after failed construction. Independent process
+mapping and descriptor counts are captured before warm-up, after one complete
+warm-up pass, and after twelve further passes. Final descriptors must equal the
+warmed count; mapping entries may grow by at most two. Linux uses `/proc/self/maps`
+and `/proc/self/fd`; macOS walks Mach VM regions; FreeBSD uses libutil's
+`kinfo_getvmmap`. Both BSD targets probe descriptor validity with `fcntl`.
+These probes live in test code, outside the production environment boundary.
+The preserved library witnesses cover the other platform-specific steps (including macOS
+MAP_JIT/write protection, Linux personality and system-provider fallback); a
+process-global first-MAP_JIT failure still requires its fresh-process witness.
+The worker-creation campaign alternates EAGAIN on maintenance and compiler
+creation, asserting exhaustion with no executable publication.
+
+**READ — native alias fixture.** On Linux/FreeBSD,
+`native_alias_relocations_survive_retirement_and_reuse` repeats 32 real RW/RX
+provider finalizations with nonzero alias offsets, absolute and cross-unit PC
+relative relocation bytes, declaration retirement and generation-checked extent
+reuse. Both referencing definitions retire before either target is released.
+It inspects relocated bytes; the existing arm64 veneer fixture supplies the
+complementary direct-call/veneer byte witness. Neither byte fixture claims guest
+execution. Native compilation/execution is covered by the separate stress binary
+when run on that platform.
+
+**MEASURED — macOS arm64, Rust 1.98.1, debug, 16 KiB pages:**
+
+| Added campaign | Iterations | Body runtime |
+|---|---:|---:|
+| Dense multi-vCPU SMC/tier replacement/reuse | 96 | 3.142 s |
+| Public no-fd multi-vCPU SMC/release (MAP_JIT here) | 96 | 4.435 s |
+| Rejected background completion during SMC | 64 | 0.288 s |
+| Relaxed handoff at the same executable address | 128 | 2.034 s |
+| Maintenance/compiler creation failure | 24 | 0.007 s |
+| Real fault recovery and nested signal pairs | 48 | 2.744 s |
+| Provider-step failure/cleanup campaign | 12 passes per reachable step | 0.009 s |
+| Decommit failure/reuse/discard | 48 | 0.005 s |
+| Native Linux/FreeBSD executable alias relocations | 32 | Not run here |
+| Ignored dense reclamation soak (explicit invocation) | 2,048 | 59.606 s |
+
+The dense run published 194 units with 189 repeated addresses; the recovery run
+reused fault-entry addresses 46 times. Dense samples stayed at one code mapping,
+16,384 resident code bytes and bounded process entries/RSS (see the soak below).
+The earlier 96-cycle sample had 215–216 entries and 13,254,656–13,336,576 RSS
+bytes. The no-fd option also stayed at one MAP_JIT view; this is not evidence for
+native anonymous W^X mapping behavior on Linux/FreeBSD. The preserved packed
+bound passed all four cases in 39.82 s: its 100,000-unit sample had one code entry,
+4,472,832 resident code bytes and 105,889,792 process RSS bytes. The preserved
+`region_fault_state --features unicorn` suite passed 26 cases in 26.41 s.
+
+**MEASURED defect and fix:** the first `--lib --test-threads 2` run failed the
+process-global zero-metadata assertion in
+`batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc`
+with 598 live metadata bytes belonging to another test. Isolating that witness
+preserves the exact zero assertion and eliminates inter-test contamination.
+The corrected library run passed 178 cases, with four existing ignored cases,
+in 9.69 s. No provider/runtime defect was observed in these campaigns.
+
+**MEASURED soak:** the explicit ignored-test command passed all 2,048 cycles,
+publishing 4,098 units and reusing addresses 4,093 times. Samples from cycle 24
+through 2,040 stayed at one code mapping and 16,384 resident code bytes, with
+213–216 process entries and 13,549,568–14,368,768 RSS bytes. The 819,200-byte RSS
+increase includes the test's retained lifecycle-event log. Final live/retired
+gauges, used bytes and commitment were zero. The soak remains ignored in the
+normal gate, with its explicit 120-second watchdog.
+
+**MEASURED compile/lint gates:** Rust 1.98.1 workspace/test checks passed for
+`aarch64-unknown-linux-gnu` (36.54 s), `x86_64-unknown-linux-gnu` (37.52 s),
+`aarch64-unknown-freebsd` (34.30 s) and `x86_64-unknown-freebsd` (36.34 s).
+Workspace clippy with all targets/features and `-D warnings`, `fmt --check`, and
+the final warm reruns of all four cross-target checks passed. Linux and
+FreeBSD runtime results remain unavailable; these checks include compilation of
+the new native alias fixture, not its execution.
+
+**Coverage limits:** local runtime evidence is macOS arm64 only. Native Linux
+arm64/x86-64 and FreeBSD arm64/x86-64 mapping, alias backing discard, PSS/unique
+backing, signals, fault recovery and instruction visibility remain **ASSUMED**
+until the corresponding binaries run there. Cross-target checks are compilation
+evidence only. FreeBSD lacks an OS mapping/RSS probe in these tests, so its
+campaigns check provider counters and region release but cannot claim an OS
+residency bound even when executed. Existing native Linux CI lanes discover the
+new binaries; no native FreeBSD runner or hosted macOS gate is configured.
+Immediate macOS RSS removal after MADV_FREE, sustained external signal storms,
+fork/unwind under reclamation load, release-profile performance/codegen review
+and the Linux real-program ladder are not claimed by this run.
+The preserved library unwind and fence witnesses run as part of the library gate.
+
+
+### Stress witness review, round 2 (2026-11-11)
+
+**MEASURED — macOS arm64, Rust 1.98.1, debug, 16 KiB pages.** Normal runtime
+code is unchanged; the only core addition is a traversal hook behind
+`test-hooks`. Every temporary mutation below was restored before final checks.
+
+| Review item | Change and passing witness | Negative control (MEASURED) |
+|---|---|---|
+| Relaxed republication | Fixed address established before consumer start; 128 same-address values pass in 2.132 s. Only the reuse version is relaxed. | Suppressing the compiled-blob copy whenever an executable address had already been written returns 1 when 2 is expected. This checks stale contents; it does not claim that removing one cache barrier alone fails on this host. |
+| Capability guard | Raw decommit/failure and dense stress witnesses print a reason and skip dense assertions without macOS per-thread JIT protection. Fault recovery keeps exercising fallback. | Forcing the capability query to false passes with the printed skip; bypassing the raw decommit guard then fails on `Unsupported`. This is a simulated unavailable capability, not a native unsupported-platform run. |
+| Nested readers and provider grace | Two nested reader sections span retirement and range removal; 32 synchronous collector passes retain storage until both exit. | Bypassing `!removal.is_complete()` in the collector emits Release while readers remain held (1 observed, 0 expected). Automatic maintenance is parked during explicit collection, eliminating collector reentry as an alternative explanation. |
+| OS cleanup | Before/warmed/final mapping counts are 200/200/200; descriptors are 3/3/3. The environment-boundary test passes. | Omitting `munmap(rw, len)` after a failed macOS read-only remap grows warmed/final mappings from 200 to 213. Injecting a leaked `dup(0)` per mapping-step attempt grows descriptors from 8 to 68. Both assertions fail independently of provider counters. |
+| Scheduler and long bound | Nextest enumerates the stress/fault/bound binaries, isolated library campaigns, soak and 100,000-unit case in the one-slot group. Each test also reserves the global thread budget. Normal deadlines are 80/90 s. The standalone 100,000-unit test passes in 40.88 s and is now ignored, with an explicit run command. | Replacing the group filter with `none()` makes the membership check fail for the raw-provider, nested-reader, soak and 100,000-unit cases. This checks configuration membership; concurrent scheduler overlap was not injected. |
+| RSS plateau and bounded bookkeeping | Last-quarter mean growth is bounded by 1 MiB and four mappings. Released lifecycle phases are removed and only 16 recent addresses are retained. Normal dense/anonymous runs grow by 16,384/0 bytes. | Retaining 128 KiB per cycle grows late RSS by 3,178,496 bytes and fails the plateau check while remaining below the earlier 32 MiB allowance. |
+| Execution after retirement | Every campaign cycle executes an admitted old generation after retirement; dense and anonymous normal runs each witness 96 such calls. | Bypassing the collector's execution-grace check fails the admitted worker's assertion that its unit remains retired before the post-retirement call. |
+
+The explicit 2,048-cycle soak passes in **35.263 s**, with 4,098 publications,
+4,093 reused addresses, 2,048 post-retirement calls and **49,152 bytes** of
+late-quarter mean RSS growth. Previous/final-quarter mean mapping counts are
+213/214. Lifecycle bookkeeping stays bounded for the whole run.
+
+Final native checks pass: stress 5 cases (soak ignored), fault stress 7 cases,
+Cranelift library 178 cases (4 ignored), normal packed bound 3 cases (100,000-unit
+case ignored), core code-map 37 cases, environment boundary 1 case and
+`region_fault_state --features unicorn` 26 cases. Workspace/all-target/all-feature
+Clippy passes with `-D warnings`; formatting and whitespace checks pass. A targeted
+Nextest run with a global budget of two passes three tests across the bound,
+fault-stress and publication-stress binaries through the configured group.
+Workspace/test cross-checks pass for x86-64 and arm64 Linux (Rust 1.96.1) and
+FreeBSD (Rust 1.98.1). Native Linux/FreeBSD execution remains unmeasured here.
+
+Commands used one stress binary at a time, one parent test thread and two Cargo
+build jobs. The first normal stress invocation used two parent test threads;
+it was subsequently rerun serially, as were the mutations, soak and final checks.
+The sandbox rejected `nice`'s priority change, so commands invoked through `nice`
+ran at the permitted priority. Cross-compilation does not establish native
+mapping, signal or instruction-visibility behavior on another platform.

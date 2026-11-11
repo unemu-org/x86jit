@@ -646,6 +646,10 @@ impl Module for JITModule {
         let (ptr, size) = (blob.ptr(), blob.size());
         self.record_function_for_perf(ptr, size, &decl.linkage_name(id));
 
+        let range_start = ptr.addr();
+        let range_end = range_start + size;
+        self.code_ranges.insert(range_start, (range_end, id));
+
         self.functions_to_finalize.push(id);
 
         Ok(())

@@ -69,6 +69,44 @@ outside it, and the script says so every time it finishes.
 `--rev` pins the *recompiler*; the userland is always the working tree next door, so
 a harness change and the engine change it exercises can be tested together.
 
+## Bounded code-memory campaigns
+
+Run one binary at a time on shared hosts, with one parent test thread and a
+180-second command timeout. Isolated children use two libtest threads, keeping
+the active parent and child to at most six threads. Normal stress cases have
+fixed iteration limits, an 80-second cooperative deadline and a 90-second
+subprocess watchdog, allowing margin for loaded CI containers. Each workload
+uses at most four child-process threads, including the idle libtest driver and
+backend compiler/maintenance threads. Watchdog parents only poll. No native
+platform result is implied by a cross-check. The design doc records measured
+and missing coverage.
+
+```sh
+export CARGO_TARGET_DIR=/private/tmp/xj-2jb5-target RUSTC_WRAPPER= CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_stress -- --test-threads 1 --nocapture
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_fault_stress -- --test-threads 1 --nocapture
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --lib -- --test-threads 1
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_bound -- --test-threads 1
+timeout 180 nice -n 10 cargo --offline test -p x86jit-tests --test region_fault_state --features unicorn -- --test-threads 1
+# Optional packed-storage bound (100,000 units; ignored with the soak):
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_bound hundred_thousand_units_have_bounded_mappings_and_residency -- --ignored --exact --test-threads 1 --nocapture
+# Optional longer soak: 2048 cycles, at most four child threads, 120s watchdog.
+timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_stress dense_reclamation_soak -- --ignored --exact --test-threads 1 --nocapture
+```
+
+**CI notes (READ):** the workspace nextest gate discovers the stress binaries on
+native Linux x86-64 and arm64 runners. `.config/nextest.toml` puts the stress,
+fault-stress and bound binaries plus isolated library campaigns in a group with
+`max-threads = 1`. Each selected test reserves `num-test-threads` globally, so
+other workspace tests cannot run alongside it. The soak and 100,000-unit bound
+remain ignored. The latter took 40.88 seconds alone on macOS arm64 in debug;
+normal gates retain the 512-unit bound.
+The library alias-relocation campaign is enabled only on Linux/FreeBSD and uses
+the real executable aliases, finalization and per-allocation retirement. FreeBSD
+cross jobs compile the stress and signal paths but cannot exercise mappings,
+backing discard, instruction visibility or signal delivery. There is no native
+FreeBSD CI runner. macOS runtime validation remains a separate native gate.
+
 ## Release-profile runs
 
 `cargo nextest run` builds the **dev** profile, so every test exercises the engine at

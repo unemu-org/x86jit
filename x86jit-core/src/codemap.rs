@@ -1307,6 +1307,14 @@ pub fn register(
     writer_code_map()?.register(start, code_len, table, guest_rips)
 }
 
+/// Test-only traversal hook called while the process-global reader is held.
+/// A callback used in a signal handler must itself be async-signal-safe.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn lookup_probed_for_test(pc: usize, visit: impl FnMut()) -> Option<u64> {
+    code_map().lookup_probed(pc, visit)
+}
+
 /// Look a host PC up in the process-global map (see [`CodeMap::lookup`]).
 pub fn lookup(pc: usize) -> Option<u64> {
     code_map().lookup(pc)

@@ -164,8 +164,9 @@ The package is named `x86jit-cranelift-jit` so embedders also resolve the explic
 path dependency when this workspace is consumed as a dependency; a root-only
 Cargo patch would not propagate. The local changes add dual addresses, scoped
 writes, provider relocation validation, allocation-generation queries and
-finalized-definition retirement, never-published-definition discard and cleanup
-of failed blob initialization (decision-17), plus a narrow system-provider
+finalized-definition retirement, never-published-definition discard, cleanup
+of failed blob initialization and code-range entries for functions defined from
+bytes (decision-17), plus a narrow system-provider
 publication callback that reports protection/cache/pipeline errors as
 `ModuleError::Allocation` instead of panicking or returning `Backend`. The callback
 lets `x86jit-cranelift` attach operation/errno diagnostics and inject failures at

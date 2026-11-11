@@ -84,6 +84,7 @@ fn check_no_fd_batched_bound(units: usize) {
 }
 
 #[test]
+#[ignore = "100,000-unit storage bound; explicit command in backlog/docs/commands.md"]
 fn hundred_thousand_units_have_bounded_mappings_and_residency() {
     check_no_fd_batched_bound(100_000);
 }

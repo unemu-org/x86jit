@@ -129,6 +129,13 @@ code-map ranges after execution grace, and releases compiler/provider storage
 after signal-reader grace. Deferred teardown retains compiler and helper state
 until both complete. See [the code-memory contract](design/code-memory-provider.md#final-phase-3-ownership-and-maintenance).
 
+The backend's `tests/code_memory_stress.rs` exercises concurrent execution,
+publication, SMC, tier replacement and reuse; `tests/code_memory_fault_stress.rs`
+uses the shared test-only signal adapter for real recovery during reclamation.
+`tests/support/stress.rs` isolates each campaign and enforces its process deadline.
+Raw provider failure and alias-relocation campaigns remain in `code_memory` unit
+tests so failure hooks do not become production API.
+
 ## Layering rules
 
 - `x86jit-core` depends on `iced-x86` only. No cranelift, no memmap2 in core.
