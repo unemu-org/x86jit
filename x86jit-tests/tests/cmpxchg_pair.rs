@@ -305,11 +305,40 @@ fn cmpxchg_pair_host_backing_alignment() {
     }
 }
 
-#[cfg(any(feature = "unicorn", all(target_arch = "x86_64", target_os = "linux")))]
+#[cfg(feature = "unicorn")]
+fn unicorn_cache_info_available() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        // Unicorn 2.1.4 init_cache_info falls back to MRS CTR_EL0 when this
+        // query fails or returns zero. In a sandbox denying the query (EPERM),
+        // that instruction (0xd53b0028) raises SIGILL during uc_mem_map.
+        let mut size: libc::c_long = 0;
+        let mut len = std::mem::size_of_val(&size);
+        // SAFETY: size and len are writable buffers of the requested sizes;
+        // the NUL-terminated name is static and no new value is supplied.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"hw.cachelinesize".as_ptr(),
+                (&raw mut size).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size == 0 {
+            eprintln!("Unicorn comparison skipped: hw.cachelinesize is unavailable");
+            return false;
+        }
+    }
+    true
+}
+
 #[test]
 fn cmpxchg_pair_matches_oracles() {
     use x86jit_tests::oracle::{run_with_backend, VectorInput};
-    use x86jit_tests::vector::{CpuSnapshot, MemChunk, MemKind, RunSpec, SnapFlags};
+    use x86jit_tests::vector::{CpuSnapshot, ExitKind, MemChunk, MemKind, RunSpec, SnapFlags};
+    #[cfg(feature = "unicorn")]
+    let unicorn_available = unicorn_cache_info_available();
     for wide in [false, true] {
         for locked in [false, true] {
             for case in 0..3 {
@@ -351,10 +380,13 @@ fn cmpxchg_pair_matches_oracles() {
                     entry: 0x21_0000,
                     run: RunSpec::UntilExit,
                 };
-                for backend in backends() {
+                let interp = run_with_backend(&input, Box::new(InterpreterBackend));
+                assert!(matches!(interp.exit, ExitKind::Hlt));
+                for backend in backends().into_iter().skip(1) {
                     let got = run_with_backend(&input, backend);
+                    assert_eq!(x86jit_tests::compare::compare(&interp, &got, &[]), None);
                     #[cfg(feature = "unicorn")]
-                    {
+                    if unicorn_available {
                         use x86jit_tests::oracle::Oracle;
                         let witness = x86jit_tests::unicorn::UnicornOracle.run(&input);
                         assert_eq!(x86jit_tests::compare::compare(&witness, &got, &[]), None);
