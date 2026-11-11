@@ -1,7 +1,10 @@
 //! Legacy system interpreter, selected before the op loop (decision-18 §§1, 4;
 //! spec.md §§8.1, 17). Shared scalar helpers retain their existing flag semantics.
 use super::*;
-use crate::legacy::{self, ControlRegister, LegacyOp as L, MachineContext, SegmentId};
+use crate::legacy::{
+    self, ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
+    SelectorDestination, SystemRegister,
+};
 
 #[derive(Default)]
 pub(crate) struct Outcome {
@@ -250,25 +253,42 @@ const DESCRIPTOR_RETRY: u64 = 1 << 62;
 const TRANSFER_IP_RETRY: u64 = DESCRIPTOR_RETRY | (1 << 33);
 const TRANSFER_CS_RETRY: u64 = TRANSFER_IP_RETRY | 1;
 
+fn descriptor_address(cpu: &CpuState, value: u16) -> Option<u32> {
+    // SDM Vol 3A §§3.4.2, 3.5.1; 286 PRM §6.6.2 pp. 6-12–13;
+    // 386 PRM §§5.1.1–5.1.2, 6.3.1.2: the last descriptor byte must
+    // lie inside the selected table. Only GDT index zero is null.
+    let offset = u32::from(value & !7);
+    let (base, limit) = if value & 4 == 0 {
+        if value & !3 == 0 {
+            return None;
+        }
+        (cpu.legacy.gdtr.base, u32::from(cpu.legacy.gdtr.limit))
+    } else {
+        let ldtr = cpu.legacy.ldtr;
+        if ldtr.selector & !3 == 0 || ldtr.cache.unusable != 0 {
+            return None;
+        }
+        (ldtr.cache.base, ldtr.cache.limit)
+    };
+    (offset + 7 <= limit).then(|| base.wrapping_add(offset))
+}
+
 fn descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
     value: u16,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
-    // SDM Vol 3A §§3.4.2, 3.4.5; 80386 PRM §§5.1.1–5.1.2,
-    // 6.3.1.2: selectors index eight-byte descriptors, including their last byte.
-    if value & 4 != 0 {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyLdtSelector,
-        ));
-    }
-    let offset = u32::from(value & !7);
-    if offset + 7 > u32::from(cpu.legacy.gdtr.limit) {
-        return Err(fault(cpu, 13, value & !3));
-    }
-    let address = cpu.legacy.gdtr.base.wrapping_add(offset);
+    let address = descriptor_address(cpu, value).ok_or_else(|| fault(cpu, 13, value & !3))?;
+    descriptor_at(cpu, mem, address, generation)
+}
+
+fn descriptor_at<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    address: u32,
+    generation: crate::CpuGeneration,
+) -> Result<Descriptor, Exit> {
     let key = DESCRIPTOR_RETRY | u64::from(address);
     if let (Some(base_limit), Some(attributes)) = (
         cpu.mmio_part(cpu.rip, key),
@@ -311,11 +331,62 @@ fn descriptor<const ROUTED: bool, const ORDER: u8>(
     })
 }
 
-fn accessed<const ROUTED: bool, const ORDER: u8>(
+#[cfg(test)]
+thread_local! {
+    static DESCRIPTOR_UPDATE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
     descriptor: &mut Descriptor,
-) -> Result<(), Exit> {
+    bit: u16,
+) -> Result<bool, Exit> {
+    if descriptor.cache.attributes & bit == 0 {
+        if let Some(address) = descriptor.access_address {
+            let linear = u64::from(address);
+            let (physical, _) = legacy::physical_span(cpu, linear, 1);
+            let expected = u64::from(descriptor.cache.attributes as u8);
+            let value = expected | u64::from(bit);
+            #[cfg(test)]
+            DESCRIPTOR_UPDATE.with(|update| {
+                if let Some((at, replacement)) = update.take() {
+                    mem.write(at, replacement, 8).unwrap();
+                }
+            });
+            // SDM Vol 2A §3.3 LTR p. 3-576; Vol 3A §11.1.2.1 p. 11-3;
+            // 386 PRM §7.6.1 p. 7-10: busy/accessed updates follow LOCK semantics.
+            // A byte CAS preserves concurrent edits and is aligned even when
+            // the descriptor table is not. Only the access-rights byte changes.
+            let observed = match mem.atomic_cas(physical, expected, value, 1) {
+                Ok(observed) => observed,
+                // Separate device read/write completions cannot implement CAS.
+                Err(MemTrap::Mmio) => {
+                    return Err(refusal(
+                        cpu,
+                        crate::UnsupportedSystemOperation::LegacyInstruction,
+                    ));
+                }
+                Err(trap) => {
+                    return Err(
+                        match trap_out(cpu, cpu.rip, trap, physical, 1, AccessKind::Write, value)
+                            .into_step()
+                        {
+                            StepResult::Exit(exit) => {
+                                crate::fault::qualify_legacy_bus(exit, linear, physical)
+                            }
+                            _ => unreachable!(),
+                        },
+                    );
+                }
+            };
+            if observed != expected {
+                descriptor.cache.attributes =
+                    (descriptor.cache.attributes & !0xff) | observed as u16;
+                return Ok(false);
+            }
+        }
+    }
     if let Some(address) = descriptor.access_address {
         let key = DESCRIPTOR_RETRY | u64::from(address.wrapping_sub(5));
         cpu.record_mmio_part(
@@ -329,21 +400,117 @@ fn accessed<const ROUTED: bool, const ORDER: u8>(
             u64::from(descriptor.cache.attributes),
         );
     }
-    // SDM Vol 3A §3.4.5.1; 80386 PRM §5.1.1 p. 5-4 (scan checked):
-    // successful segment loads set A in memory as well as in the hidden cache.
-    // I286 PRM §7.4 p. 7-11 specifies the same accessed-bit update.
-    if descriptor.cache.attributes & 1 == 0 {
-        if let Some(address) = descriptor.access_address {
-            write(
-                cpu,
-                mem,
-                u64::from(address),
-                1,
-                u64::from(descriptor.cache.attributes as u8 | 1),
-            )?;
-            descriptor.cache.attributes |= 1;
+    descriptor.cache.attributes |= bit;
+    Ok(true)
+}
+
+fn accessed<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    descriptor: &mut Descriptor,
+) -> Result<(), Exit> {
+    // SDM Vol 3A §§3.4.5.1, 11.1.2.1; 386 PRM §5.1.1 p. 5-4;
+    // 286 PRM §7.4 p. 7-11: segment loads update A in memory and cache.
+    while !descriptor_bit(cpu, mem, descriptor, 1)? {}
+    Ok(())
+}
+
+fn load_system_segment<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    register: SystemRegister,
+    value: u16,
+    allowed_types: u16,
+    generation: crate::CpuGeneration,
+) -> Result<(), Exit> {
+    // 286 PRM App. B pp. B-66/B-72; 386 PRM §17 pp. 17-98/17-108;
+    // SDM Vol 2A §3.3 LLDT/LTR: GDT-only system descriptors at CPL 0.
+    if cpu.legacy.cpl != 0 {
+        return Err(fault(cpu, 13, 0));
+    }
+    if matches!(register, SystemRegister::Ldtr) && value & !3 == 0 {
+        cpu.legacy.ldtr.selector = value;
+        cpu.legacy.ldtr.cache.unusable = 1;
+        return Ok(());
+    }
+    if value & 4 != 0 {
+        return Err(fault(cpu, 13, value & !3));
+    }
+    let mut d = descriptor(cpu, mem, value, generation)?;
+    loop {
+        let attr = d.cache.attributes;
+        if attr & 0x10 != 0 || allowed_types & (1 << (attr & 0xf)) == 0 {
+            return Err(fault(cpu, 13, value & !3));
+        }
+        if attr & 0x80 == 0 {
+            return Err(fault(cpu, 11, value & !3));
+        }
+        if matches!(register, SystemRegister::Ldtr) || descriptor_bit(cpu, mem, &mut d, 2)? {
+            break;
+        }
+        // A competing processor may have acquired the TSS or replaced it.
+        // Re-read and validate before trying to mark it busy again.
+        d = descriptor(cpu, mem, value, generation)?;
+    }
+    let system = legacy::SystemSegment {
+        selector: value,
+        reserved: 0,
+        cache: d.cache,
+    };
+    match register {
+        SystemRegister::Ldtr => cpu.legacy.ldtr = system,
+        SystemRegister::Tr => cpu.legacy.tr = system,
+    }
+    Ok(())
+}
+
+fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    selector: u16,
+    query: DescriptorQuery,
+    allowed_system_types: u16,
+    allow_conforming: bool,
+    generation: crate::CpuGeneration,
+) -> Result<(), Exit> {
+    // SDM Vol 2A §3.3 LAR/LSL; Vol 2C §5.2 VERR/VERW pp. 5-162–163;
+    // 286 PRM §11.3 pp. 11-3–4; 386 PRM §6.3.6 pp. 6-18–19:
+    // invalid selectors clear ZF; memory faults still escape. P is not tested,
+    // and querying never loads a segment or sets the descriptor accessed bit.
+    let Some(address) = descriptor_address(cpu, selector) else {
+        cpu.flags.zf = false;
+        return Ok(());
+    };
+    let cache = descriptor_at(cpu, mem, address, generation)?.cache;
+    let attr = cache.attributes;
+    let segment = attr & 0x10 != 0;
+    let code = segment && attr & 8 != 0;
+    let conforming = code && attr & 4 != 0;
+    let dpl = (attr >> 5) & 3;
+    let visible = if conforming {
+        allow_conforming
+    } else {
+        dpl >= u16::from(cpu.legacy.cpl).max(selector & 3)
+    };
+    let valid_type = match query {
+        DescriptorQuery::Read => segment && (!code || attr & 2 != 0),
+        DescriptorQuery::Write => segment && !code && attr & 2 != 0,
+        _ => segment || allowed_system_types & (1 << (attr & 0xf)) != 0,
+    };
+    if visible && valid_type {
+        match query {
+            DescriptorQuery::Rights { dst, size } => {
+                // SDM Vol 2A §3.3 LAR: undefined bits 19:16 use zero as
+                // deterministic engine policy. Access byte/flags retain their bits.
+                write_reg(cpu, dst, u64::from(attr) << 8, size);
+            }
+            DescriptorQuery::Limit { dst, size } => {
+                write_reg(cpu, dst, u64::from(cache.limit), size)
+            }
+            _ => {}
         }
     }
+    cpu.flags.zf = visible && valid_type;
     Ok(())
 }
 
@@ -1582,6 +1749,66 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // SDM Vol 2A §3.3 CLTS; 80386 PRM §17 p. 17-48.
                         outcome.context_changed = write_cr0(cpu, cpu.legacy.cr0 & !8)?;
                     }
+                    L::ReadSystemSegment { dst, register } => {
+                        temps[*dst as usize] = u64::from(match register {
+                            SystemRegister::Ldtr => cpu.legacy.ldtr.selector,
+                            SystemRegister::Tr => cpu.legacy.tr.selector,
+                        });
+                    }
+                    L::LoadSystemSegment {
+                        register,
+                        value,
+                        allowed_types,
+                    } => {
+                        load_system_segment(
+                            cpu,
+                            mem,
+                            *register,
+                            read_val(*value, temps) as u16,
+                            *allowed_types,
+                            context.generation,
+                        )?;
+                        outcome.context_changed = true;
+                    }
+                    L::QueryDescriptor {
+                        selector,
+                        query,
+                        allowed_system_types,
+                        allow_conforming,
+                    } => {
+                        query_descriptor(
+                            cpu,
+                            mem,
+                            read_val(*selector, temps) as u16,
+                            *query,
+                            *allowed_system_types,
+                            *allow_conforming,
+                            context.generation,
+                        )?;
+                    }
+                    L::AdjustRpl {
+                        selector,
+                        rpl,
+                        destination,
+                    } => {
+                        // 286 PRM App. B p. B-21; 386 PRM §17 p. 17-25:
+                        // increase only RPL, set ZF iff changed; all other flags survive.
+                        let value = read_val(*selector, temps) as u16;
+                        let rpl = read_val(*rpl, temps) as u16 & 3;
+                        let changed = value & 3 < rpl;
+                        if changed {
+                            let value = u64::from((value & !3) | rpl);
+                            match destination {
+                                SelectorDestination::Register(reg) => {
+                                    write_reg(cpu, *reg, value, 2)
+                                }
+                                SelectorDestination::Memory(addr) => {
+                                    write(cpu, mem, read_val(*addr, temps), 2, value)?
+                                }
+                            }
+                        }
+                        cpu.flags.zf = changed;
+                    }
                     L::Bound {
                         index,
                         lower,
@@ -2124,6 +2351,118 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
     }
     cpu.rip = next;
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod descriptor_update_tests {
+    use super::*;
+    use crate::{CpuGeneration, Prot, RegionKind, Vm, VmConfig};
+
+    fn image(base: u16, attr: u8) -> u64 {
+        u64::from_le_bytes([0xff, 0xff, base as u8, (base >> 8) as u8, 0, attr, 0, 0])
+    }
+
+    #[test]
+    fn ltr_cas_preserves_competing_descriptor_edits_and_reloads_the_cache() {
+        // SDM Vol 2A §3.3 LTR p. 3-576; 386 PRM §7.6.1 p. 7-10:
+        // the busy update is locked. Inject an edit after the descriptor read
+        // and before CAS; both the competing base/DPL and busy bit must survive.
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.mem.write(0x2008, image(0x4000, 0x81), 8).unwrap();
+            let mut cpu = CpuState::default();
+            cpu.legacy.gdtr.base = 0x102000;
+            cpu.legacy.gdtr.limit = 15;
+            cpu.legacy.a20_enabled = 0;
+            DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xa1)))));
+            load_system_segment(
+                &mut cpu,
+                Access::<false, 0>::new(&vm.mem),
+                SystemRegister::Tr,
+                8,
+                1 << 1,
+                generation,
+            )
+            .unwrap();
+            assert_eq!(vm.mem.read(0x2008, 8).unwrap(), image(0x5000, 0xa3));
+            assert_eq!(cpu.legacy.tr.cache.base, 0x5000);
+            assert_eq!(cpu.legacy.tr.cache.attributes, 0xa3);
+            DESCRIPTOR_UPDATE.with(|update| assert!(update.get().is_none()));
+        }
+    }
+
+    #[test]
+    fn ltr_cas_failure_rechecks_type_and_presence_without_installing_tr() {
+        // SDM Vol 2A §3.3 LTR pp. 3-576–577: a busy or wrong-type
+        // descriptor faults with #GP(selector); an absent TSS with #NP(selector).
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            for (attr, vector) in [(0x83, 13), (0x82, 13), (0x91, 13), (0x01, 11)] {
+                let mut vm = Vm::new(VmConfig::flat(0x10000));
+                vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.mem.write(0x2008, image(0x4000, 0x81), 8).unwrap();
+                let mut cpu = CpuState::default();
+                cpu.legacy.cr0 = 1;
+                cpu.legacy.gdtr.base = 0x2000;
+                cpu.legacy.gdtr.limit = 15;
+                let before = cpu.legacy.tr;
+                DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, attr)))));
+                let exit = load_system_segment(
+                    &mut cpu,
+                    Access::<false, 0>::new(&vm.mem),
+                    SystemRegister::Tr,
+                    11,
+                    1 << 1,
+                    generation,
+                )
+                .unwrap_err();
+                assert!(matches!(exit, Exit::Exception { vector: actual, .. } if actual == vector));
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    crate::fault::ErrorCode::bits(8, 0xffff)
+                );
+                assert_eq!(cpu.legacy.tr, before);
+                assert_eq!(vm.mem.read(0x2008, 8).unwrap(), image(0x5000, attr));
+            }
+        }
+    }
+
+    #[test]
+    fn accessed_cas_preserves_competing_gdt_and_ldt_edits_through_a20() {
+        // SDM Vol 3A §§3.4.5.1, 11.1.2.1 p. 11-3: setting A follows
+        // LOCK semantics. Inject a DPL/base edit in the read/write window.
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            for ldt in [false, true] {
+                let mut vm = Vm::new(VmConfig::flat(0x10000));
+                vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.mem.write(0x2008, image(0x4000, 0x92), 8).unwrap();
+                let mut cpu = CpuState::default();
+                cpu.legacy.cr0 = 1;
+                cpu.legacy.a20_enabled = 0;
+                cpu.legacy.gdtr.base = 0x102000;
+                cpu.legacy.gdtr.limit = 15;
+                cpu.legacy.ldtr.selector = 16;
+                cpu.legacy.ldtr.cache.base = 0x102000;
+                cpu.legacy.ldtr.cache.limit = 15;
+                cpu.legacy.ldtr.cache.unusable = 0;
+                DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xb2)))));
+                load_segment(
+                    &mut cpu,
+                    Access::<false, 0>::new(&vm.mem),
+                    SegmentId::Ds,
+                    if ldt { 12 } else { 8 },
+                    generation,
+                )
+                .unwrap();
+                assert_eq!(vm.mem.read(0x2008, 8).unwrap(), image(0x5000, 0xb3));
+                assert_eq!(
+                    cpu.legacy.segments[SegmentId::Ds as usize].attributes & 1,
+                    1
+                );
+                DESCRIPTOR_UPDATE.with(|update| assert!(update.get().is_none()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

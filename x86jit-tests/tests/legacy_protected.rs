@@ -544,22 +544,14 @@ fn far_transfer_faults_leave_frame_and_context_unchanged() {
 }
 
 #[test]
-fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals_cpu_model() {
-    crate::model_api::with_cpu_model(ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals);
+fn gates_outer_returns_and_nonzero_cpl_are_typed_refusals_cpu_model() {
+    crate::model_api::with_cpu_model(gates_outer_returns_and_nonzero_cpl_are_typed_refusals);
 }
 
 #[test]
-fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
+fn gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
     // Decision-18 §4: unsupported delivery/transitions never construct an IVT frame.
     for (bytes, operation) in [
-        (
-            &b"\x8e\xd8"[..],
-            UnsupportedSystemOperation::LegacyLdtSelector,
-        ),
-        (
-            &b"\xea\x00\x12\x0c\x00"[..],
-            UnsupportedSystemOperation::LegacyLdtSelector,
-        ),
         (
             &b"\xea\x00\x12\x08\x00"[..],
             UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
@@ -610,15 +602,17 @@ fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
 }
 
 #[test]
-fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic_cpu_model() {
+fn accessed_updates_are_atomic_and_device_updates_require_emulation_cpu_model() {
     crate::model_api::with_cpu_model(
-        accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic,
+        accessed_updates_are_atomic_and_device_updates_require_emulation,
     );
 }
 
 #[test]
-fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic() {
-    // SDM Vol 3A §3.4.5.1; PRM §5.1.1 p. 5-4: A is written on load.
+fn accessed_updates_are_atomic_and_device_updates_require_emulation() {
+    // SDM Vol 3A §§3.4.5.1, 11.1.2.1; PRM §5.1.1 p. 5-4:
+    // A write-back follows LOCK semantics; separate MMIO acknowledgments cannot
+    // implement it. Unsupported device updates preserve the destination cache.
     for accessed in [false, true] {
         let (vm, mut cpu) = setup(b"\x8e\xd8", false, false);
         descriptor(&vm, 16, 0x3000, 0xffff, if accessed { 0x93 } else { 0x92 });
@@ -652,10 +646,8 @@ fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_at
     assert!(
         matches!(
             run.stop(),
-            StepStop::Exit(Exit::MmioWrite {
-                addr: 0x2015,
-                size: 1,
-                value: 0x93,
+            StepStop::Exit(Exit::UnsupportedSystemContext {
+                operation: UnsupportedSystemOperation::LegacyInstruction,
                 ..
             })
         ),
@@ -664,11 +656,6 @@ fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_at
     );
     assert_eq!(cpu.cpu.legacy.segments, caches);
     assert_eq!(cpu.cpu.ds, 0);
-    cpu.complete_mmio_write();
-    steps(&mut cpu, &vm, 1);
-    assert_eq!(cpu.cpu.ds, 16);
-    assert_eq!(cpu.cpu.legacy.segments[1].base, 0x3000);
-    assert_eq!(cpu.cpu.legacy.segments[1].attributes, 0x93);
 }
 
 #[test]

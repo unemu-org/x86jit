@@ -1242,6 +1242,65 @@ mod tests {
     }
 
     #[test]
+    fn ldtr_and_tr_hidden_changes_isolate_retained_instruction_blocks() {
+        // Decisions 18 §3 and 20: the full system-register cache participates,
+        // even when its visible selector stays unchanged. Returning reuses IR.
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, b"\xeb\xfe").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.legacy.cr0 = 1;
+            let initial = cpu.cpu.legacy;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            let id = execution.context_id;
+            let original = execution.blocks.values().next().unwrap().ir.clone();
+            let edits: [fn(&mut LegacyCpuState); 8] = [
+                |s| s.ldtr.cache.base = 0x2000,
+                |s| s.ldtr.cache.limit = 0xff,
+                |s| s.ldtr.cache.attributes = 0x82,
+                |s| s.ldtr.cache.unusable = 1,
+                |s| s.tr.cache.base = 0x3000,
+                |s| s.tr.cache.limit = 0x67,
+                |s| s.tr.cache.attributes = 0x83,
+                |s| s.tr.cache.unusable = 1,
+            ];
+            for edit in edits {
+                cpu.cpu.legacy = initial;
+                edit(&mut cpu.cpu.legacy);
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1);
+                let execution = cpu.legacy_execution.as_ref().unwrap();
+                assert_ne!(execution.context_id, id);
+                let block = execution
+                    .blocks
+                    .iter()
+                    .find(|(key, _)| key.context_id == execution.context_id)
+                    .unwrap()
+                    .1;
+                assert!(!Arc::ptr_eq(&original, &block.ir));
+                cpu.cpu.legacy = initial;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1);
+                let execution = cpu.legacy_execution.as_ref().unwrap();
+                assert_eq!(execution.context_id, id);
+                let block = execution
+                    .blocks
+                    .iter()
+                    .find(|(key, _)| key.context_id == id)
+                    .unwrap()
+                    .1;
+                assert!(Arc::ptr_eq(&original, &block.ir));
+            }
+            assert_eq!(cpu.legacy_execution.as_ref().unwrap().lifts, 9);
+        }
+    }
+
+    #[test]
     fn epoch_rollover_drops_populated_contexts_before_reusing_ids() {
         let (vm, mut cpu) = pe_transition_loop();
         let model = cpu.legacy_model.unwrap();

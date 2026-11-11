@@ -1,6 +1,9 @@
 //! Explicit-context legacy lowering (decision-18 §1; spec.md §§7, 17).
 use super::*;
-use crate::legacy::{ControlRegister, LegacyOp as L, MachineContext, SegmentId};
+use crate::legacy::{
+    ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
+    SelectorDestination, SystemRegister,
+};
 
 struct Ops {
     values: Vec<IrOp>,
@@ -308,7 +311,144 @@ pub(super) fn lower(
         size
     };
     let next = insn.next_ip() as u32;
+    // 286 PRM App. B pp. B-21/60/66/71/72/102/108/111;
+    // 386 PRM §17 pp. 17-25/89/98/106/108/159/166/169 (scans checked):
+    // these instructions are protected-only, before any operand access.
+    if context.regime == crate::MachineRegime::Real
+        && matches!(
+            insn.mnemonic(),
+            Lldt | Sldt | Ltr | Str | Lar | Lsl | Verr | Verw | Arpl
+        )
+    {
+        ops.push(IrOp::Trap {
+            vector: 6,
+            advance: 0,
+        });
+        return Ok(true);
+    }
     match insn.mnemonic() {
+        Lldt | Ltr => {
+            let value = lower_read(insn, 0, ops, tg)?;
+            // SDM Vol 2A §3.3 LLDT/LTR; 286 PRM App. B pp. B-66/B-72;
+            // 386 PRM §17 pp. 17-98/17-108: GDT LDT or available TSS.
+            let (register, allowed_types) = if insn.mnemonic() == Lldt {
+                (SystemRegister::Ldtr, 1 << 2)
+            } else {
+                (
+                    SystemRegister::Tr,
+                    if context.generation == crate::CpuGeneration::I286 {
+                        1 << 1
+                    } else {
+                        (1 << 1) | (1 << 9)
+                    },
+                )
+            };
+            emit(
+                ops,
+                L::LoadSystemSegment {
+                    register,
+                    value,
+                    allowed_types,
+                },
+            );
+        }
+        Sldt | Str => {
+            let dst = tg.fresh();
+            emit(
+                ops,
+                L::ReadSystemSegment {
+                    dst,
+                    register: if insn.mnemonic() == Sldt {
+                        SystemRegister::Ldtr
+                    } else {
+                        SystemRegister::Tr
+                    },
+                },
+            );
+            let mut target = lower_write_target(insn, 0, ops, tg)?;
+            // SDM Vol 2B §4.3 SLDT p. 4-656: Intel386 upper bits are
+            // undefined; preserve them as deterministic engine policy.
+            // STR p. 4-679 requires clearing bits 31:16 for a 32-bit register.
+            // PROVENANCE.md §1: this takes precedence over 386 PRM §17
+            // p. 17-166, which says the operand-size attribute has no effect.
+            if insn.mnemonic() == Sldt {
+                if let WriteTarget::Reg { size, .. } = &mut target {
+                    *size = 2;
+                }
+            }
+            emit_write(ops, tg, target, Val::Temp(dst));
+        }
+        Lar | Lsl | Verr | Verw => {
+            let selector = lower_read(
+                insn,
+                u32::from(matches!(insn.mnemonic(), Lar | Lsl)),
+                ops,
+                tg,
+            )?;
+            let query = match insn.mnemonic() {
+                Lar => DescriptorQuery::Rights {
+                    dst: iced_to_reg(insn.op0_register()).or_unsupported(insn)?,
+                    size,
+                },
+                Lsl => DescriptorQuery::Limit {
+                    dst: iced_to_reg(insn.op0_register()).or_unsupported(insn)?,
+                    size,
+                },
+                Verr => DescriptorQuery::Read,
+                _ => DescriptorQuery::Write,
+            };
+            // SDM Vol 2A §3.3 LAR Table 3-55, LSL Table 3-59 are primary.
+            // 286 PRM §11.3 p. 11-3/App. B p. B-71: 286 system types
+            // have no 386 extensions, and LSL requires nonconforming segments.
+            let i286 = context.generation == crate::CpuGeneration::I286;
+            let allowed_system_types = match insn.mnemonic() {
+                Lar => {
+                    if i286 {
+                        0x003e
+                    } else {
+                        0x1a3e
+                    }
+                }
+                Lsl => {
+                    if i286 {
+                        0x000e
+                    } else {
+                        0x0a0e
+                    }
+                }
+                _ => 0,
+            };
+            emit(
+                ops,
+                L::QueryDescriptor {
+                    selector,
+                    query,
+                    allowed_system_types,
+                    allow_conforming: !(i286 && insn.mnemonic() == Lsl),
+                },
+            );
+        }
+        Arpl => {
+            let target = lower_write_target(insn, 0, ops, tg)?;
+            let (selector, destination) = match target {
+                WriteTarget::Reg { reg, .. } => {
+                    (read_reg(reg, ops, tg), SelectorDestination::Register(reg))
+                }
+                WriteTarget::Mem { addr, .. } => {
+                    (load(ops, tg, addr, 2), SelectorDestination::Memory(addr))
+                }
+                _ => return Err(unsupported_insn(insn)),
+            };
+            let rpl = lower_read(insn, 1, ops, tg)?;
+            emit(
+                ops,
+                L::AdjustRpl {
+                    selector,
+                    rpl,
+                    destination,
+                },
+            );
+        }
         Lgdt | Lidt | Sgdt | Sidt => {
             let addr = address(insn, ops, tg)?;
             emit(

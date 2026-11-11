@@ -696,6 +696,26 @@ pub enum LegacyOp {
         value: crate::ir::Val,
     },
     ClearTs,
+    ReadSystemSegment {
+        dst: crate::ir::Temp,
+        register: SystemRegister,
+    },
+    LoadSystemSegment {
+        register: SystemRegister,
+        value: crate::ir::Val,
+        allowed_types: u16,
+    },
+    QueryDescriptor {
+        selector: crate::ir::Val,
+        query: DescriptorQuery,
+        allowed_system_types: u16,
+        allow_conforming: bool,
+    },
+    AdjustRpl {
+        selector: crate::ir::Val,
+        rpl: crate::ir::Val,
+        destination: SelectorDestination,
+    },
     Interrupt {
         vector: u8,
         saved_ip: u32,
@@ -721,6 +741,26 @@ pub enum ControlRegister {
     Cr0,
     Cr2,
     Cr3,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SystemRegister {
+    Ldtr,
+    Tr,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DescriptorQuery {
+    Rights { dst: crate::state::Reg, size: u8 },
+    Limit { dst: crate::state::Reg, size: u8 },
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SelectorDestination {
+    Register(crate::state::Reg),
+    Memory(crate::ir::Val),
 }
 
 // SDM Vol 2A §3.3 LMSW; I286 PRM §10.2.2 Table 10-1 p. 10-4,

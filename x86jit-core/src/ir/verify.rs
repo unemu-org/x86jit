@@ -362,8 +362,10 @@ impl IrBlock {
                         check(&[*offset], &[*dst])?
                     }
                     crate::legacy::LegacyOp::ReadSelector { dst, .. }
+                    | crate::legacy::LegacyOp::ReadSystemSegment { dst, .. }
                     | crate::legacy::LegacyOp::Pop { dst, .. } => check(&[], &[*dst])?,
                     crate::legacy::LegacyOp::LoadSegment { value, .. }
+                    | crate::legacy::LegacyOp::LoadSystemSegment { value, .. }
                     | crate::legacy::LegacyOp::Push { value, .. } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::Transfer { cs, ip, .. } => {
                         check(&[cs.unwrap_or(Val::Imm(0)), *ip], &[])?
@@ -373,6 +375,19 @@ impl IrBlock {
                     crate::legacy::LegacyOp::WriteControl { value, .. } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::ClearTs => {}
+                    crate::legacy::LegacyOp::QueryDescriptor { selector, .. } => {
+                        check(&[*selector], &[])?
+                    }
+                    crate::legacy::LegacyOp::AdjustRpl {
+                        selector,
+                        rpl,
+                        destination,
+                    } => {
+                        check(&[*selector, *rpl], &[])?;
+                        if let crate::legacy::SelectorDestination::Memory(addr) = destination {
+                            check(&[*addr], &[])?;
+                        }
+                    }
                     crate::legacy::LegacyOp::Bound {
                         index,
                         lower,
@@ -545,6 +560,66 @@ mod tests {
                 .temp,
             3
         );
+    }
+
+    #[test]
+    fn descriptor_ops_check_every_input_and_define_only_the_read_output() {
+        use crate::legacy::{DescriptorQuery, LegacyOp, SelectorDestination, SystemRegister};
+        for input in 0..3 {
+            let mut values = [Val::Imm(0); 3];
+            values[input] = Val::Temp(3);
+            let op = LegacyOp::AdjustRpl {
+                selector: values[0],
+                rpl: values[1],
+                destination: SelectorDestination::Memory(values[2]),
+            };
+            assert_eq!(
+                block(vec![IrOp::Legacy(op)])
+                    .verify_temp_defs()
+                    .unwrap_err()
+                    .temp,
+                3
+            );
+        }
+        for op in [
+            LegacyOp::QueryDescriptor {
+                selector: Val::Temp(3),
+                query: DescriptorQuery::Read,
+                allowed_system_types: 0,
+                allow_conforming: true,
+            },
+            LegacyOp::LoadSystemSegment {
+                value: Val::Temp(3),
+                register: SystemRegister::Ldtr,
+                allowed_types: 4,
+            },
+        ] {
+            assert_eq!(
+                block(vec![IrOp::Legacy(op)])
+                    .verify_temp_defs()
+                    .unwrap_err()
+                    .temp,
+                3
+            );
+        }
+        for register in [SystemRegister::Ldtr, SystemRegister::Tr] {
+            let ops = vec![
+                IrOp::Legacy(LegacyOp::ReadSystemSegment { dst: 3, register }),
+                IrOp::Legacy(LegacyOp::LoadSystemSegment {
+                    register,
+                    value: Val::Temp(3),
+                    allowed_types: 4,
+                }),
+            ];
+            assert_eq!(block(ops.clone()).verify_temp_defs(), Ok(()));
+            assert_eq!(
+                block(ops[1..].to_vec())
+                    .verify_temp_defs()
+                    .unwrap_err()
+                    .temp,
+                3
+            );
+        }
     }
 
     #[test]

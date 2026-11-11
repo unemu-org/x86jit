@@ -118,7 +118,7 @@ fn every_legacy_probe_defines_temps_before_use() {
                     paging_enabled: false,
                 };
                 let mut checked = 0;
-                let mut system_ops = [false; 8];
+                let mut system_ops = [false; 12];
                 for code in Code::values().filter(|code| {
                     let info = code.op_code();
                     *code != Code::INVALID
@@ -164,6 +164,10 @@ fn every_legacy_probe_defines_temps_before_use() {
                                 IrOp::Legacy(LegacyOp::Interrupt { .. }) => 5,
                                 IrOp::Legacy(LegacyOp::Iret { .. }) => 6,
                                 IrOp::Legacy(LegacyOp::Bound { .. }) => 7,
+                                IrOp::Legacy(LegacyOp::ReadSystemSegment { .. }) => 8,
+                                IrOp::Legacy(LegacyOp::LoadSystemSegment { .. }) => 9,
+                                IrOp::Legacy(LegacyOp::QueryDescriptor { .. }) => 10,
+                                IrOp::Legacy(LegacyOp::AdjustRpl { .. }) => 11,
                                 _ => continue,
                             };
                             system_ops[index] = true;
@@ -173,7 +177,10 @@ fn every_legacy_probe_defines_temps_before_use() {
                 }
                 assert!(checked > 1000, "{context:?}: only {checked} blocks checked");
                 assert!(
-                    system_ops.into_iter().all(|seen| seen),
+                    system_ops[..8].iter().all(|seen| *seen)
+                        && system_ops[8..]
+                            .iter()
+                            .all(|seen| *seen == (regime == MachineRegime::Protected)),
                     "{context:?}: {system_ops:?}"
                 );
                 eprintln!("{context:?}: verified {checked} legacy probe blocks");
