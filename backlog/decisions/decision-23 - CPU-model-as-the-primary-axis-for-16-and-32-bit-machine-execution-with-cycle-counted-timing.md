@@ -9,7 +9,7 @@ status: accepted
 
 # CPU model as the primary axis for 16- and 32-bit machine execution, with cycle-counted timing
 
-**Status: proposed.** This record changes no code. It replaces the
+**Status: accepted (2026-11-11).** This record changes no code. It replaces the
 Application-Real16 / LegacySystem split with one execution path selected by a CPU
 model, and adds an optional cycle-counted timing level. It amends
 [decision-18](decision-18%20-%20Legacy-386-protected-mode-CPU-state-and-execution-context-contract.md)
@@ -19,8 +19,8 @@ refresh stealing, lockstep with devices) is out of scope and stays out: it is a
 separate future project.
 
 The maintainer answered the first draft's open questions on 2026-11-11. The
-answers are folded into the body and listed under Resolved questions. The record
-stays proposed until it is accepted as a whole.
+answers are folded into the body and listed under Resolved questions. The
+maintainer accepted the record as a whole the same day.
 
 ## Context
 
