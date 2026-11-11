@@ -163,6 +163,9 @@ pub mod state;
 #[doc(hidden)]
 pub mod time_stats;
 mod usercopy;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use usercopy::with_copy_out_fault;
 pub mod vm;
 pub mod x87;
 

@@ -68,9 +68,21 @@ unsafe fn invoke(
     len: usize,
     extra: usize,
 ) -> Result<usize, usize> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if deny_test_read(routine, ptr as usize) {
         return Err(ptr as usize);
+    }
+    #[cfg(any(test, feature = "test-hooks"))]
+    if routine as usize == copy_write as *const () as usize {
+        if let Some(at) = WRITE_FAULT.with(std::cell::Cell::get) {
+            if (ptr as usize..ptr as usize + len).contains(&at) {
+                // SAFETY: the injected fault is inside the validated copy; commit
+                // its prefix through the real transfer routine before failing.
+                let result = unsafe { routine(ptr, data, at - ptr as usize, extra) };
+                assert_eq!(result.failed, 0);
+                return Err(at);
+            }
+        }
     }
     // SAFETY: callers validate the guest span and keep local buffers live.
     let result = unsafe { routine(ptr, data, len, extra) };
@@ -107,12 +119,12 @@ pub(crate) unsafe fn probe(ptr: *mut u8, len: usize, write: bool) -> Result<(), 
 
 #[inline(always)]
 unsafe fn probe_write_span(ptr: *mut u8, len: usize, page: usize) -> Status {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     // SAFETY: the test wrapper preserves the routine's validated-span contract.
     unsafe {
         test_probe_rmw(ptr, len, page)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-hooks")))]
     // SAFETY: caller validates the span; the routine probes each touched page once.
     unsafe {
         probe_rmw(ptr, 0, len, page)
@@ -148,7 +160,14 @@ unsafe fn resume_write_probe(
     }
 }
 
-pub(crate) unsafe fn copy_out(ptr: *mut u8, buf: &[u8]) -> Result<(), usize> {
+/// Progress assumes backing and protections stay stable through commit (§8.1).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WriteFault {
+    pub(crate) at: usize,
+    pub(crate) committed: usize,
+}
+
+pub(crate) unsafe fn copy_out(ptr: *mut u8, buf: &[u8]) -> Result<(), WriteFault> {
     let page = crate::memory::host_page_size();
     // Preflight all touched pages if more than one is touched. A single-page
     // store faults on its first write before committing bytes. Protection revocation
@@ -161,7 +180,12 @@ pub(crate) unsafe fn copy_out(ptr: *mut u8, buf: &[u8]) -> Result<(), usize> {
                 return copy_out_after_probe_fault(ptr, buf, result);
             }
         }
-        invoke(copy_write, ptr, buf.as_ptr() as usize, buf.len(), 0).map(|_| ())
+        invoke(copy_write, ptr, buf.as_ptr() as usize, buf.len(), 0)
+            .map(|_| ())
+            .map_err(|at| WriteFault {
+                at,
+                committed: at - ptr as usize,
+            })
     }
 }
 
@@ -171,10 +195,11 @@ unsafe fn copy_out_after_probe_fault(
     ptr: *mut u8,
     buf: &[u8],
     result: Status,
-) -> Result<(), usize> {
+) -> Result<(), WriteFault> {
     let unproven = result.value;
     // SAFETY: the original probe validated the prefix; resume validates the suffix.
-    unsafe { resume_write_probe(ptr, buf.len(), result)? };
+    unsafe { resume_write_probe(ptr, buf.len(), result) }
+        .map_err(|at| WriteFault { at, committed: 0 })?;
     let start = unproven - ptr as usize;
     let page = crate::memory::host_page_size();
     let end = buf.len().min(start + page - (unproven & (page - 1)));
@@ -194,15 +219,24 @@ unsafe fn copy_out_after_probe_fault(
             buf[start..end].as_ptr() as usize,
             end - start,
             0,
-        )?;
-        invoke(copy_write, ptr, buf.as_ptr() as usize, start, 0)?;
+        )
+        .map_err(|at| WriteFault { at, committed: 0 })?;
+        // Successful RMW probes prove this prefix under the stable-backing contract.
+        invoke(copy_write, ptr, buf.as_ptr() as usize, start, 0).map_err(|at| WriteFault {
+            at,
+            committed: at - ptr as usize,
+        })?;
         invoke(
             copy_write,
             ptr.add(end),
             buf[end..].as_ptr() as usize,
             buf.len() - end,
             0,
-        )?;
+        )
+        .map_err(|at| WriteFault {
+            at,
+            committed: at - ptr as usize,
+        })?;
     }
     Ok(())
 }
@@ -224,7 +258,7 @@ pub(crate) unsafe fn load(ptr: *const u8, size: u8) -> Result<u64, usize> {
     // SAFETY: caller validates the naturally aligned or plain unaligned scalar range.
     unsafe { invoke(routine, ptr.cast_mut(), 0, 0, 0).map(|v| v as u64) }
 }
-pub(crate) unsafe fn store(ptr: *mut u8, value: u64, size: u8) -> Result<(), usize> {
+pub(crate) unsafe fn store(ptr: *mut u8, value: u64, size: u8) -> Result<(), WriteFault> {
     // Every supported host protection granule is a multiple of 4096. The common
     // scalar path needs no page-size query; only a possible crossing does.
     if (ptr as usize & 4095) + size as usize > 4096 {
@@ -236,12 +270,21 @@ pub(crate) unsafe fn store(ptr: *mut u8, value: u64, size: u8) -> Result<(), usi
 }
 /// The caller has already preflighted every touched host page.
 #[inline]
-pub(crate) unsafe fn store_preflighted(ptr: *mut u8, value: u64, size: u8) -> Result<(), usize> {
+pub(crate) unsafe fn store_preflighted(
+    ptr: *mut u8,
+    value: u64,
+    size: u8,
+) -> Result<(), WriteFault> {
     if !matches!(size, 1 | 2 | 4 | 8) || (ptr as usize & 4095) + size as usize > 4096 {
         let data = value.to_le_bytes();
         // SAFETY: caller validates the full span and has probed all touched pages.
         return unsafe {
-            invoke(copy_write, ptr, data.as_ptr() as usize, size as usize, 0).map(|_| ())
+            invoke(copy_write, ptr, data.as_ptr() as usize, size as usize, 0)
+                .map(|_| ())
+                .map_err(|at| WriteFault {
+                    at,
+                    committed: at - ptr as usize,
+                })
         };
     }
     let routine = match size {
@@ -252,6 +295,7 @@ pub(crate) unsafe fn store_preflighted(ptr: *mut u8, value: u64, size: u8) -> Re
     };
     // SAFETY: caller validates the entire scalar span.
     unsafe { invoke(routine, ptr, value as usize, 0, 0).map(|_| ()) }
+        .map_err(|at| WriteFault { at, committed: 0 })
 }
 pub(crate) unsafe fn cas(ptr: *mut u8, expected: u64, value: u64, size: u8) -> Result<u64, usize> {
     let mask = u64::MAX >> (64 - size * 8);
@@ -268,7 +312,7 @@ pub(crate) unsafe fn cas(ptr: *mut u8, expected: u64, value: u64, size: u8) -> R
             )?;
             let old = load(ptr, size)?;
             if old == expected {
-                store(ptr, value, size)?;
+                store(ptr, value, size).map_err(|fault| fault.at)?;
             }
             return Ok(old);
         }
@@ -1560,12 +1604,13 @@ mod scalar_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 std::thread_local! {
+    static WRITE_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static WRITE_ONLY: std::cell::Cell<std::ops::Range<usize>> = const { std::cell::Cell::new(0..0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 unsafe fn test_probe_rmw(ptr: *mut u8, len: usize, page: usize) -> Status {
     // Inject read denial at any touched page, including inside a multi-page call.
     let mut offset = 0;
@@ -1590,7 +1635,7 @@ unsafe fn test_probe_rmw(ptr: *mut u8, len: usize, page: usize) -> Status {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn deny_test_read(routine: Routine, ptr: usize) -> bool {
     let reads = [
         copy_read, probe_read, probe_rmw, load1, load2, load4, load8, cas1, cas2, cas4, cas8, pair,
@@ -1601,6 +1646,28 @@ fn deny_test_read(routine: Routine, ptr: usize) -> bool {
         range.set(span);
         denied
     })
+}
+
+/// Inject denied reads and a copy-write fault, committing preceding transfers.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn with_copy_out_fault<T>(
+    read_denied: std::ops::Range<usize>,
+    write_fault: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(std::ops::Range<usize>, Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WRITE_ONLY.with(|v| v.set(self.0.clone()));
+            WRITE_FAULT.with(|v| v.set(self.1));
+        }
+    }
+    let _reset = Reset(
+        WRITE_ONLY.with(|v| v.replace(read_denied)),
+        WRITE_FAULT.with(|v| v.replace(Some(write_fault))),
+    );
+    run()
 }
 
 #[cfg(test)]
@@ -1634,6 +1701,141 @@ mod store_no_read_tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn partial_copy_fault_notifies_only_committed_code() {
+        crate::with_barrier_success(partial_copy_fault_notifies_only_committed_code_in_mode);
+        crate::with_barrier_unavailable(partial_copy_fault_notifies_only_committed_code_in_mode);
+    }
+
+    fn partial_copy_fault_notifies_only_committed_code_in_mode() {
+        use crate::lift::CpuMode;
+        use crate::{BlockKey, CachedBlock};
+        for path in ["loader", "checked", "guest", "scalar"] {
+            for proven_prefix in [0, 16] {
+                for commits in [false, true] {
+                    let page = crate::memory::host_page_size();
+                    let mut vm = vm_with_host_offset(VmConfig::flat(0x10000), 0);
+                    vm.mem.set_host_fault_recovery(true);
+                    vm.set_tier_up_after(None);
+                    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+                    let first = page as u64;
+                    let second = first + page as u64;
+                    let addr = if path == "scalar" {
+                        second - 4
+                    } else {
+                        first - proven_prefix
+                    };
+                    let first = if path == "scalar" { addr } else { first };
+                    let len = if path == "scalar" {
+                        8
+                    } else {
+                        (second - addr) as usize + 16
+                    };
+                    // mov eax,1; hlt, or a four-byte block ending at the page boundary.
+                    let original = if path == "scalar" {
+                        &[0xb0, 1, 0x90, 0xf4][..]
+                    } else {
+                        &[0xb8, 1, 0, 0, 0, 0xf4][..]
+                    };
+                    vm.write_bytes(first, original).unwrap();
+                    vm.write_bytes(second, &[0xf4]).unwrap();
+                    let mut cpu = vm.new_vcpu();
+                    for entry in [first, second] {
+                        cpu.set_reg(Reg::Rip, entry);
+                        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                    }
+                    let key = BlockKey::new(first, CpuMode::Long64);
+                    let suffix_key = BlockKey::new(second, CpuMode::Long64);
+                    let Some(CachedBlock::Interpreted(before)) = vm.cache.get(key) else {
+                        panic!("first block must be cached")
+                    };
+                    let Some(CachedBlock::Interpreted(suffix)) = vm.cache.get(suffix_key) else {
+                        panic!("suffix block must be cached")
+                    };
+                    let mut old = vec![0; len];
+                    vm.mem.read_bytes(addr, &mut old).unwrap();
+                    let mut bytes = vec![0x90; len];
+                    let offset = (first - addr) as usize;
+                    bytes[offset..offset + original.len()].copy_from_slice(original);
+                    bytes[offset + 1] = 2;
+                    let host = vm.mem.host_base() as usize;
+                    let denied = if path == "scalar" { addr } else { page as u64 };
+                    let fault = if commits { second } else { denied };
+                    let committed = if commits { (second - addr) as usize } else { 0 };
+                    let failed = with_copy_out_fault(
+                        host + denied as usize..host + second as usize + page,
+                        host + fault as usize,
+                        || match path {
+                            "loader" => vm.mem.write_bytes(addr, &bytes).is_err(),
+                            "checked" => vm.mem.write_ram_checked(addr, &bytes) == Err(fault),
+                            "guest" => !vm.mem.write_ram_guest(addr, &bytes),
+                            "scalar" => vm
+                                .mem
+                                .write(addr, u64::from_le_bytes(bytes[..8].try_into().unwrap()), 8)
+                                .is_err(),
+                            _ => unreachable!(),
+                        },
+                    );
+                    assert!(failed, "{path}");
+                    let mut actual = vec![0; len];
+                    vm.mem.read_bytes(addr, &mut actual).unwrap();
+                    assert_eq!(&actual[..committed], &bytes[..committed], "{path}");
+                    assert_eq!(&actual[committed..], &old[committed..], "{path}");
+                    assert_eq!(vm.mem.has_dirty_code(), commits, "{path}");
+                    cpu.set_reg(Reg::Rip, first);
+                    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                    assert_eq!(cpu.reg(Reg::Rax), if commits { 2 } else { 1 }, "{path}");
+                    let Some(CachedBlock::Interpreted(after)) = vm.cache.get(key) else {
+                        panic!("first block must be cached")
+                    };
+                    assert_eq!(std::sync::Arc::ptr_eq(&before, &after), !commits, "{path}");
+                    let Some(CachedBlock::Interpreted(after)) = vm.cache.get(suffix_key) else {
+                        panic!("uncommitted suffix must stay cached")
+                    };
+                    assert!(
+                        std::sync::Arc::ptr_eq(&suffix, &after),
+                        "{path}: suffix was invalidated"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_fp_and_string_stores_retain_partial_copy_progress() {
+        use crate::x87::RawFpMem;
+        let page = crate::memory::host_page_size();
+        let mut vm = vm_with_host_offset(VmConfig::flat(0x10000), 0);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        let base = vm.mem.host_base().cast_mut();
+        let first = page as u64;
+        let fault = first + page as u64;
+        let fp = RawFpMem {
+            base,
+            size: 0x10000,
+            guest_base: 0,
+            recover_host_faults: true,
+        };
+        let result = with_copy_out_fault(
+            base as usize + page..base as usize + page * 3,
+            base as usize + page * 2,
+            || fp.store_checked_with_progress(first - 16, &vec![0x77; page + 32]),
+        );
+        assert_eq!(result, Err((fault, page + 16)));
+        let raw = crate::interp::RawStrMem {
+            base,
+            size: 0x10000,
+            guest_base: 0,
+            recover_host_faults: true,
+        };
+        let result = with_copy_out_fault(
+            base as usize + page * 2 - 4..base as usize + page * 3,
+            base as usize + page * 2,
+            || raw.store_with_progress(fault - 4, 0x9999_9999_9999_9999, 8),
+        );
+        assert_eq!(result, Err((crate::MemTrap::HostFault, 4)));
     }
 
     #[test]
@@ -1770,7 +1972,10 @@ mod store_no_read_tests {
         crate::host_write::FAIL_QUERY.with(|f| f.set(false));
         assert_eq!(
             result,
-            Err(edge),
+            Err(WriteFault {
+                at: edge,
+                committed: 0
+            }),
             "retain the original second-page read fault"
         );
         assert!(data.iter().all(|&v| v == 0x55), "no partial store");

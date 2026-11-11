@@ -8446,16 +8446,71 @@ impl RawStrMem {
             crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
         })
     }
+    /// Failed stores report `(fault, committed_prefix_len)` for SMC (§10).
+    /// The embedder must keep backing and protections stable through commit.
+    #[inline(always)]
+    pub fn store_with_progress(
+        &self,
+        addr: u64,
+        val: u64,
+        elem: u8,
+    ) -> Result<(), (MemTrap, usize)> {
+        if self.recover_host_faults {
+            self.store_mode_with_progress::<true>(addr, val, elem)
+        } else {
+            self.store_mode_with_progress::<false>(addr, val, elem)
+        }
+    }
+
+    /// As `store_with_progress`, after the caller has probed the destination.
+    pub fn store_preflighted_with_progress(
+        &self,
+        addr: u64,
+        val: u64,
+        elem: u8,
+    ) -> Result<(), (MemTrap, usize)> {
+        if !self.recover_host_faults {
+            return self.store_with_progress(addr, val, elem);
+        }
+        let off = self.off(addr, elem).ok_or((MemTrap::Unmapped, 0))?;
+        // SAFETY: off validates the range; the caller preflighted selected pages.
+        unsafe { crate::usercopy::store_preflighted(self.base.add(off), val, elem) }.map_err(
+            |fault| {
+                (
+                    crate::memory::record_host_fault(
+                        self.guest_base + (fault.at - self.base as usize) as u64,
+                    ),
+                    fault.committed,
+                )
+            },
+        )
+    }
+
     #[inline(always)]
     fn store_mode<const ROUTED: bool>(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
-        let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
+        self.store_mode_with_progress::<ROUTED>(addr, val, elem)
+            .map_err(|(trap, _)| trap)
+    }
+    #[inline(always)]
+    fn store_mode_with_progress<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        val: u64,
+        elem: u8,
+    ) -> Result<(), (MemTrap, usize)> {
+        let off = self.off(addr, elem).ok_or((MemTrap::Unmapped, 0))?;
         // SAFETY: off validated the full guest range; default mode requires host accessibility.
         if !ROUTED {
             unsafe { crate::memory::plain_write(self.base.add(off), val, elem) };
             return Ok(());
         }
-        unsafe { crate::usercopy::store(self.base.add(off), val, elem) }.map_err(|at| {
-            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
+        unsafe { crate::usercopy::store(self.base.add(off), val, elem) }.map_err(|fault| {
+            (
+                crate::memory::record_host_fault(
+                    self.guest_base + (fault.at - self.base as usize) as u64,
+                ),
+                fault.committed,
+            )
         })
     }
 }
@@ -8485,14 +8540,8 @@ impl StrMem for RawStrMem {
     }
 
     fn sstore_preflighted(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
-        if !self.recover_host_faults {
-            return self.sstore(addr, val, elem);
-        }
-        let off = self.off(addr, elem).ok_or(MemTrap::Unmapped)?;
-        // SAFETY: off validates the range; the caller preflighted selected pages.
-        unsafe { crate::usercopy::store_preflighted(self.base.add(off), val, elem) }.map_err(|at| {
-            crate::memory::record_host_fault(self.guest_base + (at - self.base as usize) as u64)
-        })
+        self.store_preflighted_with_progress(addr, val, elem)
+            .map_err(|(trap, _)| trap)
     }
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
         if self.recover_host_faults {

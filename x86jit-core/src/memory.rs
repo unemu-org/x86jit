@@ -1998,12 +1998,16 @@ impl Memory {
         // `Arc<Vm>` on a worker thread (M7 threaded embedder). The range sits inside a
         // mapped region `map()` bounds-checked.
         // SAFETY: the range is bounds-checked into a mapped region of the backing.
-        unsafe { self.copy_to_guest(self.host_base().cast_mut().add(start), bytes) }
-            .map_err(|_| MemError::Unmapped)?;
+        let result = unsafe { self.copy_to_guest(self.host_base().cast_mut().add(start), bytes) };
+        let committed = result
+            .as_ref()
+            .map_or_else(|fault| fault.committed, |()| bytes.len());
         // SMC: an embedder write (loader, syscall passthrough) over a code page
         // must invalidate too (§10).
-        self.note_write(guest_addr, bytes.len());
-        Ok(())
+        if committed != 0 {
+            self.note_write(guest_addr, committed);
+        }
+        result.map_err(|_| MemError::Unmapped)
     }
 
     /// Guest-side wide read for the x87 helpers (`&self`, interior-mutable model):
@@ -2252,7 +2256,11 @@ impl Memory {
         }
     }
 
-    unsafe fn copy_to_guest(&self, ptr: *mut u8, buf: &[u8]) -> Result<(), usize> {
+    unsafe fn copy_to_guest(
+        &self,
+        ptr: *mut u8,
+        buf: &[u8],
+    ) -> Result<(), crate::usercopy::WriteFault> {
         // SAFETY: same contract as copy_from_guest, with writable guest bytes.
         unsafe {
             if self.recover_host_faults {
@@ -2365,7 +2373,7 @@ impl Memory {
             return Ok(());
         }
         // SAFETY: region_for validates the entire range; the local source is live.
-        unsafe {
+        let result = unsafe {
             let ptr = self.host_base().cast_mut().add(self.host_off(addr));
             if ROUTED {
                 crate::usercopy::copy_out(ptr, bytes)
@@ -2373,9 +2381,15 @@ impl Memory {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 Ok(())
             }
+        };
+        let committed = result
+            .as_ref()
+            .map_or_else(|fault| fault.committed, |()| bytes.len());
+        if committed != 0 {
+            self.note_write_observed(addr, committed, observer);
         }
-        .map_err(|at| {
-            let addr = self.guest_base + (at - self.host_base() as usize) as u64;
+        result.map_err(|fault| {
+            let addr = self.guest_base + (fault.at - self.host_base() as usize) as u64;
             record_host_fault(addr);
             crate::fault::record_fp_fault(
                 addr,
@@ -2383,9 +2397,7 @@ impl Memory {
                 crate::FaultOrigin::HostAccess,
                 crate::AddressPrecision::ExactByte,
             )
-        })?;
-        self.note_write_observed(addr, bytes.len(), observer);
-        Ok(())
+        })
     }
 
     /// Scalar read used by the interpreter and trap-out path (§8.1). Little-endian.
@@ -2565,7 +2577,12 @@ impl Memory {
                     crate::usercopy::store(ptr, val, size)
                 }
             }
-            .map_err(|at| self.host_fault(at))?;
+            .map_err(|fault| {
+                if fault.committed != 0 {
+                    self.note_write_observed(addr, fault.committed, observer);
+                }
+                self.host_fault(fault.at)
+            })?;
         } else {
             unsafe { atomic_store_le(ptr, val, size) };
         }

@@ -404,16 +404,25 @@ impl x86jit_core::interp::StrMem for NotifyingStrMem<'_> {
         value: u64,
         elem: u8,
     ) -> Result<(), x86jit_core::MemTrap> {
-        self.raw.sstore_preflighted(addr, value, elem)?;
-        self.memory.note_write(addr, elem as usize);
-        Ok(())
+        let result = self.raw.store_preflighted_with_progress(addr, value, elem);
+        let committed = result
+            .as_ref()
+            .map_or_else(|&(_, committed)| committed, |()| elem as usize);
+        if committed != 0 {
+            self.memory.note_write(addr, committed);
+        }
+        result.map_err(|(trap, _)| trap)
     }
 
     fn sstore(&self, addr: u64, value: u64, elem: u8) -> Result<(), x86jit_core::MemTrap> {
-        self.raw.sstore(addr, value, elem)?;
-        // note_write fences before inspecting live source tags (§10).
-        self.memory.note_write(addr, elem as usize);
-        Ok(())
+        let result = self.raw.store_with_progress(addr, value, elem);
+        let committed = result
+            .as_ref()
+            .map_or_else(|&(_, committed)| committed, |()| elem as usize);
+        if committed != 0 {
+            self.memory.note_write(addr, committed);
+        }
+        result.map_err(|(trap, _)| trap)
     }
 }
 
@@ -436,11 +445,14 @@ impl FpMem for NotifyingFpMem<'_> {
     }
 
     fn store_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
-        self.raw.store_checked(addr, bytes)?;
-        // An unmasked exception can suppress an x87 store (SDM Vol 1 §8.5.1.2).
-        // Notify only a committed transfer.
-        self.memory.note_write(addr, bytes.len());
-        Ok(())
+        let result = self.raw.store_checked_with_progress(addr, bytes);
+        let committed = result
+            .as_ref()
+            .map_or_else(|&(_, committed)| committed, |()| bytes.len());
+        if committed != 0 {
+            self.memory.note_write(addr, committed);
+        }
+        result.map_err(|(at, _)| at)
     }
 
     fn fault_addr(&self, addr: u64) -> u64 {
@@ -5351,6 +5363,118 @@ unsafe extern "C" fn fp_boundary_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_copy_fault_invalidates_compiled_prefix_only() {
+        use x86jit_core::interp::StrMem;
+        use x86jit_core::{BlockKey, CpuMode, Exit, HostRam, Prot, Reg, RegionKind, Vm, VmConfig};
+        // SAFETY: sysconf has no pointer arguments.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        for path in ["fp", "string", "preflighted_string"] {
+            for commits in [false, true] {
+                let len = page * 4;
+                let layout = std::alloc::Layout::from_size_align(len, page).unwrap();
+                // SAFETY: nonzero layout, owned by HostRam's destructor below.
+                let base = unsafe { std::alloc::alloc_zeroed(layout) };
+                if base.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                let ram = HostRam {
+                    ptr: base,
+                    len,
+                    guest_base: 0,
+                    protect: None,
+                    dtor: Box::new(move |ptr, _| {
+                        // SAFETY: ptr and layout are the allocation transferred above.
+                        unsafe { std::alloc::dealloc(ptr, layout) };
+                    }),
+                };
+                let mut vm = x86jit_core::with_barrier_unavailable(|| {
+                    Vm::with_backend_host_ram(
+                        VmConfig::flat(len as u64),
+                        Box::new(JitBackend::new()),
+                        ram,
+                    )
+                    .unwrap()
+                });
+                vm.map(0, len, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.mem.set_host_fault_recovery(true);
+                vm.set_tier_up_after(None);
+                let second = (page * 2) as u64;
+                let first = second - if path == "fp" { 16 } else { 4 };
+                vm.write_bytes(first, &[0xb0, 1, 0x90, 0xf4]).unwrap();
+                vm.write_bytes(second, &[0xf4]).unwrap();
+                let mut cpu = vm.new_vcpu();
+                for entry in [first, second] {
+                    cpu.set_reg(Reg::Rip, entry);
+                    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                }
+                let key = BlockKey::new(first, CpuMode::Long64);
+                let suffix_key = BlockKey::new(second, CpuMode::Long64);
+                let Some(CachedBlock::Compiled { entry: before }) = vm.cache.get(key) else {
+                    panic!("first block must be compiled")
+                };
+                let Some(CachedBlock::Compiled { entry: suffix }) = vm.cache.get(suffix_key) else {
+                    panic!("suffix must be compiled")
+                };
+                let fault = if commits { second } else { first };
+                let failed = x86jit_core::with_copy_out_fault(
+                    base as usize + first as usize..base as usize + page * 3,
+                    base as usize + fault as usize,
+                    || {
+                        if path == "fp" {
+                            let mem = NotifyingFpMem {
+                                raw: RawFpMem {
+                                    base,
+                                    size: len as u64,
+                                    guest_base: 0,
+                                    recover_host_faults: true,
+                                },
+                                memory: &vm.mem,
+                            };
+                            let mut bytes = [0x90; 32];
+                            bytes[..4].copy_from_slice(&[0xb0, 2, 0x90, 0xf4]);
+                            mem.store_checked(first, &bytes) == Err(fault)
+                        } else {
+                            let mem = NotifyingStrMem {
+                                raw: x86jit_core::interp::RawStrMem {
+                                    base,
+                                    size: len as u64,
+                                    guest_base: 0,
+                                    recover_host_faults: true,
+                                },
+                                memory: &vm.mem,
+                            };
+                            let value =
+                                u64::from_le_bytes([0xb0, 2, 0x90, 0xf4, 0x90, 0x90, 0x90, 0x90]);
+                            let result = if path == "string" {
+                                mem.sstore(first, value, 8)
+                            } else {
+                                mem.sstore_preflighted(first, value, 8)
+                            };
+                            result == Err(x86jit_core::MemTrap::HostFault)
+                        }
+                    },
+                );
+                assert!(failed, "{path}");
+                assert_eq!(vm.mem.has_dirty_code(), commits, "{path}");
+                cpu.set_reg(Reg::Rip, first);
+                assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+                assert_eq!(cpu.reg(Reg::Rax), if commits { 2 } else { 1 }, "{path}");
+                let Some(CachedBlock::Compiled { entry: after }) = vm.cache.get(key) else {
+                    panic!("first block must be compiled")
+                };
+                assert_eq!(before.0 == after.0, !commits, "{path}");
+                let Some(CachedBlock::Compiled { entry: after }) = vm.cache.get(suffix_key) else {
+                    panic!("suffix must stay compiled")
+                };
+                assert_eq!(
+                    suffix.0, after.0,
+                    "{path}: untouched suffix was invalidated"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fma_scalar_helper_carriers_use_element_width() {

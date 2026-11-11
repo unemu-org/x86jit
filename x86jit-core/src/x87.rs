@@ -192,14 +192,21 @@ impl FpMem for RawFpMem {
         }
     }
     fn store_checked(&self, addr: u64, buf: &[u8]) -> Result<(), u64> {
-        if self.recover_host_faults {
-            self.store_mode::<true>(addr, buf)
-        } else {
-            self.store_mode::<false>(addr, buf)
-        }
+        self.store_checked_with_progress(addr, buf)
+            .map_err(|(at, _)| at)
     }
 }
 impl RawFpMem {
+    /// A failed store reports `(fault_address, committed_prefix_len)` for SMC (§10).
+    /// The embedder must keep backing and protections stable through commit.
+    pub fn store_checked_with_progress(&self, addr: u64, bytes: &[u8]) -> Result<(), (u64, usize)> {
+        if self.recover_host_faults {
+            self.store_mode::<true>(addr, bytes)
+        } else {
+            self.store_mode::<false>(addr, bytes)
+        }
+    }
+
     #[inline(always)]
     fn load_mode<const ROUTED: bool>(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
         let off = self.off(addr, buf.len()).ok_or_else(|| {
@@ -232,16 +239,19 @@ impl RawFpMem {
         })
     }
     #[inline(always)]
-    fn store_mode<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+    fn store_mode<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), (u64, usize)> {
         let off = self.off(addr, bytes.len()).ok_or_else(|| {
             if ROUTED {
                 crate::memory::record_host_fault(addr);
             }
-            crate::fault::record_fp_fault(
-                addr,
-                bytes.len(),
-                crate::FaultOrigin::GuestMap,
-                crate::AddressPrecision::TransferAddress,
+            (
+                crate::fault::record_fp_fault(
+                    addr,
+                    bytes.len(),
+                    crate::FaultOrigin::GuestMap,
+                    crate::AddressPrecision::TransferAddress,
+                ),
+                0,
             )
         })?;
         // SAFETY: off checked the complete span; default mode requires host accessibility.
@@ -251,14 +261,17 @@ impl RawFpMem {
             };
             return Ok(());
         }
-        unsafe { crate::usercopy::copy_out(self.base.add(off), bytes) }.map_err(|at| {
-            let addr = self.guest_base + (at - self.base as usize) as u64;
+        unsafe { crate::usercopy::copy_out(self.base.add(off), bytes) }.map_err(|fault| {
+            let addr = self.guest_base + (fault.at - self.base as usize) as u64;
             crate::memory::record_host_fault(addr);
-            crate::fault::record_fp_fault(
-                addr,
-                bytes.len(),
-                crate::FaultOrigin::HostAccess,
-                crate::AddressPrecision::ExactByte,
+            (
+                crate::fault::record_fp_fault(
+                    addr,
+                    bytes.len(),
+                    crate::FaultOrigin::HostAccess,
+                    crate::AddressPrecision::ExactByte,
+                ),
+                fault.committed,
             )
         })
     }
