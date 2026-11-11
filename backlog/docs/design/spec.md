@@ -1745,3 +1745,19 @@ can run. Indirect Rust helpers are outside that table.
 - **Output:** `run()` returns an `Exit` (syscall/mmio/unknown/…); guest state readable/writable between calls.
 - **Hot path (RAM):** inline in codegen, never a callback.
 - **Rare events (syscall, MMIO):** trap-out via `Exit`.
+### 17.9 Real16 coprocessor model and x87 limit checks
+
+`Vcpu::set_fpu_model` selects `FpuModel::Present` (the default, the existing x87
+engine) or `FpuModel::None` (no attached coprocessor); `Vcpu::set_fpu_emulation`
+supplies MSW.EM until legacy CR0 state exists. With EM set, every ESC opcode
+(D8h-DFh, including reserved encodings) raises #NM before any #UD (SDM Vol 3A §2.5,
+Table 2-2; 80386 PRM §§11.1.2-11.1.3). With `None` and EM clear, ESC inputs keep the
+CPU's operand checks and leave the x87 image unchanged; coprocessor outputs return
+`Exit::UnknownInstruction`, because the pinned sources do not specify empty-socket
+values.
+
+In both models, an x87 memory operand that does not fit below the Real16 segment
+end faults. An SS-relative operand faults with #GP (vector 13), although SDM Vol 2A
+§3.3 FLD (Real-Address Mode Exceptions) and 80386 PRM §14.7 item 7 prescribe #SS
+(vector 12). This deliberate divergence keeps x87 consistent with the engine's
+existing Real16 scalar policy.

@@ -3,6 +3,69 @@
 use super::*;
 use crate::ir::*;
 
+// Keep the default Real16 IR independent of per-vCPU policy. EM must win
+// before effective-address checks, and an absent FPU must not report stale ES.
+#[inline(never)]
+pub(super) fn real16_x87_gate<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    ir: &IrBlock,
+    start: usize,
+    ip: u64,
+) -> Option<WalkResult> {
+    if !ir.ops[start + 1..]
+        .iter()
+        .take_while(|op| !matches!(op, IrOp::InsnStart { .. }))
+        .any(|op| {
+            matches!(
+                op,
+                IrOp::X87 { .. } | IrOp::IntGate { vector: 6, .. } | IrOp::Unsupported { .. }
+            )
+        })
+    {
+        return None;
+    }
+    let mut bytes = [0; 15];
+    // SDM Vol 3B §23.1.4, Table 23-1: fetching beyond CS:FFFF faults.
+    let available = bytes.len().min((0x10000 - ip) as usize);
+    let pa = (u64::from(cpu.cs) << 4) + ip;
+    let fetched = mem
+        .0
+        .normal()
+        .fetch_code(pa, &mut bytes[..available])
+        .ok()?;
+    if !crate::x87::is_esc(&bytes[..fetched]) {
+        return None; // WAIT/FWAIT is opcode 9B, outside the ESC class.
+    }
+    // 80386 PRM §§11.1.2–11.1.3, pp. 11-1–11-2: the first five opcode
+    // bits identify ESC, including reserved encodings, before coprocessor decode.
+    // SDM Vol 3A §2.5, Table 2-2: EM traps ESC, not WAIT (MP/TS unmodeled).
+    if cpu.fpu_emulation {
+        return Some(WalkResult::delivered_fault(deliver_interrupt_mode(
+            cpu, mem, ip, 7, ip,
+        )));
+    }
+    if cpu.fpu_model == crate::FpuModel::None && crate::x87::esc_output(&bytes[..fetched]) {
+        // The pinned CPU manuals do not specify empty-socket transfer values.
+        // Leave the instruction for the embedder rather than inventing a result.
+        let mut decoder = iced_x86::Decoder::with_ip(
+            16,
+            &bytes[..fetched],
+            ip,
+            crate::lift::decoder_options(crate::CpuMode::Real16),
+        );
+        let len = decoder.decode().len();
+        bytes[len..].fill(0);
+        cpu.rip = ip;
+        return Some(WalkResult::exit(Exit::UnknownInstruction {
+            addr: ip,
+            bytes,
+            len: len as u8,
+        }));
+    }
+    None
+}
+
 // Keep the descriptor commit in the interpreter dispatch, without a new frame.
 #[inline(always)]
 pub(crate) fn exec_x87<const ROUTED: bool>(
@@ -48,7 +111,7 @@ pub(crate) fn exec_x87<const ROUTED: bool>(
         return Some(InterpResult::exit(crate::fault::fp_exit(
             cur_addr,
             fault,
-            crate::x87::mem_operand_bytes(*kind) as u16,
+            crate::x87::mem_operand_bytes_format(*kind, *sti) as u16,
             access,
         )));
     }

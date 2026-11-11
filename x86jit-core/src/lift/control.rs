@@ -458,12 +458,16 @@ pub(crate) fn lift_x87<B: LiftBuffer>(
             fault: Default::default(),
             kind,
             addr,
-            // SDM Vol 1 §8.1.10: the accepted 28-byte environment has a
-            // separate real-address layout. Bit 7 selects it for these two ops.
+            // SDM Vol 1 §8.1.10, Figs. 8-10/8-12: real-address layouts.
             sti: if insn.code_size() == iced_x86::CodeSize::Code16
-                && matches!(kind, K::Fldenv | K::Fnstenv)
+                && matches!(kind, K::Fldenv | K::Fnstenv | K::Fnsave | K::Frstor)
             {
-                0x80
+                crate::x87::X87_ENV_REAL
+                    | if matches!(msz, 14 | 94) {
+                        crate::x87::X87_ENV16
+                    } else {
+                        0
+                    }
             } else {
                 sti
             },
@@ -741,26 +745,31 @@ pub(crate) fn lift_x87<B: LiftBuffer>(
                 });
             }
         }
-        // `fnstenv`/`fstenv` (the waiting form maps to the same kind — the implicit
-        // `fwait` is a no-op since FP exceptions aren't modeled). Only the 28-byte
-        // image is lifted; the 14-byte one (`66` prefix, or 16-bit operand size) is a
-        // different field layout with 16-bit pointer offsets, so it is refused rather
-        // than silently written in the 32-bit shape.
         Fnstenv | Fstenv => {
-            if msz != 28 {
+            if msz != 28 && !(msz == 14 && insn.code_size() == iced_x86::CodeSize::Code16) {
                 return Err(unsupported_insn(insn));
             }
             emit(K::Fnstenv, ops, tg)?
         }
-        // `fldenv` — the restore half of the pair. Same 28-byte-only restriction as
-        // `fnstenv`: the 14-byte image (`66 D9 /4`) has 16-bit pointer offsets at
-        // different offsets, so it is refused rather than read in the 32-bit shape.
-        // There is no waiting form to fold in — `D9 /4` is the whole encoding.
         Fldenv => {
-            if msz != 28 {
+            if msz != 28 && !(msz == 14 && insn.code_size() == iced_x86::CodeSize::Code16) {
                 return Err(unsupported_insn(insn));
             }
             emit(K::Fldenv, ops, tg)?
+        }
+        Fnsave | Fsave | Frstor if insn.code_size() == iced_x86::CodeSize::Code16 => {
+            if msz != 94 {
+                return Err(unsupported_insn(insn));
+            }
+            emit(
+                if insn.mnemonic() == Frstor {
+                    K::Frstor
+                } else {
+                    K::Fnsave
+                },
+                ops,
+                tg,
+            )?;
         }
         Fprem => emit(K::Fprem, ops, tg)?,
         // Transcendentals: f64-precision, ST(0)/ST(1)-implicit (no operand).

@@ -1147,7 +1147,23 @@ mod tests {
 
     #[test]
     fn probe_requires_complete_fwait_prefixed_instruction() {
-        for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+        // Real16 lifts the 16-bit FSAVE/FSTENV images (xj-562.11); its other
+        // unsupported waiting forms report Unsupported, which also gives no credit.
+        for code in [Code::Fdisi, Code::Feni, Code::Fsave_m108byte, Code::Fsetpm] {
+            assert_eq!(
+                probe_code_in(code, CpuMode::Real16),
+                Some(Probe::Unsupported),
+                "Real16: {code:?} must not receive credit for lifting only FWAIT"
+            );
+        }
+        for code in [Code::Fsave_m94byte, Code::Fstenv_m14byte] {
+            assert_eq!(
+                probe_code_in(code, CpuMode::Real16),
+                Some(Probe::Lifted),
+                "Real16: {code:?}"
+            );
+        }
+        for mode in [CpuMode::Long64, CpuMode::Compat32] {
             for code in [
                 Code::Fdisi,
                 Code::Feni,

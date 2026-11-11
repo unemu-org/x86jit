@@ -380,7 +380,7 @@ pub enum IrOp {
         addr: Val,
         // Effective offset before segmentation (SDM Vol 1 §8.1.8).
         operand_offset: Val,
-        // ST(i), or bit 7 for a real-address 28-byte environment.
+        // ST(i), or X87_ENV16/X87_ENV_REAL for environment operations.
         sti: u8,
     },
 
@@ -2626,7 +2626,7 @@ pub enum IrOp {
         ss: Option<Val>,
         ip: Val,
     },
-    /// A decoded descriptor-dependent form delegated exactly to the embedder.
+    /// A decoded form delegated exactly to the embedder (including Real16 ESC gaps).
     Unsupported {
         bytes: [u8; 15],
         len: u8,

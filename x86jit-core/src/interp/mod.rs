@@ -330,7 +330,15 @@ pub(crate) fn step_one_mode<const ROUTED: bool>(
             }
         }
         Err(crate::lift::LiftError::Unsupported { addr, bytes, len }) => {
-            StepResult::Exit(Exit::UnknownInstruction { addr, bytes, len })
+            let exit = Exit::UnknownInstruction { addr, bytes, len };
+            StepResult::Exit(if crate::x87::emulated_esc(cpu, mode, &exit) {
+                // 80386 PRM Ch. 11 §11.1.3, p. 11-2; SDM Vol 3A §2.5:
+                // EM also traps ESC operations the x87 engine cannot execute.
+                info.retired = 0;
+                crate::fault::qualify_real16(Exit::exception(addr, 7), cpu)
+            } else {
+                exit
+            })
         }
         Err(crate::lift::LiftError::DecodeFault { addr }) => {
             StepResult::Exit(crate::fault::fetch_exit(mem, at, mode, addr, fetch_failure))
@@ -801,7 +809,7 @@ fn walk_ops<
 ) -> WalkResult {
     let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
-    for op in &ir.ops {
+    for (op_index, op) in ir.ops.iter().enumerate() {
         if CHILD {
             mem.0.begin_op(op, temps, cpu);
         }
@@ -861,6 +869,13 @@ fn walk_ops<
                 cur_addr.set(*guest_addr);
                 if !CHILD && bracket.active() {
                     crate::lockstep::on_insn_start(&mut bracket, cpu, mem, *guest_addr);
+                }
+                if ir.mode == crate::CpuMode::Real16
+                    && (cpu.fpu_emulation || cpu.fpu_model == crate::FpuModel::None)
+                {
+                    if let Some(result) = real16_x87_gate(cpu, mem, ir, op_index, *guest_addr) {
+                        return result;
+                    }
                 }
             }
             IrOp::MmxConvert {
@@ -1336,10 +1351,36 @@ fn walk_ops<
                 }
             }
             IrOp::X87 {
-                fault, addr, kind, ..
+                fault,
+                addr,
+                kind,
+                sti,
+                operand_offset,
+                ..
             } => {
                 if CHILD {
                     unreachable!("helper refused before child execution");
+                }
+                if ir.mode == crate::CpuMode::Real16 {
+                    // SDM Vol 2A §3.3 FLD/FLDENV/FRSTOR, Real-Address Mode
+                    // Exceptions: the complete operand must fit in the segment.
+                    // #GP for SS-relative data is a deliberate compatibility
+                    // divergence from their #SS rule and 80386 PRM §14.7 item 7,
+                    // p. 14-6; keep the scalar `with_segment` policy here.
+                    // 80386 PRM Ch. 11 §11.1.2, p. 11-1: EM is tested first.
+                    let bytes = crate::x87::mem_operand_bytes_format(*kind, *sti);
+                    if bytes > 4 && read_val(*operand_offset, temps) + bytes > 0x10000 {
+                        return WalkResult::delivered_fault(deliver_interrupt_mode(
+                            cpu,
+                            mem,
+                            cur_addr.get(),
+                            13,
+                            cur_addr.get(),
+                        ));
+                    }
+                    if cpu.fpu_model == crate::FpuModel::None {
+                        continue;
+                    }
                 }
                 let (mem, _ordering) =
                     mem.helper(if crate::x87::mem_write_bytes(*kind).is_some() {
@@ -4572,6 +4613,16 @@ fn walk_ops<
             IrOp::Unsupported { bytes, len } => {
                 if CHILD {
                     unreachable!("helper refused before child execution");
+                }
+                // 80386 PRM §§11.1.2–11.1.3: CPU ESC classification precedes
+                // coprocessor decode. Input ESC needs only its CPU operand checks
+                // when no coprocessor is attached; x87 state stays untouched.
+                if ir.mode == crate::CpuMode::Real16
+                    && cpu.fpu_model == crate::FpuModel::None
+                    && crate::x87::is_esc(&bytes[..usize::from(*len)])
+                    && !crate::x87::esc_output(&bytes[..usize::from(*len)])
+                {
+                    continue;
                 }
                 cpu.rip = cur_addr.get();
                 return WalkResult::exit(Exit::UnknownInstruction {

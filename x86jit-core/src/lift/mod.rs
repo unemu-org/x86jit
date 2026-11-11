@@ -305,7 +305,7 @@ impl FetchAddr {
 /// prefix on a register operand — that check is 486+ — so `lock add ah,ch` must
 /// execute, not fault-to-decode. It also lets `8E /1` (`mov cs, r/m16`) decode so the
 /// lift can raise the architectural `#UD` for it, rather than a spurious decode fault.
-fn decoder_options(mode: CpuMode) -> u32 {
+pub(crate) fn decoder_options(mode: CpuMode) -> u32 {
     if mode.wraps_16() {
         DecoderOptions::NO_INVALID_CHECK
     } else {
@@ -855,10 +855,13 @@ fn lift_block_attempt(
                 // Lowering can emit ops before discovering an unsupported operand.
                 // None may execute; dispatch retries this instruction after the prefix.
                 ops.truncate(ops_start);
-                if icount > 0 {
-                    break;
+                if !lower_real16_esc_gap(&insn, code, start, mode, &mut ops, &mut tg)? {
+                    if icount > 0 {
+                        break;
+                    }
+                    return Err(refill_unsupported_bytes(e, code, start));
                 }
-                return Err(refill_unsupported_bytes(e, code, start));
+                false
             }
         };
         mark_memory_accesses(&insn, mode, &mut ops[ops_start..]);
@@ -984,7 +987,12 @@ fn lift_one_attempt(
             icount: 1,
         });
     }
-    lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg)?;
+    if let Err(error) = lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg) {
+        ops.clear();
+        if !lower_real16_esc_gap(&insn, code, start, mode, &mut ops, &mut tg)? {
+            return Err(error);
+        }
+    }
 
     Ok(IrBlock {
         legacy_context: None,
@@ -995,6 +1003,45 @@ fn lift_one_attempt(
         guest_len: insn.len() as u32,
         icount: 1,
     })
+}
+
+/// Preserve CPU operand checks even when the Present engine cannot execute ESC.
+fn lower_real16_esc_gap(
+    insn: &Instruction,
+    code: &[u8],
+    start: u64,
+    mode: CpuMode,
+    ops: &mut Vec<IrOp>,
+    tg: &mut TempGen,
+) -> Result<bool, LiftError> {
+    let offset = insn.ip().wrapping_sub(start) as usize;
+    let raw = &code[offset..offset + insn.len()];
+    if mode != CpuMode::Real16 || !crate::x87::is_esc(raw) {
+        return Ok(false);
+    }
+    let mut bytes = [0; 15];
+    bytes[..raw.len()].copy_from_slice(raw);
+    ops.push(IrOp::InsnStart {
+        guest_addr: insn.ip(),
+    });
+    // Present exits here, before the absent-coprocessor operand checks.
+    ops.push(IrOp::Unsupported {
+        bytes,
+        len: insn.len() as u8,
+    });
+    if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
+        let offset = effective_address_no_segment(insn, ops, tg)?;
+        // SDM Vol 2A §3.3 FBLD/FRSTOR, Real-Address Mode Exceptions:
+        // the entire operand must fit. Vector 13 retains Real16's scalar policy;
+        // see the documented SS divergence at `with_segment`.
+        ops.push(IrOp::SegLimitCheck {
+            offset,
+            size: insn.memory_size().size() as u8,
+            vector: 13,
+            fault_ip: mask_pc(insn.ip(), mode),
+        });
+    }
+    Ok(true)
 }
 
 fn lower_one<const CHILD: bool>(
@@ -2524,7 +2571,9 @@ fn lift_insn_inner(
         | Ficomp | Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu
         | Fsqrt | Fprem1 | Fscale | Fcom | Fcomp | Fcompp | Fucom | Fucomp | Fucompp | Ftst
         | Fxam | Frndint | Fxtract | Fldpi | Fldl2e | Fldl2t | Fldlg2 | Fldln2 | Fist | Fnop
-        | Wait | Ffree | Fincstp | Fdecstp => lift_x87(insn, ops, tg).map(|_| false),
+        | Wait | Ffree | Fincstp | Fdecstp | Fsave | Fnsave | Frstor => {
+            lift_x87(insn, ops, tg).map(|_| false)
+        }
         Bsf => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsf).map(|_| false),
         Bsr => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Bsr).map(|_| false),
         Tzcnt => lift_bitscan(insn, ops, tg, crate::ir::BitScanOp::Tzcnt).map(|_| false),
@@ -4812,7 +4861,17 @@ fn fill_ir_bytes(insn: &Instruction, code: &[u8], start: u64, ops: &mut [IrOp]) 
             use crate::x87::{FpuKind::*, X87_MEMORY, X87_RECORD};
             if matches!(
                 *kind,
-                Fldcw | Fnstcw | Fnstsw | FnstswMem | Fnstenv | Fldenv | Fninit | Fnclex | Fwait
+                Fldcw
+                    | Fnstcw
+                    | Fnstsw
+                    | FnstswMem
+                    | Fnstenv
+                    | Fldenv
+                    | Fninit
+                    | Fnclex
+                    | Fwait
+                    | Fnsave
+                    | Frstor
             ) {
                 continue;
             }
@@ -5083,10 +5142,11 @@ pub(crate) fn with_segment(
         // one place, before the `Load`/`Store` that follows. The width is iced's memory-
         // operand size; an unknown/zero width (nothing to bound) is skipped.
         //
-        // The vector is `#GP` (13) even for an SS-relative *data* operand (BP-based): the
-        // 80286 corpus captures #GP there, not #SS. `#SS` (12) is a stack-pointer (SS:SP)
-        // fault, and those accesses go through `stack_addr`, not this path — a separate
-        // concern, left unmodeled.
+        // Compatibility policy: retain #GP for ordinary SS-relative data operands
+        // (including x87). This deliberately diverges from 80386 PRM §14.7 item 7,
+        // p. 14-6, and SDM Vol 2A §3.3 FLD, Real-Address Mode Exceptions: both
+        // prescribe #SS when SS addresses an operand crossing the segment limit.
+        // SS:SP stack operations use their separate path.
         let size = insn.memory_size().size();
         if (1..=4).contains(&size) {
             ops.push(IrOp::SegLimitCheck {

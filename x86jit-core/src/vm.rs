@@ -2053,6 +2053,28 @@ impl Vcpu {
         self.cpu.fpu_cw = cw;
     }
 
+    /// Coprocessor policy for this vCPU. Currently consumed only in Real16.
+    pub fn fpu_model(&self) -> crate::FpuModel {
+        self.cpu.fpu_model
+    }
+
+    /// Select between runs. The x87 register image and cached IR are retained.
+    /// Long64/Compat32 continue to use the existing x87 engine.
+    pub fn set_fpu_model(&mut self, model: crate::FpuModel) {
+        self.cpu.fpu_model = model;
+    }
+
+    /// Real16 MSW.EM input (SDM Vol 3A §2.5, Table 2-2;
+    /// 80386 PRM Ch. 11 §11.1.3, p. 11-2). MP/TS are not modeled here.
+    pub fn fpu_emulation(&self) -> bool {
+        self.cpu.fpu_emulation
+    }
+
+    /// Set Real16 MSW.EM between runs; independent of coprocessor presence.
+    pub fn set_fpu_emulation(&mut self, enabled: bool) {
+        self.cpu.fpu_emulation = enabled;
+    }
+
     /// Guest SSE control/status register, including the stored sticky flags
     /// (SDM Vol 1 §10.2.3). Round-trips through LDMXCSR/STMXCSR and FXSAVE/FXRSTOR;
     /// RC/FTZ/DAZ govern SIMD arithmetic; arithmetic does not set sticky flags.
@@ -2431,6 +2453,12 @@ impl Vcpu {
                 0,
             ) {
                 Ok(block) => block,
+                Err(exit) if crate::x87::emulated_esc(&self.cpu, self.mode, &exit) => {
+                    match self.step_instruction(vm) {
+                        StepResult::Continue => continue,
+                        StepResult::Exit(exit) => return StepStop::Exit(exit),
+                    }
+                }
                 Err(exit) => return StepStop::Exit(exit),
             };
             let CachedBlock::Interpreted(ir) = block else {
@@ -2912,6 +2940,17 @@ impl Vcpu {
                                 self.fast_put(self.cpu.rip, *entry);
                             }
                             b
+                        }
+                        Err(exit) if crate::x87::emulated_esc(&self.cpu, self.mode, &exit) => {
+                            match self.step_instruction(vm) {
+                                StepResult::Continue => {
+                                    if BOUNDED {
+                                        blocks_run += 1;
+                                    }
+                                    continue;
+                                }
+                                StepResult::Exit(exit) => return Ok(exit),
+                            }
                         }
                         Err(exit) => return Ok(exit),
                     }

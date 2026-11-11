@@ -514,14 +514,9 @@ pub enum FpuKind {
     Fnstcw,    // store control word to memory
     Fnstsw,    // store status word to AX (register form)
     FnstswMem, // store status word to [mem] (memory form)
-    /// `fnstenv m28byte`: store the 28-byte x87 environment, then mask every FP
-    /// exception. Only the 28-byte (32-bit-layout) image is lifted — see
-    /// [`env28`] for the field-by-field fidelity note.
+    /// Store the environment, then mask every FP exception; `sti` selects format.
     Fnstenv,
-    /// `fldenv m28byte`: load the 28-byte x87 environment — the restore half of the
-    /// pair FreeBSD's `<fenv.h>` wraps around `powf`/`expf`. Environment only: the
-    /// eight data registers are untouched (that is `frstor`). See [`load_env28`] for
-    /// the field-by-field decision.
+    /// Load the environment without changing the eight data registers.
     Fldenv,
     Fprem, // ST(0) = ST(0) rem ST(1)
     // Transcendentals. f64-precision (see `F80` transcendental methods);
@@ -542,6 +537,57 @@ pub enum FpuKind {
     // exceptions and the wait are not modeled, so the wait is a no-op.
     Fninit, // reset control word / status word / TOP
     Fnclex, // clear the exception flags
+    /// Save environment and logical ST(0)..ST(7), then initialize the FPU.
+    Fnsave,
+    /// Restore environment and logical ST(0)..ST(7).
+    Frstor,
+}
+
+/// Environment format bits in an X87 op's `sti` (SDM Vol 1 §8.1.10).
+pub const X87_ENV16: u8 = 0x40;
+pub const X87_ENV_REAL: u8 = 0x80;
+
+pub(crate) fn is_esc(bytes: &[u8]) -> bool {
+    // 80386 PRM Ch. 11 §11.1.2, p. 11-1: opcode begins with 11011b.
+    // Ch. 17 §17.2, pp. 17-2–17-3: skip instruction prefixes.
+    bytes
+        .iter()
+        .find(|b| {
+            !matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .is_some_and(|b| (0xd8..=0xdf).contains(b))
+}
+
+/// CPU-visible output classes, independent of the Present engine's coverage.
+pub(crate) fn esc_output(bytes: &[u8]) -> bool {
+    // SDM Vol 2D §B.17, Table B-39: stores use the odd ESC groups;
+    // Vol 2A §3.3 FISTTP: DB/DD/DF /1 are also memory outputs.
+    let Some(i) = bytes.iter().position(|b| (0xd8..=0xdf).contains(b)) else {
+        return false;
+    };
+    let Some(&modrm) = bytes.get(i + 1) else {
+        return false;
+    };
+    let opcode = bytes[i];
+    if modrm >= 0xc0 {
+        return opcode == 0xdf && modrm == 0xe0; // FNSTSW AX
+    }
+    let group = (modrm >> 3) & 7;
+    match opcode {
+        0xd9 => matches!(group, 2 | 3 | 6 | 7),
+        0xdb => matches!(group, 1 | 2 | 3 | 7),
+        0xdd | 0xdf => matches!(group, 1 | 2 | 3 | 6 | 7),
+        _ => false,
+    }
+}
+
+pub(crate) fn emulated_esc(cpu: &CpuState, mode: crate::CpuMode, exit: &crate::Exit) -> bool {
+    mode == crate::CpuMode::Real16
+        && cpu.fpu_emulation
+        && matches!(exit, crate::Exit::UnknownInstruction { bytes, len, .. } if is_esc(&bytes[..usize::from(*len)]))
 }
 
 /// x87 argument-reduction domain for `fsin`/`fcos`/`fptan`/`fsincos`: hardware reduces
@@ -910,6 +956,24 @@ fn env28(cpu: &CpuState, real: bool) -> [u8; 28] {
     buf
 }
 
+// SDM Vol 1 §8.1.10, Fig. 8-12: 14-byte real-address environment.
+fn env14(cpu: &CpuState) -> [u8; 14] {
+    let wide = env28(cpu, true);
+    let mut buf = [0u8; 14];
+    for (dst, src) in [0, 4, 8, 12, 16, 20, 24].into_iter().enumerate() {
+        buf[dst * 2..dst * 2 + 2].copy_from_slice(&wide[src..src + 2]);
+    }
+    buf
+}
+
+fn load_env14(cpu: &mut CpuState, buf: &[u8]) {
+    let mut wide = [0u8; 28];
+    for (src, dst) in [0, 4, 8, 12, 16, 20, 24].into_iter().enumerate() {
+        wide[dst..dst + 2].copy_from_slice(&buf[src * 2..src * 2 + 2]);
+    }
+    load_env28(cpu, &wide, true);
+}
+
 /// The full status word: TOP from `fpu_top`, everything else from `fpu_sw`
 /// (SDM Vol 1 §8.1.3). `fpu_top` stays the single source of truth for the stack pointer,
 /// so the two cannot drift apart.
@@ -1067,7 +1131,7 @@ fn waits_for_pending(kind: FpuKind) -> bool {
     use FpuKind::*;
     !matches!(
         kind,
-        Fninit | Fnstenv | Fnstsw | FnstswMem | Fnstcw | Fnclex
+        Fninit | Fnstenv | Fnstsw | FnstswMem | Fnstcw | Fnclex | Fnsave
     )
 }
 
@@ -1143,6 +1207,7 @@ pub fn mem_write_bytes(kind: FpuKind) -> Option<usize> {
         // (32-bit-layout) environment image — see [`env28`].
         Fnstcw | FnstswMem => 2,
         Fnstenv => 28,
+        Fnsave => 108,
         _ => return None,
     })
 }
@@ -1165,8 +1230,21 @@ pub fn mem_operand_bytes(kind: FpuKind) -> u64 {
         FildI16 | Fldcw | FicomI16 | FicompI16 | FiaddMemI16 | FisubMemI16 | FisubrMemI16
         | FimulMemI16 | FidivMemI16 | FidivrMemI16 => 2,
         Fldenv => 28,
+        Frstor => 108,
         _ => 0,
     }
+}
+
+/// Whole operand width including the 16-bit environment-format selection.
+pub fn mem_operand_bytes_format(kind: FpuKind, sti: u8) -> u64 {
+    if sti & X87_ENV16 != 0 {
+        match kind {
+            FpuKind::Fldenv | FpuKind::Fnstenv => return 14,
+            FpuKind::Frstor | FpuKind::Fnsave => return 94,
+            _ => {}
+        }
+    }
+    mem_operand_bytes(kind)
 }
 
 /// Lift-time descriptor flags. Bits 10:0 contain FOP, 29:16 the byte offset
@@ -1886,7 +1964,12 @@ fn exec_x87_inner<M: FpMem>(
             }
         }
         Fnstenv => {
-            if !mem.store(addr, &env28(cpu, sti & 0x80 != 0)) {
+            let stored = if sti & X87_ENV16 != 0 {
+                mem.store(addr, &env14(cpu))
+            } else {
+                mem.store(addr, &env28(cpu, sti & X87_ENV_REAL != 0))
+            };
+            if !stored {
                 return Some((mem.fault_addr(addr), true));
             }
             // SDM: "…and then masks all floating-point exceptions" — the store is
@@ -1896,10 +1979,50 @@ fn exec_x87_inner<M: FpMem>(
         }
         Fldenv => {
             let mut buf = [0u8; 28];
-            if !mem.load(addr, &mut buf) {
+            let len = mem_operand_bytes_format(kind, sti) as usize;
+            if !mem.load(addr, &mut buf[..len]) {
                 return Some((mem.fault_addr(addr), false));
             }
-            load_env28(cpu, &buf, sti & 0x80 != 0);
+            if sti & X87_ENV16 != 0 {
+                load_env14(cpu, &buf);
+            } else {
+                load_env28(cpu, &buf, sti & X87_ENV_REAL != 0);
+            }
+        }
+        Fnsave | Frstor => {
+            // SDM Vol 2A §3.3 FSAVE/FNSAVE and FRSTOR, Operation:
+            // stack registers follow the environment in logical ST order.
+            let len = mem_operand_bytes_format(kind, sti) as usize;
+            let env_len = len - 80;
+            let mut buf = [0u8; 108];
+            if kind == Fnsave {
+                if sti & X87_ENV16 != 0 {
+                    buf[..env_len].copy_from_slice(&env14(cpu));
+                } else {
+                    buf[..env_len].copy_from_slice(&env28(cpu, sti & X87_ENV_REAL != 0));
+                }
+                for i in 0..8 {
+                    let phys = (cpu.fpu_top as usize + i) & 7;
+                    buf[env_len + i * 10..env_len + (i + 1) * 10].copy_from_slice(&cpu.fpr[phys]);
+                }
+                if !mem.store(addr, &buf[..len]) {
+                    return Some((mem.fault_addr(addr), true));
+                }
+                return exec_x87_inner(cpu, mem, Fninit, 0, 0);
+            }
+            if !mem.load(addr, &mut buf[..len]) {
+                return Some((mem.fault_addr(addr), false));
+            }
+            if sti & X87_ENV16 != 0 {
+                load_env14(cpu, &buf);
+            } else {
+                let env: &[u8; 28] = buf[..28].try_into().unwrap();
+                load_env28(cpu, env, sti & X87_ENV_REAL != 0);
+            }
+            for i in 0..8 {
+                let phys = (cpu.fpu_top as usize + i) & 7;
+                cpu.fpr[phys].copy_from_slice(&buf[env_len + i * 10..env_len + (i + 1) * 10]);
+            }
         }
         Fninit => fninit(cpu),
         Fnclex => {

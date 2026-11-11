@@ -447,6 +447,39 @@ pub struct CpuState {
     pub port_string_in: Option<PortStringIn>,
     /// Reserved system state (decision-18 §2); inert in Application profiles.
     pub legacy: crate::legacy::LegacyCpuState,
+    /// Per-vCPU coprocessor selection. Only Real16 consumes this policy today.
+    /// Appended to preserve existing compiled-code offsets.
+    pub fpu_model: FpuModel,
+    /// Real16 MSW.EM input until legacy CR0 state is available. This is not
+    /// changed by selecting a coprocessor (SDM Vol 3A §2.5, Table 2-2;
+    /// 80386 PRM Ch. 11 §11.1.3, p. 11-2).
+    pub fpu_emulation: bool,
+}
+
+/// Coprocessor component of the future shared `LegacyCpuModel` profile
+/// (decision-18 §1). This is a policy value, not a CPU preset catalogue.
+/// Selection is per vCPU so CPUs sharing memory and cached IR remain independent.
+///
+/// Real16 limit checks: an x87 memory operand that does not fit below the segment
+/// end faults in both models, including the default. An SS-relative operand
+/// faults with #GP (vector 13), not the #SS (vector 12) that SDM Vol 2A §3.3 FLD
+/// (Real-Address Mode Exceptions) and 80386 PRM §14.7 item 7 prescribe. This is a
+/// deliberate divergence that keeps x87 consistent with the engine's existing
+/// Real16 scalar policy. Exception handlers in the guest see vector 13 for both
+/// segments.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum FpuModel {
+    /// Preserve the existing x87 engine and its defaults; no generation claim.
+    #[default]
+    Present,
+    /// No attached coprocessor. Real16 assumes inactive BUSY#/ERROR# inputs
+    /// (80386 PRM Ch. 11 §11.1.2, p. 11-2). With EM clear, input ESC forms
+    /// perform CPU operand checks and preserve the x87 image, independently of
+    /// the Present engine's coverage. Coprocessor output transfers are unsupported
+    /// because their empty-socket values are not specified there.
+    None,
 }
 
 /// Selects x87 opcode recording and pointer/opcode saving independently of CPUID.
@@ -598,6 +631,8 @@ impl Default for CpuState {
             x87_pointer_model: X87PointerModel::default(),
             port_string_in: None,
             legacy: crate::legacy::LegacyCpuState::default(),
+            fpu_model: FpuModel::default(),
+            fpu_emulation: false,
         }
     }
 }
