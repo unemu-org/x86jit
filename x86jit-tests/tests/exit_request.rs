@@ -290,7 +290,10 @@ fn rep_interrupt_attempt(tier: Tier, movs: bool, count: u64) -> bool {
     initial.cpu.flags.cf = true;
     initial.cpu.flags.zf = true;
     let seed = initial.cpu.clone();
-    let Some(mut interrupted) = interrupt(Arc::clone(&vm), initial, SIGNAL) else {
+    // Request only after the REP itself has stored past its first page of the
+    // destination. Polling the pre-REP signal let the request land before the
+    // first iteration, which the engine correctly takes at the instruction boundary.
+    let Some(mut interrupted) = interrupt(Arc::clone(&vm), initial, DATA + 4096) else {
         return false;
     };
     if matches!(tier, Tier::Region) {
@@ -498,7 +501,8 @@ fn mid_block_rep(tier: Tier, later_flags: bool) {
         initial.cpu.flags.cf = true;
         initial.cpu.flags.zf = true;
         let seed = initial.cpu.clone();
-        let Some(mut interrupted) = interrupt(Arc::clone(&vm), initial, SIGNAL) else {
+        // See rep_interrupt_attempt: wait for REP progress, not the pre-REP signal.
+        let Some(mut interrupted) = interrupt(Arc::clone(&vm), initial, DATA + 4096) else {
             retry_larger(&mut count, &mut attempts);
             continue;
         };
