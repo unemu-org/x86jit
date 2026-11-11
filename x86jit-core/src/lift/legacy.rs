@@ -558,7 +558,10 @@ pub(super) fn lower(
                 advance: 0,
             });
         }
-        Cpuid | Ud2 => ops.push(IrOp::Trap {
+        // I386 PRM Appendix A two-byte opcode map p. A-7, §14.6
+        // Table 14-1 p. 14-5: 0F FF is undefined and raises vector 6.
+        // Iced recognizes this encoding as UD0.
+        Cpuid | Ud0 | Ud2 => ops.push(IrOp::Trap {
             vector: 6,
             advance: 0,
         }),
