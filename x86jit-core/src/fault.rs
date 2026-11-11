@@ -385,6 +385,7 @@ pub struct FaultMetadata {
     pub(crate) projection: Option<PageFaultProjection>,
     pub(crate) raw_host_fault: Option<RawHostFault>,
     pub(crate) progress: FaultProgress,
+    pub(crate) physical_address: Knowledge<u64>,
 }
 impl FaultMetadata {
     /// Unqualified evidence; useful to custom backends without a complete model.
@@ -415,6 +416,7 @@ impl FaultMetadata {
                 rep: None,
                 acknowledged: Box::new([]),
             },
+            physical_address: Knowledge::Unknown,
         }
     }
     /// Cause-specific architectural evidence. Unsupported causes remain Unknown.
@@ -518,6 +520,12 @@ impl FaultMetadata {
     pub fn linear_address(&self) -> Knowledge<FaultAddress> {
         self.address
     }
+    /// Physical bus address of the failing legacy transfer after A20 gating.
+    /// Unknown when the execution path does not supply physical translation
+    /// evidence. Precision is the same as [`Self::linear_address`].
+    pub fn physical_address(&self) -> Knowledge<u64> {
+        self.physical_address
+    }
     pub fn real_mode_cs_ip(&self) -> Knowledge<(u16, u16)> {
         self.cs_ip
     }
@@ -596,6 +604,28 @@ pub(crate) fn memory_exit(
     m.transfer_size = Knowledge::Known(size);
     m.transfer_access = Knowledge::Known(access.into());
     Exit::unmapped_memory(addr, access).with_fault_metadata(m)
+}
+
+/// Qualify a legacy bus fault without labelling its gated address as linear.
+/// Exit addresses remain physical transfer addresses (decision-22).
+#[cold]
+pub(crate) fn qualify_legacy_bus(mut exit: Exit, linear: u64, physical: u64) -> Exit {
+    if let Exit::UnmappedMemory {
+        metadata: Some(m), ..
+    } = &mut exit
+    {
+        if let Knowledge::Known(address) = m.address {
+            // A recovered host fault can identify a later byte in this span.
+            let offset = address.value().wrapping_sub(physical);
+            m.physical_address = Knowledge::Known(address.value());
+            m.address = Knowledge::Known(FaultAddress::new(
+                u64::from((linear as u32).wrapping_add(offset as u32)),
+                address.precision(),
+                AddressSpace::Linear,
+            ));
+        }
+    }
+    exit
 }
 
 #[cold]

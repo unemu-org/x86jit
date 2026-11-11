@@ -199,13 +199,18 @@ impl EntryRecord {
                 metadata: Some(m), ..
             } = &mut exit
             {
-                let host_address = match m.linear_address() {
-                    crate::Knowledge::Known(address) => address
-                        .value()
-                        .checked_sub(mem.guest_base())
-                        .and_then(|offset| (mem.host_base() as u64).checked_add(offset)),
-                    _ => None,
+                let bus_address = match m.physical_address() {
+                    crate::Knowledge::Known(address) => Some(address),
+                    _ => match m.linear_address() {
+                        crate::Knowledge::Known(address) => Some(address.value()),
+                        _ => None,
+                    },
                 };
+                let host_address = bus_address.and_then(|address| {
+                    address
+                        .checked_sub(mem.guest_base())
+                        .and_then(|offset| (mem.host_base() as u64).checked_add(offset))
+                });
                 if m.origin() == crate::FaultOrigin::HostAccess
                     && host_address == Some(transfer.host_address)
                     // A compiled landing can carry newer evidence than an accepted probe.
@@ -498,6 +503,29 @@ mod tests {
         );
         assert!(!record.transfer.get_mut().pending);
         assert_eq!(owned.fault_metadata().unwrap().raw_host_fault(), Some(&raw));
+    }
+
+    #[test]
+    fn gated_legacy_transfer_matches_host_evidence_by_physical_address() {
+        let vm = crate::Vm::new(crate::VmConfig::flat(0x4000));
+        let mut record = EntryRecord::default();
+        let raw = crate::RawHostFault::new(crate::HostFaultPlatform::MacOsAarch64);
+        *record.transfer.get_mut() = TransferFault {
+            pending: true,
+            host_address: vm.mem.host_base() as u64 + 0x2001,
+            raw: Some(raw),
+        };
+        let exit =
+            crate::fault::memory_exit(0x1000, 0x2001, 2, crate::AccessKind::Read, true, true);
+        let exit = crate::fault::qualify_legacy_bus(exit, 0x102000, 0x2000);
+        let exit = record.finish_transfer_fault(exit, &vm.mem);
+        let metadata = exit.fault_metadata().unwrap();
+        let crate::Knowledge::Known(address) = metadata.linear_address() else {
+            panic!("missing linear address")
+        };
+        assert_eq!(address.value(), 0x102001);
+        assert_eq!(metadata.physical_address(), crate::Knowledge::Known(0x2001));
+        assert_eq!(metadata.raw_host_fault(), Some(&raw));
     }
 
     #[test]

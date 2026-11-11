@@ -127,6 +127,11 @@ pub struct LegacyCpuState {
     pub tr: SystemSegment,
     pub segments: [SegmentCache; 6],
     pub cpl: u8,
+    /// Effective board line: 0 masks physical bit 20, 1 enables it. Application
+    /// ignores it. Use `Vcpu::set_a20_enabled` between runs so an in-flight
+    /// instruction or string element keeps its line until an architectural
+    /// interruption point (decision-22): completion, a completed REP iteration,
+    /// or abandonment by an architectural fault.
     pub a20_enabled: u8,
     pub reset_fetch: u8,
     pub reserved: u8,
@@ -680,7 +685,7 @@ pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
 /// SDM Vol 3B §23.1.1 and 80386 PRM §14.1 describe ordinary 64-KiB limits;
 /// they do not specify nonstandard inherited limits after a real-mode reload.
 /// The accepted big-real contract checks the retained inclusive byte limit.
-/// Paging/A20 activation belongs to later phases; this physical boundary is identity.
+/// Returns the linear address; bus transfers apply `physical_span` afterwards.
 pub(crate) fn access(
     cpu: &CpuState,
     generation: CpuGeneration,
@@ -752,6 +757,22 @@ pub(crate) fn access(
         return Err(crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details));
     }
     Ok(u64::from(cache.base.wrapping_add(offset as u32)))
+}
+
+/// Final physical-bus gate, also for future page-walk transfers (decision-22).
+/// SDM Vol 3A §11.7.13.4: asserted A20M# forces physical bit 20 to zero
+/// on all external memory accesses. Vol 3B §§23.1.1, 25.33.1 describe wrapping.
+/// The engine exposes this board gate for I286/I386 too; the SDM dates the
+/// CPU pin to Intel486. I286 PRM Appendix C, software item 16 and hardware
+/// item 2 (p. C-3), prescribe external gating of A20 for real-mode wrapping;
+/// 80386 PRM §14.7 item 18 describes the unmasked address above 1 MiB.
+pub(crate) fn physical_span(cpu: &CpuState, address: u64, bytes: u8) -> (u64, u8) {
+    if cpu.legacy.a20_enabled != 0 {
+        (address, bytes)
+    } else {
+        let remaining = (1 << 20) - (address & ((1 << 20) - 1));
+        (address & !(1 << 20), u64::from(bytes).min(remaining) as u8)
+    }
 }
 
 /// SDM Vol 1 §21.1.2: 8086 high FLAGS bits are one, 286 real high

@@ -744,36 +744,46 @@ fn far_call_mmio_frame_retry_keeps_overwritten_descriptor_and_far_pointer() {
 fn far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modification() {
     // SDM Vol 2A §3.3 CALL; decision-16 §3: a partial frame must resume
     // the decoded CALL, even after its first push replaced that instruction.
-    let code = b"\x9a\x00\x12\x00\x00\x08\x00";
-    let (mut vm, mut cpu) = setup(code, true, true);
-    vm.unmap(0, 0x40000).unwrap();
-    vm.map(0xffc, 4, Prot::RW, RegionKind::Trap).unwrap();
-    vm.map(0x1000, 0x3f000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.write_bytes(0x1000, code).unwrap();
-    descriptor(&vm, 8, 0, 0xffff, 0x409b);
-    cpu.cpu.cs = 16;
-    cpu.cpu.gpr[4] = 0x1004;
-    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-    assert_eq!(run.steps(), 0);
-    assert!(
-        matches!(
-            run.stop(),
-            StepStop::Exit(Exit::MmioWrite {
-                addr: 0xffc,
-                value: 0x1007,
-                ..
-            })
-        ),
-        "{:?}",
-        run.stop()
-    );
-    assert_eq!(value(&vm, 0x1000, 4), 16);
-    cpu.complete_mmio_write();
-    steps(&mut cpu, &vm, 1);
-    assert_eq!(
-        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
-        (8, 0x1200, 0xffc)
-    );
+    for toggle in [false, true] {
+        let code = b"\x9a\x00\x12\x00\x00\x08\x00";
+        let (mut vm, mut cpu) = setup(code, true, true);
+        vm.unmap(0, 0x40000).unwrap();
+        vm.map(0xffc, 4, Prot::RW, RegionKind::Trap).unwrap();
+        vm.map(0x1000, 0x3f000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, code).unwrap();
+        descriptor(&vm, 8, 0, 0xffff, 0x409b);
+        cpu.cpu.cs = 16;
+        cpu.cpu.gpr[4] = 0x1004;
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(
+            matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr: 0xffc,
+                    value: 0x1007,
+                    ..
+                })
+            ),
+            "{:?}",
+            run.stop()
+        );
+        assert_eq!(value(&vm, 0x1000, 4), 16);
+        if toggle {
+            cpu.set_a20_enabled(false);
+            assert!(cpu.a20_enabled());
+            assert_eq!(cpu.pending_a20_enabled(), Some(false));
+        }
+        cpu.complete_mmio_write();
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+            (8, 0x1200, 0xffc)
+        );
+        assert_eq!(cpu.a20_enabled(), !toggle);
+        assert_eq!(cpu.pending_a20_enabled(), None);
+        assert_eq!(cpu.retired_instructions(), 1);
+    }
 }
 
 #[test]

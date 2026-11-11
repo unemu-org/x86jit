@@ -1871,8 +1871,10 @@ impl Vcpu {
     /// (including CS and IP), then resume execution. This method supplies no CPU-model
     /// reset register table. Architectural state is preserved except for the optional
     /// FNINIT environment selected by [`ResetOptions::with_x87_init`].
-    /// Retirement, step/execution and diagnostic accounting, source identity and
-    /// configuration, memory mappings, and code caches are preserved. Existing exit
+    /// Retirement, step/execution and diagnostic accounting, source identity,
+    /// configuration, memory mappings, and code caches are preserved. The embedder's
+    /// A20 request is preserved because it is a board signal; a queued change
+    /// applies when reset abandons its instruction. Existing exit
     /// and fault handles remain valid. An exit request racing with this call is
     /// discarded if it precedes the atomic request clear; later requests remain pending.
     pub fn reset_execution_state(&mut self, options: ResetOptions) {
@@ -1894,6 +1896,7 @@ impl Vcpu {
         self.cpu.mmio_parts_rip = 0;
         self.cpu.mmio_retry_active = false;
         self.cpu.mmio_retry_cs = 0;
+        self.apply_pending_a20();
         *self.fault_entry = Default::default();
         self.fast_clear();
         if options.x87_init {
@@ -1935,6 +1938,78 @@ impl Vcpu {
 
     pub fn legacy_cpu_model(&self) -> Option<LegacyCpuModel> {
         self.legacy_model
+    }
+
+    /// Drive this vCPU's legacy physical A20 line (enabled at ordinary legacy entry).
+    /// An embedder with a shared board line must update each vCPU between runs.
+    /// Safe after a port-I/O exit; no controller or port policy is implemented here.
+    /// Application profiles ignore this line. Execution-state reset preserves it.
+    /// A memory continuation, pending acknowledgment, partial split transfer or
+    /// decoded retry keeps its effective line until the next architectural
+    /// interruption point. Queue changes while that instruction or string
+    /// element is in flight. Apply them on completion, between REP iterations,
+    /// or when an architectural fault abandons the attempt, before returning or
+    /// delivering the fault. With nothing in flight, apply changes immediately.
+    /// An IRQ handler between REP iterations can change the line; the resumed
+    /// REP uses the new line, whether or not a request preceded the pause.
+    /// An accepted interrupt-delivery continuation finishes before a queued
+    /// change applies. A handler-fetch failure cannot retain an abandoned retry.
+    /// Calls requesting the effective value are no-ops, including while a change
+    /// is pending. [`Self::pending_a20_enabled`] exposes a queued change.
+    ///
+    /// This architectural interruption point rule is an engine contract
+    /// (decision-22). SDM Vol 2B REP, p. 4-564, preserves updated registers at
+    /// iteration interruption windows. An OUT used by an embedder's A20 controller
+    /// completes at a boundary before the next instruction, allowing an immediate
+    /// change. A zero-budget run leaves an in-flight request pending.
+    pub fn set_a20_enabled(&mut self, enabled: bool) {
+        if self.cpu.legacy.a20_enabled == u8::from(enabled) {
+            return;
+        }
+        if self.legacy_memory_in_flight() {
+            self.legacy_execution.as_mut().unwrap().pending_a20_enabled = Some(enabled);
+        } else {
+            self.cpu.legacy.a20_enabled = u8::from(enabled);
+        }
+    }
+
+    /// The effective legacy A20 line, excluding any queued change. Application
+    /// execution does not consult this value (decision-22).
+    pub fn a20_enabled(&self) -> bool {
+        self.cpu.legacy.a20_enabled != 0
+    }
+
+    /// A requested A20 value waiting for the next architectural interruption
+    /// point, or `None`: instruction completion, a completed REP iteration, or
+    /// abandonment by an architectural fault. Execution-state reset also abandons
+    /// the instruction and applies this value. Application profiles never queue
+    /// a change. See [`Self::set_a20_enabled`] for the boundary contract.
+    pub fn pending_a20_enabled(&self) -> Option<bool> {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.pending_a20_enabled)
+    }
+
+    fn legacy_memory_in_flight(&self) -> bool {
+        self.legacy_execution.as_ref().is_some_and(|e| {
+            self.cpu.mmio_retry_active
+                || self.cpu.mmio_parts_len != 0
+                || self.cpu.pending_mmio.is_some()
+                || self.cpu.pending_mmio_write
+                || e.has_continuation()
+        })
+    }
+
+    fn apply_pending_a20(&mut self) {
+        if !self.legacy_memory_in_flight() {
+            if let Some(enabled) = self
+                .legacy_execution
+                .as_mut()
+                .and_then(|e| e.pending_a20_enabled.take())
+            {
+                self.cpu.legacy.a20_enabled = u8::from(enabled);
+            }
+        }
     }
 
     fn unsupported_legacy(&self, operation: UnsupportedSystemOperation) -> Exit {

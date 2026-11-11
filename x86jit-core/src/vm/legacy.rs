@@ -70,6 +70,7 @@ pub(super) struct Execution {
     // Accepted IRQ delivery can itself hand off an MMIO transfer. Its retry
     // must complete before executing the interrupted instruction (decision-16 §3).
     irq_retry: Option<(u8, u32, u16)>,
+    pub(super) pending_a20_enabled: Option<bool>,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -88,11 +89,15 @@ impl Execution {
             #[cfg(test)]
             lifts: 0,
             irq_retry: None,
+            pending_a20_enabled: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.irq_retry = None;
         self.instruction_retry = None;
+    }
+    pub(super) fn has_continuation(&self) -> bool {
+        self.instruction_retry.is_some() || self.irq_retry.is_some()
     }
     fn invalidate_translations(&mut self) {
         self.blocks.clear();
@@ -170,14 +175,12 @@ impl Execution {
         // Decision-16 §3: finish the already decoded instruction on a device
         // retry. A partial CALL frame can overwrite the CALL's own bytes;
         // its IR must survive eviction and reuse of the translation's context ID.
-        if cpu.mmio_retry_active {
-            if let Some(retry) = &self.instruction_retry {
-                if retry.stamp == LegacyContextStamp::new(cpu, model)
-                    && retry.ip == cpu.rip
-                    && retry.mxcsr_mode == key.mxcsr_mode
-                {
-                    return Ok(retry.ir.clone());
-                }
+        if let Some(retry) = &self.instruction_retry {
+            if retry.stamp == LegacyContextStamp::new(cpu, model)
+                && retry.ip == cpu.rip
+                && retry.mxcsr_mode == key.mxcsr_mode
+            {
+                return Ok(retry.ir.clone());
             }
         }
         // One-instruction blocks bound fault visibility and SMC. Re-fetch each
@@ -226,7 +229,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8
         15
     };
     for i in 0..length_limit {
-        let addr = crate::legacy::access(
+        let linear = crate::legacy::access(
             cpu,
             context.generation,
             SegmentId::Cs,
@@ -234,23 +237,41 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8
             1,
             crate::AccessKind::Execute,
         )?;
+        let (addr, _) = crate::legacy::physical_span(cpu, linear, 1);
         if let Some(policy) = &vm.mem.fetch_policy {
             let verdict = policy.approve(addr >> crate::memory::CODE_PAGE_BITS, &vm.mem);
             if verdict != crate::FetchVerdict::Allow {
-                return Err(Exit::unmapped_memory(addr, crate::AccessKind::Execute));
+                return Err(crate::fault::qualify_legacy_bus(
+                    crate::fault::fetch_exit(
+                        &vm.mem,
+                        FetchAddr {
+                            pa: addr,
+                            ip: cpu.rip,
+                        },
+                        CpuMode::Compat32,
+                        addr,
+                        Some(crate::lift::FetchFailure::Policy(verdict)),
+                    ),
+                    linear,
+                    addr,
+                ));
             }
         }
         let mut byte = [0];
         if let Err(trap) = vm.mem.fetch_code(addr, &mut byte) {
-            return Err(crate::fault::fetch_exit(
-                &vm.mem,
-                FetchAddr {
-                    pa: u64::from(cpu.legacy.segments[0].base) + cpu.rip,
-                    ip: cpu.rip,
-                },
-                CpuMode::Compat32,
+            return Err(crate::fault::qualify_legacy_bus(
+                crate::fault::fetch_exit(
+                    &vm.mem,
+                    FetchAddr {
+                        pa: addr,
+                        ip: cpu.rip,
+                    },
+                    CpuMode::Compat32,
+                    addr,
+                    Some(crate::lift::FetchFailure::Memory(trap)),
+                ),
+                linear,
                 addr,
-                Some(crate::lift::FetchFailure::Memory(trap)),
             ));
         }
         bytes.push(byte[0]);
@@ -286,9 +307,8 @@ impl Vcpu {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
         // I286 PRM §10.4 p. 10-6: reset may fetch through the retained high CS base.
-        // A20 gating and the I8086 system personality remain deferred.
+        // The I8086 system personality remains deferred.
         if !matches!(model.generation, CpuGeneration::I286 | CpuGeneration::I386)
-            || self.cpu.legacy.a20_enabled == 0
             || (self.cpu.legacy.reset_fetch != 0 && model.generation != CpuGeneration::I286)
             || self.cpu.rip > u64::from(u32::MAX)
         {
@@ -393,6 +413,7 @@ impl Vcpu {
         if !cpu.cpu.mmio_retry_active {
             cpu.legacy_execution.as_mut().unwrap().instruction_retry = None;
         }
+        cpu.apply_pending_a20();
         drop(dispatch);
         self.time_outside = time_run.finish(match &result.stop {
             StepStop::Exit(exit) => Some(exit),
@@ -477,6 +498,7 @@ impl Vcpu {
                     self.pending_irq = None;
                 }
                 self.cpu.finish_mmio_retry(None);
+                self.apply_pending_a20();
                 self.legacy_execution
                     .as_mut()
                     .unwrap()
@@ -521,7 +543,10 @@ impl Vcpu {
                     self.sti_shadow = outcome.arm_sti;
                     self.ss_shadow = outcome.arm_ss && !self.ss_shadow;
                     self.cpu.finish_mmio_retry(None);
+                    // SDM Vol 2B REP, p. 4-564: a completed iteration is an
+                    // interruption window with updated registers (decision-22).
                     self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                    self.apply_pending_a20();
                     if outcome.context_changed {
                         let execution = self.legacy_execution.as_mut().unwrap();
                         if outcome.translations_invalidated {
@@ -537,9 +562,10 @@ impl Vcpu {
                     }
                 }
                 Err(exit) => {
-                    if self.cpu.mmio_retry_active
-                        || matches!(exit, Exit::MmioRead { .. } | Exit::MmioWrite { .. })
-                    {
+                    // An architectural fault abandons this attempt before it is
+                    // returned to the embedder; only resumable transfers keep IR.
+                    self.cpu.finish_mmio_retry(Some(&exit));
+                    if self.cpu.mmio_retry_active {
                         self.legacy_execution.as_mut().unwrap().instruction_retry =
                             Some(InstructionRetry {
                                 stamp: LegacyContextStamp::new(&self.cpu, model),
@@ -547,6 +573,9 @@ impl Vcpu {
                                 mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
                                 ir,
                             });
+                    } else {
+                        self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                        self.apply_pending_a20();
                     }
                     return StepRun {
                         steps,
@@ -561,6 +590,81 @@ impl Vcpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a20_toggles_reuse_only_the_matching_retained_blocks() {
+        let (vm, mut cpu) = a20_loop();
+        let mut originals = Vec::new();
+        for enabled in [true, false, true, false] {
+            cpu.set_a20_enabled(enabled);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            let block = execution
+                .blocks
+                .iter()
+                .find(|(key, _)| key.context_id == execution.context_id)
+                .unwrap()
+                .1
+                .ir
+                .clone();
+            if originals.len() < 2 {
+                originals.push(block);
+            } else {
+                assert!(Arc::ptr_eq(&block, &originals[usize::from(!enabled)]));
+            }
+        }
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert_eq!(execution.contexts.len(), 2);
+        assert_eq!(execution.blocks.len(), 2);
+        assert_eq!(execution.lifts, 2);
+    }
+
+    fn a20_loop() -> (Vm, Vcpu) {
+        let mut vm = Vm::new(VmConfig::flat(0x200000));
+        vm.set_legacy_cpu_model(LegacyCpuModel {
+            generation: CpuGeneration::I386,
+            model_semantics_id: 1,
+        });
+        vm.map(0, 0x200000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0, b"\xeb\xfe").unwrap();
+        vm.write_bytes(0x100000, b"\xeb\xfe").unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu = CpuState::legacy_real_entry([0xffff, 0, 0, 0, 0, 0]);
+        cpu.cpu.rip = 0x10;
+        (vm, cpu)
+    }
+
+    #[test]
+    #[ignore = "explicit interpreter A20 toggle throughput measurement"]
+    fn a20_toggle_throughput() {
+        let (vm, mut cpu) = a20_loop();
+        for enabled in [false, true] {
+            cpu.set_a20_enabled(enabled);
+            assert_eq!(
+                cpu.run_steps(&vm, 1, StepOptions::default())
+                    .unwrap()
+                    .steps(),
+                1
+            );
+        }
+        for sample in 0..3 {
+            let start = std::time::Instant::now();
+            for i in 0..200_000 {
+                cpu.set_a20_enabled(i & 1 != 0);
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1);
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert_eq!(cpu.cpu.rip, 0x10);
+            assert_eq!(execution.lifts, 2);
+            assert_eq!(execution.blocks.len(), 2);
+            println!("sample={sample} toggles=200000 elapsed_seconds={elapsed:.6} toggles_per_second={:.0} ns_per_toggle_and_instruction={:.1} lifts=0 cached_blocks=2", 200_000.0 / elapsed, elapsed * 1e9 / 200_000.0);
+        }
+        assert_eq!(vm.backend.compile_ns(), 0);
+    }
 
     fn cache_context(
         execution: &mut Execution,

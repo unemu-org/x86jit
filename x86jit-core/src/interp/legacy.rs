@@ -116,6 +116,22 @@ fn read<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
+    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let low = read_physical(cpu, mem, addr, physical, part)?;
+    if part == size {
+        return Ok(low);
+    }
+    let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
+    Ok(low | (read(cpu, mem, next, size - part)? << (part * 8)))
+}
+
+fn read_physical<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    linear: u64,
+    addr: u64,
+    size: u8,
+) -> Result<u64, Exit> {
     if let Some(value) = cpu.mmio_part(cpu.rip, addr) {
         return Ok(value & mask(size));
     }
@@ -130,7 +146,7 @@ fn read<const ROUTED: bool, const ORDER: u8>(
         }
         Err(
             match trap_out(cpu, cpu.rip, trap, addr, size, AccessKind::Read, 0).into_step() {
-                StepResult::Exit(exit) => exit,
+                StepResult::Exit(exit) => crate::fault::qualify_legacy_bus(exit, linear, addr),
                 _ => unreachable!(),
             },
         )
@@ -145,8 +161,27 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
+    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    if part == size {
+        return write_physical(cpu, mem, addr, physical, size, value);
+    }
+    // Validate both destinations before committing the split RAM store.
+    probe(cpu, mem, addr, size)?;
+    write_physical(cpu, mem, addr, physical, part, value)?;
+    let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
+    write(cpu, mem, next, size - part, value >> (part * 8))
+}
+
+fn write_physical<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    linear: u64,
+    addr: u64,
+    size: u8,
+    value: u64,
+) -> Result<(), Exit> {
     // The retry ledger is engine storage. Bit 63 distinguishes answered writes
-    // from reads at the same 32-bit linear address; it is never a guest address.
+    // from reads at the same physical bus address; it is never a guest address.
     let key = addr | (1 << 63);
     if cpu.mmio_part(cpu.rip, key).is_some() {
         return Ok(());
@@ -159,7 +194,7 @@ fn write<const ROUTED: bool, const ORDER: u8>(
             return Err(
                 match trap_out(cpu, cpu.rip, trap, addr, size, AccessKind::Write, value).into_step()
                 {
-                    StepResult::Exit(exit) => exit,
+                    StepResult::Exit(exit) => crate::fault::qualify_legacy_bus(exit, linear, addr),
                     _ => unreachable!(),
                 },
             );
@@ -174,11 +209,27 @@ fn probe<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
+    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    probe_physical(cpu, mem, addr, physical, part)?;
+    if part < size {
+        let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
+        probe(cpu, mem, next, size - part)?;
+    }
+    Ok(())
+}
+
+fn probe_physical<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    linear: u64,
+    addr: u64,
+    size: u8,
+) -> Result<(), Exit> {
     match mem.probe_write(addr, size) {
         Ok(()) | Err(MemTrap::Mmio) => Ok(()),
         Err(trap) => Err(
             match trap_out(cpu, cpu.rip, trap, addr, size, AccessKind::Write, 0).into_step() {
-                StepResult::Exit(exit) => exit,
+                StepResult::Exit(exit) => crate::fault::qualify_legacy_bus(exit, linear, addr),
                 _ => unreachable!(),
             },
         ),
