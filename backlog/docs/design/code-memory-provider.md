@@ -4,6 +4,239 @@ Implementation and validation on 2026-11-10. Phase 1 baseline: `c161085`.
 **MEASURED** means executed locally; **READ** means checked in source or API
 contracts; **ASSUMED** identifies platform behavior still requiring native coverage.
 
+## Provider startup fallback and diagnostics (READ)
+
+Provider selection is lazy with respect to `JitBackend` construction: the first
+compiler module probes a real 128 MiB executable region before handing the
+provider to Cranelift. A successful probe retains that region for allocations;
+there is no disposable mapping probe. This avoids reserving memory for backends
+that never compile, and selects the relocation policy and ownership before any
+pointer can escape or code can be published.
+
+Both MXCSR modules share a serialized, permanent backend-wide choice. If the
+first alias region cannot be created, Linux/FreeBSD try anonymous W^X storage
+before Cranelift's `SystemMemoryProvider`. The anonymous startup probe checks RW
+commit and RX sealing on the first page of its retained 128 MiB reservation;
+that empty sealed page is counted as used and never reopened. A failed probe
+unmaps the complete reservation. On macOS the existing MAP_JIT-to-system fallback
+is unchanged, including unsupported per-thread write protection. Partial alias
+mappings and backing handles are cleaned up by the failed reservation path.
+Once a startup probe succeeds, even in the other module and before publication,
+later allocation/write/finalization errors retain
+the existing sticky `CodeSpaceExhausted` behavior. There is no switch after a
+successful first region and no mixed dense/system ownership within a backend.
+`with_system_memory_provider()` explicitly selects the same system provider
+without probing or counting an automatic fallback. The system provider's fork
+inheritance policy and lack of dense-storage accounting apply to either route.
+
+`MemoryStats.backend` retains numeric, Copy diagnostics:
+
+| Field | Meaning |
+|---|---|
+| `code_provider_fallback` | Automatic switches: at most two on Linux/FreeBSD (aliases → anonymous W^X → system), at most one on macOS |
+| `code_first_failure_op`, `code_last_failure_op` | Stable `CodeMemoryFailureOp` numeric IDs; zero means no recorded operation failure |
+| `code_first_failure_errno`, `code_last_failure_errno` | Original raw errno, or zero if the API supplies none |
+
+The JIT crate exports the non-exhaustive `CodeMemoryFailureOp` enum and Copy
+`CodeMemoryFailure { operation, errno: Option<i32> }` value.
+`JitBackend::code_first_failure()` and `code_last_failure()` return typed values
+without taking a compiler lock. Operation/errno pairs are stored atomically;
+MemoryStats fields remain independent snapshots. First failure is never
+replaced. Both failures and the fallback count survive successful compilation.
+`code_allocation_failures` includes the failed startup probe, even when fallback
+recovers. System-provider allocation, protection, cache and pipeline failures also
+record operation/errno diagnostics and increment this counter once per failed
+allocation or finalization. All return `ModuleError::Allocation`, selecting sticky
+`CodeSpaceExhausted` even for permission errors. The vendored system provider adds
+`finalize_with` to wrap each publication operation; it preserves raw OS errors
+(including those carried by `region::Error::SystemCall`) and removes cache/pipeline
+`expect` calls from this path. The backend adapter supplies diagnostics and test
+injection.
+System-provider code storage counters stay zero while emitted bytes and finalized
+unit counters continue to work.
+
+Operation IDs distinguish object creation (`memfd_create`/`shm_open`), object
+sizing (`ftruncate`), `PROT_NONE` address reservation, RW and RX/R mapping,
+`madvise`/`minherit` exclusion, macOS support query, MAP_JIT mapping, Mach read-only
+remapping and `mprotect`, write-protect disable/restore, cache maintenance and
+pipeline synchronization. `CommitAnonymous` (15) and `SealAnonymous` (16)
+distinguish anonymous page commitment and sealing. `AnonymousPersonality` (17)
+identifies Linux personality query errors or incompatible `READ_IMPLIES_EXEC`;
+`SystemAllocate` (18), `SystemProtectExecutable` (19) and
+`SystemProtectReadOnly` (20) identify system-provider operations. Cache maintenance
+and pipeline synchronization reuse their existing IDs; existing IDs remain stable.
+Cleanup calls do not overwrite the originating error.
+Mach return codes and unsupported-operation errors supply no errno; the void
+macOS toggle/cache APIs cannot report native errors. Test-only injection at the
+operation boundaries also witnesses their error paths without changing production
+behavior. Linux arm64 registration still independently selects its existing
+SYNC_CORE/receiver protocol; a failed optional registration is not an allocation
+or publication failure.
+
+**MEASURED** embedder report at `73ed5d6`: FreeBSD stable/15 arm64 processes with a
+non-native syscall personality inside a jail each had one allocation failure,
+zero regions/committed bytes, and background code-space failures. The failing OS
+operation was unavailable in that revision. **ASSUMED:** the system provider can
+allocate executable storage in that deployment; native confirmation with these
+new diagnostics is still required. Anonymous storage now offers a path without
+backing descriptors; native confirmation remains required. Cross-target checks do not establish native
+FreeBSD execution.
+
+Startup-fallback validation on macOS arm64 (**MEASURED**, 2026-11-10): backend
+library 132 passed/four skipped, code-memory bound two passed (including 100,000
+units), memory stats three passed, core library 242 passed, and Unicorn-enabled
+`region_fault_state` 26 passed. The injected witnesses cover startup fallback,
+execution in both modules, background publication, first/last errno retention,
+over-aligned mapping errors, and later allocation/write/finalization exhaustion.
+All-target/all-feature clippy with `-D warnings` passed on Rust 1.95. Linux
+workspace/test checks passed for both ISAs on Rust 1.96.1. Both FreeBSD backend
+checks passed on installed Rust 1.98.1, which reported four warnings about the
+unchanged libc declarations in `libcalls.rs`. These are type checks, not native
+Linux/FreeBSD execution. Cargo ran offline with two build/test threads, each
+invocation under `timeout 180`, with no benchmarks.
+
+## Descriptor-free storage and policy (READ)
+
+```rust
+use x86jit_cranelift::{CodeMemoryPolicy, JitBackend};
+
+let backend = JitBackend::new()
+    .with_no_fd_memory_provider(CodeMemoryPolicy::WriteXorExecute);
+```
+
+Configure before sharing or compiling, as with `with_system_memory_provider()`.
+Linux/FreeBSD explicit selection never switches providers: any reservation,
+commit, write or publication failure enters the existing sticky
+`CodeSpaceExhausted` path. Automatic fallback selects only `WriteXorExecute`;
+`ReadWriteExecute` always requires explicit embedder selection.
+
+Linux/FreeBSD reserve one kernel-placed anonymous `PROT_NONE` mapping per region,
+without descriptors or `MAP_FIXED`. Code, read-only data and writable data reuse
+the existing per-kind bump allocator, allocation identities and region sizing.
+Alignment is taken from the reservation's actual address, including alignment
+above page size. Full regions grow by further reservations; live addresses stay
+fixed. Only newly needed pages are committed using `mprotect`. The complete
+reservation receives `MADV_DONTFORK` (Linux) or `minherit(INHERIT_NONE)` (FreeBSD)
+once; protection changes preserve that exclusion.
+
+The reservation uses `MAP_SHARED | MAP_ANON` with descriptor `-1`. One anonymous
+shared backing avoids creating private COW identities for successive writable
+frontiers, which can inhibit Linux VMA merging (READ:
+[Linux `is_mergeable_anon_vma` and shared-anonymous setup](https://github.com/torvalds/linux/blob/master/mm/vma.c)).
+FreeBSD's anonymous path passes a null object directly to `vm_mmap_object`,
+without looking up or creating a process descriptor (READ:
+[`kern_mmap`](https://github.com/freebsd/freebsd-src/blob/main/sys/vm/vm_mmap.c)).
+Native Linux/FreeBSD map-entry counts remain ASSUMED until their bound test runs.
+
+Before each strict anonymous page commitment (including the automatic startup
+probe), Linux queries `personality(0xffffffff)` without changing the caller's
+personality. A query failure or `READ_IMPLIES_EXEC` refuses commitment and records
+`AnonymousPersonality`; policy rejection has no errno. Automatic selection proceeds
+to the system provider, while explicit W^X selection returns sticky
+`CodeSpaceExhausted` without switching. Rechecking each new commitment covers a
+caller changing its personality between publication batches. Explicit RWX storage
+does not impose this check. **READ:** [personality(2), DESCRIPTION](https://man7.org/linux/man-pages/man2/personality.2.html)
+and [Linux v6.12 `do_mprotect_pkey`](https://github.com/torvalds/linux/blob/v6.12/mm/mprotect.c#L746)
+specify the query and permission expansion. Production performs no map query or
+other descriptor-creating protection verification. Test-only `region::query`
+checks actual RW, RX and inaccessible frontier protections (Linux uses
+`/proc/self/maps`); a thread-local hook forces the incompatible personality on
+all test hosts without changing the test process's real personality.
+
+Under `WriteXorExecute`, each region tracks a sealed prefix, committed frontier
+and unused reservation. Functions in the same publication batch pack densely
+into RW pages. After copying/relocation and cache maintenance, publication seals
+only the new pages RX and advances allocation to the next page. A batch's partial
+page tail remains used storage. No operation changes an executable page back to
+RW, removes execute permission from published pages, or writes through an alias.
+Read-only data follows the same RW-to-R sealing rule; writable data stays RW.
+Protection failures block publication and retain their original operation/errno.
+The existing cache, pipeline and receiver-generation protocol is shared unchanged.
+
+`ReadWriteExecute` commits code pages RWX, retaining every partial-page tail
+across publications, with no policy-imposed page waste. It permits writes to live
+executable code and gives up W^X/code-integrity protection. An embedder must
+explicitly accept that security trade-off, and the host must allow RWX pages.
+Data retains its R/RW policies. Neither policy currently recycles allocations.
+
+On macOS both public policy choices retain the existing descriptor-free MAP_JIT
+provider, per-thread write protection, process reservation and startup fallback.
+The anonymous frontier implementation is also exercised directly by internal
+W^X witnesses on macOS, but is not the public macOS provider. The initial private
+anonymous prototype left one map entry per publication batch on macOS, and its
+anonymous RWX commit failed with `EACCES`; that experiment did not replace the
+public MAP_JIT policy. The final anonymous allocator uses shared backing.
+
+Anonymous code counters count one mapping view per reservation. Protection
+boundaries can create multiple OS map entries, so `code_mapping_views` is not a
+kernel map-entry count. Used bytes include alignment, veneer capacity, sealed
+tails and the automatic startup probe page. Committed bytes count successfully
+committed high-water pages once, including sealed tails; free/largest extents
+exclude sealed tails. Region/offset/length allocation records and separate
+sealed/committed boundaries remain available to reclamation. Future reuse must
+prove that **every page in the reopened extent** is no longer executable by any
+vCPU, remove stale code metadata, and pass both grace periods before making it
+RW. No code-page reopening or reuse is implemented here.
+
+### Review safeguards validation (2026-11-11)
+
+**MEASURED — native macOS arm64, Rust 1.95:** backend library 142 passed/four
+skipped; code-memory bound four passed, including a single 100,000-unit invocation
+(31.91 seconds); memory stats three passed; core library 242 passed; Unicorn-enabled
+`region_fault_state` 26 passed. The new injected witnesses cover incompatible
+personality and query failure before strict commitment, automatic fallback,
+explicit strict refusal, preservation of actual RX/inaccessible pages, system
+allocation/RX/cache/pipeline failure after explicit or automatic selection, sticky
+backend exhaustion, and system read-only protection failure retaining its errno.
+Workspace all-target/all-feature clippy with `-D warnings` and workspace/vendor
+format checks passed. Each test invocation selected one binary, two test threads,
+and a 180-second timeout; Cargo ran offline with two build jobs. No benchmarks ran.
+
+**MEASURED — compilation only:** workspace/test checks passed for x86-64 and
+arm64 Linux on Rust 1.96.1. Backend-library checks passed for both FreeBSD targets
+on Rust 1.98.1, with four existing warnings about libc declarations in
+`libcalls.rs`. Nix devShell entry was sandbox-blocked; installed toolchains and
+SDK were used. **ASSUMED:** native Linux/FreeBSD execution, including a real Linux
+`READ_IMPLIES_EXEC` process; the forced-flag witness uses a test-only hook.
+
+### Descriptor-free validation (2026-11-10)
+
+**MEASURED — final native macOS arm64 checks:** backend library 138 passed/four
+skipped; memory stats three passed; core library 242 passed; Unicorn-enabled
+`region_fault_state` 26 passed. The native library run covers injected alias
+creation failure selecting anonymous W^X storage, execution in both MXCSR
+modules, both failed startup probes retaining first/last diagnostics, anonymous
+reservation/commit/seal/publication failures, page protections and no RX-to-RW
+transitions, alignment/growth, and exclusion/rebuild through child and grandchild.
+Test-only alias selection exercises the Unix fallback on macOS; production macOS
+still uses its original MAP_JIT-to-system route.
+
+**MEASURED — mapping checks:** the corrected public no-fd option used one code
+map entry for 512 foreground units and one for 512 batched units; each sample had
+32,768 resident code bytes (16,384-byte pages). Those are MAP_JIT measurements on
+macOS. Cross-thread publication of 1,000 units passed. These three smaller bound
+binary tests passed after correcting the macOS routing.
+
+The sole 100,000-unit invocation ran the initial private-anonymous macOS
+prototype, finished in 47.71 seconds, and **failed** the mapping bound: 1,563 code
+entries, 25,608,192 resident code bytes, 97,091,584 process RSS bytes. That result
+motivated preserving macOS MAP_JIT. It is not a passing result for the final
+implementation. The 100,000-unit test was not repeated under the requested
+single-invocation load limit; its final version uses the same batched helper as
+the passing 512-unit check. The test now accounts for one partial-page tail per
+64-unit publication batch on anonymous W^X hosts.
+
+**MEASURED — build checks:** Rust 1.95 all-target/all-feature clippy with
+`-D warnings` and formatting passed. Rust 1.96.1 workspace/test checks passed for
+both Linux ISAs. Rust 1.98.1 backend/test checks passed for aarch64 and x86-64
+FreeBSD, with the same four pre-existing libc declaration warnings in
+`libcalls.rs`. Cargo ran offline with two build/test threads and `timeout 180`
+per invocation. No benchmarks ran.
+
+**ASSUMED:** native Linux/FreeBSD execution, RWX execution/packing on those
+hosts, their map-entry bounds and fork behavior, and the final 100,000-unit
+result remain unmeasured. Cross-target type checks do not establish those facts.
+
 ## Storage and relocation design (READ)
 
 - `x86jit-cranelift/src/code_memory.rs:115`: dense bump allocation by kind, retaining
@@ -289,7 +522,7 @@ this phase. Per-backend logical reservations can exhaust the fixed shared macOS
 extent after sufficiently many short-lived backends; exhaustion fails closed.
 A contiguous 1 TiB reservation may fail in a fragmented/limited address space.
 BTI requests currently fail closed; x86jit's current ISA does not request them.
-OSes outside Linux, FreeBSD and macOS also return Unsupported through exhaustion.
+OSes outside Linux, FreeBSD and macOS reject the dense probe and select the system provider.
 Before a crates.io release, the integration must either land in an upstream pin
 or the separately named vendored package must be made available by the maintainer;
 path/git consumers already use the local integration.

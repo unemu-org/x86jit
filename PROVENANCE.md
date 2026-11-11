@@ -162,8 +162,12 @@ sources). Its upstream crate checksum is
 The package is named `x86jit-cranelift-jit` so embedders also resolve the explicit
 path dependency when this workspace is consumed as a dependency; a root-only
 Cargo patch would not propagate. The local changes add dual addresses, scoped
-writes and provider relocation validation (decision-17); allocation policy stays
-in `x86jit-cranelift`. This compiler integration supplies no x86 hardware semantics.
+writes and provider relocation validation (decision-17), plus a narrow system-provider
+publication callback that reports protection/cache/pipeline errors as
+`ModuleError::Allocation` instead of panicking or returning `Backend`. The callback
+lets `x86jit-cranelift` attach operation/errno diagnostics and inject failures at
+the OS boundaries; allocation policy and failure counters stay there. This
+compiler integration supplies no x86 hardware semantics.
 
 **`unicorn-engine` is GPL-2.0**, and this needs stating plainly because `spec.md §15` said
 for a long time that "all core dependencies are permissive", which stopped being true when

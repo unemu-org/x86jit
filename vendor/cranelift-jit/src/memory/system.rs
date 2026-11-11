@@ -96,32 +96,41 @@ impl Memory {
     pub(crate) fn set_readable_and_executable(
         &mut self,
         branch_protection: BranchProtection,
-    ) -> ModuleResult<()> {
+        perform: &mut super::Perform<'_>,
+    ) -> io::Result<()> {
         self.finish_current();
 
         for &PtrLen { ptr, len, .. } in self.non_protected_allocations_iter() {
-            super::set_readable_and_executable(ptr, len, branch_protection)?;
+            super::set_readable_and_executable_with(ptr, len, branch_protection, perform)?;
         }
 
         // Flush any in-flight instructions from the pipeline
-        wasmtime_jit_icache_coherence::pipeline_flush_mt().expect("Failed pipeline flush");
+        perform(super::SystemMemoryOperation::PipelineSync, &mut || {
+            let result = wasmtime_jit_icache_coherence::pipeline_flush_mt();
+            #[cfg(target_os = "linux")]
+            {
+                result
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                result.map_err(io::Error::other)
+            }
+        })?;
 
         self.already_protected = self.allocations.len();
         Ok(())
     }
 
     /// Set all memory allocated in this `Memory` up to now as readonly.
-    pub(crate) fn set_readonly(&mut self) -> ModuleResult<()> {
+    pub(crate) fn set_readonly(&mut self, perform: &mut super::Perform<'_>) -> io::Result<()> {
         self.finish_current();
 
         for &PtrLen { ptr, len, .. } in self.non_protected_allocations_iter() {
-            unsafe {
-                region::protect(ptr, len, region::Protection::READ).map_err(|e| {
-                    ModuleError::Backend(
-                        anyhow::Error::new(e).context("unable to make memory readonly"),
-                    )
-                })?;
-            }
+            perform(super::SystemMemoryOperation::ProtectReadOnly, &mut || {
+                // SAFETY: the provider owns this page-aligned extent.
+                unsafe { region::protect(ptr, len, region::Protection::READ) }
+                    .map_err(super::protection_error)
+            })?;
         }
 
         self.already_protected = self.allocations.len();
@@ -173,6 +182,25 @@ impl SystemMemoryProvider {
             writable: Memory::new(),
         }
     }
+
+    /// Finalize while allowing an embedder to observe and diagnose each OS operation.
+    /// The callback must execute the supplied action or return an error.
+    pub fn finalize_with(
+        &mut self,
+        branch_protection: BranchProtection,
+        mut perform: impl FnMut(
+            super::SystemMemoryOperation,
+            &mut dyn FnMut() -> io::Result<()>,
+        ) -> io::Result<()>,
+    ) -> ModuleResult<()> {
+        self.readonly
+            .set_readonly(&mut perform)
+            .and_then(|()| {
+                self.code
+                    .set_readable_and_executable(branch_protection, &mut perform)
+            })
+            .map_err(|err| ModuleError::Allocation { err })
+    }
 }
 
 impl JITMemoryProvider for SystemMemoryProvider {
@@ -183,8 +211,7 @@ impl JITMemoryProvider for SystemMemoryProvider {
     }
 
     fn finalize(&mut self, branch_protection: BranchProtection) -> ModuleResult<()> {
-        self.readonly.set_readonly()?;
-        self.code.set_readable_and_executable(branch_protection)
+        self.finalize_with(branch_protection, |_, action| action())
     }
 
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> io::Result<*mut u8> {

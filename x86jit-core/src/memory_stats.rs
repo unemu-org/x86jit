@@ -16,12 +16,13 @@ pub struct BackendMemoryStats {
     pub code_bytes_emitted: u64,
     /// Logical code-region capacity, including padding and unused tails.
     /// Exact provider accounting, including pending/failed definitions. On macOS
-    /// these are slices of code_process_reservation_bytes. Never an RSS estimate.
+    /// MAP_JIT regions are slices of code_process_reservation_bytes. Never an RSS estimate.
     pub code_bytes_reserved: u64,
     /// Logical code regions owned by this backend (128 MiB or larger).
     pub code_regions: u64,
     /// Distinct OS views covering those regions: two aliases per Unix region,
-    /// one shared process-wide MAP_JIT view on macOS. Not physical allocations.
+    /// one per no-fd reservation, or one shared process-wide MAP_JIT view on macOS.
+    /// Not physical allocations; protection boundaries can split OS map entries.
     pub code_mapping_views: u64,
     /// Process-wide macOS MAP_JIT virtual reservation (shared across backends;
     /// do not sum across VMs). Zero on other systems.
@@ -29,7 +30,8 @@ pub struct BackendMemoryStats {
     /// Page-rounded high-water extents of allocated code, counted once per
     /// backing object. Demand-paged allocator commitment, not physical residency.
     pub code_bytes_committed: u64,
-    /// Code allocation extents, including alignment padding and veneer capacity.
+    /// Code allocation extents, including alignment padding, veneer capacity and
+    /// sealed partial-page tails in anonymous W^X mode.
     pub code_bytes_used: u64,
     /// Unused region tails. No retired extents are reusable before phase 3.
     pub code_bytes_free: u64,
@@ -37,6 +39,19 @@ pub struct BackendMemoryStats {
     pub code_largest_free_extent: u64,
     /// Provider allocation/finalization failures, including OS reservation errors.
     pub code_allocation_failures: u64,
+    /// Automatic provider switches: aliases -> anonymous W^X -> system on
+    /// Linux/FreeBSD (at most two), MAP_JIT -> system on macOS (at most one).
+    /// Explicit provider selection does not increment this count.
+    pub code_provider_fallback: u64,
+    /// First failing dense-provider operation ID (CodeMemoryFailureOp in the JIT
+    /// crate), or zero if none. Retained after successful automatic fallback.
+    pub code_first_failure_op: u32,
+    /// Raw errno for the first failure, or zero if the API supplies no errno.
+    pub code_first_failure_errno: i32,
+    /// Most recent failing dense-provider operation ID, or zero if none.
+    pub code_last_failure_op: u32,
+    /// Raw errno for the most recent failure, or zero if unavailable.
+    pub code_last_failure_errno: i32,
     /// Allocation-handle and region-vector capacities, excluding allocator overhead.
     pub code_allocation_metadata_bytes: u64,
     /// Requests waiting in the background queue, excluding the active batch.

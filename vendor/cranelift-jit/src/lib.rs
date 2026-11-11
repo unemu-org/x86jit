@@ -12,7 +12,8 @@ mod memory;
 
 pub use crate::backend::{JITBuilder, JITModule};
 pub use crate::memory::{
-    ArenaMemoryProvider, BranchProtection, JITMemoryKind, JITMemoryProvider, SystemMemoryProvider,
+    ArenaMemoryProvider, BranchProtection, JITMemoryKind, JITMemoryProvider, SystemMemoryOperation,
+    SystemMemoryProvider,
 };
 
 /// Version number of this crate.

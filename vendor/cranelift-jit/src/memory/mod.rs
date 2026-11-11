@@ -7,6 +7,29 @@ mod system;
 pub use arena::ArenaMemoryProvider;
 pub use system::SystemMemoryProvider;
 
+/// A fallible system-provider publication operation.
+#[derive(Clone, Copy, Debug)]
+pub enum SystemMemoryOperation {
+    /// Remove write permission from constant data.
+    ProtectReadOnly,
+    /// Seal code RX, including any requested branch protection.
+    ProtectExecutable,
+    /// Clean or invalidate newly written instruction-cache lines.
+    CacheMaintenance,
+    /// Synchronize instruction streams before publishing code.
+    PipelineSync,
+}
+
+type Perform<'a> =
+    dyn FnMut(SystemMemoryOperation, &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> + 'a;
+
+fn protection_error(error: region::Error) -> io::Error {
+    match error {
+        region::Error::SystemCall(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
 /// Type of branch protection to apply to executable memory.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BranchProtection {
@@ -66,39 +89,44 @@ pub(crate) fn set_readable_and_executable(
     len: usize,
     branch_protection: BranchProtection,
 ) -> ModuleResult<()> {
-    // Clear all the newly allocated code from cache if the processor requires it
-    //
-    // Do this before marking the memory as R+X, technically we should be able to do it after
-    // but there are some CPU's that have had errata about doing this with read only memory.
-    unsafe {
-        wasmtime_jit_icache_coherence::clear_cache(ptr as *const libc::c_void, len)
-            .expect("Failed cache clear")
-    };
+    set_readable_and_executable_with(ptr, len, branch_protection, &mut |_, action| action())
+        .map_err(|err| ModuleError::Allocation { err })
+}
 
-    unsafe {
-        region::protect(ptr, len, region::Protection::READ_EXECUTE).map_err(|e| {
-            ModuleError::Backend(
-                anyhow::Error::new(e).context("unable to make memory readable+executable"),
-            )
-        })?;
-    }
-
-    // If BTI is requested, and the architecture supports it, use mprotect to set the PROT_BTI flag.
-    if branch_protection == BranchProtection::BTI {
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-        if std::arch::is_aarch64_feature_detected!("bti") {
-            let prot = libc::PROT_EXEC | libc::PROT_READ | /* PROT_BTI */ 0x10;
-
-            unsafe {
-                if libc::mprotect(ptr as *mut libc::c_void, len, prot) < 0 {
-                    return Err(ModuleError::Backend(
-                        anyhow::Error::new(io::Error::last_os_error())
-                            .context("unable to make memory readable+executable"),
-                    ));
+fn set_readable_and_executable_with(
+    ptr: *mut u8,
+    len: usize,
+    branch_protection: BranchProtection,
+    perform: &mut Perform<'_>,
+) -> io::Result<()> {
+    // Keep cache maintenance before RX protection: some CPUs have errata
+    // requiring writable memory for this operation.
+    perform(SystemMemoryOperation::CacheMaintenance, &mut || {
+        // SAFETY: the provider owns this initialized code extent.
+        let result = unsafe { wasmtime_jit_icache_coherence::clear_cache(ptr.cast(), len) };
+        #[cfg(target_os = "linux")]
+        {
+            result
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            result.map_err(io::Error::other)
+        }
+    })?;
+    perform(SystemMemoryOperation::ProtectExecutable, &mut || {
+        // SAFETY: this extent belongs to the provider and is page aligned.
+        unsafe { region::protect(ptr, len, region::Protection::READ_EXECUTE) }
+            .map_err(protection_error)?;
+        if branch_protection == BranchProtection::BTI {
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            if std::arch::is_aarch64_feature_detected!("bti") {
+                let prot = libc::PROT_EXEC | libc::PROT_READ | /* PROT_BTI */ 0x10;
+                // SAFETY: the same owned, page-aligned extent; add BTI protection.
+                if unsafe { libc::mprotect(ptr.cast(), len, prot) } < 0 {
+                    return Err(io::Error::last_os_error());
                 }
             }
         }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }

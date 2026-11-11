@@ -44,6 +44,8 @@ mod memory_stats;
 pub mod perfmap;
 mod unwind;
 
+pub use code_memory::{CodeMemoryFailure, CodeMemoryFailureOp, CodeMemoryPolicy};
+
 use lock_telemetry::{LockKind, Telemetry};
 pub use lock_telemetry::{LockTelemetry, LockTelemetrySnapshot};
 
@@ -3374,6 +3376,14 @@ impl JitBackend {
     /// inherited with the system provider's policy; engine workers and VM state
     /// still require the shutdown/rebuild protocol around host fork. Dense arena
     /// mapping bounds and provider storage counters do not apply to this mode.
+    /// By default the first compiler module probes and retains a dense code region.
+    /// If that first region cannot be created (including unsupported macOS write
+    /// protection), Linux/FreeBSD try anonymous W^X storage before selecting this
+    /// system provider. macOS selects this system provider directly,
+    /// before Cranelift receives any allocation. Once startup selects storage, failures
+    /// remain code-space exhaustion; providers are never mixed within a backend.
+    /// Automatic fallback and its original operation/errno remain in MemoryStats;
+    /// explicit selection here performs no probe and records no fallback.
     /// The first code registration in a fork child replaces the whole inherited
     /// code map, hiding all inherited entries, including still-mapped code from
     /// the system provider. The parent's entries are unaffected.
@@ -3387,6 +3397,45 @@ impl JitBackend {
         );
         shared.system_memory = true;
         self
+    }
+
+    /// Use code storage without creating any file descriptors.
+    /// Configure before sharing or compiling. [`CodeMemoryPolicy::WriteXorExecute`]
+    /// permanently seals each publication batch RX and discards its partial-page
+    /// tail. [`CodeMemoryPolicy::ReadWriteExecute`] keeps pages writable and
+    /// executable, permitting modification of live code in exchange for no
+    /// per-batch page waste. Choose it only when that security trade-off is acceptable.
+    /// Reservations grow in 128 MiB regions and are excluded from host fork;
+    /// shut down and rebuild engines around fork as with the default dense provider.
+    /// On Linux/FreeBSD explicit selection never switches providers on failure.
+    /// On macOS both policies retain the existing descriptor-free MAP_JIT path,
+    /// per-thread write protection, dense tails and startup system fallback.
+    pub fn with_no_fd_memory_provider(mut self, policy: CodeMemoryPolicy) -> Self {
+        let shared =
+            Arc::get_mut(&mut self.shared).expect("configure memory before sharing the backend");
+        assert!(
+            shared.inner.get_mut().unwrap().is_none()
+                && shared.nondefault_inner.get_mut().unwrap().is_none(),
+            "configure memory before compiling"
+        );
+        shared.system_memory = false;
+        *shared.memory.provider_choice.lock().unwrap() = if cfg!(target_os = "macos") {
+            memory_stats::ProviderChoice::Undecided
+        } else {
+            memory_stats::ProviderChoice::NoFd(policy)
+        };
+        self
+    }
+
+    /// First dense-provider failure, including failures recovered by fallback.
+    /// Does not acquire a compiler lock. None until a provider operation fails.
+    pub fn code_first_failure(&self) -> Option<CodeMemoryFailure> {
+        self.shared.memory.first_failure()
+    }
+
+    /// Most recent dense-provider failure, including failures recovered by fallback.
+    pub fn code_last_failure(&self) -> Option<CodeMemoryFailure> {
+        self.shared.memory.last_failure()
     }
 
     /// Choose whether the JIT narrows dead flag writes. Set before compiling.
@@ -3685,12 +3734,14 @@ impl JitBackend {
             .finish(settings::Flags::new(flags))
             .expect("finish ISA");
         let return_address_bkey = unwind::uses_bkey(isa.as_ref());
-        let mut builder = libcalls::builder(isa);
-        builder.memory_provider(if system_memory {
-            Box::new(cranelift_jit::SystemMemoryProvider::new())
-        } else {
-            code_memory::provider(memory)
-        });
+        let builder = libcalls::builder_with_memory(
+            isa,
+            if system_memory {
+                code_memory::system_provider(memory)
+            } else {
+                code_memory::provider(memory)
+            },
+        );
         let module = JITModule::new(builder);
 
         Jit {
