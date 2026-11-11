@@ -5974,6 +5974,9 @@ mod tests {
             assert_eq!(stats.source_barrier_mode, SourceBarrierMode::Degraded);
             assert_eq!(stats.source_barrier_failures, 1);
             assert_eq!(stats.source_barrier_last_errno, Some(1));
+            assert_eq!(stats.source_barrier_calls, 0);
+            assert_eq!(stats.source_barrier_ns, 0);
+            assert!(stats.source_barrier_tagged_pages > 0);
         }
     }
 

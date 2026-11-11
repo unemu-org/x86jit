@@ -14,6 +14,31 @@ fn fixture(backend: JitBackend) -> Vm {
 }
 
 #[test]
+fn source_barrier_stats_batch_two_page_jit_lift() {
+    x86jit_core::with_barrier_success(|| {
+        let vm = fixture(JitBackend::new());
+        vm.write_bytes(0x1ffd, &[0xb8, 7, 0, 0, 0, 0xf4]).unwrap();
+        let initial = vm.memory_stats();
+        assert_eq!(initial.source_barrier_calls, 0);
+        assert_eq!(initial.source_barrier_ns, 0);
+        assert_eq!(initial.source_barrier_tagged_pages, 0);
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, 0x1ffd);
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        let stats = vm.memory_stats();
+        assert_eq!(stats.cache.compiled_entries, 1);
+        assert_eq!(stats.source_barrier_calls, 1);
+        assert_eq!(stats.source_barrier_tagged_pages, 2);
+        cpu.set_reg(Reg::Rip, 0x1ffd);
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        let cached = vm.memory_stats();
+        assert_eq!(cached.source_barrier_calls, 1);
+        assert_eq!(cached.source_barrier_ns, stats.source_barrier_ns);
+        assert_eq!(cached.source_barrier_tagged_pages, 2);
+    });
+}
+
+#[test]
 fn backend_replacement_rejects_cached_compiled_entries_and_private_predictions() {
     let mut vm = fixture(JitBackend::new());
     let mut cpu = vm.new_vcpu();
@@ -63,6 +88,8 @@ fn uncached_execution_after_backend_replacement_never_registers_code() {
                 x86jit_core::SourceBarrierMode::Process
             );
             assert_eq!(stats.source_barrier_uncached_executions, u64::from(value));
+            assert_eq!(stats.source_barrier_calls, u64::from(value) * 3);
+            assert_eq!(stats.source_barrier_tagged_pages, u64::from(value));
             assert_eq!(stats.backend.compiled_units_total, 0);
             assert_eq!(stats.cache.interpreted_entries, 0);
             assert_eq!(stats.cache.compiled_entries, 0);

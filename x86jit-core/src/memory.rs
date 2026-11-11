@@ -1667,7 +1667,12 @@ impl Memory {
             let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
             if let Some(word) = self.code_page.get(w) {
                 if live {
-                    transitioned |= word.fetch_or(m, Ordering::Release) & m == 0;
+                    if word.fetch_or(m, Ordering::Release) & m == 0 {
+                        transitioned = true;
+                        self.source_barrier
+                            .tagged_pages
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 } else if !aliases.retained_code.contains(&page) {
                     word.fetch_and(!m, Ordering::Relaxed);
                 }
@@ -3325,6 +3330,183 @@ fn apply_rmw(old: u64, src: u64, op: RmwOp, size: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_barrier_stats_batch_new_pages_and_skip_synchronized_tags() {
+        crate::with_barrier_success(|| {
+            let vm = crate::Vm::new(crate::VmConfig::flat(0x6000));
+            let empty = LiftSource::new(&vm.mem);
+            assert!(empty.validate());
+            assert_eq!(vm.memory_stats().source_barrier_calls, 0);
+            assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 0);
+
+            let first = LiftSource::new(&vm.mem);
+            first.watch(0x1000, 0x3000);
+            first.watch(0x2000, 1);
+            assert!(first.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_calls, 1);
+            assert_eq!(stats.source_barrier_tagged_pages, 3);
+
+            let second = LiftSource::new(&vm.mem);
+            second.watch(0x1000, 0x3000);
+            assert!(second.validate());
+            assert!(first.validate());
+            let unchanged = vm.memory_stats();
+            assert_eq!(unchanged.source_barrier_calls, stats.source_barrier_calls);
+            assert_eq!(unchanged.source_barrier_ns, stats.source_barrier_ns);
+            assert_eq!(unchanged.source_barrier_tagged_pages, 3);
+
+            let third = LiftSource::new(&vm.mem);
+            third.watch(0x4000, 1);
+            assert!(third.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_calls, 2);
+            assert_eq!(stats.source_barrier_tagged_pages, 4);
+        });
+    }
+
+    #[test]
+    fn source_barrier_stats_cover_coalesced_lifts_and_alias_pages() {
+        crate::with_barrier_success(|| {
+            let vm = crate::Vm::new(crate::VmConfig::flat(0x6000));
+            vm.mem.declare_code_alias(0x1000, 0x3000, 0x2000).unwrap();
+            let first = LiftSource::new(&vm.mem);
+            first.watch(0x1000, 1);
+            let second = LiftSource::new(&vm.mem);
+            second.watch(0x2000, 1);
+            assert!(second.validate());
+            assert!(first.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_calls, 1);
+            assert_eq!(stats.source_barrier_tagged_pages, 4);
+        });
+    }
+
+    #[test]
+    fn degraded_source_barrier_stats_count_pages_without_calls() {
+        crate::with_barrier_unavailable(|| {
+            let vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 0x3000);
+            assert!(source.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(
+                stats.source_barrier_mode,
+                crate::SourceBarrierMode::Degraded
+            );
+            assert_eq!(stats.source_barrier_calls, 0);
+            assert_eq!(stats.source_barrier_ns, 0);
+            assert_eq!(stats.source_barrier_tagged_pages, 3);
+        });
+    }
+
+    #[test]
+    fn source_barrier_stats_count_retags_before_original_lift_validates() {
+        crate::with_barrier_success(|| {
+            let vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 1);
+            assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 1);
+            vm.mem.clear_all_code_pages();
+            assert!(vm.mem.is_code_page(1));
+            assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 2);
+            assert!(source.validate());
+            assert_eq!(vm.memory_stats().source_barrier_calls, 1);
+            assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 2);
+            drop(source);
+
+            vm.mem.clear_all_code_pages();
+            assert!(!vm.mem.is_code_page(1));
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 1);
+            assert!(source.validate());
+            assert_eq!(vm.memory_stats().source_barrier_calls, 2);
+            assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 3);
+        });
+    }
+
+    #[test]
+    fn source_barrier_stats_sum_concurrent_disjoint_lifts() {
+        crate::with_barrier_success(|| {
+            for degraded in [false, true] {
+                let create = || crate::Vm::new(crate::VmConfig::flat(0x6000));
+                let vm = if degraded {
+                    crate::with_barrier_unavailable(create)
+                } else {
+                    create()
+                };
+                let rendezvous = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    for addr in [0x1000, 0x3000] {
+                        let vm = &vm;
+                        let rendezvous = &rendezvous;
+                        scope.spawn(move || {
+                            crate::with_barrier_success(|| {
+                                let source = LiftSource::new(&vm.mem);
+                                source.watch(addr, 0x2000);
+                                rendezvous.wait();
+                                assert!(source.validate());
+                                rendezvous.wait();
+                                assert_eq!(vm.memory_stats().source_barrier_tagged_pages, 4);
+                            });
+                        });
+                    }
+                });
+                let stats = vm.memory_stats();
+                assert_eq!(stats.source_barrier_tagged_pages, 4);
+                if degraded {
+                    assert_eq!(stats.source_barrier_calls, 0);
+                    assert_eq!(stats.source_barrier_ns, 0);
+                } else {
+                    assert!((1..=2).contains(&stats.source_barrier_calls));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn source_barrier_stats_do_not_recount_tags_on_validation_retry() {
+        crate::with_barrier_success(|| {
+            let mut vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
+            vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 1);
+            source.record(0x1000, &[0]);
+            vm.write_bytes(0x1000, &[1]).unwrap();
+            assert!(!source.validate());
+            let retry = LiftSource::new(&vm.mem);
+            retry.watch(0x1000, 1);
+            retry.record(0x1000, &[1]);
+            assert!(retry.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_calls, 1);
+            assert_eq!(stats.source_barrier_tagged_pages, 1);
+        });
+    }
+
+    #[test]
+    fn failed_source_barrier_stats_count_every_attempt() {
+        crate::with_barrier_success(|| {
+            let vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 0x2000);
+            crate::with_barrier_flush_failure(|| assert!(source.validate()));
+            let stats = vm.memory_stats();
+            assert!(!source.publishable());
+            assert_eq!(stats.source_barrier_calls, 3);
+            assert_eq!(stats.source_barrier_failures, 3);
+            assert_eq!(stats.source_barrier_tagged_pages, 2);
+            drop(source);
+
+            let source = LiftSource::new(&vm.mem);
+            source.watch(0x1000, 1);
+            assert!(source.validate());
+            let stats = vm.memory_stats();
+            assert_eq!(stats.source_barrier_calls, 4);
+            assert_eq!(stats.source_barrier_tagged_pages, 3);
+        });
+    }
 
     #[test]
     fn failed_barrier_does_not_synchronize_other_lifters() {

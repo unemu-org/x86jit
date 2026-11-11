@@ -185,4 +185,19 @@ pub struct MemoryStats {
     /// Allocated capacities of code/watch/dirty bitmaps. Lazily resident and
     /// separate from RAM; excludes sparse index and alias-tree allocations.
     pub memory_tracking_bytes: u64,
+    /// Process-mode source-publication barrier attempts, successful or failed,
+    /// including retries. Excludes construction probes/registration. Always
+    /// counted; Degraded mode makes no calls and leaves this zero.
+    pub source_barrier_calls: u64,
+    /// Cumulative elapsed host nanoseconds inside those barrier calls only,
+    /// including failed attempts; excludes tagging, validation and retry yields.
+    /// Always timed, independently of time accounting. Degraded mode leaves zero.
+    pub source_barrier_ns: u64,
+    /// Pages newly tagged as code (4 KiB), including aliases, in Process and
+    /// Degraded modes alike. Counts each untagged-to-tagged transition; re-tagging
+    /// a cleared page counts again. With `source_barrier_calls`, the ratio gives
+    /// pages covered per barrier: one barrier covers every page tagged since the
+    /// previous one. Pages are counted at tagging, without per-barrier attribution;
+    /// failed attempts and retries do not add pages.
+    pub source_barrier_tagged_pages: u64,
 }

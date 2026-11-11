@@ -768,6 +768,13 @@ impl Vm {
             guest_ram_reserved,
             guest_ram_committed,
             memory_tracking_bytes,
+            source_barrier_calls: self.mem.source_barrier.calls.load(Ordering::Relaxed),
+            source_barrier_ns: self.mem.source_barrier.ns.load(Ordering::Relaxed),
+            source_barrier_tagged_pages: self
+                .mem
+                .source_barrier
+                .tagged_pages
+                .load(Ordering::Relaxed),
         }
     }
 

@@ -1182,6 +1182,18 @@ of the guest consistency tier. `Vm::memory_stats()` exposes `source_barrier_mode
 `source_barrier_last_errno` (retained even after a successful retry), and
 `source_barrier_uncached_executions` (blocks dispatched without publication after
 a later process-barrier failure).
+Always-on source-publication counters exclude construction probing/registration:
+`source_barrier_calls` counts each process-barrier attempt, including failures
+and retries; `source_barrier_ns` measures elapsed host nanoseconds inside those
+calls only, excluding tagging, validation and retry yields.
+`source_barrier_tagged_pages` counts pages newly tagged as code (4 KiB), including
+aliases, at each untagged-to-tagged transition in both Process and Degraded modes.
+Re-tagging a cleared page counts again; failed attempts and retries do not add
+pages. With `source_barrier_calls`, the ratio gives pages covered per barrier,
+because one barrier covers every page tagged since the previous one. There is no
+per-barrier page attribution. Degraded mode makes no process-barrier calls and
+leaves calls and nanoseconds at zero while still counting page transitions.
+These counters are independent relaxed snapshots.
 
 - **Process mode (Linux/FreeBSD):** probe private registration and an actual
   `membarrier(PRIVATE_EXPEDITED)` before choosing this mode. Only registration

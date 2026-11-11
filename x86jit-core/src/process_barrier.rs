@@ -25,6 +25,9 @@ pub(crate) struct ProcessBarrier {
     failures: AtomicU64,
     last_errno: AtomicI32,
     pub(crate) uncached_executions: AtomicU64,
+    pub(crate) calls: AtomicU64,
+    pub(crate) ns: AtomicU64,
+    pub(crate) tagged_pages: AtomicU64,
 }
 
 impl ProcessBarrier {
@@ -34,6 +37,9 @@ impl ProcessBarrier {
             failures: AtomicU64::new(0),
             last_errno: AtomicI32::new(0),
             uncached_executions: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+            tagged_pages: AtomicU64::new(0),
         };
         #[cfg(any(test, feature = "test-hooks"))]
         let probe = if FORCE_UNAVAILABLE.with(|v| v.get()) {
@@ -82,6 +88,7 @@ impl ProcessBarrier {
             // A per-thread filter can reject a command after another thread's
             // successful probe. Keep the mode fixed and refuse publication.
             for attempt in 0..3 {
+                let start = crate::time_stats::MonotonicTime::now();
                 #[cfg(any(test, feature = "test-hooks"))]
                 let result = if FORCE_FLUSH_FAILURE.with(|v| v.get()) {
                     Err(io::Error::from_raw_os_error(1))
@@ -92,6 +99,9 @@ impl ProcessBarrier {
                 };
                 #[cfg(not(any(test, feature = "test-hooks")))]
                 let result = os::flush();
+                let ns = start.elapsed_ns();
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.ns.fetch_add(ns, Ordering::Relaxed);
                 match result {
                     Ok(()) => break,
                     Err(error) => {
@@ -315,6 +325,9 @@ mod tests {
             failures: AtomicU64::new(0),
             last_errno: AtomicI32::new(0),
             uncached_executions: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+            tagged_pages: AtomicU64::new(0),
         }
     }
 
@@ -366,6 +379,9 @@ mod tests {
         assert_eq!(barrier.stats(), (SourceBarrierMode::Degraded, 1, Some(1)));
         barrier.writer_fence();
         barrier.flush();
+        assert_eq!(barrier.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(barrier.ns.load(Ordering::Relaxed), 0);
+        assert_eq!(barrier.tagged_pages.load(Ordering::Relaxed), 0);
         assert_eq!(
             barrier.stats().1,
             1,

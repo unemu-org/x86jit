@@ -272,6 +272,7 @@ impl MonotonicTime {
     pub fn elapsed_ns(self) -> u64 {
         #[cfg(target_arch = "aarch64")]
         {
+            let elapsed = Self::now().0.saturating_sub(self.0);
             static FREQUENCY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
             let frequency = *FREQUENCY.get_or_init(|| {
                 let frequency;
@@ -282,8 +283,7 @@ impl MonotonicTime {
                 }
                 frequency
             });
-            ((Self::now().0.saturating_sub(self.0) as u128 * 1_000_000_000) / u128::from(frequency))
-                .min(u64::MAX as u128) as u64
+            ((elapsed as u128 * 1_000_000_000) / u128::from(frequency)).min(u64::MAX as u128) as u64
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
