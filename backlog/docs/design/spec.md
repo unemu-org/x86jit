@@ -1097,21 +1097,31 @@ Because guest code lies in a *data* buffer (the guest may modify it), a write to
 - On the next execution → miss → re-lift from the changed bytes.
 
 Invalidation uses a page index to find candidate units, then compares their source
-byte spans with the accumulated write ranges. Disjoint writes preserve cached units,
-page tags and the dispatch epoch, so per-vCPU predictors remain warm. Every drained
+byte spans with the accumulated write ranges. A sparse radix directory stores an
+exact 4096-bit coverage bitmap per indexed page, for cached units and registered
+background sources. Ordinary writes check coverage under the spans read lock; a
+miss advances the publication generation before releasing that lock, without
+allocating, hashing keys or acquiring the write lock. Publishers require the write
+lock, so they either precede the coverage check or observe the generation advance.
+Overlapping writes reacquire the write lock and recheck the touched pages. Per-page
+entries carry local byte spans, so candidate checks and coverage rebuilding iterate
+those entries directly without rehashing each key into the unit table.
+Disjoint writes preserve cached units, page tags and the dispatch epoch, so per-vCPU predictors remain warm. Every drained
 range advances a separate source-publication generation under the cache spans lock.
 Synchronous lifts and tier-ups snapshot it before reading source bytes or IR and reject
 publication if it changes, including when an uncached region successor was written and
 no cached unit overlapped. Background requests use that check only until their source
 spans are registered under the same lock; subsequent invalidation cancels only requests
-whose source spans overlap the write. Uncached region successors are tagged at
-registration and retain write tracking while pending. Canceled requests keep their
+whose source spans overlap the write. Unregistered requests also retain their claim
+generation, so cancellation during source reads needs no pending-map mutation.
+Uncached region successors are tagged at registration and retain write tracking while
+pending. Canceled requests keep their
 pending slot until the matching completion drains, preventing duplicate compilation.
 An opaque request identity prevents a stale completion from releasing a newer slot.
 
 `Vm::memory_stats().cache` exposes lifetime invalidation calls and blocks dropped,
-background requests accepted, duplicate attempts skipped, completions received and
-published, and rejections split by source invalidation, backend compilation failure,
+coverage bitmap/directory allocation bytes, background requests accepted, duplicate
+attempts skipped, completions received and published, and rejections split by source invalidation, backend compilation failure,
 and supersession. These relaxed counters are independent snapshots; a region counts
 as one cache entry and one background request.
 

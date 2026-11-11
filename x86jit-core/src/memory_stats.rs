@@ -61,6 +61,11 @@ pub struct CacheMemoryStats {
     /// plus `ops.capacity() * size_of::<IrOp>()`. Counts shared IR per cache key;
     /// excludes queued IR, executing clones, and nested operation allocations.
     pub interpreted_ir_bytes: u64,
+    /// Total source-index allocation estimate: cached and pending membership tables,
+    /// source vectors, byte bitmaps, exact overlap counters, radix nodes, pending
+    /// request and suppression tables. Includes table empty buckets/control bytes
+    /// and retained capacity; excludes allocator metadata and transient victims.
+    pub coverage_index_bytes: u64,
     /// Calls to cache invalidation, including victim-free writes and explicit flushes.
     pub invalidation_calls: u64,
     /// Cache entries removed by invalidation (regions count once).
@@ -117,7 +122,7 @@ pub struct VcpuMemoryStats {
 
 /// Cheap diagnostic snapshot; categories are not a complete accounting of RSS.
 /// Standalone ChildArena storage belongs to the embedder and is excluded;
-/// vCPUs own no child arenas. Compiler contexts, cache hash tables/span indices,
+/// vCPUs own no child arenas. Compiler contexts, cache hash tables/other span indices,
 /// link slots and allocator bookkeeping are also excluded.
 /// No compiler lock or cache traversal is required. The provider registry, vCPU
 /// registry, background queue and code-map writer locks are acquired briefly.

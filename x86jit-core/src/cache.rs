@@ -68,22 +68,368 @@ pub enum CachedBlock {
     Compiled { entry: CompiledPtr },
 }
 
+// A sparse radix directory avoids hashing on a byte-coverage miss. Its height
+// grows with the highest page number, bounded by 13 nibbles for a u64 address.
+#[derive(Default)]
+struct CoverageIndex {
+    root: Option<CoverageNode>,
+    height: u32,
+    bytes: u64,
+    #[cfg(test)]
+    uncovered_ranges: usize,
+}
+
+enum CoverageNode {
+    Branch(Box<[Option<CoverageNode>; 16]>),
+    Page(Box<PageCoverage>),
+}
+
+struct PageCoverage {
+    bits: [u64; 64],
+    // Only overlapping spans need counts beyond the first reference. Disjoint
+    // translations on the same page retain the bitmap's compact representation.
+    extra: Option<Box<ExtraCoverage>>,
+}
+
+struct ExtraCoverage {
+    // Two exact extra-reference counts per byte; overflow stores the excess
+    // above 15 and is always consumed before the packed count is decremented.
+    counts: [u8; 2048],
+    overflow: Vec<(u16, usize)>,
+    shared_bytes: u16,
+}
+
+impl ExtraCoverage {
+    fn bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>()
+            + self.overflow.capacity() * std::mem::size_of::<(u16, usize)>()) as u64
+    }
+
+    fn increment(&mut self, byte: usize) {
+        let shift = (byte % 2) * 4;
+        let count = (self.counts[byte / 2] >> shift) & 15;
+        if count == 15 {
+            if let Some((_, excess)) = self
+                .overflow
+                .iter_mut()
+                .find(|(b, _)| usize::from(*b) == byte)
+            {
+                *excess = excess.checked_add(1).expect("coverage count exhausted");
+            } else {
+                self.overflow.push((byte as u16, 1));
+            }
+        } else {
+            self.shared_bytes += u16::from(count == 0);
+            self.counts[byte / 2] += 1 << shift;
+        }
+    }
+
+    fn decrement(&mut self, byte: usize) -> bool {
+        let shift = (byte % 2) * 4;
+        let count = (self.counts[byte / 2] >> shift) & 15;
+        if count == 0 {
+            return false;
+        }
+        if count == 15 {
+            if let Some(i) = self
+                .overflow
+                .iter()
+                .position(|(b, _)| usize::from(*b) == byte)
+            {
+                self.overflow[i].1 -= 1;
+                if self.overflow[i].1 == 0 {
+                    self.overflow.swap_remove(i);
+                    if self.overflow.is_empty() {
+                        self.overflow = Vec::new();
+                    }
+                }
+                return true;
+            }
+        }
+        self.counts[byte / 2] -= 1 << shift;
+        self.shared_bytes -= u16::from(count == 1);
+        true
+    }
+}
+
+impl CoverageIndex {
+    fn page(&self, page: u64) -> Option<&[u64; 64]> {
+        if page >> (self.height * 4) != 0 {
+            return None;
+        }
+        let mut node = self.root.as_ref()?;
+        for level in (0..self.height).rev() {
+            let CoverageNode::Branch(children) = node else {
+                unreachable!()
+            };
+            node = children[((page >> (level * 4)) & 15) as usize].as_ref()?;
+        }
+        let CoverageNode::Page(bits) = node else {
+            unreachable!()
+        };
+        Some(&bits.bits)
+    }
+
+    fn set_page(&mut self, page: u64, bits: [u64; 64]) {
+        while page >> (self.height * 4) != 0 {
+            if let Some(root) = self.root.take() {
+                let mut children = Box::new(std::array::from_fn(|_| None));
+                children[0] = Some(root);
+                self.bytes += std::mem::size_of_val(&*children) as u64;
+                self.root = Some(CoverageNode::Branch(children));
+            }
+            self.height += 1;
+        }
+        fn set(
+            node: &mut Option<CoverageNode>,
+            height: u32,
+            page: u64,
+            bits: [u64; 64],
+            bytes: &mut u64,
+        ) {
+            if height == 0 {
+                if node.is_none() {
+                    *bytes += std::mem::size_of::<PageCoverage>() as u64;
+                }
+                if let Some(CoverageNode::Page(current)) = node {
+                    current.bits = bits;
+                } else {
+                    *node = Some(CoverageNode::Page(Box::new(PageCoverage {
+                        bits,
+                        extra: None,
+                    })));
+                }
+                return;
+            }
+            if node.is_none() {
+                let children = Box::new(std::array::from_fn(|_| None));
+                *bytes += std::mem::size_of_val(&*children) as u64;
+                *node = Some(CoverageNode::Branch(children));
+            }
+            let Some(CoverageNode::Branch(children)) = node else {
+                unreachable!()
+            };
+            set(
+                &mut children[((page >> ((height - 1) * 4)) & 15) as usize],
+                height - 1,
+                page,
+                bits,
+                bytes,
+            );
+        }
+        set(&mut self.root, self.height, page, bits, &mut self.bytes);
+    }
+
+    fn page_mut(&mut self, page: u64) -> &mut PageCoverage {
+        let mut node = self.root.as_mut().unwrap();
+        for level in (0..self.height).rev() {
+            let CoverageNode::Branch(children) = node else {
+                unreachable!()
+            };
+            node = children[((page >> (level * 4)) & 15) as usize]
+                .as_mut()
+                .unwrap();
+        }
+        let CoverageNode::Page(coverage) = node else {
+            unreachable!()
+        };
+        coverage
+    }
+
+    fn cover(&mut self, page: u64, lo: usize, hi: usize) {
+        if self.page(page).is_none() {
+            let mut bits = [0; 64];
+            cover_page(&mut bits, lo, hi);
+            self.set_page(page, bits);
+            return;
+        }
+        let coverage = self.page_mut(page);
+        let before = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
+        for word in lo / 64..=(hi - 1) / 64 {
+            let mask = page_word_mask(word, lo, hi);
+            let mut shared = coverage.bits[word] & mask;
+            if shared != 0 {
+                let extra = coverage.extra.get_or_insert_with(|| {
+                    Box::new(ExtraCoverage {
+                        counts: [0; 2048],
+                        overflow: Vec::new(),
+                        shared_bytes: 0,
+                    })
+                });
+                while shared != 0 {
+                    extra.increment(word * 64 + shared.trailing_zeros() as usize);
+                    shared &= shared - 1;
+                }
+            }
+            coverage.bits[word] |= mask;
+        }
+        let after = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
+        self.bytes = self.bytes - before + after;
+    }
+
+    fn uncover(&mut self, page: u64, lo: usize, hi: usize) {
+        #[cfg(test)]
+        {
+            self.uncovered_ranges += 1;
+        }
+        let coverage = self.page_mut(page);
+        let before = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
+        for word in lo / 64..=(hi - 1) / 64 {
+            let mask = page_word_mask(word, lo, hi);
+            let mut keep = 0;
+            if let Some(extra) = coverage.extra.as_mut() {
+                let mut shared = mask;
+                while shared != 0 {
+                    let bit = shared.trailing_zeros() as usize;
+                    if extra.decrement(word * 64 + bit) {
+                        keep |= 1 << bit;
+                    }
+                    shared &= shared - 1;
+                }
+            }
+            coverage.bits[word] = (coverage.bits[word] & !mask) | keep;
+        }
+        if coverage
+            .extra
+            .as_ref()
+            .is_some_and(|extra| extra.shared_bytes == 0)
+        {
+            coverage.extra = None;
+        }
+        let after = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
+        self.bytes = self.bytes - before + after;
+    }
+
+    fn remove_page(&mut self, page: u64) {
+        fn remove(node: &mut Option<CoverageNode>, height: u32, page: u64, bytes: &mut u64) {
+            let Some(current) = node else { return };
+            match current {
+                CoverageNode::Page(coverage) => {
+                    *bytes -= std::mem::size_of::<PageCoverage>() as u64;
+                    *bytes -= coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
+                }
+                CoverageNode::Branch(children) => {
+                    remove(
+                        &mut children[((page >> ((height - 1) * 4)) & 15) as usize],
+                        height - 1,
+                        page,
+                        bytes,
+                    );
+                    if children.iter().any(Option::is_some) {
+                        return;
+                    }
+                    *bytes -= std::mem::size_of_val(&**children) as u64;
+                }
+            }
+            *node = None;
+        }
+        if page >> (self.height * 4) == 0 {
+            remove(&mut self.root, self.height, page, &mut self.bytes);
+        }
+        if self.root.is_none() {
+            self.height = 0;
+        }
+    }
+}
+
+fn page_word_mask(word: usize, lo: usize, hi: usize) -> u64 {
+    (u64::MAX << (lo.saturating_sub(word * 64))) & (u64::MAX >> (64 - (hi - word * 64).min(64)))
+}
+
+fn cover_page(bits: &mut [u64; 64], lo: usize, hi: usize) {
+    if lo < hi {
+        for (word, value) in bits
+            .iter_mut()
+            .enumerate()
+            .take((hi - 1) / 64 + 1)
+            .skip(lo / 64)
+        {
+            *value |= page_word_mask(word, lo, hi);
+        }
+    }
+}
+
+// Bounds fit in 13 bits each, including the exclusive page end (4096).
+// A second span sets the fallback bit: its gaps are checked against units.
+struct PageSpans(u32);
+
+impl PageSpans {
+    fn new(lo: usize, hi: usize) -> Self {
+        Self(lo as u32 | ((hi as u32) << 13))
+    }
+
+    fn extend(&mut self, lo: usize, hi: usize) {
+        *self = Self(Self::new(lo.min(self.lo()), hi.max(self.hi())).0 | (1 << 26));
+    }
+
+    fn lo(&self) -> usize {
+        (self.0 & 8191) as usize
+    }
+    fn hi(&self) -> usize {
+        ((self.0 >> 13) & 8191) as usize
+    }
+}
+
+// HashMap's public capacity excludes its empty buckets. Include those buckets
+// and control bytes (including the trailing group), but not allocator metadata.
+// Deletion can lower reported capacity without freeing buckets: retain the
+// largest allocation estimate until the owning table is dropped.
+fn table_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity + 1).next_power_of_two();
+    (buckets * (std::mem::size_of::<T>() + 1) + 16) as u64
+}
+
+#[derive(Default)]
+struct PageMembership {
+    entries: HashMap<BlockKey, PageSpans>,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct SourceIndex {
+    coverage: CoverageIndex,
+    allocation_bytes: u64,
+    units_bytes: u64,
+    pages_bytes: u64,
+    units: HashMap<BlockKey, Vec<(u64, u32)>>,
+    pages: HashMap<u64, PageMembership>,
+}
+
 // One lock protects both span indices and pending sources. Lock order is
 // spans -> map -> hotness, with atomic page-tag publication (§10, §17.4).
 #[derive(Default)]
 struct SpanIndex {
-    units: HashMap<BlockKey, Vec<(u64, u32)>>,
-    pages: HashMap<u64, HashSet<BlockKey>>,
+    cached: SourceIndex,
+    pending_sources: SourceIndex,
     pending: HashMap<BlockKey, PendingTierUp>,
+    pending_bytes: u64,
+    suppression_bytes: u64,
     next_request: u64,
     interpreter_only: HashSet<BlockKey>,
+}
+
+impl SpanIndex {
+    fn insert(&mut self, key: BlockKey, spans: Vec<(u64, u32)>) {
+        self.interpreter_only.remove(&key);
+        self.cached.insert(key, spans);
+    }
+
+    fn coverage_bytes(&self) -> u64 {
+        self.cached.bytes()
+            + self.pending_sources.bytes()
+            + self.pending_bytes
+            + self.suppression_bytes
+    }
 }
 
 struct PendingTierUp {
     queued_at: Option<crate::time_stats::MonotonicTime>,
     id: u64,
-    spans: Option<Vec<(u64, u32)>>,
     cancelled: bool,
+    generation: u64,
 }
 
 fn span_pages(start: u64, len: u32) -> std::ops::RangeInclusive<u64> {
@@ -91,35 +437,123 @@ fn span_pages(start: u64, len: u32) -> std::ops::RangeInclusive<u64> {
         ..=(start.saturating_add(u64::from(len).saturating_sub(1)) >> crate::memory::CODE_PAGE_BITS)
 }
 
-impl SpanIndex {
+impl SourceIndex {
+    fn bytes(&self) -> u64 {
+        self.coverage.bytes + self.allocation_bytes + self.units_bytes + self.pages_bytes
+    }
+
     fn insert(&mut self, key: BlockKey, spans: Vec<(u64, u32)>) {
         self.remove(&key);
         for &(start, len) in &spans {
             if len != 0 {
                 for page in span_pages(start, len) {
-                    self.pages.entry(page).or_default().insert(key);
+                    let base = page << crate::memory::CODE_PAGE_BITS;
+                    let lo = start.saturating_sub(base) as usize;
+                    let hi = start
+                        .saturating_add(u64::from(len))
+                        .saturating_sub(base)
+                        .min(4096) as usize;
+                    let membership = self.pages.entry(page).or_default();
+                    let before = membership.bytes;
+                    membership
+                        .entries
+                        .entry(key)
+                        .and_modify(|spans| spans.extend(lo, hi))
+                        .or_insert_with(|| PageSpans::new(lo, hi));
+                    membership.bytes = before.max(table_bytes::<(BlockKey, PageSpans)>(
+                        membership.entries.capacity(),
+                    ));
+                    self.allocation_bytes += membership.bytes - before;
+                    self.coverage.cover(page, lo, hi);
                 }
             }
         }
+        self.allocation_bytes += (spans.capacity() * std::mem::size_of::<(u64, u32)>()) as u64;
         self.units.insert(key, spans);
+        self.units_bytes = self
+            .units_bytes
+            .max(table_bytes::<(BlockKey, Vec<(u64, u32)>)>(
+                self.units.capacity(),
+            ));
+        self.pages_bytes = self
+            .pages_bytes
+            .max(table_bytes::<(u64, PageMembership)>(self.pages.capacity()));
     }
 
-    fn remove(&mut self, key: &BlockKey) {
-        self.interpreter_only.remove(key);
-        if let Some(spans) = self.units.remove(key) {
-            for (start, len) in spans {
+    fn remove(&mut self, key: &BlockKey) -> Option<Vec<(u64, u32)>> {
+        let removed = self.units.remove(key);
+        if let Some(spans) = &removed {
+            self.allocation_bytes -= (spans.capacity() * std::mem::size_of::<(u64, u32)>()) as u64;
+            // Remove every reference before dropping membership: repeated and
+            // overlapping spans of one unit must each decrement their counts.
+            for &(start, len) in spans {
                 if len != 0 {
                     for page in span_pages(start, len) {
-                        if let Some(keys) = self.pages.get_mut(&page) {
-                            keys.remove(key);
-                            if keys.is_empty() {
+                        let base = page << crate::memory::CODE_PAGE_BITS;
+                        let lo = start.saturating_sub(base) as usize;
+                        let hi = start
+                            .saturating_add(u64::from(len))
+                            .saturating_sub(base)
+                            .min(4096) as usize;
+                        self.coverage.uncover(page, lo, hi);
+                    }
+                }
+            }
+            for &(start, len) in spans {
+                if len != 0 {
+                    for page in span_pages(start, len) {
+                        if let Some(membership) = self.pages.get_mut(&page) {
+                            membership.entries.remove(key);
+                            if membership.entries.is_empty() {
+                                self.allocation_bytes -= membership.bytes;
                                 self.pages.remove(&page);
+                                self.coverage.remove_page(page);
                             }
                         }
                     }
                 }
             }
+            if self.units.is_empty() {
+                self.units = HashMap::new();
+                self.pages = HashMap::new();
+                self.units_bytes = 0;
+                self.pages_bytes = 0;
+            }
         }
+        removed
+    }
+
+    // Large sparse flushes use the page index instead of walking address holes.
+    // Ordinary writes touch one or two pages, and do no hashing or allocation.
+    fn coverage_overlap(&self, lo: u64, hi: u64) -> (bool, bool) {
+        if lo >= hi {
+            return (false, false);
+        }
+        let first = lo >> crate::memory::CODE_PAGE_BITS;
+        let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
+        if last - first > 1 {
+            return (true, true);
+        }
+        let mut on_page = false;
+        for page in first..=last {
+            if let Some(bits) = self.coverage.page(page) {
+                on_page = true;
+                let base = page << crate::memory::CODE_PAGE_BITS;
+                let start = lo.saturating_sub(base) as usize;
+                let end = hi.saturating_sub(base).min(4096) as usize;
+                for (word, value) in bits
+                    .iter()
+                    .enumerate()
+                    .take((end - 1) / 64 + 1)
+                    .skip(start / 64)
+                {
+                    if value & page_word_mask(word, start, end) != 0 {
+                        return (true, true);
+                    }
+                }
+            }
+        }
+        (false, on_page)
     }
 
     fn has_units(&self, lo: u64, hi: u64) -> bool {
@@ -137,24 +571,49 @@ impl SpanIndex {
         }
     }
 
-    fn candidates(&self, lo: u64, hi: u64) -> HashSet<BlockKey> {
-        let mut keys = HashSet::new();
+    fn victims(&self, lo: u64, hi: u64) -> Vec<BlockKey> {
+        let mut keys = Vec::new();
         if lo >= hi {
             return keys;
         }
         let first = lo >> crate::memory::CODE_PAGE_BITS;
         let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
+        let mut seen = HashSet::new();
+        let mut collect = |page: u64, entries: &HashMap<BlockKey, PageSpans>| {
+            let base = page << crate::memory::CODE_PAGE_BITS;
+            let start = lo.saturating_sub(base);
+            let end = hi.saturating_sub(base).min(4096);
+            for (key, spans) in entries {
+                if spans.lo() as u64 >= end || start >= spans.hi() as u64 {
+                    continue;
+                }
+                if spans.0 & (1 << 26) != 0
+                    && !self.units[key].iter().any(|&(start, len)| {
+                        start < hi && lo < start.saturating_add(u64::from(len)) && len != 0
+                    })
+                {
+                    continue;
+                }
+                if first == last {
+                    keys.push(*key);
+                    continue;
+                }
+                if seen.insert(*key) {
+                    keys.push(*key);
+                }
+            }
+        };
         // Whole-cache/unmap requests can cover a sparse 64-bit address space.
         if last - first < self.pages.len() as u64 {
             for page in first..=last {
                 if let Some(entries) = self.pages.get(&page) {
-                    keys.extend(entries);
+                    collect(page, &entries.entries);
                 }
             }
         } else {
             for (&page, entries) in &self.pages {
                 if first <= page && page <= last {
-                    keys.extend(entries);
+                    collect(page, &entries.entries);
                 }
             }
         }
@@ -166,6 +625,7 @@ impl SpanIndex {
 /// across block execution (which may mutate memory -> SMC invalidation) (§9.2).
 pub struct TranslationCache {
     memory_counts: [AtomicU64; 4],
+    coverage_bytes: AtomicU64,
     invalidation_calls: AtomicU64,
     invalidation_blocks_dropped: AtomicU64,
     tier_bg_submitted: AtomicU64,
@@ -297,6 +757,7 @@ impl TranslationCache {
             compiled_entries,
             region_entries,
             interpreted_ir_bytes,
+            coverage_index_bytes: self.coverage_bytes.load(Ordering::Relaxed),
             invalidation_calls: self.invalidation_calls.load(Ordering::Relaxed),
             invalidation_blocks_dropped: self.invalidation_blocks_dropped.load(Ordering::Relaxed),
             tier_bg_submitted: self.tier_bg_submitted.load(Ordering::Relaxed),
@@ -324,6 +785,7 @@ impl TranslationCache {
     pub fn new() -> Self {
         Self {
             memory_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            coverage_bytes: AtomicU64::new(0),
             invalidation_calls: AtomicU64::new(0),
             invalidation_blocks_dropped: AtomicU64::new(0),
             tier_bg_submitted: AtomicU64::new(0),
@@ -412,11 +874,13 @@ impl TranslationCache {
         }
         self.account_replace(
             map.get(&key),
-            spans.units.get(&key).map_or(0, Vec::len),
+            spans.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             1,
         );
         spans.insert(key, vec![span]);
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
         map.insert(key, block);
         self.hotness.write().unwrap().remove(&key);
         true
@@ -443,12 +907,14 @@ impl TranslationCache {
         on_mark(&spans);
         self.account_replace(
             mp.get(&key),
-            sp.units.get(&key).map_or(0, Vec::len),
+            sp.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             spans.len(),
         );
         mp.insert(key, block);
         sp.insert(key, spans);
+        self.coverage_bytes
+            .store(sp.coverage_bytes(), Ordering::Relaxed);
         self.hotness.write().unwrap().remove(&key);
         true
     }
@@ -631,16 +1097,31 @@ impl TranslationCache {
             PendingTierUp {
                 queued_at: None,
                 id,
-                spans: None,
                 cancelled: false,
+                generation: self.publication_generation(),
             },
         );
+        spans.pending_bytes = spans
+            .pending_bytes
+            .max(table_bytes::<(BlockKey, PendingTierUp)>(
+                spans.pending.capacity(),
+            ));
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
         true
     }
 
     /// Release an unsubmitted request's slot, or explicitly abandon ownership.
     pub fn end_tier_up(&self, key: BlockKey) {
-        self.spans.write().unwrap().pending.remove(&key);
+        let mut spans = self.spans.write().unwrap();
+        spans.pending.remove(&key);
+        if spans.pending.is_empty() {
+            spans.pending = HashMap::new();
+            spans.pending_bytes = 0;
+        }
+        spans.pending_sources.remove(&key);
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
     }
 
     /// Requests still awaiting a completion, including canceled source snapshots.
@@ -659,14 +1140,22 @@ impl TranslationCache {
     ) -> Option<u64> {
         let mut spans = self.spans.write().unwrap();
         let pending = spans.pending.get_mut(&key)?;
-        if pending.cancelled || self.publication_generation() != generation {
+        // Until sources are registered, any intervening write cancels the
+        // request through its claim generation without mutating the pending map.
+        if pending.cancelled
+            || pending.generation != generation
+            || self.publication_generation() != generation
+        {
             return None;
         }
         on_mark(&source_spans);
-        pending.spans = Some(source_spans);
         pending.queued_at =
             crate::time_stats::enabled().then(crate::time_stats::MonotonicTime::now);
-        Some(pending.id)
+        let id = pending.id;
+        spans.pending_sources.insert(key, source_spans);
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
+        Some(id)
     }
 
     pub(crate) fn publish_tier_up(
@@ -684,7 +1173,16 @@ impl TranslationCache {
             return false;
         }
         let pending = spans.pending.remove(&key).unwrap();
-        if pending.cancelled {
+        if spans.pending.is_empty() {
+            spans.pending = HashMap::new();
+            spans.pending_bytes = 0;
+        }
+        let source_spans = spans.pending_sources.remove(&key);
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
+        if pending.cancelled
+            || (source_spans.is_none() && pending.generation != self.publication_generation())
+        {
             self.record_tier_bg_rejected_generation();
             return false;
         }
@@ -694,7 +1192,7 @@ impl TranslationCache {
             self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        let source_spans = pending.spans.expect("submitted tier-up has source spans");
+        let source_spans = source_spans.expect("submitted tier-up has source spans");
         if matches!(block, CachedBlock::Interpreted(_)) {
             self.record_tier_bg_compile_failed();
             let reason = compile_failure.unwrap_or(crate::CompileFailureReason::OtherBackendError);
@@ -712,7 +1210,14 @@ impl TranslationCache {
                 // a write to any of them must release the suppression marker.
                 on_mark(&source_spans);
                 spans.insert(key, source_spans);
+                self.coverage_bytes
+                    .store(spans.coverage_bytes(), Ordering::Relaxed);
                 spans.interpreter_only.insert(key);
+                spans.suppression_bytes = spans
+                    .suppression_bytes
+                    .max(table_bytes::<BlockKey>(spans.interpreter_only.capacity()));
+                self.coverage_bytes
+                    .store(spans.coverage_bytes(), Ordering::Relaxed);
                 self.tier_bg_interpreter_only
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -721,12 +1226,14 @@ impl TranslationCache {
         on_mark(&source_spans);
         self.account_replace(
             map.get(&key),
-            spans.units.get(&key).map_or(0, Vec::len),
+            spans.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             source_spans.len(),
         );
         map.insert(key, block);
         spans.insert(key, source_spans);
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
         self.hotness.write().unwrap().remove(&key);
         self.record_tier_bg_published();
         if let Some(start) = pending.queued_at {
@@ -817,12 +1324,14 @@ impl TranslationCache {
         }
         self.account_replace(
             mp.get(&key),
-            sp.units.get(&key).map_or(0, Vec::len),
+            sp.cached.units.get(&key).map_or(0, Vec::len),
             Some(&block),
             spans.len(),
         );
         mp.insert(key, block);
         sp.insert(key, spans);
+        self.coverage_bytes
+            .store(sp.coverage_bytes(), Ordering::Relaxed);
         true
     }
 
@@ -876,19 +1385,28 @@ impl TranslationCache {
         on_write: impl FnOnce(bool),
     ) -> Vec<BlockKey> {
         self.invalidation_calls.fetch_add(1, Ordering::Relaxed);
+        {
+            let spans = self.spans.read().unwrap();
+            let (overlap, on_page) = spans.cached.coverage_overlap(lo, hi);
+            let (pending_overlap, pending_on_page) = spans.pending_sources.coverage_overlap(lo, hi);
+            if !overlap && !pending_overlap {
+                // §10: publication requires the exclusive spans lock. If it won
+                // first, this reader sees its coverage bits. Otherwise this write
+                // advances the generation before releasing the read lock, so the
+                // publisher rejects source bytes read before the store. Concurrent
+                // victim-free writers may share this lock; fetch_add preserves all
+                // generation advances. Page-tag clears also remain under the lock.
+                on_write(!on_page && !pending_on_page);
+                self.publication_generation.fetch_add(1, Ordering::Release);
+                if CHILD || self.invalidate_pending_fetches {
+                    self.epoch.fetch_add(1, Ordering::Release);
+                }
+                return Vec::new();
+            }
+        }
+        // Recompute after upgrading the lock: publication may have intervened.
         let mut spans = self.spans.write().unwrap();
-        // SMC is address-scoped: a write to `[lo, hi)` drops every overlapping unit
-        // regardless of the mode it was lifted under (§17.4 — the key carries the mode,
-        // but invalidation matches by span address across all modes).
-        let victims: Vec<BlockKey> = spans
-            .candidates(lo, hi)
-            .into_iter()
-            .filter(|key| {
-                spans.units[key]
-                    .iter()
-                    .any(|(start, len)| *start < hi && lo < start.saturating_add(u64::from(*len)))
-            })
-            .collect();
+        let victims = spans.cached.victims(lo, hi);
         let mut map = (!victims.is_empty()).then(|| self.map.write().unwrap());
         if let Some(map) = map.as_mut() {
             self.invalidation_blocks_dropped
@@ -897,44 +1415,31 @@ impl TranslationCache {
             for entry in &victims {
                 self.account_replace(
                     map.get(entry),
-                    spans.units.get(entry).map_or(0, Vec::len),
+                    spans.cached.units.get(entry).map_or(0, Vec::len),
                     None,
                     0,
                 );
-                spans.remove(entry);
+                spans.interpreter_only.remove(entry);
+                if spans.interpreter_only.is_empty() {
+                    spans.interpreter_only = HashSet::new();
+                    spans.suppression_bytes = 0;
+                }
+                spans.cached.remove(entry);
                 map.remove(entry);
                 hotness.remove(entry);
             }
+            self.coverage_bytes
+                .store(spans.coverage_bytes(), Ordering::Relaxed);
         }
-        // No extra lock or source scan when there is no in-flight request.
-        let mut pending_on_page = false;
-        if lo < hi && !spans.pending.is_empty() {
-            for pending in spans.pending.values_mut() {
-                if pending.cancelled {
-                    continue;
-                }
-                match &pending.spans {
-                    Some(source_spans) => {
-                        pending.cancelled |= source_spans.iter().any(|&(start, len)| {
-                            start < hi && lo < start.saturating_add(u64::from(len))
-                        });
-                        // Live uncached successors still need write notifications.
-                        // Canceled requests must allow fetch approvals to be cleared.
-                        pending_on_page |= !pending.cancelled
-                            && source_spans.iter().any(|&(start, len)| {
-                                len != 0
-                                    && (start >> crate::memory::CODE_PAGE_BITS)
-                                        <= ((hi - 1) >> crate::memory::CODE_PAGE_BITS)
-                                    && (lo >> crate::memory::CODE_PAGE_BITS)
-                                        <= (start.saturating_add(u64::from(len) - 1)
-                                            >> crate::memory::CODE_PAGE_BITS)
-                            });
-                    }
-                    None => pending.cancelled = true,
-                }
+        if lo < hi {
+            for key in spans.pending_sources.victims(lo, hi) {
+                spans.pending.get_mut(&key).unwrap().cancelled = true;
+                spans.pending_sources.remove(&key);
             }
         }
-        on_write(!pending_on_page && !spans.has_units(lo, hi));
+        self.coverage_bytes
+            .store(spans.coverage_bytes(), Ordering::Relaxed);
+        on_write(!spans.pending_sources.has_units(lo, hi) && !spans.cached.has_units(lo, hi));
         // A source span may have been read but not cached yet. Reject its
         // publication even when all currently cached spans survive this write.
         self.publication_generation.fetch_add(1, Ordering::Release);
@@ -967,6 +1472,363 @@ mod tests {
     }
 
     #[test]
+    fn overlap_counts_are_exact_past_narrow_overflow_and_release_early() {
+        let mut coverage = CoverageIndex::default();
+        coverage.cover(0, 63, 66);
+        let single = coverage.bytes;
+        for _ in 1..600 {
+            coverage.cover(0, 63, 66);
+        }
+        let extra = coverage.page_mut(0).extra.as_ref().unwrap();
+        assert_eq!(extra.overflow.len(), 3);
+        assert_eq!(
+            coverage.bytes,
+            single
+                + std::mem::size_of::<ExtraCoverage>() as u64
+                + 4 * std::mem::size_of::<(u16, usize)>() as u64
+        );
+        for owners in (1..600).rev() {
+            coverage.uncover(0, 63, 66);
+            assert_eq!(coverage.page(0).unwrap()[0], 1 << 63);
+            assert_eq!(coverage.page(0).unwrap()[1], 3);
+            if owners == 16 {
+                let extra = coverage.page_mut(0).extra.as_ref().unwrap();
+                assert_eq!(extra.overflow.capacity(), 0);
+                assert_eq!(
+                    coverage.bytes,
+                    single + std::mem::size_of::<ExtraCoverage>() as u64
+                );
+            }
+            if owners == 1 {
+                assert_eq!(coverage.bytes, single);
+                assert!(coverage.page_mut(0).extra.is_none());
+            }
+        }
+        coverage.uncover(0, 63, 66);
+        assert!(coverage.page(0).unwrap().iter().all(|&bits| bits == 0));
+        coverage.remove_page(0);
+        assert_eq!(coverage.bytes, 0);
+    }
+
+    #[test]
+    fn index_memory_counts_unregistered_and_cancelled_pending_slots() {
+        let c = TranslationCache::new();
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        let claim = c.memory_stats().coverage_index_bytes;
+        assert!(claim > 0);
+        assert!(c
+            .prepare_tier_up(
+                k(0x1000),
+                vec![(0x1000, 4)],
+                c.publication_generation(),
+                |_| {}
+            )
+            .is_some());
+        assert!(c.memory_stats().coverage_index_bytes > claim);
+        c.invalidate_overlapping(0x1000, 0x1001, || {});
+        assert_eq!(c.memory_stats().coverage_index_bytes, claim);
+        c.end_tier_up(k(0x1000));
+        assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+    }
+
+    #[test]
+    fn compact_membership_checks_gaps_and_repeated_spans() {
+        let mut index = SourceIndex::default();
+        index.insert(k(0), vec![(10, 4), (100, 4), (10, 4)]);
+        assert!(index.victims(50, 51).is_empty());
+        assert_eq!(index.victims(103, 104), vec![k(0)]);
+        index.remove(&k(0));
+        assert_eq!(index.bytes(), 0);
+        assert_eq!(std::mem::size_of::<(BlockKey, PageSpans)>(), 24);
+    }
+
+    #[test]
+    fn index_memory_reclaims_full_membership_tables_after_removal() {
+        let mut index = SourceIndex::default();
+        for i in 0..1792 {
+            index.insert(k(i), vec![(0, 1)]);
+        }
+        for i in 0..1792 {
+            index.remove(&k(i));
+        }
+        assert_eq!(index.bytes(), 0);
+    }
+
+    #[test]
+    fn index_memory_counts_retained_pending_capacity_after_deletion() {
+        let c = TranslationCache::new();
+        for i in 0..1792 {
+            assert!(c.try_begin_tier_up(k(i)));
+        }
+        let allocated = c.memory_stats().coverage_index_bytes;
+        for i in 0..1791 {
+            c.end_tier_up(k(i));
+            assert_eq!(c.memory_stats().coverage_index_bytes, allocated);
+        }
+        c.end_tier_up(k(1791));
+        assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+    }
+
+    #[test]
+    fn realistic_cache_index_memory_report() {
+        let c = TranslationCache::new();
+        for i in 0..31_000u64 {
+            let page = (i / 32 + 1) * 4096;
+            let slot = i % 32;
+            let spans = if slot < 16 {
+                vec![(page + slot * 128, 64)]
+            } else {
+                (0..4)
+                    .map(|j| {
+                        (
+                            page + ((slot - 16 + j) % 16) * 128 + u64::from(j == 0) * 4,
+                            if j == 0 { 60 } else { 64 },
+                        )
+                    })
+                    .collect()
+            };
+            c.insert(
+                k(page + (slot % 16) * 128 + u64::from(slot >= 16) * 4),
+                compiled(),
+                spans,
+                |_| {},
+            );
+        }
+        let bytes = c.memory_stats().coverage_index_bytes;
+        println!("cache_index,keys=31000,keys_per_page=32,bytes={bytes}");
+        // Same workload measured on main 73ed5d6, including membership tables
+        // and source-vector capacity with the same table allocation estimate.
+        const MAIN_INDEX_BYTES: u64 = 5_112_784;
+        assert!(bytes <= 2 * MAIN_INDEX_BYTES, "index bytes: {bytes}");
+        let spans = c.spans.read().unwrap();
+        let index = &spans.cached;
+        let allocations = index
+            .units
+            .values()
+            .map(|spans| spans.capacity() * std::mem::size_of::<(u64, u32)>())
+            .sum::<usize>() as u64
+            + index
+                .pages
+                .values()
+                .map(|membership| membership.bytes)
+                .sum::<u64>();
+        assert_eq!(index.allocation_bytes, allocations);
+    }
+
+    #[test]
+    fn disjoint_writes_share_the_span_read_lock_with_registered_sources() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for pending in [false, true] {
+            let c = Arc::new(TranslationCache::new());
+            if pending {
+                pending_region(&c);
+            } else {
+                c.insert(k(0x1000), compiled(), vec![(0x1000, 4)], |_| {});
+            }
+            let generation = c.publication_generation();
+            let reader = c.spans.read().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let writer = {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    let result = c.invalidate_written(0x3800, 0x3801, |empty| {
+                        assert_eq!(empty, !pending);
+                    });
+                    tx.send(result).unwrap();
+                })
+            };
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            drop(reader);
+            writer.join().unwrap();
+            assert!(result
+                .expect("disjoint write must finish with a shared reader")
+                .is_empty());
+            assert_eq!(c.publication_generation(), generation + 1);
+        }
+    }
+
+    #[test]
+    fn removing_sources_never_rebuilds_unrelated_page_survivors() {
+        for pending in [false, true] {
+            let c = TranslationCache::new();
+            for i in 0..1000 {
+                let key = k(0x4000 + i);
+                if pending {
+                    assert!(c.try_begin_tier_up(key));
+                    assert!(c
+                        .prepare_tier_up(
+                            key,
+                            vec![(0x3000 + i, 1)],
+                            c.publication_generation(),
+                            |_| {}
+                        )
+                        .is_some());
+                } else {
+                    c.insert(key, compiled(), vec![(0x3000 + i, 1)], |_| {});
+                }
+            }
+            let victim = k(0x1000);
+            // Repeated and overlapping spans within one unit count separately.
+            let source = vec![(0x1000, 4), (0x3000, 66), (0x3040, 4), (0x3000, 66)];
+            if pending {
+                assert!(c.try_begin_tier_up(victim));
+                assert!(c
+                    .prepare_tier_up(victim, source, c.publication_generation(), |_| {})
+                    .is_some());
+            } else {
+                c.insert(victim, compiled(), source, |_| {});
+            }
+            let victims = c.invalidate_overlapping(0x1000, 0x1001, || {});
+            assert_eq!(victims, if pending { vec![] } else { vec![victim] });
+            let spans = c.spans.read().unwrap();
+            let index = if pending {
+                &spans.pending_sources
+            } else {
+                &spans.cached
+            };
+            assert_eq!(index.coverage.uncovered_ranges, 4);
+            assert_eq!(index.units.len(), 1000);
+            assert_eq!(index.victims(0x3041, 0x3042), vec![k(0x4041)]);
+            assert!(!index.coverage_overlap(0x33e8, 0x33e9).0);
+        }
+    }
+
+    #[test]
+    fn many_page_victims_are_emitted_once_per_unit() {
+        let mut index = SourceIndex::default();
+        let spans: Vec<_> = (1..=2048).rev().map(|page| (page * 4096 + 63, 2)).collect();
+        index.insert(k(0x1000), spans.clone());
+        index.insert(k(0x2000), spans);
+        let mut victims = index.victims(0, u64::MAX);
+        victims.sort_by_key(|key| key.guest_addr);
+        assert_eq!(victims, vec![k(0x1000), k(0x2000)]);
+        assert_eq!(index.victims(0x1040, 0x1041).len(), 2);
+        assert!(index.victims(0x1041, 0x2000).is_empty());
+        index.remove(&k(0x1000));
+        assert_eq!(index.victims(0, u64::MAX), vec![k(0x2000)]);
+        index.remove(&k(0x2000));
+        assert_eq!(index.coverage.bytes, 0);
+    }
+
+    #[test]
+    fn byte_coverage_preserves_shared_tails_and_reclaims_sparse_storage() {
+        let c = TranslationCache::new();
+        let entries = [
+            (k(0x1000), vec![(0x103f, 66), (0x1ffe, 4)]),
+            (k(0x1100), vec![(0x1040, 2), (0x2000, 4)]),
+            (k(u64::MAX - 8), vec![(u64::MAX - 8, 4)]),
+        ];
+        for (key, spans) in &entries {
+            c.insert(*key, compiled(), spans.clone(), |_| {});
+        }
+        assert!(c.memory_stats().coverage_index_bytes >= 3 * 512);
+        for addr in 0x1000..0x3000 {
+            let expected = entries
+                .iter()
+                .flat_map(|(_, spans)| spans)
+                .any(|&(start, len)| start <= addr && addr - start < u64::from(len));
+            assert_eq!(
+                c.spans
+                    .read()
+                    .unwrap()
+                    .cached
+                    .coverage_overlap(addr, addr + 1)
+                    .0,
+                expected,
+                "coverage at {addr:#x}"
+            );
+        }
+        assert_eq!(
+            c.invalidate_overlapping(0x103f, 0x1040, || {}),
+            vec![entries[0].0]
+        );
+        // The removed block shared these bytes with a different unit.
+        assert_eq!(
+            c.invalidate_overlapping(0x1041, 0x1042, || {}),
+            vec![entries[1].0]
+        );
+        assert!(c.invalidate_overlapping(0x2000, 0x2001, || {}).is_empty());
+        assert_eq!(
+            c.invalidate_overlapping(u64::MAX - 5, u64::MAX - 4, || {}),
+            vec![entries[2].0]
+        );
+        assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+        c.insert(k(0), compiled(), vec![(0, 1)], |_| {});
+        assert_eq!(
+            c.memory_stats().coverage_index_bytes,
+            std::mem::size_of::<PageCoverage>() as u64
+                + table_bytes::<(BlockKey, Vec<(u64, u32)>)>(3)
+                + table_bytes::<(u64, PageMembership)>(3)
+                + table_bytes::<(BlockKey, PageSpans)>(3)
+                + std::mem::size_of::<(u64, u32)>() as u64
+        );
+        assert_eq!(c.invalidate_overlapping(0, 1, || {}), vec![k(0)]);
+        assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_rejected_writes_both_advance_publication_generation() {
+        let c = TranslationCache::new();
+        c.insert(k(0x1000), compiled(), vec![(0x1000, 4)], |_| {});
+        let generation = c.publication_generation();
+        let rendezvous = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for lo in [0x1800, 0x1801] {
+                let rendezvous = &rendezvous;
+                let c = &c;
+                scope.spawn(move || {
+                    assert!(c
+                        .invalidate_written(lo, lo + 1, |empty| {
+                            assert!(!empty);
+                            rendezvous.wait();
+                        })
+                        .is_empty());
+                });
+            }
+        });
+        assert_eq!(c.publication_generation(), generation + 2);
+        assert!(!c.upgrade(k(0x1000), compiled(), (0x1000, 4), generation));
+    }
+
+    #[test]
+    fn disjoint_write_cancels_unregistered_request_without_exclusive_lock() {
+        let c = TranslationCache::new();
+        assert!(c.try_begin_tier_up(k(0x1000)));
+        let reader = c.spans.read().unwrap();
+        assert!(c.invalidate_overlapping(0x1800, 0x1801, || {}).is_empty());
+        drop(reader);
+        // Re-reading the generation must not revive a claim canceled during its
+        // source-read window. Ownership still lasts until end_tier_up.
+        assert!(c
+            .prepare_tier_up(
+                k(0x1000),
+                vec![(0x1000, 4)],
+                c.publication_generation(),
+                |_| {}
+            )
+            .is_none());
+        assert!(!c.try_begin_tier_up(k(0x1000)));
+        c.end_tier_up(k(0x1000));
+    }
+
+    #[test]
+    fn pending_coverage_is_reclaimed_on_end_and_cancellation() {
+        let c = TranslationCache::new();
+        pending_region(&c);
+        let with_pending = c.memory_stats().coverage_index_bytes;
+        c.end_tier_up(k(0x1000));
+        assert!(c.memory_stats().coverage_index_bytes < with_pending);
+        let cached_only = c.memory_stats().coverage_index_bytes;
+        let id = pending_region(&c);
+        c.invalidate_overlapping(0x3001, 0x3002, || {});
+        assert!(c.memory_stats().coverage_index_bytes > cached_only);
+        assert!(!c.publish_tier_up(k(0x1000), compiled(), None, id, |_| {}));
+        c.invalidate_overlapping(0x1000, 0x1004, || {});
+        assert_eq!(c.memory_stats().coverage_index_bytes, 0);
+    }
+
+    #[test]
     fn byte_overlap_keeps_other_modes_and_crossing_page_tags() {
         let c = TranslationCache::new();
         let crossing = k(0x1ffe);
@@ -988,12 +1850,12 @@ mod tests {
             vec![crossing]
         );
         let spans = c.spans.read().unwrap();
-        assert!(!spans.pages.contains_key(&1));
-        assert_eq!(spans.pages[&2].len(), 6);
+        assert!(!spans.cached.pages.contains_key(&1));
+        assert_eq!(spans.cached.pages[&2].entries.len(), 6);
         drop(spans);
         let victims = c.invalidate_overlapping(0x2107, 0x2108, || {});
         assert_eq!(victims.len(), 6);
-        assert!(c.spans.read().unwrap().pages.is_empty());
+        assert!(c.spans.read().unwrap().cached.pages.is_empty());
     }
 
     #[test]
@@ -1014,10 +1876,10 @@ mod tests {
         ));
         assert!(c.invalidate_overlapping(0x6000, 0x7000, || {}).is_empty());
         assert_eq!(c.invalidate_overlapping(0x8000, 0x8001, || {}), vec![key]);
-        assert!(c.spans.read().unwrap().pages.is_empty());
+        assert!(c.spans.read().unwrap().cached.pages.is_empty());
         c.insert(key, compiled(), vec![(0x1000, 4), (0xffff_0000, 4)], |_| {});
         assert_eq!(c.invalidate_overlapping(0, u64::MAX, || {}), vec![key]);
-        assert!(c.spans.read().unwrap().pages.is_empty());
+        assert!(c.spans.read().unwrap().cached.pages.is_empty());
     }
 
     /// No race: a tier-up whose generation still matches commits, and the block

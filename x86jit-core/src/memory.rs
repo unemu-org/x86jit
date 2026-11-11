@@ -1157,7 +1157,11 @@ impl Memory {
             if let Some(word) = self.code_page.get(w) {
                 aliases.translated.insert(page);
                 word.fetch_or(m, Ordering::Relaxed);
-                self.refresh_code_aliases(&aliases, &aliases.connected(page));
+                if aliases.pages.contains_key(&page) {
+                    self.refresh_code_aliases(&aliases, &aliases.connected(page));
+                } else {
+                    self.widen_code_range((page << CODE_PAGE_BITS) >> CODE_RANGE_BITS);
+                }
             }
         }
     }
@@ -1338,7 +1342,14 @@ impl Memory {
         let clear = || {
             let mut aliases = self.code_aliases.lock().unwrap();
             aliases.translated.remove(&page);
-            self.refresh_code_aliases(&aliases, &aliases.connected(page));
+            if aliases.pages.contains_key(&page) {
+                self.refresh_code_aliases(&aliases, &aliases.connected(page));
+            } else {
+                let (w, m) = word_bit(page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
+                if let Some(word) = self.code_page.get(w) {
+                    word.fetch_and(!m, Ordering::Relaxed);
+                }
+            }
         };
         if let Some(policy) = &self.fetch_policy {
             policy.clear(Some(page), self.guest_base >> CODE_PAGE_BITS, clear);

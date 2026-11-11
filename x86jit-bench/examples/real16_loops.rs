@@ -2,7 +2,8 @@
 //! warmup excluded. Optional argument scales step counts (default 1).
 use std::time::Instant;
 use x86jit_core::{
-    CpuMode, Exit, Prot, Reg, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
+    BlockKey, CachedBlock, CpuMode, Exit, IrBlock, IrOp, Prot, Reg, RegionKind, StepOptions,
+    StepStop, Vcpu, Vm, VmConfig,
 };
 
 fn setup(cs: u64, ip: u64, ds: u64) -> (Vm, Vcpu) {
@@ -34,8 +35,28 @@ fn steps(vm: &Vm, cpu: &mut Vcpu, steps: u64) {
     }
 }
 fn bench(name: &str, code: &[u8], count: u64, ds: u64) {
+    bench_cached(name, code, count, ds, 0);
+}
+fn bench_cached(name: &str, code: &[u8], count: u64, ds: u64, fillers: u64) {
     let (vm, mut cpu) = setup(0, 0x7c00, ds);
     vm.write_bytes(0x7c00, code).unwrap();
+    for i in 0..fillers {
+        let pc = 0x7000 + i;
+        vm.cache.insert(
+            BlockKey::new(pc, CpuMode::Real16),
+            CachedBlock::Interpreted(std::sync::Arc::new(IrBlock {
+                mode: CpuMode::Real16,
+                guest_start: pc,
+                guest_len: 1,
+                icount: 1,
+                temp_count: 0,
+                ops: vec![IrOp::Hlt],
+                legacy_context: None,
+            })),
+            vec![(pc, 1)],
+            |_| vm.mem.mark_code(pc, 1),
+        );
+    }
     steps(&vm, &mut cpu, 1_000_000);
     let misses = vm.cache.misses();
     let start = Instant::now();
@@ -87,6 +108,13 @@ fn main() {
         &looped(&[0x89, 0x06, 0x00, 0x78, 0x01, 0xd8]),
         20_000_000 / scale,
         0,
+    );
+    bench_cached(
+        "data-next-to-dense-code",
+        &looped(&[0x89, 0x06, 0x00, 0x78, 0x01, 0xd8]),
+        20_000_000 / scale,
+        0,
+        1024,
     );
     bench(
         "call-ret",

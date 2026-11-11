@@ -1,6 +1,7 @@
 //! Release-mode SMC scaling witness. Setup is excluded; one call/return and one
 //! store per iteration. Filler translations occupy distinct pages. Arguments:
-//! interp|jit, cached block count, data|overlap, store count (default 10000).
+//! interp|jit, cached block count, data|overlap, store count (default 10000),
+//! optional dense (put filler spans beside the callee instead of on distinct pages).
 use iced_x86::code_asm::*;
 use std::time::Instant;
 use x86jit_core::{
@@ -15,6 +16,18 @@ fn main() {
     let count: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(1000);
     let overlap = args.get(3).is_some_and(|s| s == "overlap");
     let stores: u64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(10000);
+    let dense = args.get(5).is_some_and(|s| s == "dense");
+    assert!(
+        !dense || count <= 0x700,
+        "dense fillers must precede the data bytes"
+    );
+    let filler_pc = |i| {
+        if dense {
+            0x1040 + i
+        } else {
+            0x10000 + i * 4096
+        }
+    };
     let backend: Box<dyn Backend> = match tier {
         "interp" => Box::new(InterpreterBackend),
         "jit" => Box::new(JitBackend::new()),
@@ -37,10 +50,10 @@ fn main() {
     a.hlt().unwrap();
     vm.write_bytes(0x4000, &a.assemble(0x4000).unwrap())
         .unwrap();
-    // Populate the unrelated cache without measuring compilation/setup. These
+    // Populate filler translations without measuring compilation/setup. These
     // entries are never executed; their spans and page tags are real cache state.
     for i in 0..count {
-        let pc = 0x10000 + i * 4096;
+        let pc = filler_pc(i);
         let ir = IrBlock {
             legacy_context: None,
             mode: CpuMode::Long64,
@@ -78,7 +91,7 @@ fn main() {
     );
     assert!(
         vm.cache
-            .get(BlockKey::new(0x10000 + (count - 1) * 4096, CpuMode::Long64))
+            .get(BlockKey::new(filler_pc(count - 1), CpuMode::Long64))
             .is_some(),
         "warmup must retain the filler translations"
     );
