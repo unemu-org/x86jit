@@ -8,8 +8,9 @@ name: CI
 # x86-64 host paths run for real: the signal-context landing stub, the usercopy
 # fixup routines and the Linux ucontext adapters.
 #
-# There is no aarch64 leg. The aarch64 gate runs locally on an aarch64 macOS
-# host (backlog/docs/commands.md § Git remote and CI).
+# There is no native aarch64 leg. The aarch64 gate runs locally on an aarch64
+# macOS host (backlog/docs/commands.md § Git remote and CI). The FreeBSD lane
+# type-checks both architectures on this Linux runner; it runs no FreeBSD code.
 #
 # Actions resolve against the runner's default action mirror unless given as a
 # full URL. Nix is installed by the installer binary directly, not by an action,
@@ -37,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: never
+      RUSTC_WRAPPER: ""
     steps:
       # Nothing after checkout needs git credentials, so do not leave the job token
       # in .git/config next to unsandboxed builds.
@@ -121,6 +123,19 @@ jobs:
         run: |
           set -o pipefail
           nix develop --command cargo clippy --workspace --all-targets --features x86jit-tests/unicorn -- -D warnings 2>&1 | tee ci-logs/clippy.log
+
+      # The pinned stable Nix toolchain includes both FreeBSD standard libraries.
+      # Default features: no cross-built Unicorn library or FreeBSD linker needed.
+      # Runtime coverage remains with embedders until a FreeBSD runner exists.
+      - name: FreeBSD compile-check lane (aarch64)
+        id: freebsd_aarch64
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
+
+      - name: FreeBSD compile-check lane (x86_64)
+        id: freebsd_x86_64
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
 
       # Turns PROVENANCE.md §5's licence claim into a gate. `--all-features` on purpose:
       # the default resolution hides the Unicorn oracle and its bindgen build tree, so a
@@ -220,6 +235,8 @@ jobs:
             fmt=${{ steps.fmt.outcome }}
             guard=${{ steps.guard.outcome }}
             clippy=${{ steps.clippy.outcome }}
+            cross-aarch64-unknown-freebsd=${{ steps.freebsd_aarch64.outcome }}
+            cross-x86_64-unknown-freebsd=${{ steps.freebsd_x86_64.outcome }}
             deny=${{ steps.deny.outcome }}
             tests=${{ steps.tests.outcome }}
             release=${{ steps.release.outcome }}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one GitHub CI gate locally, preserving its exit status and combined log.
+# Run one CI gate locally, preserving its exit status and combined log.
 # Run from the repository root. CI_LOG_DIR defaults to ci-logs.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ step=$1
 if [[ "$step" == cross ]]; then
     [[ $# -eq 2 ]] || usage
     case "$2" in
-        x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+        x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-unknown-freebsd|aarch64-unknown-freebsd) ;;
         *) usage ;;
     esac
 else
@@ -47,12 +47,14 @@ case "$step" in
             -E 'binary(differential32) or (binary(fuzz) and (test(jit_matches_interp_32) or test(unicorn_matches_interp_32)))')
         ;;
     doctests) gate_command+=(cargo test --locked --workspace --doc --all-features) ;;
-    # The opposite architecture's Unicorn library is not available: type-check the
-    # default features here; the native lane exercises Unicorn on each architecture.
+    # Target Unicorn libraries are not available: type-check default features;
+    # native lanes exercise Unicorn on their host architecture and OS.
     cross) gate_command+=(cargo check --locked --workspace --tests --target "$2") ;;
     *) usage ;;
 esac
 
 log_dir=${CI_LOG_DIR:-ci-logs}
+log_name=$step
+[[ "$step" != cross ]] || log_name="cross-$2"
 mkdir -p "$log_dir"
-"${gate_command[@]}" 2>&1 | tee "$log_dir/$step.log"
+"${gate_command[@]}" 2>&1 | tee "$log_dir/$log_name.log"

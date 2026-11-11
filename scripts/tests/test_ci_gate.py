@@ -108,8 +108,9 @@ class CiGateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.call()["args"], [])
 
-    def test_cross_checks_cover_workspace_tests_on_both_targets(self):
-        for target in ("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"):
+    def test_cross_checks_cover_workspace_tests_on_linux_and_freebsd(self):
+        for target in ("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
+                       "aarch64-unknown-freebsd", "x86_64-unknown-freebsd"):
             with self.subTest(target=target):
                 result = self.run_gate("cross", target)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -117,6 +118,13 @@ class CiGateTests(unittest.TestCase):
                     "develop", "--no-update-lock-file", "--command", "cargo", "check",
                     "--locked", "--workspace", "--tests", "--target", target,
                 ])
+                self.assertIn("gate stdout", (self.root / f"logs/cross-{target}.log").read_text())
+
+    def test_freebsd_failure_survives_tee(self):
+        result = self.run_gate("cross", "aarch64-unknown-freebsd", status=23)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        log = (self.root / "logs/cross-aarch64-unknown-freebsd.log").read_text()
+        self.assertIn("gate stderr", log)
 
     def test_failure_survives_tee_and_both_streams_are_logged(self):
         result = self.run_gate("fmt", status=23)

@@ -7857,8 +7857,8 @@ fn vstore_crossing_ram<const ROUTED: bool>(
     lanes: &[u128],
 ) -> Result<(), VecFault> {
     let mut bytes = [0; 64];
-    for (lane, out) in lanes.iter().zip(bytes.chunks_exact_mut(16)) {
-        out.copy_from_slice(&lane.to_le_bytes());
+    for (lane, out) in lanes.iter().zip(bytes.as_chunks_mut::<16>().0) {
+        *out = lane.to_le_bytes();
     }
     // The caller validated one contiguous RAM region. Keep the entire payload
     // together so copy_out can order transfers after its actual-access probes.

@@ -122,6 +122,16 @@ jobs:
           CROSS_TARGET: ${{ matrix.cross-target }}
         run: bash scripts/ci-gate.sh cross "$CROSS_TARGET"
 
+      # Compile-only coverage of FreeBSD cfg branches, without cross-linking Unicorn.
+      # Embedders supply runtime coverage until a FreeBSD runner is available.
+      - name: FreeBSD compile-check lane (aarch64)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
+
+      - name: FreeBSD compile-check lane (x86_64)
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
+
       # Only push runs populate caches; pull requests can restore them. Explicit saves
       # keep dependency caches warm even when a gate fails.
       - name: Save cargo cache

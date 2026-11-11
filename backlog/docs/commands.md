@@ -108,6 +108,8 @@ trap is the interesting kind.
 
 ```sh
 cargo check --workspace --target aarch64-unknown-linux-gnu --tests   # cross-target guard
+cargo check --locked --workspace --tests --target aarch64-unknown-freebsd
+cargo check --locked --workspace --tests --target x86_64-unknown-freebsd
 cargo clippy --all-targets -- -D warnings                 # default features (no native deps)
 nix develop -c cargo clippy -p x86jit-tests --features unicorn --all-targets -- -D warnings
 cargo fmt --all                  # write
@@ -175,7 +177,8 @@ Forgejo Actions have separate workflows; neither publishes the repository.
   all features and `-D warnings`, cargo-deny, the workspace nextest run with Unicorn
   and without `fuzz_robustness`, the release subset, the Compat32 lane, workspace
   doctests with all features, and a workspace/test type-check for the opposite Linux
-  architecture. The cross-check uses default features because the cross architecture's
+  architecture, plus separate FreeBSD compile-check steps for both architectures.
+  The cross-check uses default features because the cross architecture's
   Unicorn library is unavailable; each native lane tests Unicorn. The x86-64 Linux
   job also exercises the cfg-gated native oracle.
   After the devShell succeeds, later gates run even if an earlier gate fails; either
@@ -202,7 +205,8 @@ Forgejo Actions have separate workflows; neither publishes the repository.
   `fj actions dispatch ci.yml <branch-or-tag>`; `fj actions tasks` lists the runs. The
   job runs the dev shell, the 80286 corpus (`SS286_REQUIRED=1`), fmt, the guest-agnostic
   guard, clippy, cargo-deny, the workspace nextest without `fuzz_robustness`, a
-  release-profile subset and the Compat32 lane. Once the dev shell is up, every step runs
+  release-profile subset, the Compat32 lane and a FreeBSD compile-check lane for both
+  architectures through `scripts/ci-gate.sh cross <target>`. Once the dev shell is up, every step runs
   even after an earlier failure. The result is a commit status on the dispatched commit,
   context `ci / x86_64`. On failure its description lists each failing step with its
   failing tests or error lines. The forge writes no status of its own for dispatched
@@ -216,8 +220,9 @@ Forgejo Actions have separate workflows; neither publishes the repository.
   host the hook cannot pass; skipping it (`SKIP=ladder-smoke git push`, never `--no-verify`) is the
   maintainer's call for each push, after the other pre-push hooks have passed.
 
-Run an individual GitHub gate from the repository root (the script enters the Nix
-devShell for Cargo commands and writes `ci-logs/<step>.log`):
+Run an individual CI gate from the repository root (the script enters the Nix
+devShell for Cargo commands and writes `ci-logs/<step>.log`, or
+`ci-logs/cross-<target>.log` for cross-checks):
 
 ```sh
 bash scripts/ci-gate.sh fmt
@@ -230,11 +235,39 @@ bash scripts/ci-gate.sh lane32
 bash scripts/ci-gate.sh doctests
 bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu   # on x86-64
 bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu    # on aarch64
+bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
+bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
 python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v  # no builds/downloads
 nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
 ```
 
 `CI_LOG_DIR` overrides the log directory; the script preserves the failing command's
 exit status through `tee`. The script tests stub external commands, checking dispatch,
-required corpus settings, both cross-targets and failure propagation without running
+required corpus settings, all four cross-targets and failure propagation without running
 the full gate.
+
+The FreeBSD lane runs `cargo check --locked --workspace --tests --target <target>`
+with default features. It type-checks the libraries and test code, including the
+FreeBSD code-memory and fork branches, without linking or executing FreeBSD binaries.
+Unicorn is disabled because its target library is unavailable. Runtime coverage
+remains with embedders until a FreeBSD runner exists.
+
+`flake.nix` explicitly selects stable Rust **1.98.1**, with both FreeBSD targets in
+the rust-overlay `targets` list. `flake.lock` pins the overlay to
+`89750a2ef1c6a44db9f4251b16c23deffdcfddff`; its release manifest supplies prebuilt
+`rust-std` archives dated **2026-09-03** for both targets. No nightly, `-Zbuild-std`,
+FreeBSD sysroot or cross-linker is needed. The previous overlay pin selected 1.96.1,
+whose manifest omitted ARM64 FreeBSD std. The selected release distributes both targets
+([Rust target documentation](https://doc.rust-lang.org/rustc/platform-support/freebsd.html)).
+This toolchain update leaves the workspace's declared Rust 1.95 MSRV unchanged.
+Successful direct Cargo checks were reproduced with rustup stable 1.98.1 and both
+prebuilt target libraries installed, outside the Nix devShell's 1.96.1 compiler.
+
+On a cold machine, `nix develop --no-update-lock-file` fetches the pinned toolchain
+and target components through Nix. In an offline environment, provision these first;
+the FreeBSD archives are
+`https://static.rust-lang.org/dist/2026-09-03/rust-std-1.98.1-aarch64-unknown-freebsd.tar.xz`
+and
+`https://static.rust-lang.org/dist/2026-09-03/rust-std-1.98.1-x86_64-unknown-freebsd.tar.xz`
+(hashes are in the pinned overlay manifest). An installed rustup target does not
+provide std to the Nix compiler; always use the gate to select the pinned toolchain.

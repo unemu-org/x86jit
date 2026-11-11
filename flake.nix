@@ -20,12 +20,16 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
-        # Pin a stable toolchain. cranelift/iced-x86/memmap2 are pure Rust,
-        # so no extra native libraries are needed at build time.
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        # Rust 1.98.1 ships std for both FreeBSD architectures (1.96.1's
+        # manifest lacks aarch64-unknown-freebsd). No nightly/build-std needed.
+        # Keep the version explicit when updating the rust-overlay lock pin.
+        rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           # Host targets covered by the spec (x86-64 and ARM64 hosts, §1).
-          targets = [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
+          targets = [
+            "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu"
+            "x86_64-unknown-freebsd" "aarch64-unknown-freebsd"
+          ];
         };
 
         nativeBuildInputs = [ rustToolchain pkgs.pkg-config ];
