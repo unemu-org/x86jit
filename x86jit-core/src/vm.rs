@@ -700,12 +700,14 @@ impl Vm {
     }
 
     /// Enable transition timing and detailed helper accounting (default false).
-    /// Dispatch and exit counters remain enabled; helper counts and samples are
-    /// collected only while enabled. Existing totals are retained; subsequent run
+    /// Dispatch and exit counters remain enabled; helper counts, split resolve
+    /// counts and detailed timing are collected only while enabled.
+    /// Existing totals are retained; subsequent run
     /// entries use the new setting. Outside intervals spanning a disabled run are excluded.
     /// Does not change generated code. See [`crate::TimeStats`] for precision.
     pub fn set_time_accounting(&mut self, enabled: bool) {
         self.time_enabled = enabled;
+        self.mem.time_enabled = enabled;
         self.backend.set_time_accounting(enabled);
     }
 
@@ -3495,7 +3497,7 @@ fn resolve_dispatch<const DEFAULT: bool>(
         stats.fetch_calls = stats.fetch_calls.saturating_add(1);
         let _time_fetch = vm
             .time_enabled
-            .then(|| crate::time_stats::SampleGuard::fetch(stats.fetch_calls));
+            .then(|| crate::time_stats::ResolveTimer::enter(stats.fetch_calls));
         let key = if DEFAULT {
             BlockKey::new(at.pa, mode)
         } else {
@@ -3507,6 +3509,9 @@ fn resolve_dispatch<const DEFAULT: bool>(
                 return Ok(block);
             }
             stats.misses = stats.misses.saturating_add(1);
+            if vm.time_enabled {
+                crate::time_stats::ResolveTimer::miss();
+            }
             // No IR exists on a miss; snapshot before fetching its bytes.
             let generation = vm.cache.publication_generation();
             match resolve_uncached::<DEFAULT>(vm, exit_word, sections, at, mode, mxcsr, generation)
@@ -3533,7 +3538,7 @@ fn resolve<const DEFAULT: bool>(
     stats.fetch_calls = stats.fetch_calls.saturating_add(1);
     let _time_fetch = vm
         .time_enabled
-        .then(|| crate::time_stats::SampleGuard::fetch(stats.fetch_calls));
+        .then(|| crate::time_stats::ResolveTimer::enter(stats.fetch_calls));
     loop {
         match resolve_attempt::<DEFAULT>(vm, stats, exit_word, sections, at, mode, mxcsr) {
             Ok(block) => return Ok(block),
@@ -3571,11 +3576,17 @@ fn resolve_attempt<const DEFAULT: bool>(
             return Ok(block);
         }
         stats.misses = stats.misses.saturating_add(1);
+        if vm.time_enabled {
+            crate::time_stats::ResolveTimer::miss();
+        }
         let compile_generation = vm.cache.publication_generation();
         let permit = vm.mem.fetch_permit();
         let mut fetch_failure = None;
         let lifted = {
             let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
+            let _time_lift = vm
+                .time_enabled
+                .then(crate::time_stats::FetchPhaseTimer::lift);
             lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
         };
         return lifted
@@ -3608,6 +3619,9 @@ fn resolve_attempt<const DEFAULT: bool>(
         stats.lookups = stats.lookups.saturating_add(1);
         let Some(block) = vm.cache.get_for_dispatch(key) else {
             stats.misses = stats.misses.saturating_add(1);
+            if vm.time_enabled {
+                crate::time_stats::ResolveTimer::miss();
+            }
             return resolve_uncached::<DEFAULT>(
                 vm, exit_word, sections, at, mode, mxcsr, generation,
             );
@@ -3658,10 +3672,15 @@ fn resolve_attempt<const DEFAULT: bool>(
                             sections,
                             CriticalSectionKind::RegionBuild,
                         );
-                        let c = matches!(
-                            lift_region(&vm.mem, pc, caps, mode),
-                            Ok(r) if r.blocks.len() > 1 && r.has_loop
-                        );
+                        let c = {
+                            let _time_lift = vm
+                                .time_enabled
+                                .then(crate::time_stats::FetchPhaseTimer::lift);
+                            matches!(
+                                lift_region(&vm.mem, pc, caps, mode),
+                                Ok(r) if r.blocks.len() > 1 && r.has_loop
+                            )
+                        };
                         vm.cache.set_region_decision(key, c);
                         c
                     }
@@ -3681,6 +3700,9 @@ fn resolve_attempt<const DEFAULT: bool>(
                 let lifted = {
                     let _section =
                         EngineSection::enter(exit_word, sections, CriticalSectionKind::RegionBuild);
+                    let _time_lift = vm
+                        .time_enabled
+                        .then(crate::time_stats::FetchPhaseTimer::lift);
                     lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
                 };
                 match lifted {
@@ -3813,6 +3835,9 @@ fn resolve_uncached<const DEFAULT: bool>(
         let lifted = {
             let _section =
                 EngineSection::enter(exit_word, sections, CriticalSectionKind::RegionBuild);
+            let _time_lift = vm
+                .time_enabled
+                .then(crate::time_stats::FetchPhaseTimer::lift);
             lift_region_with_fault(&vm.mem, pc, caps, mode, &mut fetch_failure)
         };
         match lifted {
@@ -3889,6 +3914,9 @@ fn resolve_uncached<const DEFAULT: bool>(
     let mut fetch_failure = None;
     let lifted = {
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
+        let _time_lift = vm
+            .time_enabled
+            .then(crate::time_stats::FetchPhaseTimer::lift);
         lift_block_with_fault(&vm.mem, at, mode, &mut fetch_failure)
     };
     match lifted {

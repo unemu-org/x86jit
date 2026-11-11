@@ -11,6 +11,132 @@ fn make_vm(code: &[u8]) -> Vm {
 }
 
 #[test]
+fn resolve_hits_and_misses_are_separate_populations() {
+    // The initial block executes the first decrement; the loop block executes
+    // 129 more times, followed by HLT: 131 resolves, three cold blocks.
+    let vm = make_vm(&[0xb9, 130, 0, 0, 0, 0xff, 0xc9, 0x75, 0xfc, 0xf4]);
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(stats.fetch_translate.calls, 131);
+    assert_eq!(stats.fetch_translate.samples, 3);
+    assert_eq!(stats.fetch_misses, 3);
+    assert_eq!(stats.fetch_hits.calls, 128);
+    assert_eq!(stats.fetch_hits.samples, 2);
+    assert!(stats.fetch_hits.sample_ns > 0);
+    assert!(stats.fetch_lift_ns > 0);
+    assert_eq!(stats.fetch_miss_lift_ns, stats.fetch_lift_ns);
+    assert!(stats.fetch_miss_other_ns > 0);
+    assert_eq!(stats.fetch_approval_ns, 0);
+}
+
+#[test]
+fn every_policy_callback_is_timed_including_unsampled_misses() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    // Jump from the second page to HLT on the first: two approvals in one run,
+    // while the compatibility sampler times only the first resolve.
+    let mut vm = make_vm(&[0xe9, 0xfb, 0xef, 0xff, 0xff]);
+    vm.write_bytes(0, &[0xf4]).unwrap();
+    let callbacks = Arc::new(AtomicU64::new(0));
+    let observed = callbacks.clone();
+    vm.set_fetch_policy(Box::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(5));
+        x86jit_core::FetchVerdict::Allow
+    }));
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.fetch_misses, 2);
+    assert_eq!(stats.fetch_hits.calls, 0);
+    assert_eq!(stats.fetch_translate.samples, 1);
+    assert!(stats.fetch_approval_ns >= 10_000_000);
+    assert_eq!(stats.fetch_miss_approval_ns, stats.fetch_approval_ns);
+    assert_eq!(stats.fetch_miss_lift_ns, stats.fetch_lift_ns);
+    assert!(stats.fetch_lift_ns > 0);
+}
+
+#[test]
+fn nested_child_view_callbacks_are_counted_once() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = calls.clone();
+    let mut child_source = make_vm(&[0xf4]);
+    child_source.set_fetch_policy(Box::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(10));
+        x86jit_core::FetchVerdict::Allow
+    }));
+    let mut vm = make_vm(&[0xf4]);
+    vm.set_fetch_policy(Box::new(move |_| {
+        let _view = child_source.child_view(CpuMode::Long64);
+        x86jit_core::FetchVerdict::Allow
+    }));
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.fetch_translate.calls, 1);
+    assert_eq!(stats.fetch_translate.samples, 1);
+    assert_eq!(stats.fetch_misses, 1);
+    assert!(stats.fetch_miss_approval_ns >= 20_000_000);
+    assert!(stats.fetch_miss_lift_ns > 0);
+    assert!(
+        stats.fetch_miss_approval_ns + stats.fetch_miss_lift_ns + stats.fetch_miss_other_ns
+            <= stats.fetch_translate.sample_ns,
+        "{stats:?}"
+    );
+}
+
+#[test]
+fn disabled_resolve_accounting_leaves_split_fields_zero() {
+    let mut vm = make_vm(&[0xb9, 130, 0, 0, 0, 0xff, 0xc9, 0x75, 0xfc, 0xf4]);
+    vm.set_time_accounting(false);
+    vm.set_fetch_policy(Box::new(|_| x86jit_core::FetchVerdict::Allow));
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+    let stats = vm.time_stats();
+    assert_eq!(stats.fetch_translate.calls, 131);
+    assert_eq!(stats.fetch_hits.calls, 0);
+    assert_eq!(stats.fetch_hits.samples, 0);
+    assert_eq!(stats.fetch_hits.sample_ns, 0);
+    assert_eq!(stats.fetch_misses, 0);
+    assert_eq!(stats.fetch_approval_ns, 0);
+    assert_eq!(stats.fetch_lift_ns, 0);
+    assert_eq!(stats.fetch_miss_approval_ns, 0);
+    assert_eq!(stats.fetch_miss_lift_ns, 0);
+    assert_eq!(stats.fetch_miss_other_ns, 0);
+}
+
+#[test]
+fn child_view_policy_callbacks_outside_resolve_are_excluded() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let mut vm = make_vm(&[0xf4]);
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = calls.clone();
+    vm.set_fetch_policy(Box::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        x86jit_core::FetchVerdict::Allow
+    }));
+    let _view = vm.child_view(CpuMode::Long64);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let stats = vm.time_stats();
+    assert_eq!(stats.fetch_approval_ns, 0);
+    assert_eq!(stats.fetch_miss_approval_ns, 0);
+    assert_eq!(stats.fetch_misses, 0);
+    assert_eq!(stats.fetch_hits.calls, 0);
+}
+
+#[test]
 fn empty_and_interpreter_totals_survive_vcpu_drop() {
     let vm = make_vm(&[0xb9, 100, 0, 0, 0, 0xff, 0xc9, 0x75, 0xfc, 0xf4]);
     let empty = vm.time_stats();
@@ -162,6 +288,8 @@ fn fetch_panic(resume: bool, timing: bool, steps: bool) {
     assert_eq!(first.block_misses, 1);
     assert_eq!(first.fetch_translate.calls, 1);
     assert_eq!(first.fetch_translate.samples, u64::from(timing));
+    assert_eq!(first.fetch_misses, u64::from(timing));
+    assert_eq!(first.fetch_hits.calls, 0);
     assert_eq!(vm.cache.hits(), 0);
     assert_eq!(vm.cache.misses(), 1);
     assert_eq!(first.exits.hlt.count, 0);
@@ -176,6 +304,7 @@ fn fetch_panic(resume: bool, timing: bool, steps: bool) {
     let totals = vm.time_stats();
     let calls = if resume { 2 } else { 1 };
     assert_eq!(totals.fetch_translate.calls, calls);
+    assert_eq!(totals.fetch_misses, if timing { calls } else { 0 });
     assert_eq!(totals.block_lookups, calls);
     assert_eq!(totals.block_misses, calls);
     assert_eq!(vm.cache.misses(), calls);

@@ -14,7 +14,8 @@ use std::sync::Arc;
 #[non_exhaustive]
 pub struct SampledTimeStats {
     /// Exact number of calls in the category's accounting scope. Helper calls
-    /// are counted only while detailed accounting is enabled; fetch calls always.
+    /// are counted only while detailed accounting is enabled; mixed
+    /// `fetch_translate` calls always. `fetch_hits` calls require accounting.
     pub calls: u64,
     /// Exact number of timed calls; zero when detailed timing was never enabled.
     pub samples: u64,
@@ -73,6 +74,11 @@ pub struct ExitsTimeStats {
 /// (initially interpreter). Foreground materialization is excluded from those
 /// segments. Helper and fetch/translate measurements are overlapping subsets,
 /// not additive categories; fetch/translate samples exclude nested compilation.
+/// The split fetch fields require detailed accounting. Miss callback, lift and
+/// other nanoseconds partition every miss path from its first failed probe
+/// (or resolve entry when an entry sample timestamp is available);
+/// their sum requires no sampling extrapolation. Whole-resolve callback/lift
+/// totals also include work during hit-path tier-up and overlap those buckets.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct TimeStats {
@@ -98,6 +104,44 @@ pub struct TimeStats {
     /// Includes cache access, lifting and publication; excludes compiler time.
     /// Fast-resolve hits and chained transfers do not enter this call path.
     pub fetch_translate: SampledTimeStats,
+    /// Resolve calls with no shared-cache miss, counted exactly while accounting
+    /// is enabled, with independent 1-in-64 timing (first hit per run, then every
+    /// 64th hit). Nanoseconds cover the whole resolve, including tier-up work,
+    /// excluding nested foreground compilation. Private fast-cache hits and
+    /// chained transfers are excluded, as in `fetch_translate`.
+    pub fetch_hits: SampledTimeStats,
+    /// Exact resolve calls encountering at least one shared-cache miss while
+    /// accounting is enabled. Retries and failed/unwound calls count once;
+    /// `fetch_hits.calls + fetch_misses` counts all enabled resolves.
+    pub fetch_misses: u64,
+    /// Nanoseconds inside embedder fetch-policy callbacks during enabled resolves,
+    /// timed on every outermost callback, including denial, retries and unwinding.
+    /// Nested callbacks are included once in their outer callback. Includes
+    /// callbacks during hit-path tier-up; excludes approval-cache hits, policy
+    /// locks/waits and callbacks outside resolve. Overlaps sampled hit time.
+    pub fetch_approval_ns: u64,
+    /// Nanoseconds decoding/lifting blocks and forming regions during enabled
+    /// resolves, timed on every lift, including failed lifts and hit-path tier-up.
+    /// Includes instruction/region reads; excludes fetch-policy callbacks and
+    /// approval bookkeeping (including locks/waits), compilation and publication.
+    /// Overlaps sampled hit time.
+    pub fetch_lift_ns: u64,
+    /// Nanoseconds inside fetch-policy callbacks in the miss timing window
+    /// described above, timed on every outermost callback. The miss-path subset
+    /// of `fetch_approval_ns`; excludes approval-cache hits and policy locks/waits.
+    pub fetch_miss_approval_ns: u64,
+    /// Nanoseconds decoding/lifting and forming regions in the miss timing window
+    /// described above, timed on every lift. The miss-path subset
+    /// of `fetch_lift_ns`; excludes callbacks, approval bookkeeping (including
+    /// locks/waits), compilation and publication.
+    pub fetch_miss_lift_ns: u64,
+    /// Nanoseconds on every enabled miss path from the first failed shared-cache
+    /// probe (or resolve entry when an entry sample timestamp is available) to
+    /// resolve return/unwind, excluding callback, lift and foreground compile time.
+    /// Includes fetch permits, approval bookkeeping and policy locks/waits,
+    /// publication, tier-up submission and retries; excludes background
+    /// compilation. Never extrapolated from samples.
+    pub fetch_miss_other_ns: u64,
     /// Embedder returns: exact counts and transition-timed outside nanoseconds.
     pub exits: ExitsTimeStats,
     /// Exact shared block-cache probes plus successful private fast-cache probes.
@@ -195,15 +239,33 @@ const INDIRECT: usize = 11;
 const CHAINS: usize = 12;
 const EXITS: usize = 13;
 const CATEGORIES: usize = 8;
-const FIELDS: usize = EXITS + 2 * CATEGORIES;
+const FETCH_HITS: usize = EXITS + 2 * CATEGORIES;
+const FETCH_MISSES: usize = FETCH_HITS + 3;
+const FETCH_APPROVAL: usize = FETCH_MISSES + 1;
+const FETCH_LIFT: usize = FETCH_APPROVAL + 1;
+const FETCH_MISS_APPROVAL: usize = FETCH_LIFT + 1;
+const FETCH_MISS_LIFT: usize = FETCH_MISS_APPROVAL + 1;
+const FETCH_MISS_OTHER: usize = FETCH_MISS_LIFT + 1;
+const FIELDS: usize = FETCH_MISS_OTHER + 1;
 
-#[derive(Default)]
 pub(crate) struct Record([AtomicU64; FIELDS]);
+impl Default for Record {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
 
-#[derive(Default)]
 pub(crate) struct Registry {
     records: Vec<Arc<Record>>,
     retired: [u64; FIELDS],
+}
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            retired: [0; FIELDS],
+        }
+    }
 }
 impl Registry {
     pub(crate) fn register(&mut self) -> Arc<Record> {
@@ -241,6 +303,13 @@ impl Registry {
             foreground_compile_ns: sum[COMPILER],
             helpers: sampled(HELPER),
             fetch_translate: sampled(FETCH),
+            fetch_hits: sampled(FETCH_HITS),
+            fetch_misses: sum[FETCH_MISSES],
+            fetch_approval_ns: sum[FETCH_APPROVAL],
+            fetch_lift_ns: sum[FETCH_LIFT],
+            fetch_miss_approval_ns: sum[FETCH_MISS_APPROVAL],
+            fetch_miss_lift_ns: sum[FETCH_MISS_LIFT],
+            fetch_miss_other_ns: sum[FETCH_MISS_OTHER],
             block_lookups: sum[LOOKUPS],
             block_misses: sum[MISSES],
             indirect_branch_resolves: sum[INDIRECT],
@@ -260,7 +329,7 @@ impl Registry {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Local {
     values: [u64; FIELDS],
     active: bool,
@@ -268,8 +337,33 @@ struct Local {
     segment: usize,
     since: Option<MonotonicTime>,
     helper_depth: u32,
+    approval_depth: u32,
+    policy_ns: u64,
+    resolving: bool,
+    hit_start: Option<MissTiming>,
+    miss: Option<MissTiming>,
 }
-thread_local! { static LOCAL: RefCell<Local> = const { RefCell::new(Local { values: [0; FIELDS], active: false, enabled: false, segment: INTERPRETER, since: None, helper_depth: 0 }) }; }
+impl Local {
+    const EMPTY: Self = Self {
+        values: [0; FIELDS],
+        active: false,
+        enabled: false,
+        segment: INTERPRETER,
+        since: None,
+        helper_depth: 0,
+        approval_depth: 0,
+        policy_ns: 0,
+        resolving: false,
+        hit_start: None,
+        miss: None,
+    };
+}
+impl Default for Local {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+thread_local! { static LOCAL: RefCell<Local> = const { RefCell::new(Local::EMPTY) }; }
 
 fn add(values: &mut [u64; FIELDS], i: usize, value: u64) {
     values[i] = values[i].saturating_add(value);
@@ -420,6 +514,154 @@ impl HelperTimer {
         call()
     }
 }
+#[derive(Clone, Copy)]
+struct MissTiming {
+    start: MonotonicTime,
+    compiler: u64,
+    approval: u64,
+    lift: u64,
+}
+
+pub(crate) struct ResolveTimer {
+    _mixed: SampleGuard,
+}
+impl ResolveTimer {
+    /// Called behind the VM's accounting flag; disabled resolves never touch TLS.
+    pub(crate) fn enter(calls: u64) -> Self {
+        let mixed = SampleGuard::fetch(calls);
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            l.resolving = true;
+            l.hit_start = (l.values[FETCH_HITS] % 64 == 0).then(|| MissTiming {
+                start: mixed.start.unwrap_or_else(MonotonicTime::now),
+                compiler: l.values[COMPILER],
+                approval: l.values[FETCH_APPROVAL],
+                lift: l.values[FETCH_LIFT],
+            });
+            l.miss = None;
+            Self { _mixed: mixed }
+        })
+    }
+
+    pub(crate) fn miss() {
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            if l.miss.is_none() {
+                l.miss = Some(l.hit_start.take().unwrap_or_else(|| MissTiming {
+                    start: MonotonicTime::now(),
+                    compiler: l.values[COMPILER],
+                    approval: l.values[FETCH_APPROVAL],
+                    lift: l.values[FETCH_LIFT],
+                }));
+                add(&mut l.values, FETCH_MISSES, 1);
+            }
+        });
+    }
+}
+impl Drop for ResolveTimer {
+    fn drop(&mut self) {
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            if let Some(miss) = l.miss.take() {
+                let approval = l.values[FETCH_APPROVAL].saturating_sub(miss.approval);
+                let lift = l.values[FETCH_LIFT].saturating_sub(miss.lift);
+                let ns = miss
+                    .start
+                    .elapsed_ns()
+                    .saturating_sub(l.values[COMPILER].saturating_sub(miss.compiler))
+                    .saturating_sub(approval)
+                    .saturating_sub(lift);
+                add(&mut l.values, FETCH_MISS_APPROVAL, approval);
+                add(&mut l.values, FETCH_MISS_LIFT, lift);
+                add(&mut l.values, FETCH_MISS_OTHER, ns);
+            } else {
+                add(&mut l.values, FETCH_HITS, 1);
+                if let Some(hit) = l.hit_start {
+                    let ns = hit
+                        .start
+                        .elapsed_ns()
+                        .saturating_sub(l.values[COMPILER].saturating_sub(hit.compiler));
+                    add(&mut l.values, FETCH_HITS + 1, 1);
+                    add(&mut l.values, FETCH_HITS + 2, ns);
+                }
+            }
+            l.resolving = false;
+        });
+    }
+}
+
+pub(crate) struct FetchPhaseTimer {
+    phase: FetchPhase,
+    start: Option<MonotonicTime>,
+    approval: u64,
+    policy: u64,
+}
+#[derive(Clone, Copy)]
+enum FetchPhase {
+    Approval,
+    Policy,
+    Lift,
+}
+impl FetchPhaseTimer {
+    pub(crate) fn approval() -> Option<Self> {
+        Self::enter(FetchPhase::Approval)
+    }
+    pub(crate) fn policy() -> Option<Self> {
+        Self::enter(FetchPhase::Policy)
+    }
+    pub(crate) fn lift() -> Option<Self> {
+        Self::enter(FetchPhase::Lift)
+    }
+    fn enter(phase: FetchPhase) -> Option<Self> {
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            if !l.resolving {
+                return None;
+            }
+            let nested = l.approval_depth != 0;
+            if matches!(phase, FetchPhase::Approval) {
+                l.approval_depth += 1;
+            } else if nested {
+                // Work inside a callback already belongs to its outer timer.
+                return None;
+            }
+            Some(Self {
+                phase,
+                start: (!nested).then(MonotonicTime::now),
+                approval: l.values[FETCH_APPROVAL],
+                policy: l.policy_ns,
+            })
+        })
+    }
+}
+impl Drop for FetchPhaseTimer {
+    fn drop(&mut self) {
+        LOCAL.with(|local| {
+            let mut l = local.borrow_mut();
+            if matches!(self.phase, FetchPhase::Approval) {
+                l.approval_depth -= 1;
+            }
+            let Some(start) = self.start else {
+                return;
+            };
+            let ns = start.elapsed_ns();
+            let approval = l.values[FETCH_APPROVAL].saturating_sub(self.approval);
+            match self.phase {
+                FetchPhase::Approval => add(&mut l.values, FETCH_APPROVAL, ns),
+                FetchPhase::Policy => {
+                    l.policy_ns = l.policy_ns.saturating_add(ns.saturating_sub(approval));
+                }
+                FetchPhase::Lift => {
+                    let ns = ns
+                        .saturating_sub(approval)
+                        .saturating_sub(l.policy_ns.saturating_sub(self.policy));
+                    add(&mut l.values, FETCH_LIFT, ns);
+                }
+            }
+        });
+    }
+}
+
 pub(crate) struct SampleGuard {
     field: usize,
     start: Option<MonotonicTime>,
@@ -490,5 +732,78 @@ mod tests {
             let _borrow = local.borrow_mut();
             HelperTimer::measure(false, || ());
         });
+    }
+
+    #[test]
+    fn disabled_fetch_callback_never_borrows_local_accounting() {
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x1000));
+        vm.set_fetch_policy(Box::new(|_| crate::FetchVerdict::Allow));
+        LOCAL.with(|local| {
+            let _borrow = local.borrow_mut();
+            assert_eq!(
+                vm.mem.fetch_policy.as_ref().unwrap().approve(0, &vm.mem),
+                crate::FetchVerdict::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn policy_wait_is_other_time() {
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x1000));
+        vm.set_time_accounting(true);
+        vm.set_fetch_policy(Box::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| {
+                entered.wait();
+                release.wait();
+                crate::FetchVerdict::Allow
+            }
+        }));
+        let mut registry = Registry::default();
+        let record = registry.register();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    vm.mem.fetch_policy.as_ref().unwrap().approve(0, &vm.mem),
+                    crate::FetchVerdict::Allow
+                );
+            });
+            entered.wait();
+            let _run = RunGuard::enter(record, true, None);
+            let _resolve = ResolveTimer::enter(1);
+            ResolveTimer::miss();
+            let _lift = FetchPhaseTimer::lift();
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                release.wait();
+            });
+            assert_eq!(
+                vm.mem.fetch_policy.as_ref().unwrap().approve(0, &vm.mem),
+                crate::FetchVerdict::Allow
+            );
+            // The only timed work in this lift scope is approval bookkeeping.
+            LOCAL.with(|local| {
+                let l = local.borrow();
+                assert!(l.policy_ns >= 20_000_000);
+                assert_eq!(l.values[FETCH_APPROVAL], 0);
+            });
+        });
+        let stats = registry.snapshot();
+        assert!(stats.fetch_miss_other_ns >= 20_000_000, "{stats:?}");
+        assert!(
+            stats.fetch_miss_lift_ns < stats.fetch_miss_other_ns,
+            "{stats:?}"
+        );
+        assert!(
+            stats.fetch_miss_approval_ns + stats.fetch_miss_lift_ns + stats.fetch_miss_other_ns
+                <= stats.fetch_translate.sample_ns,
+            "{stats:?}"
+        );
     }
 }

@@ -411,6 +411,9 @@ impl FetchPolicy {
         if word.load(Ordering::Acquire) & mask != 0 {
             return FetchVerdict::Allow;
         }
+        let _time_policy = mem
+            .time_enabled
+            .then(crate::time_stats::FetchPhaseTimer::policy);
         loop {
             let mut state = self.state.lock().unwrap();
             let generation = self.generation.load(Ordering::Acquire);
@@ -436,7 +439,12 @@ impl FetchPolicy {
                 }
             }
             let guard = Pending(self, key);
-            let verdict = (self.callback)(page << CODE_PAGE_BITS);
+            let verdict = {
+                let _time = mem
+                    .time_enabled
+                    .then(crate::time_stats::FetchPhaseTimer::approval);
+                (self.callback)(page << CODE_PAGE_BITS)
+            };
             let mut state = self.state.lock().unwrap();
             if self.generation.load(Ordering::Acquire) != generation {
                 drop(state);
@@ -856,6 +864,7 @@ pub struct Memory {
     code_page: Box<[AtomicU64]>,
     code_aliases: Mutex<CodeAliases>,
     pub(crate) fetch_policy: Option<FetchPolicy>,
+    pub(crate) time_enabled: bool,
     // Packed `(lo << 32) | len` over 64 KiB granules — the *watermark* the JIT's
     // inlined stores gate on, so a store outside it skips the table entirely. See
     // `code_range_ptr` for why a watermark and not a table probe.
@@ -949,6 +958,9 @@ impl Memory {
                     let verdict = if allowed {
                         FetchVerdict::Allow
                     } else {
+                        let _time = self
+                            .time_enabled
+                            .then(crate::time_stats::FetchPhaseTimer::approval);
                         (policy.callback)(page << CODE_PAGE_BITS)
                     };
                     (page, verdict)
@@ -1061,6 +1073,7 @@ impl Memory {
             code_page,
             code_aliases: Mutex::new(CodeAliases::default()),
             fetch_policy: None,
+            time_enabled: false,
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),

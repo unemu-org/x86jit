@@ -835,6 +835,7 @@ fn fetch_policy_invalidation_before_first_publication_retries() {
             }),
         );
         vm.map(0, 0x3000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.set_time_accounting(true);
         vm.write_bytes(0, &[0xf4]).unwrap();
         vm.write_bytes(PAGE, &[0xb8, 42, 0, 0, 0, 0xf4]).unwrap();
         let deny = Arc::new(AtomicBool::new(false));
@@ -872,6 +873,11 @@ fn fetch_policy_invalidation_before_first_publication_retries() {
         entered.unwrap();
         refused(&exit, PAGE, PAGE, true);
         assert_eq!(rax, 99);
+        let stats = vm.time_stats();
+        assert_eq!(stats.fetch_translate.calls, 2);
+        assert_eq!(stats.block_misses, 3);
+        assert_eq!(stats.fetch_misses, 2);
+        assert_eq!(stats.fetch_hits.calls, 0);
         assert!(vm
             .cache
             .get(x86jit_core::BlockKey::new(

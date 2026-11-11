@@ -120,6 +120,43 @@ fn integer_loop_chains() {
 }
 
 #[test]
+fn region_reads_on_a_resolve_hit_charge_policy_and_lift_time() {
+    use std::time::Duration;
+    use x86jit_core::{FetchVerdict, RegionCaps};
+    let jit = JitBackend::with_superblocks(RegionCaps {
+        max_blocks: 8,
+        max_icount: 64,
+    });
+    let handle = jit.tier_up_handle();
+    // jz 0; hlt. One-block budgets leave the cold successor unfetched until
+    // region formation during tier-up of the cached conditional branch.
+    let mut vm = vm(jit, &[0x0f, 0x84, 0xfa, 0xef, 0xff, 0xff, 0xf4]);
+    vm.write_bytes(0, &[0xf4]).unwrap();
+    vm.set_tier_up_after(Some(1));
+    vm.set_tier_up_background(true);
+    vm.set_fetch_policy(Box::new(|_| {
+        std::thread::sleep(Duration::from_millis(5));
+        FetchVerdict::Allow
+    }));
+    let mut cpu = vm.new_vcpu();
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    let cold = vm.time_stats();
+    assert_eq!(cold.fetch_misses, 1);
+    assert!(cold.fetch_miss_approval_ns >= 5_000_000);
+    cpu.set_reg(Reg::Rip, 0x1000);
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::BudgetExhausted));
+    handle.wait_idle();
+    let hot = vm.time_stats();
+    assert_eq!(hot.fetch_misses, 1);
+    assert_eq!(hot.fetch_hits.calls, 1);
+    assert_eq!(hot.fetch_miss_approval_ns, cold.fetch_miss_approval_ns);
+    assert_eq!(hot.fetch_miss_lift_ns, cold.fetch_miss_lift_ns);
+    assert!(hot.fetch_approval_ns >= cold.fetch_approval_ns + 5_000_000);
+    assert!(hot.fetch_lift_ns > cold.fetch_lift_ns);
+}
+
+#[test]
 fn snapshot_does_not_wait_for_compiler_or_running_vcpu() {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
