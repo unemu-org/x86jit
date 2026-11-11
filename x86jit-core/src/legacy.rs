@@ -206,7 +206,7 @@ pub fn derive_legacy_context(
     if cpu.rflags_system & (1 << 17) != 0 {
         return Err(Virtual8086Unsupported);
     }
-    if cpu.rflags_system & (1 << 8) != 0 {
+    if protected && cpu.rflags_system & (1 << 8) != 0 {
         return Err(DebugTrapUnsupported);
     }
     let bits = if cs.attributes & (1 << 14) != 0 {
@@ -532,7 +532,10 @@ mod tests {
                 LegacyContextError::Virtual8086Unsupported,
             ),
             (
-                |c| c.rflags_system = 1 << 8,
+                |c| {
+                    c.legacy.cr0 |= 1;
+                    c.rflags_system = 1 << 8;
+                },
                 LegacyContextError::DebugTrapUnsupported,
             ),
         ];
@@ -799,7 +802,7 @@ pub(crate) fn physical_span_with_gate(enabled: bool, address: u64, bytes: u8) ->
 /// as pictured (verified against the scan); §§4.1.1, 17 POPF, p. 17-130:
 /// POPFD leaves RF/VM unchanged and real mode has privilege zero.
 pub(crate) fn flags_image(cpu: &CpuState, generation: CpuGeneration) -> u32 {
-    let low = u32::from(cpu.flags.to_flags16()) & 0x0fd7;
+    let low = (u32::from(cpu.flags.to_flags16()) & 0x0fd7) | (cpu.rflags_system as u32 & 0x100);
     match generation {
         CpuGeneration::I8086 => low | 0xf000,
         // I286 PRM §10.1 p. 10-1; Appendix B IRET
@@ -815,9 +818,10 @@ pub(crate) fn restore_flags(
     generation: CpuGeneration,
     image: u32,
 ) -> Result<(), crate::Exit> {
-    // Decision-18 §2: stored TF is not debug execution support. Refuse before
-    // popping the stack or changing flags. VM/RF are unaffected by POPF/POPFD.
-    if image & 0x100 != 0 {
+    // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
+    // flag-image loads can enable single stepping. Protected delivery awaits
+    // the IDT path; refuse before changing flags or consuming the frame.
+    if cpu.legacy.cr0 & 1 != 0 && image & 0x100 != 0 {
         return Err(crate::Exit::UnsupportedSystemContext {
             addr: cpu.rip,
             operation: crate::UnsupportedSystemOperation::InvalidLegacyContext(
@@ -835,7 +839,7 @@ pub(crate) fn restore_flags(
     } else {
         0
     };
-    cpu.rflags_system = (cpu.rflags_system & 0x30000) | u64::from(system);
+    cpu.rflags_system = (cpu.rflags_system & 0x30000) | u64::from(system | (image & 0x100));
     Ok(())
 }
 

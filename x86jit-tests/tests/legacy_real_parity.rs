@@ -1402,3 +1402,58 @@ fn string_elements_and_xlat_wrap_linear_addresses() {
         assert_eq!(cpu.cpu.gpr[0], 0xab5a);
     }
 }
+
+#[test]
+fn real16_flag_frames_and_retirement_agree_when_tf_is_clear() {
+    // I286 PRM §5.2.2 p. 5-5; 80386 PRM §14.3 p. 14-3:
+    // both paths use FLAGS:CS:IP frames and IRET; delivery itself retires nothing.
+    for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+        let code = b"\x9c\x9d\xcd\x01\x90";
+        let (a, mut ac) = setup(code, None, 17);
+        let (b, mut bc) = setup(code, Some(generation), 17);
+        for vm in [&a, &b] {
+            vm.write_bytes(0x1804, b"\xcf").unwrap();
+        }
+        // Keep flag images in the common subset (no IOPL/NT/TF).
+        ac.cpu.flags.set_flags16(0x202);
+        bc.cpu.flags.set_flags16(0x202);
+        for _ in 0..5 {
+            let ar = step(&a, &mut ac);
+            let br = step(&b, &mut bc);
+            assert_eq!(ar.steps(), br.steps());
+            assert_eq!(exit_image(ar.stop()), exit_image(br.stop()));
+            assert_eq!(image(&ac), image(&bc));
+            assert_eq!(memory_image(&a), memory_image(&b));
+            assert_eq!(ac.retired_instructions(), bc.retired_instructions());
+        }
+        assert_eq!(ac.retired_instructions(), 5);
+    }
+}
+
+#[test]
+fn application_ignores_tf_while_legacy_delays_until_the_successor() {
+    // Application Real16's exec_popf/exec_iret use Flags::set_flags16, which
+    // ignores TF. Legacy follows I286 PRM §9.7.1 p. 9-14 and 80386 PRM
+    // §12.3.1.4 p. 12-8. Pin the difference without changing Application.
+    for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+        let code = b"\x9d\x90";
+        let (a, mut ac) = setup(code, None, 17);
+        let (b, mut bc) = setup(code, Some(generation), 17);
+        for vm in [&a, &b] {
+            vm.write_bytes(0x8000, b"\x02\x01").unwrap();
+        }
+        assert_eq!(step(&a, &mut ac).steps(), 1);
+        assert_eq!(step(&b, &mut bc).steps(), 1);
+        assert_eq!((ac.cpu.rip, bc.cpu.rip), (0x1001, 0x1001));
+        assert_eq!((ac.cpu.rflags_system, bc.cpu.rflags_system), (0, 0x100));
+        assert_eq!(step(&a, &mut ac).steps(), 1);
+        assert_eq!(step(&b, &mut bc).steps(), 1);
+        assert_eq!((ac.cpu.rip, bc.cpu.rip), (0x1002, 0x1804));
+        assert_eq!(
+            (ac.retired_instructions(), bc.retired_instructions()),
+            (2, 2)
+        );
+        assert_eq!(bc.cpu.rflags_system & 0x100, 0);
+        assert_eq!(&memory_image(&b)[0x7ffc..0x8002], &[2, 0x10, 0, 0, 2, 1]);
+    }
+}

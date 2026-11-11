@@ -23,9 +23,15 @@ impl Backend for NoBackend {
     }
 }
 fn setup(code: &[u8]) -> (Vm, Vcpu) {
+    setup_model(code, CpuGeneration::I386)
+}
+fn setup_model(code: &[u8], generation: CpuGeneration) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(NoBackend));
     vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.set_legacy_cpu_model(MODEL);
+    vm.set_legacy_cpu_model(LegacyCpuModel {
+        generation,
+        ..MODEL
+    });
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.cpu.rip = 0x1000;
@@ -190,10 +196,11 @@ fn fs_gs_loads_overrides_and_far_pointer_loads() {
 }
 
 #[test]
-fn pushfd_popfd_identification_masks_and_atomic_refusal() {
+fn pushfd_popfd_identification_masks_and_tf_storage() {
     // SDM Vol 1 §21.1.2; 80386 PRM §2.3.4 Fig. 2-8 p. 2-11,
     // §17 POPF p. 17-130 (page images checked): AC/ID/reserved bits zero,
-    // IOPL/NT writable; RF/VM unaffected. TF requests are outside engine scope.
+    // IOPL/NT writable; RF/VM unaffected. §12.3.1.4 p. 12-8: setting
+    // TF does not trap until after the following instruction.
     let (vm, mut cpu) = setup(b"\x66\x9d\x66\x9c");
     vm.write_bytes(0x8000, &0xfffffeffu32.to_le_bytes())
         .unwrap();
@@ -204,15 +211,9 @@ fn pushfd_popfd_identification_masks_and_atomic_refusal() {
     assert_eq!(cpu.cpu.gpr[4], 0x8000);
     cpu.cpu.rip = 0x1000;
     vm.write_bytes(0x8000, &0x100u32.to_le_bytes()).unwrap();
-    let before = cpu.cpu.gpr;
-    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-    assert_eq!(run.steps(), 0);
-    assert!(matches!(
-        run.stop(),
-        StepStop::Exit(Exit::UnsupportedSystemContext { .. })
-    ));
-    assert_eq!(cpu.cpu.gpr, before);
-    assert_eq!(cpu.cpu.rflags_system, 0x7000);
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.gpr[4], 0x8004);
+    assert_eq!(cpu.cpu.rflags_system, 0x100);
 }
 
 #[test]
@@ -1195,6 +1196,7 @@ fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction(
         assert_eq!(cpu.cpu.gpr[3], 0);
         assert_eq!(cpu.cpu.gpr[4], 0x8000);
         assert!(cpu.has_pending_irq());
+        cpu.cpu.flags.if_ = false; // Accepted transfer delivery must still finish.
         cpu.complete_mmio_read(answer);
         steps(&mut cpu, &vm, 0);
     }
@@ -1203,7 +1205,40 @@ fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction(
     assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
     assert_eq!(cpu.cpu.gpr[3], 0);
     assert_eq!(value(&vm, 0x7ffa, 2), 0x1000);
+    assert_eq!(value(&vm, 0x7ffe, 2), 2);
     assert!(!cpu.has_pending_irq());
+}
+
+#[test]
+fn accepted_irq_unmapped_retry_finishes_delivery_with_if_cleared() {
+    // Decision-16 §3: an unmapped transfer preserves accepted event delivery,
+    // just like MMIO; changing IF cannot split it from its continuation.
+    for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+        let (mut vm, mut cpu) = setup_model(b"\x43", generation);
+        vm.unmap(0, 0x40000).unwrap();
+        vm.map(0, 0x30000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\x43").unwrap();
+        vm.write_bytes(0x1800, b"\xf4").unwrap();
+        cpu.cpu.legacy.idtr.base = 0x30000;
+        cpu.cpu.flags.if_ = true;
+        cpu.inject_irq(0x20);
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(matches!(
+            run.stop(),
+            StepStop::Exit(Exit::UnmappedMemory { addr: 0x30080, .. })
+        ));
+        cpu.cpu.flags.if_ = false;
+        vm.map(0x30000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x30080, b"\x00\x18\x00\x00").unwrap();
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 1);
+        assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[3]), (0, 0x1801, 0));
+        assert_eq!(value(&vm, 0x7ffa, 2), 0x1000);
+        assert_eq!(value(&vm, 0x7ffe, 2), 2);
+        assert!(!cpu.has_pending_irq());
+    }
 }
 
 #[test]
@@ -1255,4 +1290,438 @@ fn application_real16_ir_matches_frozen_parent_snapshots() {
         snapshot.push_str(&format!("{name}\n{ir:?}\n"));
     }
     assert_eq!(snapshot, include_str!("fixtures/real16_parent_ir.snap"));
+}
+
+mod single_step {
+    use super::*;
+
+    const MODELS: [CpuGeneration; 2] = [CpuGeneration::I286, CpuGeneration::I386];
+    fn vector(vm: &Vm, number: u8, ip: u16, code: &[u8]) {
+        vm.write_bytes(u64::from(number) * 4, &ip.to_le_bytes())
+            .unwrap();
+        vm.write_bytes(u64::from(number) * 4 + 2, &[0, 0]).unwrap();
+        vm.write_bytes(u64::from(ip), code).unwrap();
+    }
+    fn traced(code: &[u8], generation: CpuGeneration) -> (Vm, Vcpu) {
+        let (vm, cpu) = setup_model(code, generation);
+        vector(&vm, 1, 0x1800, b"\xcf");
+        (vm, cpu)
+    }
+    fn frame(vm: &Vm, cpu: &Vcpu, ip: u16, flags: u16) {
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, 0x1800));
+        let sp = cpu.cpu.gpr[4] & 0xffff;
+        assert_eq!(value(vm, sp, 2), u64::from(ip));
+        assert_eq!(value(vm, sp + 2, 2), 0);
+        assert_eq!(value(vm, sp + 4, 2), u64::from(flags));
+        assert_eq!(cpu.cpu.rflags_system & 0x100, 0);
+        assert!(!cpu.cpu.flags.if_);
+    }
+
+    #[test]
+    fn probe_logs_pop_ds_without_inhibition_and_is_deterministic() {
+        // I286 PRM §9.7.1 p. 9-14, Appendix B POP p. B-83;
+        // 80386 PRM §12.3.1.4 p. 12-8, §17 POP pp. 17-125–126:
+        // POP DS has no SS inhibition. Both models trap immediately after it.
+        let code = b"\x9c\x9c\x58\x0d\x00\x01\x50\x31\xc0\x9d\x90\x1e\x1f\x90\x9d\xf4";
+        for generation in MODELS {
+            let mut previous = None;
+            for _ in 0..3 {
+                let (vm, mut cpu) = traced(code, generation);
+                // Preserve AX/BP; append the saved IP to ES:DI; IRET restores TF.
+                vector(
+                    &vm,
+                    1,
+                    0x1800,
+                    b"\x55\x89\xe5\x50\x8b\x46\x02\xab\x58\x5d\xcf",
+                );
+                cpu.cpu.gpr[7] = 0x6000;
+                let run = cpu.run_steps(&vm, 100, StepOptions::default()).unwrap();
+                assert!(
+                    matches!(run.stop(), StepStop::Exit(Exit::Hlt)),
+                    "{:?}",
+                    run.stop()
+                );
+                let ips: Vec<_> = (0..5).map(|i| value(&vm, 0x6000 + i * 2, 2)).collect();
+                assert_eq!(ips, [0x100b, 0x100c, 0x100d, 0x100e, 0x100f]);
+                // 13 probe instructions + five eight-instruction handlers.
+                assert_eq!((run.steps(), cpu.retired_instructions()), (53, 53));
+                assert_eq!(cpu.cpu.gpr[4], 0x8000);
+                assert_eq!(cpu.cpu.rflags_system & 0x100, 0);
+                let image = (format!("{:?}", cpu.cpu), ips, run.steps());
+                if let Some(previous) = &previous {
+                    assert_eq!(&image, previous);
+                }
+                previous = Some(image);
+            }
+        }
+    }
+
+    #[test]
+    fn popf_and_iret_set_tf_with_one_instruction_delay() {
+        // I286 PRM §2.3 FLAGS p. 2-15, §9.7.1 p. 9-14;
+        // 80386 PRM §12.3.1.4 p. 12-8: TF at instruction entry controls trapping.
+        for generation in MODELS {
+            for (code, size, iret) in [
+                (b"\x9d\x90".as_slice(), 2, false),
+                (b"\xcf", 2, true),
+                (b"\x66\x9d\x90", 4, false),
+                (b"\x66\xcf", 4, true),
+            ] {
+                if size == 4 && generation == CpuGeneration::I286 {
+                    continue;
+                }
+                let (vm, mut cpu) = traced(code, generation);
+                if iret {
+                    for (i, word) in [0x1200u32, 0, 0x102].into_iter().enumerate() {
+                        vm.write_bytes(0x8000 + (i * size) as u64, &word.to_le_bytes()[..size])
+                            .unwrap();
+                    }
+                    vm.write_bytes(0x1200, b"\x90").unwrap();
+                } else {
+                    vm.write_bytes(0x8000, &0x102u32.to_le_bytes()[..size])
+                        .unwrap();
+                }
+                let next = if iret {
+                    0x1200
+                } else {
+                    0x1000 + code.len() as u16 - 1
+                };
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.rip, u64::from(next));
+                assert_eq!(cpu.cpu.rflags_system & 0x100, 0x100);
+                steps(&mut cpu, &vm, 1);
+                frame(&vm, &cpu, next + 1, 0x102);
+                assert_eq!(cpu.retired_instructions(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn rep_traps_each_iteration_but_retires_only_on_completion() {
+        // I286 PRM Appendix B REP pp. B-92–93; 80386 PRM §17 REP
+        // pp. 17-139–140: interrupt window per iteration, updated CX/SI/DI.
+        // Together with §9.7.1 / §12.3.1.4 this gives one TF trap per iteration.
+        for generation in MODELS {
+            for count in [0, 3] {
+                let (vm, mut cpu) = traced(b"\xf3\xa4", generation);
+                cpu.cpu.rflags_system = 0x100;
+                cpu.cpu.gpr[1] = count;
+                cpu.cpu.gpr[6] = 0x4000;
+                cpu.cpu.gpr[7] = 0x5000;
+                vm.write_bytes(0x4000, b"abc").unwrap();
+                for left in (0..count.max(1)).rev() {
+                    steps(&mut cpu, &vm, 1);
+                    let done = left == 0;
+                    frame(&vm, &cpu, if done { 0x1002 } else { 0x1000 }, 0x102);
+                    assert_eq!(cpu.cpu.gpr[1], left);
+                    assert_eq!(
+                        cpu.retired_instructions(),
+                        count.max(1) - left - u64::from(!done)
+                    );
+                    if !done {
+                        steps(&mut cpu, &vm, 1);
+                    } // IRET is a retired instruction.
+                }
+                assert_eq!(cpu.cpu.gpr[6], 0x4000 + count);
+                assert_eq!(cpu.cpu.gpr[7], 0x5000 + count);
+                if count != 0 {
+                    assert_eq!(value(&vm, 0x5000, 3), 0x636261);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mov_pop_ss_suppress_only_the_load_boundary() {
+        // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
+        // 80386 PRM §9.2.4 pp. 9-3–4: SS load, then successor, then #DB.
+        for generation in MODELS {
+            for code in [b"\x8e\xd0\x90".as_slice(), b"\x17\x90"] {
+                let (vm, mut cpu) = traced(code, generation);
+                cpu.cpu.rflags_system = 0x100;
+                vm.write_bytes(0x8000, &[0, 0]).unwrap();
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64 - 1);
+                assert_eq!(cpu.cpu.rflags_system, 0x100);
+                steps(&mut cpu, &vm, 1);
+                frame(&vm, &cpu, 0x1000 + code.len() as u16, 0x102);
+                assert_eq!(cpu.retired_instructions(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn data_segment_loads_and_lss_do_not_suppress_tf() {
+        // I286 PRM Appendix B MOV p. B-73, POP p. B-83, LDS/LES pp. B-61–62;
+        // 80386 PRM §17 MOV p. 17-109, POP p. 17-126, LxS pp. 17-96–97;
+        // SDM Vol 3A §7.8.3 p. 7-9: LSS does not inhibit events.
+        for generation in MODELS {
+            let mut forms = vec![
+                vec![0x8e, 0xd8],
+                vec![0x8e, 0xc0],
+                vec![0x1f],
+                vec![0x07],
+                vec![0xc5, 0x1e, 0, 0x40],
+                vec![0xc4, 0x1e, 0, 0x40],
+            ];
+            if generation == CpuGeneration::I386 {
+                forms.extend([
+                    vec![0x8e, 0xe0],
+                    vec![0x8e, 0xe8],
+                    vec![0x0f, 0xa1],
+                    vec![0x0f, 0xa9],
+                    vec![0x0f, 0xb2, 0x1e, 0, 0x40],
+                    vec![0x0f, 0xb4, 0x1e, 0, 0x40],
+                    vec![0x0f, 0xb5, 0x1e, 0, 0x40],
+                ]);
+            }
+            for code in forms {
+                let (vm, mut cpu) = traced(&code, generation);
+                cpu.cpu.rflags_system = 0x100;
+                vm.write_bytes(0x8000, &[0, 0]).unwrap();
+                vm.write_bytes(0x4000, &[0, 0, 0, 0]).unwrap();
+                steps(&mut cpu, &vm, 1);
+                frame(&vm, &cpu, 0x1000 + code.len() as u16, 0x102);
+            }
+        }
+    }
+
+    #[test]
+    fn tf_precedes_irq_and_sti_does_not_mask_debug() {
+        // I286 PRM Table 5-1 p. 5-4, §9.7.1 p. 9-14;
+        // 80386 PRM Table 9-2 p. 9-4, §12.3.1.4 p. 12-8:
+        // debug wins over INTR. Real delivery clears IF, leaving INTR pending.
+        for generation in MODELS {
+            let (vm, mut cpu) = traced(b"\xfb\x90", generation);
+            vector(&vm, 0x20, 0x1900, b"\xf4");
+            cpu.cpu.rflags_system = 0x100;
+            cpu.inject_irq(0x20);
+            steps(&mut cpu, &vm, 1);
+            frame(&vm, &cpu, 0x1001, 0x302);
+            assert!(cpu.has_pending_irq());
+            steps(&mut cpu, &vm, 1); // IRET restores TF/IF, no immediate trap.
+            assert_eq!(cpu.cpu.rip, 0x1001);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+            assert_eq!(cpu.cpu.rip, 0x1901);
+            assert!(!cpu.has_pending_irq());
+            assert_eq!(value(&vm, 0x7ffa, 2), 0x1001);
+            assert_eq!(value(&vm, 0x7ffe, 2), 0x302);
+            assert_eq!(cpu.retired_instructions(), 3);
+        }
+    }
+
+    #[test]
+    fn faults_precede_tf_but_untaken_into_and_hlt_trap() {
+        // I286 PRM Table 5-1 p. 5-4, §9.7.1 p. 9-14;
+        // 80386 PRM Table 9-2 p. 9-4, §12.3.1.4 p. 12-8.
+        for generation in MODELS {
+            let (vm, mut cpu) = traced(b"\xf7\xf0", generation); // DIV AX, AX=0
+            cpu.cpu.rflags_system = 0x100;
+            exception(&mut cpu, &vm, 0);
+            assert_eq!(cpu.retired_instructions(), 0);
+            assert_eq!(cpu.cpu.gpr[4], 0x8000);
+            assert_eq!(cpu.cpu.rflags_system, 0x100);
+            vm.write_bytes(0x1000, b"\x90").unwrap();
+            steps(&mut cpu, &vm, 1);
+            frame(&vm, &cpu, 0x1001, 0x102);
+            for code in [b"\xce", b"\xf4"] {
+                let (vm, mut cpu) = traced(code, generation);
+                cpu.cpu.rflags_system = 0x100;
+                steps(&mut cpu, &vm, 1); // untaken INTO / completed HLT
+                frame(&vm, &cpu, 0x1001, 0x102);
+            }
+        }
+    }
+
+    #[test]
+    fn taken_int_int3_into_save_tf_and_stop_stepping_on_both_models() {
+        // I286 PRM §9.7.1 p. 9-14, Appendix B INT/INTO p. B-48;
+        // 80386 PRM §12.3.1.4 p. 12-8, §17 INT/INTO pp. 17-69, 17-73:
+        // save TF=1 and the successor, clear live TF, no #DB on entry or
+        // after the first handler instruction. IRET restores delayed stepping.
+        for generation in MODELS {
+            for (code, number) in [
+                (b"\xcd\x20".as_slice(), 0x20),
+                (b"\xcd\x03", 3),
+                (b"\xcc", 3),
+                (b"\xce", 4),
+            ] {
+                let mut program = code.to_vec();
+                program.push(0x90);
+                let (vm, mut cpu) = traced(&program, generation);
+                vector(&vm, number, 0x1900, b"\x43\xcf"); // INC BX; IRET
+                cpu.cpu.rflags_system = 0x100;
+                cpu.cpu.flags.of = true;
+                cpu.cpu.flags.if_ = true;
+                let successor = 0x1000 + code.len() as u64;
+                steps(&mut cpu, &vm, 1);
+                assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, 0x1900));
+                assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+                assert_eq!(value(&vm, 0x7ffa, 2), successor);
+                assert_eq!(value(&vm, 0x7ffc, 2), 0);
+                assert_eq!(value(&vm, 0x7ffe, 2), 0xb02); // OF, IF, TF
+                assert_eq!(cpu.cpu.rflags_system & 0x100, 0);
+                assert!(!cpu.cpu.flags.if_);
+                assert_eq!(cpu.cpu.gpr[3], 0);
+                steps(&mut cpu, &vm, 1);
+                assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, 0x1901));
+                assert_eq!(cpu.cpu.gpr[3], 1);
+                assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+                assert_eq!(cpu.cpu.rflags_system & 0x100, 0);
+                steps(&mut cpu, &vm, 1); // IRET restores TF without trapping.
+                assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, successor));
+                assert_eq!(cpu.cpu.gpr[4], 0x8000);
+                assert_eq!(cpu.cpu.rflags_system & 0x100, 0x100);
+                assert!(cpu.cpu.flags.if_);
+                steps(&mut cpu, &vm, 1);
+                frame(&vm, &cpu, successor as u16 + 1, 0xb02);
+                assert_eq!(cpu.retired_instructions(), 4);
+            }
+        }
+    }
+
+    #[test]
+    fn irq_delivery_fault_rechecks_if_before_retry() {
+        // I286 PRM §9.2; 80386 PRM §9.2.2 p. 9-3:
+        // IF masks INTR. An architectural delivery fault abandons acceptance;
+        // a still-pending IRQ must consult the embedder's updated IF.
+        // Delivery faults: I286 PRM Appendix B MOV p. B-74; SDM Vol 3B
+        // §23.1.4; 80386 PRM §14.6 Tables 14-1/14-2 pp. 14-5, 14-8.
+        for generation in MODELS {
+            for short_idtr in [false, true] {
+                let (vm, mut cpu) = traced(b"\x90", generation);
+                vector(&vm, 0x20, 0x1900, b"\xf4");
+                cpu.cpu.flags.if_ = true;
+                cpu.inject_irq(0x20);
+                let fault = if short_idtr {
+                    cpu.cpu.legacy.idtr.limit = 0x82;
+                    if generation == CpuGeneration::I386 {
+                        8
+                    } else {
+                        13
+                    }
+                } else {
+                    cpu.cpu.legacy.segments[3].limit = 0x7ff0;
+                    if generation == CpuGeneration::I386 {
+                        12
+                    } else {
+                        13
+                    }
+                };
+                exception(&mut cpu, &vm, fault);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                    (0, 0x1000, 0x8000)
+                );
+                assert!(cpu.has_pending_irq());
+                cpu.cpu.flags.if_ = false;
+                cpu.cpu.legacy.idtr.limit = 0x3ff;
+                cpu.cpu.legacy.segments[3].limit = 0xffff;
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                    (0, 0x1001, 0x8000)
+                );
+                assert!(cpu.has_pending_irq());
+                cpu.cpu.flags.if_ = true;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)));
+                assert_eq!(cpu.cpu.rip, 0x1901);
+                assert_eq!(value(&vm, 0x7ffa, 2), 0x1001);
+                assert!(!cpu.has_pending_irq());
+            }
+        }
+    }
+
+    #[test]
+    fn port_handoffs_deliver_tf_after_completion() {
+        // I286 PRM Appendix B REP p. B-93; 80386 PRM §17 REP p. 17-140:
+        // an INS element includes its destination store before the TF window.
+        // Port completion and vector delivery cost no instruction unit.
+        for generation in MODELS {
+            for ss in [false, true] {
+                let code = if ss {
+                    b"\x8e\xd0\xf3\x6c".as_slice()
+                } else {
+                    b"\xf3\x6c"
+                };
+                let (vm, mut cpu) = traced(code, generation);
+                cpu.cpu.rflags_system = 0x100;
+                cpu.cpu.gpr[1] = 2;
+                cpu.cpu.gpr[7] = 0x4000;
+                if ss {
+                    steps(&mut cpu, &vm, 1);
+                }
+                let base = u64::from(ss);
+                let ip = 0x1000 + if ss { 2 } else { 0 };
+                for left in [1, 0] {
+                    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 1);
+                    assert!(matches!(run.stop(), StepStop::Exit(Exit::PortIo { .. })));
+                    assert_eq!(cpu.cpu.rflags_system, 0x100);
+                    assert_eq!(cpu.cpu.gpr[1], left + 1);
+                    cpu.complete_port_in(0x5a);
+                    steps(&mut cpu, &vm, 0);
+                    assert_eq!(cpu.cpu.gpr[1], left + 1);
+                    steps(&mut cpu, &vm, 1); // store, #DB, then one handler IRET
+                    assert_eq!(cpu.cpu.rip, if left == 0 { ip + 2 } else { ip });
+                    assert_eq!(cpu.cpu.gpr[1], left);
+                    assert_eq!(value(&vm, 0x7ffa, 2), cpu.cpu.rip);
+                    assert_eq!(
+                        cpu.retired_instructions(),
+                        base + if left == 0 { 3 } else { 1 }
+                    );
+                }
+                assert_eq!(value(&vm, 0x4000, 2), 0x5a5a);
+            }
+            for code in [b"\xe4\x20", b"\xe6\x20"] {
+                let (vm, mut cpu) = traced(code, generation);
+                cpu.cpu.rflags_system = 0x100;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::PortIo { .. })));
+                cpu.complete_port_in(0x5a);
+                steps(&mut cpu, &vm, 1); // deferred #DB, then handler IRET
+                assert_eq!(cpu.cpu.rip, 0x1002);
+                assert_eq!(value(&vm, 0x7ffa, 2), 0x1002);
+                assert_eq!(cpu.retired_instructions(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_delivery_retry_keeps_retirement_and_priority() {
+        // The same IVT/MMIO continuation as IRQ delivery (decision-16 §3).
+        for generation in MODELS {
+            let (mut vm, mut cpu) = traced(b"\x90", generation);
+            vm.unmap(0, 0x40000).unwrap();
+            vm.map(0x1000, 0x3f000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, b"\x90").unwrap();
+            vm.write_bytes(0x1800, b"\xcf").unwrap();
+            vm.map(0, 0x1000, Prot::RWX, RegionKind::Trap).unwrap();
+            cpu.cpu.rflags_system = 0x100;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert!(matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioRead { addr: 4, .. })
+            ));
+            assert_eq!(cpu.retired_instructions(), 1);
+            for (answer, next) in [(0x1800, 6), (0, 0)] {
+                cpu.complete_mmio_read(answer);
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                if next != 0 {
+                    assert!(
+                        matches!(run.stop(), StepStop::Exit(Exit::MmioRead { addr, .. }) if *addr == next)
+                    );
+                    assert_eq!(run.steps(), 0);
+                } else {
+                    // Delivery retires nothing; this unit executes the handler's IRET.
+                    assert_eq!(run.steps(), 1);
+                    assert_eq!(cpu.cpu.rip, 0x1001);
+                    assert_eq!(cpu.retired_instructions(), 2);
+                }
+            }
+        }
+    }
 }

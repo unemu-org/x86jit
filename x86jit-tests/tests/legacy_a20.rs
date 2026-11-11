@@ -852,6 +852,93 @@ fn mmio_divide_fault_applies_queued_line_and_discards_retry() {
 }
 
 #[test]
+fn event_delivery_fault_applies_queued_line_and_discards_retry() {
+    // Decision-22: an architectural fault abandons the in-flight transfer.
+    // I286 PRM Appendix B MOV p. B-74; SDM Vol 3B §23.1.4;
+    // 80386 PRM §14.6 Tables 14-1/14-2 pp. 14-5, 14-8:
+    // a short IVT limit or invalid stack faults before committing the frame.
+    for generation in GENERATIONS {
+        for debug in [false, true] {
+            for short_idtr in [false, true] {
+                let (mut vm, mut cpu) = setup(generation, b"\x90\x90", [0; 6]);
+                vm.unmap(0, 0x400000).unwrap();
+                vm.map(0, 0x30000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x1000, b"\x90\x90").unwrap();
+                vm.map(0x30000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+                cpu.cpu.legacy.idtr.base = 0x30000;
+                let vector: u8 = if debug {
+                    cpu.cpu.rflags_system = 0x100;
+                    1
+                } else {
+                    cpu.cpu.flags.if_ = true;
+                    cpu.inject_irq(0x20);
+                    0x20
+                };
+                let address = 0x30000 + u64::from(vector) * 4;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), u64::from(debug));
+                assert!(matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::MmioRead { addr, .. }) if *addr == address
+                ));
+                cpu.set_a20_enabled(false);
+                assert!(cpu.a20_enabled());
+                assert_eq!(cpu.pending_a20_enabled(), Some(false));
+                cpu.complete_mmio_read(0x1800);
+                let fault = if short_idtr {
+                    cpu.cpu.legacy.idtr.limit = u16::from(vector) * 4 + 2;
+                    if generation == CpuGeneration::I386 {
+                        8
+                    } else {
+                        13
+                    }
+                } else {
+                    cpu.cpu.legacy.segments[SegmentId::Ss as usize].limit = 0x7ff0;
+                    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 0);
+                    assert!(matches!(
+                        run.stop(),
+                        StepStop::Exit(Exit::MmioRead { addr, .. }) if *addr == address + 2
+                    ));
+                    cpu.complete_mmio_read(0);
+                    if generation == CpuGeneration::I386 {
+                        12
+                    } else {
+                        13
+                    }
+                };
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 0);
+                assert!(matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::Exception { vector, .. }) if *vector == fault
+                ));
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                    (0, 0x1000 + u64::from(debug), 0x8000)
+                );
+                assert_eq!(cpu.retired_instructions(), u64::from(debug));
+                assert_eq!(cpu.has_pending_irq(), !debug);
+                assert!(!cpu.a20_enabled());
+                assert_eq!(cpu.pending_a20_enabled(), None);
+                assert!(!cpu.cpu.mmio_retry_active);
+                assert_eq!(cpu.cpu.mmio_parts_len, 0);
+                assert_eq!(cpu.cpu.pending_mmio, None);
+                assert!(!cpu.cpu.pending_mmio_write);
+                cpu.cpu.flags.if_ = false;
+                cpu.cpu.rflags_system = 0;
+                cpu.cpu.legacy.idtr.limit = 0x3ff;
+                cpu.cpu.legacy.segments[SegmentId::Ss as usize].limit = 0xffff;
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.rip, 0x1001 + u64::from(debug));
+                assert_eq!(cpu.cpu.gpr[4], 0x8000);
+                assert_eq!(cpu.has_pending_irq(), !debug);
+            }
+        }
+    }
+}
+
+#[test]
 fn divide_fault_handler_fetch_failure_does_not_leave_line_pending() {
     // SDM Vol 3A §7.15, Event 0; Vol 3B §23.1.4. Legacy exceptions
     // return outward (decision-18 §4); the embedder explicitly routes vector 0

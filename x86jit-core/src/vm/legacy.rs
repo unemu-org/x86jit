@@ -57,6 +57,17 @@ struct InstructionRetry {
     mxcsr_mode: u32,
     ir: Arc<IrBlock>,
 }
+#[derive(Clone, Copy)]
+enum EventSource {
+    SingleStep,
+    Irq(u8),
+}
+#[derive(Clone, Copy)]
+struct PendingEvent {
+    source: EventSource,
+    ip: u32,
+    cs: u16,
+}
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
@@ -67,9 +78,11 @@ pub(super) struct Execution {
     instruction_retry: Option<InstructionRetry>,
     #[cfg(test)]
     lifts: u64,
-    // Accepted IRQ delivery can itself hand off an MMIO transfer. Its retry
+    // Accepted event delivery can itself hand off an MMIO transfer. Its retry
     // must complete before executing the interrupted instruction (decision-16 §3).
-    irq_retry: Option<(u8, u32, u16)>,
+    event_retry: Option<PendingEvent>,
+    // Port handoffs must reach the embedder before the post-instruction trap.
+    port_debug: bool,
     pub(super) pending_a20_enabled: Option<bool>,
 }
 impl Execution {
@@ -88,16 +101,18 @@ impl Execution {
             instruction_retry: None,
             #[cfg(test)]
             lifts: 0,
-            irq_retry: None,
+            event_retry: None,
+            port_debug: false,
             pending_a20_enabled: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
-        self.irq_retry = None;
+        self.event_retry = None;
+        self.port_debug = false;
         self.instruction_retry = None;
     }
     pub(super) fn has_continuation(&self) -> bool {
-        self.instruction_retry.is_some() || self.irq_retry.is_some()
+        self.instruction_retry.is_some() || self.event_retry.is_some()
     }
     fn invalidate_translations(&mut self) {
         self.blocks.clear();
@@ -346,10 +361,10 @@ impl Vcpu {
             execution.instruction_retry = None;
         }
         if execution
-            .irq_retry
-            .is_some_and(|(_, ip, cs)| u64::from(ip) != self.cpu.rip || cs != self.cpu.cs)
+            .event_retry
+            .is_some_and(|event| u64::from(event.ip) != self.cpu.rip || event.cs != self.cpu.cs)
         {
-            execution.irq_retry = None;
+            execution.event_retry = None;
         }
         if stepped && self.cpu.pending_port_in.is_some() {
             return Err(StepRunError::PendingPortIn);
@@ -422,6 +437,61 @@ impl Vcpu {
         Ok(result)
     }
 
+    fn deliver_legacy_event<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        context: LegacyDecodeContext,
+        event: PendingEvent,
+    ) -> Result<(), Exit> {
+        let vector = match event.source {
+            EventSource::SingleStep => 1,
+            EventSource::Irq(vector) => vector,
+        };
+        // Event priority, highest first (debug-register events remain unimplemented):
+        // I286 PRM §5.2.1.1, Table 5-1 p. 5-4: instruction exception,
+        // single step, NMI, processor-extension segment overrun, INTR.
+        // 80386 PRM §9.3, Table 9-2 p. 9-4: non-debug faults, taken
+        // INTO/INT n/INT 3, debug traps for this instruction, debug faults
+        // for the next instruction, NMI, INTR. Faulting attempts never reach
+        // this post-instruction TF delivery; taken software INT suppresses it.
+        // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
+        // finish single-step delivery before examining lower-priority external
+        // interrupts, which may be serviced before the first handler instruction.
+        // Real IVT delivery clears IF, so INTR remains pending until enabled.
+        // NMI input/delivery is deferred. A future NMI path must check eligible
+        // NMIs after this delivery and before handler execution, independently
+        // of IF (80386 PRM §9.2.2 p. 9-3);
+        // MOV/POP SS inhibit its load boundary (I286 PRM Appendix B MOV
+        // p. B-73, POP p. B-83; 80386 PRM §9.2.4 pp. 9-3–4).
+        let result = crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
+            &mut self.cpu,
+            &vm.mem,
+            context,
+            vector,
+            event.ip,
+        );
+        self.legacy_execution.as_mut().unwrap().event_retry = matches!(
+            &result,
+            Err(Exit::MmioRead { .. } | Exit::MmioWrite { .. } | Exit::UnmappedMemory { .. })
+        )
+        .then_some(event);
+        result?;
+        if let EventSource::Irq(vector) = event.source {
+            if self.pending_irq == Some(vector) {
+                self.pending_irq = None;
+            }
+        }
+        self.sti_shadow = false;
+        self.ss_shadow = false;
+        self.cpu.finish_mmio_retry(None);
+        self.apply_pending_a20();
+        self.legacy_execution
+            .as_mut()
+            .unwrap()
+            .sync(&self.cpu, self.legacy_model.unwrap(), true);
+        Ok(())
+    }
+
     fn legacy_loop<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
@@ -475,49 +545,38 @@ impl Vcpu {
                     }
                 }
             };
-            let irq = self
+            if self.legacy_execution.as_ref().unwrap().port_debug
+                && self.cpu.pending_port_in.is_none()
+                && self.cpu.port_string_in.is_none()
+            {
+                self.legacy_execution.as_mut().unwrap().port_debug = false;
+                self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
+                    source: EventSource::SingleStep,
+                    ip: self.cpu.rip as u32,
+                    cs: self.cpu.cs,
+                });
+            }
+            let event = self
                 .legacy_execution
                 .as_ref()
                 .unwrap()
-                .irq_retry
+                .event_retry
                 .or_else(|| {
                     self.pending_irq
                         .filter(|_| self.irq_delivery_ready() && !self.cpu.mmio_retry_active)
-                        .map(|vector| (vector, self.cpu.rip as u32, self.cpu.cs))
+                        .map(|vector| PendingEvent {
+                            source: EventSource::Irq(vector),
+                            ip: self.cpu.rip as u32,
+                            cs: self.cpu.cs,
+                        })
                 });
-            if let Some((vector, saved_ip, saved_cs)) = irq {
-                if let Err(exit) = crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
-                    &mut self.cpu,
-                    &vm.mem,
-                    context,
-                    vector,
-                    saved_ip,
-                ) {
-                    self.legacy_execution.as_mut().unwrap().irq_retry = if matches!(
-                        exit,
-                        Exit::MmioRead { .. }
-                            | Exit::MmioWrite { .. }
-                            | Exit::UnmappedMemory { .. }
-                    ) {
-                        Some((vector, saved_ip, saved_cs))
-                    } else {
-                        None
-                    };
+            if let Some(event) = event {
+                if let Err(exit) = self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event) {
                     return StepRun {
                         steps,
                         stop: StepStop::Exit(exit),
                     };
                 }
-                self.legacy_execution.as_mut().unwrap().irq_retry = None;
-                if self.pending_irq == Some(vector) {
-                    self.pending_irq = None;
-                }
-                self.cpu.finish_mmio_retry(None);
-                self.apply_pending_a20();
-                self.legacy_execution
-                    .as_mut()
-                    .unwrap()
-                    .sync(&self.cpu, model, true);
                 // Delivery costs no instruction unit. Re-derive after the CS reload.
                 continue;
             }
@@ -545,6 +604,9 @@ impl Vcpu {
                     }
                 }
             };
+            // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
+            // sample TF before execution, including POPF/IRET that change it.
+            let single_step = self.cpu.rflags_system & 0x100 != 0;
             match crate::interp::legacy::execute::<ROUTED, ORDER>(
                 &ir,
                 &mut self.cpu,
@@ -555,9 +617,10 @@ impl Vcpu {
                     steps += 1;
                     self.retired += u64::from(outcome.retired);
                     self.executed += u64::from(outcome.retired);
+                    let arm_ss = outcome.arm_ss && !self.ss_shadow;
                     if self.cpu.port_string_in.is_none() {
                         self.sti_shadow = outcome.arm_sti;
-                        self.ss_shadow = outcome.arm_ss && !self.ss_shadow;
+                        self.ss_shadow = arm_ss;
                     }
                     self.cpu.finish_mmio_retry(None);
                     // SDM Vol 2B REP, p. 4-564: a completed iteration is an
@@ -570,6 +633,36 @@ impl Vcpu {
                             execution.invalidate_translations();
                         }
                         execution.sync(&self.cpu, model, true);
+                    }
+                    // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
+                    // 80386 PRM §9.2.4 pp. 9-3–4, §17 MOV p. 17-109,
+                    // POP p. 17-126: only MOV/POP SS suppress this boundary.
+                    // SDM Vol 3A §7.8.3 pp. 7-8–9: consecutive SS loads
+                    // guarantee inhibition only for the first load; LSS has none.
+                    let debug = single_step && !arm_ss && !outcome.suppress_debug;
+                    if debug {
+                        if matches!(outcome.exit, Some(Exit::PortIo { .. })) {
+                            self.legacy_execution.as_mut().unwrap().port_debug = true;
+                        } else {
+                            let event = PendingEvent {
+                                source: EventSource::SingleStep,
+                                ip: self.cpu.rip as u32,
+                                cs: self.cpu.cs,
+                            };
+                            let delivered = self.legacy_context_for_run().and_then(|context| {
+                                self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
+                            });
+                            if let Err(exit) = delivered {
+                                return StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                };
+                            }
+                            // HLT completed; the enabled debug trap resumes at
+                            // its successor (I286 PRM Appendix B p. B-42;
+                            // 80386 PRM §17 HLT p. 17-60).
+                            continue;
+                        }
                     }
                     if let Some(exit) = outcome.exit {
                         return StepRun {

@@ -427,7 +427,8 @@ pub struct CpuState {
     pub random_state: u64,
     /// Protected-mode RFLAGS bits outside `Flags`: TF, IOPL, NT, RF, VM, AC,
     /// VIF, VIP and ID (SDM Vol 1 §3.4.3). The embedder configures IOPL and
-    /// `flags.if_`; execution uses CPL 3. TF is stored without single-step delivery.
+    /// `flags.if_`; Application execution uses CPL 3 and stores TF without
+    /// single-step delivery. Legacy real execution delivers TF traps through the IVT.
     /// Appended to preserve every existing JIT ABI offset.
     pub rflags_system: u64,
     /// Visible FS/GS selectors, independent of the configured linear bases.

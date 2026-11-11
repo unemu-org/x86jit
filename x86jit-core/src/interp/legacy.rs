@@ -11,6 +11,7 @@ pub(crate) struct Outcome {
     pub translations_invalidated: bool,
     pub arm_sti: bool,
     pub arm_ss: bool,
+    pub suppress_debug: bool,
     preserve_rf: bool,
 }
 
@@ -571,7 +572,7 @@ fn target(cpu: &CpuState, context: LegacyDecodeContext, value: u64, size: u8) ->
     Ok(offset)
 }
 
-/// Shared real-address delivery for software INT and queued maskable IRQs.
+/// Shared real-address delivery for software INT, single stepping and queued IRQs.
 /// Faults remain outward until the exception-routing seam (decision-18 §4).
 pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
@@ -1466,6 +1467,17 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     } => {
                         if !overflow_only || cpu.flags.of {
                             deliver(cpu, mem, context, *vector, *saved_ip)?;
+                            // I286 PRM §9.7.1 p. 9-14, Appendix B INT/INTO
+                            // p. B-48; 80386 PRM §12.3.1.4 p. 12-8,
+                            // §17 INT/INTO p. 17-69: both models save then
+                            // clear TF and stop stepping for taken
+                            // INT n/INT 3/INTO. No #DB precedes or follows the
+                            // handler's first instruction; IRET restores TF.
+                            // Prefer these instruction/debug rules over the
+                            // conflicting handler-stepping summaries in I286
+                            // Appendix C item 12, I386 §14.7 item 10, and the
+                            // final paragraphs of those single-step sections.
+                            outcome.suppress_debug = true;
                             outcome.context_changed = true;
                             return Ok(outcome);
                         }

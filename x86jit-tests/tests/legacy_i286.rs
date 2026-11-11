@@ -491,3 +491,57 @@ fn real_coprocessor_execution_and_deferred_system_forms() {
         }
     }
 }
+
+#[test]
+fn protected_tf_images_and_entry_remain_typed_refusals() {
+    // I286 PRM §9.7.1 p. 9-14 describes IDT delivery; the protected
+    // event-delivery implementation is deferred (decision-18 §4).
+    for iret in [false, true] {
+        let (vm, mut cpu) = setup(if iret { b"\xcf" } else { b"\x9d" }, true);
+        if iret {
+            vm.write_bytes(0x8000, b"\x00\x12\x08\x00\x02\x01").unwrap();
+        } else {
+            vm.write_bytes(0x8000, b"\x02\x01").unwrap();
+        }
+        let before = format!("{:?}", cpu.cpu);
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(matches!(
+            run.stop(),
+            StepStop::Exit(Exit::UnsupportedSystemContext {
+                operation: UnsupportedSystemOperation::InvalidLegacyContext(
+                    LegacyContextError::DebugTrapUnsupported
+                ),
+                ..
+            })
+        ));
+        assert_eq!(format!("{:?}", cpu.cpu), before);
+        cpu.cpu.rflags_system = 0x100;
+        assert_eq!(
+            derive_legacy_context(MODEL, &cpu.cpu),
+            Err(LegacyContextError::DebugTrapUnsupported)
+        );
+    }
+}
+
+#[test]
+fn reset_fetch_single_step_uses_the_real_ivt() {
+    // I286 PRM §10.4 p. 10-6: retained reset CS base; §5.2.2 p. 5-5,
+    // §9.7.1 p. 9-14: #DB saves the visible CS and next IP, then reloads CS.
+    let (vm, mut cpu) = setup(b"\x90", false);
+    cpu.cpu = CpuState::legacy_real_entry([0xf000, 0, 0, 0, 0, 0]);
+    cpu.cpu.rip = 0xfff0;
+    cpu.cpu.gpr[4] = 0x8000;
+    cpu.cpu.rflags_system = 0x100;
+    cpu.cpu.legacy.segments[0].base = 0xff0000;
+    cpu.cpu.legacy.reset_fetch = 1;
+    vm.write_bytes(0xfffff0, b"\x90").unwrap();
+    vm.write_bytes(4, b"\x00\x18\x00\x00").unwrap();
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(
+        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.reset_fetch),
+        (0, 0x1800, 0)
+    );
+    assert_eq!(bytes(&vm, 0x7ffa, 6), [0xf1, 0xff, 0, 0xf0, 2, 1]);
+    assert_eq!(cpu.retired_instructions(), 1);
+}
