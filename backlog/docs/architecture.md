@@ -42,6 +42,7 @@ that changes.
 
 | Module | Purpose |
 |--------|---------|
+| `legacy` | Application/system execution profiles, shared legacy model boundary, pure context derivation and appended system/descriptor storage; execution currently refused (decision-18 §§1–2) |
 | `state` | `Reg`, `CpuState` (`#[repr(C)]`, flat GPR file), `Flags` (§3) |
 | `memory_stats` | Public non-exhaustive allocation snapshots: VM/cache/backend categories and live vCPU gauges; page-rounding model for the pinned Cranelift allocator, process-wide retained fault metadata (§4.1, §9.1) |
 | `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap`; opt-in host-fault recovery, owned fetch snapshots (§4, §8.1) |

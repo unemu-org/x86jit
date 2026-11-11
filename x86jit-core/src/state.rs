@@ -445,6 +445,8 @@ pub struct CpuState {
     /// Appended to preserve existing JIT ABI offsets.
     #[doc(hidden)]
     pub port_string_in: Option<PortStringIn>,
+    /// Reserved system state (decision-18 §2); inert in Application profiles.
+    pub legacy: crate::legacy::LegacyCpuState,
 }
 
 /// Selects x87 opcode recording and pointer/opcode saving independently of CPUID.
@@ -595,6 +597,7 @@ impl Default for CpuState {
             mxcsr: MXCSR_RESET,
             x87_pointer_model: X87PointerModel::default(),
             port_string_in: None,
+            legacy: crate::legacy::LegacyCpuState::default(),
         }
     }
 }

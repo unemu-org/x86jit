@@ -845,6 +845,7 @@ fn lift_block_attempt(
     }
 
     Ok(IrBlock {
+        legacy_context: None,
         mode,
         guest_start: start,
         ops,
@@ -923,6 +924,7 @@ fn lift_one_attempt(
             &mut ops,
         ) {
             return Ok(IrBlock {
+                legacy_context: None,
                 mode,
                 guest_start: start,
                 ops,
@@ -941,6 +943,7 @@ fn lift_one_attempt(
     if mode.wraps_16() && insn.len() as u32 > MAX_INSN_LEN_286 {
         push_real16_fault(&insn, mode, 13, &mut ops);
         return Ok(IrBlock {
+            legacy_context: None,
             mode,
             guest_start: start,
             ops,
@@ -952,6 +955,7 @@ fn lift_one_attempt(
     lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg)?;
 
     Ok(IrBlock {
+        legacy_context: None,
         mode,
         guest_start: start,
         ops,
@@ -1540,6 +1544,10 @@ mod tests {
 /// target, or a conditional branch's two arms. Indirect jumps / call / ret / etc.
 /// have no static successors (their edges leave the region).
 pub(crate) fn static_succs(block: &IrBlock) -> Vec<u64> {
+    assert!(
+        block.legacy_context.is_none(),
+        "legacy IR cannot form application regions"
+    );
     if block.ops.iter().any(|op| {
         matches!(
             op,

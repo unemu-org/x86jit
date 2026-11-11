@@ -1083,3 +1083,192 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod frozen_application_abi {
+    use super::*;
+    use crate::state::Flags;
+    use std::mem::{align_of, align_of_val, offset_of, size_of, size_of_val};
+
+    const fn field_layout<S, T>(_: fn(&S) -> &T) -> (usize, usize) {
+        (size_of::<T>(), align_of::<T>())
+    }
+
+    // Literal manifest measured at main 73ed5d6 before appending legacy state.
+    // The old CpuState size was 3664, alignment 16. Size may grow; no prefix
+    // field may move, shrink, change alignment, or be replaced by legacy storage.
+    #[test]
+    fn every_preexisting_field_offset_size_alignment_and_wire_value_is_frozen() {
+        let cpu = CpuState::default();
+        let flags = cpu.flags;
+        let offsets = cpu_offsets();
+        let mem = MemCtx::for_memory(&Memory::new(crate::MemoryModel::Flat { size: 4096 }));
+        macro_rules! field {
+            ($ty:ty, $value:ident, $field:ident, $literal:expr) => {
+                // Also evaluate on cargo check --tests for each cross-target ABI.
+                const _: () = {
+                    let layout = field_layout(|value: &$ty| &value.$field);
+                    assert!(offset_of!($ty, $field) == $literal.0);
+                    assert!(layout.0 == $literal.1);
+                    assert!(layout.1 == $literal.2);
+                };
+                assert_eq!(
+                    (
+                        offset_of!($ty, $field),
+                        size_of_val(&$value.$field),
+                        align_of_val(&$value.$field)
+                    ),
+                    $literal,
+                    concat!(stringify!($ty), ".", stringify!($field))
+                );
+            };
+        }
+        field!(CpuState, cpu, gpr, (0, 128, 8));
+        field!(CpuState, cpu, rip, (128, 8, 8));
+        field!(CpuState, cpu, fs_base, (136, 8, 8));
+        field!(CpuState, cpu, gs_base, (144, 8, 8));
+        field!(CpuState, cpu, flags, (152, 8, 1));
+        field!(CpuState, cpu, xmm, (160, 512, 16));
+        field!(CpuState, cpu, ymm_hi, (672, 512, 16));
+        field!(CpuState, cpu, zmm_hi, (1184, 1024, 16));
+        field!(CpuState, cpu, kmask, (2208, 64, 8));
+        field!(CpuState, cpu, fpr, (2272, 80, 1));
+        field!(CpuState, cpu, fpu_top, (2352, 4, 4));
+        field!(CpuState, cpu, fpu_cw, (2356, 2, 2));
+        field!(CpuState, cpu, fpu_pad, (2358, 2, 2));
+        field!(CpuState, cpu, pending_mmio, (2360, 16, 8));
+        field!(CpuState, cpu, pending_mmio_write, (2376, 1, 1));
+        field!(CpuState, cpu, pending_port_in, (2377, 2, 1));
+        field!(CpuState, cpu, features, (2384, 8, 8));
+        field!(CpuState, cpu, x87_precision, (2392, 1, 1));
+        field!(CpuState, cpu, cs, (2394, 2, 2));
+        field!(CpuState, cpu, ds, (2396, 2, 2));
+        field!(CpuState, cpu, es, (2398, 2, 2));
+        field!(CpuState, cpu, ss, (2400, 2, 2));
+        field!(CpuState, cpu, fpu_empty, (2402, 1, 1));
+        field!(CpuState, cpu, fpu_sw, (2404, 2, 2));
+        field!(CpuState, cpu, fpu_fip, (2408, 8, 8));
+        field!(CpuState, cpu, fpu_fdp, (2416, 8, 8));
+        field!(CpuState, cpu, fpu_fop, (2424, 2, 2));
+        field!(CpuState, cpu, fpu_fcs, (2426, 2, 2));
+        field!(CpuState, cpu, fpu_fds, (2428, 2, 2));
+        field!(CpuState, cpu, mmio_parts, (2432, 1024, 8));
+        field!(CpuState, cpu, mmio_parts_len, (3456, 1, 1));
+        field!(CpuState, cpu, mmio_parts_rip, (3464, 8, 8));
+        field!(CpuState, cpu, mmio_retry_active, (3472, 1, 1));
+        field!(CpuState, cpu, mmio_retry_cs, (3474, 2, 2));
+        field!(CpuState, cpu, cpuid_table, (3480, 8, 8));
+        field!(CpuState, cpu, cpuid_overrides, (3488, 40, 8));
+        field!(CpuState, cpu, cpu_source, (3528, 16, 8));
+        field!(CpuState, cpu, source_id, (3544, 8, 8));
+        field!(CpuState, cpu, random_state, (3552, 8, 8));
+        field!(CpuState, cpu, rflags_system, (3560, 8, 8));
+        field!(CpuState, cpu, fs, (3568, 2, 2));
+        field!(CpuState, cpu, gs, (3570, 2, 2));
+        field!(CpuState, cpu, mxcsr, (3572, 4, 4));
+        field!(CpuState, cpu, x87_pointer_model, (3576, 1, 1));
+        field!(CpuState, cpu, port_string_in, (3584, 80, 8));
+        field!(Flags, flags, cf, (0, 1, 1));
+        field!(Flags, flags, pf_src, (1, 1, 1));
+        field!(Flags, flags, af_src, (2, 1, 1));
+        field!(Flags, flags, zf, (3, 1, 1));
+        field!(Flags, flags, sf, (4, 1, 1));
+        field!(Flags, flags, of, (5, 1, 1));
+        field!(Flags, flags, df, (6, 1, 1));
+        field!(Flags, flags, if_, (7, 1, 1));
+        field!(MemCtx, mem, base, (0, 8, 8));
+        field!(MemCtx, mem, size, (8, 8, 8));
+        field!(MemCtx, mem, fault_addr, (16, 8, 8));
+        field!(MemCtx, mem, fault_size, (24, 8, 8));
+        field!(MemCtx, mem, fault_access, (32, 8, 8));
+        field!(MemCtx, mem, next_entry, (40, 8, 8));
+        field!(MemCtx, mem, link_slot, (48, 8, 8));
+        field!(MemCtx, mem, fuel, (56, 8, 8));
+        field!(MemCtx, mem, ret_stack, (64, 8, 8));
+        field!(MemCtx, mem, guest_base, (72, 8, 8));
+        field!(MemCtx, mem, exception_vector, (80, 8, 8));
+        field!(MemCtx, mem, watch_count_ptr, (88, 8, 8));
+        field!(MemCtx, mem, mem_self, (96, 8, 8));
+        field!(MemCtx, mem, icount_ptr, (104, 8, 8));
+        field!(MemCtx, mem, watch_bits_ptr, (112, 8, 8));
+        field!(MemCtx, mem, code_range_ptr, (120, 8, 8));
+        field!(MemCtx, mem, dispatch_word_ptr, (128, 8, 8));
+        field!(MemCtx, mem, helper_operand_addr, (136, 8, 8));
+        field!(MemCtx, mem, helper_operand_size, (144, 8, 8));
+        field!(MemCtx, mem, time_enabled, (152, 8, 8));
+        assert_eq!(offsets.gpr, 0);
+        assert_eq!(offsets.rip, 128);
+        assert_eq!(offsets.fs_base, 136);
+        assert_eq!(offsets.gs_base, 144);
+        assert_eq!(offsets.cf, 152);
+        assert_eq!(offsets.pf_src, 153);
+        assert_eq!(offsets.af_src, 154);
+        assert_eq!(offsets.zf, 155);
+        assert_eq!(offsets.sf, 156);
+        assert_eq!(offsets.of, 157);
+        assert_eq!(offsets.df, 158);
+        assert_eq!(offsets.xmm, 160);
+        assert_eq!(offsets.ymm_hi, 672);
+        assert_eq!(offsets.zmm_hi, 1184);
+        assert_eq!(offsets.kmask, 2208);
+        assert_eq!(offsets.mxcsr, 3572);
+        assert_eq!(offsets.fpr, 2272);
+        assert_eq!(offsets.fpu_top, 2352);
+        assert_eq!(offsets.fpu_empty, 2402);
+        assert_eq!(offsets.fpu_sw, 2404);
+        assert_eq!(offsets.fpu_fip, 2408);
+        assert_eq!(offsets.fpu_fdp, 2416);
+        assert_eq!(offsets.fpu_fds, 2428);
+        assert_eq!(offsets.fpu_fcs, 2426);
+        assert_eq!(offsets.fpu_fop, 2424);
+        assert_eq!(offsets.cs, 2394);
+        assert_eq!(RET_CONTINUE, 0);
+        assert_eq!(RET_SYSCALL, 1);
+        assert_eq!(RET_HLT, 2);
+        assert_eq!(RET_UNMAPPED, 3);
+        assert_eq!(RET_CHAIN, 4);
+        assert_eq!(RET_LINK, 5);
+        assert_eq!(RET_EXCEPTION, 6);
+        assert_eq!(RET_IBTC_MISS, 7);
+        assert_eq!(RET_MMIO_DEFER, 8);
+        assert_eq!(RET_PORTIO_DEFER, 9);
+        assert_eq!(RET_INTERRUPTED, 10);
+        assert_eq!(RET_HOST_FAULT, 11);
+        assert_eq!(RET_MXCSR_CHANGED, 12);
+        assert_eq!(RET_UNMAPPED_DETAIL, 13);
+        assert_eq!(RET_EXCEPTION_DETAIL, 14);
+        assert_eq!(RET_HOST_FAULT_DETAIL, 15);
+        assert_eq!(RET_RETURN_MISS, 16);
+        assert_eq!(MAX_GUEST_ACCESS_DESCRIPTORS, 249);
+        assert_eq!(RET_STACK_LEN, 64);
+        assert_eq!(MEMCTX_BASE, 0);
+        assert_eq!(MEMCTX_SIZE, 8);
+        assert_eq!(MEMCTX_FAULT_ADDR, 16);
+        assert_eq!(MEMCTX_FAULT_SIZE, 24);
+        assert_eq!(MEMCTX_FAULT_ACCESS, 32);
+        assert_eq!(MEMCTX_NEXT_ENTRY, 40);
+        assert_eq!(MEMCTX_LINK_SLOT, 48);
+        assert_eq!(MEMCTX_FUEL, 56);
+        assert_eq!(MEMCTX_RET_STACK, 64);
+        assert_eq!(MEMCTX_GUEST_BASE, 72);
+        assert_eq!(MEMCTX_EXCEPTION_VECTOR, 80);
+        assert_eq!(MEMCTX_WATCH_COUNT_PTR, 88);
+        assert_eq!(MEMCTX_MEM_SELF, 96);
+        assert_eq!(MEMCTX_ICOUNT_PTR, 104);
+        assert_eq!(MEMCTX_WATCH_BITS_PTR, 112);
+        assert_eq!(MEMCTX_CODE_RANGE_PTR, 120);
+        assert_eq!(MEMCTX_DISPATCH_WORD_PTR, 128);
+        assert_eq!(RETSTACK_SP, 0);
+        assert_eq!(RETSTACK_ENTRIES, 8);
+        assert_eq!(RETSTACK_STRIDE, 16);
+        assert_eq!((size_of::<Flags>(), align_of::<Flags>()), (8, 1));
+        assert_eq!((size_of::<MemCtx>(), align_of::<MemCtx>()), (160, 8));
+        assert_eq!(
+            (size_of::<CpuOffsets>(), align_of::<CpuOffsets>()),
+            (104, 4)
+        );
+        assert_eq!((size_of::<RetStack>(), align_of::<RetStack>()), (1032, 8));
+        assert_eq!(align_of::<CpuState>(), 16);
+        assert_eq!(offset_of!(CpuState, legacy), 3664);
+    }
+}

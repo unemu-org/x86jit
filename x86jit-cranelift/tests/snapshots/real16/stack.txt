@@ -1,0 +1,271 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        ReadReg {
+            dst: 0,
+            reg: Rax,
+        },
+        ReadReg {
+            dst: 1,
+            reg: Rsp,
+        },
+        Sub {
+            dst: 2,
+            a: Temp(
+                1,
+            ),
+            b: Imm(
+                2,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        And {
+            dst: 2,
+            a: Temp(
+                2,
+            ),
+            b: Imm(
+                65535,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        ReadReg {
+            dst: 3,
+            reg: Ss,
+        },
+        Shl {
+            dst: 4,
+            a: Temp(
+                3,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 5,
+            a: Temp(
+                2,
+            ),
+            b: Temp(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Store {
+            fault: MemoryAccess(
+                10,
+            ),
+            addr: Temp(
+                5,
+            ),
+            src: Temp(
+                0,
+            ),
+            size: 2,
+            order: None,
+        },
+        WriteReg {
+            reg: Rsp,
+            src: Temp(
+                2,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4097,
+        },
+        ReadReg {
+            dst: 6,
+            reg: Rsp,
+        },
+        ReadReg {
+            dst: 7,
+            reg: Ss,
+        },
+        Shl {
+            dst: 8,
+            a: Temp(
+                7,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 9,
+            a: Temp(
+                6,
+            ),
+            b: Temp(
+                8,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Load {
+            fault: MemoryAccess(
+                10,
+            ),
+            dst: 10,
+            addr: Temp(
+                9,
+            ),
+            size: 2,
+        },
+        Add {
+            dst: 11,
+            a: Temp(
+                6,
+            ),
+            b: Imm(
+                2,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        And {
+            dst: 11,
+            a: Temp(
+                11,
+            ),
+            b: Imm(
+                65535,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        WriteReg {
+            reg: Rsp,
+            src: Temp(
+                11,
+            ),
+            size: 2,
+        },
+        WriteReg {
+            reg: Rbx,
+            src: Temp(
+                10,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4098,
+        },
+        ReadReg {
+            dst: 12,
+            reg: Rsp,
+        },
+        Sub {
+            dst: 13,
+            a: Temp(
+                12,
+            ),
+            b: Imm(
+                2,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        And {
+            dst: 13,
+            a: Temp(
+                13,
+            ),
+            b: Imm(
+                65535,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        ReadReg {
+            dst: 14,
+            reg: Ss,
+        },
+        Shl {
+            dst: 15,
+            a: Temp(
+                14,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 16,
+            a: Temp(
+                13,
+            ),
+            b: Temp(
+                15,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Store {
+            fault: MemoryAccess(
+                0,
+            ),
+            addr: Temp(
+                16,
+            ),
+            src: Imm(
+                4101,
+            ),
+            size: 2,
+            order: None,
+        },
+        WriteReg {
+            reg: Rsp,
+            src: Temp(
+                13,
+            ),
+            size: 2,
+        },
+        Jump {
+            target: Imm(
+                4105,
+            ),
+        },
+    ],
+    temp_count: 17,
+    guest_len: 5,
+    icount: 3,
+}

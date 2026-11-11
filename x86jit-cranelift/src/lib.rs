@@ -22,6 +22,14 @@
 #![cfg(feature = "jit")]
 
 #[cfg(test)]
+extern crate self as x86jit_cranelift;
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
+#[path = "../tests/application_codegen.rs"]
+mod application_codegen;
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
+application_codegen::relocated_codegen_witnesses!();
+
+#[cfg(test)]
 mod batch_tests;
 #[cfg(feature = "jit")]
 mod code_memory;
@@ -3934,6 +3942,9 @@ impl Shared {
         precise_split_stores: bool,
         finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
     ) -> Result<T, CompileError> {
+        if ir.legacy_context.is_some() {
+            return Err(CompileError::BackendError);
+        }
         let icount_on = self.icount_on();
         self.define_with_fault_info(
             CompiledCodeKind::Block,
@@ -4001,6 +4012,9 @@ impl Shared {
         precise_split_stores: bool,
         finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
     ) -> Result<T, CompileError> {
+        if region.blocks.iter().any(|b| b.legacy_context.is_some()) {
+            return Err(CompileError::BackendError);
+        }
         let icount_on = self.icount_on();
         self.define_with_fault_info(
             CompiledCodeKind::Region,

@@ -1,0 +1,81 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        WriteReg {
+            reg: Rax,
+            src: Imm(
+                4660,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4099,
+        },
+        ReadReg {
+            dst: 0,
+            reg: Rax,
+        },
+        ReadReg {
+            dst: 1,
+            reg: Rbx,
+        },
+        Add {
+            dst: 2,
+            a: Temp(
+                0,
+            ),
+            b: Temp(
+                1,
+            ),
+            size: 2,
+            set_flags: FlagMask(
+                63,
+            ),
+        },
+        WriteReg {
+            reg: Rax,
+            src: Temp(
+                2,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4101,
+        },
+        ReadReg {
+            dst: 3,
+            reg: Rsi,
+        },
+        Add {
+            dst: 4,
+            a: Temp(
+                3,
+            ),
+            b: Imm(
+                1,
+            ),
+            size: 2,
+            set_flags: FlagMask(
+                62,
+            ),
+        },
+        WriteReg {
+            reg: Rsi,
+            src: Temp(
+                4,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4102,
+        },
+        Hlt,
+    ],
+    temp_count: 5,
+    guest_len: 7,
+    icount: 4,
+}

@@ -1226,6 +1226,7 @@ mod tests {
 
     fn pending_region(c: &TranslationCache) -> u64 {
         let ir = Arc::new(IrBlock {
+            legacy_context: None,
             mode: CpuMode::Long64,
             guest_start: 0x1000,
             guest_len: 4,

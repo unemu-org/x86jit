@@ -142,6 +142,7 @@ pub mod interp;
 pub mod interruption;
 pub mod ir;
 pub mod jit_abi;
+pub mod legacy;
 pub mod lift;
 pub mod lockstep;
 pub mod memory;
@@ -159,7 +160,9 @@ pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
 pub use child::{ChildArena, ChildFault, ChildRefusal, ChildStep, ChildView};
 pub use codemap::{GuestAccessKind, GuestTrapSite};
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
-pub use exit::{AccessKind, ExecutionEvidence, Exit, PortDir, StepResult};
+pub use exit::{
+    AccessKind, ExecutionEvidence, Exit, PortDir, StepResult, UnsupportedSystemOperation,
+};
 pub use fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,
     FaultHelper, FaultMetadata, FaultOrigin, FaultPath, FaultProgress, HelperCaller,
@@ -175,6 +178,11 @@ pub use ir::{
     AesOp, BitScanOp, BtOp, Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, GfniOp,
     HFloatOp, HIntOp, IrBlock, IrOp, IrRegion, MemOrder, PackedBinOp, PackedCvtKind, RegionCaps,
     RepKind, RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
+};
+pub use legacy::{
+    derive_legacy_context, CpuGeneration, ExecutionProfile, LegacyContextError, LegacyCpuModel,
+    LegacyCpuState, LegacyDecodeContext, LegacyRegime, SegmentCache, SegmentId, SystemSegment,
+    TableRegister,
 };
 pub use lift::CpuMode;
 pub use memory::{

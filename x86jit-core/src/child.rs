@@ -256,6 +256,7 @@ impl ChildArena {
         let _ = decoder.decode();
         Self {
             ir: IrBlock {
+                legacy_context: None,
                 mode: crate::CpuMode::Long64,
                 guest_start: 0,
                 guest_len: 0,

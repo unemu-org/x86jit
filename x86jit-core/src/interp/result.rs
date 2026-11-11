@@ -88,11 +88,18 @@ pub(crate) enum InterpExit {
     CodeSpaceExhausted {
         addr: u64,
     },
+    UnsupportedSystemContext {
+        addr: u64,
+        operation: crate::UnsupportedSystemOperation,
+    },
 }
 impl InterpExit {
     #[inline(always)]
     pub(super) fn from_exit(exit: Exit) -> Self {
         match exit {
+            Exit::UnsupportedSystemContext { addr, operation } => {
+                Self::UnsupportedSystemContext { addr, operation }
+            }
             Exit::Syscall => Self::Syscall,
             Exit::Hlt => Self::Hlt,
             exit @ Exit::UnmappedMemory { addr, access, .. } => {
@@ -149,6 +156,9 @@ impl InterpExit {
     #[inline(always)]
     pub(crate) fn into_exit(self) -> Exit {
         match self {
+            Self::UnsupportedSystemContext { addr, operation } => {
+                Exit::UnsupportedSystemContext { addr, operation }
+            }
             Self::Syscall => Exit::Syscall,
             Self::Hlt => Exit::Hlt,
             Self::DetailedUnmapped { addr, access } => consume(memory_key(addr, access))

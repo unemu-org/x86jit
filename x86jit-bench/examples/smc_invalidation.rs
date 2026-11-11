@@ -42,6 +42,7 @@ fn main() {
     for i in 0..count {
         let pc = 0x10000 + i * 4096;
         let ir = IrBlock {
+            legacy_context: None,
             mode: CpuMode::Long64,
             guest_start: pc,
             guest_len: 1,

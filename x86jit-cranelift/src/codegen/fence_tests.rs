@@ -294,6 +294,7 @@ fn fence_clobbers_alias_analysis_loads() {
                 ]);
                 let ctx = compile_ir(
                     &IrBlock {
+                        legacy_context: None,
                         mode: x86jit_core::CpuMode::Long64,
                         ops,
                         temp_count: 3,
@@ -581,6 +582,7 @@ fn guest_memory_helpers_follow_host_and_tier_rule() {
         cases.push((
             name,
             IrBlock {
+                legacy_context: None,
                 mode: x86jit_core::CpuMode::Long64,
                 ops: vec![op, IrOp::Hlt],
                 temp_count: 0,

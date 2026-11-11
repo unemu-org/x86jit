@@ -1,0 +1,61 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        ReadReg {
+            dst: 0,
+            reg: Ds,
+        },
+        Shl {
+            dst: 1,
+            a: Temp(
+                0,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        ReadReg {
+            dst: 2,
+            reg: Es,
+        },
+        Shl {
+            dst: 3,
+            a: Temp(
+                2,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        RepStringReal {
+            op: Movs,
+            elem: 2,
+            rep: Rep,
+            ds_base: Temp(
+                1,
+            ),
+            es_base: Temp(
+                3,
+            ),
+        },
+        InsnStart {
+            guest_addr: 4098,
+        },
+        Hlt,
+    ],
+    temp_count: 4,
+    guest_len: 3,
+    icount: 2,
+}

@@ -41,6 +41,16 @@ pub enum PortDir {
     Out,
 }
 
+/// Engine operations whose system-context implementation is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedSystemOperation {
+    LegacyExecution,
+    LegacyStepping,
+    ApplicationIrqDelivery,
+    InvalidLegacyContext(crate::legacy::LegacyContextError),
+}
+
 /// Reason `run()` returned control to the user (§5.2).
 ///
 /// MMIO exits describe one transfer of at most eight bytes. A wider memory
@@ -256,6 +266,12 @@ pub enum Exit {
     /// as fatal.
     #[non_exhaustive]
     CodeSpaceExhausted { addr: u64 },
+    /// Unsupported engine scope; no guest effect and no architectural fault.
+    #[non_exhaustive]
+    UnsupportedSystemContext {
+        addr: u64,
+        operation: UnsupportedSystemOperation,
+    },
 }
 
 impl Exit {

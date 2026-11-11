@@ -746,6 +746,7 @@ fn generic_ir_does_not_prove_a_decode_cause() {
     };
     for vector in [10, 11, 12, 13, 14, 17] {
         let ir = IrBlock {
+            legacy_context: None,
             mode: x86jit_core::CpuMode::Long64,
             guest_start: CODE,
             guest_len: 15,

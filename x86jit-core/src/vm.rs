@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
-use crate::exit::{Exit, StepResult};
+use crate::exit::{Exit, StepResult, UnsupportedSystemOperation};
 use crate::interruption::{CriticalSectionKind, EngineSection};
 use crate::ir::{IrBlock, IrRegion, RegionCaps};
 use crate::jit_abi::{
@@ -15,6 +15,7 @@ use crate::jit_abi::{
     RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_RETURN_MISS, RET_SYSCALL,
     RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
+use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
     lift_block_with_fault, lift_region, lift_region_with_fault, CpuMode, FetchAddr, LiftError,
 };
@@ -146,6 +147,7 @@ pub trait Backend: Send + Sync {
     /// case) emits the historical `host = base + guest_addr`; a non-zero base emits the
     /// rebased `host = base + (guest_addr - guest_base)` plus a lower-bound reject, so
     /// the zero-base hot path is byte-identical.
+    /// Legacy-context IR must be rejected before entering application codegen.
     fn materialize(
         &self,
         ir: &IrBlock,
@@ -164,6 +166,10 @@ pub trait Backend: Send + Sync {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        assert!(
+            ir.legacy_context.is_none(),
+            "legacy IR cannot enter application materialization"
+        );
         if mxcsr_mode != 0 {
             return CachedBlock::Interpreted(Arc::new(ir.clone()));
         }
@@ -179,6 +185,10 @@ pub trait Backend: Send + Sync {
         guest_base: u64,
         mxcsr_mode: u32,
     ) -> CachedBlock {
+        assert!(
+            region.blocks.iter().all(|b| b.legacy_context.is_none()),
+            "legacy IR cannot enter application materialization"
+        );
         if mxcsr_mode != 0 {
             return CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()));
         }
@@ -198,6 +208,10 @@ pub trait Backend: Send + Sync {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        assert!(
+            ir.legacy_context.is_none(),
+            "legacy IR cannot enter application materialization"
+        );
         if precise_split_stores {
             return CachedBlock::Interpreted(Arc::new(ir.clone()));
         }
@@ -215,6 +229,10 @@ pub trait Backend: Send + Sync {
         mxcsr_mode: u32,
         precise_split_stores: bool,
     ) -> CachedBlock {
+        assert!(
+            region.blocks.iter().all(|b| b.legacy_context.is_none()),
+            "legacy IR cannot enter application materialization"
+        );
         if precise_split_stores {
             return CachedBlock::Interpreted(Arc::new(region.blocks[0].clone()));
         }
@@ -444,6 +462,10 @@ impl Backend for InterpreterBackend {
         _mmio: Option<(u64, u64)>,
         _guest_base: u64,
     ) -> CachedBlock {
+        assert!(
+            ir.legacy_context.is_none(),
+            "legacy IR cannot enter application materialization"
+        );
         CachedBlock::Interpreted(Arc::new(ir.clone()))
     }
 }
@@ -644,6 +666,9 @@ pub struct Vm {
     /// in one mode (the §17 scope fence — no runtime mode switching); vcpus inherit it.
     /// Default [`CpuMode::Long64`]; select via [`Vm::set_cpu_mode`] before spawning vcpus.
     mode: CpuMode,
+    profile: ExecutionProfile,
+    legacy_model: Option<LegacyCpuModel>,
+    profile_locked: std::sync::atomic::AtomicBool,
 }
 
 impl Vm {
@@ -884,7 +909,7 @@ impl Vm {
         caps: RegionCaps,
         mxcsr: u32,
     ) -> Result<(), ForceRegionError> {
-        if self.mode == CpuMode::Real16 {
+        if self.profile == ExecutionProfile::LegacySystem || self.mode == CpuMode::Real16 {
             return Err(ForceRegionError::UnsupportedMode);
         }
         if self.backend.region_caps().is_none() {
@@ -1034,11 +1059,41 @@ impl Vm {
     /// it — runs under. Call before [`new_vcpu`](Vm::new_vcpu). Default is
     /// [`CpuMode::Long64`]. [`CpuMode::Real16`] always uses the interpreter, regardless
     /// of the injected backend or tier-up/region policy.
+    /// Selects Application and clears any previously selected legacy model.
+    /// Existing Application vCPUs retain their contexts when this selects the
+    /// mode for later vCPUs. Panics when leaving LegacySystem after vCPU creation.
     pub fn set_cpu_mode(&mut self, mode: CpuMode) {
+        assert!(
+            self.profile != ExecutionProfile::LegacySystem
+                || !self.profile_locked.load(Ordering::Relaxed),
+            "select execution profile before vCPU creation"
+        );
+        self.profile = ExecutionProfile::Application(mode);
+        self.legacy_model = None;
         self.mode = mode;
     }
 
-    /// The guest decode/lift mode new vcpus inherit (§17.3).
+    /// Select system execution and an immutable model before any vCPU is created.
+    /// Panics after vCPU creation, including after all such vCPUs are dropped.
+    /// Execution currently returns a typed unsupported-system exit.
+    pub fn set_legacy_cpu_model(&mut self, model: LegacyCpuModel) {
+        assert!(
+            !self.profile_locked.load(Ordering::Relaxed),
+            "select execution profile before vCPU creation"
+        );
+        self.profile = ExecutionProfile::LegacySystem;
+        self.legacy_model = Some(model);
+    }
+
+    pub fn execution_profile(&self) -> ExecutionProfile {
+        self.profile
+    }
+
+    pub fn legacy_cpu_model(&self) -> Option<LegacyCpuModel> {
+        self.legacy_model
+    }
+
+    /// Application decode metadata (§17.3), unchanged by selecting LegacySystem.
     pub fn cpu_mode(&self) -> CpuMode {
         self.mode
     }
@@ -1078,6 +1133,9 @@ impl Vm {
             source_ids: self.source_ids.clone(),
             x87_precision: self.x87_precision,
             mode: self.mode,
+            profile: self.profile,
+            legacy_model: self.legacy_model,
+            profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: self.lockstep_trace.clone(),
         })
     }
@@ -1106,6 +1164,9 @@ impl Vm {
             source_ids: Arc::new(Mutex::new(SourceIds::default())),
             x87_precision: crate::state::X87Precision::default(),
             mode: CpuMode::Long64,
+            profile: ExecutionProfile::Application(CpuMode::Long64),
+            legacy_model: None,
+            profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: None,
         }
     }
@@ -1355,7 +1416,12 @@ impl Vm {
     }
 
     fn make_vcpu(&self, id: u64, overrides: crate::features::CpuidOverrides) -> Vcpu {
-        let mut cpu = CpuState::new();
+        self.profile_locked.store(true, Ordering::Relaxed);
+        let mut cpu = if self.profile == ExecutionProfile::LegacySystem {
+            CpuState::legacy_real_entry([0; 6])
+        } else {
+            CpuState::new()
+        };
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_pointer_model = self.x87_pointer_model;
         cpu.cpuid_table = self.cpuid_table.clone();
@@ -1383,6 +1449,8 @@ impl Vm {
             syscall_evidence: None,
             engine_sections: AtomicU64::new(0),
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
+            profile: self.profile,
+            legacy_model: self.legacy_model,
             fast: Box::new(
                 [FastEntry {
                     rip: 0,
@@ -1531,6 +1599,8 @@ pub struct Vcpu {
     /// [`BlockKey`] a translation is cached under (§17.4). Constant for the vcpu's life
     /// (no runtime mode switching — the §17 scope fence).
     mode: CpuMode,
+    profile: ExecutionProfile,
+    legacy_model: Option<LegacyCpuModel>,
     /// Fast-resolve cache: a vcpu-private, direct-mapped RIP→compiled
     /// entry map that replaces the shared `RwLock<HashMap>` lookup (plus its two
     /// atomic counter bumps) for the transfers the chain loop can't chain — returns,
@@ -1655,18 +1725,30 @@ impl Vcpu {
         self.fast_hits
     }
 
-    /// Queue a pending maskable **hardware interrupt** for real-mode delivery (§17.6,
-    /// sub-seam c). `vector` is the IVT entry the embedder's PIC resolved (INTA);
-    /// x86jit does NOT model a PIC/8259 — computing the vector and updating the PIC's
-    /// in-service/ISR state on acknowledge is the **embedder's** responsibility, done
-    /// before it calls this. The interrupt is delivered at the next [`Vcpu::run`]
-    /// boundary (never mid-block) once ALL hold: IF is set, no memory/port completion is
-    /// outstanding (`pending_mmio`/`pending_mmio_write`/`pending_port_in`), and the STI
-    /// shadow has elapsed. If injection is currently blocked the vector stays queued —
-    /// it is never silently dropped — and fires at the first boundary the gates open,
-    /// including the boundary after a `hlt` wakeup. Only one interrupt is queued at a
-    /// time (a real PIC re-asserts INTR for further lines after the embedder EOIs, so a
-    /// later `inject_irq` overwrites a still-pending vector). Real-mode only.
+    pub fn execution_profile(&self) -> ExecutionProfile {
+        self.profile
+    }
+
+    pub fn legacy_cpu_model(&self) -> Option<LegacyCpuModel> {
+        self.legacy_model
+    }
+
+    fn unsupported_legacy(&self, operation: UnsupportedSystemOperation) -> Exit {
+        let model = self.legacy_model.expect("LegacySystem has a model");
+        let operation = crate::legacy::derive_legacy_context(model, &self.cpu)
+            .err()
+            .map_or(operation, UnsupportedSystemOperation::InvalidLegacyContext);
+        Exit::UnsupportedSystemContext {
+            addr: self.cpu.rip,
+            operation,
+        }
+    }
+
+    /// Queue one manual maskable IRQ vector; a subsequent injection overwrites it.
+    /// Queueing neither acknowledges a controller nor constructs a delivery frame.
+    /// Application Real16 retains its existing delivery/readiness contract.
+    /// Application Long64/Compat32 positive runs refuse with the vector retained;
+    /// legacy execution/delivery is currently unavailable.
     pub fn inject_irq(&mut self, vector: u8) {
         self.pending_irq = Some(vector);
     }
@@ -1687,7 +1769,9 @@ impl Vcpu {
     /// IF and the STI/SS shadows follow SDM Vol 3A §7.8.1 and §7.8.3;
     /// device-completion blocking follows decision-16 §§1, 4.
     pub fn irq_ready(&self) -> bool {
-        self.mode == CpuMode::Real16 && !self.cpu.mmio_retry_active && self.irq_delivery_ready()
+        self.profile == ExecutionProfile::Application(CpuMode::Real16)
+            && !self.cpu.mmio_retry_active
+            && self.irq_delivery_ready()
     }
 
     // The dispatcher handles active MMIO retries before reaching its IRQ gate;
@@ -1985,6 +2069,11 @@ impl Vcpu {
     /// (resume deferred MMIO through [`Vcpu::run`]). An answered INS first
     /// attempts its pending store and returns without executing another element.
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
+        if self.profile == ExecutionProfile::LegacySystem {
+            return StepResult::Exit(
+                self.unsupported_legacy(UnsupportedSystemOperation::LegacyStepping),
+            );
+        }
         if self.cpu.port_string_in.is_some() {
             let result = if vm.mem.host_fault_recovery() {
                 self.finish_port_string_in::<true>(vm)
@@ -2064,13 +2153,18 @@ impl Vcpu {
         self.fault_entry.handle()
     }
 
-    /// Execute at most `max_steps` units on the Real16 interpreter, including
-    /// when the VM has a compiling backend (decision-16 §§1–4).
+    /// Execute at most `max_steps` units for [`ExecutionProfile::Application`]
+    /// with [`CpuMode::Real16`], including when the VM has a compiling backend
+    /// (decision-16 §§1–4). Application Long64/Compat32 return
+    /// [`StepRunError::UnsupportedMode`], including with a zero budget.
+    /// [`ExecutionProfile::LegacySystem`] returns a zero-step typed
+    /// [`Exit::UnsupportedSystemContext`] refusal, including with a zero budget;
+    /// it never executes or delivers events.
     ///
     /// A unit is one completed instruction or one completed REP iteration. Empty
     /// REP counts once. IN/OUT count at handoff; supplying an IN value adds no unit.
-    /// A positive call with pending IN is refused. Other modes are always refused.
-    /// Zero returns budget exhaustion without fetching, delivering, consuming a
+    /// A positive call with pending IN is refused. For Application Real16,
+    /// zero returns budget exhaustion without fetching, delivering, consuming a
     /// completion, changing shadows, clearing retries, or consuming host requests.
     ///
     /// Instruction exits win over exhaustion. At other boundaries: budget, host
@@ -2088,6 +2182,14 @@ impl Vcpu {
         max_steps: u64,
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
+        if self.profile == ExecutionProfile::LegacySystem {
+            return Ok(StepRun {
+                steps: 0,
+                stop: StepStop::Exit(
+                    self.unsupported_legacy(UnsupportedSystemOperation::LegacyStepping),
+                ),
+            });
+        }
         if self.mode != CpuMode::Real16 {
             return Err(StepRunError::UnsupportedMode);
         }
@@ -2313,6 +2415,17 @@ impl Vcpu {
     /// have made partial progress and resumes at the string instruction. Evidence
     /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+        self.interruption_evidence = None;
+        self.syscall_evidence = None;
+        if self.profile == ExecutionProfile::LegacySystem {
+            return self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution);
+        }
+        if self.mode != CpuMode::Real16 && budget != Some(0) && self.pending_irq.is_some() {
+            return Exit::UnsupportedSystemContext {
+                addr: self.cpu.rip,
+                operation: UnsupportedSystemOperation::ApplicationIrqDelivery,
+            };
+        }
         let time_run = crate::time_stats::RunGuard::enter(
             self.time_record.clone(),
             vm.time_enabled,
@@ -2320,8 +2433,6 @@ impl Vcpu {
         );
         let dispatch = DispatchGuard::new(self, vm);
         let cpu = &mut *dispatch.cpu;
-        cpu.interruption_evidence = None;
-        cpu.syscall_evidence = None;
         cpu.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
@@ -2618,7 +2729,8 @@ impl Vcpu {
             // the embedder injects and re-enters, and RIP already sits past the `hlt`, so
             // delivery vectors the handler and `iret` resumes past the `hlt`. The
             // embedder owns the PIC: it must have run INTA / updated the ISR before
-            // `inject_irq`. Real-mode only (Long64/Compat32 never set `pending_irq`).
+            // `inject_irq`. The public entry guard refuses queued application IRQs
+            // outside Real16 before this dispatcher is entered.
             if let Some(vector) = self.pending_irq {
                 if self.irq_delivery_ready() {
                     if !DEFAULT {
@@ -3763,6 +3875,10 @@ fn finish_single(
     permit: Option<&crate::FetchPermit>,
     compile_generation: u64,
 ) -> Option<CachedBlock> {
+    assert!(
+        ir.legacy_context.is_none(),
+        "legacy IR cannot enter application materialization"
+    );
     if permit.is_some_and(|p| !p.is_current()) {
         return None;
     }
@@ -3817,6 +3933,159 @@ fn lift_exit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_ir_is_rejected_before_application_backend_and_region_formation() {
+        use crate::legacy::{CpuGeneration, LegacyCpuModel};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        struct Probe(AtomicU64);
+        impl Backend for Probe {
+            fn materialize(
+                &self,
+                _: &IrBlock,
+                _: MemConsistency,
+                _: Option<(u64, u64)>,
+                _: u64,
+            ) -> CachedBlock {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                panic!("legacy IR entered backend");
+            }
+        }
+        let context = crate::derive_legacy_context(
+            LegacyCpuModel {
+                generation: CpuGeneration::I386,
+                model_semantics_id: 1,
+            },
+            &CpuState::legacy_real_entry([0; 6]),
+        )
+        .unwrap();
+        let ir = IrBlock {
+            mode: CpuMode::Compat32,
+            guest_start: 0,
+            ops: Vec::new(),
+            temp_count: 0,
+            guest_len: 0,
+            icount: 0,
+            legacy_context: Some(context),
+        };
+        let region = IrRegion {
+            entry: 0,
+            blocks: vec![ir.clone()],
+            has_loop: true,
+        };
+        let backend = Probe(AtomicU64::new(0));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| backend.materialize_with_mxcsr(
+                &ir,
+                MemConsistency::Fast,
+                None,
+                0,
+                0
+            )))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| backend.materialize_with_split_stores(
+                &ir,
+                MemConsistency::Fast,
+                None,
+                0,
+                0,
+                true
+            )))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| backend.materialize_region_with_mxcsr(
+                &region,
+                MemConsistency::Fast,
+                None,
+                0,
+                0
+            )))
+            .is_err()
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| backend
+            .materialize_region_with_split_stores(
+                &region,
+                MemConsistency::Fast,
+                None,
+                0,
+                0,
+                true
+            )))
+        .is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| crate::lift::static_succs(&ir))).is_err());
+        assert_eq!(backend.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unsupported_irq_preserves_the_exact_queued_vector() {
+        for mode in [CpuMode::Compat32, CpuMode::Long64] {
+            let mut vm = Vm::new(VmConfig::flat(4096));
+            vm.set_cpu_mode(mode);
+            let mut cpu = vm.new_vcpu();
+            cpu.inject_irq(0x41);
+            cpu.inject_irq(0x82);
+            for budget in [Some(1), None] {
+                assert!(matches!(
+                    cpu.run(&vm, budget),
+                    Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::ApplicationIrqDelivery,
+                        ..
+                    }
+                ));
+                assert_eq!(cpu.pending_irq, Some(0x82));
+            }
+        }
+    }
+
+    #[test]
+    fn irq_refusal_clears_evidence_from_the_previous_run() {
+        for mode in [CpuMode::Compat32, CpuMode::Long64] {
+            for interrupted in [false, true] {
+                let mut vm = Vm::new(VmConfig::flat(0x2000));
+                vm.set_cpu_mode(mode);
+                vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x1000, &[0x0f, 0x05, 0xf4]).unwrap();
+                let mut cpu = vm.new_vcpu();
+                cpu.cpu.rip = 0x1000;
+                if interrupted {
+                    cpu.exit_request().request_exit();
+                    assert!(matches!(cpu.run(&vm, None), Exit::Interrupted));
+                    assert!(cpu.interruption_evidence().is_some());
+                } else {
+                    assert!(matches!(cpu.run(&vm, None), Exit::Syscall));
+                    assert!(cpu.syscall_evidence().is_some());
+                }
+                cpu.cpu.pending_mmio = Some(42);
+                cpu.cpu.pending_port_in = Some(1);
+                cpu.cpu.mmio_retry_active = true;
+                cpu.inject_irq(0x82);
+                let state = format!("{:?}", cpu.cpu);
+                let retired = cpu.retired_instructions();
+                let executed = cpu.executed_instructions();
+                let mut bytes = vec![0; 0x2000];
+                vm.read_bytes(0, &mut bytes).unwrap();
+                assert!(matches!(
+                    cpu.run(&vm, None),
+                    Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::ApplicationIrqDelivery,
+                        ..
+                    }
+                ));
+                assert!(cpu.syscall_evidence().is_none());
+                assert!(cpu.interruption_evidence().is_none());
+                assert_eq!(cpu.pending_irq, Some(0x82));
+                assert_eq!(format!("{:?}", cpu.cpu), state);
+                assert_eq!(cpu.retired_instructions(), retired);
+                assert_eq!(cpu.executed_instructions(), executed);
+                let mut after = vec![0; 0x2000];
+                vm.read_bytes(0, &mut after).unwrap();
+                assert_eq!(after, bytes);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -1,0 +1,163 @@
+IrBlock {
+    mode: Real16,
+    guest_start: 4096,
+    ops: [
+        InsnStart {
+            guest_addr: 4096,
+        },
+        ReadReg {
+            dst: 0,
+            reg: Rbx,
+        },
+        ReadReg {
+            dst: 1,
+            reg: Rsi,
+        },
+        Add {
+            dst: 2,
+            a: Temp(
+                0,
+            ),
+            b: Temp(
+                1,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        And {
+            dst: 3,
+            a: Temp(
+                2,
+            ),
+            b: Imm(
+                65535,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        SegLimitCheck {
+            offset: Temp(
+                3,
+            ),
+            size: 2,
+            vector: 13,
+            fault_ip: 4096,
+        },
+        ReadReg {
+            dst: 4,
+            reg: Ds,
+        },
+        Shl {
+            dst: 5,
+            a: Temp(
+                4,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 6,
+            a: Temp(
+                3,
+            ),
+            b: Temp(
+                5,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Load {
+            fault: MemoryAccess(
+                8,
+            ),
+            dst: 7,
+            addr: Temp(
+                6,
+            ),
+            size: 2,
+        },
+        WriteReg {
+            reg: Rax,
+            src: Temp(
+                7,
+            ),
+            size: 2,
+        },
+        InsnStart {
+            guest_addr: 4098,
+        },
+        ReadReg {
+            dst: 8,
+            reg: Rax,
+        },
+        SegLimitCheck {
+            offset: Imm(
+                8192,
+            ),
+            size: 2,
+            vector: 13,
+            fault_ip: 4098,
+        },
+        ReadReg {
+            dst: 9,
+            reg: Ds,
+        },
+        Shl {
+            dst: 10,
+            a: Temp(
+                9,
+            ),
+            b: Imm(
+                4,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Add {
+            dst: 11,
+            a: Imm(
+                8192,
+            ),
+            b: Temp(
+                10,
+            ),
+            size: 8,
+            set_flags: FlagMask(
+                0,
+            ),
+        },
+        Store {
+            fault: MemoryAccess(
+                8,
+            ),
+            addr: Temp(
+                11,
+            ),
+            src: Temp(
+                8,
+            ),
+            size: 2,
+            order: None,
+        },
+        InsnStart {
+            guest_addr: 4102,
+        },
+        Hlt,
+    ],
+    temp_count: 12,
+    guest_len: 7,
+    icount: 3,
+}

@@ -256,6 +256,12 @@ fn interpret_steps_ordered<
     info: &mut RetireInfo,
     steps: &mut StepContext,
 ) -> BlockResult {
+    if ir.legacy_context.is_some() {
+        return BlockResult::exit(Exit::UnsupportedSystemContext {
+            addr: cpu.rip,
+            operation: crate::UnsupportedSystemOperation::LegacyExecution,
+        });
+    }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
         interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, true, STOP_WHEN_IRQ_READY>(
@@ -335,6 +341,8 @@ pub(crate) fn step_one_mode<const ROUTED: bool>(
     result
 }
 
+/// Execute application IR. Legacy-context IR returns a typed unsupported exit
+/// before changing CPU, memory, scratch storage, or retirement bookkeeping.
 pub fn interpret_block(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -342,6 +350,12 @@ pub fn interpret_block(
     scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
+    if ir.legacy_context.is_some() {
+        return StepResult::Exit(Exit::UnsupportedSystemContext {
+            addr: cpu.rip,
+            operation: crate::UnsupportedSystemOperation::LegacyExecution,
+        });
+    }
     let _fp_mode = crate::jit_abi::fp::RunMode::new();
     if mem.host_fault_recovery() {
         interpret_block_mode::<true>(ir, cpu, mem, scratch, info)
@@ -486,6 +500,12 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
     scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> BlockResult {
+    if ir.legacy_context.is_some() {
+        return BlockResult::exit(Exit::UnsupportedSystemContext {
+            addr: cpu.rip,
+            operation: crate::UnsupportedSystemOperation::LegacyExecution,
+        });
+    }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
         interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false>(
@@ -11897,5 +11917,88 @@ fn apply_un_f64_mode<const DEFAULT: bool>(x: f64, op: FloatUnOp, mode: u32) -> f
         apply_un_f64(x, op)
     } else {
         f64::from_bits(softfloat::unary(x.to_bits(), true, op, mode))
+    }
+}
+
+#[cfg(test)]
+mod legacy_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn cached_and_stepped_walks_refuse_before_scratch_or_bookkeeping() {
+        struct NoScratch;
+        impl ScratchBuffer for NoScratch {
+            fn zeroed(&mut self, _: usize) -> &mut [u64] {
+                panic!("legacy IR allocated interpreter scratch")
+            }
+        }
+        let mut mem = Memory::new(crate::MemoryModel::Flat { size: 4096 });
+        mem.map(0, 4096, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        mem.write_bytes(0, &[0xb8, 0x34, 0x12, 0, 0, 0xf4]).unwrap();
+        let mut ir = crate::lift::lift_block(
+            &mem,
+            crate::lift::FetchAddr::flat(0),
+            crate::CpuMode::Long64,
+        )
+        .unwrap();
+        ir.legacy_context = Some(
+            crate::derive_legacy_context(
+                crate::LegacyCpuModel {
+                    generation: crate::CpuGeneration::I386,
+                    model_semantics_id: 1,
+                },
+                &CpuState::legacy_real_entry([0; 6]),
+            )
+            .unwrap(),
+        );
+        let mut cpu = CpuState::default();
+        let before = format!("{cpu:?}");
+        for consistency in [
+            crate::MemConsistency::Fast,
+            crate::MemConsistency::AcqRel,
+            crate::MemConsistency::FullTso,
+        ] {
+            let mut info = RetireInfo {
+                retired: 17,
+                sti_shadow: true,
+                ss_shadow: true,
+                consistency,
+                ..RetireInfo::default()
+            };
+            let bookkeeping = format!("{info:?}");
+            let mut steps = StepContext::new(1);
+            for result in [
+                interpret_block_fp::<false, true>(&ir, &mut cpu, &mem, &mut NoScratch, &mut info),
+                interpret_block_fp::<true, false>(&ir, &mut cpu, &mem, &mut NoScratch, &mut info),
+                interpret_block_steps::<false, true, false>(
+                    &ir,
+                    &mut cpu,
+                    &mem,
+                    &mut NoScratch,
+                    &mut info,
+                    &mut steps,
+                ),
+                interpret_block_steps::<true, false, true>(
+                    &ir,
+                    &mut cpu,
+                    &mem,
+                    &mut NoScratch,
+                    &mut info,
+                    &mut steps,
+                ),
+            ] {
+                assert!(matches!(
+                    result.into_step(),
+                    StepResult::Exit(Exit::UnsupportedSystemContext {
+                        operation: crate::UnsupportedSystemOperation::LegacyExecution,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(steps.remaining, 1);
+            assert_eq!(format!("{info:?}"), bookkeeping);
+            assert_eq!(format!("{cpu:?}"), before);
+        }
     }
 }

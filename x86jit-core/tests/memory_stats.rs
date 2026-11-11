@@ -53,6 +53,7 @@ fn cache_replacements_and_stale_upgrades_preserve_accounting() {
     let cache = TranslationCache::new();
     let key = BlockKey::new(0x1000, CpuMode::Long64);
     let ir = Arc::new(IrBlock {
+        legacy_context: None,
         mode: CpuMode::Long64,
         guest_start: 0x1000,
         ops: Vec::new(),

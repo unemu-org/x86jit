@@ -27,6 +27,7 @@ fn main() {
     measure("compile1000", || {
         let jit = JitBackend::new();
         let mut ir = IrBlock {
+            legacy_context: None,
             mode: x86jit_core::CpuMode::Long64,
             guest_start: 0x1000,
             ops: vec![IrOp::Hlt],

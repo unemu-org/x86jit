@@ -3561,7 +3561,8 @@ impl IrOp {
 /// A lifted basic block, keyed by guest start address in the cache (§6.3).
 #[derive(Clone, Debug)]
 pub struct IrBlock {
-    /// Decode mode, including the width of the sequential instruction pointer.
+    /// Application decode mode. With `legacy_context`, this is compatibility
+    /// metadata, never a legacy regime or stack-size input.
     pub mode: crate::CpuMode,
     pub guest_start: u64,
     pub ops: Vec<IrOp>,
@@ -3571,6 +3572,8 @@ pub struct IrBlock {
     pub guest_len: u32,
     /// x86 instruction count (for budget/stats).
     pub icount: u32,
+    /// Authoritative legacy context; application lifting always leaves this absent.
+    pub legacy_context: Option<crate::legacy::LegacyDecodeContext>,
 }
 
 impl IrBlock {
