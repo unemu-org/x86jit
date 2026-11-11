@@ -2,11 +2,19 @@
 //! spec.md §§3, 17). Real execution is interpreted separately from Application.
 use crate::{CpuMode, CpuState};
 
-/// Fixed application contexts and explicitly opted-in system execution.
+/// Fixed Application contexts and model-selected Machine execution (decision-23 §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionProfile {
     Application(CpuMode),
-    LegacySystem,
+    /// Processor execution selected by a CPU model (decision-23 §1).
+    Machine,
+}
+
+impl ExecutionProfile {
+    /// Compatibility name for [`Self::Machine`] (decision-23, Migration M1).
+    #[allow(non_upper_case_globals)]
+    #[deprecated(note = "use ExecutionProfile::Machine (decision-23 §1)")]
+    pub const LegacySystem: Self = Self::Machine;
 }
 
 /// Per-VM routing of processor exceptions (decision-23 §5). Software INT
@@ -39,8 +47,9 @@ pub enum CpuGeneration {
     I386,
 }
 
-/// Shared model-profile boundary. The embedder supplies a stable identity for
-/// all model policies; the CPU-model catalogue owns presets, not this module.
+/// Compatibility model boundary retained by decision-23, Migration M1.
+/// The deprecated selector preserves this embedder-supplied identity; new callers
+/// select [`crate::CpuModel`] and its catalogue-owned identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LegacyCpuModel {
     pub generation: CpuGeneration,
@@ -50,17 +59,17 @@ pub struct LegacyCpuModel {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum LegacyRegime {
+pub enum MachineRegime {
     Real,
     Protected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LegacyDecodeContext {
+pub struct MachineContext {
     /// Instruction-generation policy, independent of decoder width.
     pub generation: CpuGeneration,
     /// Real or protected execution regime derived from the retained CPU state.
-    pub regime: LegacyRegime,
+    pub regime: MachineRegime,
     /// Default operand width (16 or 32 bits) before instruction prefixes.
     pub default_operand_bits: u8,
     /// Default effective-address width (16 or 32 bits) before instruction prefixes.
@@ -77,7 +86,7 @@ pub struct LegacyDecodeContext {
 /// These are configuration refusals, not synthesized guest exceptions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LegacyContextError {
+pub enum MachineContextError {
     ProtectedModeRequires286,
     PagingRequires386,
     PagingRequiresProtectedMode,
@@ -90,6 +99,18 @@ pub enum LegacyContextError {
     Virtual8086Unsupported,
     DebugTrapUnsupported,
 }
+
+/// Compatibility name for [`MachineContext`] (decision-23, Migration M1).
+#[deprecated(note = "use MachineContext (decision-23 §5)")]
+pub type LegacyDecodeContext = MachineContext;
+
+/// Compatibility name for [`MachineRegime`] (decision-23, Migration M1).
+#[deprecated(note = "use MachineRegime (decision-23, Migration M1)")]
+pub type LegacyRegime = MachineRegime;
+
+/// Compatibility name for [`MachineContextError`] (decision-23, Migration M1).
+#[deprecated(note = "use MachineContextError (decision-23, Migration M1)")]
+pub type LegacyContextError = MachineContextError;
 
 /// Engine layout, not the packed guest table-register operand image.
 /// SDM Vol 3A §2.4: table registers retain base and limit.
@@ -164,8 +185,8 @@ pub struct LegacyCpuState {
 pub fn derive_legacy_context(
     model: LegacyCpuModel,
     cpu: &CpuState,
-) -> Result<LegacyDecodeContext, LegacyContextError> {
-    use LegacyContextError::*;
+) -> Result<MachineContext, MachineContextError> {
+    use MachineContextError::*;
     let state = &cpu.legacy;
     let protected = state.cr0 & 1 != 0;
     let paging = state.cr0 & (1 << 31) != 0;
@@ -231,12 +252,12 @@ pub fn derive_legacy_context(
     } else {
         16
     };
-    Ok(LegacyDecodeContext {
+    Ok(MachineContext {
         generation: model.generation,
         regime: if protected {
-            LegacyRegime::Protected
+            MachineRegime::Protected
         } else {
-            LegacyRegime::Real
+            MachineRegime::Real
         },
         default_operand_bits: bits,
         default_address_bits: bits,
@@ -297,7 +318,7 @@ impl CpuState {
         segment: SegmentId,
         selector: u16,
         cache: SegmentCache,
-    ) -> Result<(), LegacyContextError> {
+    ) -> Result<(), MachineContextError> {
         let mut proposed = self.clone();
         *match segment {
             SegmentId::Cs => &mut proposed.cs,
@@ -312,7 +333,7 @@ impl CpuState {
             && matches!(segment, SegmentId::Cs | SegmentId::Ss)
             && selector & 3 != u16::from(proposed.legacy.cpl)
         {
-            return Err(LegacyContextError::SelectorPrivilegeMismatch);
+            return Err(MachineContextError::SelectorPrivilegeMismatch);
         }
         derive_legacy_context(model, &proposed)?;
         *self = proposed;
@@ -385,12 +406,12 @@ mod tests {
                                 if let Ok(context) = result {
                                     assert_eq!(
                                         context,
-                                        LegacyDecodeContext {
+                                        MachineContext {
                                             generation,
                                             regime: if pe {
-                                                LegacyRegime::Protected
+                                                MachineRegime::Protected
                                             } else {
-                                                LegacyRegime::Real
+                                                MachineRegime::Real
                                             },
                                             default_operand_bits: if cs_d { 32 } else { 16 },
                                             default_address_bits: if cs_d { 32 } else { 16 },
@@ -468,7 +489,7 @@ mod tests {
                     ..cache
                 }
             ),
-            Err(LegacyContextError::InvalidStorage)
+            Err(MachineContextError::InvalidStorage)
         );
         assert_eq!(cpu.ss, 0x1234);
         assert_eq!(cpu.legacy, before);
@@ -476,7 +497,7 @@ mod tests {
         cpu.legacy.cpl = 0;
         assert_eq!(
             cpu.set_legacy_segment(model, SegmentId::Ss, 3, cache),
-            Err(LegacyContextError::SelectorPrivilegeMismatch)
+            Err(MachineContextError::SelectorPrivilegeMismatch)
         );
         assert_eq!(cpu.ss, 0x1234);
     }
@@ -485,68 +506,68 @@ mod tests {
     fn invalid_storage_and_unsupported_facilities_are_explicit() {
         let model = model(CpuGeneration::I386);
         type StateEdit = fn(&mut CpuState);
-        let cases: &[(StateEdit, LegacyContextError)] = &[
-            (|c| c.legacy.cpl = 4, LegacyContextError::InvalidPrivilege),
-            (|c| c.legacy.cpl = 1, LegacyContextError::InvalidPrivilege),
+        let cases: &[(StateEdit, MachineContextError)] = &[
+            (|c| c.legacy.cpl = 4, MachineContextError::InvalidPrivilege),
+            (|c| c.legacy.cpl = 1, MachineContextError::InvalidPrivilege),
             (
                 |c| c.legacy.a20_enabled = 2,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.reset_fetch = 2,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.gdtr.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.idtr.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.ldtr.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.tr.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.segments[0].attributes |= 0x100,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.segments[0].attributes |= 0x2000,
-                LegacyContextError::LongModeUnsupported,
+                MachineContextError::LongModeUnsupported,
             ),
             (
                 |c| c.legacy.segments[0].unusable = 1,
-                LegacyContextError::UnusableCodeOrStack,
+                MachineContextError::UnusableCodeOrStack,
             ),
             (
                 |c| c.legacy.segments[3].unusable = 1,
-                LegacyContextError::UnusableCodeOrStack,
+                MachineContextError::UnusableCodeOrStack,
             ),
             (
                 |c| c.legacy.segments[5].unusable = 2,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.ldtr.cache.reserved = 1,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.legacy.tr.cache.attributes = 0x100,
-                LegacyContextError::InvalidStorage,
+                MachineContextError::InvalidStorage,
             ),
             (
                 |c| c.rflags_system = 1 << 17,
-                LegacyContextError::Virtual8086Unsupported,
+                MachineContextError::Virtual8086Unsupported,
             ),
         ];
         for (edit, error) in cases {

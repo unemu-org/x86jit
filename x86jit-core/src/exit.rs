@@ -52,7 +52,7 @@ pub enum UnsupportedSystemOperation {
     LegacyTaskReturn,
     LegacyEntryFacility,
     ApplicationIrqDelivery,
-    InvalidLegacyContext(crate::legacy::LegacyContextError),
+    InvalidLegacyContext(crate::legacy::MachineContextError),
     LegacyLdtSelector,
     LegacyGateOrTaskTransfer,
     LegacyPrivilegeTransition,

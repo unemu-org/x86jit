@@ -3582,7 +3582,7 @@ pub struct IrBlock {
     /// x86 instruction count (for budget/stats).
     pub icount: u32,
     /// Authoritative legacy context; application lifting always leaves this absent.
-    pub legacy_context: Option<crate::legacy::LegacyDecodeContext>,
+    pub legacy_context: Option<crate::legacy::MachineContext>,
 }
 
 impl IrBlock {

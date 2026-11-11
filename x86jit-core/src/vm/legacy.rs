@@ -2,8 +2,7 @@
 //! spec.md §§9, 17). No application cache/backend entry is used here.
 use super::*;
 use crate::legacy::{
-    derive_legacy_context, CpuGeneration, LegacyCpuState, LegacyDecodeContext, LegacyRegime,
-    SegmentId,
+    derive_legacy_context, CpuGeneration, LegacyCpuState, MachineContext, MachineRegime, SegmentId,
 };
 use iced_x86::{Decoder, DecoderError, DecoderOptions};
 
@@ -14,7 +13,7 @@ struct LegacyBlockKey {
     model_semantics_id: u64,
     decode_bits: u8,
     stack_bits: u8,
-    regime: LegacyRegime,
+    regime: MachineRegime,
     decode_ip: u32,
     linear_fetch: u32,
     mxcsr_mode: u32,
@@ -204,7 +203,7 @@ impl Execution {
         vm: &Vm,
         cpu: &CpuState,
         model: LegacyCpuModel,
-        context: LegacyDecodeContext,
+        context: MachineContext,
     ) -> Result<Arc<IrBlock>, Exit> {
         let linear_fetch = crate::legacy::access(
             cpu,
@@ -273,7 +272,7 @@ impl Execution {
     }
 }
 
-fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8>, Exit> {
+fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
     // I286 PRM Appendix B #GP p. B-9: instructions are at most ten bytes.
     let length_limit = if context.generation == CpuGeneration::I286 {
@@ -348,7 +347,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8
 }
 
 impl Vcpu {
-    pub(super) fn legacy_context_for_run(&self) -> Result<LegacyDecodeContext, Exit> {
+    pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
         let context = derive_legacy_context(model, &self.cpu).map_err(|e| {
             Exit::UnsupportedSystemContext {
@@ -484,11 +483,11 @@ impl Vcpu {
     fn deliver_legacy_event<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
-        context: LegacyDecodeContext,
+        context: MachineContext,
         mut event: PendingEvent,
     ) -> Result<(), Exit> {
         // Decision-23 §5: processor exceptions can be exposed without delivery.
-        if context.regime == LegacyRegime::Protected
+        if context.regime == MachineRegime::Protected
             && self.exception_delivery == crate::ExceptionDelivery::Outward
             && matches!(event.source, EventSource::SingleStep)
         {
@@ -557,7 +556,7 @@ impl Vcpu {
                         return Err(exit);
                     }
                     self.apply_pending_a20();
-                    if context.regime == LegacyRegime::Real
+                    if context.regime == MachineRegime::Real
                         && self.exception_delivery == crate::ExceptionDelivery::Outward
                     {
                         // Real-address Outward contract: the fault is returned and a
@@ -611,7 +610,7 @@ impl Vcpu {
     fn route_legacy_exception<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
-        context: LegacyDecodeContext,
+        context: MachineContext,
         exit: Exit,
     ) -> Result<(), Exit> {
         if self.exception_delivery != crate::ExceptionDelivery::InGuest {
@@ -858,6 +857,7 @@ impl Vcpu {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Compatibility selector witnesses.
 mod tests {
     use super::*;
 

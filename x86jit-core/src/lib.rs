@@ -163,6 +163,7 @@ pub mod lift;
 pub mod lockstep;
 pub mod memory;
 mod memory_stats;
+pub mod model;
 pub mod pclmul;
 mod process_barrier;
 pub use process_barrier::SourceBarrierMode;
@@ -212,16 +213,19 @@ pub use ir::{
     RepKind, RmwOp, ShaOp, StrOp, Temp, TempGen, VKLogicOp, VLogicOp, Val, VpUnaryOp,
 };
 pub use legacy::{
-    derive_legacy_context, CpuGeneration, ExceptionDelivery, ExecutionProfile, LegacyContextError,
-    LegacyCpuModel, LegacyCpuState, LegacyDecodeContext, LegacyRegime, SegmentCache, SegmentId,
+    derive_legacy_context, CpuGeneration, ExceptionDelivery, ExecutionProfile, LegacyCpuModel,
+    LegacyCpuState, MachineContext, MachineContextError, MachineRegime, SegmentCache, SegmentId,
     SystemSegment, TableRegister,
 };
+#[allow(deprecated)]
+pub use legacy::{LegacyContextError, LegacyDecodeContext, LegacyRegime};
 pub use lift::CpuMode;
 pub use memory::{
     FetchPermit, FetchVerdict, HostRam, HostRamError, MapError, MemError, MemTrap, Memory,
     MemoryModel, Prot, RegionKind,
 };
 pub use memory_stats::{BackendMemoryStats, CacheMemoryStats, MemoryStats, VcpuMemoryStats};
+pub use model::{CpuModel, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming};
 pub use state::{
     CpuSource, CpuState, Flags, FpuModel, RandomKind, Reg, TscSample, X87PointerModel,
     X87Precision, AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,

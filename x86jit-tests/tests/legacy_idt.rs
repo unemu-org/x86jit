@@ -8,6 +8,7 @@ use x86jit_core::{
 fn setup(generation: CpuGeneration, code: &[u8]) -> (Vm, Vcpu) {
     setup_delivery(generation, code, ExceptionDelivery::Outward)
 }
+#[allow(deprecated)] // Compatibility API witness.
 fn setup_delivery(
     generation: CpuGeneration,
     code: &[u8],

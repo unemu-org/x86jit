@@ -1805,3 +1805,32 @@ end faults. An SS-relative operand faults with #GP (vector 13), although SDM Vol
 §3.3 FLD (Real-Address Mode Exceptions) and 80386 PRM §14.7 item 7 prescribe #SS
 (vector 12). This deliberate divergence keeps x87 consistent with the engine's
 existing Real16 scalar policy.
+
+
+### 17.10 CPU-model catalogue and Machine profile
+
+Decision-23 §§1–4 and Migration M1 add `CpuModel::{I80286, I80386}` and a static
+`ModelProfile` catalogue. `Vm::set_cpu_model` selects `ExecutionProfile::Machine`
+before vCPU creation. Catalogue entries own the ISA/generation projection,
+named quirks, system-register family, physical-address width, instruction-length
+limit, available FPU pairings, optional timing table and stable semantics identity.
+The existing generation-based execution checks remain in place; no lowering,
+interpretation, address translation or timing changes in this migration step.
+Timing entries are absent, and FPU pairings currently accept `Present` and `None`.
+Later model and FPU variants extend non-exhaustive enums.
+
+`Vm::set_fpu_model` fixes the construction default (initially `Present`) before
+any vCPU exists. New vCPUs inherit it, forks preserve it, and the per-vCPU setter
+remains an override. `new_vcpu` validates the VM default against a selected
+catalogue entry's FPU pairings.
+
+`ExecutionProfile::LegacySystem` is a deprecated associated constant for
+`Machine`, including in patterns. `Vm::set_legacy_cpu_model` remains a deprecated
+compatibility selector preserving the supplied generation and semantics identity.
+State storage and its ABI keep their existing names and layout.
+
+`Vm::set_cpu_model` defaults to InGuest exception delivery (decision-23 §5);
+`Vm::set_legacy_cpu_model` keeps Outward for compatibility. Either default can be
+overridden with `Vm::set_exception_delivery`. `set_cpu_mode(Real16)` still
+selects the existing Application Real16 path at M1, with frozen IR snapshots.
+Long64/Compat32 lowering, cache keys and generated code are unchanged.

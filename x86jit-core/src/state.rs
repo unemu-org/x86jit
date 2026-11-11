@@ -457,9 +457,9 @@ pub struct CpuState {
     pub fpu_emulation: bool,
 }
 
-/// Coprocessor component of the future shared `LegacyCpuModel` profile
-/// (decision-18 §1). This is a policy value, not a CPU preset catalogue.
-/// Selection is per vCPU so CPUs sharing memory and cached IR remain independent.
+/// Coprocessor policy independent of the CPU model (decision-23 §4).
+/// `Vm::set_fpu_model` sets the construction default; `Vcpu::set_fpu_model`
+/// remains an override so CPUs sharing memory and cached IR stay independent.
 ///
 /// Real16 limit checks: an x87 memory operand that does not fit below the segment
 /// end faults in both models, including the default. An SS-relative operand

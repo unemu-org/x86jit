@@ -1,6 +1,8 @@
 //! Physical A20 witnesses: SDM Vol 3A §11.7.13.4 (physical bit 20),
 //! Vol 3B §§23.1.1, 25.33.1 (real-address wrap); 80386 PRM §14.7 item 18;
 //! I286 PRM Appendix C item 16. Decision-22 applies the board gate to I286/I386.
+#[path = "support/model_api.rs"]
+mod model_api;
 use x86jit_core::{
     AccessKind, AddressSpace, Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, Exit,
     IrBlock, Knowledge, LegacyCpuModel, MemConsistency, Prot, RegionKind, ResetOptions, SegmentId,
@@ -22,10 +24,13 @@ impl Backend for NoBackend {
 }
 fn setup(generation: CpuGeneration, code: &[u8], selectors: [u16; 6]) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x400000), Box::new(NoBackend));
-    vm.set_legacy_cpu_model(LegacyCpuModel {
-        generation,
-        model_semantics_id: 1,
-    });
+    crate::model_api::select(
+        &mut vm,
+        LegacyCpuModel {
+            generation,
+            model_semantics_id: 1,
+        },
+    );
     vm.map(0, 0x400000, Prot::RWX, RegionKind::Ram).unwrap();
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
@@ -47,6 +52,11 @@ fn bytes(vm: &Vm, addr: u64, count: usize) -> Vec<u8> {
     let mut result = vec![0; count];
     vm.read_bytes(addr, &mut result).unwrap();
     result
+}
+
+#[test]
+fn fetch_ffff_0010_and_toggle_between_runs_cpu_model() {
+    crate::model_api::with_cpu_model(fetch_ffff_0010_and_toggle_between_runs);
 }
 
 #[test]
@@ -72,6 +82,11 @@ fn fetch_ffff_0010_and_toggle_between_runs() {
 }
 
 #[test]
+fn fetch_instruction_straddling_ffff_000f_cpu_model() {
+    crate::model_api::with_cpu_model(fetch_instruction_straddling_ffff_000f);
+}
+
+#[test]
 fn fetch_instruction_straddling_ffff_000f() {
     for generation in GENERATIONS {
         let (vm, mut cpu) = setup(generation, &[], [0xffff, 0, 0, 0, 0, 0]);
@@ -85,6 +100,11 @@ fn fetch_instruction_straddling_ffff_000f() {
             assert_eq!(cpu.cpu.gpr[0], if enabled { 0x5678 } else { 0x1234 });
         }
     }
+}
+
+#[test]
+fn fetch_policy_and_fault_address_follow_the_physical_alias_cpu_model() {
+    crate::model_api::with_cpu_model(fetch_policy_and_fault_address_follow_the_physical_alias);
 }
 
 #[test]
@@ -140,6 +160,11 @@ fn assert_bus_fault(stop: &StepStop, linear: u64, physical: u64) {
 }
 
 #[test]
+fn gated_fetch_and_data_faults_keep_both_address_spaces_cpu_model() {
+    crate::model_api::with_cpu_model(gated_fetch_and_data_faults_keep_both_address_spaces);
+}
+
+#[test]
 fn gated_fetch_and_data_faults_keep_both_address_spaces() {
     for generation in GENERATIONS {
         // Fetch a later byte across the physical discontinuity as well as the
@@ -192,6 +217,11 @@ fn gated_fetch_and_data_faults_keep_both_address_spaces() {
 }
 
 #[test]
+fn data_reads_and_writes_at_and_across_one_mib_cpu_model() {
+    crate::model_api::with_cpu_model(data_reads_and_writes_at_and_across_one_mib);
+}
+
+#[test]
 fn data_reads_and_writes_at_and_across_one_mib() {
     for generation in GENERATIONS {
         for offset in [0xfu16, 0x10] {
@@ -241,6 +271,11 @@ fn data_reads_and_writes_at_and_across_one_mib() {
 }
 
 #[test]
+fn strings_read_write_and_rep_crossing_cpu_model() {
+    crate::model_api::with_cpu_model(strings_read_write_and_rep_crossing);
+}
+
+#[test]
 fn strings_read_write_and_rep_crossing() {
     for generation in GENERATIONS {
         for enabled in [false, true] {
@@ -283,6 +318,11 @@ fn strings_read_write_and_rep_crossing() {
 }
 
 #[test]
+fn stack_push_and_pop_at_and_across_wrap_cpu_model() {
+    crate::model_api::with_cpu_model(stack_push_and_pop_at_and_across_wrap);
+}
+
+#[test]
 fn stack_push_and_pop_at_and_across_wrap() {
     for generation in GENERATIONS {
         for offset in [0xf, 0x10] {
@@ -310,6 +350,13 @@ fn stack_push_and_pop_at_and_across_wrap() {
             }
         }
     }
+}
+
+#[test]
+fn table_operand_and_descriptor_reads_and_accessed_write_are_gated_cpu_model() {
+    crate::model_api::with_cpu_model(
+        table_operand_and_descriptor_reads_and_accessed_write_are_gated,
+    );
 }
 
 #[test]
@@ -350,6 +397,11 @@ fn table_operand_and_descriptor_reads_and_accessed_write_are_gated() {
 }
 
 #[test]
+fn relocated_ivt_and_interrupt_stack_use_the_gate_cpu_model() {
+    crate::model_api::with_cpu_model(relocated_ivt_and_interrupt_stack_use_the_gate);
+}
+
+#[test]
 fn relocated_ivt_and_interrupt_stack_use_the_gate() {
     // SDM Vol 3B §23.1.4; I286 PRM §10.2: retained IDTR base.
     for generation in GENERATIONS {
@@ -366,6 +418,11 @@ fn relocated_ivt_and_interrupt_stack_use_the_gate() {
             assert_eq!(bytes(&vm, if enabled { 0x100000 } else { 0 }, 2), [2, 0x10]);
         }
     }
+}
+
+#[test]
+fn only_bit_twenty_is_masked_in_protected_mode_cpu_model() {
+    crate::model_api::with_cpu_model(only_bit_twenty_is_masked_in_protected_mode);
 }
 
 #[test]
@@ -386,6 +443,11 @@ fn only_bit_twenty_is_masked_in_protected_mode() {
 }
 
 #[test]
+fn crossing_two_mib_preserves_the_next_higher_address_bit_cpu_model() {
+    crate::model_api::with_cpu_model(crossing_two_mib_preserves_the_next_higher_address_bit);
+}
+
+#[test]
 fn crossing_two_mib_preserves_the_next_higher_address_bit() {
     for generation in GENERATIONS {
         let (vm, mut cpu) = setup(generation, b"\xa1\x0f\x00\xa3\x0f\x00", [0; 6]);
@@ -403,6 +465,11 @@ fn crossing_two_mib_preserves_the_next_higher_address_bit() {
         assert_eq!(bytes(&vm, 0x200000, 1), [0x12]);
         assert_eq!(bytes(&vm, 0x1fffff, 1), [0xbb]);
     }
+}
+
+#[test]
+fn dword_split_handles_every_boundary_position_cpu_model() {
+    crate::model_api::with_cpu_model(dword_split_handles_every_boundary_position);
 }
 
 #[test]
@@ -436,6 +503,13 @@ fn dword_split_handles_every_boundary_position() {
 }
 
 #[test]
+fn split_store_faults_before_committing_ram_and_names_physical_address_cpu_model() {
+    crate::model_api::with_cpu_model(
+        split_store_faults_before_committing_ram_and_names_physical_address,
+    );
+}
+
+#[test]
 fn split_store_faults_before_committing_ram_and_names_physical_address() {
     for generation in GENERATIONS {
         let (mut vm, mut cpu) = setup(generation, b"\xa3\x0f\x00", [0, 0xffff, 0, 0, 0, 0]);
@@ -462,6 +536,11 @@ fn split_store_faults_before_committing_ram_and_names_physical_address() {
         assert_eq!(bytes(&vm, 0xfffff, 1), [0xaa]);
         assert_eq!(cpu.cpu.rip, 0x1000);
     }
+}
+
+#[test]
+fn split_mmio_read_and_write_complete_with_physical_parts_cpu_model() {
+    crate::model_api::with_cpu_model(split_mmio_read_and_write_complete_with_physical_parts);
 }
 
 #[test]
@@ -518,6 +597,13 @@ fn split_mmio_read_and_write_complete_with_physical_parts() {
 }
 
 #[test]
+fn changing_line_defers_until_mmio_read_retires_and_same_value_is_a_noop_cpu_model() {
+    crate::model_api::with_cpu_model(
+        changing_line_defers_until_mmio_read_retires_and_same_value_is_a_noop,
+    );
+}
+
+#[test]
 fn changing_line_defers_until_mmio_read_retires_and_same_value_is_a_noop() {
     for generation in GENERATIONS {
         let (mut vm, mut cpu) = setup(generation, b"\xa1\x10\x00", [0, 0xffff, 0, 0, 0, 0]);
@@ -564,6 +650,13 @@ fn changing_line_defers_until_mmio_read_retires_and_same_value_is_a_noop() {
         steps(&mut cpu, &vm, 1);
         assert_eq!(cpu.cpu.gpr[0], 0x1234);
     }
+}
+
+#[test]
+fn changing_line_keeps_completed_device_write_and_pending_acknowledgment_cpu_model() {
+    crate::model_api::with_cpu_model(
+        changing_line_keeps_completed_device_write_and_pending_acknowledgment,
+    );
 }
 
 #[test]
@@ -630,6 +723,11 @@ fn changing_line_keeps_completed_device_write_and_pending_acknowledgment() {
 }
 
 #[test]
+fn changing_line_keeps_movsw_consumed_device_read_cpu_model() {
+    crate::model_api::with_cpu_model(changing_line_keeps_movsw_consumed_device_read);
+}
+
+#[test]
 fn changing_line_keeps_movsw_consumed_device_read() {
     for generation in GENERATIONS {
         for acknowledge_first in [false, true] {
@@ -690,6 +788,13 @@ fn changing_line_keeps_movsw_consumed_device_read() {
 // pp. 4-564–568: suspension preserves the next element and updated count;
 // REP services pending interrupts before executing the next element.
 #[test]
+fn line_change_at_rep_iteration_boundary_uses_new_line_for_next_element_cpu_model() {
+    crate::model_api::with_cpu_model(
+        line_change_at_rep_iteration_boundary_uses_new_line_for_next_element,
+    );
+}
+
+#[test]
 fn line_change_at_rep_iteration_boundary_uses_new_line_for_next_element() {
     for generation in GENERATIONS {
         for queued_before_pause in [false, true] {
@@ -739,6 +844,11 @@ fn line_change_at_rep_iteration_boundary_uses_new_line_for_next_element() {
             }
         }
     }
+}
+
+#[test]
+fn irq_handler_changes_line_between_rep_iterations_cpu_model() {
+    crate::model_api::with_cpu_model(irq_handler_changes_line_between_rep_iterations);
 }
 
 #[test]
@@ -804,6 +914,11 @@ fn irq_handler_changes_line_between_rep_iterations() {
 }
 
 #[test]
+fn mmio_divide_fault_applies_queued_line_and_discards_retry_cpu_model() {
+    crate::model_api::with_cpu_model(mmio_divide_fault_applies_queued_line_and_discards_retry);
+}
+
+#[test]
 fn mmio_divide_fault_applies_queued_line_and_discards_retry() {
     // SDM Vol 2A DIV, pp. 3-264–266; Vol 3A §7.15, Event 0, p. 7-25:
     // a zero divisor raises #DE with the faulting IP and unchanged registers.
@@ -849,6 +964,11 @@ fn mmio_divide_fault_applies_queued_line_and_discards_retry() {
         steps(&mut cpu, &vm, 1);
         assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[0]), (0x1003, 0x1234));
     }
+}
+
+#[test]
+fn event_delivery_fault_applies_queued_line_and_discards_retry_cpu_model() {
+    crate::model_api::with_cpu_model(event_delivery_fault_applies_queued_line_and_discards_retry);
 }
 
 #[test]
@@ -939,6 +1059,13 @@ fn event_delivery_fault_applies_queued_line_and_discards_retry() {
 }
 
 #[test]
+fn divide_fault_handler_fetch_failure_does_not_leave_line_pending_cpu_model() {
+    crate::model_api::with_cpu_model(
+        divide_fault_handler_fetch_failure_does_not_leave_line_pending,
+    );
+}
+
+#[test]
 fn divide_fault_handler_fetch_failure_does_not_leave_line_pending() {
     // SDM Vol 3A §7.15, Event 0; Vol 3B §23.1.4. Legacy exceptions
     // return outward (decision-18 §4); the embedder explicitly routes vector 0
@@ -991,6 +1118,11 @@ fn divide_fault_handler_fetch_failure_does_not_leave_line_pending() {
 }
 
 #[test]
+fn reset_applies_queued_board_line_after_abandoning_retry_cpu_model() {
+    crate::model_api::with_cpu_model(reset_applies_queued_board_line_after_abandoning_retry);
+}
+
+#[test]
 fn reset_applies_queued_board_line_after_abandoning_retry() {
     let (mut vm, mut cpu) = setup(
         CpuGeneration::I386,
@@ -1011,6 +1143,11 @@ fn reset_applies_queued_board_line_after_abandoning_retry() {
     vm.write_bytes(0, b"\x34\x12").unwrap();
     steps(&mut cpu, &vm, 1);
     assert_eq!(cpu.cpu.gpr[0], 0x1234);
+}
+
+#[test]
+fn port_exit_can_toggle_line_and_reset_preserves_it_cpu_model() {
+    crate::model_api::with_cpu_model(port_exit_can_toggle_line_and_reset_preserves_it);
 }
 
 #[test]

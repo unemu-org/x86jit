@@ -115,6 +115,7 @@ fn real16_discards_queued_irq_and_both_interrupt_shadows() {
 }
 
 #[test]
+#[allow(deprecated)] // Compatibility API witness.
 fn legacy_reset_abandons_accepted_irq_delivery_and_its_mmio_reads() {
     for stepped in [false, true] {
         for answered_reads in 0..=2 {

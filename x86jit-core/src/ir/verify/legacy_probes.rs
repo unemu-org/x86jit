@@ -1,5 +1,5 @@
 use super::*;
-use crate::legacy::{CpuGeneration, LegacyDecodeContext, LegacyOp, LegacyRegime};
+use crate::legacy::{CpuGeneration, LegacyOp, MachineContext, MachineRegime};
 use iced_x86::{Code, Encoder, Instruction, OpCodeOperandKind, OpKind, Register};
 
 const IP: u64 = 0x1000;
@@ -105,10 +105,10 @@ fn encode_probe(code: Code, bits: u8, memory_operand: Option<u32>) -> Option<Vec
 #[test]
 fn every_legacy_probe_defines_temps_before_use() {
     let mut total = 0;
-    for regime in [LegacyRegime::Real, LegacyRegime::Protected] {
+    for regime in [MachineRegime::Real, MachineRegime::Protected] {
         for default_operand_bits in [16, 32] {
             for stack_address_bits in [16, 32] {
-                let context = LegacyDecodeContext {
+                let context = MachineContext {
                     generation: CpuGeneration::I386,
                     regime,
                     default_operand_bits,

@@ -5,7 +5,7 @@
 //! no error code, faulting IP for faults and next IP for INTO.
 use x86jit_core::{
     fault::{ErrorCode, FaultClass},
-    CpuGeneration, CpuState, ExceptionDelivery, Exit, LegacyCpuModel, Prot, RegionKind, SegmentId,
+    CpuGeneration, CpuModel, CpuState, ExceptionDelivery, Exit, Prot, RegionKind, SegmentId,
     StepOptions, StepStop, Vcpu, Vm, VmConfig,
 };
 
@@ -34,9 +34,9 @@ fn setup(
     vector: u8,
 ) -> (Vm, Vcpu) {
     let mut vm = Vm::new(VmConfig::flat(0x200000));
-    vm.set_legacy_cpu_model(LegacyCpuModel {
-        generation,
-        model_semantics_id: generation as u64,
+    vm.set_cpu_model(match generation {
+        CpuGeneration::I286 => CpuModel::I80286,
+        _ => CpuModel::I80386,
     });
     vm.set_exception_delivery(delivery);
     vm.map(0, 0x200000, Prot::RWX, RegionKind::Ram).unwrap();

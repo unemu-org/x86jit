@@ -2,8 +2,8 @@
 //! they claim no legacy instruction execution or descriptor-loading support.
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, ExecutionProfile, Exit,
-    ForceRegionError, InterpreterBackend, IrBlock, LegacyContextError, LegacyCpuModel,
-    LegacyCpuState, MemConsistency, Prot, RegionCaps, RegionKind, StepOptions, StepResult,
+    ForceRegionError, InterpreterBackend, IrBlock, LegacyCpuModel, LegacyCpuState,
+    MachineContextError, MemConsistency, Prot, RegionCaps, RegionKind, StepOptions, StepResult,
     StepRunError, StepStop, UnsupportedSystemOperation, Vcpu, Vm, VmConfig,
 };
 use x86jit_cranelift::JitBackend;
@@ -50,6 +50,7 @@ fn unchanged(cpu: &Vcpu, state: &str, vm: &Vm, bytes: &[u8]) {
 }
 
 #[test]
+#[allow(deprecated)] // Compatibility API witness.
 fn profile_selection_preserves_application_defaults_and_forks() {
     let mut vm = setup(Box::new(InterpreterBackend));
     assert_eq!(
@@ -139,6 +140,7 @@ fn every_application_mode_still_ignores_legacy_storage() {
 }
 
 #[test]
+#[allow(deprecated)] // Compatibility API witness.
 fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
     for backend in [
         Box::new(NoBackend) as Box<dyn Backend>,
@@ -209,7 +211,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
             cpu.run(&vm, None),
             Exit::UnsupportedSystemContext {
                 operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    LegacyContextError::PagingRequiresProtectedMode
+                    MachineContextError::PagingRequiresProtectedMode
                 ),
                 ..
             }
@@ -376,4 +378,197 @@ fn public_interpreter_refuses_legacy_ir_including_backend_fallbacks() {
             }
         }
     }
+}
+
+#[test]
+fn catalogue_pins_current_machine_profiles() {
+    use x86jit_core::{CpuModel, FpuModel, ModelIsa, ModelSystem};
+    // Decision-23 §2; I286 PRM §6.3 Fig. 6-3, Appendix B General
+    // Protection; 80386 PRM §14.7 item 18; SDM Vol 2 §2.1.
+    for (model, isa, generation, system, physical_bits, max_insn_len, id, flags_mask) in [
+        (
+            CpuModel::I80286,
+            ModelIsa::I80286,
+            CpuGeneration::I286,
+            ModelSystem::Msw286,
+            24,
+            10,
+            0x286,
+            0xf000,
+        ),
+        (
+            CpuModel::I80386,
+            ModelIsa::I80386,
+            CpuGeneration::I386,
+            ModelSystem::Cr386,
+            32,
+            15,
+            0x386,
+            0x8000,
+        ),
+    ] {
+        let profile = model.profile();
+        assert!(std::ptr::eq(profile, model.profile()));
+        assert_eq!(profile.isa, isa);
+        assert_eq!(profile.isa.generation(), generation);
+        assert_eq!(profile.system, system);
+        assert_eq!(profile.physical_bits, physical_bits);
+        assert_eq!(profile.max_insn_len, Some(max_insn_len));
+        assert_eq!(profile.semantics_id, id);
+        assert_eq!(profile.fpu, &[FpuModel::Present, FpuModel::None]);
+        assert!(profile.timing.is_none());
+        // SDM Vol 3B §§25.17.1–25.17.2; Vol 2B §4.2, SAL/SAR/SHL/SHR.
+        assert!(!profile.quirks.push_sp_after_decrement);
+        assert_eq!(profile.quirks.shift_count_mask, Some(31));
+        assert_eq!(profile.quirks.real_flags_clear_mask, flags_mask);
+    }
+}
+
+#[test]
+#[allow(deprecated)] // Compatibility API witness.
+fn model_selectors_default_exception_delivery_and_allow_overrides() {
+    use x86jit_core::{CpuModel, ExceptionDelivery};
+
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        let mut vm = setup(Box::new(NoBackend));
+        vm.set_cpu_model(model);
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::InGuest);
+        vm.set_exception_delivery(ExceptionDelivery::Outward);
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::Outward);
+        let child = vm.fork_with_backend(Box::new(NoBackend)).unwrap();
+        assert_eq!(child.exception_delivery(), ExceptionDelivery::Outward);
+
+        vm.set_cpu_model(model);
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::InGuest);
+        vm.set_legacy_cpu_model(vm.legacy_cpu_model().unwrap());
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::Outward);
+        vm.set_exception_delivery(ExceptionDelivery::InGuest);
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::InGuest);
+        let child = vm.fork_with_backend(Box::new(NoBackend)).unwrap();
+        assert_eq!(child.exception_delivery(), ExceptionDelivery::InGuest);
+
+        vm.set_legacy_cpu_model(vm.legacy_cpu_model().unwrap());
+        assert_eq!(vm.exception_delivery(), ExceptionDelivery::Outward);
+    }
+}
+
+#[test]
+fn model_and_fpu_defaults_are_inherited_and_forked() {
+    use x86jit_core::{CpuModel, FpuModel};
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        for fpu in [FpuModel::Present, FpuModel::None] {
+            let mut vm = setup(Box::new(NoBackend));
+            assert_eq!(vm.fpu_model(), FpuModel::Present);
+            vm.set_fpu_model(fpu);
+            vm.set_cpu_model(model);
+            assert_eq!(vm.execution_profile(), ExecutionProfile::Machine);
+            assert_eq!(vm.cpu_model(), Some(model));
+            assert_eq!(vm.cpu_mode(), CpuMode::Long64);
+            let mut cpu = vm.new_vcpu();
+            assert_eq!(cpu.cpu_model(), Some(model));
+            assert_eq!(cpu.execution_profile(), ExecutionProfile::Machine);
+            assert_eq!(cpu.fpu_model(), fpu);
+            assert_eq!(cpu.cpu.legacy, CpuState::legacy_real_entry([0; 6]).legacy);
+            cpu.set_fpu_model(FpuModel::None);
+            assert_eq!(vm.new_vcpu().fpu_model(), fpu);
+            let child = vm.fork_with_backend(Box::new(NoBackend)).unwrap();
+            assert_eq!(child.cpu_model(), Some(model));
+            assert_eq!(child.fpu_model(), fpu);
+            assert_eq!(child.new_vcpu().fpu_model(), fpu);
+            drop(cpu);
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || vm.set_cpu_model(model)
+            ))
+            .is_err());
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || vm.set_fpu_model(fpu)
+            ))
+            .is_err());
+        }
+    }
+}
+
+#[test]
+#[allow(deprecated)] // Compatibility API witness.
+fn model_selection_can_be_replaced_before_creation_and_cleared_by_application() {
+    use x86jit_core::CpuModel;
+    let mut vm = setup(Box::new(NoBackend));
+    vm.set_cpu_model(CpuModel::I80286);
+    vm.set_cpu_model(CpuModel::I80386);
+    assert_eq!(vm.cpu_model(), Some(CpuModel::I80386));
+    vm.set_legacy_cpu_model(MODEL);
+    assert_eq!(vm.cpu_model(), None);
+    assert_eq!(vm.legacy_cpu_model(), Some(MODEL));
+    vm.set_cpu_model(CpuModel::I80286);
+    vm.set_cpu_mode(CpuMode::Real16);
+    assert_eq!(vm.cpu_model(), None);
+    assert_eq!(vm.legacy_cpu_model(), None);
+    assert_eq!(
+        vm.execution_profile(),
+        ExecutionProfile::Application(CpuMode::Real16)
+    );
+    assert_eq!(vm.new_vcpu().cpu.legacy, LegacyCpuState::default());
+}
+
+#[test]
+fn fpu_default_applies_to_application_and_all_vcpu_constructors() {
+    use x86jit_core::FpuModel;
+    for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+        let mut vm = setup(Box::new(InterpreterBackend));
+        vm.set_cpu_mode(mode);
+        vm.set_fpu_model(FpuModel::None);
+        for cpu in [
+            vm.new_vcpu(),
+            vm.new_vcpu_with_mxcsr(0x1f80),
+            vm.new_vcpu_with_cpuid_overrides(Default::default()),
+            vm.new_vcpu_with_source_id(100).unwrap(),
+        ] {
+            assert_eq!(cpu.fpu_model(), FpuModel::None);
+            assert_eq!(cpu.execution_profile(), ExecutionProfile::Application(mode));
+            assert_eq!(cpu.cpu.legacy, LegacyCpuState::default());
+        }
+    }
+}
+
+#[test]
+#[allow(deprecated)] // Compatibility API witness.
+fn deprecated_profile_name_remains_usable_in_patterns() {
+    let mut vm = setup(Box::new(NoBackend));
+    vm.set_legacy_cpu_model(MODEL);
+    // This exhaustive match is an external-crate compile witness for the
+    // associated-constant pattern and the unchanged enum exhaustiveness.
+    let profile = match vm.execution_profile() {
+        ExecutionProfile::LegacySystem => ExecutionProfile::Machine,
+        ExecutionProfile::Application(mode) => ExecutionProfile::Application(mode),
+    };
+    assert_eq!(profile, ExecutionProfile::Machine);
+}
+
+#[test]
+#[allow(deprecated)] // Compatibility API witness.
+fn deprecated_context_types_remain_aliases_of_machine_types() {
+    use x86jit_core::{
+        derive_legacy_context, LegacyContextError, LegacyDecodeContext, LegacyRegime,
+        MachineContext, MachineContextError, MachineRegime,
+    };
+
+    let cpu = CpuState::legacy_real_entry([0; 6]);
+    let context: MachineContext = derive_legacy_context(MODEL, &cpu).unwrap();
+    let old_context: LegacyDecodeContext = LegacyDecodeContext {
+        regime: LegacyRegime::Real,
+        ..context
+    };
+    let module_context: x86jit_core::legacy::LegacyDecodeContext = old_context;
+    assert_eq!(context, module_context);
+
+    let regime: MachineRegime = LegacyRegime::Protected;
+    let old_regime: x86jit_core::legacy::LegacyRegime = regime;
+    assert!(matches!(old_regime, MachineRegime::Protected));
+
+    let mut invalid = cpu;
+    invalid.legacy.cpl = 4;
+    let error: MachineContextError = derive_legacy_context(MODEL, &invalid).unwrap_err();
+    let old_error: LegacyContextError = error;
+    let module_error: x86jit_core::legacy::LegacyContextError = old_error;
+    assert!(matches!(module_error, LegacyContextError::InvalidPrivilege));
 }

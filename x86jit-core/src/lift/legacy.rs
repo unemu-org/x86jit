@@ -1,10 +1,10 @@
 //! Explicit-context legacy lowering (decision-18 §1; spec.md §§7, 17).
 use super::*;
-use crate::legacy::{ControlRegister, LegacyDecodeContext, LegacyOp as L, SegmentId};
+use crate::legacy::{ControlRegister, LegacyOp as L, MachineContext, SegmentId};
 
 struct Ops {
     values: Vec<IrOp>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
 }
 impl std::ops::Deref for Ops {
     type Target = [IrOp];
@@ -21,7 +21,7 @@ impl LiftBuffer for Ops {
     fn push(&mut self, op: IrOp) {
         self.values.push(op);
     }
-    fn legacy_context(&self) -> Option<LegacyDecodeContext> {
+    fn legacy_context(&self) -> Option<MachineContext> {
         Some(self.context)
     }
 }
@@ -68,7 +68,7 @@ pub(crate) fn unavailable_i286_opcode(code: &[u8]) -> bool {
 pub(crate) fn instruction(
     code: &[u8],
     ip: u32,
-    context: LegacyDecodeContext,
+    context: MachineContext,
 ) -> Result<IrBlock, LiftError> {
     let mut decoder = Decoder::with_ip(
         u32::from(context.default_operand_bits),
@@ -837,7 +837,7 @@ pub(super) fn lower(
             }
             return result;
         }
-        _ if context.regime == crate::legacy::LegacyRegime::Real => {
+        _ if context.regime == crate::legacy::MachineRegime::Real => {
             // Share application instruction semantics; effective_address still
             // emits Legacy::Address and every bus access remains legacy-owned.
             let mut application = *insn;

@@ -1,9 +1,11 @@
 //! Intel 80286/80287 PRM 210498-005 (1987), cited page images checked.
 //! Same-CPL legacy interpreter witnesses; no application backend may execute.
+#[path = "support/model_api.rs"]
+mod model_api;
 use x86jit_core::fault::ErrorCode;
 use x86jit_core::{
     derive_legacy_context, Backend, CachedBlock, CpuGeneration, CpuState, Exit, IrBlock,
-    LegacyContextError, LegacyCpuModel, LegacyRegime, MemConsistency, Prot, RegionKind,
+    LegacyCpuModel, MachineContextError, MachineRegime, MemConsistency, Prot, RegionKind,
     ResetOptions, StepOptions, StepStop, UnsupportedSystemOperation, Vcpu, Vm, VmConfig,
 };
 
@@ -26,7 +28,7 @@ impl Backend for NoBackend {
 fn setup(code: &[u8], protected: bool) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x1000000), Box::new(NoBackend));
     vm.map(0, 0x1000000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.set_legacy_cpu_model(MODEL);
+    crate::model_api::select(&mut vm, MODEL);
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.cpu.rip = 0x1000;
@@ -86,6 +88,11 @@ fn fault(cpu: &mut Vcpu, vm: &Vm, vector: u8, code: Option<u32>) {
 }
 
 #[test]
+fn real_lgdt_lmsw_far_jump_data_fault_reset_and_continue_cpu_model() {
+    crate::model_api::with_cpu_model(real_lgdt_lmsw_far_jump_data_fault_reset_and_continue);
+}
+
+#[test]
 fn real_lgdt_lmsw_far_jump_data_fault_reset_and_continue() {
     // PRM Appendix B LGDT p. B-65, LMSW p. B-67; §§7.4–7.5 pp. 7-12–15.
     let (vm, mut cpu) = setup(
@@ -130,12 +137,17 @@ fn real_lgdt_lmsw_far_jump_data_fault_reset_and_continue() {
     );
     assert_eq!(
         derive_legacy_context(MODEL, &cpu.cpu).unwrap().regime,
-        LegacyRegime::Real
+        MachineRegime::Real
     );
     assert!(matches!(cpu.run(&vm, Some(10)), Exit::Hlt));
     assert_eq!((cpu.cpu.gpr[0], cpu.cpu.gpr[3]), (0xfff0, 0xcafe));
     assert_eq!(cpu.cpu.legacy.segments[1].limit, 0xffff);
     assert_eq!(cpu.cpu.legacy.segments[1].base, 0);
+}
+
+#[test]
+fn msw_word_forms_sticky_pe_and_clts_cpu_model() {
+    crate::model_api::with_cpu_model(msw_word_forms_sticky_pe_and_clts);
 }
 
 #[test]
@@ -158,6 +170,13 @@ fn msw_word_forms_sticky_pe_and_clts() {
     steps(&mut cpu, &vm, 2);
     assert_eq!(cpu.cpu.gpr[1], 0xfff1);
     assert_eq!(cpu.cpu.legacy.cr0 & 0xf, 1);
+}
+
+#[test]
+fn table_loads_ignore_sixth_byte_stores_write_ones_in_both_regimes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        table_loads_ignore_sixth_byte_stores_write_ones_in_both_regimes,
+    );
 }
 
 #[test]
@@ -187,6 +206,11 @@ fn table_loads_ignore_sixth_byte_stores_write_ones_in_both_regimes() {
 }
 
 #[test]
+fn table_images_check_all_six_bytes_before_effects_cpu_model() {
+    crate::model_api::with_cpu_model(table_images_check_all_six_bytes_before_effects);
+}
+
+#[test]
 fn table_images_check_all_six_bytes_before_effects() {
     // PRM Appendix B LGDT/SGDT pp. B-65, B-101; §7.4.1 p. 7-12.
     for load in [false, true] {
@@ -203,6 +227,13 @@ fn table_images_check_all_six_bytes_before_effects() {
         fault(&mut cpu, &vm, 13, Some(0));
         assert_eq!(bytes(&vm, 0x2200, 6), [0xa5; 6]);
     }
+}
+
+#[test]
+fn descriptors_have_no_386_flags_high_base_or_limit_and_cache_until_reload_cpu_model() {
+    crate::model_api::with_cpu_model(
+        descriptors_have_no_386_flags_high_base_or_limit_and_cache_until_reload,
+    );
 }
 
 #[test]
@@ -246,6 +277,11 @@ fn descriptors_have_no_386_flags_high_base_or_limit_and_cache_until_reload() {
 }
 
 #[test]
+fn far_calls_and_returns_use_word_frames_and_preserve_upper_sp_cpu_model() {
+    crate::model_api::with_cpu_model(far_calls_and_returns_use_word_frames_and_preserve_upper_sp);
+}
+
+#[test]
 fn far_calls_and_returns_use_word_frames_and_preserve_upper_sp() {
     // PRM Appendix B CALL p. B-23, RET pp. B-94–95; §7.5 p. 7-15.
     for indirect in [false, true] {
@@ -270,6 +306,11 @@ fn far_calls_and_returns_use_word_frames_and_preserve_upper_sp() {
             (0x1000 + code.len() as u64, 0xabcd8000)
         );
     }
+}
+
+#[test]
+fn iret_restores_protected_flags_and_refuses_a_later_task_return_cpu_model() {
+    crate::model_api::with_cpu_model(iret_restores_protected_flags_and_refuses_a_later_task_return);
 }
 
 #[test]
@@ -300,6 +341,13 @@ fn iret_restores_protected_flags_and_refuses_a_later_task_return() {
 }
 
 #[test]
+fn protected_segment_loads_report_selector_faults_without_committing_cpu_model() {
+    crate::model_api::with_cpu_model(
+        protected_segment_loads_report_selector_faults_without_committing,
+    );
+}
+
+#[test]
 fn protected_segment_loads_report_selector_faults_without_committing() {
     // PRM §7.4.1 p. 7-12; Appendix B MOV pp. B-73–74:
     // type, presence and selector-table limits are checked on load.
@@ -314,6 +362,11 @@ fn protected_segment_loads_report_selector_faults_without_committing() {
     let (vm, mut cpu) = setup(b"\x8e\xd0", true);
     cpu.cpu.gpr[0] = 0;
     fault(&mut cpu, &vm, 13, Some(0));
+}
+
+#[test]
+fn protected_far_targets_and_stack_fault_before_committing_cpu_model() {
+    crate::model_api::with_cpu_model(protected_far_targets_and_stack_fault_before_committing);
 }
 
 #[test]
@@ -335,6 +388,13 @@ fn protected_far_targets_and_stack_fault_before_committing() {
     let (vm, mut cpu) = setup(b"\x50", true);
     cpu.cpu.legacy.segments[3].limit = 0x7ffe;
     fault(&mut cpu, &vm, 12, Some(0));
+}
+
+#[test]
+fn later_instruction_encodings_and_prefixes_are_ud_in_both_regimes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        later_instruction_encodings_and_prefixes_are_ud_in_both_regimes,
+    );
 }
 
 #[test]
@@ -373,6 +433,13 @@ fn later_instruction_encodings_and_prefixes_are_ud_in_both_regimes() {
             fault(&mut cpu, &vm, 6, None);
         }
     }
+}
+
+#[test]
+fn unavailable_opcode_bytes_at_cs_limit_are_ud_before_another_fetch_cpu_model() {
+    crate::model_api::with_cpu_model(
+        unavailable_opcode_bytes_at_cs_limit_are_ud_before_another_fetch,
+    );
 }
 
 #[test]
@@ -417,6 +484,11 @@ fn unavailable_opcode_bytes_at_cs_limit_are_ud_before_another_fetch() {
 }
 
 #[test]
+fn real_word_at_ffff_faults_with_gp_for_ss_and_ds_cpu_model() {
+    crate::model_api::with_cpu_model(real_word_at_ffff_faults_with_gp_for_ss_and_ds);
+}
+
+#[test]
 fn real_word_at_ffff_faults_with_gp_for_ss_and_ds() {
     // PRM Appendix B MOV p. B-74: real-mode word operands at FFFFh
     // raise interrupt 13, including SS overrides.
@@ -429,13 +501,20 @@ fn real_word_at_ffff_faults_with_gp_for_ss_and_ds() {
 }
 
 #[test]
+fn retained_386_sizes_and_descriptor_extensions_are_refused_for_i286_cpu_model() {
+    crate::model_api::with_cpu_model(
+        retained_386_sizes_and_descriptor_extensions_are_refused_for_i286,
+    );
+}
+
+#[test]
 fn retained_386_sizes_and_descriptor_extensions_are_refused_for_i286() {
     // PRM §6.2 p. 6-2; §6.3 Fig. 6-3 p. 6-5. These are invalid
     // embedder states, so refusal precedes guest execution rather than #UD.
     for (index, attr, error) in [
-        (0, 0x4000, LegacyContextError::SizeRequires386),
-        (3, 0x4000, LegacyContextError::SizeRequires386),
-        (1, 0x8000, LegacyContextError::InvalidStorage),
+        (0, 0x4000, MachineContextError::SizeRequires386),
+        (3, 0x4000, MachineContextError::SizeRequires386),
+        (1, 0x8000, MachineContextError::InvalidStorage),
     ] {
         let (vm, mut cpu) = setup(b"\x90", true);
         cpu.cpu.legacy.segments[index].attributes |= attr;
@@ -444,6 +523,11 @@ fn retained_386_sizes_and_descriptor_extensions_are_refused_for_i286() {
             matches!(cpu.run(&vm, Some(1)), Exit::UnsupportedSystemContext { operation: UnsupportedSystemOperation::InvalidLegacyContext(actual), .. } if actual == error)
         );
     }
+}
+
+#[test]
+fn i286_instruction_length_is_ten_bytes_in_both_regimes_cpu_model() {
+    crate::model_api::with_cpu_model(i286_instruction_length_is_ten_bytes_in_both_regimes);
 }
 
 #[test]
@@ -460,6 +544,11 @@ fn i286_instruction_length_is_ten_bytes_in_both_regimes() {
         cpu.cpu.rip = 0x1000;
         fault(&mut cpu, &vm, 13, protected.then_some(0));
     }
+}
+
+#[test]
+fn real_coprocessor_execution_and_deferred_system_forms_cpu_model() {
+    crate::model_api::with_cpu_model(real_coprocessor_execution_and_deferred_system_forms);
 }
 
 #[test]
@@ -493,6 +582,11 @@ fn real_coprocessor_execution_and_deferred_system_forms() {
 }
 
 #[test]
+fn protected_tf_images_and_entry_are_supported_cpu_model() {
+    crate::model_api::with_cpu_model(protected_tf_images_and_entry_are_supported);
+}
+
+#[test]
 fn protected_tf_images_and_entry_are_supported() {
     // I286 PRM §9.7.1 p. 9-14: a flag load enables the following instruction's
     // trap. Protected #DB delivery is witnessed in legacy_idt.rs.
@@ -508,6 +602,11 @@ fn protected_tf_images_and_entry_are_supported() {
         assert_eq!(cpu.cpu.gpr[4] & 0xffff, if iret { 0x8006 } else { 0x8002 });
         assert!(derive_legacy_context(MODEL, &cpu.cpu).is_ok());
     }
+}
+
+#[test]
+fn reset_fetch_single_step_uses_the_real_ivt_cpu_model() {
+    crate::model_api::with_cpu_model(reset_fetch_single_step_uses_the_real_ivt);
 }
 
 #[test]

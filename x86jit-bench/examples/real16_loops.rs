@@ -4,8 +4,8 @@
 //! macOS reports proc_pid_rusage host instructions around each measured region.
 use std::time::Instant;
 use x86jit_core::{
-    BlockKey, CachedBlock, CpuGeneration, CpuMode, CpuState, ExecutionProfile, Exit, IrBlock, IrOp,
-    LegacyCpuModel, Prot, Reg, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
+    BlockKey, CachedBlock, CpuMode, CpuModel, CpuState, ExecutionProfile, Exit, IrBlock, IrOp,
+    Prot, Reg, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
 };
 
 #[cfg(target_os = "macos")]
@@ -60,16 +60,13 @@ fn setup(path: Path, cs: u64, ip: u64, ds: u64) -> (Vm, Vcpu) {
     let mut vm = Vm::new(VmConfig::flat(0x10_0000));
     vm.set_cpu_mode(CpuMode::Real16);
     if !matches!(path, Path::Application) {
-        let generation = if matches!(path, Path::I386) {
-            CpuGeneration::I386
+        let model = if matches!(path, Path::I386) {
+            CpuModel::I80386
         } else {
-            CpuGeneration::I286
+            CpuModel::I80286
         };
-        vm.set_legacy_cpu_model(LegacyCpuModel {
-            generation,
-            model_semantics_id: generation as u64,
-        });
-        assert_eq!(vm.execution_profile(), ExecutionProfile::LegacySystem);
+        vm.set_cpu_model(model);
+        assert_eq!(vm.execution_profile(), ExecutionProfile::Machine);
     } else {
         assert_eq!(
             vm.execution_profile(),

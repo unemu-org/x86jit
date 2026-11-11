@@ -1,7 +1,7 @@
 //! Legacy system interpreter, selected before the op loop (decision-18 §§1, 4;
 //! spec.md §§8.1, 17). Shared scalar helpers retain their existing flag semantics.
 use super::*;
-use crate::legacy::{self, ControlRegister, LegacyDecodeContext, LegacyOp as L, SegmentId};
+use crate::legacy::{self, ControlRegister, LegacyOp as L, MachineContext, SegmentId};
 
 #[derive(Default)]
 pub(crate) struct Outcome {
@@ -100,10 +100,10 @@ fn reload(cpu: &mut CpuState, segment: SegmentId, value: u16) {
     }
 }
 
-fn sp(cpu: &CpuState, context: LegacyDecodeContext) -> u64 {
+fn sp(cpu: &CpuState, context: MachineContext) -> u64 {
     cpu.gpr[RSP] & mask(context.stack_address_bits / 8)
 }
-fn adjust(cpu: &mut CpuState, context: LegacyDecodeContext, bytes: u32) {
+fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
     cpu.write_gpr(
         RSP,
         sp(cpu, context).wrapping_add(u64::from(bytes)),
@@ -488,7 +488,7 @@ fn code_limit(cpu: &CpuState, cache: legacy::SegmentCache, ip: u64) -> Result<()
 fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     count: usize,
     size: u8,
 ) -> Result<Vec<u64>, Exit> {
@@ -524,7 +524,7 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
 fn push<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     values: &[u64],
     size: u8,
 ) -> Result<(), Exit> {
@@ -543,7 +543,7 @@ fn push<const ROUTED: bool, const ORDER: u8>(
 fn peek<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     index: u64,
     size: u8,
 ) -> Result<u64, Exit> {
@@ -559,7 +559,7 @@ fn peek<const ROUTED: bool, const ORDER: u8>(
     )?;
     read(cpu, mem, addr, size)
 }
-fn target(cpu: &CpuState, context: LegacyDecodeContext, value: u64, size: u8) -> Result<u64, Exit> {
+fn target(cpu: &CpuState, context: MachineContext, value: u64, size: u8) -> Result<u64, Exit> {
     let offset = value & mask(size);
     legacy::access(
         cpu,
@@ -576,7 +576,7 @@ fn target(cpu: &CpuState, context: LegacyDecodeContext, value: u64, size: u8) ->
 pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     memory: &Memory,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     event: legacy::LegacyEvent,
 ) -> Result<(), Exit> {
     let mem = Access::<ROUTED, ORDER>::new(memory);
@@ -586,7 +586,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
 fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     event: legacy::LegacyEvent,
 ) -> Result<(), Exit> {
     // I286 PRM §9.4 Fig. 9-3, Table 9-1 pp. 9-4–6;
@@ -712,10 +712,10 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
 fn deliver<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
-    context: LegacyDecodeContext,
+    context: MachineContext,
     event: legacy::LegacyEvent,
 ) -> Result<(), Exit> {
-    if context.regime == legacy::LegacyRegime::Protected {
+    if context.regime == legacy::MachineRegime::Protected {
         return deliver_protected(cpu, mem, context, event);
     }
     let vector = event.vector;
@@ -994,7 +994,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
     temps: &mut [u64],
-    context: LegacyDecodeContext,
+    context: MachineContext,
 ) -> Result<Outcome, Exit> {
     // 80386 PRM §14.7 item 8, p. 14-6 (scan checked): sequential
     // execution across FFFFh faults on the next fetch instead of wrapping IP.
@@ -1710,7 +1710,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         } else {
                             // SDM Vol 2B §4.3 PUSHA/PUSHAD; 80386 PRM §17,
                             // p. 17-134: these real-mode cases precede pushes.
-                            if context.regime == legacy::LegacyRegime::Real
+                            if context.regime == legacy::MachineRegime::Real
                                 && matches!(sp(cpu, context), 7 | 9 | 11 | 13 | 15)
                             {
                                 return Err(exception(cpu, 13));
@@ -1734,7 +1734,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 .unwrap_or_else(|| read_val(cs, temps))
                                 as u16
                         });
-                        let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
+                        let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
                             cs.map(|cs| code_descriptor(cpu, mem, cs, false, context.generation))
                                 .transpose()?
                         } else {
@@ -1803,7 +1803,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             None
                         };
                         let ip = ip & mask(*size);
-                        let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
+                        let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
                             cs.map(|cs| code_descriptor(cpu, mem, cs, true, context.generation))
                                 .transpose()?
                         } else {
@@ -1848,18 +1848,18 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // SDM Vol 2A §3.3, IRET/IRETD/IRETQ, Operation,
                         // REAL-ADDRESS-MODE: (tempEFLAGS AND 257FD5H) OR
                         // (EFLAGS AND 1A0000H) preserves VM with PE clear.
-                        if context.regime == legacy::LegacyRegime::Protected
+                        if context.regime == legacy::MachineRegime::Protected
                             && *size == 4
                             && image & (1 << 17) != 0
                         {
                             return Err(refusal(
                                 cpu,
                                 crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                                    legacy::LegacyContextError::Virtual8086Unsupported,
+                                    legacy::MachineContextError::Virtual8086Unsupported,
                                 ),
                             ));
                         }
-                        let mut descriptor = if context.regime == legacy::LegacyRegime::Protected {
+                        let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
                             Some(code_descriptor(cpu, mem, cs, true, context.generation)?)
                         } else {
                             None

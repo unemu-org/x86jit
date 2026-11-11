@@ -701,6 +701,8 @@ pub struct Vm {
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
     exception_delivery: crate::ExceptionDelivery,
+    cpu_model: Option<crate::CpuModel>,
+    fpu_model: crate::FpuModel,
     profile_locked: std::sync::atomic::AtomicBool,
 }
 
@@ -1025,7 +1027,7 @@ impl Vm {
         caps: RegionCaps,
         mxcsr: u32,
     ) -> Result<(), ForceRegionError> {
-        if self.profile == ExecutionProfile::LegacySystem || self.mode == CpuMode::Real16 {
+        if self.profile == ExecutionProfile::Machine || self.mode == CpuMode::Real16 {
             return Err(ForceRegionError::UnsupportedMode);
         }
         if self.backend.region_caps().is_none() {
@@ -1182,34 +1184,68 @@ impl Vm {
     /// of the injected backend or tier-up/region policy.
     /// Selects Application and clears any previously selected legacy model.
     /// Existing Application vCPUs retain their contexts when this selects the
-    /// mode for later vCPUs. Panics when leaving LegacySystem after vCPU creation.
+    /// mode for later vCPUs. Panics when leaving Machine after vCPU creation.
     pub fn set_cpu_mode(&mut self, mode: CpuMode) {
         assert!(
-            self.profile != ExecutionProfile::LegacySystem
+            self.profile != ExecutionProfile::Machine
                 || !self.profile_locked.load(Ordering::Relaxed),
             "select execution profile before vCPU creation"
         );
         self.profile = ExecutionProfile::Application(mode);
         self.legacy_model = None;
+        self.cpu_model = None;
         self.mode = mode;
     }
 
-    /// Select system execution and an immutable model before any vCPU is created.
+    /// Select a catalogue CPU model and Machine execution (decision-23 §2).
     /// Panics after vCPU creation, including after all such vCPUs are dropped.
-    /// Selects `ExceptionDelivery::Outward` for compatibility. Call
-    /// `set_exception_delivery` afterwards to opt into in-guest exceptions.
+    ///
+    /// Selects [`crate::ExceptionDelivery::InGuest`] (decision-23 §5). Call
+    /// [`Self::set_exception_delivery`] afterwards to override exception routing.
+    pub fn set_cpu_model(&mut self, model: crate::CpuModel) {
+        self.select_machine_model(model.legacy_model());
+        self.cpu_model = Some(model);
+        self.exception_delivery = crate::ExceptionDelivery::InGuest;
+    }
+
+    /// Set the FPU default inherited by new vCPUs (decision-23 §4).
+    /// Defaults to [`crate::FpuModel::Present`]. The per-vCPU setter remains an
+    /// override. Panics after any vCPU has been created, even if later dropped.
+    pub fn set_fpu_model(&mut self, model: crate::FpuModel) {
+        assert!(
+            !self.profile_locked.load(Ordering::Relaxed),
+            "select FPU default before vCPU creation"
+        );
+        self.fpu_model = model;
+    }
+
+    /// The default FPU policy inherited by new vCPUs (decision-23 §4).
+    pub fn fpu_model(&self) -> crate::FpuModel {
+        self.fpu_model
+    }
+
+    /// Compatibility selector with Outward exception delivery (decision-23 §5).
+    /// Preserves the supplied generation and semantics identity exactly.
+    /// Panics after vCPU creation, including after all such vCPUs are dropped.
+    /// Call [`Self::set_exception_delivery`] afterwards to override exception routing.
+    #[deprecated(note = "use Vm::set_cpu_model with CpuModel (decision-23 §2)")]
     pub fn set_legacy_cpu_model(&mut self, model: LegacyCpuModel) {
+        self.select_machine_model(model);
+        self.cpu_model = None;
+    }
+
+    fn select_machine_model(&mut self, model: LegacyCpuModel) {
         assert!(
             !self.profile_locked.load(Ordering::Relaxed),
             "select execution profile before vCPU creation"
         );
-        self.profile = ExecutionProfile::LegacySystem;
+        self.profile = ExecutionProfile::Machine;
         self.legacy_model = Some(model);
         self.exception_delivery = crate::ExceptionDelivery::Outward;
     }
 
     /// Select processor-exception routing before creating any vCPU.
-    /// Applies to LegacySystem in both real and protected mode (decision-23 §5).
+    /// Applies to Machine in both real and protected mode (decision-23 §5).
     /// Software INT always uses the guest table. Application profiles ignore it.
     pub fn set_exception_delivery(&mut self, delivery: crate::ExceptionDelivery) {
         assert!(
@@ -1227,11 +1263,17 @@ impl Vm {
         self.profile
     }
 
+    /// The selected catalogue model, or `None` for Application and the legacy
+    /// compatibility selector (decision-23 §2, Migration M1).
+    pub fn cpu_model(&self) -> Option<crate::CpuModel> {
+        self.cpu_model
+    }
+
     pub fn legacy_cpu_model(&self) -> Option<LegacyCpuModel> {
         self.legacy_model
     }
 
-    /// Application decode metadata (§17.3), unchanged by selecting LegacySystem.
+    /// Application decode metadata (§17.3), unchanged by selecting Machine.
     pub fn cpu_mode(&self) -> CpuMode {
         self.mode
     }
@@ -1276,6 +1318,8 @@ impl Vm {
             profile: self.profile,
             legacy_model: self.legacy_model,
             exception_delivery: self.exception_delivery,
+            cpu_model: self.cpu_model,
+            fpu_model: self.fpu_model,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: self.lockstep_trace.clone(),
         })
@@ -1310,6 +1354,8 @@ impl Vm {
             profile: ExecutionProfile::Application(CpuMode::Long64),
             legacy_model: None,
             exception_delivery: crate::ExceptionDelivery::Outward,
+            cpu_model: None,
+            fpu_model: crate::FpuModel::Present,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: None,
         }
@@ -1562,12 +1608,19 @@ impl Vm {
     }
 
     fn make_vcpu(&self, id: u64, overrides: crate::features::CpuidOverrides) -> Vcpu {
+        if let Some(model) = self.cpu_model {
+            assert!(
+                model.profile().fpu.contains(&self.fpu_model),
+                "FPU default is incompatible with the CPU model"
+            );
+        }
         self.profile_locked.store(true, Ordering::Relaxed);
-        let mut cpu = if self.profile == ExecutionProfile::LegacySystem {
+        let mut cpu = if self.profile == ExecutionProfile::Machine {
             CpuState::legacy_real_entry([0; 6])
         } else {
             CpuState::new()
         };
+        cpu.fpu_model = self.fpu_model;
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_pointer_model = self.x87_pointer_model;
         cpu.cpuid_table = self.cpuid_table.clone();
@@ -1598,7 +1651,8 @@ impl Vm {
             profile: self.profile,
             legacy_model: self.legacy_model,
             exception_delivery: self.exception_delivery,
-            legacy_execution: (self.profile == ExecutionProfile::LegacySystem)
+            cpu_model: self.cpu_model,
+            legacy_execution: (self.profile == ExecutionProfile::Machine)
                 .then(|| Box::new(legacy::Execution::new())),
             fast: Box::new(
                 [FastEntry {
@@ -1780,6 +1834,7 @@ pub struct Vcpu {
     profile: ExecutionProfile,
     legacy_model: Option<LegacyCpuModel>,
     exception_delivery: crate::ExceptionDelivery,
+    cpu_model: Option<crate::CpuModel>,
     legacy_execution: Option<Box<legacy::Execution>>,
     /// Fast-resolve cache: a vcpu-private, two-way RIP→compiled entry map
     /// that replaces the shared lookup for transfers the chain loop can't chain — returns,
@@ -1958,6 +2013,12 @@ impl Vcpu {
         self.profile
     }
 
+    /// The selected catalogue model, or `None` for Application and the legacy
+    /// compatibility selector (decision-23 §2, Migration M1).
+    pub fn cpu_model(&self) -> Option<crate::CpuModel> {
+        self.cpu_model
+    }
+
     pub fn legacy_cpu_model(&self) -> Option<LegacyCpuModel> {
         self.legacy_model
     }
@@ -2036,7 +2097,7 @@ impl Vcpu {
     }
 
     fn unsupported_legacy(&self, operation: UnsupportedSystemOperation) -> Exit {
-        let model = self.legacy_model.expect("LegacySystem has a model");
+        let model = self.legacy_model.expect("Machine has a model");
         let operation = crate::legacy::derive_legacy_context(model, &self.cpu)
             .err()
             .map_or(operation, UnsupportedSystemOperation::InvalidLegacyContext);
@@ -2065,7 +2126,7 @@ impl Vcpu {
 
     /// Whether a maskable IRQ could be accepted at this boundary.
     /// Independent of whether a vector is queued; does not acknowledge or deliver.
-    /// Supported for Application Real16 and LegacySystem I286/I386 execution.
+    /// Supported for Application Real16 and Machine I286/I386 execution.
     /// Pending IN completion and the entire MMIO retry
     /// (including answered but unfinished transfers) also prevent acceptance.
     ///
@@ -2073,7 +2134,7 @@ impl Vcpu {
     /// device-completion blocking follows decision-16 §§1, 4.
     pub fn irq_ready(&self) -> bool {
         (self.profile == ExecutionProfile::Application(CpuMode::Real16)
-            || (self.profile == ExecutionProfile::LegacySystem
+            || (self.profile == ExecutionProfile::Machine
                 && self.legacy_context_for_run().is_ok()
                 && !self.legacy_execution.as_ref().unwrap().is_shutdown()))
             && !self.cpu.mmio_retry_active
@@ -2424,7 +2485,7 @@ impl Vcpu {
     /// attempts its pending store and returns without executing another element.
     /// Legacy real execution performs one run_steps unit, including one REP iteration.
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
-        if self.profile == ExecutionProfile::LegacySystem {
+        if self.profile == ExecutionProfile::Machine {
             return match self.run_steps(vm, 1, StepOptions::default()) {
                 Ok(run) => match run.stop {
                     StepStop::Exit(Exit::BudgetExhausted) | StepStop::IrqReady => {
@@ -2520,7 +2581,7 @@ impl Vcpu {
     /// with [`CpuMode::Real16`], including when the VM has a compiling backend
     /// (decision-16 §§1–4). Application Long64/Compat32 return
     /// [`StepRunError::UnsupportedMode`], including with a zero budget.
-    /// [`ExecutionProfile::LegacySystem`] also supports same-CPL I286/I386 real and
+    /// [`ExecutionProfile::Machine`] also supports same-CPL I286/I386 real and
     /// protected execution, using derived code/stack sizes and a private
     /// interpreter cache. Unavailable event delivery returns typed unsupported exits.
     /// No legacy context enters a compiling backend.
@@ -2546,7 +2607,7 @@ impl Vcpu {
         max_steps: u64,
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
-        if self.profile == ExecutionProfile::LegacySystem {
+        if self.profile == ExecutionProfile::Machine {
             return self.run_legacy(vm, Some(max_steps), options, true);
         }
         if self.mode != CpuMode::Real16 {
@@ -2782,7 +2843,7 @@ impl Vcpu {
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         self.interruption_evidence = None;
         self.syscall_evidence = None;
-        if self.profile == ExecutionProfile::LegacySystem {
+        if self.profile == ExecutionProfile::Machine {
             return match self.run_legacy(vm, budget, StepOptions::default(), false) {
                 Ok(run) => match run.stop {
                     StepStop::Exit(exit) => exit,

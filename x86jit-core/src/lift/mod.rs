@@ -32,7 +32,7 @@ use vector::*;
 
 pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
     fn push(&mut self, op: IrOp);
-    fn legacy_context(&self) -> Option<crate::LegacyDecodeContext> {
+    fn legacy_context(&self) -> Option<crate::MachineContext> {
         None
     }
 }

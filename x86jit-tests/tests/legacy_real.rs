@@ -1,5 +1,7 @@
 //! Legacy I386 real-address witnesses. Expected values are derived from the
 //! cited manuals; no emulator supplies instruction semantics.
+#[path = "support/model_api.rs"]
+mod model_api;
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, Exit, IrBlock, LegacyCpuModel,
     MemConsistency, Prot, RegionKind, SegmentId, StepOptions, StepRunError, StepStop,
@@ -28,10 +30,13 @@ fn setup(code: &[u8]) -> (Vm, Vcpu) {
 fn setup_model(code: &[u8], generation: CpuGeneration) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(NoBackend));
     vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.set_legacy_cpu_model(LegacyCpuModel {
-        generation,
-        ..MODEL
-    });
+    crate::model_api::select(
+        &mut vm,
+        LegacyCpuModel {
+            generation,
+            ..MODEL
+        },
+    );
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.cpu.rip = 0x1000;
@@ -51,6 +56,11 @@ fn value(vm: &Vm, a: u64, n: usize) -> u64 {
     let mut b = [0; 8];
     vm.read_bytes(a, &mut b[..n]).unwrap();
     u64::from_le_bytes(b)
+}
+
+#[test]
+fn iretd_ignores_stacked_vm_in_real_mode_cpu_model() {
+    crate::model_api::with_cpu_model(iretd_ignores_stacked_vm_in_real_mode);
 }
 
 #[test]
@@ -93,6 +103,11 @@ fn exception(cpu: &mut Vcpu, vm: &Vm, vector: u8) {
 }
 
 #[test]
+fn real_word_at_ffff_faults_with_ss_for_stack_and_gp_for_data_cpu_model() {
+    crate::model_api::with_cpu_model(real_word_at_ffff_faults_with_ss_for_stack_and_gp_for_data);
+}
+
+#[test]
 fn real_word_at_ffff_faults_with_ss_for_stack_and_gp_for_data() {
     // 80386 PRM §14.6 Table 14-1 p. 14-5; SDM Vol 3B §23.1.4 Table 23-1:
     // real-mode SS overruns raise #SS; other segment overruns raise #GP.
@@ -104,6 +119,11 @@ fn real_word_at_ffff_faults_with_ss_for_stack_and_gp_for_data() {
         exception(&mut cpu, &vm, vector);
         assert_eq!(format!("{:?}", cpu.cpu), before);
     }
+}
+
+#[test]
+fn operand_and_address_prefix_combinations_and_full_offsets_cpu_model() {
+    crate::model_api::with_cpu_model(operand_and_address_prefix_combinations_and_full_offsets);
 }
 
 #[test]
@@ -146,6 +166,11 @@ fn operand_and_address_prefix_combinations_and_full_offsets() {
     exception(&mut cpu, &vm, 13);
     assert_eq!(value(&vm, 0xfffe, 4), 0xaaaaaaaa);
     assert_eq!(cpu.cpu.rip, 0x1000);
+}
+
+#[test]
+fn fs_gs_loads_overrides_and_far_pointer_loads_cpu_model() {
+    crate::model_api::with_cpu_model(fs_gs_loads_overrides_and_far_pointer_loads);
 }
 
 #[test]
@@ -196,6 +221,11 @@ fn fs_gs_loads_overrides_and_far_pointer_loads() {
 }
 
 #[test]
+fn pushfd_popfd_identification_masks_and_tf_storage_cpu_model() {
+    crate::model_api::with_cpu_model(pushfd_popfd_identification_masks_and_tf_storage);
+}
+
+#[test]
 fn pushfd_popfd_identification_masks_and_tf_storage() {
     // SDM Vol 1 §21.1.2; 80386 PRM §2.3.4 Fig. 2-8 p. 2-11,
     // §17 POPF p. 17-130 (page images checked): AC/ID/reserved bits zero,
@@ -214,6 +244,11 @@ fn pushfd_popfd_identification_masks_and_tf_storage() {
     steps(&mut cpu, &vm, 1);
     assert_eq!(cpu.cpu.gpr[4], 0x8004);
     assert_eq!(cpu.cpu.rflags_system, 0x100);
+}
+
+#[test]
+fn pushad_popad_original_esp_and_independent_stack_width_cpu_model() {
+    crate::model_api::with_cpu_model(pushad_popad_original_esp_and_independent_stack_width);
 }
 
 #[test]
@@ -240,6 +275,11 @@ fn pushad_popad_original_esp_and_independent_stack_width() {
         steps(&mut cpu, &vm, 1);
         assert_eq!(&cpu.cpu.gpr[..8], &before[..8]);
     }
+}
+
+#[test]
+fn far_1632_call_jump_and_return_frames_cpu_model() {
+    crate::model_api::with_cpu_model(far_1632_call_jump_and_return_frames);
 }
 
 #[test]
@@ -282,6 +322,11 @@ fn far_1632_call_jump_and_return_frames() {
 }
 
 #[test]
+fn strings_step_by_iteration_with_effective_indices_and_limits_cpu_model() {
+    crate::model_api::with_cpu_model(strings_step_by_iteration_with_effective_indices_and_limits);
+}
+
+#[test]
 fn strings_step_by_iteration_with_effective_indices_and_limits() {
     // SDM Vol 2B §4.3 REP/MOVS: one effective-sized element per iteration;
     // decision-16 charges an iteration without prematurely retiring the REP.
@@ -298,6 +343,11 @@ fn strings_step_by_iteration_with_effective_indices_and_limits() {
     exception(&mut cpu, &vm, 13);
     assert_eq!(cpu.cpu.gpr[1], 1);
     assert_eq!(value(&vm, 0x2004, 4), 0);
+}
+
+#[test]
+fn zero_steps_port_completion_and_sti_ss_shadows_cpu_model() {
+    crate::model_api::with_cpu_model(zero_steps_port_completion_and_sti_ss_shadows);
 }
 
 #[test]
@@ -331,6 +381,13 @@ fn zero_steps_port_completion_and_sti_ss_shadows() {
 }
 
 #[test]
+fn protected_entry_executes_with_retained_caches_and_legacy_never_materializes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        protected_entry_executes_with_retained_caches_and_legacy_never_materializes,
+    );
+}
+
+#[test]
 fn protected_entry_executes_with_retained_caches_and_legacy_never_materializes() {
     let (vm, mut cpu) = setup(b"\x66\xb8\x78\x56\x34\x12\xf4");
     cpu.cpu.legacy.cr0 = 1;
@@ -341,7 +398,7 @@ fn protected_entry_executes_with_retained_caches_and_legacy_never_materializes()
         Box::new(x86jit_cranelift::JitBackend::new()),
     );
     jit.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
-    jit.set_legacy_cpu_model(MODEL);
+    crate::model_api::select(&mut jit, MODEL);
     jit.write_bytes(0x1000, b"\x66\x50\x66\x5b\xf4").unwrap();
     let mut cpu = jit.new_vcpu();
     cpu.cpu = CpuState::legacy_real_entry([0; 6]);
@@ -350,6 +407,11 @@ fn protected_entry_executes_with_retained_caches_and_legacy_never_materializes()
     cpu.cpu.gpr[0] = 0x12345678;
     assert!(matches!(cpu.run(&jit, None), Exit::Hlt));
     assert_eq!(cpu.cpu.gpr[3], 0x12345678);
+}
+
+#[test]
+fn cache_guards_alias_decode_ip_retained_cache_and_smc_cpu_model() {
+    crate::model_api::with_cpu_model(cache_guards_alias_decode_ip_retained_cache_and_smc);
 }
 
 #[test]
@@ -390,6 +452,13 @@ fn cache_guards_alias_decode_ip_retained_cache_and_smc() {
 }
 
 #[test]
+fn fetch_crossings_fault_at_exact_instruction_and_keep_completed_prefix_cpu_model() {
+    crate::model_api::with_cpu_model(
+        fetch_crossings_fault_at_exact_instruction_and_keep_completed_prefix,
+    );
+}
+
+#[test]
 fn fetch_crossings_fault_at_exact_instruction_and_keep_completed_prefix() {
     // SDM Vol 3B §23.1.4 Table 23-1: executing beyond CS limit is #GP;
     // decode/fetch never turns a fault in the next instruction into an early exit.
@@ -414,6 +483,11 @@ fn fetch_crossings_fault_at_exact_instruction_and_keep_completed_prefix() {
 }
 
 #[test]
+fn stack_limit_faults_preserve_registers_and_multiword_frame_cpu_model() {
+    crate::model_api::with_cpu_model(stack_limit_faults_preserve_registers_and_multiword_frame);
+}
+
+#[test]
 fn stack_limit_faults_preserve_registers_and_multiword_frame() {
     // SDM Vol 3B §23.1.4 Table 23-1: stack references use #SS. Engine
     // fault-before-commit contract preflights all destinations of a frame.
@@ -428,6 +502,13 @@ fn stack_limit_faults_preserve_registers_and_multiword_frame() {
     let (vm, mut cpu) = setup(b"\x66\x67\x8b\x45\x00");
     cpu.cpu.gpr[5] = 0x10000;
     exception(&mut cpu, &vm, 12);
+}
+
+#[test]
+fn mmio_far_pointer_retry_keeps_completed_reads_and_no_partial_cs_cpu_model() {
+    crate::model_api::with_cpu_model(
+        mmio_far_pointer_retry_keeps_completed_reads_and_no_partial_cs,
+    );
 }
 
 #[test]
@@ -460,6 +541,13 @@ fn mmio_far_pointer_retry_keeps_completed_reads_and_no_partial_cs() {
 }
 
 #[test]
+fn retained_code_and_stack_defaults_remain_independent_of_real_regime_cpu_model() {
+    crate::model_api::with_cpu_model(
+        retained_code_and_stack_defaults_remain_independent_of_real_regime,
+    );
+}
+
+#[test]
 fn retained_code_and_stack_defaults_remain_independent_of_real_regime() {
     // Decision-18 §1; SDM Vol 3A §§3.4.5,12.9.2 and AMD64 APM
     // Vol 2 §§4.1,14.6: cached D/B attributes select independent sizes.
@@ -472,6 +560,13 @@ fn retained_code_and_stack_defaults_remain_independent_of_real_regime() {
     assert_eq!(cpu.cpu.gpr[0], 0x11223344);
     assert_eq!(cpu.cpu.gpr[2], 0x11223344);
     assert_eq!(cpu.cpu.gpr[4], 0x8000);
+}
+
+#[test]
+fn segment_stack_forms_model_identification_and_task_return_refusal_cpu_model() {
+    crate::model_api::with_cpu_model(
+        segment_stack_forms_model_identification_and_task_return_refusal,
+    );
 }
 
 #[test]
@@ -504,6 +599,11 @@ fn segment_stack_forms_model_identification_and_task_return_refusal() {
 }
 
 #[test]
+fn far_pointer_whole_operand_limit_and_ret_cleanup_cpu_model() {
+    crate::model_api::with_cpu_model(far_pointer_whole_operand_limit_and_ret_cleanup);
+}
+
+#[test]
 fn far_pointer_whole_operand_limit_and_ret_cleanup() {
     // SDM Vol 3B §23.1.1; Vol 2A §3.3 CALL/JMP; Vol 2B §4.3 RET:
     // the whole m16:32 operand must fit; RETF immediate adds bytes after both slots.
@@ -519,6 +619,13 @@ fn far_pointer_whole_operand_limit_and_ret_cleanup() {
     assert_eq!(
         (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
         (0x100, 0x2000, 0x8014)
+    );
+}
+
+#[test]
+fn sequential_eip_does_not_wrap_at_ffff_and_32bit_targets_keep_their_offset_cpu_model() {
+    crate::model_api::with_cpu_model(
+        sequential_eip_does_not_wrap_at_ffff_and_32bit_targets_keep_their_offset,
     );
 }
 
@@ -540,6 +647,11 @@ fn sequential_eip_does_not_wrap_at_ffff_and_32bit_targets_keep_their_offset() {
     assert_eq!(cpu.cpu.rip, 0x12000);
     steps(&mut cpu, &vm, 1);
     assert_eq!(cpu.cpu.rip, 0x12001);
+}
+
+#[test]
+fn mmio_selector_answer_does_not_replace_a_ram_far_offset_cpu_model() {
+    crate::model_api::with_cpu_model(mmio_selector_answer_does_not_replace_a_ram_far_offset);
 }
 
 #[test]
@@ -569,6 +681,11 @@ fn mmio_selector_answer_does_not_replace_a_ram_far_offset() {
     assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0x100, 0x2345));
     assert!(!cpu.cpu.mmio_retry_active);
     assert_eq!(cpu.cpu.pending_mmio, None);
+}
+
+#[test]
+fn abandoned_mmio_answer_is_cleared_for_a_new_cs_or_rip_owner_cpu_model() {
+    crate::model_api::with_cpu_model(abandoned_mmio_answer_is_cleared_for_a_new_cs_or_rip_owner);
 }
 
 #[test]
@@ -604,6 +721,13 @@ fn abandoned_mmio_answer_is_cleared_for_a_new_cs_or_rip_owner() {
 }
 
 #[test]
+fn lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit_cpu_model() {
+    crate::model_api::with_cpu_model(
+        lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit,
+    );
+}
+
+#[test]
 fn lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit() {
     // SDM Vol 3A §7.8.3; decision-16 §4: only MOV/POP SS inhibit;
     // LSS atomically loads both parts and does not create that shadow.
@@ -634,6 +758,13 @@ fn lss_accepts_irq_at_its_next_boundary_while_mov_and_pop_ss_inhibit() {
         assert_eq!(cpu.cpu.gpr[0], ax + u64::from(shadow));
         assert!(!cpu.has_pending_irq());
     }
+}
+
+#[test]
+fn untaken_jcc_and_loop_complete_before_the_next_fetch_limit_fault_cpu_model() {
+    crate::model_api::with_cpu_model(
+        untaken_jcc_and_loop_complete_before_the_next_fetch_limit_fault,
+    );
 }
 
 #[test]
@@ -692,6 +823,13 @@ fn untaken_jcc_and_loop_complete_before_the_next_fetch_limit_fault() {
 }
 
 #[test]
+fn pusha_and_pushad_special_real_stack_values_fault_before_any_push_cpu_model() {
+    crate::model_api::with_cpu_model(
+        pusha_and_pushad_special_real_stack_values_fault_before_any_push,
+    );
+}
+
+#[test]
 fn pusha_and_pushad_special_real_stack_values_fault_before_any_push() {
     // SDM Vol 2B §4.3 PUSHA/PUSHAD; 80386 PRM §17, pp. 17-133–134
     // (page images checked): SP/ESP in {7,9,11,13,15} raises #GP.
@@ -713,6 +851,13 @@ fn pusha_and_pushad_special_real_stack_values_fault_before_any_push() {
             }
         }
     }
+}
+
+#[test]
+fn ordinary_completion_clears_rf_but_zero_budget_faults_and_mmio_do_not_cpu_model() {
+    crate::model_api::with_cpu_model(
+        ordinary_completion_clears_rf_but_zero_budget_faults_and_mmio_do_not,
+    );
 }
 
 #[test]
@@ -767,6 +912,13 @@ fn ordinary_completion_clears_rf_but_zero_budget_faults_and_mmio_do_not() {
 }
 
 #[test]
+fn deferred_system_register_accesses_have_effect_free_typed_refusals_cpu_model() {
+    crate::model_api::with_cpu_model(
+        deferred_system_register_accesses_have_effect_free_typed_refusals,
+    );
+}
+
+#[test]
 fn deferred_system_register_accesses_have_effect_free_typed_refusals() {
     // Decision-18 §4: system-register operations owned by later phases use a
     // typed engine refusal. SDM Vol 2B §4.3 MOV to/from Control/Debug Registers;
@@ -799,6 +951,11 @@ fn deferred_system_register_accesses_have_effect_free_typed_refusals() {
             assert_eq!(cpu.retired_instructions(), 0);
         }
     }
+}
+
+#[test]
+fn descriptor_table_operand_images_and_flags_for_both_sizes_cpu_model() {
+    crate::model_api::with_cpu_model(descriptor_table_operand_images_and_flags_for_both_sizes);
 }
 
 #[test]
@@ -872,6 +1029,13 @@ fn descriptor_table_operand_images_and_flags_for_both_sizes() {
             }
         }
     }
+}
+
+#[test]
+fn table_operands_check_all_six_bytes_before_effects_and_retry_mmio_cpu_model() {
+    crate::model_api::with_cpu_model(
+        table_operands_check_all_six_bytes_before_effects_and_retry_mmio,
+    );
 }
 
 #[test]
@@ -951,6 +1115,13 @@ fn table_operands_check_all_six_bytes_before_effects_and_retry_mmio() {
 }
 
 #[test]
+fn control_registers_have_386_masks_fixed_width_and_real_privilege_cpu_model() {
+    crate::model_api::with_cpu_model(
+        control_registers_have_386_masks_fixed_width_and_real_privilege,
+    );
+}
+
+#[test]
 fn control_registers_have_386_masks_fixed_width_and_real_privilege() {
     // SDM Vol 3A §2.5; Vol 2B §4.3 MOV CR (reserved CR0 bits ignored;
     // arithmetic flags undefined). 80386 PRM §4.1.3 Fig. 4-2 p. 4-3;
@@ -986,6 +1157,13 @@ fn control_registers_have_386_masks_fixed_width_and_real_privilege() {
             assert_eq!(cpu.cpu.rflags_system, 0x7000);
         }
     }
+}
+
+#[test]
+fn msw_and_clts_use_only_their_documented_bits_and_preserve_flags_cpu_model() {
+    crate::model_api::with_cpu_model(
+        msw_and_clts_use_only_their_documented_bits_and_preserve_flags,
+    );
 }
 
 #[test]
@@ -1033,6 +1211,11 @@ fn msw_and_clts_use_only_their_documented_bits_and_preserve_flags() {
 }
 
 #[test]
+fn enabling_pg_refuses_atomically_but_pg_without_pe_faults_cpu_model() {
+    crate::model_api::with_cpu_model(enabling_pg_refuses_atomically_but_pg_without_pe_faults);
+}
+
+#[test]
 fn enabling_pg_refuses_atomically_but_pg_without_pe_faults() {
     // SDM Vol 3A §2.5; decision-18 §4: legality precedes an engine refusal.
     for prefix in [&b""[..], &b"\x66"[..]] {
@@ -1068,6 +1251,13 @@ fn enabling_pg_refuses_atomically_but_pg_without_pe_faults() {
             assert_eq!(cpu.retired_instructions(), 0);
         }
     }
+}
+
+#[test]
+fn illegal_system_encodings_and_word_memory_limits_fault_without_effects_cpu_model() {
+    crate::model_api::with_cpu_model(
+        illegal_system_encodings_and_word_memory_limits_fault_without_effects,
+    );
 }
 
 #[test]
@@ -1112,6 +1302,11 @@ fn illegal_system_encodings_and_word_memory_limits_fault_without_effects() {
         let (vm, mut cpu) = setup(code);
         exception(&mut cpu, &vm, 13);
     }
+}
+
+#[test]
+fn real_delivery_uses_idtr_base_limit_and_exact_six_byte_frame_cpu_model() {
+    crate::model_api::with_cpu_model(real_delivery_uses_idtr_base_limit_and_exact_six_byte_frame);
 }
 
 #[test]
@@ -1174,6 +1369,13 @@ fn real_delivery_uses_idtr_base_limit_and_exact_six_byte_frame() {
 }
 
 #[test]
+fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction_cpu_model() {
+    crate::model_api::with_cpu_model(
+        accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction,
+    );
+}
+
+#[test]
 fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction() {
     // Decision-16 §§1,3; SDM Vol 3B §23.1.4. A device answer belongs to
     // delivery, and neither accepting nor retrying delivery consumes a step.
@@ -1207,6 +1409,11 @@ fn accepted_irq_mmio_retry_finishes_delivery_before_the_interrupted_instruction(
     assert_eq!(value(&vm, 0x7ffa, 2), 0x1000);
     assert_eq!(value(&vm, 0x7ffe, 2), 2);
     assert!(!cpu.has_pending_irq());
+}
+
+#[test]
+fn accepted_irq_unmapped_retry_finishes_delivery_with_if_cleared_cpu_model() {
+    crate::model_api::with_cpu_model(accepted_irq_unmapped_retry_finishes_delivery_with_if_cleared);
 }
 
 #[test]
@@ -1318,6 +1525,11 @@ mod single_step {
     }
 
     #[test]
+    fn probe_logs_pop_ds_without_inhibition_and_is_deterministic_cpu_model() {
+        crate::model_api::with_cpu_model(probe_logs_pop_ds_without_inhibition_and_is_deterministic);
+    }
+
+    #[test]
     fn probe_logs_pop_ds_without_inhibition_and_is_deterministic() {
         // I286 PRM §9.7.1 p. 9-14, Appendix B POP p. B-83;
         // 80386 PRM §12.3.1.4 p. 12-8, §17 POP pp. 17-125–126:
@@ -1354,6 +1566,11 @@ mod single_step {
                 previous = Some(image);
             }
         }
+    }
+
+    #[test]
+    fn popf_and_iret_set_tf_with_one_instruction_delay_cpu_model() {
+        crate::model_api::with_cpu_model(popf_and_iret_set_tf_with_one_instruction_delay);
     }
 
     #[test]
@@ -1397,6 +1614,11 @@ mod single_step {
     }
 
     #[test]
+    fn rep_traps_each_iteration_but_retires_only_on_completion_cpu_model() {
+        crate::model_api::with_cpu_model(rep_traps_each_iteration_but_retires_only_on_completion);
+    }
+
+    #[test]
     fn rep_traps_each_iteration_but_retires_only_on_completion() {
         // I286 PRM Appendix B REP pp. B-92–93; 80386 PRM §17 REP
         // pp. 17-139–140: interrupt window per iteration, updated CX/SI/DI.
@@ -1432,6 +1654,11 @@ mod single_step {
     }
 
     #[test]
+    fn mov_pop_ss_suppress_only_the_load_boundary_cpu_model() {
+        crate::model_api::with_cpu_model(mov_pop_ss_suppress_only_the_load_boundary);
+    }
+
+    #[test]
     fn mov_pop_ss_suppress_only_the_load_boundary() {
         // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
         // 80386 PRM §9.2.4 pp. 9-3–4: SS load, then successor, then #DB.
@@ -1448,6 +1675,11 @@ mod single_step {
                 assert_eq!(cpu.retired_instructions(), 2);
             }
         }
+    }
+
+    #[test]
+    fn data_segment_loads_and_lss_do_not_suppress_tf_cpu_model() {
+        crate::model_api::with_cpu_model(data_segment_loads_and_lss_do_not_suppress_tf);
     }
 
     #[test]
@@ -1487,6 +1719,11 @@ mod single_step {
     }
 
     #[test]
+    fn tf_precedes_irq_and_sti_does_not_mask_debug_cpu_model() {
+        crate::model_api::with_cpu_model(tf_precedes_irq_and_sti_does_not_mask_debug);
+    }
+
+    #[test]
     fn tf_precedes_irq_and_sti_does_not_mask_debug() {
         // I286 PRM Table 5-1 p. 5-4, §9.7.1 p. 9-14;
         // 80386 PRM Table 9-2 p. 9-4, §12.3.1.4 p. 12-8:
@@ -1512,6 +1749,11 @@ mod single_step {
     }
 
     #[test]
+    fn faults_precede_tf_but_untaken_into_and_hlt_trap_cpu_model() {
+        crate::model_api::with_cpu_model(faults_precede_tf_but_untaken_into_and_hlt_trap);
+    }
+
+    #[test]
     fn faults_precede_tf_but_untaken_into_and_hlt_trap() {
         // I286 PRM Table 5-1 p. 5-4, §9.7.1 p. 9-14;
         // 80386 PRM Table 9-2 p. 9-4, §12.3.1.4 p. 12-8.
@@ -1532,6 +1774,13 @@ mod single_step {
                 frame(&vm, &cpu, 0x1001, 0x102);
             }
         }
+    }
+
+    #[test]
+    fn taken_int_int3_into_save_tf_and_stop_stepping_on_both_models_cpu_model() {
+        crate::model_api::with_cpu_model(
+            taken_int_int3_into_save_tf_and_stop_stepping_on_both_models,
+        );
     }
 
     #[test]
@@ -1579,6 +1828,11 @@ mod single_step {
                 assert_eq!(cpu.retired_instructions(), 4);
             }
         }
+    }
+
+    #[test]
+    fn irq_delivery_fault_rechecks_if_before_retry_cpu_model() {
+        crate::model_api::with_cpu_model(irq_delivery_fault_rechecks_if_before_retry);
     }
 
     #[test]
@@ -1635,6 +1889,11 @@ mod single_step {
     }
 
     #[test]
+    fn port_handoffs_deliver_tf_after_completion_cpu_model() {
+        crate::model_api::with_cpu_model(port_handoffs_deliver_tf_after_completion);
+    }
+
+    #[test]
     fn port_handoffs_deliver_tf_after_completion() {
         // I286 PRM Appendix B REP p. B-93; 80386 PRM §17 REP p. 17-140:
         // an INS element includes its destination store before the TF window.
@@ -1687,6 +1946,11 @@ mod single_step {
                 assert_eq!(cpu.retired_instructions(), 2);
             }
         }
+    }
+
+    #[test]
+    fn debug_delivery_retry_keeps_retirement_and_priority_cpu_model() {
+        crate::model_api::with_cpu_model(debug_delivery_retry_keeps_retirement_and_priority);
     }
 
     #[test]

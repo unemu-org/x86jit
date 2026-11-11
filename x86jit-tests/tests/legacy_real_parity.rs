@@ -1,4 +1,6 @@
 //! Application Real16 versus legacy real execution, using the coverage probe corpus.
+#[path = "support/model_api.rs"]
+mod model_api;
 use iced_x86::{Code, CpuidFeature as F};
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, Exit, IrBlock, LegacyCpuModel,
@@ -64,10 +66,13 @@ fn setup(bytes: &[u8], generation: Option<CpuGeneration>, seed: u64) -> (Vm, Vcp
     }
     vm.set_cpu_mode(CpuMode::Real16);
     if let Some(generation) = generation {
-        vm.set_legacy_cpu_model(LegacyCpuModel {
-            generation,
-            model_semantics_id: generation as u64,
-        });
+        crate::model_api::select(
+            &mut vm,
+            LegacyCpuModel {
+                generation,
+                model_semantics_id: generation as u64,
+            },
+        );
     }
     let mut rng = seed;
     let mut memory = vec![0; 0x20000];
@@ -432,6 +437,11 @@ fn conflict_expectation(
 }
 
 #[test]
+fn application_real16_forms_have_legacy_parity_cpu_model() {
+    crate::model_api::with_cpu_model(application_real16_forms_have_legacy_parity);
+}
+
+#[test]
 fn application_real16_forms_have_legacy_parity() {
     let forms = x86jit_tests::compat::real16_forms();
     let mut gaps = Vec::new();
@@ -548,10 +558,13 @@ fn application_real16_forms_have_legacy_parity() {
 
 fn legacy_fixture(code: &[u8], generation: CpuGeneration) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x220000), Box::new(Interpreter));
-    vm.set_legacy_cpu_model(LegacyCpuModel {
-        generation,
-        model_semantics_id: generation as u64,
-    });
+    crate::model_api::select(
+        &mut vm,
+        LegacyCpuModel {
+            generation,
+            model_semantics_id: generation as u64,
+        },
+    );
     for page in (0..0x220000).step_by(0x1000) {
         vm.map(page, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
     }
@@ -571,6 +584,11 @@ fn assert_exception(run: &x86jit_core::StepRun, vector: u8) {
         "{run:?}"
     );
 }
+#[test]
+fn i286_rejects_every_386_probe_before_operand_access_cpu_model() {
+    crate::model_api::with_cpu_model(i286_rejects_every_386_probe_before_operand_access);
+}
+
 #[test]
 fn i286_rejects_every_386_probe_before_operand_access() {
     let mut checked = 0;
@@ -604,6 +622,11 @@ fn i286_rejects_every_386_probe_before_operand_access() {
     assert!(checked > 200, "{checked}");
     eprintln!("I286: {checked} unavailable forms raise #UD without effects");
 }
+#[test]
+fn esc_and_wait_gate_before_operands_under_both_fpu_models_cpu_model() {
+    crate::model_api::with_cpu_model(esc_and_wait_gate_before_operands_under_both_fpu_models);
+}
+
 #[test]
 fn esc_and_wait_gate_before_operands_under_both_fpu_models() {
     // SDM Vol 3A §2.5 Table 2-2; 80386 PRM §§11.1.2–11.1.4:
@@ -648,6 +671,11 @@ fn esc_and_wait_gate_before_operands_under_both_fpu_models() {
     }
 }
 #[test]
+fn delegated_x87_uses_cached_limits_and_splits_at_a20_cpu_model() {
+    crate::model_api::with_cpu_model(delegated_x87_uses_cached_limits_and_splits_at_a20);
+}
+
+#[test]
 fn delegated_x87_uses_cached_limits_and_splits_at_a20() {
     // SDM Vol 1 §8.2.2: the 80-bit image of +1.0. Addressing and A20:
     // Vol 3B §23.1.1; Vol 3A §11.7.13.4; decisions 20 and 22.
@@ -683,6 +711,11 @@ fn delegated_x87_uses_cached_limits_and_splits_at_a20() {
     }
 }
 #[test]
+fn delegated_bit_strings_check_the_adjusted_offset_and_a20_cpu_model() {
+    crate::model_api::with_cpu_model(delegated_bit_strings_check_the_adjusted_offset_and_a20);
+}
+
+#[test]
 fn delegated_bit_strings_check_the_adjusted_offset_and_a20() {
     // SDM Vol 2A §3.3 BT/BTS/BTR/BTC: signed register index selects
     // the byte in the string before the segment-limit check.
@@ -702,6 +735,13 @@ fn delegated_bit_strings_check_the_adjusted_offset_and_a20() {
     cpu.cpu.legacy.segments[1].limit = 0x20;
     assert_exception(&step(&vm, &mut cpu), 13);
 }
+#[test]
+fn rep_port_strings_match_application_through_input_and_mmio_resumes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        rep_port_strings_match_application_through_input_and_mmio_resumes,
+    );
+}
+
 #[test]
 fn rep_port_strings_match_application_through_input_and_mmio_resumes() {
     // SDM Vol 2A §3.3 INS; Vol 2B §4.3 OUTS and REP: one
@@ -788,6 +828,13 @@ fn rep_port_strings_match_application_through_input_and_mmio_resumes() {
     }
 }
 #[test]
+fn input_completion_keeps_a20_until_store_then_changes_at_element_boundary_cpu_model() {
+    crate::model_api::with_cpu_model(
+        input_completion_keeps_a20_until_store_then_changes_at_element_boundary,
+    );
+}
+
+#[test]
 fn input_completion_keeps_a20_until_store_then_changes_at_element_boundary() {
     // Decision-22's boundary contract; REP interruption windows: SDM Vol 2B §4.3 REP.
     for generation in [CpuGeneration::I286, CpuGeneration::I386] {
@@ -838,6 +885,11 @@ fn input_completion_keeps_a20_until_store_then_changes_at_element_boundary() {
 }
 
 #[test]
+fn enter_preserves_widths_aliases_and_fault_restart_cpu_model() {
+    crate::model_api::with_cpu_model(enter_preserves_widths_aliases_and_fault_restart);
+}
+
+#[test]
 fn enter_preserves_widths_aliases_and_fault_restart() {
     // SDM Vol 2A §3.3 ENTER, Operation: FrameTemp comes from ESP for
     // operand size 32 even with a 16-bit stack. Display reads see prior pushes.
@@ -867,6 +919,11 @@ fn enter_preserves_widths_aliases_and_fault_restart() {
         assert_eq!(word, [0, 0]);
     }
 }
+#[test]
+fn x87_wide_store_preflights_both_a20_destinations_cpu_model() {
+    crate::model_api::with_cpu_model(x87_wide_store_preflights_both_a20_destinations);
+}
+
 #[test]
 fn x87_wide_store_preflights_both_a20_destinations() {
     // SDM Vol 1 §8.1.9 and Vol 2B §4.3 FSAVE/FNSAVE: the 16-bit
@@ -912,6 +969,11 @@ fn x87_wide_store_preflights_both_a20_destinations() {
     }
 }
 #[test]
+fn aad_decimal_base_and_absent_fpu_operand_checks_cpu_model() {
+    crate::model_api::with_cpu_model(aad_decimal_base_and_absent_fpu_operand_checks);
+}
+
+#[test]
 fn aad_decimal_base_and_absent_fpu_operand_checks() {
     // SDM Vol 2A §3.3 AAD: AL := AH * imm8 + AL; AH := 0.
     for generation in [CpuGeneration::I286, CpuGeneration::I386] {
@@ -936,6 +998,11 @@ fn aad_decimal_base_and_absent_fpu_operand_checks() {
 }
 
 #[test]
+fn port_input_completion_uses_the_checked_wrapped_linear_address_cpu_model() {
+    crate::model_api::with_cpu_model(port_input_completion_uses_the_checked_wrapped_linear_address);
+}
+
+#[test]
 fn port_input_completion_uses_the_checked_wrapped_linear_address() {
     // SDM Vol 3A §3.4.3: 32-bit segment base plus effective offset forms
     // the 32-bit linear address. The completion retains that checked address.
@@ -957,6 +1024,13 @@ fn port_input_completion_uses_the_checked_wrapped_linear_address() {
     assert_eq!(byte, [0xa5]);
     assert_eq!(cpu.cpu.gpr[7], 0x21);
     assert_eq!(cpu.cpu.gpr[1], 0);
+}
+
+#[test]
+fn i386_dword_port_strings_resume_each_element_with_both_address_sizes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        i386_dword_port_strings_resume_each_element_with_both_address_sizes,
+    );
 }
 
 #[test]
@@ -1032,6 +1106,13 @@ fn i386_dword_port_strings_resume_each_element_with_both_address_sizes() {
 }
 
 #[test]
+fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol_cpu_model() {
+    crate::model_api::with_cpu_model(
+        split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol,
+    );
+}
+
+#[test]
 fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol() {
     // SDM Vol 2B §4.3 XCHG; decision-22: the complete operand is
     // checked before physical splitting. §5.2 leaves locked MMIO to the embedder.
@@ -1074,6 +1155,11 @@ fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol() {
 }
 
 #[test]
+fn unavailable_x87_output_keeps_ud_precedence_after_the_msw_gate_cpu_model() {
+    crate::model_api::with_cpu_model(unavailable_x87_output_keeps_ud_precedence_after_the_msw_gate);
+}
+
+#[test]
 fn unavailable_x87_output_keeps_ud_precedence_after_the_msw_gate() {
     // SDM Vol 2A §3.3 FISTTP: the form requires SSE3. Decision-21's
     // generation contract and SDM Vol 3A §2.5 Table 2-2 apply:
@@ -1090,6 +1176,13 @@ fn unavailable_x87_output_keeps_ud_precedence_after_the_msw_gate() {
             }
         }
     }
+}
+
+#[test]
+fn retained_cs_default_size_does_not_change_the_real_x87_environment_layout_cpu_model() {
+    crate::model_api::with_cpu_model(
+        retained_cs_default_size_does_not_change_the_real_x87_environment_layout,
+    );
 }
 
 #[test]
@@ -1154,10 +1247,13 @@ fn linear_edge_fixture(code: &[u8], a20: bool) -> (Vm, Vcpu) {
     let mut vm =
         Vm::with_backend_host_ram(VmConfig::reserved(len as u64), Box::new(Interpreter), ram)
             .unwrap();
-    vm.set_legacy_cpu_model(LegacyCpuModel {
-        generation: CpuGeneration::I386,
-        model_semantics_id: 386,
-    });
+    crate::model_api::select(
+        &mut vm,
+        LegacyCpuModel {
+            generation: CpuGeneration::I386,
+            model_semantics_id: 386,
+        },
+    );
     for page in [
         0,
         0x1000,
@@ -1192,6 +1288,12 @@ fn edge_read(vm: &Vm, linear: u32, len: usize, a20: bool) -> Vec<u8> {
             byte[0]
         })
         .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_wraps_the_upper_linear_address_before_a20_cpu_model() {
+    crate::model_api::with_cpu_model(bound_wraps_the_upper_linear_address_before_a20);
 }
 
 #[cfg(unix)]
@@ -1243,6 +1345,12 @@ fn bound_wraps_the_upper_linear_address_before_a20() {
         ));
         assert_eq!(image(&cpu), before);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn far_pointer_second_halves_wrap_linear_addresses_cpu_model() {
+    crate::model_api::with_cpu_model(far_pointer_second_halves_wrap_linear_addresses);
 }
 
 #[cfg(unix)]
@@ -1300,6 +1408,14 @@ fn far_pointer_second_halves_wrap_linear_addresses() {
 
 #[cfg(unix)]
 #[test]
+fn x87_images_wrap_linear_parts_and_preflight_the_wrapped_destination_cpu_model() {
+    crate::model_api::with_cpu_model(
+        x87_images_wrap_linear_parts_and_preflight_the_wrapped_destination,
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn x87_images_wrap_linear_parts_and_preflight_the_wrapped_destination() {
     // SDM Vol 3A §3.4; Vol 1 §8.1.10, Fig. 8-12; Vol 2A §3.3
     // FSAVE/FNSAVE, FRSTOR, FLDENV: 14-byte environment, 94-byte save.
@@ -1340,6 +1456,12 @@ fn x87_images_wrap_linear_parts_and_preflight_the_wrapped_destination() {
 
 #[cfg(unix)]
 #[test]
+fn enter_and_all_register_frames_wrap_each_linear_slot_cpu_model() {
+    crate::model_api::with_cpu_model(enter_and_all_register_frames_wrap_each_linear_slot);
+}
+
+#[cfg(unix)]
+#[test]
 fn enter_and_all_register_frames_wrap_each_linear_slot() {
     // SDM Vol 3A §3.4; Vol 2A §3.3 ENTER; Vol 2B §4.3 PUSHA/POPA.
     for a20 in [true, false] {
@@ -1367,6 +1489,12 @@ fn enter_and_all_register_frames_wrap_each_linear_slot() {
         assert_eq!(step(&vm, &mut cpu).steps(), 1);
         assert_eq!(cpu.cpu.gpr, original);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn string_elements_and_xlat_wrap_linear_addresses_cpu_model() {
+    crate::model_api::with_cpu_model(string_elements_and_xlat_wrap_linear_addresses);
 }
 
 #[cfg(unix)]
@@ -1404,6 +1532,11 @@ fn string_elements_and_xlat_wrap_linear_addresses() {
 }
 
 #[test]
+fn real16_flag_frames_and_retirement_agree_when_tf_is_clear_cpu_model() {
+    crate::model_api::with_cpu_model(real16_flag_frames_and_retirement_agree_when_tf_is_clear);
+}
+
+#[test]
 fn real16_flag_frames_and_retirement_agree_when_tf_is_clear() {
     // I286 PRM §5.2.2 p. 5-5; 80386 PRM §14.3 p. 14-3:
     // both paths use FLAGS:CS:IP frames and IRET; delivery itself retires nothing.
@@ -1428,6 +1561,13 @@ fn real16_flag_frames_and_retirement_agree_when_tf_is_clear() {
         }
         assert_eq!(ac.retired_instructions(), 5);
     }
+}
+
+#[test]
+fn application_ignores_tf_while_legacy_delays_until_the_successor_cpu_model() {
+    crate::model_api::with_cpu_model(
+        application_ignores_tf_while_legacy_delays_until_the_successor,
+    );
 }
 
 #[test]

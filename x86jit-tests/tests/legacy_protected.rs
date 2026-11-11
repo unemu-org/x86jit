@@ -1,5 +1,7 @@
 //! Same-CPL I386 protected segmentation (decision-18 §§1–4).
 //! Authority: Intel SDM 325462-092US; 80386 PRM 230985-001 (scan checked).
+#[path = "support/model_api.rs"]
+mod model_api;
 use x86jit_core::fault::{ErrorCode, FaultClass};
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, Exit, IrBlock, LegacyCpuModel, MemConsistency, Prot,
@@ -26,7 +28,7 @@ impl Backend for NoBackend {
 fn setup(code: &[u8], code32: bool, stack32: bool) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(NoBackend));
     vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.set_legacy_cpu_model(MODEL);
+    crate::model_api::select(&mut vm, MODEL);
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.cpu.rip = 0x1000;
@@ -102,6 +104,13 @@ fn refused(cpu: &mut Vcpu, vm: &Vm, operation: UnsupportedSystemOperation) {
 }
 
 #[test]
+fn enter_use32_reload_all_caches_execute_and_return_to_real_in_step_slices_cpu_model() {
+    crate::model_api::with_cpu_model(
+        enter_use32_reload_all_caches_execute_and_return_to_real_in_step_slices,
+    );
+}
+
+#[test]
 fn enter_use32_reload_all_caches_execute_and_return_to_real_in_step_slices() {
     // SDM Vol 3A §§12.9.1–12.9.2; 80386 PRM §§14.4.1–14.5 p. 14-4.
     let (vm, mut cpu) = setup(
@@ -152,6 +161,11 @@ fn enter_use32_reload_all_caches_execute_and_return_to_real_in_step_slices() {
 }
 
 #[test]
+fn pe_changes_retain_all_selectors_bases_limits_and_size_bits_cpu_model() {
+    crate::model_api::with_cpu_model(pe_changes_retain_all_selectors_bases_limits_and_size_bits);
+}
+
+#[test]
 fn pe_changes_retain_all_selectors_bases_limits_and_size_bits() {
     // SDM Vol 3A §12.9.1 step 9, §12.9.2 step 4; PRM §§14.4.1–14.5.
     for (old, new) in [(0, 1), (1, 0)] {
@@ -180,6 +194,13 @@ fn pe_changes_retain_all_selectors_bases_limits_and_size_bits() {
         steps(&mut cpu, &vm, 1);
         assert_eq!(cpu.cpu.legacy.cr0, 1);
     }
+}
+
+#[test]
+fn mov_pop_and_far_pointer_loads_validate_and_update_descriptor_accessed_cpu_model() {
+    crate::model_api::with_cpu_model(
+        mov_pop_and_far_pointer_loads_validate_and_update_descriptor_accessed,
+    );
 }
 
 #[test]
@@ -246,6 +267,11 @@ fn mov_pop_and_far_pointer_loads_validate_and_update_descriptor_accessed() {
             assert_eq!(cpu.cpu.gpr[0], if code32 { 0x12345678 } else { 0x5678 });
         }
     }
+}
+
+#[test]
+fn segment_load_fault_codes_null_rules_and_check_order_cpu_model() {
+    crate::model_api::with_cpu_model(segment_load_fault_codes_null_rules_and_check_order);
 }
 
 #[test]
@@ -325,6 +351,13 @@ fn segment_load_fault_codes_null_rules_and_check_order() {
 }
 
 #[test]
+fn same_selector_reload_refreshes_but_gdt_edits_do_not_refresh_hidden_cache_cpu_model() {
+    crate::model_api::with_cpu_model(
+        same_selector_reload_refreshes_but_gdt_edits_do_not_refresh_hidden_cache,
+    );
+}
+
+#[test]
 fn same_selector_reload_refreshes_but_gdt_edits_do_not_refresh_hidden_cache() {
     // SDM Vol 3A §3.4.3; PRM §5.1.1: hidden descriptor survives table edits.
     let (vm, mut cpu) = setup(
@@ -343,6 +376,11 @@ fn same_selector_reload_refreshes_but_gdt_edits_do_not_refresh_hidden_cache() {
     steps(&mut cpu, &vm, 2);
     assert_eq!(cpu.cpu.gpr[3], 0x5678);
     assert_eq!(value(&vm, 0x2015, 1), 0x93);
+}
+
+#[test]
+fn every_access_checks_type_full_limit_and_expand_down_bounds_cpu_model() {
+    crate::model_api::with_cpu_model(every_access_checks_type_full_limit_and_expand_down_bounds);
 }
 
 #[test]
@@ -384,6 +422,13 @@ fn every_access_checks_type_full_limit_and_expand_down_bounds() {
     let (vm, mut cpu) = setup(b"\xb8\x34\x12", false, false);
     cpu.cpu.legacy.segments[0].limit = 0x1001;
     fault(&mut cpu, &vm, 13, 0);
+}
+
+#[test]
+fn far_call_return_and_iret_support_both_transfer_and_stack_sizes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        far_call_return_and_iret_support_both_transfer_and_stack_sizes,
+    );
 }
 
 #[test]
@@ -459,6 +504,11 @@ fn far_call_return_and_iret_support_both_transfer_and_stack_sizes() {
 }
 
 #[test]
+fn far_transfer_faults_leave_frame_and_context_unchanged_cpu_model() {
+    crate::model_api::with_cpu_model(far_transfer_faults_leave_frame_and_context_unchanged);
+}
+
+#[test]
 fn far_transfer_faults_leave_frame_and_context_unchanged() {
     // SDM Vol 3A §§6.8.1, 6.8.3–6.8.6; PRM §17 CALL/JMP/RET/IRET.
     for opcode in [0xea, 0x9a, 0xcb, 0xcf] {
@@ -491,6 +541,11 @@ fn far_transfer_faults_leave_frame_and_context_unchanged() {
     cpu.cpu.legacy.segments[3].limit = 0x7ffc;
     fault(&mut cpu, &vm, 12, 0);
     assert_eq!(value(&vm, 0x200d, 1), 0x9a);
+}
+
+#[test]
+fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals_cpu_model() {
+    crate::model_api::with_cpu_model(ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals);
 }
 
 #[test]
@@ -555,6 +610,13 @@ fn ldt_gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
 }
 
 #[test]
+fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic_cpu_model() {
+    crate::model_api::with_cpu_model(
+        accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic,
+    );
+}
+
+#[test]
 fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_atomic() {
     // SDM Vol 3A §3.4.5.1; PRM §5.1.1 p. 5-4: A is written on load.
     for accessed in [false, true] {
@@ -610,6 +672,13 @@ fn accessed_write_is_required_only_when_clear_and_descriptor_mmio_retries_are_at
 }
 
 #[test]
+fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary_cpu_model() {
+    crate::model_api::with_cpu_model(
+        protected_strings_stack_and_far_pointers_use_the_same_access_boundary,
+    );
+}
+
+#[test]
 fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary() {
     // SDM Vol 3A §§6.3–6.4; Vol 2B §4.3 MOVS/STOS/CMPS/LODS/SCAS;
     // PRM §§6.3.1.1–6.3.1.2: implicit memory operands also check cached rights.
@@ -660,6 +729,11 @@ fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary() {
 }
 
 #[test]
+fn iret_refuses_task_and_v86_before_changing_the_frame_cpu_model() {
+    crate::model_api::with_cpu_model(iret_refuses_task_and_v86_before_changing_the_frame);
+}
+
+#[test]
 fn iret_refuses_task_and_v86_before_changing_the_frame() {
     // Decision-18 §2; SDM Vol 2A §3.3 IRET; PRM §17 pp. 17-74, 17-78.
     let (vm, mut cpu) = setup(b"\xcf", true, false);
@@ -670,7 +744,7 @@ fn iret_refuses_task_and_v86_before_changing_the_frame() {
             0,
             0x20002,
             UnsupportedSystemOperation::InvalidLegacyContext(
-                x86jit_core::LegacyContextError::Virtual8086Unsupported,
+                x86jit_core::MachineContextError::Virtual8086Unsupported,
             ),
         ),
     ] {
@@ -682,6 +756,13 @@ fn iret_refuses_task_and_v86_before_changing_the_frame() {
         refused(&mut cpu, &vm, operation);
         assert_eq!(value(&vm, 0x200d, 1), 0x9a);
     }
+}
+
+#[test]
+fn far_call_mmio_frame_retry_keeps_overwritten_descriptor_and_far_pointer_cpu_model() {
+    crate::model_api::with_cpu_model(
+        far_call_mmio_frame_retry_keeps_overwritten_descriptor_and_far_pointer,
+    );
 }
 
 #[test]
@@ -734,6 +815,13 @@ fn far_call_mmio_frame_retry_keeps_overwritten_descriptor_and_far_pointer() {
 }
 
 #[test]
+fn far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modification_cpu_model() {
+    crate::model_api::with_cpu_model(
+        far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modification,
+    );
+}
+
+#[test]
 fn far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modification() {
     // SDM Vol 2A §3.3 CALL; decision-16 §3: a partial frame must resume
     // the decoded CALL, even after its first push replaced that instruction.
@@ -777,6 +865,13 @@ fn far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modifi
         assert_eq!(cpu.pending_a20_enabled(), None);
         assert_eq!(cpu.retired_instructions(), 1);
     }
+}
+
+#[test]
+fn far_call_mmio_frame_retry_survives_context_eviction_after_self_modification_cpu_model() {
+    crate::model_api::with_cpu_model(
+        far_call_mmio_frame_retry_survives_context_eviction_after_self_modification,
+    );
 }
 
 #[test]
@@ -846,6 +941,13 @@ fn far_call_mmio_frame_retry_survives_context_eviction_after_self_modification()
 }
 
 #[test]
+fn big_real_reload_preserves_descriptor_limits_attributes_and_full_effective_offsets_cpu_model() {
+    crate::model_api::with_cpu_model(
+        big_real_reload_preserves_descriptor_limits_attributes_and_full_effective_offsets,
+    );
+}
+
+#[test]
 fn big_real_reload_preserves_descriptor_limits_attributes_and_full_effective_offsets() {
     // SDM 325462-092US Vol 3A §§2.2, 12.9.2 and Vol 3B §23.1.1;
     // 80386 PRM §§14.1, 14.5 pp. 14-1, 14-4 (scan checked): ordinary
@@ -910,6 +1012,13 @@ fn big_real_reload_preserves_descriptor_limits_attributes_and_full_effective_off
 }
 
 #[test]
+fn big_real_retained_limit_faults_at_the_whole_operand_without_a_fixed_64k_check_cpu_model() {
+    crate::model_api::with_cpu_model(
+        big_real_retained_limit_faults_at_the_whole_operand_without_a_fixed_64k_check,
+    );
+}
+
+#[test]
 fn big_real_retained_limit_faults_at_the_whole_operand_without_a_fixed_64k_check() {
     // Same narrow retained-limit contract as the witness above. Limit is
     // inclusive (SDM Vol 3A §3.4.5; PRM §6.3.1.2), and real faults have
@@ -939,6 +1048,13 @@ fn big_real_retained_limit_faults_at_the_whole_operand_without_a_fixed_64k_check
         ErrorCode::NoCode
     );
     assert_eq!(cpu.cpu.gpr[0], 0x5678);
+}
+
+#[test]
+fn big_real_far_reload_preserves_cs_descriptor_limit_and_attributes_cpu_model() {
+    crate::model_api::with_cpu_model(
+        big_real_far_reload_preserves_cs_descriptor_limit_and_attributes,
+    );
 }
 
 #[test]
