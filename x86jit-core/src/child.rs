@@ -4,6 +4,7 @@
 
 use std::cell::{RefCell, UnsafeCell};
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -15,6 +16,91 @@ use crate::{CpuMode, CpuState, FetchVerdict, IrBlock, IrOp, MemTrap, Memory, Reg
 
 mod transfer;
 pub use transfer::classify;
+
+/// Caller-supplied execution snapshot for [`Vm::child_view_with`].
+/// Omitted addresses are holes even when the parent maps them. Construction
+/// validates structure and backing identity; the embedder must freeze native
+/// execute permissions and refusal tags under its own mapping synchronization.
+#[derive(Clone, Debug, Default)]
+pub struct ChildViewMetadata {
+    pub regions: Vec<ChildRegion>,
+    /// Guest 4 KiB page numbers on which stores must be refused. These supplement
+    /// the parent's code tags sampled at attachment. Each must intersect child RAM.
+    pub code_store_refusals: Vec<u64>,
+}
+
+/// A half-open guest interval in a caller's child snapshot. Adjacent RAM
+/// intervals are joined for data accesses, retaining their own fetch verdicts.
+#[derive(Clone, Debug)]
+pub enum ChildRegion {
+    Ram {
+        range: Range<u64>,
+        /// Index of `range.start` in the parent's backing, relative to
+        /// [`Memory::host_base`]. Must equal `range.start - Memory::guest_base()`.
+        /// No alternate pointer is accepted: child writes must reach parent bytes.
+        backing_offset: usize,
+        /// Frozen verdict for every fetch byte in this interval. Split at page
+        /// boundaries to represent different native execute permissions per page.
+        fetch: FetchVerdict,
+    },
+    /// Traps may narrow any mapped parent interval. Child execution
+    /// refuses both fetches and data accesses here without touching the backing.
+    Trap { range: Range<u64> },
+}
+
+impl ChildRegion {
+    pub(crate) fn range(&self) -> &Range<u64> {
+        match self {
+            Self::Ram { range, .. } | Self::Trap { range } => range,
+        }
+    }
+}
+
+/// Invalid caller metadata; rejected before registering a child bridge journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildViewError {
+    InvalidRange,
+    Overlap,
+    Unmapped,
+    NotRam,
+    BackingMismatch,
+    InvalidCodePage,
+}
+
+impl std::fmt::Display for ChildViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRange => "child interval is empty, reversed or outside the parent span",
+            Self::Overlap => "child intervals overlap",
+            Self::Unmapped => "child interval crosses an unmapped parent address",
+            Self::NotRam => "child RAM interval crosses parent non-RAM memory",
+            Self::BackingMismatch => "child RAM offset does not match the parent backing",
+            Self::InvalidCodePage => "child refusal page does not intersect child RAM",
+        })
+    }
+}
+impl std::error::Error for ChildViewError {}
+
+pub(crate) enum FrozenFetch {
+    Pages(Vec<(u64, FetchVerdict)>),
+    Ranges(Vec<(Range<u64>, FetchVerdict)>),
+}
+
+impl FrozenFetch {
+    fn verdict(&self, addr: u64) -> FetchVerdict {
+        match self {
+            Self::Pages(pages) => pages
+                .binary_search_by_key(&(addr >> CODE_PAGE_BITS), |&(p, _)| p)
+                .ok()
+                .map(|i| pages[i].1),
+            Self::Ranges(ranges) => ranges
+                .partition_point(|(range, _)| range.start <= addr)
+                .checked_sub(1)
+                .and_then(|i| ranges[i].0.contains(&addr).then_some(ranges[i].1)),
+        }
+        .unwrap_or(FetchVerdict::DenyNotPresent)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Region {
@@ -183,7 +269,7 @@ pub struct ChildView<'vm> {
     pub(crate) before_tag_read: Option<&'vm (dyn Fn() + Sync)>,
     #[cfg(test)]
     pub(crate) before_journal: Option<&'vm (dyn Fn() + Sync)>,
-    pub(crate) fetch: Option<Vec<(u64, FetchVerdict)>>,
+    pub(crate) fetch: Option<FrozenFetch>,
     pub(crate) recover: bool,
     pub(crate) mode: CpuMode,
     pub(crate) features: crate::GuestCpuFeatures,
@@ -1477,12 +1563,7 @@ fn step_ordered<const ORDER: u8>(
             break;
         }
         if let Some(fetch) = &view.fetch {
-            let page = addr >> CODE_PAGE_BITS;
-            let verdict = fetch
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .ok()
-                .map(|i| fetch[i].1)
-                .unwrap_or(FetchVerdict::DenyNotPresent);
+            let verdict = fetch.verdict(addr);
             if verdict != FetchVerdict::Allow {
                 mem.fault(addr, 1, FaultAccess::Execute, false, true);
                 if let Some(ChildStep::Fault(f)) = &mut memory.borrow_mut().outcome {
@@ -1707,6 +1788,137 @@ fn copy_cpu(dst: &mut CpuState, src: &CpuState) {
 mod tests {
     use super::*;
     use crate::{Prot, VmConfig};
+
+    #[test]
+    fn sparse_child_journal_and_code_snapshot_cover_only_child_ram() {
+        for span in [0x10000, 0x1000000] {
+            let mut vm = Vm::new(VmConfig::flat(span));
+            vm.map(0, span as usize, Prot::RWX, RegionKind::Ram)
+                .unwrap();
+            vm.set_fetch_policy(Box::new(|_| {
+                panic!("sparse attachment called parent policy")
+            }));
+            // Tags in holes, traps and both ends of a snapshot word must be masked.
+            for page in [0, 1, 3, 5, 6, 15] {
+                vm.mem.mark_code(page << CODE_PAGE_BITS, 1);
+            }
+            let view = vm
+                .child_view_with(
+                    ChildViewMetadata {
+                        regions: vec![
+                            ChildRegion::Ram {
+                                range: 0x3001..0x5001,
+                                backing_offset: 0x3001,
+                                fetch: FetchVerdict::Allow,
+                            },
+                            ChildRegion::Trap {
+                                range: 0x6000..span,
+                            },
+                            ChildRegion::Ram {
+                                range: 0x1001..0x1fff,
+                                backing_offset: 0x1001,
+                                fetch: FetchVerdict::Allow,
+                            },
+                        ],
+                        code_store_refusals: vec![4, 4],
+                    },
+                    CpuMode::Long64,
+                )
+                .unwrap();
+            assert_eq!(view.writes.pages.len(), 2);
+            assert_eq!(
+                view.writes
+                    .pages
+                    .iter()
+                    .map(|(_, words)| words.len() * 8)
+                    .sum::<usize>(),
+                16
+            );
+            assert_eq!(
+                view.code.pages,
+                vec![(0, (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5))]
+            );
+            assert_eq!(view.regions.len(), 3);
+            assert!(std::ptr::eq(view.parent, &vm.mem));
+        }
+    }
+
+    #[test]
+    fn sparse_child_backing_and_tags_use_nonzero_guest_base() {
+        let base = 0x10010;
+        let len = 0x4000;
+        let backing = vec![0u128; len / 16].into_boxed_slice();
+        let ptr = Box::into_raw(backing).cast::<u128>().cast::<u8>();
+        let mut vm = Vm::new(VmConfig::flat(0));
+        vm.consistency = crate::MemConsistency::FullTso;
+        vm.mem = Memory::from_host_ram(
+            crate::MemoryModel::Reserved {
+                span: base + len as u64,
+            },
+            crate::HostRam {
+                ptr,
+                len,
+                guest_base: base,
+                dtor: Box::new(|ptr, len| {
+                    // SAFETY: this is the boxed u128 slice transferred above.
+                    unsafe {
+                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                            ptr.cast::<u128>(),
+                            len / 16,
+                        )))
+                    };
+                }),
+                protect: None,
+            },
+        )
+        .unwrap();
+        vm.map(base, len, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(base, &[0x89, 0x18]).unwrap();
+        vm.mem.mark_code(base + 0x2000, 1);
+        let metadata = ChildViewMetadata {
+            regions: vec![ChildRegion::Ram {
+                range: base..base + len as u64,
+                backing_offset: 0,
+                fetch: FetchVerdict::Allow,
+            }],
+            code_store_refusals: vec![(base + 0x3000) >> CODE_PAGE_BITS],
+        };
+        let mut wrong = metadata.clone();
+        let ChildRegion::Ram { backing_offset, .. } = &mut wrong.regions[0] else {
+            unreachable!()
+        };
+        *backing_offset = base as usize;
+        assert!(matches!(
+            vm.child_view_with(wrong, CpuMode::Long64),
+            Err(ChildViewError::BackingMismatch)
+        ));
+        let view = vm.child_view_with(metadata, CpuMode::Long64).unwrap();
+        assert_eq!(view.mem_consistency(), crate::MemConsistency::FullTso);
+        assert_eq!(view.guest_cpu_features(), vm.guest_cpu_features());
+        assert_eq!(view.x87_pointer_model(), vm.x87_pointer_model());
+        assert!(view.code_page((base + 0x2000) >> CODE_PAGE_BITS));
+        assert!(view.code_page((base + 0x3000) >> CODE_PAGE_BITS));
+        let mut cpu = CpuState {
+            rip: base,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = base + 0x1000;
+        cpu.gpr[3] = 42;
+        let mut arena = ChildArena::new(2);
+        assert!(matches!(
+            step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        assert_eq!(vm.mem.read(base + 0x1000, 4), Ok(42));
+        assert_eq!(
+            &*arena.written_pages(),
+            &[(base + 0x1000) >> CODE_PAGE_BITS]
+        );
+        let mut pages = Vec::new();
+        view.writes.drain(|page| pages.push(page));
+        assert_eq!(pages, arena.written_pages().as_ref());
+        vm.invalidate_written_pages(&arena);
+    }
 
     #[test]
     fn child_ir_and_temporary_budgets_refuse() {

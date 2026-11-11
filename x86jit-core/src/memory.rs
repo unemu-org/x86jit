@@ -1112,6 +1112,158 @@ impl Memory {
                 })
                 .collect()
         });
+        self.attach_child_view(
+            vm,
+            mode,
+            regions,
+            fetch.map(crate::child::FrozenFetch::Pages),
+            || {
+                // Only the widened code extent can contain set bits. Retain nonzero
+                // words instead of copying the full sparse address-space bitmap.
+                let range = self.code_range.load(Ordering::Acquire);
+                let lo = (range >> 32) << CODE_RANGE_BITS;
+                let hi = ((range >> 32) + (range & 0xffff_ffff)) << CODE_RANGE_BITS;
+                let first_word = ((lo >> CODE_PAGE_BITS).saturating_sub(first_page) >> 6) as usize;
+                let end_word =
+                    (((hi >> CODE_PAGE_BITS).saturating_sub(first_page) + 63) >> 6) as usize;
+                (first_word..end_word.min(self.code_page.len()))
+                    .filter_map(|i| {
+                        let bits = self.code_page[i].load(Ordering::Acquire);
+                        (bits != 0).then_some((i as u64, bits))
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    pub(crate) fn child_view_with<'vm>(
+        &'vm self,
+        vm: &'vm crate::Vm,
+        mut metadata: crate::ChildViewMetadata,
+        mode: crate::CpuMode,
+    ) -> Result<crate::ChildView<'vm>, crate::ChildViewError> {
+        use crate::{ChildRegion, ChildViewError};
+
+        metadata.regions.sort_unstable_by_key(|r| r.range().start);
+        let mut parent_regions: Vec<_> = self.regions.iter().filter(|r| r.size != 0).collect();
+        parent_regions.sort_unstable_by_key(|r| r.start);
+        let mut regions: Vec<crate::child::Region> = Vec::new();
+        let mut fetch = Vec::new();
+        let mut previous_end = self.guest_base;
+        for region in metadata.regions {
+            let range = region.range();
+            if range.start >= range.end || range.start < self.guest_base || range.end > self.size()
+            {
+                return Err(ChildViewError::InvalidRange);
+            }
+            if range.start < previous_end {
+                return Err(ChildViewError::Overlap);
+            }
+            previous_end = range.end;
+            let ram = matches!(region, ChildRegion::Ram { .. });
+            let mut cursor = range.start;
+            let first = parent_regions.partition_point(|r| r.start + r.size as u64 <= cursor);
+            for parent in &parent_regions[first..] {
+                if cursor == range.end {
+                    break;
+                }
+                if parent.start > cursor {
+                    break;
+                }
+                if ram && parent.kind != RegionKind::Ram {
+                    return Err(ChildViewError::NotRam);
+                }
+                cursor = range.end.min(parent.start + parent.size as u64);
+            }
+            if cursor != range.end {
+                return Err(ChildViewError::Unmapped);
+            }
+            if let ChildRegion::Ram {
+                backing_offset,
+                fetch: verdict,
+                ..
+            } = &region
+            {
+                if *backing_offset != (range.start - self.guest_base) as usize {
+                    return Err(ChildViewError::BackingMismatch);
+                }
+                fetch.push((range.clone(), *verdict));
+            }
+            let kind = if ram {
+                RegionKind::Ram
+            } else {
+                RegionKind::Trap
+            };
+            if let Some(last) = regions
+                .last_mut()
+                .filter(|r| r.end == range.start && r.kind == kind)
+            {
+                last.end = range.end;
+            } else {
+                regions.push(crate::child::Region {
+                    start: range.start,
+                    end: range.end,
+                    kind,
+                    _prot: Prot::RWX,
+                });
+            }
+        }
+        let ram_pages: Vec<_> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::Ram)
+            .map(|r| (r.start >> CODE_PAGE_BITS, (r.end - 1) >> CODE_PAGE_BITS))
+            .collect();
+        for &page in &metadata.code_store_refusals {
+            if !ram_pages
+                .iter()
+                .any(|&(first, last)| first <= page && page <= last)
+            {
+                return Err(ChildViewError::InvalidCodePage);
+            }
+        }
+        let first_page = self.guest_base >> CODE_PAGE_BITS;
+        Ok(self.attach_child_view(
+            vm,
+            mode,
+            regions,
+            Some(crate::child::FrozenFetch::Ranges(fetch)),
+            || {
+                let mut words = BTreeMap::new();
+                // Sample only words intersecting sparse RAM, masking unrelated pages.
+                // The alias mutex held by attachment also covers snapshot/tag retention.
+                for (first, last) in ram_pages {
+                    let first = first - first_page;
+                    let last = last - first_page;
+                    for word in (first >> 6)..=(last >> 6) {
+                        let mut bits = self.code_page[word as usize].load(Ordering::Acquire);
+                        if word == first >> 6 {
+                            bits &= u64::MAX << (first & 63);
+                        }
+                        if word == last >> 6 {
+                            bits &= u64::MAX >> (63 - (last & 63));
+                        }
+                        if bits != 0 {
+                            *words.entry(word).or_default() |= bits;
+                        }
+                    }
+                }
+                for page in metadata.code_store_refusals {
+                    let relative = page - first_page;
+                    *words.entry(relative >> 6).or_default() |= 1 << (relative & 63);
+                }
+                words.into_iter().collect()
+            },
+        ))
+    }
+
+    fn attach_child_view<'vm>(
+        &'vm self,
+        vm: &'vm crate::Vm,
+        mode: crate::CpuMode,
+        regions: Vec<crate::child::Region>,
+        fetch: Option<crate::child::FrozenFetch>,
+        snapshot: impl FnOnce() -> crate::child::CodeSnapshot,
+    ) -> crate::ChildView<'vm> {
         let writes = Arc::new(crate::child::ChildWrites::new(&regions));
         {
             let words = self.dispatch_words.lock().unwrap();
@@ -1122,19 +1274,7 @@ impl Memory {
             }
         }
         let mut aliases = self.code_aliases.lock().unwrap();
-        // Only the widened code extent can contain set bits. Retain nonzero words
-        // as plain data instead of copying the full sparse address-space bitmap.
-        let range = self.code_range.load(Ordering::Acquire);
-        let lo = (range >> 32) << CODE_RANGE_BITS;
-        let hi = ((range >> 32) + (range & 0xffff_ffff)) << CODE_RANGE_BITS;
-        let first_word = ((lo >> CODE_PAGE_BITS).saturating_sub(first_page) >> 6) as usize;
-        let end_word = (((hi >> CODE_PAGE_BITS).saturating_sub(first_page) + 63) >> 6) as usize;
-        let code = (first_word..end_word.min(self.code_page.len()))
-            .filter_map(|i| {
-                let bits = self.code_page[i].load(Ordering::Acquire);
-                (bits != 0).then_some((i as u64, bits))
-            })
-            .collect();
+        let code = snapshot();
         let mut journals = self.child_writes.lock().unwrap();
         journals.retain(|journal| journal.strong_count() != 0);
         journals.push(Arc::downgrade(&writes));
@@ -4571,6 +4711,151 @@ mod fault_layout_tests {
 mod child_isolation_tests {
     use super::*;
     use crate::{child, ChildArena, ChildStep, CpuMode, CpuState, Vm, VmConfig};
+
+    fn child_ram(range: std::ops::Range<u64>) -> crate::ChildRegion {
+        crate::ChildRegion::Ram {
+            backing_offset: range.start as usize,
+            range,
+            fetch: FetchVerdict::Allow,
+        }
+    }
+
+    #[test]
+    fn invalid_sparse_child_metadata_never_registers_a_journal() {
+        use crate::{ChildRegion, ChildViewError as E, ChildViewMetadata};
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        // Deliberately unsorted parent mappings, including adjacent RAM and a gap.
+        vm.map(0x4000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        vm.map(0x2000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x5000, 0x1000, Prot::RX, RegionKind::Rom).unwrap();
+        let cases = [
+            (vec![child_ram(0x1000..0x1000)], vec![], E::InvalidRange),
+            (
+                vec![child_ram(std::ops::Range {
+                    start: 0x2000,
+                    end: 0x1000,
+                })],
+                vec![],
+                E::InvalidRange,
+            ),
+            (vec![child_ram(0xffff..u64::MAX)], vec![], E::InvalidRange),
+            (
+                vec![
+                    child_ram(0x1000..0x2000),
+                    ChildRegion::Trap {
+                        range: 0x1800..0x1900,
+                    },
+                ],
+                vec![],
+                E::Overlap,
+            ),
+            (vec![child_ram(0x1800..0x4001)], vec![], E::Unmapped),
+            (
+                vec![ChildRegion::Trap {
+                    range: 0x3000..0x4000,
+                }],
+                vec![],
+                E::Unmapped,
+            ),
+            (vec![child_ram(0x4000..0x5000)], vec![], E::NotRam),
+            (vec![child_ram(0x5000..0x6000)], vec![], E::NotRam),
+            (
+                vec![ChildRegion::Ram {
+                    range: 0x1000..0x2000,
+                    backing_offset: 0,
+                    fetch: FetchVerdict::Allow,
+                }],
+                vec![],
+                E::BackingMismatch,
+            ),
+            (vec![child_ram(0x1000..0x2000)], vec![2], E::InvalidCodePage),
+            (
+                vec![ChildRegion::Trap {
+                    range: 0x4000..0x5000,
+                }],
+                vec![4],
+                E::InvalidCodePage,
+            ),
+            (vec![], vec![u64::MAX], E::InvalidCodePage),
+        ];
+        for (regions, code_store_refusals, error) in cases {
+            assert!(
+                matches!(vm.child_view_with(ChildViewMetadata { regions, code_store_refusals }, CpuMode::Long64), Err(e) if e == error)
+            );
+            assert!(vm.mem.child_writes.lock().unwrap().is_empty());
+            assert_eq!(vm.mem.code_aliases.lock().unwrap().live_children, 0);
+        }
+        let view = vm
+            .child_view_with(
+                ChildViewMetadata {
+                    regions: vec![
+                        child_ram(0x1800..0x2800),
+                        ChildRegion::Trap {
+                            range: 0x4000..0x6000,
+                        },
+                    ],
+                    code_store_refusals: vec![],
+                },
+                CpuMode::Long64,
+            )
+            .unwrap();
+        assert_eq!(vm.mem.code_aliases.lock().unwrap().live_children, 1);
+        drop(view);
+        assert_eq!(vm.mem.code_aliases.lock().unwrap().live_children, 0);
+        assert!(vm.mem.child_writes.lock().unwrap().is_empty());
+        let empty = vm
+            .child_view_with(ChildViewMetadata::default(), CpuMode::Long64)
+            .unwrap();
+        drop(empty);
+    }
+
+    #[test]
+    fn sparse_child_uses_parent_alias_history_until_last_view_drop() {
+        use crate::ChildViewMetadata;
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &[0x89, 0x18]).unwrap();
+        let view = vm
+            .child_view_with(
+                ChildViewMetadata {
+                    regions: vec![child_ram(0x1000..0x2000), child_ram(0x3000..0x4000)],
+                    code_store_refusals: vec![],
+                },
+                CpuMode::Long64,
+            )
+            .unwrap();
+        let sibling_view = vm.child_view(CpuMode::Long64);
+        vm.mem.declare_code_alias(0x3000, 0x8000, 0x1000).unwrap();
+        vm.mem.mark_code(0x8000, 1);
+        let word = Arc::new(AtomicU64::new(0));
+        vm.mem.register_dispatch_word(&word);
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.gpr[0] = 0x3000;
+        cpu.gpr[3] = 42;
+        let mut arena = ChildArena::new(2);
+        assert!(matches!(
+            child::step(&view, &mut cpu, &mut arena),
+            ChildStep::Continue
+        ));
+        assert!(vm.mem.remove_code_alias(0x3000, 0x8000, 0x1000));
+        vm.mem.dispatch_smc(&word, |ranges| {
+            assert_eq!(ranges, vec![(0x3000, 0x4000), (0x8000, 0x9000)])
+        });
+        vm.invalidate_written_pages(&arena);
+        drop(view);
+        assert_eq!(vm.mem.code_aliases.lock().unwrap().live_children, 1);
+        assert!(vm.mem.is_code_page(3));
+        drop(sibling_view);
+        let aliases = vm.mem.code_aliases.lock().unwrap();
+        assert_eq!(aliases.live_children, 0);
+        assert!(aliases.retired_aliases.is_empty());
+        assert!(!vm.mem.is_code_page(3));
+        assert!(vm.mem.is_code_page(8));
+    }
 
     #[test]
     fn alias_removal_before_child_journal_publication() {

@@ -158,3 +158,37 @@ notification makes the pre-journal-publication witness fail at `no formerly
 aliased translation survives`. Dispatch drains and acknowledges before the child
 publishes its bit; its later cleared-tag read produces no new notification. With
 deferred clearing restored, both pause points and both dispatch timings pass.
+
+## Sparse metadata constructor amendment — 2026-11-11
+
+READ: `Vm::child_view_with(ChildViewMetadata, mode)` attaches caller-supplied
+execution metadata to the **running parent's** existing bridge. The original
+`child_view(mode)` keeps its behavior. Metadata lists half-open RAM intervals
+with parent-backing offsets and frozen fetch verdicts, Trap intervals, and guest
+page numbers carrying additional snapshot store refusals. Omitted addresses stay
+holes. RAM intervals may be split to express page-specific fetch permissions;
+adjacent RAM intervals share data-access bounds while retaining those verdicts.
+
+The constructor rejects empty/reversed/out-of-span or overlapping intervals,
+parent mapping gaps, RAM over parent non-RAM, mismatched backing offsets, and
+refusal pages that do not intersect child RAM. Offsets must identify exactly the
+parent's bytes at the same guest addresses; arbitrary alternate backings are not
+accepted. Trap intervals may narrow any mapped parent memory. Input ordering is
+normalized, and duplicate refusal pages are harmless. Native permission accuracy
+and mapping synchronization remain the embedder's responsibility.
+
+Construction invokes no parent fetch callback and enumerates no parent pages
+outside child RAM. It samples parent code tags intersecting sparse RAM under the
+alias mutex and unions them with caller refusal tags. The journal costs one bit
+per child RAM page, rounded to a 64-bit word per contiguous RAM interval. Traps
+and holes allocate no journal bits. Live tags, journal registration, dispatch
+targets (including later vCPUs), alias history and parent-side drop accounting
+all bind to the running parent. CPU, memory-consistency and host-fault policy
+also come from that parent. The view borrows its lifetime; final reconciliation
+and drop retain the same parent-only protocol as the original constructor.
+
+MEASURED: core witnesses keep the sparse journal at 16 bytes while the broad
+parent mapping grows from 64 KiB to 16 MiB, reject invalid input without journal
+registration, and retain aliases across mixed view lifetimes. The `child_step`
+witness observes late-translated patches on both parent vCPUs before detach or
+final reconciliation, with interpreter and JIT backends and a late registration.

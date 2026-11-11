@@ -785,6 +785,30 @@ impl Vm {
         view
     }
 
+    /// Attach a caller's sparse child snapshot to this running VM's SMC bridge.
+    /// RAM intervals must lie in parent RAM and name the same backing offsets;
+    /// traps may narrow any mapped parent interval. Holes, frozen fetch verdicts
+    /// and extra store-refusal tags come from `metadata`, without consulting the
+    /// parent's fetch callback or enumerating its broad mappings. The journal
+    /// uses one bit per child RAM page, rounded to 64 bits per contiguous interval.
+    /// CPU policy, live tags, notifications, alias retention and drop accounting
+    /// all belong to this VM. Existing parent code tags also refuse child stores.
+    ///
+    /// Call in the parent under the embedder's mapping synchronization before
+    /// fork. Native permission snapshots are the caller's responsibility. Like
+    /// [`Self::child_view`], drop the view in the parent after child exit/exec and
+    /// final written-page reconciliation on this VM.
+    pub fn child_view_with(
+        &self,
+        metadata: crate::ChildViewMetadata,
+        mode: CpuMode,
+    ) -> Result<crate::ChildView<'_>, crate::ChildViewError> {
+        let _ = crate::codemap::ProcessIdentity::current();
+        let mut view = self.mem.child_view_with(self, metadata, mode)?;
+        view.code.consistency = self.consistency;
+        Ok(view)
+    }
+
     /// Reconcile a finished child's written-page log with concurrent translation
     /// and execution, using the ordinary address-scoped invalidation protocol.
     /// Call after child exit/exec, while its view and backing still live. Watched

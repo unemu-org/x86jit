@@ -52,6 +52,14 @@
 //! notifies every parent vCPU before the child can signal a guest peer. REP faults retain
 //! completed iterations; host split stores can leave a partial memory effect.
 //!
+//! With broad parent mappings, use [`Vm::child_view_with`] and
+//! [`ChildViewMetadata`] to supply sparse RAM/trap intervals, backing offsets,
+//! frozen fetch verdicts and extra snapshot store-refusal pages. Construction
+//! validates intervals and backing identity without calling the parent fetch
+//! policy. Only child RAM sizes the journal; live tags, dispatch, alias retention
+//! and parent-side drop still belong to the running VM. CPU policy is inherited
+//! from that VM. The embedder freezes native permission metadata before attachment.
+//!
 //! The child step path uses only the live atomic code tags and store-notification
 //! bridge from the parent. It never takes parent locks or consults mutable mapping
 //! metadata, caches, code maps or policies, and does not allocate or run parent-owned
@@ -175,7 +183,10 @@ pub mod vm;
 pub mod x87;
 
 pub use cache::{BlockKey, CachedBlock, CompiledPtr, TranslationCache};
-pub use child::{ChildArena, ChildFault, ChildRefusal, ChildStep, ChildView};
+pub use child::{
+    ChildArena, ChildFault, ChildRefusal, ChildRegion, ChildStep, ChildView, ChildViewError,
+    ChildViewMetadata,
+};
 pub use codemap::{
     mark_shared_address_space_child, retire_shared_address_space_child, GuestAccessKind,
     GuestTrapSite, SharedAddressSpaceChild, SharedChildRetirement, SharedChildTableFull,

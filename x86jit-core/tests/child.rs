@@ -637,6 +637,96 @@ fn child_fetch_snapshot_and_syscall_evidence() {
 }
 
 #[test]
+fn child_sparse_metadata_preserves_holes_traps_fetch_and_store_refusals() {
+    use x86jit_core::{ChildRegion, ChildViewMetadata, FetchVerdict};
+    let mut vm = Vm::new(VmConfig::flat(0x10000));
+    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, &[0x48, 0x89, 0x18]).unwrap();
+    // A load spanning adjacent metadata intervals must still access shared RAM.
+    vm.write_bytes(0x1100, &[0x48, 0x8b, 0x18]).unwrap();
+    vm.write_bytes(0x3ffc, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    vm.set_fetch_policy(Box::new(|_| panic!("caller froze child fetch permissions")));
+    vm.mem.mark_code(0x6000, 1);
+    let ram = |range: std::ops::Range<u64>, fetch| ChildRegion::Ram {
+        backing_offset: range.start as usize,
+        range,
+        fetch,
+    };
+    let view = vm
+        .child_view_with(
+            ChildViewMetadata {
+                regions: vec![
+                    ram(0x1000..0x2000, FetchVerdict::Allow),
+                    ram(0x3000..0x4000, FetchVerdict::DenyProtection),
+                    ram(0x4000..0x5000, FetchVerdict::DenyNotPresent),
+                    ChildRegion::Trap {
+                        range: 0x5000..0x6000,
+                    },
+                    ram(0x6000..0x7000, FetchVerdict::Allow),
+                    ram(0x7000..0x8000, FetchVerdict::Allow),
+                ],
+                code_store_refusals: vec![7],
+            },
+            CpuMode::Long64,
+        )
+        .unwrap();
+    let mut cpu = initial_cpu();
+    let mut arena = ChildArena::new(4);
+    cpu.rip = 0x1100;
+    cpu.gpr[0] = 0x3ffc;
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Continue
+    ));
+    assert_eq!(cpu.gpr[3], 0x0807_0605_0403_0201);
+    for addr in [0x2000, 0x5000, 0x6000, 0x7000] {
+        cpu.rip = 0x1000;
+        cpu.gpr[0] = addr;
+        let before = format!("{cpu:?}");
+        let result = no_alloc(|| child::step(&view, &mut cpu, &mut arena));
+        match addr {
+            0x2000 => assert!(matches!(result, ChildStep::Fault(_))),
+            0x5000 => assert!(matches!(result, ChildStep::Refused(ChildRefusal::Mmio))),
+            _ => assert!(matches!(
+                result,
+                ChildStep::Refused(ChildRefusal::CodeStore)
+            )),
+        }
+        assert_eq!(before, format!("{cpu:?}"));
+        assert_eq!(vm.mem.read(addr, 8), Ok(0));
+    }
+    for (rip, present) in [(0x3000, 1), (0x4000, 0), (0x2000, 0)] {
+        cpu.rip = rip;
+        let ChildStep::Fault(fault) = no_alloc(|| child::step(&view, &mut cpu, &mut arena)) else {
+            panic!()
+        };
+        let projection = fault.projection.unwrap();
+        assert!(projection.is_fetch());
+        assert_eq!(
+            projection.error_code(),
+            x86jit_core::ErrorCode::bits(present, 1)
+        );
+        assert_eq!(cpu.rip, rip);
+    }
+    cpu.rip = 0x5000;
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Refused(ChildRefusal::Mmio)
+    ));
+    assert!(arena.written_pages().is_empty());
+    // The same frozen policy refuses only fetches: data stores still use RAM.
+    cpu.rip = 0x1000;
+    cpu.gpr[0] = 0x3000;
+    cpu.gpr[3] = 42;
+    assert!(matches!(
+        no_alloc(|| child::step(&view, &mut cpu, &mut arena)),
+        ChildStep::Continue
+    ));
+    assert_eq!(vm.mem.read(0x3000, 8), Ok(42));
+    vm.invalidate_written_pages(&arena);
+}
+
+#[test]
 fn child_arenas_are_independent_and_parent_reconciles_watches() {
     let vm = vm(&[0x48, 0x89, 0x18]);
     vm.watch_range(0x3000, 0x3000);

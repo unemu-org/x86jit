@@ -185,7 +185,17 @@ fn child_store_races_sibling_registration() {
 
 #[test]
 fn child_store_notifies_late_tagged_code_before_parent_reconciliation() {
+    child_store_notifies_late_tagged_code(false);
+}
+
+#[test]
+fn sparse_child_store_notifies_running_parent_before_detach() {
+    child_store_notifies_late_tagged_code(true);
+}
+
+fn child_store_notifies_late_tagged_code(sparse: bool) {
     use std::sync::mpsc;
+    use x86jit_core::{ChildRegion, ChildViewMetadata, FetchVerdict};
 
     for jit in [false, true] {
         // Scalar, deferred vector, REP and locked stores all commit through the
@@ -201,16 +211,38 @@ fn child_store_notifies_late_tagged_code_before_parent_reconciliation() {
             } else {
                 Box::new(InterpreterBackend)
             };
-            let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
-            vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
-            vm.map(0x3000, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            let mut vm = Vm::with_backend(VmConfig::flat(0x1000000), backend);
+            if sparse {
+                vm.map(0, 0x1000000, Prot::RWX, RegionKind::Ram).unwrap();
+            } else {
+                vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.map(0x3000, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            }
             vm.write_bytes(0x1000, code).unwrap();
             let entry = if code[0] == 0xf0 { 0x3ffb } else { 0x3ffe };
             vm.write_bytes(entry, &[0xb8, 0, 0, 0, 0, 0xf4]).unwrap();
             assert!(!vm.mem.is_code_page(3));
             assert!(!vm.mem.is_code_page(4));
             let mut parent = vm.new_vcpu();
-            let view = vm.child_view(CpuMode::Long64);
+            let view = if sparse {
+                vm.child_view_with(
+                    ChildViewMetadata {
+                        regions: [0x1000..0x2000, 0x3000..0x5000]
+                            .into_iter()
+                            .map(|range| ChildRegion::Ram {
+                                backing_offset: range.start as usize,
+                                range,
+                                fetch: FetchVerdict::Allow,
+                            })
+                            .collect(),
+                        code_store_refusals: vec![],
+                    },
+                    CpuMode::Long64,
+                )
+                .unwrap()
+            } else {
+                vm.child_view(CpuMode::Long64)
+            };
             // Register a sibling after view creation and warm its cached path.
             let mut sibling = vm.new_vcpu();
             for cpu in [&mut parent, &mut sibling] {
