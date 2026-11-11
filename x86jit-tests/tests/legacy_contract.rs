@@ -149,8 +149,9 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
         cpu.cpu.rip = 0x1000;
         cpu.cpu.gpr[4] = 0x3000;
         cpu.cpu.flags.if_ = true;
-        // Protected execution remains outside the real-forms phase.
+        // Nonzero-CPL execution awaits the complete privilege-enforcement seam.
         cpu.cpu.legacy.cr0 = 1;
+        cpu.cpu.legacy.cpl = 1;
         // Outstanding and completed device work must remain untouched on refusal.
         cpu.cpu.pending_mmio = Some(0xabcd);
         cpu.cpu.pending_mmio_write = true;
@@ -164,7 +165,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
                 cpu.run(&vm, budget),
                 Exit::UnsupportedSystemContext {
                     addr: 0x1000,
-                    operation: UnsupportedSystemOperation::LegacyExecution,
+                    operation: UnsupportedSystemOperation::LegacyEntryFacility,
                     ..
                 }
             ));
@@ -173,7 +174,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
         assert!(matches!(
             cpu.step_instruction(&vm),
             StepResult::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::LegacyExecution,
+                operation: UnsupportedSystemOperation::LegacyEntryFacility,
                 ..
             })
         ));
@@ -184,7 +185,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
             assert!(matches!(
                 run.stop(),
                 StepStop::Exit(Exit::UnsupportedSystemContext {
-                    operation: UnsupportedSystemOperation::LegacyExecution,
+                    operation: UnsupportedSystemOperation::LegacyEntryFacility,
                     ..
                 })
             ));

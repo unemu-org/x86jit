@@ -10,7 +10,7 @@ use iced_x86::{Decoder, DecoderError, DecoderOptions};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LegacyBlockKey {
     owner_id: u64,
-    context_epoch: u64,
+    context_id: u64,
     model_semantics_id: u64,
     decode_bits: u8,
     stack_bits: u8,
@@ -19,7 +19,7 @@ struct LegacyBlockKey {
     linear_fetch: u32,
     mxcsr_mode: u32,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct LegacyContextStamp {
     model: LegacyCpuModel,
     state: LegacyCpuState,
@@ -38,15 +38,35 @@ impl LegacyContextStamp {
         }
     }
 }
+// Decision-20: the firmware-style transition loop uses four contexts. Sixteen
+// leaves room for a handful of code/stack configurations while bounding churn.
+const MAX_RETAINED_CONTEXTS: usize = 16;
+
+struct RetainedContext {
+    id: u64,
+    last_used: u64,
+}
+
 struct Block {
     ir: Arc<IrBlock>,
     bytes: Vec<u8>,
 }
+struct InstructionRetry {
+    stamp: LegacyContextStamp,
+    ip: u64,
+    mxcsr_mode: u32,
+    ir: Arc<IrBlock>,
+}
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
+    context_id: u64,
     stamp: Option<LegacyContextStamp>,
+    contexts: HashMap<LegacyContextStamp, RetainedContext>,
     blocks: HashMap<LegacyBlockKey, Block>,
+    instruction_retry: Option<InstructionRetry>,
+    #[cfg(test)]
+    lifts: u64,
     // Accepted IRQ delivery can itself hand off an MMIO transfer. Its retry
     // must complete before executing the interrupted instruction (decision-16 §3).
     irq_retry: Option<(u8, u32, u16)>,
@@ -60,19 +80,64 @@ impl Execution {
         Self {
             owner_id,
             context_epoch: 0,
+            context_id: 0,
             stamp: None,
+            contexts: HashMap::new(),
             blocks: HashMap::new(),
+            instruction_retry: None,
+            #[cfg(test)]
+            lifts: 0,
             irq_retry: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.irq_retry = None;
+        self.instruction_retry = None;
+    }
+    fn invalidate_translations(&mut self) {
+        self.blocks.clear();
+        self.contexts.clear();
+        self.stamp = None;
     }
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {
         let stamp = LegacyContextStamp::new(cpu, model);
         if force || self.stamp != Some(stamp) {
-            self.blocks.clear();
-            self.context_epoch = self.context_epoch.checked_add(1).unwrap_or(0);
+            self.context_epoch = if let Some(next) = self.context_epoch.checked_add(1) {
+                next
+            } else {
+                self.invalidate_translations();
+                0
+            };
+            // Decision-18 §3 guard dimensions remain complete. Stable identities
+            // implement the accepted transition-cost contract: returning to an
+            // identical context reuses its IR instead of discarding other modes.
+            // Fetch still revalidates bytes, mappings and policy on every entry.
+            self.context_id = if let Some(context) = self.contexts.get_mut(&stamp) {
+                context.last_used = self.context_epoch;
+                context.id
+            } else {
+                let id = if self.contexts.len() == MAX_RETAINED_CONTEXTS {
+                    let oldest = *self
+                        .contexts
+                        .iter()
+                        .min_by_key(|(_, context)| context.last_used)
+                        .unwrap()
+                        .0;
+                    let evicted = self.contexts.remove(&oldest).unwrap();
+                    self.blocks.retain(|key, _| key.context_id != evicted.id);
+                    evicted.id
+                } else {
+                    self.contexts.len() as u64
+                };
+                self.contexts.insert(
+                    stamp,
+                    RetainedContext {
+                        id,
+                        last_used: self.context_epoch,
+                    },
+                );
+                id
+            };
             self.stamp = Some(stamp);
         }
     }
@@ -83,10 +148,12 @@ impl Execution {
         model: LegacyCpuModel,
         context: LegacyDecodeContext,
     ) -> Result<Arc<IrBlock>, Exit> {
-        let linear_fetch = crate::legacy::access(cpu, SegmentId::Cs, cpu.rip, 1)? as u32;
+        let linear_fetch =
+            crate::legacy::access(cpu, SegmentId::Cs, cpu.rip, 1, crate::AccessKind::Execute)?
+                as u32;
         let key = LegacyBlockKey {
             owner_id: self.owner_id,
-            context_epoch: self.context_epoch,
+            context_id: self.context_id,
             model_semantics_id: model.model_semantics_id,
             decode_bits: context.default_operand_bits,
             stack_bits: context.stack_address_bits,
@@ -95,6 +162,19 @@ impl Execution {
             linear_fetch,
             mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
         };
+        // Decision-16 §3: finish the already decoded instruction on a device
+        // retry. A partial CALL frame can overwrite the CALL's own bytes;
+        // its IR must survive eviction and reuse of the translation's context ID.
+        if cpu.mmio_retry_active {
+            if let Some(retry) = &self.instruction_retry {
+                if retry.stamp == LegacyContextStamp::new(cpu, model)
+                    && retry.ip == cpu.rip
+                    && retry.mxcsr_mode == key.mxcsr_mode
+                {
+                    return Ok(retry.ir.clone());
+                }
+            }
+        }
         // One-instruction blocks bound fault visibility and SMC. Re-fetch each
         // dependent byte, even on cache hits: permissions, policy and physical
         // aliases are checked before executing that instruction, without page
@@ -117,6 +197,10 @@ impl Execution {
                 }
             })?;
         let ir = Arc::new(ir);
+        #[cfg(test)]
+        {
+            self.lifts += 1;
+        }
         self.blocks.insert(
             key,
             Block {
@@ -131,7 +215,13 @@ impl Execution {
 fn fetch(vm: &Vm, cpu: &CpuState, context: LegacyDecodeContext) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
     for i in 0..15 {
-        let addr = crate::legacy::access(cpu, SegmentId::Cs, cpu.rip + i, 1)?;
+        let addr = crate::legacy::access(
+            cpu,
+            SegmentId::Cs,
+            cpu.rip + i,
+            1,
+            crate::AccessKind::Execute,
+        )?;
         if let Some(policy) = &vm.mem.fetch_policy {
             let verdict = policy.approve(addr >> crate::memory::CODE_PAGE_BITS, &vm.mem);
             if verdict != crate::FetchVerdict::Allow {
@@ -175,8 +265,8 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
             }
         })?;
-        if context.regime != LegacyRegime::Real {
-            return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution));
+        if context.paging_enabled || context.cpl != 0 {
+            return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
         // Other generations, A20 gating and reset-origin execution are not activated by the real-forms phase.
         if model.generation != CpuGeneration::I386
@@ -214,6 +304,9 @@ impl Vcpu {
             self.cpu.clear_mmio_parts();
         }
         let execution = self.legacy_execution.as_mut().unwrap();
+        if !self.cpu.mmio_retry_active {
+            execution.instruction_retry = None;
+        }
         if execution
             .irq_retry
             .is_some_and(|(_, ip, cs)| u64::from(ip) != self.cpu.rip || cs != self.cpu.cs)
@@ -279,6 +372,9 @@ impl Vcpu {
             StepStop::Exit(exit) => Some(exit),
             StepStop::IrqReady => None,
         });
+        if !cpu.cpu.mmio_retry_active {
+            cpu.legacy_execution.as_mut().unwrap().instruction_retry = None;
+        }
         drop(dispatch);
         self.time_outside = time_run.finish(match &result.stop {
             StepStop::Exit(exit) => Some(exit),
@@ -407,11 +503,13 @@ impl Vcpu {
                     self.sti_shadow = outcome.arm_sti;
                     self.ss_shadow = outcome.arm_ss && !self.ss_shadow;
                     self.cpu.finish_mmio_retry(None);
+                    self.legacy_execution.as_mut().unwrap().instruction_retry = None;
                     if outcome.context_changed {
-                        self.legacy_execution
-                            .as_mut()
-                            .unwrap()
-                            .sync(&self.cpu, model, true);
+                        let execution = self.legacy_execution.as_mut().unwrap();
+                        if outcome.translations_invalidated {
+                            execution.invalidate_translations();
+                        }
+                        execution.sync(&self.cpu, model, true);
                     }
                     if let Some(exit) = outcome.exit {
                         return StepRun {
@@ -421,10 +519,21 @@ impl Vcpu {
                     }
                 }
                 Err(exit) => {
+                    if self.cpu.mmio_retry_active
+                        || matches!(exit, Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+                    {
+                        self.legacy_execution.as_mut().unwrap().instruction_retry =
+                            Some(InstructionRetry {
+                                stamp: LegacyContextStamp::new(&self.cpu, model),
+                                ip: self.cpu.rip,
+                                mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+                                ir,
+                            });
+                    }
                     return StepRun {
                         steps,
                         stop: StepStop::Exit(exit),
-                    }
+                    };
                 }
             }
         }
@@ -434,6 +543,118 @@ impl Vcpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_context(
+        execution: &mut Execution,
+        vm: &Vm,
+        cpu: &mut CpuState,
+        model: LegacyCpuModel,
+        tag: u32,
+    ) -> Vec<Arc<IrBlock>> {
+        cpu.legacy.segments[SegmentId::Ds as usize].base = tag;
+        execution.sync(cpu, model, false);
+        let context = derive_legacy_context(model, cpu).unwrap();
+        [0x1000, 0x1006]
+            .into_iter()
+            .map(|ip| {
+                cpu.rip = ip;
+                execution.resolve(vm, cpu, model, context).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_churn_bounds_retained_contexts_and_their_blocks() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let model = cpu.legacy_model.unwrap();
+        let mut execution = Execution::new();
+        for tag in 0..(MAX_RETAINED_CONTEXTS * 8) {
+            cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag as u32);
+            let retained = (tag + 1).min(MAX_RETAINED_CONTEXTS);
+            assert_eq!(execution.contexts.len(), retained);
+            assert_eq!(execution.blocks.len(), retained * 2);
+            assert!(execution.blocks.keys().all(|key| execution
+                .contexts
+                .values()
+                .any(|context| context.id == key.context_id)));
+        }
+        assert!(execution.contexts.keys().all(|stamp| {
+            stamp.state.segments[SegmentId::Ds as usize].base >= (MAX_RETAINED_CONTEXTS * 7) as u32
+        }));
+    }
+
+    #[test]
+    fn context_lru_keeps_hot_contexts_and_their_blocks() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let model = cpu.legacy_model.unwrap();
+        let mut execution = Execution::new();
+        let hot: Vec<_> = (0..2)
+            .map(|tag| cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag))
+            .collect();
+        for tag in 2..(MAX_RETAINED_CONTEXTS * 8) {
+            cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag as u32);
+            let lifts = execution.lifts;
+            for (tag, original) in hot.iter().enumerate() {
+                let blocks = cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag as u32);
+                for (ir, original) in blocks.iter().zip(original) {
+                    assert!(Arc::ptr_eq(ir, original));
+                }
+            }
+            assert_eq!(execution.lifts, lifts);
+            assert!(execution.contexts.len() <= MAX_RETAINED_CONTEXTS);
+            assert!(execution.blocks.len() <= MAX_RETAINED_CONTEXTS * 2);
+        }
+    }
+
+    fn pe_transition_loop() -> (Vm, Vcpu) {
+        // SDM Vol 3A §§12.9.1–12.9.2; 80386 PRM §§14.4–14.5:
+        // each round enters USE16 with a far JMP and returns with a real far JMP.
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_legacy_cpu_model(LegacyCpuModel {
+            generation: CpuGeneration::I386,
+            model_semantics_id: 1,
+        });
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(
+            0x1000,
+            b"\x66\xb8\x01\x00\x00\x00\x0f\x22\xc0\xea\x00\x11\x08\x00",
+        )
+        .unwrap();
+        vm.write_bytes(0x1100, b"\x31\xc0\x0f\x22\xc0\xea\x00\x10\x00\x00")
+            .unwrap();
+        vm.write_bytes(0x2008, b"\xff\xff\x00\x00\x00\x9b\x00\x00")
+            .unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.legacy.gdtr.base = 0x2000;
+        cpu.cpu.legacy.gdtr.limit = 15;
+        (vm, cpu)
+    }
+
+    #[test]
+    #[ignore = "explicit interpreter transition throughput measurement"]
+    fn pe_transition_throughput() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let warm = cpu.run_steps(&vm, 600, StepOptions::default()).unwrap();
+        assert_eq!(warm.steps(), 600);
+        for sample in 0..3 {
+            let lifts = cpu.legacy_execution.as_ref().unwrap().lifts;
+            let begin = std::time::Instant::now();
+            let run = cpu.run_steps(&vm, 600_000, StepOptions::default()).unwrap();
+            let elapsed = begin.elapsed().as_secs_f64();
+            assert_eq!(run.steps(), 600_000, "{:?}", run.stop());
+            assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            assert_eq!(
+                (cpu.cpu.rip, cpu.cpu.cs, cpu.cpu.legacy.cr0),
+                (0x1000, 0, 0)
+            );
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            println!("sample={sample} transitions=200000 elapsed_seconds={elapsed:.6} transitions_per_second={:.0} lifts={} cached_blocks={}",
+                200_000.0 / elapsed, execution.lifts - lifts, execution.blocks.len());
+        }
+        assert_eq!(cpu.retired_instructions(), 1_800_600);
+        assert_eq!(vm.backend.compile_ns(), 0);
+    }
     #[test]
     fn real_delivery_advances_epoch_before_the_handler_can_execute() {
         for irq in [false, true] {
@@ -511,8 +732,10 @@ mod tests {
                 cpu.legacy_execution.as_ref().unwrap().context_epoch,
                 before + u64::from(advances)
             );
-            if advances {
+            if code == b"\x0f\x22\xd8" {
                 assert!(cpu.legacy_execution.as_ref().unwrap().blocks.is_empty());
+            } else {
+                assert_eq!(cpu.legacy_execution.as_ref().unwrap().blocks.len(), 1);
             }
             let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert_eq!(run.steps(), 1);
@@ -521,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_stamp_guards_context_but_not_live_outputs_and_rolls_over_empty() {
+    fn epoch_stamp_guards_context_but_not_live_outputs() {
         let model = LegacyCpuModel {
             generation: CpuGeneration::I386,
             model_semantics_id: 1,
@@ -566,10 +789,105 @@ mod tests {
             false,
         );
         assert_ne!(e.context_epoch, before);
-        e.context_epoch = u64::MAX;
-        e.sync(&cpu, model, true);
-        assert_eq!(e.context_epoch, 0);
-        assert!(e.blocks.is_empty());
         assert_ne!(e.owner_id, Execution::new().owner_id);
+    }
+
+    #[test]
+    fn epoch_rollover_drops_populated_contexts_before_reusing_ids() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let model = cpu.legacy_model.unwrap();
+        let mut execution = Execution::new();
+        let mut original = Vec::new();
+        for tag in 0..3 {
+            original.push(cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag));
+            assert_eq!(execution.context_id, u64::from(tag));
+        }
+        assert_eq!(execution.contexts.len(), 3);
+        assert_eq!(execution.blocks.len(), 6);
+        execution.context_epoch = u64::MAX;
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = 0;
+        execution.sync(&cpu.cpu, model, true);
+        assert_eq!(execution.context_epoch, 0);
+        assert_eq!(execution.context_id, 0);
+        assert_eq!(execution.contexts.len(), 1);
+        assert!(execution.blocks.is_empty());
+        for (tag, old_blocks) in original.iter().enumerate() {
+            let blocks = cache_context(&mut execution, &vm, &mut cpu.cpu, model, tag as u32);
+            assert_eq!(execution.context_id, tag as u64);
+            for (ir, old) in blocks.iter().zip(old_blocks) {
+                assert!(!Arc::ptr_eq(ir, old));
+            }
+        }
+        assert_eq!(execution.blocks.len(), 6);
+        assert_eq!(execution.lifts, 12);
+    }
+
+    #[test]
+    fn pe_transitions_reuse_both_regimes_without_relifting_or_flushing_other_contexts() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let warm = cpu.run_steps(&vm, 6, StepOptions::default()).unwrap();
+        assert_eq!(warm.steps(), 6, "{:?}", warm.stop());
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert_eq!(execution.contexts.len(), 4);
+        assert_eq!(execution.blocks.len(), 6);
+        assert_eq!(execution.lifts, 6);
+        let blocks: Vec<_> = execution
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.ir.clone()))
+            .collect();
+        let before_epoch = execution.context_epoch;
+        for count in [1, 2, 3, 6, 600] {
+            let run = cpu.run_steps(&vm, count, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), count, "{:?}", run.stop());
+        }
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert!(execution.context_epoch > before_epoch);
+        assert_eq!(execution.contexts.len(), 4);
+        assert_eq!(execution.blocks.len(), 6);
+        assert_eq!(execution.lifts, 6);
+        for (key, ir) in blocks {
+            assert!(Arc::ptr_eq(&ir, &execution.blocks[&key].ir));
+        }
+    }
+
+    #[test]
+    fn reused_contexts_revalidate_code_bytes_and_between_run_cache_edits() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let model = cpu.legacy_model.unwrap();
+        let mut execution = Execution::new();
+        let mut original = Vec::new();
+        for pe in [0, 1] {
+            cpu.cpu.legacy.cr0 = pe;
+            let context = derive_legacy_context(model, &cpu.cpu).unwrap();
+            execution.sync(&cpu.cpu, model, false);
+            original.push(execution.resolve(&vm, &cpu.cpu, model, context).unwrap());
+        }
+        for pe in [0, 1] {
+            cpu.cpu.legacy.cr0 = pe;
+            let context = derive_legacy_context(model, &cpu.cpu).unwrap();
+            execution.sync(&cpu.cpu, model, false);
+            let ir = execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+            assert!(Arc::ptr_eq(&ir, &original[pe as usize]));
+        }
+        vm.write_bytes(0x1002, &2u32.to_le_bytes()).unwrap();
+        for pe in [0, 1] {
+            cpu.cpu.legacy.cr0 = pe;
+            let context = derive_legacy_context(model, &cpu.cpu).unwrap();
+            execution.sync(&cpu.cpu, model, false);
+            let ir = execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+            assert!(!Arc::ptr_eq(&ir, &original[pe as usize]));
+        }
+        let before_id = execution.context_id;
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0x12345;
+        execution.sync(&cpu.cpu, model, false);
+        assert_ne!(execution.context_id, before_id);
+        let context = derive_legacy_context(model, &cpu.cpu).unwrap();
+        execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+        assert_eq!(execution.blocks.len(), 3);
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0xffff;
+        execution.sync(&cpu.cpu, model, false);
+        assert_eq!(execution.context_id, before_id);
+        assert_eq!(execution.lifts, 5);
     }
 }

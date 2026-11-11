@@ -1969,7 +1969,9 @@ impl Vcpu {
     pub fn irq_ready(&self) -> bool {
         (self.profile == ExecutionProfile::Application(CpuMode::Real16)
             || (self.profile == ExecutionProfile::LegacySystem
-                && self.legacy_context_for_run().is_ok()))
+                && self
+                    .legacy_context_for_run()
+                    .is_ok_and(|c| c.regime == crate::LegacyRegime::Real)))
             && !self.cpu.mmio_retry_active
             && self.irq_delivery_ready()
     }
@@ -2414,9 +2416,9 @@ impl Vcpu {
     /// with [`CpuMode::Real16`], including when the VM has a compiling backend
     /// (decision-16 §§1–4). Application Long64/Compat32 return
     /// [`StepRunError::UnsupportedMode`], including with a zero budget.
-    /// [`ExecutionProfile::LegacySystem`] also supports I386 real execution,
-    /// using derived code/stack sizes and a private interpreter cache. Protected
-    /// contexts and unavailable event delivery return typed unsupported exits.
+    /// [`ExecutionProfile::LegacySystem`] also supports same-CPL I386 real and
+    /// protected execution, using derived code/stack sizes and a private
+    /// interpreter cache. Unavailable event delivery returns typed unsupported exits.
     /// No legacy context enters a compiling backend.
     ///
     /// A unit is one completed instruction or one completed REP iteration. Empty

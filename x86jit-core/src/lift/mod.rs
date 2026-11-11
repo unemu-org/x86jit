@@ -5118,12 +5118,15 @@ pub(crate) fn with_segment(
     tg: &mut TempGen,
 ) -> Val {
     if ops.legacy_context().is_some() {
+        // Legacy real mode, including big real, checks the runtime cached limit
+        // in legacy::access. The fixed Application Real16 check below is separate.
         let dst = tg.fresh();
         ops.push(IrOp::Legacy(crate::legacy::LegacyOp::Address {
             dst,
             segment: legacy::segment(insn.memory_segment()).expect("memory segment"),
             offset: addr,
             bytes: insn.memory_size().size() as u8,
+            access: crate::AccessKind::Read,
         }));
         return Val::Temp(dst);
     }

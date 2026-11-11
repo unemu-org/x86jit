@@ -53,6 +53,9 @@ pub enum UnsupportedSystemOperation {
     LegacyEntryFacility,
     ApplicationIrqDelivery,
     InvalidLegacyContext(crate::legacy::LegacyContextError),
+    LegacyLdtSelector,
+    LegacyGateOrTaskTransfer,
+    LegacyPrivilegeTransition,
 }
 
 /// Reason `run()` returned control to the user (§5.2).

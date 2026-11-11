@@ -92,6 +92,29 @@ pub(crate) fn instruction(
     } else {
         lower(&insn, &mut ops, &mut tg)
             .map_err(|e| refill_unsupported_bytes(e, code, u64::from(ip)))?;
+        // Decoder access intent includes RMW operands, which require a writable
+        // segment type (SDM Vol 3A §6.4).
+        let mut factory = iced_x86::InstructionInfoFactory::new();
+        let info = factory.info(&insn);
+        let writing = (0..insn.op_count()).any(|i| {
+            insn.op_kind(i) == OpKind::Memory
+                && matches!(
+                    info.op_access(i),
+                    iced_x86::OpAccess::Write
+                        | iced_x86::OpAccess::CondWrite
+                        | iced_x86::OpAccess::ReadWrite
+                        | iced_x86::OpAccess::ReadCondWrite
+                )
+        });
+        for op in &mut ops.values {
+            if let IrOp::Legacy(L::Address { access, .. }) = op {
+                *access = if writing {
+                    crate::AccessKind::Write
+                } else {
+                    crate::AccessKind::Read
+                };
+            }
+        }
         mark_memory_accesses(&insn, mode, &mut ops.values);
     }
     Ok(IrBlock {
@@ -437,12 +460,7 @@ pub(super) fn lower(
         }),
         Iret | Iretd => {
             emit(ops, L::CheckTaskReturn);
-            emit(
-                ops,
-                L::Refuse {
-                    operation: crate::UnsupportedSystemOperation::LegacyEventDelivery,
-                },
-            );
+            emit(ops, L::Iret { size });
         }
         Int | Int3 | Into => emit(
             ops,
@@ -573,6 +591,7 @@ pub(super) fn lower(
                     segment: segment(insn.memory_segment()).unwrap_or(SegmentId::Ds),
                     offset,
                     bytes: 1,
+                    access: crate::AccessKind::Read,
                 },
             );
             let value = load(ops, tg, Val::Temp(dst), 1);

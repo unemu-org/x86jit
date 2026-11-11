@@ -1,0 +1,10 @@
+policy,sample,transitions,guest_instructions,elapsed_seconds,transitions_per_second,lifts,cached_blocks,compiler,profile,host,guest,stack_bits,flat_memory_bytes
+epoch_flush,0,200000,600000,0.156723,1276141,600000,0,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+epoch_flush,1,200000,600000,0.156026,1281834,600000,0,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+epoch_flush,2,200000,600000,0.155589,1285434,600000,0,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_hash,0,200000,600000,0.165845,1205944,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_hash,1,200000,600000,0.164713,1214233,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_hash,2,200000,600000,0.167834,1191654,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_table,0,200000,600000,0.108248,1847606,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_table,1,200000,600000,0.108049,1851020,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536
+stamp_table,2,200000,600000,0.107888,1853771,0,6,rustc 1.98.1,release,aarch64-apple-darwin,I386 USE16,16,65536

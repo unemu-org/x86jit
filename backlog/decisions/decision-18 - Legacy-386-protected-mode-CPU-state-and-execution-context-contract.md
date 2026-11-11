@@ -198,6 +198,11 @@ or a portable raw-memory serialization ABI.
 
 ### 3. Translation identity, guards and mode-switch boundaries
 
+> The accepted transition-retention and big-real reload amendment is
+> [decision-20](decision-20%20-%20Reuse-legacy-IR-across-protected-and-big-real-context-transitions-amends-decision-18.md).
+> It replaces the wholesale epoch invalidation policy below while preserving
+> the architectural guard dimensions and interpreter-only boundary.
+
 Keep Application `BlockKey`, constructors, hash stream and compiled fast paths
 unchanged. Use a separate interpreter-only legacy cache namespace with
 `LegacyBlockKey { owner_id: u64, context_epoch: u64, model_semantics_id: u64,

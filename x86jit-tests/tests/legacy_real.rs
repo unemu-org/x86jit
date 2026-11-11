@@ -46,6 +46,28 @@ fn value(vm: &Vm, a: u64, n: usize) -> u64 {
     vm.read_bytes(a, &mut b[..n]).unwrap();
     u64::from_le_bytes(b)
 }
+
+#[test]
+fn iretd_ignores_stacked_vm_in_real_mode() {
+    // SDM Vol 2A §3.3, IRET/IRETD/IRETQ, Operation, REAL-ADDRESS-MODE,
+    // p. 3-491: (tempEFLAGS AND 257FD5H) OR (EFLAGS AND 1A0000H)
+    // preserves the current VM bit instead of loading the stacked VM bit.
+    let (vm, mut cpu) = setup(b"\x66\xcf");
+    for (i, word) in [0x1200u32, 0x100, 0x20002].into_iter().enumerate() {
+        vm.write_bytes(0x8000 + i as u64 * 4, &word.to_le_bytes())
+            .unwrap();
+    }
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.legacy.cr0 & 1, 0);
+    assert_eq!(
+        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+        (0x100, 0x1200, 0x800c)
+    );
+    assert_eq!(cpu.cpu.rflags_system & (1 << 17), 0);
+    assert_eq!(cpu.cpu.flags.to_flags16(), 2);
+    assert_eq!(value(&vm, 0x8008, 4), 0x20002);
+}
+
 fn exception(cpu: &mut Vcpu, vm: &Vm, vector: u8) {
     let run = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
     assert_eq!(run.steps(), 0);
@@ -294,16 +316,9 @@ fn zero_steps_port_completion_and_sti_ss_shadows() {
 }
 
 #[test]
-fn protected_entry_stays_refused_and_legacy_never_materializes() {
+fn protected_entry_executes_with_retained_caches_and_legacy_never_materializes() {
     let (vm, mut cpu) = setup(b"\x66\xb8\x78\x56\x34\x12\xf4");
     cpu.cpu.legacy.cr0 = 1;
-    let before = format!("{:?}", cpu.cpu);
-    assert!(matches!(
-        cpu.run(&vm, None),
-        Exit::UnsupportedSystemContext { .. }
-    ));
-    assert_eq!(format!("{:?}", cpu.cpu), before);
-    cpu.cpu.legacy.cr0 = 0;
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     assert_eq!(cpu.cpu.gpr[0], 0x12345678);
     let mut jit = Vm::with_backend(
@@ -1003,15 +1018,12 @@ fn msw_and_clts_use_only_their_documented_bits_and_preserve_flags() {
 }
 
 #[test]
-fn enabling_pe_or_pg_refuses_atomically_but_pg_without_pe_faults() {
+fn enabling_pg_refuses_atomically_but_pg_without_pe_faults() {
     // SDM Vol 3A §2.5; decision-18 §4: legality precedes an engine refusal.
     for prefix in [&b""[..], &b"\x66"[..]] {
         for (code, value, gp) in [
-            (&b"\x0f\x22\xc0"[..], 1, false),
             (&b"\x0f\x22\xc0"[..], 0x80000001, false),
             (&b"\x0f\x22\xc0"[..], 0x80000000, true),
-            (&b"\x0f\x01\xf0"[..], 0xffff, false),
-            (&b"\x0f\x01\x36\x00\x20"[..], 0xffff, false),
         ] {
             let mut bytes = prefix.to_vec();
             bytes.extend(code);

@@ -21,7 +21,7 @@ pub enum CpuGeneration {
 
 /// Shared model-profile boundary. The embedder supplies a stable identity for
 /// all model policies; the CPU-model catalogue owns presets, not this module.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LegacyCpuModel {
     pub generation: CpuGeneration,
     pub model_semantics_id: u64,
@@ -74,7 +74,7 @@ pub enum LegacyContextError {
 /// Engine layout, not the packed guest table-register operand image.
 /// SDM Vol 3A §2.4: table registers retain base and limit.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TableRegister {
     pub base: u32,
     pub limit: u16,
@@ -85,7 +85,7 @@ pub struct TableRegister {
 /// descriptor access byte (7:0), and AVL/L/D-or-B/G flags (12:15).
 /// Bits 11:8 and `reserved` must be zero; `unusable` is an engine marker.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SegmentCache {
     pub base: u32,
     pub limit: u32,
@@ -96,7 +96,7 @@ pub struct SegmentCache {
 
 /// SDM Vol 3A §§2.4, 3.5.1, 10.2.4: LDTR/TR retain selector and cache.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SystemSegment {
     pub selector: u16,
     pub reserved: u16,
@@ -116,7 +116,7 @@ pub enum SegmentId {
 
 /// Inline legacy state; Application execution never consumes these values.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LegacyCpuState {
     pub cr0: u32,
     pub cr2: u32,
@@ -187,10 +187,9 @@ pub fn derive_legacy_context(
     if cs.unusable != 0 || ss.unusable != 0 {
         return Err(UnusableCodeOrStack);
     }
-    // SDM Vol 3A §6.5: CPL is distinct from descriptor DPL.
-    if protected && (cpu.cs & 3 != u16::from(state.cpl) || cpu.ss & 3 != u16::from(state.cpl)) {
-        return Err(SelectorPrivilegeMismatch);
-    }
+    // SDM Vol 3A §12.9.1: PE retains the real selectors and enters at CPL 0.
+    // Their low bits need not describe CPL until a protected reload. CPL remains
+    // authoritative; guest reloads and the coherent setter validate proposed pairs.
     // SDM Vol 1 §3.4.3.3: VM and TF are stored separately from arithmetic flags.
     if cpu.rflags_system & (1 << 17) != 0 {
         return Err(Virtual8086Unsupported);
@@ -280,6 +279,12 @@ impl CpuState {
             SegmentId::Gs => &mut proposed.gs,
         } = selector;
         proposed.legacy.segments[segment as usize] = cache;
+        if proposed.legacy.cr0 & 1 != 0
+            && matches!(segment, SegmentId::Cs | SegmentId::Ss)
+            && selector & 3 != u16::from(proposed.legacy.cpl)
+        {
+            return Err(LegacyContextError::SelectorPrivilegeMismatch);
+        }
         derive_legacy_context(model, &proposed)?;
         *self = proposed;
         Ok(())
@@ -546,6 +551,7 @@ pub enum LegacyOp {
         segment: SegmentId,
         offset: crate::ir::Val,
         bytes: u8,
+        access: crate::AccessKind,
     },
     ReadSelector {
         dst: crate::ir::Temp,
@@ -627,6 +633,9 @@ pub enum LegacyOp {
         overflow_only: bool,
     },
     CheckTaskReturn,
+    Iret {
+        size: u8,
+    },
     Refuse {
         operation: crate::UnsupportedSystemOperation,
     },
@@ -647,31 +656,64 @@ pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
 /// SDM Vol 3B §23.1.1: check the complete effective offset before forming
 /// the linear address, including 67h offsets above FFFFh. Retained cache limits
 /// follow decision-18 §1 (SDM Vol 3A §§3.4.3, 12.9.2; AMD64 APM Vol 2 §4.1).
+/// SDM Vol 3B §23.1.1 and 80386 PRM §14.1 describe ordinary 64-KiB limits;
+/// they do not specify nonstandard inherited limits after a real-mode reload.
+/// The accepted big-real contract checks the retained inclusive byte limit.
 /// Paging/A20 activation belongs to later phases; this physical boundary is identity.
 pub(crate) fn access(
     cpu: &CpuState,
     segment: SegmentId,
     offset: u64,
     bytes: u8,
+    access: crate::AccessKind,
 ) -> Result<u64, crate::Exit> {
     let cache = cpu.legacy.segments[segment as usize];
     let last = offset.checked_add(u64::from(bytes.saturating_sub(1)));
-    if cache.unusable != 0 || last.is_none_or(|last| last > u64::from(cache.limit)) {
+    let protected = cpu.legacy.cr0 & 1 != 0;
+    // SDM Vol 3A §§3.4.5.1, 6.3–6.4; 80386 PRM §§6.3.1.1–6.3.1.2,
+    // pp. 6-4–6-6 (scan checked): type and whole-operand limit checks.
+    let code = cache.attributes & 8 != 0;
+    let expand_down = protected && !code && cache.attributes & 4 != 0;
+    let bound = if cache.attributes & 0x4000 != 0 {
+        u32::MAX
+    } else {
+        0xffff
+    };
+    let within_limit = last.is_some_and(|last| {
+        if expand_down {
+            offset > u64::from(cache.limit) && last <= u64::from(bound)
+        } else {
+            last <= u64::from(cache.limit)
+        }
+    });
+    let permitted = !protected
+        || match access {
+            crate::AccessKind::Execute => code,
+            crate::AccessKind::Read => !code || cache.attributes & 2 != 0,
+            crate::AccessKind::Write => !code && cache.attributes & 2 != 0,
+        };
+    if cache.unusable != 0 || !within_limit || !permitted {
         // SDM Vol 3B §23.1.4, Table 23-1: SS overrun is #SS; other
         // segment overruns are #GP, with the faulting instruction incomplete.
         let vector = if segment == SegmentId::Ss { 12 } else { 13 };
         // Real-address pseudo-protection faults carry no error code (80386
-        // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5).
+        // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5). Protected codes
+        // define only bits 15:0 on I386 (PRM §9.7 Fig. 9-7, scan checked).
         let mut details = crate::fault::FaultMetadata::architectural_exception(
             cpu.rip,
             cpu.rip,
             vector,
             crate::fault::FaultClass::Fault,
-            crate::fault::ErrorCode::NoCode,
+            if protected {
+                crate::fault::ErrorCode::bits(0, 0xffff)
+            } else {
+                crate::fault::ErrorCode::NoCode
+            },
         );
         details.path = crate::fault::FaultPath::Interpreter;
         details.operand_base = crate::fault::Knowledge::Known(offset);
         details.operand_size = crate::fault::Knowledge::Known(u16::from(bytes));
+        details.access = crate::fault::Knowledge::Known(access.into());
         return Err(crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details));
     }
     Ok(u64::from(cache.base.wrapping_add(offset as u32)))
