@@ -131,6 +131,19 @@ plausible-looking wrong answer:
   the real register; the general comparator excludes the six sticky flags, while storage
   witnesses assert the complete value.
 
+**Machine string access ordering.** SDM 325462-092US Vol 2B §4.3 MOVS
+(Operation, pp. 4-105–106) defines `DEST := SRC`; its Real-Address Mode
+Exceptions include a segment-limit violation. The 80386 PRM §17 MOVS,
+pp. 17-112–113 (scan checked), gives the corresponding source-to-destination
+assignment and whole-operand limit rule. Neither entry explicitly orders an
+observable source device read against a destination segment-limit fault. The
+Machine model forms/checks/reads the source first, then forms/checks/accesses the
+destination, consistently in Direct and Checked execution. This source-first
+ordering is an explicit engine policy for that unspecified interaction. The
+`legacy_direct_parity` MOVSW source-MMIO/destination-limit witness pins both the
+read request and the subsequent fault. Application Real16 keeps its existing
+string engine and ordering.
+
 ## 4. What we did not copy
 
 No third-party source is vendored into this tree, and no file carries a foreign copyright

@@ -234,18 +234,18 @@ pub(crate) fn interpret_block_steps<
     #[cfg(target_arch = "aarch64")]
     match info.consistency {
         crate::MemConsistency::AcqRel => {
-            return interpret_steps_ordered::<ROUTED, DEFAULT, 1, STOP_WHEN_IRQ_READY>(
+            return interpret_steps_ordered::<ROUTED, DEFAULT, 1, STOP_WHEN_IRQ_READY, true>(
                 ir, cpu, mem, scratch, info, steps,
             )
         }
         crate::MemConsistency::FullTso => {
-            return interpret_steps_ordered::<ROUTED, DEFAULT, 2, STOP_WHEN_IRQ_READY>(
+            return interpret_steps_ordered::<ROUTED, DEFAULT, 2, STOP_WHEN_IRQ_READY, true>(
                 ir, cpu, mem, scratch, info, steps,
             )
         }
         crate::MemConsistency::Fast => {}
     }
-    interpret_steps_ordered::<ROUTED, DEFAULT, 0, STOP_WHEN_IRQ_READY>(
+    interpret_steps_ordered::<ROUTED, DEFAULT, 0, STOP_WHEN_IRQ_READY, true>(
         ir, cpu, mem, scratch, info, steps,
     )
 }
@@ -255,6 +255,7 @@ fn interpret_steps_ordered<
     const DEFAULT: bool,
     const ORDER: u8,
     const STOP_WHEN_IRQ_READY: bool,
+    const STR_MMIO: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -271,11 +272,47 @@ fn interpret_steps_ordered<
     }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, true, STOP_WHEN_IRQ_READY>(
+        interpret_block_inner::<
+            true,
+            ROUTED,
+            DEFAULT,
+            ORDER,
+            true,
+            STOP_WHEN_IRQ_READY,
+            false,
+            STR_MMIO,
+        >(ir, cpu, mem, scratch, info, steps)
+    } else {
+        interpret_block_inner::<
+            false,
+            ROUTED,
+            DEFAULT,
+            ORDER,
+            true,
+            STOP_WHEN_IRQ_READY,
+            false,
+            STR_MMIO,
+        >(ir, cpu, mem, scratch, info, steps)
+    }
+}
+
+/// Machine specialization of the same stepped walk used by Application Real16.
+#[inline(always)]
+pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    info: &mut RetireInfo,
+    steps: &mut StepContext,
+) -> BlockResult {
+    let mem = Access::<ROUTED, ORDER>::new(mem);
+    if cpu.mmio_retry_active {
+        interpret_block_inner::<true, ROUTED, true, ORDER, true, false, true, true>(
             ir, cpu, mem, scratch, info, steps,
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, true, STOP_WHEN_IRQ_READY>(
+        interpret_block_inner::<false, ROUTED, true, ORDER, true, false, true, true>(
             ir, cpu, mem, scratch, info, steps,
         )
     }
@@ -523,7 +560,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
     }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false>(
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false, false, true>(
             ir,
             cpu,
             mem,
@@ -532,7 +569,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
             &mut StepContext::default(),
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false>(
+        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false, false, true>(
             ir,
             cpu,
             mem,
@@ -559,6 +596,8 @@ fn interpret_block_inner<
     const ORDER: u8,
     const STEPPED: bool,
     const STOP_WHEN_IRQ_READY: bool,
+    const MACHINE: bool,
+    const STR_MMIO: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -616,7 +655,17 @@ fn interpret_block_inner<
     };
     let mem = Access::<ROUTED, ORDER, _>::new(&running);
     let result = if STEPPED {
-        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED, STOP_WHEN_IRQ_READY>(
+        walk_ops::<
+            RETRY,
+            ROUTED,
+            DEFAULT,
+            false,
+            ORDER,
+            STEPPED,
+            STOP_WHEN_IRQ_READY,
+            MACHINE,
+            STR_MMIO,
+        >(
             ir,
             cpu,
             mem,
@@ -630,7 +679,17 @@ fn interpret_block_inner<
             &mut *steps,
         )
     } else {
-        walk_ops::<RETRY, ROUTED, DEFAULT, false, ORDER, STEPPED, STOP_WHEN_IRQ_READY>(
+        walk_ops::<
+            RETRY,
+            ROUTED,
+            DEFAULT,
+            false,
+            ORDER,
+            STEPPED,
+            STOP_WHEN_IRQ_READY,
+            MACHINE,
+            STR_MMIO,
+        >(
             ir,
             cpu,
             mem,
@@ -738,14 +797,43 @@ fn finish_fault<const STEPPED: bool>(
         Some(IrOp::InsnStart { guest_addr }) => Some(*guest_addr),
         _ => Some(ir.next_ip()),
     };
-    let info =
-        crate::fault::InstructionFaultInfo::from_ops(rip, next, &ir.ops[start..end], ir.mode);
+    finish_instruction_fault::<STEPPED>(
+        exit,
+        &ir.ops[start..end],
+        rip,
+        next,
+        ir.mode,
+        cpu,
+        mem,
+        temps,
+        true,
+    )
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn finish_instruction_fault<const STEPPED: bool>(
+    exit: Exit,
+    ops: &[IrOp],
+    rip: u64,
+    next: Option<u64>,
+    mode: crate::CpuMode,
+    cpu: &CpuState,
+    mem: &Memory,
+    temps: &[u64],
+    string_slots: bool,
+) -> Exit {
+    if !matches!(exit, Exit::Exception { .. } | Exit::UnmappedMemory { .. }) {
+        return exit;
+    }
+    let info = crate::fault::InstructionFaultInfo::from_ops(rip, next, ops, mode);
     // Per-access classification retained Long64/SS evidence. The VM/step caller
     // qualifies Real16 physical addresses with its explicit decode mode.
     let mode = crate::CpuMode::Long64;
     let mut exit = crate::fault::finish(exit, Some(&info), cpu, mem, mode, false);
-    if STEPPED && cpu.owns_mmio_retry(cpu.rip) {
-        let addresses = ir.ops[start..end].iter().find_map(|op| match op {
+    if STEPPED && string_slots && cpu.owns_mmio_retry(cpu.rip) {
+        let addresses = ops.iter().find_map(|op| match op {
             IrOp::RepString {
                 addr_bits,
                 seg_base,
@@ -776,6 +864,22 @@ fn finish_fault<const STEPPED: bool>(
                     cpu.gpr[RDI],
                     read_val(*es_base, temps),
                     string_address_mask(*addr_bits),
+                ),
+            ]),
+            IrOp::Legacy(crate::legacy::LegacyOp::String {
+                source,
+                address_bits,
+                ..
+            }) => Some([
+                string_linear(
+                    cpu.gpr[RSI],
+                    u64::from(legacy::selector(cpu, *source)) << 4,
+                    string_address_mask(*address_bits),
+                ),
+                string_linear(
+                    cpu.gpr[RDI],
+                    u64::from(cpu.es) << 4,
+                    string_address_mask(*address_bits),
                 ),
             ]),
             _ => None,
@@ -821,6 +925,8 @@ fn walk_ops<
     const ORDER: u8,
     const STEPPED: bool,
     const STOP_WHEN_IRQ_READY: bool,
+    const MACHINE: bool,
+    const STR_MMIO: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -841,6 +947,55 @@ fn walk_ops<
             mem.0.begin_op(op, temps, cpu);
         }
         match op {
+            IrOp::Legacy(crate::legacy::LegacyOp::String {
+                kind,
+                elem,
+                rep,
+                address_bits,
+                source,
+            }) if MACHINE && STEPPED && !CHILD => {
+                let (mem, _ordering) = mem.helper(Some(match kind {
+                    StrOp::Movs => ordering::Direction::ReadWrite,
+                    StrOp::Stos => ordering::Direction::Write,
+                    _ => ordering::Direction::Read,
+                }));
+                if let Some(stop) = legacy::execute_shared_string::<ROUTED, STOP_WHEN_IRQ_READY, _>(
+                    ir,
+                    cpu,
+                    mem,
+                    *kind,
+                    *elem,
+                    *rep,
+                    cur_addr.get(),
+                    *address_bits,
+                    *source,
+                    exit_request,
+                    budget.get(),
+                    shadows,
+                    *retired,
+                ) {
+                    return stop;
+                }
+            }
+            IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk) if MACHINE => {}
+            IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
+                dst,
+                offset,
+                bytes,
+                vector,
+            }) if MACHINE => {
+                let offset = read_val(*offset, temps);
+                match legacy::direct_stack_address(cpu, offset, *bytes, *vector, cur_addr.get()) {
+                    Ok(address) => temps[*dst as usize] = address,
+                    Err(exit) => {
+                        return WalkResult::exit(legacy::stack_fault_access(
+                            exit,
+                            &ir.ops,
+                            cur_addr.get(),
+                        ))
+                    }
+                }
+            }
             IrOp::Legacy(_) => {
                 return WalkResult::exit(Exit::UnsupportedSystemContext {
                     addr: cpu.rip,
@@ -870,7 +1025,11 @@ fn walk_ops<
                     }
                     shadows.complete_before(*retired);
                     // Install the stopped marker's IP before any trace or guest effect.
-                    cpu.rip = *guest_addr & 0xffff;
+                    cpu.rip = if MACHINE {
+                        *guest_addr
+                    } else {
+                        *guest_addr & 0xffff
+                    };
                     if let Some(stop) = steps.boundary(cpu, shadows, exit_request) {
                         steps.cut = true;
                         return stop;
@@ -897,7 +1056,8 @@ fn walk_ops<
                 if !CHILD && bracket.active() {
                     crate::lockstep::on_insn_start(&mut bracket, cpu, mem, *guest_addr);
                 }
-                if ir.mode == crate::CpuMode::Real16
+                if !MACHINE
+                    && ir.mode == crate::CpuMode::Real16
                     && (cpu.fpu_emulation || cpu.fpu_model == crate::FpuModel::None)
                 {
                     if let Some(result) = real16_x87_gate(cpu, mem, ir, op_index, *guest_addr) {
@@ -1239,7 +1399,15 @@ fn walk_ops<
                 addr,
                 size,
             } => {
-                if let Some(r) = exec_load(cpu, mem, temps, cur_addr.get(), dst, addr, size) {
+                if let Some(r) = exec_load::<MACHINE, ROUTED, ORDER>(
+                    cpu,
+                    mem,
+                    temps,
+                    cur_addr.get(),
+                    dst,
+                    addr,
+                    size,
+                ) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
@@ -1388,7 +1556,7 @@ fn walk_ops<
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
-                if ir.mode == crate::CpuMode::Real16 {
+                if !MACHINE && ir.mode == crate::CpuMode::Real16 {
                     // SDM Vol 2A §3.3 FLD/FLDENV/FRSTOR, Real-Address Mode
                     // Exceptions: the complete operand must fit in the segment.
                     // #GP for SS-relative data is a deliberate compatibility
@@ -1438,7 +1606,11 @@ fn walk_ops<
                     .into();
                 }
                 cpu.mxcsr = mxcsr;
-                cpu.rip = ir.next_ip();
+                cpu.rip = if MACHINE {
+                    ir.guest_start + u64::from(ir.guest_len)
+                } else {
+                    ir.next_ip()
+                };
                 return WalkResult::ModeChange;
             }
             IrOp::XState {
@@ -1464,7 +1636,11 @@ fn walk_ops<
                     return walk_classify_access(r, cur_addr.get(), a, *fault);
                 }
                 if *kind == crate::x87::xstate::XStateKind::Restore {
-                    cpu.rip = ir.next_ip();
+                    cpu.rip = if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    };
                     return WalkResult::ModeChange;
                 }
             }
@@ -1487,7 +1663,11 @@ fn walk_ops<
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
                 if *restore {
-                    cpu.rip = ir.next_ip();
+                    cpu.rip = if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    };
                     return WalkResult::ModeChange;
                 }
             }
@@ -4422,7 +4602,15 @@ fn walk_ops<
                 }
             }
             IrOp::Syscall { is_amd64 } => {
-                if let Some(r) = exec_syscall(cpu, ir.next_ip(), *is_amd64) {
+                if let Some(r) = exec_syscall(
+                    cpu,
+                    if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    },
+                    *is_amd64,
+                ) {
                     return r.into();
                 }
             }
@@ -4440,7 +4628,11 @@ fn walk_ops<
                 let amask = mask(*addr_bits / 8);
                 let count = cpu.gpr[RCX] & amask;
                 if *rep && count == 0 {
-                    cpu.rip = ir.next_ip();
+                    cpu.rip = if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    };
                     return WalkResult::Continue;
                 }
                 let index = if *dir_out { RSI } else { RDI };
@@ -4465,7 +4657,15 @@ fn walk_ops<
                 let next_index = offset.wrapping_add(delta) & amask;
                 let next_count = count.wrapping_sub(1) & amask;
                 let last = !*rep || next_count == 0;
-                let next_ip = if last { ir.next_ip() } else { cur_addr.get() };
+                let next_ip = if last {
+                    if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    }
+                } else {
+                    cur_addr.get()
+                };
                 let value = if *dir_out {
                     let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                     match string_load::<true, _>(
@@ -4522,7 +4722,11 @@ fn walk_ops<
                     cpu.port_string_in = Some(crate::state::PortStringIn {
                         rip: cur_addr.get(),
                         next_ip,
-                        instruction_end: ir.next_ip(),
+                        instruction_end: if MACHINE {
+                            ir.guest_start + u64::from(ir.guest_len)
+                        } else {
+                            ir.next_ip()
+                        },
                         base,
                         offset,
                         next_index,
@@ -4547,13 +4751,31 @@ fn walk_ops<
                 size,
                 dir_out,
             } => {
-                if let Some(r) = exec_port_io(cpu, temps, ir.next_ip(), port, value, size, dir_out)
-                {
+                if let Some(r) = exec_port_io(
+                    cpu,
+                    temps,
+                    if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    },
+                    port,
+                    value,
+                    size,
+                    dir_out,
+                ) {
                     return r.into();
                 }
             }
             IrOp::Hlt => {
-                if let Some(r) = exec_hlt(cpu, ir.next_ip()) {
+                if let Some(r) = exec_hlt(
+                    cpu,
+                    if MACHINE {
+                        ir.guest_start + u64::from(ir.guest_len)
+                    } else {
+                        ir.next_ip()
+                    },
+                ) {
                     return r.into();
                 }
             }
@@ -4727,8 +4949,22 @@ fn walk_ops<
                 // 80286 real-mode segment-limit fault (§17.6): the access crosses the
                 // 0xFFFF byte limit iff offset + size overflows 64 KB. If so, vector the
                 // fault in-guest; otherwise fall through to the Load/Store that follows.
-                let off = read_val(*offset, temps) & 0xFFFF;
-                if off + *size as u64 > 0x1_0000 {
+                let off = read_val(*offset, temps);
+                let off = if MACHINE { off } else { off & 0xffff };
+                if off
+                    .checked_add(u64::from(*size))
+                    .is_none_or(|end| end > 0x10000)
+                {
+                    if MACHINE {
+                        cpu.rip = cur_addr.get();
+                        return WalkResult::exit(crate::legacy::segment_fault(
+                            cpu,
+                            *vector,
+                            off,
+                            *size,
+                            legacy::scalar_limit_access(&ir.ops, cur_addr.get()),
+                        ));
+                    }
                     return WalkResult::delivered_fault(deliver_interrupt_mode(
                         cpu,
                         mem,
@@ -4828,21 +5064,81 @@ fn walk_ops<
                     StrOp::Lods | StrOp::Scas | StrOp::Cmps => ordering::Direction::Read,
                 }));
                 if STEPPED {
-                    let stop = string_run_bounded::<ROUTED, STOP_WHEN_IRQ_READY, _>(
-                        cpu,
-                        mem,
-                        *op,
-                        *elem,
-                        *rep,
-                        cur_addr.get(),
-                        *addr_bits,
-                        read_val(*ds_base, temps),
-                        read_val(*es_base, temps),
-                        exit_request,
-                        budget.get(),
-                        shadows,
-                        *retired,
-                    );
+                    // Select RAM/MMIO only when a string executes, keeping scalar
+                    // dispatch independent of string state.
+                    let stop = if !MACHINE {
+                        string_run_bounded_direct::<ROUTED, STOP_WHEN_IRQ_READY, _>(
+                            cpu,
+                            mem,
+                            *op,
+                            *elem,
+                            *rep,
+                            cur_addr.get(),
+                            *addr_bits,
+                            read_val(*ds_base, temps),
+                            read_val(*es_base, temps),
+                            exit_request,
+                            budget.get(),
+                            shadows,
+                            *retired,
+                        )
+                    } else if matches!(rep, RepKind::None) {
+                        // InsnStart already checked this non-repeated element's
+                        // budget and events. Its transfer still owns MMIO slots.
+                        string_run_bounded_direct_inner::<
+                            ROUTED,
+                            STOP_WHEN_IRQ_READY,
+                            STR_MMIO,
+                            false,
+                            _,
+                        >(
+                            cpu,
+                            mem,
+                            *op,
+                            *elem,
+                            *rep,
+                            cur_addr.get(),
+                            *addr_bits,
+                            read_val(*ds_base, temps),
+                            read_val(*es_base, temps),
+                            exit_request,
+                            budget.get(),
+                            shadows,
+                            *retired,
+                        )
+                    } else if !STR_MMIO {
+                        string_run_bounded_direct_inner::<ROUTED, STOP_WHEN_IRQ_READY, false, true, _>(
+                            cpu,
+                            mem,
+                            *op,
+                            *elem,
+                            *rep,
+                            cur_addr.get(),
+                            *addr_bits,
+                            read_val(*ds_base, temps),
+                            read_val(*es_base, temps),
+                            exit_request,
+                            budget.get(),
+                            shadows,
+                            *retired,
+                        )
+                    } else {
+                        string_run_bounded::<ROUTED, STOP_WHEN_IRQ_READY, _>(
+                            cpu,
+                            mem,
+                            *op,
+                            *elem,
+                            *rep,
+                            cur_addr.get(),
+                            *addr_bits,
+                            read_val(*ds_base, temps),
+                            read_val(*es_base, temps),
+                            exit_request,
+                            budget.get(),
+                            shadows,
+                            *retired,
+                        )
+                    };
                     if let Some(stop) = stop {
                         return stop;
                     }
@@ -4924,7 +5220,11 @@ fn walk_ops<
 
     // Straight-line block with no control-flow terminator (code ran out): flow on
     // from just past the decoded bytes.
-    cpu.rip = ir.next_ip();
+    cpu.rip = if MACHINE {
+        ir.guest_start + u64::from(ir.guest_len)
+    } else {
+        ir.next_ip()
+    };
     WalkResult::Continue
 }
 
@@ -4942,7 +5242,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
     let mut shadows = ShadowState::default();
     let mem = Access::<false, ORDER, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        walk_ops::<false, false, true, true, ORDER, false, false>(
+        walk_ops::<false, false, true, true, ORDER, false, false, false, true>(
             ir,
             cpu,
             mem,
@@ -4956,7 +5256,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             (),
         )
     } else {
-        walk_ops::<false, false, false, true, ORDER, false, false>(
+        walk_ops::<false, false, false, true, ORDER, false, false, false, true>(
             ir,
             cpu,
             mem,
@@ -9117,6 +9417,300 @@ fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: In
                 matches!(stop, Some(WalkResult::Exit(InterpExit::Interrupted)));
             stop
         }
+    }
+}
+
+// Bounded REP shares the operations and restart-register updates with the
+// unbounded specialization. A returned boundary is checked before any next access.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn string_run_bounded_direct<
+    const ROUTED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+    M: InterpreterMemory,
+>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, M>,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+    steps: &mut StepContext,
+    shadows: &mut ShadowState,
+    retired: u64,
+) -> Option<WalkResult> {
+    // Device ownership and REP budgeting are chosen at helper entry. A
+    // non-repeated string already passed the walk's instruction boundary.
+    let ram = !cpu.mmio_retry_active && mem.0.normal().trap_window().is_none();
+    match (ram, matches!(rep, RepKind::None)) {
+        (true, true) => {
+            string_run_bounded_direct_inner::<ROUTED, STOP_WHEN_IRQ_READY, false, false, _>(
+                cpu,
+                mem,
+                op,
+                elem,
+                rep,
+                cur_addr,
+                addr_bits,
+                src_base,
+                dst_base,
+                exit_request,
+                steps,
+                shadows,
+                retired,
+            )
+        }
+        (true, false) => {
+            string_run_bounded_direct_inner::<ROUTED, STOP_WHEN_IRQ_READY, false, true, _>(
+                cpu,
+                mem,
+                op,
+                elem,
+                rep,
+                cur_addr,
+                addr_bits,
+                src_base,
+                dst_base,
+                exit_request,
+                steps,
+                shadows,
+                retired,
+            )
+        }
+        (false, true) => {
+            string_run_bounded_direct_inner::<ROUTED, STOP_WHEN_IRQ_READY, true, false, _>(
+                cpu,
+                mem,
+                op,
+                elem,
+                rep,
+                cur_addr,
+                addr_bits,
+                src_base,
+                dst_base,
+                exit_request,
+                steps,
+                shadows,
+                retired,
+            )
+        }
+        (false, false) => {
+            string_run_bounded_direct_inner::<ROUTED, STOP_WHEN_IRQ_READY, true, true, _>(
+                cpu,
+                mem,
+                op,
+                elem,
+                rep,
+                cur_addr,
+                addr_bits,
+                src_base,
+                dst_base,
+                exit_request,
+                steps,
+                shadows,
+                retired,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn string_run_bounded_direct_inner<
+    const ROUTED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+    const MMIO: bool,
+    const REPEATING: bool,
+    M: InterpreterMemory,
+>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, M>,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+    steps: &mut StepContext,
+    shadows: &mut ShadowState,
+    retired: u64,
+) -> Option<WalkResult> {
+    shadows.complete_before(retired);
+    let result = if REPEATING {
+        string_run_specialized::<false, true, MMIO, STOP_WHEN_IRQ_READY, _>(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+            &mut *steps,
+            &mut *shadows,
+        )
+    } else {
+        string_run_specialized::<false, false, MMIO, false, _>(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+            (),
+            (),
+        )
+    };
+    match result {
+        None => None,
+        Some(StringStop::Fault(f)) => Some(WalkResult::exit(str_fault_exit(f))),
+        Some(StringStop::Interrupted) => {
+            let stop = steps.boundary(cpu, shadows, exit_request);
+            let stop = if STOP_WHEN_IRQ_READY && stop.is_none() {
+                steps.cut = true;
+                Some(WalkResult::Continue)
+            } else {
+                stop
+            };
+            steps.string_interrupted =
+                matches!(stop, Some(WalkResult::Exit(InterpExit::Interrupted)));
+            stop
+        }
+    }
+}
+
+// SDM Vol 2B §4.3 MOVS/CMPS/LODS/STOS/SCAS, Real-Address Mode
+// Exceptions: every element must fit its segment. Aligned 16-bit indices stay
+// aligned after wrapping, so the common walk needs no per-iteration guard.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterMemory>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, M>,
+    op: StrOp,
+    elem: u8,
+    rep: RepKind,
+    cur_addr: u64,
+    addr_bits: u8,
+    src_base: u64,
+    dst_base: u64,
+    exit_request: Option<&std::sync::atomic::AtomicU64>,
+    steps: &mut StepContext,
+    shadows: &mut ShadowState,
+    retired: u64,
+) -> Option<WalkResult> {
+    let source = matches!(op, StrOp::Movs | StrOp::Lods | StrOp::Cmps);
+    let destination = matches!(op, StrOp::Movs | StrOp::Stos | StrOp::Cmps | StrOp::Scas);
+    if (!source || cpu.gpr[RSI] & u64::from(elem - 1) == 0)
+        && (!destination || cpu.gpr[RDI] & u64::from(elem - 1) == 0)
+    {
+        return string_run_bounded_direct::<ROUTED, STOP, _>(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+            steps,
+            shadows,
+            retired,
+        );
+    }
+    debug_assert_eq!(addr_bits, 16);
+    loop {
+        let count = if matches!(rep, RepKind::None) {
+            1
+        } else {
+            cpu.gpr[RCX] & 0xffff
+        };
+        if count != 0 {
+            if let Some(stop) = steps.boundary(cpu, shadows, exit_request) {
+                cpu.rip = cur_addr;
+                steps.string_interrupted =
+                    matches!(stop, WalkResult::Exit(InterpExit::Interrupted));
+                return Some(stop);
+            }
+            let last = 0x10000 - u64::from(elem);
+            let si = cpu.gpr[RSI] & 0xffff;
+            let di = cpu.gpr[RDI] & 0xffff;
+            if source && si > last {
+                cpu.rip = cur_addr;
+                return Some(WalkResult::exit(crate::legacy::segment_fault(
+                    cpu,
+                    13,
+                    si,
+                    elem,
+                    AccessKind::Read,
+                )));
+            }
+            if destination && di > last {
+                // SDM Vol 2B §4.3 MOVS Operation (DEST := SRC), Vol 2A §3.2 CMPS
+                // Operation (temp := SRC1 - SRC2); 386 PRM §17 MOVS pp. 17-112–113.
+                // These do not specify source-MMIO versus destination-limit priority;
+                // Machine preserves its source-first access order for both classes.
+                if source {
+                    let address = src_base + si;
+                    if let Err(trap) = string_load::<true, _>(cpu, mem, cur_addr, 0, address, elem)
+                    {
+                        return Some(
+                            trap_out(cpu, cur_addr, trap, address, elem, AccessKind::Read, 0)
+                                .into(),
+                        );
+                    }
+                }
+                cpu.rip = cur_addr;
+                return Some(WalkResult::exit(crate::legacy::segment_fault(
+                    cpu,
+                    13,
+                    di,
+                    elem,
+                    if matches!(op, StrOp::Movs | StrOp::Stos) {
+                        AccessKind::Write
+                    } else {
+                        AccessKind::Read
+                    },
+                )));
+            }
+        }
+        let remaining = steps.remaining;
+        steps.remaining = remaining.min(1);
+        let result = string_run_bounded_direct::<ROUTED, STOP, _>(
+            cpu,
+            mem,
+            op,
+            elem,
+            rep,
+            cur_addr,
+            addr_bits,
+            src_base,
+            dst_base,
+            exit_request,
+            steps,
+            shadows,
+            retired,
+        );
+        steps.remaining += remaining.saturating_sub(1);
+        if remaining > 1 && matches!(result, Some(WalkResult::Exit(InterpExit::BudgetExhausted))) {
+            steps.cut = false;
+            continue;
+        }
+        return result;
     }
 }
 

@@ -172,3 +172,257 @@ cargo build --offline --release -p x86jit-bench --bins --examples
 
 The 60 summary rows were also checked against all 480 raw samples, including
 independently recomputed medians and identical per-path step/retirement counts.
+
+
+## Direct class for Machine real mode (decision-23 U2)
+
+This record covers U2 rebased onto `fd67927`: the I286 empty coprocessor socket
+and hardware task switches. The alias reference is the provided release build
+of `fd67927` with the current benchmark harness. The Machine change control is
+the accepted rebased `0bdb7a4` build. U2 uses amended decision-23 §5: Machine
+within +2% of Application for loops of at least 64 steps per call; every alias
+loop must remain within +0.5% of the parent. `ip-boundary-1` is reported and its
+Machine/alias gate remains assigned to U5. The dispatchers remain separate.
+
+### Design and correctness
+
+`MachineContext::segment_class` is Direct only with PE clear, no reset-fetch marker,
+and six usable ordinary caches: selector-derived bases, FFFFh limits, CS attributes
+9Bh and data attributes 93h. Other caches, big real mode, protected mode and reset
+fetch use Checked. Direct uses shared-cache multi-instruction blocks, the common
+scalar lifter and interpreter walk with Machine specialization. Generation and
+width validation remains at lift time; unsupported shared forms retain the
+Machine lowering. TF and architectural boundaries cap execution appropriately.
+
+Direct keys include the Machine namespace and A20 assumption; hits validate decode
+IP and context. A20-on blocks have no per-access mask. A20-off uses that memory
+view where all selectors are at most F000h; upper-segment execution retains the
+bus-gated, split instruction lowering. The measured loops are below 1 MiB and do
+not establish shared-block speed for wrapping upper-segment accesses.
+
+SMC invalidations select retained Checked instruction IR through a bounded
+sixteen-page hint. Nearby data writes that invalidate no translations remain
+shared. Source watches, publication generations, fetch permits and retained-byte
+validation remain authoritative; the hint never validates code.
+
+The paired witnesses retain whole-operand stack limits and SP addressing,
+32-bit control-target checks, entry EIP validation, generation-specific vectors,
+scalar MMIO RMW completion, distinct same-address string reads, source-first
+Machine string fault ordering, first-missing-byte integer stores and complete
+fault evidence. Segment-limit stores/RMWs retain Write intent; FP stores keep
+their preflight transfer-base reporting. `PROVENANCE.md` §3 records the manuals'
+silence on observable source-MMIO versus destination-limit priority. Application
+string ordering and the frozen Real16 IR remain unchanged.
+
+The parity harness compares complete exits and metadata, registers, RAM, hidden
+segment/system state, x87/vector state, steps and retirement. Only private retry
+identity and its deliberate unused ES attribute are normalized. ES=92h forces
+Checked only while ES is not reloaded. Coverage includes RAM/Trap strings with
+and without REP, I386 66h/67h forms, XLAT, far transfers, A20 wraps, stack/frame
+aliases and both MMIO acknowledgments.
+
+Task continuations retain their stage-based transfers and stay Checked. They
+block Direct execution and new event acceptance. Ownership abandonment precedes
+entry validation. Direct entry clears stale task completion flags; shared blocks
+cannot start a task switch, and Checked transitions clear flags before returning
+to Direct. The I286 first unavailable opcode byte retains priority over a later ESC MSW gate.
+The verifier combines valid segment-class contexts with fourteen system-op probes;
+protected-only slots remain unseen in Direct contexts. No CpuState/jit_abi fields
+or frozen snapshots changed in this performance repair.
+
+### Measured alias cost and repair
+
+The task-switch ownership and continuation code is confined to Machine execution;
+it does not run in the Application benchmark path. Relative to the parent, the
+Application VM file had one change: forced inlining of `finish_single`, retained
+from the earlier SMC repair. In the rebased build this enlarged the Application
+resolver frame from 0x2A0 to 0x2E0 bytes and added cache-hit spill work.
+
+Serial source bisections measured the alternatives against the supplied parent
+and `0bdb7a4`, using six samples per side with divisor 5. Removing only forced
+materializer inlining saved about four host instructions per block and fixed the
+steady-loop failures, but left SMC-next-64 close to +0.5%. Moving all source
+ownership off cache hits made the alias much faster, but exceeded the Machine/alias
+gate and is not included. The final change preserves the parent's source-ownership
+scope and outlines only Real16 lifting/publication into `resolve_real16_uncached`.
+The materializer can still inline inside that cold frame; cached execution does
+not carry its lifted IR, backend alternatives or publication drop guards.
+All source watches, generation checks, fetch permits and cancellation paths remain.
+
+| Bisection | call-ret alias | alu alias | smc-next-64 alias | Result |
+|---|---:|---:|---:|---|
+| Remove forced materializer inlining | 1030.445 (+0.3863%) | 399.320 (+0.2534%) | 9125.659 (+0.4893%) | Steady gates pass; SMC near the limit |
+| Outline the full Real16 miss | 930.789 (-9.4141%) | 374.448 (-6.0674%) | 9083.479 (+0.0076%) | Broader hit-path change; Machine/alias gate fails |
+| Outline Real16 lifting/publication | 1021.469 (-0.6904%) | 396.924 (-0.5033%) | 9117.686 (+0.2173%) | Selected cold materialization boundary |
+
+The first cold-helper-only campaign passed every alias gate but left the rebased
+Machine boundary loop about +4.03% above the alias. Machine dispatch repeated the
+same continuation-state checks and reset stale task-completion flags on every
+shared block. The final repair snapshots task state once per dispatch iteration,
+reads saved TF only for an existing continuation, and clears stale completion
+flags once at Direct run entry. Event delivery restarts the iteration; port-input
+completion cannot change task state. Ownership validation remains before entry
+validation, pending tasks stay Checked, and event inhibition remains unchanged.
+These changes keep bookkeeping at block and run boundaries in the existing dispatcher.
+
+Nine-sample interleaved boundary-loop bisection (I286 A20 off), with the same
+alias cold helper in both candidates:
+
+| Machine bisection | Alias | Machine | Machine vs alias |
+|---|---:|---:|---:|
+| 0bdb7a4 | 415.059 [415.027–415.177] | 425.846 [425.799–426.059] | +2.5989% |
+| Reuse continuation state | 409.307 [409.296–409.373] | 418.205 [418.205–418.309] | +2.1739% |
+| Also clear flags at entry | 409.369 [409.296–409.528] | 416.754 [416.646–416.911] | +1.8040% |
+
+### Measurement method
+
+Measured on 2026-11-12, 14:22:54–14:28:25 UTC.
+Release/default-feature builds use the same host and rustc/SDK as the parent;
+both builds use the same empty Rust flag set. The supplied parent binary was not
+rebuilt. Five serial parent/candidate pairs alternate order AB/BA for `call-ret`,
+`alu`, `dos-mixed`, `smc-next-64` and `data-next-to-code`. Each invocation uses
+`real16_loops 5 3 <workload>`: fifteen samples per side and path. The other ten
+workloads use three serial rounds per engine with divisor 5. An earlier divisor-1
+parent ALU invocation reached the 180-second deadline under host load. The final
+campaign uses divisor 5 consistently and retains every completed sample.
+This parent/candidate campaign contains 1,050 samples across the five paths.
+
+A separate interleaved three-round `0bdb7a4`/candidate comparison covers all fifteen
+workloads and four Machine configurations, with divisor 5. SMC-next-1 is repeated
+in five interleaved pairs (fifteen samples per side) to resolve its small upward
+median. That repeated cohort replaces its initial three-sample control row.
+Medians and full min–max ranges are reported without trimming. Every sample checks registers, step and
+retirement parity; warm-up is excluded. No build or test ran alongside a benchmark
+in this session. The host had other activity; wall time is informational.
+Every cargo command used the bounded host-lock wait and at most four build jobs.
+
+### Alias comparison against fd67927
+
+Host instructions per guest step, median [min–max]. The five selected workloads
+have fifteen samples per side; the other ten have three.
+
+| Workload | Samples/side | Parent fd67927 | Final alias | Change |
+|---|---:|---:|---:|---:|
+| alu | 15 | 398.340 [398.298–398.630] | 396.868 [396.802–397.077] | -0.3695% |
+| load | 3 | 522.812 [522.752–522.814] | 520.803 [520.792–520.809] | -0.3843% |
+| load-odd | 3 | 533.853 [533.772–533.880] | 531.789 [531.772–531.829] | -0.3866% |
+| store | 3 | 486.125 [486.103–486.157] | 484.145 [484.106–484.258] | -0.4073% |
+| push-pop | 3 | 551.133 [551.104–551.188] | 549.632 [549.570–549.632] | -0.2723% |
+| data-next-to-code | 15 | 1049.888 [1049.758–1050.471] | 1047.911 [1047.779–1048.766] | -0.1883% |
+| data-next-to-dense-code | 3 | 1049.867 [1049.830–1050.255] | 1047.958 [1047.795–1048.085] | -0.1818% |
+| call-ret | 15 | 1026.570 [1026.431–1027.205] | 1020.631 [1020.439–1021.046] | -0.5785% |
+| dos-mixed | 15 | 492.880 [492.709–493.405] | 492.079 [491.947–492.498] | -0.1625% |
+| rep-movsw | 3 | 192.121 [192.093–192.152] | 188.107 [188.084–188.107] | -2.0893% |
+| straight-line | 3 | 410.453 [410.417–416.011] | 410.408 [410.407–415.555] | -0.0110% |
+| ip-boundary-1 | 3 | 2549.337 [2548.776–2549.383] | 2544.115 [2543.836–2544.724] | -0.2048% |
+| ip-boundary-64 | 3 | 411.918 [411.913–411.991] | 409.863 [409.323–409.878] | -0.4989% |
+| smc-next-1 | 3 | 11042.544 [11042.516–11066.995] | 11072.748 [11072.605–11106.507] | +0.2735% |
+| smc-next-64 | 15 | 9082.065 [9079.935–9085.665] | 9113.910 [9088.897–9131.547] | +0.3506% |
+
+### Host instructions per guest step
+
+Median [min–max].
+
+| Workload | Application | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| alu | 396.868 [396.802–397.077] | 383.343 [383.312–383.472] | 383.356 [383.295–383.511] | 383.335 [383.295–383.539] | 383.345 [383.288–383.451] |
+| load | 520.803 [520.792–520.809] | 504.479 [504.415–504.509] | 504.462 [504.420–504.509] | 504.453 [504.437–504.521] | 504.462 [504.454–504.489] |
+| load-odd | 531.789 [531.772–531.829] | 515.457 [515.386–515.504] | 515.446 [515.429–515.505] | 515.481 [515.460–515.524] | 515.415 [515.415–515.549] |
+| store | 484.145 [484.106–484.258] | 470.216 [470.170–470.359] | 470.178 [470.150–470.278] | 470.215 [470.110–470.278] | 470.106 [470.092–470.147] |
+| push-pop | 549.632 [549.570–549.632] | 483.873 [483.821–483.907] | 483.858 [483.825–483.887] | 483.864 [483.841–483.952] | 483.868 [483.833–483.904] |
+| data-next-to-code | 1047.911 [1047.779–1048.766] | 1036.354 [1036.077–1038.673] | 1036.384 [1036.091–1037.330] | 1036.274 [1036.087–1036.721] | 1036.234 [1036.088–1037.491] |
+| data-next-to-dense-code | 1047.958 [1047.795–1048.085] | 1036.189 [1036.176–1036.245] | 1036.265 [1036.183–1036.304] | 1036.216 [1036.211–1036.328] | 1036.255 [1036.176–1036.375] |
+| call-ret | 1020.631 [1020.439–1021.046] | 942.907 [942.824–944.092] | 942.946 [942.751–943.829] | 942.930 [942.827–943.693] | 942.942 [942.803–943.514] |
+| dos-mixed | 492.079 [491.947–492.498] | 447.048 [446.892–447.368] | 446.836 [446.713–447.258] | 447.070 [446.916–447.730] | 446.861 [446.713–447.039] |
+| rep-movsw | 188.107 [188.084–188.107] | 188.105 [188.089–188.112] | 188.120 [188.119–188.136] | 188.118 [188.112–188.122] | 188.095 [188.080–188.110] |
+| straight-line | 410.408 [410.407–415.555] | 389.973 [389.782–392.209] | 389.782 [389.781–389.840] | 389.824 [389.782–389.977] | 389.781 [389.781–390.250] |
+| ip-boundary-1 | 2544.115 [2543.836–2544.724] | 3544.915 [3544.749–3545.439] | 3483.692 [3483.581–3485.082] | 3556.281 [3555.770–3556.777] | 3495.295 [3494.883–3495.744] |
+| ip-boundary-64 | 409.863 [409.323–409.878] | 416.561 [416.560–416.569] | 415.782 [415.697–416.222] | 416.798 [416.663–421.550] | 415.883 [415.820–416.340] |
+| smc-next-1 | 11072.748 [11072.605–11106.507] | 6119.486 [6119.443–6120.663] | 5954.553 [5953.598–5958.374] | 6131.613 [6131.268–6133.649] | 5965.350 [5965.153–5966.367] |
+| smc-next-64 | 9113.910 [9088.897–9131.547] | 3436.365 [3435.572–3437.017] | 3330.322 [3329.560–3331.724] | 3438.238 [3437.596–3439.321] | 3332.522 [3331.704–3334.371] |
+
+### Wall nanoseconds per guest step
+
+Median [min–max]; informational.
+
+| Workload | Application | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| alu | 13.223 [12.300–13.667] | 12.707 [12.116–14.120] | 12.730 [11.938–13.809] | 12.602 [11.933–13.918] | 12.712 [11.990–13.961] |
+| load | 15.759 [15.618–16.463] | 15.036 [14.729–15.090] | 15.319 [15.189–15.429] | 15.057 [14.798–15.726] | 14.980 [14.921–15.142] |
+| load-odd | 15.997 [15.863–16.119] | 16.583 [15.591–16.927] | 16.030 [15.674–16.317] | 15.945 [15.756–16.296] | 16.306 [15.801–16.779] |
+| store | 15.039 [14.766–15.054] | 15.417 [14.773–15.492] | 15.434 [15.001–15.459] | 15.389 [14.775–15.635] | 15.045 [14.914–15.141] |
+| push-pop | 17.405 [17.298–17.597] | 15.556 [15.256–15.783] | 15.854 [15.450–15.963] | 16.034 [15.684–16.320] | 16.114 [15.702–16.125] |
+| data-next-to-code | 33.185 [31.966–34.499] | 33.359 [32.103–36.988] | 33.386 [32.270–35.967] | 33.057 [32.155–34.782] | 33.316 [32.383–35.066] |
+| data-next-to-dense-code | 32.798 [32.751–33.076] | 32.643 [31.632–33.065] | 32.857 [32.359–33.185] | 32.649 [32.105–32.946] | 32.350 [32.030–33.072] |
+| call-ret | 34.092 [32.385–66.529] | 33.752 [32.111–120.600] | 34.441 [32.093–114.281] | 34.230 [31.920–93.379] | 34.040 [32.178–115.386] |
+| dos-mixed | 18.003 [17.060–20.687] | 16.872 [16.083–19.689] | 17.292 [16.211–19.043] | 17.074 [16.422–19.347] | 17.065 [16.188–18.978] |
+| rep-movsw | 4.849 [4.835–5.038] | 4.985 [4.943–4.990] | 4.896 [4.822–4.966] | 5.019 [4.772–5.172] | 5.041 [4.892–5.050] |
+| straight-line | 11.923 [11.881–12.823] | 12.506 [11.917–12.986] | 12.062 [11.914–12.208] | 12.348 [12.183–12.713] | 12.822 [11.851–13.513] |
+| ip-boundary-1 | 104.741 [104.275–106.814] | 136.389 [136.126–140.017] | 133.727 [132.977–136.026] | 137.528 [135.996–138.152] | 134.405 [134.026–134.436] |
+| ip-boundary-64 | 15.423 [14.044–17.128] | 16.004 [15.819–16.026] | 15.936 [15.877–20.985] | 15.766 [15.359–25.225] | 16.203 [15.489–16.320] |
+| smc-next-1 | 478.759 [470.205–481.079] | 231.870 [227.825–232.783] | 224.932 [222.814–236.541] | 228.715 [226.209–230.216] | 221.923 [221.485–222.212] |
+| smc-next-64 | 401.168 [384.458–416.878] | 131.451 [127.169–134.908] | 128.629 [121.513–134.109] | 129.342 [124.826–137.525] | 127.939 [122.676–131.744] |
+
+### Machine comparison against the rebased control
+
+The row shows the largest median change among the four Machine configurations
+in the paired control cohort; ranges belong to that configuration. SMC-next-1
+uses the fifteen-sample repeat; the other rows use three samples per side.
+Every positive median change has overlapping sample ranges. SMC-next-1 pays
+about five extra host instructions per call for entry flag clearing; its
++0.0818% median change remains within its measured spread.
+
+| Workload | Configuration | 0bdb7a4 | Final | Change |
+|---|---|---:|---:|---:|
+| alu | legacy-i386-a20-off | 389.113 [389.084–389.173] | 383.396 [383.365–383.405] | -1.4692% |
+| load | legacy-i286 | 512.067 [512.052–512.221] | 504.517 [504.450–504.522] | -1.4744% |
+| load-odd | legacy-i386-a20-off | 523.196 [523.168–523.206] | 515.632 [515.429–515.787] | -1.4457% |
+| store | legacy-i386-a20-off | 477.781 [477.764–477.784] | 470.143 [470.084–470.571] | -1.5986% |
+| push-pop | legacy-i286-a20-off | 489.658 [489.646–489.788] | 483.900 [483.893–483.901] | -1.1759% |
+| data-next-to-code | legacy-i286 | 1043.311 [1043.085–1043.359] | 1036.291 [1036.232–1036.311] | -0.6729% |
+| data-next-to-dense-code | legacy-i286 | 1043.298 [1043.261–1043.351] | 1036.360 [1036.188–1036.432] | -0.6650% |
+| call-ret | legacy-i286 | 966.083 [966.059–966.247] | 943.313 [942.752–943.367] | -2.3569% |
+| dos-mixed | legacy-i286-a20-off | 451.051 [450.970–451.105] | 447.126 [446.946–447.144] | -0.8702% |
+| rep-movsw | legacy-i286 | 188.097 [188.097–188.119] | 188.114 [188.101–188.119] | +0.0090% |
+| straight-line | legacy-i286 | 389.813 [389.812–390.301] | 389.899 [389.791–389.939] | +0.0221% |
+| ip-boundary-1 | legacy-i286 | 3550.284 [3549.915–3551.072] | 3544.990 [3544.670–3545.165] | -0.1491% |
+| ip-boundary-64 | legacy-i386-a20-off | 424.875 [424.858–424.913] | 415.817 [415.711–416.165] | -2.1319% |
+| smc-next-1 | legacy-i286 | 6114.851 [6113.193–6125.305] | 6119.855 [6118.031–6128.119] | +0.0818% |
+| smc-next-64 | legacy-i286 | 3447.992 [3447.922–3448.115] | 3436.202 [3436.000–3436.538] | -0.3419% |
+
+### Rebase cost compared with earlier measurements
+
+These are historical pre-rebase medians from the preceding record, compared with
+the rebased `0bdb7a4` control above, not paired A/B samples.
+The materializer repair leaves Machine execution unchanged. Reusing one
+continuation-state snapshot per dispatch iteration and clearing stale task flags
+at Direct run entry removes much of this separate Machine rebase cost. The
+following table shows the original rebase cost before those Machine repairs;
+the control comparison above reports the final effect.
+
+| Workload | Configuration | Earlier pre-rebase | Rebased control | Rebase change | Final | Remaining vs earlier |
+|---|---|---:|---:|---:|---:|---:|
+| alu | legacy-i286-a20-off | 382.280 [382.277–382.291] | 389.143 [389.091–389.150] | +1.7953% | 383.414 [383.373–383.469] | +0.2966% |
+| call-ret | legacy-i286-a20-off | 938.745 [938.721–938.768] | 966.094 [966.076–966.122] | +2.9134% | 942.824 [942.773–943.002] | +0.4345% |
+| dos-mixed | legacy-i286 | 445.816 [445.792–445.826] | 451.081 [450.988–451.138] | +1.1810% | 447.084 [446.900–447.154] | +0.2844% |
+| rep-movsw | legacy-i386-a20-off | 188.069 [188.068–188.069] | 188.114 [188.077–188.122] | +0.0239% | 188.117 [188.116–188.123] | +0.0255% |
+| ip-boundary-64 | legacy-i286-a20-off | 413.763 [413.746–413.765] | 426.052 [425.841–426.188] | +2.9701% | 416.692 [416.664–416.740] | +0.7079% |
+| smc-next-1 | legacy-i386-a20-off | 5868.370 [5868.140–5881.480] | 5963.538 [5961.193–5975.519] | +1.6217% | 5967.319 [5965.162–5983.202] | +1.6861% |
+| smc-next-64 | legacy-i386 | 3316.758 [3316.066–3322.715] | 3342.351 [3342.349–3342.923] | +0.7716% | 3330.850 [3329.784–3331.119] | +0.4249% |
+
+### Gates and validation
+
+| Gate | Observed | Result |
+|---|---|---|
+| Every alias loop within +0.5% of fd67927 | Worst +0.3506% (smc-next-64) | Passed |
+| Machine within +2% of alias, U2 loops | Worst +1.6920% (ip-boundary-64, legacy-i286-a20-off) | Passed |
+| Machine vs 0bdb7a4, no regression beyond observed spread | Largest upward median +0.0818% (smc-next-1); overlapping ranges | Passed |
+| Machine ip-boundary-1 within +2% | +39.7846% | Assigned to U5 |
+
+1101 tests passed; 3 ignored probes remain skipped. This includes core,
+every legacy suite, `machine_empty_fpu`, all Real16 suites, compat, fault atomicity,
+application codegen/frozen snapshots, and the affected SMC/fetch-policy suites.
+Nextest used one test process at a time and a 180-second command deadline.
+All-targets/all-features clippy with `-D warnings`, fmt and whitespace checks pass.
+No commits, bead operations or pushes were performed. Raw measurement files remain
+outside the repository; these tables are the retained performance record.

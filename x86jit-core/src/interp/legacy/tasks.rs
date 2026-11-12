@@ -631,6 +631,8 @@ fn save_image(
 /// invalid. Normal entry validation deliberately rejects such intermediate state.
 pub(crate) fn fault_context(cpu: &CpuState, generation: CpuGeneration) -> MachineContext {
     MachineContext {
+        // A task switch loads protected-mode state.
+        segment_class: crate::SegmentClass::Checked,
         generation,
         regime: legacy::MachineRegime::Protected,
         default_operand_bits: if cpu.legacy.segments[0].attributes & 0x4000 != 0 {

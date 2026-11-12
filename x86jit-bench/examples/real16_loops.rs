@@ -1,6 +1,6 @@
 //! Real16 embedder loop benchmarks using only the core API. Release mode;
 //! warmup excluded. Arguments: step-count divisor (default 1), rounds (default 5).
-//! Each round rotates the four paths; every sample starts from a fresh VM.
+//! Each round rotates the five paths; every sample starts from a fresh VM.
 //! macOS reports proc_pid_rusage host instructions around each measured region.
 use std::time::Instant;
 use x86jit_core::{
@@ -41,9 +41,16 @@ enum Path {
     I286,
     I386,
     I286A20Off,
+    I386A20Off,
 }
 
-const PATHS: [Path; 4] = [Path::Application, Path::I286, Path::I386, Path::I286A20Off];
+const PATHS: [Path; 5] = [
+    Path::Application,
+    Path::I286,
+    Path::I386,
+    Path::I286A20Off,
+    Path::I386A20Off,
+];
 
 impl Path {
     fn name(self) -> &'static str {
@@ -52,6 +59,7 @@ impl Path {
             Self::I286 => "legacy-i286",
             Self::I386 => "legacy-i386",
             Self::I286A20Off => "legacy-i286-a20-off",
+            Self::I386A20Off => "legacy-i386-a20-off",
         }
     }
 }
@@ -60,7 +68,7 @@ fn setup(path: Path, cs: u64, ip: u64, ds: u64) -> (Vm, Vcpu) {
     let mut vm = Vm::new(VmConfig::flat(0x10_0000));
     vm.set_cpu_mode(CpuMode::Real16);
     if !matches!(path, Path::Application) {
-        let model = if matches!(path, Path::I386) {
+        let model = if matches!(path, Path::I386 | Path::I386A20Off) {
             CpuModel::I80386
         } else {
             CpuModel::I80286
@@ -146,13 +154,13 @@ impl Workload {
             cpu.cpu.legacy =
                 CpuState::legacy_real_entry([c.cs, c.ds, c.es, c.ss, c.fs, c.gs]).legacy;
         }
-        cpu.set_a20_enabled(!matches!(path, Path::I286A20Off));
+        cpu.set_a20_enabled(!matches!(path, Path::I286A20Off | Path::I386A20Off));
         for (address, bytes) in &self.writes {
             assert!(*address + bytes.len() as u64 <= 0x10_0000);
             vm.write_bytes(*address, bytes).unwrap();
         }
         // This intentionally fills the Application cache, as in the original
-        // dense-code probe. LegacySystem uses its own per-vCPU block cache.
+        // dense-code probe. Checked Machine contexts use a per-vCPU block cache.
         for i in 0..self.fillers {
             let pc = 0x7000 + i;
             vm.cache.insert(
@@ -240,7 +248,7 @@ fn summary(mut values: Vec<f64>) -> (f64, f64, f64) {
 fn bench(work: &Workload, scale: u64, rounds: usize) {
     let count = (work.count / scale).max(1);
     let warmup = (work.warmup / scale).max(1);
-    let mut samples: [Vec<(f64, f64)>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut samples: [Vec<(f64, f64)>; 5] = std::array::from_fn(|_| Vec::new());
     let mut expected: Option<CpuState> = None;
     let mut expected_counts = None;
     for round in 0..rounds {
@@ -363,12 +371,13 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let scale: u64 = args.next().map(|s| s.parse().unwrap()).unwrap_or(1);
     let rounds: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(5);
+    let workload = args.next();
     assert!(
         args.next().is_none(),
-        "usage: real16_loops [divisor] [rounds]"
+        "usage: real16_loops [divisor] [rounds] [workload]"
     );
     assert_ne!(scale, 0);
-    assert!(rounds >= 5, "at least five interleaved rounds are required");
+    assert!(rounds >= 3, "at least three serial rounds are required");
     if !cfg!(target_os = "macos") {
         eprintln!("host instruction counter unavailable: instruction columns are zero");
     }
@@ -465,7 +474,15 @@ fn main() {
         work.slices = slices;
         workloads.push(work);
     }
+    assert!(
+        workload
+            .as_ref()
+            .is_none_or(|name| workloads.iter().any(|work| work.name == name)),
+        "unknown workload"
+    );
     for work in workloads {
-        bench(&work, scale, rounds);
+        if workload.as_ref().is_none_or(|name| work.name == name) {
+            bench(&work, scale, rounds);
+        }
     }
 }

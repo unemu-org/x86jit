@@ -214,8 +214,8 @@ pub use ir::{
 };
 pub use legacy::{
     derive_legacy_context, CpuGeneration, ExceptionDelivery, ExecutionProfile, LegacyCpuModel,
-    LegacyCpuState, MachineContext, MachineContextError, MachineRegime, SegmentCache, SegmentId,
-    SystemSegment, TableRegister,
+    LegacyCpuState, MachineContext, MachineContextError, MachineRegime, SegmentCache, SegmentClass,
+    SegmentId, SystemSegment, TableRegister,
 };
 #[allow(deprecated)]
 pub use legacy::{LegacyContextError, LegacyDecodeContext, LegacyRegime};

@@ -162,6 +162,10 @@ pub enum Exit {
     Hlt,
     /// Access to an unmapped address, or instruction fetch from a `RegionKind::Trap`
     /// region (`access: AccessKind::Execute`). Trap backing is never decoded.
+    /// For a non-atomic scalar integer write rejected by a mapping boundary, `addr`
+    /// identifies the first unavailable byte; the write has not partially committed.
+    /// Scalar floating-point stores report the failed preflight transfer's base
+    /// (the operand base for an unsplit operand), rather than the first missing byte.
     /// For an execute fault, `addr` identifies the first unavailable fetch byte
     /// (including a Trap boundary); RIP stays on the attempted instruction's start.
     /// Fetch continues across adjacent mapped RAM/ROM regions.

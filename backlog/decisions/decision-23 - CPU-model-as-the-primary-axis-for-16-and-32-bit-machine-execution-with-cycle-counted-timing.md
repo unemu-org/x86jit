@@ -712,10 +712,19 @@ today.
 | When | Requirement |
 |---|---|
 | Every bead touching the shared lifter, IR, walk or dispatcher | Alias: host instructions per step within +0.5 % of the parent commit on every loop; `dos-mixed` wall time within +2 %. Decision-22 measured run-to-run differences of −0.02 % to +0.16 % on this metric. |
-| Machine real mode gains the Direct class | `I80286` and `I80386` real mode, A20 enabled or disabled, within +2 % of the alias on every loop. |
+| Machine real mode gains the Direct class (U2) | `I80286` and `I80386` real mode, A20 enabled or disabled, within +2 % of the alias on every loop of 64 or more guest steps per `run` call. |
+| The single dispatcher lands (U5) | The same, on every loop, including one guest step per `run` call (`ip-boundary-1`). |
 | The alias switches to the Machine path | Alias within +0.5 % of its pre-switch numbers. A regression blocks the switch; it is not traded against the cleanup. |
 | Level 2 lands | Level 1 numbers unchanged within noise, and the level-1 walk's disassembly compared as in decision-16 §5. Level-2 overhead is measured and recorded; target at most 5 % on `dos-mixed`. |
 | Every bead | Application Long64/Compat32 emitted code unchanged, by decision-18 witness 6. |
+
+**Amendment (U2, 2026-11-12, accepted by the maintainer).** U2 measured Machine
+real mode within +2 % of the alias on every loop except `ip-boundary-1`, which runs
+one guest step per `run` call: about +36 % (U0: +113 %). The remaining cost is per call:
+the entry validates the public `CpuState`, derives the context and enters the
+separate legacy run wrapper. U5 removes that duplication, so the one-step gate
+moves to U5. U2 meets the gate on loops of 64 or more steps per call. The alias
+gates are unchanged.
 
 ## Migration
 
@@ -958,7 +967,7 @@ named.
 | 6 | Undocumented 8086-class opcodes? | Typed refusal. PROVENANCE.md unchanged (§3). | A manual cannot license what it does not describe, and a corpus cannot license at all. |
 | 7 | V20/V30 8080 emulation mode? | The model decodes BRKEM, RETEM and CALLN and keeps the MD flag; 8080 execution is a separate core outside x86jit, entered through a typed `Exit` with a documented register mapping; the contract is designed with the V20 bead; BRKEM is a typed refusal until then (§3). | A second instruction set does not belong in a core whose dependency set is `{iced-x86}`. |
 | 8 | Timing ranges without a formula? | The midpoint, rounded down (Timing model). | The least biased single value when the manual gives no rule; the table keeps the range. |
-| 9 | Performance thresholds? | Confirmed: +0.5 % host instructions per step and +2 % wall time for the alias; Machine real mode within +2 % of the alias; 5 % target for level-2 overhead. | They sit just above the measured run-to-run noise. |
+| 9 | Performance thresholds? | Confirmed: +0.5 % host instructions per step and +2 % wall time for the alias; Machine real mode within +2 % of the alias (one-step-per-call loops from U5, amended at U2); 5 % target for level-2 overhead. | They sit just above the measured run-to-run noise. |
 | 10 | Cycle limit now, or counters only? | Both now: `StepOptions::with_cycle_limit` and the counters (Timing model). | The limit is optional and costs nothing when unset. |
 | 11 | Is "one frequency and at most one scale factor" enough? | Yes, with the 80286 PRM's own 5-10 % caveat stated (Timing model). | Anything closer is level 3. |
 | 12 | FPU per VM or per vCPU? | A VM default at construction; the per-vCPU setter stays and is not deprecated (§4). | It gives the embedder its one-place selection without removing an existing control. |

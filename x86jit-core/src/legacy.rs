@@ -64,8 +64,16 @@ pub enum MachineRegime {
     Protected,
 }
 
+/// Lift-time segment-access proof (decision-23 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentClass {
+    Direct,
+    Checked,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MachineContext {
+    pub segment_class: SegmentClass,
     /// Instruction-generation policy, independent of decoder width.
     pub generation: CpuGeneration,
     /// Real or protected execution regime derived from the retained CPU state.
@@ -253,6 +261,30 @@ pub fn derive_legacy_context(
         16
     };
     Ok(MachineContext {
+        segment_class: if !protected
+            && state.reset_fetch == 0
+            && state
+                .segments
+                .iter()
+                .zip([cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs])
+                .enumerate()
+                .all(|(i, (cache, selector))| {
+                    *cache
+                        == SegmentCache {
+                            base: u32::from(selector) << 4,
+                            limit: 0xffff,
+                            attributes: if i == SegmentId::Cs as usize {
+                                0x9b
+                            } else {
+                                0x93
+                            },
+                            ..SegmentCache::default()
+                        }
+                }) {
+            SegmentClass::Direct
+        } else {
+            SegmentClass::Checked
+        },
         generation: model.generation,
         regime: if protected {
             MachineRegime::Protected
@@ -407,6 +439,7 @@ mod tests {
                                     assert_eq!(
                                         context,
                                         MachineContext {
+                                            segment_class: SegmentClass::Checked,
                                             generation,
                                             regime: if pe {
                                                 MachineRegime::Protected
@@ -605,6 +638,10 @@ mod tests {
 /// address widths are bits. Application lifting never emits these operations.
 #[derive(Clone, Debug)]
 pub enum LegacyOp {
+    /// A Direct block using the shared Real16 walk.
+    SharedWalk,
+    /// Architectural rollback is required by this instruction's helper lowering.
+    Checkpoint,
     Address {
         dst: crate::ir::Temp,
         segment: SegmentId,
@@ -734,6 +771,13 @@ pub enum LegacyOp {
     Refuse {
         operation: crate::UnsupportedSystemOperation,
     },
+    /// Ordinary real-mode SS:SP address with a model-constant whole-operand gate.
+    DirectStackAddress {
+        dst: crate::ir::Temp,
+        offset: crate::ir::Val,
+        bytes: u8,
+        vector: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,27 +870,39 @@ pub(crate) fn access(
             // violations raise #GP(0). I386: the same SDM/80386 PRM tables.
             13
         };
-        // Real-address pseudo-protection faults carry no error code (80386
-        // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5). Protected codes
-        // define only bits 15:0 on I386 (PRM §9.7 Fig. 9-7, scan checked).
-        let mut details = crate::fault::FaultMetadata::architectural_exception(
-            cpu.rip,
-            cpu.rip,
-            vector,
-            crate::fault::FaultClass::Fault,
-            if protected {
-                crate::fault::ErrorCode::bits(0, 0xffff)
-            } else {
-                crate::fault::ErrorCode::NoCode
-            },
-        );
-        details.path = crate::fault::FaultPath::Interpreter;
-        details.operand_base = crate::fault::Knowledge::Known(offset);
-        details.operand_size = crate::fault::Knowledge::Known(u16::from(bytes));
-        details.access = crate::fault::Knowledge::Known(access.into());
-        return Err(crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details));
+        return Err(segment_fault(cpu, vector, offset, bytes, access));
     }
     Ok(u64::from(cache.base.wrapping_add(offset as u32)))
+}
+
+/// Preserve the operand evidence for cached and proven ordinary segments alike.
+#[cold]
+pub(crate) fn segment_fault(
+    cpu: &CpuState,
+    vector: u8,
+    offset: u64,
+    bytes: u8,
+    access: crate::AccessKind,
+) -> crate::Exit {
+    // Real-address pseudo-protection faults carry no error code (80386
+    // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5). Protected codes
+    // define only bits 15:0 on I386 (PRM §9.7 Fig. 9-7, scan checked).
+    let mut details = crate::fault::FaultMetadata::architectural_exception(
+        cpu.rip,
+        cpu.rip,
+        vector,
+        crate::fault::FaultClass::Fault,
+        if cpu.legacy.cr0 & 1 != 0 {
+            crate::fault::ErrorCode::bits(0, 0xffff)
+        } else {
+            crate::fault::ErrorCode::NoCode
+        },
+    );
+    details.path = crate::fault::FaultPath::Interpreter;
+    details.operand_base = crate::fault::Knowledge::Known(offset);
+    details.operand_size = crate::fault::Knowledge::Known(u16::from(bytes));
+    details.access = crate::fault::Knowledge::Known(access.into());
+    crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details)
 }
 
 /// Final physical-bus gate, also for future page-walk transfers (decision-22).

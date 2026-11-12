@@ -493,7 +493,7 @@ pub(crate) fn exec_get_cond(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn exec_load<const ROUTED: bool, const ORDER: u8>(
+pub(crate) fn exec_load<const MACHINE: bool, const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
@@ -505,6 +505,24 @@ pub(crate) fn exec_load<const ROUTED: bool, const ORDER: u8>(
     let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Read), false);
     let mem = mem.unordered();
     let a = read_val(*addr, &*temps);
+    if MACHINE {
+        // Decision-16 §3: a later write can suspend this same instruction.
+        // Keep its completed device read, and consume answers only at MMIO.
+        if let Some(value) = cpu.mmio_part(cur_addr, a) {
+            temps[*dst as usize] = value & mask(*size);
+            return None;
+        }
+        match mem.read(a, *size) {
+            Ok(value) => temps[*dst as usize] = value,
+            Err(MemTrap::Mmio) if cpu.pending_mmio.is_some() => {
+                let value = cpu.pending_mmio.take().unwrap() & mask(*size);
+                cpu.record_mmio_part(cur_addr, a, value);
+                temps[*dst as usize] = value;
+            }
+            Err(trap) => return Some(trap_out(cpu, cur_addr, trap, a, *size, AccessKind::Read, 0)),
+        }
+        return None;
+    }
     // Resume after an MMIO read (§5.2): the block re-executes from the
     // faulting instruction, so this first load consumes the value the
     // embedder supplied via `complete_mmio_read` instead of re-trapping.

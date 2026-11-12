@@ -382,7 +382,7 @@ pub struct CpuState {
     pub fpu_fcs: u16,
     pub fpu_fds: u16,
     /// Sub-transfers of the currently-trapping instruction that the embedder has already
-    /// answered, as `(guest address, value)`. Appended at the END like the
+    /// answered, as `(engine transfer key, value)`. Appended at the END like the
     /// fields above, so every pre-existing `#[repr(C)]` offset and the JIT ABI built on
     /// them stay byte-identical. Not in `jit_abi::CpuOffsets` — no compiled block reads
     /// it; the JIT defers MMIO to the interpreter (`RET_MMIO_DEFER`), so fixing the
@@ -395,11 +395,11 @@ pub struct CpuState {
     /// the FIRST half traps again with nothing pending — forever. Measured before the
     /// fix: four rounds of `run` → `complete_mmio_read` produced four identical exits.
     ///
-    /// Keyed by address rather than by transfer index so it does not depend on the
-    /// handlers visiting halves in a particular order. The maximum is 64 transfers:
-    /// masked vector operands visit at most 64 / elem elements (elem >= 1), narrowing
-    /// stores visit at most 64 / 2 elements, and unmasked operands use at most eight
-    /// 8-byte transfers.
+    /// Application vector helpers key by address. The Machine helper walk also
+    /// keys reads by their replay-stable visit; stepped strings use operand slots.
+    /// Thus distinct reads of one bus address stay distinct. At most 64 transfers:
+    /// masked operands visit at most 64 / elem elements, narrowing stores 64 / 2,
+    /// and unmasked operands at most eight 8-byte transfers.
     /// The fixed array keeps MMIO retry storage allocation-free and costs 1024 bytes, 896 more
     /// than an eight-entry array.
     /// The interpreter clears these at instruction completion, including ordinary

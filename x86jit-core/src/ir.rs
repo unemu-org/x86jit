@@ -3568,21 +3568,38 @@ impl IrOp {
 }
 
 /// A lifted basic block, keyed by guest start address in the cache (§6.3).
-#[derive(Clone, Debug)]
+// Keep the Application layout when MachineContext grows: Rust's default layout
+// moves every hot scalar field when the optional context reaches eight bytes.
+#[repr(C)]
+#[derive(Clone)]
 pub struct IrBlock {
-    /// Application decode mode. With `legacy_context`, this is compatibility
-    /// metadata, never a legacy regime or stack-size input.
-    pub mode: crate::CpuMode,
-    pub guest_start: u64,
     pub ops: Vec<IrOp>,
+    pub guest_start: u64,
     /// Number of temporaries allocated (backend reserves this many slots).
     pub temp_count: u32,
     /// Guest bytes covered by the block (for SMC invalidation).
     pub guest_len: u32,
     /// x86 instruction count (for budget/stats).
     pub icount: u32,
+    /// Application decode mode. With `legacy_context`, this is compatibility
+    /// metadata, never a legacy regime or stack-size input.
+    pub mode: crate::CpuMode,
     /// Authoritative legacy context; application lifting always leaves this absent.
     pub legacy_context: Option<crate::legacy::MachineContext>,
+}
+
+impl core::fmt::Debug for IrBlock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IrBlock")
+            .field("mode", &self.mode)
+            .field("guest_start", &self.guest_start)
+            .field("ops", &self.ops)
+            .field("temp_count", &self.temp_count)
+            .field("guest_len", &self.guest_len)
+            .field("icount", &self.icount)
+            .field("legacy_context", &self.legacy_context)
+            .finish()
+    }
 }
 
 impl IrBlock {

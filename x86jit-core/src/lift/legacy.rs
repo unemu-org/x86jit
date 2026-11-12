@@ -241,6 +241,22 @@ pub(crate) fn instruction(
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
     }
+    if context.segment_class == crate::SegmentClass::Direct {
+        direct_addresses(&mut ops.values, &mut tg, context, u64::from(ip));
+        if !ops.values.iter().all(crate::interp::legacy::supported) {
+            ops.values.truncate(1);
+            ops.values.push(IrOp::Legacy(L::Refuse {
+                operation: crate::UnsupportedSystemOperation::LegacyInstruction,
+            }));
+        }
+        // POP memory computes its EA after committing the stack increment.
+        // Other helpers stage architectural destinations until their accesses
+        // succeed; scalar RMW flags are committed after the store below.
+        if insn.mnemonic() == Mnemonic::Pop && insn.op0_kind() == OpKind::Memory {
+            ops.values.insert(1, IrOp::Legacy(L::Checkpoint));
+        }
+        defer_store_flags(&mut ops.values, &mut tg);
+    }
     Ok(IrBlock {
         mode,
         guest_start: u64::from(ip),
@@ -250,6 +266,197 @@ pub(crate) fn instruction(
         ops: ops.values,
         legacy_context: Some(context),
     })
+}
+
+pub(super) fn direct_address(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    segment: SegmentId,
+    offset: Val,
+    bytes: u8,
+    context: MachineContext,
+    ip: u64,
+) -> Val {
+    // I286 PRM Appendix B MOV p. B-74; I386 PRM §14.6 Table 14-1:
+    // check the whole operand before forming a selector-derived linear address.
+    if bytes != 0 {
+        ops.push(IrOp::SegLimitCheck {
+            offset,
+            size: bytes,
+            vector: if segment == SegmentId::Ss && context.generation == crate::CpuGeneration::I386
+            {
+                12
+            } else {
+                13
+            },
+            fault_ip: ip,
+        });
+    }
+    let reg = match segment {
+        SegmentId::Cs => Reg::Cs,
+        SegmentId::Ds => Reg::Ds,
+        SegmentId::Es => Reg::Es,
+        SegmentId::Ss => Reg::Ss,
+        SegmentId::Fs | SegmentId::Gs => Reg::Cs,
+    };
+    let sel = match segment {
+        SegmentId::Fs | SegmentId::Gs => {
+            let dst = tg.fresh();
+            ops.push(IrOp::ReadSelector {
+                dst,
+                segment: if segment == SegmentId::Fs { 4 } else { 5 },
+            });
+            Val::Temp(dst)
+        }
+        _ => read_reg(reg, ops, tg),
+    };
+    let base = alu_none(ops, tg, |dst| IrOp::Shl {
+        dst,
+        a: sel,
+        b: Val::Imm(4),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    add_addr(offset, base, ops, tg)
+}
+
+fn direct_addresses(ops: &mut Vec<IrOp>, tg: &mut TempGen, context: MachineContext, ip: u64) {
+    let mut result = Vec::with_capacity(ops.len());
+    for op in ops.drain(..) {
+        if let IrOp::Legacy(L::Address {
+            dst,
+            segment,
+            offset,
+            bytes,
+            ..
+        }) = op
+        {
+            direct_address(&mut result, tg, segment, offset, bytes, context, ip);
+            let Some(IrOp::Add { dst: output, .. }) = result.last_mut() else {
+                unreachable!("address addition")
+            };
+            *output = dst;
+        } else {
+            result.push(op);
+        }
+    }
+    *ops = result;
+}
+
+// Scalar RMW lowering computes its result before the store. Recompute only the
+// flag image after that store succeeds, so a Direct scalar needs no rollback
+// snapshot (spec.md §16, fault atomicity).
+fn defer_store_flags(ops: &mut Vec<IrOp>, tg: &mut TempGen) {
+    let Some(store) = ops.iter().rposition(|op| matches!(op, IrOp::Store { .. })) else {
+        return;
+    };
+    let mut result = Vec::with_capacity(ops.len());
+    let mut bit_flags = Vec::new();
+    for (index, op) in ops.drain(..).enumerate() {
+        if index < store {
+            if let IrOp::Bt {
+                result: dst,
+                a,
+                bit,
+                size,
+                op: kind,
+            } = op
+            {
+                bit_flags.push(IrOp::Bt {
+                    result: dst,
+                    a,
+                    bit,
+                    size,
+                    op: kind,
+                });
+                let shift = alu_none(&mut result, tg, |dst| IrOp::And {
+                    dst,
+                    a: bit,
+                    b: Val::Imm(u64::from(size) * 8 - 1),
+                    size: 8,
+                    set_flags: FlagMask::NONE,
+                });
+                let bit_mask = alu_none(&mut result, tg, |dst| IrOp::Shl {
+                    dst,
+                    a: Val::Imm(1),
+                    b: shift,
+                    size: 8,
+                    set_flags: FlagMask::NONE,
+                });
+                let b = if matches!(kind, BtOp::Reset) {
+                    alu_none(&mut result, tg, |dst| IrOp::Xor {
+                        dst,
+                        a: bit_mask,
+                        b: Val::Imm(u64::MAX),
+                        size: 8,
+                        set_flags: FlagMask::NONE,
+                    })
+                } else {
+                    bit_mask
+                };
+                result.push(match kind {
+                    BtOp::Set => IrOp::Or {
+                        dst,
+                        a,
+                        b,
+                        size,
+                        set_flags: FlagMask::NONE,
+                    },
+                    BtOp::Reset => IrOp::And {
+                        dst,
+                        a,
+                        b,
+                        size,
+                        set_flags: FlagMask::NONE,
+                    },
+                    BtOp::Complement => IrOp::Xor {
+                        dst,
+                        a,
+                        b,
+                        size,
+                        set_flags: FlagMask::NONE,
+                    },
+                    BtOp::Test => unreachable!("a bit test has no store"),
+                });
+                continue;
+            }
+        }
+        result.push(op);
+        if index == store {
+            result.append(&mut bit_flags);
+        }
+    }
+    *ops = result;
+    let Some(store) = ops.iter().rposition(|op| matches!(op, IrOp::Store { .. })) else {
+        return;
+    };
+    let mut flags = Vec::new();
+    for op in &mut ops[..store] {
+        let original = op.clone();
+        let mask = match op {
+            IrOp::Add { set_flags, .. }
+            | IrOp::Adc { set_flags, .. }
+            | IrOp::Sub { set_flags, .. }
+            | IrOp::Sbb { set_flags, .. }
+            | IrOp::And { set_flags, .. }
+            | IrOp::Or { set_flags, .. }
+            | IrOp::Xor { set_flags, .. }
+            | IrOp::Shl { set_flags, .. }
+            | IrOp::Shr { set_flags, .. }
+            | IrOp::Sar { set_flags, .. }
+            | IrOp::Rol { set_flags, .. }
+            | IrOp::Ror { set_flags, .. }
+            | IrOp::Rcl { set_flags, .. }
+            | IrOp::Rcr { set_flags, .. }
+            | IrOp::DoubleShift { set_flags, .. } => set_flags,
+            _ => continue,
+        };
+        if *mask != FlagMask::NONE {
+            *mask = FlagMask::NONE;
+            flags.push(original);
+        }
+    }
+    ops.splice(store + 1..store + 1, flags);
 }
 
 fn emit(ops: &mut impl LiftBuffer, op: L) {

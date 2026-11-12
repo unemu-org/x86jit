@@ -87,8 +87,8 @@ Where this actually bites:
 - **A resumable instruction must remember what it already got.** The retry re-executes
   the *whole* instruction, so one answer per attempt cannot finish a multi-transfer
   access: the first transfer consumes it, the second traps, and the next attempt starts
-  over with the first trapping again. `CpuState::mmio_parts` keys answered transfers by
-  address, and they are dropped when the instruction completes — otherwise a loop
+  over with the first trapping again. `CpuState::mmio_parts` records answered transfer identities
+  (addresses, Machine read visits, or string operand slots), and they are dropped when the instruction completes — otherwise a loop
   re-reading one MMIO register gets the first iteration's value forever.
 
 **A differential test cannot check any of this, and that is the point of writing it

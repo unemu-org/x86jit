@@ -254,7 +254,7 @@ pub enum LiftError {
 /// instruction, so this only bounds a *branchless* stretch: one exceeding it is cut
 /// at the last complete instruction and falls through to a continuation block (see
 /// `lift_block`). 4 KiB (one page) comfortably holds any real basic block.
-const BLOCK_FETCH_WINDOW: usize = 4096;
+pub(crate) const BLOCK_FETCH_WINDOW: usize = 4096;
 
 /// The physical code-fetch address and the decode IP for a lift.
 ///
@@ -413,7 +413,7 @@ fn push_real16_fault(insn: &Instruction, mode: CpuMode, vector: u8, ops: &mut im
 // rather than transfers: vector chunks share a width and direction. Helper-only
 // memory ops are counted too, conservatively. Reverse-subtract atomics emit both
 // an initial read and a read/write CAS; other memory IR ops need at most one.
-fn guest_access_descriptors(ops: &[IrOp]) -> usize {
+pub(crate) fn guest_access_descriptors(ops: &[IrOp]) -> usize {
     use IrOp::*;
     ops.iter()
         .map(|op| match op {
@@ -5107,17 +5107,27 @@ pub(crate) fn effective_address_no_segment(
 ///   16-bit offset wrap was already applied by the address-size mask in
 ///   [`effective_address_no_segment`] (2-byte base/index registers).
 ///
-/// Legacy lowering supplies its context explicitly through LiftBuffer and emits
-/// a segment-identified access without discarding the effective offset. Only after
-/// excluding LegacySystem does Code16 identify Application Real16; application
-/// prefixes never change the fixed decoder's CodeSize.
+/// Machine lowering supplies its context through LiftBuffer: Direct emits a
+/// selector-derived address and constant limit check; Checked retains the cache
+/// access (decision-23 §5). The Application Real16 lowering below stays frozen.
 pub(crate) fn with_segment(
     insn: &Instruction,
     addr: Val,
     ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Val {
-    if ops.legacy_context().is_some() {
+    if let Some(context) = ops.legacy_context() {
+        if context.segment_class == crate::SegmentClass::Direct {
+            return legacy::direct_address(
+                ops,
+                tg,
+                legacy::segment(insn.memory_segment()).expect("memory segment"),
+                addr,
+                insn.memory_size().size() as u8,
+                context,
+                insn.ip(),
+            );
+        }
         // Legacy real mode, including big real, checks the runtime cached limit
         // in legacy::access. The fixed Application Real16 check below is separate.
         let dst = tg.fresh();

@@ -14,15 +14,15 @@ use crate::lift::CpuMode;
 
 /// Translation-cache key (§17.4): the same guest bytes decode and lift differently per
 /// decode mode (mode × CS.D), and numerical operations depend on MXCSR.RC/FTZ/DAZ.
-/// All three form the translation identity. A future protected
-/// mode adds a `CpuMode` variant, not a new key shape; segment bases stay out of the key
-/// (they are runtime `CpuState`, per the FS/GS pattern), so a segment reload never
-/// invalidates a translation.
+/// Machine Direct blocks additionally distinguish their namespace and A20 line
+/// assumption in reserved `mxcsr_mode` bits. Checked blocks have private keys.
+/// Segment bases stay runtime inputs; Direct cache hits also guard the decode IP
+/// and MachineContext before execution.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct BlockKey {
     pub guest_addr: u64,
     pub mode: CpuMode,
-    /// RC | FTZ | DAZ assumed by this translation (SDM Vol 1 §10.2.3).
+    /// RC | FTZ | DAZ (SDM Vol 1 §10.2.3); bits 31/30 select Machine Direct/A20 off.
     pub mxcsr_mode: u32,
 }
 
@@ -36,6 +36,17 @@ impl std::hash::Hash for BlockKey {
 }
 
 impl BlockKey {
+    /// Interpreted Machine Direct namespace; Application hash streams stay fixed.
+    pub fn machine_direct(guest_addr: u64, mxcsr: u32, a20_enabled: bool) -> Self {
+        Self {
+            guest_addr,
+            mode: CpuMode::Real16,
+            mxcsr_mode: (mxcsr & crate::interp::softfloat::MODE_MASK)
+                | (1 << 31)
+                | (u32::from(!a20_enabled) << 30),
+        }
+    }
+
     pub fn new(guest_addr: u64, mode: CpuMode) -> Self {
         Self {
             guest_addr,
@@ -1108,6 +1119,11 @@ impl TranslationCache {
     /// This does not flush vCPU dispatch predictors (see [`Self::epoch`]).
     pub fn publication_generation(&self) -> u64 {
         self.publication_generation.load(Ordering::Acquire)
+    }
+
+    /// Heuristic input for retaining SMC-heavy Machine pages; never validates IR.
+    pub(crate) fn invalidated_blocks(&self) -> u64 {
+        self.invalidation_blocks_dropped.load(Ordering::Relaxed)
     }
 
     /// Look up a block, recording a hit (found) or miss (must lift).

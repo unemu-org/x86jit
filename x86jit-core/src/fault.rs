@@ -763,6 +763,12 @@ impl OperandAddress {
             let (dst, value) = match *op {
                 IrOp::InsnStart { .. } | IrOp::CheckAlign { .. } => continue,
                 IrOp::ReadReg { dst, reg } => (dst, crate::interp::read_reg(cpu, reg)),
+                IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
+                    dst, offset, ..
+                }) => (
+                    dst,
+                    (u64::from(cpu.ss) << 4) + (read(offset, &values)? & 0xffff),
+                ),
                 IrOp::Add {
                     dst, a, b, size: 8, ..
                 } => (dst, read(a, &values)?.wrapping_add(read(b, &values)?)),
@@ -960,9 +966,10 @@ impl InstructionFaultInfo {
             helper: ops.iter().find_map(|op| match op {
                 IrOp::X87 { .. } => Some(FaultHelper::X87),
                 IrOp::FxState { .. } | IrOp::XState { .. } => Some(FaultHelper::FxState),
-                IrOp::RepString { .. } | IrOp::RepStringReal { .. } | IrOp::PortString { .. } => {
-                    Some(FaultHelper::String)
-                }
+                IrOp::RepString { .. }
+                | IrOp::RepStringReal { .. }
+                | IrOp::PortString { .. }
+                | IrOp::Legacy(crate::legacy::LegacyOp::String { .. }) => Some(FaultHelper::String),
                 IrOp::Div { .. } => Some(FaultHelper::Divide),
                 IrOp::AtomicCasPair { .. } => Some(FaultHelper::CompareExchangePair),
                 _ => None,
@@ -983,6 +990,30 @@ impl InstructionFaultInfo {
                 m.split_transfer_size = Some(16);
             }
             match op {
+                IrOp::Legacy(
+                    crate::legacy::LegacyOp::Pop { size, .. }
+                    | crate::legacy::LegacyOp::Push { size, .. },
+                ) => {
+                    m.memory_ops += 1;
+                    m.operand_size = Knowledge::Known(u16::from(*size));
+                    m.writes |= matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::Push { .. }));
+                }
+                IrOp::Legacy(
+                    crate::legacy::LegacyOp::Transfer {
+                        cs: None,
+                        return_ip: Some(_),
+                        size,
+                        ..
+                    }
+                    | crate::legacy::LegacyOp::Return {
+                        far: false, size, ..
+                    },
+                ) => {
+                    m.memory_ops += 1;
+                    m.operand_size = Knowledge::Known(u16::from(*size));
+                    m.writes |=
+                        matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::Transfer { .. }));
+                }
                 IrOp::Store { addr, .. } => {
                     m.writes = true;
                     m.rmw |= ops.iter().any(|o| matches!(o, IrOp::Load { addr: a, .. } if matches!((a, addr), (crate::Val::Temp(a), crate::Val::Temp(b)) if a == b) || matches!((a, addr), (crate::Val::Imm(a), crate::Val::Imm(b)) if a == b)));
@@ -1018,7 +1049,14 @@ impl InstructionFaultInfo {
                         m.rep = Some((*op, *elem, *addr_bits));
                     }
                 }
-                IrOp::RepStringReal {
+                IrOp::Legacy(crate::legacy::LegacyOp::String {
+                    kind: op,
+                    elem,
+                    rep,
+                    address_bits: addr_bits,
+                    ..
+                })
+                | IrOp::RepStringReal {
                     op,
                     elem,
                     rep,
@@ -1075,7 +1113,17 @@ impl InstructionFaultInfo {
                 .filter(|o| {
                     matches!(
                         o,
-                        IrOp::Store { .. } | IrOp::Call { .. } | IrOp::PushFlags { .. }
+                        IrOp::Store { .. }
+                            | IrOp::Call { .. }
+                            | IrOp::PushFlags { .. }
+                            | IrOp::Legacy(
+                                crate::legacy::LegacyOp::Push { .. }
+                                    | crate::legacy::LegacyOp::Transfer {
+                                        cs: None,
+                                        return_ip: Some(_),
+                                        ..
+                                    }
+                            )
                     )
                 })
                 .count()
@@ -1116,6 +1164,16 @@ impl InstructionFaultInfo {
                         | IrOp::Call { .. }
                         | IrOp::Ret { .. }
                         | IrOp::PushFlags { .. }
+                        | IrOp::Legacy(
+                            crate::legacy::LegacyOp::Pop { .. }
+                                | crate::legacy::LegacyOp::Push { .. }
+                                | crate::legacy::LegacyOp::Transfer {
+                                    cs: None,
+                                    return_ip: Some(_),
+                                    ..
+                                }
+                                | crate::legacy::LegacyOp::Return { far: false, .. }
+                        )
                 )
             });
         if m.operand_size == Knowledge::NotApplicable {
@@ -1653,6 +1711,35 @@ mod host_address_tests {
             size: 8,
         });
         assert!(OperandAddress::from_ops(&ops).is_none());
+    }
+
+    #[test]
+    fn host_operand_recipe_keeps_direct_stack_offset_and_base() {
+        let ops = vec![
+            IrOp::ReadReg {
+                dst: 0,
+                reg: crate::Reg::Rsp,
+            },
+            IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
+                dst: 1,
+                offset: Val::Temp(0),
+                bytes: 2,
+                vector: 12,
+            }),
+            IrOp::Load {
+                fault: MemoryAccess::new(2, true, false),
+                dst: 2,
+                addr: Val::Temp(1),
+                size: 2,
+            },
+        ];
+        let mut cpu = CpuState::new();
+        cpu.gpr[4] = 0x18000;
+        cpu.ss = 0x100;
+        assert_eq!(
+            OperandAddress::from_ops(&ops).unwrap().evaluate(&cpu),
+            Some(0x9000)
+        );
     }
 }
 

@@ -26,6 +26,85 @@ fn refusal(cpu: &CpuState, operation: crate::UnsupportedSystemOperation) -> Exit
     }
 }
 
+#[inline(always)]
+pub(super) fn direct_stack_address(
+    cpu: &mut CpuState,
+    offset: u64,
+    bytes: u8,
+    vector: u8,
+    ip: u64,
+) -> Result<u64, Exit> {
+    // 80386 PRM §17.1.3: SS.B=0 selects SP independently of operand size.
+    // §14.7 item 7/Table 14-1; 286 PRM Table C-1: gate the whole operand.
+    let offset = offset & 0xffff;
+    if offset + u64::from(bytes) > 0x10000 {
+        cpu.rip = ip;
+        return Err(legacy::segment_fault(
+            cpu,
+            vector,
+            offset,
+            bytes,
+            AccessKind::Read,
+        ));
+    }
+    Ok((u64::from(cpu.ss) << 4) + offset)
+}
+
+#[cold]
+pub(super) fn stack_fault_access(mut exit: Exit, ops: &[IrOp], rip: u64) -> Exit {
+    let start = ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == rip))
+        .unwrap_or(0);
+    let gate = ops[start..]
+        .iter()
+        .position(|op| matches!(op, IrOp::Legacy(L::DirectStackAddress { .. })))
+        .expect("stack gate");
+    let access = ops[start + gate + 1..]
+        .iter()
+        .find_map(|op| match op {
+            IrOp::Load { .. } => Some(AccessKind::Read),
+            IrOp::Store { .. } => Some(AccessKind::Write),
+            _ => None,
+        })
+        .expect("stack transfer");
+    if let Exit::Exception {
+        metadata: Some(m), ..
+    } = &mut exit
+    {
+        m.access = crate::Knowledge::Known(access.into());
+    }
+    exit
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn scalar_limit_access(ops: &[IrOp], rip: u64) -> AccessKind {
+    let start = ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == rip))
+        .unwrap_or(0);
+    // Match the cached gate's write intent, including scalar RMW. Helper stack
+    // writes do not change a memory-source PUSH/CALL operand's read intent.
+    let writes = ops[start + 1..]
+        .iter()
+        .take_while(|op| !matches!(op, IrOp::InsnStart { .. }))
+        .any(|op| {
+            matches!(
+                op,
+                IrOp::Store { .. }
+                    | IrOp::AtomicRmw { .. }
+                    | IrOp::AtomicCas { .. }
+                    | IrOp::AtomicCasPair { .. }
+            )
+        });
+    if writes {
+        AccessKind::Write
+    } else {
+        AccessKind::Read
+    }
+}
+
 fn exception(cpu: &CpuState, vector: u8) -> Exit {
     fault(cpu, vector, 0)
 }
@@ -71,7 +150,7 @@ fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
     Ok(changed)
 }
 
-fn selector(cpu: &CpuState, segment: SegmentId) -> u16 {
+pub(super) fn selector(cpu: &CpuState, segment: SegmentId) -> u16 {
     match segment {
         SegmentId::Cs => cpu.cs,
         SegmentId::Ds => cpu.ds,
@@ -104,6 +183,39 @@ fn reload(cpu: &mut CpuState, segment: SegmentId, value: u16) {
     }
 }
 
+#[inline]
+fn segment_access(
+    cpu: &CpuState,
+    context: MachineContext,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+    access: AccessKind,
+) -> Result<u64, Exit> {
+    if context.segment_class == crate::SegmentClass::Checked {
+        return legacy::access(cpu, context.generation, segment, offset, bytes, access);
+    }
+    // Direct proof was derived at the context boundary (decision-23 §5).
+    // Fault vectors: I286 PRM Appendix B MOV p. B-74; I386 PRM §14.6 Table 14-1.
+    if offset
+        .checked_add(u64::from(bytes.saturating_sub(1)))
+        .is_none_or(|last| last > 0xffff)
+    {
+        return Err(legacy::segment_fault(
+            cpu,
+            if segment == SegmentId::Ss && context.generation == crate::CpuGeneration::I386 {
+                12
+            } else {
+                13
+            },
+            offset,
+            bytes,
+            access,
+        ));
+    }
+    Ok((u64::from(selector(cpu, segment)) << 4) + offset)
+}
+
 fn sp(cpu: &CpuState, context: MachineContext) -> u64 {
     cpu.gpr[RSP] & mask(context.stack_address_bits / 8)
 }
@@ -115,9 +227,71 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
     );
 }
 
+// A device read is identified by its visit as well as its bus address. The
+// cursor restarts with the instruction, including reads served from the ledger.
+// Writes retain their separate bit-63 namespace; descriptor snapshots use bit 62.
+struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
+    access: &'a Access<ROUTED, ORDER>,
+    read_index: Cell<u16>,
+}
+impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
+    fn new(memory: &'a Memory) -> Self {
+        Self {
+            access: Access::new(memory),
+            read_index: Cell::new(0),
+        }
+    }
+    fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
+        while bytes != 0 {
+            let (_, part) = legacy::physical_span(cpu, linear, bytes);
+            self.read_index.set(self.read_index.get() + 1);
+            linear = u64::from((linear as u32).wrapping_add(u32::from(part)));
+            bytes -= part;
+        }
+    }
+}
+impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for LegacyAccess<'_, ROUTED, ORDER> {
+    type Target = Access<ROUTED, ORDER>;
+    fn deref(&self) -> &Self::Target {
+        self.access
+    }
+}
+
+// Instructions replay from their first read; task continuations resume saved
+// stages, whose existing transfers retain address-based retry keys.
+trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
+    fn raw(&self) -> &Access<ROUTED, ORDER>;
+    fn read_key(&self, addr: u64) -> u64;
+    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
+}
+impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER> for Access<ROUTED, ORDER> {
+    fn raw(&self) -> &Access<ROUTED, ORDER> {
+        self
+    }
+    fn read_key(&self, addr: u64) -> u64 {
+        addr
+    }
+    fn skip_read(&self, _cpu: &CpuState, _linear: u64, _bytes: u8) {}
+}
+impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
+    for LegacyAccess<'_, ROUTED, ORDER>
+{
+    fn raw(&self) -> &Access<ROUTED, ORDER> {
+        self.access
+    }
+    fn read_key(&self, addr: u64) -> u64 {
+        let index = self.read_index.get();
+        self.read_index.set(index + 1);
+        addr | (u64::from(index) << 32)
+    }
+    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
+        LegacyAccess::skip_read(self, cpu, linear, bytes);
+    }
+}
+
 fn read<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
@@ -132,20 +306,22 @@ fn read<const ROUTED: bool, const ORDER: u8>(
 
 fn read_physical<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     linear: u64,
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
-    if let Some(value) = cpu.mmio_part(cpu.rip, addr) {
+    let key = mem.read_key(addr);
+    if let Some(value) = cpu.mmio_part(cpu.rip, key) {
         return Ok(value & mask(size));
     }
-    let value = mem.read(addr, size).or_else(|trap| {
+    let value = mem.raw().read(addr, size).or_else(|trap| {
         // Decision-16 §3: replayed RAM accesses cannot consume the answer
         // belonging to a later MMIO transfer of this instruction.
         if trap == MemTrap::Mmio {
             if let Some(value) = cpu.pending_mmio.take() {
-                cpu.record_mmio_part(cpu.rip, addr, value);
+                let value = value & mask(size);
+                cpu.record_mmio_part(cpu.rip, key, value);
                 return Ok(value);
             }
         }
@@ -161,7 +337,7 @@ fn read_physical<const ROUTED: bool, const ORDER: u8>(
 
 fn write<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
     size: u8,
     value: u64,
@@ -180,25 +356,35 @@ fn write<const ROUTED: bool, const ORDER: u8>(
 
 fn write_physical<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     linear: u64,
     addr: u64,
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
+    let value = value & mask(size);
     // The retry ledger is engine storage. Bit 63 distinguishes answered writes
     // from reads at the same physical bus address; it is never a guest address.
     let key = addr | (1 << 63);
     if cpu.mmio_part(cpu.rip, key).is_some() {
         return Ok(());
     }
-    if let Err(trap) = mem.write(addr, value, size) {
+    if let Err(trap) = mem.raw().write(addr, value, size) {
         if trap == MemTrap::Mmio && cpu.pending_mmio_write {
             cpu.pending_mmio_write = false;
             cpu.record_mmio_part(cpu.rip, key, value);
         } else {
             return Err(
-                match trap_out(cpu, cpu.rip, trap, addr, size, AccessKind::Write, value).into_step()
+                match trap_out(
+                    cpu,
+                    cpu.rip,
+                    trap,
+                    store_fault_address(mem, trap, addr, size),
+                    size,
+                    AccessKind::Write,
+                    value,
+                )
+                .into_step()
                 {
                     StepResult::Exit(exit) => crate::fault::qualify_legacy_bus(exit, linear, addr),
                     _ => unreachable!(),
@@ -211,7 +397,7 @@ fn write_physical<const ROUTED: bool, const ORDER: u8>(
 
 fn probe<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
@@ -226,19 +412,58 @@ fn probe<const ROUTED: bool, const ORDER: u8>(
 
 fn probe_physical<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     linear: u64,
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
-    match mem.probe_write(addr, size) {
+    match mem.raw().probe_write(addr, size) {
         Ok(()) | Err(MemTrap::Mmio) => Ok(()),
         Err(trap) => Err(
-            match trap_out(cpu, cpu.rip, trap, addr, size, AccessKind::Write, 0).into_step() {
+            match trap_out(
+                cpu,
+                cpu.rip,
+                trap,
+                store_fault_address(mem, trap, addr, size),
+                size,
+                AccessKind::Write,
+                0,
+            )
+            .into_step()
+            {
                 StepResult::Exit(exit) => crate::fault::qualify_legacy_bus(exit, linear, addr),
                 _ => unreachable!(),
             },
         ),
+    }
+}
+
+#[cold]
+fn store_fault_address<const ROUTED: bool, const ORDER: u8>(
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    trap: MemTrap,
+    addr: u64,
+    size: u8,
+) -> u64 {
+    if trap != MemTrap::Unmapped {
+        return addr;
+    }
+    (0..size)
+        .map(|i| addr + u64::from(i))
+        .find(|&at| {
+            matches!(
+                mem.raw().probe_write_mode::<false>(at, 1),
+                Err(MemTrap::Unmapped)
+            )
+        })
+        .unwrap_or(addr)
+}
+
+#[cold]
+fn operand_fault(exit: Exit, rip: u64, base: u64, fault: crate::ir::MemoryAccess) -> Exit {
+    match super::classify_access(InterpResult::exit(exit), rip, base, fault).into_step() {
+        StepResult::Exit(exit) => exit,
+        _ => unreachable!(),
     }
 }
 
@@ -276,7 +501,7 @@ fn descriptor_address(cpu: &CpuState, value: u16) -> Option<u32> {
 
 fn descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     value: u16,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
@@ -286,7 +511,7 @@ fn descriptor<const ROUTED: bool, const ORDER: u8>(
 
 fn descriptor_at<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     address: u32,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
@@ -295,6 +520,8 @@ fn descriptor_at<const ROUTED: bool, const ORDER: u8>(
         cpu.mmio_part(cpu.rip, key),
         cpu.mmio_part(cpu.rip, key | (1 << 32)),
     ) {
+        mem.skip_read(cpu, u64::from(address), 4);
+        mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4);
         return Ok(Descriptor {
             cache: legacy::SegmentCache {
                 base: base_limit as u32,
@@ -385,7 +612,7 @@ fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
 
 fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     descriptor: &mut Descriptor,
     bit: u16,
 ) -> Result<bool, Exit> {
@@ -393,7 +620,7 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
         if let Some(address) = descriptor.access_address {
             let expected = u64::from(descriptor.cache.attributes as u8);
             let value = expected | u64::from(bit);
-            let observed = descriptor_cas(cpu, mem, address, expected, value)?;
+            let observed = descriptor_cas(cpu, mem.raw(), address, expected, value)?;
             if observed != expected {
                 descriptor.cache.attributes =
                     (descriptor.cache.attributes & !0xff) | observed as u16;
@@ -420,7 +647,7 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
 
 fn accessed<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     descriptor: &mut Descriptor,
 ) -> Result<(), Exit> {
     // SDM Vol 3A §§3.4.5.1, 11.1.2.1; 386 PRM §5.1.1 p. 5-4;
@@ -431,7 +658,7 @@ fn accessed<const ROUTED: bool, const ORDER: u8>(
 
 fn load_system_segment<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     register: SystemRegister,
     value: u16,
     allowed_types: u16,
@@ -480,7 +707,7 @@ fn load_system_segment<const ROUTED: bool, const ORDER: u8>(
 
 fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     selector: u16,
     query: DescriptorQuery,
     allowed_system_types: u16,
@@ -535,7 +762,7 @@ fn install(cpu: &mut CpuState, segment: SegmentId, value: u16, cache: legacy::Se
 
 fn load_segment<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     segment: SegmentId,
     value: u16,
     generation: crate::CpuGeneration,
@@ -592,7 +819,7 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
 
 fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     value: u16,
     returning: bool,
     generation: crate::CpuGeneration,
@@ -668,7 +895,7 @@ fn code_limit(cpu: &CpuState, cache: legacy::SegmentCache, ip: u64) -> Result<()
 // CS/EIP slots use that same boundary (Vol 2A §3.3 CALL).
 fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     count: usize,
     size: u8,
@@ -676,27 +903,20 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     let old = sp(cpu, context);
     let bytes = count as u8 * size;
     let start = old.wrapping_sub(u64::from(bytes)) & mask(context.stack_address_bits / 8);
-    legacy::access(
-        cpu,
-        context.generation,
-        SegmentId::Ss,
-        start,
-        bytes,
-        AccessKind::Write,
-    )?;
+    segment_access(cpu, context, SegmentId::Ss, start, bytes, AccessKind::Write)?;
     let mut addresses = Vec::with_capacity(count);
     for i in 1..=count {
         let offset =
             old.wrapping_sub(i as u64 * u64::from(size)) & mask(context.stack_address_bits / 8);
-        let address = legacy::access(
-            cpu,
-            context.generation,
-            SegmentId::Ss,
-            offset,
-            size,
-            AccessKind::Write,
-        )?;
-        probe(cpu, mem, address, size)?;
+        let address = segment_access(cpu, context, SegmentId::Ss, offset, size, AccessKind::Write)?;
+        probe(cpu, mem, address, size).map_err(|exit| {
+            operand_fault(
+                exit,
+                cpu.rip,
+                address,
+                crate::ir::MemoryAccess::new(u16::from(size), false, true),
+            )
+        })?;
         addresses.push(address);
     }
     Ok(addresses)
@@ -704,7 +924,7 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
 
 fn push<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     values: &[u64],
     size: u8,
@@ -723,33 +943,26 @@ fn push<const ROUTED: bool, const ORDER: u8>(
 }
 fn peek<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     index: u64,
     size: u8,
 ) -> Result<u64, Exit> {
     let offset = sp(cpu, context).wrapping_add(index * u64::from(size))
         & mask(context.stack_address_bits / 8);
-    let addr = legacy::access(
-        cpu,
-        context.generation,
-        SegmentId::Ss,
-        offset,
-        size,
-        AccessKind::Read,
-    )?;
-    read(cpu, mem, addr, size)
+    let addr = segment_access(cpu, context, SegmentId::Ss, offset, size, AccessKind::Read)?;
+    read(cpu, mem, addr, size).map_err(|exit| {
+        operand_fault(
+            exit,
+            cpu.rip,
+            addr,
+            crate::ir::MemoryAccess::new(u16::from(size), false, true),
+        )
+    })
 }
 fn target(cpu: &CpuState, context: MachineContext, value: u64, size: u8) -> Result<u64, Exit> {
     let offset = value & mask(size);
-    legacy::access(
-        cpu,
-        context.generation,
-        SegmentId::Cs,
-        offset,
-        1,
-        AccessKind::Execute,
-    )?;
+    segment_access(cpu, context, SegmentId::Cs, offset, 1, AccessKind::Execute)?;
     Ok(offset)
 }
 
@@ -761,18 +974,18 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
-    let mem = Access::<ROUTED, ORDER>::new(memory);
+    let mem = &LegacyAccess::<ROUTED, ORDER>::new(memory);
     task_switch.committed = false;
     task_switch.completed = false;
     if task_switch.context().is_some() {
-        return tasks::resume(cpu, mem, task_switch);
+        return tasks::resume(cpu, mem.raw(), task_switch);
     }
     deliver(cpu, mem, context, event, task_switch)
 }
 
 fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
@@ -788,11 +1001,13 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     let address = cpu.legacy.idtr.base.wrapping_add(offset);
     let key = DESCRIPTOR_RETRY | (1 << 34) | u64::from(address);
     let low = if let Some(value) = cpu.mmio_part(cpu.rip, key) {
+        mem.skip_read(cpu, u64::from(address), 4);
         value as u32
     } else {
         read(cpu, mem, u64::from(address), 4)? as u32
     };
     let high = if let Some(value) = cpu.mmio_part(cpu.rip, key | (1 << 32)) {
+        mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4);
         value as u32
     } else {
         read(cpu, mem, u64::from(address.wrapping_add(4)), 4)? as u32
@@ -808,7 +1023,14 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
         return Err(fault(cpu, 11, idt_code));
     }
     if kind == 5 {
-        return tasks::event(cpu, mem, context, (low >> 16) as u16, event, task_switch);
+        return tasks::event(
+            cpu,
+            mem.raw(),
+            context,
+            (low >> 16) as u16,
+            event,
+            task_switch,
+        );
     }
     let cs = (low >> 16) as u16;
     let selector_code = (cs & !3) | ext;
@@ -896,7 +1118,7 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
 
 fn deliver<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
@@ -925,9 +1147,7 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     let address = u64::from(cpu.legacy.idtr.base.wrapping_add(offset));
     let ip = read(cpu, mem, address, 2)?;
     let cs = read(cpu, mem, u64::from((address as u32).wrapping_add(2)), 2)?;
-    if ip > u64::from(cpu.legacy.segments[SegmentId::Cs as usize].limit) {
-        return Err(exception(cpu, 13));
-    }
+    target(cpu, context, ip, 4)?;
     let flags = legacy::flags_image(cpu, context.generation);
     push(
         cpu,
@@ -1034,7 +1254,7 @@ pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
     // The handoff already checked the complete ES operand and owns its A20 line.
     write(
         cpu,
-        Access::<ROUTED, ORDER>::new(memory),
+        &LegacyAccess::<ROUTED, ORDER>::new(memory),
         u64::from((p.base as u32).wrapping_add(p.offset as u32)),
         p.elem,
         value,
@@ -1049,10 +1269,16 @@ pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+struct InstructionView<'a> {
+    guest_start: u64,
+    guest_len: u32,
+    ops: &'a [IrOp],
+}
+
 fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
     cpu: &CpuState,
-    mem: &Access<ROUTED, ORDER>,
-    ir: &IrBlock,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    ir: &InstructionView<'_>,
 ) -> Exit {
     // Locked device operands require whole-instruction embedder emulation,
     // including an operand split by the board's physical gate (§5.2).
@@ -1064,17 +1290,23 @@ fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
                 .wrapping_add((cpu.rip as u32).wrapping_add(i as u32)),
         );
         let (physical, _) = legacy::physical_span(cpu, linear, 1);
-        if mem.fetch_code(physical, &mut bytes[i..i + 1]).is_err() {
+        if mem
+            .raw()
+            .fetch_code(physical, &mut bytes[i..i + 1])
+            .is_err()
+        {
             break;
         }
     }
     Exit::unknown_instruction(cpu.rip, bytes, ir.guest_len as u8)
 }
 
-fn supported(op: &IrOp) -> bool {
+pub(crate) fn supported(op: &IrOp) -> bool {
     matches!(
         op,
-        IrOp::InsnStart { .. }
+        IrOp::ReadSelector { .. }
+            | IrOp::SegLimitCheck { .. }
+            | IrOp::InsnStart { .. }
             | IrOp::Legacy(_)
             | IrOp::ReadReg { .. }
             | IrOp::WriteReg { .. }
@@ -1134,33 +1366,51 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
         ir.verify_temp_defs()
     );
     let context = ir.legacy_context.expect("legacy interpreter context");
-    if !ir.ops.iter().all(supported) {
+    execute_instruction::<ROUTED, ORDER>(
+        &InstructionView {
+            guest_start: ir.guest_start,
+            guest_len: ir.guest_len,
+            ops: &ir.ops,
+        },
+        cpu,
+        &LegacyAccess::new(memory),
+        scratch.zeroed(ir.temp_count as usize),
+        context,
+        task_switch,
+    )
+}
+
+fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    temps: &mut [u64],
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+) -> Result<Outcome, Exit> {
+    mem.read_index.set(0);
+    let checked = context.segment_class == crate::SegmentClass::Checked;
+    if checked && !ir.ops.iter().all(supported) {
         return Err(refusal(
             cpu,
             crate::UnsupportedSystemOperation::LegacyInstruction,
         ));
     }
-    // Save architectural destinations; device completion/retry ownership stays live
-    // on failure. Scalar lowering places writes last, but a RMW can set flags
-    // before its final (faulting) store. Legacy performance has no application target.
-    let before = (
-        cpu.gpr,
-        cpu.flags,
-        cpu.rflags_system,
-        cpu.legacy,
-        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
-    );
-    let mem = Access::<ROUTED, ORDER>::new(memory);
+    let checkpoint = checked || matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint)));
+    let before = if checkpoint {
+        Some((
+            cpu.gpr,
+            cpu.flags,
+            cpu.rflags_system,
+            cpu.legacy,
+            [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        ))
+    } else {
+        None
+    };
     task_switch.committed = false;
     task_switch.completed = false;
-    let mut result = walk(
-        ir,
-        cpu,
-        mem,
-        scratch.zeroed(ir.temp_count as usize),
-        context,
-        task_switch,
-    );
+    let mut result = walk(ir, cpu, mem, temps, context, task_switch);
     if task_switch.committed
         && matches!(
             result,
@@ -1179,27 +1429,332 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
         });
     }
     if result.is_err() && !task_switch.committed {
-        cpu.gpr = before.0;
-        cpu.flags = before.1;
-        cpu.rflags_system = before.2;
-        cpu.legacy = before.3;
-        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs] = before.4;
+        if let Some(before) = before {
+            cpu.gpr = before.0;
+            cpu.flags = before.1;
+            cpu.rflags_system = before.2;
+            cpu.legacy = before.3;
+            [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs] = before.4;
+        }
         cpu.rip = ir.guest_start;
+        if let Err(exit) = result {
+            // Match the shared walk's evidence only where the instruction's
+            // memory effects are represented. Opaque frame/system helpers keep
+            // their existing evidence; generic scalar analysis cannot prove
+            // that those helpers left RAM untouched.
+            let scalar_evidence = context.regime == legacy::MachineRegime::Real
+                && ir.ops.iter().all(|op| match op {
+                    IrOp::Legacy(op) => matches!(
+                        op,
+                        L::SharedWalk
+                            | L::Checkpoint
+                            | L::Address { .. }
+                            | L::ReadSelector { .. }
+                            | L::DirectStackAddress { .. }
+                            | L::Push { .. }
+                            | L::Pop { .. }
+                            | L::AdjustStack { .. }
+                            | L::Transfer { cs: None, .. }
+                            | L::Return { far: false, .. }
+                            | L::Loop { .. }
+                            | L::String { .. }
+                            | L::Coprocessor { .. }
+                    ),
+                    _ => true,
+                });
+            let mut exit = if scalar_evidence {
+                super::finish_instruction_fault::<true>(
+                    exit,
+                    ir.ops,
+                    ir.guest_start,
+                    Some(ir.guest_start + u64::from(ir.guest_len)),
+                    crate::CpuMode::Real16,
+                    cpu,
+                    mem.0.normal(),
+                    temps,
+                    false,
+                )
+            } else {
+                exit
+            };
+            if let Exit::Exception {
+                metadata: Some(m), ..
+            }
+            | Exit::UnmappedMemory {
+                metadata: Some(m), ..
+            } = &mut exit
+            {
+                m.progress.acknowledged = m
+                    .progress
+                    .acknowledged
+                    .iter()
+                    .filter(|(key, _)| key & DESCRIPTOR_RETRY == 0)
+                    .map(|(key, value)| (key & 0xffff_ffff, *value))
+                    .collect();
+            }
+            result = Err(exit);
+        }
     } else if result
         .as_ref()
         .is_ok_and(|outcome| outcome.retired && !outcome.preserve_rf)
     {
-        // SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1, p. 12-7:
-        // completed ordinary instructions clear RF. Retry exits do not retire.
+        // SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1: retirement clears RF.
         cpu.rflags_system &= !(1 << 16);
     }
     result
 }
 
-fn walk<const ROUTED: bool, const ORDER: u8>(
+pub(crate) struct DirectProgress {
+    pub steps: u64,
+    pub retired: u64,
+    pub outcome: Result<Outcome, Exit>,
+}
+
+/// Execute a shared-cache block up to an architectural boundary. Helpers remain
+/// instruction-sized until the interpreter walks are unified (decision-23 U5).
+pub(crate) fn execute_direct<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+) -> DirectProgress {
+    debug_assert!(task_switch.context().is_none(), "Direct task continuation");
+    #[cfg(debug_assertions)]
+    debug_assert!(ir.verify_temp_defs().is_ok(), "{:?}", ir.verify_temp_defs());
+    let context = ir.legacy_context.expect("Direct context");
+    let temps = scratch.reused(ir.temp_count as usize);
+    let mem = &LegacyAccess::new(memory);
+    let mut steps = 0;
+    let mut retired = 0;
+    let mut start = 0;
+    let outcome = loop {
+        let end = ir.ops[start + 1..]
+            .iter()
+            .position(|op| matches!(op, IrOp::InsnStart { .. }))
+            .map_or(ir.ops.len(), |offset| start + 1 + offset);
+        let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
+            unreachable!("instruction marker")
+        };
+        let next = match ir.ops.get(end) {
+            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+            _ => ir.guest_start + u64::from(ir.guest_len),
+        };
+        cpu.rip = guest_addr;
+        match execute_instruction::<ROUTED, ORDER>(
+            &InstructionView {
+                guest_start: guest_addr,
+                guest_len: (next - guest_addr) as u32,
+                ops: &ir.ops[start..end],
+            },
+            cpu,
+            mem,
+            temps,
+            context,
+            task_switch,
+        ) {
+            Err(exit) => break Err(exit),
+            Ok(outcome) => {
+                steps += 1;
+                retired += u64::from(outcome.retired);
+                if cpu.mmio_retry_active {
+                    cpu.finish_mmio_retry(None);
+                }
+                // Never execute stale successors after a code write. Dispatch
+                // drains the notification and invalidates physical byte spans.
+                if (outcome.retired && end == ir.ops.len())
+                    || steps == limit
+                    || outcome.exit.is_some()
+                    || outcome.context_changed
+                    || outcome.arm_sti
+                    || outcome.arm_ss
+                    || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    || memory.has_dirty_code()
+                {
+                    break Ok(outcome);
+                }
+                if !outcome.retired {
+                    continue;
+                }
+            }
+        }
+        start = end;
+    };
+    DirectProgress {
+        steps,
+        retired,
+        outcome,
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_shared_string<const ROUTED: bool, const STOP: bool, M: InterpreterMemory>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, M>,
+    kind: StrOp,
+    elem: u8,
+    rep: RepKind,
+    ip: u64,
+    address_bits: u8,
+    source: SegmentId,
+    exit_word: Option<&std::sync::atomic::AtomicU64>,
+    steps: &mut StepContext,
+    shadows: &mut ShadowState,
+    retired: u64,
+) -> Option<WalkResult> {
+    if !ir
+        .legacy_context
+        .is_some_and(|c| c.segment_class == crate::SegmentClass::Direct)
+    {
+        return Some(WalkResult::exit(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyExecution,
+        )));
+    }
+    let src_base = u64::from(selector(cpu, source)) << 4;
+    let dst_base = u64::from(cpu.es) << 4;
+    let result = super::string_run_real_bounded::<ROUTED, STOP, _>(
+        cpu,
+        mem,
+        kind,
+        elem,
+        rep,
+        ip,
+        address_bits,
+        src_base,
+        dst_base,
+        exit_word,
+        steps,
+        shadows,
+        retired,
+    );
+    if matches!(result, Some(WalkResult::Fault)) {
+        return Some(shared_string_fault(mem, elem));
+    }
+    result
+}
+
+#[cold]
+fn shared_string_fault<const ROUTED: bool, M: InterpreterMemory>(
+    mem: &Access<ROUTED, 0, M>,
+    elem: u8,
+) -> WalkResult {
+    let mut exit = super::result::consume_current().expect("string fault");
+    if let Exit::UnmappedMemory {
+        addr,
+        access: AccessKind::Write,
+        metadata: Some(details),
+    } = &mut exit
+    {
+        if details.origin == crate::FaultOrigin::GuestMap {
+            let first = (0..elem)
+                .map(|i| addr.wrapping_add(u64::from(i)))
+                .find(|&at| matches!(mem.probe_write_mode::<false>(at, 1), Err(MemTrap::Unmapped)))
+                .unwrap_or(*addr);
+            *addr = first;
+            details.address = crate::Knowledge::Known(crate::FaultAddress::new(
+                first,
+                crate::AddressPrecision::TransferAddress,
+                crate::AddressSpace::Linear,
+            ));
+        }
+    }
+    WalkResult::exit(exit)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    sti_shadow: bool,
+    ss_shadow: bool,
+    pending_irq: bool,
+) -> SharedProgress {
+    let mut steps = StepContext::new(limit);
+    steps.pending_irq = pending_irq;
+    let mut info = RetireInfo {
+        code_base: u64::from(cpu.cs) << 4,
+        exit_request: Some(exit_word),
+        sti_shadow,
+        ss_shadow,
+        ..Default::default()
+    };
+    let result = super::interpret_direct_steps::<ROUTED, ORDER>(
+        ir, cpu, memory, scratch, &mut info, &mut steps,
+    );
+    if info.retired != 0 {
+        cpu.rflags_system &= !(1 << 16);
+    }
+    SharedProgress {
+        steps: steps.steps,
+        retired: info.retired,
+        sti_shadow: info.sti_shadow,
+        ss_shadow: info.ss_shadow,
+        result,
+    }
+}
+
+pub(crate) struct SharedProgress {
+    pub steps: u64,
+    pub retired: u64,
+    pub sti_shadow: bool,
+    pub ss_shadow: bool,
+    pub result: BlockResult,
+}
+impl SharedProgress {
+    pub fn into_direct(self) -> DirectProgress {
+        let outcome = match self.result {
+            BlockResult::Continue | BlockResult::ModeChange => Ok(Outcome {
+                arm_sti: self.sti_shadow,
+                arm_ss: self.ss_shadow,
+                ..Outcome::default()
+            }),
+            BlockResult::Exit(exit) => match exit.into_exit() {
+                Exit::BudgetExhausted => Ok(Outcome {
+                    arm_sti: self.sti_shadow,
+                    arm_ss: self.ss_shadow,
+                    ..Outcome::default()
+                }),
+                exit @ (Exit::Hlt | Exit::PortIo { .. } | Exit::Interrupted) => Ok(Outcome {
+                    exit: Some(exit),
+                    arm_sti: self.sti_shadow,
+                    arm_ss: self.ss_shadow,
+                    ..Outcome::default()
+                }),
+                exit => {
+                    let exit = match exit {
+                        Exit::UnmappedMemory { addr, .. }
+                        | Exit::MmioRead { addr, .. }
+                        | Exit::MmioWrite { addr, .. } => {
+                            crate::fault::qualify_legacy_bus(exit, addr, addr)
+                        }
+                        _ => exit,
+                    };
+                    Err(exit)
+                }
+            },
+        };
+        DirectProgress {
+            steps: self.steps,
+            retired: self.retired,
+            outcome,
+        }
+    }
+}
+
+fn walk<const ROUTED: bool, const ORDER: u8>(
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER>,
     temps: &mut [u64],
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
@@ -1213,14 +1768,18 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
     };
     if task_switch.context().is_some() {
         outcome.suppress_debug = task_switch.suppress_debug();
-        tasks::resume(cpu, mem, task_switch)?;
+        tasks::resume(cpu, mem.raw(), task_switch)?;
         outcome.context_changed = true;
         outcome.preserve_rf = true;
         return Ok(outcome);
     }
-    for op in &ir.ops {
+    for op in ir.ops {
         let result = match op {
             IrOp::InsnStart { .. } => None,
+            IrOp::ReadSelector { dst, segment } => {
+                temps[*dst as usize] = u64::from(cpu.selector(*segment));
+                None
+            }
             IrOp::ReadReg { dst, reg } => exec_read_reg(cpu, temps, dst, reg),
             IrOp::WriteReg { reg, src, size } => exec_write_reg(cpu, temps, reg, src, size),
             IrOp::Add {
@@ -1527,14 +2086,43 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 );
                 None
             }
-            IrOp::Load {
-                dst, addr, size, ..
+            IrOp::SegLimitCheck {
+                offset,
+                size,
+                vector,
+                ..
             } => {
-                temps[*dst as usize] = read(cpu, mem, read_val(*addr, temps), *size)?;
+                if read_val(*offset, temps)
+                    .checked_add(u64::from(*size))
+                    .is_none_or(|end| end > 0x1_0000)
+                {
+                    return Err(legacy::segment_fault(
+                        cpu,
+                        *vector,
+                        read_val(*offset, temps),
+                        *size,
+                        scalar_limit_access(ir.ops, cpu.rip),
+                    ));
+                }
+                None
+            }
+            IrOp::Load {
+                fault,
+                dst,
+                addr,
+                size,
+            } => {
+                let address = read_val(*addr, temps);
+                temps[*dst as usize] = read(cpu, mem, address, *size)
+                    .map_err(|exit| operand_fault(exit, cpu.rip, address, *fault))?;
                 None
             }
             IrOp::Store {
-                addr, src, size, ..
+                fault,
+                addr,
+                src,
+                size,
+                ..
             } => {
                 write(
                     cpu,
@@ -1542,7 +2130,8 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     read_val(*addr, temps),
                     *size,
                     read_val(*src, temps),
-                )?;
+                )
+                .map_err(|exit| operand_fault(exit, cpu.rip, read_val(*addr, temps), *fault))?;
                 None
             }
             IrOp::Jump { target: ip } => {
@@ -1600,6 +2189,22 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
             }
             IrOp::Legacy(op) => {
                 match op {
+                    L::Checkpoint | L::SharedWalk => {}
+                    L::DirectStackAddress {
+                        dst,
+                        offset,
+                        bytes,
+                        vector,
+                    } => {
+                        temps[*dst as usize] = direct_stack_address(
+                            cpu,
+                            read_val(*offset, temps),
+                            *bytes,
+                            *vector,
+                            cpu.rip,
+                        )
+                        .map_err(|exit| stack_fault_access(exit, ir.ops, cpu.rip))?;
+                    }
                     L::Coprocessor { bytes, len, wait } => {
                         // SDM Vol 3A §2.5 Table 2-2; 80386 PRM §§11.1.2–11.1.4:
                         // ESC tests EM/TS before operand checks; WAIT tests MP && TS.
@@ -1653,15 +2258,8 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             .wrapping_sub(pushes as u64 * u64::from(*size))
                             .wrapping_sub(u64::from(*alloc))
                             & stack_mask;
-                        legacy::access(
-                            cpu,
-                            context.generation,
-                            SegmentId::Ss,
-                            final_sp,
-                            1,
-                            AccessKind::Write,
-                        )
-                        .map_err(|_| exception(cpu, 12))?;
+                        segment_access(cpu, context, SegmentId::Ss, final_sp, 1, AccessKind::Write)
+                            .map_err(|_| exception(cpu, 12))?;
                         let addresses = push_addresses(cpu, mem, context, pushes, *size)?;
                         let mut values = vec![cpu.gpr[RBP] & mask(*size)];
                         let mut overlay = Vec::new();
@@ -1679,9 +2277,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             }
                             let offset = cpu.gpr[RBP].wrapping_sub(u64::from(i) * u64::from(*size))
                                 & stack_mask;
-                            let address = legacy::access(
+                            let address = segment_access(
                                 cpu,
-                                context.generation,
+                                context,
                                 SegmentId::Ss,
                                 offset,
                                 *size,
@@ -1947,9 +2545,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         bytes,
                         access,
                     } => {
-                        temps[*dst as usize] = legacy::access(
+                        temps[*dst as usize] = segment_access(
                             cpu,
-                            context.generation,
+                            context,
                             *segment,
                             read_val(*offset, temps),
                             *bytes,
@@ -2048,7 +2646,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             if let Some(cs) = cs {
                                 if tasks::transfer(
                                     cpu,
-                                    mem,
+                                    mem.raw(),
                                     context,
                                     cs,
                                     if return_ip.is_some() {
@@ -2119,9 +2717,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         far,
                         pop_extra,
                     } => {
-                        legacy::access(
+                        segment_access(
                             cpu,
-                            context.generation,
+                            context,
                             SegmentId::Ss,
                             sp(cpu, context),
                             *size * if *far { 2 } else { 1 },
@@ -2165,9 +2763,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     L::Iret { size } => {
                         // SDM Vol 2A §3.3 IRET; 80386 PRM §17 pp. 17-74,
                         // 17-76–78 (scan checked): same-CPL frame, independent SS.B.
-                        legacy::access(
+                        segment_access(
                             cpu,
-                            context.generation,
+                            context,
                             SegmentId::Ss,
                             sp(cpu, context),
                             3 * *size,
@@ -2195,13 +2793,11 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         } else {
                             None
                         };
-                        code_limit(
-                            cpu,
-                            descriptor
-                                .as_ref()
-                                .map_or(cpu.legacy.segments[0], |d| d.cache),
-                            ip,
-                        )?;
+                        if let Some(descriptor) = &descriptor {
+                            code_limit(cpu, descriptor.cache, ip)?;
+                        } else {
+                            target(cpu, context, ip, 4)?;
+                        }
                         if let Some(d) = &mut descriptor {
                             accessed(cpu, mem, d)?;
                         }
@@ -2273,9 +2869,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             let index = if output { RSI } else { RDI };
                             let offset = cpu.gpr[index] & mask(width);
                             let segment = if output { *source } else { SegmentId::Es };
-                            let address = legacy::access(
+                            let address = segment_access(
                                 cpu,
-                                context.generation,
+                                context,
                                 segment,
                                 offset,
                                 *elem,
@@ -2312,7 +2908,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                     rip: ir.guest_start,
                                     next_ip,
                                     instruction_end: next,
-                                    base: u64::from(cpu.legacy.segments[segment as usize].base),
+                                    base: u64::from((address as u32).wrapping_sub(offset as u32)),
                                     offset,
                                     next_index,
                                     next_count,
@@ -2340,9 +2936,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             let si = cpu.gpr[6] & mask(width);
                             let di = cpu.gpr[7] & mask(width);
                             let src = if matches!(kind, StrOp::Movs | StrOp::Cmps | StrOp::Lods) {
-                                let a = legacy::access(
+                                let a = segment_access(
                                     cpu,
-                                    context.generation,
+                                    context,
                                     *source,
                                     si,
                                     *elem,
@@ -2356,9 +2952,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 kind,
                                 StrOp::Movs | StrOp::Stos | StrOp::Cmps | StrOp::Scas
                             ) {
-                                Some(legacy::access(
+                                Some(segment_access(
                                     cpu,
-                                    context.generation,
+                                    context,
                                     SegmentId::Es,
                                     di,
                                     *elem,
@@ -2417,9 +3013,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     }
                     L::Leave { size } => {
                         let offset = cpu.gpr[5] & mask(context.stack_address_bits / 8);
-                        let a = legacy::access(
+                        let a = segment_access(
                             cpu,
-                            context.generation,
+                            context,
                             SegmentId::Ss,
                             offset,
                             *size,
@@ -2490,7 +3086,7 @@ mod descriptor_update_tests {
             DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xa1)))));
             load_system_segment(
                 &mut cpu,
-                Access::<false, 0>::new(&vm.mem),
+                &LegacyAccess::<false, 0>::new(&vm.mem),
                 SystemRegister::Tr,
                 8,
                 1 << 1,
@@ -2521,7 +3117,7 @@ mod descriptor_update_tests {
                 DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, attr)))));
                 let exit = load_system_segment(
                     &mut cpu,
-                    Access::<false, 0>::new(&vm.mem),
+                    &LegacyAccess::<false, 0>::new(&vm.mem),
                     SystemRegister::Tr,
                     11,
                     1 << 1,
@@ -2560,7 +3156,7 @@ mod descriptor_update_tests {
                 DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xb2)))));
                 load_segment(
                     &mut cpu,
-                    Access::<false, 0>::new(&vm.mem),
+                    &LegacyAccess::<false, 0>::new(&vm.mem),
                     SegmentId::Ds,
                     if ldt { 12 } else { 8 },
                     generation,

@@ -4091,32 +4091,7 @@ fn resolve_attempt<const DEFAULT: bool>(
         if vm.time_enabled {
             crate::time_stats::ResolveTimer::miss();
         }
-        let compile_generation = vm.cache.publication_generation();
-        let permit = vm.mem.fetch_permit();
-        let mut fetch_failure = None;
-        let lifted = {
-            let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
-            let _time_lift = vm
-                .time_enabled
-                .then(crate::time_stats::FetchPhaseTimer::lift);
-            lift_block_watched(&vm.mem, at, mode, &mut fetch_failure, &source)
-        };
-        return lifted
-            .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
-            .and_then(|ir| {
-                finish_single(
-                    vm,
-                    &source,
-                    exit_word,
-                    sections,
-                    key,
-                    pc,
-                    ir,
-                    permit.as_ref(),
-                    compile_generation,
-                )
-                .ok_or(ResolveFailure::Retry)
-            });
+        return resolve_real16_uncached::<DEFAULT>(vm, &source, exit_word, sections, at, mxcsr);
     }
     loop {
         // Publish any completed background compiles first, so a
@@ -4337,6 +4312,53 @@ fn resolve_attempt<const DEFAULT: bool>(
     }
 }
 
+// Lift/publication state belongs to a miss, keeping cache hits independent of
+// the materializer's stack frame and drop guards.
+#[cold]
+#[inline(never)]
+fn resolve_real16_uncached<const DEFAULT: bool>(
+    vm: &Vm,
+    source: &crate::memory::LiftSource<'_>,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
+    at: FetchAddr,
+    mxcsr: u32,
+) -> Result<CachedBlock, ResolveFailure> {
+    let mode = CpuMode::Real16;
+    let pc = at.pa;
+    let key = if DEFAULT {
+        BlockKey::new(pc, mode)
+    } else {
+        BlockKey::with_mxcsr(pc, mode, mxcsr)
+    };
+    let compile_generation = vm.cache.publication_generation();
+    let permit = vm.mem.fetch_permit();
+    let mut fetch_failure = None;
+    let lifted = {
+        let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
+        let _time_lift = vm
+            .time_enabled
+            .then(crate::time_stats::FetchPhaseTimer::lift);
+        lift_block_watched(&vm.mem, at, mode, &mut fetch_failure, source)
+    };
+    lifted
+        .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
+        .and_then(|ir| {
+            finish_single(
+                vm,
+                source,
+                exit_word,
+                sections,
+                key,
+                pc,
+                ir,
+                permit.as_ref(),
+                compile_generation,
+            )
+            .ok_or(ResolveFailure::Retry)
+        })
+}
+
 #[cold]
 #[inline(never)]
 fn resolve_uncached<const DEFAULT: bool>(
@@ -4517,6 +4539,7 @@ fn discard_materialized(vm: &Vm, block: &CachedBlock) {
 /// Real16, but the `cs_base + IP` physical address in Real16, where SMC page-tagging
 /// and the cache key must both be physical — see `resolve`).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn finish_single(
     vm: &Vm,
     source: &crate::memory::LiftSource<'_>,

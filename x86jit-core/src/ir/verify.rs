@@ -358,7 +358,8 @@ impl IrBlock {
                 IrOp::PortIo { port, value, .. } => check(&[*port, *value], &[])?,
                 IrOp::PortString { base, .. } => check(&[*base], &[])?,
                 IrOp::Legacy(op) => match op {
-                    crate::legacy::LegacyOp::Address { dst, offset, .. } => {
+                    crate::legacy::LegacyOp::Address { dst, offset, .. }
+                    | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {
                         check(&[*offset], &[*dst])?
                     }
                     crate::legacy::LegacyOp::ReadSelector { dst, .. }
@@ -374,7 +375,9 @@ impl IrBlock {
                     crate::legacy::LegacyOp::ReadControl { dst, .. } => check(&[], &[*dst])?,
                     crate::legacy::LegacyOp::WriteControl { value, .. } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
-                    crate::legacy::LegacyOp::ClearTs => {}
+                    crate::legacy::LegacyOp::ClearTs
+                    | crate::legacy::LegacyOp::Checkpoint
+                    | crate::legacy::LegacyOp::SharedWalk => {}
                     crate::legacy::LegacyOp::QueryDescriptor { selector, .. } => {
                         check(&[*selector], &[])?
                     }
@@ -555,6 +558,43 @@ mod tests {
         assert_eq!(block(ops.clone()).verify_temp_defs(), Ok(()));
         assert_eq!(
             block(ops[1..].to_vec())
+                .verify_temp_defs()
+                .unwrap_err()
+                .temp,
+            3
+        );
+    }
+
+    #[test]
+    fn direct_stack_address_checks_its_offset_and_defines_its_address() {
+        use crate::legacy::LegacyOp;
+        let op = |offset| {
+            IrOp::Legacy(LegacyOp::DirectStackAddress {
+                dst: 3,
+                offset,
+                bytes: 2,
+                vector: 12,
+            })
+        };
+        assert_eq!(
+            block(vec![op(Val::Temp(7))])
+                .verify_temp_defs()
+                .unwrap_err()
+                .temp,
+            7
+        );
+        let use_address = IrOp::Load {
+            fault: Default::default(),
+            dst: 4,
+            addr: Val::Temp(3),
+            size: 2,
+        };
+        assert_eq!(
+            block(vec![op(Val::Imm(0x8000)), use_address.clone()]).verify_temp_defs(),
+            Ok(())
+        );
+        assert_eq!(
+            block(vec![use_address])
                 .verify_temp_defs()
                 .unwrap_err()
                 .temp,

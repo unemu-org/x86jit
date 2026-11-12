@@ -1,9 +1,10 @@
-//! Private legacy translation namespace and dispatch (decision-18 §§3–4;
-//! spec.md §§9, 17). No application cache/backend entry is used here.
+//! Machine dispatch with shared Direct blocks and retained Checked contexts
+//! (decision-23 §5; decision-20; spec.md §§9, 17). All blocks remain interpreted.
 use super::*;
 use crate::legacy::{
     derive_legacy_context, CpuGeneration, LegacyCpuState, MachineContext, MachineRegime, SegmentId,
 };
+use crate::IrOp;
 use iced_x86::{Decoder, DecoderError, DecoderOptions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -118,6 +119,8 @@ pub(super) struct Execution {
     port_debug: bool,
     shutdown: bool,
     pub(super) pending_a20_enabled: Option<bool>,
+    smc_pages: Vec<u64>,
+    last_direct_fetch: Option<u64>,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -140,6 +143,8 @@ impl Execution {
             port_debug: false,
             shutdown: false,
             pending_a20_enabled: None,
+            smc_pages: Vec::new(),
+            last_direct_fetch: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
@@ -148,6 +153,8 @@ impl Execution {
         self.port_debug = false;
         self.shutdown = false;
         self.instruction_retry = None;
+        self.smc_pages.clear();
+        self.last_direct_fetch = None;
     }
     pub(super) fn is_shutdown(&self) -> bool {
         self.shutdown
@@ -165,7 +172,17 @@ impl Execution {
         self.contexts.clear();
         self.stamp = None;
     }
+    #[cfg(test)]
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {
+        self.sync_class(cpu, model, force, crate::SegmentClass::Checked);
+    }
+    fn sync_class(
+        &mut self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        force: bool,
+        class: crate::SegmentClass,
+    ) {
         let stamp = LegacyContextStamp::new(cpu, model);
         if force || self.stamp != Some(stamp) {
             self.context_epoch = if let Some(next) = self.context_epoch.checked_add(1) {
@@ -178,7 +195,10 @@ impl Execution {
             // implement the accepted transition-cost contract: returning to an
             // identical context reuses its IR instead of discarding other modes.
             // Fetch still revalidates bytes, mappings and policy on every entry.
-            self.context_id = if let Some(context) = self.contexts.get_mut(&stamp) {
+            self.context_id = if class == crate::SegmentClass::Direct {
+                // Direct states do not consume decision-20's Checked LRU slots.
+                u64::MAX
+            } else if let Some(context) = self.contexts.get_mut(&stamp) {
                 context.last_used = self.context_epoch;
                 context.id
             } else {
@@ -213,6 +233,7 @@ impl Execution {
         cpu: &CpuState,
         model: LegacyCpuModel,
         context: MachineContext,
+        _exit_word: &AtomicU64,
     ) -> Result<Arc<IrBlock>, Exit> {
         if self.task_switch.context().is_some() {
             if let Some(retry) = &self.instruction_retry {
@@ -249,6 +270,7 @@ impl Execution {
                 return Ok(retry.ir.clone());
             }
         }
+
         // One-instruction blocks bound fault visibility and SMC. Re-fetch each
         // dependent byte, even on cache hits: permissions, policy and physical
         // aliases are checked before executing that instruction, without page
@@ -286,7 +308,392 @@ impl Execution {
     }
 }
 
+fn retry_instruction(ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
+    let start = ir
+        .ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == ip))
+        .unwrap();
+    let end = ir.ops[start + 1..]
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { .. }))
+        .map_or(ir.ops.len(), |offset| start + 1 + offset);
+    let next = match ir.ops.get(end) {
+        Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+        _ => ir.guest_start + u64::from(ir.guest_len),
+    };
+    let mut ops = ir.ops[start..end].to_vec();
+    if matches!(
+        ir.ops.last(),
+        Some(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk))
+    ) && !matches!(
+        ops.last(),
+        Some(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk))
+    ) {
+        ops.push(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk));
+    }
+    Arc::new(IrBlock {
+        mode: ir.mode,
+        guest_start: ip,
+        guest_len: (next - ip) as u32,
+        icount: 1,
+        temp_count: ir.temp_count,
+        ops,
+        legacy_context: ir.legacy_context,
+    })
+}
+
+fn raw_direct(cpu: &CpuState) -> bool {
+    cpu.legacy.a20_enabled != 0
+        || [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs]
+            .iter()
+            .all(|selector| *selector <= 0xf000)
+}
+
+fn shared_instruction(insn: &iced_x86::Instruction, bytes: &[u8]) -> bool {
+    use iced_x86::{Mnemonic::*, Register};
+    if matches!(
+        insn.memory_segment(),
+        Register::FS | Register::GS | Register::SS
+    ) || insn.len() > 10
+    {
+        return false;
+    }
+    // The frozen alias truncates 32-bit effective offsets in its limit gate.
+    // Keep those forms on the width-aware Direct lowering until U3.
+    if bytes
+        .iter()
+        .take_while(|b| {
+            matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .any(|b| *b == 0x67)
+    {
+        return false;
+    }
+    // The alias wraps sequential IP; Machine retains EIP past FFFFh
+    // (80386 PRM §14.7 item 8). Specialize this edge at lift time.
+    if insn.ip() + insn.len() as u64 == 0x10000 {
+        return false;
+    }
+    let prefix32 = insn.code().op_code().operand_size() == 32;
+    match insn.mnemonic() {
+        Mov => !(0..insn.op_count()).any(|i| {
+            insn.op_register(i).is_segment_register()
+                || insn.op_register(i).is_cr()
+                || insn.op_register(i).is_dr()
+                || insn.op_register(i).is_tr()
+        }),
+        Push | Pop | Call | Ret => {
+            !(0..insn.op_count()).any(|i| insn.op_register(i).is_segment_register())
+                && !prefix32
+                && insn.op0_kind() != iced_x86::OpKind::Memory
+                && !matches!(
+                    insn.op0_kind(),
+                    iced_x86::OpKind::FarBranch16 | iced_x86::OpKind::FarBranch32
+                )
+        }
+        Jmp => {
+            !prefix32
+                && !matches!(
+                    insn.op0_kind(),
+                    iced_x86::OpKind::Memory
+                        | iced_x86::OpKind::FarBranch16
+                        | iced_x86::OpKind::FarBranch32
+                )
+        }
+        Loop | Loope | Loopne | Jcxz => insn.op0_kind() == iced_x86::OpKind::NearBranch16,
+        Movsb | Movsw | Movsd | Stosb | Stosw | Stosd | Lodsb | Lodsw | Lodsd | Cmpsb | Cmpsw
+        | Cmpsd | Scasb | Scasw | Scasd => insn.is_string_instruction(),
+        Lea | Add | Adc | Sub | Sbb | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not
+        | Xchg | Shl | Sal | Shr | Sar | Rol | Ror | Rcl | Rcr | Shld | Shrd | Mul | Imul | Div
+        | Idiv | Movzx | Movsx | Cbw | Cwde | Cwd | Cdq | Clc | Stc | Cmc | Cld | Std | Lahf
+        | Sahf | Nop | Hlt | In | Out | Cli | Sti => true,
+        Jb | Jbe | Je | Jg | Jge | Jl | Jle | Jae | Ja | Jne | Jno | Jnp | Jns | Jo | Jp | Js => {
+            !prefix32
+        }
+        _ => false,
+    }
+}
+
+fn specialize_shared_stacks(ops: &mut Vec<IrOp>, stacks: &[u64], generation: CpuGeneration) {
+    if stacks.is_empty() {
+        return;
+    }
+    let mut result = Vec::with_capacity(ops.len());
+    let mut stack = false;
+    let mut index = 0;
+    while index < ops.len() {
+        let op = &ops[index];
+        if let IrOp::InsnStart { guest_addr } = op {
+            stack = stacks.contains(guest_addr);
+        }
+        if stack
+            && matches!(
+                op,
+                IrOp::ReadReg {
+                    reg: crate::Reg::Ss,
+                    ..
+                }
+            )
+        {
+            // The admitted near word stack forms have one SS-base sequence.
+            let Some(IrOp::Add { dst, a: offset, .. }) = ops.get(index + 2) else {
+                unreachable!("shared stack address addition")
+            };
+            result.push(IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
+                dst: *dst,
+                offset: *offset,
+                bytes: 2,
+                vector: if generation == CpuGeneration::I386 {
+                    12
+                } else {
+                    13
+                },
+            }));
+            index += 3;
+        } else {
+            let mut op = op.clone();
+            if stack {
+                if let IrOp::Load { fault, size, .. } | IrOp::Store { fault, size, .. } = &mut op {
+                    // The alias CALL/RET expansion has no explicit memory operand
+                    // for its metadata pass. Machine retains the actual stack width.
+                    *fault = crate::ir::MemoryAccess::new(u16::from(*size), false, true);
+                }
+            }
+            result.push(op);
+            index += 1;
+        }
+    }
+    *ops = result;
+}
+
+#[inline(always)]
+fn resolve_direct(
+    vm: &Vm,
+    cpu: &CpuState,
+    context: MachineContext,
+    exit_word: &AtomicU64,
+    physical: u64,
+) -> Result<Arc<IrBlock>, Exit> {
+    let key = BlockKey::machine_direct(physical, cpu.mxcsr, cpu.legacy.a20_enabled != 0);
+    if let Some(CachedBlock::Interpreted(ir)) = vm.cache.get_for_dispatch(key, vm.time_enabled) {
+        if ir.guest_start == cpu.rip && ir.legacy_context == Some(context) {
+            return Ok(ir);
+        }
+    }
+    resolve_direct_uncached(vm, cpu, context, exit_word, physical, key)
+}
+
+#[cold]
+#[inline(never)]
+fn resolve_direct_uncached(
+    vm: &Vm,
+    cpu: &CpuState,
+    context: MachineContext,
+    exit_word: &AtomicU64,
+    physical: u64,
+    key: BlockKey,
+) -> Result<Arc<IrBlock>, Exit> {
+    if cpu.rip > 0xffff {
+        // 80386 PRM §14.7 item 8: EIP outside CS faults before fetching.
+        crate::legacy::access(
+            cpu,
+            context.generation,
+            SegmentId::Cs,
+            cpu.rip,
+            1,
+            crate::AccessKind::Execute,
+        )?;
+    }
+    loop {
+        let source = crate::memory::LiftSource::new(&vm.mem);
+        let generation = vm.cache.publication_generation();
+        let permit = vm.mem.fetch_permit();
+        let mut failure = None;
+        let lifted = crate::lift::lift_block_watched(
+            &vm.mem,
+            FetchAddr {
+                pa: physical,
+                ip: cpu.rip,
+            },
+            CpuMode::Real16,
+            &mut failure,
+            &source,
+        );
+        let mut ir = if let Ok(mut ir) = lifted {
+            let mut code = vec![0; ir.guest_len as usize];
+            let copied = vm.mem.fetch_code(physical, &mut code).unwrap_or(0);
+            code.truncate(copied);
+            let mut decoder = Decoder::with_ip(16, &code, cpu.rip, DecoderOptions::MOV_TR);
+            let mut count = 0;
+            let mut end = cpu.rip;
+            let mut special = None;
+            let mut strings = Vec::new();
+            let mut stacks = Vec::new();
+            while decoder.can_decode() {
+                let position = decoder.position();
+                let insn = decoder.decode();
+                let bytes = &code[position..decoder.position()];
+                // Match incremental Machine fetch: an unavailable I286 opcode
+                // byte wins before a later ESC can reach its MSW gate.
+                let reference_bytes = if context.generation == CpuGeneration::I286
+                    && crate::lift::legacy::unavailable_i286_opcode(bytes)
+                {
+                    let end = (1..=bytes.len())
+                        .find(|&end| crate::lift::legacy::unavailable_i286_opcode(&bytes[..end]))
+                        .expect("unavailable opcode byte");
+                    &bytes[..end]
+                } else {
+                    bytes
+                };
+                let reference =
+                    crate::lift::legacy::instruction(reference_bytes, insn.ip() as u32, context);
+                let allowed = !insn.is_invalid()
+                    && shared_instruction(&insn, bytes)
+                    && reference.as_ref().is_ok_and(|r| {
+                        !r.ops.iter().any(|op| {
+                            matches!(
+                                op,
+                                IrOp::Trap { .. }
+                                    | IrOp::Legacy(crate::legacy::LegacyOp::Refuse { .. })
+                            )
+                        })
+                    });
+                if !allowed {
+                    special = if insn.is_invalid() {
+                        None
+                    } else {
+                        reference.ok()
+                    };
+                    break;
+                }
+                if let Some(op) = reference.as_ref().ok().and_then(|ir| {
+                    ir.ops.iter().find(|op| {
+                        matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::String { .. }))
+                    })
+                }) {
+                    strings.push((insn.ip(), op.clone()));
+                }
+                if matches!(
+                    insn.mnemonic(),
+                    iced_x86::Mnemonic::Push
+                        | iced_x86::Mnemonic::Pop
+                        | iced_x86::Mnemonic::Call
+                        | iced_x86::Mnemonic::Ret
+                ) {
+                    stacks.push(insn.ip());
+                }
+                count += 1;
+                end = insn.ip() + insn.len() as u64;
+            }
+            if count == 0 {
+                if let Some(ir) = special {
+                    ir
+                } else {
+                    let bytes = fetch(vm, cpu, context)?;
+                    crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
+                        .map_err(|_| Exit::unknown_instruction(cpu.rip, [0; 15], 0))?
+                }
+            } else {
+                if end < ir.guest_start + u64::from(ir.guest_len) {
+                    let stop = ir
+                        .ops
+                        .iter()
+                        .position(
+                            |op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == end),
+                        )
+                        .unwrap();
+                    ir.ops.truncate(stop);
+                }
+                ir.guest_len = (end - cpu.rip) as u32;
+                ir.icount = count;
+                specialize_shared_stacks(&mut ir.ops, &stacks, context.generation);
+                for op in &mut ir.ops {
+                    if let IrOp::SegLimitCheck { vector, .. } = op {
+                        if context.generation == CpuGeneration::I286 {
+                            *vector = 13;
+                        }
+                    }
+                }
+                if !strings.is_empty() {
+                    // Preserve the width-aware Machine string op. The generic
+                    // walk uses its selector bases with the shared string engine;
+                    // the frozen alias keeps its existing string IR.
+                    let mut ops = Vec::with_capacity(ir.ops.len());
+                    let mut string = false;
+                    for op in ir.ops {
+                        if let IrOp::InsnStart { guest_addr } = op {
+                            ops.push(op);
+                            string = false;
+                            if let Some((_, body)) =
+                                strings.iter().find(|(ip, _)| *ip == guest_addr)
+                            {
+                                ops.push(body.clone());
+                                string = true;
+                            }
+                        } else if !string {
+                            ops.push(op);
+                        }
+                    }
+                    ir.ops = ops;
+                }
+                ir.ops
+                    .push(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk));
+                ir
+            }
+        } else {
+            let bytes = fetch(vm, cpu, context)?;
+            crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
+                .map_err(|_| Exit::unknown_instruction(cpu.rip, [0; 15], 0))?
+        };
+        ir.legacy_context = Some(context);
+        if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
+            continue;
+        }
+        if !source.publishable() {
+            let CachedBlock::Interpreted(ir) = source.uncached(ir) else {
+                unreachable!()
+            };
+            return Ok(ir);
+        }
+        let ir = Arc::new(ir);
+        #[cfg(test)]
+        vm.after_source_read();
+        vm.handle_smc(exit_word);
+        if vm.cache.insert_checked(
+            key,
+            CachedBlock::Interpreted(ir.clone()),
+            vec![(physical, ir.guest_len)],
+            |spans| {
+                if vm.cache.publication_generation() != generation
+                    || permit.as_ref().is_some_and(|p| !p.is_current())
+                {
+                    return false;
+                }
+                for (start, len) in spans {
+                    vm.mem.mark_code(*start, *len);
+                }
+                true
+            },
+        ) {
+            return Ok(ir);
+        }
+    }
+}
+
 fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Exit> {
+    fetch_watched(vm, cpu, context, cpu.rip, None)
+}
+fn fetch_watched(
+    vm: &Vm,
+    cpu: &CpuState,
+    context: MachineContext,
+    ip: u64,
+    source: Option<&crate::memory::LiftSource<'_>>,
+) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
     // I286 PRM Appendix B #GP p. B-9: instructions are at most ten bytes.
     let length_limit = if context.generation == CpuGeneration::I286 {
@@ -299,7 +706,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
             cpu,
             context.generation,
             SegmentId::Cs,
-            cpu.rip + i,
+            ip + i,
             1,
             crate::AccessKind::Execute,
         )?;
@@ -310,10 +717,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
                 return Err(crate::fault::qualify_legacy_bus(
                     crate::fault::fetch_exit(
                         &vm.mem,
-                        FetchAddr {
-                            pa: addr,
-                            ip: cpu.rip,
-                        },
+                        FetchAddr { pa: addr, ip },
                         CpuMode::Compat32,
                         addr,
                         Some(crate::lift::FetchFailure::Policy(verdict)),
@@ -323,15 +727,15 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
                 ));
             }
         }
+        if let Some(source) = source {
+            source.watch(addr, 1);
+        }
         let mut byte = [0];
         if let Err(trap) = vm.mem.fetch_code(addr, &mut byte) {
             return Err(crate::fault::qualify_legacy_bus(
                 crate::fault::fetch_exit(
                     &vm.mem,
-                    FetchAddr {
-                        pa: addr,
-                        ip: cpu.rip,
-                    },
+                    FetchAddr { pa: addr, ip },
                     CpuMode::Compat32,
                     addr,
                     Some(crate::lift::FetchFailure::Memory(trap)),
@@ -339,6 +743,9 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
                 linear,
                 addr,
             ));
+        }
+        if let Some(source) = source {
+            source.record(addr, &byte);
         }
         bytes.push(byte[0]);
         if context.generation == CpuGeneration::I286
@@ -349,7 +756,7 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
         let mut decoder = Decoder::with_ip(
             u32::from(context.default_operand_bits),
             &bytes,
-            cpu.rip,
+            ip,
             DecoderOptions::MOV_TR,
         );
         let insn = decoder.decode();
@@ -422,12 +829,15 @@ impl Vcpu {
             self.cpu.mmio_retry_cs = 0;
             self.apply_pending_a20();
         }
-        if let Err(exit) = self.legacy_context_for_run() {
-            return Ok(StepRun {
-                steps: 0,
-                stop: StepStop::Exit(exit),
-            });
-        }
+        let context = match self.legacy_context_for_run() {
+            Ok(context) => context,
+            Err(exit) => {
+                return Ok(StepRun {
+                    steps: 0,
+                    stop: StepStop::Exit(exit),
+                })
+            }
+        };
         if limit == Some(0) {
             return Ok(StepRun {
                 steps: 0,
@@ -461,10 +871,20 @@ impl Vcpu {
         }
         self.interruption_evidence = None;
         self.syscall_evidence = None;
-        self.legacy_execution
-            .as_mut()
-            .unwrap()
-            .sync(&self.cpu, self.legacy_model.unwrap(), false);
+        if context.segment_class == crate::SegmentClass::Direct {
+            // Direct has no task continuation and shared blocks cannot start a
+            // task switch. A Checked transition back starts a fresh execute()
+            // attempt, which also clears these stale completion flags.
+            let task_switch = &mut self.legacy_execution.as_mut().unwrap().task_switch;
+            task_switch.committed = false;
+            task_switch.completed = false;
+        }
+        self.legacy_execution.as_mut().unwrap().sync_class(
+            &self.cpu,
+            self.legacy_model.unwrap(),
+            false,
+            context.segment_class,
+        );
         let time_run = crate::time_stats::RunGuard::enter(
             self.time_record.clone(),
             vm.time_enabled,
@@ -488,21 +908,23 @@ impl Vcpu {
         let mut ctx = MemCtx::for_memory(&vm.mem);
         cpu.fault_entry.publish(&mut cpu.cpu, &mut ctx);
         let mut result = match (vm.mem.host_fault_recovery(), vm.consistency) {
-            (true, MemConsistency::Fast) => cpu.legacy_loop::<true, 0>(vm, limit, options, stepped),
+            (true, MemConsistency::Fast) => {
+                cpu.legacy_loop::<true, 0>(vm, limit, options, stepped, context)
+            }
             (false, MemConsistency::Fast) => {
-                cpu.legacy_loop::<false, 0>(vm, limit, options, stepped)
+                cpu.legacy_loop::<false, 0>(vm, limit, options, stepped, context)
             }
             (true, MemConsistency::AcqRel) => {
-                cpu.legacy_loop::<true, 1>(vm, limit, options, stepped)
+                cpu.legacy_loop::<true, 1>(vm, limit, options, stepped, context)
             }
             (false, MemConsistency::AcqRel) => {
-                cpu.legacy_loop::<false, 1>(vm, limit, options, stepped)
+                cpu.legacy_loop::<false, 1>(vm, limit, options, stepped, context)
             }
             (true, MemConsistency::FullTso) => {
-                cpu.legacy_loop::<true, 2>(vm, limit, options, stepped)
+                cpu.legacy_loop::<true, 2>(vm, limit, options, stepped, context)
             }
             (false, MemConsistency::FullTso) => {
-                cpu.legacy_loop::<false, 2>(vm, limit, options, stepped)
+                cpu.legacy_loop::<false, 2>(vm, limit, options, stepped, context)
             }
         };
         drop(guard);
@@ -510,6 +932,11 @@ impl Vcpu {
             result.stop
         {
             result.stop = StepStop::Exit(cpu.fault_entry.finish_transfer_fault(exit, &vm.mem));
+        }
+        // The Machine bus handoff exposes only this transfer's bytes, including
+        // stores whose source register or split operand contains higher bits.
+        if let StepStop::Exit(Exit::MmioWrite { size, value, .. }) = &mut result.stop {
+            *value &= u64::MAX >> (8 * (8 - *size));
         }
         cpu.cpu.finish_mmio_retry(match &result.stop {
             StepStop::Exit(exit) => Some(exit),
@@ -722,10 +1149,17 @@ impl Vcpu {
         self.release_legacy_event_boundary();
         self.cpu.finish_mmio_retry(exit);
         self.apply_pending_a20();
-        self.legacy_execution
-            .as_mut()
-            .unwrap()
-            .sync(&self.cpu, self.legacy_model.unwrap(), true);
+        let class = self
+            .legacy_context_for_run()
+            .map_or(crate::SegmentClass::Checked, |context| {
+                context.segment_class
+            });
+        self.legacy_execution.as_mut().unwrap().sync_class(
+            &self.cpu,
+            self.legacy_model.unwrap(),
+            true,
+            class,
+        );
     }
 
     fn route_legacy_exception<const ROUTED: bool, const ORDER: u8>(
@@ -763,18 +1197,25 @@ impl Vcpu {
         limit: Option<u64>,
         options: StepOptions,
         _stepped: bool,
+        mut context: MachineContext,
     ) -> StepRun {
         let model = self.legacy_model.unwrap();
         let mut steps = 0;
+        let mut direct_bus = raw_direct(&self.cpu);
+        let exit_word_owner = self.exit_request.word.clone();
+        let exit_word = &*exit_word_owner;
         loop {
+            // Task state changes only during execution or event delivery; an
+            // event restarts this iteration before dispatching its new context.
+            let task_pending = self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .task_switch_pending();
             let stop = if limit.is_some_and(|limit| steps >= limit) {
                 Some(Exit::BudgetExhausted)
             } else if !self.cpu.mmio_retry_active
-                && !self
-                    .legacy_execution
-                    .as_ref()
-                    .unwrap()
-                    .task_switch_pending()
+                && !task_pending
                 && self.cpu.pending_port_in.is_none()
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
@@ -803,23 +1244,21 @@ impl Vcpu {
                 }
                 self.sti_shadow = false;
                 self.ss_shadow = false;
-                self.cpu.finish_mmio_retry(None);
-                self.apply_pending_a20();
-            }
-            let context = match self.legacy_context_for_run() {
-                Ok(c) => c,
-                Err(exit) => {
-                    return StepRun {
-                        steps,
-                        stop: StepStop::Exit(exit),
-                    }
+                if self.cpu.mmio_retry_active {
+                    self.cpu.finish_mmio_retry(None);
                 }
-            };
-            if !self
-                .legacy_execution
-                .as_ref()
-                .unwrap()
-                .task_switch_pending()
+                if self
+                    .legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .pending_a20_enabled
+                    .is_some()
+                {
+                    self.apply_pending_a20();
+                    direct_bus = raw_direct(&self.cpu);
+                }
+            }
+            if !task_pending
                 && self.legacy_execution.as_ref().unwrap().port_debug
                 && self.cpu.pending_port_in.is_none()
                 && self.cpu.port_string_in.is_none()
@@ -839,7 +1278,11 @@ impl Vcpu {
                 .event_retry
                 .or_else(|| {
                     self.pending_irq
-                        .filter(|_| self.irq_delivery_ready() && !self.cpu.mmio_retry_active)
+                        .filter(|_| {
+                            !task_pending
+                                && self.irq_delivery_ready()
+                                && !self.cpu.mmio_retry_active
+                        })
                         .map(|vector| PendingEvent {
                             irq_consumed: false,
                             source: EventSource::Irq(vector),
@@ -855,28 +1298,106 @@ impl Vcpu {
                     };
                 }
                 // Delivery costs no instruction unit. Re-derive after the CS reload.
+                context = match self.legacy_context_for_run() {
+                    Ok(context) => context,
+                    Err(exit) => {
+                        return StepRun {
+                            steps,
+                            stop: StepStop::Exit(exit),
+                        }
+                    }
+                };
+                direct_bus = raw_direct(&self.cpu);
                 continue;
             }
-            if options.stop_when_irq_ready && self.irq_ready() {
+            if options.stop_when_irq_ready
+                && !task_pending
+                && !self.cpu.mmio_retry_active
+                && self.irq_delivery_ready()
+            {
                 return StepRun {
                     steps,
                     stop: StepStop::IrqReady,
                 };
             }
-            self.legacy_execution
-                .as_mut()
-                .unwrap()
-                .sync(&self.cpu, model, false);
-            let ir = match self
-                .legacy_execution
-                .as_mut()
-                .unwrap()
-                .resolve(vm, &self.cpu, model, context)
+            let direct = !task_pending && context.segment_class == crate::SegmentClass::Direct;
+            let linear_fetch = (u64::from(self.cpu.cs) << 4) + self.cpu.rip;
+            let physical = if direct && direct_bus {
+                linear_fetch
+            } else {
+                crate::legacy::physical_span(&self.cpu, linear_fetch, 1).0
+            };
+            let page = physical >> crate::memory::CODE_PAGE_BITS;
+            let dirty = exit_word.load(Ordering::Relaxed) & crate::memory::DISPATCH_DIRTY != 0;
+            let dropped = dirty.then(|| vm.cache.invalidated_blocks());
+            vm.handle_smc(exit_word);
+            let execution = self.legacy_execution.as_mut().unwrap();
+            if dropped.is_some_and(|before| before != vm.cache.invalidated_blocks()) {
+                if let Some(last) = execution.last_direct_fetch {
+                    // This bounded page hint is only a lowering choice. Precise
+                    // source invalidation and byte revalidation remain authoritative.
+                    for page in [last >> crate::memory::CODE_PAGE_BITS, page] {
+                        if !execution.smc_pages.contains(&page) {
+                            if execution.smc_pages.len() == 16 {
+                                execution.smc_pages.remove(0);
+                            }
+                            execution.smc_pages.push(page);
+                        }
+                    }
+                }
+            }
+            let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
+            let resolved = if direct
+                && !retained
+                && self
+                    .legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .instruction_retry
+                    .is_none()
             {
+                resolve_direct(vm, &self.cpu, context, exit_word, physical)
+            } else {
+                let execution = self.legacy_execution.as_mut().unwrap();
+                if execution.context_id == u64::MAX {
+                    execution.sync_class(&self.cpu, model, true, crate::SegmentClass::Checked);
+                }
+                execution.resolve(
+                    vm,
+                    &self.cpu,
+                    model,
+                    MachineContext {
+                        // The masked bus lowering retains the Direct proof;
+                        // SMC uses the cheaper original Checked instruction IR.
+                        segment_class: if direct && !direct_bus {
+                            crate::SegmentClass::Direct
+                        } else {
+                            crate::SegmentClass::Checked
+                        },
+                        ..context
+                    },
+                    exit_word,
+                )
+            };
+            self.legacy_execution.as_mut().unwrap().last_direct_fetch =
+                (direct && !retained).then_some(linear_fetch);
+            let ir = match resolved {
                 Ok(ir) => ir,
                 Err(exit) => {
                     match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
-                        Ok(()) => continue,
+                        Ok(()) => {
+                            context = match self.legacy_context_for_run() {
+                                Ok(context) => context,
+                                Err(exit) => {
+                                    return StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    }
+                                }
+                            };
+                            direct_bus = raw_direct(&self.cpu);
+                            continue;
+                        }
                         Err(exit) => {
                             return StepRun {
                                 steps,
@@ -888,40 +1409,151 @@ impl Vcpu {
             };
             // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
             // sample TF before execution, including POPF/IRET that change it.
-            let single_step = self
-                .legacy_execution
-                .as_ref()
-                .unwrap()
-                .task_switch
-                .single_step()
-                .unwrap_or(self.cpu.rflags_system & 0x100 != 0);
-            match crate::interp::legacy::execute::<ROUTED, ORDER>(
-                &ir,
-                &mut self.cpu,
-                &vm.mem,
-                &mut self.interp_scratch,
-                &mut self.legacy_execution.as_mut().unwrap().task_switch,
-            ) {
+            let single_step = if task_pending {
+                self.legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .task_switch
+                    .single_step()
+                    .unwrap_or(self.cpu.rflags_system & 0x100 != 0)
+            } else {
+                self.cpu.rflags_system & 0x100 != 0
+            };
+            let progress = if direct
+                && ir
+                    .legacy_context
+                    .is_some_and(|c| c.segment_class == crate::SegmentClass::Direct)
+            {
+                let remaining = limit.map_or(u64::MAX, |limit| limit - steps);
+                let remaining = if single_step
+                    || self.sti_shadow
+                    || self.ss_shadow
+                    || self.pending_irq.is_some()
+                    || self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .pending_a20_enabled
+                        .is_some()
+                    || options.stop_when_irq_ready
+                {
+                    1
+                } else {
+                    remaining
+                };
+                if matches!(
+                    ir.ops.last(),
+                    Some(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk))
+                ) {
+                    let shared = crate::interp::legacy::execute_shared::<ROUTED, ORDER>(
+                        &ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        remaining,
+                        exit_word,
+                        self.sti_shadow,
+                        self.ss_shadow,
+                        self.pending_irq.is_some(),
+                    );
+                    if !single_step
+                        && matches!(
+                            shared.result,
+                            crate::interp::BlockResult::Continue
+                                | crate::interp::BlockResult::ModeChange
+                        )
+                    {
+                        steps += shared.steps;
+                        self.retired += shared.retired;
+                        self.executed += shared.retired;
+                        self.sti_shadow = shared.sti_shadow;
+                        self.ss_shadow = shared.ss_shadow;
+                        self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                        if self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .pending_a20_enabled
+                            .is_some()
+                        {
+                            self.apply_pending_a20();
+                            direct_bus = raw_direct(&self.cpu);
+                        }
+                        continue;
+                    }
+                    shared.into_direct()
+                } else {
+                    crate::interp::legacy::execute_direct::<ROUTED, ORDER>(
+                        &ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        remaining,
+                        exit_word,
+                        &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                    )
+                }
+            } else {
+                let outcome = crate::interp::legacy::execute::<ROUTED, ORDER>(
+                    &ir,
+                    &mut self.cpu,
+                    &vm.mem,
+                    &mut self.interp_scratch,
+                    &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                );
+                crate::interp::legacy::DirectProgress {
+                    steps: u64::from(outcome.is_ok()),
+                    retired: u64::from(outcome.as_ref().is_ok_and(|outcome| outcome.retired)),
+                    outcome,
+                }
+            };
+            steps += progress.steps;
+            self.retired += progress.retired;
+            self.executed += progress.retired;
+            match progress.outcome {
                 Ok(outcome) => {
-                    steps += 1;
-                    self.retired += u64::from(outcome.retired);
-                    self.executed += u64::from(outcome.retired);
                     let arm_ss = outcome.arm_ss && !self.ss_shadow;
                     if self.cpu.port_string_in.is_none() {
                         self.sti_shadow = outcome.arm_sti;
                         self.ss_shadow = arm_ss;
                     }
-                    self.cpu.finish_mmio_retry(None);
+                    if self.cpu.mmio_retry_active {
+                        self.cpu.finish_mmio_retry(None);
+                    }
                     // SDM Vol 2B REP, p. 4-564: a completed iteration is an
                     // interruption window with updated registers (decision-22).
                     self.legacy_execution.as_mut().unwrap().instruction_retry = None;
-                    self.apply_pending_a20();
+                    if self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .pending_a20_enabled
+                        .is_some()
+                    {
+                        self.apply_pending_a20();
+                        direct_bus = raw_direct(&self.cpu);
+                    }
                     if outcome.context_changed {
                         let execution = self.legacy_execution.as_mut().unwrap();
                         if outcome.translations_invalidated {
                             execution.invalidate_translations();
                         }
-                        execution.sync(&self.cpu, model, true);
+                        context = match self.legacy_context_for_run() {
+                            Ok(context) => context,
+                            Err(exit) => {
+                                return StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                }
+                            }
+                        };
+                        direct_bus = raw_direct(&self.cpu);
+                        self.legacy_execution.as_mut().unwrap().sync_class(
+                            &self.cpu,
+                            model,
+                            true,
+                            context.segment_class,
+                        );
                     }
                     // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
                     // 80386 PRM §9.2.4 pp. 9-3–4, §17 MOV p. 17-109,
@@ -948,6 +1580,16 @@ impl Vcpu {
                                     stop: StepStop::Exit(exit),
                                 };
                             }
+                            context = match self.legacy_context_for_run() {
+                                Ok(context) => context,
+                                Err(exit) => {
+                                    return StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    }
+                                }
+                            };
+                            direct_bus = raw_direct(&self.cpu);
                             // HLT completed; the enabled debug trap resumes at
                             // its successor (I286 PRM Appendix B p. B-42;
                             // 80386 PRM §17 HLT p. 17-60).
@@ -979,14 +1621,26 @@ impl Vcpu {
                                 stamp: LegacyContextStamp::new(&self.cpu, model),
                                 ip: self.cpu.rip,
                                 mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-                                ir,
+                                ir: if direct {
+                                    retry_instruction(&ir, self.cpu.rip)
+                                } else {
+                                    ir
+                                },
                             });
                     } else {
                         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
-                        self.apply_pending_a20();
+                        if self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .pending_a20_enabled
+                            .is_some()
+                        {
+                            self.apply_pending_a20();
+                        }
                     }
                     if matches!(exit, Exit::Exception { .. }) {
-                        let context = if self
+                        let fault_context = if self
                             .legacy_execution
                             .as_ref()
                             .unwrap()
@@ -1000,8 +1654,21 @@ impl Vcpu {
                         } else {
                             context
                         };
-                        match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
-                            Ok(()) => continue,
+                        match self.route_legacy_exception::<ROUTED, ORDER>(vm, fault_context, exit)
+                        {
+                            Ok(()) => {
+                                context = match self.legacy_context_for_run() {
+                                    Ok(context) => context,
+                                    Err(exit) => {
+                                        return StepRun {
+                                            steps,
+                                            stop: StepStop::Exit(exit),
+                                        }
+                                    }
+                                };
+                                direct_bus = raw_direct(&self.cpu);
+                                continue;
+                            }
                             Err(exit) => {
                                 return StepRun {
                                     steps,
@@ -1066,6 +1733,78 @@ mod tests {
     }
 
     #[test]
+    fn shared_direct_fault_does_not_inherit_a_completed_task_commit() {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.set_exception_delivery(crate::ExceptionDelivery::InGuest);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\xa3\xff\xff").unwrap();
+        vm.write_bytes(13 * 4, &[0x00, 0x20, 0, 0]).unwrap();
+        vm.write_bytes(0x2000, &[0xf4]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        // An embedder may return to ordinary real mode after a completed switch.
+        cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.gpr[4] = 0x9000;
+        let task = &mut cpu.legacy_execution.as_mut().unwrap().task_switch;
+        task.committed = true;
+        task.completed = true;
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
+        assert_eq!(run.steps(), 1);
+        assert_eq!(cpu.cpu.rip, 0x2001);
+        assert_eq!(vm.mem.read(0x8ffa, 2).unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn direct_publication_rejects_a_source_write_before_registration() {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\xb8\x01\x00\xf4").unwrap();
+        *vm.source_read_hook.lock().unwrap() = Some(|vm| {
+            vm.write_bytes(0x1001, b"\x02").unwrap();
+        });
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 1);
+        assert_eq!(cpu.cpu.gpr[0], 2, "a source write must cancel publication");
+    }
+
+    #[test]
+    fn smc_retains_instruction_contexts_but_nearby_data_keeps_shared_blocks() {
+        for (code, smc) in [
+            (&b"\xc6\x06\x06\x10\x2a\xb0\x00\xeb\xf7"[..], true),
+            (&b"\xa3\x80\x10\xeb\xfb"[..], false),
+        ] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(crate::CpuModel::I80386);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, code).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            for _ in 0..2 {
+                assert_eq!(
+                    cpu.run_steps(&vm, 60, StepOptions::default())
+                        .unwrap()
+                        .steps(),
+                    60
+                );
+                let execution = cpu.legacy_execution.as_ref().unwrap();
+                assert_eq!(execution.smc_pages.is_empty(), !smc);
+                assert_eq!(execution.lifts, if smc { 3 } else { 0 });
+                assert_eq!(execution.blocks.len(), if smc { 3 } else { 0 });
+                if smc {
+                    assert_eq!(cpu.cpu.gpr[0] & 0xff, 42);
+                }
+            }
+            cpu.reset_execution_state(crate::ResetOptions::default());
+            assert!(cpu.legacy_execution.as_ref().unwrap().smc_pages.is_empty());
+        }
+    }
+
+    #[test]
     fn double_fault_classes_follow_each_generation() {
         // I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8 Tables 9-3/9-4 p. 9-13.
         let exception = |vector| EventSource::Exception {
@@ -1123,8 +1862,48 @@ mod tests {
     }
 
     #[test]
-    fn a20_toggles_reuse_only_the_matching_retained_blocks() {
+    fn a20_toggles_reuse_shared_and_retained_physical_blocks() {
         let (vm, mut cpu) = a20_loop();
+        let mut originals = Vec::new();
+        for enabled in [true, false, true, false] {
+            cpu.set_a20_enabled(enabled);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            let block = if enabled {
+                let CachedBlock::Interpreted(ir) = vm
+                    .cache
+                    .get(BlockKey::machine_direct(0x100000, 0, true))
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                ir
+            } else {
+                cpu.legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .blocks
+                    .values()
+                    .next()
+                    .unwrap()
+                    .ir
+                    .clone()
+            };
+            if originals.len() < 2 {
+                originals.push(block);
+            } else {
+                assert!(Arc::ptr_eq(&block, &originals[usize::from(!enabled)]));
+            }
+        }
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert_eq!(execution.blocks.len(), 1);
+        assert_eq!(execution.lifts, 1);
+    }
+
+    #[test]
+    fn checked_a20_toggles_reuse_only_the_matching_retained_blocks() {
+        let (vm, mut cpu) = a20_loop();
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0xfffe;
         let mut originals = Vec::new();
         for enabled in [true, false, true, false] {
             cpu.set_a20_enabled(enabled);
@@ -1190,9 +1969,9 @@ mod tests {
             let elapsed = start.elapsed().as_secs_f64();
             let execution = cpu.legacy_execution.as_ref().unwrap();
             assert_eq!(cpu.cpu.rip, 0x10);
-            assert_eq!(execution.lifts, 2);
-            assert_eq!(execution.blocks.len(), 2);
-            println!("sample={sample} toggles=200000 elapsed_seconds={elapsed:.6} toggles_per_second={:.0} ns_per_toggle_and_instruction={:.1} lifts=0 cached_blocks=2", 200_000.0 / elapsed, elapsed * 1e9 / 200_000.0);
+            assert_eq!(execution.lifts, 1);
+            assert_eq!(execution.blocks.len(), 1);
+            println!("sample={sample} toggles=200000 elapsed_seconds={elapsed:.6} toggles_per_second={:.0} ns_per_toggle_and_instruction={:.1} lifts=1 cached_blocks=2", 200_000.0 / elapsed, elapsed * 1e9 / 200_000.0);
         }
         assert_eq!(vm.backend.compile_ns(), 0);
     }
@@ -1211,7 +1990,9 @@ mod tests {
             .into_iter()
             .map(|ip| {
                 cpu.rip = ip;
-                execution.resolve(vm, cpu, model, context).unwrap()
+                execution
+                    .resolve(vm, cpu, model, context, &AtomicU64::new(0))
+                    .unwrap()
             })
             .collect()
     }
@@ -1303,6 +2084,7 @@ mod tests {
         vm.write_bytes(0x2008, b"\xff\xff\x00\x00\x00\x9b\x00\x00")
             .unwrap();
         let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].attributes = 0x92;
         cpu.cpu.rip = 0x1000;
         cpu.cpu.legacy.gdtr.base = 0x2000;
         cpu.cpu.legacy.gdtr.limit = 15;
@@ -1394,6 +2176,7 @@ mod tests {
             vm.write_bytes(0x1000 + code.len() as u64, b"\x43").unwrap();
             vm.write_bytes(0x2000, b"\xff\x03\x00\x30\x00\x00").unwrap();
             let mut cpu = vm.new_vcpu();
+            cpu.cpu.legacy.segments[SegmentId::Ds as usize].attributes = 0x92;
             cpu.cpu.rip = 0x1000;
             cpu.cpu.legacy.cr0 = cr0;
             cpu.cpu.gpr[0] = eax;
@@ -1589,6 +2372,44 @@ mod tests {
     }
 
     #[test]
+    fn direct_protected_round_trips_reuse_both_cache_namespaces() {
+        let (vm, mut cpu) = pe_transition_loop();
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].attributes = 0x93;
+        let warm = cpu.run_steps(&vm, 6, StepOptions::default()).unwrap();
+        assert_eq!(warm.steps(), 6, "{:?}", warm.stop());
+        let key = BlockKey::machine_direct(0x1000, 0, true);
+        let CachedBlock::Interpreted(direct) = vm.cache.get(key).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(direct.icount, 1);
+        assert_eq!(
+            direct.legacy_context.unwrap().segment_class,
+            crate::SegmentClass::Direct
+        );
+        let blocks: Vec<_> = cpu
+            .legacy_execution
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.ir.clone()))
+            .collect();
+        assert!(!blocks.is_empty());
+        let lifts = cpu.legacy_execution.as_ref().unwrap().lifts;
+        let run = cpu.run_steps(&vm, 600, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 600, "{:?}", run.stop());
+        let CachedBlock::Interpreted(reused) = vm.cache.get(key).unwrap() else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&direct, &reused));
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert_eq!(execution.lifts, lifts);
+        for (key, ir) in blocks {
+            assert!(Arc::ptr_eq(&ir, &execution.blocks[&key].ir));
+        }
+    }
+
+    #[test]
     fn reused_contexts_revalidate_code_bytes_and_between_run_cache_edits() {
         let (vm, mut cpu) = pe_transition_loop();
         let model = cpu.legacy_model.unwrap();
@@ -1598,13 +2419,19 @@ mod tests {
             cpu.cpu.legacy.cr0 = pe;
             let context = derive_legacy_context(model, &cpu.cpu).unwrap();
             execution.sync(&cpu.cpu, model, false);
-            original.push(execution.resolve(&vm, &cpu.cpu, model, context).unwrap());
+            original.push(
+                execution
+                    .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                    .unwrap(),
+            );
         }
         for pe in [0, 1] {
             cpu.cpu.legacy.cr0 = pe;
             let context = derive_legacy_context(model, &cpu.cpu).unwrap();
             execution.sync(&cpu.cpu, model, false);
-            let ir = execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+            let ir = execution
+                .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                .unwrap();
             assert!(Arc::ptr_eq(&ir, &original[pe as usize]));
         }
         vm.write_bytes(0x1002, &2u32.to_le_bytes()).unwrap();
@@ -1612,7 +2439,9 @@ mod tests {
             cpu.cpu.legacy.cr0 = pe;
             let context = derive_legacy_context(model, &cpu.cpu).unwrap();
             execution.sync(&cpu.cpu, model, false);
-            let ir = execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+            let ir = execution
+                .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                .unwrap();
             assert!(!Arc::ptr_eq(&ir, &original[pe as usize]));
         }
         let before_id = execution.context_id;
@@ -1620,7 +2449,9 @@ mod tests {
         execution.sync(&cpu.cpu, model, false);
         assert_ne!(execution.context_id, before_id);
         let context = derive_legacy_context(model, &cpu.cpu).unwrap();
-        execution.resolve(&vm, &cpu.cpu, model, context).unwrap();
+        execution
+            .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+            .unwrap();
         assert_eq!(execution.blocks.len(), 3);
         cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0xffff;
         execution.sync(&cpu.cpu, model, false);

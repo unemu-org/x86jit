@@ -105,91 +105,102 @@ fn encode_probe(code: Code, bits: u8, memory_operand: Option<u32>) -> Option<Vec
 #[test]
 fn every_legacy_probe_defines_temps_before_use() {
     let mut total = 0;
-    for regime in [MachineRegime::Real, MachineRegime::Protected] {
-        for default_operand_bits in [16, 32] {
-            for stack_address_bits in [16, 32] {
-                let context = MachineContext {
-                    generation: CpuGeneration::I386,
-                    regime,
-                    default_operand_bits,
-                    default_address_bits: default_operand_bits,
-                    stack_address_bits,
-                    cpl: 0,
-                    paging_enabled: false,
-                };
-                let mut checked = 0;
-                let mut system_ops = [false; 14];
-                for code in Code::values().filter(|code| {
-                    let info = code.op_code();
-                    *code != Code::INVALID
-                        && if default_operand_bits == 16 {
-                            info.mode16()
-                        } else {
-                            info.mode32()
-                        }
-                }) {
-                    let info = code.op_code();
-                    let memory_operand = (0..info.op_count()).find(|&i| {
-                        matches!(
-                            info.op_kind(i),
-                            OpCodeOperandKind::r8_or_mem
-                                | OpCodeOperandKind::r16_or_mem
-                                | OpCodeOperandKind::r32_or_mem
-                        )
-                    });
-                    for form in std::iter::once(None).chain(memory_operand.map(Some)) {
-                        let Some(bytes) = encode_probe(code, default_operand_bits, form) else {
-                            continue;
-                        };
-                        let block =
-                            match crate::lift::legacy::instruction(&bytes, IP as u32, context) {
+    for segment_class in [crate::SegmentClass::Checked, crate::SegmentClass::Direct] {
+        for regime in [MachineRegime::Real, MachineRegime::Protected] {
+            for default_operand_bits in [16, 32] {
+                for stack_address_bits in [16, 32] {
+                    if segment_class == crate::SegmentClass::Direct
+                        && (regime != MachineRegime::Real
+                            || default_operand_bits != 16
+                            || stack_address_bits != 16)
+                    {
+                        continue;
+                    }
+                    let context = MachineContext {
+                        segment_class,
+                        generation: CpuGeneration::I386,
+                        regime,
+                        default_operand_bits,
+                        default_address_bits: default_operand_bits,
+                        stack_address_bits,
+                        cpl: 0,
+                        paging_enabled: false,
+                    };
+                    let mut checked = 0;
+                    let mut system_ops = [false; 14];
+                    for code in Code::values().filter(|code| {
+                        let info = code.op_code();
+                        *code != Code::INVALID
+                            && if default_operand_bits == 16 {
+                                info.mode16()
+                            } else {
+                                info.mode32()
+                            }
+                    }) {
+                        let info = code.op_code();
+                        let memory_operand = (0..info.op_count()).find(|&i| {
+                            matches!(
+                                info.op_kind(i),
+                                OpCodeOperandKind::r8_or_mem
+                                    | OpCodeOperandKind::r16_or_mem
+                                    | OpCodeOperandKind::r32_or_mem
+                            )
+                        });
+                        for form in std::iter::once(None).chain(memory_operand.map(Some)) {
+                            let Some(bytes) = encode_probe(code, default_operand_bits, form) else {
+                                continue;
+                            };
+                            let block = match crate::lift::legacy::instruction(
+                                &bytes, IP as u32, context,
+                            ) {
                                 Ok(block) => block,
                                 Err(crate::lift::LiftError::Unsupported { .. }) => continue,
                                 Err(error) => panic!("{context:?}/{code:?}/{form:?}: {error:?}"),
                             };
-                        assert_eq!(block.legacy_context, Some(context));
-                        assert_eq!(
-                            block.verify_temp_defs(),
-                            Ok(()),
-                            "{context:?}/{code:?} memory_operand={form:?}: {:?}",
-                            block.ops
-                        );
-                        for op in &block.ops {
-                            let index = match op {
-                                IrOp::Legacy(LegacyOp::Table { .. }) => 0,
-                                IrOp::Legacy(LegacyOp::ReadControl { .. }) => 1,
-                                IrOp::Legacy(LegacyOp::WriteControl { .. }) => 2,
-                                IrOp::Legacy(LegacyOp::LoadMsw { .. }) => 3,
-                                IrOp::Legacy(LegacyOp::ClearTs) => 4,
-                                IrOp::Legacy(LegacyOp::Interrupt { .. }) => 5,
-                                IrOp::Legacy(LegacyOp::Iret { .. }) => 6,
-                                IrOp::Legacy(LegacyOp::Bound { .. }) => 7,
-                                IrOp::Legacy(LegacyOp::ReadSystemSegment { .. }) => 8,
-                                IrOp::Legacy(LegacyOp::LoadSystemSegment { .. }) => 9,
-                                IrOp::Legacy(LegacyOp::QueryDescriptor { .. }) => 10,
-                                IrOp::Legacy(LegacyOp::AdjustRpl { .. }) => 11,
-                                IrOp::Legacy(LegacyOp::Transfer { cs: Some(_), .. }) => 12,
-                                IrOp::Legacy(LegacyOp::CheckTaskReturn) => 13,
-                                _ => continue,
-                            };
-                            system_ops[index] = true;
+                            assert_eq!(block.legacy_context, Some(context));
+                            assert_eq!(
+                                block.verify_temp_defs(),
+                                Ok(()),
+                                "{context:?}/{code:?} memory_operand={form:?}: {:?}",
+                                block.ops
+                            );
+                            for op in &block.ops {
+                                let index = match op {
+                                    IrOp::Legacy(LegacyOp::Table { .. }) => 0,
+                                    IrOp::Legacy(LegacyOp::ReadControl { .. }) => 1,
+                                    IrOp::Legacy(LegacyOp::WriteControl { .. }) => 2,
+                                    IrOp::Legacy(LegacyOp::LoadMsw { .. }) => 3,
+                                    IrOp::Legacy(LegacyOp::ClearTs) => 4,
+                                    IrOp::Legacy(LegacyOp::Interrupt { .. }) => 5,
+                                    IrOp::Legacy(LegacyOp::Iret { .. }) => 6,
+                                    IrOp::Legacy(LegacyOp::Bound { .. }) => 7,
+                                    IrOp::Legacy(LegacyOp::ReadSystemSegment { .. }) => 8,
+                                    IrOp::Legacy(LegacyOp::LoadSystemSegment { .. }) => 9,
+                                    IrOp::Legacy(LegacyOp::QueryDescriptor { .. }) => 10,
+                                    IrOp::Legacy(LegacyOp::AdjustRpl { .. }) => 11,
+                                    IrOp::Legacy(LegacyOp::Transfer { cs: Some(_), .. }) => 12,
+                                    IrOp::Legacy(LegacyOp::CheckTaskReturn) => 13,
+                                    _ => continue,
+                                };
+                                system_ops[index] = true;
+                            }
+                            checked += 1;
                         }
-                        checked += 1;
                     }
-                }
-                assert!(checked > 1000, "{context:?}: only {checked} blocks checked");
-                assert!(
-                    system_ops[..8]
-                        .iter()
-                        .chain(system_ops[12..].iter())
-                        .all(|seen| *seen)
-                        && system_ops[8..12]
+                    assert!(checked > 1000, "{context:?}: only {checked} blocks checked");
+                    assert!(
+                        system_ops[..8]
                             .iter()
-                            .all(|seen| *seen == (regime == MachineRegime::Protected)),
-                    "{context:?}: {system_ops:?}"
-                );
-                eprintln!("{context:?}: verified {checked} legacy probe blocks");
-                total += checked;
+                            .chain(system_ops[12..].iter())
+                            .all(|seen| *seen)
+                            && system_ops[8..12]
+                                .iter()
+                                .all(|seen| *seen == (regime == MachineRegime::Protected)),
+                        "{context:?}: {system_ops:?}"
+                    );
+                    eprintln!("{context:?}: verified {checked} legacy probe blocks");
+                    total += checked;
+                }
             }
         }
     }
