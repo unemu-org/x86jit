@@ -4515,7 +4515,28 @@ impl Shared {
             let mut hidx = 0usize;
             let mut hnames = self.helper_names.lock().unwrap();
             macro_rules! helper {
-                ($sig:expr, $f:expr) => {{
+                ($sig:expr, $f:expr) => {
+                    helper!($sig, $f, Unclassified)
+                };
+                ($sig:expr, $f:expr, $fp:ident) => {{
+                    let fp = codegen::HelperFp::$fp;
+                    #[cfg(test)]
+                    {
+                        assert_ne!(
+                            fp,
+                            codegen::HelperFp::Unclassified,
+                            "classify {}",
+                            stringify!($f)
+                        );
+                        #[cfg(target_arch = "aarch64")]
+                        if fp == codegen::HelperFp::IntegerOnly {
+                            assert!(
+                                fp_helper_tests::has_witness(stringify!($f)),
+                                "witness {}",
+                                stringify!($f)
+                            );
+                        }
+                    }
                     assert!(hidx < MAX_HELPERS, "raise MAX_HELPERS");
                     let counter = &self.helper_counters[hidx] as *const AtomicU64 as u64;
                     hnames[hidx] = stringify!($f);
@@ -4531,6 +4552,7 @@ impl Shared {
                         },
                         $f as *const u8 as u64,
                         counter,
+                        fp,
                     )
                 }};
             }
@@ -4541,7 +4563,7 @@ impl Shared {
                             builder.import_signature(switch_sig),
                             x86jit_core::jit_abi::fp::set_control as *const u8 as u64,
                         ),
-                        helper!(fp_boundary_sig, fp_boundary_helper),
+                        helper!(fp_boundary_sig, fp_boundary_helper, IntegerOnly),
                     )
                 } else {
                     // Reserve the counter index in both modules, without importing
@@ -4550,7 +4572,12 @@ impl Shared {
                     hidx += 1;
                     (
                         (ir::SigRef::from_u32(0), 0),
-                        (ir::SigRef::from_u32(0), 0, 0),
+                        (
+                            ir::SigRef::from_u32(0),
+                            0,
+                            0,
+                            codegen::HelperFp::NeedsDefault,
+                        ),
                     )
                 };
             let afp = mxcsr_mode != 0
@@ -4566,80 +4593,100 @@ impl Shared {
                     x86jit_core::jit_abi::fp::control_with_afp(mxcsr_mode, afp)
                 },
                 switch_fp,
+                switch_fp_changed: x86jit_core::jit_abi::fp::set_control_changed as *const u8
+                    as u64,
                 fp_boundary,
                 flag_elision: self.flag_elision.load(Ordering::Relaxed),
-                div: helper!(div_sig, div_helper),
-                string: helper!(str_sig, string_helper::<true>),
-                cas_pair: helper!(cas_pair_sig, cas_pair_helper),
-                cpuid: helper!(cpuid_sig, cpuid_helper),
-                tsc: helper!(tsc_sig, tsc_helper),
-                random: helper!(random_sig, random_helper),
-                xgetbv: helper!(xgetbv_sig, xgetbv_helper),
-                vmaskmov: helper!(vmaskmov_sig, vmaskmov_helper),
-                vmaskmov_mem: helper!(vmaskmov_mem_sig, vmaskmov_mem_helper),
-                gather: helper!(gather_sig, gather_helper),
-                vec_maskmov_mem: helper!(vec_maskmov_mem_sig, vec_maskmov_mem_helper),
-                vmasked_logic: helper!(vmasked_logic_sig, vmasked_logic_helper),
-                vmasked_packed: helper!(vmasked_packed_sig, vmasked_packed_helper),
-                vmasked_shift: helper!(vmasked_shift_sig, vmasked_shift_helper),
-                var_shift: helper!(var_shift_sig, var_shift_helper),
-                shift_reg: helper!(shift_reg_sig, shift_reg_helper),
-                gf2p8: helper!(gf2p8_sig, gf2p8_helper),
-                gf2p8_mem: helper!(gf2p8_mem_sig, gf2p8_mem_helper),
-                valign: helper!(valign_sig, valign_helper),
-                vpermt2: helper!(vpermt2_sig, vpermt2_helper),
-                vpermt2_mem: helper!(vpermt2_mem_sig, vpermt2_mem_helper),
-                vperm1: helper!(vperm1_sig, vperm1_helper),
-                vperm1_mem: helper!(vperm1_mem_sig, vperm1_mem_helper),
-                vpmov_narrow: helper!(vpmov_narrow_sig, vpmov_narrow_helper),
-                vpmov_narrow_mem: helper!(vpmov_narrow_mem_sig, vpmov_narrow_mem_helper),
-                vpmov_extend_wide: helper!(vpmov_extend_wide_sig, vpmov_extend_wide_helper),
-                vpabs: helper!(vpabs_sig, vpabs_helper),
-                vp_unary_lane: helper!(vp_unary_lane_sig, vp_unary_lane_helper),
-                vp_blendm: helper!(vp_blendm_sig, vp_blendm_helper),
-                vshuf_lane: helper!(vshuf_lane_sig, vshuf_lane_helper),
-                vp_multishift: helper!(vp_multishift_sig, vp_multishift_helper),
-                vpshufb_wide: helper!(vpshufb_wide_sig, vpshufb_wide_helper),
-                vshuffle32_wide: helper!(vshuffle32_wide_sig, vshuffle32_wide_helper),
-                vpack: helper!(vpack_sig, vpack_helper),
-                var_shift_mem: helper!(var_shift_mem_sig, var_shift_mem_helper),
-                vstore_preflight: helper!(vstore_preflight_sig, vstore_preflight_helper),
-                cvtps2ph_value: helper!(cvtps2ph_value_sig, cvtps2ph_value_helper),
-                vpack_mem: helper!(vpack_mem_sig, vpack_mem_helper),
-                vhfloat: helper!(vhfloat_sig, vhfloat_helper),
-                vhfloat_mem: helper!(vhfloat_mem_sig, vhfloat_mem_helper),
-                vhint: helper!(vhint_sig, vhint_helper),
-                vhint_mem: helper!(vhint_mem_sig, vhint_mem_helper),
-                cvtph2ps: helper!(cvtph2ps_sig, cvtph2ps_helper),
-                cvtps2ph: helper!(cvtps2ph_sig, cvtps2ph_helper),
-                phminposuw: helper!(phminposuw_sig, phminposuw_helper),
-                mpsadbw: helper!(mpsadbw_sig, mpsadbw_helper),
-                pmaddwd: helper!(pmaddwd_sig, pmaddwd_helper),
-                vpmadd: helper!(vpmadd_sig, vpmadd_helper),
-                vpmadd_mem: helper!(vpmadd_mem_sig, vpmadd_mem_helper),
-                fma: helper!(fma_sig, fma_helper),
-                fma_mem: helper!(fma_mem_sig, fma_mem_helper),
-                broadcast_lane: helper!(broadcast_lane_sig, broadcast_lane_helper),
-                broadcast_lane_mem: helper!(broadcast_lane_mem_sig, broadcast_lane_mem_helper),
-                aes: helper!(aes_sig, aes_helper),
-                aes_mem: helper!(aes_mem_sig, aes_mem_helper),
-                sha: helper!(sha_sig, sha_helper),
-                sha_mem: helper!(sha_mem_sig, sha_mem_helper),
-                gfni: helper!(gfni_sig, gfni_helper),
-                gfni_mem: helper!(gfni_mem_sig, gfni_mem_helper),
-                pclmul: helper!(pclmul_sig, pclmul_helper),
-                pclmul_mem: helper!(pclmul_mem_sig, pclmul_mem_helper),
-                pcmpstr: helper!(pcmpstr_sig, pcmpstr_helper),
-                pcmpstr_mem: helper!(pcmpstr_mem_sig, pcmpstr_mem_helper),
-                pcmpstrm: helper!(pcmpstrm_sig, pcmpstrm_helper),
-                pcmpstrm_mem: helper!(pcmpstrm_mem_sig, pcmpstrm_mem_helper),
-                bmi: helper!(bmi_sig, bmi_helper),
-                x87: helper!(x87_sig.clone(), x87_helper::<false>),
-                x87_mem: helper!(x87_sig, x87_helper::<true>),
-                fxstate: helper!(fx_sig, fxstate_helper),
-                xstate: helper!(xstate_sig, xstate_helper),
-                crc32: helper!(crc_sig, crc32_helper),
-                note_watch: helper!(note_watch_sig, note_write_helper),
+                div: helper!(div_sig, div_helper, IntegerOnly),
+                string: helper!(str_sig, string_helper::<true>, IntegerOnly),
+                // Cold faults own metadata boxes; MMIO rejection snapshots code.
+                cas_pair: helper!(cas_pair_sig, cas_pair_helper, NeedsDefault),
+                cpuid: helper!(cpuid_sig, cpuid_helper, IntegerOnly),
+                tsc: helper!(tsc_sig, tsc_helper, NeedsDefault),
+                random: helper!(random_sig, random_helper, NeedsDefault),
+                xgetbv: helper!(xgetbv_sig, xgetbv_helper, IntegerOnly),
+                vmaskmov: helper!(vmaskmov_sig, vmaskmov_helper, IntegerOnly),
+                vmaskmov_mem: helper!(vmaskmov_mem_sig, vmaskmov_mem_helper, IntegerOnly),
+                gather: helper!(gather_sig, gather_helper, IntegerOnly),
+                vec_maskmov_mem: helper!(vec_maskmov_mem_sig, vec_maskmov_mem_helper, IntegerOnly),
+                vmasked_logic: helper!(vmasked_logic_sig, vmasked_logic_helper, IntegerOnly),
+                vmasked_packed: helper!(vmasked_packed_sig, vmasked_packed_helper, IntegerOnly),
+                vmasked_shift: helper!(vmasked_shift_sig, vmasked_shift_helper, IntegerOnly),
+                var_shift: helper!(var_shift_sig, var_shift_helper, IntegerOnly),
+                shift_reg: helper!(shift_reg_sig, shift_reg_helper, IntegerOnly),
+                gf2p8: helper!(gf2p8_sig, gf2p8_helper, IntegerOnly),
+                gf2p8_mem: helper!(gf2p8_mem_sig, gf2p8_mem_helper, IntegerOnly),
+                valign: helper!(valign_sig, valign_helper, IntegerOnly),
+                vpermt2: helper!(vpermt2_sig, vpermt2_helper, IntegerOnly),
+                vpermt2_mem: helper!(vpermt2_mem_sig, vpermt2_mem_helper, IntegerOnly),
+                vperm1: helper!(vperm1_sig, vperm1_helper, IntegerOnly),
+                vperm1_mem: helper!(vperm1_mem_sig, vperm1_mem_helper, IntegerOnly),
+                vpmov_narrow: helper!(vpmov_narrow_sig, vpmov_narrow_helper, IntegerOnly),
+                vpmov_narrow_mem: helper!(
+                    vpmov_narrow_mem_sig,
+                    vpmov_narrow_mem_helper,
+                    IntegerOnly
+                ),
+                vpmov_extend_wide: helper!(
+                    vpmov_extend_wide_sig,
+                    vpmov_extend_wide_helper,
+                    IntegerOnly
+                ),
+                vpabs: helper!(vpabs_sig, vpabs_helper, IntegerOnly),
+                vp_unary_lane: helper!(vp_unary_lane_sig, vp_unary_lane_helper, IntegerOnly),
+                vp_blendm: helper!(vp_blendm_sig, vp_blendm_helper, IntegerOnly),
+                vshuf_lane: helper!(vshuf_lane_sig, vshuf_lane_helper, IntegerOnly),
+                vp_multishift: helper!(vp_multishift_sig, vp_multishift_helper, IntegerOnly),
+                vpshufb_wide: helper!(vpshufb_wide_sig, vpshufb_wide_helper, IntegerOnly),
+                vshuffle32_wide: helper!(vshuffle32_wide_sig, vshuffle32_wide_helper, IntegerOnly),
+                vpack: helper!(vpack_sig, vpack_helper, IntegerOnly),
+                var_shift_mem: helper!(var_shift_mem_sig, var_shift_mem_helper, IntegerOnly),
+                vstore_preflight: helper!(
+                    vstore_preflight_sig,
+                    vstore_preflight_helper,
+                    IntegerOnly
+                ),
+                cvtps2ph_value: helper!(cvtps2ph_value_sig, cvtps2ph_value_helper, IntegerOnly),
+                vpack_mem: helper!(vpack_mem_sig, vpack_mem_helper, IntegerOnly),
+                vhfloat: helper!(vhfloat_sig, vhfloat_helper, NeedsDefault),
+                vhfloat_mem: helper!(vhfloat_mem_sig, vhfloat_mem_helper, NeedsDefault),
+                vhint: helper!(vhint_sig, vhint_helper, IntegerOnly),
+                vhint_mem: helper!(vhint_mem_sig, vhint_mem_helper, IntegerOnly),
+                cvtph2ps: helper!(cvtph2ps_sig, cvtph2ps_helper, NeedsDefault),
+                cvtps2ph: helper!(cvtps2ph_sig, cvtps2ph_helper, IntegerOnly),
+                phminposuw: helper!(phminposuw_sig, phminposuw_helper, IntegerOnly),
+                mpsadbw: helper!(mpsadbw_sig, mpsadbw_helper, IntegerOnly),
+                pmaddwd: helper!(pmaddwd_sig, pmaddwd_helper, IntegerOnly),
+                vpmadd: helper!(vpmadd_sig, vpmadd_helper, IntegerOnly),
+                vpmadd_mem: helper!(vpmadd_mem_sig, vpmadd_mem_helper, IntegerOnly),
+                fma: helper!(fma_sig, fma_helper, NeedsDefault),
+                fma_mem: helper!(fma_mem_sig, fma_mem_helper, NeedsDefault),
+                broadcast_lane: helper!(broadcast_lane_sig, broadcast_lane_helper, IntegerOnly),
+                broadcast_lane_mem: helper!(
+                    broadcast_lane_mem_sig,
+                    broadcast_lane_mem_helper,
+                    IntegerOnly
+                ),
+                aes: helper!(aes_sig, aes_helper, IntegerOnly),
+                aes_mem: helper!(aes_mem_sig, aes_mem_helper, IntegerOnly),
+                sha: helper!(sha_sig, sha_helper, IntegerOnly),
+                sha_mem: helper!(sha_mem_sig, sha_mem_helper, IntegerOnly),
+                gfni: helper!(gfni_sig, gfni_helper, IntegerOnly),
+                gfni_mem: helper!(gfni_mem_sig, gfni_mem_helper, IntegerOnly),
+                pclmul: helper!(pclmul_sig, pclmul_helper, IntegerOnly),
+                pclmul_mem: helper!(pclmul_mem_sig, pclmul_mem_helper, IntegerOnly),
+                pcmpstr: helper!(pcmpstr_sig, pcmpstr_helper, IntegerOnly),
+                pcmpstr_mem: helper!(pcmpstr_mem_sig, pcmpstr_mem_helper, IntegerOnly),
+                pcmpstrm: helper!(pcmpstrm_sig, pcmpstrm_helper, IntegerOnly),
+                pcmpstrm_mem: helper!(pcmpstrm_mem_sig, pcmpstrm_mem_helper, IntegerOnly),
+                bmi: helper!(bmi_sig, bmi_helper, IntegerOnly),
+                x87: helper!(x87_sig.clone(), x87_helper::<false>, NeedsDefault),
+                x87_mem: helper!(x87_sig, x87_helper::<true>, NeedsDefault),
+                fxstate: helper!(fx_sig, fxstate_helper, IntegerOnly),
+                // Save staging allocates through the embedder's global allocator.
+                xstate: helper!(xstate_sig, xstate_helper, NeedsDefault),
+                crc32: helper!(crc_sig, crc32_helper, IntegerOnly),
+                note_watch: helper!(note_watch_sig, note_write_helper, IntegerOnly),
             };
             let guest_rips = translate(&mut builder, helpers, &mut alloc_slot);
             builder.finalize(frontend_config);
@@ -7226,3 +7273,6 @@ mod tests {
         drop(guard);
     }
 }
+
+#[cfg(test)]
+mod fp_helper_tests;

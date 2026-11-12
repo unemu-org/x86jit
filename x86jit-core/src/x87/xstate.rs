@@ -74,6 +74,18 @@ impl super::FpMem for FxImage {
     }
 }
 
+// Stage only the architectural components an extended-state transfer can write.
+// The CPUID map and embedder-owned state remain borrowed throughout the transfer.
+fn copy_components(src: &CpuState, dst: &mut CpuState) {
+    macro_rules! copy {
+        ($($field:ident),* $(,)?) => { $(dst.$field = src.$field;)* };
+    }
+    copy!(
+        mxcsr, xmm, ymm_hi, zmm_hi, kmask, fpu_cw, fpu_sw, fpu_top, fpu_empty, fpr, fpu_fop,
+        fpu_fip, fpu_fdp, fpu_fcs, fpu_fds
+    );
+}
+
 fn memory_fault(addr: u64, write: bool) -> XStateFault {
     crate::fault::record_fp_fault(
         addr,
@@ -242,7 +254,8 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
     if active & 2 != 0 {
         transfer(160, &mut legacy[160..160 + n * 16])?;
     }
-    let mut next = cpu.clone();
+    let mut next = CpuState::new();
+    copy_components(cpu, &mut next);
     if restore {
         if mxcsr {
             let value = u32::from_le_bytes(legacy[24..28].try_into().unwrap());
@@ -258,7 +271,7 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
         }
         if requested & 1 != 0 {
             if active & 1 != 0 {
-                let mut decoded = cpu.clone();
+                let mut decoded = CpuState::new();
                 // The legacy decoder also checks MXCSR; supply the already-validated value.
                 legacy[24..28].copy_from_slice(&next.mxcsr.to_le_bytes());
                 super::exec_fxstate_format(
@@ -418,7 +431,7 @@ pub(crate) fn exec_xstate_access<const ROUTED: bool>(
         }
     }
     if restore {
-        *cpu = next;
+        copy_components(&next, cpu);
         return Ok(());
     }
     let saved_bv = if compact_save {

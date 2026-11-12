@@ -1897,6 +1897,8 @@ impl Memory {
     #[cold]
     #[inline(never)]
     fn note_code_write(&self, lo: u64, hi: u64, observer: &impl InterpreterMemory) {
+        // Alias expansion and dirty-range growth reach the embedder's allocator.
+        let _fp = crate::jit_abi::fp::DefaultEnvironment::enter();
         let aliases = self.code_aliases.lock().unwrap();
         let mut dirty = aliases.written_ranges(lo, hi);
         dirty.retain(|&(lo, hi)| {

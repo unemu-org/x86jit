@@ -166,10 +166,26 @@ fn compile_ir_for_isa_with_split_stores(
         builder.import_signature(sig(3, true)),
         crate::vstore_preflight_helper as *const () as u64,
         0,
+        super::HelperFp::Unclassified,
     );
-    helpers.cvtps2ph_value = (builder.import_signature(sig(5, false)), 0, 0);
-    helpers.cpuid = (builder.import_signature(sig(1, true)), 0, 0);
-    helpers.vmaskmov_mem = (builder.import_signature(sig(11, true)), 0, 0);
+    helpers.cvtps2ph_value = (
+        builder.import_signature(sig(5, false)),
+        0,
+        0,
+        super::HelperFp::Unclassified,
+    );
+    helpers.cpuid = (
+        builder.import_signature(sig(1, true)),
+        0,
+        0,
+        super::HelperFp::Unclassified,
+    );
+    helpers.vmaskmov_mem = (
+        builder.import_signature(sig(11, true)),
+        0,
+        0,
+        super::HelperFp::Unclassified,
+    );
     let offsets = cpu_offsets();
     let rips = if region {
         translate_region(

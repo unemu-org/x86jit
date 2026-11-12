@@ -165,6 +165,7 @@ macro_rules! relocated_codegen_witnesses {
                             helpers.fp_boundary.1 = 0x1234_5678_5000;
                             helpers.fp_boundary.2 = 0x1234_5678_6000;
                             helpers.switch_fp.1 = 0x1234_5678_7000;
+                            helpers.switch_fp_changed = 0x1234_5678_7000;
                             let mut alloc_slot = || {
                                 let address = 0x1234_5679_1000 + slot_index * 8;
                                 target_manifest

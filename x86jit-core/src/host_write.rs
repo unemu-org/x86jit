@@ -16,6 +16,8 @@ std::thread_local! {
 #[cold]
 #[inline(never)]
 pub(crate) fn writable(at: usize) -> bool {
+    // Host permission queries can allocate; store probes may run under guest control.
+    let _fp = crate::jit_abi::fp::DefaultEnvironment::enter();
     #[cfg(test)]
     {
         QUERIES.with(|n| n.set(n.get() + 1));

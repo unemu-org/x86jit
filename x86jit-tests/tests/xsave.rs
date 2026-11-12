@@ -1055,3 +1055,38 @@ fn xsave_noncanonical_components_fault_in_the_selected_segment() {
         }
     }
 }
+
+#[test]
+fn xstate_transfers_preserve_cpuid_override_storage() {
+    use x86jit_core::{CpuidOverride, CpuidRegisters};
+    for tier in 0..3 {
+        let vm = vm(tier, CpuMode::Long64, |a| {
+            a.xsave64(ptr(AREA)).unwrap();
+            a.xrstor64(ptr(AREA)).unwrap();
+        });
+        let mut cpu = vm.new_vcpu();
+        seed(&mut cpu, 7);
+        cpu.set_reg(Reg::Rbp, 0x12345678);
+        for leaf in 0x4000_0000..0x4000_0020 {
+            cpu.cpu.cpuid_overrides.leaves.insert(
+                (leaf, 0),
+                CpuidOverride {
+                    mask: CpuidRegisters::new(u32::MAX, 0, 0, 0),
+                    value: CpuidRegisters::new(leaf, 0, 0, 0),
+                },
+            );
+        }
+        cpu.cpu.cpuid_overrides.xcr0 = Some(7);
+        let address = cpu.cpu.cpuid_overrides.leaves.first_key_value().unwrap().1 as *const _;
+        assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
+        assert_eq!(cpu.reg(Reg::Rbp), 0x12345678);
+        assert_eq!(cpu.cpu.cpuid_overrides.xcr0, Some(7));
+        assert_eq!(cpu.cpu.cpuid_overrides.leaves.len(), 32);
+        assert_eq!(
+            cpu.cpu.cpuid_overrides.leaves.first_key_value().unwrap().1 as *const _,
+            address,
+            "extended-state transfers must retain the original CPUID map"
+        );
+        assert_eq!(cpu.cpu.cpuid(0x4000_0010, 0).eax, 0x4000_0010);
+    }
+}

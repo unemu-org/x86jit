@@ -49,6 +49,9 @@ pub fn blocks(mode: CpuMode) -> Vec<(&'static str, IrBlock, u32)> {
         ),
         ("rep-movs", block(b"\xf3\xa4\xf4", mode), 0),
         ("rep-stos", block(b"\xf3\xaa\xf4", mode), 0),
+        ("rep-movs-9fc0", block(b"\xf3\xa4\xf4", mode), 0x8040),
+        ("rep-stos-9fc0", block(b"\xf3\xaa\xf4", mode), 0x8040),
+        ("vrcpps-9fc0", block(b"\xc5\xf8\x53\xc1\xf4", mode), 0x8040),
         ("mxcsr", block(b"\xf3\x0f\x58\xc1\xf4", mode), 0x2000),
     ]
 }

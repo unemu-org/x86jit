@@ -47,3 +47,6 @@ required-features = ["unicorn"]
 [[bin]]
 name = "fuzz"
 path = "src/bin/fuzz.rs"
+
+[dev-dependencies]
+x86jit-core = { path = "../x86jit-core", version = "0.3.0", features = ["test-hooks"] }

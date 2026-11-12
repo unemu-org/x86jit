@@ -43,10 +43,20 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
     let mut signature = ir::Signature::new(isa.default_call_conv());
     signature.params = vec![AbiParam::new(types::I64); 9];
     signature.returns.push(AbiParam::new(types::I64));
-    helpers.string = (builder.import_signature(signature), 0, 0);
+    helpers.string = (
+        builder.import_signature(signature),
+        0,
+        0,
+        super::HelperFp::Unclassified,
+    );
     let mut signature = ir::Signature::new(isa.default_call_conv());
     signature.params.extend([AbiParam::new(types::I64); 2]);
-    helpers.cpuid = (builder.import_signature(signature), 0, 0);
+    helpers.cpuid = (
+        builder.import_signature(signature),
+        0,
+        0,
+        super::HelperFp::Unclassified,
+    );
     for (slot, params) in [
         (&mut helpers.x87, 6),
         (&mut helpers.fxstate, 5),
@@ -65,7 +75,12 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
         let mut signature = ir::Signature::new(isa.default_call_conv());
         signature.params = vec![AbiParam::new(types::I64); params + 1];
         signature.returns.push(AbiParam::new(types::I64));
-        *slot = (builder.import_signature(signature), 0, 0);
+        *slot = (
+            builder.import_signature(signature),
+            0,
+            0,
+            super::HelperFp::Unclassified,
+        );
     }
     translate_block_for_target(
         &mut builder,

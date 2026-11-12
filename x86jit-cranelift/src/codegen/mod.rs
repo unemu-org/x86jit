@@ -80,9 +80,24 @@ const R11: usize = 11;
 const PAGE_BYTES: i64 = 1 << CODE_PAGE_BITS;
 const PAGE_MASK: i64 = PAGE_BYTES - 1;
 
+/// Arm ARM DDI0487J.a §C5.2.7: FPCR controls floating-point arithmetic,
+/// not integer/NEON integer operations, loads, stores or byte copies. Guest
+/// control masks all traps. Callbacks and host FP arithmetic need Rust's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelperFp {
+    #[default]
+    Unclassified,
+    /// Engine-owned integer work; cold embedder paths must normalize locally.
+    IntegerOnly,
+    /// Host FP arithmetic, allocation, or an embedder-owned callback.
+    NeedsDefault,
+}
+
+pub type Helper = (ir::SigRef, u64, u64, HelperFp);
+
 /// Imported Rust helpers callable from compiled blocks (§14, §10).
 ///
-/// Each helper is `(signature, absolute fn address, call-counter address)`: compiled
+/// Each helper is `(signature, absolute fn address, call-counter address, FP class)`: compiled
 /// blocks reach them via `call_indirect` through a baked address rather than a
 /// linker-relocated direct call, so the emitted machine code carries **no
 /// relocations** (the prerequisite for a persistable AOT code cache — see
@@ -94,80 +109,81 @@ pub struct Helpers {
     pub afp: bool,
     pub fp_control: u64,
     pub switch_fp: (ir::SigRef, u64),
-    pub fp_boundary: (ir::SigRef, u64, u64),
+    pub switch_fp_changed: u64,
+    pub fp_boundary: Helper,
     pub flag_elision: bool,
-    pub div: (ir::SigRef, u64, u64),
-    pub string: (ir::SigRef, u64, u64),
-    pub cas_pair: (ir::SigRef, u64, u64),
-    pub cpuid: (ir::SigRef, u64, u64),
-    pub tsc: (ir::SigRef, u64, u64),
-    pub random: (ir::SigRef, u64, u64),
-    pub xgetbv: (ir::SigRef, u64, u64),
-    pub vmaskmov: (ir::SigRef, u64, u64),
-    pub vmaskmov_mem: (ir::SigRef, u64, u64),
-    pub gather: (ir::SigRef, u64, u64),
-    pub vec_maskmov_mem: (ir::SigRef, u64, u64),
-    pub vmasked_logic: (ir::SigRef, u64, u64),
-    pub valign: (ir::SigRef, u64, u64),
-    pub vpermt2: (ir::SigRef, u64, u64),
-    pub vpermt2_mem: (ir::SigRef, u64, u64),
-    pub vperm1: (ir::SigRef, u64, u64),
-    pub vperm1_mem: (ir::SigRef, u64, u64),
-    pub vpmov_narrow: (ir::SigRef, u64, u64),
-    pub vpmov_narrow_mem: (ir::SigRef, u64, u64),
-    pub vpmov_extend_wide: (ir::SigRef, u64, u64),
-    pub vpabs: (ir::SigRef, u64, u64),
-    pub vp_unary_lane: (ir::SigRef, u64, u64),
-    pub vp_blendm: (ir::SigRef, u64, u64),
-    pub vshuf_lane: (ir::SigRef, u64, u64),
-    pub vp_multishift: (ir::SigRef, u64, u64),
-    pub vpshufb_wide: (ir::SigRef, u64, u64),
-    pub vshuffle32_wide: (ir::SigRef, u64, u64),
-    pub vpack: (ir::SigRef, u64, u64),
-    pub var_shift_mem: (ir::SigRef, u64, u64),
-    pub vstore_preflight: (ir::SigRef, u64, u64),
-    pub cvtps2ph_value: (ir::SigRef, u64, u64),
-    pub vpack_mem: (ir::SigRef, u64, u64),
-    pub vhfloat: (ir::SigRef, u64, u64),
-    pub vhfloat_mem: (ir::SigRef, u64, u64),
-    pub vhint: (ir::SigRef, u64, u64),
-    pub vhint_mem: (ir::SigRef, u64, u64),
-    pub cvtph2ps: (ir::SigRef, u64, u64),
-    pub cvtps2ph: (ir::SigRef, u64, u64),
-    pub phminposuw: (ir::SigRef, u64, u64),
-    pub mpsadbw: (ir::SigRef, u64, u64),
-    pub pmaddwd: (ir::SigRef, u64, u64),
-    pub vpmadd: (ir::SigRef, u64, u64),
-    pub vpmadd_mem: (ir::SigRef, u64, u64),
-    pub fma: (ir::SigRef, u64, u64),
-    pub fma_mem: (ir::SigRef, u64, u64),
-    pub broadcast_lane: (ir::SigRef, u64, u64),
-    pub broadcast_lane_mem: (ir::SigRef, u64, u64),
-    pub aes: (ir::SigRef, u64, u64),
-    pub aes_mem: (ir::SigRef, u64, u64),
-    pub sha: (ir::SigRef, u64, u64),
-    pub sha_mem: (ir::SigRef, u64, u64),
-    pub gfni: (ir::SigRef, u64, u64),
-    pub gfni_mem: (ir::SigRef, u64, u64),
-    pub pclmul: (ir::SigRef, u64, u64),
-    pub pclmul_mem: (ir::SigRef, u64, u64),
-    pub vmasked_packed: (ir::SigRef, u64, u64),
-    pub vmasked_shift: (ir::SigRef, u64, u64),
-    pub var_shift: (ir::SigRef, u64, u64),
-    pub shift_reg: (ir::SigRef, u64, u64),
-    pub gf2p8: (ir::SigRef, u64, u64),
-    pub gf2p8_mem: (ir::SigRef, u64, u64),
-    pub pcmpstr_mem: (ir::SigRef, u64, u64),
-    pub pcmpstr: (ir::SigRef, u64, u64),
-    pub pcmpstrm: (ir::SigRef, u64, u64),
-    pub pcmpstrm_mem: (ir::SigRef, u64, u64),
-    pub bmi: (ir::SigRef, u64, u64),
-    pub x87: (ir::SigRef, u64, u64),
-    pub x87_mem: (ir::SigRef, u64, u64),
-    pub fxstate: (ir::SigRef, u64, u64),
-    pub xstate: (ir::SigRef, u64, u64),
-    pub crc32: (ir::SigRef, u64, u64),
-    pub note_watch: (ir::SigRef, u64, u64),
+    pub div: Helper,
+    pub string: Helper,
+    pub cas_pair: Helper,
+    pub cpuid: Helper,
+    pub tsc: Helper,
+    pub random: Helper,
+    pub xgetbv: Helper,
+    pub vmaskmov: Helper,
+    pub vmaskmov_mem: Helper,
+    pub gather: Helper,
+    pub vec_maskmov_mem: Helper,
+    pub vmasked_logic: Helper,
+    pub valign: Helper,
+    pub vpermt2: Helper,
+    pub vpermt2_mem: Helper,
+    pub vperm1: Helper,
+    pub vperm1_mem: Helper,
+    pub vpmov_narrow: Helper,
+    pub vpmov_narrow_mem: Helper,
+    pub vpmov_extend_wide: Helper,
+    pub vpabs: Helper,
+    pub vp_unary_lane: Helper,
+    pub vp_blendm: Helper,
+    pub vshuf_lane: Helper,
+    pub vp_multishift: Helper,
+    pub vpshufb_wide: Helper,
+    pub vshuffle32_wide: Helper,
+    pub vpack: Helper,
+    pub var_shift_mem: Helper,
+    pub vstore_preflight: Helper,
+    pub cvtps2ph_value: Helper,
+    pub vpack_mem: Helper,
+    pub vhfloat: Helper,
+    pub vhfloat_mem: Helper,
+    pub vhint: Helper,
+    pub vhint_mem: Helper,
+    pub cvtph2ps: Helper,
+    pub cvtps2ph: Helper,
+    pub phminposuw: Helper,
+    pub mpsadbw: Helper,
+    pub pmaddwd: Helper,
+    pub vpmadd: Helper,
+    pub vpmadd_mem: Helper,
+    pub fma: Helper,
+    pub fma_mem: Helper,
+    pub broadcast_lane: Helper,
+    pub broadcast_lane_mem: Helper,
+    pub aes: Helper,
+    pub aes_mem: Helper,
+    pub sha: Helper,
+    pub sha_mem: Helper,
+    pub gfni: Helper,
+    pub gfni_mem: Helper,
+    pub pclmul: Helper,
+    pub pclmul_mem: Helper,
+    pub vmasked_packed: Helper,
+    pub vmasked_shift: Helper,
+    pub var_shift: Helper,
+    pub shift_reg: Helper,
+    pub gf2p8: Helper,
+    pub gf2p8_mem: Helper,
+    pub pcmpstr_mem: Helper,
+    pub pcmpstr: Helper,
+    pub pcmpstrm: Helper,
+    pub pcmpstrm_mem: Helper,
+    pub bmi: Helper,
+    pub x87: Helper,
+    pub x87_mem: Helper,
+    pub fxstate: Helper,
+    pub xstate: Helper,
+    pub crc32: Helper,
+    pub note_watch: Helper,
 }
 
 impl Helpers {
@@ -190,12 +206,23 @@ impl Helpers {
         mk: &mut dyn FnMut() -> (ir::SigRef, u64, u64),
         note_watch: (ir::SigRef, u64, u64),
     ) -> Self {
+        let mut mk = || {
+            let (sig, addr, counter) = mk();
+            (sig, addr, counter, HelperFp::Unclassified)
+        };
+        let note_watch = (
+            note_watch.0,
+            note_watch.1,
+            note_watch.2,
+            HelperFp::Unclassified,
+        );
         Helpers {
             precise_split_stores: false,
             mxcsr_mode: 0,
             afp: false,
             fp_control: 0,
             switch_fp: (note_watch.0, 0),
+            switch_fp_changed: 0,
             fp_boundary: mk(),
             flag_elision: true,
             div: mk(),
@@ -3532,7 +3559,7 @@ impl Translator<'_, '_> {
         // Actual-access preflight; read-denied pages use the cold permission fallback.
         // This integer-only check commits no guest bytes. Keep access ordering
         // at the actual store, and avoid turning a probe into a counted operation.
-        let (sig, helper, _) = self.helpers.vstore_preflight;
+        let (sig, helper, _, _) = self.helpers.vstore_preflight;
         let helper = self.iconst(helper);
         let enabled =
             self.load_mem(std::mem::offset_of!(x86jit_core::jit_abi::MemCtx, time_enabled) as i32);
@@ -3995,7 +4022,7 @@ impl Translator<'_, '_> {
     /// receiving already-loaded operands use `call_helper` instead.
     pub(crate) fn call_memory_helper(
         &mut self,
-        helper: (ir::SigRef, u64, u64),
+        helper: Helper,
         args: &[Value],
         access: Option<GuestAccessKind>,
     ) -> ir::Inst {
@@ -4028,13 +4055,12 @@ impl Translator<'_, '_> {
 
     /// Call an imported Rust helper indirectly through its baked absolute address,
     /// so the compiled block emits no relocation for the call (AOT prerequisite).
-    pub(crate) fn call_helper(
-        &mut self,
-        helper: (ir::SigRef, u64, u64),
-        args: &[Value],
-    ) -> ir::Inst {
+    pub(crate) fn call_helper(&mut self, helper: Helper, args: &[Value]) -> ir::Inst {
         self.preflighted_stores.clear();
-        let (sig, addr, counter) = helper;
+        let (sig, addr, counter, fp) = helper;
+        let bracket = self.helpers.mxcsr_mode != 0
+            && self.helpers.fp_control != x86jit_core::jit_abi::fp::default_control()
+            && fp != HelperFp::IntegerOnly;
         // Count the call. Unlike the per-block instruction accounting this needs no
         // opt-in: a helper call is a C-ABI exit from compiled code running a whole
         // interpreter op, tens to hundreds of cycles, so the increment beside it is
@@ -4057,8 +4083,8 @@ impl Translator<'_, '_> {
             one,
         );
 
-        if self.helpers.mxcsr_mode != 0 {
-            self.switch_fp(x86jit_core::jit_abi::fp::default_control());
+        if bracket {
+            self.switch_fp_changed(x86jit_core::jit_abi::fp::default_control());
         }
         let callee = self.iconst(addr);
         let enabled = self.builder.ins().load(
@@ -4070,10 +4096,17 @@ impl Translator<'_, '_> {
         let mut args = args.to_vec();
         args.push(enabled);
         let call = self.builder.ins().call_indirect(sig, callee, &args);
-        if self.helpers.mxcsr_mode != 0 {
-            self.switch_fp(self.helpers.fp_control);
+        if bracket {
+            self.switch_fp_changed(self.helpers.fp_control);
         }
         call
+    }
+
+    fn switch_fp_changed(&mut self, control: u64) {
+        let sig = self.helpers.switch_fp.0;
+        let f = self.iconst(self.helpers.switch_fp_changed);
+        let value = self.iconst(control);
+        self.builder.ins().call_indirect(sig, f, &[value]);
     }
 
     fn switch_fp(&mut self, control: u64) {
@@ -4253,7 +4286,7 @@ impl Translator<'_, '_> {
     /// (div loads only after its trap fork, so the loads stay caller-placed).
     pub(crate) fn call_with_out_slot(
         &mut self,
-        helper: (ir::SigRef, u64, u64),
+        helper: Helper,
         args: &[Value],
     ) -> (ir::StackSlot, ir::Inst) {
         let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
