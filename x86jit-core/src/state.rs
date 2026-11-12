@@ -475,11 +475,21 @@ pub enum FpuModel {
     /// Preserve the existing x87 engine and its defaults; no generation claim.
     #[default]
     Present,
-    /// No attached coprocessor. Real16 assumes inactive BUSY#/ERROR# inputs
-    /// (80386 PRM Ch. 11 §11.1.2, p. 11-2). With EM clear, input ESC forms
-    /// perform CPU operand checks and preserve the x87 image, independently of
-    /// the Present engine's coverage. Coprocessor output transfers are unsupported
-    /// because their empty-socket values are not specified there.
+    /// No attached coprocessor; assume inactive BUSY#/ERROR# inputs
+    /// (80386 PRM Ch. 11 §11.1.2, p. 11-2). Real-mode input ESC forms perform
+    /// CPU operand checks and preserve the x87 image, independently of Present's
+    /// coverage. Protected input forms retain their existing refusal.
+    /// Machine I286 also retires output forms: FNSTSW AX, FNSTSW m16 and
+    /// FNSTCW m16 supply FFFFh after complete CPU operand checks, using normal
+    /// memory transfers for m16. This is the all-high board default assumed by
+    /// the I286/287 PRM Part I Appendix A p. A-4 and Part II Appendix B item 10
+    /// p. B-2; the latter requires a high low-byte bit in the memory status
+    /// probe. Other stores preserve memory after CPU checks: their outcome
+    /// without an extension is unspecified (Part II Ch. 2 p. 2-49, Ch. 3
+    /// pp. 3-1–3-3; decision-25). No ESC changes the x87 image. Machine
+    /// MSW/CR0 still gates ESC on EM or TS, and WAIT on MP and TS.
+    /// I386 and Application Real16 retain their unsupported output transfers;
+    /// Long64/Compat32 ignore this policy.
     None,
 }
 

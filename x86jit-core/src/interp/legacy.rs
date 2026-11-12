@@ -1402,6 +1402,16 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
             }
             IrOp::Unsupported { bytes, len } => {
                 if cpu.fpu_model != crate::FpuModel::None {
+                    if context.generation == crate::CpuGeneration::I286
+                        && context.regime == crate::MachineRegime::Protected
+                        && (crate::x87::esc_output(&bytes[..usize::from(*len)])
+                            || bytes[..usize::from(*len)].last() == Some(&0x9b))
+                    {
+                        return Err(refusal(
+                            cpu,
+                            crate::UnsupportedSystemOperation::LegacyInstruction,
+                        ));
+                    }
                     return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
                 }
                 None
@@ -1415,6 +1425,17 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 ..
             } => {
                 if cpu.fpu_model == crate::FpuModel::None {
+                    if context.generation == crate::CpuGeneration::I286
+                        && matches!(
+                            kind,
+                            crate::x87::FpuKind::Fnstcw | crate::x87::FpuKind::FnstswMem
+                        )
+                    {
+                        // I286/287 PRM Part II Appendix B item 10 p. B-2
+                        // reads the absent bus through the memory status store;
+                        // decision-25 selects the all-high word default.
+                        write(cpu, mem, read_val(*addr, temps), 2, 0xffff)?;
+                    }
                     continue;
                 }
                 if crate::x87::mf_pending_before(cpu, *kind) {
@@ -1542,8 +1563,11 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         } {
                             return Err(exception(cpu, 7));
                         }
-                        // Generation/decoder #UD follows the MSW gate, before
-                        // the absent-output handoff (decision-21; §17.9).
+                        // Generation/decoder #UD follows the MSW gate. I286
+                        // larger memory outputs keep the data channel idle
+                        // (I286/287 PRM Part II Ch. 2 p. 2-49, Ch. 3 p. 3-1;
+                        // decision-25). The I386 PRM §11.1.2 pp. 11-1–11-2
+                        // supplies no absent output value: retain its handoff.
                         if !*wait
                             && cpu.fpu_model == crate::FpuModel::None
                             && !ir
@@ -1552,7 +1576,14 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 .any(|op| matches!(op, IrOp::Trap { vector: 6, .. }))
                             && crate::x87::esc_output(&bytes[..usize::from(*len)])
                         {
-                            return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
+                            if context.generation != crate::CpuGeneration::I286 {
+                                return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
+                            }
+                            if bytes[..usize::from(*len)].ends_with(&[0xdf, 0xe0]) {
+                                // I286/287 PRM Part I Appendix A p. A-4:
+                                // FSTSW AX assumes an all-high empty bus.
+                                cpu.write_gpr(RAX, 0xffff, 2);
+                            }
                         }
                     }
                     L::Enter { size, alloc, level } => {

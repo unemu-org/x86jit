@@ -186,8 +186,18 @@ pub(crate) fn instruction(
         ops.push(IrOp::Trap { vector, advance: 0 });
     } else {
         let first = ops.values.len();
-        if let Err(error) = lower(&insn, &mut ops, &mut tg) {
-            if !esc {
+        // Decision-25: empty I286 outputs and WAIT complete even where
+        // executing a present protected-mode coprocessor remains deferred.
+        let lowered = if context.generation == crate::CpuGeneration::I286
+            && context.regime == crate::MachineRegime::Protected
+            && (wait || (esc && crate::x87::esc_output(code)))
+        {
+            Err(unsupported_insn(&insn))
+        } else {
+            lower(&insn, &mut ops, &mut tg)
+        };
+        if let Err(error) = lowered {
+            if !esc && !wait {
                 return Err(refill_unsupported_bytes(error, code, u64::from(ip)));
             }
             ops.values.truncate(first);
@@ -197,7 +207,11 @@ pub(crate) fn instruction(
                 bytes,
                 len: code.len() as u8,
             });
-            if insn.op_kinds().any(|k| k == OpKind::Memory) {
+            if matches!(insn.mnemonic(), Mnemonic::Fnstcw | Mnemonic::Fnstsw) {
+                // The absent word stores share real-mode transfer handling;
+                // Unsupported preserves Present's protected-mode refusal.
+                control::lift_x87(&insn, &mut ops, &mut tg)?;
+            } else if insn.op_kinds().any(|k| k == OpKind::Memory) {
                 effective_address(&insn, &mut ops, &mut tg)?;
             }
         }

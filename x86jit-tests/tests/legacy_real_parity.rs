@@ -245,6 +245,36 @@ fn application_conflict(code: Code, mmio: bool) -> Option<&'static str> {
     })
 }
 
+fn i286_empty_output(code: Code) -> bool {
+    // Decision-25; I286/287 PRM Part II Appendix A, Table A-2 pp. A-2–A-4.
+    // Exact forms with independent expectations for both execution profiles.
+    use Code::*;
+    matches!(
+        code,
+        Fnstcw_m2byte
+            | Fstcw_m2byte
+            | Fnstsw_m2byte
+            | Fstsw_m2byte
+            | Fnstsw_AX
+            | Fstsw_AX
+            | Fst_m32fp
+            | Fst_m64fp
+            | Fstp_m32fp
+            | Fstp_m64fp
+            | Fstp_m80fp
+            | Fist_m16int
+            | Fist_m32int
+            | Fistp_m16int
+            | Fistp_m32int
+            | Fistp_m64int
+            | Fbstp_m80bcd
+            | Fnstenv_m14byte
+            | Fstenv_m14byte
+            | Fnsave_m94byte
+            | Fsave_m94byte
+    )
+}
+
 // Reference only the documented conflict's instruction, starting from the seeded
 // input. No legacy output or execution helper supplies an expected value. The
 // caller still compares the complete state image, memory, exit and step count.
@@ -493,8 +523,62 @@ fn application_real16_forms_have_legacy_parity() {
                     architectural.insert(format!("{code:?} {bytes:02x?}: {reason}"));
                     conflict_expectation(&a, &ac, &insn, generation, mmio)
                 });
+                let empty_output =
+                    (generation == CpuGeneration::I286 && absent && i286_empty_output(*code))
+                        .then(|| (ac.cpu.clone(), memory_image(&a)));
                 let ar = run_form(&a, &mut ac, bytes);
                 let br = run_form(&b, &mut bc, bytes);
+                if let Some((initial, memory)) = empty_output {
+                    // Application still refuses at ESC, after a separate WAIT
+                    // if present. Machine retires; only the control/status
+                    // word transfers write memory (decision-25).
+                    let mut application = initial.clone();
+                    application.rip += u64::from(bytes[0] == 0x9b);
+                    let mut machine = initial;
+                    machine.rip += bytes.len() as u64;
+                    if matches!(code, Code::Fnstsw_AX | Code::Fstsw_AX) {
+                        // PRM Part I Appendix A p. A-4: all-high bus assumption.
+                        machine.gpr[0] = (machine.gpr[0] & !0xffff) | 0xffff;
+                    }
+                    let mut machine_memory = memory.clone();
+                    if matches!(
+                        code,
+                        Code::Fnstcw_m2byte
+                            | Code::Fstcw_m2byte
+                            | Code::Fnstsw_m2byte
+                            | Code::Fstsw_m2byte
+                    ) {
+                        // Part II Appendix B item 10 p. B-2: the memory status
+                        // store carries the high bus value even without an NPX.
+                        let prefix = usize::from(bytes[0] == 0x9b);
+                        let esc = iced_x86::Decoder::with_ip(
+                            16,
+                            &bytes[prefix..],
+                            0x1000 + prefix as u64,
+                            iced_x86::DecoderOptions::NO_INVALID_CHECK,
+                        )
+                        .decode();
+                        assert_eq!(esc.memory_base(), iced_x86::Register::BX);
+                        assert_eq!(esc.memory_index(), iced_x86::Register::None);
+                        let at = ((machine.gpr[3] + esc.memory_displacement64()) & 0xffff) as usize;
+                        machine_memory[at..at + 2].fill(0xff);
+                    }
+                    assert_eq!(image(&ac), state_image(&application), "{code:?}");
+                    assert_eq!(image(&bc), state_image(&machine), "{code:?}");
+                    assert_eq!(memory_image(&a), memory, "{code:?}");
+                    assert_eq!(memory_image(&b), machine_memory, "{code:?}");
+                    assert_eq!(ar.steps(), 0, "{code:?}");
+                    assert!(
+                        matches!(ar.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == application.rip),
+                        "{code:?}: {ar:?}"
+                    );
+                    assert_eq!(br.steps(), 1, "{code:?}");
+                    assert!(
+                        matches!(br.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                        "{code:?}: {br:?}"
+                    );
+                    continue;
+                }
                 if let Some((state, memory, stop, steps)) = expected {
                     if state_image(&state) != image(&bc)
                         || memory != memory_image(&b)

@@ -1824,6 +1824,17 @@ any vCPU exists. New vCPUs inherit it, forks preserve it, and the per-vCPU sette
 remains an override. `new_vcpu` validates the VM default against a selected
 catalogue entry's FPU pairings.
 
+With `None`, I286 Machine output ESC forms retire after the complete CPU operand
+checks, preserving the x87 image. FNSTSW AX, FNSTSW m16 and FNSTCW m16 supply
+FFFFh, the all-high board default (I286/287 PRM Part I Appendix A p. A-4;
+Part II Appendix B item 10 p. B-2). Memory word stores use ordinary Machine
+transfers. Other outputs preserve memory: their absent-extension outcome is
+not documented (Part II Ch. 2 p. 2-49, Ch. 3 pp. 3-1–3-3; decision-25).
+WAIT completes in real and protected mode unless MP and TS are both set;
+the following ESC independently tests EM and TS. I386 retains output refusal because
+its PRM §11.1.2 does not define absent output data. The MSW/CR0 exception gates,
+input forms, Present and Application paths keep their existing behavior.
+
 `ExecutionProfile::LegacySystem` is a deprecated associated constant for
 `Machine`, including in patterns. `Vm::set_legacy_cpu_model` remains a deprecated
 compatibility selector preserving the supplied generation and semantics identity.
