@@ -749,13 +749,12 @@ impl Pending {
                     legacy::restore_flags(cpu, self.context.generation, image.flags)?;
                     cpu.rflags_system =
                         (cpu.rflags_system & !0x30000) | u64::from(image.flags & 0x30000);
-                    // Both PRMs clear incoming NT on JMP (286 Table 8-2 p. 8-7;
-                    // 386 Table 7-2 p. 7-10). SDM Vol 3A Table 10-2 p. 10-15
-                    // instead preserves it. The selected historical models use PRMs.
+                    // 286 PRM App. B SWITCH_TASKS p. B-12; 386 PRM §7.5
+                    // step 5 p. 7-8; SDM Vol 3A §10.3 step 12 p. 10-11 /
+                    // §10.4 Table 10-2 p. 10-15: JMP/IRET load incoming NT.
                     match self.cause {
                         Cause::Call | Cause::Event => cpu.rflags_system |= 0x4000,
-                        Cause::Jump => cpu.rflags_system &= !0x4000,
-                        Cause::Return => {}
+                        Cause::Jump | Cause::Return => {}
                     }
                     [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs] = image.segments;
                     for cache in &mut cpu.legacy.segments {

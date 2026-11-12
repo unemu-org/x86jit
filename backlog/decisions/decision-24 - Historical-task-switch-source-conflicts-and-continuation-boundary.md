@@ -31,7 +31,7 @@ agreement for one condition does not settle a different condition on the same pa
 
 | Case | Selected rule and audit result | Conflicting statements and reason |
 |---|---|---|
-| Incoming NT on JMP | **Retained: clear**, both models. 286 §8.4 Table 8-2 p. 8-7; 386 §7.6 Table 7-2 p. 7-10 explicitly describe this flag. | SDM Vol 3A §10.4 prose p. 10-15 also says NT=0, but Table 10-2 on that page and §10.3 step 12 p. 10-11 load NT from the TSS. The SDM cannot break a tie. The model flag-effect tables are more specific than the generic FLAGS loads in 286 SWITCH_TASKS p. B-12 / 386 §7.5 step 5 p. 7-8. |
+| Incoming NT on JMP | **Changed: load NT from the incoming TSS FLAGS image**, on I286 and I386 with either supported TSS format. 286 PRM App. B SWITCH_TASKS p. B-12 loads all machine registers; 386 PRM §7.5 step 5 p. 7-8 explicitly loads the flag register. SDM Vol 3A §10.3 step 12 p. 10-11 and §10.4 Table 10-2 p. 10-15 explicitly restore incoming NT on JMP and IRET; CALL/INT set incoming NT. | 286 PRM §8.4 Table 8-2 p. 8-7 and 386 PRM §7.6 Table 7-2 p. 7-10 say incoming NT is "Cleared" on JMP; SDM Vol 3A §10.4 prose p. 10-15 also says NT=0. The maintainer-approved resolution below selects the FLAGS-load procedures and explicit SDM step/table. Outgoing NT, busy-bit effects and back-link effects are unchanged. |
 | Incoming TSS limit fault context | **Retained:** 286 checks after saving and loading TR, before loading registers/setting TS (App. B p. B-12). 386 checks before saving (§7.5 steps 2–3 p. 7-8). | 286 §8.3 pp. 8-5–6 gives an overview and separates the limit check from later selector validation; its table does not identify a different TR-load checkpoint. SDM Vol 3A §10.3 step 3 p. 10-10 describes the later old-context check. Use the detailed model procedure. |
 | Minimum inclusive TSS limit | **Retained: 2Bh / 67h.** 286 App. B SWITCH_TASKS p. B-12 and §9.6.4 Table 9-5 p. 9-12 give 43; 386 §§7.2,9.8.10 pp. 7-4/9-14 give 103 for a 32-bit TSS. | 286 Table 8-1 p. 8-6 says greater than 43. SDM Vol 3A Table 10-1 p. 10-13 says 44/108; §10.6 p. 10-18 says 2Ch; §7.15 Table 7-6 p. 7-39 says 2Ch/67h; §10.2.2 p. 10-6 explicitly says 67h. The SDM is internally inconsistent and cannot break this tie. Use the specific model instruction/#TS text and the 44-/104-byte formats. |
 | 286 segment-load checks | **Retained:** #TS for invalid selectors/type/privilege; SS before CS. App. B pp. B-12–13 and §9.6.4 Table 9-5 p. 9-12. | Table 8-1 p. 8-6 lists #GP/#SS for some of these failures. SDM Vol 3A Tables 7-6/10-1 pp. 7-39/10-14 consistently support #TS for these selector conditions. Presence still gives #SS for SS and #NP for code/data. |
@@ -58,6 +58,31 @@ For a 16-bit TSS on I386, upper GPR halves are not preserved (SDM Vol 3A §10.6
 p. 10-18); the engine zeroes them deterministically. Reserved upper selector words
 in a 32-bit TSS are left untouched. These are engine storage policies rather than
 claims about unspecified bus writes of every stepping.
+
+## Incoming NT on JMP clarification
+
+2026-11-12: The maintainer approved restoring incoming NT from the TSS on JMP
+for I286 and I386, with both supported TSS formats. This supersedes the earlier
+clear-on-JMP selection in the row above; this decision remains **accepted**.
+
+A diagnostic program validated on 286 hardware CALLs task B from A through a
+task gate, leaving B with NT=1 and a back link to A. B and C then JMP to each
+other about fifty times. B saves FLAGS=4046h when departing and must restore
+that image when resumed so that its final IRET returns to A through its back
+link. Clearing incoming NT yields 0046h and a stack IRET over fill data. The
+hardware-validated program falsifies the clear-on-JMP reading; it is an oracle,
+not the authority for the selected semantics.
+
+The licence is the incoming register/FLAGS load in 80286 PRM App. B
+SWITCH_TASKS p. B-12 and 80386 PRM §7.5 step 5 p. 7-8, together with SDM
+Vol 3A §10.3 step 12 p. 10-11 and §10.4 Table 10-2 p. 10-15's explicit
+incoming-NT rule. Each cited page image, including the opposed historical tables
+and SDM prose recorded in the row, was checked. This is a specific approved
+resolution of the conflicting NT statements; the other source-resolution rows
+stand. CALL and INT, including task gates and IDT task gates, still set incoming
+NT=1. IRET still restores incoming NT as saved and clears NT only in the outgoing
+saved FLAGS image. JMP preserves outgoing NT; its old/new busy-bit updates and
+both back links are unchanged.
 
 ## Continuation and commit boundary
 

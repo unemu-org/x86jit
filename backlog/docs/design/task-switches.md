@@ -24,7 +24,7 @@ I386/32-bit TSS. An interpreter-only backend fixture panics if compilation occur
 
 | Scope | Change | Citation | Witness |
 |---|---|---|---|
-| Far JMP to TSS | Save outgoing dynamic state, load target, clear old B/set new B | 286 §§8.3–8.4 pp. 8-5–7; 386 §§7.5–7.6 pp. 7-8–10; JMP App. B pp. B-57–58 / §17 p. 17-86 | `jmp_to_tss_and_back_saves_state_and_sets_ts` |
+| Far JMP to TSS | Save outgoing dynamic state including NT, load target FLAGS including NT, clear old B/set new B; preserve both back links | 286 App. B SWITCH_TASKS p. B-12; 386 §7.5 step 5 p. 7-8; SDM Vol 3A §10.3 step 12 p. 10-11 / §10.4 Table 10-2 p. 10-15 | `jmp_to_tss_and_back_saves_state_and_sets_ts`, `incoming_nt_on_jmp_comes_from_the_tss`; nested JMP witnesses below |
 | Far CALL and nested IRET | Keep caller busy, write back link, set NT; IRET requires busy target and clears departing B/NT in its saved flags | 286 §8.4 p. 8-7, IRET p. B-51; 386 §7.6 pp. 7-9–10, IRET p. 17-76 | `call_and_nested_iret_preserve_backlink_and_busy_chain`, `iret_backlink_must_be_busy`, `iret_rejects_null_local_wrong_type_absent_and_outside_backlinks` |
 | Task gates in GDT/LDT | Validate gate access/presence, use its TSS selector, ignore target TSS DPL/RPL | 286 §8.5 pp. 8-8–9; 386 §7.4 pp. 7-5–6; CALL pp. B-25 / 17-41 | `call_task_gate_in_gdt_and_ldt`, `descriptor_privilege_presence_and_task_gate_target_checks` |
 | Type, privilege, presence, limit and error codes | Model-specific #GP/#NP/#TS, selector error codes, old/new task placement | 286 SWITCH_TASKS pp. B-12–13, CALL/JMP/IRET pp. B-25/B-51/B-57–58; 386 §7.5 Table 7-1 pp. 7-8–9, §17 pp. 17-41/17-76/17-86 | `pre_switch_faults_keep_the_outgoing_task`, `short_tss_fault_placement_is_model_specific`, `target_ip_limit_fault_is_in_new_task_with_gp`, `task_segment_validation_vectors_codes_and_order_follow_each_prm` |
@@ -79,7 +79,7 @@ The format matrix is I286/16-bit, I386/16-bit, and I386/32-bit wherever applicab
 | 5. CS privilege checked before presence | Incoming code is DPL 3/P=0 at CPL 0. Keep the model ordering: #TS on I286; #NP before the DPL check on I386. | `review_code_presence_and_privilege_combined_failure_uses_model_order` |
 | 6. 286 TS set too early | JMP to B with limit 2Ah. TR changes and #TS(B) occurs before register loading/TS setting; CR0 remains 1. | `review_short_incoming_i286_tss_does_not_set_ts` |
 | 7. 286 outgoing cache checked too early | Execute LTR with limit 28h; JMP B must acquire B, then #TS(B), leaving outgoing state/MSW intact. LTR itself correctly has no limit check (PRM p. B-72); outgoing save needs 29h, incoming load needs 2Bh (p. B-12). | `review_short_current_i286_tss_is_checked_after_busy_acquisition` |
-| 8. Missing conflicting source | Resolve 386 LDT failures as #TS(LDT), invalid SS/data as #TS(selector), using PRM §9.8.10 Table 9-5 p. 9-14 and the consistently agreeing SDM entries. Split CALL DPL/IP #GP from disputed target-TSS #TS cases. Keep minimum limits and NT after auditing inconsistent SDM statements. | `review_i386_exception_table_resolves_ldt_stack_and_data_conflicts`, `review_i386_call_privilege_ip_and_disputed_busy_checks`; decision-24's full row audit |
+| 8. Missing conflicting source | Resolve 386 LDT failures as #TS(LDT), invalid SS/data as #TS(selector), using PRM §9.8.10 Table 9-5 p. 9-14 and the consistently agreeing SDM entries. Split CALL DPL/IP #GP from disputed target-TSS #TS cases. Keep minimum limits after auditing inconsistent SDM statements; the incoming-NT selection is superseded by the clarification below. | `review_i386_exception_table_resolves_ldt_stack_and_data_conflicts`, `review_i386_call_privilege_ip_and_disputed_busy_checks`; decision-24's full row audit |
 
 `review_complete_i286_tss_alias_image_and_system_caches` compares **every one of
 22 words in the 44-byte TSS**, both raw eight-byte task descriptors, all saved GPRs,
@@ -171,7 +171,59 @@ STI/SS and single-step regression suites remain enabled. Authority: decision-24'
 accepted continuation contract; 286 PRM §9.7.1 p. 9-14, MOV/POP pp. B-73/B-83;
 386 PRM §§9.2.4,12.3.1.4 pp. 9-3–4/12-8; SDM Vol 3A §§7.8.1,7.8.3 pp. 7-7–9.
 
-## Validation
+## Incoming NT on JMP clarification (2026-11-12)
+
+The maintainer approved loading NT from the incoming TSS FLAGS on JMP for I286
+and I386 with either supported TSS format. CALL and INT (including task gates
+and IDT task gates) set incoming NT=1; IRET restores incoming NT as saved.
+JMP still saves outgoing NT unchanged, clears the outgoing busy bit, sets the
+incoming busy bit and preserves both back links. IRET still clears departing
+NT in the saved image. The implementation change is confined to incoming NT in
+`interp/legacy/tasks.rs`'s `Stage::ReadImage`.
+
+Authority, checked against each page image: 80286 PRM App. B SWITCH_TASKS
+p. B-12; 80386 PRM §7.5 step 5 p. 7-8; SDM Vol 3A §10.3 step 12 p. 10-11
+and §10.4 Table 10-2 p. 10-15. Decision-24 records the opposed clear-on-JMP
+statements in 286 §8.4 Table 8-2 p. 8-7, 386 §7.6 Table 7-2 p. 7-10 and
+SDM §10.4 prose p. 10-15. A generic diagnostic validated on 286 hardware
+falsifies that reading by requiring B's saved FLAGS=4046h after repeated JMPs
+between B and C, followed by IRET through B's CALL-created back link to A.
+The manual load procedures and explicit SDM step/table license the rule.
+
+The existing `incoming_nt_on_jmp_uses_the_historical_prm_rule` witness is renamed
+`incoming_nt_on_jmp_comes_from_the_tss`. It now checks incoming NT=0/1 against
+outgoing NT=0/1, direct TSS and task-gate JMPs, all three model/TSS combinations,
+unchanged outgoing NT and back links, both busy bits and TR.
+
+Three added witnesses cover CALL A→B through a task gate, four B→C→B JMP
+round trips, then IRET B→A: `i286_nested_jmp_ping_pong_returns_through_backlink`,
+`i386_286_tss_nested_jmp_ping_pong_returns_through_backlink`, and
+`i386_386_tss_nested_jmp_ping_pong_returns_through_backlink`. After every switch
+they compare all GPRs, IP, FLAGS including NT, segment selectors, TR cache,
+LDTR selector, CR0, all three busy bits/back links, and complete TSS byte images.
+The 32-bit format uses nonzero upper GPR halves. Each runs with A's saved NT=0
+and NT=1, also pinning IRET's incoming-NT rule and outgoing-NT clear. B's stack
+contains fill data so a stack IRET cannot imitate the required task return.
+
+Before the engine change, the three ping-pong witnesses each failed on the first
+JMP back into B: FLAGS was 0046h rather than 4046h. The updated incoming-NT
+witness also failed separately, observing 0203h rather than 4203h.
+
+The corrected `legacy_task_switch` suite passed **65 tests**; all other
+`legacy_*` suites passed **332 tests**, for **397 passed** in total.
+`legacy_upper_audit` has no enabled tests on the ARM host. Commands used at most
+four build jobs, a 180-second timeout per test command and the isolated
+`CARGO_TARGET_DIR=/private/tmp/xj-srh25-target`. Before each Cargo command:
+
+```sh
+for i in $(seq 1 30); do [ -f /private/tmp/orbkit-live.lock ] || break; sleep 30; done
+```
+
+`cargo clippy --offline --all-targets --all-features -- -D warnings`,
+`cargo fmt --all -- --check` and `git diff --check` passed. No commits, bead
+operations or git writes were performed.
+
+## Initial implementation validation
 
 Every Cargo command first waits with
 `while [ -f /private/tmp/orbkit-live.lock ]; do sleep 30; done`.

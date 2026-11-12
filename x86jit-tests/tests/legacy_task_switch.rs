@@ -369,30 +369,190 @@ fn iret_rejects_null_local_wrong_type_absent_and_outside_backlinks() {
 }
 
 #[test]
-fn incoming_nt_on_jmp_uses_the_historical_prm_rule() {
-    // Conflict: PRM 286 Table 8-2 p. 8-7 / 386 Table 7-2 p. 7-10
-    // clear NT on JMP. SDM Vol 3A §10.4 Table 10-2 p. 10-15 loads it.
+fn incoming_nt_on_jmp_comes_from_the_tss() {
+    // 286 PRM App. B SWITCH_TASKS p. B-12; 386 PRM §7.5 step 5 p. 7-8;
+    // SDM Vol 3A §10.3 step 12 p. 10-11 / §10.4 Table 10-2 p. 10-15:
+    // JMP restores incoming NT; outgoing NT and both back links are unchanged.
     for (model, wide) in formats() {
-        let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
-        put(
-            &vm,
-            base(B) + if wide { 0x24 } else { 0x10 },
-            if wide { 4 } else { 2 },
-            0x4203,
-        );
-        cpu.cpu.rflags_system = 0x4000;
-        steps(&mut cpu, &vm, 1);
-        assert_eq!(cpu.cpu.rflags_system & 0x4000, 0);
-        assert!(cpu.cpu.flags.if_ && cpu.cpu.flags.cf);
-        assert_ne!(
-            value(
-                &vm,
-                base(A) + if wide { 0x24 } else { 0x10 },
-                if wide { 4 } else { 2 }
-            ) & 0x4000,
-            0
-        );
+        for incoming_nt in [0, 0x4000] {
+            for outgoing_nt in [0u32, 0x4000] {
+                for through_gate in [false, true] {
+                    let target = if through_gate { GATE } else { B };
+                    let (vm, mut cpu) = setup_tasks(model, wide, &far(false, target));
+                    let flags_offset = if wide { 0x24 } else { 0x10 };
+                    let size = if wide { 4 } else { 2 };
+                    put(&vm, base(B) + flags_offset, size, 0x203 | incoming_nt);
+                    put(&vm, base(A), 2, C.into());
+                    put(&vm, base(B), 2, A.into());
+                    cpu.cpu.rflags_system = outgoing_nt.into();
+                    steps(&mut cpu, &vm, 1);
+                    assert_eq!(cpu.cpu.rflags(), u64::from(0x203 | incoming_nt));
+                    assert_eq!(
+                        value(&vm, base(A) + flags_offset, size) & 0x4000,
+                        u64::from(outgoing_nt)
+                    );
+                    assert_eq!(value(&vm, base(A), 2), u64::from(C));
+                    assert_eq!(value(&vm, base(B), 2), u64::from(A));
+                    assert!(!busy(&vm, A) && busy(&vm, B));
+                    assert_eq!(cpu.cpu.legacy.tr.selector, B);
+                }
+            }
+        }
     }
+}
+
+fn nested_jmp_ping_pong(model: CpuModel, wide: bool) {
+    // 286 PRM App. B SWITCH_TASKS p. B-12; 386 PRM §7.5 step 5 p. 7-8;
+    // SDM Vol 3A §10.3 step 12 p. 10-11 / §10.4 Table 10-2 p. 10-15.
+    // TSS fields: 286 PRM §8.2 Fig. 8-1 pp. 8-2–3;
+    // 386 PRM §7.1 Fig. 7-1 pp. 7-1–3. IRET clears only departing NT.
+    use x86jit_core::legacy::{SegmentCache, SystemSegment};
+
+    const ROUNDS: u32 = 4;
+    fn set_image_field(image: &mut [u8], offset: usize, size: usize, value: u32) {
+        image[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
+    }
+    fn check(
+        cpu: &Vcpu,
+        vm: &Vm,
+        wide: bool,
+        current: u16,
+        ip: u32,
+        flags: u32,
+        registers: [u32; 8],
+    ) {
+        let mut expected = [0; 16];
+        expected[..8].copy_from_slice(&registers.map(u64::from));
+        assert_eq!(cpu.cpu.gpr, expected);
+        assert_eq!(cpu.cpu.rip, u64::from(ip));
+        assert_eq!(cpu.cpu.rflags(), u64::from(flags));
+        assert_eq!(
+            [cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs, cpu.cpu.gs],
+            [CODE, DATA, DATA, DATA, 0, 0]
+        );
+        assert_eq!(cpu.cpu.legacy.ldtr.selector, 0);
+        assert_eq!(cpu.cpu.legacy.cr0, 9);
+        assert_eq!(
+            cpu.cpu.legacy.tr,
+            SystemSegment {
+                selector: current,
+                cache: SegmentCache {
+                    base: base(current) as u32,
+                    limit: if wide { 0x67 } else { 0x2b },
+                    attributes: if wide { 0x8b } else { 0x83 },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        );
+        for (selector, expected_busy, backlink) in
+            [(A, true, C), (B, current == B, A), (C, current == C, B)]
+        {
+            assert_eq!(busy(vm, selector), expected_busy, "selector {selector}");
+            assert_eq!(value(vm, base(selector), 2), u64::from(backlink));
+        }
+    }
+
+    // Also return to a caller whose saved NT is set: IRET restores that image.
+    for caller_nt in [0, 0x4000] {
+        let (vm, mut cpu) = setup_tasks(model, wide, &far(true, GATE));
+        let size = if wide { 4 } else { 2 };
+        let ip_offset = if wide { 0x20 } else { 0x0e };
+        let flags_offset = ip_offset + size;
+        let mut registers = [[0; 8]; 3];
+        let initial_flags = [0x247 | caller_nt, 0x46, 0x803];
+        let mut images = Vec::new();
+        for (index, selector) in [A, B, C].into_iter().enumerate() {
+            for (reg, value) in registers[index].iter_mut().enumerate() {
+                *value = 0x1111 * (index as u32 + 1) + reg as u32 * 0x100;
+                if wide {
+                    *value |= (0x1234 + index as u32) << 16;
+                }
+                if reg == 4 {
+                    *value = 0x8000 + index as u32 * 0x1000;
+                }
+                put(
+                    &vm,
+                    base(selector) + (ip_offset + 2 * size + reg * size) as u64,
+                    size,
+                    *value,
+                );
+            }
+            put(
+                &vm,
+                base(selector) + flags_offset as u64,
+                size,
+                initial_flags[index],
+            );
+            put(&vm, base(selector), 2, [C, C, B][index].into());
+            let mut image = vec![0; if wide { 0x68 } else { 0x2c }];
+            vm.read_bytes(base(selector), &mut image).unwrap();
+            images.push(image);
+        }
+        cpu.cpu.gpr[..8].copy_from_slice(&registers[0].map(u64::from));
+        cpu.cpu.flags.set_flags16(initial_flags[0] as u16);
+        cpu.cpu.rflags_system = caller_nt.into();
+        vm.write_bytes(0x1800, &far(false, C).repeat(ROUNDS as usize))
+            .unwrap();
+        vm.write_bytes(0x1800 + u64::from(5 * ROUNDS), b"\xcf")
+            .unwrap();
+        vm.write_bytes(0x1900, &far(false, B).repeat(ROUNDS as usize))
+            .unwrap();
+        // A stack IRET over this fill cannot masquerade as a task return.
+        vm.write_bytes(0x9000, &[0xa5; 6]).unwrap();
+        let check_images = |images: &[Vec<u8>]| {
+            for (selector, expected) in [A, B, C].into_iter().zip(images) {
+                let mut actual = vec![0; expected.len()];
+                vm.read_bytes(base(selector), &mut actual).unwrap();
+                assert_eq!(&actual, expected, "TSS selector {selector}");
+            }
+        };
+
+        steps(&mut cpu, &vm, 1); // CALL A -> B through the task gate.
+        set_image_field(&mut images[0], ip_offset, size, 0x100b);
+        set_image_field(&mut images[1], 0, 2, A.into());
+        check(&cpu, &vm, wide, B, 0x1800, 0x4046, registers[1]);
+        check_images(&images);
+        for round in 1..=ROUNDS {
+            steps(&mut cpu, &vm, 1); // JMP B -> C saves NT=1 in B.
+            set_image_field(&mut images[1], ip_offset, size, 0x1800 + 5 * round);
+            set_image_field(&mut images[1], flags_offset, size, 0x4046);
+            check(
+                &cpu,
+                &vm,
+                wide,
+                C,
+                0x1900 + 5 * (round - 1),
+                0x803,
+                registers[2],
+            );
+            check_images(&images);
+            steps(&mut cpu, &vm, 1); // JMP C -> B restores NT=1.
+            set_image_field(&mut images[2], ip_offset, size, 0x1900 + 5 * round);
+            check(&cpu, &vm, wide, B, 0x1800 + 5 * round, 0x4046, registers[1]);
+            check_images(&images);
+        }
+        steps(&mut cpu, &vm, 1); // IRET B -> A through B's unchanged back link.
+        set_image_field(&mut images[1], ip_offset, size, 0x1800 + 5 * ROUNDS + 1);
+        set_image_field(&mut images[1], flags_offset, size, 0x46);
+        check(&cpu, &vm, wide, A, 0x100b, initial_flags[0], registers[0]);
+        check_images(&images);
+    }
+}
+
+#[test]
+fn i286_nested_jmp_ping_pong_returns_through_backlink() {
+    nested_jmp_ping_pong(CpuModel::I80286, false);
+}
+
+#[test]
+fn i386_286_tss_nested_jmp_ping_pong_returns_through_backlink() {
+    nested_jmp_ping_pong(CpuModel::I80386, false);
+}
+
+#[test]
+fn i386_386_tss_nested_jmp_ping_pong_returns_through_backlink() {
+    nested_jmp_ping_pong(CpuModel::I80386, true);
 }
 
 #[test]
