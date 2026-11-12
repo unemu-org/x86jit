@@ -19,10 +19,13 @@ impl Backend for NoBackend {
     }
 }
 pub fn setup(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+    setup_delivery(model, code, ExceptionDelivery::Outward)
+}
+pub fn setup_delivery(model: CpuModel, code: &[u8], delivery: ExceptionDelivery) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(0x240000), Box::new(NoBackend));
     vm.map(0, 0x240000, Prot::RWX, RegionKind::Ram).unwrap();
     vm.set_cpu_model(model);
-    vm.set_exception_delivery(ExceptionDelivery::Outward);
+    vm.set_exception_delivery(delivery);
     assert_eq!(vm.execution_profile(), ExecutionProfile::Machine);
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();

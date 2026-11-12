@@ -455,6 +455,11 @@ pub struct CpuState {
     /// changed by selecting a coprocessor (SDM Vol 3A §2.5, Table 2-2;
     /// 80386 PRM Ch. 11 §11.1.3, p. 11-2).
     pub fpu_emulation: bool,
+    /// 80386 PRM §7.1 Fig. 7-1 pp. 7-2–3: static incoming TSS I/O-map base.
+    /// Meaningful only with a 32-bit TSS; bitmap permission checks are deferred.
+    pub task_io_map_base: u16,
+    /// 80386 PRM §12.3.1.5 p. 12-8: incoming TSS T bit awaiting debug support.
+    pub task_debug_trap: u8,
 }
 
 /// Coprocessor policy independent of the CPU model (decision-23 §4).
@@ -644,6 +649,8 @@ impl Default for CpuState {
             legacy: crate::legacy::LegacyCpuState::default(),
             fpu_model: FpuModel::default(),
             fpu_emulation: false,
+            task_io_map_base: 0,
+            task_debug_trap: 0,
         }
     }
 }

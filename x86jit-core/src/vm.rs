@@ -2127,8 +2127,8 @@ impl Vcpu {
     /// Whether a maskable IRQ could be accepted at this boundary.
     /// Independent of whether a vector is queued; does not acknowledge or deliver.
     /// Supported for Application Real16 and Machine I286/I386 execution.
-    /// Pending IN completion and the entire MMIO retry
-    /// (including answered but unfinished transfers) also prevent acceptance.
+    /// Pending IN completion, the entire MMIO retry (including answered but
+    /// unfinished transfers), and Machine task-switch continuations prevent acceptance.
     ///
     /// IF and the STI/SS shadows follow SDM Vol 3A §7.8.1 and §7.8.3;
     /// device-completion blocking follows decision-16 §§1, 4.
@@ -2145,7 +2145,10 @@ impl Vcpu {
     // irq_ready checks that latch explicitly because it can be called during a retry.
     #[inline]
     fn irq_delivery_ready(&self) -> bool {
-        self.cpu.flags.if_
+        self.legacy_execution
+            .as_ref()
+            .is_none_or(|e| !e.task_switch_pending())
+            && self.cpu.flags.if_
             && self.cpu.pending_mmio.is_none()
             && !self.cpu.pending_mmio_write
             && self.cpu.pending_port_in.is_none()

@@ -1,6 +1,7 @@
 //! Legacy system interpreter, selected before the op loop (decision-18 §§1, 4;
 //! spec.md §§8.1, 17). Shared scalar helpers retain their existing flag semantics.
 use super::*;
+pub(crate) mod tasks;
 use crate::legacy::{
     self, ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
     SelectorDestination, SystemRegister,
@@ -336,6 +337,52 @@ thread_local! {
     static DESCRIPTOR_UPDATE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
+fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    address: u32,
+    expected: u64,
+    value: u64,
+) -> Result<u64, Exit> {
+    let linear = u64::from(address);
+    let (physical, _) = legacy::physical_span(cpu, linear, 1);
+    #[cfg(test)]
+    DESCRIPTOR_UPDATE.with(|update| {
+        if let Some((at, replacement)) = update.take() {
+            mem.write(at, replacement, 8).unwrap();
+        }
+    });
+    // SDM Vol 2A §3.3 LTR p. 3-576; Vol 3A §11.1.2.1 p. 11-3;
+    // 386 PRM §7.6.1 p. 7-10: busy/accessed updates follow LOCK semantics.
+    // A byte CAS preserves concurrent edits and is aligned even when
+    // the descriptor table is not. Only the access-rights byte changes.
+    // SDM Vol 3A §3.4.5.1 p. 3-13: descriptor memory may discard
+    // writes. ROM uses the scalar CAS policy; device CAS remains refused.
+    let observed = match mem.atomic_cas(physical, expected, value, 1) {
+        Ok(observed) => observed,
+        // Separate device read/write completions cannot implement CAS.
+        Err(MemTrap::Mmio) => {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyInstruction,
+            ));
+        }
+        Err(trap) => {
+            return Err(
+                match trap_out(cpu, cpu.rip, trap, physical, 1, AccessKind::Write, value)
+                    .into_step()
+                {
+                    StepResult::Exit(exit) => {
+                        crate::fault::qualify_legacy_bus(exit, linear, physical)
+                    }
+                    _ => unreachable!(),
+                },
+            );
+        }
+    };
+    Ok(observed)
+}
+
 fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER>,
@@ -344,42 +391,9 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<bool, Exit> {
     if descriptor.cache.attributes & bit == 0 {
         if let Some(address) = descriptor.access_address {
-            let linear = u64::from(address);
-            let (physical, _) = legacy::physical_span(cpu, linear, 1);
             let expected = u64::from(descriptor.cache.attributes as u8);
             let value = expected | u64::from(bit);
-            #[cfg(test)]
-            DESCRIPTOR_UPDATE.with(|update| {
-                if let Some((at, replacement)) = update.take() {
-                    mem.write(at, replacement, 8).unwrap();
-                }
-            });
-            // SDM Vol 2A §3.3 LTR p. 3-576; Vol 3A §11.1.2.1 p. 11-3;
-            // 386 PRM §7.6.1 p. 7-10: busy/accessed updates follow LOCK semantics.
-            // A byte CAS preserves concurrent edits and is aligned even when
-            // the descriptor table is not. Only the access-rights byte changes.
-            let observed = match mem.atomic_cas(physical, expected, value, 1) {
-                Ok(observed) => observed,
-                // Separate device read/write completions cannot implement CAS.
-                Err(MemTrap::Mmio) => {
-                    return Err(refusal(
-                        cpu,
-                        crate::UnsupportedSystemOperation::LegacyInstruction,
-                    ));
-                }
-                Err(trap) => {
-                    return Err(
-                        match trap_out(cpu, cpu.rip, trap, physical, 1, AccessKind::Write, value)
-                            .into_step()
-                        {
-                            StepResult::Exit(exit) => {
-                                crate::fault::qualify_legacy_bus(exit, linear, physical)
-                            }
-                            _ => unreachable!(),
-                        },
-                    );
-                }
-            };
+            let observed = descriptor_cas(cpu, mem, address, expected, value)?;
             if observed != expected {
                 descriptor.cache.attributes =
                     (descriptor.cache.attributes & !0xff) | observed as u16;
@@ -745,9 +759,15 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     memory: &Memory,
     context: MachineContext,
     event: legacy::LegacyEvent,
+    task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
     let mem = Access::<ROUTED, ORDER>::new(memory);
-    deliver(cpu, mem, context, event)
+    task_switch.committed = false;
+    task_switch.completed = false;
+    if task_switch.context().is_some() {
+        return tasks::resume(cpu, mem, task_switch);
+    }
+    deliver(cpu, mem, context, event, task_switch)
 }
 
 fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
@@ -755,6 +775,7 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER>,
     context: MachineContext,
     event: legacy::LegacyEvent,
+    task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
     // I286 PRM §9.4 Fig. 9-3, Table 9-1 pp. 9-4–6;
     // I386 PRM §§9.5–9.7 pp. 9-6–10; §17 INT pp. 17-70–72 (scan checked).
@@ -787,10 +808,7 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
         return Err(fault(cpu, 11, idt_code));
     }
     if kind == 5 {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
-        ));
+        return tasks::event(cpu, mem, context, (low >> 16) as u16, event, task_switch);
     }
     let cs = (low >> 16) as u16;
     let selector_code = (cs & !3) | ext;
@@ -881,9 +899,10 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER>,
     context: MachineContext,
     event: legacy::LegacyEvent,
+    task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
     if context.regime == legacy::MachineRegime::Protected {
-        return deliver_protected(cpu, mem, context, event);
+        return deliver_protected(cpu, mem, context, event, task_switch);
     }
     let vector = event.vector;
     let saved_ip = event.saved_ip;
@@ -1106,6 +1125,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     memory: &Memory,
     scratch: &mut impl ScratchBuffer,
+    task_switch: &mut tasks::SwitchState,
 ) -> Result<Outcome, Exit> {
     #[cfg(debug_assertions)]
     debug_assert!(
@@ -1131,14 +1151,34 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
         [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
     );
     let mem = Access::<ROUTED, ORDER>::new(memory);
-    let result = walk(
+    task_switch.committed = false;
+    task_switch.completed = false;
+    let mut result = walk(
         ir,
         cpu,
         mem,
         scratch.zeroed(ir.temp_count as usize),
         context,
+        task_switch,
     );
-    if result.is_err() {
+    if task_switch.committed
+        && matches!(
+            result,
+            Err(Exit::UnsupportedSystemContext {
+                operation: crate::UnsupportedSystemOperation::LegacyTaskDebugTrap,
+                ..
+            })
+        )
+    {
+        result = Ok(Outcome {
+            exit: result.err(),
+            retired: true,
+            context_changed: true,
+            preserve_rf: true,
+            ..Outcome::default()
+        });
+    }
+    if result.is_err() && !task_switch.committed {
         cpu.gpr = before.0;
         cpu.flags = before.1;
         cpu.rflags_system = before.2;
@@ -1162,6 +1202,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
     mem: &Access<ROUTED, ORDER>,
     temps: &mut [u64],
     context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
 ) -> Result<Outcome, Exit> {
     // 80386 PRM §14.7 item 8, p. 14-6 (scan checked): sequential
     // execution across FFFFh faults on the next fetch instead of wrapping IP.
@@ -1170,6 +1211,13 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
         retired: true,
         ..Outcome::default()
     };
+    if task_switch.context().is_some() {
+        outcome.suppress_debug = task_switch.suppress_debug();
+        tasks::resume(cpu, mem, task_switch)?;
+        outcome.context_changed = true;
+        outcome.preserve_rf = true;
+        return Ok(outcome);
+    }
     for op in &ir.ops {
         let result = match op {
             IrOp::InsnStart { .. } => None,
@@ -1872,6 +1920,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                     error_code: None,
                                     fault: false,
                                 },
+                                task_switch,
                             )?;
                             // I286 PRM §9.7.1 p. 9-14, Appendix B INT/INTO
                             // p. B-48; 80386 PRM §12.3.1.4 p. 12-8,
@@ -1884,6 +1933,9 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                             // Appendix C item 12, I386 §14.7 item 10, and the
                             // final paragraphs of those single-step sections.
                             outcome.suppress_debug = true;
+                            // 386 PRM §12.3.1.1 p. 12-7 exempts task-switching
+                            // INT from RF clearing, as for JMP and CALL.
+                            outcome.preserve_rf = task_switch.committed;
                             outcome.context_changed = true;
                             return Ok(outcome);
                         }
@@ -1992,6 +2044,27 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                 .unwrap_or_else(|| read_val(cs, temps))
                                 as u16
                         });
+                        if context.regime == legacy::MachineRegime::Protected {
+                            if let Some(cs) = cs {
+                                if tasks::transfer(
+                                    cpu,
+                                    mem,
+                                    context,
+                                    cs,
+                                    if return_ip.is_some() {
+                                        tasks::Cause::Call
+                                    } else {
+                                        tasks::Cause::Jump
+                                    },
+                                    next as u32,
+                                    task_switch,
+                                )? {
+                                    outcome.context_changed = true;
+                                    outcome.preserve_rf = true;
+                                    return Ok(outcome);
+                                }
+                            }
+                        }
                         let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
                             cs.map(|cs| code_descriptor(cpu, mem, cs, false, context.generation))
                                 .transpose()?
@@ -2361,13 +2434,21 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         cpu.write_gpr(5, value, *size);
                     }
                     L::CheckTaskReturn => {
-                        // SDM Vol 3A §10.3; decision-18 §2: NT storage
-                        // does not license a task return or an ordinary IRET.
-                        if cpu.rflags_system & 0x4000 != 0 {
+                        if context.regime == legacy::MachineRegime::Real
+                            && cpu.rflags_system & 0x4000 != 0
+                        {
                             return Err(refusal(
                                 cpu,
                                 crate::UnsupportedSystemOperation::LegacyTaskReturn,
                             ));
+                        }
+                        if context.regime == legacy::MachineRegime::Protected
+                            && cpu.rflags_system & 0x4000 != 0
+                        {
+                            tasks::task_return(cpu, mem, context, next as u32, task_switch)?;
+                            outcome.context_changed = true;
+                            outcome.preserve_rf = true;
+                            return Ok(outcome);
                         }
                     }
                     L::Refuse { operation } => return Err(refusal(cpu, *operation)),
@@ -2557,6 +2638,7 @@ mod delivery_tests {
                             error_code,
                             fault: !matches!(vector, 1 | 3 | 4),
                         },
+                        &mut tasks::SwitchState::default(),
                     )
                     .unwrap();
                     let sp = 0x8000 - u64::from(size) * (3 + u64::from(error_code.is_some()));
@@ -2618,6 +2700,7 @@ mod delivery_tests {
                         external,
                         ..event
                     },
+                    &mut tasks::SwitchState::default(),
                 )
                 .unwrap_err();
                 assert!(matches!(exit, Exit::Exception { vector, .. } if vector == expected));

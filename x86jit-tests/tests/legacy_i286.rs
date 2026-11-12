@@ -309,14 +309,16 @@ fn far_calls_and_returns_use_word_frames_and_preserve_upper_sp() {
 }
 
 #[test]
-fn iret_restores_protected_flags_and_refuses_a_later_task_return_cpu_model() {
-    crate::model_api::with_cpu_model(iret_restores_protected_flags_and_refuses_a_later_task_return);
+fn iret_restores_protected_flags_and_faults_a_task_return_without_tr_cpu_model() {
+    crate::model_api::with_cpu_model(
+        iret_restores_protected_flags_and_faults_a_task_return_without_tr,
+    );
 }
 
 #[test]
-fn iret_restores_protected_flags_and_refuses_a_later_task_return() {
+fn iret_restores_protected_flags_and_faults_a_task_return_without_tr() {
     // PRM §10.1 p. 10-1; Appendix B IRET pp. B-51–52: six-byte frame,
-    // IOPL and NT restored at CPL 0. Task execution remains an engine refusal.
+    // IOPL and NT restored at CPL 0. Task return requires a valid current TSS.
     let (vm, mut cpu) = setup(b"\xcf", true);
     vm.write_bytes(0x8000, b"\x00\x12\x08\x00\x03\x72").unwrap();
     vm.write_bytes(0x1200, b"\x9c\xcf").unwrap();
@@ -330,13 +332,12 @@ fn iret_restores_protected_flags_and_refuses_a_later_task_return() {
     steps(&mut cpu, &vm, 1);
     assert_eq!(bytes(&vm, 0x8004, 2), b"\x03\x72");
     let before = format!("{:?}", cpu.cpu);
-    assert!(matches!(
-        cpu.run(&vm, Some(1)),
-        Exit::UnsupportedSystemContext {
-            operation: UnsupportedSystemOperation::LegacyTaskReturn,
-            ..
-        }
-    ));
+    let exit = cpu.run(&vm, Some(1));
+    assert!(matches!(exit, Exit::Exception { vector: 10, .. }));
+    assert_eq!(
+        exit.fault_metadata().unwrap().error_code(),
+        x86jit_core::fault::ErrorCode::bits(0, 0xffff)
+    );
     assert_eq!(format!("{:?}", cpu.cpu), before);
 }
 

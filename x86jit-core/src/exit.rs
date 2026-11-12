@@ -56,6 +56,8 @@ pub enum UnsupportedSystemOperation {
     LegacyLdtSelector,
     LegacyGateOrTaskTransfer,
     LegacyPrivilegeTransition,
+    LegacyTaskPaging,
+    LegacyTaskDebugTrap,
 }
 
 /// Reason `run()` returned control to the user (§5.2).

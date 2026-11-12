@@ -195,24 +195,24 @@ fn gate_selector_rpl_is_ignored_and_accessed_bit_is_set() {
 }
 
 #[test]
-fn i286_rejects_i386_gates_and_task_gates_stay_typed() {
-    use x86jit_core::UnsupportedSystemOperation;
+fn i286_rejects_i386_gates_and_task_gates_validate_the_target_tss() {
+    // 286 PRM App. B INT pp. B-49–50; 386 PRM §17 INT p. 17-72:
+    // the SDM's conflicting Tables 7-6/10-1 cannot settle #GP versus #TS:
+    // the gate target is a code descriptor, so no task switch takes place.
     for generation in [CpuGeneration::I286, CpuGeneration::I386] {
         let (vm, mut cpu) = setup(generation, b"\xcd\x30");
         gate(&vm, 0x30, 0x85, 0x1800);
-        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert!(
-            matches!(
-                run.stop(),
-                StepStop::Exit(Exit::UnsupportedSystemContext {
-                    operation: UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
-                    ..
-                })
-            ),
-            "{:?}",
-            run.stop()
+        outward(
+            &mut cpu,
+            &vm,
+            if generation == CpuGeneration::I286 {
+                13
+            } else {
+                10
+            },
+            Some(8),
         );
-        assert_eq!((run.steps(), cpu.cpu.gpr[4]), (0, 0x8000));
+        assert_eq!(cpu.cpu.gpr[4], 0x8000);
         if generation == CpuGeneration::I286 {
             for kind in [0x8e, 0x8f] {
                 gate(&vm, 0x30, kind, 0x1800);

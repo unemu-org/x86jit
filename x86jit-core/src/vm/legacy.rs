@@ -64,6 +64,7 @@ enum EventSource {
 }
 #[derive(Clone, Copy)]
 struct PendingEvent {
+    irq_consumed: bool,
     source: EventSource,
     ip: u32,
     cs: u16,
@@ -107,6 +108,7 @@ pub(super) struct Execution {
     contexts: HashMap<LegacyContextStamp, RetainedContext>,
     blocks: HashMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
+    task_switch: crate::interp::legacy::tasks::SwitchState,
     #[cfg(test)]
     lifts: u64,
     // Accepted event delivery can itself hand off an MMIO transfer. Its retry
@@ -131,6 +133,7 @@ impl Execution {
             contexts: HashMap::new(),
             blocks: HashMap::new(),
             instruction_retry: None,
+            task_switch: Default::default(),
             #[cfg(test)]
             lifts: 0,
             event_retry: None,
@@ -141,6 +144,7 @@ impl Execution {
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
+        self.task_switch.reset();
         self.port_debug = false;
         self.shutdown = false;
         self.instruction_retry = None;
@@ -148,8 +152,13 @@ impl Execution {
     pub(super) fn is_shutdown(&self) -> bool {
         self.shutdown
     }
+    pub(super) fn task_switch_pending(&self) -> bool {
+        self.task_switch.context().is_some()
+    }
     pub(super) fn has_continuation(&self) -> bool {
-        self.instruction_retry.is_some() || self.event_retry.is_some()
+        self.instruction_retry.is_some()
+            || self.event_retry.is_some()
+            || self.task_switch.context().is_some()
     }
     fn invalidate_translations(&mut self) {
         self.blocks.clear();
@@ -205,6 +214,11 @@ impl Execution {
         model: LegacyCpuModel,
         context: MachineContext,
     ) -> Result<Arc<IrBlock>, Exit> {
+        if self.task_switch.context().is_some() {
+            if let Some(retry) = &self.instruction_retry {
+                return Ok(retry.ir.clone());
+            }
+        }
         let linear_fetch = crate::legacy::access(
             cpu,
             context.generation,
@@ -349,6 +363,16 @@ fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Ex
 impl Vcpu {
     pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
+        if let Some(context) = self
+            .legacy_execution
+            .as_ref()
+            .and_then(|e| e.task_switch.context_for(&self.cpu))
+        {
+            return Ok(context);
+        }
+        if self.cpu.task_debug_trap != 0 {
+            return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyTaskDebugTrap));
+        }
         let context = derive_legacy_context(model, &self.cpu).map_err(|e| {
             Exit::UnsupportedSystemContext {
                 addr: self.cpu.rip,
@@ -376,6 +400,28 @@ impl Vcpu {
         options: StepOptions,
         stepped: bool,
     ) -> Result<StepRun, StepRunError> {
+        // Decision-24: edited state abandons the entire owned operation before
+        // entry validation can reject its deliberately unfinished segment caches.
+        // A zero-budget probe leaves continuations and completion inputs intact.
+        if limit != Some(0)
+            && self
+                .legacy_execution
+                .as_mut()
+                .unwrap()
+                .task_switch
+                .abandon_if_changed(&self.cpu)
+        {
+            self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+            self.abandon_legacy_event();
+            self.cpu.clear_mmio_parts();
+            self.cpu.pending_mmio = None;
+            self.cpu.pending_mmio_write = false;
+            self.cpu.mmio_parts_len = 0;
+            self.cpu.mmio_parts_rip = 0;
+            self.cpu.mmio_retry_active = false;
+            self.cpu.mmio_retry_cs = 0;
+            self.apply_pending_a20();
+        }
         if let Err(exit) = self.legacy_context_for_run() {
             return Ok(StepRun {
                 steps: 0,
@@ -400,14 +446,15 @@ impl Vcpu {
             self.cpu.clear_mmio_parts();
         }
         let execution = self.legacy_execution.as_mut().unwrap();
-        if !self.cpu.mmio_retry_active {
+        if !self.cpu.mmio_retry_active && execution.task_switch.context().is_none() {
             execution.instruction_retry = None;
         }
-        if execution
-            .event_retry
-            .is_some_and(|event| u64::from(event.ip) != self.cpu.rip || event.cs != self.cpu.cs)
-        {
-            execution.event_retry = None;
+        if execution.event_retry.is_some_and(|event| {
+            (u64::from(event.ip) != self.cpu.rip || event.cs != self.cpu.cs)
+                && execution.task_switch.context().is_none()
+        }) {
+            self.release_legacy_event_boundary();
+            self.apply_pending_a20();
         }
         if stepped && self.cpu.pending_port_in.is_some() {
             return Err(StepRunError::PendingPortIn);
@@ -468,10 +515,27 @@ impl Vcpu {
             StepStop::Exit(exit) => Some(exit),
             StepStop::IrqReady => None,
         });
-        if !cpu.cpu.mmio_retry_active {
+        if !cpu.cpu.mmio_retry_active
+            && cpu
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .task_switch
+                .context()
+                .is_none()
+        {
             cpu.legacy_execution.as_mut().unwrap().instruction_retry = None;
         }
         cpu.apply_pending_a20();
+        if let StepStop::Exit(exit) = &result.stop {
+            // Retry bookkeeping above is engine-owned. Seal the state actually
+            // returned to the embedder, allowing only this exit's completion.
+            cpu.legacy_execution
+                .as_mut()
+                .unwrap()
+                .task_switch
+                .seal_exit(&cpu.cpu, exit);
+        }
         drop(dispatch);
         self.time_outside = time_run.finish(match &result.stop {
             StepStop::Exit(exit) => Some(exit),
@@ -483,7 +547,7 @@ impl Vcpu {
     fn deliver_legacy_event<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
-        context: MachineContext,
+        mut context: MachineContext,
         mut event: PendingEvent,
     ) -> Result<(), Exit> {
         // Decision-23 §5: processor exceptions can be exposed without delivery.
@@ -491,7 +555,7 @@ impl Vcpu {
             && self.exception_delivery == crate::ExceptionDelivery::Outward
             && matches!(event.source, EventSource::SingleStep)
         {
-            self.legacy_execution.as_mut().unwrap().event_retry = None;
+            self.release_legacy_event_boundary();
             let mut metadata = crate::fault::FaultMetadata::architectural_exception(
                 self.cpu.rip,
                 u64::from(event.ip),
@@ -537,20 +601,49 @@ impl Vcpu {
                 &vm.mem,
                 context,
                 delivery,
+                &mut self.legacy_execution.as_mut().unwrap().task_switch,
             ) {
                 Ok(()) => break,
                 Err(exit) => {
+                    let committed = self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .task_switch
+                        .committed;
+                    if committed {
+                        // Commit transfers ownership to the task continuation.
+                        // A fresh IRQ queued during a later handoff stays queued.
+                        self.consume_legacy_irq(&mut event);
+                        context = crate::interp::legacy::tasks::fault_context(
+                            &self.cpu,
+                            context.generation,
+                        );
+                        event.ip = self.cpu.rip as u32;
+                        event.cs = self.cpu.cs;
+                    }
                     self.cpu.finish_mmio_retry(Some(&exit));
-                    // Only a resumable bus transfer keeps the event continuation;
-                    // an architectural fault abandons it, so IF is consulted again
-                    // and a queued A20 change applies (xj-srh.20).
-                    self.legacy_execution.as_mut().unwrap().event_retry = matches!(
-                        &exit,
-                        Exit::MmioRead { .. }
-                            | Exit::MmioWrite { .. }
-                            | Exit::UnmappedMemory { .. }
-                    )
+                    // An accepted event owns its continuation through every
+                    // bus handoff and engine refusal, until completion or fault.
+                    let execution = self.legacy_execution.as_mut().unwrap();
+                    execution.event_retry = (execution.task_switch.context().is_some()
+                        || matches!(
+                            &exit,
+                            Exit::MmioRead { .. }
+                                | Exit::MmioWrite { .. }
+                                | Exit::UnmappedMemory { .. }
+                        ))
                     .then_some(event);
+                    let completed = execution.task_switch.completed;
+                    if execution.event_retry.is_none() {
+                        // A nonresumable exit releases the abandoned boundary,
+                        // including inhibition inherited from STI/MOV/POP SS.
+                        self.release_legacy_event_boundary();
+                    }
+                    if completed {
+                        self.finish_legacy_event(event, Some(&exit));
+                        return Err(exit);
+                    }
                     if !matches!(exit, Exit::Exception { .. }) {
                         // Accepted delivery owns its inputs through bus handoffs.
                         return Err(exit);
@@ -563,11 +656,7 @@ impl Vcpu {
                         // pending IRQ stays queued for the next IF check.
                         return Err(exit);
                     }
-                    if let EventSource::Irq(irq) = event.source {
-                        if self.pending_irq == Some(irq) {
-                            self.pending_irq = None;
-                        }
-                    }
+                    self.consume_legacy_irq(&mut event);
                     if self.exception_delivery == crate::ExceptionDelivery::Outward {
                         return Err(exit);
                     }
@@ -575,36 +664,68 @@ impl Vcpu {
                     // I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8,
                     // Tables 9-3/9-4 p. 9-13 (scan checked): delivery of #DF
                     // that faults stops the processor until reset.
-                    if matches!(event.source, EventSource::Exception { vector: 8, .. }) {
+                    if !committed
+                        && matches!(event.source, EventSource::Exception { vector: 8, .. })
+                    {
                         self.legacy_execution.as_mut().unwrap().shutdown = true;
                         return Err(Exit::Shutdown { addr: self.cpu.rip });
                     }
-                    event.source = if double_fault(context.generation, event.source, next) {
-                        EventSource::Exception {
-                            vector: 8,
-                            error_code: Some(0),
-                        }
-                    } else {
-                        next
-                    };
+                    // 286 PRM §9.6.4 p. 9-11; 386 PRM §7.5 p. 7-8:
+                    // descriptor faults after a task switch start a new task's
+                    // exception, rather than combining with the old task's event.
+                    event.source =
+                        if !committed && double_fault(context.generation, event.source, next) {
+                            EventSource::Exception {
+                                vector: 8,
+                                error_code: Some(0),
+                            }
+                        } else {
+                            next
+                        };
                 }
             }
         }
-        self.legacy_execution.as_mut().unwrap().event_retry = None;
-        if let EventSource::Irq(vector) = event.source {
-            if self.pending_irq == Some(vector) {
-                self.pending_irq = None;
+        self.finish_legacy_event(event, None);
+        Ok(())
+    }
+
+    fn consume_legacy_irq(&mut self, event: &mut PendingEvent) {
+        if !event.irq_consumed {
+            if let EventSource::Irq(vector) = event.source {
+                if self.pending_irq == Some(vector) {
+                    self.pending_irq = None;
+                }
+                event.irq_consumed = true;
             }
         }
+    }
+
+    fn release_legacy_event_boundary(&mut self) {
+        // Decision-24: an abandoned event owns no future inhibition or trap.
+        // Clear private boundary state; architectural TF belongs to CpuState.
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.event_retry = None;
+        execution.port_debug = false;
         self.sti_shadow = false;
         self.ss_shadow = false;
-        self.cpu.finish_mmio_retry(None);
+    }
+
+    fn abandon_legacy_event(&mut self) {
+        if let Some(mut event) = self.legacy_execution.as_mut().unwrap().event_retry.take() {
+            self.consume_legacy_irq(&mut event);
+        }
+        self.release_legacy_event_boundary();
+    }
+
+    fn finish_legacy_event(&mut self, mut event: PendingEvent, exit: Option<&Exit>) {
+        self.consume_legacy_irq(&mut event);
+        self.release_legacy_event_boundary();
+        self.cpu.finish_mmio_retry(exit);
         self.apply_pending_a20();
         self.legacy_execution
             .as_mut()
             .unwrap()
             .sync(&self.cpu, self.legacy_model.unwrap(), true);
-        Ok(())
     }
 
     fn route_legacy_exception<const ROUTED: bool, const ORDER: u8>(
@@ -626,6 +747,7 @@ impl Vcpu {
             vm,
             context,
             PendingEvent {
+                irq_consumed: false,
                 source,
                 ip: exit
                     .fault_metadata()
@@ -648,6 +770,11 @@ impl Vcpu {
             let stop = if limit.is_some_and(|limit| steps >= limit) {
                 Some(Exit::BudgetExhausted)
             } else if !self.cpu.mmio_retry_active
+                && !self
+                    .legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .task_switch_pending()
                 && self.cpu.pending_port_in.is_none()
                 && self.cpu.pending_mmio.is_none()
                 && !self.cpu.pending_mmio_write
@@ -688,12 +815,18 @@ impl Vcpu {
                     }
                 }
             };
-            if self.legacy_execution.as_ref().unwrap().port_debug
+            if !self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .task_switch_pending()
+                && self.legacy_execution.as_ref().unwrap().port_debug
                 && self.cpu.pending_port_in.is_none()
                 && self.cpu.port_string_in.is_none()
             {
                 self.legacy_execution.as_mut().unwrap().port_debug = false;
                 self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
+                    irq_consumed: false,
                     source: EventSource::SingleStep,
                     ip: self.cpu.rip as u32,
                     cs: self.cpu.cs,
@@ -708,6 +841,7 @@ impl Vcpu {
                     self.pending_irq
                         .filter(|_| self.irq_delivery_ready() && !self.cpu.mmio_retry_active)
                         .map(|vector| PendingEvent {
+                            irq_consumed: false,
                             source: EventSource::Irq(vector),
                             ip: self.cpu.rip as u32,
                             cs: self.cpu.cs,
@@ -754,12 +888,19 @@ impl Vcpu {
             };
             // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
             // sample TF before execution, including POPF/IRET that change it.
-            let single_step = self.cpu.rflags_system & 0x100 != 0;
+            let single_step = self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .task_switch
+                .single_step()
+                .unwrap_or(self.cpu.rflags_system & 0x100 != 0);
             match crate::interp::legacy::execute::<ROUTED, ORDER>(
                 &ir,
                 &mut self.cpu,
                 &vm.mem,
                 &mut self.interp_scratch,
+                &mut self.legacy_execution.as_mut().unwrap().task_switch,
             ) {
                 Ok(outcome) => {
                     steps += 1;
@@ -793,6 +934,7 @@ impl Vcpu {
                             self.legacy_execution.as_mut().unwrap().port_debug = true;
                         } else {
                             let event = PendingEvent {
+                                irq_consumed: false,
                                 source: EventSource::SingleStep,
                                 ip: self.cpu.rip as u32,
                                 cs: self.cpu.cs,
@@ -823,7 +965,15 @@ impl Vcpu {
                     // An architectural fault abandons this attempt before it is
                     // returned to the embedder; only resumable transfers keep IR.
                     self.cpu.finish_mmio_retry(Some(&exit));
-                    if self.cpu.mmio_retry_active {
+                    if self.cpu.mmio_retry_active
+                        || self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .task_switch
+                            .context()
+                            .is_some()
+                    {
                         self.legacy_execution.as_mut().unwrap().instruction_retry =
                             Some(InstructionRetry {
                                 stamp: LegacyContextStamp::new(&self.cpu, model),
@@ -836,6 +986,20 @@ impl Vcpu {
                         self.apply_pending_a20();
                     }
                     if matches!(exit, Exit::Exception { .. }) {
+                        let context = if self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .task_switch
+                            .committed
+                        {
+                            crate::interp::legacy::tasks::fault_context(
+                                &self.cpu,
+                                context.generation,
+                            )
+                        } else {
+                            context
+                        };
                         match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
                             Ok(()) => continue,
                             Err(exit) => {
@@ -860,6 +1024,46 @@ impl Vcpu {
 #[allow(deprecated)] // Compatibility selector witnesses.
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirected_event_discards_every_private_boundary_before_fetch() {
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x2000, crate::Prot::RWX, crate::RegionKind::Ram)
+                .unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+            cpu.cpu.rip = 0x3000;
+            cpu.cpu.flags.if_ = true;
+            cpu.sti_shadow = true;
+            cpu.ss_shadow = true;
+            let execution = cpu.legacy_execution.as_mut().unwrap();
+            execution.port_debug = true;
+            execution.event_retry = Some(PendingEvent {
+                irq_consumed: false,
+                source: EventSource::SingleStep,
+                ip: 0x1000,
+                cs: 0,
+            });
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0, "{:?}", run.stop());
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::UnmappedMemory { addr: 0x3000, .. })
+                ),
+                "{:?}",
+                run.stop()
+            );
+            assert!(!cpu.sti_shadow);
+            assert!(!cpu.ss_shadow);
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert!(!execution.port_debug);
+            assert!(execution.event_retry.is_none());
+            assert!(cpu.irq_ready());
+        }
+    }
 
     #[test]
     fn double_fault_classes_follow_each_generation() {
@@ -1053,6 +1257,31 @@ mod tests {
             assert!(execution.contexts.len() <= MAX_RETAINED_CONTEXTS);
             assert!(execution.blocks.len() <= MAX_RETAINED_CONTEXTS * 2);
         }
+    }
+
+    #[test]
+    fn task_register_and_ldtr_separate_retained_context_namespaces() {
+        let (vm, mut cpu) = pe_transition_loop();
+        let model = cpu.legacy_model.unwrap();
+        let mut execution = Execution::new();
+        let original = cache_context(&mut execution, &vm, &mut cpu.cpu, model, 0);
+        let original_id = execution.context_id;
+        let before = cpu.cpu.legacy;
+        cpu.cpu.legacy.tr.selector = 24;
+        cpu.cpu.legacy.tr.cache.base = 0x4000;
+        let task = cache_context(&mut execution, &vm, &mut cpu.cpu, model, 0);
+        assert_ne!(execution.context_id, original_id);
+        assert!(!Arc::ptr_eq(&original[0], &task[0]));
+        let task_id = execution.context_id;
+        cpu.cpu.legacy.ldtr.selector = 32;
+        cpu.cpu.legacy.ldtr.cache.base = 0x5000;
+        let ldt = cache_context(&mut execution, &vm, &mut cpu.cpu, model, 0);
+        assert_ne!(execution.context_id, task_id);
+        assert!(!Arc::ptr_eq(&task[0], &ldt[0]));
+        cpu.cpu.legacy = before;
+        let returned = cache_context(&mut execution, &vm, &mut cpu.cpu, model, 0);
+        assert_eq!(execution.context_id, original_id);
+        assert!(Arc::ptr_eq(&original[0], &returned[0]));
     }
 
     fn pe_transition_loop() -> (Vm, Vcpu) {

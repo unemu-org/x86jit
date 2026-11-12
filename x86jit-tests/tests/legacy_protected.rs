@@ -716,33 +716,31 @@ fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary() {
 }
 
 #[test]
-fn iret_refuses_task_and_v86_before_changing_the_frame_cpu_model() {
-    crate::model_api::with_cpu_model(iret_refuses_task_and_v86_before_changing_the_frame);
+fn iret_checks_task_return_and_refuses_v86_before_changing_the_frame_cpu_model() {
+    crate::model_api::with_cpu_model(
+        iret_checks_task_return_and_refuses_v86_before_changing_the_frame,
+    );
 }
 
 #[test]
-fn iret_refuses_task_and_v86_before_changing_the_frame() {
+fn iret_checks_task_return_and_refuses_v86_before_changing_the_frame() {
     // Decision-18 §2; SDM Vol 2A §3.3 IRET; PRM §17 pp. 17-74, 17-78.
     let (vm, mut cpu) = setup(b"\xcf", true, false);
     descriptor(&vm, 8, 0, 0xffff, 0x9a);
-    for (current, image, operation) in [
-        (0x4000, 2, UnsupportedSystemOperation::LegacyTaskReturn),
-        (
-            0,
-            0x20002,
-            UnsupportedSystemOperation::InvalidLegacyContext(
-                x86jit_core::MachineContextError::Virtual8086Unsupported,
-            ),
+    cpu.cpu.rflags_system = 0x4000;
+    fault(&mut cpu, &vm, 10, 0); // IRET requires a current TSS/back link.
+    cpu.cpu.rflags_system = 0;
+    vm.write_bytes(0x8000, b"\x00\x12\x00\x00\x08\x00\x00\x00")
+        .unwrap();
+    vm.write_bytes(0x8008, &0x20002u32.to_le_bytes()).unwrap();
+    refused(
+        &mut cpu,
+        &vm,
+        UnsupportedSystemOperation::InvalidLegacyContext(
+            x86jit_core::MachineContextError::Virtual8086Unsupported,
         ),
-    ] {
-        let image: u32 = image;
-        cpu.cpu.rflags_system = current;
-        vm.write_bytes(0x8000, b"\x00\x12\x00\x00\x08\x00\x00\x00")
-            .unwrap();
-        vm.write_bytes(0x8008, &image.to_le_bytes()).unwrap();
-        refused(&mut cpu, &vm, operation);
-        assert_eq!(value(&vm, 0x200d, 1), 0x9a);
-    }
+    );
+    assert_eq!(value(&vm, 0x200d, 1), 0x9a);
 }
 
 #[test]

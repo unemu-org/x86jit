@@ -67,6 +67,7 @@ that changes.
 | `cache::cache_hash` | Local integer hasher for shared translation keys; guest address keys use no HashDoS protection (§9.1) |
 | `cache::cache_shards` | Sixteen independent reader maps; map mutations take spans → publication gate → all shards → lifetime registry; slot fills omit shards (§9.1, §10) |
 | `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
+| `interp::legacy::tasks` | Machine interpreter hardware task switches, 286/386 TSS images, task gates and descriptor-load continuations (spec.md §17; decision-24 proposal records source conflicts) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop; 48 KiB two-way private compiled cache with epoch/MXCSR flushes (§2, §9.2) |
 
 ## Data flow
