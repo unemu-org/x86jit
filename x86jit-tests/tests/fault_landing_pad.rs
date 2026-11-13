@@ -20,7 +20,9 @@ static CLASSIFIER_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 // SAFETY: forward all allocation operations unchanged to the system allocator.
 unsafe impl std::alloc::GlobalAlloc for ClassifierAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if IN_CLASSIFIER.load(Ordering::Relaxed) {
+        // Only this thread's handler window counts; `try_with` keeps an allocation
+        // during thread teardown from touching a destroyed slot.
+        if IN_CLASSIFIER.try_with(|flag| flag.get()).unwrap_or(false) {
             CLASSIFIER_ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
         std::alloc::System.alloc(layout)

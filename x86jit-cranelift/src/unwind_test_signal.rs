@@ -133,7 +133,14 @@ mod freebsd_arm64 {
     }
 }
 pub static LEGACY_CLASSIFIER: AtomicBool = AtomicBool::new(false);
-pub static IN_CLASSIFIER: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+    /// Set while this thread's handler classifies a fault. Per thread, because other
+    /// threads keep running meanwhile: the JIT's maintenance thread allocates as it
+    /// starts, and a process-wide flag counted those allocations as the handler's.
+    /// Constant-initialized with no destructor, so access from the handler neither
+    /// allocates nor registers anything.
+    pub static IN_CLASSIFIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub static SIMD_SLOTS: AtomicUsize = AtomicUsize::new(0);
 pub static LR_CHANGED: AtomicBool = AtomicBool::new(false);
 pub static ACCESS_FAULTS: AtomicUsize = AtomicUsize::new(0);
@@ -471,7 +478,7 @@ pub fn esr_fault_kind(esr: u32) -> HostFaultKind {
 extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // SAFETY: this test installs SA_SIGINFO only in children, with live handles.
     unsafe {
-        IN_CLASSIFIER.store(true, Ordering::Relaxed);
+        IN_CLASSIFIER.with(|flag| flag.set(true));
         let kind = fault_kind(signal, (*info).si_code);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let kind = if kind == HostFaultKind::Unsupported {
@@ -498,10 +505,10 @@ extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: 
                 fault_context::extract(signal, &*info, context),
             )
         {
-            IN_CLASSIFIER.store(false, Ordering::Relaxed);
+            IN_CLASSIFIER.with(|flag| flag.set(false));
             return;
         }
-        IN_CLASSIFIER.store(false, Ordering::Relaxed);
+        IN_CLASSIFIER.with(|flag| flag.set(false));
         // Restore default and return: the synchronous instruction faults again.
         libc::signal(signal, libc::SIG_DFL);
         if kind == HostFaultKind::Unsupported {
