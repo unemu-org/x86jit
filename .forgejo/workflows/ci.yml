@@ -70,9 +70,10 @@ jobs:
           set -o pipefail
           nix develop --command rustc --version 2>&1 | tee ci-logs/devshell.log
 
-      # Restore compiled dependencies (unicorn-engine, cranelift, …) and the cargo
-      # registry. Keyed on the toolchain pin (flake.lock) and Cargo.lock; source-only
-      # commits keep the same key, so only the workspace crates recompile. Saved by
+      # Restore the cargo registry and git sources. Keyed on the toolchain pin
+      # (flake.lock) and the workspace Cargo.lock only, so source-only commits keep the
+      # same key. `target` is not cached: an entry with it was 2-5 GB, a new ci/*
+      # branch did not restore one, and the entries filled the runner's disk. Saved by
       # the matching step near the end, also when the job is red.
       - name: Restore cargo cache
         id: cargo_cache
@@ -82,8 +83,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-x86_64-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-x86_64-${{ hashFiles('flake.lock') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-x86_64-${{ hashFiles('flake.lock') }}-
 
       # The 80286 corpus is the only hardware-captured oracle here — real silicon, not
@@ -211,8 +211,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-x86_64-${{ hashFiles('flake.lock') }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-x86_64-${{ hashFiles('flake.lock') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Save 80286 corpus cache
         if: ${{ always() && steps.corpus.outcome == 'success' && steps.corpus_cache.outputs.cache-hit != 'true' }}
