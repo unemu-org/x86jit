@@ -90,6 +90,46 @@ pub struct MachineContext {
     pub paging_enabled: bool,
 }
 
+// Frozen compatibility catalogue entry (decision-23 §6). Its decoder and
+// low-word data-limit policy remain those of the Real16 lowering.
+pub(crate) struct AliasProfile {
+    pub context: MachineContext,
+    pub exception_delivery: ExceptionDelivery,
+}
+pub(crate) const REAL16_ALIAS: AliasProfile = AliasProfile {
+    context: MachineContext {
+        segment_class: SegmentClass::Direct,
+        generation: CpuGeneration::I286,
+        regime: MachineRegime::Real,
+        default_operand_bits: 16,
+        default_address_bits: 16,
+        stack_address_bits: 16,
+        cpl: 0,
+        paging_enabled: false,
+    },
+    exception_delivery: ExceptionDelivery::InGuest,
+};
+
+impl AliasProfile {
+    // Decision-23 §6: visible selectors are the authority between alias runs.
+    // Cache image: SDM Vol 3A §§3.4.3, 12.9.2.
+    pub(crate) fn derive_caches(&self, cpu: &mut CpuState) {
+        let selectors = [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs];
+        for (i, cache) in cpu.legacy.segments.iter_mut().enumerate() {
+            *cache = SegmentCache {
+                base: u32::from(selectors[i]) << 4,
+                limit: 0xffff,
+                attributes: if i == SegmentId::Cs as usize {
+                    0x9b
+                } else {
+                    0x93
+                },
+                ..SegmentCache::default()
+            };
+        }
+    }
+}
+
 /// Invalid storage or a context outside the selected generation/engine scope.
 /// These are configuration refusals, not synthesized guest exceptions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -30,16 +30,7 @@ impl LiftBuffer for Ops {
 }
 
 pub(crate) fn alias_context() -> MachineContext {
-    MachineContext {
-        segment_class: crate::SegmentClass::Direct,
-        generation: crate::CpuGeneration::I286,
-        regime: crate::MachineRegime::Real,
-        default_operand_bits: 16,
-        default_address_bits: 16,
-        stack_address_bits: 16,
-        cpl: 0,
-        paging_enabled: false,
-    }
+    crate::legacy::REAL16_ALIAS.context
 }
 
 pub(crate) fn shared_family(insn: &Instruction) -> bool {
@@ -369,7 +360,10 @@ pub(crate) fn instruction(
                 operation: crate::UnsupportedSystemOperation::LegacyInstruction,
             }));
         }
-        defer_store_flags(&mut ops.values, &mut tg);
+    }
+    defer_store_flags(&mut ops.values, &mut tg);
+    if context.segment_class == crate::SegmentClass::Checked && rollback_required(&ops.values) {
+        ops.values.insert(1, IrOp::Legacy(L::Checkpoint));
     }
     Ok(IrBlock {
         mode,
@@ -380,6 +374,71 @@ pub(crate) fn instruction(
         ops: ops.values,
         legacy_context: Some(context),
     })
+}
+
+// spec.md §16: only a fault after a CPU-state commit needs rollback. Helper
+// transactions retain their own memory evidence and task partial-commit rules.
+fn rollback_required(ops: &[IrOp]) -> bool {
+    let mut committed = false;
+    for op in ops {
+        let faultable = matches!(
+            op,
+            IrOp::Load { .. }
+                | IrOp::Store { .. }
+                | IrOp::AtomicRmw { .. }
+                | IrOp::Div { .. }
+                | IrOp::Trap { .. }
+                | IrOp::BoundGate { .. }
+                | IrOp::SegLimitCheck { .. }
+                | IrOp::X87 { .. }
+                | IrOp::Jump { .. }
+                | IrOp::Branch { .. }
+                | IrOp::Legacy(_)
+        );
+        if committed && faultable {
+            return true;
+        }
+        committed |= match op {
+            IrOp::WriteReg { .. }
+            | IrOp::Bcd { .. }
+            | IrOp::Bt { .. }
+            | IrOp::SetIf { .. }
+            | IrOp::SetDf { .. }
+            | IrOp::SetCf { .. }
+            | IrOp::Lahf
+            | IrOp::Sahf => true,
+            IrOp::Add { set_flags, .. }
+            | IrOp::Adc { set_flags, .. }
+            | IrOp::Sub { set_flags, .. }
+            | IrOp::Sbb { set_flags, .. }
+            | IrOp::And { set_flags, .. }
+            | IrOp::Or { set_flags, .. }
+            | IrOp::Xor { set_flags, .. }
+            | IrOp::Shl { set_flags, .. }
+            | IrOp::Shr { set_flags, .. }
+            | IrOp::Sar { set_flags, .. }
+            | IrOp::Rol { set_flags, .. }
+            | IrOp::Ror { set_flags, .. }
+            | IrOp::Rcl { set_flags, .. }
+            | IrOp::Rcr { set_flags, .. }
+            | IrOp::DoubleShift { set_flags, .. }
+            | IrOp::Mul { set_flags, .. } => *set_flags != FlagMask::NONE,
+            IrOp::Legacy(op) => !matches!(
+                op,
+                L::Address { .. }
+                    | L::DirectStackAddress { .. }
+                    | L::ReadSelector { .. }
+                    | L::ReadControl { .. }
+                    | L::ReadSystemSegment { .. }
+                    | L::SharedWalk
+                    | L::Checkpoint
+                    | L::Bound { .. }
+                    | L::CheckTaskReturn
+            ),
+            _ => false,
+        };
+    }
+    false
 }
 
 pub(super) fn direct_address(
@@ -459,7 +518,7 @@ fn direct_addresses(ops: &mut Vec<IrOp>, tg: &mut TempGen, context: MachineConte
 }
 
 // Scalar RMW lowering computes its result before the store. Recompute only the
-// flag image after that store succeeds, so a Direct scalar needs no rollback
+// flag image after that store succeeds, so a scalar needs no rollback
 // snapshot (spec.md §16, fault atomicity).
 fn defer_store_flags(ops: &mut Vec<IrOp>, tg: &mut TempGen) {
     let Some(store) = ops.iter().rposition(|op| matches!(op, IrOp::Store { .. })) else {
@@ -1610,4 +1669,73 @@ pub(super) fn lower(
             | Lgs
     ) || (insn.mnemonic() == Mov && insn.op0_register().is_segment_register())
         || (insn.mnemonic() == Pop && insn.op0_register().is_segment_register()))
+}
+
+#[cfg(test)]
+mod restartability_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_mark_follows_lowering_order_in_checked_and_direct_contexts() {
+        let cpu = crate::CpuState::legacy_real_entry([0; 6]);
+        let context = crate::legacy::derive_legacy_context(
+            crate::LegacyCpuModel {
+                generation: crate::CpuGeneration::I386,
+                model_semantics_id: 0,
+            },
+            &cpu,
+        )
+        .unwrap();
+        for class in [crate::SegmentClass::Direct, crate::SegmentClass::Checked] {
+            for code in [
+                &b"\x01\x06\x00\x20"[..],     // ADD [2000h],AX
+                &b"\x11\x06\x00\x20"[..],     // ADC [2000h],AX
+                &b"\x19\x06\x00\x20"[..],     // SBB [2000h],AX
+                &b"\x29\x06\x00\x20"[..],     // SUB [2000h],AX
+                &b"\x09\x06\x00\x20"[..],     // OR [2000h],AX
+                &b"\x21\x06\x00\x20"[..],     // AND [2000h],AX
+                &b"\x31\x06\x00\x20"[..],     // XOR [2000h],AX
+                &b"\xd1\x26\x00\x20"[..],     // SHL word [2000h],1
+                &b"\xd1\x1e\x00\x20"[..],     // RCR word [2000h],1
+                &b"\xff\x06\x00\x20"[..],     // INC word [2000h]
+                &b"\xff\x0e\x00\x20"[..],     // DEC word [2000h]
+                &b"\xf7\x16\x00\x20"[..],     // NOT word [2000h]
+                &b"\xf7\x1e\x00\x20"[..],     // NEG word [2000h]
+                &b"\x87\x06\x00\x20"[..],     // XCHG [2000h],AX
+                &b"\x0f\xab\x06\x00\x20"[..], // BTS [2000h],AX
+                &b"\x66\x11\x06\x00\x20"[..], // ADC [2000h],EAX
+                &b"\x66\xd1\x26\x00\x20"[..], // SHL dword [2000h],1
+                &b"\x03\x06\x00\x20"[..],     // ADD AX,[2000h]
+                &b"\x89\x06\x00\x20"[..],     // MOV [2000h],AX
+                &b"\x50"[..],
+                &b"\x90"[..],
+            ] {
+                let ir = instruction(
+                    code,
+                    0x1000,
+                    MachineContext {
+                        segment_class: class,
+                        ..context
+                    },
+                )
+                .unwrap();
+                assert!(
+                    !matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint))),
+                    "{class:?} {code:x?}"
+                );
+            }
+        }
+        // The conservative helper-commit rule still marks a coprocessor gate
+        // followed by a fallible body; scalar flag staging does not erase it.
+        let ir = instruction(
+            b"\xd9\x3e\x00\x20", // FNSTCW [2000h]
+            0x1000,
+            MachineContext {
+                segment_class: crate::SegmentClass::Checked,
+                ..context
+            },
+        )
+        .unwrap();
+        assert!(matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint))));
+    }
 }

@@ -746,6 +746,32 @@ separate legacy run wrapper. U5 removes that duplication, so the one-step gate
 moves to U5. U2 meets the gate on loops of 64 or more steps per call. The alias
 gates are unchanged.
 
+**Amendment (U4, 2026-11-13, accepted by the maintainer).** A U4-only alias switch
+failed the alias gate. The best prototype measured `ip-boundary-1` at +1.54 % over the
+pre-switch alias, which is about 39 host instructions per `run` call. The other 14
+loops were 0.2 % to 2.2 % faster. The extra cost is the Machine run entry, and U5
+removes it. U4 and U5 therefore land together, as one change. That change must meet
+the U4 alias gate on every loop, `ip-boundary-1` included, against the pre-switch
+(U3) numbers, and the U5 gates as well. The alias switch is not landed without
+its gate.
+
+**Amendment (U5, 2026-11-13, accepted by the maintainer).** After the switch, the
+alias runs on the Machine path through a private profile whose context is fixed.
+On most loops it is 4 % to 15 % faster than the U3 alias. The U5 Machine gate
+therefore counts against the pre-switch (U3) alias numbers, the same baseline as
+the U4 alias gate: `I80286` and `I80386` real mode, A20 enabled or disabled, within
++2 % of the U3 alias on every loop, `ip-boundary-1` included. The comparison with
+the current alias is still measured and reported.
+
+**Amendment (U4+U5 landing, 2026-11-13, accepted by the maintainer).** The change
+lands with one measured miss, a slowdown and not a defect: Machine `ip-boundary-1`
+is +2.56 % to +2.63 % over the U3 alias (2605.9 to 2607.7 host instructions per
+call against 2540.8), 14 to 16 instructions per call above the gate. The fix for
+an abandoned REP flag origin (xj-srh.5, found in the final review) added them;
+the round before it measured +1.86 %. Every other gate is met. Bead xj-s3p.11
+carries the miss, with the U5 gate as its acceptance; the gate itself is
+unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
@@ -873,7 +899,7 @@ marks a prerequisite of any 8086/8088 work.
 | U2 | `MachineContext` with the segment class; Direct lowering, shared-cache multi-instruction blocks and A20 mask for Machine real mode; measure and confirm or amend §5 | U1 | yes |
 | U3 | One width-aware lowering of stack, control, flag-image, frame and far-pointer instructions; retire the `*_real16` helpers; empty the parity allowlist; close xj-5t9 | U2 | no |
 | U4 | Alias switch: `set_cpu_mode(Real16)` on the Machine path through the internal entry; explicit exception-delivery option; remove the Application Real16 dispatch branch | U3 | no |
-| U5 | One interpreter walk and one dispatcher loop; lift-marked rollback; remove `interp::legacy::walk` and `legacy_loop` | U4 | no |
+| U5 | One interpreter walk and one dispatcher loop; lift-marked rollback; remove `interp::legacy::walk` and `legacy_loop`. Lands together with U4 (Performance requirement, U4 amendment) | U4 | no |
 | U6 | Remove deprecated names (M7) | both embedders migrated | no |
 | P1 | Pin the 8086 family manual | — | yes |
 | P2 | Pin the V20/V30 manual | — | no (V20 yes) |

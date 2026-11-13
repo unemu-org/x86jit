@@ -1071,3 +1071,1603 @@ fn big_real_far_reload_preserves_cs_descriptor_limit_and_attributes() {
     steps(&mut cpu, &vm, 1);
     assert_eq!(cpu.cpu.gpr[3], 0xcafe);
 }
+
+mod stepping_contracts {
+    use super::*;
+    use x86jit_core::{PortDir, StepRunError};
+
+    fn ready() -> StepOptions {
+        StepOptions::default().with_stop_when_irq_ready(true)
+    }
+
+    fn string_code(addr16: bool, word: bool, segment: u8, opcode: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        if segment != 0 {
+            code.push(segment);
+        }
+        code.push(0xf3);
+        if addr16 {
+            code.push(0x67);
+        }
+        if word {
+            code.push(0x66);
+        }
+        code.extend([opcode, 0x90]);
+        code
+    }
+
+    #[test]
+    fn code32_rep_empty_counts_and_iteration_slices() {
+        // SDM Vol 2B §4.3 REP/MOVS/CMPS/STOS/LODS/SCAS, pp. 4-563–564:
+        // address size selects count/indices; empty REP touches no operand.
+        // 80386 PRM §17 REP pp. 17-139–141; decision-16 §§1–3.
+        for segment in [0, 0x64] {
+            for addr16 in [false, true] {
+                for word in [false, true] {
+                    for opcode in [0xa5, 0xa7, 0xab, 0xad, 0xaf, 0x6d, 0x6f] {
+                        for budget in [1, 2, 8] {
+                            for count in [0, 3] {
+                                if count != 0 && matches!(opcode, 0x6d | 0x6f) {
+                                    continue;
+                                }
+                                for df in [false, true] {
+                                    let code = string_code(addr16, word, segment, opcode);
+                                    let (vm, mut cpu) = setup(&code, true, true);
+                                    let source = if segment == 0 { 1 } else { 4 };
+                                    cpu.cpu.legacy.segments[source].base = 0x10000;
+                                    let high = if addr16 { 0x1234_0000 } else { 0 };
+                                    cpu.cpu.gpr[1] = high | count;
+                                    cpu.cpu.gpr[6] = high | 0x4000;
+                                    cpu.cpu.gpr[7] = high | 0x5000;
+                                    cpu.cpu.gpr[0] = 0x1111_1111;
+                                    cpu.cpu.flags.df = df;
+                                    vm.write_bytes(0x13ff0, &[0x11; 32]).unwrap();
+                                    vm.write_bytes(0x4ff0, &[0x11; 32]).unwrap();
+                                    if count == 0 {
+                                        cpu.cpu.legacy.segments[source].unusable = 1;
+                                        cpu.cpu.legacy.segments[2].unusable = 1;
+                                    }
+                                    let units = count.max(1);
+                                    let mut completed = 0;
+                                    while completed < units {
+                                        let n = budget.min(units - completed);
+                                        steps(&mut cpu, &vm, n);
+                                        completed += n;
+                                        assert_eq!(
+                                            cpu.cpu.rip,
+                                            if completed == units {
+                                                0x1000 + code.len() as u64 - 1
+                                            } else {
+                                                0x1000
+                                            }
+                                        );
+                                        assert_eq!(
+                                            cpu.retired_instructions(),
+                                            u64::from(completed == units)
+                                        );
+                                        assert_eq!(
+                                            cpu.cpu.gpr[1],
+                                            high | count.saturating_sub(completed)
+                                        );
+                                    }
+                                    let delta = count * if word { 2 } else { 4 };
+                                    let index = |base: u64| {
+                                        high | if df { base - delta } else { base + delta }
+                                    };
+                                    assert_eq!(
+                                        cpu.cpu.gpr[6],
+                                        if matches!(opcode, 0xa5 | 0xa7 | 0xad) {
+                                            index(0x4000)
+                                        } else {
+                                            high | 0x4000
+                                        }
+                                    );
+                                    assert_eq!(
+                                        cpu.cpu.gpr[7],
+                                        if opcode != 0xad {
+                                            index(0x5000)
+                                        } else {
+                                            high | 0x5000
+                                        }
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code32_rep_fault_prefix_and_mmio_retry_in_step_slices() {
+        // SDM Vol 2B §4.3 REP pp. 4-563–564 and MOVS protected exceptions:
+        // completed elements survive; EIP/count/indices identify the next one.
+        // Vol 3A §§7.5, 7.6 (fault restart); 80386 PRM §17 REP p. 17-140.
+        // Segment violations use #SS for SS and #GP for other segments.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for failure in 0..6 {
+                    for budget in [1, 2, 8] {
+                        let segment = if failure == 5 { 0x36 } else { 0x64 };
+                        let code = string_code(addr16, word, segment, 0xa5);
+                        let (mut vm, mut cpu) = setup(&code, true, true);
+                        vm.unmap(0, 0x40000).unwrap();
+                        for page in (0..0x40000).step_by(0x1000) {
+                            vm.map(page, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+                        }
+                        vm.write_bytes(0x1000, &code).unwrap();
+                        let elem = if word { 2 } else { 4 };
+                        let source = if failure == 5 { 3 } else { 4 };
+                        let base = if source == 4 { 0x10000 } else { 0 };
+                        cpu.cpu.legacy.segments[source].base = base;
+                        let high = if addr16 { 0xabcd_0000 } else { 0 };
+                        let write_fault = failure == 1 || failure == 3;
+                        let si = if write_fault {
+                            0x4000
+                        } else {
+                            0x9000 - 2 * elem
+                        };
+                        let di = if write_fault {
+                            0xb000 - 2 * elem
+                        } else {
+                            0x5000
+                        };
+                        cpu.cpu.gpr[1] = high | 3;
+                        cpu.cpu.gpr[6] = high | si;
+                        cpu.cpu.gpr[7] = high | di;
+                        for offset in 0..12 {
+                            vm.write_bytes(u64::from(base) + si + offset, &[0x5a])
+                                .unwrap();
+                        }
+                        let at = if write_fault {
+                            0xb000
+                        } else {
+                            u64::from(base) + 0x9000
+                        };
+                        if failure < 4 {
+                            vm.unmap(at, 0x1000).unwrap();
+                            if failure >= 2 {
+                                vm.map(at, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+                            }
+                        } else {
+                            cpu.cpu.legacy.segments[source].limit = 0x8fff;
+                        }
+                        let mut completed = 0;
+                        loop {
+                            let run = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                            completed += run.steps();
+                            if matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+                                assert!(completed <= 2);
+                                continue;
+                            }
+                            assert_eq!(completed, 2, "{failure} {run:?}");
+                            match run.stop() {
+                                StepStop::Exit(Exit::UnmappedMemory { addr, .. })
+                                    if failure < 2 =>
+                                {
+                                    assert_eq!(*addr, at)
+                                }
+                                StepStop::Exit(Exit::MmioRead { addr, size, .. })
+                                    if failure == 2 =>
+                                {
+                                    assert_eq!((*addr, *size), (at, elem as u8));
+                                    cpu.complete_mmio_read(0x5a5a_5a5a);
+                                }
+                                StepStop::Exit(Exit::MmioWrite {
+                                    addr, size, value, ..
+                                }) if failure == 3 => {
+                                    assert_eq!((*addr, *size), (at, elem as u8));
+                                    assert_eq!(*value, if word { 0x5a5a } else { 0x5a5a_5a5a });
+                                    cpu.complete_mmio_write();
+                                }
+                                StepStop::Exit(exit @ Exit::Exception { vector, .. })
+                                    if failure >= 4 =>
+                                {
+                                    let metadata = exit.fault_metadata().unwrap();
+                                    assert_eq!(metadata.saved_rip(), 0x1000);
+                                    assert_eq!(metadata.class(), FaultClass::Fault);
+                                    assert_eq!(*vector, if source == 3 { 12 } else { 13 })
+                                }
+                                other => panic!("failure={failure}, {other:?}"),
+                            }
+                            break;
+                        }
+                        assert_eq!(cpu.cpu.rip, 0x1000);
+                        assert_eq!(cpu.cpu.gpr[1], high | 1);
+                        assert_eq!(cpu.cpu.gpr[6], high | (si + 2 * elem));
+                        assert_eq!(cpu.cpu.gpr[7], high | (di + 2 * elem));
+                        assert_eq!(cpu.retired_instructions(), 0);
+                        for index in 0..2 {
+                            assert_eq!(
+                                value(&vm, di + index * elem, elem as usize),
+                                if word { 0x5a5a } else { 0x5a5a_5a5a }
+                            );
+                        }
+                        if !write_fault {
+                            assert_eq!(value(&vm, di + 2 * elem, elem as usize), 0);
+                        }
+                        if failure < 2 {
+                            vm.map(at, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+                            if !write_fault {
+                                vm.write_bytes(at, &[0x5a; 4]).unwrap();
+                            }
+                        } else if failure >= 4 {
+                            cpu.cpu.legacy.segments[source].limit = 0xffff;
+                        }
+                        steps(&mut cpu, &vm, 1);
+                        assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64 - 1);
+                        assert_eq!(cpu.cpu.gpr[1], high);
+                        assert_eq!(cpu.retired_instructions(), 1);
+                        assert!(!cpu.cpu.mmio_retry_active);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inhibition_survives_pe_and_cs_transfers() {
+        // SDM Vol 2B §4.3 STI/MOV/POP, Vol 3A §§7.8.1, 7.8.3:
+        // inhibition covers the next instruction, including control transfers.
+        // Transfers: Vol 2A §3.3 CALL/IRET/JMP, Vol 2B §4.3 RET.
+        // PE retains caches: Vol 3A §§12.9.1–12.9.2; 80386 PRM §9.2.4
+        // pp. 9-3–4, §17 STI p. 17-163, §§14.4.1–14.5 p. 14-4.
+        for protected in [false, true] {
+            for wide in [false, true] {
+                for shadow in 0..3 {
+                    for transfer in 0..5 {
+                        for slicing in 0..3 {
+                            let mut code = match shadow {
+                                0 => vec![0xfb],
+                                1 => vec![0x8e, 0xd3],
+                                _ => vec![0x17],
+                            };
+                            let target_cs: u16 = if protected { 24 } else { 0x20 };
+                            let target_ip: u32 = 0x1400;
+                            match transfer {
+                                0 => code.extend([0x0f, 0x22, 0xc0]),
+                                1 | 2 => {
+                                    code.push(if transfer == 1 { 0xea } else { 0x9a });
+                                    code.extend(
+                                        &target_ip.to_le_bytes()[..if wide { 4 } else { 2 }],
+                                    );
+                                    code.extend(target_cs.to_le_bytes());
+                                }
+                                3 => code.push(0xcb),
+                                _ => code.push(0xcf),
+                            }
+                            let (vm, mut cpu) = setup(&code, wide, wide);
+                            cpu.cpu.legacy.cr0 = u32::from(protected);
+                            cpu.cpu.flags.if_ = shadow != 0;
+                            cpu.cpu.gpr[0] = u64::from(!protected);
+                            cpu.cpu.gpr[3] = if protected { 16 } else { 0 };
+                            descriptor(&vm, 16, 0, 0xffff, if wide { 0x4092 } else { 0x92 });
+                            descriptor(&vm, 24, 0, 0xffff, 0x9a);
+                            let size = if wide { 4 } else { 2 };
+                            let mut frame = Vec::new();
+                            if shadow == 2 {
+                                frame.extend(&cpu.cpu.gpr[3].to_le_bytes()[..size]);
+                            }
+                            if transfer >= 3 {
+                                frame.extend(&target_ip.to_le_bytes()[..size]);
+                                frame.extend(&u32::from(target_cs).to_le_bytes()[..size]);
+                                if transfer == 4 {
+                                    frame.extend(&0x202u32.to_le_bytes()[..size]);
+                                }
+                            }
+                            vm.write_bytes(0x8000, &frame).unwrap();
+                            if slicing == 2 {
+                                steps(&mut cpu, &vm, 2);
+                            } else {
+                                steps(&mut cpu, &vm, 1);
+                                assert!(!cpu.irq_ready());
+
+                                let n = if slicing == 0 { 1 } else { 8 };
+                                let run = cpu.run_steps(&vm, n, ready()).unwrap();
+                                assert_eq!(run.steps(), 1, "shadow={shadow}, transfer={transfer}, protected={protected}, wide={wide}: {run:?}");
+                                assert!(
+                                    if n == 1 {
+                                        matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted))
+                                    } else {
+                                        matches!(run.stop(), StepStop::IrqReady)
+                                    },
+                                    "{run:?}"
+                                );
+                            }
+                            assert!(cpu.irq_ready());
+                            assert_eq!(cpu.retired_instructions(), 2);
+                            if transfer == 0 {
+                                assert_eq!(cpu.cpu.legacy.cr0 & 1, u32::from(!protected));
+                                assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64);
+                            } else {
+                                assert_eq!(
+                                    (cpu.cpu.cs, cpu.cpu.rip),
+                                    (target_cs, u64::from(target_ip))
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_port_completions_precede_irq_readiness_once() {
+        // SDM Vol 2A §3.3 IN/INS and Vol 2B §4.3 OUT/OUTS/REP:
+        // operand size selects transfer width; address size selects count/indices.
+        // Vol 3A §§7.8.1, 7.8.3; decision-16 §3: completion adds no unit.
+        for addr16 in [false, true] {
+            for size in [1, 2, 4] {
+                for kind in 0..4 {
+                    for shadow in [false, true] {
+                        for budget in [1, 8] {
+                            let mut code = if shadow { vec![0x8e, 0xd3] } else { vec![0xfb] };
+                            let port_ip = 0x1000 + code.len() as u64;
+                            let string = kind >= 2;
+                            let input = kind % 2 == 0;
+                            if string {
+                                code.extend([0x64, 0xf3]);
+                                if addr16 {
+                                    code.push(0x67);
+                                }
+                            }
+                            if size == 2 {
+                                code.push(0x66);
+                            }
+                            code.push(match (kind, size == 1) {
+                                (0, true) => 0xec,
+                                (0, false) => 0xed,
+                                (1, true) => 0xee,
+                                (1, false) => 0xef,
+                                (2, true) => 0x6c,
+                                (2, false) => 0x6d,
+                                (_, true) => 0x6e,
+                                _ => 0x6f,
+                            });
+                            let end = 0x1000 + code.len() as u64;
+                            code.push(0x90);
+                            let (vm, mut cpu) = setup(&code, true, true);
+                            descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                            cpu.cpu.flags.if_ = shadow;
+                            cpu.cpu.gpr[3] = 16;
+                            cpu.cpu.gpr[2] = 0x80;
+                            cpu.cpu.gpr[0] = 0x8877_6655;
+                            cpu.cpu.legacy.segments[4].base = 0x10000;
+                            let high = if addr16 { 0xabcd_0000 } else { 0 };
+                            cpu.cpu.gpr[1] = high | 2;
+                            cpu.cpu.gpr[6] = high | 0x4000;
+                            cpu.cpu.gpr[7] = high | 0x5000;
+                            vm.write_bytes(0x14000, &[0x55; 8]).unwrap();
+                            steps(&mut cpu, &vm, 1);
+                            assert!(!cpu.irq_ready());
+                            for iteration in 0..if string { 2 } else { 1 } {
+                                let run =
+                                    cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                assert_eq!(run.steps(), 1, "{run:?}");
+                                let StepStop::Exit(Exit::PortIo {
+                                    port,
+                                    size: actual,
+                                    dir,
+                                    value: port_value,
+                                    ..
+                                }) = run.stop()
+                                else {
+                                    panic!("{run:?}")
+                                };
+                                assert_eq!(
+                                    (*port, *actual, *dir),
+                                    (0x80, size, if input { PortDir::In } else { PortDir::Out })
+                                );
+                                if !input {
+                                    assert_eq!(
+                                        *port_value,
+                                        if string { 0x5555_5555 } else { 0x8877_6655 }
+                                            & (u64::MAX >> (64 - size * 8))
+                                    );
+                                }
+                                if input {
+                                    assert!(!cpu.irq_ready());
+                                    assert!(matches!(
+                                        cpu.run_steps(&vm, 1, ready()),
+                                        Err(StepRunError::PendingPortIn)
+                                    ));
+                                    cpu.complete_port_in(0x4433_2211);
+                                }
+                                let rip = cpu.cpu.rip;
+                                steps(&mut cpu, &vm, 0);
+                                assert_eq!(cpu.cpu.rip, rip);
+                                let completion = cpu.run_steps(&vm, budget, ready()).unwrap();
+                                assert_eq!(completion.steps(), 0, "{completion:?}");
+                                assert!(
+                                    matches!(completion.stop(), StepStop::IrqReady),
+                                    "{completion:?}"
+                                );
+                                assert_eq!(
+                                    cpu.cpu.rip,
+                                    if string && iteration == 0 {
+                                        port_ip
+                                    } else {
+                                        end
+                                    }
+                                );
+                                if string {
+                                    assert_eq!(cpu.cpu.gpr[1], high | (1 - iteration));
+                                    assert_eq!(
+                                        cpu.cpu.gpr[if input { 7 } else { 6 }],
+                                        high | (if input { 0x5000 } else { 0x4000 }
+                                            + (iteration + 1) * u64::from(size))
+                                    );
+                                    if input {
+                                        assert_eq!(
+                                            value(
+                                                &vm,
+                                                0x5000 + iteration * u64::from(size),
+                                                size as usize
+                                            ),
+                                            0x4433_2211 & (u64::MAX >> (64 - size * 8))
+                                        );
+                                    }
+                                } else if input {
+                                    let mask = u64::MAX >> (64 - size * 8);
+                                    assert_eq!(
+                                        cpu.cpu.gpr[0],
+                                        (0x8877_6655 & !mask) | (0x4433_2211 & mask)
+                                    );
+                                }
+                                let repeated = cpu.run_steps(&vm, budget, ready()).unwrap();
+                                assert_eq!(repeated.steps(), 0);
+                                assert!(matches!(repeated.stop(), StepStop::IrqReady));
+                            }
+                            assert_eq!(cpu.retired_instructions(), 2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code32_rep_shadow_and_device_retry_boundaries() {
+        // SDM Vol 2B §4.3 REP/STI/MOV; Vol 3A §§7.8.1, 7.8.3;
+        // 80386 PRM §17 REP p. 17-140: each completed REP element
+        // provides an interrupt window, including in a caller's step slice.
+        for shadow in [false, true] {
+            for addr16 in [false, true] {
+                for word in [false, true] {
+                    for trap in [false, true] {
+                        for count in [0, 3] {
+                            for budget in [1, 2, 8] {
+                                let mut code = if shadow { vec![0x8e, 0xd3] } else { vec![0xfb] };
+                                let ip = 0x1000 + code.len() as u64;
+                                code.extend(string_code(addr16, word, 0x64, 0xa5));
+                                let end = 0x1000 + code.len() as u64 - 1;
+                                let (mut vm, mut cpu) = setup(&code, true, true);
+                                descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                                cpu.cpu.gpr[3] = 16;
+                                cpu.cpu.flags.if_ = shadow;
+                                cpu.cpu.gpr[1] = count;
+                                cpu.cpu.gpr[6] = 0x4000;
+                                cpu.cpu.gpr[7] = 0x5000;
+                                if trap {
+                                    vm.unmap(0, 0x40000).unwrap();
+                                    vm.map(0, 0x30000, Prot::RWX, RegionKind::Ram).unwrap();
+                                    vm.map(0x30000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+                                    vm.map(0x31000, 0xf000, Prot::RWX, RegionKind::Ram).unwrap();
+                                    vm.write_bytes(0x1000, &code).unwrap();
+                                    descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                                    cpu.cpu.legacy.segments[4].base = 0x2c000;
+                                }
+                                steps(&mut cpu, &vm, 1);
+                                assert!(!cpu.irq_ready());
+                                let mut run = cpu.run_steps(&vm, budget, ready()).unwrap();
+                                if trap && count != 0 {
+                                    assert_eq!(run.steps(), 0);
+                                    assert!(matches!(
+                                        run.stop(),
+                                        StepStop::Exit(Exit::MmioRead { .. })
+                                    ));
+                                    assert!(!cpu.irq_ready());
+                                    cpu.complete_mmio_read(0x1234);
+                                    assert!(!cpu.irq_ready());
+                                    run = cpu.run_steps(&vm, budget, ready()).unwrap();
+                                }
+                                assert_eq!(run.steps(), 1, "{run:?}");
+                                assert!(
+                                    if budget == 1 {
+                                        matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted))
+                                    } else {
+                                        matches!(run.stop(), StepStop::IrqReady)
+                                    },
+                                    "{run:?}"
+                                );
+                                assert!(cpu.irq_ready());
+                                assert_eq!(cpu.cpu.gpr[1], count.saturating_sub(1));
+                                assert_eq!(cpu.cpu.rip, if count == 0 { end } else { ip });
+                                assert_eq!(
+                                    cpu.retired_instructions(),
+                                    if count == 0 { 2 } else { 1 }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_irq_enters_after_shadowed_pe_or_cs_change() {
+        // SDM Vol 2B §4.3 STI/MOV/POP; Vol 3A §§7.8.1, 7.8.3,
+        // 7.12.1 (interrupt gates), 12.9.1–12.9.2 (PE transitions).
+        // 80386 PRM §9.2.4 pp. 9-3–4: inhibit the SS-load boundary.
+        for protected in [false, true] {
+            for shadow in 0..3 {
+                for change_pe in [false, true] {
+                    let mut code = match shadow {
+                        0 => vec![0xfb],
+                        1 => vec![0x8e, 0xd3],
+                        _ => vec![0x17],
+                    };
+                    if change_pe {
+                        code.extend([0x0f, 0x22, 0xc0]);
+                    } else {
+                        code.extend([0xea, 0x00, 0x14, if protected { 24 } else { 0x20 }, 0]);
+                    }
+                    let expected_ip = if change_pe {
+                        0x1000 + code.len() as u64
+                    } else {
+                        0x1400
+                    };
+                    let (vm, mut cpu) = setup(&code, false, false);
+                    cpu.cpu.legacy.cr0 = u32::from(protected);
+                    cpu.cpu.flags.if_ = shadow != 0;
+                    cpu.cpu.gpr[0] = u64::from(!protected);
+                    cpu.cpu.gpr[3] = if protected { 16 } else { 0 };
+                    descriptor(&vm, 16, 0, 0xffff, 0x92);
+                    descriptor(&vm, 24, 0, 0xffff, 0x9a);
+                    vm.write_bytes(0x8000, &cpu.cpu.gpr[3].to_le_bytes()[..2])
+                        .unwrap();
+                    vm.write_bytes(0x1800, b"\xf4").unwrap();
+                    // Both IDT formats share base zero but use disjoint entries.
+                    cpu.cpu.legacy.idtr.base = 0;
+                    cpu.cpu.legacy.idtr.limit = 0x3ff;
+                    vm.write_bytes(0xc0, b"\x00\x18\x00\x00").unwrap();
+                    vm.write_bytes(0x180, b"\x00\x18\x18\x00\x00\x86\x00\x00")
+                        .unwrap();
+                    steps(&mut cpu, &vm, 1);
+                    assert!(!cpu.irq_ready());
+                    cpu.inject_irq(0x30);
+                    let run = cpu.run_steps(&vm, 8, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 2, "{run:?}");
+                    assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
+                    assert!(!cpu.has_pending_irq());
+                    assert_eq!(cpu.cpu.rip, 0x1801);
+                    assert_eq!(value(&vm, cpu.cpu.gpr[4], 2), expected_ip);
+                    assert_eq!(
+                        value(&vm, cpu.cpu.gpr[4] + 2, 2),
+                        if change_pe {
+                            0
+                        } else if protected {
+                            24
+                        } else {
+                            0x20
+                        }
+                    );
+                    assert_eq!(cpu.retired_instructions(), 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_ins_answer_survives_destination_mmio_before_irq() {
+        // SDM Vol 2A §3.3 INS, Vol 2B §4.3 REP, Vol 3A §7.8.3;
+        // decision-16 §3: one port handoff, retry its answered destination
+        // without another IN or charged unit, then allow IRQ readiness.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for budget in [1, 8] {
+                    let mut code = vec![0x8e, 0xd3];
+                    code.extend(string_code(addr16, word, 0x64, 0x6d));
+                    let (mut vm, mut cpu) = setup(&code, true, true);
+                    descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                    vm.unmap(0, 0x40000).unwrap();
+                    vm.map(0, 0x30000, Prot::RWX, RegionKind::Ram).unwrap();
+                    vm.map(0x30000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+                    vm.map(0x31000, 0xf000, Prot::RWX, RegionKind::Ram).unwrap();
+                    vm.write_bytes(0x1000, &code).unwrap();
+                    descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                    cpu.cpu.legacy.segments[2].base = 0x2b000;
+                    cpu.cpu.flags.if_ = true;
+                    cpu.cpu.gpr[3] = 16;
+                    cpu.cpu.gpr[1] = 2;
+                    cpu.cpu.gpr[7] = 0x5000;
+                    steps(&mut cpu, &vm, 1);
+                    let port = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                    assert_eq!(port.steps(), 1);
+                    assert!(matches!(
+                        port.stop(),
+                        StepStop::Exit(Exit::PortIo {
+                            dir: PortDir::In,
+                            ..
+                        })
+                    ));
+                    cpu.complete_port_in(0x4433_2211);
+                    let store = cpu.run_steps(&vm, budget, ready()).unwrap();
+                    assert_eq!(store.steps(), 0);
+                    assert!(
+                        matches!(
+                            store.stop(),
+                            StepStop::Exit(Exit::MmioWrite { addr: 0x30000, .. })
+                        ),
+                        "{store:?}"
+                    );
+                    assert!(!cpu.irq_ready());
+                    assert_eq!((cpu.cpu.gpr[1], cpu.cpu.gpr[7]), (2, 0x5000));
+                    cpu.complete_mmio_write();
+                    let complete = cpu.run_steps(&vm, budget, ready()).unwrap();
+                    assert_eq!(complete.steps(), 0);
+                    assert!(
+                        matches!(complete.stop(), StepStop::IrqReady),
+                        "{complete:?}"
+                    );
+                    assert_eq!(
+                        (cpu.cpu.gpr[1], cpu.cpu.gpr[7]),
+                        (1, 0x5000 + if word { 2 } else { 4 })
+                    );
+                    assert_eq!(cpu.retired_instructions(), 1);
+                    assert!(!cpu.cpu.mmio_retry_active);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code32_rep_and_shadow_share_one_call() {
+        // SDM Vol 2B §4.3 REP/STI/MOV; Vol 3A §§7.6, 7.8.1, 7.8.3:
+        // completed REP iterations are interrupt windows. Decision-16 §§1–3:
+        // caller slicing does not change instruction retirement or the window.
+        for shadow in [false, true] {
+            for addr16 in [false, true] {
+                for word in [false, true] {
+                    for count in [0, 3] {
+                        for budget in [1, 2, 8] {
+                            let mut code = if shadow { vec![0x8e, 0xd3] } else { vec![0xfb] };
+                            let rep_ip = 0x1000 + code.len() as u64;
+                            code.extend(string_code(addr16, word, 0x64, 0xa5));
+                            *code.last_mut().unwrap() = 0xf4;
+                            let (vm, mut cpu) = setup(&code, true, true);
+                            descriptor(&vm, 16, 0, 0xffff, 0x4092);
+                            cpu.cpu.gpr[3] = 16;
+                            cpu.cpu.flags.if_ = shadow;
+                            cpu.cpu.gpr[1] = count;
+                            cpu.cpu.gpr[6] = 0x4000;
+                            cpu.cpu.gpr[7] = 0x5000;
+                            let mut units = 0;
+                            loop {
+                                let run =
+                                    cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                units += run.steps();
+                                if matches!(run.stop(), StepStop::Exit(Exit::Hlt)) {
+                                    break;
+                                }
+                                assert!(
+                                    matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                                    "{run:?}"
+                                );
+                                if units == 1 {
+                                    assert!(!cpu.irq_ready());
+                                }
+                                if count != 0 && units == 2 {
+                                    assert!(cpu.irq_ready());
+                                    assert_eq!(cpu.cpu.rip, rep_ip);
+                                    assert_eq!(cpu.cpu.gpr[1], 2);
+                                    assert_eq!(cpu.retired_instructions(), 1);
+                                }
+                            }
+                            assert_eq!(units, 2 + count.max(1));
+                            assert_eq!(cpu.retired_instructions(), 3);
+                            assert_eq!(cpu.cpu.gpr[1], 0);
+                            assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code32_repe_repne_fault_restores_original_flags_with_committed_prefix() {
+        // SDM Vol 2B §4.3 REPE/REPZ p. 4-565, REPNE/REPNZ p. 4-567:
+        // a CMPS/SCAS fault restores pre-instruction EFLAGS, while completed
+        // indices/count remain committed. Host step slices are not interrupts.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for opcode in [0xa7, 0xaf] {
+                    for repe in [false, true] {
+                        for budget in [1, 2, 8] {
+                            let mut code = string_code(addr16, word, 0x64, opcode);
+                            if !repe {
+                                *code.iter_mut().find(|b| **b == 0xf3).unwrap() = 0xf2;
+                            }
+                            let (mut vm, mut cpu) = setup(&code, true, true);
+                            let elem = if word { 2 } else { 4 };
+                            let at = if opcode == 0xa7 { 0x19000 } else { 0x9000 };
+                            vm.unmap(0, 0x40000).unwrap();
+                            vm.map(0, at as usize, Prot::RWX, RegionKind::Ram).unwrap();
+                            vm.map(
+                                at + 0x1000,
+                                0x40000 - at as usize - 0x1000,
+                                Prot::RWX,
+                                RegionKind::Ram,
+                            )
+                            .unwrap();
+                            vm.write_bytes(0x1000, &code).unwrap();
+                            cpu.cpu.legacy.segments[4].base = 0x10000;
+                            cpu.cpu.gpr[0] = 0x1111_1111;
+                            cpu.cpu.gpr[1] = 3;
+                            cpu.cpu.gpr[6] = 0x9000 - 2 * elem;
+                            cpu.cpu.gpr[7] = if opcode == 0xa7 {
+                                0x5000
+                            } else {
+                                0x9000 - 2 * elem
+                            };
+                            if opcode == 0xa7 {
+                                vm.write_bytes(
+                                    0x10000 + cpu.cpu.gpr[6],
+                                    &[0x11; 8][..(2 * elem) as usize],
+                                )
+                                .unwrap();
+                            }
+                            vm.write_bytes(
+                                cpu.cpu.gpr[7],
+                                &[if repe { 0x11 } else { 0x10 }; 8][..(2 * elem) as usize],
+                            )
+                            .unwrap();
+                            cpu.cpu.flags.cf = true;
+                            cpu.cpu.flags.of = true;
+                            cpu.cpu.flags.zf = !repe;
+                            let original = format!("{:?}", cpu.cpu.flags);
+                            let mut prefix = 0;
+                            loop {
+                                let run =
+                                    cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                prefix += run.steps();
+                                if matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+                                    continue;
+                                }
+                                assert!(
+                                    matches!(run.stop(), StepStop::Exit(Exit::UnmappedMemory { addr, .. }) if *addr == at),
+                                    "{run:?}"
+                                );
+                                break;
+                            }
+                            assert_eq!(prefix, 2);
+                            assert_eq!(cpu.cpu.gpr[1], 1);
+                            assert_eq!(cpu.cpu.rip, 0x1000);
+                            assert_eq!(cpu.retired_instructions(), 0);
+                            assert_eq!(format!("{:?}", cpu.cpu.flags), original, "addr16={addr16}, word={word}, opcode={opcode:x}, repe={repe}, budget={budget}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_mmio_preserves_flag_origin_until_a_later_fault() {
+        // SDM Vol 2B §4.3 REPE/REPZ p. 4-565: preserve the original
+        // EFLAGS through a completed comparison and a device handoff. The
+        // completed device element is committed before the following fault.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for opcode in [0xa7, 0xaf] {
+                    for budget in [1, 8] {
+                        let code = string_code(addr16, word, 0x64, opcode);
+                        let (mut vm, mut cpu) = setup(&code, true, true);
+                        let elem = if word { 2 } else { 4 };
+                        vm.unmap(0, 0x40000).unwrap();
+                        vm.map(0, 0x9000 - elem, Prot::RWX, RegionKind::Ram)
+                            .unwrap();
+                        vm.map((0x9000 - elem) as u64, elem, Prot::RW, RegionKind::Trap)
+                            .unwrap();
+                        vm.map(0xa000, 0x36000, Prot::RWX, RegionKind::Ram).unwrap();
+                        vm.write_bytes(0x1000, &code).unwrap();
+                        vm.write_bytes((0x9000 - 2 * elem) as u64, &[0x11; 4][..elem])
+                            .unwrap();
+                        vm.write_bytes(0x14000, &[0x11; 12]).unwrap();
+                        cpu.cpu.legacy.segments[4].base = 0x10000;
+                        cpu.cpu.gpr[0] = 0x1111_1111;
+                        cpu.cpu.gpr[1] = 3;
+                        cpu.cpu.gpr[6] = 0x4000;
+                        cpu.cpu.gpr[7] = (0x9000 - 2 * elem) as u64;
+                        cpu.cpu.flags.cf = true;
+                        cpu.cpu.flags.of = true;
+                        let original = format!("{:?}", cpu.cpu.flags);
+                        let mut units = 0;
+                        loop {
+                            let run = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                            units += run.steps();
+                            if matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+                                continue;
+                            }
+                            assert!(
+                                matches!(run.stop(), StepStop::Exit(Exit::MmioRead { .. })),
+                                "{run:?}"
+                            );
+                            break;
+                        }
+                        assert_eq!(units, 1);
+                        assert_ne!(format!("{:?}", cpu.cpu.flags), original);
+                        cpu.complete_mmio_read(0x1111_1111);
+                        let fault = cpu.run_steps(&vm, 8, StepOptions::default()).unwrap();
+                        assert_eq!(fault.steps(), 1);
+                        assert!(
+                            matches!(
+                                fault.stop(),
+                                StepStop::Exit(Exit::UnmappedMemory { addr: 0x9000, .. })
+                            ),
+                            "{fault:?}"
+                        );
+                        assert_eq!(cpu.cpu.gpr[1], 1);
+                        assert_eq!(cpu.cpu.rip, 0x1000);
+                        assert_eq!(cpu.retired_instructions(), 0);
+                        assert_eq!(format!("{:?}", cpu.cpu.flags), original);
+                        assert_eq!(cpu.cpu.mmio_parts_len, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_flag_origin_is_abandoned_for_edited_inputs() {
+        // Decision-16 §3; SDM Vol 2B §4.3 REPE/REPZ p. 4-565:
+        // edited inputs start a new instruction attempt, whose current flags
+        // become its fault-restoration origin rather than a stale prior slice.
+        for edit in 0..3 {
+            let code = string_code(false, false, 0x64, 0xaf);
+            let (mut vm, mut cpu) = setup(&code, true, true);
+            vm.unmap(0, 0x40000).unwrap();
+            vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(0x7000, 0x39000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, &code).unwrap();
+            vm.write_bytes(0x5ffc, &[0x11; 4]).unwrap();
+            cpu.cpu.gpr[0] = 0x1111_1111;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[7] = 0x5ffc;
+            cpu.cpu.flags.cf = true;
+            steps(&mut cpu, &vm, 1);
+            match edit {
+                0 => cpu.cpu.flags.of = true,
+                1 => cpu.cpu.gpr[1] = 2 + 0x10000,
+                _ => cpu.cpu.legacy.segments[2].limit = 0x5fff,
+            }
+            let current = format!("{:?}", cpu.cpu.flags);
+            let fault = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(fault.steps(), 0);
+            assert!(
+                matches!(
+                    fault.stop(),
+                    StepStop::Exit(
+                        Exit::UnmappedMemory { .. } | Exit::Exception { vector: 13, .. }
+                    )
+                ),
+                "{fault:?}"
+            );
+            assert_eq!(format!("{:?}", cpu.cpu.flags), current);
+        }
+    }
+
+    #[test]
+    fn comparison_irq_restart_uses_interrupted_flags_as_new_origin() {
+        // SDM Vol 3A §§7.6, 7.12.1 (trap gates preserve IF), and
+        // Vol 2B §4.3 REPE p. 4-565: an interrupt starts a new instruction
+        // execution. A trap gate targeting the same REP must not reuse its
+        // old origin even when code, count, indices and flags still match.
+        let code = string_code(false, false, 0x64, 0xaf);
+        let (mut vm, mut cpu) = setup(&code, true, true);
+        vm.unmap(0, 0x40000).unwrap();
+        vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x7000, 0x39000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, &code).unwrap();
+        vm.write_bytes(0x5ffc, &[0x11; 4]).unwrap();
+        descriptor(&vm, 8, 0, 0xffff, 0x409b);
+        descriptor(&vm, 16, 0, 0xffff, 0x4093);
+        cpu.cpu.cs = 8;
+        cpu.cpu.ss = 16;
+        cpu.cpu.legacy.idtr.base = 0x3000;
+        cpu.cpu.legacy.idtr.limit = 0x187;
+        vm.write_bytes(0x3180, b"\x00\x10\x08\x00\x00\x8f\x00\x00")
+            .unwrap();
+        cpu.cpu.gpr[0] = 0x1111_1111;
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[7] = 0x5ffc;
+        cpu.cpu.flags.if_ = true;
+        cpu.cpu.flags.cf = true;
+        steps(&mut cpu, &vm, 1);
+        let interrupted = format!("{:?}", cpu.cpu.flags);
+        cpu.inject_irq(0x30);
+        let fault = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(fault.steps(), 0);
+        assert!(
+            matches!(
+                fault.stop(),
+                StepStop::Exit(Exit::UnmappedMemory { addr: 0x6000, .. })
+            ),
+            "{fault:?}"
+        );
+        assert!(!cpu.has_pending_irq());
+        assert_eq!(cpu.cpu.gpr[4], 0x7ff4);
+        assert_eq!(value(&vm, 0x7ff4, 4), 0x1000);
+        assert_eq!(value(&vm, 0x7ff8, 4), 8);
+        assert_eq!(format!("{:?}", cpu.cpu.flags), interrupted);
+        assert_eq!(cpu.retired_instructions(), 0);
+    }
+
+    #[test]
+    fn catalogue_model_repeats_the_protected_stepping_contracts() {
+        crate::model_api::with_cpu_model(|| {
+            code32_rep_empty_counts_and_iteration_slices();
+            code32_rep_fault_prefix_and_mmio_retry_in_step_slices();
+            inhibition_survives_pe_and_cs_transfers();
+            protected_port_completions_precede_irq_readiness_once();
+            code32_rep_shadow_and_device_retry_boundaries();
+            code32_rep_and_shadow_share_one_call();
+            code32_repe_repne_fault_restores_original_flags_with_committed_prefix();
+            comparison_mmio_preserves_flag_origin_until_a_later_fault();
+            comparison_flag_origin_is_abandoned_for_edited_inputs();
+            comparison_irq_restart_uses_interrupted_flags_as_new_origin();
+            queued_irq_enters_after_shadowed_pe_or_cs_change();
+            protected_ins_answer_survives_destination_mmio_before_irq();
+        });
+    }
+}
+
+mod dispatch_guards {
+    use super::*;
+
+    fn protected32(code: &[u8]) -> (Vm, Vcpu) {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(NoBackend));
+        vm.set_cpu_model(x86jit_core::CpuModel::I80386);
+        vm.set_exception_delivery(x86jit_core::ExceptionDelivery::Outward);
+        for page in (0..0x40000).step_by(0x1000) {
+            vm.map(page, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        }
+        vm.write_bytes(0x2000, code).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x2000;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.legacy.cr0 = 1;
+        for segment in &mut cpu.cpu.legacy.segments {
+            segment.limit = 0x3ffff;
+            segment.attributes |= 0x4000;
+        }
+        (vm, cpu)
+    }
+
+    #[test]
+    fn code32_rep_one_unit_and_partial_fault_preserve_full_indices() {
+        // SDM Vol 2B §4.3 REP pp. 4-563–564; decision-16: full-sized
+        // count/indices retain the completed prefix on a fault.
+        for stepped in [false, true] {
+            let (mut vm, mut c) = protected32(b"\xf3\xa5\xf4");
+            vm.write_bytes(0x15ffc, &[1, 2, 3, 4]).unwrap();
+            vm.write_bytes(0x16000, &[5, 6, 7, 8]).unwrap();
+            vm.unmap(0x26000, 0x1000).unwrap();
+            c.cpu.gpr[1] = 0x10002;
+            c.cpu.gpr[6] = 0x15ffc;
+            c.cpu.gpr[7] = 0x25ffc;
+            if stepped {
+                let r = c.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), 1);
+                assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            } else {
+                assert!(matches!(c.run(&vm, Some(1)), Exit::BudgetExhausted));
+            }
+            assert_eq!(
+                (
+                    c.cpu.gpr[1],
+                    c.cpu.gpr[6],
+                    c.cpu.gpr[7],
+                    c.cpu.rip,
+                    c.retired_instructions()
+                ),
+                (0x10001, 0x16000, 0x26000, 0x2000, 0)
+            );
+            let before = c.cpu.clone();
+            let r = c.run_steps(&vm, 64, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::UnmappedMemory { addr: 0x26000, .. })
+                ),
+                "{r:?}"
+            );
+            assert_eq!(c.cpu.gpr, before.gpr);
+            assert_eq!(c.cpu.rip, before.rip);
+        }
+    }
+
+    #[test]
+    fn code32_rep_retry_queues_a20_and_budget_preserves_irq() {
+        // SDM Vol 3A §11.7.13.4; decisions 16 and 22: owned MMIO
+        // completes before applying A20 or accepting IRQ; budget has priority.
+        let (mut vm, mut c) = protected32(b"\xf3\xa5\xf4");
+        vm.unmap(0x26000, 0x1000).unwrap();
+        vm.map(0x26000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        vm.write_bytes(0x16000, &[1, 2, 3, 4]).unwrap();
+        c.cpu.gpr[1] = 2;
+        c.cpu.gpr[6] = 0x16000;
+        c.cpu.gpr[7] = 0x26000;
+        c.cpu.flags.if_ = true;
+        let r = c.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), 0);
+        assert!(
+            matches!(
+                r.stop(),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr: 0x26000,
+                    size: 4,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        c.set_a20_enabled(false);
+        c.inject_irq(0x20);
+        assert_eq!(c.pending_a20_enabled(), Some(false));
+        assert!(!c.irq_ready());
+        c.complete_mmio_write();
+        let r = c.run_steps(&vm, 0, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), 0);
+        assert_eq!(c.pending_a20_enabled(), Some(false));
+        let r = c.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), 1);
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+            "{r:?}"
+        );
+        assert_eq!(
+            (
+                c.cpu.gpr[1],
+                c.cpu.gpr[6],
+                c.cpu.gpr[7],
+                c.cpu.rip,
+                c.retired_instructions()
+            ),
+            (1, 0x16004, 0x26004, 0x2000, 0)
+        );
+        assert_eq!(c.pending_a20_enabled(), None);
+        assert!(!c.a20_enabled());
+        assert!(c.has_pending_irq());
+        assert!(c.irq_ready());
+        assert!(!c.cpu.mmio_retry_active);
+    }
+
+    #[test]
+    fn code32_popfd_tf_is_seen_in_the_same_run_and_after_public_edit() {
+        // SDM Vol 2B §4.3 POPF/POPFD; Vol 3B §20.3.1.4:
+        // the newly loaded TF controls the following instruction boundary.
+        for budget in [1, 64] {
+            let (vm, mut c) = protected32(b"\x9d\x90\xf4");
+            vm.write_bytes(0x8000, &0x102u32.to_le_bytes()).unwrap();
+            let r = c.run_steps(&vm, budget, StepOptions::default()).unwrap();
+            if budget == 1 {
+                assert_eq!(r.steps(), 1);
+                assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                let r = c.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), 1);
+                assert!(
+                    matches!(r.stop(), StepStop::Exit(Exit::Exception { vector: 1, .. })),
+                    "{r:?}"
+                );
+            } else {
+                assert_eq!(r.steps(), 2);
+                assert!(
+                    matches!(r.stop(), StepStop::Exit(Exit::Exception { vector: 1, .. })),
+                    "{r:?}"
+                );
+            }
+            c.cpu.rflags_system &= !0x100;
+            let r = c.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)), "{r:?}");
+            assert_eq!(c.retired_instructions(), 3);
+        }
+    }
+}
+
+mod comparison_attempts {
+    use x86jit_core::{
+        CpuModel, ExceptionDelivery, Exit, Prot, RegionKind, ResetOptions, StepOptions, StepStop,
+        Vcpu, Vm, VmConfig,
+    };
+
+    fn setup(code: &[u8]) -> (Vm, Vcpu) {
+        setup_delivery(code, ExceptionDelivery::Outward)
+    }
+    fn setup_delivery(code: &[u8], delivery: ExceptionDelivery) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(VmConfig::flat(0x40000));
+        vm.set_cpu_model(CpuModel::I80386);
+        vm.set_exception_delivery(delivery);
+        vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x7000, 0x39000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, code).unwrap();
+        vm.write_bytes(0x4000, &[0x11; 32]).unwrap();
+        vm.write_bytes(0x5ffc, &[0x11; 4]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.cr0 = 1;
+        cpu.cpu.legacy.segments[0].attributes |= 0x4000;
+        cpu.cpu.legacy.segments[3].attributes |= 0x4000;
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.gpr[0] = 0x1111_1111;
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[6] = 0x4000;
+        cpu.cpu.gpr[7] = 0x5ffc;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.flags.cf = true;
+        cpu.cpu.flags.of = true;
+        (vm, cpu)
+    }
+    fn slice(cpu: &mut Vcpu, vm: &Vm, n: u64) {
+        let r = cpu.run_steps(vm, n, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), n, "{r:?}");
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+            "{r:?}"
+        );
+    }
+    fn map_fault(cpu: &mut Vcpu, vm: &Vm) {
+        let r = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), 0, "{r:?}");
+        assert!(
+            matches!(
+                r.stop(),
+                StepStop::Exit(Exit::UnmappedMemory { addr: 0x6000, .. })
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn origin_is_abandoned_after_an_observed_different_instruction_attempt() {
+        // Decision-16 §3: a redirected entry abandons the old instruction attempt.
+        // SDM Vol 2B §4.3 REPE p. 4-565: restore this attempt's entry flags.
+        let (vm, mut cpu) = setup(b"\xf3\xaf");
+        vm.write_bytes(0x1800, b"\x0f\x0b").unwrap(); // UD2, outward #UD
+        slice(&mut cpu, &vm, 1);
+        let restart_flags = cpu.cpu.flags;
+        cpu.cpu.rip = 0x1800;
+        let other = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(other.steps(), 0);
+        assert!(
+            matches!(
+                other.stop(),
+                StepStop::Exit(Exit::UnknownInstruction { .. } | Exit::Exception { vector: 6, .. })
+            ),
+            "{other:?}"
+        );
+        cpu.cpu.rip = 0x1000;
+        map_fault(&mut cpu, &vm);
+        assert_eq!(cpu.cpu.flags, restart_flags);
+    }
+
+    #[test]
+    fn comparison_origin_is_not_reused_after_cr0_round_trip() {
+        // Decision-23 §5: a public CR0 edit selects a fresh execution context.
+        // SDM Vol 2B §4.3 REPE p. 4-565: a fresh attempt uses current flags.
+        let mut stale = Vec::new();
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for opcode in [0xa7, 0xaf] {
+                    for repe in [false, true] {
+                        for budget in [1, 2, 8] {
+                            let mut code = Vec::new();
+                            if addr16 {
+                                code.push(0x67);
+                            }
+                            if word {
+                                code.push(0x66);
+                            }
+                            code.extend([if repe { 0xf3 } else { 0xf2 }, opcode]);
+                            let (vm, mut cpu) = setup(&code);
+                            let elem = if word { 2 } else { 4 };
+                            cpu.cpu.gpr[7] = 0x6000 - 2 * elem;
+                            vm.write_bytes(0x5ff8, &[if repe { 0x11 } else { 0x10 }; 8])
+                                .unwrap();
+                            cpu.cpu.flags.zf = !repe;
+                            slice(&mut cpu, &vm, 2);
+                            let restart_flags = cpu.cpu.flags;
+                            cpu.cpu.legacy.cr0 = 0;
+                            let mut units = 0;
+                            loop {
+                                let run =
+                                    cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                units += run.steps();
+                                if matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+                                    continue;
+                                }
+                                assert!(
+                                    matches!(
+                                        run.stop(),
+                                        StepStop::Exit(Exit::UnmappedMemory { addr: 0x6000, .. })
+                                    ),
+                                    "{run:?}"
+                                );
+                                break;
+                            }
+                            assert_eq!(units, 0);
+                            assert_eq!(cpu.cpu.flags, restart_flags);
+                            cpu.cpu.legacy.cr0 = 1;
+                            map_fault(&mut cpu, &vm);
+                            if cpu.cpu.flags != restart_flags {
+                                stale.push((
+                                    addr16,
+                                    word,
+                                    opcode,
+                                    repe,
+                                    budget,
+                                    restart_flags.to_flags16(),
+                                    cpu.cpu.flags.to_flags16(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "{} stale flag origins; first {:?}",
+            stale.len(),
+            stale.first()
+        );
+    }
+
+    #[test]
+    fn zero_probe_keeps_origin_but_reset_drops_it() {
+        // Decision-16 §3: a zero budget neither executes nor consumes ownership.
+        for reset in [false, true] {
+            let (vm, mut cpu) = setup(b"\xf3\xaf");
+            let original = cpu.cpu.flags;
+            slice(&mut cpu, &vm, 1);
+            let current = cpu.cpu.flags;
+            slice(&mut cpu, &vm, 0);
+            if reset {
+                cpu.reset_execution_state(ResetOptions::default());
+            }
+            map_fault(&mut cpu, &vm);
+            assert_eq!(cpu.cpu.flags, if reset { current } else { original });
+        }
+    }
+
+    fn descriptor(vm: &Vm, selector: u16, attr: u16) {
+        // SDM Vol 3A §3.4.5 Fig. 3-8: flat 64-KiB descriptor image.
+        let raw = 0xffffu64 | (u64::from(attr) << 40);
+        vm.write_bytes(0x2000 + u64::from(selector), &raw.to_le_bytes())
+            .unwrap();
+    }
+    fn read32(vm: &Vm, at: u64) -> u32 {
+        let mut b = [0; 4];
+        vm.read_bytes(at, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    }
+    #[test]
+    fn comparison_architectural_fault_frame_contains_original_flags() {
+        // SDM Vol 2B §4.3 REPE pp. 4-565–566, REPNE pp. 4-567–568;
+        // Vol 3A §§7.6, 7.12.1: the fault frame saves instruction-entry EFLAGS.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for opcode in [0xa7, 0xaf] {
+                    for repe in [false, true] {
+                        for budget in [1, 2, 8] {
+                            let mut code = vec![];
+                            if addr16 {
+                                code.push(0x67);
+                            }
+                            if word {
+                                code.push(0x66);
+                            }
+                            code.extend([if repe { 0xf3 } else { 0xf2 }, opcode]);
+                            let (vm, mut cpu) = setup_delivery(&code, ExceptionDelivery::InGuest);
+                            let elem = if word { 2 } else { 4 };
+                            vm.write_bytes(0x5ff8, &[if repe { 0x11 } else { 0x10 }; 8])
+                                .unwrap();
+                            vm.write_bytes(0x1800, b"\xf4").unwrap();
+                            descriptor(&vm, 8, 0x9b);
+                            descriptor(&vm, 16, 0x93);
+                            vm.write_bytes(0x3068, b"\x00\x18\x08\x00\x00\x8e\x00\x00")
+                                .unwrap();
+                            cpu.cpu.legacy.gdtr.base = 0x2000;
+                            cpu.cpu.legacy.gdtr.limit = 0x3f;
+                            cpu.cpu.legacy.idtr.base = 0x3000;
+                            cpu.cpu.legacy.idtr.limit = 0x7ff;
+                            cpu.cpu.cs = 8;
+                            cpu.cpu.ss = 16;
+                            cpu.cpu.legacy.segments[2].limit = 0x5fff;
+                            cpu.cpu.gpr[7] = 0x6000 - 2 * elem;
+                            cpu.cpu.flags.zf = !repe;
+                            let original = cpu.cpu.flags.to_flags16();
+                            let mut units = 0;
+                            for _ in 0..5 {
+                                let r = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                units += r.steps();
+                                if matches!(r.stop(), StepStop::Exit(Exit::Hlt)) {
+                                    break;
+                                }
+                                assert!(
+                                    matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                                    "{r:?}"
+                                );
+                            }
+                            assert_eq!(units, 3);
+                            assert_eq!(cpu.cpu.gpr[1], 1);
+                            assert_eq!(cpu.cpu.gpr[4], 0x7ff0);
+                            assert_eq!(read32(&vm, 0x7ff4), 0x1000);
+                            assert_eq!(read32(&vm, 0x7ffc) as u16, original,
+                "addr16={addr16}, word={word}, opcode={opcode:x}, repe={repe}, budget={budget}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mmio_answer_that_ends_comparison_retires_and_discards_origin() {
+        // SDM Vol 2B §4.3 REPE/REPNE pp. 4-565–568: answered comparison
+        // commits its flags; a stopping comparison retires the REP instruction.
+        for addr16 in [false, true] {
+            for word in [false, true] {
+                for opcode in [0xa7, 0xaf] {
+                    for repe in [false, true] {
+                        for budget in [1, 2, 8] {
+                            let mut code = vec![];
+                            if addr16 {
+                                code.push(0x67);
+                            }
+                            if word {
+                                code.push(0x66);
+                            }
+                            code.extend([if repe { 0xf3 } else { 0xf2 }, opcode, 0xf4]);
+                            let (mut vm, mut cpu) = setup(&code);
+                            vm.map(0x6000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+                            cpu.cpu.flags.zf = !repe;
+                            let elem = if word { 2 } else { 4 };
+                            cpu.cpu.gpr[7] = 0x6000 - elem;
+                            vm.write_bytes(0x5ffc, &[if repe { 0x11 } else { 0x10 }; 4])
+                                .unwrap();
+                            let mut units = 0;
+                            loop {
+                                let r = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                                units += r.steps();
+                                if matches!(r.stop(), StepStop::Exit(Exit::MmioRead { .. })) {
+                                    break;
+                                }
+                                assert!(
+                                    matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                                    "{r:?}"
+                                );
+                            }
+                            assert_eq!(units, 1);
+                            cpu.complete_mmio_read(if repe { 0x1010_1010 } else { 0x1111_1111 });
+                            slice(&mut cpu, &vm, 0);
+                            slice(&mut cpu, &vm, 1);
+                            assert_eq!(cpu.retired_instructions(), 1);
+                            assert_eq!(cpu.cpu.gpr[1], 1);
+                            assert_eq!(cpu.cpu.flags.zf, !repe);
+                            let current = cpu.cpu.flags;
+                            cpu.cpu.rip = 0x1000;
+                            cpu.cpu.gpr[7] = 0x7000;
+                            cpu.cpu.legacy.segments[2].limit = 0x6fff;
+                            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                            assert!(
+                                matches!(
+                                    r.stop(),
+                                    StepStop::Exit(Exit::Exception { vector: 13, .. })
+                                ),
+                                "{r:?}"
+                            );
+                            assert_eq!(cpu.cpu.flags, current);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn origin_is_abandoned_after_invalid_smc_at_the_same_address() {
+        // Decision-16 §3: changed source bytes start another instruction attempt.
+        // SDM Vol 2B §4.3 SCAS: LOCK is invalid; REPE p. 4-565 restores
+        // the flags at entry to the later, restored REP instruction.
+        let (vm, mut cpu) = setup(b"\xf3\xaf");
+        slice(&mut cpu, &vm, 1);
+        let restart_flags = cpu.cpu.flags;
+        vm.write_bytes(0x1000, b"\xf0\xaf").unwrap();
+        let changed = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(changed.steps(), 0);
+        assert!(
+            matches!(
+                changed.stop(),
+                StepStop::Exit(Exit::UnknownInstruction { .. } | Exit::Exception { vector: 6, .. })
+            ),
+            "{changed:?}"
+        );
+        vm.write_bytes(0x1000, b"\xf3\xaf").unwrap();
+        map_fault(&mut cpu, &vm);
+        assert_eq!(cpu.cpu.flags, restart_flags);
+    }
+
+    #[test]
+    fn protected_selection_survives_context_churn_and_pe_round_trips() {
+        // Decision-20 context eviction and decision-23 §5 executor selection.
+        // SDM Vol 2B §4.3 REPE p. 4-565 requires original flags in PE;
+        // the legacy real-mode last-comparison behavior is deliberately frozen.
+        let (vm, mut cpu) = setup(b"\xf3\xaf");
+        vm.write_bytes(0x5ff8, &[0x11; 8]).unwrap();
+        for salt in (0..24).chain((0..24).rev()) {
+            for protected in [true, false, true] {
+                cpu.cpu.legacy.cr0 = u32::from(protected);
+                cpu.cpu.legacy.gdtr.base = 0x2000 + salt * 8;
+                cpu.cpu.rip = 0x1000;
+                cpu.cpu.gpr[1] = 3;
+                cpu.cpu.gpr[7] = 0x5ff8;
+                cpu.cpu.flags.cf = true;
+                cpu.cpu.flags.of = true;
+                cpu.cpu.flags.zf = false;
+                let original = cpu.cpu.flags;
+                slice(&mut cpu, &vm, 2);
+                let compared = cpu.cpu.flags;
+                map_fault(&mut cpu, &vm);
+                assert_eq!(
+                    cpu.cpu.flags,
+                    if protected { original } else { compared },
+                    "salt={salt}, protected={protected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_origin_is_not_reused_after_hidden_cs_fetch_fault() {
+        // Decision-23 §5: edited hidden caches invalidate an instruction attempt.
+        // SDM Vol 3A §7.6 and Vol 2B §4.3 REPE p. 4-565: a subsequent
+        // attempt must not resurrect flags from before the abandoned execution.
+        let (vm, mut cpu) = setup(b"\xf3\xaf");
+        slice(&mut cpu, &vm, 1);
+        let restart_flags = cpu.cpu.flags;
+        let old_limit = cpu.cpu.legacy.segments[0].limit;
+        cpu.cpu.legacy.segments[0].limit = 0x0fff;
+        let fetch = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(fetch.steps(), 0);
+        assert!(
+            matches!(
+                fetch.stop(),
+                StepStop::Exit(Exit::Exception { vector: 13, .. })
+            ),
+            "{fetch:?}"
+        );
+        assert_eq!(cpu.cpu.flags, restart_flags);
+        cpu.cpu.legacy.segments[0].limit = old_limit;
+        map_fault(&mut cpu, &vm);
+        assert_eq!(cpu.cpu.flags, restart_flags);
+    }
+    #[test]
+    fn comparison_origin_is_not_reused_after_fetch_mapping_round_trip() {
+        // Decision-16 §3 and SDM Vol 2B §4.3 REPE p. 4-565:
+        // a fetch fault abandons this attempt before the mapping is restored.
+        for use_run in [false, true] {
+            for budget in [1, 2, 8] {
+                let (mut vm, mut cpu) = setup(b"\xf3\xaf");
+                slice(&mut cpu, &vm, 1);
+                let restart_flags = cpu.cpu.flags;
+                vm.unmap(0, 0x6000).unwrap();
+                if use_run {
+                    assert!(matches!(
+                        cpu.run(&vm, Some(budget)),
+                        Exit::UnmappedMemory { addr: 0x1000, .. }
+                    ));
+                } else {
+                    let run = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 0);
+                    assert!(matches!(
+                        run.stop(),
+                        StepStop::Exit(Exit::UnmappedMemory { addr: 0x1000, .. })
+                    ));
+                }
+                assert_eq!(cpu.cpu.flags, restart_flags);
+                assert_eq!(cpu.retired_instructions(), 0);
+                vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(0x1000, b"\xf3\xaf").unwrap();
+                map_fault(&mut cpu, &vm);
+                assert_eq!(
+                    cpu.cpu.flags, restart_flags,
+                    "use_run={use_run}, budget={budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_origin_is_not_reused_after_entry_rejection() {
+        // Decision-16 §3: an entry refusal cannot leave an old attempt live.
+        // SDM Vol 2B §4.3 REPE p. 4-565 defines the later attempt's flags.
+        for pending_input in [false, true] {
+            let (vm, mut cpu) = setup(b"\xf3\xaf");
+            slice(&mut cpu, &vm, 1);
+            let restart_flags = cpu.cpu.flags;
+            if pending_input {
+                cpu.cpu.pending_port_in = Some(1);
+                assert!(matches!(
+                    cpu.run_steps(&vm, 1, StepOptions::default()),
+                    Err(x86jit_core::StepRunError::PendingPortIn)
+                ));
+                cpu.cpu.pending_port_in = None;
+            } else {
+                cpu.cpu.legacy.cr0 |= 1 << 31;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 0);
+                assert!(matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext { .. })
+                ));
+                cpu.cpu.legacy.cr0 &= !(1 << 31);
+            }
+            assert_eq!(cpu.cpu.flags, restart_flags);
+            assert_eq!(cpu.retired_instructions(), 0);
+            map_fault(&mut cpu, &vm);
+            assert_eq!(
+                cpu.cpu.flags, restart_flags,
+                "pending_input={pending_input}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_stop_preserves_only_the_unchanged_comparison_attempt() {
+        // Decision-16 §3 permits preemption of the same instruction attempt.
+        // Observed edits abandon it; SDM Vol 2B §4.3 REPE p. 4-565 then
+        // restores the new attempt's entry flags on its subsequent fault.
+        for edit in 0..5 {
+            for use_run in [false, true] {
+                let (vm, mut cpu) = setup(b"\xf3\xaf");
+                let original = cpu.cpu.flags;
+                slice(&mut cpu, &vm, 1);
+                let current = cpu.cpu.flags;
+                let cr0 = cpu.cpu.legacy.cr0;
+                let limit = cpu.cpu.legacy.segments[0].limit;
+                let count = cpu.cpu.gpr[1];
+                match edit {
+                    0 => {}
+                    1 => cpu.cpu.legacy.cr0 = 0,
+                    2 => cpu.cpu.legacy.segments[0].limit = 0x0fff,
+                    3 => cpu.cpu.flags.cf = !current.cf,
+                    4 => cpu.cpu.gpr[1] += 1,
+                    _ => unreachable!(),
+                }
+                cpu.exit_request().request_exit();
+                if use_run {
+                    assert!(matches!(cpu.run(&vm, Some(1)), Exit::Interrupted));
+                } else {
+                    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    assert_eq!(run.steps(), 0);
+                    assert!(matches!(run.stop(), StepStop::Exit(Exit::Interrupted)));
+                }
+                cpu.cpu.legacy.cr0 = cr0;
+                cpu.cpu.legacy.segments[0].limit = limit;
+                cpu.cpu.gpr[1] = count;
+                cpu.cpu.flags = current;
+                map_fault(&mut cpu, &vm);
+                assert_eq!(
+                    cpu.cpu.flags,
+                    if edit == 0 { original } else { current },
+                    "edit={edit}, use_run={use_run}"
+                );
+            }
+        }
+    }
+}

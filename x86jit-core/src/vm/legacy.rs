@@ -1,6 +1,7 @@
-//! Machine dispatch with shared Direct blocks and retained Checked contexts
-//! (decision-23 §5; decision-20; spec.md §§9, 17). All blocks remain interpreted.
+//! Context caches and the shared Application/Machine dispatcher (decision-23 §5;
+//! decision-20; spec.md §§9, 17). Machine and the Real16 alias stay interpreted.
 use super::*;
+use crate::interp::legacy::BlockWalk;
 use crate::legacy::{
     derive_legacy_context, CpuGeneration, LegacyCpuState, MachineContext, MachineRegime, SegmentId,
 };
@@ -34,8 +35,66 @@ impl LegacyContextStamp {
             model,
             state,
             selectors: [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
-            system_flags: cpu.rflags_system & 0x7000,
+            system_flags: cpu.rflags_system & 0x27000,
         }
+    }
+    #[inline]
+    fn matches(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
+        #[inline(always)]
+        fn cache_bits(c: &crate::legacy::SegmentCache) -> (u64, u64) {
+            (
+                u64::from(c.base) | (u64::from(c.limit) << 32),
+                u64::from(c.attributes)
+                    | (u64::from(c.unusable) << 16)
+                    | (u64::from(c.reserved) << 24),
+            )
+        }
+        #[inline(always)]
+        fn table_bits(t: &crate::legacy::TableRegister) -> u64 {
+            u64::from(t.base) | (u64::from(t.limit) << 32) | (u64::from(t.reserved) << 48)
+        }
+        #[inline(always)]
+        fn system_bits(s: &crate::legacy::SystemSegment) -> (u64, u64) {
+            (
+                u64::from(s.selector)
+                    | (u64::from(s.reserved) << 16)
+                    | (u64::from(s.cache.base) << 32),
+                u64::from(s.cache.limit)
+                    | (u64::from(s.cache.attributes) << 32)
+                    | (u64::from(s.cache.unusable) << 48)
+                    | (u64::from(s.cache.reserved) << 56),
+            )
+        }
+        #[inline(always)]
+        fn tail_bits(s: &LegacyCpuState) -> u32 {
+            u32::from(s.cpl)
+                | (u32::from(s.a20_enabled) << 8)
+                | (u32::from(s.reset_fetch) << 16)
+                | (u32::from(s.reserved) << 24)
+        }
+        // Compare initialized fields, without reading padding or copying the
+        // normalized state. CR2 remains output-only (decision-23 §5).
+        let a = &self.state;
+        let b = &cpu.legacy;
+        let mut diff = u64::from(self.model != model)
+            | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs])
+            | (self.system_flags ^ (cpu.rflags_system & 0x27000))
+            | u64::from(a.cr0 ^ b.cr0)
+            | u64::from(a.cr3 ^ b.cr3)
+            | (table_bits(&a.gdtr) ^ table_bits(&b.gdtr))
+            | (table_bits(&a.idtr) ^ table_bits(&b.idtr))
+            | u64::from(tail_bits(a) ^ tail_bits(b));
+        for (a, b) in a.segments.iter().zip(&b.segments) {
+            let (a0, a1) = cache_bits(a);
+            let (b0, b1) = cache_bits(b);
+            diff |= (a0 ^ b0) | (a1 ^ b1);
+        }
+        for (a, b) in [(&a.ldtr, &b.ldtr), (&a.tr, &b.tr)] {
+            let (a0, a1) = system_bits(a);
+            let (b0, b1) = system_bits(b);
+            diff |= (a0 ^ b0) | (a1 ^ b1);
+        }
+        diff == 0
     }
 }
 // Decision-20: the firmware-style transition loop uses four contexts. Sixteen
@@ -49,6 +108,7 @@ struct RetainedContext {
 
 struct Block {
     ir: Arc<IrBlock>,
+    walk: BlockWalk,
     bytes: Vec<u8>,
 }
 struct InstructionRetry {
@@ -56,6 +116,7 @@ struct InstructionRetry {
     ip: u64,
     mxcsr_mode: u32,
     ir: Arc<IrBlock>,
+    walk: BlockWalk,
 }
 #[derive(Clone, Copy)]
 enum EventSource {
@@ -101,14 +162,84 @@ fn double_fault(generation: CpuGeneration, first: EventSource, second: EventSour
         || (first == 14 && (contributory(second) || second == 14))
 }
 
+#[derive(Clone, Copy, Default)]
+struct MachineBoundary {
+    task_pending: bool,
+    single_step: bool,
+    one_step: bool,
+    service: bool,
+    pending_io: bool,
+    instruction_retry: bool,
+    a20_pending: bool,
+    irq_pending: bool,
+}
+
+// Qualified while MachineContext is unchanged. Keeping the Arc prevents
+// address reuse; every probe still follows an authoritative VM cache lookup.
+// Edited entry, context-changing helpers/events, faults and reset clear it.
+#[derive(Default)]
+struct DirectProofs {
+    slots: [Option<(Arc<IrBlock>, BlockWalk)>; 8],
+}
+impl DirectProofs {
+    fn slot(ip: u64) -> usize {
+        ((ip ^ (ip >> 4)) & 7) as usize
+    }
+    fn get(&self, ir: &Arc<IrBlock>, ip: u64) -> Option<BlockWalk> {
+        self.slots[Self::slot(ip)]
+            .as_ref()
+            .filter(|(known, _)| Arc::ptr_eq(known, ir))
+            .map(|(_, walk)| *walk)
+    }
+    fn insert(&mut self, ir: &Arc<IrBlock>, ip: u64) -> BlockWalk {
+        let walk = BlockWalk::for_ir::<false>(ir);
+        self.slots[Self::slot(ip)] = Some((Arc::clone(ir), walk));
+        walk
+    }
+    fn clear(&mut self) {
+        self.slots = Default::default();
+    }
+}
+
+// SDM Vol 2B §4.3 REPE/REPZ p. 4-565 and REPNE/REPNZ p. 4-567:
+// comparison faults restore the flags from before the repeated instruction,
+// while the completed count/indices remain committed across host step slices.
+struct RepFlags {
+    ir: Arc<IrBlock>,
+    stamp: LegacyContextStamp,
+    cursor: [u64; 4],
+    flags: crate::state::Flags,
+    system_flags: u64,
+    origin: crate::state::Flags,
+    retired: u64,
+}
+
+impl RepFlags {
+    fn cursor(cpu: &CpuState) -> [u64; 4] {
+        [cpu.gpr[1], cpu.gpr[6], cpu.gpr[7], cpu.gpr[0]]
+    }
+    fn matches(&self, cpu: &CpuState, model: LegacyCpuModel, retired: u64) -> bool {
+        self.retired == retired
+            && self.ir.guest_start == cpu.rip
+            && self.cursor == Self::cursor(cpu)
+            && self.flags == cpu.flags
+            && self.system_flags == cpu.rflags_system
+            && self.stamp.matches(cpu, model)
+    }
+}
+
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
     context_id: u64,
     stamp: Option<LegacyContextStamp>,
+    validated: Option<(LegacyContextStamp, MachineContext, u64)>,
+    // The validated stamp covers every selector and the effective A20 line.
+    validated_direct_bus: bool,
     contexts: HashMap<LegacyContextStamp, RetainedContext>,
     blocks: HashMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
+    rep_flags: Option<Box<RepFlags>>,
     task_switch: crate::interp::legacy::tasks::SwitchState,
     #[cfg(test)]
     lifts: u64,
@@ -119,6 +250,7 @@ pub(super) struct Execution {
     port_debug: bool,
     shutdown: bool,
     pub(super) pending_a20_enabled: Option<bool>,
+    direct_proofs: DirectProofs,
     smc_pages: Vec<u64>,
     last_direct_fetch: Option<u64>,
 }
@@ -133,9 +265,12 @@ impl Execution {
             context_epoch: 0,
             context_id: 0,
             stamp: None,
+            validated: None,
+            validated_direct_bus: false,
             contexts: HashMap::new(),
             blocks: HashMap::new(),
             instruction_retry: None,
+            rep_flags: None,
             task_switch: Default::default(),
             #[cfg(test)]
             lifts: 0,
@@ -143,18 +278,27 @@ impl Execution {
             port_debug: false,
             shutdown: false,
             pending_a20_enabled: None,
+            direct_proofs: DirectProofs::default(),
             smc_pages: Vec::new(),
             last_direct_fetch: None,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
+        self.rep_flags = None;
         self.task_switch.reset();
         self.port_debug = false;
         self.shutdown = false;
         self.instruction_retry = None;
+        self.direct_proofs.clear();
         self.smc_pages.clear();
         self.last_direct_fetch = None;
+    }
+    #[inline]
+    fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
+        // A retained namespace can change while execution returns to the same CPU inputs.
+        let (stamp, context, epoch) = self.validated.as_ref()?;
+        (*epoch == self.context_epoch && stamp.matches(cpu, model)).then_some(*context)
     }
     pub(super) fn is_shutdown(&self) -> bool {
         self.shutdown
@@ -168,9 +312,11 @@ impl Execution {
             || self.task_switch.context().is_some()
     }
     fn invalidate_translations(&mut self) {
+        self.direct_proofs.clear();
         self.blocks.clear();
         self.contexts.clear();
         self.stamp = None;
+        self.validated = None;
     }
     #[cfg(test)]
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {
@@ -227,17 +373,17 @@ impl Execution {
             self.stamp = Some(stamp);
         }
     }
-    fn resolve(
+    fn resolve<const KIND: u8>(
         &mut self,
         vm: &Vm,
         cpu: &CpuState,
         model: LegacyCpuModel,
         context: MachineContext,
         _exit_word: &AtomicU64,
-    ) -> Result<Arc<IrBlock>, Exit> {
+    ) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
         if self.task_switch.context().is_some() {
             if let Some(retry) = &self.instruction_retry {
-                return Ok(retry.ir.clone());
+                return Ok((retry.ir.clone(), retry.walk));
             }
         }
         let linear_fetch = crate::legacy::access(
@@ -267,7 +413,7 @@ impl Execution {
                 && retry.ip == cpu.rip
                 && retry.mxcsr_mode == key.mxcsr_mode
             {
-                return Ok(retry.ir.clone());
+                return Ok((retry.ir.clone(), retry.walk));
             }
         }
 
@@ -278,7 +424,7 @@ impl Execution {
         let bytes = fetch(vm, cpu, context)?;
         if let Some(block) = self.blocks.get(&key) {
             if block.bytes == bytes {
-                return Ok(block.ir.clone());
+                return Ok((block.ir.clone(), block.walk));
             }
         }
         let ir =
@@ -293,6 +439,11 @@ impl Execution {
                 }
             })?;
         let ir = Arc::new(ir);
+        let walk = if KIND == MACHINE_DISPATCH {
+            BlockWalk::for_ir::<true>(&ir)
+        } else {
+            BlockWalk::for_ir::<false>(&ir)
+        };
         #[cfg(test)]
         {
             self.lifts += 1;
@@ -301,10 +452,80 @@ impl Execution {
             key,
             Block {
                 ir: ir.clone(),
+                walk,
                 bytes,
             },
         );
-        Ok(ir)
+        Ok((ir, walk))
+    }
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_protected_block<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        ir: &Arc<IrBlock>,
+        cpu: &mut CpuState,
+        memory: &crate::memory::Memory,
+        scratch: &mut impl crate::interp::ScratchBuffer,
+        model: LegacyCpuModel,
+        retired: u64,
+    ) -> crate::interp::legacy::Progress {
+        let comparing = ir.ops.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Legacy(crate::legacy::LegacyOp::String {
+                    kind: crate::ir::StrOp::Cmps | crate::ir::StrOp::Scas,
+                    rep: crate::ir::RepKind::Repe | crate::ir::RepKind::Repne,
+                    ..
+                })
+            )
+        });
+        if comparing {
+            let continuing = self.rep_flags.as_ref().is_some_and(|saved| {
+                Arc::ptr_eq(&saved.ir, ir) && saved.matches(cpu, model, retired)
+            });
+            if !continuing {
+                self.rep_flags = Some(Box::new(RepFlags {
+                    ir: Arc::clone(ir),
+                    stamp: LegacyContextStamp::new(cpu, model),
+                    cursor: RepFlags::cursor(cpu),
+                    flags: cpu.flags,
+                    system_flags: cpu.rflags_system,
+                    origin: cpu.flags,
+                    retired,
+                }));
+            }
+        } else {
+            self.rep_flags = None;
+        }
+        let progress = crate::interp::legacy::execute_checked::<ROUTED, ORDER>(
+            ir,
+            cpu,
+            memory,
+            scratch,
+            &mut self.task_switch,
+        );
+        if let Some(saved) = self.rep_flags.as_mut() {
+            let fault = progress.outcome.as_ref().is_some_and(|outcome| {
+                outcome.as_ref().is_err_and(|exit| {
+                    matches!(exit, Exit::UnmappedMemory { .. })
+                        || exit
+                            .fault_metadata()
+                            .is_some_and(|m| m.class() == crate::fault::FaultClass::Fault)
+                })
+            });
+            if fault {
+                cpu.flags = saved.origin;
+                self.rep_flags = None;
+            } else if progress.retired != 0 || cpu.rip != ir.guest_start {
+                self.rep_flags = None;
+            } else {
+                saved.cursor = RepFlags::cursor(cpu);
+                saved.flags = cpu.flags;
+                saved.system_flags = cpu.rflags_system;
+            }
+        }
+        progress
     }
 }
 
@@ -401,14 +622,23 @@ fn resolve_direct(
     context: MachineContext,
     exit_word: &AtomicU64,
     physical: u64,
-) -> Result<Arc<IrBlock>, Exit> {
+    proofs: &mut DirectProofs,
+) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
     let key = BlockKey::machine_direct(physical, cpu.mxcsr, cpu.legacy.a20_enabled != 0);
     if let Some(CachedBlock::Interpreted(ir)) = vm.cache.get_for_dispatch(key, vm.time_enabled) {
-        if ir.guest_start == cpu.rip && ir.legacy_context == Some(context) {
-            return Ok(ir);
+        if ir.guest_start == cpu.rip {
+            if let Some(walk) = proofs.get(&ir, cpu.rip) {
+                return Ok((ir, walk));
+            }
+            if ir.legacy_context == Some(context) {
+                let walk = proofs.insert(&ir, cpu.rip);
+                return Ok((ir, walk));
+            }
         }
     }
-    resolve_direct_uncached(vm, cpu, context, exit_word, physical, key)
+    let ir = resolve_direct_uncached(vm, cpu, context, exit_word, physical, key)?;
+    let walk = proofs.insert(&ir, cpu.rip);
+    Ok((ir, walk))
 }
 
 #[cold]
@@ -681,7 +911,107 @@ fn fetch_watched(
     Ok(bytes)
 }
 
+#[inline(always)]
+fn resolve_alias<const STEPPED: bool>(
+    vm: &Vm,
+    stats: &mut crate::time_stats::DispatchCounts,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
+    at: FetchAddr,
+    mxcsr: u32,
+) -> Result<Arc<IrBlock>, Exit> {
+    stats.fetch_calls = stats.fetch_calls.saturating_add(1);
+    let _time_fetch = vm
+        .time_enabled
+        .then(|| crate::time_stats::ResolveTimer::enter(stats.fetch_calls));
+    let default = STEPPED || mxcsr & crate::jit_abi::fp::MODE_MASK == 0;
+    let key = if default {
+        BlockKey::new(at.pa, CpuMode::Real16)
+    } else {
+        BlockKey::with_mxcsr(at.pa, CpuMode::Real16, mxcsr)
+    };
+    loop {
+        stats.lookups = stats.lookups.saturating_add(1);
+        if let Some(CachedBlock::Interpreted(ir)) = vm.cache.get_for_dispatch(key, vm.time_enabled)
+        {
+            return Ok(ir);
+        }
+        stats.misses = stats.misses.saturating_add(1);
+        if vm.time_enabled {
+            crate::time_stats::ResolveTimer::miss();
+        }
+        let result = if default {
+            resolve_alias_uncached::<true>(vm, exit_word, sections, at, mxcsr)
+        } else {
+            resolve_alias_uncached::<false>(vm, exit_word, sections, at, mxcsr)
+        };
+        match result {
+            Ok(ir) => return Ok(ir),
+            Err(ResolveFailure::Exit(exit)) => return Err(exit),
+            Err(ResolveFailure::Retry) => {}
+        }
+    }
+}
+#[cold]
+#[inline(never)]
+fn resolve_alias_uncached<const DEFAULT: bool>(
+    vm: &Vm,
+    exit_word: &AtomicU64,
+    sections: &AtomicU64,
+    at: FetchAddr,
+    mxcsr: u32,
+) -> Result<Arc<IrBlock>, ResolveFailure> {
+    let source = crate::memory::LiftSource::new(&vm.mem);
+    resolve_real16_uncached::<DEFAULT>(vm, &source, exit_word, sections, at, mxcsr).map(|block| {
+        match block {
+            CachedBlock::Interpreted(ir) => ir,
+            _ => unreachable!(),
+        }
+    })
+}
+
 impl Vcpu {
+    #[inline(always)]
+    pub(super) fn finish_comparison_attempt(&mut self, result: &Result<StepRun, StepRunError>) {
+        if self.legacy_execution.as_ref().unwrap().rep_flags.is_some() {
+            self.finish_owned_comparison_attempt(result);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_owned_comparison_attempt(&mut self, result: &Result<StepRun, StepRunError>) {
+        let saved = self
+            .legacy_execution
+            .as_mut()
+            .unwrap()
+            .rep_flags
+            .take()
+            .unwrap();
+        let continuing = match result {
+            Ok(StepRun {
+                stop: StepStop::IrqReady,
+                ..
+            }) => true,
+            Ok(StepRun {
+                stop: StepStop::Exit(exit),
+                ..
+            }) => match exit {
+                Exit::BudgetExhausted | Exit::Interrupted => true,
+                Exit::MmioRead { .. } | Exit::MmioWrite { .. } => {
+                    self.cpu.mmio_retry_active && self.cpu.owns_mmio_retry(self.cpu.rip)
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        // Consume by default: faults, entry errors and future exit kinds cannot
+        // retain an abandoned attempt through a reusable translation context.
+        if continuing && saved.matches(&self.cpu, self.legacy_model.unwrap(), self.retired) {
+            self.legacy_execution.as_mut().unwrap().rep_flags = Some(saved);
+        }
+    }
+
     pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
         if let Some(context) = self
@@ -714,13 +1044,35 @@ impl Vcpu {
         Ok(context)
     }
 
-    pub(super) fn run_legacy(
+    #[inline]
+    pub(super) fn warm_machine_context(&mut self, limit: Option<u64>) -> Option<MachineContext> {
+        if limit != Some(0)
+            && !self.cpu.mmio_retry_active
+            && self.cpu.task_debug_trap == 0
+            && self.cpu.rip <= u64::from(u32::MAX)
+        {
+            let execution = self.legacy_execution.as_mut().unwrap();
+            if !execution.shutdown && !execution.has_continuation() {
+                if let Some(context) =
+                    execution.validated_context(&self.cpu, self.legacy_model.unwrap())
+                {
+                    if context.segment_class == crate::SegmentClass::Direct {
+                        execution.task_switch.committed = false;
+                        execution.task_switch.completed = false;
+                    }
+                    return Some(context);
+                }
+            }
+        }
+        None
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn prepare_machine_entry_cold(
         &mut self,
-        vm: &Vm,
         limit: Option<u64>,
-        options: StepOptions,
-        stepped: bool,
-    ) -> Result<StepRun, StepRunError> {
+    ) -> Result<MachineContext, Exit> {
         // Decision-24: edited state abandons the entire owned operation before
         // entry validation can reject its deliberately unfinished segment caches.
         // A zero-budget probe leaves continuations and completion inputs intact.
@@ -743,26 +1095,12 @@ impl Vcpu {
             self.cpu.mmio_retry_cs = 0;
             self.apply_pending_a20();
         }
-        let context = match self.legacy_context_for_run() {
-            Ok(context) => context,
-            Err(exit) => {
-                return Ok(StepRun {
-                    steps: 0,
-                    stop: StepStop::Exit(exit),
-                })
-            }
-        };
+        let context = self.legacy_context_for_run()?;
         if limit == Some(0) {
-            return Ok(StepRun {
-                steps: 0,
-                stop: StepStop::Exit(Exit::BudgetExhausted),
-            });
+            return Err(Exit::BudgetExhausted);
         }
         if self.legacy_execution.as_ref().unwrap().shutdown {
-            return Ok(StepRun {
-                steps: 0,
-                stop: StepStop::Exit(Exit::Shutdown { addr: self.cpu.rip }),
-            });
+            return Err(Exit::Shutdown { addr: self.cpu.rip });
         }
         // Decision-16 §§1,3: validate CS:RIP ownership before execution,
         // while leaving every completion slot untouched at zero budget.
@@ -780,11 +1118,6 @@ impl Vcpu {
             self.release_legacy_event_boundary();
             self.apply_pending_a20();
         }
-        if stepped && self.cpu.pending_port_in.is_some() {
-            return Err(StepRunError::PendingPortIn);
-        }
-        self.interruption_evidence = None;
-        self.syscall_evidence = None;
         if context.segment_class == crate::SegmentClass::Direct {
             // Direct has no task continuation and shared blocks cannot start a
             // task switch. A Checked transition back starts a fresh execute()
@@ -793,71 +1126,50 @@ impl Vcpu {
             task_switch.committed = false;
             task_switch.completed = false;
         }
+        self.legacy_execution
+            .as_mut()
+            .unwrap()
+            .direct_proofs
+            .clear();
         self.legacy_execution.as_mut().unwrap().sync_class(
             &self.cpu,
             self.legacy_model.unwrap(),
             false,
             context.segment_class,
         );
-        let time_run = crate::time_stats::RunGuard::enter(
-            self.time_record.clone(),
-            vm.time_enabled,
-            self.time_outside.take(),
-        );
-        let _fp = crate::jit_abi::fp::RunMode::new();
-        let dispatch = DispatchGuard::new(self, vm);
-        let cpu = &mut *dispatch.cpu;
-        cpu.fault_entry.prepare_run();
-        struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
-        impl Drop for FaultRunGuard {
-            fn drop(&mut self) {
-                // SAFETY: the boxed entry remains fixed throughout the exclusive
-                // vCPU borrow, including if a fetch-policy callback unwinds.
-                unsafe {
-                    (*self.0).deactivate();
-                }
-            }
-        }
-        let guard = FaultRunGuard(&mut *cpu.fault_entry);
-        let mut ctx = MemCtx::for_memory(&vm.mem);
-        cpu.fault_entry.publish(&mut cpu.cpu, &mut ctx);
-        let mut result = match (vm.mem.host_fault_recovery(), vm.consistency) {
-            (true, MemConsistency::Fast) => {
-                cpu.legacy_loop::<true, 0>(vm, limit, options, stepped, context)
-            }
-            (false, MemConsistency::Fast) => {
-                cpu.legacy_loop::<false, 0>(vm, limit, options, stepped, context)
-            }
-            (true, MemConsistency::AcqRel) => {
-                cpu.legacy_loop::<true, 1>(vm, limit, options, stepped, context)
-            }
-            (false, MemConsistency::AcqRel) => {
-                cpu.legacy_loop::<false, 1>(vm, limit, options, stepped, context)
-            }
-            (true, MemConsistency::FullTso) => {
-                cpu.legacy_loop::<true, 2>(vm, limit, options, stepped, context)
-            }
-            (false, MemConsistency::FullTso) => {
-                cpu.legacy_loop::<false, 2>(vm, limit, options, stepped, context)
-            }
-        };
-        drop(guard);
-        if let StepStop::Exit(exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. })) =
-            result.stop
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.validated_direct_bus = raw_direct(&self.cpu);
+        execution.validated = Some((
+            LegacyContextStamp::new(&self.cpu, self.legacy_model.unwrap()),
+            context,
+            execution.context_epoch,
+        ));
+        Ok(context)
+    }
+
+    pub(super) fn finish_machine_run(&mut self, result: &mut StepRun) {
+        if matches!(result.stop, StepStop::Exit(Exit::BudgetExhausted))
+            && !self.cpu.mmio_retry_active
         {
-            result.stop = StepStop::Exit(cpu.fault_entry.finish_transfer_fault(exit, &vm.mem));
+            let execution = self.legacy_execution.as_ref().unwrap();
+            if execution.task_switch.context().is_none()
+                && execution.instruction_retry.is_none()
+                && execution.pending_a20_enabled.is_none()
+            {
+                return;
+            }
         }
         // The Machine bus handoff exposes only this transfer's bytes, including
         // stores whose source register or split operand contains higher bits.
         if let StepStop::Exit(Exit::MmioWrite { size, value, .. }) = &mut result.stop {
             *value &= u64::MAX >> (8 * (8 - *size));
         }
-        cpu.cpu.finish_mmio_retry(match &result.stop {
+        self.cpu.finish_mmio_retry(match &result.stop {
             StepStop::Exit(exit) => Some(exit),
             StepStop::IrqReady => None,
         });
-        if !cpu.cpu.mmio_retry_active
-            && cpu
+        if !self.cpu.mmio_retry_active
+            && self
                 .legacy_execution
                 .as_ref()
                 .unwrap()
@@ -865,24 +1177,18 @@ impl Vcpu {
                 .context()
                 .is_none()
         {
-            cpu.legacy_execution.as_mut().unwrap().instruction_retry = None;
+            self.legacy_execution.as_mut().unwrap().instruction_retry = None;
         }
-        cpu.apply_pending_a20();
+        self.apply_pending_a20();
         if let StepStop::Exit(exit) = &result.stop {
             // Retry bookkeeping above is engine-owned. Seal the state actually
             // returned to the embedder, allowing only this exit's completion.
-            cpu.legacy_execution
+            self.legacy_execution
                 .as_mut()
                 .unwrap()
                 .task_switch
-                .seal_exit(&cpu.cpu, exit);
+                .seal_exit(&self.cpu, exit);
         }
-        drop(dispatch);
-        self.time_outside = time_run.finish(match &result.stop {
-            StepStop::Exit(exit) => Some(exit),
-            StepStop::IrqReady => None,
-        });
-        Ok(result)
     }
 
     fn deliver_legacy_event<const ROUTED: bool, const ORDER: u8>(
@@ -891,6 +1197,12 @@ impl Vcpu {
         mut context: MachineContext,
         mut event: PendingEvent,
     ) -> Result<(), Exit> {
+        self.legacy_execution.as_mut().unwrap().rep_flags = None;
+        self.legacy_execution
+            .as_mut()
+            .unwrap()
+            .direct_proofs
+            .clear();
         // Decision-23 §5: processor exceptions can be exposed without delivery.
         if context.regime == MachineRegime::Protected
             && self.exception_delivery == crate::ExceptionDelivery::Outward
@@ -1105,284 +1417,199 @@ impl Vcpu {
         )
     }
 
-    fn legacy_loop<const ROUTED: bool, const ORDER: u8>(
+    #[inline]
+    fn machine_pending_io(&self, task_pending: bool) -> bool {
+        task_pending
+            || self.cpu.mmio_retry_active
+            || self.cpu.pending_port_in.is_some()
+            || self.cpu.pending_mmio.is_some()
+            || self.cpu.pending_mmio_write
+            || self.cpu.port_string_in.is_some()
+    }
+
+    #[inline]
+    fn machine_boundary<const SINGLE: bool>(&self, options: StepOptions) -> MachineBoundary {
+        let execution = self.legacy_execution.as_ref().unwrap();
+        let task_pending = execution.task_switch_pending();
+        // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
+        // TF changes only at an instruction/event boundary. Task continuations
+        // retain the sample from their original instruction.
+        let single_step = if task_pending {
+            execution
+                .task_switch
+                .single_step()
+                .unwrap_or(self.cpu.rflags_system & 0x100 != 0)
+        } else {
+            self.cpu.rflags_system & 0x100 != 0
+        };
+        let irq_pending = self.pending_irq.is_some();
+        let a20_pending = execution.pending_a20_enabled.is_some();
+        MachineBoundary {
+            task_pending,
+            single_step,
+            irq_pending,
+            a20_pending,
+            one_step: SINGLE
+                || single_step
+                || self.sti_shadow
+                || self.ss_shadow
+                || irq_pending
+                || a20_pending
+                || options.stop_when_irq_ready,
+            service: self.cpu.port_string_in.is_some()
+                || execution.port_debug
+                || execution.event_retry.is_some()
+                || irq_pending
+                || options.stop_when_irq_ready,
+            // A one-step budget already caps execution and forces refresh.
+            // Its I/O eligibility is queried only when a host request exists.
+            pending_io: !SINGLE && self.machine_pending_io(task_pending),
+            instruction_retry: execution.instruction_retry.is_some(),
+        }
+    }
+
+    // Profile constants keep compiled chaining free of interpreted context checks.
+    #[inline(always)]
+    pub(super) fn run_dispatch<
+        const ROUTED: bool,
+        const DEFAULT: bool,
+        const BOUNDED: bool,
+        const KIND: u8,
+        const STEPPED: bool,
+        const STOP: bool,
+        const ORDER: u8,
+        const SINGLE: bool,
+    >(
         &mut self,
         vm: &Vm,
-        limit: Option<u64>,
+        budget: u64,
+        fp_mode: &mut crate::jit_abi::fp::RunMode,
+        origin: SharedReason,
         options: StepOptions,
-        _stepped: bool,
-        mut context: MachineContext,
-    ) -> StepRun {
-        let model = self.legacy_model.unwrap();
+        initial_context: Option<(MachineContext, Option<u64>)>,
+    ) -> DispatchResult {
+        // Epoch numbers belong to a domain. A vCPU used with another VM must
+        // not carry predictions whose equal epoch names a different backend.
+        let mut participant = if KIND == APPLICATION_DISPATCH {
+            let lifetime = vm.cache.code_lifetime();
+            if !Arc::ptr_eq(&self.fast_lifetime, &lifetime) {
+                self.fast_clear();
+                self.execution_participant = lifetime.participant();
+                self.fast_epoch = lifetime.epoch();
+                self.fast_lifetime = lifetime;
+            }
+            Some(self.execution_participant.for_dispatch())
+        } else {
+            None
+        };
+        let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
+        let mut shared_reason = origin;
+        let mut blocks_run: u64 = 0;
+        let exit_word_owner = Arc::clone(&self.exit_request.word);
+        let exit_word: &AtomicU64 = &exit_word_owner;
+        // Deliberately a LOCAL: taking it as a `&mut` parameter instead measured +5.4%
+        // on the dispatch-micro bench, because the compiler stops treating it as one.
+        let mut ctx = MemCtx::for_memory(&vm.mem);
+        ctx.time_enabled = u64::from(vm.time_enabled);
+        self.fault_entry.publish(&mut self.cpu, &mut ctx);
+        if KIND == APPLICATION_DISPATCH {
+            ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
+            // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
+            // boxed, so its address is stable for the whole run despite `&mut self`.
+            ctx.ret_stack = std::ptr::addr_of_mut!(*self.ret_stack) as u64;
+            // ...and the executed-instruction counter it charges into. Stable
+            // for the run: `self` cannot move while this call is on the stack. Read only
+            // by blocks the backend chose to emit accounting into.
+            ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
+        }
+        if (KIND == APPLICATION_DISPATCH || KIND == ALIAS_DISPATCH) && (!BOUNDED || budget != 0) {
+            if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
+                return if KIND == APPLICATION_DISPATCH {
+                    DispatchResult::Application(Ok(exit))
+                } else {
+                    DispatchResult::Stepped(StepRun {
+                        steps: 0,
+                        stop: StepStop::Exit(exit),
+                    })
+                };
+            }
+        }
+        let mut dispatch = if KIND == APPLICATION_DISPATCH {
+            exit_word.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        let limit = if SINGLE {
+            Some(1)
+        } else if KIND == MACHINE_DISPATCH {
+            if STEPPED {
+                Some(budget)
+            } else {
+                initial_context.unwrap().1
+            }
+        } else {
+            BOUNDED.then_some(budget)
+        };
         let mut steps = 0;
-        let mut direct_bus = raw_direct(&self.cpu);
-        let exit_word_owner = self.exit_request.word.clone();
-        let exit_word = &*exit_word_owner;
+        let mut alias_steps = crate::interp::StepContext::new(budget);
+        let model = self.legacy_model.unwrap_or(LegacyCpuModel {
+            generation: CpuGeneration::I286,
+            model_semantics_id: 0,
+        });
+        let mut context =
+            initial_context.map_or_else(crate::lift::legacy::alias_context, |initial| initial.0);
+        let mut direct_bus = KIND == ALIAS_DISPATCH
+            || (KIND == MACHINE_DISPATCH
+                && self.legacy_execution.as_ref().unwrap().validated_direct_bus);
+        let mut boundary = MachineBoundary::default();
+        let mut refresh_boundary = true;
         loop {
-            // Task state changes only during execution or event delivery; an
-            // event restarts this iteration before dispatching its new context.
-            let task_pending = self
-                .legacy_execution
-                .as_ref()
-                .unwrap()
-                .task_switch_pending();
-            let stop = if limit.is_some_and(|limit| steps >= limit) {
-                Some(Exit::BudgetExhausted)
-            } else if !self.cpu.mmio_retry_active
-                && !task_pending
-                && self.cpu.pending_port_in.is_none()
-                && self.cpu.pending_mmio.is_none()
-                && !self.cpu.pending_mmio_write
-                && self.cpu.port_string_in.is_none()
-                && self.exit_request.word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
-            {
-                Some(self.interrupted(crate::FaultPath::Interpreter, false))
-            } else {
-                None
-            };
-            if let Some(exit) = stop {
-                return StepRun {
-                    steps,
-                    stop: StepStop::Exit(exit),
+            if KIND == MACHINE_DISPATCH {
+                if limit.is_some_and(|limit| steps >= limit) {
+                    return DispatchResult::Stepped(StepRun {
+                        steps,
+                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                    });
+                }
+                if refresh_boundary {
+                    boundary = self.machine_boundary::<SINGLE>(options);
+                }
+                // Only an ordinary completed shared block can retain this proof.
+                // Helpers, faults and event continuations refresh on the next turn.
+                refresh_boundary = true;
+                let task_pending = boundary.task_pending;
+                let stop = if self.exit_request.word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
+                    && if SINGLE {
+                        !self.machine_pending_io(task_pending)
+                    } else {
+                        !boundary.pending_io
+                    } {
+                    Some(self.interrupted(crate::FaultPath::Interpreter, false))
+                } else {
+                    None
                 };
-            }
-            if self.cpu.port_string_in.is_some() {
-                if let Err(exit) = crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
-                    &mut self.cpu,
-                    &vm.mem,
-                ) {
-                    return StepRun {
+                if let Some(exit) = stop {
+                    return DispatchResult::Stepped(StepRun {
                         steps,
                         stop: StepStop::Exit(exit),
-                    };
+                    });
                 }
-                self.sti_shadow = false;
-                self.ss_shadow = false;
-                if self.cpu.mmio_retry_active {
-                    self.cpu.finish_mmio_retry(None);
-                }
-                if self
-                    .legacy_execution
-                    .as_ref()
-                    .unwrap()
-                    .pending_a20_enabled
-                    .is_some()
-                {
-                    self.apply_pending_a20();
-                    direct_bus = raw_direct(&self.cpu);
-                }
-            }
-            if !task_pending
-                && self.legacy_execution.as_ref().unwrap().port_debug
-                && self.cpu.pending_port_in.is_none()
-                && self.cpu.port_string_in.is_none()
-            {
-                self.legacy_execution.as_mut().unwrap().port_debug = false;
-                self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
-                    irq_consumed: false,
-                    source: EventSource::SingleStep,
-                    ip: self.cpu.rip as u32,
-                    cs: self.cpu.cs,
-                });
-            }
-            let event = self
-                .legacy_execution
-                .as_ref()
-                .unwrap()
-                .event_retry
-                .or_else(|| {
-                    self.pending_irq
-                        .filter(|_| {
-                            !task_pending
-                                && self.irq_delivery_ready()
-                                && !self.cpu.mmio_retry_active
-                        })
-                        .map(|vector| PendingEvent {
-                            irq_consumed: false,
-                            source: EventSource::Irq(vector),
-                            ip: self.cpu.rip as u32,
-                            cs: self.cpu.cs,
-                        })
-                });
-            if let Some(event) = event {
-                if let Err(exit) = self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event) {
-                    return StepRun {
-                        steps,
-                        stop: StepStop::Exit(exit),
-                    };
-                }
-                // Delivery costs no instruction unit. Re-derive after the CS reload.
-                context = match self.legacy_context_for_run() {
-                    Ok(context) => context,
-                    Err(exit) => {
-                        return StepRun {
-                            steps,
-                            stop: StepStop::Exit(exit),
-                        }
-                    }
-                };
-                direct_bus = raw_direct(&self.cpu);
-                continue;
-            }
-            if options.stop_when_irq_ready
-                && !task_pending
-                && !self.cpu.mmio_retry_active
-                && self.irq_delivery_ready()
-            {
-                return StepRun {
-                    steps,
-                    stop: StepStop::IrqReady,
-                };
-            }
-            let direct = !task_pending && context.segment_class == crate::SegmentClass::Direct;
-            let linear_fetch = (u64::from(self.cpu.cs) << 4) + self.cpu.rip;
-            let physical = if direct && direct_bus {
-                linear_fetch
-            } else {
-                crate::legacy::physical_span(&self.cpu, linear_fetch, 1).0
-            };
-            let page = physical >> crate::memory::CODE_PAGE_BITS;
-            let dirty = exit_word.load(Ordering::Relaxed) & crate::memory::DISPATCH_DIRTY != 0;
-            let dropped = dirty.then(|| vm.cache.invalidated_blocks());
-            vm.handle_smc(exit_word);
-            let execution = self.legacy_execution.as_mut().unwrap();
-            if dropped.is_some_and(|before| before != vm.cache.invalidated_blocks()) {
-                if let Some(last) = execution.last_direct_fetch {
-                    // This bounded page hint is only a lowering choice. Precise
-                    // source invalidation and byte revalidation remain authoritative.
-                    for page in [last >> crate::memory::CODE_PAGE_BITS, page] {
-                        if !execution.smc_pages.contains(&page) {
-                            if execution.smc_pages.len() == 16 {
-                                execution.smc_pages.remove(0);
-                            }
-                            execution.smc_pages.push(page);
-                        }
-                    }
-                }
-            }
-            let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
-            let resolved = if direct
-                && !retained
-                && self
-                    .legacy_execution
-                    .as_ref()
-                    .unwrap()
-                    .instruction_retry
-                    .is_none()
-            {
-                resolve_direct(vm, &self.cpu, context, exit_word, physical)
-            } else {
-                let execution = self.legacy_execution.as_mut().unwrap();
-                if execution.context_id == u64::MAX {
-                    execution.sync_class(&self.cpu, model, true, crate::SegmentClass::Checked);
-                }
-                execution.resolve(
-                    vm,
-                    &self.cpu,
-                    model,
-                    MachineContext {
-                        // The masked bus lowering retains the Direct proof;
-                        // SMC uses the cheaper original Checked instruction IR.
-                        segment_class: if direct && !direct_bus {
-                            crate::SegmentClass::Direct
-                        } else {
-                            crate::SegmentClass::Checked
-                        },
-                        ..context
-                    },
-                    exit_word,
-                )
-            };
-            self.legacy_execution.as_mut().unwrap().last_direct_fetch =
-                (direct && !retained).then_some(linear_fetch);
-            let ir = match resolved {
-                Ok(ir) => ir,
-                Err(exit) => {
-                    match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
-                        Ok(()) => {
-                            context = match self.legacy_context_for_run() {
-                                Ok(context) => context,
-                                Err(exit) => {
-                                    return StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    }
-                                }
-                            };
-                            direct_bus = raw_direct(&self.cpu);
-                            continue;
-                        }
-                        Err(exit) => {
-                            return StepRun {
+                if boundary.service {
+                    if self.cpu.port_string_in.is_some() {
+                        if let Err(exit) = crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
+                            &mut self.cpu,
+                            &vm.mem,
+                        ) {
+                            return DispatchResult::Stepped(StepRun {
                                 steps,
                                 stop: StepStop::Exit(exit),
-                            }
+                            });
                         }
-                    }
-                }
-            };
-            // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
-            // sample TF before execution, including POPF/IRET that change it.
-            let single_step = if task_pending {
-                self.legacy_execution
-                    .as_ref()
-                    .unwrap()
-                    .task_switch
-                    .single_step()
-                    .unwrap_or(self.cpu.rflags_system & 0x100 != 0)
-            } else {
-                self.cpu.rflags_system & 0x100 != 0
-            };
-            let progress = if direct
-                && ir
-                    .legacy_context
-                    .is_some_and(|c| c.segment_class == crate::SegmentClass::Direct)
-            {
-                let remaining = limit.map_or(u64::MAX, |limit| limit - steps);
-                let remaining = if single_step
-                    || self.sti_shadow
-                    || self.ss_shadow
-                    || self.pending_irq.is_some()
-                    || self
-                        .legacy_execution
-                        .as_ref()
-                        .unwrap()
-                        .pending_a20_enabled
-                        .is_some()
-                    || options.stop_when_irq_ready
-                {
-                    1
-                } else {
-                    remaining
-                };
-                if matches!(
-                    ir.ops.last(),
-                    Some(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk))
-                ) {
-                    let shared = crate::interp::legacy::execute_shared::<ROUTED, ORDER>(
-                        &ir,
-                        &mut self.cpu,
-                        &vm.mem,
-                        &mut self.interp_scratch,
-                        remaining,
-                        exit_word,
-                        self.sti_shadow,
-                        self.ss_shadow,
-                        self.pending_irq.is_some(),
-                    );
-                    if !single_step
-                        && matches!(
-                            shared.result,
-                            crate::interp::BlockResult::Continue
-                                | crate::interp::BlockResult::ModeChange
-                        )
-                    {
-                        steps += shared.steps;
-                        self.retired += shared.retired;
-                        self.executed += shared.retired;
-                        self.sti_shadow = shared.sti_shadow;
-                        self.ss_shadow = shared.ss_shadow;
-                        self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                        self.sti_shadow = false;
+                        self.ss_shadow = false;
+                        if self.cpu.mmio_retry_active {
+                            self.cpu.finish_mmio_retry(None);
+                        }
                         if self
                             .legacy_execution
                             .as_ref()
@@ -1393,11 +1620,185 @@ impl Vcpu {
                             self.apply_pending_a20();
                             direct_bus = raw_direct(&self.cpu);
                         }
+                        boundary = self.machine_boundary::<SINGLE>(options);
+                    }
+                    if !task_pending
+                        && self.legacy_execution.as_ref().unwrap().port_debug
+                        && self.cpu.pending_port_in.is_none()
+                        && self.cpu.port_string_in.is_none()
+                    {
+                        self.legacy_execution.as_mut().unwrap().port_debug = false;
+                        self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
+                            irq_consumed: false,
+                            source: EventSource::SingleStep,
+                            ip: self.cpu.rip as u32,
+                            cs: self.cpu.cs,
+                        });
+                    }
+                    let event = self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .event_retry
+                        .or_else(|| {
+                            self.pending_irq
+                                .filter(|_| {
+                                    !task_pending
+                                        && self.irq_delivery_ready()
+                                        && !self.cpu.mmio_retry_active
+                                })
+                                .map(|vector| PendingEvent {
+                                    irq_consumed: false,
+                                    source: EventSource::Irq(vector),
+                                    ip: self.cpu.rip as u32,
+                                    cs: self.cpu.cs,
+                                })
+                        });
+                    if let Some(event) = event {
+                        if let Err(exit) =
+                            self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
+                        {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            });
+                        }
+                        // Delivery costs no instruction unit. Re-derive after the CS reload.
+                        context = match self.legacy_context_for_run() {
+                            Ok(context) => context,
+                            Err(exit) => {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                })
+                            }
+                        };
+                        direct_bus = raw_direct(&self.cpu);
                         continue;
                     }
-                    shared.into_direct()
+                    if options.stop_when_irq_ready
+                        && !task_pending
+                        && !self.cpu.mmio_retry_active
+                        && self.irq_delivery_ready()
+                    {
+                        return DispatchResult::Stepped(StepRun {
+                            steps,
+                            stop: StepStop::IrqReady,
+                        });
+                    }
+                }
+                let direct = !task_pending && context.segment_class == crate::SegmentClass::Direct;
+                let linear_fetch = (u64::from(self.cpu.cs) << 4) + self.cpu.rip;
+                let physical = if direct && direct_bus {
+                    linear_fetch
                 } else {
-                    crate::interp::legacy::execute_direct::<ROUTED, ORDER>(
+                    crate::legacy::physical_span(&self.cpu, linear_fetch, 1).0
+                };
+                let page = physical >> crate::memory::CODE_PAGE_BITS;
+                let dirty = exit_word.load(Ordering::Relaxed) & crate::memory::DISPATCH_DIRTY != 0;
+                let dropped = dirty.then(|| vm.cache.invalidated_blocks());
+                vm.handle_smc(exit_word);
+                let execution = self.legacy_execution.as_mut().unwrap();
+                if dropped.is_some_and(|before| before != vm.cache.invalidated_blocks()) {
+                    if let Some(last) = execution.last_direct_fetch {
+                        // This bounded page hint is only a lowering choice. Precise
+                        // source invalidation and byte revalidation remain authoritative.
+                        for page in [last >> crate::memory::CODE_PAGE_BITS, page] {
+                            if !execution.smc_pages.contains(&page) {
+                                if execution.smc_pages.len() == 16 {
+                                    execution.smc_pages.remove(0);
+                                }
+                                execution.smc_pages.push(page);
+                            }
+                        }
+                    }
+                }
+                let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
+                let resolved = if direct && !retained && !boundary.instruction_retry {
+                    resolve_direct(
+                        vm,
+                        &self.cpu,
+                        context,
+                        exit_word,
+                        physical,
+                        &mut self.legacy_execution.as_mut().unwrap().direct_proofs,
+                    )
+                } else {
+                    let execution = self.legacy_execution.as_mut().unwrap();
+                    if execution.context_id == u64::MAX {
+                        execution.sync_class(&self.cpu, model, true, crate::SegmentClass::Checked);
+                    }
+                    execution.resolve::<KIND>(
+                        vm,
+                        &self.cpu,
+                        model,
+                        MachineContext {
+                            // The masked bus lowering retains the Direct proof;
+                            // SMC uses the cheaper original Checked instruction IR.
+                            segment_class: if direct && !direct_bus {
+                                crate::SegmentClass::Direct
+                            } else {
+                                crate::SegmentClass::Checked
+                            },
+                            ..context
+                        },
+                        exit_word,
+                    )
+                };
+                self.legacy_execution.as_mut().unwrap().last_direct_fetch =
+                    (direct && !retained).then_some(linear_fetch);
+                let (ir, walk) = match resolved {
+                    Ok(ir) => ir,
+                    Err(exit) => {
+                        self.legacy_execution
+                            .as_mut()
+                            .unwrap()
+                            .direct_proofs
+                            .clear();
+                        match self.route_legacy_exception::<ROUTED, ORDER>(vm, context, exit) {
+                            Ok(()) => {
+                                context = match self.legacy_context_for_run() {
+                                    Ok(context) => context,
+                                    Err(exit) => {
+                                        return DispatchResult::Stepped(StepRun {
+                                            steps,
+                                            stop: StepStop::Exit(exit),
+                                        })
+                                    }
+                                };
+                                direct_bus = raw_direct(&self.cpu);
+                                continue;
+                            }
+                            Err(exit) => {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                })
+                            }
+                        }
+                    }
+                };
+                let single_step = boundary.single_step;
+                let remaining = if boundary.one_step {
+                    1
+                } else {
+                    limit.map_or(u64::MAX, |limit| limit - steps)
+                };
+                let progress = if KIND == MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
+                    self.legacy_execution
+                        .as_mut()
+                        .unwrap()
+                        .execute_protected_block::<ROUTED, ORDER>(
+                            &ir,
+                            &mut self.cpu,
+                            &vm.mem,
+                            &mut self.interp_scratch,
+                            model,
+                            self.retired,
+                        )
+                } else {
+                    crate::interp::legacy::execute_block::<ROUTED, ORDER>(
+                        walk,
                         &ir,
                         &mut self.cpu,
                         &vm.mem,
@@ -1405,143 +1806,56 @@ impl Vcpu {
                         remaining,
                         exit_word,
                         &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                        self.sti_shadow,
+                        self.ss_shadow,
+                        boundary.irq_pending,
                     )
-                }
-            } else {
-                let outcome = crate::interp::legacy::execute::<ROUTED, ORDER>(
-                    &ir,
-                    &mut self.cpu,
-                    &vm.mem,
-                    &mut self.interp_scratch,
-                    &mut self.legacy_execution.as_mut().unwrap().task_switch,
-                );
-                crate::interp::legacy::DirectProgress {
-                    steps: u64::from(outcome.is_ok()),
-                    retired: u64::from(outcome.as_ref().is_ok_and(|outcome| outcome.retired)),
-                    outcome,
-                }
-            };
-            steps += progress.steps;
-            self.retired += progress.retired;
-            self.executed += progress.retired;
-            match progress.outcome {
-                Ok(outcome) => {
-                    let arm_ss = outcome.arm_ss && !self.ss_shadow;
-                    if self.cpu.port_string_in.is_none() {
-                        self.sti_shadow = outcome.arm_sti;
-                        self.ss_shadow = arm_ss;
+                };
+                if !single_step && progress.outcome.is_none() {
+                    steps += progress.steps;
+                    self.retired += progress.retired;
+                    self.executed += progress.retired;
+                    self.sti_shadow = progress.sti_shadow;
+                    self.ss_shadow = progress.ss_shadow;
+                    if boundary.instruction_retry {
+                        self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                        boundary.instruction_retry = false;
                     }
-                    if self.cpu.mmio_retry_active {
-                        self.cpu.finish_mmio_retry(None);
-                    }
-                    // SDM Vol 2B REP, p. 4-564: a completed iteration is an
-                    // interruption window with updated registers (decision-22).
-                    self.legacy_execution.as_mut().unwrap().instruction_retry = None;
-                    if self
-                        .legacy_execution
-                        .as_ref()
-                        .unwrap()
-                        .pending_a20_enabled
-                        .is_some()
-                    {
+                    refresh_boundary = boundary.one_step
+                        || boundary.pending_io
+                        || self.sti_shadow
+                        || self.ss_shadow;
+                    if boundary.a20_pending {
                         self.apply_pending_a20();
                         direct_bus = raw_direct(&self.cpu);
                     }
-                    if outcome.context_changed {
-                        let execution = self.legacy_execution.as_mut().unwrap();
-                        if outcome.translations_invalidated {
-                            execution.invalidate_translations();
-                        }
-                        context = match self.legacy_context_for_run() {
-                            Ok(context) => context,
-                            Err(exit) => {
-                                return StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                }
-                            }
-                        };
-                        direct_bus = raw_direct(&self.cpu);
-                        self.legacy_execution.as_mut().unwrap().sync_class(
-                            &self.cpu,
-                            model,
-                            true,
-                            context.segment_class,
-                        );
-                    }
-                    // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
-                    // 80386 PRM §9.2.4 pp. 9-3–4, §17 MOV p. 17-109,
-                    // POP p. 17-126: only MOV/POP SS suppress this boundary.
-                    // SDM Vol 3A §7.8.3 pp. 7-8–9: consecutive SS loads
-                    // guarantee inhibition only for the first load; LSS has none.
-                    let debug = single_step && !arm_ss && !outcome.suppress_debug;
-                    if debug {
-                        if matches!(outcome.exit, Some(Exit::PortIo { .. })) {
-                            self.legacy_execution.as_mut().unwrap().port_debug = true;
-                        } else {
-                            let event = PendingEvent {
-                                irq_consumed: false,
-                                source: EventSource::SingleStep,
-                                ip: self.cpu.rip as u32,
-                                cs: self.cpu.cs,
-                            };
-                            let delivered = self.legacy_context_for_run().and_then(|context| {
-                                self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
-                            });
-                            if let Err(exit) = delivered {
-                                return StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                };
-                            }
-                            context = match self.legacy_context_for_run() {
-                                Ok(context) => context,
-                                Err(exit) => {
-                                    return StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    }
-                                }
-                            };
-                            direct_bus = raw_direct(&self.cpu);
-                            // HLT completed; the enabled debug trap resumes at
-                            // its successor (I286 PRM Appendix B p. B-42;
-                            // 80386 PRM §17 HLT p. 17-60).
-                            continue;
-                        }
-                    }
-                    if let Some(exit) = outcome.exit {
-                        return StepRun {
-                            steps,
-                            stop: StepStop::Exit(exit),
-                        };
-                    }
+                    continue;
                 }
-                Err(exit) => {
-                    // An architectural fault abandons this attempt before it is
-                    // returned to the embedder; only resumable transfers keep IR.
-                    self.cpu.finish_mmio_retry(Some(&exit));
-                    if self.cpu.mmio_retry_active
-                        || self
-                            .legacy_execution
-                            .as_ref()
-                            .unwrap()
-                            .task_switch
-                            .context()
-                            .is_some()
-                    {
-                        self.legacy_execution.as_mut().unwrap().instruction_retry =
-                            Some(InstructionRetry {
-                                stamp: LegacyContextStamp::new(&self.cpu, model),
-                                ip: self.cpu.rip,
-                                mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-                                ir: if direct {
-                                    retry_instruction(&ir, self.cpu.rip)
-                                } else {
-                                    ir
-                                },
-                            });
-                    } else {
+                steps += progress.steps;
+                self.retired += progress.retired;
+                self.executed += progress.retired;
+                let outcome = progress.into_outcome();
+                if !outcome.as_ref().is_ok_and(|outcome| {
+                    !outcome.context_changed && !outcome.translations_invalidated
+                }) {
+                    self.legacy_execution
+                        .as_mut()
+                        .unwrap()
+                        .direct_proofs
+                        .clear();
+                }
+                match outcome {
+                    Ok(outcome) => {
+                        let arm_ss = outcome.arm_ss && !self.ss_shadow;
+                        if self.cpu.port_string_in.is_none() {
+                            self.sti_shadow = outcome.arm_sti;
+                            self.ss_shadow = arm_ss;
+                        }
+                        if self.cpu.mmio_retry_active {
+                            self.cpu.finish_mmio_retry(None);
+                        }
+                        // SDM Vol 2B REP, p. 4-564: a completed iteration is an
+                        // interruption window with updated registers (decision-22).
                         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
                         if self
                             .legacy_execution
@@ -1551,50 +1865,1230 @@ impl Vcpu {
                             .is_some()
                         {
                             self.apply_pending_a20();
+                            direct_bus = raw_direct(&self.cpu);
                         }
-                    }
-                    if matches!(exit, Exit::Exception { .. }) {
-                        let fault_context = if self
-                            .legacy_execution
-                            .as_ref()
-                            .unwrap()
-                            .task_switch
-                            .committed
-                        {
-                            crate::interp::legacy::tasks::fault_context(
+                        if outcome.context_changed {
+                            let execution = self.legacy_execution.as_mut().unwrap();
+                            if outcome.translations_invalidated {
+                                execution.invalidate_translations();
+                            }
+                            context = match self.legacy_context_for_run() {
+                                Ok(context) => context,
+                                Err(exit) => {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    })
+                                }
+                            };
+                            direct_bus = raw_direct(&self.cpu);
+                            self.legacy_execution.as_mut().unwrap().sync_class(
                                 &self.cpu,
-                                context.generation,
-                            )
-                        } else {
-                            context
-                        };
-                        match self.route_legacy_exception::<ROUTED, ORDER>(vm, fault_context, exit)
-                        {
-                            Ok(()) => {
+                                model,
+                                true,
+                                context.segment_class,
+                            );
+                        }
+                        // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
+                        // 80386 PRM §9.2.4 pp. 9-3–4, §17 MOV p. 17-109,
+                        // POP p. 17-126: only MOV/POP SS suppress this boundary.
+                        // SDM Vol 3A §7.8.3 pp. 7-8–9: consecutive SS loads
+                        // guarantee inhibition only for the first load; LSS has none.
+                        let debug = single_step && !arm_ss && !outcome.suppress_debug;
+                        if debug {
+                            if matches!(outcome.exit, Some(Exit::PortIo { .. })) {
+                                self.legacy_execution.as_mut().unwrap().port_debug = true;
+                            } else {
+                                let event = PendingEvent {
+                                    irq_consumed: false,
+                                    source: EventSource::SingleStep,
+                                    ip: self.cpu.rip as u32,
+                                    cs: self.cpu.cs,
+                                };
+                                let delivered = self.legacy_context_for_run().and_then(|context| {
+                                    self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
+                                });
+                                if let Err(exit) = delivered {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    });
+                                }
                                 context = match self.legacy_context_for_run() {
                                     Ok(context) => context,
                                     Err(exit) => {
-                                        return StepRun {
+                                        return DispatchResult::Stepped(StepRun {
                                             steps,
                                             stop: StepStop::Exit(exit),
-                                        }
+                                        })
                                     }
                                 };
                                 direct_bus = raw_direct(&self.cpu);
+                                // HLT completed; the enabled debug trap resumes at
+                                // its successor (I286 PRM Appendix B p. B-42;
+                                // 80386 PRM §17 HLT p. 17-60).
                                 continue;
                             }
-                            Err(exit) => {
-                                return StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
+                        }
+                        if let Some(exit) = outcome.exit {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            });
+                        }
+                    }
+                    Err(exit) => {
+                        // An architectural fault abandons this attempt before it is
+                        // returned to the embedder; only resumable transfers keep IR.
+                        self.cpu.finish_mmio_retry(Some(&exit));
+                        if self.cpu.mmio_retry_active
+                            || self
+                                .legacy_execution
+                                .as_ref()
+                                .unwrap()
+                                .task_switch
+                                .context()
+                                .is_some()
+                        {
+                            let retry = if direct {
+                                retry_instruction(&ir, self.cpu.rip)
+                            } else {
+                                ir
+                            };
+                            self.legacy_execution.as_mut().unwrap().instruction_retry =
+                                Some(InstructionRetry {
+                                    stamp: LegacyContextStamp::new(&self.cpu, model),
+                                    ip: self.cpu.rip,
+                                    mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+                                    walk: if direct {
+                                        BlockWalk::for_ir::<false>(&retry)
+                                    } else {
+                                        walk
+                                    },
+                                    ir: retry,
+                                });
+                        } else {
+                            self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                            if self
+                                .legacy_execution
+                                .as_ref()
+                                .unwrap()
+                                .pending_a20_enabled
+                                .is_some()
+                            {
+                                self.apply_pending_a20();
+                            }
+                        }
+                        if matches!(exit, Exit::Exception { .. }) {
+                            let fault_context = if self
+                                .legacy_execution
+                                .as_ref()
+                                .unwrap()
+                                .task_switch
+                                .committed
+                            {
+                                crate::interp::legacy::tasks::fault_context(
+                                    &self.cpu,
+                                    context.generation,
+                                )
+                            } else {
+                                context
+                            };
+                            match self.route_legacy_exception::<ROUTED, ORDER>(
+                                vm,
+                                fault_context,
+                                exit,
+                            ) {
+                                Ok(()) => {
+                                    context = match self.legacy_context_for_run() {
+                                        Ok(context) => context,
+                                        Err(exit) => {
+                                            return DispatchResult::Stepped(StepRun {
+                                                steps,
+                                                stop: StepStop::Exit(exit),
+                                            })
+                                        }
+                                    };
+                                    direct_bus = raw_direct(&self.cpu);
+                                    continue;
+                                }
+                                Err(exit) => {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    })
                                 }
                             }
                         }
+                        return DispatchResult::Stepped(StepRun {
+                            steps,
+                            stop: StepStop::Exit(exit),
+                        });
                     }
-                    return StepRun {
+                }
+            } else if KIND == ALIAS_DISPATCH {
+                let pending = self.cpu.mmio_retry_active
+                    || self.cpu.pending_mmio.is_some()
+                    || self.cpu.pending_mmio_write
+                    || self.cpu.pending_port_in.is_some();
+                if STEPPED && alias_steps.remaining == 0 {
+                    return DispatchResult::Stepped(StepRun {
+                        steps,
+                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                    });
+                }
+                if !pending && exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0 {
+                    return DispatchResult::Stepped(StepRun {
+                        steps,
+                        stop: StepStop::Exit(
+                            self.interrupted(crate::FaultPath::Interpreter, false),
+                        ),
+                    });
+                }
+                if let Some(exit) = self.code_space_exit(vm) {
+                    return DispatchResult::Stepped(StepRun {
                         steps,
                         stop: StepStop::Exit(exit),
+                    });
+                }
+                if !STEPPED && BOUNDED && steps >= budget {
+                    return DispatchResult::Stepped(StepRun {
+                        steps,
+                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                    });
+                }
+                vm.handle_smc(exit_word);
+                if !STEPPED && self.cpu.mmio_retry_active {
+                    let mut info = crate::interp::RetireInfo {
+                        consistency: vm.consistency,
+                        sti_shadow: self.sti_shadow,
+                        ss_shadow: self.ss_shadow,
+                        exit_request: Some(exit_word),
+                        ..Default::default()
                     };
+                    let ip = self.cpu.rip;
+                    let result = crate::interp::step_one_mode::<ROUTED>(
+                        &vm.mem,
+                        &mut self.cpu,
+                        self.mode,
+                        &mut self.interp_scratch,
+                        &mut info,
+                    );
+                    self.retired += info.retired;
+                    self.sti_shadow = info.sti_shadow;
+                    self.ss_shadow = info.ss_shadow;
+                    match result {
+                        StepResult::Continue => {
+                            if BOUNDED {
+                                steps += 1;
+                            }
+                            continue;
+                        }
+                        StepResult::Exit(Exit::Syscall) => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(
+                                    self.syscall(crate::FaultPath::Interpreter, ip),
+                                ),
+                            })
+                        }
+                        StepResult::Exit(Exit::Interrupted) => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(self.interrupted(
+                                    crate::FaultPath::Helper {
+                                        family: crate::FaultHelper::String,
+                                        caller: crate::HelperCaller::Interpreter,
+                                    },
+                                    false,
+                                )),
+                            })
+                        }
+                        StepResult::Exit(exit) => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            })
+                        }
+                    }
+                }
+                if self.pending_irq.is_some() && self.irq_ready() {
+                    let vector = self.pending_irq.take().unwrap();
+                    let ip = self.cpu.rip;
+                    match crate::interp::deliver_interrupt(
+                        &mut self.cpu,
+                        &vm.mem,
+                        ip,
+                        vector,
+                        ip,
+                        vm.consistency,
+                    )
+                    .into_step()
+                    {
+                        StepResult::Continue => {
+                            self.sti_shadow = false;
+                            self.ss_shadow = false;
+                            if !STEPPED && BOUNDED {
+                                steps += 1;
+                            }
+                            continue;
+                        }
+                        StepResult::Exit(exit) => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            })
+                        }
+                    }
+                }
+                if STOP && self.irq_ready() {
+                    return DispatchResult::Stepped(StepRun {
+                        steps,
+                        stop: StepStop::IrqReady,
+                    });
+                }
+                if !STEPPED && vm.time_enabled {
+                    self.record_shared_resolve(shared_reason, self.cpu.rip);
+                }
+                let fetch = FetchAddr::for_mode(CpuMode::Real16, self.cpu.rip, self.cpu.cs);
+                let ir = match resolve_alias::<STEPPED>(
+                    vm,
+                    &mut self.time_dispatch,
+                    exit_word,
+                    &self.engine_sections,
+                    fetch,
+                    self.cpu.mxcsr,
+                ) {
+                    Ok(ir) => ir,
+                    Err(exit) if crate::x87::emulated_esc(&self.cpu, self.mode, &exit) => {
+                        match self.step_instruction(vm) {
+                            StepResult::Continue => {
+                                if !STEPPED && BOUNDED {
+                                    steps += 1;
+                                }
+                                continue;
+                            }
+                            StepResult::Exit(exit) => {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                })
+                            }
+                        }
+                    }
+                    Err(exit) => {
+                        return DispatchResult::Stepped(StepRun {
+                            steps,
+                            stop: StepStop::Exit(exit),
+                        })
+                    }
+                };
+
+                if !STEPPED && vm.time_enabled {
+                    shared_reason = SharedReason::Interpreter;
+                    crate::time_stats::interpreted();
+                }
+                let mut info = crate::interp::RetireInfo {
+                    code_base: u64::from(self.cpu.cs) << 4,
+                    consistency: vm.consistency,
+                    sti_shadow: self.sti_shadow,
+                    ss_shadow: self.ss_shadow,
+                    exit_request: Some(exit_word),
+                    trace: vm.lockstep_trace.as_deref(),
+                    ..Default::default()
+                };
+                alias_steps.pending_irq = self.pending_irq.is_some();
+                let result = if STEPPED {
+                    if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0 {
+                        crate::interp::interpret_block_steps::<ROUTED, true, STOP>(
+                            &ir,
+                            &mut self.cpu,
+                            &vm.mem,
+                            &mut self.interp_scratch,
+                            &mut info,
+                            &mut alias_steps,
+                        )
+                    } else {
+                        crate::interp::interpret_block_steps::<ROUTED, false, STOP>(
+                            &ir,
+                            &mut self.cpu,
+                            &vm.mem,
+                            &mut self.interp_scratch,
+                            &mut info,
+                            &mut alias_steps,
+                        )
+                    }
+                } else if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0 {
+                    crate::interp::interpret_block_fp::<ROUTED, true>(
+                        &ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        &mut info,
+                    )
+                } else {
+                    crate::interp::interpret_block_fp::<ROUTED, false>(
+                        &ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        &mut info,
+                    )
+                };
+                self.retired += info.retired;
+                self.executed += info.retired;
+                self.sti_shadow = info.sti_shadow;
+                self.ss_shadow = info.ss_shadow;
+                steps = if STEPPED {
+                    alias_steps.steps
+                } else {
+                    steps + 1
+                };
+                match result {
+                    crate::interp::BlockResult::Continue
+                    | crate::interp::BlockResult::ModeChange => continue,
+                    crate::interp::BlockResult::Exit(exit) => match exit.into_exit() {
+                        Exit::Syscall => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(self.syscall_interpreted(&ir)),
+                            })
+                        }
+                        Exit::Interrupted => {
+                            let path = if !STEPPED || alias_steps.string_interrupted {
+                                crate::FaultPath::Helper {
+                                    family: crate::FaultHelper::String,
+                                    caller: crate::HelperCaller::Interpreter,
+                                }
+                            } else {
+                                crate::FaultPath::Interpreter
+                            };
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(self.interrupted(path, false)),
+                            });
+                        }
+                        Exit::Exception { addr, vector, .. } => {
+                            match crate::interp::deliver_interrupt(
+                                &mut self.cpu,
+                                &vm.mem,
+                                addr,
+                                vector,
+                                addr,
+                                vm.consistency,
+                            )
+                            .into_step()
+                            {
+                                StepResult::Continue => {
+                                    self.sti_shadow = false;
+                                    self.ss_shadow = false;
+                                    continue;
+                                }
+                                StepResult::Exit(exit) => {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    })
+                                }
+                            }
+                        }
+                        exit => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            })
+                        }
+                    },
+                }
+            } else {
+                // The outer dispatcher may invalidate code or invoke backend callbacks.
+                // Retain guest control only in the integer-only compiled chain below.
+                if !DEFAULT {
+                    fp_mode.default();
+                }
+                if dispatch & EXIT_REQUESTED != 0
+                    && self.cpu.pending_mmio.is_none()
+                    && !self.cpu.pending_mmio_write
+                    && self.cpu.pending_port_in.is_none()
+                    && self.cpu.port_string_in.is_none()
+                {
+                    return DispatchResult::Application(Ok(Exit::Interrupted));
+                }
+                // The sticky flag can be observed before the backend finishes its
+                // broadcast. A late bit must not keep an already-notified vcpu in
+                // the outer loop forever.
+                if self.code_space_reported && dispatch & CODE_SPACE_EXHAUSTED != 0 {
+                    exit_word.fetch_and(!CODE_SPACE_EXHAUSTED, Ordering::Acquire);
+                }
+                if let Some(exit) = self.code_space_exit(vm) {
+                    return DispatchResult::Application(Ok(exit));
+                }
+                if BOUNDED && blocks_run >= budget {
+                    return DispatchResult::Application(Ok(Exit::BudgetExhausted));
+                }
+
+                // SMC (§10): drop any cached block a prior block's store landed on,
+                // before fetching the next one, so re-execution re-lifts fresh bytes.
+                vm.handle_smc(exit_word);
+
+                // Participation precedes resolving or probing any executable pointer.
+                // Its scope includes cold fault decoding and every chain transfer;
+                // continue/return/unwind all announce quiescence through RAII.
+                let execution = participant.as_mut().unwrap().enter();
+
+                // Flush the fast-resolve cache if any invalidation happened since we
+                // last synced — covers same-thread SMC (just handled above) and
+                // cross-thread SMC (another vcpu bumped the epoch). Ordered after
+                // `handle_smc` so a probe never predates its own invalidation.
+                let epoch = self.fast_lifetime.epoch();
+                if epoch != self.fast_epoch {
+                    self.fast_clear();
+                    self.fast_epoch = epoch;
+                    self.fast_empty_reason = PrivateMiss::Epoch;
+                }
+
+                // Resume after an MMIO trap the JIT deferred (§5.2): once the
+                // embedder has supplied the read value (`complete_mmio_read`) or
+                // acknowledged the write (`complete_mmio_write`), single-step the
+                // faulting instruction on the interpreter — it consumes the pending
+                // value/ack and advances RIP — before dispatching the next block. (Under
+                // the interpreter backend this is equivalent to re-dispatching the block;
+                // it just does the one faulting instruction first.)
+                // A RAM fault may have consumed the pending completion while leaving
+                // recorded transfers. Keep that retry on the interpreter until completion;
+                // compiled blocks never inherit answers from a partially serviced operand.
+                if self.cpu.mmio_retry_active {
+                    if !DEFAULT {
+                        fp_mode.default();
+                    }
+                    // Finish the pending transfer before honouring a host request at
+                    // an instruction or REP element boundary (SDM Vol 2B §4.3,
+                    // REP Description/Operation, pp. 4-563–4-564).
+                    let mut info = crate::interp::RetireInfo {
+                        consistency: vm.consistency,
+                        sti_shadow: self.sti_shadow,
+                        ss_shadow: self.ss_shadow,
+                        exit_request: Some(exit_word),
+                        ..Default::default()
+                    };
+                    let instruction_rip = self.cpu.rip;
+                    let r = crate::interp::step_one_mode::<ROUTED>(
+                        &vm.mem,
+                        &mut self.cpu,
+                        self.mode,
+                        &mut self.interp_scratch,
+                        &mut info,
+                    );
+                    self.retired += info.retired;
+                    self.sti_shadow = info.sti_shadow;
+                    self.ss_shadow = info.ss_shadow;
+                    match r {
+                        StepResult::Continue => {
+                            if BOUNDED {
+                                blocks_run += 1;
+                            }
+                            if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != mxcsr_mode {
+                                return DispatchResult::Application(Err(blocks_run));
+                            }
+                            dispatch = exit_word.load(Ordering::Relaxed);
+                            if dispatch & EXIT_REQUESTED != 0 {
+                                return DispatchResult::Application(Ok(
+                                    self.interrupted(crate::FaultPath::Interpreter, false)
+                                ));
+                            }
+                            continue;
+                        }
+                        StepResult::Exit(Exit::Syscall) => {
+                            return DispatchResult::Application(Ok(
+                                self.syscall(crate::FaultPath::Interpreter, instruction_rip)
+                            ));
+                        }
+                        StepResult::Exit(Exit::Interrupted) => {
+                            return DispatchResult::Application(Ok(self.interrupted(
+                                crate::FaultPath::Helper {
+                                    family: crate::FaultHelper::String,
+                                    caller: crate::HelperCaller::Interpreter,
+                                },
+                                false,
+                            )));
+                        }
+                        StepResult::Exit(exit) => {
+                            return DispatchResult::Application(Ok(crate::fault::qualify_real16(
+                                exit, &self.cpu,
+                            )))
+                        }
+                    }
+                }
+
+                // Application Long64/Compat32 use a flat fetch address. The block
+                // cache and lift key on fetch.pa; compiled probes key on RIP.
+                let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
+
+                // Fast path: a vcpu-private probe replaces the shared cache lookup
+                // for compiled blocks. A miss falls back to `resolve` and installs the
+                // result; interpreted blocks are never cached here, so they always route
+                // through `resolve` (keeping the cache hit/miss counters meaningful).
+                let block = match self.fast_get(self.cpu.rip) {
+                    Some(entry) => {
+                        // Plain (non-atomic) per-vcpu counter — the whole point of the
+                        // private probe is to avoid the shared atomic bumps on this path.
+                        self.fast_hits = self.fast_hits.saturating_add(1);
+                        CachedBlock::Compiled { entry }
+                    }
+                    None => {
+                        if vm.time_enabled {
+                            self.record_shared_resolve(shared_reason, self.cpu.rip);
+                        }
+                        if !DEFAULT {
+                            fp_mode.default();
+                        }
+                        match resolve_dispatch::<DEFAULT>(
+                            vm,
+                            &mut self.time_dispatch,
+                            exit_word,
+                            &self.engine_sections,
+                            fetch,
+                            self.mode,
+                            if DEFAULT { 0 } else { self.cpu.mxcsr },
+                        ) {
+                            Ok(b) => {
+                                if let CachedBlock::Compiled { entry, .. } = &b {
+                                    self.fast_put(self.cpu.rip, *entry);
+                                }
+                                b
+                            }
+                            Err(exit) => return DispatchResult::Application(Ok(exit)),
+                        }
+                    }
+                };
+
+                if let Some(exit) = self.code_space_exit(vm) {
+                    return DispatchResult::Application(Ok(exit));
+                }
+                match block {
+                    CachedBlock::Interpreted(ir) => {
+                        // Owned IR needs no execution grace. A request deferred by
+                        // resolution is delivered by the existing execution boundary.
+                        drop(execution);
+                        if vm.time_enabled {
+                            shared_reason = SharedReason::Interpreter;
+                        }
+                        if vm.time_enabled {
+                            crate::time_stats::interpreted();
+                        }
+                        if !DEFAULT {
+                            fp_mode.default();
+                        }
+                        let mut info = crate::interp::RetireInfo {
+                            code_base: fetch.pa - fetch.ip,
+                            consistency: vm.consistency,
+                            sti_shadow: self.sti_shadow,
+                            ss_shadow: self.ss_shadow,
+                            exit_request: Some(exit_word),
+                            trace: vm.lockstep_trace.as_deref(),
+                            ..Default::default()
+                        };
+                        let r = crate::interp::interpret_block_fp::<ROUTED, DEFAULT>(
+                            &ir,
+                            &mut self.cpu,
+                            &vm.mem,
+                            &mut self.interp_scratch,
+                            &mut info,
+                        );
+                        // Publish retirement and shadows from this interpreted block.
+                        self.retired += info.retired;
+                        // Same counter as compiled code charges, so the total
+                        // covers whichever tier actually ran the guest.
+                        self.executed += info.retired;
+                        self.sti_shadow = info.sti_shadow;
+                        self.ss_shadow = info.ss_shadow;
+                        match r {
+                            crate::interp::BlockResult::Continue => {
+                                if BOUNDED {
+                                    blocks_run += 1;
+                                }
+                            }
+                            crate::interp::BlockResult::ModeChange => {
+                                return DispatchResult::Application(Err(if BOUNDED {
+                                    blocks_run + 1
+                                } else {
+                                    0
+                                }))
+                            }
+                            // Application exceptions return to the embedder.
+                            crate::interp::BlockResult::Exit(exit) => {
+                                let exit = exit.into_exit();
+                                match exit {
+                                    Exit::Syscall => {
+                                        return DispatchResult::Application(Ok(
+                                            self.syscall_interpreted(&ir)
+                                        ))
+                                    }
+                                    Exit::Interrupted => {
+                                        return DispatchResult::Application(Ok(self.interrupted(
+                                            crate::FaultPath::Helper {
+                                                family: crate::FaultHelper::String,
+                                                caller: crate::HelperCaller::Interpreter,
+                                            },
+                                            false,
+                                        )));
+                                    }
+                                    exit @ Exit::Exception { .. } => {
+                                        return DispatchResult::Application(Ok(
+                                            crate::interp::qualify_lifted_exit(exit, &ir),
+                                        ))
+                                    }
+                                    exit => return DispatchResult::Application(Ok(exit)),
+                                }
+                            }
+                        }
+                        dispatch = exit_word.load(Ordering::Relaxed);
+                        if dispatch & EXIT_REQUESTED != 0 {
+                            return DispatchResult::Application(Ok(
+                                self.interrupted(crate::FaultPath::Interpreter, false)
+                            ));
+                        }
+                    }
+                    CachedBlock::Compiled { entry, .. } => {
+                        dispatch = exit_word.load(Ordering::Relaxed);
+                        if dispatch != 0 {
+                            continue;
+                        }
+                        if vm.time_enabled {
+                            crate::time_stats::compiled();
+                        }
+                        let mut cur = entry;
+                        let (stopped, stopped_code) = loop {
+                            // Hand the block its remaining block quantum (superblocks,
+                            // §12 M5): a compiled region spends 1 fuel per guest block and
+                            // stops at 0; a single block ignores it. Charging the fuel it
+                            // consumed (min 1) keeps `blocks_run` an exact guest-block
+                            // count — identical to the interpreter, preserving §9.2 and
+                            // the `RunSpec::Blocks(n)` oracle.
+                            let quantum = if BOUNDED {
+                                budget - blocks_run
+                            } else {
+                                u64::MAX
+                            };
+                            ctx.fuel = quantum;
+                            // SAFETY: `cur` is a block compiled to this ABI, alive in
+                            // the JIT arena (owned by `vm`) for the call.
+                            if !DEFAULT {
+                                fp_mode.compiled(self.cpu.mxcsr);
+                            }
+                            let code = unsafe {
+                                crate::jit_abi::call_block_in_mode(cur, &mut self.cpu, &mut ctx)
+                            };
+                            if BOUNDED {
+                                blocks_run += (quantum - ctx.fuel).max(1);
+                            }
+                            if !DEFAULT && !matches!(code, RET_CHAIN | RET_LINK | RET_IBTC_MISS) {
+                                fp_mode.default();
+                            }
+                            let next;
+                            match code {
+                                RET_CONTINUE | RET_INTERRUPTED => break (cur, code),
+                                RET_RETURN_MISS => {
+                                    self.time_dispatch.indirect =
+                                        self.time_dispatch.indirect.saturating_add(1);
+                                    break (cur, code);
+                                }
+                                RET_MXCSR_CHANGED => {
+                                    return DispatchResult::Application(Err(blocks_run))
+                                }
+                                RET_CHAIN => {
+                                    // Plain per-vcpu counter, flushed once per `run`
+                                    // (see `TranslationCache::add_chained`): this fires
+                                    // ~1M times per frame in a real game, so a shared
+                                    // atomic here is a locked RMW on the hottest path.
+                                    self.chained = self.chained.saturating_add(1);
+                                    next = CompiledPtr::new(ctx.next_entry as *const u8);
+                                }
+                                RET_LINK => {
+                                    // Snapshot BEFORE resolving: the publish
+                                    // below only happens if the epoch is still this one, so
+                                    // an SMC drop that lands while we resolve cannot have its
+                                    // slot-clearing undone by our store.
+                                    let since_epoch = self.fast_lifetime.epoch();
+                                    if since_epoch != execution.epoch() {
+                                        break (cur, code);
+                                    }
+                                    if !DEFAULT {
+                                        fp_mode.default();
+                                    }
+                                    if vm.time_enabled {
+                                        crate::time_stats::shared_resolve(
+                                            SharedReason::DirectLink,
+                                            PrivateMiss::Bypass,
+                                        );
+                                    }
+                                    let resolved = resolve::<DEFAULT>(
+                                        vm,
+                                        &mut self.time_dispatch,
+                                        exit_word,
+                                        &self.engine_sections,
+                                        FetchAddr::flat(self.cpu.rip),
+                                        self.mode,
+                                        if DEFAULT { 0 } else { self.cpu.mxcsr },
+                                    );
+                                    if let Some(exit) = self.code_space_exit(vm) {
+                                        return DispatchResult::Application(Ok(exit));
+                                    }
+                                    match resolved {
+                                        Ok(CachedBlock::Compiled { entry, .. }) => {
+                                            // SAFETY: `link_slot` is a live `Arc<AtomicU64>`
+                                            // in the JIT arena. Relaxed store: another vcpu
+                                            // reading the slot sees 0 or a valid entry, never a
+                                            // torn value (aligned u64); it pairs with the
+                                            // backend's `invalidate_links` clear.
+                                            let slot = ctx.link_slot;
+                                            let _section = EngineSection::enter(
+                                                exit_word,
+                                                &self.engine_sections,
+                                                CriticalSectionKind::Publish,
+                                            );
+                                            let published = vm.cache.publish_entry_if_current(
+                                                since_epoch,
+                                                entry,
+                                                || unsafe {
+                                                    (*(slot as *const AtomicU64))
+                                                        .store(entry.0 as u64, Ordering::Relaxed)
+                                                },
+                                            );
+                                            drop(_section);
+                                            if !published {
+                                                // Invalidated under us. Publishing now would
+                                                // refill a slot the drop just cleared, and
+                                                // transferring would run a translation of code
+                                                // the guest has rewritten. Back to the outer
+                                                // loop, which runs `handle_smc` and re-resolves.
+                                                break (cur, code);
+                                            }
+                                            // Seed the fast-resolve cache too: the next
+                                            // outer-loop visit to this RIP skips `resolve`.
+                                            self.fast_put(self.cpu.rip, entry);
+                                            next = entry;
+                                        }
+                                        // Mixed backend can't chain — fall back to dispatch.
+                                        Ok(CachedBlock::Interpreted(_)) => break (cur, code),
+                                        Err(exit) => return DispatchResult::Application(Ok(exit)),
+                                    }
+                                }
+                                // IBTC miss: an indirect edge whose per-site slot was
+                                // empty or held a different target. Resolve the computed
+                                // RIP and refill the slot with a fresh {target, entry}
+                                // descriptor, unless the site is megamorphic.
+                                RET_IBTC_MISS => {
+                                    self.time_dispatch.indirect =
+                                        self.time_dispatch.indirect.saturating_add(1);
+                                    #[cfg(test)]
+                                    if let Some(hook) = self.ibtc_test_hook.as_mut() {
+                                        hook(false);
+                                    }
+                                    // Generation validation rejects retired tracked entries,
+                                    // but retaining backends may use generation-zero pointers.
+                                    // Keep the private fill epoch check for those entries and
+                                    // for capped refills that skip slot publication entirely.
+                                    let since_epoch = self.fast_lifetime.epoch();
+                                    if since_epoch != execution.epoch()
+                                        || since_epoch != self.fast_epoch
+                                    {
+                                        break (cur, code);
+                                    }
+                                    // Probe the vcpu-private fast cache before `resolve`.
+                                    // The per-site IBTC holds ONE target, so a site
+                                    // with several live targets misses here on nearly every
+                                    // call — and `resolve` is an RwLock read plus a hash
+                                    // lookup and a clone, where this probes two private
+                                    // tags without synchronization.
+                                    // Same key, same epoch invariant and same "compiled
+                                    // blocks only" content as the probe the outer dispatch
+                                    // loop already trusts, so a hit here is equally sound;
+                                    // it skips the tier-up drain exactly as that one does.
+                                    let entry = match self.fast_get(self.cpu.rip) {
+                                        Some(entry) => {
+                                            self.fast_hits = self.fast_hits.saturating_add(1);
+                                            Some(entry)
+                                        }
+                                        None => {
+                                            if vm.time_enabled {
+                                                self.record_shared_resolve(
+                                                    SharedReason::IbtcMiss,
+                                                    self.cpu.rip,
+                                                );
+                                            }
+                                            if !DEFAULT {
+                                                fp_mode.default();
+                                            }
+                                            let resolved = resolve::<DEFAULT>(
+                                                vm,
+                                                &mut self.time_dispatch,
+                                                exit_word,
+                                                &self.engine_sections,
+                                                FetchAddr::flat(self.cpu.rip),
+                                                self.mode,
+                                                if DEFAULT { 0 } else { self.cpu.mxcsr },
+                                            );
+                                            if let Some(exit) = self.code_space_exit(vm) {
+                                                return DispatchResult::Application(Ok(exit));
+                                            }
+                                            match resolved {
+                                                Ok(CachedBlock::Compiled { entry }) => {
+                                                    self.fast_put(self.cpu.rip, entry);
+                                                    Some(entry)
+                                                }
+                                                // Indirect edge into an interpreted block.
+                                                Ok(CachedBlock::Interpreted(_)) => None,
+                                                Err(exit) => {
+                                                    return DispatchResult::Application(Ok(exit))
+                                                }
+                                            }
+                                        }
+                                    };
+                                    #[cfg(test)]
+                                    if let Some(hook) = self.ibtc_test_hook.as_mut() {
+                                        hook(true);
+                                    }
+                                    // Even a fast hit can allocate during refill bookkeeping.
+                                    if !DEFAULT {
+                                        fp_mode.default();
+                                    }
+                                    match entry {
+                                        Some(entry) => {
+                                            let slot = ctx.link_slot;
+                                            // A full map reallocates on insert: account only then,
+                                            // not on every new refill entry.
+                                            let full = self.ibtc_refills.len()
+                                                >= self.ibtc_refills.capacity();
+                                            let count = self.ibtc_refills.entry(slot).or_insert(0);
+                                            let under_cap = *count < IBTC_MEGAMORPHIC_CAP;
+                                            if under_cap {
+                                                *count += 1;
+                                            }
+                                            if full {
+                                                self.allocations.refills.store(
+                                                    (self.ibtc_refills.capacity()
+                                                        * std::mem::size_of::<(u64, u32)>())
+                                                        as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                            }
+                                            if under_cap {
+                                                let _section = EngineSection::enter(
+                                                    exit_word,
+                                                    &self.engine_sections,
+                                                    CriticalSectionKind::Publish,
+                                                );
+                                                let desc = vm
+                                                    .cache
+                                                    .alloc_ibtc_descriptor(self.cpu.rip, entry);
+                                                // SAFETY: `slot` is a live `Box<AtomicU64>` in
+                                                // the JIT arena; the published descriptor is
+                                                // immutable and retained through execution grace.
+                                                // Release (not Relaxed): unlike the RET_LINK
+                                                // slot — a single scalar entry — this publishes
+                                                // a POINTER to a multi-field {target, entry}
+                                                // payload, so the payload's writes must be
+                                                // ordered-visible before the pointer. Release
+                                                // here pairs with the reader's address
+                                                // dependency (the compiled `ibtc_or_miss` loads
+                                                // the descriptor fields *through* this pointer),
+                                                // giving release/consume ordering; a plain
+                                                // Relaxed store would let a weakly-ordered host
+                                                // (AArch64) expose the pointer before the fields.
+                                                let published = vm.cache.publish_entry_if_current(
+                                                    since_epoch,
+                                                    entry,
+                                                    || unsafe {
+                                                        (*(slot as *const AtomicU64))
+                                                            .store(desc, Ordering::Release)
+                                                    },
+                                                );
+                                                if !published {
+                                                    // Invalidated under us — see RET_LINK.
+                                                    break (cur, code);
+                                                }
+                                            }
+                                            if !under_cap && vm.cache.epoch() != since_epoch {
+                                                break (cur, code);
+                                            }
+                                            next = entry;
+                                        }
+                                        // Interpreted target — leave the chain and dispatch.
+                                        None => break (cur, code),
+                                    }
+                                }
+                                RET_SYSCALL => {
+                                    let path = crate::codemap::fault_path(
+                                        cur.0 as usize,
+                                        crate::Knowledge::Known(ctx.next_entry),
+                                        false,
+                                    );
+                                    return DispatchResult::Application(Ok(
+                                        self.syscall(path, ctx.next_entry)
+                                    ));
+                                }
+                                RET_HLT => return DispatchResult::Application(Ok(Exit::Hlt)),
+                                RET_UNMAPPED => {
+                                    return DispatchResult::Application(Ok(
+                                        ctx.unmapped_exit(&self.cpu, self.mode)
+                                    ))
+                                }
+                                RET_UNMAPPED_DETAIL => {
+                                    return DispatchResult::Application(Ok(ctx
+                                        .detailed_unmapped_exit(
+                                            &self.cpu,
+                                            &vm.mem,
+                                            self.mode,
+                                            cur.0 as usize,
+                                        )))
+                                }
+                                RET_EXCEPTION_DETAIL => {
+                                    let exit = ctx.detailed_exception_exit(
+                                        &self.cpu,
+                                        &vm.mem,
+                                        self.mode,
+                                        cur.0 as usize,
+                                    );
+                                    return DispatchResult::Application(Ok(
+                                        crate::fault::qualify_lifted(
+                                            exit,
+                                            crate::codemap::lookup_fault_info(
+                                                cur.0 as usize,
+                                                ctx.next_entry,
+                                            )
+                                            .as_ref(),
+                                        ),
+                                    ));
+                                }
+                                RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL => {
+                                    // Alignment recovery has no reliable data address.
+                                    if code == RET_MMIO_DEFER
+                                        || self.fault_entry.fault_kind()
+                                            != crate::jit_abi::fault::HostFaultKind::Alignment
+                                    {
+                                        let pc = if code == RET_HOST_FAULT_DETAIL {
+                                            ctx.next_entry as usize
+                                        } else {
+                                            cur.0 as usize
+                                        };
+                                        if let Some(info) =
+                                            crate::codemap::lookup_fault_info(pc, self.cpu.rip)
+                                        {
+                                            info.note_partial_store(
+                                                &self.cpu,
+                                                &vm.mem,
+                                                ctx.fault_addr,
+                                            );
+                                        }
+                                    }
+                                    let raw_fault = if code == RET_HOST_FAULT_DETAIL {
+                                        self.fault_entry.raw_fault()
+                                    } else {
+                                        None
+                                    };
+                                    if code == RET_HOST_FAULT || code == RET_HOST_FAULT_DETAIL {
+                                        if DEFAULT {
+                                            // The landing stub may have restored non-default caller
+                                            // control. No guest mode was installed in this specialization.
+                                            // SAFETY: normalize before fault decoding and replay.
+                                            unsafe {
+                                                crate::jit_abi::fp::set_control(
+                                                    crate::jit_abi::fp::default_control(),
+                                                )
+                                            };
+                                        } else {
+                                            fp_mode.host_fault();
+                                        }
+                                        if self.fault_entry.fault_kind()
+                                            != crate::jit_abi::fault::HostFaultKind::Alignment
+                                            && vm.mem.mapped_ram(ctx.fault_addr)
+                                        {
+                                            let exit = if code == RET_HOST_FAULT_DETAIL {
+                                                ctx.detailed_host_exit(
+                                                    &self.cpu, &vm.mem, self.mode,
+                                                )
+                                            } else {
+                                                ctx.unmapped_exit(&self.cpu, self.mode)
+                                            };
+                                            return DispatchResult::Application(Ok(
+                                                crate::fault::attach_raw_host_fault(
+                                                    exit, raw_fault,
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    if !DEFAULT {
+                                        fp_mode.default();
+                                    }
+                                    // Trap-region accesses replay to produce MMIO exits.
+                                    // Host faults reach replay only for unmapped addresses
+                                    // or alignment faults. Misaligned locked operations
+                                    // currently replay non-atomically (tracked in xj-0w3.5).
+                                    // Replay uses this run's memory policy in both modes.
+                                    // Interpreter single-step (not the hot compiled loop):
+                                    // tick the retired counter for the one instruction it
+                                    // may retire (§17.6, sub-seam c).
+                                    let mut info = crate::interp::RetireInfo {
+                                        consistency: vm.consistency,
+                                        exit_request: Some(exit_word),
+                                        trace: vm.lockstep_trace.as_deref(),
+                                        ..Default::default()
+                                    };
+                                    let original_info = if code == RET_HOST_FAULT_DETAIL {
+                                        crate::codemap::lookup_fault_info(
+                                            ctx.next_entry as usize,
+                                            self.cpu.rip,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    let instruction_rip = self.cpu.rip;
+                                    let r = crate::time_stats::HelperTimer::measure(
+                                        vm.time_enabled,
+                                        || {
+                                            crate::interp::step_one_mode::<ROUTED>(
+                                                &vm.mem,
+                                                &mut self.cpu,
+                                                self.mode,
+                                                &mut self.interp_scratch,
+                                                &mut info,
+                                            )
+                                        },
+                                    );
+                                    self.retired += info.retired;
+                                    match r {
+                                        StepResult::Continue => {
+                                            if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
+                                                != mxcsr_mode
+                                            {
+                                                return DispatchResult::Application(Err(
+                                                    blocks_run,
+                                                ));
+                                            }
+                                            break (cur, code);
+                                        }
+                                        StepResult::Exit(Exit::Syscall) => {
+                                            return DispatchResult::Application(Ok(self.syscall(
+                                                crate::FaultPath::Interpreter,
+                                                instruction_rip,
+                                            )));
+                                        }
+                                        StepResult::Exit(Exit::Interrupted) => {
+                                            return DispatchResult::Application(Ok(self
+                                                .interrupted(
+                                                    crate::FaultPath::Helper {
+                                                        family: crate::FaultHelper::String,
+                                                        caller: crate::HelperCaller::Interpreter,
+                                                    },
+                                                    false,
+                                                )));
+                                        }
+                                        StepResult::Exit(exit) => {
+                                            return DispatchResult::Application(Ok(
+                                                if code == RET_HOST_FAULT
+                                                    || code == RET_HOST_FAULT_DETAIL
+                                                {
+                                                    crate::fault::attach_raw_host_fault(
+                                                        ctx.preserve_host_replay(
+                                                            exit,
+                                                            original_info.as_ref(),
+                                                            code == RET_HOST_FAULT_DETAIL,
+                                                        ),
+                                                        raw_fault,
+                                                    )
+                                                } else {
+                                                    exit
+                                                },
+                                            ));
+                                        }
+                                    }
+                                }
+                                // A port-I/O instruction (`in`/`out`, §5.2): the block set
+                                // RIP to the instruction; single-step it on the interpreter
+                                // to produce the `Exit::PortIo` (same deferral as MMIO).
+                                RET_PORTIO_DEFER => {
+                                    if !DEFAULT {
+                                        fp_mode.default();
+                                    }
+                                    let mut info = crate::interp::RetireInfo {
+                                        consistency: vm.consistency,
+                                        exit_request: Some(exit_word),
+                                        trace: vm.lockstep_trace.as_deref(),
+                                        ..Default::default()
+                                    };
+                                    let instruction_rip = self.cpu.rip;
+                                    let r = crate::time_stats::HelperTimer::measure(
+                                        vm.time_enabled,
+                                        || {
+                                            crate::interp::step_one_mode::<ROUTED>(
+                                                &vm.mem,
+                                                &mut self.cpu,
+                                                self.mode,
+                                                &mut self.interp_scratch,
+                                                &mut info,
+                                            )
+                                        },
+                                    );
+                                    self.retired += info.retired;
+                                    match r {
+                                        StepResult::Continue => break (cur, code),
+                                        StepResult::Exit(Exit::Syscall) => {
+                                            return DispatchResult::Application(Ok(self.syscall(
+                                                crate::FaultPath::Interpreter,
+                                                instruction_rip,
+                                            )));
+                                        }
+                                        StepResult::Exit(exit) => {
+                                            return DispatchResult::Application(Ok(exit))
+                                        }
+                                    }
+                                }
+                                // A guest exception (`#DE` div, or a lifted `ud2`/`int3`/
+                                // `int1` trap); the block set the saved RIP (fault: on the
+                                // instruction, trap: past it) and stored the vector in the
+                                // MemCtx out-field.
+                                RET_EXCEPTION => {
+                                    return DispatchResult::Application(Ok(Exit::exception(
+                                        self.cpu.rip,
+                                        ctx.exception_vector as u8,
+                                    )))
+                                }
+                                other => panic!("compiled block returned invalid ABI code {other}"),
+                            }
+                            if BOUNDED && blocks_run >= budget {
+                                if !DEFAULT {
+                                    fp_mode.default();
+                                }
+                                return DispatchResult::Application(Ok(Exit::BudgetExhausted));
+                            }
+                            // Poll before replacing the just-executed unit with its
+                            // successor. Only the cold edge needs its identity.
+                            if exit_word.load(Ordering::Relaxed) != 0
+                                || self.fast_lifetime.epoch() != execution.epoch()
+                            {
+                                break (cur, code);
+                            }
+                            cur = next;
+                        };
+                        if vm.time_enabled {
+                            shared_reason = match stopped_code {
+                                RET_RETURN_MISS => SharedReason::ReturnMiss,
+                                RET_LINK => SharedReason::DirectLink,
+                                RET_IBTC_MISS => SharedReason::IbtcMiss,
+                                _ => SharedReason::Boundary,
+                            };
+                        }
+                        dispatch = exit_word.load(Ordering::Relaxed);
+                        if dispatch & EXIT_REQUESTED != 0 {
+                            if !DEFAULT {
+                                fp_mode.default();
+                            }
+                            return DispatchResult::Application(Ok(
+                                self.interrupted_compiled(stopped, stopped_code)
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1605,6 +3099,220 @@ impl Vcpu {
 #[allow(deprecated)] // Compatibility selector witnesses.
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_direct_bus_revalidates_selectors_and_a20() {
+        // SDM Vol 3A §11.7.13.4; decision-22 §3: the board gate masks bit 20;
+        // entry edits must invalidate both context and bus-derived metadata.
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let mut vm = Vm::new(VmConfig::flat(0x120000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x120000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, b"\xa1\x20\x00\xeb\xfb").unwrap();
+            vm.mem.write(0x20, 0x1111, 2).unwrap();
+            vm.mem.write(0x10, 0x2222, 2).unwrap();
+            vm.mem.write(0x100010, 0x3333, 2).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+            for (selector, enabled, direct, value) in [
+                (0, true, true, 0x1111),
+                (0xffff, false, false, 0x2222),
+                (0xffff, true, true, 0x3333),
+                (0, false, true, 0x1111),
+            ] {
+                cpu.cpu.ds = selector;
+                cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = u32::from(selector) << 4;
+                cpu.set_a20_enabled(enabled);
+                cpu.cpu.rip = 0x1000;
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1, "{run:?}");
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                assert_eq!(cpu.cpu.gpr[0], value);
+                assert_eq!(
+                    cpu.legacy_execution.as_ref().unwrap().validated_direct_bus,
+                    direct
+                );
+            }
+        }
+    }
+
+    #[test]
+    // SDM Vol 2A §3.3 INC: CF is preserved; decision-16 §3:
+    // a completed input retires once before the next budget boundary.
+    fn partial_shared_budget_completion_keeps_mmio_cleanup() {
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+            vm.write_bytes(0x1000, b"\xa1\x00\x30\x40\xeb\xfa").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.flags.cf = true;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            assert!(matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioRead {
+                    addr: 0x3000,
+                    size: 2,
+                    ..
+                })
+            ));
+            cpu.complete_mmio_read(0x1234);
+            // Select the authoritative multi-instruction block for completion,
+            // exercising its budget boundary instead of a narrowed retry slice.
+            cpu.legacy_execution.as_mut().unwrap().instruction_retry = None;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+            assert_eq!(cpu.cpu.gpr[0], 0x1234);
+            assert_eq!(cpu.cpu.rip, 0x1003);
+            assert!(!cpu.cpu.mmio_retry_active);
+            assert_eq!(cpu.cpu.mmio_parts_len, 0);
+            assert_eq!(cpu.retired_instructions(), 1);
+            assert_eq!(
+                cpu.run_steps(&vm, 1, StepOptions::default())
+                    .unwrap()
+                    .steps(),
+                1
+            );
+            assert_eq!(cpu.cpu.gpr[0], 0x1235);
+            assert!(cpu.cpu.flags.cf);
+            assert_eq!(cpu.retired_instructions(), 2);
+        }
+    }
+
+    #[test]
+    fn replaced_direct_arc_revalidates_its_context_before_reusing_a_walk() {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\xb8\x01\x00\xeb\xfb").unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        assert_eq!(
+            cpu.run_steps(&vm, 2, StepOptions::default())
+                .unwrap()
+                .steps(),
+            2
+        );
+        let key = BlockKey::machine_direct(0x1000, 0, true);
+        let CachedBlock::Interpreted(valid) = vm.cache.get(key).unwrap() else {
+            unreachable!()
+        };
+        assert!(cpu
+            .legacy_execution
+            .as_ref()
+            .unwrap()
+            .direct_proofs
+            .get(&valid, 0x1000)
+            .is_some());
+        let mut wrong = (*valid).clone();
+        wrong.legacy_context.as_mut().unwrap().generation = CpuGeneration::I286;
+        let mut changed = false;
+        for op in &mut wrong.ops {
+            if let IrOp::WriteReg { src, .. } = op {
+                *src = crate::ir::Val::Imm(0xbad);
+                changed = true;
+            }
+        }
+        assert!(changed);
+        let len = wrong.guest_len;
+        vm.cache.insert(
+            key,
+            CachedBlock::Interpreted(Arc::new(wrong)),
+            vec![(0x1000, len)],
+            |_| vm.mem.mark_code(0x1000, len),
+        );
+        cpu.cpu.rip = 0x1000;
+        let (resolved, _) = resolve_direct(
+            &vm,
+            &cpu.cpu,
+            valid.legacy_context.unwrap(),
+            &cpu.exit_request.word,
+            0x1000,
+            &mut cpu.legacy_execution.as_mut().unwrap().direct_proofs,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.legacy_context.unwrap().generation,
+            CpuGeneration::I386
+        );
+        assert_eq!(
+            cpu.run_steps(&vm, 2, StepOptions::default())
+                .unwrap()
+                .steps(),
+            2
+        );
+        assert_eq!(cpu.cpu.gpr[0], 1);
+        let CachedBlock::Interpreted(revalidated) = vm.cache.get(key).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            revalidated.legacy_context.unwrap().generation,
+            CpuGeneration::I386
+        );
+    }
+
+    #[test]
+    fn warm_stamp_preserves_all_cache_fields_and_output_exclusions() {
+        let cpu = CpuState::legacy_real_entry([1, 2, 3, 4, 5, 6]);
+        let model = LegacyCpuModel {
+            generation: CpuGeneration::I386,
+            model_semantics_id: 17,
+        };
+        let stamp = LegacyContextStamp::new(&cpu, model);
+        assert!(stamp.matches(&cpu, model));
+        for segment in 0..8 {
+            for field in 0..5 {
+                for bit in 0..32 {
+                    let mut changed = cpu.clone();
+                    let cache = match segment {
+                        0..=5 => &mut changed.legacy.segments[segment],
+                        6 => &mut changed.legacy.ldtr.cache,
+                        _ => &mut changed.legacy.tr.cache,
+                    };
+                    match field {
+                        0 => cache.base ^= 1 << bit,
+                        1 => cache.limit ^= 1 << bit,
+                        2 => cache.attributes ^= (1u32 << bit) as u16,
+                        3 => cache.unusable ^= (1u32 << bit) as u8,
+                        _ => cache.reserved ^= (1u32 << bit) as u8,
+                    }
+                    assert_eq!(
+                        stamp.matches(&changed, model),
+                        stamp == LegacyContextStamp::new(&changed, model),
+                        "segment {segment} field {field} bit {bit}"
+                    );
+                }
+            }
+        }
+        let mut changed = cpu.clone();
+        changed.legacy.cr2 = u32::MAX;
+        changed.rflags_system ^= !0x27000;
+        assert!(stamp.matches(&changed, model));
+        for edit in [
+            |c: &mut CpuState| c.legacy.cr0 ^= 1,
+            |c: &mut CpuState| c.legacy.cr3 ^= 1,
+            |c: &mut CpuState| c.legacy.gdtr.reserved ^= 1,
+            |c: &mut CpuState| c.legacy.idtr.reserved ^= 1,
+            |c: &mut CpuState| c.legacy.ldtr.selector ^= 1,
+            |c: &mut CpuState| c.legacy.tr.selector ^= 1,
+            |c: &mut CpuState| c.legacy.cpl ^= 1,
+            |c: &mut CpuState| c.legacy.a20_enabled ^= 1,
+            |c: &mut CpuState| c.legacy.reset_fetch ^= 1,
+            |c: &mut CpuState| c.legacy.reserved ^= 1,
+            |c: &mut CpuState| c.cs ^= 1,
+            |c: &mut CpuState| c.gs ^= 1,
+            |c: &mut CpuState| c.rflags_system ^= 0x20000,
+        ] {
+            let mut changed = cpu.clone();
+            edit(&mut changed);
+            assert!(!stamp.matches(&changed, model));
+        }
+    }
 
     #[test]
     fn redirected_event_discards_every_private_boundary_before_fetch() {
@@ -1715,6 +3423,110 @@ mod tests {
             }
             cpu.reset_execution_state(crate::ResetOptions::default());
             assert!(cpu.legacy_execution.as_ref().unwrap().smc_pages.is_empty());
+        }
+    }
+
+    #[test]
+    fn smc_direct_scalar_fault_is_restartable_without_a_checkpoint() {
+        // SDM Vol 3A §7.5: a fault restores the instruction's input state.
+        // Decision-16 §3 retains the completed device read as fault evidence.
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.set_exception_delivery(crate::ExceptionDelivery::Outward);
+            vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+            // Replace the decoded NOP with HLT before ADC [3000h],AX.
+            vm.write_bytes(0x1000, b"\xc6\x06\x09\x10\xf4\x11\x06\x00\x30\x90")
+                .unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.gpr[0] = 0x7fff;
+            cpu.cpu.flags.cf = true;
+            cpu.cpu.flags.of = false;
+            let before = cpu.cpu.flags;
+            assert_eq!(
+                cpu.run_steps(&vm, 1, StepOptions::default())
+                    .unwrap()
+                    .steps(),
+                1
+            );
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::MmioRead {
+                        addr: 0x3000,
+                        size: 2,
+                        ..
+                    })
+                ),
+                "{run:?}"
+            );
+            assert_eq!(
+                crate::legacy::derive_legacy_context(cpu.legacy_model.unwrap(), &cpu.cpu)
+                    .unwrap()
+                    .segment_class,
+                crate::SegmentClass::Direct
+            );
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert!(!execution.smc_pages.is_empty());
+            let ir = &execution
+                .blocks
+                .values()
+                .find(|b| b.ir.guest_start == 0x1005)
+                .unwrap()
+                .ir;
+            assert_eq!(
+                ir.legacy_context.unwrap().segment_class,
+                crate::SegmentClass::Checked
+            );
+            assert!(!ir
+                .ops
+                .iter()
+                .any(|op| matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::Checkpoint))));
+            cpu.complete_mmio_read(0);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::MmioWrite {
+                        addr: 0x3000,
+                        size: 2,
+                        value: 0x8000,
+                        ..
+                    })
+                ),
+                "{run:?}"
+            );
+            assert_eq!(cpu.cpu.flags, before);
+            vm.unmap(0x3000, 0x1000).unwrap();
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            let StepStop::Exit(
+                exit @ Exit::UnmappedMemory {
+                    addr: 0x3000,
+                    access: crate::AccessKind::Write,
+                    ..
+                },
+            ) = run.stop()
+            else {
+                panic!("{run:?}")
+            };
+            assert_eq!(
+                exit.fault_metadata()
+                    .unwrap()
+                    .progress()
+                    .acknowledged_transfers(),
+                &[(0x3000, 0)]
+            );
+            assert_eq!(cpu.cpu.flags, before);
+            assert_eq!(
+                (cpu.cpu.rip, cpu.cpu.gpr[0], cpu.retired_instructions()),
+                (0x1005, 0x7fff, 1)
+            );
         }
     }
 
@@ -1905,8 +3717,9 @@ mod tests {
             .map(|ip| {
                 cpu.rip = ip;
                 execution
-                    .resolve(vm, cpu, model, context, &AtomicU64::new(0))
+                    .resolve::<MACHINE_DISPATCH>(vm, cpu, model, context, &AtomicU64::new(0))
                     .unwrap()
+                    .0
             })
             .collect()
     }
@@ -2335,8 +4148,9 @@ mod tests {
             execution.sync(&cpu.cpu, model, false);
             original.push(
                 execution
-                    .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
-                    .unwrap(),
+                    .resolve::<MACHINE_DISPATCH>(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                    .unwrap()
+                    .0,
             );
         }
         for pe in [0, 1] {
@@ -2344,8 +4158,9 @@ mod tests {
             let context = derive_legacy_context(model, &cpu.cpu).unwrap();
             execution.sync(&cpu.cpu, model, false);
             let ir = execution
-                .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
-                .unwrap();
+                .resolve::<MACHINE_DISPATCH>(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                .unwrap()
+                .0;
             assert!(Arc::ptr_eq(&ir, &original[pe as usize]));
         }
         vm.write_bytes(0x1002, &2u32.to_le_bytes()).unwrap();
@@ -2354,8 +4169,9 @@ mod tests {
             let context = derive_legacy_context(model, &cpu.cpu).unwrap();
             execution.sync(&cpu.cpu, model, false);
             let ir = execution
-                .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
-                .unwrap();
+                .resolve::<MACHINE_DISPATCH>(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+                .unwrap()
+                .0;
             assert!(!Arc::ptr_eq(&ir, &original[pe as usize]));
         }
         let before_id = execution.context_id;
@@ -2364,7 +4180,7 @@ mod tests {
         assert_ne!(execution.context_id, before_id);
         let context = derive_legacy_context(model, &cpu.cpu).unwrap();
         execution
-            .resolve(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
+            .resolve::<MACHINE_DISPATCH>(&vm, &cpu.cpu, model, context, &AtomicU64::new(0))
             .unwrap();
         assert_eq!(execution.blocks.len(), 3);
         cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0xffff;

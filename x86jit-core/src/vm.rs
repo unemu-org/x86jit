@@ -1182,7 +1182,10 @@ impl Vm {
     /// it — runs under. Call before [`new_vcpu`](Vm::new_vcpu). Default is
     /// [`CpuMode::Long64`]. [`CpuMode::Real16`] always uses the interpreter, regardless
     /// of the injected backend or tier-up/region policy.
-    /// Selects Application and clears any previously selected legacy model.
+    /// Long64/Compat32 select Application. Real16 selects the frozen internal
+    /// Machine entry while reporting Application(Real16) (decision-23 §6, M4).
+    /// Its hidden caches are derived from visible selectors at run entry.
+    /// Clears any previously selected public CPU model.
     /// Existing Application vCPUs retain their contexts when this selects the
     /// mode for later vCPUs. Panics when leaving Machine after vCPU creation.
     pub fn set_cpu_mode(&mut self, mode: CpuMode) {
@@ -1650,7 +1653,11 @@ impl Vm {
             mode: self.mode, // decode/lift mode the embedder chose (§17.3)
             profile: self.profile,
             legacy_model: self.legacy_model,
-            exception_delivery: self.exception_delivery,
+            exception_delivery: if self.profile == ExecutionProfile::Application(CpuMode::Real16) {
+                crate::legacy::REAL16_ALIAS.exception_delivery
+            } else {
+                self.exception_delivery
+            },
             cpu_model: self.cpu_model,
             legacy_execution: (self.profile == ExecutionProfile::Machine)
                 .then(|| Box::new(legacy::Execution::new())),
@@ -1908,6 +1915,29 @@ pub struct Vcpu {
     /// MOV/POP SS inhibition, kept distinct for consecutive-load policy
     /// (SDM Vol 3A §7.8.3; decision-16 §4). Interpreter-only, outside `CpuState`.
     ss_shadow: bool,
+}
+
+const APPLICATION_DISPATCH: u8 = 0;
+const ALIAS_DISPATCH: u8 = 1;
+const MACHINE_DISPATCH: u8 = 2;
+
+enum DispatchResult {
+    Application(Result<Exit, u64>),
+    Stepped(StepRun),
+}
+impl DispatchResult {
+    fn application(self) -> Result<Exit, u64> {
+        match self {
+            Self::Application(result) => result,
+            Self::Stepped(_) => unreachable!(),
+        }
+    }
+    fn stepped(self) -> StepRun {
+        match self {
+            Self::Stepped(result) => result,
+            Self::Application(_) => unreachable!(),
+        }
+    }
 }
 
 struct DispatchGuard<'a> {
@@ -2501,6 +2531,9 @@ impl Vcpu {
                 ),
             };
         }
+        if self.mode == CpuMode::Real16 {
+            crate::legacy::REAL16_ALIAS.derive_caches(&mut self.cpu);
+        }
         if self.cpu.port_string_in.is_some() {
             let result = if vm.mem.host_fault_recovery() {
                 self.finish_port_string_in::<true>(vm)
@@ -2611,225 +2644,11 @@ impl Vcpu {
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
         if self.profile == ExecutionProfile::Machine {
-            return self.run_legacy(vm, Some(max_steps), options, true);
-        }
-        if self.mode != CpuMode::Real16 {
-            return Err(StepRunError::UnsupportedMode);
-        }
-        if max_steps == 0 {
-            let time_run = crate::time_stats::RunGuard::enter(
-                self.time_record.clone(),
-                vm.time_enabled,
-                self.time_outside.take(),
-            );
-            drop(DispatchGuard::new(self, vm));
-            self.time_outside = time_run.finish(Some(&Exit::BudgetExhausted));
-            return Ok(StepRun {
-                steps: 0,
-                stop: StepStop::Exit(Exit::BudgetExhausted),
-            });
-        }
-        if self.cpu.pending_port_in.is_some() {
-            return Err(StepRunError::PendingPortIn);
-        }
-        let time_run = crate::time_stats::RunGuard::enter(
-            self.time_record.clone(),
-            vm.time_enabled,
-            self.time_outside.take(),
-        );
-        let dispatch = DispatchGuard::new(self, vm);
-        let cpu = &mut *dispatch.cpu;
-        cpu.interruption_evidence = None;
-        cpu.syscall_evidence = None;
-        cpu.fault_entry.prepare_run();
-        let mut fp_mode = crate::jit_abi::fp::RunMode::new();
-        // As in run(), deactivate publication even if an embedder callback unwinds.
-        struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
-        impl Drop for FaultRunGuard {
-            fn drop(&mut self) {
-                // SAFETY: the boxed record stays fixed for the exclusive vCPU borrow.
-                unsafe {
-                    (*self.0).deactivate();
-                }
-            }
-        }
-        let guard = FaultRunGuard(&mut *cpu.fault_entry);
-        let mut steps = crate::interp::StepContext::new(max_steps);
-        let stop = match (vm.mem.host_fault_recovery(), options.stop_when_irq_ready) {
-            (true, true) => cpu.run_steps_inner::<true, true>(vm, &mut steps, &mut fp_mode),
-            (true, false) => cpu.run_steps_inner::<true, false>(vm, &mut steps, &mut fp_mode),
-            (false, true) => cpu.run_steps_inner::<false, true>(vm, &mut steps, &mut fp_mode),
-            (false, false) => cpu.run_steps_inner::<false, false>(vm, &mut steps, &mut fp_mode),
-        };
-        drop(guard);
-        let stop = match stop {
-            StepStop::Exit(exit) => {
-                let exit = crate::fault::qualify_real16(exit, &cpu.cpu);
-                let exit = match exit {
-                    exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
-                        cpu.fault_entry.finish_transfer_fault(exit, &vm.mem)
-                    }
-                    other => other,
-                };
-                cpu.cpu.finish_mmio_retry(Some(&exit));
-                StepStop::Exit(exit)
-            }
-            StepStop::IrqReady => StepStop::IrqReady,
-        };
-        drop(dispatch);
-        self.time_outside = time_run.finish(match &stop {
-            StepStop::Exit(exit) => Some(exit),
-            StepStop::IrqReady => None,
-        });
-        Ok(StepRun {
-            steps: steps.steps,
-            stop,
-        })
-    }
-
-    fn run_steps_inner<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool>(
-        &mut self,
-        vm: &Vm,
-        steps: &mut crate::interp::StepContext,
-        fp_mode: &mut crate::jit_abi::fp::RunMode,
-    ) -> StepStop {
-        let exit_word_owner = Arc::clone(&self.exit_request.word);
-        let exit_word: &AtomicU64 = &exit_word_owner;
-        let mut ctx = MemCtx::for_memory(&vm.mem);
-        ctx.time_enabled = u64::from(vm.time_enabled);
-        self.fault_entry.publish(&mut self.cpu, &mut ctx);
-        if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
-            return StepStop::Exit(exit);
-        }
-        loop {
-            fp_mode.default();
-            if steps.remaining == 0 {
-                return StepStop::Exit(Exit::BudgetExhausted);
-            }
-            let pending = self.cpu.mmio_retry_active
-                || self.cpu.pending_mmio.is_some()
-                || self.cpu.pending_mmio_write
-                || self.cpu.pending_port_in.is_some();
-            if !pending && exit_word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0 {
-                return StepStop::Exit(self.interrupted(crate::FaultPath::Interpreter, false));
-            }
-            if let Some(exit) = self.code_space_exit(vm) {
-                return StepStop::Exit(exit);
-            }
-            vm.handle_smc(exit_word);
-            if self.pending_irq.is_some() && self.irq_ready() {
-                let vector = self.pending_irq.take().unwrap();
-                let ip = self.cpu.rip;
-                match crate::interp::deliver_interrupt(
-                    &mut self.cpu,
-                    &vm.mem,
-                    ip,
-                    vector,
-                    ip,
-                    vm.consistency,
-                )
-                .into_step()
-                {
-                    StepResult::Continue => {
-                        self.sti_shadow = false;
-                        self.ss_shadow = false;
-                        continue;
-                    }
-                    StepResult::Exit(exit) => return StepStop::Exit(exit),
-                }
-            }
-            if STOP_WHEN_IRQ_READY && self.irq_ready() {
-                return StepStop::IrqReady;
-            }
-            let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
-            let block = match resolve_dispatch::<true>(
-                vm,
-                &mut self.time_dispatch,
-                exit_word,
-                &self.engine_sections,
-                fetch,
-                self.mode,
-                0,
-            ) {
-                Ok(block) => block,
-                Err(exit) if crate::x87::emulated_esc(&self.cpu, self.mode, &exit) => {
-                    match self.step_instruction(vm) {
-                        StepResult::Continue => continue,
-                        StepResult::Exit(exit) => return StepStop::Exit(exit),
-                    }
-                }
-                Err(exit) => return StepStop::Exit(exit),
-            };
-            let CachedBlock::Interpreted(ir) = block else {
-                unreachable!("Real16 resolution always interprets");
-            };
-            let mut info = crate::interp::RetireInfo {
-                code_base: fetch.pa - fetch.ip,
-                consistency: vm.consistency,
-                sti_shadow: self.sti_shadow,
-                ss_shadow: self.ss_shadow,
-                exit_request: Some(exit_word),
-                trace: vm.lockstep_trace.as_deref(),
-                ..Default::default()
-            };
-            steps.pending_irq = self.pending_irq.is_some();
-            let result = if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0 {
-                crate::interp::interpret_block_steps::<ROUTED, true, STOP_WHEN_IRQ_READY>(
-                    &ir,
-                    &mut self.cpu,
-                    &vm.mem,
-                    &mut self.interp_scratch,
-                    &mut info,
-                    steps,
-                )
-            } else {
-                crate::interp::interpret_block_steps::<ROUTED, false, STOP_WHEN_IRQ_READY>(
-                    &ir,
-                    &mut self.cpu,
-                    &vm.mem,
-                    &mut self.interp_scratch,
-                    &mut info,
-                    steps,
-                )
-            };
-            self.retired += info.retired;
-            self.executed += info.retired;
-            self.sti_shadow = info.sti_shadow;
-            self.ss_shadow = info.ss_shadow;
-            match result {
-                crate::interp::BlockResult::Continue | crate::interp::BlockResult::ModeChange => {}
-                crate::interp::BlockResult::Exit(exit) => match exit.into_exit() {
-                    Exit::Syscall => return StepStop::Exit(self.syscall_interpreted(&ir)),
-                    Exit::Interrupted => {
-                        let path = if steps.string_interrupted {
-                            crate::FaultPath::Helper {
-                                family: crate::FaultHelper::String,
-                                caller: crate::HelperCaller::Interpreter,
-                            }
-                        } else {
-                            crate::FaultPath::Interpreter
-                        };
-                        return StepStop::Exit(self.interrupted(path, false));
-                    }
-                    Exit::Exception { addr, vector, .. } => match crate::interp::deliver_interrupt(
-                        &mut self.cpu,
-                        &vm.mem,
-                        addr,
-                        vector,
-                        addr,
-                        vm.consistency,
-                    )
-                    .into_step()
-                    {
-                        StepResult::Continue => {
-                            self.sti_shadow = false;
-                            self.ss_shadow = false;
-                        }
-                        StepResult::Exit(exit) => return StepStop::Exit(exit),
-                    },
-                    exit => return StepStop::Exit(exit),
-                },
-            }
+            self.run_engine::<MACHINE_DISPATCH, true>(vm, Some(max_steps), options)
+        } else if self.mode == CpuMode::Real16 {
+            self.run_engine::<ALIAS_DISPATCH, true>(vm, Some(max_steps), options)
+        } else {
+            Err(StepRunError::UnsupportedMode)
         }
     }
 
@@ -2846,22 +2665,17 @@ impl Vcpu {
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         self.interruption_evidence = None;
         self.syscall_evidence = None;
-        if self.profile == ExecutionProfile::Machine {
-            return match self.run_legacy(vm, budget, StepOptions::default(), false) {
-                Ok(run) => match run.stop {
-                    StepStop::Exit(exit) => exit,
-                    StepStop::IrqReady => unreachable!(),
-                },
-                Err(_) => self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution),
-            };
-        }
-        if self.mode != CpuMode::Real16 && budget != Some(0) && self.pending_irq.is_some() {
+        if self.profile != ExecutionProfile::Machine
+            && self.mode != CpuMode::Real16
+            && budget != Some(0)
+            && self.pending_irq.is_some()
+        {
             return Exit::UnsupportedSystemContext {
                 addr: self.cpu.rip,
                 operation: UnsupportedSystemOperation::ApplicationIrqDelivery,
             };
         }
-        if !vm.cache.code_lifetime().is_open() {
+        if self.profile != ExecutionProfile::Machine && !vm.cache.code_lifetime().is_open() {
             if let Some(next) = vm.backend.code_lifetime() {
                 if vm
                     .cache
@@ -2871,6 +2685,83 @@ impl Vcpu {
                 }
             }
         }
+        let run = if self.profile == ExecutionProfile::Machine {
+            self.run_engine::<MACHINE_DISPATCH, false>(vm, budget, StepOptions::default())
+        } else if self.mode == CpuMode::Real16 {
+            self.run_engine::<ALIAS_DISPATCH, false>(vm, budget, StepOptions::default())
+        } else {
+            self.run_engine::<APPLICATION_DISPATCH, false>(vm, budget, StepOptions::default())
+        };
+        match run {
+            Ok(StepRun {
+                stop: StepStop::Exit(exit),
+                ..
+            }) => exit,
+            Ok(_) => unreachable!(),
+            Err(_) => self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution),
+        }
+    }
+
+    #[inline(always)]
+    fn run_engine<const KIND: u8, const STEPPED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        // Decision-16 §3: every execution exit passes the attempt's ownership
+        // boundary. Only explicit continuations can return a REP flag origin.
+        let result = self.run_engine_attempt::<KIND, STEPPED>(vm, budget, options);
+        if KIND == MACHINE_DISPATCH && budget != Some(0) {
+            self.finish_comparison_attempt(&result);
+        }
+        result
+    }
+
+    #[inline(always)]
+    fn run_engine_attempt<const KIND: u8, const STEPPED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        if KIND == ALIAS_DISPATCH && STEPPED && budget == Some(0) {
+            let time_run = crate::time_stats::RunGuard::enter(
+                self.time_record.clone(),
+                vm.time_enabled,
+                self.time_outside.take(),
+            );
+            drop(DispatchGuard::new(self, vm));
+            self.time_outside = time_run.finish(Some(&Exit::BudgetExhausted));
+            return Ok(StepRun {
+                steps: 0,
+                stop: StepStop::Exit(Exit::BudgetExhausted),
+            });
+        }
+        let context = if KIND == MACHINE_DISPATCH {
+            let context = if let Some(context) = self.warm_machine_context(budget) {
+                context
+            } else {
+                match self.prepare_machine_entry_cold(budget) {
+                    Ok(context) => context,
+                    Err(exit) => {
+                        return Ok(StepRun {
+                            steps: 0,
+                            stop: StepStop::Exit(exit),
+                        });
+                    }
+                }
+            };
+            Some((context, budget))
+        } else {
+            None
+        };
+        if STEPPED && self.cpu.pending_port_in.is_some() {
+            return Err(StepRunError::PendingPortIn);
+        }
+        if KIND == ALIAS_DISPATCH && budget != Some(0) {
+            crate::legacy::REAL16_ALIAS.derive_caches(&mut self.cpu);
+        }
         let time_run = crate::time_stats::RunGuard::enter(
             self.time_record.clone(),
             vm.time_enabled,
@@ -2878,46 +2769,122 @@ impl Vcpu {
         );
         let dispatch = DispatchGuard::new(self, vm);
         let cpu = &mut *dispatch.cpu;
+        cpu.interruption_evidence = None;
+        cpu.syscall_evidence = None;
         cpu.fault_entry.prepare_run();
         let mut fp_mode = crate::jit_abi::fp::RunMode::new();
         struct FaultRunGuard(*mut crate::jit_abi::fault::EntryRecord);
         impl Drop for FaultRunGuard {
             fn drop(&mut self) {
-                // SAFETY: the boxed record stays live and fixed throughout run's
-                // exclusive vCPU borrow, including while run_inner unwinds.
+                // SAFETY: the boxed entry remains fixed for the exclusive vCPU borrow.
                 unsafe {
                     (*self.0).deactivate();
                 }
             }
         }
-        let fault_run = FaultRunGuard(&mut *cpu.fault_entry);
-        let exit = if vm.mem.host_fault_recovery() {
-            cpu.run_inner::<true>(vm, budget, &mut fp_mode)
-        } else {
-            cpu.run_inner::<false>(vm, budget, &mut fp_mode)
-        };
-        drop(fault_run);
-        let exit = match exit {
-            exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. }) => {
-                cpu.fault_entry.finish_transfer_fault(exit, &vm.mem)
+        let guard = FaultRunGuard(&mut *cpu.fault_entry);
+        let mut result = if KIND == APPLICATION_DISPATCH {
+            let exit = if vm.mem.host_fault_recovery() {
+                cpu.run_inner::<true>(vm, budget, &mut fp_mode)
+            } else {
+                cpu.run_inner::<false>(vm, budget, &mut fp_mode)
+            };
+            StepRun {
+                steps: 0,
+                stop: StepStop::Exit(exit),
             }
-            other => other,
+        } else if KIND == ALIAS_DISPATCH {
+            macro_rules! alias {
+                ($routed:literal, $bounded:literal, $stop:literal) => {
+                    cpu.run_dispatch::<$routed, true, $bounded, ALIAS_DISPATCH, STEPPED, $stop, 0, false>(
+                        vm,
+                        budget.unwrap_or(u64::MAX),
+                        &mut fp_mode,
+                        SharedReason::Entry,
+                        options,
+                        None,
+                    )
+                    .stepped()
+                };
+                ($routed:literal) => {
+                    match (budget.is_some(), options.stop_when_irq_ready) {
+                        (true, true) => alias!($routed, true, true),
+                        (true, false) => alias!($routed, true, false),
+                        (false, true) => alias!($routed, false, true),
+                        (false, false) => alias!($routed, false, false),
+                    }
+                };
+            }
+            if vm.mem.host_fault_recovery() {
+                alias!(true)
+            } else {
+                alias!(false)
+            }
+        } else {
+            macro_rules! enter {
+                ($routed:literal, $order:literal, $single:literal) => {
+                    cpu.run_dispatch::<$routed, true, false, KIND, false, false, $order, $single>(
+                        vm,
+                        if $single {
+                            1
+                        } else {
+                            budget.unwrap_or(u64::MAX)
+                        },
+                        &mut fp_mode,
+                        SharedReason::Entry,
+                        options,
+                        context,
+                    )
+                    .stepped()
+                };
+                ($routed:literal, $order:literal) => {{
+                    if budget == Some(1) {
+                        enter!($routed, $order, true)
+                    } else {
+                        enter!($routed, $order, false)
+                    }
+                }};
+            }
+            match (vm.mem.host_fault_recovery(), vm.consistency) {
+                (true, MemConsistency::Fast) => enter!(true, 0),
+                (false, MemConsistency::Fast) => enter!(false, 0),
+                (true, MemConsistency::AcqRel) => enter!(true, 1),
+                (false, MemConsistency::AcqRel) => enter!(false, 1),
+                (true, MemConsistency::FullTso) => enter!(true, 2),
+                (false, MemConsistency::FullTso) => enter!(false, 2),
+            }
         };
-        cpu.cpu.finish_mmio_retry(Some(&exit));
-        if matches!(exit, Exit::Interrupted) && cpu.interruption_evidence.is_none() {
-            // Acquire the writes published by the consumed request. A later
-            // request remains pending; a concurrent SMC bit survives the mask.
-            cpu.interruption_evidence = Some(
-                crate::interruption::consume(&cpu.exit_request.word, &cpu.engine_sections).at(
-                    crate::FaultPath::Unknown,
-                    false,
-                    cpu.cpu.rip,
-                ),
-            );
+        drop(guard);
+        if KIND == ALIAS_DISPATCH {
+            if let StepStop::Exit(exit) = result.stop {
+                result.stop = StepStop::Exit(crate::fault::qualify_real16(exit, &cpu.cpu));
+            }
+        }
+        if let StepStop::Exit(exit @ (Exit::UnmappedMemory { .. } | Exit::Exception { .. })) =
+            result.stop
+        {
+            result.stop = StepStop::Exit(cpu.fault_entry.finish_transfer_fault(exit, &vm.mem));
+        }
+        if KIND == MACHINE_DISPATCH {
+            cpu.finish_machine_run(&mut result);
+        } else if let StepStop::Exit(exit) = &result.stop {
+            cpu.cpu.finish_mmio_retry(Some(exit));
+        }
+        if let StepStop::Exit(Exit::Interrupted) = &result.stop {
+            if cpu.interruption_evidence.is_none() {
+                cpu.interruption_evidence =
+                    Some(
+                        crate::interruption::consume(&cpu.exit_request.word, &cpu.engine_sections)
+                            .at(crate::FaultPath::Unknown, false, cpu.cpu.rip),
+                    );
+            }
         }
         drop(dispatch);
-        self.time_outside = time_run.finish(Some(&exit));
-        exit
+        self.time_outside = time_run.finish(match &result.stop {
+            StepStop::Exit(exit) => Some(exit),
+            StepStop::IrqReady => None,
+        });
+        Ok(result)
     }
 
     fn finish_dispatch_counts(
@@ -3007,6 +2974,25 @@ impl Vcpu {
         }
     }
 
+    #[inline(never)]
+    fn run_application_dispatch<const ROUTED: bool, const DEFAULT: bool, const BOUNDED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: u64,
+        fp_mode: &mut crate::jit_abi::fp::RunMode,
+        origin: SharedReason,
+    ) -> Result<Exit, u64> {
+        self.run_dispatch::<ROUTED, DEFAULT, BOUNDED, APPLICATION_DISPATCH, false, false, 0, false>(
+            vm,
+            budget,
+            fp_mode,
+            origin,
+            StepOptions::default(),
+            None,
+        )
+        .application()
+    }
+
     fn run_inner<const ROUTED: bool>(
         &mut self,
         vm: &Vm,
@@ -3025,16 +3011,17 @@ impl Vcpu {
             }
             let limit = remaining.unwrap_or(u64::MAX);
             let result = match (mode == 0, remaining.is_some()) {
-                (true, true) => self.run_dispatch::<ROUTED, true, true>(vm, limit, fp_mode, origin),
+                (true, true) => {
+                    self.run_application_dispatch::<ROUTED, true, true>(vm, limit, fp_mode, origin)
+                }
                 (true, false) => {
-                    self.run_dispatch::<ROUTED, true, false>(vm, limit, fp_mode, origin)
+                    self.run_application_dispatch::<ROUTED, true, false>(vm, limit, fp_mode, origin)
                 }
                 (false, true) => {
-                    self.run_dispatch::<ROUTED, false, true>(vm, limit, fp_mode, origin)
+                    self.run_application_dispatch::<ROUTED, false, true>(vm, limit, fp_mode, origin)
                 }
-                (false, false) => {
-                    self.run_dispatch::<ROUTED, false, false>(vm, limit, fp_mode, origin)
-                }
+                (false, false) => self
+                    .run_application_dispatch::<ROUTED, false, false>(vm, limit, fp_mode, origin),
             };
             match result {
                 Ok(exit) => return exit,
@@ -3042,902 +3029,6 @@ impl Vcpu {
                     remaining = remaining.map(|b| b - consumed);
                     if vm.time_enabled {
                         origin = SharedReason::ModeRestart;
-                    }
-                }
-            }
-        }
-    }
-
-    // A mode write returns to run_inner to select a new specialization and flush
-    // private predictions. Default block transfers contain no FP guard checks.
-    #[inline(never)]
-    // Unlimited runs keep budget state out of the compiled chain loop's registers.
-    fn run_dispatch<const ROUTED: bool, const DEFAULT: bool, const BOUNDED: bool>(
-        &mut self,
-        vm: &Vm,
-        budget: u64,
-        fp_mode: &mut crate::jit_abi::fp::RunMode,
-        origin: SharedReason,
-    ) -> Result<Exit, u64> {
-        // Epoch numbers belong to a domain. A vCPU used with another VM must
-        // not carry predictions whose equal epoch names a different backend.
-        let lifetime = vm.cache.code_lifetime();
-        if !Arc::ptr_eq(&self.fast_lifetime, &lifetime) {
-            self.fast_clear();
-            self.execution_participant = lifetime.participant();
-            self.fast_epoch = lifetime.epoch();
-            self.fast_lifetime = lifetime;
-        }
-        let mut participant = self.execution_participant.for_dispatch();
-        let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
-        let mut shared_reason = origin;
-        let mut blocks_run: u64 = 0;
-        let exit_word_owner = Arc::clone(&self.exit_request.word);
-        let exit_word: &AtomicU64 = &exit_word_owner;
-        // Deliberately a LOCAL: taking it as a `&mut` parameter instead measured +5.4%
-        // on the dispatch-micro bench, because the compiler stops treating it as one.
-        let mut ctx = MemCtx::for_memory(&vm.mem);
-        ctx.time_enabled = u64::from(vm.time_enabled);
-        self.fault_entry.publish(&mut self.cpu, &mut ctx);
-        ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
-        // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
-        // boxed, so its address is stable for the whole run despite `&mut self`.
-        ctx.ret_stack = std::ptr::addr_of_mut!(*self.ret_stack) as u64;
-        // ...and the executed-instruction counter it charges into. Stable
-        // for the run: `self` cannot move while this call is on the stack. Read only
-        // by blocks the backend chose to emit accounting into.
-        ctx.icount_ptr = std::ptr::addr_of_mut!(self.executed) as u64;
-
-        if !BOUNDED || budget != 0 {
-            if let Err(exit) = self.finish_port_string_in::<ROUTED>(vm) {
-                return Ok(exit);
-            }
-        }
-        let mut dispatch = exit_word.load(Ordering::Relaxed);
-        loop {
-            // The outer dispatcher may invalidate code or invoke backend callbacks.
-            // Retain guest control only in the integer-only compiled chain below.
-            if !DEFAULT {
-                fp_mode.default();
-            }
-            if dispatch & EXIT_REQUESTED != 0
-                && self.cpu.pending_mmio.is_none()
-                && !self.cpu.pending_mmio_write
-                && self.cpu.pending_port_in.is_none()
-                && self.cpu.port_string_in.is_none()
-            {
-                return Ok(Exit::Interrupted);
-            }
-            // The sticky flag can be observed before the backend finishes its
-            // broadcast. A late bit must not keep an already-notified vcpu in
-            // the outer loop forever.
-            if self.code_space_reported && dispatch & CODE_SPACE_EXHAUSTED != 0 {
-                exit_word.fetch_and(!CODE_SPACE_EXHAUSTED, Ordering::Acquire);
-            }
-            if let Some(exit) = self.code_space_exit(vm) {
-                return Ok(exit);
-            }
-            if BOUNDED && blocks_run >= budget {
-                return Ok(Exit::BudgetExhausted);
-            }
-
-            // SMC (§10): drop any cached block a prior block's store landed on,
-            // before fetching the next one, so re-execution re-lifts fresh bytes.
-            vm.handle_smc(exit_word);
-
-            // Participation precedes resolving or probing any executable pointer.
-            // Its scope includes cold fault decoding and every chain transfer;
-            // continue/return/unwind all announce quiescence through RAII.
-            let execution = participant.enter();
-
-            // Flush the fast-resolve cache if any invalidation happened since we
-            // last synced — covers same-thread SMC (just handled above) and
-            // cross-thread SMC (another vcpu bumped the epoch). Ordered after
-            // `handle_smc` so a probe never predates its own invalidation.
-            let epoch = self.fast_lifetime.epoch();
-            if epoch != self.fast_epoch {
-                self.fast_clear();
-                self.fast_epoch = epoch;
-                self.fast_empty_reason = PrivateMiss::Epoch;
-            }
-
-            // Resume after an MMIO trap the JIT deferred (§5.2): once the
-            // embedder has supplied the read value (`complete_mmio_read`) or
-            // acknowledged the write (`complete_mmio_write`), single-step the
-            // faulting instruction on the interpreter — it consumes the pending
-            // value/ack and advances RIP — before dispatching the next block. (Under
-            // the interpreter backend this is equivalent to re-dispatching the block;
-            // it just does the one faulting instruction first.)
-            // A RAM fault may have consumed the pending completion while leaving
-            // recorded transfers. Keep that retry on the interpreter until completion;
-            // compiled blocks never inherit answers from a partially serviced operand.
-            if self.cpu.mmio_retry_active {
-                if !DEFAULT {
-                    fp_mode.default();
-                }
-                // Finish the pending transfer before honouring a host request at
-                // an instruction or REP element boundary (SDM Vol 2B §4.3,
-                // REP Description/Operation, pp. 4-563–4-564).
-                let mut info = crate::interp::RetireInfo {
-                    consistency: vm.consistency,
-                    sti_shadow: self.sti_shadow,
-                    ss_shadow: self.ss_shadow,
-                    exit_request: Some(exit_word),
-                    ..Default::default()
-                };
-                let instruction_rip = self.cpu.rip;
-                let r = crate::interp::step_one_mode::<ROUTED>(
-                    &vm.mem,
-                    &mut self.cpu,
-                    self.mode,
-                    &mut self.interp_scratch,
-                    &mut info,
-                );
-                self.retired += info.retired;
-                self.sti_shadow = info.sti_shadow;
-                self.ss_shadow = info.ss_shadow;
-                match r {
-                    StepResult::Continue => {
-                        if BOUNDED {
-                            blocks_run += 1;
-                        }
-                        if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != mxcsr_mode {
-                            return Err(blocks_run);
-                        }
-                        dispatch = exit_word.load(Ordering::Relaxed);
-                        if dispatch & EXIT_REQUESTED != 0 {
-                            return Ok(self.interrupted(crate::FaultPath::Interpreter, false));
-                        }
-                        continue;
-                    }
-                    StepResult::Exit(Exit::Syscall) => {
-                        return Ok(self.syscall(crate::FaultPath::Interpreter, instruction_rip));
-                    }
-                    StepResult::Exit(Exit::Interrupted) => {
-                        return Ok(self.interrupted(
-                            crate::FaultPath::Helper {
-                                family: crate::FaultHelper::String,
-                                caller: crate::HelperCaller::Interpreter,
-                            },
-                            false,
-                        ));
-                    }
-                    StepResult::Exit(exit) => {
-                        return Ok(crate::fault::qualify_real16(exit, &self.cpu))
-                    }
-                }
-            }
-
-            // §17.6 (sub-seam c): hardware-interrupt injection is delivered here, at a
-            // run() boundary — never mid-block. Gate: a vector is pending, IF is set, no
-            // memory/port completion is outstanding (a partially-serviced MMIO/`in` must
-            // finish first), and the one-instruction STI/SS shadow has elapsed. All false-
-            // gating leaves the vector queued (never dropped) for a later boundary — this
-            // is also the point that services a post-`hlt` wakeup: after an `Exit::Hlt`
-            // the embedder injects and re-enters, and RIP already sits past the `hlt`, so
-            // delivery vectors the handler and `iret` resumes past the `hlt`. The
-            // embedder owns the PIC: it must have run INTA / updated the ISR before
-            // `inject_irq`. The public entry guard refuses queued application IRQs
-            // outside Real16 before this dispatcher is entered.
-            if let Some(vector) = self.pending_irq {
-                if self.irq_delivery_ready() {
-                    if !DEFAULT {
-                        fp_mode.default();
-                    }
-                    self.pending_irq = None;
-                    // Saved IP = current RIP (the maskable IRQ is an async trap; execution
-                    // resumes at the next instruction, which is where RIP already points).
-                    let saved = self.cpu.rip;
-                    match crate::interp::deliver_interrupt(
-                        &mut self.cpu,
-                        &vm.mem,
-                        saved,
-                        vector,
-                        saved,
-                        vm.consistency,
-                    )
-                    .into_step()
-                    {
-                        StepResult::Continue => {
-                            // Delivery is itself an atomic hardware event, not a retired
-                            // guest instruction — do not tick `retired`; do charge a block
-                            // for §9.2 budget accounting. It also clears any stale shadow.
-                            self.sti_shadow = false;
-                            self.ss_shadow = false;
-                            if BOUNDED {
-                                blocks_run += 1;
-                            }
-                            dispatch = exit_word.load(Ordering::Relaxed);
-                            continue;
-                        }
-                        StepResult::Exit(exit) => {
-                            return Ok(crate::fault::qualify_real16(exit, &self.cpu))
-                        }
-                    }
-                }
-            }
-
-            // §17.6: the physical fetch address (`cs_base + IP` in Real16, else `rip`).
-            // The block cache and lift key on `fetch.pa`; the fast-probe stays keyed on
-            // the raw `rip` (it only ever holds *compiled* blocks, which Real16 never
-            // produces — so an IP-keyed probe is harmless and identical outside Real16).
-            let fetch = FetchAddr::for_mode(self.mode, self.cpu.rip, self.cpu.cs);
-
-            // Fast path: a vcpu-private probe replaces the shared cache lookup
-            // for compiled blocks. A miss falls back to `resolve` and installs the
-            // result; interpreted blocks are never cached here, so they always route
-            // through `resolve` (keeping the cache hit/miss counters meaningful).
-            let block = match self.fast_get(self.cpu.rip) {
-                Some(entry) => {
-                    // Plain (non-atomic) per-vcpu counter — the whole point of the
-                    // private probe is to avoid the shared atomic bumps on this path.
-                    self.fast_hits = self.fast_hits.saturating_add(1);
-                    CachedBlock::Compiled { entry }
-                }
-                None => {
-                    if vm.time_enabled {
-                        self.record_shared_resolve(shared_reason, self.cpu.rip);
-                    }
-                    if !DEFAULT {
-                        fp_mode.default();
-                    }
-                    match resolve_dispatch::<DEFAULT>(
-                        vm,
-                        &mut self.time_dispatch,
-                        exit_word,
-                        &self.engine_sections,
-                        fetch,
-                        self.mode,
-                        if DEFAULT { 0 } else { self.cpu.mxcsr },
-                    ) {
-                        Ok(b) => {
-                            if let CachedBlock::Compiled { entry, .. } = &b {
-                                self.fast_put(self.cpu.rip, *entry);
-                            }
-                            b
-                        }
-                        Err(exit) if crate::x87::emulated_esc(&self.cpu, self.mode, &exit) => {
-                            match self.step_instruction(vm) {
-                                StepResult::Continue => {
-                                    if BOUNDED {
-                                        blocks_run += 1;
-                                    }
-                                    continue;
-                                }
-                                StepResult::Exit(exit) => return Ok(exit),
-                            }
-                        }
-                        Err(exit) => return Ok(exit),
-                    }
-                }
-            };
-
-            if let Some(exit) = self.code_space_exit(vm) {
-                return Ok(exit);
-            }
-            match block {
-                CachedBlock::Interpreted(ir) => {
-                    // Owned IR needs no execution grace. A request deferred by
-                    // resolution is delivered by the existing execution boundary.
-                    drop(execution);
-                    if vm.time_enabled {
-                        shared_reason = SharedReason::Interpreter;
-                    }
-                    if vm.time_enabled {
-                        crate::time_stats::interpreted();
-                    }
-                    if !DEFAULT {
-                        fp_mode.default();
-                    }
-                    let mut info = crate::interp::RetireInfo {
-                        code_base: fetch.pa - fetch.ip,
-                        consistency: vm.consistency,
-                        sti_shadow: self.sti_shadow,
-                        ss_shadow: self.ss_shadow,
-                        exit_request: Some(exit_word),
-                        trace: vm.lockstep_trace.as_deref(),
-                        ..Default::default()
-                    };
-                    let r = crate::interp::interpret_block_fp::<ROUTED, DEFAULT>(
-                        &ir,
-                        &mut self.cpu,
-                        &vm.mem,
-                        &mut self.interp_scratch,
-                        &mut info,
-                    );
-                    // §17.6 (sub-seam c): tick the retired-instruction counter and latch
-                    // the STI/SS shadow from this interpreted block (Real16 is all
-                    // interpreter, so this is the whole real-mode instruction stream).
-                    self.retired += info.retired;
-                    // Same counter as compiled code charges, so the total
-                    // covers whichever tier actually ran the guest.
-                    self.executed += info.retired;
-                    self.sti_shadow = info.sti_shadow;
-                    self.ss_shadow = info.ss_shadow;
-                    match r {
-                        crate::interp::BlockResult::Continue => {
-                            if BOUNDED {
-                                blocks_run += 1;
-                            }
-                        }
-                        crate::interp::BlockResult::ModeChange => {
-                            return Err(if BOUNDED { blocks_run + 1 } else { 0 })
-                        }
-                        // §17.6 (sub-seam b): in real mode a CPU exception is delivered
-                        // in-guest through the IVT, not surfaced to the embedder. The
-                        // only `Exit::Exception` that escapes an interpreted Real16 block
-                        // is `#DE` (divide error, vector 0) from `IrOp::Div` — `int n`/
-                        // `int3`/`ud2` already vector in-guest via `IrOp::IntGate`. Its
-                        // `addr` is the faulting instruction's IP (the saved IP for a
-                        // fault), so re-deliver through the same IVT path and continue.
-                        // Long64/Compat32 still return `Exit::Exception` unchanged.
-                        crate::interp::BlockResult::Exit(exit) => {
-                            let exit = exit.into_exit();
-                            match exit {
-                                Exit::Syscall => return Ok(self.syscall_interpreted(&ir)),
-                                Exit::Interrupted => {
-                                    return Ok(self.interrupted(
-                                        crate::FaultPath::Helper {
-                                            family: crate::FaultHelper::String,
-                                            caller: crate::HelperCaller::Interpreter,
-                                        },
-                                        false,
-                                    ));
-                                }
-                                Exit::Exception { addr, vector, .. }
-                                    if self.mode == CpuMode::Real16 =>
-                                {
-                                    match crate::interp::deliver_interrupt(
-                                        &mut self.cpu,
-                                        &vm.mem,
-                                        addr,
-                                        vector,
-                                        addr,
-                                        vm.consistency,
-                                    )
-                                    .into_step()
-                                    {
-                                        StepResult::Continue => {
-                                            self.sti_shadow = false;
-                                            self.ss_shadow = false;
-                                            if BOUNDED {
-                                                blocks_run += 1;
-                                            }
-                                        }
-                                        StepResult::Exit(exit) => {
-                                            return Ok(crate::fault::qualify_real16(
-                                                exit, &self.cpu,
-                                            ))
-                                        }
-                                    }
-                                }
-                                exit @ Exit::Exception { .. } => {
-                                    return Ok(crate::interp::qualify_lifted_exit(exit, &ir))
-                                }
-                                exit => {
-                                    return Ok(if self.mode == CpuMode::Real16 {
-                                        crate::fault::qualify_real16(exit, &self.cpu)
-                                    } else {
-                                        exit
-                                    })
-                                }
-                            }
-                        }
-                    }
-                    dispatch = exit_word.load(Ordering::Relaxed);
-                    if dispatch & EXIT_REQUESTED != 0 {
-                        return Ok(self.interrupted(crate::FaultPath::Interpreter, false));
-                    }
-                }
-                CachedBlock::Compiled { entry, .. } => {
-                    dispatch = exit_word.load(Ordering::Relaxed);
-                    if dispatch != 0 {
-                        continue;
-                    }
-                    if vm.time_enabled {
-                        crate::time_stats::compiled();
-                    }
-                    let mut cur = entry;
-                    let (stopped, stopped_code) = loop {
-                        // Hand the block its remaining block quantum (superblocks,
-                        // §12 M5): a compiled region spends 1 fuel per guest block and
-                        // stops at 0; a single block ignores it. Charging the fuel it
-                        // consumed (min 1) keeps `blocks_run` an exact guest-block
-                        // count — identical to the interpreter, preserving §9.2 and
-                        // the `RunSpec::Blocks(n)` oracle.
-                        let quantum = if BOUNDED {
-                            budget - blocks_run
-                        } else {
-                            u64::MAX
-                        };
-                        ctx.fuel = quantum;
-                        // SAFETY: `cur` is a block compiled to this ABI, alive in
-                        // the JIT arena (owned by `vm`) for the call.
-                        if !DEFAULT {
-                            fp_mode.compiled(self.cpu.mxcsr);
-                        }
-                        let code = unsafe {
-                            crate::jit_abi::call_block_in_mode(cur, &mut self.cpu, &mut ctx)
-                        };
-                        if BOUNDED {
-                            blocks_run += (quantum - ctx.fuel).max(1);
-                        }
-                        if !DEFAULT && !matches!(code, RET_CHAIN | RET_LINK | RET_IBTC_MISS) {
-                            fp_mode.default();
-                        }
-                        let next;
-                        match code {
-                            RET_CONTINUE | RET_INTERRUPTED => break (cur, code),
-                            RET_RETURN_MISS => {
-                                self.time_dispatch.indirect =
-                                    self.time_dispatch.indirect.saturating_add(1);
-                                break (cur, code);
-                            }
-                            RET_MXCSR_CHANGED => return Err(blocks_run),
-                            RET_CHAIN => {
-                                // Plain per-vcpu counter, flushed once per `run`
-                                // (see `TranslationCache::add_chained`): this fires
-                                // ~1M times per frame in a real game, so a shared
-                                // atomic here is a locked RMW on the hottest path.
-                                self.chained = self.chained.saturating_add(1);
-                                next = CompiledPtr::new(ctx.next_entry as *const u8);
-                            }
-                            RET_LINK => {
-                                // Snapshot BEFORE resolving: the publish
-                                // below only happens if the epoch is still this one, so
-                                // an SMC drop that lands while we resolve cannot have its
-                                // slot-clearing undone by our store.
-                                let since_epoch = self.fast_lifetime.epoch();
-                                if since_epoch != execution.epoch() {
-                                    break (cur, code);
-                                }
-                                if !DEFAULT {
-                                    fp_mode.default();
-                                }
-                                if vm.time_enabled {
-                                    crate::time_stats::shared_resolve(
-                                        SharedReason::DirectLink,
-                                        PrivateMiss::Bypass,
-                                    );
-                                }
-                                let resolved = resolve::<DEFAULT>(
-                                    vm,
-                                    &mut self.time_dispatch,
-                                    exit_word,
-                                    &self.engine_sections,
-                                    FetchAddr::flat(self.cpu.rip),
-                                    self.mode,
-                                    if DEFAULT { 0 } else { self.cpu.mxcsr },
-                                );
-                                if let Some(exit) = self.code_space_exit(vm) {
-                                    return Ok(exit);
-                                }
-                                match resolved {
-                                    Ok(CachedBlock::Compiled { entry, .. }) => {
-                                        // SAFETY: `link_slot` is a live `Arc<AtomicU64>`
-                                        // in the JIT arena. Relaxed store: another vcpu
-                                        // reading the slot sees 0 or a valid entry, never a
-                                        // torn value (aligned u64); it pairs with the
-                                        // backend's `invalidate_links` clear.
-                                        let slot = ctx.link_slot;
-                                        let _section = EngineSection::enter(
-                                            exit_word,
-                                            &self.engine_sections,
-                                            CriticalSectionKind::Publish,
-                                        );
-                                        let published = vm.cache.publish_entry_if_current(
-                                            since_epoch,
-                                            entry,
-                                            || unsafe {
-                                                (*(slot as *const AtomicU64))
-                                                    .store(entry.0 as u64, Ordering::Relaxed)
-                                            },
-                                        );
-                                        drop(_section);
-                                        if !published {
-                                            // Invalidated under us. Publishing now would
-                                            // refill a slot the drop just cleared, and
-                                            // transferring would run a translation of code
-                                            // the guest has rewritten. Back to the outer
-                                            // loop, which runs `handle_smc` and re-resolves.
-                                            break (cur, code);
-                                        }
-                                        // Seed the fast-resolve cache too: the next
-                                        // outer-loop visit to this RIP skips `resolve`.
-                                        self.fast_put(self.cpu.rip, entry);
-                                        next = entry;
-                                    }
-                                    // Mixed backend can't chain — fall back to dispatch.
-                                    Ok(CachedBlock::Interpreted(_)) => break (cur, code),
-                                    Err(exit) => return Ok(exit),
-                                }
-                            }
-                            // IBTC miss: an indirect edge whose per-site slot was
-                            // empty or held a different target. Resolve the computed
-                            // RIP and refill the slot with a fresh {target, entry}
-                            // descriptor, unless the site is megamorphic.
-                            RET_IBTC_MISS => {
-                                self.time_dispatch.indirect =
-                                    self.time_dispatch.indirect.saturating_add(1);
-                                #[cfg(test)]
-                                if let Some(hook) = self.ibtc_test_hook.as_mut() {
-                                    hook(false);
-                                }
-                                // Generation validation rejects retired tracked entries,
-                                // but retaining backends may use generation-zero pointers.
-                                // Keep the private fill epoch check for those entries and
-                                // for capped refills that skip slot publication entirely.
-                                let since_epoch = self.fast_lifetime.epoch();
-                                if since_epoch != execution.epoch()
-                                    || since_epoch != self.fast_epoch
-                                {
-                                    break (cur, code);
-                                }
-                                // Probe the vcpu-private fast cache before `resolve`.
-                                // The per-site IBTC holds ONE target, so a site
-                                // with several live targets misses here on nearly every
-                                // call — and `resolve` is an RwLock read plus a hash
-                                // lookup and a clone, where this probes two private
-                                // tags without synchronization.
-                                // Same key, same epoch invariant and same "compiled
-                                // blocks only" content as the probe the outer dispatch
-                                // loop already trusts, so a hit here is equally sound;
-                                // it skips the tier-up drain exactly as that one does.
-                                let entry = match self.fast_get(self.cpu.rip) {
-                                    Some(entry) => {
-                                        self.fast_hits = self.fast_hits.saturating_add(1);
-                                        Some(entry)
-                                    }
-                                    None => {
-                                        if vm.time_enabled {
-                                            self.record_shared_resolve(
-                                                SharedReason::IbtcMiss,
-                                                self.cpu.rip,
-                                            );
-                                        }
-                                        if !DEFAULT {
-                                            fp_mode.default();
-                                        }
-                                        let resolved = resolve::<DEFAULT>(
-                                            vm,
-                                            &mut self.time_dispatch,
-                                            exit_word,
-                                            &self.engine_sections,
-                                            FetchAddr::flat(self.cpu.rip),
-                                            self.mode,
-                                            if DEFAULT { 0 } else { self.cpu.mxcsr },
-                                        );
-                                        if let Some(exit) = self.code_space_exit(vm) {
-                                            return Ok(exit);
-                                        }
-                                        match resolved {
-                                            Ok(CachedBlock::Compiled { entry }) => {
-                                                self.fast_put(self.cpu.rip, entry);
-                                                Some(entry)
-                                            }
-                                            // Indirect edge into an interpreted block.
-                                            Ok(CachedBlock::Interpreted(_)) => None,
-                                            Err(exit) => return Ok(exit),
-                                        }
-                                    }
-                                };
-                                #[cfg(test)]
-                                if let Some(hook) = self.ibtc_test_hook.as_mut() {
-                                    hook(true);
-                                }
-                                // Even a fast hit can allocate during refill bookkeeping.
-                                if !DEFAULT {
-                                    fp_mode.default();
-                                }
-                                match entry {
-                                    Some(entry) => {
-                                        let slot = ctx.link_slot;
-                                        // A full map reallocates on insert: account only then,
-                                        // not on every new refill entry.
-                                        let full =
-                                            self.ibtc_refills.len() >= self.ibtc_refills.capacity();
-                                        let count = self.ibtc_refills.entry(slot).or_insert(0);
-                                        let under_cap = *count < IBTC_MEGAMORPHIC_CAP;
-                                        if under_cap {
-                                            *count += 1;
-                                        }
-                                        if full {
-                                            self.allocations.refills.store(
-                                                (self.ibtc_refills.capacity()
-                                                    * std::mem::size_of::<(u64, u32)>())
-                                                    as u64,
-                                                Ordering::Relaxed,
-                                            );
-                                        }
-                                        if under_cap {
-                                            let _section = EngineSection::enter(
-                                                exit_word,
-                                                &self.engine_sections,
-                                                CriticalSectionKind::Publish,
-                                            );
-                                            let desc =
-                                                vm.cache.alloc_ibtc_descriptor(self.cpu.rip, entry);
-                                            // SAFETY: `slot` is a live `Box<AtomicU64>` in
-                                            // the JIT arena; the published descriptor is
-                                            // immutable and retained through execution grace.
-                                            // Release (not Relaxed): unlike the RET_LINK
-                                            // slot — a single scalar entry — this publishes
-                                            // a POINTER to a multi-field {target, entry}
-                                            // payload, so the payload's writes must be
-                                            // ordered-visible before the pointer. Release
-                                            // here pairs with the reader's address
-                                            // dependency (the compiled `ibtc_or_miss` loads
-                                            // the descriptor fields *through* this pointer),
-                                            // giving release/consume ordering; a plain
-                                            // Relaxed store would let a weakly-ordered host
-                                            // (AArch64) expose the pointer before the fields.
-                                            let published = vm.cache.publish_entry_if_current(
-                                                since_epoch,
-                                                entry,
-                                                || unsafe {
-                                                    (*(slot as *const AtomicU64))
-                                                        .store(desc, Ordering::Release)
-                                                },
-                                            );
-                                            if !published {
-                                                // Invalidated under us — see RET_LINK.
-                                                break (cur, code);
-                                            }
-                                        }
-                                        if !under_cap && vm.cache.epoch() != since_epoch {
-                                            break (cur, code);
-                                        }
-                                        next = entry;
-                                    }
-                                    // Interpreted target — leave the chain and dispatch.
-                                    None => break (cur, code),
-                                }
-                            }
-                            RET_SYSCALL => {
-                                let path = crate::codemap::fault_path(
-                                    cur.0 as usize,
-                                    crate::Knowledge::Known(ctx.next_entry),
-                                    false,
-                                );
-                                return Ok(self.syscall(path, ctx.next_entry));
-                            }
-                            RET_HLT => return Ok(Exit::Hlt),
-                            RET_UNMAPPED => return Ok(ctx.unmapped_exit(&self.cpu, self.mode)),
-                            RET_UNMAPPED_DETAIL => {
-                                return Ok(ctx.detailed_unmapped_exit(
-                                    &self.cpu,
-                                    &vm.mem,
-                                    self.mode,
-                                    cur.0 as usize,
-                                ))
-                            }
-                            RET_EXCEPTION_DETAIL => {
-                                let exit = ctx.detailed_exception_exit(
-                                    &self.cpu,
-                                    &vm.mem,
-                                    self.mode,
-                                    cur.0 as usize,
-                                );
-                                return Ok(crate::fault::qualify_lifted(
-                                    exit,
-                                    crate::codemap::lookup_fault_info(
-                                        cur.0 as usize,
-                                        ctx.next_entry,
-                                    )
-                                    .as_ref(),
-                                ));
-                            }
-                            RET_MMIO_DEFER | RET_HOST_FAULT | RET_HOST_FAULT_DETAIL => {
-                                // Alignment recovery has no reliable data address.
-                                if code == RET_MMIO_DEFER
-                                    || self.fault_entry.fault_kind()
-                                        != crate::jit_abi::fault::HostFaultKind::Alignment
-                                {
-                                    let pc = if code == RET_HOST_FAULT_DETAIL {
-                                        ctx.next_entry as usize
-                                    } else {
-                                        cur.0 as usize
-                                    };
-                                    if let Some(info) =
-                                        crate::codemap::lookup_fault_info(pc, self.cpu.rip)
-                                    {
-                                        info.note_partial_store(&self.cpu, &vm.mem, ctx.fault_addr);
-                                    }
-                                }
-                                let raw_fault = if code == RET_HOST_FAULT_DETAIL {
-                                    self.fault_entry.raw_fault()
-                                } else {
-                                    None
-                                };
-                                if code == RET_HOST_FAULT || code == RET_HOST_FAULT_DETAIL {
-                                    if DEFAULT {
-                                        // The landing stub may have restored non-default caller
-                                        // control. No guest mode was installed in this specialization.
-                                        // SAFETY: normalize before fault decoding and replay.
-                                        unsafe {
-                                            crate::jit_abi::fp::set_control(
-                                                crate::jit_abi::fp::default_control(),
-                                            )
-                                        };
-                                    } else {
-                                        fp_mode.host_fault();
-                                    }
-                                    if self.fault_entry.fault_kind()
-                                        != crate::jit_abi::fault::HostFaultKind::Alignment
-                                        && vm.mem.mapped_ram(ctx.fault_addr)
-                                    {
-                                        let exit = if code == RET_HOST_FAULT_DETAIL {
-                                            ctx.detailed_host_exit(&self.cpu, &vm.mem, self.mode)
-                                        } else {
-                                            ctx.unmapped_exit(&self.cpu, self.mode)
-                                        };
-                                        return Ok(crate::fault::attach_raw_host_fault(
-                                            exit, raw_fault,
-                                        ));
-                                    }
-                                }
-                                if !DEFAULT {
-                                    fp_mode.default();
-                                }
-                                // Trap-region accesses replay to produce MMIO exits.
-                                // Host faults reach replay only for unmapped addresses
-                                // or alignment faults. Misaligned locked operations
-                                // currently replay non-atomically (tracked in xj-0w3.5).
-                                // Replay uses this run's memory policy in both modes.
-                                // Interpreter single-step (not the hot compiled loop):
-                                // tick the retired counter for the one instruction it
-                                // may retire (§17.6, sub-seam c).
-                                let mut info = crate::interp::RetireInfo {
-                                    consistency: vm.consistency,
-                                    exit_request: Some(exit_word),
-                                    trace: vm.lockstep_trace.as_deref(),
-                                    ..Default::default()
-                                };
-                                let original_info = if code == RET_HOST_FAULT_DETAIL {
-                                    crate::codemap::lookup_fault_info(
-                                        ctx.next_entry as usize,
-                                        self.cpu.rip,
-                                    )
-                                } else {
-                                    None
-                                };
-                                let instruction_rip = self.cpu.rip;
-                                let r = crate::time_stats::HelperTimer::measure(
-                                    vm.time_enabled,
-                                    || {
-                                        crate::interp::step_one_mode::<ROUTED>(
-                                            &vm.mem,
-                                            &mut self.cpu,
-                                            self.mode,
-                                            &mut self.interp_scratch,
-                                            &mut info,
-                                        )
-                                    },
-                                );
-                                self.retired += info.retired;
-                                match r {
-                                    StepResult::Continue => {
-                                        if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
-                                            != mxcsr_mode
-                                        {
-                                            return Err(blocks_run);
-                                        }
-                                        break (cur, code);
-                                    }
-                                    StepResult::Exit(Exit::Syscall) => {
-                                        return Ok(self.syscall(
-                                            crate::FaultPath::Interpreter,
-                                            instruction_rip,
-                                        ));
-                                    }
-                                    StepResult::Exit(Exit::Interrupted) => {
-                                        return Ok(self.interrupted(
-                                            crate::FaultPath::Helper {
-                                                family: crate::FaultHelper::String,
-                                                caller: crate::HelperCaller::Interpreter,
-                                            },
-                                            false,
-                                        ));
-                                    }
-                                    StepResult::Exit(exit) => {
-                                        return Ok(
-                                            if code == RET_HOST_FAULT
-                                                || code == RET_HOST_FAULT_DETAIL
-                                            {
-                                                crate::fault::attach_raw_host_fault(
-                                                    ctx.preserve_host_replay(
-                                                        exit,
-                                                        original_info.as_ref(),
-                                                        code == RET_HOST_FAULT_DETAIL,
-                                                    ),
-                                                    raw_fault,
-                                                )
-                                            } else {
-                                                exit
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            // A port-I/O instruction (`in`/`out`, §5.2): the block set
-                            // RIP to the instruction; single-step it on the interpreter
-                            // to produce the `Exit::PortIo` (same deferral as MMIO).
-                            RET_PORTIO_DEFER => {
-                                if !DEFAULT {
-                                    fp_mode.default();
-                                }
-                                let mut info = crate::interp::RetireInfo {
-                                    consistency: vm.consistency,
-                                    exit_request: Some(exit_word),
-                                    trace: vm.lockstep_trace.as_deref(),
-                                    ..Default::default()
-                                };
-                                let instruction_rip = self.cpu.rip;
-                                let r = crate::time_stats::HelperTimer::measure(
-                                    vm.time_enabled,
-                                    || {
-                                        crate::interp::step_one_mode::<ROUTED>(
-                                            &vm.mem,
-                                            &mut self.cpu,
-                                            self.mode,
-                                            &mut self.interp_scratch,
-                                            &mut info,
-                                        )
-                                    },
-                                );
-                                self.retired += info.retired;
-                                match r {
-                                    StepResult::Continue => break (cur, code),
-                                    StepResult::Exit(Exit::Syscall) => {
-                                        return Ok(self.syscall(
-                                            crate::FaultPath::Interpreter,
-                                            instruction_rip,
-                                        ));
-                                    }
-                                    StepResult::Exit(exit) => return Ok(exit),
-                                }
-                            }
-                            // A guest exception (`#DE` div, or a lifted `ud2`/`int3`/
-                            // `int1` trap); the block set the saved RIP (fault: on the
-                            // instruction, trap: past it) and stored the vector in the
-                            // MemCtx out-field.
-                            RET_EXCEPTION => {
-                                return Ok(Exit::exception(
-                                    self.cpu.rip,
-                                    ctx.exception_vector as u8,
-                                ))
-                            }
-                            other => panic!("compiled block returned invalid ABI code {other}"),
-                        }
-                        if BOUNDED && blocks_run >= budget {
-                            if !DEFAULT {
-                                fp_mode.default();
-                            }
-                            return Ok(Exit::BudgetExhausted);
-                        }
-                        // Poll before replacing the just-executed unit with its
-                        // successor. Only the cold edge needs its identity.
-                        if exit_word.load(Ordering::Relaxed) != 0
-                            || self.fast_lifetime.epoch() != execution.epoch()
-                        {
-                            break (cur, code);
-                        }
-                        cur = next;
-                    };
-                    if vm.time_enabled {
-                        shared_reason = match stopped_code {
-                            RET_RETURN_MISS => SharedReason::ReturnMiss,
-                            RET_LINK => SharedReason::DirectLink,
-                            RET_IBTC_MISS => SharedReason::IbtcMiss,
-                            _ => SharedReason::Boundary,
-                        };
-                    }
-                    dispatch = exit_word.load(Ordering::Relaxed);
-                    if dispatch & EXIT_REQUESTED != 0 {
-                        if !DEFAULT {
-                            fp_mode.default();
-                        }
-                        return Ok(self.interrupted_compiled(stopped, stopped_code));
                     }
                 }
             }

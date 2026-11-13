@@ -707,6 +707,7 @@ pub(crate) fn deliver_interrupt_mode<const ROUTED: bool, const ORDER: u8>(
     };
     cpu.cs = new_cs;
     cpu.rip = new_ip as u64;
+    crate::legacy::REAL16_ALIAS.derive_caches(cpu);
     InterpResult::Continue
 }
 

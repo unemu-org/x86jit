@@ -1800,7 +1800,7 @@ fn alias_far_frame_uses_selector_base_without_a20_or_retained_caches() {
     cpu.cpu.rip = 0x1000;
     cpu.cpu.ss = 0xffff;
     cpu.cpu.gpr[4] = 0x40;
-    let hidden = cpu.cpu.legacy;
+    let mut hidden = cpu.cpu.legacy;
     assert_eq!(hidden.a20_enabled, 0);
     let done = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
     assert!(matches!(done.stop(), StepStop::Exit(Exit::BudgetExhausted)));
@@ -1809,6 +1809,12 @@ fn alias_far_frame_uses_selector_base_without_a20_or_retained_caches() {
         (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
         (0x1000, 0x2000, 0x3c)
     );
+    // M4 publishes selector-derived caches; other retained state stays inert.
+    hidden.segments = CpuState::legacy_real_entry([
+        cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs, cpu.cpu.gs,
+    ])
+    .legacy
+    .segments;
     assert_eq!(cpu.cpu.legacy, hidden);
     let mut low = [0; 4];
     let mut high = [0; 4];

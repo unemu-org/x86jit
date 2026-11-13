@@ -677,6 +677,7 @@ fn interpret_block_inner<
             info.exit_request,
             info.trace,
             &mut *steps,
+            (),
         )
     } else {
         walk_ops::<
@@ -700,6 +701,7 @@ fn interpret_block_inner<
             &mut shadows,
             info.exit_request,
             info.trace,
+            (),
             (),
         )
     };
@@ -978,12 +980,90 @@ fn walk_shared_helper<const MACHINE: bool, const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+trait InstructionExecutor<'ir> {
+    fn ops(&self, ir: &'ir IrBlock) -> &'ir [IrOp] {
+        &ir.ops
+    }
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn next_ip(&self) -> u64 {
+        unreachable!("disabled instruction adapter")
+    }
+    fn execute(
+        &mut self,
+        _op: &IrOp,
+        _cpu: &mut CpuState,
+        _temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        unreachable!("disabled instruction adapter")
+    }
+}
+impl InstructionExecutor<'_> for () {}
+
+struct InstructionSlice<'ir, E> {
+    ops: &'ir [IrOp],
+    executor: E,
+}
+impl<'ir, E: InstructionExecutor<'ir>> InstructionExecutor<'ir> for InstructionSlice<'ir, E> {
+    fn ops(&self, _ir: &'ir IrBlock) -> &'ir [IrOp] {
+        self.ops
+    }
+    fn enabled(&self) -> bool {
+        self.executor.enabled()
+    }
+    fn next_ip(&self) -> u64 {
+        self.executor.next_ip()
+    }
+    fn execute(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
+        self.executor.execute(op, cpu, temps)
+    }
+}
+
+fn walk_instruction<'ir, const ROUTED: bool, const ORDER: u8>(
+    ir: &'ir IrBlock,
+    ops: &'ir [IrOp],
+    ip: u64,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER>,
+    temps: &mut [u64],
+    instruction: impl InstructionExecutor<'ir>,
+) -> Result<(), Exit> {
+    let current = Cell::new(ip);
+    let started = Cell::new(1);
+    let mut retired = 0;
+    let result = walk_ops::<false, ROUTED, true, false, ORDER, false, false, true, true>(
+        ir,
+        cpu,
+        mem,
+        temps,
+        &current,
+        &mut retired,
+        &started,
+        &mut ShadowState::default(),
+        None,
+        None,
+        (),
+        InstructionSlice {
+            ops,
+            executor: instruction,
+        },
+    );
+    match result {
+        WalkResult::Continue | WalkResult::ModeChange => Ok(()),
+        WalkResult::Exit(exit) => Err(exit.into_exit()),
+        WalkResult::Fault => Err(result::consume_current().expect("instruction fault")),
+        WalkResult::FaultDelivered => unreachable!("Machine faults are routed by dispatch"),
+    }
+}
+
 /// The per-op interpreter walk. Every early `return` here exits `walk_ops`; the caller
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters and shadow state.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn walk_ops<
+    'ir,
     const RETRY: bool,
     const ROUTED: bool,
     const DEFAULT: bool,
@@ -994,7 +1074,7 @@ fn walk_ops<
     const MACHINE: bool,
     const STR_MMIO: bool,
 >(
-    ir: &IrBlock,
+    ir: &'ir IrBlock,
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
     temps: &mut [u64],
@@ -1005,11 +1085,18 @@ fn walk_ops<
     exit_request: Option<&std::sync::atomic::AtomicU64>,
     trace: Option<&crate::lockstep::Trace>,
     mut budget: impl BudgetState<StepContext>,
+    mut instruction: impl InstructionExecutor<'ir>,
 ) -> WalkResult {
     use crate::legacy::LegacyOp as L;
     let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
-    for (op_index, op) in ir.ops.iter().enumerate() {
+    for (op_index, op) in instruction.ops(ir).iter().enumerate() {
+        if instruction.enabled() && legacy::machine_specific(op) {
+            if let Some(stop) = instruction.execute(op, cpu, temps) {
+                return stop;
+            }
+            continue;
+        }
         if CHILD {
             mem.0.begin_op(op, temps, cpu);
         }
@@ -5371,7 +5458,9 @@ fn walk_ops<
 
     // Straight-line block with no control-flow terminator (code ran out): flow on
     // from just past the decoded bytes.
-    cpu.rip = if MACHINE {
+    cpu.rip = if instruction.enabled() {
+        instruction.next_ip()
+    } else if MACHINE {
         ir.guest_start + u64::from(ir.guest_len)
     } else {
         ir.next_ip()
@@ -5405,6 +5494,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             None,
             None,
             (),
+            (),
         )
     } else {
         walk_ops::<false, false, false, true, ORDER, false, false, false, true>(
@@ -5418,6 +5508,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             &mut shadows,
             None,
             None,
+            (),
             (),
         )
     };

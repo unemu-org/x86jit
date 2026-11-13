@@ -474,6 +474,15 @@ fn main() {
         work.slices = slices;
         workloads.push(work);
     }
+    workloads.push(Workload {
+        slices: &[64],
+        ..Workload::new(
+            "smc-rmw-64",
+            vec![0x80, 6, 6, 0x7c, 1, 0xb0, 0, 0xeb, 0xf7],
+            1_000_000,
+            0,
+        )
+    });
     assert!(
         workload
             .as_ref()

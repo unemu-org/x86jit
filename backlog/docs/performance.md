@@ -696,3 +696,244 @@ environment tests, and `cargo check --workspace --tests --release --features x86
 tests, captures, hashes and benchmarks are MEASURED. No hardware expectation
 requires ASSUMED evidence. Decision-23 is unchanged by this work; no commits,
 git writes, bead operations or pushes were performed.
+
+## Alias switch and shared interpreter (decision-23 U4+U5)
+
+**MEASURED (final round):** alias +0.5% PASS; Machine +2% FAIL on `ip-boundary-1` only (+2.56 % to +2.63 %, landed with the maintainer's acceptance: decision-23 Performance requirement, landing amendment; bead xj-s3p.11); dos-mixed wall +2% PASS; Long64 PASS. The abandoned protected REP flag-origin defect is fixed. The full combined rollback corpus and all required runtime checks pass.
+
+**READ:** the accepted U5 amendment (2026-11-13) gates Machine against the pre-switch U3 alias. Machine cells report **vs U3 alias first / current alias second**. The frozen U3 executable lacks `smc-rmw-64`; its reference uses the identical standalone driver linked against the saved U3 library. No gate is relaxed.
+
+### Design and guards — READ
+
+`run_dispatch` remains the sole outer loop, with private profile constants. `interp::walk_ops` remains the sole opcode iterator; `interp::legacy::execute_op` handles one system opcode and transactional slices use `InstructionSlice`. The alias remains frozen `REAL16_ALIAS`: M4/M5 behavior, selector-derived caches, InGuest delivery and its decoder/quirks. No public API or CPU/jit_abi layout changed; Long64/Compat32 lowering, keys and backend codegen are unchanged.
+
+The lifter still emits `LegacyOp::Checkpoint` only for a CPU/flag/helper commit before a later fallible operation. Only that mark takes the per-instruction rollback snapshot; task partial commits and helper evidence retain their own rules. Scalar RMW flags commit after the store in both Direct and Checked lowering, including retained SMC. No Direct scalar rollback snapshot is reintroduced; the conservative Checked coprocessor gate/body witness remains.
+
+Shared partial-block `BudgetExhausted` completion now uses the existing fast `Progress` carrier when MMIO ownership is inactive and no port-string state needs deferred cleanup. Live MMIO and port-string cases retain the outcome path; TF still selects post-instruction debug handling. The new `partial_shared_budget_completion_keeps_mmio_cleanup` witness exercises an authoritative multi-instruction block after a completed device read, both models: retirement once, cleanup, correct RIP and the next budget slice. Machine uses the existing unstepped dispatcher specialization; its unchanged instruction limit comes from `initial_context`. The public `run_steps` pending-IN check still uses the outer stepped profile. `finish_machine_run` skips a proven no-op budget cleanup only when MMIO ownership is inactive, task/instruction continuations are absent and no A20 change is pending. Other stops and owned continuations keep masking, retry cleanup, A20 application and task sealing.
+
+A private `SINGLE` specialization is selected only for an explicit Machine budget of one. Its limit/cap is exactly one, so it does not calculate a second cap from TF/shadows/IRQ/A20/readiness. Those inputs still control debug/event delivery, inhibition, IRQ readiness and queued-A20 application. Its pending-I/O predicate is queried live whenever an asynchronous host request needs eligibility; the normal multi-step descriptor remains unchanged. Budget priority, per-block host polling and SMC/fetch authority remain live.
+
+Warm entry returns a small `Option<MachineContext>`; the caller invokes the existing cold `Result` path only when the same warm guards fail. Stamp comparison, epoch/model, public CPU edits, continuation/shutdown, RIP and task-debug checks retain their original conditions and order. This changes the private return carrier, not validation. The validated entry also caches `raw_direct`: its only inputs are effective A20 and the six visible selectors, all covered by the full stamp. Successful cold preparation computes it; warm entry reuses it only after that stamp matches. Existing in-run refresh calls remain after segment/context changes, event delivery and A20 application. `cached_direct_bus_revalidates_selectors_and_a20` pins masked/unmasked loads across public selector/A20 edits on both models.
+
+The full initialized-field stamp comparison is retained, including reserved fields and the original CR2/output-flag exclusions. No fingerprint or padding read is used. Boundary descriptors refresh after helpers, faults, port completion and event delivery; ordinary shared completion can reuse them only while inputs remain fixed. New inhibition, pending I/O and one-step conditions force refresh. Context-qualified Arc classification still follows the authoritative VM cache/guest-start checks and clears on changed entry/context, faults, events, reset or translation invalidation.
+
+### Attempt ownership correction — READ / MEASURED
+
+The protected wrapper keeps the SDM original-EFLAGS rule: Vol 2B §4.3 REPE/REPZ p. 4-565, REPNE/REPNZ p. 4-567; Vol 3A §§7.5–7.6 describes fault restart. Completed count/indices remain committed. The flag origin is a private Flags memento, separate from the lift-marked CPU rollback snapshot. Qualified IR still carries the cached Protected walk choice; fixed alias and validated Direct classification omit its impossible regime predicate. No IR, key, backend, public API, CpuState or jit_abi layout changed.
+
+Round 6 confused reusable translation identity with a live instruction attempt. A CS-limit or CR0 edit could produce a fault outside the protected wrapper, leave its origin retained, then match the old Arc/stamp/cursor/flags/retirement after the original context returned. The supplied fetch witness reproduces stale FLAGS=0803h instead of the new attempt’s 0046h; all 48 CR0 round trips fail. Both supplied witnesses pass when linked against 36a9703 and fail against the exact saved R6 library.
+
+`run_engine` now encloses the unchanged run body in a private entry helper, so every normal return (including preflight errors) reaches one ownership boundary. For a nonzero Machine call, that boundary **takes** the retained origin and returns it only for an explicitly allowed continuation whose inputs still match. All faults, refusals and unlisted/future exit kinds consume it by default. This is linear ownership, without a reusable numeric identity or a new list of clearing sites. A retained context/Arc can never reconstruct a consumed origin. Zero-budget probes remain outside an instruction attempt and do not consume it.
+
+The wrapper and ownership boundary share `RepFlags::matches`: model/full context stamp, instruction IP, count/SI/DI/AX, current Flags/system flags and retired count. The wrapper additionally checks the qualified Arc. Edits that reach the wrapper start a new origin; edits exposed by a return before the wrapper fail the boundary guard. Within a run, context-changing instructions retire or pass the non-comparison wrapper; accepted events already consume the origin before delivery. Task helpers retain their existing partial-commit rules.
+
+| Return / transition | Origin ownership rule | Witness / audit |
+|---|---|---|
+| Budget exhaustion, host interruption, IRQ-ready yield | Return only with matching attempt inputs | Existing step slices; `host_stop_preserves_only_the_unchanged_comparison_attempt` |
+| MMIO read/write | Matching inputs **and** active owned retry at this IP | Existing comparison MMIO chain; answered-comparison retirement matrix |
+| Fetch/decode/map/architectural fault, unsupported context, shutdown, pending-IN refusal, every unlisted exit | Consume; a later context round trip cannot revive it | New fetch/entry matrices; redirect/SMC probes; common result boundary covers all returns |
+| Retired instruction, different instruction, accepted event, reset, changed code/input | Existing wrapper/event/reset abandonment plus the common boundary | Retirement count/Arc guards; IRQ-origin test; reset/SMC/context-churn probes |
+| Zero budget | Preserve without consuming execution/completion ownership | `zero_probe_keeps_origin_but_reset_drops_it` |
+
+All names below are in `legacy_protected::comparison_attempts`. Eight review probes were adopted; three additional tests cover the same hole before wrapper entry and both public run APIs. The added entry/mapping/edited-host-stop tests also fail against the saved R6 library.
+
+| Contract / cases | Witness | R6 before fix | R7 |
+|---|---|---|---|
+| Hidden CS.limit fetch #GP, restored context | `comparison_origin_is_not_reused_after_hidden_cs_fetch_fault` | FAIL: 0803h instead of 0046h | Pass |
+| CR0 round trips; address/operand 16/32 × CMPS/SCAS × REPE/REPNE × budgets 1/2/8 (48) | `comparison_origin_is_not_reused_after_cr0_round_trip` | FAIL: 48/48 | Pass |
+| Unmap/remap fetch, run/run_steps × budgets 1/2/8 (6) | `comparison_origin_is_not_reused_after_fetch_mapping_round_trip` | FAIL | Pass |
+| Unsupported paging context and pending-IN StepRunError (2) | `comparison_origin_is_not_reused_after_entry_rejection` | FAIL on the first unsupported-entry case | Pass |
+| Host stop: unchanged or edited CR0/CS.limit/CF/count, run/run_steps (10) | `host_stop_preserves_only_the_unchanged_comparison_attempt` | FAIL on first edited case; unchanged case passes | Pass |
+| Redirect to a different faulting instruction | `origin_is_abandoned_after_an_observed_different_instruction_attempt` | Pass | Pass |
+| Changed invalid opcode and restored bytes at the same IP | `origin_is_abandoned_after_invalid_smc_at_the_same_address` | Pass | Pass |
+| Zero-budget continuation and explicit reset (2) | `zero_probe_keeps_origin_but_reset_drops_it` | Pass | Pass |
+| In-guest comparison #GP frame saves original EFLAGS (48) | `comparison_architectural_fault_frame_contains_original_flags` | Pass | Pass |
+| Answered device comparison ends REP, retires and drops origin (48) | `mmio_answer_that_ends_comparison_retires_and_discards_origin` | Pass | Pass |
+| Protected/real/protected selection through retained-context churn (144) | `protected_selection_survives_context_churn_and_pe_round_trips` | Pass | Pass |
+
+### Rollback sweeps and retained review coverage — READ / MEASURED
+
+`legacy_rollback_sweep` now runs the complete supplied Code32 dataset through the existing corpus helper, preserving the original real-mode dataset. No subset was cut and no environment or trace switch was added. Counts are pinned, and failures name bytes, mnemonic, memory case, stop, and before/after GPR/flags/system/selector/hidden-cache state. Completed device evidence and coprocessor state remain outside the reviewed comparison.
+
+| Corpus | Cases | Zero-step fault/MMIO exits | U3 / R7 |
+|---|---:|---:|---|
+| Checked real mode | 19,194 | 7,785 | Pass / Pass |
+| Protected Code32 | 19,062 | 7,658 | Pass / Pass |
+| Combined | **38,256** | **15,443** | Pass / Pass |
+
+The brief’s 38,256 count is the combined corpus; the supplied Code32 loop alone enumerates 19,062. This was measured before fixing the engine as well. Full debug/optimized binary runtime: **1.59s/0.36s**, both within 180 seconds, two test threads. The exact same source linked against the saved U3 library passes both sweeps.
+
+Round-6 `dispatch_guards` probes remain: full Code32 ECX/ESI/EDI above FFFFh with run/run_steps parity; queued A20+IRQ during owned MMIO including zero-budget probes; Code32 POPFD/TF and a public TF clear. Their public I386 fixture still requires interpreted execution. The review worktree was read only.
+
+### xj-srh.5 folded into U4+U5 — READ / MEASURED
+
+The original audit left combined contracts unpinned. The expanded matrix found one comparison-fault flags defect; the other requested contracts already worked. Thirteen round-5 tests in `legacy_protected::stepping_contracts` run the Code32 matrix under I386, with a panic backend enforcing interpreted execution. The catalogue-model wrapper repeats all twelve semantic witnesses through `set_cpu_model`, with outward fault delivery; the other leg uses the legacy selector. The first eight contracts pass against round 4; the comparison-fault flags witness and its MMIO chain fail before the fix and pass afterward. That round-5 stepping-contract test source was separately linked against the saved round-4 release library: 10 passed / 3 failed (the main flags case, the MMIO chain, and their catalogue-model wrapper). Hardware task switches, V86, DR/TF debugging and 386/387 integration retain their existing witnesses and behavior.
+
+The pinned SDM 325462-092US numbers stack-switch inhibition **Vol 3A §7.8.3** (the brief calls it §6.8.3). Rules were read from the main oracle stash: Vol 2A §3.3 IN/INS/CALL/IRET/JMP; Vol 2B §4.3 REP/MOVS/CMPS/STOS/LODS/SCAS/STI/MOV/POP/OUT/OUTS/RET; Vol 3A §§7.5–7.6, 7.8.1, 7.8.3, 7.12.1 and 12.9.1–12.9.2. 80386 PRM §17 REP pp. 17-139–141, STI p. 17-163, §9.2.4 pp. 9-3–4 and §§14.4.1–14.5 p. 14-4 are second witnesses.
+
+Names below are in `legacy_protected::stepping_contracts`; “Pass” is the result before any runtime fix, against round 4. The first eight rows need no runtime change; comparison fault restoration needs the flags origin fix. The harness initially needed correct region-sized mappings and writes confined to each region; those were test setup errors, not engine failures.
+
+| Contract | Citation | Witness | Before fix | Fix |
+|---|---|---|---|---|
+| Code32 empty CX/ECX REP, dirty upper bits, no access/port handoff; MOVS/CMPS/STOS/LODS/SCAS/INS/OUTS; forward/backward iteration counts and retirement | SDM 2B §4.3 REP, pp. 4-563–564; 80386 PRM §17 pp. 17-139–141 | `code32_rep_empty_counts_and_iteration_slices` | Pass | None |
+| Two committed MOVS elements before read/write map faults, #GP/#SS limits and MMIO; prefixed EIP and remaining count; answer once, complete without duplicate prefix | SDM 2B §4.3 REP/MOVS; 3A §§7.5–7.6; PRM §17 p. 17-140 | `code32_rep_fault_prefix_and_mmio_retry_in_step_slices` | Pass | None |
+| STI/MOV SS then REP in one call or budgets 1/2/N; empty and partial REP retirement and readiness | SDM 2B §4.3 REP/STI/MOV; 3A §§7.6, 7.8.1, 7.8.3 | `code32_rep_and_shadow_share_one_call` | Pass | None |
+| STI/MOV SS through first REP element or MMIO retry; readiness only after completion; budgets 1/2/N | SDM 2B §4.3 REP/STI/MOV; 3A §§7.8.1, 7.8.3; PRM §17 p. 17-140 | `code32_rep_shadow_and_device_retry_boundaries` | Pass | None |
+| STI/MOV/POP SS across both PE directions and far JMP/CALL/RET/IRET CS changes, one-call and sliced, retained Code16/Code32 caches | SDM 2A §3.3 CALL/IRET/JMP; 2B §4.3 STI/MOV/POP/RET; 3A §§7.8, 12.9; PRM §9.2.4 pp. 9-3–4 | `inhibition_survives_pe_and_cs_transfers` | Pass | None |
+| Queued IRQ actually delivered after shadowed CR0/far JMP, with target CS:EIP in frame, both PE directions | SDM 3A §§7.8.1, 7.8.3, 7.12.1, 12.9; PRM §9.2.4 pp. 9-3–4 | `queued_irq_enters_after_shadowed_pe_or_cs_change` | Pass | None |
+| Protected IN/OUT/INS/OUTS, widths 1/2/4, both string address sizes and source override, budget 1/N; IN refusal/answer, zero-step probe, completion before readiness, no repeated handoff | SDM 2A §3.3 IN/INS; 2B §4.3 OUT/OUTS/REP; 3A §§7.8.1, 7.8.3; decision-16 §3 | `protected_port_completions_precede_irq_readiness_once` | Pass | None |
+| Protected REP INS destination MMIO after answered port input; zero additional units, unchanged count/index until store acknowledgement, no second port read | SDM 2A §3.3 INS; 2B §4.3 REP; 3A §7.8.3; decision-16 §3 | `protected_ins_answer_survives_destination_mmio_before_irq` | Pass | None |
+| REPE/REPNE CMPS/SCAS fault restores original EFLAGS while retaining two completed elements, both address/operand sizes, budgets 1/2/N | SDM 2B §4.3 REPE p. 4-565, REPNE p. 4-567 | `code32_repe_repne_fault_restores_original_flags_with_committed_prefix` | FAIL: CF/OF/ZF were the last comparison’s | Retain protected REP flag origin |
+| Completed device comparison then later fault; edit and accepted-IRQ origin invalidation | Same REPE rule; SDM 3A §§7.6, 7.12.1; decision-16 §3 | `comparison_mmio_preserves_flag_origin_until_a_later_fault`; `comparison_flag_origin_is_abandoned_for_edited_inputs`; `comparison_irq_restart_uses_interrupted_flags_as_new_origin` | MMIO chain FAIL; edit/IRQ cases Pass | Same origin plus ownership guards/event clear |
+
+REP matrices cover default DS and 66h/67h independently and together, FS source override (SS for #SS), both DF directions for successful memory strings, and effective count/indices. Fault matrices use budgets 1, 2 and 8; exact-completion memory-string slices use 1, 2 and the remaining N (at most 3); the combined shadow/REP test uses literal 1, 2 and 8. Empty REP retires once; a partial REP has not retired. Each fault preserves both committed destination elements and the untouched third RAM element where observable. Port matrices assert that repeated ready probes add neither units nor handoffs; OUT/OUTS are acknowledged by resumption, IN/INS by the existing completion API.
+
+### Counted R6/R7 control — MEASURED / ASSUMED
+
+One complete production change: the common attempt-ownership boundary and shared matching guard. Three serial rounds per side with explicit `real16_loops 1 3 <workload>`; RMW gets eleven via `1 11 smc-rmw-64`. Cells are instructions/step before→after. The R6 artifacts are fixed copies from the previous campaign; no diagnostic bypass or baseline rebuild is substituted. The measured delta includes generated-code/layout effects; assigning a specific register-allocation cause is **ASSUMED**, not disassembly attribution.
+
+| Loop | Alias | I286 on | I386 on | I286 off | I386 off |
+|---|---:|---:|---:|---:|---:|
+| ip-boundary-1 | 2407.970→2415.900 | 2586.387→2605.912 | 2588.030→2606.333 | 2586.359→2606.858 | 2584.726→2607.655 |
+| alu | 358.106→357.608 | 362.291→363.070 | 362.421→363.181 | 362.361→363.194 | 362.370→363.139 |
+| smc-rmw-64 | 9267.308→9264.746 | 4924.083→4927.054 | 4802.222→4805.911 | 4925.702→4928.781 | 4805.034→4807.051 |
+
+The ownership branch is specialized away for the alias and Application. Machine real mode checks an empty origin once per nonzero call; the full guard and take/return logic run only when an origin exists. The per-step walk selection and real-mode interpreter remain unchanged. Fixed executable controls can vary across campaigns; historical fail/pass differences are not attributed wholly to code.
+
+### Final gates — MEASURED
+
+Rust 1.98.1, macOS arm64, SDK 14.4/deployment 14.0, empty Rust flags, background scheduling, at most six build jobs, one benchmark process at a time. No own builds/tests overlapped timings. The fifteen original loops use `real16_loops 1 3 <workload>`, median of three serial rounds; RMW uses `1 11`. Guest state, steps, retirements and warmup agree. No timed sample was filtered.
+
+U3 frozen executable SHA-256 `4cb7dd4c7f3206585642b6c5c5d4e69501867fbee5295b02786b9b83d2632a5e`; R6 control `d07c838e00ded95866c1574d4439e4a909cb3fd3006409d99f2f35c1b526247f`; R7 `3d4749ef669f4c97656cbcba96d3d256d2265f15c865cdec1c6f68fe1ae48e5f`.
+
+| Loop | U3 alias | Round-7 alias | Change |
+|---|---:|---:|---:|
+| alu | 395.792 | 357.608 | -9.647% |
+| load | 520.061 | 468.477 | -9.919% |
+| load-odd | 530.501 | 479.436 | -9.626% |
+| store | 482.793 | 431.910 | -10.539% |
+| push-pop | 531.651 | 493.146 | -7.243% |
+| data-next-to-code | 1054.700 | 999.893 | -5.196% |
+| data-next-to-dense-code | 1055.011 | 999.736 | -5.239% |
+| call-ret | 990.666 | 837.440 | -15.467% |
+| dos-mixed | 482.465 | 455.084 | -5.675% |
+| rep-movsw | 188.283 | 188.226 | -0.030% |
+| straight-line | 411.309 | 410.810 | -0.121% |
+| ip-boundary-1 | 2540.782 | 2415.900 | -4.915% |
+| ip-boundary-64 | 406.146 | 343.830 | -15.343% |
+| smc-next-1 | 11121.184 | 11092.321 | -0.260% |
+| smc-next-64 | 9155.120 | 9160.026 | +0.054% |
+| smc-rmw-64 | 9248.976 | 9264.746 | +0.171% |
+
+Machine instructions/step (**vs U3 alias / current alias**), first percentage gates +2%:
+
+| Loop | I286 on | I386 on | I286 off | I386 off |
+|---|---:|---:|---:|---:|
+| alu | 363.070 (-8.267% / +1.527%) | 363.181 (-8.239% / +1.558%) | 363.194 (-8.236% / +1.562%) | 363.139 (-8.250% / +1.547%) |
+| load | 478.675 (-7.958% / +2.177%) | 478.709 (-7.951% / +2.184%) | 478.443 (-8.003% / +2.127%) | 478.337 (-8.023% / +2.105%) |
+| load-odd | 489.204 (-7.785% / +2.037%) | 489.240 (-7.778% / +2.045%) | 489.152 (-7.794% / +2.027%) | 489.142 (-7.796% / +2.024%) |
+| store | 445.225 (-7.781% / +3.083%) | 445.109 (-7.805% / +3.056%) | 445.112 (-7.805% / +3.057%) | 445.112 (-7.805% / +3.057%) |
+| push-pop | 491.513 (-7.550% / -0.331%) | 491.440 (-7.563% / -0.346%) | 491.366 (-7.577% / -0.361%) | 491.407 (-7.570% / -0.353%) |
+| data-next-to-code | 1014.823 (-3.781% / +1.493%) | 1014.724 (-3.790% / +1.483%) | 1014.545 (-3.807% / +1.465%) | 1014.541 (-3.808% / +1.465%) |
+| data-next-to-dense-code | 1014.478 (-3.842% / +1.475%) | 1014.332 (-3.856% / +1.460%) | 1014.403 (-3.849% / +1.467%) | 1014.313 (-3.858% / +1.458%) |
+| call-ret | 908.037 (-8.341% / +8.430%) | 907.858 (-8.359% / +8.409%) | 907.944 (-8.350% / +8.419%) | 908.042 (-8.340% / +8.431%) |
+| dos-mixed | 443.131 (-8.153% / -2.627%) | 442.910 (-8.199% / -2.675%) | 443.024 (-8.175% / -2.650%) | 443.103 (-8.159% / -2.633%) |
+| rep-movsw | 188.293 (+0.005% / +0.036%) | 188.259 (-0.013% / +0.018%) | 188.244 (-0.021% / +0.010%) | 188.232 (-0.027% / +0.003%) |
+| straight-line | 382.336 (-7.044% / -6.931%) | 381.894 (-7.152% / -7.039%) | 381.952 (-7.137% / -7.025%) | 382.109 (-7.099% / -6.986%) |
+| ip-boundary-1 | 2605.912 (+2.563% / +7.865%) | 2606.333 (+2.580% / +7.882%) | 2606.858 (+2.601% / +7.904%) | 2607.655 (+2.632% / +7.937%) |
+| ip-boundary-64 | 374.780 (-7.723% / +9.002%) | 374.797 (-7.719% / +9.006%) | 374.810 (-7.715% / +9.010%) | 374.976 (-7.675% / +9.059%) |
+| smc-next-1 | 5491.437 (-50.622% / -50.493%) | 5386.800 (-51.563% / -51.437%) | 5493.440 (-50.604% / -50.475%) | 5389.566 (-51.538% / -51.412%) |
+| smc-next-64 | 3691.078 (-59.683% / -59.705%) | 3586.558 (-60.825% / -60.846%) | 3694.196 (-59.649% / -59.670%) | 3588.405 (-60.804% / -60.825%) |
+| smc-rmw-64 | 4927.054 (-46.729% / -46.819%) | 4805.911 (-48.038% / -48.127%) | 4928.781 (-46.710% / -46.801%) | 4807.051 (-48.026% / -48.115%) |
+
+Every RMW sample is **host instructions/step ; ns/step**, round order 0–10, `1 11 smc-rmw-64`, 1M warmup/steps/retirements. Identical standalone driver/compiler flags differ only in the linked core library.
+
+| Version/path | Every sample (instructions ; ns) |
+|---|---|
+| U3/application-real16 | 9252.968;1613.590, 9242.629;1549.825, 9241.880;1613.189, 9251.597;3207.844, 9241.218;1571.148, 9244.309;1597.611, 9250.422;1632.664, 9248.976;1609.534, 9259.516;1555.476, 9252.040;1406.732, 9245.679;1569.031 |
+| U3/legacy-i286 | 4608.500;630.487, 4606.210;656.982, 4604.795;574.141, 4605.959;612.873, 4604.378;689.746, 4606.337;639.188, 4606.383;642.218, 4607.827;657.402, 4605.493;622.788, 4615.074;646.449, 4608.930;548.728 |
+| U3/legacy-i386 | 4485.455;647.200, 4482.832;627.410, 4480.934;625.093, 4480.532;648.436, 4480.642;638.522, 4482.854;648.582, 4484.956;618.829, 4487.097;830.504, 4481.413;617.286, 4494.252;630.557, 4486.185;638.877 |
+| U3/legacy-i286-a20-off | 4610.221;649.598, 4606.935;653.238, 4604.984;683.527, 4613.901;644.471, 4608.806;675.857, 4609.204;658.293, 4611.007;685.727, 4609.142;644.065, 4609.280;690.014, 4618.958;646.732, 4611.362;549.409 |
+| U3/legacy-i386-a20-off | 4486.412;659.925, 4488.263;452.903, 4482.964;674.076, 4482.759;597.573, 4484.727;641.283, 4487.521;621.917, 4484.851;620.702, 4485.614;619.842, 4485.851;660.713, 4483.532;648.480, 4487.198;587.285 |
+| R6/application-real16 | 9281.290;3824.908, 9269.483;1654.487, 9270.443;1656.711, 9264.791;1146.634, 9335.852;687.972, 9264.480;1369.444, 9264.555;1561.810, 9263.623;1580.366, 9265.973;1430.868, 9270.511;1536.143, 9267.308;1580.019 |
+| R6/legacy-i286 | 4923.180;672.074, 4922.257;683.190, 4928.448;652.419, 4924.083;500.532, 4953.842;394.125, 4923.379;555.740, 4923.184;651.774, 4923.935;700.187, 4925.683;685.185, 4926.488;652.603, 4925.805;691.887 |
+| R6/legacy-i386 | 4800.883;646.477, 4801.873;681.220, 4811.042;567.223, 4802.855;432.704, 4802.370;469.959, 4801.606;458.645, 4802.819;650.612, 4801.863;673.340, 4807.088;648.385, 4801.540;653.399, 4802.222;700.029 |
+| R6/legacy-i286-a20-off | 4933.684;1779.049, 4924.844;661.238, 4929.003;591.238, 4925.538;668.499, 4926.007;443.835, 4924.953;523.121, 4925.702;673.273, 4924.726;696.914, 4925.434;712.653, 4927.349;628.754, 4925.963;654.148 |
+| R6/legacy-i386-a20-off | 4805.034;715.797, 4803.213;649.411, 4806.076;640.889, 4803.421;624.263, 4805.364;411.749, 4806.136;611.772, 4801.181;409.387, 4803.569;578.343, 4804.890;688.683, 4805.577;630.394, 4805.822;673.598 |
+| R7/application-real16 | 9289.222;1618.233, 9260.255;1642.768, 9271.193;1616.956, 9267.028;1657.830, 9265.728;1559.328, 9263.457;1640.609, 9264.075;1642.300, 9262.896;1639.275, 9266.047;1563.424, 9264.746;1396.757, 9260.569;1570.708 |
+| R7/legacy-i286 | 4927.459;658.059, 4926.966;713.238, 4928.151;698.064, 4927.054;612.007, 4929.913;579.918, 4926.631;689.973, 4934.392;1485.588, 4930.694;595.131, 4926.955;679.722, 4925.999;506.160, 4926.807;669.269 |
+| R7/legacy-i386 | 4805.685;729.705, 4803.735;692.072, 4803.315;691.020, 4806.502;608.897, 4808.979;573.354, 4805.424;690.142, 4810.291;783.859, 4804.091;681.112, 4809.350;670.306, 4806.875;663.596, 4805.911;698.003 |
+| R7/legacy-i286-a20-off | 4927.942;736.042, 4927.629;709.356, 4927.427;711.325, 4927.677;689.493, 4929.959;715.471, 4928.781;700.812, 4935.421;1442.457, 4928.096;691.495, 4936.811;1726.891, 4931.185;635.185, 4928.964;679.629 |
+| R7/legacy-i386-a20-off | 4805.679;697.697, 4806.768;696.530, 4807.486;722.770, 4811.791;666.498, 4808.429;548.651, 4810.212;707.633, 4806.543;659.079, 4805.414;668.943, 4814.517;1617.534, 4807.051;672.336, 4806.468;665.569 |
+
+`dos-mixed` wall: 5 interleaved pairs, every U3/R7 ns/step sample: 61.344/54.122, 61.054/50.665, 20.954/58.319, 62.376/54.134, 62.866/59.185. Medians 61.344/54.134 (-11.753%); ranges 20.954–62.866/50.665–59.185. Explicit `1 3 dos-mixed`, stopped after the first warmed alias sample: 1M warmup, 8M steps, 7,338,677 retirements. The extra-five condition was not met.
+
+### Long64/Compat32 — MEASURED / READ
+
+`dispatch_thunks 1 1000 1024`, two warm sweeps, three interleaved samples/version: 7,172,001 guest instructions, 4,097,001 dispatches, 264,000 shared resolves each. Gate: not above U3.
+
+| Version | Instructions/dispatch samples | Median | vs U3 |
+|---|---|---:|---:|
+| U3 | 246.297, 246.320, 246.354 | 246.320 | +0.000% |
+| R7 | 241.377, 241.226, 241.405 | 241.377 | -2.007% |
+
+`interpreter_store_probe WIDTH single off 1000000`: 16M timed stores after equal warmup, widths in bytes. Identical standard drivers supply five interleaved wall samples; the temporary counted driver supplies three interleaved instruction samples. Gate: instructions/store within +0.5% of U3.
+
+| Width/version | Instructions/store samples (median; vs U3) | Every wall sample, ns/store (median; vs U3) |
+|---|---|---|
+| 8/U3 | 298.682, 298.583, 298.598 (298.598; +0.000%) | 32.637, 34.674, 32.472, 32.911, 33.994 (32.911; +0.000%) |
+| 8/R7 | 297.838, 297.865, 297.828 (297.838; -0.255%) | 35.161, 32.568, 30.176, 30.734, 34.164 (32.568; -1.042%) |
+| 32/U3 | 594.174, 594.153, 594.188 (594.174; +0.000%) | 63.855, 65.860, 63.200, 64.626, 66.814 (64.626; +0.000%) |
+| 32/R7 | 593.411, 593.409, 593.517 (593.411; -0.128%) | 57.304, 65.678, 67.165, 65.200, 64.943 (65.200; +0.888%) |
+
+All 27 Application IR captures (Long64/Compat32 included) and nine Real16 captures are byte-identical to U3; no fixture changed. `application_codegen` (3 tests) and four backend application witnesses preserve native AArch64 relocated/fixed emitted bytes. Other hosts’ emitted bytes were not measured. No Application lowering/key/backend-codegen source changed.
+
+### Frozen real-mode comparison-fault witness — MEASURED / READ
+
+`legacy_rep_fault_flags::repeated_comparison_fault_flags_match_frozen_real_behavior` covers 84 cases: CMPS/SCAS × REPE/REPNE × budgets 1/2/8, on Machine I286/I386 and alias. The identical diagnostic linked against 36a9703 and the final library produces identical rows. Arithmetic-mask original flags are REPE 0801h / REPNE 0841h; the last successful comparison leaves 0044h / 0000h. Fault cases commit two elements, retain count=1, EIP at the prefixed instruction and zero retirements.
+
+| Path/case | At 36a9703 | Now | SDM rule / result |
+|---|---|---|---|
+| Machine I286, unmapped memory, address16 | Last comparison flags | Same | Original EFLAGS required for comparison faults; engine-map analogue is decision-16 §3 |
+| Machine I386, unmapped address16/32 and address32 operand past FFFFh (#GP) | Last comparison flags | Same | Original EFLAGS required; rule unmet |
+| Alias, unmapped address16/32 | Last comparison flags | Same | Original EFLAGS required; frozen behavior records the gap |
+| Alias, address32 operand past FFFFh | Completes third element and HLT; no limit fault | Same | No fault restoration observed; real-address limit behavior also differs |
+
+SDM Vol 2B §4.3 REPE/REPZ p. 4-565 and REPNE/REPNZ p. 4-567 state the original-EFLAGS rule; Vol 2A §3.3 CMPS and Vol 2B §4.3 SCAS define real-address operand-limit exceptions. I286 has no address32 case. Alias limit completion has count=0, four units, two retirements and EIP after HLT. The witness deliberately asserts current behavior and points at the rule. No real-mode or alias behavior is fixed here; the supervisor will file the separate real-mode bead.
+
+### Checks — MEASURED
+
+| Binary | U3 → R7 passed/ignored | Binary | U3 → R7 passed/ignored |
+|---|---:|---|---:|
+| `application_codegen` | 3 / 0 → 3 / 0 | `boundary` | 1 / 0 → 1 / 0 |
+| `compat` | 14 / 0 → 14 / 0 | `environment_boundary` | 1 / 0 → 1 / 0 |
+| `fault_atomicity` | 41 / 0 → 41 / 0 | `fault_metadata` | 59 / 0 → 59 / 0 |
+| `fault_path` | 17 / 0 → 17 / 0 | `fences` | 6 / 2 → 6 / 2 |
+| `fetch_policy` | 20 / 1 → 20 / 1 | `irq_shadow` | 38 / 0 → 38 / 0 |
+| `legacy_a20` | 50 / 0 → 50 / 0 | `legacy_alias` | — → 5 / 0 |
+| `legacy_contract` | 13 / 0 → 13 / 0 | `legacy_direct` | 11 / 0 → 13 / 0 |
+| `legacy_direct_parity` | 28 / 0 → 28 / 0 | `legacy_i286` | 34 / 0 → 34 / 0 |
+| `legacy_idt` | 22 / 0 → 22 / 0 | `legacy_ldt` | 25 / 0 → 25 / 0 |
+| `legacy_protected` | 36 / 0 → 63 / 0 | `legacy_real` | 92 / 0 → 92 / 0 |
+| `legacy_real_exceptions` | 8 / 0 → 8 / 0 | `legacy_real_parity` | 48 / 0 → 48 / 0 |
+| `legacy_rep_fault_flags` | — → 1 / 0 | `legacy_rollback_sweep` | — → 2 / 0 |
+| `legacy_sse_integer` | 2 / 0 → 2 / 0 | `legacy_task_registers` | 6 / 0 → 6 / 0 |
+| `legacy_task_switch` | 65 / 0 → 65 / 0 | `legacy_u3_review` | 44 / 0 → 44 / 0 |
+| `legacy_upper_audit` | 0 / 0 → 0 / 0 | `machine_empty_fpu` | 17 / 0 → 17 / 0 |
+| `real16_jit_guard` | 6 / 0 → 6 / 0 | `real16_wrap` | 20 / 0 → 20 / 0 |
+| `real16_x87_model` | 21 / 0 → 21 / 0 | `retired_count` | 21 / 0 → 21 / 0 |
+| `run_steps` | 47 / 0 → 47 / 0 | `smc` | 59 / 0 → 59 / 0 |
+| `x86jit_core` | 413 / 2 → 419 / 2 | `x86jit_cranelift` | 4 / 0 → 4 / 0 |
+| `x86jit_tests` | 21 / 0 → 21 / 0 | Total | 1313 / 5 → 1356 / 5 |
+
+Runtime binaries ran serially, two threads, timeout 180; backend lib filters 182 unrelated tests. `x86jit_tests` has 21 default-feature tests at U3 and every round; the 22nd MMX test requires Unicorn. Fuzz robustness was excluded. All-target/all-feature clippy `-D warnings`, fmt `--check`, boundary/environment tests and `cargo check --workspace --tests --release --features x86jit-tests/unicorn` pass. Unicorn feature compilation passed; its runtime comparisons were not run.
+
+### Remaining — MEASURED / READ / ASSUMED
+
+| Failing loop | Residual to +2%, instructions/step across four variants |
+|---|---:|
+| ip-boundary-1 | 14.314…16.057 |
+
+The complete R6/R7 one-step control adds 18.303–22.929 instructions/call. These are real-mode runs with an empty origin, so the new full matching/take-return helper is not entered. The net cost includes the empty-origin test and generated result/entry code; their individual instruction contributions were not isolated. Register allocation/result-carrier explanations remain ASSUMED. Closing the listed residual needs specialization or reuse of an existing boundary while keeping every preflight and dispatcher return inside the fail-closed ownership rule. No semantic guard may be dropped.
+
+A final gate fails; code is retained and work stops. The protected abandoned-origin defect is fixed. Real-mode/alias differences stay documented for the separate bead. No public API/layout or IR/backend fixture changed. Decision-23 was read, not edited. Its supervisor-owned ordering amendment changed concurrently; the measured U4/U5 gate text did not. No commits, git writes, bead operations or pushes were performed.

@@ -464,3 +464,67 @@ fn compact_word_loop_is_shared_with_the_alias_on_both_bus_routes() {
         }
     }
 }
+
+#[test]
+fn stable_entry_proof_rejects_edited_public_storage() {
+    // Paging/VM input positions: SDM Vol 3A §2.5; Vol 1 §3.4.3.3.
+    // The cached engine proof must preserve all existing context refusals.
+    use x86jit_core::UnsupportedSystemOperation;
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        let (vm, mut cpu) = setup(model, b"\x40\x90");
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 1);
+        let accepted = cpu.cpu.clone();
+        let retired = cpu.retired_instructions();
+        let edits: [fn(&mut CpuState); 10] = [
+            |c| c.legacy.reserved = 1,
+            |c| c.legacy.segments[0].reserved = 1,
+            |c| c.legacy.segments[3].unusable = 1,
+            |c| c.legacy.gdtr.reserved = 1,
+            |c| c.legacy.ldtr.reserved = 1,
+            |c| c.legacy.a20_enabled = 2,
+            |c| c.legacy.cpl = 1,
+            |c| c.legacy.cr0 = 1 << 31,
+            |c| c.rflags_system |= 1 << 17,
+            |c| c.task_debug_trap = 1,
+        ];
+        for edit in edits {
+            cpu.cpu = accepted.clone();
+            edit(&mut cpu.cpu);
+            let before = cpu.cpu.gpr;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::InvalidLegacyContext(_)
+                            | UnsupportedSystemOperation::LegacyEntryFacility
+                            | UnsupportedSystemOperation::LegacyTaskDebugTrap,
+                        ..
+                    })
+                ),
+                "{model:?}: {:?}",
+                run.stop()
+            );
+            assert_eq!((run.steps(), cpu.retired_instructions()), (0, retired));
+            assert_eq!(cpu.cpu.gpr, before);
+        }
+    }
+}
+
+#[test]
+fn stable_entry_proof_rederives_direct_and_retained_caches_after_edits() {
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        let (mut vm, mut cpu) = setup(model, b"\xa1\x00\x40");
+        vm.map(0x4000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x4000, &0x1234u16.to_le_bytes()).unwrap();
+        vm.write_bytes(0x4100, &0x5678u16.to_le_bytes()).unwrap();
+        for (base, value) in [(0, 0x1234), (0x100, 0x5678), (0, 0x1234)] {
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.legacy.segments[1].base = base;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!(cpu.cpu.gpr[0], value);
+        }
+    }
+}
