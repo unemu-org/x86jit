@@ -29,6 +29,109 @@ impl LiftBuffer for Ops {
     }
 }
 
+pub(crate) fn alias_context() -> MachineContext {
+    MachineContext {
+        segment_class: crate::SegmentClass::Direct,
+        generation: crate::CpuGeneration::I286,
+        regime: crate::MachineRegime::Real,
+        default_operand_bits: 16,
+        default_address_bits: 16,
+        stack_address_bits: 16,
+        cpl: 0,
+        paging_enabled: false,
+    }
+}
+
+pub(crate) fn shared_family(insn: &Instruction) -> bool {
+    use Mnemonic::*;
+    matches!(
+        insn.mnemonic(),
+        Push | Pop
+            | Pushf
+            | Pushfd
+            | Popf
+            | Popfd
+            | Pusha
+            | Pushad
+            | Popa
+            | Popad
+            | Call
+            | Ret
+            | Retf
+            | Jmp
+            | Iret
+            | Iretd
+            | Enter
+            | Leave
+            | Loop
+            | Loope
+            | Loopne
+            | Jcxz
+            | Jecxz
+            | Les
+            | Lds
+            | Lss
+            | Lfs
+            | Lgs
+            | Bound
+            | Xlatb
+    ) || (insn.mnemonic() == Mov
+        && (insn.op0_register().is_segment_register() || insn.op1_register().is_segment_register()))
+}
+
+// Decision-23 §6 freezes the alias's accepted instruction set. Sharing the
+// implementation does not grant forms it previously left to the embedder.
+pub(super) fn alias_supported(insn: &Instruction) -> bool {
+    use Mnemonic::*;
+    !(matches!(
+        insn.mnemonic(),
+        Pushfd | Popfd | Pushad | Popad | Iretd | Jecxz | Lss | Lfs | Lgs
+    ) || (insn.mnemonic() == Bound && operand_size(insn, 0) != 2)
+        || (0..insn.op_count()).any(|i| matches!(insn.op_register(i), Register::FS | Register::GS))
+        || insn.op0_kind() == OpKind::FarBranch32
+        || matches!(insn.code(), Code::Call_m1632 | Code::Jmp_m1632))
+}
+
+pub(crate) fn shared_helper(op: &L) -> bool {
+    matches!(
+        op,
+        L::LoadSegment { .. }
+            | L::Flags { .. }
+            | L::All { .. }
+            | L::Transfer { .. }
+            | L::Return { .. }
+            | L::Iret { .. }
+            | L::CheckTaskReturn
+            | L::Enter { .. }
+            | L::Leave { .. }
+            | L::Bound { .. }
+    )
+}
+
+pub(super) struct ContextOps<'a, B> {
+    pub ops: &'a mut B,
+    pub context: MachineContext,
+}
+impl<B: LiftBuffer> std::ops::Deref for ContextOps<'_, B> {
+    type Target = [IrOp];
+    fn deref(&self) -> &[IrOp] {
+        self.ops
+    }
+}
+impl<B: LiftBuffer> std::ops::DerefMut for ContextOps<'_, B> {
+    fn deref_mut(&mut self) -> &mut [IrOp] {
+        self.ops
+    }
+}
+impl<B: LiftBuffer> LiftBuffer for ContextOps<'_, B> {
+    fn push(&mut self, op: IrOp) {
+        self.ops.push(op);
+    }
+    fn legacy_context(&self) -> Option<MachineContext> {
+        Some(self.context)
+    }
+}
+
 pub(crate) fn segment(r: Register) -> Option<SegmentId> {
     Some(match r {
         Register::CS => SegmentId::Cs,
@@ -229,8 +332,25 @@ pub(crate) fn instruction(
                         | iced_x86::OpAccess::ReadCondWrite
                 )
         });
+        let mut pop_stack = insn.mnemonic() == Mnemonic::Pop;
         for op in &mut ops.values {
-            if let IrOp::Legacy(L::Address { access, .. }) = op {
+            if let IrOp::Legacy(L::Address {
+                access, segment, ..
+            }) = op
+            {
+                // POP's implicit source is read-only even with a memory destination.
+                if pop_stack {
+                    pop_stack = false;
+                    continue;
+                }
+                if *access == crate::AccessKind::Execute {
+                    continue;
+                }
+                if *segment == SegmentId::Ss
+                    && matches!(insn.mnemonic(), Mnemonic::Push | Mnemonic::Call)
+                {
+                    continue;
+                }
                 *access = if writing {
                     crate::AccessKind::Write
                 } else {
@@ -248,12 +368,6 @@ pub(crate) fn instruction(
             ops.values.push(IrOp::Legacy(L::Refuse {
                 operation: crate::UnsupportedSystemOperation::LegacyInstruction,
             }));
-        }
-        // POP memory computes its EA after committing the stack increment.
-        // Other helpers stage architectural destinations until their accesses
-        // succeed; scalar RMW flags are committed after the store below.
-        if insn.mnemonic() == Mnemonic::Pop && insn.op0_kind() == OpKind::Memory {
-            ops.values.insert(1, IrOp::Legacy(L::Checkpoint));
         }
         defer_store_flags(&mut ops.values, &mut tg);
     }
@@ -281,6 +395,7 @@ pub(super) fn direct_address(
     // check the whole operand before forming a selector-derived linear address.
     if bytes != 0 {
         ops.push(IrOp::SegLimitCheck {
+            alias_low16: false,
             offset,
             size: bytes,
             vector: if segment == SegmentId::Ss && context.generation == crate::CpuGeneration::I386
@@ -470,9 +585,21 @@ fn address(
     effective_address(insn, ops, tg)
 }
 fn selector(ops: &mut impl LiftBuffer, tg: &mut TempGen, segment: SegmentId) -> Val {
-    let dst = tg.fresh();
-    emit(ops, L::ReadSelector { dst, segment });
-    Val::Temp(dst)
+    let reg = match segment {
+        SegmentId::Cs => Reg::Cs,
+        SegmentId::Ds => Reg::Ds,
+        SegmentId::Es => Reg::Es,
+        SegmentId::Ss => Reg::Ss,
+        SegmentId::Fs | SegmentId::Gs => {
+            let dst = tg.fresh();
+            ops.push(IrOp::ReadSelector {
+                dst,
+                segment: segment as u8,
+            });
+            return Val::Temp(dst);
+        }
+    };
+    read_reg(reg, ops, tg)
 }
 fn load(ops: &mut impl LiftBuffer, tg: &mut TempGen, addr: Val, size: u8) -> Val {
     let dst = tg.fresh();
@@ -484,6 +611,129 @@ fn load(ops: &mut impl LiftBuffer, tg: &mut TempGen, addr: Val, size: u8) -> Val
     });
     Val::Temp(dst)
 }
+// SDM Vol 2B §4.3 PUSH/POP/RET; 80386 PRM §17.1.3, pp. 17-1–17-2:
+// operand width selects slots; SS.B independently selects SP or ESP.
+fn stack_offset(ops: &mut impl LiftBuffer, tg: &mut TempGen, delta: i64) -> Val {
+    let context = ops.legacy_context().expect("stack context");
+    let sp = read_reg(Reg::Rsp, ops, tg);
+    let value = if delta == 0 {
+        sp
+    } else {
+        alu_none(ops, tg, |dst| IrOp::Add {
+            dst,
+            a: sp,
+            b: Val::Imm(delta as u64),
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    };
+    alu_none(ops, tg, |dst| IrOp::And {
+        dst,
+        a: value,
+        b: Val::Imm(if context.stack_address_bits == 16 {
+            0xffff
+        } else {
+            0xffff_ffff
+        }),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    })
+}
+fn stack_address(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    offset: Val,
+    size: u8,
+    access: crate::AccessKind,
+) -> Val {
+    let context = ops.legacy_context().expect("stack context");
+    let dst = tg.fresh();
+    if context.segment_class == crate::SegmentClass::Direct {
+        emit(
+            ops,
+            L::DirectStackAddress {
+                dst,
+                offset,
+                bytes: size,
+                vector: if context.generation == crate::CpuGeneration::I386 {
+                    12
+                } else {
+                    13
+                },
+            },
+        );
+    } else {
+        emit(
+            ops,
+            L::Address {
+                dst,
+                segment: SegmentId::Ss,
+                offset,
+                bytes: size,
+                access,
+            },
+        );
+    }
+    Val::Temp(dst)
+}
+fn write_sp(ops: &mut impl LiftBuffer, value: Val) {
+    ops.push(IrOp::WriteReg {
+        reg: Reg::Rsp,
+        src: value,
+        size: ops
+            .legacy_context()
+            .expect("stack context")
+            .stack_address_bits
+            / 8,
+    });
+}
+fn push_value(ops: &mut impl LiftBuffer, tg: &mut TempGen, value: Val, size: u8) {
+    let offset = stack_offset(ops, tg, -i64::from(size));
+    let addr = stack_address(ops, tg, offset, size, crate::AccessKind::Write);
+    ops.push(IrOp::Store {
+        fault: crate::ir::MemoryAccess::new(u16::from(size), false, true),
+        addr,
+        src: value,
+        size,
+        order: MemOrder::None,
+    });
+    write_sp(ops, offset);
+}
+fn check_target(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    ip: Val,
+    size: u8,
+    fault_ip: u64,
+) -> Val {
+    let value = ip;
+    let context = ops.legacy_context().expect("transfer context");
+    if context.segment_class == crate::SegmentClass::Direct {
+        if size == 4 {
+            ops.push(IrOp::SegLimitCheck {
+                alias_low16: false,
+                offset: value,
+                size: 1,
+                vector: 13,
+                fault_ip,
+            });
+        }
+    } else {
+        let dst = tg.fresh();
+        emit(
+            ops,
+            L::Address {
+                dst,
+                segment: SegmentId::Cs,
+                offset: value,
+                bytes: 1,
+                access: crate::AccessKind::Execute,
+            },
+        );
+    }
+    value
+}
+
 fn far_target(
     insn: &Instruction,
     ops: &mut impl LiftBuffer,
@@ -802,37 +1052,66 @@ pub(super) fn lower(
             } else {
                 lower_read(insn, 0, ops, tg)?
             };
-            emit(ops, L::Push { value, size });
+            push_value(ops, tg, value, size);
         }
         Pop => {
-            let dst = tg.fresh();
-            emit(ops, L::Pop { dst, size });
+            let offset = stack_offset(ops, tg, 0);
+            let addr = stack_address(ops, tg, offset, size, crate::AccessKind::Read);
+            let value = load(ops, tg, addr, size);
+            let next_sp = stack_offset(ops, tg, i64::from(size));
             if let Some(segment) = segment(insn.op0_register()) {
                 emit(
                     ops,
                     L::LoadSegment {
                         segment,
-                        value: Val::Temp(dst),
+                        value,
                         inhibit: segment == SegmentId::Ss,
                     },
                 );
-                emit(
-                    ops,
-                    L::AdjustStack {
-                        bytes: u32::from(size),
-                    },
-                );
+                write_sp(ops, next_sp);
             } else {
-                emit(
-                    ops,
-                    L::AdjustStack {
-                        bytes: u32::from(size),
-                    },
-                );
-                // SDM Vol 2B §4.3 POP: a memory EA uses the incremented ESP.
-                // The legacy interpreter restores SP if the destination faults.
-                let target = lower_write_target(insn, 0, ops, tg)?;
-                emit_write(ops, tg, target, Val::Temp(dst));
+                if insn.op0_kind() == OpKind::Memory {
+                    // SDM Vol 2B §4.3 POP: ESP-based destinations use post-pop ESP.
+                    // Substitute its staged value; commit SP after the store succeeds.
+                    let raw = read_reg(Reg::Rsp, ops, tg);
+                    let high = alu_none(ops, tg, |dst| IrOp::And {
+                        dst,
+                        a: raw,
+                        b: Val::Imm(if context.stack_address_bits == 16 {
+                            !0xffff
+                        } else {
+                            0
+                        }),
+                        size: 8,
+                        set_flags: FlagMask::NONE,
+                    });
+                    let post = alu_none(ops, tg, |dst| IrOp::Or {
+                        dst,
+                        a: high,
+                        b: next_sp,
+                        size: 8,
+                        set_flags: FlagMask::NONE,
+                    });
+                    let first = ops.len();
+                    let target = lower_write_target(insn, 0, ops, tg)?;
+                    for op in &mut ops[first..] {
+                        if let IrOp::ReadReg { dst, reg: Reg::Rsp } = op {
+                            *op = IrOp::Or {
+                                dst: *dst,
+                                a: post,
+                                b: Val::Imm(0),
+                                size: 8,
+                                set_flags: FlagMask::NONE,
+                            };
+                        }
+                    }
+                    emit_write(ops, tg, target, value);
+                    write_sp(ops, next_sp);
+                } else {
+                    write_sp(ops, next_sp);
+                    let target = lower_write_target(insn, 0, ops, tg)?;
+                    emit_write(ops, tg, target, value);
+                }
             }
         }
         Pushf | Pushfd => emit(ops, L::Flags { size, pop: false }),
@@ -883,10 +1162,36 @@ pub(super) fn lower(
                         OpKind::NearBranch16 | OpKind::NearBranch32 => {
                             Val::Imm(insn.near_branch_target())
                         }
-                        _ => lower_read(insn, 0, ops, tg)?,
+                        _ => {
+                            let value = lower_read(insn, 0, ops, tg)?;
+                            if insn.op0_kind() == OpKind::Register {
+                                alu_none(ops, tg, |dst| IrOp::And {
+                                    dst,
+                                    a: value,
+                                    b: Val::Imm(if size == 2 { 0xffff } else { 0xffff_ffff }),
+                                    size: 8,
+                                    set_flags: FlagMask::NONE,
+                                })
+                            } else {
+                                value
+                            }
+                        }
                     },
                 )
             };
+            if !far {
+                let ip = check_target(ops, tg, ip, size, insn.ip());
+                if insn.mnemonic() == Call {
+                    push_value(
+                        ops,
+                        tg,
+                        Val::Imm(insn.next_ip() & if size == 2 { 0xffff } else { 0xffff_ffff }),
+                        size,
+                    );
+                }
+                ops.push(IrOp::Jump { target: ip });
+                return Ok(true);
+            }
             emit(
                 ops,
                 L::Transfer {
@@ -899,11 +1204,25 @@ pub(super) fn lower(
                 },
             );
         }
-        Ret | Retf => emit(
+        Ret => {
+            let offset = stack_offset(ops, tg, 0);
+            let addr = stack_address(ops, tg, offset, size, crate::AccessKind::Read);
+            let ip = load(ops, tg, addr, size);
+            let ip = check_target(ops, tg, ip, size, insn.ip());
+            let extra = if insn.op_count() == 0 {
+                0
+            } else {
+                insn.immediate16()
+            };
+            let next_sp = stack_offset(ops, tg, i64::from(size) + i64::from(extra));
+            write_sp(ops, next_sp);
+            ops.push(IrOp::Jump { target: ip });
+        }
+        Retf => emit(
             ops,
             L::Return {
                 size,
-                far: insn.mnemonic() == Retf,
+                far: true,
                 pop_extra: if insn.op_count() == 0 {
                     0
                 } else {
@@ -927,6 +1246,10 @@ pub(super) fn lower(
             advance: 0,
         }),
         Iret | Iretd => {
+            // SDM Vol 3A §11.3: IRET is serializing in real and protected mode.
+            ops.push(IrOp::Fence {
+                kind: FenceKind::Full,
+            });
             emit(ops, L::CheckTaskReturn);
             emit(ops, L::Iret { size });
         }
@@ -979,15 +1302,27 @@ pub(super) fn lower(
                 Loopne => LoopKind::Loopne,
                 _ => LoopKind::Jcxz,
             };
-            emit(
-                ops,
-                L::Loop {
+            let check_target = context.segment_class == crate::SegmentClass::Checked
+                || insn.near_branch_target() > 0xffff;
+            if count_bits == 16 && !check_target {
+                // Both Direct paths use the compact, statically word-sized form.
+                ops.push(IrOp::LoopCx {
                     kind,
-                    count_bits,
-                    taken: insn.near_branch_target() as u32,
-                    next,
-                },
-            );
+                    taken: insn.near_branch_target(),
+                    fallthrough: u64::from(next),
+                });
+            } else {
+                emit(
+                    ops,
+                    L::Loop {
+                        kind,
+                        count_bits,
+                        check_target,
+                        taken: insn.near_branch_target() as u32,
+                        next,
+                    },
+                );
+            }
         }
         Movsb | Movsw | Movsd | Stosb | Stosw | Stosd | Lodsb | Lodsw | Lodsd | Cmpsb | Cmpsw
         | Cmpsd | Scasb | Scasw | Scasd | Insb | Insw | Insd | Outsb | Outsw | Outsd
@@ -1077,17 +1412,30 @@ pub(super) fn lower(
                 set_flags: FlagMask::NONE,
             });
             let dst = tg.fresh();
-            emit(
-                ops,
-                L::Address {
-                    dst,
-                    segment: segment(insn.memory_segment()).unwrap_or(SegmentId::Ds),
+            let addr = if context.segment_class == crate::SegmentClass::Direct {
+                direct_address(
+                    ops,
+                    tg,
+                    segment(insn.memory_segment()).unwrap_or(SegmentId::Ds),
                     offset,
-                    bytes: 1,
-                    access: crate::AccessKind::Read,
-                },
-            );
-            let value = load(ops, tg, Val::Temp(dst), 1);
+                    1,
+                    context,
+                    insn.ip(),
+                )
+            } else {
+                emit(
+                    ops,
+                    L::Address {
+                        dst,
+                        segment: segment(insn.memory_segment()).unwrap_or(SegmentId::Ds),
+                        offset,
+                        bytes: 1,
+                        access: crate::AccessKind::Read,
+                    },
+                );
+                Val::Temp(dst)
+            };
+            let value = load(ops, tg, addr, 1);
             emit_write(
                 ops,
                 tg,
@@ -1232,5 +1580,34 @@ pub(super) fn lower(
             },
         ),
     }
-    Ok(true)
+    Ok(matches!(
+        insn.mnemonic(),
+        Call | Ret
+            | Retf
+            | Jmp
+            | Iret
+            | Iretd
+            | Loop
+            | Loope
+            | Loopne
+            | Jcxz
+            | Jecxz
+            | Bound
+            | Enter
+            | Leave
+            | Pushf
+            | Pushfd
+            | Popf
+            | Popfd
+            | Pusha
+            | Pushad
+            | Popa
+            | Popad
+            | Les
+            | Lds
+            | Lss
+            | Lfs
+            | Lgs
+    ) || (insn.mnemonic() == Mov && insn.op0_register().is_segment_register())
+        || (insn.mnemonic() == Pop && insn.op0_register().is_segment_register()))
 }

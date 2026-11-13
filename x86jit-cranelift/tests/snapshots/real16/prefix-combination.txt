@@ -23,6 +23,7 @@ IrBlock {
             ),
         },
         SegLimitCheck {
+            alias_low16: true,
             offset: Temp(
                 1,
             ),

@@ -350,27 +350,11 @@ fn raw_direct(cpu: &CpuState) -> bool {
             .all(|selector| *selector <= 0xf000)
 }
 
-fn shared_instruction(insn: &iced_x86::Instruction, bytes: &[u8]) -> bool {
-    use iced_x86::{Mnemonic::*, Register};
-    if matches!(
-        insn.memory_segment(),
-        Register::FS | Register::GS | Register::SS
-    ) || insn.len() > 10
-    {
-        return false;
-    }
-    // The frozen alias truncates 32-bit effective offsets in its limit gate.
-    // Keep those forms on the width-aware Direct lowering until U3.
-    if bytes
-        .iter()
-        .take_while(|b| {
-            matches!(
-                b,
-                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
-            )
-        })
-        .any(|b| *b == 0x67)
-    {
+fn shared_instruction(insn: &iced_x86::Instruction) -> bool {
+    use iced_x86::Mnemonic::*;
+    // The compatibility decoder faults beyond ten bytes; I386 allows fifteen
+    // (80286 PRM App. C item 10 p. C-2; 80386 PRM §14.7 item 6 p. 14-6).
+    if insn.len() > 10 {
         return false;
     }
     // The alias wraps sequential IP; Machine retains EIP past FFFFh
@@ -378,96 +362,36 @@ fn shared_instruction(insn: &iced_x86::Instruction, bytes: &[u8]) -> bool {
     if insn.ip() + insn.len() as u64 == 0x10000 {
         return false;
     }
-    let prefix32 = insn.code().op_code().operand_size() == 32;
     match insn.mnemonic() {
         Mov => !(0..insn.op_count()).any(|i| {
-            insn.op_register(i).is_segment_register()
-                || insn.op_register(i).is_cr()
+            insn.op_register(i).is_cr()
                 || insn.op_register(i).is_dr()
                 || insn.op_register(i).is_tr()
         }),
-        Push | Pop | Call | Ret => {
-            !(0..insn.op_count()).any(|i| insn.op_register(i).is_segment_register())
-                && !prefix32
-                && insn.op0_kind() != iced_x86::OpKind::Memory
-                && !matches!(
-                    insn.op0_kind(),
-                    iced_x86::OpKind::FarBranch16 | iced_x86::OpKind::FarBranch32
-                )
-        }
-        Jmp => {
-            !prefix32
-                && !matches!(
-                    insn.op0_kind(),
-                    iced_x86::OpKind::Memory
-                        | iced_x86::OpKind::FarBranch16
-                        | iced_x86::OpKind::FarBranch32
-                )
-        }
-        Loop | Loope | Loopne | Jcxz => insn.op0_kind() == iced_x86::OpKind::NearBranch16,
+        Push | Pop | Call | Ret | Retf | Jmp | Pushf | Pushfd | Popf | Popfd | Pusha | Pushad
+        | Popa | Popad | Iret | Iretd | Enter | Leave | Les | Lds | Lss | Lfs | Lgs | Bound
+        | Xlatb | Loop | Loope | Loopne | Jcxz | Jecxz => true,
         Movsb | Movsw | Movsd | Stosb | Stosw | Stosd | Lodsb | Lodsw | Lodsd | Cmpsb | Cmpsw
-        | Cmpsd | Scasb | Scasw | Scasd => insn.is_string_instruction(),
+        | Cmpsd | Scasb | Scasw | Scasd => {
+            // The frozen alias has no FS/GS segment personality and uses #GP
+            // for SS limits; Machine I386 has FS/GS and #SS (PRM §14.6 Table 14-1).
+            insn.is_string_instruction()
+                && !matches!(
+                    insn.memory_segment(),
+                    iced_x86::Register::FS | iced_x86::Register::GS | iced_x86::Register::SS
+                )
+        }
         Lea | Add | Adc | Sub | Sbb | And | Or | Xor | Cmp | Test | Inc | Dec | Neg | Not
         | Xchg | Shl | Sal | Shr | Sar | Rol | Ror | Rcl | Rcr | Shld | Shrd | Mul | Imul | Div
         | Idiv | Movzx | Movsx | Cbw | Cwde | Cwd | Cdq | Clc | Stc | Cmc | Cld | Std | Lahf
         | Sahf | Nop | Hlt | In | Out | Cli | Sti => true,
         Jb | Jbe | Je | Jg | Jge | Jl | Jle | Jae | Ja | Jne | Jno | Jnp | Jns | Jo | Jp | Js => {
-            !prefix32
+            // The frozen alias's conditional-branch IP wrap is outside the
+            // unified stack/control families; Machine checks the full EIP.
+            insn.code().op_code().operand_size() != 32
         }
         _ => false,
     }
-}
-
-fn specialize_shared_stacks(ops: &mut Vec<IrOp>, stacks: &[u64], generation: CpuGeneration) {
-    if stacks.is_empty() {
-        return;
-    }
-    let mut result = Vec::with_capacity(ops.len());
-    let mut stack = false;
-    let mut index = 0;
-    while index < ops.len() {
-        let op = &ops[index];
-        if let IrOp::InsnStart { guest_addr } = op {
-            stack = stacks.contains(guest_addr);
-        }
-        if stack
-            && matches!(
-                op,
-                IrOp::ReadReg {
-                    reg: crate::Reg::Ss,
-                    ..
-                }
-            )
-        {
-            // The admitted near word stack forms have one SS-base sequence.
-            let Some(IrOp::Add { dst, a: offset, .. }) = ops.get(index + 2) else {
-                unreachable!("shared stack address addition")
-            };
-            result.push(IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
-                dst: *dst,
-                offset: *offset,
-                bytes: 2,
-                vector: if generation == CpuGeneration::I386 {
-                    12
-                } else {
-                    13
-                },
-            }));
-            index += 3;
-        } else {
-            let mut op = op.clone();
-            if stack {
-                if let IrOp::Load { fault, size, .. } | IrOp::Store { fault, size, .. } = &mut op {
-                    // The alias CALL/RET expansion has no explicit memory operand
-                    // for its metadata pass. Machine retains the actual stack width.
-                    *fault = crate::ir::MemoryAccess::new(u16::from(*size), false, true);
-                }
-            }
-            result.push(op);
-            index += 1;
-        }
-    }
-    *ops = result;
 }
 
 #[inline(always)]
@@ -513,7 +437,7 @@ fn resolve_direct_uncached(
         let generation = vm.cache.publication_generation();
         let permit = vm.mem.fetch_permit();
         let mut failure = None;
-        let lifted = crate::lift::lift_block_watched(
+        let lifted = crate::lift::lift_block_context(
             &vm.mem,
             FetchAddr {
                 pa: physical,
@@ -522,6 +446,7 @@ fn resolve_direct_uncached(
             CpuMode::Real16,
             &mut failure,
             &source,
+            Some(context),
         );
         let mut ir = if let Ok(mut ir) = lifted {
             let mut code = vec![0; ir.guest_len as usize];
@@ -532,7 +457,6 @@ fn resolve_direct_uncached(
             let mut end = cpu.rip;
             let mut special = None;
             let mut strings = Vec::new();
-            let mut stacks = Vec::new();
             while decoder.can_decode() {
                 let position = decoder.position();
                 let insn = decoder.decode();
@@ -552,7 +476,7 @@ fn resolve_direct_uncached(
                 let reference =
                     crate::lift::legacy::instruction(reference_bytes, insn.ip() as u32, context);
                 let allowed = !insn.is_invalid()
-                    && shared_instruction(&insn, bytes)
+                    && shared_instruction(&insn)
                     && reference.as_ref().is_ok_and(|r| {
                         !r.ops.iter().any(|op| {
                             matches!(
@@ -576,15 +500,6 @@ fn resolve_direct_uncached(
                     })
                 }) {
                     strings.push((insn.ip(), op.clone()));
-                }
-                if matches!(
-                    insn.mnemonic(),
-                    iced_x86::Mnemonic::Push
-                        | iced_x86::Mnemonic::Pop
-                        | iced_x86::Mnemonic::Call
-                        | iced_x86::Mnemonic::Ret
-                ) {
-                    stacks.push(insn.ip());
                 }
                 count += 1;
                 end = insn.ip() + insn.len() as u64;
@@ -610,14 +525,6 @@ fn resolve_direct_uncached(
                 }
                 ir.guest_len = (end - cpu.rip) as u32;
                 ir.icount = count;
-                specialize_shared_stacks(&mut ir.ops, &stacks, context.generation);
-                for op in &mut ir.ops {
-                    if let IrOp::SegLimitCheck { vector, .. } = op {
-                        if context.generation == CpuGeneration::I286 {
-                            *vector = 13;
-                        }
-                    }
-                }
                 if !strings.is_empty() {
                     // Preserve the width-aware Machine string op. The generic
                     // walk uses its selector bases with the shared string engine;
@@ -640,8 +547,15 @@ fn resolve_direct_uncached(
                     }
                     ir.ops = ops;
                 }
-                ir.ops
-                    .push(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk));
+                // Opaque instructions retain the instruction helper walk's fault
+                // evidence and context handoff until the walks are unified.
+                if !ir.ops.iter().any(|op| {
+                    matches!(op,
+                    IrOp::Legacy(op) if crate::lift::legacy::shared_helper(op))
+                }) {
+                    ir.ops
+                        .push(IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk));
+                }
                 ir
             }
         } else {

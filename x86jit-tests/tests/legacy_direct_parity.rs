@@ -1127,3 +1127,82 @@ fn r6_scalar_rmw_limit_keeps_write_intent() {
         (b"\x66\x83\x06\xfe\xff\x01", 0xfffe, 4),
     ]);
 }
+
+#[test]
+fn unified_far_and_interrupt_frames_match_checked() {
+    // SDM Vol 2A §3.3 CALL/IRET and Vol 2B §4.3 RET;
+    // 80386 PRM §17.1.3 pp. 17-1–17-2: 66h widens each slot,
+    // while SP still wraps according to SS.B.
+    for (form, frame) in [
+        (&b"\x66\x9a\x00\x20\x00\x00\x00\x10"[..], &[0u32; 3][..]),
+        (&b"\x66\xcb"[..], &[0x2000, 0x1000, 2][..]),
+        (&b"\x66\xcf"[..], &[0x2000, 0x1000, 0x17002][..]),
+    ] {
+        for sp in [0, 0xffff, 0x8800] {
+            let results: Vec<_> = [true, false]
+                .into_iter()
+                .map(|checked| {
+                    let (vm, mut cpu) = setup(CpuModel::I80386, checked, 0x1000, form);
+                    cpu.cpu.gpr[4] = sp;
+                    if sp == 0x8800 {
+                        for (i, value) in frame.iter().enumerate() {
+                            vm.write_bytes(sp + i as u64 * 4, &value.to_le_bytes())
+                                .unwrap();
+                        }
+                    }
+                    run(&vm, &mut cpu, 1, false)
+                })
+                .collect();
+            assert_eq!(results[0], results[1], "{form:02x?} SP={sp:x}");
+        }
+    }
+}
+
+#[test]
+fn unified_enterd_device_display_keeps_restart_state() {
+    // SDM Vol 2A §3.3 ENTER; Vol 3A §§7.5–7.6: a faulting
+    // display read precedes architectural frame commit.
+    let results: Vec<_> = [true, false]
+        .into_iter()
+        .map(|checked| {
+            let (mut vm, mut cpu) =
+                setup(CpuModel::I80386, checked, 0x1000, b"\x66\xc8\x08\x00\x02");
+            vm.unmap(0x3000, 0x1000).unwrap();
+            vm.map(0x3000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+            cpu.cpu.gpr[4] = 0x8800;
+            cpu.cpu.gpr[5] = 0x3004;
+            let before = cpu.cpu.gpr;
+            let first = run(&vm, &mut cpu, 1, true);
+            assert_eq!((first.steps, first.retired), (0, 0));
+            assert_eq!(first.gpr, before);
+            assert_eq!(first.stop, Stop::Read(0x3000, 4));
+            cpu.complete_mmio_read(0x1234_5678);
+            let done = run(&vm, &mut cpu, 1, true);
+            assert_eq!((done.steps, done.retired), (1, 1));
+            assert_eq!((done.gpr[4], done.gpr[5]), (0x87ec, 0x87fc));
+            (first, done)
+        })
+        .collect();
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn unified_segment_pop_rechecks_a20_direct_bus_proof() {
+    // SDM Vol 2B §4.3 POP loads the selector before the following instruction.
+    // Decision-23 §5: that boundary must revalidate the Direct bus view.
+    let results: Vec<_> = [true, false]
+        .into_iter()
+        .map(|checked| {
+            let (mut vm, mut cpu) = setup(CpuModel::I80386, checked, 0x1000, b"\x1f\xa0\x10\x00");
+            vm.map(0x100000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x8800, &0xffffu16.to_le_bytes()).unwrap();
+            vm.write_bytes(0, &[0x11]).unwrap();
+            vm.write_bytes(0x100000, &[0x22]).unwrap();
+            cpu.set_a20_enabled(false);
+            let done = run(&vm, &mut cpu, 2, false);
+            assert_eq!((done.steps, done.retired, done.gpr[0] & 0xff), (2, 2, 0x11));
+            done
+        })
+        .collect();
+    assert_eq!(results[0], results[1]);
+}

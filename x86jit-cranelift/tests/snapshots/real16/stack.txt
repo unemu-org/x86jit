@@ -13,13 +13,13 @@ IrBlock {
             dst: 1,
             reg: Rsp,
         },
-        Sub {
+        Add {
             dst: 2,
             a: Temp(
                 1,
             ),
             b: Imm(
-                2,
+                18446744073709551614,
             ),
             size: 8,
             set_flags: FlagMask(
@@ -27,7 +27,7 @@ IrBlock {
             ),
         },
         And {
-            dst: 2,
+            dst: 3,
             a: Temp(
                 2,
             ),
@@ -39,42 +39,22 @@ IrBlock {
                 0,
             ),
         },
-        ReadReg {
-            dst: 3,
-            reg: Ss,
-        },
-        Shl {
-            dst: 4,
-            a: Temp(
-                3,
-            ),
-            b: Imm(
-                4,
-            ),
-            size: 8,
-            set_flags: FlagMask(
-                0,
-            ),
-        },
-        Add {
-            dst: 5,
-            a: Temp(
-                2,
-            ),
-            b: Temp(
-                4,
-            ),
-            size: 8,
-            set_flags: FlagMask(
-                0,
-            ),
-        },
+        Legacy(
+            DirectStackAddress {
+                dst: 4,
+                offset: Temp(
+                    3,
+                ),
+                bytes: 2,
+                vector: 13,
+            },
+        ),
         Store {
             fault: MemoryAccess(
                 10,
             ),
             addr: Temp(
-                5,
+                4,
             ),
             src: Temp(
                 0,
@@ -85,7 +65,7 @@ IrBlock {
         WriteReg {
             reg: Rsp,
             src: Temp(
-                2,
+                3,
             ),
             size: 2,
         },
@@ -93,53 +73,50 @@ IrBlock {
             guest_addr: 4097,
         },
         ReadReg {
-            dst: 6,
+            dst: 5,
             reg: Rsp,
         },
-        ReadReg {
-            dst: 7,
-            reg: Ss,
-        },
-        Shl {
-            dst: 8,
+        And {
+            dst: 6,
             a: Temp(
-                7,
+                5,
             ),
             b: Imm(
-                4,
+                65535,
             ),
             size: 8,
             set_flags: FlagMask(
                 0,
             ),
         },
-        Add {
-            dst: 9,
-            a: Temp(
-                6,
-            ),
-            b: Temp(
-                8,
-            ),
-            size: 8,
-            set_flags: FlagMask(
-                0,
-            ),
-        },
+        Legacy(
+            DirectStackAddress {
+                dst: 7,
+                offset: Temp(
+                    6,
+                ),
+                bytes: 2,
+                vector: 13,
+            },
+        ),
         Load {
             fault: MemoryAccess(
                 10,
             ),
-            dst: 10,
+            dst: 8,
             addr: Temp(
-                9,
+                7,
             ),
             size: 2,
         },
+        ReadReg {
+            dst: 9,
+            reg: Rsp,
+        },
         Add {
-            dst: 11,
+            dst: 10,
             a: Temp(
-                6,
+                9,
             ),
             b: Imm(
                 2,
@@ -152,7 +129,7 @@ IrBlock {
         And {
             dst: 11,
             a: Temp(
-                11,
+                10,
             ),
             b: Imm(
                 65535,
@@ -172,7 +149,7 @@ IrBlock {
         WriteReg {
             reg: Rbx,
             src: Temp(
-                10,
+                8,
             ),
             size: 2,
         },
@@ -183,13 +160,13 @@ IrBlock {
             dst: 12,
             reg: Rsp,
         },
-        Sub {
+        Add {
             dst: 13,
             a: Temp(
                 12,
             ),
             b: Imm(
-                2,
+                18446744073709551614,
             ),
             size: 8,
             set_flags: FlagMask(
@@ -197,7 +174,7 @@ IrBlock {
             ),
         },
         And {
-            dst: 13,
+            dst: 14,
             a: Temp(
                 13,
             ),
@@ -209,42 +186,22 @@ IrBlock {
                 0,
             ),
         },
-        ReadReg {
-            dst: 14,
-            reg: Ss,
-        },
-        Shl {
-            dst: 15,
-            a: Temp(
-                14,
-            ),
-            b: Imm(
-                4,
-            ),
-            size: 8,
-            set_flags: FlagMask(
-                0,
-            ),
-        },
-        Add {
-            dst: 16,
-            a: Temp(
-                13,
-            ),
-            b: Temp(
-                15,
-            ),
-            size: 8,
-            set_flags: FlagMask(
-                0,
-            ),
-        },
+        Legacy(
+            DirectStackAddress {
+                dst: 15,
+                offset: Temp(
+                    14,
+                ),
+                bytes: 2,
+                vector: 13,
+            },
+        ),
         Store {
             fault: MemoryAccess(
-                0,
+                10,
             ),
             addr: Temp(
-                16,
+                15,
             ),
             src: Imm(
                 4101,
@@ -255,7 +212,7 @@ IrBlock {
         WriteReg {
             reg: Rsp,
             src: Temp(
-                13,
+                14,
             ),
             size: 2,
         },
@@ -265,7 +222,7 @@ IrBlock {
             ),
         },
     ],
-    temp_count: 17,
+    temp_count: 16,
     guest_len: 5,
     icount: 3,
 }

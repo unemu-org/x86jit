@@ -635,7 +635,7 @@ mod tests {
 }
 
 /// Interpreter-only operations (decision-18 §§1, 3–4). Widths are bytes;
-/// address widths are bits. Application lifting never emits these operations.
+/// address widths are bits. The Real16 compatibility alias shares the width-aware forms.
 #[derive(Clone, Debug)]
 pub enum LegacyOp {
     /// A Direct block using the shared Real16 walk.
@@ -692,6 +692,8 @@ pub enum LegacyOp {
     Loop {
         kind: crate::ir::LoopKind,
         count_bits: u8,
+        /// Direct constant targets within FFFFh need no runtime CS check.
+        check_target: bool,
         taken: u32,
         next: u32,
     },

@@ -195,54 +195,46 @@ fn exit_image(stop: &StepStop) -> String {
     }
 }
 
-// Application conflicts require independent architectural expectations below.
-// These are exact encoding forms, never mnemonic-wide exclusions.
-fn application_conflict(code: Code, mmio: bool) -> Option<&'static str> {
+// U3 has no operand-size conflicts. Model-dependent flag images are asserted below.
+fn application_conflict(_code: Code, _mmio: bool) -> Option<&'static str> {
+    None
+}
+
+fn operand_size_witness(code: Code, mmio: bool) -> bool {
     use Code::*;
-    Some(match code {
-        // Application pushes/pops a word for these 66h segment forms. Legacy
-        // transfers a dword stack slot. SDM Vol 2B §4.3 PUSH/POP;
-        // 80386 PRM §17 PUSH/POP.
-        Pushd_ES | Popd_ES | Pushd_CS | Pushd_SS | Popd_SS | Pushd_DS | Popd_DS =>
-            "Application uses a word segment stack slot; legacy correctly uses a dword",
-        // Application's Real16 immediate-push arm chooses a word from decode
-        // mode. Legacy honors the operand-size override. Same PUSH citations.
-        Pushd_imm32 => "Application pushes imm16; legacy correctly pushes imm32",
-        // Application models only Flags here and drops IOPL/NT. Legacy restores
-        // the I386 real-mode FLAGS image. SDM Vol 1 §3.4.3.3; Vol 2B §4.3 POPF;
-        // Vol 2A §3.3 IRET; 80386 PRM §17 POPF/IRET.
-        Popfw | Iretw => "Application drops IOPL/NT; legacy correctly restores them",
-        // Application's Real16 return helper always reads word slots. Legacy
-        // pops dword IP/selector slots with 66h. SDM Vol 2B §4.3 RET;
-        // 80386 PRM §17 RET.
-        Retnd_imm16 | Retnd | Retfd_imm16 | Retfd =>
-            "Application pops word return slots; legacy correctly pops dword slots",
-        // Application always loads a 16:16 pointer; legacy honors m16:32.
-        // SDM Vol 2A §3.3 LDS/LES/LFS/LGS/LSS; 80386 PRM §17.
-        Les_r32_m1632 | Lds_r32_m1632 =>
-            "Application loads a 16:16 pointer; legacy correctly loads 16:32",
-        // Application's implicit-frame helpers always use BP/word values.
-        // Legacy honors operand size independently of SS.B. SDM Vol 1 §6.2.3;
-        // Vol 2A §3.3 ENTER/LEAVE; 80386 PRM §17 ENTER/LEAVE.
-        // Application commits PUSH BP before an MMIO display read faults;
-        // legacy preflights the frame. SDM Vol 3A §§7.5–7.6 (fault restart).
-        Enterw_imm16_imm8 if mmio =>
-            "Application partially pushes the frame on MMIO; legacy correctly preserves restart state",
-        Enterd_imm16_imm8 | Leaved =>
-            "Application uses word frame values; legacy correctly uses dwords",
-        // Application decrements CX and preserves high GPR bits even with 67h.
-        // Legacy uses ECX, including zero-extending its write. SDM Vol 2A §3.3
-        // LOOP/LOOPcc; 80386 PRM §17 LOOP.
-        Loopne_rel8_16_ECX | Loopne_rel8_32_ECX | Loope_rel8_16_ECX
-        | Loope_rel8_32_ECX | Loop_rel8_16_ECX | Loop_rel8_32_ECX =>
-            "Application decrements CX; legacy correctly decrements ECX",
-        // Application truncates the target to 16 bits and CALL pushes a word.
-        // Legacy honors the 32-bit target and CALL return slot. SDM Vol 2A §3.3
-        // CALL/JMP; 80386 PRM §17 CALL/JMP.
-        Call_rel32_32 | Call_rm32 | Jmp_rm32 =>
-            "Application truncates targets/return slots; legacy correctly uses 32 bits",
-        _ => return None,
-    })
+    // SDM Vol 2B §4.3 PUSH/POP/POPF/RET; Vol 2A §3.3 CALL/JMP,
+    // ENTER/LEAVE, LDS/LES and LOOP. 80386 PRM §§17.1.2–17.1.3,
+    // pp. 17-1–17-2: operand and stack/address sizes are independent.
+    matches!(
+        code,
+        Pushd_ES
+            | Popd_ES
+            | Pushd_CS
+            | Pushd_SS
+            | Popd_SS
+            | Pushd_DS
+            | Popd_DS
+            | Pushd_imm32
+            | Popfw
+            | Iretw
+            | Retnd_imm16
+            | Retnd
+            | Retfd_imm16
+            | Retfd
+            | Les_r32_m1632
+            | Lds_r32_m1632
+            | Enterd_imm16_imm8
+            | Leaved
+            | Loopne_rel8_16_ECX
+            | Loopne_rel8_32_ECX
+            | Loope_rel8_16_ECX
+            | Loope_rel8_32_ECX
+            | Loop_rel8_16_ECX
+            | Loop_rel8_32_ECX
+            | Call_rel32_32
+            | Call_rm32
+            | Jmp_rm32
+    ) || (code == Enterw_imm16_imm8 && mmio)
 }
 
 fn i286_empty_output(code: Code) -> bool {
@@ -275,7 +267,7 @@ fn i286_empty_output(code: Code) -> bool {
     )
 }
 
-// Reference only the documented conflict's instruction, starting from the seeded
+// Reference the instruction directly from the manuals, starting from the seeded
 // input. No legacy output or execution helper supplies an expected value. The
 // caller still compares the complete state image, memory, exit and step count.
 fn conflict_expectation(
@@ -341,7 +333,11 @@ fn conflict_expectation(
                 }
                 next_sp = sp + 4;
             }
-            // SDM Vol 1 §3.4.3.3; Vol 2B §4.3 POPF; Vol 2A §3.3 IRET.
+            // 80286 PRM Appendix B POPF p. B-86 (real mode leaves NT/IOPL
+            // unchanged); §5.3 Table 5-3 p. 5-7 resets FLAGS to 0002h.
+            // The compatibility personality keeps this 286 real FLAGS image.
+            // 80386 PRM §17 POPF p. 17-130; SDM Vol 3B §25.17.2:
+            // I386 instead restores bits 14:12 from the supplied image.
             Popfw | Iretw => {
                 let iret = insn.code() == Iretw;
                 let flags = read(&memory, sp + if iret { 4 } else { 0 }, 2)?;
@@ -519,9 +515,12 @@ fn application_real16_forms_have_legacy_parity() {
                         vm.map(0x4000, 0x1000, Prot::RWX, RegionKind::Trap).unwrap();
                     }
                 }
-                let expected = application_conflict(*code, mmio).map(|reason| {
-                    architectural.insert(format!("{code:?} {bytes:02x?}: {reason}"));
-                    conflict_expectation(&a, &ac, &insn, generation, mmio)
+                assert_eq!(application_conflict(*code, mmio), None);
+                let expected = operand_size_witness(*code, mmio).then(|| {
+                    architectural.insert(format!("{code:?} {bytes:02x?}"));
+                    let alias = conflict_expectation(&a, &ac, &insn, CpuGeneration::I286, mmio);
+                    let machine = conflict_expectation(&b, &bc, &insn, generation, mmio);
+                    (alias, machine)
                 });
                 let empty_output =
                     (generation == CpuGeneration::I286 && absent && i286_empty_output(*code))
@@ -579,7 +578,34 @@ fn application_real16_forms_have_legacy_parity() {
                     );
                     continue;
                 }
-                if let Some((state, memory, stop, steps)) = expected {
+                if let Some((alias, (state, memory, stop, steps))) = expected {
+                    let (mut alias_state, mut alias_memory, mut alias_stop, mut alias_steps) =
+                        alias;
+                    if let StepStop::Exit(Exit::Exception { vector, .. }) = &alias_stop {
+                        // Decision-16: delivery costs no step; the handler's HLT does.
+                        let sp = (alias_state.gpr[4] as u16).wrapping_sub(6);
+                        for (offset, word) in [
+                            (0, alias_state.rip as u16),
+                            (2, alias_state.cs),
+                            (4, alias_state.flags.to_flags16()),
+                        ] {
+                            alias_memory[usize::from(sp) + offset..usize::from(sp) + offset + 2]
+                                .copy_from_slice(&word.to_le_bytes());
+                        }
+                        alias_state.gpr[4] = (alias_state.gpr[4] & !0xffff) | u64::from(sp);
+                        alias_state.flags.if_ = false;
+                        alias_state.cs = 0;
+                        alias_state.rip = 0x1801 + u64::from(*vector) * 4;
+                        alias_stop = StepStop::Exit(Exit::Hlt);
+                        alias_steps = 1;
+                    }
+                    if state_image(&alias_state) != image(&ac)
+                        || alias_memory != memory_image(&a)
+                        || exit_image(&alias_stop) != exit_image(ar.stop())
+                        || alias_steps != ar.steps()
+                    {
+                        gaps.push(format!("{generation:?} {code:?} {bytes:02x?} seed={seed:x} mmio={mmio}: alias architectural expectation {alias_steps} {alias_stop:?}, got {ar:?}\nEXPECTED {}\nAPP {}", state_image(&alias_state), image(&ac)));
+                    }
                     if state_image(&state) != image(&bc)
                         || memory != memory_image(&b)
                         || exit_image(&stop) != exit_image(br.stop())
@@ -1680,4 +1706,136 @@ fn application_ignores_tf_while_legacy_delays_until_the_successor() {
         assert_eq!(bc.cpu.rflags_system & 0x100, 0);
         assert_eq!(&memory_image(&b)[0x7ffc..0x8002], &[2, 0x10, 0, 0, 2, 1]);
     }
+}
+
+#[test]
+fn alias_enter_device_display_restarts_before_committing_frame() {
+    // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3; Vol 3A §§7.5–7.6.
+    // 80386 PRM §17 ENTER pp. 17-58–17-59: word/dword frame values
+    // are independent of the stack-address attribute.
+    for (code, size) in [
+        (&b"\xc8\x08\x00\x02"[..], 2u8),
+        (&b"\x66\xc8\x08\x00\x02"[..], 4),
+    ] {
+        let (mut vm, mut cpu) = setup(code, None, 0x123456789abcdef);
+        vm.unmap(0x4000, 0x1000).unwrap();
+        vm.map(0x4000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.gpr[5] = 0x4000 + u64::from(size);
+        let initial = cpu.cpu.gpr;
+        let mut before = [0; 16];
+        vm.read_bytes(0x7ff0, &mut before).unwrap();
+        let first = run_form(&vm, &mut cpu, code);
+        assert!(
+            matches!(first.stop(), StepStop::Exit(Exit::MmioRead { addr: 0x4000, size: actual, .. }) if *actual == size)
+        );
+        assert_eq!((first.steps(), cpu.retired_instructions()), (0, 0));
+        assert_eq!(cpu.cpu.gpr, initial);
+        let mut after = [0; 16];
+        vm.read_bytes(0x7ff0, &mut after).unwrap();
+        assert_eq!(after, before);
+        cpu.complete_mmio_read(0x1234_5678);
+        let done = run_form(&vm, &mut cpu, code);
+        assert!(matches!(done.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert_eq!((done.steps(), cpu.retired_instructions()), (1, 1));
+        assert_eq!(cpu.cpu.gpr[4], 0x8000 - 3 * u64::from(size) - 8);
+        assert_eq!(cpu.cpu.gpr[5], 0x8000 - u64::from(size));
+    }
+}
+
+#[test]
+fn alias_flags_image_uses_286_and_machine_images_follow_the_model() {
+    // 80286 PRM Appendix B POPF p. B-86; §5.3 Table 5-3 p. 5-7:
+    // real mode retains IOPL/NT from the reset FLAGS image 0002h.
+    // SDM Vol 3B §25.17.2; Vol 2A §3.3 IRET, Vol 2B §4.3 POPF.
+    for (code, size, iret) in [(&b"\x9d"[..], 2u8, false), (&b"\xcf"[..], 2, true)] {
+        for generation in [None, Some(CpuGeneration::I286), Some(CpuGeneration::I386)] {
+            let (vm, mut cpu) = setup(code, generation, 0x123456789abcdef);
+            for (i, value) in if iret {
+                vec![0x2000u32, 0, 0x7002]
+            } else {
+                vec![0x7002]
+            }
+            .into_iter()
+            .enumerate()
+            {
+                vm.write_bytes(
+                    0x8000 + i as u64 * u64::from(size),
+                    &value.to_le_bytes()[..usize::from(size)],
+                )
+                .unwrap();
+            }
+            let done = run_form(&vm, &mut cpu, code);
+            assert!(
+                matches!(done.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                "{generation:?} {code:02x?}: {done:?}"
+            );
+            assert_eq!(
+                cpu.cpu.rflags_system & 0x7000,
+                if generation == Some(CpuGeneration::I386) {
+                    0x7000
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                cpu.cpu.gpr[4],
+                0x8000 + u64::from(size) * if iret { 3 } else { 1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn alias_far_frame_uses_selector_base_without_a20_or_retained_caches() {
+    // 80286 PRM §5.1 pp. 5-1–5-2: a real segment base is selector << 4.
+    // Decision-23 §6: the compatibility alias ignores A20 and retained caches.
+    let mut vm = Vm::with_backend(VmConfig::flat(0x110000), Box::new(Interpreter));
+    vm.set_cpu_mode(CpuMode::Real16);
+    vm.map(0, 0x110000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, b"\x9a\x00\x20\x00\x10").unwrap();
+    vm.write_bytes(0x2c, &[0xaa; 4]).unwrap();
+    vm.write_bytes(0x10002c, &[0xcc; 4]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.ss = 0xffff;
+    cpu.cpu.gpr[4] = 0x40;
+    let hidden = cpu.cpu.legacy;
+    assert_eq!(hidden.a20_enabled, 0);
+    let done = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    assert!(matches!(done.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert_eq!((done.steps(), cpu.retired_instructions()), (1, 1));
+    assert_eq!(
+        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+        (0x1000, 0x2000, 0x3c)
+    );
+    assert_eq!(cpu.cpu.legacy, hidden);
+    let mut low = [0; 4];
+    let mut high = [0; 4];
+    vm.read_bytes(0x2c, &mut low).unwrap();
+    vm.read_bytes(0x10002c, &mut high).unwrap();
+    assert_eq!(low, [0xaa; 4]);
+    assert_eq!(high, [0x05, 0x10, 0, 0]);
+}
+
+#[test]
+fn alias_flag_stack_write_invalidates_decoded_successors() {
+    // SDM Vol 2B §4.3 PUSHF: the image is 0002h with all writable flags clear.
+    // Preserve the existing VM SMC guard when the stack overwrites later code.
+    let mut vm = Vm::with_backend(VmConfig::flat(0x10000), Box::new(Interpreter));
+    vm.set_cpu_mode(CpuMode::Real16);
+    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1000, b"\x9c\x40\x40\xf4").unwrap();
+    vm.write_bytes(0x3000, &[5]).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.gpr[3] = 0x3000;
+    cpu.cpu.gpr[4] = 0x1003;
+    cpu.cpu.flags.set_flags16(2);
+    let done = cpu.run_steps(&vm, 8, StepOptions::default()).unwrap();
+    assert!(matches!(done.stop(), StepStop::Exit(Exit::Hlt)));
+    assert_eq!(
+        (done.steps(), cpu.retired_instructions(), cpu.cpu.gpr[0]),
+        (3, 3, 5)
+    );
 }

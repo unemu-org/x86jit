@@ -9,13 +9,15 @@ IrBlock {
             dst: 0,
             reg: Rax,
         },
-        WriteReg {
-            reg: Ds,
-            src: Temp(
-                0,
-            ),
-            size: 2,
-        },
+        Legacy(
+            LoadSegment {
+                segment: Ds,
+                value: Temp(
+                    0,
+                ),
+                inhibit: false,
+            },
+        ),
         InsnStart {
             guest_addr: 4098,
         },
@@ -23,14 +25,15 @@ IrBlock {
             dst: 1,
             reg: Rax,
         },
-        WriteReg {
-            reg: Ss,
-            src: Temp(
-                1,
-            ),
-            size: 2,
-        },
-        SetSsShadow,
+        Legacy(
+            LoadSegment {
+                segment: Ss,
+                value: Temp(
+                    1,
+                ),
+                inhibit: true,
+            },
+        ),
         InsnStart {
             guest_addr: 4100,
         },
@@ -52,6 +55,7 @@ IrBlock {
             ),
         },
         SegLimitCheck {
+            alias_low16: true,
             offset: Temp(
                 3,
             ),

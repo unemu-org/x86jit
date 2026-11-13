@@ -756,20 +756,18 @@ pub(crate) fn exec_loop_cx(
     taken: &u64,
     fallthrough: &u64,
 ) -> InterpResult {
-    let take = match kind {
-        LoopKind::Jcxz => (cpu.gpr[RCX] as u16) == 0,
-        _ => {
-            let cx = (cpu.gpr[RCX] as u16).wrapping_sub(1);
-            cpu.gpr[RCX] = (cpu.gpr[RCX] & !0xFFFF) | cx as u64;
-            match kind {
-                LoopKind::Loop => cx != 0,
-                LoopKind::Loope => cx != 0 && cpu.flags.zf,
-                LoopKind::Loopne => cx != 0 && !cpu.flags.zf,
-                LoopKind::Jcxz => unreachable!(),
-            }
-        }
-    };
-    cpu.rip = if take { *taken } else { *fallthrough };
+    // The compact Direct form has a lift-time-proven target and CX width.
+    // Machine and the alias share the same width-aware count/branch algorithm.
+    super::legacy::execute_loop(
+        cpu,
+        crate::lift::legacy::alias_context(),
+        *kind,
+        16,
+        false,
+        *taken as u32,
+        *fallthrough as u32,
+    )
+    .expect("Direct loop target was proven by lowering");
     InterpResult::Continue
 }
 

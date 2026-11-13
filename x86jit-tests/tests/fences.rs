@@ -420,11 +420,13 @@ fn serializing_instructions_lift_with_a_full_fence() {
                 );
                 continue;
             }
+            // Real16 IRET lowers to the width-aware legacy helpers; the fence
+            // precedes the first of them (the task-return check).
             let position = ir
                 .ops
                 .iter()
-                .position(|op| matches!(op, IrOp::Cpuid | IrOp::IretReal))
-                .unwrap();
+                .position(|op| matches!(op, IrOp::Cpuid | IrOp::IretReal | IrOp::Legacy(_)))
+                .unwrap_or_else(|| panic!("{mode:?}/{bytes:x?}: {ir:?}"));
             assert!(matches!(
                 ir.ops[position - 1],
                 IrOp::Fence {

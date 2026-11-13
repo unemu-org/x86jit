@@ -40,6 +40,7 @@ IrBlock {
             ),
         },
         SegLimitCheck {
+            alias_low16: true,
             offset: Temp(
                 3,
             ),
@@ -102,6 +103,7 @@ IrBlock {
             reg: Rax,
         },
         SegLimitCheck {
+            alias_low16: true,
             offset: Imm(
                 8192,
             ),

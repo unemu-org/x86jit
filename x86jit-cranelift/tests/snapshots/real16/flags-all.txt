@@ -5,19 +5,39 @@ IrBlock {
         InsnStart {
             guest_addr: 4096,
         },
-        PushfReal,
+        Legacy(
+            Flags {
+                size: 2,
+                pop: false,
+            },
+        ),
         InsnStart {
             guest_addr: 4097,
         },
-        PopfReal,
+        Legacy(
+            Flags {
+                size: 2,
+                pop: true,
+            },
+        ),
         InsnStart {
             guest_addr: 4098,
         },
-        PushaReal,
+        Legacy(
+            All {
+                size: 2,
+                pop: false,
+            },
+        ),
         InsnStart {
             guest_addr: 4099,
         },
-        PopaReal,
+        Legacy(
+            All {
+                size: 2,
+                pop: true,
+            },
+        ),
         InsnStart {
             guest_addr: 4100,
         },

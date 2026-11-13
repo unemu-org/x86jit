@@ -1471,8 +1471,8 @@ fn application_real16_delivery_ignores_all_legacy_table_and_control_storage() {
 
 #[test]
 fn application_real16_ir_matches_frozen_parent_snapshots() {
-    // Measured at parent 9958575 with the same Rust 1.95 toolchain. Real16
-    // never materializes; compare its actual application IR, including metadata.
+    // Decision-23 Consequences: freeze the unified compatibility lowering,
+    // including memory metadata. Real16 never enters a compiling backend.
     let mut snapshot = String::new();
     for (name, code) in [
         ("alu", &b"\x01\xd8\x46\x31\xc2\x75\xfa"[..]),

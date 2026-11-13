@@ -5,15 +5,22 @@ IrBlock {
         InsnStart {
             guest_addr: 4096,
         },
-        FarCall {
-            cs: Imm(
-                256,
-            ),
-            ip: Imm(
-                8192,
-            ),
-            ret_ip: 4101,
-        },
+        Legacy(
+            Transfer {
+                cs: Some(
+                    Imm(
+                        256,
+                    ),
+                ),
+                ip: Imm(
+                    8192,
+                ),
+                size: 2,
+                return_ip: Some(
+                    4101,
+                ),
+            },
+        ),
     ],
     temp_count: 0,
     guest_len: 5,

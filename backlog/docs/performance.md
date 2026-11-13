@@ -426,3 +426,273 @@ Nextest used one test process at a time and a 180-second command deadline.
 All-targets/all-features clippy with `-D warnings`, fmt and whitespace checks pass.
 No commits, bead operations or pushes were performed. Raw measurement files remain
 outside the repository; these tables are the retained performance record.
+
+
+## Unified lowering (decision-23 U3)
+
+### Design and scope — READ
+
+`lift/legacy.rs` supplies one lowering for alias Real16 and Machine 16/32-bit stack, control,
+flag-image, frame, far-pointer, segment-register, BOUND and XLAT instructions. Operand size comes
+from the instruction; address and stack sizes come from the context. Scalar stack/near transfers
+emit scalar IR; frame and segment operations use shared sized helper IR. Direct addresses inline
+selector bases and constant limit/vector rules; Checked uses retained segment checks. Machine
+applies A20 through its existing route; the alias ignores A20 and caches. Its helper adapter
+supplies the frozen context and restores inert retained state.
+
+Retired: `lift_call_real16`, `lift_ret_real16`, `lift_far_jmp_real16`, `lift_far_call_real16`,
+`lift_retf_real16`, `lift_loop_real16`, `lift_load_far_ptr_real16`, `lift_leave_real16`,
+`lift_bound_real16`, `lift_xlat_real16`, `lift_mov_sreg_real16`, the Real16 stack/flag/frame match
+arms, and `specialize_shared_stacks`. Ordinary `lift_push`/`lift_pop` still serve Long64/Compat32.
+Existing legacy helpers serve both profiles. Compact `LoopCx` is shared by Direct paths with a
+statically word-sized count and an in-limit target; compact and general handlers call the same
+width-aware algorithm. The alias's accepted forms and block boundaries remain; dispatchers and walks
+are separate. Opaque helpers keep the Machine walk for evidence/context handoff.
+
+The prefix, segment-push, far-branch and indirect CALL/JMP exclusions are gone. Remaining
+`shared_instruction` restrictions have these model facts:
+
+| Restriction | Model fact |
+|---|---|
+| More than ten instruction bytes | Alias keeps the 286 limit; I386 allows fifteen (80286 PRM App. C item 10 p. C-2; 80386 PRM §14.7 item 6 p. 14-6). |
+| Sequential end at 10000h | Alias wraps IP; Machine checks EIP against CS (80386 PRM §14.7 item 8 p. 14-6). |
+| MOV CR/DR/TR | Frozen alias has no system-register personality. |
+| Dword Jcc | Alias keeps conditional-branch IP truncation; Machine checks full EIP (SDM Vol 2A §3.3 Jcc); outside these families. |
+| String source FS/GS or SS | Alias lacks ordinary-string FS/GS selection and keeps the 286 #GP limit rule; I386 distinguishes #SS (80386 PRM §14.7 item 7 p. 14-6). |
+
+The family allowlist still excludes system/numeric dispatch outside the shared scalar/string/unified
+families. No unified family retains a mnemonic exclusion.
+
+### Alias policy and witnesses — READ / MEASURED
+
+Decision-23 §6 freezes the superset decoder, ten-byte limit, selector bases, MOV CS #UD,
+word-at-FFFFh faults, in-guest delivery, no A20 and the 286 real FLAGS image. POPF/IRET clear
+IOPL/NT on the alias; I386 restores its documented image (80286 PRM App. B POPF p. B-86, §5.3 Table
+5-3 p. 5-7; 80386 PRM §17 POPF p. 17-130; SDM Vol 3B §25.17.2). These are model expectations, not
+conflicts.
+
+The §6 amendment accepts manual behavior within the unified families: the xj-5t9 operand-size forms;
+XLAT address size and FS/GS overrides; SP wrap and whole-operand limits; POP using SP with high ESP
+bits retained; whole far-frame preflight and deferred CALL/IRET commits; POPA skipping its discarded
+SP slot. Word LDS/LES and BOUND with a 67h memory operand now check the **full offset** against the
+alias limit, because they belong to the unified families. I286 Machine still rejects unavailable
+operand-size forms; I386 is unchanged. The alias still exits on LSS/LFS/LGS and PUSHAD/POPAD through
+its accepted-form boundary; Machine I386 executes them. Stack-limit faults use vector 13 on I286
+real mode/alias and 12 on I386; protected stack violations use #SS(0). Direct witnesses in
+`legacy_u3_review` cite SDM Vol 2A §3.3, Vol 2B §4.3, 80386 PRM §§9.1, 17.1.3, and 80286 PRM App. B
+POPA p. B-85.
+
+Outside the unified families, `SegLimitCheck::alias_low16` names the frozen ordinary-data quirk:
+only the limit gate masks to 16 bits; the load/store keeps its full linear address. The single
+interpreter policy point cites §6 and is consulted only when the full-offset gate fails.
+Machine/unified gates use full offsets. Ordinary FS/GS MOVs retain the parent selection behavior.
+
+`application_conflict` always returns `None`; the parity allowlist is empty. Independent
+`conflict_expectation` values check both paths for segment pushes/pops, immediate dword PUSH,
+near/far dword returns, dword LDS/LES, ENTERD/LEAVED, ECX LOOPcc, dword relative/indirect CALL and
+indirect JMP (SDM Vol 2A §3.3, Vol 2B §4.3; 80386 PRM §§17.1.2–17.1.3 pp. 17-1–17-2).
+Direct/forced-Checked parity covers these widths, SP=0/FFFFh, far frames, ENTER/LEAVE and device
+reads; focused witnesses check cache/A20 independence, FLAGS, self-modification, normalized IR and
+raw-proof revalidation.
+
+The parent-compatibility table has **18 cases** with fixed GPRs, FLAGS, selectors, IP, memory, steps
+and retirements: ordinary 66h/67h ALU/MOV/string forms, segment overrides, and conventional
+PUSH/POP/LEAVE/PUSHF. Expectations are hand-evaluated from `24a97d0`'s `lower_read`, `with_segment`,
+scalar ALU/register writes, `exec_rep_string_real` and stack handlers, independently of current-path
+parity. The 67h moffs row is `67 A1 00 00 01 00`, DS=0, with 1234h at linear 10000h: parent
+`effective_address_no_segment` keeps disp32=10000h, `SegLimitCheck` tests `(10000h & FFFFh)+2`, the
+load reads linear 10000h, and AX becomes 1234h while upper EAX is preserved. These expectations
+describe parent compatibility.
+
+### Restart snapshots and fault evidence — READ / MEASURED
+
+Unified scalar alias reads use the Machine ledger in retry-specialized walks; ordinary alias loads
+keep their completion policy. LDS/LES, POP-to-memory and multi-read frame helpers retain each
+answered transfer until one retirement. POPA/POPAD and PUSHA/PUSHAD preflight the complete frame
+before any device access. ENTER stages display values before frame writes and retains completed
+RAM/device displays across retries; completion clears snapshots even at the same IP.
+
+Between an MMIO exit and resume, edits preserving ENTER's architectural inputs at their read
+widths retain the attempt so no acknowledged transfer repeats; changing an input restarts ENTER.
+BP/EBP is read at operand size for the initial push and, only when nesting reads displays, at stack
+size for addressing; identity uses the wider applicable width. SP/ESP is read at stack size for
+addressing and operand size for FrameTemp, so identity uses the wider width (SDM Vol 2A §3.3 ENTER).
+Effective SS base/limit are 32-bit values (Direct uses selector<<4 and FFFFh); SS.B selects 16/32-bit
+stack size. The effective limit rule and Checked read/write permissions participate as used. Identity
+also includes operand size, the effective A20 boolean (always enabled for alias helpers), allocation
+imm16, and nesting imm8 modulo 32. Unread GPR/segment bits do not participate. CS:IP owns the ledger.
+
+Two identity slots retain these values exactly, without hashing. They become the first two completed
+display snapshots; identity remains in unused key/high-value bits. Each snapshot retains its ordinal,
+value and device-answer byte boundaries. The retained BP/EBP, SS base, stack size and operand size
+determine its address. Before collection, an identity mismatch abandons all snapshots, raw answers,
+frame acknowledgements and pending completions. The earlier exit owns its device evidence. This
+also covers incomplete displays and attempts with no display reads. FrameTemp behavior is unchanged.
+
+The fault-only helper-ledger projection strips visits/write tags, suppresses internal identities and
+snapshots, and expands display provenance into the original bus-address/value pairs. Its shared-walk
+caller selects actual legacy helper IR; ordinary scalar/vector instructions export their original
+ledger keys, including alias linear addresses above FFFFFFFFh. Its dedicated legacy instruction-walk
+caller projects that walk's helper keys after either scalar or opaque fault analysis. Witnesses cover
+alias, Machine Direct and Checked ENTER, far CALL/RET, IRET, POPA, LDS and BOUND faults, plus ordinary
+MOVDQU with an acknowledged read at 1_0000_0000h. Non-ENTER helper faults now report completed
+device reads, where the parent reported none.
+
+Only the current attempt is retained. Before two displays complete, two identity slots plus at most
+four byte answers need six slots. Later collection peaks at 29 snapshots plus four answers (**33**).
+Zero/one-display attempts retain two identities and at most four write parts (six). Otherwise the two
+identity slots are already among the 30 snapshots; 32 frame writes, or 33 when one crosses an
+A20/32-bit bus boundary, give **63 of 64** slots. No phase reaches the ledger's release overflow drop.
+Maximum-nesting witnesses, including abandoned attempts, run in debug and release. Other witnesses
+cover overlapping EBP edits, ignored upper register bits, ESP FrameTemp edits, word/dword stacks,
+SS limit/allocation edits, BP/SP/SS/A20 edits, device-page splits, and 65 frame-only input edits.
+Only ENTER executes identity checks and snapshot collection/lookup; projection runs on faults.
+
+### Snapshot changes — MEASURED
+
+| Fixture (backend paths under `x86jit-cranelift/tests/snapshots/real16/`) | Final change |
+|---|---|
+| `stack.txt` | Shared scalar stack/near-CALL IR, sized selectors, constant stack checks. |
+| `far-call.txt` | Shared sized far-transfer helper. |
+| `flags-all.txt` | Sized FLAGS/all-register helpers, original block boundaries. |
+| `segments.txt` | Shared segment-load helper and ordinary `alias_low16: true` gates. |
+| `memory.txt`, `sizes.txt`, `prefix-combination.txt` | Explicit `alias_low16: true` on ordinary data gates. |
+| `x86jit-tests/tests/fixtures/real16_parent_ir.snap` | Stack entry uses shared lowering. |
+
+The other two Real16 backend fixtures are unchanged. All 27 parent/candidate Long64/Compat32
+block/region IR captures match byte for byte; Application codegen also matches 27 relocated fixtures
+and four fixed byte sequences. No Application fixture or backend source changes. This evidence
+repair changes no IR fixtures.
+
+### Performance — MEASURED
+
+Release builds use matching Rust 1.98.1 compiler stamps, the supplied SDK and empty Rust flags.
+Commands use `taskpolicy -c background`, one benchmark at a time, without own builds/tests
+alongside. The alias recheck uses divisor 1 and three serial warmed invocations per loop: 45 samples
+per binary. Each invocation stops after its completed alias sample; all counts and medians are
+verified. No steady loop executes ENTER, so this gate does not measure ENTER's path cost. Wall uses
+five interleaved warmed alias `dos-mixed` pairs: 1,000,000 warmup steps, 8,000,000 measured steps
+and 7,338,677 retirements each.
+
+Parent 24a97d0 SHA-256: `e0a59b1032535cea89ba47a1f1a52b2ab25e449ff7dcf21fe7806ccad06ce2d4`.
+
+Alias candidate SHA-256: `18a0791e00bbbf78728d859fee876132b1eb1eee63b2a4c4af24c384b36838ea`.
+The exact-input/projection recheck refreshes the alias instruction table: 14 of 15 candidate ranges
+no longer overlap the prior samples.
+
+Host instructions per guest step, median [min–max]; alias against parent:
+
+| Loop | Parent alias | Candidate alias | Change | +0.5% gate |
+|---|---:|---:|---:|---|
+| alu | 397.772 [397.750–397.790] | 395.510 [395.495–395.561] | -0.5687% | Passed |
+| load | 522.032 [522.000–522.033] | 519.409 [519.370–519.420] | -0.5025% | Passed |
+| load-odd | 533.096 [533.025–533.097] | 530.328 [530.314–530.352] | -0.5192% | Passed |
+| store | 485.312 [485.300–485.353] | 482.673 [482.660–482.887] | -0.5438% | Passed |
+| push-pop | 550.627 [550.577–550.627] | 531.076 [530.858–531.275] | -3.5507% | Passed |
+| data-next-to-code | 1056.042 [1056.013–1056.089] | 1054.686 [1054.401–1054.910] | -0.1284% | Passed |
+| data-next-to-dense-code | 1056.056 [1056.048–1056.102] | 1054.891 [1054.708–1054.985] | -0.1103% | Passed |
+| call-ret | 1024.098 [1024.023–1024.132] | 991.610 [991.478–991.754] | -3.1724% | Passed |
+| dos-mixed | 492.756 [492.741–492.772] | 482.555 [482.306–482.685] | -2.0702% | Passed |
+| rep-movsw | 188.187 [188.184–188.196] | 188.446 [188.418–188.452] | +0.1376% | Passed |
+| straight-line | 410.776 [410.716–410.779] | 411.650 [411.559–411.905] | +0.2128% | Passed |
+| ip-boundary-1 | 2556.230 [2555.898–2559.095] | 2544.766 [2542.580–2552.595] | -0.4485% | Passed |
+| ip-boundary-64 | 411.013 [410.923–411.166] | 406.456 [406.441–406.744] | -1.1087% | Passed |
+| smc-next-1 | 11117.767 [11116.965–11121.948] | 11160.256 [11154.196–11172.140] | +0.3822% | Passed |
+| smc-next-64 | 9124.591 [9124.001–9136.586] | 9160.564 [9157.768–9172.087] | +0.3942% | Passed |
+
+The Machine table retains the full run (225 samples) of candidate
+`2c8576a507b6605f99d0e583a32d79a4c1cad62516e67e04701d037464149747`, including its alias column. No
+repeat is required: only ENTER retry and fault/evidence paths changed; successful non-ENTER paths are unchanged. Values are
+instructions per step (change from that alias), A20 on then off. One-step `ip-boundary-1` belongs to
+U5; `smc-next-1` is informational.
+
+| Loop | Recorded alias | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| alu | 398.007 | 380.020 (-4.5193%) | 380.007 (-4.5225%) | 380.078 (-4.5047%) | 380.094 (-4.5007%) |
+| load | 522.658 | 501.026 (-4.1388%) | 501.078 (-4.1289%) | 501.021 (-4.1398%) | 501.015 (-4.1409%) |
+| load-odd | 533.699 | 512.040 (-4.0583%) | 512.013 (-4.0633%) | 512.016 (-4.0628%) | 512.076 (-4.0515%) |
+| store | 486.022 | 468.035 (-3.7009%) | 467.996 (-3.7089%) | 468.029 (-3.7021%) | 467.985 (-3.7111%) |
+| push-pop | 533.374 | 508.122 (-4.7344%) | 508.135 (-4.7320%) | 508.167 (-4.7260%) | 508.129 (-4.7331%) |
+| data-next-to-code | 1057.011 | 1041.296 (-1.4867%) | 1041.191 (-1.4967%) | 1041.194 (-1.4964%) | 1041.131 (-1.5023%) |
+| data-next-to-dense-code | 1056.889 | 1041.185 (-1.4859%) | 1041.738 (-1.4335%) | 1041.814 (-1.4264%) | 1041.667 (-1.4403%) |
+| call-ret | 1000.139 | 975.936 (-2.4200%) | 975.864 (-2.4272%) | 975.867 (-2.4269%) | 975.855 (-2.4281%) |
+| dos-mixed | 483.807 | 457.654 (-5.4057%) | 457.024 (-5.5359%) | 457.313 (-5.4762%) | 457.121 (-5.5158%) |
+| rep-movsw | 188.295 | 188.262 (-0.0175%) | 188.190 (-0.0558%) | 188.210 (-0.0451%) | 188.210 (-0.0451%) |
+| straight-line | 411.333 | 381.997 (-7.1319%) | 382.306 (-7.0568%) | 382.148 (-7.0952%) | 382.032 (-7.1234%) |
+| ip-boundary-1 | 2553.163 | 3553.135 (+39.1660%) | 3491.935 (+36.7690%) | 3564.512 (+39.6116%) | 3503.747 (+37.2316%) |
+| ip-boundary-64 | 410.215 | 414.880 (+1.1372%) | 413.893 (+0.8966%) | 415.011 (+1.1691%) | 414.114 (+0.9505%) |
+| smc-next-1 | 10950.777 | 6147.329 (-43.8640%) | 5981.156 (-45.3814%) | 6159.971 (-43.7485%) | 5994.475 (-45.2598%) |
+| smc-next-64 | 8978.379 | 3453.586 (-61.5344%) | 3347.684 (-62.7139%) | 3455.583 (-61.5122%) | 3349.492 (-62.6938%) |
+
+Recorded interleaved alias `dos-mixed` wall nanoseconds per guest step (`bfa1d42a…` candidate):
+
+| Pair | Parent | Candidate |
+|---|---:|---:|
+| 1 | 34.082 | 32.658 |
+| 2 | 33.748 | 32.689 |
+| 3 | 34.501 | 34.799 |
+| 4 | 32.925 | 34.083 |
+| 5 | 33.518 | 33.377 |
+| Median | 33.748 | 33.377 |
+
+The current recheck gives parent/candidate medians **34.847/34.304 ns/step (−1.5582%, passed)**.
+Both wall sample ranges overlap the recorded ones, so the wall table is retained.
+
+| Gate | Worst/result | Verdict |
+|---|---|---|
+| Alias within +0.5% on every loop | smc-next-64 +0.3942% | Passed |
+| Recorded Machine within +2% of alias, at least 64 steps/call | ip-boundary-64, legacy-i286-a20-off +1.1691% | Passed |
+| Recorded alias dos-mixed wall within +2% | -1.0993% | Passed |
+| Recorded Machine ip-boundary-1 | legacy-i286-a20-off +39.6116% | Report only; U5 |
+
+### Validation — MEASURED
+
+Each binary runs separately with two threads and a 180-second timeout. Four Application backend
+library witnesses are selected (182 filtered). Counts retain the prior full run except the review
+binary; the exact-input/projection recheck runs 342 debug tests across review, both parity binaries,
+`legacy_real`, `legacy_direct`, boundary/environment and the three fault suites, plus 44 review tests
+in release.
+
+| Binary | Passed | Ignored |
+|---|---:|---:|
+| `x86jit_core` | 413 | 2 |
+| `x86jit_cranelift` | 4 | 0 |
+| `application_codegen` | 3 | 0 |
+| `x86jit_tests` | 21 | 0 |
+| `boundary` | 1 | 0 |
+| `compat` | 14 | 0 |
+| `environment_boundary` | 1 | 0 |
+| `fault_atomicity` | 41 | 0 |
+| `fault_metadata` | 59 | 0 |
+| `fault_path` | 17 | 0 |
+| `fetch_policy` | 20 | 1 |
+| `irq_shadow` | 38 | 0 |
+| `legacy_a20` | 50 | 0 |
+| `legacy_contract` | 13 | 0 |
+| `legacy_direct` | 11 | 0 |
+| `legacy_direct_parity` | 28 | 0 |
+| `legacy_i286` | 34 | 0 |
+| `legacy_idt` | 22 | 0 |
+| `legacy_ldt` | 25 | 0 |
+| `legacy_protected` | 36 | 0 |
+| `legacy_real` | 92 | 0 |
+| `legacy_real_exceptions` | 8 | 0 |
+| `legacy_real_parity` | 48 | 0 |
+| `legacy_sse_integer` | 2 | 0 |
+| `legacy_task_registers` | 6 | 0 |
+| `legacy_task_switch` | 65 | 0 |
+| `legacy_u3_review` | 44 | 0 |
+| `legacy_upper_audit` | 0 | 0 |
+| `machine_empty_fpu` | 17 | 0 |
+| `real16_jit_guard` | 6 | 0 |
+| `real16_wrap` | 20 | 0 |
+| `real16_x87_model` | 21 | 0 |
+| `retired_count` | 21 | 0 |
+| `smc` | 59 | 0 |
+| Total | 1260 | 3 |
+
+All-targets/all-features clippy (Rust 1.98.1) `-D warnings`, fmt `--check`, boundary and
+environment tests, and `cargo check --workspace --tests --release --features x86jit-tests/unicorn` pass. Parent identity is READ from supplied provenance;
+tests, captures, hashes and benchmarks are MEASURED. No hardware expectation
+requires ASSUMED evidence. Decision-23 is unchanged by this work; no commits,
+git writes, bead operations or pushes were performed.

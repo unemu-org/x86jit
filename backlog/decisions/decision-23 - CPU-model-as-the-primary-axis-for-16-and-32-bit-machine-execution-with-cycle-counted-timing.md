@@ -465,6 +465,26 @@ One deliberate change reaches the alias: when the lowering is unified, its 35
 xj-5t9 forms take the manual-correct operand-size behaviour, because the code that
 got them wrong no longer exists. The PC-class embedder has accepted this.
 
+**Amendment (U3, 2026-11-12, accepted by the maintainer).** U3 serves the alias
+with the same width-aware lowering of stack, control-flow, flag-image, frame and
+far-pointer instructions as every Machine context. Besides the 35 xj-5t9 forms,
+the alias therefore follows the manuals in these corner cases of those families:
+
+- the stack-segment limit check and the SP wrap at 0000h and FFFFh;
+- POP addresses the stack through SP, not ESP, when the high bits of ESP are set
+  and the stack is 16-bit;
+- a far CALL and an IRET check their whole frame before the first access and
+  commit nothing until every access has completed;
+- POPA does not read the stack slot that holds the discarded SP;
+- XLAT honours the 67h address-size prefix and an FS or GS segment override;
+- LDS, LES and BOUND with a 67h memory operand check its whole offset against the
+  segment limit.
+
+Instructions outside those families keep the frozen alias behaviour. A memory
+operand of such an instruction with a 67h prefix passes the limit gate on the low
+16 bits of its offset and is then accessed at the full linear address, as before
+U3. One named policy implements this (`alias_low16` of `SegLimitCheck`).
+
 `run_steps`, `irq_ready`, `inject_irq`, `retired_instructions`, `StepOptions`,
 `StepRun` and the decision-16 contract are unchanged for the alias and are the
 contract of every Machine model.

@@ -828,10 +828,26 @@ fn finish_instruction_fault<const STEPPED: bool>(
         return exit;
     }
     let info = crate::fault::InstructionFaultInfo::from_ops(rip, next, ops, mode);
+    // Only opaque legacy helpers use visit/write tags and ENTER snapshots.
+    // Ordinary scalar/vector keys are full addresses, including on the alias.
+    let helper_ledger = ops
+        .iter()
+        .any(|op| matches!(op, IrOp::Legacy(op) if crate::lift::legacy::shared_helper(op)));
     // Per-access classification retained Long64/SS evidence. The VM/step caller
     // qualifies Real16 physical addresses with its explicit decode mode.
     let mode = crate::CpuMode::Long64;
     let mut exit = crate::fault::finish(exit, Some(&info), cpu, mem, mode, false);
+    if helper_ledger && cpu.owns_mmio_retry(cpu.rip) {
+        if let Exit::Exception {
+            metadata: Some(m), ..
+        }
+        | Exit::UnmappedMemory {
+            metadata: Some(m), ..
+        } = &mut exit
+        {
+            m.progress.acknowledged = legacy::mmio_evidence(cpu);
+        }
+    }
     if STEPPED && string_slots && cpu.owns_mmio_retry(cpu.rip) {
         let addresses = ops.iter().find_map(|op| match op {
             IrOp::RepString {
@@ -912,6 +928,56 @@ pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
     crate::fault::qualify_lifted(exit, infos.iter().find(|i| i.rip == rip))
 }
 
+// Keep helper-only scans and ordering state out of the ordinary op walk.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn walk_shared_helper<const MACHINE: bool, const ROUTED: bool, const ORDER: u8>(
+    op: &crate::legacy::LegacyOp,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    ip: u64,
+    retired: u64,
+    shadows: &mut ShadowState,
+) -> Option<WalkResult> {
+    use crate::legacy::LegacyOp as L;
+    let next = ir
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            IrOp::InsnStart { guest_addr } if *guest_addr > ip => Some(*guest_addr),
+            _ => None,
+        })
+        .unwrap_or(ir.guest_start + u64::from(ir.guest_len));
+    let (raw, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
+    match legacy::execute_shared_op::<ROUTED, 0>(op, cpu, raw, temps, ir.legacy_context, ip, next) {
+        Ok(outcome) => {
+            if outcome.arm_ss {
+                shadows.complete_before(retired);
+                shadows.arm_ss();
+            }
+            if matches!(op, L::Transfer { .. } | L::Return { .. } | L::Iret { .. }) {
+                Some(if MACHINE && outcome.context_changed {
+                    WalkResult::ModeChange
+                } else {
+                    WalkResult::Continue
+                })
+            } else {
+                None
+            }
+        }
+        Err(Exit::Exception { vector, .. }) if !MACHINE => Some(WalkResult::delivered_fault(
+            deliver_interrupt_mode(cpu, mem, ip, vector, ip),
+        )),
+        Err(exit) => {
+            cpu.rip = ip;
+            Some(WalkResult::exit(exit))
+        }
+    }
+}
+
 /// The per-op interpreter walk. Every early `return` here exits `walk_ops`; the caller
 /// then applies the single final-instruction retirement, reading the post-walk values of
 /// the `&mut` retirement counters and shadow state.
@@ -940,6 +1006,7 @@ fn walk_ops<
     trace: Option<&crate::lockstep::Trace>,
     mut budget: impl BudgetState<StepContext>,
 ) -> WalkResult {
+    use crate::legacy::LegacyOp as L;
     let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
     for (op_index, op) in ir.ops.iter().enumerate() {
@@ -947,61 +1014,121 @@ fn walk_ops<
             mem.0.begin_op(op, temps, cpu);
         }
         match op {
-            IrOp::Legacy(crate::legacy::LegacyOp::String {
-                kind,
-                elem,
-                rep,
-                address_bits,
-                source,
-            }) if MACHINE && STEPPED && !CHILD => {
-                let (mem, _ordering) = mem.helper(Some(match kind {
-                    StrOp::Movs => ordering::Direction::ReadWrite,
-                    StrOp::Stos => ordering::Direction::Write,
-                    _ => ordering::Direction::Read,
-                }));
-                if let Some(stop) = legacy::execute_shared_string::<ROUTED, STOP_WHEN_IRQ_READY, _>(
-                    ir,
-                    cpu,
-                    mem,
-                    *kind,
-                    *elem,
-                    *rep,
-                    cur_addr.get(),
-                    *address_bits,
-                    *source,
-                    exit_request,
-                    budget.get(),
-                    shadows,
-                    *retired,
-                ) {
-                    return stop;
-                }
-            }
-            IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk) if MACHINE => {}
-            IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
-                dst,
-                offset,
-                bytes,
-                vector,
-            }) if MACHINE => {
-                let offset = read_val(*offset, temps);
-                match legacy::direct_stack_address(cpu, offset, *bytes, *vector, cur_addr.get()) {
-                    Ok(address) => temps[*dst as usize] = address,
-                    Err(exit) => {
-                        return WalkResult::exit(legacy::stack_fault_access(
-                            exit,
-                            &ir.ops,
+            IrOp::Legacy(legacy_op) => match legacy_op {
+                L::String {
+                    kind,
+                    elem,
+                    rep,
+                    address_bits,
+                    source,
+                } if MACHINE && STEPPED && !CHILD => {
+                    let (mem, _ordering) = mem.helper(Some(match kind {
+                        StrOp::Movs => ordering::Direction::ReadWrite,
+                        StrOp::Stos => ordering::Direction::Write,
+                        _ => ordering::Direction::Read,
+                    }));
+                    if let Some(stop) =
+                        legacy::execute_shared_string::<ROUTED, STOP_WHEN_IRQ_READY, _>(
+                            ir,
+                            cpu,
+                            mem,
+                            *kind,
+                            *elem,
+                            *rep,
                             cur_addr.get(),
-                        ))
+                            *address_bits,
+                            *source,
+                            exit_request,
+                            budget.get(),
+                            shadows,
+                            *retired,
+                        )
+                    {
+                        return stop;
                     }
                 }
-            }
-            IrOp::Legacy(_) => {
-                return WalkResult::exit(Exit::UnsupportedSystemContext {
-                    addr: cpu.rip,
-                    operation: crate::UnsupportedSystemOperation::LegacyExecution,
-                })
-            }
+                L::SharedWalk if MACHINE => {}
+                L::DirectStackAddress {
+                    dst,
+                    offset,
+                    bytes,
+                    vector,
+                } => {
+                    let offset = read_val(*offset, temps);
+                    match legacy::direct_stack_address(cpu, offset, *bytes, *vector, cur_addr.get())
+                    {
+                        Ok(address) => temps[*dst as usize] = address,
+                        Err(exit) => {
+                            if !MACHINE {
+                                return WalkResult::delivered_fault(deliver_interrupt_mode(
+                                    cpu,
+                                    mem,
+                                    cur_addr.get(),
+                                    *vector,
+                                    cur_addr.get(),
+                                ));
+                            }
+                            return WalkResult::exit(legacy::stack_fault_access(
+                                exit,
+                                &ir.ops,
+                                cur_addr.get(),
+                            ));
+                        }
+                    }
+                }
+                op @ L::Loop { .. } => {
+                    return match legacy::execute_loop_op(
+                        cpu,
+                        op,
+                        if MACHINE { ir.legacy_context } else { None },
+                        cur_addr.get(),
+                    ) {
+                        Ok(()) => WalkResult::Continue,
+                        Err(Exit::Exception { vector, .. }) if !MACHINE => {
+                            WalkResult::delivered_fault(deliver_interrupt_mode(
+                                cpu,
+                                mem,
+                                cur_addr.get(),
+                                vector,
+                                cur_addr.get(),
+                            ))
+                        }
+                        Err(exit) => WalkResult::exit(exit),
+                    };
+                }
+                op @ (L::LoadSegment { .. }
+                | L::Flags { .. }
+                | L::All { .. }
+                | L::Transfer { .. }
+                | L::Return { .. }
+                | L::Iret { .. }
+                | L::CheckTaskReturn
+                | L::Enter { .. }
+                | L::Leave { .. }
+                | L::Bound { .. }) => {
+                    if CHILD {
+                        unreachable!("frame helper in child execution");
+                    }
+                    if let Some(stop) = walk_shared_helper::<MACHINE, ROUTED, ORDER>(
+                        op,
+                        ir,
+                        cpu,
+                        mem,
+                        temps,
+                        cur_addr.get(),
+                        *retired,
+                        shadows,
+                    ) {
+                        return stop;
+                    }
+                }
+                _ => {
+                    return WalkResult::exit(Exit::UnsupportedSystemContext {
+                        addr: cpu.rip,
+                        operation: crate::UnsupportedSystemOperation::LegacyExecution,
+                    });
+                }
+            },
             IrOp::InsnStart { guest_addr } => {
                 if !CHILD && started.get() == 0 {
                     // The store completed; leave cur_addr on it for retirement.
@@ -1399,15 +1526,32 @@ fn walk_ops<
                 addr,
                 size,
             } => {
-                if let Some(r) = exec_load::<MACHINE, ROUTED, ORDER>(
-                    cpu,
-                    mem,
-                    temps,
-                    cur_addr.get(),
-                    dst,
-                    addr,
-                    size,
-                ) {
+                let result = if !MACHINE
+                    && RETRY
+                    && ir.mode == crate::CpuMode::Real16
+                    && legacy::unified_read_retry(&ir.ops, cur_addr.get())
+                {
+                    exec_load::<true, ROUTED, ORDER>(
+                        cpu,
+                        mem,
+                        temps,
+                        cur_addr.get(),
+                        dst,
+                        addr,
+                        size,
+                    )
+                } else {
+                    exec_load::<MACHINE, ROUTED, ORDER>(
+                        cpu,
+                        mem,
+                        temps,
+                        cur_addr.get(),
+                        dst,
+                        addr,
+                        size,
+                    )
+                };
+                if let Some(r) = result {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
@@ -4938,6 +5082,7 @@ fn walk_ops<
                 };
             }
             IrOp::SegLimitCheck {
+                alias_low16,
                 offset,
                 size,
                 vector,
@@ -4950,11 +5095,17 @@ fn walk_ops<
                 // 0xFFFF byte limit iff offset + size overflows 64 KB. If so, vector the
                 // fault in-guest; otherwise fall through to the Load/Store that follows.
                 let off = read_val(*offset, temps);
-                let off = if MACHINE { off } else { off & 0xffff };
                 if off
                     .checked_add(u64::from(*size))
                     .is_none_or(|end| end > 0x10000)
                 {
+                    // Frozen alias low-word data-limit quirk (decision-23 §6).
+                    // Consult it only after the full offset exceeds the limit;
+                    // the following access retains its full linear address.
+                    // Unified families and Machine gate the complete offset.
+                    if !MACHINE && *alias_low16 && (off & 0xffff) + u64::from(*size) <= 0x10000 {
+                        continue;
+                    }
                     if MACHINE {
                         cpu.rip = cur_addr.get();
                         return WalkResult::exit(crate::legacy::segment_fault(
@@ -4962,7 +5113,7 @@ fn walk_ops<
                             *vector,
                             off,
                             *size,
-                            legacy::scalar_limit_access(&ir.ops, cur_addr.get()),
+                            legacy::scalar_limit_access(&ir.ops, cur_addr.get(), *offset),
                         ));
                     }
                     return WalkResult::delivered_fault(deliver_interrupt_mode(
@@ -9613,7 +9764,8 @@ fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterM
 ) -> Option<WalkResult> {
     let source = matches!(op, StrOp::Movs | StrOp::Lods | StrOp::Cmps);
     let destination = matches!(op, StrOp::Movs | StrOp::Stos | StrOp::Cmps | StrOp::Scas);
-    if (!source || cpu.gpr[RSI] & u64::from(elem - 1) == 0)
+    if addr_bits == 16
+        && (!source || cpu.gpr[RSI] & u64::from(elem - 1) == 0)
         && (!destination || cpu.gpr[RDI] & u64::from(elem - 1) == 0)
     {
         return string_run_bounded_direct::<ROUTED, STOP, _>(
@@ -9632,12 +9784,12 @@ fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterM
             retired,
         );
     }
-    debug_assert_eq!(addr_bits, 16);
+    let address_mask = string_address_mask(addr_bits);
     loop {
         let count = if matches!(rep, RepKind::None) {
             1
         } else {
-            cpu.gpr[RCX] & 0xffff
+            cpu.gpr[RCX] & address_mask
         };
         if count != 0 {
             if let Some(stop) = steps.boundary(cpu, shadows, exit_request) {
@@ -9647,8 +9799,8 @@ fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterM
                 return Some(stop);
             }
             let last = 0x10000 - u64::from(elem);
-            let si = cpu.gpr[RSI] & 0xffff;
-            let di = cpu.gpr[RDI] & 0xffff;
+            let si = cpu.gpr[RSI] & address_mask;
+            let di = cpu.gpr[RDI] & address_mask;
             if source && si > last {
                 cpu.rip = cur_addr;
                 return Some(WalkResult::exit(crate::legacy::segment_fault(

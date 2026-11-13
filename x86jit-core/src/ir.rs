@@ -9,7 +9,7 @@ pub use verify::UndefinedTemp;
 pub type Temp = u32;
 
 /// An IR operand: a prior temporary or a constant.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Val {
     Temp(Temp),
     Imm(u64),
@@ -2699,6 +2699,8 @@ pub enum IrOp {
     // the 80286 corpus captures as #GP, not #SS. Otherwise a no-op (the following
     // `Load`/`Store` runs). Emitted before the access, only under Real16 (interpreter-only).
     SegLimitCheck {
+        /// Decision-23 §6: ordinary alias operands gate the low word only.
+        alias_low16: bool,
         offset: Val,
         size: u8,
         vector: u8,

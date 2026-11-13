@@ -26,7 +26,7 @@ fn refusal(cpu: &CpuState, operation: crate::UnsupportedSystemOperation) -> Exit
     }
 }
 
-#[inline(always)]
+#[inline(never)]
 pub(super) fn direct_stack_address(
     cpu: &mut CpuState,
     offset: u64,
@@ -36,7 +36,6 @@ pub(super) fn direct_stack_address(
 ) -> Result<u64, Exit> {
     // 80386 PRM §17.1.3: SS.B=0 selects SP independently of operand size.
     // §14.7 item 7/Table 14-1; 286 PRM Table C-1: gate the whole operand.
-    let offset = offset & 0xffff;
     if offset + u64::from(bytes) > 0x10000 {
         cpu.rip = ip;
         return Err(legacy::segment_fault(
@@ -79,30 +78,68 @@ pub(super) fn stack_fault_access(mut exit: Exit, ops: &[IrOp], rip: u64) -> Exit
 
 #[cold]
 #[inline(never)]
-pub(super) fn scalar_limit_access(ops: &[IrOp], rip: u64) -> AccessKind {
+pub(super) fn scalar_limit_access(ops: &[IrOp], rip: u64, offset: Val) -> AccessKind {
     let start = ops
         .iter()
         .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == rip))
         .unwrap_or(0);
-    // Match the cached gate's write intent, including scalar RMW. Helper stack
-    // writes do not change a memory-source PUSH/CALL operand's read intent.
-    let writes = ops[start + 1..]
+    let end = ops[start + 1..]
         .iter()
-        .take_while(|op| !matches!(op, IrOp::InsnStart { .. }))
-        .any(|op| {
-            matches!(
-                op,
-                IrOp::Store { .. }
-                    | IrOp::AtomicRmw { .. }
-                    | IrOp::AtomicCas { .. }
-                    | IrOp::AtomicCasPair { .. }
-            )
-        });
+        .position(|op| matches!(op, IrOp::InsnStart { .. }))
+        .map_or(ops.len(), |i| start + 1 + i);
+    let instruction = &ops[start..end];
+    if instruction
+        .iter()
+        .any(|op| matches!(op, IrOp::Jump { target } if *target == offset))
+    {
+        return AccessKind::Execute;
+    }
+    // An explicit source operand stays read-only when PUSH/CALL also stores
+    // its implicit frame. Stack-address results identify those stores exactly.
+    let writes = instruction.iter().any(|op| match op {
+        IrOp::Store {
+            addr: Val::Temp(addr),
+            ..
+        } => !instruction
+            .iter()
+            .any(|op| matches!(op, IrOp::Legacy(L::DirectStackAddress { dst, .. }) if dst == addr)),
+        IrOp::Store { .. }
+        | IrOp::AtomicRmw { .. }
+        | IrOp::AtomicCas { .. }
+        | IrOp::AtomicCasPair { .. } => true,
+        _ => false,
+    });
     if writes {
         AccessKind::Write
     } else {
         AccessKind::Read
     }
+}
+
+// Only retry-specialized alias walks need this scan. Ordinary alias loads keep
+// their frozen completion behavior (decision-23 §6); unified scalar reads use
+// the same ledger as Machine (80386 PRM §9.1, instruction restart).
+#[cold]
+#[inline(never)]
+pub(super) fn unified_read_retry(ops: &[IrOp], rip: u64) -> bool {
+    let start = ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == rip))
+        .unwrap_or(0);
+    ops[start + 1..]
+        .iter()
+        .take_while(|op| !matches!(op, IrOp::InsnStart { .. }))
+        .any(|op| {
+            matches!(
+                op,
+                IrOp::Legacy(
+                    L::DirectStackAddress { .. }
+                        | L::LoadSegment { .. }
+                        | L::Transfer { .. }
+                        | L::Bound { .. }
+                )
+            )
+        })
 }
 
 fn exception(cpu: &CpuState, vector: u8) -> Exit {
@@ -233,12 +270,14 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
     access: &'a Access<ROUTED, ORDER>,
     read_index: Cell<u16>,
+    writes: Option<&'a dyn Fn(u64, u8)>,
 }
 impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
     fn new(memory: &'a Memory) -> Self {
         Self {
             access: Access::new(memory),
             read_index: Cell::new(0),
+            writes: None,
         }
     }
     fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
@@ -263,6 +302,7 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     fn raw(&self) -> &Access<ROUTED, ORDER>;
     fn read_key(&self, addr: u64) -> u64;
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
+    fn note_write(&self, _addr: u64, _size: u8) {}
 }
 impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER> for Access<ROUTED, ORDER> {
     fn raw(&self) -> &Access<ROUTED, ORDER> {
@@ -286,6 +326,11 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
     }
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
         LegacyAccess::skip_read(self, cpu, linear, bytes);
+    }
+    fn note_write(&self, addr: u64, size: u8) {
+        if let Some(observe) = self.writes {
+            observe(addr, size);
+        }
     }
 }
 
@@ -335,6 +380,222 @@ fn read_physical<const ROUTED: bool, const ORDER: u8>(
     Ok(value & mask(size))
 }
 
+// SDM Vol 2A §3.3 ENTER; 80386 PRM §17 ENTER: overlapping frame writes
+// must not change a display on restart. Between an MMIO exit and resume,
+// edits preserving exactly the architectural inputs at their read widths keep
+// the attempt, so no acknowledged transfer repeats; changing an input restarts
+// ENTER. BP/EBP is read at operand size and, for displays, stack size; SP/ESP
+// is read at stack size for addressing and operand size for FrameTemp. Identity
+// also retains the effective SS base/limit/B and limit rule, A20 policy, operand
+// size, allocation imm16 and nesting imm8 modulo 32. Checked SS access rights
+// participate only as used by ENTER's reads/writes. Unread bits are excluded.
+//
+// The first two slots retain the exact identity, then become the first two
+// display snapshots, keeping identity in their unused key/high-value bits.
+// Collection needs at most two identities plus four current byte answers (6)
+// until both displays complete, then at most 29 snapshots plus four answers
+// (33). Zero/one-display attempts retain two identities plus at most four write
+// parts (6). Otherwise thirty snapshots plus 32 frame writes (33 if one crosses
+// a bus boundary) need at most 63 slots. No identity phase adds to that peak.
+const ENTER_DISPLAY_RETRY: u64 = 1 << 61;
+const ENTER_DISPLAY_STARTS: u32 = 37;
+const ENTER_DISPLAY_ENDS: u32 = 41;
+const ENTER_DISPLAY_PENDING: u64 = 1 << 46;
+const ENTER_IDENTITY_CONFIG: u32 = 47;
+const ENTER_IDENTITY_CONFIG_MASK: u64 = 0x3fff << ENTER_IDENTITY_CONFIG;
+const ENTER_IDENTITY_KEY: u64 = 0xffff_ffff | ENTER_IDENTITY_CONFIG_MASK;
+
+fn enter_display_index(key: u64) -> u8 {
+    ((key >> 32) & 0x1f) as u8
+}
+
+fn enter_display_key(index: u8) -> u64 {
+    ENTER_DISPLAY_RETRY | (u64::from(index) << 32)
+}
+
+#[inline(never)]
+fn prepare_enter_displays(
+    cpu: &mut CpuState,
+    context: MachineContext,
+    size: u8,
+    alloc: u16,
+    level: u8,
+) {
+    let stack_bytes = context.stack_address_bits / 8;
+    let bp_bytes = if level > 1 {
+        size.max(stack_bytes)
+    } else {
+        size
+    };
+    let bp = cpu.gpr[RBP] & mask(bp_bytes);
+    let sp = cpu.gpr[RSP] & mask(size.max(stack_bytes));
+    let (base, limit, expand_down, readable, writable) =
+        if context.segment_class == crate::SegmentClass::Direct {
+            (u32::from(cpu.ss) << 4, 0xffff, false, true, true)
+        } else {
+            let ss = cpu.legacy.segments[SegmentId::Ss as usize];
+            let protected = cpu.legacy.cr0 & 1 != 0;
+            let code = ss.attributes & 8 != 0;
+            (
+                ss.base,
+                ss.limit,
+                protected && !code && ss.attributes & 4 != 0,
+                !protected || !code || ss.attributes & 2 != 0,
+                !protected || (!code && ss.attributes & 2 != 0),
+            )
+        };
+    let config = u64::from(alloc)
+        | (u64::from(level) << 16)
+        | (u64::from(stack_bytes == 4) << 21)
+        | (u64::from(size == 4) << 22)
+        | (u64::from(cpu.legacy.a20_enabled != 0) << 23)
+        | (u64::from(expand_down) << 24)
+        | (u64::from(readable) << 25)
+        | (u64::from(writable) << 26);
+    let identities = [
+        (bp | ((config & 0x3fff) << ENTER_IDENTITY_CONFIG), sp << 32),
+        (
+            u64::from(base) | ((config >> 14) << ENTER_IDENTITY_CONFIG),
+            u64::from(limit) << 32,
+        ),
+    ];
+    let matches = cpu.owns_mmio_retry(cpu.rip)
+        && identities.iter().enumerate().all(|(i, &(key, value))| {
+            cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)]
+                .iter()
+                .any(|&(k, v)| {
+                    k >> 61 == 1
+                        && enter_display_index(k) == i as u8 + 1
+                        && k & ENTER_IDENTITY_KEY == key
+                        && v & !0xffff_ffff == value
+                })
+        });
+    if !matches {
+        // Abandon the whole attempt before collecting anything new, including
+        // its display answers and acknowledged frame writes. Those device
+        // answers belong to the earlier exit's evidence, not to this attempt.
+        cpu.clear_mmio_parts();
+        for (i, (key, value)) in identities.into_iter().enumerate() {
+            cpu.record_mmio_part(
+                cpu.rip,
+                enter_display_key(i as u8 + 1) | ENTER_DISPLAY_PENDING | key,
+                value,
+            );
+        }
+    }
+}
+
+fn enter_display(cpu: &CpuState, index: u8) -> Option<u64> {
+    cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)]
+        .iter()
+        .find(|&&(key, _)| {
+            key >> 61 == 1 && enter_display_index(key) == index && key & ENTER_DISPLAY_PENDING == 0
+        })
+        .map(|&(_, value)| u64::from(value as u32))
+}
+
+fn record_enter_display(
+    cpu: &mut CpuState,
+    visits: std::ops::Range<u16>,
+    index: u8,
+    address: u64,
+    size: u8,
+    partial: bool,
+    value: u64,
+) {
+    let mut key = enter_display_key(index);
+    let mut value = value;
+    let mut kept = 0;
+    for i in 0..usize::from(cpu.mmio_parts_len) {
+        let entry = cpu.mmio_parts[i];
+        if entry.0 >> 61 == 1 && enter_display_index(entry.0) == index {
+            key |= entry.0 & ENTER_IDENTITY_KEY;
+            value |= entry.1 & !0xffff_ffff;
+            continue;
+        }
+        let visit = (entry.0 >> 32) as u16;
+        if entry.0 >> 48 != 0 || !visits.contains(&visit) {
+            cpu.mmio_parts[kept] = entry;
+            kept += 1;
+        } else {
+            // An overlapped display reads uncovered bytes individually; an
+            // unoverlapped display uses the normal bus-span split. Preserve
+            // each completion's boundaries, not the RAM or staged bytes.
+            let byte = (0..size)
+                .find(|&byte| {
+                    legacy::physical_span(cpu, address.wrapping_add(u64::from(byte)), 1).0
+                        == u64::from(entry.0 as u32)
+                })
+                .expect("current attempt's display answer belongs to its bus span");
+            let bytes = if partial {
+                1
+            } else {
+                legacy::physical_span(cpu, address.wrapping_add(u64::from(byte)), size - byte).1
+            };
+            key |= 1 << (ENTER_DISPLAY_STARTS + u32::from(byte));
+            key |= 1 << (ENTER_DISPLAY_ENDS + u32::from(byte + bytes - 1));
+        }
+    }
+    cpu.mmio_parts_len = kept as u8;
+    cpu.record_mmio_part(cpu.rip, key, value);
+}
+
+// Fault-only projection for helper ledgers, including an incomplete first
+// display. Visits and write tags are not bus addresses; descriptor/transfer
+// snapshots are not device answers. ENTER's compact provenance retains the
+// original answer boundaries and the alias helper's saved A20 policy.
+#[cold]
+pub(crate) fn mmio_evidence(cpu: &CpuState) -> Box<[(u64, u64)]> {
+    let entries = &cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)];
+    let identity = |index| {
+        entries
+            .iter()
+            .find(|&&(key, _)| key >> 61 == 1 && enter_display_index(key) == index)
+            .copied()
+    };
+    let display_geometry = identity(1).zip(identity(2)).map(|((bp, _), (base, _))| {
+        let config = ((bp & ENTER_IDENTITY_CONFIG_MASK) >> ENTER_IDENTITY_CONFIG)
+            | (((base & ENTER_IDENTITY_CONFIG_MASK) >> ENTER_IDENTITY_CONFIG) << 14);
+        (bp as u32, base as u32, config)
+    });
+    let mut transfers = Vec::new();
+    for &(key, value) in entries {
+        if key & DESCRIPTOR_RETRY != 0 {
+            continue;
+        }
+        if key >> 61 != 1 {
+            transfers.push((u64::from(key as u32), value));
+            continue;
+        }
+        let starts = (key >> ENTER_DISPLAY_STARTS) & 0xf;
+        let ends = (key >> ENTER_DISPLAY_ENDS) & 0xf;
+        for byte in 0..4 {
+            if starts & (1 << byte) != 0 {
+                let end = (byte..4)
+                    .find(|end| ends & (1 << end) != 0)
+                    .expect("display answer has an end");
+                let (bp, base, config) = display_geometry.expect("ENTER identity");
+                let size = if config & (1 << 22) != 0 { 4 } else { 2 };
+                let stack_mask = if config & (1 << 21) != 0 {
+                    u32::MAX
+                } else {
+                    0xffff
+                };
+                let offset =
+                    bp.wrapping_sub(u32::from(enter_display_index(key)) * size) & stack_mask;
+                let address = u64::from(base.wrapping_add(offset).wrapping_add(byte));
+                let (bus, _) = legacy::physical_span_with_gate(
+                    config & (1 << 23) != 0,
+                    address,
+                    (end - byte + 1) as u8,
+                );
+                transfers.push((bus, (value >> (byte * 8)) & mask((end - byte + 1) as u8)));
+            }
+        }
+    }
+    transfers.into_boxed_slice()
+}
+
 fn write<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -367,6 +628,7 @@ fn write_physical<const ROUTED: bool, const ORDER: u8>(
     // from reads at the same physical bus address; it is never a guest address.
     let key = addr | (1 << 63);
     if cpu.mmio_part(cpu.rip, key).is_some() {
+        mem.note_write(addr, size);
         return Ok(());
     }
     if let Err(trap) = mem.raw().write(addr, value, size) {
@@ -392,6 +654,7 @@ fn write_physical<const ROUTED: bool, const ORDER: u8>(
             );
         }
     }
+    mem.note_write(addr, size);
     Ok(())
 }
 
@@ -1334,6 +1597,7 @@ pub(crate) fn supported(op: &IrOp) -> bool {
             | IrOp::Store { .. }
             | IrOp::Jump { .. }
             | IrOp::Branch { .. }
+            | IrOp::LoopCx { .. }
             | IrOp::SetIf { .. }
             | IrOp::SetDf { .. }
             | IrOp::SetCf { .. }
@@ -1343,6 +1607,7 @@ pub(crate) fn supported(op: &IrOp) -> bool {
             | IrOp::PortIo { .. }
             | IrOp::Trap { .. }
             | IrOp::Bcd { .. }
+            | IrOp::Fence { .. }
             | IrOp::Bt { .. }
             | IrOp::BoundGate { .. }
             | IrOp::X87 { .. }
@@ -1484,13 +1749,9 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
                 metadata: Some(m), ..
             } = &mut exit
             {
-                m.progress.acknowledged = m
-                    .progress
-                    .acknowledged
-                    .iter()
-                    .filter(|(key, _)| key & DESCRIPTOR_RETRY == 0)
-                    .map(|(key, value)| (key & 0xffff_ffff, *value))
-                    .collect();
+                if cpu.owns_mmio_retry(cpu.rip) {
+                    m.progress.acknowledged = mmio_evidence(cpu);
+                }
             }
             result = Err(exit);
         }
@@ -1751,6 +2012,191 @@ impl SharedProgress {
     }
 }
 
+// Instruction helpers are shared while the two dispatchers/walks remain separate.
+// The compatibility personality has no retained system state and ignores A20.
+pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
+    op: &L,
+    cpu: &mut CpuState,
+    memory: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    context: Option<MachineContext>,
+    ip: u64,
+    next: u64,
+) -> Result<Outcome, Exit> {
+    let saved = context.is_none().then_some(cpu.legacy);
+    let context = context.unwrap_or_else(crate::lift::legacy::alias_context);
+    if saved.is_some() {
+        cpu.legacy = legacy::LegacyCpuState {
+            a20_enabled: 1,
+            ..Default::default()
+        };
+    }
+    cpu.rip = ip;
+    if matches!(op, L::CheckTaskReturn) {
+        if let Some(saved) = saved {
+            cpu.legacy = saved;
+            return Ok(Outcome::default());
+        }
+    }
+    let ops = [IrOp::Legacy(op.clone())];
+    let observe = |addr, size| {
+        if !matches!(
+            memory.0.normal().region_kind(addr, size),
+            Ok(crate::RegionKind::Rom)
+        ) {
+            memory.0.note_block_write(addr, usize::from(size));
+        }
+    };
+    let mut access = LegacyAccess::new(memory.0.normal());
+    access.writes = Some(&observe);
+    let result = walk::<ROUTED, ORDER>(
+        &InstructionView {
+            guest_start: ip,
+            guest_len: (next - ip) as u32,
+            ops: &ops,
+        },
+        cpu,
+        &access,
+        temps,
+        context,
+        &mut tasks::SwitchState::default(),
+    );
+    if let Some(saved) = saved {
+        cpu.legacy = saved;
+        if result.is_ok() {
+            cpu.rip &= 0xffff;
+        }
+        if result.is_ok() && matches!(op, L::Flags { pop: true, .. } | L::Iret { .. }) {
+            // The frozen compatibility personality does not acquire single-step.
+            cpu.rflags_system &= !0x7100;
+        }
+    }
+    result
+}
+
+// Keep op decoding and the exceptional context out of the scalar walk.
+#[inline(never)]
+pub(super) fn execute_loop_op(
+    cpu: &mut CpuState,
+    op: &L,
+    context: Option<MachineContext>,
+    ip: u64,
+) -> Result<(), Exit> {
+    let L::Loop {
+        kind,
+        count_bits,
+        check_target,
+        taken,
+        next,
+    } = op
+    else {
+        unreachable!("loop operation");
+    };
+    if *check_target {
+        return execute_loop_checked_op(cpu, op, context, ip);
+    }
+    execute_loop(
+        cpu,
+        crate::lift::legacy::alias_context(),
+        *kind,
+        *count_bits,
+        false,
+        *taken,
+        *next,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn execute_loop_checked_op(
+    cpu: &mut CpuState,
+    op: &L,
+    context: Option<MachineContext>,
+    ip: u64,
+) -> Result<(), Exit> {
+    let L::Loop {
+        kind,
+        count_bits,
+        taken,
+        next,
+        ..
+    } = op
+    else {
+        unreachable!("loop operation");
+    };
+    cpu.rip = ip;
+    execute_loop(
+        cpu,
+        context.unwrap_or_else(crate::lift::legacy::alias_context),
+        *kind,
+        *count_bits,
+        true,
+        *taken,
+        *next,
+    )
+}
+
+#[inline(always)]
+pub(super) fn execute_loop(
+    cpu: &mut CpuState,
+    context: MachineContext,
+    kind: crate::ir::LoopKind,
+    count_bits: u8,
+    check_target: bool,
+    taken: u32,
+    next: u32,
+) -> Result<(), Exit> {
+    if count_bits == 16 {
+        execute_loop_count::<2>(cpu, context, kind, check_target, taken, next)
+    } else {
+        execute_loop_count::<4>(cpu, context, kind, check_target, taken, next)
+    }
+}
+
+#[inline(always)]
+fn execute_loop_count<const SIZE: u8>(
+    cpu: &mut CpuState,
+    context: MachineContext,
+    kind: crate::ir::LoopKind,
+    check_target: bool,
+    taken: u32,
+    next: u32,
+) -> Result<(), Exit> {
+    let count = cpu.gpr[1] & mask(SIZE);
+    if matches!(kind, crate::ir::LoopKind::Jcxz) {
+        cpu.rip = loop_ip(cpu, context, check_target, count == 0, taken, next)?;
+        return Ok(());
+    }
+    let count = count.wrapping_sub(1) & mask(SIZE);
+    let take = match kind {
+        crate::ir::LoopKind::Loop => count != 0,
+        crate::ir::LoopKind::Loope => count != 0 && cpu.flags.zf,
+        crate::ir::LoopKind::Loopne => count != 0 && !cpu.flags.zf,
+        crate::ir::LoopKind::Jcxz => unreachable!(),
+    };
+    let ip = loop_ip(cpu, context, check_target, take, taken, next)?;
+    cpu.write_gpr(1, count, SIZE);
+    cpu.rip = ip;
+    Ok(())
+}
+
+#[inline(always)]
+fn loop_ip(
+    cpu: &CpuState,
+    context: MachineContext,
+    check_target: bool,
+    take: bool,
+    taken: u32,
+    next: u32,
+) -> Result<u64, Exit> {
+    let ip = u64::from(if take { taken } else { next });
+    // SDM Vol 2A §3.3 LOOP: a faulting taken target precedes count commit.
+    if take && check_target {
+        target(cpu, context, ip, 4)?;
+    }
+    Ok(ip)
+}
+
 fn walk<const ROUTED: bool, const ORDER: u8>(
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -1778,6 +2224,15 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
             IrOp::InsnStart { .. } => None,
             IrOp::ReadSelector { dst, segment } => {
                 temps[*dst as usize] = u64::from(cpu.selector(*segment));
+                None
+            }
+            IrOp::Fence { kind } => {
+                let order = match kind {
+                    FenceKind::Full => std::sync::atomic::Ordering::SeqCst,
+                    FenceKind::Load => std::sync::atomic::Ordering::Acquire,
+                    FenceKind::Store => std::sync::atomic::Ordering::Release,
+                };
+                std::sync::atomic::fence(order);
                 None
             }
             IrOp::ReadReg { dst, reg } => exec_read_reg(cpu, temps, dst, reg),
@@ -2101,7 +2556,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         *vector,
                         read_val(*offset, temps),
                         *size,
-                        scalar_limit_access(ir.ops, cpu.rip),
+                        scalar_limit_access(ir.ops, cpu.rip, *offset),
                     ));
                 }
                 None
@@ -2133,6 +2588,22 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                 )
                 .map_err(|exit| operand_fault(exit, cpu.rip, read_val(*addr, temps), *fault))?;
                 None
+            }
+            IrOp::LoopCx {
+                kind,
+                taken,
+                fallthrough,
+            } => {
+                execute_loop(
+                    cpu,
+                    context,
+                    *kind,
+                    16,
+                    false,
+                    *taken as u32,
+                    *fallthrough as u32,
+                )?;
+                return Ok(outcome);
             }
             IrOp::Jump { target: ip } => {
                 cpu.rip = target(cpu, context, read_val(*ip, temps), 4)?;
@@ -2240,6 +2711,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         }
                     }
                     L::Enter { size, alloc, level } => {
+                        prepare_enter_displays(cpu, context, *size, *alloc, *level);
                         // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
                         // selects frame values independently of stack address size.
                         let stack_mask = mask(context.stack_address_bits / 8);
@@ -2295,16 +2767,25 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                     .0
                                 })
                                 .collect::<Vec<_>>();
-                            let value = if physical
+                            let cached = enter_display(cpu, i);
+                            let first = mem.read_index.get();
+                            let partial = physical
                                 .iter()
-                                .any(|at| overlay.iter().any(|(p, _)| p == at))
-                            {
+                                .any(|at| overlay.iter().any(|(p, _)| p == at));
+                            let value = if partial {
                                 let mut value = 0;
                                 for (byte, at) in physical.into_iter().enumerate() {
                                     let part = if let Some((_, value)) =
                                         overlay.iter().rev().find(|(p, _)| *p == at)
                                     {
                                         u64::from(*value)
+                                    } else if cached.is_some() {
+                                        mem.skip_read(
+                                            cpu,
+                                            u64::from((address as u32).wrapping_add(byte as u32)),
+                                            1,
+                                        );
+                                        0
                                     } else {
                                         read(
                                             cpu,
@@ -2316,9 +2797,24 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                                     value |= part << (byte * 8);
                                 }
                                 value
+                            } else if cached.is_some() {
+                                mem.skip_read(cpu, address, *size);
+                                0
                             } else {
                                 read(cpu, mem, address, *size)?
                             };
+                            let value = cached.unwrap_or(value);
+                            if cached.is_none() {
+                                record_enter_display(
+                                    cpu,
+                                    first..mem.read_index.get(),
+                                    i,
+                                    address,
+                                    *size,
+                                    partial,
+                                    value,
+                                );
+                            }
                             values.push(value);
                         }
                         if *level != 0 {
@@ -2327,6 +2823,7 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         push(cpu, mem, context, &values, *size)?;
                         cpu.write_gpr(RBP, frame, *size);
                         adjust(cpu, context, 0u32.wrapping_sub(u32::from(*alloc)));
+                        cpu.clear_mmio_parts();
                     }
                     L::Table {
                         addr,
@@ -2603,6 +3100,17 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         // SDM Vol 2B §4.3 PUSHA/POPA: original SP/ESP occupies
                         // the fifth slot; POPA skips it without loading a register.
                         if *pop {
+                            // SDM Vol 2B §4.3 POPA/POPAD; 80386 PRM §17 POPA:
+                            // preflight the whole frame before any device read,
+                            // including the discarded SP/ESP slot.
+                            segment_access(
+                                cpu,
+                                context,
+                                SegmentId::Ss,
+                                sp(cpu, context),
+                                8 * *size,
+                                AccessKind::Read,
+                            )?;
                             let mut values = [0; 8];
                             for (i, value) in values.iter_mut().enumerate() {
                                 if i != 3 {
@@ -2801,6 +3309,8 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                         if let Some(d) = &mut descriptor {
                             accessed(cpu, mem, d)?;
                         }
+                        // SDM Vol 3A §11.3: all frame reads complete before retirement.
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                         legacy::restore_flags(cpu, context.generation, image)?;
                         // IRET restores RF in a 32-bit frame; POPFD does not.
                         if *size == 4 {
@@ -2821,34 +3331,19 @@ fn walk<const ROUTED: bool, const ORDER: u8>(
                     L::Loop {
                         kind,
                         count_bits,
+                        check_target,
                         taken,
                         next,
                     } => {
-                        let size = count_bits / 8;
-                        let count = cpu.gpr[1] & mask(size);
-                        let decrement = !matches!(kind, crate::ir::LoopKind::Jcxz);
-                        let count = if decrement {
-                            count.wrapping_sub(1) & mask(size)
-                        } else {
-                            count
-                        };
-                        let take = match kind {
-                            crate::ir::LoopKind::Jcxz => count == 0,
-                            crate::ir::LoopKind::Loop => count != 0,
-                            crate::ir::LoopKind::Loope => count != 0 && cpu.flags.zf,
-                            crate::ir::LoopKind::Loopne => count != 0 && !cpu.flags.zf,
-                        };
-                        // SDM Vol 2A §3.3 LOOP: an untaken loop completes its
-                        // decrement before the next sequential fetch can fault.
-                        let ip = if take {
-                            target(cpu, context, u64::from(*taken), 4)?
-                        } else {
-                            u64::from(*next)
-                        };
-                        if decrement {
-                            cpu.write_gpr(1, count, size);
-                        }
-                        cpu.rip = ip;
+                        execute_loop(
+                            cpu,
+                            context,
+                            *kind,
+                            *count_bits,
+                            *check_target,
+                            *taken,
+                            *next,
+                        )?;
                         return Ok(outcome);
                     }
                     L::String {

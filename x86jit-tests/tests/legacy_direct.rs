@@ -367,3 +367,100 @@ fn application_ram_selection_keeps_active_string_transfer_slots() {
     vm.read_bytes(0x4000, &mut data).unwrap();
     assert_eq!(data, [0xcd, 0xab, 0x33, 0x44]);
 }
+
+#[test]
+fn unified_stack_and_loop_ir_has_only_model_vector_differences() {
+    // Decision-23 §5: both front ends must emit the same width-aware body.
+    // SDM Vol 2B §4.3 PUSH/POP; Vol 2A §3.3 LOOP: dword slots and ECX.
+    let code = b"\x66\x50\x66\x5b\x67\xe2\x00";
+    let mut alias = Vm::new(VmConfig::flat(0x20000));
+    alias.set_cpu_mode(CpuMode::Real16);
+    alias.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
+    alias.write_bytes(0x1000, code).unwrap();
+    let expected = x86jit_core::lift::lift_block(
+        &alias.mem,
+        x86jit_core::lift::FetchAddr::flat(0x1000),
+        CpuMode::Real16,
+    )
+    .unwrap();
+    let mut machine = Vm::new(VmConfig::flat(0x20000));
+    machine.set_cpu_model(CpuModel::I80386);
+    machine.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
+    machine.write_bytes(0x1000, code).unwrap();
+    let mut cpu = machine.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.gpr[4] = 0x8000;
+    cpu.run_steps(&machine, 1, StepOptions::default()).unwrap();
+    let CachedBlock::Interpreted(ir) = machine
+        .cache
+        .get(BlockKey::machine_direct(0x1000, 0, true))
+        .unwrap()
+    else {
+        panic!("Direct block must be interpreted");
+    };
+    assert_eq!(
+        (ir.icount, ir.guest_len, ir.temp_count),
+        (expected.icount, expected.guest_len, expected.temp_count)
+    );
+    let mut observed = ir.ops.clone();
+    observed.retain(|op| {
+        !matches!(
+            op,
+            x86jit_core::IrOp::Legacy(x86jit_core::legacy::LegacyOp::SharedWalk)
+        )
+    });
+    for op in &mut observed {
+        if let x86jit_core::IrOp::Legacy(x86jit_core::legacy::LegacyOp::DirectStackAddress {
+            vector,
+            bytes,
+            ..
+        }) = op
+        {
+            assert_eq!((*vector, *bytes), (12, 4));
+            *vector = 13;
+        }
+    }
+    assert_eq!(format!("{observed:?}"), format!("{:?}", expected.ops));
+    #[cfg(debug_assertions)]
+    assert_eq!(ir.verify_temp_defs(), Ok(()));
+}
+
+#[test]
+fn compact_word_loop_is_shared_with_the_alias_on_both_bus_routes() {
+    // SDM Vol 2A §3.3 LOOP; 80386 PRM §17 LOOP p. 17-104:
+    // the address attribute selects CX and leaves the upper register bits intact.
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        for a20 in [false, true] {
+            let (vm, mut cpu) = setup(model, b"\xe2\xfe");
+            cpu.cpu.gpr[1] = 0x1234_5678_9abc_0002;
+            // A20 off with this selector withholds the raw-memory shortcut.
+            cpu.set_reg(x86jit_core::Reg::Ds, 0xf800);
+            cpu.cpu.legacy = CpuState::legacy_real_entry([0, 0xf800, 0, 0, 0, 0]).legacy;
+            cpu.set_a20_enabled(a20);
+            let alias = x86jit_core::lift::lift_block(
+                &vm.mem,
+                x86jit_core::lift::FetchAddr::flat(0x1000),
+                CpuMode::Real16,
+            )
+            .unwrap();
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!(cpu.cpu.gpr[1], 0x1234_5678_9abc_0001);
+            assert_eq!(cpu.cpu.rip, 0x1000);
+            assert!(alias.ops.iter().any(|op| matches!(op, IrOp::LoopCx { .. })));
+            if a20 {
+                let ir = block(&vm, 0x1000);
+                let observed: Vec<_> = ir
+                    .ops
+                    .iter()
+                    .filter(|op| {
+                        !matches!(op, IrOp::Legacy(x86jit_core::legacy::LegacyOp::SharedWalk))
+                    })
+                    .collect();
+                assert_eq!(format!("{observed:?}"), format!("{:?}", alias.ops));
+            }
+            // The wrapped-bus route keeps its existing instruction cache;
+            // its successful count/IP result above exercises the legacy walk.
+        }
+    }
+}

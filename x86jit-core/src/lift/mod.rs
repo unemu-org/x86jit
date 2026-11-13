@@ -749,10 +749,21 @@ pub(crate) fn lift_block_watched(
     details: &mut Option<FetchFailure>,
     source: &crate::memory::LiftSource<'_>,
 ) -> Result<IrBlock, LiftError> {
+    lift_block_context(mem, at, mode, details, source, None)
+}
+
+pub(crate) fn lift_block_context(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
+    context: Option<crate::MachineContext>,
+) -> Result<IrBlock, LiftError> {
     loop {
         let permit = mem.fetch_permit();
         *details = None;
-        let result = lift_block_attempt(mem, at, mode, details, source);
+        let result = lift_block_attempt(mem, at, mode, details, source, context);
         let valid = source.validate();
         if valid && permit.as_ref().is_none_or(|p| p.is_current()) {
             return result;
@@ -766,6 +777,7 @@ fn lift_block_attempt(
     mode: CpuMode,
     details: &mut Option<FetchFailure>,
     source: &crate::memory::LiftSource<'_>,
+    context: Option<crate::MachineContext>,
 ) -> Result<IrBlock, LiftError> {
     let start = at.ip;
     let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new(mode, start);
@@ -849,7 +861,16 @@ fn lift_block_attempt(
             guest_addr: insn.ip(),
         });
 
-        let terminated = match lift_insn(&insn, &mut ops, &mut tg, mode, &mut mmx_sequence) {
+        let lowered = if let Some(context) = context {
+            let mut shared = legacy::ContextOps {
+                ops: &mut ops,
+                context,
+            };
+            lift_insn(&insn, &mut shared, &mut tg, mode, &mut mmx_sequence)
+        } else {
+            lift_insn(&insn, &mut ops, &mut tg, mode, &mut mmx_sequence)
+        };
+        let terminated = match lowered {
             Ok(terminated) => terminated,
             Err(e) => {
                 // Lowering can emit ops before discovering an unsupported operand.
@@ -1035,6 +1056,7 @@ fn lower_real16_esc_gap(
         // the entire operand must fit. Vector 13 retains Real16's scalar policy;
         // see the documented SS divergence at `with_segment`.
         ops.push(IrOp::SegLimitCheck {
+            alias_low16: true,
             offset,
             size: insn.memory_size().size() as u8,
             vector: 13,
@@ -1778,7 +1800,9 @@ fn lift_region_attempt(
             }
             // Region compilation is a JIT tier-up path; Real16 never JITs (§17.6, it
             // stays on the interpreter), so successor addresses are flat here.
-            if let Ok(b) = lift_block_attempt(mem, FetchAddr::flat(s), mode, &mut None, source) {
+            if let Ok(b) =
+                lift_block_attempt(mem, FetchAddr::flat(s), mode, &mut None, source, None)
+            {
                 let count = guest_access_descriptors(&b.ops);
                 if *descriptors + count > MAX_GUEST_ACCESS_DESCRIPTORS {
                     continue;
@@ -1804,7 +1828,7 @@ fn lift_region_attempt(
         post.push(addr); // finished: post-order
     }
 
-    let first = lift_block_attempt(mem, FetchAddr::flat(entry), mode, details, source)?;
+    let first = lift_block_attempt(mem, FetchAddr::flat(entry), mode, details, source, None)?;
     let mut descriptors = guest_access_descriptors(&first.ops);
     let mut icount = first.icount;
     let mut blocks = HashMap::from([(entry, first)]);
@@ -2361,6 +2385,42 @@ fn lift_insn(
     if ops.legacy_context().is_some() {
         return legacy::lower(insn, ops, tg);
     }
+    if mode == CpuMode::Real16 && legacy::shared_family(insn) {
+        if !legacy::alias_supported(insn) {
+            return Err(unsupported_insn(insn));
+        }
+        let first = ops.len();
+        let mut shared = legacy::ContextOps {
+            ops,
+            context: legacy::alias_context(),
+        };
+        let ends = legacy::lower(insn, &mut shared, tg)?;
+        // The alias has selector-derived segments and inert retained state;
+        // segment/frame commits preserve its existing application block boundary.
+        for op in &mut shared[first..] {
+            match op {
+                IrOp::Legacy(crate::legacy::LegacyOp::Loop { next, .. }) => *next &= 0xffff,
+                IrOp::LoopCx { fallthrough, .. } => *fallthrough &= 0xffff,
+                _ => {}
+            }
+        }
+        return Ok(ends
+            && (matches!(
+                insn.mnemonic(),
+                Mnemonic::Jmp
+                    | Mnemonic::Call
+                    | Mnemonic::Ret
+                    | Mnemonic::Retf
+                    | Mnemonic::Iret
+                    | Mnemonic::Iretd
+                    | Mnemonic::Loop
+                    | Mnemonic::Loope
+                    | Mnemonic::Loopne
+                    | Mnemonic::Jcxz
+                    | Mnemonic::Jecxz
+                    | Mnemonic::Bound
+            ) || (insn.mnemonic() == Mnemonic::Mov && insn.op0_register() == Register::CS)));
+    }
     sequence.check(insn, ops);
     let start = ops.len();
     let result = if insn.is_broadcast() || evex_is_masked(insn) {
@@ -2392,16 +2452,6 @@ fn lift_insn_inner(
         // pure cache hint with no architectural effect (Go's runtime memmove emits it).
         Nop | Endbr64 | Endbr32 | Pause | Rdsspd | Rdsspq | Prefetchnta | Prefetcht0
         | Prefetcht1 | Prefetcht2 | Prefetchw | Prefetchwt1 => Ok(false),
-
-        // Real-mode segment-register moves (§17.6): `mov Sreg, r/m16` / `mov r/m16,
-        // Sreg`. Gated to Real16 (Long64/Compat32 keep rejecting these) and placed before
-        // the generic `Mov` so the segment operand is loaded/stored as a selector rather
-        // than mis-lowered through `iced_to_reg` (which has no slot for CS/DS/ES/SS).
-        Mov if mode.wraps_16()
-            && (sreg_operand(insn, 0).is_some() || sreg_operand(insn, 1).is_some()) =>
-        {
-            lift_mov_sreg_real16(insn, ops, tg)
-        }
 
         Mov if !mode.wraps_16()
             && (insn.op_register(0).is_segment_register()
@@ -4177,27 +4227,11 @@ fn lift_insn_inner(
         Pop => lift_pop(insn, ops, tg, mode).map(|_| false),
 
         // --- control flow: ends the block ---
-        // Real16 far `jmp`/`call` (segment:offset) reload CS (§17.6): `jmp/call ptr16:16`
-        // (`EA`/`9A`) or `jmp/call m16:16` (`FF /5`, `FF /3`), and `retf`/`retf imm16`
-        // (`CB`/`CA`). The dispatcher recomputes the fetch address from the new CS:IP.
-        Jmp if mode.wraps_16() && is_far_jmp(insn) => {
-            lift_far_jmp_real16(insn, ops, tg).map(|_| true)
-        }
         Jmp => {
             let target = branch_target(insn, ops, tg, mode)?;
             ops.push(IrOp::Jump { target });
             Ok(true)
         }
-        Call if mode.wraps_16() && is_far_call(insn) => {
-            lift_far_call_real16(insn, ops, tg).map(|_| true)
-        }
-        Retf if mode.wraps_16() => lift_retf_real16(insn, ops).map(|_| true),
-        // Real16 near call/ret address the stack at SS:SP with a 16-bit wrap, which the
-        // specialized `Call`/`Ret` ops (flat SP, 32-bit `wrap_sp`) can't express — lift
-        // them to generic ops + `Jump` instead (§17.6). Long64/Compat32 keep the
-        // specialized ops untouched.
-        Call if mode.wraps_16() => lift_call_real16(insn, ops, tg).map(|_| true),
-        Ret if mode.wraps_16() => lift_ret_real16(insn, ops, tg).map(|_| true),
         Call => {
             let slot = call_ret_slot(insn, mode)?;
             let target = branch_target(insn, ops, tg, mode)?;
@@ -4227,11 +4261,6 @@ fn lift_insn_inner(
             });
             Ok(true)
         }
-        // `leave` (§17.6, `C9`) in real mode: SP = BP, then pop BP off SS:(new SP). Placed
-        // before the generic arm because the latter reads BP as a *linear* address (base
-        // 0), wrong once the SS segment base applies. Long64/Compat32 fall through.
-        Leave if mode.wraps_16() => lift_leave_real16(insn, ops, tg).map(|_| false),
-
         // leave = mov rsp, rbp; pop rbp. A 66h override (`Leavew`) makes the pop
         // 16-bit: BP is written 16-bit (upper bits preserved) and SP advances by 2,
         // while RSP itself is still a full-width stack-pointer write (§16).
@@ -4339,14 +4368,6 @@ fn lift_insn_inner(
             });
             Ok(true)
         }
-        Bound if mode.wraps_16() => {
-            // `bound r16, m16&16` (#BR, vector 5). The register-source encoding (mod=11)
-            // is architecturally invalid and never reaches here — iced rejects it and the
-            // decode loop delivers #UD. So only the memory form is lifted.
-            lift_bound_real16(insn, ops, tg)?;
-            Ok(true)
-        }
-
         Ud2 => {
             ops.push(IrOp::Trap {
                 vector: 6,
@@ -4399,23 +4420,6 @@ fn lift_insn_inner(
             ops.push(IrOp::SetIf { value: true });
             Ok(false)
         }
-        Pushf if mode.wraps_16() => {
-            ops.push(IrOp::PushfReal);
-            Ok(false)
-        }
-        Popf if mode.wraps_16() => {
-            ops.push(IrOp::PopfReal);
-            Ok(false)
-        }
-        Iret if mode.wraps_16() => {
-            // SDM Vol 3A §11.3: IRET is serializing, including in real mode.
-            ops.push(IrOp::Fence {
-                kind: FenceKind::Full,
-            });
-            ops.push(IrOp::IretReal);
-            Ok(true)
-        }
-
         Pushf | Pushfd | Pushfq if !mode.wraps_16() => {
             lift_flag_stack(insn, ops, tg, mode, false)?;
             Ok(false)
@@ -4478,13 +4482,6 @@ fn lift_insn_inner(
             Ok(false)
         }
 
-        // CX-driven near branches (§17.6): `loop`/`loope`/`loopne`/`jcxz`. Each ends the
-        // block; the CX predecrement / zero test runs in the interpreter.
-        Loop if mode.wraps_16() => lift_loop_real16(insn, ops, LoopKind::Loop).map(|_| true),
-        Loope if mode.wraps_16() => lift_loop_real16(insn, ops, LoopKind::Loope).map(|_| true),
-        Loopne if mode.wraps_16() => lift_loop_real16(insn, ops, LoopKind::Loopne).map(|_| true),
-        Jcxz if mode.wraps_16() => lift_loop_real16(insn, ops, LoopKind::Jcxz).map(|_| true),
-
         // Undocumented but 286-valid accumulator ops (§17.6). `salc` (`D6`): `AL = CF ?
         // 0xFF : 0x00`, no flags touched. `xlatb` (`D7`): `AL = [seg:(BX + AL)]`.
         Salc if mode.wraps_16() => {
@@ -4508,7 +4505,6 @@ fn lift_insn_inner(
             });
             Ok(false)
         }
-        Xlatb if mode.wraps_16() => lift_xlat_real16(insn, ops, tg).map(|_| false),
 
         // Flag-image transfers: `lahf` (`9F`) loads AH from the FLAGS low byte, `sahf`
         // (`9E`) stores AH into it. Valid in EVERY mode — 64-bit included, where AMD has
@@ -4523,34 +4519,6 @@ fn lift_insn_inner(
             ops.push(IrOp::Sahf);
             Ok(false)
         }
-
-        // Push/pop all GPRs (§17.6): `pusha` (`60`) / `popa` (`61`). 16-bit forms only on
-        // the 286 (the 32-bit `pushad`/`popad` are 386+). Interpreter walks the frame.
-        Pusha if mode.wraps_16() => {
-            ops.push(IrOp::PushaReal);
-            Ok(false)
-        }
-        Popa if mode.wraps_16() => {
-            ops.push(IrOp::PopaReal);
-            Ok(false)
-        }
-
-        // `enter alloc, level` (§17.6, `C8`): build a nested stack frame. `alloc` is the
-        // imm16 local-space size, `level` the imm8 nesting depth (used mod 32).
-        Enter if mode.wraps_16() => {
-            ops.push(IrOp::EnterReal {
-                alloc: insn.immediate16(),
-                level: insn.immediate8_2nd(),
-            });
-            Ok(false)
-        }
-
-        // Far-pointer loads (§17.6): `les r16, m16:16` (`C4`) / `lds r16, m16:16` (`C5`)
-        // load the 16-bit offset into the register and the 16-bit selector into ES / DS.
-        // The register-source (mod=11) encoding is invalid and never reaches here (iced
-        // rejects it → the decode loop delivers #UD). LSS/LFS/LGS are 386+ and absent.
-        Les if mode.wraps_16() => lift_load_far_ptr_real16(insn, ops, tg, Reg::Es).map(|_| false),
-        Lds if mode.wraps_16() => lift_load_far_ptr_real16(insn, ops, tg, Reg::Ds).map(|_| false),
 
         _ => {
             if let Some(cond) = jcc_cond(insn.mnemonic()) {
@@ -4939,6 +4907,10 @@ fn mark_memory_accesses(insn: &Instruction, mode: CpuMode, ops: &mut [IrOp]) {
             {
                 (u16::from(*size), true)
             }
+            IrOp::Store { size, .. } if insn.mnemonic() == Mnemonic::Call => {
+                (u16::from(*size), true)
+            }
+            IrOp::Load { size, .. } if insn.mnemonic() == Mnemonic::Ret => (u16::from(*size), true),
             IrOp::Call { slot, .. } | IrOp::Ret { slot, .. } => (u16::from(*slot), true),
             IrOp::PushFlags { size, .. } => (u16::from(*size), true),
             IrOp::RepString { elem, .. } => (u16::from(*elem), false),
@@ -5163,6 +5135,7 @@ pub(crate) fn with_segment(
         let size = insn.memory_size().size();
         if (1..=4).contains(&size) {
             ops.push(IrOp::SegLimitCheck {
+                alias_low16: true,
                 offset: addr,
                 size: size as u8,
                 vector: 13,
@@ -5204,36 +5177,32 @@ pub(crate) fn iced_segment_reg(reg: Register) -> Option<Reg> {
     })
 }
 
-/// Turn a stack pointer (`SP`/`ESP`/`RSP`) into the physical stack access address for
-/// the mode (§17.6). In Real16 the stack lives at SS: the physical address is
-/// `ss_base + (offset & 0xFFFF)` with `ss_base = SS << 4`; the caller passes an
-/// already-16-bit-wrapped offset. In Long64/Compat32 the stack is flat, so the offset
-/// *is* the address. `mark_memory_accesses` attaches Long64 SS metadata at lift time.
+/// Flat stack addressing for the Application Long64/Compat32 lowering.
+/// Real16 and Machine stacks use `legacy::stack_address`.
 pub(crate) fn stack_addr(
     offset: Val,
-    ops: &mut impl LiftBuffer,
-    tg: &mut TempGen,
+    _ops: &mut impl LiftBuffer,
+    _tg: &mut TempGen,
     mode: CpuMode,
 ) -> Val {
-    if !mode.wraps_16() {
-        return offset;
-    }
-    let ss = read_reg(Reg::Ss, ops, tg);
-    let base = alu_none(ops, tg, |dst| IrOp::Shl {
-        dst,
-        a: ss,
-        b: Val::Imm(4),
-        size: 8,
-        set_flags: FlagMask::NONE,
-    });
-    add_addr(offset, base, ops, tg)
+    debug_assert!(!mode.wraps_16());
+    offset
 }
 
 /// Emit a non-flag-setting address addition for the execution context.
 pub(crate) fn add_addr(a: Val, b: Val, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
     // SDM Vol 3A §3.4: legacy linear addresses are 32 bits, including
     // subsequent parts of a segmented memory operand.
-    let size = if ops.legacy_context().is_some() { 4 } else { 8 };
+    // Direct offsets are truncated before segmentation and the whole operand
+    // fits the ordinary 64-KiB segment, so its linear sum cannot overflow 32 bits.
+    let size = if ops
+        .legacy_context()
+        .is_some_and(|context| context.segment_class == crate::SegmentClass::Checked)
+    {
+        4
+    } else {
+        8
+    };
     let t = tg.fresh();
     ops.push(IrOp::Add {
         dst: t,
@@ -5464,12 +5433,12 @@ pub(crate) fn mask_pc(addr: u64, mode: CpuMode) -> u64 {
 }
 
 /// Emit a mask on a freshly-computed stack pointer temp so it is a valid pointer
-/// before it is used as a store address (§16): mod 2^32 in Compat32, mod 2^16 in
-/// Real16. Long mode passes through (RSP is already the full pointer).
+/// before it is used as a store address (§16): mod 2^32 in Compat32.
+/// Long mode passes through. Real16 stacks use the context-aware lowering.
 pub(crate) fn emit_sp_wrap(ops: &mut impl LiftBuffer, sp: Temp, mode: CpuMode) {
     let mask = match mode {
         CpuMode::Compat32 => 0xFFFF_FFFFu64,
-        CpuMode::Real16 => 0xFFFFu64,
+        CpuMode::Real16 => unreachable!("Real16 stacks use the context-aware lowering"),
         CpuMode::Long64 => return,
     };
     ops.push(IrOp::And {
