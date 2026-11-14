@@ -957,6 +957,19 @@ have landed (C1 changes decoding, so it may not land between U3 and U5), then C2
 then C4. P1, P3 and P4 are pinned now. C3, C5, C6 and the T stages keep their
 places.
 
+**Amendment (C4 split, 2026-11-14, accepted by the maintainer).** C4 is split in two
+so that the 8080-family project's joint witnesses do not wait for the V-series
+extension instructions. C4a: the `NecV20`/`NecV30` entries with the 8086 core and
+the 80186 additions, the MD flag, BRKEM, RETEM and CALLN, and the 8080-mode `Exit`
+contract agreed with that project. Three points were decided in its review:
+- the core decodes RETEM and CALLN when the adapter hands back at the ED escape;
+- BRKEM and CALLN clear IE and BRK as interrupt entry does (NEC UM p. 6-1; ASSUMED);
+- `halted` is part of the exchanged view.
+
+C4b: the native-mode extension instructions (the bit, BCD-string and nibble-rotate
+groups and the rest the NEC manual lists). Until C4b lands, they end in
+`Exit::UnknownInstruction`.
+
 Prerequisites of 8086/8088 work, in order: **U0, U1, U2, C1, P1.** U3-U5 are not
 prerequisites: an 8086 model needs the Direct class and the catalogue, not the
 removal of the old path. C2 should still land after U3 if U3 is close, so that the
