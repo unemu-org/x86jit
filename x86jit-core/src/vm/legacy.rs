@@ -6,7 +6,7 @@ use crate::legacy::{
     derive_legacy_context, CpuGeneration, LegacyCpuState, MachineContext, MachineRegime, SegmentId,
 };
 use crate::IrOp;
-use iced_x86::{Decoder, DecoderError, DecoderOptions};
+use iced_x86::{Decoder, DecoderError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LegacyBlockKey {
@@ -682,7 +682,14 @@ fn resolve_direct_uncached(
             let mut code = vec![0; ir.guest_len as usize];
             let copied = vm.mem.fetch_code(physical, &mut code).unwrap_or(0);
             code.truncate(copied);
-            let mut decoder = Decoder::with_ip(16, &code, cpu.rip, DecoderOptions::MOV_TR);
+            let mut decoder = Decoder::with_ip(
+                16,
+                &code,
+                cpu.rip,
+                crate::model::profile_for_generation(context.generation)
+                    .isa
+                    .decoder_options(),
+            );
             let mut count = 0;
             let mut end = cpu.rip;
             let mut special = None;
@@ -693,11 +700,11 @@ fn resolve_direct_uncached(
                 let bytes = &code[position..decoder.position()];
                 // Match incremental Machine fetch: an unavailable I286 opcode
                 // byte wins before a later ESC can reach its MSW gate.
-                let reference_bytes = if context.generation == CpuGeneration::I286
-                    && crate::lift::legacy::unavailable_i286_opcode(bytes)
+                let isa = crate::model::profile_for_generation(context.generation).isa;
+                let reference_bytes = if isa.legacy_segments_only() && isa.unavailable_prefix(bytes)
                 {
                     let end = (1..=bytes.len())
-                        .find(|&end| crate::lift::legacy::unavailable_i286_opcode(&bytes[..end]))
+                        .find(|&end| isa.unavailable_prefix(&bytes[..end]))
                         .expect("unavailable opcode byte");
                     &bytes[..end]
                 } else {
@@ -892,16 +899,17 @@ fn fetch_watched(
             source.record(addr, &byte);
         }
         bytes.push(byte[0]);
-        if context.generation == CpuGeneration::I286
-            && crate::lift::legacy::unavailable_i286_opcode(&bytes)
-        {
+        let isa = crate::model::profile_for_generation(context.generation).isa;
+        if isa.legacy_segments_only() && isa.unavailable_prefix(&bytes) {
             break;
         }
         let mut decoder = Decoder::with_ip(
             u32::from(context.default_operand_bits),
             &bytes,
             ip,
-            DecoderOptions::MOV_TR,
+            crate::model::profile_for_generation(context.generation)
+                .isa
+                .decoder_options(),
         );
         let insn = decoder.decode();
         if !insn.is_invalid() || decoder.last_error() != DecoderError::NoMoreBytes {

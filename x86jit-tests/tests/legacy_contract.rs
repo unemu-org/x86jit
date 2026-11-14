@@ -393,7 +393,7 @@ fn catalogue_pins_current_machine_profiles() {
             ModelSystem::Msw286,
             24,
             10,
-            0x286,
+            0x3699e02a8ef13e63,
             0xf000,
         ),
         (
@@ -403,7 +403,7 @@ fn catalogue_pins_current_machine_profiles() {
             ModelSystem::Cr386,
             32,
             15,
-            0x386,
+            0xe8d00c17f97eb71f,
             0x8000,
         ),
     ] {
@@ -421,6 +421,7 @@ fn catalogue_pins_current_machine_profiles() {
         assert!(!profile.quirks.push_sp_after_decrement);
         assert_eq!(profile.quirks.shift_count_mask, Some(31));
         assert_eq!(profile.quirks.real_flags_clear_mask, flags_mask);
+        assert_eq!(profile.quirks.flags_fixed_zero, (1 << 18) | (1 << 21));
     }
 }
 

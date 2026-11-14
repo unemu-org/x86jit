@@ -937,3 +937,313 @@ Runtime binaries ran serially, two threads, timeout 180; backend lib filters 182
 The complete R6/R7 one-step control adds 18.303–22.929 instructions/call. These are real-mode runs with an empty origin, so the new full matching/take-return helper is not entered. The net cost includes the empty-origin test and generated result/entry code; their individual instruction contributions were not isolated. Register allocation/result-carrier explanations remain ASSUMED. Closing the listed residual needs specialization or reuse of an existing boundary while keeping every preflight and dispatcher return inside the fail-closed ownership rule. No semantic guard may be dropped.
 
 A final gate fails; code is retained and work stops. The protected abandoned-origin defect is fixed. Real-mode/alias differences stay documented for the separate bead. No public API/layout or IR/backend fixture changed. Decision-23 was read, not edited. Its supervisor-owned ordering amendment changed concurrently; the measured U4/U5 gate text did not. No commits, git writes, bead operations or pushes were performed.
+
+
+## C1 model decode and identity, round 1 (baseline 7274dd96)
+
+### Initial inventory — READ
+
+Line numbers in these two tables refer to the unchanged baseline. Catalogue
+values are data unless a consumer is named. The alias keeps its separate,
+frozen decoder (`lift/mod.rs:303–314`, `lift/legacy.rs:73–84`).
+
+| Consumer (core `src/`) | Decision today | decision-23 owner |
+|---|---|---|
+| `model.rs:28–35,103–133` | ISA-to-generation projection; three quirk fields have **no consumers** | §2 isa; §3 PUSH SP, counts, FLAGS |
+| `legacy.rs:247–286,328` | Reject 8086 PE, non-386 paging/default32; 286 24-bit descriptor storage; derive context | §2 system/physical_bits |
+| `lift/legacy.rs:140–163,170–176,194–278` | Partial 286 opcode rejection, MOV_TR option, memory-only table forms, feature-tag filters, 10/15-byte faults | §2 isa/max_insn_len; §3 undefined encodings |
+| `lift/legacy.rs:285` | Protected 286 coprocessor outputs/WAIT deferred | §2 fpu/system (decision-25) |
+| `lift/legacy.rs:460,717` | Constant #SS on 386, #GP on 286 Direct accesses | §3 operand crossing |
+| `lift/legacy.rs:869,933–965` | TSS types, descriptor query masks/conforming LSL | §2 system |
+| `lift/legacy.rs:1048,1090,1294–1305` | Reserved control register, MOV CS, later NOP/CPUID/UD0/UD2 traps | §2 isa/system; §3 undefined encodings |
+| `lift/legacy.rs:1112,1176–1177,1307–1313`; `lift/mod.rs:2271`; `interp/integer.rs:223` | PUSH pre-decrement value; common masked shifts; flag/IRET helpers | §3 PUSH SP/count/FLAGS |
+| `legacy.rs:867–919` / `interp/legacy.rs:233–248` | Runtime segment permissions/limits and 286-real #GP vs #SS | §3 operand crossing |
+| `legacy.rs:979–1012` | Generation/regime FLAGS images/load masks; already excludes AC/ID | §3 FLAGS/identity |
+| `interp/legacy.rs:802,1281,1353,1403` | 286 descriptor high bytes; gate types; 386 fault RF; real IDT-limit vector | §2 system; §3 exception vectors |
+| `interp/legacy.rs:2440,2463,2666` | Protected 286 coprocessor refusal, absent status-word output, MSW availability | §2 fpu; §3 numeric errors |
+| `interp/legacy.rs:2829,2848` | Table base truncation and MSW image | §2 system |
+| `interp/legacy.rs:3040,3050,3270`; `interp/legacy/tasks.rs:587,749–751` | Flags load/store, IRET/task flags (AC/ID already absent) | §3 FLAGS/identity |
+| `interp/legacy/tasks.rs:232–234,268–271,300–304,423,438,730,816,931` | Task fault vectors, TSS types/limit checks, CR3, segment order/descriptors | §2 system |
+| `vm/legacy.rs:148–159` | Double-fault classification | §2 system; §3 exception vectors |
+| `vm/legacy.rs:576–599,685–707,843–847,895–905` | Alias/Direct/incremental decode, length limits, partial 286 #UD | §2 isa/max_insn_len; §6 frozen alias |
+| `vm/legacy.rs:1038–1039` | Supported execution models and 286 reset fetch | §2 system |
+| `vm/legacy.rs:1223–1238,1434,1892–1930`; `interp/legacy.rs:2979–2988` | TF priority, SS inhibition and software-event stepping | §3 single step |
+| `vm.rs:1231`, cache key/stamp in `vm/legacy.rs` | Compatibility identity and per-model cache ownership | §2 semantics_id |
+
+Existing runtime generation checks above are an outstanding migration, not a
+claim that the whole interpreter already satisfies §3's lift-time-only rule.
+C1 introduces no additional per-op model branch.
+
+| §3 row | 80286 / 80386 baseline implementation and result | Manual match (286 / 386) |
+|---|---|---|
+| PUSH SP | `lift/legacy.rs:1112`: both pre-decrement | yes / yes (SDM 3B §25.17.1 p.25-7) |
+| FLAGS 15:12 | `legacy.rs:979–1012`: real zero / 7000h loaded | yes / yes (SDM 3B §25.17.2 p.25-7; PRM386 §14.7 item12 p.14-7) |
+| Shift/rotate count | common scalar ops mask to five bits | yes / yes (PRM286 App.C item9 p.C-2; PRM386 §14.7 item5 p.14-6) |
+| Divide saved CS:IP | scalar DIV faults at instruction start | yes / yes (PRM286 App.C item3 p.C-1; PRM386 §14.7 item2 p.14-5) |
+| Minimum signed quotient | common signed division permits -128/-32768 | yes / yes (PRM286 App.C item13 p.C-3; PRM386 §14.7 item11 p.14-7) |
+| Length | fetch/lift enforce 10 / 15 | yes / yes (PRM286 App.C item10 p.C-2; PRM386 §14.7 item6 p.14-6) |
+| Operand crossing FFFFh | Direct/Checked #GP / #SS on SS, otherwise #GP | yes / yes for integer ordinary limits; inherited big-real limits are separate |
+| Sequential past FFFFh | dispatcher/fetch retained CS limit checks; Machine keeps EIP past FFFFh | 286 value not derived in decision / 386 yes |
+| Above 1MiB | `legacy.rs:physical_span` 32-bit bus + optional A20 | 286 physical_bits=24 is metadata, not general 24-bit truncation / 386 32-bit yes |
+| Processor interrupts | exception/event dispatch models 5/6/7/8/12/13/16; coprocessor limits use generic addressing | 286 #9 absent for x87 segment overrun / 386 exception vectors follow Table14-1 |
+| Undefined encodings | feature filters plus hard traps; UD1 can escape as UnknownInstruction; F6 /1 source conflict below | incomplete / incomplete (PRM286 App.B #UD p.B-12; PRM386 §14.6 Table14-1 p.14-5) |
+| LOCK | strict Iced decoder in Machine for both | 286 valid LOCK MOV/MOVS/INS/OUTS rejected / 386 generally matches listed forms; unsupported atomic ADC/SBB remains refusal |
+| x87 segment end | Machine Direct/Checked address paths select #GP on 286 and #SS/#GP on 386 | mismatch on 286 (#9 required) / 386 matches; `state.rs` divergence comment describes the frozen alias |
+| Numeric error | common present-x87 #16 (`interp/legacy.rs:2481` and WAIT/ESC gate); pairing-specific details remain outside Present | yes / yes for this row; existing deferred FPU behavior unchanged |
+| Single-step vs external IRQ | shared dispatch tests TF before IRQ; software INT/exception stepping follows existing precedence rule | matches external-IRQ priority / matches external-IRQ priority; conflicting manual summaries documented at `interp/legacy.rs:2986` |
+| AC/ID | flag image/load/task helpers omit bits 18/21 already | yes / yes (PRM286 §2.3 pp.2-14–15; PRM386 §2.3.4 Fig.2-8 p.2-11; SDM3B §§25.16–25.16.1 pp.25-6–7) |
+
+The non-identity rows retain their current behavior in this round. Unmeasured
+coverage and audit needs are labelled READ, not represented as witness results.
+
+### Decode design and identity — READ
+
+`model/decode.rs` contains the explicit encoding membership table (one bit per
+current model), compiled to a constant-time code-indexed array. Decoder feature
+tags no longer decide Machine membership. Each `DecodeSet` owns decoder options,
+its segment-prefix policy, and the absent-encoding result. `DecodeAction` separates
+a defined instruction, a canonical alias, and absence: `Some(vector)` emits a
+fault, `None` returns a lift refusal which becomes `Exit::UnknownInstruction`.
+Both current entries select vector 6; neither uses the refusal policy. This
+provides the C2 policy without creating an 8086 model or guessing its encodings.
+The incremental 286 rejection is shared by fetching and lifting, preserving
+fault priority before later bytes or coprocessor gates are examined.
+
+SDM Vol 3B §25.15 pp.25-5–6 licenses canonical 82h group-1, group-2 /6 and
+group-3 /1 aliases. The existing accepted aliases retain their results. Reserved
+`UD0`/`UD2`, later NOPs and identity instructions are absent from the explicit
+sets; `UD1` is now absent too. The 80386 PRM Appendix A two-byte opcode map
+p.A-7 leaves 0F B9 undefined, and §14.6 Table14-1 p.14-5 requires #UD at the
+faulting instruction. This fixes the baseline's I80386 refusal. Existing
+reserved LOADALL/XBTS/IBTS slots continue to fault; the table does not admit them.
+The older unsupported coprocessor pairing policy is preserved (decision-25).
+
+`ModelQuirks::flags_fixed_zero` names AC/ID as catalogue data. Both entries
+select the existing early-processor flag helper shape at lift time. The central
+flag-load mask also names this same catalogue constant; it adds no per-op model
+lookup or branch. POPF/IRET and task switches already cleared AC/ID at the
+baseline, and flag/interrupt/task images already excluded them. This is a
+catalogue migration and new witnesses for that behavior, not a claim to repair
+an AC/ID toggle defect that the baseline witnesses could not reproduce.
+The other three quirk fields were unused at the baseline. They now select the
+supported lowering shape at lift time: pre-decrement PUSH SP value, five-bit
+counts, and the existing real-mode FLAGS image. Unimplemented shapes remain
+lift refusals; C2 supplies its own lowering. No quirk field is read by the
+interpreter. Existing runtime generation checks in system helpers remain listed
+in the inventory and are not expanded here.
+
+Identity authority, checked in the pinned local PDFs: SDM Vol 3B §25.13.1 and
+Table25-1 pp.25-4–5, §§25.15–25.16.1 pp.25-5–7; 80386 PRM §2.3.4 Fig.2-8
+p.2-11 and §14.6 Table14-1 p.14-5; 80286 PRM §2.3.4 Fig.2-10 p.2-15,
+§5.2.3 Table5-2 pp.5-5–7 and Appendix B #UD p.B-12. The flag diagrams and #UD/
+opcode-map page images were checked, not only OCR. The SDM instruction pages
+are Vol2A §3.3 BSWAP p.3-111, CMPXCHG p.3-194, CPUID p.3-203, INVD p.3-483,
+INVLPG p.3-485; Vol2B §4.3 RDMSR p.4-544 and RDTSC p.4-559; Vol2D §6 WBINVD
+p.6-2, WRMSR p.6-8 and XADD p.6-27. The latter three are in **Vol2D** in the
+pinned SDM. No second-witness inference from an emulator was used.
+
+`semantics_id` uses deterministic FNV-1a over explicit encoding membership and canonical alias pairs,
+decoder/absence/prefix policy, quirks, system/physical/length attributes, lift
+constants and FPU/timing selection, prefixed by `LIFT_POLICY_REVISION`. Changes to
+validation or alias/lowering rules independent of those values must bump that
+revision. Current identities are I80286 `3699e02a8ef13e63` and I80386
+`e8d00c17f97eb71f` (previously 286h/386h). Checked cache keys and context stamps
+include the identity, so old entries cannot hit. Direct caches are owned by a
+VM with its model locked before execution; no persisted cache survives a library
+rebuild. No Application cache-key/hash stream changes.
+
+The public change is one additional named attribute on the already non-exhaustive
+`ModelQuirks`, required by decision-23 §2's identity catalogue. The explicit decode
+sets, disposition and lift-policy details are private. No new CpuModel variant,
+Exit variant, public method, IR variant, dependency, CpuState field or jit_abi
+layout is introduced. Long64/Compat32 and the frozen Real16 alias retain their
+existing decoder. The architecture and spec §17.10 describe the new consumers.
+
+### Round-2 differences retained — READ
+
+- I80286 physical width: `physical_bits=24` is catalogue data, while the bus
+  helper wraps formed addresses at 32 bits and applies the separate A20 gate;
+  it does not generally truncate to 24 bits. Authority: 80286 PRM App.C hardware
+  item2 p.C-3; §6.3 Fig.6-3 p.6-5.
+- I80286 LOCK: the strict Machine decoder rejects forms which the 286 permits
+  with MOV, MOVS, INS and OUTS. Authority: 80286 PRM App.C item11 p.C-2;
+  80386 PRM §14.8.1 p.14-8. The alias's permissive decoder is frozen.
+- I80286 x87 operand beyond the segment end: integer-style address checks select
+  #GP/#SS instead of the 286's interrupt9. Authority: 80286 PRM App.C TableC-1
+  p.C-1. I80386 Machine selects #SS/#GP through its existing address path, as
+  required by 80386 PRM §14.6 Table14-1 p.14-5. The generic `state.rs` divergence
+  comment describes alias behavior and needs a separate documentation audit.
+- The complete model-specific coprocessor and exception sets are not supplied
+  by `FpuModel::Present` (it deliberately makes no pairing-generation claim).
+  Generation-specific numeric-error details and unsupported x87 forms remain
+  outside this round. This is a coverage limitation, not a measured wrong-vector
+  result for the numeric-error row, whose implemented present-x87 path uses #16.
+
+For the 286 sequential-IP row the decision itself says “to derive”; there is no
+licensed value here against which to call the current limit fault a mismatch.
+The already-recorded real-mode REP comparison-fault differences in U4/U5 remain
+unchanged and are outside §3's quirk table.
+
+A further **READ source conflict** belongs to the undefined-encoding row: the
+80286 PRM Appendix B #UD p.B-12 names F6h /1 as an invalid extension, whereas
+SDM Vol3B §25.15 p.25-6 defines group3 /1 as the TEST /0 alias for compatibility
+with prior generations. The baseline executes TEST on I80286, and C1 preserves
+that behavior and pins it under the SDM rule (PROVENANCE.md §1 names the SDM as
+the instruction-semantics authority). The 286 PRM therefore does not corroborate
+this specific alias. A model-specific resolution belongs in the supervisor's
+round-2 brief; this report does not silently claim the sources agree.
+
+### Runtime checks — MEASURED
+
+Forty binaries; 1,366 passed, five ignored. Default-feature runtime tests ran
+serially, with two threads per binary and timeout 180. The backend unit run
+selected four Application witnesses (182 other tests filtered).
+
+| Binary | Passed / ignored | Binary | Passed / ignored |
+|---|---:|---|---:|
+| `application_codegen` | 3 / 0 | `legacy_real` | 92 / 0 |
+| `boundary` | 1 / 0 | `legacy_real_exceptions` | 8 / 0 |
+| `compat` | 14 / 0 | `legacy_real_parity` | 48 / 0 |
+| `environment_boundary` | 1 / 0 | `legacy_rep_fault_flags` | 1 / 0 |
+| `fault_atomicity` | 41 / 0 | `legacy_rollback_sweep` | 2 / 0 |
+| `fault_metadata` | 59 / 0 | `legacy_sse_integer` | 2 / 0 |
+| `fault_path` | 17 / 0 | `legacy_task_registers` | 6 / 0 |
+| `fences` | 6 / 2 | `legacy_task_switch` | 65 / 0 |
+| `fetch_policy` | 20 / 1 | `legacy_u3_review` | 44 / 0 |
+| `irq_shadow` | 38 / 0 | `legacy_upper_audit` | 0 / 0 |
+| `legacy_a20` | 50 / 0 | `machine_empty_fpu` | 17 / 0 |
+| `legacy_alias` | 5 / 0 | `real16_jit_guard` | 6 / 0 |
+| `legacy_contract` | 13 / 0 | `real16_wrap` | 20 / 0 |
+| `legacy_direct` | 13 / 0 | `real16_x87_model` | 21 / 0 |
+| `legacy_direct_parity` | 28 / 0 | `retired_count` | 21 / 0 |
+| `legacy_i286` | 34 / 0 | `run_steps` | 47 / 0 |
+| `legacy_idt` | 22 / 0 | `smc` | 59 / 0 |
+| `legacy_ldt` | 25 / 0 | `x86jit_core` | 420 / 2 |
+| `legacy_model_decode` | 9 / 0 | `x86jit_cranelift` | 4 / 0 |
+| `legacy_protected` | 63 / 0 | `x86jit_tests` | 21 / 0 |
+
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, and `cargo check --workspace --tests --release --features x86jit-tests/unicorn` passed. Unicorn feature compilation was checked; Unicorn runtime comparisons were not part of these counts. Core dependencies remain `{iced-x86}`; boundary/environment tests pass.
+
+### Identity and decode witnesses — MEASURED
+
+The identical standalone `legacy_model_decode` witness binary source was linked
+against each saved release core library: baseline **8 passed / 1 failed**;
+candidate **9 passed / 0 failed**. The failure is I80386 `UD1`, whose baseline
+exit is `UnknownInstruction { addr: 564, bytes: [0;15], len: 0 }`; the candidate
+reports vector6 at CS:IP 0100:0234. This is the only failing baseline witness.
+
+| Witness | 7274dd96 | C1 |
+|---|---|---|
+| Real POPF/PUSHF (POPFD/PUSHFD on 386), AC/ID attempts individually and together; alias low-word behavior | Pass | Pass |
+| Real IRET/IRETD identity probes, both models and alias | Pass | Pass |
+| All listed post-386 instructions: prefixed #UD, outward saved IP and actual in-guest CS:IP frame, both models | Pass | Pass |
+| UD1 reserved encoding, both models | Fail on I80386 | Pass |
+| Reserved LOADALL/XBTS/IBTS map slots, including 386 width prefixes | Pass | Pass |
+| 82h ADD, group2 /6 SAL, group3 /1 TEST aliases | Pass | Pass |
+| Protected default-16 286 / default-32 386 POPF and IRET identity probes | Pass | Pass |
+| Protected decode: every listed absent instruction at the model's default width | Pass | Pass |
+| CPUID in Application Long64/Compat32 and frozen Real16 alias | Pass | Pass |
+
+The strengthened task-switch witness attempts AC/ID in a 32-bit incoming TSS
+while checking retained RF and loaded TF. The identical source passes when
+linked against the baseline (one selected test, 64 filtered); all 65 task-switch
+tests pass on the candidate. Thus its before/after result is also Pass→Pass.
+The two-byte 286 FLAGS/TSS forms cannot represent bits18/21; the word probes
+also start with dirty system-flag storage and verify it is cleared on load.
+
+### Application invariants — MEASURED / READ
+
+All 27 Long64/Compat32 Application IR captures and nine frozen Real16 captures
+are byte-identical to the release baseline. The temporary capture source uses
+exactly the committed `application_fixtures.rs` (file comparison passed); no
+fixture was changed. `application_codegen` passes three tests; four backend
+Application unit witnesses preserve relocated/fixed native AArch64 emitted bytes.
+Other hosts' native bytes were not measured. No Application lowering, public IR
+shape, backend codegen, CpuState or jit_abi layout changed (source inspection).
+
+### Counted-gate method — MEASURED
+
+Rust 1.98.1, macOS AArch64, SDK14.4/deployment14.0, background scheduling,
+at most four Cargo build jobs. Baseline built from 7274dd96, before source edits;
+candidate built with the same flags. One benchmark process at a time, with no
+own builds/tests overlapping counted runs. Each of all sixteen workloads uses
+literal `real16_loops 1 3 <workload>`, including `smc-rmw-64`. The final candidate is compared against the unchanged, frozen three-round baseline measurements from the initial campaign. Cells below are
+median host instructions/step, baseline→candidate (percent change). All five
+paths' step, retirement and warmup counts must agree before a result is accepted.
+No timed sample is filtered. The C1 gate is +0.5% against the corresponding
+7274dd96 path, including Machine; the historical U3 gate is not substituted.
+
+Initial-campaign executable SHA-256: baseline
+`3d4749ef669f4c97656cbcba96d3d256d2265f15c865cdec1c6f68fe1ae48e5f`;
+initial candidate `16335e0502f7016a9a341391370611f0f6e090ebca57bc7890a0d947121ae29a`.
+The baseline hash also matches the frozen U4/U5 R7 executable above.
+
+### Initial SMC control and classification change — MEASURED / READ
+
+The first full campaign failed six I80386 SMC cells: `smc-next-1` +0.777% /
++0.751%, `smc-next-64` +1.147% / +1.150%, `smc-rmw-64` +1.160% / +1.185%
+(A20 on/off). The other 74 loop cells and both store widths passed. These
+samples are retained; no failed sample was filtered. The initial candidate is
+the executable with hash `16335e05…` above.
+
+The revised classifier checks membership first, uses a const-derived marker to
+bypass the canonical-alias match for ordinary instructions, and limits 286
+prefix/Sreg checks and memory-only table checks to the relevant admitted forms.
+Quirk/helper-shape checks now run only for their instruction families. This
+narrows lift-time work while retaining the same current-model results and fault
+policy. The semantics digest also directly hashes canonical alias pairs. The
+source-level extra checks were identified by inspection; no precise assembly
+attribution is claimed for the six measured increases.
+
+A second focused control (`b8f8cb86…`) still failed `smc-next-1`: alias
++0.501%, I386 A20 on/off +0.940%/+0.897%; I286 on/off passed. That campaign
+stopped at the failed workload; its measurements are retained separately and
+are not mixed into the final candidate table. Disassembly then showed that
+Machine I386 still entered the out-of-line 286 prefix checker, including its
+stack frame, where the original generation predicate had skipped it. The
+catalogue's prefix capability now guards the call in both fetch paths. Quirk
+checks sit in their corresponding match arms rather than in a shared prologue.
+The complete net effect is measured by the final gates; the six initial deltas
+are not assigned wholly to that single call.
+
+### Final counted gates — MEASURED
+
+Final executable SHA-256:
+`4db0da02d946edc96164f2b70b8479c507b363f0482a4542eb1a601debe9c461`.
+All sixteen final-candidate workloads were measured with three rounds against
+the retained, unchanged 7274dd96 baseline measurements. Store controls were
+remeasured as three interleaved pairs per width. The final release library again
+passes all nine decode/identity witnesses and preserves all 36 IR captures.
+The final source again passes the complete 40-binary runtime and static checks
+listed above; no fixture or hardware behavior outside the scoped decode fix was
+changed to pass a gate.
+
+| Workload | Alias | I286 A20 on | I386 A20 on | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 357.569→357.316 (-0.071%) | 362.911→362.861 (-0.014%) | 363.087→362.848 (-0.066%) | 363.156→362.848 (-0.085%) | 363.096→362.882 (-0.059%) |
+| `load` | 468.435→468.906 (+0.101%) | 478.203→478.078 (-0.026%) | 478.326→478.079 (-0.052%) | 478.414→478.186 (-0.048%) | 478.209→478.142 (-0.014%) |
+| `load-odd` | 479.691→479.603 (-0.018%) | 489.170→489.111 (-0.012%) | 489.160→489.246 (+0.018%) | 489.136→489.276 (+0.029%) | 489.498→489.335 (-0.033%) |
+| `store` | 432.431→432.065 (-0.085%) | 445.890→445.369 (-0.117%) | 445.720→445.609 (-0.025%) | 445.782→445.509 (-0.061%) | 445.766→445.610 (-0.035%) |
+| `push-pop` | 493.247→493.300 (+0.011%) | 491.500→491.089 (-0.084%) | 491.578→491.242 (-0.068%) | 491.483→491.481 (-0.000%) | 491.477→491.933 (+0.093%) |
+| `data-next-to-code` | 998.444→999.679 (+0.124%) | 1013.118→1014.725 (+0.159%) | 1014.533→1014.699 (+0.016%) | 1013.759→1014.642 (+0.087%) | 1013.327→1014.494 (+0.115%) |
+| `data-next-to-dense-code` | 999.674→999.457 (-0.022%) | 1014.848→1014.530 (-0.031%) | 1014.695→1014.282 (-0.041%) | 1014.834→1014.517 (-0.031%) | 1014.764→1013.948 (-0.080%) |
+| `call-ret` | 836.996→838.248 (+0.150%) | 907.444→908.369 (+0.102%) | 907.442→908.474 (+0.114%) | 907.418→909.081 (+0.183%) | 907.464→909.102 (+0.181%) |
+| `dos-mixed` | 454.910→455.193 (+0.062%) | 442.935→443.086 (+0.034%) | 442.920→443.326 (+0.092%) | 442.844→443.203 (+0.081%) | 442.828→443.210 (+0.086%) |
+| `rep-movsw` | 188.279→188.467 (+0.100%) | 188.213→188.485 (+0.145%) | 188.223→188.471 (+0.132%) | 188.203→188.471 (+0.142%) | 188.247→188.459 (+0.113%) |
+| `straight-line` | 410.818→411.975 (+0.282%) | 382.401→383.083 (+0.178%) | 381.874→382.240 (+0.096%) | 381.987→382.425 (+0.115%) | 382.091→382.685 (+0.155%) |
+| `ip-boundary-1` | 2413.922→2417.681 (+0.156%) | 2605.257→2609.596 (+0.167%) | 2605.309→2609.360 (+0.155%) | 2605.403→2610.641 (+0.201%) | 2604.849→2610.668 (+0.223%) |
+| `ip-boundary-64` | 343.723→344.174 (+0.131%) | 374.853→375.342 (+0.130%) | 374.757→375.359 (+0.161%) | 374.774→375.399 (+0.167%) | 374.965→375.355 (+0.104%) |
+| `smc-next-1` | 11092.090→11115.946 (+0.215%) | 5490.210→5501.633 (+0.208%) | 5386.598→5384.359 (-0.042%) | 5492.271→5505.893 (+0.248%) | 5389.578→5387.076 (-0.046%) |
+| `smc-next-64` | 9176.447→9165.932 (-0.115%) | 3689.836→3700.649 (+0.293%) | 3584.702→3584.777 (+0.002%) | 3691.369→3703.966 (+0.341%) | 3586.197→3583.603 (-0.072%) |
+| `smc-rmw-64` | 9285.748→9266.676 (-0.205%) | 4926.765→4925.790 (-0.020%) | 4804.850→4791.979 (-0.268%) | 4928.930→4927.894 (-0.021%) | 4806.459→4792.698 (-0.286%) |
+
+`interpreter_store_probe WIDTH single off 1000000`, identical augmented counted driver linked to each saved core library; 16M stores after equal warmup. Three serial interleaved samples per side. Gate: +0.5% instructions/store.
+
+| Width | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---:|
+| 8 | 298.284, 298.949, 298.410 (**298.410**) | 298.438, 298.318, 298.593 (**298.438**) | +0.009% |
+| 32 | 594.781, 593.978, 594.607 (**594.607**) | 594.466, 594.402, 594.946 (**594.466**) | -0.024% |
+
+All 80 path/workload cells and both store widths pass. Largest loop increase: +0.341% (`smc-next-64`, `legacy-i286-a20-off`).
+
+**ASSUMED before measurement:** lift-time changes should have zero steady-state cost. The counter results above include relifting and code/layout effects; no individual cause is assigned to differences within the gate. Other hosts and whole-program guest ladders were not measured. No commits, git writes, bead operations or pushes were performed.

@@ -135,47 +135,22 @@ pub(crate) fn segment(r: Register) -> Option<SegmentId> {
     })
 }
 
-/// Check opcode availability even when the instruction is not fully fetched.
-pub(crate) fn unavailable_i286_opcode(code: &[u8]) -> bool {
-    let mut opcode = code
-        .iter()
-        .skip_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3));
-    // I286 PRM Appendix B #UD p. B-12: invalid first or second opcode bytes
-    // suffice for #UD. Appendix B encodings (CLTS p. B-31, LAR p. B-60,
-    // LGDT/LIDT p. B-65, LSL p. B-71, LTR p. B-72) use only 0F 00–03/06.
-    match opcode.next() {
-        Some(0x64..=0x67) => true,
-        Some(0x0f) => match opcode.next() {
-            // Appendix B SLDT/STR/LLDT/LTR/VERR/VERW pp. B-66, B-72,
-            // B-102, B-108, B-111: 0F 00 has only extensions /0–/5.
-            Some(0x00) => opcode.next().is_some_and(|b| b & 0x38 >= 0x30),
-            // Appendix B LGDT/LIDT, LMSW, SGDT/SIDT, SMSW pp. B-65,
-            // B-67, B-101, B-103: /5 and /7 are absent; /0–/3 need memory.
-            Some(0x01) => opcode.next().is_some_and(|b| {
-                matches!(b & 0x38, 0x28 | 0x38) || (b & 0xc0 == 0xc0 && b & 0x38 <= 0x18)
-            }),
-            Some(0x02 | 0x03 | 0x06) | None => false,
-            Some(_) => true,
-        },
-        _ => false,
-    }
-}
-
 /// Decode exactly the fetched instruction; callers fetch incrementally and check CS.
 pub(crate) fn instruction(
     code: &[u8],
     ip: u32,
     context: MachineContext,
 ) -> Result<IrBlock, LiftError> {
+    let profile = crate::model::profile_for_generation(context.generation);
     let mut decoder = Decoder::with_ip(
         u32::from(context.default_operand_bits),
         code,
         u64::from(ip),
         // 80386 PRM §17 MOV to/from Special Registers, p. 17-111:
         // recognize test-register MOV so deferred system accesses are typed.
-        DecoderOptions::MOV_TR,
+        profile.isa.decoder_options(),
     );
-    let insn = decoder.decode();
+    let mut insn = decoder.decode();
     let mode = if context.default_operand_bits == 16 {
         CpuMode::Real16
     } else {
@@ -189,42 +164,10 @@ pub(crate) fn instruction(
     ops.push(IrOp::InsnStart {
         guest_addr: u64::from(ip),
     });
-    // SDM Vol 2A §3.3 LGDT/LIDT; 80386 PRM §17 pp. 17-95,
-    // 17-154: /0../3 require memory. Newer instruction aliases in these
-    // ModRM register slots do not make them legal on the I386 generation.
-    let opcode = code;
-    let prefix_bytes = opcode
-        .iter()
-        .take_while(|b| {
-            matches!(
-                b,
-                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
-            )
-        })
-        .count();
-    let table_register_operand = matches!(&opcode[prefix_bytes..],
-        [0x0f, 0x01, modrm, ..] if modrm & 0xe0 == 0xc0);
-    // I286 PRM §6.2 p. 6-2; Appendix B #UD p. B-12 and MOV p. B-73;
-    // §9.6.1 p. 9-10: unavailable opcodes/operands fault at their prefixes.
-    // Iced's generation tags classify encodings, not individual Sreg operands.
-    let unavailable_286 = context.generation == crate::CpuGeneration::I286
-        && (unavailable_i286_opcode(code)
-            || (0..insn.op_count())
-                .any(|i| matches!(insn.op_register(i), Register::FS | Register::GS))
-            || !insn.cpuid_features().iter().all(|feature| {
-                matches!(
-                    feature,
-                    iced_x86::CpuidFeature::INTEL8086
-                        | iced_x86::CpuidFeature::INTEL8086_ONLY
-                        | iced_x86::CpuidFeature::INTEL186
-                        | iced_x86::CpuidFeature::INTEL286
-                        | iced_x86::CpuidFeature::INTEL286_ONLY
-                        // I286/287 PRM Part II Ch. 2, Processor Control
-                        // Instructions, p. 2-16: available coprocessor forms.
-                        | iced_x86::CpuidFeature::FPU
-                        | iced_x86::CpuidFeature::FPU287
-                )
-            }));
+    let action = profile.isa.decode(code, &insn);
+    if let crate::model::decode::DecodeAction::Alias(canonical) = action {
+        insn.set_code(canonical);
+    }
     let esc = crate::x87::is_esc(code);
     let wait = insn.mnemonic() == Mnemonic::Wait;
     if esc || wait {
@@ -239,41 +182,22 @@ pub(crate) fn instruction(
             },
         );
     }
-    // SDM Vol 1 §§2.1.1–2.1.3; 80386 PRM §17: sharing lowering
-    // does not grant instructions introduced after the selected generation.
-    // 80386 PRM §17 MOV to/from Special Registers, p. 17-111:
-    // TR6/TR7 are I386. Iced also tags the shared encoding with 486-only
-    // test registers; that alternative must not hide the I386 operands.
-    let i386_test_register = matches!(insn.code(), Code::Mov_r32_tr | Code::Mov_tr_r32)
-        && (0..insn.op_count())
-            .any(|i| matches!(insn.op_register(i), Register::TR6 | Register::TR7));
-    let unavailable_386 = context.generation == crate::CpuGeneration::I386
-        && !i386_test_register
-        && !insn.cpuid_features().iter().all(|feature| {
-            matches!(
-                feature,
-                iced_x86::CpuidFeature::INTEL8086
-                    | iced_x86::CpuidFeature::INTEL8086_ONLY
-                    | iced_x86::CpuidFeature::INTEL186
-                    | iced_x86::CpuidFeature::INTEL286
-                    | iced_x86::CpuidFeature::INTEL286_ONLY
-                    | iced_x86::CpuidFeature::INTEL386
-                    | iced_x86::CpuidFeature::INTEL386_ONLY
-                    | iced_x86::CpuidFeature::INTEL386_A0_ONLY
-                    | iced_x86::CpuidFeature::FPU
-                    | iced_x86::CpuidFeature::FPU287
-                    | iced_x86::CpuidFeature::FPU387
-            )
-        });
-    if insn.is_invalid() || table_register_operand || unavailable_286 || unavailable_386 {
-        // SDM Vol 3A §7.15, Events 6/13: #UD or an overlong instruction.
-        // I286 PRM Appendix B #GP p. B-9: incomplete at ten bytes is overlong.
-        let overlong_286 = context.generation == crate::CpuGeneration::I286
+    if insn.is_invalid() || matches!(action, crate::model::decode::DecodeAction::Absent(_)) {
+        let overlong_286 = profile.max_insn_len == Some(10)
             && code.len() == 10
             && decoder.last_error() == iced_x86::DecoderError::NoMoreBytes
-            && !unavailable_286;
+            && !profile.isa.unavailable_prefix(code);
+        if matches!(action, crate::model::decode::DecodeAction::Absent(None)) {
+            return Err(refill_unsupported_bytes(
+                unsupported_insn(&insn),
+                code,
+                u64::from(ip),
+            ));
+        }
         let vector = if overlong_286 || (code.len() == 15 && exceeds_length_limit(code, mode)) {
             13
+        } else if let crate::model::decode::DecodeAction::Absent(Some(vector)) = action {
+            vector
         } else {
             6
         };
@@ -282,7 +206,7 @@ pub(crate) fn instruction(
         let first = ops.values.len();
         // Decision-25: empty I286 outputs and WAIT complete even where
         // executing a present protected-mode coprocessor remains deferred.
-        let lowered = if context.generation == crate::CpuGeneration::I286
+        let lowered = if !profile.lift.protected_coprocessor_outputs
             && context.regime == crate::MachineRegime::Protected
             && (wait || (esc && crate::x87::esc_output(code)))
         {
@@ -457,9 +381,10 @@ pub(super) fn direct_address(
             alias_low16: false,
             offset,
             size: bytes,
-            vector: if segment == SegmentId::Ss && context.generation == crate::CpuGeneration::I386
-            {
-                12
+            vector: if segment == SegmentId::Ss {
+                crate::model::profile_for_generation(context.generation)
+                    .lift
+                    .direct_stack_fault
             } else {
                 13
             },
@@ -714,11 +639,9 @@ fn stack_address(
                 dst,
                 offset,
                 bytes: size,
-                vector: if context.generation == crate::CpuGeneration::I386 {
-                    12
-                } else {
-                    13
-                },
+                vector: crate::model::profile_for_generation(context.generation)
+                    .lift
+                    .direct_stack_fault,
             },
         );
     } else {
@@ -826,6 +749,7 @@ pub(super) fn lower(
 ) -> Result<bool, LiftError> {
     use Mnemonic::*;
     let context = ops.legacy_context().expect("legacy lowering context");
+    let profile = crate::model::profile_for_generation(context.generation);
     // Generation availability is checked before lowering; decoder width alone
     // never grants the 286 any 386 forms (I286 PRM §6.2 p. 6-2, Appendix B).
     let mode = if context.default_operand_bits == 16 {
@@ -857,6 +781,14 @@ pub(super) fn lower(
         return Ok(true);
     }
     match insn.mnemonic() {
+        Pushf | Pushfd | Popf | Popfd | Iret | Iretd if !profile.flags_helper_supported() => {
+            return Err(unsupported_insn(insn))
+        }
+        Shl | Sal | Shr | Sar | Rol | Ror | Rcl | Rcr | Shld | Shrd
+            if profile.quirks.shift_count_mask != Some(31) =>
+        {
+            return Err(unsupported_insn(insn))
+        }
         Lldt | Ltr => {
             let value = lower_read(insn, 0, ops, tg)?;
             // SDM Vol 2A §3.3 LLDT/LTR; 286 PRM App. B pp. B-66/B-72;
@@ -864,14 +796,7 @@ pub(super) fn lower(
             let (register, allowed_types) = if insn.mnemonic() == Lldt {
                 (SystemRegister::Ldtr, 1 << 2)
             } else {
-                (
-                    SystemRegister::Tr,
-                    if context.generation == crate::CpuGeneration::I286 {
-                        1 << 1
-                    } else {
-                        (1 << 1) | (1 << 9)
-                    },
-                )
+                (SystemRegister::Tr, profile.lift.available_tss_types)
             };
             emit(
                 ops,
@@ -930,22 +855,9 @@ pub(super) fn lower(
             // SDM Vol 2A §3.3 LAR Table 3-55, LSL Table 3-59 are primary.
             // 286 PRM §11.3 p. 11-3/App. B p. B-71: 286 system types
             // have no 386 extensions, and LSL requires nonconforming segments.
-            let i286 = context.generation == crate::CpuGeneration::I286;
             let allowed_system_types = match insn.mnemonic() {
-                Lar => {
-                    if i286 {
-                        0x003e
-                    } else {
-                        0x1a3e
-                    }
-                }
-                Lsl => {
-                    if i286 {
-                        0x000e
-                    } else {
-                        0x0a0e
-                    }
-                }
+                Lar => profile.lift.lar_system_types,
+                Lsl => profile.lift.lsl_system_types,
                 _ => 0,
             };
             emit(
@@ -954,7 +866,7 @@ pub(super) fn lower(
                     selector,
                     query,
                     allowed_system_types,
-                    allow_conforming: !(i286 && insn.mnemonic() == Lsl),
+                    allow_conforming: profile.lift.lsl_conforming || insn.mnemonic() != Lsl,
                 },
             );
         }
@@ -1106,6 +1018,9 @@ pub(super) fn lower(
             }
         }
         Push => {
+            if profile.quirks.push_sp_after_decrement {
+                return Err(unsupported_insn(insn));
+            }
             let value = if let Some(seg) = segment(insn.op0_register()) {
                 selector(ops, tg, seg)
             } else {
@@ -1300,7 +1215,7 @@ pub(super) fn lower(
         // I386 PRM Appendix A two-byte opcode map p. A-7, §14.6
         // Table 14-1 p. 14-5: 0F FF is undefined and raises vector 6.
         // Iced recognizes this encoding as UD0.
-        Cpuid | Ud0 | Ud2 => ops.push(IrOp::Trap {
+        Ud0 | Ud2 => ops.push(IrOp::Trap {
             vector: 6,
             advance: 0,
         }),

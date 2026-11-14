@@ -1183,9 +1183,12 @@ fn task_flags_preserve_rf_and_loaded_tf_traps_after_first_new_instruction() {
             &vm,
             base(B) + if wide { 0x24 } else { 0x10 },
             if wide { 4 } else { 2 },
-            if wide { 0x10102 } else { 0x102 },
+            // SDM Vol3B §§25.16–25.16.1 pp.25-6–7; PRM386
+            // §2.3.4 Fig.2-8 p.2-11: absent AC/ID cannot load from a TSS.
+            if wide { 0x250102 } else { 0x102 },
         );
         steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rflags_system & ((1 << 18) | (1 << 21)), 0);
         assert_eq!(cpu.cpu.rflags_system & 0x100, 0x100);
         if wide {
             assert_ne!(cpu.cpu.rflags_system & 0x10000, 0);

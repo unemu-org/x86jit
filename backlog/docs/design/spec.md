@@ -1819,6 +1819,28 @@ interpretation, address translation or timing changes in this migration step.
 Timing entries are absent, and FPU pairings currently accept `Present` and `None`.
 Later model and FPU variants extend non-exhaustive enums.
 
+Decision-23 C1 makes `isa` an explicit encoding set, with a per-entry absent
+encoding policy: #UD, a defined canonical alias, or typed refusal through
+`Exit::UnknownInstruction`. I80286 and I80386 use #UD for absent reserved
+encodings. Machine decoders and the lifter read this policy; Application and the
+Real16 alias retain their existing decoder. Existing system helpers still use
+`CpuGeneration` as a compatibility projection. The catalogue's AC/ID fixed-zero
+attribute selects the existing early-processor flag helper shape at lift time;
+POPF, IRET, interrupt images and task flags retain their fixed-zero behavior.
+No per-op model branch is added. The existing PUSH-SP, count-mask and real-FLAGS
+quirks select the currently supported helper shape at lift time; adding a new
+shape remains work for the corresponding model.
+
+`semantics_id` is a deterministic content digest of encoding membership and canonical alias pairs,
+decoder/absence policy, quirks and system/lift/FPU attributes, plus an explicit
+lifting-policy revision for changes to validation or alias rules. Changes to
+lifting-relevant content require a new identity; rule changes bump the revision.
+Checked cache keys and context stamps include it. Direct translations are scoped
+to a VM whose model is immutable before execution; they are never shared between
+catalogue revisions. There is no persisted translation cache to carry across a
+library rebuild. CpuState and jit_abi layouts are unchanged.
+
+
 `Vm::set_fpu_model` fixes the construction default (initially `Present`) before
 any vCPU exists. New vCPUs inherit it, forks preserve it, and the per-vCPU setter
 remains an override. `new_vcpu` validates the VM default against a selected

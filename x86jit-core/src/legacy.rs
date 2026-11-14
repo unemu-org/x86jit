@@ -993,6 +993,7 @@ pub(crate) fn restore_flags(
     generation: CpuGeneration,
     image: u32,
 ) -> Result<(), crate::Exit> {
+    let image = image & !crate::model::EARLY_FLAGS_FIXED_ZERO;
     cpu.flags.set_flags16((image & 0x0ed7) as u16);
     // I286 PRM Appendix B IRET pp. B-51–52; §10.1 p. 10-1.
     // Execution is currently limited to CPL 0, where IOPL is writable.
