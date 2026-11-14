@@ -1827,9 +1827,92 @@ Real16 alias retain their existing decoder. Existing system helpers still use
 `CpuGeneration` as a compatibility projection. The catalogue's AC/ID fixed-zero
 attribute selects the existing early-processor flag helper shape at lift time;
 POPF, IRET, interrupt images and task flags retain their fixed-zero behavior.
-No per-op model branch is added. The existing PUSH-SP, count-mask and real-FLAGS
-quirks select the currently supported helper shape at lift time; adding a new
-shape remains work for the corresponding model.
+There is no per-op model branch. PUSH-SP, count-mask and real-FLAGS quirks
+select the supported helper shape at lift time; each model supplies the shapes
+its policies require.
+
+
+Decision-23 C2 adds `I8088` and `I8086`. Both select the 8086 instruction set,
+`system = None`, twenty physical address bits, no instruction-length limit,
+`None`/`Present` FPU policies and no timing table. The 8086 Family User's Manual
+(9800722-03) §4.2 Tables 4-12/4-13, pp. 4-22–36 defines the CPU encodings;
+later additions, MOV CS, the 0F map and unused forms outside decision-23's
+accepted compatibility amendment return `UnknownInstruction`, without an
+invalid-opcode interrupt. That amendment permits 82h as 80h and F6h/F7h /1 as
+TEST /0 (SDM Vol 3B §25.15 pp. 25-5–6, corroborated by the "alias" entries in
+`oracles/ss8088/v2/metadata.json`); D0–D3 /6 remains refused because the metadata
+marks it "undocumented". The amendment also permits ordinary 83h /1,/4,/6
+(OR/AND/XOR r/m16 with sign-extended imm8): SDM Vol 2A §3.3 AND p. 3-60,
+Vol 2B §4.3 OR p. 4-163, Vol 2D §6.1 XOR p. 6-40; the same corpus metadata
+marks these forms "normal". LOCK remains a typed
+refusal: §2.5 pp. 2-17–18 specifies bus ownership across the complete instruction
+(including a repeated string), which the engine cannot promise. AAM/AAD's
+second byte is fixed to 0Ah by Table 4-12 p. 4-24. The decoder folds redundant
+prefixes before using iced's bounded representation, while retaining the full
+instruction length, real next IP, source spans and final-prefix restart IP.
+
+These entries have a permanent Direct context; `CpuState::legacy` is inert.
+Their dispatcher bypasses context validation, stamps and the retained cache.
+Multi-instruction blocks use the shared cache and the same interpreter walk.
+Blocks end after any instruction that crosses an IP or physical-bus wrap,
+including a prefix run longer than 64 KiB, so a changed following instruction
+is refetched under the shared self-modifying-code contract.
+Every operand byte wraps its offset inside the segment, then its formed address
+at 1 MiB; fetch and its cache key use the sixteen-bit IP offset, IP wraps
+to zero and A20 settings have no effect (UM §2.3 p. 2-12,
+§2.8 p. 2-68; 286 PRM App. C item 10 p. C-2). Lowering copies the FLAGS-image
+constants and divide return/range policy into Machine operations and maps full
+CL counts to equivalent counts for the shared arithmetic operations. New
+`LegacyOp` forms carry those constants and wrapped transfers; Application IR,
+CpuState and jit_abi layouts are unchanged. An interrupt taken inside a
+repeated string saves the last prefix only (UM §2.7 p. 2-42); before its
+first element completes, the frame names the first prefix. Budget and
+exit-request yields keep the complete instruction as the owner; the dispatcher
+retains the owner/restart pair once an element has completed and applies the
+restart only at delivery, so an abandoned request resumes the whole instruction.
+The cold event boundary reads the catalogue's priority policy: an external
+interrupt enters its handler before the single-step trap (UM §2.6 pp. 2-26–28).
+STI and IRET "reenable interrupts only after the end of the following
+instruction" (UM §2.6 p. 2-24): either one delays external interrupts through
+its successor when it sets IF from clear, and neither delays when IF was
+already set. The lifted flag restore carries this policy; POPF does not.
+When POPF or IRET loads TF, the following instruction is the first one
+trapped (UM §2.6 p. 2-28).
+Wrapped strings report acknowledged bus addresses and REP restart registers,
+with conservative evidence of earlier RAM effects, matching ordinary strings.
+A RAM-side fault that answered no device byte leaves no retry open.
+The selected catalogue entry reaches lowering and delivery directly; the
+generation projection serves the system models only. The deprecated selector
+keeps refusing the I8086 generation at run entry.
+
+The undefined status flags in UM §2.7 pp. 2-35–40 are not guest guarantees.
+The deterministic engine policy preserves OF/SF/ZF/PF for AAA/AAS; clears OF
+for DAA/DAS; preserves AF/CF/OF for AAM/AAD; preserves AF/PF/SF/ZF for
+MUL/IMUL; preserves all six status flags for DIV/IDIV; clears AF for
+AND/OR/XOR/TEST; and preserves AF for shifts. For a multi-bit shift or rotate,
+undefined OF uses the shared engine's single-bit formula at the equivalent
+count; a zero equivalent RCL/RCR count preserves it. LAHF's undefined image
+bits 5, 3 and 1 are 0, 0 and 1 (UM p. 2-33). These are engine choices;
+hardware-corpus comparison belongs to C3. AAM/AAD accept only second byte
+0Ah, which Table 4-12 p. 4-24 explicitly prints; other immediates are absent.
+
+For these models, `None` executes the CPU's ESC word read and discards the data,
+including for coprocessor output encodings; register ESCs have no CPU data effect
+(UM §2.7 p. 2-48; iAPX 86/88,186/188 PRM §6.3 p. 6-8). `Present` retains the
+existing generation-neutral x87 engine; it makes no 8087 pairing claim. CPU
+dummy-read acknowledgements and coprocessor operand acknowledgements remain
+distinct through byte-granular MMIO retries. The adapter retains memory error
+identity and compacts large-image acknowledgements inside the fixed retry ledger.
+`set_fpu_emulation` requests a typed ESC handoff, with no fabricated interrupt 7.
+Pending numeric-error delivery also remains a typed refusal, with no processor
+interrupt 16. Generation-faithful `I8087` pairing is deferred to decision-23 §4.
+WAIT completes with an empty socket under the engine's ready-TEST policy.
+
+UM Appendix B, "The 8088 Compared to the 8086", pp. B-31–32 states that
+instruction results are identical and identifies the bus/prefetch/timing
+differences. The entries therefore share ISA and quirks and have separate
+catalogue identities; their cycle tables remain absent. The witness binary is
+`legacy_i8086`; hardware-corpus differential testing remains decision-23 C3.
 
 `semantics_id` is a deterministic content digest of encoding membership and canonical alias pairs,
 decoder/absence policy, quirks and system/lift/FPU attributes, plus an explicit

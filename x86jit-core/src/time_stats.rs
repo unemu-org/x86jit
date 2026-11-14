@@ -639,19 +639,22 @@ impl Drop for RunGuard {
         if let Some(start) = current.since {
             add(&mut current.values, current.segment, start.elapsed_ns());
         }
-        for (counter, value) in self.record.0.iter().zip(
-            current
-                .values
-                .basic
-                .into_iter()
-                .chain(current.values.detailed.into_iter().flat_map(|v| v.values)),
-        ) {
-            if value == 0 {
-                continue;
+        let publish = |counter: &AtomicU64, value: u64| {
+            if value != 0 {
+                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old.saturating_add(value))
+                });
             }
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                Some(old.saturating_add(value))
-            });
+        };
+        // Keep the always-on array independent of optional detailed storage.
+        // Model dispatch specializations share this publication path.
+        for (counter, value) in self.record.0[..FETCH_HITS].iter().zip(current.values.basic) {
+            publish(counter, value);
+        }
+        if let Some(detailed) = current.values.detailed {
+            for (counter, value) in self.record.0[FETCH_HITS..].iter().zip(detailed.values) {
+                publish(counter, value);
+            }
         }
     }
 }
@@ -966,6 +969,29 @@ impl Drop for SampleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_publication_keeps_basic_and_detailed_indices_and_saturates() {
+        let record = Arc::new(Record::default());
+        record.0[FIELDS - 1].store(u64::MAX - 3, Ordering::Relaxed);
+        let run = RunGuard::enter(record.clone(), true, None);
+        LOCAL.with(|local| {
+            let mut local = local.borrow_mut();
+            local.values[HELPER] = 11;
+            local.values[FETCH_HITS - 1] = 13;
+            local.values[FETCH_HITS] = 17;
+            local.values[FIELDS - 1] = 19;
+        });
+        drop(run);
+        for (index, value) in [
+            (HELPER, 11),
+            (FETCH_HITS - 1, 13),
+            (FETCH_HITS, 17),
+            (FIELDS - 1, u64::MAX),
+        ] {
+            assert_eq!(record.0[index].load(Ordering::Relaxed), value);
+        }
+    }
 
     #[test]
     fn disabled_run_has_no_detailed_counter_storage() {

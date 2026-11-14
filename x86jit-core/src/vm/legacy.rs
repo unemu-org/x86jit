@@ -240,6 +240,7 @@ pub(super) struct Execution {
     blocks: HashMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
     rep_flags: Option<Box<RepFlags>>,
+    rep_restart20: Option<(u16, u16, u16)>,
     task_switch: crate::interp::legacy::tasks::SwitchState,
     #[cfg(test)]
     lifts: u64,
@@ -271,6 +272,7 @@ impl Execution {
             blocks: HashMap::new(),
             instruction_retry: None,
             rep_flags: None,
+            rep_restart20: None,
             task_switch: Default::default(),
             #[cfg(test)]
             lifts: 0,
@@ -286,6 +288,7 @@ impl Execution {
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
         self.rep_flags = None;
+        self.rep_restart20 = None;
         self.task_switch.reset();
         self.port_debug = false;
         self.shutdown = false;
@@ -439,7 +442,7 @@ impl Execution {
                 }
             })?;
         let ir = Arc::new(ir);
-        let walk = if KIND == MACHINE_DISPATCH {
+        let walk = if KIND >= MACHINE_DISPATCH {
             BlockWalk::for_ir::<true>(&ir)
         } else {
             BlockWalk::for_ir::<false>(&ir)
@@ -686,9 +689,7 @@ fn resolve_direct_uncached(
                 16,
                 &code,
                 cpu.rip,
-                crate::model::profile_for_generation(context.generation)
-                    .isa
-                    .decoder_options(),
+                crate::model::decode::SYSTEM_DECODER_OPTIONS,
             );
             let mut count = 0;
             let mut end = cpu.rip;
@@ -899,17 +900,14 @@ fn fetch_watched(
             source.record(addr, &byte);
         }
         bytes.push(byte[0]);
-        let isa = crate::model::profile_for_generation(context.generation).isa;
-        if isa.legacy_segments_only() && isa.unavailable_prefix(&bytes) {
+        if crate::model::decode::unavailable_prefix_for_generation(context.generation, &bytes) {
             break;
         }
         let mut decoder = Decoder::with_ip(
             u32::from(context.default_operand_bits),
             &bytes,
             ip,
-            crate::model::profile_for_generation(context.generation)
-                .isa
-                .decoder_options(),
+            crate::model::decode::SYSTEM_DECODER_OPTIONS,
         );
         let insn = decoder.decode();
         if !insn.is_invalid() || decoder.last_error() != DecoderError::NoMoreBytes {
@@ -1022,6 +1020,9 @@ impl Vcpu {
 
     pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
+        if self.twenty_bit_model() {
+            return Ok(crate::lift::i8086::CONTEXT);
+        }
         if let Some(context) = self
             .legacy_execution
             .as_ref()
@@ -1042,7 +1043,7 @@ impl Vcpu {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
         // I286 PRM §10.4 p. 10-6: reset may fetch through the retained high CS base.
-        // The I8086 system personality remains deferred.
+        // System-free models have already returned their permanent context.
         if !matches!(model.generation, CpuGeneration::I286 | CpuGeneration::I386)
             || (self.cpu.legacy.reset_fetch != 0 && model.generation != CpuGeneration::I286)
             || self.cpu.rip > u64::from(u32::MAX)
@@ -1205,6 +1206,9 @@ impl Vcpu {
         mut context: MachineContext,
         mut event: PendingEvent,
     ) -> Result<(), Exit> {
+        if context.generation == CpuGeneration::I8086 {
+            return self.deliver_event20::<ROUTED, ORDER>(vm, event);
+        }
         self.legacy_execution.as_mut().unwrap().rep_flags = None;
         self.legacy_execution
             .as_mut()
@@ -1383,6 +1387,9 @@ impl Vcpu {
         self.release_legacy_event_boundary();
         self.cpu.finish_mmio_retry(exit);
         self.apply_pending_a20();
+        if self.twenty_bit_model() {
+            return;
+        }
         let class = self
             .legacy_context_for_run()
             .map_or(crate::SegmentClass::Checked, |context| {
@@ -1549,7 +1556,7 @@ impl Vcpu {
         };
         let limit = if SINGLE {
             Some(1)
-        } else if KIND == MACHINE_DISPATCH {
+        } else if KIND >= MACHINE_DISPATCH {
             if STEPPED {
                 Some(budget)
             } else {
@@ -1566,13 +1573,15 @@ impl Vcpu {
         });
         let mut context =
             initial_context.map_or_else(crate::lift::legacy::alias_context, |initial| initial.0);
-        let mut direct_bus = KIND == ALIAS_DISPATCH
-            || (KIND == MACHINE_DISPATCH
+        let direct20 = KIND == super::DIRECT20_DISPATCH;
+        let mut direct_bus = direct20
+            || KIND == ALIAS_DISPATCH
+            || (KIND >= MACHINE_DISPATCH
                 && self.legacy_execution.as_ref().unwrap().validated_direct_bus);
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
         loop {
-            if KIND == MACHINE_DISPATCH {
+            if KIND >= MACHINE_DISPATCH {
                 if limit.is_some_and(|limit| steps >= limit) {
                     return DispatchResult::Stepped(StepRun {
                         steps,
@@ -1696,7 +1705,19 @@ impl Vcpu {
                     }
                 }
                 let direct = !task_pending && context.segment_class == crate::SegmentClass::Direct;
-                let linear_fetch = (u64::from(self.cpu.cs) << 4) + self.cpu.rip;
+                // 8086 Family UM §2.2 p. 2-7: IP is a sixteen-bit offset,
+                // including when the embedder has supplied upper storage bits.
+                let fetch_offset = if direct20 {
+                    self.cpu.rip & 0xffff
+                } else {
+                    self.cpu.rip
+                };
+                let linear_fetch = (u64::from(self.cpu.cs) << 4) + fetch_offset;
+                let linear_fetch = if direct20 {
+                    linear_fetch & 0xfffff
+                } else {
+                    linear_fetch
+                };
                 let physical = if direct && direct_bus {
                     linear_fetch
                 } else {
@@ -1722,7 +1743,9 @@ impl Vcpu {
                     }
                 }
                 let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
-                let resolved = if direct && !retained && !boundary.instruction_retry {
+                let resolved = if direct20 {
+                    super::i8086::resolve(vm, &self.cpu, exit_word, physical)
+                } else if direct && !retained && !boundary.instruction_retry {
                     resolve_direct(
                         vm,
                         &self.cpu,
@@ -1792,7 +1815,19 @@ impl Vcpu {
                 } else {
                     limit.map_or(u64::MAX, |limit| limit - steps)
                 };
-                let progress = if KIND == MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
+                let progress = if direct20 {
+                    crate::interp::legacy::execute_shared20::<ROUTED, ORDER>(
+                        &ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        remaining,
+                        exit_word,
+                        self.sti_shadow,
+                        self.ss_shadow,
+                        boundary.irq_pending,
+                    )
+                } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
                     self.legacy_execution
                         .as_mut()
                         .unwrap()
@@ -1819,6 +1854,29 @@ impl Vcpu {
                         boundary.irq_pending,
                     )
                 };
+                if direct20 {
+                    self.cpu.rip &= 0xffff;
+                    let restart = ir.ops.iter().find_map(|op| match op {
+                        IrOp::Legacy(crate::legacy::LegacyOp::WrappedString {
+                            restart_ip,
+                            rep,
+                            ..
+                        }) if !matches!(rep, crate::ir::RepKind::None)
+                            && self.cpu.rip == ir.guest_start =>
+                        {
+                            Some((self.cpu.cs, self.cpu.rip as u16, *restart_ip))
+                        }
+                        _ => None,
+                    });
+                    // UM §2.7 p. 2-42: only a string with a completed element is
+                    // interrupted inside the instruction. A stop before its first
+                    // element keeps the full owner unless an earlier walk already
+                    // completed one (the same pair is still pending).
+                    let execution = self.legacy_execution.as_mut().unwrap();
+                    execution.rep_restart20 = restart.filter(|pair| {
+                        progress.steps != 0 || execution.rep_restart20 == Some(*pair)
+                    });
+                }
                 if !single_step && progress.outcome.is_none() {
                     steps += progress.steps;
                     self.retired += progress.retired;
@@ -1829,10 +1887,13 @@ impl Vcpu {
                         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
                         boundary.instruction_retry = false;
                     }
+                    // 8086 Family UM §2.6 p. 2-28: a lifted POPF or IRET can load
+                    // TF; the instruction after it is the first one trapped.
                     refresh_boundary = boundary.one_step
                         || boundary.pending_io
                         || self.sti_shadow
-                        || self.ss_shadow;
+                        || self.ss_shadow
+                        || (direct20 && self.cpu.rflags_system & 0x100 != 0);
                     if boundary.a20_pending {
                         self.apply_pending_a20();
                         direct_bus = raw_direct(&self.cpu);
@@ -1875,7 +1936,7 @@ impl Vcpu {
                             self.apply_pending_a20();
                             direct_bus = raw_direct(&self.cpu);
                         }
-                        if outcome.context_changed {
+                        if !direct20 && outcome.context_changed {
                             let execution = self.legacy_execution.as_mut().unwrap();
                             if outcome.translations_invalidated {
                                 execution.invalidate_translations();
@@ -3098,6 +3159,68 @@ impl Vcpu {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+impl Vcpu {
+    fn deliver_event20<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        mut event: PendingEvent,
+    ) -> Result<(), Exit> {
+        // 8086 Family UM §2.6 Table 2-3 p. 2-26 and Single-Step p. 2-28:
+        // enter the external handler before recognizing the single-step trap.
+        if let Some((cs, owner, restart)) =
+            self.legacy_execution.as_mut().unwrap().rep_restart20.take()
+        {
+            if cs == event.cs && u32::from(owner) == event.ip {
+                event.ip = u32::from(restart);
+            }
+        }
+        // Each catalogue entry supplies its own delivery policy (decision-23 §2).
+        let quirks = self
+            .cpu_model
+            .expect("twenty-bit dispatch requires an 8086-family catalogue model")
+            .profile()
+            .quirks;
+        let trap = matches!(event.source, EventSource::SingleStep)
+            || (quirks.step_interrupt_handler && self.cpu.rflags_system & 0x100 != 0);
+        if quirks.step_interrupt_handler
+            && matches!(event.source, EventSource::SingleStep)
+            && self.irq_delivery_ready()
+        {
+            if let Some(vector) = self.pending_irq {
+                event.source = EventSource::Irq(vector);
+            }
+        }
+        loop {
+            let vector = match event.source {
+                EventSource::SingleStep => 1,
+                EventSource::Irq(vector) | EventSource::Exception { vector, .. } => vector,
+            };
+            if let Err(exit) = crate::interp::i8086::interrupt::<ROUTED, ORDER>(
+                &mut self.cpu,
+                &vm.mem,
+                vector,
+                event.ip as u16,
+                quirks.real_flags_set_mask,
+            ) {
+                self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
+                return Err(exit);
+            }
+            let stepped = matches!(event.source, EventSource::SingleStep);
+            self.finish_legacy_event(event, None);
+            if trap && !stepped {
+                event = PendingEvent {
+                    irq_consumed: false,
+                    source: EventSource::SingleStep,
+                    ip: self.cpu.rip as u32,
+                    cs: self.cpu.cs,
+                };
+            } else {
+                return Ok(());
             }
         }
     }

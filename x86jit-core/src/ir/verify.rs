@@ -358,6 +358,25 @@ impl IrBlock {
                 IrOp::PortIo { port, value, .. } => check(&[*port, *value], &[])?,
                 IrOp::PortString { base, .. } => check(&[*base], &[])?,
                 IrOp::Legacy(op) => match op {
+                    crate::legacy::LegacyOp::WrappedLoad { dst, addr, .. } => {
+                        check(&[*addr], &[*dst])?
+                    }
+                    crate::legacy::LegacyOp::WrappedStore { addr, value, .. } => {
+                        check(&[*addr, *value], &[])?
+                    }
+                    crate::legacy::LegacyOp::Coprocessor20 { addr, .. } => check(&[*addr], &[])?,
+                    crate::legacy::LegacyOp::FlagsImage { dst, .. } => check(&[], &[*dst])?,
+                    crate::legacy::LegacyOp::LoadFlagsWord { value, .. } => check(&[*value], &[])?,
+                    crate::legacy::LegacyOp::DivideTrap {
+                        quot,
+                        rem,
+                        hi,
+                        lo,
+                        divisor,
+                        ..
+                    } => check(&[Val::Temp(*hi), *lo, *divisor], &[*quot, *rem])?,
+                    crate::legacy::LegacyOp::WrappedString { .. }
+                    | crate::legacy::LegacyOp::Interrupt20 { .. } => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {
                         check(&[*offset], &[*dst])?

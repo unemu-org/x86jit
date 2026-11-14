@@ -969,7 +969,10 @@ impl InstructionFaultInfo {
                 IrOp::RepString { .. }
                 | IrOp::RepStringReal { .. }
                 | IrOp::PortString { .. }
-                | IrOp::Legacy(crate::legacy::LegacyOp::String { .. }) => Some(FaultHelper::String),
+                | IrOp::Legacy(crate::legacy::LegacyOp::String { .. })
+                | IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. }) => {
+                    Some(FaultHelper::String)
+                }
                 IrOp::Div { .. } => Some(FaultHelper::Divide),
                 IrOp::AtomicCasPair { .. } => Some(FaultHelper::CompareExchangePair),
                 _ => None,
@@ -1067,6 +1070,15 @@ impl InstructionFaultInfo {
                     m.operand_size = Knowledge::Known(u16::from(*elem));
                     if !matches!(rep, RepKind::None) {
                         m.rep = Some((*op, *elem, *addr_bits));
+                    }
+                }
+                IrOp::Legacy(crate::legacy::LegacyOp::WrappedString {
+                    kind, elem, rep, ..
+                }) => {
+                    m.writes |= matches!(kind, StrOp::Movs | StrOp::Stos);
+                    m.operand_size = Knowledge::Known(u16::from(*elem));
+                    if !matches!(rep, RepKind::None) {
+                        m.rep = Some((*kind, *elem, 16));
                     }
                 }
                 IrOp::PortString {

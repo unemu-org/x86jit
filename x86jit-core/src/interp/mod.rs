@@ -6,6 +6,7 @@
 //! is set to the FAULTING instruction (`cur_addr`, from `InsnStart`) so the user
 //! can map/handle and retry; after `syscall`/`hlt` RIP is PAST the instruction.
 
+pub(crate) mod i8086;
 pub(crate) mod legacy;
 mod mmx;
 pub(crate) mod ordering;
@@ -281,6 +282,7 @@ fn interpret_steps_ordered<
             STOP_WHEN_IRQ_READY,
             false,
             STR_MMIO,
+            false,
         >(ir, cpu, mem, scratch, info, steps)
     } else {
         interpret_block_inner::<
@@ -292,13 +294,14 @@ fn interpret_steps_ordered<
             STOP_WHEN_IRQ_READY,
             false,
             STR_MMIO,
+            false,
         >(ir, cpu, mem, scratch, info, steps)
     }
 }
 
 /// Machine specialization of the same stepped walk used by Application Real16.
 #[inline(always)]
-pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8>(
+pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -308,11 +311,11 @@ pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8>(
 ) -> BlockResult {
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, true, ORDER, true, false, true, true>(
+        interpret_block_inner::<true, ROUTED, true, ORDER, true, false, true, true, DIRECT20>(
             ir, cpu, mem, scratch, info, steps,
         )
     } else {
-        interpret_block_inner::<false, ROUTED, true, ORDER, true, false, true, true>(
+        interpret_block_inner::<false, ROUTED, true, ORDER, true, false, true, true, DIRECT20>(
             ir, cpu, mem, scratch, info, steps,
         )
     }
@@ -560,7 +563,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
     }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false, false, true>(
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false, false, true, false>(
             ir,
             cpu,
             mem,
@@ -569,7 +572,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
             &mut StepContext::default(),
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false, false, true>(
+        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false, false, true, false>(
             ir,
             cpu,
             mem,
@@ -598,6 +601,7 @@ fn interpret_block_inner<
     const STOP_WHEN_IRQ_READY: bool,
     const MACHINE: bool,
     const STR_MMIO: bool,
+    const DIRECT20: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -641,7 +645,7 @@ fn interpret_block_inner<
     if STEPPED {
         steps.cut = false;
     }
-    let start = info.code_base + ir.guest_start;
+    let start = info.code_base.wrapping_add(ir.guest_start);
     let host_start = (mem.host_base() as u64).wrapping_add(start.wrapping_sub(mem.guest_base()));
     let running = RunningMemory {
         memory: mem,
@@ -665,6 +669,7 @@ fn interpret_block_inner<
             STOP_WHEN_IRQ_READY,
             MACHINE,
             STR_MMIO,
+            DIRECT20,
         >(
             ir,
             cpu,
@@ -690,6 +695,7 @@ fn interpret_block_inner<
             STOP_WHEN_IRQ_READY,
             MACHINE,
             STR_MMIO,
+            DIRECT20,
         >(
             ir,
             cpu,
@@ -839,6 +845,21 @@ fn finish_instruction_fault<const STEPPED: bool>(
     // qualifies Real16 physical addresses with its explicit decode mode.
     let mode = crate::CpuMode::Long64;
     let mut exit = crate::fault::finish(exit, Some(&info), cpu, mem, mode, false);
+    // A lift-resolved divide trap has a next-IP image even though its result
+    // did not commit. Preserve that image through common fault qualification.
+    if let Exit::Exception {
+        vector: 0,
+        metadata: Some(m),
+        ..
+    } = &mut exit
+    {
+        if let Some(saved) = ops.iter().find_map(|op| match op {
+            IrOp::Legacy(crate::legacy::LegacyOp::DivideTrap { saved_ip, .. }) => Some(*saved_ip),
+            _ => None,
+        }) {
+            m.saved_rip = u64::from(saved);
+        }
+    }
     if helper_ledger && cpu.owns_mmio_retry(cpu.rip) {
         if let Exit::Exception {
             metadata: Some(m), ..
@@ -848,6 +869,33 @@ fn finish_instruction_fault<const STEPPED: bool>(
         } = &mut exit
         {
             m.progress.acknowledged = legacy::mmio_evidence(cpu);
+        }
+    }
+    if let Exit::Exception {
+        metadata: Some(m), ..
+    }
+    | Exit::UnmappedMemory {
+        metadata: Some(m), ..
+    } = &mut exit
+    {
+        if let Some(op) = ops.iter().find_map(|op| match op {
+            IrOp::Legacy(
+                op @ (crate::legacy::LegacyOp::WrappedString { .. }
+                | crate::legacy::LegacyOp::WrappedLoad { .. }
+                | crate::legacy::LegacyOp::WrappedStore { .. }
+                | crate::legacy::LegacyOp::Coprocessor20 { .. }),
+            ) => Some(op),
+            _ => None,
+        }) {
+            m.progress.acknowledged = match op {
+                crate::legacy::LegacyOp::WrappedString { source, .. } => {
+                    i8086::string_evidence(cpu, *source)
+                }
+                _ => i8086::bus_evidence(
+                    cpu,
+                    matches!(op, crate::legacy::LegacyOp::Coprocessor20 { .. }),
+                ),
+            };
         }
     }
     if STEPPED && string_slots && cpu.owns_mmio_retry(cpu.rip) {
@@ -1032,7 +1080,7 @@ fn walk_instruction<'ir, const ROUTED: bool, const ORDER: u8>(
     let current = Cell::new(ip);
     let started = Cell::new(1);
     let mut retired = 0;
-    let result = walk_ops::<false, ROUTED, true, false, ORDER, false, false, true, true>(
+    let result = walk_ops::<false, ROUTED, true, false, ORDER, false, false, true, true, false>(
         ir,
         cpu,
         mem,
@@ -1073,6 +1121,7 @@ fn walk_ops<
     const STOP_WHEN_IRQ_READY: bool,
     const MACHINE: bool,
     const STR_MMIO: bool,
+    const DIRECT20: bool,
 >(
     ir: &'ir IrBlock,
     cpu: &mut CpuState,
@@ -1102,6 +1151,106 @@ fn walk_ops<
         }
         match op {
             IrOp::Legacy(legacy_op) => match legacy_op {
+                op @ (L::WrappedLoad { .. }
+                | L::WrappedStore { .. }
+                | L::FlagsImage { .. }
+                | L::LoadFlagsWord { .. }
+                | L::DivideTrap { .. }
+                | L::Coprocessor20 { .. })
+                    if MACHINE && DIRECT20 =>
+                {
+                    if let Err(exit) = i8086::primitive::<ROUTED, ORDER>(
+                        op,
+                        cpu,
+                        mem.0.normal(),
+                        temps,
+                        cur_addr.get(),
+                    ) {
+                        return WalkResult::exit(exit);
+                    }
+                    if matches!(
+                        op,
+                        L::LoadFlagsWord {
+                            delay_irq: true,
+                            ..
+                        }
+                    ) {
+                        // 8086 Family UM §2.6 p. 2-24: STI and IRET "reenable
+                        // interrupts only after the end of the following
+                        // instruction". As for STI, only IF 0 -> 1 reenables.
+                        shadows.complete_before(*retired);
+                        shadows.arm_sti(cpu.flags.if_, entry_flags.if_);
+                    }
+                    if cpu.fpu_model != crate::FpuModel::None {
+                        if let L::Coprocessor20 {
+                            kind: Some(kind),
+                            memory: true,
+                            addr,
+                            ..
+                        } = op
+                        {
+                            if let Some(bytes) = crate::x87::mem_write_bytes(*kind) {
+                                for i in 0..bytes {
+                                    mem.0.note_block_write(
+                                        i8086::physical(read_val(*addr, temps), i as u8),
+                                        1,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let L::WrappedStore { addr, size, .. } = op {
+                        for i in 0..*size {
+                            mem.0
+                                .note_block_write(i8086::physical(read_val(*addr, temps), i), 1);
+                        }
+                    }
+                }
+                L::Interrupt20 {
+                    vector,
+                    saved_ip,
+                    overflow_only,
+                    flags_set,
+                } if MACHINE && DIRECT20 => {
+                    if !overflow_only || cpu.flags.of {
+                        if let Err(exit) = i8086::interrupt::<ROUTED, ORDER>(
+                            cpu,
+                            mem.0.normal(),
+                            *vector,
+                            *saved_ip,
+                            *flags_set,
+                        ) {
+                            return WalkResult::exit(exit);
+                        }
+                    } else {
+                        cpu.rip = u64::from(*saved_ip);
+                    }
+                    return WalkResult::Continue;
+                }
+                L::WrappedString {
+                    kind,
+                    elem,
+                    rep,
+                    source,
+                    ..
+                } if MACHINE && DIRECT20 && STEPPED && !CHILD => {
+                    let (access, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
+                    if let Some(stop) = i8086::string::<ROUTED, STOP_WHEN_IRQ_READY, _>(
+                        cpu,
+                        access,
+                        *kind,
+                        *elem,
+                        *rep,
+                        *source,
+                        cur_addr.get(),
+                        exit_request,
+                        budget.get(),
+                        shadows,
+                        *retired,
+                    ) {
+                        return stop;
+                    }
+                }
                 L::String {
                     kind,
                     elem,
@@ -4899,7 +5048,7 @@ fn walk_ops<
                 };
                 let value = if *dir_out {
                     let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
-                    match string_load::<true, _>(
+                    match string_load::<true, false, _>(
                         cpu,
                         mem,
                         cur_addr.get(),
@@ -5482,7 +5631,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
     let mut shadows = ShadowState::default();
     let mem = Access::<false, ORDER, _>::new(mem);
     let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        walk_ops::<false, false, true, true, ORDER, false, false, false, true>(
+        walk_ops::<false, false, true, true, ORDER, false, false, false, true, false>(
             ir,
             cpu,
             mem,
@@ -5497,7 +5646,7 @@ pub(crate) fn walk_child<const ORDER: u8>(
             (),
         )
     } else {
-        walk_ops::<false, false, false, true, ORDER, false, false, false, true>(
+        walk_ops::<false, false, false, true, ORDER, false, false, false, true, false>(
             ir,
             cpu,
             mem,
@@ -9581,7 +9730,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
     exit_request: Option<&std::sync::atomic::AtomicU64>,
 ) -> Option<StringStop> {
     if !CHILD && cpu.mmio_retry_active {
-        return string_run_specialized::<false, false, true, false, M>(
+        return string_run_specialized::<false, false, false, true, false, M>(
             cpu,
             mem,
             op,
@@ -9596,7 +9745,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
             (),
         );
     }
-    string_run_specialized::<CHILD, false, false, false, M>(
+    string_run_specialized::<false, CHILD, false, false, false, M>(
         cpu,
         mem,
         op,
@@ -9631,7 +9780,7 @@ fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: In
     retired: u64,
 ) -> Option<WalkResult> {
     shadows.complete_before(retired);
-    match string_run_specialized::<false, true, true, STOP_WHEN_IRQ_READY, _>(
+    match string_run_specialized::<false, false, true, true, STOP_WHEN_IRQ_READY, _>(
         cpu,
         mem,
         op,
@@ -9785,7 +9934,7 @@ fn string_run_bounded_direct_inner<
 ) -> Option<WalkResult> {
     shadows.complete_before(retired);
     let result = if REPEATING {
-        string_run_specialized::<false, true, MMIO, STOP_WHEN_IRQ_READY, _>(
+        string_run_specialized::<false, false, true, MMIO, STOP_WHEN_IRQ_READY, _>(
             cpu,
             mem,
             op,
@@ -9800,7 +9949,7 @@ fn string_run_bounded_direct_inner<
             &mut *shadows,
         )
     } else {
-        string_run_specialized::<false, false, MMIO, false, _>(
+        string_run_specialized::<false, false, false, MMIO, false, _>(
             cpu,
             mem,
             op,
@@ -9909,7 +10058,8 @@ fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterM
                 // Machine preserves its source-first access order for both classes.
                 if source {
                     let address = src_base + si;
-                    if let Err(trap) = string_load::<true, _>(cpu, mem, cur_addr, 0, address, elem)
+                    if let Err(trap) =
+                        string_load::<true, false, _>(cpu, mem, cur_addr, 0, address, elem)
                     {
                         return Some(
                             trap_out(cpu, cur_addr, trap, address, elem, AccessKind::Read, 0)
@@ -9961,7 +10111,7 @@ fn string_run_real_bounded<const ROUTED: bool, const STOP: bool, M: InterpreterM
 // at the same physical address are distinct device obligations. The ordinary
 // vector ledger remains address-keyed; these paths cannot share an owner.
 #[inline(always)]
-fn string_load<const MMIO: bool, M: StrMem>(
+fn string_load<const MMIO: bool, const WRAPPED: bool, M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
     rip: u64,
@@ -9969,6 +10119,9 @@ fn string_load<const MMIO: bool, M: StrMem>(
     addr: u64,
     elem: u8,
 ) -> Result<u64, MemTrap> {
+    if WRAPPED {
+        return i8086::string_load(cpu, mem, rip, slot, addr, elem);
+    }
     if MMIO {
         if let Some(v) = cpu.mmio_part(rip, slot) {
             return Ok(v);
@@ -9989,7 +10142,7 @@ fn string_load<const MMIO: bool, M: StrMem>(
 }
 
 #[inline(always)]
-fn string_store<const MMIO: bool, M: StrMem>(
+fn string_store<const MMIO: bool, const WRAPPED: bool, M: StrMem>(
     cpu: &mut CpuState,
     mem: &M,
     rip: u64,
@@ -9997,6 +10150,9 @@ fn string_store<const MMIO: bool, M: StrMem>(
     value: u64,
     elem: u8,
 ) -> Result<(), MemTrap> {
+    if WRAPPED {
+        return i8086::string_store(cpu, mem, rip, addr, value, elem);
+    }
     if MMIO && cpu.mmio_part(rip, 1).is_some() {
         return Ok(());
     }
@@ -10014,6 +10170,7 @@ fn string_store<const MMIO: bool, M: StrMem>(
 // share the stepped path's transfer slots and end ownership at each element.
 #[allow(clippy::too_many_arguments)]
 fn string_run_specialized<
+    const WRAPPED: bool,
     const CHILD: bool,
     const STEPPED: bool,
     const MMIO: bool,
@@ -10098,7 +10255,7 @@ fn string_run_specialized<
             StrOp::Movs => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);
-                let v = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let v = match string_load::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -10108,7 +10265,7 @@ fn string_run_specialized<
                         return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
-                if let Err(t) = string_store::<MMIO, M>(cpu, mem, cur_addr, da, v, elem) {
+                if let Err(t) = string_store::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, da, v, elem) {
                     if CHILD {
                         cpu.rip = cur_addr;
                         return Some(StringStop::Interrupted);
@@ -10121,7 +10278,7 @@ fn string_run_specialized<
             StrOp::Stos => {
                 let da = dst_lin(cpu.gpr[RDI]);
                 let v = cpu.gpr[RAX] & m;
-                if let Err(t) = string_store::<MMIO, M>(cpu, mem, cur_addr, da, v, elem) {
+                if let Err(t) = string_store::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, da, v, elem) {
                     if CHILD {
                         cpu.rip = cur_addr;
                         return Some(StringStop::Interrupted);
@@ -10132,7 +10289,7 @@ fn string_run_specialized<
             }
             StrOp::Lods => {
                 let sa = src_lin(cpu.gpr[RSI]);
-                let v = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let v = match string_load::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -10147,7 +10304,7 @@ fn string_run_specialized<
             }
             StrOp::Scas => {
                 let da = dst_lin(cpu.gpr[RDI]);
-                let b = match string_load::<MMIO, M>(cpu, mem, cur_addr, 1, da, elem) {
+                let b = match string_load::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, 1, da, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -10164,7 +10321,7 @@ fn string_run_specialized<
             StrOp::Cmps => {
                 let sa = src_lin(cpu.gpr[RSI]);
                 let da = dst_lin(cpu.gpr[RDI]);
-                let a = match string_load::<MMIO, M>(cpu, mem, cur_addr, 0, sa, elem) {
+                let a = match string_load::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, 0, sa, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {
@@ -10174,7 +10331,7 @@ fn string_run_specialized<
                         return trap(cpu, cur_addr, sa, false, t, 0, elem).map(StringStop::Fault);
                     }
                 };
-                let b = match string_load::<MMIO, M>(cpu, mem, cur_addr, 1, da, elem) {
+                let b = match string_load::<MMIO, WRAPPED, M>(cpu, mem, cur_addr, 1, da, elem) {
                     Ok(v) => v,
                     Err(t) => {
                         if CHILD {

@@ -485,7 +485,12 @@ impl SourceIndex {
                         .saturating_add(u64::from(len))
                         .saturating_sub(base)
                         .min(4096) as usize;
-                    let membership = self.pages.entry(page).or_default();
+                    // Keep the source index's hash builder when a page table is
+                    // recreated after invalidation; no fresh seed is needed.
+                    let membership = self.pages.entry(page).or_insert_with(|| PageMembership {
+                        entries: HashMap::with_hasher(self.units.hasher().clone()),
+                        bytes: 0,
+                    });
                     let before = membership.bytes;
                     membership
                         .entries
@@ -546,8 +551,8 @@ impl SourceIndex {
                 }
             }
             if self.units.is_empty() {
-                self.units = HashMap::new();
-                self.pages = HashMap::new();
+                self.units = HashMap::with_hasher(self.units.hasher().clone());
+                self.pages = HashMap::with_hasher(self.pages.hasher().clone());
                 self.units_bytes = 0;
                 self.pages_bytes = 0;
             }
@@ -573,14 +578,25 @@ impl SourceIndex {
                 let base = page << crate::memory::CODE_PAGE_BITS;
                 let start = lo.saturating_sub(base) as usize;
                 let end = hi.saturating_sub(base).min(4096) as usize;
-                for (word, value) in bits
-                    .iter()
-                    .enumerate()
-                    .take((end - 1) / 64 + 1)
-                    .skip(start / 64)
-                {
-                    if value & page_word_mask(word, start, end) != 0 {
+                // Most scalar stores query one coverage word. Avoid constructing
+                // a bounded iterator and the general per-word mask for that case.
+                let first_word = start / 64;
+                let last_word = (end - 1) / 64;
+                if first_word == last_word {
+                    let mask = (u64::MAX << (start & 63)) & (u64::MAX >> (63 - ((end - 1) & 63)));
+                    if bits[first_word] & mask != 0 {
                         return (true, true);
+                    }
+                } else {
+                    for (word, value) in bits
+                        .iter()
+                        .enumerate()
+                        .take((end - 1) / 64 + 1)
+                        .skip(start / 64)
+                    {
+                        if value & page_word_mask(word, start, end) != 0 {
+                            return (true, true);
+                        }
                     }
                 }
             }
@@ -589,7 +605,7 @@ impl SourceIndex {
     }
 
     fn has_units(&self, lo: u64, hi: u64) -> bool {
-        if lo >= hi {
+        if lo >= hi || self.units.is_empty() {
             return false;
         }
         let first = lo >> crate::memory::CODE_PAGE_BITS;
@@ -605,12 +621,14 @@ impl SourceIndex {
 
     fn victims(&self, lo: u64, hi: u64) -> Vec<BlockKey> {
         let mut keys = Vec::new();
-        if lo >= hi {
+        if lo >= hi || self.units.is_empty() {
             return keys;
         }
         let first = lo >> crate::memory::CODE_PAGE_BITS;
         let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
-        let mut seen = HashSet::new();
+        // Single-page scans cannot encounter the same unit twice. Initialize
+        // the de-duplication set only when a multi-page scan finds a victim.
+        let mut seen = None;
         let mut collect = |page: u64, entries: &HashMap<BlockKey, PageSpans>| {
             let base = page << crate::memory::CODE_PAGE_BITS;
             let start = lo.saturating_sub(base);
@@ -630,7 +648,7 @@ impl SourceIndex {
                     keys.push(*key);
                     continue;
                 }
-                if seen.insert(*key) {
+                if seen.get_or_insert_with(HashSet::new).insert(*key) {
                     keys.push(*key);
                 }
             }
@@ -1578,7 +1596,14 @@ impl TranslationCache {
         {
             let spans = self.spans.read().unwrap();
             let (overlap, on_page) = spans.cached.coverage_overlap(lo, hi);
-            let (pending_overlap, pending_on_page) = spans.pending_sources.coverage_overlap(lo, hi);
+            // Empty pending coverage has no source spans. The cached query
+            // already sends conservative wide ranges to the slow path.
+            let (pending_overlap, pending_on_page) =
+                if spans.pending_sources.coverage.root.is_none() {
+                    (false, false)
+                } else {
+                    spans.pending_sources.coverage_overlap(lo, hi)
+                };
             if !overlap && !pending_overlap {
                 // §10: publication requires the exclusive spans lock. If it won
                 // first, this reader sees its coverage bits. Otherwise this write
@@ -1620,7 +1645,11 @@ impl TranslationCache {
                 );
                 spans.interpreter_only.remove(entry);
                 if spans.interpreter_only.is_empty() {
-                    spans.interpreter_only = HashSet::new();
+                    // Reclaim allocated suppression storage; an untouched empty
+                    // table has no allocation to release or hash seed to replace.
+                    if spans.interpreter_only.capacity() != 0 {
+                        spans.interpreter_only = HashSet::new();
+                    }
                     spans.suppression_bytes = 0;
                 }
                 spans.cached.remove(entry);
@@ -1953,20 +1982,18 @@ mod tests {
         }
         assert!(c.memory_stats().coverage_index_bytes >= 3 * 512);
         for addr in 0x1000..0x3000 {
-            let expected = entries
-                .iter()
-                .flat_map(|(_, spans)| spans)
-                .any(|&(start, len)| start <= addr && addr - start < u64::from(len));
-            assert_eq!(
-                c.spans
-                    .read()
-                    .unwrap()
-                    .cached
-                    .coverage_overlap(addr, addr + 1)
-                    .0,
-                expected,
-                "coverage at {addr:#x}"
-            );
+            for bytes in [1, 2, 8, 65] {
+                let end = addr + bytes;
+                let expected = entries
+                    .iter()
+                    .flat_map(|(_, spans)| spans)
+                    .any(|&(start, len)| start < end && addr < start + u64::from(len));
+                assert_eq!(
+                    c.spans.read().unwrap().cached.coverage_overlap(addr, end).0,
+                    expected,
+                    "coverage at {addr:#x}..{end:#x}"
+                );
+            }
         }
         assert_eq!(
             c.invalidate_overlapping(0x103f, 0x1040, || {}),

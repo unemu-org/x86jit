@@ -15,6 +15,7 @@ use crate::jit_abi::{
     RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_RETURN_MISS, RET_SYSCALL,
     RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
+mod i8086;
 mod legacy;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
@@ -1920,6 +1921,7 @@ pub struct Vcpu {
 const APPLICATION_DISPATCH: u8 = 0;
 const ALIAS_DISPATCH: u8 = 1;
 const MACHINE_DISPATCH: u8 = 2;
+const DIRECT20_DISPATCH: u8 = 3;
 
 enum DispatchResult {
     Application(Result<Exit, u64>),
@@ -2076,6 +2078,9 @@ impl Vcpu {
     /// completes at a boundary before the next instruction, allowing an immediate
     /// change. A zero-budget run leaves an in-flight request pending.
     pub fn set_a20_enabled(&mut self, enabled: bool) {
+        if self.twenty_bit_model() {
+            return;
+        }
         if self.cpu.legacy.a20_enabled == u8::from(enabled) {
             return;
         }
@@ -2393,13 +2398,15 @@ impl Vcpu {
         self.cpu.fpu_model = model;
     }
 
-    /// Real16 MSW.EM input (SDM Vol 3A §2.5, Table 2-2;
-    /// 80386 PRM Ch. 11 §11.1.3, p. 11-2). MP/TS are not modeled here.
+    /// Engine emulation input for the Real16 alias and models without system
+    /// registers (decision-23 §4). MSW/CR0 models use their architectural EM bit.
     pub fn fpu_emulation(&self) -> bool {
         self.cpu.fpu_emulation
     }
 
-    /// Set Real16 MSW.EM between runs; independent of coprocessor presence.
+    /// Set the emulation input between runs, independently of FPU presence.
+    /// On I8088/I8086 this requests a typed ESC handoff; these processors have
+    /// no interrupt 7. The Real16 alias retains its existing MSW.EM policy.
     pub fn set_fpu_emulation(&mut self, enabled: bool) {
         self.cpu.fpu_emulation = enabled;
     }
@@ -2644,7 +2651,14 @@ impl Vcpu {
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
         if self.profile == ExecutionProfile::Machine {
-            self.run_engine::<MACHINE_DISPATCH, true>(vm, Some(max_steps), options)
+            if self
+                .legacy_model
+                .is_some_and(|model| model.generation == crate::CpuGeneration::I8086)
+            {
+                self.run_direct20::<true>(vm, Some(max_steps), options)
+            } else {
+                self.run_engine::<MACHINE_DISPATCH, true>(vm, Some(max_steps), options)
+            }
         } else if self.mode == CpuMode::Real16 {
             self.run_engine::<ALIAS_DISPATCH, true>(vm, Some(max_steps), options)
         } else {
@@ -2686,7 +2700,14 @@ impl Vcpu {
             }
         }
         let run = if self.profile == ExecutionProfile::Machine {
-            self.run_engine::<MACHINE_DISPATCH, false>(vm, budget, StepOptions::default())
+            if self
+                .legacy_model
+                .is_some_and(|model| model.generation == crate::CpuGeneration::I8086)
+            {
+                self.run_direct20::<false>(vm, budget, StepOptions::default())
+            } else {
+                self.run_engine::<MACHINE_DISPATCH, false>(vm, budget, StepOptions::default())
+            }
         } else if self.mode == CpuMode::Real16 {
             self.run_engine::<ALIAS_DISPATCH, false>(vm, budget, StepOptions::default())
         } else {
@@ -2702,6 +2723,29 @@ impl Vcpu {
         }
     }
 
+    // I8088/I8086 run in a permanent Direct context. The deprecated selector's
+    // I8086 generation keeps its C1 run-entry refusal until removal
+    // (decision-23 Migration); only set_cpu_model selects these models.
+    // The run entries keep their generation test; the Direct20 entry refuses.
+    #[inline(always)]
+    fn twenty_bit_model(&self) -> bool {
+        matches!(
+            self.cpu_model,
+            Some(crate::CpuModel::I8088 | crate::CpuModel::I8086)
+        )
+    }
+
+    // Isolate the permanent-context specialization from the existing entries.
+    #[inline(never)]
+    fn run_direct20<const STEPPED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        self.run_engine::<DIRECT20_DISPATCH, STEPPED>(vm, budget, options)
+    }
+
     #[inline(always)]
     fn run_engine<const KIND: u8, const STEPPED: bool>(
         &mut self,
@@ -2712,7 +2756,7 @@ impl Vcpu {
         // Decision-16 §3: every execution exit passes the attempt's ownership
         // boundary. Only explicit continuations can return a REP flag origin.
         let result = self.run_engine_attempt::<KIND, STEPPED>(vm, budget, options);
-        if KIND == MACHINE_DISPATCH && budget != Some(0) {
+        if KIND >= MACHINE_DISPATCH && budget != Some(0) {
             self.finish_comparison_attempt(&result);
         }
         result
@@ -2738,8 +2782,27 @@ impl Vcpu {
                 stop: StepStop::Exit(Exit::BudgetExhausted),
             });
         }
-        let context = if KIND == MACHINE_DISPATCH {
-            let context = if let Some(context) = self.warm_machine_context(budget) {
+        let context = if KIND >= MACHINE_DISPATCH {
+            let context = if KIND == DIRECT20_DISPATCH {
+                // The deprecated selector's I8086 generation keeps the C1
+                // run-entry refusal (decision-23 Migration).
+                if !self.twenty_bit_model() {
+                    let Err(exit) = self.prepare_machine_entry_cold(budget) else {
+                        unreachable!("the I8086 generation has no system entry")
+                    };
+                    return Ok(StepRun {
+                        steps: 0,
+                        stop: StepStop::Exit(exit),
+                    });
+                }
+                if budget == Some(0) {
+                    return Ok(StepRun {
+                        steps: 0,
+                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                    });
+                }
+                crate::lift::i8086::CONTEXT
+            } else if let Some(context) = self.warm_machine_context(budget) {
                 context
             } else {
                 match self.prepare_machine_entry_cold(budget) {
@@ -2865,7 +2928,7 @@ impl Vcpu {
         {
             result.stop = StepStop::Exit(cpu.fault_entry.finish_transfer_fault(exit, &vm.mem));
         }
-        if KIND == MACHINE_DISPATCH {
+        if KIND >= MACHINE_DISPATCH {
             cpu.finish_machine_run(&mut result);
         } else if let StepStop::Exit(exit) = &result.stop {
             cpu.cpu.finish_mmio_retry(Some(exit));

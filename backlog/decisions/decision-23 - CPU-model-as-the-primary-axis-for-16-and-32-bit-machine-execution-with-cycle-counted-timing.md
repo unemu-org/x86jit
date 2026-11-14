@@ -319,6 +319,32 @@ that has none. PROVENANCE.md is not changed, and no "observed, not licensed"
 category is introduced. If real software for these machines needs one of these
 encodings, that is a new question for the maintainer with the software's evidence.
 
+**Amendment (compatibility aliases, 2026-11-14, accepted by the maintainer).** SDM
+Vol 3B §25.15 (p. 25-5) lists reserved opcodes that, "for compatibility with prior
+generations", behave as defined instructions: 82h as 80h, F6h/F7h /1 as TEST /0,
+shift group 2 /6 as /4. Such an alias is a defined alias of a model when both hold:
+SDM §25.15 lists it, and the hardware-captured corpus of that processor shows it as
+an alias. It is not one when the model's own manual or its corpus says otherwise.
+On that basis, F6h/F7h /1 is TEST and 82h is 80h on `I8088`, `I8086`, `NecV20`,
+`NecV30` and `I80286`. The 80286 PRM, Appendix B p. B-12, lists F6h /1 as an invalid
+extension, but the 80286 corpus shows it executing as TEST, so the 286 entry keeps
+TEST. Shift group 2 /6 is not an alias on the 8088 or the V20: their corpora mark it
+undocumented, not as the SHL alias. It stays a typed refusal there, as the rule
+above says.
+
+The same holds for an encoding the SDM's instruction pages define as an ordinary
+instruction, valid in real-address mode, which the model's manual omits but the
+model's hardware-captured corpus shows executing as that instruction. Case: 83h /1,
+/4, /6 (OR, AND, XOR r/m16 with a sign-extended imm8). The 8086 manual's tables do
+not list them. The SDM defines them (Vol 2A §3.3 AND; Vol 2B §4.3 OR; Vol 2D §6.1 XOR), the
+8088 corpus marks them normal, and assemblers emit them in 16-bit code. They execute
+on `I8088`, `I8086`, `NecV20` and `NecV30`. Other encodings stay typed refusals on
+the 8088 even though its corpus shows them executing:
+- 60h-6Fh, C0h/C1h and C8h/C9h, where the 8088 does something other than the
+  instruction the SDM defines for that encoding;
+- FFh /7 and D6h, which the SDM reserves;
+- shift /6.
+
 **8080 emulation mode on the V20/V30 is split between two cores.** Executing 8080
 code is not x86jit's job: it is a second instruction set, and it lives in a
 separate core outside this repository: the 8080-family project x80 (working

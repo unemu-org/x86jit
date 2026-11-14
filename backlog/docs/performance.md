@@ -1247,3 +1247,353 @@ changed to pass a gate.
 All 80 path/workload cells and both store widths pass. Largest loop increase: +0.341% (`smc-next-64`, `legacy-i286-a20-off`).
 
 **ASSUMED before measurement:** lift-time changes should have zero steady-state cost. The counter results above include relifting and code/layout effects; no individual cause is assigned to differences within the gate. Other hosts and whole-program guest ladders were not measured. No commits, git writes, bead operations or pushes were performed.
+
+## C2 I8088 and I8086, round 1 (baseline d4a58e2a)
+
+**READ:** the catalogue adds `I8088` and `I8086`: 8086 ISA, `system = None`,
+20 physical address bits, no instruction-length limit, `None`/`Present` FPU
+policies and no timing table. The CPU encodings come from
+`oracles/intel/i8086-um.pdf` (9800722-03), §4.2 Tables 4-12/4-13 pp. 4-22–35
+and Table 4-14 p. 4-36. Decision-23's accepted amendment admits 82h as 80h and
+F6h/F7h /1 as TEST /0 (SDM Vol 3B §25.15 pp. 25-5–6, corroborated by the
+"alias" entries in `oracles/ss8088/v2/metadata.json`). D0–D3 /6 stays refused
+("undocumented"). Other absent forms, later additions and the 0F map return
+`UnknownInstruction`, with no fabricated #UD. LOCK also remains a typed
+handoff: UM §2.5 pp. 2-17–18 requires whole-instruction bus ownership, including
+REP. AAM/AAD accept only the second byte 0Ah printed in Table 4-12 p. 4-24.
+
+Both models execute in a permanent Direct context. Their instruction results
+are identical; Appendix B pp. B-31–32 describes bus, prefetch and timing
+differences, including four- versus six-byte queues. These differences are not
+modelled at this timing level. Spec §17.10 records the quirk witnesses, REP
+restart rule, deterministic undefined-flag values and FPU policies.
+**ASSUMED engine policy:** WAIT with `None` sees ready TEST. `Present` is the
+existing generic x87 engine, without an 8087-faithfulness claim; C6 supplies that
+pairing. The C3 hardware differential lane was not run.
+
+**MEASURED validation:** 41 runtime binaries, 1,395 passed, five ignored, zero
+final failures, including all 21 `legacy_*` binaries, 421 core tests and 27 C2
+witness tests covering both models. Boundary/environment, run_steps, IRQ shadow,
+retirement, SMC, fences and Application code-byte witnesses pass. All 36 captured
+Application/alias IR images are byte-identical to C1; all 27 C2 release witnesses
+also pass. Clippy across all targets/features with warnings denied, fmt checking,
+and the workspace release test check with Unicorn pass. An earlier fence run
+timed out during a build; its log is retained, and the final isolated binary
+passes all six active tests. Direct-rustc fixtures use the same SDK linker wrapper
+as Cargo.
+
+**READ / MEASURED provenance:** cited values were checked against page images at
+oracle revision `c591d7a`. The hash-checked 8086 UM SHA-256 is
+`717194ec03520d6499a40523abdfd4ed15a2b8ccc45a21c653e2b443c248664c`;
+the iAPX 86/88,186/188 PRM SHA-256 is
+`7f33bead2b7111b6871b50f14368531b90c30d960ca47865c5b0d8aa5fb55ed2`.
+
+**MEASURED method:** Rust 1.98.1, native macOS arm64, SDK 14.4/deployment 14.0,
+standard release settings, empty Rust flags. Background scheduling, at most four
+build jobs, 30-minute build limits, and 180-second individual test/benchmark
+limits. No build or test overlaps counted runs; only one benchmark process runs
+at a time. Each workload uses literal `real16_loops 1 3 <workload>`; values are
+three-sample median host instructions per step, with equal warmup, step and
+retirement counts. All 336 samples pass the guest-state/accounting assertions.
+Earlier failing controls are retained separately without filtering or resampling.
+
+The retained d4a58e2a baseline executable SHA-256 is
+`4db0da02d946edc96164f2b70b8479c507b363f0482a4542eb1a601debe9c461`;
+the final C2 executable SHA-256 is
+`49a6a0185385148a25d6c5416fecf9b3e407d8ce74c62721b39a9243015df7a0`.
+The existing dispatcher keeps its original four walk kinds; Direct20 selects
+its shared specialization separately. Basic accounting counters publish
+separately from optional detailed storage. SMC avoids a coverage call when the
+pending-source index is empty. These host-side changes preserve execution and
+accounting semantics and are included in the measured result.
+
+Round-1 gate against frozen controls: all **80** existing path/workload cells
+passed **+0.5%** (largest +0.485%, I286 `smc-rmw-64`); store widths +0.092% (8)
+and +0.051% (32). These tables are superseded by the round-3 gate below.
+No commits, git writes, bead operations or pushes were performed.
+
+
+**READ quirk inventory / before and after:** C1 exposed neither catalogue
+entry; C2 supplies the following model-specific behavior. Existing alias and
+system-model behavior is retained. UM means `oracles/intel/i8086-um.pdf`;
+PRM means `oracles/intel/i286-prm.pdf`. Each named witness is in
+[legacy_i8086.rs](../../x86jit-tests/tests/legacy_i8086.rs) and runs both models.
+The page images for these derivations were checked in round 1.
+
+| Quirk or derived item | C2 value / source | Witness |
+|---|---|---|
+| PUSH SP | Store decremented SP; SDM Vol 3B §25.17.1; PRM App. C item 8 p. C-2 | `push_sp_stores_decremented_value` |
+| Stored FLAGS 15:12 | Fh, including interrupt/exception frames; SDM Vol 3B §25.17.2 | `stored_flags_are_ones_and_popf_cannot_change_them`, `divide_error_saves_next_ip_and_signed_minimum_is_outside_range`, `external_interrupt_precedes_single_step_and_handler_is_steppable` |
+| Shift/rotate count | Full CL, through 255; UM §2.7 p. 2-39 | `shifts_and_rotates_use_all_eight_count_bits` |
+| Divide return IP | Next instruction; UM §2.6 p. 2-26 | `divide_error_saves_next_ip_and_signed_minimum_is_outside_range`, `divide_outward_metadata_names_next_ip` |
+| Signed minimum quotient | 80h/8000h raises interrupt 0; UM §2.7 p. 2-37 | `divide_error_saves_next_ip_and_signed_minimum_is_outside_range` |
+| Length limit | None; PRM App. C item 10 p. C-2 | `prefix_runs_longer_than_fifteen_and_255_have_no_length_fault`, `a_full_ip_wrap_inside_one_instruction_ends_the_shared_block` |
+| Operand offset | Each byte wraps within the segment; UM §2.3 p. 2-12 | `word_and_far_pointer_bytes_wrap_inside_segment`, `stack_word_wraps_and_ip_wraps_at_ffff` |
+| Sequential IP | Wrap to zero; UM §§2.2–2.3 pp. 2-7–12 | `nop_and_halt_at_ffff_wrap_the_sequential_ip` |
+| Formed address | Truncate at twenty bits, no A20 gate; UM §2.8 p. 2-68 | `no_system_state_is_consulted_and_a20_cannot_change_the_bus`, `fetch_wraps_twenty_bits_and_smc_refetches_the_following_instruction` |
+| Processor interrupts | Only 0–4; UM §2.6 pp. 2-24–28 | `catalogue_and_bus_siblings`, `empty_socket_and_emulation_are_per_vcpu_engine_policies` |
+| Undefined encodings | Typed refusal, including POP CS and MOV CS; UM §4.2 pp. 4-27–35; PRM App. C item 6 p. C-2; accepted aliases as recorded above | `later_and_undefined_encodings_are_typed_refusals`, `compatibility_aliases_follow_the_accepted_model_policy` |
+| LOCK | Typed refusal: UM §2.5 pp. 2-17–18 requires whole-instruction bus ownership, including REP | `later_and_undefined_encodings_are_typed_refusals` |
+| External IRQ and TF | Enter external handler before single-step trap; UM §2.6 pp. 2-26–28 | `external_interrupt_precedes_single_step_and_handler_is_steppable` |
+| Interrupted multi-prefix REP | Save IP of last prefix, retaining completed elements; UM §2.7 p. 2-42 | `interrupted_rep_resumes_at_last_prefix_in_both_orders`, `resumed_multi_prefix_string_loses_the_other_prefix` |
+| Undefined flags | Deterministic engine values, fully listed in spec §17.10; guests must not rely on them; UM §2.7 pp. 2-35–40 | `undefined_status_flags_have_a_deterministic_engine_value` |
+| AAM/AAD second byte | Manual prints 0Ah; other immediates refused; UM §4.2 Table 4-12 p. 4-24 | `aam_aad_documented_second_byte_and_undefined_flag_policy` |
+
+## C2 I8088 and I8086, round 2 (baseline d4a58e2a)
+
+**MEASURED result:** all **80** existing path/workload cells pass **+0.5%**
+against fresh paired controls of the same saved d4a58e2a executable. Largest
+increase: **+0.410%**, `alu` / `legacy-i286-a20-off`.
+Both store widths pass (-0.027% / -0.049%). These round-2 tables are
+superseded by the round-3 gate below.
+
+**MEASURED review witnesses / READ fixes:** six adopted adversarial tests failed
+against the saved round-1 library on both models. Their transfers and assertions
+are retained in `legacy_i8086`, extended to run both catalogue entries.
+
+| Finding | Witness in `legacy_i8086` | Fix | Before → final |
+|---|---|---|---|
+| Word-string MMIO retry | `wrapped_scalar_and_string_mmio_roundtrips`, `string_write_reports_second_mmio_byte` | Replace the current fault-byte marker on each fault; acknowledge actual byte values | Repeated 4000h → 4000h then 4001h, once each; pass |
+| IRET delay | `iret_defers_irq_through_following_instruction` | Lift a flag restore that arms inhibition through its successor; POPF does not | IRQ before INC → INC before IRQ; pass |
+| Present FPU MMIO | `present_fpu_memory_operand_mmio_is_resumable`, `coprocessor_mmio_read_and_write_complete_once_per_bus_byte`, `coprocessor_large_image_mmio_fits_the_fixed_retry_ledger` | Preserve the complete memory error and distinguish CPU dummy reads from coprocessor transfers; pack large images within the existing ledger | UnmappedMemory → answerable byte MMIO and complete read/write/94-byte-image retries; pass |
+| WrappedString evidence | `wrapped_string_fault_evidence_names_bus_transfers`, `completed_rep_iterations_are_in_fault_progress` | Add the string descriptor/address resolution; map ledger entries to bus addresses and conservative REP/RAM progress | Internal keys and false entry progress → real transfers and restart evidence; pass |
+| 83h /1,/4,/6 amendment | `logical_83_forms_sign_extend_the_immediate`, `compatibility_amendment_keeps_other_encodings_absent` | Admit sign-extended OR/AND/XOR register and memory forms; retain all listed refusals | Refusal → defined operation; all refusal witnesses pass |
+
+**READ primary sources:** IRET inhibition is specified by
+`oracles/intel/i8086-um.pdf` §2.6 p. 2-24. The ordinary 83h forms are in
+`oracles/intel/sdm.pdf`, Vol 2A §3.3 AND p. 3-60, Vol 2B §4.3 OR p. 4-163,
+Vol 2D §6.1 XOR p. 6-40. Every cited value was checked against its page image.
+`oracles/ss8088/v2/metadata.json` marks these forms "normal"; it corroborates
+the maintainer's primary-source amendment. The corpus does not license
+semantics, and the C3 differential lane was not run. The I80286 TEST /1 witness
+in `legacy_model_decode` cites the accepted amendment and retains its existing
+behavior. 60h–6Fh, C0h/C1h, C8h/C9h, FFh /7, D6h and D0–D3 /6 remain refused.
+
+**READ API and integration:** the catalogue requires the two CpuModel variants,
+ModelIsa::I8086 and the 8086 quirk fields (§2). LegacyOp was already a public
+enum with public variants; its eight C2 variants retain that pattern. Rust does
+not permit private visibility for individual enum variants. No CpuState or
+jit_abi layout changes were made. LegacyOp remains 56 bytes and IrOp 72 bytes,
+as in C1. Round 2 makes no memory.rs edits; round 1's sole hunk uses wrapping
+arithmetic when RunningMemory derives the next instruction's physical address.
+In interp/mod.rs, round 2 adds cold bus-evidence qualification and the lifted
+IRET delay hook to round 1's Direct20 dispatch/wrapped-operation integration.
+These hunks are separate from ordinary adjacent-region access handling.
+
+**READ / pairing policy:** `None` performs the CPU ESC dummy word read and
+discards it (UM §2.7 p. 2-48; iAPX 86/88,186/188 PRM §6.3 p. 6-8).
+`Present` retains the generic x87 engine with resumable operand transfers,
+without an 8087-fidelity claim. C6 supplies the generation-faithful pairing.
+**ASSUMED engine policy:** WAIT with `None` uses ready TEST.
+The original quirk/derived-item inventory and citations are above; spec §17.10
+lists the deterministic undefined-flag values, on which a guest must not rely.
+I8086/I8088 instruction results are identical in UM Appendix B pp. B-31–32;
+bus width, prefetch and timing differences have no cycle-table implementation yet.
+
+**MEASURED validation:** 41 runtime binaries, **1,406 passed,
+5 ignored**, zero final failures. This includes every legacy binary
+(21), 421 core tests, 37 C2 tests covering both models, boundary/environment,
+run_steps, irq_shadow, retired_count, smc and application_codegen. All 37 C2
+witnesses also pass against the final release library. All 36 captured
+Application/alias IR images match C1 byte for byte; the existing Application
+emitted-byte snapshots pass. Formatting, Clippy with all targets/features and
+warnings denied, and the workspace release test check with Unicorn pass.
+The final isolated fences run passed six active tests with two threads in
+25.35s. An earlier helper-rendezvous timeout after 14,525 trials is retained;
+its focused and complete isolated reruns passed without a source change.
+
+**MEASURED method:** the compiler, SDK and background/timeout/job limits are
+those recorded for round 1. One benchmark or heavy job runs at a time; no
+build/test overlaps counting. Each native measurement uses literal `1 3` and
+retains all three samples, matched warmup/step/retirement counts and guest-state
+assertions. Store widths use three serial C1/candidate pairs. The gate baseline
+SHA-256 is `4db0da02d946edc96164f2b70b8479c507b363f0482a4542eb1a601debe9c461`; the final Cargo executable is `286aceb868825c1b324e244f6c3f1e743585e74a36a6f9bc6a717c23d5afe290`.
+
+**MEASURED SMC attribution:** complete campaigns 1–7 missed 6/4/6/5/8/5/5
+SMC cells. Returning DecodeSet rows by value, the system-only reference decoder
+shortcut, and the shared register-MOV qualification shortcut did not remove the
+cost and were reverted. The last shortcut missed the steady-state path: warmed
+SMC uses retained one-instruction IR and re-fetches its bytes on every entry.
+Next-instruction SMC reuses that IR after its constant store, while RMW can also
+rebuild the changed MOV. Cache empty/lazy/coverage/hash-builder guards remain
+covered by the cache witnesses; the decoder-flags projection showed a small
+next-instruction benefit and no consistent RMW benefit. Those changes left the measured SMC misses.
+
+**MEASURED component localization:** varying a retained Checked MOV from 2 to
+10/15 bytes separates fixed entry work from per-byte fetch. Three C1/sixth pairs
+showed excess slopes of 9.208, 5.622, 9.977 host instructions/byte on I80286;
+6.326, 4.154, 5.222 on I80386. The generated sixth code selected a profile,
+loaded its ISA, selected a decode-set pointer and loaded its prefix-policy bit
+on every byte. C1 used a generation check. The final single change projects
+exact existing catalogue-row constants by generation, retaining prefix policy
+without those pointer selections. No policy value, identity digest, or public
+API changes in that host-cost change.
+
+The one-change sixth/final core A/B reduced retained-fetch medians by 57.665
+host instructions at length 10 on I80286, and 62.962 at length 10 / 94.775 at
+length 15 on I80386. Every candidate component sample was below every matching
+reference sample. The removed pointer loads are also absent in generated code.
+The native A/B below uses identical direct-rustc harnesses and matching core
+features/compiler/flags; the gate campaign uses the final Cargo executable.
+Every system-path normalized median improved on both SMC workloads. C1 itself
+varies between blocks: **every C1 and candidate sample is shown**, without
+filtering or resampling. A is the sixth core; B is the prefix projection. Order
+is C1→A→C1→B for RMW, reversed for next-instruction SMC.
+
+| Workload / path | C1 before A (all three) | A (all three) | C1 before B (all three) | B (all three) | Normalized B/A effects (all three; median) |
+|---|---|---|---|---|---|
+| `smc-rmw-64` / `application-real16` | 9295.667, 9271.770, 9273.509 | 9185.735, 9238.065, 9256.070 | 9323.696, 9301.059, 9334.272 | 9222.179, 9176.623, 9159.652 | +0.095%, -0.978%, -1.686%; **-0.978%** |
+| `smc-rmw-64` / `legacy-i286` | 4930.761, 4935.945, 4929.559 | 4968.042, 4971.396, 5001.385 | 4937.454, 4941.848, 4954.199 | 4965.692, 4970.368, 4944.531 | -0.183%, -0.140%, -1.628%; **-0.183%** |
+| `smc-rmw-64` / `legacy-i386` | 4793.735, 4794.052, 4795.728 | 4834.719, 4838.029, 4854.623 | 4805.429, 4802.361, 4810.150 | 4819.638, 4804.574, 4797.832 | -0.555%, -0.863%, -1.466%; **-0.863%** |
+| `smc-rmw-64` / `legacy-i286-a20-off` | 4930.212, 4929.023, 4932.000 | 4983.630, 4990.757, 4992.339 | 4939.196, 4942.209, 4963.095 | 4970.465, 4947.552, 4946.068 | -0.446%, -1.130%, -1.548%; **-1.130%** |
+| `smc-rmw-64` / `legacy-i386-a20-off` | 4795.930, 4800.691, 4797.655 | 4848.571, 4834.824, 4851.527 | 4806.823, 4808.423, 4830.991 | 4825.353, 4802.732, 4797.608 | -0.704%, -0.824%, -1.794%; **-0.824%** |
+| `smc-next-64` / `application-real16` | 9183.901, 9159.783, 9163.107 | 9073.091, 9071.384, 9071.641 | 9183.965, 9162.554, 9165.775 | 9096.663, 9075.232, 9071.302 | +0.259%, +0.012%, -0.033%; **+0.012%** |
+| `smc-next-64` / `legacy-i286` | 3704.161, 3700.719, 3700.604 | 3720.432, 3721.785, 3724.214 | 3701.217, 3699.942, 3703.418 | 3702.546, 3703.564, 3703.480 | -0.402%, -0.469%, -0.632%; **-0.469%** |
+| `smc-next-64` / `legacy-i386` | 3586.032, 3585.177, 3583.465 | 3595.244, 3594.915, 3594.309 | 3584.053, 3584.378, 3584.421 | 3572.653, 3573.019, 3575.190 | -0.573%, -0.587%, -0.558%; **-0.573%** |
+| `smc-next-64` / `legacy-i286-a20-off` | 3703.382, 3703.583, 3704.465 | 3724.713, 3724.401, 3725.863 | 3703.684, 3699.869, 3703.752 | 3703.383, 3707.488, 3705.620 | -0.581%, -0.354%, -0.524%; **-0.524%** |
+| `smc-next-64` / `legacy-i386-a20-off` | 3587.927, 3585.870, 3585.951 | 3596.397, 3596.351, 3597.501 | 3586.115, 3586.945, 3587.280 | 3574.937, 3577.752, 3576.345 | -0.546%, -0.547%, -0.625%; **-0.547%** |
+
+The unfiltered native samples were recorded during the round and are not
+committed. They include failed campaigns, both fresh C1 controls for each A/B,
+the frozen round-1 context, store and component samples, and a manifest with
+executable, source and data fingerprints. The medians above are taken from them.
+
+**MEASURED final gates (superseded by round 3):** all 80 cells passed +0.5%
+against fresh paired d4a58e2a controls; I8088/I8086 ran +9.8% to +123.7% host
+instructions per step against the alias; stores -0.027% (8) / -0.049% (32).
+
+**MEASURED / maintainer follow-ups:** an eleven-byte I80286 instruction
+(`26` nine times followed by `B0 5A`) executes in Direct but raises #GP in
+Checked. The exact saved C1 and sixth libraries reproduce this difference;
+C2 preserves it. The new parity witness covers admitted lengths, prefixes and
+the FFFFh edge. Track this existing over-limit discrepancy separately.
+The supervisor-owned decision-23 amendment is unchanged by this worker; its
+XOR citation uses an older volume/section location. The checked pinned edition
+places XOR at Vol 2D §6.1 p. 6-40 as recorded above.
+
+## C2 I8088 and I8086, round 3 (baseline d4a58e2a)
+
+**MEASURED result:** all **80** existing path/workload cells pass **+0.5%**
+against fresh paired controls of the saved d4a58e2a executable, interleaved
+in one campaign. Largest increase: **+0.249%**, `smc-rmw-64` / I286 A20 on.
+Store widths: -0.003% (8) and -0.006% (32).
+
+**MEASURED review witnesses / READ fixes:** a read-only adversarial review of
+round 2 reported one P2 and five P3 findings. Each witness below failed on the
+round-2 code and passes after its fix. The reviewer's sequences are adopted in
+`legacy_i8086` unchanged in substance and run on both models.
+
+| Finding | Witness | Fix | Before → final |
+|---|---|---|---|
+| P2-1 REP owner at a yield | `budget_yield_with_pending_irq_keeps_the_prefix_owner`, `budget_yield_with_pending_irq_rep_first_order`; control `budget_yield_with_pending_irq_then_delivery_names_the_last_prefix` | The walk never moves IP to the last prefix. The dispatcher keeps the owner/restart pair and applies it at delivery (UM §2.7 p. 2-42) | Yield IP 1202h; bytes 11 BB CC, or CX 2 → 1201h; 11 22 33, CX 0 |
+| P3-1 RAM fault opened a retry | `unmapped_string_fault_does_not_open_an_mmio_retry` | The fault marker records whether it opened the retry; a RAM-side fault closes that retry again | `irq_ready` false, string first → as I80286: ready, IRQ first |
+| P3-2 IRET delay with IF set | `sti_and_iret_delay_only_when_they_reenable_interrupts` | IRET arms the delay only for IF 0 → 1, as STI does. UM §2.6 p. 2-24 (page image checked) says both "reenable interrupts only after the end of the following instruction" | AX 1 → 0 |
+| P3-3 I8088 read I8086 rows | `lift::i8086::tests::lowering_reads_the_supplied_catalogue_entry` | The lift buffer carries the selected entry into shared lowering; delivery and resolve read `cpu_model`. The generation projection returns to its C1 values | Changed row ignored → followed |
+| P3-4 deprecated selector ran I8086 | `deprecated_selector_keeps_refusing_the_8086_generation` | The Direct20 entry refuses a VM without an 8088/8086 catalogue model through the C1 cold entry | `BudgetExhausted` and execution → `LegacyEntryFacility`, state unchanged |
+| P3-5 decode rows | `model::decode::i8086::tests::every_8086_row_is_admitted_by_some_encoding` | The 8086 bit is cleared on every row the 8086 policy never admits: ARPL, SALC, D0–D3 /6, the 66h/REX NOP widths and the ten combined WAIT forms (their C1 values) | 18 rows → none |
+
+Two consequences of these fixes also have witnesses. Before P3-2, the
+unconditional IRET delay was the only thing that refreshed the Direct20
+boundary after a flag restore loaded TF. POPF never had that refresh, so in
+round 2 a POPF that loaded TF with IF clear was never single-stepped.
+`flag_restores_loading_tf_trap_after_the_following_instruction` covers POPF and
+IRET (HLT reached, BX 1 → trap after INC AX; UM §2.6 p. 2-28). The fast path now
+refreshes its boundary when TF is set after a Direct20 block. After P3-1 an IRQ
+can be delivered directly after a RAM-side fault on a string's first element,
+and the recorded pair would have named the last prefix although no element had
+completed. `irq_after_a_string_fault_names_the_last_prefix_only_after_an_element`
+shows frame 1201h → 1200h. The pair is now kept only after a completed element.
+
+**MEASURED gate attribution:** the first complete campaign missed 19 cells
+(`alu`, `load`, `load-odd`, `call-ret` on every system path, plus one `store`
+and two `ip-boundary-64` cells; worst +0.880%, `load` / I386). Interleaved runs
+of d4a58e2a, the round-2 final executable and round-3 builds placed the cost in
+round 3, not in host drift: `alu` +0.27–0.31% for round 2 against +0.63–0.81%
+for round 3, and `call-ret` +0.01–0.07% against +0.93–0.96%. The system walk
+instantiations were byte-identical to round 2. `Vcpu::run_steps`, which inlines
+the 110 KB system dispatcher, was not. Its run-entry test had been changed to
+read `cpu_model` for P3-4. A separate lift buffer type for P3-3 also added
+about 70 KB of lifter monomorphizations; replacing it with a field on the
+existing buffer did not move those cells. Restoring the round-2 generation test
+at the run entries, with the deprecated refusal inside the out-of-line Direct20
+entry, brought `alu` to -0.04%…-0.02% and `load` to -0.01%…+0.04%. All samples
+of the failed campaign and of the triads are retained with the round's
+scratch evidence.
+
+**MEASURED validation:** 32 runtime binaries on the final source, **1,251 passed,
+4 ignored**, zero failures: every `legacy_*` binary (21; `legacy_i8086` 45,
+of which 8 are new), the core library (423, two new), run_steps, irq_shadow,
+retired_count, smc, same_block_smc, fences, fault_metadata,
+boundary/environment and the Cranelift application_codegen witnesses. The
+reviewer's two scratch files (not committed) pass 29/29 and 10/10 on each
+model. Formatting, Clippy with all targets/features and warnings denied, and
+the workspace release test check with Unicorn pass.
+
+**MEASURED method:** the compiler, SDK, background/timeout/job limits and
+counted drivers are those of rounds 1 and 2. Each workload runs literal
+`real16_loops 1 3 <workload>` for the d4a58e2a executable (SHA-256
+`4db0da02d946edc96164f2b70b8479c507b363f0482a4542eb1a601debe9c461`) and then
+for the candidate (SHA-256
+`dbaa820388387311495dc1975d15105226a673f6eef1b8d46350c49587470a6e`), one
+process at a time. Values are three-sample medians of host instructions per
+step, with equal warmup, step and retirement counts. Another workload built on
+the host throughout (load average 13–38); instruction counts were used, not time.
+A rebuild of the final source reproduces the measured executable and core
+library byte for byte.
+
+**MEASURED final gate:** host instructions per step, d4a58e2a → round 3.
+
+| Workload | Alias | I286 A20 on | I386 A20 on | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 357.602→357.212 (-0.109%) | 363.009→363.047 (+0.010%) | 363.245→363.044 (-0.055%) | 363.072→363.214 (+0.039%) | 363.071→362.954 (-0.032%) |
+| `load` | 468.755→468.023 (-0.156%) | 478.368→478.043 (-0.068%) | 478.529→478.151 (-0.079%) | 478.468→478.078 (-0.082%) | 478.467→478.220 (-0.052%) |
+| `load-odd` | 479.573→479.207 (-0.076%) | 489.172→489.136 (-0.007%) | 489.221→489.196 (-0.005%) | 489.309→489.344 (+0.007%) | 489.137→489.316 (+0.037%) |
+| `store` | 431.853→431.262 (-0.137%) | 445.094→444.884 (-0.047%) | 445.001→444.872 (-0.029%) | 445.080→444.846 (-0.053%) | 444.891→444.904 (+0.003%) |
+| `push-pop` | 492.724→490.496 (-0.452%) | 490.993→488.894 (-0.428%) | 490.864→488.887 (-0.403%) | 490.801→488.902 (-0.387%) | 490.849→488.924 (-0.392%) |
+| `data-next-to-code` | 998.575→974.718 (-2.389%) | 1013.216→990.382 (-2.254%) | 1013.278→989.901 (-2.307%) | 1013.076→990.062 (-2.272%) | 1013.151→989.844 (-2.300%) |
+| `data-next-to-dense-code` | 998.596→974.948 (-2.368%) | 1013.808→989.739 (-2.374%) | 1013.343→989.825 (-2.321%) | 1013.417→989.971 (-2.314%) | 1013.485→989.769 (-2.340%) |
+| `call-ret` | 837.267→833.517 (-0.448%) | 907.769→904.858 (-0.321%) | 907.700→904.448 (-0.358%) | 907.743→904.125 (-0.399%) | 907.752→904.180 (-0.393%) |
+| `dos-mixed` | 454.927→453.049 (-0.413%) | 443.000→440.949 (-0.463%) | 443.147→440.954 (-0.495%) | 443.051→440.858 (-0.495%) | 442.761→441.010 (-0.395%) |
+| `rep-movsw` | 188.278→188.340 (+0.033%) | 188.295→188.215 (-0.042%) | 188.282→188.217 (-0.035%) | 188.300→188.251 (-0.026%) | 188.306→188.217 (-0.047%) |
+| `straight-line` | 411.838→410.742 (-0.266%) | 381.981→382.169 (+0.049%) | 381.855→381.950 (+0.025%) | 382.503→382.521 (+0.005%) | 382.469→382.235 (-0.061%) |
+| `ip-boundary-1` | 2415.034→2270.252 (-5.995%) | 2604.904→2488.861 (-4.455%) | 2605.353→2487.397 (-4.527%) | 2605.725→2487.149 (-4.551%) | 2605.624→2488.003 (-4.514%) |
+| `ip-boundary-64` | 343.577→341.022 (-0.744%) | 374.954→372.647 (-0.615%) | 374.834→372.395 (-0.651%) | 374.952→372.410 (-0.678%) | 374.888→372.505 (-0.636%) |
+| `smc-next-1` | 11122.991→10874.772 (-2.232%) | 5499.968→5371.696 (-2.332%) | 5392.923→5246.691 (-2.712%) | 5506.278→5373.149 (-2.418%) | 5387.479→5245.099 (-2.643%) |
+| `smc-next-64` | 9159.235→9070.090 (-0.973%) | 3697.608→3698.427 (+0.022%) | 3581.059→3569.439 (-0.324%) | 3699.614→3701.011 (+0.038%) | 3583.401→3570.780 (-0.352%) |
+| `smc-rmw-64` | 9266.410→9181.979 (-0.911%) | 4925.811→4938.080 (+0.249%) | 4790.547→4787.406 (-0.066%) | 4926.753→4935.203 (+0.172%) | 4791.550→4788.843 (-0.056%) |
+
+**MEASURED new models:** host instructions per step against the current alias;
+no gate or guest-cycle claim. Compared with round 2 they run up to 2.2% more
+host instructions per step (`alu` 393.513 → 402.265 on I8088). The cause was
+not attributed.
+
+| Workload | Current alias | I8088 (vs alias) | I8086 (vs alias) |
+|---|---:|---:|---:|
+| `alu` | 357.212 | 402.265 (+12.61%) | 402.431 (+12.66%) |
+| `load` | 468.023 | 547.960 (+17.08%) | 547.711 (+17.03%) |
+| `load-odd` | 479.207 | 547.953 (+14.35%) | 547.961 (+14.35%) |
+| `store` | 431.262 | 544.000 (+26.14%) | 543.965 (+26.13%) |
+| `push-pop` | 490.496 | 651.502 (+32.83%) | 651.534 (+32.83%) |
+| `data-next-to-code` | 974.718 | 1431.258 (+46.84%) | 1431.411 (+46.85%) |
+| `data-next-to-dense-code` | 974.948 | 1431.344 (+46.81%) | 1430.868 (+46.76%) |
+| `call-ret` | 833.517 | 1132.996 (+35.93%) | 1133.012 (+35.93%) |
+| `dos-mixed` | 453.049 | 642.546 (+41.83%) | 642.782 (+41.88%) |
+| `rep-movsw` | 188.340 | 357.407 (+89.77%) | 357.475 (+89.80%) |
+| `straight-line` | 410.742 | 516.017 (+25.63%) | 514.701 (+25.31%) |
+| `ip-boundary-1` | 2270.252 | 2399.649 (+5.70%) | 2400.161 (+5.72%) |
+| `ip-boundary-64` | 341.022 | 403.076 (+18.20%) | 403.111 (+18.21%) |
+| `smc-next-1` | 10874.772 | 21511.231 (+97.81%) | 21533.296 (+98.01%) |
+| `smc-next-64` | 9070.090 | 19692.629 (+117.12%) | 19692.231 (+117.11%) |
+| `smc-rmw-64` | 9181.979 | 20572.272 (+124.05%) | 20561.202 (+123.93%) |
+
+**MEASURED store gate:** `interpreter_store_probe WIDTH single off 1000000`
+through the counted driver linked to each core library; three interleaved
+pairs per width, +0.5% limit.
+
+| Width | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---:|
+| 8 | 298.111, 298.167, 298.010 (**298.111**) | 298.323, 298.103, 298.023 (**298.103**) | -0.003% |
+| 32 | 593.845, 593.855, 593.692 (**593.845**) | 593.809, 593.817, 593.532 (**593.809**) | -0.006% |
+
+No commits, git writes, bead operations or pushes were performed, and
+backlog/decisions/ was not edited.

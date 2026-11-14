@@ -102,6 +102,9 @@ pub(crate) fn shared_helper(op: &L) -> bool {
 pub(super) struct ContextOps<'a, B> {
     pub ops: &'a mut B,
     pub context: MachineContext,
+    /// The selected catalogue entry where lowering must not use the
+    /// generation projection (I8088/I8086; decision-23 §2).
+    pub profile: Option<&'static crate::ModelProfile>,
 }
 impl<B: LiftBuffer> std::ops::Deref for ContextOps<'_, B> {
     type Target = [IrOp];
@@ -120,6 +123,9 @@ impl<B: LiftBuffer> LiftBuffer for ContextOps<'_, B> {
     }
     fn legacy_context(&self) -> Option<MachineContext> {
         Some(self.context)
+    }
+    fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
+        self.profile
     }
 }
 
@@ -148,7 +154,7 @@ pub(crate) fn instruction(
         u64::from(ip),
         // 80386 PRM §17 MOV to/from Special Registers, p. 17-111:
         // recognize test-register MOV so deferred system accesses are typed.
-        profile.isa.decoder_options(),
+        crate::model::decode::decoder_options_for_generation(context.generation),
     );
     let mut insn = decoder.decode();
     let mode = if context.default_operand_bits == 16 {
@@ -365,6 +371,26 @@ fn rollback_required(ops: &[IrOp]) -> bool {
     false
 }
 
+// The catalogue entry that governs this lowering. I8088/I8086 lowering carries
+// its selected entry (decision-23 §2); the generation projection serves the
+// system models, whose entries it reproduces exactly.
+#[inline(always)]
+fn lowering_profile(
+    ops: &impl LiftBuffer,
+    context: MachineContext,
+) -> &'static crate::ModelProfile {
+    match ops.model_profile() {
+        Some(profile) => profile,
+        None => {
+            debug_assert!(
+                context.generation != crate::CpuGeneration::I8086,
+                "8086-family lowering carries its catalogue entry"
+            );
+            crate::model::profile_for_generation(context.generation)
+        }
+    }
+}
+
 pub(super) fn direct_address(
     ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
@@ -374,6 +400,13 @@ pub(super) fn direct_address(
     context: MachineContext,
     ip: u64,
 ) -> Val {
+    // Only an 8086-family context can select the wrapped shape.
+    // Keep the catalogue lookup off the existing system-model lift paths.
+    if context.generation == crate::CpuGeneration::I8086
+        && lowering_profile(ops, context).quirks.wrap_segment_offsets
+    {
+        return super::i8086::tagged_address(ops, tg, segment, offset);
+    }
     // I286 PRM Appendix B MOV p. B-74; I386 PRM §14.6 Table 14-1:
     // check the whole operand before forming a selector-derived linear address.
     if bytes != 0 {
@@ -382,9 +415,7 @@ pub(super) fn direct_address(
             offset,
             size: bytes,
             vector: if segment == SegmentId::Ss {
-                crate::model::profile_for_generation(context.generation)
-                    .lift
-                    .direct_stack_fault
+                lowering_profile(ops, context).lift.direct_stack_fault
             } else {
                 13
             },
@@ -445,7 +476,7 @@ fn direct_addresses(ops: &mut Vec<IrOp>, tg: &mut TempGen, context: MachineConte
 // Scalar RMW lowering computes its result before the store. Recompute only the
 // flag image after that store succeeds, so a scalar needs no rollback
 // snapshot (spec.md §16, fault atomicity).
-fn defer_store_flags(ops: &mut Vec<IrOp>, tg: &mut TempGen) {
+pub(super) fn defer_store_flags(ops: &mut Vec<IrOp>, tg: &mut TempGen) {
     let Some(store) = ops.iter().rposition(|op| matches!(op, IrOp::Store { .. })) else {
         return;
     };
@@ -568,7 +599,7 @@ fn address(
 ) -> Result<Val, LiftError> {
     effective_address(insn, ops, tg)
 }
-fn selector(ops: &mut impl LiftBuffer, tg: &mut TempGen, segment: SegmentId) -> Val {
+pub(super) fn selector(ops: &mut impl LiftBuffer, tg: &mut TempGen, segment: SegmentId) -> Val {
     let reg = match segment {
         SegmentId::Cs => Reg::Cs,
         SegmentId::Ds => Reg::Ds,
@@ -585,7 +616,7 @@ fn selector(ops: &mut impl LiftBuffer, tg: &mut TempGen, segment: SegmentId) -> 
     };
     read_reg(reg, ops, tg)
 }
-fn load(ops: &mut impl LiftBuffer, tg: &mut TempGen, addr: Val, size: u8) -> Val {
+pub(super) fn load(ops: &mut impl LiftBuffer, tg: &mut TempGen, addr: Val, size: u8) -> Val {
     let dst = tg.fresh();
     ops.push(IrOp::Load {
         fault: Default::default(),
@@ -597,7 +628,7 @@ fn load(ops: &mut impl LiftBuffer, tg: &mut TempGen, addr: Val, size: u8) -> Val
 }
 // SDM Vol 2B §4.3 PUSH/POP/RET; 80386 PRM §17.1.3, pp. 17-1–17-2:
 // operand width selects slots; SS.B independently selects SP or ESP.
-fn stack_offset(ops: &mut impl LiftBuffer, tg: &mut TempGen, delta: i64) -> Val {
+pub(super) fn stack_offset(ops: &mut impl LiftBuffer, tg: &mut TempGen, delta: i64) -> Val {
     let context = ops.legacy_context().expect("stack context");
     let sp = read_reg(Reg::Rsp, ops, tg);
     let value = if delta == 0 {
@@ -631,6 +662,13 @@ fn stack_address(
     access: crate::AccessKind,
 ) -> Val {
     let context = ops.legacy_context().expect("stack context");
+    // Only an 8086-family context can select the wrapped shape.
+    // Keep the catalogue lookup off the existing system-model lift paths.
+    if context.generation == crate::CpuGeneration::I8086
+        && lowering_profile(ops, context).quirks.wrap_segment_offsets
+    {
+        return super::i8086::tagged_address(ops, tg, SegmentId::Ss, offset);
+    }
     let dst = tg.fresh();
     if context.segment_class == crate::SegmentClass::Direct {
         emit(
@@ -639,9 +677,7 @@ fn stack_address(
                 dst,
                 offset,
                 bytes: size,
-                vector: crate::model::profile_for_generation(context.generation)
-                    .lift
-                    .direct_stack_fault,
+                vector: lowering_profile(ops, context).lift.direct_stack_fault,
             },
         );
     } else {
@@ -658,7 +694,7 @@ fn stack_address(
     }
     Val::Temp(dst)
 }
-fn write_sp(ops: &mut impl LiftBuffer, value: Val) {
+pub(super) fn write_sp(ops: &mut impl LiftBuffer, value: Val) {
     ops.push(IrOp::WriteReg {
         reg: Reg::Rsp,
         src: value,
@@ -669,7 +705,7 @@ fn write_sp(ops: &mut impl LiftBuffer, value: Val) {
             / 8,
     });
 }
-fn push_value(ops: &mut impl LiftBuffer, tg: &mut TempGen, value: Val, size: u8) {
+pub(super) fn push_value(ops: &mut impl LiftBuffer, tg: &mut TempGen, value: Val, size: u8) {
     let offset = stack_offset(ops, tg, -i64::from(size));
     let addr = stack_address(ops, tg, offset, size, crate::AccessKind::Write);
     ops.push(IrOp::Store {
@@ -716,7 +752,7 @@ fn check_target(
     value
 }
 
-fn far_target(
+pub(super) fn far_target(
     insn: &Instruction,
     ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
@@ -749,7 +785,7 @@ pub(super) fn lower(
 ) -> Result<bool, LiftError> {
     use Mnemonic::*;
     let context = ops.legacy_context().expect("legacy lowering context");
-    let profile = crate::model::profile_for_generation(context.generation);
+    let profile = lowering_profile(ops, context);
     // Generation availability is checked before lowering; decoder width alone
     // never grants the 286 any 386 forms (I286 PRM §6.2 p. 6-2, Appendix B).
     let mode = if context.default_operand_bits == 16 {
@@ -782,11 +818,6 @@ pub(super) fn lower(
     }
     match insn.mnemonic() {
         Pushf | Pushfd | Popf | Popfd | Iret | Iretd if !profile.flags_helper_supported() => {
-            return Err(unsupported_insn(insn))
-        }
-        Shl | Sal | Shr | Sar | Rol | Ror | Rcl | Rcr | Shld | Shrd
-            if profile.quirks.shift_count_mask != Some(31) =>
-        {
             return Err(unsupported_insn(insn))
         }
         Lldt | Ltr => {
@@ -1018,14 +1049,17 @@ pub(super) fn lower(
             }
         }
         Push => {
-            if profile.quirks.push_sp_after_decrement {
-                return Err(unsupported_insn(insn));
-            }
             let value = if let Some(seg) = segment(insn.op0_register()) {
                 selector(ops, tg, seg)
             } else {
                 lower_read(insn, 0, ops, tg)?
             };
+            let value =
+                if profile.quirks.push_sp_after_decrement && insn.op0_register() == Register::SP {
+                    stack_offset(ops, tg, -2)
+                } else {
+                    value
+                };
             push_value(ops, tg, value, size);
         }
         Pop => {

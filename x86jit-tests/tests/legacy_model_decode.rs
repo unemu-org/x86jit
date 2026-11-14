@@ -271,3 +271,23 @@ fn protected_default_width_does_not_grant_later_instructions() {
         }
     }
 }
+
+#[test]
+fn i80286_group_three_test_aliases_follow_the_compatibility_amendment() {
+    // Decision-23 amendment; SDM Vol 3B §25.15 pp. 25-5–6;
+    // oracles/ss8088/v2/metadata.json marks F6h/F7h /1 "alias".
+    // The amendment retains the existing I80286 TEST /1 disposition.
+    for (bytes, ax, zero) in [
+        (&b"\xf6\xc8\x80"[..], 0x81, false),
+        (&b"\xf7\xc8\x00\x80"[..], 0x7fff, true),
+    ] {
+        let (vm, mut cpu) = setup(Some(CpuModel::I80286), bytes);
+        cpu.cpu.gpr[0] = ax;
+        cpu.cpu.flags.set_flags16(0x8d5);
+        step(&vm, &mut cpu, 1);
+        assert_eq!(cpu.cpu.gpr[0], ax);
+        assert_eq!(cpu.cpu.flags.zf, zero);
+        assert!(!cpu.cpu.flags.cf && !cpu.cpu.flags.of);
+        assert_eq!(cpu.cpu.rip, IP + bytes.len() as u64);
+    }
+}

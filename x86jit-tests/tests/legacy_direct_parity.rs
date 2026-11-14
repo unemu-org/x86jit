@@ -1206,3 +1206,44 @@ fn unified_segment_pop_rechecks_a20_direct_bus_proof() {
         .collect();
     assert_eq!(results[0], results[1]);
 }
+
+#[test]
+fn register_immediate_qualification_preserves_prefix_and_ip_edges() {
+    // Compare shared qualification with the complete Checked reference path,
+    // including model-absent prefixes and instruction/segment length edges.
+    let mut cases = vec![
+        vec![0xb0, 0x5a],
+        vec![0xb4, 0xa5],
+        vec![0xb8, 0x34, 0x12],
+        vec![0x66, 0xb8, 0x78, 0x56, 0x34, 0x12],
+        vec![0x67, 0xb0, 0x5a],
+        vec![0x64, 0xb0, 0x5a],
+        vec![0xf0, 0xb0, 0x5a],
+        vec![0xf3, 0xb0, 0x5a],
+    ];
+    for prefixes in [8, 9, 13, 14] {
+        let mut code = vec![0x26; prefixes];
+        code.extend([0xb0, 0x5a]);
+        cases.push(code);
+    }
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        for ip in [0x1000, 0xfffe] {
+            for code in &cases {
+                // Over-limit I286 Direct/Checked behavior already differs in
+                // C1. It is outside this at-most-ten-byte shared qualification.
+                if model == CpuModel::I80286 && code.len() > 10 {
+                    continue;
+                }
+                let outcomes: Vec<_> = [false, true]
+                    .into_iter()
+                    .map(|checked| {
+                        let (vm, mut cpu) = setup(model, checked, ip, code);
+                        cpu.cpu.gpr[0] = 0x8877_6655_4433_2211;
+                        run(&vm, &mut cpu, 1, false)
+                    })
+                    .collect();
+                assert_eq!(outcomes[0], outcomes[1], "{model:?} {ip:x} {code:02x?}");
+            }
+        }
+    }
+}

@@ -866,7 +866,7 @@ fn finish_port_string_in_ordered<const ROUTED: bool, const ORDER: u8>(
     let access = Access::<ROUTED, ORDER>::new(mem);
     let (access, _ordering) = access.helper(Some(ordering::Direction::Write));
     let addr = p.base.wrapping_add(p.offset);
-    if let Err(t) = string_store::<true, _>(cpu, access, p.rip, addr, value, p.elem) {
+    if let Err(t) = string_store::<true, false, _>(cpu, access, p.rip, addr, value, p.elem) {
         // SDM Vol 2A §3.3 INS, 64-Bit Mode Exceptions: ES is never SS.
         let exit = if matches!(t, MemTrap::Unmapped | MemTrap::NonCanonical) {
             crate::memory::unmapped_exit(

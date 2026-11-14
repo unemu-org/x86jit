@@ -4746,9 +4746,10 @@ impl RunningMemory<'_> {
         // SDM Vol 3A §14.6: discard decoded bytes after the storing instruction.
         // Scan only after an overlap; ordinary instruction markers do no extra work.
         let next = self.ir.ops.iter().find_map(|op| match op {
-            crate::IrOp::InsnStart { guest_addr } if *guest_addr > self.current.get() => {
-                Some(self.start - self.ir.guest_start + guest_addr)
-            }
+            crate::IrOp::InsnStart { guest_addr } if *guest_addr > self.current.get() => Some(
+                self.start
+                    .wrapping_add(guest_addr.wrapping_sub(self.ir.guest_start)),
+            ),
             _ => None,
         });
         if next.is_some_and(|next| addr.saturating_add(len as u64) > next) {

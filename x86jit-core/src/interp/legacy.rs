@@ -2010,7 +2010,7 @@ fn shared_string_fault<const ROUTED: bool, M: InterpreterMemory>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8>(
+pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -2021,16 +2021,21 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8>(
     ss_shadow: bool,
     pending_irq: bool,
 ) -> Progress {
+    let code_base = if DIRECT20 {
+        (((u64::from(cpu.cs) << 4) + ir.guest_start) & 0xfffff).wrapping_sub(ir.guest_start)
+    } else {
+        u64::from(cpu.cs) << 4
+    };
     let mut steps = StepContext::new(limit);
     steps.pending_irq = pending_irq;
     let mut info = RetireInfo {
-        code_base: u64::from(cpu.cs) << 4,
+        code_base,
         exit_request: Some(exit_word),
         sti_shadow,
         ss_shadow,
         ..Default::default()
     };
-    let result = super::interpret_direct_steps::<ROUTED, ORDER>(
+    let result = super::interpret_direct_steps::<ROUTED, ORDER, DIRECT20>(
         ir, cpu, memory, scratch, &mut info, &mut steps,
     );
     if info.retired != 0 {
@@ -2091,6 +2096,33 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+// Keep the new operation shapes out of existing walks while sharing their source.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    sti_shadow: bool,
+    ss_shadow: bool,
+    pending_irq: bool,
+) -> Progress {
+    execute_shared::<ROUTED, ORDER, true>(
+        ir,
+        cpu,
+        memory,
+        scratch,
+        limit,
+        exit_word,
+        sti_shadow,
+        ss_shadow,
+        pending_irq,
+    )
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
@@ -2107,7 +2139,7 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
     pending_irq: bool,
 ) -> Progress {
     match walk {
-        BlockWalk::Shared => execute_shared::<ROUTED, ORDER>(
+        BlockWalk::Shared => execute_shared::<ROUTED, ORDER, false>(
             ir,
             cpu,
             memory,
@@ -3487,6 +3519,21 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         outcome.preserve_rf = true;
                         return Ok(true);
                     }
+                }
+                // Twenty-bit operations belong to the dedicated shared walk.
+                // Keep that execution machinery out of the system-model walker.
+                L::WrappedLoad { .. }
+                | L::WrappedStore { .. }
+                | L::FlagsImage { .. }
+                | L::LoadFlagsWord { .. }
+                | L::DivideTrap { .. }
+                | L::Coprocessor20 { .. }
+                | L::WrappedString { .. }
+                | L::Interrupt20 { .. } => {
+                    return Err(refusal(
+                        cpu,
+                        crate::UnsupportedSystemOperation::LegacyExecution,
+                    ))
                 }
                 L::Refuse { operation } => return Err(refusal(cpu, *operation)),
             }

@@ -5,6 +5,7 @@
 //! before an op is emitted; memory operands expand to effective-address arithmetic
 //! (the single `effective_address` helper, §17.5) plus `Load`/`Store`.
 
+pub(crate) mod i8086;
 pub(crate) mod legacy;
 mod mmx;
 
@@ -33,6 +34,11 @@ use vector::*;
 pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
     fn push(&mut self, op: IrOp);
     fn legacy_context(&self) -> Option<crate::MachineContext> {
+        None
+    }
+    /// The selected catalogue entry, for a model whose lowering must not
+    /// read another entry through the generation projection (decision-23 §2).
+    fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
         None
     }
 }
@@ -865,6 +871,7 @@ fn lift_block_attempt(
             let mut shared = legacy::ContextOps {
                 ops: &mut ops,
                 context,
+                profile: None,
             };
             lift_insn(&insn, &mut shared, &mut tg, mode, &mut mmx_sequence)
         } else {
@@ -2393,6 +2400,7 @@ fn lift_insn(
         let mut shared = legacy::ContextOps {
             ops,
             context: legacy::alias_context(),
+            profile: None,
         };
         let ends = legacy::lower(insn, &mut shared, tg)?;
         // The alias has selector-derived segments and inert retained state;

@@ -18,6 +18,10 @@ pub enum CpuModel {
     I80286,
     /// Intel 80386DX (decision-23 §2).
     I80386,
+    /// Intel 8088, with an 8-bit external bus (8086 Family UM App. B pp. B-31–32).
+    I8088,
+    /// Intel 8086, with a 16-bit external bus (8086 Family UM App. B pp. B-31–32).
+    I8086,
 }
 
 /// Decode-set identity, independent of instruction width (decision-23 §2).
@@ -28,12 +32,15 @@ pub enum ModelIsa {
     I80286,
     /// The current 386 real/protected decode policy (decision-23 §2).
     I80386,
+    /// 8086/8088 encodings (8086 Family UM §4.2 Tables 4-12/4-13 pp. 4-22–36).
+    I8086,
 }
 
 impl ModelIsa {
     /// Compatibility projection for existing generation checks (decision-23 §2).
     pub const fn generation(self) -> CpuGeneration {
         match self {
+            Self::I8086 => CpuGeneration::I8086,
             Self::I80286 => CpuGeneration::I286,
             Self::I80386 => CpuGeneration::I386,
         }
@@ -58,6 +65,23 @@ pub enum ModelSystem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ModelQuirks {
+    /// Highest processor-generated interrupt (8086 Family UM §2.6 pp. 2-24–28;
+    /// 286 PRM App. C Table C-1 p. C-1; 386 PRM §14.6 Table 14-1 p. 14-5).
+    pub max_processor_interrupt: u8,
+    /// Ones in the stored FLAGS image (SDM Vol 3B §25.17.2).
+    pub real_flags_set_mask: u16,
+    /// Divide interrupt returns after the instruction (8086 Family UM §2.6 p. 2-26).
+    pub divide_saves_next_ip: bool,
+    /// Signed minimum quotient is outside the divide range (UM §2.7 p. 2-37).
+    pub idiv_rejects_signed_minimum: bool,
+    /// Each byte offset wraps inside its segment (UM §2.3 p. 2-12).
+    pub wrap_segment_offsets: bool,
+    /// Sequential IP wraps to zero (UM §2.2 p. 2-7; §2.3 p. 2-12).
+    pub wrap_sequential_ip: bool,
+    /// Interrupted strings restart at the last prefix (UM §2.7 p. 2-42).
+    pub rep_keeps_last_prefix_only: bool,
+    /// The single-step trap follows external interrupt entry (UM §2.6 p. 2-28).
+    pub step_interrupt_handler: bool,
     /// Whether PUSH SP stores the decremented value (decision-23 §3;
     /// SDM Vol 3B §25.17.1).
     pub push_sp_after_decrement: bool,
@@ -133,6 +157,14 @@ impl ModelProfile {
 static I80286: ModelProfile = identified(ModelProfile {
     isa: ModelIsa::I80286,
     quirks: ModelQuirks {
+        max_processor_interrupt: 16,
+        real_flags_set_mask: 0,
+        divide_saves_next_ip: false,
+        idiv_rejects_signed_minimum: false,
+        wrap_segment_offsets: false,
+        wrap_sequential_ip: false,
+        rep_keeps_last_prefix_only: false,
+        step_interrupt_handler: false,
         push_sp_after_decrement: false,
         shift_count_mask: Some(31),
         real_flags_clear_mask: 0xf000,
@@ -159,6 +191,14 @@ static I80286: ModelProfile = identified(ModelProfile {
 static I80386: ModelProfile = identified(ModelProfile {
     isa: ModelIsa::I80386,
     quirks: ModelQuirks {
+        max_processor_interrupt: 16,
+        real_flags_set_mask: 0,
+        divide_saves_next_ip: false,
+        idiv_rejects_signed_minimum: false,
+        wrap_segment_offsets: false,
+        wrap_sequential_ip: false,
+        rep_keeps_last_prefix_only: false,
+        step_interrupt_handler: false,
         push_sp_after_decrement: false,
         shift_count_mask: Some(31),
         real_flags_clear_mask: 0x8000,
@@ -182,10 +222,53 @@ static I80386: ModelProfile = identified(ModelProfile {
     },
 });
 
+// 8086 Family UM §§2.2–2.3 pp. 2-7–12, §2.6 pp. 2-24–28,
+// §2.7 pp. 2-37–42; 286 PRM App. C pp. C-1–3; SDM Vol 3B §25.17.
+// Present retains the generation-neutral engine; I8087 pairing arrives in C6.
+const fn early_model(identity: u64) -> ModelProfile {
+    let mut p = identified(ModelProfile {
+        isa: ModelIsa::I8086,
+        quirks: ModelQuirks {
+            max_processor_interrupt: 4,
+            real_flags_set_mask: 0xf000,
+            divide_saves_next_ip: true,
+            idiv_rejects_signed_minimum: true,
+            wrap_segment_offsets: true,
+            wrap_sequential_ip: true,
+            rep_keeps_last_prefix_only: true,
+            step_interrupt_handler: true,
+            push_sp_after_decrement: true,
+            shift_count_mask: None,
+            real_flags_clear_mask: 0,
+            flags_fixed_zero: EARLY_FLAGS_FIXED_ZERO,
+        },
+        system: ModelSystem::None,
+        physical_bits: 20,
+        max_insn_len: None,
+        fpu: &[FpuModel::Present, FpuModel::None],
+        timing: None,
+        semantics_id: 0,
+        lift: ModelLiftPolicy {
+            direct_stack_fault: 0,
+            available_tss_types: 0,
+            lar_system_types: 0,
+            lsl_system_types: 0,
+            lsl_conforming: false,
+            protected_coprocessor_outputs: false,
+        },
+    });
+    p.semantics_id ^= identity;
+    p
+}
+static I8088: ModelProfile = early_model(8088);
+static I8086: ModelProfile = early_model(8086);
+
 impl CpuModel {
     /// The immutable catalogue entry for this model (decision-23 §2).
     pub const fn profile(self) -> &'static ModelProfile {
         match self {
+            Self::I8088 => &I8088,
+            Self::I8086 => &I8086,
             Self::I80286 => &I80286,
             Self::I80386 => &I80386,
         }
@@ -200,8 +283,10 @@ impl CpuModel {
     }
 }
 
-/// Compatibility lookup used only during lifting. I8086 execution is still
-/// refused at run entry; its catalogue is introduced separately (decision-23 C2).
+/// Compatibility lookup used only while lifting for the system models.
+/// I8088/I8086 lowering and delivery read the selected entry instead
+/// (decision-23 §2). The deprecated selector's I8086 generation is still
+/// refused at run entry and keeps its C1 projection here.
 pub(crate) const fn profile_for_generation(generation: CpuGeneration) -> &'static ModelProfile {
     match generation {
         CpuGeneration::I286 | CpuGeneration::I8086 => &I80286,
@@ -274,6 +359,36 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
         i += 1;
     }
     hash = word(hash, p.timing.is_some() as u64);
+    // Existing entries retain their canonical implicit defaults in the digest.
+    // Any departure is explicit data, including a future change to an old model.
+    if p.quirks.max_processor_interrupt != 16
+        || p.quirks.real_flags_set_mask != 0
+        || p.quirks.divide_saves_next_ip
+        || p.quirks.idiv_rejects_signed_minimum
+        || p.quirks.wrap_segment_offsets
+        || p.quirks.wrap_sequential_ip
+        || p.quirks.rep_keeps_last_prefix_only
+        || p.quirks.step_interrupt_handler
+    {
+        let early = [
+            p.quirks.max_processor_interrupt as u64,
+            p.quirks.real_flags_set_mask as u64,
+            p.quirks.divide_saves_next_ip as u64,
+            p.quirks.idiv_rejects_signed_minimum as u64,
+            p.quirks.wrap_segment_offsets as u64,
+            p.quirks.wrap_sequential_ip as u64,
+            p.quirks.rep_keeps_last_prefix_only as u64,
+            p.quirks.step_interrupt_handler as u64,
+            // Byte-extension disposition, including the decision-23 alias
+            // amendment, and prefix folding revision.
+            3,
+        ];
+        i = 0;
+        while i < early.len() {
+            hash = word(hash, early[i]);
+            i += 1;
+        }
+    }
     p.semantics_id = hash;
     p
 }
@@ -299,7 +414,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..9 {
+            for change in 0..17 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -310,7 +425,15 @@ mod tests {
                     5 => changed.max_insn_len = None,
                     6 => changed.lift.direct_stack_fault ^= 1,
                     7 => changed.fpu = &[FpuModel::None],
-                    _ => changed.lift.available_tss_types ^= 1,
+                    8 => changed.lift.available_tss_types ^= 1,
+                    9 => changed.quirks.max_processor_interrupt = 4,
+                    10 => changed.quirks.real_flags_set_mask = 0xf000,
+                    11 => changed.quirks.divide_saves_next_ip = true,
+                    12 => changed.quirks.idiv_rejects_signed_minimum = true,
+                    13 => changed.quirks.wrap_segment_offsets = true,
+                    14 => changed.quirks.wrap_sequential_ip = true,
+                    15 => changed.quirks.rep_keeps_last_prefix_only = true,
+                    _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);
             }

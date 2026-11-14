@@ -820,6 +820,67 @@ pub enum LegacyOp {
         bytes: u8,
         vector: u8,
     },
+
+    /// Bytewise transfers through a segment-wrapping twenty-bit address.
+    WrappedLoad {
+        dst: crate::ir::Temp,
+        addr: crate::ir::Val,
+        size: u8,
+    },
+    WrappedStore {
+        addr: crate::ir::Val,
+        value: crate::ir::Val,
+        size: u8,
+    },
+    /// CPU ESC/WAIT policy with a generation-neutral optional coprocessor.
+    Coprocessor20 {
+        kind: Option<crate::x87::FpuKind>,
+        addr: crate::ir::Val,
+        sti: u8,
+        memory: bool,
+        wait: bool,
+        bytes: [u8; 15],
+        len: u8,
+    },
+    /// IVT delivery without an IDTR or a system-register image.
+    Interrupt20 {
+        vector: u8,
+        saved_ip: u16,
+        overflow_only: bool,
+        flags_set: u16,
+    },
+    /// Lift-resolved FLAGS image constants (decision-23 §3).
+    FlagsImage {
+        dst: crate::ir::Temp,
+        clear: u16,
+        set: u16,
+    },
+    /// Restore the implemented real-mode flag bits, without system registers.
+    LoadFlagsWord {
+        value: crate::ir::Val,
+        mask: u16,
+        delay_irq: bool,
+    },
+    /// Divide with a lift-resolved return IP and signed quotient bound.
+    DivideTrap {
+        quot: crate::ir::Temp,
+        rem: crate::ir::Temp,
+        hi: crate::ir::Temp,
+        lo: crate::ir::Val,
+        divisor: crate::ir::Val,
+        size: u8,
+        signed: bool,
+        reject_minimum: bool,
+        saved_ip: u16,
+    },
+    /// String bytes wrap inside their segments and on a twenty-bit bus.
+    WrappedString {
+        kind: crate::ir::StrOp,
+        elem: u8,
+        rep: crate::ir::RepKind,
+        source: SegmentId,
+        restart_ip: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
