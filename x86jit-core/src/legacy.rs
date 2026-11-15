@@ -223,8 +223,20 @@ pub struct LegacyCpuState {
     /// or abandonment by an architectural fault.
     pub a20_enabled: u8,
     pub reset_fetch: u8,
+    /// Zero on every model except `NecV20`/`NecV30`, where it holds their mode
+    /// state (decision-23 C4a): bit 0 is set while PSW.MD = 0 (8080 emulation
+    /// mode), bit 1 is the hidden MD write-enable latch that BRKEM sets and
+    /// RETEM clears (NEC V20/V30 UM pp. 12-169, 12-177), and bit 2 is the
+    /// 8080-mode standby latch exchanged as `I8080View::halted`. A V20/V30
+    /// reset image writes zero (MD = 1, NEC UM §7 p. 7-1). The 286 and 386
+    /// refuse a nonzero value.
     pub reserved: u8,
 }
+
+/// `LegacyCpuState::reserved` bits of the NEC V20/V30 (decision-23 C4a).
+pub(crate) const NEC_EMULATION: u8 = 1;
+pub(crate) const NEC_MD_WRITE: u8 = 2;
+pub(crate) const NEC_STANDBY: u8 = 4;
 
 /// SDM Vol 3A §2.5: PE is bit 0, PG is bit 31; PG requires PE.
 /// SDM Vol 3A §3.4.5: CS.D and SS.B independently select default sizes.
@@ -881,6 +893,37 @@ pub enum LegacyOp {
         source: SegmentId,
         restart_ip: u16,
     },
+    /// NEC V20/V30 CHKIND: BRK 5 when the index lies outside the bounds
+    /// (NEC UM p. 12-170). The page does not say whether the comparison is
+    /// signed; a word pair on which the two readings disagree is refused.
+    CheckIndex20 {
+        index: crate::ir::Temp,
+        lower: crate::ir::Temp,
+        upper: crate::ir::Temp,
+        saved_ip: u16,
+        flags_set: u16,
+    },
+    /// NEC V20/V30 BRKEM imm8: frame, MD <- 0, MD write-enable, vector
+    /// (NEC UM p. 12-169; IE and BRK cleared under decision-23 rule R2).
+    Brkem20 {
+        vector: u8,
+        saved_ip: u16,
+        flags_set: u16,
+    },
+    /// NEC V20/V30 RETI: PC, PS, PSW from the popped words; MD only while
+    /// the MD write-enable latch is set (NEC UM p. 12-168).
+    Reti20 {
+        ip: crate::ir::Temp,
+        cs: crate::ir::Temp,
+        flags: crate::ir::Temp,
+        sp: crate::ir::Temp,
+    },
+    /// NEC V20/V30 POP PSW flag restore with the MD rule (NEC UM p. 12-151).
+    PopPsw20 {
+        value: crate::ir::Temp,
+    },
+    /// Hold INT through the following instruction (NEC UM §6 p. 6-4).
+    InhibitIrq20,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -194,7 +194,8 @@ pub use codemap::{
 };
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{
-    AccessKind, ExecutionEvidence, Exit, PortDir, StepResult, UnsupportedSystemOperation,
+    AccessKind, ExecutionEvidence, Exit, I8080Entry, I8080Handback, I8080HandbackError, I8080View,
+    PortDir, StepResult, UnsupportedSystemOperation,
 };
 pub use fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,

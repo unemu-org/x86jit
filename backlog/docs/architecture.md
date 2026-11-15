@@ -43,7 +43,7 @@ that changes.
 | Module | Purpose |
 |--------|---------|
 | `legacy` | Application/Machine execution profiles, compatibility model boundary, pure Machine context derivation, appended system/descriptor storage, checked real-address accesses and model-aware flag images (decision-18 §§1–2; decision-23 Migration M1) |
-| `model` | Static `CpuModel` / `ModelProfile` catalogue for I8088/I8086/I80286/I80386; explicit encoding sets and absent-encoding policy (`model/decode.rs`), ISA/generation projection, quirks, system family, physical width, instruction limit, FPU pairing, timing slot and stable semantics identity (decision-23 §2) |
+| `model` | Static `CpuModel` / `ModelProfile` catalogue for I8088/I8086/NecV20/NecV30/I80286/I80386; explicit encoding sets and absent-encoding policy (`model/decode.rs`), ISA/generation projection, quirks, system family, physical width, instruction limit, FPU pairing, timing slot and stable semantics identity (decision-23 §2) |
 | `state` | `Reg`, `CpuState` (`#[repr(C)]`, flat GPR file), `Flags` (§3) |
 | `memory_stats` | Public non-exhaustive allocation snapshots: VM/cache/backend categories and live vCPU gauges; page-rounding model for the pinned Cranelift allocator, process-wide retained fault metadata (§4.1, §9.1) |
 | `memory` | `Memory`, `MemoryModel` (Flat/SoftMmu), `Prot`, `RegionKind`, `MemTrap`; opt-in host-fault recovery, owned fetch snapshots (§4, §8.1) |
@@ -55,6 +55,7 @@ that changes.
 | `host_write` | Cold host VM write-permission queries after a crossing-store read probe faults (§8.1, decision-13) |
 | `lift::legacy`, `interp::legacy`, `vm::legacy` | Explicit-context I386 real lowering and interpreter, centralized stack/segmented accesses, private per-vCPU cache/epoch; protected execution and event delivery remain refused (decision-18 §§1, 3–4) |
 | `lift::i8086`, `interp::i8086`, `vm::i8086` | Permanent Direct execution for models without system registers: shared multi-instruction cache, decoding from manual tables and accepted aliases with typed refusals, segment-offset and 20-bit physical wrapping, lift-resolved FLAGS/divide/count policies, CPU ESC transfers and IVT events (decision-23 C2, spec.md §17.10) |
+| `vm::nec` | NEC V20/V30 native side of 8080 emulation mode: the `I8080Mode` boundary, `hand_back_i8080`, and RETEM/CALLN decoded behind the ED escape (decision-23 C4a, spec.md §17.10) |
 | `interp` | IR interpreter: `interpret_block` over a Vcpu-reused temps buffer, Variant-A flags, RIP-on-trap; also the shared `string_run`/`divide`/`crc32c` helpers the JIT calls; `interp::softfloat` implements non-default SIMD numerical modes with integer arithmetic (§8.1) |
 | `x87` | x87 FPU exec (`exec_x87`/`exec_fxstate`), shared by both backends; register file is `[F80; 8]` (§14) |
 | `f80` | software 80-bit extended float (`F80`) — true x87 precision, rounds each op to a 64-bit significand; pure Rust (portable across x86/ARM) (§14) |

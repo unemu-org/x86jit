@@ -58,6 +58,28 @@ pub enum UnsupportedSystemOperation {
     LegacyPrivilegeTransition,
     LegacyTaskPaging,
     LegacyTaskDebugTrap,
+    /// NEC V20/V30: BRKEM while the MD write-enable latch is set. Emulation
+    /// mode cannot be nested and "normal operation cannot be expected"
+    /// (NEC V20/V30 UM §8 p. 8-5).
+    NecNestedEmulation,
+    /// NEC V20/V30: POP PSW would clear MD between BRKEM and RETEM. NEC UM
+    /// p. 12-151 says not to do this and describes no result.
+    NecPswModeWrite,
+    /// NEC V20/V30: RETEM popped a PSW with MD = 0. NEC UM p. 12-177
+    /// describes only the frame BRKEM saved.
+    NecRetemToEmulation,
+    /// NEC V20/V30: BRK = 1 where the single-step break would meet the mode
+    /// switch: at an 8080-mode boundary, at the start of a BRKEM, or at the
+    /// start of a RETI that would re-enter 8080 mode. NEC UM §6 p. 6-3 gives the
+    /// general break rule; how it combines with the mode switch is not
+    /// described.
+    NecEmulationSingleStep,
+    /// NEC V20/V30: a single-step trap and an acceptable INT at one boundary.
+    /// NEC UM Table 6-1 p. 6-1 gives priorities, not the sequence.
+    NecStepWithInterrupt,
+    /// NEC V20/V30: CHKIND bounds on which a signed and an unsigned
+    /// comparison disagree. NEC UM p. 12-170 does not say which applies.
+    NecIndexComparison,
 }
 
 /// Reason `run()` returned control to the user (§5.2).
@@ -290,6 +312,112 @@ pub enum Exit {
     /// I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8 p. 9-13.
     #[non_exhaustive]
     Shutdown { addr: u64 },
+    /// NEC V20/V30 only: an instruction boundary with PSW.MD = 0 (8080
+    /// emulation mode, NEC V20/V30 UM §8 p. 8-1) at which the engine has
+    /// nothing to execute. Zero steps; nothing is in flight. The embedder runs
+    /// an 8080 core on `view` and returns through
+    /// [`crate::Vcpu::hand_back_i8080`] (decision-23 C4a; spec.md §17.10). The
+    /// core's stop test ORs in [`crate::ExitRequest::is_requested`].
+    #[non_exhaustive]
+    I8080Mode { view: I8080View, entry: I8080Entry },
+}
+
+/// How a NEC V20/V30 vCPU reached the boundary of an [`Exit::I8080Mode`].
+/// Diagnostic only; the hand-back does not depend on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum I8080Entry {
+    /// BRKEM imm8 completed since the last I8080Mode exit (NEC V20/V30 UM
+    /// p. 12-169).
+    Brkem { vector: u8 },
+    /// RETI restored MD = 0 since the last I8080Mode exit (NEC V20/V30 UM
+    /// p. 12-168).
+    Reti,
+    /// The vCPU was already in 8080 mode, for example after a hand-back.
+    Resume,
+}
+
+/// The 8080-visible state of a NEC V20/V30 in emulation mode, by value
+/// (NEC V20/V30 UM §8 p. 8-1, Figs. 8-1 and 8-2; register encodings §12
+/// Tables 12-6/12-7 p. 12-3). The fields an 8080 instruction can change are
+/// written back by [`crate::Vcpu::hand_back_i8080`]; the segments are not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct I8080View {
+    /// A: AL. AH is not addressable in emulation mode and is not exchanged.
+    pub a: u8,
+    /// 8080 flags: PSW bits 7:0, S Z 0 AC 0 P 1 CY.
+    pub flags: u8,
+    /// BC: CW (CX); B is CH, C is CL.
+    pub bc: u16,
+    /// DE: DW (DX); D is DH, E is DL.
+    pub de: u16,
+    /// HL: BW (BX); H is BH, L is BL.
+    pub hl: u16,
+    /// The 8080 stack pointer: BP. Its stack is in the data segment.
+    pub sp: u16,
+    /// The 8080 PC: PC (IP), an offset in the code segment.
+    pub pc: u16,
+    /// PSW.IE (IF). That the 8080 EI and DI set and clear it is ASSUMED
+    /// (contract draft S4); NEC V20/V30 UM §8 does not say.
+    pub interrupt_enable: bool,
+    /// The 8080 core's EI delay: INT is not accepted at this boundary.
+    /// Stored and returned verbatim; the zero-step exit never clears it.
+    pub ei_delay: bool,
+    /// The 8080 core is in standby after HLT (NEC V20/V30 UM §9 p. 9-1).
+    pub halted: bool,
+    /// PS (CS): instruction and operand fetches.
+    pub code_segment: u16,
+    /// DS0 (DS): data operands and the 8080 stack.
+    pub data_segment: u16,
+}
+
+impl I8080View {
+    /// Twenty-bit address of a code-segment offset (NEC UM §10 Fig. 10-1).
+    pub const fn code_address(&self, offset: u16) -> u32 {
+        ((self.code_segment as u32) * 16 + offset as u32) & 0xf_ffff
+    }
+
+    /// Twenty-bit address of a data-segment offset (NEC UM §10 Fig. 10-1).
+    pub const fn data_address(&self, offset: u16) -> u32 {
+        ((self.data_segment as u32) * 16 + offset as u32) & 0xf_ffff
+    }
+}
+
+/// How the 8080 core stopped, for [`crate::Vcpu::hand_back_i8080`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum I8080Handback {
+    /// Stopped on opcode EDh at `pc` without consuming it. The engine decodes
+    /// that byte again at PS:PC as its next unit: RETEM (ED FD) or CALLN
+    /// (ED ED imm8), each one step; any other ED form is
+    /// [`Exit::UnknownInstruction`].
+    EdEscape,
+    /// Stopped at an instruction boundary (budget, host stop or interrupt).
+    Boundary,
+    /// Refused the opcode at `pc`, which is not EDh. MD stays 0; until the next
+    /// hand-back, each run at this PS:PC returns [`Exit::UnknownInstruction`]
+    /// with that byte. An interrupt taken at this boundary also ends it.
+    Refused { opcode: u8 },
+}
+
+/// A hand-back the engine rejected; the vCPU is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum I8080HandbackError {
+    /// The vCPU is not a NEC V20/V30 in 8080 mode.
+    NotInI8080Mode,
+    /// The view names other segments; emulation mode cannot change them
+    /// (NEC V20/V30 UM §8 p. 8-1).
+    SegmentChanged,
+    /// A halted 8080 core cannot stop on an opcode.
+    HaltedStop,
+    /// `Refused` named EDh, the escape byte; an ED stop is `EdEscape`.
+    RefusedEscape,
+    /// An MMIO transfer is in flight: the last call stopped a frame access of
+    /// RETEM, CALLN or an interrupt taken in 8080 mode with an MMIO exit.
+    /// Complete it and run again first; a pending escape stays pending.
+    InFlight,
 }
 
 impl Exit {

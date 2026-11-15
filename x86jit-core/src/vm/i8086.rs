@@ -21,6 +21,8 @@ struct Decoded {
     restart: u16,
     bytes: Vec<u8>,
     evidence: Vec<u8>,
+    /// NEC V20/V30 BRKEM imm8, which the iced tables do not describe.
+    brkem: Option<u8>,
 }
 
 fn fetch(
@@ -98,6 +100,24 @@ fn fetch(
         if profile.isa.unavailable_prefix(&suffix) {
             return Err(refusal(u64::from(ip), &original));
         }
+        // NEC UM p. 12-169: BRKEM imm8 is 0F FF imm8. No prefix use is
+        // described, so a prefixed form is a typed refusal.
+        if suffix[0] == 0x0f {
+            if suffix.len() < 3 {
+                continue;
+            }
+            if prefixes != 0 {
+                return Err(refusal(u64::from(ip), &original));
+            }
+            return Ok(Decoded {
+                insn: Instruction::default(),
+                len: 3,
+                restart: ip,
+                bytes: suffix.clone(),
+                evidence: original,
+                brkem: Some(suffix[2]),
+            });
+        }
         // iced's fifteen-byte representation is a decoding tool, not the
         // processor's length limit. Retain the last prefix in each class,
         // then decode the bounded opcode/operand suffix at its real end IP.
@@ -141,18 +161,31 @@ fn fetch(
             DecodeAction::Alias(code) => insn.set_code(code),
             DecodeAction::Absent(_) => return Err(refusal(u64::from(ip), &original)),
         }
+        // A port block transfer resumes at its first byte. With more prefixes
+        // than the model keeps (NEC UM §6 p. 6-4: three) it would resume at a
+        // later prefix, which this engine's port strings do not model.
+        if matches!(
+            insn.mnemonic(),
+            iced_x86::Mnemonic::Insb
+                | iced_x86::Mnemonic::Insw
+                | iced_x86::Mnemonic::Outsb
+                | iced_x86::Mnemonic::Outsw
+        ) && prefixes > u32::from(profile.quirks.rep_restart_prefixes.unwrap_or(0))
+        {
+            return Err(refusal(u64::from(ip), &original));
+        }
         let len = prefixes + suffix.len() as u32;
-        let restart = if prefixes == 0 {
-            ip
-        } else {
-            ip.wrapping_add((prefixes - 1) as u16)
-        };
+        // 8086 Family UM §2.7 p. 2-42 keeps the last prefix; NEC V20/V30 UM
+        // §6 p. 6-4 keeps up to three, one address back per prefix.
+        let kept = u32::from(profile.quirks.rep_restart_prefixes.unwrap_or(0));
+        let restart = ip.wrapping_add(prefixes.saturating_sub(kept) as u16);
         return Ok(Decoded {
             insn,
             len,
             restart,
             bytes,
             evidence: original,
+            brkem: None,
         });
     }
 }
@@ -189,6 +222,7 @@ pub(super) fn resolve(
                 restart,
                 bytes,
                 evidence,
+                brkem,
             } = match fetched {
                 Ok(value) => value,
                 Err(Exit::Interrupted) => return Err(Exit::Interrupted),
@@ -201,9 +235,12 @@ pub(super) fn resolve(
                 u16::try_from(u64::from(ip) + u64::from(len))
                     .map_err(|_| refusal(u64::from(ip), &bytes))?
             };
-            let lifted = crate::lift::i8086::instruction(
-                &insn, &bytes, &evidence, ip, len, next, restart, profile, &mut tg,
-            );
+            let lifted = match brkem {
+                Some(vector) => Ok(crate::lift::i8086::brkem(ip, len, next, vector, profile)),
+                None => crate::lift::i8086::instruction(
+                    &insn, &bytes, &evidence, ip, len, next, restart, profile, &mut tg,
+                ),
+            };
             let part = match lifted {
                 Ok(ir) => ir,
                 Err(_) if combined.is_some() => break,
@@ -222,7 +259,8 @@ pub(super) fn resolve(
             {
                 break;
             }
-            let terminates = insn.flow_control() != iced_x86::FlowControl::Next
+            let terminates = brkem.is_some()
+                || insn.flow_control() != iced_x86::FlowControl::Next
                 || matches!(
                     insn.mnemonic(),
                     iced_x86::Mnemonic::Hlt | iced_x86::Mnemonic::Popf
@@ -230,10 +268,12 @@ pub(super) fn resolve(
                 || part.ops.iter().any(|op| {
                     matches!(
                         op,
-                        IrOp::Legacy(
-                            crate::legacy::LegacyOp::WrappedString { .. }
-                                | crate::legacy::LegacyOp::Interrupt20 { .. }
-                        )
+                        IrOp::PortString { .. }
+                            | IrOp::Legacy(
+                                crate::legacy::LegacyOp::WrappedString { .. }
+                                    | crate::legacy::LegacyOp::Interrupt20 { .. }
+                                    | crate::legacy::LegacyOp::CheckIndex20 { .. }
+                            )
                     )
                 })
                 || u64::from(ip) + u64::from(len) >= 0x10000

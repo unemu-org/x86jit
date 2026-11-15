@@ -1227,6 +1227,31 @@ fn walk_ops<
                     }
                     return WalkResult::Continue;
                 }
+                op @ (L::CheckIndex20 { .. }
+                | L::Brkem20 { .. }
+                | L::Reti20 { .. }
+                | L::PopPsw20 { .. })
+                    if MACHINE && DIRECT20 =>
+                {
+                    match i8086::nec::<ROUTED, ORDER>(
+                        op,
+                        cpu,
+                        mem.0.normal(),
+                        temps,
+                        cur_addr.get(),
+                    ) {
+                        Err(exit) => return WalkResult::exit(exit),
+                        Ok(i8086::Nec::Fallthrough) => {}
+                        Ok(i8086::Nec::Transfer) => return WalkResult::Continue,
+                        Ok(i8086::Nec::ModeChange) => return WalkResult::ModeChange,
+                    }
+                }
+                // NEC UM §6 p. 6-4: INT is held through the next instruction;
+                // the single-step break is not named for these forms.
+                L::InhibitIrq20 if MACHINE && DIRECT20 => {
+                    shadows.complete_before(*retired);
+                    shadows.arm_sti(true, false);
+                }
                 L::WrappedString {
                     kind,
                     elem,
@@ -5020,7 +5045,12 @@ fn walk_ops<
                 let base = read_val(*base, temps);
                 // SDM Vol 3B §23.1.4, Table 23-1: real-mode operands
                 // crossing the 64 KiB segment limit raise #GP (or #SS).
-                if ir.mode == crate::CpuMode::Real16 && offset + u64::from(*elem) > 0x10000 {
+                // A twenty-bit model's base is a segment tag whose bytes wrap
+                // inside the segment (decision-23 §3; NEC UM Fig. 10-1 p. 10-1).
+                if !DIRECT20
+                    && ir.mode == crate::CpuMode::Real16
+                    && offset + u64::from(*elem) > 0x10000
+                {
                     return WalkResult::delivered_fault(deliver_interrupt_mode(
                         cpu,
                         mem,
@@ -5048,7 +5078,7 @@ fn walk_ops<
                 };
                 let value = if *dir_out {
                     let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
-                    match string_load::<true, false, _>(
+                    match string_load::<true, DIRECT20, _>(
                         cpu,
                         mem,
                         cur_addr.get(),
@@ -5057,6 +5087,13 @@ fn walk_ops<
                         *elem,
                     ) {
                         Ok(value) => value & mask(*elem),
+                        Err(t) if DIRECT20 => {
+                            return WalkResult::exit(i8086::port_string_fault(
+                                cpu,
+                                t,
+                                base.wrapping_add(offset),
+                            ));
+                        }
                         Err(t) => {
                             // SDM Vol 2B §4.3 OUTS, 64-Bit Mode Exceptions.
                             if matches!(t, MemTrap::Unmapped | MemTrap::NonCanonical) {

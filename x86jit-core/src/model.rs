@@ -22,6 +22,10 @@ pub enum CpuModel {
     I8088,
     /// Intel 8086, with a 16-bit external bus (8086 Family UM App. B pp. B-31–32).
     I8086,
+    /// NEC uPD70108 (V20), with an 8-bit external bus (NEC V20/V30 UM §1 p. 1-1).
+    NecV20,
+    /// NEC uPD70116 (V30), with a 16-bit external bus (NEC V20/V30 UM §1 p. 1-1).
+    NecV30,
 }
 
 /// Decode-set identity, independent of instruction width (decision-23 §2).
@@ -34,13 +38,17 @@ pub enum ModelIsa {
     I80386,
     /// 8086/8088 encodings (8086 Family UM §4.2 Tables 4-12/4-13 pp. 4-22–36).
     I8086,
+    /// NEC V20/V30 native mode: the 8086 set, the 80186-class forms NEC UM
+    /// §12 lists and BRKEM (decision-23 C4a). The NEC extension groups are
+    /// typed refusals until C4b.
+    NecV20,
 }
 
 impl ModelIsa {
     /// Compatibility projection for existing generation checks (decision-23 §2).
     pub const fn generation(self) -> CpuGeneration {
         match self {
-            Self::I8086 => CpuGeneration::I8086,
+            Self::I8086 | Self::NecV20 => CpuGeneration::I8086,
             Self::I80286 => CpuGeneration::I286,
             Self::I80386 => CpuGeneration::I386,
         }
@@ -78,8 +86,11 @@ pub struct ModelQuirks {
     pub wrap_segment_offsets: bool,
     /// Sequential IP wraps to zero (UM §2.2 p. 2-7; §2.3 p. 2-12).
     pub wrap_sequential_ip: bool,
-    /// Interrupted strings restart at the last prefix (UM §2.7 p. 2-42).
-    pub rep_keeps_last_prefix_only: bool,
+    /// Prefix bytes an interrupted repeated string keeps in its return
+    /// address, counted back from the opcode; `None` returns to the
+    /// instruction's first byte (8086 Family UM §2.7 p. 2-42: the last one;
+    /// NEC V20/V30 UM §6 p. 6-4: up to three).
+    pub rep_restart_prefixes: Option<u8>,
     /// The single-step trap follows external interrupt entry (UM §2.6 p. 2-28).
     pub step_interrupt_handler: bool,
     /// Whether PUSH SP stores the decremented value (decision-23 §3;
@@ -93,6 +104,22 @@ pub struct ModelQuirks {
     pub real_flags_clear_mask: u16,
     /// Absent identity flags (SDM Vol 3B §§25.16–25.16.1 pp.25-6–7).
     pub flags_fixed_zero: u32,
+    /// IRET delays maskable interrupts through its successor when it sets
+    /// IF (8086 Family UM §2.6 p. 2-24). NEC V20/V30 UM §6 p. 6-4 does not
+    /// list RETI among the instructions after which INT is held.
+    pub iret_delays_interrupts: bool,
+    /// A store of a segment register (MOV r/m16, sreg) holds NMI and INT
+    /// through the following instruction (NEC V20/V30 UM §6 p. 6-4).
+    pub segment_store_inhibits_interrupts: bool,
+    /// The manual gives no order for a single-step trap and an acceptable
+    /// external interrupt at one boundary; the engine refuses that boundary
+    /// (NEC V20/V30 UM §6 Table 6-1 p. 6-1 lists priorities only).
+    pub step_irq_conflict_refused: bool,
+    /// STI holds maskable interrupts through the next instruction whatever IF
+    /// was: NEC V20/V30 UM §6 p. 6-4 ("between the EI instruction and the next
+    /// instruction") and p. 12-172 EI state no condition. Otherwise only an
+    /// STI that begins with IF = 0 does (SDM Vol 2B §4.3 STI).
+    pub ei_delay_unconditional: bool,
 }
 
 /// Reserved catalogue handle for a cycle table (decision-23, Timing model).
@@ -163,12 +190,16 @@ static I80286: ModelProfile = identified(ModelProfile {
         idiv_rejects_signed_minimum: false,
         wrap_segment_offsets: false,
         wrap_sequential_ip: false,
-        rep_keeps_last_prefix_only: false,
+        rep_restart_prefixes: None,
         step_interrupt_handler: false,
         push_sp_after_decrement: false,
         shift_count_mask: Some(31),
         real_flags_clear_mask: 0xf000,
         flags_fixed_zero: EARLY_FLAGS_FIXED_ZERO,
+        iret_delays_interrupts: false,
+        segment_store_inhibits_interrupts: false,
+        step_irq_conflict_refused: false,
+        ei_delay_unconditional: false,
     },
     system: ModelSystem::Msw286,
     physical_bits: 24,
@@ -197,12 +228,16 @@ static I80386: ModelProfile = identified(ModelProfile {
         idiv_rejects_signed_minimum: false,
         wrap_segment_offsets: false,
         wrap_sequential_ip: false,
-        rep_keeps_last_prefix_only: false,
+        rep_restart_prefixes: None,
         step_interrupt_handler: false,
         push_sp_after_decrement: false,
         shift_count_mask: Some(31),
         real_flags_clear_mask: 0x8000,
         flags_fixed_zero: EARLY_FLAGS_FIXED_ZERO,
+        iret_delays_interrupts: false,
+        segment_store_inhibits_interrupts: false,
+        step_irq_conflict_refused: false,
+        ei_delay_unconditional: false,
     },
     system: ModelSystem::Cr386,
     physical_bits: 32,
@@ -235,12 +270,16 @@ const fn early_model(identity: u64) -> ModelProfile {
             idiv_rejects_signed_minimum: true,
             wrap_segment_offsets: true,
             wrap_sequential_ip: true,
-            rep_keeps_last_prefix_only: true,
+            rep_restart_prefixes: Some(1),
             step_interrupt_handler: true,
             push_sp_after_decrement: true,
             shift_count_mask: None,
             real_flags_clear_mask: 0,
             flags_fixed_zero: EARLY_FLAGS_FIXED_ZERO,
+            iret_delays_interrupts: true,
+            segment_store_inhibits_interrupts: false,
+            step_irq_conflict_refused: false,
+            ei_delay_unconditional: false,
         },
         system: ModelSystem::None,
         physical_bits: 20,
@@ -263,12 +302,75 @@ const fn early_model(identity: u64) -> ModelProfile {
 static I8088: ModelProfile = early_model(8088);
 static I8086: ModelProfile = early_model(8086);
 
+// NEC V20/V30 native mode (decision-23 C4a). Values are read from NEC
+// uPD70108/70116 User's Manual, Stock No. 500350 (page images checked):
+// - PSW image MD,1,1,1 above V (§3 p. 3-3); MD is 1 whenever a native
+//   instruction executes (§8 p. 8-1), so lifted images store F000h;
+// - vectors 0-5 are processor-assigned (§6 p. 6-1, Fig. 6-1, Table 6-1);
+// - DIV/DIVU push PC, the offset of the next instruction (§12 pp. 12-56–60;
+//   §3 p. 3-1), and the signed quotient stops at -127/-32767 (pp. 12-58–59).
+//   Those pages' operation lines give the bound as "0-7FH-1"/"0-7FFFH-1"
+//   (-128/-32768) with garbled comparison signs; the prose minimum, stated
+//   with its hexadecimal value (81H/8001H), is taken;
+// - offsets are 16-bit values added to segment x 16 on a 20-bit bus
+//   (§10 Fig. 10-1 p. 10-1; §4 p. 4-1); PC is a 16-bit counter (§3 p. 3-1);
+// - shift and rotate counts are used whole (pp. 12-102, 12-104);
+// - an interrupted block instruction keeps up to three prefixes (§6 p. 6-4);
+// - INT is held after a segment-register store, not after RETI (§6 p. 6-4),
+//   and after every EI, whatever IE was (§6 p. 6-4; p. 12-172);
+// - no instruction-length limit is stated.
+// PUSH SP/POP SP and the single-step/INT order are not stated: the first is a
+// typed refusal of the decode set, the second the refused-conflict field.
+const fn nec_model(identity: u64) -> ModelProfile {
+    let mut p = identified(ModelProfile {
+        isa: ModelIsa::NecV20,
+        quirks: ModelQuirks {
+            max_processor_interrupt: 5,
+            real_flags_set_mask: 0xf000,
+            divide_saves_next_ip: true,
+            idiv_rejects_signed_minimum: true,
+            wrap_segment_offsets: true,
+            wrap_sequential_ip: true,
+            rep_restart_prefixes: Some(3),
+            step_interrupt_handler: false,
+            push_sp_after_decrement: false,
+            shift_count_mask: None,
+            real_flags_clear_mask: 0,
+            flags_fixed_zero: EARLY_FLAGS_FIXED_ZERO,
+            iret_delays_interrupts: false,
+            segment_store_inhibits_interrupts: true,
+            step_irq_conflict_refused: true,
+            ei_delay_unconditional: true,
+        },
+        system: ModelSystem::None,
+        physical_bits: 20,
+        max_insn_len: None,
+        fpu: &[FpuModel::Present, FpuModel::None],
+        timing: None,
+        semantics_id: 0,
+        lift: ModelLiftPolicy {
+            direct_stack_fault: 0,
+            available_tss_types: 0,
+            lar_system_types: 0,
+            lsl_system_types: 0,
+            lsl_conforming: false,
+            protected_coprocessor_outputs: false,
+        },
+    });
+    p.semantics_id ^= identity;
+    p
+}
+static NEC_V20: ModelProfile = nec_model(70108);
+static NEC_V30: ModelProfile = nec_model(70116);
+
 impl CpuModel {
     /// The immutable catalogue entry for this model (decision-23 §2).
     pub const fn profile(self) -> &'static ModelProfile {
         match self {
             Self::I8088 => &I8088,
             Self::I8086 => &I8086,
+            Self::NecV20 => &NEC_V20,
+            Self::NecV30 => &NEC_V30,
             Self::I80286 => &I80286,
             Self::I80386 => &I80386,
         }
@@ -361,15 +463,15 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
     hash = word(hash, p.timing.is_some() as u64);
     // Existing entries retain their canonical implicit defaults in the digest.
     // Any departure is explicit data, including a future change to an old model.
-    if p.quirks.max_processor_interrupt != 16
+    let early_entry = p.quirks.max_processor_interrupt != 16
         || p.quirks.real_flags_set_mask != 0
         || p.quirks.divide_saves_next_ip
         || p.quirks.idiv_rejects_signed_minimum
         || p.quirks.wrap_segment_offsets
         || p.quirks.wrap_sequential_ip
-        || p.quirks.rep_keeps_last_prefix_only
-        || p.quirks.step_interrupt_handler
-    {
+        || p.quirks.rep_restart_prefixes.is_some()
+        || p.quirks.step_interrupt_handler;
+    if early_entry {
         let early = [
             p.quirks.max_processor_interrupt as u64,
             p.quirks.real_flags_set_mask as u64,
@@ -377,7 +479,10 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
             p.quirks.idiv_rejects_signed_minimum as u64,
             p.quirks.wrap_segment_offsets as u64,
             p.quirks.wrap_sequential_ip as u64,
-            p.quirks.rep_keeps_last_prefix_only as u64,
+            match p.quirks.rep_restart_prefixes {
+                Some(v) => v as u64,
+                None => 0,
+            },
             p.quirks.step_interrupt_handler as u64,
             // Byte-extension disposition, including the decision-23 alias
             // amendment, and prefix folding revision.
@@ -386,6 +491,26 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
         i = 0;
         while i < early.len() {
             hash = word(hash, early[i]);
+            i += 1;
+        }
+    }
+    // Interrupt-timing fields added with the NEC entries (decision-23 C4a).
+    // Their canonical values are the 8086's inside the early block and the
+    // system models' outside it, so existing identities are unchanged.
+    if p.quirks.iret_delays_interrupts != early_entry
+        || p.quirks.segment_store_inhibits_interrupts
+        || p.quirks.step_irq_conflict_refused
+        || p.quirks.ei_delay_unconditional
+    {
+        let timing = [
+            p.quirks.iret_delays_interrupts as u64,
+            p.quirks.segment_store_inhibits_interrupts as u64,
+            p.quirks.step_irq_conflict_refused as u64,
+            p.quirks.ei_delay_unconditional as u64,
+        ];
+        i = 0;
+        while i < timing.len() {
+            hash = word(hash, timing[i]);
             i += 1;
         }
     }
@@ -414,7 +539,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..17 {
+            for change in 0..21 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -432,12 +557,49 @@ mod tests {
                     12 => changed.quirks.idiv_rejects_signed_minimum = true,
                     13 => changed.quirks.wrap_segment_offsets = true,
                     14 => changed.quirks.wrap_sequential_ip = true,
-                    15 => changed.quirks.rep_keeps_last_prefix_only = true,
+                    15 => changed.quirks.rep_restart_prefixes = Some(1),
+                    16 => changed.quirks.iret_delays_interrupts = true,
+                    17 => changed.quirks.segment_store_inhibits_interrupts = true,
+                    18 => changed.quirks.step_irq_conflict_refused = true,
+                    19 => changed.quirks.ei_delay_unconditional = true,
                     _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);
             }
         }
         assert_ne!(I80286.semantics_id, I80386.semantics_id);
+    }
+
+    // Decision-23 C4a: the NEC entries share content and differ in identity;
+    // their content digest differs from the 8086's in every new field.
+    #[test]
+    fn nec_identity_tracks_its_fields() {
+        assert_eq!(
+            identified(copy(&NEC_V20)).semantics_id,
+            NEC_V20.semantics_id ^ 70108
+        );
+        assert_eq!(
+            identified(copy(&NEC_V30)).semantics_id,
+            NEC_V30.semantics_id ^ 70116
+        );
+        assert_eq!(
+            identified(copy(&I8088)).semantics_id,
+            I8088.semantics_id ^ 8088
+        );
+        let base = identified(copy(&NEC_V20)).semantics_id;
+        for change in 0..5 {
+            let mut changed = copy(&NEC_V20);
+            match change {
+                0 => changed.quirks.rep_restart_prefixes = Some(1),
+                1 => changed.quirks.iret_delays_interrupts = true,
+                2 => changed.quirks.segment_store_inhibits_interrupts = false,
+                3 => changed.quirks.ei_delay_unconditional = false,
+                _ => changed.quirks.step_irq_conflict_refused = false,
+            }
+            assert_ne!(identified(changed).semantics_id, base, "{change}");
+        }
+        let mut as_8086 = copy(&NEC_V20);
+        as_8086.isa = ModelIsa::I8086;
+        assert_ne!(identified(as_8086).semantics_id, base);
     }
 }

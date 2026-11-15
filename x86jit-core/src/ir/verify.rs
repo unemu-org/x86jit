@@ -375,8 +375,31 @@ impl IrBlock {
                         divisor,
                         ..
                     } => check(&[Val::Temp(*hi), *lo, *divisor], &[*quot, *rem])?,
+                    crate::legacy::LegacyOp::CheckIndex20 {
+                        index,
+                        lower,
+                        upper,
+                        ..
+                    } => check(
+                        &[Val::Temp(*index), Val::Temp(*lower), Val::Temp(*upper)],
+                        &[],
+                    )?,
+                    crate::legacy::LegacyOp::Reti20 { ip, cs, flags, sp } => check(
+                        &[
+                            Val::Temp(*ip),
+                            Val::Temp(*cs),
+                            Val::Temp(*flags),
+                            Val::Temp(*sp),
+                        ],
+                        &[],
+                    )?,
+                    crate::legacy::LegacyOp::PopPsw20 { value } => {
+                        check(&[Val::Temp(*value)], &[])?
+                    }
                     crate::legacy::LegacyOp::WrappedString { .. }
-                    | crate::legacy::LegacyOp::Interrupt20 { .. } => {}
+                    | crate::legacy::LegacyOp::Interrupt20 { .. }
+                    | crate::legacy::LegacyOp::Brkem20 { .. }
+                    | crate::legacy::LegacyOp::InhibitIrq20 => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {
                         check(&[*offset], &[*dst])?

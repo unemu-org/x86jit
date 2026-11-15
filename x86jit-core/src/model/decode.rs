@@ -6,8 +6,9 @@
 //! These are encoding names, not decoder feature tags. Bit 0 selects 286,
 //! bit 1 selects 386, bit 2 selects 8086/8088 (UM §4.2 Tables 4-12/4-13).
 //! Bit 2 marks only rows that the 8086 policy in `decode/i8086.rs` admits;
-//! there, WAIT and ESC stay separate instructions. Width variants are
-//! separate encodings.
+//! there, WAIT and ESC stay separate instructions. Bit 3 marks the
+//! 80186-class rows NEC V20/V30 UM §12 lists for native mode; the V20/V30
+//! set is bits 2 and 3. Width variants are separate encodings.
 use super::ModelIsa;
 mod i8086;
 use iced_x86::{Code, Instruction, Register};
@@ -121,27 +122,27 @@ pub(super) const ENCODINGS: &[(Code, u8)] = &[
     (Code::Push_r32, 2),
     (Code::Pop_r16, 7),
     (Code::Pop_r32, 2),
-    (Code::Pushaw, 3),
+    (Code::Pushaw, 11),
     (Code::Pushad, 2),
-    (Code::Popaw, 3),
+    (Code::Popaw, 11),
     (Code::Popad, 2),
-    (Code::Bound_r16_m1616, 3),
+    (Code::Bound_r16_m1616, 11),
     (Code::Bound_r32_m3232, 2),
     (Code::Arpl_rm16_r16, 3),
     (Code::Arpl_r32m16_r32, 2),
-    (Code::Push_imm16, 3),
+    (Code::Push_imm16, 11),
     (Code::Pushd_imm32, 2),
-    (Code::Imul_r16_rm16_imm16, 3),
+    (Code::Imul_r16_rm16_imm16, 11),
     (Code::Imul_r32_rm32_imm32, 2),
-    (Code::Pushw_imm8, 3),
+    (Code::Pushw_imm8, 11),
     (Code::Pushd_imm8, 2),
-    (Code::Imul_r16_rm16_imm8, 3),
+    (Code::Imul_r16_rm16_imm8, 11),
     (Code::Imul_r32_rm32_imm8, 2),
-    (Code::Insb_m8_DX, 3),
-    (Code::Insw_m16_DX, 3),
+    (Code::Insb_m8_DX, 11),
+    (Code::Insw_m16_DX, 11),
     (Code::Insd_m32_DX, 2),
-    (Code::Outsb_DX_m8, 3),
-    (Code::Outsw_DX_m16, 3),
+    (Code::Outsb_DX_m8, 11),
+    (Code::Outsw_DX_m16, 11),
     (Code::Outsd_DX_m32, 2),
     (Code::Jo_rel8_16, 7),
     (Code::Jo_rel8_32, 2),
@@ -288,29 +289,29 @@ pub(super) const ENCODINGS: &[(Code, u8)] = &[
     (Code::Mov_r8_imm8, 7),
     (Code::Mov_r16_imm16, 7),
     (Code::Mov_r32_imm32, 2),
-    (Code::Rol_rm8_imm8, 3),
-    (Code::Ror_rm8_imm8, 3),
-    (Code::Rcl_rm8_imm8, 3),
-    (Code::Rcr_rm8_imm8, 3),
-    (Code::Shl_rm8_imm8, 3),
-    (Code::Shr_rm8_imm8, 3),
+    (Code::Rol_rm8_imm8, 11),
+    (Code::Ror_rm8_imm8, 11),
+    (Code::Rcl_rm8_imm8, 11),
+    (Code::Rcr_rm8_imm8, 11),
+    (Code::Shl_rm8_imm8, 11),
+    (Code::Shr_rm8_imm8, 11),
     (Code::Sal_rm8_imm8, 3),
-    (Code::Sar_rm8_imm8, 3),
-    (Code::Rol_rm16_imm8, 3),
+    (Code::Sar_rm8_imm8, 11),
+    (Code::Rol_rm16_imm8, 11),
     (Code::Rol_rm32_imm8, 2),
-    (Code::Ror_rm16_imm8, 3),
+    (Code::Ror_rm16_imm8, 11),
     (Code::Ror_rm32_imm8, 2),
-    (Code::Rcl_rm16_imm8, 3),
+    (Code::Rcl_rm16_imm8, 11),
     (Code::Rcl_rm32_imm8, 2),
-    (Code::Rcr_rm16_imm8, 3),
+    (Code::Rcr_rm16_imm8, 11),
     (Code::Rcr_rm32_imm8, 2),
-    (Code::Shl_rm16_imm8, 3),
+    (Code::Shl_rm16_imm8, 11),
     (Code::Shl_rm32_imm8, 2),
-    (Code::Shr_rm16_imm8, 3),
+    (Code::Shr_rm16_imm8, 11),
     (Code::Shr_rm32_imm8, 2),
     (Code::Sal_rm16_imm8, 3),
     (Code::Sal_rm32_imm8, 2),
-    (Code::Sar_rm16_imm8, 3),
+    (Code::Sar_rm16_imm8, 11),
     (Code::Sar_rm32_imm8, 2),
     (Code::Retnw_imm16, 7),
     (Code::Retnd_imm16, 2),
@@ -323,9 +324,9 @@ pub(super) const ENCODINGS: &[(Code, u8)] = &[
     (Code::Mov_rm8_imm8, 7),
     (Code::Mov_rm16_imm16, 7),
     (Code::Mov_rm32_imm32, 2),
-    (Code::Enterw_imm16_imm8, 3),
+    (Code::Enterw_imm16_imm8, 11),
     (Code::Enterd_imm16_imm8, 2),
-    (Code::Leavew, 3),
+    (Code::Leavew, 11),
     (Code::Leaved, 2),
     (Code::Retfw_imm16, 7),
     (Code::Retfd_imm16, 2),
@@ -850,6 +851,7 @@ impl ModelIsa {
     const fn set(self) -> &'static DecodeSet {
         match self {
             Self::I8086 => &i8086::SET,
+            Self::NecV20 => &i8086::NEC_SET,
             Self::I80286 => &I286_SET,
             Self::I80386 => &I386_SET,
         }
@@ -870,6 +872,9 @@ impl ModelIsa {
     pub(crate) fn unavailable_prefix(self, code: &[u8]) -> bool {
         if self == Self::I8086 {
             return i8086::known_absent(code);
+        }
+        if self == Self::NecV20 {
+            return i8086::known_absent_nec(code);
         }
         let mut opcode = code
             .iter()
@@ -898,6 +903,9 @@ impl ModelIsa {
     pub(crate) fn decode(self, bytes: &[u8], insn: &Instruction) -> DecodeAction {
         if self == Self::I8086 {
             return i8086::decode(bytes, insn);
+        }
+        if self == Self::NecV20 {
+            return i8086::decode_nec(bytes, insn);
         }
         let mask = self.model_mask();
         let absent = DecodeAction::Absent(self.absent_encoding());

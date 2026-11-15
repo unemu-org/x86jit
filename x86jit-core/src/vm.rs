@@ -17,6 +17,7 @@ use crate::jit_abi::{
 };
 mod i8086;
 mod legacy;
+mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
     lift_block_watched, lift_region, lift_region_watched, CpuMode, FetchAddr, LiftError,
@@ -1763,6 +1764,18 @@ impl ExitRequest {
         // this RMW. Preserve SMC and leave requests after consumption pending.
         self.word.fetch_or(EXIT_REQUESTED, Ordering::Release);
     }
+
+    /// Whether a request is pending, without consuming it. Code that the
+    /// embedder runs between calls, such as an 8080 core during
+    /// [`Exit::I8080Mode`], ORs this into its own stop test. The request stays
+    /// pending, and the next `run` or positive `run_steps` consumes it.
+    ///
+    /// Async-signal-safe for the same reasons as [`Self::request_exit`]: one
+    /// lock-free atomic load of a word the handle already owns. The Acquire load
+    /// makes writes that preceded the request visible.
+    pub fn is_requested(&self) -> bool {
+        self.word.load(Ordering::Acquire) & EXIT_REQUESTED != 0
+    }
 }
 
 #[derive(Default)]
@@ -2731,7 +2744,12 @@ impl Vcpu {
     fn twenty_bit_model(&self) -> bool {
         matches!(
             self.cpu_model,
-            Some(crate::CpuModel::I8088 | crate::CpuModel::I8086)
+            Some(
+                crate::CpuModel::I8088
+                    | crate::CpuModel::I8086
+                    | crate::CpuModel::NecV20
+                    | crate::CpuModel::NecV30
+            )
         )
     }
 

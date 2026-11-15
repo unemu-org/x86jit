@@ -153,7 +153,12 @@ impl InterpExit {
                 value,
             },
             Exit::BudgetExhausted => Self::BudgetExhausted,
-            Exit::Interrupted => Self::Interrupted,
+            // No walk produces the NEC 8080-mode exit; its only producer is
+            // the dispatcher's 8080-mode boundary in vm/nec.rs, which returns
+            // it directly (pinned by `i8080_mode_exit_has_one_producer`).
+            // Sharing an arm keeps this conversion, inlined into every walk,
+            // free of a panic path.
+            Exit::Interrupted | Exit::I8080Mode { .. } => Self::Interrupted,
             Exit::CodeSpaceExhausted { addr } => Self::CodeSpaceExhausted { addr },
         }
     }
@@ -239,6 +244,58 @@ mod tests {
         assert_eq!(owned.fault_metadata().unwrap().saved_rip(), 2);
         assert_eq!(later.fault_metadata().unwrap().saved_rip(), 3);
         assert!(InterpExit::Hlt.into_exit().fault_metadata().is_none());
+    }
+    // The shared arm of from_exit maps Exit::I8080Mode to Interrupted, which is
+    // right only while no walk produces it. Its one producer is the 8080-mode
+    // boundary in vm/nec.rs; a new construction must revisit from_exit first.
+    #[test]
+    fn i8080_mode_exit_has_one_producer() {
+        fn visit(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    // String literals, such as this test's expectations, are skipped.
+                    let needle = concat!("I8080Mode", " {");
+                    for line in std::fs::read_to_string(&path).unwrap().lines() {
+                        let code = line.trim();
+                        if code.starts_with('"') || code.starts_with("(\"") {
+                            continue;
+                        }
+                        if line.contains(needle) {
+                            out.push((name.clone(), line.trim().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        visit(&root, &root, &mut found);
+        found.sort();
+        let expected: Vec<(String, String)> = [
+            (
+                "exit.rs",
+                "I8080Mode { view: I8080View, entry: I8080Entry },",
+            ),
+            (
+                "interp/result.rs",
+                "Exit::Interrupted | Exit::I8080Mode { .. } => Self::Interrupted,",
+            ),
+            ("vm/nec.rs", "Err(Exit::I8080Mode {"),
+        ]
+        .iter()
+        .map(|(f, l)| (f.to_string(), l.to_string()))
+        .collect();
+        assert_eq!(found, expected);
     }
     #[test]
     fn private_carriers_have_no_implicit_drop_work() {

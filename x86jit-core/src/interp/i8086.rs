@@ -209,6 +209,135 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+/// How a NEC V20/V30 control primitive ended its instruction (decision-23 C4a).
+pub(super) enum Nec {
+    /// The remaining operations of the instruction run.
+    Fallthrough,
+    /// IP and CS are final; the walk ends at this instruction.
+    Transfer,
+    /// As `Transfer`, and PSW.MD is now 0: the dispatcher decides the boundary.
+    ModeChange,
+}
+
+fn nec_refusal(cpu: &mut CpuState, ip: u64, operation: crate::UnsupportedSystemOperation) -> Exit {
+    cpu.rip = ip;
+    Exit::UnsupportedSystemContext {
+        addr: ip,
+        operation,
+    }
+}
+
+// NEC UM p. 12-168 RETI and p. 12-151 POP PSW: the flags of the 8086 image
+// (§3 p. 3-3); MD is loaded only while the write-enable latch is set.
+fn nec_load_psw(cpu: &mut CpuState, value: u16) {
+    cpu.flags.set_flags16(value & 0x0fd5);
+    cpu.rflags_system = u64::from(value & 0x100);
+}
+
+#[inline(never)]
+pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
+    op: &L,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    temps: &[u64],
+    ip: u64,
+) -> Result<Nec, Exit> {
+    use crate::legacy::{NEC_EMULATION, NEC_MD_WRITE, NEC_STANDBY};
+    use crate::UnsupportedSystemOperation as U;
+    let latch = cpu.legacy.reserved & NEC_MD_WRITE != 0;
+    match op {
+        L::CheckIndex20 {
+            index,
+            lower,
+            upper,
+            saved_ip,
+            flags_set,
+        } => {
+            let index = temps[*index as usize] as u16;
+            let lower = temps[*lower as usize] as u16;
+            let upper = temps[*upper as usize] as u16;
+            let unsigned = lower > index || upper < index;
+            let signed = (lower as i16) > (index as i16) || (upper as i16) < (index as i16);
+            if unsigned != signed {
+                return Err(nec_refusal(cpu, ip, U::NecIndexComparison));
+            }
+            if unsigned {
+                interrupt::<ROUTED, ORDER>(cpu, mem, 5, *saved_ip, *flags_set)?;
+            } else {
+                cpu.rip = u64::from(*saved_ip);
+            }
+            Ok(Nec::Transfer)
+        }
+        // NEC UM p. 12-169; IE and BRK cleared as interrupt entry does
+        // (p. 6-1; decision-23 rule R2, ASSUMED). With BRK = 1 at its start the
+        // general break rule (p. 6-3) would meet the mode switch, which no page
+        // describes: refused before commit.
+        L::Brkem20 {
+            vector,
+            saved_ip,
+            flags_set,
+        } => {
+            if latch {
+                return Err(nec_refusal(cpu, ip, U::NecNestedEmulation));
+            }
+            if cpu.rflags_system & 0x100 != 0 {
+                return Err(nec_refusal(cpu, ip, U::NecEmulationSingleStep));
+            }
+            interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set)?;
+            cpu.legacy.reserved =
+                (cpu.legacy.reserved | NEC_EMULATION | NEC_MD_WRITE) & !NEC_STANDBY;
+            Ok(Nec::ModeChange)
+        }
+        L::Reti20 {
+            ip: target,
+            cs,
+            flags,
+            sp,
+        } => {
+            let value = temps[*flags as usize] as u16;
+            // A RETI that enters 8080 mode with BRK = 1 at its start: the
+            // break after it is not described for emulation mode. Refused
+            // before commit, as POP PSW below.
+            if latch && value & 0x8000 == 0 && cpu.rflags_system & 0x100 != 0 {
+                return Err(nec_refusal(cpu, ip, U::NecEmulationSingleStep));
+            }
+            nec_load_psw(cpu, value);
+            cpu.write_gpr(RSP, temps[*sp as usize], 2);
+            cpu.cs = temps[*cs as usize] as u16;
+            cpu.rip = temps[*target as usize] & 0xffff;
+            if latch && value & 0x8000 == 0 {
+                cpu.legacy.reserved |= NEC_EMULATION;
+                Ok(Nec::ModeChange)
+            } else {
+                Ok(Nec::Transfer)
+            }
+        }
+        L::PopPsw20 { value } => {
+            let value = temps[*value as usize] as u16;
+            if latch && value & 0x8000 == 0 {
+                return Err(nec_refusal(cpu, ip, U::NecPswModeWrite));
+            }
+            nec_load_psw(cpu, value);
+            Ok(Nec::Fallthrough)
+        }
+        _ => unreachable!("NEC control primitive"),
+    }
+}
+
+/// The three words at SS:SP, each byte wrapping inside the segment
+/// (NEC V20/V30 UM p. 12-177 RETEM; §10 Fig. 10-1).
+pub(crate) fn read_frame<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+) -> Result<[u16; 3], Exit> {
+    let tag = bus_tag(cpu.ss, cpu.gpr[RSP]);
+    let mut words = [0; 3];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = read::<ROUTED, ORDER>(cpu, mem, tag + 2 * i as u64, 2)? as u16;
+    }
+    Ok(words)
+}
+
 // UM §2.6 pp. 2-25–28: fixed IVT, FLAGS/CS/IP frame, clear IF and TF.
 #[inline(never)]
 pub(crate) fn interrupt<const ROUTED: bool, const ORDER: u8>(
@@ -299,6 +428,43 @@ pub(super) fn string_store<M: StrMem>(
     }
     Ok(())
 }
+// NEC V20/V30 OUTM source fault: name the wrapped byte the bus refused.
+pub(super) fn port_string_fault(cpu: &mut CpuState, trap: MemTrap, tag: u64) -> Exit {
+    let marker = cpu.mmio_part(cpu.rip, WRAPPED_FAULT_BYTE).unwrap_or(0);
+    if trap != MemTrap::Mmio && marker & FAULT_OPENED_RETRY != 0 {
+        cpu.clear_mmio_parts();
+    }
+    memory_exit(cpu, trap, physical(tag, marker as u8), false, 0)
+}
+
+/// Complete a NEC V20/V30 INM element with the supplied port value
+/// (NEC UM p. 12-28): DS1:IY, whose bytes wrap inside the segment.
+pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+) -> Result<(), Exit> {
+    let Some(p) = cpu.port_string_in else {
+        return Ok(());
+    };
+    let Some(value) = p.value else {
+        return Err(Exit::port_io(
+            cpu.gpr[RDX] as u16,
+            p.elem,
+            crate::PortDir::In,
+            0,
+        ));
+    };
+    write::<ROUTED, ORDER>(cpu, mem, p.base.wrapping_add(p.offset), p.elem, value)?;
+    cpu.write_gpr(RDI, p.next_index, 2);
+    if p.rep {
+        cpu.write_gpr(RCX, p.next_count, 2);
+    }
+    cpu.rip = p.next_ip & 0xffff;
+    cpu.port_string_in = None;
+    cpu.clear_mmio_parts();
+    Ok(())
+}
+
 // This is current-fault state, not an acknowledged transfer. Replace it when
 // the retry advances to another byte; record_mmio_part deliberately deduplicates.
 // FAULT_OPENED_RETRY marks a retry opened only to carry this marker.

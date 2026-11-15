@@ -1,6 +1,6 @@
 //! Real16 embedder loop benchmarks using only the core API. Release mode;
 //! warmup excluded. Arguments: step-count divisor (default 1), rounds (default 5).
-//! Each round rotates the seven paths; every sample starts from a fresh VM.
+//! Each round rotates the nine paths; every sample starts from a fresh VM.
 //! macOS reports proc_pid_rusage host instructions around each measured region.
 use std::time::Instant;
 use x86jit_core::{
@@ -40,16 +40,20 @@ enum Path {
     Application,
     I8088,
     I8086,
+    NecV20,
+    NecV30,
     I286,
     I386,
     I286A20Off,
     I386A20Off,
 }
 
-const PATHS: [Path; 7] = [
+const PATHS: [Path; 9] = [
     Path::Application,
     Path::I8088,
     Path::I8086,
+    Path::NecV20,
+    Path::NecV30,
     Path::I286,
     Path::I386,
     Path::I286A20Off,
@@ -62,6 +66,8 @@ impl Path {
             Self::Application => "application-real16",
             Self::I8088 => "machine-i8088",
             Self::I8086 => "machine-i8086",
+            Self::NecV20 => "machine-nec-v20",
+            Self::NecV30 => "machine-nec-v30",
             Self::I286 => "legacy-i286",
             Self::I386 => "legacy-i386",
             Self::I286A20Off => "legacy-i286-a20-off",
@@ -78,6 +84,10 @@ fn setup(path: Path, cs: u64, ip: u64, ds: u64) -> (Vm, Vcpu) {
             CpuModel::I8088
         } else if matches!(path, Path::I8086) {
             CpuModel::I8086
+        } else if matches!(path, Path::NecV20) {
+            CpuModel::NecV20
+        } else if matches!(path, Path::NecV30) {
+            CpuModel::NecV30
         } else if matches!(path, Path::I386 | Path::I386A20Off) {
             CpuModel::I80386
         } else {
@@ -258,7 +268,7 @@ fn summary(mut values: Vec<f64>) -> (f64, f64, f64) {
 fn bench(work: &Workload, scale: u64, rounds: usize) {
     let count = (work.count / scale).max(1);
     let warmup = (work.warmup / scale).max(1);
-    let mut samples: [Vec<(f64, f64)>; 7] = std::array::from_fn(|_| Vec::new());
+    let mut samples: [Vec<(f64, f64)>; PATHS.len()] = std::array::from_fn(|_| Vec::new());
     let mut expected: Option<CpuState> = None;
     let mut expected_counts = None;
     for round in 0..rounds {

@@ -9,6 +9,16 @@ pub(super) const SET: DecodeSet = DecodeSet {
     legacy_segments_only: true,
 };
 
+// NEC V20/V30 native mode: the 8086 rows plus the 80186-class rows of NEC UM
+// §12 (bit 3). Like the 8086 it has no invalid-opcode interrupt (§6 p. 6-1
+// assigns vectors 0-5 only), so every unlisted form is a typed refusal.
+pub(super) const NEC_SET: DecodeSet = DecodeSet {
+    models: 4 | 8,
+    options: iced_x86::DecoderOptions::NO_INVALID_CHECK,
+    absent: None,
+    legacy_segments_only: true,
+};
+
 pub(crate) fn prefix(byte: u8) -> bool {
     matches!(byte, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3)
 }
@@ -16,6 +26,15 @@ pub(crate) fn prefix(byte: u8) -> bool {
 // Table 4-13 is the byte-level inventory. Unlike later processors there is
 // no invalid-opcode exception; every unlisted form is a typed refusal.
 pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
+    decode_model::<false>(bytes, insn)
+}
+
+// NEC UM §12 and Appendix A pp. A-1–3 are the V20/V30 inventory.
+pub(super) fn decode_nec(bytes: &[u8], insn: &Instruction) -> DecodeAction {
+    decode_model::<true>(bytes, insn)
+}
+
+fn decode_model<const NEC: bool>(bytes: &[u8], insn: &Instruction) -> DecodeAction {
     let absent = DecodeAction::Absent(None);
     let first = bytes.iter().position(|b| !prefix(*b));
     let Some(first) = first else { return absent };
@@ -28,7 +47,11 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
     if bytes[..first].contains(&0xf0) {
         return absent;
     }
-    if known_absent(bytes) {
+    if if NEC {
+        known_absent_nec(bytes)
+    } else {
+        known_absent(bytes)
+    } {
         return absent;
     }
     // UM §4.2 Table 4-12 p. 4-27 defines the whole ESC encoding space.
@@ -44,7 +67,7 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
             .get(insn.code() as usize)
             .copied()
             .unwrap_or(0)
-            & 4
+            & if NEC { NEC_SET.models } else { SET.models }
             == 0
     {
         return absent;
@@ -73,7 +96,7 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
         0xfe => matches!(extension, Some(0 | 1)),
         0xff => extension.is_some_and(|e| e != 7),
         _ => true,
-    };
+    } && (!NEC || nec_admits(b));
     if !valid
         || (0..insn.op_count()).any(|i| matches!(insn.op_register(i), Register::FS | Register::GS))
     {
@@ -81,6 +104,12 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
     }
     // UM §2.7 pp. 2-42–43 defines REP for MOVS/STOS/LODS and REPE/REPNE
     // for CMPS/SCAS. Other prefix/instruction combinations remain refused.
+    // NEC UM p. 12-15 adds REP (F3h) for OUTM and INM; REPNE stays a
+    // block-comparison prefix only.
+    let port_string = matches!(
+        insn.mnemonic(),
+        Mnemonic::Insb | Mnemonic::Insw | Mnemonic::Outsb | Mnemonic::Outsw
+    );
     if bytes[..first].iter().any(|b| matches!(b, 0xf2 | 0xf3))
         && !matches!(
             insn.mnemonic(),
@@ -95,6 +124,17 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
                 | Mnemonic::Scasb
                 | Mnemonic::Scasw
         )
+        && !(NEC && port_string)
+    {
+        return absent;
+    }
+    // NEC UM p. 12-28: INM's destination is always DS1 and "a segment
+    // override prefix is prohibited"; its effect is not described.
+    if NEC
+        && matches!(insn.mnemonic(), Mnemonic::Insb | Mnemonic::Insw)
+        && bytes[..first]
+            .iter()
+            .any(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e))
     {
         return absent;
     }
@@ -110,6 +150,52 @@ pub(super) fn decode(bytes: &[u8], insn: &Instruction) -> DecodeAction {
         DecodeAction::Alias(alias)
     } else {
         DecodeAction::Defined
+    }
+}
+
+// NEC V20/V30 forms beyond the 8086 table, and the 8086 forms whose result
+// the NEC manual does not state. Called after the shared 8086 checks.
+fn nec_admits(b: &[u8]) -> bool {
+    let modrm = b.get(1).copied();
+    match b[0] {
+        // NEC UM p. 12-147: "(SP - 1, SP - 2) <- reg16, SP <- SP - 2" and
+        // p. 12-150 "reg16 <- (SP + 1, SP), SP <- SP + 2" do not say which
+        // SP value PUSH SP stores or what POP SP leaves: typed refusals.
+        0x54 | 0x5c => false,
+        0x8f => modrm != Some(0xc4),
+        0xff => modrm != Some(0xf4),
+        // NEC UM p. 12-170: CHKIND reg16,mem32 has only a memory operand.
+        0x62 => modrm.is_some_and(|m| m & 0xc0 != 0xc0),
+        // Shift group /6 stays refused (decision-23 compatibility amendment).
+        0xc0 | 0xc1 => modrm.is_some_and(|m| (m >> 3) & 7 != 6),
+        _ => true,
+    }
+}
+
+// NEC V20/V30 byte table: the 8086 rows, the 80186-class forms of NEC UM §12
+// (60h-62h, 68h-6Fh, C0h/C1h, C8h/C9h) and BRKEM 0F FF imm8 (p. 12-169).
+// 63h-67h, D6h, F1h and the rest of the 0Fh map are typed refusals; 64h/65h
+// (REPC/REPNC), 66h/67h (FPO2) and the 0Fh groups are decision-23 C4b.
+pub(super) fn known_absent_nec(bytes: &[u8]) -> bool {
+    let b = &bytes[bytes.iter().take_while(|b| prefix(**b)).count()..];
+    let Some(&opcode) = b.first() else {
+        return false;
+    };
+    if !matches!(opcode, 0x00..=0x53 | 0x55..=0x5b | 0x5d..=0x62 | 0x68..=0xd5 | 0xd7..=0xef | 0xf4..=0xff)
+    {
+        return true;
+    }
+    let Some(&second) = b.get(1) else {
+        return false;
+    };
+    match opcode {
+        0x0f => second != 0xff,
+        0x62 => second & 0xc0 == 0xc0,
+        0xc0 | 0xc1 => (second >> 3) & 7 == 6,
+        0x8f => second == 0xc4 || known_absent(b),
+        0xff => second == 0xf4 || known_absent(b),
+        0x60 | 0x61 | 0x68..=0x6f | 0xc8 | 0xc9 => false,
+        _ => known_absent(b),
     }
 }
 
@@ -165,5 +251,58 @@ mod tests {
             .map(|(code, _)| *code)
             .collect();
         assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    // The same for the NEC V20/V30 rows (bits 2 and 3).
+    #[test]
+    fn every_nec_row_is_admitted_by_some_encoding() {
+        let mut admitted = std::collections::HashSet::new();
+        for opcode in 0..=255u8 {
+            for modrm in 0..=255u8 {
+                for prefix in [None, Some(0xf3)] {
+                    let mut bytes = Vec::from_iter(prefix);
+                    bytes.extend([opcode, modrm, 0, 0, 0, 0]);
+                    let insn = Decoder::new(16, &bytes, NEC_SET.options).decode();
+                    let len = insn.len().max(1);
+                    if !matches!(decode_nec(&bytes[..len], &insn), DecodeAction::Absent(_)) {
+                        admitted.insert(insn.code());
+                    }
+                }
+            }
+        }
+        let refused: Vec<Code> = super::super::ENCODINGS
+            .iter()
+            .filter(|(code, models)| models & NEC_SET.models != 0 && !admitted.contains(code))
+            .map(|(code, _)| *code)
+            .collect();
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    // Every byte the NEC table refuses at the opcode is refused by the
+    // decoder too, and the 8086 policy admits none of the 80186-class rows.
+    #[test]
+    fn nec_and_8086_byte_tables_agree_with_their_decoders() {
+        for opcode in 0..=255u8 {
+            let bytes = [opcode, 0xc0, 0, 0, 0, 0];
+            if known_absent_nec(&bytes[..1]) {
+                let insn = Decoder::new(16, &bytes, NEC_SET.options).decode();
+                let len = insn.len().max(1);
+                assert!(matches!(
+                    decode_nec(&bytes[..len], &insn),
+                    DecodeAction::Absent(_)
+                ));
+            }
+        }
+        for code in super::super::ENCODINGS
+            .iter()
+            .filter(|(_, models)| models & 8 != 0)
+            .map(|(code, _)| *code)
+        {
+            assert_eq!(
+                super::super::MODELS_BY_CODE[code as usize] & SET.models,
+                0,
+                "{code:?}"
+            );
+        }
     }
 }

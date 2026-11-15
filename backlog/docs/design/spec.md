@@ -1936,6 +1936,117 @@ differences. The entries therefore share ISA and quirks and have separate
 catalogue identities; their cycle tables remain absent. The witness binary is
 `legacy_i8086`; hardware-corpus differential testing remains decision-23 C3.
 
+Decision-23 C4a adds `NecV20` and `NecV30` (NEC uPD70108/uPD70116 User's
+Manual, Stock No. 500350, October 1986: "UM"). They run on the twenty-bit
+Direct path of the 8086 entries with their own decode set and quirk values:
+`system = None`, twenty physical address bits, no instruction-length limit,
+`None`/`Present` FPU policies, no timing table. UM §1 p. 1-1 and §3 p. 3-1
+separate the two by external bus width and prefetch queue (4 and 6 bytes); §12
+gives one instruction set and per-processor clocks only, so the entries share
+ISA and quirks and differ in identity.
+
+The decode set is the 8086 set plus the 80186-class forms UM §12 lists for
+native mode: PUSH imm8/imm16 (p. 12-149), PUSH R/POP R (pp. 12-148, 12-152),
+MUL reg16,r/m16,imm8/imm16 (pp. 12-54/55), shift and rotate by imm8
+(pp. 12-104–141), INM/OUTM (pp. 12-28/29), CHKIND (p. 12-170, memory only),
+PREPARE/DISPOSE (pp. 12-152/153) and BRKEM imm8 (0F FF imm8, p. 12-169). The
+compatibility amendment's aliases apply as on the 8088 (82h, F6h/F7h /1,
+83h /1,/4,/6); shift /6, FFh /7, D6h, 63h, F1h and every other unlisted form
+return `UnknownInstruction`, as do the NEC extension groups (0Fh map,
+REPC/REPNC 64h/65h, FPO2 66h/67h) until decision-23 C4b. REP (F3h) also
+repeats INM/OUTM (p. 12-15); a segment prefix on INM, which p. 12-28 prohibits,
+is refused, and so are PUSH SP and POP SP: the operation lists of pp. 12-147 and
+12-150 do not say which SP value is stored or left. PREPARE uses the whole imm8
+as its level; no modulus is stated. CHKIND raises BRK 5 with the next
+instruction's PC (§3 p. 3-1); a bound pair on which a signed and an unsigned
+comparison disagree is refused (`NecIndexComparison`), since the page does not
+say which applies.
+
+Quirk values: the PSW image is MD,1,1,1 above V (§3 p. 3-3) and MD is 1 while
+native code runs, so lifted images store F000h; vectors 0-5 are processor
+assigned (§6 Table 6-1 p. 6-1); DIV/DIVU push the next PC and the signed
+quotient stops at -127/-32767 (pp. 12-56–59). That bound is the pages' prose,
+which also gives it in hexadecimal (81H/8001H). Their operation lines read
+"0-7FH-1"/"0-7FFFH-1" (-128/-32768) with garbled comparison signs, and are
+not taken. Offsets are sixteen-bit values
+on a twenty-bit bus (§10 Fig. 10-1 p. 10-1; §4 p. 4-1) and PC is a sixteen-bit
+counter (§3 p. 3-1); shift counts are used whole (pp. 12-102, 12-104); an
+interrupted block instruction keeps up to three prefixes (§6 p. 6-4,
+`rep_restart_prefixes = Some(3)`); INT is held after MOV r/m16,sreg as after
+MOV/POP sreg, and not after RETI or POP PSW (§6 p. 6-4); EI holds INT
+through the next instruction whatever IE was (§6 p. 6-4; p. 12-172 EI;
+`ei_delay_unconditional`), where the other entries keep the rule of SDM Vol 2B
+§4.3 STI. A single-step trap
+and an acceptable INT at one boundary are refused (`NecStepWithInterrupt`):
+Table 6-1 gives priorities, not the sequence.
+
+**8080 emulation mode (UM §8).** The engine keeps PSW.MD and the hidden MD
+write-enable latch in `CpuState::legacy.reserved` (bit 0 set while MD = 0,
+bit 1 the latch, bit 2 the 8080 standby latch); the C2 entries keep their
+twenty-bit state in the same places, and no layout changes. BRKEM pushes PSW,
+PS, PC, clears IE and BRK (decision-23 rule R2, ASSUMED from p. 6-1), sets
+MD = 0 and the latch, and loads the vector. p. 6-3 gives the general rule
+that the single-step break follows the current instruction, but no page
+describes how it combines with the switch to 8080 mode, so a BRKEM that begins
+with BRK = 1 is refused before it commits (`NecEmulationSingleStep`). RETI and POP PSW load MD
+from the stack only while the latch is set (pp. 12-168, 12-151). A POP PSW that
+would clear MD there is refused (`NecPswModeWrite`). So is a RETI that would
+clear it with BRK = 1 at its start (`NecEmulationSingleStep`), before it
+commits: the break after it is not described for emulation mode. BRKEM with the
+latch set is refused (`NecNestedEmulation`, p. 8-5).
+
+At a boundary with MD = 0 the decision-16 order is unchanged: budget, host
+request, delivery of a queued acceptable IRQ, the readiness stop; then the
+model returns `Exit::I8080Mode { view, entry }` with zero steps and nothing in
+flight. `I8080View` carries A = AL, the 8080 flags (PSW 7:0), BC = CX,
+DE = DX, HL = BX, SP = BP, PC = IP, IE (that the 8080 EI and DI set and
+clear it is ASSUMED, contract draft S4), the EI delay (the STI shadow,
+verbatim), the standby latch and the code (PS) and data (DS0) segments
+(Figs. 8-1/8-2 p. 8-1; Table 12-6 p. 12-3). The embedder runs an 8080 core on
+the view and calls `Vcpu::hand_back_i8080(view, how)`. The hand-back writes
+AL (not AH), BX, CX, DX, BP, IP, the five 8080 flags, IF, the delay and the
+standby latch; it never writes a segment, SP, SI, DI, V, DIR, BRK, MD or the
+latch, adds no step and changes nothing when it returns an error:
+`NotInI8080Mode`, `SegmentChanged`, `HaltedStop`, `RefusedEscape` (`Refused`
+naming EDh) or `InFlight` (an MMIO transfer of a frame access of RETEM, CALLN
+or an interrupt taken in 8080 mode is in flight). `how` is:
+- `EdEscape`: the 8080 core stopped on EDh without consuming it. At the next
+  boundary, after delivery, the engine reads ED again at PS:PC with its own
+  fetch (the second read of that byte) and executes RETEM (ED FD) or CALLN
+  (ED ED imm8) as one step; any other ED form is `UnknownInstruction`. RETEM
+  pops PC, PS and the whole PSW from SS:SP and write-disables MD (p. 12-177,
+  whose "When the BRKEM instruction is executed" is taken as a misprint for
+  RETEM, ASSUMED); a frame with MD = 0 is refused (`NecRetemToEmulation`).
+  CALLN pushes the PSW with MD = 0, PS and the PC after its three bytes
+  (ASSUMED), clears IE and BRK (rule R2), sets MD = 1 and loads the vector
+  (p. 12-176, whose "SP <- PS - 6" is taken as a misprint for SP - 6,
+  ASSUMED). Frames and vectors
+  are read from memory when the unit executes.
+- `Boundary`: the 8080 core stopped at a boundary. A queued IRQ that
+  `irq_ready` accepts is delivered natively: the frame's PSW has MD = 0, entry
+  clears IE and BRK, sets MD = 1 and ends standby (§6 p. 6-1, §8 p. 8-4). A
+  delivery discards a pending `EdEscape`; RETI returns to the ED.
+- `Refused { opcode }`: the 8080 core refused another byte. MD stays 0 and,
+  until the next hand-back (or an interrupt taken there), every call at that
+  PS:PC returns `UnknownInstruction` with the byte.
+A boundary with MD = 0 and BRK = 1 is refused (`NecEmulationSingleStep`). The
+embedder must not inject INT while NMI or HOLD is asserted (§6 p. 6-2); the
+engine has no NMI input. The 8080 core's stop test ORs in
+`ExitRequest::is_requested`, a non-consuming, async-signal-safe load. A host
+request made while the core runs therefore stops it; the request stays pending,
+and the next call reports it as `Interrupted` before any delivery. Writes by the 8080 core use
+`Vm::write_bytes`, which invalidates overlapping translations. A V20/V30 reset
+image writes `legacy.reserved = 0` (MD = 1; §7 p. 7-1). Steps: BRKEM, RETEM,
+CALLN and RETI are one each; the exit, the hand-back and delivery are zero;
+8080 instructions are counted by the embedder's core. No cycle table exists
+yet, and the manual gives no 8080-mode clocks. UM §8 p. 8-1 names the
+uPD8080AF instruction set without listing it; that it behaves as the Intel
+8080A is an ASSUMPTION of the 8080 core (S16 of the contract draft), not of
+this engine. The witness binary is
+`legacy_nec_v20`, which also runs eleven of the sibling 8080-family project's
+fourteen contract vectors on the native side (the three NMI cases need an NMI
+input).
+
 `semantics_id` is a deterministic content digest of encoding membership and canonical alias pairs,
 decoder/absence policy, quirks and system/lift/FPU attributes, plus an explicit
 lifting-policy revision for changes to validation or alias rules. Changes to

@@ -241,6 +241,12 @@ pub(super) struct Execution {
     instruction_retry: Option<InstructionRetry>,
     rep_flags: Option<Box<RepFlags>>,
     rep_restart20: Option<(u16, u16, u16)>,
+    /// NEC V20/V30 8080-mode hand-back state (decision-23 C4a): an ED
+    /// escape at CS:IP, an 8080 refusal at CS:IP with its opcode, and the
+    /// reason MD became 0 in the current call. Valid only while CS:IP match.
+    pub(super) nec_escape: Option<(u16, u16)>,
+    pub(super) nec_refusal: Option<(u16, u16, u8)>,
+    pub(super) nec_entry: Option<crate::I8080Entry>,
     task_switch: crate::interp::legacy::tasks::SwitchState,
     #[cfg(test)]
     lifts: u64,
@@ -273,6 +279,9 @@ impl Execution {
             instruction_retry: None,
             rep_flags: None,
             rep_restart20: None,
+            nec_escape: None,
+            nec_refusal: None,
+            nec_entry: None,
             task_switch: Default::default(),
             #[cfg(test)]
             lifts: 0,
@@ -289,6 +298,9 @@ impl Execution {
         self.event_retry = None;
         self.rep_flags = None;
         self.rep_restart20 = None;
+        self.nec_escape = None;
+        self.nec_refusal = None;
+        self.nec_entry = None;
         self.task_switch.reset();
         self.port_debug = false;
         self.shutdown = false;
@@ -1590,6 +1602,11 @@ impl Vcpu {
                 }
                 if refresh_boundary {
                     boundary = self.machine_boundary::<SINGLE>(options);
+                    // NEC V20/V30 8080 mode decides its boundary after the
+                    // service steps (decision-23 C4a).
+                    if direct20 && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
+                        boundary.service = true;
+                    }
                 }
                 // Only an ordinary completed shared block can retain this proof.
                 // Helpers, faults and event continuations refresh on the next turn.
@@ -1613,10 +1630,18 @@ impl Vcpu {
                 }
                 if boundary.service {
                     if self.cpu.port_string_in.is_some() {
-                        if let Err(exit) = crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
-                            &mut self.cpu,
-                            &vm.mem,
-                        ) {
+                        let finished = if direct20 {
+                            crate::interp::i8086::finish_port_input::<ROUTED, ORDER>(
+                                &mut self.cpu,
+                                &vm.mem,
+                            )
+                        } else {
+                            crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
+                                &mut self.cpu,
+                                &vm.mem,
+                            )
+                        };
+                        if let Err(exit) = finished {
                             return DispatchResult::Stepped(StepRun {
                                 steps,
                                 stop: StepStop::Exit(exit),
@@ -1702,6 +1727,17 @@ impl Vcpu {
                             steps,
                             stop: StepStop::IrqReady,
                         });
+                    }
+                    if direct20 && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
+                        // RETEM or CALLN completed as one unit; otherwise stop.
+                        if let Err(exit) = self.nec_boundary::<ROUTED, ORDER>(vm) {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            });
+                        }
+                        steps += 1;
+                        continue;
                     }
                 }
                 let direct = !task_pending && context.segment_class == crate::SegmentClass::Direct;
@@ -1912,6 +1948,22 @@ impl Vcpu {
                         .unwrap()
                         .direct_proofs
                         .clear();
+                }
+                // NEC V20/V30: BRKEM or RETI made MD 0. Both refuse a start
+                // with BRK = 1 before they commit (interp/i8086.rs), so no
+                // single-step boundary reaches this point.
+                if direct20 && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
+                    debug_assert!(!single_step);
+                    let brkem = ir.ops.iter().rev().find_map(|op| match op {
+                        IrOp::Legacy(crate::legacy::LegacyOp::Brkem20 { vector, .. }) => {
+                            Some(*vector)
+                        }
+                        _ => None,
+                    });
+                    self.legacy_execution.as_mut().unwrap().nec_entry = Some(match brkem {
+                        Some(vector) => crate::I8080Entry::Brkem { vector },
+                        None => crate::I8080Entry::Reti,
+                    });
                 }
                 match outcome {
                     Ok(outcome) => {
@@ -3185,6 +3237,17 @@ impl Vcpu {
             .expect("twenty-bit dispatch requires an 8086-family catalogue model")
             .profile()
             .quirks;
+        if quirks.step_irq_conflict_refused
+            && matches!(event.source, EventSource::SingleStep)
+            && self.pending_irq.is_some()
+            && self.irq_delivery_ready()
+        {
+            self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
+            return Err(Exit::UnsupportedSystemContext {
+                addr: self.cpu.rip,
+                operation: UnsupportedSystemOperation::NecStepWithInterrupt,
+            });
+        }
         let trap = matches!(event.source, EventSource::SingleStep)
             || (quirks.step_interrupt_handler && self.cpu.rflags_system & 0x100 != 0);
         if quirks.step_interrupt_handler
@@ -3200,15 +3263,30 @@ impl Vcpu {
                 EventSource::SingleStep => 1,
                 EventSource::Irq(vector) | EventSource::Exception { vector, .. } => vector,
             };
+            // NEC V20/V30 UM §6 p. 6-1, §8 p. 8-4: an interrupt taken in 8080
+            // mode pushes the PSW with MD = 0, then sets MD = 1; standby ends.
+            let emulation = self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0;
             if let Err(exit) = crate::interp::i8086::interrupt::<ROUTED, ORDER>(
                 &mut self.cpu,
                 &vm.mem,
                 vector,
                 event.ip as u16,
-                quirks.real_flags_set_mask,
+                if emulation {
+                    quirks.real_flags_set_mask & 0x7fff
+                } else {
+                    quirks.real_flags_set_mask
+                },
             ) {
                 self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
                 return Err(exit);
+            }
+            if emulation {
+                self.cpu.legacy.reserved &=
+                    !(crate::legacy::NEC_EMULATION | crate::legacy::NEC_STANDBY);
+                let execution = self.legacy_execution.as_mut().unwrap();
+                execution.nec_escape = None;
+                execution.nec_refusal = None;
+                execution.nec_entry = None;
             }
             let stepped = matches!(event.source, EventSource::SingleStep);
             self.finish_legacy_event(event, None);

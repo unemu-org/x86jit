@@ -2089,7 +2089,10 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
     if info.retired != 0 {
         cpu.rflags_system &= !(1 << 16);
     }
-    if matches!(result, BlockResult::Continue | BlockResult::ModeChange)
+    // A twenty-bit ModeChange is a NEC V20/V30 switch to 8080 mode: the
+    // dispatcher decides the next boundary (decision-23 C4a).
+    if matches!(result, BlockResult::Continue)
+        || (!DIRECT20 && matches!(result, BlockResult::ModeChange))
         || (matches!(
             result,
             BlockResult::Exit(super::result::InterpExit::BudgetExhausted)
@@ -3577,7 +3580,12 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 | L::DivideTrap { .. }
                 | L::Coprocessor20 { .. }
                 | L::WrappedString { .. }
-                | L::Interrupt20 { .. } => {
+                | L::Interrupt20 { .. }
+                | L::CheckIndex20 { .. }
+                | L::Brkem20 { .. }
+                | L::Reti20 { .. }
+                | L::PopPsw20 { .. }
+                | L::InhibitIrq20 => {
                     return Err(refusal(
                         cpu,
                         crate::UnsupportedSystemOperation::LegacyExecution,

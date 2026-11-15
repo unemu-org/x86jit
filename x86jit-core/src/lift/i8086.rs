@@ -78,6 +78,274 @@ fn write_segment(ops: &mut impl LiftBuffer, segment: SegmentId, value: Val, inhi
     }
 }
 
+// A temporary holding `value` (NEC operations name their operands by temporary).
+fn temp(ops: &mut impl LiftBuffer, tg: &mut TempGen, value: Val) -> Temp {
+    match value {
+        Val::Temp(t) => t,
+        value => {
+            let t = tg.fresh();
+            ops.push(IrOp::Or {
+                dst: t,
+                a: value,
+                b: Val::Imm(0),
+                size: 8,
+                set_flags: FlagMask::NONE,
+            });
+            t
+        }
+    }
+}
+// (base + delta) as a sixteen-bit offset.
+fn offset16(ops: &mut impl LiftBuffer, tg: &mut TempGen, base: Val, delta: i64) -> Val {
+    let sum = alu_none(ops, tg, |dst| IrOp::Add {
+        dst,
+        a: base,
+        b: Val::Imm(delta as u64),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    alu_none(ops, tg, |dst| IrOp::And {
+        dst,
+        a: sum,
+        b: Val::Imm(0xffff),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    })
+}
+fn store_word(
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    segment: SegmentId,
+    offset: Val,
+    value: Val,
+) {
+    let addr = tagged_address(ops, tg, segment, offset);
+    ops.push(IrOp::Store {
+        fault: Default::default(),
+        addr,
+        src: value,
+        size: 2,
+        order: MemOrder::None,
+    });
+}
+fn load_word(ops: &mut impl LiftBuffer, tg: &mut TempGen, segment: SegmentId, offset: Val) -> Val {
+    let addr = tagged_address(ops, tg, segment, offset);
+    load(ops, tg, addr, 2)
+}
+fn write16(ops: &mut impl LiftBuffer, reg: Reg, src: Val) {
+    ops.push(IrOp::WriteReg { reg, src, size: 2 });
+}
+
+// NEC V20/V30 forms with their own lowering (decision-23 C4a). Returns false
+// for an instruction the shared 8086 lowering handles. Kept out of line so the
+// shared lowering, which every twenty-bit lift runs, keeps its own size.
+#[inline(never)]
+fn nec_instruction(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+    next: u16,
+    profile: &'static crate::ModelProfile,
+) -> Result<bool, LiftError> {
+    use Mnemonic::*;
+    match insn.mnemonic() {
+        // NEC UM p. 12-148 PUSH R: temp <- SP, then AW CW DW BW temp BP IX IY
+        // at SP-2 ... SP-16, SP <- SP - 16.
+        Pusha => {
+            for (i, reg) in [
+                Reg::Rax,
+                Reg::Rcx,
+                Reg::Rdx,
+                Reg::Rbx,
+                Reg::Rsp,
+                Reg::Rbp,
+                Reg::Rsi,
+                Reg::Rdi,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let value = read_reg(reg, ops, tg);
+                let offset = legacy::stack_offset(ops, tg, -2 * (i as i64 + 1));
+                store_word(ops, tg, SegmentId::Ss, offset, value);
+            }
+            let sp = legacy::stack_offset(ops, tg, -16);
+            legacy::write_sp(ops, sp);
+        }
+        // NEC UM p. 12-152 POP R: IY IX BP from SP..SP+5, BW DW CW AW from
+        // SP+8..SP+15; the word at SP+6 is not read. SP <- SP + 16.
+        Popa => {
+            let mut values = Vec::new();
+            for (delta, reg) in [
+                (0, Reg::Rdi),
+                (2, Reg::Rsi),
+                (4, Reg::Rbp),
+                (8, Reg::Rbx),
+                (10, Reg::Rdx),
+                (12, Reg::Rcx),
+                (14, Reg::Rax),
+            ] {
+                values.push((reg, peek(ops, tg, delta)));
+            }
+            let sp = legacy::stack_offset(ops, tg, 16);
+            for (reg, value) in values {
+                write16(ops, reg, value);
+            }
+            legacy::write_sp(ops, sp);
+        }
+        // NEC UM p. 12-152 PREPARE imm16,imm8. The level is the whole imm8
+        // (no modulus is stated). Stack and frame words use SS (§10 p. 10-2).
+        Enter => {
+            let level = insn.immediate8_2nd();
+            let bp = read_reg(Reg::Rbp, ops, tg);
+            let mut delta = -2i64;
+            let frame = legacy::stack_offset(ops, tg, delta);
+            store_word(ops, tg, SegmentId::Ss, frame, bp);
+            if level > 0 {
+                for i in 1..i64::from(level) {
+                    let source = offset16(ops, tg, bp, -2 * i);
+                    let value = load_word(ops, tg, SegmentId::Ss, source);
+                    delta -= 2;
+                    let offset = legacy::stack_offset(ops, tg, delta);
+                    store_word(ops, tg, SegmentId::Ss, offset, value);
+                }
+                delta -= 2;
+                let offset = legacy::stack_offset(ops, tg, delta);
+                store_word(ops, tg, SegmentId::Ss, offset, frame);
+            }
+            let sp = legacy::stack_offset(ops, tg, delta - i64::from(insn.immediate16()));
+            write16(ops, Reg::Rbp, frame);
+            legacy::write_sp(ops, sp);
+        }
+        // NEC UM p. 12-153 DISPOSE: SP <- BP, BP <- (SP + 1, SP), SP <- SP + 2.
+        Leave => {
+            let bp = read_reg(Reg::Rbp, ops, tg);
+            let offset = offset16(ops, tg, bp, 0);
+            let value = load_word(ops, tg, SegmentId::Ss, offset);
+            let sp = offset16(ops, tg, bp, 2);
+            write16(ops, Reg::Rbp, value);
+            legacy::write_sp(ops, sp);
+        }
+        // NEC UM p. 12-170 CHKIND reg16,mem32: lower bound at mem32, upper at
+        // mem32 + 2; BRK 5 when outside. The pushed PC is the next instruction's
+        // offset (§3 p. 3-1).
+        Bound => {
+            let index = lower_read(insn, 0, ops, tg)?;
+            let index = temp(ops, tg, index);
+            let addr = effective_address(insn, ops, tg)?;
+            let lower = load(ops, tg, addr, 2);
+            let lower = temp(ops, tg, lower);
+            let second = add_addr(addr, Val::Imm(2), ops, tg);
+            let upper = load(ops, tg, second, 2);
+            let upper = temp(ops, tg, upper);
+            ops.push(IrOp::Legacy(L::CheckIndex20 {
+                index,
+                lower,
+                upper,
+                saved_ip: next,
+                flags_set: profile.quirks.real_flags_set_mask,
+            }));
+        }
+        // NEC UM pp. 12-28–29 INM/OUTM: one port transfer per element through
+        // DW; INM stores at DS1:IY, OUTM reads [seg-spec:]IX (default DS0).
+        Insb | Insw | Outsb | Outsw => {
+            let dir_out = matches!(insn.mnemonic(), Outsb | Outsw);
+            let segment = if dir_out {
+                legacy::segment(insn.segment_prefix()).unwrap_or(SegmentId::Ds)
+            } else {
+                SegmentId::Es
+            };
+            let sel = legacy::selector(ops, tg, segment);
+            let base = alu_none(ops, tg, |dst| IrOp::Shl {
+                dst,
+                a: sel,
+                b: Val::Imm(36),
+                size: 8,
+                set_flags: FlagMask::NONE,
+            });
+            ops.push(IrOp::PortString {
+                elem: if matches!(insn.mnemonic(), Insb | Outsb) {
+                    1
+                } else {
+                    2
+                },
+                rep: insn.has_rep_prefix(),
+                addr_bits: 16,
+                base,
+                dir_out,
+                stack: false,
+            });
+        }
+        // NEC UM p. 12-168 RETI; the MD rule is applied when it commits.
+        Iret => {
+            let ip = peek(ops, tg, 0);
+            let cs = peek(ops, tg, 2);
+            let flags = peek(ops, tg, 4);
+            let sp = legacy::stack_offset(ops, tg, 6);
+            let (ip, cs, flags, sp) = (
+                temp(ops, tg, ip),
+                temp(ops, tg, cs),
+                temp(ops, tg, flags),
+                temp(ops, tg, sp),
+            );
+            ops.push(IrOp::Legacy(L::Reti20 { ip, cs, flags, sp }));
+        }
+        // NEC UM p. 12-151 POP PSW.
+        Popf => {
+            let value = peek(ops, tg, 0);
+            let value = temp(ops, tg, value);
+            let sp = legacy::stack_offset(ops, tg, 2);
+            ops.push(IrOp::Legacy(L::PopPsw20 { value }));
+            legacy::write_sp(ops, sp);
+        }
+        // NEC UM §6 p. 6-4 and p. 12-172 EI: INT is held through the next
+        // instruction whatever IE was; IE is set as STI sets IF.
+        Sti if profile.quirks.ei_delay_unconditional => {
+            ops.push(IrOp::SetIf { value: true });
+            ops.push(IrOp::Legacy(L::InhibitIrq20));
+        }
+        // NEC UM §6 p. 6-4: INT and NMI are not acknowledged between MOV
+        // reg16/mem16, sreg and the next instruction.
+        Mov if insn.op1_register().is_segment_register()
+            && profile.quirks.segment_store_inhibits_interrupts =>
+        {
+            legacy::lower(insn, ops, tg)?;
+            ops.push(IrOp::Legacy(L::InhibitIrq20));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// NEC V20/V30 BRKEM imm8 (NEC UM p. 12-169), decoded by the fetch.
+pub(crate) fn brkem(
+    start: u16,
+    length: u32,
+    next: u16,
+    vector: u8,
+    profile: &'static crate::ModelProfile,
+) -> IrBlock {
+    IrBlock {
+        mode: CpuMode::Real16,
+        guest_start: u64::from(start),
+        guest_len: length,
+        icount: 1,
+        temp_count: 0,
+        ops: vec![
+            IrOp::InsnStart {
+                guest_addr: u64::from(start),
+            },
+            IrOp::Legacy(L::Brkem20 {
+                vector,
+                saved_ip: next,
+                flags_set: profile.quirks.real_flags_set_mask,
+            }),
+            IrOp::Legacy(L::SharedWalk),
+        ],
+        legacy_context: Some(CONTEXT),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn instruction(
     insn: &Instruction,
@@ -138,6 +406,9 @@ pub(crate) fn instruction(
             bytes: raw,
             len: evidence.len() as u8,
         }));
+    } else if profile.isa == crate::ModelIsa::NecV20
+        && nec_instruction(insn, &mut ops, tg, next, profile)?
+    {
     } else {
         match insn.mnemonic() {
             Pushf => {
@@ -254,7 +525,7 @@ pub(crate) fn instruction(
                 if let Some(flags) = flags {
                     // 8086 Family UM §2.6 p. 2-24: IRET, like STI,
                     // delays external interrupts through its successor.
-                    pop_flags(&mut ops, flags, true);
+                    pop_flags(&mut ops, flags, profile.quirks.iret_delays_interrupts);
                 }
                 legacy::write_sp(&mut ops, sp);
                 write_segment(&mut ops, SegmentId::Cs, cs, false);
@@ -341,7 +612,7 @@ pub(crate) fn instruction(
                 elem,
                 rep,
                 source,
-                restart_ip: if q.rep_keeps_last_prefix_only {
+                restart_ip: if q.rep_restart_prefixes.is_some() {
                     restart_ip
                 } else {
                     start
@@ -387,7 +658,7 @@ pub(crate) fn instruction(
                 | IrOp::Branch { .. }
                 | IrOp::LoopCx { .. }
                 | IrOp::Hlt
-                | IrOp::Legacy(L::Interrupt20 { .. })
+                | IrOp::Legacy(L::Interrupt20 { .. } | L::CheckIndex20 { .. } | L::Reti20 { .. })
         )
     ) {
         result.push(IrOp::Jump {
