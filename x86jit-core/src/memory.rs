@@ -347,12 +347,13 @@ pub enum RegionKind {
     /// via [`Memory::write_bytes`] (the host loader path, which bypasses region
     /// kind), so a Rom region is populated at map time and immutable thereafter.
     ///
-    /// The write-drop is enforced on the interpreter's scalar/atomic store path.
-    /// Real-mode guests (the BIOS/ROM consumer) run entirely on the interpreter,
-    /// so this fully covers ROM. `Rom` is deliberately **excluded from
-    /// [`Memory::trap_window`]** so its reads/fetches stay inlined; under the
-    /// Long64/Compat32 JIT the inlined store fast path does not consult region
-    /// kind, so ROM's write-drop is an interpreter-path guarantee.
+    /// The write-drop is enforced on the interpreter's scalar/atomic store path,
+    /// including the ROM bytes of a store that also covers an adjacent RAM region
+    /// (whose RAM bytes are written). Real-mode guests (the BIOS/ROM consumer) run
+    /// entirely on the interpreter, so this fully covers ROM. `Rom` is deliberately
+    /// **excluded from [`Memory::trap_window`]** so its reads/fetches stay inlined;
+    /// under the Long64/Compat32 JIT the inlined store fast path does not consult
+    /// region kind, so ROM's write-drop is an interpreter-path guarantee.
     Rom,
 }
 
@@ -2473,7 +2474,11 @@ impl Memory {
         addr: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        match self.region_at(addr, size)?.kind {
+        let region = match self.region_at(addr, size) {
+            Ok(region) => region,
+            Err(miss) => return self.probe_write_across(addr, size, miss, ROUTED),
+        };
+        match region.kind {
             RegionKind::Trap => Err(MemTrap::Mmio),
             RegionKind::Rom => Ok(()),
             RegionKind::Ram if !ROUTED => Ok(()),
@@ -2489,6 +2494,325 @@ impl Memory {
                 .map_err(|at| self.host_fault(at))
             }
         }
+    }
+
+    /// Kinds of the adjacent regions covering `[addr, addr + len)` when no single
+    /// region contains it: `Some(true)` when some byte is ROM, `Some(false)` when
+    /// every byte is RAM, and `None` when a byte is unmapped (a gap) or lies in a
+    /// Trap region. Only `None` keeps the containment miss (§4.2).
+    ///
+    /// SDM Vol 1 §4.1.1: an unaligned operand can need more than one bus cycle, so
+    /// one guest operand can cover bytes of two regions. Every region tags a slice of
+    /// the one contiguous backing (`Flat` and `Reserved` alike; `map` never gives a
+    /// region host storage of its own), so such a span is still one contiguous host
+    /// range at `host_base + (addr - guest_base)`.
+    #[cold]
+    #[inline(never)]
+    fn adjacent_span(&self, addr: u64, len: usize) -> Option<bool> {
+        if len == 0 {
+            return None;
+        }
+        let end = addr.checked_add(len as u64)?;
+        let mut at = addr;
+        let mut rom = false;
+        while at < end {
+            let region = self
+                .regions
+                .iter()
+                .find(|r| r.start <= at && at - r.start < r.size as u64)?;
+            match region.kind {
+                RegionKind::Trap => return None,
+                RegionKind::Rom => rom = true,
+                RegionKind::Ram => {}
+            }
+            at = end.min(region.start + region.size as u64);
+        }
+        Some(rom)
+    }
+
+    /// Visit the per-region pieces of a span [`Self::adjacent_span`] accepted, in
+    /// ascending address order. The order is an engine rule, not a hardware claim:
+    /// the SDM does not order the bus cycles of one unaligned operand.
+    fn span_pieces<E>(
+        &self,
+        addr: u64,
+        len: usize,
+        mut visit: impl FnMut(u64, usize, RegionKind) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let end = addr + len as u64;
+        let mut at = addr;
+        while at < end {
+            let region = self
+                .regions
+                .iter()
+                .find(|r| r.start <= at && at - r.start < r.size as u64)
+                .expect("adjacent_span accepted every byte");
+            let next = end.min(region.start + region.size as u64);
+            visit(at, (next - at) as usize, region.kind)?;
+            at = next;
+        }
+        Ok(())
+    }
+
+    /// Host-probe every RAM piece of an accepted span for write access, in ascending
+    /// order, before any byte is stored: a protected byte faults first and nothing
+    /// commits. ROM pieces are not probed; their stores are dropped, as in a
+    /// contained ROM store, which never touches the host bytes either.
+    fn probe_ram_pieces(&self, addr: u64, len: usize) -> Result<(), usize> {
+        self.span_pieces(addr, len, |at, n, kind| {
+            if kind != RegionKind::Ram {
+                return Ok(());
+            }
+            // SAFETY: adjacent_span validated the piece inside the backing.
+            unsafe {
+                crate::usercopy::probe(self.host_base().cast_mut().add(self.host_off(at)), n, true)
+            }
+        })
+    }
+
+    // The containment misses of the transfer paths. Each is out of line and
+    // non-generic (the recovery mode is a run-time flag; stores report SMC/watch
+    // notes through a callback), so a transfer path gains one cold call and its
+    // callers gain no instances. Any span `adjacent_span` rejects returns the
+    // containment miss unchanged.
+
+    /// Containment miss of [`Self::read_mode`]. A span over adjacent RAM/ROM
+    /// regions is one contiguous host range and ROM reads exactly like RAM, so it is
+    /// read with the same single whole-width host load as a contained access.
+    /// SDM Vol 3A §11.1.1: that keeps an aligned word/doubleword/quadword atomic, as
+    /// on hardware and in compiled code (one host `mov` over the same bytes). A
+    /// misaligned span takes the byte copy a contained misaligned access takes;
+    /// Vol 3A §11.1.1 does not make accesses split across cache lines or pages
+    /// atomic, and a region boundary may fall anywhere.
+    #[cold]
+    #[inline(never)]
+    fn read_across(
+        &self,
+        addr: u64,
+        size: u8,
+        miss: MemTrap,
+        routed: bool,
+    ) -> Result<u64, MemTrap> {
+        if self.adjacent_span(addr, usize::from(size)).is_none() {
+            return Err(miss);
+        }
+        // SAFETY: adjacent_span validated the whole span inside the backing.
+        let ptr = unsafe { (*self.backing.get()).as_ptr().add(self.host_off(addr)) };
+        if routed {
+            unsafe { crate::usercopy::load(ptr, size) }.map_err(|at| self.host_fault(at))
+        } else {
+            Ok(unsafe { atomic_load_le(ptr, size) })
+        }
+    }
+
+    /// Containment miss of [`Self::probe_write_mode`]: each RAM piece is probed as a
+    /// contained RAM probe is; ROM pieces report what a contained ROM probe does.
+    #[cold]
+    #[inline(never)]
+    fn probe_write_across(
+        &self,
+        addr: u64,
+        size: u8,
+        miss: MemTrap,
+        routed: bool,
+    ) -> Result<(), MemTrap> {
+        if self.adjacent_span(addr, usize::from(size)).is_none() {
+            return Err(miss);
+        }
+        if !routed {
+            return Ok(());
+        }
+        self.probe_ram_pieces(addr, usize::from(size))
+            .map_err(|at| self.host_fault(at))
+    }
+
+    /// Names the observer for [`Self::write_across`].
+    #[cold]
+    #[inline(never)]
+    fn write_across_observed<const ROUTED: bool, const PREFLIGHTED: bool>(
+        &self,
+        addr: u64,
+        val: u64,
+        size: u8,
+        observer: &impl InterpreterMemory,
+        miss: MemTrap,
+    ) -> Result<(), MemTrap> {
+        let mut note = |at, len| self.note_write_observed(at, len, observer);
+        self.write_across(addr, val, size, miss, (ROUTED, PREFLIGHTED), &mut note)
+    }
+
+    /// Containment miss of [`Self::write_mode_observed`]. An all-RAM span over
+    /// adjacent regions takes the same single whole-width host store as a contained
+    /// access: SDM Vol 3A §11.1.1 keeps an aligned store atomic, and a misaligned
+    /// one takes the contained path's byte copy. With ROM bytes in the span, those
+    /// bytes are dropped as in a contained ROM store and each RAM piece is stored
+    /// separately (SDM Vol 1 §4.1.1: separate bus cycles) in ascending address order
+    /// (an engine rule); with host-fault recovery every RAM piece is probed first,
+    /// so a protected byte faults before any byte is written.
+    #[cold]
+    #[inline(never)]
+    fn write_across(
+        &self,
+        addr: u64,
+        val: u64,
+        size: u8,
+        miss: MemTrap,
+        (routed, preflighted): (bool, bool),
+        note: &mut dyn FnMut(u64, usize),
+    ) -> Result<(), MemTrap> {
+        let Some(rom) = self.adjacent_span(addr, usize::from(size)) else {
+            return Err(miss);
+        };
+        if rom && routed {
+            self.probe_ram_pieces(addr, usize::from(size))
+                .map_err(|at| self.host_fault(at))?;
+        }
+        let mut store = |at: u64, val: u64, size: u8, preflighted: bool| {
+            // SAFETY: adjacent_span validated the piece inside the backing; with
+            // recovery, `preflighted` is set only after its host probe.
+            let ptr = unsafe { ((*self.backing.get()).as_ptr() as *mut u8).add(self.host_off(at)) };
+            if routed {
+                unsafe {
+                    if preflighted {
+                        crate::usercopy::store_preflighted(ptr, val, size)
+                    } else {
+                        crate::usercopy::store(ptr, val, size)
+                    }
+                }
+                .map_err(|fault| {
+                    if fault.committed != 0 {
+                        note(at, fault.committed);
+                    }
+                    self.host_fault(fault.at)
+                })?;
+            } else {
+                unsafe { atomic_store_le(ptr, val, size) };
+            }
+            note(at, usize::from(size));
+            Ok(())
+        };
+        if !rom {
+            return store(addr, val, size, preflighted);
+        }
+        self.span_pieces(addr, usize::from(size), |at, n, kind| {
+            if kind != RegionKind::Ram {
+                return Ok(());
+            }
+            store(at, val >> ((at - addr) * 8), n as u8, true)
+        })
+    }
+
+    /// Containment miss of [`Self::read_ram_checked_mode`]: a span over adjacent
+    /// RAM/ROM regions is one host range and is copied as a contained span is.
+    #[cold]
+    #[inline(never)]
+    fn read_ram_across(&self, addr: u64, buf: &mut [u8], routed: bool) -> Result<(), u64> {
+        if self.adjacent_span(addr, buf.len()).is_none() {
+            return Err(crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            ));
+        }
+        // SAFETY: adjacent_span validated the whole span; the local output is live.
+        unsafe {
+            let ptr = self.host_base().add(self.host_off(addr));
+            if routed {
+                crate::usercopy::copy_in(ptr, buf)
+            } else {
+                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len());
+                Ok(())
+            }
+        }
+        .map_err(|at| {
+            let addr = self.guest_base + (at - self.host_base() as usize) as u64;
+            record_host_fault(addr);
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
+        })
+    }
+
+    /// Names the observer for [`Self::write_ram_across`].
+    #[cold]
+    #[inline(never)]
+    fn write_ram_across_observed<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        observer: &impl InterpreterMemory,
+    ) -> Result<(), u64> {
+        let mut note = |at, len| self.note_write_observed(at, len, observer);
+        self.write_ram_across(addr, bytes, ROUTED, &mut note)
+    }
+
+    /// Containment miss of [`Self::write_ram_checked_mode_observed`]. An all-RAM
+    /// span is copied as one contained span is. A span with ROM bytes drops them, as
+    /// a contained ROM store does, and copies the RAM pieces only after every RAM
+    /// piece passed its host probe, so a protected byte faults with nothing written.
+    #[cold]
+    #[inline(never)]
+    fn write_ram_across(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        routed: bool,
+        note: &mut dyn FnMut(u64, usize),
+    ) -> Result<(), u64> {
+        let Some(rom) = self.adjacent_span(addr, bytes.len()) else {
+            return Err(crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            ));
+        };
+        let fault = |at: usize| {
+            let at = self.guest_base + (at - self.host_base() as usize) as u64;
+            record_host_fault(at);
+            crate::fault::record_fp_fault(
+                at,
+                bytes.len(),
+                crate::FaultOrigin::HostAccess,
+                crate::AddressPrecision::ExactByte,
+            )
+        };
+        if rom && routed {
+            self.probe_ram_pieces(addr, bytes.len()).map_err(fault)?;
+        }
+        let mut copy = |at: u64, src: &[u8]| {
+            // SAFETY: adjacent_span validated the piece; the local source is live.
+            let result = unsafe {
+                let ptr = self.host_base().cast_mut().add(self.host_off(at));
+                if routed {
+                    crate::usercopy::copy_out(ptr, src)
+                } else {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
+                    Ok(())
+                }
+            };
+            let committed = result
+                .as_ref()
+                .map_or_else(|fault| fault.committed, |()| src.len());
+            if committed != 0 {
+                note(at, committed);
+            }
+            result.map_err(|f| fault(f.at))
+        };
+        if !rom {
+            return copy(addr, bytes);
+        }
+        self.span_pieces(addr, bytes.len(), |at, n, kind| {
+            if kind != RegionKind::Ram {
+                return Ok(());
+            }
+            let offset = (at - addr) as usize;
+            copy(at, &bytes[offset..offset + n])
+        })
     }
 
     /// Cold evidence about one byte, independent of permissions and host VM state.
@@ -2515,7 +2839,10 @@ impl Memory {
 
     /// The region containing `[addr, addr + size)`, or `Unmapped` if the range
     /// escapes every mapped region; a non-canonical miss is `NonCanonical`.
-    /// Shared by scalar read/write.
+    /// Shared by scalar read/write. Containment only: the data transfer paths hand
+    /// a miss out of line to the `*_across` functions, which perform a span covered
+    /// by adjacent RAM/ROM regions (see [`Self::adjacent_span`]); atomic operands
+    /// keep the miss.
     fn region_at(&self, addr: u64, size: u8) -> Result<&Region, MemTrap> {
         let end = addr
             .checked_add(size as u64)
@@ -2608,14 +2935,9 @@ impl Memory {
         addr: u64,
         buf: &mut [u8],
     ) -> Result<(), u64> {
-        let region = self.region_for(addr, buf.len()).ok_or_else(|| {
-            crate::fault::record_fp_fault(
-                addr,
-                buf.len(),
-                crate::FaultOrigin::GuestMap,
-                crate::AddressPrecision::TransferAddress,
-            )
-        })?;
+        let Some(region) = self.region_for(addr, buf.len()) else {
+            return self.read_ram_across(addr, buf, ROUTED);
+        };
         if matches!(region.kind, RegionKind::Trap) {
             return Err(crate::fault::record_fp_fault(
                 addr,
@@ -2670,14 +2992,9 @@ impl Memory {
         bytes: &[u8],
         observer: &impl InterpreterMemory,
     ) -> Result<(), u64> {
-        let region = self.region_for(addr, bytes.len()).ok_or_else(|| {
-            crate::fault::record_fp_fault(
-                addr,
-                bytes.len(),
-                crate::FaultOrigin::GuestMap,
-                crate::AddressPrecision::TransferAddress,
-            )
-        })?;
+        let Some(region) = self.region_for(addr, bytes.len()) else {
+            return self.write_ram_across_observed::<ROUTED>(addr, bytes, observer);
+        };
         if matches!(region.kind, RegionKind::Trap) {
             return Err(crate::fault::record_fp_fault(
                 addr,
@@ -2734,7 +3051,10 @@ impl Memory {
         addr: u64,
         size: u8,
     ) -> Result<u64, MemTrap> {
-        let region = self.region_at(addr, size)?;
+        let region = match self.region_at(addr, size) {
+            Ok(region) => region,
+            Err(miss) => return self.read_across(addr, size, miss, ROUTED),
+        };
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
         }
@@ -2857,18 +3177,28 @@ impl Memory {
         val: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED, false>(addr, val, size, self)
+        self.write_mode_observed::<ROUTED, false, true>(addr, val, size, self)
     }
 
+    /// `ACROSS` selects what a containment miss does: hand the span to
+    /// [`Self::write_across_observed`], or return the miss to a caller that first
+    /// checks the other transfers of its operand (see `write_preflighted_contained`).
     #[inline(always)]
-    fn write_mode_observed<const ROUTED: bool, const PREFLIGHTED: bool>(
+    fn write_mode_observed<const ROUTED: bool, const PREFLIGHTED: bool, const ACROSS: bool>(
         &self,
         addr: u64,
         val: u64,
         size: u8,
         observer: &impl InterpreterMemory,
     ) -> Result<(), MemTrap> {
-        let region = self.region_at(addr, size)?;
+        let region = match self.region_at(addr, size) {
+            Ok(region) => region,
+            Err(miss) if !ACROSS => return Err(miss),
+            Err(miss) => {
+                return self
+                    .write_across_observed::<ROUTED, PREFLIGHTED>(addr, val, size, observer, miss)
+            }
+        };
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
         }
@@ -4055,6 +4385,79 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_ram_regions_join_for_data_transfers() {
+        let mut m = flat(0x1000);
+        m.map(0x100, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x110, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        for size in [2u8, 4, 8] {
+            for at in 0x111 - u64::from(size)..0x110 {
+                m.write(at, 0x8877_6655_4433_2211, size).unwrap();
+                assert_eq!(
+                    m.read(at, size),
+                    Ok(0x8877_6655_4433_2211 & mask_bits(size))
+                );
+                assert_eq!(m.probe_write(at, size), Ok(()));
+            }
+        }
+        m.write_ram_checked(0x10b, &[7; 10]).unwrap();
+        let mut buf = [0; 10];
+        m.read_ram_checked(0x10b, &mut buf).unwrap();
+        assert_eq!(buf, [7; 10]);
+    }
+
+    #[test]
+    fn adjacent_rom_bytes_read_like_ram_and_drop_stores() {
+        let mut m = flat(0x1000);
+        m.map(0x100, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x110, 0x10, Prot::RX, RegionKind::Rom).unwrap();
+        m.map(0x120, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.write_bytes(0x110, &[0xaa; 0x10]).unwrap();
+        m.write(0x10e, 0x4433_2211, 4).unwrap();
+        assert_eq!(m.read(0x10e, 4), Ok(0xaaaa_2211));
+        m.write(0x11e, 0x4433_2211, 4).unwrap();
+        assert_eq!(m.read(0x11e, 4), Ok(0x4433_aaaa));
+        m.write_ram_checked(0x10c, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        let mut buf = [0; 8];
+        m.read_ram_checked(0x10c, &mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4, 0xaa, 0xaa, 0xaa, 0xaa]);
+        // RAM, a whole ROM region, then RAM: only the RAM pieces change.
+        let mut wide = [0x5a; 0x14];
+        m.write_ram_checked(0x10e, &wide).unwrap();
+        m.read_ram_checked(0x10e, &mut wide).unwrap();
+        let mut expected = [0xaa; 0x14];
+        expected[..2].fill(0x5a);
+        expected[0x12..].fill(0x5a);
+        assert_eq!(wide, expected);
+    }
+
+    #[test]
+    fn gap_trap_and_atomic_spans_keep_the_containment_miss() {
+        let mut m = flat(0x1000);
+        m.map(0x100, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x111, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x130, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x140, 0x10, Prot::RW, RegionKind::Trap).unwrap();
+        m.map(0x200, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        m.map(0x210, 0x10, Prot::RW, RegionKind::Ram).unwrap();
+        // 0x10e covers the gap byte 0x110; 0x13e covers the Trap byte 0x140.
+        for at in [0x10e, 0x13e] {
+            assert_eq!(m.read(at, 4), Err(MemTrap::Unmapped));
+            assert_eq!(m.write(at, u64::MAX, 4), Err(MemTrap::Unmapped));
+            assert_eq!(m.probe_write(at, 4), Err(MemTrap::Unmapped));
+            assert!(m.read_ram_checked(at, &mut [0; 4]).is_err());
+            assert!(m.write_ram_checked(at, &[0xff; 4]).is_err());
+            assert_eq!(m.read(at, 2), Ok(0), "nothing written at {at:#x}");
+        }
+        assert_eq!(
+            m.atomic_rmw(0x20e, 9, 4, RmwOp::Add),
+            Err(MemTrap::Unmapped)
+        );
+        assert_eq!(m.atomic_cas(0x20e, 0, 9, 4), Err(MemTrap::Unmapped));
+        assert_eq!(m.read(0x20e, 4), Ok(0));
+    }
+
+    #[test]
     fn trap_region_routes_to_mmio() {
         let mut m = flat(0x1000);
         m.map(0x200, 0x10, Prot::RW, RegionKind::Trap).unwrap();
@@ -4651,6 +5054,18 @@ pub(crate) trait InterpreterMemory {
     ) -> Result<(), MemTrap> {
         self.write::<ROUTED>(addr, value, size)
     }
+    /// [`Self::write_preflighted`] for the first transfer of a multi-transfer store:
+    /// a span that no single region contains returns the containment miss instead
+    /// of being stored across adjacent regions, so the caller can check the
+    /// operand's other transfers before any byte is written.
+    fn write_preflighted_contained<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.write_preflighted::<ROUTED>(addr, value, size)
+    }
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap>;
     #[inline(always)]
     fn preflight_store<const ROUTED: bool>(
@@ -4782,7 +5197,7 @@ impl InterpreterMemory for RunningMemory<'_> {
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
         self.memory
-            .write_mode_observed::<ROUTED, false>(addr, value, size, self)
+            .write_mode_observed::<ROUTED, false, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn write_preflighted<const ROUTED: bool>(
@@ -4792,7 +5207,17 @@ impl InterpreterMemory for RunningMemory<'_> {
         size: u8,
     ) -> Result<(), MemTrap> {
         self.memory
-            .write_mode_observed::<ROUTED, true>(addr, value, size, self)
+            .write_mode_observed::<ROUTED, true, true>(addr, value, size, self)
+    }
+    #[inline(always)]
+    fn write_preflighted_contained<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.memory
+            .write_mode_observed::<ROUTED, true, false>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
@@ -4820,7 +5245,16 @@ impl InterpreterMemory for Memory {
         value: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED, true>(addr, value, size, self)
+        self.write_mode_observed::<ROUTED, true, true>(addr, value, size, self)
+    }
+    #[inline(always)]
+    fn write_preflighted_contained<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.write_mode_observed::<ROUTED, true, false>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
@@ -4889,6 +5323,24 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, O
             false,
         );
         let result = self.0.write_preflighted::<ROUTED>(addr, value, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
+        result
+    }
+    #[inline(always)]
+    pub fn write_preflighted_contained(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Write),
+            false,
+        );
+        let result = self
+            .0
+            .write_preflighted_contained::<ROUTED>(addr, value, size);
         #[cfg(test)]
         crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
         result

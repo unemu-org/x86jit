@@ -313,6 +313,36 @@ impl ChildView<'_> {
             .iter()
             .find(|r| r.start <= addr && end <= r.end)
     }
+    /// Kind of a non-atomic data span: the region containing it or, as the
+    /// parent's `Memory::adjacent_span` accepts one, the kind shared by the
+    /// adjacent regions covering it (all RAM or all ROM). Both kinds share one
+    /// backing, so the span is one host range. A gap, a Trap byte and a span that
+    /// mixes RAM and ROM are `None`: the child keeps the containment fault there.
+    fn data_kind(&self, addr: u64, size: u8) -> Option<RegionKind> {
+        match self.region(addr, size) {
+            Some(r) => Some(r.kind),
+            None => self.kind_across(addr, size),
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn kind_across(&self, addr: u64, size: u8) -> Option<RegionKind> {
+        let end = addr.checked_add(u64::from(size))?;
+        if size == 0 || addr < self.guest_base || end > self.top {
+            return None;
+        }
+        let mut at = addr;
+        let mut kind = None;
+        while at < end {
+            let r = self.regions.iter().find(|r| r.start <= at && at < r.end)?;
+            if r.kind == RegionKind::Trap || kind.is_some_and(|k| k != r.kind) {
+                return None;
+            }
+            kind = Some(r.kind);
+            at = end.min(r.end);
+        }
+        kind
+    }
     fn code_page(&self, page: u64) -> bool {
         let relative = page.wrapping_sub(self.guest_base >> CODE_PAGE_BITS);
         self.code
@@ -635,7 +665,16 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         }
         s.outcome = Some(ChildStep::Fault(f));
     }
-    fn check(&self, addr: u64, size: u8, direction: FaultAccess) -> Option<RegionKind> {
+    /// `across` admits a data span over adjacent regions ([`ChildView::data_kind`]);
+    /// an atomic operand passes `false` and keeps the containment fault, as in the
+    /// parent.
+    fn check(
+        &self,
+        addr: u64,
+        size: u8,
+        direction: FaultAccess,
+        across: bool,
+    ) -> Option<RegionKind> {
         if self.stopped() {
             return None;
         }
@@ -662,6 +701,11 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
             }
             Some(r) => Some(r.kind),
             None => {
+                if across {
+                    if let Some(kind) = self.view.kind_across(addr, size) {
+                        return Some(kind);
+                    }
+                }
                 let at = (0..size)
                     .map(|i| addr.wrapping_add(u64::from(i)))
                     .find(|&a| self.view.region(a, 1).is_none())
@@ -694,7 +738,7 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         true
     }
     fn load(&self, addr: u64, size: u8) -> u64 {
-        if self.check(addr, size, FaultAccess::Read).is_none() {
+        if self.check(addr, size, FaultAccess::Read, true).is_none() {
             return 0;
         }
         // SAFETY: the snapshot's lifetime keeps this validated backing live.
@@ -719,7 +763,7 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         }
     }
     fn compare_exchange(&self, addr: u64, expected: u128, src: u128, size: u8) -> Option<u128> {
-        let kind = self.check(addr, size, FaultAccess::Write)?;
+        let kind = self.check(addr, size, FaultAccess::Write, false)?;
         if kind != RegionKind::Ram {
             self.refuse(ChildRefusal::Mmio);
             return None;
@@ -839,7 +883,7 @@ impl<const ORDER: u8> ChildMemory<'_, '_, ORDER> {
         }
     }
     fn store(&self, addr: u64, value: u64, size: u8) {
-        let Some(kind) = self.check(addr, size, FaultAccess::Write) else {
+        let Some(kind) = self.check(addr, size, FaultAccess::Write, true) else {
             return;
         };
         if kind == RegionKind::Rom {
@@ -913,7 +957,7 @@ impl<const ORDER: u8> InterpreterMemory for ChildMemory<'_, '_, ORDER> {
         Ok(())
     }
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
-        self.check(addr, size, FaultAccess::Write);
+        self.check(addr, size, FaultAccess::Write, true);
         Ok(())
     }
     fn stopped(&self) -> bool {
@@ -1122,10 +1166,7 @@ impl<const ORDER: u8> InterpreterMemory for ChildMemory<'_, '_, ORDER> {
                     self.refuse(ChildRefusal::Mmio);
                     return;
                 }
-                if self
-                    .view
-                    .region(dst, elem)
-                    .is_some_and(|r| r.kind == RegionKind::Ram)
+                if self.view.data_kind(dst, elem) == Some(RegionKind::Ram)
                     && !self.reserve_write(dst, elem)
                 {
                     return;

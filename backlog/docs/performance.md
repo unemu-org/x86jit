@@ -1597,3 +1597,103 @@ pairs per width, +0.5% limit.
 
 No commits, git writes, bead operations or pushes were performed, and
 backlog/decisions/ was not edited.
+
+## Accesses across adjacent regions (xj-ir6.12) — known regression
+
+**Accepted by the maintainer for landing (2026-11-14):** a Real16 embedder needs the
+split now. The +0.5 % gate is not met and is not relaxed; bead xj-ir6.31 carries the
+miss (decision-23 amendment).
+
+### Change — READ
+
+A data access that misses region containment but whose bytes all lie in adjacent
+RAM/ROM-kind regions is performed instead of ending with `UnmappedMemory` (spec.md,
+"Data accesses across adjacent regions"). Each containment miss in `memory.rs`
+(scalar read, write and write probe; wide checked read and write) tail-calls an
+out-of-line, non-generic function behind a small observer wrapper. Gaps, Trap bytes
+and LOCK operands keep the previous exit.
+
+### Measurement method — MEASURED
+
+Base: d4a58e2a. Candidate: that commit with the change in `memory.rs` only (sha256
+`468add41c8add4c2257d231290f4351097b387c689298d9e3932f637ee66b256`). Both built
+with the release profile as committed (no codegen-units or other profile change),
+`CARGO_BUILD_JOBS=4`, same toolchain, same host (Apple M5 Pro, macOS, aarch64).
+`real16_loops 1 3 <workload>` for every workload and all five paths: host
+instructions per guest step, the median of three serial rounds. Store probe: a copy
+of `interpreter_store_probe` that reads `proc_pid_rusage` instructions around the
+measured run, 200000 iterations × 16 stores, three processes per side. The base
+campaign ran before the candidate's, not interleaved.
+
+### Host instructions per guest step — MEASURED
+
+| Workload | Alias | I286 A20 on | I386 A20 on | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 357.833→358.383 (+0.154%) | 363.076→367.424 (+1.198%) | 363.111→367.513 (+1.212%) | 363.150→367.375 (+1.163%) | 363.149→367.479 (+1.192%) |
+| `load` | 468.714→473.600 (+1.042%) | 478.395→487.333 (+1.868%) | 478.365→487.170 (+1.841%) | 478.387→487.348 (+1.873%) | 478.700→487.361 (+1.809%) |
+| `load-odd` | 480.001→481.555 (+0.324%) | 489.448→498.382 (+1.825%) | 489.670→498.250 (+1.752%) | 489.717→498.488 (+1.791%) | 489.810→498.233 (+1.720%) |
+| `store` | 432.143→435.737 (+0.832%) | 445.641→452.191 (+1.470%) | 445.543→452.060 (+1.463%) | 445.671→452.120 (+1.447%) | 445.581→452.058 (+1.454%) |
+| `push-pop` | 493.061→499.067 (+1.218%) | 491.355→503.298 (+2.431%) | 491.171→503.028 (+2.414%) | 491.150→502.512 (+2.313%) | 491.270→503.255 (+2.440%) |
+| `data-next-to-code` | 1000.171→1005.836 (+0.566%) | 1013.906→1023.929 (+0.989%) | 1013.963→1023.543 (+0.945%) | 1014.051→1023.439 (+0.926%) | 1015.877→1023.211 (+0.722%) |
+| `data-next-to-dense-code` | 999.951→1004.710 (+0.476%) | 1013.872→1022.888 (+0.889%) | 1013.976→1022.218 (+0.813%) | 1013.762→1022.268 (+0.839%) | 1013.787→1023.036 (+0.912%) |
+| `call-ret` | 839.155→844.163 (+0.597%) | 908.716→919.793 (+1.219%) | 909.691→919.744 (+1.105%) | 909.449→919.736 (+1.131%) | 910.260→919.615 (+1.028%) |
+| `dos-mixed` | 456.115→458.504 (+0.524%) | 444.282→451.994 (+1.736%) | 444.159→451.710 (+1.700%) | 444.241→451.880 (+1.720%) | 444.408→452.035 (+1.716%) |
+| `rep-movsw` | 188.732→187.400 (-0.706%) | 188.751→187.424 (-0.703%) | 188.708→187.376 (-0.706%) | 188.703→187.432 (-0.674%) | 188.688→187.263 (-0.755%) |
+| `straight-line` | 411.573→412.965 (+0.338%) | 383.043→391.951 (+2.326%) | 384.933→392.199 (+1.888%) | 383.478→392.432 (+2.335%) | 382.971→392.262 (+2.426%) |
+| `ip-boundary-1` | 2423.438→2456.543 (+1.366%) | 2612.944→2644.021 (+1.189%) | 2613.354→2643.023 (+1.135%) | 2614.755→2643.290 (+1.091%) | 2613.010→2643.103 (+1.152%) |
+| `ip-boundary-64` | 344.803→345.543 (+0.215%) | 375.896→376.986 (+0.290%) | 375.942→377.020 (+0.287%) | 376.446→376.941 (+0.131%) | 376.140→377.369 (+0.327%) |
+| `smc-next-1` | 11110.829→11162.306 (+0.463%) | 5503.891→5529.177 (+0.459%) | 5387.467→5420.248 (+0.608%) | 5507.207→5531.458 (+0.440%) | 5387.692→5415.966 (+0.525%) |
+| `smc-next-64` | 9166.423→9167.587 (+0.013%) | 3700.957→3690.713 (-0.277%) | 3587.413→3573.769 (-0.380%) | 3705.735→3690.978 (-0.398%) | 3586.612→3575.088 (-0.321%) |
+| `smc-rmw-64` | 9269.139→9239.486 (-0.320%) | 4928.805→4913.877 (-0.303%) | 4793.165→4779.194 (-0.291%) | 4931.757→4917.118 (-0.297%) | 4795.063→4779.375 (-0.327%) |
+
+Worst cell +2.440 % (`push-pop`, `legacy-i386-a20-off`); 53 of 80 cells exceed +0.5 %.
+
+### Store probe, host instructions per store — MEASURED
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 297.994, 297.935, 298.039 (**297.994**) | 307.988, 307.891, 308.318 (**307.988**) | +3.354% |
+| 8 | single | on | 344.433, 344.549, 344.631 (**344.549**) | 336.430, 336.314, 336.273 (**336.314**) | -2.390% |
+| 8 | crossing | off | 334.053, 334.332, 333.900 (**334.053**) | 343.901, 343.921, 343.859 (**343.901**) | +2.948% |
+| 8 | crossing | on | 417.687, 417.663, 417.621 (**417.663**) | 409.411, 409.815, 409.430 (**409.430**) | -1.971% |
+| 32 | single | off | 593.643, 593.711, 593.806 (**593.711**) | 625.560, 625.436, 625.604 (**625.560**) | +5.364% |
+| 32 | single | on | 679.248, 679.316, 679.565 (**679.316**) | 694.069, 693.958, 693.890 (**693.958**) | +2.155% |
+| 32 | crossing | off | 594.100, 593.799, 593.875 (**593.875**) | 626.103, 626.598, 625.797 (**626.103**) | +5.427% |
+| 32 | crossing | on | 585.916, 586.411, 586.539 (**586.411**) | 613.010, 613.403, 613.259 (**613.259**) | +4.578% |
+
+### Attribution and follow-up — MEASURED / ASSUMED
+
+MEASURED: workloads with no guest data access regress too (`alu` +1.2 % on the
+Machine paths). Between base and candidate, 2088 single-home items change codegen
+unit (`-Zprint-mono-items`, diagnostic build only), and functions in untouched
+modules change size: for example `TranslationCache::get_for_dispatch` grows from
+824 to 1556 bytes because `DispatchMap::get_accounted` is now inlined into it.
+MEASURED with x86jit-core at one codegen unit on both sides (diagnostic only),
+`real16_loops` stays within +0.37 %, but the store probe still costs +1.05 % at
+width 8 and +8.25 % at width 32. A successful split rejoins the hot code after its
+cold call. `vstore::<false, 0, Memory>` grows from 3148 to 3844 bytes and saves 8
+callee-saved registers instead of 2.
+
+Follow-up direction (xj-ir6.31): take the split off the hot path. The transfer
+functions stay exactly as at d4a58e2a, with no rejoin into `vstore` or the scalar
+paths. The split runs one level up, where the miss already becomes an exit, by
+re-executing the instruction through a cold path whose memory provider performs
+the access. MEASURED, partial and not a gate result: a first A/B of that design
+(`alu`, `load` and `store` only, interleaved with the base) stayed within +0.33 %
+on all five paths. The store probe and the other workloads were not measured.
+
+### Review fixes on top of the measured candidate — MEASURED
+
+The tree that lands also carries three review fixes outside `memory.rs`: the first
+8-byte transfer of a 16-byte `vstore` is stored only when one region contains it,
+and a containment miss checks both transfers before either is written; a LOCK
+operand split by the A20 gate keeps the containment miss for each bus piece; an
+automatic child view joins adjacent regions of one kind for data accesses. Quick
+interleaved A/B against the measured candidate binaries above (same method):
+`real16_loops` `alu`, `load`, `store`, `push-pop` and `ip-boundary-1` on all five
+paths change by −0.09 % to +0.23 %. The store probe at width 32 and at width 8
+without recovery changes by less than ±0.1 %. At width 8 with recovery the single
+case is +0.74 % and the crossing case −3.04 %. The cause is an inlining change in
+`usercopy.rs`, which the fixes do not touch. `usercopy::copy_out` now has 26 call
+sites instead of 49 and is inlined into `usercopy::store`. The crossing path saves
+a call, and every recovery-mode scalar store saves one more register pair.

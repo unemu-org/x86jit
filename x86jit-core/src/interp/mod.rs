@@ -8478,6 +8478,20 @@ impl<M: StrMem> StrMem for Preflighted<'_, M> {
     }
 }
 
+/// [`Preflighted`] whose store returns a containment miss instead of performing it
+/// across adjacent regions (`write_preflighted_contained`): the first transfer of a
+/// store whose later transfers are not yet checked.
+struct Contained<'a, M>(&'a M);
+impl<const ROUTED: bool, M: InterpreterMemory> StrMem for Contained<'_, Access<ROUTED, 0, M>> {
+    fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
+        self.0.sload(addr, elem)
+    }
+    #[inline(always)]
+    fn sstore(&self, addr: u64, val: u64, elem: u8) -> Result<(), MemTrap> {
+        self.0.write_preflighted_contained(addr, val, elem)
+    }
+}
+
 /// The store counterpart of [`vpart`]. An acknowledgement is recorded the same way, with
 /// a zero value — only its presence matters, and sharing one table means a 16-byte store
 /// converges for the same reason a load does.
@@ -8635,7 +8649,65 @@ fn vstore<const ROUTED: bool, const ORDER: u8>(
             });
         }
     }
+    if size == 16 {
+        // The first transfer is stored only when one region contains it; a miss
+        // checks both transfers before either is written (vstore_across).
+        match vpart_store(cpu, &Contained(mem), cur_addr, addr, v as u64, 8) {
+            Ok(()) => {}
+            Err(miss) if miss.trap == MemTrap::Unmapped => {
+                return vstore_across(cpu, mem, cur_addr, addr, v, miss)
+            }
+            Err(fault) => return Err(fault),
+        }
+        let mem = &Preflighted(mem);
+        return vpart_store(cpu, mem, cur_addr, addr + 8, (v >> 64) as u64, 8);
+    }
     vstore_parts(cpu, mem, cur_addr, addr, v, size)
+}
+
+/// Containment miss of the first transfer of a 16-byte [`vstore`]. Its bytes may
+/// lie in adjacent RAM/ROM regions (`Memory::adjacent_span`), but then the second
+/// transfer is checked as well before either is written, with or without host-fault
+/// recovery, so a gap or a non-canonical byte in it faults with nothing written
+/// (SDM Vol 3A §7.5: the destination is checked before any RAM store, as for the
+/// other vector stores). The first transfer's own miss is returned unchanged. A
+/// Trap transfer passes the check and keeps its MMIO exit.
+#[cold]
+#[inline(never)]
+fn vstore_across<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
+    cur_addr: u64,
+    addr: u64,
+    v: u128,
+    miss: VecFault,
+) -> Result<(), VecFault> {
+    for at in [addr, addr + 8] {
+        if let Err(trap @ (MemTrap::Unmapped | MemTrap::NonCanonical | MemTrap::HostFault)) =
+            mem.probe_write_mode::<false>(at, 8)
+        {
+            if at == addr {
+                return Err(miss);
+            }
+            let at = if trap == MemTrap::Unmapped {
+                (0..8)
+                    .map(|i| at.wrapping_add(i))
+                    .find(|&b| {
+                        matches!(mem.probe_write_mode::<false>(b, 1), Err(MemTrap::Unmapped))
+                    })
+                    .unwrap_or(at)
+            } else {
+                trap.fault_addr(at)
+            };
+            return Err(VecFault {
+                at,
+                size: 8,
+                trap,
+                value: 0,
+            });
+        }
+    }
+    vstore_parts(cpu, mem, cur_addr, addr, v, 16)
 }
 
 #[cold]

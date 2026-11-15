@@ -701,6 +701,54 @@ fn probe_physical<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+/// [`probe`] for a LOCK or implicitly locked operand that the A20 gate splits into
+/// two bus pieces. Each piece must lie in one region, as an undivided locked operand
+/// must (`Memory::atomic_rmw` keeps the containment miss): a piece over adjacent
+/// regions reports the miss and its exit, as [`probe_physical`] did before data
+/// transfers were performed across adjacent regions. A contained piece is probed
+/// as [`probe_physical`] probes it.
+#[cold]
+fn probe_locked<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+) -> Result<(), Exit> {
+    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let checked = mem
+        .raw()
+        .region_kind(physical, part)
+        .and_then(|_| mem.raw().probe_write(physical, part));
+    match checked {
+        Ok(()) | Err(MemTrap::Mmio) => {}
+        Err(trap) => {
+            return Err(
+                match trap_out(
+                    cpu,
+                    cpu.rip,
+                    trap,
+                    store_fault_address(mem, trap, physical, part),
+                    part,
+                    AccessKind::Write,
+                    0,
+                )
+                .into_step()
+                {
+                    StepResult::Exit(exit) => {
+                        crate::fault::qualify_legacy_bus(exit, addr, physical)
+                    }
+                    _ => unreachable!(),
+                },
+            )
+        }
+    }
+    if part < size {
+        let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
+        probe_locked(cpu, mem, next, size - part)?;
+    }
+    Ok(())
+}
+
 #[cold]
 fn store_fault_address<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -2450,7 +2498,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 }
                 // As with the memory layer's unaligned RMW fallback, this
                 // discontinuous bus operand has no single host atomic address.
-                probe(cpu, mem, linear, *size)?;
+                probe_locked(cpu, mem, linear, *size)?;
                 let value = read(cpu, mem, linear, *size)?;
                 let src = read_val(*src, temps);
                 let updated = match op {

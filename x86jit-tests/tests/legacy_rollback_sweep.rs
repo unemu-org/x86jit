@@ -8,14 +8,16 @@ use x86jit_core::{
     VmConfig,
 };
 
+// Memory kind 1 maps RAM at 0x4000 next to the RAM at 0x5000, so an operand at
+// 0x4fff covers two adjacent RAM regions and completes instead of faulting.
 #[test]
 fn checked_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(false), (19_194, 7_785));
+    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_293));
 }
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 7_658));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_306));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {

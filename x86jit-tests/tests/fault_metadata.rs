@@ -963,10 +963,12 @@ fn real16_failed_delivery_reports_the_delivery_access() {
 }
 #[test]
 fn containment_miss_does_not_prove_a_missing_byte() {
+    // Every byte is mapped, but the operand covers RAM and a Trap region, which
+    // stays a containment miss (an all-RAM or RAM/ROM span is performed instead).
     let (mut vm, mut cpu, _) = setup(0, &[0x48, 0x8b, 0x03]);
     vm.unmap(0, HOLE as usize).unwrap();
     vm.map(0, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.map(0x5000, 0x2000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.map(0x5000, 0x2000, Prot::RW, RegionKind::Trap).unwrap();
     cpu.set_reg(Reg::Rbx, 0x4ffc);
     let exit = cpu.run(&vm, Some(20));
     let m = exit.fault_metadata().unwrap();

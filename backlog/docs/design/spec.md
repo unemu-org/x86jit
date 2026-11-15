@@ -414,6 +414,28 @@ These rules apply to block, region and single-instruction execution: an unliftab
 instruction ends the valid prefix, which executes before dispatch retries that
 instruction; any partial IR emitted for the unliftable instruction is discarded.
 
+**Data accesses across adjacent regions.** A data operand need not lie in one
+region: an unaligned operand can take more than one bus cycle (SDM Vol 1 §4.1.1).
+When every byte lies in adjacent RAM or ROM regions with no gap, the access is
+performed: a load returns the bytes, a store commits the RAM bytes and drops the
+ROM bytes exactly as a store inside a ROM region does. Every region tags the one
+contiguous backing, so an all-RAM span takes the same single host operation as a
+contained access, which keeps an aligned word, doubleword or quadword atomic
+(SDM Vol 3A §11.1.1). A span with ROM bytes stores its RAM pieces one region at a
+time in ascending address order (an engine rule, not a hardware claim); with host
+fault recovery every RAM piece is probed before any byte commits. The rule holds
+per transfer: a transfer touching a gap or a Trap byte keeps the containment miss
+and its exit; splitting device accesses is xj-ir6.30. A 16-byte vector store is two
+8-byte transfers; when the first is not inside one region, both are checked before
+either is written, with or without recovery, so a gap in the second faults there
+with nothing written. A LOCK or implicitly locked operand keeps the containment
+miss, including each bus piece of one that the A20 gate splits. An automatic child
+view joins adjacent regions of one kind for non-atomic data accesses; a span that
+mixes RAM and ROM keeps the containment fault in the child. Inline compiled
+accesses bound only against the backing and never consult the region map, so they
+perform such spans natively, and the `RegionKind::Rom` store limit applies to them
+as it does to a contained ROM store.
+
 > **Why MmioRead/MmioWrite are separated:** on an MMIO read, data flows FROM the user TO the guest (the guest wrote the address into the destination register and is waiting for a value); on a write — from the guest to the user. A single `value` field does not model both directions. A read additionally requires a mechanism for injecting the result:
 
 ```rust

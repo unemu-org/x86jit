@@ -798,6 +798,14 @@ the round before it measured +1.86 %. Every other gate is met. Bead xj-s3p.11
 carries the miss, with the U5 gate as its acceptance; the gate itself is
 unchanged.
 
+**Amendment (xj-ir6.12 landing, 2026-11-14, accepted by the maintainer).** The split
+of an access across adjacent RAM and ROM-kind regions lands with a measured
+slowdown, not a defect. Against d4a58e2a, the worst real16_loops cell is +2.44 %
+(53 of 80 cells exceed +0.5 %). The store probe is +3.35 % at width 8 and +5.43 %
+at width 32. The maintainer accepted it because a Real16 embedder needs the split
+now. Bead xj-ir6.31 carries the miss, with this requirement's +0.5 % gate as its
+acceptance; the gate itself is unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
