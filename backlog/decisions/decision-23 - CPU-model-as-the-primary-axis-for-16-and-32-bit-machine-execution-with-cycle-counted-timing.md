@@ -806,6 +806,19 @@ at width 32. The maintainer accepted it because a Real16 embedder needs the spli
 now. Bead xj-ir6.31 carries the miss, with this requirement's +0.5 % gate as its
 acceptance; the gate itself is unchanged.
 
+**Amendment (C4a landing, 2026-11-15, accepted by the maintainer).** C4a, the NEC V20/V30
+models and the 8080-mode exit contract, lands with a measured slowdown, not a defect. Against
+060d446a, 106 of 112 real16_loops cells are within +0.5 %. The six misses are on SMC workloads:
+- smc-next-1, I8088/I8086: +1.35 % and +1.33 %;
+- smc-next-64, alias/I8088/I8086: +0.50 %, +0.81 % and +0.79 %;
+- smc-rmw-64, alias: +0.55 %.
+
+The store probe is within +0.02 %. The measured mechanism is a change in rustc's codegen-unit
+partition, triggered by the new public `Exit::I8080Mode` variant; the paths with misses run no
+NEC code. The maintainer accepted the slowdown because the sibling 8080 project needs the
+contract for feature completeness. Bead xj-50w.17 carries the miss, with this requirement's
++0.5 % gate as its acceptance; the gate itself is unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
