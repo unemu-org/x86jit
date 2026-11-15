@@ -1132,7 +1132,10 @@ fn finish_instruction_fault<const STEPPED: bool>(
                 op @ (crate::legacy::LegacyOp::WrappedString { .. }
                 | crate::legacy::LegacyOp::WrappedLoad { .. }
                 | crate::legacy::LegacyOp::WrappedStore { .. }
-                | crate::legacy::LegacyOp::Coprocessor20 { .. }),
+                | crate::legacy::LegacyOp::Coprocessor20 { .. }
+                | crate::legacy::LegacyOp::BitField20 { .. }
+                | crate::legacy::LegacyOp::BcdString20 { .. }
+                | crate::legacy::LegacyOp::Fpo2Escape20 { .. }),
             ) => Some(op),
             _ => None,
         }) {
@@ -1479,7 +1482,10 @@ fn walk_ops<
                 op @ (L::CheckIndex20 { .. }
                 | L::Brkem20 { .. }
                 | L::Reti20 { .. }
-                | L::PopPsw20 { .. })
+                | L::PopPsw20 { .. }
+                | L::BitField20 { .. }
+                | L::BcdString20 { .. }
+                | L::Fpo2Escape20 { .. })
                     if MACHINE && DIRECT20 =>
                 {
                     match i8086::nec::<ROUTED, ORDER>(
@@ -1506,6 +1512,7 @@ fn walk_ops<
                     elem,
                     rep,
                     source,
+                    carry,
                     ..
                 } if MACHINE && DIRECT20 && STEPPED && !CHILD => {
                     let (access, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
@@ -1515,6 +1522,7 @@ fn walk_ops<
                         *kind,
                         *elem,
                         *rep,
+                        *carry,
                         *source,
                         cur_addr.get(),
                         exit_request,
@@ -10111,6 +10119,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
             op,
             elem,
             rep,
+            false,
             cur_addr,
             addr_bits,
             src_base,
@@ -10126,6 +10135,7 @@ pub(crate) fn string_run_mode<const CHILD: bool, M: StrMem>(
         op,
         elem,
         rep,
+        false,
         cur_addr,
         addr_bits,
         src_base,
@@ -10161,6 +10171,7 @@ fn string_run_bounded<const ROUTED: bool, const STOP_WHEN_IRQ_READY: bool, M: In
         op,
         elem,
         rep,
+        false,
         cur_addr,
         addr_bits,
         src_base,
@@ -10315,6 +10326,7 @@ fn string_run_bounded_direct_inner<
             op,
             elem,
             rep,
+            false,
             cur_addr,
             addr_bits,
             src_base,
@@ -10330,6 +10342,7 @@ fn string_run_bounded_direct_inner<
             op,
             elem,
             rep,
+            false,
             cur_addr,
             addr_bits,
             src_base,
@@ -10557,6 +10570,9 @@ fn string_run_specialized<
     op: StrOp,
     elem: u8,
     rep: RepKind,
+    // NEC V20/V30 REPC/REPNC (NEC UM p. 12-14): `Repe`/`Repne` test CY.
+    // Only the twenty-bit (WRAPPED) path passes `true`.
+    carry: bool,
     cur_addr: u64,
     addr_bits: u8,
     src_base: u64,
@@ -10755,13 +10771,21 @@ fn string_run_specialized<
             RepKind::Rep => cpu.gpr[RCX] = dec(cpu.gpr[RCX]),
             RepKind::Repe => {
                 cpu.gpr[RCX] = dec(cpu.gpr[RCX]);
-                if !cpu.flags.zf {
+                if !(if WRAPPED && carry {
+                    cpu.flags.cf
+                } else {
+                    cpu.flags.zf
+                }) {
                     break;
                 }
             }
             RepKind::Repne => {
                 cpu.gpr[RCX] = dec(cpu.gpr[RCX]);
-                if cpu.flags.zf {
+                if if WRAPPED && carry {
+                    cpu.flags.cf
+                } else {
+                    cpu.flags.zf
+                } {
                     break;
                 }
             }

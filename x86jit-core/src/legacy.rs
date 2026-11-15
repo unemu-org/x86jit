@@ -686,6 +686,17 @@ mod tests {
     }
 }
 
+/// NEC V20/V30 BCD string operation (NEC UM pp. 12-42–44).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BcdStringOp {
+    /// ADD4S: (IY) <- (IY) + (IX).
+    Add,
+    /// SUB4S: (IY) <- (IY) - (IX).
+    Sub,
+    /// CMP4S: (IY) - (IX), flags only.
+    Cmp,
+}
+
 /// Interpreter-only operations (decision-18 §§1, 3–4). Widths are bytes;
 /// address widths are bits. The Real16 compatibility alias shares the width-aware forms.
 #[derive(Clone, Debug)]
@@ -886,12 +897,38 @@ pub enum LegacyOp {
         saved_ip: u16,
     },
     /// String bytes wrap inside their segments and on a twenty-bit bus.
+    /// `carry` is NEC V20/V30 REPC/REPNC: `Repe`/`Repne` test CY in place
+    /// of Z (NEC UM p. 12-14).
     WrappedString {
         kind: crate::ir::StrOp,
         elem: u8,
         rep: crate::ir::RepKind,
         source: SegmentId,
         restart_ip: u16,
+        carry: bool,
+    },
+    /// NEC V20/V30 INS (`insert`) and EXT (NEC UM pp. 12-21–24). `offset`
+    /// is a Table 12-6 reg8 code; `length` is a reg8 code when
+    /// `length_register`, else the immediate (the field length minus one).
+    BitField20 {
+        insert: bool,
+        offset: u8,
+        length: u8,
+        length_register: bool,
+    },
+    /// NEC V20/V30 ADD4S, SUB4S and CMP4S (NEC UM pp. 12-42–44); `source`
+    /// is the segment of the IX string.
+    BcdString20 {
+        op: BcdStringOp,
+        source: SegmentId,
+    },
+    /// NEC V20/V30 FPO2 (NEC UM pp. 12-174–175): the CPU's part, with the
+    /// instruction bytes for a typed refusal.
+    Fpo2Escape20 {
+        addr: crate::ir::Val,
+        memory: bool,
+        bytes: [u8; 15],
+        len: u8,
     },
     /// NEC V20/V30 CHKIND: BRK 5 when the index lies outside the bounds
     /// (NEC UM p. 12-170). The page does not say whether the comparison is

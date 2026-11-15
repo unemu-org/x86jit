@@ -317,8 +317,291 @@ fn nec_instruction(
     Ok(true)
 }
 
+/// NEC V20/V30 forms the twenty-bit fetch decodes itself, because the iced
+/// tables describe other instructions at these bytes (decision-23 C4a, C4b).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NecForm {
+    /// BRKEM imm8, 0F FF imm8 (NEC UM p. 12-169).
+    Brkem(u8),
+    /// TEST1, CLR1, SET1, NOT1 (0F 10h–1Fh, pp. 12-81–98) and ROL4, ROR4
+    /// (0F 28h/2Ah, pp. 12-45–46): the second opcode byte and the immediate
+    /// byte. The r/m operand is the surrogate: MOV r/m,reg of its width.
+    Operand { opcode: u8, imm: u8 },
+    /// INS (0F 31h/39h) and EXT (0F 33h/3Bh), pp. 12-21–24.
+    BitField {
+        insert: bool,
+        offset: u8,
+        length: u8,
+        length_register: bool,
+    },
+    /// ADD4S, SUB4S, CMP4S (0F 20h/22h/26h), pp. 12-42–44.
+    BcdString {
+        op: crate::legacy::BcdStringOp,
+        source: SegmentId,
+    },
+    /// FPO2 (66h/67h), pp. 12-174–175. A memory form's surrogate is
+    /// MOV reg,r/m with its address.
+    Fpo2 { memory: bool },
+}
+
+impl NecForm {
+    /// Whether the block ends after this instruction: it switches mode or
+    /// writes memory outside the walk's lifted stores.
+    pub(crate) fn terminates(&self) -> bool {
+        matches!(
+            self,
+            Self::Brkem(_)
+                | Self::BitField { insert: true, .. }
+                | Self::BcdString {
+                    op: crate::legacy::BcdStringOp::Add | crate::legacy::BcdStringOp::Sub,
+                    ..
+                }
+        )
+    }
+}
+
+/// Lower a [`NecForm`] with its operand `surrogate`. Kept out of line, like
+/// `nec_instruction`, so the shared 8086 lowering keeps its size (decision-23
+/// C4b).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nec_form(
+    form: &NecForm,
+    surrogate: &Instruction,
+    evidence: &[u8],
+    start: u16,
+    length: u32,
+    next: u16,
+    profile: &'static crate::ModelProfile,
+    tg: &mut TempGen,
+) -> Result<IrBlock, LiftError> {
+    if let NecForm::Brkem(vector) = *form {
+        return Ok(brkem(start, length, next, vector, profile));
+    }
+    let mut values = vec![IrOp::InsnStart {
+        guest_addr: u64::from(start),
+    }];
+    let mut ops = legacy::ContextOps {
+        ops: &mut values,
+        context: CONTEXT,
+        profile: Some(profile),
+    };
+    match *form {
+        NecForm::Brkem(_) => unreachable!("lowered above"),
+        NecForm::Operand { opcode, imm } => nec_operand(opcode, surrogate, imm, &mut ops, tg)?,
+        NecForm::BitField {
+            insert,
+            offset,
+            length,
+            length_register,
+        } => ops.push(IrOp::Legacy(L::BitField20 {
+            insert,
+            offset,
+            length,
+            length_register,
+        })),
+        NecForm::BcdString { op, source } => ops.push(IrOp::Legacy(L::BcdString20 { op, source })),
+        NecForm::Fpo2 { memory } => {
+            // The ESC address policy (UM p. 12-175: "calculation of effective
+            // address ... and start of memory read cycles").
+            let addr = if memory {
+                effective_address(surrogate, &mut ops, tg)?
+            } else {
+                Val::Imm(0)
+            };
+            let mut bytes = [0; 15];
+            bytes[..evidence.len()].copy_from_slice(evidence);
+            ops.push(IrOp::Legacy(L::Fpo2Escape20 {
+                addr,
+                memory,
+                bytes,
+                len: evidence.len() as u8,
+            }));
+        }
+    }
+    // Every byte of a lifted transfer wraps in its segment (UM §10 p. 10-1).
+    let mut result = Vec::with_capacity(values.len() + 2);
+    for op in values {
+        match op {
+            IrOp::Load {
+                dst, addr, size, ..
+            } => result.push(IrOp::Legacy(L::WrappedLoad { dst, addr, size })),
+            IrOp::Store {
+                addr, src, size, ..
+            } => result.push(IrOp::Legacy(L::WrappedStore {
+                addr,
+                value: src,
+                size,
+            })),
+            IrOp::SegLimitCheck { .. } => {}
+            op => result.push(op),
+        }
+    }
+    result.push(IrOp::Jump {
+        target: Val::Imm(u64::from(next)),
+    });
+    result.push(IrOp::Legacy(L::SharedWalk));
+    Ok(IrBlock {
+        mode: CpuMode::Real16,
+        guest_start: u64::from(start),
+        guest_len: length,
+        icount: 1,
+        temp_count: tg.count(),
+        ops: result,
+        legacy_context: Some(CONTEXT),
+    })
+}
+
+// TEST1/CLR1/SET1/NOT1 and ROL4/ROR4 on an r/m operand, as ordinary lifted
+// operations: the operand transfers are the shared wrapped ones.
+fn nec_operand(
+    opcode: u8,
+    operand: &Instruction,
+    imm: u8,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+) -> Result<(), LiftError> {
+    let size = if matches!(opcode, 0x10..=0x1f) && opcode & 1 != 0 {
+        2
+    } else {
+        1
+    };
+    let (value, target) = if operand.op0_kind() == OpKind::Memory {
+        let addr = effective_address(operand, ops, tg)?;
+        (load(ops, tg, addr, size), WriteTarget::Mem { addr, size })
+    } else {
+        (
+            lower_read(operand, 0, ops, tg)?,
+            lower_write_target(operand, 0, ops, tg)?,
+        )
+    };
+    fn and(ops: &mut impl LiftBuffer, tg: &mut TempGen, a: Val, b: Val) -> Val {
+        alu_none(ops, tg, |dst| IrOp::And {
+            dst,
+            a,
+            b,
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    }
+    fn or(ops: &mut impl LiftBuffer, tg: &mut TempGen, a: Val, b: Val) -> Val {
+        alu_none(ops, tg, |dst| IrOp::Or {
+            dst,
+            a,
+            b,
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    }
+    fn shift(ops: &mut impl LiftBuffer, tg: &mut TempGen, a: Val, count: u64, left: bool) -> Val {
+        let b = Val::Imm(count);
+        let set_flags = FlagMask::NONE;
+        alu_none(ops, tg, |dst| {
+            if left {
+                IrOp::Shl {
+                    dst,
+                    a,
+                    b,
+                    size: 8,
+                    set_flags,
+                }
+            } else {
+                IrOp::Shr {
+                    dst,
+                    a,
+                    b,
+                    size: 8,
+                    set_flags,
+                }
+            }
+        })
+    }
+    if matches!(opcode, 0x28 | 0x2a) {
+        // UM pp. 12-45–46: the byte is two digits, rotated one digit through
+        // AL bits 3:0. AL bits 7:4 are "not assured", which the engine treats
+        // like a U flag: it keeps them, as C2 keeps undefined flags.
+        let byte = and(ops, tg, value, Val::Imm(0xff));
+        let al = read_reg(Reg::Rax, ops, tg);
+        let al_low = and(ops, tg, al, Val::Imm(0x0f));
+        let al_high = and(ops, tg, al, Val::Imm(0xf0));
+        let (stored, digit) = if opcode == 0x28 {
+            // ROL4: byte <- byte 3:0, AL 3:0; AL 3:0 <- byte 7:4.
+            let up = shift(ops, tg, byte, 4, true);
+            let up = and(ops, tg, up, Val::Imm(0xf0));
+            (or(ops, tg, up, al_low), shift(ops, tg, byte, 4, false))
+        } else {
+            // ROR4: byte <- AL 3:0, byte 7:4; AL 3:0 <- byte 3:0.
+            let up = shift(ops, tg, al_low, 4, true);
+            let down = shift(ops, tg, byte, 4, false);
+            (or(ops, tg, up, down), and(ops, tg, byte, Val::Imm(0x0f)))
+        };
+        let al = or(ops, tg, al_high, digit);
+        emit_write(ops, tg, target, stored);
+        ops.push(IrOp::WriteReg {
+            reg: Reg::Rax,
+            src: al,
+            size: 1,
+        });
+        return Ok(());
+    }
+    // UM pp. 12-81–98: the bit number is CL or the immediate, of which only
+    // bits 2:0 (byte) or 3:0 (word) are used.
+    let bits = u64::from(size) * 8 - 1;
+    let mask = if opcode < 0x18 {
+        let cl = read_reg(Reg::Rcx, ops, tg);
+        let bit = and(ops, tg, cl, Val::Imm(bits));
+        alu_none(ops, tg, |dst| IrOp::Shl {
+            dst,
+            a: Val::Imm(1),
+            b: bit,
+            size: 8,
+            set_flags: FlagMask::NONE,
+        })
+    } else {
+        Val::Imm(1 << (u64::from(imm) & bits))
+    };
+    match (opcode >> 1) & 3 {
+        // TEST1: Z <- 1 when the bit is 0; V and CY cleared (pp. 12-81–85).
+        // S, AC and P are undefined there: the engine keeps them.
+        0 => {
+            alu_none(ops, tg, |dst| IrOp::And {
+                dst,
+                a: value,
+                b: mask,
+                size,
+                set_flags: FlagMask(0b10_1001),
+            });
+        }
+        // CLR1, SET1, NOT1: flags unchanged (pp. 12-85–98).
+        kind => {
+            let result = match kind {
+                1 => {
+                    let clear = alu_none(ops, tg, |dst| IrOp::Xor {
+                        dst,
+                        a: mask,
+                        b: Val::Imm(u64::MAX),
+                        size: 8,
+                        set_flags: FlagMask::NONE,
+                    });
+                    and(ops, tg, value, clear)
+                }
+                2 => or(ops, tg, value, mask),
+                _ => alu_none(ops, tg, |dst| IrOp::Xor {
+                    dst,
+                    a: value,
+                    b: mask,
+                    size: 8,
+                    set_flags: FlagMask::NONE,
+                }),
+            };
+            emit_write(ops, tg, target, result);
+        }
+    }
+    Ok(())
+}
+
 /// NEC V20/V30 BRKEM imm8 (NEC UM p. 12-169), decoded by the fetch.
-pub(crate) fn brkem(
+fn brkem(
     start: u16,
     length: u32,
     next: u16,
@@ -617,6 +900,7 @@ pub(crate) fn instruction(
                 } else {
                     start
                 },
+                carry: false,
             })),
             IrOp::Legacy(L::DirectStackAddress { dst, offset, .. }) => {
                 let value = tagged_address(&mut result, tg, SegmentId::Ss, offset);

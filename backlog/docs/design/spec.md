@@ -1952,8 +1952,8 @@ MUL reg16,r/m16,imm8/imm16 (pp. 12-54/55), shift and rotate by imm8
 PREPARE/DISPOSE (pp. 12-152/153) and BRKEM imm8 (0F FF imm8, p. 12-169). The
 compatibility amendment's aliases apply as on the 8088 (82h, F6h/F7h /1,
 83h /1,/4,/6); shift /6, FFh /7, D6h, 63h, F1h and every other unlisted form
-return `UnknownInstruction`, as do the NEC extension groups (0Fh map,
-REPC/REPNC 64h/65h, FPO2 66h/67h) until decision-23 C4b. REP (F3h) also
+return `UnknownInstruction`. The native-mode extensions are decision-23 C4b,
+below. REP (F3h) also
 repeats INM/OUTM (p. 12-15); a segment prefix on INM, which p. 12-28 prohibits,
 is refused, and so are PUSH SP and POP SP: the operation lists of pp. 12-147 and
 12-150 do not say which SP value is stored or left. PREPARE uses the whole imm8
@@ -1961,6 +1961,105 @@ as its level; no modulus is stated. CHKIND raises BRK 5 with the next
 instruction's PC (§3 p. 3-1); a bound pair on which a signed and an unsigned
 comparison disagree is refused (`NecIndexComparison`), since the page does not
 say which applies.
+
+**Native-mode extensions (decision-23 C4b).** The twenty-bit fetch decodes
+them itself, because the iced tables describe other instructions at these
+bytes; the I8088/I8086 byte table still refuses 0Fh and 64h-67h. Each is one
+step and one retired instruction (a repeat: one step per iteration), lowered
+out of line from the shared 8086 lowering. Flags marked U on a page are kept,
+as C2 keeps undefined flags: an engine choice, not a hardware claim.
+
+| Encoding | Instruction | Forms | Flags | UM |
+|---|---|---|---|---|
+| 0F 10/11 /0 | TEST1 r/m8, r/m16, CL | reg, mem | Z = !bit; V, CY 0; S, AC, P U | pp. 12-81–83 |
+| 0F 18/19 /0 ib | TEST1 r/m8,imm3; r/m16,imm4 | reg, mem | as above | pp. 12-83–85 |
+| 0F 12/13, 1A/1B /0 | CLR1 r/m, CL or imm | reg, mem | none | pp. 12-90–93 |
+| 0F 14/15, 1C/1D /0 | SET1 r/m, CL or imm | reg, mem | none | pp. 12-95–98 |
+| 0F 16/17, 1E/1F /0 | NOT1 r/m, CL or imm | reg, mem | none | pp. 12-85–89 |
+| 0F 28 /0, 0F 2A /0 | ROL4, ROR4 r/m8 | reg, mem | none | pp. 12-45–46 |
+| 0F 31 11 r2 r1, 0F 39 11 000 r ib | INS reg8,reg8; reg8,imm4 | reg | all U | pp. 12-21–22 |
+| 0F 33 11 r2 r1, 0F 3B 11 000 r ib | EXT reg8,reg8; reg8,imm4 | reg | all U | pp. 12-23–24 |
+| 0F 20, 0F 22, 0F 26 | ADD4S, SUB4S, CMP4S | DS1:IY, seg:IX, CL digits | Z, CY; V, S, AC, P U | pp. 12-42–44 |
+| 65h, 64h | REPC, REPNC | CMPBK, CMPM (CMPS, SCAS) | none | p. 12-14 |
+| 66h/67h /r | FPO2 fp-op; fp-op,mem | reg, mem | none | pp. 12-174–175 |
+
+The bit number is CL or the immediate, of which bits 2:0 (byte) or 3:0
+(word) are used. ROL4/ROR4 rotate the operand's two digits through AL bits
+3:0; AL bits 7:4 are "not assured", which the engine treats like a U flag and
+keeps. INS stores the low `length` + 1 bits of AW at bit `offset` of DS1:IY,
+EXT loads them from DS0:IX into AW and zeros the rest; the field may run into
+the next word, which is accessed only then ("Transfers: 2 or 4", "1 or 2").
+Afterwards the offset register holds (offset + length + 1) mod 16 and IY (IX)
+advances by two when the field reached the word end. The pages' worked
+examples show 3 + 5 bits -> offset 8 with IY unchanged and 8 + 13 bits ->
+offset 5 with IY + 2. A field ending exactly at bit 16 is derived, not shown:
+the registers are "updated to point to the next bit field" and the offset
+register holds only 0-15, so the next field is bit 0 of the next word. The BCD
+strings run from the low byte up; IX, IY and CL are unchanged, the source may
+take a segment override and the destination is DS1 ("[DS1-spec:]dst-string",
+pp. 12-42–44). "Transfers: 3n" gives no order of the reads and stores, so an
+overlap that would show the order is refused (below). Disjoint strings,
+identical ones (IX = IY in one segment) and an overlap in which every shared
+byte is read as source no later than its step as destination give the same
+result byte by byte or with all reads first, and run; CMP4S stores nothing.
+REPC repeats while CY = 1
+and REPNC while CY = 0, with CW tested first, as REPE/REPNE test Z; an
+interrupted one keeps up to three prefixes, as other block instructions do.
+FPO2 takes the ESC address and prefix policy: with `FpuModel::None` the CPU
+computes the address and performs one word read, with no other effect. The
+width is the page's: FPO2 fp-op,mem gives Clocks 15 (V20), 15 (V30, odd
+address) and 11 (V30, even address) (p. 12-175, the same for FPO1 on
+p. 12-174), and the manual prints an odd/even difference only for word
+transfers (TEST1 mem16 p. 12-83: 16/16/12; TEST1 mem8 p. 12-82: 12).
+
+Typed refusals, each before any store or device transfer (`NecBcdDigit` is
+found after RAM reads of both strings):
+- `UnknownInstruction`: 0Fh second bytes other than the listed ones; ModRM
+  bits 5:3 not 000 in the bit and nibble forms and the INS/EXT immediate
+  forms; INS/EXT with a memory operand or an imm4 above 15; ROL4/ROR4 AL (AL
+  would be both the rotated byte and the digit source, and the page gives no
+  result for that); EXT AL/AH; any repeat prefix on the 0Fh forms and FPO2;
+  any prefix on INS/EXT and BRKEM; REPC/REPNC on anything but CMPS/SCAS, or
+  with another repeat prefix, or in a prefix run longer than 15 bytes (the
+  fetch keeps 15 bytes of evidence to check the run; REP/REPE/REPNE accept any
+  count); FPO2 with `Present` (the engine defines no 66h/67h coprocessor
+  instruction) or with the EM input set. EXT AL/AH: p. 12-23 orders the update
+  ("AW <- 16-bit field ... After the transfer, the IX register and the 8-bit
+  register specified by the first operand are updated"), so the page would
+  give AL/AH the new offset, but the hardware corpus documentation
+  (`oracles/ssv20/README.md`, "Using AL or AH as the first operand to EXT is
+  invalid") marks the form invalid; the derived result is not claimed. INS
+  AL/AH differs: AW is only read, before the transfer, and AL/AH is written
+  once, after it, so no value is in question.
+- `NecBitFieldOperand`: INS/EXT with nonzero bits 7:4 in the offset or length
+  register, which the pages require to be 0 "for correct operation".
+- `NecBcdStringLength`: CL = 0, 255 or odd (1-254 digits are given; an odd
+  count leaves the upper digit, Z and CY undefined). `NecBcdStringOverlap`:
+  ADD4S/SUB4S whose destination byte i is, at its physical address, the
+  source byte j of a later step (j > i), so that a store before that read and
+  a read before every store give different results. `NecBcdDigit`: a digit
+  above 9 in either string. `NecBcdStringDevice`: an operand byte in a trapped
+  region. This is an engine limit, not a gap in the page: the instruction is
+  one unit of up to 381 transfers, and a replay after an MMIO stop would read
+  RAM bytes it had already stored. An unmapped or unwritable byte faults
+  before the first store.
+
+Corpus disagreements (`oracles/ssv20/v1_native/metadata.json` and
+`README.md`, harness classifications without captured bytes in the pin; the
+manual is followed): the metadata marks Z undefined for TEST1 CL (0F10/0F11,
+`"flags": "...szap."`, `"flags-mask": 65387`), where pp. 12-81–83 set it, and
+marks no flag undefined for TEST1 imm (0F18/0F19), where pp. 12-83–85 mark S,
+AC and P U; the README says "REPC/REPNC prefixes on INS and OUTS act as
+regular REP prefixes" (6C/6D), which p. 12-14 does not describe, so the
+engine refuses it.
+
+Out of scope: BUSLOCK (F0h, p. 12-173), which the manual lists for native
+mode, keeps the C2 LOCK refusal; the engine has no primitive that holds the
+bus for a whole instruction. The device-memory BCD refusal and the REPC
+prefix-run limit above are engine limits.
+
+The other entries' identities are unchanged; the NEC entries hash an
+extension revision word. The witness binary is `legacy_nec_v20_extensions`.
 
 Quirk values: the PSW image is MD,1,1,1 above V (§3 p. 3-3) and MD is 1 while
 native code runs, so lifted images store F000h; vectors 0-5 are processor

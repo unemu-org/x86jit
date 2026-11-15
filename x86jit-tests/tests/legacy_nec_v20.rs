@@ -396,18 +396,12 @@ fn compatibility_aliases_execute_and_other_forms_are_refused() {
         cpu.cpu.gpr[0] = 1;
         step(&vm, &mut cpu, 1);
         assert!(!cpu.cpu.flags.zf);
-        // C4b groups, undefined bytes, not-stated forms and later ISAs.
+        // Undefined bytes, not-stated forms and later ISAs. The C4b
+        // extension forms are witnessed in legacy_nec_v20_extensions.
         for code in [
             &b"\x63\xc0"[..],
-            b"\x64\xa6",
-            b"\x65\xa6",
-            b"\x66\x90",
-            b"\x67\x90",
             b"\xd6",
             b"\xf1\x90",
-            b"\x0f\x10\xc0",
-            b"\x0f\x20",
-            b"\x0f\x31\xc0",
             b"\x0f\x01\xc0",
             b"\xc0\xf0\x01",
             b"\xd1\xf0",
@@ -426,7 +420,6 @@ fn compatibility_aliases_execute_and_other_forms_are_refused() {
             b"\xf2\x6c",
             b"\x26\x6c",
             b"\xf3\x90",
-            b"\x66\x40",
             b"\x0f\xa2",
             b"\xf3\x26\x2e\x3e\x6e",
         ] {

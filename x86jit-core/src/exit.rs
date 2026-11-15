@@ -80,6 +80,27 @@ pub enum UnsupportedSystemOperation {
     /// NEC V20/V30: CHKIND bounds on which a signed and an unsigned
     /// comparison disagree. NEC UM p. 12-170 does not say which applies.
     NecIndexComparison,
+    /// NEC V20/V30: INS or EXT with a nonzero upper four bits in its
+    /// bit-offset register or bit-length register. NEC UM pp. 12-21–24 require
+    /// them to be zero "for correct operation" and describe no other result.
+    NecBitFieldOperand,
+    /// NEC V20/V30: ADD4S, SUB4S or CMP4S with CL = 0, 255 or odd. NEC UM
+    /// pp. 12-42–44 give 1 to 254 digits, and leave the upper digit and the
+    /// Z and CY flags undefined for an odd count.
+    NecBcdStringLength,
+    /// NEC V20/V30: a digit above 9 in an ADD4S, SUB4S or CMP4S operand.
+    /// NEC UM pp. 12-42–44 describe packed BCD strings only.
+    NecBcdDigit,
+    /// NEC V20/V30: an ADD4S, SUB4S or CMP4S operand byte in a trapped
+    /// (device) region. An engine limit, not a gap in the page: the
+    /// instruction is one unit of up to 381 transfers, and a replay after an
+    /// MMIO stop would read RAM bytes it had already stored.
+    NecBcdStringDevice,
+    /// NEC V20/V30: ADD4S or SUB4S whose destination byte i is, at its
+    /// physical address, the source byte j of a later step (j > i). NEC UM
+    /// pp. 12-42–43 give "Transfers: 3n" but no order of the reads and
+    /// stores, and this overlap is where the order shows.
+    NecBcdStringOverlap,
 }
 
 /// Reason `run()` returned control to the user (§5.2).

@@ -39,8 +39,9 @@ pub enum ModelIsa {
     /// 8086/8088 encodings (8086 Family UM §4.2 Tables 4-12/4-13 pp. 4-22–36).
     I8086,
     /// NEC V20/V30 native mode: the 8086 set, the 80186-class forms NEC UM
-    /// §12 lists and BRKEM (decision-23 C4a). The NEC extension groups are
-    /// typed refusals until C4b.
+    /// §12 lists and BRKEM (decision-23 C4a), and the native-mode extensions
+    /// (bit, BCD-string, nibble-rotate and bit-field groups, REPC/REPNC and
+    /// FPO2; decision-23 C4b).
     NecV20,
 }
 
@@ -514,9 +515,18 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
             i += 1;
         }
     }
+    // The NEC native-mode extension forms (decision-23 C4b), which the
+    // twenty-bit fetch decodes outside the encoding table. Only the NEC
+    // entries hash this word, so no other identity changes.
+    if matches!(p.isa, ModelIsa::NecV20) {
+        hash = word(hash, NEC_EXTENSION_REVISION);
+    }
     p.semantics_id = hash;
     p
 }
+
+// Bump when the NEC extension decode or lowering changes (decision-23 C4b).
+const NEC_EXTENSION_REVISION: u64 = 1;
 
 #[cfg(test)]
 mod tests {

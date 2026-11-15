@@ -320,8 +320,215 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
             nec_load_psw(cpu, value);
             Ok(Nec::Fallthrough)
         }
+        L::BitField20 {
+            insert,
+            offset,
+            length,
+            length_register,
+        } => {
+            bit_field::<ROUTED, ORDER>(cpu, mem, ip, *insert, *offset, *length, *length_register)?;
+            Ok(Nec::Fallthrough)
+        }
+        L::BcdString20 { op, source } => {
+            bcd_string::<ROUTED, ORDER>(cpu, mem, ip, *op, *source)?;
+            Ok(Nec::Fallthrough)
+        }
+        // NEC UM pp. 12-174–175 FPO2: the CPU computes the address and
+        // starts the read; the external chip decides what the instruction
+        // does. With an empty socket the CPU's part is the whole effect, as
+        // for FPO1 (ESC). The generation-neutral engine defines no 66h/67h
+        // instruction, so with it attached the result is not stated: a typed
+        // refusal before any transfer, as is the engine's EM input.
+        L::Fpo2Escape20 {
+            addr,
+            memory,
+            bytes,
+            len,
+        } => {
+            if cpu.fpu_emulation || cpu.fpu_model != crate::FpuModel::None {
+                return Err(Exit::unknown_instruction(ip, *bytes, *len));
+            }
+            if *memory {
+                // One word read: p. 12-175 gives "Transfers: 1" and Clocks
+                // 15 (V20), 15 (V30, odd address), 11 (V30, even address);
+                // the manual prints that odd/even split only for word
+                // transfers (TEST1 mem16 p. 12-83: 16/16/12; mem8 p. 12-82:
+                // 12). FPO1 on p. 12-174 gives the same clocks.
+                read::<ROUTED, ORDER>(cpu, mem, read_val(*addr, temps), 2)?;
+            }
+            Ok(Nec::Fallthrough)
+        }
         _ => unreachable!("NEC control primitive"),
     }
+}
+
+// A Table 12-6 reg8 code: AL CL DL BL AH CH DH BH.
+fn reg8(cpu: &CpuState, code: u8) -> u8 {
+    (cpu.gpr[usize::from(code & 3)] >> if code & 4 != 0 { 8 } else { 0 }) as u8
+}
+fn set_reg8(cpu: &mut CpuState, code: u8, value: u8) {
+    let shift = if code & 4 != 0 { 8 } else { 0 };
+    let reg = &mut cpu.gpr[usize::from(code & 3)];
+    *reg = (*reg & !(0xff << shift)) | (u64::from(value) << shift);
+}
+
+// NEC UM pp. 12-21–24 INS and EXT. The field is `length` + 1 bits at bit
+// `offset` of the word at DS1:IY (INS) or DS0:IX (EXT), continuing into the
+// next word ("Bit field data may overlap the byte boundary"); "Transfers: 2
+// or 4" (INS) and "1 or 2" (EXT) read the second word only when the field
+// reaches it. INS stores AW bits length:0 there; EXT loads them into AW and
+// zeros the rest. "After the transfer", the offset register and IY (IX)
+// are "updated to point to the next bit field": the worked examples give
+// offset 3 + 5 bits -> offset 8, IY unchanged, and offset 8 + 13 bits ->
+// offset 5, IY + 2. A field ending exactly at bit 16 is derived from the same
+// sentence and the 0-15 offset rule: the next field is bit 0 of the next
+// word, which no other offset value names. Every byte wraps inside its
+// segment (§10 Fig. 10-1). Flags are undefined; the
+// engine keeps them. Upper offset or length bits must be zero "for correct
+// operation" and no other result is described: refused before any transfer.
+#[allow(clippy::too_many_arguments)]
+fn bit_field<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    ip: u64,
+    insert: bool,
+    offset_register: u8,
+    length: u8,
+    length_register: bool,
+) -> Result<(), Exit> {
+    let offset = reg8(cpu, offset_register);
+    let length = if length_register {
+        reg8(cpu, length)
+    } else {
+        length
+    };
+    if (offset | length) & 0xf0 != 0 {
+        return Err(nec_refusal(
+            cpu,
+            ip,
+            crate::UnsupportedSystemOperation::NecBitFieldOperand,
+        ));
+    }
+    let (offset, bits) = (u32::from(offset), u32::from(length) + 1);
+    let (selector, index) = if insert { (cpu.es, RDI) } else { (cpu.ds, RSI) };
+    let pointer = cpu.gpr[index] & 0xffff;
+    let tag = bus_tag(selector, pointer);
+    let end = offset + bits;
+    let size = if end > 16 { 4 } else { 2 };
+    let mask = ((1u64 << bits) - 1) << offset;
+    if insert {
+        let old = read::<ROUTED, ORDER>(cpu, mem, tag, size)?;
+        let field = ((cpu.gpr[RAX] & 0xffff) << offset) & mask;
+        write::<ROUTED, ORDER>(cpu, mem, tag, size, (old & !mask) | field)?;
+    } else {
+        let value = read::<ROUTED, ORDER>(cpu, mem, tag, size)?;
+        cpu.write_gpr(RAX, (value & mask) >> offset, 2);
+    }
+    set_reg8(cpu, offset_register, (end & 15) as u8);
+    if end >= 16 {
+        cpu.write_gpr(index, pointer.wrapping_add(2) & 0xffff, 2);
+    }
+    Ok(())
+}
+
+// Whether destination byte i of the strings at `src` and `dst` is, at its
+// physical address, source byte j of a later step (j > i).
+#[cold]
+#[inline(never)]
+fn bcd_order_shows(src: u64, dst: u64, bytes: u64) -> bool {
+    (1..bytes).any(|j| {
+        let at = physical(src + j, 0);
+        (0..j).any(|i| physical(dst + i, 0) == at)
+    })
+}
+
+// NEC UM pp. 12-42–44 ADD4S, SUB4S, CMP4S: the packed BCD string of CL
+// digits at DS1:IY ("[DS1-spec:]dst-string"), with the one at seg:IX
+// (default DS0) added, subtracted or compared, from the low byte up
+// ("Transfers: 3n" for n = CL/2 bytes). Z and CY follow the result for an
+// even count; V, S, AC and P are undefined and kept. IX, IY and CL are not
+// named as changed. Every byte wraps inside its segment. Refused before any
+// store or device transfer: CL outside 1-254 or odd (undefined digit and
+// flags), an overlap that would show the unstated transfer order, a device
+// byte (engine limit), a digit above 9 (found by RAM reads). An unmapped or
+// unwritable byte faults before the first store.
+fn bcd_string<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    ip: u64,
+    op: crate::legacy::BcdStringOp,
+    source: SegmentId,
+) -> Result<(), Exit> {
+    use crate::UnsupportedSystemOperation as U;
+    let digits = cpu.gpr[RCX] as u8;
+    if digits == 0 || digits & 1 != 0 {
+        return Err(nec_refusal(cpu, ip, U::NecBcdStringLength));
+    }
+    let store = op != crate::legacy::BcdStringOp::Cmp;
+    let src = bus_tag(legacy::selector(cpu, source), cpu.gpr[RSI]);
+    let dst = bus_tag(cpu.es, cpu.gpr[RDI]);
+    let bytes = u64::from(digits / 2);
+    // "Transfers: 3n" gives no order. If destination byte i is source byte j
+    // of a later step, a store before that read and all reads first differ:
+    // refused. Disjoint and identical strings, and an overlap whose shared
+    // bytes are read no later than they are stored, have one result.
+    if store && bcd_order_shows(src, dst, bytes) {
+        return Err(nec_refusal(cpu, ip, U::NecBcdStringOverlap));
+    }
+    for i in 0..bytes {
+        for tag in [src + i, dst + i] {
+            if matches!(
+                mem.region_kind(physical(tag, 0), 1),
+                Ok(crate::RegionKind::Trap)
+            ) {
+                return Err(nec_refusal(cpu, ip, U::NecBcdStringDevice));
+            }
+        }
+    }
+    let valid = |byte: u64| byte & 0x0f <= 9 && byte >> 4 <= 9;
+    for i in 0..bytes {
+        let a = read::<ROUTED, ORDER>(cpu, mem, dst + i, 1)?;
+        let b = read::<ROUTED, ORDER>(cpu, mem, src + i, 1)?;
+        if !valid(a) || !valid(b) {
+            return Err(nec_refusal(cpu, ip, U::NecBcdDigit));
+        }
+        if store {
+            let at = physical(dst + i, 0);
+            if let Err(trap) = mem.probe_write_mode::<ROUTED>(at, 1) {
+                return Err(memory_exit(cpu, trap, at, true, a));
+            }
+        }
+    }
+    // One byte at a time. With the overlap refused above, the order of the
+    // reads and stores no longer changes the result.
+    let (mut carry, mut zero) = (0, true);
+    for i in 0..bytes {
+        let a = read::<ROUTED, ORDER>(cpu, mem, dst + i, 1)?;
+        let b = read::<ROUTED, ORDER>(cpu, mem, src + i, 1)?;
+        let mut digit = |a: u64, b: u64| {
+            let value = if op == crate::legacy::BcdStringOp::Add {
+                a + b + carry
+            } else {
+                (a + 10).wrapping_sub(b + carry)
+            };
+            carry = u64::from(if op == crate::legacy::BcdStringOp::Add {
+                value > 9
+            } else {
+                value < 10
+            });
+            value % 10
+        };
+        let low = digit(a & 0x0f, b & 0x0f);
+        let high = digit(a >> 4, b >> 4);
+        let result = (high << 4) | low;
+        zero &= result == 0;
+        if store {
+            write::<ROUTED, ORDER>(cpu, mem, dst + i, 1, result)?;
+        }
+    }
+    cpu.flags.zf = zero;
+    cpu.flags.cf = carry != 0;
+    Ok(())
 }
 
 /// The three words at SS:SP, each byte wrapping inside the segment
@@ -516,6 +723,7 @@ pub(super) fn string<const ROUTED: bool, const STOP: bool, M: InterpreterMemory>
     kind: StrOp,
     elem: u8,
     rep: RepKind,
+    carry: bool,
     source: SegmentId,
     ip: u64,
     exit_request: Option<&std::sync::atomic::AtomicU64>,
@@ -526,12 +734,14 @@ pub(super) fn string<const ROUTED: bool, const STOP: bool, M: InterpreterMemory>
     shadows.complete_before(retired);
     let src = bus_tag(legacy::selector(cpu, source), 0);
     let dst = bus_tag(cpu.es, 0);
+    // NEC UM p. 12-14: REPC/REPNC end on CY as REPE/REPNE end on Z.
     let result = string_run_specialized::<true, false, true, true, STOP, _>(
         cpu,
         mem,
         kind,
         elem,
         rep,
+        carry,
         ip,
         16,
         src,

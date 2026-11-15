@@ -54,6 +54,11 @@ fn decode_model<const NEC: bool>(bytes: &[u8], insn: &Instruction) -> DecodeActi
     } {
         return absent;
     }
+    // The fetch decodes the NEC 0Fh and FPO2 forms itself (decision-23 C4b);
+    // the iced tables describe other instructions at these bytes.
+    if NEC && matches!(opcode, 0x0f | 0x66 | 0x67) {
+        return absent;
+    }
     // UM §4.2 Table 4-12 p. 4-27 defines the whole ESC encoding space.
     if matches!(opcode, 0xd8..=0xdf) {
         return if bytes[..first].iter().any(|b| matches!(b, 0xf2 | 0xf3)) {
@@ -173,15 +178,16 @@ fn nec_admits(b: &[u8]) -> bool {
 }
 
 // NEC V20/V30 byte table: the 8086 rows, the 80186-class forms of NEC UM §12
-// (60h-62h, 68h-6Fh, C0h/C1h, C8h/C9h) and BRKEM 0F FF imm8 (p. 12-169).
-// 63h-67h, D6h, F1h and the rest of the 0Fh map are typed refusals; 64h/65h
-// (REPC/REPNC), 66h/67h (FPO2) and the 0Fh groups are decision-23 C4b.
+// (60h-62h, 68h-6Fh, C0h/C1h, C8h/C9h), FPO2 (66h/67h, pp. 12-174–175) and
+// the 0Fh forms of `known_absent_nec_0f`. 63h, D6h and F1h are typed
+// refusals. 64h/65h (REPNC/REPC, p. 12-14) are prefixes, which the fetch
+// takes before this table; as an opcode they are absent.
 pub(super) fn known_absent_nec(bytes: &[u8]) -> bool {
     let b = &bytes[bytes.iter().take_while(|b| prefix(**b)).count()..];
     let Some(&opcode) = b.first() else {
         return false;
     };
-    if !matches!(opcode, 0x00..=0x53 | 0x55..=0x5b | 0x5d..=0x62 | 0x68..=0xd5 | 0xd7..=0xef | 0xf4..=0xff)
+    if !matches!(opcode, 0x00..=0x53 | 0x55..=0x5b | 0x5d..=0x62 | 0x66..=0xd5 | 0xd7..=0xef | 0xf4..=0xff)
     {
         return true;
     }
@@ -189,13 +195,49 @@ pub(super) fn known_absent_nec(bytes: &[u8]) -> bool {
         return false;
     };
     match opcode {
-        0x0f => second != 0xff,
+        0x0f => known_absent_nec_0f(&b[1..]),
+        0x66 | 0x67 => false,
         0x62 => second & 0xc0 == 0xc0,
         0xc0 | 0xc1 => (second >> 3) & 7 == 6,
         0x8f => second == 0xc4 || known_absent(b),
         0xff => second == 0xf4 || known_absent(b),
         0x60 | 0x61 | 0x68..=0x6f | 0xc8 | 0xc9 => false,
         _ => known_absent(b),
+    }
+}
+
+// The NEC 0Fh map after its first byte (NEC UM §12):
+// - 10h-1Fh TEST1/CLR1/SET1/NOT1 (pp. 12-81–98) and 28h/2Ah ROL4/ROR4
+//   (pp. 12-45–46): ModRM bits 5:3 are 000; ROL4/ROR4 AL is refused, since AL
+//   would be both the rotated byte and the digit source and the page gives
+//   no result for that;
+// - 20h/22h/26h ADD4S/SUB4S/CMP4S (pp. 12-42–44): no ModRM;
+// - 31h/33h INS/EXT reg,reg (pp. 12-21, 12-23): ModRM 11 reg2 reg1;
+//   39h/3Bh INS/EXT reg,imm4 (pp. 12-22, 12-24): 11 000 reg, imm4 0-15. EXT
+//   with AL or AH as the offset register is refused. P. 12-23 orders the
+//   update ("AW <- 16-bit field ... After the transfer, the IX register and
+//   the 8-bit register specified by the first operand are updated"), so the
+//   page would leave the new offset there, but the hardware corpus
+//   documentation (oracles/ssv20/README.md: "Using AL or AH as the first
+//   operand to EXT is invalid") marks the form invalid, and that derived
+//   result is not claimed. INS AL/AH differs: AW is only read, before the
+//   transfer, and AL/AH is written once, after it;
+// - FFh BRKEM (p. 12-169).
+// Every other second byte is a typed refusal.
+fn known_absent_nec_0f(b: &[u8]) -> bool {
+    let second = b[0];
+    let modrm = b.get(1).copied();
+    match second {
+        0x10..=0x1f | 0x28 | 0x2a => {
+            modrm.is_some_and(|m| m & 0x38 != 0 || (matches!(second, 0x28 | 0x2a) && m == 0xc0))
+        }
+        0x31 | 0x33 => modrm.is_some_and(|m| m & 0xc0 != 0xc0 || (second == 0x33 && m & 3 == 0)),
+        0x39 | 0x3b => {
+            modrm.is_some_and(|m| m & 0xf8 != 0xc0 || (second == 0x3b && m & 3 == 0))
+                || b.get(2).is_some_and(|imm| *imm > 15)
+        }
+        0x20 | 0x22 | 0x26 | 0xff => false,
+        _ => true,
     }
 }
 
@@ -276,6 +318,32 @@ mod tests {
             .map(|(code, _)| *code)
             .collect();
         assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    // Decision-23 C4b: the NEC 0Fh map admits exactly the second bytes NEC
+    // UM §12 lists, 66h/67h open FPO2 and 64h/65h stay prefixes only; the
+    // 8086 table still refuses all of them at the first byte, and the NEC
+    // iced path never decodes them.
+    #[test]
+    fn nec_extension_bytes_and_unchanged_8086_refusals() {
+        for opcode in [0x0f, 0x63, 0x64, 0x65, 0x66, 0x67] {
+            assert!(known_absent(&[opcode]), "{opcode:#x}");
+        }
+        for second in 0..=255u8 {
+            let listed = matches!(
+                second,
+                0x10..=0x1f | 0x20 | 0x22 | 0x26 | 0x28 | 0x2a | 0x31 | 0x33 | 0x39 | 0x3b | 0xff
+            );
+            assert_eq!(!known_absent_nec(&[0x0f, second]), listed, "{second:#x}");
+        }
+        assert!(!known_absent_nec(&[0x66]) && !known_absent_nec(&[0x67]));
+        for opcode in [0x63, 0x64, 0x65] {
+            assert!(known_absent_nec(&[opcode]), "{opcode:#x}");
+        }
+        for bytes in [&[0x66, 0xf4][..], &[0x67, 0x90], &[0x0f, 0x10, 0xc0]] {
+            let insn = Decoder::new(16, bytes, NEC_SET.options).decode();
+            assert!(matches!(decode_nec(bytes, &insn), DecodeAction::Absent(_)));
+        }
     }
 
     // Every byte the NEC table refuses at the opcode is refused by the

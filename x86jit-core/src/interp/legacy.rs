@@ -3652,6 +3652,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 | L::Brkem20 { .. }
                 | L::Reti20 { .. }
                 | L::PopPsw20 { .. }
+                | L::BitField20 { .. }
+                | L::BcdString20 { .. }
+                | L::Fpo2Escape20 { .. }
                 | L::InhibitIrq20 => {
                     return Err(refusal(
                         cpu,

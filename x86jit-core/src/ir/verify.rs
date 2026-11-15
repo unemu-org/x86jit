@@ -396,9 +396,12 @@ impl IrBlock {
                     crate::legacy::LegacyOp::PopPsw20 { value } => {
                         check(&[Val::Temp(*value)], &[])?
                     }
+                    crate::legacy::LegacyOp::Fpo2Escape20 { addr, .. } => check(&[*addr], &[])?,
                     crate::legacy::LegacyOp::WrappedString { .. }
                     | crate::legacy::LegacyOp::Interrupt20 { .. }
                     | crate::legacy::LegacyOp::Brkem20 { .. }
+                    | crate::legacy::LegacyOp::BitField20 { .. }
+                    | crate::legacy::LegacyOp::BcdString20 { .. }
                     | crate::legacy::LegacyOp::InhibitIrq20 => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {

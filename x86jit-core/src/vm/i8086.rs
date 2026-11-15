@@ -21,11 +21,181 @@ struct Decoded {
     restart: u16,
     bytes: Vec<u8>,
     evidence: Vec<u8>,
-    /// NEC V20/V30 BRKEM imm8, which the iced tables do not describe.
-    brkem: Option<u8>,
+    /// A NEC V20/V30 form the iced tables do not describe.
+    nec: Option<crate::lift::i8086::NecForm>,
+    /// NEC V20/V30 REPC or REPNC: the repeat condition tests CY.
+    carry: bool,
 }
 
-fn fetch(
+enum NecFetch {
+    More,
+    Refuse,
+    /// The form and its operand surrogate.
+    Form(crate::lift::i8086::NecForm, Instruction),
+}
+
+// NEC V20/V30 forms at 0Fh and 66h/67h (decision-23 C4a, C4b). The byte
+// table (`known_absent_nec`) has already refused the forms it rules out.
+#[cold]
+#[inline(never)]
+fn nec_form(suffix: &[u8], prefixes: u32, segment: Option<u8>, repeat: bool) -> NecFetch {
+    use crate::legacy::BcdStringOp as Bcd;
+    use crate::lift::i8086::NecForm as F;
+    // Operand-free forms carry a NOP surrogate: sequential flow, so only
+    // `NecForm::terminates` ends a block after them.
+    let mut nop = Instruction::default();
+    nop.set_code(iced_x86::Code::Nopw);
+    // The r/m operand of `suffix[at..]` as a surrogate `opcode` with the same
+    // ModRM and displacement, and their length; `None` until all bytes arrived.
+    let surrogate = |opcode: u8, at: usize| {
+        let mut bytes = Vec::from_iter(segment);
+        bytes.push(opcode);
+        bytes.extend_from_slice(&suffix[at..]);
+        let mut decoder = Decoder::new(16, &bytes, iced_x86::DecoderOptions::NO_INVALID_CHECK);
+        let insn = decoder.decode();
+        (decoder.last_error() != DecoderError::NoMoreBytes)
+            .then(|| (insn, insn.len() - usize::from(segment.is_some()) - 1))
+    };
+    if suffix[0] != 0x0f {
+        // FPO2 (UM pp. 12-174–175) takes the ESC address and prefix policy.
+        let Some(&modrm) = suffix.get(1) else {
+            return NecFetch::More;
+        };
+        return if repeat {
+            NecFetch::Refuse
+        } else if modrm & 0xc0 == 0xc0 {
+            NecFetch::Form(F::Fpo2 { memory: false }, nop)
+        } else {
+            match surrogate(0x8b, 1) {
+                Some((address, _)) => NecFetch::Form(F::Fpo2 { memory: true }, address),
+                None => NecFetch::More,
+            }
+        };
+    }
+    let Some(&second) = suffix.get(1) else {
+        return NecFetch::More;
+    };
+    match second {
+        // NEC UM p. 12-169: BRKEM imm8 is 0F FF imm8. No prefix use is
+        // described, so a prefixed form is a typed refusal.
+        0xff => {
+            if prefixes != 0 {
+                NecFetch::Refuse
+            } else if suffix.len() < 3 {
+                NecFetch::More
+            } else {
+                NecFetch::Form(F::Brkem(suffix[2]), nop)
+            }
+        }
+        // pp. 12-42–44: the source segment may be overridden; no repeat
+        // prefix is described for these instructions.
+        0x20 | 0x22 | 0x26 if !repeat => NecFetch::Form(
+            F::BcdString {
+                op: match second {
+                    0x20 => Bcd::Add,
+                    0x22 => Bcd::Sub,
+                    _ => Bcd::Cmp,
+                },
+                source: match segment {
+                    Some(0x26) => crate::legacy::SegmentId::Es,
+                    Some(0x2e) => crate::legacy::SegmentId::Cs,
+                    Some(0x36) => crate::legacy::SegmentId::Ss,
+                    _ => crate::legacy::SegmentId::Ds,
+                },
+            },
+            nop,
+        ),
+        // pp. 12-21–24: register operands and fixed DS1:IY or DS0:IX; no
+        // prefix use is described.
+        0x31 | 0x33 | 0x39 | 0x3b if prefixes == 0 => {
+            let insert = second & 2 == 0;
+            match (second & 8 != 0, suffix.get(2), suffix.get(3)) {
+                (false, Some(&modrm), _) => NecFetch::Form(
+                    F::BitField {
+                        insert,
+                        offset: modrm & 7,
+                        length: (modrm >> 3) & 7,
+                        length_register: true,
+                    },
+                    nop,
+                ),
+                (true, Some(&modrm), Some(&imm)) => NecFetch::Form(
+                    F::BitField {
+                        insert,
+                        offset: modrm & 7,
+                        length: imm,
+                        length_register: false,
+                    },
+                    nop,
+                ),
+                _ => NecFetch::More,
+            }
+        }
+        // pp. 12-81–98 and 12-45–46: an r/m operand, then imm3/imm4 for
+        // 0F 18h–1Fh. A segment prefix applies to a memory operand.
+        0x10..=0x1f | 0x28 | 0x2a if !repeat => {
+            if suffix.len() < 3 {
+                return NecFetch::More;
+            }
+            let word = matches!(second, 0x10..=0x1f) && second & 1 != 0;
+            let Some((operand, len)) = surrogate(if word { 0x89 } else { 0x88 }, 2) else {
+                return NecFetch::More;
+            };
+            let imm = if matches!(second, 0x18..=0x1f) {
+                match suffix.get(2 + len) {
+                    Some(&imm) => imm,
+                    None => return NecFetch::More,
+                }
+            } else {
+                0
+            };
+            NecFetch::Form(
+                F::Operand {
+                    opcode: second,
+                    imm,
+                },
+                operand,
+            )
+        }
+        _ => NecFetch::Refuse,
+    }
+}
+
+// The lifted string of a REPC/REPNC instruction tests CY (NEC UM p. 12-14).
+#[cold]
+#[inline(never)]
+fn carry_string(part: &mut IrBlock) {
+    for op in &mut part.ops {
+        if let IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { carry, .. }) = op {
+            *carry = true;
+        }
+    }
+}
+
+// NEC V20/V30 REPC (65h) and REPNC (64h), NEC UM p. 12-14: the iced decode
+// sees REPE or REPNE and the string tests CY. Two different repeat prefixes
+// are not described: refused. A prefix run longer than the 15 bytes of
+// evidence the fetch keeps cannot be checked and is refused too, an engine
+// limit (REP/REPE/REPNE accept any count).
+#[cold]
+#[inline(never)]
+fn carry_repeat(original: &[u8], prefixes: u32) -> Option<u8> {
+    let run = original.get(..prefixes as usize)?;
+    let mut repeats = run
+        .iter()
+        .filter(|b| matches!(b, 0x64 | 0x65 | 0xf2 | 0xf3));
+    let first = *repeats.next()?;
+    if repeats.any(|b| *b != first) {
+        return None;
+    }
+    match first {
+        0x65 => Some(0xf3),
+        0x64 => Some(0xf2),
+        _ => None,
+    }
+}
+
+fn fetch<const NEC: bool>(
     vm: &Vm,
     cpu: &CpuState,
     ip: u16,
@@ -36,6 +206,7 @@ fn fetch(
 ) -> Result<Decoded, Exit> {
     let mut segment = None;
     let mut repeat = None;
+    let mut carry = false;
     let mut prefixes = 0u32;
     let mut original = Vec::new();
     let mut suffix = Vec::new();
@@ -98,25 +269,38 @@ fn fetch(
         }
         suffix.push(b[0]);
         if profile.isa.unavailable_prefix(&suffix) {
-            return Err(refusal(u64::from(ip), &original));
-        }
-        // NEC UM p. 12-169: BRKEM imm8 is 0F FF imm8. No prefix use is
-        // described, so a prefixed form is a typed refusal.
-        if suffix[0] == 0x0f {
-            if suffix.len() < 3 {
+            // NEC UM p. 12-14: REPNC (64h) and REPC (65h) are repeat prefixes.
+            if NEC && matches!(suffix[..], [0x64 | 0x65]) {
+                suffix.clear();
+                prefixes = prefixes.wrapping_add(1);
+                carry = true;
                 continue;
             }
-            if prefixes != 0 {
-                return Err(refusal(u64::from(ip), &original));
+            return Err(refusal(u64::from(ip), &original));
+        }
+        // NEC V20/V30 only: the 8086 byte table refuses these opcodes.
+        if NEC && matches!(suffix[0], 0x0f | 0x66 | 0x67) {
+            match nec_form(&suffix, prefixes, segment, carry || repeat.is_some()) {
+                NecFetch::More => continue,
+                NecFetch::Refuse => return Err(refusal(u64::from(ip), &original)),
+                NecFetch::Form(form, insn) => {
+                    return Ok(Decoded {
+                        insn,
+                        len: prefixes + suffix.len() as u32,
+                        restart: ip,
+                        bytes: suffix.clone(),
+                        evidence: original,
+                        nec: Some(form),
+                        carry: false,
+                    });
+                }
             }
-            return Ok(Decoded {
-                insn: Instruction::default(),
-                len: 3,
-                restart: ip,
-                bytes: suffix.clone(),
-                evidence: original,
-                brkem: Some(suffix[2]),
-            });
+        }
+        if NEC && carry {
+            match carry_repeat(&original, prefixes) {
+                Some(substitute) => repeat = Some(substitute),
+                None => return Err(refusal(u64::from(ip), &original)),
+            }
         }
         // iced's fifteen-byte representation is a decoding tool, not the
         // processor's length limit. Retain the last prefix in each class,
@@ -161,6 +345,20 @@ fn fetch(
             DecodeAction::Alias(code) => insn.set_code(code),
             DecodeAction::Absent(_) => return Err(refusal(u64::from(ip), &original)),
         }
+        // NEC UM p. 12-14: REPC and REPNC repeat a block comparison (CMPBK,
+        // CMPM) only.
+        if NEC
+            && carry
+            && !matches!(
+                insn.mnemonic(),
+                iced_x86::Mnemonic::Cmpsb
+                    | iced_x86::Mnemonic::Cmpsw
+                    | iced_x86::Mnemonic::Scasb
+                    | iced_x86::Mnemonic::Scasw
+            )
+        {
+            return Err(refusal(u64::from(ip), &original));
+        }
         // A port block transfer resumes at its first byte. With more prefixes
         // than the model keeps (NEC UM §6 p. 6-4: three) it would resume at a
         // later prefix, which this engine's port strings do not model.
@@ -185,7 +383,8 @@ fn fetch(
             restart,
             bytes,
             evidence: original,
-            brkem: None,
+            nec: None,
+            carry,
         });
     }
 }
@@ -211,18 +410,24 @@ pub(super) fn resolve(
             .cpu_model
             .expect("twenty-bit dispatch requires an 8086-family catalogue model")
             .profile();
+        let nec_model = profile.isa == crate::ModelIsa::NecV20;
         let mut ip = cpu.rip as u16;
         let mut tg = crate::ir::TempGen::new();
         let mut combined: Option<IrBlock> = None;
         for _ in 0..16 {
-            let fetched = fetch(vm, cpu, ip, &source, &mut spans, word, profile);
+            let fetched = if nec_model {
+                fetch::<true>(vm, cpu, ip, &source, &mut spans, word, profile)
+            } else {
+                fetch::<false>(vm, cpu, ip, &source, &mut spans, word, profile)
+            };
             let Decoded {
                 insn,
                 len,
                 restart,
                 bytes,
                 evidence,
-                brkem,
+                nec,
+                carry,
             } = match fetched {
                 Ok(value) => value,
                 Err(Exit::Interrupted) => return Err(Exit::Interrupted),
@@ -235,17 +440,22 @@ pub(super) fn resolve(
                 u16::try_from(u64::from(ip) + u64::from(len))
                     .map_err(|_| refusal(u64::from(ip), &bytes))?
             };
-            let lifted = match brkem {
-                Some(vector) => Ok(crate::lift::i8086::brkem(ip, len, next, vector, profile)),
+            let lifted = match &nec {
+                Some(form) => crate::lift::i8086::nec_form(
+                    form, &insn, &evidence, ip, len, next, profile, &mut tg,
+                ),
                 None => crate::lift::i8086::instruction(
                     &insn, &bytes, &evidence, ip, len, next, restart, profile, &mut tg,
                 ),
             };
-            let part = match lifted {
+            let mut part = match lifted {
                 Ok(ir) => ir,
                 Err(_) if combined.is_some() => break,
                 Err(_) => return Err(refusal(cpu.rip, &evidence)),
             };
+            if carry {
+                carry_string(&mut part);
+            }
             // REP interruption ownership starts at its own prefix sequence.
             // Keep strings at block entry so a yield before their first element
             // cannot acquire an in-progress repeat's restart IP.
@@ -259,7 +469,7 @@ pub(super) fn resolve(
             {
                 break;
             }
-            let terminates = brkem.is_some()
+            let terminates = nec.is_some_and(|form| form.terminates())
                 || insn.flow_control() != iced_x86::FlowControl::Next
                 || matches!(
                     insn.mnemonic(),
