@@ -1446,39 +1446,29 @@ fn hand_back_is_rejected_while_mmio_is_in_flight() {
 
 // ---------------------------------------------------------------------------
 // Contract vectors of the sibling 8080-family project x80, format
-// x80-v20-contract-1, copied verbatim from x80 commit d77bb31
-// (x80-v20-contract/vectors/mode-switch.txt) except for the initial PSW
-// (last item below). Here x86jit is the native side
+// x80-v20-contract-2, copied verbatim from x80 commit 2d5a535
+// (x80-v20-contract/vectors/mode-switch.txt). Here x86jit is the native side
 // in place of that project's mock; the 8080 side is the small fixture below,
 // which implements only the opcodes the vectors use (Intel 8080 semantics,
 // as the vectors' README cites them). Differences from the mock, each named
 // where it applies:
 // - The service routines are native code: HLT, then edits equal to the mock's
-//   (AL C7h, CW ABCDh, IX DEADh, PSW saved XOR 0ED5h with MD = 1), then RETI.
-//   BRK is not inverted, since a set BRK at RETI raises the single-step trap
-//   (UM §6 p. 6-3); `routine` is compared with BRK masked. The routine's PUSH
-//   leaves one word below the service frame (3000:7FF2), which the memory
-//   comparison adds.
-// - The access counts follow the rule agreed for the source's format 2, which
-//   lands there after this change: only the 8080 core's bus is counted, and
-//   the bytes after ED are fetched by x86jit. Operand-fetch counts of this
-//   format-1 port therefore drop by one per RETEM and two per CALLN.
-// - The NMI cases are not ported: x86jit has no NMI input (open question).
-// - The initial PSW F392 is changed to F292 because BRKEM with BRK = 1 is a
-//   typed refusal (decision-23 §3); the source's format 2 makes the same
-//   change. The PSWs that depend on it change with it: the saved BRKEM frame
-//   and the PSW RETEM restores (`final`). All other data is verbatim; the
-//   service and routine PSWs come from the CALLN/INT frames, which BRKEM's
-//   IE/BRK clear (rule R2) already made independent of it.
-//   `x80_initial_psw_with_brk_refuses_brkem` keeps the F392 start as a
-//   witness.
-const VECTORS: &str = r#"# x80-v20-contract-1; hexadecimal numbers; native word order:
+//   (AL C7h, CW ABCDh, IX DEADh, PSW saved XOR 0ED5h with MD = 1, BRK kept),
+//   then RETI. The routine's PUSH leaves one word below the service frame
+//   (3000:7FF2), which the memory comparison adds.
+// - The NMI cases are not ported: x86jit has no NMI input (xj-50w.19).
+const VECTORS: &str = r#"# x80-v20-contract-2; hexadecimal numbers; native word order:
 # AW BW CW DW BP SP IX IY PS SS DS0 DS1 PC PSW
-format x80-v20-contract-1
+# Option B (decision-9 amendment, 2026-11-15): the native side decodes the
+# bytes after ED, so `access` counts only x80's bus and never an escape read.
+format x80-v20-contract-2
+# The initial PSW F292 has BRK = 0: the native core refuses BRKEM with BRK = 1
+# (decision-9 amendment, 2026-11-15). Format 1 started from F392.
 initial A111 B223 C445 D667 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 brkem 80
-# ASSUMPTION R2 (decision-9 amendment): BRKEM leaves IE = BRK = 0, so the
-# emulation PSW starts as 7092. Cases that need IE = 1 execute an 8080 EI;
+# After BRKEM, IE = 0 (ASSUMPTION R2, decision-9 amendment) and BRK = 0
+# (precondition), so the emulation PSW starts as 7092. R2's BRK clear has no
+# observable effect here. Cases that need IE = 1 execute an 8080 EI;
 # where an INT must be acceptable, a NOP or HLT then expires the EI delay.
 # Vector table: NMI=02, CALLN=40, INT=41, BRKEM=80.
 memory 0000 0008 00 04 00 62
@@ -1496,27 +1486,28 @@ changed 4000 8FFE 34 12
 case brkem_retem
 memory 2000 0111 ED FD
 run 0009
-# ASSUMPTION R2: IE = BRK = 0 after BRKEM; MD = 0; prefix set CY.
+# After BRKEM: IE = 0 (ASSUMPTION R2), BRK = 0 (precondition), MD = 0;
+# the prefix set CY.
 emulation 7093
 until retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000A 0009 0001 0001 0002 0002
+access 2000 4000 000A 0008 0001 0001 0002 0002
 end
 
 case calln_reti_retem
 # EI makes the saved IE = 1, so CALLN's IE clear (ASSUMPTION R2) is visible.
 memory 2000 0111 FB ED ED 40 ED FD
 until serviced
-# NEC p. 12-168: RETI restores the full saved PSW, not live FD46.
+# NEC p. 12-168: RETI restores the full saved PSW, not live FC46.
 emulation 7293
 until retem
 final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame calln 3000 7FF4 0115 2000 7293
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6000 3000 4000 5000 0200 F093
-routine FD46
-access 2000 4000 000C 000B 0001 0001 0002 0002
+routine FC46
+access 2000 4000 000C 0008 0001 0001 0002 0002
 end
 
 case int_enabled_running
@@ -1529,8 +1520,8 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame int 3000 7FF4 0113 2000 7293
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6100 3000 4000 5000 0300 F093
-routine FD46
-access 2000 4000 000D 0009 0001 0001 0002 0002
+routine FC46
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case int_disabled_running
@@ -1540,7 +1531,7 @@ signal 1 0 0 0 41 budget
 until retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000C 0009 0001 0001 0002 0002
+access 2000 4000 000C 0008 0001 0001 0002 0002
 end
 
 case nmi_running
@@ -1553,8 +1544,8 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame nmi 3000 7FF4 0112 2000 7093
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6200 3000 4000 5000 0400 F093
-routine FF46
-access 2000 4000 000C 0009 0001 0001 0002 0002
+routine FE46
+access 2000 4000 000C 0008 0001 0001 0002 0002
 end
 
 case hlt_int_disabled
@@ -1564,7 +1555,7 @@ signal 1 0 0 0 41 wake
 until retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000D 0009 0001 0001 0002 0002
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case hlt_int_enabled
@@ -1578,8 +1569,8 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame int 3000 7FF4 0113 2000 7293
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6100 3000 4000 5000 0300 F093
-routine FD46
-access 2000 4000 000D 0009 0001 0001 0002 0002
+routine FC46
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case hlt_nmi
@@ -1592,8 +1583,8 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame nmi 3000 7FF4 0113 2000 7093
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6200 3000 4000 5000 0400 F093
-routine FF46
-access 2000 4000 000D 0009 0001 0001 0002 0002
+routine FE46
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case reset_running
@@ -1614,7 +1605,7 @@ signal 0 0 0 0 41 budget
 until retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000D 0009 0001 0001 0002 0002
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case int_held_running
@@ -1624,7 +1615,7 @@ signal 1 0 1 0 41 budget
 until retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000D 0009 0001 0001 0002 0002
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 case nmi_over_int_and_hold
@@ -1637,8 +1628,8 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame nmi 3000 7FF4 0113 2000 7293
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6200 3000 4000 5000 0400 F093
-routine FD46
-access 2000 4000 000D 0009 0001 0001 0002 0002
+routine FC46
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 
 # NEC p. 9-1 does not restrict the instruction after a masked HLT wake.
@@ -1648,7 +1639,7 @@ until halt
 signal 1 0 0 0 41 retem
 final A1A6 1234 1234 5678 9000 8000 1357 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
-access 2000 4000 000C 0009 0001 0001 0002 0002
+access 2000 4000 000C 0008 0001 0001 0002 0002
 end
 
 case hlt_int_disabled_calln
@@ -1661,8 +1652,32 @@ final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
 frame brkem 3000 7FFA 2345 1000 F292
 frame calln 3000 7FF4 0116 2000 7093
 service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6000 3000 4000 5000 0200 F093
-routine FF46
-access 2000 4000 000D 000B 0001 0001 0002 0002
+routine FE46
+access 2000 4000 000D 0008 0001 0001 0002 0002
+end
+
+# decision-9 amendment, 2026-11-15, ASSUMED (CALLN_CONSUMES_EI_DELAY): no EI
+# delay survives a CALLN excursion, and CALLN itself consumes it. On a native
+# core the routine's own RETI would also end it. This case witnesses that
+# constant and that the adapter carries no 8080 latch across the excursion:
+# after RETI the INT is serviced at the first 8080 boundary, before the NOP
+# at 0115.
+case calln_consumes_ei_delay
+memory 2000 0111 FB ED ED 40 00 ED FD
+until serviced
+emulation 7293
+signal 1 0 0 0 41 serviced
+emulation 7293
+until retem
+final A1C7 1234 ABCD 5678 9000 8000 DEAD 2468 1000 3000 4000 5000 2345 F292
+frame brkem 3000 7FFA 2345 1000 F292
+frame calln 3000 7FF4 0115 2000 7293
+frame int 3000 7FF4 0115 2000 7293
+service A1A6 1234 1234 5678 9000 7FF4 1357 2468 6000 3000 4000 5000 0200 F093
+service A1C7 1234 ABCD 5678 9000 7FF4 DEAD 2468 6100 3000 4000 5000 0300 F093
+routine FC46
+routine FC46
+access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 "#;
 const NOT_PORTED: [&str; 3] = ["nmi_running", "hlt_nmi", "nmi_over_int_and_hold"];
@@ -1748,7 +1763,6 @@ struct Port {
     i: I8080,
     // opcode fetch, operand fetch, data read/write, stack read/write
     counts: [u64; 6],
-    escapes: (u64, u64),
     frames: Vec<(&'static str, u16, u16, [u16; 3])>,
     services: Vec<[u16; 14]>,
     routines: Vec<u16>,
@@ -1963,11 +1977,9 @@ impl Port {
                 let r = run(&self.vm, &mut self.cpu, 1);
                 assert_eq!(r.steps(), 1, "{:?}", r.stop());
                 if self.cpu.cpu.legacy.reserved & 2 == 0 {
-                    self.escapes.0 += 1;
                     self.ended = true;
                     return Outcome::Retem;
                 }
-                self.escapes.1 += 1;
                 let entry = self.native();
                 let r = run(&self.vm, &mut self.cpu, 1);
                 assert!(
@@ -2037,7 +2049,7 @@ fn vector_machine(
     let mut vector = None;
     for tokens in records {
         match tokens.as_slice() {
-            ["format", "x80-v20-contract-1"] => {}
+            ["format", "x80-v20-contract-2"] => {}
             ["initial", w @ ..] => initial = Some(w.iter().map(|t| hex(t)).collect::<Vec<_>>()),
             ["brkem", n] => vector = Some(hex(n) as u8),
             ["memory", data @ ..] => patch(&mut image, data),
@@ -2089,7 +2101,6 @@ fn run_vector(model: CpuModel, name: &str) {
         view,
         i: I8080::load(&view),
         counts: [0; 6],
-        escapes: (0, 0),
         frames: Vec::new(),
         services: Vec::new(),
         routines: Vec::new(),
@@ -2102,7 +2113,7 @@ fn run_vector(model: CpuModel, name: &str) {
     let mut seen = (false, false);
     for tokens in &records {
         match tokens.as_slice() {
-            ["format", ..] | ["initial", ..] | ["brkem", _] | ["memory", ..] => {}
+            ["format", "x80-v20-contract-2"] | ["initial", ..] | ["brkem", _] | ["memory", ..] => {}
             ["run", n] => assert_eq!(
                 port.run(u64::from(hex(n)), Lines::default()),
                 Outcome::Budget
@@ -2154,16 +2165,14 @@ fn run_vector(model: CpuModel, name: &str) {
                 frames.push((*source, ss, sp, words));
             }
             ["service", w @ ..] => services.push(w.iter().map(|t| hex(t)).collect::<Vec<_>>()),
-            ["routine", psw] => routines.push(hex(psw) & !0x100),
+            ["routine", psw] => routines.push(hex(psw)),
             ["access", ps, ds0, counts @ ..] => {
                 seen.1 = true;
                 assert_eq!(
                     (port.view.code_segment, port.view.data_segment),
                     (hex(ps), hex(ds0))
                 );
-                let mut want: Vec<u64> = counts.iter().map(|t| u64::from(hex(t))).collect();
-                // Format 2: the bytes after ED are x86jit's fetches.
-                want[1] -= port.escapes.0 + 2 * port.escapes.1;
+                let want: Vec<u64> = counts.iter().map(|t| u64::from(hex(t))).collect();
                 assert_eq!(port.counts.as_slice(), want.as_slice(), "{name} access");
             }
             other => panic!("unknown record {other:?}"),
@@ -2198,7 +2207,7 @@ fn x80_contract_vectors_on_the_native_side() {
             names.push(name.trim());
         }
     }
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 15);
     for model in MODELS {
         let mut ported = 0;
         for name in &names {
@@ -2207,14 +2216,15 @@ fn x80_contract_vectors_on_the_native_side() {
                 ported += 1;
             }
         }
-        assert_eq!(ported, 11);
+        assert_eq!(ported, 12);
     }
 }
 
 #[test]
 fn x80_initial_psw_with_brk_refuses_brkem() {
-    // The source's initial PSW F392 has BRK = 1; BRKEM from it is a typed
-    // refusal (decision-23 §3) with no guest effect.
+    // Format 1 of the source started from PSW F392 (BRK = 1); format 2 starts
+    // from F292. BRKEM from F392 is a typed refusal (decision-23 §3) with no
+    // guest effect.
     for model in MODELS {
         let records = sections("brkem_retem");
         let (vm, mut cpu, image, _) = vector_machine(model, &records, Some(0xf392));
