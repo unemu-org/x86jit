@@ -1674,13 +1674,16 @@ width 8 and +8.25 % at width 32. A successful split rejoins the hot code after i
 cold call. `vstore::<false, 0, Memory>` grows from 3148 to 3844 bytes and saves 8
 callee-saved registers instead of 2.
 
-Follow-up direction (xj-ir6.31): take the split off the hot path. The transfer
-functions stay exactly as at d4a58e2a, with no rejoin into `vstore` or the scalar
-paths. The split runs one level up, where the miss already becomes an exit, by
-re-executing the instruction through a cold path whose memory provider performs
-the access. MEASURED, partial and not a gate result: a first A/B of that design
-(`alu`, `load` and `store` only, interleaved with the base) stayed within +0.33 %
-on all five paths. The store probe and the other workloads were not measured.
+Result (xj-ir6.31): the split now runs off the hot path. The transfer functions are
+containment-only again, and a containment miss over adjacent regions re-executes
+the rest of the block through a cold path. The gate base is a373f11b (main after
+C4a) with 060d446a reverted, code only. In the final campaign on 176c4681, every
+non-SMC cell of `real16_loops` and every store-probe cell is within +0.5 %
+(MEASURED). Over 15 processes per side, `smc-next-64` misses on the four
+twenty-bit paths (+0.500 % to +0.529 %); see "Split off the hot path
+(xj-ir6.31)" below. The first round
+measured against f15060b9 (0 of 80 cells over, worst +0.241 %) and is kept there
+as history, as are the tables above.
 
 ### Review fixes on top of the measured candidate — MEASURED
 
@@ -2003,3 +2006,461 @@ workspace release test check with Unicorn pass.
 
 No commits, git writes, bead operations or pushes were performed, and
 backlog/decisions/ was not edited.
+
+## Split off the hot path (xj-ir6.31)
+
+Gate base: a373f11b (main after C4a) with 060d446a reverted, code only — main
+without the split. The first round measured against f15060b9, before C4a landed;
+it is kept below as history.
+
+### Change — READ
+
+- The scalar and wide transfers in `memory.rs` are containment-only, with the
+  bodies they had before xj-ir6.12. The walk's providers (`RunningMemory`,
+  `ChildMemory`) return the containment miss unchanged. An associated constant,
+  `InterpreterMemory::SPLIT`, is false for them, so their `vstore` compiles no split
+  branch.
+- A data access over adjacent RAM/ROM regions first ends with the usual
+  `UnmappedMemory` exit, with no register of that instruction committed. The code that
+  already handles that exit calls a cold, non-inlined function: the application and
+  alias dispatchers' exit arms (`vm/legacy.rs`), `execute_shared` on the I286 and
+  I386 Machine path (`interp/legacy.rs`), and `interpret_block_mode` for `step_one`
+  and `interpret_block` (`interp/mod.rs`).
+- That function walks the rest of the block again, from the faulting instruction,
+  through the existing retry walk. The retry walk's provider, `SplitMemory`, performs
+  the span with the out-of-line functions that xj-ir6.12 added. Re-execution is
+  restart-safe because a fault exit leaves the instruction's registers uncommitted
+  (spec.md §16; SDM Vol 3A §§7.5-7.6), and stores made before the miss are made
+  again with the same values. The real-mode stack-frame helpers
+  (`interp/control.rs`: interrupt delivery, far CALL/RET, IRET, PUSHA/POPA, ENTER,
+  PUSHF/POPF) commit SP word by word, so they perform the span themselves
+  (`read_across_regions` / `write_across_regions`), exactly as the walk did before
+  this change. The rest of the block ends where the block ends, so retirement, step
+  and block accounting equal one walk of the block.
+- If the re-execution stops at the same access without completing an instruction,
+  with a guest-map containment miss of its own (a gap, a Trap byte or a LOCK
+  operand), the first exit is returned with its evidence. Any other exit there, such
+  as a host fault at the operand's first byte, is the re-execution's.
+- Out-of-walk callers use `Memory`: JIT fallback helpers, Machine bus helpers, x87
+  memory operands and user copy. Its public accessors try containment first and call
+  the cold span function only on a miss. A 16-byte `vstore` through `Memory` or
+  `SplitMemory` goes to the out-of-line `vstore16_split`, which keeps the review fix:
+  both transfers are checked before either is written.
+- A one-byte access lies in one region or in none, so the scalar `*_spanning`
+  entry points call the span functions only for a wider access. The twenty-bit
+  walk (I8088, I8086, V20, V30) moves every data byte through a one-byte transfer
+  (`interp/i8086.rs`; `lift/i8086.rs` lowers loads, stores and strings to its
+  Wrapped primitives), so no containment miss over adjacent regions reaches it:
+  `execute_shared20` keeps its shape without the re-execution, and its byte helpers
+  keep their containment-only shape.
+
+### Codegen pins — MEASURED / READ
+
+The change moves code between codegen units, and some unrelated inlining decisions
+flip. Each pin below keeps the shape that the commit before xj-ir6.12 had. The
+numbers come from intermediate candidates of the first round. After C4a, the
+shapes were checked again in the rebased `real16_loops` and store-probe binaries
+(READ, objdump call lists): `usercopy::store` calls `copy_out` once on both sides;
+`Execution::sync_class` makes no `eq` call on either side; `RunGuard::finish` and
+`finish_with_counts` are single calls with the thread-local access inline. The
+gate base instead inlines `RunGuard::finish` into `Vcpu::run_steps` with three
+out-of-line `LocalKey::with` calls and three accessor-shim calls. That matches
+`ip-boundary-1` running −1.5 % to −2.0 % below the base on every path (ASSUMED
+attribution). No pin was redundant or harmful in that check, so all are kept.
+
+- `usercopy::copy_out` is `#[inline(never)]`. Without it, it is inlined into
+  `usercopy::store`, and the store probe at width 8, single, recovery on costs
+  +0.67 % (MEASURED).
+- `time_stats::RunGuard::finish` is `#[inline(never)]` and uses
+  `LocalKey::try_with`. Without that, it is inlined with an out-of-line
+  `LocalKey::with` call (READ).
+- The run's dispatch counts are added in the same thread-local access as the exit
+  count (`DispatchGuard::finish` calls `RunGuard::finish_with_counts`). Without that,
+  the dispatchers reach the thread-local through an out-of-line accessor call (READ),
+  and `ip-boundary-1` is +0.56 % to +0.75 % on the gated paths instead of −0.27 % to
+  −0.33 % (MEASURED; that is the only difference between the two candidates).
+- `LegacyContextStamp` has a hand-written `PartialEq` marked `#[inline(always)]`.
+  Without it, the derived `eq` is an out-of-line call in `sync_class` (READ).
+- The alias dispatcher calls its split only from an `Exit::UnmappedMemory` arm. A
+  call on every exit cost `ip-boundary-1` +1.9 % on the Alias path (MEASURED).
+
+### Final campaign on 176c4681 — MEASURED
+
+The tree reviewed as 176c4681 (the rebase round plus the review fixes below),
+against the gate base. The candidate binaries are byte-identical to a build of
+`git archive 176c4681` (`real16_loops` SHA-256
+`2f67d45864b939b6ea9e3467be07ee80909293180e5b4008c2d9f382abe036e4`). Method as in
+the rebase round. All 144 cells are measured in one interleaved campaign. The SMC
+cells also have 15 interleaved processes per side, for each of the three SMC
+workloads.
+
+**The gate is not met in 4 of 144 cells: `smc-next-64` on I8088, I8086, V20 and
+V30, at +0.520 %, +0.529 %, +0.500 % and +0.517 % (median of 15 processes).**
+- The 117 non-SMC cells are within +0.5 %, worst +0.360 % (`call-ret`, Alias).
+  The twenty-bit paths are at −1.99 % to +0.030 %.
+- The SMC cells on the Alias and I286/I386 paths pass, at −0.77 % to +0.16 %.
+- On the twenty-bit paths, `smc-next-1` is +0.27 % to +0.28 % and `smc-rmw-64`
+  +0.47 % to +0.48 % (both pass).
+- Every store-probe cell is below the base (worst −0.066 %).
+
+On the twenty-bit SMC cells the base still takes one of two values per process,
+about 0.55 % apart. The candidate now takes a single value in all 15 processes:
+- `smc-next-64` and `smc-rmw-64`: 0.04 % to 0.09 % below the base's upper value.
+- `smc-next-1`: between the two values, 0.27 % above the lower one and 0.25 %
+  below the upper one.
+
+The median therefore compares mostly against the base's more frequent lower value.
+What selects the value is not known (ASSUMED, as in C4a: per-process layout).
+
+Change in host instructions per guest step, one process per side (the SMC rows
+are replaced by the next table):
+
+| Workload | Alias | I8088 | I8086 | V20 | V30 | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `alu` | +0.211% | -0.425% | -0.421% | -0.398% | -0.393% | +0.193% | +0.183% | +0.197% | +0.205% |
+| `load` | +0.194% | -0.384% | -0.528% | -0.498% | -0.415% | -0.015% | -0.254% | -0.184% | -0.013% |
+| `load-odd` | +0.202% | -0.381% | -0.376% | -0.403% | -0.381% | +0.202% | +0.199% | +0.203% | +0.204% |
+| `store` | +0.232% | -0.367% | -0.366% | -0.366% | -0.368% | +0.224% | +0.224% | +0.226% | +0.225% |
+| `push-pop` | +0.156% | -0.227% | -0.229% | -0.230% | -0.230% | +0.155% | +0.154% | +0.154% | +0.153% |
+| `data-next-to-code` | -0.013% | -0.271% | -0.286% | -0.288% | -0.282% | +0.009% | +0.011% | +0.016% | -0.018% |
+| `data-next-to-dense-code` | +0.032% | -0.252% | -0.260% | -0.260% | -0.275% | +0.013% | +0.004% | +0.000% | +0.025% |
+| `call-ret` | +0.360% | -0.525% | -0.531% | -0.527% | -0.514% | +0.335% | +0.337% | +0.339% | +0.332% |
+| `dos-mixed` | +0.083% | -0.313% | -0.316% | -0.318% | -0.314% | +0.082% | +0.084% | +0.083% | +0.083% |
+| `rep-movsw` | -0.011% | +0.004% | +0.024% | +0.030% | +0.018% | +0.025% | +0.011% | +0.020% | +0.024% |
+| `straight-line` | +0.002% | +0.023% | -0.084% | -0.085% | -0.052% | +0.002% | +0.001% | +0.001% | -0.003% |
+| `ip-boundary-1` | -1.551% | -1.967% | -1.986% | -1.947% | -1.980% | -1.545% | -1.517% | -1.563% | -1.548% |
+| `ip-boundary-64` | +0.205% | -0.715% | -0.756% | -0.735% | -0.748% | +0.130% | +0.168% | +0.156% | +0.174% |
+| `smc-next-1` | -0.376% | -0.288% | -0.302% | -0.317% | -0.291% | -0.700% | -0.715% | -0.685% | -0.708% |
+| `smc-next-64` | +0.084% | +0.455% | +0.550% | +0.545% | +0.501% | -0.072% | -0.056% | -0.094% | -0.072% |
+| `smc-rmw-64` | +0.133% | +0.523% | +0.617% | +0.567% | +0.575% | -0.154% | -0.162% | -0.130% | -0.134% |
+
+SMC cells over 15 processes per side:
+
+| Workload | Path | Processes (base / candidate) | Median of processes | Lower mode | Upper mode |
+|---|---|---:|---:|---:|---:|
+| `smc-next-1` | Alias | 15 / 15 | 10707.1→10682.3 (-0.232%) | -0.232% (one mode) | – |
+| `smc-next-1` | I8088 | 15 / 15 | 21535.3→21595.1 (+0.278%) | +0.278% (one mode) | – |
+| `smc-next-1` | I8086 | 15 / 15 | 21536.4→21596.6 (+0.280%) | +0.280% (one mode) | – |
+| `smc-next-1` | V20 | 15 / 15 | 21933.7→21992.4 (+0.267%) | +0.267% (one mode) | – |
+| `smc-next-1` | V30 | 15 / 15 | 21933.5→21992.3 (+0.268%) | +0.268% (one mode) | – |
+| `smc-next-1` | I286 | 15 / 15 | 5405.0→5363.7 (-0.765%) | -0.765% (one mode) | – |
+| `smc-next-64` | Alias | 15 / 15 | 8884.2→8898.0 (+0.155%) | +0.155% (one mode) | – |
+| `smc-next-64` | I8088 | 15 / 15 | 19686.4→19788.8 (+0.520%) | n/a (13/0) | -0.045% (2/15) |
+| `smc-next-64` | I8086 | 15 / 15 | 19685.9→19790.1 (+0.529%) | n/a (13/0) | -0.052% (2/15) |
+| `smc-next-64` | V20 | 15 / 15 | 20085.1→20185.6 (+0.500%) | n/a (13/0) | -0.062% (2/15) |
+| `smc-next-64` | V30 | 15 / 15 | 20082.8→20186.6 (+0.517%) | n/a (13/0) | -0.043% (2/15) |
+| `smc-next-64` | I286 | 15 / 15 | 3701.1→3698.2 (-0.079%) | -0.079% (one mode) | – |
+| `smc-rmw-64` | Alias | 15 / 15 | 8993.1→9004.1 (+0.123%) | +0.123% (one mode) | – |
+| `smc-rmw-64` | I8088 | 15 / 15 | 20443.0→20540.4 (+0.476%) | n/a (12/0) | -0.073% (3/15) |
+| `smc-rmw-64` | I8086 | 15 / 15 | 20443.2→20541.8 (+0.483%) | n/a (12/0) | -0.074% (3/15) |
+| `smc-rmw-64` | V20 | 15 / 15 | 20835.7→20932.5 (+0.465%) | +0.465% (one mode) | – |
+| `smc-rmw-64` | V30 | 15 / 15 | 20835.2→20932.7 (+0.468%) | n/a (12/0) | -0.086% (3/15) |
+| `smc-rmw-64` | I286 | 15 / 15 | 4934.9→4927.2 (-0.156%) | -0.156% (one mode) | – |
+
+The twenty-bit SMC cells against each of the base's two values:
+
+| Workload | Path | Base lower value (n) | Base upper value (n) | Candidate (n, spread) | Median of 15 | vs base lower | vs base upper |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `smc-next-1` | I8088 | 21534.5 (10) | 21647.6 (5) | 21595.1 (15, 0.01%) | +0.278% | +0.281% | -0.242% |
+| `smc-next-1` | I8086 | 21536.0 (10) | 21649.4 (5) | 21596.6 (15, 0.02%) | +0.280% | +0.282% | -0.244% |
+| `smc-next-1` | V20 | 21933.3 (10) | 22046.6 (5) | 21992.4 (15, 0.01%) | +0.267% | +0.270% | -0.246% |
+| `smc-next-1` | V30 | 21933.3 (10) | 22046.9 (5) | 21992.3 (15, 0.01%) | +0.268% | +0.269% | -0.248% |
+| `smc-next-64` | I8088 | 19686.2 (13) | 19797.7 (2) | 19788.8 (15, 0.06%) | +0.520% | +0.521% | -0.045% |
+| `smc-next-64` | I8086 | 19685.7 (13) | 19800.4 (2) | 19790.1 (15, 0.07%) | +0.529% | +0.530% | -0.052% |
+| `smc-next-64` | V20 | 20084.4 (13) | 20198.2 (2) | 20185.6 (15, 0.05%) | +0.500% | +0.504% | -0.062% |
+| `smc-next-64` | V30 | 20082.7 (13) | 20195.2 (2) | 20186.6 (15, 0.07%) | +0.517% | +0.517% | -0.043% |
+| `smc-rmw-64` | I8088 | 20439.0 (12) | 20555.4 (3) | 20540.4 (15, 0.13%) | +0.476% | +0.496% | -0.073% |
+| `smc-rmw-64` | I8086 | 20432.9 (12) | 20557.1 (3) | 20541.8 (15, 0.13%) | +0.483% | +0.533% | -0.074% |
+| `smc-rmw-64` | V20 | 20826.4 (12) | 20949.2 (3) | 20932.5 (15, 0.13%) | +0.465% | +0.510% | -0.080% |
+| `smc-rmw-64` | V30 | 20825.7 (12) | 20950.8 (3) | 20932.7 (15, 0.13%) | +0.468% | +0.514% | -0.086% |
+
+Store probe, host instructions per store:
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 298.098, 298.205, 298.200 (**298.200**) | 297.678, 297.683, 297.607 (**297.678**) | -0.175% |
+| 8 | single | on | 343.829, 343.860, 343.890 (**343.860**) | 343.362, 343.526, 343.446 (**343.446**) | -0.120% |
+| 8 | crossing | off | 334.387, 334.186, 334.367 (**334.367**) | 333.652, 333.657, 333.823 (**333.657**) | -0.212% |
+| 8 | crossing | on | 416.971, 416.953, 416.969 (**416.969**) | 416.499, 416.442, 416.666 (**416.499**) | -0.113% |
+| 32 | single | off | 593.768, 593.724, 593.666 (**593.724**) | 593.176, 593.181, 593.134 (**593.176**) | -0.092% |
+| 32 | single | on | 678.345, 678.398, 678.569 (**678.398**) | 678.057, 677.950, 677.911 (**677.950**) | -0.066% |
+| 32 | crossing | off | 593.672, 593.553, 593.666 (**593.666**) | 593.267, 593.130, 593.180 (**593.180**) | -0.082% |
+| 32 | crossing | on | 585.426, 585.375, 585.365 (**585.375**) | 584.901, 584.937, 584.908 (**584.908**) | -0.080% |
+
+### Rebase round against a373f11b without 060d446a — result (MEASURED, superseded by the final campaign)
+
+**The gate is not met in 4 of 144 cells.** Every non-SMC cell is within +0.5 %:
+117 cells, worst +0.339 % (`call-ret`, Alias); the twenty-bit paths are at
+−1.97 % to +0.064 %. Every store-probe cell is below the base (worst −0.077 %).
+The SMC cells on the Alias and the I286/I386 paths pass (−0.80 % to +0.17 %). On
+the twenty-bit paths each process lands in one of two values about 0.6 % apart, as
+the C4a round found, so these cells were measured over repeated processes:
+`smc-next-1` and `smc-rmw-64` pass on the median of processes (at most +0.478 %);
+`smc-next-64` misses on I8088, I8086, V20 and V30 at +0.657 % to +0.683 %. Within
+one mode it changes by +0.005 % to +0.206 %. The miss is in how often a process
+takes the upper value: 13 of 15 candidate processes against 3 of 15 base
+processes. What selects the value is not known (ASSUMED, as in C4a: per-process
+hash seeds and heap addresses). The two designs this round allows were spent on
+the twenty-bit memory cells below, so this is the best state.
+
+### Rebase round: what the rebased tree needed — MEASURED / READ
+
+- The rebased tree as handed over (WIP 9b3c4f15) missed 26 of 144 cells, all on
+  the twenty-bit paths, in one interleaved campaign: `load` and `load-odd`
+  +1.20 % to +1.23 %, `call-ret` +1.00 %, `push-pop` +0.92 %, `dos-mixed` +0.70 %,
+  `straight-line` +0.68 % (I8088, I8086), `store` +0.54 % to +0.56 % (MEASURED).
+  Two causes (READ, objdump): `interp::i8086::read` and `write` saved 10
+  callee-saved registers instead of 2, because their byte loops kept values live
+  across the cold span call; `execute_shared20` grew from 708 to 912 bytes and
+  saved 12 registers instead of 4, to keep its arguments for the re-execution.
+- Design 1, the one-byte guard in the scalar `*_spanning` entry points: the
+  twenty-bit byte helpers have the base's code again (READ). The twenty-bit memory
+  cells fell to +0.20 % to +0.48 % (MEASURED).
+- Design 2, no re-execution on the twenty-bit walk: `execute_shared20` has the
+  base's code except one branch condition (READ). The twenty-bit non-SMC cells are
+  now at −1.97 % to +0.064 % (MEASURED, table below).
+- C4a changed `execute_shared` so that a twenty-bit `ModeChange` leaves the
+  boundary to the dispatcher. `split_shared` follows the rule for the other walks,
+  and with design 2 it never runs on the twenty-bit walk (READ).
+
+### Rebase round: measurement method — MEASURED
+
+- Base: a373f11b with 060d446a reverted, code only, as handed over (uncommitted).
+  Candidate: the rebased tree with designs 1 and 2. Each is built from its own
+  source snapshot into its own target directory, with the release profile as
+  committed, `CARGO_BUILD_JOBS=4`, the same toolchain and the same host (Apple M5
+  Pro, macOS, aarch64). The final tree produces the same `__text` bytes as the
+  measured candidate.
+- `real16_loops 1 3 <workload>` for all 16 workloads and all nine paths it has
+  (Alias, I8088, I8086, V20, V30, I286, I386, and I286/I386 with A20 off): 144
+  cells, each the median of three rounds in one process. Base and candidate
+  alternate for each workload, and the order rotates between workloads.
+- SMC cells: extra interleaved processes per side (15 for `smc-next-64`, 11 for
+  `smc-next-1`, 5 for `smc-rmw-64`). A cell is the median over processes; the mode
+  columns split the values at the largest gap (twenty-bit paths only).
+- Store probe: as above, three rounds of all eight cells, in rotating side order.
+- One benchmark process at a time; builds and test runs shared the host.
+
+### Rebase round: change in host instructions per guest step, one process per side — MEASURED
+
+| Workload | Alias | I8088 | I8086 | V20 | V30 | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `alu` | +0.205% | -0.432% | -0.383% | -0.378% | -0.373% | +0.187% | +0.180% | +0.189% | +0.188% |
+| `load` | +0.230% | -0.386% | -0.336% | -0.366% | -0.382% | +0.191% | +0.185% | +0.224% | +0.220% |
+| `load-odd` | +0.222% | -0.414% | -0.384% | -0.363% | -0.406% | +0.160% | +0.180% | +0.172% | +0.196% |
+| `store` | +0.234% | -0.376% | -0.395% | -0.396% | -0.403% | +0.162% | +0.157% | +0.209% | +0.175% |
+| `push-pop` | +0.165% | -0.194% | -0.205% | -0.231% | -0.232% | +0.159% | +0.142% | +0.164% | +0.161% |
+| `data-next-to-code` | +0.089% | -0.144% | -0.239% | -0.191% | -0.199% | +0.086% | +0.053% | +0.063% | +0.055% |
+| `data-next-to-dense-code` | +0.049% | -0.162% | -0.212% | -0.224% | -0.231% | +0.058% | +0.036% | +0.033% | +0.039% |
+| `call-ret` | +0.339% | -0.551% | -0.529% | -0.516% | -0.542% | +0.324% | +0.311% | +0.323% | +0.310% |
+| `dos-mixed` | +0.085% | -0.318% | -0.310% | -0.315% | -0.305% | +0.081% | +0.081% | +0.079% | +0.081% |
+| `rep-movsw` | -0.009% | -0.013% | -0.002% | +0.001% | -0.007% | -0.035% | -0.011% | -0.046% | -0.019% |
+| `straight-line` | -0.056% | +0.064% | -0.095% | -0.121% | -0.142% | +0.000% | +0.095% | +0.002% | +0.003% |
+| `ip-boundary-1` | -1.483% | -1.971% | -1.958% | -1.969% | -1.964% | -1.510% | -1.510% | -1.506% | -1.511% |
+| `ip-boundary-64` | +0.191% | -0.754% | -0.753% | -0.761% | -0.751% | +0.154% | +0.163% | +0.154% | +0.154% |
+| `smc-next-1` | -0.452% | +0.446% | +0.458% | +0.437% | +0.381% | -0.771% | -0.796% | -0.771% | -0.782% |
+| `smc-next-64` | -0.101% | +0.613% | +0.571% | +0.572% | +0.594% | -0.094% | -0.092% | -0.085% | -0.089% |
+| `smc-rmw-64` | +0.162% | +0.550% | +0.580% | +0.558% | +0.568% | -0.143% | -0.163% | -0.159% | -0.165% |
+
+The SMC rows of this table are single processes; the next table replaces them.
+
+### Rebase round: SMC cells over repeated processes — MEASURED
+
+| Workload | Path | Processes (base / candidate) | Median of processes | Lower mode | Upper mode |
+|---|---|---:|---:|---:|---:|
+| `smc-next-1` | Alias | 11 / 11 | 10710.5→10686.8 (-0.221%) | -0.221% (one mode) | – |
+| `smc-next-1` | I8088 | 11 / 11 | 21539.2→21631.3 (+0.428%) | +0.428% (one mode) | – |
+| `smc-next-1` | I8086 | 11 / 11 | 21541.2→21621.7 (+0.374%) | -0.172% (11/5) | n/a (0/6) |
+| `smc-next-1` | V20 | 11 / 11 | 21936.9→22018.6 (+0.372%) | -0.163% (11/5) | n/a (0/6) |
+| `smc-next-1` | V30 | 11 / 11 | 21935.9→22014.6 (+0.359%) | -0.166% (11/5) | n/a (0/6) |
+| `smc-next-1` | I286 | 11 / 11 | 5405.5→5363.9 (-0.770%) | -0.770% (one mode) | – |
+| `smc-next-64` | Alias | 15 / 15 | 8887.9→8899.6 (+0.132%) | +0.132% (one mode) | – |
+| `smc-next-64` | I8088 | 15 / 15 | 19700.2→19831.6 (+0.667%) | +0.005% (12/2) | +0.206% (3/13) |
+| `smc-next-64` | I8086 | 15 / 15 | 19702.6→19837.1 (+0.683%) | +0.029% (12/2) | +0.185% (3/13) |
+| `smc-next-64` | V20 | 15 / 15 | 20096.5→20233.3 (+0.681%) | +0.040% (12/2) | +0.181% (3/13) |
+| `smc-next-64` | V30 | 15 / 15 | 20098.9→20231.1 (+0.657%) | +0.043% (12/2) | +0.148% (3/13) |
+| `smc-next-64` | I286 | 15 / 15 | 3701.7→3698.7 (-0.082%) | -0.082% (one mode) | – |
+| `smc-rmw-64` | Alias | 5 / 5 | 8994.8→8993.1 (-0.019%) | -0.019% (one mode) | – |
+| `smc-rmw-64` | I8088 | 5 / 5 | 20447.6→20545.4 (+0.478%) | +0.047% (3/2) | +0.079% (2/3) |
+| `smc-rmw-64` | I8086 | 5 / 5 | 20451.6→20544.4 (+0.453%) | +0.017% (3/2) | +0.034% (2/3) |
+| `smc-rmw-64` | V20 | 5 / 5 | 20847.7→20936.2 (+0.425%) | +0.035% (3/2) | -0.029% (2/3) |
+| `smc-rmw-64` | V30 | 5 / 5 | 20843.7→20935.9 (+0.443%) | +0.002% (3/2) | +0.054% (2/3) |
+| `smc-rmw-64` | I286 | 5 / 5 | 4935.2→4927.5 (-0.156%) | -0.156% (one mode) | – |
+
+Lower and upper mode: the change of the median within that mode, with the number
+of base/candidate processes in it. "n/a" means one side has no process in that
+mode.
+
+### Rebase round: store probe, host instructions per store — MEASURED
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 298.072, 298.046, 298.064 (**298.064**) | 297.545, 297.576, 297.598 (**297.576**) | -0.164% |
+| 8 | single | on | 343.701, 343.764, 343.981 (**343.764**) | 343.341, 343.244, 343.376 (**343.341**) | -0.123% |
+| 8 | crossing | off | 334.271, 334.103, 334.105 (**334.105**) | 333.611, 333.533, 334.325 (**333.611**) | -0.148% |
+| 8 | crossing | on | 416.981, 417.102, 416.754 (**416.981**) | 416.225, 416.351, 416.351 (**416.351**) | -0.151% |
+| 32 | single | off | 593.441, 593.434, 593.419 (**593.434**) | 592.961, 593.012, 592.916 (**592.961**) | -0.080% |
+| 32 | single | on | 678.167, 678.178, 678.208 (**678.178**) | 677.658, 677.810, 677.607 (**677.658**) | -0.077% |
+| 32 | crossing | off | 593.716, 593.448, 593.407 (**593.448**) | 593.216, 592.985, 592.924 (**592.985**) | -0.078% |
+| 32 | crossing | on | 585.192, 585.165, 585.087 (**585.165**) | 584.712, 584.615, 584.578 (**584.615**) | -0.094% |
+
+### Review fixes after the rebase round — MEASURED / READ
+
+A review of the rebase-round tree found two regressions against 060d446a. Both
+are fixed; behaviour equals 060d446a again (MEASURED).
+
+- Real-mode interrupt delivery in the walk committed SP after each frame word. A
+  CS or IP word over two adjacent RAM regions missed after FLAGS was pushed, and
+  the re-execution pushed a second frame lower (Alias, INT n and INT3). The frame
+  helpers now perform such a span themselves (`read_across_regions` /
+  `write_across_regions` in `control::push16`, `pop16`, the ENTER display read and
+  the IVT reads), as the walk did at 060d446a. The reviewer's alternative (store
+  all three words, then commit SP once) would change the exit state of a frame
+  that meets a gap part-way, so it was not taken.
+- When the re-execution stopped at the first attempt's address with a host fault
+  (the operand's first byte host-protected), the first attempt's guest-map exit
+  was returned. The first exit is now kept only when the re-execution's exit is
+  itself a guest-map containment miss; otherwise the re-execution's exit, with its
+  HostAccess evidence, is returned.
+
+Evidence (MEASURED): scratch harnesses compared main at 6614d2e0, which carries
+060d446a, with this tree. They covered INT 21h, INT3, far CALL, PUSHA, ENTER,
+PUSHF, IRET, RETF, POPA and POPF on Alias, I286, I386, I8086 and V30, under `run`
+and `run_steps`, with every frame word in turn meeting the edge. Layouts:
+contained, RAM|RAM, gap on either side, Trap on either side, ROM on either side,
+an IVT entry over a RAM|RAM edge, a gap or a Trap byte, and a host-protected page
+part-way through the frame (contained and over a region edge at three offsets).
+All 10,200 + 2,560 outcomes are equal, including exit, fault metadata, SP and the
+other registers, flags, frame bytes, retirement and step counts. Host addresses
+were normalised.
+
+New permanent witnesses: in `cross_region_ram.rs`, module `reexecution`, an INT
+frame, every stack-frame helper, Real16 block accounting (a mid-block split and
+REP MOVSW, `run_steps` budgets 1–9) and Long64 block accounting (mid-block scalar
+and 16-byte splits on every tier, with and without the Trap window); in
+`cross_region_host_fault.rs`, a protected first byte (load and store, every tier,
+as the first instruction and after an INC). With the two fixes reverted, the INT
+frame and the protected first-byte witnesses fail; the others pass on both
+(MEASURED).
+
+Hot path, rebase-round candidate → this tree, one interleaved campaign (MEASURED):
+
+| Workload | Alias | I8088 | I8086 | V20 | V30 | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `alu` | -0.003% | +0.001% | -0.003% | -0.000% | -0.003% | +0.004% | -0.002% | -0.002% | -0.000% |
+| `load` | -0.001% | -0.002% | -0.003% | -0.013% | -0.009% | -0.002% | -0.001% | -0.001% | -0.006% |
+| `store` | -0.022% | -0.005% | -0.027% | -0.031% | -0.019% | -0.044% | -0.021% | -0.021% | -0.020% |
+| `push-pop` | -0.000% | +0.000% | -0.000% | -0.000% | +0.000% | -0.000% | +0.001% | +0.000% | +0.000% |
+| `call-ret` | +0.000% | +0.000% | -0.000% | +0.000% | -0.000% | +0.000% | +0.000% | +0.001% | +0.000% |
+| `dos-mixed` | -0.001% | +0.000% | -0.001% | -0.000% | -0.001% | -0.000% | +0.001% | -0.001% | -0.000% |
+| `ip-boundary-1` | +0.001% | +0.001% | +0.001% | -0.001% | +0.001% | -0.000% | +0.000% | +0.001% | +0.000% |
+
+Worst cell +0.004 % (`alu`, `legacy-i286`); 0 of 63 cells exceed +0.5 %.
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 297.517, 297.524, 297.525 (**297.524**) | 297.514, 297.529, 297.520 (**297.520**) | -0.001% |
+| 8 | single | on | 343.207, 343.204, 343.215 (**343.207**) | 343.209, 343.209, 343.212 (**343.209**) | +0.001% |
+| 8 | crossing | off | 333.523, 333.517, 333.520 (**333.520**) | 333.517, 333.526, 333.526 (**333.526**) | +0.002% |
+| 8 | crossing | on | 416.218, 416.219, 416.224 (**416.219**) | 416.224, 416.222, 416.226 (**416.224**) | +0.001% |
+| 32 | single | off | 592.911, 592.911, 592.910 (**592.911**) | 592.907, 592.916, 592.902 (**592.907**) | -0.001% |
+| 32 | single | on | 677.603, 677.605, 677.612 (**677.605**) | 677.604, 677.605, 677.603 (**677.604**) | -0.000% |
+| 32 | crossing | off | 592.908, 592.914, 592.909 (**592.909**) | 592.931, 592.922, 592.913 (**592.922**) | +0.002% |
+| 32 | crossing | on | 584.600, 584.608, 584.619 (**584.608**) | 584.591, 584.612, 584.596 (**584.596**) | -0.002% |
+
+### Round 1 against f15060b9: measurement method — MEASURED (history)
+
+- Sides: the commit before xj-ir6.12 (f15060b9, the gate base), the commit that
+  landed it (060d446a), and the candidate (060d446a plus this change). Each side is
+  built from its own source snapshot into its own target directory, with the release
+  profile as committed, `CARGO_BUILD_JOBS=4`, the same toolchain and the same host
+  (Apple M5 Pro, macOS, aarch64). Two builds of f15060b9 from different source paths
+  give identical binaries.
+- `real16_loops 1 3 <workload>` for every workload and every path: host
+  instructions per guest step, the median of three rounds. The three sides run one
+  after another for each workload, and the order rotates between workloads.
+- Store probe: the instrumented copy of `interpreter_store_probe` described above
+  (200000 iterations × 16 stores). Three rounds; in each round every cell runs once
+  per side, in rotating side order.
+- One benchmark process at a time. The formatted tree of this change produces the
+  same `__text` bytes as the measured candidate.
+
+### Round 1: host instructions per guest step, candidate against f15060b9 — MEASURED (history)
+
+| Workload | Alias | I286 A20 on | I386 A20 on | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 356.782→357.289 (+0.142%) | 362.542→363.042 (+0.138%) | 362.540→363.041 (+0.138%) | 362.541→363.034 (+0.136%) | 362.550→363.039 (+0.135%) |
+| `load` | 467.708→468.385 (+0.145%) | 477.703→478.375 (+0.141%) | 477.701→478.387 (+0.144%) | 477.709→478.392 (+0.143%) | 477.702→478.401 (+0.146%) |
+| `load-odd` | 478.724→479.366 (+0.134%) | 488.736→489.402 (+0.136%) | 488.724→489.396 (+0.138%) | 488.726→489.396 (+0.137%) | 488.729→489.402 (+0.138%) |
+| `store` | 431.062→431.711 (+0.151%) | 444.726→445.358 (+0.142%) | 444.721→445.369 (+0.146%) | 444.704→445.367 (+0.149%) | 444.709→445.370 (+0.149%) |
+| `push-pop` | 490.031→490.544 (+0.105%) | 488.547→489.038 (+0.101%) | 488.528→489.037 (+0.104%) | 488.520→489.041 (+0.107%) | 488.527→489.052 (+0.107%) |
+| `data-next-to-code` | 973.734→973.736 (+0.000%) | 988.746→988.734 (-0.001%) | 988.752→988.715 (-0.004%) | 988.735→988.748 (+0.001%) | 988.739→988.744 (+0.001%) |
+| `data-next-to-dense-code` | 973.728→973.752 (+0.002%) | 988.747→988.723 (-0.002%) | 988.750→988.755 (+0.001%) | 988.740→988.730 (-0.001%) | 988.748→988.733 (-0.002%) |
+| `call-ret` | 832.739→834.744 (+0.241%) | 903.436→905.434 (+0.221%) | 903.417→905.441 (+0.224%) | 903.440→905.450 (+0.222%) | 903.439→905.439 (+0.221%) |
+| `dos-mixed` | 452.772→453.106 (+0.074%) | 440.529→440.827 (+0.068%) | 440.522→440.825 (+0.069%) | 440.518→440.822 (+0.069%) | 440.516→440.829 (+0.071%) |
+| `rep-movsw` | 188.069→188.071 (+0.001%) | 188.067→188.069 (+0.001%) | 188.067→188.069 (+0.001%) | 188.066→188.067 (+0.001%) | 188.070→188.069 (-0.001%) |
+| `straight-line` | 410.523→410.561 (+0.009%) | 381.755→381.761 (+0.002%) | 381.789→381.797 (+0.002%) | 381.755→381.760 (+0.001%) | 381.842→381.799 (-0.011%) |
+| `ip-boundary-1` | 2267.744→2261.723 (-0.266%) | 2484.677→2476.528 (-0.328%) | 2484.701→2476.550 (-0.328%) | 2484.652→2476.556 (-0.326%) | 2484.726→2476.542 (-0.329%) |
+| `ip-boundary-64` | 340.813→341.515 (+0.206%) | 372.083→372.716 (+0.170%) | 372.086→372.730 (+0.173%) | 372.080→372.746 (+0.179%) | 372.107→372.723 (+0.166%) |
+| `smc-next-1` | 10828.131→10676.344 (-1.402%) | 5367.122→5356.687 (-0.194%) | 5237.989→5227.648 (-0.197%) | 5368.974→5358.563 (-0.194%) | 5239.984→5229.616 (-0.198%) |
+| `smc-next-64` | 9032.932→8865.753 (-1.851%) | 3693.429→3691.890 (-0.042%) | 3564.479→3563.048 (-0.040%) | 3695.490→3694.061 (-0.039%) | 3566.500→3564.953 (-0.043%) |
+| `smc-rmw-64` | 9142.926→8998.950 (-1.575%) | 4926.700→4920.987 (-0.116%) | 4777.958→4772.113 (-0.122%) | 4928.529→4922.905 (-0.114%) | 4779.964→4774.164 (-0.121%) |
+
+Worst cell +0.241 % (`call-ret`, `application-real16`); 0 of 80 cells exceed +0.5 %.
+
+Paths that the gate does not cover (`machine-i8088`, `machine-i8086`) move by
+−1.33 % to +1.29 % (worst `load`). At 060d446a they move by −1.16 % to +3.36 %
+(worst `rep-movsw`).
+
+### Round 1: store probe, candidate against f15060b9 — MEASURED (history)
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 297.596, 297.592, 297.592 (**297.592**) | 297.467, 297.462, 297.467 (**297.467**) | -0.042% |
+| 8 | single | on | 343.284, 343.285, 343.278 (**343.284**) | 343.166, 343.158, 343.156 (**343.158**) | -0.037% |
+| 8 | crossing | off | 333.635, 333.593, 333.601 (**333.601**) | 333.473, 333.477, 333.472 (**333.473**) | -0.038% |
+| 8 | crossing | on | 416.285, 416.340, 416.294 (**416.294**) | 416.172, 416.197, 416.172 (**416.172**) | -0.029% |
+| 32 | single | off | 592.983, 593.008, 592.999 (**592.999**) | 592.846, 592.862, 592.852 (**592.852**) | -0.025% |
+| 32 | single | on | 677.667, 677.723, 677.673 (**677.673**) | 677.570, 677.565, 677.539 (**677.565**) | -0.016% |
+| 32 | crossing | off | 592.986, 592.981, 592.975 (**592.981**) | 592.842, 592.864, 592.868 (**592.864**) | -0.020% |
+| 32 | crossing | on | 584.743, 584.695, 584.695 (**584.695**) | 584.556, 584.560, 584.590 (**584.560**) | -0.023% |
+
+Worst store cell -0.016 %.
+
+### Round 1: recovered amount, 060d446a against f15060b9 — MEASURED (history)
+
+The same campaign, with the commit that landed xj-ir6.12 as the candidate:
+
+| Workload | Alias | I286 A20 on | I386 A20 on | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 356.782→357.292 (+0.143%) | 362.542→367.043 (+1.242%) | 362.540→367.041 (+1.242%) | 362.541→367.029 (+1.238%) | 362.550→367.039 (+1.238%) |
+| `load` | 467.708→472.055 (+0.929%) | 477.703→486.717 (+1.887%) | 477.701→486.709 (+1.886%) | 477.709→486.718 (+1.886%) | 477.702→486.715 (+1.887%) |
+| `load-odd` | 478.724→480.056 (+0.278%) | 488.736→497.725 (+1.839%) | 488.724→497.720 (+1.841%) | 488.726→497.714 (+1.839%) | 488.729→497.711 (+1.838%) |
+| `store` | 431.062→433.039 (+0.459%) | 444.726→450.376 (+1.270%) | 444.721→450.380 (+1.272%) | 444.704→450.485 (+1.300%) | 444.709→450.377 (+1.275%) |
+| `push-pop` | 490.031→494.284 (+0.868%) | 488.547→499.032 (+2.146%) | 488.528→499.041 (+2.152%) | 488.520→499.056 (+2.157%) | 488.527→499.044 (+2.153%) |
+| `data-next-to-code` | 973.734→975.407 (+0.172%) | 988.746→994.075 (+0.539%) | 988.752→994.069 (+0.538%) | 988.735→994.071 (+0.540%) | 988.739→994.074 (+0.540%) |
+| `data-next-to-dense-code` | 973.728→975.401 (+0.172%) | 988.747→994.115 (+0.543%) | 988.750→994.086 (+0.540%) | 988.740→994.094 (+0.541%) | 988.748→994.124 (+0.544%) |
+| `call-ret` | 832.739→838.763 (+0.723%) | 903.436→917.103 (+1.513%) | 903.417→917.093 (+1.514%) | 903.440→917.104 (+1.512%) | 903.439→917.105 (+1.513%) |
+| `dos-mixed` | 452.772→455.723 (+0.652%) | 440.529→449.235 (+1.976%) | 440.522→449.248 (+1.981%) | 440.518→449.248 (+1.982%) | 440.516→449.247 (+1.982%) |
+| `rep-movsw` | 188.069→187.072 (-0.530%) | 188.067→187.073 (-0.529%) | 188.067→187.067 (-0.532%) | 188.066→187.072 (-0.529%) | 188.070→187.069 (-0.532%) |
+| `straight-line` | 410.523→411.852 (+0.324%) | 381.755→391.467 (+2.544%) | 381.789→391.464 (+2.534%) | 381.755→391.422 (+2.532%) | 381.842→391.423 (+2.509%) |
+| `ip-boundary-1` | 2267.744→2298.023 (+1.335%) | 2484.677→2518.759 (+1.372%) | 2484.701→2518.703 (+1.368%) | 2484.652→2518.740 (+1.372%) | 2484.726→2518.647 (+1.365%) |
+| `ip-boundary-64` | 340.813→341.712 (+0.264%) | 372.083→374.516 (+0.654%) | 372.086→374.520 (+0.654%) | 372.080→374.538 (+0.661%) | 372.107→374.547 (+0.656%) |
+| `smc-next-1` | 10828.131→10665.742 (-1.500%) | 5367.122→5394.672 (+0.513%) | 5237.989→5265.560 (+0.526%) | 5368.974→5396.626 (+0.515%) | 5239.984→5267.562 (+0.526%) |
+| `smc-next-64` | 9032.932→8841.244 (-2.122%) | 3693.429→3689.591 (-0.104%) | 3564.479→3560.593 (-0.109%) | 3695.490→3691.620 (-0.105%) | 3566.500→3562.598 (-0.109%) |
+| `smc-rmw-64` | 9142.926→8955.253 (-2.053%) | 4926.700→4920.130 (-0.133%) | 4777.958→4771.427 (-0.137%) | 4928.529→4922.083 (-0.131%) | 4779.964→4773.336 (-0.139%) |
+
+Worst cell +2.544 % (`straight-line`, `legacy-i286`); 57 of 80 cells exceed +0.5 %.
+
+| Width | Placement | Recovery | Baseline samples (median) | Candidate samples (median) | Change |
+|---|---|---|---|---|---:|
+| 8 | single | off | 297.596, 297.592, 297.592 (**297.592**) | 307.270, 307.290, 307.285 (**307.285**) | +3.257% |
+| 8 | single | on | 343.284, 343.285, 343.278 (**343.284**) | 337.719, 337.713, 337.717 (**337.717**) | -1.622% |
+| 8 | crossing | off | 333.635, 333.593, 333.601 (**333.601**) | 343.296, 343.289, 343.285 (**343.289**) | +2.904% |
+| 8 | crossing | on | 416.285, 416.340, 416.294 (**416.294**) | 395.714, 395.740, 395.748 (**395.740**) | -4.937% |
+| 32 | single | off | 592.983, 593.008, 592.999 (**592.999**) | 624.677, 624.671, 624.743 (**624.677**) | +5.342% |
+| 32 | single | on | 677.667, 677.723, 677.673 (**677.673**) | 693.117, 693.124, 693.102 (**693.117**) | +2.279% |
+| 32 | crossing | off | 592.986, 592.981, 592.975 (**592.981**) | 624.675, 624.726, 624.685 (**624.685**) | +5.347% |
+| 32 | crossing | on | 584.743, 584.695, 584.695 (**584.695**) | 612.119, 612.128, 612.128 (**612.128**) | +4.692% |
+
+Worst store cell +5.347 %.

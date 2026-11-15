@@ -1972,11 +1972,34 @@ impl<'a> DispatchGuard<'a> {
     }
 }
 
-impl Drop for DispatchGuard<'_> {
-    fn drop(&mut self) {
+impl DispatchGuard<'_> {
+    /// The run's chain and dispatch counts, with the shared cache's totals
+    /// updated; `drop` publishes them to the run's time statistics.
+    #[inline(always)]
+    fn take_counts(&mut self) -> (u64, crate::time_stats::DispatchCounts) {
         let counts = self.cpu.finish_dispatch_counts(self.vm, self.fast_before);
         let chains = std::mem::take(&mut self.cpu.chained);
         self.vm.cache.add_chained(chains);
+        (chains, counts)
+    }
+
+    /// The normal end of a run: the counts go to `finish`, in the same
+    /// thread-local access as the run's exit (`RunGuard::finish_with_counts`).
+    #[inline(always)]
+    fn finish(
+        mut self,
+        time_run: &crate::time_stats::RunGuard,
+        exit: Option<&Exit>,
+    ) -> crate::time_stats::Outside {
+        let (chains, counts) = self.take_counts();
+        std::mem::forget(self);
+        time_run.finish_with_counts(exit, chains, &counts)
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        let (chains, counts) = self.take_counts();
         crate::time_stats::dispatch_counts(chains, counts);
     }
 }
@@ -2960,11 +2983,14 @@ impl Vcpu {
                     );
             }
         }
-        drop(dispatch);
-        self.time_outside = time_run.finish(match &result.stop {
-            StepStop::Exit(exit) => Some(exit),
-            StepStop::IrqReady => None,
-        });
+        let outside = dispatch.finish(
+            &time_run,
+            match &result.stop {
+                StepStop::Exit(exit) => Some(exit),
+                StepStop::IrqReady => None,
+            },
+        );
+        self.time_outside = outside;
         Ok(result)
     }
 

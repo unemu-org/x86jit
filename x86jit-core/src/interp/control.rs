@@ -347,7 +347,7 @@ pub(crate) fn exec_enter_real<const ROUTED: bool, const ORDER: u8>(
         for _ in 1..level {
             bp = bp.wrapping_sub(2);
             cpu.gpr[RBP] = (cpu.gpr[RBP] & !0xFFFF) | bp as u64;
-            let w = match mem.read(ss_addr(cpu, bp), 2) {
+            let w = match mem.read_across_regions(ss_addr(cpu, bp), 2) {
                 Ok(v) => v as u16,
                 Err(t) => {
                     return Some(trap_out(
@@ -543,6 +543,12 @@ fn ss_addr(cpu: &CpuState, sp: u16) -> u64 {
 /// Push a 16-bit word onto the real-mode stack SS:SP: `SP -= 2` (16-bit wrap), then
 /// store at SS:SP. Returns the trap on a faulting store (RIP left on `cur_addr`), or
 /// `Ok(())` with SP committed. Used by `int`/`pushf`/IVT delivery.
+///
+/// SP is committed word by word, so the frame helpers are not restartable after a
+/// later word misses. A word over two adjacent RAM/ROM regions is therefore stored
+/// here (`write_across_regions`) instead of being left to the re-execution after a
+/// containment miss (`interp::split_block`); `pop16` and the frame helpers' other
+/// reads do the same.
 fn push16<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
@@ -551,7 +557,7 @@ fn push16<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<(), InterpResult> {
     let sp = (cpu.gpr[RSP] as u16).wrapping_sub(2);
     let addr = ss_addr(cpu, sp);
-    if let Err(t) = mem.write(addr, word as u64, 2) {
+    if let Err(t) = mem.write_across_regions(addr, word as u64, 2) {
         return Err(trap_out(
             cpu,
             cur_addr,
@@ -577,7 +583,7 @@ fn pop16<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<u16, InterpResult> {
     let sp = cpu.gpr[RSP] as u16;
     let addr = ss_addr(cpu, sp);
-    match mem.read(addr, 2) {
+    match mem.read_across_regions(addr, 2) {
         Ok(v) => {
             let nsp = sp.wrapping_add(2);
             cpu.gpr[RSP] = (cpu.gpr[RSP] & !0xFFFF) | nsp as u64;
@@ -697,11 +703,11 @@ pub(crate) fn deliver_interrupt_mode<const ROUTED: bool, const ORDER: u8>(
     cpu.flags.if_ = false;
     // Vector through the IVT: IP = [vector*4], CS = [vector*4 + 2].
     let ivt = vector as u64 * 4;
-    let new_ip = match mem.read(ivt, 2) {
+    let new_ip = match mem.read_across_regions(ivt, 2) {
         Ok(v) => v as u16,
         Err(t) => return trap_out(cpu, cur_addr, t, ivt, 2, AccessKind::Read, 0),
     };
-    let new_cs = match mem.read(ivt + 2, 2) {
+    let new_cs = match mem.read_across_regions(ivt + 2, 2) {
         Ok(v) => v as u16,
         Err(t) => return trap_out(cpu, cur_addr, t, ivt + 2, 2, AccessKind::Read, 0),
     };

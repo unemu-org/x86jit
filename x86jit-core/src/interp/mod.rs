@@ -22,7 +22,7 @@ use crate::ir::{
     Cond, FPrec, FenceKind, FlagMask, FloatBinOp, FloatUnOp, HFloatOp, HIntOp, IrBlock, IrOp,
     PackedBinOp, RepKind, StrOp, VLogicOp, Val,
 };
-use crate::memory::{Access, InterpreterMemory, MemTrap, Memory, RunningMemory};
+use crate::memory::{Access, InterpreterMemory, MemTrap, Memory, RunningMemory, SplitMemory};
 use crate::state::{CpuState, Flags, Reg};
 
 /// `gpr[]` slot for RSP (used by push/pop-style stack ops in Call/Ret).
@@ -504,10 +504,29 @@ pub(crate) fn interpret_block_mode<const ROUTED: bool>(
     scratch: &mut impl ScratchBuffer,
     info: &mut RetireInfo,
 ) -> StepResult {
-    if cpu.mxcsr & softfloat::MODE_MASK == 0 {
-        interpret_block_fp::<ROUTED, true>(ir, cpu, mem, scratch, info).into_step()
+    let result = if cpu.mxcsr & softfloat::MODE_MASK == 0 {
+        interpret_block_fp::<ROUTED, true>(ir, cpu, mem, scratch, info)
     } else {
-        interpret_block_fp::<ROUTED, false>(ir, cpu, mem, scratch, info).into_step()
+        interpret_block_fp::<ROUTED, false>(ir, cpu, mem, scratch, info)
+    };
+    // `step_one` and `interpret_block` callers handle the miss here, out of the
+    // dispatchers' hot walks.
+    match result {
+        BlockResult::Exit(exit @ InterpExit::DetailedUnmapped { .. }) => {
+            match split_application::<ROUTED, false, false>(
+                exit.into_exit(),
+                ir,
+                cpu,
+                mem,
+                scratch,
+                info,
+                &mut StepContext::default(),
+            ) {
+                Ok(result) => result.into_step(),
+                Err(exit) => StepResult::Exit(exit),
+            }
+        }
+        result => result.into_step(),
     }
 }
 
@@ -658,58 +677,71 @@ fn interpret_block_inner<
         started: &started,
     };
     let mem = Access::<ROUTED, ORDER, _>::new(&running);
-    let result = if STEPPED {
-        walk_ops::<
-            RETRY,
-            ROUTED,
-            DEFAULT,
-            false,
-            ORDER,
-            STEPPED,
-            STOP_WHEN_IRQ_READY,
-            MACHINE,
-            STR_MMIO,
-            DIRECT20,
-        >(
-            ir,
-            cpu,
-            mem,
-            temps,
-            &cur_addr,
-            &mut retired,
-            &started,
-            &mut shadows,
-            info.exit_request,
-            info.trace,
-            &mut *steps,
-            (),
-        )
+    macro_rules! walk {
+        ($mem:expr) => {
+            if STEPPED {
+                walk_ops::<
+                    RETRY,
+                    ROUTED,
+                    DEFAULT,
+                    false,
+                    ORDER,
+                    STEPPED,
+                    STOP_WHEN_IRQ_READY,
+                    MACHINE,
+                    STR_MMIO,
+                    DIRECT20,
+                >(
+                    ir,
+                    cpu,
+                    $mem,
+                    temps,
+                    &cur_addr,
+                    &mut retired,
+                    &started,
+                    &mut shadows,
+                    info.exit_request,
+                    info.trace,
+                    &mut *steps,
+                    (),
+                )
+            } else {
+                walk_ops::<
+                    RETRY,
+                    ROUTED,
+                    DEFAULT,
+                    false,
+                    ORDER,
+                    STEPPED,
+                    STOP_WHEN_IRQ_READY,
+                    MACHINE,
+                    STR_MMIO,
+                    DIRECT20,
+                >(
+                    ir,
+                    cpu,
+                    $mem,
+                    temps,
+                    &cur_addr,
+                    &mut retired,
+                    &started,
+                    &mut shadows,
+                    info.exit_request,
+                    info.trace,
+                    (),
+                    (),
+                )
+            }
+        };
+    }
+    // A retry walk (an MMIO resume or the re-execution after a containment miss,
+    // see `split_block`) performs a miss over adjacent RAM/ROM regions through
+    // `SplitMemory`. A first attempt keeps the containment-only provider: its walk
+    // is the one compiled without split support.
+    let result = if RETRY {
+        walk!(Access::<ROUTED, ORDER, _>::new(&SplitMemory(&running)))
     } else {
-        walk_ops::<
-            RETRY,
-            ROUTED,
-            DEFAULT,
-            false,
-            ORDER,
-            STEPPED,
-            STOP_WHEN_IRQ_READY,
-            MACHINE,
-            STR_MMIO,
-            DIRECT20,
-        >(
-            ir,
-            cpu,
-            mem,
-            temps,
-            &cur_addr,
-            &mut retired,
-            &started,
-            &mut shadows,
-            info.exit_request,
-            info.trace,
-            (),
-            (),
-        )
+        walk!(mem)
     };
     if STEPPED && steps.cut {
         started.set(1);
@@ -777,6 +809,223 @@ fn interpret_block_inner<
     info.sti_shadow = shadows.bits & ShadowState::STI != 0;
     info.ss_shadow = shadows.bits & ShadowState::SS != 0;
     result
+}
+
+// --- Re-execution after a containment miss over adjacent regions ---
+//
+// spec.md "Data accesses across adjacent regions". The walk's transfers are
+// containment-only, so a data access whose bytes lie in two or more adjacent
+// RAM/ROM regions ends the first attempt with the usual `UnmappedMemory` exit.
+// Where that exit is already handled (the dispatchers' exit arms,
+// `execute_shared`, `interpret_block_mode`), `split_block` walks the rest of the
+// block again from that instruction through the retry walk, whose `SplitMemory`
+// provider performs such a span. Re-execution is restart-safe for the reason an
+// embedder's retry after mapping is: a fault exit leaves the instruction's
+// registers uncommitted (§16; SDM Vol 3A §§7.5-7.6), stores the instruction made
+// before the miss are made again with the same values, and completed REP
+// iterations have already advanced their registers. The real-mode frame helpers
+// (`control::push16` and its users) commit SP between transfers, so they perform
+// such a span themselves and never reach the re-execution with a partial frame.
+// The rest of the block ends where the block ends, so retirement, step and block
+// accounting equal one walk of the block.
+
+/// Whether the first attempt's `UnmappedMemory` exit at `addr` may be a data
+/// containment miss over adjacent RAM/ROM regions, with no device or port transfer
+/// of the instruction in flight. A false positive re-executes the instruction into
+/// the same exit, repeating only the restart-safe work described above; the
+/// first exit is then returned unchanged, except that a host fault at the same
+/// access returns the re-execution's exit, which carries the host evidence.
+fn split_candidate(cpu: &CpuState, memory: &Memory, addr: u64, access: AccessKind) -> bool {
+    access != AccessKind::Execute
+        && !cpu.mmio_retry_active
+        && cpu.pending_mmio.is_none()
+        && !cpu.pending_mmio_write
+        && cpu.pending_port_in.is_none()
+        && cpu.port_string_in.is_none()
+        && memory.continues_into_adjacent(addr)
+}
+
+/// The ops of `ir` from the instruction at `ip` to its end, as a block of its own
+/// (the block the lifter forms at `ip`, ending where `ir` ends).
+fn block_suffix(ir: &IrBlock, ip: u64) -> Option<IrBlock> {
+    let offset = ip.checked_sub(ir.guest_start)?;
+    if offset >= u64::from(ir.guest_len) {
+        return None;
+    }
+    let start = ir
+        .ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == ip))?;
+    let ops = ir.ops[start..].to_vec();
+    let icount = ops
+        .iter()
+        .filter(|op| matches!(op, IrOp::InsnStart { .. }))
+        .count() as u32;
+    Some(IrBlock {
+        mode: ir.mode,
+        guest_start: ip,
+        guest_len: ir.guest_len - offset as u32,
+        icount,
+        temp_count: ir.temp_count,
+        ops,
+        legacy_context: ir.legacy_context,
+    })
+}
+
+/// Re-execute the rest of `ir` from the instruction at `cpu.rip` after the first
+/// attempt's exit `first`, through the retry walk (`SplitMemory`); `info` and
+/// `steps` continue from the first attempt and retirement accumulates over both
+/// walks. `Err(first)` returns the first attempt's exit, evidence included: it is
+/// no candidate, or the re-execution stopped at the same access, without
+/// completing an instruction, with a guest-map containment miss of its own (a gap,
+/// a Trap byte, or a locked operand, none of which `SplitMemory` performs). Any
+/// other exit there, such as a host fault at the operand's first byte, is the
+/// re-execution's, with its own evidence.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn split_block<
+    const ROUTED: bool,
+    const DEFAULT: bool,
+    const ORDER: u8,
+    const STEPPED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+    const MACHINE: bool,
+    const STR_MMIO: bool,
+    const DIRECT20: bool,
+>(
+    first: Exit,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    info: &mut RetireInfo,
+    steps: &mut StepContext,
+) -> Result<BlockResult, Exit> {
+    let (addr, access) = match first {
+        Exit::UnmappedMemory { addr, access, .. } if split_candidate(cpu, memory, addr, access) => {
+            (addr, access)
+        }
+        _ => return Err(first),
+    };
+    let Some(rest) = block_suffix(ir, cpu.rip) else {
+        return Err(first);
+    };
+    let before = (info.retired, info.sti_shadow, info.ss_shadow);
+    let result = interpret_block_inner::<
+        true,
+        ROUTED,
+        DEFAULT,
+        ORDER,
+        STEPPED,
+        STOP_WHEN_IRQ_READY,
+        MACHINE,
+        STR_MMIO,
+        DIRECT20,
+    >(
+        &rest,
+        cpu,
+        Access::<ROUTED, ORDER>::new(memory),
+        scratch,
+        info,
+        steps,
+    );
+    if info.retired == 0 {
+        if let BlockResult::Exit(InterpExit::DetailedUnmapped {
+            addr: at,
+            access: kind,
+        }) = result
+        {
+            if at == addr && kind == access {
+                let again = InterpExit::DetailedUnmapped {
+                    addr: at,
+                    access: kind,
+                }
+                .into_exit();
+                // Keep the first exit only for the same guest-map containment
+                // miss; a host fault found by the span keeps its own evidence.
+                if again.fault_metadata().is_none_or(|detail| {
+                    detail.origin() == crate::FaultOrigin::GuestMap
+                        && detail.raw_host_fault().is_none()
+                }) {
+                    (info.retired, info.sti_shadow, info.ss_shadow) = before;
+                    return Err(first);
+                }
+                info.retired += before.0;
+                return Ok(BlockResult::Exit(InterpExit::from_exit(again)));
+            }
+        }
+    }
+    info.retired += before.0;
+    Ok(result)
+}
+
+/// [`split_block`] for an application block walked by [`interpret_block_fp`]
+/// (`STEPPED` false) or [`interpret_block_steps`].
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn split_application<
+    const ROUTED: bool,
+    const STEPPED: bool,
+    const STOP_WHEN_IRQ_READY: bool,
+>(
+    first: Exit,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    info: &mut RetireInfo,
+    steps: &mut StepContext,
+) -> Result<BlockResult, Exit> {
+    macro_rules! split {
+        ($default:literal, $order:literal) => {
+            split_block::<
+                ROUTED,
+                $default,
+                $order,
+                STEPPED,
+                STOP_WHEN_IRQ_READY,
+                false,
+                true,
+                false,
+            >(first, ir, cpu, memory, scratch, info, steps)
+        };
+    }
+    macro_rules! ordered {
+        ($default:literal) => {{
+            #[cfg(target_arch = "aarch64")]
+            match info.consistency {
+                crate::MemConsistency::AcqRel => return split!($default, 1),
+                crate::MemConsistency::FullTso => return split!($default, 2),
+                crate::MemConsistency::Fast => {}
+            }
+            split!($default, 0)
+        }};
+    }
+    if cpu.mxcsr & softfloat::MODE_MASK == 0 {
+        ordered!(true)
+    } else {
+        ordered!(false)
+    }
+}
+
+/// [`split_block`] for a Machine block walked by [`interpret_direct_steps`].
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn split_direct<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
+    first: Exit,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    info: &mut RetireInfo,
+    steps: &mut StepContext,
+) -> Result<BlockResult, Exit> {
+    split_block::<ROUTED, true, ORDER, true, false, true, true, DIRECT20>(
+        first, ir, cpu, memory, scratch, info, steps,
+    )
 }
 
 #[cold]
@@ -8517,7 +8766,7 @@ impl<M: StrMem> StrMem for Preflighted<'_, M> {
 
 /// [`Preflighted`] whose store returns a containment miss instead of performing it
 /// across adjacent regions (`write_preflighted_contained`): the first transfer of a
-/// store whose later transfers are not yet checked.
+/// store whose later transfers are not yet checked. Only [`vstore16_split`] uses it.
 struct Contained<'a, M>(&'a M);
 impl<const ROUTED: bool, M: InterpreterMemory> StrMem for Contained<'_, Access<ROUTED, 0, M>> {
     fn sload(&self, addr: u64, elem: u8) -> Result<u64, MemTrap> {
@@ -8660,9 +8909,9 @@ fn vpopcnt_lanes(a: [u128; 4], lane: u8) -> [u128; 4] {
 
 /// Store a 128-bit vector value. The error carries the faulting sub-transfer — see
 /// [`vload`].
-fn vstore<const ROUTED: bool, const ORDER: u8>(
+fn vstore<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    mem: &Access<ROUTED, ORDER, M>,
     cur_addr: u64,
     addr: u64,
     v: u128,
@@ -8686,20 +8935,37 @@ fn vstore<const ROUTED: bool, const ORDER: u8>(
             });
         }
     }
-    if size == 16 {
-        // The first transfer is stored only when one region contains it; a miss
-        // checks both transfers before either is written (vstore_across).
-        match vpart_store(cpu, &Contained(mem), cur_addr, addr, v as u64, 8) {
-            Ok(()) => {}
-            Err(miss) if miss.trap == MemTrap::Unmapped => {
-                return vstore_across(cpu, mem, cur_addr, addr, v, miss)
-            }
-            Err(fault) => return Err(fault),
-        }
-        let mem = &Preflighted(mem);
-        return vpart_store(cpu, mem, cur_addr, addr + 8, (v >> 64) as u64, 8);
+    // A constant of the provider type: the walk's containment-only provider
+    // compiles no split path.
+    if M::SPLIT && size == 16 {
+        return vstore16_split(cpu, mem, cur_addr, addr, v);
     }
     vstore_parts(cpu, mem, cur_addr, addr, v, size)
+}
+
+/// A 16-byte [`vstore`] whose provider performs a span over adjacent regions
+/// (`Memory`, and `SplitMemory` on the re-execution after a containment miss, see
+/// [`split_block`]). The first transfer is stored only when one region contains
+/// it; a miss checks both transfers before either is written ([`vstore_across`]).
+/// Out of line, so the first attempt's `vstore` keeps its containment-only shape.
+#[cold]
+#[inline(never)]
+fn vstore16_split<const ROUTED: bool>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, 0, impl InterpreterMemory>,
+    cur_addr: u64,
+    addr: u64,
+    v: u128,
+) -> Result<(), VecFault> {
+    match vpart_store(cpu, &Contained(mem), cur_addr, addr, v as u64, 8) {
+        Ok(()) => {}
+        Err(miss) if miss.trap == MemTrap::Unmapped => {
+            return vstore_across(cpu, mem, cur_addr, addr, v, miss)
+        }
+        Err(fault) => return Err(fault),
+    }
+    let mem = &Preflighted(mem);
+    vpart_store(cpu, mem, cur_addr, addr + 8, (v >> 64) as u64, 8)
 }
 
 /// Containment miss of the first transfer of a 16-byte [`vstore`]. Its bytes may
@@ -9223,9 +9489,9 @@ impl StrMem for Memory {
                 self.host_base() as usize,
                 self.guest_base(),
                 (
-                    |a, n| self.probe_write_mode::<false>(a, n),
+                    |a, n| self.probe_write_spanning::<false>(a, n),
                     |a, n| {
-                        self.probe_write_mode::<true>(a, n)?;
+                        self.probe_write_spanning::<true>(a, n)?;
                         self.region_end(a)
                     },
                 ),

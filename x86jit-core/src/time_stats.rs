@@ -603,7 +603,33 @@ impl RunGuard {
         let previous = LOCAL.with(|l| l.replace(current));
         Self { previous, record }
     }
+    // Codegen pin, once per run: out of line, with the TLS access inlined in this
+    // module. `LocalKey::with` is not `#[inline]`, so whether it inlines here depends
+    // on which codegen unit holds its instance; `try_with` is `#[inline]`. The
+    // destroyed-key path still panics through `with`, with its message.
+    #[inline(never)]
     pub(crate) fn finish(&self, exit: Option<&crate::Exit>) -> Outside {
+        self.finish_run(exit, None)
+    }
+    /// [`Self::finish`] that also adds the run's dispatch counts, as
+    /// [`dispatch_counts`] does, in the same thread-local access. A dispatcher
+    /// that inlined `dispatch_counts` reached the thread-local through an accessor
+    /// call whenever codegen-unit placement kept that accessor out of its unit.
+    #[inline(never)]
+    pub(crate) fn finish_with_counts(
+        &self,
+        exit: Option<&crate::Exit>,
+        chains: u64,
+        counts: &DispatchCounts,
+    ) -> Outside {
+        self.finish_run(exit, Some((chains, counts)))
+    }
+    #[inline(always)]
+    fn finish_run(
+        &self,
+        exit: Option<&crate::Exit>,
+        dispatch: Option<(u64, &DispatchCounts)>,
+    ) -> Outside {
         let kind = match exit {
             Some(crate::Exit::Syscall) => 0,
             Some(crate::Exit::UnmappedMemory { .. } | crate::Exit::Exception { .. }) => 1,
@@ -614,22 +640,28 @@ impl RunGuard {
             Some(crate::Exit::BudgetExhausted) | None => 6,
             _ => 7,
         };
-        LOCAL.with(|l| {
-            let mut l = l.borrow_mut();
-            add(&mut l.values, EXITS + kind * 2, 1);
-            l.enabled.then(|| (kind, MonotonicTime::now()))
-        })
+        LOCAL
+            .try_with(|l| {
+                let mut l = l.borrow_mut();
+                if let Some((chains, counts)) = dispatch {
+                    add_dispatch(&mut l.values, chains, counts);
+                }
+                add(&mut l.values, EXITS + kind * 2, 1);
+                l.enabled.then(|| (kind, MonotonicTime::now()))
+            })
+            .unwrap_or_else(|_| LOCAL.with(|_| unreachable!()))
     }
 }
 pub(crate) fn dispatch_counts(chains: u64, counts: DispatchCounts) {
-    LOCAL.with(|l| {
-        let mut l = l.borrow_mut();
-        add(&mut l.values, CHAINS, chains);
-        add(&mut l.values, LOOKUPS, counts.lookups);
-        add(&mut l.values, MISSES, counts.misses);
-        add(&mut l.values, INDIRECT, counts.indirect);
-        add(&mut l.values, FETCH, counts.fetch_calls);
-    });
+    LOCAL.with(|l| add_dispatch(&mut l.borrow_mut().values, chains, &counts));
+}
+#[inline(always)]
+fn add_dispatch(values: &mut Counters, chains: u64, counts: &DispatchCounts) {
+    add(values, CHAINS, chains);
+    add(values, LOOKUPS, counts.lookups);
+    add(values, MISSES, counts.misses);
+    add(values, INDIRECT, counts.indirect);
+    add(values, FETCH, counts.fetch_calls);
 }
 
 impl Drop for RunGuard {

@@ -99,10 +99,27 @@ fn protect(vm: &Vm, prot: i32) {
 /// Run one qword access at `guard - 4` with the guard page protected; return the
 /// exit and the eight destination bytes (read back after unprotecting).
 fn case(tier: u8, routed: bool, store: bool, layout: &[(u64, u64, RegionKind)]) -> (Exit, Vec<u8>) {
+    let (exit, bytes, _, _) = case_at(tier, routed, store, layout, guard() - 4, false);
+    (exit, bytes)
+}
+
+/// [`case`] with the operand at `at`, after `inc rcx` when `lead` (so the access
+/// is not the first instruction of its block); also returns RCX and the
+/// retired-instruction count.
+fn case_at(
+    tier: u8,
+    routed: bool,
+    store: bool,
+    layout: &[(u64, u64, RegionKind)],
+    at: u64,
+    lead: bool,
+) -> (Exit, Vec<u8>, u64, u64) {
     let vm = vm(tier, routed, layout);
     let code_addr = BASE + 0x1000;
-    let at = guard() - 4;
     let mut a = CodeAssembler::new(64).unwrap();
+    if lead {
+        a.inc(rcx).unwrap();
+    }
     if store {
         a.mov(qword_ptr(rdi), rax).unwrap();
     } else {
@@ -122,7 +139,7 @@ fn case(tier: u8, routed: bool, store: bool, layout: &[(u64, u64, RegionKind)]) 
     }
     run(vm, at, store)
 }
-fn run(vm: Vm, at: u64, store: bool) -> (Exit, Vec<u8>) {
+fn run(vm: Vm, at: u64, store: bool) -> (Exit, Vec<u8>, u64, u64) {
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, BASE + 0x1000);
     cpu.set_reg(Reg::Rdi, at);
@@ -145,7 +162,7 @@ fn run(vm: Vm, at: u64, store: bool) -> (Exit, Vec<u8>) {
             b[0]
         })
         .collect();
-    (exit, bytes)
+    (exit, bytes, cpu.reg(Reg::Rcx), cpu.retired_instructions())
 }
 
 fn layouts() -> Vec<(&'static str, Layout)> {
@@ -217,4 +234,55 @@ fn protected_split_access_faults_like_contained() {
         }
     }
     assert!(failures.is_empty(), "failed cases: {failures:?}");
+}
+
+/// The operand's first byte is host-protected and a region edge lies inside the
+/// operand after it. The re-execution after the containment miss reaches the host
+/// fault at the operand's first byte, the address of the first attempt's miss; the
+/// exit keeps the host-fault evidence of the same access inside one region, on
+/// every tier, for a load and a store, as the block's first instruction and after
+/// an `inc rcx`.
+#[test]
+fn protected_first_byte_of_split_access_faults_like_contained() {
+    let end = BASE + (page() * 8) as u64;
+    let g = guard();
+    let contained: Layout = vec![(BASE, end, RegionKind::Ram)];
+    let split: Layout = vec![
+        (BASE, g + 4, RegionKind::Ram),
+        (g + 4, end, RegionKind::Ram),
+    ];
+    let mut failures = Vec::new();
+    for tier in 0..3u8 {
+        for store in [false, true] {
+            for lead in [false, true] {
+                let status = signal::child(|| {
+                    // SAFETY: the forked child owns its handlers and mapping.
+                    unsafe {
+                        signal::install();
+                    }
+                    let (want, _, want_count, want_retired) =
+                        case_at(tier, true, store, &contained, g, lead);
+                    let (exit, bytes, count, retired) = case_at(tier, true, store, &split, g, lead);
+                    assert_eq!(bytes, [0x53; 8], "tier={tier} store={store} lead={lead}");
+                    assert_eq!(
+                        format!("{exit:?}"),
+                        format!("{want:?}"),
+                        "tier={tier} store={store} lead={lead}"
+                    );
+                    assert_eq!(
+                        (count, retired),
+                        (want_count, want_retired),
+                        "tier={tier} store={store} lead={lead}"
+                    );
+                });
+                if status != 0 {
+                    failures.push((tier, store, lead, status));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "failed cases (tier, store, lead, status): {failures:?}"
+    );
 }

@@ -1477,6 +1477,7 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
 
 // x87 retains its existing RAM-only transfer contract. Segment checks happen in
 // Legacy::Address; this adapter splits each actual RAM transfer at the A20 gate.
+// A transfer over adjacent RAM/ROM regions is performed (the `*_spanning` paths).
 struct PhysicalFpMemory<'a, const ROUTED: bool> {
     memory: &'a Memory,
     a20_enabled: bool,
@@ -1505,7 +1506,7 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
                 legacy::physical_span_with_gate(self.a20_enabled, addr, buf.len().min(255) as u8);
             let (head, tail) = buf.split_at_mut(usize::from(part));
             self.memory
-                .read_ram_checked_mode::<ROUTED>(physical, head)
+                .read_ram_checked_spanning::<ROUTED>(physical, head)
                 .map_err(|at| addr + at.saturating_sub(physical))?;
             addr = u64::from((addr as u32).wrapping_add(u32::from(part)));
             buf = tail;
@@ -1522,7 +1523,7 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
                 linear,
                 (bytes.len() - offset).min(255) as u8,
             );
-            if let Err(trap) = self.memory.probe_write_mode::<ROUTED>(physical, part) {
+            if let Err(trap) = self.memory.probe_write_spanning::<ROUTED>(physical, part) {
                 let at = trap.fault_addr(physical);
                 crate::fault::record_fp_fault(
                     at,
@@ -1543,7 +1544,7 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
                 legacy::physical_span_with_gate(self.a20_enabled, addr, bytes.len().min(255) as u8);
             let (head, tail) = bytes.split_at(usize::from(part));
             self.memory
-                .write_ram_checked_mode::<ROUTED>(physical, head)
+                .write_ram_checked_spanning_observed::<ROUTED>(physical, head, self.memory)
                 .map_err(|at| addr + at.saturating_sub(physical))?;
             addr = u64::from((addr as u32).wrapping_add(u32::from(part)));
             bytes = tail;
@@ -2125,16 +2126,20 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
                 arm_ss: info.ss_shadow,
                 ..Outcome::default()
             }),
+            // The twenty-bit walk moves every data byte through a one-byte
+            // transfer (`interp::i8086`; lift/i8086.rs lowers loads, stores and
+            // strings to its Wrapped primitives), and a one-byte access lies in
+            // one region or in none. No containment miss over adjacent regions
+            // reaches this arm, so it keeps its pre-split shape.
+            exit if DIRECT20 => Err(qualify_shared_exit(exit)),
             exit => {
-                let exit = match exit {
-                    Exit::UnmappedMemory { addr, .. }
-                    | Exit::MmioRead { addr, .. }
-                    | Exit::MmioWrite { addr, .. } => {
-                        crate::fault::qualify_legacy_bus(exit, addr, addr)
-                    }
-                    _ => exit,
+                let exit = match split_shared::<ROUTED, ORDER, DIRECT20>(
+                    exit, ir, cpu, memory, scratch, &mut info, &mut steps,
+                ) {
+                    Ok(progress) => return progress,
+                    Err(exit) => exit,
                 };
-                Err(exit)
+                Err(qualify_shared_exit(exit))
             }
         },
     };
@@ -2145,6 +2150,68 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
         retired: info.retired,
         outcome: Some(outcome),
     }
+}
+
+#[inline(always)]
+fn qualify_shared_exit(exit: Exit) -> Exit {
+    match exit {
+        Exit::UnmappedMemory { addr, .. }
+        | Exit::MmioRead { addr, .. }
+        | Exit::MmioWrite { addr, .. } => crate::fault::qualify_legacy_bus(exit, addr, addr),
+        _ => exit,
+    }
+}
+
+/// [`execute_shared`]'s re-execution of the rest of its block after a containment
+/// miss over adjacent RAM/ROM regions (`interp::split_direct`): `Ok` with the
+/// block's progress over both walks, or `Err` with the first attempt's exit. The
+/// twenty-bit walk does not reach it (see `execute_shared`).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn split_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
+    first: Exit,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    info: &mut RetireInfo,
+    steps: &mut StepContext,
+) -> Result<Progress, Exit> {
+    let result = super::split_direct::<ROUTED, ORDER, DIRECT20>(
+        first, ir, cpu, memory, scratch, info, steps,
+    )?;
+    if info.retired != 0 {
+        cpu.rflags_system &= !(1 << 16);
+    }
+    let progress = |outcome| Progress {
+        steps: steps.steps,
+        retired: info.retired,
+        sti_shadow: info.sti_shadow,
+        ss_shadow: info.ss_shadow,
+        outcome,
+    };
+    let boundary = Outcome {
+        arm_sti: info.sti_shadow,
+        arm_ss: info.ss_shadow,
+        ..Outcome::default()
+    };
+    Ok(match result {
+        BlockResult::Continue | BlockResult::ModeChange => progress(None),
+        BlockResult::Exit(exit) => match exit.into_exit() {
+            Exit::BudgetExhausted if !cpu.mmio_retry_active && cpu.port_string_in.is_none() => {
+                progress(None)
+            }
+            Exit::BudgetExhausted => progress(Some(Ok(boundary))),
+            exit @ (Exit::Hlt | Exit::PortIo { .. } | Exit::Interrupted) => {
+                progress(Some(Ok(Outcome {
+                    exit: Some(exit),
+                    ..boundary
+                })))
+            }
+            exit => progress(Some(Err(qualify_shared_exit(exit)))),
+        },
+    })
 }
 
 // Keep the new operation shapes out of existing walks while sharing their source.

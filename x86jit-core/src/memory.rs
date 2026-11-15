@@ -2462,23 +2462,21 @@ impl Memory {
     /// Reporting the region's verdict without consuming anything is what the probe wants.
     pub fn probe_write(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
         if self.recover_host_faults {
-            self.probe_write_mode::<true>(addr, size)
+            self.probe_write_spanning::<true>(addr, size)
         } else {
-            self.probe_write_mode::<false>(addr, size)
+            self.probe_write_spanning::<false>(addr, size)
         }
     }
 
+    /// Containment only: a span that no single region contains is `Unmapped`.
+    /// [`Self::probe_write_spanning`] also accepts a span over adjacent regions.
     #[inline]
     pub(crate) fn probe_write_mode<const ROUTED: bool>(
         &self,
         addr: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        let region = match self.region_at(addr, size) {
-            Ok(region) => region,
-            Err(miss) => return self.probe_write_across(addr, size, miss, ROUTED),
-        };
-        match region.kind {
+        match self.region_at(addr, size)?.kind {
             RegionKind::Trap => Err(MemTrap::Mmio),
             RegionKind::Rom => Ok(()),
             RegionKind::Ram if !ROUTED => Ok(()),
@@ -2494,6 +2492,41 @@ impl Memory {
                 .map_err(|at| self.host_fault(at))
             }
         }
+    }
+
+    /// [`Self::probe_write_mode`] whose containment miss probes a span over adjacent
+    /// RAM/ROM regions ([`Self::probe_write_across`]). Only `region_at` reports
+    /// `Unmapped` there; a host fault is `HostFault`.
+    #[inline]
+    pub(crate) fn probe_write_spanning<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        match self.probe_write_mode::<ROUTED>(addr, size) {
+            Err(miss @ MemTrap::Unmapped) if size > 1 => {
+                self.probe_write_across(addr, size, miss, ROUTED)
+            }
+            result => result,
+        }
+    }
+
+    /// Whether the region holding `addr` is RAM or ROM and the byte after its end
+    /// lies in another RAM or ROM region. Every transfer whose span
+    /// [`Self::adjacent_span`] accepts starts in such a region, so a containment miss
+    /// at its base passes; a gap or a Trap byte at `addr` or at that end does not.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn continues_into_adjacent(&self, addr: u64) -> bool {
+        let data = |at: u64| {
+            self.regions
+                .iter()
+                .find(|r| r.start <= at && at - r.start < r.size as u64)
+                .filter(|r| r.kind != RegionKind::Trap)
+        };
+        data(addr)
+            .and_then(|r| r.start.checked_add(r.size as u64))
+            .is_some_and(|end| data(end).is_some())
     }
 
     /// Kinds of the adjacent regions covering `[addr, addr + len)` when no single
@@ -2570,11 +2603,18 @@ impl Memory {
         })
     }
 
-    // The containment misses of the transfer paths. Each is out of line and
+    // Spans over adjacent regions. The transfer paths (`read_mode`,
+    // `write_mode_observed`, `probe_write_mode` and the wide checked transfers) are
+    // containment-only. A containment miss reaches the functions below only one
+    // level up: the `*_spanning` entry points (the public scalar and wide API and
+    // the `Memory` interpreter provider, which serves the Machine bus helpers) and
+    // `SplitMemory`, the provider of the interpreter's re-execution of an
+    // instruction after such a miss (`interp::split_block`). Each is out of line and
     // non-generic (the recovery mode is a run-time flag; stores report SMC/watch
-    // notes through a callback), so a transfer path gains one cold call and its
-    // callers gain no instances. Any span `adjacent_span` rejects returns the
-    // containment miss unchanged.
+    // notes through a callback). Any span `adjacent_span` rejects returns the
+    // containment miss unchanged. A one-byte access lies in one region or in none,
+    // so the scalar `*_spanning` entry points call them only for a wider access;
+    // byte-wise callers (the twenty-bit bus helpers) keep the containment-only shape.
 
     /// Containment miss of [`Self::read_mode`]. A span over adjacent RAM/ROM
     /// regions is one contiguous host range and ROM reads exactly like RAM, so it is
@@ -2839,10 +2879,10 @@ impl Memory {
 
     /// The region containing `[addr, addr + size)`, or `Unmapped` if the range
     /// escapes every mapped region; a non-canonical miss is `NonCanonical`.
-    /// Shared by scalar read/write. Containment only: the data transfer paths hand
-    /// a miss out of line to the `*_across` functions, which perform a span covered
-    /// by adjacent RAM/ROM regions (see [`Self::adjacent_span`]); atomic operands
-    /// keep the miss.
+    /// Shared by scalar read/write. Containment only: a span covered by adjacent
+    /// RAM/ROM regions is performed one level up, by the `*_spanning` entry points
+    /// and `SplitMemory` (see [`Self::adjacent_span`]); atomic operands keep the
+    /// miss.
     fn region_at(&self, addr: u64, size: u8) -> Result<&Region, MemTrap> {
         let end = addr
             .checked_add(size as u64)
@@ -2923,21 +2963,41 @@ impl Memory {
     /// Wide checked transfer retaining the faulting byte for the FP helpers.
     pub(crate) fn read_ram_checked(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
         if self.recover_host_faults {
-            self.read_ram_checked_mode::<true>(addr, buf)
+            self.read_ram_checked_spanning::<true>(addr, buf)
         } else {
-            self.read_ram_checked_mode::<false>(addr, buf)
+            self.read_ram_checked_spanning::<false>(addr, buf)
         }
     }
 
+    /// [`Self::read_ram_checked_mode`] that also copies a span over adjacent RAM/ROM
+    /// regions ([`Self::read_ram_across`]).
+    #[inline(always)]
+    pub(crate) fn read_ram_checked_spanning<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        buf: &mut [u8],
+    ) -> Result<(), u64> {
+        if self.region_for(addr, buf.len()).is_none() {
+            return self.read_ram_across(addr, buf, ROUTED);
+        }
+        self.read_ram_checked_mode::<ROUTED>(addr, buf)
+    }
+
+    /// Containment only, as the scalar transfers.
     #[inline(always)]
     pub(crate) fn read_ram_checked_mode<const ROUTED: bool>(
         &self,
         addr: u64,
         buf: &mut [u8],
     ) -> Result<(), u64> {
-        let Some(region) = self.region_for(addr, buf.len()) else {
-            return self.read_ram_across(addr, buf, ROUTED);
-        };
+        let region = self.region_for(addr, buf.len()).ok_or_else(|| {
+            crate::fault::record_fp_fault(
+                addr,
+                buf.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
+        })?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(crate::fault::record_fp_fault(
                 addr,
@@ -2970,21 +3030,28 @@ impl Memory {
 
     pub(crate) fn write_ram_checked(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
         if self.recover_host_faults {
-            self.write_ram_checked_mode::<true>(addr, bytes)
+            self.write_ram_checked_spanning_observed::<true>(addr, bytes, self)
         } else {
-            self.write_ram_checked_mode::<false>(addr, bytes)
+            self.write_ram_checked_spanning_observed::<false>(addr, bytes, self)
         }
     }
 
+    /// [`Self::write_ram_checked_mode_observed`] that also stores a span over
+    /// adjacent RAM/ROM regions ([`Self::write_ram_across`]).
     #[inline(always)]
-    pub(crate) fn write_ram_checked_mode<const ROUTED: bool>(
+    pub(crate) fn write_ram_checked_spanning_observed<const ROUTED: bool>(
         &self,
         addr: u64,
         bytes: &[u8],
+        observer: &impl InterpreterMemory,
     ) -> Result<(), u64> {
-        self.write_ram_checked_mode_observed::<ROUTED>(addr, bytes, self)
+        if self.region_for(addr, bytes.len()).is_none() {
+            return self.write_ram_across_observed::<ROUTED>(addr, bytes, observer);
+        }
+        self.write_ram_checked_mode_observed::<ROUTED>(addr, bytes, observer)
     }
 
+    /// Containment only, as the scalar transfers.
     #[inline(always)]
     fn write_ram_checked_mode_observed<const ROUTED: bool>(
         &self,
@@ -2992,9 +3059,14 @@ impl Memory {
         bytes: &[u8],
         observer: &impl InterpreterMemory,
     ) -> Result<(), u64> {
-        let Some(region) = self.region_for(addr, bytes.len()) else {
-            return self.write_ram_across_observed::<ROUTED>(addr, bytes, observer);
-        };
+        let region = self.region_for(addr, bytes.len()).ok_or_else(|| {
+            crate::fault::record_fp_fault(
+                addr,
+                bytes.len(),
+                crate::FaultOrigin::GuestMap,
+                crate::AddressPrecision::TransferAddress,
+            )
+        })?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(crate::fault::record_fp_fault(
                 addr,
@@ -3039,22 +3111,34 @@ impl Memory {
     /// A `Trap` region yields `MemTrap::Mmio` (routed out as `Exit::MmioRead`).
     pub fn read(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
         if self.recover_host_faults {
-            self.read_mode::<true>(addr, size)
+            self.read_spanning::<true>(addr, size)
         } else {
-            self.read_mode::<false>(addr, size)
+            self.read_spanning::<false>(addr, size)
         }
     }
 
+    /// [`Self::read_mode`] whose containment miss reads a span over adjacent
+    /// RAM/ROM regions ([`Self::read_across`]).
+    #[inline]
+    pub(crate) fn read_spanning<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        size: u8,
+    ) -> Result<u64, MemTrap> {
+        match self.read_mode::<ROUTED>(addr, size) {
+            Err(miss @ MemTrap::Unmapped) if size > 1 => self.read_across(addr, size, miss, ROUTED),
+            result => result,
+        }
+    }
+
+    /// Containment only: a span that no single region contains is `Unmapped`.
     #[inline]
     pub(crate) fn read_mode<const ROUTED: bool>(
         &self,
         addr: u64,
         size: u8,
     ) -> Result<u64, MemTrap> {
-        let region = match self.region_at(addr, size) {
-            Ok(region) => region,
-            Err(miss) => return self.read_across(addr, size, miss, ROUTED),
-        };
+        let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
         }
@@ -3170,6 +3254,8 @@ impl Memory {
         }
     }
 
+    /// [`Self::write_mode_observed`] whose containment miss stores a span over
+    /// adjacent RAM/ROM regions, observed by `self`.
     #[inline]
     pub(crate) fn write_mode<const ROUTED: bool>(
         &self,
@@ -3177,28 +3263,38 @@ impl Memory {
         val: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED, false, true>(addr, val, size, self)
+        self.write_spanning_observed::<ROUTED, false>(addr, val, size, self)
     }
 
-    /// `ACROSS` selects what a containment miss does: hand the span to
-    /// [`Self::write_across_observed`], or return the miss to a caller that first
-    /// checks the other transfers of its operand (see `write_preflighted_contained`).
+    /// [`Self::write_mode_observed`] whose containment miss stores a span over
+    /// adjacent RAM/ROM regions ([`Self::write_across_observed`]). Only `region_at`
+    /// reports `Unmapped` there; nothing is stored before it.
     #[inline(always)]
-    fn write_mode_observed<const ROUTED: bool, const PREFLIGHTED: bool, const ACROSS: bool>(
+    fn write_spanning_observed<const ROUTED: bool, const PREFLIGHTED: bool>(
         &self,
         addr: u64,
         val: u64,
         size: u8,
         observer: &impl InterpreterMemory,
     ) -> Result<(), MemTrap> {
-        let region = match self.region_at(addr, size) {
-            Ok(region) => region,
-            Err(miss) if !ACROSS => return Err(miss),
-            Err(miss) => {
-                return self
-                    .write_across_observed::<ROUTED, PREFLIGHTED>(addr, val, size, observer, miss)
+        match self.write_mode_observed::<ROUTED, PREFLIGHTED>(addr, val, size, observer) {
+            Err(miss @ MemTrap::Unmapped) if size > 1 => {
+                self.write_across_observed::<ROUTED, PREFLIGHTED>(addr, val, size, observer, miss)
             }
-        };
+            result => result,
+        }
+    }
+
+    /// Containment only: a span that no single region contains is `Unmapped`.
+    #[inline(always)]
+    fn write_mode_observed<const ROUTED: bool, const PREFLIGHTED: bool>(
+        &self,
+        addr: u64,
+        val: u64,
+        size: u8,
+        observer: &impl InterpreterMemory,
+    ) -> Result<(), MemTrap> {
+        let region = self.region_at(addr, size)?;
         if matches!(region.kind, RegionKind::Trap) {
             return Err(MemTrap::Mmio);
         }
@@ -5041,6 +5137,12 @@ pub(crate) fn with_host_page_size_for_test<T>(page: usize, run: impl FnOnce() ->
 pub(crate) struct Access<const ROUTED: bool, const ORDER: u8 = 0, M = Memory>(pub M);
 
 pub(crate) trait InterpreterMemory {
+    /// Whether this provider's scalar transfers perform a containment miss over
+    /// adjacent RAM/ROM regions (`Memory` and [`SplitMemory`]). Only such a provider
+    /// compiles the 16-byte vector-store path that checks both transfers before
+    /// either is written (`interp::vstore16_split`); it then also overrides
+    /// [`Self::write_preflighted_contained`].
+    const SPLIT: bool = false;
     fn normal(&self) -> &Memory;
     fn note_block_write(&self, _addr: u64, _len: usize) {}
     fn note_host_block_write(&self, _host: u64, _addr: u64, _len: usize) {}
@@ -5057,7 +5159,8 @@ pub(crate) trait InterpreterMemory {
     /// [`Self::write_preflighted`] for the first transfer of a multi-transfer store:
     /// a span that no single region contains returns the containment miss instead
     /// of being stored across adjacent regions, so the caller can check the
-    /// operand's other transfers before any byte is written.
+    /// operand's other transfers before any byte is written. A provider whose
+    /// `write_preflighted` stores such a span (see [`Self::SPLIT`]) overrides this.
     fn write_preflighted_contained<const ROUTED: bool>(
         &self,
         addr: u64,
@@ -5067,6 +5170,56 @@ pub(crate) trait InterpreterMemory {
         self.write_preflighted::<ROUTED>(addr, value, size)
     }
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap>;
+    /// [`Self::read`] that also performs a span over adjacent RAM/ROM regions, for a
+    /// helper that commits state between its transfers (the real-mode stack frames
+    /// in `interp/control.rs`). Its re-execution after a containment miss would
+    /// repeat that commit, so the span is performed here, as the walk performed it
+    /// before the split moved off the hot path. A provider that already performs
+    /// spans (see [`Self::SPLIT`]) reads unchanged.
+    #[inline(always)]
+    fn read_across_regions<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        match self.read::<ROUTED>(addr, size) {
+            Err(miss @ MemTrap::Unmapped) if !Self::SPLIT && size > 1 => {
+                self.normal().read_across(addr, size, miss, ROUTED)
+            }
+            result => result,
+        }
+    }
+    /// [`Self::write`] that also performs a span over adjacent RAM/ROM regions, with
+    /// its SMC/watch notes sent to this provider; see [`Self::read_across_regions`].
+    #[inline(always)]
+    fn write_across_regions<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap>
+    where
+        Self: Sized,
+    {
+        match self.write::<ROUTED>(addr, value, size) {
+            Err(miss @ MemTrap::Unmapped) if !Self::SPLIT && size > 1 => self
+                .normal()
+                .write_across_observed::<ROUTED, false>(addr, value, size, self, miss),
+            result => result,
+        }
+    }
+    /// Wide checked read (x87 and state images), retaining the faulting byte. The
+    /// default also copies a span over adjacent RAM/ROM regions.
+    #[inline(always)]
+    fn wide_read<const ROUTED: bool>(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.normal().read_ram_checked_spanning::<ROUTED>(addr, buf)
+    }
+    /// Wide checked store with its SMC/watch notes sent to this provider. The
+    /// default also stores a span over adjacent RAM/ROM regions.
+    #[inline(always)]
+    fn wide_write<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), u64>
+    where
+        Self: Sized,
+    {
+        self.normal()
+            .write_ram_checked_spanning_observed::<ROUTED>(addr, bytes, self)
+    }
     #[inline(always)]
     fn preflight_store<const ROUTED: bool>(
         &self,
@@ -5190,6 +5343,9 @@ impl InterpreterMemory for RunningMemory<'_> {
             self.overlap(addr, len);
         }
     }
+    // The interpreter walk's transfers are containment-only. A miss over adjacent
+    // regions ends the attempt with its usual exit; the instruction is then
+    // re-executed through `SplitMemory` (`interp::split_block`).
     #[inline(always)]
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
         self.memory.read_mode::<ROUTED>(addr, size)
@@ -5197,7 +5353,7 @@ impl InterpreterMemory for RunningMemory<'_> {
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
         self.memory
-            .write_mode_observed::<ROUTED, false, true>(addr, value, size, self)
+            .write_mode_observed::<ROUTED, false>(addr, value, size, self)
     }
     #[inline(always)]
     fn write_preflighted<const ROUTED: bool>(
@@ -5207,32 +5363,35 @@ impl InterpreterMemory for RunningMemory<'_> {
         size: u8,
     ) -> Result<(), MemTrap> {
         self.memory
-            .write_mode_observed::<ROUTED, true, true>(addr, value, size, self)
-    }
-    #[inline(always)]
-    fn write_preflighted_contained<const ROUTED: bool>(
-        &self,
-        addr: u64,
-        value: u64,
-        size: u8,
-    ) -> Result<(), MemTrap> {
-        self.memory
-            .write_mode_observed::<ROUTED, true, false>(addr, value, size, self)
+            .write_mode_observed::<ROUTED, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
         self.memory.probe_write_mode::<ROUTED>(addr, size)
     }
+    #[inline(always)]
+    fn wide_read<const ROUTED: bool>(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.memory.read_ram_checked_mode::<ROUTED>(addr, buf)
+    }
+    #[inline(always)]
+    fn wide_write<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.memory
+            .write_ram_checked_mode_observed::<ROUTED>(addr, bytes, self)
+    }
 }
 
+// The provider of out-of-walk helpers (the Machine bus helpers, interrupt
+// delivery, state images): a containment miss over adjacent RAM/ROM regions is
+// performed here, out of line, where the helper already handles its miss.
 impl InterpreterMemory for Memory {
+    const SPLIT: bool = true;
     #[inline(always)]
     fn normal(&self) -> &Memory {
         self
     }
     #[inline(always)]
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
-        self.read_mode::<ROUTED>(addr, size)
+        self.read_spanning::<ROUTED>(addr, size)
     }
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
@@ -5245,7 +5404,7 @@ impl InterpreterMemory for Memory {
         value: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED, true, true>(addr, value, size, self)
+        self.write_spanning_observed::<ROUTED, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn write_preflighted_contained<const ROUTED: bool>(
@@ -5254,11 +5413,92 @@ impl InterpreterMemory for Memory {
         value: u64,
         size: u8,
     ) -> Result<(), MemTrap> {
-        self.write_mode_observed::<ROUTED, true, false>(addr, value, size, self)
+        self.write_mode_observed::<ROUTED, true>(addr, value, size, self)
     }
     #[inline(always)]
     fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
-        self.probe_write_mode::<ROUTED>(addr, size)
+        self.probe_write_spanning::<ROUTED>(addr, size)
+    }
+}
+
+/// The provider of the interpreter's re-execution of one instruction after a
+/// containment miss (`interp::split_block`), wrapping the walk's provider. A
+/// contained access takes the inner provider unchanged; an `Unmapped` miss is
+/// handed to the cold `*_across` paths, which perform a span over adjacent RAM/ROM
+/// regions and return any other miss unchanged. It never serves the first attempt
+/// of an instruction, so that walk keeps its containment-only transfers.
+pub(crate) struct SplitMemory<'a, M>(pub &'a M);
+
+impl<M: InterpreterMemory> InterpreterMemory for SplitMemory<'_, M> {
+    const SPLIT: bool = true;
+    #[inline(always)]
+    fn normal(&self) -> &Memory {
+        self.0.normal()
+    }
+    #[inline(always)]
+    fn note_block_write(&self, addr: u64, len: usize) {
+        self.0.note_block_write(addr, len)
+    }
+    #[inline(always)]
+    fn note_host_block_write(&self, host: u64, addr: u64, len: usize) {
+        self.0.note_host_block_write(host, addr, len)
+    }
+    #[inline(always)]
+    fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        match self.0.read::<ROUTED>(addr, size) {
+            Err(miss @ MemTrap::Unmapped) => self.normal().read_across(addr, size, miss, ROUTED),
+            result => result,
+        }
+    }
+    #[inline(always)]
+    fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        match self.0.write::<ROUTED>(addr, value, size) {
+            Err(miss @ MemTrap::Unmapped) => self
+                .normal()
+                .write_across_observed::<ROUTED, false>(addr, value, size, self.0, miss),
+            result => result,
+        }
+    }
+    #[inline(always)]
+    fn write_preflighted<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        match self.0.write_preflighted::<ROUTED>(addr, value, size) {
+            Err(miss @ MemTrap::Unmapped) => self
+                .normal()
+                .write_across_observed::<ROUTED, true>(addr, value, size, self.0, miss),
+            result => result,
+        }
+    }
+    #[inline(always)]
+    fn write_preflighted_contained<const ROUTED: bool>(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap> {
+        self.0.write_preflighted::<ROUTED>(addr, value, size)
+    }
+    #[inline(always)]
+    fn probe_write<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<(), MemTrap> {
+        match self.0.probe_write::<ROUTED>(addr, size) {
+            Err(miss @ MemTrap::Unmapped) => {
+                self.normal().probe_write_across(addr, size, miss, ROUTED)
+            }
+            result => result,
+        }
+    }
+    #[inline(always)]
+    fn wide_read<const ROUTED: bool>(&self, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+        self.normal().read_ram_checked_spanning::<ROUTED>(addr, buf)
+    }
+    #[inline(always)]
+    fn wide_write<const ROUTED: bool>(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+        self.normal()
+            .write_ram_checked_spanning_observed::<ROUTED>(addr, bytes, self.0)
     }
 }
 impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> std::ops::Deref
@@ -5295,6 +5535,38 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, O
             false,
         );
         let result = self.0.write::<ROUTED>(addr, value, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
+        result
+    }
+    /// [`Self::read`] through [`InterpreterMemory::read_across_regions`].
+    #[inline(always)]
+    pub(crate) fn read_across_regions(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Read),
+            false,
+        );
+        let result = self.0.read_across_regions::<ROUTED>(addr, size);
+        #[cfg(test)]
+        crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("read"));
+        result
+    }
+    /// [`Self::write`] through [`InterpreterMemory::write_across_regions`].
+    #[inline(always)]
+    pub(crate) fn write_across_regions(
+        &self,
+        addr: u64,
+        value: u64,
+        size: u8,
+    ) -> Result<(), MemTrap>
+    where
+        M: Sized,
+    {
+        let _ordering = crate::interp::ordering::Barrier::<ORDER>::new(
+            Some(crate::interp::ordering::Direction::Write),
+            false,
+        );
+        let result = self.0.write_across_regions::<ROUTED>(addr, value, size);
         #[cfg(test)]
         crate::interp::ordering::EVENTS.with(|events| events.borrow_mut().push("write"));
         result
@@ -5372,9 +5644,7 @@ impl<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory> Access<ROUTED, O
         self.0.probe_write::<RECOVER>(addr, size)
     }
     pub(crate) fn write_ram(&self, addr: u64, bytes: &[u8]) -> Result<(), u64> {
-        self.0
-            .normal()
-            .write_ram_checked_mode_observed::<ROUTED>(addr, bytes, &self.0)
+        self.0.wide_write::<ROUTED>(addr, bytes)
     }
     pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
         self.0

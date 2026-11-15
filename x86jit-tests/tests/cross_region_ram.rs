@@ -856,3 +856,411 @@ fn child_view_keeps_the_containment_fault_over_ram_and_rom() {
         assert_eq!(fault.operand_base, x86jit_core::Knowledge::Known(EDGE - 4));
     }
 }
+
+/// The re-execution after a containment miss (`interp::split_block`): every case
+/// compares a layout whose operand covers two adjacent RAM regions with the same
+/// program and operand inside one region. Exit, registers, memory, retirement and
+/// step counts must be equal, also when the split access is not the first
+/// instruction of its block and under every `run_steps` budget.
+mod reexecution {
+    use super::{backend, peek, poke, Tier, CAPS, EDGE, TIERS};
+    use iced_x86::code_asm::{
+        qword_ptr, rax, rbx, rcx, rdi, rdx, rsi, xmm0, xmmword_ptr, CodeAssembler,
+    };
+    use x86jit_core::{
+        CpuMode, CpuModel, CpuState, InterpreterBackend, Prot, Reg, RegionKind, StepOptions,
+        StepStop, Vm, VmConfig,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Target {
+        Alias,
+        I286,
+        I386,
+        I8086,
+        V30,
+    }
+    const TARGETS: [Target; 5] = [
+        Target::Alias,
+        Target::I286,
+        Target::I386,
+        Target::I8086,
+        Target::V30,
+    ];
+
+    /// `split` maps 0x3000..EDGE and EDGE..0x8000 as two RAM regions; otherwise
+    /// one RAM region covers 0x3000..0x8000. Code, IVT and handlers live below 0x2000.
+    fn vm(target: Target, split: bool, mode: CpuMode) -> Vm {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x10_0000), Box::new(InterpreterBackend));
+        vm.set_cpu_mode(mode);
+        match target {
+            Target::Alias => {}
+            Target::I286 => vm.set_cpu_model(CpuModel::I80286),
+            Target::I386 => vm.set_cpu_model(CpuModel::I80386),
+            Target::I8086 => vm.set_cpu_model(CpuModel::I8086),
+            Target::V30 => vm.set_cpu_model(CpuModel::NecV30),
+        }
+        vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+        if split {
+            vm.map(0x3000, (EDGE - 0x3000) as usize, Prot::RWX, RegionKind::Ram)
+                .unwrap();
+            vm.map(EDGE, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+        } else {
+            vm.map(0x3000, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        }
+        vm
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Outcome {
+        exit: String,
+        rip: u64,
+        sp: u64,
+        frame: Vec<u8>,
+        retired: u64,
+    }
+
+    fn frame_run(target: Target, split: bool, code: &[u8], sp: u64, stepped: bool) -> Outcome {
+        let vm = vm(target, split, CpuMode::Real16);
+        vm.write_bytes(0x1000, code).unwrap();
+        // IVT: vectors 3, 6 and 0x21 -> 0000:1800 (HLT).
+        for v in [3u64, 6, 0x21] {
+            vm.mem.write(v * 4, 0x1800, 4).unwrap();
+        }
+        vm.write_bytes(0x1800, &[0xf4]).unwrap();
+        for i in 0..16u64 {
+            vm.write_bytes(sp - 8 + i, &[0xcc]).unwrap();
+        }
+        let mut cpu = vm.new_vcpu();
+        if matches!(target, Target::I286 | Target::I386) {
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+        }
+        cpu.set_reg(Reg::Rip, 0x1000);
+        cpu.set_reg(Reg::Rsp, sp);
+        let exit = if stepped {
+            let r = cpu.run_steps(&vm, 20, StepOptions::default()).unwrap();
+            match r.stop() {
+                StepStop::Exit(exit) => format!("{exit:?} steps={}", r.steps()),
+                other => format!("{other:?}"),
+            }
+        } else {
+            format!("{:?}", cpu.run(&vm, None))
+        };
+        let mut frame = vec![0; 16];
+        for (i, b) in frame.iter_mut().enumerate() {
+            let mut x = [0];
+            vm.read_bytes(sp - 8 + i as u64, &mut x).unwrap();
+            *b = x[0];
+        }
+        Outcome {
+            exit,
+            rip: cpu.reg(Reg::Rip),
+            sp: cpu.reg(Reg::Rsp) & 0xffff,
+            frame,
+            retired: cpu.retired_instructions(),
+        }
+    }
+
+    /// SDM Vol 3B §23.1.4: a real-address interrupt pushes FLAGS, CS and IP. A frame
+    /// whose CS or IP word covers two adjacent RAM regions gives the same SP, frame
+    /// and RIP as the same frame inside one region (the frame helpers commit SP per
+    /// word, so they span the word themselves rather than re-executing).
+    #[test]
+    fn int_frame_across_ram_regions_matches_contained() {
+        let mut failures = Vec::new();
+        for target in TARGETS {
+            // nop; int 21h  and  nop; int3 (a NOP first, so the gate is not the
+            // block's first instruction)
+            for code in [&[0x90u8, 0xcd, 0x21][..], &[0x90, 0xcc][..]] {
+                // SP = EDGE+1: FLAGS word straddles; +3: CS word; +5: IP word.
+                for sp in [EDGE + 1, EDGE + 3, EDGE + 5] {
+                    for stepped in [false, true] {
+                        let contained = frame_run(target, false, code, sp, stepped);
+                        let split = frame_run(target, true, code, sp, stepped);
+                        if contained != split {
+                            failures.push(format!(
+                                "{target:?} code={code:x?} sp={sp:#x} stepped={stepped}:\n  \
+                                 contained={contained:x?}\n  split    ={split:x?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Every real-mode stack helper that commits SP (or BP) between its transfers:
+    /// far CALL, PUSHA, ENTER, PUSHF pushing down over EDGE, and IRET, RETF, POPA,
+    /// POPF popping up over it, each after a NOP, with each word in turn straddling.
+    /// State, frame, retirement and step counts equal the contained run.
+    #[test]
+    fn stack_frames_across_ram_regions_match_contained() {
+        let snapshot = |target: Target, split: bool, code: &[u8], sp: u64, stepped: bool| {
+            let vm = vm(target, split, CpuMode::Real16);
+            vm.write_bytes(0x1000, code).unwrap();
+            vm.write_bytes(0x1800, &[0xf4]).unwrap();
+            for i in 0..48u64 {
+                vm.write_bytes(sp - 24 + i, &[0xa0 | (i as u8 & 0xf)])
+                    .unwrap();
+            }
+            // A return frame for the pops: IP=0x1800, CS=0, FLAGS=0x0202, then
+            // values for POPA.
+            for (i, w) in [0x1800u16, 0, 0x0202, 0x1234, 0x5678, 0x9abc, 0xdef0, 0x1357]
+                .iter()
+                .enumerate()
+            {
+                poke(&vm, sp + 2 * i as u64, &w.to_le_bytes());
+            }
+            let mut cpu = vm.new_vcpu();
+            if matches!(target, Target::I286 | Target::I386) {
+                cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+            }
+            cpu.set_reg(Reg::Rip, 0x1000);
+            cpu.set_reg(Reg::Rsp, sp);
+            cpu.set_reg(Reg::Rbp, sp + 4);
+            cpu.set_reg(Reg::Rax, 0x1111);
+            let stop = if stepped {
+                let r = cpu.run_steps(&vm, 20, StepOptions::default()).unwrap();
+                format!("steps={} {:?}", r.steps(), r.stop())
+            } else {
+                format!("{:?}", cpu.run(&vm, None))
+            };
+            let gprs: Vec<u64> = [
+                Reg::Rax,
+                Reg::Rcx,
+                Reg::Rdx,
+                Reg::Rbx,
+                Reg::Rsp,
+                Reg::Rbp,
+                Reg::Rsi,
+                Reg::Rdi,
+            ]
+            .iter()
+            .map(|&r| cpu.reg(r))
+            .collect();
+            format!(
+                "{stop} rip={:#x} cs={:#x} rflags={:#x} gpr={gprs:x?} retired={} executed={} frame={:x?}",
+                cpu.reg(Reg::Rip),
+                cpu.reg(Reg::Cs),
+                cpu.cpu.rflags(),
+                cpu.retired_instructions(),
+                cpu.executed_instructions(),
+                peek(&vm, sp - 24, 48)
+            )
+        };
+        let pushes: [&[u8]; 4] = [
+            &[0x90, 0x9a, 0x00, 0x18, 0x00, 0x00], // call far 0000:1800
+            &[0x90, 0x60, 0xf4],                   // pusha
+            &[0x90, 0xc8, 0x04, 0x00, 0x03, 0xf4], // enter 4, 3
+            &[0x90, 0x9c, 0xf4],                   // pushf
+        ];
+        let pops: [&[u8]; 4] = [
+            &[0x90, 0xcf],       // iret
+            &[0x90, 0xcb],       // retf
+            &[0x90, 0x61, 0xf4], // popa
+            &[0x90, 0x9d, 0xf4], // popf
+        ];
+        let mut failures = Vec::new();
+        for target in TARGETS {
+            for stepped in [false, true] {
+                let cases = pushes
+                    .iter()
+                    .flat_map(|&code| (0..9).map(move |k| (code, EDGE + 1 + 2 * k)))
+                    .chain(
+                        pops.iter()
+                            .flat_map(|&code| (0..9).map(move |k| (code, EDGE - 1 - 2 * k))),
+                    );
+                for (code, sp) in cases {
+                    let contained = snapshot(target, false, code, sp, stepped);
+                    let split = snapshot(target, true, code, sp, stepped);
+                    if contained != split {
+                        failures.push(format!(
+                            "{target:?} code={code:x?} sp={sp:#x} stepped={stepped}:\n  \
+                             contained={contained}\n  split    ={split}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn snapshot(
+        target: Target,
+        split: bool,
+        code: &[u8],
+        regs: &[(Reg, u64)],
+        budget: Option<u64>,
+    ) -> String {
+        let vm = vm(target, split, CpuMode::Real16);
+        vm.write_bytes(0x1000, code).unwrap();
+        for i in 0..0x20u64 {
+            vm.write_bytes(EDGE - 0x10 + i, &[i as u8]).unwrap();
+        }
+        let mut cpu = vm.new_vcpu();
+        if matches!(target, Target::I286 | Target::I386) {
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+        }
+        cpu.set_reg(Reg::Rip, 0x1000);
+        cpu.set_reg(Reg::Rsp, 0x1f00);
+        for &(r, v) in regs {
+            cpu.set_reg(r, v);
+        }
+        let stop = match budget {
+            Some(b) => {
+                let r = cpu.run_steps(&vm, b, StepOptions::default()).unwrap();
+                format!("steps={} {:?}", r.steps(), r.stop())
+            }
+            None => format!("{:?}", cpu.run(&vm, None)),
+        };
+        let mem = peek(&vm, EDGE - 0x10, 0x20);
+        let gprs: Vec<u64> = [
+            Reg::Rax,
+            Reg::Rcx,
+            Reg::Rdx,
+            Reg::Rbx,
+            Reg::Rsp,
+            Reg::Rsi,
+            Reg::Rdi,
+        ]
+        .iter()
+        .map(|&r| cpu.reg(r) & 0xffff)
+        .collect();
+        format!(
+            "{stop} rip={:#x} gpr={gprs:x?} retired={} executed={} mem={mem:x?}",
+            cpu.reg(Reg::Rip),
+            cpu.retired_instructions(),
+            cpu.executed_instructions()
+        )
+    }
+
+    /// A named program with its initial registers.
+    type Case<'a> = (&'a str, &'a [u8], Vec<(Reg, u64)>);
+
+    /// A split access in the middle of a block (after a non-idempotent INC) and a
+    /// REP MOVSW whose destination crosses the edge: state, step counts and
+    /// retirement equal the contained run under `run` and `run_steps` budgets.
+    #[test]
+    fn real16_block_accounting_matches_contained() {
+        // inc cx; mov [di],ax; inc dx; mov bx,[di]; inc si; hlt
+        let straight: &[u8] = &[0x41, 0x89, 0x05, 0x42, 0x8b, 0x1d, 0x46, 0xf4];
+        // cld; rep movsw; hlt  (DS:SI contained source, ES:DI destination over EDGE)
+        let rep: &[u8] = &[0xfc, 0xf3, 0xa5, 0xf4];
+        let cases: [Case; 3] = [
+            (
+                "straight",
+                straight,
+                vec![(Reg::Rdi, EDGE - 1), (Reg::Rax, 0xa1b2)],
+            ),
+            (
+                "rep-movsw",
+                rep,
+                vec![(Reg::Rdi, EDGE - 3), (Reg::Rsi, 0x1100), (Reg::Rcx, 4)],
+            ),
+            (
+                "rep-movsw-first",
+                rep,
+                vec![(Reg::Rdi, EDGE - 1), (Reg::Rsi, 0x1100), (Reg::Rcx, 4)],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for target in TARGETS {
+            for (name, code, regs) in &cases {
+                for budget in [
+                    None,
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                    Some(7),
+                    Some(9),
+                ] {
+                    let contained = snapshot(target, false, code, regs, budget);
+                    let split = snapshot(target, true, code, regs, budget);
+                    if contained != split {
+                        failures.push(format!(
+                            "{target:?} {name} budget={budget:?}\n  contained={contained}\n  split    ={split}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A Long64 block with a scalar store, a 16-byte store and a scalar load over
+    /// the edge between non-idempotent INCs, on every tier, with the compiled
+    /// tiers' Trap window on and off (`window` hands the accesses to the
+    /// interpreter). `run_steps` serves Real16 only, so retirement and the
+    /// executed-instruction count stand for the step accounting here.
+    #[test]
+    fn long64_block_accounting_matches_contained() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.inc(rcx).unwrap();
+        a.mov(qword_ptr(rdi), rax).unwrap();
+        a.inc(rdx).unwrap();
+        a.movdqu(xmmword_ptr(rdi + 8), xmm0).unwrap();
+        a.mov(rbx, qword_ptr(rdi)).unwrap();
+        a.inc(rsi).unwrap();
+        a.hlt().unwrap();
+        let code = a.assemble(0x1000).unwrap();
+        let mut failures = Vec::new();
+        for tier in TIERS {
+            for window in [false, true] {
+                for at in [EDGE - 3, EDGE - 12, EDGE - 20] {
+                    let contained = long64_run(tier, window, false, &code, at);
+                    let split = long64_run(tier, window, true, &code, at);
+                    if contained != split {
+                        failures.push(format!(
+                            "{tier:?} window={window} at={at:#x}\n  \
+                             contained={contained}\n  split    ={split}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn long64_run(tier: Tier, window: bool, split: bool, code: &[u8], at: u64) -> String {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x10_0000), backend(tier));
+        vm.set_cpu_mode(CpuMode::Long64);
+        vm.set_tier_up_after(None);
+        vm.map(0, 0x2000, Prot::RWX, RegionKind::Ram).unwrap();
+        if split {
+            vm.map(0x3000, (EDGE - 0x3000) as usize, Prot::RWX, RegionKind::Ram)
+                .unwrap();
+            vm.map(EDGE, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+        } else {
+            vm.map(0x3000, 0x5000, Prot::RWX, RegionKind::Ram).unwrap();
+        }
+        if window {
+            vm.map(0x2000, 0x10, Prot::RW, RegionKind::Trap).unwrap();
+            vm.map(0x9000, 0x10, Prot::RW, RegionKind::Trap).unwrap();
+        }
+        vm.write_bytes(0x1000, code).unwrap();
+        if tier == Tier::Region {
+            vm.test_support_force_region(0x1000, CAPS, 0x1f80).unwrap();
+        }
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, 0x1000);
+        cpu.set_reg(Reg::Rsp, 0x1f00);
+        cpu.set_reg(Reg::Rdi, at);
+        cpu.set_reg(Reg::Rax, 0x1122_3344_5566_7788);
+        let exit = cpu.run(&vm, None);
+        format!(
+            "{exit:?} rip={:#x} rbx={:#x} rcx={} rdx={} rsi={} retired={} executed={} mem={:x?}",
+            cpu.reg(Reg::Rip),
+            cpu.reg(Reg::Rbx),
+            cpu.reg(Reg::Rcx),
+            cpu.reg(Reg::Rdx),
+            cpu.reg(Reg::Rsi),
+            cpu.retired_instructions(),
+            cpu.executed_instructions(),
+            peek(&vm, at - 8, 0x30)
+        )
+    }
+}

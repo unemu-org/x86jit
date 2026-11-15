@@ -167,6 +167,9 @@ pub(crate) struct WriteFault {
     pub(crate) committed: usize,
 }
 
+// Out of line (a codegen pin): inlined into `store`, its preflight enlarges the
+// frame of every recovery-mode scalar store, which only calls it to cross a page.
+#[inline(never)]
 pub(crate) unsafe fn copy_out(ptr: *mut u8, buf: &[u8]) -> Result<(), WriteFault> {
     let page = crate::memory::host_page_size();
     // Preflight all touched pages if more than one is touched. A single-page

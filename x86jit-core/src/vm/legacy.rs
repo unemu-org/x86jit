@@ -20,12 +20,25 @@ struct LegacyBlockKey {
     linear_fetch: u32,
     mxcsr_mode: u32,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+// `eq` below is the derived field-by-field comparison, so the derived `Hash` agrees.
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Clone, Copy, Eq, Hash)]
 struct LegacyContextStamp {
     model: LegacyCpuModel,
     state: LegacyCpuState,
     selectors: [u16; 6],
     system_flags: u64,
+}
+// The derived comparison, field by field, inlined into the per-run context check
+// (a codegen pin: the derived `#[inline]` leaves the choice to the inliner).
+impl PartialEq for LegacyContextStamp {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.state == other.state
+            && self.selectors == other.selectors
+            && self.system_flags == other.system_flags
+    }
 }
 impl LegacyContextStamp {
     fn new(cpu: &CpuState, model: LegacyCpuModel) -> Self {
@@ -541,6 +554,156 @@ impl Execution {
             }
         }
         progress
+    }
+}
+
+/// The outcome of [`Vcpu::split_retry`].
+enum SplitRetry {
+    /// The rest of the block completed on its re-execution.
+    Done { mode_change: bool },
+    /// The exit to handle: the first attempt's, or the re-execution's.
+    Exit(Exit),
+}
+
+impl Vcpu {
+    /// An interpreted application block ended with the containment miss `exit`. If
+    /// its operand lies in adjacent RAM/ROM regions, the rest of the block is
+    /// re-executed (`interp::split_application`) with the accounting of an
+    /// interpreted block; otherwise `exit` is returned unchanged.
+    #[cold]
+    #[inline(never)]
+    fn split_retry<const ROUTED: bool, const STEPPED: bool, const STOP: bool>(
+        &mut self,
+        vm: &Vm,
+        ir: &IrBlock,
+        exit: Exit,
+        code_base: u64,
+        exit_word: &AtomicU64,
+        steps: &mut crate::interp::StepContext,
+    ) -> SplitRetry {
+        let mut info = crate::interp::RetireInfo {
+            code_base,
+            consistency: vm.consistency,
+            sti_shadow: self.sti_shadow,
+            ss_shadow: self.ss_shadow,
+            exit_request: Some(exit_word),
+            trace: vm.lockstep_trace.as_deref(),
+            ..Default::default()
+        };
+        let result = match crate::interp::split_application::<ROUTED, STEPPED, STOP>(
+            exit,
+            ir,
+            &mut self.cpu,
+            &vm.mem,
+            &mut self.interp_scratch,
+            &mut info,
+            steps,
+        ) {
+            Ok(result) => result,
+            Err(exit) => return SplitRetry::Exit(exit),
+        };
+        self.retired += info.retired;
+        self.executed += info.retired;
+        self.sti_shadow = info.sti_shadow;
+        self.ss_shadow = info.ss_shadow;
+        match result {
+            crate::interp::BlockResult::Continue => SplitRetry::Done { mode_change: false },
+            crate::interp::BlockResult::ModeChange => SplitRetry::Done { mode_change: true },
+            crate::interp::BlockResult::Exit(exit) => SplitRetry::Exit(exit.into_exit()),
+        }
+    }
+
+    /// The Real16 alias dispatcher's containment miss: [`Self::split_retry`], then
+    /// the dispatcher's handling of the exit that results. `None` continues the
+    /// dispatch loop; `Some` is the stop to return.
+    #[cold]
+    #[inline(never)]
+    fn split_alias<const ROUTED: bool, const STEPPED: bool, const STOP: bool>(
+        &mut self,
+        vm: &Vm,
+        ir: &IrBlock,
+        exit: Exit,
+        exit_word: &AtomicU64,
+        steps: &mut crate::interp::StepContext,
+    ) -> Option<StepStop> {
+        let code_base = u64::from(self.cpu.cs) << 4;
+        let exit = match self
+            .split_retry::<ROUTED, STEPPED, STOP>(vm, ir, exit, code_base, exit_word, steps)
+        {
+            SplitRetry::Done { .. } => return None,
+            SplitRetry::Exit(exit) => exit,
+        };
+        Some(StepStop::Exit(match exit {
+            Exit::Syscall => self.syscall_interpreted(ir),
+            Exit::Interrupted => {
+                let path = if !STEPPED || steps.string_interrupted {
+                    crate::FaultPath::Helper {
+                        family: crate::FaultHelper::String,
+                        caller: crate::HelperCaller::Interpreter,
+                    }
+                } else {
+                    crate::FaultPath::Interpreter
+                };
+                self.interrupted(path, false)
+            }
+            Exit::Exception { addr, vector, .. } => {
+                match crate::interp::deliver_interrupt(
+                    &mut self.cpu,
+                    &vm.mem,
+                    addr,
+                    vector,
+                    addr,
+                    vm.consistency,
+                )
+                .into_step()
+                {
+                    StepResult::Continue => {
+                        self.sti_shadow = false;
+                        self.ss_shadow = false;
+                        return None;
+                    }
+                    StepResult::Exit(exit) => exit,
+                }
+            }
+            exit => exit,
+        }))
+    }
+
+    /// The application dispatcher's containment miss: [`Self::split_retry`], then
+    /// the dispatcher's qualification of the exit that results. `Ok` reports
+    /// whether the completed block changed the MXCSR mode.
+    #[cold]
+    #[inline(never)]
+    fn split_application<const ROUTED: bool>(
+        &mut self,
+        vm: &Vm,
+        ir: &IrBlock,
+        exit: Exit,
+        code_base: u64,
+        exit_word: &AtomicU64,
+    ) -> Result<bool, Exit> {
+        match self.split_retry::<ROUTED, false, false>(
+            vm,
+            ir,
+            exit,
+            code_base,
+            exit_word,
+            &mut crate::interp::StepContext::default(),
+        ) {
+            SplitRetry::Done { mode_change } => Ok(mode_change),
+            SplitRetry::Exit(Exit::Syscall) => Err(self.syscall_interpreted(ir)),
+            SplitRetry::Exit(Exit::Interrupted) => Err(self.interrupted(
+                crate::FaultPath::Helper {
+                    family: crate::FaultHelper::String,
+                    caller: crate::HelperCaller::Interpreter,
+                },
+                false,
+            )),
+            SplitRetry::Exit(exit @ Exit::Exception { .. }) => {
+                Err(crate::interp::qualify_lifted_exit(exit, ir))
+            }
+            SplitRetry::Exit(exit) => Err(exit),
+        }
     }
 }
 
@@ -2413,6 +2576,24 @@ impl Vcpu {
                                 }
                             }
                         }
+                        exit @ Exit::UnmappedMemory { .. } => {
+                            let split = self.split_alias::<ROUTED, STEPPED, STOP>(
+                                vm,
+                                &ir,
+                                exit,
+                                exit_word,
+                                &mut alias_steps,
+                            );
+                            if STEPPED {
+                                steps = alias_steps.steps;
+                            }
+                            match split {
+                                None => continue,
+                                Some(stop) => {
+                                    return DispatchResult::Stepped(StepRun { steps, stop })
+                                }
+                            }
+                        }
                         exit => {
                             return DispatchResult::Stepped(StepRun {
                                 steps,
@@ -2658,6 +2839,30 @@ impl Vcpu {
                                         return DispatchResult::Application(Ok(
                                             crate::interp::qualify_lifted_exit(exit, &ir),
                                         ))
+                                    }
+                                    exit @ Exit::UnmappedMemory { .. } => {
+                                        match self.split_application::<ROUTED>(
+                                            vm,
+                                            &ir,
+                                            exit,
+                                            fetch.pa - fetch.ip,
+                                            exit_word,
+                                        ) {
+                                            // The rest of the block completed: one block.
+                                            Ok(false) => {
+                                                if BOUNDED {
+                                                    blocks_run += 1;
+                                                }
+                                            }
+                                            Ok(true) => {
+                                                return DispatchResult::Application(Err(
+                                                    if BOUNDED { blocks_run + 1 } else { 0 },
+                                                ))
+                                            }
+                                            Err(exit) => {
+                                                return DispatchResult::Application(Ok(exit))
+                                            }
+                                        }
                                     }
                                     exit => return DispatchResult::Application(Ok(exit)),
                                 }
