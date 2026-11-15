@@ -819,6 +819,19 @@ NEC code. The maintainer accepted the slowdown because the sibling 8080 project 
 contract for feature completeness. Bead xj-50w.17 carries the miss, with this requirement's
 +0.5 % gate as its acceptance; the gate itself is unchanged.
 
+**Amendment (xj-ir6.31 closing, 2026-11-15, accepted by the maintainer).** xj-ir6.31 moves
+the xj-ir6.12 region split off the hot path, which removes the slowdown the "xj-ir6.12 landing"
+amendment accepted. It was measured against a373f11b with 060d446a reverted, that is, main
+without the split:
+- 140 of 144 real16_loops cells are within +0.5 %;
+- the store probe is below the base in all 8 cells;
+- the four misses are smc-next-64 on the four twenty-bit paths, at +0.50 % to +0.53 % on the
+  median of 15 processes.
+
+The base is bimodal per process in those cells, with two values about 0.55 % apart, and the
+candidate is within −0.06 % of its upper value. The maintainer accepted these four cells as
+measurement noise and closed xj-ir6.31. The gate itself is unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
