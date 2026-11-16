@@ -985,7 +985,9 @@ fn smc_tracks_code_above_the_old_window(backend: Box<dyn Backend>) {
 
     // `Reserved`, not `Flat`: this needs a span past 4 GiB, and `Reserved` goes through
     // `alloc_zeroed`, so the pages the test never touches are never committed.
-    let mut vm = Vm::with_backend(VmConfig::reserved(16 << 30), backend);
+    // Just past the code: a larger reservation can exceed a CI host's overcommit
+    // limit (xj-jge.18).
+    let mut vm = Vm::with_backend(VmConfig::reserved(HIGH + (1 << 20)), backend);
     vm.map(HIGH, 0x8000, Prot::RWX, RegionKind::Ram).unwrap();
 
     let target = assemble(TARGET_HI, |a| {
