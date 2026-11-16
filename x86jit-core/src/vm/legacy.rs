@@ -1008,7 +1008,15 @@ fn resolve_direct_uncached(
                 let bytes = &code[position..decoder.position()];
                 // Match incremental Machine fetch: an unavailable I286 opcode
                 // byte wins before a later ESC can reach its MSW gate.
-                let isa = crate::model::profile_for_generation(context.generation).isa;
+                let profile = crate::model::profile_for_generation(context.generation);
+                let isa = profile.isa;
+                // The catalogue's length limit (xj-50w.13; I286 PRM App. C
+                // item 10 p. C-2): a fetch holds at most that many bytes, so
+                // the reference sees what the Checked fetch sees, also when an
+                // unavailable opcode lies past the limit.
+                let bytes = &bytes[..bytes
+                    .len()
+                    .min(profile.max_insn_len.map_or(15, usize::from))];
                 let reference_bytes = if isa.legacy_segments_only() && isa.unavailable_prefix(bytes)
                 {
                     let end = (1..=bytes.len())
@@ -1055,7 +1063,7 @@ fn resolve_direct_uncached(
                 } else {
                     let bytes = fetch(vm, cpu, context)?;
                     crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
-                        .map_err(|_| Exit::unknown_instruction(cpu.rip, [0; 15], 0))?
+                        .map_err(|error| direct_refusal(cpu, error))?
                 }
             } else {
                 if end < ir.guest_start + u64::from(ir.guest_len) {
@@ -1106,7 +1114,7 @@ fn resolve_direct_uncached(
         } else {
             let bytes = fetch(vm, cpu, context)?;
             crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
-                .map_err(|_| Exit::unknown_instruction(cpu.rip, [0; 15], 0))?
+                .map_err(|error| direct_refusal(cpu, error))?
         };
         ir.legacy_context = Some(context);
         if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
@@ -1143,6 +1151,20 @@ fn resolve_direct_uncached(
     }
 }
 
+// A Direct lift refusal reports the refused instruction's bytes, as the
+// Checked resolver does (`resolve`) and the twenty-bit path does.
+#[cold]
+fn direct_refusal(cpu: &CpuState, error: crate::lift::LiftError) -> Exit {
+    match error {
+        crate::lift::LiftError::Unsupported { addr, bytes, len } => {
+            Exit::unknown_instruction(addr, bytes, len)
+        }
+        crate::lift::LiftError::DecodeFault { .. } => {
+            Exit::unknown_instruction(cpu.rip, [0; 15], 0)
+        }
+    }
+}
+
 fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Exit> {
     fetch_watched(vm, cpu, context, cpu.rip, None)
 }
@@ -1153,14 +1175,43 @@ fn fetch_watched(
     ip: u64,
     source: Option<&crate::memory::LiftSource<'_>>,
 ) -> Result<Vec<u8>, Exit> {
+    // The catalogue's instruction-length limit (ten bytes on the 80286,
+    // I286 PRM Appendix B #GP p. B-9; fifteen on the 80386) and formed-address
+    // mask (`legacy::physical_mask`), resolved at compile time per model so
+    // the per-byte loop carries no model data. A model with no limit (the
+    // 8086 family) reads at most fifteen bytes, the decoder's maximum.
+    const fn limit(model: crate::CpuModel) -> u64 {
+        match model.profile().max_insn_len {
+            Some(limit) => limit as u64,
+            None => 15,
+        }
+    }
+    use crate::legacy::{bus_model, physical_mask};
+    match context.generation {
+        CpuGeneration::I8086 => fetch_bytes::<
+            { physical_mask(CpuGeneration::I8086) },
+            { limit(bus_model(CpuGeneration::I8086)) },
+        >(vm, cpu, context, ip, source),
+        CpuGeneration::I286 => fetch_bytes::<
+            { physical_mask(CpuGeneration::I286) },
+            { limit(bus_model(CpuGeneration::I286)) },
+        >(vm, cpu, context, ip, source),
+        CpuGeneration::I386 => fetch_bytes::<
+            { physical_mask(CpuGeneration::I386) },
+            { limit(bus_model(CpuGeneration::I386)) },
+        >(vm, cpu, context, ip, source),
+    }
+}
+
+fn fetch_bytes<const MASK: u32, const LIMIT: u64>(
+    vm: &Vm,
+    cpu: &CpuState,
+    context: MachineContext,
+    ip: u64,
+    source: Option<&crate::memory::LiftSource<'_>>,
+) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
-    // I286 PRM Appendix B #GP p. B-9: instructions are at most ten bytes.
-    let length_limit = if context.generation == CpuGeneration::I286 {
-        10
-    } else {
-        15
-    };
-    for i in 0..length_limit {
+    for i in 0..LIMIT {
         let linear = crate::legacy::access(
             cpu,
             context.generation,
@@ -1169,7 +1220,7 @@ fn fetch_watched(
             1,
             crate::AccessKind::Execute,
         )?;
-        let (addr, _) = crate::legacy::physical_span(cpu, linear, 1);
+        let (addr, _) = crate::legacy::physical_span(cpu, MASK, linear, 1);
         if let Some(policy) = &vm.mem.fetch_policy {
             let verdict = policy.approve(addr >> crate::memory::CODE_PAGE_BITS, &vm.mem);
             if verdict != crate::FetchVerdict::Allow {
@@ -1217,11 +1268,41 @@ fn fetch_watched(
             crate::model::decode::SYSTEM_DECODER_OPTIONS,
         );
         let insn = decoder.decode();
-        if !insn.is_invalid() || decoder.last_error() != DecoderError::NoMoreBytes {
+        if !insn.is_invalid() {
+            break;
+        }
+        if decoder.last_error() != DecoderError::NoMoreBytes
+            && !locked_form_continues(&bytes, context, ip)
+        {
             break;
         }
     }
     Ok(bytes)
+}
+
+// A LOCK form the 80286 executes (80286 PRM App. C item 11 p. C-2) is
+// rejected by the strict decoder; keep fetching while it is still incomplete.
+#[cold]
+#[inline(never)]
+fn locked_form_continues(bytes: &[u8], context: MachineContext, ip: u64) -> bool {
+    if !crate::legacy::bus_model(context.generation)
+        .profile()
+        .quirks
+        .lock_data_movement
+        || !bytes
+            .iter()
+            .take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3))
+            .any(|b| *b == 0xf0)
+    {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(
+        u32::from(context.default_operand_bits),
+        bytes,
+        ip,
+        crate::model::decode::SYSTEM_DECODER_OPTIONS | iced_x86::DecoderOptions::NO_INVALID_CHECK,
+    );
+    decoder.decode().is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes
 }
 
 #[inline(always)]
@@ -1919,6 +2000,9 @@ impl Vcpu {
             generation: CpuGeneration::I286,
             model_semantics_id: 0,
         });
+        // The model's bus mask, once per call: the dispatch loop's page hint
+        // and port-input completion form physical addresses with it.
+        let physical_mask = crate::legacy::physical_mask(model.generation);
         let mut context =
             initial_context.map_or_else(crate::lift::legacy::alias_context, |initial| initial.0);
         let direct20 = KIND == super::DIRECT20_DISPATCH;
@@ -1975,6 +2059,7 @@ impl Vcpu {
                             crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
                                 &mut self.cpu,
                                 &vm.mem,
+                                physical_mask,
                             )
                         };
                         if let Err(exit) = finished {
@@ -2093,7 +2178,7 @@ impl Vcpu {
                 let physical = if direct && direct_bus {
                     linear_fetch
                 } else {
-                    crate::legacy::physical_span(&self.cpu, linear_fetch, 1).0
+                    crate::legacy::physical_span(&self.cpu, physical_mask, linear_fetch, 1).0
                 };
                 let page = physical >> crate::memory::CODE_PAGE_BITS;
                 let dirty = exit_word.load(Ordering::Relaxed) & crate::memory::DISPATCH_DIRTY != 0;

@@ -1229,11 +1229,6 @@ fn register_immediate_qualification_preserves_prefix_and_ip_edges() {
     for model in [CpuModel::I80286, CpuModel::I80386] {
         for ip in [0x1000, 0xfffe] {
             for code in &cases {
-                // Over-limit I286 Direct/Checked behavior already differs in
-                // C1. It is outside this at-most-ten-byte shared qualification.
-                if model == CpuModel::I80286 && code.len() > 10 {
-                    continue;
-                }
                 let outcomes: Vec<_> = [false, true]
                     .into_iter()
                     .map(|checked| {
@@ -1243,6 +1238,72 @@ fn register_immediate_qualification_preserves_prefix_and_ip_edges() {
                     })
                     .collect();
                 assert_eq!(outcomes[0], outcomes[1], "{model:?} {ip:x} {code:02x?}");
+            }
+        }
+    }
+}
+
+// xj-50w.13: the catalogue's instruction-length limit holds in both segment
+// classes. The 80286 limit is ten bytes (80286 PRM App. C item 10 p. C-2),
+// and an eleven-byte instruction raises #GP at its first byte (App. B #GP
+// p. B-9; decision-23 "The 80286 over-length fault"), including when an
+// opcode the 80286 lacks follows the limit. The 80386 executes up to
+// fifteen bytes (80386 PRM §14.7 item 6 p. 14-6).
+#[test]
+fn instruction_length_limit_matches_in_direct_and_checked() {
+    for prefixes in [8, 9, 13] {
+        let mut code = vec![0x26; prefixes];
+        code.extend([0xb0, 0x5a]);
+        for model in [CpuModel::I80286, CpuModel::I80386] {
+            for checked in [false, true] {
+                let (vm, mut cpu) = setup(model, checked, 0x1000, &code);
+                let observed = run(&vm, &mut cpu, 1, false);
+                let label = format!("{model:?} {} bytes checked={checked}", code.len());
+                if model == CpuModel::I80286 && code.len() > 10 {
+                    assert_eq!(observed.stop, Stop::Exception(0x1000, 13), "{label}");
+                    assert_eq!((observed.steps, observed.retired), (0, 0), "{label}");
+                    assert_eq!(observed.gpr[0] & 0xff, 0, "{label}");
+                } else {
+                    assert_eq!(observed.steps, 1, "{label}");
+                    assert_eq!(observed.gpr[0] & 0xff, 0x5a, "{label}");
+                    assert_eq!(observed.ip, 0x1000 + code.len() as u64, "{label}");
+                }
+            }
+        }
+    }
+    // The review's encodings: a prefix run ending in an opcode the 80286
+    // lacks (66h, 64h, 67h, 0F 20). Nine prefixes put the unavailable byte
+    // inside the limit (#UD); ten or more put it past the limit (#GP), and
+    // so does nine with the 0F 20 form, whose unavailable byte is the
+    // eleventh. Direct and Checked agree, at 1000h and near FFFFh.
+    for tail in [
+        &[0x66u8, 0x90][..],
+        &[0x64, 0x90],
+        &[0x67, 0x90],
+        &[0x0f, 0x20, 0xc0],
+    ] {
+        for run_len in [9usize, 10, 11] {
+            let mut code = vec![0x26; run_len];
+            code.extend_from_slice(tail);
+            let expected = if run_len >= 10 || tail[0] == 0x0f {
+                13
+            } else {
+                6
+            };
+            for ip in [0x1000u64, 0xfff0] {
+                let outcomes: Vec<_> = [false, true]
+                    .into_iter()
+                    .map(|checked| {
+                        let (vm, mut cpu) = setup(CpuModel::I80286, checked, ip, &code);
+                        run(&vm, &mut cpu, 1, false)
+                    })
+                    .collect();
+                assert_eq!(outcomes[0], outcomes[1], "{ip:x} {code:02x?}");
+                assert_eq!(
+                    outcomes[0].stop,
+                    Stop::Exception(ip, expected),
+                    "{ip:x} {code:02x?}"
+                );
             }
         }
     }

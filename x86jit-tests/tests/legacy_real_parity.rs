@@ -767,7 +767,18 @@ fn esc_and_wait_gate_before_operands_under_both_fpu_models() {
                         assert_exception(&run, 7);
                         assert_eq!(image(&cpu), before);
                     } else if code == b"\xd9\x07" {
-                        assert_exception(&run, 13);
+                        // I286 PRM App. B #MP p. B-9: with a coprocessor
+                        // attached, a dword past the limit raises 9.
+                        assert_exception(
+                            &run,
+                            if generation == CpuGeneration::I286
+                                && model == x86jit_core::FpuModel::Present
+                            {
+                                9
+                            } else {
+                                13
+                            },
+                        );
                     } else if code == b"\xdb\xe3" && model == x86jit_core::FpuModel::Present {
                         assert_eq!(cpu.cpu.fpu_cw, 0x37f);
                         assert_eq!(cpu.cpu.fpu_empty, 0xff);
@@ -808,7 +819,15 @@ fn delegated_x87_uses_cached_limits_and_splits_at_a20() {
         assert_eq!(stored, one);
         let (vm, mut cpu) = legacy_fixture(b"\xdb\x2f", generation);
         cpu.cpu.gpr[3] = 0xfff8;
-        assert_exception(&step(&vm, &mut cpu), 13);
+        // I286 PRM App. B #MP p. B-9: the tbyte's later words pass FFFFh.
+        assert_exception(
+            &step(&vm, &mut cpu),
+            if generation == CpuGeneration::I286 {
+                9
+            } else {
+                13
+            },
+        );
         if generation == CpuGeneration::I386 {
             cpu.cpu.legacy.segments[1].limit = 0x1ffff;
             cpu.cpu.gpr[3] = 0x10008;

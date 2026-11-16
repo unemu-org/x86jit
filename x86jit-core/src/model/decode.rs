@@ -953,6 +953,64 @@ impl ModelIsa {
     }
 }
 
+/// 80286 PRM App. C item 11 p. C-2: LOCK is meant for XCHG, MOV, MOVS, INS
+/// and OUTS, and App. B LOCK p. B-68 gives no real-mode exception for the
+/// prefix. The strict decoder rejects it on the last four; for an entry whose
+/// `lock_data_movement` quirk admits them, this decodes `bytes` (one whole
+/// instruction) with the prefix kept. Bytes the strict decoder rejects for
+/// any other reason stay rejected: without its LOCK prefixes the instruction
+/// must decode strictly, to the same encoding and length.
+pub(crate) fn locked_data_movement(
+    bytes: &[u8],
+    bitness: u32,
+    ip: u64,
+    options: u32,
+) -> Option<Instruction> {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic::*};
+    let prefixes = bytes
+        .iter()
+        .take_while(|b| {
+            matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .count();
+    if bytes.len() > 15 || !bytes[..prefixes].contains(&0xf0) {
+        return None;
+    }
+    let mut unlocked = [0; 15];
+    let mut len = 0;
+    for &byte in bytes[..prefixes].iter().filter(|b| **b != 0xf0) {
+        unlocked[len] = byte;
+        len += 1;
+    }
+    unlocked[len..len + bytes.len() - prefixes].copy_from_slice(&bytes[prefixes..]);
+    len += bytes.len() - prefixes;
+    let plain = Decoder::with_ip(bitness, &unlocked[..len], ip, options).decode();
+    if plain.is_invalid()
+        || plain.len() != len
+        || !matches!(
+            plain.mnemonic(),
+            Mov | Movsb | Movsw | Movsd | Insb | Insw | Insd | Outsb | Outsw | Outsd
+        )
+    {
+        return None;
+    }
+    let locked = Decoder::with_ip(
+        bitness,
+        bytes,
+        ip,
+        options | DecoderOptions::NO_INVALID_CHECK,
+    )
+    .decode();
+    (!locked.is_invalid()
+        && locked.len() == bytes.len()
+        && locked.code() == plain.code()
+        && locked.has_lock_prefix())
+    .then_some(locked)
+}
+
 pub(super) const fn defined_alias(code: Code) -> Option<Code> {
     // SDM Vol 3B §25.15 p.25-6: 82h, group 2 /6 and group 3 /1 are defined aliases.
     use Code::*;
@@ -980,4 +1038,72 @@ pub(super) const fn defined_alias(code: Code) -> Option<Code> {
         _ => return None,
     };
     Some(canonical)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderError, DecoderOptions};
+
+    // 80286 PRM App. C item 11 p. C-2; App. B LOCK p. B-68.
+    #[test]
+    fn locked_data_movement_admits_only_the_listed_forms() {
+        let options = I286_SET.options;
+        for (bytes, code) in [
+            (&[0xf0, 0x88, 0x07][..], Code::Mov_rm8_r8),
+            (&[0xf0, 0x89, 0x47, 0x02], Code::Mov_rm16_r16),
+            (&[0xf0, 0x8b, 0x07], Code::Mov_r16_rm16),
+            (&[0xf0, 0xb0, 0x5a], Code::Mov_r8_imm8),
+            (
+                &[0xf0, 0xc7, 0x06, 0x34, 0x12, 0x78, 0x56],
+                Code::Mov_rm16_imm16,
+            ),
+            (&[0xf0, 0xa1, 0x34, 0x12], Code::Mov_AX_moffs16),
+            (&[0xf0, 0x8e, 0xd8], Code::Mov_Sreg_rm16),
+            (&[0x26, 0xf0, 0xa5], Code::Movsw_m16_m16),
+            (&[0xf0, 0xf3, 0xa4], Code::Movsb_m8_m8),
+            (&[0xf0, 0x6c], Code::Insb_m8_DX),
+            (&[0xf0, 0xf3, 0x6f], Code::Outsw_DX_m16),
+        ] {
+            assert!(Decoder::with_ip(16, bytes, 0, options)
+                .decode()
+                .is_invalid());
+            let insn = locked_data_movement(bytes, 16, 0, options).expect("admitted");
+            assert_eq!(
+                (insn.code(), insn.len()),
+                (code, bytes.len()),
+                "{bytes:02x?}"
+            );
+            assert!(insn.has_lock_prefix());
+            // A shorter fetch still asks for more bytes, so incremental
+            // fetching reads the whole instruction.
+            for end in 1..bytes.len() {
+                let mut decoder = Decoder::with_ip(
+                    16,
+                    &bytes[..end],
+                    0,
+                    options | DecoderOptions::NO_INVALID_CHECK,
+                );
+                assert!(decoder.decode().is_invalid());
+                assert_eq!(decoder.last_error(), DecoderError::NoMoreBytes);
+            }
+        }
+        for bytes in [
+            &[0xf0, 0x00, 0xec][..], // LOCK ADD AH,CH: not a listed form
+            &[0xf0, 0x87, 0xc3],     // LOCK XCHG BX,AX: not in this quirk
+            &[0xf0, 0xaa],           // LOCK STOSB
+            &[0xf0, 0x8e, 0xc8],     // MOV CS,AX: invalid without LOCK too
+            &[0x88, 0x07],           // no LOCK prefix
+            &[0xf0, 0x88],           // truncated
+        ] {
+            assert!(
+                locked_data_movement(bytes, 16, 0, options).is_none(),
+                "{bytes:02x?}"
+            );
+        }
+        // LOCK on a lockable read-modify-write form is valid without this path.
+        assert!(!Decoder::with_ip(16, &[0xf0, 0x00, 0x07], 0, options)
+            .decode()
+            .is_invalid());
+    }
 }

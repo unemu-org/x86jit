@@ -241,7 +241,7 @@ fn transfer_vector(generation: CpuGeneration, cause: Cause) -> u8 {
 
 fn task_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     value: u16,
     generation: CpuGeneration,
     vector: u8,
@@ -254,7 +254,7 @@ fn task_descriptor<const ROUTED: bool, const ORDER: u8>(
 }
 fn task_segment_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     value: u16,
     generation: CpuGeneration,
     vector: u8,
@@ -284,7 +284,7 @@ fn minimum(tss: SystemSegment) -> u32 {
 /// None leaves a normal code transfer to the existing helper.
 pub(super) fn transfer<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     cause: Cause,
@@ -329,7 +329,7 @@ pub(super) fn transfer<const ROUTED: bool, const ORDER: u8>(
 
 pub(super) fn task_return<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     context: MachineContext,
     next: u32,
     state: &mut SwitchState,
@@ -359,7 +359,7 @@ pub(super) fn task_return<const ROUTED: bool, const ORDER: u8>(
 
 pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     event: legacy::LegacyEvent,
@@ -389,7 +389,7 @@ pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
 #[allow(clippy::too_many_arguments)]
 fn start<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     cause: Cause,
@@ -497,11 +497,11 @@ fn start<const ROUTED: bool, const ORDER: u8>(
 
 fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     address: u32,
 ) -> Result<(), Exit> {
     let linear = u64::from(address);
-    let (physical, _) = legacy::physical_span(cpu, linear, 1);
+    let (physical, _) = legacy::physical_span(cpu, mem.physical_mask, linear, 1);
     match mem.0.region_kind(physical, 1) {
         Ok(crate::RegionKind::Ram | crate::RegionKind::Rom) => mem.probe_write(physical, 1),
         Ok(_) => {
@@ -522,7 +522,7 @@ fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
 
 fn load_image<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     tss: SystemSegment,
 ) -> Result<Image, Exit> {
     let base = tss.cache.base;
@@ -657,7 +657,7 @@ pub(crate) fn fault_context(cpu: &CpuState, generation: CpuGeneration) -> Machin
 
 pub(crate) fn resume<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     state: &mut SwitchState,
 ) -> Result<(), Exit> {
     let mut pending = state.pending.take().expect("task switch continuation");
@@ -688,7 +688,7 @@ impl Pending {
     fn clear_busy<const ROUTED: bool, const ORDER: u8>(
         &self,
         cpu: &mut CpuState,
-        mem: &Access<ROUTED, ORDER>,
+        mem: &AddressKeyed<'_, ROUTED, ORDER>,
     ) -> Result<(), Exit> {
         let mut expected = read(cpu, mem, u64::from(self.old_access), 1)?;
         loop {
@@ -702,7 +702,7 @@ impl Pending {
     fn run<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         cpu: &mut CpuState,
-        mem: &Access<ROUTED, ORDER>,
+        mem: &AddressKeyed<'_, ROUTED, ORDER>,
     ) -> Result<(), Exit> {
         loop {
             match self.stage {
@@ -880,7 +880,7 @@ impl Pending {
 
 fn load_segment<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &AddressKeyed<'_, ROUTED, ORDER>,
     generation: CpuGeneration,
     segment: SegmentId,
     ext: u16,
@@ -1075,7 +1075,10 @@ mod tests {
             });
             let exit = transfer(
                 &mut cpu,
-                Access::<false, 0>::new(&vm.mem),
+                &AddressKeyed {
+                    access: Access::<false, 0>::new(&vm.mem),
+                    physical_mask: legacy::physical_mask(context.generation),
+                },
                 context,
                 35,
                 Cause::Jump,
@@ -1102,7 +1105,10 @@ mod tests {
         cpu.legacy.cr0 |= 0x8000_0000;
         let exit = transfer(
             &mut cpu,
-            Access::<false, 0>::new(&vm.mem),
+            &AddressKeyed {
+                access: Access::<false, 0>::new(&vm.mem),
+                physical_mask: legacy::physical_mask(context.generation),
+            },
             context,
             35,
             Cause::Jump,
@@ -1140,7 +1146,10 @@ mod tests {
             let mut state = SwitchState::default();
             let exit = event(
                 &mut cpu,
-                Access::<false, 0>::new(&vm.mem),
+                &AddressKeyed {
+                    access: Access::<false, 0>::new(&vm.mem),
+                    physical_mask: legacy::physical_mask(context.generation),
+                },
                 context,
                 32,
                 legacy::LegacyEvent {
@@ -1214,7 +1223,10 @@ mod tests {
                 .with(|u| u.set(Some((0x4100 + if wide { 0x28 } else { 0x12 }, 0x7654))));
             transfer(
                 &mut cpu,
-                Access::<false, 0>::new(&vm.mem),
+                &AddressKeyed {
+                    access: Access::<false, 0>::new(&vm.mem),
+                    physical_mask: legacy::physical_mask(context.generation),
+                },
                 context,
                 35,
                 Cause::Jump,

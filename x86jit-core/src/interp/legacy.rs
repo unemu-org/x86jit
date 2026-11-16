@@ -267,22 +267,25 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 // A device read is identified by its visit as well as its bus address. The
 // cursor restarts with the instruction, including reads served from the ledger.
 // Writes retain their separate bit-63 namespace; descriptor snapshots use bit 62.
+// `physical_mask` is the context model's bus mask (`legacy::physical_mask`).
 struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
     access: &'a Access<ROUTED, ORDER>,
     read_index: Cell<u16>,
     writes: Option<&'a dyn Fn(u64, u8)>,
+    physical_mask: u32,
 }
 impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
-    fn new(memory: &'a Memory) -> Self {
+    fn new(memory: &'a Memory, physical_mask: u32) -> Self {
         Self {
             access: Access::new(memory),
             read_index: Cell::new(0),
             writes: None,
+            physical_mask,
         }
     }
     fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
         while bytes != 0 {
-            let (_, part) = legacy::physical_span(cpu, linear, bytes);
+            let (_, part) = legacy::physical_span(cpu, self.physical_mask, linear, bytes);
             self.read_index.set(self.read_index.get() + 1);
             linear = u64::from((linear as u32).wrapping_add(u32::from(part)));
             bytes -= part;
@@ -296,28 +299,57 @@ impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for LegacyAccess<'_, R
     }
 }
 
+// Task-switch stages: the context's bus with address-based retry keys.
+pub(crate) struct AddressKeyed<'a, const ROUTED: bool, const ORDER: u8> {
+    access: &'a Access<ROUTED, ORDER>,
+    physical_mask: u32,
+}
+impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for AddressKeyed<'_, ROUTED, ORDER> {
+    type Target = Access<ROUTED, ORDER>;
+    fn deref(&self) -> &Self::Target {
+        self.access
+    }
+}
+
 // Instructions replay from their first read; task continuations resume saved
-// stages, whose existing transfers retain address-based retry keys.
+// stages, whose existing transfers retain address-based retry keys. Every
+// view carries its model's physical-address mask (`legacy::physical_mask`).
 trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     fn raw(&self) -> &Access<ROUTED, ORDER>;
     fn read_key(&self, addr: u64) -> u64;
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
     fn note_write(&self, _addr: u64, _size: u8) {}
+    fn physical_mask(&self) -> u32;
+    /// The same bus, with address-based retry keys (task-switch stages).
+    fn address_keyed(&self) -> AddressKeyed<'_, ROUTED, ORDER> {
+        AddressKeyed {
+            access: self.raw(),
+            physical_mask: self.physical_mask(),
+        }
+    }
 }
-impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER> for Access<ROUTED, ORDER> {
+impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
+    for AddressKeyed<'_, ROUTED, ORDER>
+{
     fn raw(&self) -> &Access<ROUTED, ORDER> {
-        self
+        self.access
     }
     fn read_key(&self, addr: u64) -> u64 {
         addr
     }
     fn skip_read(&self, _cpu: &CpuState, _linear: u64, _bytes: u8) {}
+    fn physical_mask(&self) -> u32 {
+        self.physical_mask
+    }
 }
 impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
     for LegacyAccess<'_, ROUTED, ORDER>
 {
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.access
+    }
+    fn physical_mask(&self) -> u32 {
+        self.physical_mask
     }
     fn read_key(&self, addr: u64) -> u64 {
         let index = self.read_index.get();
@@ -340,7 +372,7 @@ fn read<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
-    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     let low = read_physical(cpu, mem, addr, physical, part)?;
     if part == size {
         return Ok(low);
@@ -417,6 +449,7 @@ fn enter_display_key(index: u8) -> u64 {
 fn prepare_enter_displays(
     cpu: &mut CpuState,
     context: MachineContext,
+    physical_mask: u32,
     size: u8,
     alloc: u16,
     level: u8,
@@ -451,7 +484,9 @@ fn prepare_enter_displays(
         | (u64::from(cpu.legacy.a20_enabled != 0) << 23)
         | (u64::from(expand_down) << 24)
         | (u64::from(readable) << 25)
-        | (u64::from(writable) << 26);
+        | (u64::from(writable) << 26)
+        // A bus narrower than 32 bits (the 80286's), for mmio_evidence.
+        | (u64::from(physical_mask != u32::MAX) << 27);
     let identities = [
         (bp | ((config & 0x3fff) << ENTER_IDENTITY_CONFIG), sp << 32),
         (
@@ -494,8 +529,10 @@ fn enter_display(cpu: &CpuState, index: u8) -> Option<u64> {
         .map(|&(_, value)| u64::from(value as u32))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_enter_display(
     cpu: &mut CpuState,
+    physical_mask: u32,
     visits: std::ops::Range<u16>,
     index: u8,
     address: u64,
@@ -523,14 +560,25 @@ fn record_enter_display(
             // each completion's boundaries, not the RAM or staged bytes.
             let byte = (0..size)
                 .find(|&byte| {
-                    legacy::physical_span(cpu, address.wrapping_add(u64::from(byte)), 1).0
-                        == u64::from(entry.0 as u32)
+                    legacy::physical_span(
+                        cpu,
+                        physical_mask,
+                        address.wrapping_add(u64::from(byte)),
+                        1,
+                    )
+                    .0 == u64::from(entry.0 as u32)
                 })
                 .expect("current attempt's display answer belongs to its bus span");
             let bytes = if partial {
                 1
             } else {
-                legacy::physical_span(cpu, address.wrapping_add(u64::from(byte)), size - byte).1
+                legacy::physical_span(
+                    cpu,
+                    physical_mask,
+                    address.wrapping_add(u64::from(byte)),
+                    size - byte,
+                )
+                .1
             };
             key |= 1 << (ENTER_DISPLAY_STARTS + u32::from(byte));
             key |= 1 << (ENTER_DISPLAY_ENDS + u32::from(byte + bytes - 1));
@@ -586,6 +634,11 @@ pub(crate) fn mmio_evidence(cpu: &CpuState) -> Box<[(u64, u64)]> {
                 let address = u64::from(base.wrapping_add(offset).wrapping_add(byte));
                 let (bus, _) = legacy::physical_span_with_gate(
                     config & (1 << 23) != 0,
+                    legacy::physical_mask(if config & (1 << 27) != 0 {
+                        crate::CpuGeneration::I286
+                    } else {
+                        crate::CpuGeneration::I386
+                    }),
                     address,
                     (end - byte + 1) as u8,
                 );
@@ -604,7 +657,7 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     value: u64,
 ) -> Result<(), Exit> {
     let value = value & mask(size);
-    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     if part == size {
         return write_physical(cpu, mem, addr, physical, size, value);
     }
@@ -634,7 +687,7 @@ fn split_device_follows_ram<const ROUTED: bool, const ORDER: u8>(
     next: u64,
     rest: u8,
 ) -> bool {
-    let (next, rest) = legacy::physical_span(cpu, next, rest);
+    let (next, rest) = legacy::physical_span(cpu, mem.physical_mask(), next, rest);
     let device = |at, bytes| {
         matches!(
             mem.raw().region_kind(at, bytes),
@@ -693,7 +746,7 @@ fn probe<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
-    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     probe_physical(cpu, mem, addr, physical, part)?;
     if part < size {
         let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
@@ -743,7 +796,7 @@ fn probe_locked<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
-    let (physical, part) = legacy::physical_span(cpu, addr, size);
+    let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     let checked = mem
         .raw()
         .region_kind(physical, part)
@@ -906,13 +959,14 @@ thread_local! {
 
 fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &Access<ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     address: u32,
     expected: u64,
     value: u64,
 ) -> Result<u64, Exit> {
     let linear = u64::from(address);
-    let (physical, _) = legacy::physical_span(cpu, linear, 1);
+    let (physical, _) = legacy::physical_span(cpu, mem.physical_mask(), linear, 1);
+    let mem = mem.raw();
     #[cfg(test)]
     DESCRIPTOR_UPDATE.with(|update| {
         if let Some((at, replacement)) = update.take() {
@@ -960,7 +1014,7 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
         if let Some(address) = descriptor.access_address {
             let expected = u64::from(descriptor.cache.attributes as u8);
             let value = expected | u64::from(bit);
-            let observed = descriptor_cas(cpu, mem.raw(), address, expected, value)?;
+            let observed = descriptor_cas(cpu, mem, address, expected, value)?;
             if observed != expected {
                 descriptor.cache.attributes =
                     (descriptor.cache.attributes & !0xff) | observed as u16;
@@ -1314,11 +1368,12 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
-    let mem = &LegacyAccess::<ROUTED, ORDER>::new(memory);
+    let mem =
+        &LegacyAccess::<ROUTED, ORDER>::new(memory, legacy::physical_mask(context.generation));
     task_switch.committed = false;
     task_switch.completed = false;
     if task_switch.context().is_some() {
-        return tasks::resume(cpu, mem.raw(), task_switch);
+        return tasks::resume(cpu, &mem.address_keyed(), task_switch);
     }
     deliver(cpu, mem, context, event, task_switch)
 }
@@ -1365,7 +1420,7 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     if kind == 5 {
         return tasks::event(
             cpu,
-            mem.raw(),
+            &mem.address_keyed(),
             context,
             (low >> 16) as u16,
             event,
@@ -1510,6 +1565,7 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
 struct PhysicalFpMemory<'a, const ROUTED: bool> {
     memory: &'a Memory,
     a20_enabled: bool,
+    physical_mask: u32,
     fault: std::cell::Cell<Option<u64>>,
 }
 impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
@@ -1531,8 +1587,12 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
     }
     fn load_checked(&self, mut addr: u64, mut buf: &mut [u8]) -> Result<(), u64> {
         while !buf.is_empty() {
-            let (physical, part) =
-                legacy::physical_span_with_gate(self.a20_enabled, addr, buf.len().min(255) as u8);
+            let (physical, part) = legacy::physical_span_with_gate(
+                self.a20_enabled,
+                self.physical_mask,
+                addr,
+                buf.len().min(255) as u8,
+            );
             let (head, tail) = buf.split_at_mut(usize::from(part));
             self.memory
                 .read_ram_checked_spanning::<ROUTED>(physical, head)
@@ -1549,6 +1609,7 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
             let linear = u64::from((addr as u32).wrapping_add(offset as u32));
             let (physical, part) = legacy::physical_span_with_gate(
                 self.a20_enabled,
+                self.physical_mask,
                 linear,
                 (bytes.len() - offset).min(255) as u8,
             );
@@ -1569,8 +1630,12 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
             offset += usize::from(part);
         }
         while !bytes.is_empty() {
-            let (physical, part) =
-                legacy::physical_span_with_gate(self.a20_enabled, addr, bytes.len().min(255) as u8);
+            let (physical, part) = legacy::physical_span_with_gate(
+                self.a20_enabled,
+                self.physical_mask,
+                addr,
+                bytes.len().min(255) as u8,
+            );
             let (head, tail) = bytes.split_at(usize::from(part));
             self.memory
                 .write_ram_checked_spanning_observed::<ROUTED>(physical, head, self.memory)
@@ -1585,6 +1650,7 @@ impl<const ROUTED: bool> crate::x87::FpMem for PhysicalFpMemory<'_, ROUTED> {
 pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     memory: &Memory,
+    physical_mask: u32,
 ) -> Result<(), Exit> {
     let Some(p) = cpu.port_string_in else {
         return Ok(());
@@ -1595,7 +1661,7 @@ pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
     // The handoff already checked the complete ES operand and owns its A20 line.
     write(
         cpu,
-        &LegacyAccess::<ROUTED, ORDER>::new(memory),
+        &LegacyAccess::<ROUTED, ORDER>::new(memory, physical_mask),
         u64::from((p.base as u32).wrapping_add(p.offset as u32)),
         p.elem,
         value,
@@ -1630,7 +1696,7 @@ fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
                 .base
                 .wrapping_add((cpu.rip as u32).wrapping_add(i as u32)),
         );
-        let (physical, _) = legacy::physical_span(cpu, linear, 1);
+        let (physical, _) = legacy::physical_span(cpu, mem.physical_mask(), linear, 1);
         if mem
             .raw()
             .fetch_code(physical, &mut bytes[i..i + 1])
@@ -1717,7 +1783,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
             ops: &ir.ops,
         },
         cpu,
-        &LegacyAccess::new(memory),
+        &LegacyAccess::new(memory, legacy::physical_mask(context.generation)),
         scratch.zeroed(ir.temp_count as usize),
         context,
         task_switch,
@@ -1757,7 +1823,7 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
     task_switch.completed = false;
     let mut result = if task_switch.context().is_some() {
         let suppress_debug = task_switch.suppress_debug();
-        tasks::resume(cpu, mem.raw(), task_switch).map(|()| Outcome {
+        tasks::resume(cpu, &mem.address_keyed(), task_switch).map(|()| Outcome {
             retired: true,
             context_changed: true,
             preserve_rf: true,
@@ -1943,7 +2009,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
     debug_assert!(ir.verify_temp_defs().is_ok(), "{:?}", ir.verify_temp_defs());
     let context = ir.legacy_context.expect("Direct context");
     let temps = scratch.reused(ir.temp_count as usize);
-    let mem = &LegacyAccess::new(memory);
+    let mem = &LegacyAccess::new(memory, legacy::physical_mask(context.generation));
     let mut steps = 0;
     let mut retired = 0;
     let mut start = 0;
@@ -2368,7 +2434,15 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
             memory.0.note_block_write(addr, usize::from(size));
         }
     };
-    let mut access = LegacyAccess::new(memory.0.normal());
+    // The alias keeps its 32-bit address formation (decision-23 §6).
+    let mut access = LegacyAccess::new(
+        memory.0.normal(),
+        if saved.is_some() {
+            u32::MAX
+        } else {
+            legacy::physical_mask(context.generation)
+        },
+    );
     access.writes = Some(&observe);
     let mut outcome = Outcome {
         retired: true,
@@ -2569,7 +2643,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
             ..
         } => {
             let linear = read_val(*addr, temps);
-            let (physical, part) = legacy::physical_span(cpu, linear, *size);
+            let (physical, part) = legacy::physical_span(cpu, mem.physical_mask, linear, *size);
             let completed = if part == *size {
                 match mem.atomic_rmw(physical, read_val(*src, temps), *size, *op) {
                     Ok(value) => {
@@ -2611,7 +2685,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 let trap_bytes = (0..*size)
                     .filter(|&byte| {
                         let linear = u64::from((linear as u32).wrapping_add(u32::from(byte)));
-                        let (physical, _) = legacy::physical_span(cpu, linear, 1);
+                        let (physical, _) =
+                            legacy::physical_span(cpu, mem.physical_mask, linear, 1);
                         matches!(mem.0.region_kind(physical, 1), Ok(crate::RegionKind::Trap))
                     })
                     .count();
@@ -2691,6 +2766,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
             let fp = PhysicalFpMemory::<ROUTED> {
                 memory: &mem.0,
                 a20_enabled: cpu.legacy.a20_enabled != 0,
+                physical_mask: mem.physical_mask,
                 fault: std::cell::Cell::new(None),
             };
             let _ordering = ordering::Barrier::<ORDER>::new(
@@ -2704,7 +2780,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 false,
             );
             if let Some((at, writing)) = crate::x87::exec_x87(cpu, &fp, *kind, address, *sti) {
-                let (physical, _) = legacy::physical_span(cpu, at, 1);
+                let (physical, _) = legacy::physical_span(cpu, mem.physical_mask, at, 1);
                 let exit = crate::fault::fp_exit(
                     cpu.rip,
                     physical,
@@ -2850,6 +2926,23 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     )
                     .map_err(|exit| stack_fault_access(exit, ir.ops, cpu.rip))?;
                 }
+                L::CoprocessorOverrun {
+                    segment,
+                    offset,
+                    bytes,
+                    access,
+                    vector,
+                    kind,
+                } => coprocessor_overrun(
+                    cpu,
+                    context,
+                    *segment,
+                    read_val(*offset, temps),
+                    *bytes,
+                    *access,
+                    *vector,
+                    *kind,
+                )?,
                 L::Coprocessor { bytes, len, wait } => {
                     // SDM Vol 3A §2.5 Table 2-2; 80386 PRM §§11.1.2–11.1.4:
                     // ESC tests EM/TS before operand checks; WAIT tests MP && TS.
@@ -2885,7 +2978,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     }
                 }
                 L::Enter { size, alloc, level } => {
-                    prepare_enter_displays(cpu, context, *size, *alloc, *level);
+                    prepare_enter_displays(cpu, context, mem.physical_mask, *size, *alloc, *level);
                     // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
                     // selects frame values independently of stack address size.
                     let stack_mask = mask(context.stack_address_bits / 8);
@@ -2917,7 +3010,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         let pushed = addresses[usize::from(i - 1)];
                         for byte in 0..*size {
                             let linear = u64::from((pushed as u32).wrapping_add(u32::from(byte)));
-                            let (physical, _) = legacy::physical_span(cpu, linear, 1);
+                            let (physical, _) =
+                                legacy::physical_span(cpu, mem.physical_mask, linear, 1);
                             overlay.push((physical, (value >> (byte * 8)) as u8));
                         }
                         let offset =
@@ -2934,6 +3028,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             .map(|byte| {
                                 legacy::physical_span(
                                     cpu,
+                                    mem.physical_mask,
                                     u64::from((address as u32).wrapping_add(u32::from(byte))),
                                     1,
                                 )
@@ -2980,6 +3075,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         if cached.is_none() {
                             record_enter_display(
                                 cpu,
+                                mem.physical_mask,
                                 first..mem.read_index.get(),
                                 i,
                                 address,
@@ -3321,7 +3417,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         if let Some(cs) = cs {
                             if tasks::transfer(
                                 cpu,
-                                mem.raw(),
+                                &mem.address_keyed(),
                                 context,
                                 cs,
                                 if return_ip.is_some() {
@@ -3693,7 +3789,13 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     if context.regime == legacy::MachineRegime::Protected
                         && cpu.rflags_system & 0x4000 != 0
                     {
-                        tasks::task_return(cpu, mem, context, next as u32, task_switch)?;
+                        tasks::task_return(
+                            cpu,
+                            &mem.address_keyed(),
+                            context,
+                            next as u32,
+                            task_switch,
+                        )?;
                         outcome.context_changed = true;
                         outcome.preserve_rf = true;
                         return Ok(true);
@@ -3733,6 +3835,42 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
         return Err(exit.into_exit());
     }
     Ok(false)
+}
+
+// 80286 PRM App. B #MP p. B-9: the attached coprocessor's transfer raises
+// the overrun "during the execution of the numeric instruction by the 80287".
+// App. B #MF p. B-9 tests the ERROR pin "at the beginning of most floating
+// point instructions", so a pending numeric error that the instruction tests
+// raises interrupt 16 first and the transfer never starts. ASSUMED (accepted
+// engine choice): the overrun is delivered as a fault of the ESC, before any
+// transfer; §9.6.3 pp. 9-10–11 describes an asynchronous event and Tables
+// 2-4/5-2 disagree on its return address (spec.md §17.10). With an empty
+// socket the CPU operand check that follows applies unchanged (decision-25).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn coprocessor_overrun(
+    cpu: &CpuState,
+    context: MachineContext,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+    access: AccessKind,
+    vector: u8,
+    kind: Option<crate::x87::FpuKind>,
+) -> Result<(), Exit> {
+    if cpu.fpu_model == crate::FpuModel::None
+        || segment_access(cpu, context, segment, offset, 1, access).is_err()
+        || segment_access(cpu, context, segment, offset, bytes, access).is_ok()
+    {
+        return Ok(());
+    }
+    if kind.is_some_and(|kind| crate::x87::mf_pending_before(cpu, kind)) {
+        return Err(exception(cpu, 16));
+    }
+    Err(legacy::coprocessor_overrun_fault(
+        cpu, vector, offset, bytes, access,
+    ))
 }
 
 pub(super) fn machine_specific(op: &IrOp) -> bool {
@@ -3818,7 +3956,7 @@ mod descriptor_update_tests {
             DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xa1)))));
             load_system_segment(
                 &mut cpu,
-                &LegacyAccess::<false, 0>::new(&vm.mem),
+                &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(generation)),
                 SystemRegister::Tr,
                 8,
                 1 << 1,
@@ -3849,7 +3987,7 @@ mod descriptor_update_tests {
                 DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, attr)))));
                 let exit = load_system_segment(
                     &mut cpu,
-                    &LegacyAccess::<false, 0>::new(&vm.mem),
+                    &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(generation)),
                     SystemRegister::Tr,
                     11,
                     1 << 1,
@@ -3888,7 +4026,7 @@ mod descriptor_update_tests {
                 DESCRIPTOR_UPDATE.with(|update| update.set(Some((0x2008, image(0x5000, 0xb2)))));
                 load_segment(
                     &mut cpu,
-                    &LegacyAccess::<false, 0>::new(&vm.mem),
+                    &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(generation)),
                     SegmentId::Ds,
                     if ldt { 12 } else { 8 },
                     generation,

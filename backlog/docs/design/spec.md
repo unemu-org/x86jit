@@ -1928,6 +1928,78 @@ There is no per-op model branch. PUSH-SP, count-mask and real-FLAGS quirks
 select the supported helper shape at lift time; each model supplies the shapes
 its policies require.
 
+Three `I80286` values from the 80286 PRM (210498-005) reach execution through
+the catalogue (xj-50w.11); the other entries keep theirs, and their identities
+are unchanged:
+- **Address width.** The physical-bus gate forms addresses at the entry's
+  `physical_bits`: a 24-bit address on `I80286`, so a part past FFFFFFh wraps
+  to the first megabyte and a transfer splits there (§6.4 p. 6-6; App. C
+  hardware item 2 p. C-3; App. D item 2 p. D-1). Data, descriptor-table,
+  task-state, coprocessor and fetch transfers all pass this gate. `I80386`
+  keeps 32 bits (80386 PRM §14.7 item 18 p. 14-7) and the Real16 alias its
+  frozen 32-bit formation. A Direct context never forms an address past
+  10FFEFh, so only Checked contexts can reach the wrap.
+- **LOCK.** `ModelQuirks::lock_data_movement`: LOCK with MOV, MOVS, INS and
+  OUTS raises no #UD ("LOCK should only be used with the XCHG, MOV, MOVS,
+  INS, and OUTS instructions", App. C item 11 p. C-2; App. B LOCK p. B-68
+  gives no real-mode exception). A locked MOV takes the engine's atomic path:
+  its store is one `IrOp::AtomicRmw` exchange, with the typed handoff every
+  locked device operand on this path gets; its load is one read, which the
+  memory layer performs as one host access for an aligned operand; a
+  register-only MOV transfers nothing. A locked store keeps the rule of every
+  locked operand: it lies in one region (§5.2, Data accesses across adjacent
+  regions; xj-ir6.12), so a locked MOV whose operand spans two adjacent
+  regions (RAM and RAM, or RAM and ROM) stops with `UnmappedMemory` before any
+  byte is written, where the unprefixed MOV completes. An operand split by the
+  A20 gate or at FFFFFFh takes the locked-operand fallback and completes. A
+  locked MOVS, INS or OUTS (repeated or not) would hold the bus across its
+  transfers, which the engine cannot do, so it returns `UnknownInstruction`
+  with the instruction's bytes before anything commits, in Direct and Checked
+  contexts alike, as the twenty-bit models' locked strings do (xj-50w.12).
+  Every other LOCK form keeps the strict decoder's disposition: locked
+  read-modify-write forms execute atomically as before, and LOCK on any other
+  register or string form stays #UD. That #UD is the engine's rule (the
+  maintainer's, as for xj-50w.12), not a manual value: App. B LOCK p. B-68
+  lists no real-mode LOCK exception and the #UD list of p. B-12 has no LOCK
+  case. `I80386` keeps #UD for these forms (80386 PRM §14.7 item 9 p. 14-6).
+- **Coprocessor operand overrun.** `ModelQuirks::coprocessor_overrun_vector`
+  is 9 on `I80286`. With an attached coprocessor, an operand larger than one
+  word whose first byte passes the segment check and whose end does not raises
+  interrupt 9, with no error code and the saved CS:IP on the instruction's
+  first byte, prefixes included (App. B #MP p. B-9; §5.2 Table 5-2 p. 5-6 and
+  p. 5-7; App. C Table C-1 and item 3, p. C-1). A one-word operand, or one
+  whose start lies outside the limit, keeps the CPU's exception 13. The start
+  test is on the operand's first byte, from Part II App. B item 7 p. B-2
+  ("Interrupt 13 will occur if the starting address of a numeric operand
+  falls outside a segment's size"). An operand of more than one word that
+  starts at the limit, so that its first word straddles it, therefore raises
+  9: its starting address is inside and its later words are outside (B-9).
+  READ: no page states the straddling first word explicitly, and Table C-1
+  gives 13 for "a word operation at offset 0FFFFH", which the engine applies
+  to one-word operands only. A pending numeric error that the instruction
+  tests raises interrupt 16 first: B-9 tests ERROR "at the beginning of most
+  floating point instructions", while interrupt 9 "occurs during the
+  execution of the numeric instruction by the 80287". Nothing
+  of the operand is transferred and the coprocessor image is unchanged.
+  ASSUMED, an engine choice the maintainer accepted: the manual describes the
+  interrupt as an asynchronous demand of the coprocessor's data channel,
+  raised "any time after the processor extension is started", in a task that
+  need not be the one that executed the ESC (§9.6.3 pp. 9-10–11), and Table 2-4
+  p. 2-26 answers "No" for its return address where Table 5-2 p. 5-6 and the
+  p. 5-7 prose put it on the instruction; the engine delivers it as a fault of
+  the ESC instruction. With `FpuModel::None` the CPU's whole-operand check
+  stays (decision-25).
+  Coprocessor instructions in protected mode remain a typed refusal on the
+  Machine path, so the interrupt arises in real mode. `I80386` keeps 12/13
+  (80386 PRM §14.6 Table 14-1 p. 14-5).
+
+The instruction-length limit is the entry's `max_insn_len` in both segment
+classes (xj-50w.13). A Direct block stops before an instruction longer than
+the limit and lifts it from the bytes a fetch would hold, so an eleven-byte
+`I80286` instruction raises #GP at its first byte in Direct as in Checked
+(App. C item 10 p. C-2; App. B #GP p. B-9; decision-23, "The 80286 over-length
+fault").
+
 
 Decision-23 C2 adds `I8088` and `I8086`. Both select the 8086 instruction set,
 `system = None`, twenty physical address bits, no instruction-length limit,

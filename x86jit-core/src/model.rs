@@ -121,6 +121,20 @@ pub struct ModelQuirks {
     /// instruction") and p. 12-172 EI state no condition. Otherwise only an
     /// STI that begins with IF = 0 does (SDM Vol 2B §4.3 STI).
     pub ei_delay_unconditional: bool,
+    /// LOCK may prefix MOV, MOVS, INS and OUTS without #UD (80286 PRM App. C
+    /// item 11 p. C-2). A locked MOV takes the engine's atomic path; a locked
+    /// MOVS, INS or OUTS, whose transfers the engine cannot hold the bus
+    /// across, ends in a typed handoff (`Exit::UnknownInstruction`). Other
+    /// LOCK forms follow the decode set: #UD outside the lockable forms, a
+    /// manual value on the 80386 (80386 PRM §14.7 item 9 p. 14-6) and the
+    /// engine's rule on the 80286, whose App. B LOCK p. B-68 and #UD p. B-12
+    /// give no LOCK #UD.
+    pub lock_data_movement: bool,
+    /// Vector raised when a coprocessor memory operand larger than one word
+    /// starts inside its segment and ends past it (80286 PRM App. B #MP
+    /// p. B-9; §5.2 p. 5-7; App. C Table C-1 p. C-1). Only an attached
+    /// coprocessor raises it; `None` keeps the CPU's whole-operand check.
+    pub coprocessor_overrun_vector: Option<u8>,
 }
 
 /// Reserved catalogue handle for a cycle table (decision-23, Timing model).
@@ -201,6 +215,8 @@ static I80286: ModelProfile = identified(ModelProfile {
         segment_store_inhibits_interrupts: false,
         step_irq_conflict_refused: false,
         ei_delay_unconditional: false,
+        lock_data_movement: true,
+        coprocessor_overrun_vector: Some(9),
     },
     system: ModelSystem::Msw286,
     physical_bits: 24,
@@ -239,6 +255,8 @@ static I80386: ModelProfile = identified(ModelProfile {
         segment_store_inhibits_interrupts: false,
         step_irq_conflict_refused: false,
         ei_delay_unconditional: false,
+        lock_data_movement: false,
+        coprocessor_overrun_vector: None,
     },
     system: ModelSystem::Cr386,
     physical_bits: 32,
@@ -281,6 +299,8 @@ const fn early_model(identity: u64) -> ModelProfile {
             segment_store_inhibits_interrupts: false,
             step_irq_conflict_refused: false,
             ei_delay_unconditional: false,
+            lock_data_movement: false,
+            coprocessor_overrun_vector: None,
         },
         system: ModelSystem::None,
         physical_bits: 20,
@@ -342,6 +362,8 @@ const fn nec_model(identity: u64) -> ModelProfile {
             segment_store_inhibits_interrupts: true,
             step_irq_conflict_refused: true,
             ei_delay_unconditional: true,
+            lock_data_movement: false,
+            coprocessor_overrun_vector: None,
         },
         system: ModelSystem::None,
         physical_bits: 20,
@@ -522,6 +544,19 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
     if matches!(p.isa, ModelIsa::NecV20) {
         hash = word(hash, NEC_EXTENSION_REVISION);
     }
+    // The 80286 LOCK and coprocessor-overrun fields (xj-50w.11). Their
+    // canonical values are false and None, so only a departing entry hashes
+    // them and no other identity changes.
+    if p.quirks.lock_data_movement || p.quirks.coprocessor_overrun_vector.is_some() {
+        hash = word(hash, p.quirks.lock_data_movement as u64);
+        hash = word(
+            hash,
+            match p.quirks.coprocessor_overrun_vector {
+                Some(v) => v as u64,
+                None => 256,
+            },
+        );
+    }
     p.semantics_id = hash;
     p
 }
@@ -550,7 +585,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..21 {
+            for change in 0..23 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -573,12 +608,48 @@ mod tests {
                     17 => changed.quirks.segment_store_inhibits_interrupts = true,
                     18 => changed.quirks.step_irq_conflict_refused = true,
                     19 => changed.quirks.ei_delay_unconditional = true,
+                    20 => changed.quirks.lock_data_movement ^= true,
+                    21 => {
+                        changed.quirks.coprocessor_overrun_vector =
+                            match changed.quirks.coprocessor_overrun_vector {
+                                Some(_) => None,
+                                None => Some(9),
+                            }
+                    }
                     _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);
             }
         }
         assert_ne!(I80286.semantics_id, I80386.semantics_id);
+    }
+
+    // xj-50w.11: the 80286 LOCK and coprocessor-overrun fields change only the
+    // I80286 identity. The other entries keep their b2ac76e4 values, pinned by
+    // value; I80286's departs from 3699e02a8ef13e63.
+    #[test]
+    fn only_the_80286_identity_follows_its_new_quirk_fields() {
+        for (model, identity) in [
+            (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f_u64),
+            // The 8086-family values after xj-50w.12's LOCK revision word.
+            (CpuModel::I8088, 0x8815_844f_bd9d_4559),
+            (CpuModel::I8086, 0x8815_844f_bd9d_4557),
+            (CpuModel::NecV20, 0x2a38_6bfd_83ff_8f1f),
+            (CpuModel::NecV30, 0x2a38_6bfd_83ff_8f27),
+        ] {
+            assert_eq!(model.profile().semantics_id, identity, "{model:?}");
+            assert!(!model.profile().quirks.lock_data_movement, "{model:?}");
+            assert_eq!(model.profile().quirks.coprocessor_overrun_vector, None);
+        }
+        let q = CpuModel::I80286.profile().quirks;
+        assert!(q.lock_data_movement);
+        assert_eq!(q.coprocessor_overrun_vector, Some(9));
+        assert_ne!(I80286.semantics_id, 0x3699_e02a_8ef1_3e63);
+        // Restoring the canonical values restores the earlier identity.
+        let mut earlier = copy(&I80286);
+        earlier.quirks.lock_data_movement = false;
+        earlier.quirks.coprocessor_overrun_vector = None;
+        assert_eq!(identified(earlier).semantics_id, 0x3699_e02a_8ef1_3e63);
     }
 
     // Decision-23 C4a: the NEC entries share content and differ in identity;

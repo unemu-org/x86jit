@@ -157,6 +157,10 @@ pub(crate) fn instruction(
         crate::model::decode::decoder_options_for_generation(context.generation),
     );
     let mut insn = decoder.decode();
+    let mut locked_mov = false;
+    if insn.is_invalid() && profile.quirks.lock_data_movement {
+        locked_mov = relock(&mut insn, code, ip, context, profile)?;
+    }
     let mode = if context.default_operand_bits == 16 {
         CpuMode::Real16
     } else {
@@ -254,6 +258,11 @@ pub(crate) fn instruction(
                 )
         });
         let mut pop_stack = insn.mnemonic() == Mnemonic::Pop;
+        let operand_access = if writing {
+            crate::AccessKind::Write
+        } else {
+            crate::AccessKind::Read
+        };
         for op in &mut ops.values {
             if let IrOp::Legacy(L::Address {
                 access, segment, ..
@@ -272,12 +281,16 @@ pub(crate) fn instruction(
                 {
                     continue;
                 }
-                *access = if writing {
-                    crate::AccessKind::Write
-                } else {
-                    crate::AccessKind::Read
-                };
+                *access = operand_access;
             }
+        }
+        if esc {
+            if let Some(vector) = profile.quirks.coprocessor_overrun_vector {
+                coprocessor_overrun(&insn, &mut ops.values, operand_access, vector);
+            }
+        }
+        if locked_mov {
+            lock_stores(&mut ops.values, &mut tg);
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
@@ -304,6 +317,127 @@ pub(crate) fn instruction(
         ops: ops.values,
         legacy_context: Some(context),
     })
+}
+
+// 80286 PRM App. C item 11 p. C-2: "LOCK should only be used with the XCHG,
+// MOV, MOVS, INS, and OUTS instructions", so none of them raises #UD. A locked
+// MOV takes the engine's atomic path (`lock_stores`). A locked MOVS, INS or
+// OUTS holds the bus across its transfers, which the engine cannot do: a
+// typed handoff (`UnknownInstruction`) before anything commits, as for the
+// twenty-bit models' locked strings (xj-50w.12). Returns whether `insn` is
+// now a locked MOV.
+#[cold]
+#[inline(never)]
+fn relock(
+    insn: &mut Instruction,
+    code: &[u8],
+    ip: u32,
+    context: MachineContext,
+    profile: &crate::ModelProfile,
+) -> Result<bool, LiftError> {
+    let Some(locked) = crate::model::decode::locked_data_movement(
+        code,
+        u32::from(context.default_operand_bits),
+        u64::from(ip),
+        crate::model::decode::decoder_options_for_generation(context.generation),
+    ) else {
+        return Ok(false);
+    };
+    *insn = locked;
+    // A form the decode set does not define keeps its #UD.
+    if matches!(
+        profile.isa.decode(code, insn),
+        crate::model::decode::DecodeAction::Absent(_)
+    ) {
+        return Ok(false);
+    }
+    if insn.mnemonic() != Mnemonic::Mov {
+        return Err(refill_unsupported_bytes(
+            unsupported_insn(insn),
+            code,
+            u64::from(ip),
+        ));
+    }
+    Ok(true)
+}
+
+// A locked MOV's store is one atomic exchange whose old value is discarded:
+// the path `IrOp::AtomicRmw` gives every locked operand on this path,
+// including the typed handoff for a device operand. A load is one read,
+// which the memory layer already performs as one host access when the
+// operand is naturally aligned; a register-only MOV transfers nothing.
+#[cold]
+#[inline(never)]
+fn lock_stores(ops: &mut [IrOp], tg: &mut TempGen) {
+    for op in ops {
+        if let IrOp::Store {
+            fault,
+            addr,
+            src,
+            size,
+            ..
+        } = *op
+        {
+            *op = IrOp::AtomicRmw {
+                fault,
+                old: tg.fresh(),
+                addr,
+                src,
+                size,
+                op: crate::ir::RmwOp::Xchg,
+            };
+        }
+    }
+}
+
+// 80286 PRM App. B #MP p. B-9: a coprocessor operand larger than one word
+// whose second or later words lie outside the segment raises interrupt 9; one
+// whose start lies outside, or a one-word operand, takes the CPU's limit fault
+// (#GP), as do writes to a read-only segment. §5.2 p. 5-7 and App. C Table C-1
+// p. C-1 state the real-mode case ("does not fit in a segment"; "exceeded
+// offset 0FFFFH"). The check precedes the operand's CPU limit check; the
+// interpreter delivers it as a fault of the ESC (ASSUMED, spec.md §17.10).
+#[inline(never)]
+fn coprocessor_overrun(
+    insn: &Instruction,
+    ops: &mut Vec<IrOp>,
+    access: crate::AccessKind,
+    vector: u8,
+) {
+    let bytes = insn.memory_size().size();
+    if bytes <= 2 || !insn.op_kinds().any(|k| k == OpKind::Memory) {
+        return;
+    }
+    let Some((at, offset)) = ops.iter().enumerate().find_map(|(at, op)| match op {
+        IrOp::Legacy(L::Address {
+            offset,
+            bytes: size,
+            ..
+        })
+        | IrOp::SegLimitCheck { offset, size, .. }
+            if usize::from(*size) == bytes =>
+        {
+            Some((at, *offset))
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+    let kind = ops.iter().find_map(|op| match op {
+        IrOp::X87 { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    ops.insert(
+        at,
+        IrOp::Legacy(L::CoprocessorOverrun {
+            segment: segment(insn.memory_segment()).expect("memory segment"),
+            offset,
+            bytes: bytes as u8,
+            access,
+            vector,
+            kind,
+        }),
+    );
 }
 
 // spec.md §16: only a fault after a CPU-state commit needs rollback. Helper
@@ -356,6 +490,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
             IrOp::Legacy(op) => !matches!(
                 op,
                 L::Address { .. }
+                    | L::CoprocessorOverrun { .. }
                     | L::DirectStackAddress { .. }
                     | L::ReadSelector { .. }
                     | L::ReadControl { .. }

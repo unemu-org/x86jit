@@ -836,6 +836,19 @@ pub enum LegacyOp {
     Refuse {
         operation: crate::UnsupportedSystemOperation,
     },
+    /// A coprocessor operand of `bytes` (more than one word) whose first byte
+    /// passes the segment check and whose end does not raises `vector` when a
+    /// coprocessor is attached (the model's `coprocessor_overrun_vector`).
+    /// Otherwise the following CPU operand check applies. A pending numeric
+    /// error that `kind` tests at its start raises interrupt 16 first.
+    CoprocessorOverrun {
+        segment: SegmentId,
+        offset: crate::ir::Val,
+        bytes: u8,
+        access: crate::AccessKind,
+        vector: u8,
+        kind: Option<crate::x87::FpuKind>,
+    },
     /// Ordinary real-mode SS:SP address with a model-constant whole-operand gate.
     DirectStackAddress {
         dst: crate::ir::Temp,
@@ -1087,22 +1100,89 @@ pub(crate) fn segment_fault(
     // Real-address pseudo-protection faults carry no error code (80386
     // PRM §14.1 p. 14-1; §14.6 Table 14-1 p. 14-5). Protected codes
     // define only bits 15:0 on I386 (PRM §9.7 Fig. 9-7, scan checked).
-    let mut details = crate::fault::FaultMetadata::architectural_exception(
-        cpu.rip,
-        cpu.rip,
+    operand_fault(
+        cpu,
         vector,
-        crate::fault::FaultClass::Fault,
+        offset,
+        bytes,
+        access,
         if cpu.legacy.cr0 & 1 != 0 {
             crate::fault::ErrorCode::bits(0, 0xffff)
         } else {
             crate::fault::ErrorCode::NoCode
         },
+    )
+}
+
+/// The 80286 coprocessor operand overrun, with the operand evidence and no
+/// error code in either mode (I286 PRM Table 9-3 p. 9-9; App. B #MP p. B-9).
+#[cold]
+pub(crate) fn coprocessor_overrun_fault(
+    cpu: &CpuState,
+    vector: u8,
+    offset: u64,
+    bytes: u8,
+    access: crate::AccessKind,
+) -> crate::Exit {
+    operand_fault(
+        cpu,
+        vector,
+        offset,
+        bytes,
+        access,
+        crate::fault::ErrorCode::NoCode,
+    )
+}
+
+fn operand_fault(
+    cpu: &CpuState,
+    vector: u8,
+    offset: u64,
+    bytes: u8,
+    access: crate::AccessKind,
+    error_code: crate::fault::ErrorCode,
+) -> crate::Exit {
+    let mut details = crate::fault::FaultMetadata::architectural_exception(
+        cpu.rip,
+        cpu.rip,
+        vector,
+        crate::fault::FaultClass::Fault,
+        error_code,
     );
     details.path = crate::fault::FaultPath::Interpreter;
     details.operand_base = crate::fault::Knowledge::Known(offset);
     details.operand_size = crate::fault::Knowledge::Known(u16::from(bytes));
     details.access = crate::fault::Knowledge::Known(access.into());
     crate::Exit::exception(cpu.rip, vector).with_fault_metadata(details)
+}
+
+/// The catalogue entry whose bus and fetch values a generation's context
+/// uses. The twenty-bit generation takes the 8086-family values (I8088 and
+/// I8086 share them, 8086 Family UM App. B pp. B-31–32).
+pub(crate) const fn bus_model(generation: CpuGeneration) -> crate::CpuModel {
+    match generation {
+        CpuGeneration::I8086 => crate::CpuModel::I8088,
+        CpuGeneration::I286 => crate::CpuModel::I80286,
+        CpuGeneration::I386 => crate::CpuModel::I80386,
+    }
+}
+
+/// The catalogue's formed physical-address width for a context, as a mask
+/// (decision-23 §2): 24 bits on the 80286, which "sums the 24-bit segment
+/// base and the specified 16-bit offset to generate the resulting 24-bit
+/// physical address" (I286 PRM §6.4 p. 6-6; App. C hardware item 2 p. C-3),
+/// 32 on the 80386 (80386 PRM §14.7 item 18 p. 14-7) and 20 on the 8086
+/// family. Const blocks read the catalogue once, at compile time.
+#[inline(always)]
+pub(crate) const fn physical_mask(generation: CpuGeneration) -> u32 {
+    const fn mask(model: crate::CpuModel) -> u32 {
+        (((1u64 << model.profile().physical_bits) - 1) & 0xffff_ffff) as u32
+    }
+    match generation {
+        CpuGeneration::I8086 => const { mask(bus_model(CpuGeneration::I8086)) },
+        CpuGeneration::I286 => const { mask(bus_model(CpuGeneration::I286)) },
+        CpuGeneration::I386 => const { mask(bus_model(CpuGeneration::I386)) },
+    }
 }
 
 /// Final physical-bus gate, also for future page-walk transfers (decision-22).
@@ -1112,15 +1192,25 @@ pub(crate) fn segment_fault(
 /// CPU pin to Intel486. I286 PRM Appendix C, software item 16 and hardware
 /// item 2 (p. C-3), prescribe external gating of A20 for real-mode wrapping;
 /// 80386 PRM §14.7 item 18 describes the unmasked address above 1 MiB.
-pub(crate) fn physical_span(cpu: &CpuState, address: u64, bytes: u8) -> (u64, u8) {
-    physical_span_with_gate(cpu.legacy.a20_enabled != 0, address, bytes)
+/// `mask` is the model's [`physical_mask`].
+pub(crate) fn physical_span(cpu: &CpuState, mask: u32, address: u64, bytes: u8) -> (u64, u8) {
+    physical_span_with_gate(cpu.legacy.a20_enabled != 0, mask, address, bytes)
 }
 
-pub(crate) fn physical_span_with_gate(enabled: bool, address: u64, bytes: u8) -> (u64, u8) {
+pub(crate) fn physical_span_with_gate(
+    enabled: bool,
+    mask: u32,
+    address: u64,
+    bytes: u8,
+) -> (u64, u8) {
     // SDM Vol 3A §3.4: wrap each linear part before applying the bus gate,
     // and split transfers that cross the end of the 32-bit linear space.
-    let address = u64::from(address as u32);
-    let bytes = u64::from(bytes).min((1u64 << 32) - address) as u8;
+    // The 80286 forms 24-bit addresses: a part past FFFFFFh wraps to the
+    // first megabyte (I286 PRM §6.4 p. 6-6; App. D item 2 p. D-1), so its
+    // transfers split at the end of the 24-bit space.
+    let mask = u64::from(mask);
+    let address = address & mask;
+    let bytes = u64::from(bytes).min(mask - address + 1) as u8;
     if enabled {
         (address, bytes)
     } else {

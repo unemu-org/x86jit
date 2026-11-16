@@ -98,10 +98,11 @@ fn catalogue_identities_change_only_for_the_nec_entries() {
     // gain the extension revision word and keep differing by bus. The
     // twenty-bit values are those after xj-50w.12, which changed all four
     // (legacy_i8086.rs `lock_admission_changes_only_the_twenty_bit_identities`).
+    // I80286 takes its xj-50w.11 quirk fields (3699e02a8ef13e63 before them).
     for (model, id) in [
         (CpuModel::I8088, 0x8815_844f_bd9d_4559),
         (CpuModel::I8086, 0x8815_844f_bd9d_4557),
-        (CpuModel::I80286, 0x3699_e02a_8ef1_3e63),
+        (CpuModel::I80286, 0x24d3_4f81_af8d_a20b),
         (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f),
         (CpuModel::NecV20, 0x2a38_6bfd_83ff_8f1f),
         (CpuModel::NecV30, 0x2a38_6bfd_83ff_8f27),

@@ -393,7 +393,8 @@ fn catalogue_pins_current_machine_profiles() {
             ModelSystem::Msw286,
             24,
             10,
-            0x3699e02a8ef13e63,
+            // xj-50w.11 adds the LOCK and coprocessor-overrun quirk fields.
+            0x24d34f81af8da20b,
             0xf000,
         ),
         (

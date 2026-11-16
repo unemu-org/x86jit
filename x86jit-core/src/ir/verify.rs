@@ -420,6 +420,9 @@ impl IrBlock {
                         check(&[cs.unwrap_or(Val::Imm(0)), *ip], &[])?
                     }
                     crate::legacy::LegacyOp::Table { addr, .. } => check(&[*addr], &[])?,
+                    crate::legacy::LegacyOp::CoprocessorOverrun { offset, .. } => {
+                        check(&[*offset], &[])?
+                    }
                     crate::legacy::LegacyOp::ReadControl { dst, .. } => check(&[], &[*dst])?,
                     crate::legacy::LegacyOp::WriteControl { value, .. } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
