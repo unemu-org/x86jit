@@ -3,7 +3,7 @@
 //! it. Syscalls trap out as `Exit::Syscall` for the embedder to service — this
 //! example implements only `write` and `exit`, enough for a freestanding program.
 //! For a real Linux userland (a full syscall shim, fd table, fork) use
-//! [`unemulinux`](https://github.com/unemu-org/unemulinux).
+//! `unemulinux` (to be published).
 //!
 //! Build a suitable input and run it:
 //! ```sh

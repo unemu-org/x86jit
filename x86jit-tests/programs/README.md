@@ -1,6 +1,7 @@
 # Guest programs
 
-One file, and it is our own work:
+One file. The program is our own work; the binary statically links musl libc, whose
+licence notice is [below](#licence-notice-musl-libc-in-pthreadself):
 
 | File | What | Used by |
 |---|---|---|
@@ -15,11 +16,23 @@ waking them — without needing a Linux userland.
 is reproducible in behaviour (any equivalent four-thread mutex program would do) but not
 byte-for-byte. Reconstructing the source is open work.
 
+## Licence notice: musl libc in `pthreads.elf`
+
+`pthreads.elf` is statically linked against [musl libc](https://musl.libc.org/), so the
+binary contains musl's code. musl is MIT-licensed, and the MIT licence requires its
+copyright and permission notice to accompany every copy of the binary. The musl release
+it was linked against was not recorded.
+
+musl's copyright and permission notice is in [`MUSL-COPYRIGHT`](MUSL-COPYRIGHT), copied
+verbatim from the `COPYRIGHT` file of musl 1.2.6. musl is MIT-licensed as a whole; the
+notice of the release actually linked was not recorded, and the 1.2.6 file carries the
+same MIT terms.
+
 ## Where everything else went
 
 The third-party guest binaries this directory used to hold — busybox, sqlite3, lua,
 `djpeg`, CPython and its stdlib subset, the glibc and musl loaders, the Go servers — moved
-to [`unemulinux`](https://github.com/unemu-org/unemulinux) with the syscall shim that makes
+to `unemulinux` (a separate repository) with the syscall shim that makes
 them runnable, and are fetched and checksum-pinned there rather than committed.
 
 That move also ended this repository's redistribution of `busybox` (GPL-2.0), the glibc

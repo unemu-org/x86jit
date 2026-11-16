@@ -50,12 +50,12 @@ done
   if [[ "$if_present" == 1 ]]; then
     echo "SKIP: the real-program ladder did not run — unemulinux is not at $unemulinux." >&2
     echo "      ISA-level tests alone cannot tell you what real software trips over." >&2
-    echo "      git clone https://github.com/unemu-org/unemulinux $unemulinux" >&2
+    echo "      Clone unemulinux (a separate repository, to be published) to $unemulinux." >&2
     exit 0
   fi
   echo "error: unemulinux not found at $unemulinux" >&2
-  echo "       clone it, or point UNEMULINUX_DIR at it:" >&2
-  echo "       git clone https://github.com/unemu-org/unemulinux $unemulinux" >&2
+  echo "       clone unemulinux (a separate repository, to be published) to" >&2
+  echo "       $unemulinux, or point UNEMULINUX_DIR at a checkout." >&2
   # Exit 2, never 0: 'the ladder did not run' must not look like 'the ladder passed'.
   exit 2
 }

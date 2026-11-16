@@ -1,3 +1,12 @@
+// Modified by the x86jit project. This file is changed from cranelift-jit 0.135.8
+// (crates.io, sha256 31d67d6c6a02ffd860599e55b03d4f37c6cf9be678c1d68dbfa6d1f61946e4ae;
+// wasmtime commit 7b6c29ec3e9a49c97da231665cbd8eead9ccbda0, path cranelift/jit),
+// licensed Apache-2.0 WITH LLVM-exception (LICENSE in this directory).
+// Changed: `SystemMemoryProvider::finalize_with`, a callback around each
+// protection, cache-maintenance and pipeline-sync operation; those failures are
+// returned as errors instead of panicking.
+// README.md in this directory lists every changed file.
+
 use std::io;
 use std::mem;
 use std::ptr;

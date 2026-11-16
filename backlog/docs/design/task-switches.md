@@ -212,24 +212,17 @@ witness also failed separately, observing 0203h rather than 4203h.
 The corrected `legacy_task_switch` suite passed **65 tests**; all other
 `legacy_*` suites passed **332 tests**, for **397 passed** in total.
 `legacy_upper_audit` has no enabled tests on the ARM host. Commands used at most
-four build jobs, a 180-second timeout per test command and the isolated
-`CARGO_TARGET_DIR=/private/tmp/xj-srh25-target`. Before each Cargo command:
-
-```sh
-for i in $(seq 1 30); do [ -f /private/tmp/orbkit-live.lock ] || break; sleep 30; done
-```
+four build jobs, a 180-second timeout per test command and a separate
+`CARGO_TARGET_DIR`.
 
 `cargo clippy --offline --all-targets --all-features -- -D warnings`,
-`cargo fmt --all -- --check` and `git diff --check` passed. No commits, bead
-operations or git writes were performed.
+`cargo fmt --all -- --check` and `git diff --check` passed.
 
 ## Initial implementation validation
 
-Every Cargo command first waits with
-`while [ -f /private/tmp/orbkit-live.lock ]; do sleep 30; done`.
 All commands use at most six Cargo jobs, a 180-second timeout per command,
-one test binary at a time, and one libtest thread. Build artifacts used
-`CARGO_TARGET_DIR=/private/tmp/xj-srh18-target`. The test-only compiler wrapper
+one test binary at a time, and one libtest thread. Build artifacts used a
+separate `CARGO_TARGET_DIR`. The test-only compiler wrapper
 selected the installed linker for a core witness that launches rustc directly;
 repository toolchain configuration was unchanged.
 

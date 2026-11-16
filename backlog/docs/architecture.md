@@ -9,7 +9,7 @@ created_date: '2026-07-06 11:25'
 
 > **The Linux userland moved out (2026-08-04).** The syscall shim, process model,
 > OCI/ELF runner and the whole-program test ladder now live in a separate project,
-> [`unemulinux`](https://github.com/unemu-org/unemulinux), which embeds this library.
+> `unemulinux`, which embeds this library.
 > Passages below describing `x86jit-linux`, `x86jit-cli`, or running busybox/sqlite/
 > CPython/Go describe work that happened in this repository's history and now lives
 > there. What stays here is the recompiler: core, the Cranelift backend, the ELF
@@ -34,7 +34,7 @@ x86jit/
 ```
 
 The syscall shim, the process model and the OCI/ELF runner are **not** here — they live in
-[`unemulinux`](https://github.com/unemu-org/unemulinux), which embeds this library. `x86jit-core`'s
+`unemulinux`, which embeds this library. `x86jit-core`'s
 dependency set is exactly `{iced-x86}`, and `x86jit-tests/tests/boundary.rs` fails the build if
 that changes.
 

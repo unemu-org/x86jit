@@ -9,6 +9,25 @@ created_date: '2026-08-09 14:49'
 
 # Republish handoff
 
+## 2026-11-16: the publication plan changed
+
+The maintainer changed the plan on 2026-11-16. **The history is kept:** the existing
+history is published with the third-party binaries filtered out of it, and the result is
+re-signed. Re-signing gives every commit a new id, so the consumer re-pin steps below still
+apply, with the rewritten commit in place of an orphan commit. Commit ids quoted in this
+document name commits of the history before the rewrite.
+
+Superseded by this change, and left below as written:
+
+- "History is discarded: both projects get a fresh single initial commit" under *What we are
+  doing*, step 5 of *Before the repo is created* ("orphan branch, one signed commit") and
+  every other mention of the orphan commit.
+- *Where things stand* and the open-task table, which predate the 2026-11-04 move to beads.
+  The aarch64 lane recorded as green in step 1 ran before that date; the workflow has not run
+  since, so the first run on the public repository has to be checked.
+- The unemupc98 pin named under *Consumers and their pins* has moved since registration; take
+  the current pin from that project's manifest.
+
 **Read this before touching the republish.** Rewritten 2026-08-15 at `621db28`;
 earlier versions are in the history of this file.
 
@@ -25,6 +44,7 @@ Three decisions are settled and not open for re-litigation:
 
 - The Linux userland is split into `unemulinux`. Maintainer's call.
 - History is discarded: both projects get a fresh single initial commit.
+  *(Superseded 2026-11-16: see the top section.)*
 - The real-program ladder still runs — in `unemulinux` now. The split makes the CI job
   span two repositories; it does **not** remove coverage.
 
@@ -189,7 +209,7 @@ wrong with it.
    CPU-model / OS / architecture label. Matching labels do not identify a unique
    machine; compare measurements taken on the same machine.
 
-   *(Added 2026-11-04, after the move to beads and the private remote.)* The issue database
+   *(Added 2026-11-04, after the move to beads.)* The issue database
    travels with the repository as `refs/dolt/data`, and the orphan commit drops git history but
    not Dolt history: earlier bead and memory text (one epic description named a console before it
    was reworded) survives there. Before `refs/dolt/data` first goes to a public remote, squash it
@@ -205,6 +225,8 @@ wrong with it.
    `cd oracles && ./fetch-oracles.sh verify`.
 
 5. Only then: orphan branch, one signed commit, `gh repo create`.
+   *(Superseded 2026-11-16: the filtered, re-signed history replaces the orphan commit; see
+   the top section.)*
 
 `unemulinux` is publishable on the same schedule; see its own `backlog/`.
 
@@ -217,32 +239,32 @@ wrong with it.
 - **unemulinux is published too**, on the same schedule, with its own checklist in its
   `backlog/`.
 - **CI:** `.github/workflows/ci.yml` (x86-64 and aarch64 GitHub-hosted lanes, gate in
-  `scripts/ci-gate.sh`) is ready; it has not run on GitHub yet. The Forgejo workflow stays for
-  the private origin. Whether this repository also gates on unemulinux's ladder stays with
+  `scripts/ci-gate.sh`) is ready; it has not run on GitHub yet. The `.forgejo` workflow is for
+  a self-hosted forge. Whether this repository also gates on unemulinux's ladder stays with
   xj-jge.1; until then the README says so.
-- **Beads history (xj-6o4):** clean it before `refs/dolt/data` goes public: keep a private
-  archive of the current ref on the private origin, re-scan every bead and memory, then
+- **Beads history (xj-6o4):** clean it before `refs/dolt/data` goes public: keep an
+  archive of the current ref on the configured origin, re-scan every bead and memory, then
   `bd flatten` and re-scan. Bead owner fields carry the maintainer's own identity, the same
   one the commits carry.
 - **Consumers and their pins.** The orphan commit discards history, so every consumer's pin
   stops resolving publicly. Before the republish:
-  1. Tag the current `main` on the private origin as `archive/pre-republish` and never
-     force-push or delete history there; every existing pin stays fetchable from the
-     private origin.
+  1. Tag the current `main` on the configured origin as `archive/pre-republish` and never
+     force-push or delete history there; every existing pin stays fetchable from that
+     origin.
   2. Known consumers, and what they pin:
      - **unemulinux** builds against `../x86jit` as a path dependency, and its CI checks
        x86jit out beside it at the revision under test. It pins no revision; after the
        republish it follows the public `main`. Re-validate: its unit tests and the
        real-program ladder.
      - **A downstream emulator embedder** pins exact x86jit revisions of the current history
-       (most recently the series that ends at the latest `main`), fetched from the private
-       origin and kept in local checkouts per pin. After the republish it re-pins to the
+       (most recently the series that ends at the latest `main`), fetched from the
+       configured origin. After the republish it re-pins to the
        public commit whose tree equals its current pin's tree (the orphan commit's tree is
        identical to `main` at the republish), then re-runs its own gate and its VM-backed
        acceptance suites.
      - **unemupc98** (a PC/AT emulator that runs x86jit in `CpuMode::Real16` on the
        interpreter backend) pins `x86jit-core` as a git dependency at an exact revision of
-       `main` (b0c9ae5 at registration), fetched from the private origin. After the
+       `main` (b0c9ae5 at registration), fetched from the configured origin. After the
        republish it re-pins to the public commit whose tree equals its pin, then re-runs
        its unit tests and slow goldens (BIOS POST, DOS boot, directory listing, file write).
        Registered by xj-39u.1.
@@ -315,8 +337,6 @@ Tooling, still true:
 - **`git checkout <file>` to undo a negative control discards the whole file's work.**
   Cost a full re-apply of six changes in `interp/mod.rs` this session, and the same
   mistake had already happened once with `compare.rs`. Copy the file aside first.
-- **`rtk` shims `git`, `grep` and `cat`.** `cat` strips Rust function bodies. Use
-  `rtk proxy <cmd>` when a result surprises you.
 - **git quotes non-ASCII paths.** Every task filename has an em-dash.
 - **Slash lists survive a renumber with only their first element updated.**
 - **`git add -A` before a commit whose message describes one change** produced a 74-file

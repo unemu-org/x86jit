@@ -20,7 +20,7 @@ Supports static, static-PIE, and (with `load_dynamic_elf`) dynamically-linked
 images. Syscalls trap out as `Exit::Syscall` for the embedder to service — this
 crate loads a program, it does not run an operating system. For a Linux userland
 (syscall shim, process model, runner) see
-[`unemulinux`](https://github.com/unemu-org/unemulinux).
+`unemulinux` (to be published).
 
 Runnable example: `run_elf`
 (`cargo run -p x86jit-elf --example run_elf -- <static-elf>`).

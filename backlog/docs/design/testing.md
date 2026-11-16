@@ -11,7 +11,7 @@ Companion document to `spec.md` (v0.3). Version 0.1.
 
 > **Scope note (2026-08-04).** Levels 1-2 — instruction vectors, the differential oracles,
 > the fuzzers, the 80286 corpus — live in this repository. **Level 3, the whole-program
-> ladder (§12), moved to [`unemulinux`](https://github.com/unemu-org/unemulinux)** with the
+> ladder (§12), moved to `unemulinux`** with the
 > Linux userland that makes running a real ELF possible. §12 and the `programs/` references
 > below still describe the method — it is simply exercised in that repository now.
 

@@ -1450,6 +1450,12 @@ fn hand_back_is_rejected_while_mmio_is_in_flight() {
 //   then RETI. The routine's PUSH leaves one word below the service frame
 //   (3000:7FF2), which the memory comparison adds.
 // - The NMI cases are not ported: x86jit has no NMI input (xj-50w.19).
+//
+// The vector text is Copyright (c) 2026 Mikołaj Mikołajczyk, from x80
+// (https://github.com/unemu-org/x80, to be published), commit
+// 2d5a5354ea1b3b3005a13e4594d753a1896006e5, licensed MIT OR Apache-2.0 at your
+// option. PROVENANCE.md §5 carries the MIT permission notice; LICENSE-MIT and
+// LICENSE-APACHE at this repository's root hold the same licence texts.
 const VECTORS: &str = r#"# x80-v20-contract-2; hexadecimal numbers; native word order:
 # AW BW CW DW BP SP IX IY PS SS DS0 DS1 PC PSW
 # Option B (decision-9 amendment, 2026-11-15): the native side decodes the

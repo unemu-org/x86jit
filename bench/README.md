@@ -58,7 +58,7 @@ commit the JSON on your branch.
 
 > **Synthetic only.** The workloads that ran a real program through a syscall shim —
 > `sha256`, `sqlite`, `lua`, `go-startup` — moved to
-> [`unemulinux`](https://github.com/unemu-org/unemulinux) with the userland that makes them
+> `unemulinux` with the userland that makes them
 > runnable. These five assemble their own snippets, so they measure the recompiler alone:
 > dispatch, chaining, codegen and bandwidth, not a realistic instruction mix.
 

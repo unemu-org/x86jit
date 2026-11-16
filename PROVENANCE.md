@@ -150,8 +150,13 @@ string engine and ordering.
 
 ## 4. What we did not copy
 
-No third-party source is vendored into this tree, and no file carries a foreign copyright
-or SPDX header — checked, not assumed. Nothing here is a port of another emulator's
+One third-party source is vendored: `vendor/cranelift-jit`, a modified fork of
+Cranelift's `cranelift-jit` 0.135.8 (§5). It is compiler integration and supplies no fact
+about how an x86 behaves. Its files keep their upstream licence, and each file the project
+changed says so at its top. Outside `vendor/`, no file carries a foreign copyright or SPDX
+header — checked, not assumed. Two further pieces of other projects' work are recorded in
+§5: the V20 contract vectors from the sibling 8080-family project, and the musl libc that
+`pthreads.elf` links statically. Nothing here is a port of another emulator's
 implementation. Where another project is named in a comment it is in one of two roles:
 *this is what mature translators do* (the memory-ordering design cites Box64's `STRONGMEM`
 levels and FEX's RCpc use as precedent), or *this oracle is wrong here*.
@@ -173,10 +178,18 @@ This project is `MIT OR Apache-2.0`. The dependency graph, by crate:
 | `x86jit-tests` | `serde`, `ron`, `hex`, `serde_json`, `flate2`, `iced-x86`, `libc`, **`unicorn-engine`** | permissive, except as below |
 | `x86jit-bench` | `serde`, `serde_json`, `iced-x86` | permissive |
 
-`vendor/cranelift-jit` retains Cranelift JIT 0.135.8 under its original
-Apache-2.0 WITH LLVM-exception licence (the complete licence is alongside the
-sources). Its upstream crate checksum is
-`31d67d6c6a02ffd860599e55b03d4f37c6cf9be678c1d68dbfa6d1f61946e4ae`.
+`vendor/cranelift-jit` is a modified fork of Cranelift JIT 0.135.8, kept under its
+original Apache-2.0 WITH LLVM-exception licence (the complete licence is alongside the
+sources). The fork point is the crates.io `cranelift-jit` 0.135.8 package, checksum
+`31d67d6c6a02ffd860599e55b03d4f37c6cf9be678c1d68dbfa6d1f61946e4ae`, published from
+wasmtime commit `7b6c29ec3e9a49c97da231665cbd8eead9ccbda0` (path `cranelift/jit`). As
+Apache-2.0 §4(b) requires, every file changed from that package carries a notice at its
+top saying the x86jit project modified it: `Cargo.toml`, `README.md`, `src/lib.rs`,
+`src/backend.rs`, `src/compiled_blob.rs`, `src/memory/mod.rs` and
+`src/memory/system.rs`. `LICENSE`, `examples/jit-minimal.rs`, `src/memory/arena.rs`
+and `tests/basic.rs` are byte-identical to upstream. The fork's `README.md` and
+`Cargo.toml` name it a fork and point at this repository; the README lists each
+file's change.
 The package is named `x86jit-cranelift-jit` so embedders also resolve the explicit
 path dependency when this workspace is consumed as a dependency; a root-only
 Cargo patch would not propagate. The local changes add dual addresses, scoped
@@ -203,11 +216,59 @@ the Unicorn oracle was added. It is:
 Nothing shipped from this repository links it. A consumer of `x86jit-core`,
 `x86jit-cranelift` or `x86jit-elf` never sees it.
 
-The one committed guest binary, `x86jit-tests/programs/pthreads.elf`, is our own work.
+The one committed guest binary, `x86jit-tests/programs/pthreads.elf`, is our own program,
+but it is statically linked against **musl libc**, which is MIT-licensed. Redistributing
+the binary therefore requires musl's copyright and permission notice. It belongs in
+[`x86jit-tests/programs/README.md`](x86jit-tests/programs/README.md), which holds a
+placeholder until the text from musl's `COPYRIGHT` file is inserted.
 Every third-party guest binary left with the Linux userland when `unemulinux` was split
 out — which is also how this repository stopped shipping busybox (GPL-2.0), the glibc
 loader (LGPL-2.1), and lua and CPython, both of which statically link GNU Readline and
 are therefore GPL-3.0 combined works.
+
+### Contract vectors from the sibling 8080-family project
+
+`x86jit-tests/tests/legacy_nec_v20.rs` embeds, byte for byte, the V20 mode-switch
+contract vectors (format `x80-v20-contract-2`) of `x80`, the sibling 8080-family
+project:
+
+- **Source:** `x80`, <https://github.com/unemu-org/x80> (to be published alongside
+  x86jit), file `x80-v20-contract/vectors/mode-switch.txt` at commit
+  `2d5a5354ea1b3b3005a13e4594d753a1896006e5`.
+- **Licence:** MIT OR Apache-2.0, at the user's option. That is the x80 repository's
+  licence (its workspace declares `license = "MIT OR Apache-2.0"`); no separate
+  licence covers the vectors' directory.
+- **Copyright:** Copyright (c) 2026 Mikołaj Mikołajczyk, the same holder as x86jit.
+- **Compatibility:** x86jit has the same licence and the same holder, so the copy is
+  compatible with this repository's licence.
+
+The vectors are an interface contract between the two engines (the 8080-mode exit and
+hand-back), not a hardware authority: the V20 behaviour they exercise is cited to the
+NEC manual (§1). A comment next to the embedded text in the test file repeats the
+copyright line. The MIT licence asks for the copyright and permission notice to
+accompany a copy; it is:
+
+```text
+Copyright (c) 2026 Mikołaj Mikołajczyk
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALING IN THE
+SOFTWARE.
+```
 
 ## 6. A clean source can still be second-hand
 

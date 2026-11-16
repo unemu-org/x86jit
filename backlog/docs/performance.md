@@ -85,11 +85,12 @@ start and **9.18/7.94/8.91** at the end. The 120 pre-round readings ranged over
 **3.01–10.96 / 6.72–9.58 / 8.52–9.75**. These are shared-host measurements;
 retain the reported wall-time ranges when assessing the +2% wall gate.
 
-Exact build and measurement commands, from the repository root (the SDK path
-identifies the installed toolchain, not a project-local SDK):
+Build and measurement commands, from the repository root. The target and output
+paths are generic; the SDK path identifies the installed toolchain, not a
+project-local SDK:
 
 ```sh
-export CARGO_TARGET_DIR=/private/tmp/xj-s3p3-target
+export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/real16-loops-target"
 export CARGO_BUILD_JOBS=2 RUSTC_WRAPPER=
 export SDKROOT=/nix/store/ag12vlxrx98yq5cnb50wbv3ypbbfcha5-apple-sdk-14.4/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
 export RUSTFLAGS="-C link-arg=-isysroot -C link-arg=$SDKROOT"
@@ -97,7 +98,7 @@ nice -n 10 cargo build --offline --release -p x86jit-bench --example real16_loop
 set -e
 date -u '+%Y-%m-%dT%H:%M:%SZ'
 uptime
-nice -n 10 "$CARGO_TARGET_DIR/release/examples/real16_loops" 5 8 > /private/tmp/xj-s3p3-baseline.csv 2> /private/tmp/xj-s3p3-baseline.log
+nice -n 10 "$CARGO_TARGET_DIR/release/examples/real16_loops" 5 8 > real16-baseline.csv 2> real16-baseline.log
 date -u '+%Y-%m-%dT%H:%M:%SZ'
 uptime
 ```

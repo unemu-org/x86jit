@@ -23,7 +23,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        # vendor/ holds byte-identical upstream sources plus a reviewed patch.
+        # vendor/ holds an upstream crate with marked local changes; keep its layout.
         exclude: '^vendor/'
       - id: end-of-file-fixer
         exclude: '^vendor/'
@@ -44,15 +44,16 @@ repos:
         files: '\.rs$'
         stages: [pre-commit]
 
-      # x86jit is guest-agnostic; naming a downstream consumer in engine source is the
-      # way that claim erodes, one comment at a time. Cheap (a grep over tracked .rs),
-      # so it runs per-commit rather than per-push.
+      # x86jit is guest-agnostic; naming a downstream consumer in source or docs is the
+      # way that claim erodes, one comment at a time. Cheap (a grep over every tracked
+      # file and path, backlog/ and markdown included), so it runs per-commit rather
+      # than per-push, whatever the commit touches.
       - id: guest-agnostic
-        name: no downstream consumer named in engine source
+        name: no downstream consumer named in tracked files
         language: system
         entry: scripts/guest-agnostic-guard.sh
         pass_filenames: false
-        files: '\.rs$'
+        always_run: true
         stages: [pre-commit]
 
       - id: cargo-clippy

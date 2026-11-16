@@ -9,7 +9,7 @@ created_date: '2026-07-06 11:25'
 
 > **The Linux userland moved out (2026-08-04).** The syscall shim, process model,
 > OCI/ELF runner and the whole-program test ladder now live in a separate project,
-> [`unemulinux`](https://github.com/unemu-org/unemulinux), which embeds this library.
+> `unemulinux`, which embeds this library.
 > Passages below describing `x86jit-linux`, `x86jit-cli`, or running busybox/sqlite/
 > CPython/Go describe work that happened in this repository's history and now lives
 > there. What stays here is the recompiler: core, the Cranelift backend, the ELF
@@ -150,7 +150,7 @@ The generated map ([`compat/isa-coverage.md`](compat/isa-coverage.md)) mis-state
   runner.
 - **What moved, and what that costs.** The ladder of real production programs — busybox,
   sqlite3, lua, CPython, the Go servers — is in
-  [`unemulinux`](https://github.com/unemu-org/unemulinux) with the Linux userland that makes
+  `unemulinux` with the Linux userland that makes
   running them possible. The coverage is unchanged; a lifter change is still validated
   against that ladder. What changed is where the job runs: it now spans two repositories,
   so wiring unemulinux's CI to x86jit changes is the piece of plumbing this split buys
@@ -162,7 +162,7 @@ The generated map ([`compat/isa-coverage.md`](compat/isa-coverage.md)) mis-state
 
 ## CI — the AArch64 JIT is exercised on real hardware
 
-- *(2026-11-04: GitHub is gone; x86-64 now runs on a Forgejo Actions runner and aarch64 locally on an aarch64 macOS host — see [`commands.md`](commands.md) § Git remote and CI. The paragraph below is the history of the GitHub ARM lane.)*
+- *(Current CI: `.github/workflows` for the public repository — GitHub-hosted x86-64 and aarch64 Linux lanes — and `.forgejo` for a self-hosted forge, x86-64 only; macOS is checked locally. See [`commands.md`](commands.md) § Git remote and CI. The paragraphs below are the history of the first GitHub ARM lane.)*
 - **GitHub Actions runs the whole suite on an ARM host.** [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) builds, clippy-lints, and tests on `ubuntu-latest` (x86-64) and `ubuntu-24.04-arm` (aarch64) via the Nix devShell (Unicorn oracle included). Manual (`workflow_dispatch`) only, a matrix over the two hosts. The Nix store and the cargo build (deps like unicorn-engine/cranelift) are cached in the GitHub Actions cache, so re-runs don't re-download the toolchain or recompile dependencies. Two ARM-only latents it caught the first time it actually ran the suite (both fixed): a `barrier_tests` `Helpers { .. }` literal missing the `fxstate` field (compiles only on ARM), and the OCI three-way tests exec'ing the x86 ELF natively on ARM (now `cfg`-skipped like `reference`). On x86 the whole-program tests run the guest ELF natively (native==interp==JIT); on ARM the native leg is skipped (a host can't exec an x86-64 ELF — see `x86jit-tests::reference`) and interp==JIT + interp==Unicorn carry the validation. **Every real program — busybox, sqlite, lua, glibc/musl dynamic hellos, pthreads, the Jaguar SSE4.2 fixture, and CPython 3.13 — passes interp==JIT on the AArch64 backend.** This is the first time the Cranelift ARM64 codegen runs against the full corpus on real ARM hardware.
 - **First ARM-only bug it caught:** the `cmp{ss,sd,ps,pd}` predicate mask fed Cranelift a vector `fcmp` with the `UnorderedOrGreaterThan{,OrEqual}` float condition codes (NLT/NLE), which its AArch64 backend can't lower (panicked in `lower_fp_condcode`). Fixed by building the mask from only `Equal`/`LessThan`/`LessThanOrEqual` + bit-negation/self-compares — byte-identical on x86, now lowerable on ARM. Surfaced only by CPython (the one program using those predicates), only on the ARM runner.
 - **M7 memory tiers and explicit fences.** On aarch64, `Fast` uses LDR/STR; `AcqRel` emits DMB ISH before stores and after loads; `FullTso` emits DMB ISH after each load and store, with no leading store fence. x86 inline code is tier-independent. Interpreter ordinary accesses use matching fences on aarch64, including cold blocks, fallback execution and MMIO replay. JIT guest-memory helpers use `call_memory_helper`: `AcqRel` fences before writes and after reads; `FullTso` fences before reads and after all memory calls; `Fast` adds none. Interpreter helpers match this policy, and post-call barriers cover partial progress before faults/exits (§8.2.3). MFENCE, CPUID and Real16 IRET carry full barriers in every tier on both backends. JIT LFENCE/SFENCE emit DMB ISH in every aarch64 tier as conservative full fences for explicit ordering, and no extra barrier on x86 while non-temporal guest stores use ordinary host stores. Locked operations remain atomic, but aarch64 LL/SC sequences lack the full x86 ordering guarantee: non-LSE RMW/CAS and XCHG even with LSE have no trailing DMB. Deterministic byte tests cover both ISAs, and bounded litmus tests exercise explicit fences. Leaner STLR/LDAPR lowering remains a future optimization.

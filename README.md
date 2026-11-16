@@ -6,8 +6,8 @@ You give it a memory map and an entry point. It runs the guest's x86-64 code on 
 host (the primary target) or an x86-64 host, and hands control back through an `Exit` whenever
 it meets something it does not handle itself: a syscall, an MMIO access, port I/O, a guest
 exception, or an instruction it cannot lift yet. File formats, operating-system emulation and
-devices belong to the embedder. A Linux userland built on this library is
-[`unemulinux`](https://github.com/unemu-org/unemulinux).
+devices belong to the embedder. A Linux userland built on this library is `unemulinux`, a
+separate repository that is to be published.
 
 > **Early-stage.** x86jit is under active development and has bugs and missing instructions.
 > If you need a production-grade x86 emulator today, use [QEMU](https://www.qemu.org/) or
@@ -37,6 +37,20 @@ devices belong to the embedder. A Linux userland built on this library is
   `GuestCpuFeatures::{baseline, v2, v3, v4}` or a complete CPUID table ([decision-11]);
   embedder-supplied time and entropy sources ([decision-12]). x87 runs as true 80-bit arithmetic
   in software, so its results are identical on every host.
+- **CPU models for 16- and 32-bit machines.** `Vm::set_cpu_model` puts a VM on the Machine
+  path with one of `CpuModel::{I8088, I8086, NecV20, NecV30, I80286, I80386}` ([decision-23]).
+  Each model selects its decode set, and an encoding the model lacks raises #UD or returns
+  `Exit::UnknownInstruction`, as the model's catalogue entry says. CPU exceptions are delivered
+  in the guest by default. The 8088, 8086, V20 and V30 run twenty-bit real mode; the NEC models
+  add their native-mode extensions and hand the 8080 emulation mode to the embedder through
+  `Exit::I8080Mode`. The 286 and 386 run real and protected mode with descriptor tables, the
+  LDT, the task register and the A20 gate, including **hardware task switches** through 286
+  TSSs, and on the 386 also 386 TSSs (far JMP and CALL, task gates, IDT task gates, IRET
+  through the back link).
+- **Data accesses across adjacent regions.** A data access whose bytes lie in adjacent RAM or
+  ROM regions completes as one access instead of exiting, as bus cycles do on hardware, so an
+  embedder can map RAM, ROM and empty-bus windows as separate regions. Locked operands and
+  spans with a gap or a trap region still exit.
 - **Guest-agnostic core.** `x86jit-core` depends on `iced-x86` and nothing else;
   [`boundary.rs`](x86jit-tests/tests/boundary.rs) fails the build if that changes.
 
@@ -44,7 +58,7 @@ devices belong to the embedder. A Linux userland built on this library is
 
 | Crate | What it is |
 | --- | --- |
-| [`x86jit-core`](x86jit-core/) | The engine: `Vm`, `Vcpu`, lift, IR, interpreter, translation cache, dispatcher, x87. |
+| [`x86jit-core`](x86jit-core/) | The engine: `Vm`, `Vcpu`, lift, IR, interpreter, translation cache, dispatcher, x87, the CPU-model catalogue and the Machine path. |
 | [`x86jit-cranelift`](x86jit-cranelift/) | The Cranelift JIT backend, `JitBackend` (default `jit` feature). |
 | [`x86jit-elf`](x86jit-elf/) | Optional ELF loader helpers: static, static-PIE and dynamic images, initial stack. |
 | [`x86jit-tests`](x86jit-tests/) | Differential harness: vectors, Unicorn and native (x86-64 Linux) oracles, fuzzers, the 80286 corpus, the ISA coverage map. |
@@ -132,6 +146,11 @@ feature (also enabled by `--all-features`) links the native Unicorn library from
 without Nix, use stable Rust 1.95 or newer and leave it out. Tests need neither the network nor
 the `oracles/` submodule: witness tests pin the cited values in code.
 
+CI on GitHub ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) covers x86-64 and aarch64
+Linux: fmt, the guest-agnostic guard, clippy, `cargo deny`, the test suite with the Unicorn
+oracle, a release-profile subset, the 32-bit lane and doctests, plus FreeBSD type-checks for
+both architectures. macOS is checked locally, not in CI.
+
 ## Known gaps
 
 - **Missing instructions.** Anything the lifter does not handle returns
@@ -149,20 +168,30 @@ the `oracles/` submodule: witness tests pin the cited values in code.
 - **Memory ordering covers JIT inline accesses only.** Interpreter accesses and helper-executed
   accesses (string ops, x87, FXSAVE, masked stores) get no tier barriers, and AArch64 LL/SC
   locked operations lack full x86 ordering.
-- **Translations are never reclaimed.** A guest that keeps patching its code grows host memory
-  with every patch. When JIT code space runs out, each vCPU returns `Exit::CodeSpaceExhausted`
-  once and continues interpreted; `JitBackend::set_compile_limit` caps compilation earlier.
+- **Code reclamation depends on the memory provider.** Invalidated and replaced translations
+  are retired, and x86jit's own code-memory provider reclaims their storage after execution
+  and signal-reader grace periods ([decision-17]). Where a host falls back to Cranelift's
+  system provider, retired storage stays allocated. When JIT code space runs out, each vCPU
+  returns `Exit::CodeSpaceExhausted` once and continues interpreted;
+  `JitBackend::set_compile_limit` caps compilation earlier.
 - **Shared code mappings must be declared.** `Memory::declare_code_alias` connects shared
   guest views for SMC tracking on every tier. The embedder creates the host aliases and
   reports writes made outside the engine with `note_write`. Undeclared aliases can execute
   stale translations. Far-apart views widen the store barrier's conservative watermark.
-- **`Real16` is interpreter-only**, and there is no protected-mode segment-descriptor model:
-  `Compat32` is flat apart from the FS/GS bases.
+- **16-bit and Machine-path code runs on the interpreter only.** `Real16` and every CPU model
+  execute on the interpreter whichever backend is configured; no Machine code is compiled yet.
+  Segment descriptors exist on the Machine path only: `Compat32` stays flat apart from the
+  FS/GS bases.
+- **The Machine path refuses what it does not model.** Protected mode runs at privilege
+  level 0 only, and paging, virtual-8086 tasks and the 386 task T bit are refused with a typed
+  exit rather than approximated. No model has a cycle table yet, and the 8088 and V20 hardware
+  corpora are pinned but not yet run against the engine.
 - **Host-fault recovery depends on the host.** [decision-13] lists which hosts are
   runtime-validated, cross-checked or pending, and the remaining partial-store gap.
 - **Real programs are tested elsewhere.** Whole programs (busybox, sqlite, CPython, Go servers)
-  run in `unemulinux`. [`scripts/ladder.sh`](scripts/ladder.sh) drives that ladder from here,
-  but this repository's CI does not gate on it yet.
+  run in `unemulinux`. [`scripts/ladder.sh`](scripts/ladder.sh) drives that ladder from a local
+  checkout, but the cross-repository real-program ladder does not gate this repository: its CI
+  runs only the checks listed under [Building and testing](#building-and-testing).
 - **Pre-1.0 API.** Expect breaking changes between `0.x` releases.
 
 ## License
@@ -178,3 +207,5 @@ enforces this, and [`PROVENANCE.md`](PROVENANCE.md) §5 has the analysis.
 [decision-11]: backlog/decisions/decision-11%20-%20CPUID-tables-and-per-vCPU-overrides-amend-decision-9.md
 [decision-12]: backlog/decisions/decision-12%20-%20Shared-CPU-source-handles-for-time-and-entropy.md
 [decision-13]: backlog/decisions/decision-13%20-%20Signal-context-landing-pads-for-compiled-guest-faults.md
+[decision-17]: backlog/decisions/decision-17%20-%20Upgrade-Cranelift-and-own-JIT-code-memory-through-a-memory-provider.md
+[decision-23]: backlog/decisions/decision-23%20-%20CPU-model-as-the-primary-axis-for-16-and-32-bit-machine-execution-with-cycle-counted-timing.md

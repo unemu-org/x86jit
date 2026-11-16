@@ -19,7 +19,7 @@ keeps the interpreter, the JIT, Unicorn, and native execution in agreement
 - **The program corpus** ([`programs/`](programs/)) — a ladder of real binaries
   (busybox, SQLite, Lua, `djpeg`, CPython, Go servers, Caddy) run
   interp-vs-JIT-vs-native. **That ladder now lives in**
-  [`unemulinux`](https://github.com/unemu-org/unemulinux) — running a real
+  `unemulinux` — running a real
   program needs an operating system, which this repository deliberately has
   none of. What remains here is ISA-level: vectors, oracles, fuzzers, the
   hardware-captured 80286 corpus, and the compat map.

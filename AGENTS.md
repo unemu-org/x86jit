@@ -6,9 +6,9 @@ Repo-specific notes for coding agents (Claude Code, Cursor, Aider, Copilot, …)
 
 ## What this is
 
-`x86jit` is a guest-agnostic x86-64 → host recompiler (JIT) delivered as a pure-Rust library. You feed it a memory map plus an entry point; it executes guest x86-64 instructions on any host (x86-64 or ARM64) and hands control back through `Exit` whenever it hits something it doesn't handle (syscall, MMIO, unknown instruction). File-format parsing, OS syscall emulation, and devices live in the embedder's code, not the core — a Linux userland built on this library is [`unemulinux`](https://github.com/unemu-org/unemulinux), which is where the syscall shim, the process model, the OCI/ELF runner and the whole-program test ladder (busybox, sqlite, CPython, Go servers) live. That boundary is enforced, not just documented: `x86jit-core`'s dependency set is exactly `{iced-x86}` and `x86jit-tests/tests/boundary.rs` fails the build if it changes. The authoritative design is [`spec.md`](backlog/docs/design/spec.md); where the engine's *behaviour* comes from is [`PROVENANCE.md`](PROVENANCE.md).
+`x86jit` is a guest-agnostic x86-64 → host recompiler (JIT) delivered as a pure-Rust library. You feed it a memory map plus an entry point; it executes guest x86-64 instructions on any host (x86-64 or ARM64) and hands control back through `Exit` whenever it hits something it doesn't handle (syscall, MMIO, unknown instruction). File-format parsing, OS syscall emulation, and devices live in the embedder's code, not the core — a Linux userland built on this library is `unemulinux` (to be published), which is where the syscall shim, the process model, the OCI/ELF runner and the whole-program test ladder (busybox, sqlite, CPython, Go servers) live. That boundary is enforced, not just documented: `x86jit-core`'s dependency set is exactly `{iced-x86}` and `x86jit-tests/tests/boundary.rs` fails the build if it changes. The authoritative design is [`spec.md`](backlog/docs/design/spec.md); where the engine's *behaviour* comes from is [`PROVENANCE.md`](PROVENANCE.md).
 
-Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. The bead database is pushed only to the configured `origin`.
+Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (the database files are gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on the configured `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. The bead database is pushed only to the configured `origin`.
 
 ## Where things live
 
@@ -47,12 +47,13 @@ The roles, the path from a bead to `main`, the worker rules and the publication 
 
 ## Session handoff
 
-> **Republish in progress.** Read
+> **Republish.** Read
 > [`backlog/docs/doc-28 - Republish-handoff…`](backlog/docs/doc-28%20-%20Republish-handoff-%E2%80%94-state-known-defects-and-what-must-be-fixed-before-the-repo-is-created.md)
-> before touching it: it records what is done, the known defects, what blocks creating
-> the public repository, and the traps that already cost a session. **No public repository
-> has been created yet** — do not run `gh repo create`. `origin` is the
-> configured remote; never push anywhere else.
+> before touching it: it records what is done, the known defects, what must be fixed
+> before publication, and the traps that already cost a session. Its top section records
+> the plan as changed on 2026-11-16: the history is kept, the third-party binaries are
+> filtered out of it, and the result is re-signed. Publishing is the maintainer's step —
+> do not run `gh repo create`, and push only to the configured `origin`.
 
 Ending a session mid-task, leave the state on the bead itself:
 

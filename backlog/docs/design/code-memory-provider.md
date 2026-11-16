@@ -290,14 +290,14 @@ result remain unmeasured. Cross-target type checks do not establish those facts.
   with compatible entitlements; this provider does not support that policy in
   process. Entitled deployment remains unmeasured. RO data uses an anonymous
   Mach shared remap; writable data uses anonymous RW memory outside MAP_JIT.
-- `vendor/cranelift-jit/src/memory/mod.rs:31`: narrow integration adds runtime-pointer
+- `vendor/cranelift-jit/src/memory/mod.rs:63`: narrow integration adds runtime-pointer
   translation, scoped copying/patching and a provider relocation allowlist. The
   provider retains the translation in its region/allocation state. The vendored
   package is explicitly named `x86jit-cranelift-jit` and referenced by path so an
   embedder's dependency graph also uses it; a root-only Cargo patch would disappear
   when this repository is consumed as a dependency. The upstream licence and
   checksum are recorded in `PROVENANCE.md`.
-- `vendor/cranelift-jit/src/compiled_blob.rs:163`: relocation writes use RW;
+- `vendor/cranelift-jit/src/compiled_blob.rs:185`: relocation writes use RW;
   arithmetic uses RX sites and RX targets, including veneer branches and pointer
   literals. `CompiledBlob::ptr` exposes RX for finalized functions, data, symbols,
   perf entries and code ranges. Module relocation logic and the closed libcall

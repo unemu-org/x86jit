@@ -7,7 +7,7 @@ on any host (x86-64 or ARM64) and returns control through [`Exit`] whenever it
 hits something it does not handle itself — a syscall, an MMIO access, or an
 instruction the lift does not yet support. File-format parsing, OS syscall
 emulation, and devices live in *your* code, not here (see `x86jit-elf`, and
-[`unemulinux`](https://github.com/unemu-org/unemulinux) for a Linux userland
+`unemulinux` (to be published) for a Linux userland
 built on this crate).
 
 The core ships the default **interpreter** backend. The optional
