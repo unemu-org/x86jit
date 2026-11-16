@@ -256,15 +256,13 @@ fn lock_mov_executes_as_the_unprefixed_move() {
     }
 }
 
-// The atomic path hands a locked device operand to the embedder as one
-// instruction, as for every locked operand on this path, in Direct and
-// Checked contexts; the unprefixed store is an ordinary device write. This
-// tells the atomic path from a LOCK that is merely stripped. A locked load
-// is one read: a device load reaches the embedder as the unprefixed one.
-// Bead xj-ir6.33 changes every locked device operand to one MmioRead and one
-// MmioWrite of the operand size; this witness pins the handoff until then.
+// A locked device operand is its bus transfers (spec.md §5.2, the maintainer's
+// MMIO rule), in Direct and Checked contexts. A locked MOV's store, lifted as
+// an exchange for the atomic path on RAM, is one MmioWrite of the operand,
+// with no read, as the unprefixed store; the instruction completes once the
+// write is acknowledged. A locked load is one MmioRead, as the unprefixed one.
 #[test]
-fn lock_mov_to_a_device_is_a_typed_handoff() {
+fn lock_mov_to_a_device_is_one_transfer() {
     for checked in [false, true] {
         for (code, store) in [
             (&[0x88, 0x07][..], true),         // MOV [BX],AL
@@ -273,6 +271,7 @@ fn lock_mov_to_a_device_is_a_typed_handoff() {
             (&[0x8c, 0x07], true),             // MOV [BX],ES
             (&[0x8a, 0x07], false),            // MOV AL,[BX]
         ] {
+            let mut first_stops = Vec::new();
             for locked in [false, true] {
                 let code = if locked {
                     [&[0xf0][..], code].concat()
@@ -297,23 +296,32 @@ fn lock_mov_to_a_device_is_a_typed_handoff() {
                 let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
                 let label = format!("{code:02x?} checked={checked}");
                 assert_eq!(run.steps(), 0, "{label}");
+                assert_eq!(cpu.cpu.rip, 0x1000, "{label}");
                 match run.stop() {
-                    StepStop::Exit(Exit::UnknownInstruction {
-                        addr, bytes, len, ..
-                    }) if locked && store => {
-                        assert_eq!((*addr, usize::from(*len)), (0x1000, code.len()), "{label}");
-                        assert_eq!(&bytes[..code.len()], &code[..], "{label}");
-                    }
-                    StepStop::Exit(Exit::MmioWrite { addr, .. }) if !locked && store => {
+                    StepStop::Exit(Exit::MmioWrite { addr, .. }) if store => {
                         assert_eq!(*addr, 0x1_0010, "{label}");
+                        cpu.complete_mmio_write();
                     }
                     StepStop::Exit(Exit::MmioRead { addr, size, .. }) if !store => {
                         assert_eq!((*addr, *size), (0x1_0010, 1), "{label}");
+                        cpu.complete_mmio_read(0x66);
                     }
                     other => panic!("{label}: {other:?}"),
                 }
-                assert_eq!(cpu.cpu.rip, 0x1000, "{label}");
+                first_stops.push(format!("{:?}", run.stop()));
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1, "{label}: {:?}", run.stop());
+                assert_eq!(cpu.cpu.rip, 0x1000 + code.len() as u64, "{label}");
+                if !store {
+                    assert_eq!(cpu.cpu.gpr[0] & 0xff, 0x66, "{label}");
+                }
             }
+            // The locked transfer is the unprefixed one: same address, size
+            // and value.
+            assert_eq!(
+                first_stops[0], first_stops[1],
+                "{code:02x?} checked={checked}"
+            );
         }
     }
 }

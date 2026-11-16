@@ -2705,7 +2705,15 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 // inside one region. The Machine ledger keys these transfers as
                 // for any other Machine access.
                 probe_locked(cpu, mem, linear, *size)?;
-                let value = read(cpu, mem, linear, *size)?;
+                // An exchange whose old value the instruction discards (the
+                // locked MOV) is a store: it reads nothing.
+                let value = if matches!(op, crate::ir::RmwOp::Xchg)
+                    && super::integer::exchange_discards_old(ir.ops, cpu.rip)
+                {
+                    0
+                } else {
+                    read(cpu, mem, linear, *size)?
+                };
                 let src = read_val(*src, temps);
                 let updated = match op {
                     crate::ir::RmwOp::Add => value.wrapping_add(src),

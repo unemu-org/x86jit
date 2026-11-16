@@ -286,9 +286,11 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
 // read-modify-write takes the engine's atomic path, as `IrOp::AtomicRmw` does
 // on the 286 and 386 Machine paths (decision-23, xj-50w.12): one host atomic
 // of the operand's width (`Memory::atomic_rmw`), the one data transfer of this
-// walk wider than a byte. A device operand is a typed refusal, and an operand
-// over two adjacent regions keeps the containment miss of every locked
-// operand. A word at an odd address has no host atomic (`Memory::atomic_rmw`
+// walk wider than a byte. A device operand inside one Trap region is one read,
+// then one write, of its byte transfers (`locked_device`, spec.md §5.2); one
+// only partly in a Trap region is a typed refusal, and an operand over two
+// adjacent regions keeps the containment miss of every locked operand. A word
+// at an odd address has no host atomic (`Memory::atomic_rmw`
 // would fall back to a plain read and write), so no atomic path: a typed
 // refusal before any transfer. That covers every word whose bytes wrap their
 // segment (offset FFFFh, UM §2.3 p. 2-12) or the twenty-bit bus (FFFFFh,
@@ -311,6 +313,11 @@ fn locked_rmw(
     debug_assert_eq!(physical(tag, size - 1), first + u64::from(size) - 1);
     match mem.atomic_rmw(first, src, size, op) {
         Ok(old) => Ok(old),
+        Err(MemTrap::Mmio)
+            if matches!(mem.region_kind(first, size), Ok(crate::RegionKind::Trap)) =>
+        {
+            locked_device(cpu, mem, tag, src, size, op)
+        }
         Err(MemTrap::Mmio) => Err(Exit::unknown_instruction(ip, *bytes, len)),
         Err(trap) => {
             let StepResult::Exit(exit) =
@@ -321,6 +328,37 @@ fn locked_rmw(
             Err(exit)
         }
     }
+}
+
+// A locked operand inside one Trap region: the read, then the write, of the
+// whole operand (SDM Vol 3A §11.1.2.2 p. 11-4; 8086 Family UM §2.5 p. 2-18:
+// LOCK holds the bus through the instruction). Each byte is a transfer of its
+// own, as every device transfer of this walk is (spec.md §5.2), keyed in the
+// instruction's retry ledger. No RAM is touched, so no host-fault routing or
+// ordering barrier applies.
+#[cold]
+#[inline(never)]
+fn locked_device(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    tag: u64,
+    src: u64,
+    size: u8,
+    op: crate::ir::RmwOp,
+) -> Result<u64, Exit> {
+    use crate::ir::RmwOp;
+    let old = read::<false, 0>(cpu, mem, tag, size)?;
+    let new = match op {
+        RmwOp::Add => old.wrapping_add(src),
+        RmwOp::Sub => old.wrapping_sub(src),
+        RmwOp::Rsub => src.wrapping_sub(old),
+        RmwOp::And => old & src,
+        RmwOp::Or => old | src,
+        RmwOp::Xor => old ^ src,
+        RmwOp::Xchg => src,
+    };
+    write::<false, 0>(cpu, mem, tag, size, new)?;
+    Ok(old)
 }
 
 /// How a NEC V20/V30 control primitive ended its instruction (decision-23 C4a).

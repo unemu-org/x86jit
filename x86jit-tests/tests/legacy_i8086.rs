@@ -2020,36 +2020,96 @@ fn locked_increments_from_two_vcpus_lose_no_update() {
     }
 }
 
-// A locked device operand has no atomic path: a typed refusal with the
-// instruction's bytes and no device transfer, as on the 286 and 386 paths.
-// The unlocked form reaches the device one byte at a time. This asserts
-// today's handoff for a locked MMIO operand; bead xj-ir6.33 replaces it with
-// one MmioRead and one MmioWrite of the operand size on every Machine model,
-// and this witness changes when that bead lands.
+// A locked device operand inside one Trap region is one read, then one write,
+// of the whole operand (spec.md §5.2, the maintainer's MMIO rule): the bus lock
+// holds through the instruction (UM §2.5 p. 2-18; SDM Vol 3A §11.1.2.2), and
+// the vCPU is stopped across the exits. Each byte is its own transfer, as every
+// device transfer of the twenty-bit walk is. The instruction retires once,
+// after the last write is acknowledged. The unlocked form reaches the device
+// one byte at a time as well.
 #[test]
-fn a_locked_device_operand_is_a_typed_refusal() {
-    for model in LOCK_MODELS {
-        for code in [&b"\xf0\xfe\x07"[..], b"\xf0\x87\x07", b"\xf0\x26\x01\x07"] {
-            let (vm, mut cpu) = setup_review(model, code, true);
-            cpu.cpu.gpr[3] = 0x4000;
-            let before = cpu.cpu.gpr;
-            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+fn a_locked_device_operand_reads_then_writes_once() {
+    // One device transfer: (write, address, value).
+    type Transfer = (bool, u64, u64);
+    // Answer each device stop of `run_steps(1)` until the instruction retires.
+    fn drive(vm: &Vm, cpu: &mut Vcpu) -> Vec<Transfer> {
+        let mut bus = Vec::new();
+        for _ in 0..8 {
+            let r = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
             match r.stop() {
-                StepStop::Exit(Exit::UnknownInstruction {
-                    addr, bytes, len, ..
-                }) => {
-                    assert_eq!(*addr, IP);
-                    assert_eq!(&bytes[..usize::from(*len)], code, "{model:?}");
+                StepStop::Exit(Exit::MmioRead { addr, size: 1, .. }) => {
+                    assert_eq!(r.steps(), 0);
+                    let value = 0x30 + (*addr & 0xff);
+                    bus.push((false, *addr, value));
+                    cpu.complete_mmio_read(value);
                 }
-                other => panic!("{model:?} {code:02x?}: {other:?}"),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr,
+                    size: 1,
+                    value,
+                    ..
+                }) => {
+                    assert_eq!(r.steps(), 0);
+                    bus.push((true, *addr, *value));
+                    cpu.complete_mmio_write();
+                }
+                _ if r.steps() == 1 => return bus,
+                other => panic!("{other:?}"),
             }
-            assert_eq!((r.steps(), cpu.cpu.rip, cpu.cpu.gpr), (0, IP, before));
-            // After an earlier instruction of its block: that one retires.
+        }
+        panic!("{bus:x?}")
+    }
+    // Device bytes 4000h = 30h, 4001h = 31h; AX = 1234h.
+    let cases: [(&[u8], &[Transfer], u64); 3] = [
+        // LOCK INC BYTE [BX]
+        (
+            b"\xf0\xfe\x07",
+            &[(false, 0x4000, 0x30), (true, 0x4000, 0x31)],
+            0x1234,
+        ),
+        // LOCK XCHG [BX],AX
+        (
+            b"\xf0\x87\x07",
+            &[
+                (false, 0x4000, 0x30),
+                (false, 0x4001, 0x31),
+                (true, 0x4000, 0x34),
+                (true, 0x4001, 0x12),
+            ],
+            0x3130,
+        ),
+        // LOCK ADD ES:[BX],AX: 3130h + 1234h = 4364h
+        (
+            b"\xf0\x26\x01\x07",
+            &[
+                (false, 0x4000, 0x30),
+                (false, 0x4001, 0x31),
+                (true, 0x4000, 0x64),
+                (true, 0x4001, 0x43),
+            ],
+            0x1234,
+        ),
+    ];
+    for model in LOCK_MODELS {
+        for (code, transfers, ax) in cases {
+            let (vm, mut cpu) = setup_review(model, code, true);
+            cpu.cpu.gpr[0] = 0x1234;
+            cpu.cpu.gpr[3] = 0x4000;
+            let bus = drive(&vm, &mut cpu);
+            assert_eq!(bus, transfers, "{model:?} {code:02x?}");
+            assert_eq!(cpu.cpu.rip, IP + code.len() as u64, "{model:?} {code:02x?}");
+            assert_eq!(cpu.cpu.gpr[0] & 0xffff, ax, "{model:?} {code:02x?}");
+            assert_eq!(cpu.retired_instructions(), 1, "{model:?} {code:02x?}");
+            // After an earlier instruction of its block: that one retires
+            // before the first device stop.
             let (vm, mut cpu) = setup_review(model, &[&b"\x40"[..], code].concat(), true);
             cpu.cpu.gpr[3] = 0x4000;
             let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
             assert!(
-                matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP + 1),
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::MmioRead { addr: 0x4000, .. })
+                ),
                 "{model:?} {code:02x?}: {:?}",
                 r.stop()
             );
@@ -2266,8 +2326,11 @@ fn a_locked_instruction_is_one_instruction_to_interrupts_and_traps() {
 }
 
 // xj-50w.12 changes the twenty-bit entries' decode and lowering (LOCK), so
-// their prefix revision word, and with it their identities, change. The
-// system models' identities do not (values of b2ac76e4 on the left).
+// their prefix revision word, and with it their identities, change. Of the
+// system models, the I80286 identity changes with its own quirk fields
+// (xj-50w.11) and the I80386 identity does not (values of b2ac76e4 on the
+// left). xj-ir6.33 changes no identity: its device transfers are interpreter
+// behaviour, and no lifting rule or catalogue field changes.
 #[test]
 fn lock_admission_changes_only_the_twenty_bit_identities() {
     for (model, before, after) in [
@@ -2304,10 +2367,7 @@ fn lock_admission_changes_only_the_twenty_bit_identities() {
         ),
     ] {
         assert_eq!(model.profile().semantics_id, after, "{model:?}");
-        assert_eq!(
-            before == after,
-            matches!(model, CpuModel::I80286 | CpuModel::I80386)
-        );
+        assert_eq!(before == after, model == CpuModel::I80386, "{model:?}");
     }
 }
 
@@ -2600,9 +2660,11 @@ fn a_locked_word_at_an_odd_address_has_no_atomic_path() {
 
 // xj-50w.12, a systematic scan. Data, stack and string memory lie in a
 // device region, so every data transfer of an unlocked form shows as an
-// MMIO or port exit. No locked form may run while its unlocked form
-// transfers data, and every locked form that runs must end as its unlocked
-// form does. The one locked form refused although its unlocked form runs
+// MMIO or port exit. A locked form whose unlocked form transfers data is
+// refused, or it is a read-modify-write with the atomic path (it runs on
+// RAM), whose device operand is then one read and one write of its bus
+// transfers (spec.md §5.2, xj-ir6.33): its first transfer is the unlocked
+// form's. Every locked form that runs must end as its unlocked form does. The one locked form refused although its unlocked form runs
 // here without a transfer is INTO with OF clear: INTO with OF set reads the
 // interrupt pointer and pushes as INT does (UM §2.7 pp. 2-46–47), the lift
 // decides per form, and so the form has no atomic path. An unlocked form
@@ -2616,11 +2678,14 @@ struct ScanOutcome {
     flags: u16,
 }
 fn scan_run(model: CpuModel, code: &[u8]) -> ScanOutcome {
+    scan_run_in(model, code, RegionKind::Trap)
+}
+fn scan_run_in(model: CpuModel, code: &[u8], data: RegionKind) -> ScanOutcome {
     let mut vm = Vm::with_backend(VmConfig::flat(0x4000), Box::new(InterpreterBackend));
     vm.set_cpu_model(model);
     vm.set_exception_delivery(ExceptionDelivery::InGuest);
     vm.map(0, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.map(0x1000, 0x2000, Prot::RWX, RegionKind::Trap).unwrap();
+    vm.map(0x1000, 0x2000, Prot::RWX, data).unwrap();
     vm.map(0x3000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
     vm.write_bytes(0x500, code).unwrap();
     for v in 0..256u64 {
@@ -2689,10 +2754,17 @@ fn every_locked_form_runs_as_its_unlocked_form_or_is_refused() {
         let mut wrong = Vec::new();
         for code in &cases {
             let unlocked = scan_run(model, code);
-            let locked = scan_run(model, &[&[0xf0][..], code].concat());
+            let locked_code = [&[0xf0][..], code].concat();
+            let locked = scan_run(model, &locked_code);
             let refused = locked.kind == "unknown";
             if unlocked.kind == "transfer" && !refused {
-                wrong.push(format!("{code:02x?}: runs locked, transfers unlocked"));
+                let on_ram = scan_run_in(model, &locked_code, RegionKind::Ram);
+                if on_ram.kind != "ran" || locked != unlocked {
+                    wrong.push(format!(
+                        "{code:02x?}: transfers locked without the atomic path: \
+                         {locked:?}, unlocked {unlocked:?}, on RAM {on_ram:?}"
+                    ));
+                }
             } else if refused && matches!(unlocked.kind.as_str(), "ran" | "hlt") {
                 if code[0] != 0xce {
                     wrong.push(format!(

@@ -618,10 +618,14 @@ fn shifts_and_rotates_read_then_write_once() {
     });
 }
 
+/// Every model admits these LOCK forms except LOCK ADC, which has no atomic
+/// form and is refused on RAM and device alike. The twenty-bit models admit
+/// them since xj-50w.12, and move each byte of a device operand as its own
+/// transfer.
 #[test]
 fn lock_forms_read_then_write_once_where_admitted() {
-    matrix(LOCK, WINDOW, SEG, 0x10, |path, done| {
-        !done.contains(&"lock adc [di],al") && (path.twenty_bit() || done.len() == LOCK.len() - 1)
+    matrix(LOCK, WINDOW, SEG, 0x10, |_, done| {
+        !done.contains(&"lock adc [di],al") && done.len() == LOCK.len() - 1
     });
 }
 

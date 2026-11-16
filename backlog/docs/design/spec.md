@@ -517,7 +517,9 @@ operation holds the bus "for as many bus cycles as necessary to update the entir
 operand" (SDM Vol 3A §11.1.2.2 p. 11-4); "the processor never produces a locked
 read without also producing a locked write", and a CMPXCHG writes the value read
 back when its comparison fails and the source when it succeeds (SDM Vol 2A §3.3
-CMPXCHG, p. 3-194). LOCK# is not modelled: the vCPU is stopped across both exits
+CMPXCHG, p. 3-194). A locked exchange whose old value the instruction
+discards, the 80286's locked MOV store, is one write and no read, as the
+unlocked store is. LOCK# is not modelled: the vCPU is stopped across both exits
 — no interrupt is accepted between them — so ordering against devices and DMA
 stays with the embedder. The twenty-bit models move every data byte as its own
 transfer (above), so a word operand there is two byte reads, then two byte writes,
@@ -1943,10 +1945,11 @@ are unchanged:
   OUTS raises no #UD ("LOCK should only be used with the XCHG, MOV, MOVS,
   INS, and OUTS instructions", App. C item 11 p. C-2; App. B LOCK p. B-68
   gives no real-mode exception). A locked MOV takes the engine's atomic path:
-  its store is one `IrOp::AtomicRmw` exchange, with the typed handoff every
-  locked device operand on this path gets; its load is one read, which the
-  memory layer performs as one host access for an aligned operand; a
-  register-only MOV transfers nothing. A locked store keeps the rule of every
+  its store is one `IrOp::AtomicRmw` exchange whose old value is discarded,
+  which on a device is one `MmioWrite` and no read (§5.2); its load is one
+  read, which the memory layer performs as one host access for an aligned
+  operand, and on a device one `MmioRead`; a register-only MOV transfers
+  nothing. A locked store keeps the rule of every
   locked operand: it lies in one region (§5.2, Data accesses across adjacent
   regions; xj-ir6.12), so a locked MOV whose operand spans two adjacent
   regions (RAM and RAM, or RAM and ROM) stops with `UnmappedMemory` before any
@@ -2087,8 +2090,9 @@ write AL) and BCD strings on memory. The lift decides per form, so INTO is
 refused whatever OF is: with OF set it reads the interrupt pointer and pushes
 as INT does (UM §2.7 pp. 2-46–47). A locked operand is one host atomic of its
 width (`Memory::atomic_rmw`), the only data transfer of the twenty-bit walk
-wider than one byte. A device operand there is a typed refusal (bead
-xj-ir6.33 changes the device case on every Machine model), and an operand
+wider than one byte. A device operand inside one Trap region is one read,
+then one write, of its byte transfers (§5.2, xj-ir6.33); one only partly in a
+Trap region is a typed refusal, and an operand
 over two adjacent regions keeps the containment miss of every locked operand
 (§5.2, Data accesses across adjacent regions). A word at an odd address has
 no host atomic (`Memory::atomic_rmw` would fall back to a plain read and
@@ -2097,8 +2101,8 @@ every word whose bytes wrap their segment (offset FFFFh) or the bus
 (FFFFFh). Interrupts and the single-step trap see a locked
 instruction as one instruction (UM §2.6 p. 2-24: prefixes are "part of" the
 instruction they prefix). The four twenty-bit identities change with this rule
-(the early entries' prefix revision word); the I80286 and I80386 identities do
-not. The witnesses are in `legacy_i8086` and `legacy_nec_v20_extensions`.
+(the early entries' prefix revision word); the I80386 identity does not, and
+the I80286 identity changes only with its own quirk fields (xj-50w.11). The witnesses are in `legacy_i8086` and `legacy_nec_v20_extensions`.
 The cold event boundary reads the catalogue's priority policy: an external
 interrupt enters its handler before the single-step trap (UM §2.6 pp. 2-26–28).
 STI and IRET "reenable interrupts only after the end of the following

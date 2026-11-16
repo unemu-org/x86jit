@@ -818,7 +818,12 @@ pub(crate) fn locked_device_operand(
     }
     let m = mask(size);
     let key = crate::state::bound_answer_key(addr, size, false);
-    let prev = if let Some(value) = bound_answer(cpu, ir, cur_addr, key, mem, addr, size) {
+    let prev = if matches!(update, LockedUpdate::Rmw(RmwOp::Xchg))
+        && exchange_discards_old(&ir.ops, cur_addr)
+    {
+        // A store: the value read would be discarded, so nothing is read.
+        0
+    } else if let Some(value) = bound_answer(cpu, ir, cur_addr, key, mem, addr, size) {
         value & m
     } else if let Some(value) = cpu.pending_mmio.take() {
         let value = value & m;
@@ -860,6 +865,42 @@ pub(crate) fn locked_device_operand(
             value,
         ))
     }
+}
+
+/// Whether the locked exchange of the instruction at `cur_addr` in `ops` (or of
+/// the first instruction, when no marker names it) discards the
+/// value it reads: no later operation of the instruction reads its `old`
+/// temporary. Such an exchange is a store. The 80286's locked MOV is lifted as
+/// one (`lift::legacy::lock_stores`) for the atomic path on RAM; on a device it
+/// is one write and no read, as the unlocked store is (spec.md §5.2). A
+/// temporary is read only through a `Val::Temp` operand, whose debug form names
+/// it as `Temp(n)`.
+#[cold]
+#[inline(never)]
+pub(crate) fn exchange_discards_old(ops: &[IrOp], cur_addr: u64) -> bool {
+    let start = ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == cur_addr))
+        .unwrap_or(0);
+    let mut old = None;
+    for (i, op) in ops[start..].iter().enumerate() {
+        if i != 0 && matches!(op, IrOp::InsnStart { .. }) {
+            break;
+        }
+        match (&old, op) {
+            (
+                None,
+                IrOp::AtomicRmw {
+                    old: temp,
+                    op: RmwOp::Xchg,
+                    ..
+                },
+            ) => old = Some(format!("{:?}", Val::Temp(*temp))),
+            (Some(read), op) if format!("{op:?}").contains(read.as_str()) => return false,
+            _ => {}
+        }
+    }
+    old.is_some()
 }
 
 #[cold]
