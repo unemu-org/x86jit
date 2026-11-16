@@ -858,12 +858,13 @@ than it measures the change. Changes that do not touch those paths have repeated
 gate on such cells: C4a, the 80286 quirks, the xj-ir6.31 rebase round.
 
 From now on, a cell is **bimodal** when either side's per-process values form two clusters
-separated by more than the gate. On a bimodal cell:
+whose medians differ by more than 0.5 %. On a bimodal cell:
 - the gate compares like modes, the candidate's median within each mode against the base's
   median in the same mode;
 - every mode present on both sides must be within +0.5 %;
 - the median of processes is still reported, as advisory;
-- a mode present on one side only is reported, and does not fail the gate on its own;
+- when the two sides have different numbers of modes, each mode is matched to the nearest mode
+  on the other side; a mode left unmatched is reported, and does not fail the gate on its own;
 - at least 7 processes per side are measured.
 
 A unimodal cell keeps the median of processes, and the +0.5 % gate is unchanged.
