@@ -1332,7 +1332,13 @@ pub(crate) fn finish(
         }
     }
     if cpu.owns_mmio_retry(cpu.rip) {
-        m.progress.acknowledged = cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)].into();
+        // Bound answers end with this fault (`CpuState::finish_mmio_retry`): the
+        // re-execution reads the device again, so they are not reported.
+        m.progress.acknowledged = cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)]
+            .iter()
+            .copied()
+            .filter(|&(key, _)| !crate::state::is_bound_key(key))
+            .collect();
     }
     // No ledger means no proof about already issued device reads. A regular
     // single-transfer read with no retry cannot have completed a prior transfer.

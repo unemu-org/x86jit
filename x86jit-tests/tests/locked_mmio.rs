@@ -1,4 +1,6 @@
-//! Engine policy (§5.2): atomic RMW/CAS on Trap regions requires embedder emulation.
+//! Engine policy for Long64/Compat32 (§5.2): atomic RMW/CAS on Trap regions requires
+//! embedder emulation. Real16 and the Machine models read, then write, a locked
+//! operand inside one Trap region instead (`mmio_rmw.rs`).
 //! SDM Vol 2A §3.3 CMPXCHG, Operation; Vol 2D §6.1 XCHG, Description;
 //! Vol 3A §§11.1.2.1–11.1.2.2: automatic and software-controlled locking.
 

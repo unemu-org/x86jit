@@ -537,6 +537,134 @@ pub(crate) fn exec_load<const MACHINE: bool, const ROUTED: bool, const ORDER: u8
     None
 }
 
+/// The load of an application walk with an MMIO retry open (spec.md §5.2).
+///
+/// The answer the retry consumes is recorded in the retry ledger, bound to its
+/// request: the owning instruction (RIP, CS and an IR fingerprint) and the
+/// access's address, size and direction (`bound_answer_key`). A later stop of the
+/// same instruction, such as the write of a read-modify-write, then re-executes it
+/// without asking the device again. A changed instruction at the same RIP, or any
+/// stop other than this instruction's own device stops, drops the answer
+/// (`CpuState::finish_mmio_retry`). The recorded answer is consulted before the
+/// pending one: it is the answer to this access, while a pending answer belongs
+/// to the access that stopped last. It is used only while the access still stops
+/// at a Trap region; a region remapped as RAM, or unmapped, drops it
+/// (`bound_answer`). The alias forms that keep a multi-read ledger
+/// (`unified_read_retry`) take the Machine load. The split re-execution after a
+/// containment miss also runs here, with no answer pending or recorded.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_load_retry<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    cur_addr: u64,
+    ir: &IrBlock,
+    dst: &Temp,
+    addr: &Val,
+    size: &u8,
+) -> Option<InterpResult> {
+    if ir.mode == crate::CpuMode::Real16 && super::legacy::unified_read_retry(&ir.ops, cur_addr) {
+        return exec_load::<true, ROUTED, ORDER>(cpu, mem, temps, cur_addr, dst, addr, size);
+    }
+    let _ordering = ordering::Barrier::<ORDER>::new(Some(ordering::Direction::Read), false);
+    let mem = mem.unordered();
+    let a = read_val(*addr, &*temps);
+    let key = crate::state::bound_answer_key(a, *size, false);
+    if let Some(v) = bound_answer(cpu, ir, cur_addr, key, mem.0.normal(), a, *size) {
+        temps[*dst as usize] = v & mask(*size);
+    } else if let Some(v) = cpu.pending_mmio.take() {
+        let v = v & mask(*size);
+        if cpu.mmio_retry_active {
+            record_bound_answer(cpu, ir, cur_addr, key, v);
+        }
+        temps[*dst as usize] = v;
+    } else {
+        match mem.read(a, *size) {
+            Ok(v) => temps[*dst as usize] = v,
+            Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Read, 0)),
+        }
+    }
+    None
+}
+
+/// A fingerprint of the instruction at `cur_addr` in `ir`: its lifted operations
+/// and the decode mode. Equal fingerprints mean the same accesses from the same
+/// registers; code rewritten at the same RIP gives another fingerprint.
+#[cold]
+#[inline(never)]
+fn instruction_fingerprint(ir: &IrBlock, cur_addr: u64) -> u64 {
+    struct Fnv(u64);
+    impl std::fmt::Write for Fnv {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            for byte in text.bytes() {
+                self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            Ok(())
+        }
+    }
+    use std::fmt::Write as _;
+    let mut hash = Fnv(0xcbf2_9ce4_8422_2325);
+    let start = ir
+        .ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { guest_addr } if *guest_addr == cur_addr))
+        .unwrap_or(0);
+    let _ = write!(hash, "{:?}", ir.mode);
+    for (i, op) in ir.ops[start..].iter().enumerate() {
+        if i != 0 && matches!(op, IrOp::InsnStart { .. }) {
+            break;
+        }
+        let _ = write!(hash, "{op:?};");
+    }
+    hash.0
+}
+
+/// The recorded answer for `key`, the access of `size` bytes at `addr`, if the
+/// owning instruction is unchanged and the access still stops at a Trap region.
+/// A different instruction at the owner's RIP drops every bound answer. A
+/// recorded answer is the device's: remapped as RAM, or unmapped, the access
+/// drops it and runs as it would without one.
+#[cold]
+#[inline(never)]
+fn bound_answer(
+    cpu: &mut CpuState,
+    ir: &IrBlock,
+    cur_addr: u64,
+    key: u64,
+    memory: &Memory,
+    addr: u64,
+    size: u8,
+) -> Option<u64> {
+    let value = cpu.mmio_part(cur_addr, key)?;
+    if cpu.owns_mmio_retry(cur_addr)
+        && cpu.mmio_part(cur_addr, crate::state::bound_fingerprint_key())
+            == Some(instruction_fingerprint(ir, cur_addr))
+        && matches!(memory.region_kind(addr, size), Ok(crate::RegionKind::Trap))
+    {
+        Some(value)
+    } else {
+        cpu.drop_bound_answers();
+        None
+    }
+}
+
+/// Record a consumed answer bound to its request and to the owning instruction.
+#[cold]
+#[inline(never)]
+fn record_bound_answer(cpu: &mut CpuState, ir: &IrBlock, cur_addr: u64, key: u64, value: u64) {
+    let fingerprint = instruction_fingerprint(ir, cur_addr);
+    match cpu.mmio_part(cur_addr, crate::state::bound_fingerprint_key()) {
+        Some(recorded) if recorded == fingerprint => {}
+        Some(_) => {
+            cpu.drop_bound_answers();
+            cpu.record_mmio_part(cur_addr, crate::state::bound_fingerprint_key(), fingerprint);
+        }
+        None => cpu.record_mmio_part(cur_addr, crate::state::bound_fingerprint_key(), fingerprint),
+    }
+    cpu.record_mmio_part(cur_addr, key, value);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_store<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
@@ -594,6 +722,13 @@ pub(crate) fn exec_atomic_rmw<const ROUTED: bool, const ORDER: u8>(
     let s = read_val(*src, &*temps);
     match mem.atomic_rmw(a, s, *size, *op) {
         Ok(prev) => temps[*old as usize] = prev,
+        Err(MemTrap::Mmio) if locked_bus_transfers(ir) => {
+            match locked_device_operand(cpu, mem, cur_addr, ir, a, s, *size, LockedUpdate::Rmw(*op))
+            {
+                Ok(prev) => temps[*old as usize] = prev,
+                Err(exit) => return Some(exit),
+            }
+        }
         Err(MemTrap::Mmio) => return Some(atomic_mmio_exit(cpu, mem, cur_addr, ir)),
         Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Write, s)),
     }
@@ -617,10 +752,114 @@ pub(crate) fn exec_atomic_cas<const ROUTED: bool, const ORDER: u8>(
     let (exp, s) = (read_val(*expected, &*temps), read_val(*src, &*temps));
     match mem.atomic_cas(a, exp, s, *size) {
         Ok(prev) => temps[*old as usize] = prev,
+        Err(MemTrap::Mmio) if locked_bus_transfers(ir) => {
+            match locked_device_operand(cpu, mem, cur_addr, ir, a, s, *size, LockedUpdate::Cas(exp))
+            {
+                Ok(prev) => temps[*old as usize] = prev,
+                Err(exit) => return Some(exit),
+            }
+        }
         Err(MemTrap::Mmio) => return Some(atomic_mmio_exit(cpu, mem, cur_addr, ir)),
         Err(t) => return Some(trap_out(cpu, cur_addr, t, a, *size, AccessKind::Write, s)),
     }
     None
+}
+
+/// Whether a locked operand on a Trap region becomes bus transfers: Real16
+/// (the alias) and Machine IR. Long64 and Compat32 keep
+/// `Exit::UnknownInstruction` (`atomic_mmio_exit`): their compiled code is
+/// unchanged and the embedder emulates the instruction (spec.md §5.2).
+#[inline(always)]
+pub(crate) fn locked_bus_transfers(ir: &IrBlock) -> bool {
+    ir.mode == crate::CpuMode::Real16 || ir.legacy_context.is_some()
+}
+
+/// The value a locked operand on a Trap region is written with.
+#[derive(Clone, Copy)]
+pub(crate) enum LockedUpdate {
+    /// XCHG, XADD and the LOCK-prefixed ALU and bit forms.
+    Rmw(RmwOp),
+    /// CMPXCHG, with the expected value: the destination receives a write cycle
+    /// either way, and a failed comparison writes the value read back (SDM Vol 2A
+    /// §3.3 CMPXCHG, Description).
+    Cas(u64),
+}
+
+/// A locked or implicitly locked operand whose bytes touch a Trap region.
+///
+/// Real16 and Machine IR perform the bus transaction as the processor does: one
+/// read of the operand, then one write of the updated value (SDM Vol 3A
+/// §§11.1.2.1–11.1.2.2; Vol 2A §3.3 CMPXCHG: "the processor never produces a
+/// locked read without also producing a locked write"; 80286 PRM Appendix B,
+/// XCHG p. B-114). Each half is an ordinary MMIO exit, and LOCK# is not
+/// modelled: the vCPU is stopped across both exits, so ordering against devices
+/// and DMA stays with the embedder (spec.md §5.2). No host memory is accessed
+/// here, so no ordering barrier applies. The read answer is bound in the retry
+/// ledger (see [`exec_load_retry`]), so the retry after the write acknowledgement
+/// does not read the device again. An operand that is not inside one Trap region
+/// returns `Exit::UnknownInstruction`, as before: the processor performs it in as
+/// many bus cycles as necessary (SDM Vol 3A §11.1.2.2), which separate exits do
+/// not express yet. Returns the value read.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn locked_device_operand(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    cur_addr: u64,
+    ir: &IrBlock,
+    addr: u64,
+    src: u64,
+    size: u8,
+    update: LockedUpdate,
+) -> Result<u64, InterpResult> {
+    if !matches!(mem.region_kind(addr, size), Ok(crate::RegionKind::Trap)) {
+        return Err(unknown_atomic_exit(cpu, mem, cur_addr, ir));
+    }
+    let m = mask(size);
+    let key = crate::state::bound_answer_key(addr, size, false);
+    let prev = if let Some(value) = bound_answer(cpu, ir, cur_addr, key, mem, addr, size) {
+        value & m
+    } else if let Some(value) = cpu.pending_mmio.take() {
+        let value = value & m;
+        record_bound_answer(cpu, ir, cur_addr, key, value);
+        value
+    } else {
+        return Err(trap_out(
+            cpu,
+            cur_addr,
+            MemTrap::Mmio,
+            addr,
+            size,
+            AccessKind::Read,
+            0,
+        ));
+    };
+    let value = match update {
+        LockedUpdate::Rmw(RmwOp::Add) => prev.wrapping_add(src),
+        LockedUpdate::Rmw(RmwOp::Sub) => prev.wrapping_sub(src),
+        LockedUpdate::Rmw(RmwOp::Rsub) => src.wrapping_sub(prev),
+        LockedUpdate::Rmw(RmwOp::And) => prev & src,
+        LockedUpdate::Rmw(RmwOp::Or) => prev | src,
+        LockedUpdate::Rmw(RmwOp::Xor) => prev ^ src,
+        LockedUpdate::Rmw(RmwOp::Xchg) => src,
+        LockedUpdate::Cas(expected) if prev == expected & m => src,
+        LockedUpdate::Cas(_) => prev,
+    } & m;
+    if cpu.pending_mmio_write {
+        cpu.pending_mmio_write = false;
+        Ok(prev)
+    } else {
+        Err(trap_out(
+            cpu,
+            cur_addr,
+            MemTrap::Mmio,
+            addr,
+            size,
+            AccessKind::Write,
+            value,
+        ))
+    }
 }
 
 #[cold]
@@ -630,8 +869,23 @@ fn atomic_mmio_exit<const ROUTED: bool, const ORDER: u8>(
     cur_addr: u64,
     ir: &IrBlock,
 ) -> InterpResult {
-    // Engine policy (§5.2): separate device exits cannot implement an atomic
-    // RMW/CAS. Leave emulation to the embedder, as for paired compare-exchange.
+    unknown_atomic_exit(cpu, mem, cur_addr, ir)
+}
+
+/// `Exit::UnknownInstruction` with the instruction's exact bytes and length, RIP
+/// left on it: embedder emulation of an atomic operation on a device operand.
+#[cold]
+#[inline(never)]
+fn unknown_atomic_exit(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    cur_addr: u64,
+    ir: &IrBlock,
+) -> InterpResult {
+    // Engine policy (§5.2) for Long64/Compat32, and for a Real16 or Machine
+    // operand only partly in a Trap region: separate device exits do not express
+    // the transaction there. Leave emulation to the embedder, as for paired
+    // compare-exchange.
     let next = ir.ops.iter().find_map(|op| match op {
         IrOp::InsnStart { guest_addr } if *guest_addr > cur_addr => Some(*guest_addr),
         _ => None,

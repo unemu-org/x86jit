@@ -70,6 +70,7 @@ fn write<const ROUTED: bool, const ORDER: u8>(
             if trap != MemTrap::Mmio {
                 return Err(memory_exit(cpu, trap, addr, true, (value >> (8 * i)) & 255));
             }
+            return write_devices_first::<ROUTED, ORDER>(cpu, mem, tag, size, value, i);
         }
     }
     let access = Access::<ROUTED, ORDER, _>::new(mem);
@@ -86,6 +87,59 @@ fn write<const ROUTED: bool, const ORDER: u8>(
                 cpu.record_mmio_part(cpu.rip, key, byte);
             } else {
                 return Err(memory_exit(cpu, trap, addr, true, byte));
+            }
+        }
+    }
+    Ok(())
+}
+
+// A store whose byte `first` is its first device byte, with the bytes before it
+// validated: the rest are validated, then the device bytes are written first, in
+// order, and the RAM bytes once every device byte is acknowledged. A device stop
+// then leaves the instruction's RAM bytes uncommitted (spec.md §16, pitfall 0),
+// so the retry of a read-modify-write over RAM and device bytes reads the operand
+// it read the first time. The order is an engine choice for restartability; the
+// device sees no RAM transfer either way. Every store with a device byte comes
+// here, so the validation loop in `write` keeps no state of its own.
+#[cold]
+#[inline(never)]
+fn write_devices_first<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    tag: u64,
+    size: u8,
+    value: u64,
+    first: u8,
+) -> Result<(), Exit> {
+    for i in first + 1..size {
+        let addr = physical(tag, i);
+        match mem.probe_write_mode::<ROUTED>(addr, 1) {
+            Ok(()) | Err(MemTrap::Mmio) => {}
+            Err(trap) => {
+                return Err(memory_exit(cpu, trap, addr, true, (value >> (8 * i)) & 255));
+            }
+        }
+    }
+    let access = Access::<ROUTED, ORDER, _>::new(mem);
+    for pass_device in [true, false] {
+        for i in 0..size {
+            let addr = physical(tag, i);
+            if matches!(mem.probe_write_mode::<ROUTED>(addr, 1), Err(MemTrap::Mmio)) != pass_device
+            {
+                continue;
+            }
+            let key = addr | (1 << 63);
+            let byte = (value >> (8 * i)) & 255;
+            if cpu.mmio_part(cpu.rip, key).is_some() {
+                continue;
+            }
+            if let Err(trap) = access.write(addr, byte, 1) {
+                if trap == MemTrap::Mmio && cpu.pending_mmio_write {
+                    cpu.pending_mmio_write = false;
+                    cpu.record_mmio_part(cpu.rip, key, byte);
+                } else {
+                    return Err(memory_exit(cpu, trap, addr, true, byte));
+                }
             }
         }
     }

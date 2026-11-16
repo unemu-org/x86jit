@@ -116,9 +116,9 @@ pub(super) fn scalar_limit_access(ops: &[IrOp], rip: u64, offset: Val) -> Access
     }
 }
 
-// Only retry-specialized alias walks need this scan. Ordinary alias loads keep
-// their frozen completion behavior (decision-23 §6); unified scalar reads use
-// the same ledger as Machine (80386 PRM §9.1, instruction restart).
+// Only retry-specialized alias walks need this scan. The unified multi-read
+// families use the same ledger as Machine (80386 PRM §9.1, instruction
+// restart); other alias loads bind their answers (`exec_load_retry`).
 #[cold]
 #[inline(never)]
 pub(super) fn unified_read_retry(ops: &[IrOp], rip: u64) -> bool {
@@ -560,7 +560,7 @@ pub(crate) fn mmio_evidence(cpu: &CpuState) -> Box<[(u64, u64)]> {
     });
     let mut transfers = Vec::new();
     for &(key, value) in entries {
-        if key & DESCRIPTOR_RETRY != 0 {
+        if key & DESCRIPTOR_RETRY != 0 || crate::state::is_bound_key(key) {
             continue;
         }
         if key >> 61 != 1 {
@@ -610,9 +610,38 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     }
     // Validate both destinations before committing the split RAM store.
     probe(cpu, mem, addr, size)?;
-    write_physical(cpu, mem, addr, physical, part, value)?;
     let next = u64::from((addr as u32).wrapping_add(u32::from(part)));
+    if split_device_follows_ram(cpu, mem, physical, part, next, size - part) {
+        // The device piece goes first, so a device stop leaves the RAM piece
+        // uncommitted (spec.md §16, pitfall 0) and the retry of a
+        // read-modify-write reads the operand it read the first time. This
+        // order is an engine choice for restartability; no pinned manual gives
+        // the order of the two bus cycles.
+        write(cpu, mem, next, size - part, value >> (part * 8))?;
+        return write_physical(cpu, mem, addr, physical, part, value);
+    }
+    write_physical(cpu, mem, addr, physical, part, value)?;
     write(cpu, mem, next, size - part, value >> (part * 8))
+}
+
+#[cold]
+#[inline(never)]
+fn split_device_follows_ram<const ROUTED: bool, const ORDER: u8>(
+    cpu: &CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    physical: u64,
+    part: u8,
+    next: u64,
+    rest: u8,
+) -> bool {
+    let (next, rest) = legacy::physical_span(cpu, next, rest);
+    let device = |at, bytes| {
+        matches!(
+            mem.raw().region_kind(at, bytes),
+            Ok(crate::RegionKind::Trap)
+        )
+    };
+    !device(physical, part) && device(next, rest)
 }
 
 fn write_physical<const ROUTED: bool, const ORDER: u8>(
@@ -2538,12 +2567,26 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
         } => {
             let linear = read_val(*addr, temps);
             let (physical, part) = legacy::physical_span(cpu, linear, *size);
-            if part == *size {
+            let completed = if part == *size {
                 match mem.atomic_rmw(physical, read_val(*src, temps), *size, *op) {
-                    Ok(value) => temps[*old as usize] = value,
-                    Err(MemTrap::Mmio) => return Err(atomic_device_exit(cpu, mem, ir)),
+                    Ok(value) => {
+                        temps[*old as usize] = value;
+                        true
+                    }
+                    // A device operand inside one Trap region takes the bus
+                    // transfers below (spec.md §5.2); one only partly in a
+                    // Trap region keeps embedder emulation, as before.
+                    Err(MemTrap::Mmio) => {
+                        if !matches!(
+                            mem.0.region_kind(physical, *size),
+                            Ok(crate::RegionKind::Trap)
+                        ) {
+                            return Err(atomic_device_exit(cpu, mem, ir));
+                        }
+                        false
+                    }
                     Err(trap) => {
-                        if let StepResult::Exit(exit) = trap_out(
+                        let StepResult::Exit(exit) = trap_out(
                             cpu,
                             cpu.rip,
                             trap,
@@ -2552,22 +2595,37 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             AccessKind::Write,
                             read_val(*src, temps),
                         )
-                        .into_step()
-                        {
-                            return Err(crate::fault::qualify_legacy_bus(exit, linear, physical));
-                        }
+                        .into_step() else {
+                            unreachable!("a memory trap exits")
+                        };
+                        return Err(crate::fault::qualify_legacy_bus(exit, linear, physical));
                     }
                 }
             } else {
-                if (0..*size).any(|byte| {
-                    let linear = u64::from((linear as u32).wrapping_add(u32::from(byte)));
-                    let (physical, _) = legacy::physical_span(cpu, linear, 1);
-                    matches!(mem.0.region_kind(physical, 1), Ok(crate::RegionKind::Trap))
-                }) {
+                // A20 splits the operand into bus pieces. All in devices: each
+                // piece is a transfer of its own. Devices and RAM mixed: embedder
+                // emulation, as for an operand partly in a Trap region.
+                let trap_bytes = (0..*size)
+                    .filter(|&byte| {
+                        let linear = u64::from((linear as u32).wrapping_add(u32::from(byte)));
+                        let (physical, _) = legacy::physical_span(cpu, linear, 1);
+                        matches!(mem.0.region_kind(physical, 1), Ok(crate::RegionKind::Trap))
+                    })
+                    .count();
+                if trap_bytes != 0 && trap_bytes != usize::from(*size) {
                     return Err(atomic_device_exit(cpu, mem, ir));
                 }
-                // As with the memory layer's unaligned RMW fallback, this
-                // discontinuous bus operand has no single host atomic address.
+                false
+            };
+            if !completed {
+                // A discontinuous bus operand, as with the memory layer's
+                // unaligned RMW fallback, has no single host atomic address. A
+                // device operand is read once, then written once: the LOCK
+                // semantics "are followed for as many bus cycles as necessary
+                // to update the entire operand" (SDM Vol 3A §11.1.2.2; 80286
+                // PRM Appendix B, XCHG p. B-114). Each bus piece must still lie
+                // inside one region. The Machine ledger keys these transfers as
+                // for any other Machine access.
                 probe_locked(cpu, mem, linear, *size)?;
                 let value = read(cpu, mem, linear, *size)?;
                 let src = read_val(*src, temps);

@@ -2467,7 +2467,8 @@ impl Vcpu {
 
     /// Deliver an MMIO read result after `Exit::MmioRead`, then resume (§5.2). The
     /// block re-executes from the faulting instruction (RIP was left there), and its
-    /// first load consumes this value instead of re-trapping. Stored on `CpuState`,
+    /// first load consumes this value instead of re-trapping; the retry ledger keeps
+    /// it across the instruction's own device stops (spec.md §5.2). Stored on `CpuState`,
     /// not a temp (temps die when the block returns). Interpreter path today —
     /// JIT-side MMIO trap/resume is deferred, and the JIT never emits an
     /// `Exit::MmioRead` for an inlined load, so this is only reached under the interp.
@@ -2488,9 +2489,16 @@ impl Vcpu {
     /// exactly once, preserving instruction atomicity (§7 pitfall 0). Interpreter
     /// path today; JIT-side MMIO is deferred.
     ///
-    /// A read-modify-write to a `Trap` region (`add [mmio], reg`) is not supported:
-    /// on retry its load re-traps as a fresh `MmioRead`. Model such a device with a
-    /// pure load then a pure store instead.
+    /// A read-modify-write to a `Trap` region (`add [mmio], reg`) stops twice: one
+    /// `MmioRead`, then one `MmioWrite` of the updated value. The retry after this
+    /// acknowledgement reuses the value the read was answered with; the device is
+    /// not read again, also after a budget or host stop taken before the retry. A
+    /// different instruction written at the same RIP in between, or a fault of the
+    /// instruction, discards that value, and the re-execution reads the device
+    /// again. On Real16 and the
+    /// Machine models, XCHG with memory and a LOCK-prefixed form do the same for an
+    /// operand inside one Trap region; Long64 and Compat32 return
+    /// `Exit::UnknownInstruction` for those (spec.md §5.2).
     pub fn complete_mmio_write(&mut self) {
         if !self.cpu.mmio_retry_active {
             self.cpu.begin_mmio_retry(self.cpu.rip);

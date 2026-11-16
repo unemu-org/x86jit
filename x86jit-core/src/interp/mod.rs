@@ -2044,16 +2044,13 @@ fn walk_ops<
                 addr,
                 size,
             } => {
-                let result = if !MACHINE
-                    && RETRY
-                    && ir.mode == crate::CpuMode::Real16
-                    && legacy::unified_read_retry(&ir.ops, cur_addr.get())
-                {
-                    exec_load::<true, ROUTED, ORDER>(
+                let result = if !MACHINE && RETRY {
+                    exec_load_retry::<ROUTED, ORDER>(
                         cpu,
                         mem,
                         temps,
                         cur_addr.get(),
+                        ir,
                         dst,
                         addr,
                         size,

@@ -1225,7 +1225,8 @@ fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol_cpu_model() {
 #[test]
 fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol() {
     // SDM Vol 2B §4.3 XCHG; decision-22: the complete operand is
-    // checked before physical splitting. §5.2 leaves locked MMIO to the embedder.
+    // checked before physical splitting. §5.2 leaves a locked operand with a RAM
+    // piece and a device piece to the embedder.
     for generation in [CpuGeneration::I286, CpuGeneration::I386] {
         let (mut vm, mut cpu) = legacy_fixture(b"\x87\x07", generation);
         cpu.cpu.ds = 0xffff;

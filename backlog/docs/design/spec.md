@@ -455,15 +455,88 @@ impl Vcpu {
 >
 > This works identically in the interpreter and the JIT (the retried load is a fresh execution in both), costs one `Option` check on the Trap-slow-path only, and never requires resuming a half-executed block.
 
-**Atomic operations on Trap regions:** memory CMPXCHG, XADD, XCHG,
-CMPXCHG8B/CMPXCHG16B and supported LOCK-prefixed ALU/bit modifications return
+**Read-modify-write operands on Trap regions.** An instruction that reads and
+writes a memory operand transfers it once in each direction: one `MmioRead`, then
+one `MmioWrite` of the result. The 8086 Family User's Manual (9800722-03) Table 2-21
+(pp. 2-51–2-67) counts two transfers for every `memory, register`,
+`memory, immediate` and one-operand `memory` form of the arithmetic, logical,
+shift, rotate, INC/DEC/NOT/NEG and XCHG instructions, and one for a
+`register, memory` form and for CMP (p. 2-53). RIP stays on the instruction across
+both exits, and none of its register or flag effects commit before the write is
+acknowledged. This holds in every mode and at every tier: compiled code defers an
+instruction with a Trap operand to the interpreter.
+
+The retry after each completion re-executes the instruction. In the application
+walks (the Real16 alias, Long64, Compat32) the answer it consumes is recorded in
+the retry ledger, bound to its request: the owning instruction (RIP, CS and a
+fingerprint of its lifted operations) and the access's address, size and
+direction. The retry after the write acknowledgement takes the recorded answer
+instead of reading the device again. A different instruction at the same RIP
+(code written between the exits) does not match the fingerprint and reads the
+device itself, and a recorded answer stands only while its access still stops at
+a Trap region: remapped as RAM, or unmapped, between the exits, the access drops
+it and runs as without one. A recorded answer lives across the instruction's own
+`MmioRead`/`MmioWrite` stops and across the boundary stops taken before its retry
+runs — `BudgetExhausted` (also from `run(Some(0))` or `run_steps(0)`) and a host
+stop (`Interrupted`) — since the instruction has neither completed nor aborted
+there. Any other stop of that instruction — a fault such as `UnmappedMemory`, a
+delivered exception — ends it, as a fault aborts the instruction on the
+processor, and the re-execution reads the device again; it is not reported as an
+acknowledged transfer. The Machine walks keep their existing
+ledger (decision-16 §3), and the alias's multi-read families share it (U3). The
+pending answer of `complete_mmio_read` is still taken by the first load of the
+retry that has no recorded answer; binding the pending answer itself to its
+request is xj-ir6.13.
+
+Some stores are split into a RAM part and a device part: the twenty-bit models'
+byte transfers of a word over a RAM byte and a device byte, and an operand that
+the A20 gate splits into bus pieces on the I286/I386 Machine path. Such a store
+writes its device part first and commits the RAM part once the device write is
+acknowledged, so a stop at the device leaves the instruction's RAM uncommitted
+and the retry of a read-modify-write computes from the operand it read first.
+That order is an engine choice for restartability (ASSUMED; no pinned manual
+gives the order of the two bus cycles), not a bus order; the device sees the same
+transfers either way, and only an `MmioWrite` handler that reads guest RAM can see
+the RAM part still unwritten.
+
+The twenty-bit models' device transfers are byte-wide today. That matches the
+8-bit bus of the 8088 and V20, but not the 16-bit bus of the 8086 and V30, where
+an even-aligned word is one bus cycle (8086 Family User's Manual Table 2-21
+counts a word operand as one transfer, and its p. 2-51 footnote adds clocks only
+for a word at an odd address). Bus-width-faithful device transfers are a
+follow-up.
+
+**Locked operands on Trap regions — Real16 and Machine.** On the Real16 alias and
+every Machine model, XCHG with memory, CMPXCHG, XADD and the LOCK-prefixed forms
+perform the same one read, then one write, of an operand inside one Trap region.
+XCHG with memory is locked automatically (SDM Vol 3A §11.1.2.1 p. 11-3; 80286 PRM
+Appendix B XCHG p. B-114; 8086 Family User's Manual §2.5 p. 2-18); a locked
+operation holds the bus "for as many bus cycles as necessary to update the entire
+operand" (SDM Vol 3A §11.1.2.2 p. 11-4); "the processor never produces a locked
+read without also producing a locked write", and a CMPXCHG writes the value read
+back when its comparison fails and the source when it succeeds (SDM Vol 2A §3.3
+CMPXCHG, p. 3-194). LOCK# is not modelled: the vCPU is stopped across both exits
+— no interrupt is accepted between them — so ordering against devices and DMA
+stays with the embedder. The twenty-bit models move every data byte as its own
+transfer (above), so a word operand there is two byte reads, then two byte writes,
+and an XCHG over a RAM byte and a device byte transfers the device byte. A locked
+operand on RAM keeps the atomic path. A locked operand only partly in a Trap
+region — a word over the last RAM byte and the first device byte, or an A20-split
+operand with a RAM piece and a device piece — keeps `Exit::UnknownInstruction`
+with the instruction's bytes, as before, for the embedder to emulate. The
+processor performs such an operand in as many bus cycles as necessary (SDM Vol 3A
+§11.1.2.2); performing it with separate exits is a follow-up. An A20-split operand
+whose pieces all lie in devices is one transfer per bus piece. The alias's
+CMPXCHG8B keeps embedder emulation: `Exit::UnknownInstruction`, as below.
+
+**Atomic operations on Trap regions — Long64 and Compat32:** memory CMPXCHG, XADD,
+XCHG, CMPXCHG8B/CMPXCHG16B and supported LOCK-prefixed ALU/bit modifications return
 `Exit::UnknownInstruction` with the instruction's exact bytes and length, leaving
 RIP on that instruction and its guest state unchanged. No device transfer is
-requested. Separate MMIO read/write exits cannot express a locked transaction
-(SDM Vol 3A §§11.1.2–11.1.2.2). The embedder emulates the instruction and advances
-RIP; `complete_mmio_read`/`complete_mmio_write` do not acknowledge this exit.
-Memory CMPXCHG and XADD use this policy with or without an explicit LOCK prefix,
-matching their atomic IR lowering.
+requested; their compiled code has no device path. The embedder emulates the
+instruction and advances RIP; `complete_mmio_read`/`complete_mmio_write` do not
+acknowledge this exit. Memory CMPXCHG and XADD use this policy with or without an
+explicit LOCK prefix, matching their atomic IR lowering.
 
 > **Note on MMIO vs JIT:** in generated code, ordinary RAM is inlined, but access to a Trap region must leave the block. This complicates codegen (the JIT must generate a check "is this address a Trap" or know it statically). At the start (interpreter) this is trivial. With the JIT, consider: either a runtime check on accesses that may hit a Trap, or keeping MMIO out of the hot path and accepting that accesses to unknown addresses go the slow route. Resolve this in M4 together with the inline-access safety check (§8.2.3) — one range/permission check can serve both.
 

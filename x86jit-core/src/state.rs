@@ -803,6 +803,46 @@ impl CpuState {
         self.mmio_retry_cs = self.cs;
     }
 
+    /// Drop the bound answers ([`bound_answer_key`]) and their instruction
+    /// fingerprint, keeping every other ledger entry and the pending completion.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn drop_bound_answers(&mut self) {
+        let mut kept = 0;
+        for i in 0..usize::from(self.mmio_parts_len) {
+            let entry = self.mmio_parts[i];
+            if !is_bound_key(entry.0) {
+                self.mmio_parts[kept] = entry;
+                kept += 1;
+            }
+        }
+        self.mmio_parts_len = kept as u8;
+    }
+
+    /// A host stop while the instruction that owns the retry is still pending. The
+    /// stop is taken only at an instruction boundary, so the instruction has not
+    /// run again: its bound answers stay, and the rest of the ledger and any
+    /// pending completion are dropped as for any other host stop.
+    #[cold]
+    #[inline(never)]
+    fn keep_only_bound_answers(&mut self) {
+        let mut kept = 0;
+        for i in 0..usize::from(self.mmio_parts_len) {
+            let entry = self.mmio_parts[i];
+            if is_bound_key(entry.0) {
+                self.mmio_parts[kept] = entry;
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            self.clear_mmio_parts();
+            return;
+        }
+        self.mmio_parts_len = kept as u8;
+        self.pending_mmio = None;
+        self.pending_mmio_write = false;
+    }
+
     /// Common retry/abandonment policy for interpretation, stepping and dispatch exits.
     pub(crate) fn finish_mmio_retry(&mut self, exit: Option<&crate::exit::Exit>) {
         use crate::exit::Exit;
@@ -815,8 +855,30 @@ impl CpuState {
                     | Exit::BudgetExhausted
             )
         );
-        if self.mmio_retry_active && (!retry || !self.owns_mmio_retry(self.rip)) {
+        if self.mmio_retry_active
+            && matches!(exit, Some(Exit::Interrupted))
+            && self.owns_mmio_retry(self.rip)
+        {
+            self.keep_only_bound_answers();
+        } else if self.mmio_retry_active && (!retry || !self.owns_mmio_retry(self.rip)) {
             self.clear_mmio_parts();
+        }
+        // A bound answer lives across the instruction's own device stops and the
+        // boundary stops before its retry (a budget or host stop). Any other stop
+        // ends the attempt as a fault ends it on the processor, and the
+        // re-execution reads the device again (spec.md §5.2).
+        if self.mmio_retry_active
+            && !matches!(
+                exit,
+                Some(
+                    Exit::MmioRead { .. }
+                        | Exit::MmioWrite { .. }
+                        | Exit::BudgetExhausted
+                        | Exit::Interrupted
+                )
+            )
+        {
+            self.drop_bound_answers();
         }
         if matches!(exit, Some(Exit::MmioRead { .. } | Exit::MmioWrite { .. })) {
             self.begin_mmio_retry(self.rip);
@@ -935,6 +997,37 @@ impl CpuState {
             _ => unreachable!("gpr write size must be 1/2/4/8, got {size}"),
         };
     }
+}
+
+/// Ledger namespace of the answers that application walks and locked device
+/// operands record (`interp::integer::{exec_load_retry, locked_device_operand}`):
+/// bits 63..61 are `101`, which no other ledger key uses (raw canonical or bus
+/// addresses, `1 << 63` write acknowledgements, `1 << 62` descriptor and transfer
+/// snapshots, `1 << 61` ENTER displays). Bit 60 marks the instruction fingerprint.
+const BOUND_TAG: u64 = 0b101 << 61;
+const BOUND_FINGERPRINT: u64 = BOUND_TAG | (1 << 60);
+
+/// The ledger key of a device answer bound to its request: the access size
+/// (bits 59..58, log2), its direction (bit 57, set for a write) and the low 57
+/// address bits, which determine any canonical or bus address. The owner (RIP,
+/// CS) and the instruction fingerprint complete the binding.
+pub(crate) fn bound_answer_key(addr: u64, size: u8, write: bool) -> u64 {
+    BOUND_TAG
+        | (u64::from(size.trailing_zeros() & 3) << 58)
+        | (u64::from(write) << 57)
+        | (addr & ((1 << 57) - 1))
+}
+
+/// The ledger key of the owning instruction's fingerprint.
+pub(crate) fn bound_fingerprint_key() -> u64 {
+    BOUND_FINGERPRINT
+}
+
+/// Whether a ledger key is a bound answer or its fingerprint. These are never
+/// reported as acknowledged transfers: they do not outlive the instruction's
+/// own device stops.
+pub(crate) fn is_bound_key(key: u64) -> bool {
+    key >> 61 == 0b101
 }
 
 #[cfg(test)]
