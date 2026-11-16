@@ -844,6 +844,12 @@ impl CpuState {
     }
 
     /// Common retry/abandonment policy for interpretation, stepping and dispatch exits.
+    ///
+    /// `#[inline]` keeps this available to every codegen unit that calls it, so the
+    /// walks inline it whatever the partitioning; without it, growing this policy
+    /// moved the twenty-bit and system walks by 1–2 % host instructions per step
+    /// (xj-ir6.36, performance.md).
+    #[inline]
     pub(crate) fn finish_mmio_retry(&mut self, exit: Option<&crate::exit::Exit>) {
         use crate::exit::Exit;
         let retry = matches!(

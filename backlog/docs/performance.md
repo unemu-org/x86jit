@@ -3119,3 +3119,145 @@ workloads.
 | `smc-next-64` | I386 | 3563.9 (9) | 3561.2 (9) | 3561.2 (9) | -0.075% | -0.001% |
 | `smc-next-64` | I286 A20 off | 3700.9 (9) | 3697.9 (9) | 3697.9 (9) | -0.082% | -0.001% |
 | `smc-next-64` | I386 A20 off | 3565.9 (9) | 3562.9 (9) | 3562.9 (9) | -0.084% | -0.001% |
+
+## Codegen-unit regression after xj-ir6.33 (xj-ir6.36, baseline b2ac76e4)
+
+### Finding — MEASURED
+
+xj-ir6.33 as landed (f9aa0c98) costs +1.0 % to +2.2 % host instructions per step.
+The cost is on the twenty-bit paths, on `alu`, `load`, `store`, `push-pop`,
+`call-ret`, `dos-mixed` and `straight-line`. The system paths cost +1.2 % on
+`straight-line` and +0.5 % on `push-pop`. The xj-ir6.33 gate above passed
+because its review rounds measured only `ip-boundary-1` and the SMC workloads.
+
+The step is 3bf14e3c, the budget and host stop change (re-review P1-2). It
+touches only `CpuState::finish_mmio_retry` and adds `keep_only_bound_answers`.
+Three process pairs per build:
+
+| Workload | Path | b2ac76e4 | d59d181e | 3bf14e3c | f9aa0c98 |
+|---|---|---:|---:|---:|---:|
+| `alu` | I8086 | 401.034 | 400.885 | 405.123 | 405.156 |
+| `push-pop` | I8086 | 650.318 | 651.695 | 660.597 | 660.627 |
+| `straight-line` | I8086 | 514.097 | 515.968 | 525.158 | 525.093 |
+| `store` | I8086 | 542.782 | 544.398 | 549.135 | 549.075 |
+| `straight-line` | I286 | 381.783 | 381.774 | 386.428 | 386.427 |
+| `push-pop` | I286 | 489.305 | 489.418 | 491.806 | 491.886 |
+
+The function grows from 220 to 320 bytes, and its direct calls go from 25 to 236.
+Code whose source did not change also compiles differently. For example,
+`vm::i8086::resolve` now inlines `ModelIsa::decode`.
+
+The same function out of line does not recover the cells. Three variants stay at
++2.19 % on I8086 `straight-line`:
+- a forced-inline fast test with a cold remainder;
+- the same, also with the no-exit case inlined;
+- d59d181e's body with an early branch to a cold boundary function.
+
+Only `#[inline]` recovers them.
+
+ASSUMED: the mechanism is rustc's codegen-unit partitioning in the default release
+profile. A non-`#[inline]` function is code-generated once, in its module's unit.
+Its growth changed how the units were merged, and with that the inlining in
+untouched hot code. An `#[inline]` function is instantiated in each calling unit.
+With it, `resolve` again matches d59d181e (2 normalized lines differ, 188 before).
+
+The fingerprint is not the cause. `<IrOp as Debug>::fmt` has been linked since
+d59d181e, through `instruction_fingerprint`. Only the cold bound-answer functions
+reach it, from the retry walks. d59d181e measures at the base on the system paths.
+
+### Change — READ
+
+`#[inline]` on `CpuState::finish_mmio_retry`, with a doc comment that says why.
+Behaviour is unchanged. The witnesses pass: `mmio_rmw` 23, `locked_mmio` 16,
+`run_steps` 47 and `fault_metadata` 59 tests, and the 24 `legacy_*` binaries
+that run on this host (`legacy_upper_audit` is Linux x86-64 only), 793 tests in
+total.
+
+### Method — MEASURED
+
+Dev-shell Rust 1.98.1, macOS arm64, release profile as committed. Base: `git
+archive b2ac76e4` (`real16_loops` SHA-256
+`c82b167e27b06cb75dd35fb017edef2e839a8c2cb66fd3e4a851a0a3e3654019`,
+`counted_store_probe`
+`62c304ccfe61537c665881a4742e17d61914e512c4cf1bbdd3364baa0be2bf71`). Candidate:
+80b54f8a with this change, built both from the worktree and from a source
+snapshot; `real16_loops` is the same binary either way (SHA-256
+`cce2f35a4afc1b94719f72766fb7e6d598254b057188fb7c0343c2d4fa4f4a0e`;
+`counted_store_probe`
+`de8dbf5cb63633402da034d703776eb938580f15ff032d5843e272e2eb9eeb23`).
+
+The gate uses literal `real16_loops 1 3 <workload>` on all nine paths:
+- three process pairs for each of the 13 non-SMC workloads;
+- seven processes per side for each of the three SMC workloads;
+- side order alternating between workloads and pairs.
+
+A process value is the median of its three rounds. Equal steps and retirements
+were checked for every cell. The decision-23 rule decides each cell. A side is
+bimodal when its values split, at the largest neighbour ratio, into two groups
+whose medians differ by more than 0.5 %. The store probe is the counted copy of
+`interpreter_store_probe`, with 200000 iterations × 16 stores, eight cells and
+three rounds. One benchmark process ran at a time.
+
+### Gate, non-SMC — MEASURED: all 117 cells pass
+
+All cells are unimodal. The worst is +0.387 % (`straight-line`, I8088). The
+twenty-bit `straight-line`, `store` and `push-pop` cells keep +0.2 % to +0.4 %
+from d59d181e.
+
+| Workload | Alias | I8088 | I8086 | V20 | V30 | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `alu` | 357.100→357.082 (-0.005%) PASS | 401.093→400.898 (-0.049%) PASS | 401.079→400.827 (-0.063%) PASS | 401.106→400.886 (-0.055%) PASS | 401.068→400.906 (-0.040%) PASS | 363.362→363.367 (+0.001%) PASS | 363.357→363.338 (-0.005%) PASS | 363.379→363.377 (-0.001%) PASS | 363.373→363.401 (+0.008%) PASS |
+| `call-ret` | 833.773→833.770 (-0.000%) PASS | 1128.193→1129.133 (+0.083%) PASS | 1128.120→1129.126 (+0.089%) PASS | 1128.123→1129.118 (+0.088%) PASS | 1128.197→1129.133 (+0.083%) PASS | 906.465→906.454 (-0.001%) PASS | 906.442→906.449 (+0.001%) PASS | 906.448→906.459 (+0.001%) PASS | 906.440→906.506 (+0.007%) PASS |
+| `data-next-to-code` | 972.760→973.746 (+0.101%) PASS | 1426.477→1429.118 (+0.185%) PASS | 1426.443→1429.149 (+0.190%) PASS | 1426.433→1429.125 (+0.189%) PASS | 1426.454→1429.123 (+0.187%) PASS | 988.426→989.443 (+0.103%) PASS | 988.439→989.419 (+0.099%) PASS | 988.420→989.418 (+0.101%) PASS | 988.417→989.425 (+0.102%) PASS |
+| `data-next-to-dense-code` | 972.855→973.816 (+0.099%) PASS | 1426.490→1429.315 (+0.198%) PASS | 1426.465→1429.415 (+0.207%) PASS | 1426.461→1429.331 (+0.201%) PASS | 1426.489→1429.335 (+0.200%) PASS | 988.432→989.471 (+0.105%) PASS | 988.677→989.452 (+0.078%) PASS | 988.520→989.462 (+0.095%) PASS | 988.497→989.449 (+0.096%) PASS |
+| `dos-mixed` | 452.939→452.939 (+0.000%) PASS | 641.669→642.130 (+0.072%) PASS | 641.656→642.143 (+0.076%) PASS | 641.650→642.132 (+0.075%) PASS | 641.662→642.122 (+0.072%) PASS | 441.155→441.026 (-0.029%) PASS | 441.014→441.010 (-0.001%) PASS | 441.016→441.015 (-0.000%) PASS | 441.003→441.014 (+0.002%) PASS |
+| `ip-boundary-1` | 2258.506→2259.426 (+0.041%) PASS | 2386.490→2388.483 (+0.084%) PASS | 2386.510→2388.472 (+0.082%) PASS | 2386.561→2388.585 (+0.085%) PASS | 2386.558→2388.477 (+0.080%) PASS | 2475.647→2479.504 (+0.156%) PASS | 2475.552→2479.467 (+0.158%) PASS | 2475.542→2479.505 (+0.160%) PASS | 2475.700→2479.505 (+0.154%) PASS |
+| `ip-boundary-64` | 341.067→341.101 (+0.010%) PASS | 400.899→400.556 (-0.086%) PASS | 400.886→400.535 (-0.088%) PASS | 400.896→400.547 (-0.087%) PASS | 400.917→400.540 (-0.094%) PASS | 373.103→373.130 (+0.007%) PASS | 373.107→373.119 (+0.003%) PASS | 373.102→373.129 (+0.007%) PASS | 373.101→373.154 (+0.014%) PASS |
+| `load` | 468.049→468.070 (+0.004%) PASS | 546.408→546.077 (-0.061%) PASS | 546.387→546.119 (-0.049%) PASS | 546.389→546.067 (-0.059%) PASS | 546.382→546.082 (-0.055%) PASS | 478.720→478.739 (+0.004%) PASS | 478.799→478.806 (+0.001%) PASS | 478.720→478.772 (+0.011%) PASS | 478.715→478.793 (+0.016%) PASS |
+| `load-odd` | 479.043→479.075 (+0.007%) PASS | 546.385→546.064 (-0.059%) PASS | 546.379→546.061 (-0.058%) PASS | 546.379→546.058 (-0.059%) PASS | 546.377→546.064 (-0.057%) PASS | 489.704→489.746 (+0.009%) PASS | 489.707→489.757 (+0.010%) PASS | 489.704→489.738 (+0.007%) PASS | 489.703→489.723 (+0.004%) PASS |
+| `push-pop` | 490.309→490.296 (-0.003%) PASS | 650.332→651.565 (+0.190%) PASS | 650.322→651.579 (+0.193%) PASS | 650.330→651.571 (+0.191%) PASS | 650.346→651.572 (+0.189%) PASS | 489.316→489.320 (+0.001%) PASS | 489.318→489.304 (-0.003%) PASS | 489.304→489.310 (+0.001%) PASS | 489.300→489.307 (+0.001%) PASS |
+| `rep-movsw` | 188.074→188.077 (+0.002%) PASS | 358.121→358.126 (+0.001%) PASS | 358.126→358.127 (+0.000%) PASS | 358.124→358.124 (+0.000%) PASS | 358.123→358.124 (+0.000%) PASS | 188.070→188.072 (+0.001%) PASS | 188.072→188.073 (+0.001%) PASS | 188.072→188.072 (+0.000%) PASS | 188.072→188.072 (+0.000%) PASS |
+| `store` | 431.377→431.385 (+0.002%) PASS | 542.735→544.418 (+0.310%) PASS | 542.732→544.396 (+0.307%) PASS | 542.724→544.406 (+0.310%) PASS | 542.737→544.431 (+0.312%) PASS | 445.718→445.748 (+0.007%) PASS | 445.723→445.733 (+0.002%) PASS | 445.716→445.731 (+0.003%) PASS | 445.716→445.718 (+0.000%) PASS |
+| `straight-line` | 410.525→410.524 (-0.000%) PASS | 514.030→516.020 (+0.387%) PASS | 514.031→515.968 (+0.377%) PASS | 514.159→515.964 (+0.351%) PASS | 514.030→515.968 (+0.377%) PASS | 381.762→381.759 (-0.001%) PASS | 381.762→381.762 (+0.000%) PASS | 381.759→381.762 (+0.001%) PASS | 381.762→381.762 (+0.000%) PASS |
+
+### Gate, SMC — MEASURED: all 27 cells pass
+
+The alias and the four system paths are unimodal. The twelve twenty-bit cells are
+bimodal on both sides, with both modes present on both sides. Mode for mode they
+are +0.10 % to +0.25 %.
+
+| Workload | Alias | I8088 | I8086 | V20 | V30 | I286 | I386 | I286 A20 off | I386 A20 off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `smc-next-1` | 10655.536→10660.760 (+0.049%) PASS | 21535.2→21489.1 (-0.214%, advisory) PASS | 21536.8→21473.6 (-0.294%, advisory) PASS | 21986.2→21921.2 (-0.296%, advisory) PASS | 21986.3→21921.3 (-0.296%, advisory) PASS | 5362.619→5364.940 (+0.043%) PASS | 5227.616→5230.119 (+0.048%) PASS | 5364.491→5366.616 (+0.040%) PASS | 5229.567→5231.659 (+0.040%) PASS |
+| `smc-next-64` | 8850.585→8874.145 (+0.266%) PASS | 19643.9→19687.9 (+0.224%, advisory) PASS | 19640.9→19683.2 (+0.215%, advisory) PASS | 20090.5→20122.1 (+0.157%, advisory) PASS | 20090.6→20118.0 (+0.137%, advisory) PASS | 3698.980→3698.380 (-0.016%) PASS | 3563.896→3563.483 (-0.012%) PASS | 3700.959→3699.949 (-0.027%) PASS | 3565.912→3564.947 (-0.027%) PASS |
+| `smc-rmw-64` | 8980.152→8983.369 (+0.036%) PASS | 20508.9→20420.1 (-0.433%, advisory) PASS | 20509.8→20424.3 (-0.417%, advisory) PASS | 20967.5→20877.9 (-0.427%, advisory) PASS | 20967.9→20883.2 (-0.404%, advisory) PASS | 4929.077→4928.063 (-0.021%) PASS | 4773.852→4772.702 (-0.024%) PASS | 4931.054→4929.707 (-0.027%) PASS | 4775.690→4774.352 (-0.028%) PASS |
+
+| Workload | Path | Modes, base → candidate, median (processes) | Verdict |
+|---|---|---|---|
+| `smc-next-1` | I8088 | 21444.0 (3) → 21472.3 (5): +0.132%; 21559.1 (4) → 21586.6 (2): +0.128% | PASS |
+| `smc-next-1` | I8086 | 21445.1 (3) → 21473.1 (5): +0.131%; 21559.5 (4) → 21587.8 (2): +0.131% | PASS |
+| `smc-next-1` | V20 | 21894.4 (3) → 21921.0 (5): +0.121%; 22008.3 (4) → 22035.0 (2): +0.121% | PASS |
+| `smc-next-1` | V30 | 21894.4 (3) → 21921.1 (5): +0.122%; 22009.3 (4) → 22035.3 (2): +0.118% | PASS |
+| `smc-next-64` | I8088 | 19621.2 (5) → 19664.2 (4): +0.219%; 19757.9 (2) → 19782.8 (3): +0.126% | PASS |
+| `smc-next-64` | I8086 | 19617.7 (5) → 19667.0 (4): +0.251%; 19747.6 (2) → 19780.2 (3): +0.165% | PASS |
+| `smc-next-64` | V20 | 20067.2 (5) → 20113.6 (4): +0.231%; 20195.9 (2) → 20227.5 (3): +0.157% | PASS |
+| `smc-next-64` | V30 | 20067.5 (5) → 20113.9 (4): +0.231%; 20197.3 (2) → 20226.9 (3): +0.147% | PASS |
+| `smc-rmw-64` | I8088 | 20395.1 (1) → 20418.7 (4): +0.116%; 20509.4 (6) → 20531.8 (3): +0.109% | PASS |
+| `smc-rmw-64` | I8086 | 20396.2 (1) → 20420.1 (4): +0.117%; 20509.9 (6) → 20533.1 (3): +0.113% | PASS |
+| `smc-rmw-64` | V20 | 20853.9 (1) → 20875.8 (4): +0.105%; 20967.5 (6) → 20989.0 (3): +0.102% | PASS |
+| `smc-rmw-64` | V30 | 20854.5 (1) → 20875.9 (4): +0.103%; 20968.4 (6) → 20989.3 (3): +0.100% | PASS |
+
+### Store probe — MEASURED
+
+Host instructions per guest store, median of three rounds.
+
+| Width | Placement | Watch | b2ac76e4 | This change | Delta |
+|---:|---|---|---:|---:|---:|
+| 8 | single | off | 297.4766 | 297.4731 | −0.001 % |
+| 8 | single | on | 343.9922 | 343.9929 | +0.000 % |
+| 8 | crossing | off | 333.4898 | 333.4938 | +0.001 % |
+| 8 | crossing | on | 416.9985 | 416.9775 | −0.005 % |
+| 32 | single | off | 592.8904 | 592.8685 | −0.004 % |
+| 32 | single | on | 678.3564 | 678.3652 | +0.001 % |
+| 32 | crossing | off | 592.8632 | 592.8574 | −0.001 % |
+| 32 | crossing | on | 585.3674 | 585.3690 | +0.000 % |
