@@ -49,6 +49,7 @@ class CiGateTests(unittest.TestCase):
             "RUST_BACKTRACE": "1",
         }
         self.env.pop("SS286_REQUIRED", None)
+        self.env.pop("XJ_DEVSHELL", None)
 
     def run_gate(self, *args, status=0):
         result = subprocess.run(
@@ -119,6 +120,19 @@ class CiGateTests(unittest.TestCase):
                     "--locked", "--workspace", "--tests", "--target", target,
                 ])
                 self.assertIn("gate stdout", (self.root / f"logs/cross-{target}.log").read_text())
+
+    def test_named_dev_shell_is_selected(self):
+        self.env["XJ_DEVSHELL"] = "no-freebsd"
+        result = self.run_gate("fmt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.call()["args"], [
+            "develop", ".#no-freebsd", "--no-update-lock-file", "--command",
+            "cargo", "fmt", "--all", "--check",
+        ])
+        self.env["XJ_DEVSHELL"] = "default"
+        result = self.run_gate("fmt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.call()["args"][:3], ["develop", "--no-update-lock-file", "--command"])
 
     def test_freebsd_failure_survives_tee(self):
         result = self.run_gate("cross", "aarch64-unknown-freebsd", status=23)

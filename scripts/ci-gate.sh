@@ -20,7 +20,13 @@ else
     [[ $# -eq 1 ]] || usage
 fi
 
-gate_command=(nix develop --no-update-lock-file --command)
+# XJ_DEVSHELL selects a flake dev shell other than the default; the aarch64
+# Linux CI lane uses `no-freebsd` (flake.nix).
+if [[ -n "${XJ_DEVSHELL:-}" && "${XJ_DEVSHELL}" != default ]]; then
+    gate_command=(nix develop ".#${XJ_DEVSHELL}" --no-update-lock-file --command)
+else
+    gate_command=(nix develop --no-update-lock-file --command)
+fi
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 case "$step" in
     devshell) gate_command+=(rustc --version) ;;

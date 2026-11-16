@@ -30,14 +30,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The aarch64 Linux host cannot load the aarch64 FreeBSD std (flake.nix),
+          # so it uses the no-freebsd shell and the x86-64 lane runs both FreeBSD
+          # compile checks.
           - arch: x86_64
             runner: ubuntu-24.04
             cross-target: aarch64-unknown-linux-gnu
+            devshell: default
+            freebsd: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
             cross-target: x86_64-unknown-linux-gnu
+            devshell: no-freebsd
+            freebsd: false
     env:
       CARGO_TERM_COLOR: never
+      XJ_DEVSHELL: ${{ matrix.devshell }}
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: ""
     steps:
@@ -130,11 +138,11 @@ jobs:
       # Compile-only coverage of FreeBSD cfg branches, without cross-linking Unicorn.
       # Embedders supply runtime coverage until a FreeBSD runner is available.
       - name: FreeBSD compile-check lane (aarch64)
-        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' && matrix.freebsd }}
         run: bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
 
       - name: FreeBSD compile-check lane (x86_64)
-        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' && matrix.freebsd }}
         run: bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
 
       # Only push runs populate caches; pull requests can restore them. Explicit saves

@@ -23,14 +23,19 @@
         # Rust 1.98.1 ships std for both FreeBSD architectures (1.96.1's
         # manifest lacks aarch64-unknown-freebsd). No nightly/build-std needed.
         # Keep the version explicit when updating the rust-overlay lock pin.
-        rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
+        linuxTargets = [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
+        freebsdTargets = [ "x86_64-unknown-freebsd" "aarch64-unknown-freebsd" ];
+        toolchainFor = targets: pkgs.rust-bin.stable."1.98.1".default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
-          # Host targets covered by the spec (x86-64 and ARM64 hosts, §1).
-          targets = [
-            "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu"
-            "x86_64-unknown-freebsd" "aarch64-unknown-freebsd"
-          ];
+          inherit targets;
         };
+        # Host targets covered by the spec (x86-64 and ARM64 hosts, §1).
+        rustToolchain = toolchainFor (linuxTargets ++ freebsdTargets);
+        # On an aarch64 Linux host, auto-patchelf rejects the aarch64 FreeBSD
+        # std (it cannot resolve FreeBSD's libc.so.7 and libthr.so.3), so the
+        # aarch64 CI lane uses this shell and the FreeBSD compile checks run
+        # on the x86-64 lane.
+        linuxToolchain = toolchainFor linuxTargets;
 
         nativeBuildInputs = [ rustToolchain pkgs.pkg-config ];
         # memmap2 uses mmap/mprotect from libc only; nothing else required.
@@ -38,10 +43,8 @@
         # Unicorn is only needed for the feature-gated differential test oracle
         # (x86jit-tests `unicorn` feature); pkg-config picks up its shared lib.
         unicorn = pkgs.unicorn;
-      in
-      {
-        devShells.default = pkgs.mkShell {
-          inherit nativeBuildInputs;
+        mkDevShell = toolchain: pkgs.mkShell {
+          nativeBuildInputs = [ toolchain pkgs.pkg-config ];
           buildInputs = buildInputs ++ [ unicorn ];
           packages = [
             pkgs.cargo-nextest
@@ -50,7 +53,7 @@
             pkgs.cargo-deny # licence + advisory gate over the dependency graph
           ];
 
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
           # unicorn-engine-sys runs bindgen over the Unicorn headers.
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
@@ -58,6 +61,10 @@
             echo "x86jit dev shell — rust $(rustc --version)"
           '';
         };
+      in
+      {
+        devShells.default = mkDevShell rustToolchain;
+        devShells.no-freebsd = mkDevShell linuxToolchain;
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "x86jit";
