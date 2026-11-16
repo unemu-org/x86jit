@@ -91,8 +91,8 @@ A bead closes only when all of these hold on `main`:
 3. `cargo fmt --check` is clean (the nix-pinned rustfmt).
 
 Plus, when the change warrants it: the same run on an aarch64 host for codegen, memory-ordering or
-host-specific changes (no CI runner covers aarch64 — [`commands.md`](commands.md) § Git remote and
-CI), `cargo deny --all-features check licenses bans sources`, the real-program ladder
+host-specific changes (GitHub CI covers aarch64 Linux, not aarch64 macOS —
+[`commands.md`](commands.md) § Git remote and CI), `cargo deny --all-features check licenses bans sources`, the real-program ladder
 ([`commands.md`](commands.md)), and a hot-path measurement against `bench/baseline.json` for codegen
 changes.
 
@@ -104,10 +104,12 @@ checkout. The supervisor squash-merges each bead into `main` as one commit: **Co
 pre-commit `gpg-uid-guard` refuses a sign-key/email mismatch). Commits and pushes happen only at the
 maintainer's request. Never bypass hooks. Details: `bd recall bead-to-main`.
 
-The configured `origin` is the only push destination. The issue database lives in `.beads/` (gitignored);
+`origin`, the public GitHub repository, is the only push destination
+([decision-26](../decisions/decision-26%20-%20GitHub-as-the-primary-forge.md)); a Forgejo copy
+pulls a read-only mirror of it as a backup. The issue database lives in `.beads/` (gitignored);
 `bd dolt push` stores it in `refs/dolt/data` on `origin` (plus bd's `__dolt_remote_info__`
-branch) and it goes nowhere else. Push it after a batch of bead changes, with the maintainer's
-agreement like any push.
+branch) and it goes nowhere else. `origin` is public, so bead history is published at once. Push
+it after a batch of bead changes, with the maintainer's agreement like any push.
 
 ## Decision capture
 

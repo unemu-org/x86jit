@@ -8,7 +8,7 @@ Repo-specific notes for coding agents (Claude Code, Cursor, Aider, Copilot, …)
 
 `x86jit` is a guest-agnostic x86-64 → host recompiler (JIT) delivered as a pure-Rust library. You feed it a memory map plus an entry point; it executes guest x86-64 instructions on any host (x86-64 or ARM64) and hands control back through `Exit` whenever it hits something it doesn't handle (syscall, MMIO, unknown instruction). File-format parsing, OS syscall emulation, and devices live in the embedder's code, not the core — a Linux userland built on this library is `unemulinux` (to be published), which is where the syscall shim, the process model, the OCI/ELF runner and the whole-program test ladder (busybox, sqlite, CPython, Go servers) live. That boundary is enforced, not just documented: `x86jit-core`'s dependency set is exactly `{iced-x86}` and `x86jit-tests/tests/boundary.rs` fails the build if it changes. The authoritative design is [`spec.md`](backlog/docs/design/spec.md); where the engine's *behaviour* comes from is [`PROVENANCE.md`](PROVENANCE.md).
 
-Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (the database files are gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on the configured `origin`. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. The bead database is pushed only to the configured `origin`.
+Open work is tracked in **beads** (`bd`, issue prefix `xj`), a Dolt-backed issue tracker. Its database lives in `.beads/` (the database files are gitignored) and reaches other machines only through `bd dolt push` → `refs/dolt/data` on `origin`, the public GitHub repository. Knowledge — design, decisions, guides — is committed markdown under `backlog/`, and the Done history of the earlier Backlog.md tracker stays there read-only. The bead database is pushed only to `origin`; the Forgejo backup mirror pulls it from there.
 
 ## Where things live
 
@@ -47,13 +47,10 @@ The roles, the path from a bead to `main`, the worker rules and the publication 
 
 ## Session handoff
 
-> **Republish.** Read
-> [`backlog/docs/doc-28 - Republish-handoff…`](backlog/docs/doc-28%20-%20Republish-handoff-%E2%80%94-state-known-defects-and-what-must-be-fixed-before-the-repo-is-created.md)
-> before touching it: it records what is done, the known defects, what must be fixed
-> before publication, and the traps that already cost a session. Its top section records
-> the plan as changed on 2026-11-16: the history is kept, the third-party binaries are
-> filtered out of it, and the result is re-signed. Publishing is the maintainer's step —
-> do not run `gh repo create`, and push only to the configured `origin`.
+> **Public on GitHub.** x86jit is public at <https://github.com/unemu-org/x86jit>,
+> which is `origin` for code, CI and the beads database; a Forgejo copy is a read-only
+> backup mirror. See
+> [decision-26](backlog/decisions/decision-26%20-%20GitHub-as-the-primary-forge.md).
 
 Ending a session mid-task, leave the state on the bead itself:
 
@@ -80,7 +77,7 @@ Full list: [`backlog/docs/commands.md`](backlog/docs/commands.md).
 ## Hard rules (don't violate)
 
 - **Never commit without explicit user request.** Even mid-task, after accepting a plan, stop and ask. Plan acceptance ≠ commit acceptance.
-- **Write as if the repository were public.** Code, comments, docs, bead text and commit messages are English, publish-safe and guest-agnostic: never name a proprietary guest, a private host, a private path or anyone's personal setup. Push only to the configured `origin`; never create, mirror or publish a repository — publishing is the maintainer's step.
+- **Write as if the repository were public.** Code, comments, docs, bead text and commit messages are English, publish-safe and guest-agnostic: never name a proprietary guest, a private host, a private path or anyone's personal setup. Push only to `origin`, the public GitHub repository, where every push is published at once; never create, mirror or publish a repository — that is the maintainer's step.
 - **Don't add features, refactor, or introduce abstractions beyond what the task requires.** Bug fix = bug fix, not surrounding cleanup.
 - **Don't pre-empt later milestones.** `todo!()` stubs are milestone markers — fill them in `spec.md` §12 order. Don't half-implement a later milestone during earlier work.
 - **Encode x86 semantics traps once, centrally** (upper-32-bit zeroing, effective-address lowering, RIP-relative, FS/GS base, flags). See `spec.md` §16 and [`backlog/docs/conventions.md`](backlog/docs/conventions.md).

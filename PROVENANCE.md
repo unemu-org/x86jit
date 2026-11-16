@@ -232,8 +232,7 @@ are therefore GPL-3.0 combined works.
 contract vectors (format `x80-v20-contract-2`) of `x80`, the sibling 8080-family
 project:
 
-- **Source:** `x80`, <https://github.com/unemu-org/x80> (to be published alongside
-  x86jit), file `x80-v20-contract/vectors/mode-switch.txt` at commit
+- **Source:** `x80`, <https://github.com/unemu-org/x80>, file `x80-v20-contract/vectors/mode-switch.txt` at commit
   `2d5a5354ea1b3b3005a13e4594d753a1896006e5`.
 - **Licence:** MIT OR Apache-2.0, at the user's option. That is the x80 repository's
   licence (its workspace declares `license = "MIT OR Apache-2.0"`); no separate

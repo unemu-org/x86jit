@@ -60,9 +60,10 @@ database, and an older `bd` against a newer schema is unsafe. Install `bd` ≥ 1
 (e.g. `brew install beads`, or a release binary from the upstream repository) and check with
 `bd --version`.
 
-On a fresh clone the issue database is not in git (`.beads/embeddeddolt/` is ignored). Once
-`origin` carries `refs/dolt/data`, recreate it with `bd bootstrap` (non-destructive; see
-`bd bootstrap --help`). Use `bootstrap`, not `bd init`, in a clone that already has `.beads/`:
+On a fresh clone the issue database is not in git (`.beads/embeddeddolt/` is ignored). `origin`,
+the public GitHub repository, carries it as `refs/dolt/data`; recreate it with `bd bootstrap`
+(non-destructive; see `bd bootstrap --help`). The Forgejo backup only pulls a mirror of GitHub;
+push neither git nor bd there. Use `bootstrap`, not `bd init`, in a clone that already has `.beads/`:
 `init` mints a new project identity. `bd init`, and the first `bd dolt push --yes` (which adopts
 `origin` and writes `sync.remote` to `.beads/config.yaml`), each make a git commit on their own —
 after any bd setup command, check `git log -1` and `git status`.

@@ -1452,7 +1452,7 @@ fn hand_back_is_rejected_while_mmio_is_in_flight() {
 // - The NMI cases are not ported: x86jit has no NMI input (xj-50w.19).
 //
 // The vector text is Copyright (c) 2026 Mikołaj Mikołajczyk, from x80
-// (https://github.com/unemu-org/x80, to be published), commit
+// (https://github.com/unemu-org/x80), commit
 // 2d5a5354ea1b3b3005a13e4594d753a1896006e5, licensed MIT OR Apache-2.0 at your
 // option. PROVENANCE.md §5 carries the MIT permission notice; LICENSE-MIT and
 // LICENSE-APACHE at this repository's root hold the same licence texts.

@@ -9,6 +9,8 @@ created_date: '2026-08-09 14:49'
 
 # Republish handoff
 
+> Published 2026-11-16: GitHub is `origin` and the Forgejo copy is a backup mirror — see [decision-26](../decisions/decision-26%20-%20GitHub-as-the-primary-forge.md).
+
 ## 2026-11-16: the publication plan changed
 
 The maintainer changed the plan on 2026-11-16. **The history is kept:** the existing
@@ -16,6 +18,10 @@ history is published with the third-party binaries filtered out of it, and the r
 re-signed. Re-signing gives every commit a new id, so the consumer re-pin steps below still
 apply, with the rewritten commit in place of an orphan commit. Commit ids quoted in this
 document name commits of the history before the rewrite.
+
+Until the publication, "the configured origin" below was the private Forgejo repository. It is
+now the backup, and keeps the pre-publication history under the tag `archive/pre-republish`;
+`origin` is <https://github.com/unemu-org/x86jit>.
 
 Superseded by this change, and left below as written:
 
@@ -38,7 +44,8 @@ production-presentable public project, alongside `oracles` (already public) and 
 sibling, `unemulinux`, which takes the Linux userland.
 
 **No repository has been created yet.** Do not run `gh repo create` until the
-maintainer says so.
+maintainer says so. *(Superseded 2026-11-16: the repository is public on GitHub; see
+decision-26.)*
 
 Three decisions are settled and not open for re-litigation:
 
@@ -239,9 +246,9 @@ wrong with it.
 - **unemulinux is published too**, on the same schedule, with its own checklist in its
   `backlog/`.
 - **CI:** `.github/workflows/ci.yml` (x86-64 and aarch64 GitHub-hosted lanes, gate in
-  `scripts/ci-gate.sh`) is ready; it has not run on GitHub yet. The `.forgejo` workflow is for
-  a self-hosted forge. Whether this repository also gates on unemulinux's ladder stays with
-  xj-jge.1; until then the README says so.
+  `scripts/ci-gate.sh`) was ready and had not yet run on GitHub. Since 2026-11-16 it is the
+  only CI; the Forgejo workflow was removed (decision-26). Whether this repository also gates
+  on unemulinux's ladder stays with xj-jge.1; until then the README says so.
 - **Beads history (xj-6o4):** clean it before `refs/dolt/data` goes public: keep an
   archive of the current ref on the configured origin, re-scan every bead and memory, then
   `bd flatten` and re-scan. Bead owner fields carry the maintainer's own identity, the same

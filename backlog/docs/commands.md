@@ -121,7 +121,7 @@ cargo nextest run --release -p x86jit-tests -E 'binary(jit) or binary(differenti
 ```
 
 CI runs a narrower form (the second line plus the corpus, smc, mt and host-fault
-recovery binaries; see `scripts/ci-gate.sh` and the workflows under `.github/` and `.forgejo/`); the full release run is a local
+recovery binaries; see `scripts/ci-gate.sh` and `.github/workflows/ci.yml`); the full release run is a local
 check worth doing before a release or after touching the softfloat and codegen paths.
 
 ## AVX/VEX differential fuzz (`cargo xfuzz`)
@@ -206,12 +206,16 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 
 ## Git remote and CI
 
-Push only to the configured `origin`, at the maintainer's request. CI has two
-workflows: `.github/workflows` for the public repository, `.forgejo` for a
-self-hosted forge. Neither publishes the repository.
+`origin` is the public GitHub repository, <https://github.com/unemu-org/x86jit>
+([decision-26](../decisions/decision-26%20-%20GitHub-as-the-primary-forge.md)).
+Push only there, at the maintainer's request; a push is public at once. A Forgejo
+copy pulls a read-only mirror of it as a backup and receives no pushes. CI runs
+only on GitHub Actions, and the workflow publishes nothing.
 
-- **GitHub**: `.github/workflows/ci.yml` runs on pushes, pull requests (including forks),
-  and manual dispatches. Its two independent jobs use GitHub-hosted `ubuntu-24.04`
+- **GitHub**: `.github/workflows/ci.yml` runs on every push, on pull requests and
+  on manual dispatch; pull requests are disabled on the repository, so in practice
+  pushes and dispatches start it. Its two independent jobs use GitHub-hosted
+  `ubuntu-24.04`
   (x86-64) and `ubuntu-24.04-arm` (aarch64) runners. Both install pinned Nix and use
   the devShell from `flake.lock`. Each runs fmt, the guest-agnostic guard, clippy with
   all features and `-D warnings`, cargo-deny, the workspace nextest run with Unicorn
@@ -227,8 +231,8 @@ self-hosted forge. Neither publishes the repository.
   Combined gate logs are retained as `ci-logs-x86_64` / `ci-logs-aarch64` artifacts for
   seven days. Installer and cache diagnostics remain in the Actions job log.
   All actions are pinned to commit SHAs, checkout does not persist credentials, and
-  the only repository permission is `contents: read`. No configured secrets or
-  self-hosted runners are needed.
+  the only repository permission is `contents: read`. No configured secrets are
+  needed, and every runner is GitHub-hosted.
   Cargo caches are separated by OS, architecture, Nix inputs, gate script and Cargo
   lockfile; the pinned 80286 corpus cache is shared between architectures. Only push
   runs save caches; pull requests can restore them. A corpus cache miss fetches the
@@ -240,16 +244,11 @@ self-hosted forge. Neither publishes the repository.
   caches. These are planning estimates pending the first hosted run; each job has a
   90-minute timeout. Runner provisioning, Nix binary-cache availability, disk use,
   corpus downloads and native-oracle results must be checked on that first run.
-- **Self-hosted forge**: `.forgejo/workflows/ci.yml` is for a self-hosted Forgejo
-  forge; GitHub ignores it. It is manual only (`workflow_dispatch`), and a run checks
-  out what is on the remote, so push the branch first. Its one x86-64 job runs the dev
-  shell, the 80286 corpus (`SS286_REQUIRED=1`), fmt, the guest-agnostic guard, clippy,
-  cargo-deny, the workspace nextest without `fuzz_robustness`, a release-profile
-  subset, the Compat32 lane and a FreeBSD compile-check lane for both architectures
-  through `scripts/ci-gate.sh cross <target>`. Once the dev shell is up, every step
-  runs even after an earlier failure. The last step, `scripts/ci-report-status.sh`,
-  posts the outcome as a commit status (context `ci / x86_64`); on failure its
-  description lists each failing step with its failing tests or error lines.
+  Every push to `origin` starts a run. To rerun a ref without a new push, dispatch it
+  with an authenticated GitHub CLI, `gh workflow run ci.yml --ref <ref>`; read the
+  result in the commit's checks or with `gh run list --workflow ci.yml`.
+  A newer run on the same ref cancels an older one (concurrency group
+  `ci-<workflow>-<ref>`).
 - **Local macOS**: `cargo nextest`, clippy and fmt additionally cover
   aarch64-apple-darwin. The Linux hosted lanes do not replace checks of Darwin-specific
   code. The native x86-64 Linux oracle and the real-program ladder do not run on macOS.

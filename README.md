@@ -1,5 +1,11 @@
 # x86jit
 
+> **LLM-powered project.** Most of the code, tests and documentation in x86jit are
+> written by LLM coding agents, working under the maintainer's direction. Every
+> change goes through the same source rules and test gates described below, but
+> if you use x86jit in your own project, be aware of how it is made and review it
+> as you would any third-party code you depend on.
+
 A guest-agnostic x86-64 → host recompiler (JIT), delivered as a pure-Rust library.
 
 You give it a memory map and an entry point. It runs the guest's x86-64 code on an AArch64
@@ -193,6 +199,16 @@ both architectures. macOS is checked locally, not in CI.
   checkout, but the cross-repository real-program ladder does not gate this repository: its CI
   runs only the checks listed under [Building and testing](#building-and-testing).
 - **Pre-1.0 API.** Expect breaking changes between `0.x` releases.
+
+## Contributing
+
+x86jit is developed in the open at <https://github.com/unemu-org/x86jit>, by the
+maintainer working with LLM coding agents. Pull requests are disabled while the
+project matures. Issues are very welcome: bug reports, questions, instructions a
+real program needs, hardware measurements and corrections to a cited source.
+Conversations about them stay open on GitHub. Planned work is tracked with beads
+(`bd`), whose database lives in the same repository; `bd bootstrap` restores it
+in a clone.
 
 ## License
 

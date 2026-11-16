@@ -1,5 +1,8 @@
 name: CI
 
+# The gates of scripts/ci-gate.sh (backlog/docs/commands.md § Git remote and CI),
+# on GitHub-hosted x86-64 and aarch64 Ubuntu runners. This is the project's only
+# CI (decision-26). Runs on every push, on pull requests and on manual dispatch.
 on:
   push:
   pull_request:
@@ -8,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# A newer run on the same ref cancels an older one. The ci- prefix keeps this
+# group apart from any other workflow's <workflow>-<ref> group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -152,7 +157,7 @@ jobs:
           path: x86jit-tests/vendor/80286/v1_real_mode
           key: ${{ steps.corpus_cache.outputs.cache-primary-key }}
 
-      # GitHub supplies job checks, so the Forgejo status-posting script is not used.
+      # GitHub reports the job checks; the workflow posts no commit statuses of its own.
       - name: Upload gate logs
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
