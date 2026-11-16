@@ -42,9 +42,12 @@ fn decode_model<const NEC: bool>(bytes: &[u8], insn: &Instruction) -> DecodeActi
     let Some(&opcode) = b.first() else {
         return absent;
     };
-    // UM §2.5 pp. 2-17–18 specifies a bus lock for the whole instruction,
-    // including an entire REP. This engine has no such bus ownership primitive.
-    if bytes[..first].contains(&0xf0) {
+    // UM §2.5 p. 2-17: "In the case of a locked repeated string instruction,
+    // LOCK does remain active for the duration of the block operation"; NEC
+    // UM p. 12-173 says the same of BUSLOCK. The engine has no primitive that
+    // holds the bus for a whole block operation: a typed refusal. Other locked
+    // forms are decided after lowering (`lift::i8086::locked`).
+    if bytes[..first].contains(&0xf0) && bytes[..first].iter().any(|b| matches!(b, 0xf2 | 0xf3)) {
         return absent;
     }
     if if NEC {
@@ -343,6 +346,42 @@ mod tests {
         for bytes in [&[0x66, 0xf4][..], &[0x67, 0x90], &[0x0f, 0x10, 0xc0]] {
             let insn = Decoder::new(16, bytes, NEC_SET.options).decode();
             assert!(matches!(decode_nec(bytes, &insn), DecodeAction::Absent(_)));
+        }
+    }
+
+    // xj-50w.12: UM §2.5 p. 2-17 and NEC UM p. 12-173 hold the bus lock
+    // through a whole repeated string, which the engine refuses. LOCK alone
+    // reaches lowering (`lift::i8086::locked`), in either prefix order.
+    #[test]
+    fn lock_is_refused_only_with_a_repeat_prefix() {
+        for bytes in [
+            &[0xf0, 0xff, 0x07][..],
+            &[0xf0, 0x26, 0x01, 0x07],
+            &[0x26, 0xf0, 0x01, 0x07],
+            &[0xf0, 0x90],
+            &[0xf0, 0xa4],
+        ] {
+            let insn = Decoder::new(16, bytes, SET.options).decode();
+            assert!(insn.has_lock_prefix(), "{bytes:02x?}");
+            assert_eq!(decode(bytes, &insn), DecodeAction::Defined, "{bytes:02x?}");
+            assert_eq!(
+                decode_nec(bytes, &insn),
+                DecodeAction::Defined,
+                "{bytes:02x?}"
+            );
+        }
+        for bytes in [
+            &[0xf0, 0xf3, 0xa4][..],
+            &[0xf3, 0xf0, 0xa5],
+            &[0xf0, 0xf2, 0xa6],
+            &[0xf0, 0x26, 0xf3, 0xaa],
+        ] {
+            let insn = Decoder::new(16, bytes, SET.options).decode();
+            assert!(matches!(decode(bytes, &insn), DecodeAction::Absent(None)));
+            assert!(matches!(
+                decode_nec(bytes, &insn),
+                DecodeAction::Absent(None)
+            ));
         }
     }
 

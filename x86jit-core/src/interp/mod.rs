@@ -1132,6 +1132,7 @@ fn finish_instruction_fault<const STEPPED: bool>(
                 op @ (crate::legacy::LegacyOp::WrappedString { .. }
                 | crate::legacy::LegacyOp::WrappedLoad { .. }
                 | crate::legacy::LegacyOp::WrappedStore { .. }
+                | crate::legacy::LegacyOp::LockedRmw20 { .. }
                 | crate::legacy::LegacyOp::Coprocessor20 { .. }
                 | crate::legacy::LegacyOp::BitField20 { .. }
                 | crate::legacy::LegacyOp::BcdString20 { .. }
@@ -1405,6 +1406,7 @@ fn walk_ops<
             IrOp::Legacy(legacy_op) => match legacy_op {
                 op @ (L::WrappedLoad { .. }
                 | L::WrappedStore { .. }
+                | L::LockedRmw20 { .. }
                 | L::FlagsImage { .. }
                 | L::LoadFlagsWord { .. }
                 | L::DivideTrap { .. }
@@ -1451,7 +1453,9 @@ fn walk_ops<
                             }
                         }
                     }
-                    if let L::WrappedStore { addr, size, .. } = op {
+                    if let L::WrappedStore { addr, size, .. } | L::LockedRmw20 { addr, size, .. } =
+                        op
+                    {
                         for i in 0..*size {
                             mem.0
                                 .note_block_write(i8086::physical(read_val(*addr, temps), i), 1);

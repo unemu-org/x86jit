@@ -241,6 +241,136 @@ impl RepFlags {
     }
 }
 
+// 8086 Family UM §2.7 p. 2-42 (NEC V20/V30 UM §6 p. 6-4 for three prefixes):
+// an interrupt taken inside a repeated string saves the restart IP of its kept
+// prefixes. The owner/restart pair of the string at CS:IP (`rep_restart20`) is
+// keyed on that instruction and on the inputs its next element reads, at their
+// read widths, as the U3 ENTER identity contract keys an attempt (xj-50w.15): a
+// host change of the instruction bytes there, or a host edit of one of those
+// inputs, between runs starts a new operation at that address, which an
+// interrupt then names by its first prefix; an edit of a register the string
+// does not read, or a write of the same bytes, keeps the pair. Only the host
+// edits between runs, so when a run returns with a pair pending its string's
+// bytes (prefixes and opcode, as lifted), inputs and registers are recorded,
+// and the next run with a budget compares them with guest memory at CS:IP and
+// the registers; the dispatcher's per-block code is unchanged.
+//
+// The inputs (UM §2.7 Table 2-13 p. 2-40, pp. 2-42–43): CX and DF; SI and the
+// source segment for MOVS, LODS and CMPS; DI and ES for MOVS, STOS, CMPS and
+// SCAS; AL or AX as the STOS source and SCAS value. ZF "does not need to be
+// initialized" (p. 2-42), so it is not an input.
+#[derive(Clone, Copy, Default)]
+struct RepInputs20 {
+    registers: [u16; 9],
+    // The registers the string reads (its description) and its bytes from
+    // the first prefix through the opcode.
+    mask: [u16; 9],
+    bytes: [u8; 15],
+    len: u8,
+}
+impl RepInputs20 {
+    // CX, DF, SI, DI, AX and the DS, ES, SS and CS selectors.
+    fn registers(cpu: &CpuState) -> [u16; 9] {
+        [
+            cpu.gpr[1] as u16,
+            u16::from(cpu.flags.df),
+            cpu.gpr[6] as u16,
+            cpu.gpr[7] as u16,
+            cpu.gpr[0] as u16,
+            cpu.ds,
+            cpu.es,
+            cpu.ss,
+            cpu.cs,
+        ]
+    }
+    // The registers `string` reads. Twenty-bit port strings lower to
+    // `IrOp::PortString` and never own a pair.
+    fn mask(string: &crate::legacy::LegacyOp) -> [u16; 9] {
+        use crate::ir::StrOp::*;
+        let crate::legacy::LegacyOp::WrappedString {
+            kind, elem, source, ..
+        } = string
+        else {
+            unreachable!("a REP owner/restart pair belongs to a WrappedString")
+        };
+        let source_read = matches!(kind, Movs | Lods | Cmps);
+        let destination_read = matches!(kind, Movs | Stos | Cmps | Scas);
+        let value = match kind {
+            Stos | Scas if *elem == 1 => 0xff,
+            Stos | Scas => 0xffff,
+            _ => 0,
+        };
+        let on = |read: bool| if read { 0xffff } else { 0 };
+        let segment = |id: SegmentId| on(source_read && *source == id);
+        [
+            0xffff,
+            0xffff,
+            on(source_read),
+            on(destination_read),
+            value,
+            segment(SegmentId::Ds),
+            on(destination_read) | segment(SegmentId::Es),
+            segment(SegmentId::Ss),
+            segment(SegmentId::Cs),
+        ]
+    }
+    // The code byte at CS:offset, read as the twenty-bit fetch reads it.
+    fn code_byte(vm: &Vm, cs: u16, offset: u16) -> Option<u8> {
+        let mut byte = [0];
+        let physical = ((u64::from(cs) << 4) + u64::from(offset)) & 0xfffff;
+        vm.mem.fetch_code(physical, &mut byte).ok().map(|_| byte[0])
+    }
+    // Record the pair's string at run exit: its block's string, with the
+    // bytes it was lifted from (`LegacyOp::WrappedString::code`), not a read
+    // of guest memory. Pending code writes are applied to the cache first
+    // (`handle_smc`). A write after the lift whose notice this drain sees has
+    // removed the block, so the pair is dropped here. Any other write, one
+    // whose notice comes later included, leaves guest memory different from
+    // those bytes at the next entry, which drops the pair there; no order of
+    // the reads in this function matters. A string the cache no longer holds
+    // (a concurrent code write or eviction), or one longer than fifteen bytes,
+    // is not recorded, and the caller drops the pair.
+    fn record(&mut self, vm: &Vm, cpu: &CpuState, word: &AtomicU64, pair: (u16, u16, u16)) -> bool {
+        let (cs, owner, restart) = pair;
+        vm.handle_smc(word);
+        let physical = ((u64::from(cs) << 4) + u64::from(owner)) & 0xfffff;
+        let key = BlockKey::machine_direct(physical, cpu.mxcsr, false);
+        let Some(CachedBlock::Interpreted(ir)) = vm.cache.get_for_dispatch(key, false) else {
+            return false;
+        };
+        let string = ir.ops.iter().find_map(|op| match op {
+            IrOp::Legacy(
+                op @ crate::legacy::LegacyOp::WrappedString {
+                    rep, restart_ip, ..
+                },
+            ) if !matches!(rep, crate::ir::RepKind::None) && *restart_ip == restart => Some(op),
+            _ => None,
+        });
+        let Some(string @ crate::legacy::LegacyOp::WrappedString { code, code_len, .. }) =
+            string.filter(|_| ir.guest_start == u64::from(owner))
+        else {
+            return false;
+        };
+        if *code_len == 0 {
+            return false;
+        }
+        self.registers = Self::registers(cpu);
+        self.mask = Self::mask(string);
+        self.bytes = *code;
+        self.len = *code_len;
+        true
+    }
+    // Whether the host changed the recorded string or one of its inputs.
+    fn edited(&self, vm: &Vm, cpu: &CpuState, cs: u16, owner: u16) -> bool {
+        let registers = Self::registers(cpu);
+        (0..9).any(|i| (registers[i] ^ self.registers[i]) & self.mask[i] != 0)
+            || (0..self.len).any(|i| {
+                Self::code_byte(vm, cs, owner.wrapping_add(u16::from(i)))
+                    != Some(self.bytes[usize::from(i)])
+            })
+    }
+}
+
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
@@ -254,6 +384,7 @@ pub(super) struct Execution {
     instruction_retry: Option<InstructionRetry>,
     rep_flags: Option<Box<RepFlags>>,
     rep_restart20: Option<(u16, u16, u16)>,
+    rep_inputs20: RepInputs20,
     /// NEC V20/V30 8080-mode hand-back state (decision-23 C4a): an ED
     /// escape at CS:IP, an 8080 refusal at CS:IP with its opcode, and the
     /// reason MD became 0 in the current call. Valid only while CS:IP match.
@@ -292,6 +423,7 @@ impl Execution {
             instruction_retry: None,
             rep_flags: None,
             rep_restart20: None,
+            rep_inputs20: RepInputs20::default(),
             nec_escape: None,
             nec_refusal: None,
             nec_entry: None,
@@ -1152,6 +1284,47 @@ fn resolve_alias_uncached<const DEFAULT: bool>(
 }
 
 impl Vcpu {
+    // Twenty-bit run entry (xj-50w.15): a REP owner/restart pair is pending.
+    #[inline(always)]
+    pub(super) fn rep_restart20_pending(&self) -> bool {
+        self.legacy_execution
+            .as_deref()
+            .is_some_and(|execution| execution.rep_restart20.is_some())
+    }
+
+    // Twenty-bit run entry (xj-50w.15): drop the pending REP owner/restart pair
+    // when the host changed the string's bytes at CS:owner or one of its inputs
+    // since the last run returned. The translation cache is not consulted, so
+    // an eviction keeps the pair.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn forget_edited_rep_restart20(&mut self, vm: &Vm) {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        let Some((cs, owner, _)) = execution.rep_restart20 else {
+            return;
+        };
+        if execution.rep_inputs20.edited(vm, &self.cpu, cs, owner) {
+            execution.rep_restart20 = None;
+        }
+    }
+
+    // Twenty-bit run exit (xj-50w.15): a REP owner/restart pair is pending;
+    // record its string for the next run's entry. Called before the run's
+    // dispatch counts are published, while the VM is still in use.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn record_rep_restart20(&mut self, vm: &Vm) {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        if let Some(pair) = execution.rep_restart20 {
+            if !execution
+                .rep_inputs20
+                .record(vm, &self.cpu, &self.exit_request.word, pair)
+            {
+                execution.rep_restart20 = None;
+            }
+        }
+    }
+
     #[inline(always)]
     pub(super) fn finish_comparison_attempt(&mut self, result: &Result<StepRun, StepRunError>) {
         if self.legacy_execution.as_ref().unwrap().rep_flags.is_some() {
@@ -2070,7 +2243,8 @@ impl Vcpu {
                     // UM §2.7 p. 2-42: only a string with a completed element is
                     // interrupted inside the instruction. A stop before its first
                     // element keeps the full owner unless an earlier walk already
-                    // completed one (the same pair is still pending).
+                    // completed one (the same pair is still pending; a host edit
+                    // of the string or its inputs dropped it at entry, xj-50w.15).
                     let execution = self.legacy_execution.as_mut().unwrap();
                     execution.rep_restart20 = restart.filter(|pair| {
                         progress.steps != 0 || execution.rep_restart20 == Some(*pair)

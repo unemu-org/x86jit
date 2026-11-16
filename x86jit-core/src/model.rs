@@ -486,8 +486,9 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
             },
             p.quirks.step_interrupt_handler as u64,
             // Byte-extension disposition, including the decision-23 alias
-            // amendment, and prefix folding revision.
-            3,
+            // amendment, and prefix folding revision; 4 admits LOCK
+            // (xj-50w.12).
+            4,
         ];
         i = 0;
         while i < early.len() {

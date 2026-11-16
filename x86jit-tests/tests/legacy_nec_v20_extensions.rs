@@ -94,15 +94,17 @@ fn assert_refused(model: CpuModel, code: &[u8]) {
 
 #[test]
 fn catalogue_identities_change_only_for_the_nec_entries() {
-    // Values of 29ddeda9 (before C4b) for the other entries; the NEC entries
-    // gain the extension revision word and keep differing by bus.
+    // Values of 29ddeda9 (before C4b) for the system entries; the NEC entries
+    // gain the extension revision word and keep differing by bus. The
+    // twenty-bit values are those after xj-50w.12, which changed all four
+    // (legacy_i8086.rs `lock_admission_changes_only_the_twenty_bit_identities`).
     for (model, id) in [
-        (CpuModel::I8088, 0x22fb_677c_f449_d2fe),
-        (CpuModel::I8086, 0x22fb_677c_f449_d2f0),
+        (CpuModel::I8088, 0x8815_844f_bd9d_4559),
+        (CpuModel::I8086, 0x8815_844f_bd9d_4557),
         (CpuModel::I80286, 0x3699_e02a_8ef1_3e63),
         (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f),
-        (CpuModel::NecV20, 0x909a_c76c_b38b_71d8),
-        (CpuModel::NecV30, 0x909a_c76c_b38b_71e0),
+        (CpuModel::NecV20, 0x2a38_6bfd_83ff_8f1f),
+        (CpuModel::NecV30, 0x2a38_6bfd_83ff_8f27),
     ] {
         assert_eq!(model.profile().semantics_id, id, "{model:?}");
     }
@@ -1375,6 +1377,226 @@ fn bcd_zero_flag_covers_every_byte() {
             assert_eq!(r.steps(), 1);
             assert_eq!(vm.mem.read(0x20, 4).unwrap(), expected);
             assert!(!cpu.cpu.flags.zf, "{model:?} {dst:#x}");
+        }
+    }
+}
+
+// xj-50w.15 on the shared twenty-bit dispatcher. §6 p. 6-4: an interrupted
+// block instruction keeps up to three prefixes, so a REPC CMPBK with four
+// resumes at its second byte. That restart is keyed on the inputs the
+// comparison reads: a host edit of CW, IX, IY, DS0 (the source segment
+// here) or DS1 after a yield starts a new operation, and an interrupt taken
+// before its first element names the first prefix. An edit of AW, which
+// CMPBK does not read, keeps it.
+#[test]
+fn host_edit_of_a_block_comparison_input_abandons_its_restart() {
+    type Edit = fn(&mut x86jit_core::CpuState);
+    let cases: [(&str, Edit, u64); 7] = [
+        ("none", |_| {}, IP + 1),
+        ("cw", |c| c.gpr[1] = 3, IP),
+        ("ix", |c| c.gpr[6] = 0x30, IP),
+        ("iy", |c| c.gpr[7] = 0x40, IP),
+        ("ds0", |c| c.ds = 0x10, IP),
+        ("ds1", |c| c.es = 0x10, IP),
+        ("aw", |c| c.gpr[0] = 0x55, IP + 1),
+    ];
+    for model in MODELS {
+        for (name, edit, frame) in cases {
+            let (vm, mut cpu) = setup(model, b"\x26\x2e\x3e\x65\xa6\xf4");
+            vector(&vm, 0x20, 0x400, 0);
+            vm.write_bytes(0x400, b"\xf4").unwrap();
+            cpu.cpu.flags.if_ = true;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[6] = 0x10;
+            cpu.cpu.gpr[7] = 0x20;
+            vm.write_bytes(0x10, &[0, 0, 0, 0]).unwrap();
+            vm.write_bytes(0x20, &[1, 1, 1, 1]).unwrap();
+            step(&vm, &mut cpu, 1);
+            assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[1]), (IP, 2));
+            edit(&mut cpu.cpu);
+            cpu.inject_irq(0x20);
+            let r = run(&vm, &mut cpu, 1);
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                "{model:?} {name}: {:?}",
+                r.stop()
+            );
+            assert_eq!(word(&vm, 0x7ffa), frame, "{model:?} {name}");
+        }
+    }
+}
+
+// xj-50w.12: BUSLOCK on the forms only the V20/V30 have. P. 12-173: BUSLOCK
+// "Outputs the buslock signal (BUSLOCK) while the instruction immediately
+// after the BUSLOCK instruction is being executed", and through the whole
+// block operation of a repeated one; "Flag operation: None". The shared rule
+// (legacy_i8086.rs, LOCK witnesses for all four twenty-bit models) applies:
+// a form that transfers no data runs as the unprefixed one, and every form
+// that transfers data without the atomic read-modify-write is a typed
+// refusal, as is every repeated block instruction, REPC and REPNC included.
+#[test]
+fn buslock_on_the_nec_forms() {
+    let state = |model: CpuModel, code: &[u8]| {
+        let (vm, mut cpu) = setup(model, code);
+        // FPO2 has a CPU part only with an empty socket (pp. 12-174–175).
+        cpu.set_fpu_model(FpuModel::None);
+        cpu.cpu.ds = 0x100;
+        cpu.cpu.gpr[0] = 0x8387;
+        cpu.cpu.gpr[1] = 0x0003;
+        cpu.cpu.gpr[2] = 0x0010;
+        cpu.cpu.gpr[3] = 0x0010;
+        vm.write_bytes(0x1010, &[0x5a, 0xa5, 0x11, 0x22]).unwrap();
+        let r = run(&vm, &mut cpu, 1);
+        (
+            r.steps(),
+            format!("{:?}", r.stop()),
+            cpu.cpu.rip,
+            cpu.cpu.gpr,
+            flags(&cpu),
+            vm.mem.read(0x1010, 4).unwrap(),
+            vm.mem.read(0x7ff0, 8).unwrap() | vm.mem.read(0x7ff8, 8).unwrap(),
+        )
+    };
+    let executes: &[&[u8]] = &[
+        b"\x0f\x10\xc0",
+        b"\x0f\x1c\xc3\x05",
+        b"\x0f\x16\xc3",
+        b"\x0f\x28\xc3",
+        b"\x66\xc0",
+        b"\xc1\xe0\x03",
+        b"\x6b\xc3\x05",
+        // CLR1, SET1, NOT1 on memory, CL and imm forms, byte and word: the
+        // atomic path (one AND, OR or XOR of the bit mask; pp. 12-85–98).
+        b"\x0f\x12\x07",
+        b"\x0f\x13\x07",
+        b"\x0f\x14\x07",
+        b"\x0f\x15\x07",
+        b"\x0f\x16\x07",
+        b"\x0f\x17\x07",
+        b"\x0f\x1a\x07\x06",
+        b"\x0f\x1b\x07\x0e",
+        b"\x0f\x1c\x07\x05",
+        b"\x0f\x1d\x07\x09",
+        b"\x0f\x1e\x07\x00",
+        b"\x0f\x1f\x07\x0f",
+        b"\x26\x0f\x16\x07",
+    ];
+    let refused_forms: &[&[u8]] = &[
+        b"\x65\xa6",
+        b"\x64\xa7",
+        b"\xf3\x6c",
+        b"\xf3\x6e",
+        b"\x6c",
+        b"\x6f",
+        b"\x68\x34\x12",
+        b"\x6a\x05",
+        b"\x60",
+        b"\x61",
+        b"\xc8\x04\x00\x00",
+        b"\xc9",
+        b"\x62\x07",
+        b"\xc0\x27\x03",
+        b"\x69\x07\x34\x12",
+        b"\x0f\x18\x07\x03",
+        b"\x0f\x28\x07",
+        b"\x0f\x20",
+        b"\x0f\x22",
+        b"\x0f\x26",
+        b"\x0f\x31\xc0",
+        b"\x0f\xff\x10",
+        b"\x66\x07",
+    ];
+    for model in MODELS {
+        for code in executes {
+            let plain = state(model, code);
+            let mut locked = state(model, &[&[0xf0][..], code].concat());
+            assert_eq!(locked.0, 1, "{model:?} {code:02x?}: {}", locked.1);
+            locked.2 -= 1;
+            assert_eq!(locked, plain, "{model:?} {code:02x?}");
+        }
+        for code in refused_forms {
+            for prefixes in [&b"\xf0"[..], b"\xf0\x26", b"\x26\xf0"] {
+                let locked = [prefixes, code].concat();
+                let (steps, stop, rip, ..) = state(model, &locked);
+                assert!(
+                    stop.contains("UnknownInstruction") && (steps, rip) == (0, IP),
+                    "{model:?} {locked:02x?}: {stop}"
+                );
+                let r = state(model, &locked);
+                assert_eq!((r.5, r.6), (0x2211_a55a, 0), "{model:?} {locked:02x?}");
+            }
+        }
+        // REPC after BUSLOCK, in either order.
+        for code in [&b"\x65\xf0\xa6"[..], b"\xf0\x65\x26\xa6"] {
+            assert_refused(model, code);
+        }
+        // At an odd address a word has no host atomic and is refused before
+        // it commits; a byte runs.
+        for (code, refused_word) in [
+            (&b"\xf0\x0f\x17\x07"[..], true),
+            (b"\xf0\x0f\x16\x07", false),
+        ] {
+            let (vm, mut cpu) = setup(model, code);
+            cpu.cpu.gpr[1] = 9;
+            cpu.cpu.gpr[3] = 0x11;
+            vm.write_bytes(0x11, &[0x00, 0x00]).unwrap();
+            let r = run(&vm, &mut cpu, 1);
+            if refused_word {
+                assert!(refused(&r), "{model:?} {code:02x?}: {:?}", r.stop());
+                assert_eq!((r.steps(), cpu.cpu.rip, word(&vm, 0x11)), (0, IP, 0));
+            } else {
+                assert_eq!((r.steps(), byte(&vm, 0x11)), (1, 0x02), "{model:?}");
+            }
+        }
+    }
+}
+
+// xj-50w.12 (re-review): BUSLOCK NOT1 byte [BX] (p. 12-173; NOT1 pp. 12-95–98)
+// from two vCPUs on different bits, an odd number of times each. The locked
+// form is one atomic XOR, so no update is lost and both bits end set. The
+// unlocked form is a control only: its read-modify-write may lose an update,
+// so its result is not asserted.
+#[test]
+fn buslock_not1_from_two_vcpus_loses_no_update() {
+    const N: u64 = 20_001;
+    for model in MODELS {
+        for locked in [true, false] {
+            for _ in 0..3 {
+                let (vm, _) = setup(model, b"\xf4");
+                for (at, bit) in [(0x1300u64, 0u8), (0x1400, 1)] {
+                    let mut code = vec![];
+                    if locked {
+                        code.push(0xf0);
+                    }
+                    // NOT1 byte [BX], imm3; LOOP back; HLT.
+                    code.extend_from_slice(&[0x0f, 0x1e, 0x07, bit]);
+                    let back = -(code.len() as i8 + 2);
+                    code.extend_from_slice(&[0xe2, back as u8, 0xf4]);
+                    vm.write_bytes(at, &code).unwrap();
+                }
+                vm.mem.write(0x2000, 0, 1).unwrap();
+                std::thread::scope(|scope| {
+                    for at in [0x1300u64, 0x1400] {
+                        let vm = &vm;
+                        scope.spawn(move || {
+                            let mut cpu = vm.new_vcpu();
+                            cpu.cpu.rip = at;
+                            cpu.cpu.gpr[4] = 0x8000;
+                            cpu.cpu.gpr[3] = 0x2000;
+                            cpu.cpu.gpr[1] = N;
+                            let r = cpu.run_steps(vm, 3 * N, StepOptions::default()).unwrap();
+                            assert!(
+                                matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                                "{model:?}: {:?}",
+                                r.stop()
+                            );
+                        });
+                    }
+                });
+                if locked {
+                    assert_eq!(byte(&vm, 0x2000), 0x03, "{model:?}");
+                }
+            }
         }
     }
 }

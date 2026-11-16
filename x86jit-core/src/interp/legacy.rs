@@ -2158,8 +2158,11 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
             // The twenty-bit walk moves every data byte through a one-byte
             // transfer (`interp::i8086`; lift/i8086.rs lowers loads, stores and
             // strings to its Wrapped primitives), and a one-byte access lies in
-            // one region or in none. No containment miss over adjacent regions
-            // reaches this arm, so it keeps its pre-split shape.
+            // one region or in none. The one wider transfer is a locked
+            // read-modify-write (`LockedRmw20`), whose containment miss over
+            // adjacent regions the re-execution would return unchanged
+            // (`SplitMemory` performs no locked operand). So this arm keeps its
+            // pre-split shape.
             exit if DIRECT20 => Err(qualify_shared_exit(exit)),
             exit => {
                 let exit = match split_shared::<ROUTED, ORDER, DIRECT20>(
@@ -3700,6 +3703,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 // Keep that execution machinery out of the system-model walker.
                 L::WrappedLoad { .. }
                 | L::WrappedStore { .. }
+                | L::LockedRmw20 { .. }
                 | L::FlagsImage { .. }
                 | L::LoadFlagsWord { .. }
                 | L::DivideTrap { .. }

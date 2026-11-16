@@ -267,7 +267,6 @@ fn later_and_undefined_encodings_are_typed_refusals() {
         b"\xff\xf8",
         b"\xff\xd8",
         b"\xff\xe8",
-        b"\xf0\x90",
         b"\xf0\xf3\xa5",
         b"\xf3\xd9\xe8",
         b"\xf2\xa4",
@@ -1385,4 +1384,1343 @@ fn irq_after_a_string_fault_names_the_last_prefix_only_after_an_element() {
             );
         }
     }
+}
+
+// xj-50w.15. UM §2.7 p. 2-42: an interrupt taken inside a repeated string
+// saves the last prefix only; spec.md §17.10: before its first element the
+// frame names the first prefix. The owner/restart pair is keyed on the
+// inputs the string reads (CX, SI and its segment, DI and ES, DF; AL/AX for
+// STOS and SCAS), as the U3 ENTER identity contract keys an attempt. A host
+// edit of one of them between runs starts a new operation at the same
+// address; an edit of a register the string does not read keeps the pair.
+#[test]
+fn host_edit_of_a_string_input_abandons_the_restart_pair() {
+    type Edit = fn(&mut x86jit_core::CpuState);
+    let cases: [(&str, Edit, u64); 8] = [
+        ("none", |_| {}, IP + 1),
+        ("cx", |c| c.gpr[1] = 3, IP),
+        ("si", |c| c.gpr[6] = 0x180, IP),
+        ("di", |c| c.gpr[7] = 0x300, IP),
+        ("es", |c| c.es = 0x1100, IP),
+        ("df", |c| c.flags.df = true, IP),
+        // ES: REP MOVSB reads neither DS nor AX.
+        ("ds", |c| c.ds = 0x2000, IP + 1),
+        ("ax", |c| c.gpr[0] = 0x55, IP + 1),
+    ];
+    for model in MODELS {
+        for (name, edit, frame) in cases {
+            let (vm, mut cpu) = setup(model, b"\x26\xf3\xa4\xf4");
+            vector(&vm, 0x20, 0x3000, 0);
+            cpu.cpu.flags.if_ = true;
+            cpu.cpu.es = 0x1000;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[6] = 0x100;
+            cpu.cpu.gpr[7] = 0x200;
+            step(&vm, &mut cpu, 1); // one element, then a budget yield
+            assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[1]), (IP, 2));
+            edit(&mut cpu.cpu);
+            let cx = cpu.cpu.gpr[1];
+            cpu.inject_irq(0x20);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                "{model:?} {name}: {:?}",
+                r.stop()
+            );
+            assert_eq!(
+                (vm.mem.read(0x7ffa, 2).unwrap(), cpu.cpu.gpr[1]),
+                (frame, cx),
+                "{model:?} {name}"
+            );
+        }
+    }
+    // The other inputs, each against a string that reads it and has two
+    // prefixes (so the pair's restart differs from IP): DS of a DS source in
+    // both prefix orders, SS of an SS source (the frame goes to the new
+    // SS:SP), AH of REP STOSW (the value is read at word width; REP STOSB
+    // reads AL only), AL of REPNE SCASB, SI of REP LODSB, and DS of a LODSB
+    // whose source is CS.
+    type Case = (&'static str, &'static [u8], Edit, u64);
+    let cases: [Case; 8] = [
+        ("ds of F3 3E A4", b"\xf3\x3e\xa4\xf4", |c| c.ds = 0x2000, IP),
+        ("ds of 3E F3 A4", b"\x3e\xf3\xa4\xf4", |c| c.ds = 0x2000, IP),
+        ("ss of 36 F3 A4", b"\x36\xf3\xa4\xf4", |c| c.ss = 0x10, IP),
+        (
+            "ah of 2E F3 AB",
+            b"\x2e\xf3\xab\xf4",
+            |c| c.gpr[0] = 0x5534,
+            IP,
+        ),
+        (
+            "ah of 2E F3 AA",
+            b"\x2e\xf3\xaa\xf4",
+            |c| c.gpr[0] = 0x5534,
+            IP + 1,
+        ),
+        (
+            "al of 2E F2 AE",
+            b"\x2e\xf2\xae\xf4",
+            |c| c.gpr[0] = 0x1235,
+            IP,
+        ),
+        (
+            "si of 2E F3 AC",
+            b"\x2e\xf3\xac\xf4",
+            |c| c.gpr[6] = 0x180,
+            IP,
+        ),
+        (
+            "ds of 2E F3 AC",
+            b"\x2e\xf3\xac\xf4",
+            |c| c.ds = 0x2000,
+            IP + 1,
+        ),
+    ];
+    for model in MODELS {
+        for (name, code, edit, frame) in cases {
+            let (vm, mut cpu) = setup(model, code);
+            vector(&vm, 0x20, 0x3000, 0);
+            cpu.cpu.flags.if_ = true;
+            cpu.cpu.es = 0x1000;
+            cpu.cpu.gpr[0] = 0x1234;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[6] = 0x100;
+            cpu.cpu.gpr[7] = 0x200;
+            step(&vm, &mut cpu, 1);
+            assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[1]), (IP, 2), "{model:?} {name}");
+            edit(&mut cpu.cpu);
+            cpu.inject_irq(0x20);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                "{model:?} {name}: {:?}",
+                r.stop()
+            );
+            let sp = (u64::from(cpu.cpu.ss) << 4) + 0x7ffa;
+            assert_eq!(vm.mem.read(sp, 2).unwrap(), frame, "{model:?} {name}");
+        }
+    }
+}
+
+// xj-50w.15, the C2 round-3 review case: a yield after one element, a host
+// edit that re-points the string at a fresh operation, a fault on that
+// operation's first element, then an IRQ. No element of the edited
+// instruction completed, so the frame names the first prefix.
+#[test]
+fn a_fault_after_a_host_edit_does_not_keep_the_old_restart_pair() {
+    for model in MODELS {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
+        vm.set_cpu_model(model);
+        vm.set_exception_delivery(ExceptionDelivery::InGuest);
+        vm.map(0, 0x6000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x7000, 0x19000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(IP, b"\x26\xf3\xa4\xf4").unwrap();
+        vector(&vm, 0x20, 0x3000, 0);
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = IP;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[6] = 0x100;
+        cpu.cpu.gpr[7] = 0x200;
+        cpu.cpu.flags.if_ = true;
+        step(&vm, &mut cpu, 1);
+        assert_eq!(cpu.cpu.rip, IP);
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[7] = 0x6000;
+        let r = cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+        assert!(
+            matches!(
+                r.stop(),
+                StepStop::Exit(Exit::UnmappedMemory { addr: 0x6000, .. })
+            ),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(r.steps(), 0);
+        vm.map(0x6000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        cpu.inject_irq(0x20);
+        let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(
+            (vm.mem.read(0x7ffa, 2).unwrap(), cpu.cpu.gpr[1]),
+            (IP, 3),
+            "{model:?}"
+        );
+    }
+}
+
+// The same keying for a string that reads AL/AX: an edit of AX abandons a
+// REP STOSB pair, while an edit of SI, which STOS does not read, keeps it.
+#[test]
+fn stos_restart_pair_is_keyed_on_its_value_register() {
+    for model in MODELS {
+        for (edit_ax, frame) in [(false, IP + 1), (true, IP)] {
+            let (vm, mut cpu) = setup(model, b"\x2e\xf3\xaa\xf4");
+            vector(&vm, 0x20, 0x3000, 0);
+            cpu.cpu.flags.if_ = true;
+            cpu.cpu.gpr[0] = 0x5a;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[7] = 0x200;
+            step(&vm, &mut cpu, 1);
+            if edit_ax {
+                cpu.cpu.gpr[0] = 0x5b;
+            } else {
+                cpu.cpu.gpr[6] = 0x700;
+            }
+            cpu.inject_irq(0x20);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
+            assert_eq!(
+                vm.mem.read(0x7ffa, 2).unwrap(),
+                frame,
+                "{model:?} edit AX {edit_ax}"
+            );
+        }
+    }
+}
+
+// ---- xj-50w.12: LOCK on the twenty-bit models ----
+//
+// 8086 Family UM §2.5 p. 2-17: the LOCK signal "remains active throughout
+// execution of the instruction that follows the LOCK prefix", and "in the
+// case of a locked repeated string instruction, LOCK does remain active for
+// the duration of the block operation"; p. 2-18: "The LOCK signal provides
+// information only"; §2.7 p. 2-48: LOCK makes the processor "assert its bus
+// LOCK signal while the following instruction executes. LOCK does not affect
+// any flags"; §4.2 p. 4-14: "Greater latencies occur when a 'long'
+// instruction is locked." No page restricts the instructions LOCK may
+// precede. NEC UM p. 12-173 BUSLOCK says the same for the V20/V30. The
+// engine executes a locked read-modify-write through its atomic path and a
+// locked form that transfers no data as the unlocked form; every other
+// locked form, and every repeated string, is a typed refusal.
+const LOCK_MODELS: [CpuModel; 4] = [
+    CpuModel::I8088,
+    CpuModel::I8086,
+    CpuModel::NecV20,
+    CpuModel::NecV30,
+];
+
+// The operand is DS:BX = 0100:0010 (physical 1010h); BP points at a second
+// word for the r/m forms that name it.
+#[derive(Debug, PartialEq)]
+struct LockState {
+    stop: String,
+    steps: u64,
+    retired: u64,
+    end: u64,
+    gpr: [u64; 8],
+    flags: u16,
+    segments: [u16; 4],
+    operand: [u64; 5],
+}
+fn lock_case(model: CpuModel, code: &[u8], prepare: impl Fn(&Vm, &mut Vcpu)) -> LockState {
+    let (vm, mut cpu) = setup(model, code);
+    vector(&vm, 0x21, 0x3000, 0);
+    cpu.cpu.ds = 0x100;
+    cpu.cpu.es = 0x200;
+    cpu.cpu.gpr[0] = 0x8387;
+    cpu.cpu.gpr[1] = 0x0102;
+    cpu.cpu.gpr[2] = 0x0010;
+    cpu.cpu.gpr[3] = 0x0010;
+    cpu.cpu.gpr[5] = 0x2020;
+    cpu.cpu.flags.cf = true;
+    vm.write_bytes(0x1010, &[0x5a, 0xa5, 0x11, 0x22]).unwrap();
+    vm.write_bytes(0x2010, &[0x96, 0x69, 0x55, 0x66]).unwrap();
+    vm.write_bytes(0x2020, &[0xc3, 0x3c, 0x33, 0x44]).unwrap();
+    prepare(&vm, &mut cpu);
+    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    let mut gpr = [0; 8];
+    gpr.copy_from_slice(&cpu.cpu.gpr[..8]);
+    LockState {
+        stop: format!("{:?}", r.stop()),
+        steps: r.steps(),
+        retired: cpu.retired_instructions(),
+        end: cpu.cpu.rip,
+        gpr,
+        flags: cpu.cpu.flags.to_flags16(),
+        segments: [cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss],
+        operand: [
+            vm.mem.read(0x1010, 4).unwrap(),
+            vm.mem.read(0x2010, 4).unwrap(),
+            vm.mem.read(0x2020, 4).unwrap(),
+            vm.mem.read(0x7ff0, 8).unwrap(),
+            vm.mem.read(0x7ff8, 8).unwrap(),
+        ],
+    }
+}
+// The locked form runs as the unlocked one: one step, the same registers,
+// flags and memory, IP one byte further (the prefix).
+fn assert_lock_matches_unlocked(model: CpuModel, code: &[u8], prepare: impl Fn(&Vm, &mut Vcpu)) {
+    let unlocked = lock_case(model, code, &prepare);
+    let mut locked_code = vec![0xf0];
+    locked_code.extend_from_slice(code);
+    let mut locked = lock_case(model, &locked_code, &prepare);
+    assert_eq!(locked.steps, 1, "{model:?} {code:02x?}: {}", locked.stop);
+    locked.end -= 1;
+    assert_eq!(locked, unlocked, "{model:?} {code:02x?}");
+}
+
+#[test]
+fn locked_read_modify_write_forms_match_their_unlocked_results() {
+    let forms: &[&[u8]] = &[
+        b"\x00\x07",
+        b"\x01\x07",
+        b"\x08\x07",
+        b"\x09\x07",
+        b"\x20\x07",
+        b"\x21\x07",
+        b"\x28\x07",
+        b"\x29\x07",
+        b"\x30\x07",
+        b"\x31\x07",
+        b"\x80\x07\x5a",
+        b"\x80\x0f\x5a",
+        b"\x80\x27\x5a",
+        b"\x80\x2f\x5a",
+        b"\x80\x37\x5a",
+        b"\x81\x07\x34\x12",
+        b"\x81\x0f\x34\x12",
+        b"\x81\x27\x34\x12",
+        b"\x81\x2f\x34\x12",
+        b"\x81\x37\x34\x12",
+        b"\x82\x07\xa6",
+        b"\x82\x2f\xa6",
+        b"\x83\x07\xff",
+        b"\x83\x0f\x80",
+        b"\x83\x27\x7f",
+        b"\x83\x2f\x01",
+        b"\x83\x37\xfe",
+        b"\xfe\x07",
+        b"\xfe\x0f",
+        b"\xff\x07",
+        b"\xff\x0f",
+        b"\xf6\x17",
+        b"\xf6\x1f",
+        b"\xf7\x17",
+        b"\xf7\x1f",
+        b"\x86\x07",
+        b"\x87\x07",
+        // Other addressing: displacement, BP (SS) and segment overrides.
+        b"\x01\x46\x00",
+        b"\x26\x01\x47\x10",
+        b"\x2e\xff\x87\x00\x10",
+        b"\x87\x8f\x00\x00",
+    ];
+    for model in LOCK_MODELS {
+        for code in forms {
+            assert_lock_matches_unlocked(model, code, |_, _| {});
+            // An operand at an odd address: a byte runs as above; a word has
+            // no host atomic (Memory::atomic_rmw's unaligned fallback is a
+            // plain read and write), so it is a typed refusal before it
+            // commits. The [BP] form keeps its even address.
+            let odd = |_: &Vm, cpu: &mut Vcpu| cpu.cpu.gpr[3] = 0x11;
+            let opcode = *code.iter().find(|b| !matches!(b, 0x26 | 0x2e)).unwrap();
+            let word = matches!(
+                opcode,
+                0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x81 | 0x83 | 0x87 | 0xf7 | 0xff
+            );
+            if word && code.get(1) != Some(&0x46) {
+                let unlocked = lock_case(model, code, odd);
+                let locked = lock_case(model, &[&[0xf0][..], code].concat(), odd);
+                assert_eq!(unlocked.steps, 1, "{model:?} {code:02x?}");
+                assert!(
+                    locked.stop.contains("UnknownInstruction"),
+                    "{model:?} {code:02x?}: {}",
+                    locked.stop
+                );
+                assert_eq!((locked.steps, locked.end), (0, IP), "{model:?} {code:02x?}");
+                assert_eq!(
+                    locked.operand[..3],
+                    [0x2211_a55a, 0x6655_6996, 0x4433_3cc3],
+                    "{model:?} {code:02x?}"
+                );
+            } else {
+                assert_lock_matches_unlocked(model, code, odd);
+            }
+        }
+        // Flag inputs: an operand at its boundary values.
+        for value in [0u16, 0x7fff, 0x8000, 0xffff, 0x00ff] {
+            for code in [
+                &b"\xff\x07"[..],
+                b"\xff\x0f",
+                b"\xf7\x1f",
+                b"\x01\x07",
+                b"\x29\x07",
+            ] {
+                assert_lock_matches_unlocked(model, code, |vm, _| {
+                    vm.mem.write(0x1010, u64::from(value), 2).unwrap()
+                });
+            }
+        }
+        // Prefix order, repeated LOCK and a long prefix run.
+        for prefixes in [
+            &b"\x26"[..],
+            b"\xf0\x26",
+            b"\x26\xf0\x26",
+            &[0xf0u8; 20][..],
+        ] {
+            let mut code = prefixes.to_vec();
+            code.extend_from_slice(b"\x01\x07");
+            let mut plain = code.clone();
+            plain.retain(|b| *b != 0xf0);
+            let locked = lock_case(model, &[&[0xf0][..], &code].concat(), |_, _| {});
+            let unlocked = lock_case(model, &plain, |_, _| {});
+            assert_eq!(locked.steps, 1, "{model:?} {code:02x?}");
+            assert_eq!(
+                (locked.gpr, locked.flags, locked.operand),
+                (unlocked.gpr, unlocked.flags, unlocked.operand),
+                "{model:?} {code:02x?}"
+            );
+            assert_eq!(locked.end, IP + code.len() as u64 + 1, "{model:?}");
+        }
+    }
+}
+
+// A locked form whose lowering transfers no data runs as the unlocked one:
+// the bus lock "provides information only" (UM p. 2-18) and LOCK "does not
+// affect any flags" (p. 2-48). NEC UM p. 2-2 describes BUSLOCK before HALT.
+#[test]
+fn locked_forms_without_a_data_transfer_execute() {
+    let forms: &[&[u8]] = &[
+        b"\x90",
+        b"\x40",
+        b"\x4b",
+        b"\x01\xd8",
+        b"\x31\xc0",
+        b"\x80\xc3\x7f",
+        b"\x87\xd8",
+        b"\x93",
+        b"\xb0\x05",
+        b"\x8b\xc3",
+        b"\x8d\x07",
+        b"\xf7\xd3",
+        b"\xf7\xdb",
+        b"\xf6\xe3",
+        b"\xf7\xf1",
+        b"\xd1\xe0",
+        b"\xd3\xc8",
+        b"\x98",
+        b"\x99",
+        b"\x9e",
+        b"\x9f",
+        b"\x27",
+        b"\x37",
+        b"\xd4\x0a",
+        b"\xf8",
+        b"\xf9",
+        b"\xf5",
+        b"\xfc",
+        b"\xfd",
+        b"\xfa",
+        b"\xfb",
+        b"\x8e\xc0",
+        b"\x8c\xd8",
+        b"\x9b",
+        // A register ESC: no CPU transfer (UM §2.7 p. 2-48).
+        b"\xd9\xc0",
+        b"\xd9\xe8",
+        b"\xeb\x00",
+        b"\x74\x00",
+        b"\x75\x00",
+        b"\xe3\x00",
+    ];
+    for model in LOCK_MODELS {
+        for code in forms {
+            assert_lock_matches_unlocked(model, code, |_, _| {});
+        }
+        // HLT: the locked halt stops after the whole instruction.
+        let r = lock_case(model, b"\xf0\xf4", |_, _| {});
+        assert!(r.stop.contains("Hlt"), "{model:?}: {}", r.stop);
+        assert_eq!(r.end, IP + 2);
+    }
+}
+
+// Every other locked form is a typed refusal before it commits anything:
+// no step, IP on the first prefix, registers and memory unchanged.
+#[test]
+fn locked_forms_without_an_atomic_path_are_typed_refusals() {
+    let forms: &[&[u8]] = &[
+        // Repeated strings (decision: they stay typed handoffs).
+        b"\xf3\xa4",
+        b"\xf3\xa5",
+        b"\xf3\xaa",
+        b"\xf3\xac",
+        b"\xf3\xa6",
+        b"\xf2\xa6",
+        b"\xf3\xae",
+        b"\xf2\xaf",
+        b"\x26\xf3\xa4",
+        b"\xf3\x26\xa5",
+        // Single strings.
+        b"\xa4",
+        b"\xa5",
+        b"\xaa",
+        b"\xac",
+        b"\xa6",
+        b"\xae",
+        // A read-modify-write without an atomic form.
+        b"\x10\x07",
+        b"\x11\x07",
+        b"\x18\x07",
+        b"\x19\x07",
+        b"\x80\x17\x01",
+        b"\x80\x1f\x01",
+        b"\x81\x17\x01\x00",
+        b"\x83\x1f\x01",
+        b"\xd0\x27",
+        b"\xd1\x07",
+        b"\xd3\x2f",
+        b"\xd2\x1f",
+        // Only a read or only a write of memory.
+        b"\x02\x07",
+        b"\x03\x07",
+        b"\x2b\x07",
+        b"\x38\x07",
+        b"\x39\x07",
+        b"\x3a\x07",
+        b"\x80\x3f\x01",
+        b"\x83\x3f\x01",
+        b"\x84\x07",
+        b"\xf6\x07\x01",
+        b"\xf7\x07\x01\x00",
+        b"\x88\x07",
+        b"\x89\x07",
+        b"\x8a\x07",
+        b"\x8b\x07",
+        b"\xa0\x10\x00",
+        b"\xa3\x10\x00",
+        b"\xc6\x07\x01",
+        b"\xc7\x07\x01\x00",
+        b"\x8c\x07",
+        b"\x8e\x07",
+        b"\xc4\x07",
+        b"\xc5\x07",
+        b"\xd7",
+        b"\xf6\x27",
+        b"\xf7\x37",
+        b"\xd9\x07",
+        b"\xdd\x07",
+        // Stack and control transfers through memory.
+        b"\x50",
+        b"\x5b",
+        b"\x06",
+        b"\x1f",
+        b"\x9c",
+        b"\x9d",
+        b"\xff\x37",
+        b"\x8f\x07",
+        b"\xe8\x00\x00",
+        b"\xff\xd0",
+        b"\xff\x17",
+        b"\xff\x1f",
+        b"\xff\x27",
+        b"\xff\x2f",
+        b"\x9a\x00\x00\x00\x00",
+        b"\xc3",
+        b"\xc2\x02\x00",
+        b"\xcb",
+        b"\xcf",
+        b"\xcd\x21",
+        b"\xcc",
+        b"\xce",
+        // Port transfers.
+        b"\xe4\x10",
+        b"\xe5\x10",
+        b"\xe6\x10",
+        b"\xe7\x10",
+        b"\xec",
+        b"\xed",
+        b"\xee",
+        b"\xef",
+    ];
+    for model in LOCK_MODELS {
+        for code in forms {
+            let mut locked = vec![0xf0];
+            locked.extend_from_slice(code);
+            let (vm, mut cpu) = setup(model, &locked);
+            cpu.cpu.flags.of = true;
+            cpu.cpu.ds = 0x100;
+            cpu.cpu.gpr[3] = 0x10;
+            cpu.cpu.gpr[1] = 2;
+            vm.write_bytes(0x1010, &[0x5a, 0xa5, 0, 0x10]).unwrap();
+            let before = (cpu.cpu.gpr, cpu.cpu.flags.to_flags16());
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP),
+                "{model:?} {locked:02x?}: {:?}",
+                r.stop()
+            );
+            assert_eq!(r.steps(), 0, "{model:?} {locked:02x?}");
+            assert_eq!(cpu.cpu.rip, IP);
+            assert_eq!((cpu.cpu.gpr, cpu.cpu.flags.to_flags16()), before);
+            assert_eq!(vm.mem.read(0x1010, 4).unwrap(), 0x1000_a55a);
+            assert_eq!(
+                (
+                    vm.mem.read(0x7ff0, 8).unwrap(),
+                    vm.mem.read(0x7ff8, 8).unwrap()
+                ),
+                (0, 0),
+                "{model:?} {locked:02x?}"
+            );
+        }
+    }
+}
+
+// A refused locked form after an earlier instruction of the same block: the
+// earlier instruction retires, IP names the locked one.
+#[test]
+fn a_refused_locked_form_ends_the_block_before_it() {
+    for model in LOCK_MODELS {
+        let (vm, mut cpu) = setup(model, b"\x40\xf0\x89\x07\xf4");
+        let r = cpu.run_steps(&vm, 5, StepOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP + 1),
+            "{model:?}: {:?}",
+            r.stop()
+        );
+        assert_eq!((r.steps(), cpu.cpu.rip, cpu.cpu.gpr[0]), (1, IP + 1, 1));
+    }
+}
+
+// The atomic path makes one host atomic of the operand (Memory::atomic_rmw):
+// two vCPUs incrementing one aligned word lose no update. A word at an odd
+// address is refused (a_locked_word_at_an_odd_address_has_no_atomic_path).
+#[test]
+fn locked_increments_from_two_vcpus_lose_no_update() {
+    const N: u64 = 20_000;
+    for model in LOCK_MODELS {
+        // LOCK INC word [2000h]; LOOP back; HLT.
+        let (vm, _) = setup(model, b"\xf0\xff\x06\x00\x20\xe2\xf9\xf4");
+        vm.mem.write(0x2000, 0, 2).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let mut cpu = vm.new_vcpu();
+                    cpu.cpu.rip = IP;
+                    cpu.cpu.gpr[4] = 0x8000;
+                    cpu.cpu.gpr[1] = N;
+                    let r = cpu.run_steps(&vm, 3 * N, StepOptions::default()).unwrap();
+                    assert!(
+                        matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                        "{:?}",
+                        r.stop()
+                    );
+                });
+            }
+        });
+        assert_eq!(
+            vm.mem.read(0x2000, 2).unwrap(),
+            2 * N % 0x10000,
+            "{model:?}"
+        );
+    }
+}
+
+// A locked device operand has no atomic path: a typed refusal with the
+// instruction's bytes and no device transfer, as on the 286 and 386 paths.
+// The unlocked form reaches the device one byte at a time. This asserts
+// today's handoff for a locked MMIO operand; bead xj-ir6.33 replaces it with
+// one MmioRead and one MmioWrite of the operand size on every Machine model,
+// and this witness changes when that bead lands.
+#[test]
+fn a_locked_device_operand_is_a_typed_refusal() {
+    for model in LOCK_MODELS {
+        for code in [&b"\xf0\xfe\x07"[..], b"\xf0\x87\x07", b"\xf0\x26\x01\x07"] {
+            let (vm, mut cpu) = setup_review(model, code, true);
+            cpu.cpu.gpr[3] = 0x4000;
+            let before = cpu.cpu.gpr;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            match r.stop() {
+                StepStop::Exit(Exit::UnknownInstruction {
+                    addr, bytes, len, ..
+                }) => {
+                    assert_eq!(*addr, IP);
+                    assert_eq!(&bytes[..usize::from(*len)], code, "{model:?}");
+                }
+                other => panic!("{model:?} {code:02x?}: {other:?}"),
+            }
+            assert_eq!((r.steps(), cpu.cpu.rip, cpu.cpu.gpr), (0, IP, before));
+            // After an earlier instruction of its block: that one retires.
+            let (vm, mut cpu) = setup_review(model, &[&b"\x40"[..], code].concat(), true);
+            cpu.cpu.gpr[3] = 0x4000;
+            let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP + 1),
+                "{model:?} {code:02x?}: {:?}",
+                r.stop()
+            );
+            assert_eq!((r.steps(), cpu.cpu.rip, cpu.cpu.gpr[0]), (1, IP + 1, 1));
+            assert_eq!(cpu.retired_instructions(), 1);
+            // Without LOCK the operand is read from the device.
+            let (vm, mut cpu) = setup_review(model, &code[1..], true);
+            cpu.cpu.gpr[3] = 0x4000;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::MmioRead {
+                        addr: 0x4000,
+                        size: 1,
+                        ..
+                    })
+                ),
+                "{model:?} {code:02x?}: {:?}",
+                r.stop()
+            );
+        }
+    }
+}
+
+// A locked word over two adjacent RAM regions keeps the containment miss, as
+// every LOCK operand does on the other paths (spec.md "Data accesses across
+// adjacent regions"); the I80286 real-mode run of the same program agrees.
+// The word is even (an odd one is refused first), so the region boundary is
+// at an odd address. The unlocked word is performed one byte at a time.
+#[test]
+fn a_locked_word_over_two_regions_keeps_the_single_region_rule() {
+    let run = |model: CpuModel, code: &[u8]| {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x4001, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x4001, 0x1bfff, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(IP, code).unwrap();
+        vm.write_bytes(0x4000, &[0xff]).unwrap();
+        vm.write_bytes(0x4001, &[0x12]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        if model == CpuModel::I80286 {
+            cpu.cpu = x86jit_core::CpuState::legacy_real_entry([0; 6]);
+        }
+        cpu.cpu.rip = IP;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.gpr[3] = 0x4000;
+        let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        (
+            matches!(
+                r.stop(),
+                StepStop::Exit(Exit::UnmappedMemory {
+                    addr: 0x4000,
+                    access: x86jit_core::AccessKind::Write,
+                    ..
+                })
+            ),
+            r.steps(),
+            vm.mem.read(0x4000, 1).unwrap() | vm.mem.read(0x4001, 1).unwrap() << 8,
+            format!("{:?}", r.stop()),
+        )
+    };
+    let reference = run(CpuModel::I80286, b"\xf0\xff\x07");
+    assert_eq!(
+        (reference.0, reference.1, reference.2),
+        (true, 0, 0x12ff),
+        "{reference:?}"
+    );
+    for model in LOCK_MODELS {
+        let locked = run(model, b"\xf0\xff\x07");
+        assert_eq!(
+            (locked.0, locked.1, locked.2),
+            (true, 0, 0x12ff),
+            "{model:?}: {locked:?}"
+        );
+        let unlocked = run(model, b"\xff\x07");
+        assert_eq!(
+            (unlocked.1, unlocked.2),
+            (1, 0x1300),
+            "{model:?}: {unlocked:?}"
+        );
+    }
+}
+
+// A locked word whose bytes are not adjacent on the bus (offset FFFFh wraps
+// in its segment, UM §2.3 p. 2-12; physical FFFFFh wraps to 0, §2.8
+// p. 2-68) has no single host address and so no atomic path: a typed
+// refusal before any byte is read or written (such a word starts at an odd
+// address). The unlocked form wraps.
+#[test]
+fn a_locked_word_that_wraps_has_no_atomic_path() {
+    for model in LOCK_MODELS {
+        for (ds, bx, low, high) in [
+            (0x1000u16, 0xffffu64, 0x1ffffu64, 0x10000u64),
+            (0xffff, 0x000f, 0xfffff, 0),
+            (0xf000, 0xffff, 0xfffff, 0xf0000),
+        ] {
+            for code in [&b"\xff\x07"[..], b"\x87\x07", b"\x81\x37\x01\x80"] {
+                let run = |locked: bool| {
+                    let mut bytes = if locked { vec![0xf0] } else { vec![] };
+                    bytes.extend_from_slice(code);
+                    let (vm, mut cpu) = setup(model, &bytes);
+                    cpu.cpu.ds = ds;
+                    cpu.cpu.gpr[3] = bx;
+                    cpu.cpu.gpr[0] = 0x5566;
+                    vm.mem.write(low, 0xff, 1).unwrap();
+                    vm.mem.write(high, 0x12, 1).unwrap();
+                    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    (
+                        format!("{:?}", r.stop()),
+                        r.steps(),
+                        cpu.cpu.rip,
+                        cpu.cpu.gpr[0],
+                        vm.mem.read(low, 1).unwrap(),
+                        vm.mem.read(high, 1).unwrap(),
+                    )
+                };
+                let what = format!("{model:?} {ds:x}:{bx:x} {code:02x?}");
+                let locked = run(true);
+                assert!(
+                    locked.0.contains("UnknownInstruction"),
+                    "{what}: {locked:?}"
+                );
+                assert_eq!(
+                    (locked.1, locked.2, locked.3, locked.4, locked.5),
+                    (0, IP, 0x5566, 0xff, 0x12),
+                    "{what}"
+                );
+                let unlocked = run(false);
+                assert_eq!(unlocked.1, 1, "{what}: {unlocked:?}");
+                assert_ne!((unlocked.4, unlocked.5), (0xff, 0x12), "{what}");
+            }
+        }
+    }
+}
+
+// A locked operand in ROM: the read half returns the byte and the store is
+// dropped, as an unlocked store to ROM is (spec.md "Data accesses across
+// adjacent regions"); flags follow the read value.
+#[test]
+fn a_locked_rom_operand_matches_the_unlocked_form() {
+    for model in LOCK_MODELS {
+        for code in [&b"\xff\x07"[..], b"\x87\x07", b"\x00\x27"] {
+            let state = |locked: bool| {
+                let mut bytes = if locked { vec![0xf0] } else { vec![] };
+                bytes.extend_from_slice(code);
+                let mut vm =
+                    Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
+                vm.set_cpu_model(model);
+                vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.map(0x4000, 0x1000, Prot::RWX, RegionKind::Rom).unwrap();
+                vm.map(0x5000, 0x1b000, Prot::RWX, RegionKind::Ram).unwrap();
+                vm.write_bytes(IP, &bytes).unwrap();
+                vm.write_bytes(0x4000, &[0xff, 0x7f]).unwrap();
+                let mut cpu = vm.new_vcpu();
+                cpu.cpu.rip = IP;
+                cpu.cpu.gpr[3] = 0x4000;
+                cpu.cpu.gpr[0] = 0x0102;
+                step(&vm, &mut cpu, 1);
+                (
+                    cpu.cpu.gpr,
+                    cpu.cpu.flags.to_flags16(),
+                    vm.mem.read(0x4000, 2).unwrap(),
+                )
+            };
+            let locked = state(true);
+            assert_eq!(locked.2, 0x7fff, "{model:?} {code:02x?}");
+            assert_eq!(locked, state(false), "{model:?} {code:02x?}");
+        }
+    }
+}
+
+// UM §2.6 p. 2-24: "Repeat, LOCK and segment override prefixes are
+// considered 'part of' the instructions they prefix; no interrupt is
+// recognized between execution of a prefix and an instruction"; p. 2-17:
+// "Interrupts are not affected by the LOCK prefix". An IRQ held by STI's
+// shadow is taken after the whole locked instruction, and a single-step trap
+// follows the whole instruction.
+#[test]
+fn a_locked_instruction_is_one_instruction_to_interrupts_and_traps() {
+    for model in LOCK_MODELS {
+        // STI from IF = 0 holds a pending IRQ through the following
+        // instruction (UM §2.6 p. 2-24; NEC UM §6 p. 6-4). Were the LOCK
+        // prefix an instruction of its own, the IRQ would be taken after it,
+        // with a frame naming the 26h byte and no increment.
+        let (vm, mut cpu) = setup(model, b"\xfb\xf0\x26\xff\x07\xf4");
+        vector(&vm, 0x20, 0x3000, 0);
+        cpu.cpu.es = 0x100;
+        cpu.cpu.gpr[3] = 0x10;
+        cpu.inject_irq(0x20);
+        let r = cpu.run_steps(&vm, 5, StepOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(vm.mem.read(0x7ffa, 2).unwrap(), IP + 5, "{model:?}");
+        assert_eq!(vm.mem.read(0x1010, 2).unwrap(), 1, "{model:?}");
+
+        let (vm, mut cpu) = setup(model, b"\xf0\x26\xff\x07\xf4");
+        vector(&vm, 1, 0x3000, 0);
+        cpu.cpu.rflags_system |= 0x100;
+        cpu.cpu.es = 0x100;
+        cpu.cpu.gpr[3] = 0x10;
+        let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(vm.mem.read(0x7ffa, 2).unwrap(), IP + 4, "{model:?}");
+        assert_eq!(vm.mem.read(0x1010, 2).unwrap(), 1, "{model:?}");
+    }
+}
+
+// xj-50w.12 changes the twenty-bit entries' decode and lowering (LOCK), so
+// their prefix revision word, and with it their identities, change. The
+// system models' identities do not (values of b2ac76e4 on the left).
+#[test]
+fn lock_admission_changes_only_the_twenty_bit_identities() {
+    for (model, before, after) in [
+        (
+            CpuModel::I8088,
+            0x22fb_677c_f449_d2fe,
+            0x8815_844f_bd9d_4559,
+        ),
+        (
+            CpuModel::I8086,
+            0x22fb_677c_f449_d2f0,
+            0x8815_844f_bd9d_4557,
+        ),
+        (
+            CpuModel::NecV20,
+            0x909a_c76c_b38b_71d8,
+            0x2a38_6bfd_83ff_8f1f,
+        ),
+        (
+            CpuModel::NecV30,
+            0x909a_c76c_b38b_71e0,
+            0x2a38_6bfd_83ff_8f27,
+        ),
+        (
+            CpuModel::I80286,
+            0x3699_e02a_8ef1_3e63,
+            0x3699_e02a_8ef1_3e63,
+        ),
+        (
+            CpuModel::I80386,
+            0xe8d0_0c17_f97e_b71f,
+            0xe8d0_0c17_f97e_b71f,
+        ),
+    ] {
+        assert_eq!(model.profile().semantics_id, after, "{model:?}");
+        assert_eq!(
+            before == after,
+            matches!(model, CpuModel::I80286 | CpuModel::I80386)
+        );
+    }
+}
+
+// ---- Review witnesses (xj-50w.12/xj-50w.15 review), the scratch tests of
+// the review adopted with their substance; their assertions name the fixed
+// behaviour.
+
+// One element of a REP string, then a budget yield: the pair is pending.
+fn pending(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = setup(model, code);
+    vector(&vm, 0x20, 0x3000, 0);
+    cpu.cpu.flags.if_ = true;
+    cpu.cpu.es = 0x1000;
+    cpu.cpu.gpr[1] = 3;
+    cpu.cpu.gpr[6] = 0x100;
+    cpu.cpu.gpr[7] = 0x200;
+    step(&vm, &mut cpu, 1);
+    assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[1]), (IP, 2));
+    (vm, cpu)
+}
+fn irq_frame(vm: &Vm, cpu: &mut Vcpu) -> u64 {
+    cpu.inject_irq(0x20);
+    let r = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
+    assert!(
+        matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+        "{:?}",
+        r.stop()
+    );
+    vm.mem.read(0x7ffa, 2).unwrap()
+}
+
+// xj-50w.15: the pair is keyed on the instruction too. A host write that
+// replaces the interrupted string, with no register changed, starts new
+// code at CS:IP; no element of it completed, so the frame names IP (UM §2.7
+// p. 2-42). NecV20/V30 keep three prefixes, so four give a restart of IP+1.
+#[test]
+fn a_code_write_at_the_string_drops_the_restart_pair() {
+    for model in LOCK_MODELS {
+        let nec = matches!(model, CpuModel::NecV20 | CpuModel::NecV30);
+        let code: &[u8] = if nec {
+            b"\x26\x2e\x26\xf3\xa4\xf4"
+        } else {
+            b"\x26\xf3\xa4\xf4"
+        };
+        // INC AX; INC AX; HLT, and a plain REP MOVSB.
+        for new in [
+            &b"\x40\x40\xf4\xf4\xf4\xf4"[..],
+            b"\xf3\xa4\xf4\xf4\xf4\xf4",
+        ] {
+            let (vm, mut cpu) = pending(model, code);
+            vm.write_bytes(IP, &new[..code.len()]).unwrap();
+            assert_eq!(irq_frame(&vm, &mut cpu), IP, "{model:?} {new:02x?}");
+        }
+    }
+}
+
+// xj-50w.15: a zero-budget call is no attempt boundary, so an edit undone
+// around it (ABA) keeps the pair as an edit undone with no call between.
+#[test]
+fn a_zero_budget_call_between_an_edit_and_its_undo_keeps_the_pair() {
+    for model in LOCK_MODELS {
+        let code: &[u8] = if matches!(model, CpuModel::NecV20 | CpuModel::NecV30) {
+            b"\x26\x2e\x26\xf3\xa4\xf4"
+        } else {
+            b"\x26\xf3\xa4\xf4"
+        };
+        let (vm, mut cpu) = pending(model, code);
+        cpu.cpu.gpr[1] = 7;
+        cpu.cpu.gpr[1] = 2;
+        assert_eq!(irq_frame(&vm, &mut cpu), IP + 1, "{model:?} plain");
+
+        let (vm, mut cpu) = pending(model, code);
+        cpu.cpu.gpr[1] = 7;
+        let r = cpu.run_steps(&vm, 0, StepOptions::default()).unwrap();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        cpu.cpu.gpr[1] = 2;
+        assert_eq!(irq_frame(&vm, &mut cpu), IP + 1, "{model:?} run_steps(0)");
+
+        let (vm, mut cpu) = pending(model, code);
+        cpu.cpu.gpr[1] = 7;
+        assert!(matches!(cpu.run(&vm, Some(0)), Exit::BudgetExhausted));
+        cpu.cpu.gpr[1] = 2;
+        assert_eq!(irq_frame(&vm, &mut cpu), IP + 1, "{model:?} run(Some(0))");
+    }
+}
+
+// xj-50w.15: the run entry compares the string's bytes with guest memory at
+// CS:IP, not with the translation cache, which still holds the old block
+// until the dispatcher applies the write. A write of the same bytes keeps the
+// pair, and an edit of AX, which MOVSB does not read, is irrelevant; other
+// bytes drop it.
+#[test]
+fn a_rewrite_of_the_string_is_compared_by_its_bytes() {
+    for (bytes, frame) in [
+        (&b"\x26\xf3\xa4\xf4"[..], IP + 1),
+        (b"\x40\x40\xf4\xf4", IP),
+    ] {
+        let (vm, mut cpu) = pending(CpuModel::I8088, b"\x26\xf3\xa4\xf4");
+        let key = x86jit_core::BlockKey::machine_direct(IP, cpu.cpu.mxcsr, false);
+        assert!(vm.cache.get(key).is_some());
+        vm.write_bytes(IP, bytes).unwrap();
+        assert!(vm.cache.get(key).is_some(), "the write is not applied yet");
+        cpu.cpu.gpr[0] = 0x55;
+        assert_eq!(irq_frame(&vm, &mut cpu), frame, "{bytes:02x?}");
+    }
+}
+
+// xj-50w.15 (re-review): the host rewrites the interrupted `26 F3 A4` as
+// `26 F3 A5`, with the same prefixes, and a second vCPU executes the new
+// string first, so the cache holds a REP string with the same restart IP
+// again. The bytes differ, so the paused vCPU's pair is dropped and the frame
+// names IP (UM §2.7 p. 2-42).
+#[test]
+fn a_string_rewritten_and_relifted_by_another_vcpu_drops_the_pair() {
+    for model in LOCK_MODELS {
+        let (code, new): (&[u8], &[u8]) = if matches!(model, CpuModel::NecV20 | CpuModel::NecV30) {
+            (b"\x26\x2e\x26\xf3\xa4\xf4", b"\x26\x2e\x26\xf3\xa5\xf4")
+        } else {
+            (b"\x26\xf3\xa4\xf4", b"\x26\xf3\xa5\xf4")
+        };
+        let (vm, mut a) = pending(model, code);
+        vm.write_bytes(IP, new).unwrap();
+        let mut b = vm.new_vcpu();
+        b.cpu.rip = IP;
+        b.cpu.gpr[4] = 0x9000;
+        b.cpu.es = 0x2000;
+        b.cpu.gpr[1] = 5;
+        b.cpu.gpr[6] = 0x400;
+        b.cpu.gpr[7] = 0x400;
+        let r = b.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(
+            (r.steps(), b.cpu.rip, b.cpu.gpr[1]),
+            (1, IP, 4),
+            "{model:?}"
+        );
+        let key = x86jit_core::BlockKey::machine_direct(IP, a.cpu.mxcsr, false);
+        assert!(
+            vm.cache.get(key).is_some(),
+            "{model:?}: the new string is cached"
+        );
+        assert_eq!(irq_frame(&vm, &mut a), IP, "{model:?}");
+    }
+}
+
+// xj-50w.15 (re-review): with no code write and no register edit, mapping a
+// device region elsewhere flushes the whole translation cache (`Vm::map`).
+// The pair is kept: the frame names the kept prefix, as with no map.
+#[test]
+fn a_cache_flush_with_nothing_changed_keeps_the_pair() {
+    for model in LOCK_MODELS {
+        let code: &[u8] = if matches!(model, CpuModel::NecV20 | CpuModel::NecV30) {
+            b"\x26\x2e\x26\xf3\xa4\xf4"
+        } else {
+            b"\x26\xf3\xa4\xf4"
+        };
+        let mut vm = Vm::with_backend(VmConfig::flat(0x120000), Box::new(InterpreterBackend));
+        vm.set_cpu_model(model);
+        vm.set_exception_delivery(ExceptionDelivery::InGuest);
+        vm.map(0, 0x60000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x70000, 0xb0000, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(IP, code).unwrap();
+        vector(&vm, 0x20, 0x3000, 0);
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = IP;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.flags.if_ = true;
+        cpu.cpu.es = 0x1000;
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[6] = 0x100;
+        cpu.cpu.gpr[7] = 0x200;
+        step(&vm, &mut cpu, 1);
+        assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[1]), (IP, 2));
+        let key = x86jit_core::BlockKey::machine_direct(IP, cpu.cpu.mxcsr, false);
+        assert!(vm.cache.get(key).is_some());
+        vm.map(0x60000, 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        assert!(
+            vm.cache.get(key).is_none(),
+            "{model:?}: the map flushed the cache"
+        );
+        assert_eq!(irq_frame(&vm, &mut cpu), IP + 1, "{model:?}");
+    }
+}
+
+// xj-50w.15 (re-review 2): the pair's bytes are the ones its block was lifted
+// from, not a read of guest memory when the run returns. An external writer
+// stores new string bytes and reports the write only later (`note_write`), so
+// the next run still walks the cached old string and returns with its pair
+// pending while memory already holds the new bytes. After the late notice the
+// entry finds memory different from the old string's bytes and drops the
+// pair: the frame names IP (UM §2.7 p. 2-42).
+#[test]
+fn a_write_reported_after_the_run_returns_drops_the_pair() {
+    for model in LOCK_MODELS {
+        let (code, new): (&[u8], &[u8]) = if matches!(model, CpuModel::NecV20 | CpuModel::NecV30) {
+            (b"\x26\x2e\x26\xf3\xa4\xf4", b"\x26\x2e\x26\xf3\xa5\xf4")
+        } else {
+            (b"\x26\xf3\xa4\xf4", b"\x26\xf3\xa5\xf4")
+        };
+        let (vm, mut cpu) = setup(model, code);
+        vector(&vm, 0x20, 0x3000, 0);
+        cpu.cpu.flags.if_ = true;
+        cpu.cpu.es = 0x1000;
+        cpu.cpu.gpr[1] = 1;
+        // One element completes the string: its block is cached, no pair.
+        step(&vm, &mut cpu, 1);
+        assert_eq!(cpu.cpu.rip, IP + code.len() as u64 - 1, "{model:?}");
+        cpu.cpu.rip = IP;
+        cpu.cpu.gpr[1] = 3;
+        cpu.cpu.gpr[6] = 0x100;
+        cpu.cpu.gpr[7] = 0x200;
+        // SAFETY: the range is inside this VM's RAM; no vCPU is running.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                new.as_ptr(),
+                vm.mem.host_base().add(IP as usize).cast_mut(),
+                new.len(),
+            );
+        }
+        let key = x86jit_core::BlockKey::machine_direct(IP, cpu.cpu.mxcsr, false);
+        assert!(
+            vm.cache.get(key).is_some(),
+            "{model:?}: the write is not reported yet"
+        );
+        step(&vm, &mut cpu, 1);
+        assert_eq!(
+            (cpu.cpu.rip, cpu.cpu.gpr[1]),
+            (IP, 2),
+            "{model:?}: the old MOVSB ran"
+        );
+        vm.mem.note_write(IP, new.len());
+        assert_eq!(irq_frame(&vm, &mut cpu), IP, "{model:?}");
+    }
+}
+
+// xj-50w.12: a locked word at an odd address has no host atomic: refused on
+// the twenty-bit models. The aligned word loses no update across two vCPUs.
+// The I80286 real-mode path takes Memory::atomic_rmw's unaligned fallback
+// for the odd word and is run for reference only (filed separately).
+#[test]
+fn a_locked_word_at_an_odd_address_has_no_atomic_path() {
+    const N: u64 = 20_000;
+    for model in [
+        CpuModel::I8088,
+        CpuModel::I8086,
+        CpuModel::NecV20,
+        CpuModel::NecV30,
+        CpuModel::I80286,
+    ] {
+        for addr in [0x2000u16, 0x2001] {
+            let [lo, hi] = addr.to_le_bytes();
+            let code = [0xf0, 0xff, 0x06, lo, hi, 0xe2, 0xf9, 0xf4];
+            let (vm, _) = setup(model, &code);
+            vm.mem.write(u64::from(addr), 0, 2).unwrap();
+            let refused = model != CpuModel::I80286 && addr & 1 != 0;
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        let mut cpu = vm.new_vcpu();
+                        if model == CpuModel::I80286 {
+                            cpu.cpu = x86jit_core::CpuState::legacy_real_entry([0; 6]);
+                        }
+                        cpu.cpu.rip = IP;
+                        cpu.cpu.gpr[4] = 0x8000;
+                        cpu.cpu.gpr[1] = N;
+                        let r = cpu.run_steps(&vm, 3 * N, StepOptions::default()).unwrap();
+                        if refused {
+                            assert!(
+                                matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP),
+                                "{:?}",
+                                r.stop()
+                            );
+                            assert_eq!(r.steps(), 0);
+                        } else {
+                            assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)), "{:?}", r.stop());
+                        }
+                    });
+                }
+            });
+            let got = vm.mem.read(u64::from(addr), 2).unwrap();
+            if refused {
+                assert_eq!(got, 0, "{model:?} {addr:#x}");
+            } else if addr & 1 == 0 {
+                assert_eq!(got, 2 * N, "{model:?} {addr:#x}");
+            }
+        }
+    }
+}
+
+// xj-50w.12, a systematic scan. Data, stack and string memory lie in a
+// device region, so every data transfer of an unlocked form shows as an
+// MMIO or port exit. No locked form may run while its unlocked form
+// transfers data, and every locked form that runs must end as its unlocked
+// form does. The one locked form refused although its unlocked form runs
+// here without a transfer is INTO with OF clear: INTO with OF set reads the
+// interrupt pointer and pushes as INT does (UM §2.7 pp. 2-46–47), the lift
+// decides per form, and so the form has no atomic path. An unlocked form
+// that stops with a device refusal of its own (an NEC BCD string over the
+// device region) is a transfer, not a run.
+#[derive(Debug, Clone, PartialEq)]
+struct ScanOutcome {
+    kind: String,
+    steps: u64,
+    gpr: [u64; 8],
+    flags: u16,
+}
+fn scan_run(model: CpuModel, code: &[u8]) -> ScanOutcome {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x4000), Box::new(InterpreterBackend));
+    vm.set_cpu_model(model);
+    vm.set_exception_delivery(ExceptionDelivery::InGuest);
+    vm.map(0, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x1000, 0x2000, Prot::RWX, RegionKind::Trap).unwrap();
+    vm.map(0x3000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x500, code).unwrap();
+    for v in 0..256u64 {
+        vm.mem.write(v * 4, 0x0300_0000, 4).unwrap();
+    }
+    vm.write_bytes(0x3000, b"\xf4").unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.cs = 0;
+    cpu.cpu.rip = 0x500;
+    cpu.cpu.ds = 0x100;
+    cpu.cpu.es = 0x100;
+    cpu.cpu.ss = 0x200;
+    cpu.cpu.gpr = [0; 16];
+    cpu.cpu.gpr[0] = 0x0087;
+    cpu.cpu.gpr[1] = 0x0002;
+    cpu.cpu.gpr[3] = 0x10;
+    cpu.cpu.gpr[4] = 0x100;
+    cpu.cpu.gpr[5] = 0x40;
+    cpu.cpu.gpr[6] = 0x20;
+    cpu.cpu.gpr[7] = 0x30;
+    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    let kind = match r.stop() {
+        StepStop::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. } | Exit::PortIo { .. }) => {
+            "transfer".to_string()
+        }
+        StepStop::Exit(Exit::UnknownInstruction { .. }) => "unknown".to_string(),
+        StepStop::Exit(Exit::BudgetExhausted) => "ran".to_string(),
+        StepStop::Exit(Exit::Hlt) => "hlt".to_string(),
+        other => format!("{other:?}"),
+    };
+    let mut gpr = [0; 8];
+    gpr.copy_from_slice(&cpu.cpu.gpr[..8]);
+    ScanOutcome {
+        kind,
+        steps: r.steps(),
+        gpr,
+        flags: cpu.cpu.flags.to_flags16(),
+    }
+}
+#[test]
+fn every_locked_form_runs_as_its_unlocked_form_or_is_refused() {
+    for model in [CpuModel::I8088, CpuModel::NecV20] {
+        let nec = model == CpuModel::NecV20;
+        let modrms: Vec<u8> = (0..8u8)
+            .flat_map(|r| [0xc3 | (r << 3), 0x07 | (r << 3)])
+            .collect();
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for op in 0..=255u8 {
+            if matches!(op, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3)
+                || (nec && matches!(op, 0x64 | 0x65))
+            {
+                continue;
+            }
+            if nec && op == 0x0f {
+                for op2 in 0..=255u8 {
+                    for m in &modrms {
+                        cases.push(vec![0x0f, op2, *m, 1, 1, 1, 1]);
+                    }
+                }
+                continue;
+            }
+            for m in &modrms {
+                cases.push(vec![op, *m, 1, 1, 1, 1]);
+            }
+        }
+        let mut wrong = Vec::new();
+        for code in &cases {
+            let unlocked = scan_run(model, code);
+            let locked = scan_run(model, &[&[0xf0][..], code].concat());
+            let refused = locked.kind == "unknown";
+            if unlocked.kind == "transfer" && !refused {
+                wrong.push(format!("{code:02x?}: runs locked, transfers unlocked"));
+            } else if refused && matches!(unlocked.kind.as_str(), "ran" | "hlt") {
+                if code[0] != 0xce {
+                    wrong.push(format!(
+                        "{code:02x?}: refused, runs unlocked without a transfer"
+                    ));
+                }
+            } else if !refused && locked != unlocked {
+                wrong.push(format!("{code:02x?}: {locked:?} != {unlocked:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{model:?}:\n{}", wrong.join("\n"));
+    }
+}
+
+// xj-50w.15: the pair is not part of CpuState. Restoring a mid-string
+// CpuState after the string has finished names the first prefix: the
+// conservative frame, as for an abandoned request.
+#[test]
+fn a_restored_mid_string_state_names_the_first_prefix() {
+    let (vm, mut cpu) = pending(CpuModel::I8088, b"\x26\xf3\xa4\xf4");
+    let saved = cpu.cpu.clone();
+    let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+    assert_eq!(r.steps(), 2, "{:?}", r.stop());
+    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    assert!(
+        matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+        "{:?}",
+        r.stop()
+    );
+    cpu.cpu = saved;
+    assert_eq!(irq_frame(&vm, &mut cpu), IP);
 }

@@ -429,7 +429,9 @@ and its exit; splitting device accesses is xj-ir6.30. A 16-byte vector store is 
 8-byte transfers; when the first is not inside one region, both are checked before
 either is written, with or without recovery, so a gap in the second faults there
 with nothing written. A LOCK or implicitly locked operand keeps the containment
-miss, including each bus piece of one that the A20 gate splits. An automatic child
+miss, including each bus piece of one that the A20 gate splits; on the
+twenty-bit models a locked word at an odd address, which includes one that
+wraps its segment or the bus, is a typed refusal (§17.10). An automatic child
 view joins adjacent regions of one kind for non-atomic data accesses; a span that
 mixes RAM and ROM keeps the containment fault in the child. Inline compiled
 accesses bound only against the backing and never consult the region map, so they
@@ -1939,9 +1941,7 @@ TEST /0 (SDM Vol 3B §25.15 pp. 25-5–6, corroborated by the "alias" entries in
 marks it "undocumented". The amendment also permits ordinary 83h /1,/4,/6
 (OR/AND/XOR r/m16 with sign-extended imm8): SDM Vol 2A §3.3 AND p. 3-60,
 Vol 2B §4.3 OR p. 4-163, Vol 2D §6.1 XOR p. 6-40; the same corpus metadata
-marks these forms "normal". LOCK remains a typed
-refusal: §2.5 pp. 2-17–18 specifies bus ownership across the complete instruction
-(including a repeated string), which the engine cannot promise. AAM/AAD's
+marks these forms "normal". AAM/AAD's
 second byte is fixed to 0Ah by Table 4-12 p. 4-24. The decoder folds redundant
 prefixes before using iced's bounded representation, while retaining the full
 instruction length, real next IP, source spans and final-prefix restart IP.
@@ -1965,6 +1965,68 @@ first element completes, the frame names the first prefix. Budget and
 exit-request yields keep the complete instruction as the owner; the dispatcher
 retains the owner/restart pair once an element has completed and applies the
 restart only at delivery, so an abandoned request resumes the whole instruction.
+The pair is keyed on the instruction at CS:IP and on the inputs the string's
+next element reads, at their read widths, as the U3 ENTER identity contract
+keys an attempt (xj-50w.15): CX and DF; SI and the source segment for MOVS,
+LODS and CMPS; DI and ES for MOVS, STOS, CMPS and SCAS; AL or AX for STOS and
+SCAS (UM §2.7 Table 2-13 p. 2-40, pp. 2-42–43; ZF "does not need to be
+initialized", p. 2-42). A host change of the instruction's bytes there, or
+an edit of one of those inputs, between runs starts a new operation at that
+address, which an interrupt names by its first prefix; an edit of an unread
+register, or a write of the same bytes, keeps the pair. Only the host edits
+between runs, so when a run returns with a pair pending the string's inputs,
+the registers and the bytes (prefixes and opcode) its block was lifted from
+are recorded, after pending code writes are applied to the cache. A string
+no longer cached, or one longer than fifteen bytes, is not recorded and drops
+the pair. The next run with a budget (a zero-budget call is no attempt
+boundary) drops the pair unless those bytes still are in guest memory at
+CS:IP and the inputs are unchanged. A code write whose notice comes after the
+run returned therefore still drops it. The entry does not consult the
+translation cache, so an eviction keeps the pair.
+The NEC entries' three-prefix restart and REPC/REPNC share the rule.
+
+**LOCK (xj-50w.12).** LOCK makes the processor "assert its bus LOCK signal
+while the following instruction executes. LOCK does not affect any flags"
+(UM §2.7 p. 2-48). The signal "remains active throughout execution of the
+instruction that follows the LOCK prefix", and for a locked repeated string
+"for the duration of the block operation"; it "provides information only"
+(§2.5 pp. 2-17–18). §4.2 p. 4-14 adds that "greater latencies occur when a
+'long' instruction is locked". No page restricts the instructions LOCK may
+precede, and NEC UM p. 12-173 says the same of BUSLOCK, which p. 2-2 also
+describes before HALT. The entries execute a locked form in one of two ways:
+- a read-modify-write with an atomic operation (ADD, OR, AND, SUB, XOR, INC,
+  DEC, NEG, NOT and XCHG with a memory destination, and the NEC CLR1, SET1 and
+  NOT1 on memory, one AND, OR or XOR of the bit mask with no flag change,
+  pp. 12-85–98, as a locked BTR, BTS or BTC on the 386 path) goes through the
+  engine's atomic path, as `IrOp::AtomicRmw` does on the I80286 and I80386
+  Machine paths;
+- a form that transfers no data (register operands, LEA, flag and control
+  instructions without a memory operand, HLT, WAIT, a register ESC or FPO2)
+  runs as the unprefixed form: the bus lock has nothing to hold.
+
+Every other locked form has no atomic path and returns `UnknownInstruction`
+before it commits: a repeated string (REP, REPE, REPNE, REPC, REPNC), a single
+string, ADC and SBB, shifts and rotates, MUL and DIV of memory, a memory read
+or write without a read-modify-write (MOV, CMP, TEST, LDS, LES, XLAT, a memory
+ESC or FPO2, the NEC TEST1), stack and frame transfers (PUSH, POP, CALL, RET,
+INT, INTO, IRET, PUSHF, POPF and the NEC PUSH R, POP R, PREPARE, DISPOSE,
+CHKIND), port transfers (IN, OUT, INM, OUTM), the NEC ROL4/ROR4 (which also
+write AL) and BCD strings on memory. The lift decides per form, so INTO is
+refused whatever OF is: with OF set it reads the interrupt pointer and pushes
+as INT does (UM §2.7 pp. 2-46–47). A locked operand is one host atomic of its
+width (`Memory::atomic_rmw`), the only data transfer of the twenty-bit walk
+wider than one byte. A device operand there is a typed refusal (bead
+xj-ir6.33 changes the device case on every Machine model), and an operand
+over two adjacent regions keeps the containment miss of every locked operand
+(§5.2, Data accesses across adjacent regions). A word at an odd address has
+no host atomic (`Memory::atomic_rmw` would fall back to a plain read and
+write), so no atomic path: a typed refusal before any byte moves. That covers
+every word whose bytes wrap their segment (offset FFFFh) or the bus
+(FFFFFh). Interrupts and the single-step trap see a locked
+instruction as one instruction (UM §2.6 p. 2-24: prefixes are "part of" the
+instruction they prefix). The four twenty-bit identities change with this rule
+(the early entries' prefix revision word); the I80286 and I80386 identities do
+not. The witnesses are in `legacy_i8086` and `legacy_nec_v20_extensions`.
 The cold event boundary reads the catalogue's priority policy: an external
 interrupt enters its handler before the single-step trap (UM §2.6 pp. 2-26–28).
 STI and IRET "reenable interrupts only after the end of the following
@@ -2126,10 +2188,11 @@ AC and P U; the README says "REPC/REPNC prefixes on INS and OUTS act as
 regular REP prefixes" (6C/6D), which p. 12-14 does not describe, so the
 engine refuses it.
 
-Out of scope: BUSLOCK (F0h, p. 12-173), which the manual lists for native
-mode, keeps the C2 LOCK refusal; the engine has no primitive that holds the
-bus for a whole instruction. The device-memory BCD refusal and the REPC
-prefix-run limit above are engine limits.
+BUSLOCK (F0h, p. 12-173) follows the C2 LOCK rule (xj-50w.12, above): CLR1,
+SET1 and NOT1 on memory take the atomic path, a register-only bit or nibble
+form and a register FPO2 run, and TEST1, ROL4 and ROR4 on memory, the BCD
+strings, BRKEM and REPC/REPNC are typed refusals. The device-memory
+BCD refusal and the REPC prefix-run limit above are engine limits.
 
 The other entries' identities are unchanged; the NEC entries hash an
 extension revision word. The witness binary is `legacy_nec_v20_extensions`.

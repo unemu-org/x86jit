@@ -165,6 +165,25 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
             *size,
             read_val(*value, temps),
         )?,
+        L::LockedRmw20 {
+            old,
+            addr,
+            src,
+            size,
+            op,
+            bytes,
+            len,
+        } => {
+            temps[*old as usize] = locked_rmw(
+                cpu,
+                mem,
+                read_val(*addr, temps),
+                read_val(*src, temps),
+                *size,
+                *op,
+                (ip, bytes, *len),
+            )?
+        }
         L::FlagsImage { dst, clear, set } => {
             temps[*dst as usize] = (cpu.rflags() & !u64::from(*clear)) | u64::from(*set)
         }
@@ -261,6 +280,47 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
         _ => unreachable!("resolved real-mode primitive"),
     }
     Ok(())
+}
+
+// 8086 Family UM §2.5 pp. 2-17–18 and NEC V20/V30 UM p. 12-173: a locked
+// read-modify-write takes the engine's atomic path, as `IrOp::AtomicRmw` does
+// on the 286 and 386 Machine paths (decision-23, xj-50w.12): one host atomic
+// of the operand's width (`Memory::atomic_rmw`), the one data transfer of this
+// walk wider than a byte. A device operand is a typed refusal, and an operand
+// over two adjacent regions keeps the containment miss of every locked
+// operand. A word at an odd address has no host atomic (`Memory::atomic_rmw`
+// would fall back to a plain read and write), so no atomic path: a typed
+// refusal before any transfer. That covers every word whose bytes wrap their
+// segment (offset FFFFh, UM §2.3 p. 2-12) or the twenty-bit bus (FFFFFh,
+// §2.8 p. 2-68).
+#[cold]
+#[inline(never)]
+fn locked_rmw(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    tag: u64,
+    src: u64,
+    size: u8,
+    op: crate::ir::RmwOp,
+    (ip, bytes, len): (u64, &[u8; 15], u8),
+) -> Result<u64, Exit> {
+    let first = physical(tag, 0);
+    if !first.is_multiple_of(u64::from(size)) {
+        return Err(Exit::unknown_instruction(ip, *bytes, len));
+    }
+    debug_assert_eq!(physical(tag, size - 1), first + u64::from(size) - 1);
+    match mem.atomic_rmw(first, src, size, op) {
+        Ok(old) => Ok(old),
+        Err(MemTrap::Mmio) => Err(Exit::unknown_instruction(ip, *bytes, len)),
+        Err(trap) => {
+            let StepResult::Exit(exit) =
+                trap_out(cpu, cpu.rip, trap, first, size, AccessKind::Write, src).into_step()
+            else {
+                unreachable!()
+            };
+            Err(exit)
+        }
+    }
 }
 
 /// How a NEC V20/V30 control primitive ended its instruction (decision-23 C4a).

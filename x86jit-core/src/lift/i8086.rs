@@ -373,6 +373,7 @@ pub(crate) fn nec_form(
     length: u32,
     next: u16,
     profile: &'static crate::ModelProfile,
+    lock: bool,
     tg: &mut TempGen,
 ) -> Result<IrBlock, LiftError> {
     if let NecForm::Brkem(vector) = *form {
@@ -388,7 +389,9 @@ pub(crate) fn nec_form(
     };
     match *form {
         NecForm::Brkem(_) => unreachable!("lowered above"),
-        NecForm::Operand { opcode, imm } => nec_operand(opcode, surrogate, imm, &mut ops, tg)?,
+        NecForm::Operand { opcode, imm } => {
+            nec_operand(opcode, surrogate, imm, lock, &mut ops, tg)?
+        }
         NecForm::BitField {
             insert,
             offset,
@@ -434,6 +437,14 @@ pub(crate) fn nec_form(
                 size,
             })),
             IrOp::SegLimitCheck { .. } => {}
+            IrOp::AtomicRmw {
+                old,
+                addr,
+                src,
+                size,
+                op,
+                ..
+            } => result.push(locked_rmw(old, addr, src, size, op, evidence)),
             op => result.push(op),
         }
     }
@@ -458,6 +469,7 @@ fn nec_operand(
     opcode: u8,
     operand: &Instruction,
     imm: u8,
+    locked: bool,
     ops: &mut impl LiftBuffer,
     tg: &mut TempGen,
 ) -> Result<(), LiftError> {
@@ -466,6 +478,42 @@ fn nec_operand(
     } else {
         1
     };
+    // NEC UM p. 12-173: BUSLOCK holds the bus for the following instruction.
+    // CLR1, SET1 and NOT1 change one bit of the operand and no flag
+    // (pp. 12-85–98): on memory, one atomic AND, OR or XOR of the bit mask, as
+    // a locked BTR, BTS or BTC on the 386 path (lift/integer.rs `emit_mem_bt`).
+    if locked
+        && operand.op0_kind() == OpKind::Memory
+        && matches!(opcode, 0x10..=0x1f)
+        && (opcode >> 1) & 3 != 0
+    {
+        let addr = effective_address(operand, ops, tg)?;
+        let mask = bit_mask(opcode, imm, size, ops, tg);
+        let (src, op) = match (opcode >> 1) & 3 {
+            1 => (
+                alu_none(ops, tg, |dst| IrOp::Xor {
+                    dst,
+                    a: mask,
+                    b: Val::Imm(u64::MAX),
+                    size: 8,
+                    set_flags: FlagMask::NONE,
+                }),
+                RmwOp::And,
+            ),
+            2 => (mask, RmwOp::Or),
+            _ => (mask, RmwOp::Xor),
+        };
+        let old = tg.fresh();
+        ops.push(IrOp::AtomicRmw {
+            fault: Default::default(),
+            old,
+            addr,
+            src,
+            size,
+            op,
+        });
+        return Ok(());
+    }
     let (value, target) = if operand.op0_kind() == OpKind::Memory {
         let addr = effective_address(operand, ops, tg)?;
         (load(ops, tg, addr, size), WriteTarget::Mem { addr, size })
@@ -546,20 +594,23 @@ fn nec_operand(
     }
     // UM pp. 12-81–98: the bit number is CL or the immediate, of which only
     // bits 2:0 (byte) or 3:0 (word) are used.
-    let bits = u64::from(size) * 8 - 1;
-    let mask = if opcode < 0x18 {
-        let cl = read_reg(Reg::Rcx, ops, tg);
-        let bit = and(ops, tg, cl, Val::Imm(bits));
-        alu_none(ops, tg, |dst| IrOp::Shl {
-            dst,
-            a: Val::Imm(1),
-            b: bit,
-            size: 8,
-            set_flags: FlagMask::NONE,
-        })
-    } else {
-        Val::Imm(1 << (u64::from(imm) & bits))
-    };
+    fn bit_mask(opcode: u8, imm: u8, size: u8, ops: &mut impl LiftBuffer, tg: &mut TempGen) -> Val {
+        let bits = u64::from(size) * 8 - 1;
+        if opcode < 0x18 {
+            let cl = read_reg(Reg::Rcx, ops, tg);
+            let bit = and(ops, tg, cl, Val::Imm(bits));
+            alu_none(ops, tg, |dst| IrOp::Shl {
+                dst,
+                a: Val::Imm(1),
+                b: bit,
+                size: 8,
+                set_flags: FlagMask::NONE,
+            })
+        } else {
+            Val::Imm(1 << (u64::from(imm) & bits))
+        }
+    }
+    let mask = bit_mask(opcode, imm, size, ops, tg);
     match (opcode >> 1) & 3 {
         // TEST1: Z <- 1 when the bit is 0; V and CY cleared (pp. 12-81–85).
         // S, AC and P are undefined there: the engine keeps them.
@@ -653,7 +704,7 @@ pub(crate) fn instruction(
     use Mnemonic::*;
     let opcode = bytes
         .iter()
-        .position(|b| !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf2 | 0xf3))
+        .position(|b| !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3))
         .unwrap();
     if matches!(bytes[opcode], 0xd8..=0xdf | 0x9b) {
         let mut raw = [0; 15];
@@ -901,6 +952,16 @@ pub(crate) fn instruction(
                     start
                 },
                 carry: false,
+                code: {
+                    let mut code = [0; 15];
+                    let len = evidence.len().min(15);
+                    code[..len].copy_from_slice(&evidence[..len]);
+                    code
+                },
+                code_len: u8::try_from(length)
+                    .ok()
+                    .filter(|len| usize::from(*len) == evidence.len())
+                    .unwrap_or(0),
             })),
             IrOp::Legacy(L::DirectStackAddress { dst, offset, .. }) => {
                 let value = tagged_address(&mut result, tg, SegmentId::Ss, offset);
@@ -920,6 +981,13 @@ pub(crate) fn instruction(
                 op,
                 ..
             } => {
+                if insn.has_lock_prefix() {
+                    result.push(locked_rmw(old, addr, src, size, op, evidence));
+                    continue;
+                }
+                // UM §2.5 p. 2-18: an unlocked XCHG "requires two bus cycles
+                // to swap 8-bit values", and another processor can take the
+                // bus between them.
                 result.push(IrOp::Legacy(L::WrappedLoad {
                     dst: old,
                     addr,
@@ -959,6 +1027,93 @@ pub(crate) fn instruction(
         ops: result,
         legacy_context: Some(CONTEXT),
     })
+}
+
+// UM §2.5 pp. 2-17–18: LOCK holds the bus through the whole instruction. A
+// locked read-modify-write takes the engine's atomic path (decision-23,
+// xj-50w.12), as the 286 and 386 Machine paths do.
+#[cold]
+#[inline(never)]
+fn locked_rmw(old: Temp, addr: Val, src: Val, size: u8, op: RmwOp, evidence: &[u8]) -> IrOp {
+    let mut bytes = [0; 15];
+    bytes[..evidence.len()].copy_from_slice(evidence);
+    IrOp::Legacy(L::LockedRmw20 {
+        old,
+        addr,
+        src,
+        size,
+        op,
+        bytes,
+        len: evidence.len() as u8,
+    })
+}
+
+/// The LOCK policy of the twenty-bit models (decision-23, xj-50w.12). LOCK
+/// makes the 8086/8088 "assert its bus LOCK signal while the following
+/// instruction executes. LOCK does not affect any flags" (8086 Family UM §2.7
+/// p. 2-48); the signal "remains active throughout execution of the
+/// instruction that follows the LOCK prefix", for a repeated string through
+/// the whole block operation, and "provides information only" (§2.5
+/// pp. 2-17–18). NEC V20/V30 UM p. 12-173 says the same of BUSLOCK. Neither
+/// manual restricts the instructions it may precede. `ir` is the lifted
+/// locked instruction. It runs when its only data transfer is the atomic
+/// read-modify-write (`LockedRmw20`) or when it transfers no data, which leaves
+/// the bus lock nothing to hold. A locked repeated string, a read-modify-write
+/// without an atomic form, and every other memory or port transfer have no
+/// atomic path and are typed refusals.
+#[cold]
+#[inline(never)]
+pub(crate) fn locked(ir: IrBlock, insn: &Instruction) -> Result<IrBlock, LiftError> {
+    let transfers = ir.ops.iter().any(|op| match op {
+        IrOp::Legacy(
+            L::LockedRmw20 { .. }
+            | L::FlagsImage { .. }
+            | L::LoadFlagsWord { .. }
+            | L::DivideTrap { .. }
+            | L::InhibitIrq20
+            | L::SharedWalk,
+        ) => false,
+        IrOp::Legacy(L::Coprocessor20 { memory, .. } | L::Fpo2Escape20 { memory, .. }) => *memory,
+        IrOp::InsnStart { .. }
+        | IrOp::ReadReg { .. }
+        | IrOp::WriteReg { .. }
+        | IrOp::ReadSelector { .. }
+        | IrOp::Add { .. }
+        | IrOp::Adc { .. }
+        | IrOp::Sub { .. }
+        | IrOp::Sbb { .. }
+        | IrOp::And { .. }
+        | IrOp::Or { .. }
+        | IrOp::Xor { .. }
+        | IrOp::Shl { .. }
+        | IrOp::Shr { .. }
+        | IrOp::Sar { .. }
+        | IrOp::Rol { .. }
+        | IrOp::Ror { .. }
+        | IrOp::Rcl { .. }
+        | IrOp::Rcr { .. }
+        | IrOp::Sext { .. }
+        | IrOp::Mul { .. }
+        | IrOp::Div { .. }
+        | IrOp::GetCond { .. }
+        | IrOp::Bcd { .. }
+        | IrOp::Lahf
+        | IrOp::Sahf
+        | IrOp::SetIf { .. }
+        | IrOp::SetDf { .. }
+        | IrOp::SetCf { .. }
+        | IrOp::SetSsShadow
+        | IrOp::Jump { .. }
+        | IrOp::Branch { .. }
+        | IrOp::LoopCx { .. }
+        | IrOp::Hlt => false,
+        _ => true,
+    });
+    if transfers {
+        Err(unsupported_insn(insn))
+    } else {
+        Ok(ir)
+    }
 }
 
 // UM §2.7 p. 2-39: up to 255 shifts. Reduce only to an equivalent count

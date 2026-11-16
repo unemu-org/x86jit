@@ -364,6 +364,9 @@ impl IrBlock {
                     crate::legacy::LegacyOp::WrappedStore { addr, value, .. } => {
                         check(&[*addr, *value], &[])?
                     }
+                    crate::legacy::LegacyOp::LockedRmw20 { old, addr, src, .. } => {
+                        check(&[*addr, *src], &[*old])?
+                    }
                     crate::legacy::LegacyOp::Coprocessor20 { addr, .. } => check(&[*addr], &[])?,
                     crate::legacy::LegacyOp::FlagsImage { dst, .. } => check(&[], &[*dst])?,
                     crate::legacy::LegacyOp::LoadFlagsWord { value, .. } => check(&[*value], &[])?,

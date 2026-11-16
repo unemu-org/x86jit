@@ -898,7 +898,9 @@ pub enum LegacyOp {
     },
     /// String bytes wrap inside their segments and on a twenty-bit bus.
     /// `carry` is NEC V20/V30 REPC/REPNC: `Repe`/`Repne` test CY in place
-    /// of Z (NEC UM p. 12-14).
+    /// of Z (NEC UM p. 12-14). `code` holds the instruction's bytes, its
+    /// prefixes and opcode, as they were lifted; `code_len` is 0 when there
+    /// are more than fifteen (the REP restart pair's key, xj-50w.15).
     WrappedString {
         kind: crate::ir::StrOp,
         elem: u8,
@@ -906,6 +908,8 @@ pub enum LegacyOp {
         source: SegmentId,
         restart_ip: u16,
         carry: bool,
+        code: [u8; 15],
+        code_len: u8,
     },
     /// NEC V20/V30 INS (`insert`) and EXT (NEC UM pp. 12-21–24). `offset`
     /// is a Table 12-6 reg8 code; `length` is a reg8 code when
@@ -961,6 +965,19 @@ pub enum LegacyOp {
     },
     /// Hold INT through the following instruction (NEC UM §6 p. 6-4).
     InhibitIrq20,
+    /// A LOCK-prefixed read-modify-write through a twenty-bit address
+    /// (8086 Family UM §2.5 pp. 2-17–18, §2.7 p. 2-48; NEC V20/V30 UM
+    /// p. 12-173 BUSLOCK), with the instruction bytes for the typed refusal
+    /// of a device operand.
+    LockedRmw20 {
+        old: crate::ir::Temp,
+        addr: crate::ir::Val,
+        src: crate::ir::Val,
+        size: u8,
+        op: crate::ir::RmwOp,
+        bytes: [u8; 15],
+        len: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

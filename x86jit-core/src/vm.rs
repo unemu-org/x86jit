@@ -2701,6 +2701,12 @@ impl Vcpu {
                 .legacy_model
                 .is_some_and(|model| model.generation == crate::CpuGeneration::I8086)
             {
+                // xj-50w.15: a REP owner/restart pair was pending when the last
+                // run returned; the host may have edited its string or inputs.
+                // A zero-budget call is no attempt boundary (`run_engine`).
+                if max_steps != 0 && self.rep_restart20_pending() {
+                    self.forget_edited_rep_restart20(vm);
+                }
                 self.run_direct20::<true>(vm, Some(max_steps), options)
             } else {
                 self.run_engine::<MACHINE_DISPATCH, true>(vm, Some(max_steps), options)
@@ -2750,6 +2756,9 @@ impl Vcpu {
                 .legacy_model
                 .is_some_and(|model| model.generation == crate::CpuGeneration::I8086)
             {
+                if budget != Some(0) && self.rep_restart20_pending() {
+                    self.forget_edited_rep_restart20(vm);
+                }
                 self.run_direct20::<false>(vm, budget, StepOptions::default())
             } else {
                 self.run_engine::<MACHINE_DISPATCH, false>(vm, budget, StepOptions::default())
@@ -2806,8 +2815,11 @@ impl Vcpu {
     ) -> Result<StepRun, StepRunError> {
         // Decision-16 §3: every execution exit passes the attempt's ownership
         // boundary. Only explicit continuations can return a REP flag origin.
+        // The twenty-bit walk never sets a REP flag origin (only
+        // `execute_protected_block` does); its REP restart pair is recorded
+        // at the end of `run_engine_attempt` (xj-50w.15).
         let result = self.run_engine_attempt::<KIND, STEPPED>(vm, budget, options);
-        if KIND >= MACHINE_DISPATCH && budget != Some(0) {
+        if KIND >= MACHINE_DISPATCH && KIND != DIRECT20_DISPATCH && budget != Some(0) {
             self.finish_comparison_attempt(&result);
         }
         result
@@ -2992,6 +3004,12 @@ impl Vcpu {
                             .at(crate::FaultPath::Unknown, false, cpu.cpu.rip),
                     );
             }
+        }
+        // xj-50w.15: a twenty-bit run returns with a REP owner/restart pair
+        // pending; record its string while the VM is still in use. A
+        // zero-budget call returned before the dispatch (no attempt boundary).
+        if KIND == DIRECT20_DISPATCH && cpu.rep_restart20_pending() {
+            cpu.record_rep_restart20(vm);
         }
         let outside = dispatch.finish(
             &time_run,

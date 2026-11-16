@@ -25,6 +25,8 @@ struct Decoded {
     nec: Option<crate::lift::i8086::NecForm>,
     /// NEC V20/V30 REPC or REPNC: the repeat condition tests CY.
     carry: bool,
+    /// A LOCK (BUSLOCK) prefix: `lift::i8086::locked` decides the form.
+    lock: bool,
 }
 
 enum NecFetch {
@@ -207,6 +209,7 @@ fn fetch<const NEC: bool>(
     let mut segment = None;
     let mut repeat = None;
     let mut carry = false;
+    let mut lock = false;
     let mut prefixes = 0u32;
     let mut original = Vec::new();
     let mut suffix = Vec::new();
@@ -261,7 +264,8 @@ fn fetch<const NEC: bool>(
         if suffix.is_empty() && prefix(b[0]) {
             prefixes = prefixes.wrapping_add(1);
             match b[0] {
-                0xf0 => return Err(refusal(u64::from(ip), &original)),
+                // 8086 Family UM §2.5 pp. 2-17–18; NEC V20/V30 UM p. 12-173.
+                0xf0 => lock = true,
                 0xf2 | 0xf3 => repeat = Some(b[0]),
                 _ => segment = Some(b[0]),
             }
@@ -292,6 +296,7 @@ fn fetch<const NEC: bool>(
                         evidence: original,
                         nec: Some(form),
                         carry: false,
+                        lock,
                     });
                 }
             }
@@ -306,6 +311,9 @@ fn fetch<const NEC: bool>(
         // processor's length limit. Retain the last prefix in each class,
         // then decode the bounded opcode/operand suffix at its real end IP.
         let mut bytes = Vec::new();
+        if lock {
+            bytes.push(0xf0);
+        }
         bytes.extend(segment);
         bytes.extend(repeat);
         bytes.extend_from_slice(&suffix);
@@ -385,6 +393,7 @@ fn fetch<const NEC: bool>(
             evidence: original,
             nec: None,
             carry,
+            lock,
         });
     }
 }
@@ -428,6 +437,7 @@ pub(super) fn resolve(
                 evidence,
                 nec,
                 carry,
+                lock,
             } = match fetched {
                 Ok(value) => value,
                 Err(Exit::Interrupted) => return Err(Exit::Interrupted),
@@ -440,14 +450,17 @@ pub(super) fn resolve(
                 u16::try_from(u64::from(ip) + u64::from(len))
                     .map_err(|_| refusal(u64::from(ip), &bytes))?
             };
-            let lifted = match &nec {
+            let mut lifted = match &nec {
                 Some(form) => crate::lift::i8086::nec_form(
-                    form, &insn, &evidence, ip, len, next, profile, &mut tg,
+                    form, &insn, &evidence, ip, len, next, profile, lock, &mut tg,
                 ),
                 None => crate::lift::i8086::instruction(
                     &insn, &bytes, &evidence, ip, len, next, restart, profile, &mut tg,
                 ),
             };
+            if lock {
+                lifted = lifted.and_then(|ir| crate::lift::i8086::locked(ir, &insn));
+            }
             let mut part = match lifted {
                 Ok(ir) => ir,
                 Err(_) if combined.is_some() => break,
