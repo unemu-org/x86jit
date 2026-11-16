@@ -37,6 +37,9 @@ static ALLOCATOR: ClassifierAllocator = ClassifierAllocator;
 #[path = "../../x86jit-cranelift/src/unwind_test_signal.rs"]
 mod signal;
 use signal::*;
+#[path = "support/canonical_mmap.rs"]
+mod canonical_mmap;
+use canonical_mmap::map_below_canonical_top;
 
 static COMPILER_FP: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -1058,15 +1061,7 @@ fn raw_host_fault_from_identity_mapped_rwx_ram() {
                 unsafe {
                     let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
                     let len = page * 2;
-                    let ptr = libc::mmap(
-                        std::ptr::null_mut(),
-                        len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANON,
-                        -1,
-                        0,
-                    );
-                    assert_ne!(ptr, libc::MAP_FAILED);
+                    let ptr = map_below_canonical_top(len, libc::PROT_READ | libc::PROT_WRITE);
                     let base = ptr as u64;
                     let data = base + page as u64;
                     let mut vm = Vm::with_backend_host_ram(
@@ -1147,15 +1142,7 @@ fn identity_mapped_helpers_keep_raw_fault_in_all_tiers() {
             let status = child(|| unsafe {
                 let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
                 let len = page * 3;
-                let ptr = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                );
-                assert_ne!(ptr, libc::MAP_FAILED);
+                let ptr = map_below_canonical_top(len, libc::PROT_READ | libc::PROT_WRITE);
                 let base = ptr as u64;
                 let data = base + page as u64;
                 let backend: Box<dyn Backend> = match tier {
@@ -1372,15 +1359,7 @@ fn split_store_case(
     unsafe {
         let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
         let len = page * 4;
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(ptr, libc::MAP_FAILED);
+        let ptr = map_below_canonical_top(len, libc::PROT_READ | libc::PROT_WRITE);
         let base = ptr as u64;
         let boundary = base + (page * 2 - shift) as u64;
         let backend: Box<dyn Backend> = match tier {

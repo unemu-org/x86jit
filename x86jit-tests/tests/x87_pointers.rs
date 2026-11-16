@@ -712,25 +712,36 @@ tiers!(
     native_save_policy
 );
 
-// AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE/FXRSTOR: error pointers are
-// saved/restored only with ES=1. Ryzen 7 7840HS (Zen 4) measured FOP/FIP/FDP
-// as zero with ES=0, including after FXRSTOR of nonzero edited fields.
-// Exclude those native fields on AMD only; engine witnesses remain unconditional
-// (SDM Vol 1 §§8.1.8–8.1.9; Vol 2A §3.3 FXSAVE).
+// AMD64 APM Vol 2 §11.4.4.3 p. 354; Vol 5 FXSAVE p. 26 and FXRSTOR p. 25: error
+// pointers are saved/restored only with ES=1. Ryzen 7 7840HS (Zen 4) measured
+// FOP/FIP/FDP as zero with ES=0, including after FXRSTOR of nonzero edited fields.
+// Intel documents two more host differences (SDM Vol 1 §8.1.8 p. 8-9): with
+// CPUID.(EAX=07H,ECX=0):EBX[6] = 1 only an unmasked exception updates FDP, and with
+// EBX[13] = 1 FCS and FDS are saved as 0000H. A native witness compares a pointer
+// field only where `native::host_x87_pointers` measured that this host stores it, and
+// prints why it skipped one. Engine witnesses remain unconditional (SDM Vol 1
+// §§8.1.8–8.1.9; Vol 2A §3.3 FXSAVE).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn x87_pointer_native_instruction_witness() {
+    use x86jit_tests::native::{host_x87_pointers, HostX87Pointers};
+    let host = host_x87_pointers();
     let (code, ip, nop_ip) = instruction_code();
     let native = native_output(code, instruction_data().to_vec());
     // Register-form FDP is undefined (SDM Vol 1 §8.1.8), so only compare FIP.
     // Report the actual image if a vendor's pointer-saving policy differs.
     for (base, expected) in [(0, ip), (512, ip), (1024, nop_ip), (1536, 0)] {
-        if !host_is_amd() || base == 1536 {
+        if host.fxsave_pointers_without_es || base == 1536 {
             assert_eq!(
                 u64_at(&native, base + 8),
                 expected,
                 "native environment={:02x?}",
                 &native[base + 6..base + 24]
+            );
+        } else {
+            eprintln!(
+                "FXSAVE64 image at +{base}: FIP not compared: {}",
+                HostX87Pointers::NO_FXSAVE_POINTERS
             );
         }
     }
@@ -739,6 +750,8 @@ fn x87_pointer_native_instruction_witness() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn x87_pointer_native_edited_image_witness() {
+    use x86jit_tests::native::{host_x87_pointers, HostX87Pointers};
+    let host = host_x87_pointers();
     let mut a = CodeAssembler::new(64).unwrap();
     fx(&mut a, true, true, DATA);
     fx(&mut a, false, true, OUT);
@@ -747,10 +760,38 @@ fn x87_pointer_native_edited_image_witness() {
     let native = native_output(a.assemble(CODE).unwrap(), initial.to_vec());
     assert_eq!(&native[..6], &initial[..6]);
     assert_eq!(&native[24..28], &initial[24..28]);
-    if !host_is_amd() {
+    if !host.fxsave_pointers_without_es {
         // ES=0: see the measured AMD divergence above the instruction witness.
-        assert_eq!(&native[6..24], &initial[6..24]);
+        eprintln!(
+            "FXSAVE64 FOP/FIP/FDP not compared: {}",
+            HostX87Pointers::NO_FXSAVE_POINTERS
+        );
+        return;
     }
+    assert_eq!(&native[6..8], &initial[6..8], "FOP");
+    assert_eq!(&native[16..24], &initial[16..24], "FDP");
+    // SDM Vol 3A §4.5.3 p. 4-6: a load of FIP ignores the image bits beyond the
+    // maximum linear-address width and sign-extends the top kept bit, so FIP is CPU
+    // canonical: 48-bit with 4-level paging only, 57-bit with 5-level paging (Vol 3A
+    // §4.5 p. 4-4). CPUID.(EAX=07H,ECX=0):ECX[16] enumerates 5-level paging (Vol 1
+    // Table 21-20 p. 21-28). A hypervisor can hide that bit from its guest, so without
+    // it both widths are accepted. A GitHub-hosted runner measured 0x0034_5678_9abc_def0
+    // here, the 57-bit result. The engine's FXRSTOR keeps all 64 bits, which the
+    // engine-side image witnesses above still expect.
+    let fip = u64_at(&initial, 8);
+    let canonical = |bits: u32| ((fip << (64 - bits)) as i64 >> (64 - bits)) as u64;
+    // SAFETY: CPUID exists on every x86-64 host; leaf 0 reports the highest basic leaf.
+    #[allow(unused_unsafe)] // CPUID intrinsics are unsafe on the workspace MSRV.
+    let la57 = unsafe {
+        std::arch::x86_64::__cpuid(0).eax >= 7
+            && std::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 16) != 0
+    };
+    let widths: &[u32] = if la57 { &[57] } else { &[48, 57] };
+    let saved = u64_at(&native, 8);
+    assert!(
+        widths.iter().any(|&bits| canonical(bits) == saved),
+        "native FIP {saved:#x} is not the image's {fip:#x} made canonical at {widths:?} bits"
+    );
 }
 
 fn fault_retains_environment(backend: Box<dyn Backend>) {
@@ -887,6 +928,8 @@ tiers!(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn x87_pointer_native_memory_and_exception_witness() {
+    use x86jit_tests::native::{host_x87_pointers, HostX87Pointers};
+    let host = host_x87_pointers();
     let mut a = CodeAssembler::new(64).unwrap();
     a.fld(qword_ptr(DATA)).unwrap();
     fx(&mut a, false, true, OUT);
@@ -901,15 +944,27 @@ fn x87_pointer_native_memory_and_exception_witness() {
     let mut data = 2f64.to_le_bytes().to_vec();
     data.extend_from_slice(&0x037bu16.to_le_bytes());
     let out = native_output(a.assemble(CODE).unwrap(), data);
-    if !host_is_amd() {
-        // ES=0: see the measured AMD divergence above the instruction witness.
+    // ES=0: see the host differences above the instruction witness.
+    if !host.fxsave_pointers_without_es {
+        eprintln!(
+            "FXSAVE64 FIP/FDP with ES=0 not compared: {}",
+            HostX87Pointers::NO_FXSAVE_POINTERS
+        );
+    } else {
         assert_eq!(
             u64_at(&out, 8),
             CODE,
             "native memory environment={:02x?}",
             &out[6..24]
         );
-        assert_eq!(u64_at(&out, 16), DATA);
+        if host.fdp_without_exception {
+            assert_eq!(u64_at(&out, 16), DATA);
+        } else {
+            eprintln!(
+                "FXSAVE64 FDP with ES=0 not compared: {}",
+                HostX87Pointers::NO_FDP_UPDATE
+            );
+        }
     }
     // APM Vol 2 §11.4.4.3; Vol 5 FXSAVE: ES=1 must save the error pointers
     // on AMD too. Keep this native witness even if a host returns zero pointers.

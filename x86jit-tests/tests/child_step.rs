@@ -17,6 +17,12 @@ use x86jit_cranelift::JitBackend;
     any(target_os = "linux", target_os = "macos"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
+#[path = "support/canonical_mmap.rs"]
+mod canonical_mmap;
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
 #[path = "../../x86jit-cranelift/src/unwind_test_fault_context.rs"]
 mod fault_context;
 
@@ -391,15 +397,10 @@ mod protected {
                     );
                     let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
                     let len = 4 * page;
-                    let ptr = libc::mmap(
-                        std::ptr::null_mut(),
+                    let ptr = super::canonical_mmap::map_below_canonical_top(
                         len,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANON,
-                        -1,
-                        0,
                     );
-                    assert_ne!(ptr, libc::MAP_FAILED);
                     let base = ptr as u64;
                     let ram = x86jit_core::HostRam {
                         ptr: ptr.cast(),

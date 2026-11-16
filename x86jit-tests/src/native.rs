@@ -509,6 +509,139 @@ pub fn run_native_fault_details(
     run_native_inner(input, Some(fault))
 }
 
+/// Which x87 pointer fields this host's save instructions store, measured on the
+/// host by [`host_x87_pointers`].
+///
+/// The engine records the pointers as the SDM describes. A native witness may compare
+/// a pointer field against the host only where the host stores it. Vendors and models
+/// differ here, and each manual documents its own behaviour:
+///
+/// - AMD FXSAVE stores FIP, FDP and FOP only while FSW.ES = 1 (AMD64 APM Vol 2
+///   §11.4.4.3 p. 354; Vol 5 FXSAVE p. 26). FNSTENV has no such condition (APM Vol 5
+///   FSTENV p. 306).
+/// - Where CPUID.(EAX=07H,ECX=0):EBX[6] = 1, only an x87 non-control instruction that
+///   incurs an unmasked exception updates FDP (SDM Vol 1 §8.1.8 p. 8-9).
+/// - Where CPUID.(EAX=07H,ECX=0):EBX[13] = 1, FCS and FDS are deprecated and saved
+///   as 0000H (SDM Vol 1 §8.1.8 p. 8-9).
+///
+/// The probe executes the instructions instead of reading those CPUID bits, because
+/// a hypervisor can report bits that differ from the silicon underneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostX87Pointers {
+    /// FXSAVE stores the pointer registers while FSW.ES = 0. False on AMD.
+    pub fxsave_pointers_without_es: bool,
+    /// An x87 memory operand that incurs no unmasked exception updates FDP. False
+    /// where CPUID.(EAX=07H,ECX=0):EBX[6] = 1.
+    pub fdp_without_exception: bool,
+    /// FNSTENV stores the FCS and FDS that FLDENV loaded. False where
+    /// CPUID.(EAX=07H,ECX=0):EBX[13] = 1, which saves both as 0000H.
+    pub selectors: bool,
+}
+
+impl HostX87Pointers {
+    /// Why a witness skips FXSAVE's FIP, FDP and FOP when the host does not store them.
+    pub const NO_FXSAVE_POINTERS: &'static str = "this host's FXSAVE stores no x87 pointers \
+        while FSW.ES = 0 (AMD64 APM Vol 2 §11.4.4.3 p. 354)";
+    /// Why a witness skips FDP when the host does not update it.
+    pub const NO_FDP_UPDATE: &'static str = "this host updates FDP only on an unmasked x87 \
+        exception (SDM Vol 1 §8.1.8 p. 8-9, CPUID.(EAX=07H,ECX=0):EBX[6])";
+    /// Why a witness skips FCS and FDS when the host deprecates them.
+    pub const DEPRECATED_SELECTORS: &'static str = "this host deprecates FCS and FDS and \
+        saves both as 0000H (SDM Vol 1 §8.1.8 p. 8-9, CPUID.(EAX=07H,ECX=0):EBX[13])";
+}
+
+/// Measure [`HostX87Pointers`] once per process and print what the host stored.
+///
+/// # Panics
+/// Panics if the probe cannot run natively. The caller is a native witness, which
+/// cannot run either.
+pub fn host_x87_pointers() -> HostX87Pointers {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<HostX87Pointers> = OnceLock::new();
+    *PROBE.get_or_init(probe_x87_pointers)
+}
+
+fn probe_x87_pointers() -> HostX87Pointers {
+    use crate::vector::MemKind;
+    const CODE: u64 = 0x21_0000;
+    const DATA: u64 = 0x22_0000;
+    // Offsets into the DATA page. FXSAVE64 needs a 16-byte-aligned operand.
+    const LOADED: usize = 0x40; // the FLDENV image
+    const FX: usize = 0x200; // FXSAVE64 after FLD m64
+    const ENV: usize = 0x400; // FNSTENV after FLD m64
+    const STORED: usize = 0x440; // FNSTENV after FLDENV
+    const FCS: u16 = 0x4567;
+    const FDS: u16 = 0x89ab;
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fld(qword_ptr(DATA)).unwrap();
+    a.fxsave64(ptr(DATA + FX as u64)).unwrap();
+    a.fnstenv(ptr(DATA + ENV as u64)).unwrap();
+    a.fldenv(ptr(DATA + LOADED as u64)).unwrap();
+    a.fnstenv(ptr(DATA + STORED as u64)).unwrap();
+    a.hlt().unwrap();
+    let mut data = vec![0u8; PAGE as usize];
+    data[..8].copy_from_slice(&2f64.to_le_bytes());
+    // SDM Vol 1 §8.1.10 Figure 8-9 p. 8-11: the 32-bit protected-mode image. Every
+    // register empty, all exceptions masked, live-looking selectors.
+    data[LOADED..LOADED + 2].copy_from_slice(&0x037fu16.to_le_bytes());
+    data[LOADED + 8..LOADED + 10].copy_from_slice(&0xffffu16.to_le_bytes());
+    data[LOADED + 16..LOADED + 18].copy_from_slice(&FCS.to_le_bytes());
+    data[LOADED + 24..LOADED + 26].copy_from_slice(&FDS.to_le_bytes());
+    let input = VectorInput {
+        cpu_init: CpuSnapshot::default(),
+        mem_init: vec![
+            MemChunk {
+                addr: CODE,
+                bytes: a.assemble(CODE).unwrap(),
+                kind: MemKind::Ram,
+            },
+            MemChunk {
+                addr: DATA,
+                bytes: data,
+                kind: MemKind::Ram,
+            },
+        ],
+        entry: CODE,
+        run: RunSpec::UntilExit,
+    };
+    let u16_at = |m: &[u8], at: usize| u16::from_le_bytes(m[at..at + 2].try_into().unwrap());
+    let u32_at = |m: &[u8], at: usize| u32::from_le_bytes(m[at..at + 4].try_into().unwrap());
+    let u64_at = |m: &[u8], at: usize| u64::from_le_bytes(m[at..at + 8].try_into().unwrap());
+    let mut host = HostX87Pointers {
+        fxsave_pointers_without_es: false,
+        fdp_without_exception: false,
+        selectors: false,
+    };
+    let mut seen = Vec::new();
+    // A context switch between the FLD and a save can drop the pointers on AMD, whose
+    // XSAVE omits them without a pending #MF (APM Vol 2 §11.5.10 p. 359). A switch
+    // can lose a pointer but never invent one, so one run that stores a field shows
+    // that the host stores it.
+    for _ in 0..8 {
+        let out = run_native(&input).expect("the native x87 pointer probe must run");
+        assert_eq!(out.exit, ExitKind::Hlt, "native x87 pointer probe");
+        let m = &out.mem[1].bytes;
+        // SDM Vol 2A FXSAVE Table 3-48 p. 3-416: FIP at bytes 15:8 of FXSAVE64.
+        host.fxsave_pointers_without_es |= u64_at(m, FX + 8) == CODE;
+        host.fdp_without_exception |= u32_at(m, ENV + 20) == DATA as u32;
+        host.selectors |= (u16_at(m, STORED + 16), u16_at(m, STORED + 24)) == (FCS, FDS);
+        seen.push((
+            u64_at(m, FX + 8),
+            u32_at(m, ENV + 20),
+            u16_at(m, STORED + 16),
+            u16_at(m, STORED + 24),
+        ));
+        if host.fxsave_pointers_without_es && host.fdp_without_exception && host.selectors {
+            break;
+        }
+    }
+    eprintln!(
+        "native x87 pointer probe: {host:?}; per run (FXSAVE64 FIP, FNSTENV FDP, FCS, FDS) = \
+         {seen:x?}; expected FIP {CODE:#x}, FDP {DATA:#x}, FCS {FCS:#x}, FDS {FDS:#x}"
+    );
+    host
+}
+
 fn run_native_inner(
     input: &VectorInput,
     fault: Option<NativeFault>,

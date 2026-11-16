@@ -153,6 +153,13 @@ pub struct HostRam {
     /// guest_base == 0`, i.e. the numeric host base is 0, so `*(guest_addr as *const u8)`
     /// from the embedder reads the same byte the guest sees. The subtraction is done in
     /// integers (never as a null-adjacent raw pointer, which would be UB).
+    ///
+    /// An identity mapping makes the host span the guest span, so the embedder must
+    /// place the whole mapping below `1 << 47`, the top of the lower canonical half
+    /// (SDM Vol 1 §3.3.7.1 p. 3-10). [`Memory::from_host_ram`] rejects a higher span
+    /// with [`HostRamError::NonCanonicalSpan`]. `mmap(NULL, …)` does not place a
+    /// mapping there on every host; aarch64 Linux places it above `1 << 47`. Request a
+    /// low address explicitly (on Linux, a hint with `MAP_FIXED_NOREPLACE`).
     pub guest_base: u64,
     pub dtor: Box<dyn FnMut(*mut u8, usize) + Send>,
     /// Optional guard-page hook: `protect(page_ptr, len, accessible)` flips a

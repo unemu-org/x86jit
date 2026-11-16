@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use iced_x86::code_asm::*;
 use x86jit_core::{Exit, InterpreterBackend, Prot, Reg, Vm, VmConfig, X87PointerModel};
 use x86jit_tests::compare::compare;
-use x86jit_tests::native::run_native;
+use x86jit_tests::native::{host_x87_pointers, run_native, HostX87Pointers};
 use x86jit_tests::oracle::{run_with_backend, VectorInput};
 use x86jit_tests::vector::{CpuSnapshot, MemChunk, MemKind, RunSpec};
 
@@ -295,23 +295,45 @@ fn an_environment_image_round_trips_through_fldenv_and_fnstenv() {
         entry: CODE,
         run: RunSpec::UntilExit,
     };
-    let native = run_native(&input).expect("host runs fldenv/fnstenv");
-    let interp = run_with_backend(&input, Box::new(InterpreterBackend));
-    assert!(
-        compare(&native, &interp, &[]).is_none(),
-        "interp diverges from the real CPU on an environment round trip:\n{:#?}",
-        compare(&native, &interp, &[])
-    );
-
+    let mut native = run_native(&input).expect("host runs fldenv/fnstenv");
+    let mut interp = run_with_backend(&input, Box::new(InterpreterBackend));
     let stored = |o: &x86jit_tests::oracle::RunOutcome| {
         let c = o.mem.iter().find(|c| c.addr == SCRATCH).unwrap();
         let mut r = [0u8; 28];
         r.copy_from_slice(&c.bytes[32..60]);
         r
     };
-    let hw = stored(&native);
     let ours = stored(&interp);
-    assert_eq!(hw, ours, "the whole image, byte for byte");
+    if !host_x87_pointers().selectors {
+        // SDM Vol 1 §8.1.8 p. 8-9: a host that deprecates FCS and FDS stores 0000H for
+        // both. Check that, then leave the two selectors out of the comparison below.
+        // The engine's selectors are still asserted against the loaded image at the end.
+        let hw = stored(&native);
+        assert_eq!(
+            [hw[16], hw[17], hw[24], hw[25]],
+            [0; 4],
+            "deprecated FCS and FDS"
+        );
+        eprintln!(
+            "FNSTENV FCS/FDS not compared: {}",
+            HostX87Pointers::DEPRECATED_SELECTORS
+        );
+        for outcome in [&mut native, &mut interp] {
+            let c = outcome.mem.iter_mut().find(|c| c.addr == SCRATCH).unwrap();
+            c.bytes[32 + 16..32 + 18].fill(0);
+            c.bytes[32 + 24..32 + 26].fill(0);
+        }
+    }
+    assert!(
+        compare(&native, &interp, &[]).is_none(),
+        "interp diverges from the real CPU on an environment round trip:\n{:#?}",
+        compare(&native, &interp, &[])
+    );
+    assert_eq!(
+        stored(&native),
+        stored(&interp),
+        "the whole image, byte for byte"
+    );
 
     // And it is the image we loaded, not a reset one.
     assert_eq!(&ours[0..2], &env[0..2], "control word");
@@ -382,6 +404,19 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
     };
     let native = run_native(&input).expect("host runs fxsave/fxrstor");
     let interp = run_with_backend(&input, Box::new(InterpreterBackend));
+    let host = host_x87_pointers();
+    if !host.fxsave_pointers_without_es {
+        eprintln!(
+            "FXSAVE and FNSTENV pointer fields not compared: {}",
+            HostX87Pointers::NO_FXSAVE_POINTERS
+        );
+    }
+    if !host.selectors {
+        eprintln!(
+            "FXSAVE and FNSTENV FCS/FDS not compared: {}",
+            HostX87Pointers::DEPRECATED_SELECTORS
+        );
+    }
 
     let page = |o: &x86jit_tests::oracle::RunOutcome, policy: X87PointerModel| {
         let mut b = o
@@ -398,18 +433,25 @@ fn fxsave_and_fxrstor_carry_the_empty_tags() {
         // both sides so the rest of the image is compared byte for byte rather than not
         // compared at all.
         b[128 + 28..128 + 32].fill(0);
-        if host_is_amd() && policy == X87PointerModel::Sdm {
-            // AMD64 APM Vol 2 §11.4.4.3; Vol 5 FXSAVE/FXRSTOR: with ES=0,
-            // error pointers need not be saved/restored. Ryzen 7 7840HS (Zen 4)
-            // measured zero FOP/FIP/FDP in FXSAVE. After FNINIT and FXRSTOR
-            // of that zero image, FNSTENV also saves zero pointers; FNSTENV
-            // itself saves unconditionally (APM Vol 5 FSTENV/FNSTENV).
-            // Mask only these fields and their selectors in the native comparison;
-            // retain reserved bytes (SDM Vol 2A §3.3 FXSAVE, Table 3-49;
-            // Vol 1 §8.1.8). The engine's unmasked image is asserted below.
+        if !host.fxsave_pointers_without_es && policy == X87PointerModel::Sdm {
+            // AMD64 APM Vol 2 §11.4.4.3 p. 354; Vol 5 FXSAVE p. 26 and FXRSTOR
+            // p. 25: with ES=0, error pointers need not be saved/restored.
+            // Ryzen 7 7840HS (Zen 4) measured zero FOP/FIP/FDP in FXSAVE. After
+            // FNINIT and FXRSTOR of that zero image, FNSTENV also saves zero
+            // pointers; FNSTENV itself saves unconditionally (APM Vol 5 FSTENV
+            // p. 306). Mask only these fields and their selectors in the native
+            // comparison; retain reserved bytes (SDM Vol 2A §3.3 FXSAVE, Table
+            // 3-49; Vol 1 §8.1.8). The engine's unmasked image is asserted below.
             b[128 + 6..128 + 14].fill(0); // FOP, FIP, FCS
             b[128 + 16..128 + 22].fill(0); // FDP, FDS
             b[64 + 12..64 + 26].fill(0); // FNSTENV FIP, FCS, FOP, FDP, FDS
+        }
+        if !host.selectors && policy == X87PointerModel::Sdm {
+            // SDM Vol 1 §8.1.8 p. 8-9: deprecated FCS and FDS are saved as 0000H.
+            b[128 + 12..128 + 14].fill(0); // FXSAVE FCS
+            b[128 + 20..128 + 22].fill(0); // FXSAVE FDS
+            b[64 + 16..64 + 18].fill(0); // FNSTENV FCS
+            b[64 + 24..64 + 26].fill(0); // FNSTENV FDS
         }
         b
     };

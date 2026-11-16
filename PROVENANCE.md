@@ -101,6 +101,26 @@ than argued:
 Where an oracle disagrees, the SDM settles it, and the divergence is written down with the
 measured bytes — never quietly excluded.
 
+**The host CPU's x87 pointer fields depend on the host, and the manuals say so.** A native
+witness compares FIP, FDP, FOP, FCS or FDS only where `native::host_x87_pointers` measured
+that the host stores the field, and prints why it skipped one. Measured so far:
+
+- AMD Zen 4 (Ryzen 7 7840HS): FXSAVE with FSW.ES = 0 stores zero FOP, FIP and FDP (APM
+  Vol 2 §11.4.4.3 p. 354; Vol 5 FXSAVE p. 26). FNSTENV stores them regardless of ES
+  (Vol 5 FSTENV p. 306).
+- An Intel GitHub-hosted x86-64 runner: after `fld qword [0x220000]`, FXSAVE64 stored
+  FDP = 0, because that CPU updates FDP only on an unmasked x87 exception (SDM Vol 1
+  §8.1.8 p. 8-9, CPUID.(EAX=07H,ECX=0):EBX[6]). FNSTENV after an FLDENV of FCS = 0x4567
+  and FDS = 0x89AB stored 0x0000 for both: the selectors are deprecated (same section,
+  EBX[13]).
+- The same runner, given FIP = 0x1234_5678_9abc_def0 by FXRSTOR64, saved
+  0x0034_5678_9abc_def0 with FXSAVE64. A load of FIP keeps only the bits within the
+  maximum linear-address width, here 57, and sign-extends the top one (SDM Vol 3A §4.5.3
+  p. 4-6). That is not a vendor difference: the section applies to every Intel processor.
+  The engine's FXRSTOR keeps all 64 bits, so on this point the engine diverges from the
+  SDM. The native witness checks the SDM's value. The engine-side witnesses still check
+  the engine's value.
+
 ## 3. What we do not model, and say so
 
 Refusing to lift is a design position, not an omission, when the alternative is a

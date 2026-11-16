@@ -1379,7 +1379,9 @@ impl Vm {
     /// embedder-provided host mapping (a `MAP_NORESERVE` span the core can't allocate
     /// itself). `config.memory_model` should be `Reserved { span: ram.len }`.
     /// The host pointer must equal `ram.guest_base` modulo 16. Returns an error
-    /// for misaligned backing or a backing that cannot contain the guest extent.
+    /// for misaligned backing, a backing that cannot contain the guest extent, or a
+    /// span above `1 << 47`. An identity mapping therefore needs a host mapping below
+    /// `1 << 47` (see [`HostRam::guest_base`](crate::memory::HostRam::guest_base)).
     pub fn with_backend_host_ram(
         config: VmConfig,
         backend: Box<dyn Backend>,
