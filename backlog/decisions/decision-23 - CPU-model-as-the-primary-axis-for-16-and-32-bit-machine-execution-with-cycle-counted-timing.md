@@ -832,6 +832,42 @@ The base is bimodal per process in those cells, with two values about 0.55 % apa
 candidate is within −0.06 % of its upper value. The maintainer accepted these four cells as
 measurement noise and closed xj-ir6.31. The gate itself is unchanged.
 
+**Amendment (locked operands on MMIO, 2026-11-15, accepted by the maintainer).** On the Real16
+alias and on every Machine model (I8088, I8086, NecV20, NecV30, I80286, I80386), a locked or
+implicitly locked operand in a Trap region performs one MmioRead and then one MmioWrite, as the
+bus does:
+- XCHG, XADD and CMPXCHG with memory are covered, and so are the LOCK forms;
+- LOCK# is not modelled;
+- the CPU stays stopped across both exits, so ordering against devices and DMA is the embedder's;
+- on RAM, a locked operand keeps the atomic path.
+
+The alias is otherwise frozen (§6); this is the one change to it. Long64 and Compat32 keep
+`Exit::UnknownInstruction` for these forms, and their generated code is unchanged.
+
+Two cases are follow-ups:
+- an operand that lies partly in RAM and partly in a device region keeps `UnknownInstruction`
+  (xj-ir6.34);
+- the twenty-bit models move device data a byte at a time, which matches the 8-bit bus of the
+  8088 and V20 but not the 16-bit bus of the 8086 and V30 (xj-50w.20).
+
+**Amendment (gate on bimodal cells, 2026-11-16, accepted by the maintainer).** Some real16_loops
+cells are bimodal per process: each process settles on one of two values, about 0.5–0.6 % apart,
+on the base and on the candidate alike. The twenty-bit and alias SMC workloads are the known
+cases. On those cells, the median of processes measures which mode the processes landed in more
+than it measures the change. Changes that do not touch those paths have repeatedly missed the
+gate on such cells: C4a, the 80286 quirks, the xj-ir6.31 rebase round.
+
+From now on, a cell is **bimodal** when either side's per-process values form two clusters
+separated by more than the gate. On a bimodal cell:
+- the gate compares like modes, the candidate's median within each mode against the base's
+  median in the same mode;
+- every mode present on both sides must be within +0.5 %;
+- the median of processes is still reported, as advisory;
+- a mode present on one side only is reported, and does not fail the gate on its own;
+- at least 7 processes per side are measured.
+
+A unimodal cell keeps the median of processes, and the +0.5 % gate is unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
