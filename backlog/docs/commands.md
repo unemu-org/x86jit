@@ -204,6 +204,52 @@ git add bench/baseline.json backlog/docs/performance.md bench/history/
 The gate skips when there's no baseline (fresh clone) or the host differs (timings aren't comparable
 across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ vs the prior baseline.
 
+## Test scope
+
+`scripts/test-scope.sh` chooses the smallest local command set that covers a branch's
+changes. It is meant for workers' inner loops and for the local gate before work is handed
+back. It does not replace CI: GitHub still runs the full gate on every push.
+
+```sh
+bash scripts/test-scope.sh origin/main            # classify the changes, print the commands
+bash scripts/test-scope.sh --run origin/main      # run them; keeps going, exits 1 on any failure
+bash scripts/test-scope.sh --classify <path>...   # the class of each path
+bash scripts/test-scope.sh --plan legacy-only     # one scope's commands, without a diff
+```
+
+The changed paths are those that differ between the working tree and the merge base with
+the base ref (the commits of `git diff <base>...HEAD` plus staged and unstaged edits),
+together with untracked files. A rename counts at its old path and at its new one. Each
+path is docs, legacy or shared, and the widest class present selects exactly one scope:
+
+| Scope | Selected when | Runs |
+| ----- | ------------- | ---- |
+| docs-only | every path is docs: under `backlog/` (except `backlog/docs/compat/`), a `*.md` or `*.txt` outside the crate, `scripts`, `vendor` and dot-config directories, or the `oracles` submodule. An empty diff runs nothing. | `cargo fmt --check`, the guest-agnostic guard and pre-commit on the changed files; no build |
+| legacy-only | every path is legacy or docs | fmt, the guard, clippy with `-D warnings`, `test_legacy_scope.py`, every test binary that selects Real16 or a CPU model (all `legacy_*` and `real16_*`, `ss286`, `cf16`, `compat` and others), the shared checks `boundary`, `environment_boundary`, `run_steps`, `irq_shadow`, `retired_count`, `smc`, `cross_region_*` and `application_codegen`, the `x86jit-core` and `x86jit-tests` unit tests, and `cargo check --workspace --tests` for both Linux targets |
+| shared | any other path | the full gate: every `scripts/ci-gate.sh` step that CI runs on either lane, both Linux cross-checks, the FreeBSD checks unless `XJ_DEVSHELL=no-freebsd`, and the gate-script tests |
+
+The legacy paths are `interp/legacy.rs`, `interp/i8086.rs`, `lift/legacy.rs`,
+`lift/i8086.rs`, `vm/nec.rs`, `vm/i8086.rs` and `model.rs` under `x86jit-core/src/`, with
+their submodules; `ir/verify/legacy_probes.rs`; `x86jit-tests/tests/legacy_*`; the two
+support files that only legacy tests include; and `backlog/docs/compat/`, the ISA map that
+the `compat` test checks. `x86jit-core/src/legacy.rs` and `vm/legacy.rs` are shared: every
+vCPU uses the types the first defines, and the second holds `run_dispatch`, which is also
+the Long64 and Compat32 dispatch loop. The call-graph evidence is in the script.
+
+`scripts/tests/test_legacy_scope.py` keeps the legacy-only scope sound, and CI runs it in
+the gate-script step. It fails when shared engine code gains a reference into a legacy
+module, when `alias_context` (the one legacy function that application dispatch calls)
+changes, when a legacy file implements a shared type or contains a doctest, and when a test
+that selects Real16 or a CPU model is missing from the legacy-only set. If a new reference
+is reached only from Real16 or a Machine profile, record it with its reason in the test's
+`REVIEWED_ENTRY_POINTS`; otherwise remove that module from `legacy_paths` in the script.
+`scripts/tests/test_test_scope.py` checks the classifier itself on throwaway repositories.
+
+```sh
+python3 -B -m unittest discover -s scripts/tests -p test_legacy_scope.py -v
+python3 -B -m unittest discover -s scripts/tests -p test_test_scope.py -v
+```
+
 ## Git remote and CI
 
 `origin` is the public GitHub repository, <https://github.com/unemu-org/x86jit>
@@ -274,6 +320,7 @@ bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu    # on aarch64
 bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
 bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
 python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v  # no builds/downloads
+python3 -B -m unittest discover -s scripts/tests -p test_legacy_scope.py -v   # § Test scope
 nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
 ```
 

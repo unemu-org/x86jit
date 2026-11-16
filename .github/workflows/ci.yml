@@ -56,8 +56,11 @@ jobs:
           # The gates use in-code witness values, not the manual PDFs or tables.
           submodules: false
 
+      # Includes test_legacy_scope.py, which keeps the legacy-only scope of
+      # scripts/test-scope.sh sound, and the scope classifier's own tests.
       - name: Gate script tests
-        run: python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v
+        run: |
+          python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
