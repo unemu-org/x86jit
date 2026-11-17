@@ -91,7 +91,8 @@ code_dirs=(x86jit-* scripts vendor .github .cargo .config)
 legacy_test_prefixes=(legacy_ real16_ cross_region_)
 legacy_tests=(
     application_codegen boundary cf16 compat coverage_ratchet cpuid
-    environment_boundary evex_modifiers fault_metadata fences flags_at_exit gathers
+    environment_boundary evex_modifiers exit_request exit_request_signal fault_metadata
+    fences flags_at_exit gathers
     irq_shadow machine_empty_fpu mmio_rmw mmx port_string retired_count run_steps
     same_block_smc smc ss286 string_mmio time_stats vcpu_reset x87_pointers
 )

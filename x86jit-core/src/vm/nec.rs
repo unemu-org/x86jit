@@ -78,7 +78,7 @@ impl Vcpu {
         // The 8080 EI and DI act on IE (ASSUMED, contract draft S4).
         self.cpu.flags.if_ = view.interrupt_enable;
         self.sti_shadow = view.ei_delay;
-        self.ss_shadow = false;
+        self.ss_shadow = 0;
         if view.halted {
             self.cpu.legacy.reserved |= NEC_STANDBY;
         } else {
@@ -232,7 +232,7 @@ impl Vcpu {
         self.retired += 1;
         self.executed += 1;
         self.sti_shadow = false;
-        self.ss_shadow = false;
+        self.ss_shadow = 0;
         if self.cpu.mmio_retry_active {
             self.cpu.finish_mmio_retry(None);
         }

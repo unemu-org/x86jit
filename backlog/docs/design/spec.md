@@ -2341,9 +2341,11 @@ or an interrupt taken in 8080 mode is in flight). `how` is:
   until the next hand-back (or an interrupt taken there), every call at that
   PS:PC returns `UnknownInstruction` with the byte.
 A boundary with MD = 0 and BRK = 1 is refused (`NecEmulationSingleStep`). The
-embedder must not inject INT while NMI or HOLD is asserted (§6 p. 6-2); the
-engine has no NMI input. The 8080 core's stop test ORs in
-`ExitRequest::is_requested`, a non-consuming, async-signal-safe load. A host
+embedder must not inject INT while NMI or HOLD is asserted (§6 p. 6-2). A
+latched NMI is taken at an MD = 0 boundary before any of the above (see "NMI
+input" below). The 8080 core's stop test ORs in
+`ExitRequest::is_requested` and `NmiLine::is_raised`, non-consuming,
+async-signal-safe loads. A host
 request made while the core runs therefore stops it; the request stays pending,
 and the next call reports it as `Interrupted` before any delivery. Writes by the 8080 core use
 `Vm::write_bytes`, which invalidates overlapping translations. A V20/V30 reset
@@ -2354,9 +2356,97 @@ yet, and the manual gives no 8080-mode clocks. UM §8 p. 8-1 names the
 uPD8080AF instruction set without listing it; that it behaves as the Intel
 8080A is an ASSUMPTION of the 8080 core (S16 of the contract draft), not of
 this engine. The witness binary is
-`legacy_nec_v20`, which also runs eleven of the sibling 8080-family project's
-fourteen contract vectors on the native side (the three NMI cases need an NMI
-input).
+`legacy_nec_v20`, which also runs all fifteen of the sibling 8080-family
+project's contract vectors on the native side, the three NMI cases included.
+
+#### NMI input (xj-50w.19)
+
+Every Machine model has an NMI input. `Vcpu::raise_nmi` (between runs) and
+`NmiLine::raise` (from any thread, or from a signal handler on a handle obtained
+beforehand) latch one rising edge; edges coalesce until one is accepted. The
+latch is bit 33 (`NMI_EDGE`) of the vCPU's dispatch word, set with one lock-free
+`fetch_or(Release)` like `ExitRequest::request_exit`; cloning or dropping a
+handle is not async-signal-safe. An Application vCPU refuses with
+`NmiUnsupported` and `nmi_line()` is `None`: its compiled code exits on any bit
+of that word. There is no exit for an NMI, which has no acknowledge cycle
+(8086 UM §2.6 p. 2-24; NEC UM p. 2-3, p. 6-2; 286 PRM §9.2 p. 9-3). A running
+vCPU observes the edge at its next instruction or REP-iteration boundary.
+`NmiLine::is_raised` is the raw latch; `Vcpu::has_pending_nmi` is the model's
+view (false on an I80386 inside its NMI handler); `Vcpu::nmi_ready` says whether
+a latched NMI would be accepted at this boundary, whatever IF and the STI/EI
+shadow: not while blocked (I80286, I80386), after a segment load or store that
+holds NMI (see the table), with an IN, INS or MMIO completion (answered or not) or
+a task-switch continuation outstanding, or at an NEC 8080-mode boundary with
+BRK = 1. Shutdown does not prevent it. HLT returns `Exit::Hlt` as before; the
+embedder wakes on `has_pending_nmi() && nmi_ready()`. `irq_ready` is false
+while that holds: NMI has priority and INT is not accepted (NEC UM p. 2-2;
+8086 UM p. 2-24; 286 PRM p. 9-3). `inject_irq(2)` stays an ordinary maskable
+vector (SDM Vol 3A §7.7.1 p. 7-6).
+
+Acceptance is the consuming `fetch_and` of the latch after the model's
+predicate holds, so no edge is lost or taken twice; delivery costs no step.
+Boundary order (decision-16 §2 extended): budget; host request when no
+completion is pending (the latch is kept); the service steps; an owned
+continuation; in shutdown, only a latched NMI may proceed, otherwise
+`Exit::Shutdown`; at an NEC 8080-mode boundary with BRK = 1 and an NMI latched,
+`NecEmulationSingleStep` with the latch kept; the NMI; a queued eligible IRQ;
+the readiness stop; the 8080-mode exit; the next unit. After any delivery the
+order runs again before the handler's first instruction, so an NMI is taken
+on top of a just-delivered frame, and an IRQ on top of an NMI entered through a
+trap gate or a task whose image has IF = 1 (286 PRM §9.6 p. 9-9). A post-
+instruction single-step trap is delivered from the unit's epilogue: on the
+80286/80386 the NMI is taken before the step handler's first instruction; on
+the 8086 family the NMI test runs inside that delivery (below).
+
+An accepted NMI owns its delivery through bus handoffs, like an accepted IRQ.
+A fault during delivery is delivered serially: NMI is benign (286 PRM §9.6.2
+p. 9-10; 386 PRM Table 9-3 p. 9-13), the NMI is lost and blocking stays until
+the exception handler's IRET (SDM Vol 3A §7.7.2 p. 7-6). An accepted NMI that
+never enters the guest leaves no blocking: a real-address Outward delivery
+fault, a nonresumable refusal and a continuation released because CS:IP moved
+latch the edge again; a protected Outward delivery fault and an abandoned
+(edited-state) continuation consume it. When an NMI's delivery faulted, the
+exception delivered serially carries its blocking: if that delivery is released,
+abandoned or refused in the same ways, blocking ends and the NMI stays lost.
+An NMI taken out of shutdown and latched again also restores the shutdown.
+`reset_execution_state` clears the latch, the hold and blocking (that reset
+ends blocking is ASSUMED). The blocking state, the hold and the latch live
+outside `CpuState`, `jit_abi` and the retained-context stamp; no getter exposes
+them yet.
+
+| Rule | I8088/I8086 | NecV20/NecV30 | I80286 | I80386 |
+|---|---|---|---|---|
+| Vector, frame | 2 through IVT 008H; FLAGS (15:12 set), CS, next IP; IF, TF cleared (UM p. 2-24, Fig. 2-30 p. 2-25, p. 2-26) | 2 through 008H; PSW (MD = 0 in 8080 mode), PS, PC; IE, BRK cleared, MD set, standby ended (UM Table 6-1, p. 6-1, p. 8-4, p. 9-1) | 2; real mode through the IVT (§5.2.2 p. 5-5); protected through IDT entry 2 as an external event: CPL and gate DPL unchecked, EXT on delivery faults, no error code (§9.4 p. 9-4, Table 9-3 p. 9-9) | as the 80286 with 386 gates (Table 9-1 p. 9-2; SDM Table 7-1 p. 7-2) |
+| IF/IE | not masked (p. 2-24; CLI p. 2-48) | not masked (p. 2-3; DI p. 12-172) | not masked (§3.11.2 p. 3-28) | not masked (§4.1 p. 4-1) |
+| NMI and INTR | NMI first (p. 2-24) | NMI first (p. 2-2) | NMI first (Table 5-1 p. 5-4) | NMI first (Table 9-2 p. 9-4) |
+| NMI and the step trap | NMI frame, then the step frame: the step routine returns into the unstepped handler (p. 2-28; AP-67 Fig. 3E3a p. A-29). After INT n, INT 3, a taken INTO or a fault with TF: that frame, then the NMI frame, no step frame (AP-67 p. A-28, Fig. 3E3b p. A-29) | refused, `NecStepWithNmi`, with the trap and the latch kept: Table 6-1 gives priorities, not the sequence | step frame, then the NMI before the step handler (§9.7.1 p. 9-14) | as the 80286 (§12.3.1.4 p. 12-8) |
+| NMI during NMI service | nested (p. 2-26; App. B p. B-6); the engine's acceptance is "the start of the NMI procedure" (ASSUMED) | nested, ASSUMED (the manual is silent) | blocked until the next IRET, one edge remembered and serviced after it (§9.2 p. 9-3) | blocked until the next IRET, edges ignored (§9.2.1 p. 9-3) |
+| What ends blocking | — | — | any IRET: a nested handler's, a task return; a faulting IRET (ASSUMED); not a refused IRET or a bus handoff before completion | the next IRET; a faulting IRET (SDM §7.7.2 p. 7-6); not a refused IRET |
+| Holds | MOV/POP of any segment register, each load (p. 2-24 footnote; held for NMI as for INTR, a choice against App. B p. B-6 and AP-67 p. A-27, which states the rule in its maskable-interrupt section) | segment loads and MOV reg16/mem16, sreg, each (p. 6-4; pp. 12-7, 12-8, 12-151); EI holds INT only (p. 12-172) | MOV SS and POP SS, each load (App. B pp. B-73, B-83); STI holds nothing for NMI (ASSUMED) | MOV SS and POP SS, each load (§9.2.4 pp. 9-3–4); not LSS (SDM §7.8.3 p. 7-9); STI holds nothing for NMI (ASSUMED) |
+| HLT | wakes; saved IP after HLT (p. 2-48, p. 2-26) | wakes in both modes (p. 12-171, p. 9-1) | wakes unless blocked (App. B p. B-42) | wakes unless blocked (p. 17-60) |
+| Inside REP | between elements; the last prefix (p. 2-42; App. B p. B-6) | between primitives; up to three prefixes (p. 6-4) | between repetitions (§3.7.2 p. 3-22) | between repetitions (§9.2 p. 9-2) |
+| Shutdown | — | — | NMI ends it (§9.6.2 p. 9-10, §11.6 p. 11-7) | NMI ends it (SDM §7.15 p. 7-37, second witness) |
+
+An edge raised while blocked that no boundary has seen yet is still latched
+when the IRET ends blocking. The 80386 ignores it like the others (§9.2.1
+p. 9-3). It also ignores an edge raised between that IRET's retirement and the
+end of the IRET's unit: a window of the engine's granularity (ASSUMED). The
+80286 keeps such an edge latched, as it would a remembered one, and services
+it after the IRET (§9.2 p. 9-3).
+
+Shutdown: the NMI is delivered through the current IVT or IDT and saves the
+CS:IP held at shutdown (ASSUMED). If that delivery faults, the CPU re-enters
+shutdown still blocked, and only reset ends it (286 PRM p. 9-10, reading
+"processing the NMI" as its delivery, ASSUMED). In 8080 mode an NMI is taken
+at every boundary with BRK = 1 refused first; the delivery ends the 8080 EI
+delay (DERIVED from EI p. 12-172), drops a pending escape or refusal, and the
+routine's RETI returns to 8080 mode (`I8080Entry::Reti`, also right after
+BRKEM). The NMI hold is rearmed by every segment load as the model manuals say;
+INT and the single-step trap keep decision-16 §4. `ModelQuirks::nmi_nesting`
+(`NmiNesting`) carries the per-model policy; it is hashed into `semantics_id`
+only where it departs from its canonical value, so no identity changes for it.
+The NEC segment-register store holds NMI through a new IR operation, so
+`NEC_EXTENSION_REVISION` is 2 and only the NecV20/NecV30 identities change.
 
 `semantics_id` is a deterministic content digest of encoding membership and canonical alias pairs,
 decoder/absence policy, quirks and system/lift/FPU attributes, plus an explicit

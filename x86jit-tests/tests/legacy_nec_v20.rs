@@ -1451,7 +1451,10 @@ fn hand_back_is_rejected_while_mmio_is_in_flight() {
 //   (AL C7h, CW ABCDh, IX DEADh, PSW saved XOR 0ED5h with MD = 1, BRK kept),
 //   then RETI. The routine's PUSH leaves one word below the service frame
 //   (3000:7FF2), which the memory comparison adds.
-// - The NMI cases are not ported: x86jit has no NMI input (xj-50w.19).
+// - NMI (xj-50w.19): the fixture's 8080 core stops on the NMI line as on an
+//   accepted INT; the adapter hands the state back, raises the native NMI
+//   input, and the delivery enters the same routine, placed at the NMI
+//   vector's target 6200:0400.
 //
 // The vector text is Copyright (c) 2026 Mikołaj Mikołajczyk, from x80
 // (https://github.com/unemu-org/x80), commit
@@ -1681,8 +1684,6 @@ routine FC46
 access 2000 4000 000D 0008 0001 0001 0002 0002
 end
 "#;
-const NOT_PORTED: [&str; 3] = ["nmi_running", "hlt_nmi", "nmi_over_int_and_hold"];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Budget,
@@ -1695,6 +1696,7 @@ enum Outcome {
 #[derive(Clone, Copy, Default)]
 struct Lines {
     int: bool,
+    nmi: bool,
     hold: bool,
     reset: bool,
     vector: u8,
@@ -1923,10 +1925,12 @@ impl Port {
         // UM §6 p. 6-2: INT at a boundary with IE = 1 and no NMI or hold;
         // the adapter decides acceptance from the 8080 latches, and x86jit's
         // irq_ready must agree after the hand-back.
-        let accepted = lines.int && self.i.ie && !self.i.ei_delay && !lines.hold;
+        let accepted = lines.int && self.i.ie && !self.i.ei_delay && !lines.hold && !lines.nmi;
         // UM §8 p. 8-2, §9 p. 9-1: a masked INT wakes the 8080 standby.
         let wake = self.i.halted && lines.int && !self.i.ie;
-        match self.core(steps, lines.reset || accepted || wake) {
+        // UM p. 2-3, §6 p. 6-1, §9 p. 9-1: NMI is taken whatever IE, the EI
+        // delay or HOLD; it also releases the standby.
+        match self.core(steps, lines.reset || accepted || wake || lines.nmi) {
             Core::Budget => {
                 self.hand_back(I8080Handback::Boundary);
                 self.reenter();
@@ -1949,6 +1953,26 @@ impl Port {
                 c.cpu.rflags_system = 0;
                 self.ended = true;
                 Outcome::Reset
+            }
+            Core::Stop if lines.nmi => {
+                // The native core takes the NMI (UM §8 p. 8-4: "the interrupt
+                // process is performed the same as in native mode").
+                self.hand_back(I8080Handback::Boundary);
+                assert!(self.cpu.nmi_ready());
+                self.cpu.raise_nmi().unwrap();
+                assert!(!self.cpu.irq_ready(), "NMI has priority (UM p. 2-2)");
+                // Delivery (zero steps), then the routine's HLT.
+                let r = run(&self.vm, &mut self.cpu, 1);
+                assert!(
+                    matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                    "{:?}",
+                    r.stop()
+                );
+                assert!(!self.cpu.has_pending_nmi());
+                let mut entry = self.native();
+                entry[12] -= 1;
+                self.routine("nmi", entry);
+                Outcome::Serviced
             }
             Core::Stop if accepted => {
                 self.hand_back(I8080Handback::Boundary);
@@ -2059,10 +2083,10 @@ fn vector_machine(
     }
     let w = initial.unwrap();
     // Native code of this port: BRKEM before the continuation PC, and the
-    // routines at the CALLN (40h) and INT (41h) vectors' targets.
+    // routines at the CALLN (40h), INT (41h) and NMI (02h) vectors' targets.
     let at = physical(w[8], w[12].wrapping_sub(3)) as usize;
     image[at..at + 3].copy_from_slice(&[0x0f, 0xff, vector.unwrap()]);
-    for (segment, offset) in [(0x6000, 0x200), (0x6100, 0x300)] {
+    for (segment, offset) in [(0x6000, 0x200), (0x6100, 0x300), (0x6200, 0x400)] {
         let at = physical(segment, offset) as usize;
         image[at..at + ROUTINE.len()].copy_from_slice(ROUTINE);
     }
@@ -2131,9 +2155,9 @@ fn run_vector(model: CpuModel, name: &str) {
                 assert_eq!(u16::from(port.i.f), hex(psw) & 0xff, "{name}");
             }
             ["signal", int, nmi, hold, reset, vector, outcome] => {
-                assert_eq!(*nmi, "0", "NMI is not ported");
                 let lines = Lines {
                     int: *int == "1",
+                    nmi: *nmi == "1",
                     hold: *hold == "1",
                     reset: *reset == "1",
                     vector: hex(vector) as u8,
@@ -2212,12 +2236,10 @@ fn x80_contract_vectors_on_the_native_side() {
     for model in MODELS {
         let mut ported = 0;
         for name in &names {
-            if !NOT_PORTED.contains(name) {
-                run_vector(model, name);
-                ported += 1;
-            }
+            run_vector(model, name);
+            ported += 1;
         }
-        assert_eq!(ported, 12);
+        assert_eq!(ported, 15);
     }
 }
 
@@ -2248,6 +2270,386 @@ fn x80_initial_psw_with_brk_refuses_brkem() {
         let mut actual = vec![0u8; 1 << 20];
         vm.read_bytes(0, &mut actual).unwrap();
         assert!(actual == image, "memory changed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The NMI input (xj-50w.19; spec.md §17.10). UM §2 pp. 2-2–3, §6 pp. 6-1–4,
+// §8 p. 8-4, §9 p. 9-1, §12 pp. 12-168–172. Each witness compares the whole
+// CpuState, the frame words, the steps and the retired count.
+
+const NMI_CS: u16 = 0x6200;
+const NMI_IP: u16 = 0x400;
+
+fn state(c: &x86jit_core::CpuState) -> String {
+    format!("{c:?}")
+}
+// The PSW image a native frame stores: MD,1,1,1 above V (UM §3 p. 3-3).
+fn image(c: &x86jit_core::CpuState) -> u64 {
+    (c.rflags() & 0xffff) | 0xf000
+}
+// The CPU after one interrupt entry: PSW, PS, PC pushed, IE and BRK clear
+// (UM §6 p. 6-1).
+fn entered(c: &x86jit_core::CpuState, cs: u16, ip: u16) -> x86jit_core::CpuState {
+    let mut e = c.clone();
+    e.gpr[4] = c.gpr[4].wrapping_sub(6) & 0xffff;
+    e.flags.if_ = false;
+    e.rflags_system &= !0x100;
+    e.cs = cs;
+    e.rip = u64::from(ip);
+    e
+}
+fn frame_at(vm: &Vm, sp: u64) -> [u64; 3] {
+    [0, 2, 4].map(|d| word(vm, sp + d))
+}
+fn to_hlt(vm: &Vm, cpu: &mut Vcpu, budget: u64) -> u64 {
+    let r = run(vm, cpu, budget);
+    assert!(
+        matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+        "{:?}",
+        r.stop()
+    );
+    r.steps()
+}
+fn nmi_setup(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+    let (vm, cpu) = setup(model, code);
+    vector(&vm, 2, NMI_IP, NMI_CS);
+    vm.write_bytes(0x62400, b"\xf4").unwrap();
+    (vm, cpu)
+}
+// A trapped (device) page at 4000h for an answered-but-unfinished transfer.
+fn nmi_device_setup(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x120000), Box::new(InterpreterBackend));
+    vm.set_cpu_model(model);
+    vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x4000, 0x1000, Prot::RWX, RegionKind::Trap).unwrap();
+    vm.map(0x5000, 0x11b000, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.write_bytes(IP, code).unwrap();
+    vector(&vm, 2, NMI_IP, NMI_CS);
+    vm.write_bytes(0x62400, b"\xf4").unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = IP;
+    cpu.cpu.gpr[4] = 0x8000;
+    (vm, cpu)
+}
+
+#[test]
+fn nmi_ignores_ie_and_an_edge_in_service_nests() {
+    // UM p. 2-3 (rising edge, fixed vector 2, processing after the current
+    // instruction), DI p. 12-172 (IE does not mask NMI). The manual is
+    // silent on an edge during NMI service: nesting is ASSUMED (spec.md
+    // §17.10), as on the 8086.
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x90");
+        vm.write_bytes(0x62400, b"\x90\xf4").unwrap();
+        cpu.raise_nmi().unwrap();
+        cpu.raise_nmi().unwrap();
+        let before = cpu.cpu.clone();
+        step(&vm, &mut cpu, 1); // delivery, then the routine's NOP
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP, 0, image(&before)]);
+        assert!(!cpu.has_pending_nmi(), "the two edges coalesced");
+        cpu.raise_nmi().unwrap();
+        assert!(cpu.nmi_ready());
+        let nested = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 2);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&nested, NMI_CS, NMI_IP + 2))
+        );
+        assert_eq!(
+            frame_at(&vm, 0x7ff4),
+            [u64::from(NMI_IP) + 1, u64::from(NMI_CS), image(&nested)]
+        );
+        assert_eq!(cpu.retired_instructions(), 3);
+    }
+}
+
+#[test]
+fn single_step_with_an_acceptable_nmi_is_refused() {
+    // UM Table 6-1 p. 6-1 gives priorities, not the sequence: a typed
+    // refusal with no guest effect; the trap and the latch are kept. The
+    // device transfer holds the NMI until the instruction completes; the
+    // port handoff defers the trap until the handoff returns.
+    for model in MODELS {
+        for (code, port) in [(&b"\xa0\x00\x40\x90"[..], false), (&b"\xee\x90"[..], true)] {
+            let (vm, mut cpu) = nmi_device_setup(model, code);
+            vector(&vm, 1, 0x500, 0);
+            cpu.cpu.rflags_system = 0x100;
+            let r = run(&vm, &mut cpu, 1);
+            if port {
+                assert!(matches!(r.stop(), StepStop::Exit(Exit::PortIo { .. })));
+            } else {
+                assert!(matches!(r.stop(), StepStop::Exit(Exit::MmioRead { .. })));
+                cpu.complete_mmio_read(0x5a);
+            }
+            cpu.raise_nmi().unwrap();
+            let r = run(&vm, &mut cpu, 4);
+            assert_eq!(
+                unsupported(r.stop()),
+                Some(UnsupportedSystemOperation::NecStepWithNmi),
+                "{:?}",
+                r.stop()
+            );
+            assert_eq!(r.steps(), u64::from(!port));
+            let refused = cpu.cpu.clone();
+            assert_eq!(refused.gpr[4], 0x8000, "no frame");
+            assert_eq!(refused.gpr[0] & 0xff, if port { 0 } else { 0x5a });
+            assert!(cpu.has_pending_nmi());
+            let retired = cpu.retired_instructions();
+            let r = run(&vm, &mut cpu, 4);
+            assert_eq!(
+                unsupported(r.stop()),
+                Some(UnsupportedSystemOperation::NecStepWithNmi)
+            );
+            assert_eq!(r.steps(), 0);
+            assert_eq!(state(&cpu.cpu), state(&refused));
+            assert_eq!(cpu.retired_instructions(), retired);
+            assert!(cpu.has_pending_nmi());
+        }
+    }
+}
+
+#[test]
+fn ei_does_not_hold_nmi() {
+    // UM §6 p. 6-4 and EI p. 12-172: the EI delay holds INT only, whatever
+    // IE was.
+    for model in MODELS {
+        for ie in [false, true] {
+            let (vm, mut cpu) = nmi_setup(model, b"\xfb\x90");
+            cpu.cpu.flags.if_ = ie;
+            step(&vm, &mut cpu, 1);
+            cpu.raise_nmi().unwrap();
+            assert!(cpu.nmi_ready());
+            assert!(!cpu.irq_ready());
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+            assert_eq!(frame_at(&vm, 0x7ffa), [IP + 1, 0, image(&before)]);
+        }
+    }
+}
+
+#[test]
+fn segment_loads_and_stores_hold_nmi_for_one_instruction() {
+    // UM §6 p. 6-4: no NMI or INT is acknowledged between MOV sreg, POP
+    // sreg or MOV reg16/mem16, sreg and the following instruction; pp. 12-7,
+    // 12-8, 12-151. The request is "acknowledged on completion of the
+    // subsequent single instruction".
+    for model in MODELS {
+        for first in [
+            &b"\x8e\xd8"[..],
+            b"\x8e\xd0",
+            b"\x1f",
+            b"\x17",
+            b"\x8c\xd8",
+            b"\x8c\x1e\x00\x30",
+        ] {
+            let mut code = first.to_vec();
+            code.extend_from_slice(b"\x90\x90");
+            let (vm, mut cpu) = nmi_setup(model, &code);
+            step(&vm, &mut cpu, 1);
+            cpu.raise_nmi().unwrap();
+            assert!(cpu.has_pending_nmi() && !cpu.nmi_ready(), "{first:x?}");
+            step(&vm, &mut cpu, 1);
+            assert!(cpu.nmi_ready(), "{first:x?}");
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+            let next = IP + first.len() as u64 + 1;
+            assert_eq!(frame_at(&vm, before.gpr[4] - 6)[0], next, "{first:x?}");
+        }
+        // Consecutive loads hold NMI at each boundary (spec.md §17.10); INT
+        // keeps decision-16 §4 and is held only after the first.
+        let (vm, mut cpu) = nmi_setup(model, b"\x1f\x07\x90\x90");
+        cpu.cpu.flags.if_ = true;
+        step(&vm, &mut cpu, 1); // POP DS
+        cpu.raise_nmi().unwrap();
+        step(&vm, &mut cpu, 1); // POP ES
+        assert!(!cpu.nmi_ready());
+        assert!(cpu.irq_ready());
+        step(&vm, &mut cpu, 1); // NOP
+        assert!(cpu.nmi_ready() && !cpu.irq_ready());
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(frame_at(&vm, 0x7ffe)[0], IP + 3);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        // The store's single-step break is unchanged: it follows the store.
+        let (vm, mut cpu) = nmi_setup(model, b"\x8c\xd8\x90");
+        vector(&vm, 1, 0x500, 0);
+        cpu.cpu.rflags_system = 0x100;
+        step(&vm, &mut cpu, 1);
+        assert_eq!((cpu.cpu.rip, word(&vm, 0x7ffa)), (0x500, IP + 2));
+    }
+}
+
+#[test]
+fn hlt_wakes_on_nmi_and_rep_keeps_up_to_three_prefixes() {
+    // UM HALT p. 12-171 and §9 p. 9-1 (NMI releases standby; the saved PC
+    // follows HLT); §6 p. 6-4 (an interrupted block transfer keeps up to
+    // three prefixes).
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\xf4");
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        cpu.raise_nmi().unwrap();
+        assert!(cpu.has_pending_nmi() && cpu.nmi_ready());
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP + 1, 0, image(&before)]);
+        for (code, restart) in [
+            (&b"\x26\x2e\xf3\xa4"[..], IP),
+            (&b"\x26\x2e\x3e\xf3\xa4"[..], IP + 1),
+        ] {
+            let (vm, mut cpu) = nmi_setup(model, code);
+            cpu.cpu.gpr[1] = 3;
+            step(&vm, &mut cpu, 1);
+            cpu.raise_nmi().unwrap();
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 1), 1);
+            assert_eq!(frame_at(&vm, 0x7ffa), [restart, 0, image(&before)]);
+            assert_eq!(cpu.cpu.gpr[1], 2);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+        }
+    }
+}
+
+// The 8080-mode side: an NMI is taken at an 8080-mode boundary before any ED
+// escape, refusal or I8080Mode exit (UM §8 p. 8-4; §6 p. 6-1).
+fn emulation_nmi_setup(model: CpuModel) -> (Vm, Vcpu) {
+    let (vm, cpu) = emulation_setup(model);
+    vector(&vm, 2, NMI_IP, NMI_CS);
+    vm.write_bytes(0x62400, b"\xcf").unwrap(); // RETI
+    (vm, cpu)
+}
+fn reti_to_emulation(vm: &Vm, cpu: &mut Vcpu) -> I8080View {
+    let r = run(vm, cpu, 10);
+    assert_eq!(r.steps(), 1, "{:?}", r.stop());
+    let StepStop::Exit(Exit::I8080Mode { view, entry, .. }) = r.stop() else {
+        panic!("{:?}", r.stop())
+    };
+    assert_eq!(*entry, I8080Entry::Reti);
+    *view
+}
+
+#[test]
+fn nmi_in_emulation_mode_ends_the_ei_delay_and_returns_by_reti() {
+    // UM §8 p. 8-4: "the interrupt process is performed the same as in native
+    // mode"; p. 6-1 (IE and BRK cleared); RETI p. 12-168 restores MD = 0.
+    // The EI delay ends with the delivery (spec.md §17.10, DERIVED from EI
+    // p. 12-172: it holds INT through one instruction).
+    for model in MODELS {
+        let (vm, mut cpu) = emulation_nmi_setup(model);
+        let mut view = enter(&vm, &mut cpu);
+        view.interrupt_enable = true;
+        view.ei_delay = true;
+        cpu.hand_back_i8080(&view, I8080Handback::Boundary).unwrap();
+        assert!(!cpu.irq_ready() && cpu.nmi_ready());
+        cpu.raise_nmi().unwrap();
+        let after = reti_to_emulation(&vm, &mut cpu);
+        assert!(after.interrupt_enable && !after.ei_delay);
+        assert_eq!((after.pc, after.code_segment), (view.pc, view.code_segment));
+        // PSW with MD = 0 and IE = 1, then PS, then PC.
+        assert_eq!(
+            frame_at(&vm, 0x7ff4),
+            [
+                view.pc.into(),
+                0x2000,
+                0x7203 | u64::from(view.flags & 0xd4)
+            ]
+        );
+        assert_eq!(cpu.cpu.legacy.reserved & 3, 3, "MD = 0, MD write enabled");
+        assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+    }
+}
+
+#[test]
+fn nmi_in_emulation_mode_drops_a_pending_escape_and_refusal() {
+    // decision-23 C4a: an interrupt taken at the escape or refusal's PS:PC
+    // ends it; RETI returns to the same 8080 instruction.
+    for model in MODELS {
+        for how in [
+            I8080Handback::EdEscape,
+            I8080Handback::Refused { opcode: 0x10 },
+        ] {
+            let (vm, mut cpu) = emulation_nmi_setup(model);
+            let view = enter(&vm, &mut cpu);
+            vm.write_bytes(0x20100, b"\xed\xfd").unwrap();
+            cpu.hand_back_i8080(&view, how).unwrap();
+            cpu.raise_nmi().unwrap();
+            let after = reti_to_emulation(&vm, &mut cpu);
+            assert_eq!(after, view, "{how:?}");
+            // The escape or refusal was dropped: the boundary is a plain one.
+            assert_eq!(resume(&vm, &mut cpu), view);
+        }
+    }
+}
+
+#[test]
+fn nmi_right_after_brkem_reports_reti() {
+    // BRKEM clears IE (rule R2) and NMI ignores IE, so an NMI held by a
+    // segment load before BRKEM is taken at the first 8080-mode boundary.
+    // The routine's RETI then reports `Reti`, not `Brkem` (spec.md §17.10;
+    // diagnostic only), and the 8080 core starts at the BRKEM target.
+    for model in MODELS {
+        let (vm, mut cpu) = emulation_nmi_setup(model);
+        vm.write_bytes(BRKEM_AT - 2, b"\x8e\xc0").unwrap(); // MOV ES,AX
+        cpu.cpu.rip = BRKEM_AT - 2;
+        step(&vm, &mut cpu, 1);
+        cpu.raise_nmi().unwrap();
+        let r = run(&vm, &mut cpu, 10);
+        assert_eq!(r.steps(), 2, "BRKEM and RETI: {:?}", r.stop());
+        let StepStop::Exit(Exit::I8080Mode { view, entry, .. }) = r.stop() else {
+            panic!("{:?}", r.stop())
+        };
+        assert_eq!(*entry, I8080Entry::Reti);
+        assert_eq!((view.code_segment, view.pc), (0x2000, 0x100));
+        assert_eq!(word(&vm, 0x7ffa), BRKEM_AT + 3, "the BRKEM frame");
+        assert_eq!(word(&vm, 0x7ff4), 0x100, "the NMI frame saves the target");
+        assert_eq!(word(&vm, 0x7ff8) & 0x8000, 0, "PSW with MD = 0");
+    }
+}
+
+#[test]
+fn brk_at_an_emulation_boundary_refuses_before_a_latched_nmi() {
+    // spec.md §17.10 step 4b: single-step in 8080 mode is not described;
+    // the refusal comes before the delivery and the latch is kept.
+    for model in MODELS {
+        let (vm, mut cpu) = emulation_nmi_setup(model);
+        enter(&vm, &mut cpu);
+        cpu.cpu.rflags_system |= 0x100;
+        assert!(!cpu.nmi_ready());
+        cpu.raise_nmi().unwrap();
+        let before = cpu.cpu.clone();
+        let r = run(&vm, &mut cpu, 10);
+        assert_eq!(
+            unsupported(r.stop()),
+            Some(UnsupportedSystemOperation::NecEmulationSingleStep),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(r.steps(), 0);
+        assert_eq!(state(&cpu.cpu), state(&before));
+        assert!(cpu.has_pending_nmi());
     }
 }
 

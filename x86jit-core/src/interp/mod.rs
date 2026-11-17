@@ -63,7 +63,7 @@ pub struct RetireInfo<'a> {
 
 #[derive(Default)]
 struct ShadowState {
-    // Bits 0..2 hold incoming STI/SS; bits 2..4 hold newly armed STI/SS.
+    // Bits 0..3 hold incoming STI/SS/NMI; bits 3..6 hold newly armed ones.
     bits: u8,
     observed_retired: u64,
 }
@@ -71,11 +71,15 @@ struct ShadowState {
 impl ShadowState {
     const STI: u8 = 1;
     const SS: u8 = 2;
-    const ARM_SHIFT: u8 = 2;
+    // Holds only the NMI input (spec.md §17.10); INT and the single-step
+    // trap test STI | SS.
+    const NMI: u8 = 4;
+    const ARM_SHIFT: u8 = 3;
 
-    fn new(sti: bool, ss: bool) -> Self {
+    // `ss`: the Vcpu `ss_shadow` byte (SS in bit 0, the NMI hold in bit 1).
+    fn new(sti: bool, ss: u8) -> Self {
         Self {
-            bits: u8::from(sti) | (u8::from(ss) << 1),
+            bits: u8::from(sti) | (ss << 1),
             observed_retired: 0,
         }
     }
@@ -109,9 +113,18 @@ impl ShadowState {
         self.bits = (self.bits & !mask) | (u8::from(value && !entry_if) << Self::ARM_SHIFT);
     }
 
+    // Decision-16 §4: an incoming SS hold is not rearmed for INT and the
+    // single-step trap. The NMI hold is rearmed by every load: each model's
+    // manual says each load holds the following boundary (spec.md §17.10).
     fn arm_ss(&mut self) {
-        let mask = Self::SS << Self::ARM_SHIFT;
-        self.bits = (self.bits & !mask) | (u8::from(self.bits & Self::SS == 0) * mask);
+        let ss = Self::SS << Self::ARM_SHIFT;
+        let nmi = Self::NMI << Self::ARM_SHIFT;
+        self.bits = (self.bits & !ss) | (u8::from(self.bits & Self::SS == 0) * ss) | nmi;
+    }
+
+    // NEC UM §6 p. 6-4: the NMI hold of a segment-register store.
+    fn arm_nmi(&mut self) {
+        self.bits |= Self::NMI << Self::ARM_SHIFT;
     }
 
     fn complete_rep_prefix(&mut self, before: u64, cpu: &CpuState, retired: u64) {
@@ -131,6 +144,15 @@ pub(crate) struct StepContext {
     pub remaining: u64,
     pub steps: u64,
     pub pending_irq: bool,
+    /// In/out of a stepped Machine walk, in place of `RetireInfo::ss_shadow`:
+    /// the Vcpu `ss_shadow` byte, the SS class in bit 0 and the NMI hold after
+    /// a segment-register load in bit 1 (spec.md §17.10).
+    pub ss_shadow: u8,
+    /// Into a stepped Machine walk, once per walk: NMI is blocked (I80286,
+    /// I80386) until the next IRET. Blocking changes only at the dispatcher
+    /// (acceptance) and after a unit that retired an IRET, never inside a
+    /// walk (spec.md §17.10).
+    pub nmi_blocked: bool,
     pub string_interrupted: bool,
     rep_counted: bool,
     cut: bool,
@@ -179,14 +201,24 @@ impl StepContext {
             || cpu.pending_mmio_write
             || cpu.pending_port_in.is_some()
             || cpu.port_string_in.is_some();
-        if !pending
-            && exit_request.is_some_and(|word| {
-                word.load(std::sync::atomic::Ordering::Relaxed) & crate::vm::EXIT_REQUESTED != 0
-            })
-        {
-            return Some(WalkResult::exit(Exit::Interrupted));
+        // A host request, or a latched NMI (spec.md §17.10): one load and one
+        // test (`NMI_EDGE` keeps the mask one immediate); the decision is out
+        // of line.
+        if let Some(word) = exit_request {
+            if word.load(std::sync::atomic::Ordering::Relaxed)
+                & (crate::vm::EXIT_REQUESTED | crate::vm::NMI_EDGE)
+                != 0
+            {
+                if let Some(stop) = self.external(word, shadows.bits, pending) {
+                    return Some(stop);
+                }
+            }
         }
-        if self.pending_irq && cpu.flags.if_ && shadows.bits == 0 && !pending {
+        if self.pending_irq
+            && cpu.flags.if_
+            && shadows.bits & (ShadowState::STI | ShadowState::SS) == 0
+            && !pending
+        {
             // Return to the dispatcher to deliver; no guest instruction is in flight.
             // Reuse the no-retirement result so unstepped result layout stays fixed.
             // Inhibition is already empty at this boundary.
@@ -194,6 +226,40 @@ impl StepContext {
         }
         None
     }
+
+    // The word held a host request or an NMI edge. The walk applies the
+    // dispatcher's `nmi_gate`, NMI blocking (I80286, I80386) included, so it
+    // stops only for an NMI the dispatcher accepts. A blocked edge does not
+    // stop it: the edge leaves the word at the dispatcher's next test, which
+    // remembers or ignores it (spec.md §17.10).
+    #[cold]
+    #[inline(never)]
+    fn external(
+        &self,
+        exit_request: &std::sync::atomic::AtomicU64,
+        shadows: u8,
+        pending: bool,
+    ) -> Option<WalkResult> {
+        if pending {
+            return None;
+        }
+        let word = exit_request.load(std::sync::atomic::Ordering::Relaxed);
+        if word & crate::vm::EXIT_REQUESTED != 0 {
+            return Some(WalkResult::exit(Exit::Interrupted));
+        }
+        nmi_gate(self.nmi_blocked, shadows & ShadowState::NMI != 0, pending)
+            .then_some(WalkResult::FaultDelivered)
+    }
+}
+
+/// Whether a latched NMI is accepted at a boundary, as far as the walk can
+/// tell (spec.md §17.10): no blocking (I80286, I80386), no NMI hold after a
+/// segment-register load, and no IN, INS or MMIO completion outstanding. The
+/// dispatcher applies the same function, adding the conditions under which no
+/// walk runs, so the two cannot disagree.
+#[inline(always)]
+pub(crate) fn nmi_gate(blocked: bool, hold: bool, pending: bool) -> bool {
+    !blocked && !hold && !pending
 }
 
 /// Reusable interpreter temporaries. The VM supplies an allocation-tracked buffer;
@@ -656,7 +722,14 @@ fn interpret_block_inner<
     let mut retired: u64 = 0;
     // 0 = refetch after a store, 1 = no instruction yet, 2 = instruction in flight.
     // Bit 1 contributes retirement; the zero test handles only refetch.
-    let mut shadows = ShadowState::new(info.sti_shadow, info.ss_shadow);
+    let mut shadows = ShadowState::new(
+        info.sti_shadow,
+        if MACHINE && STEPPED {
+            steps.ss_shadow
+        } else {
+            u8::from(info.ss_shadow)
+        },
+    );
 
     // The op walk lives in `walk_ops`; its every early `return` funnels back here for the
     // single final-instruction retirement below. `cur_addr`/`retired`/`started`/
@@ -807,7 +880,11 @@ fn interpret_block_inner<
     };
     info.retired = retired;
     info.sti_shadow = shadows.bits & ShadowState::STI != 0;
-    info.ss_shadow = shadows.bits & ShadowState::SS != 0;
+    if MACHINE && STEPPED {
+        steps.ss_shadow = (shadows.bits >> 1) & 3;
+    } else {
+        info.ss_shadow = shadows.bits & ShadowState::SS != 0;
+    }
     result
 }
 
@@ -911,7 +988,12 @@ fn split_block<
     let Some(rest) = block_suffix(ir, cpu.rip) else {
         return Err(first);
     };
-    let before = (info.retired, info.sti_shadow, info.ss_shadow);
+    let before = (
+        info.retired,
+        info.sti_shadow,
+        info.ss_shadow,
+        steps.ss_shadow,
+    );
     let result = interpret_block_inner::<
         true,
         ROUTED,
@@ -948,7 +1030,12 @@ fn split_block<
                     detail.origin() == crate::FaultOrigin::GuestMap
                         && detail.raw_host_fault().is_none()
                 }) {
-                    (info.retired, info.sti_shadow, info.ss_shadow) = before;
+                    (
+                        info.retired,
+                        info.sti_shadow,
+                        info.ss_shadow,
+                        steps.ss_shadow,
+                    ) = before;
                     return Err(first);
                 }
                 info.retired += before.0;
@@ -1257,7 +1344,7 @@ fn walk_shared_helper<const MACHINE: bool, const ROUTED: bool, const ORDER: u8>(
     let (raw, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
     match legacy::execute_shared_op::<ROUTED, 0>(op, cpu, raw, temps, ir.legacy_context, ip, next) {
         Ok(outcome) => {
-            if outcome.arm_ss {
+            if outcome.arm_ss != 0 {
                 shadows.complete_before(retired);
                 shadows.arm_ss();
             }
@@ -1510,6 +1597,14 @@ fn walk_ops<
                 L::InhibitIrq20 if MACHINE && DIRECT20 => {
                     shadows.complete_before(*retired);
                     shadows.arm_sti(true, false);
+                }
+                // NEC UM §6 p. 6-4: after MOV reg16/mem16, sreg, INT and NMI
+                // are both held through the next instruction. The INT hold
+                // keeps the STI class, so the single-step break is unchanged.
+                L::HoldExternal20 if MACHINE && DIRECT20 => {
+                    shadows.complete_before(*retired);
+                    shadows.arm_sti(true, false);
+                    shadows.arm_nmi();
                 }
                 L::WrappedString {
                     kind,

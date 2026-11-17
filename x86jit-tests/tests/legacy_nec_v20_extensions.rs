@@ -99,13 +99,16 @@ fn catalogue_identities_change_only_for_the_nec_entries() {
     // twenty-bit values are those after xj-50w.12, which changed all four
     // (legacy_i8086.rs `lock_admission_changes_only_the_twenty_bit_identities`).
     // I80286 takes its xj-50w.11 quirk fields (3699e02a8ef13e63 before them).
+    // xj-50w.19 raises the NEC extension revision word to 2 (the segment
+    // register store holds NMI as well as INT), so only the NEC entries move
+    // again; they were 2a386bfd83ff8f1f and 2a386bfd83ff8f27.
     for (model, id) in [
         (CpuModel::I8088, 0x8815_844f_bd9d_4559),
         (CpuModel::I8086, 0x8815_844f_bd9d_4557),
         (CpuModel::I80286, 0x24d3_4f81_af8d_a20b),
         (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f),
-        (CpuModel::NecV20, 0x2a38_6bfd_83ff_8f1f),
-        (CpuModel::NecV30, 0x2a38_6bfd_83ff_8f27),
+        (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
+        (CpuModel::NecV30, 0xcd48_16e2_6331_d184),
     ] {
         assert_eq!(model.profile().semantics_id, id, "{model:?}");
     }

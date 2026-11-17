@@ -1691,12 +1691,15 @@ impl Vm {
                 fill_before_block: None,
                 #[cfg(test)]
                 block_entries: 0,
+                #[cfg(test)]
+                nmi_before_block: None,
             },
             pending_irq: None,
             retired: 0,
             sti_shadow: false,
             code_space_reported: false,
-            ss_shadow: false,
+            ss_shadow: 0,
+            nmi_state: 0,
         }
     }
 }
@@ -1731,6 +1734,19 @@ pub(crate) const EXIT_REQUESTED: u64 = 2;
 
 /// Backend-to-vcpu notification in the dispatch word shared with SMC and exits.
 pub const CODE_SPACE_EXHAUSTED: u64 = 4;
+
+/// The NMI edge latch of a Machine vCPU, in its dispatch word (spec.md §17.10).
+/// Application vCPUs never carry it: their compiled code exits on any nonzero
+/// word. Bit 33, so that `EXIT_REQUESTED | NMI_EDGE` (2_0000_0002h, one bit
+/// repeated every 32) is a single AArch64 test immediate: the boundary test
+/// keeps its one load and one test.
+pub(crate) const NMI_EDGE: u64 = 1 << 33;
+
+/// The Vcpu `ss_shadow` bits: the MOV/POP SS class that holds INT and the
+/// single-step trap (decision-16 §4), and the hold of the NMI input that every
+/// segment-register load arms (spec.md §17.10).
+pub(crate) const SS_HOLD: u8 = 1;
+pub(crate) const NMI_HOLD: u8 = 2;
 
 /// Thread-safe, cloneable request to return from a vcpu's next running boundary.
 /// Requests coalesce until consumed by `run`; requests made outside `run` persist.
@@ -1780,6 +1796,54 @@ impl ExitRequest {
     }
 }
 
+/// Thread-safe, cloneable handle on the NMI input of an
+/// [`ExecutionProfile::Machine`] vCPU (spec.md §17.10). Each [`Self::raise`]
+/// is one rising edge. Edges coalesce until the model accepts one at an
+/// instruction or REP-iteration boundary; no exit is returned for it. A handle
+/// that outlives its vCPU has no effect.
+#[derive(Clone, Debug)]
+pub struct NmiLine {
+    word: Arc<AtomicU64>,
+}
+
+impl NmiLine {
+    /// Latch one rising edge. A running vCPU observes it at its next
+    /// instruction or REP-iteration boundary. Writes preceding this call are
+    /// visible to the guest's NMI handler.
+    ///
+    /// Async-signal-safe: one lock-free atomic read-modify-write on a word the
+    /// handle already owns, like [`ExitRequest::request_exit`]. Cloning or
+    /// dropping an `NmiLine` is not async-signal-safe.
+    pub fn raise(&self) {
+        // Release publishes preceding writes; acceptance's Acquire RMW pairs.
+        self.word.fetch_or(NMI_EDGE, Ordering::Release);
+    }
+
+    /// The raw latch: an edge raised and not yet accepted or discarded. It can
+    /// report an edge that the model will ignore (an I80386 inside its NMI
+    /// handler) or that is not deliverable yet; [`Vcpu::has_pending_nmi`] is
+    /// the model's view. Code that the embedder runs between calls, such as
+    /// an 8080 core during [`Exit::I8080Mode`], ORs this into its stop test.
+    ///
+    /// Async-signal-safe: one lock-free Acquire load.
+    pub fn is_raised(&self) -> bool {
+        self.word.load(Ordering::Acquire) & NMI_EDGE != 0
+    }
+}
+
+/// [`Vcpu::raise_nmi`] on a vCPU that is not [`ExecutionProfile::Machine`]:
+/// the Application profiles have no NMI input (spec.md §17.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NmiUnsupported;
+
+impl std::fmt::Display for NmiUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the NMI input exists only on ExecutionProfile::Machine vCPUs")
+    }
+}
+
+impl std::error::Error for NmiUnsupported {}
+
 #[derive(Default)]
 struct VcpuAllocations {
     scratch: AtomicU64,
@@ -1793,6 +1857,10 @@ struct VcpuScratch {
     fill_before_block: Option<u64>,
     #[cfg(test)]
     block_entries: u64,
+    // Raises an NMI edge at each of the next `.1` block entries: after the
+    // dispatcher's word test and before the walk's first boundary.
+    #[cfg(test)]
+    nmi_before_block: Option<(NmiLine, u64)>,
 }
 
 impl VcpuScratch {
@@ -1819,6 +1887,11 @@ impl crate::interp::ScratchBuffer for VcpuScratch {
     fn reused(&mut self, count: usize) -> &mut [u64] {
         if count > self.values.len() {
             self.grow(count);
+        }
+        #[cfg(test)]
+        if let Some((line, count @ 1..)) = &mut self.nmi_before_block {
+            *count -= 1;
+            line.raise();
         }
         #[cfg(test)]
         if let Some(pattern) = self.fill_before_block {
@@ -1929,8 +2002,16 @@ pub struct Vcpu {
     /// completion or event delivery (SDM Vol 3A §7.8.1; Vol 2B §4.3 STI).
     sti_shadow: bool,
     /// MOV/POP SS inhibition, kept distinct for consecutive-load policy
-    /// (SDM Vol 3A §7.8.3; decision-16 §4). Interpreter-only, outside `CpuState`.
-    ss_shadow: bool,
+    /// (SDM Vol 3A §7.8.3; decision-16 §4), in bit 0 ([`SS_HOLD`]); bit 1
+    /// ([`NMI_HOLD`]) holds the NMI input after every segment-register load,
+    /// rearmed by consecutive loads (spec.md §17.10). Interpreter-only,
+    /// outside `CpuState`.
+    ss_shadow: u8,
+    /// NMI blocking of the I80286 and I80386 (spec.md §17.10):
+    /// [`legacy::NMI_BLOCKED`] from acceptance to the next IRET, and on the
+    /// I80286 [`legacy::NMI_REMEMBERED`], one edge raised meanwhile. Private,
+    /// outside `CpuState` and the retained-context stamp.
+    nmi_state: u8,
 }
 
 const APPLICATION_DISPATCH: u8 = 0;
@@ -2012,7 +2093,9 @@ impl Vcpu {
     /// MMIO handoffs, accepted legacy IRQ deliveries, host exit requests and their
     /// evidence, syscall evidence, host-fault records, and per-vCPU fast lookup,
     /// IBTC refill and return-stack predictions. Shared translations and their
-    /// validated links are retained.
+    /// validated links are retained. A Machine vCPU also loses its NMI latch,
+    /// its NMI hold and its NMI blocking (spec.md §17.10); an edge racing with
+    /// this call is discarded if it precedes the atomic latch clear.
     ///
     /// Call this first, then write the CPU model's reset registers into [`Self::cpu`]
     /// (including CS and IP), then resume execution. This method supplies no CPU-model
@@ -2026,6 +2109,11 @@ impl Vcpu {
     /// discarded if it precedes the atomic request clear; later requests remain pending.
     pub fn reset_execution_state(&mut self, options: ResetOptions) {
         crate::interruption::consume(&self.exit_request.word, &self.engine_sections);
+        // spec.md §17.10: reset ends NMI blocking (ASSUMED; no PRM states it).
+        self.exit_request
+            .word
+            .fetch_and(!NMI_EDGE, Ordering::Acquire);
+        self.nmi_state = 0;
         self.interruption_evidence = None;
         self.syscall_evidence = None;
         self.pending_irq = None;
@@ -2033,7 +2121,7 @@ impl Vcpu {
             execution.reset_execution_state();
         }
         self.sti_shadow = false;
-        self.ss_shadow = false;
+        self.ss_shadow = 0;
         self.cpu.pending_port_in = None;
         self.cpu.port_string_in = None;
         self.cpu.pending_mmio = None;
@@ -2205,6 +2293,10 @@ impl Vcpu {
     ///
     /// IF and the STI/SS shadows follow SDM Vol 3A §7.8.1 and §7.8.3;
     /// device-completion blocking follows decision-16 §§1, 4.
+    /// While an NMI is pending and ready ([`Self::has_pending_nmi`] and
+    /// [`Self::nmi_ready`]) this is false: NMI has priority and INT is not
+    /// accepted at that boundary (NEC UM p. 2-2; 8086 Family UM p. 2-24;
+    /// 286 PRM §9.2 p. 9-3).
     pub fn irq_ready(&self) -> bool {
         (self.profile == ExecutionProfile::Application(CpuMode::Real16)
             || (self.profile == ExecutionProfile::Machine
@@ -2212,6 +2304,70 @@ impl Vcpu {
                 && !self.legacy_execution.as_ref().unwrap().is_shutdown()))
             && !self.cpu.mmio_retry_active
             && self.irq_delivery_ready()
+            && !(self.has_pending_nmi() && self.nmi_ready())
+    }
+
+    /// Latch one rising edge on the NMI input of an
+    /// [`ExecutionProfile::Machine`] vCPU (spec.md §17.10). Edges coalesce
+    /// until one is accepted. Takes no step, has no guest effect and returns
+    /// no exit; the next positive [`Self::run`] or [`Self::run_steps`] delivers
+    /// it at the first boundary where [`Self::nmi_ready`] holds, ahead of any
+    /// queued IRQ and independently of IF. Application vCPUs refuse with no
+    /// change. [`Self::nmi_line`] raises from another thread or a signal handler.
+    pub fn raise_nmi(&mut self) -> Result<(), NmiUnsupported> {
+        let line = self.nmi_line().ok_or(NmiUnsupported)?;
+        line.raise();
+        Ok(())
+    }
+
+    /// A thread-safe handle on this vCPU's NMI input, or `None` outside
+    /// [`ExecutionProfile::Machine`] (spec.md §17.10).
+    pub fn nmi_line(&self) -> Option<NmiLine> {
+        (self.profile == ExecutionProfile::Machine).then(|| NmiLine {
+            word: Arc::clone(&self.exit_request.word),
+        })
+    }
+
+    /// The model's view of the NMI input (spec.md §17.10): an edge is latched,
+    /// or remembered while an I80286 services an earlier NMI, and not yet
+    /// accepted. On an I80386 inside its NMI handler it is false, because the
+    /// processor ignores edges until the next IRET. Always false outside
+    /// [`ExecutionProfile::Machine`].
+    pub fn has_pending_nmi(&self) -> bool {
+        if self.profile != ExecutionProfile::Machine {
+            return false;
+        }
+        let latched = self.exit_request.word.load(Ordering::Acquire) & NMI_EDGE != 0;
+        if self.nmi_state & legacy::NMI_BLOCKED == 0 {
+            return latched;
+        }
+        match self.nmi_nesting() {
+            crate::NmiNesting::BlockedIgnore => false,
+            _ => latched || self.nmi_state & legacy::NMI_REMEMBERED != 0,
+        }
+    }
+
+    /// Whether a latched NMI would be accepted at this boundary (spec.md
+    /// §17.10). Independent of IF and the STI/EI shadow, and of whether an edge
+    /// is latched. False while an I80286/I80386 services an earlier NMI, after
+    /// a segment-register load or store that holds NMI (the model table of
+    /// spec.md §17.10), while an IN, INS or MMIO completion (including an
+    /// answered but unfinished retry) or a task-switch continuation is
+    /// outstanding, outside [`ExecutionProfile::Machine`] or a valid Machine
+    /// context, and at an NEC V20/V30 8080-mode boundary with BRK = 1.
+    /// Shutdown does not prevent it: NMI ends an I80286/I80386 shutdown.
+    pub fn nmi_ready(&self) -> bool {
+        self.profile == ExecutionProfile::Machine
+            && self.legacy_context_for_run().is_ok()
+            && self.nmi_gate(
+                self.legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .task_switch_pending(),
+            )
+            && !(self.twenty_bit_model()
+                && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0
+                && self.cpu.rflags_system & 0x100 != 0)
     }
 
     // The dispatcher handles active MMIO retries before reaching its IRQ gate;
@@ -2227,7 +2383,7 @@ impl Vcpu {
             && self.cpu.pending_port_in.is_none()
             && self.cpu.port_string_in.is_none()
             && !self.sti_shadow
-            && !self.ss_shadow
+            && self.ss_shadow & SS_HOLD == 0
     }
 
     /// The retired-instruction counter (§17.6, sub-seam c): guest instructions that have
@@ -2523,7 +2679,7 @@ impl Vcpu {
                 self.cpu
                     .write_gpr(Reg::Rax.gpr_index().unwrap(), value, size);
                 self.sti_shadow = false;
-                self.ss_shadow = false;
+                self.ss_shadow = 0;
             }
         }
     }
@@ -2540,7 +2696,7 @@ impl Vcpu {
         ) {
             Ok(()) => {
                 self.sti_shadow = false;
-                self.ss_shadow = false;
+                self.ss_shadow = 0;
                 Ok(())
             }
             Err(exit) => {
@@ -2605,7 +2761,7 @@ impl Vcpu {
         let mut info = crate::interp::RetireInfo {
             consistency: vm.consistency,
             sti_shadow: self.sti_shadow,
-            ss_shadow: self.ss_shadow,
+            ss_shadow: self.ss_shadow & SS_HOLD != 0,
             ..Default::default()
         };
         let r = crate::interp::step_one(
@@ -2617,7 +2773,7 @@ impl Vcpu {
         );
         self.retired += info.retired;
         self.sti_shadow = info.sti_shadow;
-        self.ss_shadow = info.ss_shadow;
+        self.ss_shadow = u8::from(info.ss_shadow);
         let result = match r {
             // §17.6 (sub-seam b): re-deliver a real-mode exception through the IVT,
             // mirroring the interpreted-block arm of `run`.
@@ -2635,7 +2791,7 @@ impl Vcpu {
                 .into_step();
                 if matches!(result, StepResult::Continue) {
                     self.sti_shadow = false;
-                    self.ss_shadow = false;
+                    self.ss_shadow = 0;
                 }
                 result
             }
@@ -2682,7 +2838,8 @@ impl Vcpu {
     /// completion, changing shadows, clearing retries, or consuming host requests.
     ///
     /// Instruction exits win over exhaustion. At other boundaries: budget, host
-    /// request (after pending completion), queued eligible IRQ, optional readiness
+    /// request (after pending completion), a latched Machine NMI that
+    /// [`Self::nmi_ready`] accepts, queued eligible IRQ, optional readiness
     /// stop, then execution.
     /// Delivery costs no unit. An incomplete instruction/iteration contributes zero;
     /// its already-permitted partial effects remain. The next unit never begins.

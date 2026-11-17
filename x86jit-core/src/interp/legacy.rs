@@ -14,7 +14,9 @@ pub(crate) struct Outcome {
     pub context_changed: bool,
     pub translations_invalidated: bool,
     pub arm_sti: bool,
-    pub arm_ss: bool,
+    /// The Vcpu `ss_shadow` bits this instruction arms: bit 0 the MOV/POP SS
+    /// hold, bit 1 the NMI hold (spec.md §17.10).
+    pub arm_ss: u8,
     pub suppress_debug: bool,
     preserve_rf: bool,
 }
@@ -1974,7 +1976,7 @@ impl BlockWalk {
 
 pub(crate) struct Progress {
     pub sti_shadow: bool,
-    pub ss_shadow: bool,
+    pub ss_shadow: u8,
     pub steps: u64,
     pub retired: u64,
     pub outcome: Option<Result<Outcome, Exit>>,
@@ -2053,7 +2055,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
                     || outcome.exit.is_some()
                     || outcome.context_changed
                     || outcome.arm_sti
-                    || outcome.arm_ss
+                    || outcome.arm_ss != 0
                     || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
                     || memory.has_dirty_code()
                 {
@@ -2068,7 +2070,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
     };
     Progress {
         sti_shadow: false,
-        ss_shadow: false,
+        ss_shadow: 0,
         steps,
         retired,
         outcome: Some(outcome),
@@ -2162,8 +2164,9 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
     limit: u64,
     exit_word: &std::sync::atomic::AtomicU64,
     sti_shadow: bool,
-    ss_shadow: bool,
+    ss_shadow: u8,
     pending_irq: bool,
+    nmi_blocked: bool,
 ) -> Progress {
     let code_base = if DIRECT20 {
         (((u64::from(cpu.cs) << 4) + ir.guest_start) & 0xfffff).wrapping_sub(ir.guest_start)
@@ -2172,11 +2175,13 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
     };
     let mut steps = StepContext::new(limit);
     steps.pending_irq = pending_irq;
+    // The Machine walk carries the whole `ss_shadow` byte in its StepContext.
+    steps.ss_shadow = ss_shadow;
+    steps.nmi_blocked = nmi_blocked;
     let mut info = RetireInfo {
         code_base,
         exit_request: Some(exit_word),
         sti_shadow,
-        ss_shadow,
         ..Default::default()
     };
     let result = super::interpret_direct_steps::<ROUTED, ORDER, DIRECT20>(
@@ -2185,6 +2190,7 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
     if info.retired != 0 {
         cpu.rflags_system &= !(1 << 16);
     }
+    let ss_shadow = steps.ss_shadow;
     // A twenty-bit ModeChange is a NEC V20/V30 switch to 8080 mode: the
     // dispatcher decides the next boundary (decision-23 C4a).
     if matches!(result, BlockResult::Continue)
@@ -2199,26 +2205,26 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
             steps: steps.steps,
             retired: info.retired,
             sti_shadow: info.sti_shadow,
-            ss_shadow: info.ss_shadow,
+            ss_shadow,
             outcome: None,
         };
     }
     let outcome = match result {
         BlockResult::Continue | BlockResult::ModeChange => Ok(Outcome {
             arm_sti: info.sti_shadow,
-            arm_ss: info.ss_shadow,
+            arm_ss: ss_shadow,
             ..Outcome::default()
         }),
         BlockResult::Exit(exit) => match exit.into_exit() {
             Exit::BudgetExhausted => Ok(Outcome {
                 arm_sti: info.sti_shadow,
-                arm_ss: info.ss_shadow,
+                arm_ss: ss_shadow,
                 ..Outcome::default()
             }),
             exit @ (Exit::Hlt | Exit::PortIo { .. } | Exit::Interrupted) => Ok(Outcome {
                 exit: Some(exit),
                 arm_sti: info.sti_shadow,
-                arm_ss: info.ss_shadow,
+                arm_ss: ss_shadow,
                 ..Outcome::default()
             }),
             // The twenty-bit walk moves every data byte through a one-byte
@@ -2243,7 +2249,7 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
     };
     Progress {
         sti_shadow: info.sti_shadow,
-        ss_shadow: info.ss_shadow,
+        ss_shadow,
         steps: steps.steps,
         retired: info.retired,
         outcome: Some(outcome),
@@ -2282,16 +2288,17 @@ fn split_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
     if info.retired != 0 {
         cpu.rflags_system &= !(1 << 16);
     }
+    let ss_shadow = steps.ss_shadow;
     let progress = |outcome| Progress {
         steps: steps.steps,
         retired: info.retired,
         sti_shadow: info.sti_shadow,
-        ss_shadow: info.ss_shadow,
+        ss_shadow,
         outcome,
     };
     let boundary = Outcome {
         arm_sti: info.sti_shadow,
-        arm_ss: info.ss_shadow,
+        arm_ss: ss_shadow,
         ..Outcome::default()
     };
     Ok(match result {
@@ -2323,8 +2330,9 @@ pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
     limit: u64,
     exit_word: &std::sync::atomic::AtomicU64,
     sti_shadow: bool,
-    ss_shadow: bool,
+    ss_shadow: u8,
     pending_irq: bool,
+    nmi_blocked: bool,
 ) -> Progress {
     execute_shared::<ROUTED, ORDER, true>(
         ir,
@@ -2336,6 +2344,7 @@ pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
         sti_shadow,
         ss_shadow,
         pending_irq,
+        nmi_blocked,
     )
 }
 
@@ -2351,8 +2360,9 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
     exit_word: &std::sync::atomic::AtomicU64,
     task_switch: &mut tasks::SwitchState,
     sti_shadow: bool,
-    ss_shadow: bool,
+    ss_shadow: u8,
     pending_irq: bool,
+    nmi_blocked: bool,
 ) -> Progress {
     match walk {
         BlockWalk::Shared => execute_shared::<ROUTED, ORDER, false>(
@@ -2365,6 +2375,7 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
             sti_shadow,
             ss_shadow,
             pending_irq,
+            nmi_blocked,
         ),
         BlockWalk::Direct => execute_instructions::<ROUTED, ORDER>(
             ir,
@@ -2392,7 +2403,7 @@ pub(crate) fn execute_checked<const ROUTED: bool, const ORDER: u8>(
     let outcome = execute::<ROUTED, ORDER>(ir, cpu, memory, scratch, task_switch);
     Progress {
         sti_shadow: false,
-        ss_shadow: false,
+        ss_shadow: 0,
         steps: u64::from(outcome.is_ok()),
         retired: u64::from(outcome.as_ref().is_ok_and(|o| o.retired)),
         outcome: Some(outcome),
@@ -3341,7 +3352,12 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         context.generation,
                     )?;
                     outcome.context_changed = true;
-                    outcome.arm_ss = *inhibit;
+                    // spec.md §17.10: an SS load also holds the NMI input.
+                    outcome.arm_ss = if *inhibit {
+                        crate::vm::SS_HOLD | crate::vm::NMI_HOLD
+                    } else {
+                        0
+                    };
                 }
                 L::Push { value, size } => {
                     push(cpu, mem, context, &[read_val(*value, temps)], *size)?
@@ -3827,7 +3843,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 | L::BitField20 { .. }
                 | L::BcdString20 { .. }
                 | L::Fpo2Escape20 { .. }
-                | L::InhibitIrq20 => {
+                | L::InhibitIrq20
+                | L::HoldExternal20 => {
                     return Err(refusal(
                         cpu,
                         crate::UnsupportedSystemOperation::LegacyExecution,

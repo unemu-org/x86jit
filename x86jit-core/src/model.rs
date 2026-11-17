@@ -113,8 +113,9 @@ pub struct ModelQuirks {
     /// through the following instruction (NEC V20/V30 UM §6 p. 6-4).
     pub segment_store_inhibits_interrupts: bool,
     /// The manual gives no order for a single-step trap and an acceptable
-    /// external interrupt at one boundary; the engine refuses that boundary
-    /// (NEC V20/V30 UM §6 Table 6-1 p. 6-1 lists priorities only).
+    /// external interrupt, INT or NMI, at one boundary; the engine refuses
+    /// that boundary (NEC V20/V30 UM §6 Table 6-1 p. 6-1 lists priorities
+    /// only).
     pub step_irq_conflict_refused: bool,
     /// STI holds maskable interrupts through the next instruction whatever IF
     /// was: NEC V20/V30 UM §6 p. 6-4 ("between the EI instruction and the next
@@ -135,6 +136,36 @@ pub struct ModelQuirks {
     /// p. B-9; §5.2 p. 5-7; App. C Table C-1 p. C-1). Only an attached
     /// coprocessor raises it; `None` keeps the CPU's whole-operand check.
     pub coprocessor_overrun_vector: Option<u8>,
+    /// What an NMI edge does while an earlier NMI is being serviced
+    /// (spec.md §17.10).
+    pub nmi_nesting: NmiNesting,
+}
+
+/// What a rising edge on the NMI input does while an earlier NMI is being
+/// serviced (spec.md §17.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NmiNesting {
+    /// No blocking: an edge after acceptance is serviced again (8086 Family
+    /// UM §2.6 p. 2-26 and App. B p. B-6; ASSUMED for the NEC V20/V30, whose
+    /// manual is silent).
+    Nested,
+    /// Blocked from acceptance until the next IRET; one further edge is
+    /// remembered and serviced after that IRET (80286 PRM §9.2 p. 9-3).
+    BlockedRemember,
+    /// Blocked from acceptance until the next IRET; edges meanwhile are
+    /// ignored (80386 PRM §9.2.1 p. 9-3).
+    BlockedIgnore,
+}
+
+impl NmiNesting {
+    const fn word(self) -> u64 {
+        match self {
+            Self::Nested => 0,
+            Self::BlockedRemember => 1,
+            Self::BlockedIgnore => 2,
+        }
+    }
 }
 
 /// Reserved catalogue handle for a cycle table (decision-23, Timing model).
@@ -217,6 +248,7 @@ static I80286: ModelProfile = identified(ModelProfile {
         ei_delay_unconditional: false,
         lock_data_movement: true,
         coprocessor_overrun_vector: Some(9),
+        nmi_nesting: NmiNesting::BlockedRemember,
     },
     system: ModelSystem::Msw286,
     physical_bits: 24,
@@ -257,6 +289,7 @@ static I80386: ModelProfile = identified(ModelProfile {
         ei_delay_unconditional: false,
         lock_data_movement: false,
         coprocessor_overrun_vector: None,
+        nmi_nesting: NmiNesting::BlockedIgnore,
     },
     system: ModelSystem::Cr386,
     physical_bits: 32,
@@ -301,6 +334,7 @@ const fn early_model(identity: u64) -> ModelProfile {
             ei_delay_unconditional: false,
             lock_data_movement: false,
             coprocessor_overrun_vector: None,
+            nmi_nesting: NmiNesting::Nested,
         },
         system: ModelSystem::None,
         physical_bits: 20,
@@ -364,6 +398,7 @@ const fn nec_model(identity: u64) -> ModelProfile {
             ei_delay_unconditional: true,
             lock_data_movement: false,
             coprocessor_overrun_vector: None,
+            nmi_nesting: NmiNesting::Nested,
         },
         system: ModelSystem::None,
         physical_bits: 20,
@@ -557,12 +592,27 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
             },
         );
     }
+    // NMI nesting (xj-50w.19). Its canonical value is Nested for the early
+    // entries, BlockedRemember for the 286 and BlockedIgnore for the 386, so
+    // only a departing entry hashes it and no identity changes.
+    let canonical_nmi = if early_entry {
+        NmiNesting::Nested
+    } else if matches!(p.system, ModelSystem::Msw286) {
+        NmiNesting::BlockedRemember
+    } else {
+        NmiNesting::BlockedIgnore
+    };
+    if p.quirks.nmi_nesting.word() != canonical_nmi.word() {
+        hash = word(hash, 0x4e4d49);
+        hash = word(hash, p.quirks.nmi_nesting.word());
+    }
     p.semantics_id = hash;
     p
 }
 
 // Bump when the NEC extension decode or lowering changes (decision-23 C4b).
-const NEC_EXTENSION_REVISION: u64 = 1;
+// 2: the segment-register store holds NMI as well as INT (xj-50w.19).
+const NEC_EXTENSION_REVISION: u64 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -585,7 +635,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..23 {
+            for change in 0..24 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -616,6 +666,7 @@ mod tests {
                                 None => Some(9),
                             }
                     }
+                    22 => changed.quirks.nmi_nesting = NmiNesting::Nested,
                     _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);
@@ -634,8 +685,11 @@ mod tests {
             // The 8086-family values after xj-50w.12's LOCK revision word.
             (CpuModel::I8088, 0x8815_844f_bd9d_4559),
             (CpuModel::I8086, 0x8815_844f_bd9d_4557),
-            (CpuModel::NecV20, 0x2a38_6bfd_83ff_8f1f),
-            (CpuModel::NecV30, 0x2a38_6bfd_83ff_8f27),
+            // The NEC values after xj-50w.19's NEC_EXTENSION_REVISION 2 (the
+            // segment-register store holds NMI); they were 0x2a38_6bfd_83ff_8f1f
+            // and 0x2a38_6bfd_83ff_8f27.
+            (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
+            (CpuModel::NecV30, 0xcd48_16e2_6331_d184),
         ] {
             assert_eq!(model.profile().semantics_id, identity, "{model:?}");
             assert!(!model.profile().quirks.lock_data_movement, "{model:?}");
@@ -669,10 +723,11 @@ mod tests {
             I8088.semantics_id ^ 8088
         );
         let base = identified(copy(&NEC_V20)).semantics_id;
-        for change in 0..5 {
+        for change in 0..6 {
             let mut changed = copy(&NEC_V20);
             match change {
                 0 => changed.quirks.rep_restart_prefixes = Some(1),
+                4 => changed.quirks.nmi_nesting = NmiNesting::BlockedIgnore,
                 1 => changed.quirks.iret_delays_interrupts = true,
                 2 => changed.quirks.segment_store_inhibits_interrupts = false,
                 3 => changed.quirks.ei_delay_unconditional = false,

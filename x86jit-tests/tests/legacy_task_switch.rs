@@ -3028,3 +3028,180 @@ fn review6_nonresumable_debug_delivery_refusal_releases_sti_shadow() {
         assert!(!cpu.has_pending_irq());
     }
 }
+
+// ---------------------------------------------------------------------------
+// The NMI input through an IDT task gate (xj-50w.19; spec.md §17.10):
+// I286 PRM §9.2 p. 9-3 ("the first IRET", which may be a task return), §9.6
+// p. 9-9; 80386 PRM §9.2.1 p. 9-3.
+
+// Vector 2 through a task gate to B; B starts at 1800h with the TSS FLAGS
+// image `flags`.
+fn nmi_task(model: CpuModel, wide: bool, flags: u32, b_code: &[u8]) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = setup_tasks_delivery(model, wide, b"\x90\x90", ExceptionDelivery::InGuest);
+    cpu.cpu.legacy.idtr.base = 0x3000;
+    cpu.cpu.legacy.idtr.limit = 0x7ff;
+    gate(&vm, 0x3010, B, 0x85);
+    put(
+        &vm,
+        base(B) + if wide { 0x24 } else { 0x10 },
+        if wide { 4 } else { 2 },
+        flags,
+    );
+    vm.write_bytes(0x1800, b_code).unwrap();
+    (vm, cpu)
+}
+
+#[test]
+fn nmi_task_gate_with_if_set_takes_a_queued_irq_first() {
+    // I286 PRM §9.6 p. 9-9: "If other interrupts remain enabled, they are
+    // processed before the first instruction of the current interrupt
+    // handler"; §9.2 p. 9-3 recommends IF = 0 in the NMI task for this reason.
+    for (model, wide) in formats() {
+        let (vm, mut cpu) = nmi_task(model, wide, 0x202, b"\xf4");
+        // Vector 30h: a 16-bit interrupt gate to 8:1A00 (HLT).
+        vm.write_bytes(0x3180, &[0x00, 0x1a, 8, 0, 0, 0x86, 0, 0])
+            .unwrap();
+        vm.write_bytes(0x1a00, b"\xf4").unwrap();
+        cpu.cpu.flags.if_ = true;
+        cpu.inject_irq(0x30);
+        cpu.raise_nmi().unwrap();
+        let run = cpu.run_steps(&vm, 4, StepOptions::default()).unwrap();
+        assert!(
+            matches!(run.stop(), StepStop::Exit(Exit::Hlt)),
+            "{:?}",
+            run.stop()
+        );
+        assert_eq!(run.steps(), 1);
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1a01));
+        assert_eq!(
+            value(&vm, 0x8ffa, 2),
+            0x1800,
+            "IRQ frame: the NMI task's entry"
+        );
+        assert!(!cpu.has_pending_irq() && !cpu.has_pending_nmi());
+        assert!(!cpu.nmi_ready(), "blocked in the NMI task");
+    }
+}
+
+#[test]
+fn a_task_return_iret_ends_nmi_blocking() {
+    // I286 PRM §9.2 p. 9-3: the NMI task's IRET (NT = 1, a task return) is
+    // the first IRET; the I80286 then services the remembered edge.
+    for (model, wide) in formats() {
+        let (vm, mut cpu) = nmi_task(model, wide, 2, b"\x90\xcf");
+        cpu.raise_nmi().unwrap();
+        steps(&mut cpu, &vm, 1); // the switch, then B's NOP
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1801));
+        assert!(!cpu.nmi_ready());
+        cpu.raise_nmi().unwrap();
+        steps(&mut cpu, &vm, 1); // B's IRET returns to A
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (A, 0x1006));
+        assert!(cpu.nmi_ready(), "the task return ended blocking");
+        assert_eq!(cpu.has_pending_nmi(), model == CpuModel::I80286);
+    }
+}
+
+#[test]
+fn a_task_return_iret_through_a_device_ends_nmi_blocking_at_completion() {
+    // spec.md §17.10: a bus handoff inside the task-return IRET does not end
+    // blocking; its completion does (I286 PRM §9.2 p. 9-3, "the first
+    // IRET"). The TSS page is a device here. An edge raised during the first
+    // handoff leaves the word as a blocked edge, remembered (80286) or
+    // ignored (80386); the 80286 latches it again at completion.
+    for (model, wide) in formats() {
+        let (mut vm, mut cpu) = nmi_task(model, wide, 2, b"\x90\xcf");
+        cpu.raise_nmi().unwrap();
+        steps(&mut cpu, &vm, 1); // the switch, then B's NOP
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1801));
+        vm.unmap(0, 0x240000).unwrap();
+        for (at, size, kind) in [
+            (0, 0x4000, x86jit_core::RegionKind::Ram),
+            (0x4000, 0x1000, x86jit_core::RegionKind::Trap),
+            (0x5000, 0x23b000, x86jit_core::RegionKind::Ram),
+        ] {
+            vm.map(at, size, x86jit_core::Prot::RWX, kind).unwrap();
+        }
+        let line = cpu.nmi_line().unwrap();
+        let remember = model == CpuModel::I80286;
+        let mut handoffs = 0;
+        loop {
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            match *run.stop() {
+                StepStop::Exit(Exit::MmioRead { addr, size, .. }) => {
+                    cpu.complete_mmio_read(value(&vm, addr, size.into()));
+                }
+                StepStop::Exit(Exit::MmioWrite {
+                    addr, size, value, ..
+                }) => {
+                    put(&vm, addr, size.into(), value as u32);
+                    cpu.complete_mmio_write();
+                }
+                StepStop::Exit(Exit::BudgetExhausted) => break,
+                ref other => panic!("{other:?}"),
+            }
+            assert_eq!(run.steps(), 0);
+            assert!(!cpu.nmi_ready());
+            if handoffs == 1 {
+                assert!(!line.is_raised(), "a blocked edge during the handoff");
+            }
+            if handoffs != 0 {
+                assert_eq!(cpu.has_pending_nmi(), remember, "still blocked");
+            } else {
+                cpu.raise_nmi().unwrap();
+            }
+            handoffs += 1;
+        }
+        assert!(handoffs > 2, "{handoffs}");
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (A, 0x1006));
+        assert!(cpu.nmi_ready(), "the completed task return ended blocking");
+        assert_eq!(
+            (cpu.has_pending_nmi(), line.is_raised()),
+            (remember, remember)
+        );
+    }
+}
+
+#[test]
+fn an_edited_state_abandons_an_nmi_task_switch_and_its_blocking() {
+    // decision-24 and spec.md §17.10: an accepted NMI whose task switch is
+    // abandoned by a host edit is consumed, and leaves no blocking behind.
+    for (model, wide) in formats() {
+        let (mut vm, mut cpu) =
+            setup_tasks_delivery(model, wide, b"\x90", ExceptionDelivery::InGuest);
+        cpu.cpu.legacy.idtr.base = 0x7000;
+        cpu.cpu.legacy.idtr.limit = 0x7ff;
+        gate(&vm, 0x7010, B, 0x85);
+        descriptor(&vm, 0x2038, 0x6000, 7, 0x82);
+        descriptor(&vm, 0x6000, 0, 0xffff, 0x92);
+        put(&vm, base(B) + if wide { 0x60 } else { 0x2a }, 2, 56);
+        put(&vm, base(B) + if wide { 0x54 } else { 0x28 }, 2, 4);
+        vm.write_bytes(0x1800, b"\x90\x90").unwrap();
+        split_task_pages(&mut vm);
+        retag_task_page(&mut vm, 0x6000, x86jit_core::RegionKind::Trap);
+        cpu.raise_nmi().unwrap();
+        for at in [0x6000, 0x6004] {
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(run.stop(), StepStop::Exit(Exit::MmioRead {addr, size:4, ..}) if *addr == at),
+                "{:?}",
+                run.stop()
+            );
+            cpu.complete_mmio_read(value(&vm, at, 4));
+        }
+        expect_task_refusal(
+            &mut cpu,
+            &vm,
+            x86jit_core::UnsupportedSystemOperation::LegacyInstruction,
+        );
+        assert!(
+            !cpu.has_pending_nmi() && !cpu.nmi_ready(),
+            "accepted, blocked"
+        );
+        cpu.cpu.gpr[0] = 0xbeef;
+        retag_task_page(&mut vm, 0x6000, x86jit_core::RegionKind::Ram);
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rip, 0x1801);
+        assert!(!cpu.has_pending_nmi(), "consumed");
+        assert!(cpu.nmi_ready(), "no blocking left");
+    }
+}

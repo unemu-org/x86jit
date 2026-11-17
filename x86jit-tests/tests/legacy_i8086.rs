@@ -2332,7 +2332,11 @@ fn a_locked_instruction_is_one_instruction_to_interrupts_and_traps() {
 // system models, the I80286 identity changes with its own quirk fields
 // (xj-50w.11) and the I80386 identity does not (values of b2ac76e4 on the
 // left). xj-ir6.33 changes no identity: its device transfers are interpreter
-// behaviour, and no lifting rule or catalogue field changes.
+// behaviour, and no lifting rule or catalogue field changes. xj-50w.19 then
+// raises the NEC extension revision word to 2 (the segment-register store
+// holds NMI as well as INT): the NEC "after" values below are that revision's
+// (2a386bfd83ff8f1f and 2a386bfd83ff8f27 after xj-50w.12); its new
+// `nmi_nesting` field keeps its canonical value everywhere and moves nothing.
 #[test]
 fn lock_admission_changes_only_the_twenty_bit_identities() {
     for (model, before, after) in [
@@ -2349,12 +2353,12 @@ fn lock_admission_changes_only_the_twenty_bit_identities() {
         (
             CpuModel::NecV20,
             0x909a_c76c_b38b_71d8,
-            0x2a38_6bfd_83ff_8f1f,
+            0xcd48_16e2_6331_d1bc,
         ),
         (
             CpuModel::NecV30,
             0x909a_c76c_b38b_71e0,
-            0x2a38_6bfd_83ff_8f27,
+            0xcd48_16e2_6331_d184,
         ),
         (
             CpuModel::I80286,
@@ -2798,6 +2802,515 @@ fn a_restored_mid_string_state_names_the_first_prefix() {
     );
     cpu.cpu = saved;
     assert_eq!(irq_frame(&vm, &mut cpu), IP);
+}
+
+// ---------------------------------------------------------------------------
+// The NMI input (xj-50w.19; spec.md §17.10). 8086 Family UM §2.6
+// pp. 2-24–28, §2.7 pp. 2-42 and 2-48, App. A AP-67 pp. A-27–29, App. B
+// p. B-6. Each witness compares the whole CpuState, the frame words, the
+// steps and the retired count.
+
+use x86jit_core::CpuState;
+
+const NMI_CS: u16 = 0x1000;
+const NMI_IP: u16 = 0x400;
+
+fn state(c: &CpuState) -> String {
+    format!("{c:?}")
+}
+// The FLAGS image an 8086 frame stores: bits 15:12 set (UM p. 4-17).
+fn image(c: &CpuState) -> u64 {
+    (c.rflags() & 0xffff) | 0xf000
+}
+// The CPU after one interrupt entry: FLAGS, CS, IP pushed, IF and TF clear,
+// CS:IP from the vector (UM §2.6 p. 2-26).
+fn entered(c: &CpuState, cs: u16, ip: u16) -> CpuState {
+    let mut e = c.clone();
+    e.gpr[4] = c.gpr[4].wrapping_sub(6) & 0xffff;
+    e.flags.if_ = false;
+    e.rflags_system &= !0x100;
+    e.cs = cs;
+    e.rip = u64::from(ip);
+    e
+}
+fn frame_at(vm: &Vm, sp: u64) -> [u64; 3] {
+    [0, 2, 4].map(|d| vm.mem.read(sp + d, 2).unwrap())
+}
+fn to_hlt(vm: &Vm, cpu: &mut Vcpu, budget: u64) -> u64 {
+    let r = cpu.run_steps(vm, budget, StepOptions::default()).unwrap();
+    assert!(
+        matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+        "{:?}",
+        r.stop()
+    );
+    r.steps()
+}
+fn nmi_setup(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+    let (vm, cpu) = setup(model, code);
+    vector(&vm, 2, NMI_IP, NMI_CS);
+    (vm, cpu)
+}
+
+#[test]
+fn nmi_ignores_if_and_coalesces_its_edges() {
+    // UM §2.6 p. 2-24 (IF does not mask NMI; no INTA cycles), p. 2-26
+    // (frame, IF and TF cleared); App. B p. B-6 (an edge is latched and
+    // serviced at the end of the current instruction).
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\xfa\x90");
+        cpu.cpu.flags.if_ = true;
+        step(&vm, &mut cpu, 1); // CLI
+        cpu.raise_nmi().unwrap();
+        let line = cpu.nmi_line().unwrap();
+        line.raise();
+        assert!(line.is_raised());
+        assert!(cpu.has_pending_nmi() && cpu.nmi_ready());
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP + 1, 0, image(&before)]);
+        assert_eq!(image(&before) & 0x200, 0, "delivered with IF = 0");
+        assert_eq!(cpu.retired_instructions(), 2);
+        assert!(!cpu.has_pending_nmi() && !line.is_raised(), "one delivery");
+    }
+}
+
+#[test]
+fn an_edge_after_acceptance_nests_on_the_8086() {
+    // UM §2.6 p. 2-26 ("always may be interrupted by a request arriving on
+    // NMI"); App. B p. B-6 ("Another high-going edge triggers another
+    // response if it occurs after the start of the NMI procedure").
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x90");
+        vm.write_bytes(0x10400, b"\x90\xf4").unwrap();
+        cpu.raise_nmi().unwrap();
+        step(&vm, &mut cpu, 1); // delivery, then the handler's NOP
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (NMI_CS, 0x401));
+        cpu.raise_nmi().unwrap();
+        assert!(cpu.has_pending_nmi() && cpu.nmi_ready());
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 2);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 2))
+        );
+        assert_eq!(
+            frame_at(&vm, 0x7ff4),
+            [0x401, u64::from(NMI_CS), image(&before)]
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa)[0], IP);
+        assert_eq!(cpu.retired_instructions(), 3);
+    }
+}
+
+#[test]
+fn nmi_frame_precedes_the_step_frame_and_a_queued_irq_waits() {
+    // UM §2.6 p. 2-28 ("either internal or external"), AP-67 Fig. 3E3a
+    // p. A-29: an NMI met by the single-step trap is entered first, then the
+    // step frame, so the step routine returns into the unstepped NMI
+    // handler. UM p. 2-24: NMI before INTR; the IRQ waits behind IF = 0.
+    // Both the post-instruction trap and the port-I/O trap (deferred until
+    // the handoff returns) take this order.
+    for model in MODELS {
+        for (code, port) in [(&b"\xa0\x00\x40\x90"[..], false), (&b"\xee\x90"[..], true)] {
+            for irq in [false, true] {
+                let (vm, mut cpu) = setup_review(model, code, true);
+                vector(&vm, 2, NMI_IP, NMI_CS);
+                vector(&vm, 1, 0x500, 0);
+                vector(&vm, 0x20, 0x600, 0);
+                vm.write_bytes(0x500, b"\xf4\xcf").unwrap(); // step routine: HLT; IRET
+                cpu.cpu.flags.if_ = irq;
+                cpu.cpu.rflags_system = 0x100;
+                let start = cpu.cpu.clone();
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                if port {
+                    assert!(matches!(r.stop(), StepStop::Exit(Exit::PortIo { .. })));
+                    assert_eq!(r.steps(), 1);
+                } else {
+                    assert!(matches!(r.stop(), StepStop::Exit(Exit::MmioRead { .. })));
+                    assert_eq!(r.steps(), 0);
+                    // Answered but unfinished: not yet an NMI boundary.
+                    cpu.complete_mmio_read(0x5a);
+                }
+                cpu.raise_nmi().unwrap();
+                if irq {
+                    cpu.inject_irq(0x20);
+                }
+                assert_eq!(cpu.nmi_ready(), port);
+                // The port handoff names the next instruction (xj-50w.22),
+                // and the NMI frame saves it.
+                let next = if port { IP + 1 } else { IP + 3 };
+                if port {
+                    assert_eq!(cpu.cpu.rip, next);
+                }
+                let mut before = start.clone();
+                before.rip = next;
+                if !port {
+                    before.gpr[0] = 0x5a;
+                }
+                assert_eq!(to_hlt(&vm, &mut cpu, 2), if port { 1 } else { 2 });
+                let inner = entered(&before, NMI_CS, NMI_IP);
+                let mut expected = entered(&inner, 0, 0x501);
+                // The finished device transfer's retry bookkeeping.
+                expected.mmio_parts = cpu.cpu.mmio_parts;
+                assert_eq!(state(&cpu.cpu), state(&expected));
+                assert_eq!(frame_at(&vm, 0x7ffa), [next, 0, image(&before)]);
+                assert_eq!(
+                    frame_at(&vm, 0x7ff4),
+                    [u64::from(NMI_IP), u64::from(NMI_CS), image(&inner)]
+                );
+                assert_eq!(cpu.has_pending_irq(), irq);
+                assert!(!cpu.has_pending_nmi());
+                step(&vm, &mut cpu, 1); // the step routine's IRET
+                assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (NMI_CS, u64::from(NMI_IP)));
+                // The NMI handler runs unstepped: no further step frame.
+                assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+                assert_eq!(cpu.cpu.gpr[4], 0x7ffa);
+                assert_eq!(cpu.has_pending_irq(), irq);
+            }
+        }
+    }
+}
+
+#[test]
+fn ap67_internal_interrupt_nmi_and_tf_take_no_step_frame() {
+    // AP-67 p. A-28 and Fig. 3E3b p. A-29: an internal interrupt, an NMI and
+    // TF together run both service routines without single stepping; with
+    // TF = 0 the same two frames are taken. The segment load before the
+    // interrupting instruction holds the latched NMI one instruction
+    // (UM p. 2-24 footnote), so the NMI meets that instruction's trap.
+    for model in MODELS {
+        for (code, n, saved, of) in [
+            (&b"\x8e\xd8\xcd\x21"[..], 0x21u8, IP + 4, false),
+            (&b"\x8e\xd8\xcc"[..], 3, IP + 3, false),
+            (&b"\x8e\xd8\xce"[..], 4, IP + 3, true),
+            (&b"\x8e\xd8\xf7\xf3"[..], 0, IP + 4, false),
+        ] {
+            for tf in [true, false] {
+                let (vm, mut cpu) = nmi_setup(model, code);
+                vector(&vm, n, 0x300, 0x2000);
+                vector(&vm, 1, 0x500, 0);
+                cpu.cpu.flags.of = of;
+                cpu.cpu.rflags_system = if tf { 0x100 } else { 0 };
+                step(&vm, &mut cpu, 1); // MOV DS,AX: no step trap after it
+                assert_eq!(cpu.cpu.rip, IP + 2);
+                cpu.raise_nmi().unwrap();
+                assert!(cpu.has_pending_nmi() && !cpu.nmi_ready());
+                let before = cpu.cpu.clone();
+                let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+                assert!(
+                    matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                    "{n} {tf}: {:?}",
+                    r.stop()
+                );
+                // The divide error is a trap of the DIV, which retires no
+                // unit; INT n, INT 3 and INTO complete one.
+                assert_eq!(r.steps(), if n == 0 { 1 } else { 2 }, "{n}");
+                let internal = entered(&before, 0x2000, 0x300);
+                let mut expected = entered(&internal, NMI_CS, NMI_IP + 1);
+                expected.flags.of = of;
+                assert_eq!(state(&cpu.cpu), state(&expected), "{n} {tf}");
+                assert_eq!(frame_at(&vm, 0x7ffa), [saved, 0, image(&before)]);
+                assert_eq!(
+                    frame_at(&vm, 0x7ff4),
+                    [0x300, 0x2000, image(&internal)],
+                    "{n} {tf}"
+                );
+                assert_eq!(cpu.cpu.gpr[4], 0x7ff4, "no step frame");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_edge_after_the_step_frame_is_stacked_on_top() {
+    // UM §2.6 p. 2-26: NMI is not masked inside the step routine; the edge
+    // raised between calls meets an ordinary boundary.
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x90");
+        vector(&vm, 1, 0x500, 0);
+        vm.write_bytes(0x500, b"\x90").unwrap();
+        cpu.cpu.rflags_system = 0x100;
+        let first = cpu.cpu.clone();
+        step(&vm, &mut cpu, 1); // NOP, then the step frame
+        let mut stepped = first.clone();
+        stepped.rip = IP + 1;
+        assert_eq!(state(&cpu.cpu), state(&entered(&stepped, 0, 0x500)));
+        cpu.raise_nmi().unwrap();
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP + 1, 0, image(&stepped)]);
+        assert_eq!(frame_at(&vm, 0x7ff4), [0x500, 0, image(&before)]);
+    }
+}
+
+#[test]
+fn sti_and_iret_delays_do_not_hold_nmi() {
+    // UM p. 2-24 and STI p. 2-48: the one-instruction delay concerns INTR;
+    // NMI is not masked by IF (p. 2-24). CLI leaves NMI deliverable.
+    for model in MODELS {
+        // STI from IF = 0, then IRET that sets IF.
+        for (code, frame) in [
+            (&b"\xfb\x90"[..], None),
+            (&b"\xcf\x90"[..], Some(0xf202u64)),
+        ] {
+            let (vm, mut cpu) = nmi_setup(model, code);
+            if let Some(flags) = frame {
+                vm.mem.write(0x8000, IP + 1, 2).unwrap();
+                vm.mem.write(0x8002, 0, 2).unwrap();
+                vm.mem.write(0x8004, flags, 2).unwrap();
+            }
+            step(&vm, &mut cpu, 1);
+            assert!(cpu.cpu.flags.if_);
+            // IF = 1, yet INTR is not ready: the delay is in force at this
+            // boundary, and the NMI is accepted there.
+            assert!(!cpu.irq_ready(), "the INTR delay is in force");
+            cpu.raise_nmi().unwrap();
+            assert!(cpu.nmi_ready());
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+            assert_eq!(frame_at(&vm, before.gpr[4] - 6)[0], IP + 1);
+        }
+    }
+}
+
+#[test]
+fn every_segment_load_holds_nmi_for_one_instruction() {
+    // UM §2.6 p. 2-24 footnote: after MOV or POP to a segment register "no
+    // interrupt is recognized until after the following instruction"
+    // (spec.md §17.10: held for NMI as for INTR).
+    for model in MODELS {
+        for load in [
+            &b"\x8e\xc0"[..],
+            b"\x8e\xd0",
+            b"\x8e\xd8",
+            b"\x07",
+            b"\x17",
+            b"\x1f",
+        ] {
+            let mut code = load.to_vec();
+            code.extend_from_slice(b"\x90\x90");
+            let (vm, mut cpu) = nmi_setup(model, &code);
+            step(&vm, &mut cpu, 1);
+            cpu.raise_nmi().unwrap();
+            assert!(cpu.has_pending_nmi() && !cpu.nmi_ready(), "{load:x?}");
+            step(&vm, &mut cpu, 1); // the held instruction
+            assert!(cpu.nmi_ready(), "{load:x?}");
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+            let next = IP + load.len() as u64 + 1;
+            assert_eq!(frame_at(&vm, before.gpr[4] - 6)[0], next, "{load:x?}");
+        }
+    }
+}
+
+#[test]
+fn consecutive_segment_loads_hold_nmi_at_each_boundary() {
+    // spec.md §17.10: each load holds the following boundary for NMI;
+    // INTR keeps decision-16 §4 (only the first load holds it).
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x8e\xd8\x8e\xc0\x90\x90");
+        cpu.cpu.flags.if_ = true;
+        step(&vm, &mut cpu, 1); // MOV DS,AX
+        cpu.raise_nmi().unwrap();
+        assert!(!cpu.nmi_ready());
+        step(&vm, &mut cpu, 1); // MOV ES,AX: held
+        assert!(!cpu.nmi_ready(), "the second load holds NMI again");
+        assert!(cpu.irq_ready(), "INTR is not held again (decision-16 §4)");
+        step(&vm, &mut cpu, 1); // NOP: held
+        assert!(cpu.nmi_ready());
+        assert!(!cpu.irq_ready(), "NMI has priority (UM p. 2-24)");
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP + 5, 0, image(&before)]);
+    }
+}
+
+#[test]
+fn hlt_wakes_on_nmi_and_saves_the_next_ip() {
+    // UM HLT p. 2-48 (NMI resumes); p. 2-26 (the next instruction's
+    // address is saved).
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\xf4");
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(cpu.cpu.rip, IP + 1);
+        assert!(!cpu.has_pending_nmi());
+        cpu.raise_nmi().unwrap();
+        assert!(
+            cpu.has_pending_nmi() && cpu.nmi_ready(),
+            "the wake condition"
+        );
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa), [IP + 1, 0, image(&before)]);
+    }
+}
+
+#[test]
+fn nmi_inside_rep_follows_the_last_prefix_rule() {
+    // UM §2.7 p. 2-42; App. B p. B-6 ("between whole moves"): after an
+    // element the saved IP names the last prefix; a budget cut before the
+    // first element keeps the whole instruction.
+    for model in MODELS {
+        for (code, budget, saved, count) in [
+            (&b"\x26\xf3\xa4"[..], 1, IP + 1, 2),
+            (&b"\xf3\x26\xa4"[..], 1, IP + 1, 2),
+            (&b"\x90\x26\xf3\xa4"[..], 1, IP + 1, 3),
+            (&b"\x90\x26\xf3\xa4"[..], 2, IP + 2, 2),
+        ] {
+            let (vm, mut cpu) = nmi_setup(model, code);
+            cpu.cpu.es = 0x1000;
+            cpu.cpu.gpr[1] = 3;
+            cpu.cpu.gpr[6] = 0x100;
+            cpu.cpu.gpr[7] = 0x200;
+            step(&vm, &mut cpu, budget);
+            cpu.raise_nmi().unwrap();
+            let before = cpu.cpu.clone();
+            assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+            assert_eq!(cpu.cpu.gpr[1], count);
+            assert_eq!(frame_at(&vm, 0x7ffa), [saved, 0, image(&before)]);
+            assert_eq!(
+                state(&cpu.cpu),
+                state(&entered(&before, NMI_CS, NMI_IP + 1))
+            );
+        }
+    }
+}
+
+#[test]
+fn nmi_delivery_costs_no_step_and_irq_ready_follows_the_handler() {
+    // decision-16 §2 order extended (spec.md §17.10): delivery costs zero
+    // steps; no stop reason is added. UM p. 2-24 (IRET delays INTR).
+    for model in MODELS {
+        for budget in [1, 2, 3] {
+            let (vm, mut cpu) = nmi_setup(model, b"\x90\x90");
+            vm.write_bytes(0x10400, b"\x90\x90\xcf").unwrap();
+            cpu.raise_nmi().unwrap();
+            let before = cpu.cpu.clone();
+            step(&vm, &mut cpu, budget);
+            let mut expected = if budget < 3 {
+                entered(&before, NMI_CS, NMI_IP + budget as u16)
+            } else {
+                before.clone()
+            };
+            if budget == 3 {
+                expected.rip = IP;
+            }
+            assert_eq!(state(&cpu.cpu), state(&expected), "{budget}");
+            assert_eq!(cpu.retired_instructions(), budget);
+        }
+        let (vm, mut cpu) = nmi_setup(model, b"\x90\x90");
+        vm.write_bytes(0x10400, b"\x90\x90\xcf").unwrap();
+        cpu.raise_nmi().unwrap();
+        assert!(matches!(
+            cpu.step_instruction(&vm),
+            x86jit_core::StepResult::Continue
+        ));
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (NMI_CS, u64::from(NMI_IP) + 1));
+        // The readiness stop: IF = 0 inside the handler; after its IRET the
+        // INTR delay holds one more instruction.
+        let (vm, mut cpu) = nmi_setup(model, b"\x90\x90");
+        vm.write_bytes(0x10400, b"\x90\x90\xcf").unwrap();
+        cpu.cpu.flags.if_ = true;
+        cpu.raise_nmi().unwrap();
+        assert!(!cpu.irq_ready());
+        let r = cpu
+            .run_steps(
+                &vm,
+                16,
+                StepOptions::default().with_stop_when_irq_ready(true),
+            )
+            .unwrap();
+        assert!(matches!(r.stop(), StepStop::IrqReady), "{:?}", r.stop());
+        assert_eq!(r.steps(), 4);
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, IP + 1));
+    }
+}
+
+#[test]
+fn zero_budget_host_request_and_pending_input_keep_the_latch() {
+    // decision-16 §2 extended (spec.md §17.10): N = 0 changes nothing; a host
+    // request returns first with the latch kept; an IN completion holds it.
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x90\xec\x90");
+        vector(&vm, 0x20, 0x600, 0);
+        cpu.cpu.flags.if_ = true;
+        cpu.raise_nmi().unwrap();
+        cpu.inject_irq(0x20);
+        cpu.exit_request().request_exit();
+        let before = cpu.cpu.clone();
+        let r = cpu.run_steps(&vm, 0, StepOptions::default()).unwrap();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert_eq!(r.steps(), 0);
+        let r = cpu.run_steps(&vm, 5, StepOptions::default()).unwrap();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::Interrupted)));
+        assert_eq!(r.steps(), 0);
+        assert_eq!(state(&cpu.cpu), state(&before));
+        assert!(cpu.has_pending_nmi() && cpu.has_pending_irq());
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert!(cpu.has_pending_irq(), "INTR waits behind IF = 0");
+        assert_eq!(cpu.retired_instructions(), 1);
+        // A pending IN: zero budget, then the refusal, then the completion.
+        let (vm, mut cpu) = nmi_setup(model, b"\xec\x90");
+        let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::PortIo { .. })));
+        // The handoff names the next instruction (xj-50w.22), and the NMI
+        // frame saves it.
+        assert_eq!(cpu.cpu.rip, IP + 1);
+        cpu.raise_nmi().unwrap();
+        assert!(!cpu.nmi_ready());
+        let held = cpu.cpu.clone();
+        let r = cpu.run_steps(&vm, 0, StepOptions::default()).unwrap();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert!(cpu.run_steps(&vm, 1, StepOptions::default()).is_err());
+        assert_eq!(state(&cpu.cpu), state(&held));
+        cpu.complete_port_in(0x5a);
+        assert!(cpu.nmi_ready());
+        let before = cpu.cpu.clone();
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 1);
+        assert_eq!(
+            state(&cpu.cpu),
+            state(&entered(&before, NMI_CS, NMI_IP + 1))
+        );
+        assert_eq!(frame_at(&vm, 0x7ffa)[0], IP + 1);
+    }
+}
+
+#[test]
+fn execution_reset_clears_the_nmi_latch() {
+    // spec.md §17.10: reset_execution_state discards the latch.
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x90\xf4");
+        cpu.raise_nmi().unwrap();
+        cpu.reset_execution_state(ResetOptions::default());
+        assert!(!cpu.has_pending_nmi());
+        assert!(!cpu.nmi_line().unwrap().is_raised());
+        assert_eq!(to_hlt(&vm, &mut cpu, 4), 2);
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, IP + 2));
+    }
 }
 
 // xj-50w.22: IN and OUT end their twenty-bit block. The exit names the next

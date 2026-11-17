@@ -978,6 +978,9 @@ pub enum LegacyOp {
     },
     /// Hold INT through the following instruction (NEC UM §6 p. 6-4).
     InhibitIrq20,
+    /// Hold INT and NMI through the following instruction: MOV reg16/mem16,
+    /// sreg (NEC UM §6 p. 6-4).
+    HoldExternal20,
     /// A LOCK-prefixed read-modify-write through a twenty-bit address
     /// (8086 Family UM §2.5 pp. 2-17–18, §2.7 p. 2-48; NEC V20/V30 UM
     /// p. 12-173 BUSLOCK), with the instruction bytes for the typed refusal

@@ -944,3 +944,88 @@ fn interruption_path_before_execution_and_owned_lifetime() {
         assert_eq!(evidence.rip(), CODE);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The NMI input raised while a Machine vCPU runs (xj-50w.19; spec.md
+// §17.10): `NmiLine::raise` from another thread is observed at the next
+// instruction or REP-iteration boundary, with no exit; writes made before the
+// raise are visible to the handler.
+
+// JMP $ at 0:1000, or MOV AX,2000h; MOV ES,AX; MOV AL,CCh; REP STOSB at
+// 0:1007 (CX = FFFFh, DI = 0) then JMP $.
+// The NMI handler at 0:1800 reads the flag byte at 5000h into AL, then halts.
+fn nmi_machine(model: x86jit_core::CpuModel, rep: bool) -> (Arc<Vm>, Vcpu) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x40000), Box::new(InterpreterBackend));
+    vm.set_cpu_model(model);
+    vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
+    let code: &[u8] = if rep {
+        b"\xb8\x00\x20\x8e\xc0\xb0\xcc\xf3\xaa\xeb\xfe"
+    } else {
+        b"\xeb\xfe"
+    };
+    vm.write_bytes(0x1000, code).unwrap();
+    vm.write_bytes(0x1800, b"\xa0\x00\x50\xf4").unwrap();
+    vm.mem.write(8, 0x1800, 4).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.gpr[4] = 0x8000;
+    cpu.cpu.gpr[1] = 0xffff;
+    (Arc::new(vm), cpu)
+}
+
+#[test]
+fn nmi_line_raised_from_another_thread_reaches_a_running_machine() {
+    use x86jit_core::CpuModel;
+    for model in [
+        CpuModel::I8086,
+        CpuModel::NecV20,
+        CpuModel::I80286,
+        CpuModel::I80386,
+    ] {
+        for rep in [false, true] {
+            let mut inside = 0;
+            for _ in 0..16 {
+                let (vm, mut cpu) = nmi_machine(model, rep);
+                let line = cpu.nmi_line().unwrap();
+                let request = cpu.exit_request();
+                let observed = Arc::clone(&vm);
+                let (done_tx, done_rx) = mpsc::channel::<()>();
+                let raiser = thread::spawn(move || {
+                    // Raise once the guest is running (the REP's first element).
+                    let start = Instant::now();
+                    while rep && observed.mem.read(0x20000, 1).unwrap() != 0xcc {
+                        assert!(start.elapsed() < TIMEOUT, "the guest never started");
+                        std::hint::spin_loop();
+                    }
+                    observed.write_bytes(0x5000, &[0x5a]).unwrap();
+                    line.raise();
+                    // A missing poll would spin forever: fail through a request.
+                    if done_rx.recv_timeout(TIMEOUT).is_err() {
+                        request.request_exit();
+                    }
+                });
+                let exit = cpu.run(&vm, None);
+                let _ = done_tx.send(());
+                raiser.join().unwrap();
+                assert!(matches!(exit, Exit::Hlt), "{model:?} {rep}: {exit:?}");
+                assert_eq!(cpu.cpu.gpr[0] & 0xff, 0x5a, "the flag is visible");
+                assert_eq!(cpu.cpu.rip, 0x1804);
+                assert!(!cpu.has_pending_nmi());
+                let saved = vm.mem.read(0x7ffa, 2).unwrap();
+                let count = cpu.cpu.gpr[1] & 0xffff;
+                if rep && count != 0 {
+                    // Between iterations: the saved IP names the string
+                    // instruction (its only prefix, on the 8086 family).
+                    assert_eq!(saved, 0x1007, "{model:?}");
+                    assert_eq!(cpu.cpu.gpr[7] & 0xffff, 0xffff - count);
+                    inside += 1;
+                } else {
+                    assert_eq!(saved, if rep { 0x1009 } else { 0x1000 }, "{model:?}");
+                }
+            }
+            if rep {
+                assert!(inside > 0, "{model:?}: no edge met the REP");
+            }
+        }
+    }
+}

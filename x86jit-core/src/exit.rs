@@ -77,6 +77,9 @@ pub enum UnsupportedSystemOperation {
     /// NEC V20/V30: a single-step trap and an acceptable INT at one boundary.
     /// NEC UM Table 6-1 p. 6-1 gives priorities, not the sequence.
     NecStepWithInterrupt,
+    /// NEC V20/V30: a single-step trap and an acceptable NMI at one boundary.
+    /// NEC UM Table 6-1 p. 6-1 gives priorities, not the sequence.
+    NecStepWithNmi,
     /// NEC V20/V30: CHKIND bounds on which a signed and an unsigned
     /// comparison disagree. NEC UM p. 12-170 does not say which applies.
     NecIndexComparison,

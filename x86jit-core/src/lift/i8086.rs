@@ -310,7 +310,7 @@ fn nec_instruction(
             && profile.quirks.segment_store_inhibits_interrupts =>
         {
             legacy::lower(insn, ops, tg)?;
-            ops.push(IrOp::Legacy(L::InhibitIrq20));
+            ops.push(IrOp::Legacy(L::HoldExternal20));
         }
         _ => return Ok(false),
     }
@@ -1071,6 +1071,7 @@ pub(crate) fn locked(ir: IrBlock, insn: &Instruction) -> Result<IrBlock, LiftErr
             | L::LoadFlagsWord { .. }
             | L::DivideTrap { .. }
             | L::InhibitIrq20
+            | L::HoldExternal20
             | L::SharedWalk,
         ) => false,
         IrOp::Legacy(L::Coprocessor20 { memory, .. } | L::Fpo2Escape20 { memory, .. }) => *memory,

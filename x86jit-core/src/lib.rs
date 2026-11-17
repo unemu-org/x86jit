@@ -226,7 +226,9 @@ pub use memory::{
     MemoryModel, Prot, RegionKind,
 };
 pub use memory_stats::{BackendMemoryStats, CacheMemoryStats, MemoryStats, VcpuMemoryStats};
-pub use model::{CpuModel, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming};
+pub use model::{
+    CpuModel, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming, NmiNesting,
+};
 pub use state::{
     CpuSource, CpuState, Flags, FpuModel, RandomKind, Reg, TscSample, X87PointerModel,
     X87Precision, AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
@@ -236,8 +238,8 @@ pub use time_stats::{
 };
 pub use vm::{
     Backend, CompileFailureReason, ExitRequest, ForceRegionError, InterpreterBackend,
-    MemConsistency, ResetOptions, ShutdownError, ShutdownReport, SourceIdError, StepOptions,
-    StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest, TierUpSubmit, TierUpUnit, Vcpu,
-    Vm, VmConfig,
+    MemConsistency, NmiLine, NmiUnsupported, ResetOptions, ShutdownError, ShutdownReport,
+    SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest,
+    TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
 pub use x87::FpuKind;

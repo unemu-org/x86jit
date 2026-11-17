@@ -8,6 +8,12 @@ use crate::legacy::{
 use crate::IrOp;
 use iced_x86::{Decoder, DecoderError};
 
+// The NMI input's cold helpers (spec.md §17.10), in their own module so that
+// this module's hot dispatcher code keeps its code-generation unit.
+mod nmi;
+use nmi::took_software_interrupt20;
+pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LegacyBlockKey {
     owner_id: u64,
@@ -135,15 +141,31 @@ struct InstructionRetry {
 enum EventSource {
     SingleStep,
     Irq(u8),
-    Exception { vector: u8, error_code: Option<u32> },
+    Exception {
+        vector: u8,
+        error_code: Option<u32>,
+    },
+    /// An accepted NMI (spec.md §17.10); `shutdown` when it ends an I80286 or
+    /// I80386 shutdown.
+    Nmi {
+        shutdown: bool,
+    },
 }
 #[derive(Clone, Copy)]
 struct PendingEvent {
     irq_consumed: bool,
+    /// The unit that raised this single-step trap took a software interrupt
+    /// (8086 AP-67 p. A-28; read only with an NMI latched).
+    software: bool,
+    /// An exception delivered serially after an NMI's delivery faulted: it
+    /// carries that NMI's blocking, which ends if this delivery never enters
+    /// the guest either (spec.md §17.10).
+    after_nmi: bool,
     source: EventSource,
     ip: u32,
     cs: u16,
 }
+
 fn exception_source(exit: &Exit) -> Option<EventSource> {
     let Exit::Exception { vector, .. } = exit else {
         return None;
@@ -183,7 +205,9 @@ struct MachineBoundary {
     service: bool,
     pending_io: bool,
     instruction_retry: bool,
-    a20_pending: bool,
+    // After a unit: a queued A20 change, or NMI blocking that an IRET may end
+    // (spec.md §17.10). The cold epilogue reads which.
+    cold_epilogue: bool,
     irq_pending: bool,
 }
 
@@ -717,7 +741,7 @@ impl Vcpu {
             code_base,
             consistency: vm.consistency,
             sti_shadow: self.sti_shadow,
-            ss_shadow: self.ss_shadow,
+            ss_shadow: self.ss_shadow & SS_HOLD != 0,
             exit_request: Some(exit_word),
             trace: vm.lockstep_trace.as_deref(),
             ..Default::default()
@@ -737,7 +761,7 @@ impl Vcpu {
         self.retired += info.retired;
         self.executed += info.retired;
         self.sti_shadow = info.sti_shadow;
-        self.ss_shadow = info.ss_shadow;
+        self.ss_shadow = u8::from(info.ss_shadow);
         match result {
             crate::interp::BlockResult::Continue => SplitRetry::Done { mode_change: false },
             crate::interp::BlockResult::ModeChange => SplitRetry::Done { mode_change: true },
@@ -791,7 +815,7 @@ impl Vcpu {
                 {
                     StepResult::Continue => {
                         self.sti_shadow = false;
-                        self.ss_shadow = false;
+                        self.ss_shadow = 0;
                         return None;
                     }
                     StepResult::Exit(exit) => exit,
@@ -1537,7 +1561,12 @@ impl Vcpu {
         if limit == Some(0) {
             return Err(Exit::BudgetExhausted);
         }
-        if self.legacy_execution.as_ref().unwrap().shutdown {
+        // spec.md §17.10: a latched NMI ends shutdown unless NMI is blocked;
+        // the dispatcher's first boundary admits only that NMI.
+        if self.legacy_execution.as_ref().unwrap().shutdown
+            && (self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE == 0
+                || self.nmi_state & NMI_BLOCKED != 0)
+        {
             return Err(Exit::Shutdown { addr: self.cpu.rip });
         }
         // Decision-16 §§1,3: validate CS:RIP ownership before execution,
@@ -1549,11 +1578,14 @@ impl Vcpu {
         if !self.cpu.mmio_retry_active && execution.task_switch.context().is_none() {
             execution.instruction_retry = None;
         }
-        if execution.event_retry.is_some_and(|event| {
+        if let Some(event) = execution.event_retry.filter(|event| {
             (u64::from(event.ip) != self.cpu.rip || event.cs != self.cpu.cs)
                 && execution.task_switch.context().is_none()
         }) {
             self.release_legacy_event_boundary();
+            // spec.md §17.10: a released NMI is latched again, unblocked; a
+            // released exception after a faulting NMI delivery unblocks.
+            self.undo_nmi(&event, true);
             self.apply_pending_a20();
         }
         if context.segment_class == crate::SegmentClass::Direct {
@@ -1671,16 +1703,18 @@ impl Vcpu {
         // finish single-step delivery before examining lower-priority external
         // interrupts, which may be serviced before the first handler instruction.
         // Interrupt gates clear IF; trap gates retain its prior value.
-        // NMI input/delivery is deferred. A future NMI path must check eligible
-        // NMIs after this delivery and before handler execution, independently
-        // of IF (80386 PRM §9.2.2 p. 9-3);
-        // MOV/POP SS inhibit its load boundary (I286 PRM Appendix B MOV
-        // p. B-73, POP p. B-83; 80386 PRM §9.2.4 pp. 9-3–4).
+        // The dispatcher checks a latched NMI after this delivery and before
+        // the handler's first instruction, independently of IF (80386 PRM
+        // §9.2.2 p. 9-3; spec.md §17.10).
         loop {
             let (vector, error_code, fault) = match event.source {
                 EventSource::SingleStep => (1, None, false),
                 EventSource::Irq(vector) => (vector, None, false),
                 EventSource::Exception { vector, error_code } => (vector, error_code, true),
+                // I286 PRM §9.2 p. 9-3, Table 9-3 p. 9-9; 80386 PRM Table 9-1
+                // p. 9-2: vector 2, no error code. External: CPL and gate DPL
+                // are not checked (I286 PRM §9.4 p. 9-4).
+                EventSource::Nmi { .. } => (2, None, false),
             };
             let delivery = crate::legacy::LegacyEvent {
                 vector,
@@ -1739,6 +1773,18 @@ impl Vcpu {
                         return Err(exit);
                     }
                     if !matches!(exit, Exit::Exception { .. }) {
+                        if self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .event_retry
+                            .is_none()
+                        {
+                            // A nonresumable refusal: as a queued IRQ stays
+                            // queued, an NMI is latched again; after a faulting
+                            // NMI delivery, its blocking ends (spec.md §17.10).
+                            self.undo_nmi(&event, true);
+                        }
                         // Accepted delivery owns its inputs through bus handoffs.
                         return Err(exit);
                     }
@@ -1747,23 +1793,41 @@ impl Vcpu {
                         && self.exception_delivery == crate::ExceptionDelivery::Outward
                     {
                         // Real-address Outward contract: the fault is returned and a
-                        // pending IRQ stays queued for the next IF check.
+                        // pending IRQ stays queued for the next IF check; an NMI
+                        // is latched again (spec.md §17.10).
+                        self.undo_nmi(&event, true);
                         return Err(exit);
                     }
                     self.consume_legacy_irq(&mut event);
                     if self.exception_delivery == crate::ExceptionDelivery::Outward {
+                        // 386 PRM Table 9-6 note 3 p. 9-20: the NMI is lost; no
+                        // guest handler will IRET (spec.md §17.10).
+                        self.undo_nmi(&event, false);
                         return Err(exit);
                     }
                     let next = exception_source(&exit).expect("architectural exception");
                     // I286 PRM §9.6.2 p. 9-10; I386 PRM §9.8.8,
                     // Tables 9-3/9-4 p. 9-13 (scan checked): delivery of #DF
-                    // that faults stops the processor until reset.
+                    // that faults stops the processor until reset. An NMI
+                    // taken out of shutdown whose delivery faults re-enters
+                    // it, still blocked: only reset ends it (I286 PRM §9.6.2
+                    // p. 9-10; SDM Vol 3A §7.15 p. 7-37; spec.md §17.10).
+                    // Any other NMI is benign: the fault is delivered
+                    // serially and the NMI is lost, still blocked (I286 PRM
+                    // §9.6.2 p. 9-10; 386 PRM Table 9-3 p. 9-13).
                     if !committed
-                        && matches!(event.source, EventSource::Exception { vector: 8, .. })
+                        && matches!(
+                            event.source,
+                            EventSource::Exception { vector: 8, .. }
+                                | EventSource::Nmi { shutdown: true }
+                        )
                     {
                         self.legacy_execution.as_mut().unwrap().shutdown = true;
                         return Err(Exit::Shutdown { addr: self.cpu.rip });
                     }
+                    // The serial exception carries the lost NMI's blocking
+                    // (spec.md §17.10).
+                    event.after_nmi |= matches!(event.source, EventSource::Nmi { .. });
                     // 286 PRM §9.6.4 p. 9-11; 386 PRM §7.5 p. 7-8:
                     // descriptor faults after a task switch start a new task's
                     // exception, rather than combining with the old task's event.
@@ -1801,12 +1865,15 @@ impl Vcpu {
         execution.event_retry = None;
         execution.port_debug = false;
         self.sti_shadow = false;
-        self.ss_shadow = false;
+        self.ss_shadow = 0;
     }
 
     fn abandon_legacy_event(&mut self) {
         if let Some(mut event) = self.legacy_execution.as_mut().unwrap().event_retry.take() {
             self.consume_legacy_irq(&mut event);
+            // spec.md §17.10: an abandoned NMI, or exception after a faulting
+            // NMI delivery, is consumed and leaves no blocking.
+            self.undo_nmi(&event, false);
         }
         self.release_legacy_event_boundary();
     }
@@ -1852,6 +1919,8 @@ impl Vcpu {
             context,
             PendingEvent {
                 irq_consumed: false,
+                software: false,
+                after_nmi: false,
                 source,
                 ip: exit
                     .fault_metadata()
@@ -1892,11 +1961,11 @@ impl Vcpu {
             task_pending,
             single_step,
             irq_pending,
-            a20_pending,
+            cold_epilogue: a20_pending || self.nmi_state != 0,
             one_step: SINGLE
                 || single_step
                 || self.sti_shadow
-                || self.ss_shadow
+                || self.ss_shadow & SS_HOLD != 0
                 || irq_pending
                 || a20_pending
                 || options.stop_when_irq_ready,
@@ -2032,21 +2101,29 @@ impl Vcpu {
                 // Helpers, faults and event continuations refresh on the next turn.
                 refresh_boundary = true;
                 let task_pending = boundary.task_pending;
-                let stop = if self.exit_request.word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
-                    && if SINGLE {
-                        !self.machine_pending_io(task_pending)
+                // A host request, or an NMI edge (spec.md §17.10), in one load.
+                if self.exit_request.word.load(Ordering::Relaxed) & (EXIT_REQUESTED | NMI_EDGE) != 0
+                {
+                    let pending_io = if SINGLE {
+                        self.machine_pending_io(task_pending)
                     } else {
-                        !boundary.pending_io
-                    } {
-                    Some(self.interrupted(crate::FaultPath::Interpreter, false))
-                } else {
-                    None
-                };
-                if let Some(exit) = stop {
-                    return DispatchResult::Stepped(StepRun {
-                        steps,
-                        stop: StepStop::Exit(exit),
-                    });
+                        boundary.pending_io
+                    };
+                    match self.machine_external(pending_io) {
+                        Err(exit) => {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(exit),
+                            })
+                        }
+                        // A latched NMI is decided at the service step and
+                        // forces one-step mode until it is delivered.
+                        Ok(true) => {
+                            boundary.service = true;
+                            boundary.one_step = true;
+                        }
+                        Ok(false) => {}
+                    }
                 }
                 if boundary.service {
                     if self.cpu.port_string_in.is_some() {
@@ -2069,7 +2146,7 @@ impl Vcpu {
                             });
                         }
                         self.sti_shadow = false;
-                        self.ss_shadow = false;
+                        self.ss_shadow = 0;
                         if self.cpu.mmio_retry_active {
                             self.cpu.finish_mmio_retry(None);
                         }
@@ -2093,10 +2170,38 @@ impl Vcpu {
                         self.legacy_execution.as_mut().unwrap().port_debug = false;
                         self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
                             irq_consumed: false,
+                            software: false,
+                            after_nmi: false,
                             source: EventSource::SingleStep,
                             ip: self.cpu.rip as u32,
                             cs: self.cpu.cs,
                         });
+                    }
+                    // spec.md §17.10: after an owned continuation, the NMI step
+                    // (including shutdown and the NEC 8080-mode BRK refusal),
+                    // then a queued IRQ.
+                    if self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE != 0
+                        && self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .event_retry
+                            .is_none()
+                    {
+                        match self.machine_nmi::<ROUTED, ORDER>(vm, context, task_pending) {
+                            None => {}
+                            Some(Ok(entered)) => {
+                                context = entered;
+                                direct_bus = raw_direct(&self.cpu);
+                                continue;
+                            }
+                            Some(Err(exit)) => {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                })
+                            }
+                        }
                     }
                     let event = self
                         .legacy_execution
@@ -2112,6 +2217,8 @@ impl Vcpu {
                                 })
                                 .map(|vector| PendingEvent {
                                     irq_consumed: false,
+                                    software: false,
+                                    after_nmi: false,
                                     source: EventSource::Irq(vector),
                                     ip: self.cpu.rip as u32,
                                     cs: self.cpu.cs,
@@ -2283,6 +2390,7 @@ impl Vcpu {
                         self.sti_shadow,
                         self.ss_shadow,
                         boundary.irq_pending,
+                        self.nmi_state & NMI_BLOCKED != 0,
                     )
                 } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
                     self.legacy_execution
@@ -2309,6 +2417,7 @@ impl Vcpu {
                         self.sti_shadow,
                         self.ss_shadow,
                         boundary.irq_pending,
+                        self.nmi_state & NMI_BLOCKED != 0,
                     )
                 };
                 if direct20 {
@@ -2350,17 +2459,22 @@ impl Vcpu {
                     refresh_boundary = boundary.one_step
                         || boundary.pending_io
                         || self.sti_shadow
-                        || self.ss_shadow
+                        || self.ss_shadow & SS_HOLD != 0
                         || (direct20 && self.cpu.rflags_system & 0x100 != 0);
-                    if boundary.a20_pending {
-                        self.apply_pending_a20();
-                        direct_bus = raw_direct(&self.cpu);
+                    if boundary.cold_epilogue {
+                        // A queued A20 change, or an IRET that ends NMI
+                        // blocking: derive the bus and the boundary again.
+                        if self.machine_epilogue(&ir, progress.retired) {
+                            direct_bus = raw_direct(&self.cpu);
+                            refresh_boundary = true;
+                        }
                     }
                     continue;
                 }
                 steps += progress.steps;
                 self.retired += progress.retired;
                 self.executed += progress.retired;
+                let unit_retired = progress.retired;
                 let outcome = progress.into_outcome();
                 if !outcome.as_ref().is_ok_and(|outcome| {
                     !outcome.context_changed && !outcome.translations_invalidated
@@ -2389,10 +2503,15 @@ impl Vcpu {
                 }
                 match outcome {
                     Ok(outcome) => {
-                        let arm_ss = outcome.arm_ss && !self.ss_shadow;
+                        if self.nmi_state & NMI_BLOCKED != 0 {
+                            self.nmi_after_unit(&ir, unit_retired);
+                        }
+                        // Decision-16 §4: the SS class is not rearmed; the NMI
+                        // hold is, by every load (spec.md §17.10).
+                        let arm_ss = outcome.arm_ss & SS_HOLD != 0 && self.ss_shadow & SS_HOLD == 0;
                         if self.cpu.port_string_in.is_none() {
                             self.sti_shadow = outcome.arm_sti;
-                            self.ss_shadow = arm_ss;
+                            self.ss_shadow = u8::from(arm_ss) | (outcome.arm_ss & NMI_HOLD);
                         }
                         if self.cpu.mmio_retry_active {
                             self.cpu.finish_mmio_retry(None);
@@ -2444,6 +2563,8 @@ impl Vcpu {
                             } else {
                                 let event = PendingEvent {
                                     irq_consumed: false,
+                                    software: direct20 && took_software_interrupt20(&ir, &self.cpu),
+                                    after_nmi: false,
                                     source: EventSource::SingleStep,
                                     ip: self.cpu.rip as u32,
                                     cs: self.cpu.cs,
@@ -2481,6 +2602,9 @@ impl Vcpu {
                         }
                     }
                     Err(exit) => {
+                        if self.nmi_state & NMI_BLOCKED != 0 {
+                            self.nmi_after_fault(&ir, &exit);
+                        }
                         // An architectural fault abandons this attempt before it is
                         // returned to the embedder; only resumable transfers keep IR.
                         self.cpu.finish_mmio_retry(Some(&exit));
@@ -2605,7 +2729,7 @@ impl Vcpu {
                     let mut info = crate::interp::RetireInfo {
                         consistency: vm.consistency,
                         sti_shadow: self.sti_shadow,
-                        ss_shadow: self.ss_shadow,
+                        ss_shadow: self.ss_shadow & SS_HOLD != 0,
                         exit_request: Some(exit_word),
                         ..Default::default()
                     };
@@ -2619,7 +2743,7 @@ impl Vcpu {
                     );
                     self.retired += info.retired;
                     self.sti_shadow = info.sti_shadow;
-                    self.ss_shadow = info.ss_shadow;
+                    self.ss_shadow = u8::from(info.ss_shadow);
                     match result {
                         StepResult::Continue => {
                             if BOUNDED {
@@ -2670,7 +2794,7 @@ impl Vcpu {
                     {
                         StepResult::Continue => {
                             self.sti_shadow = false;
-                            self.ss_shadow = false;
+                            self.ss_shadow = 0;
                             if !STEPPED && BOUNDED {
                                 steps += 1;
                             }
@@ -2735,7 +2859,7 @@ impl Vcpu {
                     code_base: u64::from(self.cpu.cs) << 4,
                     consistency: vm.consistency,
                     sti_shadow: self.sti_shadow,
-                    ss_shadow: self.ss_shadow,
+                    ss_shadow: self.ss_shadow & SS_HOLD != 0,
                     exit_request: Some(exit_word),
                     trace: vm.lockstep_trace.as_deref(),
                     ..Default::default()
@@ -2781,7 +2905,7 @@ impl Vcpu {
                 self.retired += info.retired;
                 self.executed += info.retired;
                 self.sti_shadow = info.sti_shadow;
-                self.ss_shadow = info.ss_shadow;
+                self.ss_shadow = u8::from(info.ss_shadow);
                 steps = if STEPPED {
                     alias_steps.steps
                 } else {
@@ -2824,7 +2948,7 @@ impl Vcpu {
                             {
                                 StepResult::Continue => {
                                     self.sti_shadow = false;
-                                    self.ss_shadow = false;
+                                    self.ss_shadow = 0;
                                     continue;
                                 }
                                 StepResult::Exit(exit) => {
@@ -2928,7 +3052,7 @@ impl Vcpu {
                     let mut info = crate::interp::RetireInfo {
                         consistency: vm.consistency,
                         sti_shadow: self.sti_shadow,
-                        ss_shadow: self.ss_shadow,
+                        ss_shadow: self.ss_shadow & SS_HOLD != 0,
                         exit_request: Some(exit_word),
                         ..Default::default()
                     };
@@ -2942,7 +3066,7 @@ impl Vcpu {
                     );
                     self.retired += info.retired;
                     self.sti_shadow = info.sti_shadow;
-                    self.ss_shadow = info.ss_shadow;
+                    self.ss_shadow = u8::from(info.ss_shadow);
                     match r {
                         StepResult::Continue => {
                             if BOUNDED {
@@ -3044,7 +3168,7 @@ impl Vcpu {
                             code_base: fetch.pa - fetch.ip,
                             consistency: vm.consistency,
                             sti_shadow: self.sti_shadow,
-                            ss_shadow: self.ss_shadow,
+                            ss_shadow: self.ss_shadow & SS_HOLD != 0,
                             exit_request: Some(exit_word),
                             trace: vm.lockstep_trace.as_deref(),
                             ..Default::default()
@@ -3062,7 +3186,7 @@ impl Vcpu {
                         // covers whichever tier actually ran the guest.
                         self.executed += info.retired;
                         self.sti_shadow = info.sti_shadow;
-                        self.ss_shadow = info.ss_shadow;
+                        self.ss_shadow = u8::from(info.ss_shadow);
                         match r {
                             crate::interp::BlockResult::Continue => {
                                 if BOUNDED {
@@ -3701,6 +3825,22 @@ impl Vcpu {
             .expect("twenty-bit dispatch requires an 8086-family catalogue model")
             .profile()
             .quirks;
+        // spec.md §17.10: a single-step trap meets an acceptable NMI here,
+        // before the boundary's NMI step.
+        let step_nmi = matches!(event.source, EventSource::SingleStep)
+            && self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE != 0
+            && self.nmi_gate(false);
+        if quirks.step_irq_conflict_refused
+            && matches!(event.source, EventSource::SingleStep)
+            && step_nmi
+        {
+            // NEC UM Table 6-1 p. 6-1 gives priorities, not the sequence.
+            self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
+            return Err(Exit::UnsupportedSystemContext {
+                addr: self.cpu.rip,
+                operation: UnsupportedSystemOperation::NecStepWithNmi,
+            });
+        }
         if quirks.step_irq_conflict_refused
             && matches!(event.source, EventSource::SingleStep)
             && self.pending_irq.is_some()
@@ -3712,9 +3852,26 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::NecStepWithInterrupt,
             });
         }
-        let trap = matches!(event.source, EventSource::SingleStep)
+        let mut trap = matches!(event.source, EventSource::SingleStep)
             || (quirks.step_interrupt_handler && self.cpu.rflags_system & 0x100 != 0);
-        if quirks.step_interrupt_handler
+        // 8086: an exception taken with TF meets an acceptable NMI after its
+        // own frame, once that delivery has ended the faulting instruction's
+        // shadows.
+        let mut nmi_after = quirks.step_interrupt_handler
+            && trap
+            && matches!(event.source, EventSource::Exception { .. });
+        if quirks.step_interrupt_handler && step_nmi {
+            // 8086 Family UM §2.6 p. 2-28 ("either internal or external");
+            // AP-67 Fig. 3E3a p. A-29: the NMI frame, then the step frame, so
+            // the step routine returns into the unstepped NMI handler. NMI
+            // wins over a queued IRQ, which waits behind IF = 0. After a
+            // software interrupt, AP-67 p. A-28 and Fig. 3E3b p. A-29: no step
+            // frame; stepping resumes after the interrupting instruction.
+            if self.accept_nmi() {
+                event.source = EventSource::Nmi { shutdown: false };
+                trap = !event.software;
+            }
+        } else if quirks.step_interrupt_handler
             && matches!(event.source, EventSource::SingleStep)
             && self.irq_delivery_ready()
         {
@@ -3726,6 +3883,9 @@ impl Vcpu {
             let vector = match event.source {
                 EventSource::SingleStep => 1,
                 EventSource::Irq(vector) | EventSource::Exception { vector, .. } => vector,
+                // 8086 Family UM §2.6 p. 2-24, Fig. 2-30 p. 2-25; NEC UM
+                // Table 6-1 p. 6-1: vector 2, no INTA cycle.
+                EventSource::Nmi { .. } => 2,
             };
             // NEC V20/V30 UM §6 p. 6-1, §8 p. 8-4: an interrupt taken in 8080
             // mode pushes the PSW with MD = 0, then sets MD = 1; standby ends.
@@ -3754,9 +3914,27 @@ impl Vcpu {
             }
             let stepped = matches!(event.source, EventSource::SingleStep);
             self.finish_legacy_event(event, None);
-            if trap && !stepped {
+            if std::mem::take(&mut nmi_after)
+                && self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE != 0
+                && self.nmi_gate(false)
+                && self.accept_nmi()
+            {
+                // AP-67 p. A-28, Fig. 3E3b p. A-29: the exception's frame,
+                // then the NMI frame, and no step frame.
+                trap = false;
                 event = PendingEvent {
                     irq_consumed: false,
+                    software: false,
+                    after_nmi: false,
+                    source: EventSource::Nmi { shutdown: false },
+                    ip: self.cpu.rip as u32,
+                    cs: self.cpu.cs,
+                };
+            } else if trap && !stepped {
+                event = PendingEvent {
+                    irq_consumed: false,
+                    software: false,
+                    after_nmi: false,
                     source: EventSource::SingleStep,
                     ip: self.cpu.rip as u32,
                     cs: self.cpu.cs,
@@ -3999,11 +4177,13 @@ mod tests {
             cpu.cpu.rip = 0x3000;
             cpu.cpu.flags.if_ = true;
             cpu.sti_shadow = true;
-            cpu.ss_shadow = true;
+            cpu.ss_shadow = SS_HOLD | NMI_HOLD;
             let execution = cpu.legacy_execution.as_mut().unwrap();
             execution.port_debug = true;
             execution.event_retry = Some(PendingEvent {
                 irq_consumed: false,
+                software: false,
+                after_nmi: false,
                 source: EventSource::SingleStep,
                 ip: 0x1000,
                 cs: 0,
@@ -4019,7 +4199,7 @@ mod tests {
                 run.stop()
             );
             assert!(!cpu.sti_shadow);
-            assert!(!cpu.ss_shadow);
+            assert_eq!(cpu.ss_shadow, 0);
             let execution = cpu.legacy_execution.as_ref().unwrap();
             assert!(!execution.port_debug);
             assert!(execution.event_retry.is_none());
@@ -4327,6 +4507,158 @@ mod tests {
         assert_eq!(execution.contexts.len(), 2);
         assert_eq!(execution.blocks.len(), 2);
         assert_eq!(execution.lifts, 2);
+    }
+
+    // spec.md §17.10: NMI blocking forces no one-step dispatch. A handler that
+    // never executes IRET (it far-jumps back) keeps NMI blocked, and the
+    // following loop of 10^6 instructions walks exactly the blocks of the same
+    // loop entered without an NMI.
+    #[test]
+    fn a_blocked_nmi_handler_that_never_irets_keeps_ordinary_dispatch() {
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let walk = |nmi: bool| {
+                let mut vm = Vm::new(VmConfig::flat(0x40000));
+                vm.set_cpu_model(model);
+                vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
+                // INC AX; INC BX; JMP $-2 at 0:1000; JMP FAR 0:1000 at 0:1800.
+                vm.write_bytes(0x1000, b"\x40\x43\xeb\xfc").unwrap();
+                vm.write_bytes(0x1800, b"\xea\x00\x10\x00\x00").unwrap();
+                vm.mem.write(8, 0x1800, 4).unwrap();
+                let mut cpu = vm.new_vcpu();
+                cpu.cpu.rip = 0x1800;
+                cpu.cpu.gpr[4] = 0x8000;
+                cpu.interp_scratch.fill_before_block = Some(0);
+                if nmi {
+                    cpu.cpu.rip = 0x1000;
+                    cpu.raise_nmi().unwrap();
+                }
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 1);
+                assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0, 0x1000));
+                assert_eq!(cpu.nmi_state & NMI_BLOCKED != 0, nmi);
+                if nmi {
+                    cpu.raise_nmi().unwrap();
+                }
+                let entries = cpu.interp_scratch.block_entries;
+                let run = cpu.run_steps(&vm, 999_999, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 999_999);
+                assert_eq!(cpu.nmi_state & NMI_BLOCKED != 0, nmi, "never unblocked");
+                (
+                    cpu.interp_scratch.block_entries - entries,
+                    cpu.cpu.gpr[0],
+                    cpu.cpu.gpr[3],
+                    cpu.cpu.rip,
+                )
+            };
+            let (blocked, plain) = (walk(true), walk(false));
+            assert!(plain.0 > 1000, "{plain:?}");
+            assert_eq!(blocked, plain, "{model:?}");
+        }
+    }
+
+    // A Machine at 0:1000 (real mode, SP 8000h) with `code` there, the NMI
+    // handler `handler` at 0:1800 and the IRQ 20h handler HLT at 0:1900.
+    fn blocked_nmi_machine(model: crate::CpuModel, code: &[u8], handler: &[u8]) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(VmConfig::flat(0x40000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x40000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, code).unwrap();
+        vm.write_bytes(0x1800, handler).unwrap();
+        vm.write_bytes(0x1900, b"\xf4").unwrap();
+        vm.mem.write(8, 0x1800, 4).unwrap();
+        vm.mem.write(0x80, 0x1900, 4).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.gpr[4] = 0x8000;
+        (vm, cpu)
+    }
+
+    // spec.md §17.10: while NMI is blocked (I80286, I80386) the walk applies
+    // the dispatcher's predicate. An edge raised after the dispatcher's word
+    // test and before the walk's first boundary (here by the scratch hook, at
+    // every block entry) neither stops the walk nor ends the STI shadow the
+    // walk carries in. The handler, entered with IF = 0 and never left, is
+    // STI; CLI; JMP $-4: its only IF = 1 boundary is the one STI shadows, so a
+    // queued IRQ is never taken. The edge storm walks exactly the blocks of
+    // the same run with no edges, with or without the IRQ.
+    #[test]
+    fn a_blocked_edge_inside_a_walk_neither_stops_it_nor_ends_the_sti_shadow() {
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            for irq in [false, true] {
+                let walk = |storm: bool| {
+                    let (vm, mut cpu) = blocked_nmi_machine(model, b"\x90", b"\xfb\xfa\xeb\xfc");
+                    cpu.interp_scratch.fill_before_block = Some(0);
+                    cpu.raise_nmi().unwrap();
+                    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    assert_eq!((run.steps(), cpu.cpu.rip), (1, 0x1801)); // STI
+                    assert!(cpu.cpu.flags.if_ && cpu.sti_shadow);
+                    assert_ne!(cpu.nmi_state & NMI_BLOCKED, 0);
+                    if irq {
+                        cpu.inject_irq(0x20);
+                    }
+                    if storm {
+                        cpu.interp_scratch.nmi_before_block =
+                            Some((cpu.nmi_line().unwrap(), 200_000));
+                    }
+                    let entries = cpu.interp_scratch.block_entries;
+                    let run = cpu.run_steps(&vm, 30_000, StepOptions::default()).unwrap();
+                    assert!(
+                        matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                        "{model:?} irq {irq} storm {storm}: {:?} at {:#x}",
+                        run.stop(),
+                        cpu.cpu.rip
+                    );
+                    assert_eq!(run.steps(), 30_000);
+                    assert_eq!(cpu.has_pending_irq(), irq, "never taken in the shadow");
+                    assert_ne!(cpu.nmi_state & NMI_BLOCKED, 0);
+                    if storm {
+                        let left = cpu.interp_scratch.nmi_before_block.as_ref().unwrap().1;
+                        assert_ne!(left, 0, "an edge at every walk");
+                    }
+                    (
+                        cpu.interp_scratch.block_entries - entries,
+                        format!("{:?}", cpu.cpu),
+                    )
+                };
+                let (calm, storm) = (walk(false), walk(true));
+                assert!(calm.0 >= 10_000, "{calm:?}");
+                assert_eq!(storm, calm, "{model:?} irq {irq}");
+            }
+        }
+    }
+
+    // spec.md §17.10: an edge raised while blocked that no word test has seen
+    // yet (here raised at the entry of the IRET's own walk) is still in the
+    // word when that IRET ends blocking. The I80386 ignores it as it ignores
+    // the others (80386 PRM §9.2.1 p. 9-3); on the I80286 it stays latched,
+    // as a remembered edge would be, and is serviced after that IRET (I286
+    // PRM §9.2 p. 9-3).
+    #[test]
+    fn an_edge_raised_in_the_irets_own_walk_follows_the_blocked_rule() {
+        for model in [crate::CpuModel::I80286, crate::CpuModel::I80386] {
+            let (vm, mut cpu) = blocked_nmi_machine(model, b"\x90\x90", b"\xcf");
+            let line = cpu.nmi_line().unwrap();
+            cpu.raise_nmi().unwrap();
+            // Delivery costs no step; the hook raises at the IRET's walk.
+            cpu.interp_scratch.nmi_before_block = Some((line.clone(), 1));
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!((cpu.cpu.rip, cpu.cpu.gpr[4]), (0x1000, 0x8000));
+            assert_eq!(cpu.interp_scratch.nmi_before_block.as_ref().unwrap().1, 0);
+            assert_eq!(cpu.nmi_state, 0, "the IRET ended blocking");
+            let remember = model == crate::CpuModel::I80286;
+            assert_eq!(
+                (line.is_raised(), cpu.has_pending_nmi()),
+                (remember, remember)
+            );
+            // The 80286 takes it before the next NOP (the handler's IRET is
+            // its one step); the 80386 executes the NOP.
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1);
+            assert_eq!(cpu.cpu.rip, if remember { 0x1000 } else { 0x1001 });
+            assert_eq!(cpu.retired_instructions(), 2);
+            assert!(!line.is_raised() && cpu.nmi_state == 0);
+        }
     }
 
     fn a20_loop() -> (Vm, Vcpu) {

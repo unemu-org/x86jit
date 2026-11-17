@@ -405,7 +405,8 @@ impl IrBlock {
                     | crate::legacy::LegacyOp::Brkem20 { .. }
                     | crate::legacy::LegacyOp::BitField20 { .. }
                     | crate::legacy::LegacyOp::BcdString20 { .. }
-                    | crate::legacy::LegacyOp::InhibitIrq20 => {}
+                    | crate::legacy::LegacyOp::InhibitIrq20
+                    | crate::legacy::LegacyOp::HoldExternal20 => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {
                         check(&[*offset], &[*dst])?

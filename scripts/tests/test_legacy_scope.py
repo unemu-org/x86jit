@@ -48,7 +48,11 @@ CORE_SRC = "x86jit-core/src/"
 #     in const blocks, at compile time.
 #   vm.rs: the run entries select DIRECT20 (CONTEXT) for a twenty-bit
 #     CpuModel; set_cpu_model and the CpuModel accessors serve an
-#     embedder-selected model.
+#     embedder-selected model; has_pending_nmi reads NmiNesting only after its
+#     ExecutionProfile::Machine check.
+#   vm/legacy/nmi.rs: the NMI helpers of the Machine dispatcher. They are
+#     called only in the KIND >= MACHINE_DISPATCH branch or from Vcpu methods
+#     that return early outside ExecutionProfile::Machine.
 #   vm/legacy.rs: run_dispatch is also the application dispatch loop, so this
 #     file is shared. Its legacy calls sit in the KIND >= MACHINE_DISPATCH
 #     branch or in methods that need legacy_execution, which only a Machine
@@ -86,7 +90,8 @@ REVIEWED_ENTRY_POINTS = {
     },
     "x86jit-core/src/lib.rs": {
         "model::CpuModel", "model::ModelIsa", "model::ModelProfile",
-        "model::ModelQuirks", "model::ModelSystem", "model::ModelTiming", "model::mod",
+        "model::ModelQuirks", "model::ModelSystem", "model::ModelTiming",
+        "model::NmiNesting", "model::mod",
     },
     "x86jit-core/src/lift/mod.rs": {
         "lift::i8086::mod", "lift::legacy::ContextOps", "lift::legacy::alias_context",
@@ -95,7 +100,8 @@ REVIEWED_ENTRY_POINTS = {
         "lift::legacy::shared_family", "model::ModelProfile",
     },
     "x86jit-core/src/vm.rs": {
-        "lift::i8086::CONTEXT", "model::CpuModel", "vm::i8086::mod", "vm::nec::mod",
+        "lift::i8086::CONTEXT", "model::CpuModel", "model::NmiNesting",
+        "vm::i8086::mod", "vm::nec::mod",
     },
     "x86jit-core/src/vm/legacy.rs": {
         "Vcpu::nec_boundary", "interp::i8086::finish_port_input",
@@ -106,6 +112,9 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::tasks", "lift::i8086::CONTEXT", "lift::legacy::alias_context",
         "lift::legacy::instruction", "lift::legacy::shared_helper", "model::CpuModel",
         "model::decode", "model::profile_for_generation", "vm::i8086::resolve",
+    },
+    "x86jit-core/src/vm/legacy/nmi.rs": {
+        "model::CpuModel", "model::NmiNesting", "model::profile_for_generation",
     },
 }
 
