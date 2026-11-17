@@ -1642,3 +1642,124 @@ fn nmi_readiness_follows_completions_and_application_has_no_input() {
     }
     let _ = UnsupportedSystemOperation::NecStepWithNmi;
 }
+
+#[test]
+fn ins_completion_then_nmi_then_irq() {
+    // spec.md §17.10 boundary order: the service steps (an answered INS
+    // completes), then the NMI, then a queued IRQ; NMI first (I286 PRM
+    // Table 5-1 p. 5-4; 80386 PRM Table 9-2 p. 9-4). The real-mode NMI entry
+    // clears IF (I286 PRM §5.2.2 p. 5-5), so the IRQ stays queued.
+    for model in NMI_MODELS {
+        let (vm, mut cpu) = nmi_machine(
+            model,
+            false,
+            b"\x6c\x90\xf4",
+            b"\xf4",
+            ExceptionDelivery::InGuest,
+        );
+        ivt(&vm, 0x20, 0x1900);
+        vm.write_bytes(0x1900, b"\xf4").unwrap();
+        cpu.cpu.gpr[7] = 0x3000;
+        cpu.cpu.gpr[2] = 0x10;
+        cpu.cpu.flags.if_ = true;
+        let (_, s) = stop(&mut cpu, &vm, 1);
+        assert!(matches!(s, StepStop::Exit(Exit::PortIo { .. })), "{s:?}");
+        cpu.complete_port_in(0x5a);
+        cpu.inject_irq(0x20);
+        cpu.raise_nmi().unwrap();
+        let _ = halted(&mut cpu, &vm, 8);
+        assert_eq!(vm.mem.read(0x3000, 1).unwrap(), 0x5a);
+        assert_eq!(cpu.cpu.rip, HANDLER + 1, "{model:?}");
+        assert_eq!(cpu.cpu.gpr[4], 0x7ffa, "{model:?}: the NMI frame only");
+        assert_eq!(word(&vm, 0x7ffa, 2), 0x1001, "{model:?}");
+        assert!(cpu.has_pending_irq(), "{model:?}");
+    }
+}
+
+#[test]
+fn port_debug_step_trap_precedes_nmi() {
+    // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8: the step frame
+    // first, then the NMI before the step handler's first instruction. The
+    // OUT hands off before its step trap; spec.md §17.10 makes that trap the
+    // owned continuation, taken before the NMI.
+    for model in NMI_MODELS {
+        let (vm, mut cpu) = nmi_machine(
+            model,
+            false,
+            b"\xe6\x10\x90\xf4",
+            b"\xf4",
+            ExceptionDelivery::InGuest,
+        );
+        ivt(&vm, 1, 0x1900);
+        vm.write_bytes(0x1900, b"\xf4").unwrap();
+        cpu.cpu.rflags_system = 0x100;
+        let (_, s) = stop(&mut cpu, &vm, 1);
+        assert!(matches!(s, StepStop::Exit(Exit::PortIo { .. })), "{s:?}");
+        cpu.raise_nmi().unwrap();
+        let _ = halted(&mut cpu, &vm, 8);
+        assert_eq!(cpu.cpu.rip, HANDLER + 1, "{model:?}");
+        assert_eq!(word(&vm, 0x7ffa, 2), 0x1002, "{model:?} step frame");
+        assert_eq!(word(&vm, 0x7ff4, 2), 0x1900, "{model:?} NMI frame");
+    }
+}
+
+#[test]
+fn one_step_host_request_waits_for_an_answered_ins() {
+    // spec.md §17.10 boundary order: the host request is taken only when no
+    // completion is pending, so an answered INS completes first at every
+    // budget, a one-step budget included.
+    for model in NMI_MODELS {
+        for budget in [1, 2] {
+            let (vm, mut cpu) = nmi_machine(
+                model,
+                false,
+                b"\x6c\x90\xf4",
+                b"\xf4",
+                ExceptionDelivery::InGuest,
+            );
+            cpu.cpu.gpr[7] = 0x3000;
+            cpu.cpu.gpr[2] = 0x10;
+            let (_, s) = stop(&mut cpu, &vm, 1);
+            assert!(matches!(s, StepStop::Exit(Exit::PortIo { .. })), "{s:?}");
+            cpu.complete_port_in(0x5a);
+            cpu.exit_request().request_exit();
+            let (n, s) = stop(&mut cpu, &vm, budget);
+            assert_eq!(
+                vm.mem.read(0x3000, 1).unwrap(),
+                0x5a,
+                "{model:?} budget {budget}: {n} {s:?}"
+            );
+            assert_eq!(cpu.cpu.gpr[7] & 0xffff, 0x3001, "{model:?} budget {budget}");
+        }
+    }
+}
+
+#[test]
+fn nmi_into_a_32_bit_code_segment_rederives_the_context() {
+    // 80386 PRM Table 9-1 p. 9-2: NMI through IDT entry 2, here a 386
+    // interrupt gate (type 8Eh; I386 PRM §§9.5–9.7 pp. 9-6–10) to selector
+    // 18h, a code segment with D = 1. I386 PRM §17.1.1 p. 17-1: CS.D selects
+    // the default operand size, so the handler's MOV EAX, imm32 loads all
+    // four bytes (spec.md §17.10: the context is derived again after any
+    // delivery).
+    let (vm, mut cpu) = nmi_machine(
+        CpuModel::I80386,
+        true,
+        b"\x90\x90",
+        b"\xb8\x78\x56\x34\x12\xf4",
+        ExceptionDelivery::InGuest,
+    );
+    vm.write_bytes(0x2018, &[0xff, 0xff, 0, 0, 0, 0x9b, 0x40, 0])
+        .unwrap();
+    cpu.cpu.legacy.gdtr.limit = 31;
+    let low = (0x18u32 << 16) | (HANDLER as u32 & 0xffff);
+    let high = (HANDLER as u32 & 0xffff_0000) | (0x8eu32 << 8);
+    vm.write_bytes(0x3010, &low.to_le_bytes()).unwrap();
+    vm.write_bytes(0x3014, &high.to_le_bytes()).unwrap();
+    cpu.raise_nmi().unwrap();
+    let (n, s) = stop(&mut cpu, &vm, 8);
+    assert!(matches!(s, StepStop::Exit(Exit::Hlt)), "{n} {s:?}");
+    assert_eq!(cpu.cpu.cs, 0x18);
+    assert_eq!(cpu.cpu.rip, HANDLER + 6);
+    assert_eq!(cpu.cpu.gpr[0] & 0xffff_ffff, 0x1234_5678);
+}

@@ -114,7 +114,8 @@ REVIEWED_ENTRY_POINTS = {
         "model::decode", "model::profile_for_generation", "vm::i8086::resolve",
     },
     "x86jit-core/src/vm/legacy/nmi.rs": {
-        "model::CpuModel", "model::NmiNesting", "model::profile_for_generation",
+        "interp::legacy::Progress", "model::CpuModel", "model::NmiNesting",
+        "model::profile_for_generation",
     },
 }
 

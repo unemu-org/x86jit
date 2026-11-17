@@ -1,7 +1,48 @@
 //! The NMI input's cold helpers (spec.md §17.10): acceptance, blocking, the
-//! boundary's NMI step and the IRET checks. The dispatcher calls them only
-//! when an edge is latched or NMI is blocked.
+//! boundary's NMI step and the IRET checks. The Machine dispatcher's loop
+//! holds no NMI decision: it calls these when its dispatch word holds a host
+//! request or an edge, after a unit while NMI is blocked, and to deliver a
+//! post-unit single-step trap.
 use super::*;
+
+// Every twenty-bit catalogue entry nests NMIs (spec.md §17.10), so a vCPU on
+// the twenty-bit dispatcher is never blocked: that dispatcher gives its walk
+// `false` for blocking, which equals its own predicate, and watches for no
+// IRET. The run entries select that dispatcher by the model's generation
+// (`CpuGeneration::I8086`); a model of that generation that blocks fails this
+// build. The match names every `CpuModel` with no wildcard, so a new model
+// fails the build here until it is added to the list below.
+const fn nests_if_twenty_bit(model: crate::CpuModel) -> bool {
+    match model {
+        crate::CpuModel::I80286
+        | crate::CpuModel::I80386
+        | crate::CpuModel::I8088
+        | crate::CpuModel::I8086
+        | crate::CpuModel::NecV20
+        | crate::CpuModel::NecV30 => {
+            !matches!(model.legacy_model().generation, crate::CpuGeneration::I8086)
+                || matches!(
+                    model.profile().quirks.nmi_nesting,
+                    crate::NmiNesting::Nested
+                )
+        }
+    }
+}
+const _: () = {
+    let models = [
+        crate::CpuModel::I80286,
+        crate::CpuModel::I80386,
+        crate::CpuModel::I8088,
+        crate::CpuModel::I8086,
+        crate::CpuModel::NecV20,
+        crate::CpuModel::NecV30,
+    ];
+    let mut i = 0;
+    while i < models.len() {
+        assert!(nests_if_twenty_bit(models[i]));
+        i += 1;
+    }
+};
 
 /// `Vcpu::nmi_state`: blocked from NMI acceptance to the next IRET
 /// (I80286, I80386), and one edge remembered meanwhile (I80286).
@@ -47,7 +88,7 @@ fn iret_retired(ir: &crate::ir::IrBlock, retired: u64) -> bool {
 /// by INTO). Only the first instruction of the block runs under TF.
 #[cold]
 #[inline(never)]
-pub(super) fn took_software_interrupt20(ir: &crate::ir::IrBlock, cpu: &CpuState) -> bool {
+fn took_software_interrupt20(ir: &crate::ir::IrBlock, cpu: &CpuState) -> bool {
     for op in ir.ops.iter().skip(1) {
         match op {
             IrOp::InsnStart { .. } => return false,
@@ -59,6 +100,26 @@ pub(super) fn took_software_interrupt20(ir: &crate::ir::IrBlock, cpu: &CpuState)
     }
     false
 }
+/// What the dispatcher's out-of-line host-request and NMI decision leaves to
+/// its loop (`Vcpu::machine_external`).
+pub(super) enum External {
+    /// Continue the boundary unchanged.
+    Proceed,
+    /// A latched NMI not delivered here: the service steps run and one unit
+    /// is executed, until it is.
+    OneStep,
+    /// An INS completion ran with an NMI latched and not delivered: continue
+    /// the service steps with this boundary, derived again after it, and this
+    /// bus proof.
+    Serviced(MachineBoundary, bool),
+    /// An NMI was delivered; the loop derives the context again after the CS
+    /// reload, and the order runs again before the handler's first
+    /// instruction.
+    Delivered,
+    /// Return this exit.
+    Stop(Exit),
+}
+
 impl Vcpu {
     /// The catalogue's NMI nesting policy (spec.md §17.10): a system model's
     /// generation entry, or a twenty-bit model's own entry.
@@ -148,38 +209,102 @@ impl Vcpu {
         }
     }
 
-    // The dispatch word holds a host request or an NMI edge. `Err`: return
-    // the request. `Ok(true)`: a latched NMI for the boundary's NMI step.
-    // While blocked, the edge leaves the word here: the I80286 remembers one
-    // (I286 PRM §9.2 p. 9-3), the I80386 ignores it (80386 PRM §9.2.1
-    // p. 9-3), so no boundary test keeps tripping on it (spec.md §17.10).
+    // The dispatch word holds a host request or an NMI edge: boundary steps 2
+    // to 5 of spec.md §17.10 for a latched NMI, out of the dispatcher loop.
+    // A host request when no completion is pending stops the run, the latch
+    // kept. While NMI is blocked, the edge leaves the word here: the I80286
+    // remembers one (I286 PRM §9.2 p. 9-3), the I80386 ignores it (80386 PRM
+    // §9.2.1 p. 9-3), so no boundary test keeps tripping on it. Otherwise the
+    // service steps that precede the NMI step run here, then the NMI step
+    // after an owned continuation; an NMI not delivered forces one-step mode
+    // until it is. The loop's own service steps follow, and the ones run here
+    // leave them nothing to do.
     #[cold]
     #[inline(never)]
-    pub(super) fn machine_external(&mut self, pending_io: bool) -> Result<bool, Exit> {
+    pub(super) fn machine_external<
+        const ROUTED: bool,
+        const ORDER: u8,
+        const SINGLE: bool,
+        const KIND: u8,
+    >(
+        &mut self,
+        vm: &Vm,
+        options: StepOptions,
+        context: MachineContext,
+        task_pending: bool,
+        pending_io: bool,
+        mut direct_bus: bool,
+    ) -> External {
+        // A one-step budget's boundary leaves I/O eligibility to this query.
+        let pending_io = if SINGLE {
+            self.machine_pending_io(task_pending)
+        } else {
+            pending_io
+        };
         let word = self.exit_request.word.load(Ordering::Relaxed);
         if word & EXIT_REQUESTED != 0 && !pending_io {
-            return Err(self.interrupted(crate::FaultPath::Interpreter, false));
+            return External::Stop(self.interrupted(crate::FaultPath::Interpreter, false));
         }
         if word & NMI_EDGE == 0 {
-            return Ok(false);
+            return External::Proceed;
         }
-        if self.nmi_state & NMI_BLOCKED == 0 {
-            return Ok(true);
+        if self.nmi_state & NMI_BLOCKED != 0 {
+            let prev = self
+                .exit_request
+                .word
+                .fetch_and(!NMI_EDGE, Ordering::Acquire);
+            if prev & NMI_EDGE != 0 && self.nmi_nesting() == crate::NmiNesting::BlockedRemember {
+                self.nmi_state |= NMI_REMEMBERED;
+            }
+            return External::Proceed;
         }
-        let prev = self
-            .exit_request
-            .word
-            .fetch_and(!NMI_EDGE, Ordering::Acquire);
-        if prev & NMI_EDGE != 0 && self.nmi_nesting() == crate::NmiNesting::BlockedRemember {
-            self.nmi_state |= NMI_REMEMBERED;
+        // The completion ends the boundary derived before it; the loop's
+        // service block then runs on with the boundary derived again.
+        let mut serviced = None;
+        if self.cpu.port_string_in.is_some() {
+            let mut boundary = MachineBoundary::default();
+            let model = self.legacy_model.unwrap_or(LegacyCpuModel {
+                generation: CpuGeneration::I286,
+                model_semantics_id: 0,
+            });
+            if let Err(exit) = self.finish_port_string::<ROUTED, ORDER, SINGLE, KIND>(
+                vm,
+                options,
+                crate::legacy::physical_mask(model.generation),
+                &mut boundary,
+                &mut direct_bus,
+            ) {
+                return External::Stop(exit);
+            }
+            boundary.service = true;
+            serviced = Some(boundary);
         }
-        Ok(false)
+        self.queue_port_debug(task_pending);
+        if self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE != 0
+            && self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .event_retry
+                .is_none()
+        {
+            match self.machine_nmi::<ROUTED, ORDER>(vm, context, task_pending) {
+                None => {}
+                Some(Ok(())) => return External::Delivered,
+                Some(Err(exit)) => return External::Stop(exit),
+            }
+        }
+        match serviced {
+            Some(boundary) => External::Serviced(boundary, direct_bus),
+            // A latched NMI not delivered forces one-step mode until it is.
+            None => External::OneStep,
+        }
     }
 
     // Boundary steps 4a, 4b and 5 (spec.md §17.10), with an NMI edge seen and
     // no owned continuation. `None`: no NMI here; the IRQ step follows.
-    // `Some(Ok)`: delivered, with the context derived again after the CS
-    // reload; delivery costs no instruction unit.
+    // `Some(Ok)`: delivered; the caller derives the context again after the
+    // CS reload. Delivery costs no instruction unit.
     #[cold]
     #[inline(never)]
     pub(super) fn machine_nmi<const ROUTED: bool, const ORDER: u8>(
@@ -187,7 +312,7 @@ impl Vcpu {
         vm: &Vm,
         context: MachineContext,
         task_pending: bool,
-    ) -> Option<Result<MachineContext, Exit>> {
+    ) -> Option<Result<(), Exit>> {
         let shutdown = self.legacy_execution.as_ref().unwrap().shutdown;
         if self.twenty_bit_model() && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
             if !matches!(
@@ -213,21 +338,18 @@ impl Vcpu {
         // I286 PRM §9.6.2 p. 9-10: NMI forces the CPU out of shutdown; the
         // saved CS:IP is the one held at shutdown (ASSUMED).
         self.legacy_execution.as_mut().unwrap().shutdown = false;
-        Some(
-            self.deliver_legacy_event::<ROUTED, ORDER>(
-                vm,
-                context,
-                PendingEvent {
-                    irq_consumed: false,
-                    software: false,
-                    after_nmi: false,
-                    source: EventSource::Nmi { shutdown },
-                    ip: self.cpu.rip as u32,
-                    cs: self.cpu.cs,
-                },
-            )
-            .and_then(|()| self.legacy_context_for_run()),
-        )
+        Some(self.deliver_legacy_event::<ROUTED, ORDER>(
+            vm,
+            context,
+            PendingEvent {
+                irq_consumed: false,
+                software: false,
+                after_nmi: false,
+                source: EventSource::Nmi { shutdown },
+                ip: self.cpu.rip as u32,
+                cs: self.cpu.cs,
+            },
+        ))
     }
 
     // The fast arm's cold epilogue: a queued A20 change applies, and while NMI
@@ -247,6 +369,49 @@ impl Vcpu {
             self.apply_pending_a20();
         }
         unblocked || a20
+    }
+
+    // The slow arm's cold epilogue: while NMI is blocked, an IRET the unit
+    // retired, or a faulting IRET, ends blocking.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn nmi_after_progress(
+        &mut self,
+        ir: &crate::ir::IrBlock,
+        progress: &crate::interp::legacy::Progress,
+    ) {
+        match &progress.outcome {
+            Some(Err(exit)) => self.nmi_after_fault(ir, exit),
+            _ => {
+                self.nmi_after_unit(ir, progress.retired);
+            }
+        }
+    }
+
+    // The post-instruction single-step trap of a unit run with TF (I286 PRM
+    // §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8; 8086 UM §2.6 p. 2-28),
+    // with the context derived again after the CS reload. On the twenty-bit
+    // models the trap records whether the unit took a software interrupt
+    // (AP-67 p. A-28), which decides the NMI frame order there.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn deliver_step_trap<const ROUTED: bool, const ORDER: u8, const KIND: u8>(
+        &mut self,
+        vm: &Vm,
+        ir: &crate::ir::IrBlock,
+    ) -> Result<MachineContext, Exit> {
+        let event = PendingEvent {
+            irq_consumed: false,
+            software: KIND == crate::vm::DIRECT20_DISPATCH
+                && took_software_interrupt20(ir, &self.cpu),
+            after_nmi: false,
+            source: EventSource::SingleStep,
+            ip: self.cpu.rip as u32,
+            cs: self.cpu.cs,
+        };
+        let context = self.legacy_context_for_run()?;
+        self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)?;
+        self.legacy_context_for_run()
     }
 
     // After a unit while NMI is blocked: an IRET it retired ends blocking

@@ -11,7 +11,7 @@ use iced_x86::{Decoder, DecoderError};
 // The NMI input's cold helpers (spec.md §17.10), in their own module so that
 // this module's hot dispatcher code keeps its code-generation unit.
 mod nmi;
-use nmi::took_software_interrupt20;
+use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -206,7 +206,10 @@ struct MachineBoundary {
     pending_io: bool,
     instruction_retry: bool,
     // After a unit: a queued A20 change, or NMI blocking that an IRET may end
-    // (spec.md §17.10). The cold epilogue reads which.
+    // (spec.md §17.10). The cold epilogue reads which. The twenty-bit boundary
+    // leaves out the NMI term: its models nest NMIs and are never blocked (the
+    // assertion in nmi.rs). The slow arm gates its IRET checks
+    // (`nmi_after_progress`) on this field, as the fast arm gates its epilogue.
     cold_epilogue: bool,
     irq_pending: bool,
 }
@@ -1941,7 +1944,10 @@ impl Vcpu {
     }
 
     #[inline]
-    fn machine_boundary<const SINGLE: bool>(&self, options: StepOptions) -> MachineBoundary {
+    fn machine_boundary<const SINGLE: bool, const KIND: u8>(
+        &self,
+        options: StepOptions,
+    ) -> MachineBoundary {
         let execution = self.legacy_execution.as_ref().unwrap();
         let task_pending = execution.task_switch_pending();
         // I286 PRM §9.7.1 p. 9-14; 80386 PRM §12.3.1.4 p. 12-8:
@@ -1961,7 +1967,8 @@ impl Vcpu {
             task_pending,
             single_step,
             irq_pending,
-            cold_epilogue: a20_pending || self.nmi_state != 0,
+            // A twenty-bit model is never blocked (`nmi.rs`).
+            cold_epilogue: a20_pending || (KIND != super::DIRECT20_DISPATCH && self.nmi_state != 0),
             one_step: SINGLE
                 || single_step
                 || self.sti_shadow
@@ -1978,6 +1985,72 @@ impl Vcpu {
             // Its I/O eligibility is queried only when a host request exists.
             pending_io: !SINGLE && self.machine_pending_io(task_pending),
             instruction_retry: execution.instruction_retry.is_some(),
+        }
+    }
+
+    // Service step: an INS element whose input was answered completes, which
+    // ends both shadows and an MMIO retry; a queued A20 change applies, and the
+    // boundary is derived again.
+    #[inline(always)]
+    fn finish_port_string<
+        const ROUTED: bool,
+        const ORDER: u8,
+        const SINGLE: bool,
+        const KIND: u8,
+    >(
+        &mut self,
+        vm: &Vm,
+        options: StepOptions,
+        physical_mask: u32,
+        boundary: &mut MachineBoundary,
+        direct_bus: &mut bool,
+    ) -> Result<(), Exit> {
+        if KIND == super::DIRECT20_DISPATCH {
+            crate::interp::i8086::finish_port_input::<ROUTED, ORDER>(&mut self.cpu, &vm.mem)
+        } else {
+            crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
+                &mut self.cpu,
+                &vm.mem,
+                physical_mask,
+            )
+        }?;
+        self.sti_shadow = false;
+        self.ss_shadow = 0;
+        if self.cpu.mmio_retry_active {
+            self.cpu.finish_mmio_retry(None);
+        }
+        if self
+            .legacy_execution
+            .as_ref()
+            .unwrap()
+            .pending_a20_enabled
+            .is_some()
+        {
+            self.apply_pending_a20();
+            *direct_bus = raw_direct(&self.cpu);
+        }
+        *boundary = self.machine_boundary::<SINGLE, KIND>(options);
+        Ok(())
+    }
+
+    // Service step: a single-step trap held behind a port handoff becomes the
+    // owned continuation once the transfer has completed.
+    #[inline(always)]
+    fn queue_port_debug(&mut self, task_pending: bool) {
+        if !task_pending
+            && self.legacy_execution.as_ref().unwrap().port_debug
+            && self.cpu.pending_port_in.is_none()
+            && self.cpu.port_string_in.is_none()
+        {
+            self.legacy_execution.as_mut().unwrap().port_debug = false;
+            self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
+                irq_consumed: false,
+                software: false,
+                after_nmi: false,
+                source: EventSource::SingleStep,
+                ip: self.cpu.rip as u32,
+                cs: self.cpu.cs,
+            });
         }
     }
 
@@ -2082,6 +2155,12 @@ impl Vcpu {
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
         loop {
+            if direct20 {
+                // spec.md §17.10: the twenty-bit entries have a permanent
+                // Direct context, the one every derivation of theirs returns
+                // (`legacy_context_for_run`). As a constant it costs no turn.
+                context = crate::lift::i8086::CONTEXT;
+            }
             if KIND >= MACHINE_DISPATCH {
                 if limit.is_some_and(|limit| steps >= limit) {
                     return DispatchResult::Stepped(StepRun {
@@ -2090,7 +2169,7 @@ impl Vcpu {
                     });
                 }
                 if refresh_boundary {
-                    boundary = self.machine_boundary::<SINGLE>(options);
+                    boundary = self.machine_boundary::<SINGLE, KIND>(options);
                     // NEC V20/V30 8080 mode decides its boundary after the
                     // service steps (decision-23 C4a).
                     if direct20 && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
@@ -2102,107 +2181,68 @@ impl Vcpu {
                 refresh_boundary = true;
                 let task_pending = boundary.task_pending;
                 // A host request, or an NMI edge (spec.md §17.10), in one load.
+                // Both are decided out of line, the NMI step included.
                 if self.exit_request.word.load(Ordering::Relaxed) & (EXIT_REQUESTED | NMI_EDGE) != 0
                 {
-                    let pending_io = if SINGLE {
-                        self.machine_pending_io(task_pending)
-                    } else {
-                        boundary.pending_io
-                    };
-                    match self.machine_external(pending_io) {
-                        Err(exit) => {
+                    match self.machine_external::<ROUTED, ORDER, SINGLE, KIND>(
+                        vm,
+                        options,
+                        context,
+                        task_pending,
+                        boundary.pending_io,
+                        direct_bus,
+                    ) {
+                        External::Proceed => {}
+                        External::OneStep => {
+                            boundary.service = true;
+                            boundary.one_step = true;
+                        }
+                        External::Serviced(next, bus) => {
+                            boundary = next;
+                            direct_bus = bus;
+                        }
+                        External::Delivered => {
+                            // Delivery costs no instruction unit. Re-derive
+                            // after the CS reload.
+                            context = match self.legacy_context_for_run() {
+                                Ok(context) => context,
+                                Err(exit) => {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(exit),
+                                    })
+                                }
+                            };
+                            direct_bus = raw_direct(&self.cpu);
+                            continue;
+                        }
+                        External::Stop(exit) => {
                             return DispatchResult::Stepped(StepRun {
                                 steps,
                                 stop: StepStop::Exit(exit),
                             })
                         }
-                        // A latched NMI is decided at the service step and
-                        // forces one-step mode until it is delivered.
-                        Ok(true) => {
-                            boundary.service = true;
-                            boundary.one_step = true;
-                        }
-                        Ok(false) => {}
                     }
                 }
                 if boundary.service {
                     if self.cpu.port_string_in.is_some() {
-                        let finished = if direct20 {
-                            crate::interp::i8086::finish_port_input::<ROUTED, ORDER>(
-                                &mut self.cpu,
-                                &vm.mem,
-                            )
-                        } else {
-                            crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
-                                &mut self.cpu,
-                                &vm.mem,
-                                physical_mask,
-                            )
-                        };
-                        if let Err(exit) = finished {
+                        if let Err(exit) = self.finish_port_string::<ROUTED, ORDER, SINGLE, KIND>(
+                            vm,
+                            options,
+                            physical_mask,
+                            &mut boundary,
+                            &mut direct_bus,
+                        ) {
                             return DispatchResult::Stepped(StepRun {
                                 steps,
                                 stop: StepStop::Exit(exit),
                             });
                         }
-                        self.sti_shadow = false;
-                        self.ss_shadow = 0;
-                        if self.cpu.mmio_retry_active {
-                            self.cpu.finish_mmio_retry(None);
-                        }
-                        if self
-                            .legacy_execution
-                            .as_ref()
-                            .unwrap()
-                            .pending_a20_enabled
-                            .is_some()
-                        {
-                            self.apply_pending_a20();
-                            direct_bus = raw_direct(&self.cpu);
-                        }
-                        boundary = self.machine_boundary::<SINGLE>(options);
                     }
-                    if !task_pending
-                        && self.legacy_execution.as_ref().unwrap().port_debug
-                        && self.cpu.pending_port_in.is_none()
-                        && self.cpu.port_string_in.is_none()
-                    {
-                        self.legacy_execution.as_mut().unwrap().port_debug = false;
-                        self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
-                            irq_consumed: false,
-                            software: false,
-                            after_nmi: false,
-                            source: EventSource::SingleStep,
-                            ip: self.cpu.rip as u32,
-                            cs: self.cpu.cs,
-                        });
-                    }
-                    // spec.md §17.10: after an owned continuation, the NMI step
-                    // (including shutdown and the NEC 8080-mode BRK refusal),
-                    // then a queued IRQ.
-                    if self.exit_request.word.load(Ordering::Relaxed) & NMI_EDGE != 0
-                        && self
-                            .legacy_execution
-                            .as_ref()
-                            .unwrap()
-                            .event_retry
-                            .is_none()
-                    {
-                        match self.machine_nmi::<ROUTED, ORDER>(vm, context, task_pending) {
-                            None => {}
-                            Some(Ok(entered)) => {
-                                context = entered;
-                                direct_bus = raw_direct(&self.cpu);
-                                continue;
-                            }
-                            Some(Err(exit)) => {
-                                return DispatchResult::Stepped(StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                })
-                            }
-                        }
-                    }
+                    self.queue_port_debug(task_pending);
+                    // spec.md §17.10: the NMI step, after an owned
+                    // continuation and before a queued IRQ, ran in
+                    // `machine_external`.
                     let event = self
                         .legacy_execution
                         .as_ref()
@@ -2390,7 +2430,8 @@ impl Vcpu {
                         self.sti_shadow,
                         self.ss_shadow,
                         boundary.irq_pending,
-                        self.nmi_state & NMI_BLOCKED != 0,
+                        // A twenty-bit model is never blocked (`nmi.rs`).
+                        false,
                     )
                 } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
                     self.legacy_execution
@@ -2469,12 +2510,26 @@ impl Vcpu {
                             refresh_boundary = true;
                         }
                     }
+                    if SINGLE && steps != 0 {
+                        // A spent one-step budget: the next turn's budget
+                        // test returns this, before anything else runs.
+                        return DispatchResult::Stepped(StepRun {
+                            steps,
+                            stop: StepStop::Exit(Exit::BudgetExhausted),
+                        });
+                    }
                     continue;
                 }
                 steps += progress.steps;
                 self.retired += progress.retired;
                 self.executed += progress.retired;
-                let unit_retired = progress.retired;
+                // spec.md §17.10: while NMI is blocked, an IRET this unit
+                // retired, or one that faulted, ends blocking. Blocking sets
+                // `cold_epilogue`, as for the fast arm; a twenty-bit model is
+                // never blocked (`nmi.rs`).
+                if !direct20 && boundary.cold_epilogue {
+                    self.nmi_after_progress(&ir, &progress);
+                }
                 let outcome = progress.into_outcome();
                 if !outcome.as_ref().is_ok_and(|outcome| {
                     !outcome.context_changed && !outcome.translations_invalidated
@@ -2503,9 +2558,6 @@ impl Vcpu {
                 }
                 match outcome {
                     Ok(outcome) => {
-                        if self.nmi_state & NMI_BLOCKED != 0 {
-                            self.nmi_after_unit(&ir, unit_retired);
-                        }
                         // Decision-16 §4: the SS class is not rearmed; the NMI
                         // hold is, by every load (spec.md §17.10).
                         let arm_ss = outcome.arm_ss & SS_HOLD != 0 && self.ss_shadow & SS_HOLD == 0;
@@ -2561,32 +2613,16 @@ impl Vcpu {
                             if matches!(outcome.exit, Some(Exit::PortIo { .. })) {
                                 self.legacy_execution.as_mut().unwrap().port_debug = true;
                             } else {
-                                let event = PendingEvent {
-                                    irq_consumed: false,
-                                    software: direct20 && took_software_interrupt20(&ir, &self.cpu),
-                                    after_nmi: false,
-                                    source: EventSource::SingleStep,
-                                    ip: self.cpu.rip as u32,
-                                    cs: self.cpu.cs,
-                                };
-                                let delivered = self.legacy_context_for_run().and_then(|context| {
-                                    self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
-                                });
-                                if let Err(exit) = delivered {
-                                    return DispatchResult::Stepped(StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    });
-                                }
-                                context = match self.legacy_context_for_run() {
-                                    Ok(context) => context,
-                                    Err(exit) => {
-                                        return DispatchResult::Stepped(StepRun {
-                                            steps,
-                                            stop: StepStop::Exit(exit),
-                                        })
-                                    }
-                                };
+                                context =
+                                    match self.deliver_step_trap::<ROUTED, ORDER, KIND>(vm, &ir) {
+                                        Ok(context) => context,
+                                        Err(exit) => {
+                                            return DispatchResult::Stepped(StepRun {
+                                                steps,
+                                                stop: StepStop::Exit(exit),
+                                            })
+                                        }
+                                    };
                                 direct_bus = raw_direct(&self.cpu);
                                 // HLT completed; the enabled debug trap resumes at
                                 // its successor (I286 PRM Appendix B p. B-42;
@@ -2602,9 +2638,6 @@ impl Vcpu {
                         }
                     }
                     Err(exit) => {
-                        if self.nmi_state & NMI_BLOCKED != 0 {
-                            self.nmi_after_fault(&ir, &exit);
-                        }
                         // An architectural fault abandons this attempt before it is
                         // returned to the embedder; only resumable transfers keep IR.
                         self.cpu.finish_mmio_retry(Some(&exit));

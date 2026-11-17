@@ -2661,3 +2661,42 @@ fn in_and_out_end_their_block() {
         port_block::check(|code| setup(model, code), IP, true);
     }
 }
+
+#[test]
+fn ins_completion_then_nmi_then_irq_v20() {
+    // spec.md §17.10 boundary order: the service steps (an answered INM
+    // completes), then the NMI, then a queued IRQ; NMI first (UM p. 2-2).
+    // The NMI entry clears IE (UM §6 p. 6-1), so the IRQ stays queued.
+    for model in MODELS {
+        let (vm, mut cpu) = nmi_setup(model, b"\x6c\x90\xf4");
+        vector(&vm, 0x20, 0x1900, 0);
+        vm.write_bytes(0x1900, b"\xf4").unwrap();
+        cpu.cpu.gpr[7] = 0x3000;
+        cpu.cpu.gpr[2] = 0x10;
+        cpu.cpu.flags.if_ = true;
+        let r = run(&vm, &mut cpu, 1);
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::PortIo { .. })),
+            "{:?}",
+            r.stop()
+        );
+        cpu.complete_port_in(0x5a);
+        cpu.inject_irq(0x20);
+        cpu.raise_nmi().unwrap();
+        let r = run(&vm, &mut cpu, 8);
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(vm.mem.read(0x3000, 1).unwrap(), 0x5a);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip),
+            (NMI_CS, u64::from(NMI_IP) + 1),
+            "{model:?}"
+        );
+        assert_eq!(cpu.cpu.gpr[4], 0x7ffa, "{model:?}: the NMI frame only");
+        assert_eq!(word(&vm, 0x7ffa), IP + 1, "{model:?}");
+        assert!(cpu.has_pending_irq(), "{model:?}");
+    }
+}
