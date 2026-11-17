@@ -869,6 +869,41 @@ whose medians differ by more than 0.5 %. On a bimodal cell:
 
 A unimodal cell keeps the median of processes, and the +0.5 % gate is unchanged.
 
+**Amendment (NMI landing, 2026-11-17, accepted by the maintainer).** Every Machine model gains
+an NMI input (xj-50w.19; the contract and the per-model rule table are in spec.md §17.10, "NMI
+input"). The manuals leave these points open, and the engine takes them as ASSUMED:
+- an NMI during NMI service nests on the V20/V30;
+- a faulting IRET ends NMI blocking on the 80286 (on the 80386 the SDM is the second witness);
+- STI does not hold NMI on the 80286/80386;
+- an NMI that ends shutdown saves the CS:IP held at shutdown, and a delivery that faults
+  re-enters shutdown;
+- `reset_execution_state` ends blocking and clears the latch and the hold.
+
+The 8086 counter-wording on segment-load holds (App. B and AP-67 speak of INTR only) is recorded
+in spec.md; every segment load holds NMI, per the model manuals.
+
+NMI lands with a measured slowdown, not a defect. It was measured against 8e5bc441 together
+with xj-50w.22, which ends a twenty-bit block at IN and OUT and is within +0.5 % on its own:
+- the alias path is −0.71 % to +0.25 % on every workload, and the store probe at most +0.22 %;
+- 52 of 117 non-SMC Machine cells and 4 of 25 unimodal SMC cells exceed +0.5 %;
+- the largest misses are:
+  - call-ret: +1.82 % to +1.84 % on the 80286/80386 paths, +1.52 % to +1.54 % on the
+    twenty-bit paths;
+  - ip-boundary-64: +1.33 % to +1.43 %;
+  - ip-boundary-1 on the twenty-bit paths: +1.27 % to +1.29 %;
+  - smc-next-64 on the 80286/80386 paths: +0.55 % to +0.57 %;
+- the two bimodal SMC cells are within +0.2 % on like modes.
+
+The cost is a few host instructions per dispatcher turn, not per guest instruction. It comes
+from the NMI branches in the Machine dispatcher loop, which are cold there but change the
+register allocation and layout of the two dispatcher instantiations. The per-instruction edge
+test is free: the latch is bit 33 of the exit word. Ten layout variants were tried.
+
+The maintainer accepted the slowdown so that the sibling 8080 project gets the NMI input for
+feature completeness. Bead xj-50w.23 carries the miss: it moves the NMI decision out of the
+dispatcher loop, with this requirement's +0.5 % gate as its acceptance. The gate itself is
+unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
