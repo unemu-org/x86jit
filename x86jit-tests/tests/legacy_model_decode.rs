@@ -158,6 +158,7 @@ fn absent_ud1_is_ud_instead_of_a_refusal() {
 fn reserved_386_map_slots_raise_ud() {
     // 80386 PRM Appendix A two-byte map pp.A-6–A-7: 0F 05/07/A6/A7
     // are reserved. Table14-1 p.14-5 specifies #UD at the faulting instruction.
+    // On the 80286, 0F 05 is LOADALL (legacy_i286_loadall.rs).
     for model in [CpuModel::I80286, CpuModel::I80386] {
         for code in [
             &b"\x0f\x05"[..],
@@ -167,6 +168,9 @@ fn reserved_386_map_slots_raise_ud() {
             &b"\x66\x0f\xa6\xc1"[..],
             &b"\x66\x0f\xa7\xc1"[..],
         ] {
+            if model == CpuModel::I80286 && code == b"\x0f\x05" {
+                continue;
+            }
             ud(model, "reserved slot", code, false);
         }
     }

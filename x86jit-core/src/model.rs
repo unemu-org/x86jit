@@ -677,7 +677,9 @@ mod tests {
 
     // xj-50w.11: the 80286 LOCK and coprocessor-overrun fields change only the
     // I80286 identity. The other entries keep their b2ac76e4 values, pinned by
-    // value; I80286's departs from 3699e02a8ef13e63.
+    // value; I80286's departed from 3699e02a8ef13e63. xj-oog adds LOADALL to
+    // the 80286 encoding set and decoder flags alone: I80286 moves from
+    // 24d34f81af8da20b to the value pinned below, and no other entry moves.
     #[test]
     fn only_the_80286_identity_follows_its_new_quirk_fields() {
         for (model, identity) in [
@@ -698,12 +700,12 @@ mod tests {
         let q = CpuModel::I80286.profile().quirks;
         assert!(q.lock_data_movement);
         assert_eq!(q.coprocessor_overrun_vector, Some(9));
-        assert_ne!(I80286.semantics_id, 0x3699_e02a_8ef1_3e63);
-        // Restoring the canonical values restores the earlier identity.
-        let mut earlier = copy(&I80286);
-        earlier.quirks.lock_data_movement = false;
-        earlier.quirks.coprocessor_overrun_vector = None;
-        assert_eq!(identified(earlier).semantics_id, 0x3699_e02a_8ef1_3e63);
+        assert_eq!(I80286.semantics_id, 0x7357_723a_3f16_2910);
+        // The two quirk fields feed the identity.
+        let mut canonical = copy(&I80286);
+        canonical.quirks.lock_data_movement = false;
+        canonical.quirks.coprocessor_overrun_vector = None;
+        assert_ne!(identified(canonical).semantics_id, I80286.semantics_id);
     }
 
     // Decision-23 C4a: the NEC entries share content and differ in identity;

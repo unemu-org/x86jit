@@ -920,6 +920,38 @@ ASSUMED as the cause. Three layout variants did not restore that function. The s
 by +0.55 % at the C4a landing. The maintainer accepted the slowdown. Bead xj-50w.17 carries it,
 with this requirement's +0.5 % gate as its acceptance. The gate itself is unchanged.
 
+**Amendment (LOADALL on the 80286, 2026-11-17, accepted by the maintainer).** The I80286 model
+executes the undocumented LOADALL instruction, 0F 05 (xj-oog; spec.md §17.10, "LOADALL"). The
+evidence that a guest needs it:
+- an embedder's real-mode guest stops on 0F 05 with #UD today (MEASURED by the embedder);
+- a static scan of that guest finds one 0F 05 and no 0F 04 or 0F 07 (MEASURED by the embedder);
+- that the guest executes it at run time is READ from its code.
+
+The source is Intel's "Undocumented iAPX 286 Test Instruction", pinned fetch-only as
+`oracles/intel/i286-loadall.pdf` (15 pp.). It contradicts itself on the opcode: p. 2's bit
+encoding gives 0F 05, while p. 13 gives 0F04H and says that 0F05H halts. The engine follows
+p. 2 and pp. 1–3; this choice is DERIVED. 0F 04 keeps #UD (80286 PRM App. B p. B-12), a recorded
+divergence from p. 13. 0F 05 stays #UD on the I80386 and SYSCALL in the Application profiles.
+
+The table policy is in spec.md §17.10:
+- a table that breaks a p. 4 requirement is refused with the typed refusal `I286LoadallTable`,
+  and nothing is loaded;
+- the document's "should" advice is not checked, and the values load as given;
+- the engine also refuses what it cannot execute as the 80286 would: in protected mode a data
+  CS or a CS DPL other than 0, and in real mode an expand-down SS, DS or ES;
+- real-mode access checks no rights, so a real-mode access through a loaded code or read-only
+  cache succeeds where the 80286 faults. This divergence is recorded.
+
+On the I80286, a real-mode segment load now sets the hidden limit to FFFFh (the LOADALL document
+p. 3; 80286 PRM §5.1 p. 5-2) and the rights to 93h, or to 9Bh for CS. The 9Bh is ASSUMED: neither source gives
+it. A cache that LOADALL loaded therefore lasts until the next load of that segment register.
+Only the I80286 identity moves, 24d34f81af8da20b → 7357723a3f162910.
+
+Against add161a9, every real16_loops cell is within +0.5 % on the median of processes (−0.27 %
+to +0.20 %), and the store probe is within +0.08 %. On the 80386 path, one candidate process
+of 7 in the straight-line cell forms an unmatched mode at +0.92 %; the bimodal rule above
+reports it and does not count it.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and

@@ -1017,6 +1017,8 @@ sets; `UD1` is now absent too. The 80386 PRM Appendix A two-byte opcode map
 p.A-7 leaves 0F B9 undefined, and §14.6 Table14-1 p.14-5 requires #UD at the
 faulting instruction. This fixes the baseline's I80386 refusal. Existing
 reserved LOADALL/XBTS/IBTS slots continue to fault; the table does not admit them.
+(A later note: xj-oog makes 0F 05 LOADALL on `I80286`, spec.md §17.10. This
+record describes the decode before it.)
 The older unsupported coprocessor pairing policy is preserved (decision-25).
 
 `ModelQuirks::flags_fixed_zero` names AC/ID as catalogue data. Both entries
@@ -1139,7 +1141,7 @@ reports vector6 at CS:IP 0100:0234. This is the only failing baseline witness.
 | Real IRET/IRETD identity probes, both models and alias | Pass | Pass |
 | All listed post-386 instructions: prefixed #UD, outward saved IP and actual in-guest CS:IP frame, both models | Pass | Pass |
 | UD1 reserved encoding, both models | Fail on I80386 | Pass |
-| Reserved LOADALL/XBTS/IBTS map slots, including 386 width prefixes | Pass | Pass |
+| Reserved LOADALL/XBTS/IBTS map slots, including 386 width prefixes (80286 0F 05 is LOADALL since xj-oog) | Pass | Pass |
 | 82h ADD, group2 /6 SAL, group3 /1 TEST aliases | Pass | Pass |
 | Protected default-16 286 / default-32 386 POPF and IRET identity probes | Pass | Pass |
 | Protected decode: every listed absent instruction at the model's default width | Pass | Pass |

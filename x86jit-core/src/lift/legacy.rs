@@ -1116,6 +1116,13 @@ pub(super) fn lower(
             emit(ops, L::LoadMsw { value });
         }
         Clts => emit(ops, L::ClearTs),
+        // Intel, "Undocumented iAPX 286 Test Instruction", p. 1: LOADALL
+        // belongs to the 80286; another generation keeps the undefined opcode.
+        Loadall if context.generation == crate::CpuGeneration::I286 => emit(ops, L::Loadall),
+        Loadall => ops.push(IrOp::Trap {
+            vector: 6,
+            advance: 0,
+        }),
         Mov if insn.op_register(0).is_cr() || insn.op_register(1).is_cr() => {
             let writing = insn.op_register(0).is_cr();
             let register = match insn.op_register(u32::from(!writing)) {
@@ -1751,6 +1758,7 @@ pub(super) fn lower(
             | Lss
             | Lfs
             | Lgs
+            | Loadall
     ) || (insn.mnemonic() == Mov && insn.op0_register().is_segment_register())
         || (insn.mnemonic() == Pop && insn.op0_register().is_segment_register()))
 }

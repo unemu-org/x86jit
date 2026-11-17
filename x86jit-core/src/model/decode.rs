@@ -648,6 +648,11 @@ pub(super) const ENCODINGS: &[(Code, u8)] = &[
     (Code::Lsl_r16_rm16, 3),
     (Code::Lsl_r32_r32m16, 2),
     (Code::Storeall, 3),
+    // Intel, "Undocumented iAPX 286 Test Instruction"
+    // (`oracles/intel/i286-loadall.pdf`), pp. 1-2: LOADALL is 0F 05 on the
+    // 80286 and "will not work on an iAPX 386". p. 13 says "opcode 0F04H"
+    // and that 0F05H halts; p. 2's bit encoding governs (DERIVED, spec.md).
+    (Code::Loadall286, 1),
     (Code::Clts, 3),
     (Code::Mov_r32_cr, 2),
     (Code::Mov_r32_dr, 2),
@@ -795,10 +800,13 @@ struct DecodeSet {
 // 80286 PRM App.B #UD p.B-12; 80386 PRM §14.6 Table14-1 p.14-5:
 // both models have #UD. None is reserved for a model with typed refusals.
 // MOV_TR exposes the 386 special-register forms (PRM §17 p.17-111);
-// encoding membership still denies them on the 286.
+// encoding membership still denies them on the 286. LOADALL286 names 0F 05
+// LOADALL (Intel, "Undocumented iAPX 286 Test Instruction", p. 2) and 0F 04
+// STOREALL, which `unavailable_prefix` keeps #UD (App. B p. B-12) although
+// that document's p. 13 gives 0F04H exception 13 at CPL > 0 (spec.md).
 const I286_SET: DecodeSet = DecodeSet {
     models: 1,
-    options: iced_x86::DecoderOptions::MOV_TR,
+    options: iced_x86::DecoderOptions::MOV_TR | iced_x86::DecoderOptions::LOADALL286,
     absent: Some(6),
     legacy_segments_only: true,
 };
@@ -811,9 +819,12 @@ const I386_SET: DecodeSet = DecodeSet {
 
 // The existing system VM handles these two rows after the twenty-bit dispatch.
 // Keep the common decoder flags a catalogue-derived constant on that path.
+// They decide where a fetch ends and which forms the shared walk may take.
+// The 286's LOADALL286 renames only the two-byte 0F 04 and 0F 05, neither
+// of which the shared walk takes, so the common flags omit it.
 pub(crate) const SYSTEM_DECODER_OPTIONS: u32 = {
-    assert!(I286_SET.options == I386_SET.options);
-    I286_SET.options
+    assert!(I286_SET.options & !iced_x86::DecoderOptions::LOADALL286 == I386_SET.options);
+    I386_SET.options
 };
 
 // The compatibility-generation adapter uses the same rows. Const blocks avoid
@@ -881,6 +892,8 @@ impl ModelIsa {
             .skip_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0xf0 | 0xf2 | 0xf3));
         // 80286 PRM App. B #UD p. B-12: first/second opcode, extension,
         // invalid Sreg or register in a memory-only form are independently #UD.
+        // 0F 05 is LOADALL (Intel, "Undocumented iAPX 286 Test Instruction",
+        // p. 2); 0F 04 stays #UD.
         if self.set().legacy_segments_only {
             match opcode.next() {
                 Some(0x64..=0x67) => true,
@@ -889,7 +902,7 @@ impl ModelIsa {
                     Some(0x01) => opcode.next().is_some_and(|b| {
                         matches!(b & 0x38, 0x28 | 0x38) || (b & 0xc0 == 0xc0 && b & 0x38 <= 0x18)
                     }),
-                    Some(0x02 | 0x03 | 0x06) | None => false,
+                    Some(0x02 | 0x03 | 0x05 | 0x06) | None => false,
                     Some(_) => true,
                 },
                 _ => false,

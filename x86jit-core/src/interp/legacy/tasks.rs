@@ -260,8 +260,8 @@ fn task_segment_descriptor<const ROUTED: bool, const ORDER: u8>(
     vector: u8,
     ext: u16,
 ) -> Result<Descriptor, Exit> {
-    let address =
-        descriptor_address(cpu, value).ok_or_else(|| selector_fault(cpu, vector, value, ext))?;
+    let address = descriptor_address(cpu, value, generation)
+        .ok_or_else(|| selector_fault(cpu, vector, value, ext))?;
     descriptor_at(cpu, mem, address, generation)
 }
 

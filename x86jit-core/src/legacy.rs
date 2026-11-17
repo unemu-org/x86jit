@@ -994,6 +994,10 @@ pub enum LegacyOp {
         bytes: [u8; 15],
         len: u8,
     },
+    /// 80286 LOADALL: the whole register image from the table at physical
+    /// 000800H (Intel, "Undocumented iAPX 286 Test Instruction",
+    /// `oracles/intel/i286-loadall.pdf`, pp. 1-3).
+    Loadall,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1027,6 +1031,136 @@ pub enum SelectorDestination {
 // Appendix B LMSW p. B-67 (scan checked): only PE/MP/EM/TS load; PE is sticky.
 pub(crate) fn lmsw_value(cr0: u32, source: u16) -> u32 {
     (cr0 & !0xe) | u32::from(source & 0xf)
+}
+
+/// Intel, "Undocumented iAPX 286 Test Instruction", p. 2: LOADALL reads 102
+/// bytes of physical memory from 000800H in 51 bus cycles.
+pub(crate) const LOADALL_TABLE: u32 = 0x800;
+pub(crate) const LOADALL_TABLE_BYTES: usize = 102;
+
+/// The register image in an 80286 LOADALL table, as engine records (Intel,
+/// "Undocumented iAPX 286 Test Instruction", p. 2 "LOADALL Memory Area
+/// Format", p. 3 entry formats).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadallImage {
+    pub msw: u16,
+    pub flags: u16,
+    pub ip: u16,
+    /// CS, DS, ES and SS, in `SegmentId` order.
+    pub selectors: [u16; 4],
+    pub caches: [SegmentCache; 4],
+    /// AX, CX, DX, BX, SP, BP, SI and DI, in the engine's register order.
+    pub gpr: [u16; 8],
+    pub gdtr: TableRegister,
+    pub idtr: TableRegister,
+    pub ldtr: SystemSegment,
+    pub tr: SystemSegment,
+}
+
+impl LoadallImage {
+    pub(crate) fn parse(table: &[u8; LOADALL_TABLE_BYTES]) -> Self {
+        // p. 2 gives each register's physical address. 800H-805H and
+        // 808H-815H are read but load no register.
+        let at = |address: usize| &table[address - LOADALL_TABLE as usize..];
+        let word = |address: usize| u16::from_le_bytes([at(address)[0], at(address)[1]]);
+        // p. 3: a descriptor cache entry is the 24-bit base, least significant
+        // byte first, the access rights byte, then the 16-bit limit. Its
+        // present bit "becomes a valid bit": zero marks the cache invalid.
+        let cache = |address: usize| {
+            let entry = at(address);
+            SegmentCache {
+                base: u32::from_le_bytes([entry[0], entry[1], entry[2], 0]),
+                limit: u32::from(u16::from_le_bytes([entry[4], entry[5]])),
+                attributes: u16::from(entry[3]),
+                unusable: u8::from(entry[3] & 0x80 == 0),
+                reserved: 0,
+            }
+        };
+        // p. 3: GDTR and IDTR use the same base and limit bytes. Their byte 3
+        // "should be zeroes" and has no field to load: it is ignored, as LGDT
+        // and LIDT ignore the last byte of their operand (I286 PRM App. B
+        // LGDT/LIDT p. B-65, scan checked). DERIVED.
+        let table_register = |address: usize| {
+            let entry = cache(address);
+            TableRegister {
+                base: entry.base,
+                limit: entry.limit as u16,
+                reserved: 0,
+            }
+        };
+        let system = |selector: usize, address: usize| SystemSegment {
+            selector: word(selector),
+            reserved: 0,
+            cache: cache(address),
+        };
+        Self {
+            msw: word(0x806),
+            flags: word(0x818),
+            ip: word(0x81a),
+            selectors: [word(0x822), word(0x81e), word(0x824), word(0x820)],
+            caches: [cache(0x83c), cache(0x848), cache(0x836), cache(0x842)],
+            gpr: [0x834, 0x832, 0x830, 0x82e, 0x82c, 0x82a, 0x828, 0x826].map(word),
+            gdtr: table_register(0x84e),
+            idtr: table_register(0x85a),
+            ldtr: system(0x81c, 0x854),
+            tr: system(0x816, 0x860),
+        }
+    }
+
+    /// Whether the engine loads this image as the 80286 would, in the regime
+    /// the loaded MSW selects; otherwise LOADALL is the typed refusal
+    /// `I286LoadallTable`, with nothing loaded. Intel, "Undocumented iAPX 286
+    /// Test Instruction" (`oracles/intel/i286-loadall.pdf`): LOADALL itself
+    /// checks nothing (pp. 1, 3), but p. 4 requires of the caches:
+    /// - item 1: SS is a writable, valid data segment;
+    /// - item 2: CS is execute-only code, execute/read code, or a writable
+    ///   expand-up data segment;
+    /// - item 3, "for proper protected mode operation": the CS and SS DPLs
+    ///   are equal; they are the CPL.
+    ///
+    /// The policy for the document's wording. A table that breaks one of
+    /// these requirements is refused: the document gives no result for it.
+    /// Its advice ("should": a DS and ES DPL of 3, p. 3 and p. 4 item 4;
+    /// GDTR and IDTR byte 3, p. 3) is not checked, and the values load as
+    /// given. p. 2's protected-mode MSW "must have a one in bit position 0"
+    /// states its own outcome (LOADALL cannot leave protected mode), so it is
+    /// not checked either. Beyond the document, the engine refuses what it
+    /// cannot execute as the 80286 would:
+    /// - in protected mode, a data CS (the engine fetches only through code)
+    ///   and a CS DPL other than 0 (the Machine runs only at CPL 0);
+    /// - in real mode, an expand-down SS, DS or ES (real-mode access checks
+    ///   every limit as expand-up);
+    /// - a valid DS or ES with S = 0, a system type, in either mode.
+    ///
+    /// A conforming CS has one of item 2's two code capabilities and loads.
+    /// The engine's real-mode access checks the limit and the valid bit but
+    /// no rights, where the 80286 checks them "in either operating mode"
+    /// (p. 1): a real-mode write through a loaded code or read-only data
+    /// cache, or a read through execute-only code, faults on the 80286 and
+    /// succeeds in the engine. Access byte bits: I286 PRM §6.5 Fig. 6-7
+    /// p. 6-9 (scan checked).
+    pub(crate) fn supported(&self, protected: bool) -> bool {
+        const PRESENT: u16 = 0x80;
+        const DPL: u16 = 0x60;
+        // Present, S = 1, executable: code of any kind.
+        let code = |rights: u16| rights & 0x98 == 0x98;
+        // Present, S = 1, not executable, writable.
+        let writable = |rights: u16| rights & 0x9a == 0x92;
+        // S = 1, not executable, expand-down.
+        let expand_down = |rights: u16| rights & 0x1c == 0x14;
+        let rights = |id: SegmentId| self.caches[id as usize].attributes;
+        let (cs, ss) = (rights(SegmentId::Cs), rights(SegmentId::Ss));
+        let data = [rights(SegmentId::Ds), rights(SegmentId::Es)];
+        writable(ss)
+            && data
+                .iter()
+                .all(|&r| r & PRESENT == 0 || (r & 0x10 != 0 && (protected || !expand_down(r))))
+            && if protected {
+                code(cs) && (cs | ss) & DPL == 0
+            } else {
+                (code(cs) || (writable(cs) && !expand_down(cs))) && !expand_down(ss)
+            }
+    }
 }
 
 /// SDM Vol 3B §23.1.1: check the complete effective offset before forming
@@ -1300,5 +1434,162 @@ mod real_flags_tests {
         restore_flags(&mut cpu, CpuGeneration::I386, 0).unwrap();
         assert_eq!(cpu.rflags_system, 0x30000);
         assert_eq!(flags_image(&cpu, CpuGeneration::I386), 0x30002);
+    }
+}
+
+#[cfg(test)]
+mod loadall_tests {
+    use super::*;
+
+    #[test]
+    fn loadall_table_follows_the_documented_layout() {
+        // Intel, "Undocumented iAPX 286 Test Instruction", p. 2 "LOADALL
+        // Memory Area Format", restated row by row: each word register is
+        // written with its own address. The rows that load no register hold
+        // A5h and must not reach any field.
+        let mut table = [0xa5; LOADALL_TABLE_BYTES];
+        let mut put = |address: usize, bytes: &[u8]| {
+            table[address - 0x800..][..bytes.len()].copy_from_slice(bytes);
+        };
+        for address in [
+            0x806, 0x816, 0x818, 0x81a, 0x81c, 0x81e, 0x820, 0x822, 0x824, 0x826, 0x828, 0x82a,
+            0x82c, 0x82e, 0x830, 0x832, 0x834,
+        ] {
+            put(address, &(address as u16).to_le_bytes());
+        }
+        // p. 3: base bytes 0-2 least significant first, access byte, limit.
+        for (address, access) in [
+            (0x836, 0x93), // ES descriptor cache
+            (0x83c, 0x9b), // CS descriptor cache
+            (0x842, 0x92), // SS descriptor cache
+            (0x848, 0x13), // DS descriptor cache, invalid (present bit zero)
+            (0x84e, 0x00), // GDTR
+            (0x854, 0x82), // LDT descriptor cache
+            (0x85a, 0x01), // IDTR, byte 3 nonzero and ignored
+            (0x860, 0x03), // TSS descriptor cache, invalid
+        ] {
+            put(
+                address,
+                &[
+                    address as u8,
+                    0x34,
+                    0x12,
+                    access,
+                    address as u8,
+                    0xf0 | (address >> 8) as u8,
+                ],
+            );
+        }
+        let cache = |address: u32, attributes: u16| SegmentCache {
+            base: 0x12_3400 | (address & 0xff),
+            limit: 0xf000 | address,
+            attributes,
+            unusable: u8::from(attributes & 0x80 == 0),
+            reserved: 0,
+        };
+        let table_register = |address: u32| TableRegister {
+            base: 0x12_3400 | (address & 0xff),
+            limit: 0xf000 | address as u16,
+            reserved: 0,
+        };
+        assert_eq!(
+            LoadallImage::parse(&table),
+            LoadallImage {
+                msw: 0x806,
+                flags: 0x818,
+                ip: 0x81a,
+                // CS, DS, ES, SS.
+                selectors: [0x822, 0x81e, 0x824, 0x820],
+                caches: [
+                    cache(0x83c, 0x9b),
+                    cache(0x848, 0x13),
+                    cache(0x836, 0x93),
+                    cache(0x842, 0x92),
+                ],
+                // AX, CX, DX, BX, SP, BP, SI, DI.
+                gpr: [0x834, 0x832, 0x830, 0x82e, 0x82c, 0x82a, 0x828, 0x826],
+                gdtr: table_register(0x84e),
+                idtr: table_register(0x85a),
+                ldtr: SystemSegment {
+                    selector: 0x81c,
+                    reserved: 0,
+                    cache: cache(0x854, 0x82),
+                },
+                tr: SystemSegment {
+                    selector: 0x816,
+                    reserved: 0,
+                    cache: cache(0x860, 0x03),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn loadall_tables_the_engine_loads_exactly() {
+        // Intel, "Undocumented iAPX 286 Test Instruction", pp. 1-4, and the
+        // policy in `LoadallImage::supported`; access byte: I286 PRM §6.5
+        // Fig. 6-7 p. 6-9.
+        let image = |cs: u8, ss: u8, ds: u8, es: u8| {
+            let mut table = [0; LOADALL_TABLE_BYTES];
+            for (address, access) in [(0x83c, cs), (0x842, ss), (0x848, ds), (0x836, es)] {
+                table[address - 0x800 + 3] = access;
+            }
+            LoadallImage::parse(&table)
+        };
+        // Real mode: SS writable expand-up data; CS any code or writable
+        // expand-up data; DS and ES invalid, code or expand-up data. DPLs
+        // are free; rights faults are not raised in real mode.
+        for (cs, ss, ds, es, expected) in [
+            (0x93, 0x93, 0x93, 0x93, true),
+            (0x92, 0xf2, 0xb3, 0xd3, true),
+            (0x93, 0x93, 0x13, 0x00, true),
+            (0x9b, 0x93, 0x93, 0x93, true),
+            (0x98, 0x93, 0x93, 0x93, true),
+            (0x9f, 0x93, 0x93, 0x93, true),
+            (0xfb, 0x93, 0x93, 0x93, true),
+            (0x93, 0x93, 0x91, 0x93, true),
+            (0x93, 0x93, 0x93, 0x9a, true),
+            (0x93, 0x93, 0x98, 0x9e, true),
+            (0x91, 0x93, 0x93, 0x93, false),
+            (0x97, 0x93, 0x93, 0x93, false),
+            (0x93, 0x97, 0x93, 0x93, false),
+            (0x93, 0x91, 0x93, 0x93, false),
+            (0x93, 0x9b, 0x93, 0x93, false),
+            (0x13, 0x93, 0x93, 0x93, false),
+            (0x1b, 0x93, 0x93, 0x93, false),
+            (0x93, 0x13, 0x93, 0x93, false),
+            (0x93, 0x93, 0x97, 0x93, false),
+            (0x93, 0x93, 0x93, 0x95, false),
+            (0x93, 0x93, 0x93, 0x82, false),
+        ] {
+            assert_eq!(
+                image(cs, ss, ds, es).supported(false),
+                expected,
+                "real {cs:02x} {ss:02x} {ds:02x} {es:02x}"
+            );
+        }
+        // Protected mode: SS valid writable data; CS valid code, conforming
+        // or not; both at DPL 0; DS and ES invalid or any S = 1 type.
+        for (cs, ss, ds, es, expected) in [
+            (0x9b, 0x93, 0x93, 0x93, true),
+            (0x99, 0x97, 0x9a, 0x00, true),
+            (0x9f, 0x93, 0xf1, 0xf9, true),
+            (0x9c, 0x92, 0x95, 0x13, true),
+            (0x93, 0x93, 0x93, 0x93, false),
+            (0x1b, 0x93, 0x93, 0x93, false),
+            (0xfb, 0xf3, 0x93, 0x93, false),
+            (0xbb, 0xb3, 0x93, 0x93, false),
+            (0x9b, 0xd3, 0x93, 0x93, false),
+            (0x9b, 0x91, 0x93, 0x93, false),
+            (0x9b, 0x9b, 0x93, 0x93, false),
+            (0x9b, 0x93, 0x81, 0x93, false),
+            (0x9b, 0x93, 0x93, 0x83, false),
+        ] {
+            assert_eq!(
+                image(cs, ss, ds, es).supported(true),
+                expected,
+                "protected {cs:02x} {ss:02x} {ds:02x} {es:02x}"
+            );
+        }
     }
 }

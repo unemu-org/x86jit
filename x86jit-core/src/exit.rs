@@ -104,6 +104,17 @@ pub enum UnsupportedSystemOperation {
     /// pp. 12-42–43 give "Transfers: 3n" but no order of the reads and
     /// stores, and this overlap is where the order shows.
     NecBcdStringOverlap,
+    /// 80286 LOADALL: a table the engine does not load. Intel's LOADALL
+    /// description ("Undocumented iAPX 286 Test Instruction",
+    /// `oracles/intel/i286-loadall.pdf`) requires SS to be valid writable
+    /// data and CS execute-only code, execute/read code or writable
+    /// expand-up data (p. 4 items 1-2), and in protected mode the CS and SS
+    /// DPLs to be equal (item 3); it describes no result otherwise. The
+    /// engine also refuses a data CS or a CS DPL other than 0 in protected
+    /// mode, an expand-down SS, DS or ES in real mode, and a valid DS or ES
+    /// with a system type. Nothing is loaded. `LoadallImage::supported`
+    /// states the whole policy.
+    I286LoadallTable,
 }
 
 /// Reason `run()` returned control to the user (§5.2).

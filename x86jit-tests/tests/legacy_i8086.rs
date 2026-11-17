@@ -2398,7 +2398,8 @@ fn lock_admission_changes_only_the_twenty_bit_identities() {
             CpuModel::I80286,
             0x3699_e02a_8ef1_3e63,
             // xj-50w.11 gives the 80286 its own quirk fields; xj-50w.12 does not touch it.
-            0x24d3_4f81_af8d_a20b,
+            // xj-oog adds LOADALL to its decode set (0x24d3_4f81_af8d_a20b before).
+            0x7357_723a_3f16_2910,
         ),
         (
             CpuModel::I80386,

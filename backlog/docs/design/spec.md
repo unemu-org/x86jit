@@ -2017,6 +2017,81 @@ the limit and lifts it from the bytes a fetch would hold, so an eleven-byte
 (App. C item 10 p. C-2; App. B #GP p. B-9; decision-23, "The 80286 over-length
 fault").
 
+`I80286` executes LOADALL, 0F 05 (xj-oog; decision-23 amendment, LOADALL).
+The 80286 PRM omits it; its source is Intel's "Undocumented iAPX 286 Test
+Instruction", `oracles/intel/i286-loadall.pdf` (PROVENANCE.md §1), cited by
+the page numbers printed on it. The document contradicts itself on the
+opcode. p. 2 encodes LOADALL as 00001111 00000101, 0F 05, and pp. 1-3 and the
+p. 15 erratum describe an instruction that loads the machine state in real
+mode too. p. 13 calls it "opcode 0F04H", says that 0F05H in real mode or at
+CPL 0 stops the 80286 until RESET, and ends by saying that 0F05H "may be
+executed at any time in real address mode". The engine follows p. 2's bit
+encoding and pp. 1-3 (DERIVED: the p. 13 paragraph contradicts itself, and no
+pinned oracle has a 0F xx case). 0F 04 stays #UD (App. B p. B-12), a recorded
+divergence from p. 13's exception 13 at CPL > 0. 0F 05 stays #UD on `I80386`
+and SYSCALL in every Application mode; only the `I80286` identity moves.
+
+In real mode, or in protected mode at CPL 0, LOADALL reads the 102-byte table
+at physical 000800H as 51 words through the A20 gate and loads the MSW, TR,
+FLAGS, IP, LDTR, the DS, SS, CS and ES selectors, the eight word registers,
+the ES, CS, SS and DS descriptor caches, GDTR, the LDT cache, IDTR and the
+TSS cache (p. 2). The bytes at 800h-805h and 808h-815h are read and ignored.
+At CPL 1-3 it raises #GP(0) before reading (p. 1). PE stays set: LOADALL
+"cannot switch the 80286 from protected mode to real mode" (p. 2; DERIVED).
+A cache entry's present bit is a valid bit: a clear one marks the cache
+`unusable`, and a reference through it raises #GP(0) in protected mode
+(p. 3) and, in real mode, interrupt 13 without an error code, as the engine's
+other real-mode segment faults (App. B MOV p. B-74). In protected mode the CS
+DPL becomes the CPL (p. 3). The LDT cache's valid bit alone says whether an
+LDT exists, so a valid LDT cache under a null LDTR selector serves LDT
+references (pp. 2-3, with LLDT's "marked invalid", App. B p. B-66; DERIVED);
+the 80386 keeps its null-selector test. A loaded cache, its base above 1 MiB
+included, addresses memory until its register is loaded again. On the 80286
+a real-mode load also resets the limit to FFFFh (p. 3; §5.1 p. 5-2) and the
+rights to the engine's real-mode labels, 93h for DS, ES and SS and 9Bh for
+CS, so a real-mode far transfer meets the new limit. 9Bh is ASSUMED: neither
+source gives it, and after LMSW enters protected mode, before CS is loaded
+again, the engine raises #GP for a CS-override write that p. 3's "a writable
+segment" lets succeed.
+
+The table policy. LOADALL checks nothing (pp. 1, 3), but p. 4 requires that
+SS be valid, writable data (item 1), that CS be execute-only code,
+execute/read code or writable expand-up data (item 2), and, "for proper
+protected mode operation", that the CS and SS DPLs be equal (item 3). One
+rule covers the document's wording. A table that breaks a requirement is the
+typed refusal `I286LoadallTable`, with nothing loaded, because the document
+gives no result for it. Advice is not checked, and the values load as given:
+the DS and ES DPL "should be 3" (p. 3; p. 4 item 4), and GDTR and IDTR byte 3
+"should be zeroes" (p. 3); that byte is ignored, as LGDT and LIDT ignore the
+last byte of their operand (App. B p. B-65; DERIVED). p. 2's protected-mode
+MSW "must have a one in bit position 0" states its own outcome, so it is not
+checked either. Beyond the document, the engine refuses what it cannot
+execute as the 80286 would: in protected mode a data CS, since it fetches only
+through code, and a CS DPL of 1-3, since the Machine runs only at CPL 0; in
+real mode an expand-down SS, DS or ES, since real-mode access checks every
+limit as expand-up; and a valid DS or ES with a system type. An invalid CS or
+SS stays refused (`UnusableCodeOrStack`). A conforming CS has one of item 2's
+code capabilities and loads in either mode. Real-mode access checks no
+rights, where the 80286 checks the loaded rights "in either operating mode"
+(p. 1): a real-mode CS of any code form and a read-only or code DS or ES
+load, and a real-mode write through such a cache, or a read through
+execute-only code, succeeds where the 80286 raises exception 13. The LDT and
+TSS caches load unchecked, as p. 3 says.
+
+What the document leaves open, and the engine's choice, each ASSUMED. The 51
+words are read in ascending order and every read precedes the first change,
+so a fault or a device stop restarts LOADALL with nothing loaded (p. 2 gives
+the count, not the order). FLAGS loads by the POPF and IRET rule: IOPL and NT
+load only in protected mode (App. B IRET pp. B-51–52; §10.1 p. 10-1). The MSW
+loads as LMSW does, bits 3:0 (App. B LMSW p. B-67). No interrupt or NMI hold
+follows LOADALL, even when it loads SS, and LOADALL does not end NMI
+blocking. A TF set before LOADALL traps after it, with the loaded CS:IP
+saved; a TF that LOADALL loads traps after the next instruction, as after
+IRET or a task switch (§9.7.1 p. 9-14). The model is a later stepping: the
+A1/B1 erratum, a real-mode LOADALL that may enter protected mode (p. 15), is
+not modelled. p. 2 gives both "195 clocks" and "190 clocks with no wait
+states"; neither is modelled, with the rest of the timing model. Word
+registers keep their bits above 15 as any 16-bit write does.
 
 Decision-23 C2 adds `I8088` and `I8086`. Both select the 8086 instruction set,
 `system = None`, twenty physical address bits, no instruction-length limit,

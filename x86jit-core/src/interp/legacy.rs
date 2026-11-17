@@ -222,6 +222,111 @@ fn reload(cpu: &mut CpuState, segment: SegmentId, value: u16) {
     }
 }
 
+/// A real-mode segment load. On the 80286 it also resets the limit to FFFFH
+/// and "access rights is changed to a writable segment", which ends a cache
+/// that LOADALL loaded (Intel, "Undocumented iAPX 286 Test Instruction",
+/// `oracles/intel/i286-loadall.pdf`, p. 3); every real-mode segment has the
+/// limit 0FFFFH (I286 PRM §5.1 p. 5-2, scan checked). The rights are the
+/// engine's real-mode labels, the values of `CpuState::legacy_real_entry`,
+/// which real-mode access does not check: 93h, writable data, for DS, ES and
+/// SS, and 9Bh, execute/read code, for CS. 9Bh is ASSUMED: neither source
+/// gives it, and p. 3's "writable" makes a CS-override write succeed where
+/// the engine raises #GP if LMSW enters protected mode before CS is loaded
+/// again.
+fn reload_real(
+    cpu: &mut CpuState,
+    segment: SegmentId,
+    value: u16,
+    generation: crate::CpuGeneration,
+) {
+    reload(cpu, segment, value);
+    if generation == crate::CpuGeneration::I286 {
+        let cache = &mut cpu.legacy.segments[segment as usize];
+        cache.limit = 0xffff;
+        cache.attributes = if segment == SegmentId::Cs { 0x9b } else { 0x93 };
+    }
+}
+
+/// The new IP of a real-mode transfer that loads CS. The 80286 reload sets
+/// the CS limit to FFFFH (`reload_real`), so the current cache's limit does
+/// not bound the new IP; the 80386 keeps the limit, so there it does.
+fn far_real_target(
+    cpu: &CpuState,
+    context: MachineContext,
+    value: u64,
+    size: u8,
+) -> Result<u64, Exit> {
+    let offset = value & mask(size);
+    if context.generation == crate::CpuGeneration::I286 && offset <= 0xffff {
+        return Ok(offset);
+    }
+    target(cpu, context, value, size)
+}
+
+/// 80286 LOADALL (Intel, "Undocumented iAPX 286 Test Instruction",
+/// `oracles/intel/i286-loadall.pdf`, pp. 1-4). p. 2 gives the 51 bus cycles
+/// but not their order: the engine reads ascending words, and every read
+/// precedes the first state change, so a fault or a device stop restarts
+/// the instruction with nothing loaded (ASSUMED). The model is a later
+/// stepping: the A1/B1 erratum that may enter protected mode (p. 15) is not
+/// modelled (ASSUMED).
+fn loadall<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+) -> Result<(), Exit> {
+    // p. 1: in protected mode at a privilege level other than 0, exception
+    // 13 with an error code of 0.
+    if cpu.legacy.cr0 & 1 != 0 && cpu.legacy.cpl != 0 {
+        return Err(fault(cpu, 13, 0));
+    }
+    // p. 2: 51 bus cycles from physical 000800H. No paging precedes the
+    // 80286 bus, and the board's A20 gate applies as to any transfer.
+    let mut table = [0; legacy::LOADALL_TABLE_BYTES];
+    for (i, word) in table.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let address = u64::from(legacy::LOADALL_TABLE) + 2 * i as u64;
+        *word = (read(cpu, mem, address, 2)? as u16).to_le_bytes();
+    }
+    let image = legacy::LoadallImage::parse(&table);
+    // p. 2: LOADALL "cannot switch the 80286 from protected mode to real
+    // mode", so PE stays set (DERIVED). The MSW loads as LMSW does (I286 PRM
+    // App. B LMSW p. B-67): bits 3:0, the higher bits dropped (ASSUMED).
+    let cr0 = legacy::lmsw_value(cpu.legacy.cr0, image.msw);
+    let protected = cr0 & 1 != 0;
+    if !image.supported(protected) {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::I286LoadallTable,
+        ));
+    }
+    cpu.legacy.cr0 = cr0;
+    // p. 3: the DPLs of the CS and SS caches are the CPL; `supported` admits
+    // DPL 0 alone in protected mode, and real mode is CPL 0.
+    let cs = image.caches[SegmentId::Cs as usize];
+    cpu.legacy.cpl = if protected {
+        ((cs.attributes >> 5) & 3) as u8
+    } else {
+        0
+    };
+    let segments = [SegmentId::Cs, SegmentId::Ds, SegmentId::Es, SegmentId::Ss];
+    for ((segment, selector), cache) in segments.into_iter().zip(image.selectors).zip(image.caches)
+    {
+        install(cpu, segment, selector, cache);
+    }
+    cpu.legacy.gdtr = image.gdtr;
+    cpu.legacy.idtr = image.idtr;
+    cpu.legacy.ldtr = image.ldtr;
+    cpu.legacy.tr = image.tr;
+    for (register, value) in image.gpr.into_iter().enumerate() {
+        cpu.write_gpr(register, u64::from(value), 2);
+    }
+    // p. 1 says only that all registers load. FLAGS loads by the POPF and
+    // IRET rule, so IOPL and NT load only in protected mode (I286 PRM App. B
+    // IRET pp. B-51–52; §10.1 p. 10-1). ASSUMED.
+    legacy::restore_flags(cpu, crate::CpuGeneration::I286, u32::from(image.flags))?;
+    cpu.rip = u64::from(image.ip);
+    Ok(())
+}
+
 #[inline]
 fn segment_access(
     cpu: &CpuState,
@@ -874,7 +979,7 @@ const DESCRIPTOR_RETRY: u64 = 1 << 62;
 const TRANSFER_IP_RETRY: u64 = DESCRIPTOR_RETRY | (1 << 33);
 const TRANSFER_CS_RETRY: u64 = TRANSFER_IP_RETRY | 1;
 
-fn descriptor_address(cpu: &CpuState, value: u16) -> Option<u32> {
+fn descriptor_address(cpu: &CpuState, value: u16, generation: crate::CpuGeneration) -> Option<u32> {
     // SDM Vol 3A §§3.4.2, 3.5.1; 286 PRM §6.6.2 pp. 6-12–13;
     // 386 PRM §§5.1.1–5.1.2, 6.3.1.2: the last descriptor byte must
     // lie inside the selected table. Only GDT index zero is null.
@@ -885,8 +990,16 @@ fn descriptor_address(cpu: &CpuState, value: u16) -> Option<u32> {
         }
         (cpu.legacy.gdtr.base, u32::from(cpu.legacy.gdtr.limit))
     } else {
+        // On the 80286 the LDT cache's valid bit alone says whether there
+        // is an LDT. LLDT with a null selector marks the register invalid
+        // (286 PRM App. B LLDT p. B-66, scan checked), as a task switch to a
+        // null LDT does here, and LOADALL loads the cache with no check
+        // against the selector ("Undocumented iAPX 286 Test Instruction",
+        // pp. 2-3). DERIVED. The 80386 path keeps the null-selector test.
         let ldtr = cpu.legacy.ldtr;
-        if ldtr.selector & !3 == 0 || ldtr.cache.unusable != 0 {
+        if ldtr.cache.unusable != 0
+            || (generation != crate::CpuGeneration::I286 && ldtr.selector & !3 == 0)
+        {
             return None;
         }
         (ldtr.cache.base, ldtr.cache.limit)
@@ -900,7 +1013,8 @@ fn descriptor<const ROUTED: bool, const ORDER: u8>(
     value: u16,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
-    let address = descriptor_address(cpu, value).ok_or_else(|| fault(cpu, 13, value & !3))?;
+    let address =
+        descriptor_address(cpu, value, generation).ok_or_else(|| fault(cpu, 13, value & !3))?;
     descriptor_at(cpu, mem, address, generation)
 }
 
@@ -1114,7 +1228,7 @@ fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
     // 286 PRM §11.3 pp. 11-3–4; 386 PRM §6.3.6 pp. 6-18–19:
     // invalid selectors clear ZF; memory faults still escape. P is not tested,
     // and querying never loads a segment or sets the descriptor accessed bit.
-    let Some(address) = descriptor_address(cpu, selector) else {
+    let Some(address) = descriptor_address(cpu, selector, generation) else {
         cpu.flags.zf = false;
         return Ok(());
     };
@@ -1164,7 +1278,7 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
     generation: crate::CpuGeneration,
 ) -> Result<(), Exit> {
     if cpu.legacy.cr0 & 1 == 0 {
-        reload(cpu, segment, value);
+        reload_real(cpu, segment, value, generation);
         return Ok(());
     }
     // SDM Vol 2B §4.3 MOV; Vol 3A §§6.3, 6.6, 6.7;
@@ -1544,7 +1658,7 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     let address = u64::from(cpu.legacy.idtr.base.wrapping_add(offset));
     let ip = read(cpu, mem, address, 2)?;
     let cs = read(cpu, mem, u64::from((address as u32).wrapping_add(2)), 2)?;
-    target(cpu, context, ip, 4)?;
+    far_real_target(cpu, context, ip, 4)?;
     let flags = legacy::flags_image(cpu, context.generation);
     push(
         cpu,
@@ -1556,7 +1670,7 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     cpu.flags.if_ = false;
     // SDM Vol 3B §23.1.4: clear TF/RF/AC on entry.
     cpu.rflags_system &= !0x50100;
-    reload(cpu, SegmentId::Cs, cs as u16);
+    reload_real(cpu, SegmentId::Cs, cs as u16, context.generation);
     cpu.rip = ip;
     Ok(())
 }
@@ -3213,6 +3327,18 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     // SDM Vol 2A §3.3 CLTS; 80386 PRM §17 p. 17-48.
                     outcome.context_changed = write_cr0(cpu, cpu.legacy.cr0 & !8)?;
                 }
+                L::Loadall => {
+                    // The document is silent on events after LOADALL; the
+                    // engine's choices are ASSUMED. No interrupt or NMI hold
+                    // follows, even when SS loads, and NMI blocking does not
+                    // end. A TF set before LOADALL traps after it, saving
+                    // the loaded CS:IP; a TF it loads traps after the next
+                    // instruction, as for IRET or a task switch (I286 PRM
+                    // §9.7.1 p. 9-14).
+                    loadall(cpu, mem)?;
+                    outcome.context_changed = true;
+                    return Ok(true);
+                }
                 L::ReadSystemSegment { dst, register } => {
                     temps[*dst as usize] = u64::from(match register {
                         SystemRegister::Ldtr => cpu.legacy.ldtr.selector,
@@ -3472,6 +3598,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             push_addresses(cpu, mem, context, 2, *size)?;
                         }
                         code_limit(cpu, d.cache, ip)?;
+                    } else if cs.is_some() {
+                        far_real_target(cpu, context, ip, *size)?;
                     } else {
                         target(cpu, context, ip, *size)?;
                     }
@@ -3503,7 +3631,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                                 d.cache,
                             );
                         } else {
-                            reload(cpu, SegmentId::Cs, cs);
+                            reload_real(cpu, SegmentId::Cs, cs, context.generation);
                         }
                         outcome.context_changed = true;
                     }
@@ -3539,6 +3667,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     if let Some(d) = &mut descriptor {
                         code_limit(cpu, d.cache, ip)?;
                         accessed(cpu, mem, d)?;
+                    } else if cs.is_some() {
+                        far_real_target(cpu, context, ip, *size)?;
                     } else {
                         target(cpu, context, ip, *size)?;
                     }
@@ -3551,7 +3681,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         if let Some(d) = descriptor {
                             install(cpu, SegmentId::Cs, cs, d.cache);
                         } else {
-                            reload(cpu, SegmentId::Cs, cs);
+                            reload_real(cpu, SegmentId::Cs, cs, context.generation);
                         }
                         outcome.context_changed = true;
                     }
@@ -3594,7 +3724,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     if let Some(descriptor) = &descriptor {
                         code_limit(cpu, descriptor.cache, ip)?;
                     } else {
-                        target(cpu, context, ip, 4)?;
+                        far_real_target(cpu, context, ip, 4)?;
                     }
                     if let Some(d) = &mut descriptor {
                         accessed(cpu, mem, d)?;
@@ -3611,7 +3741,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     if let Some(d) = descriptor {
                         install(cpu, SegmentId::Cs, cs, d.cache);
                     } else {
-                        reload(cpu, SegmentId::Cs, cs);
+                        reload_real(cpu, SegmentId::Cs, cs, context.generation);
                     }
                     cpu.rip = ip;
                     outcome.context_changed = true;
@@ -4203,6 +4333,71 @@ mod delivery_tests {
                     crate::fault::ErrorCode::bits(code, 0xffff)
                 );
                 assert_eq!(cpu.rip, 0x1000);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod loadall_tests {
+    use super::*;
+    use crate::{CpuGeneration, LegacyCpuModel, Prot, RegionKind, Vm, VmConfig};
+
+    #[test]
+    fn loadall_outside_privilege_level_zero_faults_before_reading_the_table() {
+        // Intel, "Undocumented iAPX 286 Test Instruction", p. 1: in protected
+        // mode at a privilege level other than 0, exception 13 with an error
+        // code of 0. The public dispatcher enters only CPL 0; exercise the
+        // instruction directly. The table lies in a device region, so a read
+        // would stop with an MMIO exit instead.
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Trap).unwrap();
+        for cpl in 0..=3u8 {
+            let mut cpu = CpuState::legacy_real_entry([u16::from(cpl), 0, 0, u16::from(cpl), 0, 0]);
+            cpu.rip = 0x1000;
+            cpu.legacy.cr0 = 1;
+            cpu.legacy.cpl = cpl;
+            let context = legacy::derive_legacy_context(
+                LegacyCpuModel {
+                    generation: CpuGeneration::I286,
+                    model_semantics_id: 0,
+                },
+                &cpu,
+            )
+            .unwrap();
+            let ir = crate::lift::legacy::instruction(b"\x0f\x05", 0x1000, context).unwrap();
+            let before = format!("{cpu:?}");
+            let exit = execute::<false, 0>(
+                &ir,
+                &mut cpu,
+                &vm.mem,
+                &mut Vec::new(),
+                &mut tasks::SwitchState::default(),
+            )
+            .err()
+            .unwrap();
+            if cpl == 0 {
+                assert!(
+                    matches!(
+                        exit,
+                        Exit::MmioRead {
+                            addr: 0x800,
+                            size: 2,
+                            ..
+                        }
+                    ),
+                    "{exit:?}"
+                );
+            } else {
+                assert!(
+                    matches!(exit, Exit::Exception { vector: 13, .. }),
+                    "{exit:?}"
+                );
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    crate::fault::ErrorCode::bits(0, 0xffff)
+                );
+                assert_eq!(format!("{cpu:?}"), before);
             }
         }
     }
