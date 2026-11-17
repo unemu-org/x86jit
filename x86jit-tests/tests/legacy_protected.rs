@@ -2,6 +2,8 @@
 //! Authority: Intel SDM 325462-092US; 80386 PRM 230985-001 (scan checked).
 #[path = "support/model_api.rs"]
 mod model_api;
+#[path = "support/port_block.rs"]
+mod port_block;
 use x86jit_core::fault::{ErrorCode, FaultClass};
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, Exit, IrBlock, LegacyCpuModel, MemConsistency, Prot,
@@ -2670,4 +2672,17 @@ mod comparison_attempts {
             }
         }
     }
+}
+
+#[test]
+fn in_and_out_end_their_block_cpu_model() {
+    crate::model_api::with_cpu_model(in_and_out_end_their_block);
+}
+
+// xj-50w.22: protected-mode IN and OUT at CPL 0 in a 16-bit code segment.
+// The exit names the next instruction, and the rest of the block runs after
+// the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    port_block::check(|code| setup(code, false, false), 0x1000, false);
 }

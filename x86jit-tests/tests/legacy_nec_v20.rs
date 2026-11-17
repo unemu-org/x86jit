@@ -8,6 +8,8 @@ use x86jit_core::{
     InterpreterBackend, ModelIsa, ModelSystem, PortDir, Prot, RegionKind, StepOptions, StepRun,
     StepStop, UnsupportedSystemOperation, Vcpu, Vm, VmConfig,
 };
+#[path = "support/port_block.rs"]
+mod port_block;
 
 const MODELS: [CpuModel; 2] = [CpuModel::NecV20, CpuModel::NecV30];
 const IP: u64 = 0x1200;
@@ -2246,5 +2248,14 @@ fn x80_initial_psw_with_brk_refuses_brkem() {
         let mut actual = vec![0u8; 1 << 20];
         vm.read_bytes(0, &mut actual).unwrap();
         assert!(actual == image, "memory changed");
+    }
+}
+
+// xj-50w.22: IN and OUT end their twenty-bit block. The exit names the next
+// instruction, and the rest of the block runs after the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    for model in MODELS {
+        port_block::check(|code| setup(model, code), IP, true);
     }
 }

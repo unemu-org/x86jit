@@ -2,6 +2,8 @@
 //! Same-CPL legacy interpreter witnesses; no application backend may execute.
 #[path = "support/model_api.rs"]
 mod model_api;
+#[path = "support/port_block.rs"]
+mod port_block;
 use x86jit_core::fault::ErrorCode;
 use x86jit_core::{
     derive_legacy_context, Backend, CachedBlock, CpuGeneration, CpuState, Exit, IrBlock,
@@ -630,4 +632,16 @@ fn reset_fetch_single_step_uses_the_real_ivt() {
     );
     assert_eq!(bytes(&vm, 0x7ffa, 6), [0xf1, 0xff, 0, 0xf0, 2, 1]);
     assert_eq!(cpu.retired_instructions(), 1);
+}
+
+#[test]
+fn in_and_out_end_their_block_cpu_model() {
+    crate::model_api::with_cpu_model(in_and_out_end_their_block);
+}
+
+// xj-50w.22: protected-mode IN and OUT at CPL 0. The exit names the next
+// instruction, and the rest of the block runs after the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    port_block::check(|code| setup(code, true), 0x1000, false);
 }

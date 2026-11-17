@@ -2,6 +2,8 @@
 //! cited manuals; no emulator supplies instruction semantics.
 #[path = "support/model_api.rs"]
 mod model_api;
+#[path = "support/port_block.rs"]
+mod port_block;
 use x86jit_core::{
     Backend, CachedBlock, CpuGeneration, CpuMode, CpuState, Exit, IrBlock, LegacyCpuModel,
     MemConsistency, Prot, RegionKind, SegmentId, StepOptions, StepRunError, StepStop,
@@ -1987,5 +1989,19 @@ mod single_step {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn in_and_out_end_their_block_cpu_model() {
+    crate::model_api::with_cpu_model(in_and_out_end_their_block);
+}
+
+// xj-50w.22: real-mode IN and OUT on both system models. The exit names the
+// next instruction, and the rest of the block runs after the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+        port_block::check(|code| setup_model(code, generation), 0x1000, true);
     }
 }

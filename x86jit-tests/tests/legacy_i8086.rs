@@ -6,6 +6,8 @@ use x86jit_core::{
     ModelSystem, Prot, RegionKind, ResetOptions, StepOptions, StepStop, UnsupportedSystemOperation,
     Vcpu, Vm, VmConfig,
 };
+#[path = "support/port_block.rs"]
+mod port_block;
 const MODELS: [CpuModel; 2] = [CpuModel::I8088, CpuModel::I8086];
 const IP: u64 = 0x1200;
 fn setup(model: CpuModel, code: &[u8]) -> (Vm, Vcpu) {
@@ -2796,4 +2798,13 @@ fn a_restored_mid_string_state_names_the_first_prefix() {
     );
     cpu.cpu = saved;
     assert_eq!(irq_frame(&vm, &mut cpu), IP);
+}
+
+// xj-50w.22: IN and OUT end their twenty-bit block. The exit names the next
+// instruction, and the rest of the block runs after the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    for model in MODELS {
+        port_block::check(|code| setup(model, code), IP, true);
+    }
 }

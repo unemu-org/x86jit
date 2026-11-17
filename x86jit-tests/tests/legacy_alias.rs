@@ -3,6 +3,8 @@ use x86jit_core::{
     CpuMode, ExceptionDelivery, ExecutionProfile, Exit, Prot, RegionKind, SegmentId, StepOptions,
     StepStop, Vm, VmConfig,
 };
+#[path = "support/port_block.rs"]
+mod port_block;
 
 fn vm(code: &[u8]) -> Vm {
     let mut vm = Vm::new(VmConfig::flat(0x40000));
@@ -119,4 +121,21 @@ fn single_step_does_not_reach_alias() {
         (1, 1, 0x1001)
     );
     assert_eq!(cpu.cpu.gpr[4], 0x8000);
+}
+
+// xj-50w.22: the alias's IN and OUT. The exit names the next instruction,
+// and the rest of the block runs after the port completes.
+#[test]
+fn in_and_out_end_their_block() {
+    port_block::check(
+        |code| {
+            let vm = vm(code);
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.gpr[4] = 0x8000;
+            (vm, cpu)
+        },
+        0x1000,
+        false,
+    );
 }

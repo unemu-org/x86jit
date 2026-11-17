@@ -488,10 +488,13 @@ pub(super) fn resolve(
                     insn.mnemonic(),
                     iced_x86::Mnemonic::Hlt | iced_x86::Mnemonic::Popf
                 )
+                // `IrOp::PortIo` ends its block: the walk hands off with IP
+                // at the block end, which must be the next instruction.
                 || part.ops.iter().any(|op| {
                     matches!(
                         op,
-                        IrOp::PortString { .. }
+                        IrOp::PortIo { .. }
+                            | IrOp::PortString { .. }
                             | IrOp::Legacy(
                                 crate::legacy::LegacyOp::WrappedString { .. }
                                     | crate::legacy::LegacyOp::Interrupt20 { .. }

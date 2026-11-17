@@ -76,6 +76,7 @@ legacy_paths=(
     'x86jit-tests/tests/legacy_*'
     'x86jit-tests/tests/support/model_api.rs'
     'x86jit-tests/tests/support/descriptor_fixture.rs'
+    'x86jit-tests/tests/support/port_block.rs'
     'backlog/docs/compat/*'
 )
 # Markdown and text in these directories can be compiled or compared as fixtures.
