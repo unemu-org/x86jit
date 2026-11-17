@@ -409,7 +409,8 @@ pub struct CpuState {
     /// The interpreter clears these at instruction completion, including ordinary
     /// retries after a RAM fault. The dispatcher keeps partially serviced instructions
     /// on that path and clears abandoned retries at exits; explicit RIP writes also
-    /// clear the entries and pending completion.
+    /// clear the entries and pending completion. A budget stop or a host stop taken
+    /// before the retry keeps them (`finish_mmio_retry`).
     pub mmio_parts: [(u64, u64); 64],
     pub mmio_parts_len: u8,
     /// Guest RIP owning the retry, including a pending completion with no parts yet.
@@ -824,25 +825,24 @@ impl CpuState {
     }
 
     /// A host stop while the instruction that owns the retry is still pending. The
-    /// stop is taken only at an instruction boundary, so the instruction has not
-    /// run again: its bound answers stay, and the rest of the ledger and any
-    /// pending completion are dropped as for any other host stop.
+    /// stop is taken only at an instruction boundary, before the retry runs, so
+    /// the instruction has neither completed nor aborted. As at a budget stop, its
+    /// whole ledger stays: the bound answers, and the answer or acknowledgement of
+    /// each transfer of a multi-transfer access (a vector operand, a string
+    /// element), recorded under that transfer. The retry then stops again only at
+    /// the transfer that asked last, which the next completion answers (spec.md
+    /// §5.2). Without its earlier answers the retry would stop first at the first
+    /// transfer, and the completion meant for a later one would be taken there.
+    /// The application dispatcher takes this stop only with no completion
+    /// pending. An owner with nothing recorded ends here; the completion of its
+    /// request, given after the stop, begins the retry again.
     #[cold]
     #[inline(never)]
-    fn keep_only_bound_answers(&mut self) {
-        let mut kept = 0;
-        for i in 0..usize::from(self.mmio_parts_len) {
-            let entry = self.mmio_parts[i];
-            if is_bound_key(entry.0) {
-                self.mmio_parts[kept] = entry;
-                kept += 1;
-            }
-        }
-        if kept == 0 {
+    fn keep_retry_across_host_stop(&mut self) {
+        if self.mmio_parts_len == 0 {
             self.clear_mmio_parts();
             return;
         }
-        self.mmio_parts_len = kept as u8;
         self.pending_mmio = None;
         self.pending_mmio_write = false;
     }
@@ -869,7 +869,7 @@ impl CpuState {
             && matches!(exit, Some(Exit::Interrupted))
             && self.owns_mmio_retry(self.rip)
         {
-            self.keep_only_bound_answers();
+            self.keep_retry_across_host_stop();
         } else if self.mmio_retry_active && (!retry || !self.owns_mmio_retry(self.rip)) {
             self.clear_mmio_parts();
         }

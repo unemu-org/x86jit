@@ -1146,3 +1146,256 @@ fn access_width_jit() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Boundary stops between the transfers of one vector access (xj-ir6.35).
+// ---------------------------------------------------------------------------
+
+/// What the driver does at a device stop of the vector access, around its
+/// completion, before the retry runs.
+#[derive(Clone, Copy, Debug)]
+enum Between {
+    /// Complete it, then `run`.
+    Run,
+    /// Request a host stop and `run` before the completion: Long64 and
+    /// Compat32 take the stop at the boundary before the retry. Then complete
+    /// it and `run`.
+    HostFirst,
+    /// As `HostFirst`, then `run` once more before the completion and answer
+    /// whatever that run asks for.
+    HostRepeat,
+    /// Complete it, request a host stop, then `run`.
+    HostAfter,
+    /// `run(Some(0))` before the completion.
+    ZeroFirst,
+    /// `run(Some(0))` after the completion.
+    ZeroAfter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bus {
+    Read(u64, u8),
+    Write(u64, u8, u64),
+}
+
+/// The device window of the boundary-stop witnesses, and its operand.
+const WINDOW: u64 = 0x3000;
+const OPERAND: u64 = 0x3010;
+
+/// A device whose answer names the transfer it answers: 1111h for the first
+/// quadword of the operand, 2222h for the second, and so on.
+fn device_answer(addr: u64) -> u64 {
+    0x1111 * ((addr - OPERAND) / 8 + 1)
+}
+
+/// Drive `Vcpu::run` to a stop other than a device, budget or host stop,
+/// applying `schedule[i % len]` at the i-th device stop. `None` after twelve
+/// transfers: the access does not converge.
+fn drive_between(
+    vm: &Vm,
+    cpu: &mut x86jit_core::Vcpu,
+    schedule: &[Between],
+) -> (Vec<Bus>, Option<Exit>) {
+    let mut bus = Vec::new();
+    let mut stops = 0;
+    let mut exit = cpu.run(vm, Some(64));
+    loop {
+        match exit {
+            Exit::BudgetExhausted | Exit::Interrupted => {
+                exit = cpu.run(vm, Some(64));
+                continue;
+            }
+            Exit::MmioRead { .. } | Exit::MmioWrite { .. } => {}
+            other => return (bus, Some(other)),
+        }
+        if bus.len() >= 12 {
+            return (bus, None);
+        }
+        let how = schedule[stops % schedule.len()];
+        stops += 1;
+        match how {
+            Between::HostFirst | Between::HostRepeat => {
+                cpu.exit_request().request_exit();
+                let stop = cpu.run(vm, Some(64));
+                if !matches!(stop, Exit::Interrupted) {
+                    // Not taken at the boundary: a stale completion was pending.
+                    return (bus, Some(stop));
+                }
+                if matches!(how, Between::HostRepeat) {
+                    exit = cpu.run(vm, Some(64));
+                    if !matches!(exit, Exit::MmioRead { .. } | Exit::MmioWrite { .. }) {
+                        return (bus, Some(exit));
+                    }
+                }
+            }
+            Between::ZeroFirst => {
+                let stop = cpu.run(vm, Some(0));
+                assert!(matches!(stop, Exit::BudgetExhausted), "{stop:?}");
+            }
+            Between::Run | Between::HostAfter | Between::ZeroAfter => {}
+        }
+        match exit {
+            Exit::MmioRead { addr, size, .. } => {
+                bus.push(Bus::Read(addr, size));
+                cpu.complete_mmio_read(device_answer(addr));
+            }
+            Exit::MmioWrite {
+                addr, size, value, ..
+            } => {
+                bus.push(Bus::Write(addr, size, value));
+                cpu.complete_mmio_write();
+            }
+            _ => unreachable!(),
+        }
+        match how {
+            Between::HostAfter => cpu.exit_request().request_exit(),
+            Between::ZeroAfter => {
+                let stop = cpu.run(vm, Some(0));
+                assert!(matches!(stop, Exit::BudgetExhausted), "{stop:?}");
+            }
+            _ => {}
+        }
+        exit = cpu.run(vm, Some(64));
+    }
+}
+
+/// A 16- or 32-byte vector load or store on a Trap region is one 8-byte
+/// `MmioRead` or `MmioWrite` per quadword (spec.md §5.2). A budget stop or a
+/// host stop between those exits is taken at the boundary before the retry:
+/// the instruction has neither completed nor aborted, so each completed
+/// transfer keeps its own answer or acknowledgement, and the completion given
+/// after the stop answers the transfer that asked for it. Every transfer is
+/// performed once, and the instruction ends as it does on RAM holding the
+/// device's values (SDM Vol 2B §4.3, MOVDQU,VMOVDQU8/16/32/64, Operation,
+/// pp. 4-66–4-69, where the VEX.256 form moves 32 bytes; MOVUPS, Operation,
+/// p. 4-127). Long64 and Compat32, at the interpreter, block and region tiers,
+/// with every tier-up setting: compiled code defers the access to the
+/// interpreter. Measured at 5b04d7a2: a host stop requested before the second
+/// completion dropped the first answer, and the first transfer took the second
+/// answer, so MOVDQU loaded 2222h into the low quadword; with a host stop at
+/// every device stop the access never completed.
+#[test]
+fn boundary_stops_between_vector_transfers() {
+    use Between::*;
+    let schedules: &[&[Between]] = &[
+        &[Run],
+        &[HostFirst],
+        &[Run, HostFirst],
+        &[HostRepeat],
+        &[Run, HostRepeat],
+        &[HostAfter],
+        &[ZeroFirst],
+        &[ZeroAfter],
+    ];
+    // (name, bytes, quadwords, store); the operand is [rdi] / [edi].
+    let cases: &[(&str, &[u8], u64, bool)] = &[
+        ("movdqu xmm0,[rdi]", &[0xf3, 0x0f, 0x6f, 0x07], 2, false),
+        ("movups xmm0,[rdi]", &[0x0f, 0x10, 0x07], 2, false),
+        ("vmovdqu xmm0,[rdi]", &[0xc5, 0xfa, 0x6f, 0x07], 2, false),
+        ("vmovdqu ymm0,[rdi]", &[0xc5, 0xfe, 0x6f, 0x07], 4, false),
+        ("movdqu [rdi],xmm0", &[0xf3, 0x0f, 0x7f, 0x07], 2, true),
+        ("movups [rdi],xmm0", &[0x0f, 0x11, 0x07], 2, true),
+        ("vmovdqu [rdi],xmm0", &[0xc5, 0xfa, 0x7f, 0x07], 2, true),
+        ("vmovdqu [rdi],ymm0", &[0xc5, 0xfe, 0x7f, 0x07], 4, true),
+    ];
+    let setup =
+        |mode: x86jit_core::CpuMode, tier: u8, tier_up: Option<u32>, trap: bool, code: &[u8]| {
+            let backend: Box<dyn Backend> = match tier {
+                0 => Box::new(InterpreterBackend),
+                1 => Box::new(JitBackend::new()),
+                _ => Box::new(JitBackend::with_superblocks(x86jit_core::RegionCaps {
+                    max_blocks: 8,
+                    max_icount: 64,
+                })),
+            };
+            let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend);
+            vm.set_cpu_mode(mode);
+            vm.set_tier_up_after(tier_up);
+            vm.map(CODE, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+            let kind = if trap {
+                RegionKind::Trap
+            } else {
+                RegionKind::Ram
+            };
+            vm.map(WINDOW, 0x1000, Prot::RW, kind).unwrap();
+            if !trap {
+                for q in 0..4 {
+                    let at = OPERAND + q * 8;
+                    vm.mem.write(at, device_answer(at), 8).unwrap();
+                }
+            }
+            // inc ebx ; <case> ; inc esi ; hlt (FF /0 keeps one encoding in both modes)
+            let mut bytes = vec![0xff, 0xc3];
+            bytes.extend_from_slice(code);
+            bytes.extend_from_slice(&[0xff, 0xc6, 0xf4]);
+            vm.write_bytes(CODE, &bytes).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, CODE);
+            cpu.set_reg(Reg::Rdi, OPERAND);
+            cpu.set_xmm(0, 0x8888_7777_6666_5555_4444_3333_2222_1111_u128);
+            cpu.set_ymm_hi(0, 0xffff_eeee_dddd_cccc_bbbb_aaaa_9999_8888_u128);
+            (vm, cpu)
+        };
+    let observe = |cpu: &x86jit_core::Vcpu| {
+        (
+            cpu.reg(Reg::Rbx),
+            cpu.reg(Reg::Rsi),
+            cpu.reg(Reg::Rip),
+            cpu.xmm(0),
+            cpu.ymm_hi(0),
+        )
+    };
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for mode in [x86jit_core::CpuMode::Long64, x86jit_core::CpuMode::Compat32] {
+        for &(name, code, quads, store) in cases {
+            // The reference: the same instruction on RAM holding the device's values.
+            let (vm, mut cpu) = setup(mode, 0, None, false, code);
+            assert!(
+                matches!(cpu.run(&vm, Some(64)), Exit::Hlt),
+                "{mode:?} {name}"
+            );
+            let reference = observe(&cpu);
+            let expected: Vec<Bus> = (0..quads)
+                .map(|q| {
+                    let at = OPERAND + q * 8;
+                    if store {
+                        Bus::Write(at, 8, vm.mem.read(at, 8).unwrap())
+                    } else {
+                        Bus::Read(at, 8)
+                    }
+                })
+                .collect();
+            for tier in 0..3 {
+                for tier_up in [None, Some(1), Some(2), Some(3)] {
+                    if tier == 0 && tier_up.is_some() {
+                        continue;
+                    }
+                    for schedule in schedules {
+                        let (vm, mut cpu) = setup(mode, tier, tier_up, true, code);
+                        let (bus, stop) = drive_between(&vm, &mut cpu, schedule);
+                        checked += 1;
+                        let observed = observe(&cpu);
+                        if bus != expected
+                            || !matches!(stop, Some(Exit::Hlt))
+                            || observed != reference
+                        {
+                            bad.push(format!(
+                                "{mode:?} {name} tier {tier} tier-up {tier_up:?} {schedule:?}: \
+                                 {bus:x?} then {stop:?}, expected {expected:x?}; \
+                                 state {observed:x?}, RAM run {reference:x?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 2 * 8 * 9 * 8);
+    assert!(
+        bad.is_empty(),
+        "{} failures:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}

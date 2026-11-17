@@ -1057,3 +1057,223 @@ fn child_trap_intervals_differ_from_parent() {
         }
     }
 }
+
+/// What the driver does at a device stop of a string element, around its
+/// completion, before the retry runs.
+#[derive(Clone, Copy, Debug)]
+enum Between {
+    /// Complete it, then `run`.
+    Run,
+    /// Request a host stop and `run` before the completion: Long64 and
+    /// Compat32 take the stop at the boundary before the retry. Then complete
+    /// it and `run`.
+    HostFirst,
+    /// As `HostFirst`, then `run` once more before the completion and answer
+    /// whatever that run asks for.
+    HostRepeat,
+    /// `run(Some(0))` before the completion.
+    ZeroFirst,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bus {
+    Read(u64, u8),
+    Write(u64, u8, u64),
+}
+
+/// A device whose answer names the byte it answers: its address's low byte
+/// plus one in each byte of the transfer.
+fn device_answer(addr: u64, size: u8) -> u64 {
+    (0..u64::from(size)).fold(0, |v, i| v | (((addr + i + 1) & 0xff) << (8 * i)))
+}
+
+/// Drive `Vcpu::run` to a stop other than a device, budget or host stop,
+/// applying `schedule[i % len]` at the i-th device stop. `None` after twelve
+/// transfers: the instruction does not converge.
+fn drive_between(
+    vm: &Vm,
+    cpu: &mut x86jit_core::Vcpu,
+    schedule: &[Between],
+) -> (Vec<Bus>, Option<Exit>) {
+    let mut bus = Vec::new();
+    let mut stops = 0;
+    let mut exit = cpu.run(vm, Some(64));
+    loop {
+        match exit {
+            Exit::BudgetExhausted | Exit::Interrupted => {
+                exit = cpu.run(vm, Some(64));
+                continue;
+            }
+            Exit::MmioRead { .. } | Exit::MmioWrite { .. } => {}
+            other => return (bus, Some(other)),
+        }
+        if bus.len() >= 12 {
+            return (bus, None);
+        }
+        let how = schedule[stops % schedule.len()];
+        stops += 1;
+        match how {
+            Between::HostFirst | Between::HostRepeat => {
+                cpu.exit_request().request_exit();
+                let stop = cpu.run(vm, Some(64));
+                if !matches!(stop, Exit::Interrupted) {
+                    // Not taken at the boundary: a stale completion was pending.
+                    return (bus, Some(stop));
+                }
+                if matches!(how, Between::HostRepeat) {
+                    exit = cpu.run(vm, Some(64));
+                    if !matches!(exit, Exit::MmioRead { .. } | Exit::MmioWrite { .. }) {
+                        return (bus, Some(exit));
+                    }
+                }
+            }
+            Between::ZeroFirst => {
+                let stop = cpu.run(vm, Some(0));
+                assert!(matches!(stop, Exit::BudgetExhausted), "{stop:?}");
+            }
+            Between::Run => {}
+        }
+        match exit {
+            Exit::MmioRead { addr, size, .. } => {
+                bus.push(Bus::Read(addr, size));
+                cpu.complete_mmio_read(device_answer(addr, size));
+            }
+            Exit::MmioWrite {
+                addr, size, value, ..
+            } => {
+                bus.push(Bus::Write(addr, size, value));
+                cpu.complete_mmio_write();
+            }
+            _ => unreachable!(),
+        }
+        exit = cpu.run(vm, Some(64));
+    }
+}
+
+/// A string element between two device operands is two transfers: MOVS reads
+/// the source and writes the destination (SDM Vol 2B §4.3, MOVS/MOVSB/MOVSW/
+/// MOVSD/MOVSQ, Operation, p. 4-105), CMPS reads both (SDM Vol 2A §3.3,
+/// CMPS/CMPSB/CMPSW/CMPSD/CMPSQ, Operation, p. 3-182). A budget stop or a host
+/// stop between them is taken at the boundary before the retry: the element has
+/// neither completed nor aborted, so the first transfer keeps its answer and
+/// the completion given after the stop answers the second (spec.md §5.2). Each
+/// transfer is performed once, and the instruction ends as it does on RAM
+/// holding the device's values. Long64 and Compat32, interpreter and compiled
+/// tiers. Measured at 5b04d7a2: a host stop before the second completion
+/// dropped the first answer, so CMPSB compared the destination's answer with
+/// itself and MOVSB read its source twice.
+#[test]
+fn boundary_stops_between_string_transfers() {
+    use Between::*;
+    const SRC: u64 = DEVICE + 0x10;
+    const DST: u64 = DEVICE + 0x120;
+    let schedules: &[&[Between]] = &[
+        &[Run],
+        &[HostFirst],
+        &[Run, HostFirst],
+        &[HostRepeat],
+        &[Run, HostRepeat],
+        &[ZeroFirst],
+    ];
+    // (name, bytes, count, expected transfers)
+    let cases: &[(&str, &[u8], u64, &[Bus])] = &[
+        (
+            "movsb",
+            &[0xa4],
+            0,
+            &[Bus::Read(SRC, 1), Bus::Write(DST, 1, 0x11)],
+        ),
+        (
+            "movsd",
+            &[0xa5],
+            0,
+            &[Bus::Read(SRC, 4), Bus::Write(DST, 4, 0x1413_1211)],
+        ),
+        (
+            "rep movsb",
+            &[0xf3, 0xa4],
+            2,
+            &[
+                Bus::Read(SRC, 1),
+                Bus::Write(DST, 1, 0x11),
+                Bus::Read(SRC + 1, 1),
+                Bus::Write(DST + 1, 1, 0x12),
+            ],
+        ),
+        ("cmpsb", &[0xa6], 0, &[Bus::Read(SRC, 1), Bus::Read(DST, 1)]),
+        (
+            "repe cmpsd",
+            &[0xf3, 0xa7],
+            2,
+            &[Bus::Read(SRC, 4), Bus::Read(DST, 4)],
+        ),
+    ];
+    let setup = |mode: CpuMode, jit: bool, trap: bool, code: &[u8], count: u64| {
+        let mut vm = Vm::with_backend(VmConfig::flat(0x10000), backend(jit));
+        vm.set_cpu_mode(mode);
+        vm.map(0, DEVICE as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        let kind = if trap {
+            RegionKind::Trap
+        } else {
+            RegionKind::Ram
+        };
+        vm.map(DEVICE, 0x1000, Prot::RW, kind).unwrap();
+        if !trap {
+            for at in DEVICE..DEVICE + 0x1000 {
+                vm.mem.write(at, device_answer(at, 1), 1).unwrap();
+            }
+        }
+        // inc ebx ; <case> ; inc ebp ; hlt
+        let mut bytes = vec![0xff, 0xc3];
+        bytes.extend_from_slice(code);
+        bytes.extend_from_slice(&[0xff, 0xc5, 0xf4]);
+        vm.write_bytes(CODE, &bytes).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Rip, CODE);
+        cpu.set_reg(Reg::Rsi, SRC);
+        cpu.set_reg(Reg::Rdi, DST);
+        cpu.set_reg(Reg::Rcx, count);
+        (vm, cpu)
+    };
+    let observe = |cpu: &x86jit_core::Vcpu| {
+        (
+            [Reg::Rbx, Reg::Rcx, Reg::Rsi, Reg::Rdi, Reg::Rbp, Reg::Rip].map(|r| cpu.reg(r)),
+            cpu.flags(),
+        )
+    };
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for mode in [CpuMode::Long64, CpuMode::Compat32] {
+        for &(name, code, count, expected) in cases {
+            let (vm, mut cpu) = setup(mode, false, false, code, count);
+            assert!(
+                matches!(cpu.run(&vm, Some(64)), Exit::Hlt),
+                "{mode:?} {name}"
+            );
+            let reference = observe(&cpu);
+            for jit in [false, true] {
+                for schedule in schedules {
+                    let (vm, mut cpu) = setup(mode, jit, true, code, count);
+                    let (bus, stop) = drive_between(&vm, &mut cpu, schedule);
+                    checked += 1;
+                    let observed = observe(&cpu);
+                    if bus != expected || !matches!(stop, Some(Exit::Hlt)) || observed != reference
+                    {
+                        bad.push(format!(
+                            "{mode:?} {name} jit {jit} {schedule:?}: {bus:x?} then {stop:?}, \
+                             expected {expected:x?}; state {observed:x?}, RAM run {reference:x?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 2 * 5 * 2 * 6);
+    assert!(
+        bad.is_empty(),
+        "{} failures:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}

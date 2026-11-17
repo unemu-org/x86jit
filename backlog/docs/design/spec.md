@@ -490,6 +490,20 @@ pending answer of `complete_mmio_read` is still taken by the first load of the
 retry that has no recorded answer; binding the pending answer itself to its
 request is xj-ir6.13.
 
+**Accesses of several transfers.** A vector operand wider than eight bytes is one
+8-byte transfer per quadword, and a masked form one transfer per active element.
+A string element between two operands is a read and a write (MOVS) or two reads
+(CMPS). Each transfer is its own `MmioRead` or `MmioWrite`. The retry ledger keeps
+the answer or acknowledgement of each completed transfer under that transfer: its
+address for a vector operand, its operand for a string element. The retry then
+stops only at the transfer that asked last, and the next completion answers that
+transfer. These records live across the same boundary stops as a recorded
+answer: `BudgetExhausted` and a host stop (`Interrupted`) taken before the retry
+runs. Long64 and Compat32 take a requested host stop there. The alias and the
+Machine models finish the open retry first, and repeat an unanswered request
+instead of stopping. A fault of the instruction reports these records as its
+acknowledged transfers (`FaultProgress::acknowledged_transfers`).
+
 Some stores are split into a RAM part and a device part: the twenty-bit models'
 byte transfers of a word over a RAM byte and a device byte, and an operand that
 the A20 gate splits into bus pieces on the I286/I386 Machine path. Such a store
