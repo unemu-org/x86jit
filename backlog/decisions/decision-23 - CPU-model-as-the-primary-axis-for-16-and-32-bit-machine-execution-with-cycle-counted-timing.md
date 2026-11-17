@@ -904,6 +904,22 @@ feature completeness. Bead xj-50w.23 carries the miss: it moves the NMI decision
 dispatcher loop, with this requirement's +0.5 % gate as its acceptance. The gate itself is
 unchanged.
 
+**Amendment (xj-0w3.8 landing, 2026-11-17, accepted by the maintainer).** A misaligned locked
+operand inside one aligned 16-byte granule becomes atomic (decision-13, amendment of the same
+date), and the twenty-bit models admit an odd locked word. This lands with a measured slowdown,
+not a defect. Against add161a9:
+- 137 of 138 unimodal real16_loops cells are within +0.5 %;
+- the six bimodal cells, all straight-line, are within +0.5 % on like modes;
+- the store probe is at most +0.07 %;
+- the one miss is smc-rmw-64 on the alias, +0.540 % on the median of 7 processes per side,
+  with disjoint distributions.
+
+The new code is cold and the alias workload runs none of it. The miss follows a change in the
+inlining of `TranslationCache::invalidate_range`; a change in rustc's codegen-unit partition is
+ASSUMED as the cause. Three layout variants did not restore that function. The same cell missed
+by +0.55 % at the C4a landing. The maintainer accepted the slowdown. Bead xj-50w.17 carries it,
+with this requirement's +0.5 % gate as its acceptance. The gate itself is unchanged.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and

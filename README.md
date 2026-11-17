@@ -31,7 +31,10 @@ separate repository that is to be published.
   directly and indirect branches are cached.
 - **x86-TSO memory-ordering tiers.** On weak hosts, `MemConsistency` (`Fast`, `AcqRel`,
   `FullTso`) selects the barriers around JIT inline loads and stores. `mfence` is a full barrier
-  on both backends and locked operations stay atomic. Many vCPUs on host threads share one `Vm`.
+  on both backends and locked operations stay atomic, except a misaligned operand that crosses
+  an aligned 16-byte granule outside an x86-64 host's compiled code; on aarch64 a misaligned
+  compiled operand also needs the embedder's alignment-fault handler ([`spec.md`][spec]
+  §8.2.3). Many vCPUs on host threads share one `Vm`.
 - **Precise faults, resumable exits.** A fault leaves RIP on the faulting instruction with
   earlier instructions complete; handle the cause and call `run()` again. Host faults on guest
   memory in compiled code are recovered through a signal-context landing pad, with the signal

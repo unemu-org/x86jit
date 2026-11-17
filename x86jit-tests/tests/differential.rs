@@ -973,6 +973,134 @@ fn atomics_match_unicorn() {
     diff(atomics_body, |_| {}, &[]);
 }
 
+/// xj-0w3.8: every locked form on a misaligned operand, inside one aligned
+/// 16-byte granule (word +1, +7; dword +6; qword +4) and across one (word +15,
+/// dword +13, qword +12), matches Unicorn in its result, its flags and every
+/// byte around it. CMPXCHG and CMPXCHG8B run with a matching and a failing
+/// compare. BTS, BTR and BTC leave OF, SF, AF and PF undefined (SDM Vol 2A BTS
+/// p. 3-118). NEG sets OF, SF, ZF, AF and PF "according to the result" (SDM Vol
+/// 2B NEG p. 4-158); Unicorn reports them from the source of LOCK NEG, aligned
+/// or not (measured: word 4B5Ah at +2 becomes B4A6h, Unicorn SF=0), so the
+/// manual wins and those five flags are left out of the LOCK NEG comparison.
+/// The NEG row keeps an independent witness for them: the engine's LOCK NEG
+/// against Unicorn's unlocked NEG of the same operand, every flag compared.
+#[test]
+fn misaligned_locked_forms_match_unicorn() {
+    let image: [u64; 4] = [
+        0x8f1e_2d3c_4b5a_6978,
+        0x0718_293a_4b5c_6d7e,
+        0xfedc_ba98_7654_3210,
+        0x7fff_ffff_8000_0001,
+    ];
+    let bytes: Vec<u8> = image.iter().flat_map(|q| q.to_le_bytes()).collect();
+    let undefined = [FlagName::Of, FlagName::Sf, FlagName::Af, FlagName::Pf];
+    for (offset, size) in [
+        (1u64, 2u8),
+        (7, 2),
+        (15, 2),
+        (6, 4),
+        (13, 4),
+        (4, 8),
+        (12, 8),
+    ] {
+        let mut v = [0u8; 8];
+        v[..size as usize].copy_from_slice(&bytes[offset as usize..][..size as usize]);
+        let field = u64::from_le_bytes(v);
+        for form in 0..18 {
+            if form >= 16 && size != 8 {
+                continue;
+            }
+            let m = match size {
+                2 => word_ptr(SCRATCH + offset),
+                4 => dword_ptr(SCRATCH + offset),
+                _ => qword_ptr(SCRATCH + offset),
+            };
+            // `plain_neg` runs NEG without the prefix, a NOP in its place so
+            // that RIP ends where it does after LOCK NEG.
+            let build = |a: &mut CodeAssembler, plain_neg: bool| {
+                for (i, q) in image.iter().enumerate() {
+                    a.mov(rax, *q).unwrap();
+                    a.mov(qword_ptr(SCRATCH + 8 * i as u64), rax).unwrap();
+                }
+                a.mov(rax, field ^ u64::from(form == 11)).unwrap();
+                a.mov(rdx, 0x8899_aabb_ccdd_eeffu64).unwrap();
+                macro_rules! with_reg {
+                    ($op:ident, $lock:expr) => {{
+                        let a = if $lock { a.lock() } else { &mut *a };
+                        match size {
+                            2 => a.$op(m, dx).unwrap(),
+                            4 => a.$op(m, edx).unwrap(),
+                            _ => a.$op(m, rdx).unwrap(),
+                        }
+                    }};
+                }
+                match form {
+                    0 => with_reg!(add, true),
+                    1 => a.lock().add(m, 0x7f).unwrap(),
+                    2 => with_reg!(sub, true),
+                    3 => with_reg!(and, true),
+                    4 => with_reg!(or, true),
+                    5 => with_reg!(xor, true),
+                    6 => a.lock().inc(m).unwrap(),
+                    7 => a.lock().dec(m).unwrap(),
+                    8 if plain_neg => {
+                        a.nop().unwrap();
+                        a.neg(m).unwrap();
+                    }
+                    8 => a.lock().neg(m).unwrap(),
+                    9 => a.lock().not(m).unwrap(),
+                    10 | 11 => with_reg!(cmpxchg, true),
+                    12 => with_reg!(xadd, true),
+                    13 => with_reg!(xchg, false),
+                    14 => a.lock().bts(m, u32::from(size) * 8 - 1).unwrap(),
+                    15 => {
+                        a.lock().btr(m, 3).unwrap();
+                        a.lock().btc(m, u32::from(size) * 4 + 1).unwrap();
+                    }
+                    _ => {
+                        // CMPXCHG8B, EDX:EAX = the operand (16) or not (17).
+                        a.mov(rdx, rax).unwrap();
+                        a.shr(rdx, 32).unwrap();
+                        if form == 17 {
+                            a.xor(eax, 1).unwrap();
+                        }
+                        a.mov(ebx, 0x1357_9bdf).unwrap();
+                        a.mov(ecx, 0x2468_ace0).unwrap();
+                        a.lock().cmpxchg8b(m).unwrap();
+                    }
+                }
+                a.hlt().unwrap();
+            };
+            let dont_care: &[FlagName] = match form {
+                8 => &[
+                    FlagName::Of,
+                    FlagName::Sf,
+                    FlagName::Zf,
+                    FlagName::Af,
+                    FlagName::Pf,
+                ],
+                14 | 15 => &undefined,
+                _ => &[],
+            };
+            eprintln!("form {form}, size {size} at +{offset}");
+            diff(|a| build(a, false), |_| {}, dont_care);
+            if form == 8 {
+                let engine = Vector::asm(|a| build(a, false)).interpret();
+                let mut unlocked = Vector::asm(|a| build(a, true)).unicorn();
+                // The code differs in one byte, the prefix against the NOP.
+                for (u, e) in unlocked.mem.iter_mut().zip(&engine.mem) {
+                    if u.addr < SCRATCH {
+                        u.bytes.clone_from(&e.bytes);
+                    }
+                }
+                if let Some(d) = x86jit_tests::compare::compare(&unlocked, &engine, &[]) {
+                    panic!("LOCK NEG diverges from Unicorn's unlocked NEG:\n{d}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn shld_shrd_match_unicorn() {
     // Double-precision shifts (busybox `sort` uses SHLD). AF is undefined for these;

@@ -3632,8 +3632,9 @@ impl Vcpu {
                                     }
                                     // Trap-region accesses replay to produce MMIO exits.
                                     // Host faults reach replay only for unmapped addresses
-                                    // or alignment faults. Misaligned locked operations
-                                    // currently replay non-atomically (tracked in xj-0w3.5).
+                                    // or alignment faults. A misaligned locked operand
+                                    // replays atomically inside one aligned 16-byte granule,
+                                    // not across one (`Memory::locked_unaligned`).
                                     // Replay uses this run's memory policy in both modes.
                                     // Interpreter single-step (not the hot compiled loop):
                                     // tick the retired counter for the one instruction it

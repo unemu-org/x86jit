@@ -161,6 +161,13 @@ pub unsafe fn checked_classify(
 }
 
 pub static HANDLE: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    /// This thread's vCPU handle, for a test that runs compiled vCPUs on several
+    /// threads at once: `classify` takes only the faulting thread's own handle.
+    /// Zero falls back to `HANDLE`. Constant-initialized with no destructor, as
+    /// `IN_CLASSIFIER` is, so the handler reads it without allocating.
+    pub static THREAD_HANDLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub static FOREIGN: AtomicUsize = AtomicUsize::new(0);
 pub static FAULTS: AtomicUsize = AtomicUsize::new(0);
 pub static WIDTH: AtomicUsize = AtomicUsize::new(0);
@@ -295,8 +302,13 @@ unsafe fn recover(
     {
         libc::_exit(93);
     }
+    let own = THREAD_HANDLE.try_with(std::cell::Cell::get).unwrap_or(0);
     if !checked_classify(
-        HANDLE.load(Ordering::Relaxed),
+        if own != 0 {
+            own
+        } else {
+            HANDLE.load(Ordering::Relaxed)
+        },
         regs.pc as usize,
         addr,
         kind,

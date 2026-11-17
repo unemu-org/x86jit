@@ -2707,8 +2707,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 false
             };
             if !completed {
-                // A discontinuous bus operand, as with the memory layer's
-                // unaligned RMW fallback, has no single host atomic address. A
+                // A discontinuous bus operand has no single host atomic address.
+                // LIMITATION: a RAM operand split by A20 takes the policy of an
+                // operand that crosses an aligned 16-byte granule
+                // (`Memory::locked_unaligned`, spec.md §8.2.3): one read, then one
+                // write, not atomic against another vCPU. A
                 // device operand is read once, then written once: the LOCK
                 // semantics "are followed for as many bus cycles as necessary
                 // to update the entire operand" (SDM Vol 3A §11.1.2.2; 80286

@@ -801,3 +801,29 @@ faults keep their uncertainty, including native scalar transfers without probes.
 MEASURED: x86-64 Linux workspace/test type-check passed with installed Nix Rust
 1.96.1 target libraries. Native x86-64 execution and cross-host performance remain
 ASSUMED / unverified; no new performance campaign was run for policy selection.
+
+## Amendment — 2026-11-17: misaligned locked operands inside a 16-byte granule
+
+Accepted by the maintainer with xj-0w3.8. A misaligned locked or implicitly locked operand
+that lies inside one aligned 16-byte granule is now atomic on the `Memory` path.
+`Memory::locked_unaligned` runs a compare-and-swap loop on the containing aligned 8-byte word,
+or on the 16-byte granule, and writes back the bytes outside the operand unchanged. Intel SDM
+Vol 3A §11.1.2.2 p. 11-4 states that the integrity of a bus lock does not depend on the
+alignment of the field. For such operands this replaces two statements above:
+- "Dispatcher and signal safety": an Alignment fault replayed in the interpreter no longer
+  completes the locked operation non-atomically;
+- the 2026-11-05 amendment: a misaligned operand no longer reaches a non-atomic fallback inside
+  the routed `usercopy::cas`, which now takes naturally aligned operands only. The operand goes
+  to `locked_unaligned` first.
+
+Still not atomic across vCPUs: an operand that crosses a 16-byte granule, or whose containing
+word leaves the backing allocation. It keeps a plain read-modify-write, documented in spec.md
+§8.2.3 "Locked operations". Bead xj-0w3.9 carries a cross-vCPU rendezvous for it.
+
+Compiled code is unchanged (xj-0w3.10). On an aarch64 host, a misaligned inline atomic either
+completes in hardware or raises the Alignment fault that this record replays. That the
+hardware completion is atomic is ASSUMED: the Arm ARM is not pinned in `oracles/`.
+
+Witnesses: `x86jit-tests/tests/locked_misaligned.rs`, multi-vCPU on every execution path, whose
+in-granule rows fail at add161a9 (MEASURED); and `rust_memory_faults`
+`routed_scalars_recover_and_remain_single_copy_atomic`.

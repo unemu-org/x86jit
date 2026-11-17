@@ -174,7 +174,7 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
             bytes,
             len,
         } => {
-            temps[*old as usize] = locked_rmw(
+            temps[*old as usize] = locked_rmw::<ROUTED, ORDER>(
                 cpu,
                 mem,
                 read_val(*addr, temps),
@@ -290,14 +290,14 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
 // then one write, of its byte transfers (`locked_device`, spec.md §5.2); one
 // only partly in a Trap region is a typed refusal, and an operand over two
 // adjacent regions keeps the containment miss of every locked operand. A word
-// at an odd address has no host atomic (`Memory::atomic_rmw`
-// would fall back to a plain read and write), so no atomic path: a typed
-// refusal before any transfer. That covers every word whose bytes wrap their
-// segment (offset FFFFh, UM §2.3 p. 2-12) or the twenty-bit bus (FFFFFh,
-// §2.8 p. 2-68).
+// at an odd address is the same atomic operation: atomic inside one aligned
+// 16-byte granule, and a plain read and write when its first byte is at 15 mod
+// 16 (`Memory::locked_unaligned`, spec.md §8.2.3). A word whose bytes wrap
+// their segment (offset FFFFh, UM §2.3 p. 2-12) or the twenty-bit bus (FFFFFh,
+// §2.8 p. 2-68) has no single host address (`locked_split`).
 #[cold]
 #[inline(never)]
-fn locked_rmw(
+fn locked_rmw<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Memory,
     tag: u64,
@@ -307,10 +307,9 @@ fn locked_rmw(
     (ip, bytes, len): (u64, &[u8; 15], u8),
 ) -> Result<u64, Exit> {
     let first = physical(tag, 0);
-    if !first.is_multiple_of(u64::from(size)) {
-        return Err(Exit::unknown_instruction(ip, *bytes, len));
+    if physical(tag, size - 1) != first + u64::from(size) - 1 {
+        return locked_split::<ROUTED, ORDER>(cpu, mem, tag, src, size, op, (ip, bytes, len));
     }
-    debug_assert_eq!(physical(tag, size - 1), first + u64::from(size) - 1);
     match mem.atomic_rmw(first, src, size, op) {
         Ok(old) => Ok(old),
         Err(MemTrap::Mmio)
@@ -346,9 +345,14 @@ fn locked_device(
     size: u8,
     op: crate::ir::RmwOp,
 ) -> Result<u64, Exit> {
-    use crate::ir::RmwOp;
     let old = read::<false, 0>(cpu, mem, tag, size)?;
-    let new = match op {
+    write::<false, 0>(cpu, mem, tag, size, updated(op, old, src))?;
+    Ok(old)
+}
+
+fn updated(op: crate::ir::RmwOp, old: u64, src: u64) -> u64 {
+    use crate::ir::RmwOp;
+    match op {
         RmwOp::Add => old.wrapping_add(src),
         RmwOp::Sub => old.wrapping_sub(src),
         RmwOp::Rsub => src.wrapping_sub(old),
@@ -356,8 +360,44 @@ fn locked_device(
         RmwOp::Or => old | src,
         RmwOp::Xor => old ^ src,
         RmwOp::Xchg => src,
-    };
-    write::<false, 0>(cpu, mem, tag, size, new)?;
+    }
+}
+
+// A locked word that wraps its segment or the bus, so its first byte is at 15
+// mod 16. LIMITATION: like a word that crosses an aligned 16-byte granule, it
+// has no host atomic, so it is the read, then the write, of its byte
+// transfers. It completes with the single-processor result, which LOCK holds
+// for the whole instruction (UM §2.5 p. 2-18), but is not atomic against
+// another vCPU. This is the policy of the 286 and 386 for an A20-split operand
+// (spec.md §8.2.3). As in the atomic path, a word wholly in Trap regions is
+// `locked_device` and one only partly in them is a typed refusal.
+#[cold]
+#[inline(never)]
+fn locked_split<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    tag: u64,
+    src: u64,
+    size: u8,
+    op: crate::ir::RmwOp,
+    (ip, bytes, len): (u64, &[u8; 15], u8),
+) -> Result<u64, Exit> {
+    let devices = (0..size)
+        .filter(|&i| {
+            matches!(
+                mem.region_kind(physical(tag, i), 1),
+                Ok(crate::RegionKind::Trap)
+            )
+        })
+        .count();
+    if devices == usize::from(size) {
+        return locked_device(cpu, mem, tag, src, size, op);
+    }
+    if devices != 0 {
+        return Err(Exit::unknown_instruction(ip, *bytes, len));
+    }
+    let old = read::<ROUTED, ORDER>(cpu, mem, tag, size)?;
+    write::<ROUTED, ORDER>(cpu, mem, tag, size, updated(op, old, src))?;
     Ok(old)
 }
 

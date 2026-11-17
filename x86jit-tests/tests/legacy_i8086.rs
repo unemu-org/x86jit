@@ -1715,34 +1715,11 @@ fn locked_read_modify_write_forms_match_their_unlocked_results() {
     for model in LOCK_MODELS {
         for code in forms {
             assert_lock_matches_unlocked(model, code, |_, _| {});
-            // An operand at an odd address: a byte runs as above; a word has
-            // no host atomic (Memory::atomic_rmw's unaligned fallback is a
-            // plain read and write), so it is a typed refusal before it
-            // commits. The [BP] form keeps its even address.
-            let odd = |_: &Vm, cpu: &mut Vcpu| cpu.cpu.gpr[3] = 0x11;
-            let opcode = *code.iter().find(|b| !matches!(b, 0x26 | 0x2e)).unwrap();
-            let word = matches!(
-                opcode,
-                0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x81 | 0x83 | 0x87 | 0xf7 | 0xff
-            );
-            if word && code.get(1) != Some(&0x46) {
-                let unlocked = lock_case(model, code, odd);
-                let locked = lock_case(model, &[&[0xf0][..], code].concat(), odd);
-                assert_eq!(unlocked.steps, 1, "{model:?} {code:02x?}");
-                assert!(
-                    locked.stop.contains("UnknownInstruction"),
-                    "{model:?} {code:02x?}: {}",
-                    locked.stop
-                );
-                assert_eq!((locked.steps, locked.end), (0, IP), "{model:?} {code:02x?}");
-                assert_eq!(
-                    locked.operand[..3],
-                    [0x2211_a55a, 0x6655_6996, 0x4433_3cc3],
-                    "{model:?} {code:02x?}"
-                );
-            } else {
-                assert_lock_matches_unlocked(model, code, odd);
-            }
+            // An operand at an odd address inside one aligned 16-byte granule
+            // (1011h, 2021h) runs as above, a word too: its atomic path
+            // is a swap of the containing word (xj-0w3.8). The [BP] form keeps
+            // its even address.
+            assert_lock_matches_unlocked(model, code, |_, cpu| cpu.cpu.gpr[3] = 0x11);
         }
         // Flag inputs: an operand at its boundary values.
         for value in [0u16, 0x7fff, 0x8000, 0xffff, 0x00ff] {
@@ -2140,69 +2117,132 @@ fn a_locked_device_operand_reads_then_writes_once() {
 // A locked word over two adjacent RAM regions keeps the containment miss, as
 // every LOCK operand does on the other paths (spec.md "Data accesses across
 // adjacent regions"); the I80286 real-mode run of the same program agrees.
-// The word is even (an odd one is refused first), so the region boundary is
-// at an odd address. The unlocked word is performed one byte at a time.
+// The exit names the word's first byte, which is mapped. Three placements: an
+// even word over a boundary at an odd address; an odd word inside one 16-byte
+// granule over a boundary at an even address; and an odd word at the usual
+// page-aligned boundary, at 15 mod 16. The odd words had a typed refusal
+// before xj-0w3.8 admitted them; an odd word now keeps the same containment
+// miss as an even one. The unlocked word is performed one byte at a time.
 #[test]
 fn a_locked_word_over_two_regions_keeps_the_single_region_rule() {
-    let run = |model: CpuModel, code: &[u8]| {
-        let mut vm = Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
-        vm.set_cpu_model(model);
-        vm.map(0, 0x4001, Prot::RWX, RegionKind::Ram).unwrap();
-        vm.map(0x4001, 0x1bfff, Prot::RWX, RegionKind::Ram).unwrap();
-        vm.write_bytes(IP, code).unwrap();
-        vm.write_bytes(0x4000, &[0xff]).unwrap();
-        vm.write_bytes(0x4001, &[0x12]).unwrap();
-        let mut cpu = vm.new_vcpu();
-        if model == CpuModel::I80286 {
-            cpu.cpu = x86jit_core::CpuState::legacy_real_entry([0; 6]);
-        }
-        cpu.cpu.rip = IP;
-        cpu.cpu.gpr[4] = 0x8000;
-        cpu.cpu.gpr[3] = 0x4000;
-        let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        (
-            matches!(
-                r.stop(),
-                StepStop::Exit(Exit::UnmappedMemory {
-                    addr: 0x4000,
-                    access: x86jit_core::AccessKind::Write,
-                    ..
-                })
-            ),
-            r.steps(),
-            vm.mem.read(0x4000, 1).unwrap() | vm.mem.read(0x4001, 1).unwrap() << 8,
-            format!("{:?}", r.stop()),
-        )
-    };
-    let reference = run(CpuModel::I80286, b"\xf0\xff\x07");
-    assert_eq!(
-        (reference.0, reference.1, reference.2),
-        (true, 0, 0x12ff),
-        "{reference:?}"
-    );
-    for model in LOCK_MODELS {
-        let locked = run(model, b"\xf0\xff\x07");
+    for (boundary, word) in [(0x4001usize, 0x4000u64), (0x4002, 0x4001), (0x4000, 0x3fff)] {
+        let run = |model: CpuModel, code: &[u8]| {
+            let mut vm = Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
+            vm.set_cpu_model(model);
+            vm.map(0, boundary, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(
+                boundary as u64,
+                0x20000 - boundary,
+                Prot::RWX,
+                RegionKind::Ram,
+            )
+            .unwrap();
+            vm.write_bytes(IP, code).unwrap();
+            vm.write_bytes(word, &[0xff]).unwrap();
+            vm.write_bytes(word + 1, &[0x12]).unwrap();
+            let mut cpu = vm.new_vcpu();
+            if model == CpuModel::I80286 {
+                cpu.cpu = x86jit_core::CpuState::legacy_real_entry([0; 6]);
+            }
+            cpu.cpu.rip = IP;
+            cpu.cpu.gpr[4] = 0x8000;
+            cpu.cpu.gpr[3] = word;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            (
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::UnmappedMemory {
+                        addr,
+                        access: x86jit_core::AccessKind::Write,
+                        ..
+                    }) if *addr == word
+                ),
+                r.steps(),
+                vm.mem.read(word, 1).unwrap() | vm.mem.read(word + 1, 1).unwrap() << 8,
+                format!("{word:#x}: {:?}", r.stop()),
+            )
+        };
+        let reference = run(CpuModel::I80286, b"\xf0\xff\x07");
         assert_eq!(
-            (locked.0, locked.1, locked.2),
+            (reference.0, reference.1, reference.2),
             (true, 0, 0x12ff),
-            "{model:?}: {locked:?}"
+            "{reference:?}"
         );
-        let unlocked = run(model, b"\xff\x07");
-        assert_eq!(
-            (unlocked.1, unlocked.2),
-            (1, 0x1300),
-            "{model:?}: {unlocked:?}"
-        );
+        for model in LOCK_MODELS {
+            let locked = run(model, b"\xf0\xff\x07");
+            assert_eq!(
+                (locked.0, locked.1, locked.2),
+                (true, 0, 0x12ff),
+                "{model:?}: {locked:?}"
+            );
+            let unlocked = run(model, b"\xff\x07");
+            assert_eq!(
+                (unlocked.1, unlocked.2),
+                (1, 0x1300),
+                "{model:?}: {unlocked:?}"
+            );
+        }
+    }
+}
+
+// A locked word that wraps its segment (DS:FFFFh, UM §2.3 p. 2-12) with one
+// byte in a Trap region and the other in RAM has neither an atomic path nor
+// the device path of a word wholly in Trap regions: a typed refusal before any
+// transfer, the RAM byte unchanged (`locked_split`; spec.md §17.10).
+#[test]
+fn a_locked_word_that_wraps_half_into_a_device_is_refused() {
+    // DS = 1000h, BX = FFFFh: the low byte at 1FFFFh, the high byte at 10000h.
+    // The Trap region holds the high byte, then the low byte.
+    for (trap, ram) in [(0x10000usize, 0x1ffffu64), (0x1fff0, 0x10000)] {
+        for model in LOCK_MODELS {
+            let mut vm = Vm::with_backend(VmConfig::flat(0x20000), Box::new(InterpreterBackend));
+            vm.set_cpu_model(model);
+            vm.map(0, trap, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.map(trap as u64, 0x10, Prot::RWX, RegionKind::Trap)
+                .unwrap();
+            if trap + 0x10 < 0x20000 {
+                vm.map(
+                    (trap + 0x10) as u64,
+                    0x20000 - trap - 0x10,
+                    Prot::RWX,
+                    RegionKind::Ram,
+                )
+                .unwrap();
+            }
+            vm.write_bytes(IP, b"\xf0\xff\x07").unwrap();
+            vm.write_bytes(ram, &[0x5a]).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = IP;
+            cpu.cpu.gpr[4] = 0x8000;
+            cpu.cpu.ds = 0x1000;
+            cpu.cpu.gpr[3] = 0xffff;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::UnknownInstruction {
+                        addr: IP,
+                        len: 3,
+                        ..
+                    })
+                ),
+                "{model:?} {trap:#x}: {:?}",
+                r.stop()
+            );
+            assert_eq!((r.steps(), cpu.cpu.rip), (0, IP), "{model:?} {trap:#x}");
+            assert_eq!(vm.mem.read(ram, 1).unwrap(), 0x5a, "{model:?} {trap:#x}");
+        }
     }
 }
 
 // A locked word whose bytes are not adjacent on the bus (offset FFFFh wraps
 // in its segment, UM §2.3 p. 2-12; physical FFFFFh wraps to 0, §2.8
-// p. 2-68) has no single host address and so no atomic path: a typed
-// refusal before any byte is read or written (such a word starts at an odd
-// address). The unlocked form wraps.
+// p. 2-68) has no single host address. Since xj-0w3.8 it takes the policy of
+// an operand that crosses an aligned 16-byte granule (spec.md §8.2.3): the
+// read, then the write, of its byte transfers, not atomic against another
+// vCPU. On one vCPU it wraps exactly as the unlocked form does.
 #[test]
-fn a_locked_word_that_wraps_has_no_atomic_path() {
+fn a_locked_word_that_wraps_matches_the_unlocked_form() {
     for model in LOCK_MODELS {
         for (ds, bx, low, high) in [
             (0x1000u16, 0xffffu64, 0x1ffffu64, 0x10000u64),
@@ -2230,19 +2270,13 @@ fn a_locked_word_that_wraps_has_no_atomic_path() {
                     )
                 };
                 let what = format!("{model:?} {ds:x}:{bx:x} {code:02x?}");
-                let locked = run(true);
-                assert!(
-                    locked.0.contains("UnknownInstruction"),
-                    "{what}: {locked:?}"
-                );
-                assert_eq!(
-                    (locked.1, locked.2, locked.3, locked.4, locked.5),
-                    (0, IP, 0x5566, 0xff, 0x12),
-                    "{what}"
-                );
+                let mut locked = run(true);
                 let unlocked = run(false);
                 assert_eq!(unlocked.1, 1, "{what}: {unlocked:?}");
                 assert_ne!((unlocked.4, unlocked.5), (0xff, 0x12), "{what}");
+                // The LOCK prefix is the one byte the locked form adds.
+                locked.2 -= 1;
+                assert_eq!(locked, unlocked, "{what}");
             }
         }
     }
@@ -2610,12 +2644,16 @@ fn a_write_reported_after_the_run_returns_drops_the_pair() {
     }
 }
 
-// xj-50w.12: a locked word at an odd address has no host atomic: refused on
-// the twenty-bit models. The aligned word loses no update across two vCPUs.
-// The I80286 real-mode path takes Memory::atomic_rmw's unaligned fallback
-// for the odd word and is run for reference only (filed separately).
+// xj-0w3.8 (replacing xj-50w.12's refusal): a locked word at an odd address
+// inside one aligned 16-byte granule takes the atomic path and loses no
+// update across two vCPUs, at an offset inside the containing 8-byte word
+// (2001h) and one that crosses it (2007h). A word whose first byte is at 15
+// mod 16 crosses the granule (200Fh), as does one that wraps its segment
+// (DS:FFFFh) or the twenty-bit bus (FFFF:000Fh; UM §2.3 p. 2-12, §2.8
+// p. 2-68). No host atomic covers it, so it is a plain read, then write
+// (spec.md §8.2.3): one vCPU, which must get the single-processor result.
 #[test]
-fn a_locked_word_at_an_odd_address_has_no_atomic_path() {
+fn a_locked_odd_word_inside_a_granule_is_atomic() {
     const N: u64 = 20_000;
     for model in [
         CpuModel::I8088,
@@ -2624,42 +2662,46 @@ fn a_locked_word_at_an_odd_address_has_no_atomic_path() {
         CpuModel::NecV30,
         CpuModel::I80286,
     ] {
-        for addr in [0x2000u16, 0x2001] {
+        // (DS, offset, the word's two physical bytes, vCPUs)
+        let mut rows = vec![
+            (0u16, 0x2000u16, [0x2000u64, 0x2001], 2),
+            (0, 0x2001, [0x2001, 0x2002], 2),
+            (0, 0x2007, [0x2007, 0x2008], 2),
+            (0, 0x200f, [0x200f, 0x2010], 1),
+        ];
+        if model != CpuModel::I80286 {
+            rows.push((0, 0xffff, [0xffff, 0], 1));
+            rows.push((0xffff, 0x000f, [0xfffff, 0], 1));
+        }
+        for (ds, addr, bytes, vcpus) in rows {
             let [lo, hi] = addr.to_le_bytes();
             let code = [0xf0, 0xff, 0x06, lo, hi, 0xe2, 0xf9, 0xf4];
             let (vm, _) = setup(model, &code);
-            vm.mem.write(u64::from(addr), 0, 2).unwrap();
-            let refused = model != CpuModel::I80286 && addr & 1 != 0;
+            for byte in bytes {
+                vm.mem.write(byte, 0, 1).unwrap();
+            }
             std::thread::scope(|scope| {
-                for _ in 0..2 {
+                for _ in 0..vcpus {
                     scope.spawn(|| {
                         let mut cpu = vm.new_vcpu();
                         if model == CpuModel::I80286 {
                             cpu.cpu = x86jit_core::CpuState::legacy_real_entry([0; 6]);
                         }
+                        cpu.cpu.ds = ds;
                         cpu.cpu.rip = IP;
                         cpu.cpu.gpr[4] = 0x8000;
                         cpu.cpu.gpr[1] = N;
                         let r = cpu.run_steps(&vm, 3 * N, StepOptions::default()).unwrap();
-                        if refused {
-                            assert!(
-                                matches!(r.stop(), StepStop::Exit(Exit::UnknownInstruction { addr, .. }) if *addr == IP),
-                                "{:?}",
-                                r.stop()
-                            );
-                            assert_eq!(r.steps(), 0);
-                        } else {
-                            assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)), "{:?}", r.stop());
-                        }
+                        assert!(
+                            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                            "{model:?} {ds:#x}:{addr:#x}: {:?}",
+                            r.stop()
+                        );
                     });
                 }
             });
-            let got = vm.mem.read(u64::from(addr), 2).unwrap();
-            if refused {
-                assert_eq!(got, 0, "{model:?} {addr:#x}");
-            } else if addr & 1 == 0 {
-                assert_eq!(got, 2 * N, "{model:?} {addr:#x}");
-            }
+            let got = vm.mem.read(bytes[0], 1).unwrap() | vm.mem.read(bytes[1], 1).unwrap() << 8;
+            assert_eq!(got, vcpus * N, "{model:?} {ds:#x}:{addr:#x}");
         }
     }
 }

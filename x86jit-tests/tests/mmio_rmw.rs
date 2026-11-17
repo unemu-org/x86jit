@@ -638,19 +638,21 @@ fn wide_forms_read_then_write_once_where_present() {
     });
 }
 
+// Every path completes every form, the twenty-bit LOCK ADD too since
+// xj-0w3.8 (a locked odd word takes the atomic path, and a device operand
+// inside one Trap region is one read, then one write, of its transfers).
 #[test]
 fn word_at_odd_address_reads_then_writes_once() {
-    matrix(EDGE, WINDOW, SEG, 0x11, |path, done| {
-        done.len() == EDGE.len() - usize::from(path.twenty_bit())
-    });
+    matrix(EDGE, WINDOW, SEG, 0x11, |_, done| done.len() == EDGE.len());
 }
 
 #[test]
 fn word_at_segment_edge_wraps_or_faults_before_any_transfer() {
     // B000:FFFF and its 8086 wrap B000:0000 both lie in the device window.
+    // The twenty-bit LOCK ADD wraps too since xj-0w3.8 (spec.md §17.10).
     matrix(EDGE, (0xb_0000, 0x1_0000), 0xb000, 0xffff, |path, done| {
         if path.twenty_bit() {
-            done.len() == EDGE.len() - 1
+            done.len() == EDGE.len()
         } else {
             done.is_empty()
         }

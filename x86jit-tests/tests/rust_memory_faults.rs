@@ -599,6 +599,40 @@ fn routed_scalars_recover_and_remain_single_copy_atomic() {
                 assert_eq!(vm.mem.read(guard, size).unwrap(), mask);
                 protect(&vm, false);
             }
+            // xj-0w3.8: a misaligned operand inside a 16-byte granule swaps its
+            // containing word, and a fault there names the operand's first
+            // byte, as a probe of the operand does: on a read-only page the
+            // swap faults, on an inaccessible one the first load of the word
+            // (one 8-byte load, or the first of two for the 16-byte granule).
+            for readable in [true, false] {
+                // SAFETY: this page belongs to the child's mapping.
+                unsafe {
+                    assert_eq!(
+                        libc::mprotect(
+                            vm.mem.host_base().add(page() * 4).cast_mut().cast(),
+                            page(),
+                            if readable {
+                                libc::PROT_READ
+                            } else {
+                                libc::PROT_NONE
+                            }
+                        ),
+                        0
+                    );
+                }
+                for (offset, size) in [(1u64, 2u8), (7, 2), (6, 4), (4, 8)] {
+                    let at = guard + offset;
+                    assert!(
+                        matches!(vm.mem.atomic_rmw(at, 1, size, x86jit_core::RmwOp::Add), Err(x86jit_core::memory::MemTrap::HostFault) if x86jit_core::MemTrap::HostFault.fault_addr(0) == at),
+                        "readable={readable} +{offset}"
+                    );
+                    assert!(
+                        matches!(vm.mem.atomic_cas(at, 0, 1, size), Err(x86jit_core::memory::MemTrap::HostFault) if x86jit_core::MemTrap::HostFault.fault_addr(0) == at),
+                        "readable={readable} +{offset}"
+                    );
+                }
+            }
+            protect(&vm, false);
         }),
         0
     );

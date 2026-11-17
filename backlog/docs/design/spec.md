@@ -430,8 +430,8 @@ and its exit; splitting device accesses is xj-ir6.30. A 16-byte vector store is 
 either is written, with or without recovery, so a gap in the second faults there
 with nothing written. A LOCK or implicitly locked operand keeps the containment
 miss, including each bus piece of one that the A20 gate splits; on the
-twenty-bit models a locked word at an odd address, which includes one that
-wraps its segment or the bus, is a typed refusal (§17.10). An automatic child
+twenty-bit models a locked word that wraps its segment or the bus is one
+transfer per byte (§8.2.3, §17.10). An automatic child
 view joins adjacent regions of one kind for non-atomic data accesses; a span that
 mixes RAM and ROM keeps the containment fault in the child. Inline compiled
 accesses bound only against the backing and never consult the region map, so they
@@ -1145,7 +1145,7 @@ IrOp::ReadReg { dst, reg } => {
 
 **Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, using a conservative full fence to enforce explicit ordering independently of the ordinary-access tier, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
 
-**Locked operations:** atomicity is implemented on both backends in every tier. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.115.1 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
+**Locked operations:** atomicity is implemented on both backends in every tier for a naturally aligned operand. The bus lock does not depend on the operand's alignment (SDM Vol 3A §11.1.2.2 p. 11-4; Vol 2A LOCK p. 3-565). The interpreter, the shared helper that compiled CMPXCHG8B and CMPXCHG16B call, and the replay of an instruction whose compiled access took a host alignment fault (decision-13) update a misaligned operand with a compare-and-swap loop on the containing aligned 8- or 16-byte host word (`Memory::locked_unaligned`), which preserves the bytes outside the operand and retries after any store to the word: atomic inside one aligned 16-byte granule. **Limitation:** on that path no host primitive covers an operand that crosses an aligned 16-byte granule (a word at 15, a doubleword at 13–15, a quadword or CMPXCHG8B operand at 9–15, mod 16), or one whose containing word would pass the start or end of the backing (an owned backing whose length is not a multiple of 16, or an embedder's `HostRam` span whose start or end is not 16-byte aligned), so it is a plain read, update and write: it completes with the single-processor result but is not atomic against another vCPU. The A20-split operand of the 286 and 386 and the twenty-bit word that wraps its segment or the bus (§17.10) have the same policy. A cross-vCPU rendezvous for them is a follow-up. Other compiled locked forms issue the host atomic at the operand's address, so a misaligned operand there depends on the host. An x86-64 host performs it atomically at any alignment, a crossing one as a split lock (SDM Vol 3A §11.1.2.2), so a crossing operand is atomic in compiled code and not on the path above: the tiers diverge. On an aarch64 host the access either completes in hardware or takes an alignment fault: FEAT_LSE2 lets the LSE atomics complete inside a 16-byte granule, while XCHG's exclusives and a crossing operand are not covered by it (Arm architecture behaviour, not pinned in `oracles/`). A faulting access completes only through the embedder's decision-13 handler, whose replay takes the path above; without one the process receives SIGBUS. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.135.8 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
 
 > **Switching tiers = flushing the translation cache.** Barriers are baked into compiled blocks, so a block compiled under `Fast` is wrong under `FullTso`. The tier is per-`Vm` config; if you ever make it switchable at runtime, the switch must invalidate the whole cache (and it's the cheap, correct way to implement it — don't try to key the cache by tier). Decide the tagging mechanics (lift-tags vs codegen-applies-blanket) in M7 — the lift sketches emit `MemOrder::None` today on purpose, which makes codegen-applies-blanket the natural fit.
 
@@ -2108,14 +2108,20 @@ wider than one byte. A device operand inside one Trap region is one read,
 then one write, of its byte transfers (§5.2, xj-ir6.33); one only partly in a
 Trap region is a typed refusal, and an operand
 over two adjacent regions keeps the containment miss of every locked operand
-(§5.2, Data accesses across adjacent regions). A word at an odd address has
-no host atomic (`Memory::atomic_rmw` would fall back to a plain read and
-write), so no atomic path: a typed refusal before any byte moves. That covers
-every word whose bytes wrap their segment (offset FFFFh) or the bus
-(FFFFFh). Interrupts and the single-step trap see a locked
+(§5.2, Data accesses across adjacent regions). A word at an odd address
+takes the same atomic path: it is atomic inside one aligned 16-byte granule,
+and a word whose first byte is at 15 mod 16 crosses the granule and has the
+crossing operand's policy, a plain read and write, with the single-processor
+result but not atomic against another vCPU (§8.2.3). A word whose bytes wrap
+their segment (offset FFFFh) or the bus (FFFFFh) starts there and has no single
+host address: as an A20-split operand on the 286 and 386, it is one read, then
+one write, of its byte transfers. This policy (xj-0w3.8) replaced a typed
+refusal of every odd word. It changes execution only, not the lifted
+instruction, so no identity changes with it. Interrupts and the single-step trap see a locked
 instruction as one instruction (UM §2.6 p. 2-24: prefixes are "part of" the
-instruction they prefix). The four twenty-bit identities change with this rule
-(the early entries' prefix revision word); the I80386 identity does not, and
+instruction they prefix). The four twenty-bit identities change with the LOCK
+admission rule of xj-50w.12 (the early entries' prefix revision word); the
+I80386 identity does not, and
 the I80286 identity changes only with its own quirk fields (xj-50w.11). The witnesses are in `legacy_i8086` and `legacy_nec_v20_extensions`.
 The cold event boundary reads the catalogue's priority policy: an external
 interrupt enters its handler before the single-step trap (UM §2.6 pp. 2-26–28).

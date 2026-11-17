@@ -3353,10 +3353,8 @@ impl Memory {
     /// prior value (size-masked). Uses Rust SeqCst host atomics. Full x86 locked-op
     /// ordering (SDM Vol 3A §11.2.3.9) is not guaranteed for aarch64 LL/SC paths
     /// without an additional full fence. A naturally-aligned access uses a real
-    /// host atomic; a misaligned
-    /// one (rare; x86 permits it via a bus lock) falls back to a plain RMW — the
-    /// *value* is identical, only cross-thread atomicity is lost, which aligned
-    /// guest atomics never hit.
+    /// host atomic. A misaligned one is atomic when it lies inside one aligned
+    /// 16-byte granule, and is not when it crosses one (`Memory::locked_unaligned`).
     pub fn atomic_rmw(&self, addr: u64, src: u64, size: u8, op: RmwOp) -> Result<u64, MemTrap> {
         if self.recover_host_faults {
             self.atomic_rmw_mode::<true>(addr, src, size, op)
@@ -3397,21 +3395,27 @@ impl Memory {
                 .map(|v| v & mask_bits(size));
         }
         if !ROUTED {
-            let old = unsafe { atomic_rmw_raw(ptr, src, size, op) };
+            let old = unsafe { atomic_rmw_raw(self, ptr, src, size, op) };
             self.note_write_observed(addr, size as usize, observer);
             return Ok(old & mask_bits(size));
         }
-        let mut old =
-            unsafe { crate::usercopy::load(ptr, size) }.map_err(|at| self.host_fault(at))?;
-        loop {
-            let new = apply_rmw(old, src, op, size);
-            let observed = unsafe { crate::usercopy::cas(ptr, old, new, size) }
-                .map_err(|at| self.host_fault(at))?;
-            if observed == old {
-                break;
+        let old = if (ptr as usize).is_multiple_of(size as usize) {
+            let mut old =
+                unsafe { crate::usercopy::load(ptr, size) }.map_err(|at| self.host_fault(at))?;
+            loop {
+                let new = apply_rmw(old, src, op, size);
+                let observed = unsafe { crate::usercopy::cas(ptr, old, new, size) }
+                    .map_err(|at| self.host_fault(at))?;
+                if observed == old {
+                    break;
+                }
+                old = observed;
             }
-            old = observed;
-        }
+            old
+        } else {
+            self.locked_unaligned::<true>(ptr, size, LockedUpdate::Rmw { src, op })
+                .map_err(|at| self.host_fault(at))?
+        };
         self.note_write_observed(addr, size as usize, observer);
         Ok(old & mask_bits(size))
     }
@@ -3515,13 +3519,182 @@ impl Memory {
                 .map(|v| v & mask_bits(size));
         }
         let old = if ROUTED {
-            unsafe { crate::usercopy::cas(ptr, expected & mask_bits(size), src, size) }
-                .map_err(|at| self.host_fault(at))?
+            if (ptr as usize).is_multiple_of(size as usize) {
+                unsafe { crate::usercopy::cas(ptr, expected & mask_bits(size), src, size) }
+            } else {
+                let expected = expected & mask_bits(size);
+                self.locked_unaligned::<true>(ptr, size, LockedUpdate::Cas { expected, src })
+            }
+            .map_err(|at| self.host_fault(at))?
         } else {
-            unsafe { atomic_cas_raw(ptr, expected & mask_bits(size), src, size) }
+            unsafe { atomic_cas_raw(self, ptr, expected & mask_bits(size), src, size) }
         };
         self.note_write_observed(addr, size as usize, observer);
         Ok(old & mask_bits(size))
+    }
+
+    /// A locked operand that is not naturally aligned, at host address `ptr` in
+    /// the backing; returns the operand's prior value. "The integrity of a bus
+    /// lock is not affected by the alignment of the memory field" and "Locked
+    /// operations are atomic with respect to all other memory operations" (SDM
+    /// Vol 3A §11.1.2.2 p. 11-4; Vol 2A LOCK p. 3-565).
+    ///
+    /// Inside one aligned 16-byte granule, the update is a compare-and-swap
+    /// loop on the containing aligned host word: the 8-byte word when the
+    /// operand fits in one, else the 16-byte granule. Each pass takes a
+    /// snapshot of the word, updates the operand's bytes in it, and swaps it in
+    /// only if the word still holds the snapshot, so the bytes outside the
+    /// operand are written back exactly as they were. Any store to any byte of
+    /// the word after the snapshot (an aligned atomic on the same bytes, or a
+    /// plain store to a neighbour byte) fails the swap, and the loop retries
+    /// from the value it saw. The swaps are the host primitives the aligned
+    /// paths use: for 8 bytes a SeqCst `compare_exchange` or the routed `cas8`,
+    /// for 16 bytes the CMPXCHG16B primitive [`atomic_cas128_raw`] or the
+    /// routed pair routine, both of which return a validated snapshot. A failed
+    /// `cmpxchg` compare writes the word back unchanged, as the instruction
+    /// writes its destination back (SDM Vol 2A CMPXCHG p. 3-194). Host
+    /// alignment equals guest alignment modulo 16 ([`Self::from_host_ram`]), so
+    /// the host granule is the guest's.
+    ///
+    /// The argument is the host architecture's. On an x86-64 host the swaps
+    /// are LOCK CMPXCHG and LOCK CMPXCHG16B, atomic against every other memory
+    /// operation by the SDM rule above. On an aarch64 host it relies on the Arm
+    /// architecture's single-copy atomicity of CAS and of the exclusive pair
+    /// against an overlapping write of any size: ASSUMED, because the Arm ARM
+    /// is not yet pinned in `oracles/`; `locked_misaligned` measures it.
+    ///
+    /// LIMITATION: an operand that crosses an aligned 16-byte granule has no
+    /// host primitive that covers it, so it is a plain read, update and write.
+    /// It completes with the single-processor result but is not atomic against
+    /// other vCPUs. The same holds when the containing word extends past the
+    /// backing, whose start or end need not be 16-byte aligned. A cross-vCPU
+    /// rendezvous for these operands is a follow-up (spec.md §8.2.3).
+    #[cold]
+    #[inline(never)]
+    fn locked_unaligned<const ROUTED: bool>(
+        &self,
+        ptr: *mut u8,
+        size: u8,
+        update: LockedUpdate,
+    ) -> Result<u64, usize> {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
+        let mask = mask_bits(size);
+        let host = ptr as usize;
+        let len = size as usize;
+        // SAFETY: shared read of the backing's fixed pointer and length (§8).
+        let backing = unsafe { &*self.backing.get() };
+        let base = backing.as_ptr() as usize;
+        let inside =
+            |start: usize, bytes: usize| base <= start && start + bytes <= base + backing.len();
+        // A routed fault on the containing word is a fault on the operand's
+        // page, which a granule never leaves: report the operand's first byte,
+        // as a probe of the operand would.
+        let at_operand = |_: usize| host;
+        if (host & 7) + len <= 8 && inside(host & !7, 8) {
+            let word = (host & !7) as *mut u8;
+            let shift = (host & 7) * 8;
+            // SAFETY: the aligned word lies inside the backing (checked above).
+            let mut seen = if ROUTED {
+                unsafe { crate::usercopy::load(word, 8) }.map_err(at_operand)?
+            } else {
+                unsafe { (*(word as *const AtomicU64)).load(Relaxed) }
+            };
+            loop {
+                let old = (seen >> shift) & mask;
+                let next = (seen & !(mask << shift)) | (update.apply(old, size) << shift);
+                // SAFETY: as above; the swap is an aligned 8-byte host atomic.
+                let now = if ROUTED {
+                    unsafe { crate::usercopy::cas(word, seen, next, 8) }.map_err(at_operand)?
+                } else {
+                    match unsafe { &*(word as *const AtomicU64) }
+                        .compare_exchange(seen, next, SeqCst, SeqCst)
+                    {
+                        Ok(v) | Err(v) => v,
+                    }
+                };
+                if now == seen {
+                    return Ok(old);
+                }
+                seen = now;
+            }
+        }
+        if cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
+            && (host & 15) + len <= 16
+            && inside(host & !15, 16)
+        {
+            let granule = (host & !15) as *mut u8;
+            let shift = (host & 15) * 8;
+            let field = u128::from(mask) << shift;
+            // The first guess is two aligned 8-byte loads; the swap validates it.
+            // SAFETY: the aligned granule lies inside the backing (checked above).
+            let (lo, hi) = if ROUTED {
+                unsafe {
+                    (
+                        crate::usercopy::load(granule, 8).map_err(at_operand)?,
+                        crate::usercopy::load(granule.add(8), 8).map_err(at_operand)?,
+                    )
+                }
+            } else {
+                unsafe {
+                    (
+                        (*(granule as *const AtomicU64)).load(Relaxed),
+                        (*(granule.add(8) as *const AtomicU64)).load(Relaxed),
+                    )
+                }
+            };
+            let mut seen = u128::from(lo) | (u128::from(hi) << 64);
+            loop {
+                let old = (seen >> shift) as u64 & mask;
+                let next = (seen & !field) | (u128::from(update.apply(old, size)) << shift);
+                // SAFETY: as above; the swap is an aligned 16-byte host atomic.
+                let now = if ROUTED {
+                    unsafe { crate::usercopy::cas_pair(granule, seen, next) }.map_err(at_operand)?
+                } else {
+                    unsafe { atomic_cas128_raw(granule, seen, next) }
+                };
+                if now == seen {
+                    return Ok(old);
+                }
+                seen = now;
+            }
+        }
+        // The limitation above: one read, then one write when the update stores.
+        // SAFETY: the caller validated the operand's `size` bytes.
+        unsafe {
+            if ROUTED {
+                crate::usercopy::update_plain(ptr, size, |old| update.store(old, size))
+            } else {
+                let old = plain_read(ptr, size);
+                if let Some(new) = update.store(old, size) {
+                    plain_write(ptr, new, size);
+                }
+                Ok(old)
+            }
+        }
+    }
+}
+
+/// What a locked operand does to its prior value (`Memory::locked_unaligned`).
+#[derive(Clone, Copy)]
+enum LockedUpdate {
+    /// `atomic_rmw`: always stores.
+    Rmw { src: u64, op: RmwOp },
+    /// `atomic_cas`, `expected` already masked: stores `src` on a match.
+    Cas { expected: u64, src: u64 },
+}
+
+impl LockedUpdate {
+    /// The operand's new value; a failed compare leaves it unchanged.
+    fn apply(self, old: u64, size: u8) -> u64 {
+        self.store(old, size).unwrap_or(old)
+    }
+
+    /// The value the instruction stores, or `None` for a failed compare.
+    fn store(self, old: u64, size: u8) -> Option<u64> {
+        match self {
+            Self::Rmw { src, op } => Some(apply_rmw(old, src, op, size)),
+            Self::Cas { expected, src } => (old == expected).then_some(src & mask_bits(size)),
+        }
     }
 }
 
@@ -3590,12 +3763,12 @@ unsafe fn atomic_cas128_raw(_: *mut u8, _: u128, _: u128) -> u128 {
     unimplemented!("16-byte CAS requires an aarch64 or x86-64 host")
 }
 
-/// Raw atomic RMW dispatch over a guest pointer. Aligned → real host atomic;
-/// misaligned → plain read/modify/write (see `Memory::atomic_rmw`).
+/// Raw atomic RMW dispatch over a guest pointer in `mem`'s backing. Aligned →
+/// real host atomic; misaligned → [`Memory::locked_unaligned`].
 ///
 /// # Safety
 /// `ptr` must point to `size` valid, mapped bytes inside the backing buffer.
-unsafe fn atomic_rmw_raw(ptr: *mut u8, src: u64, size: u8, op: RmwOp) -> u64 {
+unsafe fn atomic_rmw_raw(mem: &Memory, ptr: *mut u8, src: u64, size: u8, op: RmwOp) -> u64 {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
 
     macro_rules! rmw {
@@ -3624,10 +3797,8 @@ unsafe fn atomic_rmw_raw(ptr: *mut u8, src: u64, size: u8, op: RmwOp) -> u64 {
                 };
                 old as u64
             } else {
-                let old = unsafe { plain_read(ptr, size) };
-                let new = apply_rmw(old, src, op, size);
-                unsafe { plain_write(ptr, new, size) };
-                old
+                mem.locked_unaligned::<false>(ptr, size, LockedUpdate::Rmw { src, op })
+                    .unwrap_or_else(|_| unreachable!("only a routed transfer faults"))
             }
         }};
     }
@@ -3642,7 +3813,7 @@ unsafe fn atomic_rmw_raw(ptr: *mut u8, src: u64, size: u8, op: RmwOp) -> u64 {
 
 /// # Safety
 /// As `atomic_rmw_raw`.
-unsafe fn atomic_cas_raw(ptr: *mut u8, expected: u64, src: u64, size: u8) -> u64 {
+unsafe fn atomic_cas_raw(mem: &Memory, ptr: *mut u8, expected: u64, src: u64, size: u8) -> u64 {
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
 
     macro_rules! cas {
@@ -3655,11 +3826,8 @@ unsafe fn atomic_cas_raw(ptr: *mut u8, expected: u64, src: u64, size: u8) -> u64
                     Err(v) => v as u64,
                 }
             } else {
-                let old = unsafe { plain_read(ptr, size) };
-                if old == expected {
-                    unsafe { plain_write(ptr, src, size) };
-                }
-                old
+                mem.locked_unaligned::<false>(ptr, size, LockedUpdate::Cas { expected, src })
+                    .unwrap_or_else(|_| unreachable!("only a routed transfer faults"))
             }
         }};
     }
@@ -3689,9 +3857,12 @@ pub(crate) unsafe fn plain_write(ptr: *mut u8, val: u64, size: u8) {
 /// a byte-wise `plain_read` racing a concurrent store on another vcpu can observe a
 /// *torn* word (half old, half new), which a lock-free guest reader (a Go runtime
 /// pointer/length) never tolerates. A misaligned or odd-size access falls back to the
-/// byte copy — aligned guest accesses never rely on atomicity there (same rule as
-/// [`atomic_rmw_raw`]). `Relaxed` is sufficient: this fixes single-copy atomicity
-/// (no tearing), not inter-location ordering, which x86 TSO handles separately.
+/// byte copy. LIMITATION: x86 also makes an unaligned 16-, 32- or 64-bit access to
+/// cached memory atomic when it fits in one cache line (SDM Vol 3A §11.1.1 p. 11-2),
+/// and the byte copy is not, so such a load can tear here where it cannot on
+/// hardware: against a plain store, or against a locked update of the same field
+/// (`Memory::locked_unaligned`). `Relaxed` is sufficient: this fixes single-copy
+/// atomicity (no tearing), not inter-location ordering, which x86 TSO handles separately.
 ///
 /// # Safety
 /// `ptr` must point to `size` valid, mapped bytes inside the backing buffer.
@@ -4507,6 +4678,121 @@ mod tests {
         );
         assert_eq!(m.atomic_cas(0x10e, 7, 9, 4), Err(MemTrap::Unmapped));
         assert_eq!(m.read(0x10c, 4), Ok(7));
+    }
+
+    // xj-0w3.8: a misaligned locked operand at every offset of a 16-byte
+    // granule, inside it (the containing-word swap) and across it (the plain
+    // fallback), routed and not. The operand's result is the instruction's,
+    // and every byte outside the operand keeps its value; a failed compare
+    // changes nothing (SDM Vol 2A CMPXCHG p. 3-194).
+    #[test]
+    fn locked_unaligned_operands_keep_their_neighbours() {
+        let pattern: [u8; 48] = std::array::from_fn(|i| 0x31u8.wrapping_mul(i as u8 + 7));
+        for routed in [false, true] {
+            let mut m = flat(0x1000);
+            m.map(0x100, 0x40, Prot::RW, RegionKind::Ram).unwrap();
+            m.set_host_fault_recovery(routed);
+            let read = |m: &Memory| {
+                let mut b = [0u8; 48];
+                m.read_ram_checked(0x100, &mut b).unwrap();
+                b
+            };
+            for size in [2u8, 4, 8] {
+                for at in 0x111..0x120u64 {
+                    if at % u64::from(size) == 0 {
+                        continue;
+                    }
+                    let bytes = (at - 0x100) as usize..(at - 0x100) as usize + size as usize;
+                    let mut v = [0u8; 8];
+                    v[..size as usize].copy_from_slice(&pattern[bytes.clone()]);
+                    let old = u64::from_le_bytes(v);
+                    let with = |v: u64| {
+                        let mut b = pattern;
+                        b[bytes.clone()].copy_from_slice(&v.to_le_bytes()[..size as usize]);
+                        b
+                    };
+                    let src = 0x0123_4567_89ab_cdef;
+                    for op in [RmwOp::Add, RmwOp::Rsub, RmwOp::Xor, RmwOp::Xchg] {
+                        m.write_ram_checked(0x100, &pattern).unwrap();
+                        assert_eq!(m.atomic_rmw(at, src, size, op), Ok(old), "{op:?} {at:#x}");
+                        let new = apply_rmw(old, src, op, size);
+                        assert_eq!(read(&m), with(new), "{op:?} {size} {at:#x}");
+                    }
+                    m.write_ram_checked(0x100, &pattern).unwrap();
+                    assert_eq!(m.atomic_cas(at, old ^ 1, src, size), Ok(old));
+                    assert_eq!(read(&m), pattern, "failed compare {size} {at:#x}");
+                    assert_eq!(m.atomic_cas(at, old | !mask_bits(size), src, size), Ok(old));
+                    assert_eq!(read(&m), with(src & mask_bits(size)), "{size} {at:#x}");
+                }
+            }
+        }
+    }
+
+    // xj-0w3.8: a containing word that would extend past a backing whose length
+    // is not a multiple of 16 is never touched; the operand takes the plain
+    // fallback, with the same result.
+    #[test]
+    fn a_granule_past_the_backing_takes_the_plain_fallback() {
+        for routed in [false, true] {
+            let mut m = flat(0x1009);
+            m.map(0x1000, 9, Prot::RW, RegionKind::Ram).unwrap();
+            m.set_host_fault_recovery(routed);
+            m.write_ram_checked(0x1000, &[1, 2, 3, 4, 5, 6, 7, 8, 9])
+                .unwrap();
+            assert_eq!(m.atomic_rmw(0x1005, 0x10, 4, RmwOp::Add), Ok(0x0908_0706));
+            assert_eq!(m.atomic_cas(0x1007, 0x0908, 0x5555, 2), Ok(0x0908));
+            let mut b = [0; 9];
+            m.read_ram_checked(0x1000, &mut b).unwrap();
+            assert_eq!(b, [1, 2, 3, 4, 5, 0x16, 7, 0x55, 0x55]);
+        }
+    }
+
+    // xj-0w3.8: concurrent locked updates of one misaligned field inside a
+    // granule, against a second locked update of the same bytes and plain
+    // stores to a neighbour byte of the containing word, lose nothing (SDM
+    // Vol 3A §11.1.2.2 p. 11-4). Both adders add to the field's low byte and
+    // the sum stays below 2^16, so no carry leaves the field and the order of
+    // the updates does not matter.
+    #[test]
+    fn locked_unaligned_updates_are_atomic_across_threads() {
+        const N: u64 = 20_000;
+        // (field offset, size; second adder's offset, size; neighbour offset)
+        let rows = [
+            (1u64, 2u8, 0u64, 4u8, 5u64),
+            (7, 2, 6, 4, 12),
+            (6, 4, 4, 4, 3),
+            (4, 8, 4, 4, 2),
+        ];
+        for (field, size, other, other_size, neighbour) in rows {
+            for routed in [false, true] {
+                let mut m = flat(0x1000);
+                m.map(0x100, 0x40, Prot::RW, RegionKind::Ram).unwrap();
+                m.set_host_fault_recovery(routed);
+                let base = 0x110;
+                let shift = 8 * (field - other);
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        for _ in 0..N {
+                            m.atomic_rmw(base + field, 1, size, RmwOp::Add).unwrap();
+                        }
+                    });
+                    s.spawn(|| {
+                        for _ in 0..N {
+                            m.atomic_rmw(base + other, 1 << shift, other_size, RmwOp::Add)
+                                .unwrap();
+                        }
+                    });
+                    s.spawn(|| {
+                        for i in (1..=N).rev() {
+                            m.write(base + neighbour, i & 0xff, 1).unwrap();
+                        }
+                    });
+                });
+                let tag = format!("field +{field} size {size} routed {routed}");
+                assert_eq!(m.read(base + field, size), Ok(2 * N), "{tag}");
+                assert_eq!(m.read(base + neighbour, 1), Ok(1), "{tag}");
+            }
+        }
     }
 
     #[test]

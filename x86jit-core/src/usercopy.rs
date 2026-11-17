@@ -300,26 +300,11 @@ pub(crate) unsafe fn store_preflighted(
     unsafe { invoke(routine, ptr, value as usize, 0, 0).map(|_| ()) }
         .map_err(|at| WriteFault { at, committed: 0 })
 }
+/// A naturally aligned operand; `Memory::locked_unaligned` takes every other.
 pub(crate) unsafe fn cas(ptr: *mut u8, expected: u64, value: u64, size: u8) -> Result<u64, usize> {
     let mask = u64::MAX >> (64 - size * 8);
     let expected = expected & mask;
-    if !(ptr as usize).is_multiple_of(size as usize) {
-        // SAFETY: retains the existing non-atomic misaligned fallback; no unaligned exclusive.
-        unsafe {
-            invoke(
-                probe_rmw,
-                ptr,
-                0,
-                size as usize,
-                crate::memory::host_page_size(),
-            )?;
-            let old = load(ptr, size)?;
-            if old == expected {
-                store(ptr, value, size).map_err(|fault| fault.at)?;
-            }
-            return Ok(old);
-        }
-    }
+    debug_assert!((ptr as usize).is_multiple_of(size as usize));
     let routine = match size {
         1 => cas1,
         2 => cas2,
@@ -328,6 +313,30 @@ pub(crate) unsafe fn cas(ptr: *mut u8, expected: u64, value: u64, size: u8) -> R
     };
     // SAFETY: caller validates the aligned operand; expected is width-masked on both hosts.
     unsafe { invoke(routine, ptr, expected as usize, value as usize, 0).map(|v| v as u64) }
+}
+/// The non-atomic locked fallback of `Memory::locked_unaligned`: one write
+/// probe, one read, then the write `update` returns, if any. No unaligned
+/// exclusive is issued.
+pub(crate) unsafe fn update_plain(
+    ptr: *mut u8,
+    size: u8,
+    update: impl FnOnce(u64) -> Option<u64>,
+) -> Result<u64, usize> {
+    // SAFETY: the caller validates the operand's `size` guest bytes.
+    unsafe {
+        invoke(
+            probe_rmw,
+            ptr,
+            0,
+            size as usize,
+            crate::memory::host_page_size(),
+        )?;
+        let old = load(ptr, size)?;
+        if let Some(new) = update(old) {
+            store(ptr, new, size).map_err(|fault| fault.at)?;
+        }
+        Ok(old)
+    }
 }
 pub(crate) unsafe fn cas_pair(ptr: *mut u8, expected: u128, value: u128) -> Result<u128, usize> {
     #[cfg(target_arch = "x86_64")]
@@ -1589,9 +1598,10 @@ mod scalar_tests {
     fn cas_masks_expected_at_every_width() {
         let mut data = [0x42u64; 2];
         for size in [1, 2, 4, 8] {
-            for offset in [0, 1] {
+            // `cas` takes naturally aligned operands only (`Memory::locked_unaligned`).
+            for offset in [0, usize::from(size)] {
                 let ptr = data.as_mut_ptr().cast::<u8>().wrapping_add(offset);
-                // SAFETY: both aligned and unaligned accesses stay in the local allocation.
+                // SAFETY: both aligned accesses stay in the local allocation.
                 unsafe {
                     store(ptr, 0x42, size).unwrap();
                     let expected = if size == 8 {

@@ -259,8 +259,9 @@ impl EntryRecord {
 /// Derive `kind` from a verified OS fault cause: Linux/FreeBSD signal/code or
 /// macOS AArch64's saved data-abort ESR (decision-13). Ambiguous and user-sent
 /// signals are Unsupported.
-/// Alignment recovery replays the guest instruction; its locked-operation
-/// atomicity limitation is tracked in xj-0w3.5.
+/// Alignment recovery replays the guest instruction in the interpreter. A
+/// misaligned locked operand is atomic there inside one aligned 16-byte
+/// granule and not across one (see `Memory::atomic_rmw`).
 /// Do not fabricate frames or handles, reenter execution, or modify guest state
 /// in the handler. Compiled accesses must preserve precise instruction-entry
 /// state. The stack and compiler-emitted frame save slots must remain readable.

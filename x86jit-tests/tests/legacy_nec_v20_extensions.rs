@@ -1534,9 +1534,10 @@ fn buslock_on_the_nec_forms() {
         for code in [&b"\x65\xf0\xa6"[..], b"\xf0\x65\x26\xa6"] {
             assert_refused(model, code);
         }
-        // At an odd address a word has no host atomic and is refused before
-        // it commits; a byte runs.
-        for (code, refused_word) in [
+        // At an odd address inside one aligned 16-byte granule a word runs on
+        // its atomic path, a swap of the containing word (xj-0w3.8), as a
+        // byte does.
+        for (code, word_form) in [
             (&b"\xf0\x0f\x17\x07"[..], true),
             (b"\xf0\x0f\x16\x07", false),
         ] {
@@ -1545,9 +1546,8 @@ fn buslock_on_the_nec_forms() {
             cpu.cpu.gpr[3] = 0x11;
             vm.write_bytes(0x11, &[0x00, 0x00]).unwrap();
             let r = run(&vm, &mut cpu, 1);
-            if refused_word {
-                assert!(refused(&r), "{model:?} {code:02x?}: {:?}", r.stop());
-                assert_eq!((r.steps(), cpu.cpu.rip, word(&vm, 0x11)), (0, IP, 0));
+            if word_form {
+                assert_eq!((r.steps(), word(&vm, 0x11)), (1, 0x0200), "{model:?}");
             } else {
                 assert_eq!((r.steps(), byte(&vm, 0x11)), (1, 0x02), "{model:?}");
             }
