@@ -543,7 +543,9 @@ impl VmConfig {
     }
 
     /// A `Reserved` (embedder-mmap'd) span of `span` bytes at `Fast` consistency.
-    /// Pair with [`Vm::with_backend_host_ram`].
+    /// Pair with [`Vm::with_backend_host_ram`]. Through [`Vm::with_backend`] the
+    /// whole span is instead one zeroed allocation, and a failed allocation aborts
+    /// the process as [`Memory::new`] documents.
     pub fn reserved(span: u64) -> Self {
         VmConfig {
             memory_model: MemoryModel::Reserved { span },
