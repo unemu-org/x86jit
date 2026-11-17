@@ -9,7 +9,16 @@ use crate::ir::RmwOp;
 
 /// SDM Vol 1 §3.3.7.1: no LA57; bits 63:47 must all agree.
 pub fn is_canonical(addr: u64) -> bool {
-    ((addr as i64) << 16 >> 16) as u64 == addr
+    canonical(addr) == addr
+}
+
+/// `addr` with bit 47 copied into bits 63:48: the engine's 48-bit linear-address width.
+/// A processor without 5-level paging is 48-bit CPU canonical (SDM Vol 3A §4.5 p. 4-4).
+/// The engine enumerates CPUID.(EAX=07H,ECX=0):ECX[16] (LA57) clear and
+/// CPUID.80000001H:EDX[29] (Intel 64) set, the pair that reports a 48-bit width
+/// (Vol 3A §5.1.4 p. 5-6).
+pub(crate) fn canonical(addr: u64) -> u64 {
+    ((addr as i64) << 16 >> 16) as u64
 }
 
 #[cold]
@@ -4047,6 +4056,19 @@ mod tests {
                 Err(MapError::OutOfBounds)
             ));
             assert_eq!(mem.read(addr, 1), Err(MemTrap::NonCanonical));
+        }
+    }
+
+    // SDM Vol 3A §4.5 p. 4-4: 48-bit CPU canonical means bits 63:48 copy bit 47.
+    #[test]
+    fn canonical_sign_extends_bit_47() {
+        for (addr, expected) in [
+            (0x0000_7fff_ffff_fff0, 0x0000_7fff_ffff_fff0),
+            (0xffff_8765_4321_0fed, 0xffff_8765_4321_0fed),
+            (0x1234_5678_9abc_def0, 0x0000_5678_9abc_def0),
+            (0x0123_8765_4321_0fed, 0xffff_8765_4321_0fed),
+        ] {
+            assert_eq!(canonical(addr), expected, "{addr:#x}");
         }
     }
 

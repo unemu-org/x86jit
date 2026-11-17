@@ -375,6 +375,10 @@ pub struct CpuState {
     /// `fnstenv`/`fldenv` unchanged, which is what a `fenv_t` save/restore needs.
     pub fpu_sw: u16,
     /// x87 instruction/data offsets and opcode (SDM Vol 1 §§8.1.8–8.1.9).
+    ///
+    /// FXRSTOR64 and XRSTOR64 load FIP 48-bit canonical (SDM Vol 3A §4.5.3 p. 4-6),
+    /// including through [`crate::x87::exec_fxstate`]. A direct write to this field is
+    /// kept as written, as `Vcpu::set_reg` keeps RIP and the FS/GS bases.
     pub fpu_fip: u64,
     pub fpu_fdp: u64,
     pub fpu_fop: u16,

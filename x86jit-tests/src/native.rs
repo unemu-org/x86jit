@@ -523,6 +523,9 @@ pub fn run_native_fault_details(
 ///   incurs an unmasked exception updates FDP (SDM Vol 1 §8.1.8 p. 8-9).
 /// - Where CPUID.(EAX=07H,ECX=0):EBX[13] = 1, FCS and FDS are deprecated and saved
 ///   as 0000H (SDM Vol 1 §8.1.8 p. 8-9).
+/// - FXRSTOR64 loads FIP canonical at the processor's maximum linear-address width,
+///   57 bits with 5-level paging and 48 without (SDM Vol 3A §4.5 p. 4-4; §4.5.3
+///   p. 4-6). The engine's width is 48 bits.
 ///
 /// The probe executes the instructions instead of reading those CPUID bits, because
 /// a hypervisor can report bits that differ from the silicon underneath it.
@@ -536,9 +539,25 @@ pub struct HostX87Pointers {
     /// FNSTENV stores the FCS and FDS that FLDENV loaded. False where
     /// CPUID.(EAX=07H,ECX=0):EBX[13] = 1, which saves both as 0000H.
     pub selectors: bool,
+    /// The width, 48 or 57, at which FXRSTOR64 loaded a FIP that is canonical at
+    /// neither. `None` when FXSAVE64 stored no FIP canonical at either width.
+    pub fip_bits: Option<u32>,
+}
+
+/// `value` with bits 63:`bits` copied from bit `bits - 1`.
+fn sign_extend(value: u64, bits: u32) -> u64 {
+    ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 
 impl HostX87Pointers {
+    /// The FIP this host loads from an FXRSTOR64 image that holds `image_fip`
+    /// (SDM Vol 3A §4.5.3 p. 4-6). `None` when the probe measured no width.
+    pub fn loaded_fip(self, image_fip: u64) -> Option<u64> {
+        self.fip_bits.map(|bits| sign_extend(image_fip, bits))
+    }
+    /// Why a witness skips a loaded FIP when the host keeps more bits than the engine.
+    pub const WIDER_FIP: &'static str = "this host loads FIP at a linear-address width \
+        wider than the engine's 48 bits (SDM Vol 3A §4.5 p. 4-4; §4.5.3 p. 4-6)";
     /// Why a witness skips FXSAVE's FIP, FDP and FOP when the host does not store them.
     pub const NO_FXSAVE_POINTERS: &'static str = "this host's FXSAVE stores no x87 pointers \
         while FSW.ES = 0 (AMD64 APM Vol 2 §11.4.4.3 p. 354)";
@@ -570,14 +589,20 @@ fn probe_x87_pointers() -> HostX87Pointers {
     const FX: usize = 0x200; // FXSAVE64 after FLD m64
     const ENV: usize = 0x400; // FNSTENV after FLD m64
     const STORED: usize = 0x440; // FNSTENV after FLDENV
+    const WIDE: usize = 0x600; // the FXRSTOR64 image
+    const WIDE_SAVED: usize = 0x800; // FXSAVE64 after FXRSTOR64
     const FCS: u16 = 0x4567;
     const FDS: u16 = 0x89ab;
+    // Canonical at neither 48 nor 57 bits, and different at each width.
+    const WIDE_FIP: u64 = 0x1234_5678_9abc_def0;
     let mut a = CodeAssembler::new(64).unwrap();
     a.fld(qword_ptr(DATA)).unwrap();
     a.fxsave64(ptr(DATA + FX as u64)).unwrap();
     a.fnstenv(ptr(DATA + ENV as u64)).unwrap();
     a.fldenv(ptr(DATA + LOADED as u64)).unwrap();
     a.fnstenv(ptr(DATA + STORED as u64)).unwrap();
+    a.fxrstor64(ptr(DATA + WIDE as u64)).unwrap();
+    a.fxsave64(ptr(DATA + WIDE_SAVED as u64)).unwrap();
     a.hlt().unwrap();
     let mut data = vec![0u8; PAGE as usize];
     data[..8].copy_from_slice(&2f64.to_le_bytes());
@@ -587,6 +612,11 @@ fn probe_x87_pointers() -> HostX87Pointers {
     data[LOADED + 8..LOADED + 10].copy_from_slice(&0xffffu16.to_le_bytes());
     data[LOADED + 16..LOADED + 18].copy_from_slice(&FCS.to_le_bytes());
     data[LOADED + 24..LOADED + 26].copy_from_slice(&FDS.to_le_bytes());
+    // SDM Vol 2A FXSAVE Table 3-48 p. 3-416: FCW, FIP and MXCSR of the 64-bit image.
+    // Every register empty, all exceptions masked, the MXCSR reset value.
+    data[WIDE..WIDE + 2].copy_from_slice(&0x037fu16.to_le_bytes());
+    data[WIDE + 8..WIDE + 16].copy_from_slice(&WIDE_FIP.to_le_bytes());
+    data[WIDE + 24..WIDE + 28].copy_from_slice(&0x1f80u32.to_le_bytes());
     let input = VectorInput {
         cpu_init: CpuSnapshot::default(),
         mem_init: vec![
@@ -611,6 +641,7 @@ fn probe_x87_pointers() -> HostX87Pointers {
         fxsave_pointers_without_es: false,
         fdp_without_exception: false,
         selectors: false,
+        fip_bits: None,
     };
     let mut seen = Vec::new();
     // A context switch between the FLD and a save can drop the pointers on AMD, whose
@@ -625,19 +656,29 @@ fn probe_x87_pointers() -> HostX87Pointers {
         host.fxsave_pointers_without_es |= u64_at(m, FX + 8) == CODE;
         host.fdp_without_exception |= u32_at(m, ENV + 20) == DATA as u32;
         host.selectors |= (u16_at(m, STORED + 16), u16_at(m, STORED + 24)) == (FCS, FDS);
+        let wide = u64_at(m, WIDE_SAVED + 8);
+        host.fip_bits = host.fip_bits.or([48, 57]
+            .into_iter()
+            .find(|&bits| sign_extend(WIDE_FIP, bits) == wide));
         seen.push((
             u64_at(m, FX + 8),
             u32_at(m, ENV + 20),
             u16_at(m, STORED + 16),
             u16_at(m, STORED + 24),
+            wide,
         ));
-        if host.fxsave_pointers_without_es && host.fdp_without_exception && host.selectors {
+        if host.fxsave_pointers_without_es
+            && host.fdp_without_exception
+            && host.selectors
+            && host.fip_bits.is_some()
+        {
             break;
         }
     }
     eprintln!(
-        "native x87 pointer probe: {host:?}; per run (FXSAVE64 FIP, FNSTENV FDP, FCS, FDS) = \
-         {seen:x?}; expected FIP {CODE:#x}, FDP {DATA:#x}, FCS {FCS:#x}, FDS {FDS:#x}"
+        "native x87 pointer probe: {host:?}; per run (FXSAVE64 FIP, FNSTENV FDP, FCS, FDS, \
+         FXSAVE64 FIP after FXRSTOR64) = {seen:x?}; expected FIP {CODE:#x}, FDP {DATA:#x}, \
+         FCS {FCS:#x}, FDS {FDS:#x}, and FIP {WIDE_FIP:#x} at 48 or 57 bits"
     );
     host
 }

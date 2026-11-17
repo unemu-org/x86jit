@@ -59,6 +59,27 @@ fn image() -> [u8; 512] {
     b
 }
 
+/// Image FIP values, each with the FIP that a REX.W restore loads from it. The engine's
+/// linear-address width is 48 bits, so bits 63:48 copy bit 47 (SDM Vol 3A §4.5 p. 4-4;
+/// §4.5.3 p. 4-6). The third is the FIP of [`image`].
+const FIP_LOADS: [(u64, u64); 4] = [
+    (0xffff_8765_4321_0fed, 0xffff_8765_4321_0fed), // upper half: kept
+    (0x0000_7fff_ffff_fff0, 0x0000_7fff_ffff_fff0), // lower half: kept
+    (0x1234_5678_9abc_def0, 0x0000_5678_9abc_def0), // not canonical, bit 47 clear
+    (0x0123_8765_4321_0fed, 0xffff_8765_4321_0fed), // not canonical, bit 47 set
+];
+
+fn image_with_fip(fip: u64) -> [u8; 512] {
+    let mut b = image();
+    b[8..16].copy_from_slice(&fip.to_le_bytes());
+    b
+}
+
+/// [`image`] as a REX.W restore loads it: FIP canonical, FDP unchanged.
+fn loaded_image() -> [u8; 512] {
+    image_with_fip(FIP_LOADS[2].1)
+}
+
 #[test]
 fn fxstate_helper_retains_edited_pointers() {
     struct Image(RefCell<[u8; 512]>);
@@ -81,7 +102,19 @@ fn fxstate_helper_retains_edited_pointers() {
     assert_eq!(cpu.cpuid(7, 0).ebx & ((1 << 6) | (1 << 13)), 0);
     assert_eq!(exec_fxstate(&mut cpu, &mem, 0, true), None);
     assert_eq!(exec_fxstate(&mut cpu, &mem, 0, false), None);
-    assert_eq!(&mem.0.borrow()[6..24], &expected[6..24]);
+    // The helper restores as FXRSTOR64 does: FOP and FDP as edited, FIP canonical
+    // (SDM Vol 3A §4.5.3 p. 4-6).
+    assert_eq!(&mem.0.borrow()[6..24], &loaded_image()[6..24]);
+    for (fip, loaded) in FIP_LOADS {
+        *mem.0.borrow_mut() = image_with_fip(fip);
+        assert_eq!(exec_fxstate(&mut cpu, &mem, 0, true), None);
+        assert_eq!(cpu.fpu_fip, loaded, "image FIP {fip:#x}");
+        assert_eq!(cpu.fpu_fdp, u64_at(&expected, 16));
+    }
+    // A direct write to the field is kept as written, and a save stores it.
+    cpu.fpu_fip = FIP_LOADS[2].0;
+    assert_eq!(exec_fxstate(&mut cpu, &mem, 0, false), None);
+    assert_eq!(u64_at(&mem.0.borrow()[..], 8), FIP_LOADS[2].0);
 }
 
 // SDM Vol 1 §§8.1.8–8.1.9; AMD64 APM Vol 2 §11.4.4.3, Vol 5 FXSAVE:
@@ -111,7 +144,7 @@ fn x87_pointer_model_policy_fxstate_export() {
                 ..CpuState::default()
             };
             assert_eq!(exec_fxstate(&mut cpu, &mem, 0, true), None);
-            assert_eq!(cpu.fpu_fip, u64_at(&initial, 8));
+            assert_eq!(cpu.fpu_fip, FIP_LOADS[2].1);
             assert_eq!(cpu.fpu_fdp, u64_at(&initial, 16));
             assert_eq!(cpu.fpu_fop, 0x523);
             assert_eq!(exec_fxstate(&mut cpu, &mem, 0, false), None);
@@ -119,7 +152,7 @@ fn x87_pointer_model_policy_fxstate_export() {
             if policy == X87PointerModel::Amd && sw & 0x80 == 0 {
                 assert_eq!(&saved[6..24], &[0; 18]);
             } else {
-                assert_eq!(&saved[6..24], &initial[6..24]);
+                assert_eq!(&saved[6..24], &loaded_image()[6..24]);
             }
             assert_eq!(&saved[..6], &initial[..6]);
             assert_eq!(&saved[24..28], &initial[24..28]);
@@ -155,7 +188,7 @@ fn save_policy_images(backend: Box<dyn Backend>) {
                     let mut initial = image().to_vec();
                     initial[2..4].copy_from_slice(&sw.to_le_bytes());
                     let fip = if import == 0 {
-                        u64_at(&initial, 8)
+                        FIP_LOADS[2].1
                     } else {
                         u64_at(&initial, 8) as u32 as u64
                     };
@@ -385,7 +418,8 @@ fn fx_images_round_trip(backend: Box<dyn Backend>) {
         a.hlt().unwrap();
         let initial = image();
         let out = run(&a.assemble(CODE).unwrap(), &initial, backend);
-        assert_eq!(&out[6..24], &initial[6..24]);
+        // FXRSTOR64 loads FIP canonical (SDM Vol 3A §4.5.3 p. 4-6); bits 31:0 survive.
+        assert_eq!(&out[6..24], &loaded_image()[6..24]);
         for base in [512, 1536] {
             assert_eq!(&out[base + 6..base + 12], &initial[6..12]);
             assert_eq!(&out[base + 16..base + 20], &initial[16..20]);
@@ -515,6 +549,74 @@ tiers!(
     fx_images_round_trip
 );
 
+// Every FXRSTOR and XRSTOR image form. With REX.W = 1, FIP is loaded canonical at
+// the engine's 48 bits (SDM Vol 3A §4.5.3 p. 4-6) and FDP loads all 64 bits. With
+// REX.W = 0 both load bits 31:0 and clear the upper 32 (Vol 1 §8.1.8 p. 8-10).
+fn restore_forms_load_fip_canonical(backend: Box<dyn Backend>) {
+    let mut vm = Vm::with_backend(VmConfig::flat(0x30_0000), backend);
+    vm.map(0, 0x30_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    // (form, REX.W, XCOMP_BV of an XSAVE image or None for an FXSAVE image)
+    let forms = [
+        ("FXRSTOR64", true, None),
+        ("XRSTOR64, standard", true, Some(0)),
+        ("XRSTOR64, compacted", true, Some((1u64 << 63) | 1)),
+        ("FXRSTOR", false, None),
+        ("XRSTOR, standard", false, Some(0)),
+    ];
+    for (i, (form, wide, xcomp)) in forms.into_iter().enumerate() {
+        let at = CODE + i as u64 * 0x100;
+        let mut a = CodeAssembler::new(64).unwrap();
+        // EDX:EAX = 1 requests the x87 component only (SDM Vol 1 §13.8).
+        a.mov(eax, 1).unwrap();
+        a.xor(edx, edx).unwrap();
+        match (xcomp, wide) {
+            (None, _) => fx(&mut a, true, wide, DATA),
+            (Some(_), true) => a.xrstor64(ptr(DATA)).unwrap(),
+            (Some(_), false) => a.xrstor(ptr(DATA)).unwrap(),
+        }
+        fx(&mut a, false, true, OUT);
+        a.hlt().unwrap();
+        vm.write_bytes(at, &a.assemble(at).unwrap()).unwrap();
+        for (fip, loaded) in FIP_LOADS {
+            let mut area = image_with_fip(fip).to_vec();
+            if let Some(xcomp) = xcomp {
+                // SDM Vol 1 §13.4.2: XSTATE_BV, then XCOMP_BV; bit 0 is the x87 state.
+                let mut header = [0u8; 64];
+                header[..8].copy_from_slice(&1u64.to_le_bytes());
+                header[8..16].copy_from_slice(&xcomp.to_le_bytes());
+                area.extend_from_slice(&header);
+            }
+            vm.write_bytes(DATA, &area).unwrap();
+            let fdp = u64_at(&area, 16);
+            let expected = if wide {
+                (loaded, fdp)
+            } else {
+                (fip as u32 as u64, fdp as u32 as u64)
+            };
+            let mut cpu = vm.new_vcpu();
+            cpu.set_reg(Reg::Rip, at);
+            assert!(matches!(cpu.run(&vm, None), Exit::Hlt), "{form}");
+            assert_eq!(
+                (cpu.cpu.fpu_fip, cpu.cpu.fpu_fdp),
+                expected,
+                "{form}: image FIP {fip:#x}"
+            );
+            let mut out = [0; 512];
+            vm.read_bytes(OUT, &mut out).unwrap();
+            assert_eq!(
+                (u64_at(&out, 8), u64_at(&out, 16)),
+                expected,
+                "{form}: FXSAVE64 after image FIP {fip:#x}"
+            );
+        }
+    }
+}
+tiers!(
+    x87_pointer_restore_forms_load_fip_canonical_interp,
+    x87_pointer_restore_forms_load_fip_canonical_jit,
+    restore_forms_load_fip_canonical
+);
+
 tiers!(
     x87_pointer_legacy_environment_round_trip_interp,
     x87_pointer_legacy_environment_round_trip_jit,
@@ -553,7 +655,7 @@ fn prefix_and_control(backend: Box<dyn Backend>) {
     code.extend(tail.assemble(CODE + code.len() as u64).unwrap());
     let initial = image();
     let out = run(&code, &initial, backend);
-    assert_eq!(&out[6..24], &initial[6..24]);
+    assert_eq!(&out[6..24], &loaded_image()[6..24]);
     assert_eq!(u64_at(&out, 520), ip);
     assert_eq!(&out[518..520], &initial[6..8]);
     assert_eq!(&out[528..536], &initial[16..24]);
@@ -752,14 +854,28 @@ fn x87_pointer_native_instruction_witness() {
 fn x87_pointer_native_edited_image_witness() {
     use x86jit_tests::native::{host_x87_pointers, HostX87Pointers};
     let host = host_x87_pointers();
+    // One FXRSTOR64/FXSAVE64 pair per FIP_LOADS image, 512 bytes apart.
     let mut a = CodeAssembler::new(64).unwrap();
-    fx(&mut a, true, true, DATA);
-    fx(&mut a, false, true, OUT);
+    let mut data = Vec::new();
+    for (i, (fip, _)) in FIP_LOADS.into_iter().enumerate() {
+        fx(&mut a, true, true, DATA + i as u64 * 512);
+        fx(&mut a, false, true, OUT + i as u64 * 512);
+        data.extend_from_slice(&image_with_fip(fip));
+    }
     a.hlt().unwrap();
-    let initial = image();
-    let native = native_output(a.assemble(CODE).unwrap(), initial.to_vec());
-    assert_eq!(&native[..6], &initial[..6]);
-    assert_eq!(&native[24..28], &initial[24..28]);
+    let code = a.assemble(CODE).unwrap();
+    let native = native_output(code.clone(), data.clone());
+    // The engine loads FIP at its own 48 bits on every tier, whatever the host does.
+    let ours = run(&code, &data, Box::new(InterpreterBackend));
+    let jit = run(&code, &data, Box::new(x86jit_cranelift::JitBackend::new()));
+    assert_eq!(ours, jit);
+    for (i, (_, loaded)) in FIP_LOADS.into_iter().enumerate() {
+        let base = i * 512;
+        assert_eq!(u64_at(&ours, base + 8), loaded);
+        assert_eq!(&ours[base + 16..base + 24], &image()[16..24]);
+        assert_eq!(&native[base..base + 6], &data[base..base + 6]);
+        assert_eq!(&native[base + 24..base + 28], &data[base + 24..base + 28]);
+    }
     if !host.fxsave_pointers_without_es {
         // ES=0: see the measured AMD divergence above the instruction witness.
         eprintln!(
@@ -768,30 +884,52 @@ fn x87_pointer_native_edited_image_witness() {
         );
         return;
     }
-    assert_eq!(&native[6..8], &initial[6..8], "FOP");
-    assert_eq!(&native[16..24], &initial[16..24], "FDP");
     // SDM Vol 3A §4.5.3 p. 4-6: a load of FIP ignores the image bits beyond the
     // maximum linear-address width and sign-extends the top kept bit, so FIP is CPU
     // canonical: 48-bit with 4-level paging only, 57-bit with 5-level paging (Vol 3A
-    // §4.5 p. 4-4). CPUID.(EAX=07H,ECX=0):ECX[16] enumerates 5-level paging (Vol 1
-    // Table 21-20 p. 21-28). A hypervisor can hide that bit from its guest, so without
-    // it both widths are accepted. A GitHub-hosted runner measured 0x0034_5678_9abc_def0
-    // here, the 57-bit result. The engine's FXRSTOR keeps all 64 bits, which the
-    // engine-side image witnesses above still expect.
-    let fip = u64_at(&initial, 8);
-    let canonical = |bits: u32| ((fip << (64 - bits)) as i64 >> (64 - bits)) as u64;
+    // §4.5 p. 4-4). The probe measures the width. CPUID.(EAX=07H,ECX=0):ECX[16]
+    // enumerates 5-level paging (Vol 1 Table 21-20 p. 21-28), so a host that reports it
+    // must have measured 57. A hypervisor can hide that bit from its guest, so a host
+    // that does not report it may have measured either width. A GitHub-hosted runner
+    // measured 57. FDP is not a register that section lists: all 64 bits load.
     // SAFETY: CPUID exists on every x86-64 host; leaf 0 reports the highest basic leaf.
     #[allow(unused_unsafe)] // CPUID intrinsics are unsafe on the workspace MSRV.
     let la57 = unsafe {
         std::arch::x86_64::__cpuid(0).eax >= 7
             && std::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 16) != 0
     };
-    let widths: &[u32] = if la57 { &[57] } else { &[48, 57] };
-    let saved = u64_at(&native, 8);
     assert!(
-        widths.iter().any(|&bits| canonical(bits) == saved),
-        "native FIP {saved:#x} is not the image's {fip:#x} made canonical at {widths:?} bits"
+        host.fip_bits == Some(57) || (!la57 && host.fip_bits == Some(48)),
+        "host FIP width {:?} with CPUID LA57 = {la57}",
+        host.fip_bits
     );
+    for (i, (fip, _)) in FIP_LOADS.into_iter().enumerate() {
+        let base = i * 512;
+        assert_eq!(
+            &native[base + 6..base + 8],
+            &data[base + 6..base + 8],
+            "FOP"
+        );
+        assert_eq!(
+            &native[base + 16..base + 24],
+            &data[base + 16..base + 24],
+            "FDP"
+        );
+        let saved = u64_at(&native, base + 8);
+        let engine = u64_at(&ours, base + 8);
+        assert_eq!(Some(saved), host.loaded_fip(fip), "image FIP {fip:#x}");
+        // A 48-bit host loads what the engine loads. A 57-bit host differs from the
+        // engine only for an image FIP that is not 48-bit canonical.
+        if host.fip_bits == Some(48) {
+            assert_eq!(saved, engine, "image FIP {fip:#x}");
+        } else if saved != engine {
+            eprintln!(
+                "FXSAVE64 FIP after image FIP {fip:#x} not compared: host {saved:#x}, \
+                 engine {engine:#x}: {}",
+                HostX87Pointers::WIDER_FIP
+            );
+        }
+    }
 }
 
 fn fault_retains_environment(backend: Box<dyn Backend>) {
@@ -829,7 +967,7 @@ fn fault_retains_environment(backend: Box<dyn Backend>) {
         let mut out = [0; 512];
         vm.read_bytes(OUT, &mut out).unwrap();
         // SDM Vol 3A §7.5: a memory fault leaves instruction-entry state intact.
-        assert_eq!(&out[6..24], &initial[6..24]);
+        assert_eq!(&out[6..24], &loaded_image()[6..24]);
     }
 }
 tiers!(

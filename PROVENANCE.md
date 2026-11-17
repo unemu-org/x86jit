@@ -103,7 +103,8 @@ measured bytes — never quietly excluded.
 
 **The host CPU's x87 pointer fields depend on the host, and the manuals say so.** A native
 witness compares FIP, FDP, FOP, FCS or FDS only where `native::host_x87_pointers` measured
-that the host stores the field, and prints why it skipped one. Measured so far:
+that the host stores the field the way the engine does, and prints why it skipped one.
+Measured so far:
 
 - AMD Zen 4 (Ryzen 7 7840HS): FXSAVE with FSW.ES = 0 stores zero FOP, FIP and FDP (APM
   Vol 2 §11.4.4.3 p. 354; Vol 5 FXSAVE p. 26). FNSTENV stores them regardless of ES
@@ -117,19 +118,27 @@ that the host stores the field, and prints why it skipped one. Measured so far:
   0x0034_5678_9abc_def0 with FXSAVE64. A load of FIP keeps only the bits within the
   maximum linear-address width, here 57, and sign-extends the top one (SDM Vol 3A §4.5.3
   p. 4-6). That is not a vendor difference: the section applies to every Intel processor.
-  The engine's FXRSTOR keeps all 64 bits, so on this point the engine diverges from the
-  SDM. The native witness checks the SDM's value. The engine-side witnesses still check
-  the engine's value.
+  The FDP of the same image, 0x2345_6789_abcd_ef01, came back whole: FDP is not one of
+  the registers that section lists.
+- The engine loads FIP the same way at its own width, 48 bits, on FXRSTOR64 and
+  XRSTOR64 in both tiers and in `x87::exec_fxstate` (`memory::canonical`). That is the
+  width it enforces on every Long64 memory access and the one its CPUID implies: LA57
+  clear with Intel 64 set (Vol 3A §4.5 p. 4-4; §5.1.4 p. 5-6). The probe measures the
+  host's width. The native witness compares the host's FIP with the engine's on a 48-bit
+  host. On a 57-bit host it checks the host against the host's width and prints why it
+  does not compare the two. The engine-side witnesses check 48 bits on every host.
 
 ## 3. What we do not model, and say so
 
 Refusing to lift is a design position, not an omission, when the alternative is a
 plausible-looking wrong answer:
 
-- **x87 `FIP`/`CS+FOP`/`FDP`/`FDS`** are not modelled: no instruction updates them. They
-  are carried verbatim across `fldenv`/`fnstenv`, so a `fenv_t` save/restore round trip is
-  exact, but the values are whatever the guest last loaded rather than the last
-  instruction's. `fnsave`/`frstor` remain **unlifted**.
+- **x87 `FIP`/`FCS`, `FDP`/`FDS` and `FOP` are modelled**, so they are no longer listed
+  here as a gap. Non-control x87 instructions record them as SDM Vol 1 §§8.1.8–8.1.9
+  describe, and FXSAVE/FXRSTOR, XSAVE/XRSTOR, `fnstenv`/`fldenv` and `fnsave`/`frstor` carry them.
+  A REX.W restore loads FIP canonical at 48 bits and FDP whole (Vol 3A §4.5.3 p. 4-6; see
+  §2). What remains unmodelled: `fnsave`/`frstor` are lifted only in 16-bit code; the 32-
+  and 64-bit forms remain **unlifted**.
 - **The six FP exception flags ARE set** by arithmetic since task-328, and each rule is
   witnessed against the host rather than restated from the manual — including the two that
   are easy to get backwards: masked underflow needs the result to be both tiny and

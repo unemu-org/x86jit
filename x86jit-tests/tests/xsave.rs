@@ -159,10 +159,12 @@ fn xsave_all_forms_round_trip_all_components_and_tiers() {
             assert_eq!(restored.cpu.mxcsr, 0x5fc1);
             assert_eq!(restored.cpu.fpu_fop, before.fpu_fop);
             let wide = kind & 1 == 1;
+            // SDM Vol 3A §4.5.3 p. 4-6: XRSTOR64 loads the seeded 0x1234_5678_abcd_ef00
+            // canonical at the engine's 48 bits. FDP is not made canonical.
             assert_eq!(
                 restored.cpu.fpu_fip,
                 if wide {
-                    before.fpu_fip
+                    0x0000_5678_abcd_ef00
                 } else {
                     before.fpu_fip as u32 as u64
                 }

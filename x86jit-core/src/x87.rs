@@ -728,7 +728,8 @@ pub enum FpStateFault {
 }
 
 /// Transfer the 512-byte REX.W FP/SSE image at `addr` (§14).
-/// XMM, x87 (including the 64-bit pointers) and MXCSR round-trip.
+/// XMM, x87 (including the 64-bit pointers) and MXCSR round-trip, except that a
+/// restore loads FIP canonical, as FXRSTOR64 does (see [`exec_fxstate_format`]).
 /// Reserved MXCSR bits fault before any CPU state is restored
 /// (SDM Vol 2A §3.3 FXRSTOR, 64-Bit Mode Exceptions).
 pub fn exec_fxstate<M: FpMem>(
@@ -763,7 +764,15 @@ pub fn exec_fxstate_format<M: FpMem>(
         }
         cpu.fpu_fop = u16::from_le_bytes(buf[6..8].try_into().unwrap()) & 0x7ff;
         if wide {
-            cpu.fpu_fip = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            // SDM Vol 3A §4.5.3 p. 4-6: FXRSTOR, XRSTOR and XRSTORS load FIP without the
+            // image bits beyond the maximum linear-address width and sign-extend the top
+            // kept bit, so FIP is always CPU canonical. The width is the engine's 48 bits
+            // (`memory::canonical`). XRSTOR decodes its x87 component through this path.
+            // FDP is not among the registers that section lists, so it loads all 64 bits
+            // (Vol 1 §8.1.8 p. 8-10). The REX.W = 0 forms below, FLDENV and FRSTOR load 32
+            // bits and clear the upper 32 (same section), which is canonical already.
+            cpu.fpu_fip =
+                crate::memory::canonical(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
             cpu.fpu_fdp = u64::from_le_bytes(buf[16..24].try_into().unwrap());
             cpu.fpu_fcs = 0;
             cpu.fpu_fds = 0;
