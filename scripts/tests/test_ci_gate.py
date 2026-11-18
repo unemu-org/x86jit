@@ -83,10 +83,47 @@ class CiGateTests(unittest.TestCase):
         self.assertEqual(call["backtrace"], "1")
         self.assertEqual(call["args"], [
             "develop", "--no-update-lock-file", "--command", "cargo", "nextest",
-            "run", "--locked", "--workspace", "--features", "x86jit-tests/unicorn",
-            "--no-fail-fast", "--success-output", "final", "-E",
+            "run", "--profile", "ci", "--locked", "--workspace", "--features",
+            "x86jit-tests/unicorn", "--no-fail-fast", "--success-output", "final", "-E",
             "not binary(fuzz_robustness)",
         ])
+
+    def test_fast_tier_requires_corpus_and_uses_the_fast_profile(self):
+        result = self.run_gate("fast")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call = self.call()
+        self.assertEqual(call["corpus_required"], "1")
+        self.assertEqual(call["args"], [
+            "develop", "--no-update-lock-file", "--command", "cargo", "nextest",
+            "run", "--profile", "fast", "--locked", "--workspace", "--features",
+            "x86jit-tests/unicorn", "--no-fail-fast",
+        ])
+
+    def test_heavy_tier_runs_the_ignored_tests_of_the_heavy_profile(self):
+        result = self.run_gate("heavy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.call()["args"], [
+            "develop", "--no-update-lock-file", "--command", "cargo", "nextest",
+            "run", "--profile", "heavy", "--run-ignored", "all", "--locked", "--workspace",
+            "--features", "x86jit-tests/unicorn", "--no-fail-fast", "--success-output",
+            "final",
+        ])
+
+    def test_ratchet_reads_the_full_tier_report_without_nix(self):
+        tiers = self.root / "scripts" / "test-tiers.py"
+        tiers.write_text(STUB)
+        tiers.chmod(0o755)
+        junit = self.root / "target" / "nextest" / "ci" / "junit.xml"
+        junit.parent.mkdir(parents=True)
+        junit.write_text("<testsuites/>\n")
+        result = self.run_gate("ratchet")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call = self.call()
+        self.assertEqual(call["program"], "test-tiers.py")
+        self.assertEqual(call["args"], ["ratchet", "target/nextest/ci/junit.xml"])
+        self.assertEqual((self.root / "logs" / "junit-tests.xml").read_text(),
+                         "<testsuites/>\n")
+        self.assertIn("run: bash scripts/ci-gate.sh ratchet", WORKFLOW.read_text())
 
     def test_other_gates_dispatch_without_running_heavy_jobs(self):
         expected = {
@@ -150,7 +187,8 @@ class CiGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.call()["program"], "guest-agnostic-guard.sh")
         self.call_file.unlink()
-        for step in ("clippy", "tests", "release", "build-tests", "build-release"):
+        for step in ("clippy", "tests", "fast", "heavy", "release", "build-tests",
+                     "build-release"):
             with self.subTest(step=step):
                 result = self.run_gate(step)
                 self.assertEqual(result.returncode, 2, result.stderr)

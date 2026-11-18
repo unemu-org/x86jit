@@ -188,7 +188,8 @@ class Scopes(unittest.TestCase):
         self.repo.write("x86jit-core/src/vm.rs", "edited\n")
         self.repo.commit()
         result = self.assertScope("shared")
-        self.assertIn("  bash scripts/ci-gate.sh tests", commands_of(result))
+        self.assertIn("  bash scripts/ci-gate.sh fast", commands_of(result))
+        self.assertNotIn("  bash scripts/ci-gate.sh tests", commands_of(result))
 
     def test_legacy_and_shared_together_are_shared(self):
         self.repo.write("x86jit-core/src/vm/nec.rs", "edited\n")
@@ -310,14 +311,20 @@ class Plans(unittest.TestCase):
                                 check=True)
         return [line.strip() for line in commands_of(result)]
 
-    def test_shared_plan_runs_every_gate_ci_runs(self):
+    def test_shared_plan_runs_every_gate_ci_runs_with_the_fast_tier(self):
         workflow = CI.read_text()
         plan = self.plan("shared")
         gates = re.findall(r"run: (bash scripts/ci-gate\.sh [^\n]+)", workflow)
-        expected = set()
+        expected = {"bash scripts/ci-gate.sh fast"}
+        full_tier = {"bash scripts/ci-gate.sh tests", "bash scripts/ci-gate.sh ratchet",
+                     "bash scripts/ci-gate.sh release"}
+        self.assertLessEqual(full_tier, set(gates))
+        self.assertFalse(full_tier & set(plan), "the full tier runs only in CI")
         for gate in gates:
             if gate.endswith(("devshell", "corpus", "build-tests", "build-release")):
                 continue  # CI setup and cache warming; the plan fetches the corpus only when absent
+            if gate in full_tier:
+                continue
             if '"$CROSS_TARGET"' in gate:
                 expected |= {"bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu",
                              "bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu"}
@@ -342,7 +349,7 @@ class Plans(unittest.TestCase):
         tests = next(c for c in plan if "--test " in c)
         self.assertTrue(tests.startswith(
             "SS286_REQUIRED=1 nix develop --no-update-lock-file --command cargo nextest run "
-            "--locked --workspace --features x86jit-tests/unicorn --no-fail-fast --test "))
+            "--profile fast --locked --workspace --features x86jit-tests/unicorn --no-fail-fast --test "))
         names = re.findall(r"--test (\w+)", tests)
         self.assertEqual(names, sorted(set(names)))
         legacy = {p.stem for p in (ROOT / "x86jit-tests" / "tests").glob("legacy_*.rs")}
@@ -353,8 +360,8 @@ class Plans(unittest.TestCase):
             self.assertIn(name, names)
         for name in ("jit", "differential", "differential32", "fuzz", "mt", "corpus"):
             self.assertNotIn(name, names)
-        self.assertIn("nix develop --no-update-lock-file --command cargo nextest run --locked "
-                      "-p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn "
+        self.assertIn("nix develop --no-update-lock-file --command cargo nextest run "
+                      "--profile fast --locked -p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn "
                       "--no-fail-fast --lib", plan)
         for target in ("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"):
             self.assertIn(f"bash scripts/ci-gate.sh cross {target}", plan)

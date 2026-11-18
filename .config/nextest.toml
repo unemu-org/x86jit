@@ -8,3 +8,62 @@ max-threads = 1
 filter = 'package(x86jit-cranelift) & (binary(code_memory_stress) | binary(code_memory_fault_stress) | binary(code_memory_bound) | test(code_memory::tests::repeated_) | test(batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc))'
 test-group = 'code-memory-stress'
 threads-required = 'num-test-threads'
+
+# Test tiers (backlog/docs/commands.md § Test tiers). Overrides of the default
+# profile, such as the group above, apply to every profile.
+#
+# The full tier: everything except fuzz_robustness (scripts/ci-gate.sh tests adds
+# the filter), with a JUnit report that scripts/test-tiers.py ratchet reads.
+[profile.ci.junit]
+path = "junit.xml"
+
+# The heavy tier: fuzz_robustness and the ignored soaks. Run with --run-ignored all
+# (scripts/ci-gate.sh heavy); off the path to main.
+[profile.heavy]
+default-filter = '''
+binary(fuzz_robustness)
+| (binary_id(=x86jit-cranelift::code_memory_stress) & test(=dense_reclamation_soak))
+| (binary_id(=x86jit-cranelift::code_memory_bound) & test(=hundred_thousand_units_have_bounded_mappings_and_residency))
+'''
+
+# The fast tier: the local hand-back gate.
+[profile.fast.junit]
+path = "junit.xml"
+
+# BEGIN generated fast-tier filter
+# Written by `python3 -B scripts/test-tiers.py sync` from .config/slow-tests.txt;
+# edit the list, not this block.
+[profile.fast]
+default-filter = '''
+not (binary(fuzz_robustness))
+& not (binary_id(=x86jit-core) & (test(=vm::legacy::tests::a_blocked_nmi_handler_that_never_irets_keeps_ordinary_dispatch)))
+& not (binary_id(=x86jit-cranelift) & (test(=batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc) | test(=codegen::trap_tests::guest_trap_sites_lifter_capped_blocks_never_overflow) | test(=codegen::trap_tests::shifts_and_rotates_compile_with_guest_traps_on_both_isas)))
+& not (binary_id(=x86jit-cranelift::code_memory_fault_stress) & (test(=signals_and_fault_recovery_in_reused_code)))
+& not (binary_id(=x86jit-cranelift::code_memory_stress) & (test(=anonymous_multi_vcpu_smc_tiering_and_release) | test(=background_completion_rejection_during_smc) | test(=dense_multi_vcpu_smc_tiering_and_reuse) | test(=relaxed_republication_at_same_address_is_visible)))
+& not (binary_id(=x86jit-tests::cvt_integer_indefinite) & (test(=cvt_indefinite_matches_native) | test(=cvt_indefinite_matches_unicorn) | test(=cvt_indefinite_packed_block) | test(=cvt_indefinite_packed_region) | test(=cvt_indefinite_scalar_block) | test(=cvt_indefinite_scalar_region)))
+& not (binary_id(=x86jit-tests::evex_modifiers) & (test(=evex_fma_family_broadcast_masks_and_accumulators) | test(=evex_modifiers_match_native) | test(=evex_random_masks_and_broadcast_match_jit_and_expanded_memory)))
+& not (binary_id(=x86jit-tests::fault_landing_pad) & (test(=split_stores_leave_no_bytes_and_retry_once)))
+& not (binary_id(=x86jit-tests::fences) & (test(=helper_stos_message_passing_jit_block_and_region) | test(=interpreter_fences_order_message_passing) | test(=sb_mfence_all_tiers_and_backends)))
+& not (binary_id(=x86jit-tests::fp_special_cases) & (test(=fp_default_randomized_tiers)))
+& not (binary_id(=x86jit-tests::fuzz) & (test(=jit_matches_interp) | test(=jit_matches_interp_32) | test(=jit_superblocks_matches_interp)))
+& not (binary_id(=x86jit-tests::guest_trap_sites) & (test(=guest_trap_sites_descriptor_overflow_125_rmw_compiles) | test(=guest_trap_sites_descriptor_overflow_4k_ymm_copy_compiles)))
+& not (binary_id(=x86jit-tests::interp_ordering) & (test(=acqrel_interpreter_message_passing) | test(=child_and_interpreter_message_passing)))
+& not (binary_id(=x86jit-tests::legacy_direct_parity) & (test(=r5_string_families_match_over_ram_and_devices)))
+& not (binary_id(=x86jit-tests::legacy_i8086) & (test(=a_locked_odd_word_inside_a_granule_is_atomic) | test(=every_locked_form_runs_as_its_unlocked_form_or_is_refused)))
+& not (binary_id(=x86jit-tests::legacy_real_parity) & (test(=application_real16_forms_have_legacy_parity) | test(=application_real16_forms_have_legacy_parity_cpu_model)))
+& not (binary_id(=x86jit-tests::locked_misaligned) & (test(=machine_i80386::lock_add) | test(=machine_i80386::lock_bts_btr) | test(=machine_i80386::lock_inc) | test(=machine_i80386::overlapping_locked_operands_and_a_plain_byte) | test(=machine_i80386::xchg) | test(=machine_i8086::lock_add) | test(=machine_i8086::overlapping_locked_operands_and_a_plain_byte) | test(=machine_nec_v20::overlapping_locked_operands_and_a_plain_byte) | test(=real16_alias::lock_add) | test(=real16_alias::lock_bts_btr) | test(=real16_alias::lock_cmpxchg8b_loop) | test(=real16_alias::lock_cmpxchg_loop) | test(=real16_alias::lock_inc) | test(=real16_alias::lock_xadd) | test(=real16_alias::overlapping_locked_operands_and_a_plain_byte) | test(=real16_alias::xchg)))
+& not (binary_id(=x86jit-tests::locked_split_device) & (test(=locked_dword_over_ram_and_device_is_performed) | test(=locked_word_over_ram_and_device_is_performed) | test(=rom_piece_beside_a_device_is_read_and_its_write_dropped)))
+& not (binary_id(=x86jit-tests::mmio_rmw) & (test(=alu_reads_then_writes_once) | test(=inc_dec_not_neg_read_then_write_once) | test(=lock_forms_read_then_write_once_where_admitted) | test(=shifts_and_rotates_read_then_write_once) | test(=wide_forms_read_then_write_once_where_present) | test(=word_at_odd_address_reads_then_writes_once) | test(=word_at_segment_edge_wraps_or_faults_before_any_transfer) | test(=xchg_reads_then_writes_once)))
+& not (binary_id(=x86jit-tests::mmx) & (test(=mmx_all_forms_lift_and_differential)))
+& not (binary_id(=x86jit-tests::mt) & (test(=pthreads_counter_interp)))
+& not (binary_id(=x86jit-tests::mt_atomic_store_coherence) & (test(=plain_store_release_spinlock_excludes_interp) | test(=plain_store_release_spinlock_routed_interp)))
+& not (binary_id(=x86jit-tests::mxcsr_modes) & (test(=mxcsr_modes_arithmetic_all_tiers) | test(=mxcsr_modes_arithmetic_matches_native) | test(=mxcsr_modes_conversions_match_native) | test(=mxcsr_modes_restore_host_and_default_helpers_on_exits) | test(=mxcsr_modes_sse_matches_unicorn)))
+& not (binary_id(=x86jit-tests::region_fault_state) & (test(=region_guard_fault_recovers_gprs_and_flags) | test(=write_fault_adc) | test(=write_fault_add) | test(=write_fault_and) | test(=write_fault_btc_imm) | test(=write_fault_btc_reg) | test(=write_fault_btr_imm) | test(=write_fault_btr_reg) | test(=write_fault_bts_imm) | test(=write_fault_bts_reg) | test(=write_fault_dec) | test(=write_fault_inc) | test(=write_fault_lock_add) | test(=write_fault_neg) | test(=write_fault_not) | test(=write_fault_or) | test(=write_fault_rcl) | test(=write_fault_rcr) | test(=write_fault_rol) | test(=write_fault_ror) | test(=write_fault_sbb) | test(=write_fault_shl) | test(=write_fault_shld) | test(=write_fault_shrd) | test(=write_fault_sub) | test(=write_fault_xor)))
+& not (binary_id(=x86jit-tests::ss286) & (test(=corpus_runs)))
+& not (binary_id(=x86jit-tests::sse4a_adx) & (test(=adx_single_partial_flags_and_interleaved_chains)))
+& not (binary_id(=x86jit-tests::v3_memory_forms) & (test(=v3_memory_forms_exact_width_and_fault_atomicity) | test(=v3_memory_forms_match_register_and_jit)))
+& not (binary_id(=x86jit-tests::x87_forms) & (test(=binary_stack_underflow_precedes_nan_propagation) | test(=fcmov_all_conditions_and_classes) | test(=fcom_fucom_ftst_and_fxam_classes) | test(=fscale_truncates_and_preserves_extended_precision)))
+& not (binary_id(=x86jit-tests::x87_integer_store) & (test(=jit::integer_store_rounding_and_boundaries)))
+& not (binary_id(=x86jit-tests::x87_rest) & (test(=fist_nonpop_widths_rounding_invalid_and_empty) | test(=fnop_ffree_and_stack_pointer_rotations) | test(=frndint_exact_rounding_classes_and_precision_independence) | test(=fxtract_exact_components_and_special_values)))
+'''
+# END generated fast-tier filter

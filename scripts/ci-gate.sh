@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: bash scripts/ci-gate.sh {devshell|corpus|fmt|guard|clippy|deny|tests|release|build-tests|build-release|doctests|cross <target>}' >&2
+    echo 'Usage: bash scripts/ci-gate.sh {devshell|corpus|fmt|guard|clippy|deny|tests|ratchet|fast|heavy|release|build-tests|build-release|doctests|cross <target>}' >&2
     exit 2
 }
 
@@ -20,15 +20,20 @@ else
     [[ $# -eq 1 ]] || usage
 fi
 
+# The test tiers are nextest profiles in .config/nextest.toml
+# (backlog/docs/commands.md § Test tiers): tests is the full tier and writes the
+# JUnit report that ratchet checks, fast is the local hand-back gate, and heavy
+# runs fuzz_robustness and the ignored soaks.
+#
 # XJ_DEVSHELL selects a flake dev shell other than the default; the aarch64
 # Linux CI lane uses `no-freebsd` (flake.nix). `host` uses no Nix: the runner's
-# rustup with the toolchain version flake.nix pins. Only fmt takes it (guard and
-# corpus never enter the shell); the docs-only CI lane uses it to skip the Nix
-# install.
+# rustup with the toolchain version flake.nix pins. Only fmt takes it (guard,
+# corpus and ratchet never enter the shell); the docs-only CI lane uses it to skip
+# the Nix install.
 host_toolchain=
 if [[ "${XJ_DEVSHELL:-}" == host ]]; then
     case "$step" in
-        fmt | guard | corpus) ;;
+        fmt | guard | corpus | ratchet) ;;
         *) echo "ci-gate: $step needs the Nix dev shell, not XJ_DEVSHELL=host" >&2; exit 2 ;;
     esac
     host_toolchain=$(sed -n 's/.*rust-bin\.stable\."\([0-9][0-9.]*\)".*/\1/p' flake.nix | head -n 1)
@@ -56,8 +61,24 @@ case "$step" in
         export SS286_REQUIRED=1
         # nextest.toml serializes code-memory campaigns and reserves the global
         # test budget while each runs; the soak and 100,000-unit bound are ignored.
-        gate_command+=(cargo nextest run --locked --workspace --features x86jit-tests/unicorn
+        gate_command+=(cargo nextest run --profile ci --locked --workspace
+            --features x86jit-tests/unicorn
             --no-fail-fast --success-output final -E 'not binary(fuzz_robustness)')
+        ;;
+    # Reads the report of the tests step; needs no dev shell. nextest writes it
+    # under the workspace's target/nextest, also when CARGO_TARGET_DIR is set.
+    ratchet)
+        junit=target/nextest/ci/junit.xml
+        gate_command=(python3 -B scripts/test-tiers.py ratchet "$junit")
+        ;;
+    fast)
+        export SS286_REQUIRED=1
+        gate_command+=(cargo nextest run --profile fast --locked --workspace
+            --features x86jit-tests/unicorn --no-fail-fast)
+        ;;
+    heavy)
+        gate_command+=(cargo nextest run --profile heavy --run-ignored all --locked --workspace
+            --features x86jit-tests/unicorn --no-fail-fast --success-output final)
         ;;
     release)
         # Build only the binaries this gate runs: a nextest -E filter selects
@@ -91,5 +112,9 @@ mkdir -p "$log_dir"
 if [[ -n "$host_toolchain" && "$step" == fmt ]]; then
     rustup toolchain install "$host_toolchain" --profile minimal --component rustfmt \
         --no-self-update 2>&1 | tee "$log_dir/toolchain.log"
+fi
+# The report goes with the logs, so a slow-list update can start from it.
+if [[ "$step" == ratchet && -f "$junit" ]]; then
+    cp "$junit" "$log_dir/junit-tests.xml"
 fi
 "${gate_command[@]}" 2>&1 | tee "$log_dir/$log_name.log"

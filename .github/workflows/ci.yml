@@ -200,9 +200,16 @@ jobs:
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
         run: bash scripts/ci-gate.sh deny
 
+      # The full tier (backlog/docs/commands.md § Test tiers).
       - name: Tests (Unicorn, excluding fuzz_robustness)
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
         run: bash scripts/ci-gate.sh tests
+
+      # Fails when a fast-tier test ran over the bound or a slow-listed test is gone
+      # (scripts/test-tiers.py, .config/slow-tests.txt).
+      - name: Fast-tier ratchet
+        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
+        run: bash scripts/ci-gate.sh ratchet
 
       - name: Tests (release profile)
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
@@ -244,7 +251,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-logs-${{ matrix.arch }}
-          path: ci-logs/*.log
+          path: |
+            ci-logs/*.log
+            ci-logs/*.xml
           if-no-files-found: ignore
           retention-days: 7
 

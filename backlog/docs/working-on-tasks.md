@@ -86,9 +86,22 @@ bd close <id> --reason "<commit> — <what landed; doc/spec section changed>"   
 
 A bead closes only when all of these hold on `main`:
 
-1. `cargo nextest run --features unicorn -E 'not binary(fuzz_robustness)'` is green.
+1. The full test tier is green in CI on both Linux lanes, the fast-tier ratchet included:
+   every test except `fuzz_robustness`, and the release subset
+   ([`commands.md`](commands.md) § Test tiers).
 2. `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 3. `cargo fmt --check` is clean (the nix-pinned rustfmt).
+
+The test tiers, and where each runs:
+
+- **fast** (nextest profile `fast`: every test except `fuzz_robustness` and the slow list in
+  `.config/slow-tests.txt`) runs locally. The worker hands back after it passes, and the
+  supervisor runs it before a push: `bash scripts/test-scope.sh --run origin/main`, whose
+  shared and legacy-only scopes use it.
+- **full** (profile `ci`, plus the release subset) runs in CI on every `ci/*` push and before
+  `main`; the local full run is a debugging command, not a gate.
+- **heavy** (profile `heavy`: `fuzz_robustness` and the ignored soaks) runs off the path to
+  `main`.
 
 Plus, when the change warrants it: the same run on an aarch64 host for codegen, memory-ordering or
 host-specific changes (GitHub CI covers aarch64 Linux, not aarch64 macOS —

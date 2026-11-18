@@ -100,7 +100,7 @@ native Linux x86-64 and arm64 runners. `.config/nextest.toml` puts the stress,
 fault-stress and bound binaries plus isolated library campaigns in a group with
 `max-threads = 1`. Each selected test reserves `num-test-threads` globally, so
 other workspace tests cannot run alongside it. The soak and 100,000-unit bound
-remain ignored. The latter took 40.88 seconds alone on macOS arm64 in debug;
+remain ignored; the heavy tier runs them (§ Test tiers). The latter took 40.88 seconds alone on macOS arm64 in debug;
 normal gates retain the 512-unit bound.
 The library alias-relocation campaign is enabled only on Linux/FreeBSD and uses
 the real executable aliases, finalization and per-allocation retirement. FreeBSD
@@ -284,11 +284,54 @@ What it does:
 A campaign with cached bases takes two candidate builds and a few minutes of measuring; the
 timings are in `performance.md` § "Short campaign protocol".
 
+## Test tiers
+
+The test suite runs in three tiers, each a nextest profile in `.config/nextest.toml`.
+The overrides of the default profile (the code-memory group) apply to all three.
+
+| Tier | Profile | Contents | Runs where |
+| ---- | ------- | -------- | ---------- |
+| fast | `fast` | every test except `fuzz_robustness` and the slow list | locally: the worker before hand-back and the supervisor before a push (`scripts/test-scope.sh`, the Definition of Done) |
+| full | `ci` | every test except `fuzz_robustness`, with a JUnit report; plus the release subset | CI, on every push that runs the gate, both Linux lanes, before `main` |
+| heavy | `heavy` | `fuzz_robustness` and the ignored soaks (`dense_reclamation_soak`, the 100,000-unit bound) | off the path to `main`: by hand today, a scheduled workflow later |
+
+```sh
+bash scripts/ci-gate.sh fast      # the fast tier: cargo nextest run --profile fast ...
+bash scripts/ci-gate.sh tests     # the full tier, as CI runs it
+bash scripts/ci-gate.sh heavy     # the heavy tier: --profile heavy --run-ignored all
+cargo nextest run --profile fast -p x86jit-tests --test jit   # the profile takes any selection
+```
+
+The **slow list** is `.config/slow-tests.txt`: one test per line, `<binary-id> <test-name>`,
+with `only=<lane glob>` for a test that exists only on some lanes (`linux-x86_64`,
+`linux-aarch64`, `macos-aarch64`). A test enters it when it takes longer than 5 s on any
+lane. The fast profile's filter is generated from it; after editing the list, run
+`python3 -B scripts/test-tiers.py sync`, and the gate-script tests fail while the two
+differ.
+
+The **ratchet** keeps the fast tier honest in both directions. The CI step *Fast-tier
+ratchet* (`scripts/ci-gate.sh ratchet`) reads the full tier's JUnit report and fails when a
+test that the fast tier runs took more than 10 s, or when a listed test that applies to the
+lane is missing from the report. Tests between 5 s and 10 s are printed as candidates
+without failing: the gap absorbs the run-to-run variance of shared runners. The report is
+kept in the lane's log artifact as `junit-tests.xml`, the input for the next list update.
+A worker can check a local fast run the same way, timing only:
+
+```sh
+python3 -B scripts/test-tiers.py ratchet --tier fast target/nextest/fast/junit.xml   # also with CARGO_TARGET_DIR set
+```
+
+Every test of the full tier still runs before `main`, in CI on Linux x86-64 and aarch64; the
+slow list does not run on the developer's machine for every change. Darwin-specific slow
+tests are covered only by a local full run (`bash scripts/ci-gate.sh tests`) until a macOS
+lane exists.
+
 ## Test scope
 
 `scripts/test-scope.sh` chooses the smallest local command set that covers a branch's
 changes. It is meant for workers' inner loops and for the local gate before work is handed
-back. It does not replace CI: GitHub runs the full gate on every push except a docs-only one
+back; both scopes that run tests use the fast tier (§ Test tiers). It does not replace CI:
+GitHub runs the full gate, slow tests included, on every push except a docs-only one
 (§ Git remote and CI), which `--scope` identifies there.
 
 ```sh
@@ -307,8 +350,8 @@ path is docs, legacy or shared, and the widest class present selects exactly one
 | Scope | Selected when | Runs |
 | ----- | ------------- | ---- |
 | docs-only | every path is docs: under `backlog/` (except `backlog/docs/compat/`), a `*.md` or `*.txt` outside the crate, `scripts`, `vendor` and dot-config directories, or the `oracles` submodule. An empty diff runs nothing. | `cargo fmt --check`, the guest-agnostic guard and pre-commit on the changed files; no build |
-| legacy-only | every path is legacy or docs | fmt, the guard, clippy with `-D warnings`, `test_legacy_scope.py`, every test binary that selects Real16 or a CPU model (all `legacy_*` and `real16_*`, `ss286`, `cf16`, `compat` and others), the shared checks `boundary`, `environment_boundary`, `run_steps`, `irq_shadow`, `retired_count`, `smc`, `cross_region_*` and `application_codegen`, the `x86jit-core` and `x86jit-tests` unit tests, and `cargo check --workspace --tests` for both Linux targets |
-| shared | any other path | the full gate: every `scripts/ci-gate.sh` step that CI runs on either lane, both Linux cross-checks, the FreeBSD checks unless `XJ_DEVSHELL=no-freebsd`, and the gate-script tests |
+| legacy-only | every path is legacy or docs | fmt, the guard, clippy with `-D warnings`, `test_legacy_scope.py`, in the fast profile every test binary that selects Real16 or a CPU model (all `legacy_*` and `real16_*`, `ss286`, `cf16`, `compat` and others), the shared checks `boundary`, `environment_boundary`, `run_steps`, `irq_shadow`, `retired_count`, `smc`, `cross_region_*` and `application_codegen`, the `x86jit-core` and `x86jit-tests` unit tests, and `cargo check --workspace --tests` for both Linux targets |
+| shared | any other path | the fast tier: every `scripts/ci-gate.sh` step that CI runs on either lane, except that `fast` replaces the full tier (`tests`, `ratchet`, `release`); both Linux cross-checks, the FreeBSD checks unless `XJ_DEVSHELL=no-freebsd`, and the gate-script tests |
 
 The legacy paths are `interp/legacy.rs`, `interp/i8086.rs`, `lift/legacy.rs`,
 `lift/i8086.rs`, `vm/nec.rs`, `vm/i8086.rs` and `model.rs` under `x86jit-core/src/`, with
@@ -367,7 +410,8 @@ only on GitHub Actions, and the workflow publishes nothing.
     when the plan asks for the gate. Both install pinned Nix, restore the Nix store,
     and use the devShell from `flake.lock`. Each runs fmt, the guest-agnostic guard,
     clippy with all features and `-D warnings`, cargo-deny, the workspace nextest run
-    with Unicorn and without `fuzz_robustness`, the release subset, workspace doctests
+    with Unicorn and without `fuzz_robustness` (the full tier, nextest profile `ci`),
+    the fast-tier ratchet on its JUnit report (§ Test tiers), the release subset, workspace doctests
     with all features, and a workspace/test type-check for the opposite Linux
     architecture; the x86-64 job adds separate FreeBSD compile-check steps for both
     architectures. The release subset builds only the eight binaries it runs (`jit`,
@@ -390,7 +434,8 @@ only on GitHub Actions, and the workflow publishes nothing.
 
   GitHub supplies the job checks; this workflow posts no commit statuses of its own.
   Combined gate logs are retained as `ci-logs-x86_64` / `ci-logs-aarch64` (and
-  `ci-logs-plan` for the docs-only lane) artifacts for seven days. Installer and cache
+  `ci-logs-plan` for the docs-only lane) artifacts for seven days; the test lanes'
+  artifacts also hold the full tier's JUnit report, `junit-tests.xml`. Installer and cache
   diagnostics remain in the Actions job log.
   All actions are pinned to commit SHAs, checkout does not persist credentials, and
   the repository permissions are `contents: read` and `actions: read` (the plan's run

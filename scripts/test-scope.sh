@@ -13,14 +13,18 @@
 # as docs, legacy or shared, and the widest class present selects the scope:
 #   docs-only    every path is docs. An empty diff runs nothing.
 #   legacy-only  every path is legacy or docs.
-#   shared       anything else. This runs the full gate, the gates CI runs.
+#   shared       anything else. This runs the fast tier: every gate CI runs, with
+#                the fast nextest profile in place of the full test run and
+#                without the release subset, which only CI runs.
 # --run executes the commands and keeps going after a failure, as CI does; it
 # exits 1 if any command failed. --scope prints only the scope, or `none` for an
 # empty diff. --classify prints the class of each path and --plan prints a scope's
 # commands; none of the three runs anything.
-# The script shortens local loops. CI (scripts/ci-plan.py) uses --scope only to
-# stop a docs-only push after fmt, the guard and the script tests; any other scope
-# runs the full gate (backlog/docs/commands.md § Test scope).
+# The script shortens local loops; both test-running scopes use the fast nextest
+# profile, which skips the slow list (.config/slow-tests.txt). CI
+# (scripts/ci-plan.py) uses --scope only to stop a docs-only push after fmt, the
+# guard and the script tests; any other scope runs the full gate there, slow
+# tests included (backlog/docs/commands.md § Test scope, § Test tiers).
 set -euo pipefail
 
 usage() {
@@ -198,16 +202,17 @@ plan_legacy() {
     )
     add_corpus_fetch
     commands+=(
-        "SS286_REQUIRED=1 $shell_prefix cargo nextest run --locked --workspace --features x86jit-tests/unicorn --no-fail-fast$test_args"
-        "$shell_prefix cargo nextest run --locked -p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn --no-fail-fast --lib"
+        "SS286_REQUIRED=1 $shell_prefix cargo nextest run --profile fast --locked --workspace --features x86jit-tests/unicorn --no-fail-fast$test_args"
+        "$shell_prefix cargo nextest run --profile fast --locked -p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn --no-fail-fast --lib"
         'bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu'
         'bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu'
     )
 }
 
 plan_shared() {
-    # .github/workflows/ci.yml, both lanes. The aarch64 Linux lane has no
-    # FreeBSD std (flake.nix), so XJ_DEVSHELL=no-freebsd skips those checks.
+    # The gates of .github/workflows/ci.yml, both lanes, with the fast tier in
+    # place of the full tier (tests, ratchet, release). The aarch64 Linux lane
+    # has no FreeBSD std (flake.nix), so XJ_DEVSHELL=no-freebsd skips those checks.
     commands+=(
         "python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'"
     )
@@ -217,8 +222,7 @@ plan_shared() {
         'bash scripts/ci-gate.sh guard'
         'bash scripts/ci-gate.sh clippy'
         'bash scripts/ci-gate.sh deny'
-        'bash scripts/ci-gate.sh tests'
-        'bash scripts/ci-gate.sh release'
+        'bash scripts/ci-gate.sh fast'
         'bash scripts/ci-gate.sh doctests'
         'bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu'
         'bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu'
