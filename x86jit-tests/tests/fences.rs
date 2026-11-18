@@ -1,6 +1,7 @@
 //! SDM Vol 3A §11.2.3.4 permits the SB (0,0) outcome without a fence;
 //! Vol 2B §4.3 MFENCE forbids it with a full fence.
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_arch = "aarch64")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +12,10 @@ use x86jit_core::{
     VmConfig,
 };
 use x86jit_cranelift::JitBackend;
+
+#[path = "support/rendezvous.rs"]
+mod rendezvous;
+use rendezvous::{Rendezvous, STALL};
 
 const CODE: u64 = 0x1000;
 const X: u64 = 0x8000;
@@ -111,24 +116,6 @@ fn helper_stos_message_passing_jit_block_and_region() {
     );
 }
 
-#[derive(Default)]
-struct Rendezvous {
-    epoch: AtomicUsize,
-    done: [AtomicUsize; 2],
-    result: [AtomicU64; 2],
-    stop: AtomicBool,
-}
-
-fn wait_yield(spins: &mut u32) {
-    *spins += 1;
-    if *spins == 64 {
-        thread::yield_now();
-        *spins = 0;
-    } else {
-        std::hint::spin_loop();
-    }
-}
-
 fn race(tier: MemConsistency, mode: &str, helper_mp: bool) -> usize {
     let iters = if helper_mp { 200_000 } else { ITERS };
     let regions = mode == "regions";
@@ -171,7 +158,6 @@ fn race(tier: MemConsistency, mode: &str, helper_mp: bool) -> usize {
     }
     let vm = Arc::new(vm);
     let sync = Arc::new(Rendezvous::default());
-    let deadline = Instant::now() + Duration::from_secs(30);
     let handles: Vec<_> = (0..2)
         .map(|id| {
             let vm = vm.clone();
@@ -181,13 +167,8 @@ fn race(tier: MemConsistency, mode: &str, helper_mp: bool) -> usize {
                 cpu.set_reg(Reg::Rbx, if id == 0 { X } else { Y });
                 cpu.set_reg(Reg::Rdx, if id == 0 { Y } else { X });
                 for epoch in 1..=iters {
-                    let mut spins = 0;
-                    while sync.epoch.load(Ordering::Acquire) != epoch {
-                        if sync.stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                            sync.stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                        wait_yield(&mut spins);
+                    if !sync.wait_start(epoch) {
+                        return;
                     }
                     cpu.set_reg(Reg::Rip, CODE + id as u64 * 0x100);
                     cpu.set_reg(Reg::Rcx, 1);
@@ -200,49 +181,44 @@ fn race(tier: MemConsistency, mode: &str, helper_mp: bool) -> usize {
                     } else {
                         cpu.reg(Reg::Rax)
                     };
-                    sync.result[id].store(result, Ordering::Relaxed);
-                    sync.done[id].store(epoch, Ordering::Release);
+                    sync.finish(id, epoch, result);
                 }
             })
         })
         .collect();
     let mut relaxed = 0;
-    let mut completed = 0;
-    let mut timed_out = false;
-    for epoch in 1..=iters {
-        vm.mem.write(X, 0, 8).unwrap();
-        vm.mem.write(Y, 0, 8).unwrap();
-        sync.epoch.store(epoch, Ordering::Release);
-        let mut spins = 0;
-        while sync.done.iter().any(|d| d.load(Ordering::Acquire) != epoch) {
-            if Instant::now() >= deadline {
-                timed_out = true;
-                break;
-            }
-            wait_yield(&mut spins);
-        }
-        if timed_out {
-            break;
-        }
-        completed += 1;
-        relaxed += usize::from(if helper_mp {
-            sync.result[1].load(Ordering::Relaxed) == 1
-        } else {
-            sync.result.iter().all(|r| r.load(Ordering::Relaxed) == 0)
-        });
-    }
-    sync.stop.store(true, Ordering::Relaxed);
+    let start = Instant::now();
+    // A loaded host (the full suite or CI runs tests in parallel) slows the
+    // rendezvous; past the budget the sample ends early once a tenth of the
+    // trials ran, and only a stalled trial fails.
+    let outcome = sync.run(
+        iters,
+        iters / 10,
+        Duration::from_secs(30),
+        || {
+            vm.mem.write(X, 0, 8).unwrap();
+            vm.mem.write(Y, 0, 8).unwrap();
+        },
+        |result| {
+            relaxed += usize::from(if helper_mp {
+                result[1] == 1
+            } else {
+                result == [0, 0]
+            });
+        },
+    );
     for handle in handles {
         handle.join().unwrap();
     }
-    // A loaded host (the full suite or CI runs tests in parallel) can slow the
-    // rendezvous; the deadline then ends the sample early instead of failing, as
-    // long as enough trials ran to be meaningful.
-    assert!(
-        !timed_out || completed >= iters / 10,
-        "rendezvous timed out after {completed} trials: {tier:?}/{mode}, helper_mp={helper_mp}"
+    let completed = outcome.unwrap_or_else(|completed| {
+        panic!(
+            "rendezvous stalled for {STALL:?} after {completed} trials: {tier:?}/{mode}, helper_mp={helper_mp}"
+        )
+    });
+    eprintln!(
+        "helper_mp={helper_mp} {tier:?}/{mode}: {relaxed}/{completed} relaxed outcomes in {:?}",
+        start.elapsed()
     );
-    eprintln!("helper_mp={helper_mp} {tier:?}/{mode}: {relaxed}/{completed} relaxed outcomes");
     relaxed
 }
 

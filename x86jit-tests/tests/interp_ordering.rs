@@ -1,6 +1,5 @@
 //! Interpreter-only ordering witnesses for SDM Vol 3A §11.2.2.
 use iced_x86::code_asm::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,8 +9,14 @@ const CODE: u64 = 0x1000;
 const X: u64 = 0x8000;
 const Y: u64 = 0x8100;
 
-/// Fewest litmus trials a deadline-shortened run must still complete.
+#[path = "support/rendezvous.rs"]
+mod rendezvous;
+use rendezvous::{Rendezvous, STALL};
+
+/// Fewest litmus trials a budget-shortened run must still complete.
 const MIN_TRIALS: usize = 200;
+/// Time after which a run may end early once `MIN_TRIALS` completed.
+const BUDGET: Duration = Duration::from_secs(8);
 
 #[test]
 fn standalone_compiled_ram_store_replays_inside_mmio_window() {
@@ -88,24 +93,6 @@ fn program(writer: bool, helper_write: bool, sb: bool) -> Vec<u8> {
     a.assemble(CODE + if writer { 0 } else { 0x100 }).unwrap()
 }
 
-#[derive(Default)]
-struct Rendezvous {
-    epoch: AtomicUsize,
-    done: [AtomicUsize; 2],
-    result: [AtomicU64; 2],
-    stop: AtomicBool,
-}
-
-fn wait_yield(spins: &mut u32) {
-    *spins += 1;
-    if *spins == 64 {
-        thread::yield_now();
-        *spins = 0;
-    } else {
-        std::hint::spin_loop();
-    }
-}
-
 fn race(tier: MemConsistency, helper_write: bool, sb: bool) -> usize {
     const ITERS: usize = 20_000;
     let iters = ITERS;
@@ -132,7 +119,6 @@ fn race(tier: MemConsistency, helper_write: bool, sb: bool) -> usize {
     }
     let vm = Arc::new(vm);
     let sync = Arc::new(Rendezvous::default());
-    let deadline = Instant::now() + Duration::from_secs(8);
     let handles: Vec<_> = (0..2)
         .map(|id| {
             let vm = vm.clone();
@@ -142,13 +128,8 @@ fn race(tier: MemConsistency, helper_write: bool, sb: bool) -> usize {
                 cpu.set_reg(Reg::Rbx, if id == 0 { X } else { Y });
                 cpu.set_reg(Reg::Rdx, if id == 0 { Y } else { X });
                 for epoch in 1..=iters {
-                    let mut spins = 0;
-                    while sync.epoch.load(Ordering::Acquire) != epoch {
-                        if sync.stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                            sync.stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                        wait_yield(&mut spins);
+                    if !sync.wait_start(epoch) {
+                        return;
                     }
                     cpu.set_reg(Reg::Rip, CODE + id as u64 * 0x100);
                     cpu.set_reg(Reg::Rcx, 1);
@@ -161,50 +142,43 @@ fn race(tier: MemConsistency, helper_write: bool, sb: bool) -> usize {
                     } else {
                         cpu.reg(Reg::Rax)
                     };
-                    sync.result[id].store(result, Ordering::Relaxed);
-                    sync.done[id].store(epoch, Ordering::Release);
+                    sync.finish(id, epoch, result);
                 }
             })
         })
         .collect();
     let mut relaxed = 0;
-    let mut completed = 0;
-    let mut timed_out = false;
-    for epoch in 1..=iters {
-        vm.mem.write(X, 0, 8).unwrap();
-        vm.mem.write(Y, 0, 8).unwrap();
-        sync.epoch.store(epoch, Ordering::Release);
-        let mut spins = 0;
-        while sync.done.iter().any(|d| d.load(Ordering::Acquire) != epoch) {
-            if Instant::now() >= deadline {
-                timed_out = true;
-                break;
-            }
-            wait_yield(&mut spins);
-        }
-        if timed_out {
-            break;
-        }
-        completed += 1;
-        relaxed += usize::from(if !sb {
-            sync.result[1].load(Ordering::Relaxed) == 1
-        } else {
-            sync.result.iter().all(|r| r.load(Ordering::Relaxed) == 0)
-        });
-    }
-    sync.stop.store(true, Ordering::Relaxed);
+    let start = Instant::now();
+    // A loaded host (the full suite runs tests in parallel) slows the
+    // rendezvous; past the budget the sample ends early once MIN_TRIALS ran,
+    // and only a stalled trial fails.
+    let outcome = sync.run(
+        iters,
+        MIN_TRIALS,
+        BUDGET,
+        || {
+            vm.mem.write(X, 0, 8).unwrap();
+            vm.mem.write(Y, 0, 8).unwrap();
+        },
+        |result| {
+            relaxed += usize::from(if !sb {
+                result[1] == 1
+            } else {
+                result == [0, 0]
+            });
+        },
+    );
     for handle in handles {
         handle.join().unwrap();
     }
-    // A loaded host (the full suite runs tests in parallel) can make the
-    // rendezvous slow; the deadline then ends the sample early instead of
-    // failing, as long as enough trials ran to be meaningful.
-    assert!(
-        !timed_out || completed >= MIN_TRIALS,
-        "rendezvous timed out after {completed} trials: {tier:?}, helper_write={helper_write}, sb={sb}"
-    );
+    let completed = outcome.unwrap_or_else(|completed| {
+        panic!(
+            "rendezvous stalled for {STALL:?} after {completed} trials: {tier:?}, helper_write={helper_write}, sb={sb}"
+        )
+    });
     eprintln!(
-        "{tier:?}, helper_write={helper_write}, sb={sb}: {relaxed}/{completed} forbidden outcomes"
+        "{tier:?}, helper_write={helper_write}, sb={sb}: {relaxed}/{completed} forbidden outcomes in {:?}",
+        start.elapsed()
     );
     relaxed
 }
@@ -250,7 +224,6 @@ fn child_and_interpreter_message_passing() {
                 }
                 let view = vm.child_view(CpuMode::Long64);
                 let sync = Rendezvous::default();
-                let deadline = Instant::now() + Duration::from_secs(8);
                 thread::scope(|scope| {
                     let handles: Vec<_> = (0..2)
                         .map(|id| {
@@ -261,15 +234,8 @@ fn child_and_interpreter_message_passing() {
                                 let mut cpu = vm.new_vcpu();
                                 let mut arena = ChildArena::new(2);
                                 for epoch in 1..=ITERS {
-                                    let mut spins = 0;
-                                    while sync.epoch.load(Ordering::Acquire) != epoch {
-                                        if sync.stop.load(Ordering::Relaxed)
-                                            || Instant::now() >= deadline
-                                        {
-                                            sync.stop.store(true, Ordering::Relaxed);
-                                            return;
-                                        }
-                                        wait_yield(&mut spins);
+                                    if !sync.wait_start(epoch) {
+                                        return;
                                     }
                                     cpu.cpu.rip = CODE + id as u64 * 0x100;
                                     cpu.cpu.gpr[0] = 1;
@@ -287,49 +253,39 @@ fn child_and_interpreter_message_passing() {
                                     } else {
                                         assert!(matches!(cpu.run(vm, Some(8)), Exit::Hlt));
                                     }
-                                    sync.result[id].store(
+                                    sync.finish(
+                                        id,
+                                        epoch,
                                         u64::from(cpu.cpu.gpr[0] == 1 && cpu.cpu.gpr[1] == 0),
-                                        Ordering::Relaxed,
                                     );
-                                    sync.done[id].store(epoch, Ordering::Release);
                                 }
                             })
                         })
                         .collect();
                     let mut forbidden = 0;
-                    let mut completed = 0;
-                    let mut timed_out = false;
-                    for epoch in 1..=ITERS {
-                        vm.mem.write(X, 0, 8).unwrap();
-                        vm.mem.write(Y, 0, 8).unwrap();
-                        sync.epoch.store(epoch, Ordering::Release);
-                        let mut spins = 0;
-                        while sync
-                            .done
-                            .iter()
-                            .any(|done| done.load(Ordering::Acquire) != epoch)
-                        {
-                            if Instant::now() >= deadline {
-                                timed_out = true;
-                                break;
-                            }
-                            wait_yield(&mut spins);
-                        }
-                        if timed_out {
-                            break;
-                        }
-                        completed += 1;
-                        forbidden += sync.result[1].load(Ordering::Relaxed);
-                    }
-                    sync.stop.store(true, Ordering::Relaxed);
+                    let start = Instant::now();
+                    let outcome = sync.run(
+                        ITERS,
+                        MIN_TRIALS,
+                        BUDGET,
+                        || {
+                            vm.mem.write(X, 0, 8).unwrap();
+                            vm.mem.write(Y, 0, 8).unwrap();
+                        },
+                        |result| forbidden += result[1],
+                    );
                     for handle in handles {
                         handle.join().unwrap();
                     }
-                    assert!(
-                        !timed_out || completed >= MIN_TRIALS,
-                        "child MP rendezvous timed out after {completed} trials: {tier:?}, helper={helper_write}, child_writer={child_writer}"
+                    let completed = outcome.unwrap_or_else(|completed| {
+                        panic!(
+                            "child MP rendezvous stalled for {STALL:?} after {completed} trials: {tier:?}, helper={helper_write}, child_writer={child_writer}"
+                        )
+                    });
+                    eprintln!(
+                        "{tier:?}, helper={helper_write}, child_writer={child_writer}: {forbidden}/{completed} forbidden outcomes in {:?}",
+                        start.elapsed()
                     );
-                    eprintln!("{tier:?}, helper={helper_write}, child_writer={child_writer}: {forbidden}/{completed} forbidden outcomes");
                     assert_eq!(forbidden, 0);
                 });
             }
