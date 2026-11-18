@@ -204,6 +204,86 @@ git add bench/baseline.json backlog/docs/performance.md bench/history/
 The gate skips when there's no baseline (fresh clone) or the host differs (timings aren't comparable
 across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ vs the prior baseline.
 
+### Performance campaign (decision-23)
+
+`scripts/perf-campaign.sh` measures the decision-23 performance requirement: host instructions
+per guest step of `real16_loops` on all 16 workloads × 9 paths, and the counted store probe,
+base against candidate, in two build profiles, and gives the two-profile verdict. Run it in
+the dev shell at default QoS; it lowers only its builds.
+
+```sh
+nix develop --command scripts/perf-campaign.sh origin/main          # candidate = this working tree
+nix develop --command scripts/perf-campaign.sh cf32ec2e f14e9d1c    # two commits
+scripts/perf-campaign.sh --profile perf BASE CAND                   # one profile only, for exploration
+scripts/perf-campaign.sh --profile release --processes 10 BASE CAND # the shipped profile, 10 processes
+scripts/perf-campaign.sh --build-only BASE                          # fill the cache only
+python3 scripts/perf_campaign.py analyze <out>/perf/raw             # analyse kept raw data again
+python3 scripts/perf_campaign.py combine release=<out>/release/analysis.json perf=<out>/perf/analysis.json
+```
+
+What it does:
+
+- **Profiles.** By default (`--profiles release,perf`) both sides are built and measured in the
+  default release profile and in the `perf` profile, all builds first, then one profile's
+  measuring after the other. `--profile NAME` runs one profile alone; its verdict is that
+  profile's own.
+- **Builds** each side and profile with `cargo build --locked --profile <profile> -p x86jit-bench
+  --example real16_loops --example interpreter_store_probe`, one at a time, under `taskpolicy -c background`
+  (`nice` elsewhere), `CARGO_BUILD_JOBS=4`, `RUSTC_WRAPPER=` and `CARGO_INCREMENTAL=0`. A commit
+  is built from `git archive`; a working tree from a copy of its tracked and untracked, not
+  ignored, files. A clean working tree counts as its HEAD commit.
+- **Caches** the binaries of every commit under `<cache>/bin/<commit>-<profile>-<toolchain>`, so
+  a `main` commit used as the base is built once. The cache is `--cache DIR`, else
+  `$X86JIT_PERF_CACHE`, else `$TMPDIR/x86jit-perf-cache`; it also holds the shared target
+  directory (dependencies are reused) and a lock that serialises builds. Working-tree binaries
+  are not cached; they are kept in the run directory.
+- **The `perf` profile** (workspace `Cargo.toml`) is release with `codegen-units = 1` for
+  `x86jit-core` and `x86jit-bench`. A commit from before the profile gets the same profile on the
+  cargo command line. Base binaries are cached per profile.
+- **The store probe** is the bench example `interpreter_store_probe`, which prints host
+  instructions per store on macOS as its sixth column; nothing is patched into the tree. For a
+  commit from before that column, the script builds this checkout's copy of the example in its
+  place and records that in the binaries' `meta.txt`.
+- **Measures** with address-space randomization off for every process: on macOS through
+  `posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR`, on Linux through `setarch -R`. Each process runs
+  one workload, three rounds over all paths (`real16_loops DIVISOR 3 WORKLOAD`), and reports
+  the median of its rounds; `straight-line` runs seven rounds, because its measured run is short
+  (about 90000 steps) and one perturbed round moves it by 1–5 %. Three processes
+  per cell and side by default (`--processes`, 3–5), four processes at once (`--parallel`), the two
+  sides interleaved and alternating order. The store probe runs its 8 cells (width 8 and 32, single
+  and crossing, recovery off and on) with 200000 iterations, the same number of processes.
+- **Divisors.** Each workload's step count and warm-up are divided by 8, except `straight-line`,
+  which runs at 1: its run grows with the divisor (one warm-up and three measured passes per
+  unit). Each divisor was validated against divisor 1 on one binary with
+  `python3 scripts/perf_campaign.py validate-divisors --bin DIR --out DIR`, which runs every
+  workload at divisor 1 and at each candidate divisor and reports, per workload, the largest
+  change of a path's median of processes; a divisor is kept when that change stays within the
+  process-to-process spread. The replays in `performance.md` § "Short campaign protocol" check
+  the deltas, not only the values, against recorded campaigns at divisor 1.
+- **Reports**, per profile in `<out>/<profile>/`: `report.txt` (the per-cell change table, the
+  path means, the store probe, the spread within a side, cells with two modes and the profile's
+  own verdict), `analysis.json`, `cells.csv` and the raw per-process files in `raw/`; and in
+  `<out>/` the two-profile verdict, `combined.txt` and `combined.json`. `--out DIR` defaults to
+  `<cache>/runs/<time>-<base>-<cand>`.
+  A cell's value is the median over processes of each process's in-run value; the path mean is
+  the geometric mean of a path's cells on each side.
+- **Gate, per profile:** a cell or store-probe cell is over when its change exceeds +0.5 %
+  (`--gate`). The step, retired-instruction and warm-up counts must be equal across all
+  processes of both sides. The bimodal rule of decision-23 is the fallback, applied within each
+  profile before the combination: a cell in which a side's values still form two modes is
+  compared on like modes, and its workload is topped up to seven processes per side.
+- **Gate, two profiles:** a cell **blocks** only when it is over in both the release and the
+  `perf` profile. A cell over in one profile only is **drift**: the report lists it with the
+  profile it is over in and both changes, and it does not block. The store probe follows the same
+  rule.
+- **Exit status:** 0 pass, 1 block, 2 a usage, build or measuring problem (a failed process,
+  unequal counts, a zero counter, a cell missing in one profile), 3 drift only. With
+  `--profile NAME`: 0 pass, 1 a cell over, 2 a problem. The instruction counter exists on macOS
+  only; on Linux the script runs but reports a problem.
+
+A campaign with cached bases takes two candidate builds and a few minutes of measuring; the
+timings are in `performance.md` § "Short campaign protocol".
+
 ## Test scope
 
 `scripts/test-scope.sh` chooses the smallest local command set that covers a branch's

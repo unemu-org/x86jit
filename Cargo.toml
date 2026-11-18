@@ -54,3 +54,16 @@ x86jit-core = { path = "x86jit-core", version = "0.3.0" }
 x86jit-cranelift = { path = "x86jit-cranelift", version = "0.3.0" }
 x86jit-elf = { path = "x86jit-elf", version = "0.3.0" }
 x86jit-tests = { path = "x86jit-tests", version = "0.3.0" }
+
+# The measurement profile of `scripts/perf-campaign.sh` (decision-23 performance
+# requirement). It is release with one codegen unit for the core and the bench, so
+# that a change in one function does not move unrelated code between codegen
+# units and shift the layout of hot paths it does not touch. Not for shipping.
+[profile.perf]
+inherits = "release"
+
+[profile.perf.package.x86jit-core]
+codegen-units = 1
+
+[profile.perf.package.x86jit-bench]
+codegen-units = 1

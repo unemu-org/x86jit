@@ -3729,3 +3729,198 @@ maintainer accepted the result first and stopped the attribution.
   ip-boundary-64 +0.42 %): the dispatch loop's per-block bus-mask select. The
   final tree computes it once per call. A layout variant with the fetch loop
   out of line measured worse (smc-rmw-64 +0.62 %) and was dropped.
+
+## Short campaign protocol (xj-193.6, xj-193.9)
+
+`scripts/perf-campaign.sh` (commands.md, "Performance campaign") replaces the per-campaign
+scripts of the earlier sections. This section records how its protocol was validated: the
+divisors, the replays of recorded campaigns in the default release profile, and the same
+landings in the `perf` profile (release with one codegen unit for `x86jit-core` and
+`x86jit-bench`). Host: the Apple-silicon workstation of the earlier sections, loaded by other
+work (load average 10–12) throughout. Builds ran under background QoS with
+`CARGO_BUILD_JOBS=4`; measuring at default QoS, four processes at once.
+
+### Randomization off — MEASURED
+
+A process started through `posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR` maps its images at the
+same address on every start (a probe process started twice each way: the same address twice with
+the attribute, two different addresses without it). The earlier sections' two modes per process in the SMC and `straight-line`
+cells came from randomization (turnaround analysis of 2026-11-18, 10 of 10 runs in one mode).
+
+### Divisors — MEASURED
+
+`python3 scripts/perf_campaign.py validate-divisors` on the `perf` binary of `019a8517`, three
+processes per workload and divisor, randomization off. Largest change of a path's median of
+processes against divisor 1, in %:
+
+| Workload | /4 | /8 | /16 |
+|---|---:|---:|---:|
+| `alu` | 0.018 | 0.020 | 0.021 |
+| `load` | 0.032 | 0.038 | 0.047 |
+| `load-odd` | 0.009 | 0.016 | 0.026 |
+| `store` | 0.035 | 0.032 | 0.029 |
+| `push-pop` | 0.010 | 0.037 | 0.039 |
+| `data-next-to-code` | 0.014 | 0.033 | 0.032 |
+| `data-next-to-dense-code` | 0.018 | 0.035 | 0.021 |
+| `call-ret` | 0.039 | 0.029 | 0.026 |
+| `dos-mixed` | 0.020 | 0.057 | 0.131 |
+| `rep-movsw` | 0.021 | 0.020 | 0.023 |
+| `straight-line` | 0.147 | 0.115 | 0.034 |
+| `ip-boundary-1` | 0.031 | 0.033 | 0.042 |
+| `ip-boundary-64` | 0.011 | 0.041 | 0.108 |
+| `smc-next-1` | 0.024 | 0.025 | 0.019 |
+| `smc-next-64` | 0.024 | 0.057 | 0.022 |
+| `smc-rmw-64` | 0.023 | 0.020 | 0.034 |
+
+`straight-line` grows with the divisor instead of shrinking (one warm-up and three measured
+passes per unit), so it keeps divisor 1, the length every earlier campaign measured. Every
+other workload runs at divisor 8: at most 0.057 % from divisor 1, inside the process-to-process
+spread of the earlier campaigns (p50 0.07 %). Divisor 16 moves `dos-mixed` and `ip-boundary-64`
+by 0.13 % and 0.11 % and is not used. The validation run (divisors 1, 4, 8 and 16, three
+processes each) took 4 min 55 s; the campaign itself does not run divisor 1.
+
+### Replays in the default release profile — MEASURED
+
+Each landing rebuilt from git in the default release profile and measured with the campaign at
+ten processes per cell and side (`--profile release --processes 10`), against the recorded
+campaign's raw data at divisor 1 with randomization on. The rebuilt `real16_loops` binaries are
+byte-identical to the recorded ones (sha256 prefixes `039fea23` add161a9, `d54107c0` b2089624,
+`87a487b4` cf32ec2e, `8183882d` f14e9d1c, `b968a839` 8e5bc441, `e2c80c52` 6a3c2a3f), so the
+replays differ from the records in protocol only. "Δ difference" compares each cell's change
+with the record's: the median-of-processes change, or, on a recorded two-mode cell, the like-mode
+pair of the lower base mode.
+
+| Landing | Record: cells over | Replay: cells over | Same cells? | Δ difference, pp: p50 / p90 / max | Cells > 0.25 pp | Two-mode cells in 10 processes | Measuring |
+|---|---:|---:|---|---|---:|---:|---:|
+| xj-50w.23 (cf32ec2e → f14e9d1c) | 4 | 4 | yes | 0.017 / 0.047 / 0.225 | 0 | 0 | 220 s |
+| xj-50w.23 against pre-NMI (8e5bc441 → f14e9d1c) | 14 | 12 | the record's 2 alias SMC cells are not over | 0.019 / 0.076 / 0.210 | 0 | 0 | 283 s |
+| xj-0w3.8 (add161a9 → b2089624) | 1 | 0 | `smc-rmw-64` alias: +0.540 % recorded, +0.445 % replayed | 0.050 / 0.183 / 0.703 | 13 | 0 | 212 s |
+| xj-0w3.8 + LOADALL (add161a9 → cf32ec2e) | 0 | 0 | yes | 0.019 / 0.051 / 0.140 | 0 | 0 | 189 s |
+| xj-50w.20 (019a8517 → 6a3c2a3f) | 0 | 0 | yes | 0.022 / 0.125 / 0.250 | 1 (`straight-line` I8088, 0.25 pp, two modes in the record) | 0 | 177 s |
+| NMI (8e5bc441 → d6028809) | 56 (amendment) | 57 | blocks, as recorded | — (no raw record) | — | 1 | 237 s |
+
+- **xj-50w.23 and the 2026-11-17 integration** meet the acceptance: the same cells over the gate,
+  every cell within 0.25 pp of the record, no cell with two modes in ten processes.
+- **Against 8e5bc441** every cell is within 0.21 pp. The two cells the record has over and the
+  replay does not are the alias `smc-next-64` and `smc-rmw-64`: +0.69 % and +0.53 % recorded,
+  +0.48 % and +0.44 % replayed, 0.21 and 0.09 pp apart. A hard threshold flips such cells in
+  either protocol.
+- **xj-0w3.8 does not meet the 0.25 pp bound** on 13 cells: twelve SMC cells of the twenty-bit
+  paths (+0.21..+0.36 % replayed against −0.36..+0.01 % recorded) and one `straight-line` cell.
+  In that record those cells spread 0.3–0.6 % within a side over 7 processes without splitting
+  into two modes, so their recorded medians sit anywhere in that range; the replay measures one
+  fixed layout. Its one recorded miss is +0.445 % in the replay, under the gate.
+- **NMI still blocks**, with 57 cells over (call-ret +1.51..+1.87 %, ip-boundary-64
+  +1.25..+1.41 %). One cell of 144 had two modes in ten processes: `ip-boundary-64` on the V20,
+  where one candidate process measured +0.55 % above the other nine in all three of its rounds. So
+  a per-process mode can still occur with randomization off, rarely; the bimodal fallback covers it.
+- `straight-line` ran seven rounds per process in these replays (commands.md). A first
+  xj-50w.23 replay with three rounds had four `straight-line` cells with two modes in ten
+  processes, at the same verdict and every cell still within 0.23 pp of the record; see "Two
+  modes" below for the cause.
+- Ten processes per side take 3–5 min; the default three take about 1 min.
+
+### The same landings in the `perf` profile — MEASURED
+
+Each landing rebuilt from git in the `perf` profile and measured with the campaign's defaults:
+three processes per cell and side, divisor 8 (`straight-line` 1, seven rounds), randomization
+off. "Record" is the recorded campaign in the default profile, re-analysed with
+`perf_campaign.py analyze` (it reproduces each record's verdict and miss list). Path means are
+the change of the geometric mean of a path's 16 cells; the twenty-bit paths are the I8088, I8086,
+V20 and V30, the 80286/80386 paths the four `legacy-*` paths.
+
+| Landing | Base → candidate | Record: cells over +0.5 % | `perf`: cells over +0.5 % | Path means: alias / twenty-bit / 80286-80386 | Measuring |
+|---|---|---:|---:|---|---:|
+| xj-50w.23 | cf32ec2e → f14e9d1c | 4 | **0** | +0.03 / −0.93..−0.95 / −0.22 % | 59 s |
+| xj-50w.23 against pre-NMI | 8e5bc441 → f14e9d1c | 14 | 18 | −0.38 / −0.98..−1.00 / +0.40..+0.41 % | 60 s |
+| xj-0w3.8 | add161a9 → b2089624 | 1 | **0** | −0.00 / −0.10..−0.11 / +0.01..+0.02 % | 75 s |
+| xj-0w3.8 + LOADALL (2026-11-17) | add161a9 → cf32ec2e | 0 | 0 | −0.04 / −0.11 / −0.00..+0.01 % | 61 s |
+| xj-50w.20 | 019a8517 → 6a3c2a3f | 0 | **6** | −0.05 / +0.34..+0.35 / +0.00..+0.01 % | 58 s |
+| NMI (with xj-50w.22) | 8e5bc441 → d6028809 | 56 (amendment) | 45 | −0.42 / −0.04..−0.08 / +0.59..+0.61 % | 73 s |
+
+- **Layout misses go away.** The four `ip-boundary-1` misses of xj-50w.23 (+0.53..+0.63 % in the
+  record) are +0.24..+0.30 % in the `perf` profile, and the `smc-rmw-64` alias miss of xj-0w3.8
+  (+0.54 %) is +0.01 %. With the C4a replay of the turnaround analysis (8 misses → 0), that is
+  three landings whose misses were all layout.
+- **Real regressions still block.** NMI misses on 45 cells, led by `call-ret` +1.89..+2.01 % and
+  `ip-boundary-64` +1.45..+1.55 % on the 80286/80386 paths, and its 80286/80386 path means are
+  +0.59..+0.61 %. Against 8e5bc441, xj-50w.23's main still misses on 18 cells: the part of the
+  NMI cost that xj-50w.23 did not recover (`call-ret` +1.40..+1.43 % on the 80286/80386 paths).
+- **One miss the `perf` profile adds.** xj-50w.20 (device words on the 16-bit bus) makes
+  `rep-movsw` on the four twenty-bit paths +2.73..+2.74 % in the `perf` profile: 329.2 → 338.2 host
+  instructions per step on the I8088. The two other misses are `smc-next-64` on the I8086 and V30
+  at +0.50..+0.52 %; the other twenty-bit cells move −0.07..+0.49 %, and the twenty-bit path means
+  +0.34..+0.35 %. In the default profile the same cell is 360.2 on both sides (+0.004 %, ten
+  processes). So the one-unit build makes this loop about 9 % cheaper than the default build, and
+  xj-50w.20 gives back nearly a third of that advantage; it is a codegen effect of the `perf` profile, not
+  a cost the default build pays. A one-unit build has layout and inlining effects of its own; it
+  has fewer, not none.
+- **Repeatability.** Each landing was measured twice in the `perf` profile, the first time with
+  three rounds for `straight-line` as well. Outside `straight-line`, the two runs' cell deltas
+  differ by p50 0.009–0.023, p90 0.033–0.076 and at most 0.225 percentage points. Cells within
+  about 0.05 % of the gate change sides between such runs (xj-50w.20's `smc-next-64` misses moved
+  from the I8088 to the I8086 and V30).
+- **Two modes.** With three rounds, `straight-line` showed one or two "two-mode" cells in 3 of 6
+  replays: single processes 0.5–1.8 % off. The per-round samples show the cause: one or two of a
+  process's three rounds perturbed by 1–5 %, which a median of three does not reject. Its
+  measured run is about 90000 guest steps, against millions for the other workloads. With seven
+  rounds, no cell of any replay shows two modes. The bimodal fallback stays for the case it
+  recurs.
+- **Measuring took 58–75 s** per two-sided campaign, store probe included, on the loaded machine.
+
+### Replays through the two-profile rule — MEASURED
+
+The maintainer's gate: a cell, or a store-probe cell, blocks only when it is over +0.5 % in both
+the release and the `perf` profile; over in one profile only, it is drift and does not block.
+No new measuring: `perf_campaign.py combine` on the two tables above, the release replay at ten
+processes and the `perf` replay at three (seven rounds for `straight-line`). No store-probe cell
+is over in any profile of any landing.
+
+| Landing | Release over | `perf` over | Block | Drift | Verdict (exit) |
+|---|---:|---:|---:|---:|---|
+| xj-50w.23 (cf32ec2e → f14e9d1c) | 4 | 0 | 0 | 4 | DRIFT (3) |
+| xj-50w.23 against pre-NMI (8e5bc441 → f14e9d1c) | 12 | 18 | 7 | 16 | BLOCK (1) |
+| xj-0w3.8 (add161a9 → b2089624) | 0 | 0 | 0 | 0 | PASS (0) |
+| xj-0w3.8 + LOADALL (add161a9 → cf32ec2e) | 0 | 0 | 0 | 0 | PASS (0) |
+| xj-50w.20 (019a8517 → 6a3c2a3f) | 0 | 6 | 0 | 6 | DRIFT (3) |
+| NMI (8e5bc441 → d6028809) | 57 | 45 | 37 | 28 | BLOCK (1) |
+
+- **xj-50w.23:** drift on the four 80286/80386 `ip-boundary-1` cells, release +0.57..+0.61 %,
+  `perf` +0.24..+0.30 %. It does not block.
+- **xj-50w.20:** drift on `rep-movsw` on the twenty-bit paths (`perf` +2.73..+2.74 %, release
+  −0.00..+0.00 %) and on `smc-next-64` on the I8086 and V30 (`perf` +0.50..+0.52 %). It does not
+  block.
+- **xj-0w3.8** passes in both profiles.
+- **NMI blocks** on 37 cells over in both: `call-ret` on all 8 Machine paths (release
+  +1.51..+1.87 %, `perf` +0.80..+2.01 %), `ip-boundary-64` on all 8, `ip-boundary-1` on the four
+  twenty-bit paths, and `store`, `load`, `load-odd` and `smc-next-64` on the 80286/80386 paths.
+- **Against 8e5bc441**, main at f14e9d1c blocks on `ip-boundary-1` on seven Machine paths
+  (release +0.83..+1.22 %, `perf` +0.53..+0.86 %). The profiles disagree elsewhere: `call-ret` on
+  the 80286/80386 paths is +1.40..+1.43 % in `perf` and +0.04..+0.08 % in release, and
+  `rep-movsw` on the twenty-bit paths +0.54..+0.57 % in release and about 0 in `perf`. Single
+  cells move with the build configuration in both directions; the rule keeps what both see.
+
+### Timing and a null comparison — MEASURED
+
+- **A campaign with a cached base:** `scripts/perf-campaign.sh 6a3c2a3f <this working tree>`,
+  base binaries in the cache, the dependencies already built in the cache's target directory:
+  948 s end to end, of which 889 s is the candidate's `perf` build (background QoS,
+  `CARGO_BUILD_JOBS=4`, load average about 10, with two ten-process replays of this section
+  measuring alongside for part of it) and 57 s is measuring. That is 48 s over the 15 min aimed
+  for; the build is 94 % of it.
+- **A two-profile campaign with cached bases** (the default since the two-profile rule):
+  `scripts/perf-campaign.sh 6a3c2a3f <this working tree>`, both profiles' base binaries in the
+  cache. Two runs: 1333 s (release build 533 s, `perf` build 703 s, measuring 47 s + 49 s; the
+  cache's target directory had been deleted, so both builds also compiled the dependencies) and
+  1734 s (646 s and 965 s, measuring 58 s + 63 s; dependencies cached, load average 14–15 from
+  other work). The two candidate builds are 93 % of the wall time; measuring both profiles
+  takes about 2 min. Both runs: PASS in both profiles, and the candidate's binaries are
+  byte-identical to `6a3c2a3f`'s in each profile.
+- **Builds of one side** in this section: `perf` 659–889 s (the first, with all dependencies,
+  794 s), default release 498–620 s; the one-unit profile costs about 20–40 % more build time.
+- **Measuring:** 48–75 s for the default three processes per side, 189–283 s for ten.
+- **A null comparison:** the working tree's `real16_loops` is byte-identical to the one of
+  `6a3c2a3f` built with the profile given on the cargo command line, so the profile in
+  `Cargo.toml` and the script's fallback for older commits are the same profile. Measured against
+  itself in that campaign, the cells change by −0.134..+0.088 %, the path means by at most
+  ±0.013 %, the spread within a side is p50 0.054 %, max 0.231 %, and the verdict is PASS.

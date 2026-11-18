@@ -1024,6 +1024,46 @@ Against 019a8517, every real16_loops cell is within +0.5 %:
 - the worst like-mode pair of the 12 bimodal cells is +0.27 %;
 - the store probe is within ±0.02 %.
 
+**Amendment (measurement protocol and two-profile gate, 2026-11-18, accepted by the maintainer).**
+The gate of this requirement is measured with the committed campaign, `scripts/perf-campaign.sh`
+(commands.md, "Performance campaign"), in two build profiles: the default release profile and the
+`perf` profile, which is release with one codegen unit for `x86jit-core` and `x86jit-bench`.
+- Threshold: +0.5 % per real16_loops cell and per store-probe cell, unchanged.
+- Rule: a cell blocks only when it is over +0.5 % in both profiles. A cell over in one profile only
+  is drift: the campaign lists it with the profile and both changes, and it does not block. The
+  store probe follows the same rule. Exit status: 0 pass, 1 block, 2 problem, 3 drift only.
+- Build: base and candidate in both profiles. A base is a commit of `main`, built once per profile
+  and kept by commit hash.
+- Processes: every benchmark process starts with address-space randomization off (macOS
+  `posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR`; Linux `setarch -R`). Three processes per cell and
+  side, four at once, at default QoS, the sides interleaved. A process runs one workload: three
+  rounds over all paths (`straight-line`: seven) and reports the median of its rounds.
+- Divisors: step counts divided by 8; `straight-line` by 1. Each validated against divisor 1
+  (performance.md, "Short campaign protocol").
+- Cell value: the median over processes. Step, retired and warm-up counts must agree across all
+  processes of both sides.
+- Bimodal fallback: the "gate on bimodal cells" amendment stays in force within each profile,
+  before the combination. A cell that still shows two modes is compared on like modes with at
+  least seven processes per side, which the script runs itself.
+- Reported, not gated: the path means, the geometric mean of a path's 16 cells on each side, per
+  profile.
+- The store probe is the bench example `interpreter_store_probe`, which prints host instructions
+  per store.
+Why two profiles: a single cell moves with the build configuration. The release profile moves
+cells a change does not touch through its codegen-unit partition; the one-unit profile has
+inlining effects of its own (xj-50w.20's `rep-movsw`: +2.7 % in `perf`, +0.004 % in release).
+A real regression shows in both.
+Evidence (performance.md, "Short campaign protocol"): rebuilt from git, the release binaries of
+four recorded landings are byte-identical to the recorded ones; replayed at ten processes,
+xj-50w.23 and the 2026-11-17 integration show the same cells over the gate and every cell within
+0.25 pp of the record. Through the two-profile rule: NMI blocks on 37 cells; xj-50w.23 (4 cells)
+and xj-50w.20 (6 cells) are drift; xj-0w3.8 and the integration pass.
+
+The first landings measured this way, xj-srh.9 L1 (b4e64dff) and L2, pass in the `perf` profile
+and show drift only in release, on data-next-to-code and data-next-to-dense-code, which run none
+of their code. Release drift on those cells accumulates across landings. The pinned-reference
+trend of bead xj-193.8 is the instrument for it; step two of the plan sets that rule.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and

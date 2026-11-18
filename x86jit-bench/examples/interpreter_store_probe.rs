@@ -1,9 +1,40 @@
 //! Store-heavy interpreter timing. Arguments: WIDTH single|crossing off|on ITERATIONS.
 //! Build identical copies against both revisions and interleave process runs.
-//! Reports ns per guest store, including interpreter dispatch and loop overhead.
+//! Reports ns per guest store, including interpreter dispatch and loop overhead,
+//! and, on macOS, proc_pid_rusage host instructions per guest store around the
+//! measured run (zero elsewhere). Output:
+//! width,placement,recovery,stores,ns_per_store,instructions_per_store
+//! `scripts/perf-campaign.sh` runs it as the counted store probe.
 use iced_x86::code_asm::*;
 use std::time::Instant;
 use x86jit_core::{Exit, InterpreterBackend, Prot, Reg, RegionKind, Vm, VmConfig};
+
+#[cfg(target_os = "macos")]
+fn instructions() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: flavor V4 writes exactly rusage_info_v4; the buffer is only read
+    // after success. libproc takes the buffer address through rusage_info_t*.
+    unsafe {
+        assert_eq!(
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                usage.as_mut_ptr().cast()
+            ),
+            0,
+            "proc_pid_rusage: {}",
+            std::io::Error::last_os_error()
+        );
+        let count = usage.assume_init().ri_instructions;
+        assert_ne!(count, 0, "host instruction counter unavailable");
+        count
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn instructions() -> u64 {
+    0
+}
 
 #[cfg(unix)]
 fn host_page_size() -> usize {
@@ -68,9 +99,11 @@ fn main() {
     cpu.set_reg(Reg::Rip, 0x1000);
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     cpu.set_reg(Reg::Rip, 0x1000);
+    let before = instructions();
     let start = Instant::now();
     assert!(matches!(cpu.run(&vm, None), Exit::Hlt));
     let elapsed = start.elapsed();
+    let host_instructions = instructions() - before;
     assert_eq!(
         vm.mem.read(address as u64, 8).unwrap(),
         0x3535_3535_3535_3535
@@ -81,9 +114,10 @@ fn main() {
     );
     let stores = u64::from(iterations) * 16;
     println!(
-        "{width},{},{},{stores},{:.3}",
+        "{width},{},{},{stores},{:.3},{:.3}",
         args[1],
         args[2],
-        elapsed.as_nanos() as f64 / stores as f64
+        elapsed.as_nanos() as f64 / stores as f64,
+        host_instructions as f64 / stores as f64
     );
 }
