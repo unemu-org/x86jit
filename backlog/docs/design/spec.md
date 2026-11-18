@@ -2067,7 +2067,8 @@ last byte of their operand (App. B p. B-65; DERIVED). p. 2's protected-mode
 MSW "must have a one in bit position 0" states its own outcome, so it is not
 checked either. Beyond the document, the engine refuses what it cannot
 execute as the 80286 would: in protected mode a data CS, since it fetches only
-through code, and a CS DPL of 1-3, since the Machine runs only at CPL 0; in
+through code, and a CS DPL of 1-3, which stays refused although CPL 1-3
+now executes (xj-srh.9, decision O12); in
 real mode an expand-down SS, DS or ES, since real-mode access checks every
 limit as expand-up; and a valid DS or ES with a system type. An invalid CS or
 SS stays refused (`UnusableCodeOrStack`). A conforming CS has one of item 2's
@@ -2092,6 +2093,139 @@ A1/B1 erratum, a real-mode LOADALL that may enter protected mode (p. 15), is
 not modelled. p. 2 gives both "195 clocks" and "190 clocks with no wait
 states"; neither is modelled, with the rest of the timing model. Word
 registers keep their bits above 15 as any 16-bit write does.
+
+**Privilege levels on `I80286` and `I80386`** (xj-srh.9, first landing).
+Protected contexts run at CPL 0-3; paging stays `LegacyEntryFacility`.
+Sources: 80286 PRM 210498-005 ("286 PRM"), 80386 PRM 230985-001 ("386 PRM"),
+SDM 325462-092US; printed page numbers. `interp/legacy/privilege.rs` holds the
+helpers. Every fault of a transition precedes its commit point: the helpers
+read the TSS, descriptors and frame first and probe the new stack, then set
+the accessed bits of the new CS and SS (a descriptor on a device is refused as
+`LegacyInstruction` before either changes), write the frame, and only then
+the registers, so a device stop during the frame writes leaves `CpuState`
+unchanged and the instruction or event replays.
+- **Inward delivery.** An interrupt, trap or exception through a gate to a
+  non-conforming handler with DPL < CPL takes SS:(E)SP for the target ring
+  from the current TSS (SP_n at 2+4n and SS_n at 4+4n in a 286 TSS, 286 PRM
+  §8.2 Fig. 8-1 p. 8-2; ESP_n at 4+8n and SS_n at 8+8n in a 386 TSS, 386 PRM
+  §7.1 Fig. 7-1 p. 7-2) and pushes old SS, old (E)SP, FLAGS, CS, IP and the
+  error code at the gate's width (286 PRM App. B INT p. B-49, §9.4 Fig. 9-4
+  pp. 9-4-5; 386 PRM §17 INT pp. 17-70-71; SDM Vol 2A INT pp. 3-472-474). A
+  field beyond the TSS limit, or an unusable TR, is #TS(TR + EXT) (SDM
+  p. 3-472; DERIVED, the PRMs are silent). New-SS null #TS(EXT); index, RPL,
+  DPL and type #TS(SS + EXT); not present #SS(SS + EXT); the gate offset
+  beyond the new CS limit #GP(EXT), as on the same-level path.
+- **Outward RETF, RETF n and IRET.** A popped CS.RPL above CPL checks the top
+  8+n or 10 bytes (16+n or 20 with a 32-bit operand), #SS(0); the return CS
+  (null #GP(0); index, type and DPL #GP(CS); not present #NP(CS)); the return
+  SS (null #GP(0); index, RPL, type and DPL #GP(SS); not present #SS(SS));
+  then the IP against the new CS limit, #GP(0) (286 PRM App. B RET
+  pp. B-94-95, IRET pp. B-51-52; 386 PRM §17 RET pp. 17-142-144, IRET
+  pp. 17-76-78, §6.3.4.2 Table 6-3 pp. 6-16-17; SDM Vol 2B RET pp. 4-571-574,
+  Vol 2A IRET pp. 3-493-497). ESP := the popped (E)SP, a 16-bit pop
+  zero-extended (SDM IRET pp. 3-493-494; RET p. 4-573, DERIVED). ES and DS,
+  and FS and GS on the 386, become null when their cache is data or
+  non-conforming code with DPL < the new CPL; the test reads the cache
+  only, so a null selector over a cache that passes it (left by real mode or
+  LOADALL) is kept as it is (SDM RET p. 4-574, IRET p. 3-495).
+- **FLAGS at CPL > 0.** POPF and IRET load IOPL only at CPL 0 and IF only
+  when CPL <= IOPL, from the CPL and IOPL before the instruction, with no
+  fault (286 PRM App. B POPF p. B-86, IRET p. B-51, §10.1 p. 10-1; 386 PRM
+  §8.3.1 p. 8-5, §17 POPF p. 17-130; SDM Vol 2B POPF pp. 4-407-408). A task
+  switch loads the whole image, as before.
+- **CPL and IOPL checks** run at run time, before any operand transfer or
+  port exit, in the protected regime only (`LegacyOp::Privileged`). HLT,
+  LGDT, LIDT, LLDT, LTR, LMSW, CLTS and MOV to or from CRn, DRn and TRn need
+  CPL 0; CLI, STI, IN, OUT, INS and OUTS need CPL <= IOPL; else #GP(0) (286
+  PRM App. B pp. B-30, B-31, B-42, B-45, B-47, B-65, B-66, B-67, B-72, B-81,
+  B-82, B-106; 386 PRM §6.3.5.1 p. 6-17, §8.3.1 pp. 8-4-5; SDM Vol 3A §6.9
+  p. 6-23). On `I80286` any instruction with a LOCK prefix needs CPL <= IOPL
+  too, else #GP(0) (286 PRM App. B LOCK p. B-68, §3.11.2 p. 3-29); a locked
+  MOVS, INS or OUTS that passes keeps its typed handoff (`UnknownInstruction`).
+  The 386 has no such rule: its LOCK page lists #UD only (386 PRM §17 LOCK
+  pp. 17-100-101). On `I80386` an I/O instruction with CPL > IOPL consults
+  the I/O permission bitmap of a 386 TSS (386 PRM §8.3.2 p. 8-5), which is
+  not modelled: the typed refusal `LegacyIoPermissionBitmap`, with nothing
+  done (xj-srh.10). With a 286 TSS in TR the I/O permission function returns
+  FALSE (386 PRM §17.2.2.5 p. 17-15; a 16-bit TSS has no I/O map, SDM Vol 3A
+  §10.6 p. 10-18), so the access is #GP(0), as it is with a TR that holds no
+  TSS (ASSUMED). REP INS and REP OUTS with a zero count (CX, or ECX with a
+  32-bit address size) execute nothing and make no test (SDM Vol 2B REP
+  Operation p. 4-564; the maintainer's decision, 2026-11-18). A reserved
+  control register, and a LOCK prefix on a form the decode set does not
+  lock, keep their #UD ahead of the check (ASSUMED).
+- **Task switches** into a task whose CS.RPL is 1-3 run at that CPL; the
+  existing segment loads check the incoming CS, SS and data DPLs against it
+  (286 PRM App. B p. B-13; 386 PRM Table 7-1 p. 7-9).
+- **Still refused:** a call gate (`LegacyGateOrTaskTransfer`, second
+  landing), a VM image, paging, the 386 TSS T bit, LOADALL with a CS DPL of
+  1-3 and the I/O bitmap of a 386 TSS. `LegacyPrivilegeTransition` is no
+  longer produced.
+
+The source rows that disagree, and the engine's choice (decisions O1-O14):
+- **Inward room (O2).** 286 PRM p. B-49 and 386 PRM p. 17-71 count 10 or 20
+  bytes with #SS(0); 286 PRM Table 9-1 p. 9-6 ("5 words (or 6 if error
+  code)", SS selector + EXT) and SDM p. 3-473 (10/12 or 20/24 bytes,
+  #SS(NewSS + EXT)). The engine: #SS(new SS + EXT), counting the error code,
+  on both generations.
+- **Null new SS on an interrupt (O5b).** 386 PRM p. 17-70 gives #GP(EXT)
+  (page image checked); 386 CALL p. 17-40, 286 PRM p. B-49 and SDM p. 3-473
+  give #TS. The engine: #TS(EXT).
+- **Inward gate offset.** 286 PRM p. B-49 gives #GP(0); the engine keeps the
+  SDM's #GP(EXT) (p. 3-474) of the landed same-level path.
+- **Return SS not present (O3).** 386 PRM pp. 17-77 and 17-144 give #NP(SS);
+  386 Table 6-3 p. 6-17 and §9.8.12 p. 9-16, 286 PRM pp. B-52 and B-95 and
+  SDM RET p. 4-573 give #SS(SS); SDM IRET p. 3-497 lists #SS(0). The engine:
+  #SS(SS selector) on both generations.
+- **Return SS selector, type and privilege (O4).** 286 PRM Table 7-4 p. 7-22
+  lists SF; pp. B-52, B-95, 386 PRM and SDM give #GP. The engine: #GP(SS).
+- **Conforming return CS on IRET (O5a).** 286 PRM p. B-52 and 386 PRM
+  p. 17-77 print "DPL must be > CPL"; both RET pages and SDM IRET p. 3-497
+  say DPL <= RPL. The engine: DPL <= RPL.
+- **Data-segment nulling (O6).** The PRM prose nulls a segment whose DPL is
+  "greater" than the new CPL (286 PRM §7.5.2 p. 7-21, page image checked;
+  386 PRM §6.3.4.2 p. 6-16); the PRM pseudocode re-validates each register
+  against its table and readability (286 pp. B-52, B-95; 386 pp. 17-78,
+  17-144); SDM RET p. 4-574, IRET p. 3-495 and Vol 3A §6.8.6 p. 6-20 null
+  from the hidden cache when DPL < CPL. The engine: the SDM rule, from the
+  cache alone, whatever the selector; the re-validation is not modelled (it
+  differs only if the table changed after the load).
+- **RET n on the outer stack (O9).** The PRM pseudocode (pp. B-95, 17-144)
+  loads SS:SP with no second adjustment; the prose (286 p. 7-21, 386 p. 6-16)
+  and SDM p. 4-574 add n. The engine adds n, unchecked.
+- **Interrupt CS presence order (O8).** 286 p. B-49 and 386 p. 17-70 test
+  presence before the DPL dispatch; the engine keeps the SDM order (p. 3-472)
+  that landed with xj-srh.6.
+- **CPL or IOPL check against a memory operand (O10).** No source orders the
+  two; the check comes first (ASSUMED), as LOADALL's does. This holds for
+  LLDT and LTR as well, whose helper also checks CPL after the read.
+- **VM = 1 in an IRET image at CPL > 0.** 386 PRM §17 IRET p. 17-74 goes to
+  STACK-RETURN-TO-V86 whenever the image has VM = 1; SDM Vol 2A IRET
+  p. 3-492 requires "tempEFLAGS(VM) = 1 and CPL = 0" and otherwise takes the
+  protected-mode return, ignoring VM. The engine keeps the typed refusal
+  `InvalidLegacyContext(Virtual8086Unsupported)` at any CPL (the
+  maintainer's decision, 2026-11-18), as for a VM image in a task.
+- **ESP after a 16-bit outward return.** The SDM pops tempESP with "16-bit
+  pop; clear upper bits" and assigns ESP := tempESP (IRET pp. 3-493-494;
+  RET p. 4-573), so the engine zero-extends SP into ESP. Processors that
+  keep the upper bits of the old ESP after such a return are not modelled:
+  no source pinned in `oracles/` describes that retention.
+- Recorded, for the call-gate landing: an inter-level CALL's room fault is
+  #SS(0) on the 286 (p. B-25; p. 7-20 "error code of 0") and #SS(new SS) on
+  the 386 (§9.8.12 p. 9-16; SDM p. 3-132) (O1); the gate's target CS presence
+  check, omitted by 286 p. B-24 and 386 pp. 17-39-40, is #NP(CS) per 286
+  Table 7-3 p. 7-18 and SDM p. 3-131, whose "If EPL > CPL" should read
+  "> DPL" (O7); 286 p. 7-20 calls an SS DPL mismatch a "task stack fault"
+  and 386 §6.3.4.1 p. 6-14 a "stack exception", where p. B-25 and the SDM
+  give #TS; the PRM pseudocode's "OperandSize" for the gate push width reads
+  as the gate type (386 PRM §16.4.2.1 p. 16-6).
+- 286 PRM §3.11.1 p. 3-28 reads "CPL ≥ 0" for the IF rule in its OCR text;
+  pp. B-86 and §10.1 p. 10-1 state the rule, and the engine cites those.
+
+Retention (O13): a ring change interns a new context stamp and counts against
+decision-20's 16 retained contexts. An INT and IRET round trip from ring 3
+retains two contexts and relifts nothing after the first trip
+(`ring_trips_retain_two_contexts_and_relift_nothing`).
 
 Decision-23 C2 adds `I8088` and `I8086`. Both select the 8086 instruction set,
 `system = None`, twenty physical address bits, no instruction-length limit,

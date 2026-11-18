@@ -780,49 +780,37 @@ fn full_386_registers_and_static_tss_fields_survive() {
 }
 
 #[test]
-fn typed_refusals_for_v86_privilege_and_task_debug_trap() {
-    for (model, wide) in formats() {
-        for privilege in [false, true] {
-            if !wide && !privilege {
-                continue;
-            }
-            let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
-            if privilege {
-                put(&vm, base(B) + if wide { 0x4c } else { 0x24 }, 2, 11);
-            } else {
-                put(&vm, base(B) + 0x24, 4, 0x20002);
-            }
-            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-            let StepStop::Exit(Exit::UnsupportedSystemContext { operation, .. }) = run.stop()
-            else {
-                panic!("{:?}", run.stop())
-            };
-            assert_eq!(
-                *operation,
-                if privilege {
-                    x86jit_core::UnsupportedSystemOperation::LegacyPrivilegeTransition
-                } else {
-                    x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
-                        x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
-                    )
-                }
-            );
-            // Incoming state is read only after acquiring B and saving A.
-            // Unsupported incoming execution is reported at that committed boundary.
-            assert_eq!(
-                (cpu.cpu.legacy.tr.selector, cpu.cpu.rip, cpu.cpu.legacy.cr0),
-                (B, 0x1800, 9)
-            );
-            assert!(!busy(&vm, A) && busy(&vm, B));
-            assert_eq!(
-                value(
-                    &vm,
-                    base(A) + if wide { 0x20 } else { 0x0e },
-                    if wide { 4 } else { 2 }
-                ),
-                0x100b
-            );
-        }
+fn typed_refusals_for_v86_and_task_debug_trap() {
+    // VM exists only in a 386 TSS image. A task whose CS.RPL is 1–3 is no
+    // longer refused: a_task_with_cs_rpl_3_runs_at_cpl_3_or_faults_on_its_segments.
+    for (model, wide) in formats().into_iter().filter(|&(_, wide)| wide) {
+        let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
+        put(&vm, base(B) + 0x24, 4, 0x20002);
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        let StepStop::Exit(Exit::UnsupportedSystemContext { operation, .. }) = run.stop() else {
+            panic!("{:?}", run.stop())
+        };
+        assert_eq!(
+            *operation,
+            x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
+                x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
+            )
+        );
+        // Incoming state is read only after acquiring B and saving A.
+        // Unsupported incoming execution is reported at that committed boundary.
+        assert_eq!(
+            (cpu.cpu.legacy.tr.selector, cpu.cpu.rip, cpu.cpu.legacy.cr0),
+            (B, 0x1800, 9)
+        );
+        assert!(!busy(&vm, A) && busy(&vm, B));
+        assert_eq!(
+            value(
+                &vm,
+                base(A) + if wide { 0x20 } else { 0x0e },
+                if wide { 4 } else { 2 }
+            ),
+            0x100b
+        );
     }
     let (vm, mut cpu) = setup_tasks(CpuModel::I80386, true, &far(true, B));
     put(&vm, base(B) + 0x64, 2, 1);
@@ -2273,49 +2261,80 @@ fn review4_i286_iret_reads_incoming_image_before_departing_busy_clear() {
 }
 
 #[test]
-fn review4_image_refusals_keep_committed_state_until_input_is_corrected() {
-    for wide in [false, true] {
-        for virtual_mode in [false, true] {
-            if virtual_mode && !wide {
-                continue;
-            }
-            let (vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &far(true, B));
-            let (offset, size, bad, good, operation) = if virtual_mode {
-                (
-                    0x24,
-                    4,
-                    0x20002,
-                    2,
-                    x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
-                        x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
-                    ),
-                )
-            } else {
-                (
-                    if wide { 0x4c } else { 0x24 },
-                    2,
-                    11,
-                    8,
-                    x86jit_core::UnsupportedSystemOperation::LegacyPrivilegeTransition,
-                )
-            };
-            put(&vm, base(B) + offset, size, bad);
-            expect_task_refusal(&mut cpu, &vm, operation);
-            assert_eq!(cpu.cpu.legacy.tr.selector, B);
-            put(&vm, base(B) + offset, size, good);
-            steps(&mut cpu, &vm, 1);
-            assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1800));
-            assert_eq!(
-                value(
-                    &vm,
-                    base(A) + if wide { 0x20 } else { 0x0e },
-                    if wide { 4 } else { 2 }
-                ),
-                0x100b
-            );
-            assert_eq!(cpu.cpu.rflags_system & 0x4000, 0x4000);
+fn a_task_with_cs_rpl_3_runs_at_cpl_3_or_faults_on_its_segments() {
+    // The rows that refused an incoming CS.RPL of 3 (LegacyPrivilegeTransition)
+    // before xj-srh.9. The incoming CPL is CS.RPL and each segment is checked
+    // against it after the switch commits (286 PRM App. B SWITCH_TASKS
+    // p. B-13; 386 PRM §7.5 p. 7-8, Table 7-1 p. 7-9): CS 0Bh names DPL-0 code
+    // and SS 10h has RPL 0, so the 286 (SS first) gives #TS(10h) and the 386
+    // (CS first) #TS(08h), with B entered and A saved. With DPL-3 code and
+    // data at 40h and 48h the task runs at CPL 3.
+    for (model, wide) in formats() {
+        let (cs_at, ss_at, ds_at, es_at) = if wide {
+            (0x4c, 0x50, 0x54, 0x48)
+        } else {
+            (0x24, 0x26, 0x28, 0x22)
+        };
+        let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
+        put(&vm, base(B) + cs_at, 2, 11);
+        outward(
+            &mut cpu,
+            &vm,
+            10,
+            if model == CpuModel::I80286 { 16 } else { 8 },
+        );
+        assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1800));
+        assert!(!busy(&vm, A) && busy(&vm, B));
+        let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
+        descriptor(&vm, 0x2040, 0, 0xffff, 0xfb);
+        descriptor(&vm, 0x2048, 0, 0xffff, 0xf3);
+        put(&vm, base(B) + cs_at, 2, 0x43);
+        for at in [ss_at, ds_at, es_at] {
+            put(&vm, base(B) + at, 2, 0x4b);
         }
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(
+            (
+                cpu.cpu.legacy.tr.selector,
+                cpu.cpu.cs,
+                cpu.cpu.ss,
+                cpu.cpu.rip,
+                cpu.cpu.legacy.cpl
+            ),
+            (B, 0x43, 0x4b, 0x1800, 3)
+        );
     }
+}
+
+#[test]
+fn review4_image_refusals_keep_committed_state_until_input_is_corrected() {
+    // An image with CS.RPL 3 now runs at CPL 3; only VM = 1 is refused.
+    let wide = true;
+    let (vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &far(true, B));
+    let (offset, size, bad, good, operation) = (
+        0x24,
+        4,
+        0x20002,
+        2,
+        x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
+            x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
+        ),
+    );
+    put(&vm, base(B) + offset, size, bad);
+    expect_task_refusal(&mut cpu, &vm, operation);
+    assert_eq!(cpu.cpu.legacy.tr.selector, B);
+    put(&vm, base(B) + offset, size, good);
+    steps(&mut cpu, &vm, 1);
+    assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1800));
+    assert_eq!(
+        value(
+            &vm,
+            base(A) + if wide { 0x20 } else { 0x0e },
+            if wide { 4 } else { 2 }
+        ),
+        0x100b
+    );
+    assert_eq!(cpu.cpu.rflags_system & 0x4000, 0x4000);
 }
 
 #[test]

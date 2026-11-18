@@ -159,7 +159,12 @@ pub(crate) fn instruction(
     let mut insn = decoder.decode();
     let mut locked_mov = false;
     if insn.is_invalid() && profile.quirks.lock_data_movement {
-        locked_mov = relock(&mut insn, code, ip, context, profile)?;
+        locked_mov = match relock(&mut insn, code, ip, context, profile) {
+            Err(error) if context.regime == crate::MachineRegime::Protected => {
+                return Ok(locked_transfer(code, ip, context, error));
+            }
+            locked => locked?,
+        };
     }
     let mode = if context.default_operand_bits == 16 {
         CpuMode::Real16
@@ -294,6 +299,9 @@ pub(crate) fn instruction(
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
+        if context.regime == crate::MachineRegime::Protected {
+            privilege_guard(&insn, locked_mov, context.generation, &mut ops.values);
+        }
     }
     if context.segment_class == crate::SegmentClass::Direct {
         direct_addresses(&mut ops.values, &mut tg, context, u64::from(ip));
@@ -440,6 +448,94 @@ fn coprocessor_overrun(
     );
 }
 
+// The CPL and IOPL tests that protected mode makes (286 PRM App. B; 386 PRM
+// §6.3.5.1 p. 6-17, §8.3.1 pp. 8-4–5; SDM Vol 3A §6.9 p. 6-23). The test
+// runs first, ahead of any memory operand (decision O10: ASSUMED, as LOADALL
+// does; the sources give no order), and only in the protected regime, so the
+// Real and Direct lowering is unchanged. A #UD that the lowering raised (a
+// reserved control register, or a LOCK prefix on a form the decode set does
+// not lock) keeps its place ahead of it (ASSUMED).
+#[cold]
+#[inline(never)]
+fn privilege_guard(
+    insn: &Instruction,
+    locked_mov: bool,
+    generation: crate::CpuGeneration,
+    ops: &mut Vec<IrOp>,
+) {
+    use crate::legacy::PrivilegeCheck;
+    use Mnemonic::*;
+    let special = |i| {
+        let register = insn.op_register(i);
+        register.is_cr() || register.is_dr() || register.is_tr()
+    };
+    let kind = match insn.mnemonic() {
+        Hlt | Lgdt | Lidt | Lmsw | Clts | Lldt | Ltr => PrivilegeCheck::Cpl0,
+        Mov if special(0) || special(1) => PrivilegeCheck::Cpl0,
+        Cli | Sti => PrivilegeCheck::Iopl,
+        // SDM Vol 2B REP Operation p. 4-564: with a zero count the string
+        // instruction does not execute, so it makes no I/O test.
+        Insb | Insw | Insd | Outsb | Outsw | Outsd
+            if insn.has_rep_prefix() || insn.has_repne_prefix() =>
+        {
+            PrivilegeCheck::RepIoPort {
+                count_bytes: if insn
+                    .op_kinds()
+                    .any(|k| matches!(k, OpKind::MemorySegSI | OpKind::MemoryESDI))
+                {
+                    2
+                } else {
+                    4
+                },
+            }
+        }
+        In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd => PrivilegeCheck::IoPort,
+        // 286 PRM App. B LOCK p. B-68 and §3.11.2 p. 3-29: LOCK in protected
+        // mode is #GP(0) when CPL > IOPL. The 386 has no such rule (386 PRM
+        // §17 LOCK pp. 17-100–101 lists #UD only).
+        _ if generation == crate::CpuGeneration::I286 && (locked_mov || insn.has_lock_prefix()) => {
+            PrivilegeCheck::Iopl
+        }
+        _ => return,
+    };
+    if ops.iter().any(|op| matches!(op, IrOp::Trap { .. })) {
+        return;
+    }
+    ops.insert(1, IrOp::Legacy(L::Privileged { kind }));
+}
+
+// A locked MOVS, INS or OUTS on the 80286 in the protected regime (`relock`'s
+// handoff): its LOCK test first (286 PRM App. B LOCK p. B-68), so CPL > IOPL
+// is #GP(0); with CPL <= IOPL the same typed handoff `relock` gives
+// elsewhere, before any effect.
+#[cold]
+#[inline(never)]
+fn locked_transfer(code: &[u8], ip: u32, context: MachineContext, error: LiftError) -> IrBlock {
+    debug_assert!(matches!(error, LiftError::Unsupported { .. }), "{error:?}");
+    let mode = if context.default_operand_bits == 16 {
+        CpuMode::Real16
+    } else {
+        CpuMode::Compat32
+    };
+    IrBlock {
+        mode,
+        guest_start: u64::from(ip),
+        guest_len: code.len() as u32,
+        icount: 1,
+        temp_count: 0,
+        ops: vec![
+            IrOp::InsnStart {
+                guest_addr: u64::from(ip),
+            },
+            IrOp::Legacy(L::Privileged {
+                kind: crate::legacy::PrivilegeCheck::Iopl,
+            }),
+            IrOp::Legacy(L::LockedTransfer),
+        ],
+        legacy_context: Some(context),
+    }
+}
+
 // spec.md §16: only a fault after a CPU-state commit needs rollback. Helper
 // transactions retain their own memory evidence and task partial-commit rules.
 fn rollback_required(ops: &[IrOp]) -> bool {
@@ -499,6 +595,8 @@ fn rollback_required(ops: &[IrOp]) -> bool {
                     | L::Checkpoint
                     | L::Bound { .. }
                     | L::CheckTaskReturn
+                    | L::Privileged { .. }
+                    | L::LockedTransfer
             ),
             _ => false,
         };

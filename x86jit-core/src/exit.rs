@@ -54,7 +54,11 @@ pub enum UnsupportedSystemOperation {
     ApplicationIrqDelivery,
     InvalidLegacyContext(crate::legacy::MachineContextError),
     LegacyLdtSelector,
+    /// A far CALL or JMP that names a call gate (type 4, or type 12).
     LegacyGateOrTaskTransfer,
+    /// No longer produced. RETF and IRET to an outer ring, interrupts and
+    /// exceptions through a gate to an inner ring, and task switches into
+    /// rings 1–3 execute.
     LegacyPrivilegeTransition,
     LegacyTaskPaging,
     LegacyTaskDebugTrap,
@@ -115,6 +119,13 @@ pub enum UnsupportedSystemOperation {
     /// with a system type. Nothing is loaded. `LoadallImage::supported`
     /// states the whole policy.
     I286LoadallTable,
+    /// 80386 IN, OUT, INS or OUTS in protected mode with CPL > IOPL while TR
+    /// holds a 386 TSS. The processor then consults that TSS's I/O
+    /// permission bitmap (80386 PRM §8.3.2 p. 8-5), which the engine does
+    /// not model. Nothing is done: no operand transfer and no port exit.
+    /// With a 286 TSS in TR there is no bitmap and the access is #GP(0)
+    /// (80386 PRM §17.2.2.5 p. 17-15).
+    LegacyIoPermissionBitmap,
 }
 
 /// Reason `run()` returned control to the user (§5.2).
