@@ -1495,7 +1495,8 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
             }
         })?;
-        if context.paging_enabled || context.cpl != 0 {
+        // Paging stays an engine facility; CPL 1–3 executes (xj-srh.9).
+        if context.paging_enabled {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
         // I286 PRM §10.4 p. 10-6: reset may fetch through the retained high CS base.
@@ -4787,6 +4788,101 @@ mod tests {
         assert!(execution.contexts.keys().all(|stamp| {
             stamp.state.segments[SegmentId::Ds as usize].base >= (MAX_RETAINED_CONTEXTS * 7) as u32
         }));
+    }
+
+    // Decision O13: a ring-3 loop that enters ring 0 through INT 40h and
+    // returns with IRET retains two contexts, ring 3 and ring 0, and relifts
+    // nothing after its first round trip.
+    fn ring_trip_loop(generation: CpuGeneration) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_legacy_cpu_model(LegacyCpuModel {
+            generation,
+            model_semantics_id: 1,
+        });
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\xcd\x40\xeb\xfc").unwrap(); // int 40h; jmp $-2
+        vm.write_bytes(0x5000, b"\xcf").unwrap(); // iret
+        for (selector, attr) in [(8u64, 0x9bu8), (16, 0x93), (24, 0xfb), (32, 0xf3)] {
+            vm.write_bytes(0x2000 + selector, &[0xff, 0xff, 0, 0, 0, attr, 0, 0])
+                .unwrap();
+        }
+        vm.write_bytes(0x2028, &[0x2b, 0, 0, 0x30, 0, 0x83, 0, 0])
+            .unwrap();
+        vm.write_bytes(0x3002, &[0x00, 0x90, 0x10, 0x00]).unwrap(); // SP0, SS0
+        vm.write_bytes(0x3200, &[0, 0x50, 8, 0, 0, 0xe6, 0, 0])
+            .unwrap(); // vector 40h
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.legacy.cr0 = 1;
+        cpu.cpu.legacy.cpl = 3;
+        [cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss] = [0x1b, 0x23, 0x23, 0x23];
+        for (i, attr) in [0xfb, 0xf3, 0xf3, 0xf3].into_iter().enumerate() {
+            cpu.cpu.legacy.segments[i].attributes = attr;
+        }
+        // Null FS and GS, as an outward return leaves them (SDM Vol 2A IRET
+        // p. 3-495); usable null caches would be one more context each time.
+        for segment in [SegmentId::Fs, SegmentId::Gs] {
+            cpu.cpu.legacy.segments[segment as usize] = crate::legacy::SegmentCache {
+                unusable: 1,
+                ..Default::default()
+            };
+        }
+        cpu.cpu.legacy.gdtr.base = 0x2000;
+        cpu.cpu.legacy.gdtr.limit = 0x2f;
+        cpu.cpu.legacy.idtr.base = 0x3000;
+        cpu.cpu.legacy.idtr.limit = 0x7ff;
+        cpu.cpu.legacy.tr = crate::legacy::SystemSegment {
+            selector: 0x28,
+            cache: crate::legacy::SegmentCache {
+                base: 0x3000,
+                limit: 0x2b,
+                attributes: 0x83,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (vm, cpu)
+    }
+
+    #[test]
+    fn ring_trips_retain_two_contexts_and_relift_nothing() {
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            let (vm, mut cpu) = ring_trip_loop(generation);
+            let warm = cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+            assert_eq!(warm.steps(), 3);
+            let warm = cpu.legacy_execution.as_ref().unwrap();
+            let (lifts, blocks) = (warm.lifts, warm.blocks.len());
+            let run = cpu.run_steps(&vm, 3000, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 3000, "{:?}", run.stop());
+            assert_eq!(
+                (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                (0x1b, 0x1000, 0x8000)
+            );
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert_eq!(execution.lifts, lifts);
+            assert_eq!(execution.contexts.len(), 2);
+            assert_eq!(execution.blocks.len(), blocks);
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit interpreter ring-trip throughput measurement"]
+    fn ring_trip_throughput() {
+        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
+            let (vm, mut cpu) = ring_trip_loop(generation);
+            cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+            for sample in 0..3 {
+                let lifts = cpu.legacy_execution.as_ref().unwrap().lifts;
+                let begin = std::time::Instant::now();
+                let run = cpu.run_steps(&vm, 300_000, StepOptions::default()).unwrap();
+                let elapsed = begin.elapsed().as_secs_f64();
+                assert_eq!(run.steps(), 300_000);
+                let execution = cpu.legacy_execution.as_ref().unwrap();
+                println!("generation={generation:?} sample={sample} trips=100000 elapsed_seconds={elapsed:.6} ns_per_trip={:.1} contexts={} lifts={} cached_blocks={}",
+                    elapsed * 1e9 / 100_000.0, execution.contexts.len(), execution.lifts - lifts, execution.blocks.len());
+            }
+        }
     }
 
     #[test]

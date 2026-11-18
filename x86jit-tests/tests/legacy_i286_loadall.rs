@@ -530,7 +530,7 @@ fn tables_outside_the_modelled_forms_are_refused_with_nothing_loaded() {
             t.word(MSW, 1);
         }),
         // Protected mode: a data CS, unequal DPLs, a CS and SS at DPL 3
-        // (the Machine runs only at CPL 0), a system-type ES.
+        // (refused by decision O12, although CPL 1-3 runs), a system-type ES.
         (true, |t| {
             t.entry(CS_CACHE, 0, 0x93, 0xffff);
         }),
