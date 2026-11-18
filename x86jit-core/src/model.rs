@@ -203,6 +203,17 @@ pub struct ModelProfile {
     /// Formed physical-address width (decision-23 §2).
     /// I286 PRM §6.3 Fig. 6-3; 80386 PRM §14.7 item 18.
     pub physical_bits: u8,
+    /// External data-bus width in bits. On the twenty-bit models it sets the
+    /// width of a device (Trap region) transfer: 8 moves a word as two byte
+    /// cycles, 16 moves an even-addressed word in one cycle (8086 Family UM
+    /// §2.3 p. 2-15; NEC V20/V30 UM §4 pp. 4-2–4-3; spec.md §5.2). The 80286
+    /// and 80386 entries record their buses (80286 PRM §2.5.1 p. 2-23; 80386
+    /// PRM §8.1.1 p. 8-1, which states 32-bit port alignment "so that the 32
+    /// bits can be transferred in a single bus access"); their Machine paths
+    /// do not read it. Only a value that departs from the canonical one feeds
+    /// the identity, so a path that starts reading it on the 80286 or 80386
+    /// must move that identity itself (a revision word).
+    pub data_bus_bits: u8,
     /// Maximum instruction bytes, or no architectural limit (decision-23 §2).
     /// I286 PRM Appendix B, General Protection; SDM Vol 2 §2.1.
     pub max_insn_len: Option<u8>,
@@ -252,6 +263,7 @@ static I80286: ModelProfile = identified(ModelProfile {
     },
     system: ModelSystem::Msw286,
     physical_bits: 24,
+    data_bus_bits: 16,
     max_insn_len: Some(10),
     fpu: &[FpuModel::Present, FpuModel::None],
     timing: None,
@@ -293,6 +305,7 @@ static I80386: ModelProfile = identified(ModelProfile {
     },
     system: ModelSystem::Cr386,
     physical_bits: 32,
+    data_bus_bits: 32,
     max_insn_len: Some(15),
     fpu: &[FpuModel::Present, FpuModel::None],
     timing: None,
@@ -312,7 +325,9 @@ static I80386: ModelProfile = identified(ModelProfile {
 // 8086 Family UM §§2.2–2.3 pp. 2-7–12, §2.6 pp. 2-24–28,
 // §2.7 pp. 2-37–42; 286 PRM App. C pp. C-1–3; SDM Vol 3B §25.17.
 // Present retains the generation-neutral engine; I8087 pairing arrives in C6.
-const fn early_model(identity: u64) -> ModelProfile {
+// UM §2.3 p. 2-15: the 8088 "always accesses memory in bytes"; the 8086
+// accesses an even-addressed word "in one bus cycle".
+const fn early_model(identity: u64, data_bus_bits: u8) -> ModelProfile {
     let mut p = identified(ModelProfile {
         isa: ModelIsa::I8086,
         quirks: ModelQuirks {
@@ -338,6 +353,7 @@ const fn early_model(identity: u64) -> ModelProfile {
         },
         system: ModelSystem::None,
         physical_bits: 20,
+        data_bus_bits,
         max_insn_len: None,
         fpu: &[FpuModel::Present, FpuModel::None],
         timing: None,
@@ -354,8 +370,8 @@ const fn early_model(identity: u64) -> ModelProfile {
     p.semantics_id ^= identity;
     p
 }
-static I8088: ModelProfile = early_model(8088);
-static I8086: ModelProfile = early_model(8086);
+static I8088: ModelProfile = early_model(8088, 8);
+static I8086: ModelProfile = early_model(8086, 16);
 
 // NEC V20/V30 native mode (decision-23 C4a). Values are read from NEC
 // uPD70108/70116 User's Manual, Stock No. 500350 (page images checked):
@@ -376,7 +392,9 @@ static I8086: ModelProfile = early_model(8086);
 // - no instruction-length limit is stated.
 // PUSH SP/POP SP and the single-step/INT order are not stated: the first is a
 // typed refusal of the decode set, the second the refused-conflict field.
-const fn nec_model(identity: u64) -> ModelProfile {
+// - the V20 has an 8-bit data bus and the V30 a 16-bit one, which moves an
+//   even-addressed word in one bus cycle (§4 pp. 4-2–4-3).
+const fn nec_model(identity: u64, data_bus_bits: u8) -> ModelProfile {
     let mut p = identified(ModelProfile {
         isa: ModelIsa::NecV20,
         quirks: ModelQuirks {
@@ -402,6 +420,7 @@ const fn nec_model(identity: u64) -> ModelProfile {
         },
         system: ModelSystem::None,
         physical_bits: 20,
+        data_bus_bits,
         max_insn_len: None,
         fpu: &[FpuModel::Present, FpuModel::None],
         timing: None,
@@ -418,8 +437,8 @@ const fn nec_model(identity: u64) -> ModelProfile {
     p.semantics_id ^= identity;
     p
 }
-static NEC_V20: ModelProfile = nec_model(70108);
-static NEC_V30: ModelProfile = nec_model(70116);
+static NEC_V20: ModelProfile = nec_model(70108, 8);
+static NEC_V30: ModelProfile = nec_model(70116, 16);
 
 impl CpuModel {
     /// The immutable catalogue entry for this model (decision-23 §2).
@@ -606,6 +625,20 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
         hash = word(hash, 0x4e4d49);
         hash = word(hash, p.quirks.nmi_nesting.word());
     }
+    // Data-bus width (xj-50w.20). Its canonical value is 8 for the early
+    // entries, 16 for the 286 and 32 for the 386, so only a departing entry
+    // (the I8086 and NEC V30) hashes it and no other identity changes.
+    let canonical_bus = if early_entry {
+        8
+    } else if matches!(p.system, ModelSystem::Msw286) {
+        16
+    } else {
+        32
+    };
+    if p.data_bus_bits != canonical_bus {
+        hash = word(hash, 0x627573);
+        hash = word(hash, p.data_bus_bits as u64);
+    }
     p.semantics_id = hash;
     p
 }
@@ -623,6 +656,7 @@ mod tests {
             quirks: p.quirks,
             system: p.system,
             physical_bits: p.physical_bits,
+            data_bus_bits: p.data_bus_bits,
             max_insn_len: p.max_insn_len,
             fpu: p.fpu,
             timing: p.timing,
@@ -635,7 +669,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..24 {
+            for change in 0..25 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -667,6 +701,7 @@ mod tests {
                             }
                     }
                     22 => changed.quirks.nmi_nesting = NmiNesting::Nested,
+                    23 => changed.data_bus_bits = 8,
                     _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);
@@ -686,12 +721,15 @@ mod tests {
             (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f_u64),
             // The 8086-family values after xj-50w.12's LOCK revision word.
             (CpuModel::I8088, 0x8815_844f_bd9d_4559),
-            (CpuModel::I8086, 0x8815_844f_bd9d_4557),
+            // xj-50w.20: the sixteen-bit data bus moves the I8086 identity
+            // from 0x8815_844f_bd9d_4557.
+            (CpuModel::I8086, 0xde9d_608e_bea8_4545),
             // The NEC values after xj-50w.19's NEC_EXTENSION_REVISION 2 (the
             // segment-register store holds NMI); they were 0x2a38_6bfd_83ff_8f1f
-            // and 0x2a38_6bfd_83ff_8f27.
+            // and 0x2a38_6bfd_83ff_8f27. xj-50w.20 moves the V30 from
+            // 0xcd48_16e2_6331_d184 with its sixteen-bit data bus.
             (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
-            (CpuModel::NecV30, 0xcd48_16e2_6331_d184),
+            (CpuModel::NecV30, 0x196e_97d4_9eba_3cd2),
         ] {
             assert_eq!(model.profile().semantics_id, identity, "{model:?}");
             assert!(!model.profile().quirks.lock_data_movement, "{model:?}");
@@ -725,11 +763,12 @@ mod tests {
             I8088.semantics_id ^ 8088
         );
         let base = identified(copy(&NEC_V20)).semantics_id;
-        for change in 0..6 {
+        for change in 0..7 {
             let mut changed = copy(&NEC_V20);
             match change {
                 0 => changed.quirks.rep_restart_prefixes = Some(1),
                 4 => changed.quirks.nmi_nesting = NmiNesting::BlockedIgnore,
+                5 => changed.data_bus_bits = 16,
                 1 => changed.quirks.iret_delays_interrupts = true,
                 2 => changed.quirks.segment_store_inhibits_interrupts = false,
                 3 => changed.quirks.ei_delay_unconditional = false,
@@ -737,6 +776,16 @@ mod tests {
             }
             assert_ne!(identified(changed).semantics_id, base, "{change}");
         }
+        // xj-50w.20: the bus siblings differ in content only by the data bus.
+        let mut v30 = copy(&NEC_V30);
+        v30.data_bus_bits = 8;
+        assert_eq!(identified(v30).semantics_id, base);
+        let mut i8086 = copy(&I8086);
+        i8086.data_bus_bits = 8;
+        assert_eq!(
+            identified(i8086).semantics_id,
+            identified(copy(&I8088)).semantics_id
+        );
         let mut as_8086 = copy(&NEC_V20);
         as_8086.isa = ModelIsa::I8086;
         assert_ne!(identified(as_8086).semantics_id, base);

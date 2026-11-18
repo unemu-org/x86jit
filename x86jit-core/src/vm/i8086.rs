@@ -168,8 +168,8 @@ fn nec_form(suffix: &[u8], prefixes: u32, segment: Option<u8>, repeat: bool) -> 
 #[inline(never)]
 fn carry_string(part: &mut IrBlock) {
     for op in &mut part.ops {
-        if let IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { carry, .. }) = op {
-            *carry = true;
+        if let IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { mode, .. }) = op {
+            mode.set_carry();
         }
     }
 }

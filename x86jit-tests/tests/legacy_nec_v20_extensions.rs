@@ -102,14 +102,16 @@ fn catalogue_identities_change_only_for_the_nec_entries() {
     // and xj-oog's LOADALL encoding (24d34f81af8da20b before it).
     // xj-50w.19 raises the NEC extension revision word to 2 (the segment
     // register store holds NMI as well as INT), so only the NEC entries move
-    // again; they were 2a386bfd83ff8f1f and 2a386bfd83ff8f27.
+    // again; they were 2a386bfd83ff8f1f and 2a386bfd83ff8f27. xj-50w.20's
+    // sixteen-bit data bus moves the I8086 and NecV30 only; they were
+    // 8815844fbd9d4557 and cd4816e26331d184.
     for (model, id) in [
         (CpuModel::I8088, 0x8815_844f_bd9d_4559),
-        (CpuModel::I8086, 0x8815_844f_bd9d_4557),
+        (CpuModel::I8086, 0xde9d_608e_bea8_4545),
         (CpuModel::I80286, 0x7357_723a_3f16_2910),
         (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f),
         (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
-        (CpuModel::NecV30, 0xcd48_16e2_6331_d184),
+        (CpuModel::NecV30, 0x196e_97d4_9eba_3cd2),
     ] {
         assert_eq!(model.profile().semantics_id, id, "{model:?}");
     }
@@ -837,14 +839,25 @@ fn fpo2_does_the_cpu_part_with_an_empty_socket() {
             cpu.cpu.ds = 0x7000;
             cpu.cpu.es = 0x7100;
             cpu.cpu.gpr[3] = 0x10;
-            // Exactly one word: two device bytes, then the step completes
-            // (p. 12-175 clocks 15/15/11, the odd/even split of a word).
-            for byte in 0..2 {
+            // Exactly one word, then the step completes (p. 12-175 clocks
+            // 15/15/11, the odd/even split of a word): two device bytes on
+            // the V20's 8-bit bus, one word transfer at these even addresses
+            // on the V30's 16-bit bus (UM §4 pp. 4-2–4-3).
+            let transfers: &[(u64, u8)] = if model == CpuModel::NecV30 {
+                &[(0, 2)]
+            } else {
+                &[(0, 1), (1, 1)]
+            };
+            for &(byte, width) in transfers {
                 let r = run(&vm, &mut cpu, 1);
-                let StepStop::Exit(Exit::MmioRead { addr: at, .. }) = r.stop() else {
+                let StepStop::Exit(Exit::MmioRead { addr: at, size, .. }) = r.stop() else {
                     panic!("{code:x?}: {:?}", r.stop())
                 };
-                assert_eq!((*at, r.steps()), (addr + byte, 0), "{code:x?}");
+                assert_eq!(
+                    (*at, *size, r.steps()),
+                    (addr + byte, width, 0),
+                    "{code:x?}"
+                );
                 cpu.complete_mmio_read(0x5a);
             }
             let r = run(&vm, &mut cpu, 1);
@@ -1345,19 +1358,22 @@ fn fpo2_reads_a_word() {
         cpu.cpu.gpr[4] = 0x8000;
         cpu.set_fpu_model(FpuModel::None);
         cpu.cpu.ds = 0x7000;
-        let mut reads = 0;
+        let (mut reads, mut bytes) = (0, 0);
         loop {
             let r = run(&vm, &mut cpu, 5);
             match r.stop() {
-                StepStop::Exit(Exit::MmioRead { .. }) => {
+                StepStop::Exit(Exit::MmioRead { size, .. }) => {
                     reads += 1;
+                    bytes += *size;
                     cpu.complete_mmio_read(0);
                 }
                 StepStop::Exit(Exit::Hlt) => break,
                 other => panic!("{other:?}"),
             }
         }
-        assert_eq!(reads, 2, "{model:?}");
+        // Two bytes: two transfers on the V20, one even word on the V30.
+        let transfers = if model == CpuModel::NecV30 { 1 } else { 2 };
+        assert_eq!((reads, bytes), (transfers, 2), "{model:?}");
     }
 }
 

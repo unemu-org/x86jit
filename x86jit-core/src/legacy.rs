@@ -858,15 +858,21 @@ pub enum LegacyOp {
     },
 
     /// Bytewise transfers through a segment-wrapping twenty-bit address.
+    /// `word_bus` is the catalogue's sixteen-bit data bus (`data_bus_bits`):
+    /// an even-addressed word of the operand inside one Trap region is then
+    /// one device transfer (spec.md §5.2). RAM transfers ignore it. Every
+    /// twenty-bit form that names it below uses it the same way.
     WrappedLoad {
         dst: crate::ir::Temp,
         addr: crate::ir::Val,
         size: u8,
+        word_bus: bool,
     },
     WrappedStore {
         addr: crate::ir::Val,
         value: crate::ir::Val,
         size: u8,
+        word_bus: bool,
     },
     /// CPU ESC/WAIT policy with a generation-neutral optional coprocessor.
     Coprocessor20 {
@@ -877,6 +883,7 @@ pub enum LegacyOp {
         wait: bool,
         bytes: [u8; 15],
         len: u8,
+        word_bus: bool,
     },
     /// IVT delivery without an IDTR or a system-register image.
     Interrupt20 {
@@ -884,6 +891,7 @@ pub enum LegacyOp {
         saved_ip: u16,
         overflow_only: bool,
         flags_set: u16,
+        word_bus: bool,
     },
     /// Lift-resolved FLAGS image constants (decision-23 §3).
     FlagsImage {
@@ -910,8 +918,8 @@ pub enum LegacyOp {
         saved_ip: u16,
     },
     /// String bytes wrap inside their segments and on a twenty-bit bus.
-    /// `carry` is NEC V20/V30 REPC/REPNC: `Repe`/`Repne` test CY in place
-    /// of Z (NEC UM p. 12-14). `code` holds the instruction's bytes, its
+    /// `mode` holds NEC V20/V30 REPC/REPNC (`Repe`/`Repne` test CY in place
+    /// of Z, NEC UM p. 12-14) and the catalogue's sixteen-bit data bus. `code` holds the instruction's bytes, its
     /// prefixes and opcode, as they were lifted; `code_len` is 0 when there
     /// are more than fifteen (the REP restart pair's key, xj-50w.15).
     WrappedString {
@@ -920,7 +928,7 @@ pub enum LegacyOp {
         rep: crate::ir::RepKind,
         source: SegmentId,
         restart_ip: u16,
-        carry: bool,
+        mode: WrappedStringMode,
         code: [u8; 15],
         code_len: u8,
     },
@@ -932,6 +940,7 @@ pub enum LegacyOp {
         offset: u8,
         length: u8,
         length_register: bool,
+        word_bus: bool,
     },
     /// NEC V20/V30 ADD4S, SUB4S and CMP4S (NEC UM pp. 12-42–44); `source`
     /// is the segment of the IX string.
@@ -946,6 +955,7 @@ pub enum LegacyOp {
         memory: bool,
         bytes: [u8; 15],
         len: u8,
+        word_bus: bool,
     },
     /// NEC V20/V30 CHKIND: BRK 5 when the index lies outside the bounds
     /// (NEC UM p. 12-170). The page does not say whether the comparison is
@@ -956,6 +966,7 @@ pub enum LegacyOp {
         upper: crate::ir::Temp,
         saved_ip: u16,
         flags_set: u16,
+        word_bus: bool,
     },
     /// NEC V20/V30 BRKEM imm8: frame, MD <- 0, MD write-enable, vector
     /// (NEC UM p. 12-169; IE and BRK cleared under decision-23 rule R2).
@@ -963,6 +974,7 @@ pub enum LegacyOp {
         vector: u8,
         saved_ip: u16,
         flags_set: u16,
+        word_bus: bool,
     },
     /// NEC V20/V30 RETI: PC, PS, PSW from the popped words; MD only while
     /// the MD write-enable latch is set (NEC UM p. 12-168).
@@ -993,11 +1005,40 @@ pub enum LegacyOp {
         op: crate::ir::RmwOp,
         bytes: [u8; 15],
         len: u8,
+        word_bus: bool,
     },
     /// 80286 LOADALL: the whole register image from the table at physical
     /// 000800H (Intel, "Undocumented iAPX 286 Test Instruction",
     /// `oracles/intel/i286-loadall.pdf`, pp. 1-3).
     Loadall,
+}
+
+/// The REPC/REPNC test and the data-bus width of a `LegacyOp::WrappedString`.
+/// One byte, the size of the `carry` flag it replaced: a wider operation moved
+/// `restart_ip`, and the twenty-bit dispatcher's per-walk scan for a repeated
+/// string then took two more host instructions per operation (xj-50w.20,
+/// MEASURED in the decision-23 campaign).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WrappedStringMode(u8);
+
+impl WrappedStringMode {
+    const CARRY: u8 = 1;
+    const WORD_BUS: u8 = 2;
+    /// A string that tests Z, on a bus of the given width.
+    pub const fn new(word_bus: bool) -> Self {
+        Self(if word_bus { Self::WORD_BUS } else { 0 })
+    }
+    /// REPC/REPNC: `Repe`/`Repne` test CY in place of Z.
+    pub const fn carry(self) -> bool {
+        self.0 & Self::CARRY != 0
+    }
+    /// The model's data bus moves a word in one cycle.
+    pub const fn word_bus(self) -> bool {
+        self.0 & Self::WORD_BUS != 0
+    }
+    pub(crate) fn set_carry(&mut self) {
+        self.0 |= Self::CARRY;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -188,8 +188,13 @@ impl Vcpu {
         bytes[1] = self.nec_fetch(vm, ip, ip.wrapping_add(1))?;
         match bytes[1] {
             0xfd => {
-                let [pc, ps, psw] =
-                    crate::interp::i8086::read_frame::<ROUTED, ORDER>(&mut self.cpu, &vm.mem)?;
+                let word_bus =
+                    crate::lift::i8086::word_bus(self.cpu_model.expect("NEC model").profile());
+                let [pc, ps, psw] = crate::interp::i8086::read_frame::<ROUTED, ORDER>(
+                    &mut self.cpu,
+                    &vm.mem,
+                    word_bus,
+                )?;
                 // Only the frame BRKEM saved (MD = 1) is described. p. 12-177
                 // reads "When the BRKEM instruction is executed, the MD flag is
                 // write disabled"; taken as a misprint for RETEM, the
@@ -211,7 +216,8 @@ impl Vcpu {
             }
             0xed => {
                 let vector = self.nec_fetch(vm, ip, ip.wrapping_add(2))?;
-                let quirks = self.cpu_model.expect("NEC model").profile().quirks;
+                let profile = self.cpu_model.expect("NEC model").profile();
+                let quirks = profile.quirks;
                 // The saved PC follows ED ED imm8 (§3 p. 3-1; ASSUMED for
                 // CALLN, as x80's CALLN_PC_ADVANCE). The PSW image keeps
                 // MD = 0 (p. 12-176); IE and BRK clear under rule R2.
@@ -223,6 +229,7 @@ impl Vcpu {
                     vector,
                     ip.wrapping_add(3),
                     quirks.real_flags_set_mask & 0x7fff,
+                    crate::lift::i8086::word_bus(profile),
                 )?;
                 self.cpu.legacy.reserved &= !(NEC_EMULATION | NEC_STANDBY);
             }

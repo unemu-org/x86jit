@@ -2006,7 +2006,11 @@ impl Vcpu {
         direct_bus: &mut bool,
     ) -> Result<(), Exit> {
         if KIND == super::DIRECT20_DISPATCH {
-            crate::interp::i8086::finish_port_input::<ROUTED, ORDER>(&mut self.cpu, &vm.mem)
+            crate::interp::i8086::finish_port_input::<ROUTED, ORDER>(
+                &mut self.cpu,
+                &vm.mem,
+                self.cpu_model,
+            )
         } else {
             crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
                 &mut self.cpu,
@@ -3854,11 +3858,12 @@ impl Vcpu {
             }
         }
         // Each catalogue entry supplies its own delivery policy (decision-23 §2).
-        let quirks = self
+        let profile = self
             .cpu_model
             .expect("twenty-bit dispatch requires an 8086-family catalogue model")
-            .profile()
-            .quirks;
+            .profile();
+        let quirks = profile.quirks;
+        let word_bus = crate::lift::i8086::word_bus(profile);
         // spec.md §17.10: a single-step trap meets an acceptable NMI here,
         // before the boundary's NMI step.
         let step_nmi = matches!(event.source, EventSource::SingleStep)
@@ -3934,6 +3939,7 @@ impl Vcpu {
                 } else {
                     quirks.real_flags_set_mask
                 },
+                word_bus,
             ) {
                 self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
                 return Err(exit);

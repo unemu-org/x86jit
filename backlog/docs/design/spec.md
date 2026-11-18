@@ -505,7 +505,7 @@ instead of stopping. A fault of the instruction reports these records as its
 acknowledged transfers (`FaultProgress::acknowledged_transfers`).
 
 Some stores are split into a RAM part and a device part: the twenty-bit models'
-byte transfers of a word over a RAM byte and a device byte, and an operand that
+transfers of a word over a RAM byte and a device byte, and an operand that
 the A20 gate splits into bus pieces on the I286/I386 Machine path. Such a store
 writes its device part first and commits the RAM part once the device write is
 acknowledged, so a stop at the device leaves the instruction's RAM uncommitted
@@ -515,12 +515,62 @@ gives the order of the two bus cycles), not a bus order; the device sees the sam
 transfers either way, and only an `MmioWrite` handler that reads guest RAM can see
 the RAM part still unwritten.
 
-The twenty-bit models' device transfers are byte-wide today. That matches the
-8-bit bus of the 8088 and V20, but not the 16-bit bus of the 8086 and V30, where
-an even-aligned word is one bus cycle (8086 Family User's Manual Table 2-21
-counts a word operand as one transfer, and its p. 2-51 footnote adds clocks only
-for a word at an odd address). Bus-width-faithful device transfers are a
-follow-up.
+**Twenty-bit device transfers follow the data bus (xj-50w.20).** The catalogue's
+`data_bus_bits` sets the width of a twenty-bit model's device transfer, and the
+lift copies it into each transfer it lowers. The 8088 "always accesses memory in
+bytes. Word operands are accessed in two bus cycles regardless of their
+alignment"; the 8086 accesses a word at an even address "in one bus cycle" and a
+word at an odd address "one byte at a time in two consecutive bus cycles" (8086
+Family User's Manual §2.3 p. 2-15). NEC V20/V30 UM §4 pp. 4-2–4-3 says the same
+of the uPD70108's 8-bit bus and the uPD70116's 16-bit bus. Hence:
+- I8088 and NecV20 (8 bits): every device byte is one `MmioRead`/`MmioWrite` of
+  size 1, as before.
+- I8086 and NecV30 (16 bits): a word of an operand whose low byte is at an even
+  address and whose two bytes lie in one Trap region is one transfer of size 2 at
+  that address. An operand's words start at its even byte indices: a far pointer,
+  a stack frame and an interrupt vector are sequences of words.
+- A word at an odd address is two byte transfers on every model: the low byte at
+  the address, then the high byte at the address plus one (UM §4.2 p. 4-15; NEC
+  UM §4 p. 4-3). A word that wraps its segment (offset FFFFh) or the bus
+  (FFFFFh) starts at an odd address, so it keeps its two byte transfers, the
+  second at the wrapped address (DERIVED).
+- A word over two Trap regions, or over a Trap byte and a RAM byte, keeps its
+  byte transfers on every model, the device part first as above. On the 8086 and
+  V30 that is an engine limit (ASSUMED): one exit names one region, while the
+  processor makes one bus cycle of an even word (UM §4.2 p. 4-15, Table 4-5).
+  A locked operand there keeps its typed refusal (below).
+- Frames are written in the engine's order: an interrupt frame is stored from
+  SP-6 upward (IP, CS, FLAGS), a far-call frame from SP-4 upward (IP, CS), PUSH R
+  from SP-2 downward; IRET, RETF and POP R read upward. On a 16-bit bus each even
+  word of them is one transfer. The store order of the interrupt and far-call
+  frames is a known divergence from the sources, on every twenty-bit model: the
+  processor pushes FLAGS, then CS, then IP (UM §2.6 p. 2-26; the bus sequence of
+  AP-67, UM p. A-28: IVT IP read, IVT CS read, push FLAGS, push CS, push IP), and
+  an intersegment CALL pushes CS, then IP (UM §2.7 p. 2-44). A device that sees
+  the stores sees the engine's order. Owned by xj-50w.25; the IVT reads (IP,
+  then CS) and the IRET/RETF pops already follow the sources.
+- Strings: each word element at an even address inside one Trap region is one
+  transfer (MOVSW, STOSW, LODSW, CMPSW, SCASW, and the V30's INM/OUTM memory
+  side), once per element of a repeated string.
+- The CPU's dummy read of a memory ESC or FPO2 operand is one word transfer
+  under the same rule. The coprocessor's own operand transfers stay byte-wide on
+  every model (ASSUMED: no pinned source gives the 8087's cycle width on an 8086
+  bus). For a load, the coprocessor then reads the operand's first word again;
+  on the processor the 8087 captures that word from the CPU's dummy read and
+  reads only the rest "in consecutive bus cycles" (iAPX 86/88, 186/188 PRM §6.3
+  p. 6-8). That second read is a known divergence, owned by xj-50w.26.
+A word transfer is recorded in the retry ledger under its word: the retry after
+its completion takes the recorded answer for both bytes, and stops again only
+at the operand's next transfer, also across a budget or host stop before the
+retry. Only a transfer inside one Trap region is a word transfer, so it never
+reaches the adjacent-region rule above: RAM transfers stay byte-wide and
+containment-only, and the twenty-bit walk still meets no containment miss over
+adjacent regions. The 8088 and V20 identities are unchanged; the I8086 and NecV30
+identities hash the new bus width (§17.10).
+On the I8086 and NecV30 an entry of `FaultProgress::acknowledged_transfers` may
+stand for a word transfer: it names the even address of the word's low byte, and
+its value is the word. The entry carries no size; the value's width is the only
+clue (the I8088 and V20 report the same word as two byte entries).
 
 **Locked operands on Trap regions — Real16 and Machine.** On the Real16 alias and
 every Machine model, XCHG with memory, CMPXCHG, XADD and the LOCK-prefixed forms
@@ -535,9 +585,10 @@ CMPXCHG, p. 3-194). A locked exchange whose old value the instruction
 discards, the 80286's locked MOV store, is one write and no read, as the
 unlocked store is. LOCK# is not modelled: the vCPU is stopped across both exits
 — no interrupt is accepted between them — so ordering against devices and DMA
-stays with the embedder. The twenty-bit models move every data byte as its own
-transfer (above), so a word operand there is two byte reads, then two byte writes,
-and an XCHG over a RAM byte and a device byte transfers the device byte. A locked
+stays with the embedder. The twenty-bit models move device data at their bus
+width (above), so a word operand there is one word read, then one word write, on
+the 8086 and V30 at an even address, and two byte reads, then two byte writes,
+otherwise; an XCHG over a RAM byte and a device byte transfers the device byte. A locked
 operand on RAM keeps the atomic path. A locked operand only partly in a Trap
 region — a word over the last RAM byte and the first device byte, or an A20-split
 operand with a RAM piece and a device piece — keeps `Exit::UnknownInstruction`
@@ -2179,8 +2230,10 @@ write AL) and BCD strings on memory. The lift decides per form, so INTO is
 refused whatever OF is: with OF set it reads the interrupt pointer and pushes
 as INT does (UM §2.7 pp. 2-46–47). A locked operand is one host atomic of its
 width (`Memory::atomic_rmw`), the only data transfer of the twenty-bit walk
-wider than one byte. A device operand inside one Trap region is one read,
-then one write, of its byte transfers (§5.2, xj-ir6.33); one only partly in a
+wider than one byte on RAM. A device operand inside one Trap region is one read,
+then one write, of its bus transfers (§5.2, xj-ir6.33, xj-50w.20): a word
+transfer each at an even address on the I8086 and NecV30, byte transfers
+otherwise; one only partly in a
 Trap region is a typed refusal, and an operand
 over two adjacent regions keeps the containment miss of every locked operand
 (§5.2, Data accesses across adjacent regions). A word at an odd address
@@ -2190,7 +2243,8 @@ crossing operand's policy, a plain read and write, with the single-processor
 result but not atomic against another vCPU (§8.2.3). A word whose bytes wrap
 their segment (offset FFFFh) or the bus (FFFFFh) starts there and has no single
 host address: as an A20-split operand on the 286 and 386, it is one read, then
-one write, of its byte transfers. This policy (xj-0w3.8) replaced a typed
+one write, of its byte transfers (it starts at an odd address, so the 16-bit bus
+makes it two byte cycles too). This policy (xj-0w3.8) replaced a typed
 refusal of every odd word. It changes execution only, not the lifted
 instruction, so no identity changes with it. Interrupts and the single-step trap see a locked
 instruction as one instruction (UM §2.6 p. 2-24: prefixes are "part of" the
@@ -2198,6 +2252,27 @@ instruction they prefix). The four twenty-bit identities change with the LOCK
 admission rule of xj-50w.12 (the early entries' prefix revision word); the
 I80386 identity does not, and
 the I80286 identity changes only with its own quirk fields (xj-50w.11). The witnesses are in `legacy_i8086` and `legacy_nec_v20_extensions`.
+
+**Data-bus width (xj-50w.20).** Each entry records its external data bus,
+`data_bus_bits`: 8 for the I8088 and NecV20, 16 for the I8086, NecV30 and
+I80286, 32 for the I80386 (UM §2.3 p. 2-15; NEC UM §4 pp. 4-2–4-3; 80286 PRM
+§2.5.1 p. 2-23; 80386 PRM §8.1.1 p. 8-1). The twenty-bit lift copies it into
+every lowered transfer; external interrupt and exception delivery, INM's
+completion, CALLN and RETEM read it from the vCPU's entry. It sets the width of
+device transfers as §5.2 describes. RAM transfers do not read it, and the
+I80286 and I80386 paths do not read it. Only a value that
+departs from the canonical one (8 for the early entries, 16 for the 286, 32
+for the 386) feeds the identity, so the I8086 and NecV30 identities change and
+no other does. The witnesses are in `legacy_bus_width`, `mmio_rmw`, `legacy_i8086`
+and `legacy_nec_v20_extensions`.
+Port I/O does not follow the data bus: IN, OUT and the port side of the V20/V30
+INM and OUTM are one `PortIo` exit per element, of the element's size,
+on every model. That is an engine contract (ASSUMED), not the bus: the 8088
+moves a word to a port "eight bits at a time in two bus cycles", and the 8086
+moves a word at an even port in one bus cycle (UM §2.4 p. 2-16); the uPD70108
+connects only 8-bit I/O devices, and the uPD70116 needs two bus cycles for a
+word at an odd address (NEC UM §4 p. 4-3). The embedder that models a port of
+another width splits or joins the cycles itself.
 The cold event boundary reads the catalogue's priority policy: an external
 interrupt enters its handler before the single-step trap (UM §2.6 pp. 2-26–28).
 STI and IRET "reenable interrupts only after the end of the following

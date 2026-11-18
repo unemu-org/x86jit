@@ -757,10 +757,16 @@ fn wrapped_scalar_and_string_mmio_roundtrips() {
             let (vm, mut cpu) = setup_review(model, code, true);
             cpu.cpu.gpr[6] = 0x4000;
             cpu.cpu.gpr[1] = 1;
-            for (addr, value) in [(0x4000, 0x34), (0x4001, 0x12)] {
+            // The 8086 moves the even word in one bus cycle (UM §2.3 p. 2-15).
+            let reads: &[(u64, u8, u64)] = if model == CpuModel::I8086 {
+                &[(0x4000, 2, 0x1234)]
+            } else {
+                &[(0x4000, 1, 0x34), (0x4001, 1, 0x12)]
+            };
+            for &(addr, size, value) in reads {
                 let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
                 assert!(
-                    matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: 1, .. }) if *a == addr),
+                    matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: n, .. }) if *a == addr && *n == size),
                     "{code:x?} expected {addr:x}: {:?}",
                     r.stop()
                 );
@@ -776,10 +782,15 @@ fn wrapped_scalar_and_string_mmio_roundtrips() {
             cpu.cpu.gpr[7] = 0x4000;
             cpu.cpu.gpr[1] = 1;
             cpu.cpu.gpr[0] = 0x1234;
-            for (addr, value) in [(0x4000, 0x34), (0x4001, 0x12)] {
+            let writes: &[(u64, u8, u64)] = if model == CpuModel::I8086 {
+                &[(0x4000, 2, 0x1234)]
+            } else {
+                &[(0x4000, 1, 0x34), (0x4001, 1, 0x12)]
+            };
+            for &(addr, size, value) in writes {
                 let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
                 assert!(
-                    matches!(r.stop(), StepStop::Exit(Exit::MmioWrite { addr: a, size: 1, value: v, .. }) if *a == addr && *v == value),
+                    matches!(r.stop(), StepStop::Exit(Exit::MmioWrite { addr: a, size: n, value: v, .. }) if *a == addr && *n == size && *v == value),
                     "{:?}",
                     r.stop()
                 );
@@ -817,15 +828,17 @@ fn present_fpu_memory_operand_mmio_is_resumable() {
 
 #[test]
 fn string_write_reports_second_mmio_byte() {
+    // An odd word is two byte cycles on both models (UM §2.3 p. 2-15).
     for model in MODELS {
         let (vm, mut cpu) = setup_review(model, b"\xab", true);
-        cpu.cpu.gpr[7] = 0x4000;
+        cpu.cpu.gpr[7] = 0x4001;
         cpu.cpu.gpr[0] = 0x1234;
         let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
         assert!(matches!(
             r.stop(),
             StepStop::Exit(Exit::MmioWrite {
-                addr: 0x4000,
+                addr: 0x4001,
+                size: 1,
                 value: 0x34,
                 ..
             })
@@ -836,7 +849,8 @@ fn string_write_reports_second_mmio_byte() {
             matches!(
                 r.stop(),
                 StepStop::Exit(Exit::MmioWrite {
-                    addr: 0x4001,
+                    addr: 0x4002,
+                    size: 1,
                     value: 0x12,
                     ..
                 })
@@ -986,17 +1000,27 @@ fn coprocessor_mmio_read_and_write_complete_once_per_bus_byte() {
     for model in MODELS {
         let (vm, mut cpu) = setup_review(model, b"\xd9\x06\x00\x40\xd9\x1e\x08\x40", true);
         cpu.set_fpu_model(FpuModel::Present);
-        for (addr, value) in [
-            (0x4000, 0),
-            (0x4001, 0),
-            (0x4000, 0),
-            (0x4001, 0),
-            (0x4002, 0x80),
-            (0x4003, 0x3f),
-        ] {
+        // The CPU's dummy word is one bus cycle on the 8086 (UM §2.3
+        // p. 2-15); the coprocessor's own transfers stay byte-wide (ASSUMED,
+        // spec.md §5.2). This pins today's known-divergent behaviour: the
+        // load reads 4000h-4001h again after the dummy read, where the 8087
+        // captures that word from the dummy read and reads only the rest
+        // (iAPX 86/88, 186/188 PRM §6.3 p. 6-8); owned by xj-50w.26.
+        let dummy: &[(u64, u8)] = if model == CpuModel::I8086 {
+            &[(0x4000, 2)]
+        } else {
+            &[(0x4000, 1), (0x4001, 1)]
+        };
+        let coprocessor = [(0x4000, 1), (0x4001, 1), (0x4002, 1), (0x4003, 1)];
+        let values = [0, 0, 0x80, 0x3f];
+        let reads = dummy
+            .iter()
+            .map(|&t| (t, 0))
+            .chain(coprocessor.iter().zip(values).map(|(&t, v)| (t, v)));
+        for ((addr, size), value) in reads {
             let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert!(
-                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: 1, .. }) if *a == addr),
+                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: n, .. }) if *a == addr && *n == size),
                 "{:?}",
                 r.stop()
             );
@@ -1004,10 +1028,15 @@ fn coprocessor_mmio_read_and_write_complete_once_per_bus_byte() {
             cpu.complete_mmio_read(value);
         }
         step(&vm, &mut cpu, 1);
-        for addr in [0x4008, 0x4009] {
+        let dummy: &[(u64, u8)] = if model == CpuModel::I8086 {
+            &[(0x4008, 2)]
+        } else {
+            &[(0x4008, 1), (0x4009, 1)]
+        };
+        for &(addr, size) in dummy {
             let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert!(
-                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: 1, .. }) if *a == addr),
+                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: n, .. }) if *a == addr && *n == size),
                 "{:?}",
                 r.stop()
             );
@@ -1035,10 +1064,16 @@ fn coprocessor_large_image_mmio_fits_the_fixed_retry_ledger() {
     for model in MODELS {
         let (vm, mut cpu) = setup_review(model, b"\xdd\x36\x00\x40", true); // FNSAVE m94
         cpu.set_fpu_model(FpuModel::Present);
-        for addr in [0x4000, 0x4001] {
+        // The CPU's dummy word: one bus cycle on the 8086 (UM §2.3 p. 2-15).
+        let dummy: &[(u64, u8)] = if model == CpuModel::I8086 {
+            &[(0x4000, 2)]
+        } else {
+            &[(0x4000, 1), (0x4001, 1)]
+        };
+        for &(addr, size) in dummy {
             let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert!(
-                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: 1, .. }) if *a == addr)
+                matches!(r.stop(), StepStop::Exit(Exit::MmioRead { addr: a, size: n, .. }) if *a == addr && *n == size)
             );
             cpu.complete_mmio_read(0);
         }
@@ -2002,34 +2037,36 @@ fn locked_increments_from_two_vcpus_lose_no_update() {
 // A locked device operand inside one Trap region is one read, then one write,
 // of the whole operand (spec.md §5.2, the maintainer's MMIO rule): the bus lock
 // holds through the instruction (UM §2.5 p. 2-18; SDM Vol 3A §11.1.2.2), and
-// the vCPU is stopped across the exits. Each byte is its own transfer, as every
-// device transfer of the twenty-bit walk is. The instruction retires once,
-// after the last write is acknowledged. The unlocked form reaches the device
-// one byte at a time as well.
+// the vCPU is stopped across the exits. Each transfer follows the model's data
+// bus, as every device transfer of the twenty-bit walk does (xj-50w.20): a word
+// at an even address is one transfer on the 8086 and V30 (UM §2.3 p. 2-15; NEC
+// UM §4 pp. 4-2–4-3), a byte at a time on the 8088 and V20. The instruction
+// retires once, after the last write is acknowledged. The unlocked form reaches
+// the device the same way.
 #[test]
 fn a_locked_device_operand_reads_then_writes_once() {
-    // One device transfer: (write, address, value).
-    type Transfer = (bool, u64, u64);
+    // One device transfer: (write, address, size, value).
+    type Transfer = (bool, u64, u8, u64);
     // Answer each device stop of `run_steps(1)` until the instruction retires.
     fn drive(vm: &Vm, cpu: &mut Vcpu) -> Vec<Transfer> {
         let mut bus = Vec::new();
         for _ in 0..8 {
             let r = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
             match r.stop() {
-                StepStop::Exit(Exit::MmioRead { addr, size: 1, .. }) => {
+                StepStop::Exit(Exit::MmioRead { addr, size, .. }) => {
                     assert_eq!(r.steps(), 0);
-                    let value = 0x30 + (*addr & 0xff);
-                    bus.push((false, *addr, value));
+                    // Device bytes 4000h + i = 30h + i.
+                    let value = (0..u64::from(*size))
+                        .map(|i| (0x30 + ((*addr + i) & 0xff)) << (8 * i))
+                        .sum();
+                    bus.push((false, *addr, *size, value));
                     cpu.complete_mmio_read(value);
                 }
                 StepStop::Exit(Exit::MmioWrite {
-                    addr,
-                    size: 1,
-                    value,
-                    ..
+                    addr, size, value, ..
                 }) => {
                     assert_eq!(r.steps(), 0);
-                    bus.push((true, *addr, *value));
+                    bus.push((true, *addr, *size, *value));
                     cpu.complete_mmio_write();
                 }
                 _ if r.steps() == 1 => return bus,
@@ -2038,39 +2075,46 @@ fn a_locked_device_operand_reads_then_writes_once() {
         }
         panic!("{bus:x?}")
     }
-    // Device bytes 4000h = 30h, 4001h = 31h; AX = 1234h.
-    let cases: [(&[u8], &[Transfer], u64); 3] = [
+    // Device bytes 4000h = 30h, 4001h = 31h; AX = 1234h. Each case gives the
+    // eight-bit bus transfers, then the sixteen-bit bus transfers.
+    type Case<'a> = (&'a [u8], &'a [Transfer], &'a [Transfer], u64);
+    let cases: [Case; 3] = [
         // LOCK INC BYTE [BX]
         (
             b"\xf0\xfe\x07",
-            &[(false, 0x4000, 0x30), (true, 0x4000, 0x31)],
+            &[(false, 0x4000, 1, 0x30), (true, 0x4000, 1, 0x31)],
+            &[(false, 0x4000, 1, 0x30), (true, 0x4000, 1, 0x31)],
             0x1234,
         ),
         // LOCK XCHG [BX],AX
         (
             b"\xf0\x87\x07",
             &[
-                (false, 0x4000, 0x30),
-                (false, 0x4001, 0x31),
-                (true, 0x4000, 0x34),
-                (true, 0x4001, 0x12),
+                (false, 0x4000, 1, 0x30),
+                (false, 0x4001, 1, 0x31),
+                (true, 0x4000, 1, 0x34),
+                (true, 0x4001, 1, 0x12),
             ],
+            &[(false, 0x4000, 2, 0x3130), (true, 0x4000, 2, 0x1234)],
             0x3130,
         ),
         // LOCK ADD ES:[BX],AX: 3130h + 1234h = 4364h
         (
             b"\xf0\x26\x01\x07",
             &[
-                (false, 0x4000, 0x30),
-                (false, 0x4001, 0x31),
-                (true, 0x4000, 0x64),
-                (true, 0x4001, 0x43),
+                (false, 0x4000, 1, 0x30),
+                (false, 0x4001, 1, 0x31),
+                (true, 0x4000, 1, 0x64),
+                (true, 0x4001, 1, 0x43),
             ],
+            &[(false, 0x4000, 2, 0x3130), (true, 0x4000, 2, 0x4364)],
             0x1234,
         ),
     ];
     for model in LOCK_MODELS {
-        for (code, transfers, ax) in cases {
+        let word_bus = matches!(model, CpuModel::I8086 | CpuModel::NecV30);
+        for (code, bytes, words, ax) in cases {
+            let transfers = if word_bus { words } else { bytes };
             let (vm, mut cpu) = setup_review(model, code, true);
             cpu.cpu.gpr[0] = 0x1234;
             cpu.cpu.gpr[3] = 0x4000;
@@ -2098,14 +2142,15 @@ fn a_locked_device_operand_reads_then_writes_once() {
             let (vm, mut cpu) = setup_review(model, &code[1..], true);
             cpu.cpu.gpr[3] = 0x4000;
             let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            let size = transfers[0].2;
             assert!(
                 matches!(
                     r.stop(),
                     StepStop::Exit(Exit::MmioRead {
                         addr: 0x4000,
-                        size: 1,
+                        size: s,
                         ..
-                    })
+                    }) if *s == size
                 ),
                 "{model:?} {code:02x?}: {:?}",
                 r.stop()
@@ -2371,6 +2416,9 @@ fn a_locked_instruction_is_one_instruction_to_interrupts_and_traps() {
 // holds NMI as well as INT): the NEC "after" values below are that revision's
 // (2a386bfd83ff8f1f and 2a386bfd83ff8f27 after xj-50w.12); its new
 // `nmi_nesting` field keeps its canonical value everywhere and moves nothing.
+// xj-50w.20's `data_bus_bits` departs from its canonical value only on the
+// I8086 and NecV30: their "after" values below are that change's
+// (8815844fbd9d4557 and cd4816e26331d184 before it).
 #[test]
 fn lock_admission_changes_only_the_twenty_bit_identities() {
     for (model, before, after) in [
@@ -2382,7 +2430,7 @@ fn lock_admission_changes_only_the_twenty_bit_identities() {
         (
             CpuModel::I8086,
             0x22fb_677c_f449_d2f0,
-            0x8815_844f_bd9d_4557,
+            0xde9d_608e_bea8_4545,
         ),
         (
             CpuModel::NecV20,
@@ -2392,7 +2440,7 @@ fn lock_admission_changes_only_the_twenty_bit_identities() {
         (
             CpuModel::NecV30,
             0x909a_c76c_b38b_71e0,
-            0xcd48_16e2_6331_d184,
+            0x196e_97d4_9eba_3cd2,
         ),
         (
             CpuModel::I80286,

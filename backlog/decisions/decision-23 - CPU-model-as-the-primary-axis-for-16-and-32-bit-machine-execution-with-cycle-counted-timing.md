@@ -994,6 +994,36 @@ change adds +0.22 % and +0.08 %. The maintainer accepted the four ip-boundary-1 
 xj-50w.24 carries the one-step cost, with this requirement's +0.5 % gate against 8e5bc441 as its
 acceptance. The gate itself is unchanged.
 
+**Amendment (xj-50w.20 landing, 2026-11-18, accepted by the maintainer).** On the I8086 and
+NecV30 models, an even-aligned word whose two bytes lie in one device (Trap) region is one size-2
+MmioRead or MmioWrite. The 16-bit bus makes one cycle of it: 8086 Family User's Manual §2.3
+p. 2-15 and §4.2 p. 4-15; NEC V20/V30 User's Manual §4 pp. 4-2–4-3.
+
+This completes the follow-up that the "locked operands on MMIO" amendment names: on those two
+models, a locked even word on a device is one word read and one word write. The bus width is
+catalogue data (`data_bus_bits`), read at lift time. The I8088 and NecV20 exits are unchanged.
+Only two identities move:
+- I8086: 8815844fbd9d4557 → de9d608ebea84545;
+- NecV30: cd4816e26331d184 → 196e97d49eba3cd2.
+
+The maintainer accepted these limits, which spec.md records:
+- an odd word and a word that wraps its segment or the bus keep byte transfers, as the bus does;
+- a word over two regions, or over a device byte and a RAM byte, also keeps byte transfers. This
+  is an engine limit (ASSUMED): an exit names one region, while the hardware makes one cycle;
+- interrupt and far-call frames are stored in the reverse of the hardware push order (8086 UM
+  §2.6 p. 2-26 and §2.7 p. 2-44). This known divergence is visible only on a device stack, and
+  xj-50w.25 fixes it;
+- the 8087's own operand transfers stay byte-wide, and the engine reads the first word a second
+  time, where the 8087 takes it from the CPU's dummy read (iAPX 86/88, 186/188 PRM §6.3 p. 6-8).
+  xj-50w.26 follows up;
+- port I/O stays one PortIo per element, as an engine contract. The 8088/V20, and an odd port on
+  the 8086/V30, make two byte cycles (8086 UM §2.4 p. 2-16; NEC UM p. 4-3).
+
+Against 019a8517, every real16_loops cell is within +0.5 %:
+- median deltas run from −0.39 % to +0.23 %;
+- the worst like-mode pair of the 12 bimodal cells is +0.27 %;
+- the store probe is within ±0.02 %.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and

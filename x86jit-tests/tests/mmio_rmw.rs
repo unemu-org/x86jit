@@ -10,8 +10,10 @@
 //! locked read without also producing a locked write"); 80286 PRM Appendix B,
 //! XCHG p. B-114. On Real16 and every Machine model a Trap operand
 //! therefore performs one MmioRead and then one MmioWrite of its bus transfers,
-//! with no replayed read; the twenty-bit models move every data byte as its own
-//! transfer (spec.md §17.10).
+//! with no replayed read; the twenty-bit models move device data at their bus
+//! width: the 8088 and V20 a byte per transfer, the 8086 and V30 an
+//! even-addressed word in one transfer and any other byte alone (8086 Family
+//! UM §2.3 p. 2-15; NEC V20/V30 UM §4 pp. 4-2–4-3; spec.md §17.10).
 //!
 //! Each witness runs the instruction twice on the same path: once with the
 //! operand window as RAM, once as a Trap region served by a byte-addressed
@@ -65,6 +67,10 @@ impl Path {
             self,
             Self::I8088 | Self::I8086 | Self::NecV20 | Self::NecV30
         )
+    }
+    /// A sixteen-bit bus: an even-addressed word is one device transfer.
+    fn word_bus(self) -> bool {
+        matches!(self, Self::I8086 | Self::NecV30)
     }
     fn model(self) -> Option<CpuModel> {
         match self {
@@ -466,10 +472,27 @@ fn drive(vm: &Vm, cpu: &mut Vcpu, budget: u64, mut device: Option<&mut Device>) 
 fn expected_bus(f: &Fixture, case: &Case, ram_window: &dyn Fn(u64) -> u8) -> Vec<Bus> {
     let base = u64::from(f.segment) << 4;
     let pieces: Vec<(u64, u8)> = if f.path.twenty_bit() {
-        // UM §2.3 p. 2-12: the offset wraps inside the segment, one byte per transfer.
-        (0..case.size)
-            .map(|i| (base + u64::from(f.offset.wrapping_add(u16::from(i))), 1))
-            .collect()
+        // UM §2.3 p. 2-12: the offset wraps inside the segment, one byte per
+        // transfer; on a sixteen-bit bus each word of the operand (an even
+        // byte index) at an even address is one transfer (p. 2-15).
+        let byte = |i: u8| base + u64::from(f.offset.wrapping_add(u16::from(i)));
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i < case.size {
+            if f.path.word_bus()
+                && i & 1 == 0
+                && i + 1 < case.size
+                && byte(i) & 1 == 0
+                && byte(i + 1) == byte(i) + 1
+            {
+                pieces.push((byte(i), 2));
+                i += 2;
+            } else {
+                pieces.push((byte(i), 1));
+                i += 1;
+            }
+        }
+        pieces
     } else {
         vec![(base + u64::from(f.offset), case.size)]
     };

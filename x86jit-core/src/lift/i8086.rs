@@ -78,6 +78,12 @@ fn write_segment(ops: &mut impl LiftBuffer, segment: SegmentId, value: Val, inhi
     }
 }
 
+// The catalogue's data bus moves a word in one cycle (`ModelProfile::data_bus_bits`;
+// 8086 Family UM §2.3 p. 2-15; NEC V20/V30 UM §4 pp. 4-2–4-3).
+pub(crate) fn word_bus(profile: &crate::ModelProfile) -> bool {
+    profile.data_bus_bits > 8
+}
+
 // A temporary holding `value` (NEC operations name their operands by temporary).
 fn temp(ops: &mut impl LiftBuffer, tg: &mut TempGen, value: Val) -> Temp {
     match value {
@@ -244,6 +250,7 @@ fn nec_instruction(
                 upper,
                 saved_ip: next,
                 flags_set: profile.quirks.real_flags_set_mask,
+                word_bus: word_bus(profile),
             }));
         }
         // NEC UM pp. 12-28–29 INM/OUTM: one port transfer per element through
@@ -256,13 +263,25 @@ fn nec_instruction(
                 SegmentId::Es
             };
             let sel = legacy::selector(ops, tg, segment);
-            let base = alu_none(ops, tg, |dst| IrOp::Shl {
+            let mut base = alu_none(ops, tg, |dst| IrOp::Shl {
                 dst,
                 a: sel,
                 b: Val::Imm(36),
                 size: 8,
                 set_flags: FlagMask::NONE,
             });
+            // OUTM's memory read carries the bus width in its tag. INM's
+            // store completes outside the walk, which reads the catalogue
+            // there (`finish_port_input`), so its base stays the plain tag.
+            if dir_out && word_bus(profile) {
+                base = alu_none(ops, tg, |dst| IrOp::Or {
+                    dst,
+                    a: base,
+                    b: Val::Imm(crate::interp::i8086::WORD_BUS),
+                    size: 8,
+                    set_flags: FlagMask::NONE,
+                });
+            }
             ops.push(IrOp::PortString {
                 elem: if matches!(insn.mnemonic(), Insb | Outsb) {
                     1
@@ -402,6 +421,7 @@ pub(crate) fn nec_form(
             offset,
             length,
             length_register,
+            word_bus: word_bus(profile),
         })),
         NecForm::BcdString { op, source } => ops.push(IrOp::Legacy(L::BcdString20 { op, source })),
         NecForm::Fpo2 { memory } => {
@@ -419,22 +439,30 @@ pub(crate) fn nec_form(
                 memory,
                 bytes,
                 len: evidence.len() as u8,
+                word_bus: word_bus(profile),
             }));
         }
     }
     // Every byte of a lifted transfer wraps in its segment (UM §10 p. 10-1).
+    let word_bus = word_bus(profile);
     let mut result = Vec::with_capacity(values.len() + 2);
     for op in values {
         match op {
             IrOp::Load {
                 dst, addr, size, ..
-            } => result.push(IrOp::Legacy(L::WrappedLoad { dst, addr, size })),
+            } => result.push(IrOp::Legacy(L::WrappedLoad {
+                dst,
+                addr,
+                size,
+                word_bus,
+            })),
             IrOp::Store {
                 addr, src, size, ..
             } => result.push(IrOp::Legacy(L::WrappedStore {
                 addr,
                 value: src,
                 size,
+                word_bus,
             })),
             IrOp::SegLimitCheck { .. } => {}
             IrOp::AtomicRmw {
@@ -444,7 +472,7 @@ pub(crate) fn nec_form(
                 size,
                 op,
                 ..
-            } => result.push(locked_rmw(old, addr, src, size, op, evidence)),
+            } => result.push(locked_rmw(old, addr, src, size, op, evidence, word_bus)),
             op => result.push(op),
         }
     }
@@ -673,6 +701,7 @@ fn brkem(
                 vector,
                 saved_ip: next,
                 flags_set: profile.quirks.real_flags_set_mask,
+                word_bus: word_bus(profile),
             }),
             IrOp::Legacy(L::SharedWalk),
         ],
@@ -739,6 +768,7 @@ pub(crate) fn instruction(
             wait,
             bytes: raw,
             len: evidence.len() as u8,
+            word_bus: word_bus(profile),
         }));
     } else if profile.isa == crate::ModelIsa::NecV20
         && nec_instruction(insn, &mut ops, tg, next, profile)?
@@ -840,6 +870,7 @@ pub(crate) fn instruction(
                     saved_ip: next,
                     overflow_only: insn.mnemonic() == Into,
                     flags_set: profile.quirks.real_flags_set_mask,
+                    word_bus: word_bus(profile),
                 }));
             }
             Retf | Iret => {
@@ -886,18 +917,25 @@ pub(crate) fn instruction(
     {
         return Err(unsupported_insn(insn));
     }
+    let word_bus = word_bus(profile);
     let mut result = Vec::new();
     for op in values {
         match op {
             IrOp::Load {
                 dst, addr, size, ..
-            } => result.push(IrOp::Legacy(L::WrappedLoad { dst, addr, size })),
+            } => result.push(IrOp::Legacy(L::WrappedLoad {
+                dst,
+                addr,
+                size,
+                word_bus,
+            })),
             IrOp::Store {
                 addr, src, size, ..
             } => result.push(IrOp::Legacy(L::WrappedStore {
                 addr,
                 value: src,
                 size,
+                word_bus,
             })),
             IrOp::SegLimitCheck { .. } => {}
             IrOp::Div {
@@ -951,7 +989,7 @@ pub(crate) fn instruction(
                 } else {
                     start
                 },
-                carry: false,
+                mode: crate::legacy::WrappedStringMode::new(word_bus),
                 code: {
                     let mut code = [0; 15];
                     let len = evidence.len().min(15);
@@ -982,7 +1020,7 @@ pub(crate) fn instruction(
                 ..
             } => {
                 if insn.has_lock_prefix() {
-                    result.push(locked_rmw(old, addr, src, size, op, evidence));
+                    result.push(locked_rmw(old, addr, src, size, op, evidence, word_bus));
                     continue;
                 }
                 // UM §2.5 p. 2-18: an unlocked XCHG "requires two bus cycles
@@ -992,12 +1030,18 @@ pub(crate) fn instruction(
                     dst: old,
                     addr,
                     size,
+                    word_bus,
                 }));
                 let value = match op {
                     RmwOp::Xchg => src,
                     _ => return Err(unsupported_insn(insn)),
                 };
-                result.push(IrOp::Legacy(L::WrappedStore { addr, value, size }));
+                result.push(IrOp::Legacy(L::WrappedStore {
+                    addr,
+                    value,
+                    size,
+                    word_bus,
+                }));
             }
             op => result.push(op),
         }
@@ -1034,7 +1078,15 @@ pub(crate) fn instruction(
 // xj-50w.12), as the 286 and 386 Machine paths do.
 #[cold]
 #[inline(never)]
-fn locked_rmw(old: Temp, addr: Val, src: Val, size: u8, op: RmwOp, evidence: &[u8]) -> IrOp {
+fn locked_rmw(
+    old: Temp,
+    addr: Val,
+    src: Val,
+    size: u8,
+    op: RmwOp,
+    evidence: &[u8],
+    word_bus: bool,
+) -> IrOp {
     let mut bytes = [0; 15];
     bytes[..evidence.len()].copy_from_slice(evidence);
     IrOp::Legacy(L::LockedRmw20 {
@@ -1045,6 +1097,7 @@ fn locked_rmw(old: Temp, addr: Val, src: Val, size: u8, op: RmwOp, evidence: &[u
         op,
         bytes,
         len: evidence.len() as u8,
+        word_bus,
     })
 }
 
@@ -1265,6 +1318,7 @@ mod tests {
                     quirks,
                     system: p.system,
                     physical_bits: p.physical_bits,
+                    data_bus_bits: p.data_bus_bits,
                     max_insn_len: p.max_insn_len,
                     fpu: p.fpu,
                     timing: p.timing,
@@ -1287,6 +1341,32 @@ mod tests {
                 lowered(b"\x8b\x07", row(quirks)),
                 "{model:?}"
             );
+            // xj-50w.20: the data-bus width reaches the lifted transfers.
+            let other: &'static crate::ModelProfile = Box::leak(Box::new(crate::ModelProfile {
+                isa: p.isa,
+                quirks: p.quirks,
+                system: p.system,
+                physical_bits: p.physical_bits,
+                data_bus_bits: 24 - p.data_bus_bits,
+                max_insn_len: p.max_insn_len,
+                fpu: p.fpu,
+                timing: p.timing,
+                semantics_id: p.semantics_id,
+                lift: p.lift,
+            }));
+            for code in [
+                &b"\x8b\x07"[..],
+                b"\x89\x07",
+                b"\xcd\x21",
+                b"\xa5",
+                b"\xf0\x01\x07",
+            ] {
+                assert_ne!(
+                    lowered(code, p),
+                    lowered(code, other),
+                    "{model:?} {code:x?}"
+                );
+            }
         }
     }
 }

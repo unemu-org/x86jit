@@ -2341,14 +2341,16 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
                 arm_ss: ss_shadow,
                 ..Outcome::default()
             }),
-            // The twenty-bit walk moves every data byte through a one-byte
+            // The twenty-bit walk moves every RAM byte through a one-byte
             // transfer (`interp::i8086`; lift/i8086.rs lowers loads, stores and
             // strings to its Wrapped primitives), and a one-byte access lies in
-            // one region or in none. The one wider transfer is a locked
-            // read-modify-write (`LockedRmw20`), whose containment miss over
-            // adjacent regions the re-execution would return unchanged
-            // (`SplitMemory` performs no locked operand). So this arm keeps its
-            // pre-split shape.
+            // one region or in none. A device word on a sixteen-bit bus
+            // (xj-50w.20) is made only when both its bytes lie in one Trap
+            // region (`device_word`), so it is a device exit and never a span.
+            // The one wider RAM transfer is a locked read-modify-write
+            // (`LockedRmw20`), whose containment miss over adjacent regions the
+            // re-execution would return unchanged (`SplitMemory` performs no
+            // locked operand). So this arm keeps its pre-split shape.
             exit if DIRECT20 => Err(qualify_shared_exit(exit)),
             exit => {
                 let exit = match split_shared::<ROUTED, ORDER, DIRECT20>(

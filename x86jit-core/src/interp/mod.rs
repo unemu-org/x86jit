@@ -1223,7 +1223,9 @@ fn finish_instruction_fault<const STEPPED: bool>(
                 | crate::legacy::LegacyOp::Coprocessor20 { .. }
                 | crate::legacy::LegacyOp::BitField20 { .. }
                 | crate::legacy::LegacyOp::BcdString20 { .. }
-                | crate::legacy::LegacyOp::Fpo2Escape20 { .. }),
+                | crate::legacy::LegacyOp::Fpo2Escape20 { .. }
+                | crate::legacy::LegacyOp::Interrupt20 { .. }
+                | crate::legacy::LegacyOp::Brkem20 { .. }),
             ) => Some(op),
             _ => None,
         }) {
@@ -1554,6 +1556,7 @@ fn walk_ops<
                     saved_ip,
                     overflow_only,
                     flags_set,
+                    word_bus,
                 } if MACHINE && DIRECT20 => {
                     if !overflow_only || cpu.flags.of {
                         if let Err(exit) = i8086::interrupt::<ROUTED, ORDER>(
@@ -1562,6 +1565,7 @@ fn walk_ops<
                             *vector,
                             *saved_ip,
                             *flags_set,
+                            *word_bus,
                         ) {
                             return WalkResult::exit(exit);
                         }
@@ -1611,7 +1615,7 @@ fn walk_ops<
                     elem,
                     rep,
                     source,
-                    carry,
+                    mode,
                     ..
                 } if MACHINE && DIRECT20 && STEPPED && !CHILD => {
                     let (access, _ordering) = mem.helper(Some(ordering::Direction::ReadWrite));
@@ -1621,7 +1625,7 @@ fn walk_ops<
                         *kind,
                         *elem,
                         *rep,
-                        *carry,
+                        (mode.carry(), mode.word_bus()),
                         *source,
                         cur_addr.get(),
                         exit_request,
