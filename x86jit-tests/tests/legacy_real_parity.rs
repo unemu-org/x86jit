@@ -1244,8 +1244,10 @@ fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol_cpu_model() {
 #[test]
 fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol() {
     // SDM Vol 2B §4.3 XCHG; decision-22: the complete operand is
-    // checked before physical splitting. §5.2 leaves a locked operand with a RAM
-    // piece and a device piece to the embedder.
+    // checked before physical splitting. A locked operand with a RAM piece and a
+    // device piece is performed by pieces (spec.md §5.2, xj-ir6.34): the RAM
+    // piece is read, the device piece is read and written once, and the RAM
+    // piece is written after the device write is acknowledged.
     for generation in [CpuGeneration::I286, CpuGeneration::I386] {
         let (mut vm, mut cpu) = legacy_fixture(b"\x87\x07", generation);
         cpu.cpu.ds = 0xffff;
@@ -1265,22 +1267,41 @@ fn split_xchg_uses_gated_ram_and_keeps_the_locked_device_protocol() {
         cpu.cpu.rip = 0x1000;
         vm.unmap(0, 0x1000).unwrap();
         vm.map(0, 0x1000, Prot::RWX, RegionKind::Trap).unwrap();
-        let before = image(&cpu);
         let run = step(&vm, &mut cpu);
         assert!(
             matches!(
                 run.stop(),
-                StepStop::Exit(Exit::UnknownInstruction {
-                    bytes: [0x87, 0x07, ..],
-                    len: 2,
+                StepStop::Exit(Exit::MmioRead {
+                    addr: 0,
+                    size: 1,
                     ..
                 })
             ),
             "{run:?}"
         );
-        assert_eq!(image(&cpu), before);
         vm.read_bytes(0xfffff, &mut byte).unwrap();
         assert_eq!(byte, [0x55]);
+        cpu.complete_mmio_read(0x77);
+        let run = step(&vm, &mut cpu);
+        assert!(
+            matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr: 0,
+                    size: 1,
+                    value: 0x22,
+                    ..
+                })
+            ),
+            "{run:?}"
+        );
+        vm.read_bytes(0xfffff, &mut byte).unwrap();
+        assert_eq!(byte, [0x55]);
+        cpu.complete_mmio_write();
+        assert_eq!(step(&vm, &mut cpu).steps(), 1);
+        assert_eq!(cpu.cpu.gpr[0], 0x1234_7755);
+        vm.read_bytes(0xfffff, &mut byte).unwrap();
+        assert_eq!(byte, [0x11]);
     }
 }
 

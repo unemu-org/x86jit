@@ -684,11 +684,12 @@ fn word_at_segment_edge_wraps_or_faults_before_any_transfer() {
 
 /// A word operand over the last RAM byte and the first device byte. A plain
 /// operand keeps the containment miss of spec.md §5.2 (splitting device accesses
-/// is xj-ir6.30). A locked one keeps embedder emulation, as before:
-/// `UnknownInstruction` with the instruction's bytes, before any transfer and
-/// with nothing committed; the processor performs it in as many bus cycles as
-/// necessary (SDM Vol 3A §11.1.2.2), which a follow-up will express. The
-/// twenty-bit models move each byte separately (`twenty_bit_rmw_over_ram_and_device`).
+/// is xj-ir6.30), before any transfer and with nothing committed. A locked one
+/// is performed by pieces since xj-ir6.34: the processor performs it in as many
+/// bus cycles as necessary (SDM Vol 3A §11.1.2.2), so the RAM byte is read, the
+/// device byte is read and written once, and the RAM byte is written last
+/// (`locked_split_device.rs`). The twenty-bit models move each byte separately
+/// (`twenty_bit_rmw_over_ram_and_device`).
 #[test]
 fn operand_across_ram_and_device() {
     const BASE: u64 = 0xb_7fff;
@@ -719,9 +720,12 @@ fn operand_across_ram_and_device() {
             vm.write_bytes(BASE, &[0x77]).unwrap();
             let before = cpu.cpu.gpr;
             let mut device = Device::new(WINDOW);
+            let device_byte = seed(WINDOW.0);
             let run = drive(&vm, &mut cpu, 64, Some(&mut device));
-            assert!(run.bus.is_empty(), "{what}: {:x?}", run.bus);
+            let mut expected = before;
+            expected[3] += 1;
             if plain {
+                assert!(run.bus.is_empty(), "{what}: {:x?}", run.bus);
                 assert!(
                     run.observation
                         .stop
@@ -729,19 +733,30 @@ fn operand_across_ram_and_device() {
                     "{what}: {}",
                     run.observation.stop
                 );
-            } else {
-                assert_eq!(
-                    run.observation.stop,
-                    format!("UnknownInstruction@{:#x}+{}", CODE + 1, bytes.len()),
-                    "{what}"
-                );
+                assert_eq!(run.observation.rip, CODE + 1, "{what}");
+                assert_eq!(run.observation.retired, 1, "{what}");
+                assert_eq!(cpu.cpu.gpr[..8], expected[..8], "{what}");
+                assert_eq!(vm.mem.read(BASE, 1).unwrap(), 0x77, "{what}");
+                continue;
             }
-            assert_eq!(run.observation.rip, CODE + 1, "{what}");
-            assert_eq!(run.observation.retired, 1, "{what}");
-            let mut expected = before;
-            expected[3] += 1;
+            let old = u64::from_le_bytes([0x77, device_byte, 0, 0, 0, 0, 0, 0]);
+            let new = if name.starts_with("xchg") {
+                expected[0] = (expected[0] & !0xffff) | old;
+                0xc35a
+            } else {
+                (old + 0xc35a) & 0xffff
+            };
+            assert_eq!(
+                run.bus,
+                [Bus::Read(WINDOW.0, 1), Bus::Write(WINDOW.0, 1, new >> 8)],
+                "{what}"
+            );
+            assert_eq!(run.observation.stop, "Hlt", "{what}");
+            assert_eq!(run.observation.retired, 4, "{what}");
+            expected[6] += 1;
             assert_eq!(cpu.cpu.gpr[..8], expected[..8], "{what}");
-            assert_eq!(vm.mem.read(BASE, 1).unwrap(), 0x77, "{what}");
+            assert_eq!(vm.mem.read(BASE, 1).unwrap(), new & 0xff, "{what}");
+            assert_eq!(u64::from(device.0[&WINDOW.0]), new >> 8, "{what}");
         }
     }
 }
@@ -818,10 +833,9 @@ fn twenty_bit_rmw_over_ram_and_device() {
 /// With A20 off, a word at FFFF:000F is split at the bus into FFFFFh and 0
 /// (spec.md §17.10; decision-22). Each piece is a transfer of its own. Both
 /// pieces in devices: a plain or locked operand reads both pieces, then writes
-/// both. One RAM piece: the plain RMW writes the device piece first (an engine
-/// choice for restartability, spec.md §5.2), in either piece order; the locked
-/// forms keep embedder emulation (`UnknownInstruction`), as for an operand partly
-/// in a Trap region.
+/// both. One RAM piece: the RMW writes the device piece first (an engine choice
+/// for restartability, spec.md §5.2), in either piece order; the locked forms
+/// too since xj-ir6.34, which reads the RAM piece once (`locked_split_device.rs`).
 #[test]
 fn a20_split_operand_transfers_each_bus_piece() {
     for path in [Path::I286, Path::I286Checked, Path::I386, Path::I386Checked] {
@@ -868,17 +882,6 @@ fn a20_split_operand_transfers_each_bus_piece() {
                 cpu.set_a20_enabled(false);
                 let mut device = Device(BTreeMap::from([(0, 0x34), (0xf_ffff, 0x12)]));
                 let run = drive(&vm, &mut cpu, 64, Some(&mut device));
-                let locked = !name.starts_with("add");
-                if locked && high_device != low_device {
-                    assert!(run.bus.is_empty(), "{what}: {:x?}", run.bus);
-                    assert_eq!(
-                        run.observation.stop,
-                        format!("UnknownInstruction@{CODE:#x}+{}", bytes.len()),
-                        "{what}"
-                    );
-                    assert_eq!(cpu.cpu.gpr[0], 0xc35a, "{what}");
-                    continue;
-                }
                 let old = 0x3412;
                 let new = if name.starts_with("xchg") {
                     0xc35a

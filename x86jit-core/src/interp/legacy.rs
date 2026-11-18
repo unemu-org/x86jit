@@ -1837,6 +1837,84 @@ struct InstructionView<'a> {
     ops: &'a [IrOp],
 }
 
+// A locked operand partly in RAM and partly in one Trap region, A20-split or
+// not (xj-ir6.34): the read of its pieces in operand byte order, then the
+// device piece's write and the RAM pieces' commit (`integer::locked_split_update`,
+// which cites the order and the retry rule). The device piece is one transfer,
+// as an A20 bus piece is, keyed by its visit (`read_physical`) and its write
+// acknowledgement (`write_physical`). An operand over two Trap regions keeps
+// embedder emulation; a ROM piece is read and its write dropped, and a byte in
+// no region faults before any transfer (`integer::locked_pieces`).
+#[cold]
+#[inline(never)]
+fn locked_split<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    ir: &InstructionView<'_>,
+    linear: u64,
+    src: u64,
+    size: u8,
+    op: crate::ir::RmwOp,
+) -> Result<u64, Exit> {
+    use super::integer::{locked_piece_exit, locked_pieces, locked_split_update, LockedPieces};
+    let at = |byte: u8| u64::from((linear as u32).wrapping_add(u32::from(byte)));
+    let mut bus = [0; 8];
+    for (byte, bus) in bus.iter_mut().enumerate().take(usize::from(size)) {
+        *bus = legacy::physical_span(cpu, mem.physical_mask, at(byte as u8), 1).0;
+    }
+    let fault = |cpu: &mut CpuState, trap, piece: super::integer::LockedPiece, write, value| {
+        let access = if write {
+            AccessKind::Write
+        } else {
+            AccessKind::Read
+        };
+        let exit = trap_out(cpu, cpu.rip, trap, piece.addr, piece.len, access, value);
+        let StepResult::Exit(exit) = exit.into_step() else {
+            unreachable!("a memory trap exits")
+        };
+        crate::fault::qualify_legacy_bus(exit, at(piece.first), piece.addr)
+    };
+    let (pieces, count) = match locked_pieces::<ROUTED>(&mem.0, size, |byte| bus[usize::from(byte)])
+    {
+        LockedPieces::Split(pieces, count) => (pieces, count),
+        LockedPieces::Refused => return Err(atomic_device_exit(cpu, mem, ir)),
+        LockedPieces::Miss(trap, piece) => {
+            let address = store_fault_address(mem, trap, piece.addr, piece.len);
+            let piece = super::integer::LockedPiece {
+                addr: address,
+                ..piece
+            };
+            return Err(fault(cpu, trap, piece, true, 0));
+        }
+    };
+    // An exchange whose old value the instruction discards (the locked MOV) is
+    // a store: it reads nothing.
+    let read = !(matches!(op, crate::ir::RmwOp::Xchg)
+        && super::integer::exchange_discards_old(ir.ops, cpu.rip));
+    let owner = cpu.rip;
+    locked_split_update(
+        cpu,
+        owner,
+        &pieces[..count],
+        read,
+        |old| super::i8086::updated(op, old, src),
+        |cpu, piece| {
+            read_physical(cpu, mem, at(piece.first), piece.addr, piece.len)
+                .map_err(|exit| locked_piece_exit(exit, size, piece))
+        },
+        |cpu, piece| {
+            mem.raw()
+                .read(piece.addr, piece.len)
+                .map_err(|trap| fault(cpu, trap, piece, false, 0))
+        },
+        |cpu, piece, value| {
+            write_physical(cpu, mem, at(piece.first), piece.addr, piece.len, value)
+                .map_err(|exit| locked_piece_exit(exit, size, piece))
+        },
+        |cpu, piece, value| write_physical(cpu, mem, at(piece.first), piece.addr, piece.len, value),
+    )
+}
+
 fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
     cpu: &CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -2817,16 +2895,20 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         true
                     }
                     // A device operand inside one Trap region takes the bus
-                    // transfers below (spec.md §5.2); one only partly in a
-                    // Trap region keeps embedder emulation, as before.
+                    // transfers below (spec.md §5.2); one partly in RAM is
+                    // performed by pieces (`locked_split`).
                     Err(MemTrap::Mmio) => {
                         if !matches!(
                             mem.0.region_kind(physical, *size),
                             Ok(crate::RegionKind::Trap)
                         ) {
-                            return Err(atomic_device_exit(cpu, mem, ir));
+                            let src = read_val(*src, temps);
+                            temps[*old as usize] =
+                                locked_split(cpu, mem, ir, linear, src, *size, *op)?;
+                            true
+                        } else {
+                            false
                         }
-                        false
                     }
                     Err(trap) => {
                         let StepResult::Exit(exit) = trap_out(
@@ -2846,8 +2928,8 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 }
             } else {
                 // A20 splits the operand into bus pieces. All in devices: each
-                // piece is a transfer of its own. Devices and RAM mixed: embedder
-                // emulation, as for an operand partly in a Trap region.
+                // piece is a transfer of its own. Devices and RAM mixed: the
+                // pieces of an operand partly in a Trap region (`locked_split`).
                 let trap_bytes = (0..*size)
                     .filter(|&byte| {
                         let linear = u64::from((linear as u32).wrapping_add(u32::from(byte)));
@@ -2857,9 +2939,12 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     })
                     .count();
                 if trap_bytes != 0 && trap_bytes != usize::from(*size) {
-                    return Err(atomic_device_exit(cpu, mem, ir));
+                    let src = read_val(*src, temps);
+                    temps[*old as usize] = locked_split(cpu, mem, ir, linear, src, *size, *op)?;
+                    true
+                } else {
+                    false
                 }
-                false
             };
             if !completed {
                 // A discontinuous bus operand has no single host atomic address.

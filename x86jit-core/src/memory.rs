@@ -2925,7 +2925,9 @@ impl Memory {
 
     fn atomic_region_at(&self, addr: u64, size: u8) -> Result<&Region, MemTrap> {
         let region = self.region_at(addr, size).map_err(|fault| {
-            // §5.2: even a partial device operand requires embedder emulation.
+            // §5.2: an operand partly in a device takes the device path: the
+            // embedder's emulation on Long64 and Compat32, its pieces on
+            // Real16 and Machine IR.
             if let Some(end) = addr.checked_add(u64::from(size)) {
                 if self.regions.iter().any(|r| {
                     matches!(r.kind, RegionKind::Trap)
