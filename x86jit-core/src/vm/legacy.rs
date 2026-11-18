@@ -4791,17 +4791,28 @@ mod tests {
     }
 
     // Decision O13: a ring-3 loop that enters ring 0 through INT 40h and
-    // returns with IRET retains two contexts, ring 3 and ring 0, and relifts
-    // nothing after its first round trip.
-    fn ring_trip_loop(generation: CpuGeneration) -> (Vm, Vcpu) {
+    // returns with IRET, or through a call gate and returns with RETF,
+    // retains two contexts, ring 3 and ring 0, and relifts nothing after its
+    // first round trip.
+    fn ring_trip_loop(generation: CpuGeneration, call_gate: bool) -> (Vm, Vcpu) {
         let mut vm = Vm::new(VmConfig::flat(0x10000));
         vm.set_legacy_cpu_model(LegacyCpuModel {
             generation,
             model_semantics_id: 1,
         });
         vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
-        vm.write_bytes(0x1000, b"\xcd\x40\xeb\xfc").unwrap(); // int 40h; jmp $-2
-        vm.write_bytes(0x5000, b"\xcf").unwrap(); // iret
+        if call_gate {
+            // call far 0033h:0; jmp $-5; at 5000h retf. GDT 30h is a DPL-3
+            // 286 call gate to 0008h:5000h with no parameters.
+            vm.write_bytes(0x1000, b"\x9a\x00\x00\x33\x00\xeb\xf9")
+                .unwrap();
+            vm.write_bytes(0x5000, b"\xcb").unwrap();
+            vm.write_bytes(0x2030, &[0, 0x50, 8, 0, 0, 0xe4, 0, 0])
+                .unwrap();
+        } else {
+            vm.write_bytes(0x1000, b"\xcd\x40\xeb\xfc").unwrap(); // int 40h; jmp $-2
+            vm.write_bytes(0x5000, b"\xcf").unwrap(); // iret
+        }
         for (selector, attr) in [(8u64, 0x9bu8), (16, 0x93), (24, 0xfb), (32, 0xf3)] {
             vm.write_bytes(0x2000 + selector, &[0xff, 0xff, 0, 0, 0, attr, 0, 0])
                 .unwrap();
@@ -4829,7 +4840,7 @@ mod tests {
             };
         }
         cpu.cpu.legacy.gdtr.base = 0x2000;
-        cpu.cpu.legacy.gdtr.limit = 0x2f;
+        cpu.cpu.legacy.gdtr.limit = 0x37;
         cpu.cpu.legacy.idtr.base = 0x3000;
         cpu.cpu.legacy.idtr.limit = 0x7ff;
         cpu.cpu.legacy.tr = crate::legacy::SystemSegment {
@@ -4847,8 +4858,13 @@ mod tests {
 
     #[test]
     fn ring_trips_retain_two_contexts_and_relift_nothing() {
-        for generation in [CpuGeneration::I286, CpuGeneration::I386] {
-            let (vm, mut cpu) = ring_trip_loop(generation);
+        for (generation, call_gate) in [
+            (CpuGeneration::I286, false),
+            (CpuGeneration::I386, false),
+            (CpuGeneration::I286, true),
+            (CpuGeneration::I386, true),
+        ] {
+            let (vm, mut cpu) = ring_trip_loop(generation, call_gate);
             let warm = cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
             assert_eq!(warm.steps(), 3);
             let warm = cpu.legacy_execution.as_ref().unwrap();
@@ -4870,7 +4886,7 @@ mod tests {
     #[ignore = "explicit interpreter ring-trip throughput measurement"]
     fn ring_trip_throughput() {
         for generation in [CpuGeneration::I286, CpuGeneration::I386] {
-            let (vm, mut cpu) = ring_trip_loop(generation);
+            let (vm, mut cpu) = ring_trip_loop(generation, false);
             cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
             for sample in 0..3 {
                 let lifts = cpu.legacy_execution.as_ref().unwrap().lifts;

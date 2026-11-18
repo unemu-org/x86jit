@@ -425,6 +425,9 @@ impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for AddressKeyed<'_, R
 trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     fn raw(&self) -> &Access<ROUTED, ORDER>;
     fn read_key(&self, addr: u64) -> u64;
+    /// The key `read_key` gives the read of `addr` that comes `ahead` reads
+    /// after the next one, without moving the cursor.
+    fn next_read_key(&self, addr: u64, ahead: u16) -> u64;
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
     fn note_write(&self, _addr: u64, _size: u8) {}
     fn physical_mask(&self) -> u32;
@@ -445,6 +448,9 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
     fn read_key(&self, addr: u64) -> u64 {
         addr
     }
+    fn next_read_key(&self, addr: u64, _ahead: u16) -> u64 {
+        addr
+    }
     fn skip_read(&self, _cpu: &CpuState, _linear: u64, _bytes: u8) {}
     fn physical_mask(&self) -> u32 {
         self.physical_mask
@@ -463,6 +469,9 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
         let index = self.read_index.get();
         self.read_index.set(index + 1);
         addr | (u64::from(index) << 32)
+    }
+    fn next_read_key(&self, addr: u64, ahead: u16) -> u64 {
+        addr | (u64::from(self.read_index.get() + ahead) << 32)
     }
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
         LegacyAccess::skip_read(self, cpu, linear, bytes);
@@ -1139,6 +1148,14 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
             }
         }
     }
+    remember(cpu, descriptor);
+    descriptor.cache.attributes |= bit;
+    Ok(true)
+}
+
+/// Keep a descriptor as it was read for the replays of this instruction, so
+/// that a frame write over its table cannot change it (`descriptor_at`).
+fn remember(cpu: &mut CpuState, descriptor: &Descriptor) {
     if let Some(address) = descriptor.access_address {
         let key = DESCRIPTOR_RETRY | u64::from(address.wrapping_sub(5));
         cpu.record_mmio_part(
@@ -1152,8 +1169,6 @@ fn descriptor_bit<const ROUTED: bool, const ORDER: u8>(
             u64::from(descriptor.cache.attributes),
         );
     }
-    descriptor.cache.attributes |= bit;
-    Ok(true)
 }
 
 fn accessed<const ROUTED: bool, const ORDER: u8>(
@@ -1335,6 +1350,24 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
     returning: bool,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
+    let (d, gate) = far_descriptor(cpu, mem, value, returning, generation)?;
+    debug_assert!(!gate, "a return never names a call gate");
+    Ok(d)
+}
+
+/// The descriptor a far CALL, JMP, RET or IRET names, after the code-segment
+/// checks; or, for CALL and JMP only, a call gate (`true`), which the caller
+/// hands to `privilege::call_gate` unchecked. Type 4 is a call gate on both
+/// generations and type 12 on the 80386 only: on the 80286 it takes the
+/// "ELSE #GP (code segment selector)" branch of 286 PRM App. B CALL p. B-25
+/// and JMP p. B-58 (DERIVED, as `tasks::transfer` does for types 9 and 11).
+fn far_descriptor<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    value: u16,
+    returning: bool,
+    generation: crate::CpuGeneration,
+) -> Result<(Descriptor, bool), Exit> {
     // SDM Vol 3A §6.8; Vol 2A §3.3 CALL/IRET/JMP; Vol 2B §4.3 RET;
     // 80386 PRM §17 pp. 17-39, 17-76–77, 17-85, 17-142–143 (scan checked).
     // I286 PRM §§7.4.2–7.5 pp. 7-13–15; Appendix B IRET pp. B-51–52,
@@ -1352,11 +1385,12 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
     let d = descriptor(cpu, mem, value, generation)?;
     let attr = d.cache.attributes;
     if attr & 0x10 == 0 {
-        if !returning && matches!(attr & 0xf, 1 | 3 | 4 | 5 | 9 | 11 | 12) {
-            return Err(refusal(
-                cpu,
-                crate::UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
-            ));
+        // Task gates and TSSs were dispatched by `tasks::transfer` before
+        // this; every other system type is #GP(selector).
+        if !returning
+            && (attr & 0xf == 4 || (generation != crate::CpuGeneration::I286 && attr & 0xf == 12))
+        {
+            return Ok((d, true));
         }
         return Err(fault(cpu, 13, value & !3));
     }
@@ -1375,7 +1409,7 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
         return Err(fault(cpu, 11, value & !3));
     }
     supported_descriptor(cpu, attr)?;
-    Ok(d)
+    Ok((d, false))
 }
 
 fn supported_descriptor(cpu: &CpuState, attributes: u16) -> Result<(), Exit> {
@@ -3596,12 +3630,16 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             }
                         }
                     }
-                    let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
-                        cs.map(|cs| code_descriptor(cpu, mem, cs, false, context.generation))
-                            .transpose()?
-                    } else {
-                        None
-                    };
+                    let mut descriptor = None;
+                    if let (Some(cs), legacy::MachineRegime::Protected) = (cs, context.regime) {
+                        let (d, gate) = far_descriptor(cpu, mem, cs, false, context.generation)?;
+                        if gate {
+                            privilege::call_gate(cpu, mem, context, cs, d, ip, *return_ip)?;
+                            outcome.context_changed = true;
+                            return Ok(true);
+                        }
+                        descriptor = Some(d);
+                    }
                     if let Some(d) = &descriptor {
                         if return_ip.is_some() {
                             push_addresses(cpu, mem, context, 2, *size)?;

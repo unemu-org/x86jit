@@ -546,23 +546,20 @@ fn far_transfer_faults_leave_frame_and_context_unchanged() {
 }
 
 #[test]
-fn call_gates_are_typed_refusals_and_outer_returns_transfer_cpu_model() {
-    crate::model_api::with_cpu_model(call_gates_are_typed_refusals_and_outer_returns_transfer);
+fn call_gates_and_outer_returns_transfer_cpu_model() {
+    crate::model_api::with_cpu_model(call_gates_and_outer_returns_transfer);
 }
 
 #[test]
-fn call_gates_are_typed_refusals_and_outer_returns_transfer() {
-    // Decision-18 §4: a call gate stays a typed refusal and constructs no
-    // frame. A RETF or IRET whose CS.RPL exceeds CPL now returns to the
-    // outer ring (xj-srh.9); here the frame's SS slot is null, #GP(0)
-    // (SDM Vol 2B RET p. 4-573), with nothing changed.
+fn call_gates_and_outer_returns_transfer() {
+    // A call gate is a transfer (xj-srh.9): this one names a null code
+    // selector, #GP(0) (SDM Vol 2A CALL p. 3-131), and constructs no frame.
+    // A RETF or IRET whose CS.RPL exceeds CPL returns to the outer ring; here
+    // the frame's SS slot is null, #GP(0) (SDM Vol 2B RET p. 4-573), with
+    // nothing changed.
     let (vm, mut cpu) = setup(b"\xea\x00\x12\x08\x00", false, false);
     descriptor(&vm, 8, 0, 0xffff, 0x84);
-    refused(
-        &mut cpu,
-        &vm,
-        UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
-    );
+    fault(&mut cpu, &vm, 13, 0);
     for bytes in [&b"\xcb"[..], b"\xcf"] {
         let (vm, mut cpu) = setup(bytes, false, false);
         descriptor(&vm, 8, 0, 0xffff, 0xfa);

@@ -48,13 +48,21 @@ pub enum UnsupportedSystemOperation {
     LegacyExecution,
     LegacyStepping,
     LegacyEventDelivery,
+    /// A legacy instruction, or a form of one, that the engine does not
+    /// perform; `CpuState` is unchanged. The cases include a locked update of
+    /// a descriptor's accessed bit on a device (decision-24's preflight), and
+    /// an inward far CALL through a call gate whose frame copy would need more
+    /// retry-ledger entries than `CpuState` holds (64): one per device piece of
+    /// a parameter read or frame write, plus the instruction's other entries.
+    /// The call is refused before its first parameter read (spec.md §17.10).
     LegacyInstruction,
     LegacyTaskReturn,
     LegacyEntryFacility,
     ApplicationIrqDelivery,
     InvalidLegacyContext(crate::legacy::MachineContextError),
     LegacyLdtSelector,
-    /// A far CALL or JMP that names a call gate (type 4, or type 12).
+    /// No longer produced. A far CALL or JMP through a call gate (type 4, or
+    /// type 12 on the 80386) executes, and task gates and TSSs switch tasks.
     LegacyGateOrTaskTransfer,
     /// No longer produced. RETF and IRET to an outer ring, interrupts and
     /// exceptions through a gate to an inner ring, and task switches into
