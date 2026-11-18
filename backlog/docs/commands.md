@@ -208,11 +208,13 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 
 `scripts/test-scope.sh` chooses the smallest local command set that covers a branch's
 changes. It is meant for workers' inner loops and for the local gate before work is handed
-back. It does not replace CI: GitHub still runs the full gate on every push.
+back. It does not replace CI: GitHub runs the full gate on every push except a docs-only one
+(§ Git remote and CI), which `--scope` identifies there.
 
 ```sh
 bash scripts/test-scope.sh origin/main            # classify the changes, print the commands
 bash scripts/test-scope.sh --run origin/main      # run them; keeps going, exits 1 on any failure
+bash scripts/test-scope.sh --scope origin/main    # print only the scope (`none` for an empty diff)
 bash scripts/test-scope.sh --classify <path>...   # the class of each path
 bash scripts/test-scope.sh --plan legacy-only     # one scope's commands, without a diff
 ```
@@ -260,41 +262,89 @@ only on GitHub Actions, and the workflow publishes nothing.
 
 - **GitHub**: `.github/workflows/ci.yml` runs on every push, on pull requests and
   on manual dispatch; pull requests are disabled on the repository, so in practice
-  pushes and dispatches start it. Its two independent jobs use GitHub-hosted
-  `ubuntu-24.04`
-  (x86-64) and `ubuntu-24.04-arm` (aarch64) runners. Both install pinned Nix and use
-  the devShell from `flake.lock`. Each runs fmt, the guest-agnostic guard, clippy with
-  all features and `-D warnings`, cargo-deny, the workspace nextest run with Unicorn
-  and without `fuzz_robustness`, the release subset, the Compat32 lane, workspace
-  doctests with all features, and a workspace/test type-check for the opposite Linux
-  architecture, plus separate FreeBSD compile-check steps for both architectures.
-  The cross-check uses default features because the cross architecture's
-  Unicorn library is unavailable; each native lane tests Unicorn. The x86-64 Linux
-  job also exercises the cfg-gated native oracle.
-  After the devShell succeeds, later gates run even if an earlier gate fails; either
-  job's failure fails the workflow, without cancelling the other architecture.
+  pushes and dispatches start it. It has three jobs.
+  - **plan** (`ubuntu-24.04`, about a minute) checks out the full history and runs
+    `scripts/ci-plan.py`, then the gate-script tests
+    (`python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'`). The plan
+    decides:
+    - a **push to `main` whose commit already has a run, on any branch, in which both
+      test jobs succeeded** (a `push` or `workflow_dispatch` run of `ci.yml`, found
+      through the Actions API by commit SHA) skips the test jobs. This is the normal
+      case after a `ci/*` branch passed and `main` is fast-forwarded to it;
+    - otherwise the changed paths are classified with `scripts/test-scope.sh --scope`
+      against the previous tip for a push to `main`, the merge base with `origin/main`
+      for any other push, and the base commit of a pull request. **Docs-only**
+      (§ Test scope: nothing under the crates, `scripts`, `vendor`, `.github`,
+      `.cargo`, `.config`, no Cargo or flake file, no test fixture) runs fmt and the
+      guest-agnostic guard in the plan job, without Nix — fmt through the runner's
+      rustup at the Rust version `flake.nix` pins (`XJ_DEVSHELL=host`) — and stops;
+    - **legacy-only and shared** run the full gate.
+
+    Every doubt runs the full gate: a failed API lookup, an event other than push or
+    pull request, a missing base commit, an empty diff, a classifier error, or the
+    plan script itself failing.
+  - **test (x86_64)** on `ubuntu-24.04` and **test (aarch64)** on `ubuntu-24.04-arm`,
+    when the plan asks for the gate. Both install pinned Nix, restore the Nix store,
+    and use the devShell from `flake.lock`. Each runs fmt, the guest-agnostic guard,
+    clippy with all features and `-D warnings`, cargo-deny, the workspace nextest run
+    with Unicorn and without `fuzz_robustness`, the release subset, workspace doctests
+    with all features, and a workspace/test type-check for the opposite Linux
+    architecture; the x86-64 job adds separate FreeBSD compile-check steps for both
+    architectures. The release subset builds only the eight binaries it runs (`jit`,
+    `differential`, `corpus`, `smc`, `mt`, `fault_landing_pad`, `region_fault_state`,
+    `rust_memory_faults`). There is no separate Compat32 lane: its 22 tests
+    (`differential32` and the two `*_matches_interp_32` fuzz tests) run in the
+    workspace nextest step.
+    The cross-check uses default features because the cross architecture's
+    Unicorn library is unavailable; each native lane tests Unicorn. The x86-64 Linux
+    job also exercises the cfg-gated native oracle.
+    After the devShell succeeds, later gates run even if an earlier gate fails; the
+    test jobs also run when only the gate-script tests failed. Any job's failure fails
+    the workflow, without cancelling the other architecture.
+  - **warm caches** (both architectures), on a push to `main` whose test jobs did not
+    run, so the caches other refs restore stay present. It restores the Nix store and
+    the Rust dependency cache; on a dependency-cache miss (a changed `Cargo.lock`,
+    toolchain or evicted entry) it builds what the test job builds without running
+    any test (`ci-gate.sh clippy`, `build-tests`, `build-release` and the cross
+    checks), and saves both.
+
   GitHub supplies the job checks; this workflow posts no commit statuses of its own.
-  Combined gate logs are retained as `ci-logs-x86_64` / `ci-logs-aarch64` artifacts for
-  seven days. Installer and cache diagnostics remain in the Actions job log.
+  Combined gate logs are retained as `ci-logs-x86_64` / `ci-logs-aarch64` (and
+  `ci-logs-plan` for the docs-only lane) artifacts for seven days. Installer and cache
+  diagnostics remain in the Actions job log.
   All actions are pinned to commit SHAs, checkout does not persist credentials, and
-  the only repository permission is `contents: read`. No configured secrets are
-  needed, and every runner is GitHub-hosted.
-  Cargo caches are separated by OS, architecture, Nix inputs, gate script and Cargo
-  lockfile; the pinned 80286 corpus cache is shared between architectures. Only push
-  runs save caches; pull requests can restore them. A corpus cache miss fetches the
-  corpus, and `SS286_REQUIRED=1` makes an absent corpus fail the test gate.
+  the repository permissions are `contents: read` and `actions: read` (the plan's run
+  lookup, with the default token). No configured secrets are needed, and every runner
+  is GitHub-hosted.
+  Caches: the Nix store (`nix-community/cache-nix-action`, keyed by OS, architecture,
+  dev shell and the flake files), the Rust dependency cache (`Swatinem/rust-cache`)
+  and the pinned 80286 corpus, shared between architectures. The Rust dependency cache
+  holds the Cargo registry and git checkouts and the compiled dependencies under
+  `target/` of every profile and target one job builds (dev, test, the release subset,
+  cross checks); workspace crates are pruned, so the project's own crates always build
+  fresh. It has one entry per architecture and dev shell (`shared-key`), keyed further
+  by the toolchain's `rustc -vV`, the Cargo manifests and lockfile and the `CARGO*` /
+  `RUST*` variables, and the test and warm-caches jobs share it. The former cache of the
+  whole `target/` (7.7–8.3 GB per architecture) is gone: restoring it took longer than
+  the dependency builds it saved. The steady state is two Nix stores, two dependency
+  entries and the corpus, which must stay under GitHub's 10 GB per repository; check
+  with `gh api repos/unemu-org/x86jit/actions/cache/usage` and `gh cache list`.
+  Only pushes to `main` save caches; every other ref restores `main`'s,
+  as GitHub scopes caches, and per-branch copies would evict them. A corpus cache miss
+  fetches the corpus, and `SS286_REQUIRED=1` makes an absent corpus fail the test gate.
   The `oracles` submodule is deliberately not checked out: these gates use in-code
   witness values, while `vendor/80286/fetch.sh` fetches its pinned corpus separately.
   Manuals remain necessary when deriving new hardware facts.
-  Allow roughly 20–40 minutes per lane with cold caches and 10–25 minutes with warm
-  caches. These are planning estimates pending the first hosted run; each job has a
-  90-minute timeout. Runner provisioning, Nix binary-cache availability, disk use,
-  corpus downloads and native-oracle results must be checked on that first run.
+  A test job took about 30 minutes with the former `target/` cache; the target is 18
+  minutes or less with warm caches, and a docs-only push finishes in under 3 minutes.
+  Each test job has a 90-minute timeout.
   Every push to `origin` starts a run. To rerun a ref without a new push, dispatch it
   with an authenticated GitHub CLI, `gh workflow run ci.yml --ref <ref>`; read the
-  result in the commit's checks or with `gh run list --workflow ci.yml`.
+  result in the commit's checks or with `gh run list --workflow ci.yml`. A dispatch
+  always runs the full gate.
   A newer run on the same ref cancels an older one (concurrency group
-  `ci-<workflow>-<ref>`).
+  `ci-<workflow>-<ref>`), except on `main`: a `main` run classifies only the paths
+  since the previous push, so each one finishes.
 - **Local macOS**: `cargo nextest`, clippy and fmt additionally cover
   aarch64-apple-darwin. The Linux hosted lanes do not replace checks of Darwin-specific
   code. The native x86-64 Linux oracle and the real-program ladder do not run on macOS.
@@ -313,13 +363,13 @@ bash scripts/ci-gate.sh deny
 bash scripts/ci-gate.sh corpus       # fetch the corpus before the full test gate
 bash scripts/ci-gate.sh tests
 bash scripts/ci-gate.sh release
-bash scripts/ci-gate.sh lane32
 bash scripts/ci-gate.sh doctests
 bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu   # on x86-64
 bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu    # on aarch64
 bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
 bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
-python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v  # no builds/downloads
+python3 -B -m unittest discover -s scripts/tests -p test_ci_gate.py -v  # gates, plan, workflow
+XJ_DEVSHELL=host bash scripts/ci-gate.sh fmt   # fmt without Nix, as the docs-only lane runs it
 python3 -B -m unittest discover -s scripts/tests -p test_legacy_scope.py -v   # § Test scope
 nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
 ```
@@ -327,7 +377,9 @@ nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
 `CI_LOG_DIR` overrides the log directory; the script preserves the failing command's
 exit status through `tee`. The script tests stub external commands, checking dispatch,
 required corpus settings, all four cross-targets and failure propagation without running
-the full gate.
+the full gate. `test_ci_gate.py` also runs `scripts/ci-plan.py` against throwaway
+repositories and a stubbed `gh`, and checks the workflow's plan, docs-only, cache and
+skip steps.
 
 The FreeBSD lane runs `cargo check --locked --workspace --tests --target <target>`
 with default features. It type-checks the libraries and test code, including the

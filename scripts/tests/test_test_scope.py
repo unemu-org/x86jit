@@ -276,8 +276,22 @@ class Scopes(unittest.TestCase):
         self.assertIn("nix develop .#no-freebsd --no-update-lock-file --command pre-commit",
                       result.stdout)
 
+    def test_scope_prints_only_the_scope(self):
+        result = self.repo.scope("--scope", "main")
+        self.assertEqual((result.returncode, result.stdout), (0, "none\n"), result.stderr)
+        for path, scope in (("backlog/docs/guide.md", "docs-only"),
+                            ("x86jit-core/src/vm/nec.rs", "legacy-only"),
+                            ("x86jit-core/src/vm.rs", "shared")):
+            with self.subTest(path=path):
+                self.repo.write(path, "edited\n")
+                result = self.repo.scope("--scope", "main")
+                self.assertEqual((result.returncode, result.stdout), (0, f"{scope}\n"),
+                                 result.stderr)
+        self.assertFalse(self.repo.log.exists())
+
     def test_invalid_invocations(self):
         for args in ((), ("--run",), ("main", "extra"), ("--frobnicate",),
+                     ("--scope",), ("--scope", "main", "extra"), ("--scope", "no-such-ref"),
                      ("--plan",), ("--plan", "everything"), ("--classify",),
                      ("no-such-ref",)):
             with self.subTest(args=args):
@@ -302,8 +316,8 @@ class Plans(unittest.TestCase):
         gates = re.findall(r"run: (bash scripts/ci-gate\.sh [^\n]+)", workflow)
         expected = set()
         for gate in gates:
-            if gate.endswith(("devshell", "corpus")):
-                continue  # CI setup; the plan fetches the corpus only when absent
+            if gate.endswith(("devshell", "corpus", "build-tests", "build-release")):
+                continue  # CI setup and cache warming; the plan fetches the corpus only when absent
             if '"$CROSS_TARGET"' in gate:
                 expected |= {"bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu",
                              "bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu"}
@@ -311,6 +325,7 @@ class Plans(unittest.TestCase):
                 expected.add(gate)
         self.assertTrue(expected)
         self.assertLessEqual(expected, set(plan))
+        self.assertNotIn("bash scripts/ci-gate.sh lane32", plan)
         script_tests = re.findall(r"python3 -B -m unittest discover -s scripts/tests -p \S+",
                                   workflow)
         self.assertTrue(script_tests)

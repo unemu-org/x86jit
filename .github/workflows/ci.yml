@@ -3,27 +3,95 @@ name: CI
 # The gates of scripts/ci-gate.sh (backlog/docs/commands.md § Git remote and CI),
 # on GitHub-hosted x86-64 and aarch64 Ubuntu runners. This is the project's only
 # CI (decision-26). Runs on every push, on pull requests and on manual dispatch.
+# The plan job decides first (scripts/ci-plan.py): a push to main whose commit
+# already passed both test jobs skips them, a docs-only change runs fmt and the
+# guard without Nix, and everything else runs the full gate.
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+# actions: read lets the plan job find an earlier run of the same commit.
 permissions:
   contents: read
+  actions: read
 
-# A newer run on the same ref cancels an older one. The ci- prefix keeps this
-# group apart from any other workflow's <workflow>-<ref> group.
+# A newer run on the same ref cancels an older one, except on main: a main run
+# classifies only the paths since the previous push, so every main run must finish.
+# The ci- prefix keeps this group apart from any other workflow's <workflow>-<ref> group.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      gates: ${{ steps.plan.outputs.gates }}
+      docs: ${{ steps.plan.outputs.docs }}
+      warm: ${{ steps.plan.outputs.warm }}
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: false
+          # The classifier needs the base commit: main's previous tip or origin/main.
+          fetch-depth: 0
+
+      # Any failure here runs the full gate (fail safe).
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 -B scripts/ci-plan.py || {
+            echo 'ci-plan.py failed; running the full gate'
+            printf '%s\n' gates=true docs=false warm=false scope=shared >> "$GITHUB_OUTPUT"
+          }
+
+      # Includes test_legacy_scope.py, which keeps the legacy-only scope of
+      # scripts/test-scope.sh sound, and the scope classifier's own tests.
+      - name: Gate script tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      # The docs-only lane: no Nix, the runner's rustup at flake.nix's Rust version.
+      - name: Formatting (docs-only)
+        if: ${{ !cancelled() && steps.plan.outputs.docs == 'true' }}
+        env:
+          XJ_DEVSHELL: host
+        run: bash scripts/ci-gate.sh fmt
+
+      - name: Guest-agnostic guard (docs-only)
+        if: ${{ !cancelled() && steps.plan.outputs.docs == 'true' }}
+        run: bash scripts/ci-gate.sh guard
+
+      - name: Upload gate logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-logs-plan
+          path: ci-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   test:
     name: test (${{ matrix.arch }})
+    needs: plan
+    # Runs even when only the script tests failed, so every gate reports.
+    if: ${{ !cancelled() && needs.plan.outputs.gates == 'true' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -56,12 +124,6 @@ jobs:
           # The gates use in-code witness values, not the manual PDFs or tables.
           submodules: false
 
-      # Includes test_legacy_scope.py, which keeps the legacy-only scope of
-      # scripts/test-scope.sh sound, and the scope classifier's own tests.
-      - name: Gate script tests
-        run: |
-          python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
-
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
         with:
@@ -69,22 +131,44 @@ jobs:
           github_access_token: ""
           enable_kvm: false
 
+      # The Nix store holds the dev shell's closure; a hit leaves nix develop little to fetch.
+      - name: Restore Nix store
+        id: nix_cache
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.devshell }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.devshell }}-
+
       - name: Dev shell
         id: devshell
         run: bash scripts/ci-gate.sh devshell
 
-      # Separate architectures and toolchains; reuse dependencies across source edits.
-      - name: Restore cargo cache
-        id: cargo_cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # Saved right after the dev shell, so a failing gate cannot lose it.
+      - name: Save Nix store
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.devshell.outcome == 'success' && steps.nix_cache.outputs.hit-primary-key != 'true' }}
+        uses: nix-community/cache-nix-action/save@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-v1-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'scripts/ci-gate.sh') }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-v1-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'scripts/ci-gate.sh') }}-
+          primary-key: ${{ steps.nix_cache.outputs.primary-key }}
+
+      # Needs the dev shell: the key includes the Nix toolchain's rustc -vV. Saved by
+      # its post step at the end of the job, also when a gate fails.
+      - name: Rust dependency cache
+        id: rust_cache
+        if: ${{ steps.devshell.outcome == 'success' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One entry per architecture and dev shell, shared by the test and warm-caches
+          # jobs (shared-key replaces the job id). It holds the registry and the compiled
+          # dependencies of every profile and target one job builds (dev, test, release,
+          # cross checks); workspace crates are pruned and always build fresh. The key
+          # also hashes rustc -vV, Cargo.toml/Cargo.lock and CARGO*/RUST* variables, so
+          # both jobs keep identical env blocks.
+          prefix-key: rust-v1
+          shared-key: ${{ matrix.arch }}-${{ matrix.devshell }}
+          cmd-format: nix develop .#${{ matrix.devshell }} --no-update-lock-file --command {0}
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The corpus is architecture independent and pinned inside fetch.sh.
       - name: Restore 80286 corpus cache
@@ -124,10 +208,6 @@ jobs:
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
         run: bash scripts/ci-gate.sh release
 
-      - name: 32-bit differential lane (Compat32)
-        if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
-        run: bash scripts/ci-gate.sh lane32
-
       - name: Documentation tests
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' }}
         run: bash scripts/ci-gate.sh doctests
@@ -148,21 +228,11 @@ jobs:
         if: ${{ !cancelled() && steps.devshell.outcome == 'success' && matrix.freebsd }}
         run: bash scripts/ci-gate.sh cross x86_64-unknown-freebsd
 
-      # Only push runs populate caches; pull requests can restore them. Explicit saves
-      # keep dependency caches warm even when a gate fails.
-      - name: Save cargo cache
-        if: ${{ !cancelled() && github.event_name == 'push' && steps.devshell.outcome == 'success' && steps.cargo_cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
-
+      # Only pushes to main save caches (here, the Nix store above and the Rust
+      # dependency cache's save-if); every other ref restores main's (GitHub's cache
+      # scoping), and per-branch copies would evict them.
       - name: Save 80286 corpus cache
-        if: ${{ !cancelled() && github.event_name == 'push' && steps.corpus.outcome == 'success' && steps.corpus_cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.corpus.outcome == 'success' && steps.corpus_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: x86jit-tests/vendor/80286/v1_real_mode
@@ -177,3 +247,128 @@ jobs:
           path: ci-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # A main push that skips the test jobs still keeps main's caches present, since
+  # other refs can restore only those. On a hit nothing is built; a miss (a changed
+  # flake.lock, Cargo.lock, toolchain or corpus pin, or an evicted entry) rebuilds the
+  # dependencies the test job builds, without running any test.
+  warm-caches:
+    name: warm caches (${{ matrix.arch }})
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.outputs.warm == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            cross-target: aarch64-unknown-linux-gnu
+            devshell: default
+            freebsd: true
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            cross-target: x86_64-unknown-linux-gnu
+            devshell: no-freebsd
+            freebsd: false
+    # Identical to the test job's env: the Rust dependency cache key hashes it.
+    env:
+      CARGO_TERM_COLOR: never
+      XJ_DEVSHELL: ${{ matrix.devshell }}
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      # Keys and paths must stay identical to the test job's.
+      - name: Look up 80286 corpus cache
+        id: corpus_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: x86jit-tests/vendor/80286/v1_real_mode
+          key: ss286-${{ hashFiles('x86jit-tests/vendor/80286/fetch.sh') }}
+          lookup-only: true
+
+      - name: Fetch 80286 corpus
+        id: corpus
+        if: ${{ matrix.arch == 'x86_64' && steps.corpus_cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-gate.sh corpus
+
+      - name: Save 80286 corpus cache
+        if: ${{ steps.corpus.outcome == 'success' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: x86jit-tests/vendor/80286/v1_real_mode
+          key: ${{ steps.corpus_cache.outputs.cache-primary-key }}
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        with:
+          nix_version: "2.29.2"
+          github_access_token: ""
+          enable_kvm: false
+
+      # Restored, not only looked up: the dependency cache needs the dev shell's rustc.
+      - name: Restore Nix store
+        id: nix_cache
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.devshell }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.devshell }}-
+
+      - name: Dev shell
+        id: devshell
+        run: bash scripts/ci-gate.sh devshell
+
+      - name: Save Nix store
+        if: ${{ steps.devshell.outcome == 'success' && steps.nix_cache.outputs.hit-primary-key != 'true' }}
+        uses: nix-community/cache-nix-action/save@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: ${{ steps.nix_cache.outputs.primary-key }}
+
+      - name: Rust dependency cache
+        id: rust_cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One entry per architecture and dev shell, shared by the test and warm-caches
+          # jobs (shared-key replaces the job id). It holds the registry and the compiled
+          # dependencies of every profile and target one job builds (dev, test, release,
+          # cross checks); workspace crates are pruned and always build fresh. The key
+          # also hashes rustc -vV, Cargo.toml/Cargo.lock and CARGO*/RUST* variables, so
+          # both jobs keep identical env blocks.
+          prefix-key: rust-v1
+          shared-key: ${{ matrix.arch }}-${{ matrix.devshell }}
+          cmd-format: nix develop .#${{ matrix.devshell }} --no-update-lock-file --command {0}
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # On a miss, build what the test job builds, so the saved entry covers it.
+      - name: Build (clippy)
+        if: ${{ steps.rust_cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-gate.sh clippy
+
+      - name: Build (tests)
+        if: ${{ steps.rust_cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-gate.sh build-tests
+
+      - name: Build (release)
+        if: ${{ steps.rust_cache.outputs.cache-hit != 'true' }}
+        run: bash scripts/ci-gate.sh build-release
+
+      - name: Build (cross-target check)
+        if: ${{ steps.rust_cache.outputs.cache-hit != 'true' }}
+        env:
+          CROSS_TARGET: ${{ matrix.cross-target }}
+        run: bash scripts/ci-gate.sh cross "$CROSS_TARGET"
+
+      - name: Build (FreeBSD checks)
+        if: ${{ steps.rust_cache.outputs.cache-hit != 'true' && matrix.freebsd }}
+        run: |
+          bash scripts/ci-gate.sh cross aarch64-unknown-freebsd
+          bash scripts/ci-gate.sh cross x86_64-unknown-freebsd

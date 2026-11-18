@@ -2,6 +2,7 @@
 # Choose the local test scope for this branch's changes, then print it or run it.
 #
 #   bash scripts/test-scope.sh [--run] <base-ref>
+#   bash scripts/test-scope.sh --scope <base-ref>
 #   bash scripts/test-scope.sh --classify <path>...
 #   bash scripts/test-scope.sh --plan {docs-only|legacy-only|shared}
 #
@@ -14,14 +15,17 @@
 #   legacy-only  every path is legacy or docs.
 #   shared       anything else. This runs the full gate, the gates CI runs.
 # --run executes the commands and keeps going after a failure, as CI does; it
-# exits 1 if any command failed. --classify prints the class of each path and
-# --plan prints a scope's commands; neither runs anything.
-# The script shortens local loops. CI on GitHub still runs the full gate on every
-# push (backlog/docs/commands.md § Test scope).
+# exits 1 if any command failed. --scope prints only the scope, or `none` for an
+# empty diff. --classify prints the class of each path and --plan prints a scope's
+# commands; none of the three runs anything.
+# The script shortens local loops. CI (scripts/ci-plan.py) uses --scope only to
+# stop a docs-only push after fmt, the guard and the script tests; any other scope
+# runs the full gate (backlog/docs/commands.md § Test scope).
 set -euo pipefail
 
 usage() {
     echo 'Usage: bash scripts/test-scope.sh [--run] <base-ref>' >&2
+    echo '       bash scripts/test-scope.sh --scope <base-ref>' >&2
     echo '       bash scripts/test-scope.sh --classify <path>...' >&2
     echo '       bash scripts/test-scope.sh --plan {docs-only|legacy-only|shared}' >&2
     exit 2
@@ -214,7 +218,6 @@ plan_shared() {
         'bash scripts/ci-gate.sh deny'
         'bash scripts/ci-gate.sh tests'
         'bash scripts/ci-gate.sh release'
-        'bash scripts/ci-gate.sh lane32'
         'bash scripts/ci-gate.sh doctests'
         'bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu'
         'bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu'
@@ -268,11 +271,11 @@ case "$1" in
         ;;
 esac
 
-run=no
-if [[ "$1" == --run ]]; then
-    run=yes
-    shift
-fi
+mode=print
+case "$1" in
+    --run) mode=run; shift ;;
+    --scope) mode=scope; shift ;;
+esac
 [[ $# -eq 1 && "$1" != -* ]] || usage
 base=$1
 merge_base=$(git merge-base "$base" HEAD 2>/dev/null) || {
@@ -291,21 +294,30 @@ done < <({
 } | LC_ALL=C sort -zu)
 
 scope=docs-only
-echo "base: $base (merge base $(git rev-parse --short "$merge_base"))"
-echo "changed paths: ${#paths[@]}"
+listing=()
 for path in ${paths[@]+"${paths[@]}"}; do
     class=$(path_class "$path")
-    printf '  %-6s  %s\n' "$class" "$path"
+    listing+=("$(printf '  %-6s  %s' "$class" "$path")")
     case "$class" in
         shared) scope=shared ;;
         legacy) [[ "$scope" == shared ]] || scope=legacy-only ;;
     esac
 done
+if [[ "$mode" == scope ]]; then
+    [[ ${#paths[@]} -gt 0 ]] || scope=none
+    echo "$scope"
+    exit 0
+fi
+echo "base: $base (merge base $(git rev-parse --short "$merge_base"))"
+echo "changed paths: ${#paths[@]}"
+for line in ${listing[@]+"${listing[@]}"}; do
+    echo "$line"
+done
 plan "$scope" yes ${paths[@]+"${paths[@]}"}
 echo "scope: $scope"
 print_commands
 
-[[ "$run" == yes ]] || exit 0
+[[ "$mode" == run ]] || exit 0
 failed=()
 for command in ${commands[@]+"${commands[@]}"}; do
     printf '\n==> %s\n' "$command"

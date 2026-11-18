@@ -4,7 +4,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: bash scripts/ci-gate.sh {devshell|corpus|fmt|guard|clippy|deny|tests|release|lane32|doctests|cross <target>}' >&2
+    echo 'Usage: bash scripts/ci-gate.sh {devshell|corpus|fmt|guard|clippy|deny|tests|release|build-tests|build-release|doctests|cross <target>}' >&2
     exit 2
 }
 
@@ -21,8 +21,23 @@ else
 fi
 
 # XJ_DEVSHELL selects a flake dev shell other than the default; the aarch64
-# Linux CI lane uses `no-freebsd` (flake.nix).
-if [[ -n "${XJ_DEVSHELL:-}" && "${XJ_DEVSHELL}" != default ]]; then
+# Linux CI lane uses `no-freebsd` (flake.nix). `host` uses no Nix: the runner's
+# rustup with the toolchain version flake.nix pins. Only fmt takes it (guard and
+# corpus never enter the shell); the docs-only CI lane uses it to skip the Nix
+# install.
+host_toolchain=
+if [[ "${XJ_DEVSHELL:-}" == host ]]; then
+    case "$step" in
+        fmt | guard | corpus) ;;
+        *) echo "ci-gate: $step needs the Nix dev shell, not XJ_DEVSHELL=host" >&2; exit 2 ;;
+    esac
+    host_toolchain=$(sed -n 's/.*rust-bin\.stable\."\([0-9][0-9.]*\)".*/\1/p' flake.nix | head -n 1)
+    [[ -n "$host_toolchain" ]] || {
+        echo 'ci-gate: no rust-bin.stable."<version>" in flake.nix' >&2
+        exit 2
+    }
+    gate_command=(rustup run "$host_toolchain")
+elif [[ -n "${XJ_DEVSHELL:-}" && "${XJ_DEVSHELL}" != default ]]; then
     gate_command=(nix develop ".#${XJ_DEVSHELL}" --no-update-lock-file --command)
 else
     gate_command=(nix develop --no-update-lock-file --command)
@@ -45,14 +60,22 @@ case "$step" in
             --no-fail-fast --success-output final -E 'not binary(fuzz_robustness)')
         ;;
     release)
+        # Build only the binaries this gate runs: a nextest -E filter selects
+        # after building every test binary of the package.
         gate_command+=(cargo nextest run --locked --release -p x86jit-tests
             --no-fail-fast --success-output final
-            -E 'binary(jit) or binary(differential) or binary(corpus) or binary(smc) or binary(mt) or binary(fault_landing_pad) or binary(region_fault_state) or binary(rust_memory_faults)')
+            --test jit --test differential --test corpus --test smc --test mt
+            --test fault_landing_pad --test region_fault_state --test rust_memory_faults)
         ;;
-    lane32)
-        gate_command+=(cargo nextest run --locked -p x86jit-tests --features unicorn
-            --no-fail-fast --success-output final
-            -E 'binary(differential32) or (binary(fuzz) and (test(jit_matches_interp_32) or test(unicorn_matches_interp_32)))')
+    # Compile what tests and release build, with the same profile, packages and
+    # features, without running anything: CI fills main's dependency cache with them.
+    build-tests)
+        gate_command+=(cargo test --locked --workspace --features x86jit-tests/unicorn --no-run)
+        ;;
+    build-release)
+        gate_command+=(cargo test --locked --release -p x86jit-tests --no-run
+            --test jit --test differential --test corpus --test smc --test mt
+            --test fault_landing_pad --test region_fault_state --test rust_memory_faults)
         ;;
     doctests) gate_command+=(cargo test --locked --workspace --doc --all-features) ;;
     # Target Unicorn libraries are not available: type-check default features;
@@ -65,4 +88,8 @@ log_dir=${CI_LOG_DIR:-ci-logs}
 log_name=$step
 [[ "$step" != cross ]] || log_name="cross-$2"
 mkdir -p "$log_dir"
+if [[ -n "$host_toolchain" && "$step" == fmt ]]; then
+    rustup toolchain install "$host_toolchain" --profile minimal --component rustfmt \
+        --no-self-update 2>&1 | tee "$log_dir/toolchain.log"
+fi
 "${gate_command[@]}" 2>&1 | tee "$log_dir/$log_name.log"
