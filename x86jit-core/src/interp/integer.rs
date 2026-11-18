@@ -785,6 +785,24 @@ pub(crate) enum LockedUpdate {
     Cas(u64),
 }
 
+impl LockedUpdate {
+    /// The value written back over `prev`, the `size`-byte operand as read.
+    fn apply(self, prev: u64, src: u64, size: u8) -> u64 {
+        let m = mask(size);
+        (match self {
+            LockedUpdate::Rmw(RmwOp::Add) => prev.wrapping_add(src),
+            LockedUpdate::Rmw(RmwOp::Sub) => prev.wrapping_sub(src),
+            LockedUpdate::Rmw(RmwOp::Rsub) => src.wrapping_sub(prev),
+            LockedUpdate::Rmw(RmwOp::And) => prev & src,
+            LockedUpdate::Rmw(RmwOp::Or) => prev | src,
+            LockedUpdate::Rmw(RmwOp::Xor) => prev ^ src,
+            LockedUpdate::Rmw(RmwOp::Xchg) => src,
+            LockedUpdate::Cas(expected) if prev == expected & m => src,
+            LockedUpdate::Cas(_) => prev,
+        }) & m
+    }
+}
+
 /// A locked or implicitly locked operand whose bytes touch a Trap region.
 ///
 /// Real16 and Machine IR perform the bus transaction as the processor does: one
@@ -797,15 +815,13 @@ pub(crate) enum LockedUpdate {
 /// here, so no ordering barrier applies. The read answer is bound in the retry
 /// ledger (see [`exec_load_retry`]), so the retry after the write acknowledgement
 /// does not read the device again. An operand that is not inside one Trap region
-/// returns `Exit::UnknownInstruction`, as before: the processor performs it in as
-/// many bus cycles as necessary (SDM Vol 3A §11.1.2.2), which separate exits do
-/// not express yet. Returns the value read.
+/// is [`locked_split_operand`]. Returns the value read.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn locked_device_operand(
+pub(crate) fn locked_device_operand<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory>(
     cpu: &mut CpuState,
-    mem: &Memory,
+    access: &Access<ROUTED, ORDER, M>,
     cur_addr: u64,
     ir: &IrBlock,
     addr: u64,
@@ -813,8 +829,9 @@ pub(crate) fn locked_device_operand(
     size: u8,
     update: LockedUpdate,
 ) -> Result<u64, InterpResult> {
+    let mem: &Memory = access;
     if !matches!(mem.region_kind(addr, size), Ok(crate::RegionKind::Trap)) {
-        return Err(unknown_atomic_exit(cpu, mem, cur_addr, ir));
+        return locked_split_operand(cpu, access, cur_addr, ir, addr, src, size, update);
     }
     let m = mask(size);
     let key = crate::state::bound_answer_key(addr, size, false);
@@ -840,17 +857,7 @@ pub(crate) fn locked_device_operand(
             0,
         ));
     };
-    let value = match update {
-        LockedUpdate::Rmw(RmwOp::Add) => prev.wrapping_add(src),
-        LockedUpdate::Rmw(RmwOp::Sub) => prev.wrapping_sub(src),
-        LockedUpdate::Rmw(RmwOp::Rsub) => src.wrapping_sub(prev),
-        LockedUpdate::Rmw(RmwOp::And) => prev & src,
-        LockedUpdate::Rmw(RmwOp::Or) => prev | src,
-        LockedUpdate::Rmw(RmwOp::Xor) => prev ^ src,
-        LockedUpdate::Rmw(RmwOp::Xchg) => src,
-        LockedUpdate::Cas(expected) if prev == expected & m => src,
-        LockedUpdate::Cas(_) => prev,
-    } & m;
+    let value = update.apply(prev, src, size);
     if cpu.pending_mmio_write {
         cpu.pending_mmio_write = false;
         Ok(prev)
@@ -865,6 +872,279 @@ pub(crate) fn locked_device_operand(
             value,
         ))
     }
+}
+
+/// One piece of a locked operand that lies partly in RAM and partly in a Trap
+/// region: operand bytes `first..first + len`, at consecutive bus addresses from
+/// `addr`, all in one region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockedPiece {
+    pub(crate) first: u8,
+    pub(crate) len: u8,
+    pub(crate) addr: u64,
+    pub(crate) device: bool,
+}
+
+/// How [`locked_pieces`] divides a locked operand that touches a Trap region but
+/// is not inside one.
+pub(crate) enum LockedPieces {
+    /// RAM pieces and the piece of one Trap region, in operand byte order.
+    Split([LockedPiece; 8], usize),
+    /// Bytes in more than one Trap region: `Exit::UnknownInstruction`, as before.
+    Refused,
+    /// A piece in ROM or unmapped, or a RAM piece the host refuses to write: the
+    /// containment miss of a locked operand, reported at the piece before any
+    /// transfer.
+    Miss(MemTrap, LockedPiece),
+}
+
+/// The pieces of a locked operand of `size` bytes whose byte `i` is at bus
+/// address `byte(i)`: maximal runs of consecutive addresses in one region.
+///
+/// Every byte must lie in RAM or in one Trap region. An operand over two Trap
+/// regions keeps `Exit::UnknownInstruction` (as before xj-ir6.34: one exit names
+/// one region). A byte in ROM or in no region is the containment miss that a
+/// locked operand over two regions takes (spec.md §5.2, Data accesses across
+/// adjacent regions), and so is a RAM piece the host refuses to write (`ROUTED`);
+/// both are found before any transfer, so the instruction faults with no device
+/// transfer issued and nothing committed (ASSUMED: an engine rule, as the
+/// twenty-bit store and the A20-split locked operand validate their destination
+/// before the first transfer). With one Trap region, the device bytes form one
+/// piece: a region is one range of bus addresses.
+#[cold]
+#[inline(never)]
+pub(crate) fn locked_pieces<const ROUTED: bool>(
+    mem: &Memory,
+    size: u8,
+    byte: impl Fn(u8) -> u64,
+) -> LockedPieces {
+    let mut pieces = [LockedPiece {
+        first: 0,
+        len: 0,
+        addr: 0,
+        device: false,
+    }; 8];
+    let mut ends = [None; 8];
+    let mut len = 0;
+    let mut device_end = None;
+    for i in 0..size.min(8) {
+        let at = byte(i);
+        let kind = mem.region_kind(at, 1);
+        let end = mem.region_end(at).ok();
+        let device = matches!(kind, Ok(crate::RegionKind::Trap));
+        if device {
+            if device_end.is_some_and(|known| Some(known) != end) {
+                return LockedPieces::Refused;
+            }
+            device_end = end;
+        }
+        if len > 0 {
+            let last = &mut pieces[len - 1];
+            if last.addr.wrapping_add(u64::from(last.len)) == at && ends[len - 1] == end {
+                last.len += 1;
+                continue;
+            }
+        }
+        pieces[len] = LockedPiece {
+            first: i,
+            len: 1,
+            addr: at,
+            device,
+        };
+        ends[len] = end;
+        len += 1;
+    }
+    for piece in &pieces[..len] {
+        let checked = match mem.region_kind(piece.addr, piece.len) {
+            Ok(crate::RegionKind::Trap) => Ok(()),
+            Ok(crate::RegionKind::Ram) => mem.probe_write_mode::<ROUTED>(piece.addr, piece.len),
+            Ok(crate::RegionKind::Rom) => Err(MemTrap::Unmapped),
+            Err(trap) => Err(trap),
+        };
+        if let Err(trap) = checked {
+            return LockedPieces::Miss(trap, *piece);
+        }
+    }
+    LockedPieces::Split(pieces, len)
+}
+
+/// The read, update and write of a locked operand split by [`locked_pieces`]
+/// into RAM pieces and the piece of one Trap region (xj-ir6.34). The processor
+/// performs such an operand: the lock "is not affected by the alignment of the
+/// memory field" and is held "for as many bus cycles as necessary to update the
+/// entire operand" (SDM Vol 3A §11.1.2.2 p. 11-4; 80386 PRM §11.2.1 p. 11-5).
+///
+/// - Order: the pieces are read in operand byte order, the lowest address
+///   first. On the twenty-bit models that is the bus order of a word at an odd
+///   address, the low byte first (8086 Family UM §4.2 p. 4-15; NEC V20/V30 UM
+///   §4 p. 4-3: DERIVED for an operand partly in a device). For the 80286, the
+///   80386 and the alias no pinned source orders the bus cycles of a misaligned
+///   operand (80386 PRM §2.2 p. 2-4 says only that the processor converts it
+///   into "the appropriate sequences of requests"), so the order is ASSUMED,
+///   the one the engine's plain split read uses. The write sends the device
+///   piece first and commits the RAM pieces once it is acknowledged (ASSUMED,
+///   the engine's order for a store split into a RAM and a device part,
+///   spec.md §5.2): a stop at the device leaves the RAM uncommitted. Only an
+///   `MmioWrite` handler that reads guest RAM can see that order.
+/// - Retry: each device transfer is the caller's (`device_read`,
+///   `device_write`), with its ledger key and pending completion. Each RAM piece
+///   is read once per attempt: its value is recorded in the retry ledger
+///   ([`crate::state::bound_ram_key`]) and every retry of the attempt, across the
+///   instruction's device stops and a budget or host stop before the retry
+///   (spec.md §5.2, Accesses of several transfers), computes from it. The RAM is
+///   written once, at the commit, after the device write is acknowledged.
+/// - Atomicity: the vCPU is stopped across the device exits, which no interrupt
+///   enters, so the result is the single-processor one. LIMITATION: the RAM
+///   pieces are a plain read and a later write, not one host atomic, so a store
+///   by another vCPU between them is lost: the crossing-operand policy of
+///   spec.md §8.2.3. The Machine models run one vCPU; the alias may run more.
+///
+/// A locked exchange whose old value is discarded (`read` false) reads nothing.
+/// Returns the operand as read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn locked_split_update<E>(
+    cpu: &mut CpuState,
+    owner: u64,
+    pieces: &[LockedPiece],
+    read: bool,
+    update: impl FnOnce(u64) -> u64,
+    mut device_read: impl FnMut(&mut CpuState, LockedPiece) -> Result<u64, E>,
+    mut ram_read: impl FnMut(&mut CpuState, LockedPiece) -> Result<u64, E>,
+    mut device_write: impl FnMut(&mut CpuState, LockedPiece, u64) -> Result<(), E>,
+    mut ram_write: impl FnMut(&mut CpuState, LockedPiece, u64) -> Result<(), E>,
+) -> Result<u64, E> {
+    let mut old = 0;
+    for &piece in pieces.iter().filter(|_| read) {
+        let value = if piece.device {
+            device_read(cpu, piece)?
+        } else {
+            let key = crate::state::bound_ram_key(piece.addr, piece.len);
+            match cpu.mmio_part(owner, key) {
+                Some(value) => value,
+                None => {
+                    let value = ram_read(cpu, piece)? & mask(piece.len);
+                    cpu.record_mmio_part(owner, key, value);
+                    value
+                }
+            }
+        };
+        old |= (value & mask(piece.len)) << (8 * piece.first);
+    }
+    let new = update(old);
+    let part = |piece: LockedPiece| (new >> (8 * piece.first)) & mask(piece.len);
+    for &piece in pieces.iter().filter(|piece| piece.device) {
+        device_write(cpu, piece, part(piece))?;
+    }
+    for &piece in pieces.iter().filter(|piece| !piece.device) {
+        ram_write(cpu, piece, part(piece))?;
+    }
+    Ok(old)
+}
+
+/// A Real16 or Machine-IR locked operand that touches a Trap region but is not
+/// inside one ([`locked_pieces`], [`locked_split_update`]). Its device answer is
+/// bound in the retry ledger as [`locked_device_operand`] binds it, and its RAM
+/// values go with the bound answers: code rewritten at the RIP between the
+/// exits, which changes the instruction fingerprint, starts a new attempt. The
+/// RAM pieces go through the walk's `access`, so its ordering barrier and its
+/// block-write observer apply.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn locked_split_operand<const ROUTED: bool, const ORDER: u8, M: InterpreterMemory>(
+    cpu: &mut CpuState,
+    access: &Access<ROUTED, ORDER, M>,
+    cur_addr: u64,
+    ir: &IrBlock,
+    addr: u64,
+    src: u64,
+    size: u8,
+    update: LockedUpdate,
+) -> Result<u64, InterpResult> {
+    let mem: &Memory = access;
+    let (pieces, len) = match locked_pieces::<ROUTED>(mem, size, |i| addr + u64::from(i)) {
+        LockedPieces::Split(pieces, len) => (pieces, len),
+        LockedPieces::Refused => return Err(unknown_atomic_exit(cpu, mem, cur_addr, ir)),
+        LockedPieces::Miss(trap, piece) => {
+            return Err(trap_out(
+                cpu,
+                cur_addr,
+                trap,
+                piece.addr,
+                piece.len,
+                AccessKind::Write,
+                0,
+            ))
+        }
+    };
+    // The fingerprint is recorded with the device answer, on a retry: the first
+    // attempt may run inside a block that starts earlier, whose temporaries are
+    // numbered differently. A recorded fingerprint that differs drops the RAM
+    // values too, before any of them is used.
+    if let Some(recorded) = cpu.mmio_part(cur_addr, crate::state::bound_fingerprint_key()) {
+        if recorded != instruction_fingerprint(ir, cur_addr) {
+            cpu.drop_bound_answers();
+        }
+    }
+    let read = !(matches!(update, LockedUpdate::Rmw(RmwOp::Xchg))
+        && exchange_discards_old(&ir.ops, cur_addr));
+    locked_split_update(
+        cpu,
+        cur_addr,
+        &pieces[..len],
+        read,
+        |old| update.apply(old, src, size),
+        |cpu, piece| {
+            let key = crate::state::bound_answer_key(piece.addr, piece.len, false);
+            if let Some(value) = bound_answer(cpu, ir, cur_addr, key, mem, piece.addr, piece.len) {
+                Ok(value)
+            } else if let Some(value) = cpu.pending_mmio.take() {
+                let value = value & mask(piece.len);
+                record_bound_answer(cpu, ir, cur_addr, key, value);
+                Ok(value)
+            } else {
+                let (at, len) = (piece.addr, piece.len);
+                Err(trap_out(
+                    cpu,
+                    cur_addr,
+                    MemTrap::Mmio,
+                    at,
+                    len,
+                    AccessKind::Read,
+                    0,
+                ))
+            }
+        },
+        |cpu, piece| {
+            access.read(piece.addr, piece.len).map_err(|trap| {
+                let (at, len) = (piece.addr, piece.len);
+                trap_out(cpu, cur_addr, trap, at, len, AccessKind::Read, 0)
+            })
+        },
+        |cpu, piece, value| {
+            if cpu.pending_mmio_write {
+                cpu.pending_mmio_write = false;
+                Ok(())
+            } else {
+                let (at, len) = (piece.addr, piece.len);
+                Err(trap_out(
+                    cpu,
+                    cur_addr,
+                    MemTrap::Mmio,
+                    at,
+                    len,
+                    AccessKind::Write,
+                    value,
+                ))
+            }
+        },
+        |cpu, piece, value| {
+            access.write(piece.addr, value, piece.len).map_err(|trap| {
+                let (at, len) = (piece.addr, piece.len);
+                trap_out(cpu, cur_addr, trap, at, len, AccessKind::Write, value)
+            })
+        },
+    )
 }
 
 /// Whether the locked exchange of the instruction at `cur_addr` in `ops` (or of
@@ -924,9 +1204,9 @@ fn unknown_atomic_exit(
     ir: &IrBlock,
 ) -> InterpResult {
     // Engine policy (§5.2) for Long64/Compat32, and for a Real16 or Machine
-    // operand only partly in a Trap region: separate device exits do not express
-    // the transaction there. Leave emulation to the embedder, as for paired
-    // compare-exchange.
+    // operand over more than one Trap region: separate device exits do not
+    // express the transaction there. Leave emulation to the embedder, as for
+    // paired compare-exchange.
     let next = ir.ops.iter().find_map(|op| match op {
         IrOp::InsnStart { guest_addr } if *guest_addr > cur_addr => Some(*guest_addr),
         _ => None,

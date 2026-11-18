@@ -505,8 +505,9 @@ instead of stopping. A fault of the instruction reports these records as its
 acknowledged transfers (`FaultProgress::acknowledged_transfers`).
 
 Some stores are split into a RAM part and a device part: the twenty-bit models'
-transfers of a word over a RAM byte and a device byte, and an operand that
-the A20 gate splits into bus pieces on the I286/I386 Machine path. Such a store
+transfers of a word over a RAM byte and a device byte, an operand that
+the A20 gate splits into bus pieces on the I286/I386 Machine path, and a locked
+operand partly in RAM and partly in a device (below). Such a store
 writes its device part first and commits the RAM part once the device write is
 acknowledged, so a stop at the device leaves the instruction's RAM uncommitted
 and the retry of a read-modify-write computes from the operand it read first.
@@ -538,7 +539,9 @@ of the uPD70108's 8-bit bus and the uPD70116's 16-bit bus. Hence:
   byte transfers on every model, the device part first as above. On the 8086 and
   V30 that is an engine limit (ASSUMED): one exit names one region, while the
   processor makes one bus cycle of an even word (UM §4.2 p. 4-15, Table 4-5).
-  A locked operand there keeps its typed refusal (below).
+  A locked word over a Trap byte and a RAM byte is performed the same way, with
+  its RAM byte read once (below); over two Trap regions it keeps its typed
+  refusal.
 - Frames are written in the engine's order: an interrupt frame is stored from
   SP-6 upward (IP, CS, FLAGS), a far-call frame from SP-4 upward (IP, CS), PUSH R
   from SP-2 downward; IRET, RETF and POP R read upward. On a 16-bit bus each even
@@ -589,14 +592,57 @@ stays with the embedder. The twenty-bit models move device data at their bus
 width (above), so a word operand there is one word read, then one word write, on
 the 8086 and V30 at an even address, and two byte reads, then two byte writes,
 otherwise; an XCHG over a RAM byte and a device byte transfers the device byte. A locked
-operand on RAM keeps the atomic path. A locked operand only partly in a Trap
-region — a word over the last RAM byte and the first device byte, or an A20-split
-operand with a RAM piece and a device piece — keeps `Exit::UnknownInstruction`
-with the instruction's bytes, as before, for the embedder to emulate. The
-processor performs such an operand in as many bus cycles as necessary (SDM Vol 3A
-§11.1.2.2); performing it with separate exits is a follow-up. An A20-split operand
-whose pieces all lie in devices is one transfer per bus piece. The alias's
-CMPXCHG8B keeps embedder emulation: `Exit::UnknownInstruction`, as below.
+operand on RAM keeps the atomic path. An A20-split operand whose pieces all lie
+in devices is one transfer per bus piece. The alias's CMPXCHG8B keeps embedder
+emulation: `Exit::UnknownInstruction`, as below.
+
+**Locked operands partly in RAM (xj-ir6.34).** The processor performs a locked
+operand whose bytes lie partly in RAM and partly in a device: the lock "is not
+affected by the alignment of the memory field" and is held "for as many bus
+cycles as necessary to update the entire operand" (SDM Vol 3A §11.1.2.2 p. 11-4;
+80386 PRM §11.2.1 p. 11-5). On the Real16 alias and every Machine model such an
+operand — a word over the last RAM byte and the first device byte, a doubleword
+with one to three bytes on either side, or an A20-split operand with a RAM piece
+and a device piece — is split into pieces, each a run of consecutive bus
+addresses in one region:
+- Order. The pieces are read in operand byte order, the lowest address first:
+  the RAM pieces directly, the device piece as one `MmioRead` of its bytes (one
+  transfer, as an A20 bus piece is; a byte transfer on the twenty-bit models,
+  whose split word is never inside one Trap region). Then the device piece is
+  written as one `MmioWrite`, and the RAM pieces are committed once it is
+  acknowledged. On the twenty-bit models the read order is the bus order of a
+  word at an odd address, the low byte first (8086 Family UM §4.2 p. 4-15;
+  DERIVED). For the 80286, the 80386 and the alias no pinned source orders the
+  bus cycles of a misaligned operand (the 80386 PRM §2.2 p. 2-4 says only that
+  the processor converts it into "the appropriate sequences of requests"), so the
+  order is ASSUMED: the one the engine's plain split read uses. The device-first
+  write is the engine's order for a split store (above, ASSUMED).
+- Retry. The value of each RAM piece is read once per attempt and recorded in
+  the retry ledger as a bound key: it lives across the instruction's own device
+  stops and a budget or host stop before the retry, and every retry computes from
+  it, so a store to that RAM between the exits does not change the result and is
+  overwritten by the commit. The device answer and acknowledgement are recorded
+  as every other device transfer of the path is, so the retry after the write's
+  acknowledgement reads no device. A fault, or any other stop, drops the RAM
+  values with the bound answers, and the re-execution reads both again; they are
+  never reported as acknowledged transfers.
+- Faults. Every piece is checked before the first transfer. A piece in ROM or in
+  no region is the containment miss of a locked operand over two regions
+  (`UnmappedMemory` for a write, at that piece), and a RAM piece the host refuses
+  to write faults there too: no device transfer is issued and nothing is
+  committed, a RAM fault coming before any device read (ASSUMED, as the
+  twenty-bit store and the A20-split locked operand validate first).
+- CMPXCHG writes its destination either way: the source when the comparison
+  succeeds, the value read when it fails (SDM Vol 2A §3.3 CMPXCHG, p. 3-194), so a
+  failed comparison writes the device piece and the RAM piece back.
+- Atomicity. The vCPU is stopped across both exits and takes no interrupt
+  between them, so the result is the single-processor one. LIMITATION: the RAM
+  pieces are a plain read and a later write, not one host atomic, so a store by
+  another vCPU between them is lost: the crossing-operand policy of §8.2.3. The
+  Machine models run one vCPU; the alias may run several.
+- An operand over two Trap regions, with or without RAM bytes, keeps
+  `Exit::UnknownInstruction` with the instruction's bytes: one exit names one
+  region. The alias's CMPXCHG8B keeps it too.
 
 **Atomic operations on Trap regions — Long64 and Compat32:** memory CMPXCHG, XADD,
 XCHG, CMPXCHG8B/CMPXCHG16B and supported LOCK-prefixed ALU/bit modifications return
@@ -1196,7 +1242,7 @@ IrOp::ReadReg { dst, reg } => {
 
 **Explicit ordering:** `IrOp::Fence { kind: Full }` carries MFENCE and precedes CPUID and Real16 IRET (SDM Vol 3A §11.3). It executes a SeqCst host fence in the interpreter and a Cranelift full fence in the JIT (`DMB ISH` on aarch64, `MFENCE` on x86-64), in every tier. LFENCE/SFENCE carry `Load`/`Store`; the interpreter uses Acquire/Release fences. The JIT emits DMB ISH for both in **every aarch64 tier**, using a conservative full fence to enforce explicit ordering independently of the ordinary-access tier, and emits no extra barrier for them on x86-64. Guest non-temporal stores currently use ordinary host stores; host non-temporal lowering would require SFENCE on x86 too (SDM Vol 3A §11.2.2, §11.2.5; Vol 2B §4.3 MFENCE/SFENCE; Vol 2A §3.3 LFENCE).
 
-**Locked operations:** atomicity is implemented on both backends in every tier for a naturally aligned operand. The bus lock does not depend on the operand's alignment (SDM Vol 3A §11.1.2.2 p. 11-4; Vol 2A LOCK p. 3-565). The interpreter, the shared helper that compiled CMPXCHG8B and CMPXCHG16B call, and the replay of an instruction whose compiled access took a host alignment fault (decision-13) update a misaligned operand with a compare-and-swap loop on the containing aligned 8- or 16-byte host word (`Memory::locked_unaligned`), which preserves the bytes outside the operand and retries after any store to the word: atomic inside one aligned 16-byte granule. **Limitation:** on that path no host primitive covers an operand that crosses an aligned 16-byte granule (a word at 15, a doubleword at 13–15, a quadword or CMPXCHG8B operand at 9–15, mod 16), or one whose containing word would pass the start or end of the backing (an owned backing whose length is not a multiple of 16, or an embedder's `HostRam` span whose start or end is not 16-byte aligned), so it is a plain read, update and write: it completes with the single-processor result but is not atomic against another vCPU. The A20-split operand of the 286 and 386 and the twenty-bit word that wraps its segment or the bus (§17.10) have the same policy. A cross-vCPU rendezvous for them is a follow-up. Other compiled locked forms issue the host atomic at the operand's address, so a misaligned operand there depends on the host. An x86-64 host performs it atomically at any alignment, a crossing one as a split lock (SDM Vol 3A §11.1.2.2), so a crossing operand is atomic in compiled code and not on the path above: the tiers diverge. On an aarch64 host the access either completes in hardware or takes an alignment fault: FEAT_LSE2 lets the LSE atomics complete inside a 16-byte granule, while XCHG's exclusives and a crossing operand are not covered by it (Arm architecture behaviour, not pinned in `oracles/`). A faulting access completes only through the embedder's decision-13 handler, whose replay takes the path above; without one the process receives SIGBUS. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.135.8 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
+**Locked operations:** atomicity is implemented on both backends in every tier for a naturally aligned operand. The bus lock does not depend on the operand's alignment (SDM Vol 3A §11.1.2.2 p. 11-4; Vol 2A LOCK p. 3-565). The interpreter, the shared helper that compiled CMPXCHG8B and CMPXCHG16B call, and the replay of an instruction whose compiled access took a host alignment fault (decision-13) update a misaligned operand with a compare-and-swap loop on the containing aligned 8- or 16-byte host word (`Memory::locked_unaligned`), which preserves the bytes outside the operand and retries after any store to the word: atomic inside one aligned 16-byte granule. **Limitation:** on that path no host primitive covers an operand that crosses an aligned 16-byte granule (a word at 15, a doubleword at 13–15, a quadword or CMPXCHG8B operand at 9–15, mod 16), or one whose containing word would pass the start or end of the backing (an owned backing whose length is not a multiple of 16, or an embedder's `HostRam` span whose start or end is not 16-byte aligned), so it is a plain read, update and write: it completes with the single-processor result but is not atomic against another vCPU. The A20-split operand of the 286 and 386, the twenty-bit word that wraps its segment or the bus (§17.10) and the RAM piece of a locked operand partly in a Trap region (§5.2) have the same policy. A cross-vCPU rendezvous for them is a follow-up. Other compiled locked forms issue the host atomic at the operand's address, so a misaligned operand there depends on the host. An x86-64 host performs it atomically at any alignment, a crossing one as a split lock (SDM Vol 3A §11.1.2.2), so a crossing operand is atomic in compiled code and not on the path above: the tiers diverge. On an aarch64 host the access either completes in hardware or takes an alignment fault: FEAT_LSE2 lets the LSE atomics complete inside a 16-byte granule, while XCHG's exclusives and a crossing operand are not covered by it (Arm architecture behaviour, not pinned in `oracles/`). A faulting access completes only through the embedder's decision-13 handler, whose replay takes the path above; without one the process receives SIGBUS. Full x86 locked-op ordering (SDM Vol 3A §11.2.3.9) is not guaranteed on aarch64 LL/SC paths: Cranelift 0.135.8 emits LDAXR/STLXR loops without a trailing DMB when LSE is unavailable, and XCHG uses LL/SC even with LSE. This limitation is separate from explicit fences, which always enforce their requested ordering.
 
 > **Switching tiers = flushing the translation cache.** Barriers are baked into compiled blocks, so a block compiled under `Fast` is wrong under `FullTso`. The tier is per-`Vm` config; if you ever make it switchable at runtime, the switch must invalidate the whole cache (and it's the cheap, correct way to implement it — don't try to key the cache by tier). Decide the tagging mechanics (lift-tags vs codegen-applies-blanket) in M7 — the lift sketches emit `MemOrder::None` today on purpose, which makes codegen-applies-blanket the natural fit.
 
@@ -2367,10 +2413,11 @@ width (`Memory::atomic_rmw`), the only data transfer of the twenty-bit walk
 wider than one byte on RAM. A device operand inside one Trap region is one read,
 then one write, of its bus transfers (§5.2, xj-ir6.33, xj-50w.20): a word
 transfer each at an even address on the I8086 and NecV30, byte transfers
-otherwise; one only partly in a
-Trap region is a typed refusal, and an operand
-over two adjacent regions keeps the containment miss of every locked operand
-(§5.2, Data accesses across adjacent regions). A word at an odd address
+otherwise; a word over a device byte and a RAM byte is performed by pieces, its
+RAM byte read once (§5.2, Locked operands partly in RAM; xj-ir6.34), a word
+over two Trap regions is a typed refusal, and an operand over two adjacent RAM
+regions keeps the containment miss of every locked operand (§5.2, Data accesses
+across adjacent regions). A word at an odd address
 takes the same atomic path: it is atomic inside one aligned 16-byte granule,
 and a word whose first byte is at 15 mod 16 crosses the granule and has the
 crossing operand's policy, a plain read and write, with the single-processor

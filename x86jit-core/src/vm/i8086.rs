@@ -213,8 +213,19 @@ fn fetch<const NEC: bool>(
     let mut prefixes = 0u32;
     let mut original = Vec::new();
     let mut suffix = Vec::new();
+    // A requested host stop is taken here only with no transfer of the
+    // instruction open: the Machine models finish the open retry first
+    // (spec.md §5.2, Accesses of several transfers), and a stop at the fetch of
+    // the retry would drop its pending completion and ask the device again.
+    let retrying = cpu.mmio_retry_active
+        || cpu.pending_mmio.is_some()
+        || cpu.pending_mmio_write
+        || cpu.pending_port_in.is_some();
     loop {
-        if prefixes.is_multiple_of(256) && word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0 {
+        if prefixes.is_multiple_of(256)
+            && !retrying
+            && word.load(Ordering::Relaxed) & EXIT_REQUESTED != 0
+        {
             return Err(Exit::Interrupted);
         }
         let offset = ip.wrapping_add((prefixes + suffix.len() as u32) as u16);

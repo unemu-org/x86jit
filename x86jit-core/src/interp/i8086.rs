@@ -429,8 +429,9 @@ pub(super) fn primitive<const ROUTED: bool, const ORDER: u8>(
 // of the operand's width (`Memory::atomic_rmw`), the one RAM transfer of this
 // walk wider than a byte. A device operand inside one Trap region is one read,
 // then one write, of its bus transfers (`locked_device`, spec.md §5.2); one
-// only partly in a Trap region is a typed refusal, and an operand over two
-// adjacent regions keeps the containment miss of every locked operand. A word
+// partly in RAM and partly in a Trap region is performed by pieces
+// (`locked_mixed`), and an operand over two adjacent RAM regions keeps the
+// containment miss of every locked operand. A word
 // at an odd address is the same atomic operation: atomic inside one aligned
 // 16-byte granule, and a plain read and write when its first byte is at 15 mod
 // 16 (`Memory::locked_unaligned`, spec.md §8.2.3). A word whose bytes wrap
@@ -458,7 +459,9 @@ fn locked_rmw<const ROUTED: bool, const ORDER: u8>(
         {
             locked_device(cpu, mem, tag, src, size, op)
         }
-        Err(MemTrap::Mmio) => Err(Exit::unknown_instruction(ip, *bytes, len)),
+        Err(MemTrap::Mmio) => {
+            locked_mixed::<ROUTED, ORDER>(cpu, mem, tag, src, size, op, (ip, bytes, len))
+        }
         Err(trap) => {
             let StepResult::Exit(exit) =
                 trap_out(cpu, cpu.rip, trap, first, size, AccessKind::Write, src).into_step()
@@ -492,7 +495,7 @@ fn locked_device(
     Ok(old)
 }
 
-fn updated(op: crate::ir::RmwOp, old: u64, src: u64) -> u64 {
+pub(super) fn updated(op: crate::ir::RmwOp, old: u64, src: u64) -> u64 {
     use crate::ir::RmwOp;
     match op {
         RmwOp::Add => old.wrapping_add(src),
@@ -512,7 +515,7 @@ fn updated(op: crate::ir::RmwOp, old: u64, src: u64) -> u64 {
 // for the whole instruction (UM §2.5 p. 2-18), but is not atomic against
 // another vCPU. This is the policy of the 286 and 386 for an A20-split operand
 // (spec.md §8.2.3). As in the atomic path, a word wholly in Trap regions is
-// `locked_device` and one only partly in them is a typed refusal.
+// `locked_device` and one only partly in them is `locked_mixed`.
 #[cold]
 #[inline(never)]
 fn locked_split<const ROUTED: bool, const ORDER: u8>(
@@ -536,11 +539,96 @@ fn locked_split<const ROUTED: bool, const ORDER: u8>(
         return locked_device(cpu, mem, tag, src, size, op);
     }
     if devices != 0 {
-        return Err(Exit::unknown_instruction(ip, *bytes, len));
+        return locked_mixed::<ROUTED, ORDER>(cpu, mem, tag, src, size, op, (ip, bytes, len));
     }
     let old = read::<ROUTED, ORDER>(cpu, mem, tag, size)?;
     write::<ROUTED, ORDER>(cpu, mem, tag, size, updated(op, old, src))?;
     Ok(old)
+}
+
+// A locked word over a RAM byte and a device byte (xj-ir6.34): the read of
+// both bytes, the low byte first, then the device byte's write and, once it is
+// acknowledged, the RAM byte's (`integer::locked_split_update`, which cites the
+// order and the retry rule). The device byte is a byte transfer on every model,
+// keyed by its address as every byte transfer of this walk is: its word is not
+// inside one Trap region (`device_word`). A word over two Trap regions keeps
+// the typed refusal, and a byte in ROM or in no region faults before any
+// transfer (`integer::locked_pieces`).
+#[cold]
+#[inline(never)]
+fn locked_mixed<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &Memory,
+    tag: u64,
+    src: u64,
+    size: u8,
+    op: crate::ir::RmwOp,
+    (ip, bytes, len): (u64, &[u8; 15], u8),
+) -> Result<u64, Exit> {
+    use super::integer::{locked_pieces, locked_split_update, LockedPieces};
+    let (pieces, count) = match locked_pieces::<ROUTED>(mem, size, |i| physical(tag, i)) {
+        LockedPieces::Split(pieces, count) => (pieces, count),
+        LockedPieces::Refused => return Err(Exit::unknown_instruction(ip, *bytes, len)),
+        LockedPieces::Miss(trap, piece) => {
+            return Err(transfer_exit(cpu, trap, piece.addr, piece.len, true, 0))
+        }
+    };
+    let access = Access::<ROUTED, ORDER, _>::new(mem);
+    let owner = cpu.rip;
+    locked_split_update(
+        cpu,
+        owner,
+        &pieces[..count],
+        true,
+        |old| updated(op, old, src),
+        |cpu, piece| {
+            if let Some(value) = cpu.mmio_part(owner, piece.addr) {
+                return Ok(value);
+            }
+            let Some(value) = cpu.pending_mmio.take() else {
+                return Err(transfer_exit(
+                    cpu,
+                    MemTrap::Mmio,
+                    piece.addr,
+                    piece.len,
+                    false,
+                    0,
+                ));
+            };
+            let value = value & mask(piece.len);
+            cpu.record_mmio_part(owner, piece.addr, value);
+            Ok(value)
+        },
+        |cpu, piece| {
+            access
+                .read(piece.addr, piece.len)
+                .map_err(|trap| transfer_exit(cpu, trap, piece.addr, piece.len, false, 0))
+        },
+        |cpu, piece, value| {
+            let key = piece.addr | (1 << 63);
+            if cpu.mmio_part(owner, key).is_some() {
+                return Ok(());
+            }
+            if !cpu.pending_mmio_write {
+                return Err(transfer_exit(
+                    cpu,
+                    MemTrap::Mmio,
+                    piece.addr,
+                    piece.len,
+                    true,
+                    value,
+                ));
+            }
+            cpu.pending_mmio_write = false;
+            cpu.record_mmio_part(owner, key, value);
+            Ok(())
+        },
+        |cpu, piece, value| {
+            access
+                .write(piece.addr, value, piece.len)
+                .map_err(|trap| transfer_exit(cpu, trap, piece.addr, piece.len, true, value))
+        },
+    )
 }
 
 /// How a NEC V20/V30 control primitive ended its instruction (decision-23 C4a).
@@ -1356,6 +1444,7 @@ pub(super) fn bus_evidence(cpu: &CpuState, coprocessor: bool) -> Box<[(u64, u64)
     };
     parts
         .into_iter()
+        .filter(|&(key, _)| !crate::state::is_bound_key(key))
         .map(|(key, value)| (key & 0xfffff, value))
         .collect()
 }

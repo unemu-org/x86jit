@@ -11,16 +11,17 @@ use x86jit_core::{
 // Memory kind 1 maps RAM at 0x4000 next to the RAM at 0x5000, so an operand at
 // 0x4fff covers two adjacent RAM regions and completes instead of faulting.
 // Memory kind 2 maps a Trap region there: an XCHG or LOCK byte operand at 0x4fff
-// stops at its device read before any state commits; a wider one, over the
-// device byte and RAM, keeps UnknownInstruction (spec.md §5.2).
+// stops at its device read before any state commits; so does a wider one, over
+// the device byte and RAM, since xj-ir6.34 (spec.md §5.2), which until then
+// kept UnknownInstruction.
 #[test]
 fn checked_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_393));
+    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_490));
 }
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_403));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_497));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {

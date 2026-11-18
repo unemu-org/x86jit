@@ -834,32 +834,28 @@ fn locked_words_on_a_device_follow_the_bus_width() {
     witness(&cases);
 }
 
-/// Rule 5: a locked word over a device byte and a RAM byte, or over two device
-/// regions, keeps the typed refusal on every model (xj-ir6.34), with no
-/// transfer and nothing committed.
+/// Rule 5: a locked word over two device regions keeps the typed refusal on
+/// every model, with no transfer and nothing committed: one exit names one
+/// region. A locked word over a device byte and a RAM byte is performed since
+/// xj-ir6.34 (`locked_split_device.rs`).
 #[test]
-fn locked_word_over_device_and_ram_is_refused() {
+fn locked_word_over_two_device_regions_is_refused() {
     for model in MODELS {
-        // B800:0010 is the region's last device byte; 0011 is RAM, or the
-        // first byte of a second device region: the operand is not inside one
-        // Trap region either way.
-        for traps in [
-            &[(0xb_8000u64, 0x11u64)][..],
-            &[(0xb_8000, 0x11), (0xb_8011, 0xef)][..],
-        ] {
-            let c = case("lock add [di],ax", &[0xf0, 0x01, 0x05]).traps(traps);
-            let (vm, mut cpu) = setup(model, &c, true);
-            let mut device = Device::new(&c);
-            let run = drive(&vm, &mut cpu, 64, Some(&mut device), Resume::Run, None);
-            assert!(run.bus.is_empty(), "{model:?} {traps:x?}: {:x?}", run.bus);
-            assert_eq!(
-                run.observation.stop,
-                format!("UnknownInstruction@{CODE:#x}+3"),
-                "{model:?} {traps:x?}"
-            );
-            assert_eq!(run.observation.retired, 0, "{model:?} {traps:x?}");
-            assert_eq!(cpu.cpu.gpr[0], 0xc35a, "{model:?} {traps:x?}");
-        }
+        // B800:0010 is the first region's last device byte; 0011 is the first
+        // byte of a second device region.
+        let traps = &[(0xb_8000u64, 0x11u64), (0xb_8011, 0xef)][..];
+        let c = case("lock add [di],ax", &[0xf0, 0x01, 0x05]).traps(traps);
+        let (vm, mut cpu) = setup(model, &c, true);
+        let mut device = Device::new(&c);
+        let run = drive(&vm, &mut cpu, 64, Some(&mut device), Resume::Run, None);
+        assert!(run.bus.is_empty(), "{model:?}: {:x?}", run.bus);
+        assert_eq!(
+            run.observation.stop,
+            format!("UnknownInstruction@{CODE:#x}+3"),
+            "{model:?}"
+        );
+        assert_eq!(run.observation.retired, 0, "{model:?}");
+        assert_eq!(cpu.cpu.gpr[0], 0xc35a, "{model:?}");
     }
 }
 

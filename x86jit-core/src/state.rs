@@ -1033,6 +1033,17 @@ pub(crate) fn bound_fingerprint_key() -> u64 {
     BOUND_FINGERPRINT
 }
 
+/// The ledger key of the value a locked operand's RAM piece held when the
+/// attempt read it, for an operand partly in RAM and partly in a Trap region
+/// (`interp::integer::locked_split_update`): bit 60 with the piece's size
+/// (1 to 7 in bits 59..57, never zero, so never the fingerprint key) and the
+/// low 57 address bits. It is a bound key: it lives across the instruction's
+/// own device stops and the boundary stops before its retry, and it is not an
+/// acknowledged transfer.
+pub(crate) fn bound_ram_key(addr: u64, size: u8) -> u64 {
+    BOUND_FINGERPRINT | (u64::from(size & 7) << 57) | (addr & ((1 << 57) - 1))
+}
+
 /// Whether a ledger key is a bound answer or its fingerprint. These are never
 /// reported as acknowledged transfers: they do not outlive the instruction's
 /// own device stops.

@@ -2231,11 +2231,11 @@ fn a_locked_word_over_two_regions_keeps_the_single_region_rule() {
 }
 
 // A locked word that wraps its segment (DS:FFFFh, UM §2.3 p. 2-12) with one
-// byte in a Trap region and the other in RAM has neither an atomic path nor
-// the device path of a word wholly in Trap regions: a typed refusal before any
-// transfer, the RAM byte unchanged (`locked_split`; spec.md §17.10).
+// byte in a Trap region and the other in RAM is performed by pieces since
+// xj-ir6.34 (spec.md §5.2, Locked operands partly in RAM): one byte read and
+// one byte write of the device byte, and the RAM byte written once after it.
 #[test]
-fn a_locked_word_that_wraps_half_into_a_device_is_refused() {
+fn a_locked_word_that_wraps_half_into_a_device_is_performed() {
     // DS = 1000h, BX = FFFFh: the low byte at 1FFFFh, the high byte at 10000h.
     // The Trap region holds the high byte, then the low byte.
     for (trap, ram) in [(0x10000usize, 0x1ffffu64), (0x1fff0, 0x10000)] {
@@ -2261,21 +2261,47 @@ fn a_locked_word_that_wraps_half_into_a_device_is_refused() {
             cpu.cpu.gpr[4] = 0x8000;
             cpu.cpu.ds = 0x1000;
             cpu.cpu.gpr[3] = 0xffff;
-            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-            assert!(
-                matches!(
-                    r.stop(),
-                    StepStop::Exit(Exit::UnknownInstruction {
-                        addr: IP,
-                        len: 3,
-                        ..
-                    })
-                ),
-                "{model:?} {trap:#x}: {:?}",
-                r.stop()
+            let device = if ram == 0x1ffff { 0x10000 } else { 0x1ffff };
+            let mut bus = Vec::new();
+            let steps = loop {
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                match r.stop() {
+                    StepStop::Exit(Exit::MmioRead { addr, size, .. }) => {
+                        bus.push((false, *addr, *size, 0));
+                        cpu.complete_mmio_read(0x12);
+                    }
+                    StepStop::Exit(Exit::MmioWrite {
+                        addr, size, value, ..
+                    }) => {
+                        bus.push((true, *addr, *size, *value));
+                        cpu.complete_mmio_write();
+                    }
+                    _ => break r.steps(),
+                }
+            };
+            // LOCK INC WORD [BX]: the operand is 125Ah (RAM low) or 5A12h.
+            let (old, low_is_ram) = if ram == 0x1ffff {
+                (0x125a_u64, true)
+            } else {
+                (0x5a12, false)
+            };
+            let new = old + 1;
+            let (ram_byte, device_byte) = if low_is_ram {
+                (new & 0xff, new >> 8)
+            } else {
+                (new >> 8, new & 0xff)
+            };
+            assert_eq!(
+                bus,
+                [(false, device, 1, 0), (true, device, 1, device_byte)],
+                "{model:?} {trap:#x}"
             );
-            assert_eq!((r.steps(), cpu.cpu.rip), (0, IP), "{model:?} {trap:#x}");
-            assert_eq!(vm.mem.read(ram, 1).unwrap(), 0x5a, "{model:?} {trap:#x}");
+            assert_eq!((steps, cpu.cpu.rip), (1, IP + 3), "{model:?} {trap:#x}");
+            assert_eq!(
+                vm.mem.read(ram, 1).unwrap(),
+                ram_byte,
+                "{model:?} {trap:#x}"
+            );
         }
     }
 }
