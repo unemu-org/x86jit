@@ -30,12 +30,12 @@ I386/32-bit TSS. An interpreter-only backend fixture panics if compilation occur
 | Type, privilege, presence, limit and error codes | Model-specific #GP/#NP/#TS, selector error codes, old/new task placement | 286 SWITCH_TASKS pp. B-12–13, CALL/JMP/IRET pp. B-25/B-51/B-57–58; 386 §7.5 Table 7-1 pp. 7-8–9, §17 pp. 17-41/17-76/17-86 | `pre_switch_faults_keep_the_outgoing_task`, `short_tss_fault_placement_is_model_specific`, `target_ip_limit_fault_is_in_new_task_with_gp`, `task_segment_validation_vectors_codes_and_order_follow_each_prm` |
 | 286 and 386 state images | Word/dword dynamic fields, all eight GPRs, flags/IP/selectors; static LDTR/CR3/privilege stacks/T/I/O-base fields remain unwritten | 286 §8.2 Fig. 8-1 pp. 8-2–3; 386 §7.1 Fig. 7-1 pp. 7-1–3 | `full_386_registers_and_static_tss_fields_survive`, `i286_rejects_386_tss_descriptors_and_old_tr_cache_owns_saves` |
 | Busy updates and A20 | Share LTR's physical byte CAS for acquiring and clearing B, preserving other bits | 286 §8.4 p. 8-7; 386 §7.6.1 p. 7-10; SDM Vol 3A §11.1.2.1 p. 11-3; decision-22 | `a20_gates_tss_images_and_both_busy_updates`; core `interp::legacy::tasks::tests::task_acquire_cas_revalidates_competing_privilege_and_busy_edits`; existing LTR CAS witnesses |
-| MSW/CR0.TS | Set TS after the 286 register load / at the 386 TR load; a short incoming 286 TSS leaves TS unchanged | 286 §8.3 p. 8-6; 386 §7.5 p. 7-8; SDM Vol 3A §10.3 p. 10-14 | `jmp_to_tss_and_back_saves_state_and_sets_ts`, `typed_refusals_for_v86_privilege_and_task_debug_trap` |
+| MSW/CR0.TS | Set TS after the 286 register load / at the 386 TR load; a short incoming 286 TSS leaves TS unchanged | 286 §8.3 p. 8-6; 386 §7.5 p. 7-8; SDM Vol 3A §10.3 p. 10-14 | `jmp_to_tss_and_back_saves_state_and_sets_ts`, `typed_refusals_for_v86_and_task_debug_trap` |
 | TR, LDTR and segment caches | Install incoming TR and LDT, qualify/load all applicable segment caches, preserve cached old TR base for saving | 286 SWITCH_TASKS pp. B-12–13; 386 §§7.3,7.5 pp. 7-4/7-8–9; SDM Vol 3A §10.2.4 p. 10-7 | `incoming_ldtr_and_every_segment_cache_are_reloaded`, `i286_rejects_386_tss_descriptors_and_old_tr_cache_owns_saves` |
 | Retained IR isolation | Existing complete context stamp includes TR/LDTR and all caches; successful transfers return to dispatch | decision-20; decision-18 §3 | core `vm::legacy::tests::task_register_and_ldtr_separate_retained_context_namespaces` |
 | Fault after commit | Preserve incoming registers/selectors/loaded caches and deliver using new IP/stack context | 286 §9.6.4 p. 9-11, SWITCH_TASKS pp. B-12–13; 386 §7.5 pp. 7-8–9; SDM Vol 3A §10.3 pp. 10-13–14 | `segment_fault_stays_in_the_new_task_outward_and_in_guest`, `fault_in_interrupt_task_load_uses_new_context_without_old_double_fault_pair` |
 | IDT task gates | Nest like CALL, save fault/interrupt resume IP, push only error code on incoming stack | 286 §9.4 p. 9-4, INT pp. B-49–50; 386 §9.6.2 pp. 9-9–10, INT p. 17-72; SDM Vol 3A §7.12.2 p. 7-18 | `exception_task_gate_pushes_error_on_new_stack_and_returns_by_link`, `software_and_external_idt_task_gates_nest` |
-| 386 T bit | Record incoming T, complete switch, refuse pending task debug trap before executing new task | 386 §12.3.1.5 p. 12-8; SDM Vol 3A §10.2.1 p. 10-5 | `typed_refusals_for_v86_privilege_and_task_debug_trap` |
+| 386 T bit | Record incoming T, complete switch, refuse pending task debug trap before executing new task | 386 §12.3.1.5 p. 12-8; SDM Vol 3A §10.2.1 p. 10-5 | `typed_refusals_for_v86_and_task_debug_trap` |
 | CR3 and I/O-map base | With PG clear, retain CR3 and read only I/O base; refuse paging reloads | 386 §7.1 p. 7-3; I/O map §8.3.2 pp. 8-4–5 | `full_386_registers_and_static_tss_fields_survive`; core `task_paging_reload_is_refused_before_saves_or_busy_updates` |
 | Outward faults | Return precise architectural exception and error code without guest delivery | decision-23 §5 | `pre_switch_faults_keep_the_outgoing_task`, `segment_fault_stays_in_the_new_task_outward_and_in_guest` |
 | Resume handoffs | Retain progress through saves, descriptor loads and error push; never execute incoming instruction before completing switch | decisions 16, 22; task commit split above | `task_save_mmio_handoffs_preserve_the_acquired_task_and_old_state`, `post_commit_unmapped_segment_load_resumes_without_restarting_transfer`, `idt_task_gate_error_push_mmio_resumes_in_new_task_once` |
@@ -43,9 +43,9 @@ I386/32-bit TSS. An interpreter-only backend fixture panics if compilation occur
 
 ## Deliberate boundaries
 
-Incoming nonzero CS.RPL uses `LegacyPrivilegeTransition`: the dispatcher currently
-runs only CPL 0. Incoming VM uses `Virtual8086Unsupported`. Both refusals occur
-after acquiring the task, saving the outgoing state and loading the incoming
+An incoming CS.RPL of 1-3 is the new CPL, and the segment loads check against it
+(xj-srh.9; spec.md §17.10; `a_task_with_cs_rpl_3_runs_at_cpl_3_or_faults_on_its_segments`). Incoming VM uses `Virtual8086Unsupported`. That refusal
+occurs after acquiring the task, saving the outgoing state and loading the incoming
 image, so that aliasing and busy acquisition cannot use a stale input snapshot.
 Paging is refused by the existing entry guard and by `LegacyTaskPaging` at the
 switch seam; no paging reload is simulated. `LegacyTaskDebugTrap` persists until

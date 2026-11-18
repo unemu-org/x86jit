@@ -270,7 +270,7 @@ fn is_tss(attr: u16, generation: CpuGeneration) -> bool {
         && (matches!(attr & 15, 1 | 3)
             || (generation == CpuGeneration::I386 && matches!(attr & 15, 9 | 11)))
 }
-fn wide(tss: SystemSegment) -> bool {
+pub(super) fn wide(tss: SystemSegment) -> bool {
     tss.cache.attributes & 8 != 0
 }
 fn minimum(tss: SystemSegment) -> u32 {
@@ -495,7 +495,7 @@ fn start<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
-fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
+pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &AddressKeyed<'_, ROUTED, ORDER>,
     address: u32,
@@ -780,12 +780,10 @@ impl Pending {
                             ),
                         ));
                     }
-                    if cpu.legacy.cpl != 0 {
-                        return Err(refusal(
-                            cpu,
-                            crate::UnsupportedSystemOperation::LegacyPrivilegeTransition,
-                        ));
-                    }
+                    // The incoming CPL is CS.RPL, at any level: the segment
+                    // loads below check CS, SS and the data DPLs against it
+                    // (286 PRM App. B SWITCH_TASKS p. B-13; 386 PRM
+                    // Table 7-1 p. 7-9).
                     self.stage = Stage::Ldt;
                 }
                 Stage::Ldt => {

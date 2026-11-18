@@ -168,3 +168,57 @@ Application lowering, frozen Real16 snapshots, CpuState's existing field offsets
 and jit_abi are unchanged. Revisit this policy when more specific model
 errata or primary-source evidence becomes available, and the private continuation
 representation when unified Machine lowering lands.
+
+## Amendment — 2026-11-18: privilege transitions (xj-srh.9, first landing)
+
+Accepted by the maintainer. The I80286 and I80386 Machine models run protected-mode code at
+CPL 1–3. The design is in backlog/docs/design/privilege-transitions.md, and the rules are in
+spec.md §17.10. The first landing covers:
+- inward interrupts and exceptions with the stack switch from the TSS;
+- outward RETF, RETF n and IRET;
+- task switches into rings 1–3;
+- the CPL and IOPL checks that become reachable at CPL > 0.
+
+Call gates are the second landing. Until then they keep the typed refusal
+`LegacyGateOrTaskTransfer`.
+
+The source-resolution rule above settles these conflicts between the 80286 PRM, the 80386 PRM and
+the SDM. Each counter-statement is recorded in spec.md:
+- **O1. Stack room on an inter-level CALL** (second landing): #SS(0) on the 80286, #SS(new SS)
+  on the 80386.
+- **O2. Stack room on an inward interrupt:** #SS(new SS + EXT), and the room includes the error
+  code, on both generations.
+- **O3. A return SS that is not present:** #SS(SS selector) on both generations. The 386
+  instruction pages' #NP is recorded.
+- **O4. Return-SS selector, type and privilege failures:** #GP(SS selector). The 80286 Table
+  7-4 "SF" is recorded.
+- **O5. Two single-page outliers:**
+  - a conforming return CS on an outward IRET needs DPL ≤ RPL;
+  - a null new SS on an inward interrupt is #TS(EXT).
+- **O6. Data-segment nulling:** the SDM rule. A register whose cache is data or non-conforming
+  code with DPL below the new CPL becomes null.
+- **O7. The call-gate target CS presence check** (second landing): kept, in the SDM order.
+- **O8. Interrupt target CS checks:** the order that landed with xj-srh.6 is kept.
+- **O9. RET n** also adjusts the outer stack.
+- **O10. The CPL or IOPL check** comes before the memory operand. ASSUMED: no source orders
+  them.
+- **O11. Parameter copy** (second landing): every parameter is read before the first write.
+- **O12. LOADALL with a CS DPL of 1–3** stays refused.
+- **O13. Retained contexts:** the bound of 16 stays.
+- **O14. The CPL and IOPL instruction checks** land here. xj-srh.10 keeps only the 80386 I/O
+  permission bitmap.
+
+The review round added four more points:
+- **D-1.** On the 80286, a LOCK-prefixed instruction at CPL > IOPL raises #GP(0) (286 PRM
+  p. B-68). The 80386 has no such rule.
+- **D-2.** On the 80386, an I/O access at CPL > IOPL with a 286 TSS in TR raises #GP(0) (386 PRM
+  p. 17-15). With a 386 TSS it is the typed refusal `LegacyIoPermissionBitmap` until the bitmap
+  lands.
+- **D-3.** REP INS/OUTS with a zero count makes no I/O test (SDM REP Operation).
+- **D-4.** An IRET image with VM = 1 at CPL > 0 stays refused. The 386 PRM p. 17-74 and SDM
+  p. 3-492 conflict here; spec.md records both.
+
+A 16-bit outward pop zero-extends ESP, as the SDM pseudocode reads. The hardware's retention of
+the upper bits is not modelled.
+
+CpuState, jit_abi, the model identities and the compiled path are unchanged.
