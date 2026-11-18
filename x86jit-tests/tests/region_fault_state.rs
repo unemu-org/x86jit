@@ -15,31 +15,203 @@ use x86jit_cranelift::{HostTarget, JitBackend, OptLevel};
 
 const CODE: u64 = 0x1000;
 
-fn wait_for_child(pid: libc::pid_t) -> libc::c_int {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut status = 0;
-    loop {
-        // SAFETY: pid is our child and status is writable; WNOHANG bounds polling.
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if result == pid {
-            return status;
-        }
-        if result == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                panic!("waitpid failed for fault-state child: {error}");
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            // SAFETY: the child remains unreaped, so its PID cannot be reused.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
-            }
-            panic!("fault-state child exceeded 20 seconds and was killed");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+/// How long a fault-state child may run before it is killed and its case fails.
+const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn wait_for_child(pid: libc::pid_t, case: &str) -> libc::c_int {
+    wait_for_child_by(pid, case, CHILD_DEADLINE)
+}
+
+/// Blocks until the child `pid` exits and returns its wait status; a child still
+/// running after `deadline` is killed and reported as a failure naming `case`.
+///
+/// The wait is event-driven on the waiting thread: a pidfd under `poll` on Linux, an
+/// `EVFILT_PROC`/`NOTE_EXIT` kevent on macOS. Both wake on the exit itself and use
+/// the deadline only as the timeout, so a fast child costs no polling interval: a
+/// 10 ms sleep loop paid at least one interval per child, stretched further by timer
+/// coalescing at low scheduling priority. No thread is spawned per child, because a
+/// thread being created or torn down in the parent while another test forks may
+/// hold a libc lock the forked child then needs. No signal handler is installed in the
+/// parent, so nothing here runs in signal context. The child stays unreaped until
+/// the wait has decided, so the SIGKILL at the deadline can only reach this child,
+/// never a recycled PID; `waitpid` reaps it afterwards.
+fn wait_for_child_by(pid: libc::pid_t, case: &str, deadline: std::time::Duration) -> libc::c_int {
+    let exited = wait_for_exit(pid, deadline)
+        .unwrap_or_else(|error| panic!("{case}: waiting for fault-state child failed: {error}"));
+    if !exited {
+        // SAFETY: the child is still unreaped, so the PID cannot have been reused.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
+    let mut status = 0;
+    // SAFETY: pid is our unreaped child; status is writable.
+    while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            panic!("{case}: waitpid failed for fault-state child: {error}");
+        }
+    }
+    if !exited {
+        panic!(
+            "{case}: fault-state child exceeded {deadline:?} and was killed (wait status {status:#x})"
+        );
+    }
+    status
+}
+
+/// Milliseconds left until `end` for `poll`, rounded up so the wait never ends early.
+#[cfg(target_os = "linux")]
+fn millis_until(end: std::time::Instant) -> libc::c_int {
+    let left = end.saturating_duration_since(std::time::Instant::now());
+    left.as_nanos()
+        .div_ceil(1_000_000)
+        .min(libc::c_int::MAX as u128) as libc::c_int
+}
+
+/// `Ok(true)` once the child has exited (left unreaped), `Ok(false)` at the deadline.
+#[cfg(target_os = "linux")]
+fn wait_for_exit(pid: libc::pid_t, deadline: std::time::Duration) -> std::io::Result<bool> {
+    let end = std::time::Instant::now() + deadline;
+    // SAFETY: pidfd_open takes no pointers; a pidfd of an exited, unreaped child
+    // still polls readable, so an exit before this call is not missed.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = loop {
+        let mut entry = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: entry is one valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut entry, 1, millis_until(end)) } {
+            1 => break Ok(true),
+            0 if std::time::Instant::now() >= end => break Ok(false),
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    break Err(error);
+                }
+            }
+        }
+    };
+    // SAFETY: fd is the pidfd opened above and closed exactly once.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// `Ok(true)` once the child has exited (left unreaped), `Ok(false)` at the deadline.
+#[cfg(target_os = "macos")]
+fn wait_for_exit(pid: libc::pid_t, deadline: std::time::Duration) -> std::io::Result<bool> {
+    let end = std::time::Instant::now() + deadline;
+    // SAFETY: kqueue takes no arguments.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        // SAFETY: kevent is plain data; the fields that matter are set below.
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_ONESHOT;
+        change.fflags = libc::NOTE_EXIT;
+        // SAFETY: one valid change, no event buffer, no timeout.
+        let registered =
+            unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if registered == -1 {
+            let error = std::io::Error::last_os_error();
+            // ESRCH: the child has already exited and only its zombie remains.
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(true)
+            } else {
+                Err(error)
+            };
+        }
+        // An exit before the registration raises no event; look for it once now.
+        // Any later exit raises NOTE_EXIT on the registered filter.
+        if exited_unreaped(pid)? {
+            return Ok(true);
+        }
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: left.as_secs() as libc::time_t,
+                tv_nsec: left.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: no changes; event is one writable slot; timeout is valid.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            match unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout) } {
+                1 => return Ok(true),
+                0 if std::time::Instant::now() >= end => return Ok(false),
+                0 => {}
+                _ => {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    })();
+    // SAFETY: kq is the queue opened above and closed exactly once.
+    unsafe { libc::close(kq) };
+    result
+}
+
+/// Whether the child has already exited, observed without reaping it.
+#[cfg(target_os = "macos")]
+fn exited_unreaped(pid: libc::pid_t) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: info is writable; WNOHANG returns at once and WNOWAIT keeps the zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(info.si_pid == pid);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+/// A child that never exits is killed at the deadline, and the failure names its case.
+#[test]
+fn hung_child_is_killed_at_the_deadline() {
+    // SAFETY: the child only calls pause(), which is async-signal-safe, until killed.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        loop {
+            // SAFETY: async-signal-safe; the child never returns into the harness.
+            unsafe { libc::pause() };
+        }
+    }
+    let started = std::time::Instant::now();
+    let report = std::panic::catch_unwind(|| {
+        wait_for_child_by(pid, "witness case", std::time::Duration::from_millis(200))
+    })
+    .expect_err("a hung child must fail the case");
+    let elapsed = started.elapsed();
+    let message = report
+        .downcast_ref::<String>()
+        .expect("panic message is a String");
+    assert!(message.starts_with("witness case: "), "{message}");
+    assert!(message.contains("was killed"), "{message}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "{elapsed:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
 }
 
 #[repr(C)]
@@ -284,7 +456,7 @@ fn write_fault(kind: &str, tier: usize) -> Vec<String> {
                         }
                         libc::_exit(92);
                     }
-                    let status = wait_for_child(pid);
+                    let status = wait_for_child(pid, &format!("{kind}, tier={tier}, {opt:?}"));
                     let actual = capture.read();
                     libc::munmap(capture.cast(), page);
                     assert_eq!(status, 0, "{kind}, tier={tier}, {opt:?}");
@@ -596,7 +768,8 @@ fn region_guard_fault_recovers_gprs_and_flags() {
                         x86jit_core::jit_abi::call_block(entry, &mut cpu, &mut ctx);
                         libc::_exit(92);
                     }
-                    let status = wait_for_child(pid);
+                    let status =
+                        wait_for_child(pid, &format!("site={site}, offset={offset}, opt={opt:?}"));
                     assert_eq!(status, 0, "site={site}, offset={offset}, opt={opt:?}");
                     let actual = capture.read();
                     libc::munmap(capture.cast(), page);
@@ -619,4 +792,29 @@ fn region_guard_fault_recovers_gprs_and_flags() {
             }
         }
     }
+}
+
+/// A child that exited before the wait began is collected at once, not at the deadline.
+#[test]
+fn child_exited_before_the_wait_is_collected_at_once() {
+    // SAFETY: the child only calls _exit, which is async-signal-safe.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // SAFETY: async-signal-safe; the child never returns into the harness.
+        unsafe { libc::_exit(7) };
+    }
+    // Needed: let the child become a zombie before the exit notification is armed.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    let status = wait_for_child_by(pid, "exited case", std::time::Duration::from_secs(20));
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7,
+        "{status:#x}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
