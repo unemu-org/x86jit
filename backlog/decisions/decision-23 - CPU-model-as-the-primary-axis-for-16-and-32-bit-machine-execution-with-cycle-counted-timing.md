@@ -920,6 +920,10 @@ ASSUMED as the cause. Three layout variants did not restore that function. The s
 by +0.55 % at the C4a landing. The maintainer accepted the slowdown. Bead xj-50w.17 carries it,
 with this requirement's +0.5 % gate as its acceptance. The gate itself is unchanged.
 
+The change landed batched with LOADALL (cf32ec2e). Measured on that tree against add161a9, every
+cell is within +0.5 %, and smc-rmw-64 on the alias is +0.186 %, so main does not carry the slowdown
+above.
+
 **Amendment (LOADALL on the 80286, 2026-11-17, accepted by the maintainer).** The I80286 model
 executes the undocumented LOADALL instruction, 0F 05 (xj-oog; spec.md §17.10, "LOADALL"). The
 evidence that a guest needs it:
@@ -951,6 +955,44 @@ Against add161a9, every real16_loops cell is within +0.5 % on the median of proc
 to +0.20 %), and the store probe is within +0.08 %. On the 80386 path, one candidate process
 of 7 in the straight-line cell forms an unmatched mode at +0.92 %; the bimodal rule above
 reports it and does not count it.
+
+**Amendment (xj-50w.23 landing, 2026-11-18, accepted by the maintainer).** The NMI decision moves
+out of the Machine dispatcher's hot loop. This change is the follow-up the "NMI landing" amendment
+names, and the semantics are unchanged. It lands with a measured slowdown on one workload, not a
+defect. Against cf32ec2e, the main it lands on, 148 of 152 cells are within +0.5 %:
+- faster on the Machine paths:
+  - call-ret −1.74..−1.48 %;
+  - ip-boundary-64 −1.78..−1.65 %;
+  - alu, load, load-odd and store −1.20..−1.00 %;
+  - dos-mixed −0.92..−0.60 %;
+  - push-pop −0.81..−0.64 %;
+  - data-next-to-code and data-next-to-dense-code −0.58..−0.38 %;
+  - smc-next-64 and smc-rmw-64 on the 80286/80386 paths −0.54..−0.38 %;
+  - ip-boundary-1 on the twenty-bit paths −0.15..−0.11 %;
+- unchanged: rep-movsw −0.03..+0.02 % and straight-line −0.20..+0.02 %;
+- slower: smc-next-1 +0.08..+0.29 %;
+- the alias: −0.02..+0.22 %;
+- the store probe: within +0.03 %;
+- nine twenty-bit SMC cells are bimodal on the candidate side. Like modes are within +0.09 %. An
+  unmatched upper mode of 1–3 of 7 processes, +0.57..+0.69 %, is reported.
+
+The four misses are ip-boundary-1 on the 80286/80386 paths: I286 +0.628 %, I386 +0.567 %, I286
+with A20 off +0.607 % and I386 with A20 off +0.530 %. The cost is per `run_steps` call with a
+one-step budget, not per guest instruction. It is 17 more host instructions per call, from
+register allocation in the dispatcher's one-step instantiation (traced). Fifteen layout variants
+did not remove it.
+
+Against 8e5bc441, before the NMI input, 14 of 152 cells are over +0.5 %:
+- ip-boundary-1 on every Machine path: the twenty-bit paths +1.08..+1.18 %, the 80286/80386 paths
+  +0.81..+0.87 %;
+- rep-movsw on the twenty-bit paths: +0.55 %;
+- smc-next-64 and smc-rmw-64 on the alias: +0.69 % and +0.53 %.
+
+This change decides only the four 80286/80386 ip-boundary-1 cells. Eight of the others are
+already over +0.5 % at cf32ec2e. The two alias SMC cells are at +0.47 % and +0.46 % there, and this
+change adds +0.22 % and +0.08 %. The maintainer accepted the four ip-boundary-1 misses. Bead
+xj-50w.24 carries the one-step cost, with this requirement's +0.5 % gate against 8e5bc441 as its
+acceptance. The gate itself is unchanged.
 
 ## Migration
 
