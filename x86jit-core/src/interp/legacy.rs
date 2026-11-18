@@ -1,6 +1,7 @@
 //! Machine memory and transactional system helpers for the shared interpreter
 //! (decision-18 §§1, 4; spec.md §§8.1, 17).
 use super::*;
+mod privilege;
 pub(crate) mod tasks;
 use crate::legacy::{
     self, ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
@@ -1346,12 +1347,8 @@ fn code_descriptor<const ROUTED: bool, const ORDER: u8>(
     if returning && rpl < cpl {
         return Err(fault(cpu, 13, value & !3));
     }
-    if returning && rpl > cpl {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyPrivilegeTransition,
-        ));
-    }
+    // A return to an outer ring takes `privilege::outward` before this.
+    debug_assert!(!returning || rpl == cpl, "outward return");
     let d = descriptor(cpu, mem, value, generation)?;
     let attr = d.cache.attributes;
     if attr & 0x10 == 0 {
@@ -1563,15 +1560,23 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     if d.cache.attributes & 0x80 == 0 {
         return Err(fault(cpu, 11, selector_code));
     }
-    if d.cache.attributes & 4 == 0 && dpl < context.cpl {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyPrivilegeTransition,
-        ));
-    }
     supported_descriptor(cpu, d.cache.attributes)?;
     let size = if kind & 8 != 0 { 4 } else { 2 };
     let ip = u64::from((low & 0xffff) | if size == 4 { high & 0xffff0000 } else { 0 });
+    if d.cache.attributes & 4 == 0 && dpl < context.cpl {
+        return privilege::inward(
+            cpu,
+            mem,
+            context,
+            event,
+            cs,
+            d,
+            ip,
+            size,
+            kind & 1 == 0,
+            privilege::Gate { key, low, high },
+        );
+    }
     // I386 PRM §17 INT p. 17-72 checks stack space before the target offset,
     // reporting #SS(0)/#GP(0). Follow SDM Vol 2A §3.3 INT n/INTO/INT3/INT1,
     // Operation, INTRA-PRIVILEGE-LEVEL-INTERRUPT p. 3-478 for the error codes:
@@ -3047,6 +3052,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
         IrOp::Legacy(op) => {
             match op {
                 L::Checkpoint | L::SharedWalk => {}
+                L::Privileged { kind } => privilege::check(cpu, context.generation, *kind)?,
                 L::DirectStackAddress {
                     dst,
                     offset,
@@ -3497,7 +3503,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     if *pop {
                         let image = peek(cpu, mem, context, 0, *size)? as u32;
                         let before = cpu.rflags_system;
-                        legacy::restore_flags(cpu, context.generation, image)?;
+                        privilege::load_flags(cpu, context.generation, image)?;
                         outcome.context_changed |= (before ^ cpu.rflags_system) & 0x7000 != 0;
                         adjust(cpu, context, u32::from(*size));
                     } else {
@@ -3659,6 +3665,22 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     };
                     let ip = ip & mask(*size);
                     let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
+                        if let Some(cs) = cs.filter(|cs| (cs & 3) as u8 > cpu.legacy.cpl) {
+                            privilege::outward(
+                                cpu,
+                                mem,
+                                context,
+                                privilege::Return {
+                                    ip,
+                                    cs,
+                                    flags: None,
+                                    size: *size,
+                                    release: *pop_extra,
+                                },
+                            )?;
+                            outcome.context_changed = true;
+                            return Ok(true);
+                        }
                         cs.map(|cs| code_descriptor(cpu, mem, cs, true, context.generation))
                             .transpose()?
                     } else {
@@ -3717,6 +3739,23 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         ));
                     }
                     let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
+                        if (cs & 3) as u8 > cpu.legacy.cpl {
+                            privilege::outward(
+                                cpu,
+                                mem,
+                                context,
+                                privilege::Return {
+                                    ip,
+                                    cs,
+                                    flags: Some(image),
+                                    size: *size,
+                                    release: 0,
+                                },
+                            )?;
+                            outcome.context_changed = true;
+                            outcome.preserve_rf = true;
+                            return Ok(true);
+                        }
                         Some(code_descriptor(cpu, mem, cs, true, context.generation)?)
                     } else {
                         None
@@ -3731,7 +3770,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     }
                     // SDM Vol 3A §11.3: all frame reads complete before retirement.
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-                    legacy::restore_flags(cpu, context.generation, image)?;
+                    privilege::load_flags(cpu, context.generation, image)?;
                     // IRET restores RF in a 32-bit frame; POPFD does not.
                     if *size == 4 {
                         cpu.rflags_system =

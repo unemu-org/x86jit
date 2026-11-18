@@ -429,6 +429,7 @@ impl IrBlock {
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::ClearTs
                     | crate::legacy::LegacyOp::Loadall
+                    | crate::legacy::LegacyOp::Privileged { .. }
                     | crate::legacy::LegacyOp::Checkpoint
                     | crate::legacy::LegacyOp::SharedWalk => {}
                     crate::legacy::LegacyOp::QueryDescriptor { selector, .. } => {

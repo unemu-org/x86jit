@@ -546,32 +546,29 @@ fn far_transfer_faults_leave_frame_and_context_unchanged() {
 }
 
 #[test]
-fn gates_outer_returns_and_nonzero_cpl_are_typed_refusals_cpu_model() {
-    crate::model_api::with_cpu_model(gates_outer_returns_and_nonzero_cpl_are_typed_refusals);
+fn call_gates_are_typed_refusals_and_outer_returns_transfer_cpu_model() {
+    crate::model_api::with_cpu_model(call_gates_are_typed_refusals_and_outer_returns_transfer);
 }
 
 #[test]
-fn gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
-    // Decision-18 §4: unsupported delivery/transitions never construct an IVT frame.
-    for (bytes, operation) in [
-        (
-            &b"\xea\x00\x12\x08\x00"[..],
-            UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
-        ),
-        (
-            &b"\xcb"[..],
-            UnsupportedSystemOperation::LegacyPrivilegeTransition,
-        ),
-        (
-            &b"\xcf"[..],
-            UnsupportedSystemOperation::LegacyPrivilegeTransition,
-        ),
-    ] {
+fn call_gates_are_typed_refusals_and_outer_returns_transfer() {
+    // Decision-18 §4: a call gate stays a typed refusal and constructs no
+    // frame. A RETF or IRET whose CS.RPL exceeds CPL now returns to the
+    // outer ring (xj-srh.9); here the frame's SS slot is null, #GP(0)
+    // (SDM Vol 2B RET p. 4-573), with nothing changed.
+    let (vm, mut cpu) = setup(b"\xea\x00\x12\x08\x00", false, false);
+    descriptor(&vm, 8, 0, 0xffff, 0x84);
+    refused(
+        &mut cpu,
+        &vm,
+        UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
+    );
+    for bytes in [&b"\xcb"[..], b"\xcf"] {
         let (vm, mut cpu) = setup(bytes, false, false);
-        cpu.cpu.gpr[0] = 12;
-        descriptor(&vm, 8, 0, 0xffff, 0x84);
-        vm.write_bytes(0x8000, b"\x00\x12\x0b\x00\x02\x02").unwrap();
-        refused(&mut cpu, &vm, operation);
+        descriptor(&vm, 8, 0, 0xffff, 0xfa);
+        vm.write_bytes(0x8000, b"\x00\x12\x0b\x00\x02\x02\x00\x00\x00\x00")
+            .unwrap();
+        fault(&mut cpu, &vm, 13, 0);
     }
     let (vm, mut cpu) = setup(b"\x90", false, false);
     cpu.cpu.flags.if_ = true;
@@ -591,16 +588,18 @@ fn gates_outer_returns_and_nonzero_cpl_are_typed_refusals() {
     cpu.inject_irq(0x20);
     cpu.cpu.legacy.cr0 = 0;
     vm.write_bytes(0x80, b"\x00\x12\x00\x00").unwrap();
-    vm.write_bytes(0x1200, b"\x90").unwrap();
+    vm.write_bytes(0x1200, b"\x90\x90").unwrap();
     steps(&mut cpu, &vm, 1);
     assert_eq!(cpu.cpu.rip, 0x1201); // explicitly requeued vector uses real delivery
+                                     // An embedder state at CPL 1 executes (xj-srh.9).
     cpu.cpu.legacy.cr0 = 1;
     cpu.cpu.legacy.cpl = 1;
-    refused(
-        &mut cpu,
-        &vm,
-        UnsupportedSystemOperation::LegacyEntryFacility,
-    );
+    cpu.cpu.cs = 9;
+    cpu.cpu.ss = 17;
+    cpu.cpu.legacy.segments[0].attributes = 0xbb;
+    cpu.cpu.legacy.segments[3].attributes = 0xb3;
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.rip, 0x1202);
 }
 
 #[test]

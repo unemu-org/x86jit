@@ -164,8 +164,8 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
         cpu.cpu.rip = 0x1000;
         cpu.cpu.gpr[4] = 0x3000;
         cpu.cpu.flags.if_ = true;
-        // Nonzero-CPL execution awaits the complete privilege-enforcement seam.
-        cpu.cpu.legacy.cr0 = 1;
+        // Paging remains an engine facility (CPL 1–3 executes since xj-srh.9).
+        cpu.cpu.legacy.cr0 = 0x8000_0001;
         cpu.cpu.legacy.cpl = 1;
         // Outstanding and completed device work must remain untouched on refusal.
         cpu.cpu.pending_mmio = Some(0xabcd);

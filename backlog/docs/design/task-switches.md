@@ -43,9 +43,9 @@ I386/32-bit TSS. An interpreter-only backend fixture panics if compilation occur
 
 ## Deliberate boundaries
 
-Incoming nonzero CS.RPL uses `LegacyPrivilegeTransition`: the dispatcher currently
-runs only CPL 0. Incoming VM uses `Virtual8086Unsupported`. Both refusals occur
-after acquiring the task, saving the outgoing state and loading the incoming
+An incoming CS.RPL of 1-3 is the new CPL, and the segment loads check against it
+(xj-srh.9; spec.md §17.10). Incoming VM uses `Virtual8086Unsupported`. That refusal
+occurs after acquiring the task, saving the outgoing state and loading the incoming
 image, so that aliasing and busy acquisition cannot use a stale input snapshot.
 Paging is refused by the existing entry guard and by `LegacyTaskPaging` at the
 switch seam; no paging reload is simulated. `LegacyTaskDebugTrap` persists until

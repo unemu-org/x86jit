@@ -294,6 +294,9 @@ pub(crate) fn instruction(
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
+        if context.regime == crate::MachineRegime::Protected {
+            privilege_guard(&insn, &mut ops.values);
+        }
     }
     if context.segment_class == crate::SegmentClass::Direct {
         direct_addresses(&mut ops.values, &mut tg, context, u64::from(ip));
@@ -440,6 +443,34 @@ fn coprocessor_overrun(
     );
 }
 
+// The CPL and IOPL tests that protected mode makes (286 PRM App. B; 386 PRM
+// §6.3.5.1 p. 6-17, §8.3.1 pp. 8-4–5; SDM Vol 3A §6.9 p. 6-23). The test
+// runs first, ahead of any memory operand (decision O10: ASSUMED, as LOADALL
+// does; the sources give no order), and only in the protected regime, so the
+// Real and Direct lowering is unchanged. A #UD that the lowering raised (a
+// reserved control register) keeps its place ahead of it (ASSUMED).
+#[cold]
+#[inline(never)]
+fn privilege_guard(insn: &Instruction, ops: &mut Vec<IrOp>) {
+    use crate::legacy::PrivilegeCheck;
+    use Mnemonic::*;
+    let special = |i| {
+        let register = insn.op_register(i);
+        register.is_cr() || register.is_dr() || register.is_tr()
+    };
+    let kind = match insn.mnemonic() {
+        Hlt | Lgdt | Lidt | Lmsw | Clts => PrivilegeCheck::Cpl0,
+        Mov if special(0) || special(1) => PrivilegeCheck::Cpl0,
+        Cli | Sti => PrivilegeCheck::Iopl,
+        In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd => PrivilegeCheck::IoPort,
+        _ => return,
+    };
+    if ops.iter().any(|op| matches!(op, IrOp::Trap { .. })) {
+        return;
+    }
+    ops.insert(1, IrOp::Legacy(L::Privileged { kind }));
+}
+
 // spec.md §16: only a fault after a CPU-state commit needs rollback. Helper
 // transactions retain their own memory evidence and task partial-commit rules.
 fn rollback_required(ops: &[IrOp]) -> bool {
@@ -499,6 +530,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
                     | L::Checkpoint
                     | L::Bound { .. }
                     | L::CheckTaskReturn
+                    | L::Privileged { .. }
             ),
             _ => false,
         };

@@ -998,6 +998,29 @@ pub enum LegacyOp {
     /// 000800H (Intel, "Undocumented iAPX 286 Test Instruction",
     /// `oracles/intel/i286-loadall.pdf`, pp. 1-3).
     Loadall,
+    /// The run-time CPL or IOPL test of a protected-mode instruction, before
+    /// any operand transfer, port exit or other effect. The lifter emits it
+    /// only in the protected regime.
+    Privileged {
+        kind: PrivilegeCheck,
+    },
+}
+
+/// What a [`LegacyOp::Privileged`] test requires of the running program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivilegeCheck {
+    /// CPL 0, else #GP(0): HLT, LGDT, LIDT, LMSW, CLTS and MOV to or from a
+    /// control, debug or test register (286 PRM App. B pp. B-31, B-42,
+    /// B-65, B-67; 386 PRM §6.3.5.1 p. 6-17; SDM Vol 3A §6.9 p. 6-23).
+    Cpl0,
+    /// CPL <= IOPL, else #GP(0): CLI and STI (286 PRM §3.11.2 p. 3-28,
+    /// App. B pp. B-30, B-106; 386 PRM §8.3.1 pp. 8-4–5).
+    Iopl,
+    /// CPL <= IOPL for IN, OUT, INS and OUTS. Otherwise the 80286 raises
+    /// #GP(0) (286 PRM App. B pp. B-45, B-47, B-81, B-82) and the 80386
+    /// consults the TSS I/O permission bitmap (386 PRM §8.3.2 p. 8-5), which
+    /// the engine refuses with `LegacyIoPermissionBitmap`.
+    IoPort,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1127,7 +1150,7 @@ impl LoadallImage {
     /// not checked either. Beyond the document, the engine refuses what it
     /// cannot execute as the 80286 would:
     /// - in protected mode, a data CS (the engine fetches only through code)
-    ///   and a CS DPL other than 0 (the Machine runs only at CPL 0);
+    ///   and a CS DPL other than 0 (kept refused at CPL 1–3, decision O12);
     /// - in real mode, an expand-down SS, DS or ES (real-mode access checks
     ///   every limit as expand-up);
     /// - a valid DS or ES with S = 0, a system type, in either mode.
@@ -1381,7 +1404,8 @@ pub(crate) fn restore_flags(
     let image = image & !crate::model::EARLY_FLAGS_FIXED_ZERO;
     cpu.flags.set_flags16((image & 0x0ed7) as u16);
     // I286 PRM Appendix B IRET pp. B-51–52; §10.1 p. 10-1.
-    // Execution is currently limited to CPL 0, where IOPL is writable.
+    // This is the CPL-0 load, and a task switch's; POPF and IRET at CPL 1–3
+    // mask IF and IOPL in `interp::legacy::privilege::load_flags`.
     let system = if generation == CpuGeneration::I386
         || (generation == CpuGeneration::I286 && cpu.legacy.cr0 & 1 != 0)
     {
