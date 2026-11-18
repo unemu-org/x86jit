@@ -54,7 +54,8 @@ pub enum UnsupportedSystemOperation {
     ApplicationIrqDelivery,
     InvalidLegacyContext(crate::legacy::MachineContextError),
     LegacyLdtSelector,
-    /// A far CALL or JMP that names a call gate (type 4, or type 12).
+    /// No longer produced. A far CALL or JMP through a call gate (type 4, or
+    /// type 12 on the 80386) executes, and task gates and TSSs switch tasks.
     LegacyGateOrTaskTransfer,
     /// No longer produced. RETF and IRET to an outer ring, interrupts and
     /// exceptions through a gate to an inner ring, and task switches into

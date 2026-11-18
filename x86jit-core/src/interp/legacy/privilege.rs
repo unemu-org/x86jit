@@ -1,6 +1,6 @@
 //! Privilege-level transitions on the Machine interpreter (spec.md §17.10):
-//! interrupts and exceptions to an inner ring, RETF and IRET to an outer ring,
-//! and the masked FLAGS load at CPL 1–3.
+//! interrupts and exceptions to an inner ring, far CALL and JMP through a call
+//! gate, RETF and IRET to an outer ring, and the masked FLAGS load at CPL 1–3.
 //!
 //! Sources: 80286 and 80287 PRM 210498-005 ("286 PRM"), 80386 PRM
 //! 230985-001 ("386 PRM") and SDM 325462-092US, as pinned in `oracles/`.
@@ -232,6 +232,241 @@ pub(super) fn inward<const ROUTED: bool, const ORDER: u8>(
     // §7.12.1.3 also clears RF in the live handler flags.
     cpu.rflags_system &= !0x14100;
     install(cpu, SegmentId::Cs, (cs & !3) | u16::from(ring), code.cache);
+    cpu.rip = ip;
+    Ok(())
+}
+
+/// Retry keys for the parameters a call gate copies, packed by 64-bit word:
+/// four words or two doublewords per key, in the engine-only space of
+/// `DESCRIPTOR_RETRY`.
+const PARAMETER_RETRY: u64 = DESCRIPTOR_RETRY | (1 << 35);
+
+/// The fields of a call-gate descriptor, decoded from the cache that
+/// `descriptor_at` builds from its image: offset 15:0 in bytes 0-1, the
+/// target selector in bytes 2-3, the parameter count in byte 4 bits 4:0 and,
+/// in a type-12 gate, offset 31:16 in bytes 6-7 (286 PRM §7.5.1.1 Fig. 7-10
+/// p. 7-17; 386 PRM §6.3.4 Fig. 6-5 p. 6-11; SDM Vol 3A §6.8.3 Fig. 6-8
+/// p. 6-13). The cache splits offset 31:16 across the limit, flags and base
+/// fields, and scales the limit when byte-6 bit 7 (offset bit 23) is set; the
+/// decode undoes both (DERIVED from that layout). On the 80286 bytes 6-7 are
+/// reserved and the cache never holds them.
+fn gate_fields(gate: &Descriptor) -> (u16, u32, u64) {
+    let cache = gate.cache;
+    let attr = u32::from(cache.attributes);
+    let raw = if attr & 0x8000 != 0 {
+        cache.limit >> 12
+    } else {
+        cache.limit
+    };
+    let offset = (raw & 0xf_ffff) | ((attr & 0xf000) << 8) | (cache.base & 0xff00_0000);
+    (
+        cache.base as u16,
+        offset,
+        u64::from((cache.base >> 16) & 0x1f),
+    )
+}
+
+/// A far CALL or JMP whose selector names a call gate: type 4, a 16-bit gate
+/// on both generations, or type 12, a 32-bit gate on the 80386. The gate
+/// type, not the instruction's operand size, sets the width of the offset, the
+/// pushes and the parameters: words for type 4, doublewords for type 12
+/// (386 PRM §16.4.2.1 p. 16-6; SDM Vol 3A §6.8.3 p. 6-14). The caller has
+/// checked the selector for null and its table limit (`far_descriptor`).
+///
+/// Check order: 286 PRM App. B CALL pp. B-24–25, JMP p. B-57; 386 PRM §17
+/// CALL pp. 17-39–41, JMP pp. 17-85–86; SDM Vol 2A CALL pp. 3-130–133; SDM
+/// Vol 3A §6.8.4 Table 6-1 p. 6-16. A CALL to a non-conforming segment with
+/// DPL < CPL switches to the TSS stack of that ring and copies the parameters
+/// (SDM Vol 3A §6.8.5 steps 1–9 p. 6-18, Fig. 6-13 p. 6-19; 286 PRM
+/// §7.5.1.4 p. 7-20). Every other transfer stays at CPL with no stack switch:
+/// a conforming target, or DPL = CPL (SDM Vol 3A p. 6-17). A JMP never changes
+/// privilege (286 PRM §7.5.1.3 p. 7-19; 386 PRM §6.3.4 p. 6-12).
+#[cold]
+#[inline(never)]
+pub(super) fn call_gate<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    selector: u16,
+    gate: Descriptor,
+    far_ip: u64,
+    return_ip: Option<u32>,
+) -> Result<(), Exit> {
+    let generation = context.generation;
+    let cpl = cpu.legacy.cpl;
+    let attr = gate.cache.attributes;
+    let size: u8 = if attr & 8 != 0 { 4 } else { 2 };
+    // 1. MAX(CPL, RPL) <= gate DPL, else #GP(gate); 2. the gate present,
+    // else #NP(gate).
+    let gate_dpl = ((attr >> 5) & 3) as u8;
+    if gate_dpl < cpl || gate_dpl < (selector & 3) as u8 {
+        return Err(fault(cpu, 13, selector & !3));
+    }
+    if attr & 0x80 == 0 {
+        return Err(fault(cpu, 11, selector & !3));
+    }
+    // 3–7. The target CS: null #GP(0); index #GP(CS); not code or DPL > CPL
+    // #GP(CS); for JMP, non-conforming DPL != CPL #GP(CS) (286 PRM p. B-57;
+    // SDM Table 6-1); not present #NP(CS). The 286 and 386 CALL pages omit
+    // the presence test; 286 PRM Table 7-3 p. 7-18 and SDM p. 3-131 make it,
+    // after the type and DPL tests (decision O7).
+    let (cs, offset, count) = gate_fields(&gate);
+    if cs & !3 == 0 {
+        return Err(fault(cpu, 13, 0));
+    }
+    let mut code = descriptor(cpu, mem, cs, generation)?;
+    let code_attr = code.cache.attributes;
+    let dpl = ((code_attr >> 5) & 3) as u8;
+    let conforming = code_attr & 4 != 0;
+    if code_attr & 0x18 != 0x18 || dpl > cpl {
+        return Err(fault(cpu, 13, cs & !3));
+    }
+    if return_ip.is_none() && !conforming && dpl != cpl {
+        return Err(fault(cpu, 13, cs & !3));
+    }
+    if code_attr & 0x80 == 0 {
+        return Err(fault(cpu, 11, cs & !3));
+    }
+    supported_descriptor(cpu, code_attr)?;
+    // A 16-bit gate supplies offset 15:0 only (SDM p. 3-132 "CallGate
+    // (InstructionPointer) AND FFFFH").
+    let ip = u64::from(offset) & mask(size);
+    let Some(return_ip) = return_ip else {
+        // JMP: offset beyond the CS limit #GP(0); CS.RPL := CPL (286 PRM
+        // p. B-57; 386 PRM p. 17-86).
+        code_limit(cpu, code.cache, ip)?;
+        accessed(cpu, mem, &mut code)?;
+        install(cpu, SegmentId::Cs, (cs & !3) | u16::from(cpl), code.cache);
+        cpu.rip = ip;
+        return Ok(());
+    };
+    if conforming || dpl == cpl {
+        // SAME-PRIVILEGE: room for 4 bytes, or 8 on a 32-bit gate, #SS(0);
+        // then the offset, #GP(0); CS.RPL := CPL (286 PRM p. B-25; 386 PRM
+        // pp. 17-40–41; SDM pp. 3-133–134).
+        push_addresses(cpu, mem, context, 2, size)?;
+        code_limit(cpu, code.cache, ip)?;
+        cpu.record_mmio_part(cpu.rip, TRANSFER_IP_RETRY, far_ip);
+        cpu.record_mmio_part(cpu.rip, TRANSFER_CS_RETRY, u64::from(selector));
+        remember(cpu, &gate);
+        accessed(cpu, mem, &mut code)?;
+        let frame = [u64::from(cpu.cs), u64::from(return_ip)];
+        push(cpu, mem, context, &frame, size)?;
+        install(cpu, SegmentId::Cs, (cs & !3) | u16::from(cpl), code.cache);
+        cpu.rip = ip;
+        return Ok(());
+    }
+    // MORE-PRIVILEGE. The ring-`dpl` stack from the TSS, checked as for an
+    // interrupt with EXT = 0: a null SS is #TS(0) (286 PRM p. B-25; 386 PRM
+    // p. 17-40; SDM p. 3-131).
+    let mut stack = inner_stack(cpu, mem, generation, dpl, 0)?;
+    // Room for the parameters plus 8 bytes, or plus 16 on a 32-bit gate. The
+    // fault is #SS(0) on the 80286 (286 PRM p. B-25; §7.5.1.4 p. 7-20 "a
+    // stack fault occurs with an error code of 0") and #SS(new SS) on the
+    // 80386 (386 PRM §9.8.12 p. 9-16 "overflow of the new stack during an
+    // interlevel CALL"; SDM p. 3-132), where 386 PRM p. 17-40 and §6.3.4.1
+    // p. 6-15 print #SS(0) (decision O1).
+    let slots = 4 + count;
+    if !stack.room(slots * u64::from(size)) {
+        let code = if generation == CpuGeneration::I286 {
+            0
+        } else {
+            stack.selector & !3
+        };
+        return Err(fault(cpu, 12, code));
+    }
+    code_limit(cpu, code.cache, ip)?;
+    // The parameters, from the old SS:(E)SP at the old SS.B width. A
+    // parameter beyond the old SS limit is #SS(0), after the offset check;
+    // no source orders the two (ASSUMED, decision O11). Every parameter is
+    // read before the first write, so a new stack that overlaps the old one
+    // copies the caller's values (decision O11). They are read in push order,
+    // the one at the highest address first (ASSUMED; the order is visible to
+    // a device only).
+    let width = context.stack_address_bits / 8;
+    let old = sp(cpu, context);
+    let mut sources = Vec::with_capacity(count as usize);
+    for k in (0..count).rev() {
+        let offset = old.wrapping_add(k * u64::from(size)) & mask(width);
+        sources.push(segment_access(
+            cpu,
+            context,
+            SegmentId::Ss,
+            offset,
+            size,
+            AccessKind::Read,
+        )?);
+    }
+    let targets = (1..=slots)
+        .map(|k| stack.linear(stack.slot(k, size)))
+        .collect::<Vec<_>>();
+    for &at in &targets {
+        probe(cpu, mem, at, size).map_err(|exit| {
+            operand_fault(
+                exit,
+                cpu.rip,
+                at,
+                crate::ir::MemoryAccess::new(u16::from(size), false, true),
+            )
+        })?;
+    }
+    // A replay after a device stop in the frame takes the parameters from the
+    // ledger, as a frame write over the old stack may have changed them.
+    let per = 8 / u64::from(size);
+    let mut parameters = Vec::with_capacity(count as usize);
+    for (i, &at) in sources.iter().enumerate() {
+        let i = i as u64;
+        let key = PARAMETER_RETRY | (i / per);
+        let shift = (i % per) * u64::from(size) * 8;
+        if let Some(packed) = cpu.mmio_part(cpu.rip, key) {
+            mem.skip_read(cpu, at, size);
+            parameters.push((packed >> shift) & mask(size));
+            continue;
+        }
+        parameters.push(read(cpu, mem, at, size).map_err(|exit| {
+            operand_fault(
+                exit,
+                cpu.rip,
+                at,
+                crate::ir::MemoryAccess::new(u16::from(size), false, false),
+            )
+        })?);
+    }
+    // Commit point.
+    cpu.record_mmio_part(cpu.rip, TRANSFER_IP_RETRY, far_ip);
+    cpu.record_mmio_part(cpu.rip, TRANSFER_CS_RETRY, u64::from(selector));
+    remember(cpu, &gate);
+    for (group, values) in parameters.chunks(per as usize).enumerate() {
+        let packed = values.iter().enumerate().fold(0, |packed, (j, &value)| {
+            packed | (value << (j as u64 * u64::from(size) * 8))
+        });
+        cpu.record_mmio_part(cpu.rip, PARAMETER_RETRY | group as u64, packed);
+    }
+    preflight(cpu, mem, &code)?;
+    preflight(cpu, mem, &stack.descriptor)?;
+    accessed(cpu, mem, &mut code)?;
+    accessed(cpu, mem, &mut stack.descriptor)?;
+    // Old SS, old (E)SP, the parameters in their order, old CS and the return
+    // (E)IP (SDM p. 3-132; 286 PRM §7.5.1.4 Fig. 7-12 p. 7-21). The selectors
+    // are zero-extended in a 32-bit frame, as the engine's CS pushes are
+    // (386 PRM p. 17-40 "6-byte return address (padded to 8 bytes)";
+    // ASSUMED value).
+    let mut frame = Vec::with_capacity(slots as usize);
+    frame.push(u64::from(cpu.ss));
+    frame.push(cpu.gpr[RSP] & mask(size));
+    frame.extend_from_slice(&parameters);
+    frame.push(u64::from(cpu.cs));
+    frame.push(u64::from(return_ip));
+    for (&at, &value) in targets.iter().zip(&frame) {
+        write(cpu, mem, at, size, value)?;
+    }
+    install(cpu, SegmentId::Ss, stack.selector, stack.descriptor.cache);
+    // ESP := NewESP, then the pushes at the new SS.B width (SDM p. 3-132).
+    cpu.gpr[RSP] = stack.pointer;
+    cpu.write_gpr(RSP, stack.slot(slots, size), stack.bytes());
+    // CPL := the CS DPL; CS.RPL := CPL (SDM p. 3-132; 286 PRM p. B-25).
+    cpu.legacy.cpl = dpl;
+    install(cpu, SegmentId::Cs, (cs & !3) | u16::from(dpl), code.cache);
     cpu.rip = ip;
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Privilege transitions on the I80286 and I80386 Machine models: interrupts
-//! and exceptions to an inner ring, RETF and IRET to an outer ring, task
-//! switches into rings 1–3, and the CPL and IOPL checks at CPL 1–3.
+//! and exceptions to an inner ring, far CALL and JMP through call gates, RETF
+//! and IRET to an outer ring, task switches into rings 1–3, and the CPL and
+//! IOPL checks at CPL 1–3.
 //! Sources pinned in oracles/intel: 80286 PRM 210498-005, 80386 PRM
 //! 230985-001, SDM 325462-092US; printed page numbers. spec.md §17.10 records
 //! the rows where they disagree and the choice (decisions O1–O14).
@@ -1791,5 +1792,479 @@ fn a_failing_nmi_delivery_from_ring_3_carries_ext() {
         put(&vm, tss_stack(model, 0).0, 2, 0);
         cpu.raise_nmi().unwrap();
         fault(&mut cpu, &vm, 10, Some(1));
+    }
+}
+
+// Call gates (xj-srh.9, second landing). The gate selector GATE | 3 names a
+// DPL-3 gate at GDT 70h; CPL-3 code at 1000h calls or jumps through it with a
+// far pointer whose offset is ignored.
+const GATE: u16 = 0x70;
+const LDT: u64 = 0x2400;
+/// A call-gate image: offset 15:0, selector, the parameter count in byte 4,
+/// the access byte, offset 31:16 (286 PRM §7.5.1.1 Fig. 7-10 p. 7-17;
+/// 386 PRM §6.3.4 Fig. 6-5 p. 6-11).
+fn call_gate(vm: &Vm, address: u64, selector: u16, offset: u32, count: u8, attr: u8) {
+    let low = (u32::from(selector) << 16) | (offset & 0xffff);
+    let high = (offset & 0xffff_0000) | (u32::from(attr) << 8) | u32::from(count);
+    put(vm, address, 4, u64::from(low));
+    put(vm, address + 4, 4, u64::from(high));
+}
+fn far_ptr(op: u8, selector: u16) -> Vec<u8> {
+    let [low, high] = selector.to_le_bytes();
+    vec![op, 0x34, 0x12, low, high]
+}
+/// The gate types a model has: type 4 on both, type 12 on the 80386 only.
+fn gate_types(model: CpuModel) -> &'static [u8] {
+    if wide(model) {
+        &[0x04, 0x0c]
+    } else {
+        &[0x04]
+    }
+}
+fn gate_size(kind: u8) -> usize {
+    if kind & 8 != 0 {
+        4
+    } else {
+        2
+    }
+}
+/// An LDT at 2400h, limit 3Fh, in LDTR (selector 68h).
+fn with_ldt(vm: &Vm, cpu: &mut Vcpu) {
+    descriptor(vm, 0x2068, LDT as u32, 0x3f, 0x82);
+    cpu.cpu.legacy.ldtr = SystemSegment {
+        selector: 0x68,
+        cache: SegmentCache {
+            base: LDT as u32,
+            limit: 0x3f,
+            attributes: 0x82,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+}
+/// CPL-3 code calls (9A) or jumps (EA) through GATE | 3, a DPL-3 gate of
+/// `kind` to `target`:5000h with `count` parameters.
+fn gate_world(model: CpuModel, op: u8, kind: u8, target: u16, count: u8) -> (Vm, Vcpu) {
+    let (vm, cpu) = world(model, 3, &far_ptr(op, GATE | 3), ExceptionDelivery::Outward);
+    call_gate(&vm, 0x2070, target, 0x5000, count, 0xe0 | kind);
+    (vm, cpu)
+}
+
+#[test]
+fn a_call_gate_from_ring_3_enters_ring_0_on_the_tss_stack_and_retf_returns() {
+    // The embedder's shape: CPL 3, a selector with RPL 3 naming a present
+    // DPL-3 gate with no parameters, to DPL-0 non-conforming code (selector
+    // RPL 0), with SS0:SP0 in the TSS. 286 PRM App. B CALL pp. B-24–25 and
+    // §7.5.1.4 Fig. 7-12 p. 7-21; 386 PRM §17 CALL pp. 17-39–40; SDM Vol 2A
+    // CALL pp. 3-131–132 and Vol 3A §6.8.5 p. 6-18. The new stack holds old
+    // SS, old (E)SP, CS and (E)IP at the gate's width; CPL becomes 0 and
+    // CS.RPL the CPL. RETF (RETFD through a 32-bit gate) returns to ring 3
+    // (286 PRM p. B-95; SDM Vol 2B RET p. 4-573).
+    for model in MODELS {
+        for &kind in gate_types(model) {
+            let size = gate_size(kind);
+            let (vm, mut cpu) = gate_world(model, 0x9a, kind, K_CODE, 0);
+            let ret: &[u8] = if size == 4 { b"\x66\xcb" } else { b"\xcb" };
+            vm.write_bytes(0x5000, ret).unwrap();
+            cpu.cpu.flags.if_ = true;
+            steps(&mut cpu, &vm, 1);
+            let sp = 0x9000 - 4 * size as u64;
+            assert_eq!(
+                (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.ss, cpu.cpu.gpr[4]),
+                (K_CODE, 0x5000, K_STACK, sp)
+            );
+            assert_eq!(cpu.cpu.legacy.cpl, 0);
+            assert_eq!(
+                frame(&vm, sp, size, 4),
+                [0x1005, u64::from(U_CODE), 0x8000, u64::from(U_DATA)]
+            );
+            // The loaded caches, and the accessed bits in the GDT.
+            let loaded = |attr| SegmentCache {
+                base: 0,
+                limit: 0xffff,
+                attributes: attr,
+                unusable: 0,
+                reserved: 0,
+            };
+            assert_eq!(cpu.cpu.legacy.segments[0], loaded(0x9b));
+            assert_eq!(cpu.cpu.legacy.segments[3], loaded(0x93));
+            assert_eq!((value(&vm, 0x200d, 1), value(&vm, 0x2015, 1)), (0x9b, 0x93));
+            // Nothing else changes: IF, DS and ES are kept, the old stack is
+            // untouched.
+            assert!(cpu.cpu.flags.if_);
+            assert_eq!((cpu.cpu.ds, cpu.cpu.es), (U_DATA, U_DATA));
+            assert_eq!(value(&vm, 0x7ff0, 8) | value(&vm, 0x7ff8, 8), 0);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(
+                (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.ss, cpu.cpu.gpr[4]),
+                (U_CODE, 0x1005, U_DATA, 0x8000)
+            );
+            assert_eq!(cpu.cpu.legacy.cpl, 3);
+            assert_eq!((cpu.cpu.ds, cpu.cpu.es), (U_DATA, U_DATA));
+        }
+    }
+}
+
+#[test]
+fn call_gates_in_the_ldt_and_to_ldt_code_enter_ring_0() {
+    // A call gate may reside in the GDT or the LDT (286 PRM §7.5.1.1
+    // p. 7-17); its target selector may name either table. The gate at LDT
+    // index 1 (selector 0Fh) targets K_CODE; the GDT gate targets DPL-0 code
+    // at LDT index 2 (selector 14h).
+    for model in MODELS {
+        let (vm, mut cpu) = world(model, 3, &far_ptr(0x9a, 0x0f), ExceptionDelivery::Outward);
+        with_ldt(&vm, &mut cpu);
+        call_gate(&vm, LDT + 8, K_CODE, 0x5000, 0, 0xe4);
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl),
+            (K_CODE, 0x5000, 0)
+        );
+        let (vm, mut cpu) = gate_world(model, 0x9a, 4, 0x14, 0);
+        with_ldt(&vm, &mut cpu);
+        descriptor(&vm, LDT + 0x10, 0, 0xffff, 0x9a);
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl, cpu.cpu.ss),
+            (0x14, 0x5000, 0, K_STACK)
+        );
+        assert_eq!(value(&vm, LDT + 0x15, 1), 0x9b);
+    }
+}
+
+#[test]
+fn a_call_gate_copies_its_parameters_and_retf_n_releases_them_on_both_stacks() {
+    // The count in gate byte 4 names words for a type-4 gate and doublewords
+    // for a type-12 gate (SDM Vol 3A §6.8.3 p. 6-14; 386 PRM §6.3.4.1
+    // p. 6-14). They are copied in their order between old (E)SP and the
+    // return address (SDM Vol 3A §6.8.5 step 7 p. 6-18, Fig. 6-13 p. 6-19).
+    // RETF n pops the return address, skips n bytes, pops SS:SP and adds n to
+    // the outer (E)SP (decision O9; SDM Vol 2B RET p. 4-574). With a new
+    // stack that overlaps the parameters, every parameter is read before the
+    // first write (decision O11).
+    for model in MODELS {
+        for &kind in gate_types(model) {
+            for alias in [false, true] {
+                let size = gate_size(kind);
+                let n = 2 * size as u64;
+                let (vm, mut cpu) = gate_world(model, 0x9a, kind, K_CODE, 2);
+                let ret: &[u8] = if size == 4 {
+                    b"\x66\xca\x08\x00"
+                } else {
+                    b"\xca\x04\x00"
+                };
+                vm.write_bytes(0x5000, ret).unwrap();
+                let (first, second) = if size == 4 {
+                    (0x1111_1111, 0x2222_2222)
+                } else {
+                    (0x1111, 0x2222)
+                };
+                // The caller pushed `first`, then `second`.
+                let old = 0x8000 - n;
+                cpu.cpu.gpr[4] = old;
+                put(&vm, old, size, second);
+                put(&vm, old + size as u64, size, first);
+                // Aliased: SP0 is the caller's SP before the pushes, so the
+                // first two frame slots overwrite both parameters.
+                let top = if alias { 0x8000 } else { 0x9000 };
+                set_tss_stack(&vm, model, 0, K_STACK, top);
+                steps(&mut cpu, &vm, 1);
+                let sp = u64::from(top) - 6 * size as u64;
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.gpr[4], cpu.cpu.legacy.cpl),
+                    (K_CODE, sp, 0)
+                );
+                assert_eq!(
+                    frame(&vm, sp, size, 6),
+                    [
+                        0x1005,
+                        u64::from(U_CODE),
+                        second,
+                        first,
+                        old,
+                        u64::from(U_DATA)
+                    ]
+                );
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.ss, cpu.cpu.gpr[4]),
+                    (U_CODE, 0x1005, U_DATA, 0x8000)
+                );
+                assert_eq!(cpu.cpu.legacy.cpl, 3);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_call_gate_counts_room_on_the_new_stack_by_gate_width_and_parameters() {
+    // Room for the parameters plus 8 bytes, or plus 16 through a type-12
+    // gate (286 PRM p. B-25; 386 PRM p. 17-40; SDM p. 3-132). SS0 is 80h,
+    // DPL-0 data with limit 0FFFh: SP0 = 1000h fits exactly, SP0 = 1001h
+    // ends one byte beyond the limit. The fault is #SS(0) on the 80286 and
+    // #SS(new SS) on the 80386 (decision O1).
+    for model in MODELS {
+        for &kind in gate_types(model) {
+            for count in [0u8, 3] {
+                for top in [0x1000u32, 0x1001] {
+                    let size = gate_size(kind) as u64;
+                    let (vm, mut cpu) = gate_world(model, 0x9a, kind, K_CODE, count);
+                    descriptor(&vm, 0x2080, 0, 0x0fff, 0x92);
+                    set_tss_stack(&vm, model, 0, 0x80, top);
+                    let used = (4 + u64::from(count)) * size;
+                    if top == 0x1000 {
+                        steps(&mut cpu, &vm, 1);
+                        assert_eq!((cpu.cpu.ss, cpu.cpu.gpr[4]), (0x80, 0x1000 - used));
+                    } else {
+                        fault(&mut cpu, &vm, 12, Some(if wide(model) { 0x80 } else { 0 }));
+                        assert_eq!(value(&vm, 0x2085, 1), 0x92);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One way to break a call through GATE, in the check order of 286 PRM
+/// App. B CALL pp. B-24–25 and SDM Vol 2A CALL pp. 3-131–132, with the
+/// expected vector and error code. Each world is a CPL-3 CALL through a
+/// DPL-3 type-4 gate to K_CODE with two parameters.
+fn break_call(vm: &Vm, cpu: &mut Vcpu, model: CpuModel, index: usize) -> (u8, u16) {
+    let gate = |selector, attr| call_gate(vm, 0x2070, selector, 0x5000, 2, attr);
+    match index {
+        // Gate DPL < CPL, and gate DPL < RPL (at CPL 2, RPL 3), #GP(gate).
+        0 => {
+            gate(K_CODE, 0xc4);
+            (13, GATE)
+        }
+        1 => {
+            enter(cpu, 2);
+            gate(K_CODE, 0xc4);
+            (13, GATE)
+        }
+        // Gate not present, #NP(gate); with its DPL also too low, #GP first.
+        2 => {
+            gate(K_CODE, 0x64);
+            (11, GATE)
+        }
+        3 => {
+            gate(K_CODE, 0x44);
+            (13, GATE)
+        }
+        // Gate CS null #GP(0); beyond the GDT limit #GP(CS).
+        4 => {
+            gate(3, 0xe4);
+            (13, 0)
+        }
+        5 => {
+            gate(0x1f8, 0xe4);
+            (13, 0x1f8)
+        }
+        // Not code; code with DPL > CPL (from ring 0 to DPL-3 code).
+        6 => {
+            gate(K_STACK, 0xe4);
+            (13, K_STACK)
+        }
+        7 => {
+            enter(cpu, 0);
+            gate(U_CODE, 0xe4);
+            (13, U_CODE & !3)
+        }
+        // The target not present, #NP(CS) (decision O7); not present with
+        // DPL > CPL as well, #GP(CS), as the type and DPL tests come first.
+        8 => {
+            descriptor(vm, 0x2078, 0, 0xffff, 0x1a);
+            gate(0x78, 0xe4);
+            (11, 0x78)
+        }
+        9 => {
+            enter(cpu, 2);
+            descriptor(vm, 0x2078, 0, 0xffff, 0x7a);
+            gate(0x78, 0xe4);
+            (13, 0x78)
+        }
+        // TSS: the ring-0 SS field one byte beyond the TR limit, #TS(TR).
+        10 => {
+            cpu.cpu.legacy.tr.cache.limit = if wide(model) { 8 } else { 4 };
+            (10, TSS_SEL)
+        }
+        // A null SS0 #TS(0); SS0 with RPL 3 #TS(SS); SS0 not present #SS(SS).
+        11 => {
+            set_tss_stack(vm, model, 0, 0, 0x9000);
+            (10, 0)
+        }
+        12 => {
+            set_tss_stack(vm, model, 0, K_STACK | 3, 0x9000);
+            (10, K_STACK)
+        }
+        13 => {
+            descriptor(vm, 0x2080, 0, 0xffff, 0x12);
+            set_tss_stack(vm, model, 0, 0x80, 0x9000);
+            (12, 0x80)
+        }
+        // No room for 12 bytes (decision O1); with a bad offset too, room
+        // first.
+        14 | 15 => {
+            set_tss_stack(vm, model, 0, K_STACK, 0x0b);
+            if index == 15 {
+                call_gate(vm, 0x2070, 0x88, 0x5000, 2, 0xe4);
+            }
+            (12, if wide(model) { K_STACK } else { 0 })
+        }
+        // The gate offset beyond the new CS limit (88h: limit 0FFFh), #GP(0);
+        // with a parameter beyond the old SS limit too, the offset first
+        // (decision O11).
+        16 | 17 => {
+            call_gate(vm, 0x2070, 0x88, 0x5000, 2, 0xe4);
+            if index == 17 {
+                cpu.cpu.legacy.segments[3].limit = 0x7ffd;
+            }
+            (13, 0)
+        }
+        // A parameter beyond the old SS limit, #SS(0) (decision O11).
+        18 => {
+            cpu.cpu.legacy.segments[3].limit = 0x7ffd;
+            (12, 0)
+        }
+        _ => unreachable!(),
+    }
+}
+const CALL_FAULTS: usize = 19;
+
+#[test]
+fn call_gate_faults_precede_every_change() {
+    for model in MODELS {
+        for index in 0..CALL_FAULTS {
+            let (vm, mut cpu) = gate_world(model, 0x9a, 4, K_CODE, 2);
+            descriptor(&vm, 0x2088, 0, 0x0fff, 0x9a);
+            cpu.cpu.gpr[4] = 0x7ffc;
+            put(&vm, 0x7ffc, 4, 0x1111_2222);
+            let (vector, code) = break_call(&vm, &mut cpu, model, index);
+            fault(&mut cpu, &vm, vector, Some(u32::from(code)));
+            // The new stack and every accessed bit are untouched.
+            assert_eq!(value(&vm, 0x8ff0, 8) | value(&vm, 0x8ff8, 8), 0, "{index}");
+            for at in [0x200d, 0x2015, 0x2085] {
+                assert_eq!(value(&vm, at, 1) & 1, 0, "{index} {at:x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_type_12_gate_on_the_80286_is_a_general_protection_fault() {
+    // On the 80286 descriptor type 12 is no gate: CALL and JMP take the
+    // "ELSE #GP (code segment selector)" branch (286 PRM App. B CALL p. B-25,
+    // JMP p. B-58; DERIVED).
+    for op in [0x9a, 0xea] {
+        let (vm, mut cpu) = gate_world(CpuModel::I80286, op, 0x0c, K_CODE, 0);
+        fault(&mut cpu, &vm, 13, Some(u32::from(GATE)));
+    }
+}
+
+#[test]
+fn jmp_and_same_level_calls_through_a_gate_stay_at_cpl() {
+    // A JMP through a call gate reaches non-conforming code with DPL = CPL
+    // or conforming code with DPL <= CPL, and never changes privilege; an
+    // inward JMP is #GP(CS) (286 PRM App. B JMP p. B-57, §7.5.1.3 p. 7-19;
+    // 386 PRM §17 JMP pp. 17-85–86; SDM Vol 3A Table 6-1 p. 6-16). A CALL
+    // through a gate to the same level, or to conforming code, makes no stack
+    // switch: it pushes CS and IP at the gate's width on the current stack
+    // (286 PRM p. B-25; 386 PRM pp. 17-40–41; SDM Vol 2A CALL pp. 3-133–134).
+    // CS.RPL is the CPL in every case.
+    for model in MODELS {
+        for &kind in gate_types(model) {
+            let size = gate_size(kind);
+            for (target, cs) in [(U_CODE, U_CODE), (CONF0, CONF0 | 3)] {
+                let (vm, mut cpu) = gate_world(model, 0xea, kind, target, 3);
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl),
+                    (cs, 0x5000, 3)
+                );
+                assert_eq!((cpu.cpu.ss, cpu.cpu.gpr[4]), (U_DATA, 0x8000));
+                let (vm, mut cpu) = gate_world(model, 0x9a, kind, target, 3);
+                let ret: &[u8] = if size == 4 { b"\x66\xcb" } else { b"\xcb" };
+                vm.write_bytes(0x5000, ret).unwrap();
+                steps(&mut cpu, &vm, 1);
+                let sp = 0x8000 - 2 * size as u64;
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl, cpu.cpu.ss),
+                    (cs, 0x5000, 3, U_DATA)
+                );
+                assert_eq!(cpu.cpu.gpr[4], sp);
+                assert_eq!(frame(&vm, sp, size, 2), [0x1005, u64::from(U_CODE)]);
+                assert_eq!(value(&vm, 0x8ff0, 8) | value(&vm, 0x8ff8, 8), 0);
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(
+                    (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                    (U_CODE, 0x1005, 0x8000)
+                );
+            }
+            // Inward: #GP(K_CODE); and to DPL-0 code from ring 0 it runs.
+            let (vm, mut cpu) = gate_world(model, 0xea, kind, K_CODE, 0);
+            fault(&mut cpu, &vm, 13, Some(u32::from(K_CODE)));
+            let (vm, mut cpu) = gate_world(model, 0xea, kind, K_CODE, 0);
+            enter(&mut cpu, 0);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(
+                (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl),
+                (K_CODE, 0x5000, 0)
+            );
+        }
+        // A 32-bit gate supplies offset 31:16 too; a 16-bit gate does not.
+        if wide(model) {
+            let (vm, mut cpu) = gate_world(model, 0xea, 0x0c, K_CODE, 0);
+            enter(&mut cpu, 0);
+            descriptor(&vm, 0x2008, 0, 0xffff_ffff, 0x809a);
+            call_gate(&vm, 0x2070, K_CODE, 0x0081_5000, 0, 0xec);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.rip, 0x0081_5000);
+        }
+    }
+}
+
+#[test]
+fn a_call_gate_frame_on_a_device_hands_off_and_replays_the_copied_parameters() {
+    // The new stack aliases the caller's parameters, and its last slot (IP)
+    // is a device: the frame write stops with nothing committed, after RAM
+    // slots have overwritten the parameters. The replay copies the values
+    // first read (decision O11; spec.md §5.2).
+    for model in MODELS {
+        let (mut vm, mut cpu) = gate_world(model, 0x9a, 4, K_CODE, 2);
+        cpu.cpu.gpr[4] = 0x7ffc;
+        put(&vm, 0x7ffc, 2, 0x2222);
+        put(&vm, 0x7ffe, 2, 0x1111);
+        set_tss_stack(&vm, model, 0, K_STACK, 0x8000);
+        trap_range(&mut vm, 0x7ff4, 2);
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert!(
+            matches!(
+                run.stop(),
+                StepStop::Exit(Exit::MmioWrite {
+                    addr: 0x7ff4,
+                    size: 2,
+                    value: 0x1005,
+                    ..
+                })
+            ),
+            "{:?}",
+            run.stop()
+        );
+        assert_eq!(run.steps(), 0);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.ss, cpu.cpu.legacy.cpl, cpu.cpu.gpr[4]),
+            (U_CODE, U_DATA, 3, 0x7ffc)
+        );
+        assert_eq!(value(&vm, 0x7ffe, 2), u64::from(U_DATA));
+        cpu.complete_mmio_write();
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl, cpu.cpu.gpr[4]),
+            (K_CODE, 0x5000, 0, 0x7ff4)
+        );
+        assert_eq!(
+            frame(&vm, 0x7ff6, 2, 5),
+            [u64::from(U_CODE), 0x2222, 0x1111, 0x7ffc, u64::from(U_DATA)]
+        );
     }
 }

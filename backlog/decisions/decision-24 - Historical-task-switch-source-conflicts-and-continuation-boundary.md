@@ -182,6 +182,17 @@ spec.md §17.10. The first landing covers:
 Call gates are the second landing. Until then they keep the typed refusal
 `LegacyGateOrTaskTransfer`.
 
+**Second landing (2026-11-18).** CALL and JMP through a call gate in the GDT or the LDT are
+implemented on both generations:
+- 286 gates on both models, and 386 gates on the 80386 only (#GP(selector) on the 80286);
+- inward calls switch to the stack from the TSS and copy the gate's parameter count, words or
+  dwords, following O1, O7 and O11;
+- same-level calls and conforming targets;
+- JMP through a gate goes to the same privilege level only.
+
+`LegacyGateOrTaskTransfer` is no longer produced. A task gate or a TSS named by CALL or JMP is a
+task switch, as before.
+
 The source-resolution rule above settles these conflicts between the 80286 PRM, the 80386 PRM and
 the SDM. Each counter-statement is recorded in spec.md:
 - **O1. Stack room on an inter-level CALL** (second landing): #SS(0) on the 80286, #SS(new SS)

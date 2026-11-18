@@ -2208,10 +2208,37 @@ unchanged and the instruction or event replays.
 - **Task switches** into a task whose CS.RPL is 1-3 run at that CPL; the
   existing segment loads check the incoming CS, SS and data DPLs against it
   (286 PRM App. B p. B-13; 386 PRM Table 7-1 p. 7-9).
-- **Still refused:** a call gate (`LegacyGateOrTaskTransfer`, second
-  landing), a VM image, paging, the 386 TSS T bit, LOADALL with a CS DPL of
-  1-3 and the I/O bitmap of a 386 TSS. `LegacyPrivilegeTransition` is no
-  longer produced.
+- **Call gates** (xj-srh.9, second landing). A far CALL or JMP whose
+  selector names a call gate in the GDT or the LDT, type 4 on both
+  generations or type 12 on `I80386`, transfers through it; the gate type
+  sets the offset width, the push width and the parameter unit, words for
+  type 4 and doublewords for type 12, with the count from byte 4 bits 4:0
+  (SDM Vol 3A §6.8.3 p. 6-14; 386 PRM §16.4.2.1 p. 16-6). Type 12 on
+  `I80286` is #GP(selector) (286 PRM App. B CALL p. B-25, JMP p. B-58;
+  DERIVED). The checks, in order (286 PRM App. B CALL pp. B-24-25, JMP
+  p. B-57; 386 PRM §17 CALL pp. 17-39-41, JMP pp. 17-85-86; SDM Vol 2A CALL
+  pp. 3-131-134; SDM Vol 3A Table 6-1 p. 6-16): gate DPL < CPL or < RPL
+  #GP(gate); gate not present #NP(gate); target CS null #GP(0); index
+  #GP(CS); not code, or DPL > CPL, #GP(CS); for JMP a non-conforming DPL !=
+  CPL #GP(CS), so a JMP never changes privilege; CS not present #NP(CS).
+  A CALL to non-conforming code with DPL < CPL takes the TSS stack of that
+  ring with the inward checks above (null SS #TS(0)), needs room for the
+  parameters plus 8 bytes (16 through type 12), then checks the offset
+  against the new CS limit, #GP(0), then reads every parameter from the old
+  SS:(E)SP before the first write, a parameter beyond the old SS limit
+  being #SS(0); it pushes old SS, old (E)SP, the parameters in their order,
+  CS and (E)IP and sets CPL to the CS DPL (SDM Vol 3A §6.8.5 p. 6-18,
+  Fig. 6-13 p. 6-19). Every other gate CALL stays at CPL with no stack
+  switch: room for 4 bytes (8 through type 12) #SS(0), the offset #GP(0),
+  then CS:(E)IP pushed on the current stack. CS.RPL is the CPL after every
+  gate transfer. A replay after a device stop in the frame copies the
+  parameters it first read (the retry ledger, as for the far pointer).
+  Task gates and TSSs named by CALL and JMP switch tasks as before
+  (decision-24); RETF and RETF n from the called procedure are the outward
+  return above.
+- **Still refused:** a VM image, paging, the 386 TSS T bit, LOADALL with a
+  CS DPL of 1-3 and the I/O bitmap of a 386 TSS. `LegacyPrivilegeTransition`
+  and `LegacyGateOrTaskTransfer` are no longer produced.
 
 The source rows that disagree, and the engine's choice (decisions O1-O14):
 - **Inward room (O2).** 286 PRM p. B-49 and 386 PRM p. 17-71 count 10 or 20
@@ -2240,7 +2267,11 @@ The source rows that disagree, and the engine's choice (decisions O1-O14):
   17-144); SDM RET p. 4-574, IRET p. 3-495 and Vol 3A §6.8.6 p. 6-20 null
   from the hidden cache when DPL < CPL. The engine: the SDM rule, from the
   cache alone, whatever the selector; the re-validation is not modelled (it
-  differs only if the table changed after the load).
+  differs only if the table changed after the load). The pseudocode's test,
+  "DPL ≥ CPL, or DPL ≥ RPL", never nulls when read literally with RPL as the
+  register's own selector RPL: every register that passed the load rule
+  DPL ≥ MAX(CPL, RPL) (286 PRM App. B MOV pp. B-73-74) satisfies the second
+  clause.
 - **RET n on the outer stack (O9).** The PRM pseudocode (pp. B-95, 17-144)
   loads SS:SP with no second adjustment; the prose (286 p. 7-21, 386 p. 6-16)
   and SDM p. 4-574 add n. The engine adds n, unchecked.
@@ -2261,15 +2292,25 @@ The source rows that disagree, and the engine's choice (decisions O1-O14):
   RET p. 4-573), so the engine zero-extends SP into ESP. Processors that
   keep the upper bits of the old ESP after such a return are not modelled:
   no source pinned in `oracles/` describes that retention.
-- Recorded, for the call-gate landing: an inter-level CALL's room fault is
-  #SS(0) on the 286 (p. B-25; p. 7-20 "error code of 0") and #SS(new SS) on
-  the 386 (§9.8.12 p. 9-16; SDM p. 3-132) (O1); the gate's target CS presence
-  check, omitted by 286 p. B-24 and 386 pp. 17-39-40, is #NP(CS) per 286
-  Table 7-3 p. 7-18 and SDM p. 3-131, whose "If EPL > CPL" should read
-  "> DPL" (O7); 286 p. 7-20 calls an SS DPL mismatch a "task stack fault"
-  and 386 §6.3.4.1 p. 6-14 a "stack exception", where p. B-25 and the SDM
-  give #TS; the PRM pseudocode's "OperandSize" for the gate push width reads
-  as the gate type (386 PRM §16.4.2.1 p. 16-6).
+- **Inter-level CALL room (O1).** 286 PRM p. B-25 and p. 7-20 ("an error
+  code of 0") give #SS(0); 386 PRM p. 17-40 and §6.3.4.1 p. 6-15 give
+  #SS(0), its §9.8.12 p. 9-16 a selector for "overflow of the new stack
+  during an interlevel CALL", and SDM p. 3-132 #SS(NewSS). The engine:
+  #SS(0) on `I80286`, #SS(new SS) on `I80386`, whatever the gate type.
+- **Call-gate target CS presence (O7).** 286 p. B-24 and 386 pp. 17-39-40
+  omit the check; 286 Table 7-3 p. 7-18 and SDM p. 3-131 make it, #NP(CS).
+  The engine checks it after the type and DPL tests, in the SDM order. 286
+  §7.5.1.1 p. 7-18's "If EPL > CPL" should read "> DPL".
+- **Parameter copy (O11).** No source orders the parameter reads against the
+  offset check or the writes. The engine reads every parameter after the
+  offset check and before the first write (ASSUMED), so a new stack that
+  overlaps the old one copies the caller's values; a read beyond the old SS
+  limit is #SS(0). The reads go in push order, highest address first
+  (ASSUMED; visible to a device only).
+- Recorded: 286 p. 7-20 calls an SS DPL mismatch a "task stack fault" and
+  386 §6.3.4.1 p. 6-14 a "stack exception", where p. B-25 and the SDM give
+  #TS; the PRM pseudocode's "OperandSize" for the gate push width reads as
+  the gate type (386 PRM §16.4.2.1 p. 16-6).
 - 286 PRM §3.11.1 p. 3-28 reads "CPL ≥ 0" for the IF rule in its OCR text;
   pp. B-86 and §10.1 p. 10-1 state the rule, and the engine cites those.
 
