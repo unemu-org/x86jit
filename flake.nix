@@ -58,7 +58,7 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           shellHook = ''
-            echo "x86jit dev shell — rust $(rustc --version)"
+            echo "x86jit dev shell — rust $(rustc --version)" >&2
           '';
         };
       in
