@@ -48,6 +48,14 @@ else
     gate_command=(nix develop --no-update-lock-file --command)
 fi
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+# The release subset: the jit, differential, corpus, smc, mt, region_fault_state
+# and rust_memory_faults modules of the grouped binaries, and fault_landing_pad.
+release_tests=(--test codegen --test differential --test fault_landing_pad --test memory
+    --test threads)
+release_filter='binary(=fault_landing_pad) | (binary(=codegen) & test(/^jit::/))'
+release_filter+=' | (binary(=differential) & test(/^(corpus|differential)::/))'
+release_filter+=' | (binary(=memory) & test(/^(region_fault_state|rust_memory_faults)::/))'
+release_filter+=' | (binary(=threads) & test(/^(mt|smc)::/))'
 case "$step" in
     devshell) gate_command+=(rustc --version) ;;
     corpus) gate_command=(./x86jit-tests/vendor/80286/fetch.sh) ;;
@@ -82,11 +90,10 @@ case "$step" in
         ;;
     release)
         # Build only the binaries this gate runs: a nextest -E filter selects
-        # after building every test binary of the package.
+        # after building every test binary of the package. The filter keeps the
+        # release subset to its modules of the grouped binaries.
         gate_command+=(cargo nextest run --locked --release -p x86jit-tests
-            --no-fail-fast --success-output final
-            --test jit --test differential --test corpus --test smc --test mt
-            --test fault_landing_pad --test region_fault_state --test rust_memory_faults)
+            --no-fail-fast --success-output final "${release_tests[@]}" -E "$release_filter")
         ;;
     # Compile what tests and release build, with the same profile, packages and
     # features, without running anything: CI fills main's dependency cache with them.
@@ -94,9 +101,7 @@ case "$step" in
         gate_command+=(cargo test --locked --workspace --features x86jit-tests/unicorn --no-run)
         ;;
     build-release)
-        gate_command+=(cargo test --locked --release -p x86jit-tests --no-run
-            --test jit --test differential --test corpus --test smc --test mt
-            --test fault_landing_pad --test region_fault_state --test rust_memory_faults)
+        gate_command+=(cargo test --locked --release -p x86jit-tests --no-run "${release_tests[@]}")
         ;;
     doctests) gate_command+=(cargo test --locked --workspace --doc --all-features) ;;
     # Target Unicorn libraries are not available: type-check default features;

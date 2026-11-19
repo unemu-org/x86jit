@@ -1690,7 +1690,7 @@ stores outside tagged pages.
 
 **Chained execution has to be able to notice.** Invalidation is applied by `Vm::handle_smc` in the dispatcher loop, and compiled code follows chain/link/IBTC edges *without returning to it*. Marking a page dirty is therefore only half the job — the compiled inner loop leaves the chain when a code page has been dirtied, which bounds its deferral below to one block. Without that, "deferred to the end of the running block" quietly becomes "deferred until the chain happens to end".
 
-**Cross-modifying code (another vcpu writes) is bounded by the guest's own protocol.** SDM Vol 3A §11.1.3 calls the *unsynchronized* form model-specific — real silicon may run stale bytes too, depending how far ahead of the executing processor the write landed — and defines the case that is guaranteed: the modifier stores the code then raises a flag, and the executing processor polls it, executes a serializing instruction, and only then runs the code. A guest following that is served correctly here, and `x86jit-tests/tests/cross_modifying.rs` pins it on both backends. CPUID carries a full memory fence (SDM Vol 3A §11.3); the dirty-page chain leave above supplies translation invalidation, which a memory fence alone cannot provide. Do **not** add a validity check at the chain transfer itself to make the unsynchronized case behave — it would put a load, a compare and a branch on the path fast dispatch exists to keep free, in exchange for a promise the architecture does not make.
+**Cross-modifying code (another vcpu writes) is bounded by the guest's own protocol.** SDM Vol 3A §11.1.3 calls the *unsynchronized* form model-specific — real silicon may run stale bytes too, depending how far ahead of the executing processor the write landed — and defines the case that is guaranteed: the modifier stores the code then raises a flag, and the executing processor polls it, executes a serializing instruction, and only then runs the code. A guest following that is served correctly here, and `x86jit-tests/tests/threads/cross_modifying.rs` pins it on both backends. CPUID carries a full memory fence (SDM Vol 3A §11.3); the dirty-page chain leave above supplies translation invalidation, which a memory fence alone cannot provide. Do **not** add a validity check at the chain transfer itself to make the unsynchronized case behave — it would put a load, a compare and a branch on the path fast dispatch exists to keep free, in exchange for a promise the architecture does not make.
 
 **Same-block SMC on the interpreter.** SDM Vol 3A §14.6, *Self-Modifying Code*,
 describes invalidating prefetched/decoded instructions
@@ -1826,7 +1826,7 @@ The order is chosen so as to **have a working, testable core as fast as possible
 
 ## 15. Dependencies
 
-- `iced-x86` (MIT) — x86 decoder. Core's **only** dependency, and `x86jit-tests/tests/boundary.rs` fails the build if that changes.
+- `iced-x86` (MIT) — x86 decoder. Core's **only** dependency, and `x86jit-tests/tests/codegen/boundary.rs` fails the build if that changes.
 - `cranelift-*` (Apache-2.0 WITH LLVM-exception) — JIT backend. Feature-gated (`x86jit-cranelift`).
 - `memmap2` (MIT OR Apache-2.0) — allocation of executable memory for the JIT cache (W^X; on macOS `pthread_jit_write_protect`).
 - `goblin` (MIT) — ELF parsing, in the loader helper (`x86jit-elf`) only.

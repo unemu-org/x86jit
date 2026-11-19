@@ -88,7 +88,7 @@ timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memo
 timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_fault_stress -- --test-threads 1 --nocapture
 timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --lib -- --test-threads 1
 timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_bound -- --test-threads 1
-timeout 180 nice -n 10 cargo --offline test -p x86jit-tests --test region_fault_state --features unicorn -- --test-threads 1
+timeout 180 nice -n 10 cargo --offline test -p x86jit-tests --test memory --features unicorn region_fault_state:: -- --test-threads 1
 # Optional packed-storage bound (100,000 units; ignored with the soak):
 timeout 180 nice -n 10 cargo --offline test -p x86jit-cranelift --test code_memory_bound hundred_thousand_units_have_bounded_mappings_and_residency -- --ignored --exact --test-threads 1 --nocapture
 # Optional longer soak: 2048 cycles, at most four child threads, 120s watchdog.
@@ -117,7 +117,7 @@ while failing under `cargo test --release` on the same tree.
 
 ```sh
 cargo nextest run --release --features unicorn -E 'not binary(fuzz_robustness)'
-cargo nextest run --release -p x86jit-tests -E 'binary(jit) or binary(differential)'
+cargo nextest run --release -p x86jit-tests -E '(binary(codegen) & test(/^jit::/)) or (binary(differential) & test(/^differential::/))'
 ```
 
 CI runs a narrower form (the second line plus the corpus, smc, mt and host-fault
@@ -284,6 +284,18 @@ What it does:
 A campaign with cached bases takes two candidate builds and a few minutes of measuring; the
 timings are in `performance.md` § "Short campaign protocol".
 
+
+### Test layout
+
+x86jit-tests builds a few test binaries instead of one per file:
+- the area groups (`legacy`, `differential`, `codegen`, `exits`, `memory`, `threads`, `isa`) are
+  `tests/<group>/main.rs`, with one module per test file;
+- a file that defines a `#[global_allocator]`, and `fuzz_robustness`, stay single-file binaries.
+
+To add a test file to a group, put it in `tests/<group>/` and add its `mod` line to that group's
+`main.rs`. Cargo does not find it on its own. A test's nextest name is
+`x86jit-tests::<group> <file>::<test>`. If the new file holds a test slower than 5 s, list it in
+`.config/slow-tests.txt` and run `python3 -B scripts/test-tiers.py sync`.
 ## Test tiers
 
 The test suite runs in three tiers, each a nextest profile in `.config/nextest.toml`.
@@ -299,7 +311,7 @@ The overrides of the default profile (the code-memory group) apply to all three.
 bash scripts/ci-gate.sh fast      # the fast tier: cargo nextest run --profile fast ...
 bash scripts/ci-gate.sh tests     # the full tier, as CI runs it
 bash scripts/ci-gate.sh heavy     # the heavy tier: --profile heavy --run-ignored all
-cargo nextest run --profile fast -p x86jit-tests --test jit   # the profile takes any selection
+cargo nextest run --profile fast -p x86jit-tests --test codegen   # the profile takes any selection
 ```
 
 The **slow list** is `.config/slow-tests.txt`: one test per line, `<binary-id> <test-name>`,

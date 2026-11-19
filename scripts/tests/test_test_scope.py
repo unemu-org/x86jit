@@ -21,8 +21,10 @@ BASE_FILES = (
     "x86jit-core/src/legacy.rs",
     "x86jit-core/src/vm/legacy.rs",
     "x86jit-core/src/vm/nec.rs",
-    "x86jit-tests/tests/legacy_real.rs",
-    "x86jit-tests/tests/smc.rs",
+    "x86jit-tests/tests/legacy/main.rs",
+    "x86jit-tests/tests/legacy/legacy_real.rs",
+    "x86jit-tests/tests/threads/main.rs",
+    "x86jit-tests/tests/threads/smc.rs",
 )
 STUB_GATE = """#!/usr/bin/env bash
 echo "gate $*" >> "$CALL_LOG"
@@ -117,6 +119,8 @@ class Classification(unittest.TestCase):
             "x86jit-core/src/model/decode/i8086.rs": "legacy",
             "x86jit-core/src/ir/verify/legacy_probes.rs": "legacy",
             "x86jit-tests/tests/legacy_real.rs": "legacy",
+            "x86jit-tests/tests/legacy/main.rs": "legacy",
+            "x86jit-tests/tests/legacy/legacy_real.rs": "legacy",
             "x86jit-tests/tests/support/model_api.rs": "legacy",
             "x86jit-tests/tests/support/descriptor_fixture.rs": "legacy",
             # Reached from shared paths (scripts/test-scope.sh, evidence block).
@@ -125,7 +129,8 @@ class Classification(unittest.TestCase):
             "x86jit-core/src/vm.rs": "shared",
             "x86jit-core/src/interp/mod.rs": "shared",
             "x86jit-core/src/ir/verify.rs": "shared",
-            "x86jit-tests/tests/real16_wrap.rs": "shared",
+            "x86jit-tests/tests/memory/real16_wrap.rs": "shared",
+            "x86jit-tests/tests/threads/smc.rs": "shared",
             "x86jit-tests/tests/support/canonical_mmap.rs": "shared",
             "x86jit-tests/src/compat.rs": "shared",
             "Cargo.toml": "shared",
@@ -173,13 +178,18 @@ class Scopes(unittest.TestCase):
 
     def test_legacy_only_including_docs(self):
         self.repo.write("x86jit-core/src/vm/nec.rs", "edited\n")
-        self.repo.write("x86jit-tests/tests/legacy_real.rs", "edited\n")
+        self.repo.write("x86jit-tests/tests/legacy/legacy_real.rs", "edited\n")
         self.repo.write("backlog/docs/guide.md", "edited\n")
         self.repo.commit()
         result = self.assertScope("legacy-only")
         commands = "\n".join(commands_of(result))
         self.assertIn("bash scripts/ci-gate.sh clippy", commands)
-        self.assertIn("--test legacy_real ", commands)
+        # The legacy binary runs whole; a grouped binary only its listed modules.
+        self.assertIn("--test legacy ", commands)
+        self.assertIn("--test threads ", commands)
+        self.assertIn("binary(=legacy) | ", commands)
+        self.assertIn("(binary(=threads) & test(/^(smc)::/))", commands)
+        self.assertNotIn("--test smc ", commands)
         self.assertIn("-p test_legacy_scope.py", commands)
         self.assertNotIn("ci-gate.sh tests", commands)
         self.assertNotIn("ci-gate.sh release", commands)
@@ -209,8 +219,8 @@ class Scopes(unittest.TestCase):
         self.assertIn("shared  x86jit-core/src/vm.rs", result.stdout)
 
     def test_a_rename_between_legacy_paths_stays_legacy(self):
-        self.repo.git("mv", "x86jit-tests/tests/legacy_real.rs",
-                      "x86jit-tests/tests/legacy_real_mode.rs")
+        self.repo.git("mv", "x86jit-tests/tests/legacy/legacy_real.rs",
+                      "x86jit-tests/tests/legacy/legacy_real_mode.rs")
         self.repo.commit()
         self.assertScope("legacy-only")
 
@@ -218,10 +228,12 @@ class Scopes(unittest.TestCase):
         self.repo.git("rm", "-q", "x86jit-core/src/vm/nec.rs")
         self.repo.commit()
         self.assertScope("legacy-only")
-        self.repo.git("rm", "-q", "x86jit-tests/tests/smc.rs")
+        self.repo.git("rm", "-q", "x86jit-tests/tests/threads/smc.rs")
         self.assertScope("shared")
 
     def test_uncommitted_and_untracked_changes_count(self):
+        self.repo.write("x86jit-tests/tests/legacy/legacy_new.rs", "untracked\n")
+        self.assertScope("legacy-only")
         self.repo.write("x86jit-tests/tests/legacy_new.rs", "untracked\n")
         result = self.assertScope("legacy-only")
         self.assertIn("--test legacy_new ", "\n".join(commands_of(result)))
@@ -231,6 +243,15 @@ class Scopes(unittest.TestCase):
         self.repo.write("x86jit-core/src/legacy.rs", "staged\n")
         self.repo.git("add", "x86jit-core/src/legacy.rs")
         self.assertScope("shared")
+
+    def test_prefixed_modules_of_grouped_binaries_are_found_by_file_name(self):
+        self.repo.write("x86jit-tests/tests/threads/real16_new.rs")
+        self.repo.write("x86jit-tests/tests/support/real16_helper.rs")
+        result = self.repo.scope("--plan", "legacy-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = "\n".join(commands_of(result))
+        self.assertIn("(binary(=threads) & test(/^(real16_new|smc)::/))", commands)
+        self.assertNotIn("real16_helper", commands)
 
     def test_a_change_reverted_in_the_working_tree_does_not_count(self):
         self.repo.write("x86jit-core/src/vm.rs", "edited\n")
@@ -352,14 +373,24 @@ class Plans(unittest.TestCase):
             "--profile fast --locked --workspace --features x86jit-tests/unicorn --no-fail-fast --test "))
         names = re.findall(r"--test (\w+)", tests)
         self.assertEqual(names, sorted(set(names)))
-        legacy = {p.stem for p in (ROOT / "x86jit-tests" / "tests").glob("legacy_*.rs")}
-        for name in legacy | {"boundary", "environment_boundary", "run_steps", "irq_shadow",
-                              "retired_count", "smc", "cross_region_ram",
-                              "cross_region_host_fault", "application_codegen", "ss286",
-                              "cf16"}:
-            self.assertIn(name, names)
+        # Whole binaries are `binary(=<name>)`; modules of a grouped binary are
+        # `(binary(=<group>) & test(/^(<a>|<b>)::/))`. Name each by its module.
+        expression = re.search(r" -E '([^']*)'$", tests).group(1)
+        whole = set(re.findall(r"(?:^| \| )binary\(=(\w+)\)(?= \| |$)", expression))
+        modules = {m for _, group in re.findall(
+            r"\(binary\(=(\w+)\) & test\(/\^\(([\w|]+)\)::/\)\)", expression)
+            for m in group.split("|")}
+        self.assertEqual(set(names), whole | set(re.findall(r"\(binary\(=(\w+)\)", expression)))
+        self.assertIn("legacy", whole)
+        self.assertEqual({p.stem for p in (ROOT / "x86jit-tests" / "tests").glob("legacy_*.rs")},
+                         set(), "every legacy_* witness is a module of the legacy binary")
+        for name in {"boundary", "environment_boundary", "run_steps", "irq_shadow",
+                     "retired_count", "smc", "cross_region_ram", "cross_region_host_fault",
+                     "ss286", "cf16", "real16_wrap"}:
+            self.assertIn(name, modules)
+        self.assertIn("application_codegen", whole)
         for name in ("jit", "differential", "differential32", "fuzz", "mt", "corpus"):
-            self.assertNotIn(name, names)
+            self.assertNotIn(name, modules | whole)
         self.assertIn("nix develop --no-update-lock-file --command cargo nextest run "
                       "--profile fast --locked -p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn "
                       "--no-fail-fast --lib", plan)

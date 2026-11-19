@@ -14,6 +14,14 @@ ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / "scripts" / "ci-gate.sh"
 PLAN = ROOT / "scripts" / "ci-plan.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+# The release subset (scripts/ci-gate.sh): binaries, and the modules of the
+# grouped ones that it runs.
+RELEASE_TESTS = ["--test", "codegen", "--test", "differential", "--test", "fault_landing_pad",
+                 "--test", "memory", "--test", "threads"]
+RELEASE_FILTER = ("binary(=fault_landing_pad) | (binary(=codegen) & test(/^jit::/))"
+                  " | (binary(=differential) & test(/^(corpus|differential)::/))"
+                  " | (binary(=memory) & test(/^(region_fault_state|rust_memory_faults)::/))"
+                  " | (binary(=threads) & test(/^(mt|smc)::/))")
 STUB = """#!/usr/bin/env python3
 import json
 import os
@@ -135,16 +143,11 @@ class CiGateTests(unittest.TestCase):
             "build-tests": ["cargo", "test", "--locked", "--workspace", "--features",
                             "x86jit-tests/unicorn", "--no-run"],
             "build-release": ["cargo", "test", "--locked", "--release", "-p", "x86jit-tests",
-                              "--no-run", "--test", "jit", "--test", "differential",
-                              "--test", "corpus", "--test", "smc", "--test", "mt",
-                              "--test", "fault_landing_pad", "--test", "region_fault_state",
-                              "--test", "rust_memory_faults"],
-            # Only the binaries it runs are built: no -E filter after a full build.
+                              "--no-run", *RELEASE_TESTS],
+            # Only the binaries it runs are built; the filter keeps their release modules.
             "release": ["cargo", "nextest", "run", "--locked", "--release", "-p", "x86jit-tests",
-                        "--no-fail-fast", "--success-output", "final",
-                        "--test", "jit", "--test", "differential", "--test", "corpus",
-                        "--test", "smc", "--test", "mt", "--test", "fault_landing_pad",
-                        "--test", "region_fault_state", "--test", "rust_memory_faults"],
+                        "--no-fail-fast", "--success-output", "final", *RELEASE_TESTS,
+                        "-E", RELEASE_FILTER],
             "doctests": ["cargo", "test", "--locked", "--workspace", "--doc", "--all-features"],
         }
         for step, command in expected.items():
@@ -162,10 +165,15 @@ class CiGateTests(unittest.TestCase):
 
     def test_release_binaries_exist(self):
         tests = ROOT / "x86jit-tests" / "tests"
-        for name in ("jit", "differential", "corpus", "smc", "mt", "fault_landing_pad",
-                     "region_fault_state", "rust_memory_faults"):
+        for name in RELEASE_TESTS[1::2]:
             with self.subTest(name=name):
-                self.assertTrue((tests / f"{name}.rs").is_file())
+                self.assertTrue((tests / f"{name}.rs").is_file()
+                                or (tests / name / "main.rs").is_file())
+        for group, modules in re.findall(r"binary\(=(\w+)\) & test\(/\^\(?([\w|]+)\)?::/\)",
+                                         RELEASE_FILTER):
+            for module in modules.split("|"):
+                with self.subTest(module=f"{group}::{module}"):
+                    self.assertTrue((tests / group / f"{module}.rs").is_file())
 
     def test_host_shell_formats_with_the_flake_toolchain_without_nix(self):
         (self.root / "flake.nix").write_text(

@@ -293,9 +293,50 @@ def references(tree):
 
 
 def test_name(path):
-    """Integration-test binary name of `x86jit-*/tests/<name>.rs`, else None."""
+    """Selection unit of an integration-test file, else None.
+
+    `<name>` for a binary `x86jit-*/tests/<name>.rs`, `<group>/<name>` for a
+    module `x86jit-*/tests/<group>/<name>.rs` of a grouped binary, whose crate
+    root is `<group>/main.rs` (scripts/test-scope.sh, legacy_units).
+    """
     match = re.fullmatch(r"x86jit-[\w-]+/tests/(\w+)\.rs", path)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"(x86jit-[\w-]+/tests/(\w+))/(\w+)\.rs", path)
+    if match and match.group(3) != "main" and (ROOT / match.group(1) / "main.rs").is_file():
+        return f"{match.group(2)}/{match.group(3)}"
+    return None
+
+
+def binary_names(files):
+    """Integration-test binary names: `<name>.rs` files and `<name>/main.rs` groups."""
+    names = set()
+    for path in files:
+        match = re.fullmatch(r"x86jit-[\w-]+/tests/(\w+)(?:\.rs|/main\.rs)", path)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def selected_units(plan_line):
+    """{unit} that a legacy-only nextest command selects, and its --test binaries.
+
+    The -E filterset is `binary(=<name>)` for a whole binary and
+    `(binary(=<group>) & test(/^(<a>|<b>)::/))` for modules, joined by ` | `.
+    """
+    binaries = set(re.findall(r"--test (\w+)", plan_line))
+    expression = re.search(r"-E '([^']*)'", plan_line).group(1)
+    units = set()
+    for term in expression.split(" | "):
+        whole = re.fullmatch(r"binary\(=(\w+)\)", term)
+        modules = re.fullmatch(r"\(binary\(=(\w+)\) & test\(/\^\(([\w|]+)\)::/\)\)", term)
+        if whole:
+            units.add(whole.group(1))
+        elif modules:
+            units |= {f"{modules.group(1)}/{m}" for m in modules.group(2).split("|")}
+        else:
+            raise AssertionError(f"unexpected filter term {term!r}")
+    return units, binaries
 
 
 def selects_legacy(text):
@@ -357,10 +398,14 @@ class LegacyScopeSoundness(unittest.TestCase):
 
     def test_legacy_test_set_covers_tests_that_select_legacy_execution(self):
         plan = legacy_plan()
-        selected = set(re.findall(r"--test (\w+)", plan))
-        existing = {test_name(p) for p in self.tree.files} - {None}
+        tests = next(line for line in plan.splitlines() if "--test " in line)
+        selected, binaries = selected_units(tests)
+        existing = ({test_name(p) for p in self.tree.files} - {None}) | binary_names(
+            self.tree.files)
         self.assertEqual(selected - existing, set(), "the legacy-only plan names test "
                          "targets that do not exist")
+        self.assertEqual(binaries, {unit.split("/")[0] for unit in selected},
+                         "the legacy-only plan builds binaries it does not select from")
         unit_tests = next(line for line in plan.splitlines() if line.endswith(" --lib"))
         crates = {p.split("/")[0] for p in self.tree.files
                   if "/src/" in p and selects_legacy(read(p))}
@@ -374,7 +419,7 @@ class LegacyScopeSoundness(unittest.TestCase):
         missing = []
         for path in self.tree.files:
             name = test_name(path)
-            if name is None or name in selected:
+            if name is None or name in selected or name.split("/")[0] in selected:
                 continue
             text = read(path)
             includes = [os.path.normpath(os.path.join(os.path.dirname(path), p))

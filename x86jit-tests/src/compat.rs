@@ -937,8 +937,8 @@ impl Coverage {
              (`Call_rm16`/`Retnw`/`Pushaw`/…). `CpuMode::Real16` exists and is \
              interpreter-only; this generated map does not yet include a 16-bit real-mode \
              table. Real16 validation uses the [SingleStepTests 80286 \
-             corpus](../../../x86jit-tests/tests/ss286.rs) and [targeted Unicorn \
-             comparisons](../../../x86jit-tests/tests/cf16.rs).\n\n",
+             corpus](../../../x86jit-tests/tests/differential/ss286.rs) and [targeted Unicorn \
+             comparisons](../../../x86jit-tests/tests/differential/cf16.rs).\n\n",
         );
         render_mode_table(&mut s, &self.compat32);
         render_missing(&mut s, "long64", &self.generations);

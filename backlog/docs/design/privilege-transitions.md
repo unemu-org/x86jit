@@ -21,7 +21,7 @@ DERIVED mark engine choices.
 
 ## Fact, citation, witness
 
-Test names are in `x86jit-tests/tests/legacy_privilege.rs` unless another module
+Test names are in `x86jit-tests/tests/legacy/legacy_privilege.rs` unless another module
 is named. Every test runs on both generations.
 
 | Fact | Citation | Witness |

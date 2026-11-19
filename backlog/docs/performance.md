@@ -1320,7 +1320,7 @@ No commits, git writes, bead operations or pushes were performed.
 entry; C2 supplies the following model-specific behavior. Existing alias and
 system-model behavior is retained. UM means `oracles/intel/i8086-um.pdf`;
 PRM means `oracles/intel/i286-prm.pdf`. Each named witness is in
-[legacy_i8086.rs](../../x86jit-tests/tests/legacy_i8086.rs) and runs both models.
+[legacy_i8086.rs](../../x86jit-tests/tests/legacy/legacy_i8086.rs) and runs both models.
 The page images for these derivations were checked in round 1.
 
 | Quirk or derived item | C2 value / source | Witness |
