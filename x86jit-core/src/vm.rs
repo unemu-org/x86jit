@@ -2443,21 +2443,71 @@ impl Vcpu {
     /// cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
     /// let batch = cpu.delivery_log_mut().unwrap().take();
     /// assert_eq!((batch.dropped, batch.total), (0, 1));
-    /// let record = batch.records[0];
+    /// let record = &batch.records[0];
     /// assert_eq!((record.vector, record.kind), (0x21, DeliveryKind::Software));
     /// assert_eq!((record.saved_cs, record.saved_ip, record.saved_linear), (0, 0x1002, 0x1002));
     /// assert_eq!(record.retired, 1);
+    /// assert_eq!(record.regs, None); // see `enable_delivery_log_with`
     /// ```
     pub fn enable_delivery_log(&mut self, capacity: usize) -> Result<(), crate::DeliveryLogError> {
+        self.enable_delivery_log_with(capacity, crate::DeliveryLogOptions::default())
+    }
+
+    /// [`Self::enable_delivery_log`] with `options`, which choose what each
+    /// record holds besides the default fields: with
+    /// [`crate::DeliveryLogOptions::registers`] set, every record carries the
+    /// interrupted code's registers in [`crate::DeliveryRecord::regs`]. With
+    /// the default options this is [`Self::enable_delivery_log`]; the options
+    /// change no execution, retirement or generated code. The options are
+    /// fixed for the log's life: this call is the only way to change them,
+    /// and it starts an empty ring. A delivery that began before it, an
+    /// 80286/80386 task switch handed off to the embedder, records `regs:
+    /// None`.
+    ///
+    /// ```
+    /// use x86jit_core::{CpuModel, DeliveryLogOptions, Prot, RegionKind, StepOptions, Vm, VmConfig};
+    /// let mut vm = Vm::new(VmConfig::flat(0x10_0000));
+    /// vm.set_cpu_model(CpuModel::I8086);
+    /// vm.map(0, 0x10_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    /// vm.write_bytes(0x21 * 4, &[0x00, 0x05, 0x00, 0x00]).unwrap(); // INT 21h -> 0000:0500
+    /// vm.write_bytes(0x500, &[0xf4]).unwrap(); // HLT
+    /// // MOV AH, 09h; INT 21h at 0000:1000: INT n with a function number in AH.
+    /// vm.write_bytes(0x1000, &[0xb4, 0x09, 0xcd, 0x21]).unwrap();
+    /// let mut cpu = vm.new_vcpu();
+    /// cpu.cpu.rip = 0x1000;
+    /// cpu.cpu.gpr[4] = 0x8000;
+    /// cpu.cpu.ds = 0x1234;
+    /// let options = DeliveryLogOptions::default().registers(true);
+    /// cpu.enable_delivery_log_with(64, options).unwrap();
+    /// cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+    /// let log = cpu.delivery_log().unwrap();
+    /// assert!(log.options().records_registers());
+    /// let regs = log.iter().next().unwrap().regs.as_deref().copied().unwrap();
+    /// // The INT's inputs: AH as MOV set it, SP before the frame.
+    /// assert_eq!((regs.eax >> 8, regs.esp, regs.ds), (0x09, 0x8000, 0x1234));
+    /// assert_eq!((regs.fs, regs.gs), (None, None)); // FS and GS exist on the 80386 only.
+    /// ```
+    pub fn enable_delivery_log_with(
+        &mut self,
+        capacity: usize,
+        options: crate::DeliveryLogOptions,
+    ) -> Result<(), crate::DeliveryLogError> {
         if self.profile != ExecutionProfile::Machine {
             return Err(crate::DeliveryLogError::NotMachine);
         }
-        self.delivery_log = Some(Box::new(crate::DeliveryLog::new(capacity)?));
+        self.delivery_log = Some(Box::new(crate::DeliveryLog::new(capacity, options)?));
+        self.legacy_execution
+            .as_mut()
+            .expect("a Machine vCPU has its execution state")
+            .set_record_regs(options.records_registers());
         Ok(())
     }
 
     /// Stop recording, and return the log with the records it still holds.
     pub fn disable_delivery_log(&mut self) -> Option<crate::DeliveryLog> {
+        if let Some(execution) = self.legacy_execution.as_mut() {
+            execution.set_record_regs(false);
+        }
         self.delivery_log.take().map(|log| *log)
     }
 

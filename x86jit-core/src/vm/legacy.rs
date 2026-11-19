@@ -182,6 +182,19 @@ pub(super) struct Origin {
     cpl: u8,
 }
 
+/// Where the delivery log takes the interrupted registers of a delivery
+/// from, when it records them (spec.md §17.10, Delivery log).
+#[derive(Clone, Copy)]
+pub(super) enum Interrupted {
+    /// An 80286/80386 delivery: the copy `interp::legacy::deliver` took when
+    /// the delivery began (`SwitchState::regs`).
+    Captured,
+    /// A twenty-bit delivery, which changes only SP, FLAGS, CS and IP: the
+    /// vCPU state with SP before its six-byte frame, and the FLAGS image the
+    /// frame holds.
+    Frame20 { flags: u16 },
+}
+
 // The kind a delivery log records for an event's source. BOUND's #BR is a
 // fault that saves BOUND (SDM Vol 3A §7.15, Event 5 p. 7-31).
 fn delivery_kind(source: EventSource) -> crate::DeliveryKind {
@@ -511,6 +524,14 @@ impl Execution {
             stall_retired: 0,
             stall_count: 0,
         }
+    }
+    // Whether deliveries copy the registers they begin with for the delivery
+    // log (`DeliveryLogOptions::registers`; spec.md §17.10, Delivery log).
+    // A delivery already under way when this changes took no copy, and
+    // records none.
+    pub(super) fn set_record_regs(&mut self, record: bool) {
+        self.task_switch.record_regs = record;
+        self.task_switch.regs = None;
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
@@ -1913,6 +1934,7 @@ impl Vcpu {
                 delivery_kind(event.source),
                 event.origin,
                 error_code,
+                Interrupted::Captured,
             );
         }
         self.finish_legacy_event(event, None);
@@ -1962,8 +1984,9 @@ impl Vcpu {
     }
 
     // Append a delivery of `vector` from `origin` that has just entered its
-    // handler to the delivery log (spec.md §17.10, Delivery log). Called only
-    // while the log is enabled.
+    // handler to the delivery log (spec.md §17.10, Delivery log), with the
+    // interrupted registers from `interrupted` when the log records them.
+    // Called only while the log is enabled.
     #[cold]
     #[inline(never)]
     pub(super) fn record_delivery(
@@ -1972,8 +1995,26 @@ impl Vcpu {
         kind: crate::DeliveryKind,
         origin: Origin,
         error_code: Option<u32>,
+        interrupted: Interrupted,
     ) {
         let twenty = self.twenty_bit_model();
+        let regs = self
+            .delivery_log
+            .as_ref()
+            .is_some_and(|log| log.options().records_registers())
+            .then(|| match interrupted {
+                Interrupted::Captured => self.legacy_execution.as_ref().unwrap().task_switch.regs,
+                // 8086 Family UM §2.6 pp. 2-25–28: the frame is three words
+                // below the interrupted SP.
+                Interrupted::Frame20 { flags } => Some(crate::delivery_log::regs_at(
+                    &self.cpu,
+                    crate::CpuGeneration::I8086,
+                    u32::from(flags),
+                    self.cpu.gpr[4].wrapping_add(6),
+                )),
+            })
+            .flatten()
+            .map(Box::new);
         // 8086 Family UM §2.2 p. 2-7: a twenty-bit IP is a sixteen-bit offset.
         let ip = if twenty {
             origin.ip & 0xffff
@@ -1992,6 +2033,7 @@ impl Vcpu {
             cpl_before: origin.cpl,
             cpl_after: if twenty { 0 } else { self.cpu.legacy.cpl },
             retired: self.retired,
+            regs,
         };
         if let Some(log) = &mut self.delivery_log {
             log.push(record);
@@ -2013,7 +2055,7 @@ impl Vcpu {
         ir: &IrBlock,
         progress: &crate::interp::legacy::Progress,
     ) {
-        let (vector, origin) = if twenty {
+        let (vector, origin, interrupted) = if twenty {
             let taken = |op: &IrOp| match op {
                 IrOp::Legacy(
                     crate::legacy::LegacyOp::Interrupt20 { taken, .. }
@@ -2052,7 +2094,7 @@ impl Vcpu {
             if progress.retired != u64::from(ir.icount) {
                 return;
             }
-            let Some((vector, cs, ip)) = self
+            let Some((vector, cs, ip, flags)) = self
                 .interp_scratch
                 .values
                 .get(taken as usize)
@@ -2060,7 +2102,11 @@ impl Vcpu {
             else {
                 return;
             };
-            (vector, self.delivery_origin(cs, u32::from(ip)))
+            (
+                vector,
+                self.delivery_origin(cs, u32::from(ip)),
+                Interrupted::Frame20 { flags },
+            )
         } else {
             if !matches!(&progress.outcome, Some(Ok(outcome)) if outcome.software_interrupt) {
                 return;
@@ -2079,9 +2125,16 @@ impl Vcpu {
                     cs_base: delivered.cs_base,
                     cpl: delivered.cpl,
                 },
+                Interrupted::Captured,
             )
         };
-        self.record_delivery(vector, crate::DeliveryKind::Software, origin, None);
+        self.record_delivery(
+            vector,
+            crate::DeliveryKind::Software,
+            origin,
+            None,
+            interrupted,
+        );
     }
 
     fn consume_legacy_irq(&mut self, event: &mut PendingEvent) {
@@ -4203,7 +4256,7 @@ impl Vcpu {
             // NEC V20/V30 UM §6 p. 6-1, §8 p. 8-4: an interrupt taken in 8080
             // mode pushes the PSW with MD = 0, then sets MD = 1; standby ends.
             let emulation = self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0;
-            if let Err(exit) = crate::interp::i8086::interrupt::<ROUTED, ORDER>(
+            let flags = match crate::interp::i8086::interrupt::<ROUTED, ORDER>(
                 &mut self.cpu,
                 &vm.mem,
                 vector,
@@ -4215,11 +4268,20 @@ impl Vcpu {
                 },
                 word_bus,
             ) {
-                self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
-                return Err(exit);
-            }
+                Ok(flags) => flags,
+                Err(exit) => {
+                    self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
+                    return Err(exit);
+                }
+            };
             if self.delivery_log.is_some() {
-                self.record_delivery(vector, delivery_kind(event.source), event.origin, None);
+                self.record_delivery(
+                    vector,
+                    delivery_kind(event.source),
+                    event.origin,
+                    None,
+                    Interrupted::Frame20 { flags },
+                );
             }
             if emulation {
                 self.cpu.legacy.reserved &=

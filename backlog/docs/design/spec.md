@@ -3000,7 +3000,55 @@ same run gives the same records. `DeliveryRecord` holds:
   outside protected mode;
 - `retired`, `Vcpu::retired_instructions` when the handler was entered. A software
   interrupt retires by delivering, so its own instruction is counted; a faulting
-  instruction is not.
+  instruction is not;
+- `regs`, the interrupted code's registers (`DeliveryRegs`), or `None` unless
+  the log was enabled with them (below).
+
+Registers (xj-ir6.40). `Vcpu::enable_delivery_log_with(capacity, options)` takes
+a `DeliveryLogOptions` (`#[non_exhaustive]`, `Default` records nothing extra;
+`DeliveryLogOptions::default().registers(true)` sets the one option there is,
+and `records_registers()` reads it); `enable_delivery_log(capacity)` is the same
+call with the default options, and `DeliveryLog::options()` reports them. A log
+keeps its options for its life: another `enable_delivery_log_with` is the only
+way to change them, and it starts an empty ring. With the option set, each record
+carries a boxed `DeliveryRegs` (`#[non_exhaustive]`) in `regs`, so that a record
+without it is one pointer wider than before, not a whole register set (a test
+pins the record at 40 bytes). `DeliveryRegs` holds `eax`, `ebx`, `ecx`, `edx`,
+`esi`, `edi`, `ebp` and `esp` as `u32` (the twenty-bit models and the 80286 fill
+the low 16 bits; I286 PRM §2.3.1), the selectors `ds`, `es` and `ss`, `fs` and
+`gs` as `Some` on the 80386 only (80386 PRM §2.3.2), and `flags`. Every field is
+its value when the delivery began: after the raising instruction's own effects
+and before any of the delivery's, so before the frame push, a stack or task
+switch and the FLAGS changes. For INT n, INT 3 and INTO they are the
+instruction's inputs (a function number in AH arrives as `eax`); for a fault,
+the state at the fault, the faulting instruction rolled back where the model
+rolls it back; for an IRQ or NMI, the state after the last completed
+instruction. `esp` with `ss` is the interrupted stack, before the frame: on an
+inward delivery the outer stack, not the handler's. On the 80386 `esp` is the
+whole register: on a sixteen-bit stack segment (always in real mode) the stack
+pointer is its low 16 bits, and the high half is recorded as the register holds
+it. `flags` is the FLAGS (EFLAGS) image as PUSHF forms it on the model, so RF and
+VM are zero on the 80386 (SDM Vol 2B §4.3 PUSHF/PUSHFD/PUSHFQ, Operation)
+whatever their live value, while a fault's frame can hold RF set; on the
+twenty-bit models it is the image the frame holds, which an interrupt taken in
+NEC 8080 mode saves with MD clear. A delivery that follows another without an
+instruction between them (the NMI frame after an exception's, the step trap after
+a twenty-bit INT, the exception a faulting delivery raises) records the state the
+earlier one left; after a task switch has committed, a fault belongs to the new
+task and records the new task's state, and a task switch handed off to the
+embedder keeps the registers it began with until it completes. A delivery that
+began before the option was enabled, which only an 80286/80386 task switch
+handed off across the enable can be, records `regs: None`: no copy was taken.
+
+The copy is taken off the walk. An 80286/80386 delivery begins in the
+interpreter's one delivery routine, which, with the option on, copies the
+registers into the task-switch state beside the walk from an out-of-line call;
+with the option off it tests one flag. A twenty-bit delivery changes only SP,
+FLAGS, CS and IP, so the recording call rebuilds the registers from the vCPU
+state with SP before the six-byte frame and the FLAGS image the frame holds,
+which the twenty-bit interrupt routine returns and the report of a twenty-bit
+software interrupt carries in its high bits. Nothing else changes when the
+option is off.
 
 A fault during delivery. An attempt whose delivery raises an exception is not
 recorded. The exception it raised is delivered next, serially or as #DF with
@@ -3035,7 +3083,7 @@ handed off to the embedder, the switch remembers that it is a software
 interrupt's, and the resumed instruction that completes it marks its outcome the
 same way. A twenty-bit INT, INT 3, INTO,
 CHKIND or BRKEM op has a temporary of its own: the walk writes 0 there when it
-reaches the op, and the vector and the CS:IP the frame holds once the interrupt is
+reaches the op, and the vector, the CS:IP and the FLAGS image the frame holds once the interrupt is
 taken and the frame written; a not-taken INTO or CHKIND leaves 0. A twenty-bit
 unit holds up to sixteen instructions and such an interrupt ends it (a debug
 assertion checks that the op is the block's only one, in its last instruction), so

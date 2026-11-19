@@ -7,9 +7,9 @@
 //! this file pins what the log says about them.
 use x86jit_core::legacy::SystemSegment;
 use x86jit_core::{
-    CpuMode, CpuModel, CpuState, DeliveryKind, DeliveryLog, DeliveryLogError, DeliveryRecord, Exit,
-    I8080Entry, I8080Handback, Prot, RegionKind, SegmentCache, SegmentId, StepOptions, StepStop,
-    Vcpu, Vm, VmConfig,
+    CpuMode, CpuModel, CpuState, DeliveryKind, DeliveryLog, DeliveryLogError, DeliveryLogOptions,
+    DeliveryRecord, DeliveryRegs, Exit, I8080Entry, I8080Handback, Prot, RegionKind, SegmentCache,
+    SegmentId, StepOptions, StepStop, Vcpu, Vm, VmConfig,
 };
 
 const ALL: [CpuModel; 6] = [
@@ -1208,6 +1208,15 @@ fn mixed(
     protected: bool,
     log: Option<usize>,
 ) -> (Vec<String>, Option<DeliveryLog>) {
+    mixed_with(model, protected, log.map(|capacity| (capacity, None)))
+}
+/// [`mixed`], with the log enabled through `enable_delivery_log_with` when
+/// options are given.
+fn mixed_with(
+    model: CpuModel,
+    protected: bool,
+    log: Option<(usize, Option<DeliveryLogOptions>)>,
+) -> (Vec<String>, Option<DeliveryLog>) {
     let program: &[u8] = &[
         0xb9, 0x14, 0x00, // mov cx,20
         0xcd, 0x40, //       L: int 40h
@@ -1227,8 +1236,10 @@ fn mixed(
         0xeb, 0xfe, //       jmp $
     ];
     let (vm, mut cpu) = unlogged(model, protected, program, false);
-    if let Some(capacity) = log {
-        cpu.enable_delivery_log(capacity).unwrap();
+    match log {
+        Some((capacity, None)) => cpu.enable_delivery_log(capacity).unwrap(),
+        Some((capacity, Some(options))) => cpu.enable_delivery_log_with(capacity, options).unwrap(),
+        None => {}
     }
     // The divide handler returns past DIV BL when the saved IP names it.
     let divide: &[u8] = if twenty(model) && model.profile().quirks.divide_saves_next_ip {
@@ -1318,4 +1329,557 @@ fn the_log_changes_no_execution_state_or_retired_count() {
             );
         }
     }
+}
+
+// The registers option (spec.md §17.10, Delivery log, Registers; xj-ir6.40):
+// each record carries the interrupted code's registers, as they were when the
+// delivery began.
+
+fn registers() -> DeliveryLogOptions {
+    DeliveryLogOptions::default().registers(true)
+}
+/// The log's first record.
+fn first(cpu: &Vcpu) -> DeliveryRecord {
+    cpu.delivery_log().unwrap().iter().next().unwrap().clone()
+}
+/// A record's registers, which the registers option fills.
+fn regs_of(record: &DeliveryRecord) -> DeliveryRegs {
+    *record
+        .regs
+        .clone()
+        .expect("the registers option fills regs")
+}
+/// The fields of a [`DeliveryRegs`] but FLAGS, as a value to compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Regs {
+    /// EAX, EBX, ECX, EDX, ESI, EDI, EBP, ESP.
+    gpr: [u32; 8],
+    /// DS, ES, SS.
+    selectors: [u16; 3],
+    fs: Option<u16>,
+    gs: Option<u16>,
+}
+impl From<&DeliveryRegs> for Regs {
+    fn from(r: &DeliveryRegs) -> Self {
+        Self {
+            gpr: [r.eax, r.ebx, r.ecx, r.edx, r.esi, r.edi, r.ebp, r.esp],
+            selectors: [r.ds, r.es, r.ss],
+            fs: r.fs,
+            gs: r.gs,
+        }
+    }
+}
+/// The general registers in `CpuState::gpr` order (AX, CX, DX, BX, SP, BP,
+/// SI, DI) as `Regs::gpr` orders them.
+fn ordered(gpr: [u32; 8]) -> [u32; 8] {
+    [
+        gpr[0], gpr[3], gpr[1], gpr[2], gpr[6], gpr[7], gpr[5], gpr[4],
+    ]
+}
+const FLAGS_SET: u32 = 0x0001 | 0x0040 | 0x0200 | 0x0400 | 0x0800; // CF ZF IF DF OF
+
+/// A vCPU running `code` with a distinct value in every register, handlers
+/// that halt at 4000h for vectors 0, 13, 21h and 50h, and the delivery log
+/// recording registers. AX..DI hold 1111h..7777h, BP excepted (with the
+/// 80386's high halves 1..7), DX 0044h so that DH is zero; SS:SP is
+/// 0400h:4000h in real mode and 10h:8000h in protected mode (ESP 0005xxxxh
+/// on the 80386, whose stack is sixteen-bit), DS and ES 1234h
+/// and 0567h or selectors 18h and 20h, FS and GS 0ABCh and 0DEFh in real mode
+/// and null in protected mode. CF, ZF, IF, DF and OF are set. Returns the
+/// registers a record of a delivery before the first instruction holds.
+fn loaded(model: CpuModel, protected: bool, code: &[u8]) -> (Vm, Vcpu, Regs) {
+    let (vm, mut cpu) = unlogged(model, protected, code, false);
+    cpu.enable_delivery_log_with(64, registers()).unwrap();
+    for vector in [0, 13, 0x21, 0x50] {
+        handler(&vm, protected, vector, 0x4000, b"\xf4");
+    }
+    let wide = model == CpuModel::I80386;
+    // CpuState::gpr order: AX, CX, DX, BX, SP, BP, SI, DI.
+    let low: [u32; 8] = [0x1111, 0x3333, 0x0044, 0x2222, 0, 0x7777, 0x5555, 0x6666];
+    let mut gpr = [0u32; 8];
+    for (index, value) in low.into_iter().enumerate() {
+        let high = if wide && index != 4 {
+            (index as u32 + 1) << 16
+        } else {
+            0
+        };
+        gpr[index] = high | value;
+    }
+    let (ss, sp) = if protected {
+        (0x10, 0x8000)
+    } else {
+        (0x400, 0x4000)
+    };
+    // The 80386's ESP has a high half too, which the sixteen-bit stack does
+    // not use and the record carries (`DeliveryRegs::esp`).
+    gpr[4] = if wide { 0x0005_0000 | sp } else { sp };
+    for (index, value) in gpr.into_iter().enumerate() {
+        cpu.cpu.gpr[index] = u64::from(value);
+    }
+    let (ds, es, fs, gs) = if protected {
+        (0x18, 0x20, 0, 0)
+    } else {
+        (0x1234, 0x0567, 0x0abc, 0x0def)
+    };
+    if protected {
+        descriptor(&vm, GDT + 0x18, 0, 0xffff, 0x92);
+        descriptor(&vm, GDT + 0x20, 0, 0xffff, 0x92);
+    }
+    cpu.cpu.ss = ss;
+    cpu.cpu.ds = ds;
+    cpu.cpu.es = es;
+    cpu.cpu.fs = fs;
+    cpu.cpu.gs = gs;
+    for (id, selector) in [
+        (SegmentId::Ss, ss),
+        (SegmentId::Ds, ds),
+        (SegmentId::Es, es),
+        (SegmentId::Fs, fs),
+        (SegmentId::Gs, gs),
+    ] {
+        if !protected {
+            cpu.cpu.legacy.segments[id as usize].base = u32::from(selector) << 4;
+        }
+    }
+    let flags = &mut cpu.cpu.flags;
+    (flags.cf, flags.zf, flags.if_, flags.df, flags.of) = (true, true, true, true, true);
+    let expected = Regs {
+        gpr: ordered(gpr),
+        selectors: [ds, es, ss],
+        fs: wide.then_some(fs),
+        gs: wide.then_some(gs),
+    };
+    (vm, cpu, expected)
+}
+/// Run to the handler's HLT and return the one record's registers, after
+/// checking that its FLAGS hold `set` (CF, ZF, IF, DF and OF, or fewer where
+/// the raising instruction changes some of them), that the FLAGS word
+/// the frame holds below the recorded SS:SP is its low half, and that the
+/// handler runs with IF clear.
+fn delivered(vm: &Vm, cpu: &mut Vcpu, protected: bool, set: u32, label: &str) -> Regs {
+    halt(vm, cpu);
+    let records: Vec<DeliveryRecord> = cpu.delivery_log().unwrap().iter().cloned().collect();
+    assert_eq!(records.len(), 1, "{label}");
+    let regs = *records[0]
+        .regs
+        .clone()
+        .expect("the registers option fills regs");
+    assert_eq!(regs.flags & set, set, "{label}: {:#x}", regs.flags);
+    assert!(!cpu.cpu.flags.if_, "{label}");
+    // Real-mode and 286-gate frames are words: FLAGS is the one pushed first,
+    // just below the interrupted SP (8086 Family UM §2.6 pp. 2-25–28; 286 PRM
+    // §9.4 Fig. 9-3).
+    let base = if protected {
+        0
+    } else {
+        u64::from(regs.ss) << 4
+    };
+    let mut word = [0; 2];
+    vm.read_bytes(base + u64::from(regs.esp & 0xffff) - 2, &mut word)
+        .unwrap();
+    assert_eq!(
+        regs.flags & 0xffff,
+        u32::from(u16::from_le_bytes(word)),
+        "{label}"
+    );
+    assert_eq!(regs.flags >> 16, 0, "{label}: no RF or VM");
+    Regs::from(&regs)
+}
+
+#[test]
+fn a_software_interrupt_records_its_inputs_on_every_model() {
+    // INT n with a function number in AH: MOV AH, 30h; INT 21h. The record
+    // holds the INT's inputs, SS:SP before its frame.
+    for model in ALL {
+        for &protected in modes(model) {
+            let label = format!("{model:?} protected={protected}");
+            let (vm, mut cpu, mut expected) = loaded(model, protected, b"\xb4\x30\xcd\x21");
+            expected.gpr[0] = (expected.gpr[0] & !0xff00) | 0x3000;
+            assert_eq!(
+                delivered(&vm, &mut cpu, protected, FLAGS_SET, &label),
+                expected,
+                "{label}"
+            );
+            assert_ne!(cpu.cpu.gpr[4] as u32 & 0xffff, expected.gpr[7], "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_fault_and_an_irq_record_the_registers_at_that_moment() {
+    // The fault: #GP for a word at DS:FFFFh on the 80286 and 80386 (interrupt
+    // 13 in real mode, I286 PRM App. B MOV p. B-74; #GP(0) past the limit in
+    // protected mode); the divide error of DIV DH on the twenty-bit models,
+    // which raise no processor interrupt above 4. Neither writes a register
+    // before it faults: the record holds the registers the faulting
+    // instruction met, after the INC SI before it.
+    for model in ALL {
+        for &protected in modes(model) {
+            let label = format!("{model:?} protected={protected}");
+            let code: &[u8] = if twenty(model) {
+                b"\x46\xf6\xf6" // INC SI; DIV DH
+            } else {
+                b"\x46\x3e\xa1\xff\xff" // INC SI; MOV AX, DS:[FFFFh]
+            };
+            let (vm, mut cpu, mut expected) = loaded(model, protected, code);
+            expected.gpr[4] = (expected.gpr[4] & !0xffff) | 0x5556;
+            // INC SI writes ZF and OF and keeps CF. DIV leaves the status
+            // flags undefined (SDM Vol 2A §3.3 DIV, Flags Affected), and the
+            // twenty-bit divide error leaves them as the engine's DIV wrote
+            // them: there only IF and DF are pinned.
+            let set = if twenty(model) { 0x0600 } else { 0x0601 };
+            assert_eq!(
+                delivered(&vm, &mut cpu, protected, set, &label),
+                expected,
+                "{label}"
+            );
+            let record = first(&cpu);
+            assert_eq!(record.kind, DeliveryKind::Fault, "{label}");
+
+            // An IRQ before the first instruction.
+            let (vm, mut cpu, expected) = loaded(model, protected, b"\x90");
+            cpu.inject_irq(0x50);
+            assert_eq!(
+                delivered(&vm, &mut cpu, protected, FLAGS_SET, &label),
+                expected,
+                "{label}"
+            );
+            let record = first(&cpu);
+            assert_eq!(record.kind, DeliveryKind::Irq, "{label}");
+        }
+    }
+}
+
+#[test]
+fn an_inward_delivery_records_the_interrupted_stack() {
+    // 286 PRM §9.4 pp. 9-4–5; 386 PRM §9.6.1.1 p. 9-7: the gate switches to
+    // the ring-0 stack 10h:9000h of the TSS; the record holds the ring-3
+    // stack 23h:8000h the code was interrupted on.
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        let wide = model == CpuModel::I80386;
+        for (code, vector, gate, kind) in [
+            (&b"\xcd\x40"[..], 0x40, 0xe6, DeliveryKind::Software),
+            (b"\x8e\xd8", 13, 0x86, DeliveryKind::Fault), // MOV DS, AX with AX = 10h
+            (b"\x90", 0x50, 0x86, DeliveryKind::Irq),
+        ] {
+            let label = format!("{model:?} vector={vector:#x}");
+            let (vm, mut cpu) = ring3(model, code);
+            cpu.enable_delivery_log_with(8, registers()).unwrap();
+            ring0_gate(&vm, vector, gate);
+            vm.write_bytes(0x5000, b"\xf4").unwrap();
+            let high = |index: u32| if wide { index << 16 } else { 0 };
+            let gpr = [
+                high(1) | u32::from(K_STACK),
+                high(2) | 0x3333,
+                high(3) | 0x4444,
+                high(4) | 0x2222,
+                0x8000,
+                high(6) | 0x7777,
+                high(7) | 0x5555,
+                high(8) | 0x6666,
+            ];
+            for (index, value) in gpr.into_iter().enumerate() {
+                cpu.cpu.gpr[index] = u64::from(value);
+            }
+            if kind == DeliveryKind::Irq {
+                cpu.cpu.flags.if_ = true;
+                cpu.inject_irq(0x50);
+            }
+            halt(&vm, &mut cpu);
+            assert_eq!(
+                (cpu.cpu.ss, cpu.cpu.gpr[4] & 0xffff < 0x9000),
+                (K_STACK, true),
+                "{label}"
+            );
+            let record = first(&cpu);
+            assert_eq!((record.kind, record.cpl_before), (kind, 3), "{label}");
+            assert_eq!(
+                Regs::from(&regs_of(&record)),
+                Regs {
+                    gpr: ordered(gpr),
+                    selectors: [U_DATA, U_DATA, U_DATA],
+                    fs: wide.then_some(0),
+                    gs: wide.then_some(0),
+                },
+                "{label}"
+            );
+            // The ring-3 frame on the ring-0 stack holds the same SS:SP.
+            let mut frame = [0; 4];
+            vm.read_bytes(0x9000 - 4, &mut frame).unwrap();
+            assert_eq!(frame, [0x00, 0x80, U_DATA as u8, 0], "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_task_gate_delivery_records_the_outgoing_task_registers() {
+    // 286 PRM §9.5 p. 9-6; 386 PRM §9.6.2 p. 9-9: the switch replaces every
+    // register; the record holds task A's, as INT 30h met them, also when
+    // the switch is handed off to the embedder to write A's TSS on a device.
+    for (model, wide) in TASK_FORMATS {
+        for device in [None, Some(A_TSS_PAGE)] {
+            let label = format!("{model:?} wide={wide} device={device:?}");
+            let (vm, mut cpu) = task_gates(model, wide, b"\xcd\x30", device);
+            cpu.enable_delivery_log_with(8, registers()).unwrap();
+            for (index, value) in [(1, 0x3333u64), (2, 0x4444), (3, 0x2222), (6, 0x5555)] {
+                cpu.cpu.gpr[index] = value;
+            }
+            if device.is_some() {
+                assert!(halt_completing_writes(&vm, &mut cpu, &label) > 0, "{label}");
+            } else {
+                halt(&vm, &mut cpu);
+            }
+            assert_eq!(
+                (cpu.cpu.legacy.tr.selector, cpu.cpu.gpr[4]),
+                (0x20, 0x9000),
+                "{label}"
+            );
+            let record = first(&cpu);
+            assert_eq!(
+                Regs::from(&regs_of(&record)),
+                Regs {
+                    gpr: [0x18, 0x2222, 0x3333, 0x4444, 0x5555, 0, 0, 0x8000],
+                    selectors: [16, 16, 16],
+                    fs: (model == CpuModel::I80386).then_some(0),
+                    gs: (model == CpuModel::I80386).then_some(0),
+                },
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_registers_option_changes_no_execution_state_or_retired_count() {
+    for model in ALL {
+        for &protected in modes(model) {
+            let label = format!("{model:?} protected={protected}");
+            let (off, _) = mixed(model, protected, None);
+            let (plain, plain_log) = mixed_with(
+                model,
+                protected,
+                Some((64, Some(DeliveryLogOptions::default()))),
+            );
+            let (on, log) = mixed_with(model, protected, Some((64, Some(registers()))));
+            assert_eq!(off, plain, "{label}");
+            assert_eq!(off, on, "{label}");
+            let (plain_log, log) = (plain_log.unwrap(), log.unwrap());
+            assert!(!plain_log.options().records_registers(), "{label}");
+            assert!(log.options().records_registers(), "{label}");
+            assert!(plain_log.iter().all(|r| r.regs.is_none()), "{label}");
+            assert_eq!(recs(log.iter()), mixed_records(model, protected), "{label}");
+            assert_eq!(recs(plain_log.iter()), recs(log.iter()), "{label}");
+            let regs: Vec<DeliveryRegs> = log.iter().map(regs_of).collect();
+            // The first INT 40h meets CX = 20 and SP = 8000h; every delivery
+            // of the program interrupts code on that stack.
+            assert_eq!((regs[0].ecx, regs[0].esp), (20, 0x8000), "{label}");
+            assert!(regs.iter().all(|r| r.esp == 0x8000), "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_record_without_registers_stays_small() {
+    // The registers are boxed: a record without them is one pointer larger
+    // than the xj-ir6.37 record (32 bytes), not a whole DeliveryRegs.
+    assert_eq!(std::mem::size_of::<DeliveryRecord>(), 40);
+    assert_eq!(
+        std::mem::size_of::<Option<Box<DeliveryRegs>>>(),
+        std::mem::size_of::<usize>()
+    );
+}
+
+#[test]
+fn a_delivery_begun_before_the_registers_option_records_none() {
+    // INT 30h through a task gate with task A's TSS on a device: the switch
+    // is handed off to the embedder before it commits. Enabling the registers
+    // option during the handoff starts an empty log; the INT, which began
+    // before it, records no registers rather than a copy it never took.
+    for (model, wide) in TASK_FORMATS {
+        let label = format!("{model:?} wide={wide}");
+        let (vm, mut cpu) = task_gates(model, wide, b"\xcd\x30", Some(A_TSS_PAGE));
+        let mut enabled = false;
+        loop {
+            match cpu.run(&vm, Some(100)) {
+                Exit::MmioWrite { .. } => {
+                    if !enabled {
+                        cpu.enable_delivery_log_with(8, registers()).unwrap();
+                        enabled = true;
+                    }
+                    cpu.complete_mmio_write();
+                }
+                Exit::Hlt => break,
+                exit => panic!("{label}: {exit:?}"),
+            }
+        }
+        assert!(enabled, "{label}");
+        let record = first(&cpu);
+        assert_eq!(
+            Rec::from(&record),
+            flat(0x30, DeliveryKind::Software, 0x1008, None, 3),
+            "{label}"
+        );
+        assert_eq!(record.regs, None, "{label}");
+    }
+}
+
+#[test]
+fn chained_and_handed_off_deliveries_record_where_they_began() {
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        // INT 40h through a gate with P = 0 raises #NP (286 PRM §9.4 Fig. 9-3
+        // p. 9-5); a #GP whose gate is absent becomes #DF (286 PRM §9.6.2
+        // p. 9-10). Each record holds the state the first delivery began
+        // with: the INT's inputs, the MOV's.
+        for (code, absent, vector) in [
+            (&b"\xcd\x40"[..], 0x40u8, 11u8),
+            (b"\x3e\xa1\xff\xff", 13, 8),
+        ] {
+            let label = format!("{model:?} vector={vector}");
+            let (vm, mut cpu) = machine(model, true, code);
+            cpu.enable_delivery_log_with(8, registers()).unwrap();
+            handler(&vm, true, vector, 0x4000, b"\xf4");
+            vm.write_bytes(IDT + u64::from(absent) * 8 + 5, &[0x06])
+                .unwrap();
+            cpu.cpu.gpr[1] = 0x1234;
+            halt(&vm, &mut cpu);
+            let record = first(&cpu);
+            assert_eq!(record.vector, vector, "{label}");
+            let regs = regs_of(&record);
+            assert_eq!(
+                (regs.ecx, regs.esp, regs.ss),
+                (0x1234, 0x8000, 16),
+                "{label}"
+            );
+        }
+    }
+    for (model, wide) in TASK_FORMATS {
+        // A fault after a committed task switch belongs to task B: task B's
+        // IP 1800h past its CS limit is #GP(0) in the new task (as
+        // a_fault_after_a_committed_task_switch_records_the_new_task), and
+        // the record holds B's registers, SP 9000h, not A's.
+        let label = format!("{model:?} wide={wide}");
+        let (vm, mut cpu) = task_gates(model, wide, b"\xcd\x30", None);
+        cpu.enable_delivery_log_with(8, registers()).unwrap();
+        descriptor(&vm, GDT + 8, 0, 0x17ff, 0x9b);
+        vm.write_bytes(IDT + 13 * 8, &[0, 0x17, 8, 0, 0, 0x86, 0, 0])
+            .unwrap();
+        vm.write_bytes(0x1700, b"\xf4").unwrap();
+        cpu.cpu.gpr[1] = 0x1234;
+        halt(&vm, &mut cpu);
+        let regs = regs_of(&first(&cpu));
+        assert_eq!((regs.eax, regs.ecx, regs.esp), (0, 0, 0x9000), "{label}");
+
+        // The #GP(78h) of MOV DS through a task gate, whose error code goes
+        // to task B's stack on a device after the switch commits: the record
+        // keeps task A's registers through the handoff. A copy taken again
+        // when the switch resumes would hold B's (SP 9000h).
+        let (vm, mut cpu) = task_gates(model, wide, b"\xb8\x78\x00\x8e\xd8", Some(B_STACK_PAGE));
+        cpu.enable_delivery_log_with(8, registers()).unwrap();
+        cpu.cpu.gpr[1] = 0x1234;
+        assert!(halt_completing_writes(&vm, &mut cpu, &label) > 0, "{label}");
+        assert_eq!(cpu.cpu.legacy.tr.selector, 0x20, "{label}");
+        let regs = regs_of(&first(&cpu));
+        assert_eq!(
+            (regs.eax, regs.ecx, regs.esp, regs.ss, regs.ds),
+            (0x78, 0x1234, 0x8000, 16, 16),
+            "{label}"
+        );
+    }
+    for model in [CpuModel::I8086, CpuModel::NecV30] {
+        let label = format!("{model:?}");
+        // INT 40h under TF: the INT records its inputs, TF set; the step trap
+        // after it records the state the INT left, its frame pushed and IF
+        // and TF clear (8086 Family UM §2.6 p. 2-28).
+        let (vm, mut cpu) = machine(model, false, b"\xcd\x40");
+        cpu.enable_delivery_log_with(8, registers()).unwrap();
+        handler(&vm, false, 0x40, 0x4400, b"\x90\xf4");
+        handler(&vm, false, 1, 0x4500, b"\xf4");
+        cpu.cpu.flags.if_ = true;
+        cpu.cpu.rflags_system |= 0x100;
+        halt(&vm, &mut cpu);
+        let regs: Vec<DeliveryRegs> = cpu.delivery_log().unwrap().iter().map(regs_of).collect();
+        assert_eq!(regs.len(), 2, "{label}");
+        assert_eq!(
+            (regs[0].esp, regs[0].flags & 0x300),
+            (0x8000, 0x300),
+            "{label}"
+        );
+        assert_eq!((regs[1].esp, regs[1].flags & 0x300), (0x7ffa, 0), "{label}");
+
+        // SP wraps: the frame of an INT at SP = 0, 2, 4 or 6 wraps in the
+        // stack segment, and the record holds the SP the INT met.
+        for sp in [0u16, 2, 4, 6] {
+            let (vm, mut cpu) = machine(model, false, b"\xcd\x40");
+            cpu.enable_delivery_log_with(8, registers()).unwrap();
+            handler(&vm, false, 0x40, 0x4000, b"\xf4");
+            cpu.cpu.gpr[4] = u64::from(sp);
+            halt(&vm, &mut cpu);
+            assert_eq!(regs_of(&first(&cpu)).esp, u32::from(sp), "{label} sp={sp}");
+        }
+    }
+    for model in [CpuModel::NecV20, CpuModel::NecV30] {
+        let label = format!("{model:?}");
+        // CHKIND out of bounds: interrupt 5 with the CHKIND's inputs.
+        let (vm, mut cpu) = machine(model, false, b"\x62\x06\x00\x04");
+        cpu.enable_delivery_log_with(8, registers()).unwrap();
+        handler(&vm, false, 5, 0x4000, b"\xf4");
+        vm.write_bytes(0x400, &[0xfd, 0xff, 0x03, 0x00]).unwrap();
+        cpu.cpu.gpr[0] = 4;
+        cpu.cpu.gpr[1] = 0x1234;
+        halt(&vm, &mut cpu);
+        let regs = regs_of(&first(&cpu));
+        assert_eq!(
+            (regs.eax, regs.ecx, regs.esp),
+            (4, 0x1234, 0x8000),
+            "{label}"
+        );
+
+        // BRKEM from native mode saves MD = 1; CALLN from 8080 mode runs on
+        // the native stack below BRKEM's frame and saves MD = 0 (NEC UM
+        // p. 12-169 BRKEM, p. 12-176 CALLN).
+        let mut vm = Vm::new(VmConfig::flat(0x120000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x120000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1200, b"\x0f\xff\x80").unwrap(); // BRKEM 80h
+        vm.write_bytes(0x80 * 4, &[0x00, 0x01, 0x00, 0x20]).unwrap(); // 2000:0100
+        vm.write_bytes(0x40 * 4, &[0x00, 0x02, 0x00, 0x60]).unwrap(); // 6000:0200
+        vm.write_bytes(0x60200, b"\xf4").unwrap();
+        vm.write_bytes(0x20110, b"\xed\xed\x40").unwrap(); // CALLN 40h
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1200;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.enable_delivery_log_with(8, registers()).unwrap();
+        let run = cpu.run_steps(&vm, 10, StepOptions::default()).unwrap();
+        let StepStop::Exit(Exit::I8080Mode { view, .. }) = run.stop() else {
+            panic!("{:?}", run.stop())
+        };
+        let mut view = *view;
+        view.pc = 0x110;
+        cpu.hand_back_i8080(&view, I8080Handback::EdEscape).unwrap();
+        halt(&vm, &mut cpu);
+        let regs: Vec<DeliveryRegs> = cpu.delivery_log().unwrap().iter().map(regs_of).collect();
+        assert_eq!(regs.len(), 2, "{label}");
+        assert_eq!(
+            (regs[0].esp, regs[0].flags & 0x8000),
+            (0x8000, 0x8000),
+            "{label}"
+        );
+        assert_eq!(
+            (regs[1].esp, regs[1].flags & 0x8000),
+            (0x7ffa, 0),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn the_80386_records_eflags_as_pushfd_forms_it() {
+    // SDM Vol 2B §4.3 PUSHF/PUSHFD/PUSHFQ, Operation: the image has RF and
+    // VM clear. A live RF at the INT does not reach the record.
+    let (vm, mut cpu, _) = loaded(CpuModel::I80386, true, b"\xcd\x21");
+    cpu.cpu.rflags_system |= 0x1_0000;
+    halt(&vm, &mut cpu);
+    let regs = regs_of(&first(&cpu));
+    assert_eq!(regs.flags >> 16, 0, "{:#x}", regs.flags);
+    assert_eq!(regs.flags & FLAGS_SET, FLAGS_SET, "{:#x}", regs.flags);
 }

@@ -225,7 +225,7 @@ impl Vcpu {
                 // p. 12-176 reads "SP <- PS - 6"; taken as a misprint for
                 // SP - 6, the three-word frame its other lines push (ASSUMED).
                 let origin = self.delivery_origin(self.cpu.cs, u32::from(ip.wrapping_add(3)));
-                crate::interp::i8086::interrupt::<ROUTED, ORDER>(
+                let flags = crate::interp::i8086::interrupt::<ROUTED, ORDER>(
                     &mut self.cpu,
                     &vm.mem,
                     vector,
@@ -234,15 +234,21 @@ impl Vcpu {
                     crate::lift::i8086::word_bus(profile),
                 )?;
                 self.cpu.legacy.reserved &= !(NEC_EMULATION | NEC_STANDBY);
-                calln = Some((vector, origin));
+                calln = Some((vector, origin, flags));
             }
             _ => return Err(Exit::unknown_instruction(u64::from(ip), bytes, 2)),
         }
         // One completed unit (decision-16 §2); the caller charges its step.
         self.retired += 1;
         self.executed += 1;
-        if let Some((vector, origin)) = calln.filter(|_| self.delivery_log.is_some()) {
-            self.record_delivery(vector, crate::DeliveryKind::Software, origin, None);
+        if let Some((vector, origin, flags)) = calln.filter(|_| self.delivery_log.is_some()) {
+            self.record_delivery(
+                vector,
+                crate::DeliveryKind::Software,
+                origin,
+                None,
+                super::legacy::Interrupted::Frame20 { flags },
+            );
         }
         self.sti_shadow = false;
         self.ss_shadow = 0;

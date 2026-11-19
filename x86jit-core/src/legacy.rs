@@ -1683,15 +1683,21 @@ mod loadall_tests {
 /// The report a twenty-bit INT, INT 3, INTO, CHKIND or BRKEM op leaves in its
 /// `taken` temporary for the delivery log (spec.md §17.10, Delivery log). The
 /// walk writes 0 when it reaches the op, and this value once the interrupt is
-/// taken and its frame written: bit 40 set, the vector in bits 32-39, and the
-/// CS and IP the frame holds in bits 16-31 and 0-15. Only the interrupt path
-/// writes it, so a unit without one pays nothing.
-pub(crate) fn report_interrupt20(vector: u8, cs: u16, ip: u16) -> u64 {
-    1 << 40 | u64::from(vector) << 32 | u64::from(cs) << 16 | u64::from(ip)
+/// taken and its frame written: bit 40 set, the vector in bits 32-39, the CS
+/// and IP the frame holds in bits 16-31 and 0-15, and the FLAGS image it holds
+/// in bits 48-63. Only the interrupt path writes it, so a unit without one
+/// pays nothing.
+pub(crate) fn report_interrupt20(vector: u8, cs: u16, ip: u16, flags: u16) -> u64 {
+    u64::from(flags) << 48 | 1 << 40 | u64::from(vector) << 32 | u64::from(cs) << 16 | u64::from(ip)
 }
 
-/// The vector, CS and IP of a [`report_interrupt20`] value; `None` for an
-/// interrupt not taken.
-pub(crate) fn reported_interrupt20(report: u64) -> Option<(u8, u16, u16)> {
-    (report >> 40 & 1 != 0).then_some(((report >> 32) as u8, (report >> 16) as u16, report as u16))
+/// The vector, CS, IP and FLAGS image of a [`report_interrupt20`] value;
+/// `None` for an interrupt not taken.
+pub(crate) fn reported_interrupt20(report: u64) -> Option<(u8, u16, u16, u16)> {
+    (report >> 40 & 1 != 0).then_some((
+        (report >> 32) as u8,
+        (report >> 16) as u16,
+        report as u16,
+        (report >> 48) as u16,
+    ))
 }

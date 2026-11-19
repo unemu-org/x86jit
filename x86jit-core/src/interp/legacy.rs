@@ -1689,6 +1689,9 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
 ) -> Result<(), Exit> {
+    if task_switch.record_regs {
+        task_switch.capture_regs(cpu, context.generation);
+    }
     if context.regime == legacy::MachineRegime::Protected {
         return deliver_protected(cpu, mem, context, event, task_switch);
     }

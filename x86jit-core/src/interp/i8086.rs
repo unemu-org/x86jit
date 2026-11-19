@@ -677,8 +677,9 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
             }
             if unsigned {
                 let cs = cpu.cs;
-                interrupt::<ROUTED, ORDER>(cpu, mem, 5, *saved_ip, *flags_set, *word_bus)?;
-                temps[*taken as usize] = crate::legacy::report_interrupt20(5, cs, *saved_ip);
+                let flags =
+                    interrupt::<ROUTED, ORDER>(cpu, mem, 5, *saved_ip, *flags_set, *word_bus)?;
+                temps[*taken as usize] = crate::legacy::report_interrupt20(5, cs, *saved_ip, flags);
             } else {
                 cpu.rip = u64::from(*saved_ip);
             }
@@ -703,8 +704,10 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
                 return Err(nec_refusal(cpu, ip, U::NecEmulationSingleStep));
             }
             let cs = cpu.cs;
-            interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
-            temps[*taken as usize] = crate::legacy::report_interrupt20(*vector, cs, *saved_ip);
+            let flags =
+                interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
+            temps[*taken as usize] =
+                crate::legacy::report_interrupt20(*vector, cs, *saved_ip, flags);
             cpu.legacy.reserved =
                 (cpu.legacy.reserved | NEC_EMULATION | NEC_MD_WRITE) & !NEC_STANDBY;
             Ok(Nec::ModeChange)
@@ -1003,8 +1006,9 @@ pub(super) fn software_interrupt<const ROUTED: bool, const ORDER: u8>(
     temps[*taken as usize] = 0;
     if !overflow_only || cpu.flags.of {
         let cs = cpu.cs;
-        interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
-        temps[*taken as usize] = crate::legacy::report_interrupt20(*vector, cs, *saved_ip);
+        let flags =
+            interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
+        temps[*taken as usize] = crate::legacy::report_interrupt20(*vector, cs, *saved_ip, flags);
     } else {
         cpu.rip = u64::from(*saved_ip);
     }
@@ -1016,7 +1020,8 @@ pub(super) fn software_interrupt<const ROUTED: bool, const ORDER: u8>(
 // even, NEC UM §4 p. 4-3) and an even-addressed frame are word transfers on a
 // device. The frame is stored from SP-6 upward (IP, CS, FLAGS): a known
 // divergence from the processor's FLAGS, CS, IP push order (UM §2.6 p. 2-26;
-// UM p. A-28), visible to a device stack (spec.md §5.2, xj-50w.25).
+// UM p. A-28), visible to a device stack (spec.md §5.2, xj-50w.25). Returns
+// the FLAGS image the frame holds, for the delivery log.
 #[inline(never)]
 pub(crate) fn interrupt<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
@@ -1025,7 +1030,7 @@ pub(crate) fn interrupt<const ROUTED: bool, const ORDER: u8>(
     saved_ip: u16,
     flags_set: u16,
     word_bus: bool,
-) -> Result<(), Exit> {
+) -> Result<u16, Exit> {
     let addr = (u64::from(vector) * 4) | bus(word_bus);
     let ip = read::<ROUTED, ORDER>(cpu, mem, addr, 2)?;
     let cs = read::<ROUTED, ORDER>(cpu, mem, addr + 2, 2)?;
@@ -1038,7 +1043,7 @@ pub(crate) fn interrupt<const ROUTED: bool, const ORDER: u8>(
     cpu.rflags_system &= !0x100;
     cpu.cs = cs as u16;
     cpu.rip = ip;
-    Ok(())
+    Ok(flags as u16)
 }
 
 #[inline(never)]

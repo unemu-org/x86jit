@@ -194,7 +194,8 @@ pub use codemap::{
     GuestTrapSite, SharedAddressSpaceChild, SharedChildRetirement, SharedChildTableFull,
 };
 pub use delivery_log::{
-    DeliveryBatch, DeliveryCounts, DeliveryKind, DeliveryLog, DeliveryLogError, DeliveryRecord,
+    DeliveryBatch, DeliveryCounts, DeliveryKind, DeliveryLog, DeliveryLogError, DeliveryLogOptions,
+    DeliveryRecord, DeliveryRegs,
 };
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{

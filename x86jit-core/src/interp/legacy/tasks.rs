@@ -24,8 +24,30 @@ pub(crate) struct SwitchState {
     /// rides here, beside the walk, so that the per-instruction `Outcome`
     /// keeps its size.
     pub software_interrupt: super::SoftwareInterrupt,
+    /// Set while the delivery log records registers
+    /// (`DeliveryLogOptions::registers`); kept across [`Self::reset`].
+    pub record_regs: bool,
+    /// The registers when the last delivery began, copied only while
+    /// `record_regs` is set and read by the delivery log once that delivery
+    /// has entered its handler (spec.md §17.10, Delivery log). A task switch
+    /// resumed after a bus handoff keeps the copy its delivery began with;
+    /// `None` when no copy was taken, as for a delivery that began before
+    /// the option was enabled.
+    pub regs: Option<crate::DeliveryRegs>,
 }
 impl SwitchState {
+    /// Copy the registers a delivery begins with (spec.md §17.10, Delivery
+    /// log). Out of line: a delivery with the option off pays one test.
+    #[cold]
+    #[inline(never)]
+    pub fn capture_regs(&mut self, cpu: &CpuState, generation: CpuGeneration) {
+        // SDM Vol 2B §4.3 PUSHF/PUSHFD/PUSHFQ, Operation: the image PUSHFD
+        // stores has RF and VM clear.
+        let flags = crate::legacy::flags_image(cpu, generation) & !0x3_0000;
+        self.regs = Some(crate::delivery_log::regs_at(
+            cpu, generation, flags, cpu.gpr[4],
+        ));
+    }
     pub fn context(&self) -> Option<MachineContext> {
         self.pending.as_ref().map(|p| p.context)
     }
@@ -65,7 +87,10 @@ impl SwitchState {
         self.pending.as_ref().map(|p| p.single_step)
     }
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            record_regs: self.record_regs,
+            ..Self::default()
+        };
     }
 }
 
