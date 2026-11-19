@@ -185,7 +185,7 @@ smc/threads/mt/tso; jit/superblock/cache).
 
 ## 4. First task: R1 acceptance test
 
-`x86jit-tests/tests/smc.rs` (JIT): `stale_link_slot_cleared_on_invalidation` —
+`x86jit-tests/tests/threads/smc.rs` (JIT): `stale_link_slot_cleared_on_invalidation` —
 1. `MAIN`: block ending in direct `jmp TARGET`; `TARGET`: `mov eax, 1; hlt`. Run
    from `MAIN` → chains (slot filled via `RET_LINK`), `rax == 1`.
 2. Embedder rewrites `TARGET` via `vm.write_bytes` to `mov eax, 42; hlt`.

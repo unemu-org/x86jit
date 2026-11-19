@@ -18,7 +18,7 @@ records conflicting statements and the choices made for the historical models.
 
 ## Scope, implementation, authority, witness
 
-Test names below are in `x86jit-tests/tests/legacy_task_switch.rs` unless another
+Test names below are in `x86jit-tests/tests/legacy/legacy_task_switch.rs` unless another
 module is named. The format matrix is I286/16-bit TSS, I386/16-bit TSS, and
 I386/32-bit TSS. An interpreter-only backend fixture panics if compilation occurs.
 
@@ -253,7 +253,7 @@ refusal remains unchanged.
 
 ```sh
 cargo test --offline -p x86jit-core --lib -- --test-threads=1
-cargo test --offline -p x86jit-tests --test legacy_task_switch -- --test-threads=1
+cargo test --offline -p x86jit-tests --test legacy legacy_task_switch:: -- --test-threads=1
 # Repeat the second command with each regression binary listed above.
 cargo clippy --offline --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check

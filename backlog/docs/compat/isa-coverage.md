@@ -29,7 +29,7 @@ created_date: '2026-07-06 11:25'
 
 ## 32-bit compat mode (Compat32)
 
-Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Pushad`/`Into`/`Daa`/…) and the 16-bit operand-size forms (`Call_rm16`/`Retnw`/`Pushaw`/…). `CpuMode::Real16` exists and is interpreter-only; this generated map does not yet include a 16-bit real-mode table. Real16 validation uses the [SingleStepTests 80286 corpus](../../../x86jit-tests/tests/ss286.rs) and [targeted Unicorn comparisons](../../../x86jit-tests/tests/cf16.rs).
+Probed at bitness 32: also covers the legacy-only forms long mode dropped (`Pushad`/`Into`/`Daa`/…) and the 16-bit operand-size forms (`Call_rm16`/`Retnw`/`Pushaw`/…). `CpuMode::Real16` exists and is interpreter-only; this generated map does not yet include a 16-bit real-mode table. Real16 validation uses the [SingleStepTests 80286 corpus](../../../x86jit-tests/tests/differential/ss286.rs) and [targeted Unicorn comparisons](../../../x86jit-tests/tests/differential/cf16.rs).
 
 | generation | lifted | reg_only | missing | % of encodable | unencodable |
 |---|---:|---:|---:|---:|---:|

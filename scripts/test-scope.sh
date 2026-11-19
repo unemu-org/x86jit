@@ -81,7 +81,7 @@ legacy_paths=(
     'x86jit-core/src/vm/i8086.rs' 'x86jit-core/src/vm/i8086/*'
     'x86jit-core/src/model.rs' 'x86jit-core/src/model/*'
     'x86jit-core/src/ir/verify/legacy_probes.rs'
-    'x86jit-tests/tests/legacy_*'
+    'x86jit-tests/tests/legacy/*' 'x86jit-tests/tests/legacy_*'
     'x86jit-tests/tests/support/model_api.rs'
     'x86jit-tests/tests/support/descriptor_fixture.rs'
     'x86jit-tests/tests/support/port_block.rs'
@@ -90,14 +90,18 @@ legacy_paths=(
 # Markdown and text in these directories can be compiled or compared as fixtures.
 code_dirs=(x86jit-* scripts vendor .github .cargo .config)
 
-# Legacy-only test set: every test binary that selects Real16 or a CPU model,
+# Legacy-only test set: every test that selects Real16 or a CPU model,
 # directly, through a tests/support file, or through an x86jit-tests helper
 # module that does so (compat, ss286). The set also keeps the shared checks
 # boundary, environment_boundary, run_steps, irq_shadow, retired_count, smc,
 # cross_region_* and application_codegen, which checks Long64 code generation.
-# Binaries with these prefixes are found by file name.
+# A name is a test binary (x86jit-*/tests/<name>.rs or <name>/main.rs) or a
+# module of a grouped binary (x86jit-*/tests/<group>/<name>.rs, one module per
+# former binary); `legacy` is the binary of every legacy_* witness. Names with
+# these prefixes are found by file name.
 legacy_test_prefixes=(legacy_ real16_ cross_region_)
 legacy_tests=(
+    legacy
     application_codegen boundary cf16 compat coverage_ratchet cpuid
     environment_boundary evex_modifiers exit_request exit_request_signal fault_metadata
     fences flags_at_exit gathers
@@ -181,19 +185,68 @@ plan_docs() {
     fi
 }
 
-plan_legacy() {
-    local name prefix file tests=() test_args=''
-    tests=("${legacy_tests[@]}")
-    for prefix in "${legacy_test_prefixes[@]}"; do
-        for file in x86jit-*/tests/"$prefix"*.rs; do
+# Prints the selection unit of a test name: `<binary>` for a whole test binary,
+# `<group>/<name>` for a module of a grouped binary. A name that matches neither
+# is printed as a binary, so cargo reports the missing target.
+legacy_units() {
+    local name file group found
+    for name in "$@"; do
+        found=no
+        for file in x86jit-*/tests/"$name".rs x86jit-*/tests/"$name"/main.rs; do
             [[ -f "$file" ]] || continue
-            name=${file##*/}
-            tests+=("${name%.rs}")
+            echo "$name"
+            found=yes
+            break
         done
+        [[ "$found" == no ]] || continue
+        for file in x86jit-*/tests/*/"$name".rs; do
+            [[ -f "$file" && -f "${file%/*}/main.rs" ]] || continue
+            group=${file%/*}
+            echo "${group##*/}/$name"
+            found=yes
+        done
+        [[ "$found" == yes ]] || echo "$name"
+    done
+}
+
+plan_legacy() {
+    local name prefix file unit binary names=() units=() whole=' ' filter='' test_args=''
+    local group='' modules=''
+    names=("${legacy_tests[@]}")
+    for prefix in "${legacy_test_prefixes[@]}"; do
+        for file in x86jit-*/tests/"$prefix"*.rs x86jit-*/tests/*/"$prefix"*.rs; do
+            [[ -f "$file" ]] || continue
+            case "$file" in
+                x86jit-*/tests/*/*) [[ -f "${file%/*}/main.rs" ]] || continue ;;
+            esac
+            name=${file##*/}
+            names+=("${name%.rs}")
+        done
+    done
+    while IFS= read -r unit; do
+        units+=("$unit")
+    done < <(legacy_units "${names[@]}" | LC_ALL=C sort -u)
+    # A whole binary is one term; the modules of a grouped binary share one.
+    for unit in "${units[@]}"; do
+        [[ "$unit" == */* ]] || whole+="$unit "
+    done
+    for unit in "${units[@]}" '/'; do
+        binary=${unit%%/*}
+        if [[ -n "$group" && "$binary" != "$group" ]]; then
+            filter+=" | (binary(=$group) & test(/^(${modules#|})::/))"
+            group='' modules=''
+        fi
+        [[ "$unit" != / ]] || break
+        if [[ "$unit" != */* ]]; then
+            filter+=" | binary(=$unit)"
+        elif [[ "$whole" != *" $binary "* ]]; then
+            group=$binary
+            modules+="|${unit#*/}"
+        fi
     done
     while IFS= read -r name; do
         test_args+=" --test $name"
-    done < <(printf '%s\n' "${tests[@]}" | LC_ALL=C sort -u)
+    done < <(printf '%s\n' "${units[@]%%/*}" | LC_ALL=C sort -u)
     commands+=(
         'bash scripts/ci-gate.sh fmt'
         'bash scripts/ci-gate.sh guard'
@@ -202,7 +255,7 @@ plan_legacy() {
     )
     add_corpus_fetch
     commands+=(
-        "SS286_REQUIRED=1 $shell_prefix cargo nextest run --profile fast --locked --workspace --features x86jit-tests/unicorn --no-fail-fast$test_args"
+        "SS286_REQUIRED=1 $shell_prefix cargo nextest run --profile fast --locked --workspace --features x86jit-tests/unicorn --no-fail-fast$test_args -E '${filter# | }'"
         "$shell_prefix cargo nextest run --profile fast --locked -p x86jit-core -p x86jit-tests --features x86jit-tests/unicorn --no-fail-fast --lib"
         'bash scripts/ci-gate.sh cross aarch64-unknown-linux-gnu'
         'bash scripts/ci-gate.sh cross x86_64-unknown-linux-gnu'

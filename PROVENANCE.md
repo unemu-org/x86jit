@@ -64,7 +64,7 @@ The same shape appears wherever a value comes from a document rather than from r
 all four — a mis-decoded field cannot pass it.
 
 A citation can also settle **how much to guarantee**, not just what a value is.
-`x86jit-tests/tests/cross_modifying.rs` runs the two-processor protocol from
+`x86jit-tests/tests/threads/cross_modifying.rs` runs the two-processor protocol from
 **SDM Vol 3A §11.1.3** ("Handling Self- and Cross-Modifying Code") — modifier stores the
 code then raises a flag, executor polls, executes a serializing instruction, then runs it
 — because that is the case the architecture actually defines. The same section calls the
@@ -192,7 +192,7 @@ implementation. Where another project is named in a comment it is in one of two 
 levels and FEX's RCpc use as precedent), or *this oracle is wrong here*.
 
 `x86jit-core`'s dependency set is exactly `{iced-x86}` — the x86 decoder, the one thing a
-recompiler legitimately needs — and `x86jit-tests/tests/boundary.rs` fails the build if
+recompiler legitimately needs — and `x86jit-tests/tests/codegen/boundary.rs` fails the build if
 that ever changes. That tripwire is why extracting the Linux userland into `unemulinux`
 was a move rather than an untangling.
 
@@ -258,7 +258,7 @@ are therefore GPL-3.0 combined works.
 
 ### Contract vectors from the sibling 8080-family project
 
-`x86jit-tests/tests/legacy_nec_v20.rs` embeds, byte for byte, the V20 mode-switch
+`x86jit-tests/tests/legacy/legacy_nec_v20.rs` embeds, byte for byte, the V20 mode-switch
 contract vectors (format `x80-v20-contract-2`) of `x80`, the sibling 8080-family
 project:
 

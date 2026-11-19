@@ -12,7 +12,7 @@
 //! a Linux userland, so it lives with that userland in `unemulinux`, along with the
 //! `Guest` builder and the fetched fixtures it needs.
 //!
-//! **One exception, and it is deliberate.** `tests/mt.rs` loads a static-musl pthreads
+//! **One exception, and it is deliberate.** `tests/threads/mt.rs` loads a static-musl pthreads
 //! binary and services its handful of syscalls (`write`, `futex`, `clone`, `mmap`,
 //! `arch_prctl`, exit) *inline* in the test. It is not an embedder: there is no shim
 //! crate, no process model, no filesystem — just enough to let four guest threads reach

@@ -129,14 +129,20 @@ class SlowList(unittest.TestCase):
                     self.assertTrue(any(entry.applies_to(lane) for lane in lanes))
 
     def test_listed_test_files_exist(self):
-        # Integration-test binaries are files; a renamed file shows up here
-        # before a CI run reports the entries as gone.
+        # An integration-test binary is a file or a directory with main.rs, whose
+        # modules are files beside it; a renamed file shows up here before a CI
+        # run reports the entries as gone.
         for entry in tiers.read_list():
             crate, _, binary = entry.binary.partition("::")
             self.assertTrue((ROOT / crate).is_dir(), entry.binary)
             if binary and not binary.startswith("bin/"):
-                with self.subTest(binary=entry.binary):
-                    self.assertTrue((ROOT / crate / "tests" / f"{binary}.rs").is_file())
+                tests = ROOT / crate / "tests"
+                with self.subTest(binary=entry.binary, test=entry.test):
+                    if (tests / binary / "main.rs").is_file():
+                        module = entry.test.split("::", 1)[0]
+                        self.assertTrue((tests / binary / f"{module}.rs").is_file())
+                    else:
+                        self.assertTrue((tests / f"{binary}.rs").is_file())
 
     def test_malformed_and_duplicate_entries_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

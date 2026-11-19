@@ -35,7 +35,7 @@ x86jit/
 
 The syscall shim, the process model and the OCI/ELF runner are **not** here — they live in
 `unemulinux`, which embeds this library. `x86jit-core`'s
-dependency set is exactly `{iced-x86}`, and `x86jit-tests/tests/boundary.rs` fails the build if
+dependency set is exactly `{iced-x86}`, and `x86jit-tests/tests/codegen/boundary.rs` fails the build if
 that changes.
 
 `x86jit-core` module map (`x86jit-core/src/`):

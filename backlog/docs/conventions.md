@@ -95,7 +95,7 @@ Where this actually bites:
 down.** `jit_eq_interp` compares two tiers that share the IR — and, for the wide
 handlers, shared the bug. It also compares state after a *completed* run, so a trapped
 instruction's partial state is precisely what it never looks at. These properties need
-tests that assert against the architecture directly; `x86jit-tests/tests/fault_atomicity.rs`
+tests that assert against the architecture directly; `x86jit-tests/tests/memory/fault_atomicity.rs`
 is where they live.
 
 ## Phase / milestone discipline

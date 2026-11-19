@@ -61,7 +61,7 @@ separate repository that is to be published.
   embedder can map RAM, ROM and empty-bus windows as separate regions. Locked operands and
   spans with a gap or a trap region still exit.
 - **Guest-agnostic core.** `x86jit-core` depends on `iced-x86` and nothing else;
-  [`boundary.rs`](x86jit-tests/tests/boundary.rs) fails the build if that changes.
+  [`boundary.rs`](x86jit-tests/tests/codegen/boundary.rs) fails the build if that changes.
 
 ## Workspace
 

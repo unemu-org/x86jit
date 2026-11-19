@@ -243,11 +243,11 @@ as ordinary defects rather than listed here.
 - **What ships:** `CpuMode::Long64`, `CpuMode::Compat32` (32-bit
   protected/compatibility mode with flat segments), and `CpuMode::Real16` (16-bit
   real mode). Real16 is **interpreter-only**; an embedder uses it. Real mode itself is not deferred.
-- **Validation:** the [SingleStepTests 80286 harness](../../x86jit-tests/tests/ss286.rs)
+- **Validation:** the [SingleStepTests 80286 harness](../../x86jit-tests/tests/differential/ss286.rs)
   executes the hardware-captured corpus on the Real16 interpreter and compares
   final CPU/memory state and in-guest exception delivery. It reports unsupported
   opcodes and divergences rather than enforcing full conformance. Targeted
-  [Unicorn comparisons](../../x86jit-tests/tests/cf16.rs) also exercise real-mode
+  [Unicorn comparisons](../../x86jit-tests/tests/differential/cf16.rs) also exercise real-mode
   addressing and control flow.
 - **Still deferred:** a Real16 JIT tier; remaining 286 fidelity items exposed by
   corpus failures, traps, and unsupported opcodes; and full protected-mode

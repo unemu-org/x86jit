@@ -5,7 +5,7 @@ licence notice is [below](#licence-notice-musl-libc-in-pthreadself):
 
 | File | What | Used by |
 |---|---|---|
-| `pthreads.elf` | A static-musl C program: four pthreads each incrementing a shared counter under a mutex 100 000 times, so the result is deterministically `400000` — but only if guest threads, cross-thread atomics, and the futex-backed mutex and join all work. Statically linked, not stripped. | `tests/mt.rs` (`pthreads_counter_{interp,jit,jit_background}`) |
+| `pthreads.elf` | A static-musl C program: four pthreads each incrementing a shared counter under a mutex 100 000 times, so the result is deterministically `400000` — but only if guest threads, cross-thread atomics, and the futex-backed mutex and join all work. Statically linked, not stripped. | `tests/threads/mt.rs` (`pthreads_counter_{interp,jit,jit_background}`) |
 
 `mt.rs` services this program's syscalls inline rather than through a shim, which is why
 the test belongs in this repository at all: it exercises the M7 threading stack — `clone`
