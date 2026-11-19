@@ -332,7 +332,9 @@ pub enum Exit {
         dir: PortDir,
         value: u64,
     },
-    /// `budget` blocks executed — cooperative yield.
+    /// `budget` blocks executed — cooperative yield. A Machine run also
+    /// yields with it, budget unspent, after a bounded series of deliveries
+    /// that retire nothing ([`crate::Vcpu::run_steps`]).
     BudgetExhausted,
     /// A host thread requested a yield at a checked boundary. Guest state is
     /// resumable; REP may have completed only some iterations.

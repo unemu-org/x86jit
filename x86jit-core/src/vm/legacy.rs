@@ -197,6 +197,19 @@ fn double_fault(generation: CpuGeneration, first: EventSource, second: EventSour
         || (first == 14 && (contributory(second) || second == 14))
 }
 
+/// Completed event deliveries in a row with no instruction retired between
+/// them, at which the run returns `Exit::BudgetExhausted`. Delivery costs no
+/// unit (`Vcpu::run_steps`), so a handler whose first instruction faults
+/// enters delivery again with nothing retired. It does so until the frames
+/// exhaust the stack: an 8086-family stack wraps within its segment and never
+/// does (8086 Family UM §2.3 p. 2-12), and a 32-bit stack takes up to
+/// 2^32 / 12 frames. The return is at a boundary and resumable; the next run
+/// counts afresh. The value is an engine choice (ASSUMED): one boundary takes
+/// at most an owned continuation, an NMI, an IRQ and the single-step trap
+/// after a unit (spec.md §17.10), so a guest that retires instructions never
+/// reaches it. Only the delivery path reads or writes the count.
+const DELIVERY_STALL_LIMIT: u32 = 1024;
+
 #[derive(Clone, Copy, Default)]
 struct MachineBoundary {
     task_pending: bool,
@@ -431,6 +444,10 @@ pub(super) struct Execution {
     direct_proofs: DirectProofs,
     smc_pages: Vec<u64>,
     last_direct_fetch: Option<u64>,
+    // `Vcpu::delivery_stalled`: the retired count at the last completed
+    // delivery, and the deliveries completed since it last moved.
+    stall_retired: u64,
+    stall_count: u32,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -464,6 +481,8 @@ impl Execution {
             direct_proofs: DirectProofs::default(),
             smc_pages: Vec::new(),
             last_direct_fetch: None,
+            stall_retired: 0,
+            stall_count: 0,
         }
     }
     pub(super) fn reset_execution_state(&mut self) {
@@ -480,6 +499,7 @@ impl Execution {
         self.direct_proofs.clear();
         self.smc_pages.clear();
         self.last_direct_fetch = None;
+        self.stall_count = 0;
     }
     #[inline]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
@@ -1851,6 +1871,26 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Record a delivery that completed and that the dispatch loop continues
+    /// from. True at the `DELIVERY_STALL_LIMIT`th one with no instruction
+    /// retired since the first; the count then starts again.
+    #[cold]
+    #[inline(never)]
+    fn delivery_stalled(&mut self) -> bool {
+        let retired = self.retired;
+        let execution = self.legacy_execution.as_mut().unwrap();
+        if execution.stall_count == 0 || execution.stall_retired != retired {
+            execution.stall_retired = retired;
+            execution.stall_count = 0;
+        }
+        execution.stall_count += 1;
+        if execution.stall_count < DELIVERY_STALL_LIMIT {
+            return false;
+        }
+        execution.stall_count = 0;
+        true
+    }
+
     fn consume_legacy_irq(&mut self, event: &mut PendingEvent) {
         if !event.irq_consumed {
             if let EventSource::Irq(vector) = event.source {
@@ -2219,6 +2259,12 @@ impl Vcpu {
                                 }
                             };
                             direct_bus = raw_direct(&self.cpu);
+                            if self.delivery_stalled() {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(Exit::BudgetExhausted),
+                                });
+                            }
                             continue;
                         }
                         External::Stop(exit) => {
@@ -2289,6 +2335,12 @@ impl Vcpu {
                             }
                         };
                         direct_bus = raw_direct(&self.cpu);
+                        if self.delivery_stalled() {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(Exit::BudgetExhausted),
+                            });
+                        }
                         continue;
                     }
                     if options.stop_when_irq_ready
@@ -2407,6 +2459,12 @@ impl Vcpu {
                                     }
                                 };
                                 direct_bus = raw_direct(&self.cpu);
+                                if self.delivery_stalled() {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                                    });
+                                }
                                 continue;
                             }
                             Err(exit) => {
@@ -2715,6 +2773,12 @@ impl Vcpu {
                                         }
                                     };
                                     direct_bus = raw_direct(&self.cpu);
+                                    if self.delivery_stalled() {
+                                        return DispatchResult::Stepped(StepRun {
+                                            steps,
+                                            stop: StepStop::Exit(Exit::BudgetExhausted),
+                                        });
+                                    }
                                     continue;
                                 }
                                 Err(exit) => {

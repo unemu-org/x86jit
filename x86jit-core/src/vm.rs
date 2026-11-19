@@ -2847,8 +2847,13 @@ impl Vcpu {
     /// its already-permitted partial effects remain. The next unit never begins.
     /// `steps = delta(retired_instructions) + completed_rep_iterations
     /// - completed_nonempty_rep_instructions`, local to this call.
-    /// Repeated zero-retirement fault delivery is not wall-clock bounded; a host
-    /// exit request remains the escape. As with `run`, this vCPU must belong to `vm`.
+    /// A Machine run, here and in `run`, bounds delivery that retires nothing:
+    /// after 1024 consecutive completed deliveries with no instruction retired
+    /// between them, counted across runs, as when a handler's first
+    /// instruction faults again, it returns [`Exit::BudgetExhausted`] at that
+    /// boundary, resumable, with `steps` below the budget. The next run counts
+    /// afresh. A host exit request remains the earlier escape.
+    /// As with `run`, this vCPU must belong to `vm`.
     pub fn run_steps(
         &mut self,
         vm: &Vm,
