@@ -1702,6 +1702,7 @@ impl Vm {
             code_space_reported: false,
             ss_shadow: 0,
             nmi_state: 0,
+            delivery_log: None,
         }
     }
 }
@@ -2014,6 +2015,11 @@ pub struct Vcpu {
     /// I80286 [`legacy::NMI_REMEMBERED`], one edge raised meanwhile. Private,
     /// outside `CpuState` and the retained-context stamp.
     nmi_state: u8,
+    /// The opt-in record of in-guest deliveries (spec.md §17.10, Delivery log):
+    /// `None` unless [`Vcpu::enable_delivery_log`] started it. Host-side
+    /// diagnostics, outside `CpuState` and `jit_abi`; written only by the cold
+    /// recording calls at the Machine delivery sites.
+    delivery_log: Option<Box<crate::DeliveryLog>>,
 }
 
 const APPLICATION_DISPATCH: u8 = 0;
@@ -2395,6 +2401,61 @@ impl Vcpu {
     /// Long64/Compat32 blocks do not tick it (see the field docs). Monotone, never reset.
     pub fn retired_instructions(&self) -> u64 {
         self.retired
+    }
+
+    /// Start recording the exceptions and interrupts this
+    /// [`ExecutionProfile::Machine`] vCPU delivers in the guest, in a ring that
+    /// keeps the last `capacity` records (1 to [`crate::DeliveryLog::MAX_CAPACITY`]),
+    /// read between runs through [`Self::delivery_log`] (spec.md §17.10,
+    /// Delivery log). The log is off by default, and while it is off nothing
+    /// in execution, retirement or generated code depends on it. A record is
+    /// written when a delivery enters its handler, so the same run gives the
+    /// same records. Enabling it again starts an empty ring. An Application
+    /// vCPU refuses with [`crate::DeliveryLogError::NotMachine`], an out-of-range
+    /// capacity with [`crate::DeliveryLogError::Capacity`], both with no change.
+    ///
+    /// ```
+    /// use x86jit_core::{CpuModel, DeliveryKind, Prot, RegionKind, StepOptions, Vm, VmConfig};
+    /// let mut vm = Vm::new(VmConfig::flat(0x10_0000));
+    /// vm.set_cpu_model(CpuModel::I8086);
+    /// vm.map(0, 0x10_0000, Prot::RWX, RegionKind::Ram).unwrap();
+    /// vm.write_bytes(0x21 * 4, &[0x00, 0x05, 0x00, 0x00]).unwrap(); // INT 21h -> 0000:0500
+    /// vm.write_bytes(0x500, &[0xf4]).unwrap(); // HLT
+    /// vm.write_bytes(0x1000, &[0xcd, 0x21]).unwrap(); // INT 21h at 0000:1000
+    /// let mut cpu = vm.new_vcpu();
+    /// cpu.cpu.rip = 0x1000;
+    /// cpu.cpu.gpr[4] = 0x8000;
+    /// cpu.enable_delivery_log(64).unwrap();
+    /// cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+    /// let batch = cpu.delivery_log_mut().unwrap().take();
+    /// assert_eq!(batch.dropped, 0);
+    /// let record = batch.records[0];
+    /// assert_eq!((record.vector, record.kind), (0x21, DeliveryKind::Software));
+    /// assert_eq!((record.saved_cs, record.saved_ip, record.saved_linear), (0, 0x1002, 0x1002));
+    /// assert_eq!(record.retired, 1);
+    /// ```
+    pub fn enable_delivery_log(&mut self, capacity: usize) -> Result<(), crate::DeliveryLogError> {
+        if self.profile != ExecutionProfile::Machine {
+            return Err(crate::DeliveryLogError::NotMachine);
+        }
+        self.delivery_log = Some(Box::new(crate::DeliveryLog::new(capacity)?));
+        Ok(())
+    }
+
+    /// Stop recording, and return the log with the records it still holds.
+    pub fn disable_delivery_log(&mut self) -> Option<crate::DeliveryLog> {
+        self.delivery_log.take().map(|log| *log)
+    }
+
+    /// The delivery log, while it is enabled (spec.md §17.10, Delivery log).
+    pub fn delivery_log(&self) -> Option<&crate::DeliveryLog> {
+        self.delivery_log.as_deref()
+    }
+
+    /// The delivery log, to [`crate::DeliveryLog::take`] or
+    /// [`crate::DeliveryLog::clear`] its records between runs.
+    pub fn delivery_log_mut(&mut self) -> Option<&mut crate::DeliveryLog> {
+        self.delivery_log.as_deref_mut()
     }
 
     // Fold alignment and page bits into the set index: short aligned thunks

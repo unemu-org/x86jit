@@ -20,6 +20,20 @@ pub(crate) struct Outcome {
     pub arm_ss: u8,
     pub suppress_debug: bool,
     preserve_rf: bool,
+    /// The software interrupt this instruction delivered, for the delivery
+    /// log (spec.md §17.10, Delivery log).
+    pub software_interrupt: Option<SoftwareInterrupt>,
+}
+
+/// A delivered software interrupt and the origin it saved (spec.md §17.10,
+/// Delivery log): the CS:IP its frame holds, the CS base and CPL before it.
+#[derive(Clone, Copy)]
+pub(crate) struct SoftwareInterrupt {
+    pub vector: u8,
+    pub cs: u16,
+    pub ip: u32,
+    pub cs_base: u32,
+    pub cpl: u8,
 }
 
 fn refusal(cpu: &CpuState, operation: crate::UnsupportedSystemOperation) -> Exit {
@@ -3545,6 +3559,13 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     overflow_only,
                 } => {
                     if !overflow_only || cpu.flags.of {
+                        let origin = SoftwareInterrupt {
+                            vector: *vector,
+                            cs: cpu.cs,
+                            ip: *saved_ip,
+                            cs_base: cpu.legacy.segments[SegmentId::Cs as usize].base,
+                            cpl: context.cpl,
+                        };
                         deliver(
                             cpu,
                             mem,
@@ -3574,6 +3595,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         // INT from RF clearing, as for JMP and CALL.
                         outcome.preserve_rf = task_switch.committed;
                         outcome.context_changed = true;
+                        outcome.software_interrupt = Some(origin);
                         return Ok(true);
                     }
                 }

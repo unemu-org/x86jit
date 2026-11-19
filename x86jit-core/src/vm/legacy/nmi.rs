@@ -348,6 +348,7 @@ impl Vcpu {
                 source: EventSource::Nmi { shutdown },
                 ip: self.cpu.rip as u32,
                 cs: self.cpu.cs,
+                origin: self.delivery_origin(),
             },
         ))
     }
@@ -408,6 +409,7 @@ impl Vcpu {
             source: EventSource::SingleStep,
             ip: self.cpu.rip as u32,
             cs: self.cpu.cs,
+            origin: self.delivery_origin(),
         };
         let context = self.legacy_context_for_run()?;
         self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)?;

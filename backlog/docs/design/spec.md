@@ -2929,3 +2929,78 @@ State storage and its ABI keep their existing names and layout.
 overridden with `Vm::set_exception_delivery`. `set_cpu_mode(Real16)` still
 selects the existing Application Real16 path at M1, with frozen IR snapshots.
 Long64/Compat32 lowering, cache keys and generated code are unchanged.
+
+#### Delivery log (xj-ir6.37)
+
+With `ExceptionDelivery::InGuest` the host never sees a delivery. The delivery
+log is an opt-in, per-vCPU ring of the last N exceptions and interrupts a
+Machine vCPU delivered in the guest, which the embedder reads between runs.
+`Vcpu::enable_delivery_log(capacity)` starts an empty ring of 1 to
+`DeliveryLog::MAX_CAPACITY` (65536) records; an Application vCPU refuses with
+`DeliveryLogError::NotMachine`, a capacity outside that range with
+`DeliveryLogError::Capacity`. `delivery_log()` and `delivery_log_mut()` give the
+`DeliveryLog`: `iter()` (oldest first), `len()`, `capacity()`, `dropped()` (records
+the full ring overwrote since the last `take` or `clear`), `total()` (every record
+since the log was enabled), `take()` (the records and the dropped count, both then
+reset) and `clear()`. `disable_delivery_log()` stops recording and returns the log.
+`reset_execution_state` keeps it, as it keeps the other diagnostic accounting.
+
+The log lives in the `Vcpu`, outside `CpuState`, `jit_abi` and the retained-context
+stamp: it is host-side diagnostics that guest execution never reads. It is off by
+default. While it is off, execution, retirement and generated code are unchanged:
+the Machine delivery sites test the option before one cold recording call, and the
+dispatcher's boundary derivation folds it into its existing cold-epilogue and
+service flags, so the walk of a unit is unchanged. Application profiles, the
+Real16 alias among them, have no log.
+
+A record is written when a delivery enters its handler, in delivery order, so the
+same run gives the same records. `DeliveryRecord` holds:
+
+- `vector`, the vector the delivery used;
+- `kind` (`DeliveryKind`): `Fault` for a processor exception of the fault or abort
+  class (SDM Vol 3A §7.5), #DF included, and the twenty-bit divide error, whose
+  saved IP is the one its model saves (`ModelQuirks::divide_saves_next_ip`);
+  `Trap` for the single-step trap; `Software` for INT n, INT 3, a taken INTO, INT1
+  on the 80386, BOUND's exception 5 (SDM Vol 3A §§7.3.3, 7.4.2; the engine raises
+  exception 5 only for BOUND), and on the NEC V20/V30 CHKIND's interrupt 5, BRKEM
+  and the 8080-mode CALLN; `Irq` for a vector queued with `inject_irq`; `Nmi`;
+- `saved_cs` and `saved_ip`, the return address the delivery saved: in its frame,
+  or in the outgoing TSS for a task gate; a twenty-bit IP is sixteen bits;
+- `saved_linear`, the CS base in effect before the delivery plus `saved_ip`, before
+  the A20 gate; on the twenty-bit models CS × 16 plus IP, wrapped to 20 bits
+  (8086 Family UM §2.8 p. 2-68). The instruction bytes are the embedder's to read
+  from its RAM;
+- `error_code`, the code the delivery pushed: protected-mode exceptions that have
+  one, through a gate or a task gate; `None` for every real-address and twenty-bit
+  delivery, which push none (SDM Vol 3B §23.1.4);
+- `cpl_before` and `cpl_after`: 3 and 0 for an inward delivery from ring 3; 0
+  outside protected mode;
+- `retired`, `Vcpu::retired_instructions` when the handler was entered. A software
+  interrupt retires by delivering, so its own instruction is counted; a faulting
+  instruction is not.
+
+A fault during delivery. An attempt whose delivery raises an exception is not
+recorded. The exception it raised is delivered next, serially or as #DF with
+error code 0 (I286 PRM §9.6.2 p. 9-10; 386 PRM Tables 9-3/9-4 p. 9-13), or in the
+new task after a committed task switch, and that delivery is recorded when it
+enters its handler, with its own vector and error code and the return address its
+frame holds: the interrupted instruction, the INT instruction for a software
+interrupt whose delivery faulted, or the new task's CS:IP. A #DF whose delivery
+faults enters shutdown: the log ends before it, the run returns `Exit::Shutdown`,
+and an NMI that ends shutdown is recorded like any NMI. A delivery handed off to
+the embedder (a device IDT entry or stack) is recorded once, when it completes; one
+released because CS:IP moved, abandoned or refused is not recorded.
+
+Not recorded: an exception that `ExceptionDelivery::Outward` returns as an exit
+(IRQs, NMIs and software interrupts are still delivered and recorded), and a
+task-gate delivery whose incoming task has the T bit set, which the engine refuses
+with `LegacyTaskDebugTrap` after the switch.
+
+Where each delivery is recorded. Exceptions, IRQs, NMIs and the step trap are
+delivered by the dispatcher's event path, which records them after the delivery
+call returns. An 80286/80386 software interrupt executes inside its instruction,
+whose outcome carries the vector, the saved CS:IP and the CS base and CPL it read
+before delivering; the unit's cold epilogue records it. A twenty-bit unit is one
+instruction: the dispatcher notes CS and SP before the walk, and the unit's cold
+epilogue records the interrupt of an INT, INTO, CHKIND or BRKEM whose frame moved
+SP. CALLN is recorded by the 8080-mode boundary that decodes it.
