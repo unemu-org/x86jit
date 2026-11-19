@@ -285,6 +285,13 @@ A campaign with cached bases takes two candidate builds and a few minutes of mea
 timings are in `performance.md` § "Short campaign protocol".
 
 
+
+### Build profiles for tests
+
+Tests build in the dev profile. The workspace is at `opt-level 0`, and the run-time dependencies
+(the decoder, Cranelift and the JIT module, and the test-data readers) are at `opt-level 3`, as
+listed in the root Cargo.toml. Debug assertions and overflow checks stay on. An edit to a
+workspace crate rebuilds no dependency.
 ### Test layout
 
 x86jit-tests builds a few test binaries instead of one per file:

@@ -55,6 +55,48 @@ x86jit-cranelift = { path = "x86jit-cranelift", version = "0.3.0" }
 x86jit-elf = { path = "x86jit-elf", version = "0.3.0" }
 x86jit-tests = { path = "x86jit-tests", version = "0.3.0" }
 
+# Tests run on the dev profile, the workspace at `opt-level 0`. The dependencies that
+# do work at run time are optimized: the decoder, Cranelift and the JIT module, their
+# containers, and the RON, JSON and gzip readers of the test data. An unoptimized
+# Cranelift made the JIT-bound tests wait for their own compiler. The list is explicit:
+# `package."*"` would also optimize the proc-macro and build-script crates, which cost
+# build time and do nothing at run time. A crate missing from the list only runs
+# slower. Debug assertions and overflow checks stay on, and an edit to a workspace
+# crate rebuilds no dependency.
+[profile.dev.package]
+# The decoder.
+iced-x86 = { opt-level = 3 }
+# Cranelift, the vendored JIT module and their containers.
+cranelift-assembler-x64 = { opt-level = 3 }
+cranelift-bforest = { opt-level = 3 }
+cranelift-bitset = { opt-level = 3 }
+cranelift-codegen = { opt-level = 3 }
+cranelift-codegen-shared = { opt-level = 3 }
+cranelift-control = { opt-level = 3 }
+cranelift-entity = { opt-level = 3 }
+cranelift-frontend = { opt-level = 3 }
+cranelift-module = { opt-level = 3 }
+cranelift-native = { opt-level = 3 }
+x86jit-cranelift-jit = { opt-level = 3 }
+regalloc2 = { opt-level = 3 }
+gimli = { opt-level = 3 }
+hashbrown = { opt-level = 3 }
+smallvec = { opt-level = 3 }
+rustc-hash = { opt-level = 3 }
+bumpalo = { opt-level = 3 }
+target-lexicon = { opt-level = 3 }
+memchr = { opt-level = 3 }
+# The readers of the test data: RON vectors, JSON records, the gzipped corpus.
+serde = { opt-level = 3 }
+serde_core = { opt-level = 3 }
+serde_json = { opt-level = 3 }
+ron = { opt-level = 3 }
+flate2 = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+adler2 = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }
+
 # The measurement profile of `scripts/perf-campaign.sh` (decision-23 performance
 # requirement). It is release with one codegen unit for the core and the bench, so
 # that a change in one function does not move unrelated code between codegen
