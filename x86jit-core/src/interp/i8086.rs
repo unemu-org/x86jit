@@ -649,7 +649,7 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
     op: &L,
     cpu: &mut CpuState,
     mem: &Memory,
-    temps: &[u64],
+    temps: &mut [u64],
     ip: u64,
 ) -> Result<Nec, Exit> {
     use crate::legacy::{NEC_EMULATION, NEC_MD_WRITE, NEC_STANDBY};
@@ -663,7 +663,10 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
             saved_ip,
             flags_set,
             word_bus,
+            taken,
         } => {
+            // The delivery log's report (`crate::legacy::report_interrupt20`).
+            temps[*taken as usize] = 0;
             let index = temps[*index as usize] as u16;
             let lower = temps[*lower as usize] as u16;
             let upper = temps[*upper as usize] as u16;
@@ -673,7 +676,9 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
                 return Err(nec_refusal(cpu, ip, U::NecIndexComparison));
             }
             if unsigned {
+                let cs = cpu.cs;
                 interrupt::<ROUTED, ORDER>(cpu, mem, 5, *saved_ip, *flags_set, *word_bus)?;
+                temps[*taken as usize] = crate::legacy::report_interrupt20(5, cs, *saved_ip);
             } else {
                 cpu.rip = u64::from(*saved_ip);
             }
@@ -688,14 +693,18 @@ pub(super) fn nec<const ROUTED: bool, const ORDER: u8>(
             saved_ip,
             flags_set,
             word_bus,
+            taken,
         } => {
+            temps[*taken as usize] = 0;
             if latch {
                 return Err(nec_refusal(cpu, ip, U::NecNestedEmulation));
             }
             if cpu.rflags_system & 0x100 != 0 {
                 return Err(nec_refusal(cpu, ip, U::NecEmulationSingleStep));
             }
+            let cs = cpu.cs;
             interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
+            temps[*taken as usize] = crate::legacy::report_interrupt20(*vector, cs, *saved_ip);
             cpu.legacy.reserved =
                 (cpu.legacy.reserved | NEC_EMULATION | NEC_MD_WRITE) & !NEC_STANDBY;
             Ok(Nec::ModeChange)
@@ -966,6 +975,40 @@ pub(crate) fn read_frame<const ROUTED: bool, const ORDER: u8>(
         *word = read::<ROUTED, ORDER>(cpu, mem, tag + 2 * i as u64, 2)? as u16;
     }
     Ok(words)
+}
+
+/// INT n, INT 3 and INTO on the twenty-bit models: INTO delivers only with OF
+/// set, and falls through otherwise. The op's `taken` temporary receives the
+/// delivery log's report (`crate::legacy::report_interrupt20`): 0, then the
+/// report once the frame is written. Out of line, so that the walk's arm is
+/// one call and its hot loop is unchanged.
+#[inline(never)]
+pub(super) fn software_interrupt<const ROUTED: bool, const ORDER: u8>(
+    op: &L,
+    cpu: &mut CpuState,
+    mem: &Memory,
+    temps: &mut [u64],
+) -> Result<(), Exit> {
+    let L::Interrupt20 {
+        vector,
+        saved_ip,
+        overflow_only,
+        flags_set,
+        word_bus,
+        taken,
+    } = op
+    else {
+        unreachable!("an Interrupt20 op")
+    };
+    temps[*taken as usize] = 0;
+    if !overflow_only || cpu.flags.of {
+        let cs = cpu.cs;
+        interrupt::<ROUTED, ORDER>(cpu, mem, *vector, *saved_ip, *flags_set, *word_bus)?;
+        temps[*taken as usize] = crate::legacy::report_interrupt20(*vector, cs, *saved_ip);
+    } else {
+        cpu.rip = u64::from(*saved_ip);
+    }
+    Ok(())
 }
 
 // UM §2.6 pp. 2-25–28: fixed IVT, FLAGS/CS/IP frame, clear IF and TF.

@@ -251,6 +251,7 @@ fn nec_instruction(
                 saved_ip: next,
                 flags_set: profile.quirks.real_flags_set_mask,
                 word_bus: word_bus(profile),
+                taken: tg.fresh(),
             }));
         }
         // NEC UM pp. 12-28–29 INM/OUTM: one port transfer per element through
@@ -396,7 +397,7 @@ pub(crate) fn nec_form(
     tg: &mut TempGen,
 ) -> Result<IrBlock, LiftError> {
     if let NecForm::Brkem(vector) = *form {
-        return Ok(brkem(start, length, next, vector, profile));
+        return Ok(brkem(start, length, next, vector, profile, tg));
     }
     let mut values = vec![IrOp::InsnStart {
         guest_addr: u64::from(start),
@@ -686,13 +687,15 @@ fn brkem(
     next: u16,
     vector: u8,
     profile: &'static crate::ModelProfile,
+    tg: &mut TempGen,
 ) -> IrBlock {
+    let taken = tg.fresh();
     IrBlock {
         mode: CpuMode::Real16,
         guest_start: u64::from(start),
         guest_len: length,
         icount: 1,
-        temp_count: 0,
+        temp_count: tg.count(),
         ops: vec![
             IrOp::InsnStart {
                 guest_addr: u64::from(start),
@@ -702,6 +705,7 @@ fn brkem(
                 saved_ip: next,
                 flags_set: profile.quirks.real_flags_set_mask,
                 word_bus: word_bus(profile),
+                taken,
             }),
             IrOp::Legacy(L::SharedWalk),
         ],
@@ -871,6 +875,7 @@ pub(crate) fn instruction(
                     overflow_only: insn.mnemonic() == Into,
                     flags_set: profile.quirks.real_flags_set_mask,
                     word_bus: word_bus(profile),
+                    taken: tg.fresh(),
                 }));
             }
             Retf | Iret => {

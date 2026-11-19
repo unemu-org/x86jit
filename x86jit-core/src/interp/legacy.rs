@@ -20,6 +20,22 @@ pub(crate) struct Outcome {
     pub arm_ss: u8,
     pub suppress_debug: bool,
     preserve_rf: bool,
+    /// This instruction delivered a software interrupt, whose origin is in
+    /// `SwitchState::software_interrupt`, for the delivery log (spec.md
+    /// §17.10, Delivery log). One byte, in the padding beside the flags above
+    /// (`the_delivery_log_markers_fit_the_existing_layout`).
+    pub software_interrupt: bool,
+}
+
+/// A delivered software interrupt and the origin it saved (spec.md §17.10,
+/// Delivery log): the CS:IP its frame holds, the CS base and CPL before it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SoftwareInterrupt {
+    pub vector: u8,
+    pub cs: u16,
+    pub ip: u32,
+    pub cs_base: u32,
+    pub cpl: u8,
 }
 
 fn refusal(cpu: &CpuState, operation: crate::UnsupportedSystemOperation) -> Exit {
@@ -2056,11 +2072,15 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
     task_switch.completed = false;
     let mut result = if task_switch.context().is_some() {
         let suppress_debug = task_switch.suppress_debug();
+        // A software interrupt whose task switch was handed off delivers here,
+        // with the origin its INT stored (spec.md §17.10, Delivery log).
+        let software_interrupt = task_switch.software_interrupt_pending();
         tasks::resume(cpu, &mem.address_keyed(), task_switch).map(|()| Outcome {
             retired: true,
             context_changed: true,
             preserve_rf: true,
             suppress_debug,
+            software_interrupt,
             ..Outcome::default()
         })
     } else {
@@ -3545,6 +3565,17 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     overflow_only,
                 } => {
                     if !overflow_only || cpu.flags.of {
+                        let origin = SoftwareInterrupt {
+                            vector: *vector,
+                            cs: cpu.cs,
+                            ip: *saved_ip,
+                            cs_base: cpu.legacy.segments[SegmentId::Cs as usize].base,
+                            cpl: context.cpl,
+                        };
+                        // Stored before the delivery: a task switch handed off
+                        // to the embedder completes in `tasks::resume`, whose
+                        // outcome reads it (`execute_instruction`).
+                        task_switch.software_interrupt = origin;
                         deliver(
                             cpu,
                             mem,
@@ -3574,6 +3605,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         // INT from RF clearing, as for JMP and CALL.
                         outcome.preserve_rf = task_switch.committed;
                         outcome.context_changed = true;
+                        outcome.software_interrupt = true;
                         return Ok(true);
                     }
                 }
@@ -4565,5 +4597,46 @@ mod loadall_tests {
                 assert_eq!(format!("{cpu:?}"), before);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_log_layout {
+    use super::*;
+    use std::mem::size_of;
+
+    // Outcome and Progress as they were before the delivery log (spec.md
+    // §17.10, Delivery log): the same fields, without its markers.
+    #[allow(dead_code)]
+    struct OutcomeBefore {
+        exit: Option<Exit>,
+        retired: bool,
+        context_changed: bool,
+        translations_invalidated: bool,
+        arm_sti: bool,
+        arm_ss: u8,
+        suppress_debug: bool,
+        preserve_rf: bool,
+    }
+    #[allow(dead_code)]
+    struct ProgressBefore {
+        sti_shadow: bool,
+        ss_shadow: u8,
+        steps: u64,
+        retired: u64,
+        outcome: Option<Result<OutcomeBefore, Exit>>,
+    }
+
+    // Each instruction returns an Outcome and each unit a Progress. The log's
+    // one flag fills padding in Outcome, and Progress carries nothing for it,
+    // so neither return grows while the log is off.
+    #[test]
+    fn the_delivery_log_markers_fit_the_existing_layout() {
+        assert_eq!(size_of::<Outcome>(), size_of::<OutcomeBefore>());
+        assert_eq!(
+            size_of::<Result<Outcome, Exit>>(),
+            size_of::<Result<OutcomeBefore, Exit>>()
+        );
+        assert_eq!(size_of::<Progress>(), size_of::<ProgressBefore>());
     }
 }

@@ -70,9 +70,10 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::unified_read_retry",
     },
     "x86jit-core/src/interp/mod.rs": {
-        "interp::i8086::Nec", "interp::i8086::bus_evidence", "interp::i8086::interrupt",
+        "interp::i8086::Nec", "interp::i8086::bus_evidence",
         "interp::i8086::mod", "interp::i8086::nec", "interp::i8086::physical",
         "interp::i8086::port_string_fault", "interp::i8086::primitive",
+        "interp::i8086::software_interrupt",
         "interp::i8086::string", "interp::i8086::string_evidence",
         "interp::i8086::string_load", "interp::i8086::string_store",
         "interp::legacy::direct_stack_address", "interp::legacy::execute_loop_op",

@@ -17,6 +17,13 @@ pub(crate) struct SwitchState {
     pub committed: bool,
     pub completed: bool,
     pending: Option<Pending>,
+    /// The origin of the software interrupt an instruction last started to
+    /// deliver, written before the delivery and read by the delivery log
+    /// after the unit whose `Outcome::software_interrupt` is set: the INT's,
+    /// or the resumed task switch's of one (spec.md §17.10, Delivery log). It
+    /// rides here, beside the walk, so that the per-instruction `Outcome`
+    /// keeps its size.
+    pub software_interrupt: super::SoftwareInterrupt,
 }
 impl SwitchState {
     pub fn context(&self) -> Option<MachineContext> {
@@ -49,6 +56,10 @@ impl SwitchState {
         self.pending
             .as_ref()
             .is_some_and(|p| p.cause == Cause::Event)
+    }
+    /// The pending switch is a software interrupt's, through a task gate.
+    pub fn software_interrupt_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.software)
     }
     pub fn single_step(&self) -> Option<bool> {
         self.pending.as_ref().map(|p| p.single_step)
@@ -220,6 +231,9 @@ struct Pending {
     ext: u16,
     stage: Stage,
     committed: bool,
+    /// The switch is an INT n, INT 3, INTO or INT1 delivery's (spec.md §17.10,
+    /// Delivery log).
+    software: bool,
 }
 
 fn selector_fault(cpu: &CpuState, vector: u8, value: u16, ext: u16) -> Exit {
@@ -372,7 +386,7 @@ pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
     // processor instruction faults are internal to the program; INTR and
     // asynchronous coprocessor/debug events carry EXT.
     let external = event.external && (!event.fault || matches!(event.vector, 7 | 9 | 16));
-    start(
+    let result = start(
         cpu,
         mem,
         context,
@@ -383,7 +397,12 @@ pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
         u16::from(external),
         false,
         state,
-    )
+    );
+    // A switch left pending for a handoff remembers whose it is.
+    if let Some(pending) = &mut state.pending {
+        pending.software = event.software;
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,6 +509,7 @@ fn start<const ROUTED: bool, const ORDER: u8>(
             ext,
             stage: Stage::Save(0),
             committed: false,
+            software: false,
         });
         return resume(cpu, mem, state);
     }

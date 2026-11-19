@@ -145,6 +145,7 @@ pub mod cache;
 pub mod child;
 pub mod code_lifetime;
 pub mod codemap;
+mod delivery_log;
 pub mod disasm;
 #[cfg(feature = "environment")]
 mod environment;
@@ -191,6 +192,9 @@ pub use child::{
 pub use codemap::{
     mark_shared_address_space_child, retire_shared_address_space_child, GuestAccessKind,
     GuestTrapSite, SharedAddressSpaceChild, SharedChildRetirement, SharedChildTableFull,
+};
+pub use delivery_log::{
+    DeliveryBatch, DeliveryCounts, DeliveryKind, DeliveryLog, DeliveryLogError, DeliveryRecord,
 };
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{

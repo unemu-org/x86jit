@@ -1551,26 +1551,11 @@ fn walk_ops<
                         }
                     }
                 }
-                L::Interrupt20 {
-                    vector,
-                    saved_ip,
-                    overflow_only,
-                    flags_set,
-                    word_bus,
-                } if MACHINE && DIRECT20 => {
-                    if !overflow_only || cpu.flags.of {
-                        if let Err(exit) = i8086::interrupt::<ROUTED, ORDER>(
-                            cpu,
-                            mem.0.normal(),
-                            *vector,
-                            *saved_ip,
-                            *flags_set,
-                            *word_bus,
-                        ) {
-                            return WalkResult::exit(exit);
-                        }
-                    } else {
-                        cpu.rip = u64::from(*saved_ip);
+                op @ L::Interrupt20 { .. } if MACHINE && DIRECT20 => {
+                    if let Err(exit) =
+                        i8086::software_interrupt::<ROUTED, ORDER>(op, cpu, mem.0.normal(), temps)
+                    {
+                        return WalkResult::exit(exit);
                     }
                     return WalkResult::Continue;
                 }

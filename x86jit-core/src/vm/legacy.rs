@@ -164,6 +164,33 @@ struct PendingEvent {
     source: EventSource,
     ip: u32,
     cs: u16,
+    /// The return address, CS base and CPL the delivery log records for this
+    /// event (spec.md §17.10, Delivery log). It starts as `cs:ip` and the
+    /// state around it, and changes only when a fault after a committed task
+    /// switch makes the event an exception of the new task: a bus handoff in
+    /// the continuation moves `cs:ip` to the new task, not the record.
+    origin: Origin,
+}
+
+/// The return address a delivery saves, with the CS base and CPL in effect
+/// before it (spec.md §17.10, Delivery log).
+#[derive(Clone, Copy, Default)]
+pub(super) struct Origin {
+    cs: u16,
+    ip: u32,
+    cs_base: u32,
+    cpl: u8,
+}
+
+// The kind a delivery log records for an event's source. BOUND's #BR is a
+// fault that saves BOUND (SDM Vol 3A §7.15, Event 5 p. 7-31).
+fn delivery_kind(source: EventSource) -> crate::DeliveryKind {
+    match source {
+        EventSource::SingleStep => crate::DeliveryKind::Trap,
+        EventSource::Irq(_) => crate::DeliveryKind::Irq,
+        EventSource::Nmi { .. } => crate::DeliveryKind::Nmi,
+        EventSource::Exception { .. } => crate::DeliveryKind::Fault,
+    }
 }
 
 fn exception_source(exit: &Exit) -> Option<EventSource> {
@@ -1730,7 +1757,7 @@ impl Vcpu {
         // The dispatcher checks a latched NMI after this delivery and before
         // the handler's first instruction, independently of IF (80386 PRM
         // §9.2.2 p. 9-3; spec.md §17.10).
-        loop {
+        let (vector, error_code) = loop {
             let (vector, error_code, fault) = match event.source {
                 EventSource::SingleStep => (1, None, false),
                 EventSource::Irq(vector) => (vector, None, false),
@@ -1755,7 +1782,14 @@ impl Vcpu {
                 delivery,
                 &mut self.legacy_execution.as_mut().unwrap().task_switch,
             ) {
-                Ok(()) => break,
+                // A real-address frame holds no error code (SDM Vol 3B
+                // §23.1.4); a protected one, gate or task, holds the event's.
+                Ok(()) => {
+                    break (
+                        vector,
+                        error_code.filter(|_| context.regime == MachineRegime::Protected),
+                    )
+                }
                 Err(exit) => {
                     let committed = self
                         .legacy_execution
@@ -1864,8 +1898,22 @@ impl Vcpu {
                         } else {
                             next
                         };
+                    if committed {
+                        // The exception belongs to the new task: its frame
+                        // holds the new task's CS:IP (spec.md §17.10,
+                        // Delivery log).
+                        event.origin = self.delivery_origin(event.cs, event.ip);
+                    }
                 }
             }
+        };
+        if self.delivery_log.is_some() {
+            self.record_delivery(
+                vector,
+                delivery_kind(event.source),
+                event.origin,
+                error_code,
+            );
         }
         self.finish_legacy_event(event, None);
         Ok(())
@@ -1889,6 +1937,151 @@ impl Vcpu {
         }
         execution.stall_count = 0;
         true
+    }
+
+    // The record origin of a delivery that saves `cs:ip` now (spec.md
+    // §17.10, Delivery log), with the CS base and CPL in effect. The
+    // twenty-bit models keep no descriptor cache: their base is CS × 16 (8086
+    // Family UM §2.3 p. 2-12).
+    pub(super) fn delivery_origin(&self, cs: u16, ip: u32) -> Origin {
+        if self.twenty_bit_model() {
+            Origin {
+                cs,
+                ip,
+                cs_base: u32::from(cs) << 4,
+                cpl: 0,
+            }
+        } else {
+            Origin {
+                cs,
+                ip,
+                cs_base: self.cpu.legacy.segments[SegmentId::Cs as usize].base,
+                cpl: self.cpu.legacy.cpl,
+            }
+        }
+    }
+
+    // Append a delivery of `vector` from `origin` that has just entered its
+    // handler to the delivery log (spec.md §17.10, Delivery log). Called only
+    // while the log is enabled.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn record_delivery(
+        &mut self,
+        vector: u8,
+        kind: crate::DeliveryKind,
+        origin: Origin,
+        error_code: Option<u32>,
+    ) {
+        let twenty = self.twenty_bit_model();
+        // 8086 Family UM §2.2 p. 2-7: a twenty-bit IP is a sixteen-bit offset.
+        let ip = if twenty {
+            origin.ip & 0xffff
+        } else {
+            origin.ip
+        };
+        let linear = origin.cs_base.wrapping_add(ip);
+        let record = crate::DeliveryRecord {
+            vector,
+            kind,
+            saved_cs: origin.cs,
+            saved_ip: ip,
+            // 8086 Family UM §2.8 p. 2-68: twenty address bits.
+            saved_linear: if twenty { linear & 0xfffff } else { linear },
+            error_code,
+            cpl_before: origin.cpl,
+            cpl_after: if twenty { 0 } else { self.cpu.legacy.cpl },
+            retired: self.retired,
+        };
+        if let Some(log) = &mut self.delivery_log {
+            log.push(record);
+        }
+    }
+
+    // The software interrupt the unit just walked took, as the walk itself
+    // reported it (spec.md §17.10, Delivery log). An 80286/80386 INT marks
+    // its outcome and leaves the origin it read in the task-switch state; a
+    // twenty-bit INT, INT 3, INTO, CHKIND or BRKEM writes the vector and the
+    // CS:IP its frame holds into the op's `taken` temporary once the frame is
+    // written (`legacy::report_interrupt20`). Called only while the log is
+    // enabled.
+    #[cold]
+    #[inline(never)]
+    fn record_unit(
+        &mut self,
+        twenty: bool,
+        ir: &IrBlock,
+        progress: &crate::interp::legacy::Progress,
+    ) {
+        let (vector, origin) = if twenty {
+            let taken = |op: &IrOp| match op {
+                IrOp::Legacy(
+                    crate::legacy::LegacyOp::Interrupt20 { taken, .. }
+                    | crate::legacy::LegacyOp::CheckIndex20 { taken, .. }
+                    | crate::legacy::LegacyOp::Brkem20 { taken, .. },
+                ) => Some(*taken),
+                _ => None,
+            };
+            // The interrupt op ends its block (`vm::i8086::resolve`): the block
+            // holds one, in its last instruction.
+            debug_assert!(
+                {
+                    let last = ir
+                        .ops
+                        .iter()
+                        .rposition(|op| matches!(op, IrOp::InsnStart { .. }));
+                    let mut found = ir
+                        .ops
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, op)| taken(op).is_some());
+                    match (found.next(), found.next(), last) {
+                        (None, _, _) => true,
+                        (Some((at, _)), None, Some(last)) => at > last,
+                        _ => false,
+                    }
+                },
+                "a twenty-bit interrupt op that is not its block's only one, in its last instruction"
+            );
+            let Some(taken) = ir.ops.iter().rev().find_map(taken) else {
+                return;
+            };
+            // A walk that retired the whole block reached the op, which wrote
+            // its report; one that stopped earlier left the temporary from an
+            // earlier walk.
+            if progress.retired != u64::from(ir.icount) {
+                return;
+            }
+            let Some((vector, cs, ip)) = self
+                .interp_scratch
+                .values
+                .get(taken as usize)
+                .and_then(|&report| crate::legacy::reported_interrupt20(report))
+            else {
+                return;
+            };
+            (vector, self.delivery_origin(cs, u32::from(ip)))
+        } else {
+            if !matches!(&progress.outcome, Some(Ok(outcome)) if outcome.software_interrupt) {
+                return;
+            }
+            let delivered = self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .task_switch
+                .software_interrupt;
+            (
+                delivered.vector,
+                Origin {
+                    cs: delivered.cs,
+                    ip: delivered.ip,
+                    cs_base: delivered.cs_base,
+                    cpl: delivered.cpl,
+                },
+            )
+        };
+        self.record_delivery(vector, crate::DeliveryKind::Software, origin, None);
     }
 
     fn consume_legacy_irq(&mut self, event: &mut PendingEvent) {
@@ -1958,6 +2151,9 @@ impl Vcpu {
         self.cpu.finish_mmio_retry(Some(&exit));
         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
         self.apply_pending_a20();
+        let ip = exit
+            .fault_metadata()
+            .map_or(self.cpu.rip, |m| m.saved_rip()) as u32;
         self.deliver_legacy_event::<ROUTED, ORDER>(
             vm,
             context,
@@ -1966,10 +2162,9 @@ impl Vcpu {
                 software: false,
                 after_nmi: false,
                 source,
-                ip: exit
-                    .fault_metadata()
-                    .map_or(self.cpu.rip, |m| m.saved_rip()) as u32,
+                ip,
                 cs: self.cpu.cs,
+                origin: self.delivery_origin(self.cpu.cs, ip),
             },
         )
     }
@@ -2008,8 +2203,12 @@ impl Vcpu {
             task_pending,
             single_step,
             irq_pending,
-            // A twenty-bit model is never blocked (`nmi.rs`).
-            cold_epilogue: a20_pending || (KIND != super::DIRECT20_DISPATCH && self.nmi_state != 0),
+            // A twenty-bit model is never blocked (`nmi.rs`). An enabled
+            // delivery log reads each unit's software interrupt in the
+            // epilogue (`record_unit`).
+            cold_epilogue: a20_pending
+                || (KIND != super::DIRECT20_DISPATCH && self.nmi_state != 0)
+                || self.delivery_log.is_some(),
             one_step: SINGLE
                 || single_step
                 || self.sti_shadow
@@ -2095,6 +2294,7 @@ impl Vcpu {
                 source: EventSource::SingleStep,
                 ip: self.cpu.rip as u32,
                 cs: self.cpu.cs,
+                origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
             });
         }
     }
@@ -2313,6 +2513,7 @@ impl Vcpu {
                                     source: EventSource::Irq(vector),
                                     ip: self.cpu.rip as u32,
                                     cs: self.cpu.cs,
+                                    origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
                                 })
                         });
                     if let Some(event) = event {
@@ -2566,6 +2767,9 @@ impl Vcpu {
                         || self.ss_shadow & SS_HOLD != 0
                         || (direct20 && self.cpu.rflags_system & 0x100 != 0);
                     if boundary.cold_epilogue {
+                        if self.delivery_log.is_some() {
+                            self.record_unit(direct20, &ir, &progress);
+                        }
                         // A queued A20 change, or an IRET that ends NMI
                         // blocking: derive the bus and the boundary again.
                         if self.machine_epilogue(&ir, progress.retired) {
@@ -2590,8 +2794,13 @@ impl Vcpu {
                 // retired, or one that faulted, ends blocking. Blocking sets
                 // `cold_epilogue`, as for the fast arm; a twenty-bit model is
                 // never blocked (`nmi.rs`).
-                if !direct20 && boundary.cold_epilogue {
-                    self.nmi_after_progress(&ir, &progress);
+                if boundary.cold_epilogue {
+                    if !direct20 {
+                        self.nmi_after_progress(&ir, &progress);
+                    }
+                    if self.delivery_log.is_some() {
+                        self.record_unit(direct20, &ir, &progress);
+                    }
                 }
                 let outcome = progress.into_outcome();
                 if !outcome.as_ref().is_ok_and(|outcome| {
@@ -4009,6 +4218,9 @@ impl Vcpu {
                 self.legacy_execution.as_mut().unwrap().event_retry = Some(event);
                 return Err(exit);
             }
+            if self.delivery_log.is_some() {
+                self.record_delivery(vector, delivery_kind(event.source), event.origin, None);
+            }
             if emulation {
                 self.cpu.legacy.reserved &=
                     !(crate::legacy::NEC_EMULATION | crate::legacy::NEC_STANDBY);
@@ -4034,6 +4246,7 @@ impl Vcpu {
                     source: EventSource::Nmi { shutdown: false },
                     ip: self.cpu.rip as u32,
                     cs: self.cpu.cs,
+                    origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
                 };
             } else if trap && !stepped {
                 event = PendingEvent {
@@ -4043,6 +4256,7 @@ impl Vcpu {
                     source: EventSource::SingleStep,
                     ip: self.cpu.rip as u32,
                     cs: self.cpu.cs,
+                    origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
                 };
             } else {
                 return Ok(());
@@ -4292,6 +4506,7 @@ mod tests {
                 source: EventSource::SingleStep,
                 ip: 0x1000,
                 cs: 0,
+                origin: Origin::default(),
             });
             let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert_eq!(run.steps(), 0, "{:?}", run.stop());

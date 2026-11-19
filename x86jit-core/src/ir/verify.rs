@@ -382,11 +382,14 @@ impl IrBlock {
                         index,
                         lower,
                         upper,
+                        taken,
                         ..
                     } => check(
                         &[Val::Temp(*index), Val::Temp(*lower), Val::Temp(*upper)],
-                        &[],
+                        &[*taken],
                     )?,
+                    crate::legacy::LegacyOp::Interrupt20 { taken, .. }
+                    | crate::legacy::LegacyOp::Brkem20 { taken, .. } => check(&[], &[*taken])?,
                     crate::legacy::LegacyOp::Reti20 { ip, cs, flags, sp } => check(
                         &[
                             Val::Temp(*ip),
@@ -401,8 +404,6 @@ impl IrBlock {
                     }
                     crate::legacy::LegacyOp::Fpo2Escape20 { addr, .. } => check(&[*addr], &[])?,
                     crate::legacy::LegacyOp::WrappedString { .. }
-                    | crate::legacy::LegacyOp::Interrupt20 { .. }
-                    | crate::legacy::LegacyOp::Brkem20 { .. }
                     | crate::legacy::LegacyOp::BitField20 { .. }
                     | crate::legacy::LegacyOp::BcdString20 { .. }
                     | crate::legacy::LegacyOp::InhibitIrq20
