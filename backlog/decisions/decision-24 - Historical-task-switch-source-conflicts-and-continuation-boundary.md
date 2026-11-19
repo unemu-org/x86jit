@@ -233,3 +233,81 @@ A 16-bit outward pop zero-extends ESP, as the SDM pseudocode reads. The hardware
 the upper bits is not modelled.
 
 CpuState, jit_abi, the model identities and the compiled path are unchanged.
+
+## Amendment — 2026-11-19: real-address stack frames that wrap SP (xj-srh.27)
+
+Accepted by the maintainer (2026-11-19). On the I80286 and I80386 Machine models, a
+real-address-mode stack frame wraps SP inside the stack segment. A transfer faults only when
+one of its own operands leaves the segment: a word at offset FFFFh, or a dword that crosses
+the top. The rule applies to every multi-slot frame:
+- an interrupt frame (INT n, INT 3, INTO, a processor exception, an IRQ or NMI);
+- PUSHA/PUSHAD and POPA/POPAD;
+- the far CALL frame, and RETF and RETF n;
+- IRET.
+
+The governing clause is the last sentence of the source-resolution rule: "A later SDM
+difference alone does not replace an unambiguous historical model rule." Both PRMs state the
+rule on each instruction's own exceptions entry, and they agree. Every page image below was
+checked.
+- **INT/INTO:** shut down only at SP = 1, 3 or 5 (I286 PRM App. B p. B-50; 80386 PRM §17
+  p. 17-73). Those are the SP values at which one frame word crosses offset FFFFh (80386 PRM
+  §14.7 item 7 p. 14-6). The word's fault is delivered on the same SP, crosses again, and #DF
+  then shuts down.
+- **PUSHA/PUSHAD:** the same three shutdown values, and exception 13 at SP = 7, 9, 11, 13 or
+  15 (I286 PRM p. B-88; 80386 PRM p. 17-134).
+- **CALL:** "Interrupt 13 for a word operand at offset 0FFFFH" (I286 PRM p. B-26). The 80386
+  faults "if any part of the operand would lie outside of the effective address space from 0
+  to 0FFFFH" (p. 17-42). 80386 PRM Table 14-2 p. 14-8, interrupt 12: "push with SP=1 during
+  PUSH, CALL, or INT".
+- **IRET:** "Interrupt 13 if the stack is popped when it has offset 0FFFFH" (I286 PRM p. B-53).
+  The 80386 faults "if any part of the operand being popped lies beyond address 0FFFFH"
+  (p. 17-79).
+- **POPA:** "Interrupt 13 for a word operand at offset 0FFFFH" (I286 PRM p. B-85). The 80386
+  faults per operand (p. 17-129).
+- **RET:** the 80386 faults per operand (p. 17-145). I286 PRM App. B RET p. B-95 says
+  "Interrupt 13 if the stack pop wraps around from 0FFFFH to 0". That is read as a word popped
+  at FFFFh (maintainer decision D3), consistent with B-53, B-85 and Table C-1 p. C-1 ("a word
+  operation at offset 0FFFFH").
+
+The resulting behaviour:
+- An SP = 2 interrupt stores FLAGS at 0000h, CS at FFFEh and IP at FFFCh, and its IRET returns
+  through the same wrap.
+- PUSHA then POPA round-trips at every even SP.
+- A far CALL at SP = 2 pushes CS at 0000h and IP at FFFEh, and RETF returns.
+- On the 80386 with SS.B = 1 (big real), the pointer is ESP. An interrupt at ESP = 2 or 4 wraps
+  through 2^32 (maintainer decision D4). The 80386 page names only "SP or ESP = 1, 3, or 5".
+- A frame word at FFFFh faults with that word as its operand evidence (offset FFFFh, 2 bytes),
+  not the whole frame. The vector is unchanged: #GP on the 80286, #SS on the 80386
+  (I286 PRM App. B MOV p. B-74; 80386 PRM §14.6 Table 14-1 p. 14-5).
+- PUSHAD at SP = 2 or 6 raises #SS: a dword crosses FFFFh (§14.7 item 7), a case the PUSHAD
+  list does not name.
+
+Counter-statements, recorded as decision-24 asks:
+- **SDM Vol 2A INT, REAL-ADDRESS-MODE p. 3-470:** "IF stack not large enough for a 6-byte
+  return information THEN #SS". The far CALL pseudocode in Vol 2A uses the same "stack not
+  large enough" wording. The engine followed this before xj-srh.27.
+- **SDM Vol 2A IRET p. 3-497:** "#SS If the top bytes of stack are not within stack limits".
+  Its REAL-ADDRESS-MODE pseudocode on p. 3-491 pops slot by slot.
+- **SDM Vol 3B §25.33.1 p. 25-34:** "If a stack operation wraps around the address limit,
+  shutdown occurs." The same section raises an exception only for an operand that crosses
+  offset FFFFh or 0. It also says that an aligned pop at the top "will wrap around to 0" with
+  no limit violation.
+- **SDM Vol 2B PUSHA pp. 4-526/527:** states the PRM rule (shutdown at 1, 3 or 5; #GP at
+  7..15).
+- **I286 PRM App. B #SS p. B-11:** a PUSHA or POPA that "attempts to wrap around the 64K
+  boundary of a stack segment" faults. That text describes #SS, which the 80286 raises only in
+  protected mode. Protected mode keeps its whole-frame check.
+
+Scope:
+- Protected mode keeps the whole-frame check.
+- ENTER is unchanged.
+- The 8086 family has no limit and no shutdown (8086 Family UM §2.3 p. 2-12) and is
+  unchanged.
+- The frozen Real16 alias keeps its whole-frame checks (maintainer decision D1; decision-23
+  §6). Its PUSHA at SP = 2 still raises #13, and its IRET at FFFCh and far CALL at SP = 2 still
+  fault.
+
+Witnesses:
+- x86jit-tests/tests/legacy/legacy_real_sp_wrap.rs;
+- legacy_delivery_liveness.rs;
+- legacy_u3_review.rs (`alias_pusha_keeps_the_whole_frame_check` and the moved pins).

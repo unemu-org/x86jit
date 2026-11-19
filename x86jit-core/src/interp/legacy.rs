@@ -397,6 +397,9 @@ struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
     read_index: Cell<u16>,
     writes: Option<&'a dyn Fn(u64, u8)>,
     physical_mask: u32,
+    /// The frozen Real16 alias (decision-23 §6) keeps its whole-frame stack
+    /// checks; see `wraps_in_segment`.
+    frozen_alias: bool,
 }
 impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
     fn new(memory: &'a Memory, physical_mask: u32) -> Self {
@@ -405,6 +408,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
             read_index: Cell::new(0),
             writes: None,
             physical_mask,
+            frozen_alias: false,
         }
     }
     fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
@@ -447,6 +451,9 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
     fn note_write(&self, _addr: u64, _size: u8) {}
     fn physical_mask(&self) -> u32;
+    fn frozen_alias(&self) -> bool {
+        false
+    }
     /// The same bus, with address-based retry keys (task-switch stages).
     fn address_keyed(&self) -> AddressKeyed<'_, ROUTED, ORDER> {
         AddressKeyed {
@@ -496,6 +503,9 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
         if let Some(observe) = self.writes {
             observe(addr, size);
         }
+    }
+    fn frozen_alias(&self) -> bool {
+        self.frozen_alias
     }
 }
 
@@ -1457,10 +1467,25 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     count: usize,
     size: u8,
 ) -> Result<Vec<u64>, Exit> {
+    push_slots(cpu, mem, context, count, size, true)
+}
+
+/// `whole_frame` checks the frame as one span before its slots; without it,
+/// only a slot that itself leaves the segment faults and SP wraps inside it.
+fn push_slots<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    count: usize,
+    size: u8,
+    whole_frame: bool,
+) -> Result<Vec<u64>, Exit> {
     let old = sp(cpu, context);
-    let bytes = count as u8 * size;
-    let start = old.wrapping_sub(u64::from(bytes)) & mask(context.stack_address_bits / 8);
-    segment_access(cpu, context, SegmentId::Ss, start, bytes, AccessKind::Write)?;
+    if whole_frame {
+        let bytes = count as u8 * size;
+        let start = old.wrapping_sub(u64::from(bytes)) & mask(context.stack_address_bits / 8);
+        segment_access(cpu, context, SegmentId::Ss, start, bytes, AccessKind::Write)?;
+    }
     let mut addresses = Vec::with_capacity(count);
     for i in 1..=count {
         let offset =
@@ -1486,8 +1511,84 @@ fn push<const ROUTED: bool, const ORDER: u8>(
     values: &[u64],
     size: u8,
 ) -> Result<(), Exit> {
+    push_values(cpu, mem, context, values, size, true)
+}
+
+/// Whether a multi-slot stack frame wraps SP inside the stack segment, so
+/// that only a slot which itself leaves the segment faults. True in
+/// real-address mode on the I80286 and I80386 Machine models; protected mode
+/// and the frozen Real16 alias (decision-23 §6) check the whole frame first.
+/// The model is not tested here: only the 286/386 legacy interpreter calls
+/// it, and the twenty-bit models take their own path with no stack limit.
+///
+/// The PRMs fault only on the word at offset FFFFh: INT/INTO shut down only
+/// at SP = 1, 3 or 5 (I286 PRM App. B p. B-50; 80386 PRM §17 p. 17-73), PUSHA
+/// likewise (p. B-88; p. 17-134); IRET, POPA and CALL raise interrupt 13
+/// "for a word operand at offset 0FFFFH" or when "the stack is popped when it
+/// has offset 0FFFFH" (pp. B-26, B-53, B-85); the 80386 pages fault "if any
+/// part of the operand" lies beyond 0FFFFH (pp. 17-42, 17-79, 17-129,
+/// 17-145) and Table 14-2 p. 14-8 names "push with SP=1 during PUSH, CALL, or
+/// INT" (§14.7 item 7 p. 14-6). Decision-24 records the SDM's whole-frame
+/// wording as the counter-statement.
+fn wraps_in_segment<const ROUTED: bool, const ORDER: u8>(
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+) -> bool {
+    context.regime == legacy::MachineRegime::Real && !mem.frozen_alias()
+}
+
+/// An interrupt frame, a far CALL frame or PUSHA/PUSHAD (`wraps_in_segment`).
+/// A wrapped frame word at FFFFh faults; that fault is delivered on the same
+/// SP, so at SP = 1, 3 or 5 it crosses again and escalates to shutdown.
+fn push_frame<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    values: &[u64],
+    size: u8,
+) -> Result<(), Exit> {
+    let whole_frame = !wraps_in_segment(mem, context);
+    push_values(cpu, mem, context, values, size, whole_frame)
+}
+
+/// Check every slot of a `count`-slot pop frame before its first read: the
+/// whole span, or each slot alone when the frame wraps (`wraps_in_segment`).
+fn pop_frame_limit<const ROUTED: bool, const ORDER: u8>(
+    cpu: &CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    count: u8,
+    size: u8,
+) -> Result<(), Exit> {
+    let base = sp(cpu, context);
+    if !wraps_in_segment(mem, context) {
+        segment_access(
+            cpu,
+            context,
+            SegmentId::Ss,
+            base,
+            count * size,
+            AccessKind::Read,
+        )?;
+        return Ok(());
+    }
+    for i in 0..u64::from(count) {
+        let offset = base.wrapping_add(i * u64::from(size)) & mask(context.stack_address_bits / 8);
+        segment_access(cpu, context, SegmentId::Ss, offset, size, AccessKind::Read)?;
+    }
+    Ok(())
+}
+
+fn push_values<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    values: &[u64],
+    size: u8,
+    whole_frame: bool,
+) -> Result<(), Exit> {
     let old = sp(cpu, context);
-    let addresses = push_addresses(cpu, mem, context, values.len(), size)?;
+    let addresses = push_slots(cpu, mem, context, values.len(), size, whole_frame)?;
     for (&addr, &value) in addresses.iter().zip(values) {
         write(cpu, mem, addr, size, value)?;
     }
@@ -1718,7 +1819,10 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     let cs = read(cpu, mem, u64::from((address as u32).wrapping_add(2)), 2)?;
     far_real_target(cpu, context, ip, 4)?;
     let flags = legacy::flags_image(cpu, context.generation);
-    push(
+    // Decision-24's source rule: the frame wraps SP as both PRMs' INT pages
+    // say (`wraps_in_segment`), not the whole-frame room check in SDM Vol 2A
+    // §3.3 INT, REAL-ADDRESS-MODE p. 3-470.
+    push_frame(
         cpu,
         mem,
         context,
@@ -2711,6 +2815,7 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
         },
     );
     access.writes = Some(&observe);
+    access.frozen_alias = saved.is_some();
     let mut outcome = Outcome {
         retired: true,
         ..Outcome::default()
@@ -3681,16 +3786,10 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     // the fifth slot; POPA skips it without loading a register.
                     if *pop {
                         // SDM Vol 2B §4.3 POPA/POPAD; 80386 PRM §17 POPA:
-                        // preflight the whole frame before any device read,
-                        // including the discarded SP/ESP slot.
-                        segment_access(
-                            cpu,
-                            context,
-                            SegmentId::Ss,
-                            sp(cpu, context),
-                            8 * *size,
-                            AccessKind::Read,
-                        )?;
+                        // preflight the frame before any device read,
+                        // including the discarded SP/ESP slot. In real mode
+                        // it wraps (I286 PRM App. B POPA p. B-85).
+                        pop_frame_limit(cpu, mem, context, 8, *size)?;
                         let mut values = [0; 8];
                         for (i, value) in values.iter_mut().enumerate() {
                             if i != 3 {
@@ -3706,13 +3805,14 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     } else {
                         // SDM Vol 2B §4.3 PUSHA/PUSHAD; 80386 PRM §17,
                         // p. 17-134: these real-mode cases precede pushes.
+                        // An even SP wraps and completes (`push_frame`).
                         if context.regime == legacy::MachineRegime::Real
                             && matches!(sp(cpu, context), 7 | 9 | 11 | 13 | 15)
                         {
                             return Err(exception(cpu, 13));
                         }
                         let values = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| cpu.gpr[i]);
-                        push(cpu, mem, context, &values, *size)?;
+                        push_frame(cpu, mem, context, &values, *size)?;
                     }
                 }
                 L::Transfer {
@@ -3787,7 +3887,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             frame.push(u64::from(cpu.cs));
                         }
                         frame.push(u64::from(*return_ip));
-                        push(cpu, mem, context, &frame, *size)?;
+                        // I286 PRM App. B CALL p. B-26; 80386 PRM p. 17-42
+                        // and Table 14-2 p. 14-8: the real-mode frame wraps.
+                        push_frame(cpu, mem, context, &frame, *size)?;
                     }
                     if let Some(cs) = cs {
                         if let Some(d) = descriptor {
@@ -3810,14 +3912,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     far,
                     pop_extra,
                 } => {
-                    segment_access(
-                        cpu,
-                        context,
-                        SegmentId::Ss,
-                        sp(cpu, context),
-                        *size * if *far { 2 } else { 1 },
-                        AccessKind::Read,
-                    )?;
+                    // 80386 PRM §17 RET p. 17-145; I286 PRM App. B RET
+                    // p. B-95 read as a word popped at FFFFh (decision-24).
+                    pop_frame_limit(cpu, mem, context, if *far { 2 } else { 1 }, *size)?;
                     let ip = peek(cpu, mem, context, 0, *size)?;
                     let cs = if *far {
                         Some(peek(cpu, mem, context, 1, *size)? as u16)
@@ -3874,14 +3971,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 L::Iret { size } => {
                     // SDM Vol 2A §3.3 IRET; 80386 PRM §17 pp. 17-74,
                     // 17-76–78 (scan checked): same-CPL frame, independent SS.B.
-                    segment_access(
-                        cpu,
-                        context,
-                        SegmentId::Ss,
-                        sp(cpu, context),
-                        3 * *size,
-                        AccessKind::Read,
-                    )?;
+                    // Real mode wraps: I286 PRM App. B IRET p. B-53, 80386
+                    // PRM §17 IRET p. 17-79 (`wraps_in_segment`).
+                    pop_frame_limit(cpu, mem, context, 3, *size)?;
                     let ip = peek(cpu, mem, context, 0, *size)? & mask(*size);
                     let cs = peek(cpu, mem, context, 1, *size)? as u16;
                     let image = peek(cpu, mem, context, 2, *size)? as u32;

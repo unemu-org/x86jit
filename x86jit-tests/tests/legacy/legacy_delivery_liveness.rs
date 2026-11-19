@@ -151,7 +151,8 @@ fn stalled(label: &str, result: &StepRun, cpu: &Vcpu, at: (u16, u64)) {
 /// Run until something other than the delivery bound stops the run: each
 /// bounded return is at the handler's first instruction, `STALL` frames
 /// further down the 16-bit stack. A stack from `sp` holds `sp / 6` frames;
-/// the next delivery faults and escalates to shutdown.
+/// the next delivery faults and escalates to shutdown. In real-address mode
+/// that needs an odd `sp`: an even one wraps at offset 0 instead.
 fn bounded_then_shutdown(label: &str, vm: &Vm, cpu: &mut Vcpu, handler: (u16, u64), sp: u64) {
     let frames = sp / 6;
     let mut runs = 0;
@@ -174,17 +175,48 @@ fn bounded_then_shutdown(label: &str, vm: &Vm, cpu: &mut Vcpu, handler: (u16, u6
 #[test]
 fn real_mode_handler_that_faults_at_once_is_bounded_then_shuts_down() {
     // The #UD handler is itself 0F FF. Each run returns after STALL
-    // deliveries; once the frames reach the bottom of the stack, the frame
-    // overrun is #GP (286) or #SS (386), whose own frame overruns too (#DF),
-    // and so does #DF's: shutdown.
+    // deliveries; the frames step down from SP = 8001h to SP = 3, where a
+    // frame word crosses FFFFh: #GP (286) or #SS (386), whose own frame
+    // crosses too (#DF), and so does #DF's: shutdown (I286 PRM App. B INT
+    // p. B-50; 80386 PRM §17 INT p. 17-73). From an even SP the frames wrap
+    // and never stop (the next test).
     for model in MODELS {
         let label = format!("{model:?}");
-        let (vm, mut cpu) = real(model, ExceptionDelivery::InGuest, UD, UD, 0x8000);
+        let (vm, mut cpu) = real(model, ExceptionDelivery::InGuest, UD, UD, 0x8001);
         watched(&label.clone(), move || {
-            bounded_then_shutdown(&label, &vm, &mut cpu, (0, 0x3000), 0x8000);
+            bounded_then_shutdown(&label, &vm, &mut cpu, (0, 0x3000), 0x8001);
+            assert_eq!(cpu.cpu.gpr[4] & 0xffff, 3, "{label}: SP");
             // The first frame, for the fault at 1000:0000.
-            assert_eq!(word(&vm, SS_BASE + 0x7ffa), 0x0000, "{label}: IP");
-            assert_eq!(word(&vm, SS_BASE + 0x7ffc), REAL_CS, "{label}: CS");
+            assert_eq!(word(&vm, SS_BASE + 0x7ffb), 0x0000, "{label}: IP");
+            assert_eq!(word(&vm, SS_BASE + 0x7ffd), REAL_CS, "{label}: CS");
+        });
+    }
+}
+
+#[test]
+fn real_mode_handler_that_faults_at_once_wraps_from_an_even_sp() {
+    // From SP = 10h the frames pass SP = 4 and wrap below 0000h: no frame
+    // word crosses FFFFh (I286 PRM App. B INT p. B-50; 80386 PRM §17 INT
+    // p. 17-73), so only the delivery bound returns each run.
+    for model in MODELS {
+        let label = format!("{model:?}");
+        let (vm, mut cpu) = real(model, ExceptionDelivery::InGuest, UD, UD, 0x10);
+        vm.write_bytes(SS_BASE, &[0xaa, 0xaa]).unwrap();
+        watched(&label.clone(), move || {
+            for runs in 1..=2u64 {
+                let result = run(&vm, &mut cpu, BUDGET);
+                stalled(&label, &result, &cpu, (0, 0x3000));
+                assert_eq!(
+                    cpu.cpu.gpr[4],
+                    0x10u64.wrapping_sub(6 * STALL * runs) & 0xffff,
+                    "{label}"
+                );
+            }
+            // The frame pushed at SP = 4: FLAGS at 0002h, CS at 0000h, IP
+            // at FFFEh, for the handler's fault at 0000:3000. A sentinel at
+            // 0000h shows that the wrapped CS word was written.
+            assert_eq!(word(&vm, SS_BASE), 0, "{label}: CS");
+            assert_eq!(word(&vm, SS_BASE + 0xfffe), 0x3000, "{label}: IP");
         });
     }
 }

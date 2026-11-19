@@ -975,16 +975,28 @@ fn accepted_far_call_and_iret_defer_commits() {
 
 #[test]
 fn accepted_far_frame_preflight_precedes_first_read() {
-    // SDM Vol 2A §3.3 IRET and Vol 2B §4.3 RET: preflight a whole frame.
+    // SDM Vol 2A §3.3 IRET and Vol 2B §4.3 RET: preflight the frame before
+    // its first read. The frozen alias checks the whole frame (FFFCh/FFFEh
+    // fault). The Machine models wrap a real-mode pop (I286 PRM App. B IRET
+    // p. B-53; 80386 PRM §17 IRET p. 17-79, RET p. 17-145), so their frame
+    // faults only on the word at FFFFh, here the second slot from FFFDh; the
+    // first slot sits on a device page and is never read.
     for (model, checked) in [
         (None, false),
+        (Some(CpuModel::I80286), false),
+        (Some(CpuModel::I80286), true),
         (Some(CpuModel::I80386), false),
         (Some(CpuModel::I80386), true),
     ] {
-        for (code, sp) in [(b"\xcf".as_slice(), 0xfffc), (b"\xcb".as_slice(), 0xfffe)] {
-            let (vm, mut cpu) = setup(model, checked, code);
-            vm.write_bytes(sp, &0x1234u16.to_le_bytes()).unwrap();
-            cpu.cpu.gpr[4] = sp;
+        for (code, alias_sp) in [(b"\xcf".as_slice(), 0xfffc), (b"\xcb".as_slice(), 0xfffe)] {
+            let (mut vm, mut cpu) = setup(model, checked, code);
+            if model.is_none() {
+                vm.write_bytes(alias_sp, &0x1234u16.to_le_bytes()).unwrap();
+                cpu.cpu.gpr[4] = alias_sp;
+            } else {
+                trap(&mut vm, 0xf000);
+                cpu.cpu.gpr[4] = 0xfffd;
+            }
             gp_or_ss(&vm, &mut cpu, model);
         }
     }
@@ -1015,14 +1027,20 @@ fn accepted_popa_skips_discarded_sp_device_slot() {
 
 #[test]
 fn accepted_far_call_whole_frame_limit_preflight() {
-    // SDM Vol 2A §3.3 CALL: check space for the whole far return frame.
+    // SDM Vol 2A §3.3 CALL: check space for the whole far return frame. The
+    // frozen alias keeps that (SP = 2 faults). The Machine models wrap the
+    // real-mode frame (I286 PRM App. B CALL p. B-26; 80386 PRM §17 CALL
+    // p. 17-42, Table 14-2 p. 14-8): at SP = 3 the IP word crosses FFFFh and
+    // faults before the CS word reaches the device page at 0.
     for (model, checked) in [
         (None, false),
+        (Some(CpuModel::I80286), false),
+        (Some(CpuModel::I80286), true),
         (Some(CpuModel::I80386), false),
         (Some(CpuModel::I80386), true),
     ] {
         let (mut vm, mut cpu) = setup(model, checked, b"\x9a\x00\x22\x00\x01");
-        cpu.cpu.gpr[4] = 2;
+        cpu.cpu.gpr[4] = if model.is_some() { 3 } else { 2 };
         if model.is_some() {
             trap(&mut vm, 0);
         }
@@ -1034,16 +1052,34 @@ fn accepted_far_call_whole_frame_limit_preflight() {
 }
 
 #[test]
+fn alias_pusha_keeps_the_whole_frame_check() {
+    // Decision-23 §6 freezes the Real16 alias: unlike the Machine models
+    // (`legacy_real_sp_wrap`), its PUSHA at SP = 2 still raises #GP for the
+    // 16-byte frame, delivered through the IVT on the wrapped SP (FFFCh).
+    let (vm, mut cpu) = setup(None, false, b"\x60");
+    cpu.cpu.gpr[4] = 2;
+    gp_or_ss(&vm, &mut cpu, None);
+    assert_eq!(cpu.cpu.gpr[4], 0xfffc);
+}
+
+#[test]
 fn all_register_frame_limit_uses_model_fault_vector() {
-    // I286 PRM App. B POPA p. B-85; SDM Vol 3B §23.1.4 Table 23-1:
+    // I286 PRM App. B MOV p. B-74; 80386 PRM §14.6 Table 14-1 p. 14-5:
     // I286 real-mode stack limits report #GP; I386 reports #SS.
+    // POPA at SP = FFF9h: its fourth word is at FFFFh (I286 PRM App. B POPA
+    // p. B-85, "a word operand at offset 0FFFFH"); the first slot is on a
+    // device page and is not read first.
+    // PUSHA at SP = 5: its third word crosses FFFFh (80386 PRM §14.7 item 7
+    // p. 14-6); with in-guest delivery that is a shutdown (I286 PRM App. B
+    // PUSHA p. B-88; 80386 PRM §17 PUSHA p. 17-134), here returned outward.
+    // An even SP such as 8 wraps and completes (`legacy_real_sp_wrap`).
     for (model, checked) in [
         (Some(CpuModel::I80286), false),
         (Some(CpuModel::I80286), true),
         (Some(CpuModel::I80386), false),
         (Some(CpuModel::I80386), true),
     ] {
-        for (code, sp) in [(b"\x61".as_slice(), 0xfff8), (b"\x60".as_slice(), 8)] {
+        for (code, sp) in [(b"\x61".as_slice(), 0xfff9), (b"\x60".as_slice(), 5)] {
             let (mut vm, mut cpu) = setup(model, checked, code);
             trap(&mut vm, 0xf000);
             cpu.cpu.gpr[4] = sp;
