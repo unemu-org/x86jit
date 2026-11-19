@@ -197,6 +197,38 @@ fn double_fault(generation: CpuGeneration, first: EventSource, second: EventSour
         || (first == 14 && (contributory(second) || second == 14))
 }
 
+/// Completed event deliveries in a row, within one run, with no completed
+/// unit between them, at which the run returns `Exit::BudgetExhausted`.
+/// Delivery costs no unit (`Vcpu::run_steps`), so a handler whose first
+/// instruction faults enters delivery again with nothing retired. It does so
+/// until the frames exhaust the stack: an 8086-family stack wraps within its
+/// segment and never does (8086 Family UM §2.3 p. 2-12), and a 32-bit stack
+/// takes up to 2^32 / 12 frames. The return is at a boundary
+/// and resumable. The value is an engine choice (ASSUMED): one boundary takes
+/// at most an owned continuation, an NMI, an IRQ and the single-step trap
+/// after a unit (spec.md §17.10), so a guest that retires instructions never
+/// reaches it.
+const DELIVERY_STALL_LIMIT: u32 = 1024;
+
+#[derive(Clone, Copy, Default)]
+struct DeliveryStall {
+    steps: u64,
+    count: u32,
+}
+impl DeliveryStall {
+    /// Record a completed delivery at the run's unit count `steps`. True at
+    /// the `DELIVERY_STALL_LIMIT`th delivery with no unit since the first.
+    #[cold]
+    #[inline(never)]
+    fn delivered(&mut self, steps: u64) -> bool {
+        if self.count == 0 || self.steps != steps {
+            *self = Self { steps, count: 0 };
+        }
+        self.count += 1;
+        self.count >= DELIVERY_STALL_LIMIT
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct MachineBoundary {
     task_pending: bool,
@@ -2142,6 +2174,7 @@ impl Vcpu {
             BOUNDED.then_some(budget)
         };
         let mut steps = 0;
+        let mut stall = DeliveryStall::default();
         let mut alias_steps = crate::interp::StepContext::new(budget);
         let model = self.legacy_model.unwrap_or(LegacyCpuModel {
             generation: CpuGeneration::I286,
@@ -2219,6 +2252,12 @@ impl Vcpu {
                                 }
                             };
                             direct_bus = raw_direct(&self.cpu);
+                            if stall.delivered(steps) {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(Exit::BudgetExhausted),
+                                });
+                            }
                             continue;
                         }
                         External::Stop(exit) => {
@@ -2289,6 +2328,12 @@ impl Vcpu {
                             }
                         };
                         direct_bus = raw_direct(&self.cpu);
+                        if stall.delivered(steps) {
+                            return DispatchResult::Stepped(StepRun {
+                                steps,
+                                stop: StepStop::Exit(Exit::BudgetExhausted),
+                            });
+                        }
                         continue;
                     }
                     if options.stop_when_irq_ready
@@ -2407,6 +2452,12 @@ impl Vcpu {
                                     }
                                 };
                                 direct_bus = raw_direct(&self.cpu);
+                                if stall.delivered(steps) {
+                                    return DispatchResult::Stepped(StepRun {
+                                        steps,
+                                        stop: StepStop::Exit(Exit::BudgetExhausted),
+                                    });
+                                }
                                 continue;
                             }
                             Err(exit) => {
@@ -2715,6 +2766,12 @@ impl Vcpu {
                                         }
                                     };
                                     direct_bus = raw_direct(&self.cpu);
+                                    if stall.delivered(steps) {
+                                        return DispatchResult::Stepped(StepRun {
+                                            steps,
+                                            stop: StepStop::Exit(Exit::BudgetExhausted),
+                                        });
+                                    }
                                     continue;
                                 }
                                 Err(exit) => {
