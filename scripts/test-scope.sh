@@ -117,6 +117,8 @@ path_class() {
         backlog/*) echo docs; return ;;
         # CI checks out without submodules; no gate reads the oracle stash.
         oracles | oracles/*) echo docs; return ;;
+        # Serena's project config for code-navigation tools; no build reads it.
+        .serena/*) echo docs; return ;;
     esac
     for pattern in "${legacy_paths[@]}"; do
         # shellcheck disable=SC2053 # the right-hand side is a glob on purpose

@@ -104,6 +104,7 @@ class Classification(unittest.TestCase):
             "bench/README.md": "docs",
             ".agents/skills/backlog/SKILL.md": "docs",
             "oracles": "docs",
+            ".serena/project.yml": "docs",
             "x86jit-elf/README.md": "shared",
             "x86jit-cranelift/tests/snapshots/application/Long64-call.txt": "shared",
             "scripts/notes.md": "shared",
