@@ -3183,12 +3183,40 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 );
                 return Err(crate::fault::qualify_legacy_bus(exit, at, physical));
             }
+            use crate::x87::FpuKind as K;
+            if matches!(
+                kind,
+                K::Fldcw | K::Fldenv | K::Frstor | K::Fnstenv | K::Fnsave | K::Fninit | K::Fnclex
+            ) {
+                // SDM Vol 1 §8.1.3.3 p. 8-5; Intel486 PRM §15.1.2
+                // pp. 15-2–3 (387 witness, §25.1 pp. 25-1–2): ES/B
+                // summarize flags whose current masks are clear. Refresh after
+                // the transfer commits so stores retain the pre-change image.
+                // 80286/287 PRM Part II Ch. 1, "The NPX Status Word",
+                // p. 1-10 gives the same ES rule, but B denotes execution/error
+                // busy rather than mirroring ES; retain that model's B policy.
+                let summary = match context.generation {
+                    crate::CpuGeneration::I386 => 0x8080,
+                    crate::CpuGeneration::I286 => 0x0080,
+                    crate::CpuGeneration::I8086 => 0,
+                };
+                let pending = cpu.fpu_sw & !cpu.fpu_cw & 0x3f != 0;
+                cpu.fpu_sw = (cpu.fpu_sw & !summary) | if pending { summary } else { 0 };
+            }
             crate::x87::record_x87_instruction(
                 cpu,
                 read_val(*operand_offset, temps),
                 ir.guest_start,
                 *instruction,
             );
+            if context.generation == crate::CpuGeneration::I386
+                && instruction & crate::x87::X87_RECORD != 0
+            {
+                // Intel486 PRM §15.1.6 p. 15-8, second witness for the 387
+                // programming model: each non-control ESC records its opcode.
+                // SDM Vol 1 §8.1.9.1 p. 8-10 describes this original policy.
+                cpu.fpu_fop = *instruction as u16 & 0x7ff;
+            }
             None
         }
         IrOp::SegLimitCheck {

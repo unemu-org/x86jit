@@ -1810,6 +1810,49 @@ pub(super) fn lower(
             // WAIT operation handles the configured coprocessor's errors.
             control::lift_x87(insn, ops, tg)?;
         }
+        _ if context.generation == crate::CpuGeneration::I386
+            && insn.cpuid_features().iter().any(|feature| {
+                matches!(
+                    feature,
+                    iced_x86::CpuidFeature::FPU
+                        | iced_x86::CpuidFeature::FPU287
+                        | iced_x86::CpuidFeature::FPU387
+                )
+            }) =>
+        {
+            // 80386 PRM §§11.1.1–11.1.2 p. 11-1: ESC uses the attached
+            // 387 in either regime. SDM Vol 1 §8.1.10, Figs. 8-9–8-12
+            // pp. 8-11–12: PE and operand size select the environment image.
+            use crate::x87::{FpuKind as K, X87_ENV_REAL, X87_ENV16};
+            let environment = match insn.mnemonic() {
+                Fldenv => Some(K::Fldenv),
+                Fnstenv | Fstenv => Some(K::Fnstenv),
+                Fnsave | Fsave => Some(K::Fnsave),
+                Frstor => Some(K::Frstor),
+                _ => None,
+            };
+            if let Some(kind) = environment {
+                let (addr, operand_offset) = effective_address_parts(insn, ops, tg)?;
+                ops.push(IrOp::X87 {
+                    kind,
+                    addr,
+                    operand_offset,
+                    instruction: 0,
+                    fault: Default::default(),
+                    sti: if context.regime == crate::MachineRegime::Real {
+                        X87_ENV_REAL
+                    } else {
+                        0
+                    } | if matches!(insn.memory_size().size(), 14 | 94) {
+                        X87_ENV16
+                    } else {
+                        0
+                    },
+                });
+            } else {
+                control::lift_x87(insn, ops, tg)?;
+            }
+        }
         Cli => ops.push(IrOp::SetIf { value: false }),
         Sti => ops.push(IrOp::SetIf { value: true }),
         // Shared scalar lowering has no legacy control/stack assumptions here.

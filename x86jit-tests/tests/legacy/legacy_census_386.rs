@@ -1,4 +1,5 @@
 //! Opt-in runtime census. Run with `--ignored --nocapture`; writes CENSUS_386_OUT.
+//! D8–DF probes attach `FpuModel::Present` (the I80386 387 pairing).
 //! The opcode and group masks follow 80386 PRM Appendix A, pp. A-4–A-8.
 //! Decoder metadata supplies lengths/labels, never the historical opcode membership.
 #[path = "../support/descriptor_fixture.rs"]
@@ -288,7 +289,11 @@ fn setup(p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu) {
     } else {
         descriptor_fixture::setup(CpuModel::I80386, &bytes)
     };
-    cpu.set_fpu_model(FpuModel::None);
+    cpu.set_fpu_model(if p.x87 {
+        FpuModel::Present
+    } else {
+        FpuModel::None
+    });
     vm.write_bytes(0x1800, &[0xf4]).unwrap();
     cpu.cpu.rip = 0x1000;
     cpu.cpu.gpr[..8].copy_from_slice(&[7, 1, 0, 0x90f0, 0x8000, 0x8100, 0x6000, 0x7000]);
@@ -649,6 +654,11 @@ fn runtime_census() {
             )
             .unwrap();
         }
+        assert_eq!(
+            counts.get("x87-refused").copied().unwrap_or(0),
+            0,
+            "x87 must not refuse the Machine context in {mode:?}"
+        );
         let count = |category: &str| counts.get(category).copied().unwrap_or(0);
         let integer_total: usize = counts
             .iter()

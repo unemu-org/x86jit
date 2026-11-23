@@ -16,12 +16,12 @@ use x86jit_core::{
 // kept UnknownInstruction.
 #[test]
 fn checked_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_490));
+    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_498));
 }
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_538));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_722));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {
@@ -171,6 +171,18 @@ fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {
                             cpu.cpu.flags,
                             cpu.cpu.rflags_system,
                             cpu.cpu.legacy,
+                            (
+                                cpu.cpu.fpr,
+                                cpu.cpu.fpu_cw,
+                                cpu.cpu.fpu_sw,
+                                cpu.cpu.fpu_top,
+                                cpu.cpu.fpu_empty,
+                                cpu.cpu.fpu_fip,
+                                cpu.cpu.fpu_fcs,
+                                cpu.cpu.fpu_fop,
+                                cpu.cpu.fpu_fdp,
+                                cpu.cpu.fpu_fds,
+                            ),
                             [
                                 cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs,
                                 cpu.cpu.gs,
@@ -195,6 +207,18 @@ fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {
                                 cpu.cpu.flags,
                                 cpu.cpu.rflags_system,
                                 cpu.cpu.legacy,
+                                (
+                                    cpu.cpu.fpr,
+                                    cpu.cpu.fpu_cw,
+                                    cpu.cpu.fpu_sw,
+                                    cpu.cpu.fpu_top,
+                                    cpu.cpu.fpu_empty,
+                                    cpu.cpu.fpu_fip,
+                                    cpu.cpu.fpu_fcs,
+                                    cpu.cpu.fpu_fop,
+                                    cpu.cpu.fpu_fdp,
+                                    cpu.cpu.fpu_fds,
+                                ),
                                 [
                                     cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs,
                                     cpu.cpu.gs,
@@ -202,7 +226,7 @@ fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {
                             );
                             assert_eq!(
                                 after, before,
-                                "instruction bytes={code:02x?} {:?}, memory kind {kind}, stop={:?}; partial state (GPR/flags/system/hidden-cache/selectors)",
+                                "instruction bytes={code:02x?} {:?}, memory kind {kind}, stop={:?}; partial state (GPR/flags/system/hidden-cache/x87/selectors)",
                                 insn.mnemonic(), r.stop()
                             );
                         }

@@ -964,9 +964,10 @@ fn env28(cpu: &CpuState, real: bool) -> [u8; 28] {
     buf
 }
 
-// SDM Vol 1 §8.1.10, Fig. 8-12: 14-byte real-address environment.
-fn env14(cpu: &CpuState) -> [u8; 14] {
-    let wide = env28(cpu, true);
+// SDM Vol 1 §8.1.10, Figs. 8-11–8-12 p. 8-12: selector pairs in
+// protected mode; packed 20-bit pointers and opcode in real mode.
+fn env14(cpu: &CpuState, real: bool) -> [u8; 14] {
+    let wide = env28(cpu, real);
     let mut buf = [0u8; 14];
     for (dst, src) in [0, 4, 8, 12, 16, 20, 24].into_iter().enumerate() {
         buf[dst * 2..dst * 2 + 2].copy_from_slice(&wide[src..src + 2]);
@@ -974,12 +975,18 @@ fn env14(cpu: &CpuState) -> [u8; 14] {
     buf
 }
 
-fn load_env14(cpu: &mut CpuState, buf: &[u8]) {
+fn load_env14(cpu: &mut CpuState, buf: &[u8], real: bool) {
     let mut wide = [0u8; 28];
     for (src, dst) in [0, 4, 8, 12, 16, 20, 24].into_iter().enumerate() {
         wide[dst..dst + 2].copy_from_slice(&buf[src * 2..src * 2 + 2]);
     }
-    load_env28(cpu, &wide, true);
+    // The 16-bit protected image has no opcode field (Fig. 8-11).
+    // ASSUMED: retain FOP when this image cannot supply it.
+    let fop = cpu.fpu_fop;
+    load_env28(cpu, &wide, real);
+    if !real {
+        cpu.fpu_fop = fop;
+    }
 }
 
 /// The full status word: TOP from `fpu_top`, everything else from `fpu_sw`
@@ -1039,10 +1046,9 @@ fn load_env28(cpu: &mut CpuState, buf: &[u8; 28], real: bool) {
 /// ES (bit 7) is NOT one of the six. It is set when any **unmasked** exception flag is
 /// set: "if an exception flag is masked, the x87 FPU will still set the appropriate flag
 /// if the associated exception occurs, but it will not set the ES flag" (same section).
-/// So it is recomputed from the whole status word against the current masks, not ORed in
-/// per operation — a later `fldcw` that unmasks something does not retroactively set it,
-/// but the next raise sees the new masks. B (bit 15) "reflects the contents of the ES
-/// flag" and is "included for 8087 compatibility only", so it simply mirrors it.
+/// This routine sets ES/B when a sticky flag is unmasked. Machine control-word and
+/// environment changes refresh summaries at their commit point. B (bit 15) "reflects
+/// the contents of the ES flag" (same section).
 ///
 /// Returns whether an exception is unmasked. Pre-operation exceptions abandon the
 /// instruction (SDM Vol 1 §4.9.2); register post-operation exceptions retain their
@@ -1973,7 +1979,7 @@ fn exec_x87_inner<M: FpMem>(
         }
         Fnstenv => {
             let stored = if sti & X87_ENV16 != 0 {
-                mem.store(addr, &env14(cpu))
+                mem.store(addr, &env14(cpu, sti & X87_ENV_REAL != 0))
             } else {
                 mem.store(addr, &env28(cpu, sti & X87_ENV_REAL != 0))
             };
@@ -1992,7 +1998,7 @@ fn exec_x87_inner<M: FpMem>(
                 return Some((mem.fault_addr(addr), false));
             }
             if sti & X87_ENV16 != 0 {
-                load_env14(cpu, &buf);
+                load_env14(cpu, &buf, sti & X87_ENV_REAL != 0);
             } else {
                 load_env28(cpu, &buf, sti & X87_ENV_REAL != 0);
             }
@@ -2005,7 +2011,7 @@ fn exec_x87_inner<M: FpMem>(
             let mut buf = [0u8; 108];
             if kind == Fnsave {
                 if sti & X87_ENV16 != 0 {
-                    buf[..env_len].copy_from_slice(&env14(cpu));
+                    buf[..env_len].copy_from_slice(&env14(cpu, sti & X87_ENV_REAL != 0));
                 } else {
                     buf[..env_len].copy_from_slice(&env28(cpu, sti & X87_ENV_REAL != 0));
                 }
@@ -2022,7 +2028,7 @@ fn exec_x87_inner<M: FpMem>(
                 return Some((mem.fault_addr(addr), false));
             }
             if sti & X87_ENV16 != 0 {
-                load_env14(cpu, &buf);
+                load_env14(cpu, &buf, sti & X87_ENV_REAL != 0);
             } else {
                 let env: &[u8; 28] = buf[..28].try_into().unwrap();
                 load_env28(cpu, env, sti & X87_ENV_REAL != 0);

@@ -449,6 +449,90 @@ fn conflict_expectation(
                     store(&mut memory, next_sp, insn.next_ip(), 4);
                 }
             }
+            // SDM Vol 1 §8.1.10 pp. 8-11–12, Fig. 8-10; Vol 2A
+            // §3.3 FRSTOR p. 3-373 and FSAVE/FNSAVE p. 3-375:
+            // 66h selects a 28-byte real-mode environment plus 80 bytes
+            // of logical ST registers. Application Real16 refuses these
+            // 108-byte forms; Machine I386/387 executes them.
+            Fnsave_m108byte | Frstor_m108byte => {
+                let at = address();
+                if mmio && (0x4000..0x5000).contains(&at) {
+                    // The x87 helper reports trapped image transfers as
+                    // unmapped, with no state or RAM change in this fixture.
+                    return Err(Exit::unmapped_memory(
+                        at,
+                        if insn.code() == Frstor_m108byte {
+                            x86jit_core::AccessKind::Read
+                        } else {
+                            x86jit_core::AccessKind::Write
+                        },
+                    ));
+                }
+                let at = at as usize;
+                if insn.code() == Frstor_m108byte {
+                    let word = |off| u16::from_le_bytes([memory[at + off], memory[at + off + 1]]);
+                    let dword = |off| {
+                        u32::from_le_bytes(memory[at + off..at + off + 4].try_into().unwrap())
+                    };
+                    // SDM Vol 1 §8.1.5 pp. 8-7–8 defines the control
+                    // fields; retain the existing reserved-bit normalization.
+                    cpu.fpu_cw = (word(0) | 0x40) & 0x1f7f;
+                    let sw = word(4);
+                    // SDM Vol 1 §8.1.3.3 p. 8-5; Intel486 PRM
+                    // §15.1.2 pp. 15-2–3: ES/B summarize unmasked flags.
+                    cpu.fpu_sw = (sw & !0xb880)
+                        | if sw & !cpu.fpu_cw & 0x3f != 0 {
+                            0x8080
+                        } else {
+                            0
+                        };
+                    cpu.fpu_top = u32::from((sw >> 11) & 7);
+                    // SDM Vol 1 §8.1.7 p. 8-8: tags index physical
+                    // registers; 11b denotes an empty register.
+                    let tags = word(8);
+                    cpu.fpu_empty = 0;
+                    for i in 0..8 {
+                        if tags >> (i * 2) & 3 == 3 {
+                            cpu.fpu_empty |= 1 << i;
+                        }
+                        cpu.fpr[(cpu.fpu_top as usize + i) & 7]
+                            .copy_from_slice(&memory[at + 28 + i * 10..at + 38 + i * 10]);
+                    }
+                    cpu.fpu_fip = u64::from(word(12)) | (u64::from(dword(16) & 0x0fff_f000) << 4);
+                    cpu.fpu_fdp = u64::from(word(20)) | (u64::from(dword(24) & 0x0fff_f000) << 4);
+                    cpu.fpu_fop = word(16) & 0x7ff;
+                    cpu.fpu_fcs = 0;
+                    cpu.fpu_fds = 0;
+                } else {
+                    // The fixture starts with eight valid, nonzero registers
+                    // at TOP=0 and an initialized environment. Pin its input
+                    // before using the corresponding literal image.
+                    assert_eq!(initial.fpu_cw, 0x037f);
+                    assert_eq!(
+                        (initial.fpu_sw, initial.fpu_top, initial.fpu_empty),
+                        (0, 0, 0)
+                    );
+                    assert_eq!(
+                        (initial.fpu_fip, initial.fpu_fdp, initial.fpu_fop),
+                        (0, 0, 0)
+                    );
+                    assert_eq!((initial.fpu_fcs, initial.fpu_fds), (0, 0));
+                    // ASSUMED: reserved image words are FFFFh, as in the
+                    // Machine image policy. No other bytes are excluded.
+                    for (i, value) in [0xffff037fu32, 0xffff0000, 0xffff0000, 0, 0, 0, 0]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        memory[at + i * 4..at + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                    for i in 0..8 {
+                        memory[at + 28 + i * 10..at + 38 + i * 10].copy_from_slice(&initial.fpr[i]);
+                    }
+                    // FSAVE/FNSAVE initializes the environment but preserves
+                    // register contents (Vol 2A §3.3 FINIT/FNINIT p. 3-345).
+                    cpu.fpu_empty = 0xff;
+                }
+            }
             other => panic!("missing architectural conflict expectation: {other:?}"),
         }
         cpu.gpr[4] = (initial.gpr[4] & !0xffff) | (next_sp & 0xffff);
@@ -522,9 +606,59 @@ fn application_real16_forms_have_legacy_parity() {
                     let machine = conflict_expectation(&b, &bc, &insn, generation, mmio);
                     (alias, machine)
                 });
+                let expected = expected.or_else(|| {
+                    (generation == CpuGeneration::I386
+                        && !absent
+                        && !emulation
+                        && matches!(code, Code::Fnsave_m108byte | Code::Frstor_m108byte))
+                    .then(|| {
+                        architectural.insert(format!("{code:?} {bytes:02x?}"));
+                        let mut refused = [0; 15];
+                        refused[..bytes.len()].copy_from_slice(bytes);
+                        let alias = (
+                            ac.cpu.clone(),
+                            memory_image(&a),
+                            StepStop::Exit(Exit::unknown_instruction(
+                                ac.cpu.rip,
+                                refused,
+                                bytes.len() as u8,
+                            )),
+                            0,
+                        );
+                        (
+                            alias,
+                            conflict_expectation(&b, &bc, &insn, generation, mmio),
+                        )
+                    })
+                });
+                let restored_status = (generation == CpuGeneration::I386
+                    && !absent
+                    && !emulation
+                    && !mmio
+                    && matches!(
+                        code,
+                        Code::Fldenv_m14byte | Code::Fldenv_m28byte | Code::Frstor_m94byte
+                    ))
+                .then(|| {
+                    assert_eq!(insn.memory_index(), iced_x86::Register::None);
+                    let mask = match insn.memory_base() {
+                        iced_x86::Register::BX => 0xffff,
+                        iced_x86::Register::EBX => 0xffff_ffff,
+                        other => panic!("unexpected x87 address base: {other:?}"),
+                    };
+                    let at = (ac.cpu.gpr[3] + insn.memory_displacement64()) & mask;
+                    let mut sw = [0; 2];
+                    a.read_bytes(
+                        at + if *code == Code::Fldenv_m28byte { 4 } else { 2 },
+                        &mut sw,
+                    )
+                    .unwrap();
+                    u16::from_le_bytes(sw)
+                });
                 let empty_output =
                     (generation == CpuGeneration::I286 && absent && i286_empty_output(*code))
                         .then(|| (ac.cpu.clone(), memory_image(&a)));
+                let initial_fop = ac.cpu.fpu_fop;
                 let ar = run_form(&a, &mut ac, bytes);
                 let br = run_form(&b, &mut bc, bytes);
                 if let Some((initial, memory)) = empty_output {
@@ -633,7 +767,79 @@ fn application_real16_forms_have_legacy_parity() {
                 }
                 let am = memory_image(&a);
                 let bm = memory_image(&b);
-                let states = image(&ac) == image(&bc) && am == bm;
+                let mut expected_machine = ac.cpu.clone();
+                if let Some(sw) = restored_status {
+                    // SDM Vol 1 §8.1.3.3 p. 8-5; Intel486 PRM §15.1.2
+                    // pp. 15-2–3: the 387 recomputes ES/B after FLDENV and
+                    // FRSTOR from the loaded flags and masks. Application
+                    // Real16 retains those two bits from the memory image.
+                    // Compare every other status bit and field unchanged.
+                    assert_eq!(ar.steps(), 1, "{code:?}");
+                    assert_eq!(br.steps(), 1, "{code:?}");
+                    assert!(matches!(ar.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                    assert!(matches!(br.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                    assert_eq!(ac.cpu.fpu_sw, sw & !0x3800, "Application SW: {code:?}");
+                    expected_machine.fpu_sw = (ac.cpu.fpu_sw & !0x8080)
+                        | if sw & !ac.cpu.fpu_cw & 0x3f != 0 {
+                            0x8080
+                        } else {
+                            0
+                        };
+                }
+                if generation == CpuGeneration::I386
+                    && !absent
+                    && !emulation
+                    && br.steps() == 1
+                    && matches!(br.stop(), StepStop::Exit(Exit::BudgetExhausted))
+                    && insn
+                        .cpuid_features()
+                        .iter()
+                        .any(|f| matches!(f, F::FPU | F::FPU287 | F::FPU387))
+                    && !matches!(
+                        insn.mnemonic(),
+                        iced_x86::Mnemonic::Fldcw
+                            | iced_x86::Mnemonic::Fnstcw
+                            | iced_x86::Mnemonic::Fstcw
+                            | iced_x86::Mnemonic::Fnstsw
+                            | iced_x86::Mnemonic::Fstsw
+                            | iced_x86::Mnemonic::Fnstenv
+                            | iced_x86::Mnemonic::Fstenv
+                            | iced_x86::Mnemonic::Fldenv
+                            | iced_x86::Mnemonic::Fninit
+                            | iced_x86::Mnemonic::Finit
+                            | iced_x86::Mnemonic::Fnclex
+                            | iced_x86::Mnemonic::Fclex
+                            | iced_x86::Mnemonic::Wait
+                            | iced_x86::Mnemonic::Fnsave
+                            | iced_x86::Mnemonic::Fsave
+                            | iced_x86::Mnemonic::Frstor
+                    )
+                {
+                    // SDM Vol 1 §§8.1.9–8.1.9.1 p. 8-10, Fig. 8-8:
+                    // the 387 records every non-control opcode, while the
+                    // Application alias uses Intel's unmasked-exception policy.
+                    // 80386 PRM §§11.1.1–11.1.2 p. 11-1 identifies the 387
+                    // interface; Intel486 PRM §15.1.6 pp. 15-8–9 witnesses
+                    // opcode recording and real-mode images for that model
+                    // (§25.1 pp. 25-1–2). SDM §8.1.10 p. 8-12, Fig. 8-12
+                    // likewise includes FOP in the 16-bit real-mode image.
+                    let opcode = bytes
+                        .iter()
+                        .position(|b| (0xd8..=0xdf).contains(b))
+                        .unwrap();
+                    let fop = (u16::from(bytes[opcode] & 7) << 8) | u16::from(bytes[opcode + 1]);
+                    assert_eq!(
+                        ac.cpu.fpu_fop,
+                        if ac.cpu.fpu_sw & 0x80 != 0 {
+                            fop
+                        } else {
+                            initial_fop
+                        },
+                        "Application FOP: {code:?} {bytes:02x?}"
+                    );
+                    expected_machine.fpu_fop = fop;
+                }
+                let states = state_image(&expected_machine) == image(&bc) && am == bm;
                 let exits = exit_image(ar.stop()) == exit_image(br.stop())
                     || matches!(br.stop(), StepStop::Exit(Exit::Exception { vector, .. }) if ac.cpu.rip == 0x1801 + u64::from(*vector) * 4);
                 if !states || !exits {
