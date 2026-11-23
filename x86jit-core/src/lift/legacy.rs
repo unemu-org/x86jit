@@ -1,7 +1,7 @@
 //! Explicit-context legacy lowering (decision-18 §1; spec.md §§7, 17).
 use super::*;
 use crate::legacy::{
-    ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
+    ControlRegister, DebugTestRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
     SelectorDestination, SystemRegister,
 };
 
@@ -153,7 +153,7 @@ pub(crate) fn instruction(
         code,
         u64::from(ip),
         // 80386 PRM §17 MOV to/from Special Registers, p. 17-111:
-        // recognize test-register MOV so deferred system accesses are typed.
+        // recognize the test-register MOV encodings.
         crate::model::decode::decoder_options_for_generation(context.generation),
     );
     let mut insn = decoder.decode();
@@ -590,6 +590,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
                     | L::DirectStackAddress { .. }
                     | L::ReadSelector { .. }
                     | L::ReadControl { .. }
+                    | L::ReadDebugTest { .. }
                     | L::ReadSystemSegment { .. }
                     | L::SharedWalk
                     | L::Checkpoint
@@ -1249,18 +1250,36 @@ pub(super) fn lower(
                 emit_write(ops, tg, target, Val::Temp(dst));
             }
         }
-        // Debug/test-register execution remains outside the activated system seam.
         Mov if insn.op_register(0).is_dr()
             || insn.op_register(1).is_dr()
             || insn.op_register(0).is_tr()
             || insn.op_register(1).is_tr() =>
         {
-            emit(
-                ops,
-                L::Refuse {
-                    operation: crate::UnsupportedSystemOperation::LegacyInstruction,
-                },
-            );
+            let writing = insn.op_register(0).is_dr() || insn.op_register(0).is_tr();
+            let register = match insn.op_register(u32::from(!writing)) {
+                Register::DR0 => DebugTestRegister::Dr0,
+                Register::DR1 => DebugTestRegister::Dr1,
+                Register::DR2 => DebugTestRegister::Dr2,
+                Register::DR3 => DebugTestRegister::Dr3,
+                // SDM Vol 2B §4.3 MOV DR p. 4-35 explicitly describes
+                // Intel386 compatibility: DR4/DR5 alias DR6/DR7.
+                Register::DR4 | Register::DR6 => DebugTestRegister::Dr6,
+                Register::DR5 | Register::DR7 => DebugTestRegister::Dr7,
+                Register::TR6 => DebugTestRegister::Tr6,
+                Register::TR7 => DebugTestRegister::Tr7,
+                _ => unreachable!("generation decode excludes other special registers"),
+            };
+            // 80386 PRM §17 MOV p. 17-111: always a 32-bit GPR transfer,
+            // irrespective of 66h. Preserve undefined arithmetic flags (ASSUMED).
+            if writing {
+                let value = lower_read(insn, 1, ops, tg)?;
+                emit(ops, L::WriteDebugTest { register, value });
+            } else {
+                let dst = tg.fresh();
+                emit(ops, L::ReadDebugTest { dst, register });
+                let target = lower_write_target(insn, 0, ops, tg)?;
+                emit_write(ops, tg, target, Val::Temp(dst));
+            }
         }
         Mov if insn.op_register(0).is_segment_register()
             || insn.op_register(1).is_segment_register() =>

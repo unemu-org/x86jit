@@ -828,6 +828,14 @@ pub enum LegacyOp {
         register: ControlRegister,
         value: crate::ir::Val,
     },
+    ReadDebugTest {
+        dst: crate::ir::Temp,
+        register: DebugTestRegister,
+    },
+    WriteDebugTest {
+        register: DebugTestRegister,
+        value: crate::ir::Val,
+    },
     LoadMsw {
         value: crate::ir::Val,
     },
@@ -1124,6 +1132,19 @@ pub enum ControlRegister {
     Cr0,
     Cr2,
     Cr3,
+}
+
+/// Indices into `CpuState::debug_test_registers`, not hardware register numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugTestRegister {
+    Dr0,
+    Dr1,
+    Dr2,
+    Dr3,
+    Dr6,
+    Dr7,
+    Tr6,
+    Tr7,
 }
 
 #[derive(Clone, Copy, Debug)]

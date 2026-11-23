@@ -10,6 +10,7 @@ mod legacy_a20;
 mod legacy_alias;
 mod legacy_bus_width;
 mod legacy_contract;
+mod legacy_debug_test;
 mod legacy_delivery_liveness;
 mod legacy_delivery_log;
 mod legacy_direct;

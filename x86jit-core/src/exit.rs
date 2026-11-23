@@ -70,6 +70,12 @@ pub enum UnsupportedSystemOperation {
     LegacyPrivilegeTransition,
     LegacyTaskPaging,
     LegacyTaskDebugTrap,
+    /// ASSUMED engine boundary: a DR7 write enabling address breakpoints or
+    /// general detection is refused without changing state or retiring.
+    LegacyDebugBreakpoints,
+    /// Every TR6 write issues a TLB command (80386 PRM §10.6.2 p. 10-14).
+    /// ASSUMED engine boundary: refuse without changing state or retiring.
+    LegacyTlbTest,
     /// NEC V20/V30: BRKEM while the MD write-enable latch is set. Emulation
     /// mode cannot be nested and "normal operation cannot be expected"
     /// (NEC V20/V30 UM §8 p. 8-5).

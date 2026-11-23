@@ -465,6 +465,11 @@ pub struct CpuState {
     pub task_io_map_base: u16,
     /// 80386 PRM §12.3.1.5 p. 12-8: incoming TSS T bit awaiting debug support.
     pub task_debug_trap: u8,
+    /// I80386 Machine register images, indexed by `legacy::DebugTestRegister`:
+    /// DR0–DR3, DR6, DR7, TR6, TR7 (80386 PRM §12.2 Fig. 12-1 p. 12-3;
+    /// §10.6.2 Fig. 10-4 p. 10-15). Inert in Application profiles.
+    /// Appended to preserve existing compiled-code offsets.
+    pub debug_test_registers: [u32; 8],
 }
 
 /// Coprocessor policy independent of the CPU model (decision-23 §4).
@@ -656,6 +661,11 @@ impl Default for CpuState {
             fpu_emulation: false,
             task_io_map_base: 0,
             task_debug_trap: 0,
+            // ASSUMED: deterministic reserved/reset images for the 386; the
+            // PRM marks reserved bits "do not define" (§12.2 Fig. 12-1 p. 12-3).
+            // Use the SDM Vol 3A §12.1 Table 12-1 p. 12-3 DR6/DR7 images.
+            // TR reset values are unspecified here; choose zero.
+            debug_test_registers: [0, 0, 0, 0, 0xffff_0ff0, 0x400, 0, 0],
         }
     }
 }

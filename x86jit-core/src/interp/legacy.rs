@@ -4,8 +4,8 @@ use super::*;
 mod privilege;
 pub(crate) mod tasks;
 use crate::legacy::{
-    self, ControlRegister, DescriptorQuery, LegacyOp as L, MachineContext, SegmentId,
-    SelectorDestination, SystemRegister,
+    self, ControlRegister, DebugTestRegister, DescriptorQuery, LegacyOp as L, MachineContext,
+    SegmentId, SelectorDestination, SystemRegister,
 };
 
 #[derive(Default)]
@@ -3575,6 +3575,48 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                         }
                     }
                 }
+                L::ReadDebugTest { dst, register } => {
+                    temps[*dst as usize] = u64::from(cpu.debug_test_registers[*register as usize]);
+                }
+                L::WriteDebugTest { register, value } => {
+                    let value = read_val(*value, temps) as u32;
+                    let value = match register {
+                        DebugTestRegister::Dr6 => {
+                            // 80386 PRM §12.2 Fig. 12-1 pp. 12-3–5 defines
+                            // B0–B3, BD, BS, BT; reserved bits are "do not define".
+                            // ASSUMED: freeze reserved bits to the SDM Vol 3A
+                            // §12.1 Table 12-1 p. 12-3 image, including bit 12=0.
+                            (value & 0x0000_e00f) | 0xffff_0ff0
+                        }
+                        DebugTestRegister::Dr7 => {
+                            // 80386 PRM §12.2.2 pp. 12-3–4: L0–L3/G0–G3
+                            // enable breakpoints. SDM Vol 3B §20.2.4 p. 20-5:
+                            // GD enables debug-register access traps.
+                            // ASSUMED: refuse before committing, including GD,
+                            // so unsupported debug traps cannot be silently lost.
+                            if value & 0x20ff != 0 {
+                                return Err(refusal(
+                                    cpu,
+                                    crate::UnsupportedSystemOperation::LegacyDebugBreakpoints,
+                                ));
+                            }
+                            // ASSUMED: freeze reserved bits (PRM Fig. 12-1
+                            // p. 12-3) to the SDM Table 12-1 p. 12-3 image.
+                            (value & 0xffff_23ff) | 0x400
+                        }
+                        DebugTestRegister::Tr6 => {
+                            // 80386 PRM §10.6.2 p. 10-14: both C=0 (write)
+                            // and C=1 (lookup) issue an immediate TLB command.
+                            // ASSUMED: refuse every command, also with PG=0.
+                            return Err(refusal(
+                                cpu,
+                                crate::UnsupportedSystemOperation::LegacyTlbTest,
+                            ));
+                        }
+                        _ => value,
+                    };
+                    cpu.debug_test_registers[*register as usize] = value;
+                }
                 L::LoadMsw { value } => {
                     let value = legacy::lmsw_value(cpu.legacy.cr0, read_val(*value, temps) as u16);
                     outcome.context_changed = write_cr0(cpu, value)?;
@@ -4227,7 +4269,10 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     cpu.write_gpr(5, value, *size);
                 }
                 L::CheckTaskReturn => {
+                    // 80386 PRM §17 IRET p. 17-74: PE=0 pops the stack
+                    // before considering NT. Retain the I286 boundary unchanged.
                     if context.regime == legacy::MachineRegime::Real
+                        && context.generation == crate::CpuGeneration::I286
                         && cpu.rflags_system & 0x4000 != 0
                     {
                         return Err(refusal(

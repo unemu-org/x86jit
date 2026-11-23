@@ -150,6 +150,67 @@ fn replace_page(vm: &mut Vm, at: u64, trap: bool) {
 }
 
 #[test]
+fn i386_task_switch_clears_dr7_le_and_preserves_ge() {
+    // 80386 PRM §12.2.2 p. 12-4: task switches clear LE and local
+    // enables, retaining GE/global enables. Breakpoint enables are refused
+    // at entry; write only LE/GE here. The fixed reserved bit 10 makes
+    // MOV DR7 of 300h read as 700h, then 600h after the task switch.
+    for wide in [false, true] {
+        for call in [false, true] {
+            let mut code = b"\x0f\x23\xf8".to_vec(); // MOV DR7,EAX.
+            code.extend(far(call, B));
+            let (vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &code);
+            vm.write_bytes(0x1800, b"\x0f\x21\xfb").unwrap(); // MOV EBX,DR7.
+            cpu.cpu.gpr[0] = 0x300;
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.debug_test_registers[5], 0x700);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.legacy.tr.selector, B);
+            assert_eq!(cpu.cpu.debug_test_registers[5], 0x600);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.gpr[3], 0x600);
+        }
+    }
+}
+
+#[test]
+fn restored_dr7_refusal_preserves_a_task_switch_mmio_handoff() {
+    for wide in [false, true] {
+        for stepped in [false, true] {
+            let (mut vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &far(false, B));
+            cpu.cpu.legacy.tr.cache.base = 0x7000;
+            replace_page(&mut vm, 0x7000, true);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            assert!(matches!(run.stop(), StepStop::Exit(Exit::MmioWrite { .. })));
+            cpu.complete_mmio_write();
+            cpu.cpu.debug_test_registers[5] |= 1;
+            let before = format!("{:?}", cpu.cpu);
+            let retired = cpu.retired_instructions();
+            let exit = if stepped {
+                let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 0);
+                let StepStop::Exit(exit) = run.stop() else {
+                    panic!("{:?}", run.stop());
+                };
+                exit.clone()
+            } else {
+                cpu.run(&vm, Some(1))
+            };
+            assert!(matches!(
+                exit,
+                Exit::UnsupportedSystemContext {
+                    operation: x86jit_core::UnsupportedSystemOperation::LegacyDebugBreakpoints,
+                    ..
+                }
+            ));
+            assert_eq!(format!("{:?}", cpu.cpu), before);
+            assert_eq!(cpu.retired_instructions(), retired);
+        }
+    }
+}
+
+#[test]
 fn jmp_to_tss_and_back_saves_state_and_sets_ts() {
     for (model, wide) in formats() {
         let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
@@ -814,6 +875,7 @@ fn typed_refusals_for_v86_and_task_debug_trap() {
     }
     let (vm, mut cpu) = setup_tasks(CpuModel::I80386, true, &far(true, B));
     put(&vm, base(B) + 0x64, 2, 1);
+    let dr6 = cpu.cpu.debug_test_registers[4];
     let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
     assert_eq!(run.steps(), 1);
     assert!(matches!(
@@ -832,6 +894,9 @@ fn typed_refusals_for_v86_and_task_debug_trap() {
         (B, 0x1800, 1)
     );
     assert_ne!(cpu.cpu.legacy.cr0 & 8, 0);
+    // T-bit traps are refused, not delivered; DR6.BT stays unchanged
+    // (80386 PRM §12.2.3 p. 12-4, §12.3.1.5 p. 12-8).
+    assert_eq!(cpu.cpu.debug_test_registers[4], dr6);
 }
 
 #[test]

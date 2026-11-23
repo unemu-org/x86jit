@@ -425,8 +425,12 @@ impl IrBlock {
                     crate::legacy::LegacyOp::CoprocessorOverrun { offset, .. } => {
                         check(&[*offset], &[])?
                     }
-                    crate::legacy::LegacyOp::ReadControl { dst, .. } => check(&[], &[*dst])?,
-                    crate::legacy::LegacyOp::WriteControl { value, .. } => check(&[*value], &[])?,
+                    crate::legacy::LegacyOp::ReadControl { dst, .. }
+                    | crate::legacy::LegacyOp::ReadDebugTest { dst, .. } => check(&[], &[*dst])?,
+                    crate::legacy::LegacyOp::WriteControl { value, .. }
+                    | crate::legacy::LegacyOp::WriteDebugTest { value, .. } => {
+                        check(&[*value], &[])?
+                    }
                     crate::legacy::LegacyOp::LoadMsw { value } => check(&[*value], &[])?,
                     crate::legacy::LegacyOp::ClearTs
                     | crate::legacy::LegacyOp::Loadall

@@ -1549,7 +1549,23 @@ impl Vcpu {
         }
     }
 
+    #[inline]
+    fn validate_legacy_debug_state(&self) -> Result<(), Exit> {
+        // 80386 PRM §12.2.2 p. 12-4: L0–L3/G0–G3 enable breakpoints;
+        // SDM Vol 3B §20.2.4 p. 20-5: GD enables debug-register traps.
+        // Apply the MOV DR7 refusal policy to embedder-restored images too.
+        if self.legacy_model.unwrap().generation == CpuGeneration::I386
+            && self.cpu.debug_test_registers[crate::legacy::DebugTestRegister::Dr7 as usize]
+                & 0x20ff
+                != 0
+        {
+            return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyDebugBreakpoints));
+        }
+        Ok(())
+    }
+
     pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
+        self.validate_legacy_debug_state()?;
         let model = self.legacy_model.expect("legacy model");
         if self.twenty_bit_model() {
             return Ok(crate::lift::i8086::CONTEXT);
@@ -1590,6 +1606,7 @@ impl Vcpu {
         if limit != Some(0)
             && !self.cpu.mmio_retry_active
             && self.cpu.task_debug_trap == 0
+            && self.validate_legacy_debug_state().is_ok()
             && self.cpu.rip <= u64::from(u32::MAX)
         {
             let execution = self.legacy_execution.as_mut().unwrap();
@@ -1614,6 +1631,7 @@ impl Vcpu {
         &mut self,
         limit: Option<u64>,
     ) -> Result<MachineContext, Exit> {
+        self.validate_legacy_debug_state()?;
         // Decision-24: edited state abandons the entire owned operation before
         // entry validation can reject its deliberately unfinished segment caches.
         // A zero-budget probe leaves continuations and completion inputs intact.
@@ -1748,6 +1766,14 @@ impl Vcpu {
     ) -> Result<(), Exit> {
         if context.generation == CpuGeneration::I8086 {
             return self.deliver_event20::<ROUTED, ORDER>(vm, event);
+        }
+        if context.generation == CpuGeneration::I386
+            && matches!(event.source, EventSource::SingleStep)
+        {
+            // 80386 PRM §12.2.3 pp. 12-4–5: single-step sets BS;
+            // DR6 status bits are sticky, including B0–B3, BD and BT.
+            self.cpu.debug_test_registers[crate::legacy::DebugTestRegister::Dr6 as usize] |=
+                1 << 14;
         }
         self.legacy_execution.as_mut().unwrap().rep_flags = None;
         self.legacy_execution

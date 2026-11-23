@@ -209,6 +209,7 @@ impl Owner {
             fpu_emulation,
             task_io_map_base,
             task_debug_trap,
+            debug_test_registers,
         ) && self.cpu.flags == cpu.flags
             && self.cpu.flags.pf_src == cpu.flags.pf_src
             && self.cpu.flags.af_src == cpu.flags.af_src
@@ -774,6 +775,9 @@ impl Pending {
                     self.committed = true;
                     if self.context.generation == CpuGeneration::I386 {
                         cpu.legacy.cr0 |= 8;
+                        // 80386 PRM §12.2.2 p. 12-4: a task switch clears
+                        // DR7.L0–L3 and LE, preserving the global enables/GE.
+                        cpu.debug_test_registers[DebugTestRegister::Dr7 as usize] &= !0x155;
                     }
                     // 286 PRM App. B p. B-12: TR changes before this limit
                     // check; TS is set only after the incoming registers load.

@@ -1024,10 +1024,13 @@ fn privileged_and_iopl_sensitive_instructions_check_before_any_effect() {
             let (vm, mut cpu) = world(model, 3, b"\x0f\x20\xc8", ExceptionDelivery::Outward);
             fault(&mut cpu, &vm, 6, None);
         }
-        // At CPL 0 the debug-register form keeps its refusal.
+        // 80386 PRM §17 MOV p. 17-111: CPL 0 may read DR7.
+        // ASSUMED: reserved/reset image from SDM Vol 3A §12.1
+        // Table 12-1 p. 12-3.
         if wide(model) {
             let (vm, mut cpu) = world(model, 0, b"\x0f\x21\xf8", ExceptionDelivery::Outward);
-            refused(&mut cpu, &vm, UnsupportedSystemOperation::LegacyInstruction);
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.gpr[0], 0x400);
         }
     }
 }

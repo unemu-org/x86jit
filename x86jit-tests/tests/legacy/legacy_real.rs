@@ -559,14 +559,14 @@ fn retained_code_and_stack_defaults_remain_independent_of_real_regime() {
 }
 
 #[test]
-fn segment_stack_forms_model_identification_and_task_return_refusal_cpu_model() {
-    model_api::with_cpu_model(segment_stack_forms_model_identification_and_task_return_refusal);
+fn segment_stack_forms_model_identification_and_real_task_flag_cpu_model() {
+    model_api::with_cpu_model(segment_stack_forms_model_identification_and_real_task_flag);
 }
 
 #[test]
-fn segment_stack_forms_model_identification_and_task_return_refusal() {
+fn segment_stack_forms_model_identification_and_real_task_flag() {
     // SDM Vol 2B §4.3 PUSH/POP; Vol 1 §21.1.2 (no 386 CPUID);
-    // decision-18 §2; Vol 3A §10.3 (NT task-return scope).
+    // decision-18 §2; 80386 PRM §17 IRET p. 17-74: NT is tested only with PE=1.
     let (vm, mut cpu) = setup(b"\x66\x0f\xa0\x66\x0f\xa9\xcf");
     cpu.cpu.fs = 0x1234;
     steps(&mut cpu, &vm, 1);
@@ -576,15 +576,13 @@ fn segment_stack_forms_model_identification_and_task_return_refusal() {
     assert_eq!(cpu.cpu.gs, 0x1234);
     assert_eq!(cpu.cpu.gpr[4], 0x8000);
     cpu.cpu.rflags_system = 0x4000;
-    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-    assert_eq!(run.steps(), 0);
-    assert!(matches!(
-        run.stop(),
-        StepStop::Exit(Exit::UnsupportedSystemContext {
-            operation: UnsupportedSystemOperation::LegacyTaskReturn,
-            ..
-        })
-    ));
+    vm.write_bytes(0x8000, b"\x00\x20\x00\x01\x02\x00").unwrap();
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(
+        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+        (0x100, 0x2000, 0x8006)
+    );
+    assert_eq!(cpu.cpu.rflags_system & 0x4000, 0);
     let (vm, mut cpu) = setup(b"\x0f\xa2");
     exception(&mut cpu, &vm, 6);
     // SDM Vol 2B §4.3 NOP: the multi-byte form is unavailable on I386.
@@ -898,42 +896,40 @@ fn ordinary_completion_clears_rf_but_zero_budget_faults_and_mmio_do_not() {
 }
 
 #[test]
-fn deferred_system_register_accesses_have_effect_free_typed_refusals_cpu_model() {
-    model_api::with_cpu_model(deferred_system_register_accesses_have_effect_free_typed_refusals);
+fn unsupported_debug_and_tlb_commands_have_effect_free_typed_refusals_cpu_model() {
+    model_api::with_cpu_model(unsupported_debug_and_tlb_commands_have_effect_free_typed_refusals);
 }
 
 #[test]
-fn deferred_system_register_accesses_have_effect_free_typed_refusals() {
-    // Decision-18 §4: system-register operations owned by later phases use a
-    // typed engine refusal. SDM Vol 2B §4.3 MOV to/from Control/Debug Registers;
-    // 80386 PRM §17 MOV to/from Special Registers, pp. 17-111 (page image checked).
-    for opcode in [0x21, 0x23, 0x24, 0x26] {
-        let registers: &[u8] = match opcode {
-            0x21 | 0x23 => &[0, 1, 2, 3, 6, 7],
-            _ => &[6, 7],
-        };
-        for &register in registers {
-            let (vm, mut cpu) = setup(&[0x0f, opcode, 0xc0 | (register << 3)]);
-            cpu.cpu.gpr[0] = 1;
-            cpu.cpu.rflags_system = 0x10000;
-            let before = format!("{:?}", cpu.cpu);
-            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-            assert_eq!(run.steps(), 0);
-            assert!(
-                matches!(
-                    run.stop(),
-                    StepStop::Exit(Exit::UnsupportedSystemContext {
-                        addr: 0x1000,
-                        operation: UnsupportedSystemOperation::LegacyInstruction,
-                        ..
-                    })
-                ),
-                "{opcode:02x}/{register}: {:?}",
-                run.stop()
-            );
-            assert_eq!(format!("{:?}", cpu.cpu), before);
-            assert_eq!(cpu.retired_instructions(), 0);
-        }
+fn unsupported_debug_and_tlb_commands_have_effect_free_typed_refusals() {
+    // 80386 PRM §12.2.2 pp. 12-3–4: DR7 enables address breakpoints.
+    // §10.6.2 p. 10-14: both TR6 commands start a TLB operation.
+    // ASSUMED engine boundary: refuse these writes before any state commits.
+    for (opcode, register, value, expected) in [
+        (
+            0x23,
+            7,
+            1,
+            UnsupportedSystemOperation::LegacyDebugBreakpoints,
+        ),
+        (0x26, 6, 0, UnsupportedSystemOperation::LegacyTlbTest),
+        (0x26, 6, 1, UnsupportedSystemOperation::LegacyTlbTest),
+    ] {
+        let (vm, mut cpu) = setup(&[0x0f, opcode, 0xc0 | (register << 3)]);
+        cpu.cpu.gpr[0] = value;
+        cpu.cpu.rflags_system = 0x10000;
+        let before = format!("{:?}", cpu.cpu);
+        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(
+            matches!(run.stop(), StepStop::Exit(Exit::UnsupportedSystemContext {
+                addr: 0x1000, operation, ..
+            }) if *operation == expected),
+            "{opcode:02x}/{register}: {:?}",
+            run.stop()
+        );
+        assert_eq!(format!("{:?}", cpu.cpu), before);
+        assert_eq!(cpu.retired_instructions(), 0);
     }
 }
 
