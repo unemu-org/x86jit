@@ -1716,7 +1716,7 @@ pub(super) fn lower(
         Bt | Bts | Btr | Btc
             if insn.op_kind(0) == OpKind::Memory && insn.op_kind(1) == OpKind::Register =>
         {
-            // SDM Vol 2A §3.3 BT/BTC/BTR/BTS: a register bit index
+            // 80386 PRM §17.2.2.4 pp. 17-14–15: a register bit index
             // contributes a signed byte displacement before segment checks.
             let bit = lower_read(insn, 1, ops, tg)?;
             let signed = tg.fresh();
@@ -1790,6 +1790,26 @@ pub(super) fn lower(
             },
         ),
         Leave => emit(ops, L::Leave { size }),
+        Daa | Das | Aaa | Aas | Aam | Aad
+            if context.generation == crate::CpuGeneration::I386 =>
+        {
+            // 80386 PRM §17 pp. 17-18–21, 17-54–55: these byte/AX
+            // operations are independent of CS.D. Reuse real-mode lowering.
+            // SDM Vol 2A §3.2 AAM p. 3-5: base zero raises #DE.
+            return lift_insn_inner(
+                insn,
+                ops,
+                tg,
+                CpuMode::Real16,
+                &mut mmx::Sequence::default(),
+            );
+        }
+        Wait if context.generation == crate::CpuGeneration::I386 => {
+            // 80386 PRM §17 p. 17-171; §§11.1.2–11.1.4 pp. 11-1–2:
+            // the preceding Coprocessor gate tests MP && TS; the shared
+            // WAIT operation handles the configured coprocessor's errors.
+            control::lift_x87(insn, ops, tg)?;
+        }
         Cli => ops.push(IrOp::SetIf { value: false }),
         Sti => ops.push(IrOp::SetIf { value: true }),
         // Shared scalar lowering has no legacy control/stack assumptions here.
@@ -1799,7 +1819,11 @@ pub(super) fn lower(
         | Idiv | Movzx | Movsx | Cbw | Cwde | Cwd | Cdq | Clc | Stc | Cmc | Cld | Std | Lahf
         | Sahf | Nop | Hlt | In | Out | Jb | Jbe | Je | Jg | Jge | Jl | Jle | Jae | Ja | Jne
         | Jno | Jnp | Jns | Jo | Jp | Js | Setb | Setbe | Sete | Setg | Setge | Setl | Setle
-        | Setae | Seta | Setne | Setno | Setnp | Setns | Seto | Setp | Sets | Bsf | Bsr => {
+        | Setae | Seta | Setne | Setno | Setnp | Setns | Seto | Setp | Sets | Bsf | Bsr
+        // 80386 PRM §17 pp. 17-29–36: register destinations and immediate
+        // indices wrap within the operand width. Memory/register bit strings
+        // retain the signed displacement lowering above (§17.2.2.4 pp. 17-14–15).
+        | Bt | Bts | Btr | Btc => {
             let first = ops.len();
             let result = lift_insn_inner(insn, ops, tg, mode, &mut mmx::Sequence::default());
             for op in &mut ops[first..] {

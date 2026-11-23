@@ -21,7 +21,7 @@ fn checked_fault_atomicity_sweep() {
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_497));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_538));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {

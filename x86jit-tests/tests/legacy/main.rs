@@ -9,6 +9,7 @@
 mod legacy_a20;
 mod legacy_alias;
 mod legacy_bus_width;
+mod legacy_census_386;
 mod legacy_contract;
 mod legacy_debug_test;
 mod legacy_delivery_liveness;
@@ -18,6 +19,7 @@ mod legacy_direct_parity;
 mod legacy_i286;
 mod legacy_i286_loadall;
 mod legacy_i286_quirks;
+mod legacy_i386_integer;
 mod legacy_i386_reset;
 mod legacy_i8086;
 mod legacy_idt;
