@@ -1567,10 +1567,10 @@ impl Vcpu {
         if context.paging_enabled {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
         }
-        // I286 PRM §10.4 p. 10-6: reset may fetch through the retained high CS base.
+        // I286 PRM §10.4 p. 10-6; 80386 PRM §10.2.3 p. 10-3:
+        // reset may fetch through the retained high CS base.
         // System-free models have already returned their permanent context.
         if !matches!(model.generation, CpuGeneration::I286 | CpuGeneration::I386)
-            || (self.cpu.legacy.reset_fetch != 0 && model.generation != CpuGeneration::I286)
             || self.cpu.rip > u64::from(u32::MAX)
         {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));

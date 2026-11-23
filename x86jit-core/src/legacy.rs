@@ -222,6 +222,9 @@ pub struct LegacyCpuState {
     /// interruption point (decision-22): completion, a completed REP iteration,
     /// or abandonment by an architectural fault.
     pub a20_enabled: u8,
+    /// Retained reset CS cache on I80286/I80386. A guest CS reload clears it;
+    /// near transfers keep the hidden base and limit. I286 PRM §10.4 p. 10-6;
+    /// 80386 PRM §10.2.3 p. 10-3; SDM Vol 3A §12.1.4 p. 12-5.
     pub reset_fetch: u8,
     /// Zero on every model except `NecV20`/`NecV30`, where it holds their mode
     /// state (decision-23 C4a): bit 0 is set while PSW.MD = 0 (8080 emulation
@@ -356,6 +359,37 @@ pub fn derive_legacy_context(
 }
 
 impl CpuState {
+    /// Reset register image for the I80386 Machine model (spec.md §17.10).
+    /// Install after `Vcpu::reset_execution_state`; that call preserves registers.
+    ///
+    /// 80386 PRM §10.1 pp. 10-1–10-2, Figs. 10-1/10-2: EFLAGS=2,
+    /// EIP=FFF0h, data selectors=0, IDTR=0:03FFh, DH=03h, and CR0's
+    /// PG/TS/EM/MP/PE bits clear. ASSUMED: DL=03h (a representative stepping),
+    /// undefined registers/bits are zero, and `Present` denotes an 80387 for ET.
+    /// The PRM leaves EAX undefined without self-test; zero also represents a
+    /// successful self-test. The x87 image remains the engine's FNINIT default.
+    ///
+    /// SDM Vol 3A §12.1.4 p. 12-5 specifies CS=F000h, base=FFFF0000h
+    /// until CS is reloaded (the pinned PRM §10.1 prints CS=000h).
+    /// DERIVED: use ordinary 64-KiB real caches (386 PRM §14.1 p. 14-1)
+    /// with the exceptional CS base. ASSUMED: keep the engine's real-cache
+    /// attribute labels, 9Bh/93h, and enable the board A20 line initially;
+    /// the embedder can change it with `Vcpu::set_a20_enabled`.
+    pub fn i386_reset(fpu_model: crate::FpuModel) -> Self {
+        let mut cpu = Self::legacy_real_entry([0xf000, 0, 0, 0, 0, 0]);
+        cpu.rip = 0xfff0;
+        cpu.gpr[2] = 0x0303;
+        cpu.fpu_model = fpu_model;
+        cpu.legacy.cr0 = if fpu_model == crate::FpuModel::Present {
+            0x10
+        } else {
+            0
+        };
+        cpu.legacy.segments[SegmentId::Cs as usize].base = 0xffff_0000;
+        cpu.legacy.reset_fetch = 1;
+        cpu
+    }
+
     /// Engine ordinary real entry, not hardware reset. The array uses SegmentId
     /// order. SDM Vol 3A §§3.4.3, 12.9.2: selector-derived normal real caches;
     /// SDM Vol 3B §23.1.4: the ordinary IVT has 256 four-byte entries.

@@ -2052,6 +2052,34 @@ interpretation, address translation or timing changes in this migration step.
 Timing entries are absent, and FPU pairings currently accept `Present` and `None`.
 Later model and FPU variants extend non-exhaustive enums.
 
+`CpuState::i386_reset(fpu_model)` supplies an explicit I80386 reset image;
+`reset_execution_state` still abandons execution state without installing
+registers. The image has EFLAGS=2, EIP=FFF0h, zero data selectors,
+IDTR=0:03FFh and CR0's PG/TS/EM/MP/PE clear (80386 PRM §10.1
+pp. 10-1–10-2, Figs. 10-1/10-2). DH=03h is documented; DL=03h is
+**ASSUMED**, as are zero undefined registers/bits and treating `Present`
+as an 80387 for CR0.ET. x87 keeps the engine's FNINIT image. CS=F000h
+with hidden base FFFF0000h follows SDM Vol 3A §12.1.4 p. 12-5 (the
+pinned PRM §10.1 prints CS=000h). Near transfers retain this base; the
+first CS reload, including a far transfer or interrupt, replaces it with
+selector×16 (PRM §10.2.3 p. 10-3; SDM §12.1.4 p. 12-5). Ordinary
+FFFFh limits are **DERIVED** from PRM §14.1 p. 14-1; real-cache attribute
+labels and retention of big-real limits keep the existing engine contract.
+
+The embedder can use `Vm::with_backend_host_ram` with
+`VmConfig::reserved(1 << 32)` and a demand-backed 4-GiB host virtual
+reservation (`HostRam`, `guest_base=0`). It maps only the required regions:
+for example, `vm.map(0xffff0000, 0x10000, Prot::RWX, RegionKind::Ram)`
+and `write_bytes` install the high firmware copy, alongside low firmware
+and RAM. This reserves virtual addresses, without allocating 4 GiB of
+physical RAM; `Vm::with_backend` instead allocates the whole backing.
+The ordinary fetch path applies the board A20 policy (decision-22): when
+A20 is disabled, the embedder must also map/copy the firmware at
+FFEF0000h..FFEFFFFFh, because only physical bit 20 is cleared (SDM
+Vol 3A §11.7.13.4 p. 11-33); the reset fetch then uses FFEFFFF0h.
+Applying that board gate at reset is **ASSUMED**. A missing window reports
+the actual physical fetch fault and retains the linear address as evidence.
+
 Decision-23 C1 makes `isa` an explicit encoding set, with a per-entry absent
 encoding policy: #UD, a defined canonical alias, or typed refusal through
 `Exit::UnknownInstruction`. I80286 and I80386 use #UD for absent reserved
