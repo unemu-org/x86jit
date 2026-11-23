@@ -227,6 +227,10 @@ pub enum MemoryModel {
     /// Good at the start and when the guest space is dense and fits in host RAM.
     Flat { size: u64 },
 
+    /// The same contiguous translation over a potentially huge reserved span.
+    /// Use a sparse constructor or HostRam for sparse host commitment.
+    Reserved { span: u64 },
+
     /// Sparse address space via a page table / region map.
     /// `map()` allocates separate pages. Slower address translation (lookup),
     /// but handles scattered, high addresses without allocating the whole thing.
@@ -245,6 +249,60 @@ impl Vm {
 > **Backend selection is an injected trait object, NOT a config enum.** An earlier draft had `pub enum Backend { Interpreter, Jit }` in `VmConfig` — that cannot work: `x86jit-cranelift` depends on the core, so the core **cannot name or construct** the JIT backend (the dependency points the other way). The `Backend` *trait* (§8) is defined in the core; the interpreter implements it in the core; `x86jit-cranelift` exports a `JitBackend` implementing the same trait, and the user passes it into `Vm::with_backend`. This keeps the JIT crate optional without a feature-flag knot in the core.
 
 > **Flat vs map():** in the `Flat` model, `size` is the total size of the allocated host buffer. `map()` does NOT add memory — it divides the already existing buffer into regions with different permissions and type (Ram/Trap). In `SoftMmu`, `map()` really allocates pages. Keep this distinction clear, because otherwise `map(guest_addr = 0x7fff_0000_0000, ...)` in Flat mode would mean an attempt to allocate 128 TB.
+
+**Sparse host backing.** Backing allocation is separate from the memory model:
+`Vm::sparse(config) -> Result<Vm, SparseError>` selects the interpreter;
+`Vm::with_backend_sparse(config, backend)` selects an injected backend. Both accept
+the existing `VmConfig::flat(size)` or `VmConfig::reserved(span)` and reserve the
+span without committing it. `Memory::sparse(model)` supplies the same backing for
+direct memory users. The old constructors retain their allocation policy, and
+`HostRam` remains available for caller-managed reservations. There is no new core
+dependency. Zero spans, spans above the lower canonical half, and spans that cannot
+fit a host pointer are `SparseError::InvalidSpan`; SoftMmu is
+`SparseError::UnsupportedModel`. Other hosts return `SparseError::UnsupportedHost`.
+
+Linux and macOS use direct FFI to `mmap(PROT_NONE, MAP_PRIVATE | MAP_ANON |
+MAP_NORESERVE)`, then `mprotect(PROT_READ | PROT_WRITE)` on map. Linux unmap uses
+`madvise(MADV_DONTNEED)`; macOS uses `MADV_FREE_REUSABLE` (and `MADV_FREE_REUSE`
+before reuse); both close the pages with `mprotect(PROT_NONE)` and release the
+reservation with `munmap` on drop. Windows uses `VirtualAlloc(MEM_RESERVE,
+PAGE_NOACCESS)`, `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)`,
+`VirtualFree(MEM_DECOMMIT)` and `VirtualFree(MEM_RELEASE)` respectively. Host page
+size comes from `getpagesize` or `GetSystemInfo`, independent of the 4 KiB guest
+tracking granule. Mapping commits rounded host pages before publishing the region
+tag, and zeroes only the new region's bytes. Partial pages shared with other live
+regions stay accessible; unmap discards only unshared whole pages. Trap regions
+also have backing for the host inspection/loader API, but guest accesses still
+dispatch to the device. `Prot` retains its existing advisory semantics; select
+`RegionKind::Rom` to discard guest writes to firmware.
+
+Reservation/metadata failures return `SparseError`; commit/decommit failures return
+`MapError::Sparse(SparseError)`. A failed map publishes no tag. A failed unmap
+removes the tag and invalidates translations even if the OS could not discard the
+pages, retaining address ownership until drop. These errors report synchronous
+host API failures: anonymous Unix memory still follows the host's overcommit/OOM
+policy, so success cannot guarantee that the OS will service every future page
+fault. No whole-span zeroing or copying is performed.
+
+Sparse backing executes **all** guest instructions through the checked interpreter,
+even with an injected JIT backend. Block compilation, region formation and tier-up
+are bypassed. This keeps retirement and step accounting exact without charging
+compiled suffixes that later defer to the interpreter, and requires no host signal
+handler. Ordinary backing's generated code is unchanged. Because `Vm::mem` is
+public, run entry detects a sparse/ordinary backing-policy change and invalidates
+translations, chained links, vCPU predictions and pending publications before
+dispatch; switching back to ordinary backing can compile fresh code.
+The interpreter checks containment/adjacent RAM pieces and device kinds before
+dereferencing; fetch and lifter snapshots stop at region boundaries. Aligned
+atomic containing granules stay within committed host pages even for sub-page
+regions. Machine bus dispatch and child execution use their checked region views;
+child views borrow the VM, preventing safe unmap while a view lives. SMC and dirty
+tracking inspect metadata and fetched/mapped bytes, never scan guest backing.
+`CpuState` copies, instruction checkpoints and `reset_execution_state` touch CPU
+and execution metadata only. The existing whole-buffer deep-copy/fork path is
+refused: `Memory::deep_copy` / `Vm::fork_with_backend` return `None`, while
+`Vm::try_fork_with_backend` returns `ForkError::SparseBacking`. An embedder needing
+a memory snapshot can inspect mapped regions explicitly with `read_bytes`.
 
 ### 4.2 Memory mapping
 

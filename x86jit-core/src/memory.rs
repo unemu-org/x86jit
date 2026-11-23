@@ -7,6 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::ir::RmwOp;
 
+mod sparse;
+pub use sparse::SparseError;
+
 /// SDM Vol 1 §3.3.7.1: no LA57; bits 63:47 must all agree.
 pub fn is_canonical(addr: u64) -> bool {
     canonical(addr) == addr
@@ -104,9 +107,8 @@ pub enum MemoryModel {
     /// A huge (`span`-byte) guest address space `[0, span)`, same one-add translation
     /// as `Flat` but sparsely committed: untouched guest VA (a `PROT_NONE`
     /// reservation, Go's 768 GiB arena hints) costs no physical memory. To actually
-    /// reserve hundreds of GiB on a normal host the backing must be a `MAP_NORESERVE`
-    /// mapping — which the guest-agnostic core can't allocate (no OS dep), so the
-    /// embedder provides it via [`Memory::from_host_ram`]. Constructing this model
+    /// reserve hundreds of GiB on a normal host use [`Memory::sparse`] or provide
+    /// a host reservation via [`Memory::from_host_ram`]. Constructing this model
     /// through [`Memory::new`] instead uses a plain allocation (fine only for a modest
     /// span or a test). The exclusive span top may be at most 2^47, the lower
     /// canonical half (SDM Vol 1 §3.3.7.1). Forecloses per-page guest protections.
@@ -137,9 +139,7 @@ impl std::fmt::Display for HostRamError {
 impl std::error::Error for HostRamError {}
 
 /// Host-provided backing for a `Reserved` address space. The
-/// guest-agnostic core must not depend on an OS allocator, so an embedder that
-/// needs a huge sparse mapping (a `MAP_NORESERVE` mmap for Go's 768 GiB arena hints)
-/// allocates it host-side and hands core the raw region through
+/// embedder can supply its own allocation policy and hand core the raw region through
 /// [`Memory::from_host_ram`]. `dtor(ptr, len)` frees it when the `Memory` drops.
 ///
 /// # Safety
@@ -196,6 +196,7 @@ enum Owner {
         len: usize,
     },
     Host(#[allow(dead_code)] HostRam),
+    Sparse(sparse::Reservation),
 }
 
 impl Drop for Owner {
@@ -548,6 +549,7 @@ pub enum MapError {
     Overlap,
     OutOfBounds,
     BadAlign,
+    Sparse(SparseError),
 }
 
 #[derive(Debug)]
@@ -636,6 +638,21 @@ fn zeroed_words(words: usize) -> Box<[AtomicU64]> {
     // SAFETY: `AtomicU64` has the same size and alignment as `u64` and no invalid
     // bit patterns, so the zero-initialized allocation is a valid `[AtomicU64]`.
     unsafe { Box::from_raw(Box::into_raw(v) as *mut [AtomicU64]) }
+}
+
+fn try_zeroed_words(words: usize) -> Result<Box<[AtomicU64]>, SparseError> {
+    if words == 0 {
+        return Ok(Box::default());
+    }
+    let layout =
+        std::alloc::Layout::array::<AtomicU64>(words).map_err(|_| SparseError::Allocation)?;
+    // SAFETY: zero is a valid AtomicU64 representation, with its native alignment.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<AtomicU64>();
+    if ptr.is_null() {
+        return Err(SparseError::Allocation);
+    }
+    // SAFETY: the allocation has exactly the layout Box<[AtomicU64]> will release.
+    Ok(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, words)) })
 }
 
 /// Embedder-registered DATA-range dirty tracking.
@@ -903,6 +920,8 @@ pub struct Memory {
     // region table comes later. Access must be bounds-checked (§8.2.3) — no raw
     // out-of-range indexing, that would be host UB.
     backing: UnsafeCell<Backing>,
+    // Allocation policy is immutable; dispatch must not inspect the backing owner.
+    sparse: bool,
     // Region tags (prot/kind + bounds). `map()`/`unmap()` mutate this through
     // `&mut self` before execution; per-access lookups read it through `&self`.
     regions: Vec<Region>,
@@ -1074,6 +1093,42 @@ impl Drop for LiftSource<'_> {
 }
 
 impl Memory {
+    /// Reserve a contiguous guest span and commit only mapped regions (§4.1).
+    /// Supports Flat and Reserved on Linux, macOS, and Windows. Host page edges
+    /// shared by regions stay committed until their last region is unmapped.
+    /// Sparse VMs execute through the checked interpreter, even with a JIT backend.
+    pub fn sparse(model: MemoryModel) -> Result<Self, SparseError> {
+        let span = match model {
+            MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => size,
+            MemoryModel::SoftMmu => return Err(SparseError::UnsupportedModel),
+        };
+        let reservation = sparse::Reservation::new(span)?;
+        let words = span.div_ceil(CODE_PAGE_SIZE).div_ceil(64) as usize;
+        let code_page = try_zeroed_words(words)?;
+        let watch = WatchPages {
+            base_page: 0,
+            watch: try_zeroed_words(words)?,
+            dirty: try_zeroed_words(words)?,
+            words: Mutex::new(BTreeSet::new()),
+            count: AtomicUsize::new(0),
+        };
+        let backing = Backing {
+            ptr: reservation.ptr,
+            len: span as usize,
+            guest_base: 0,
+            owner: Owner::Sparse(reservation),
+        };
+        Ok(Self::from_backing_with_tracking(
+            model, backing, code_page, watch,
+        ))
+    }
+
+    /// Whether the host span contains uncommitted pages.
+    #[inline(always)]
+    pub fn is_sparse(&self) -> bool {
+        self.sparse
+    }
+
     pub(crate) fn allocation_stats(&self) -> (u64, Option<u64>, u64) {
         // SAFETY: only immutable allocation metadata is read; guest writes mutate bytes.
         let backing = unsafe { &*self.backing.get() };
@@ -1370,7 +1425,7 @@ impl Memory {
             span <= 1 << 47,
             "guest span overlaps non-canonical addresses"
         );
-        // Huge sparse mappings are supplied by the embedder through from_host_ram.
+        // Sparse allocation is opt-in through sparse or from_host_ram.
         let len = match &model {
             MemoryModel::Flat { size } | MemoryModel::Reserved { span: size } => *size as usize,
             MemoryModel::SoftMmu => 0,
@@ -1379,8 +1434,7 @@ impl Memory {
     }
 
     /// Build a `Reserved` memory over an embedder-provided host mapping.
-    /// Core can't allocate a `MAP_NORESERVE` span itself (it must stay guest-agnostic,
-    /// depending only on the decoder), so the embedder hands in the raw region; the
+    /// An alternative to [`Memory::sparse`] for caller-managed host storage; the
     /// `HostRam` dtor frees it on drop. `ram.len` is the span the JIT bounds against.
     /// The host pointer must be congruent to `guest_base` modulo 16, so aligned
     /// guest CMPXCHG16B operands are aligned on the host. Page-aligned mappings
@@ -1424,9 +1478,20 @@ impl Memory {
         };
         let code_page = fresh_code_pages(guest_base, top);
         let watch = WatchPages::new(guest_base, top);
+        Self::from_backing_with_tracking(model, backing, code_page, watch)
+    }
+
+    fn from_backing_with_tracking(
+        model: MemoryModel,
+        backing: Backing,
+        code_page: Box<[AtomicU64]>,
+        watch: WatchPages,
+    ) -> Self {
+        let guest_base = backing.guest_base();
         let source_barrier = crate::process_barrier::ProcessBarrier::new();
         Self {
             model,
+            sparse: matches!(backing.owner, Owner::Sparse(_)),
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
             trap_intervals: Vec::new(),
@@ -1465,13 +1530,13 @@ impl Memory {
         // memory (identity mapping) can't be faithfully re-homed into one, and it is
         // always host-backed anyway (the two `None`-returning arms below already cover
         // the shipped identity-mapping case). Reject it rather than miscopy.
-        if self.guest_base != 0 {
+        if self.guest_base != 0 || self.is_sparse() {
             return None;
         }
         let owner = &unsafe { &*self.backing.get() }.owner;
         let bytes: Box<[u8]> = match (self.model, owner) {
-            // A host-backed (NORESERVE) `Reserved` span can't be re-allocated by the
-            // core (that's the embedder's job), and cloning it into a `Vec` would
+            // A caller-owned `Reserved` span has an external allocation policy,
+            // and cloning it into a `Vec` would
             // commit the whole span. Fork of such a memory is unsupported — `None` lets
             // the embedder surface a typed error instead of aborting the host. Go, the
             // only huge-`Reserved` guest, never forks; forking guests use `Flat`.
@@ -2227,7 +2292,8 @@ impl Memory {
     /// inlined access to the interpreter. It is the *bounding* window: an address in
     /// a RAM gap between two Trap regions is conservatively deferred too — correct
     /// (the interpreter handles RAM), only slightly slower. `None` means zero
-    /// per-access cost, the common case.
+    /// per-access cost, the common case. Sparse VMs execute only checked
+    /// interpreter code (§4.1).
     pub fn trap_window(&self) -> Option<(u64, u64)> {
         Some((
             self.trap_intervals.first()?.0,
@@ -2291,6 +2357,26 @@ impl Memory {
                     .any(|r| guest_addr < r.start + r.size as u64 && r.start < end);
                 if overlaps {
                     return Err(MapError::Overlap);
+                }
+                // Commit before publishing a tag: every tagged byte must be
+                // accessible, including host inspection of Trap regions.
+                if let Owner::Sparse(reservation) = &unsafe { &*self.backing.get() }.owner {
+                    self.regions
+                        .try_reserve(1)
+                        .map_err(|_| MapError::Sparse(SparseError::Allocation))?;
+                    if kind == RegionKind::Trap && size != 0 {
+                        self.trap_intervals
+                            .try_reserve(1)
+                            .map_err(|_| MapError::Sparse(SparseError::Allocation))?;
+                    }
+                    reservation
+                        .commit(guest_addr as usize, size)
+                        .map_err(MapError::Sparse)?;
+                    // Shared edge pages can retain bytes from an earlier mapping.
+                    // Zero only this region; never walk the uncommitted span.
+                    unsafe {
+                        std::ptr::write_bytes(reservation.ptr.add(guest_addr as usize), 0, size)
+                    };
                 }
                 self.regions.push(Region {
                     start: guest_addr,
@@ -2370,9 +2456,11 @@ impl Memory {
         Ok(())
     }
 
-    /// Drop a region's tag. In `Flat` the backing buffer is untouched — only the
+    /// Drop a region's tag. With ordinary `Flat` backing the buffer is untouched — only the
     /// permission/kind tag goes away. Partial unmap isn't modeled in M0, so the
-    /// `(guest_addr, size)` must match a mapped region exactly. (§4.1)
+    /// `(guest_addr, size)` must match a mapped region exactly. Sparse backing
+    /// discards unshared host pages; on a host decommit error the tag is still
+    /// removed and the reservation retained. (§4.1)
     pub fn unmap(&mut self, guest_addr: u64, size: usize) -> Result<(), MapError> {
         match self
             .regions
@@ -2414,10 +2502,41 @@ impl Memory {
                 // Guard pages: close the region's host pages, except any page still
                 // touched by a surviving region.
                 self.reprotect(guest_addr, size, false);
+                self.decommit_sparse(guest_addr, size)?;
                 Ok(())
             }
             None => Err(MapError::OutOfBounds),
         }
+    }
+
+    fn decommit_sparse(&self, start: u64, size: usize) -> Result<(), MapError> {
+        let Owner::Sparse(reservation) = &unsafe { &*self.backing.get() }.owner else {
+            return Ok(());
+        };
+        if size == 0 {
+            return Ok(());
+        }
+        let page = reservation.page as u64;
+        let mut lo = start / page * page;
+        let mut hi = (start + size as u64).div_ceil(page) * page;
+        let shared = |first, last| {
+            self.regions
+                .iter()
+                .any(|r| r.size != 0 && r.start < last && first < r.start + r.size as u64)
+        };
+        // Non-overlap of guest regions means only the two edge pages can be shared.
+        if shared(lo, lo + page) {
+            lo += page;
+        }
+        if lo < hi && shared(hi - page, hi) {
+            hi -= page;
+        }
+        if lo < hi {
+            reservation
+                .decommit(lo as usize, (hi - lo) as usize)
+                .map_err(MapError::Sparse)?;
+        }
+        Ok(())
     }
 
     /// Flip host guard-page protection for the pages `[start, start+size)` touches.
@@ -5420,7 +5539,43 @@ pub fn host_page_size() -> usize {
     page
 }
 /// Host protection granule on platforms without host-fault recovery.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+#[cfg(target_os = "windows")]
+pub fn host_page_size() -> usize {
+    #[cfg(test)]
+    if let Some(page) = TEST_HOST_PAGE_SIZE.with(Cell::get) {
+        return page;
+    }
+    #[repr(C)]
+    struct SystemInfo {
+        architecture: u32,
+        page_size: u32,
+        min_address: *mut std::ffi::c_void,
+        max_address: *mut std::ffi::c_void,
+        processor_mask: usize,
+        processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemInfo(info: *mut SystemInfo);
+    }
+    let mut info = std::mem::MaybeUninit::<SystemInfo>::uninit();
+    // SAFETY: GetSystemInfo fills the complete SYSTEM_INFO structure.
+    unsafe {
+        GetSystemInfo(info.as_mut_ptr());
+        info.assume_init().page_size as usize
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+)))]
 pub fn host_page_size() -> usize {
     #[cfg(test)]
     if let Some(page) = TEST_HOST_PAGE_SIZE.with(Cell::get) {

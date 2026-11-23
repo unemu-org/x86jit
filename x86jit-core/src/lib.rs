@@ -228,7 +228,7 @@ pub use legacy::{LegacyContextError, LegacyDecodeContext, LegacyRegime};
 pub use lift::CpuMode;
 pub use memory::{
     FetchPermit, FetchVerdict, HostRam, HostRamError, MapError, MemError, MemTrap, Memory,
-    MemoryModel, Prot, RegionKind,
+    MemoryModel, Prot, RegionKind, SparseError,
 };
 pub use memory_stats::{BackendMemoryStats, CacheMemoryStats, MemoryStats, VcpuMemoryStats};
 pub use model::{
@@ -242,7 +242,7 @@ pub use time_stats::{
     BackendTimeStats, ExitTimeStats, ExitsTimeStats, SampledTimeStats, TimeStats,
 };
 pub use vm::{
-    Backend, CompileFailureReason, ExitRequest, ForceRegionError, InterpreterBackend,
+    Backend, CompileFailureReason, ExitRequest, ForceRegionError, ForkError, InterpreterBackend,
     MemConsistency, NmiLine, NmiUnsupported, ResetOptions, ShutdownError, ShutdownReport,
     SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest,
     TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,

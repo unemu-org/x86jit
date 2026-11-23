@@ -24,6 +24,7 @@ mod prot_advisory;
 mod real16_wrap;
 mod region_fault_state;
 mod rust_memory_faults;
+mod sparse_backing;
 mod store_no_read;
 mod string_mmio;
 mod trap_fetch;

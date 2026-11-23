@@ -531,6 +531,22 @@ pub struct VmConfig {
     pub consistency: MemConsistency,
 }
 
+/// A VM backing that the core's fork implementation cannot copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkError {
+    SparseBacking,
+    UnsupportedBacking,
+}
+impl std::fmt::Display for ForkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SparseBacking => "fork of sparse backing is unsupported",
+            Self::UnsupportedBacking => "guest backing cannot be copied by the core",
+        })
+    }
+}
+impl std::error::Error for ForkError {}
+
 impl VmConfig {
     /// A `Flat` guest of `size` bytes at the default `Fast` consistency — the common
     /// case. Refine `consistency` on the returned value if a weak host needs a stronger
@@ -542,8 +558,9 @@ impl VmConfig {
         }
     }
 
-    /// A `Reserved` (embedder-mmap'd) span of `span` bytes at `Fast` consistency.
-    /// Pair with [`Vm::with_backend_host_ram`]. Through [`Vm::with_backend`] the
+    /// A `Reserved` span of `span` bytes at `Fast` consistency.
+    /// Pair with [`Vm::sparse`], [`Vm::with_backend_sparse`] or
+    /// [`Vm::with_backend_host_ram`]. Through [`Vm::with_backend`] the
     /// whole span is instead one zeroed allocation, and a failed allocation aborts
     /// the process as [`Memory::new`] documents.
     pub fn reserved(span: u64) -> Self {
@@ -656,6 +673,9 @@ pub struct Vm {
     pub backend: Box<dyn Backend>,
     pub cache: TranslationCache,
     pub mem: Memory,
+    /// Cached policy byte (0 = ordinary, 1 = sparse); the mutex serializes a switch.
+    /// An integer lets run entry compare bytes without normalizing an atomic bool.
+    sparse_backing: (std::sync::atomic::AtomicU8, Mutex<()>),
     pub consistency: MemConsistency,
     /// Hotness-gated tier-up: when `Some(n)`, a freshly-lifted block
     /// runs on the interpreter and is JIT-compiled only after it executes `n` times.
@@ -1031,6 +1051,10 @@ impl Vm {
         caps: RegionCaps,
         mxcsr: u32,
     ) -> Result<(), ForceRegionError> {
+        self.sync_backing_policy();
+        if self.mem.is_sparse() {
+            return Err(ForceRegionError::NotCompiled);
+        }
         if self.profile == ExecutionProfile::Machine || self.mode == CpuMode::Real16 {
             return Err(ForceRegionError::UnsupportedMode);
         }
@@ -1291,9 +1315,9 @@ impl Vm {
     /// the embedder clones the vcpu's `CpuState` (child RAX = 0) and drives the
     /// child. Knows nothing about processes, pids, or fds.
     ///
-    /// `None` when the guest memory can't be deep-copied by the core — a host-backed
-    /// (embedder-`mmap`ed) `Reserved` span, which only the embedder can re-allocate.
-    /// The embedder surfaces that as a typed error to the guest rather than aborting.
+    /// `None` when the guest memory can't be deep-copied by the core, including
+    /// sparse backing and caller-owned `Reserved` spans. Use
+    /// [`Self::try_fork_with_backend`] for a typed refusal.
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
         Some(Vm {
             time_enabled: false,
@@ -1304,6 +1328,7 @@ impl Vm {
             compile_hold: None,
             #[cfg(test)]
             source_read_hook: Mutex::new(None),
+            sparse_backing: (std::sync::atomic::AtomicU8::new(0), Mutex::new(())),
             mem: self.mem.deep_copy()?,
             cache: {
                 let mut cache = TranslationCache::with_code_lifetime(backend.code_lifetime());
@@ -1332,6 +1357,30 @@ impl Vm {
         })
     }
 
+    // `mem` is public: a replacement must not inherit translations or pending
+    // publications compiled for the other backing policy (§4.1).
+    #[inline(always)]
+    fn sync_backing_policy(&self) {
+        let current = u8::from(self.mem.is_sparse());
+        if self.sparse_backing.0.load(Ordering::Acquire) != current {
+            self.switch_backing_policy(current);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn switch_backing_policy(&self, current: u8) {
+        let _switch = self.sparse_backing.1.lock().unwrap();
+        if self.sparse_backing.0.load(Ordering::Acquire) == current {
+            return;
+        }
+        self.cache
+            .invalidate_overlapping(0, u64::MAX, || self.mem.clear_all_code_pages());
+        self.cache.code_lifetime().flush_predictions();
+        self.backend.invalidate_links();
+        self.sparse_backing.0.store(current, Ordering::Release);
+    }
+
     /// Assemble a fresh `Vm` around already-built guest memory — the shared body of the
     /// public constructors, holding the default tier-up policy and CPU features in one place.
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
@@ -1344,6 +1393,10 @@ impl Vm {
             compile_hold: None,
             #[cfg(test)]
             source_read_hook: Mutex::new(None),
+            sparse_backing: (
+                std::sync::atomic::AtomicU8::new(u8::from(mem.is_sparse())),
+                Mutex::new(()),
+            ),
             mem,
             cache: TranslationCache::with_code_lifetime(backend.code_lifetime()),
             backend,
@@ -1377,9 +1430,39 @@ impl Vm {
         )
     }
 
+    /// Fallible interpreter VM with host pages committed only by [`Self::map`].
+    /// The configuration's Flat/Reserved span is reserved without committing it.
+    pub fn sparse(config: VmConfig) -> Result<Self, crate::memory::SparseError> {
+        Self::with_backend_sparse(config, Box::new(InterpreterBackend))
+    }
+
+    /// Fallible sparse backing with an injected backend (§4.1).
+    /// All instructions use the checked interpreter path, including when a
+    /// JIT backend is selected. Existing Flat/Reserved constructors are unchanged.
+    pub fn with_backend_sparse(
+        config: VmConfig,
+        backend: Box<dyn Backend>,
+    ) -> Result<Self, crate::memory::SparseError> {
+        Ok(Self::from_mem(
+            Memory::sparse(config.memory_model)?,
+            backend,
+            config.consistency,
+        ))
+    }
+
+    /// Typed alternative to [`Self::fork_with_backend`]. Sparse backing cannot
+    /// be deep-copied by the existing whole-buffer fork implementation.
+    pub fn try_fork_with_backend(&self, backend: Box<dyn Backend>) -> Result<Vm, ForkError> {
+        if self.mem.is_sparse() {
+            return Err(ForkError::SparseBacking);
+        }
+        self.fork_with_backend(backend)
+            .ok_or(ForkError::UnsupportedBacking)
+    }
+
     /// Like [`Vm::with_backend`] but for a `Reserved` model backed by an
-    /// embedder-provided host mapping (a `MAP_NORESERVE` span the core can't allocate
-    /// itself). `config.memory_model` should be `Reserved { span: ram.len }`.
+    /// embedder-provided host mapping. `config.memory_model` should be
+    /// `Reserved { span: ram.len }`.
     /// The host pointer must equal `ram.guest_base` modulo 16. Returns an error
     /// for misaligned backing, a backing that cannot contain the guest extent, or a
     /// span above `1 << 47`. An identity mapping therefore needs a host mapping below
@@ -1447,7 +1530,12 @@ impl Vm {
     }
 
     pub fn unmap(&mut self, guest_addr: u64, size: usize) -> Result<(), MapError> {
-        self.mem.unmap(guest_addr, size)?;
+        let result = self.mem.unmap(guest_addr, size);
+        // A sparse decommit error occurs after the region tag has been removed.
+        // Its translations must still be invalidated before returning the error.
+        if result.is_err() && !matches!(result, Err(MapError::Sparse(_))) {
+            return result;
+        }
         // A block cached from the now-unmapped range must not stay executable (§10):
         // drop every unit overlapping it, clear the code-page tags, and flush the
         // backend's link/IBTC slots — mirroring `handle_smc`. Without this a stale
@@ -1473,7 +1561,7 @@ impl Vm {
         if dropped {
             self.backend.invalidate_links();
         }
-        Ok(())
+        result
     }
 
     /// Process pending self-modifying-code writes (§10): drop units overlapping
@@ -2986,6 +3074,7 @@ impl Vcpu {
         max_steps: u64,
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
+        vm.sync_backing_policy();
         if self.profile == ExecutionProfile::Machine {
             if self
                 .legacy_model
@@ -3019,6 +3108,7 @@ impl Vcpu {
     /// have made partial progress and resumes at the string instruction. Evidence
     /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
+        vm.sync_backing_policy();
         self.interruption_evidence = None;
         self.syscall_evidence = None;
         if self.profile != ExecutionProfile::Machine
@@ -3596,8 +3686,7 @@ fn resolve_attempt<const DEFAULT: bool>(
     } else {
         BlockKey::with_mxcsr(pc, mode, mxcsr)
     };
-    // §17.6: Real16 has no compiled tier. Bypass tier-up and region formation even
-    // when the embedder injected a compiling backend.
+    // §17.6: Real16 has no compiled tier, including with an injected backend.
     if mode == CpuMode::Real16 {
         stats.lookups = stats.lookups.saturating_add(1);
         if let Some(block) = vm.cache.get_for_dispatch(key, vm.time_enabled) {
@@ -3607,13 +3696,15 @@ fn resolve_attempt<const DEFAULT: bool>(
         if vm.time_enabled {
             crate::time_stats::ResolveTimer::miss();
         }
-        return resolve_real16_uncached::<DEFAULT>(vm, &source, exit_word, sections, at, mxcsr);
+        return resolve_interpreted_uncached::<DEFAULT>(
+            vm, &source, exit_word, sections, at, mode, mxcsr,
+        );
     }
     loop {
         // Publish any completed background compiles first, so a
         // freshly-landed unit is seen by the lookup below. Cheap when idle (the
         // backend's ready-probe short-circuits an empty drain).
-        if vm.tier_up_background {
+        if vm.tier_up_background && !vm.mem.is_sparse() {
             let _publication_time = vm
                 .time_enabled
                 .then(crate::time_stats::PublicationTimer::enter);
@@ -3640,6 +3731,10 @@ fn resolve_attempt<const DEFAULT: bool>(
         let (Some(thr), CachedBlock::Interpreted(ir)) = (vm.tier_up_after, &block) else {
             return Ok(block);
         };
+        // §4.1: sparse backing never tiers up, even with an injected backend.
+        if vm.mem.is_sparse() {
+            return Ok(block);
+        }
         if !vm.cache.code_lifetime().is_open() || vm.backend.code_space_exhausted() {
             return Ok(block);
         }
@@ -3832,15 +3927,15 @@ fn resolve_attempt<const DEFAULT: bool>(
 // the materializer's stack frame and drop guards.
 #[cold]
 #[inline(never)]
-fn resolve_real16_uncached<const DEFAULT: bool>(
+fn resolve_interpreted_uncached<const DEFAULT: bool>(
     vm: &Vm,
     source: &crate::memory::LiftSource<'_>,
     exit_word: &AtomicU64,
     sections: &AtomicU64,
     at: FetchAddr,
+    mode: CpuMode,
     mxcsr: u32,
 ) -> Result<CachedBlock, ResolveFailure> {
-    let mode = CpuMode::Real16;
     let pc = at.pa;
     let key = if DEFAULT {
         BlockKey::new(pc, mode)
@@ -3887,6 +3982,12 @@ fn resolve_uncached<const DEFAULT: bool>(
     compile_generation: u64,
 ) -> Result<CachedBlock, ResolveFailure> {
     let source = crate::memory::LiftSource::new(&vm.mem);
+    // §4.1: keep the backing-policy check off non-tiered cache hits.
+    if vm.mem.is_sparse() {
+        return resolve_interpreted_uncached::<DEFAULT>(
+            vm, &source, exit_word, sections, at, mode, mxcsr,
+        );
+    }
     let pc = at.pa;
     let key = if DEFAULT {
         BlockKey::new(pc, mode)
@@ -4084,6 +4185,7 @@ fn finish_single(
     // the block proves hot under a tier-up policy (see `resolve`).
     let mut ir = Some(ir);
     let materialized = if key.mode == CpuMode::Real16
+        || vm.mem.is_sparse()
         || vm.tier_up_after.is_some()
         || !vm.cache.code_lifetime().is_open()
     {
@@ -5301,6 +5403,81 @@ mod tests {
             consistency: MemConsistency::Fast,
         });
         vm.new_vcpu()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn backing_policy_switch_cancels_publications_links_and_predictions() {
+        struct LinkBackend(Arc<AtomicU64>);
+        impl Backend for LinkBackend {
+            fn materialize(
+                &self,
+                ir: &IrBlock,
+                _: MemConsistency,
+                _: Option<(u64, u64)>,
+                _: u64,
+            ) -> CachedBlock {
+                CachedBlock::Interpreted(Arc::new(ir.clone()))
+            }
+            fn invalidate_links(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let links = Arc::new(AtomicU64::new(0));
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(0x10000),
+            Box::new(LinkBackend(links.clone())),
+        );
+        vm.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\xf4").unwrap();
+        let mut cpus: Vec<_> = (0..4).map(|_| vm.new_vcpu()).collect();
+        let key = BlockKey::new(0x1000, CpuMode::Long64);
+        for sparse in [true, false] {
+            for cpu in &mut cpus {
+                cpu.cpu.rip = 0x1000;
+                assert!(matches!(cpu.run(&vm, Some(4)), Exit::Hlt));
+                cpu.fast_put(0x1000, CompiledPtr::new(std::ptr::dangling()));
+                cpu.ibtc_refills.insert(0x1000, IBTC_MEGAMORPHIC_CAP);
+                cpu.ret_stack.sp = 1;
+                cpu.ret_stack.entries[0] = [0x1000, 0x2000];
+            }
+            let old = vm.cache.get_for_dispatch(key, false).unwrap();
+            let generation = vm.cache.publication_generation();
+            assert!(vm.cache.try_begin_tier_up(key));
+            let request = vm
+                .cache
+                .prepare_tier_up(key, vec![(0x1000, 1)], generation, |_| {})
+                .unwrap();
+            let mut next = if sparse {
+                Memory::sparse(MemoryModel::Flat { size: 0x10000 }).unwrap()
+            } else {
+                Memory::new(MemoryModel::Flat { size: 0x10000 })
+            };
+            next.map(0x1000, 0x1000, Prot::RWX, RegionKind::Ram)
+                .unwrap();
+            next.write_bytes(0x1000, b"\xf4").unwrap();
+            vm.mem = next;
+            let links_before = links.load(Ordering::Relaxed);
+            let start = std::sync::Barrier::new(cpus.len());
+            std::thread::scope(|scope| {
+                for cpu in &mut cpus {
+                    scope.spawn(|| {
+                        cpu.cpu.rip = 0x1000;
+                        start.wait();
+                        assert!(matches!(cpu.run(&vm, Some(4)), Exit::Hlt));
+                        assert!(cpu.fast.iter().all(|e| e.entry.0.is_null()));
+                        assert!(cpu.ibtc_refills.is_empty());
+                        assert_eq!(cpu.ret_stack.sp, 0);
+                    });
+                }
+            });
+            assert!(vm.cache.publication_generation() > generation);
+            assert_eq!(links.load(Ordering::Relaxed), links_before + 1);
+            assert!(!vm
+                .cache
+                .publish_tier_up(key, old, None, request, |_| panic!("stale publication")));
+            assert_eq!(vm.cache.tier_pending_len(), 0);
+        }
     }
 
     #[test]

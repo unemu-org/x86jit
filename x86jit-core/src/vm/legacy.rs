@@ -1451,11 +1451,18 @@ fn resolve_alias_uncached<const DEFAULT: bool>(
     mxcsr: u32,
 ) -> Result<Arc<IrBlock>, ResolveFailure> {
     let source = crate::memory::LiftSource::new(&vm.mem);
-    resolve_real16_uncached::<DEFAULT>(vm, &source, exit_word, sections, at, mxcsr).map(|block| {
-        match block {
-            CachedBlock::Interpreted(ir) => ir,
-            _ => unreachable!(),
-        }
+    resolve_interpreted_uncached::<DEFAULT>(
+        vm,
+        &source,
+        exit_word,
+        sections,
+        at,
+        CpuMode::Real16,
+        mxcsr,
+    )
+    .map(|block| match block {
+        CachedBlock::Interpreted(ir) => ir,
+        _ => unreachable!(),
     })
 }
 
