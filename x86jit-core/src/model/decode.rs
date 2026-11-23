@@ -13,7 +13,22 @@
 //! (Intel486 PRM App. A pp. A-4–7). Width variants are separate encodings.
 use super::ModelIsa;
 mod i8086;
-use iced_x86::{Code, Instruction, Register};
+use iced_x86::{Code, DecoderOptions, Instruction, Register};
+
+// SDM Vol 2B §4.3 PAUSE p. 4-226: before Pentium 4, F3 90 is NOP.
+// Vol 2A §3.3 LZCNT p. 3-578 / Vol 2B §4.3 TZCNT p. 4-730:
+// without the extensions, F3 0F BD/BC execute BSR/BSF. Intel486 PRM
+// §26 REP p. 26-246 ignores REP on non-strings (LOOP is unspecified),
+// including F3 0F 09 (WBINVD, §26 p. 26-281).
+// 8086 UM §2.7 pp. 2-42–43, 286 PRM App. B REP pp. B-92–93 and
+// NEC UM §12 p. 12-15 describe string uses only: ignoring REP/REPNE
+// on ordinary non-strings is ASSUMED. 386 PRM §17 REP p. 17-141 says
+// #UD there; SDM PAUSE and the bit-scan entries govern their explicit
+// backward-compatible forms. F2 90 is an ASSUMED NOP compatibility case.
+const HISTORICAL_PREFIX_OPTIONS: u32 = DecoderOptions::NO_PAUSE
+    | DecoderOptions::NO_WBNOINVD
+    | DecoderOptions::NO_MPFX_0FBC
+    | DecoderOptions::NO_MPFX_0FBD;
 
 // SDM Vol 3B §25.15 pp. 25-5–6: absent reserved encodings raise #UD;
 // defined aliases are decoded as their canonical instruction. None means a
@@ -822,13 +837,13 @@ struct DecodeSet {
 // that document's p. 13 gives 0F04H exception 13 at CPL > 0 (spec.md).
 const I286_SET: DecodeSet = DecodeSet {
     models: 1,
-    options: iced_x86::DecoderOptions::MOV_TR | iced_x86::DecoderOptions::LOADALL286,
+    options: HISTORICAL_PREFIX_OPTIONS | DecoderOptions::MOV_TR | DecoderOptions::LOADALL286,
     absent: Some(6),
     legacy_segments_only: true,
 };
 const I486_SET: DecodeSet = DecodeSet {
     models: 18,
-    options: iced_x86::DecoderOptions::MOV_TR,
+    options: HISTORICAL_PREFIX_OPTIONS | DecoderOptions::MOV_TR,
     absent: Some(6),
     legacy_segments_only: false,
 };
@@ -838,7 +853,7 @@ const I486_CPUID_SET: DecodeSet = DecodeSet {
 };
 const I386_SET: DecodeSet = DecodeSet {
     models: 2,
-    options: iced_x86::DecoderOptions::MOV_TR,
+    options: HISTORICAL_PREFIX_OPTIONS | DecoderOptions::MOV_TR,
     absent: Some(6),
     legacy_segments_only: false,
 };
@@ -956,6 +971,32 @@ impl ModelIsa {
             .unwrap_or(0);
         if models & mask == 0 {
             return absent;
+        }
+        // 386 PRM §17 REP p. 17-141: #UD on non-strings. The SDM
+        // explicitly defines F3 90 and F3 0F BC/BD on older CPUs (above).
+        // F2 90 is ASSUMED to share NOP's ignored-prefix behavior.
+        if self == Self::I80386 {
+            let repeat = bytes
+                .iter()
+                .take_while(|b| {
+                    matches!(
+                        b,
+                        0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+                    )
+                })
+                .filter(|b| matches!(b, 0xf2 | 0xf3))
+                .last();
+            if repeat.is_some()
+                && !insn.is_string_instruction()
+                && !matches!(insn.code(), Code::Nopw | Code::Nopd)
+                && !(repeat == Some(&0xf3)
+                    && matches!(
+                        insn.mnemonic(),
+                        iced_x86::Mnemonic::Bsf | iced_x86::Mnemonic::Bsr
+                    ))
+            {
+                return absent;
+            }
         }
         if self.set().legacy_segments_only
             && (self.unavailable_prefix(bytes)

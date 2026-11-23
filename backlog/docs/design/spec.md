@@ -2504,6 +2504,26 @@ and a call-gate CALL and RETF round trip, each retain two contexts and relift
 nothing after the first trip
 (`ring_trips_retain_two_contexts_and_relift_nothing`).
 
+Machine decode selects the historical meanings of redundant prefixes: F3 90
+is NOP (SDM Vol 2B §4.3 PAUSE p. 4-226); F3 0F BC/BD are BSF/BSR
+without TZCNT/LZCNT (Vol 2B §4.3 TZCNT p. 4-730; Vol 2A §3.3 LZCNT
+p. 3-578); F3 0F 09 is WBINVD on the 486 (Intel486 PRM §26 REP
+p. 26-246). Application decode and generated code are unchanged.
+
+Intel486 PRM §26 REP pp. 26-244–246 explicitly ignores REP/REPNE before
+non-string instructions except LOOP, for which proper operation is not
+guaranteed. The 8086 UM §2.7 pp. 2-42–43, 286 PRM App. B REP pp. B-92–93
+and NEC V20/V30 UM §12 p. 12-15 describe string uses only; ignoring these
+prefixes on ordinary non-strings is **ASSUMED** for those models. The 386
+PRM §17 REP p. 17-141 specifies #UD on non-strings: for F3 90 the engine
+follows the SDM's explicit backward-compatibility statement, as it does for
+F3 BSF/BSR. F2 90 is an **ASSUMED** NOP compatibility case. Other 386
+non-string REP forms raise #UD as specified by its PRM. ESC, NEC extensions,
+string-repeat combinations and LOCK retain their separate policies. The
+witnesses live in `legacy_redundant_prefix`; the ignored
+`legacy_census_386::redundant_prefix_census` reports the one-byte/0F CPU
+forms under REP/REPNE, segment, operand-size and address-size prefixes.
+
 Decision-23 C2 adds `I8088` and `I8086`. Both select the 8086 instruction set,
 `system = None`, twenty physical address bits, no instruction-length limit,
 `None`/`Present` FPU policies and no timing table. The 8086 Family User's Manual

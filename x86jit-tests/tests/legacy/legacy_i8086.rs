@@ -273,7 +273,6 @@ fn later_and_undefined_encodings_are_typed_refusals() {
         b"\xf3\xd9\xe8",
         b"\xf2\xa4",
         b"\xf2\xab",
-        b"\xf3\x90",
         b"\xd4\x09",
         b"\xd5\x0b",
     ];
@@ -2432,57 +2431,43 @@ fn a_locked_instruction_is_one_instruction_to_interrupts_and_traps() {
     }
 }
 
-// xj-50w.12 changes the twenty-bit entries' decode and lowering (LOCK), so
-// their prefix revision word, and with it their identities, change. Of the
-// system models, the I80286 identity changes with its own quirk fields
-// (xj-50w.11) and the I80386 identity does not (values of b2ac76e4 on the
-// left). xj-ir6.33 changes no identity: its device transfers are interpreter
-// behaviour, and no lifting rule or catalogue field changes. xj-50w.19 then
-// raises the NEC extension revision word to 2 (the segment-register store
-// holds NMI as well as INT): the NEC "after" values below are that revision's
-// (2a386bfd83ff8f1f and 2a386bfd83ff8f27 after xj-50w.12); its new
-// `nmi_nesting` field keeps its canonical value everywhere and moves nothing.
-// xj-50w.20's `data_bus_bits` departs from its canonical value only on the
-// I8086 and NecV30: their "after" values below are that change's
-// (8815844fbd9d4557 and cd4816e26331d184 before it).
+// Model semantics IDs include the historical prefix decoder policy.
 #[test]
-fn lock_admission_changes_only_the_twenty_bit_identities() {
+fn prefix_policy_changes_machine_identities() {
     for (model, before, after) in [
         (
             CpuModel::I8088,
-            0x22fb_677c_f449_d2fe,
             0x8815_844f_bd9d_4559,
+            0x0b71_3477_b270_a8b9,
         ),
         (
             CpuModel::I8086,
-            0x22fb_677c_f449_d2f0,
             0xde9d_608e_bea8_4545,
+            0xe283_0b47_9d3b_74e5,
         ),
         (
             CpuModel::NecV20,
-            0x909a_c76c_b38b_71d8,
             0xcd48_16e2_6331_d1bc,
+            0xd70e_6f86_6f32_e09c,
         ),
         (
             CpuModel::NecV30,
-            0x909a_c76c_b38b_71e0,
             0x196e_97d4_9eba_3cd2,
+            0x9868_73c6_78e7_9ab2,
         ),
         (
             CpuModel::I80286,
-            0x3699_e02a_8ef1_3e63,
-            // xj-50w.11 gives the 80286 its own quirk fields; xj-50w.12 does not touch it.
-            // xj-oog adds LOADALL to its decode set (0x24d3_4f81_af8d_a20b before).
             0x7357_723a_3f16_2910,
+            0xa812_1b75_802e_461b,
         ),
         (
             CpuModel::I80386,
             0xe8d0_0c17_f97e_b71f,
-            0xe8d0_0c17_f97e_b71f,
+            0xc82b_1bb8_08a6_d958,
         ),
     ] {
         assert_eq!(model.profile().semantics_id, after, "{model:?}");
-        assert_eq!(before == after, model == CpuModel::I80386, "{model:?}");
+        assert_ne!(before, after, "{model:?}");
     }
 }
 

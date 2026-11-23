@@ -786,26 +786,17 @@ mod tests {
         assert_ne!(I80286.semantics_id, I80386.semantics_id);
     }
 
-    // xj-50w.11: the 80286 LOCK and coprocessor-overrun fields change only the
-    // I80286 identity. The other entries keep their b2ac76e4 values, pinned by
-    // value; I80286's departed from 3699e02a8ef13e63. xj-oog adds LOADALL to
-    // the 80286 encoding set and decoder flags alone: I80286 moves from
-    // 24d34f81af8da20b to the value pinned below, and no other entry moves.
+    // Historical prefix decoder options participate in every Machine identity.
+    // Pin the catalogue after selecting NOP/BSF/BSR/WBINVD instead of their
+    // later mandatory-prefix interpretations (spec.md §17.10).
     #[test]
-    fn only_the_80286_identity_follows_its_new_quirk_fields() {
+    fn machine_identities_include_historical_prefix_policy() {
         for (model, identity) in [
-            (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f_u64),
-            // The 8086-family values after xj-50w.12's LOCK revision word.
-            (CpuModel::I8088, 0x8815_844f_bd9d_4559),
-            // xj-50w.20: the sixteen-bit data bus moves the I8086 identity
-            // from 0x8815_844f_bd9d_4557.
-            (CpuModel::I8086, 0xde9d_608e_bea8_4545),
-            // The NEC values after xj-50w.19's NEC_EXTENSION_REVISION 2 (the
-            // segment-register store holds NMI); they were 0x2a38_6bfd_83ff_8f1f
-            // and 0x2a38_6bfd_83ff_8f27. xj-50w.20 moves the V30 from
-            // 0xcd48_16e2_6331_d184 with its sixteen-bit data bus.
-            (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
-            (CpuModel::NecV30, 0x196e_97d4_9eba_3cd2),
+            (CpuModel::I80386, 0xc82b_1bb8_08a6_d958_u64),
+            (CpuModel::I8088, 0x0b71_3477_b270_a8b9),
+            (CpuModel::I8086, 0xe283_0b47_9d3b_74e5),
+            (CpuModel::NecV20, 0xd70e_6f86_6f32_e09c),
+            (CpuModel::NecV30, 0x9868_73c6_78e7_9ab2),
         ] {
             assert_eq!(model.profile().semantics_id, identity, "{model:?}");
             assert!(!model.profile().quirks.lock_data_movement, "{model:?}");
@@ -814,7 +805,7 @@ mod tests {
         let q = CpuModel::I80286.profile().quirks;
         assert!(q.lock_data_movement);
         assert_eq!(q.coprocessor_overrun_vector, Some(9));
-        assert_eq!(I80286.semantics_id, 0x7357_723a_3f16_2910);
+        assert_eq!(I80286.semantics_id, 0xa812_1b75_802e_461b);
         // The two quirk fields feed the identity.
         let mut canonical = copy(&I80286);
         canonical.quirks.lock_data_movement = false;

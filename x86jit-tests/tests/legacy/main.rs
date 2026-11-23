@@ -36,6 +36,7 @@ mod legacy_real;
 mod legacy_real_exceptions;
 mod legacy_real_parity;
 mod legacy_real_sp_wrap;
+mod legacy_redundant_prefix;
 mod legacy_rep_fault_flags;
 mod legacy_rollback_sweep;
 mod legacy_sse_integer;

@@ -735,3 +735,109 @@ fn runtime_census_for(model: CpuModel) {
     std::fs::write(&path, report).unwrap();
     eprintln!("Census rows: {path}");
 }
+
+/// Sweep defined one-byte/0F CPU forms with redundant prefixes. Keep modern
+/// decoder labels in the report: a changed label is evidence of reinterpretation,
+/// not evidence that the historical model has that instruction. See
+/// legacy_redundant_prefix for the per-generation REP assumptions and citations.
+#[test]
+#[ignore = "manual redundant-prefix census; emits TSV runtime artifacts"]
+fn redundant_prefix_census() {
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        let mut report = String::from("model\tmode\tprefix\tbytes\tdecoded\tbaseline\toutcome\n");
+        for mode in [Mode::Real, Mode::P16, Mode::P32] {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut counts = BTreeMap::<String, usize>::new();
+            let mut regressions = BTreeMap::<String, usize>::new();
+            for p in probes(model, mode) {
+                if p.x87
+                    || p.reserved
+                    || p.bytes
+                        .first()
+                        .is_some_and(|b| matches!(b, 0x66 | 0x67 | 0xf2 | 0xf3))
+                    || !seen.insert((
+                        p.insn.code() as u32,
+                        p.shape,
+                        p.insn.op0_register() as u32,
+                        p.insn.op1_register() as u32,
+                    ))
+                {
+                    continue;
+                }
+                let baseline = prefix_outcome(model, &p, mode);
+                for prefix in [0xf2, 0xf3, 0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67] {
+                    let mut bytes = vec![prefix];
+                    bytes.extend(&p.bytes);
+                    bytes.resize(15, 0);
+                    let insn =
+                        Decoder::with_ip(mode.bits(), &bytes, 0x1000, DecoderOptions::MOV_TR)
+                            .decode();
+                    // An operand-size prefix may change immediate length; padding
+                    // is deliberate. Do not discard decoder-invalid forms.
+                    bytes.truncate(insn.len());
+                    let q = Probe {
+                        bytes,
+                        insn,
+                        ..p.clone()
+                    };
+                    let outcome = prefix_outcome(model, &q, mode);
+                    *counts.entry(outcome.clone()).or_default() += 1;
+                    if outcome != baseline
+                        && matches!(
+                            outcome.as_str(),
+                            "ud" | "refused" | "unknown" | "panic" | "step-error"
+                        )
+                    {
+                        *regressions
+                            .entry(format!("{prefix:02X}/{}/{outcome}", p.insn))
+                            .or_default() += 1;
+                    }
+                    let bytes: String = q.bytes.iter().map(|b| format!("{b:02X}")).collect();
+                    writeln!(
+                        report,
+                        "{model:?}\t{mode:?}\t{prefix:02X}\t{bytes}\t{}\t{baseline}\t{outcome}",
+                        q.insn
+                    )
+                    .unwrap();
+                }
+            }
+            eprintln!(
+                "PREFIX CENSUS {model:?}/{mode:?}: {counts:?}; new refusals/UD={regressions:?}"
+            );
+            writeln!(
+                report,
+                "# {model:?}/{mode:?}: {counts:?}; new refusals/UD={regressions:?}"
+            )
+            .unwrap();
+            assert_eq!(counts.get("panic"), None);
+            assert_eq!(counts.get("step-error"), None);
+        }
+        let path = std::env::temp_dir().join(format!("census-{model:?}-prefixes.tsv"));
+        std::fs::write(&path, report).unwrap();
+        eprintln!("Prefix census rows: {}", path.display());
+    }
+}
+
+fn prefix_outcome(model: CpuModel, p: &Probe, mode: Mode) -> String {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (vm, mut cpu) = setup(model, p, mode, false);
+        match cpu.run_steps(&vm, 1, StepOptions::default()) {
+            Ok(run) => match run.stop() {
+                StepStop::Exit(Exit::Exception { vector: 6, .. }) => "ud",
+                StepStop::Exit(Exit::Exception { .. }) => "fault",
+                StepStop::Exit(Exit::UnsupportedSystemContext { .. }) => "refused",
+                StepStop::Exit(Exit::UnknownInstruction { .. }) => "unknown",
+                StepStop::Exit(Exit::BudgetExhausted | Exit::Hlt) => "executes",
+                StepStop::Exit(Exit::PortIo { .. }) => "io",
+                _ => "other",
+            },
+            Err(_) => "step-error",
+        }
+    }))
+    .unwrap_or("panic")
+    .to_owned()
+}

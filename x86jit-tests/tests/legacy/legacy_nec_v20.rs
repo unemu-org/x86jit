@@ -421,7 +421,6 @@ fn compatibility_aliases_execute_and_other_forms_are_refused() {
             b"\x2e\x0f\xff\x80",
             b"\xf2\x6c",
             b"\x26\x6c",
-            b"\xf3\x90",
             b"\x0f\xa2",
             b"\xf3\x26\x2e\x3e\x6e",
         ] {

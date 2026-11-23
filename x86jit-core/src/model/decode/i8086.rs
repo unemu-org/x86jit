@@ -4,7 +4,7 @@ use iced_x86::{Instruction, Mnemonic, Register};
 
 pub(super) const SET: DecodeSet = DecodeSet {
     models: 4,
-    options: iced_x86::DecoderOptions::NO_INVALID_CHECK,
+    options: iced_x86::DecoderOptions::NO_INVALID_CHECK | iced_x86::DecoderOptions::NO_PAUSE,
     absent: None,
     legacy_segments_only: true,
 };
@@ -14,7 +14,7 @@ pub(super) const SET: DecodeSet = DecodeSet {
 // assigns vectors 0-5 only), so every unlisted form is a typed refusal.
 pub(super) const NEC_SET: DecodeSet = DecodeSet {
     models: 4 | 8,
-    options: iced_x86::DecoderOptions::NO_INVALID_CHECK,
+    options: iced_x86::DecoderOptions::NO_INVALID_CHECK | iced_x86::DecoderOptions::NO_PAUSE,
     absent: None,
     legacy_segments_only: true,
 };
@@ -110,32 +110,9 @@ fn decode_model<const NEC: bool>(bytes: &[u8], insn: &Instruction) -> DecodeActi
     {
         return absent;
     }
-    // UM §2.7 pp. 2-42–43 defines REP for MOVS/STOS/LODS and REPE/REPNE
-    // for CMPS/SCAS. Other prefix/instruction combinations remain refused.
-    // NEC UM p. 12-15 adds REP (F3h) for OUTM and INM; REPNE stays a
-    // block-comparison prefix only.
-    let port_string = matches!(
-        insn.mnemonic(),
-        Mnemonic::Insb | Mnemonic::Insw | Mnemonic::Outsb | Mnemonic::Outsw
-    );
-    if bytes[..first].iter().any(|b| matches!(b, 0xf2 | 0xf3))
-        && !matches!(
-            insn.mnemonic(),
-            Mnemonic::Movsb
-                | Mnemonic::Movsw
-                | Mnemonic::Stosb
-                | Mnemonic::Stosw
-                | Mnemonic::Lodsb
-                | Mnemonic::Lodsw
-                | Mnemonic::Cmpsb
-                | Mnemonic::Cmpsw
-                | Mnemonic::Scasb
-                | Mnemonic::Scasw
-        )
-        && !(NEC && port_string)
-    {
-        return absent;
-    }
+    // ASSUMED: REP/REPNE on ordinary non-strings is ignored; the manuals
+    // describe string uses only (sources in decode.rs). ESC and the NEC
+    // extensions retain their separate prefix policies.
     // NEC UM p. 12-28: INM's destination is always DS1 and "a segment
     // override prefix is prohibited"; its effect is not described.
     if NEC
@@ -147,9 +124,18 @@ fn decode_model<const NEC: bool>(bytes: &[u8], insn: &Instruction) -> DecodeActi
         return absent;
     }
     if bytes[..first].contains(&0xf2)
-        && !matches!(
+        && matches!(
             insn.mnemonic(),
-            Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Scasb | Mnemonic::Scasw
+            Mnemonic::Movsb
+                | Mnemonic::Movsw
+                | Mnemonic::Stosb
+                | Mnemonic::Stosw
+                | Mnemonic::Lodsb
+                | Mnemonic::Lodsw
+                | Mnemonic::Insb
+                | Mnemonic::Insw
+                | Mnemonic::Outsb
+                | Mnemonic::Outsw
         )
     {
         return absent;

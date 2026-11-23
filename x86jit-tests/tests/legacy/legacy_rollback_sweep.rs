@@ -8,6 +8,8 @@ use x86jit_core::{
     VmConfig,
 };
 
+// 386 PRM §17 REP p. 17-141: non-string REP forms fault before operand
+// access; these are included in the pinned fault counts below.
 // Memory kind 1 maps RAM at 0x4000 next to the RAM at 0x5000, so an operand at
 // 0x4fff covers two adjacent RAM regions and completes instead of faulting.
 // Memory kind 2 maps a Trap region there: an XCHG or LOCK byte operand at 0x4fff
@@ -16,12 +18,12 @@ use x86jit_core::{
 // kept UnknownInstruction.
 #[test]
 fn checked_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_498));
+    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_714));
 }
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_722));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_902));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {

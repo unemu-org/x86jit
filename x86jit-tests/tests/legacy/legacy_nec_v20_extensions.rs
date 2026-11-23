@@ -93,25 +93,16 @@ fn assert_refused(model: CpuModel, code: &[u8]) {
 }
 
 #[test]
-fn catalogue_identities_change_only_for_the_nec_entries() {
-    // Values of 29ddeda9 (before C4b) for the system entries; the NEC entries
-    // gain the extension revision word and keep differing by bus. The
-    // twenty-bit values are those after xj-50w.12, which changed all four
-    // (legacy_i8086.rs `lock_admission_changes_only_the_twenty_bit_identities`).
-    // I80286 takes its xj-50w.11 quirk fields (3699e02a8ef13e63 before them)
-    // and xj-oog's LOADALL encoding (24d34f81af8da20b before it).
-    // xj-50w.19 raises the NEC extension revision word to 2 (the segment
-    // register store holds NMI as well as INT), so only the NEC entries move
-    // again; they were 2a386bfd83ff8f1f and 2a386bfd83ff8f27. xj-50w.20's
-    // sixteen-bit data bus moves the I8086 and NecV30 only; they were
-    // 8815844fbd9d4557 and cd4816e26331d184.
+fn catalogue_identities_include_native_prefix_policy() {
+    // Prefix decoder options join the existing NEC extension revision and
+    // bus-width fields in the identity (spec.md §17.10).
     for (model, id) in [
-        (CpuModel::I8088, 0x8815_844f_bd9d_4559),
-        (CpuModel::I8086, 0xde9d_608e_bea8_4545),
-        (CpuModel::I80286, 0x7357_723a_3f16_2910),
-        (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f),
-        (CpuModel::NecV20, 0xcd48_16e2_6331_d1bc),
-        (CpuModel::NecV30, 0x196e_97d4_9eba_3cd2),
+        (CpuModel::I8088, 0x0b71_3477_b270_a8b9),
+        (CpuModel::I8086, 0xe283_0b47_9d3b_74e5),
+        (CpuModel::I80286, 0xa812_1b75_802e_461b),
+        (CpuModel::I80386, 0xc82b_1bb8_08a6_d958),
+        (CpuModel::NecV20, 0xd70e_6f86_6f32_e09c),
+        (CpuModel::NecV30, 0x9868_73c6_78e7_9ab2),
     ] {
         assert_eq!(model.profile().semantics_id, id, "{model:?}");
     }
