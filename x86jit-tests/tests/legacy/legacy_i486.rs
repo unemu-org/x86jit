@@ -747,3 +747,26 @@ fn locked_xadd_and_cmpxchg_from_two_vcpus_lose_no_update() {
         }
     }
 }
+
+#[test]
+fn external_numeric_error_routing_is_not_offered_on_the_486_entries() {
+    // On the 486, CR0.NE is the routing authority (fpu-error-routing.md, maintainer
+    // decision 4); until that is implemented, both entries keep the internal route.
+    for model in MODELS {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(model);
+        assert_eq!(
+            vm.set_numeric_error_route(x86jit_core::NumericErrorRoute::External),
+            Err(x86jit_core::NumericErrorConfigError::UnsupportedModel)
+        );
+        let (_vm, mut cpu) = setup(model, Mode::Real, &[0xf4]);
+        assert_eq!(
+            cpu.set_numeric_error_route(x86jit_core::NumericErrorRoute::External),
+            Err(x86jit_core::NumericErrorConfigError::UnsupportedModel)
+        );
+        assert_eq!(
+            cpu.numeric_error_route(),
+            x86jit_core::NumericErrorRoute::Internal
+        );
+    }
+}

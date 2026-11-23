@@ -473,6 +473,83 @@ pub struct CpuState {
     /// Catalogue-owned AC/ID availability on Machine execution. Refreshed at
     /// dispatch entry; inert in Application profiles. Appended for ABI stability.
     pub machine_flags_mask: u32,
+    /// Runtime Machine numeric-error wiring (§17.9), independent of delivery policy.
+    pub numeric_error_route: NumericErrorRoute,
+    /// Checkpointed notification and board-interlock state; ES remains the source.
+    pub external_numeric_error: ExternalNumericErrorState,
+}
+
+/// Numeric-error wiring for supported Machine I80286/I80386 contexts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NumericErrorRoute {
+    /// Direct CPU connection, reporting exception 16 at a recognition point.
+    #[default]
+    Internal,
+    /// Embedder-owned board interrupt and acknowledgement interlock.
+    External,
+}
+
+/// CPU-side checkpoint state for the external board abstraction (§17.9).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct ExternalNumericErrorState {
+    /// The active numeric episode has already produced its assertion exit.
+    pub reported: bool,
+    /// Board interlock, released only by an explicit embedder acknowledgement.
+    pub held: bool,
+    /// Reserved input for a future 486 model; unused by 286/386 execution.
+    pub ignne: bool,
+}
+
+/// A rejected numeric-error configuration or board acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericErrorConfigError {
+    UnsupportedProfile,
+    UnsupportedModel,
+    CoprocessorAbsent,
+    ContinuationInFlight,
+    ConfigurationLocked,
+    ExternalRouteRequired,
+}
+
+impl std::fmt::Display for NumericErrorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "numeric-error configuration rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for NumericErrorConfigError {}
+
+impl CpuState {
+    /// Raw committed ERROR level (80286/287 PRM Part II Ch. 1, Fig. 1-4
+    /// p. 1-10; 80386 PRM §11.1.5.3). Does not recompute the caller's image.
+    pub fn numeric_error_pending(&self) -> bool {
+        self.fpu_sw & 0x80 != 0
+    }
+
+    /// Observe only committed numeric state (§17.9). Board acknowledgement
+    /// releases `held` separately; clearing ES only re-arms notification.
+    pub(crate) fn reconcile_numeric_error(&mut self, addr: u64) -> Option<crate::Exit> {
+        if !self.numeric_error_pending() {
+            self.external_numeric_error.reported = false;
+            return None;
+        }
+        if self.numeric_error_route != NumericErrorRoute::External
+            || self.fpu_model != FpuModel::Present
+        {
+            return None;
+        }
+        if !self.external_numeric_error.reported {
+            self.external_numeric_error.reported = true;
+            self.external_numeric_error.held = true;
+            return Some(crate::Exit::ExternalNumericError {
+                addr,
+                event: crate::NumericErrorEvent::Asserted,
+            });
+        }
+        None
+    }
 }
 
 /// Coprocessor policy independent of the CPU model (decision-23 §4).
@@ -670,6 +747,8 @@ impl Default for CpuState {
             // TR reset values are unspecified here; choose zero.
             debug_test_registers: [0, 0, 0, 0, 0xffff_0ff0, 0x400, 0, 0],
             machine_flags_mask: 0,
+            numeric_error_route: NumericErrorRoute::Internal,
+            external_numeric_error: ExternalNumericErrorState::default(),
         }
     }
 }

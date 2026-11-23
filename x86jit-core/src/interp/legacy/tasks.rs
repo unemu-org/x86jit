@@ -211,6 +211,8 @@ impl Owner {
             task_debug_trap,
             debug_test_registers,
             machine_flags_mask,
+            numeric_error_route,
+            external_numeric_error,
         ) && self.cpu.flags == cpu.flags
             && self.cpu.flags.pf_src == cpu.flags.pf_src
             && self.cpu.flags.af_src == cpu.flags.af_src

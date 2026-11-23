@@ -1147,3 +1147,54 @@ fn direct_refusals_report_the_instruction_bytes() {
         }
     }
 }
+
+// H1: 80286 PRM Part I Appendix B #MF/#MP p. B-9. External routing
+// substitutes the embedder board hold for direct ERROR recognition; its
+// acknowledgement preserves ES and exposes the existing overrun policy.
+#[test]
+fn external_numeric_hold_precedes_286_overrun_but_acknowledgement_releases_it() {
+    use x86jit_core::{NumericErrorEvent as E, NumericErrorRoute as R};
+    for checked in [false, true] {
+        for no_wait in [false, true] {
+            let code: &[u8] = if no_wait {
+                &[0xdd, 0x36, 0xb0, 0xff]
+            } else {
+                &[0xdd, 0x06, 0xfc, 0xff]
+            };
+            let (vm, mut cpu) = machine(CpuModel::I80286, FpuModel::Present, code);
+            if checked {
+                cpu.cpu.legacy.segments[SegmentId::Fs as usize].attributes = 0x92;
+            }
+            cpu.set_numeric_error_route(R::External).unwrap();
+            cpu.cpu.fpu_cw = 0x037e;
+            cpu.cpu.fpu_sw = 0x0081;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(matches!(
+                r.stop(),
+                StepStop::Exit(Exit::ExternalNumericError {
+                    addr: 0x1000,
+                    event: E::Asserted
+                })
+            ));
+            if !no_wait {
+                let before = format!("{:?}", cpu.cpu);
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), 0);
+                assert!(matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::ExternalNumericError {
+                        addr: 0x1000,
+                        event: E::Waiting
+                    })
+                ));
+                assert_eq!(format!("{:?}", cpu.cpu), before);
+                cpu.ack_external_numeric_error().unwrap();
+                assert!(cpu.numeric_error_pending());
+            }
+            // No-wait FNSAVE keeps the pre-existing overrun, even while held.
+            let (actual, _, saved, ..) = exception(&vm, &mut cpu);
+            assert_eq!((actual, saved), (9, 0x1000));
+        }
+    }
+}

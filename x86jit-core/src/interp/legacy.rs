@@ -3235,9 +3235,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 }
                 return Ok(false);
             }
-            if crate::x87::mf_pending_before(cpu, *kind) {
-                return Err(exception(cpu, 16));
-            }
+            numeric_error_before(cpu, *kind)?;
             let address = read_val(*addr, temps);
             let fp = PhysicalFpMemory::<ROUTED> {
                 memory: &mem.0,
@@ -3302,6 +3300,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 // programming model: each non-control ESC records its opcode.
                 // SDM Vol 1 §8.1.9.1 p. 8-10 describes this original policy.
                 cpu.fpu_fop = *instruction as u16 & 0x7ff;
+            }
+            // Numeric transfers and pointer updates have committed; the typed
+            // exit is instruction-produced and includes this retirement.
+            if cpu.numeric_error_route == crate::NumericErrorRoute::External {
+                outcome.exit = cpu.reconcile_numeric_error(next);
             }
             None
         }
@@ -4528,8 +4531,8 @@ fn coprocessor_overrun(
     {
         return Ok(());
     }
-    if kind.is_some_and(|kind| crate::x87::mf_pending_before(cpu, kind)) {
-        return Err(exception(cpu, 16));
+    if let Some(kind) = kind {
+        numeric_error_before(cpu, kind)?;
     }
     Err(legacy::coprocessor_overrun_fault(
         cpu, vector, offset, bytes, access,
@@ -4593,6 +4596,23 @@ impl<const ROUTED: bool, const ORDER: u8> super::InstructionExecutor<'_>
             Err(exit) => Some(WalkResult::exit(exit)),
         }
     }
+}
+
+// 80286 PRM Part I Appendix B #MF p. B-9; 80386 PRM §§11.1.2,
+// 11.1.5.3: direct ERROR recognition precedes the waiting operation.
+// External hold/acknowledgement is an engine abstraction of embedder board wiring.
+fn numeric_error_before(cpu: &CpuState, kind: crate::x87::FpuKind) -> Result<(), Exit> {
+    if cpu.numeric_error_route == crate::NumericErrorRoute::External {
+        if crate::x87::waits_for_pending(kind) && cpu.external_numeric_error.held {
+            return Err(Exit::ExternalNumericError {
+                addr: cpu.rip,
+                event: crate::NumericErrorEvent::Waiting,
+            });
+        }
+    } else if crate::x87::mf_pending_before(cpu, kind) {
+        return Err(exception(cpu, 16));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

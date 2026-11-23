@@ -200,7 +200,7 @@ pub use delivery_log::{
 pub use disasm::{disassemble, print_disassembly, DecodedInsn};
 pub use exit::{
     AccessKind, ExecutionEvidence, Exit, I8080Entry, I8080Handback, I8080HandbackError, I8080View,
-    PortDir, StepResult, UnsupportedSystemOperation,
+    NumericErrorEvent, PortDir, StepResult, UnsupportedSystemOperation,
 };
 pub use fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultAddress, FaultCause, FaultClass,
@@ -235,8 +235,9 @@ pub use model::{
     CpuModel, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming, NmiNesting,
 };
 pub use state::{
-    CpuSource, CpuState, Flags, FpuModel, RandomKind, Reg, TscSample, X87PointerModel,
-    X87Precision, AF_SRC_ONE, AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
+    CpuSource, CpuState, ExternalNumericErrorState, Flags, FpuModel, NumericErrorConfigError,
+    NumericErrorRoute, RandomKind, Reg, TscSample, X87PointerModel, X87Precision, AF_SRC_ONE,
+    AF_SRC_ZERO, PF_SRC_ONE, PF_SRC_ZERO,
 };
 pub use time_stats::{
     BackendTimeStats, ExitTimeStats, ExitsTimeStats, SampledTimeStats, TimeStats,

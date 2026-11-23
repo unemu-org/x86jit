@@ -1141,7 +1141,7 @@ fn set_codes(cpu: &mut CpuState, c3: bool, c2: bool, c0: bool) {
 /// waiting variants of these six do not check either. The difference is only observable
 /// to a guest that uses `fclex` rather than `fnclex` *while* an unmasked exception is
 /// pending and expects the trap to come from the `fclex` itself.
-fn waits_for_pending(kind: FpuKind) -> bool {
+pub(crate) fn waits_for_pending(kind: FpuKind) -> bool {
     use FpuKind::*;
     !matches!(
         kind,

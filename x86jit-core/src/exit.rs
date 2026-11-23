@@ -1,5 +1,14 @@
 //! Return-based exit reasons and the backend execution result (§5.2, §8).
 
+/// External numeric-error handoff position (§17.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericErrorEvent {
+    /// A committed source became active; RIP names the next instruction.
+    Asserted,
+    /// The board interlock holds a waiting instruction at RIP, with no progress.
+    Waiting,
+}
+
 /// Owned execution identity for a non-fault exit (§5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionEvidence {
@@ -242,6 +251,9 @@ pub enum UnsupportedSystemOperation {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Exit {
+    /// External board handoff (§17.9). Assertion is post-instruction; waiting
+    /// is pre-instruction. Neither is a CPU exception or a delivered interrupt.
+    ExternalNumericError { addr: u64, event: NumericErrorEvent },
     /// Guest executed syscall/sysenter/int 0x80. Args are in guest registers.
     /// Execution identity and instruction RIP are available through
     /// [`crate::Vcpu::syscall_evidence`] until the next `run`.

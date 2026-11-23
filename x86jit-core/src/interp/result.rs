@@ -49,6 +49,10 @@ pub(super) fn consume_current() -> Option<Exit> {
 // into_exit before another fault can be recorded. A pending record abandoned by a panic is bounded to one box and is
 // replaced by the next recorded fault or destroyed with the thread's TLS.
 pub(crate) enum InterpExit {
+    ExternalNumericError {
+        addr: u64,
+        event: crate::NumericErrorEvent,
+    },
     Syscall,
     Hlt,
     DetailedUnmapped {
@@ -100,6 +104,9 @@ impl InterpExit {
     #[inline(always)]
     pub(super) fn from_exit(exit: Exit) -> Self {
         match exit {
+            Exit::ExternalNumericError { addr, event } => {
+                Self::ExternalNumericError { addr, event }
+            }
             Exit::UnsupportedSystemContext { addr, operation } => {
                 Self::UnsupportedSystemContext { addr, operation }
             }
@@ -165,6 +172,9 @@ impl InterpExit {
     #[inline(always)]
     pub(crate) fn into_exit(self) -> Exit {
         match self {
+            Self::ExternalNumericError { addr, event } => {
+                Exit::ExternalNumericError { addr, event }
+            }
             Self::UnsupportedSystemContext { addr, operation } => {
                 Exit::UnsupportedSystemContext { addr, operation }
             }

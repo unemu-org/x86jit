@@ -451,6 +451,9 @@ impl RepInputs20 {
     }
 }
 
+const HANDOFF_DEBUG: u8 = 1;
+const HANDOFF_NUMERIC: u8 = 2;
+
 pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
@@ -477,8 +480,9 @@ pub(super) struct Execution {
     // Accepted event delivery can itself hand off an MMIO transfer. Its retry
     // must complete before executing the interrupted instruction (decision-16 §3).
     event_retry: Option<PendingEvent>,
-    // Port handoffs must reach the embedder before the post-instruction trap.
-    port_debug: bool,
+    // Port/numeric handoffs precede the post-instruction trap. External
+    // routing shares the service load; Internal does not add a boundary check.
+    handoff_service: u8,
     shutdown: bool,
     pub(super) pending_a20_enabled: Option<bool>,
     direct_proofs: DirectProofs,
@@ -515,7 +519,7 @@ impl Execution {
             #[cfg(test)]
             lifts: 0,
             event_retry: None,
-            port_debug: false,
+            handoff_service: 0,
             shutdown: false,
             pending_a20_enabled: None,
             direct_proofs: DirectProofs::default(),
@@ -541,7 +545,7 @@ impl Execution {
         self.nec_refusal = None;
         self.nec_entry = None;
         self.task_switch.reset();
-        self.port_debug = false;
+        self.handoff_service &= !HANDOFF_DEBUG;
         self.shutdown = false;
         self.instruction_retry = None;
         self.direct_proofs.clear();
@@ -565,6 +569,9 @@ impl Execution {
         self.instruction_retry.is_some()
             || self.event_retry.is_some()
             || self.task_switch.context().is_some()
+    }
+    pub(super) fn debug_handoff_pending(&self) -> bool {
+        self.handoff_service & HANDOFF_DEBUG != 0
     }
     fn invalidate_translations(&mut self) {
         self.direct_proofs.clear();
@@ -2223,7 +2230,7 @@ impl Vcpu {
         // Clear private boundary state; architectural TF belongs to CpuState.
         let execution = self.legacy_execution.as_mut().unwrap();
         execution.event_retry = None;
-        execution.port_debug = false;
+        execution.handoff_service &= !HANDOFF_DEBUG;
         self.sti_shadow = false;
         self.ss_shadow = 0;
     }
@@ -2340,7 +2347,7 @@ impl Vcpu {
                 || a20_pending
                 || options.stop_when_irq_ready,
             service: self.cpu.port_string_in.is_some()
-                || execution.port_debug
+                || execution.handoff_service != 0
                 || execution.event_retry.is_some()
                 || irq_pending
                 || options.stop_when_irq_ready,
@@ -2400,26 +2407,34 @@ impl Vcpu {
         Ok(())
     }
 
-    // Service step: a single-step trap held behind a port handoff becomes the
-    // owned continuation once the transfer has completed.
+    // A handoff's completed transfer releases its owned single-step trap.
     #[inline(always)]
     fn queue_port_debug(&mut self, task_pending: bool) {
         if !task_pending
-            && self.legacy_execution.as_ref().unwrap().port_debug
+            && self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .debug_handoff_pending()
             && self.cpu.pending_port_in.is_none()
             && self.cpu.port_string_in.is_none()
         {
-            self.legacy_execution.as_mut().unwrap().port_debug = false;
-            self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
-                irq_consumed: false,
-                software: false,
-                after_nmi: false,
-                source: EventSource::SingleStep,
-                ip: self.cpu.rip as u32,
-                cs: self.cpu.cs,
-                origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
-            });
+            self.queue_debug_event();
         }
+    }
+
+    #[inline(always)]
+    fn queue_debug_event(&mut self) {
+        self.legacy_execution.as_mut().unwrap().handoff_service &= !HANDOFF_DEBUG;
+        self.legacy_execution.as_mut().unwrap().event_retry = Some(PendingEvent {
+            irq_consumed: false,
+            software: false,
+            after_nmi: false,
+            source: EventSource::SingleStep,
+            ip: self.cpu.rip as u32,
+            cs: self.cpu.cs,
+            origin: self.delivery_origin(self.cpu.cs, self.cpu.rip as u32),
+        });
     }
 
     // Profile constants keep compiled chaining free of interpreted context checks.
@@ -2524,6 +2539,18 @@ impl Vcpu {
             || KIND == ALIAS_DISPATCH
             || (KIND >= MACHINE_DISPATCH
                 && self.legacy_execution.as_ref().unwrap().validated_direct_bus);
+        if KIND == MACHINE_DISPATCH {
+            // CpuState may have been restored or edited between calls. Sample
+            // the opt-in route once, never at each instruction boundary. The
+            // twenty-bit and Application dispatchers compile this away.
+            let execution = self.legacy_execution.as_mut().unwrap();
+            execution.handoff_service = (execution.handoff_service & !HANDOFF_NUMERIC)
+                | if self.cpu.numeric_error_route == crate::NumericErrorRoute::External {
+                    HANDOFF_NUMERIC
+                } else {
+                    0
+                };
+        }
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
         loop {
@@ -2617,7 +2644,28 @@ impl Vcpu {
                             });
                         }
                     }
-                    self.queue_port_debug(task_pending);
+                    // This is the existing deferred-debug service gate, with
+                    // External folded into its flag. Internal with no deferred
+                    // debug skips the entire body, including pending-I/O checks.
+                    let service = self.legacy_execution.as_ref().unwrap().handoff_service;
+                    if !task_pending
+                        && service != 0
+                        && self.cpu.pending_port_in.is_none()
+                        && self.cpu.port_string_in.is_none()
+                    {
+                        if service & HANDOFF_NUMERIC != 0 && !self.machine_pending_io(task_pending)
+                        {
+                            if let Some(exit) = self.cpu.reconcile_numeric_error(self.cpu.rip) {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                });
+                            }
+                        }
+                        if service & HANDOFF_DEBUG != 0 {
+                            self.queue_debug_event();
+                        }
+                    }
                     // spec.md §17.10: the NMI step, after an owned
                     // continuation and before a queued IRQ, ran in
                     // `machine_external`.
@@ -3009,8 +3057,18 @@ impl Vcpu {
                         // guarantee inhibition only for the first load; LSS has none.
                         let debug = single_step && !arm_ss && !outcome.suppress_debug;
                         if debug {
-                            if matches!(outcome.exit, Some(Exit::PortIo { .. })) {
-                                self.legacy_execution.as_mut().unwrap().port_debug = true;
+                            if matches!(
+                                outcome.exit,
+                                Some(
+                                    Exit::PortIo { .. }
+                                        | Exit::ExternalNumericError {
+                                            event: crate::NumericErrorEvent::Asserted,
+                                            ..
+                                        }
+                                )
+                            ) {
+                                self.legacy_execution.as_mut().unwrap().handoff_service |=
+                                    HANDOFF_DEBUG;
                             } else {
                                 context =
                                     match self.deliver_step_trap::<ROUTED, ORDER, KIND>(vm, &ir) {
@@ -4634,7 +4692,7 @@ mod tests {
             cpu.sti_shadow = true;
             cpu.ss_shadow = SS_HOLD | NMI_HOLD;
             let execution = cpu.legacy_execution.as_mut().unwrap();
-            execution.port_debug = true;
+            execution.handoff_service |= HANDOFF_DEBUG;
             execution.event_retry = Some(PendingEvent {
                 irq_consumed: false,
                 software: false,
@@ -4657,7 +4715,7 @@ mod tests {
             assert!(!cpu.sti_shadow);
             assert_eq!(cpu.ss_shadow, 0);
             let execution = cpu.legacy_execution.as_ref().unwrap();
-            assert!(!execution.port_debug);
+            assert_eq!(execution.handoff_service & HANDOFF_DEBUG, 0);
             assert!(execution.event_retry.is_none());
             assert!(cpu.irq_ready());
         }

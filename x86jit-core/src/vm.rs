@@ -727,6 +727,7 @@ pub struct Vm {
     exception_delivery: crate::ExceptionDelivery,
     cpu_model: Option<crate::CpuModel>,
     fpu_model: crate::FpuModel,
+    numeric_error_route: crate::NumericErrorRoute,
     profile_locked: std::sync::atomic::AtomicBool,
 }
 
@@ -1255,6 +1256,26 @@ impl Vm {
         self.fpu_model
     }
 
+    /// Set the construction default before creating any vCPU (§17.9).
+    pub fn set_numeric_error_route(
+        &mut self,
+        route: crate::NumericErrorRoute,
+    ) -> Result<(), crate::NumericErrorConfigError> {
+        if self.profile_locked.load(Ordering::Relaxed) {
+            return Err(crate::NumericErrorConfigError::ConfigurationLocked);
+        }
+        if route == crate::NumericErrorRoute::External {
+            validate_numeric_error_model(self.profile, self.legacy_model, self.fpu_model)?;
+        }
+        self.numeric_error_route = route;
+        Ok(())
+    }
+
+    /// The numeric-error route inherited by new vCPUs.
+    pub fn numeric_error_route(&self) -> crate::NumericErrorRoute {
+        self.numeric_error_route
+    }
+
     /// Compatibility selector with Outward exception delivery (decision-23 §5).
     /// Preserves the supplied generation and semantics identity exactly.
     /// Panics after vCPU creation, including after all such vCPUs are dropped.
@@ -1352,6 +1373,7 @@ impl Vm {
             exception_delivery: self.exception_delivery,
             cpu_model: self.cpu_model,
             fpu_model: self.fpu_model,
+            numeric_error_route: self.numeric_error_route,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: self.lockstep_trace.clone(),
         })
@@ -1416,6 +1438,7 @@ impl Vm {
             exception_delivery: crate::ExceptionDelivery::Outward,
             cpu_model: None,
             fpu_model: crate::FpuModel::Present,
+            numeric_error_route: crate::NumericErrorRoute::Internal,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: None,
         }
@@ -1711,6 +1734,10 @@ impl Vm {
                 "FPU default is incompatible with the CPU model"
             );
         }
+        if self.numeric_error_route == crate::NumericErrorRoute::External {
+            validate_numeric_error_model(self.profile, self.legacy_model, self.fpu_model)
+                .expect("numeric-error default is incompatible with the CPU/FPU profile");
+        }
         self.profile_locked.store(true, Ordering::Relaxed);
         let mut cpu = if self.profile == ExecutionProfile::Machine {
             CpuState::legacy_real_entry([0; 6])
@@ -1726,6 +1753,7 @@ impl Vm {
             cpu.legacy.cr0 |= 0x10;
         }
         cpu.fpu_model = self.fpu_model;
+        cpu.numeric_error_route = self.numeric_error_route;
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_pointer_model = self.x87_pointer_model;
         cpu.cpuid_table = self.cpuid_table.clone();
@@ -2242,6 +2270,7 @@ impl Vcpu {
         self.fast_clear();
         if options.x87_init {
             crate::x87::fninit(&mut self.cpu);
+            self.cpu.external_numeric_error.reported = false;
         }
     }
 
@@ -2814,6 +2843,64 @@ impl Vcpu {
     /// Long64/Compat32 continue to use the existing x87 engine.
     pub fn set_fpu_model(&mut self, model: crate::FpuModel) {
         self.cpu.fpu_model = model;
+    }
+
+    /// Select runtime wiring without invalidating shared translations (§17.9).
+    pub fn set_numeric_error_route(
+        &mut self,
+        route: crate::NumericErrorRoute,
+    ) -> Result<(), crate::NumericErrorConfigError> {
+        self.numeric_error_config_ready()?;
+        if route == crate::NumericErrorRoute::External {
+            validate_numeric_error_model(self.profile, self.legacy_model, self.cpu.fpu_model)?;
+        }
+        self.cpu.numeric_error_route = route;
+        Ok(())
+    }
+
+    pub fn numeric_error_route(&self) -> crate::NumericErrorRoute {
+        self.cpu.numeric_error_route
+    }
+
+    /// Raw committed numeric-error level, independent of board acknowledgement.
+    pub fn numeric_error_pending(&self) -> bool {
+        self.cpu.numeric_error_pending()
+    }
+
+    /// Release the CPU-side board hold, preserving the complete numeric image.
+    /// The embedder owns the AT-class board's F0h port decode and IRQ latch.
+    pub fn ack_external_numeric_error(&mut self) -> Result<(), crate::NumericErrorConfigError> {
+        self.numeric_error_config_ready()?;
+        validate_numeric_error_model(self.profile, self.legacy_model, self.cpu.fpu_model)?;
+        if self.numeric_error_route() != crate::NumericErrorRoute::External {
+            return Err(crate::NumericErrorConfigError::ExternalRouteRequired);
+        }
+        self.cpu.external_numeric_error.held = false;
+        Ok(())
+    }
+
+    /// Reserved for a future 486: CR0.NE will own routing and IGNNE# will be
+    /// an explicit input, separate from the 286/386 board acknowledgement.
+    pub fn set_ignne(&mut self, _asserted: bool) -> Result<(), crate::NumericErrorConfigError> {
+        self.numeric_error_config_ready()?;
+        Err(crate::NumericErrorConfigError::UnsupportedModel)
+    }
+
+    fn numeric_error_config_ready(&self) -> Result<(), crate::NumericErrorConfigError> {
+        if self.cpu.mmio_retry_active
+            || self.cpu.task_debug_trap != 0
+            || self.cpu.pending_port_in.is_some()
+            || self.cpu.port_string_in.is_some()
+            || self.cpu.pending_mmio.is_some()
+            || self.cpu.pending_mmio_write
+            || self
+                .legacy_execution
+                .as_ref()
+                .is_some_and(|e| e.has_continuation() || e.debug_handoff_pending())
+        {
+            return Err(crate::NumericErrorConfigError::ContinuationInFlight);
+        }
+        Ok(())
     }
 
     /// Engine emulation input for the Real16 alias and models without system
@@ -4252,6 +4339,37 @@ fn lift_exit(
         }
         LiftError::DecodeFault { addr } => crate::fault::fetch_exit(mem, at, mode, addr, details),
     }
+}
+
+fn validate_numeric_error_model(
+    profile: ExecutionProfile,
+    model: Option<crate::LegacyCpuModel>,
+    fpu: crate::FpuModel,
+) -> Result<(), crate::NumericErrorConfigError> {
+    use crate::NumericErrorConfigError as E;
+    if profile != ExecutionProfile::Machine {
+        return Err(E::UnsupportedProfile);
+    }
+    // The Intel486 entries project to the 386 generation, but CR0.NE is their only
+    // routing authority (design note, maintainer decision 4); until that lands they
+    // keep the internal route.
+    let intel486 = |m: &crate::LegacyCpuModel| {
+        [crate::CpuModel::I80486Dx, crate::CpuModel::I80486DxCpuid]
+            .iter()
+            .any(|c| c.profile().semantics_id == m.model_semantics_id)
+    };
+    if !model.is_some_and(|m| {
+        matches!(
+            m.generation,
+            crate::CpuGeneration::I286 | crate::CpuGeneration::I386
+        ) && !intel486(&m)
+    }) {
+        return Err(E::UnsupportedModel);
+    }
+    if fpu != crate::FpuModel::Present {
+        return Err(E::CoprocessorAbsent);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

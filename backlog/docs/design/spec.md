@@ -2097,6 +2097,66 @@ end faults. An SS-relative operand faults with #GP (vector 13), although SDM Vol
 (vector 12). This deliberate divergence keeps x87 consistent with the engine's
 existing Real16 scalar policy.
 
+**Machine numeric-error routing.** `NumericErrorRoute::{Internal, External}` is
+per-vCPU runtime state; Internal remains the default. The VM setter supplies
+the construction default, inherited by new vCPUs and preserved by VM forks.
+External is supported only for I80286/I80386 Machine execution with
+`FpuModel::Present`, for the forms already supported in Direct and Checked
+execution. Typed configuration errors reject unsupported profiles/models,
+absent coprocessors, and changes while an instruction/device/event continuation
+is in flight. Routing is independent of `ExceptionDelivery` and cached IR.
+
+Internal preserves exception 16 at the later recognition instruction (80286 PRM
+Part I Appendix B, #MF p. B-9; 80386 PRM §§11.1.2, 11.1.5.3). External returns
+`Exit::ExternalNumericError { addr, event: NumericErrorEvent::Asserted }` at the
+first committed pending boundary, before the next instruction executes. The
+producer retires and contributes one step; `addr == cpu.rip` is its successor.
+A pending image installed by the embedder reports at positive run entry with
+zero steps. This deterministic notification boundary is engine policy, not
+signal-cycle timing. `numeric_error_pending()` reads committed SW.ES (80286/287
+PRM Part II Ch. 1, Fig. 1-4 p. 1-10), independently of routing, IF and notification
+history. Failed memory transfers publish no event. Numeric clearing re-arms
+notification, including a clear and new assertion within one run.
+
+External assertion latches a CPU-side board hold. At a supported waiting
+recognition point, a held instruction returns `Waiting` at its unchanged RIP,
+with zero progress and unchanged numeric pointers, registers and memory.
+`ack_external_numeric_error()` releases that hold idempotently, preserving the
+complete numeric image, even if ES is still set. ES alone does not re-latch an
+acknowledged episode or produce #MF in External. Clearing ES alone does not
+release the board hold. No-wait controls retain handler access (80286 PRM
+Appendix B #MF; 80386 PRM §11.1.2). Pending recognition retains its precedence
+over the existing 286 coprocessor-overrun policy.
+
+The hold/acknowledgement abstraction is an **engine choice and embedder
+requirement**: AT-class boards supply IRQ13 wiring, a board latch and port F0h
+acknowledgement. The embedder decodes ports, arbitrates controller requests,
+chooses the injected vector and performs EOI. The core neither decodes F0h nor
+injects a vector automatically. A stalled instruction permits ordinary host
+request, NMI and IRQ boundary arbitration, with the existing IF, shadow and
+continuation rules. Assertions/waits are not deliveries and add no delivery-log
+record; actual board interrupt entry records the selected vector as `Irq`.
+Internal InGuest still records Fault/16; Outward does not record a delivery.
+
+The appended CpuState route and external state preserve notification history
+and the hold across cloned checkpoints. Direct edits are reconciled at positive
+entry without rewriting SW/CW. Zero-budget calls change neither notification nor
+hold. `reset_execution_state` preserves the hold; optional x87 initialization
+clears the source and re-arms notification without acknowledging the board.
+A whole-machine checkpoint additionally needs the embedder's board/PIC state,
+queued events and the existing Vcpu continuation state. CPU restore does not
+rewind the delivery log; use its explicit take/clear API.
+
+**Scope limitation:** shared lifting folds some waiting control forms into their
+no-wait twins, so those folded forms do not acquire a distinct recognition point.
+Separating them belongs to xj-srh.34. Explicit WAIT instructions that the Machine
+decoder retains still recognize the hold; protected 286 refusals and the early
+8087-era pending-error refusal remain unchanged. No 486 model exists. A future
+486 must derive routing from CR0.NE (NE=1 internal, NE=0 external), retain reset
+NE=0 and use the explicit IGNNE# input and PRM control/non-control recognition
+rules (Intel486 PRM §§4.1.3, 16.2.1.2, 25.1). `set_ignne` currently returns a
+typed unsupported-model error; the 386 CR0 mask is unchanged.
+
 
 ### 17.10 CPU-model catalogue and Machine profile
 
