@@ -8,7 +8,9 @@
 //! Bit 2 marks only rows that the 8086 policy in `decode/i8086.rs` admits;
 //! there, WAIT and ESC stay separate instructions. Bit 3 marks the
 //! 80186-class rows NEC V20/V30 UM §12 lists for native mode; the V20/V30
-//! set is bits 2 and 3. Width variants are separate encodings.
+//! set is bits 2 and 3. Bit 4 selects early 486 additions; bit 5 selects the
+//! CPUID-capable 486. Both also select bit 1 to inherit the 386 set
+//! (Intel486 PRM App. A pp. A-4–7). Width variants are separate encodings.
 use super::ModelIsa;
 mod i8086;
 use iced_x86::{Code, Instruction, Register};
@@ -24,6 +26,20 @@ pub(crate) enum DecodeAction {
 }
 
 pub(super) const ENCODINGS: &[(Code, u8)] = &[
+    // Intel486 PRM App. A pp. A-4–7; §26 instruction entries.
+    (Code::Bswap_r16, 48),
+    (Code::Bswap_r32, 48),
+    (Code::Xadd_rm8_r8, 48),
+    (Code::Xadd_rm16_r16, 48),
+    (Code::Xadd_rm32_r32, 48),
+    (Code::Cmpxchg_rm8_r8, 48),
+    (Code::Cmpxchg_rm16_r16, 48),
+    (Code::Cmpxchg_rm32_r32, 48),
+    (Code::Invd, 48),
+    (Code::Wbinvd, 48),
+    (Code::Invlpg_m, 48),
+    // Embedded Intel486 DM §D.1/Table D-1 pp. D-1–3.
+    (Code::Cpuid, 32),
     (Code::Add_rm8_r8, 7),
     (Code::Add_rm16_r16, 7),
     (Code::Add_rm32_r32, 2),
@@ -810,6 +826,16 @@ const I286_SET: DecodeSet = DecodeSet {
     absent: Some(6),
     legacy_segments_only: true,
 };
+const I486_SET: DecodeSet = DecodeSet {
+    models: 18,
+    options: iced_x86::DecoderOptions::MOV_TR,
+    absent: Some(6),
+    legacy_segments_only: false,
+};
+const I486_CPUID_SET: DecodeSet = DecodeSet {
+    models: 34,
+    ..I486_SET
+};
 const I386_SET: DecodeSet = DecodeSet {
     models: 2,
     options: iced_x86::DecoderOptions::MOV_TR,
@@ -865,6 +891,8 @@ impl ModelIsa {
             Self::NecV20 => &i8086::NEC_SET,
             Self::I80286 => &I286_SET,
             Self::I80386 => &I386_SET,
+            Self::I80486Dx => &I486_SET,
+            Self::I80486DxCpuid => &I486_CPUID_SET,
         }
     }
     pub(super) const fn model_mask(self) -> u8 {
@@ -953,8 +981,14 @@ impl ModelIsa {
             return absent;
         }
         if matches!(insn.code(), Code::Mov_r32_tr | Code::Mov_tr_r32)
-            && !(0..insn.op_count())
-                .any(|i| matches!(insn.op_register(i), Register::TR6 | Register::TR7))
+            && !(0..insn.op_count()).any(|i| {
+                matches!(insn.op_register(i), Register::TR6 | Register::TR7)
+                    || matches!(self, Self::I80486Dx | Self::I80486DxCpuid)
+                        && matches!(
+                            insn.op_register(i),
+                            Register::TR3 | Register::TR4 | Register::TR5
+                        )
+            })
         {
             return absent;
         }

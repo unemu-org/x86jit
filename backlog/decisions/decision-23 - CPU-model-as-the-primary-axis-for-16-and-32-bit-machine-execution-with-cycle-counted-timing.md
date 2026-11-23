@@ -1350,3 +1350,132 @@ Two points arose from the answers. Neither blocks the unification work.
    say whether that decision and its first model precede the 8086-class wave or
    may run beside it. §2 lists them in the same step as the compiled route; the
    maintainer confirms or reorders when that decision is opened.
+
+
+## Amendment: two Intel486 DX entries (2026-11-23, accepted)
+
+The maintainer requested two entries on the Machine path and accepted this
+amendment, with its ASSUMED choices, on 2026-11-23; alignment check (#AC)
+follows as a separate item. `I80486Dx` names the early processor
+without CPUID; `I80486DxCpuid` names a later CPUID-capable DX. Separate names keep
+software-visible identity in the catalogue and prevent a runtime feature toggle
+from silently changing the processor. Both project to `CpuGeneration::I386` and
+`ModelSystem::Cr386`, inherit the existing 386 system implementation, and have
+separate `ModelIsa` sets and semantics identities. Application generated code and
+all existing model identities remain unchanged.
+
+Sources are the *Intel486 Microprocessor Family Programmer's Reference Manual*
+(1992 edition; the title page prints no order number) (`oracles/intel/i486-prm.pdf`, **PRM** below), and the
+*Embedded Intel486 Processor Family Developer's Manual*, order 273021-001
+(`oracles/intel/i486-embedded-dm.pdf`, **DM** below). Oracle commit `ecb750f`
+pins these manuals; the integration must include that submodule update. Printed
+page numbers, rather than PDF indices, are cited below. The reset, flags, cache
+mode, instruction and opcode-map values were checked against page images.
+
+| Entry | Reset EDX / CPUID.1:EAX | AC | ID | CPUID |
+|---|---|---|---|---|
+| `I80486Dx` | `00000403h` (**ASSUMED** representative revision 03h) | writable | fixed zero | #UD |
+| `I80486DxCpuid` | `00000410h` (**ASSUMED** model 1, stepping 0) | writable | writable | leaves 0 and 1 |
+
+PRM §10.1, Fig. 10-1, pp. 10-1–2 licenses the early family/revision fields;
+DM §D.2 and Table D-2, pp. D-2–3 licenses DX models 0/1 and equates reset EDX
+with leaf 1 EAX. Neither source ties an exact stepping to CPUID availability:
+these are representative engine choices, not measured part signatures. The
+early entry uses the PRM's current B0/B1 CMPXCHG encoding; Appendix A's older
+A-step encodings are not selected by either entry.
+
+PRM §4.1.1, Fig. 4-1, p. 4-2 and §26 POPF/POPFD, p. 26-235 license AC and
+its loading. DM §D.1, p. D-1 ties ID writability to CPUID presence and resets
+ID to zero. Word POPF/IRET preserves the high flags. The existing 386 continues
+to fix AC and ID at zero. The appended `CpuState::machine_flags_mask` carries
+only the catalogue's AC/ID availability to shared flag helpers; dispatch refreshes
+it after a replaced register image. Existing state and JIT ABI offsets are retained.
+
+DM §§D.2–D.4, pp. D-1–2 supplies leaf 0 EAX=1 and EBX/EDX/ECX spelling
+`GenuineIntel`, leaf 1 EAX=`0410h`, EBX=ECX=0, and zero registers for inputs
+above 1. CPUID is independent of live ID, subleaf, and CPL and preserves flags.
+**ASSUMED:** reserved CPUID bits are zero and leaf 1 EDX=`00000001h` advertises
+the on-chip FPU only. **Source ambiguity requiring acceptance:** p. D-2 also
+prints `EDX[3:1] ← 1`, referring to Appendix A, which describes pins rather than
+CPUID features. DM §4.1.3 p. 4-18 says CR4 extensions are specific to particular
+models. We do not infer VME, DE or PSE for this DX from that ambiguous field.
+The maintainer must accept the FPU-only mask or supply a part-specific correction.
+
+Both entries accept `FpuModel::Present` only, and the VM's default remains
+Present. This expresses an integrated 387-compatible FPU through the existing,
+generation-neutral FPU axis (§4), rather than adding a new generation-specific
+FPU model. PRM §4.1.3, p. 4-7 specifies ET=1 and Intel387 DX compatibility.
+The existing per-vCPU override remains available as an engine configuration.
+
+`CpuState::i486_reset(model)` installs EFLAGS=2, EIP=FFF0h, CS=F000h with retained
+base FFFF0000h and limit FFFFh, zero data selectors, IDTR=0:03FFh,
+CR0=`60000010h`, DR6=`FFFF0FF0h`, DR7=0 (PRM §10.1, Figs. 10-1/2,
+Table 10-1, pp. 10-1–3). **ASSUMED:** zero undefined registers/reserved bits;
+ordinary real-cache attribute labels and enabled A20 as on `i386_reset`; the
+engine FNINIT FPU image even without hardware self-test. PRM Table 10-1 note 4
+leaves the FPU uninitialized without self-test.
+
+The decode set is the existing 386 set plus BSWAP, XADD, CMPXCHG, INVD, WBINVD
+and INVLPG (PRM Appendix A pp. A-4–7; §26 pp. 26-35, 26-62–63,
+26-171–172, 26-281–283); only the later entry adds CPUID (DM App. D).
+XADD and CMPXCHG use the shared scalar/atomic operations in all three modes,
+including LOCK. CMPXCHG's failed memory comparison still issues a write cycle
+(PRM p. 26-63); device handoffs retain the read until the write is acknowledged,
+and register/flag commit follows that acknowledgement. The existing split-RAM
+atomicity limitation of the Machine locked-update path also applies to CMPXCHG.
+Post-486 encodings remain #UD. BSWAP's undefined word result is an **ASSUMED**
+typed refusal (`LegacyInstruction`), following PRM p. 26-35.
+
+CR0.CD/NW/WP/NE/AM are readable and writable, ET stays one, and CR3.PCD/PWT are
+retained (PRM §4.1.3 pp. 4-6–7). NW=1/CD=0 raises #GP(0) (PRM §12.2.1,
+Table 12-1, p. 12-3). **ASSUMED:** reserved write bits are ignored/read zero.
+There is no cache model: INVD/WBINVD complete at CPL 0 and #GP(0) at other
+CPLs (PRM §26 pp. 26-171, 26-281). INVLPG similarly completes with paging off
+(PRM p. 26-172); paging-enabled entry is refused with `LegacyEntryFacility`.
+WP enforcement therefore remains with paging. NE is retained, while the
+floating-point error-reporting route remains deferred to xj-srh.33.
+
+**ASSUMED conservative boundary:** AM=AC=1 and CPL=3 refuses the entire
+instruction regime, including aligned accesses and register-only operations,
+with `LegacyAlignmentCheck` before any instruction commits. This is broader
+than the hardware's unaligned-operand #AC (PRM §4.1.1 p. 4-2); no #AC is
+synthesized. Every 486 instruction carries the gate, including an instruction
+following POPFD or a privilege transition. TR3–TR5 reads and writes receive
+`LegacyCacheTest` (PRM §10.7.2 pp. 10-13–17); the privilege check precedes
+that refusal. TR6 commands retain `LegacyTlbTest` from the 386 implementation.
+The inherited event/interrupt and debug policies have not had a separate 486
+audit; this inheritance is **ASSUMED**, not a claim about stepping differences.
+
+### Runtime census
+
+The opt-in `legacy_census_386::runtime_census_i486` test runs both entries with
+FPU present, extending the 386 opcode/group masks from PRM Appendix A pp. A-4–7.
+It emits a TSV per model and lists every refused, unknown, and differing family.
+The ordinary 386 census remains independently runnable. Counts below exclude
+D8–DF and reserved group controls; the three modes use the same generated forms.
+
+| Entry | Mode | Integer probes | Executes | Refused | Faults | Port I/O | Unknown / panic |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `I80486Dx` | real | 8929 | 8505 | 44 | 300 | 80 | 0 / 0 |
+| `I80486Dx` | protected 16 | 8929 | 8805 | 44 | 0 | 80 | 0 / 0 |
+| `I80486Dx` | protected 32 | 8929 | 8805 | 44 | 0 | 80 | 0 / 0 |
+| `I80486DxCpuid` | real | 8933 | 8509 | 44 | 300 | 80 | 0 / 0 |
+| `I80486DxCpuid` | protected 16 | 8933 | 8809 | 44 | 0 | 80 | 0 / 0 |
+| `I80486DxCpuid` | protected 32 | 8933 | 8809 | 44 | 0 | 80 | 0 / 0 |
+
+Every mode of each entry has these integer refusals: word BSWAP 16 probes,
+MOV TR3–TR5 24, MOV TR6 commands 4. Real-mode faults are the inherited
+protected-only instructions. Each entry/mode also has 482 executing x87 probes
+and 20 inherited unknowns: FBLD 6, FBSTP 6, FSTP aliases 4, FFREEP aliases 4.
+They are recorded as unknown rather than silently counted as implemented.
+
+Protected-32 comparisons with Application show 24 mismatches: REPNE MOVSB/MOVSW/
+MOVSD, STOSB/STOSW/STOSD and LODSB/LODSW/LODSD, four prefix combinations per
+opcode, with Machine ECX=0 versus Application ECX=1. The independently run 386
+baseline has exactly these same differences. They are a comparison finding,
+not a hardware oracle verdict; this amendment changes neither model's string
+semantics nor Application code. There are no comparison differences in real or
+protected-16 mode. Comparison coverage is partial: forms whose Application
+decode differs or whose Application execution refuses are reported separately;
+CPUID and system/cache instructions are excluded from that comparator and pinned
+by architectural witnesses instead.

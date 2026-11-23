@@ -1717,6 +1717,14 @@ impl Vm {
         } else {
             CpuState::new()
         };
+        cpu.machine_flags_mask = self
+            .cpu_model
+            .map_or(0, crate::CpuModel::machine_flags_mask);
+        // Intel486 PRM §4.1.3 p. 4-7; SDM Vol 3B §25.18.1 p. 25-8:
+        // ET is fixed at one, including at the ordinary real entry.
+        if cpu.machine_flags_mask != 0 {
+            cpu.legacy.cr0 |= 0x10;
+        }
         cpu.fpu_model = self.fpu_model;
         cpu.features = self.features; // ISA level the embedder chose
         cpu.x87_pointer_model = self.x87_pointer_model;

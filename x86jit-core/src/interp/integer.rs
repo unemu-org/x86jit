@@ -787,7 +787,7 @@ pub(crate) enum LockedUpdate {
 
 impl LockedUpdate {
     /// The value written back over `prev`, the `size`-byte operand as read.
-    fn apply(self, prev: u64, src: u64, size: u8) -> u64 {
+    pub(super) fn apply(self, prev: u64, src: u64, size: u8) -> u64 {
         let m = mask(size);
         (match self {
             LockedUpdate::Rmw(RmwOp::Add) => prev.wrapping_add(src),

@@ -190,6 +190,10 @@ fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
     if value & 0x8000_0001 == 0x8000_0000 {
         return Err(exception(cpu, 13));
     }
+    // Intel486 PRM §12.2.1 Table 12-1 p. 12-3: NW=1/CD=0 is #GP(0).
+    if cpu.machine_flags_mask != 0 && value & 0x6000_0000 == 0x2000_0000 {
+        return Err(exception(cpu, 13));
+    }
     if value & 0x8000_0000 != 0 {
         return Err(refusal(
             cpu,
@@ -1977,7 +1981,7 @@ fn locked_split<const ROUTED: bool, const ORDER: u8>(
     linear: u64,
     src: u64,
     size: u8,
-    op: crate::ir::RmwOp,
+    update: super::integer::LockedUpdate,
 ) -> Result<u64, Exit> {
     use super::integer::{locked_piece_exit, locked_pieces, locked_split_update, LockedPieces};
     let at = |byte: u8| u64::from((linear as u32).wrapping_add(u32::from(byte)));
@@ -2012,15 +2016,17 @@ fn locked_split<const ROUTED: bool, const ORDER: u8>(
     };
     // An exchange whose old value the instruction discards (the locked MOV) is
     // a store: it reads nothing.
-    let read = !(matches!(op, crate::ir::RmwOp::Xchg)
-        && super::integer::exchange_discards_old(ir.ops, cpu.rip));
+    let read = !(matches!(
+        update,
+        super::integer::LockedUpdate::Rmw(crate::ir::RmwOp::Xchg)
+    ) && super::integer::exchange_discards_old(ir.ops, cpu.rip));
     let owner = cpu.rip;
     locked_split_update(
         cpu,
         owner,
         &pieces[..count],
         read,
-        |old| super::i8086::updated(op, old, src),
+        |old| update.apply(old, src, size),
         |cpu, piece| {
             read_physical(cpu, mem, at(piece.first), piece.addr, piece.len)
                 .map_err(|exit| locked_piece_exit(exit, size, piece))
@@ -2112,6 +2118,8 @@ pub(crate) fn supported(op: &IrOp) -> bool {
             | IrOp::BoundGate { .. }
             | IrOp::X87 { .. }
             | IrOp::AtomicRmw { .. }
+            | IrOp::AtomicCas { .. }
+            | IrOp::Bswap { .. }
             | IrOp::Unsupported { .. }
     )
 }
@@ -3006,6 +3014,69 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
             }
             None
         }
+        IrOp::AtomicCas {
+            old,
+            addr,
+            expected,
+            src,
+            size,
+            ..
+        } => {
+            // 486 PRM §26 CMPXCHG pp. 26-62–63, §3.11.7 p. 3-47:
+            // LOCK makes the memory comparison/update one bus transaction.
+            let linear = read_val(*addr, temps);
+            let expected = read_val(*expected, temps) & mask(*size);
+            let src = read_val(*src, temps);
+            let update = super::integer::LockedUpdate::Cas(expected);
+            let (physical, part) = legacy::physical_span(cpu, mem.physical_mask, linear, *size);
+            let host = if part == *size {
+                match mem.atomic_cas(physical, expected, src, *size) {
+                    Ok(value) => Some(value),
+                    Err(MemTrap::Mmio) => {
+                        if !matches!(
+                            mem.0.region_kind(physical, *size),
+                            Ok(crate::RegionKind::Trap)
+                        ) {
+                            Some(locked_split(cpu, mem, ir, linear, src, *size, update)?)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(trap) => {
+                        let StepResult::Exit(exit) =
+                            trap_out(cpu, cpu.rip, trap, physical, *size, AccessKind::Write, src)
+                                .into_step()
+                        else {
+                            unreachable!("a memory trap exits")
+                        };
+                        return Err(crate::fault::qualify_legacy_bus(exit, linear, physical));
+                    }
+                }
+            } else {
+                None
+            };
+            temps[*old as usize] = if let Some(value) = host {
+                value
+            } else {
+                let trap_bytes = (0..*size)
+                    .filter(|&byte| {
+                        let at = u64::from((linear as u32).wrapping_add(u32::from(byte)));
+                        let (bus, _) = legacy::physical_span(cpu, mem.physical_mask, at, 1);
+                        matches!(mem.0.region_kind(bus, 1), Ok(crate::RegionKind::Trap))
+                    })
+                    .count();
+                if trap_bytes != 0 && trap_bytes != usize::from(*size) {
+                    locked_split(cpu, mem, ir, linear, src, *size, update)?
+                } else {
+                    // Same split-RAM atomicity limitation as AtomicRmw below.
+                    probe_locked(cpu, mem, linear, *size)?;
+                    let value = read(cpu, mem, linear, *size)?;
+                    write(cpu, mem, linear, *size, update.apply(value, src, *size))?;
+                    value
+                }
+            };
+            None
+        }
         IrOp::AtomicRmw {
             old,
             addr,
@@ -3031,8 +3102,15 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                             Ok(crate::RegionKind::Trap)
                         ) {
                             let src = read_val(*src, temps);
-                            temps[*old as usize] =
-                                locked_split(cpu, mem, ir, linear, src, *size, *op)?;
+                            temps[*old as usize] = locked_split(
+                                cpu,
+                                mem,
+                                ir,
+                                linear,
+                                src,
+                                *size,
+                                super::integer::LockedUpdate::Rmw(*op),
+                            )?;
                             true
                         } else {
                             false
@@ -3068,7 +3146,15 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     .count();
                 if trap_bytes != 0 && trap_bytes != usize::from(*size) {
                     let src = read_val(*src, temps);
-                    temps[*old as usize] = locked_split(cpu, mem, ir, linear, src, *size, *op)?;
+                    temps[*old as usize] = locked_split(
+                        cpu,
+                        mem,
+                        ir,
+                        linear,
+                        src,
+                        *size,
+                        super::integer::LockedUpdate::Rmw(*op),
+                    )?;
                     true
                 } else {
                     false
@@ -3328,6 +3414,39 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
         }
         IrOp::Legacy(op) => {
             match op {
+                L::I486Gate => {
+                    // 486 PRM §4.1.1 p. 4-2. ASSUMED: conservative refusal
+                    // of the whole AM+AC+CPL3 regime, including aligned accesses.
+                    if cpu.legacy.cpl == 3
+                        && cpu.legacy.cr0 & (1 << 18) != 0
+                        && cpu.rflags_system & (1 << 18) != 0
+                    {
+                        return Err(refusal(
+                            cpu,
+                            crate::UnsupportedSystemOperation::LegacyAlignmentCheck,
+                        ));
+                    }
+                }
+                L::I486Invalidate => {
+                    if context.paging_enabled {
+                        return Err(refusal(
+                            cpu,
+                            crate::UnsupportedSystemOperation::LegacyExecution,
+                        ));
+                    }
+                }
+                L::I486Cpuid { signature } => {
+                    // Embedded 486 DM §§D.2–D.3 pp. D-1–2. ASSUMED:
+                    // reserved bits zero; model-1 DX exposes only on-chip FPU.
+                    let [eax, ebx, ecx, edx] = match cpu.gpr[RAX] as u32 {
+                        0 => [1, 0x756e_6547, 0x6c65_746e, 0x4965_6e69],
+                        1 => [*signature, 0, 0, crate::model::I486_DX_CPUID_FEATURES],
+                        _ => [0; 4],
+                    };
+                    for (reg, value) in [(RAX, eax), (RBX, ebx), (RCX, ecx), (RDX, edx)] {
+                        cpu.gpr[reg] = u64::from(value);
+                    }
+                }
                 L::Checkpoint | L::SharedWalk => {}
                 L::Privileged { kind } => privilege::check(cpu, context.generation, *kind)?,
                 L::LockedTransfer => return Err(atomic_device_exit(cpu, mem, ir)),
@@ -3592,11 +3711,24 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     // §4.3); retaining them is the engine's deterministic policy.
                     match register {
                         ControlRegister::Cr0 => {
-                            outcome.context_changed = write_cr0(cpu, value & 0x8000_001f)?;
+                            // 486 PRM §4.1.3 pp. 4-6–7: CD/NW/AM/WP/NE;
+                            // ET is fixed one. Reserved bits read zero (ASSUMED).
+                            let value = if cpu.machine_flags_mask != 0 {
+                                (value & 0xe005_003f) | 0x10
+                            } else {
+                                value & 0x8000_001f
+                            };
+                            outcome.context_changed = write_cr0(cpu, value)?;
                         }
                         ControlRegister::Cr2 => cpu.legacy.cr2 = value,
                         ControlRegister::Cr3 => {
-                            cpu.legacy.cr3 = value & 0xffff_f000;
+                            // 486 PRM §4.1.3 p. 4-6: CR3.PCD/PWT.
+                            cpu.legacy.cr3 = value
+                                & if cpu.machine_flags_mask != 0 {
+                                    0xffff_f018
+                                } else {
+                                    0xffff_f000
+                                };
                             // Decision-18 §3: even an equal CR3 write invalidates.
                             outcome.context_changed = true;
                             outcome.translations_invalidated = true;
@@ -3833,7 +3965,10 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                 L::AdjustStack { bytes } => adjust(cpu, context, *bytes),
                 L::Flags { size, pop } => {
                     if *pop {
-                        let image = peek(cpu, mem, context, 0, *size)? as u32;
+                        let mut image = peek(cpu, mem, context, 0, *size)? as u32;
+                        if *size == 2 {
+                            image |= cpu.rflags_system as u32 & cpu.machine_flags_mask;
+                        }
                         let before = cpu.rflags_system;
                         privilege::load_flags(cpu, context.generation, image)?;
                         outcome.context_changed |= (before ^ cpu.rflags_system) & 0x7000 != 0;
@@ -4093,6 +4228,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     }
                     // SDM Vol 3A §11.3: all frame reads complete before retirement.
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    let image = if *size == 2 {
+                        image | (cpu.rflags_system as u32 & cpu.machine_flags_mask)
+                    } else {
+                        image
+                    };
                     privilege::load_flags(cpu, context.generation, image)?;
                     // IRET restores RF in a 32-bit frame; POPFD does not.
                     if *size == 4 {
@@ -4400,6 +4540,7 @@ pub(super) fn machine_specific(op: &IrOp) -> bool {
     matches!(
         op,
         IrOp::AtomicRmw { .. }
+            | IrOp::AtomicCas { .. }
             | IrOp::BoundGate { .. }
             | IrOp::Branch { .. }
             | IrOp::Hlt

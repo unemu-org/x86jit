@@ -26,6 +26,10 @@ pub enum CpuModel {
     NecV20,
     /// NEC uPD70116 (V30), with a 16-bit external bus (NEC V20/V30 UM §1 p. 1-1).
     NecV30,
+    /// Early Intel486 DX without CPUID (486 PRM §10.1 pp. 10-1–3).
+    I80486Dx,
+    /// Later Intel486 DX with CPUID (Embedded 486 DM App. D pp. D-1–3).
+    I80486DxCpuid,
 }
 
 /// Decode-set identity, independent of instruction width (decision-23 §2).
@@ -43,6 +47,10 @@ pub enum ModelIsa {
     /// (bit, BCD-string, nibble-rotate and bit-field groups, REPC/REPNC and
     /// FPO2; decision-23 C4b).
     NecV20,
+    /// Intel486 PRM App. A pp. A-4–7, without CPUID.
+    I80486Dx,
+    /// The 486 set plus Embedded 486 DM App. D CPUID.
+    I80486DxCpuid,
 }
 
 impl ModelIsa {
@@ -51,7 +59,7 @@ impl ModelIsa {
         match self {
             Self::I8086 | Self::NecV20 => CpuGeneration::I8086,
             Self::I80286 => CpuGeneration::I286,
-            Self::I80386 => CpuGeneration::I386,
+            Self::I80386 | Self::I80486Dx | Self::I80486DxCpuid => CpuGeneration::I386,
         }
     }
 }
@@ -229,7 +237,8 @@ pub struct ModelProfile {
 
 impl ModelProfile {
     pub(crate) fn flags_helper_supported(&self) -> bool {
-        self.quirks.flags_fixed_zero == EARLY_FLAGS_FIXED_ZERO
+        (self.quirks.flags_fixed_zero == EARLY_FLAGS_FIXED_ZERO
+            || matches!(self.isa, ModelIsa::I80486Dx | ModelIsa::I80486DxCpuid))
             && self.quirks.real_flags_clear_mask
                 == match self.system {
                     ModelSystem::Msw286 => 0xf000,
@@ -321,6 +330,42 @@ static I80386: ModelProfile = identified(ModelProfile {
         protected_coprocessor_outputs: true,
     },
 });
+
+// Intel486 PRM §4.1.1 Fig. 4-1 p. 4-2: AC is implemented; Embedded
+// Intel486 DM §D.1 p. D-1: ID is writable exactly when CPUID is present.
+// DERIVED: inherit the 386 system/lift policies; these entries have no timing
+// model. ASSUMED: retain its NMI policy pending a 486-specific event audit.
+const fn i486_model(cpuid: bool) -> ModelProfile {
+    let mut p = ModelProfile {
+        isa: I80386.isa,
+        quirks: I80386.quirks,
+        system: I80386.system,
+        physical_bits: I80386.physical_bits,
+        data_bus_bits: I80386.data_bus_bits,
+        max_insn_len: I80386.max_insn_len,
+        fpu: I80386.fpu,
+        timing: I80386.timing,
+        semantics_id: 0,
+        lift: I80386.lift,
+    };
+    p.isa = if cpuid {
+        ModelIsa::I80486DxCpuid
+    } else {
+        ModelIsa::I80486Dx
+    };
+    p.quirks.flags_fixed_zero = if cpuid { 0 } else { 1 << 21 };
+    // PRM §9.9.16 p. 9-24: alignment-check exception vector.
+    p.quirks.max_processor_interrupt = 17;
+    // PRM §4.1.3 p. 4-7: ET=1, 387-compatible integrated FPU.
+    p.fpu = &[FpuModel::Present];
+    identified(p)
+}
+static I80486_DX: ModelProfile = i486_model(false);
+static I80486_DX_CPUID: ModelProfile = i486_model(true);
+// ASSUMED model-1 stepping 0; Embedded 486 DM §D.2/Table D-2 pp. D-2–3.
+pub(crate) const I486_DX_CPUID_SIGNATURE: u32 = 0x0410;
+// ASSUMED: FPU only; DM p. D-2's EDX[3:1] field is ambiguous (decision-23).
+pub(crate) const I486_DX_CPUID_FEATURES: u32 = 1;
 
 // 8086 Family UM §§2.2–2.3 pp. 2-7–12, §2.6 pp. 2-24–28,
 // §2.7 pp. 2-37–42; 286 PRM App. C pp. C-1–3; SDM Vol 3B §25.17.
@@ -450,6 +495,29 @@ impl CpuModel {
             Self::NecV30 => &NEC_V30,
             Self::I80286 => &I80286,
             Self::I80386 => &I80386,
+            Self::I80486Dx => &I80486_DX,
+            Self::I80486DxCpuid => &I80486_DX_CPUID,
+        }
+    }
+
+    /// Reset EDX and CPUID.1:EAX. ASSUMED representative stepping choices:
+    /// 0403h for early DX (486 PRM §10.1 Fig. 10-1 pp. 10-1–2), 0410h
+    /// for CPUID DX model 1 (Embedded 486 DM §D.2/Table D-2 pp. D-2–3).
+    /// Neither manual assigns an exact stepping to CPUID availability.
+    pub const fn i486_signature(self) -> Option<u32> {
+        match self {
+            Self::I80486Dx => Some(0x0403),
+            Self::I80486DxCpuid => Some(I486_DX_CPUID_SIGNATURE),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn machine_flags_mask(self) -> u32 {
+        match self {
+            Self::I80486Dx | Self::I80486DxCpuid => {
+                EARLY_FLAGS_FIXED_ZERO & !self.profile().quirks.flags_fixed_zero
+            }
+            _ => 0,
         }
     }
 
@@ -638,6 +706,14 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
     if p.data_bus_bits != canonical_bus {
         hash = word(hash, 0x627573);
         hash = word(hash, p.data_bus_bits as u64);
+    }
+    if matches!(p.isa, ModelIsa::I80486Dx | ModelIsa::I80486DxCpuid) {
+        // 486-specific lowering/helper revision; existing model IDs stay fixed.
+        hash = word(hash, 1);
+        if matches!(p.isa, ModelIsa::I80486DxCpuid) {
+            hash = word(hash, I486_DX_CPUID_SIGNATURE as u64);
+            hash = word(hash, I486_DX_CPUID_FEATURES as u64);
+        }
     }
     p.semantics_id = hash;
     p

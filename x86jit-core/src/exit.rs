@@ -76,6 +76,12 @@ pub enum UnsupportedSystemOperation {
     /// Every TR6 write issues a TLB command (80386 PRM §10.6.2 p. 10-14).
     /// ASSUMED engine boundary: refuse without changing state or retiring.
     LegacyTlbTest,
+    /// Intel486 PRM §10.7.2 pp. 10-13–17: TR3–TR5 cache tests.
+    /// ASSUMED: refuse all reads and writes without a cache model.
+    LegacyCacheTest,
+    /// Intel486 PRM §4.1.1 p. 4-2: AM && AC && CPL=3.
+    /// ASSUMED conservative boundary: refuse this entire regime before execution.
+    LegacyAlignmentCheck,
     /// NEC V20/V30: BRKEM while the MD write-enable latch is set. Emulation
     /// mode cannot be nested and "normal operation cannot be expected"
     /// (NEC V20/V30 UM §8 p. 8-5).

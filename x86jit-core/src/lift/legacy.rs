@@ -8,6 +8,7 @@ use crate::legacy::{
 struct Ops {
     values: Vec<IrOp>,
     context: MachineContext,
+    profile: &'static crate::ModelProfile,
 }
 impl std::ops::Deref for Ops {
     type Target = [IrOp];
@@ -26,6 +27,9 @@ impl LiftBuffer for Ops {
     }
     fn legacy_context(&self) -> Option<MachineContext> {
         Some(self.context)
+    }
+    fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
+        Some(self.profile)
     }
 }
 
@@ -142,12 +146,26 @@ pub(crate) fn segment(r: Register) -> Option<SegmentId> {
 }
 
 /// Decode exactly the fetched instruction; callers fetch incrementally and check CS.
+#[cfg(test)]
 pub(crate) fn instruction(
     code: &[u8],
     ip: u32,
     context: MachineContext,
 ) -> Result<IrBlock, LiftError> {
-    let profile = crate::model::profile_for_generation(context.generation);
+    instruction_for_profile(
+        code,
+        ip,
+        context,
+        crate::model::profile_for_generation(context.generation),
+    )
+}
+
+pub(crate) fn instruction_for_profile(
+    code: &[u8],
+    ip: u32,
+    context: MachineContext,
+    profile: &'static crate::ModelProfile,
+) -> Result<IrBlock, LiftError> {
     let mut decoder = Decoder::with_ip(
         u32::from(context.default_operand_bits),
         code,
@@ -174,6 +192,7 @@ pub(crate) fn instruction(
     let mut ops = Ops {
         values: Vec::new(),
         context,
+        profile,
     };
     let mut tg = TempGen::new();
     ops.push(IrOp::InsnStart {
@@ -470,7 +489,9 @@ fn privilege_guard(
         register.is_cr() || register.is_dr() || register.is_tr()
     };
     let kind = match insn.mnemonic() {
-        Hlt | Lgdt | Lidt | Lmsw | Clts | Lldt | Ltr => PrivilegeCheck::Cpl0,
+        Hlt | Lgdt | Lidt | Lmsw | Clts | Lldt | Ltr | Invd | Wbinvd | Invlpg => {
+            PrivilegeCheck::Cpl0
+        }
         Mov if special(0) || special(1) => PrivilegeCheck::Cpl0,
         Cli | Sti => PrivilegeCheck::Iopl,
         // SDM Vol 2B REP Operation p. 4-564: with a zero count the string
@@ -546,6 +567,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
             IrOp::Load { .. }
                 | IrOp::Store { .. }
                 | IrOp::AtomicRmw { .. }
+                | IrOp::AtomicCas { .. }
                 | IrOp::Div { .. }
                 | IrOp::Trap { .. }
                 | IrOp::BoundGate { .. }
@@ -1020,6 +1042,12 @@ pub(super) fn lower(
     use Mnemonic::*;
     let context = ops.legacy_context().expect("legacy lowering context");
     let profile = lowering_profile(ops, context);
+    if matches!(
+        profile.isa,
+        crate::ModelIsa::I80486Dx | crate::ModelIsa::I80486DxCpuid
+    ) {
+        emit(ops, L::I486Gate);
+    }
     // Generation availability is checked before lowering; decoder width alone
     // never grants the 286 any 386 forms (I286 PRM §6.2 p. 6-2, Appendix B).
     let mode = if context.default_operand_bits == 16 {
@@ -1051,6 +1079,12 @@ pub(super) fn lower(
         return Ok(true);
     }
     match insn.mnemonic() {
+        // Intel486 PRM §26 INVD/INVLPG/WBINVD pp. 26-171–172, 26-281.
+        // DERIVED: no cache/TLB state exists with paging off; CPL is gated above.
+        Invd | Wbinvd | Invlpg => emit(ops, L::I486Invalidate),
+        // PRM §26 BSWAP p. 26-35: 16-bit result is undefined.
+        Bswap if size == 2 => emit(ops, L::Refuse { operation: crate::UnsupportedSystemOperation::LegacyInstruction }),
+        Cpuid => emit(ops, L::I486Cpuid { signature: crate::model::I486_DX_CPUID_SIGNATURE }),
         Pushf | Pushfd | Popf | Popfd | Iret | Iretd if !profile.flags_helper_supported() => {
             return Err(unsupported_insn(insn))
         }
@@ -1267,6 +1301,11 @@ pub(super) fn lower(
                 Register::DR5 | Register::DR7 => DebugTestRegister::Dr7,
                 Register::TR6 => DebugTestRegister::Tr6,
                 Register::TR7 => DebugTestRegister::Tr7,
+                Register::TR3 | Register::TR4 | Register::TR5 => {
+                    // 486 PRM §10.7.2 pp. 10-13–17: cache test registers.
+                    emit(ops, L::Refuse { operation: crate::UnsupportedSystemOperation::LegacyCacheTest });
+                    return Ok(true);
+                }
                 _ => unreachable!("generation decode excludes other special registers"),
             };
             // 80386 PRM §17 MOV p. 17-111: always a 32-bit GPR transfer,
@@ -1866,7 +1905,9 @@ pub(super) fn lower(
         // 80386 PRM §17 pp. 17-29–36: register destinations and immediate
         // indices wrap within the operand width. Memory/register bit strings
         // retain the signed displacement lowering above (§17.2.2.4 pp. 17-14–15).
-        | Bt | Bts | Btr | Btc => {
+        // 486 PRM §26 BSWAP p. 26-35, CMPXCHG pp. 26-62–63,
+        // XADD pp. 26-282–283: reuse the shared scalar/atomic lowering.
+        | Bt | Bts | Btr | Btc | Bswap | Xadd | Cmpxchg => {
             let first = ops.len();
             let result = lift_insn_inner(insn, ops, tg, mode, &mut mmx::Sequence::default());
             for op in &mut ops[first..] {

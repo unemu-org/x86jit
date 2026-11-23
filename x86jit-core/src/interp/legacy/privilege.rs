@@ -693,6 +693,11 @@ pub(super) fn outward<const ROUTED: bool, const ORDER: u8>(
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         // The old CPL and IOPL decide which flags load: the SDM assigns
         // them before CPL := CS.RPL (IRET p. 3-493).
+        let image = if frame.size == 2 {
+            image | (cpu.rflags_system as u32 & cpu.machine_flags_mask)
+        } else {
+            image
+        };
         load_flags(cpu, generation, image)?;
         if frame.size == 4 {
             cpu.rflags_system = (cpu.rflags_system & !(1 << 16)) | u64::from(image & (1 << 16));

@@ -682,17 +682,23 @@ impl Execution {
                 return Ok((block.ir.clone(), block.walk));
             }
         }
-        let ir =
-            crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context).map_err(|error| {
-                match error {
-                    crate::lift::LiftError::Unsupported { addr, bytes, len } => {
-                        Exit::unknown_instruction(addr, bytes, len)
-                    }
-                    crate::lift::LiftError::DecodeFault { addr } => {
-                        Exit::unmapped_memory(addr, crate::AccessKind::Execute)
-                    }
-                }
-            })?;
+        let ir = crate::lift::legacy::instruction_for_profile(
+            &bytes,
+            cpu.rip as u32,
+            context,
+            vm.cpu_model.map_or_else(
+                || crate::model::profile_for_generation(context.generation),
+                crate::CpuModel::profile,
+            ),
+        )
+        .map_err(|error| match error {
+            crate::lift::LiftError::Unsupported { addr, bytes, len } => {
+                Exit::unknown_instruction(addr, bytes, len)
+            }
+            crate::lift::LiftError::DecodeFault { addr } => {
+                Exit::unmapped_memory(addr, crate::AccessKind::Execute)
+            }
+        })?;
         let ir = Arc::new(ir);
         let walk = if KIND >= MACHINE_DISPATCH {
             BlockWalk::for_ir::<true>(&ir)
@@ -1103,7 +1109,10 @@ fn resolve_direct_uncached(
                 let bytes = &code[position..decoder.position()];
                 // Match incremental Machine fetch: an unavailable I286 opcode
                 // byte wins before a later ESC can reach its MSW gate.
-                let profile = crate::model::profile_for_generation(context.generation);
+                let profile = vm.cpu_model.map_or_else(
+                    || crate::model::profile_for_generation(context.generation),
+                    crate::CpuModel::profile,
+                );
                 let isa = profile.isa;
                 // The catalogue's length limit (xj-50w.13; I286 PRM App. C
                 // item 10 p. C-2): a fetch holds at most that many bytes, so
@@ -1121,8 +1130,12 @@ fn resolve_direct_uncached(
                 } else {
                     bytes
                 };
-                let reference =
-                    crate::lift::legacy::instruction(reference_bytes, insn.ip() as u32, context);
+                let reference = crate::lift::legacy::instruction_for_profile(
+                    reference_bytes,
+                    insn.ip() as u32,
+                    context,
+                    profile,
+                );
                 let allowed = !insn.is_invalid()
                     && shared_instruction(&insn)
                     && reference.as_ref().is_ok_and(|r| {
@@ -1157,8 +1170,16 @@ fn resolve_direct_uncached(
                     ir
                 } else {
                     let bytes = fetch(vm, cpu, context)?;
-                    crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
-                        .map_err(|error| direct_refusal(cpu, error))?
+                    crate::lift::legacy::instruction_for_profile(
+                        &bytes,
+                        cpu.rip as u32,
+                        context,
+                        vm.cpu_model.map_or_else(
+                            || crate::model::profile_for_generation(context.generation),
+                            crate::CpuModel::profile,
+                        ),
+                    )
+                    .map_err(|error| direct_refusal(cpu, error))?
                 }
             } else {
                 if end < ir.guest_start + u64::from(ir.guest_len) {
@@ -1208,8 +1229,16 @@ fn resolve_direct_uncached(
             }
         } else {
             let bytes = fetch(vm, cpu, context)?;
-            crate::lift::legacy::instruction(&bytes, cpu.rip as u32, context)
-                .map_err(|error| direct_refusal(cpu, error))?
+            crate::lift::legacy::instruction_for_profile(
+                &bytes,
+                cpu.rip as u32,
+                context,
+                vm.cpu_model.map_or_else(
+                    || crate::model::profile_for_generation(context.generation),
+                    crate::CpuModel::profile,
+                ),
+            )
+            .map_err(|error| direct_refusal(cpu, error))?
         };
         ir.legacy_context = Some(context);
         if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
@@ -2413,6 +2442,10 @@ impl Vcpu {
         options: StepOptions,
         initial_context: Option<(MachineContext, Option<u64>)>,
     ) -> DispatchResult {
+        if KIND != APPLICATION_DISPATCH {
+            self.cpu.machine_flags_mask =
+                vm.cpu_model.map_or(0, crate::CpuModel::machine_flags_mask);
+        }
         // Epoch numbers belong to a domain. A vCPU used with another VM must
         // not carry predictions whose equal epoch names a different backend.
         let mut participant = if KIND == APPLICATION_DISPATCH {

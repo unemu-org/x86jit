@@ -477,6 +477,9 @@ impl IrBlock {
                     }
                     | crate::legacy::LegacyOp::Leave { .. }
                     | crate::legacy::LegacyOp::CheckTaskReturn
+                    | crate::legacy::LegacyOp::I486Gate
+                    | crate::legacy::LegacyOp::I486Cpuid { .. }
+                    | crate::legacy::LegacyOp::I486Invalidate
                     | crate::legacy::LegacyOp::Refuse { .. } => {}
                 },
             }

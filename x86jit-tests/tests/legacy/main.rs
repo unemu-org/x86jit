@@ -22,6 +22,7 @@ mod legacy_i286_quirks;
 mod legacy_i386_integer;
 mod legacy_i386_reset;
 mod legacy_i386_x87;
+mod legacy_i486;
 mod legacy_i8086;
 mod legacy_idt;
 mod legacy_ldt;

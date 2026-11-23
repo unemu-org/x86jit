@@ -470,6 +470,9 @@ pub struct CpuState {
     /// §10.6.2 Fig. 10-4 p. 10-15). Inert in Application profiles.
     /// Appended to preserve existing compiled-code offsets.
     pub debug_test_registers: [u32; 8],
+    /// Catalogue-owned AC/ID availability on Machine execution. Refreshed at
+    /// dispatch entry; inert in Application profiles. Appended for ABI stability.
+    pub machine_flags_mask: u32,
 }
 
 /// Coprocessor policy independent of the CPU model (decision-23 §4).
@@ -666,6 +669,7 @@ impl Default for CpuState {
             // Use the SDM Vol 3A §12.1 Table 12-1 p. 12-3 DR6/DR7 images.
             // TR reset values are unspecified here; choose zero.
             debug_test_registers: [0, 0, 0, 0, 0xffff_0ff0, 0x400, 0, 0],
+            machine_flags_mask: 0,
         }
     }
 }

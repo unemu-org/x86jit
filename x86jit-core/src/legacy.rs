@@ -390,6 +390,22 @@ impl CpuState {
         cpu
     }
 
+    /// Intel486 DX reset image (PRM §10.1 Figs. 10-1/2, Table 10-1,
+    /// pp. 10-1–3; Embedded 486 DM §D.2 p. D-2 for the CPUID signature).
+    /// ASSUMED: undefined registers are zero, FPU uses the engine FNINIT image
+    /// even without self-test, and all real-cache attributes/A20 follow i386_reset.
+    /// Panics unless `model` is one of the two Intel486 DX catalogue entries.
+    pub fn i486_reset(model: crate::CpuModel) -> Self {
+        let signature = model.i486_signature().expect("Intel486 DX model");
+        let mut cpu = Self::i386_reset(crate::FpuModel::Present);
+        cpu.gpr[2] = u64::from(signature);
+        cpu.legacy.cr0 = 0x6000_0010;
+        cpu.debug_test_registers[4] = 0xffff_0ff0;
+        cpu.debug_test_registers[5] = 0;
+        cpu.machine_flags_mask = model.machine_flags_mask();
+        cpu
+    }
+
     /// Engine ordinary real entry, not hardware reset. The array uses SegmentId
     /// order. SDM Vol 3A §§3.4.3, 12.9.2: selector-derived normal real caches;
     /// SDM Vol 3B §23.1.4: the ordinary IVT has 256 four-byte entries.
@@ -735,6 +751,14 @@ pub enum BcdStringOp {
 /// address widths are bits. The Real16 compatibility alias shares the width-aware forms.
 #[derive(Clone, Debug)]
 pub enum LegacyOp {
+    /// ASSUMED conservative refusal for the enabled alignment-check regime.
+    I486Gate,
+    /// Embedded Intel486 DM §D.2 pp. D-1–2; independent of Application CPUID.
+    I486Cpuid {
+        signature: u32,
+    },
+    /// No cache model: cache operations complete; paging is refused at entry.
+    I486Invalidate,
     /// A Direct block using the shared Real16 walk.
     SharedWalk,
     /// Architectural rollback is required by this instruction's helper lowering.
@@ -1509,7 +1533,9 @@ pub(crate) fn flags_image(cpu: &CpuState, generation: CpuGeneration) -> u32 {
         // pp. B-51–52: protected FLAGS includes IOPL and NT.
         CpuGeneration::I286 if cpu.legacy.cr0 & 1 != 0 => low | (cpu.rflags_system as u32 & 0x7000),
         CpuGeneration::I286 => low,
-        CpuGeneration::I386 => low | (cpu.rflags_system as u32 & 0x0003_7000),
+        CpuGeneration::I386 => {
+            low | (cpu.rflags_system as u32 & (0x0003_7000 | cpu.machine_flags_mask))
+        }
     }
 }
 
@@ -1518,7 +1544,9 @@ pub(crate) fn restore_flags(
     generation: CpuGeneration,
     image: u32,
 ) -> Result<(), crate::Exit> {
-    let image = image & !crate::model::EARLY_FLAGS_FIXED_ZERO;
+    // 486 PRM §4.1.1 p. 4-2; §26 POPFD p. 26-235; Embedded 486
+    // DM §D.1 p. D-1: AC/ID load independently of IOPL.
+    let image = image & !(crate::model::EARLY_FLAGS_FIXED_ZERO & !cpu.machine_flags_mask);
     cpu.flags.set_flags16((image & 0x0ed7) as u16);
     // I286 PRM Appendix B IRET pp. B-51–52; §10.1 p. 10-1.
     // This is the CPL-0 load, and a task switch's; POPF and IRET at CPL 1–3
@@ -1526,7 +1554,7 @@ pub(crate) fn restore_flags(
     let system = if generation == CpuGeneration::I386
         || (generation == CpuGeneration::I286 && cpu.legacy.cr0 & 1 != 0)
     {
-        image & 0x7000
+        image & (0x7000 | cpu.machine_flags_mask)
     } else {
         0
     };

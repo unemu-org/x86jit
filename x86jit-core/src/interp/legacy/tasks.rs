@@ -210,6 +210,7 @@ impl Owner {
             task_io_map_base,
             task_debug_trap,
             debug_test_registers,
+            machine_flags_mask,
         ) && self.cpu.flags == cpu.flags
             && self.cpu.flags.pf_src == cpu.flags.pf_src
             && self.cpu.flags.af_src == cpu.flags.af_src

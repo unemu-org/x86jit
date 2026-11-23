@@ -42,13 +42,21 @@ struct Probe {
 
 fn modrm(two: bool, op: u8) -> bool {
     if two {
-        !matches!(op, 0x06 | 0x80..=0x8f | 0xa0..=0xa1 | 0xa8..=0xa9)
+        !matches!(op, 0x06 | 0x08..=0x09 | 0x80..=0x8f | 0xa0..=0xa2 | 0xa8..=0xa9 | 0xc8..=0xcf)
     } else {
         (op < 0x40 && op & 7 <= 3)
             || matches!(op, 0x62..=0x63 | 0x69 | 0x6b | 0x80..=0x8f | 0xc0..=0xc1 | 0xc4..=0xc7 | 0xd0..=0xd3 | 0xd8..=0xdf | 0xf6..=0xf7 | 0xfe..=0xff)
     }
 }
-fn defined(two: bool, op: u8) -> bool {
+fn defined(model: CpuModel, two: bool, op: u8) -> bool {
+    // Intel486 PRM App. A pp. A-4–7; Embedded 486 DM §D.1 p. D-1.
+    if two
+        && model.i486_signature().is_some()
+        && (matches!(op, 0x08..=0x09 | 0xb0..=0xb1 | 0xc0..=0xc1 | 0xc8..=0xcf)
+            || op == 0xa2 && model == CpuModel::I80486DxCpuid)
+    {
+        return true;
+    }
     if two {
         matches!(op, 0x00..=0x03 | 0x06 | 0x20..=0x24 | 0x26 | 0x80..=0x9f | 0xa0..=0xa1 | 0xa3..=0xa5 | 0xa8..=0xa9 | 0xab..=0xad | 0xaf | 0xb2..=0xb7 | 0xba..=0xbf)
     } else {
@@ -66,15 +74,19 @@ fn group(two: bool, op: u8) -> bool {
         )
     }
 }
-fn legal(two: bool, op: u8, reg: u8, shape: u8) -> bool {
+fn legal(model: CpuModel, two: bool, op: u8, reg: u8, shape: u8) -> bool {
     // PRM Appendix A p. A-8; §17 MOV special-register encodings.
     if two {
         match op {
             0x00 => reg <= 5,
-            0x01 => matches!(reg, 0..=4 | 6) && (reg >= 4 || shape != 0),
+            0x01 => {
+                (matches!(reg, 0..=4 | 6)
+                    || reg == 7 && model.i486_signature().is_some() && shape != 0)
+                    && (reg >= 4 || shape != 0)
+            }
             0x20 | 0x22 => matches!(reg, 0 | 2 | 3) && shape == 0,
             0x21 | 0x23 => matches!(reg, 0..=3 | 6..=7) && shape == 0,
-            0x24 | 0x26 => reg >= 6 && shape == 0,
+            0x24 | 0x26 => (reg >= 6 || model.i486_signature().is_some() && reg >= 3) && shape == 0,
             0xb2 | 0xb4 | 0xb5 => shape != 0,
             0xba => reg >= 4,
             _ => true,
@@ -93,11 +105,11 @@ fn legal(two: bool, op: u8, reg: u8, shape: u8) -> bool {
         }
     }
 }
-fn probes(mode: Mode) -> Vec<Probe> {
+fn probes(model: CpuModel, mode: Mode) -> Vec<Probe> {
     let mut out = Vec::new();
     for two in [false, true] {
         for op in 0..=255u8 {
-            if !defined(two, op) {
+            if !defined(model, two, op) {
                 continue;
             }
             let has_modrm = modrm(two, op);
@@ -113,8 +125,8 @@ fn probes(mode: Mode) -> Vec<Probe> {
                                 if shape == 2 && !addr32 {
                                     continue;
                                 }
-                                let reserved = group(two, op) && !legal(two, op, reg, 1);
-                                if !legal(two, op, reg, shape) && !reserved {
+                                let reserved = group(two, op) && !legal(model, two, op, reg, 1);
+                                if !legal(model, two, op, reg, shape) && !reserved {
                                     continue;
                                 }
                                 let mut b = Vec::new();
@@ -276,7 +288,7 @@ fn probes(mode: Mode) -> Vec<Probe> {
 fn descriptor(vm: &Vm, selector: u16, base: u32, limit: u32, attr: u16) {
     descriptor_fixture::descriptor(vm, 0x2000 + u64::from(selector), base, limit, attr);
 }
-fn setup(p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu) {
+fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu) {
     let mut bytes = p.bytes.clone();
     bytes.extend([0xf4; 32]);
     let (vm, mut cpu) = if application {
@@ -287,9 +299,9 @@ fn setup(p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu) {
         let cpu = vm.new_vcpu();
         (vm, cpu)
     } else {
-        descriptor_fixture::setup(CpuModel::I80386, &bytes)
+        descriptor_fixture::setup(model, &bytes)
     };
-    cpu.set_fpu_model(if p.x87 {
+    cpu.set_fpu_model(if p.x87 || model.i486_signature().is_some() {
         FpuModel::Present
     } else {
         FpuModel::None
@@ -463,6 +475,10 @@ fn comparable(p: &Probe) -> bool {
                 | Outsw
                 | Outsd
                 | Wait
+                | Cpuid
+                | Invd
+                | Wbinvd
+                | Invlpg
         )
         && !matches!(p.insn.op0_kind(), OpKind::FarBranch16 | OpKind::FarBranch32)
         && !(matches!(p.insn.mnemonic(), Push | Pop) && p.insn.op0_register().is_segment_register())
@@ -481,7 +497,7 @@ fn same_application_decode(p: &Probe) -> bool {
         && app.memory_displacement64() == p.insn.memory_displacement64()
 }
 fn compare(p: &Probe, mode: Mode, cpu: &Vcpu, vm: &Vm) -> String {
-    let (app, mut other) = setup(p, mode, true);
+    let (app, mut other) = setup(CpuModel::I80386, p, mode, true);
     let ir = match x86jit_core::lift::lift_one(&app.mem, FetchAddr::flat(0x1000), CpuMode::Compat32)
     {
         Ok(ir) => ir,
@@ -553,17 +569,31 @@ fn compare(p: &Probe, mode: Mode, cpu: &Vcpu, vm: &Vm) -> String {
 #[test]
 #[ignore = "manual 386 opcode census; emits a TSV runtime artifact"]
 fn runtime_census() {
-    let mut report = String::from("mode\tbytes\tmnemonic\tshape\tclass\texit\tcomparison\n");
-    let mut summary =
-        String::from("mode\tinteger total\texecutes\trefused\tfault\tport I/O\tunknown\tpanic\n");
+    runtime_census_for(CpuModel::I80386);
+}
+
+#[test]
+#[ignore = "manual 486 opcode census; emits TSV runtime artifacts"]
+fn runtime_census_i486() {
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        runtime_census_for(model);
+    }
+}
+
+fn runtime_census_for(model: CpuModel) {
+    let mut report = String::from("model\tmode\tbytes\tmnemonic\tshape\tclass\texit\tcomparison\n");
+    let mut summary = String::from(
+        "model\tmode\tinteger total\texecutes\trefused\tfault\tport I/O\tunknown\tpanic\n",
+    );
     for mode in [Mode::P32, Mode::P16, Mode::Real] {
         let mut counts = BTreeMap::<String, usize>::new();
         let mut comparisons = BTreeMap::<String, usize>::new();
+        let mut families = BTreeMap::<String, usize>::new();
         let mut integer_refusals = BTreeMap::<String, usize>::new();
-        let generated = probes(mode);
+        let generated = probes(model, mode);
         for two in [false, true] {
             for op in 0..=255u8 {
-                if defined(two, op) {
+                if defined(model, two, op) {
                     assert!(
                         generated.iter().any(|p| {
                             let raw = p
@@ -584,7 +614,7 @@ fn runtime_census() {
             }
         }
         for p in generated {
-            let (vm, mut cpu) = setup(&p, mode, false);
+            let (vm, mut cpu) = setup(model, &p, mode, false);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let run = cpu.run_steps(&vm, 1, StepOptions::default());
                 let (class, exit) = match run {
@@ -594,7 +624,7 @@ fn runtime_census() {
                                 operation, ..
                             }) if !p.x87 && !p.reserved => {
                                 *integer_refusals
-                                    .entry(format!("{operation:?}"))
+                                    .entry(format!("{:?}/{operation:?}", p.insn.mnemonic()))
                                     .or_default() += 1;
                             }
                             _ => {}
@@ -643,13 +673,26 @@ fn runtime_census() {
                 class.clone()
             };
             *counts.entry(category.clone()).or_default() += 1;
+            if matches!(
+                class.as_str(),
+                "refused" | "unknown" | "panic" | "step-error"
+            ) || comparison.starts_with("DIFF:")
+            {
+                *families
+                    .entry(format!(
+                        "{category}/{:?}/{}",
+                        p.insn.mnemonic(),
+                        comparison.split(':').next().unwrap()
+                    ))
+                    .or_default() += 1;
+            }
             *comparisons
                 .entry(comparison.split(':').next().unwrap().into())
                 .or_default() += 1;
             let bytes: String = p.bytes.iter().map(|b| format!("{b:02X}")).collect();
             writeln!(
                 report,
-                "{mode:?}\t{bytes}\t{}\t{}\t{category}\t{exit}\t{comparison}",
+                "{model:?}\t{mode:?}\t{bytes}\t{}\t{}\t{category}\t{exit}\t{comparison}",
                 p.insn, p.shape
             )
             .unwrap();
@@ -669,7 +712,7 @@ fn runtime_census() {
             .sum();
         writeln!(
             summary,
-            "{mode:?}\t{integer_total}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{model:?}\t{mode:?}\t{integer_total}\t{}\t{}\t{}\t{}\t{}\t{}",
             count("executes"),
             count("refused"),
             count("fault"),
@@ -678,14 +721,14 @@ fn runtime_census() {
             count("panic")
         )
         .unwrap();
-        eprintln!("CENSUS {mode:?}: {counts:?}; integer refusals={integer_refusals:?}; comparison={comparisons:?}");
-        writeln!(report, "# {mode:?}: {counts:?}; integer refusals={integer_refusals:?}; comparison={comparisons:?}").unwrap();
+        eprintln!("CENSUS {model:?} {mode:?}: {counts:?}; integer refusals={integer_refusals:?}; comparison={comparisons:?}; families={families:?}");
+        writeln!(report, "# {model:?} {mode:?}: {counts:?}; integer refusals={integer_refusals:?}; comparison={comparisons:?}; families={families:?}").unwrap();
     }
     eprintln!("INTEGER CENSUS (excludes D8–DF and reserved group controls)\n{summary}");
     report.push_str(&format!("# INTEGER SUMMARY\n{summary}"));
     let path = std::env::var("CENSUS_386_OUT").unwrap_or_else(|_| {
         std::env::temp_dir()
-            .join("census-386-runtime.tsv")
+            .join(format!("census-{model:?}-runtime.tsv"))
             .display()
             .to_string()
     });

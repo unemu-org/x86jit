@@ -57,7 +57,9 @@ CORE_SRC = "x86jit-core/src/"
 #     file is shared. Its legacy calls sit in the KIND >= MACHINE_DISPATCH
 #     branch or in methods that need legacy_execution, which only a Machine
 #     profile creates (Execution, resolve_direct*, deliver_legacy_event,
-#     deliver_event20, legacy_context_for_run). Its prologue calls
+#     deliver_event20, legacy_context_for_run). instruction_for_profile replaces
+#     the generation-only instruction call in Machine resolvers and carries the
+#     selected catalogue entry. Its prologue calls
 #     alias_context for every KIND; the application branch never reads the
 #     value.
 #   lib.rs, ir/verify.rs: declarations and public re-exports (legacy_probes is
@@ -112,7 +114,7 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::execute_shared20", "interp::legacy::finish_port_input",
         "interp::legacy::tasks", "lift::i8086::CONTEXT", "lift::i8086::word_bus",
         "lift::legacy::alias_context",
-        "lift::legacy::instruction", "lift::legacy::shared_helper", "model::CpuModel",
+        "lift::legacy::instruction_for_profile", "lift::legacy::shared_helper", "model::CpuModel",
         "model::decode", "model::profile_for_generation", "vm::i8086::resolve",
     },
     "x86jit-core/src/vm/legacy/nmi.rs": {

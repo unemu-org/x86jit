@@ -15,6 +15,8 @@ use super::*;
 const fn nests_if_twenty_bit(model: crate::CpuModel) -> bool {
     match model {
         crate::CpuModel::I80286
+        | crate::CpuModel::I80486Dx
+        | crate::CpuModel::I80486DxCpuid
         | crate::CpuModel::I80386
         | crate::CpuModel::I8088
         | crate::CpuModel::I8086
@@ -32,6 +34,8 @@ const _: () = {
     let models = [
         crate::CpuModel::I80286,
         crate::CpuModel::I80386,
+        crate::CpuModel::I80486Dx,
+        crate::CpuModel::I80486DxCpuid,
         crate::CpuModel::I8088,
         crate::CpuModel::I8086,
         crate::CpuModel::NecV20,
