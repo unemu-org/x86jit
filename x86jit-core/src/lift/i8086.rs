@@ -714,6 +714,7 @@ fn brkem(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub(crate) fn instruction(
     insn: &Instruction,
     bytes: &[u8],
@@ -907,7 +908,21 @@ pub(crate) fn instruction(
         }
     }
     let q = profile.quirks;
-    if q.shift_count_mask.is_none() {
+    if q.shift_count_mask.is_none()
+        && values.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Shl { b, set_flags, .. }
+                    | IrOp::Shr { b, set_flags, .. }
+                    | IrOp::Sar { b, set_flags, .. }
+                    | IrOp::Rol { b, set_flags, .. }
+                    | IrOp::Ror { b, set_flags, .. }
+                    | IrOp::Rcl { b, set_flags, .. }
+                    | IrOp::Rcr { b, set_flags, .. }
+                    if !set_flags.is_none() && !matches!(b, Val::Imm(0..=1))
+            )
+        })
+    {
         let mut normalized = Vec::new();
         for mut op in values {
             unmasked_count(&mut op, &mut normalized, tg);

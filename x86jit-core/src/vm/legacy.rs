@@ -57,7 +57,7 @@ impl LegacyContextStamp {
             system_flags: cpu.rflags_system & 0x27000,
         }
     }
-    #[inline]
+    #[inline(always)]
     fn matches(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
         #[inline(always)]
         fn cache_bits(c: &crate::legacy::SegmentCache) -> (u64, u64) {
@@ -549,7 +549,7 @@ impl Execution {
         self.last_direct_fetch = None;
         self.stall_count = 0;
     }
-    #[inline]
+    #[inline(always)]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
         // A retained namespace can change while execution returns to the same CPU inputs.
         let (stamp, context, epoch) = self.validated.as_ref()?;
@@ -1549,7 +1549,8 @@ impl Vcpu {
         }
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
     fn validate_legacy_debug_state(&self) -> Result<(), Exit> {
         // 80386 PRM §12.2.2 p. 12-4: L0–L3/G0–G3 enable breakpoints;
         // SDM Vol 3B §20.2.4 p. 20-5: GD enables debug-register traps.
@@ -1601,12 +1602,11 @@ impl Vcpu {
         Ok(context)
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn warm_machine_context(&mut self, limit: Option<u64>) -> Option<MachineContext> {
         if limit != Some(0)
             && !self.cpu.mmio_retry_active
             && self.cpu.task_debug_trap == 0
-            && self.validate_legacy_debug_state().is_ok()
             && self.cpu.rip <= u64::from(u32::MAX)
         {
             let execution = self.legacy_execution.as_mut().unwrap();
@@ -1614,6 +1614,14 @@ impl Vcpu {
                 if let Some(context) =
                     execution.validated_context(&self.cpu, self.legacy_model.unwrap())
                 {
+                    if context.generation == CpuGeneration::I386
+                        && self.cpu.debug_test_registers
+                            [crate::legacy::DebugTestRegister::Dr7 as usize]
+                            & 0x20ff
+                            != 0
+                    {
+                        return None;
+                    }
                     if context.segment_class == crate::SegmentClass::Direct {
                         execution.task_switch.committed = false;
                         execution.task_switch.completed = false;
