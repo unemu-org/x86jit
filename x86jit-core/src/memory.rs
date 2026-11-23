@@ -1133,13 +1133,45 @@ impl Memory {
         // SAFETY: only immutable allocation metadata is read; guest writes mutate bytes.
         let backing = unsafe { &*self.backing.get() };
         let reserved = backing.len as u64;
-        let committed = match backing.owner {
+        let committed = match &backing.owner {
             Owner::Boxed { .. } => Some(reserved),
+            Owner::Sparse(reservation) => Some(self.sparse_committed(reservation.page as u64)),
             _ => None,
         };
         let tracking = (self.code_page.len() + self.watch.watch.len() + self.watch.dirty.len())
             * std::mem::size_of::<AtomicU64>();
         (reserved, committed, tracking as u64)
+    }
+
+    /// Host bytes committed for a sparse backing: the union of the mapped regions
+    /// rounded out to host pages, which is exactly what `map` commits and `unmap`
+    /// leaves committed (shared edge pages count once).
+    fn sparse_committed(&self, page: u64) -> u64 {
+        let mut spans: Vec<(u64, u64)> = self
+            .regions
+            .iter()
+            .filter(|r| r.size != 0)
+            .map(|r| {
+                (
+                    r.start / page * page,
+                    (r.start + r.size as u64).div_ceil(page) * page,
+                )
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut total = 0;
+        let mut open: Option<(u64, u64)> = None;
+        for (lo, hi) in spans {
+            match &mut open {
+                Some((_, end)) if lo <= *end => *end = (*end).max(hi),
+                _ => {
+                    if let Some((a, b)) = open.replace((lo, hi)) {
+                        total += b - a;
+                    }
+                }
+            }
+        }
+        total + open.map_or(0, |(a, b)| b - a)
     }
 
     pub(crate) fn child_view<'vm>(

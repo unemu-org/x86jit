@@ -179,8 +179,10 @@ pub struct MemoryStats {
     pub codemap_bytes: u64,
     /// Guest backing extent, including any spare embedder-supplied backing bytes.
     pub guest_ram_reserved: u64,
-    /// Owned RAM allocation bytes, or None for embedder-provided backing whose
-    /// commitment is unknown. Allocation commitment is not resident memory.
+    /// Owned RAM allocation bytes; for a sparse backing, the host bytes committed
+    /// for the mapped regions (rounded out to host pages). None for
+    /// embedder-provided backing whose commitment is unknown. Allocation
+    /// commitment is not resident memory.
     pub guest_ram_committed: Option<u64>,
     /// Allocated capacities of code/watch/dirty bitmaps. Lazily resident and
     /// separate from RAM; excludes sparse index and alias-tree allocations.

@@ -521,3 +521,29 @@ fn sparse_run_steps_counts_each_load_and_halt_once() {
         assert_execution_tier(&vm, tier);
     }
 }
+
+#[test]
+fn memory_stats_report_the_committed_bytes_of_a_sparse_backing() {
+    let mut vm = Vm::sparse(VmConfig::reserved(SPAN)).unwrap();
+    let stats = |vm: &Vm| vm.memory_stats().guest_ram_committed;
+    assert_eq!(stats(&vm), Some(0));
+    // Regions aligned to 64 KiB commit exactly their size on every supported host page size.
+    vm.map(0, LOW, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(HIGH, 128 << 10, Prot::RX, RegionKind::Rom).unwrap();
+    assert_eq!(stats(&vm), Some(LOW as u64 + (128 << 10)));
+    assert_eq!(vm.memory_stats().guest_ram_reserved, SPAN);
+    // Two small regions in one host page share it: it counts once, before and after one unmap.
+    let page_base = 0x1000_0000;
+    vm.map(page_base, 0x100, Prot::RW, RegionKind::Ram).unwrap();
+    let one = stats(&vm).unwrap();
+    assert!(one > LOW as u64 + (128 << 10));
+    vm.map(page_base + 0x100, 0x100, Prot::RW, RegionKind::Ram)
+        .unwrap();
+    assert_eq!(stats(&vm), Some(one));
+    vm.unmap(page_base, 0x100).unwrap();
+    assert_eq!(stats(&vm), Some(one));
+    vm.unmap(page_base + 0x100, 0x100).unwrap();
+    assert_eq!(stats(&vm), Some(LOW as u64 + (128 << 10)));
+    vm.unmap(HIGH, 128 << 10).unwrap();
+    assert_eq!(stats(&vm), Some(LOW as u64));
+}
