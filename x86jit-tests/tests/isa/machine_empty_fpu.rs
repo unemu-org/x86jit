@@ -1,7 +1,8 @@
 //! I286/287 PRM 210498-005, Part I Appendix A p. A-4; Part II Ch. 2
 //! "Data Synchronization" p. 2-49, Ch. 3 pp. 3-1–3-3, Appendix B item 10
 //! p. B-2, Appendix A p. A-5. Page images checked. Decision-25 supplies the
-//! all-high word-transfer default and preserves larger memory destinations.
+//! all-high word-transfer default; the 2026-11-24 maintainer policy extends
+//! that ASSUMED bus value to absent FNSTENV/FNSAVE images.
 use x86jit_core::{
     fault::{ErrorCode, FaultClass},
     Backend, CachedBlock, CpuModel, CpuState, ExceptionDelivery, Exit, FpuModel, IrBlock,
@@ -201,12 +202,17 @@ const OUTPUTS: [(u8, u8, u8); 15] = [
     (0xdd, 0x36, 94), // FNSAVE m94
 ];
 
-fn transfers_word(opcode: u8, modrm: u8) -> bool {
-    matches!((opcode, modrm), (0xd9 | 0xdd, 0x3e))
+fn transfer_width(opcode: u8, modrm: u8) -> usize {
+    match (opcode, modrm) {
+        (0xd9 | 0xdd, 0x3e) => 2,
+        (0xd9, 0x36) => 14,
+        (0xdd, 0x36) => 94,
+        _ => 0,
+    }
 }
 
 #[test]
-fn memory_outputs_follow_the_word_transfer_and_larger_store_rules() {
+fn memory_outputs_follow_the_control_store_and_other_output_rules() {
     for (opcode, modrm, _) in OUTPUTS {
         for path in 0..3 {
             let (vm, mut cpu) = setup(CpuModel::I80286, &[opcode, modrm, 0, 4]);
@@ -216,8 +222,8 @@ fn memory_outputs_follow_the_word_transfer_and_larger_store_rules() {
             let gpr = cpu.cpu.gpr;
             let flags = cpu.cpu.flags.to_rflags();
             retire(&mut cpu, &vm, 4, path);
-            if transfers_word(opcode, modrm) {
-                sentinel[1..3].fill(0xff);
+            if transfer_width(opcode, modrm) != 0 {
+                sentinel[1..1 + transfer_width(opcode, modrm)].fill(0xff);
             }
             assert_eq!(bytes(&vm, 0x23ff, 96), sentinel, "{opcode:02x}/{modrm:02x}");
             assert_eq!(cpu.cpu.gpr, gpr);
@@ -283,8 +289,8 @@ fn memory_output_boundary(crossing: bool) {
                     assert_eq!(cpu.cpu.rip, 0x1005);
                 }
                 let mut expected = [0xa5; 96];
-                if !crossing && transfers_word(opcode, modrm) {
-                    expected[1..3].fill(0xff);
+                if !crossing && transfer_width(opcode, modrm) != 0 {
+                    expected[1..1 + transfer_width(opcode, modrm)].fill(0xff);
                 }
                 assert_eq!(bytes(&vm, at - 1, 96), expected);
                 assert_eq!(cpu.cpu.gpr, gpr);
@@ -295,9 +301,9 @@ fn memory_output_boundary(crossing: bool) {
 }
 
 #[test]
-fn larger_outputs_issue_no_bus_transfer_to_unmapped_or_trapped_memory() {
+fn other_outputs_issue_no_bus_transfer_to_unmapped_or_trapped_memory() {
     for (opcode, modrm, _) in OUTPUTS {
-        if transfers_word(opcode, modrm) {
+        if transfer_width(opcode, modrm) != 0 {
             continue;
         }
         for trap in [false, true] {
@@ -526,16 +532,9 @@ fn nm_precedes_output_and_operand_checks_with_outward_or_in_guest_delivery() {
 }
 
 #[test]
-fn i386_outputs_keep_the_existing_refusal_without_a_sourced_empty_value() {
+fn i386_other_outputs_keep_the_existing_refusal() {
     // I386 PRM §11.1.2 specifies inactive pins when absent, not output data.
-    for code in [
-        &b"\xdf\xe0"[..],
-        &b"\xd9\x3e\x00\x04"[..],
-        &b"\xdd\x3e\x00\x04"[..],
-        &b"\xdd\x36\x00\x04"[..],
-        &b"\xdf\x36\x00\x04"[..],
-        &b"\xd9\x3e\xff\xff"[..],
-    ] {
+    for code in [&b"\xdf\x36\x00\x04"[..], &b"\xd9\x1e\x00\x04"[..]] {
         let (vm, mut cpu) = setup(CpuModel::I80386, code);
         vm.write_bytes(0x2400, &[0xa5; 96]).unwrap();
         let before = image(&cpu.cpu);

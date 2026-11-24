@@ -242,8 +242,12 @@ pub(crate) fn instruction_for_profile(
         // executing a present protected-mode coprocessor remains deferred.
         let lowered = if !profile.lift.protected_coprocessor_outputs
             && context.regime == crate::MachineRegime::Protected
-            && (wait || (esc && crate::x87::esc_output(code)))
-        {
+            && (wait
+                || (esc && crate::x87::esc_output(code))
+                || matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Fninit | Mnemonic::Fnclex | Mnemonic::Fnsetpm
+                )) {
             Err(unsupported_insn(&insn))
         } else {
             lower(&insn, &mut ops, &mut tg)
@@ -259,8 +263,11 @@ pub(crate) fn instruction_for_profile(
                 bytes,
                 len: code.len() as u8,
             });
-            if matches!(insn.mnemonic(), Mnemonic::Fnstcw | Mnemonic::Fnstsw) {
-                // The absent word stores share real-mode transfer handling;
+            if matches!(
+                insn.mnemonic(),
+                Mnemonic::Fnstcw | Mnemonic::Fnstsw | Mnemonic::Fnstenv | Mnemonic::Fnsave
+            ) {
+                // Absent control stores share real-mode transfer handling;
                 // Unsupported preserves Present's protected-mode refusal.
                 control::lift_x87(&insn, &mut ops, &mut tg)?;
             } else if insn.op_kinds().any(|k| k == OpKind::Memory) {
@@ -1077,6 +1084,19 @@ pub(super) fn lower(
     ) {
         emit(ops, L::I486Gate);
     }
+    // 287 PRM Part II Ch. 2 p. 2-16, App. B item 2 p. B-1;
+    // SDM Vol 1 §8.3.13 p. 8-24; Intel486 PRM §17.7 p. 17-8,
+    // §25.2.3 / §25.3 p. 25-11: these controls affect no internal state.
+    if matches!(insn.mnemonic(), Fneni | Fndisi)
+        && context.generation != crate::CpuGeneration::I8086
+    {
+        return Ok(false);
+    }
+    if insn.mnemonic() == Fnsetpm && context.generation == crate::CpuGeneration::I386 {
+        return Ok(false);
+    }
+    // 287 FSETPM changes addressing mode (Part II Ch. 2 p. 2-16).
+    // Its independent mode latch remains outside the supported 287 scope.
     // Generation availability is checked before lowering; decoder width alone
     // never grants the 286 any 386 forms (I286 PRM §6.2 p. 6-2, Appendix B).
     let mode = if context.default_operand_bits == 16 {

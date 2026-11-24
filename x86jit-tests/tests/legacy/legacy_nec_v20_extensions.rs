@@ -99,8 +99,8 @@ fn catalogue_identities_include_native_prefix_policy() {
     for (model, id) in [
         (CpuModel::I8088, 0x0b71_3477_b270_a8b9),
         (CpuModel::I8086, 0xe283_0b47_9d3b_74e5),
-        (CpuModel::I80286, 0xa812_1b75_802e_461b),
-        (CpuModel::I80386, 0x11f31a4fa911fbc2),
+        (CpuModel::I80286, 0x85e7de6333cabf0a),
+        (CpuModel::I80386, 0xcf184f520163d83b),
         (CpuModel::NecV20, 0xd70e_6f86_6f32_e09c),
         (CpuModel::NecV30, 0x9868_73c6_78e7_9ab2),
     ] {

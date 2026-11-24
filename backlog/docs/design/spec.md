@@ -3258,16 +3258,29 @@ any vCPU exists. New vCPUs inherit it, forks preserve it, and the per-vCPU sette
 remains an override. `new_vcpu` validates the VM default against a selected
 catalogue entry's FPU pairings.
 
-With `None`, I286 Machine output ESC forms retire after the complete CPU operand
-checks, preserving the x87 image. FNSTSW AX, FNSTSW m16 and FNSTCW m16 supply
-FFFFh, the all-high board default (I286/287 PRM Part I Appendix A p. A-4;
-Part II Appendix B item 10 p. B-2). Memory word stores use ordinary Machine
-transfers. Other outputs preserve memory: their absent-extension outcome is
-not documented (Part II Ch. 2 p. 2-49, Ch. 3 pp. 3-1–3-3; decision-25).
-WAIT completes in real and protected mode unless MP and TS are both set;
-the following ESC independently tests EM and TS. I386 retains output refusal because
-its PRM §11.1.2 does not define absent output data. The MSW/CR0 exception gates,
-input forms, Present and Application paths keep their existing behavior.
+With `None`, I286 and I386 Machine no-wait control stores (FNSTCW m16,
+FNSTSW m16/AX, FNSTENV and FNSAVE) retire after complete CPU operand checks,
+preserving the x87 image. Every destination byte is FFh; AX receives FFFFh.
+**ASSUMED (maintainer policy, 2026-11-24):** a floating absent data bus reads
+all ones. No cited source defines that general value: the I286/287 PRM Part II
+Ch. 3 p. 3-2 explicitly calls floating-bus data undefined. Part I Appendix A
+p. A-4 assumes all-high board wiring for its probe; Part II Appendix B item 10
+p. B-2 gives a memory-status probe. The 80386 PRM §11.1.2 pp. 11-1–2 specifies
+inactive BUSY#/ERROR# when absent, without defining output data. Memory stores
+use ordinary Machine writes, preflighted across the complete destination.
+Other I286 outputs retain their memory-preserving policy (decision-25); other
+I386 outputs retain their handoff. The 8086 family keeps its existing behavior.
+WAIT retains its MP && TS gate; ESC independently tests EM and TS (286 PRM
+§10.2.2 pp. 10-4–5, Part II Ch. 3 p. 3-4; 386 PRM §§11.1.3–11.1.4 p. 11-2).
+Absent no-wait control forms have no effect. Application profiles are unchanged.
+
+With a present FPU, FNENI/FNDISI are no-ops on the 287 (287 PRM Part II
+Ch. 2 p. 2-16, Appendix B item 2 p. B-1), 387 and both Intel486 entries.
+FNSETPM is a no-op on the 387/486 (SDM Vol 1 §8.3.13 p. 8-24, Vol 3B
+§25.18.9 p. 25-15; Intel486 PRM §17.7 p. 17-8, §25.2.3 / §25.3 p. 25-11).
+WAIT-prefixed twins retain ordinary WAIT behavior. The 287 FNSETPM remains
+refused: it changes the 287's independent addressing-mode latch (287 PRM
+Part II Ch. 2 p. 2-16), which the engine does not model.
 
 `ExecutionProfile::LegacySystem` is a deprecated associated constant for
 `Machine`, including in patterns. `Vm::set_legacy_cpu_model` remains a deprecated

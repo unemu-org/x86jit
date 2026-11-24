@@ -2455,12 +2455,8 @@ fn prefix_policy_changes_machine_identities() {
             0x196e_97d4_9eba_3cd2,
             0x9868_73c6_78e7_9ab2,
         ),
-        (
-            CpuModel::I80286,
-            0x7357_723a_3f16_2910,
-            0xa812_1b75_802e_461b,
-        ),
-        (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f, 0x11f31a4fa911fbc2),
+        (CpuModel::I80286, 0x7357_723a_3f16_2910, 0x85e7de6333cabf0a),
+        (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f, 0xcf184f520163d83b),
     ] {
         assert_eq!(model.profile().semantics_id, after, "{model:?}");
         assert_ne!(before, after, "{model:?}");

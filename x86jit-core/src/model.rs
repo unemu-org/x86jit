@@ -580,6 +580,7 @@ pub(crate) const fn profile_for_generation(generation: CpuGeneration) -> &'stati
 // Bump this revision when lifting/operand-validation rules change independently
 // of the data. No persisted translation with a different ID may be reused.
 const LIFT_POLICY_REVISION: u64 = 1;
+const SYSTEM_X87_POLICY_REVISION: u64 = 1;
 const fn identified(mut p: ModelProfile) -> ModelProfile {
     const fn word(mut hash: u64, value: u64) -> u64 {
         let mut byte = 0;
@@ -590,6 +591,10 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
         hash
     }
     let mut hash = word(0xcbf29ce484222325, LIFT_POLICY_REVISION);
+    // Machine 286/386/486 obsolete x87 controls and absent control outputs.
+    if !matches!(p.isa.generation(), CpuGeneration::I8086) {
+        hash = word(hash, SYSTEM_X87_POLICY_REVISION);
+    }
     let mask = p.isa.model_mask();
     let mut i = 0;
     while i < decode::ENCODINGS.len() {
@@ -839,7 +844,7 @@ mod tests {
     #[test]
     fn machine_identities_include_historical_prefix_policy() {
         for (model, identity) in [
-            (CpuModel::I80386, 0x11f31a4fa911fbc2_u64),
+            (CpuModel::I80386, 0xcf184f520163d83b_u64),
             (CpuModel::I8088, 0x0b71_3477_b270_a8b9),
             (CpuModel::I8086, 0xe283_0b47_9d3b_74e5),
             (CpuModel::NecV20, 0xd70e_6f86_6f32_e09c),
@@ -852,7 +857,7 @@ mod tests {
         let q = CpuModel::I80286.profile().quirks;
         assert!(q.lock_data_movement);
         assert_eq!(q.coprocessor_overrun_vector, Some(9));
-        assert_eq!(I80286.semantics_id, 0xa812_1b75_802e_461b);
+        assert_eq!(I80286.semantics_id, 0x85e7de6333cabf0a);
         // The two quirk fields feed the identity.
         let mut canonical = copy(&I80286);
         canonical.quirks.lock_data_movement = false;

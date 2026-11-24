@@ -716,16 +716,40 @@ fn application_real16_forms_have_legacy_parity() {
                     .unwrap();
                     u16::from_le_bytes(sw)
                 });
-                let empty_output =
-                    (generation == CpuGeneration::I286 && absent && i286_empty_output(*code))
-                        .then(|| (ac.cpu.clone(), memory_image(&a)));
+                // 287 PRM Part II App. B item 2 p. B-1; SDM Vol 1
+                // §8.3.13 p. 8-24: Machine accepts these obsolete no-ops.
+                let obsolete_noop = !absent
+                    && !emulation
+                    && (matches!(code, Code::Fneni | Code::Fndisi)
+                        || generation == CpuGeneration::I386 && *code == Code::Fnsetpm);
+                let machine_control = (obsolete_noop
+                    || absent
+                        && (generation == CpuGeneration::I286 && i286_empty_output(*code)
+                            || matches!(
+                                code,
+                                Code::Fnstcw_m2byte
+                                    | Code::Fstcw_m2byte
+                                    | Code::Fnstsw_m2byte
+                                    | Code::Fstsw_m2byte
+                                    | Code::Fnstsw_AX
+                                    | Code::Fstsw_AX
+                                    | Code::Fnstenv_m14byte
+                                    | Code::Fstenv_m14byte
+                                    | Code::Fnstenv_m28byte
+                                    | Code::Fstenv_m28byte
+                                    | Code::Fnsave_m94byte
+                                    | Code::Fsave_m94byte
+                                    | Code::Fnsave_m108byte
+                                    | Code::Fsave_m108byte
+                            )))
+                .then(|| (ac.cpu.clone(), memory_image(&a)));
                 let initial_fop = ac.cpu.fpu_fop;
                 let ar = run_form(&a, &mut ac, bytes);
                 let br = run_form(&b, &mut bc, bytes);
-                if let Some((initial, memory)) = empty_output {
+                if let Some((initial, memory)) = machine_control {
                     // Application still refuses at ESC, after a separate WAIT
-                    // if present. Machine retires; only the control/status
-                    // word transfers write memory (decision-25).
+                    // if present. Machine retires with an unchanged x87 image;
+                    // absent control stores use the assumed all-high bus policy.
                     let mut application = initial.clone();
                     application.rip += u64::from(bytes[0] == 0x9b);
                     let mut machine = initial;
@@ -741,6 +765,14 @@ fn application_real16_forms_have_legacy_parity() {
                             | Code::Fstcw_m2byte
                             | Code::Fnstsw_m2byte
                             | Code::Fstsw_m2byte
+                            | Code::Fnstenv_m14byte
+                            | Code::Fstenv_m14byte
+                            | Code::Fnstenv_m28byte
+                            | Code::Fstenv_m28byte
+                            | Code::Fnsave_m94byte
+                            | Code::Fsave_m94byte
+                            | Code::Fnsave_m108byte
+                            | Code::Fsave_m108byte
                     ) {
                         // Part II Appendix B item 10 p. B-2: the memory status
                         // store carries the high bus value even without an NPX.
@@ -752,10 +784,17 @@ fn application_real16_forms_have_legacy_parity() {
                             iced_x86::DecoderOptions::NO_INVALID_CHECK,
                         )
                         .decode();
-                        assert_eq!(esc.memory_base(), iced_x86::Register::BX);
+                        let mask = match esc.memory_base() {
+                            iced_x86::Register::BX => 0xffff,
+                            iced_x86::Register::EBX => 0xffff_ffff,
+                            other => panic!("unexpected absent-store base: {other:?}"),
+                        };
                         assert_eq!(esc.memory_index(), iced_x86::Register::None);
-                        let at = ((machine.gpr[3] + esc.memory_displacement64()) & 0xffff) as usize;
-                        machine_memory[at..at + 2].fill(0xff);
+                        let at = ((machine.gpr[3] + esc.memory_displacement64()) & mask) as usize;
+                        // ASSUMED absent bus policy, 2026-11-24; 286 PRM
+                        // Part II Ch. 3 p. 3-2 calls floating data undefined.
+                        let width = esc.memory_size().size();
+                        machine_memory[at..at + width].fill(0xff);
                     }
                     assert_eq!(image(&ac), state_image(&application), "{code:?}");
                     assert_eq!(image(&bc), state_image(&machine), "{code:?}");

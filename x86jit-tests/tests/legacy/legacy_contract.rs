@@ -396,7 +396,7 @@ fn catalogue_pins_current_machine_profiles() {
             24,
             10,
             // Includes the historical-prefix decoder policy (spec.md §17.10).
-            0xa8121b75802e461b,
+            0x85e7de6333cabf0a,
             0xf000,
         ),
         (
@@ -406,7 +406,7 @@ fn catalogue_pins_current_machine_profiles() {
             ModelSystem::Cr386,
             32,
             15,
-            0x11f31a4fa911fbc2,
+            0xcf184f520163d83b,
             0x8000,
         ),
     ] {

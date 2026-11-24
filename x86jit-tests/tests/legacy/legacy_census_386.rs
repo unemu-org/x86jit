@@ -1026,3 +1026,43 @@ fn prefix_outcome(model: CpuModel, p: &Probe, mode: Mode) -> String {
     .unwrap_or("panic")
     .to_owned()
 }
+
+#[test]
+#[ignore = "manual absent-coprocessor x87 census; emits a TSV runtime artifact"]
+fn runtime_census_x87_absent() {
+    let mut report = String::from("mode\tbytes\tmnemonic\tclass\texit\n");
+    for mode in [
+        Mode::Real,
+        Mode::P16,
+        Mode::P32,
+        Mode::V86,
+        Mode::PagedP32,
+        Mode::PagedV86,
+    ] {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for p in probes(CpuModel::I80386, mode).into_iter().filter(|p| p.x87) {
+            let (vm, mut cpu) = setup(CpuModel::I80386, &p, mode, false);
+            cpu.set_fpu_model(FpuModel::None);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            let class = match r.stop() {
+                StepStop::Exit(Exit::BudgetExhausted) => "executes",
+                StepStop::Exit(Exit::UnknownInstruction { .. }) => "unknown",
+                StepStop::Exit(Exit::Exception { .. }) => "fault",
+                other => panic!("{mode:?}/{}: {other:?}", p.insn),
+            };
+            *counts.entry(class.into()).or_default() += 1;
+            let bytes: String = p.bytes.iter().map(|b| format!("{b:02X}")).collect();
+            writeln!(
+                report,
+                "{mode:?}\t{bytes}\t{}\t{class}\t{:?}",
+                p.insn,
+                r.stop()
+            )
+            .unwrap();
+        }
+        println!("I80386/None/{mode:?}: {counts:?}");
+    }
+    let path = std::env::temp_dir().join("census-x87-absent.tsv");
+    std::fs::write(&path, report).unwrap();
+    println!("{}", path.display());
+}

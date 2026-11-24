@@ -3410,7 +3410,10 @@ where
                 if context.generation == crate::CpuGeneration::I286
                     && context.regime == crate::MachineRegime::Protected
                     && (crate::x87::esc_output(&bytes[..usize::from(*len)])
-                        || bytes[..usize::from(*len)].last() == Some(&0x9b))
+                        || bytes[..usize::from(*len)].last() == Some(&0x9b)
+                        || [0xe2, 0xe3, 0xe4]
+                            .iter()
+                            .any(|op| bytes[..usize::from(*len)].ends_with(&[0xdb, *op])))
                 {
                     return Err(refusal(
                         cpu,
@@ -3430,17 +3433,7 @@ where
             ..
         } => {
             if cpu.fpu_model == crate::FpuModel::None {
-                if context.generation == crate::CpuGeneration::I286
-                    && matches!(
-                        kind,
-                        crate::x87::FpuKind::Fnstcw | crate::x87::FpuKind::FnstswMem
-                    )
-                {
-                    // I286/287 PRM Part II Appendix B item 10 p. B-2
-                    // reads the absent bus through the memory status store;
-                    // decision-25 selects the all-high word default.
-                    write(cpu, mem, read_val(*addr, temps), 2, 0xffff)?;
-                }
+                absent_coprocessor_store(cpu, mem, *kind, read_val(*addr, temps), *sti)?;
                 return Ok(false);
             }
             numeric_error_before(cpu, *kind)?;
@@ -3735,27 +3728,34 @@ where
                     } {
                         return Err(exception(cpu, 7));
                     }
-                    // Generation/decoder #UD follows the MSW gate. I286
-                    // larger memory outputs keep the data channel idle
-                    // (I286/287 PRM Part II Ch. 2 p. 2-49, Ch. 3 p. 3-1;
-                    // decision-25). The I386 PRM §11.1.2 pp. 11-1–11-2
-                    // supplies no absent output value: retain its handoff.
+                    // 80386 PRM §§11.1.2–11.1.4 pp. 11-1–2 describe the
+                    // ESC/WAIT gates, with absent BUSY#/ERROR# tied inactive.
+                    // 286 PRM §10.2.2 pp. 10-4–5 recommends MP or EM for ESC;
+                    // Part II Ch. 3 p. 3-4 describes the same emulation gate.
+                    // Neither defines arbitrary absent-socket output data.
                     if !*wait
                         && cpu.fpu_model == crate::FpuModel::None
+                        && context.generation != crate::CpuGeneration::I286
                         && !ir
                             .ops
                             .iter()
                             .any(|op| matches!(op, IrOp::Trap { vector: 6, .. }))
                         && crate::x87::esc_output(&bytes[..usize::from(*len)])
+                        && !ir.ops.iter().any(|op| {
+                            matches!(
+                                op,
+                                IrOp::X87 {
+                                    kind: crate::x87::FpuKind::Fnstcw
+                                        | crate::x87::FpuKind::Fnstsw
+                                        | crate::x87::FpuKind::FnstswMem
+                                        | crate::x87::FpuKind::Fnstenv
+                                        | crate::x87::FpuKind::Fnsave,
+                                    ..
+                                }
+                            )
+                        })
                     {
-                        if context.generation != crate::CpuGeneration::I286 {
-                            return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
-                        }
-                        if bytes[..usize::from(*len)].ends_with(&[0xdf, 0xe0]) {
-                            // I286/287 PRM Part I Appendix A p. A-4:
-                            // FSTSW AX assumes an all-high empty bus.
-                            cpu.write_gpr(RAX, 0xffff, 2);
-                        }
+                        return Err(Exit::unknown_instruction(cpu.rip, *bytes, *len));
                     }
                 }
                 L::Enter { size, alloc, level } => {
@@ -4804,6 +4804,36 @@ where
         return Err(exit.into_exit());
     }
     Ok(false)
+}
+
+// ASSUMED (maintainer policy, 2026-11-24): a floating absent data bus reads
+// all ones. 286 PRM Part II Ch. 3 p. 3-2 calls floating data undefined;
+// 386 PRM §11.1.2 pp. 11-1–2 defines no output value. Preserve the x87 image,
+// including after FNSTENV/FNSAVE.
+#[cold]
+#[inline(never)]
+fn absent_coprocessor_store<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    kind: crate::x87::FpuKind,
+    address: u64,
+    sti: u8,
+) -> Result<(), Exit> {
+    use crate::x87::FpuKind as K;
+    if kind == K::Fnstsw {
+        cpu.write_gpr(RAX, 0xffff, 2);
+    } else if matches!(kind, K::Fnstcw | K::FnstswMem | K::Fnstenv | K::Fnsave) {
+        let bytes = crate::x87::mem_operand_bytes_format(kind, sti) as usize;
+        for offset in (0..bytes).step_by(8) {
+            let linear = u64::from((address as u32).wrapping_add(offset as u32));
+            probe(cpu, mem, linear, (bytes - offset).min(8) as u8)?;
+        }
+        for offset in (0..bytes).step_by(8) {
+            let linear = u64::from((address as u32).wrapping_add(offset as u32));
+            write(cpu, mem, linear, (bytes - offset).min(8) as u8, u64::MAX)?;
+        }
+    }
+    Ok(())
 }
 
 // 80286 PRM App. B #MP p. B-9: the attached coprocessor's transfer raises
