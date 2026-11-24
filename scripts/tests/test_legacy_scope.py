@@ -120,8 +120,8 @@ REVIEWED_ENTRY_POINTS = {
         "Vcpu::nec_boundary", "interp::i8086::finish_port_input",
         "interp::i8086::interrupt", "interp::legacy::BlockWalk",
         "interp::legacy::Progress", "interp::legacy::deliver_interrupt",
-        # PAGED=true is instantiated only by the test-hooks Machine entry;
-        # ordinary delivery statically selects PAGED=false.
+        # Machine delivery selects the paged adapter only with CR0.PG set;
+        # PG=0 retains its statically unpaged transfer helpers.
         "interp::legacy::paging",
         "interp::legacy::execute_block", "interp::legacy::execute_checked",
         "interp::legacy::execute_shared20", "interp::legacy::finish_port_input",
@@ -135,8 +135,9 @@ REVIEWED_ENTRY_POINTS = {
         "model::profile_for_generation",
     },
     "x86jit-core/src/vm/legacy/paging.rs": {
-        # Incoming-task fault ownership in the private Machine paging entry.
-        "interp::legacy::tasks",
+        # Machine-only paged dispatch and incoming-task fault ownership.
+        "interp::legacy::tasks", "interp::legacy::BlockWalk",
+        "interp::legacy::Outcome", "interp::legacy::Progress",
         "interp::legacy::paging", "lift::legacy::instruction_for_profile",
         "model::CpuModel", "model::decode",
     },

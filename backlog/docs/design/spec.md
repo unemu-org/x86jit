@@ -2360,8 +2360,68 @@ not modelled. p. 2 gives both "195 clocks" and "190 clocks with no wait
 states"; neither is modelled, with the rest of the timing model. Word
 registers keep their bits above 15 as any 16-bit write does.
 
+**386/486 paging.** `I80386`, `I80486Dx` and `I80486DxCpuid` support
+CR0.PG through normal Machine entry and guest MOV CR0. PG requires PE;
+PG=1/PE=0 raises #GP(0) before the control write commits. The 80286 and
+8086 families never page. Application profiles retain their memory contract.
+The translator implements 32-bit two-level paging with 4 KiB frames, CR3,
+P/U/S/R/W/A/D, CR2 and restartable #PF; both 486 entries additionally implement
+CR0.WP and INVLPG. Sources: 80386 PRM §§5.2–5.3 pp. 5-7–11,
+§§6.4–6.5 pp. 6-20–22, §9.8.14 pp. 9-17–19; Intel486 PRM
+§§5.3.1–5.3.5 pp. 5-18–22, §6.8 pp. 6-23–25, §9.9.14
+pp. 9-21–23; SDM Vol 3A §§5.1.3, 5.6.1 pp. 5-5, 5-33–35
+(WP protects supervisor and user mappings alike). The complete permissions,
+walk ordering and model qualifications are in [paging.md](paging.md).
+
+Segmentation precedes translation. Fetch, scalar/string/x87 operands, stack
+frames, descriptor/IDT/TSS/bitmap references and supported task switches use
+the same translator; implicit system references use supervisor privilege.
+A20 gates physical table reads/A/D updates and final fetch/operand transfers
+after translation. Memory region policy, sparse backing and HostRam remain
+physical bus policies. A guest mapping neither allocates backing nor changes
+physical region permissions. Missing physical storage remains a bus exit;
+it does not invent #PF or modify CR2. CR2 records the failing linear byte on
+#PF after architectural rollback. A/D effects survive rollback.
+
+Page directories and page tables must reside in ordinary RAM. Device or ROM
+table storage returns `PagingTableStorage` before a table transfer. This is
+an engine limitation (Q1), not a processor restriction. Operand MMIO uses
+physical fragment address, width and value;
+`Vcpu::pending_mmio_linear_address()` supplies the original linear byte without
+enlarging the shared exit or CPU-state layouts.
+Each instruction/REP iteration preflights its complete translated plan;
+retries retain decoded bytes, operand snapshots and transfer visits. Completed
+device transfers do not repeat, and RAM stores commit after device handoffs.
+Value-dependent system/device operations that cannot be preflighted and
+descriptor CAS on devices retain typed facility refusals. RAM task saves
+commit at the existing incoming-task boundary before incoming CR3 accesses.
+
+Paged execution uses private one-instruction interpreted blocks and counted
+post-A20 physical source registrations in every build. Linear aliases of one
+frame share SMC tracking automatically; distinct physical HostRam aliases
+still require `Memory::declare_code_alias` and write notifications. The
+current walker is uncached; invalidation still discards derived block proofs
+and advances their translation generation. MOV CR3 (including equal reload),
+PG/WP changes, INVLPG and A20 changes invalidate those proofs.
+
+Embedders must synchronize page-table edits with execution and call
+`Vcpu::invalidate_paging()` between runs after editing tables or restoring a
+checkpoint, including equal-byte control-register restores. A complete Machine
+checkpoint includes CpuState, physical RAM/tables, board/device state and
+pending events. Take and restore it at a quiescent boundary; finish an MMIO or
+port handoff first, or explicitly abandon it with `reset_execution_state`.
+Copying CpuState alone does not save the private translated continuation.
+Invalidation preserves an already partially completed handoff's span plan;
+reset abandons it. The retry fingerprint conservatively includes all GPR
+storage and stored flags; editing any of these, or the owning translation
+context, abandons its operand snapshot and completion inputs before restarting.
+
+PG=0 keeps its statically selected unpaged adapter;
+paged walks, transactions and proofs live in cold, non-inlined functions.
+
 **Privilege levels on `I80286` and `I80386`** (xj-srh.9, first landing).
-Protected contexts run at CPL 0-3; paging stays `LegacyEntryFacility`.
+Protected contexts run at CPL 0-3. The I80386 and both Intel486 entries also
+execute with paging enabled, under the contract below.
 Sources: 80286 PRM 210498-005 ("286 PRM"), 80386 PRM 230985-001 ("386 PRM"),
 SDM 325462-092US; printed page numbers. `interp/legacy/privilege.rs` holds the
 helpers. Every fault of a transition precedes its commit point: the helpers
@@ -2478,7 +2538,7 @@ unchanged and the instruction or event replays.
   Task gates and TSSs named by CALL and JMP switch tasks as before
   (decision-24); RETF and RETF n from the called procedure are the outward
   return above.
-- **Still refused:** a VM image, paging, the 386 TSS T bit, LOADALL with a
+- **Still refused:** a VM image, the 386 TSS T bit, LOADALL with a
   CS DPL of 1-3 and an inward call-gate CALL
   whose frame copy exceeds the retry ledger. `LegacyPrivilegeTransition`
   and `LegacyGateOrTaskTransfer` are no longer produced.

@@ -69,8 +69,8 @@ that changes.
 | `cache::cache_hash` | Local integer hasher for shared translation keys; guest address keys use no HashDoS protection (§9.1) |
 | `cache::cache_shards` | Sixteen independent reader maps; map mutations take spans → publication gate → all shards → lifetime registry; slot fills omit shards (§9.1, §10) |
 | `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
-| `interp::legacy::paging` | Internal uncached 386/486 physical page walker, scalar span preflight, A/D CAS and typed #PF; private scalar/fetch entries exercise translation while public PG=1 remains refused (paging design §5 steps 1–2) |
-| `vm::legacy::paging` | Test-hooks-only incremental paged fetch, bounded one-instruction private proofs and ordered physical source registration; conservative source-generation invalidation, control/entry reconciliation and the explicit `Vcpu::invalidate_paging` operation (paging design §§3.2, 3.5, decision Q5) |
+| `interp::legacy::paging` | Uncached 386/486 physical page walker, instruction-wide operand/system preflight, A/D CAS and typed #PF; retained snapshots and transfer ledgers resume operand, event, port and task-phase bus handoffs (paging design §§3.1–3.7) |
+| `vm::legacy::paging` | Public Machine PG=1 dispatch and incremental paged fetch, bounded one-instruction proofs and counted physical source registrations in every build; control/entry reconciliation, `Vcpu::invalidate_paging` and pending-MMIO linear evidence (paging design §§3.2, 3.5–3.7, decision Q5) |
 | `interp::legacy::tasks` | Machine interpreter hardware task switches, 286/386 TSS images, task gates and descriptor-load continuations (spec.md §17; decision-24 proposal records source conflicts) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop; 48 KiB two-way private compiled cache with epoch/MXCSR flushes (§2, §9.2) |
 

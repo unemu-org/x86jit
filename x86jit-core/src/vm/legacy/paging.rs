@@ -1,7 +1,9 @@
 //! Internal one-instruction paging fetch/proofs (paging design §§3.2, 3.5;
 //! spec.md §17.10). No shared dispatch entry or compiled materialization.
 use super::*;
-use crate::interp::legacy::paging::{execute_for_test, fetch_bus_for_test, publish_cr2};
+#[cfg(feature = "test-hooks")]
+use crate::interp::legacy::paging::execute_for_test;
+use crate::interp::legacy::paging::{fetch_bus_for_test, publish_cr2};
 use std::cell::Cell;
 
 const MAX_BLOCKS: usize = 64;
@@ -32,9 +34,18 @@ pub(super) struct State {
     lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
+    transaction: Option<crate::interp::legacy::paging::Transaction>,
+    pub(super) event_transaction: Option<crate::interp::legacy::paging::Transaction>,
 }
 
 impl State {
+    pub(super) fn reset(&mut self) {
+        self.invalidate();
+        self.transaction = None;
+        self.event_transaction = None;
+        self.port_input = None;
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.blocks.clear();
         // Dropping entries before wrap prevents identifier reuse retaining proofs.
@@ -63,7 +74,7 @@ impl State {
         &mut self,
         vm: &Vm,
         cpu: &mut CpuState,
-        model: crate::CpuModel,
+        model: LegacyCpuModel,
         context: MachineContext,
         owner_id: u64,
         exit_word: &AtomicU64,
@@ -71,7 +82,7 @@ impl State {
         let walk_wrote = Cell::new(false);
         loop {
             vm.handle_smc(exit_word);
-            self.reconcile(vm, cpu, model.legacy_model());
+            self.reconcile(vm, cpu, model);
             let source = crate::memory::LiftSource::new(&vm.mem);
             let generation = vm.cache.publication_generation();
             let permit = vm.mem.fetch_permit();
@@ -116,7 +127,7 @@ impl State {
                 decode: LegacyBlockKey {
                     owner_id,
                     context_id: self.generation,
-                    model_semantics_id: model.legacy_model().model_semantics_id,
+                    model_semantics_id: model.model_semantics_id,
                     decode_bits: context.default_operand_bits,
                     stack_bits: context.stack_address_bits,
                     regime: context.regime,
@@ -139,7 +150,7 @@ impl State {
                     &bytes,
                     cpu.rip as u32,
                     context,
-                    model.profile(),
+                    vm.machine_model_profile(context.generation),
                 )
                 .map_err(|e| direct_refusal(cpu, e))?;
                 self.lifts += 1;
@@ -262,11 +273,241 @@ fn fetch(
 }
 
 impl Vcpu {
-    /// Internal single-instruction fetch/execute entry; public PG=1 stays refused.
-    /// All operand/system consumers use the private paged adapter.
+    #[cold]
+    #[inline(never)]
+    pub(in crate::vm) fn validate_paged_continuations(&self, vm: &Vm) -> Result<(), Exit> {
+        let Some(state) = self
+            .legacy_execution
+            .as_ref()
+            .and_then(|e| e.paging.as_ref())
+        else {
+            return Ok(());
+        };
+        // Refuse before dispatch cleanup can release an acknowledged effect's
+        // ledger. A later retry must keep refusing the same stale physical plan.
+        if state
+            .transaction
+            .iter()
+            .chain(&state.event_transaction)
+            .any(|tx| !tx.matches_memory(&vm.mem))
+            || state
+                .port_input
+                .as_ref()
+                .is_some_and(|p| !p.matches_owner(&self.cpu, &vm.mem))
+        {
+            return Err(Exit::UnsupportedSystemContext {
+                addr: self.cpu.rip,
+                operation: UnsupportedSystemOperation::LegacyEntryFacility,
+            });
+        }
+        Ok(())
+    }
+
+    /// Original linear byte of the pending paged Machine MMIO fragment.
+    /// The returned `Exit::MmioRead`/`MmioWrite` carries its physical bus address,
+    /// width and value. This evidence survives a held retry and is cleared when
+    /// the instruction completes or is abandoned. Other execution paths return None.
+    pub fn pending_mmio_linear_address(&self) -> Option<u32> {
+        if self.cpu.legacy.cr0 & 0x8000_0000 == 0 {
+            return None;
+        }
+        let state = self.legacy_execution.as_ref()?.paging.as_ref()?;
+        state
+            .event_transaction
+            .as_ref()
+            .and_then(|tx| tx.pending_mmio_linear_address())
+            .or_else(|| {
+                state
+                    .port_input
+                    .as_ref()
+                    .and_then(|p| p.pending_mmio_linear_address())
+            })
+            .or_else(|| {
+                state
+                    .transaction
+                    .as_ref()
+                    .and_then(|tx| tx.pending_mmio_linear_address())
+            })
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn abandon_edited_paged_retry(&mut self) {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        let Some(state) = execution.paging.as_mut() else {
+            return;
+        };
+        let event_edited = state
+            .event_transaction
+            .as_ref()
+            .is_some_and(|tx| !tx.matches_inputs(&self.cpu));
+        let instruction_edited = state.transaction.as_ref().is_some_and(|tx| {
+            !execution.instruction_retry.as_ref().is_some_and(|retry| {
+                retry.stamp == LegacyContextStamp::new(&self.cpu, self.legacy_model.unwrap())
+                    && retry.ip == self.cpu.rip
+                    && retry.mxcsr_mode == self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
+                    && tx.matches_inputs(&self.cpu)
+            })
+        });
+        if event_edited || instruction_edited {
+            state.transaction = None;
+            state.event_transaction = None;
+            execution.instruction_retry = None;
+            execution.task_switch.reset();
+            if event_edited {
+                self.abandon_legacy_event();
+            }
+            self.cpu.clear_mmio_parts();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn resolve_paged(
+        &mut self,
+        vm: &Vm,
+        context: MachineContext,
+    ) -> Result<(Arc<IrBlock>, crate::interp::legacy::BlockWalk), Exit> {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        // A bus handoff owns its decoded bytes and translated spans until the
+        // instruction finishes or entry abandons it (decision-16).
+        if let Some(retry) = &execution.instruction_retry {
+            if retry.stamp == LegacyContextStamp::new(&self.cpu, self.legacy_model.unwrap())
+                && retry.ip == self.cpu.rip
+                && retry.mxcsr_mode == self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
+                && execution
+                    .paging
+                    .as_ref()
+                    .and_then(|s| s.transaction.as_ref())
+                    .is_none_or(|tx| tx.matches_inputs(&self.cpu))
+            {
+                return Ok((retry.ir.clone(), retry.walk));
+            }
+            self.cpu.clear_mmio_parts();
+            execution.instruction_retry = None;
+        }
+        let state = execution.paging.get_or_insert_with(Default::default);
+        state.transaction = None;
+        state
+            .resolve(
+                vm,
+                &mut self.cpu,
+                self.legacy_model.unwrap(),
+                context,
+                execution.owner_id,
+                &self.exit_request.word,
+            )
+            .map(|ir| (ir, crate::interp::legacy::BlockWalk::Checked))
+            .inspect_err(|exit| publish_cr2(&mut self.cpu, exit))
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn execute_paged<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        ir: &Arc<IrBlock>,
+        context: MachineContext,
+    ) -> crate::interp::legacy::Progress {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        let comparing = ir.ops.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Legacy(crate::legacy::LegacyOp::String {
+                    kind: crate::ir::StrOp::Cmps | crate::ir::StrOp::Scas,
+                    rep: crate::ir::RepKind::Repe | crate::ir::RepKind::Repne,
+                    ..
+                })
+            )
+        });
+        if comparing {
+            let continuing = execution.rep_flags.as_ref().is_some_and(|saved| {
+                Arc::ptr_eq(&saved.ir, ir)
+                    && saved.matches(&self.cpu, self.legacy_model.unwrap(), self.retired)
+            });
+            if !continuing {
+                execution.rep_flags = Some(Box::new(RepFlags {
+                    ir: ir.clone(),
+                    stamp: LegacyContextStamp::new(&self.cpu, self.legacy_model.unwrap()),
+                    cursor: RepFlags::cursor(&self.cpu),
+                    flags: self.cpu.flags,
+                    system_flags: self.cpu.rflags_system,
+                    origin: self.cpu.flags,
+                    retired: self.retired,
+                }));
+            }
+        } else {
+            execution.rep_flags = None;
+        }
+        let state = execution.paging.get_or_insert_with(Default::default);
+        let result = execute_retained::<ROUTED, ORDER>(
+            ir,
+            &mut self.cpu,
+            &vm.mem,
+            context,
+            &mut execution.task_switch,
+            &mut state.transaction,
+        );
+        let outcome = result.map(|(outcome, input)| {
+            state.port_input = input;
+            if outcome.context_changed || outcome.translations_invalidated {
+                state.invalidate();
+            }
+            outcome
+        });
+        if let Some(saved) = execution.rep_flags.as_mut() {
+            let fault = outcome.as_ref().is_err_and(|exit| {
+                matches!(exit, Exit::UnmappedMemory { .. })
+                    || exit
+                        .fault_metadata()
+                        .is_some_and(|m| m.class() == crate::fault::FaultClass::Fault)
+            });
+            if fault {
+                self.cpu.flags = saved.origin;
+                execution.rep_flags = None;
+            } else if outcome.as_ref().is_ok_and(|o| o.retired) || self.cpu.rip != ir.guest_start {
+                execution.rep_flags = None;
+            } else {
+                saved.cursor = RepFlags::cursor(&self.cpu);
+                saved.flags = self.cpu.flags;
+                saved.system_flags = self.cpu.rflags_system;
+            }
+        }
+        let retired = u64::from(outcome.as_ref().is_ok_and(|o| o.retired));
+        crate::interp::legacy::Progress {
+            steps: u64::from(outcome.is_ok()),
+            retired,
+            sti_shadow: self.sti_shadow,
+            ss_shadow: self.ss_shadow,
+            outcome: Some(outcome),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn finish_paged_port_input<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+    ) -> Result<(), Exit> {
+        let state = self
+            .legacy_execution
+            .as_mut()
+            .unwrap()
+            .paging
+            .get_or_insert_with(Default::default);
+        crate::interp::legacy::paging::finish_port_input::<ROUTED, ORDER>(
+            &mut self.cpu,
+            &vm.mem,
+            &mut state.port_input,
+        )
+    }
+
+    /// Internal single-instruction fetch/execute entry for focused witnesses.
+    /// Uses the same paged adapter as normal Machine dispatch.
     #[doc(hidden)]
     #[cold]
     #[inline(never)]
+    #[cfg(feature = "test-hooks")]
     pub fn interpret_paged_for_test(&mut self, vm: &Vm) -> Result<(), Exit> {
         let model = vm
             .cpu_model
@@ -302,7 +543,7 @@ impl Vcpu {
                 .unwrap()
                 .paging
                 .get_or_insert_with(Default::default);
-            return crate::interp::legacy::paging::finish_port_input(
+            return crate::interp::legacy::paging::finish_port_input::<false, 0>(
                 &mut self.cpu,
                 &vm.mem,
                 &mut state.port_input,
@@ -313,7 +554,7 @@ impl Vcpu {
         let result = state.resolve(
             vm,
             &mut self.cpu,
-            model,
+            model.legacy_model(),
             context,
             execution.owner_id,
             &self.exit_request.word,
@@ -358,12 +599,13 @@ impl Vcpu {
             execution.rep_flags = None;
         }
         let outcome = if context.paging_enabled {
-            execute_for_test::<true>(
+            execute_retained::<false, 0>(
                 &ir,
                 &mut self.cpu,
                 &vm.mem,
                 context,
                 &mut execution.task_switch,
+                &mut state.transaction,
             )
         } else {
             execute_for_test::<false>(
@@ -408,6 +650,7 @@ impl Vcpu {
         outcome.exit.map_or(Ok(()), Err)
     }
 
+    #[cfg(feature = "test-hooks")]
     fn route_paged_exception(
         &mut self,
         vm: &Vm,
@@ -450,6 +693,7 @@ impl Vcpu {
 
     /// Internal proof diagnostics: translation generation, retained blocks, lifts.
     #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub fn paging_cache_for_test(&self) -> (u64, usize, u64) {
         self.legacy_execution
             .as_ref()
@@ -459,6 +703,7 @@ impl Vcpu {
 
     /// Inject a physical write after fetch and before source registration.
     #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub fn paging_publication_hook_for_test(&mut self, hook: fn(&Vm)) {
         self.legacy_execution
             .as_mut()
@@ -467,4 +712,30 @@ impl Vcpu {
             .get_or_insert_with(Default::default)
             .before_publication = Some(hook);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn execute_retained<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    task_switch: &mut crate::interp::legacy::tasks::SwitchState,
+    retry: &mut Option<crate::interp::legacy::paging::Transaction>,
+) -> Result<
+    (
+        crate::interp::legacy::Outcome,
+        Option<crate::interp::legacy::paging::PortPlan>,
+    ),
+    Exit,
+> {
+    crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER>(
+        ir,
+        cpu,
+        memory,
+        context,
+        task_switch,
+        retry,
+    )
 }

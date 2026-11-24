@@ -1185,13 +1185,13 @@ fn msw_and_clts_use_only_their_documented_bits_and_preserve_flags() {
 }
 
 #[test]
-fn enabling_pg_refuses_atomically_but_pg_without_pe_faults_cpu_model() {
-    model_api::with_cpu_model(enabling_pg_refuses_atomically_but_pg_without_pe_faults);
+fn enabling_pg_succeeds_but_pg_without_pe_faults_cpu_model() {
+    model_api::with_cpu_model(enabling_pg_succeeds_but_pg_without_pe_faults);
 }
 
 #[test]
-fn enabling_pg_refuses_atomically_but_pg_without_pe_faults() {
-    // SDM Vol 3A §2.5; decision-18 §4: legality precedes an engine refusal.
+fn enabling_pg_succeeds_but_pg_without_pe_faults() {
+    // SDM Vol 3A §5.1.1 p. 5-2: PG requires PE before the write commits.
     for prefix in [&b""[..], &b"\x66"[..]] {
         for (code, value, gp) in [
             (&b"\x0f\x22\xc0"[..], 0x80000001, false),
@@ -1205,24 +1205,21 @@ fn enabling_pg_refuses_atomically_but_pg_without_pe_faults() {
             cpu.cpu.rflags_system = 0x10000;
             vm.write_bytes(0x2000, &[0xff, 0xff]).unwrap();
             let before = format!("{:?}", cpu.cpu);
-            let run = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
-            assert_eq!(run.steps(), 0);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             if gp {
+                assert_eq!(run.steps(), 0);
                 assert!(matches!(
                     run.stop(),
                     StepStop::Exit(Exit::Exception { vector: 13, .. })
                 ));
+                assert_eq!(format!("{:?}", cpu.cpu), before);
+                assert_eq!(cpu.retired_instructions(), 0);
             } else {
-                assert!(matches!(
-                    run.stop(),
-                    StepStop::Exit(Exit::UnsupportedSystemContext {
-                        operation: UnsupportedSystemOperation::LegacyExecution,
-                        ..
-                    })
-                ));
+                assert_eq!(run.steps(), 1);
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                assert_eq!(cpu.cpu.legacy.cr0 & 0x8000_0001, 0x8000_0001);
+                assert_eq!(cpu.retired_instructions(), 1);
             }
-            assert_eq!(format!("{:?}", cpu.cpu), before);
-            assert_eq!(cpu.retired_instructions(), 0);
         }
     }
 }

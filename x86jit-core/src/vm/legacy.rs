@@ -11,7 +11,6 @@ use iced_x86::{Decoder, DecoderError};
 // The NMI input's cold helpers (spec.md §17.10), in their own module so that
 // this module's hot dispatcher code keeps its code-generation unit.
 mod nmi;
-#[cfg(feature = "test-hooks")]
 mod paging;
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
@@ -494,7 +493,6 @@ pub(super) struct Execution {
     // delivery, and the deliveries completed since it last moved.
     stall_retired: u64,
     stall_count: u32,
-    #[cfg(feature = "test-hooks")]
     paging: Option<Box<paging::State>>,
 }
 impl Execution {
@@ -531,7 +529,6 @@ impl Execution {
             last_direct_fetch: None,
             stall_retired: 0,
             stall_count: 0,
-            #[cfg(feature = "test-hooks")]
             paging: None,
         }
     }
@@ -558,8 +555,9 @@ impl Execution {
         self.smc_pages.clear();
         self.last_direct_fetch = None;
         self.stall_count = 0;
-        #[cfg(feature = "test-hooks")]
-        self.invalidate_paging();
+        if let Some(paging) = &mut self.paging {
+            paging.reset();
+        }
     }
     #[inline(always)]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
@@ -581,10 +579,9 @@ impl Execution {
     pub(super) fn debug_handoff_pending(&self) -> bool {
         self.handoff_service & HANDOFF_DEBUG != 0
     }
-    #[cfg_attr(feature = "test-hooks", cold)]
-    #[cfg_attr(feature = "test-hooks", inline(never))]
+    #[cold]
+    #[inline(never)]
     fn invalidate_translations(&mut self) {
-        #[cfg(feature = "test-hooks")]
         self.invalidate_paging();
         self.direct_proofs.clear();
         self.blocks.clear();
@@ -595,7 +592,6 @@ impl Execution {
     #[cold]
     #[inline(never)]
     pub(super) fn invalidate_paging(&mut self) {
-        #[cfg(feature = "test-hooks")]
         if let Some(paging) = &mut self.paging {
             paging.invalidate();
         }
@@ -1631,10 +1627,6 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
             }
         })?;
-        // Paging stays an engine facility; CPL 1–3 executes (xj-srh.9).
-        if context.paging_enabled {
-            return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyEntryFacility));
-        }
         // I286 PRM §10.4 p. 10-6; 80386 PRM §10.2.3 p. 10-3:
         // reset may fetch through the retained high CS base.
         // System-free models have already returned their permanent context.
@@ -1684,6 +1676,9 @@ impl Vcpu {
         limit: Option<u64>,
     ) -> Result<MachineContext, Exit> {
         self.validate_legacy_debug_state()?;
+        if limit != Some(0) && self.cpu.mmio_retry_active {
+            self.abandon_edited_paged_retry();
+        }
         // Decision-24: edited state abandons the entire owned operation before
         // entry validation can reject its deliberately unfinished segment caches.
         // A zero-budget probe leaves continuations and completion inputs intact.
@@ -1816,6 +1811,9 @@ impl Vcpu {
         context: MachineContext,
         event: PendingEvent,
     ) -> Result<(), Exit> {
+        if context.paging_enabled {
+            return self.deliver_legacy_event_impl::<ROUTED, ORDER, true>(vm, context, event);
+        }
         self.deliver_legacy_event_impl::<ROUTED, ORDER, false>(vm, context, event)
     }
 
@@ -1891,12 +1889,18 @@ impl Vcpu {
                 fault,
             };
             let result = if PAGED {
+                let execution = self.legacy_execution.as_mut().unwrap();
+                let state = execution.paging.get_or_insert_with(Default::default);
+                if !self.cpu.mmio_retry_active {
+                    state.event_transaction = None;
+                }
                 crate::interp::legacy::paging::deliver_interrupt::<ROUTED, ORDER>(
                     &mut self.cpu,
                     &vm.mem,
                     context,
                     delivery,
-                    &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                    &mut execution.task_switch,
+                    &mut state.event_transaction,
                 )
             } else {
                 crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
@@ -2409,6 +2413,8 @@ impl Vcpu {
                 &vm.mem,
                 self.cpu_model,
             )
+        } else if KIND == MACHINE_DISPATCH && self.cpu.legacy.cr0 & 0x8000_0000 != 0 {
+            self.finish_paged_port_input::<ROUTED, ORDER>(vm)
         } else {
             crate::interp::legacy::finish_port_input::<ROUTED, ORDER>(
                 &mut self.cpu,
@@ -2808,7 +2814,9 @@ impl Vcpu {
                     }
                 }
                 let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
-                let resolved = if direct20 {
+                let resolved = if KIND == MACHINE_DISPATCH && context.paging_enabled {
+                    self.resolve_paged(vm, context)
+                } else if direct20 {
                     super::i8086::resolve(vm, &self.cpu, exit_word, physical)
                 } else if direct && !retained && !boundary.instruction_retry {
                     resolve_direct(
@@ -2886,7 +2894,9 @@ impl Vcpu {
                 } else {
                     limit.map_or(u64::MAX, |limit| limit - steps)
                 };
-                let progress = if direct20 {
+                let progress = if KIND == MACHINE_DISPATCH && context.paging_enabled {
+                    self.execute_paged::<ROUTED, ORDER>(vm, &ir, context)
+                } else if direct20 {
                     crate::interp::legacy::execute_shared20::<ROUTED, ORDER>(
                         &ir,
                         &mut self.cpu,

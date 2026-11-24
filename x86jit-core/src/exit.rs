@@ -153,8 +153,8 @@ pub enum UnsupportedSystemOperation {
     LegacyIoPermissionBitmap,
     /// Engine policy: page-directory/table storage must be ordinary RAM.
     PagingTableStorage,
-    /// Internal paging policy: split device operands require a retained bus
-    /// continuation plan (paging design §5 step 5).
+    /// Reserved compatibility value for the former split-device paging refusal.
+    /// Paged operands now retain their bus continuation plan.
     PagingSplitDevice,
 }
 

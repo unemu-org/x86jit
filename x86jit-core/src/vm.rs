@@ -2272,8 +2272,8 @@ impl Vcpu {
     /// Report physical code/DMA writes with [`Memory::note_write`] as usual.
     /// CPU registers and pending device completions are preserved; restore must
     /// occur at a quiescent boundary (paging design §§3.2, 3.7, decision Q5).
-    /// Application profiles have no guest-paging state. Public Machine PG=1
-    /// execution remains refused until the complete paging contract is enabled.
+    /// Application profiles have no guest-paging state. Machine paging requires
+    /// page directories and page tables in ordinary RAM.
     #[cold]
     #[inline(never)]
     pub fn invalidate_paging(&mut self) {
@@ -3384,6 +3384,14 @@ impl Vcpu {
             });
         }
         let context = if KIND >= MACHINE_DISPATCH {
+            if KIND == MACHINE_DISPATCH && budget != Some(0) {
+                if let Err(exit) = self.validate_paged_continuations(vm) {
+                    return Ok(StepRun {
+                        steps: 0,
+                        stop: StepStop::Exit(exit),
+                    });
+                }
+            }
             let context = if KIND == DIRECT20_DISPATCH {
                 // The deprecated selector's I8086 generation keeps the C1
                 // run-entry refusal (decision-23 Migration).

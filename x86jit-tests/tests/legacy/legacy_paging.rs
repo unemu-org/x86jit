@@ -1,5 +1,5 @@
-//! Internal paging witnesses (paging design §5 steps 1–4). Scalar operand tests
-//! supply bytes; fetch/proof tests use the private single-instruction vCPU entry.
+//! Paging witnesses (paging design §5). Focused scalar/proof tests retain the
+//! private entry; public witnesses exercise normal Machine dispatch and retries.
 use x86jit_core::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultClass, FaultOrigin, Knowledge,
     MemoryEffects,
@@ -358,39 +358,26 @@ fn physical_table_failure_retains_cr2_and_never_becomes_pf() {
 }
 
 #[test]
-fn public_paged_entry_and_cr0_enable_stay_refused() {
+fn public_paged_entry_and_guest_cr0_enable() {
+    // 80386 PRM §5.2 pp. 5-7–11; Intel486 PRM §5.3.1 p. 5-18.
     for model in MODELS {
         for code32 in [false, true] {
             let mut f = Fixture::new(model, code32, 0);
-            let before = format!("{:?}", f.cpu.cpu);
-            let run = f.cpu.run_steps(&f.vm, 1, StepOptions::default()).unwrap();
-            assert!(
-                matches!(
-                    run.stop(),
-                    StepStop::Exit(Exit::UnsupportedSystemContext {
-                        operation: UnsupportedSystemOperation::LegacyEntryFacility,
-                        ..
-                    })
-                ),
-                "{:?}",
-                run.stop()
-            );
-            assert_eq!(run.steps(), 0);
-            assert_eq!(format!("{:?}", f.cpu.cpu), before);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(0x400, &[0x0f, 0x22, 0xc0]).unwrap();
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x403, &[0xb0, 0x73])
+                .unwrap();
             f.cpu.cpu.legacy.cr0 = 1;
             f.cpu.cpu.gpr[0] = 0x8000_0001;
-            f.vm.write_bytes(0x400, &[0x0f, 0x22, 0xc0]).unwrap(); // MOV CR0,EAX
-            let run = f.cpu.run_steps(&f.vm, 1, StepOptions::default()).unwrap();
+            let run = f.cpu.run_steps(&f.vm, 2, StepOptions::default()).unwrap();
             assert!(
-                matches!(
-                    run.stop(),
-                    StepStop::Exit(Exit::UnsupportedSystemContext { .. })
-                ),
-                "{:?}",
-                run.stop()
+                matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                "{run:?}"
             );
-            assert_eq!(f.cpu.cpu.legacy.cr0, 1);
-            assert_eq!(f.cpu.cpu.rip, 0x400);
+            assert_eq!(run.steps(), 2);
+            assert_eq!(f.cpu.cpu.legacy.cr0 & 0x8000_0001, 0x8000_0001);
+            assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x73);
+            assert_eq!(f.cpu.cpu.rip, 0x405);
         }
     }
 }
@@ -512,136 +499,6 @@ fn missing_second_page_precedes_first_page_device_handoff() {
                     LINEAR + 0x1000,
                     if write { 6 } else { 4 },
                 );
-                assert_eq!(f.get(f.pte()), DATA | 7 | A);
-            }
-        }
-    }
-}
-
-#[test]
-fn split_device_operands_are_refused_before_reads_writes_or_rmw() {
-    // Engine policy, paging design §§3.4, 5 step 5: no split device handoff
-    // without a retained operand snapshot and translated continuation plan.
-    for model in MODELS {
-        for code32 in [false, true] {
-            for devices in [0, 1, 2, 3] {
-                for operation in 0..3 {
-                    let mut f = Fixture::new(model, code32, 0);
-                    f.put(f.pte() + 4, NEXT | 7);
-                    f.put(u64::from(DATA + 0xffc), 0x1234_5678);
-                    f.put(u64::from(NEXT), 0x8765_4321);
-                    for (bit, page) in [(1, DATA), (2, NEXT)] {
-                        if devices & bit != 0 {
-                            f.vm.unmap(u64::from(page), 0x1000).unwrap();
-                            f.vm.map(u64::from(page), 0x1000, Prot::RWX, RegionKind::Trap)
-                                .unwrap();
-                        }
-                    }
-                    f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
-                    let code = if operation == 2 {
-                        // ADD dword [OFFSET+0xffe],1: RAM-first used to commit
-                        // its low half before the MMIO write and add twice on retry.
-                        let mut code = Vec::new();
-                        if !code32 {
-                            code.push(0x66);
-                        }
-                        code.extend([0x83, if code32 { 0x05 } else { 0x06 }]);
-                        if code32 {
-                            code.extend((OFFSET + 0xffe).to_le_bytes());
-                        } else {
-                            code.extend(((OFFSET + 0xffe) as u16).to_le_bytes());
-                        }
-                        code.push(1);
-                        code
-                    } else {
-                        f.code(operation == 1, OFFSET + 0xffe)
-                    };
-                    if devices == 0 {
-                        f.execute(&code).unwrap();
-                        assert_eq!(
-                            f.get(u64::from(DATA + 0xffc)),
-                            [0x1234_5678, 0xccdd_5678, 0x1235_5678][operation]
-                        );
-                        assert_eq!(
-                            f.get(u64::from(NEXT)),
-                            if operation == 1 {
-                                0x8765_aabb
-                            } else {
-                                0x8765_4321
-                            }
-                        );
-                        if operation == 0 {
-                            assert_eq!(f.cpu.cpu.gpr[0], 0x4321_1234);
-                        }
-                        continue;
-                    }
-                    let before = format!("{:?}", f.cpu.cpu);
-                    for _ in 0..2 {
-                        let exit = f.execute(&code).unwrap_err();
-                        assert!(
-                            matches!(
-                                exit,
-                                Exit::UnsupportedSystemContext {
-                                    operation: UnsupportedSystemOperation::PagingSplitDevice,
-                                    ..
-                                }
-                            ),
-                            "{exit:?}"
-                        );
-                        assert_eq!(format!("{:?}", f.cpu.cpu), before);
-                        if devices & 1 == 0 {
-                            assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x1234_5678);
-                        }
-                        if devices & 2 == 0 {
-                            assert_eq!(f.get(u64::from(NEXT)), 0x8765_4321);
-                        }
-                        assert_eq!(f.get(f.pte()), DATA | 7 | A);
-                        assert_eq!(f.get(f.pte() + 4), NEXT | 7 | A);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn device_region_split_within_one_page_is_also_refused() {
-    // Paging design §5 step 5: physical-region and page splits both need the
-    // same continuation, even when only one page translation is involved.
-    for model in MODELS {
-        for device_first in [false, true] {
-            for write in [false, true] {
-                let mut f = Fixture::new(model, true, 0);
-                f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
-                for (offset, size, device) in [(0, 4, device_first), (4, 0xffc, !device_first)] {
-                    f.vm.map(
-                        u64::from(DATA + offset),
-                        size,
-                        Prot::RWX,
-                        if device {
-                            RegionKind::Trap
-                        } else {
-                            RegionKind::Ram
-                        },
-                    )
-                    .unwrap();
-                }
-                let ram = u64::from(DATA + if device_first { 4 } else { 0 });
-                f.put(ram, 0x1234_5678);
-                let before = format!("{:?}", f.cpu.cpu);
-                let exit = f.mov(write, OFFSET + 2).unwrap_err();
-                assert!(
-                    matches!(
-                        exit,
-                        Exit::UnsupportedSystemContext {
-                            operation: UnsupportedSystemOperation::PagingSplitDevice,
-                            ..
-                        }
-                    ),
-                    "{exit:?}"
-                );
-                assert_eq!(format!("{:?}", f.cpu.cpu), before);
-                assert_eq!(f.get(ram), 0x1234_5678);
                 assert_eq!(f.get(f.pte()), DATA | 7 | A);
             }
         }
@@ -986,7 +843,7 @@ fn paged_fetch_pg_transitions_and_explicit_embedder_invalidation() {
             f.fetch_at(0x400).unwrap();
             assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x22);
             let before = f.cpu.paging_cache_for_test().0;
-            f.cpu.cpu.legacy.cr0 |= 0x8000_0000; // private setup, no public enable
+            f.cpu.cpu.legacy.cr0 |= 0x8000_0000; // restore an already-paged context
             f.fetch_at(0x400).unwrap();
             assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
             assert!(f.cpu.paging_cache_for_test().0 > before);
@@ -1241,9 +1098,9 @@ fn paged_fetch_private_tags_follow_vcpu_lifetimes() {
 }
 
 #[test]
-fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_stays_refused() {
+fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_succeeds() {
     // 80386 PRM §§6.4.3–6.5 pp. 6-21–22; Intel486 PRM §§6.8.3–6.9
-    // pp. 6-24–25: segmentation precedes paging. Public enablement is step 5.
+    // pp. 6-24–25: segmentation precedes paging.
     for model in MODELS {
         for code32 in [false, true] {
             let mut f = Fixture::new(model, code32, 0);
@@ -1261,24 +1118,14 @@ fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_stays_refused() {
             f.cpu.cpu.legacy.segments[0].limit = u32::MAX;
             f.vm.write_bytes(0x400, &[0x0f, 0x22, 0xc0]).unwrap();
             f.cpu.cpu.legacy.cr0 &= !0x8000_0000;
-            let before = f.cpu.cpu.legacy.cr0;
             f.cpu.cpu.gpr[0] = 0x8000_0001;
             let run = f.cpu.run_steps(&f.vm, 1, StepOptions::default()).unwrap();
-            let StepStop::Exit(exit) = run.stop() else {
-                panic!("expected PG-setting refusal: {run:?}");
-            };
             assert!(
-                matches!(
-                    exit,
-                    Exit::UnsupportedSystemContext {
-                        operation: UnsupportedSystemOperation::LegacyExecution,
-                        ..
-                    }
-                ),
-                "{exit:?}"
+                matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                "{run:?}"
             );
-            assert_eq!(f.cpu.cpu.legacy.cr0, before);
-            assert_eq!(f.cpu.cpu.rip, 0x400);
+            assert_eq!(f.cpu.cpu.legacy.cr0 & 0x8000_0001, 0x8000_0001);
+            assert_eq!(f.cpu.cpu.rip, 0x403);
         }
     }
 }
@@ -1317,10 +1164,9 @@ fn paging_wp_supervisor_writes_both_mapping_classes() {
 }
 
 #[test]
-fn paging_wp_changes_drop_proofs_and_public_cr0_still_refuses_pg() {
+fn paging_wp_changes_drop_proofs_and_public_cr0_enables_pg() {
     // Paging design §3.2, Q3: conservative generation change on WP changes.
     // 80386 PRM §4.1.3 p. 4-3: bit 16 is outside the 386 CR0 mask.
-    // Public PG-setting remains refused until §5 step 5.
     for model in MODELS {
         for code32 in [false, true] {
             let mut f = Fixture::new(model, code32, 0);
@@ -1354,13 +1200,8 @@ fn paging_wp_changes_drop_proofs_and_public_cr0_still_refuses_pg() {
             f.cpu.cpu.legacy.cr0 &= !0x8000_0000;
             f.cpu.cpu.gpr[0] = 0x8000_0001;
             f.vm.write_bytes(0x500, &[0x0f, 0x22, 0xc0]).unwrap();
-            let before = f.cpu.cpu.legacy.cr0;
-            let exit = f.fetch_at(0x500).unwrap_err();
-            assert!(
-                matches!(exit, Exit::UnsupportedSystemContext { .. }),
-                "{exit:?}"
-            );
-            assert_eq!(f.cpu.cpu.legacy.cr0, before);
+            f.fetch_at(0x500).unwrap();
+            assert_eq!(f.cpu.cpu.legacy.cr0 & 0x8000_0001, 0x8000_0001);
         }
     }
 }
@@ -2906,5 +2747,1293 @@ fn step4_equal_task_cr3_load_observes_pte_written_by_outgoing_save() {
         assert_eq!(f.cpu.cpu.legacy.segments[1].base, BASE + 0x10000);
         assert_eq!(f.cpu.cpu.rip, 0x900);
         assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+    }
+}
+
+fn public_step(f: &mut Fixture) -> Exit {
+    let run = f.cpu.run_steps(&f.vm, 1, StepOptions::default()).unwrap();
+    match run.stop() {
+        StepStop::Exit(exit) => exit.clone(),
+        other => panic!("unexpected paged stop: {other:?}"),
+    }
+}
+
+#[test]
+fn public_split_device_retry_preserves_snapshot_and_transfer_order() {
+    // 80386 PRM §9.8.14 pp. 9-17–19: restart at the original instruction.
+    // Staged RAM and visit-ledger ordering are engine policy (paging §3.4).
+    for model in MODELS {
+        for devices in 1..=3 {
+            for operation in 0..4 {
+                let mut f = Fixture::new(model, true, 0);
+                f.code_mapping(0, CODE_FRAME);
+                f.put(f.pte() + 4, NEXT | 7);
+                f.put(u64::from(DATA + 0xffc), 0x1234_5678);
+                f.put(u64::from(NEXT), 0x8765_4321);
+                for (bit, page) in [(1, DATA), (2, NEXT)] {
+                    if devices & bit != 0 {
+                        f.vm.unmap(u64::from(page), 0x1000).unwrap();
+                        f.vm.map(u64::from(page), 0x1000, Prot::RWX, RegionKind::Trap)
+                            .unwrap();
+                    }
+                }
+                f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
+                let code = if operation >= 2 {
+                    let mut code = if operation == 3 { vec![0xf0] } else { vec![] };
+                    code.extend([0x83, 0x05]);
+                    code.extend((OFFSET + 0xffe).to_le_bytes());
+                    code.push(1);
+                    code
+                } else {
+                    f.code(operation == 1, OFFSET + 0xffe)
+                };
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                    .unwrap();
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                for attempt in 0..8 {
+                    match public_step(&mut f) {
+                        Exit::MmioRead { addr, size, .. } => {
+                            assert_eq!(size, 2);
+                            assert_eq!(
+                                f.cpu.pending_mmio_linear_address(),
+                                Some(
+                                    LINEAR
+                                        + if addr == u64::from(DATA + 0xffe) {
+                                            0xffe
+                                        } else {
+                                            0x1000
+                                        }
+                                )
+                            );
+                            assert!(!reads.contains(&addr), "duplicate device read");
+                            reads.push(addr);
+                            f.cpu
+                                .complete_mmio_read(if addr == u64::from(DATA + 0xffe) {
+                                    0x1234
+                                } else {
+                                    0x4321
+                                });
+                        }
+                        Exit::MmioWrite {
+                            addr, size, value, ..
+                        } => {
+                            assert_eq!(size, 2);
+                            assert_eq!(
+                                f.cpu.pending_mmio_linear_address(),
+                                Some(
+                                    LINEAR
+                                        + if addr == u64::from(DATA + 0xffe) {
+                                            0xffe
+                                        } else {
+                                            0x1000
+                                        }
+                                )
+                            );
+                            assert!(!writes.contains(&addr), "duplicate device write");
+                            assert_eq!(
+                                value,
+                                if operation == 1 {
+                                    if addr == u64::from(DATA + 0xffe) {
+                                        0xccdd
+                                    } else {
+                                        0xaabb
+                                    }
+                                } else if addr == u64::from(DATA + 0xffe) {
+                                    0x1235
+                                } else {
+                                    0x4321
+                                }
+                            );
+                            writes.push(addr);
+                            // Operand RAM remains at entry until all device pieces finish.
+                            if devices & 1 == 0 {
+                                assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x1234_5678);
+                            }
+                            f.cpu.complete_mmio_write();
+                        }
+                        Exit::BudgetExhausted => break,
+                        exit => panic!("{model:?}/{devices}/{operation}/{attempt}: {exit:?}"),
+                    }
+                    assert!(attempt < 7, "retry did not finish");
+                }
+                assert_eq!(f.cpu.pending_mmio_linear_address(), None);
+                let device_count = (devices as u32).count_ones() as usize;
+                assert_eq!(reads.len(), if operation == 1 { 0 } else { device_count });
+                assert_eq!(writes.len(), if operation == 0 { 0 } else { device_count });
+                assert_eq!(f.cpu.cpu.rip, 0x400 + code.len() as u64);
+                if devices & 1 == 0 {
+                    assert_eq!(
+                        f.get(u64::from(DATA + 0xffc)),
+                        [0x1234_5678, 0xccdd_5678, 0x1235_5678, 0x1235_5678][operation]
+                    );
+                }
+                if devices == 1 && operation >= 2 {
+                    assert_eq!(f.get(u64::from(NEXT)), 0x8765_4321);
+                }
+                if operation == 0 {
+                    assert_eq!(f.cpu.cpu.gpr[0], 0x4321_1234);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn public_device_region_split_and_multi_address_push() {
+    // Paging §3.4: physical-region splits and explicit/implicit operands use
+    // the same preflight and retained visit ledger.
+    for model in MODELS {
+        for device_first in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+            for (offset, size, device) in [(0, 4, device_first), (4, 0xffc, !device_first)] {
+                f.vm.map(
+                    u64::from(DATA + offset),
+                    size,
+                    Prot::RWX,
+                    if device {
+                        RegionKind::Trap
+                    } else {
+                        RegionKind::Ram
+                    },
+                )
+                .unwrap();
+            }
+            let code = f.code(false, OFFSET + 2);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                .unwrap();
+            let ram = u64::from(DATA + if device_first { 4 } else { 0 });
+            f.put(ram, 0x1234_5678);
+            let exit = public_step(&mut f);
+            assert!(matches!(exit, Exit::MmioRead { size: 2, .. }), "{exit:?}");
+            f.cpu.complete_mmio_read(0xabcd);
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(
+                f.cpu.cpu.gpr[0],
+                if device_first {
+                    0x5678_abcd
+                } else {
+                    0xabcd_1234
+                }
+            );
+        }
+        for source_device in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.put(f.pte() + 4, NEXT | 7);
+            f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x1004);
+            f.put(u64::from(DATA), 0x1234_5678);
+            let page = if source_device { DATA } else { NEXT };
+            f.vm.unmap(u64::from(page), 0x1000).unwrap();
+            f.vm.map(u64::from(page), 0x1000, Prot::RWX, RegionKind::Trap)
+                .unwrap();
+            let mut code = vec![0xff, 0x35]; // PUSH dword [OFFSET]
+            code.extend(OFFSET.to_le_bytes());
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                .unwrap();
+            let exit = public_step(&mut f);
+            if source_device {
+                assert!(
+                    matches!(exit, Exit::MmioRead { addr, size: 4, .. } if addr == u64::from(DATA)),
+                    "{exit:?}"
+                );
+                f.cpu.complete_mmio_read(0x1234_5678);
+            } else {
+                assert!(
+                    matches!(exit, Exit::MmioWrite { addr, size: 4, value: 0x1234_5678, .. } if addr == u64::from(NEXT)),
+                    "{exit:?}"
+                );
+                // The original RAM operand snapshot survives a host edit.
+                f.put(u64::from(DATA), 0xaabb_ccdd);
+                f.cpu.complete_mmio_write();
+            }
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x1000));
+            if source_device {
+                assert_eq!(f.get(u64::from(NEXT)), 0x1234_5678);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_retry_keeps_translation_after_page_table_edit_and_invalidation() {
+    let mut f = Fixture::new(CpuModel::I80386, true, 0);
+    f.code_mapping(0, CODE_FRAME);
+    f.put(f.pte() + 4, NEXT | 7);
+    f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+    f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+        .unwrap();
+    let code = f.code(true, OFFSET + 0xffe);
+    f.cpu.cpu.gpr[0] = 0x1234_5678;
+    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+        .unwrap();
+    assert!(
+        matches!(public_step(&mut f), Exit::MmioWrite { addr, value: 0x1234, size: 2, .. } if addr == u64::from(NEXT))
+    );
+    f.put(f.pte(), OTHER_FRAME | 7);
+    f.put(f.pte() + 4, OTHER_FRAME | 7);
+    f.cpu.invalidate_paging();
+    f.cpu.complete_mmio_write();
+    assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+    assert_eq!(f.get(u64::from(DATA + 0xffc)) >> 16, 0x5678);
+    assert_eq!(f.get(u64::from(OTHER_FRAME)), 0);
+}
+
+#[test]
+fn public_sparse_and_host_ram_alias_smc_and_restore() {
+    // 80386 PRM §5.2 Fig. 5-9 pp. 5-8–9: linear aliases select the same
+    // physical frame. Paging §3.5/3.7: physical SMC and quiescent restore policy.
+    for model in MODELS {
+        for host in [false, true] {
+            let vm = if host {
+                let mut storage = vec![0u8; 0x20000].into_boxed_slice();
+                let ptr = storage.as_mut_ptr();
+                let len = storage.len();
+                let mut storage = Some(storage);
+                let ram = x86jit_core::HostRam {
+                    ptr,
+                    len,
+                    guest_base: 0,
+                    dtor: Box::new(move |_, _| drop(storage.take())),
+                    protect: None,
+                };
+                Vm::with_backend_host_ram(
+                    VmConfig::flat(0x20000),
+                    Box::new(x86jit_core::InterpreterBackend),
+                    ram,
+                )
+                .unwrap()
+            } else {
+                Vm::sparse(VmConfig::reserved(0x20000)).unwrap()
+            };
+            let mut f = Fixture::with_vm(vm, model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.code_mapping(0x4000, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            for ip in [0x400, 0x4400] {
+                f.cpu.cpu.rip = ip;
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
+            }
+            f.cpu.cpu.rip = 0x400;
+            let snapshot = f.cpu.cpu.clone();
+            let mut ram = vec![0; 0x20000];
+            for (page, bytes) in ram.chunks_mut(0x1000).enumerate() {
+                f.vm.read_bytes((page * 0x1000) as u64, bytes).unwrap();
+            }
+            // Write through a third linear alias using the normal paged store.
+            f.put(f.pte(), CODE_FRAME | 7);
+            let mut code = vec![0xc6, 0x05];
+            code.extend((OFFSET + 0x401).to_le_bytes());
+            code.push(0x22);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, &code)
+                .unwrap();
+            f.cpu.cpu.rip = 0x500;
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            for ip in [0x400, 0x4400] {
+                f.cpu.cpu.rip = ip;
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x22);
+            }
+            for (page, bytes) in ram.chunks(0x1000).enumerate() {
+                f.vm.write_bytes((page * 0x1000) as u64, bytes).unwrap();
+            }
+            f.cpu.cpu = snapshot;
+            f.cpu.invalidate_paging();
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
+        }
+    }
+}
+
+#[test]
+fn public_paging_a20_gates_tables_and_final_frames_after_translation() {
+    // 80386 PRM §5.2 pp. 5-7–10 defines the translation; the board A20
+    // gate applies to its physical traffic (paging design §3.6).
+    for model in MODELS {
+        let mut f = Fixture::with_vm(
+            Vm::sparse(VmConfig::reserved(0x200000)).unwrap(),
+            model,
+            true,
+            0,
+        );
+        f.cpu.cpu.legacy.cr3 = PD as u32 | 0x100000;
+        f.map_code(PD as u32, CODE_PT | 0x100000, 0, CODE_FRAME | 0x100000, 7);
+        f.map_code(
+            PD as u32 | 0x100000,
+            OTHER_PT | 0x100000,
+            0,
+            OTHER_FRAME | 0x100000,
+            7,
+        );
+        // A20=0 selects the low directory, then gates its high table/frame.
+        f.put(u64::from(CODE_PT), CODE_FRAME | 0x100007);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+            .unwrap();
+        f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x100400, &[0xb0, 0x22])
+            .unwrap();
+        for (enabled, expected) in [(true, 0x22), (false, 0x11), (true, 0x22)] {
+            f.cpu.set_a20_enabled(enabled);
+            f.cpu.cpu.rip = 0x400;
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.cpu.cpu.gpr[0] & 0xff, expected);
+        }
+        // Linear bit 20 still selects PTE[256] with A20 off; only its
+        // translated table/frame bus addresses pass through the board gate.
+        f.put(u64::from(CODE_PT + 256 * 4), OTHER_FRAME | 0x100007);
+        f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x400, &[0xb0, 0x33])
+            .unwrap();
+        f.cpu.set_a20_enabled(false);
+        f.cpu.cpu.rip = 0x100400;
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x33);
+        assert_eq!(f.get(u64::from(CODE_PT)) & A, A);
+        assert_eq!(f.get(u64::from(OTHER_PT) + 0x100000) & A, A);
+    }
+}
+
+#[test]
+fn public_paging_table_device_refusal_and_286_rejection() {
+    // Q1 is an engine limitation, not a hardware page fault. 80386 PRM
+    // §5.2.3 pp. 5-8–9: CR3 and PDE table addresses are physical.
+    for model in MODELS {
+        for directory in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            let page = if directory { PD } else { u64::from(CODE_PT) };
+            f.vm.unmap(page, 0x1000).unwrap();
+            f.vm.map(page, 0x1000, Prot::RWX, RegionKind::Trap).unwrap();
+            assert!(matches!(
+                public_step(&mut f),
+                Exit::UnsupportedSystemContext {
+                    operation: UnsupportedSystemOperation::PagingTableStorage,
+                    ..
+                }
+            ));
+            assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+            assert!(!f.cpu.cpu.mmio_retry_active);
+        }
+    }
+    let mut f = Fixture::new(CpuModel::I80286, false, 0);
+    // Keep the 286 storage image valid apart from the requested PG bit.
+    for segment in &mut f.cpu.cpu.legacy.segments {
+        segment.base = 0;
+        segment.limit = 0xffff;
+    }
+    assert!(matches!(
+        public_step(&mut f),
+        Exit::UnsupportedSystemContext {
+            operation: UnsupportedSystemOperation::InvalidLegacyContext(
+                x86jit_core::MachineContextError::PagingRequires386
+            ),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn public_device_retry_survives_host_stop_request_and_queued_a20_change() {
+    let mut f = Fixture::new(CpuModel::I80386, true, 0);
+    f.code_mapping(0, CODE_FRAME);
+    f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+    f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+        .unwrap();
+    let mut code = vec![0x83, 0x05];
+    code.extend(OFFSET.to_le_bytes());
+    code.push(1);
+    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+        .unwrap();
+    assert!(matches!(public_step(&mut f), Exit::MmioRead { .. }));
+    f.cpu.complete_mmio_read(41);
+    assert!(matches!(
+        public_step(&mut f),
+        Exit::MmioWrite { value: 42, .. }
+    ));
+    f.cpu.set_a20_enabled(false);
+    assert_eq!(f.cpu.cpu.legacy.a20_enabled, 1);
+    f.cpu.exit_request().request_exit();
+    let stop = public_step(&mut f);
+    assert!(
+        matches!(stop, Exit::Interrupted | Exit::MmioWrite { value: 42, .. }),
+        "{stop:?}"
+    );
+    f.cpu.complete_mmio_write();
+    let stop = public_step(&mut f);
+    assert!(
+        matches!(stop, Exit::BudgetExhausted | Exit::Interrupted),
+        "{stop:?}"
+    );
+    assert_eq!(f.cpu.cpu.legacy.a20_enabled, 0);
+    assert_eq!(f.cpu.cpu.rip, 0x400 + code.len() as u64);
+}
+
+#[test]
+fn public_paged_cache_operations_preserve_flags() {
+    // Intel486 PRM §26 INVD/WBINVD pp. 26-171, 26-281: privileged
+    // cache operations preserve flags, independently of paging.
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        for code in [[0x0f, 0x08], [0x0f, 0x09]] {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                .unwrap();
+            f.cpu.cpu.flags.cf = true;
+            let flags = f.cpu.cpu.flags;
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.cpu.cpu.flags, flags);
+        }
+    }
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[path = "../../../x86jit-cranelift/src/unwind_test_signal.rs"]
+mod paged_signal;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod paged_host_fault {
+    use super::paged_signal as signal;
+    use super::*;
+
+    #[test]
+    fn public_host_ram_fault_keeps_linear_and_physical_evidence() {
+        // Physical backing failure is a bus exit (paging §3.6), not the
+        // not-present/protection #PF of 80386 PRM §9.8.14 pp. 9-17–19.
+        let len = 0x20000;
+        // SAFETY: HostRam owns the complete anonymous span until VM drop;
+        // protection changes cover one aligned host page within that span.
+        assert_eq!(
+            signal::child(|| unsafe {
+                signal::install();
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let ram = x86jit_core::HostRam {
+                    ptr: ptr.cast(),
+                    len,
+                    guest_base: 0,
+                    dtor: Box::new(|p, n| {
+                        libc::munmap(p.cast(), n);
+                    }),
+                    protect: None,
+                };
+                let mut vm = Vm::with_backend_host_ram(
+                    VmConfig::flat(len as u64),
+                    Box::new(x86jit_core::InterpreterBackend),
+                    ram,
+                )
+                .unwrap();
+                vm.mem.set_host_fault_recovery(true);
+                let mut f = Fixture::with_vm(vm, CpuModel::I80386, true, 0);
+                f.code_mapping(0, CODE_FRAME);
+                f.put(u64::from(DATA), 0x1234_5678);
+                let code = f.code(false, OFFSET);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                    .unwrap();
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                let data = ptr.cast::<u8>().add(DATA as usize).cast();
+                assert_eq!(libc::mprotect(data, page, libc::PROT_NONE), 0);
+                let exit = public_step(&mut f);
+                assert!(matches!(exit, Exit::UnmappedMemory { .. }), "{exit:?}");
+                let metadata = exit.fault_metadata().unwrap();
+                assert!(
+                    matches!(metadata.linear_address(), Knowledge::Known(a) if a.value() == u64::from(LINEAR))
+                );
+                assert_eq!(
+                    metadata.physical_address(),
+                    Knowledge::Known(u64::from(DATA))
+                );
+                assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+                assert_eq!(
+                    libc::mprotect(data, page, libc::PROT_READ | libc::PROT_WRITE),
+                    0
+                );
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.cpu.cpu.gpr[0], 0x1234_5678);
+
+                // Revoke backing only while a device write is held. The later
+                // RAM commit fault retains that consumed acknowledgement.
+                f.put(f.pte() + 4, NEXT | 7);
+                f.put(u64::from(DATA + 0xffc), 0x1111_2222);
+                f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+                f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+                    .unwrap();
+                let code = f.code(true, OFFSET + 0xffe);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                    .unwrap();
+                f.cpu.cpu.rip = 0x400;
+                assert!(
+                    matches!(public_step(&mut f), Exit::MmioWrite { addr, size: 2, value: 0x1234, .. } if addr == u64::from(NEXT))
+                );
+                assert_eq!(libc::mprotect(data, page, libc::PROT_NONE), 0);
+                f.cpu.complete_mmio_write();
+                let exit = public_step(&mut f);
+                assert!(matches!(exit, Exit::UnmappedMemory { .. }), "{exit:?}");
+                assert_eq!(f.cpu.cpu.rip, 0x400);
+                assert!(!f.cpu.cpu.pending_mmio_write);
+                let metadata = exit.fault_metadata().unwrap();
+                assert_eq!(metadata.saved_rip(), 0x400);
+                assert!(
+                    matches!(metadata.linear_address(), Knowledge::Known(a) if a.value() == u64::from(LINEAR + 0xffe))
+                );
+                assert!(!metadata.progress().acknowledged_transfers().is_empty());
+                assert_eq!(
+                    libc::mprotect(data, page, libc::PROT_READ | libc::PROT_WRITE),
+                    0
+                );
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x5678_2222);
+            }),
+            0
+        );
+    }
+}
+
+#[test]
+fn public_enter_device_displays_and_frame_complete_once() {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297: frame/display stack operations.
+    // Retained display snapshots and transfer order follow paging §3.4 policy.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xc8, 0, 0, 2])
+            .unwrap();
+        f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x100);
+        f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0x80);
+        assert!(
+            matches!(public_step(&mut f), Exit::MmioRead { addr, size: 4, .. } if addr == u64::from(DATA + 0x7c))
+        );
+        f.cpu.complete_mmio_read(0x1234_5678);
+        for (offset, value) in [
+            (0xfc, OFFSET + 0x80),
+            (0xf8, 0x1234_5678),
+            (0xf4, OFFSET + 0xfc),
+        ] {
+            let exit = public_step(&mut f);
+            assert!(
+                matches!(exit, Exit::MmioWrite { addr, size: 4, value: actual, .. } if addr == u64::from(DATA + offset) && actual == u64::from(value)),
+                "{exit:?}"
+            );
+            f.cpu.complete_mmio_write();
+        }
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0xf4));
+        assert_eq!(f.cpu.cpu.gpr[5], u64::from(OFFSET + 0xfc));
+    }
+}
+
+#[test]
+fn public_aliased_device_stores_have_separate_completion_owners() {
+    // 80386 PRM §5.2 pp. 5-8–9: different linear pages may select one
+    // physical frame. Paging §3.4: an answer never belongs to a later store.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.put(f.pte() + 4, DATA | 7);
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xab])
+            .unwrap(); // STOSD
+        for (offset, value) in [(OFFSET, 0x1234), (OFFSET + 0x1000, 0x5678)] {
+            f.cpu.cpu.rip = 0x400;
+            f.cpu.cpu.gpr[7] = u64::from(offset);
+            f.cpu.cpu.gpr[0] = value;
+            let exit = public_step(&mut f);
+            assert!(
+                matches!(exit, Exit::MmioWrite { addr, size: 4, value: actual, .. } if addr == u64::from(DATA) && actual == value),
+                "{exit:?}"
+            );
+            f.cpu.complete_mmio_write();
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        }
+    }
+}
+
+#[test]
+fn public_reset_abandons_paged_device_plan_and_snapshot() {
+    let mut f = Fixture::new(CpuModel::I80386, true, 0);
+    f.code_mapping(0, CODE_FRAME);
+    f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+    f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+        .unwrap();
+    let mut code = vec![0x83, 0x05];
+    code.extend(OFFSET.to_le_bytes());
+    code.push(1);
+    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+        .unwrap();
+    assert!(matches!(public_step(&mut f), Exit::MmioRead { .. }));
+    f.cpu.complete_mmio_read(41);
+    assert!(matches!(
+        public_step(&mut f),
+        Exit::MmioWrite { value: 42, .. }
+    ));
+    f.cpu.reset_execution_state(Default::default());
+    assert!(matches!(public_step(&mut f), Exit::MmioRead { .. }));
+    f.cpu.complete_mmio_read(9);
+    assert!(matches!(
+        public_step(&mut f),
+        Exit::MmioWrite { value: 10, .. }
+    ));
+    f.cpu.complete_mmio_write();
+    assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+}
+
+#[test]
+fn public_device_write_acknowledgement_invalidates_declared_code_alias() {
+    // Paging §3.5: the acknowledged physical bus write invalidates all
+    // registered source aliases even when the embedder supplies equal bytes.
+    let mut f = Fixture::new(CpuModel::I80386, true, 0);
+    f.code_mapping(0, CODE_FRAME);
+    f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+    f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+        .unwrap();
+    f.vm.mem
+        .declare_code_alias(u64::from(DATA), u64::from(CODE_FRAME), 0x1000)
+        .unwrap();
+    let code = f.code(true, OFFSET + 0x600);
+    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+        .unwrap();
+    f.cpu.cpu.gpr[0] = 0; // equal-byte device write at the corresponding alias offset
+    assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+    let before = f.cpu.paging_cache_for_test();
+    f.cpu.complete_mmio_write();
+    assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+    f.cpu.cpu.rip = 0x400;
+    assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+    let after = f.cpu.paging_cache_for_test();
+    assert!(after.0 > before.0);
+    assert!(after.2 > before.2);
+}
+
+#[test]
+fn public_pg_clear_abandons_old_device_completion_before_unpaged_access() {
+    let mut f = Fixture::new(CpuModel::I80386, true, 0);
+    f.code_mapping(0, CODE_FRAME);
+    f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+    f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+        .unwrap();
+    let code = f.code(true, OFFSET);
+    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+        .unwrap();
+    f.cpu.cpu.gpr[0] = 1;
+    assert!(matches!(
+        public_step(&mut f),
+        Exit::MmioWrite { value: 1, .. }
+    ));
+    f.cpu.complete_mmio_write();
+    f.cpu.cpu.legacy.cr0 = 1;
+    f.cpu.cpu.legacy.segments[1].base = 0;
+    f.cpu.cpu.gpr[0] = 2;
+    let mut code = vec![0xa3];
+    code.extend(DATA.to_le_bytes());
+    f.vm.write_bytes(0x400, &code).unwrap();
+    assert!(
+        matches!(public_step(&mut f), Exit::MmioWrite { addr, value: 2, .. } if addr == u64::from(DATA))
+    );
+    assert_eq!(f.cpu.pending_mmio_linear_address(), None);
+    f.cpu.complete_mmio_write();
+    assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+}
+
+#[test]
+fn public_x87_and_table_device_operands_retain_ram_snapshots() {
+    // SDM Vol 2A §3.3 FLDCW p. 3-356; 80386 PRM §17 LGDT
+    // pp. 17-94–95. Paging §3.4 retains each complete operand over MMIO.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.cpu.set_fpu_model(x86jit_core::FpuModel::Present);
+        f.code_mapping(0, CODE_FRAME);
+        f.put(f.pte() + 4, NEXT | 7);
+        f.put(u64::from(DATA + 0xffc), 0x7f00_0000);
+        f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+        f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        let code = f.memory_code(&[0xd9], 5, OFFSET + 0xfff, 4); // FLDCW
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+            .unwrap();
+        let before = f.cpu.cpu.fpu_cw;
+        let exit = public_step(&mut f);
+        assert!(
+            matches!(exit, Exit::MmioRead { addr, size: 1, .. } if addr == u64::from(NEXT)),
+            "{exit:?}"
+        );
+        assert_eq!(f.cpu.cpu.fpu_cw, before);
+        f.put(u64::from(DATA + 0xffc), 0);
+        f.cpu.complete_mmio_read(0x0f);
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.cpu.cpu.fpu_cw, 0x0f7f);
+
+        let code = f.memory_code(&[0x0f, 0x01], 2, OFFSET + 0xffe, 4); // LGDT
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+            .unwrap();
+        f.cpu.cpu.rip = 0x400;
+        f.put(u64::from(DATA + 0xffc), 0x1234_0000);
+        let exit = public_step(&mut f);
+        assert!(
+            matches!(exit, Exit::MmioRead { addr, size: 4, .. } if addr == u64::from(NEXT)),
+            "{exit:?}"
+        );
+        f.put(u64::from(DATA + 0xffc), 0);
+        f.cpu.complete_mmio_read(0x1122_3344);
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.cpu.cpu.legacy.gdtr.base, 0x1122_3344);
+        assert_eq!(f.cpu.cpu.legacy.gdtr.limit, 0x1234);
+    }
+}
+
+#[test]
+fn public_x87_image_store_acknowledgements_are_consumed_once() {
+    // SDM Vol 2A §3.3 FSTENV/FNSTENV p. 3-390: save before masking
+    // exceptions. Paging §3.4: rollback numeric outputs, retain bus completions.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.cpu.set_fpu_model(x86jit_core::FpuModel::Present);
+        f.code_mapping(0, CODE_FRAME);
+        f.put(f.pte() + 4, NEXT | 7);
+        f.put(u64::from(DATA + 0xff8), 0x1122_3344);
+        f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+        f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        let code = f.memory_code(&[0xd9], 6, OFFSET + 0xff8, 4); // FNSTENV, 28 bytes
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+            .unwrap();
+        let before = f.cpu.cpu.fpu_cw;
+        for (offset, bytes) in [(0, 8), (8, 8), (16, 4)] {
+            let exit = public_step(&mut f);
+            assert!(
+                matches!(exit, Exit::MmioWrite { addr, size, .. } if addr == u64::from(NEXT + offset) && size == bytes),
+                "{exit:?}"
+            );
+            assert_eq!(f.get(u64::from(DATA + 0xff8)), 0x1122_3344);
+            assert_eq!(f.cpu.cpu.fpu_cw, before);
+            f.cpu.complete_mmio_write();
+        }
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.get(u64::from(DATA + 0xff8)) as u16, before);
+    }
+}
+
+#[test]
+fn public_task_switch_device_saves_resume_the_owned_phase_once() {
+    // 80386 PRM §7.5 pp. 7-8–9; SDM Vol 3A §10.3 pp. 10-10–11:
+    // outgoing saves use the old space, then incoming CR3 selects descriptors.
+    for model in MODELS {
+        for split in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.incoming_task(OTHER_PD, false);
+            if split {
+                f.cpu.cpu.legacy.tr.cache.base = BASE + 0x7fdd;
+                f.put(0x13ffc, 0xaabb_ccdd);
+            }
+            f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+            f.vm.unmap(0x14000, 0x1000).unwrap();
+            f.vm.map(0x14000, 0x1000, Prot::RWX, RegionKind::Trap)
+                .unwrap();
+            let mut saves = std::collections::BTreeMap::new();
+            for attempt in 0..64 {
+                match public_step(&mut f) {
+                    Exit::MmioWrite {
+                        addr, size, value, ..
+                    } => {
+                        assert!((0x14000..0x15000).contains(&addr));
+                        assert!(
+                            saves.insert(addr, (size, value)).is_none(),
+                            "repeated task save"
+                        );
+                        if split {
+                            assert_eq!(f.get(0x13ffc), 0xaabb_ccdd);
+                        }
+                        f.cpu.complete_mmio_write();
+                    }
+                    Exit::BudgetExhausted => break,
+                    exit => panic!("{model:?}/{attempt}: {exit:?}"),
+                }
+                assert!(attempt < 63);
+            }
+            if split {
+                assert_eq!(saves.get(&0x14000), Some(&(1, 0)));
+                assert_eq!(saves.get(&0x14005), Some(&(4, 0x1122_3344)));
+                assert_eq!(f.get(0x13ffc), 0x0004_07dd);
+            } else {
+                assert_eq!(saves.get(&0x14020), Some(&(4, 0x407)));
+                assert_eq!(saves.get(&0x14028), Some(&(4, 0x1122_3344)));
+                assert!(!saves.contains_key(&0x1401c)); // static CR3 is not saved
+            }
+            assert_eq!(f.cpu.cpu.rip, 0x900);
+            assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+            assert_eq!(f.cpu.cpu.legacy.cr3 & 0xffff_f000, OTHER_PD);
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.cpu.cpu.gpr[0], 0x7654_3210);
+        }
+    }
+}
+
+#[test]
+fn public_privilege_interrupt_device_stack_retries_all_gate_kinds() {
+    // 80386 PRM §§9.5–9.6 pp. 9-6–9; SDM Vol 3A §7.12.1:
+    // inner-ring delivery saves SS:ESP, FLAGS, CS:IP in the gate's width;
+    // interrupt gates clear IF, trap gates retain it.
+    for model in MODELS {
+        for size in [2, 4] {
+            for trap in [false, true] {
+                let mut f = Fixture::new(model, true, 3);
+                f.system_setup();
+                f.cpu.cpu.cs = 11;
+                f.cpu.cpu.ss = 19;
+                f.cpu.cpu.flags.if_ = true;
+                let old_sp = f.cpu.cpu.gpr[4];
+                f.put(0x14004, 0xa800);
+                f.put(0x14008, 16);
+                f.gate(0x30, 0x800, size);
+                if trap {
+                    f.put(0x13184, if size == 4 { 0x8f00 } else { 0x8700 });
+                }
+                f.mapped_instruction(&[0x90]);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x800, &[0x90])
+                    .unwrap();
+                f.vm.unmap(0x16000, 0x1000).unwrap();
+                f.vm.map(0x16000, 0x1000, Prot::RWX, RegionKind::Trap)
+                    .unwrap();
+                f.cpu.inject_irq(0x30);
+                let mut writes = std::collections::BTreeMap::new();
+                for slot in 1..=5 {
+                    let exit = public_step(&mut f);
+                    let Exit::MmioWrite {
+                        addr,
+                        size: width,
+                        value,
+                        ..
+                    } = exit
+                    else {
+                        panic!("{model:?}/{size}/{trap}/{slot}: {exit:?}");
+                    };
+                    assert_eq!(width, size);
+                    assert_eq!(addr, 0x16800 - slot * u64::from(size));
+                    assert!(writes.insert(addr, value).is_none());
+                    assert_eq!(f.cpu.cpu.gpr[4], old_sp);
+                    assert_eq!(f.cpu.cpu.legacy.cpl, 3);
+                    // A held completion replays the same visit without advancing it.
+                    assert!(matches!(public_step(&mut f), Exit::MmioWrite {
+                        addr: again, size: bytes, value: stored, ..
+                    } if (again, bytes, stored) == (addr, width, value)));
+                    f.cpu.complete_mmio_write();
+                }
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.cpu.cpu.legacy.cpl, 0);
+                assert_eq!((f.cpu.cpu.cs, f.cpu.cpu.ss), (8, 16));
+                assert_eq!(f.cpu.cpu.rip, 0x801);
+                assert_eq!(f.cpu.cpu.gpr[4], 0xa800 - 5 * u64::from(size));
+                assert_eq!(f.cpu.cpu.flags.if_, trap);
+                assert_eq!(writes[&(0x16800 - u64::from(size))], 19);
+                assert_eq!(writes[&(0x16800 - 2 * u64::from(size))], old_sp);
+                assert_eq!(writes[&(0x16800 - 4 * u64::from(size))], 11);
+                assert_eq!(writes[&(0x16800 - 5 * u64::from(size))], 0x400);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_task_saves_precede_busy_clear_with_overlapping_storage() {
+    // SDM Vol 3A §10.3 steps 6, 10 pp. 10-10–11: saves precede clearing
+    // the outgoing busy flag. The overlap pins the same order as PG=0.
+    for model in MODELS {
+        for overlap in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.incoming_task(OTHER_PD, false);
+            if overlap {
+                // EAX at TSS+0x28 aliases the outgoing descriptor access byte.
+                f.cpu.cpu.legacy.tr.cache.base = BASE + 0x5ff5;
+            }
+            f.cpu.cpu.gpr[0] = 0x1122_338b;
+            f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            let mut access = [0];
+            f.vm.read_bytes(0x1201d, &mut access).unwrap();
+            assert_eq!(access[0], 0x89, "{model:?}/{overlap}");
+            if overlap {
+                let mut saved = [0; 4];
+                f.vm.read_bytes(0x1201d, &mut saved).unwrap();
+                assert_eq!(u32::from_le_bytes(saved), 0x1122_3389);
+            } else {
+                assert_eq!(f.get(0x14028), 0x1122_338b);
+            }
+            assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+            assert_eq!(f.cpu.cpu.rip, 0x900);
+            assert_eq!(f.cpu.cpu.gpr[0], 0xabcdef);
+        }
+    }
+}
+
+#[test]
+fn public_x87_edit_abandons_retained_environment_and_stale_acknowledgement() {
+    // SDM Vol 2A §3.3 FSTENV/FNSTENV p. 3-390: store the control word
+    // before masking exceptions. Paging §3.4: edited inputs abandon the
+    // retained image and its completions; the new attempt uses the edited CW.
+    for model in MODELS {
+        for completed_prefix in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.set_fpu_model(x86jit_core::FpuModel::Present);
+            f.code_mapping(0, CODE_FRAME);
+            f.put(f.pte() + 4, NEXT | 7);
+            f.put(u64::from(DATA + 0xff8), 0x1122_3344);
+            f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+            f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+                .unwrap();
+            let code = f.memory_code(&[0xd9], 6, OFFSET + 0xff8, 4);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+                .unwrap();
+            assert!(
+                matches!(public_step(&mut f), Exit::MmioWrite { addr, size: 8, .. }
+                if addr == u64::from(NEXT))
+            );
+            if completed_prefix {
+                f.cpu.complete_mmio_write();
+                assert!(
+                    matches!(public_step(&mut f), Exit::MmioWrite { addr, size: 8, .. }
+                    if addr == u64::from(NEXT + 8))
+                );
+            }
+            f.cpu.cpu.fpu_cw = 0x0240;
+            f.cpu.complete_mmio_write();
+            for (offset, width) in [(0, 8), (8, 8), (16, 4)] {
+                let exit = public_step(&mut f);
+                assert!(
+                    matches!(exit, Exit::MmioWrite { addr, size, .. }
+                    if addr == u64::from(NEXT + offset) && size == width),
+                    "{exit:?}"
+                );
+                assert!(!f.cpu.cpu.pending_mmio_write);
+                assert_eq!(f.get(u64::from(DATA + 0xff8)), 0x1122_3344);
+                assert_eq!(f.cpu.cpu.fpu_cw, 0x0240);
+                f.cpu.complete_mmio_write();
+            }
+            assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+            assert_eq!(f.get(u64::from(DATA + 0xff8)) as u16, 0x0240);
+            assert_eq!(f.cpu.cpu.fpu_cw, 0x027f);
+        }
+    }
+}
+
+#[test]
+fn public_event_stack_retry_abandons_edited_esp_or_cr3() {
+    // Paging §3.4 and decision-16: an edited owner abandons the accepted
+    // event and completion before replay; no acknowledgement moves to another
+    // stack. SDM Vol 3A §7.12.1 defines the unedited interrupt frame.
+    for model in MODELS {
+        for edit_cr3 in [false, true] {
+            for acknowledge in [false, true] {
+                let mut f = Fixture::new(model, true, 0);
+                f.system_setup();
+                f.cpu.cpu.flags.if_ = true;
+                f.gate(0x30, 0x800, 4);
+                f.mapped_instruction(&[0x90]);
+                f.put(u64::from(OTHER_PD + 4 * (BASE >> 22)), OTHER_PT | 7);
+                for index in [3, 6, 7] {
+                    f.put(
+                        u64::from(OTHER_PT + index * 4),
+                        if index == 3 {
+                            NEXT | 7
+                        } else {
+                            f.get(u64::from(PT + index * 4))
+                        },
+                    );
+                }
+                f.map_code(OTHER_PD, 0x7000, 0, CODE_FRAME, 7);
+                for frame in [DATA, NEXT] {
+                    f.vm.unmap(u64::from(frame), 0x1000).unwrap();
+                    f.vm.map(u64::from(frame), 0x1000, Prot::RWX, RegionKind::Trap)
+                        .unwrap();
+                }
+                f.cpu.inject_irq(0x30);
+                let exit = public_step(&mut f);
+                assert!(
+                    matches!(
+                        exit,
+                        Exit::MmioWrite {
+                            addr: 0x87fc,
+                            size: 4,
+                            ..
+                        }
+                    ),
+                    "{exit:?}"
+                );
+                assert!(f.cpu.has_pending_irq());
+                if acknowledge {
+                    f.cpu.complete_mmio_write();
+                }
+                if edit_cr3 {
+                    f.cpu.cpu.legacy.cr3 = OTHER_PD;
+                } else {
+                    f.cpu.cpu.gpr[4] -= 0x100;
+                }
+                let esp = f.cpu.cpu.gpr[4];
+                assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+                assert_eq!(f.cpu.cpu.rip, 0x401);
+                assert_eq!(f.cpu.cpu.gpr[4], esp);
+                assert!(!f.cpu.has_pending_irq());
+                assert!(!f.cpu.cpu.pending_mmio_write);
+                assert!(!f.cpu.cpu.mmio_retry_active);
+                assert_eq!(f.cpu.pending_mmio_linear_address(), None);
+            }
+        }
+    }
+}
+
+fn assert_paged_owner_refused(f: &mut Fixture) {
+    for _ in 0..2 {
+        let exit = public_step(f);
+        assert!(
+            matches!(
+                exit,
+                Exit::UnsupportedSystemContext {
+                    operation: UnsupportedSystemOperation::LegacyEntryFacility,
+                    ..
+                }
+            ),
+            "{exit:?}"
+        );
+    }
+}
+
+#[test]
+fn public_split_store_refuses_physical_map_edits() {
+    // Paging §3.4: a physical plan cannot transfer its staged prefix or
+    // acknowledged tail to a replacement mapping, even of the same kind.
+    for model in MODELS {
+        for page in [DATA, NEXT] {
+            for replacement in [None, Some(RegionKind::Ram), Some(RegionKind::Trap)] {
+                let mut f = Fixture::new(model, true, 0);
+                f.put(f.pte() + 4, NEXT | 7);
+                f.put(u64::from(DATA + 0xffc), 0x1234_5678);
+                f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+                f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+                    .unwrap();
+                f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
+                f.mapped_instruction(&f.code(true, OFFSET + 0xffe));
+                assert!(
+                    matches!(public_step(&mut f), Exit::MmioWrite { addr, size: 2, value: 0xaabb, .. } if addr == u64::from(NEXT))
+                );
+                f.vm.unmap(u64::from(page), 0x1000).unwrap();
+                if let Some(kind) = replacement {
+                    f.vm.map(u64::from(page), 0x1000, Prot::RWX, kind).unwrap();
+                }
+                f.cpu.complete_mmio_write();
+                let before = f.cpu.cpu.gpr;
+                assert_paged_owner_refused(&mut f);
+                assert_eq!(f.cpu.cpu.gpr, before);
+                assert_eq!(f.cpu.cpu.rip, 0x400);
+                assert!(f.cpu.cpu.pending_mmio_write);
+                if page != DATA || replacement.is_some() {
+                    assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x1234_5678);
+                }
+            }
+        }
+        // A new tag elsewhere also changes the map generation.
+        let mut f = Fixture::new(model, true, 0);
+        f.vm.unmap(0x1f000, 0x1000).unwrap();
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.mapped_instruction(&f.code(true, OFFSET));
+        assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+        f.vm.map(0x1f000, 0x1000, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        f.cpu.complete_mmio_write();
+        assert_paged_owner_refused(&mut f);
+    }
+}
+
+#[test]
+fn public_event_refuses_physical_stack_remap() {
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.system_setup();
+        f.cpu.cpu.flags.if_ = true;
+        f.gate(0x30, 0x800, 4);
+        f.mapped_instruction(&[0x90]);
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.cpu.inject_irq(0x30);
+        assert!(matches!(
+            public_step(&mut f),
+            Exit::MmioWrite { addr: 0x87fc, .. }
+        ));
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        f.cpu.complete_mmio_write();
+        assert_paged_owner_refused(&mut f);
+        assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x800));
+        assert_eq!(f.get(0x87fc), 0);
+        assert!(f.cpu.has_pending_irq());
+    }
+}
+
+#[test]
+fn public_ins_refuses_edited_destination_owner() {
+    // Paging §3.4: INS owns all destination/count inputs across the port
+    // handoff and subsequent device store; only completion may change them.
+    for model in MODELS {
+        for rep in [false, true] {
+            for device in [false, true] {
+                for edit in 0..10 {
+                    let mut f = Fixture::new(model, true, 0);
+                    f.cpu.cpu.gpr[7] = u64::from(OFFSET);
+                    f.cpu.cpu.gpr[1] = 2;
+                    if device {
+                        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+                        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+                            .unwrap();
+                    }
+                    f.mapped_instruction(if rep { &[0xf3, 0x6d] } else { &[0x6d] });
+                    assert!(matches!(public_step(&mut f), Exit::PortIo { .. }));
+                    f.cpu.complete_port_in(0x1122_3344);
+                    if device {
+                        assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+                        f.cpu.complete_mmio_write();
+                    }
+                    match edit {
+                        0 => f.cpu.cpu.gpr[7] += 0x10,
+                        1 => f.cpu.cpu.legacy.segments[2].base += 0x1000,
+                        2 => f.cpu.cpu.legacy.cr3 = OTHER_PD,
+                        3 => f.cpu.cpu.gpr[1] += 1,
+                        4 => f.cpu.cpu.flags.df = true,
+                        5 => f.cpu.cpu.port_string_in.as_mut().unwrap().next_index += 0x10,
+                        6 => {
+                            f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+                            f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Ram)
+                                .unwrap();
+                        }
+                        7 => f.cpu.cpu.gpr[2] += 1,
+                        8 if device => f.cpu.cpu.port_string_in.as_mut().unwrap().value = Some(7),
+                        8 => f.cpu.cpu.pending_port_in = Some(4),
+                        9 => f.cpu.cpu.flags.if_ = !f.cpu.cpu.flags.if_,
+                        _ => unreachable!(),
+                    }
+                    let before = f.cpu.cpu.gpr;
+                    let value = f.cpu.cpu.port_string_in.unwrap().value;
+                    assert_paged_owner_refused(&mut f);
+                    assert_eq!(f.cpu.cpu.gpr, before);
+                    assert_eq!(f.get(u64::from(DATA)), 0);
+                    assert_eq!(f.cpu.cpu.port_string_in.unwrap().value, value);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn public_task_incoming_eax_reads_committed_busy_clear() {
+    // SDM Vol 3A §10.3 steps 6, 10, 12 pp. 10-10–12: the incoming
+    // image observes committed saves and the subsequent descriptor CAS.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.incoming_task(OTHER_PD, false);
+        f.system_page(5, 0x11000, 3);
+        let base = BASE + 0x5ff5;
+        f.cpu.cpu.legacy.tr.cache.base = base;
+        f.put64(0x12020, step4_descriptor(base, 0x100, 0x89));
+        f.put(0x12011, OTHER_PD | 0x18);
+        f.cpu.cpu.gpr[0] = 0x1122_338b;
+        f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        assert_eq!(f.get(0x1201d), 0x1122_3389);
+        assert_eq!(f.cpu.cpu.gpr[0], 0x1122_3389);
+        assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+        assert_eq!(f.cpu.cpu.rip, 0x407);
+    }
+}
+
+#[test]
+fn public_held_instruction_refuses_replacement_memory_identity() {
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.mapped_instruction(&f.code(true, OFFSET));
+        assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+        let mut replacement = Fixture::new(model, true, 0);
+        replacement.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        replacement
+            .vm
+            .map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        replacement.mapped_instruction(&replacement.code(true, OFFSET));
+        std::mem::swap(&mut f.vm, &mut replacement.vm);
+        f.cpu.complete_mmio_write();
+        assert_paged_owner_refused(&mut f);
+        assert!(f.cpu.cpu.pending_mmio_write);
+    }
+}
+
+#[test]
+fn public_instruction_and_event_retries_cover_additional_cpu_inputs() {
+    for model in MODELS {
+        for event in [false, true] {
+            for edit in 0..5 {
+                let mut f = Fixture::new(model, true, 0);
+                if event {
+                    f.system_setup();
+                    f.cpu.cpu.flags.if_ = true;
+                    f.gate(0x30, 0x800, 4);
+                    f.mapped_instruction(&[0x90]);
+                    f.cpu.inject_irq(0x30);
+                } else {
+                    f.mapped_instruction(&f.code(true, OFFSET));
+                }
+                f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+                f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+                    .unwrap();
+                assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+                f.cpu.complete_mmio_write();
+                match edit {
+                    0 => f.cpu.cpu.random_state ^= 1,
+                    1 => f.cpu.cpu.source_id ^= 1,
+                    2 => f.cpu.cpu.task_io_map_base ^= 1,
+                    3 => f.cpu.cpu.cpuid_overrides.xcr0 = Some(0),
+                    4 => f.cpu.cpu.flags.if_ = !f.cpu.cpu.flags.if_,
+                    _ => unreachable!(),
+                }
+                let exit = public_step(&mut f);
+                if event {
+                    assert!(
+                        matches!(exit, Exit::BudgetExhausted),
+                        "{model:?}/{edit}: {exit:?}"
+                    );
+                    assert!(!f.cpu.has_pending_irq());
+                    assert_eq!(f.cpu.cpu.rip, 0x401);
+                    assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x800));
+                } else {
+                    assert!(
+                        matches!(exit, Exit::MmioWrite { .. }),
+                        "{model:?}/{edit}: {exit:?}"
+                    );
+                }
+                assert!(!f.cpu.cpu.pending_mmio_write);
+                assert_eq!(f.get(if event { 0x87fc } else { u64::from(DATA) }), 0);
+            }
+        }
     }
 }

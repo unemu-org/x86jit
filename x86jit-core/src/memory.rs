@@ -925,6 +925,9 @@ pub struct Memory {
     // Region tags (prot/kind + bounds). `map()`/`unmap()` mutate this through
     // `&mut self` before execution; per-access lookups read it through `&self`.
     regions: Vec<Region>,
+    // A retained physical plan owns this exact map. Replacing the token on
+    // edits also distinguishes new Memory instances without address reuse or wrap.
+    mapping_identity: Arc<()>,
     // SMC tracking (§10). `code_page[p]` = page `p` backs a translated block, so a
     // write to it must invalidate the cache. Atomic (not `&mut`) because it's set
     // through `&self` at block-resolve time and read on every store — the same
@@ -932,13 +935,7 @@ pub struct Memory {
     // byte ranges written since the last drain; `dirty_flag` lets the hot path skip the lock.
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
-    #[cfg(not(feature = "test-hooks"))]
-    code_page: Box<[AtomicU64]>,
-    #[cfg(feature = "test-hooks")]
     code_page: Arc<Box<[AtomicU64]>>,
-    #[cfg(not(feature = "test-hooks"))]
-    code_aliases: Mutex<CodeAliases>,
-    #[cfg(feature = "test-hooks")]
     code_aliases: Arc<Mutex<CodeAliases>>,
     code_tag_epoch: AtomicU64,
     code_barrier_epoch: AtomicU64,
@@ -986,7 +983,6 @@ unsafe impl Sync for Memory {}
 
 /// Counted source tags for private proofs. Tracking storage can outlive Memory:
 /// a vCPU may be dropped after its VM, or reused with a different VM.
-#[cfg(feature = "test-hooks")]
 pub(crate) struct CodeRegistration {
     code_page: Arc<Box<[AtomicU64]>>,
     aliases: Arc<Mutex<CodeAliases>>,
@@ -994,7 +990,6 @@ pub(crate) struct CodeRegistration {
     pages: BTreeSet<u64>,
 }
 
-#[cfg(feature = "test-hooks")]
 impl Drop for CodeRegistration {
     fn drop(&mut self) {
         let mut aliases = self.aliases.lock().unwrap();
@@ -1568,16 +1563,15 @@ impl Memory {
     ) -> Self {
         let guest_base = backing.guest_base();
         let source_barrier = crate::process_barrier::ProcessBarrier::new();
-        #[cfg(feature = "test-hooks")]
         let code_page = Arc::new(code_page);
         let code_aliases = Mutex::new(CodeAliases::default());
-        #[cfg(feature = "test-hooks")]
         let code_aliases = Arc::new(code_aliases);
         Self {
             model,
             sparse: matches!(backing.owner, Owner::Sparse(_)),
             backing: UnsafeCell::new(backing),
             regions: Vec::new(),
+            mapping_identity: Arc::new(()),
             trap_intervals: Vec::new(),
             code_page,
             code_aliases,
@@ -1682,6 +1676,10 @@ impl Memory {
         })
     }
 
+    pub(crate) fn mapping_identity(&self) -> Arc<()> {
+        self.mapping_identity.clone()
+    }
+
     /// Tag every page spanned by `[addr, addr+len)` as backing translated code
     /// (§10). Called through `&self` when a block is cached, so a later store to
     /// the page is caught. Idempotent.
@@ -1698,7 +1696,6 @@ impl Memory {
         }
     }
 
-    #[cfg(feature = "test-hooks")]
     pub(crate) fn register_code_sources(&self, sources: &[(u64, u32)]) -> CodeRegistration {
         let mut aliases = self.code_aliases.lock().unwrap();
         let pages: BTreeSet<_> = sources
@@ -2481,6 +2478,7 @@ impl Memory {
                         std::ptr::write_bytes(reservation.ptr.add(guest_addr as usize), 0, size)
                     };
                 }
+                self.mapping_identity = Arc::new(());
                 self.regions.push(Region {
                     start: guest_addr,
                     size,
@@ -2571,6 +2569,7 @@ impl Memory {
             .position(|r| r.start == guest_addr && r.size == size)
         {
             Some(pos) => {
+                self.mapping_identity = Arc::new(());
                 let region = self.regions.remove(pos);
                 if region.kind == RegionKind::Trap && size != 0 {
                     let i = self
@@ -5281,7 +5280,6 @@ mod tests {
         // The backing is never accessed; mark/clear only touch the page tables.
         let mut m = Memory::new(MemoryModel::SoftMmu);
         let code_page = fresh_code_pages(0, TOP);
-        #[cfg(feature = "test-hooks")]
         let code_page = Arc::new(code_page);
         m.code_page = code_page;
         m.watch = WatchPages::new(0, TOP);

@@ -18,13 +18,14 @@ use x86jit_core::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
+    PagedP32,
     P32,
     P16,
     Real,
 }
 impl Mode {
     fn bits(self) -> u32 {
-        if self == Self::P32 {
+        if matches!(self, Self::P32 | Self::PagedP32) {
             32
         } else {
             16
@@ -315,7 +316,7 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     cpu.cpu.legacy.gdtr.limit = 0x3f;
     cpu.cpu.legacy.idtr.base = if mode == Mode::Real { 0 } else { 0x3000 };
     cpu.cpu.legacy.idtr.limit = if mode == Mode::Real { 0x3ff } else { 0x7ff };
-    let wide = mode == Mode::P32;
+    let wide = matches!(mode, Mode::P32 | Mode::PagedP32);
     descriptor(&vm, 8, 0, 0xffff_ffff, if wide { 0xc09b } else { 0x809b });
     descriptor(&vm, 16, 0, 0xffff_ffff, if wide { 0xc093 } else { 0x8093 });
     descriptor(&vm, 24, 0x4000, 0xff, 0x82); // LDT
@@ -428,6 +429,20 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     }
     if m == M::Into {
         cpu.cpu.flags.of = true;
+    }
+    if mode == Mode::PagedP32 && !application {
+        // 80386 PRM §5.2 pp. 5-7–11; Intel486 PRM §5.3 pp. 5-18–22:
+        // one identity-mapped directory/table, separate from probe storage.
+        vm.write_bytes(0x1e000, &0x1f007u32.to_le_bytes()).unwrap();
+        for page in 0..32u32 {
+            vm.write_bytes(
+                0x1f000 + u64::from(page * 4),
+                &((page * 0x1000) | 7).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        cpu.cpu.legacy.cr3 = 0x1e000;
+        cpu.cpu.legacy.cr0 |= 0x8000_0000;
     }
     (vm, cpu)
 }
@@ -569,23 +584,40 @@ fn compare(p: &Probe, mode: Mode, cpu: &Vcpu, vm: &Vm) -> String {
 #[test]
 #[ignore = "manual 386 opcode census; emits a TSV runtime artifact"]
 fn runtime_census() {
-    runtime_census_for(CpuModel::I80386);
+    runtime_census_for(CpuModel::I80386, false);
 }
 
 #[test]
 #[ignore = "manual 486 opcode census; emits TSV runtime artifacts"]
 fn runtime_census_i486() {
     for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
-        runtime_census_for(model);
+        runtime_census_for(model, false);
     }
 }
 
-fn runtime_census_for(model: CpuModel) {
+#[test]
+#[ignore = "manual paged P32 opcode census; emits TSV runtime artifacts"]
+fn runtime_census_paged() {
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        runtime_census_for(model, true);
+    }
+}
+
+fn runtime_census_for(model: CpuModel, paged: bool) {
     let mut report = String::from("model\tmode\tbytes\tmnemonic\tshape\tclass\texit\tcomparison\n");
     let mut summary = String::from(
         "model\tmode\tinteger total\texecutes\trefused\tfault\tport I/O\tunknown\tpanic\n",
     );
-    for mode in [Mode::P32, Mode::P16, Mode::Real] {
+    let modes: &[Mode] = if paged {
+        &[Mode::PagedP32]
+    } else {
+        &[Mode::P32, Mode::P16, Mode::Real]
+    };
+    for &mode in modes {
         let mut counts = BTreeMap::<String, usize>::new();
         let mut comparisons = BTreeMap::<String, usize>::new();
         let mut families = BTreeMap::<String, usize>::new();
@@ -702,6 +734,31 @@ fn runtime_census_for(model: CpuModel) {
             0,
             "x87 must not refuse the Machine context in {mode:?}"
         );
+        if paged {
+            // Existing explicit limitations: test-register commands (386 PRM
+            // §10.6.2 p. 10-14; Intel486 PRM §4.5 pp. 4-14–17), and
+            // undefined 16-bit BSWAP (Intel486 PRM §26 p. 26-35).
+            for reason in integer_refusals.keys() {
+                assert!(
+                    matches!(
+                        reason.as_str(),
+                        "Mov/LegacyTlbTest" | "Mov/LegacyCacheTest" | "Bswap/LegacyInstruction"
+                    ),
+                    "unexplained paged refusal: {reason}"
+                );
+            }
+            for category in ["panic", "unknown", "step-error"] {
+                assert_eq!(
+                    counts.get(category).copied().unwrap_or(0),
+                    0,
+                    "{model:?}/{category}"
+                );
+            }
+            // Machine retains the historical F2 string repetition policy;
+            // the Application decoder ignores F2 on MOVS/STOS/LODS. These
+            // same 24 RCX-only comparisons differ in the unpaged census.
+            writeln!(report, "# F2 MOVS/STOS/LODS comparisons retain the unpaged Machine/Application prefix-policy difference").unwrap();
+        }
         let count = |category: &str| counts.get(category).copied().unwrap_or(0);
         let integer_total: usize = counts
             .iter()
@@ -728,7 +785,10 @@ fn runtime_census_for(model: CpuModel) {
     report.push_str(&format!("# INTEGER SUMMARY\n{summary}"));
     let path = std::env::var("CENSUS_386_OUT").unwrap_or_else(|_| {
         std::env::temp_dir()
-            .join(format!("census-{model:?}-runtime.tsv"))
+            .join(format!(
+                "census-{model:?}-runtime{}.tsv",
+                if paged { "-paged" } else { "" }
+            ))
             .display()
             .to_string()
     });

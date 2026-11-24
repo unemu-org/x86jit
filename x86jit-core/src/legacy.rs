@@ -757,7 +757,7 @@ pub enum LegacyOp {
     I486Cpuid {
         signature: u32,
     },
-    /// No cache model: cache operations complete; paging is refused at entry.
+    /// No data-cache model: INVD/WBINVD complete without a cache transfer.
     I486Invalidate,
     /// A Direct block using the shared Real16 walk.
     SharedWalk,

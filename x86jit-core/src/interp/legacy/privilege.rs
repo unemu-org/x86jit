@@ -440,7 +440,7 @@ pub(super) fn call_gate<const ROUTED: bool, const ORDER: u8>(
         let key = PARAMETER_RETRY | (i / per);
         let shift = (i % per) * u64::from(size) * 8;
         if let Some(packed) = cpu.mmio_part(cpu.rip, key) {
-            mem.skip_read(cpu, at, size);
+            mem.skip_read(cpu, at, size)?;
             parameters.push((packed >> shift) & mask(size));
             continue;
         }

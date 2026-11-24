@@ -237,8 +237,8 @@ pub(super) struct Image {
     io_map_base: u16,
     debug_trap: u8,
 }
-#[derive(Clone, Copy)]
-enum Stage {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stage {
     Save(usize),
     ClearBusy,
     ReturnBusy,
@@ -777,6 +777,9 @@ impl Pending {
         mem: &impl LegacyMemory<ROUTED, ORDER>,
     ) -> Result<(), Exit> {
         loop {
+            if mem.paged() {
+                paging::task_phase(mem, self.stage);
+            }
             match self.stage {
                 Stage::Save(i) => {
                     if let Some(&(at, size, value)) = self.stores.get(i) {
@@ -787,6 +790,9 @@ impl Pending {
                     }
                 }
                 Stage::ClearBusy => {
+                    if mem.paged() {
+                        paging::task_saves_complete(cpu, mem)?;
+                    }
                     if self.cause == Cause::Jump {
                         self.clear_busy(cpu, mem)?;
                     }

@@ -141,7 +141,7 @@ fn every_application_mode_still_ignores_legacy_storage() {
 
 #[test]
 #[allow(deprecated)] // Compatibility API witness.
-fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
+fn legacy_debug_entry_refuses_before_any_guest_effect_or_backend_entry() {
     for backend in [
         Box::new(NoBackend) as Box<dyn Backend>,
         Box::new(JitBackend::new()),
@@ -164,8 +164,9 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
         cpu.cpu.rip = 0x1000;
         cpu.cpu.gpr[4] = 0x3000;
         cpu.cpu.flags.if_ = true;
-        // Paging remains an engine facility (CPL 1–3 executes since xj-srh.9).
-        cpu.cpu.legacy.cr0 = 0x8000_0001;
+        // Restored task-debug state is still an unsupported facility.
+        cpu.cpu.legacy.cr0 = 1;
+        cpu.cpu.task_debug_trap = 1;
         cpu.cpu.legacy.cpl = 1;
         // Outstanding and completed device work must remain untouched on refusal.
         cpu.cpu.pending_mmio = Some(0xabcd);
@@ -180,7 +181,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
                 cpu.run(&vm, budget),
                 Exit::UnsupportedSystemContext {
                     addr: 0x1000,
-                    operation: UnsupportedSystemOperation::LegacyEntryFacility,
+                    operation: UnsupportedSystemOperation::LegacyTaskDebugTrap,
                     ..
                 }
             ));
@@ -189,7 +190,7 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
         assert!(matches!(
             cpu.step_instruction(&vm),
             StepResult::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::LegacyEntryFacility,
+                operation: UnsupportedSystemOperation::LegacyTaskDebugTrap,
                 ..
             })
         ));
@@ -200,12 +201,13 @@ fn legacy_run_and_step_refuse_before_any_guest_effect_or_backend_entry() {
             assert!(matches!(
                 run.stop(),
                 StepStop::Exit(Exit::UnsupportedSystemContext {
-                    operation: UnsupportedSystemOperation::LegacyEntryFacility,
+                    operation: UnsupportedSystemOperation::LegacyTaskDebugTrap,
                     ..
                 })
             ));
             unchanged(&cpu, &before, &vm, &bytes);
         }
+        cpu.cpu.task_debug_trap = 0;
         cpu.cpu.legacy.cr0 = 1 << 31;
         assert!(matches!(
             cpu.run(&vm, None),
@@ -573,4 +575,26 @@ fn deprecated_context_types_remain_aliases_of_machine_types() {
     let old_error: LegacyContextError = error;
     let module_error: x86jit_core::legacy::LegacyContextError = old_error;
     assert!(matches!(module_error, LegacyContextError::InvalidPrivilege));
+}
+
+#[test]
+fn application_real16_port_input_ignores_legacy_paging_storage() {
+    let mut vm = setup(Box::new(InterpreterBackend));
+    vm.set_cpu_mode(CpuMode::Real16);
+    vm.write_bytes(0x1000, &[0x6c, 0xf4]).unwrap(); // INSB; HLT
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
+    cpu.cpu.gpr[2] = 0x40;
+    cpu.cpu.gpr[7] = 0x2000;
+    cpu.cpu.legacy.cr0 = u32::MAX;
+    assert!(matches!(cpu.run(&vm, Some(1)), Exit::PortIo { .. }));
+    cpu.complete_port_in(0x77);
+    assert!(matches!(
+        cpu.run(&vm, Some(1)),
+        Exit::Hlt | Exit::BudgetExhausted
+    ));
+    let mut byte = [0];
+    vm.read_bytes(0x2000, &mut byte).unwrap();
+    assert_eq!(byte, [0x77]);
+    assert_eq!(cpu.cpu.legacy.cr0, u32::MAX);
 }

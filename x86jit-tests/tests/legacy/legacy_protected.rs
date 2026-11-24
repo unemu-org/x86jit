@@ -2599,14 +2599,14 @@ mod comparison_attempts {
                 ));
                 cpu.cpu.pending_port_in = None;
             } else {
-                cpu.cpu.legacy.cr0 |= 1 << 31;
+                cpu.cpu.task_debug_trap = 1;
                 let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
                 assert_eq!(run.steps(), 0);
                 assert!(matches!(
                     run.stop(),
                     StepStop::Exit(Exit::UnsupportedSystemContext { .. })
                 ));
-                cpu.cpu.legacy.cr0 &= !(1 << 31);
+                cpu.cpu.task_debug_trap = 0;
             }
             assert_eq!(cpu.cpu.flags, restart_flags);
             assert_eq!(cpu.retired_instructions(), 0);

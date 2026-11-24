@@ -366,7 +366,15 @@ fn cache_tlb_invalidation_privilege_and_register_ud() {
             fixture::fault(&mut cpu, &vm, 6, None);
             let (vm, mut cpu) = setup(model, mode, &[0x0f, 0x08]);
             cpu.cpu.legacy.cr0 |= 0x80000001;
-            refused(&mut cpu, &vm, U::LegacyEntryFacility);
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0);
+            let StepStop::Exit(exit @ Exit::Exception { vector: 14, .. }) = run.stop() else {
+                panic!("{run:?}");
+            };
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                x86jit_core::ErrorCode::bits(0, 7)
+            );
         }
     }
 }
@@ -416,9 +424,9 @@ fn control_bits_and_cache_test_refusals() {
 }
 
 #[test]
-fn cr0_cache_validity_precedes_paging_refusal() {
+fn cr0_cache_validity_precedes_paging_enablement() {
     // Intel486 PRM §12.2.1 Table 12-1 p. 12-3: NW=1/CD=0 is #GP(0),
-    // including when PG and PE are set. Paging itself remains unsupported.
+    // including when PG and PE are set. Valid writes enable paging.
     for model in [CpuModel::I80386, MODELS[0], MODELS[1]] {
         for mode in MODES {
             for value in [0xa000_0011, 0x8000_0011, 0xe000_0011] {
@@ -436,7 +444,8 @@ fn cr0_cache_validity_precedes_paging_refusal() {
                         },
                     );
                 } else {
-                    refused(&mut cpu, &vm, U::LegacyExecution);
+                    fixture::steps(&mut cpu, &vm, 1);
+                    assert_ne!(cpu.cpu.legacy.cr0 & 0x8000_0000, 0);
                 }
             }
         }

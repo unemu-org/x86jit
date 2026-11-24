@@ -1518,7 +1518,6 @@ impl TranslationCache {
     /// Private interpreted proofs use the global source generation rather than
     /// shared dispatch keys. Serialize physical source tagging with SMC drains;
     /// any later invalidation rejects the entire private proof generation.
-    #[cfg(feature = "test-hooks")]
     pub(crate) fn register_private_sources(&self, generation: u64, on_mark: impl FnOnce()) -> bool {
         let _spans = self.spans.write().unwrap();
         if self.publication_generation() != generation {

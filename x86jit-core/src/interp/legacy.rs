@@ -195,12 +195,6 @@ fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
     if cpu.machine_flags_mask != 0 && value & 0x6000_0000 == 0x2000_0000 {
         return Err(exception(cpu, 13));
     }
-    if value & 0x8000_0000 != 0 {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyExecution,
-        ));
-    }
     let changed = cpu.legacy.cr0 != value;
     // SDM Vol 3A §12.9.1; 80386 PRM §14.4.1: enter at CPL 0;
     // the six selector/cache pairs remain intact until explicitly reloaded.
@@ -449,13 +443,17 @@ where
             paging: Default::default(),
         }
     }
-    fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
+    fn skip_read(&self, cpu: &mut CpuState, mut linear: u64, mut bytes: u8) -> Result<(), Exit> {
+        if PAGED {
+            return paging::read(cpu, self, linear, bytes, AccessKind::Read).map(|_| ());
+        }
         while bytes != 0 {
             let (_, part) = legacy::physical_span(cpu, self.physical_mask, linear, bytes);
             self.read_index.set(self.read_index.get() + 1);
             linear = u64::from((linear as u32).wrapping_add(u32::from(part)));
             bytes -= part;
         }
+        Ok(())
     }
 }
 impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> std::ops::Deref
@@ -502,7 +500,7 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     /// The key `read_key` gives the read of `addr` that comes `ahead` reads
     /// after the next one, without moving the cursor.
     fn next_read_key(&self, addr: u64, ahead: u16) -> u64;
-    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8);
+    fn skip_read(&self, cpu: &mut CpuState, linear: u64, bytes: u8) -> Result<(), Exit>;
     fn note_write(&self, _addr: u64, _size: u8) {}
     fn physical_mask(&self) -> u32;
     fn frozen_alias(&self) -> bool {
@@ -535,7 +533,13 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     fn next_read_key(&self, addr: u64, _ahead: u16) -> u64 {
         addr
     }
-    fn skip_read(&self, _cpu: &CpuState, _linear: u64, _bytes: u8) {}
+    fn skip_read(&self, cpu: &mut CpuState, linear: u64, bytes: u8) -> Result<(), Exit> {
+        if Self::PAGED {
+            paging::read(cpu, self, linear, bytes, AccessKind::Read).map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
     fn physical_mask(&self) -> u32 {
         self.memory.physical_mask()
     }
@@ -564,8 +568,12 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     fn next_read_key(&self, addr: u64, ahead: u16) -> u64 {
         self.0.next_read_key(addr, ahead)
     }
-    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
-        self.0.skip_read(cpu, linear, bytes);
+    fn skip_read(&self, cpu: &mut CpuState, linear: u64, bytes: u8) -> Result<(), Exit> {
+        if Self::PAGED {
+            paging::read(cpu, self, linear, bytes, AccessKind::Read).map(|_| ())
+        } else {
+            self.0.skip_read(cpu, linear, bytes)
+        }
     }
     fn physical_mask(&self) -> u32 {
         self.0.physical_mask()
@@ -598,8 +606,8 @@ where
     fn next_read_key(&self, addr: u64, ahead: u16) -> u64 {
         addr | (u64::from(self.read_index.get() + ahead) << 32)
     }
-    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
-        LegacyAccess::skip_read(self, cpu, linear, bytes);
+    fn skip_read(&self, cpu: &mut CpuState, linear: u64, bytes: u8) -> Result<(), Exit> {
+        LegacyAccess::skip_read(self, cpu, linear, bytes)
     }
     fn note_write(&self, addr: u64, size: u8) {
         if let Some(observe) = self.writes {
@@ -1177,8 +1185,8 @@ fn descriptor_at<const ROUTED: bool, const ORDER: u8>(
         cpu.mmio_part(cpu.rip, key),
         cpu.mmio_part(cpu.rip, key | (1 << 32)),
     ) {
-        mem.skip_read(cpu, u64::from(address), 4);
-        mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4);
+        mem.skip_read(cpu, u64::from(address), 4)?;
+        mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4)?;
         return Ok(Descriptor {
             cache: legacy::SegmentCache {
                 base: base_limit as u32,
@@ -1776,13 +1784,14 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     let address = cpu.legacy.idtr.base.wrapping_add(offset);
     let key = DESCRIPTOR_RETRY | (1 << 34) | u64::from(address);
     let low = if let Some(value) = cpu.mmio_part(cpu.rip, key) {
-        mem.skip_read(cpu, u64::from(address), 4);
+        mem.system().skip_read(cpu, u64::from(address), 4)?;
         value as u32
     } else {
         read(cpu, &mem.system(), u64::from(address), 4)? as u32
     };
     let high = if let Some(value) = cpu.mmio_part(cpu.rip, key | (1 << 32)) {
-        mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4);
+        mem.system()
+            .skip_read(cpu, u64::from(address.wrapping_add(4)), 4)?;
         value as u32
     } else {
         read(cpu, &mem.system(), u64::from(address.wrapping_add(4)), 4)? as u32
@@ -3604,14 +3613,9 @@ where
                         ));
                     }
                 }
-                L::I486Invalidate => {
-                    if context.paging_enabled {
-                        return Err(refusal(
-                            cpu,
-                            crate::UnsupportedSystemOperation::LegacyExecution,
-                        ));
-                    }
-                }
+                // Intel486 PRM §26 INVD/WBINVD pp. 26-171, 26-281: operate
+                // on caches. The functional engine models no data cache.
+                L::I486Invalidate => {}
                 L::InvalidatePage { segment, offset } => {
                     // Intel486 PRM §26 INVLPG p. 26-172; SDM Vol 3A
                     // §5.10.4.1 pp. 5-48–49 permits conservative invalidation.
@@ -3706,7 +3710,16 @@ where
                     }
                 }
                 L::Enter { size, alloc, level } => {
-                    prepare_enter_displays(cpu, context, mem.physical_mask, *size, *alloc, *level);
+                    if !PAGED {
+                        prepare_enter_displays(
+                            cpu,
+                            context,
+                            mem.physical_mask,
+                            *size,
+                            *alloc,
+                            *level,
+                        );
+                    }
                     // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
                     // selects frame values independently of stack address size.
                     let stack_mask = mask(context.stack_address_bits / 8);
@@ -3777,7 +3790,7 @@ where
                                 })
                                 .collect::<Vec<_>>()
                         };
-                        let cached = enter_display(cpu, i);
+                        let cached = if PAGED { None } else { enter_display(cpu, i) };
                         let first = mem.read_index.get();
                         let partial = physical
                             .iter()
@@ -3794,7 +3807,7 @@ where
                                         cpu,
                                         u64::from((address as u32).wrapping_add(byte as u32)),
                                         1,
-                                    );
+                                    )?;
                                     0
                                 } else {
                                     read(
@@ -3808,13 +3821,13 @@ where
                             }
                             value
                         } else if cached.is_some() {
-                            mem.skip_read(cpu, address, *size);
+                            mem.skip_read(cpu, address, *size)?;
                             0
                         } else {
                             read(cpu, mem, address, *size)?
                         };
                         let value = cached.unwrap_or(value);
-                        if cached.is_none() {
+                        if !PAGED && cached.is_none() {
                             record_enter_display(
                                 cpu,
                                 mem.physical_mask,

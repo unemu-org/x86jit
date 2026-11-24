@@ -48,8 +48,7 @@ fn cas_hook(memory: &Memory, bus: u64, expected: u32, bits: u32, observed: Optio
     });
 }
 
-// Only an already-paged private interpreter reaches this helper. Public
-// PG-setting writes continue through write_cr0 and its facility refusal.
+// The paged adapter retains the same control-write validation as PG=0.
 #[cold]
 #[inline(never)]
 pub(super) fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
@@ -186,6 +185,19 @@ fn table_bus<const ROUTED: bool, const ORDER: u8>(
             cpu,
             crate::UnsupportedSystemOperation::PagingTableStorage,
         )),
+        Err(_)
+            if (0..4).any(|byte| {
+                matches!(
+                    mem.raw().region_kind(bus + byte, 1),
+                    Ok(crate::RegionKind::Trap | crate::RegionKind::Rom)
+                )
+            }) =>
+        {
+            Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::PagingTableStorage,
+            ))
+        }
         Err(trap) => Err(bus_failure(
             cpu,
             trap,
@@ -438,6 +450,10 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
                 u64::from(translation.physical),
                 translation.bytes,
             );
+            let bytes = mem
+                .raw()
+                .region_end(bus)
+                .map_or(bytes, |end| u64::from(bytes).min(end - bus) as u8);
             fragments.push(Fragment {
                 linear,
                 bus,
@@ -447,24 +463,6 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
                 dirty_complete: translation.pte & DIRTY != 0,
             });
             consumed += bytes;
-        }
-        // Paging design §§3.4, 5 step 5: a split device operand needs a stable
-        // plan and operand snapshot across handoffs. Refuse before any transfer
-        // or D update until that continuation exists, including region splits
-        // inside a single translated page.
-        let device = fragments.iter().any(|f| {
-            (0..f.bytes).any(|byte| {
-                mem.raw().region_kind(f.bus + u64::from(byte), 1) == Ok(crate::RegionKind::Trap)
-            })
-        });
-        if device
-            && (fragments.len() != 1
-                || mem.raw().region_kind(fragments[0].bus, size) != Ok(crate::RegionKind::Trap))
-        {
-            return Err(refusal(
-                cpu,
-                crate::UnsupportedSystemOperation::PagingSplitDevice,
-            ));
         }
         if access == AccessKind::Write {
             for fragment in &fragments {
@@ -492,6 +490,186 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+fn commit_ram<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+) -> Result<(), Exit> {
+    let mut tx = mem.transaction().expect("paged transaction").borrow_mut();
+    let linears: Vec<_> = tx
+        .plans
+        .iter()
+        .flat_map(|(_, spans)| spans)
+        .map(|f| (f.bus, f.linear))
+        .collect();
+    for (bus, bytes, value, committed) in &mut tx.writes {
+        if !*committed {
+            if let Err(trap) = mem.raw().write(*bus, *value, *bytes) {
+                let linear = linears.iter().find(|f| f.0 == *bus).map_or(0, |f| f.1);
+                let StepResult::Exit(exit) =
+                    trap_out(cpu, cpu.rip, trap, *bus, *bytes, AccessKind::Write, *value)
+                        .into_step()
+                else {
+                    unreachable!()
+                };
+                let mut exit = crate::fault::qualify_legacy_bus(exit, u64::from(linear), *bus);
+                if let Exit::UnmappedMemory {
+                    metadata: Some(m), ..
+                } = &mut exit
+                {
+                    m.progress.ram = MemoryEffects::PossiblyPartial;
+                    m.progress.acknowledged = mmio_evidence(cpu);
+                    if !m.progress.acknowledged.is_empty() {
+                        m.progress.device = MemoryEffects::PossiblyPartial;
+                    }
+                }
+                return Err(exit);
+            }
+            mem.note_write(*bus, *bytes);
+            *committed = true;
+        }
+    }
+    Ok(())
+}
+
+// Transfer visits belong to one retained instruction/iteration. Separate read
+// and write cursors distinguish two accesses even when their bus bytes alias.
+fn transfer_read<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    f: &Fragment,
+) -> Result<u64, Exit> {
+    let Some(cell) = mem.transaction() else {
+        return read_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes);
+    };
+    let index = {
+        let mut tx = cell.borrow_mut();
+        let i = tx.read_cursor;
+        tx.read_cursor += 1;
+        i
+    };
+    if preparing(mem) {
+        let result = read_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes);
+        cell.borrow_mut()
+            .prepared_reads
+            .push((f.bus, f.bytes, result.as_ref().ok().copied()));
+        return result;
+    }
+    if let Some(&(bus, bytes, value)) = cell.borrow().reads.get(index) {
+        if (bus, bytes) != (f.bus, f.bytes) {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyEntryFacility,
+            ));
+        }
+        return Ok(value);
+    }
+    let prepared = cell.borrow().prepared_reads.get(index).copied();
+    let mut value = if let Some((bus, bytes, Some(value))) = prepared {
+        if (bus, bytes) != (f.bus, f.bytes) {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyEntryFacility,
+            ));
+        }
+        value
+    } else {
+        match mem.raw().read(f.bus, f.bytes) {
+            Ok(value) => value,
+            Err(MemTrap::Mmio) if cpu.pending_mmio.is_some() => {
+                let value = cpu.pending_mmio.take().unwrap() & mask(f.bytes);
+                cpu.record_mmio_part(cpu.rip, f.bus | ((index as u64) << 32), value);
+                value
+            }
+            Err(trap) => return Err(transfer_failure(cpu, mem, trap, f, AccessKind::Read, 0)),
+        }
+    } & mask(f.bytes);
+    // A later read in ENTER or a task save sees this attempt's staged RAM.
+    let mut tx = cell.borrow_mut();
+    for byte in 0..f.bytes {
+        for &(bus, bytes, stored, committed) in tx.writes.iter().rev() {
+            let at = f.bus + u64::from(byte);
+            if !committed && (bus..bus + u64::from(bytes)).contains(&at) {
+                let shift = byte * 8;
+                value =
+                    (value & !(0xff << shift)) | (((stored >> ((at - bus) * 8)) & 0xff) << shift);
+                break;
+            }
+        }
+    }
+    tx.reads.push((f.bus, f.bytes, value));
+    Ok(value)
+}
+
+fn transfer_failure<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    trap: MemTrap,
+    f: &Fragment,
+    access: AccessKind,
+    value: u64,
+) -> Exit {
+    if trap == MemTrap::Mmio {
+        if let Some(tx) = mem.transaction() {
+            tx.borrow_mut().pending_mmio_linear = Some(f.linear);
+        }
+    }
+    let StepResult::Exit(exit) =
+        trap_out(cpu, cpu.rip, trap, f.bus, f.bytes, access, value).into_step()
+    else {
+        unreachable!()
+    };
+    crate::fault::qualify_legacy_bus(exit, u64::from(f.linear), f.bus)
+}
+
+fn transfer_write<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    f: &Fragment,
+    value: u64,
+) -> Result<(), Exit> {
+    let Some(cell) = mem.transaction() else {
+        return write_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes, value);
+    };
+    let value = value & mask(f.bytes);
+    let index = {
+        let mut tx = cell.borrow_mut();
+        let i = tx.write_cursor;
+        tx.write_cursor += 1;
+        i
+    };
+    if let Some(&(bus, bytes, stored, _)) = cell.borrow().writes.get(index) {
+        if (bus, bytes, stored) != (f.bus, f.bytes, value) {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyEntryFacility,
+            ));
+        }
+        return Ok(());
+    }
+    let device = mem.raw().region_kind(f.bus, f.bytes) == Ok(crate::RegionKind::Trap);
+    if device {
+        if cpu.pending_mmio_write {
+            cpu.pending_mmio_write = false;
+            cpu.record_mmio_part(cpu.rip, f.bus | ((index as u64) << 32) | (1 << 63), value);
+            mem.raw().note_write(f.bus, usize::from(f.bytes));
+            mem.note_write(f.bus, f.bytes);
+        } else {
+            return Err(transfer_failure(
+                cpu,
+                mem,
+                MemTrap::Mmio,
+                f,
+                AccessKind::Write,
+                value,
+            ));
+        }
+    }
+    cell.borrow_mut()
+        .writes
+        .push((f.bus, f.bytes, value, device));
+    Ok(())
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
@@ -504,12 +682,12 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     let fragments = plan(cpu, mem, addr, size, access, false)?;
     let mut value = 0;
     for f in fragments {
-        let part = match read_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes) {
+        let part = match transfer_read(cpu, mem, &f) {
             Err(Exit::MmioRead { .. }) if preparing(mem) => {
-                if !mem.transaction().unwrap().borrow().device_dummy {
+                if mem.supervisor() || !mem.transaction().unwrap().borrow().device_dummy {
                     return Err(refusal(
                         cpu,
-                        crate::UnsupportedSystemOperation::PagingSplitDevice,
+                        crate::UnsupportedSystemOperation::LegacyInstruction,
                     ));
                 }
                 0
@@ -517,7 +695,7 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
             other => other?,
         };
         let part = if preparing(mem) {
-            let tx = mem.transaction().unwrap().borrow();
+            let mut tx = mem.transaction().unwrap().borrow_mut();
             let mut part = part;
             for byte in 0..f.bytes {
                 if let Some((_, value)) = tx
@@ -528,6 +706,11 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
                 {
                     let shift = byte * 8;
                     part = (part & !(0xff << shift)) | (u64::from(*value) << shift);
+                }
+            }
+            if let Some((_, _, snapshot)) = tx.prepared_reads.last_mut() {
+                if snapshot.is_some() {
+                    *snapshot = Some(part);
                 }
             }
             part
@@ -560,14 +743,7 @@ pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
             }
             continue;
         }
-        write_physical(
-            cpu,
-            mem,
-            u64::from(f.linear),
-            f.bus,
-            f.bytes,
-            value >> f.shift,
-        )?;
+        transfer_write(cpu, mem, &f, value >> f.shift)?;
     }
     Ok(())
 }
@@ -614,8 +790,20 @@ pub(super) fn check_write_permission<const ROUTED: bool, const ORDER: u8>(
 // Fetch performs the same read-permission walk but retains execute metadata.
 // 80386 PRM §9.8.14 Fig. 9-8 pp. 9-17–18; Intel486 PRM §9.9.14
 // Fig. 9-7 pp. 9-21–22: no I/D bit exists on these models.
-#[cfg(feature = "test-hooks")]
 pub(crate) fn fetch_bus_for_test(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    linear: u32,
+    wrote: &Cell<bool>,
+) -> Result<u64, Exit> {
+    if memory.host_fault_recovery() {
+        fetch_bus::<true>(cpu, memory, linear, wrote)
+    } else {
+        fetch_bus::<false>(cpu, memory, linear, wrote)
+    }
+}
+
+fn fetch_bus<const ROUTED: bool>(
     cpu: &mut CpuState,
     memory: &Memory,
     linear: u32,
@@ -627,7 +815,7 @@ pub(crate) fn fetch_bus_for_test(
         Privilege::Supervisor
     };
     let observe = |_, _| wrote.set(true);
-    let mut mem = LegacyAccess::<false, 0, true>::new(memory, u32::MAX);
+    let mut mem = LegacyAccess::<ROUTED, 0, true>::new(memory, u32::MAX);
     mem.writes = Some(&observe);
     let t = translate_linear(cpu, &mem, linear, 1, AccessKind::Execute, privilege, true)?;
     Ok(legacy::physical_span(cpu, u32::MAX, u64::from(t.physical), 1).0)
@@ -723,18 +911,152 @@ struct PlanKey {
 
 // One instruction/REP iteration owns these spans. No page-table lookup after
 // the first operand store: operand bytes may themselves alias a later PTE.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) struct PortPlan {
-    owner: u64,
+    inputs: Box<CpuState>,
+    mapping_identity: std::sync::Arc<()>,
     spans: Vec<Fragment>,
+    completed: usize,
+    pending_mmio_linear: Option<u32>,
+}
+
+impl PortPlan {
+    pub(crate) fn pending_mmio_linear_address(&self) -> Option<u32> {
+        self.pending_mmio_linear
+    }
+    pub(crate) fn matches_owner(&self, cpu: &CpuState, memory: &Memory) -> bool {
+        let Some(p) = cpu.port_string_in else {
+            return false;
+        };
+        matches_cpu_inputs(&self.inputs, cpu)
+            && std::sync::Arc::ptr_eq(&self.mapping_identity, &memory.mapping_identity())
+            && self.inputs.pending_mmio == cpu.pending_mmio
+            && (self.pending_mmio_linear.is_some()
+                || self.inputs.pending_mmio_write == cpu.pending_mmio_write)
+            && self.inputs.port_string_in.is_some_and(|owner| {
+                // Only the requested port value may change the retained handoff.
+                owner.rip == p.rip
+                    && owner.next_ip == p.next_ip
+                    && owner.instruction_end == p.instruction_end
+                    && owner.base == p.base
+                    && owner.offset == p.offset
+                    && owner.next_index == p.next_index
+                    && owner.next_count == p.next_count
+                    && owner.addr_bits == p.addr_bits
+                    && owner.elem == p.elem
+                    && owner.rep == p.rep
+                    && match (owner.value, p.value, cpu.pending_port_in) {
+                        (None, None, Some(size)) => size == p.elem,
+                        (None, Some(_), None) => true,
+                        (Some(before), Some(after), None) => before == after,
+                        _ => false,
+                    }
+            })
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Transaction {
+    mapping_identity: Option<std::sync::Arc<()>>,
     plans: Vec<(PlanKey, Vec<Fragment>)>,
     overlay: Vec<(u64, u8)>,
     preparing: bool,
     device_dummy: bool,
+    reads: Vec<(u64, u8, u64)>,
+    prepared_reads: Vec<(u64, u8, Option<u64>)>,
+    writes: Vec<(u64, u8, u64, bool)>,
+    read_cursor: usize,
+    write_cursor: usize,
+    inputs: Option<Box<CpuState>>,
+    task_phase: Option<(tasks::Stage, usize, usize)>,
+    pending_mmio_linear: Option<u32>,
+}
+
+impl Transaction {
+    pub(crate) fn matches_memory(&self, memory: &Memory) -> bool {
+        same_arc(&self.mapping_identity, &Some(memory.mapping_identity()))
+    }
+
+    pub(crate) fn pending_mmio_linear_address(&self) -> Option<u32> {
+        self.pending_mmio_linear
+    }
+
+    pub(crate) fn matches_inputs(&self, cpu: &CpuState) -> bool {
+        let Some(inputs) = &self.inputs else {
+            return true;
+        };
+        matches_cpu_inputs(inputs, cpu)
+    }
+}
+
+fn matches_cpu_inputs(inputs: &CpuState, cpu: &CpuState) -> bool {
+    macro_rules! same {
+            ($($field:ident),* $(,)?) => {{
+                let CpuState {
+                    $($field: _,)*
+                    flags: _, fpu_pad: _, pending_port_in: _,
+                    pending_mmio: _, pending_mmio_write: _, port_string_in: _,
+                    mmio_parts: _, mmio_parts_len: _, mmio_parts_rip: _,
+                    mmio_retry_active: _, mmio_retry_cs: _,
+                    cpuid_table: _, cpu_source: _,
+                } = cpu;
+                true $(&& inputs.$field == cpu.$field)*
+            }};
+        }
+    // Completion slots and the transfer ledger are outputs of the bus handoff.
+    // Numeric and system inputs own the retained image just as GPRs do.
+    same!(
+        gpr,
+        rip,
+        rflags_system,
+        legacy,
+        cs,
+        ds,
+        es,
+        ss,
+        fs,
+        gs,
+        fs_base,
+        gs_base,
+        xmm,
+        ymm_hi,
+        zmm_hi,
+        kmask,
+        mxcsr,
+        fpr,
+        fpu_top,
+        fpu_cw,
+        fpu_sw,
+        fpu_empty,
+        fpu_fip,
+        fpu_fdp,
+        fpu_fop,
+        fpu_fcs,
+        fpu_fds,
+        fpu_model,
+        fpu_emulation,
+        x87_precision,
+        x87_pointer_model,
+        features,
+        machine_flags_mask,
+        debug_test_registers,
+        numeric_error_route,
+        external_numeric_error,
+        task_io_map_base,
+        task_debug_trap,
+        cpuid_overrides,
+        source_id,
+        random_state,
+    ) && inputs.flags == cpu.flags
+        && same_arc(&inputs.cpuid_table, &cpu.cpuid_table)
+        && same_arc(&inputs.cpu_source, &cpu.cpu_source)
+}
+
+fn same_arc<T: ?Sized>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn preparing<const ROUTED: bool, const ORDER: u8>(mem: &impl LegacyMemory<ROUTED, ORDER>) -> bool {
@@ -748,29 +1070,7 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     tx: &std::cell::RefCell<Transaction>,
 ) -> Result<bool, Exit> {
-    let tx = tx.borrow();
-    // Multiple device operands need retained completions across handoffs (design
-    // §5 step 5). Preflight has already selected any later #PF before refusal.
-    let device = tx.plans.iter().any(|(_, spans)| {
-        spans.iter().any(|f| {
-            (0..f.bytes).any(|b| {
-                mem.raw().region_kind(f.bus + u64::from(b), 1) == Ok(crate::RegionKind::Trap)
-            })
-        })
-    });
-    if device {
-        let first = &tx.plans[0].0;
-        if tx
-            .plans
-            .iter()
-            .any(|(k, _)| k.addr != first.addr || k.size != first.size || k.cr3 != first.cr3)
-        {
-            return Err(refusal(
-                cpu,
-                crate::UnsupportedSystemOperation::PagingSplitDevice,
-            ));
-        }
-    }
+    let mut tx = tx.borrow_mut();
     let mut dirtied = false;
     for (key, spans) in &tx.plans {
         if key.access != AccessKind::Write {
@@ -795,6 +1095,15 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
     }
     // A source can alias a PTE whose D bit was just set. Re-evaluate the
     // prepared instruction with those physical walk writes already visible.
+    if !dirtied {
+        for (key, spans) in &mut tx.plans {
+            if key.access == AccessKind::Write {
+                for f in spans {
+                    f.dirty_complete = true;
+                }
+            }
+        }
+    }
     Ok(!dirtied)
 }
 
@@ -813,8 +1122,48 @@ pub(super) fn execute<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
 where
     PagingMode<PAGED>: PagingStorage,
 {
+    execute_with_retry(
+        block,
+        ir,
+        cpu,
+        original,
+        temps,
+        context,
+        task_switch,
+        &mut None,
+    )
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_with_retry<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+    block: &IrBlock,
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    original: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
+    temps: &mut [u64],
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+) -> Result<(Outcome, Option<PortPlan>), Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     loop {
-        let tx = std::cell::RefCell::new(Transaction {
+        if retry
+            .as_ref()
+            .is_some_and(|tx| !tx.matches_memory(original.raw()))
+        {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyEntryFacility,
+            ));
+        }
+        let retained = retry.take();
+        let resuming = retained.is_some();
+        let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| Transaction {
+            mapping_identity: Some(original.raw().mapping_identity()),
             preparing: true,
             device_dummy: ir.ops.iter().all(|op| match op {
                 IrOp::Legacy(op) => matches!(
@@ -827,42 +1176,72 @@ where
                         | L::Pop { .. }
                         | L::AdjustStack { .. }
                         | L::String { .. }
+                        | L::Enter { .. }
+                        | L::Leave { .. }
+                        | L::All { .. }
+                        | L::Flags { .. }
+                        | L::Table { .. }
+                        | L::Privileged { .. }
+                        | L::LoadMsw { .. }
+                        | L::Coprocessor { .. }
+                        | L::CoprocessorOverrun { .. }
                 ),
                 IrOp::Jump { .. } | IrOp::Branch { .. } => false,
                 _ => true,
             }),
             ..Transaction::default()
-        });
+        }));
+        {
+            let mut tx = tx.borrow_mut();
+            // Task continuations resume their saved phase; ordinary instructions
+            // replay from their checkpoint and consume their earlier visits.
+            let task_resume = resuming && task_switch.context().is_some();
+            let (read, write) = if task_resume {
+                tx.task_phase
+                    .map_or((tx.reads.len(), tx.writes.len()), |(_, read, write)| {
+                        (read, write)
+                    })
+            } else {
+                (0, 0)
+            };
+            tx.read_cursor = read;
+            tx.write_cursor = write;
+        }
         let mut mem =
             LegacyAccess::<ROUTED, ORDER, true>::new(&original.access.0, original.physical_mask);
         mem.writes = original.writes;
         mem.paging = Some(&tx);
-        let mut preview_cpu = cpu.clone();
-        let mut preview_tasks = task_switch.clone();
-        let mut preview_temps = temps.to_vec();
-        let preview = execute_instruction::<ROUTED, ORDER, true>(
-            block,
-            ir,
-            &mut preview_cpu,
-            &mem,
-            &mut preview_temps,
-            context,
-            &mut preview_tasks,
-        );
-        if let Err(exit) = preview {
-            if !preview_tasks.committed {
-                publish_cr2(cpu, &exit);
-                return Err(exit);
+        if !resuming {
+            let mut preview_cpu = cpu.clone();
+            let mut preview_tasks = task_switch.clone();
+            let mut preview_temps = temps.to_vec();
+            let preview = execute_instruction::<ROUTED, ORDER, true>(
+                block,
+                ir,
+                &mut preview_cpu,
+                &mem,
+                &mut preview_temps,
+                context,
+                &mut preview_tasks,
+            );
+            if let Err(exit) = preview {
+                if !preview_tasks.committed {
+                    publish_cr2(cpu, &exit);
+                    return Err(exit);
+                }
+                // Hardware task switches have their own commit boundary. Replay the
+                // outgoing saves and incoming commit even when the new task faults
+                // (80386 PRM §7.5 pp. 7-8–9; design §3.7).
             }
-            // Hardware task switches have their own commit boundary. Replay the
-            // outgoing saves and incoming commit even when the new task faults
-            // (80386 PRM §7.5 pp. 7-8–9; design §3.7).
+            if !finish_plan(cpu, &mem, &tx)? {
+                continue;
+            }
+            let mut tx = tx.borrow_mut();
+            tx.preparing = false;
+            tx.read_cursor = 0;
         }
-        if !finish_plan(cpu, &mem, &tx)? {
-            continue;
-        }
-        tx.borrow_mut().preparing = false;
-        let outcome = execute_instruction::<ROUTED, ORDER, true>(
+        let before_commit = cpu.clone();
+        let result = execute_instruction::<ROUTED, ORDER, true>(
             block,
             ir,
             cpu,
@@ -870,7 +1249,35 @@ where
             temps,
             context,
             task_switch,
-        )?;
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(exit) => {
+                if matches!(
+                    exit,
+                    Exit::MmioRead { .. } | Exit::MmioWrite { .. } | Exit::UnmappedMemory { .. }
+                ) {
+                    tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
+                    *retry = Some(tx.into_inner());
+                }
+                return Err(exit);
+            }
+        };
+        // RAM stores commit only after every irreversible device transfer has
+        // completed. Reads below see the staged stores in instruction order.
+        let next_ip = cpu.rip;
+        if !task_switch.committed {
+            cpu.rip = before_commit.rip;
+        }
+        if let Err(exit) = commit_ram(cpu, &mem) {
+            if !task_switch.committed {
+                restore_destinations(cpu, before_commit);
+            }
+            tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
+            *retry = Some(tx.into_inner());
+            return Err(exit);
+        }
+        cpu.rip = next_ip;
         let input = cpu.port_string_in.map(|p| {
             let linear = (p.base as u32).wrapping_add(p.offset as u32);
             let spans = tx
@@ -884,8 +1291,11 @@ where
                 .1
                 .clone();
             PortPlan {
-                owner: p.rip,
+                inputs: Box::new(cpu.clone()),
+                mapping_identity: original.raw().mapping_identity(),
                 spans,
+                completed: 0,
+                pending_mmio_linear: None,
             }
         });
         return Ok((outcome, input));
@@ -932,6 +1342,13 @@ pub(super) fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     probe_descriptor_cas(cpu, mem, address)?;
     if preparing(mem) {
         let observed = read(cpu, mem, u64::from(address), 1, AccessKind::Write)?;
+        // The committing phase uses a physical CAS rather than an operand
+        // read visit. Keep the ordinary operand snapshot cursor aligned.
+        if let Some(tx) = mem.transaction() {
+            let mut tx = tx.borrow_mut();
+            tx.prepared_reads.pop();
+            tx.read_cursor -= 1;
+        }
         if observed == expected {
             write(cpu, mem, u64::from(address), 1, value)?;
         }
@@ -994,10 +1411,23 @@ pub(super) fn locked<const ROUTED: bool, const ORDER: u8>(
     }
     // SDM Vol 3A §11.1.2.2 pp. 11-4–5; design §3.4: one retained
     // snapshot for the scatter operand, with the existing single-vCPU contract.
-    // Split device shapes were refused by plan before any transfer/D update.
+    // The transaction retains reads and completed writes across bus handoffs.
     let old = read(cpu, mem, linear, size, AccessKind::Write)?;
     write(cpu, mem, linear, size, update.apply(old, src, size))?;
     Ok(old)
+}
+
+// Architectural rollback must not resurrect an already consumed device answer.
+// The translated transaction and its transfer visits live outside CpuState.
+fn restore_destinations(cpu: &mut CpuState, mut before: CpuState) {
+    std::mem::swap(&mut before.pending_mmio, &mut cpu.pending_mmio);
+    std::mem::swap(&mut before.pending_mmio_write, &mut cpu.pending_mmio_write);
+    std::mem::swap(&mut before.mmio_parts, &mut cpu.mmio_parts);
+    std::mem::swap(&mut before.mmio_parts_len, &mut cpu.mmio_parts_len);
+    std::mem::swap(&mut before.mmio_parts_rip, &mut cpu.mmio_parts_rip);
+    std::mem::swap(&mut before.mmio_retry_active, &mut cpu.mmio_retry_active);
+    std::mem::swap(&mut before.mmio_retry_cs, &mut cpu.mmio_retry_cs);
+    *cpu = before;
 }
 
 struct FpBuffer {
@@ -1061,7 +1491,7 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
         for offset in (0..bytes).step_by(8) {
             let linear = u64::from((address as u32).wrapping_add(offset as u32));
             if let Err(exit) = probe(cpu, mem, linear, (bytes - offset).min(8) as u8) {
-                *cpu = before;
+                restore_destinations(cpu, before);
                 return Err(exit);
             }
         }
@@ -1072,7 +1502,7 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
             value[..size].copy_from_slice(&data[offset..offset + size]);
             let linear = u64::from((address as u32).wrapping_add(offset as u32));
             if let Err(exit) = write(cpu, mem, linear, size as u8, u64::from_le_bytes(value)) {
-                *cpu = before;
+                restore_destinations(cpu, before);
                 return Err(exit);
             }
         }
@@ -1088,73 +1518,151 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     context: MachineContext,
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
 ) -> Result<(), Exit> {
     loop {
-        let tx = std::cell::RefCell::new(Transaction {
+        if retry.as_ref().is_some_and(|tx| !tx.matches_memory(memory)) {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::LegacyEntryFacility,
+            ));
+        }
+        let retained = retry.take();
+        let resuming = retained.is_some();
+        let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| Transaction {
+            mapping_identity: Some(memory.mapping_identity()),
             preparing: true,
             ..Transaction::default()
-        });
+        }));
+        {
+            let mut tx = tx.borrow_mut();
+            // Task continuations resume their saved phase; ordinary instructions
+            // replay from their checkpoint and consume their earlier visits.
+            let task_resume = resuming && task_switch.context().is_some();
+            let (read, write) = if task_resume {
+                tx.task_phase
+                    .map_or((tx.reads.len(), tx.writes.len()), |(_, read, write)| {
+                        (read, write)
+                    })
+            } else {
+                (0, 0)
+            };
+            tx.read_cursor = read;
+            tx.write_cursor = write;
+        }
         let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
         mem.paging = Some(&tx);
-        let mut preview_cpu = cpu.clone();
-        let mut preview_tasks = task_switch.clone();
-        let preview = if preview_tasks.context().is_some() {
-            tasks::resume(&mut preview_cpu, &mem.address_keyed(), &mut preview_tasks)
-        } else {
-            deliver(&mut preview_cpu, &mem, context, event, &mut preview_tasks)
-        };
-        if let Err(exit) = preview {
-            if !preview_tasks.committed {
-                publish_cr2(cpu, &exit);
-                return Err(exit);
+        if !resuming {
+            let mut preview_cpu = cpu.clone();
+            let mut preview_tasks = task_switch.clone();
+            let preview = if preview_tasks.context().is_some() {
+                tasks::resume(&mut preview_cpu, &mem.address_keyed(), &mut preview_tasks)
+            } else {
+                deliver(&mut preview_cpu, &mem, context, event, &mut preview_tasks)
+            };
+            if let Err(exit) = preview {
+                if !preview_tasks.committed {
+                    publish_cr2(cpu, &exit);
+                    return Err(exit);
+                }
             }
+            if !finish_plan(cpu, &mem, &tx)? {
+                continue;
+            }
+            let mut tx = tx.borrow_mut();
+            tx.preparing = false;
+            tx.read_cursor = 0;
         }
-        if !finish_plan(cpu, &mem, &tx)? {
-            continue;
-        }
-        tx.borrow_mut().preparing = false;
         task_switch.committed = false;
         task_switch.completed = false;
-        let result = if task_switch.context().is_some() {
+        let before_commit = cpu.clone();
+        let mut result = if task_switch.context().is_some() {
             tasks::resume(cpu, &mem.address_keyed(), task_switch)
         } else {
             deliver(cpu, &mem, context, event, task_switch)
         };
+        if result.is_ok() {
+            let next_ip = cpu.rip;
+            if !task_switch.committed {
+                cpu.rip = before_commit.rip;
+            }
+            if let Err(exit) = commit_ram(cpu, &mem) {
+                if !task_switch.committed {
+                    restore_destinations(cpu, before_commit);
+                }
+                result = Err(exit);
+            } else {
+                cpu.rip = next_ip;
+            }
+        }
         if let Err(exit) = &result {
             publish_cr2(cpu, exit);
+            if matches!(
+                exit,
+                Exit::MmioRead { .. } | Exit::MmioWrite { .. } | Exit::UnmappedMemory { .. }
+            ) {
+                tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
+                *retry = Some(tx.into_inner());
+            }
         }
         return result;
     }
 }
 
-#[cfg(feature = "test-hooks")]
 #[cold]
 #[inline(never)]
-pub(crate) fn finish_port_input(
+pub(crate) fn finish_port_input<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     memory: &Memory,
     plan: &mut Option<PortPlan>,
 ) -> Result<(), Exit> {
     let p = cpu.port_string_in.expect("pending input iteration");
+    let saved = plan
+        .as_mut()
+        .filter(|saved| saved.matches_owner(cpu, memory))
+        .ok_or_else(|| refusal(cpu, crate::UnsupportedSystemOperation::LegacyEntryFacility))?;
     let Some(value) = p.value else {
         return Err(Exit::port_io(cpu.gpr[RDX] as u16, p.elem, PortDir::In, 0));
     };
-    let mem = LegacyAccess::<false, 0, true>::new(memory, u32::MAX);
-    let saved = plan
-        .as_ref()
-        .filter(|saved| saved.owner == p.rip)
-        .ok_or_else(|| refusal(cpu, crate::UnsupportedSystemOperation::LegacyEntryFacility))?;
+    saved.inputs.port_string_in.as_mut().unwrap().value = Some(value);
+    let mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
     // The port read is irreversible. Retain this iteration's translated spans
     // over the handoff, even if the embedder edits its PTEs before completion.
-    for f in &saved.spans {
-        write_physical(
-            cpu,
-            &mem,
-            u64::from(f.linear),
-            f.bus,
-            f.bytes,
-            value >> f.shift,
-        )?;
+    while saved.completed < saved.spans.len() {
+        let f = &saved.spans[saved.completed];
+        let value = (value >> f.shift) & mask(f.bytes);
+        if mem.raw().region_kind(f.bus, f.bytes) == Ok(crate::RegionKind::Trap) {
+            if !cpu.pending_mmio_write {
+                saved.pending_mmio_linear = Some(f.linear);
+                return Err(transfer_failure(
+                    cpu,
+                    &mem,
+                    MemTrap::Mmio,
+                    f,
+                    AccessKind::Write,
+                    value,
+                ));
+            }
+            cpu.pending_mmio_write = false;
+            cpu.record_mmio_part(
+                cpu.rip,
+                f.bus | ((saved.completed as u64) << 32) | (1 << 63),
+                value,
+            );
+            mem.raw().note_write(f.bus, usize::from(f.bytes));
+        } else if let Err(trap) = mem.raw().write(f.bus, value, f.bytes) {
+            return Err(transfer_failure(
+                cpu,
+                &mem,
+                trap,
+                f,
+                AccessKind::Write,
+                value,
+            ));
+        }
+        mem.note_write(f.bus, f.bytes);
+        saved.completed += 1;
+        saved.pending_mmio_linear = None;
     }
     *plan = None;
     cpu.write_gpr(RDI, p.next_index, p.addr_bits / 8);
@@ -1167,12 +1675,46 @@ pub(crate) fn finish_port_input(
     Ok(())
 }
 
+// A task phase can contain several reads (the incoming image or a segment
+// descriptor). Retry that phase's visits without replaying earlier phases.
+#[cold]
+#[inline(never)]
+pub(super) fn task_phase<const ROUTED: bool, const ORDER: u8>(
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    stage: tasks::Stage,
+) {
+    if preparing(mem) {
+        return;
+    }
+    let mut tx = mem
+        .transaction()
+        .expect("paged task transaction")
+        .borrow_mut();
+    if tx.task_phase.is_none_or(|(old, _, _)| old != stage) {
+        tx.task_phase = Some((stage, tx.read_cursor, tx.write_cursor));
+    }
+}
+
+// SDM Vol 3A §10.3 steps 6, 10 pp. 10-10–11: outgoing saves precede
+// clearing the outgoing busy bit, even when their physical storage overlaps.
+#[cold]
+#[inline(never)]
+pub(super) fn task_saves_complete<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+) -> Result<(), Exit> {
+    if preparing(mem) {
+        return Ok(());
+    }
+    commit_ram(cpu, mem)
+}
+
 // Task switches have an architectural commit seam; ordinary instruction
 // preflight must stop there rather than roll an incoming-task fault back.
 #[cold]
 #[inline(never)]
 pub(super) fn task_commit<const ROUTED: bool, const ORDER: u8>(
-    cpu: &CpuState,
+    cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
 ) -> Result<(), Exit> {
     if preparing(mem) {
@@ -1182,6 +1724,7 @@ pub(super) fn task_commit<const ROUTED: bool, const ORDER: u8>(
             crate::UnsupportedSystemOperation::LegacyTaskPaging,
         ));
     }
+    commit_ram(cpu, mem)?;
     // Keep the outgoing plans through the incoming image read. The saves may
     // alias its paging structures; that image was preflighted before commit.
     Ok(())
@@ -1236,4 +1779,33 @@ pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
         None
     };
     Ok((tasks::load_image(cpu, mem, tss)?, cr3))
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+) -> Result<(Outcome, Option<PortPlan>), Exit> {
+    let mut scratch = vec![0; ir.temp_count as usize];
+    let mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    let view = InstructionView {
+        guest_start: ir.guest_start,
+        guest_len: ir.guest_len,
+        ops: &ir.ops,
+    };
+    execute_with_retry(
+        ir,
+        &view,
+        cpu,
+        &mem,
+        &mut scratch,
+        context,
+        task_switch,
+        retry,
+    )
 }
