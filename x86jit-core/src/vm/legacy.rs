@@ -1813,6 +1813,15 @@ impl Vcpu {
     fn deliver_legacy_event<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
+        context: MachineContext,
+        event: PendingEvent,
+    ) -> Result<(), Exit> {
+        self.deliver_legacy_event_impl::<ROUTED, ORDER, false>(vm, context, event)
+    }
+
+    fn deliver_legacy_event_impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+        &mut self,
+        vm: &Vm,
         mut context: MachineContext,
         mut event: PendingEvent,
     ) -> Result<(), Exit> {
@@ -1881,13 +1890,24 @@ impl Vcpu {
                 error_code,
                 fault,
             };
-            match crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
-                &mut self.cpu,
-                &vm.mem,
-                context,
-                delivery,
-                &mut self.legacy_execution.as_mut().unwrap().task_switch,
-            ) {
+            let result = if PAGED {
+                crate::interp::legacy::paging::deliver_interrupt::<ROUTED, ORDER>(
+                    &mut self.cpu,
+                    &vm.mem,
+                    context,
+                    delivery,
+                    &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                )
+            } else {
+                crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(
+                    &mut self.cpu,
+                    &vm.mem,
+                    context,
+                    delivery,
+                    &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                )
+            };
+            match result {
                 // A real-address frame holds no error code (SDM Vol 3B
                 // §23.1.4); a protected one, gate or task, holds the event's.
                 Ok(()) => {

@@ -74,6 +74,7 @@ fn inner_stack<const ROUTED: bool, const ORDER: u8>(
     ring: u8,
     ext: u16,
 ) -> Result<Stack, Exit> {
+    let mem = &mem.system();
     let tr = cpu.legacy.tr;
     let ring = u32::from(ring);
     let (sp_at, ss_at, sp_bytes) = if tasks::wide(tr) {
@@ -184,7 +185,7 @@ pub(super) fn inward<const ROUTED: bool, const ORDER: u8>(
         .map(|k| stack.linear(stack.slot(k, size)))
         .collect::<Vec<_>>();
     for &at in &slots {
-        probe(cpu, mem, at, size).map_err(|exit| {
+        probe(cpu, &mem.system(), at, size).map_err(|exit| {
             operand_fault(
                 exit,
                 cpu.rip,
@@ -218,7 +219,7 @@ pub(super) fn inward<const ROUTED: bool, const ORDER: u8>(
         frame.push(u64::from(error));
     }
     for (&at, &value) in slots.iter().zip(&frame) {
-        write(cpu, mem, at, size, value)?;
+        write(cpu, &mem.system(), at, size, value)?;
     }
     install(cpu, SegmentId::Ss, stack.selector, stack.descriptor.cache);
     // SDM p. 3-474: ESP := NewESP, then the pushes at the new SS.B width.
@@ -405,7 +406,7 @@ pub(super) fn call_gate<const ROUTED: bool, const ORDER: u8>(
         .map(|k| stack.linear(stack.slot(k, size)))
         .collect::<Vec<_>>();
     for &at in &targets {
-        probe(cpu, mem, at, size).map_err(|exit| {
+        probe(cpu, &mem.system(), at, size).map_err(|exit| {
             operand_fault(
                 exit,
                 cpu.rip,
@@ -478,7 +479,7 @@ pub(super) fn call_gate<const ROUTED: bool, const ORDER: u8>(
     frame.push(u64::from(cpu.cs));
     frame.push(u64::from(return_ip));
     for (&at, &value) in targets.iter().zip(&frame) {
-        write(cpu, mem, at, size, value)?;
+        write(cpu, &mem.system(), at, size, value)?;
     }
     install(cpu, SegmentId::Ss, stack.selector, stack.descriptor.cache);
     // ESP := NewESP, then the pushes at the new SS.B width (SDM p. 3-132).
@@ -834,7 +835,12 @@ pub(super) fn check<const ROUTED: bool, const ORDER: u8>(
             if tr.cache.limit < 0x67 {
                 return Err(fault(cpu, 13, 0));
             }
-            let base = read(cpu, mem, u64::from(tr.cache.base.wrapping_add(0x66)), 2)? as u32;
+            let base = read(
+                cpu,
+                &mem.system(),
+                u64::from(tr.cache.base.wrapping_add(0x66)),
+                2,
+            )? as u32;
             let offset = base + u32::from(port >> 3);
             // SDM Vol 1 §20.5.2 pp. 20-4–5; 486 PRM §8.3.2 pp. 8-7–8:
             // always read two bytes; missing bitmap bytes deny access.
@@ -843,7 +849,12 @@ pub(super) fn check<const ROUTED: bool, const ORDER: u8>(
             if offset + 1 > tr.cache.limit {
                 return Err(fault(cpu, 13, 0));
             }
-            let bits = read(cpu, mem, u64::from(tr.cache.base.wrapping_add(offset)), 2)?;
+            let bits = read(
+                cpu,
+                &mem.system(),
+                u64::from(tr.cache.base.wrapping_add(offset)),
+                2,
+            )?;
             let mask = ((1u64 << size) - 1) << (port & 7);
             // SDM Vol 2A IN p. 3-455, INS pp. 3-464–465; Vol 2B OUT
             // p. 4-171, OUTS pp. 4-173–175: denial precedes the transfer.

@@ -393,11 +393,38 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
     );
 }
 
+// The unpaged adapter has zero paging storage: no extra field initialization
+// or transaction-pointer lookup in its existing per-instruction construction.
+pub(crate) struct PagingMode<const PAGED: bool>;
+pub(crate) trait PagingStorage {
+    type State<'a>: Default;
+    fn transaction<'a>(
+        state: &Self::State<'a>,
+    ) -> Option<&'a std::cell::RefCell<paging::Transaction>>;
+}
+impl PagingStorage for PagingMode<false> {
+    type State<'a> = ();
+    fn transaction<'a>(_: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Transaction>> {
+        None
+    }
+}
+impl PagingStorage for PagingMode<true> {
+    type State<'a> = Option<&'a std::cell::RefCell<paging::Transaction>>;
+    fn transaction<'a>(
+        state: &Self::State<'a>,
+    ) -> Option<&'a std::cell::RefCell<paging::Transaction>> {
+        *state
+    }
+}
+
 // A device read is identified by its visit as well as its bus address. The
 // cursor restarts with the instruction, including reads served from the ledger.
 // Writes retain their separate bit-63 namespace; descriptor snapshots use bit 62.
 // `physical_mask` is the context model's bus mask (`legacy::physical_mask`).
-struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool = false> {
+struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool = false>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     access: &'a Access<ROUTED, ORDER>,
     read_index: Cell<u16>,
     writes: Option<&'a dyn Fn(u64, u8)>,
@@ -405,9 +432,12 @@ struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool =
     /// The frozen Real16 alias (decision-23 §6) keeps its whole-frame stack
     /// checks; see `wraps_in_segment`.
     frozen_alias: bool,
+    paging: <PagingMode<PAGED> as PagingStorage>::State<'a>,
 }
 impl<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
     LegacyAccess<'a, ROUTED, ORDER, PAGED>
+where
+    PagingMode<PAGED>: PagingStorage,
 {
     fn new(memory: &'a Memory, physical_mask: u32) -> Self {
         Self {
@@ -416,6 +446,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
             writes: None,
             physical_mask,
             frozen_alias: false,
+            paging: Default::default(),
         }
     }
     fn skip_read(&self, cpu: &CpuState, mut linear: u64, mut bytes: u8) {
@@ -429,6 +460,8 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
 }
 impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> std::ops::Deref
     for LegacyAccess<'_, ROUTED, ORDER, PAGED>
+where
+    PagingMode<PAGED>: PagingStorage,
 {
     type Target = Access<ROUTED, ORDER>;
     fn deref(&self) -> &Self::Target {
@@ -437,16 +470,11 @@ impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> std::ops::Deref
 }
 
 // Task-switch stages: the context's bus with address-based retry keys.
-pub(crate) struct AddressKeyed<'a, const ROUTED: bool, const ORDER: u8> {
-    access: &'a Access<ROUTED, ORDER>,
-    physical_mask: u32,
+pub(crate) struct AddressKeyed<'a, M> {
+    memory: &'a M,
 }
-impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for AddressKeyed<'_, ROUTED, ORDER> {
-    type Target = Access<ROUTED, ORDER>;
-    fn deref(&self) -> &Self::Target {
-        self.access
-    }
-}
+
+struct Supervisor<'a, M>(&'a M);
 
 // Instructions replay from their first read; task continuations resume saved
 // stages, whose existing transfers retain address-based retry keys. Every
@@ -456,6 +484,18 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     #[inline(always)]
     fn paged(&self) -> bool {
         Self::PAGED
+    }
+    fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
+        None
+    }
+    fn supervisor(&self) -> bool {
+        false
+    }
+    fn system(&self) -> Supervisor<'_, Self>
+    where
+        Self: Sized,
+    {
+        Supervisor(self)
     }
     fn raw(&self) -> &Access<ROUTED, ORDER>;
     fn read_key(&self, addr: u64) -> u64;
@@ -469,18 +509,25 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
         false
     }
     /// The same bus, with address-based retry keys (task-switch stages).
-    fn address_keyed(&self) -> AddressKeyed<'_, ROUTED, ORDER> {
-        AddressKeyed {
-            access: self.raw(),
-            physical_mask: self.physical_mask(),
-        }
+    fn address_keyed(&self) -> AddressKeyed<'_, Self>
+    where
+        Self: Sized,
+    {
+        AddressKeyed { memory: self }
     }
 }
-impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
-    for AddressKeyed<'_, ROUTED, ORDER>
+impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
+    LegacyMemory<ROUTED, ORDER> for AddressKeyed<'_, M>
 {
+    const PAGED: bool = M::PAGED;
     fn raw(&self) -> &Access<ROUTED, ORDER> {
-        self.access
+        self.memory.raw()
+    }
+    fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
+        self.memory.transaction()
+    }
+    fn supervisor(&self) -> bool {
+        self.memory.supervisor()
     }
     fn read_key(&self, addr: u64) -> u64 {
         addr
@@ -490,13 +537,53 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
     }
     fn skip_read(&self, _cpu: &CpuState, _linear: u64, _bytes: u8) {}
     fn physical_mask(&self) -> u32 {
-        self.physical_mask
+        self.memory.physical_mask()
+    }
+    fn note_write(&self, addr: u64, size: u8) {
+        if Self::PAGED {
+            self.memory.note_write(addr, size);
+        }
+    }
+}
+impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
+    LegacyMemory<ROUTED, ORDER> for Supervisor<'_, M>
+{
+    const PAGED: bool = M::PAGED;
+    fn raw(&self) -> &Access<ROUTED, ORDER> {
+        self.0.raw()
+    }
+    fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
+        self.0.transaction()
+    }
+    fn supervisor(&self) -> bool {
+        true
+    }
+    fn read_key(&self, addr: u64) -> u64 {
+        self.0.read_key(addr)
+    }
+    fn next_read_key(&self, addr: u64, ahead: u16) -> u64 {
+        self.0.next_read_key(addr, ahead)
+    }
+    fn skip_read(&self, cpu: &CpuState, linear: u64, bytes: u8) {
+        self.0.skip_read(cpu, linear, bytes);
+    }
+    fn physical_mask(&self) -> u32 {
+        self.0.physical_mask()
+    }
+    fn note_write(&self, addr: u64, size: u8) {
+        self.0.note_write(addr, size);
     }
 }
 impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> LegacyMemory<ROUTED, ORDER>
     for LegacyAccess<'_, ROUTED, ORDER, PAGED>
+where
+    PagingMode<PAGED>: PagingStorage,
 {
     const PAGED: bool = PAGED;
+    fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
+        PagingMode::<PAGED>::transaction(&self.paging)
+    }
+
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.access
     }
@@ -1084,6 +1171,7 @@ fn descriptor_at<const ROUTED: bool, const ORDER: u8>(
     address: u32,
     generation: crate::CpuGeneration,
 ) -> Result<Descriptor, Exit> {
+    let mem = &mem.system();
     let key = DESCRIPTOR_RETRY | u64::from(address);
     if let (Some(base_limit), Some(attributes)) = (
         cpu.mmio_part(cpu.rip, key),
@@ -1140,6 +1228,10 @@ fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     expected: u64,
     value: u64,
 ) -> Result<u64, Exit> {
+    let mem = &mem.system();
+    if mem.paged() {
+        return paging::descriptor_cas(cpu, mem, address, expected, value);
+    }
     let linear = u64::from(address);
     let (physical, _) = legacy::physical_span(cpu, mem.physical_mask(), linear, 1);
     let mem = mem.raw();
@@ -1687,13 +1779,13 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
         mem.skip_read(cpu, u64::from(address), 4);
         value as u32
     } else {
-        read(cpu, mem, u64::from(address), 4)? as u32
+        read(cpu, &mem.system(), u64::from(address), 4)? as u32
     };
     let high = if let Some(value) = cpu.mmio_part(cpu.rip, key | (1 << 32)) {
         mem.skip_read(cpu, u64::from(address.wrapping_add(4)), 4);
         value as u32
     } else {
-        read(cpu, mem, u64::from(address.wrapping_add(4)), 4)? as u32
+        read(cpu, &mem.system(), u64::from(address.wrapping_add(4)), 4)? as u32
     };
     let attr = (high >> 8) as u8;
     let kind = attr & 0x1f;
@@ -2002,7 +2094,10 @@ fn locked_split<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     src: u64,
     size: u8,
     update: super::integer::LockedUpdate,
-) -> Result<u64, Exit> {
+) -> Result<u64, Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     use super::integer::{locked_piece_exit, locked_pieces, locked_split_update, LockedPieces};
     let at = |byte: u8| u64::from((linear as u32).wrapping_add(u32::from(byte)));
     let mut bus = [0; 8];
@@ -2182,7 +2277,14 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     temps: &mut [u64],
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
-) -> Result<Outcome, Exit> {
+) -> Result<Outcome, Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
+    if PAGED && mem.transaction().is_none() {
+        return paging::execute(block, ir, cpu, mem, temps, context, task_switch)
+            .map(|(outcome, _)| outcome);
+    }
     mem.read_index.set(0);
     let checked = context.segment_class == crate::SegmentClass::Checked;
     if checked && !ir.ops.iter().all(supported) {
@@ -3024,7 +3126,10 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
     outcome: &mut Outcome,
-) -> Result<bool, Exit> {
+) -> Result<bool, Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     let next = ir.guest_start.wrapping_add(u64::from(ir.guest_len)) & 0xffff_ffff;
     let result = match op {
         IrOp::BoundGate {
@@ -3049,6 +3154,17 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
         } => {
             // 486 PRM §26 CMPXCHG pp. 26-62–63, §3.11.7 p. 3-47:
             // LOCK makes the memory comparison/update one bus transaction.
+            if PAGED {
+                temps[*old as usize] = paging::locked(
+                    cpu,
+                    mem,
+                    read_val(*addr, temps),
+                    read_val(*src, temps),
+                    *size,
+                    super::integer::LockedUpdate::Cas(read_val(*expected, temps) & mask(*size)),
+                )?;
+                return Ok(false);
+            }
             let linear = read_val(*addr, temps);
             let expected = read_val(*expected, temps) & mask(*size);
             let src = read_val(*src, temps);
@@ -3110,6 +3226,17 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
             op,
             ..
         } => {
+            if PAGED {
+                temps[*old as usize] = paging::locked(
+                    cpu,
+                    mem,
+                    read_val(*addr, temps),
+                    read_val(*src, temps),
+                    *size,
+                    super::integer::LockedUpdate::Rmw(*op),
+                )?;
+                return Ok(false);
+            }
             let linear = read_val(*addr, temps);
             let (physical, part) = legacy::physical_span(cpu, mem.physical_mask, linear, *size);
             let completed = if part == *size {
@@ -3262,35 +3389,39 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
             }
             numeric_error_before(cpu, *kind)?;
             let address = read_val(*addr, temps);
-            let fp = PhysicalFpMemory::<ROUTED> {
-                memory: &mem.0,
-                a20_enabled: cpu.legacy.a20_enabled != 0,
-                physical_mask: mem.physical_mask,
-                fault: std::cell::Cell::new(None),
-            };
-            let _ordering = ordering::Barrier::<ORDER>::new(
-                if crate::x87::mem_write_bytes(*kind).is_some() {
-                    Some(ordering::Direction::Write)
-                } else if crate::x87::mem_operand_bytes(*kind) != 0 {
-                    Some(ordering::Direction::Read)
-                } else {
-                    None
-                },
-                false,
-            );
-            if let Some((at, writing)) = crate::x87::exec_x87(cpu, &fp, *kind, address, *sti) {
-                let (physical, _) = legacy::physical_span(cpu, mem.physical_mask, at, 1);
-                let exit = crate::fault::fp_exit(
-                    cpu.rip,
-                    physical,
-                    crate::x87::mem_operand_bytes_format(*kind, *sti) as u16,
-                    if writing {
-                        AccessKind::Write
+            if PAGED {
+                paging::x87(cpu, mem, *kind, address, *sti)?;
+            } else {
+                let fp = PhysicalFpMemory::<ROUTED> {
+                    memory: &mem.0,
+                    a20_enabled: cpu.legacy.a20_enabled != 0,
+                    physical_mask: mem.physical_mask,
+                    fault: std::cell::Cell::new(None),
+                };
+                let _ordering = ordering::Barrier::<ORDER>::new(
+                    if crate::x87::mem_write_bytes(*kind).is_some() {
+                        Some(ordering::Direction::Write)
+                    } else if crate::x87::mem_operand_bytes(*kind) != 0 {
+                        Some(ordering::Direction::Read)
                     } else {
-                        AccessKind::Read
+                        None
                     },
+                    false,
                 );
-                return Err(crate::fault::qualify_legacy_bus(exit, at, physical));
+                if let Some((at, writing)) = crate::x87::exec_x87(cpu, &fp, *kind, address, *sti) {
+                    let (physical, _) = legacy::physical_span(cpu, mem.physical_mask, at, 1);
+                    let exit = crate::fault::fp_exit(
+                        cpu.rip,
+                        physical,
+                        crate::x87::mem_operand_bytes_format(*kind, *sti) as u16,
+                        if writing {
+                            AccessKind::Write
+                        } else {
+                            AccessKind::Read
+                        },
+                    );
+                    return Err(crate::fault::qualify_legacy_bus(exit, at, physical));
+                }
             }
             use crate::x87::FpuKind as K;
             if matches!(
@@ -3594,8 +3725,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                         .wrapping_sub(pushes as u64 * u64::from(*size))
                         .wrapping_sub(u64::from(*alloc))
                         & stack_mask;
-                    segment_access(cpu, context, SegmentId::Ss, final_sp, 1, AccessKind::Write)
-                        .map_err(|_| exception(cpu, 12))?;
+                    let final_address =
+                        segment_access(cpu, context, SegmentId::Ss, final_sp, 1, AccessKind::Write)
+                            .map_err(|_| exception(cpu, 12))?;
                     let addresses = push_addresses(cpu, mem, context, pushes, *size)?;
                     let mut values = vec![cpu.gpr[RBP] & mask(*size)];
                     let mut overlay = Vec::new();
@@ -3607,8 +3739,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                         let pushed = addresses[usize::from(i - 1)];
                         for byte in 0..*size {
                             let linear = u64::from((pushed as u32).wrapping_add(u32::from(byte)));
-                            let (physical, _) =
-                                legacy::physical_span(cpu, mem.physical_mask, linear, 1);
+                            let physical = if PAGED {
+                                paging::byte_bus(cpu, mem, linear, AccessKind::Write)?
+                            } else {
+                                legacy::physical_span(cpu, mem.physical_mask, linear, 1).0
+                            };
                             overlay.push((physical, (value >> (byte * 8)) as u8));
                         }
                         let offset =
@@ -3621,17 +3756,27 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                             *size,
                             AccessKind::Read,
                         )?;
-                        let physical = (0..*size)
-                            .map(|byte| {
-                                legacy::physical_span(
-                                    cpu,
-                                    mem.physical_mask,
-                                    u64::from((address as u32).wrapping_add(u32::from(byte))),
-                                    1,
-                                )
-                                .0
-                            })
-                            .collect::<Vec<_>>();
+                        let physical = if PAGED {
+                            (0..*size)
+                                .map(|byte| {
+                                    let linear =
+                                        u64::from((address as u32).wrapping_add(u32::from(byte)));
+                                    paging::byte_bus(cpu, mem, linear, AccessKind::Read)
+                                })
+                                .collect::<Result<Vec<_>, Exit>>()?
+                        } else {
+                            (0..*size)
+                                .map(|byte| {
+                                    legacy::physical_span(
+                                        cpu,
+                                        mem.physical_mask,
+                                        u64::from((address as u32).wrapping_add(u32::from(byte))),
+                                        1,
+                                    )
+                                    .0
+                                })
+                                .collect::<Vec<_>>()
+                        };
                         let cached = enter_display(cpu, i);
                         let first = mem.read_index.get();
                         let partial = physical
@@ -3685,6 +3830,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                     }
                     if *level != 0 {
                         values.push(frame);
+                    }
+                    if PAGED {
+                        // SDM Vol 2A §3.3 ENTER pp. 3-295–297: display
+                        // reads and frame pushes precede the allocation check.
+                        paging::check_write_permission(cpu, mem, final_address)?;
                     }
                     push(cpu, mem, context, &values, *size)?;
                     cpu.write_gpr(RBP, frame, *size);
@@ -4360,6 +4510,9 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                                 AccessKind::Write
                             },
                         )?;
+                        if PAGED && !output {
+                            paging::probe(cpu, mem, address, *elem)?;
+                        }
                         let value = if output {
                             read(cpu, mem, address, *elem)?
                         } else {
@@ -4620,15 +4773,20 @@ pub(super) fn machine_specific(op: &IrOp) -> bool {
     )
 }
 
-struct InstructionExecution<'a, 'b, const ROUTED: bool, const ORDER: u8, const PAGED: bool> {
+struct InstructionExecution<'a, 'b, 'memory, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     ir: &'a InstructionView<'a>,
-    mem: &'a LegacyAccess<'a, ROUTED, ORDER, PAGED>,
+    mem: &'a LegacyAccess<'memory, ROUTED, ORDER, PAGED>,
     context: MachineContext,
     task_switch: &'b mut tasks::SwitchState,
     outcome: Outcome,
 }
 impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> super::InstructionExecutor<'_>
-    for &mut InstructionExecution<'_, '_, ROUTED, ORDER, PAGED>
+    for &mut InstructionExecution<'_, '_, '_, ROUTED, ORDER, PAGED>
+where
+    PagingMode<PAGED>: PagingStorage,
 {
     fn enabled(&self) -> bool {
         true

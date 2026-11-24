@@ -31,6 +31,7 @@ pub(super) struct State {
     blocks: HashMap<Key, Proof>,
     lifts: u64,
     before_publication: Option<fn(&Vm)>,
+    port_input: Option<crate::interp::legacy::paging::PortPlan>,
 }
 
 impl State {
@@ -262,7 +263,7 @@ fn fetch(
 
 impl Vcpu {
     /// Internal single-instruction fetch/execute entry; public PG=1 stays refused.
-    /// Only step-1 scalar instructions and control-register transfers are allowed.
+    /// All operand/system consumers use the private paged adapter.
     #[doc(hidden)]
     #[cold]
     #[inline(never)]
@@ -294,6 +295,19 @@ impl Vcpu {
                 operation: UnsupportedSystemOperation::InvalidLegacyContext(error),
             }
         })?;
+        if self.cpu.port_string_in.is_some() {
+            let state = self
+                .legacy_execution
+                .as_mut()
+                .unwrap()
+                .paging
+                .get_or_insert_with(Default::default);
+            return crate::interp::legacy::paging::finish_port_input(
+                &mut self.cpu,
+                &vm.mem,
+                &mut state.port_input,
+            );
+        }
         let execution = self.legacy_execution.as_mut().unwrap();
         let state = execution.paging.get_or_insert_with(Default::default);
         let result = state.resolve(
@@ -308,20 +322,130 @@ impl Vcpu {
             Ok(ir) => ir,
             Err(exit) => {
                 publish_cr2(&mut self.cpu, &exit);
-                return Err(exit);
+                if let Some(saved) = execution.rep_flags.take() {
+                    self.cpu.flags = saved.origin;
+                }
+                return self.route_paged_exception(vm, context, exit);
             }
         };
-        let outcome = if context.paging_enabled {
-            execute_for_test::<true>(&ir, &mut self.cpu, &vm.mem, context, true)
+        let comparing = ir.ops.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Legacy(crate::legacy::LegacyOp::String {
+                    kind: crate::ir::StrOp::Cmps | crate::ir::StrOp::Scas,
+                    rep: crate::ir::RepKind::Repe | crate::ir::RepKind::Repne,
+                    ..
+                })
+            )
+        });
+        if comparing {
+            let continuing = execution.rep_flags.as_ref().is_some_and(|saved| {
+                Arc::ptr_eq(&saved.ir, &ir)
+                    && saved.matches(&self.cpu, model.legacy_model(), self.retired)
+            });
+            if !continuing {
+                execution.rep_flags = Some(Box::new(RepFlags {
+                    ir: Arc::clone(&ir),
+                    stamp: LegacyContextStamp::new(&self.cpu, model.legacy_model()),
+                    cursor: RepFlags::cursor(&self.cpu),
+                    flags: self.cpu.flags,
+                    system_flags: self.cpu.rflags_system,
+                    origin: self.cpu.flags,
+                    retired: self.retired,
+                }));
+            }
         } else {
-            execute_for_test::<false>(&ir, &mut self.cpu, &vm.mem, context, true)
-        }?;
+            execution.rep_flags = None;
+        }
+        let outcome = if context.paging_enabled {
+            execute_for_test::<true>(
+                &ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+            )
+        } else {
+            execute_for_test::<false>(
+                &ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+            )
+        };
+        if let Some(saved) = execution.rep_flags.as_mut() {
+            let fault = outcome.as_ref().is_err_and(|exit| {
+                matches!(exit, Exit::UnmappedMemory { .. })
+                    || exit
+                        .fault_metadata()
+                        .is_some_and(|m| m.class() == crate::fault::FaultClass::Fault)
+            });
+            if fault {
+                self.cpu.flags = saved.origin;
+                execution.rep_flags = None;
+            } else if outcome.as_ref().is_ok_and(|(o, _)| o.retired)
+                || self.cpu.rip != ir.guest_start
+            {
+                execution.rep_flags = None;
+            } else {
+                saved.cursor = RepFlags::cursor(&self.cpu);
+                saved.flags = self.cpu.flags;
+                saved.system_flags = self.cpu.rflags_system;
+            }
+        }
+        let (outcome, input) = match outcome {
+            Ok(outcome) => outcome,
+            Err(exit) => return self.route_paged_exception(vm, context, exit),
+        };
+        state.port_input = input;
         // 80386 PRM §5.2.5 p. 5-11; Intel486 PRM §5.3.5 p. 5-22:
         // loading CR3 flushes even when its value is unchanged.
         if outcome.translations_invalidated || outcome.context_changed {
             state.invalidate();
         }
+        self.cpu.finish_mmio_retry(outcome.exit.as_ref());
         outcome.exit.map_or(Ok(()), Err)
+    }
+
+    fn route_paged_exception(
+        &mut self,
+        vm: &Vm,
+        mut context: MachineContext,
+        exit: Exit,
+    ) -> Result<(), Exit> {
+        self.cpu.finish_mmio_retry(Some(&exit));
+        if self.exception_delivery != crate::ExceptionDelivery::InGuest {
+            return Err(exit);
+        }
+        let Some(source) = exception_source(&exit) else {
+            return Err(exit);
+        };
+        if self
+            .legacy_execution
+            .as_ref()
+            .unwrap()
+            .task_switch
+            .committed
+        {
+            context = crate::interp::legacy::tasks::fault_context(&self.cpu, context.generation);
+        }
+        let ip = exit
+            .fault_metadata()
+            .map_or(self.cpu.rip, |m| m.saved_rip()) as u32;
+        self.deliver_legacy_event_impl::<false, 0, true>(
+            vm,
+            context,
+            PendingEvent {
+                irq_consumed: false,
+                software: false,
+                after_nmi: false,
+                source,
+                ip,
+                cs: self.cpu.cs,
+                origin: self.delivery_origin(self.cpu.cs, ip),
+            },
+        )
     }
 
     /// Internal proof diagnostics: translation generation, retained blocks, lifts.

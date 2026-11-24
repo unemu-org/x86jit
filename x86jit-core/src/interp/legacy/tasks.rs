@@ -12,7 +12,7 @@ pub(crate) enum Cause {
     Event,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SwitchState {
     pub committed: bool,
     pub completed: bool,
@@ -100,6 +100,7 @@ enum Completion {
     Read,
     Write,
 }
+#[derive(Clone)]
 struct Owner {
     cpu: Box<CpuState>,
     completion: Completion,
@@ -226,7 +227,8 @@ impl Owner {
     }
 }
 
-struct Image {
+#[derive(Clone)]
+pub(super) struct Image {
     ip: u32,
     flags: u32,
     gpr: [u32; 8],
@@ -248,6 +250,7 @@ enum Stage {
     ErrorCode,
     Complete,
 }
+#[derive(Clone)]
 struct Pending {
     owner: Owner,
     context: MachineContext,
@@ -284,7 +287,7 @@ fn transfer_vector(generation: CpuGeneration, cause: Cause) -> u8 {
 
 fn task_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     value: u16,
     generation: CpuGeneration,
     vector: u8,
@@ -297,7 +300,7 @@ fn task_descriptor<const ROUTED: bool, const ORDER: u8>(
 }
 fn task_segment_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     value: u16,
     generation: CpuGeneration,
     vector: u8,
@@ -327,7 +330,7 @@ fn minimum(tss: SystemSegment) -> u32 {
 /// None leaves a normal code transfer to the existing helper.
 pub(super) fn transfer<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     cause: Cause,
@@ -372,7 +375,7 @@ pub(super) fn transfer<const ROUTED: bool, const ORDER: u8>(
 
 pub(super) fn task_return<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     next: u32,
     state: &mut SwitchState,
@@ -385,7 +388,7 @@ pub(super) fn task_return<const ROUTED: bool, const ORDER: u8>(
     if tr.cache.unusable != 0 || tr.cache.limit < 1 {
         return Err(selector_fault(cpu, 10, tr.selector, 0));
     }
-    let value = read(cpu, mem, u64::from(tr.cache.base), 2)? as u16;
+    let value = read(cpu, &mem.system(), u64::from(tr.cache.base), 2)? as u16;
     start(
         cpu,
         mem,
@@ -402,7 +405,7 @@ pub(super) fn task_return<const ROUTED: bool, const ORDER: u8>(
 
 pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     event: legacy::LegacyEvent,
@@ -437,7 +440,7 @@ pub(super) fn event<const ROUTED: bool, const ORDER: u8>(
 #[allow(clippy::too_many_arguments)]
 fn start<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
     value: u16,
     cause: Cause,
@@ -471,7 +474,7 @@ fn start<const ROUTED: bool, const ORDER: u8>(
         if context.generation == CpuGeneration::I386 && d.cache.limit < minimum(incoming) {
             return Err(selector_fault(cpu, 10, value, ext));
         }
-        if context.paging_enabled {
+        if context.paging_enabled && !mem.paged() {
             return Err(refusal(
                 cpu,
                 crate::UnsupportedSystemOperation::LegacyTaskPaging,
@@ -506,8 +509,19 @@ fn start<const ROUTED: bool, const ORDER: u8>(
         }
         if !invalid_old {
             for &(at, size, _) in &stores {
-                probe(cpu, mem, u64::from(at), size)?;
+                probe(cpu, &mem.system(), u64::from(at), size)?;
             }
+        }
+        if mem.paged() {
+            // SDM Vol 3A §10.3 steps 5–7 p. 10-10: TSS residency precedes
+            // saves/TR. Notes p. 10-13 restore the old context for errors in
+            // steps 1–8; step 9 load failures may corrupt state but use the
+            // prior environment. After commit (step 13), step 14 descriptor
+            // faults use the loaded new context (p. 10-11). 80386 PRM
+            // §9.8.14.1 p. 9-18 likewise assigns TSS-driven descriptor/LDT
+            // check faults to the new task's IP. Preflight avoids a fault
+            // halfway through establishing that context.
+            paging::task_image(cpu, mem, incoming)?;
         }
         // Acquire with the same locked, A20-gated byte CAS as LTR. Retry the
         // whole descriptor validation if another CPU changes the access byte.
@@ -546,13 +560,16 @@ fn start<const ROUTED: bool, const ORDER: u8>(
 
 pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     address: u32,
 ) -> Result<(), Exit> {
+    if mem.paged() {
+        return paging::probe_descriptor_cas(cpu, &mem.system(), address);
+    }
     let linear = u64::from(address);
-    let (physical, _) = legacy::physical_span(cpu, mem.physical_mask, linear, 1);
-    match mem.0.region_kind(physical, 1) {
-        Ok(crate::RegionKind::Ram | crate::RegionKind::Rom) => mem.probe_write(physical, 1),
+    let (physical, _) = legacy::physical_span(cpu, mem.physical_mask(), linear, 1);
+    match mem.raw().region_kind(physical, 1) {
+        Ok(crate::RegionKind::Ram | crate::RegionKind::Rom) => mem.raw().probe_write(physical, 1),
         Ok(_) => {
             return Err(refusal(
                 cpu,
@@ -569,15 +586,21 @@ pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     })
 }
 
-fn load_image<const ROUTED: bool, const ORDER: u8>(
+pub(super) fn load_image<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     tss: SystemSegment,
 ) -> Result<Image, Exit> {
     let base = tss.cache.base;
     let is_wide = wide(tss);
     let mut field = |offset: u32, size| {
-        read(cpu, mem, u64::from(base.wrapping_add(offset)), size).map(|v| v as u32)
+        read(
+            cpu,
+            &mem.system(),
+            u64::from(base.wrapping_add(offset)),
+            size,
+        )
+        .map(|v| v as u32)
     };
     let size = if is_wide { 4 } else { 2 };
     let ip = field(if is_wide { 0x20 } else { 0x0e }, size)?;
@@ -704,9 +727,9 @@ pub(crate) fn fault_context(cpu: &CpuState, generation: CpuGeneration) -> Machin
     }
 }
 
-pub(crate) fn resume<const ROUTED: bool, const ORDER: u8>(
+pub(super) fn resume<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     state: &mut SwitchState,
 ) -> Result<(), Exit> {
     let mut pending = state.pending.take().expect("task switch continuation");
@@ -737,9 +760,9 @@ impl Pending {
     fn clear_busy<const ROUTED: bool, const ORDER: u8>(
         &self,
         cpu: &mut CpuState,
-        mem: &AddressKeyed<'_, ROUTED, ORDER>,
+        mem: &impl LegacyMemory<ROUTED, ORDER>,
     ) -> Result<(), Exit> {
-        let mut expected = read(cpu, mem, u64::from(self.old_access), 1)?;
+        let mut expected = read(cpu, &mem.system(), u64::from(self.old_access), 1)?;
         loop {
             let observed = descriptor_cas(cpu, mem, self.old_access, expected, expected & !2)?;
             if observed == expected {
@@ -751,13 +774,13 @@ impl Pending {
     fn run<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         cpu: &mut CpuState,
-        mem: &AddressKeyed<'_, ROUTED, ORDER>,
+        mem: &impl LegacyMemory<ROUTED, ORDER>,
     ) -> Result<(), Exit> {
         loop {
             match self.stage {
                 Stage::Save(i) => {
                     if let Some(&(at, size, value)) = self.stores.get(i) {
-                        write(cpu, mem, u64::from(at), size, value)?;
+                        write(cpu, &mem.system(), u64::from(at), size, value)?;
                         self.stage = Stage::Save(i + 1);
                     } else {
                         self.stage = Stage::ClearBusy;
@@ -777,7 +800,11 @@ impl Pending {
                     cpu.legacy.tr = self.incoming;
                     self.committed = true;
                     if self.context.generation == CpuGeneration::I386 {
-                        cpu.legacy.cr0 |= 8;
+                        // Keep the paged image's preflight keys valid until
+                        // its register load, which also sets TS below.
+                        if !mem.paged() {
+                            cpu.legacy.cr0 |= 8;
+                        }
                         // 80386 PRM §12.2.2 p. 12-4: a task switch clears
                         // DR7.L0–L3 and LE, preserving the global enables/GE.
                         cpu.debug_test_registers[DebugTestRegister::Dr7 as usize] &= !0x155;
@@ -787,12 +814,33 @@ impl Pending {
                     if self.incoming.cache.limit < minimum(self.incoming) {
                         return Err(selector_fault(cpu, 10, self.incoming.selector, self.ext));
                     }
+                    if mem.paged() {
+                        paging::task_commit(cpu, mem)?;
+                    }
                     self.stage = Stage::ReadImage;
                 }
                 Stage::ReadImage => {
                     // 286 PRM App. B pp. B-12–13; 386 PRM §7.5 steps 3–5
                     // p. 7-8: acquire/save first, then read the incoming state.
-                    let image = load_image(cpu, mem, self.incoming)?;
+                    let (image, cr3) = if mem.paged() {
+                        paging::task_image(cpu, mem, self.incoming)?
+                    } else {
+                        (load_image(cpu, mem, self.incoming)?, None)
+                    };
+                    // 80386 PRM §7.5 p. 7-8; SDM Vol 3A §10.3 pp. 10-10–11:
+                    // incoming CR3 precedes LDT/segment translation. TSS reads
+                    // still use the outgoing address space at this commit seam.
+                    if let Some(cr3) = cr3 {
+                        cpu.legacy.cr3 = cr3
+                            & if cpu.machine_flags_mask != 0 {
+                                0xffff_f018
+                            } else {
+                                0xffff_f000
+                            };
+                    }
+                    if mem.paged() {
+                        paging::task_cr3_loaded(mem);
+                    }
                     cpu.clear_mmio_parts();
                     cpu.rip = u64::from(image.ip);
                     for i in 0..8 {
@@ -930,7 +978,7 @@ impl Pending {
 
 fn load_segment<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
-    mem: &AddressKeyed<'_, ROUTED, ORDER>,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     generation: CpuGeneration,
     segment: SegmentId,
     ext: u16,
@@ -1125,10 +1173,8 @@ mod tests {
             });
             let exit = transfer(
                 &mut cpu,
-                &AddressKeyed {
-                    access: Access::<false, 0>::new(&vm.mem),
-                    physical_mask: legacy::physical_mask(context.generation),
-                },
+                &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(context.generation))
+                    .address_keyed(),
                 context,
                 35,
                 Cause::Jump,
@@ -1155,10 +1201,8 @@ mod tests {
         cpu.legacy.cr0 |= 0x8000_0000;
         let exit = transfer(
             &mut cpu,
-            &AddressKeyed {
-                access: Access::<false, 0>::new(&vm.mem),
-                physical_mask: legacy::physical_mask(context.generation),
-            },
+            &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(context.generation))
+                .address_keyed(),
             context,
             35,
             Cause::Jump,
@@ -1196,10 +1240,8 @@ mod tests {
             let mut state = SwitchState::default();
             let exit = event(
                 &mut cpu,
-                &AddressKeyed {
-                    access: Access::<false, 0>::new(&vm.mem),
-                    physical_mask: legacy::physical_mask(context.generation),
-                },
+                &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(context.generation))
+                    .address_keyed(),
                 context,
                 32,
                 legacy::LegacyEvent {
@@ -1273,10 +1315,8 @@ mod tests {
                 .with(|u| u.set(Some((0x4100 + if wide { 0x28 } else { 0x12 }, 0x7654))));
             transfer(
                 &mut cpu,
-                &AddressKeyed {
-                    access: Access::<false, 0>::new(&vm.mem),
-                    physical_mask: legacy::physical_mask(context.generation),
-                },
+                &LegacyAccess::<false, 0>::new(&vm.mem, legacy::physical_mask(context.generation))
+                    .address_keyed(),
                 context,
                 35,
                 Cause::Jump,

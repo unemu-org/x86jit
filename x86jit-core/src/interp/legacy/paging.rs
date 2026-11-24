@@ -1,5 +1,5 @@
 //! Internal Machine translation boundary (paging design §§3.1–3.4, spec §17.10).
-//! No translation cache: every scalar plan owns its resolved physical spans.
+//! No translation cache: each instruction/iteration owns its physical spans.
 use super::*;
 use crate::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAddress, FaultCause, FaultClass, FaultMetadata,
@@ -63,7 +63,7 @@ pub(super) fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
     Ok(changed)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Privilege {
     Supervisor,
     User,
@@ -266,6 +266,7 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     bytes: u8,
     access: AccessKind,
     privilege: Privilege,
+    set_accessed: bool,
 ) -> Result<Translation, Exit> {
     loop {
         // 80386 PRM §5.2, Figs. 5-8–10 pp. 5-7–9; SDM Vol 3A §5.3
@@ -281,36 +282,46 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         if pde & PRESENT == 0 {
             return Err(fault(false).exit(cpu));
         }
-        let Some(pde) = table_or(
-            cpu,
-            mem,
-            linear,
-            pde_address,
-            PagingWalkLevel::Directory,
-            pde,
-            ACCESSED,
-        )?
-        else {
-            continue;
+        let pde = if set_accessed {
+            let Some(pde) = table_or(
+                cpu,
+                mem,
+                linear,
+                pde_address,
+                PagingWalkLevel::Directory,
+                pde,
+                ACCESSED,
+            )?
+            else {
+                continue;
+            };
+            pde
+        } else {
+            pde
         };
         let pte_address = (pde & FRAME) + 4 * ((linear >> 12) & 0x3ff);
         let pte = table_read(cpu, mem, linear, pte_address, PagingWalkLevel::Table)?;
         if pte & PRESENT == 0 {
             return Err(fault(false).exit(cpu));
         }
-        // Intel486 PRM §9.9.14 p. 9-21 requires both A bits on protection
-        // faults. The same failed-walk order on the 386 is engine policy (§3.3).
-        let Some(pte) = table_or(
-            cpu,
-            mem,
-            linear,
-            pte_address,
-            PagingWalkLevel::Table,
-            pte,
-            ACCESSED,
-        )?
-        else {
-            continue;
+        // Intel486 PRM §9.9.14 p. 9-21 requires both A bits on operand
+        // protection faults. The same order on the 386 is engine policy (§3.3).
+        let pte = if set_accessed {
+            let Some(pte) = table_or(
+                cpu,
+                mem,
+                linear,
+                pte_address,
+                PagingWalkLevel::Table,
+                pte,
+                ACCESSED,
+            )?
+            else {
+                continue;
+            };
+            pte
+        } else {
+            pte
         };
         // 80386 PRM §§6.4.1–6.4.2 pp. 6-20–22, Table 6-5;
         // Intel486 PRM §4.1.3 p. 4-7 describes WP for user pages.
@@ -332,12 +343,44 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+#[derive(Clone)]
 struct Fragment {
     linear: u32,
     bus: u64,
     bytes: u8,
     shift: u8,
     translation: Translation,
+    dirty_complete: bool,
+}
+
+fn complete_dirty<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    fragments: &mut [Fragment],
+) -> Result<bool, Exit> {
+    // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3 pp. 5-21–22:
+    // a permission probe does not complete the D update required by a write.
+    for f in fragments {
+        if f.dirty_complete {
+            continue;
+        }
+        let t = f.translation;
+        if table_or(
+            cpu,
+            mem,
+            f.linear,
+            t.pte_address,
+            PagingWalkLevel::Table,
+            t.pte,
+            DIRTY,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+        f.dirty_complete = true;
+    }
+    Ok(true)
 }
 
 fn plan<const ROUTED: bool, const ORDER: u8>(
@@ -348,18 +391,47 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
     access: AccessKind,
     dirty: bool,
 ) -> Result<Vec<Fragment>, Exit> {
-    let privilege = if cpu.legacy.cpl == 3 {
+    // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §6.5 p. 6-22:
+    // implicit table/TSS and inner-stack accesses are supervisor at any CPL.
+    let privilege = if cpu.legacy.cpl == 3 && !mem.supervisor() {
         Privilege::User
     } else {
         Privilege::Supervisor
     };
+    let key = PlanKey {
+        addr: addr as u32,
+        size,
+        access,
+        privilege,
+        cr3: cpu.legacy.cr3,
+        cr0: cpu.legacy.cr0,
+    };
+    if let Some(tx) = mem.transaction() {
+        let cached = tx
+            .borrow()
+            .plans
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, fragments)| fragments.clone());
+        if let Some(mut fragments) = cached {
+            if !dirty || preparing(mem) {
+                return Ok(fragments);
+            }
+            if complete_dirty(cpu, mem, &mut fragments)? {
+                let mut tx = tx.borrow_mut();
+                tx.plans.iter_mut().find(|(k, _)| *k == key).unwrap().1 = fragments.clone();
+                return Ok(fragments);
+            }
+            tx.borrow_mut().plans.retain(|(k, _)| *k != key);
+        }
+    }
     'restart: loop {
         let mut fragments = Vec::new();
         let mut consumed = 0;
         while consumed < size {
             let linear = (addr as u32).wrapping_add(u32::from(consumed));
             let translation =
-                translate_linear(cpu, mem, linear, size - consumed, access, privilege)?;
+                translate_linear(cpu, mem, linear, size - consumed, access, privilege, true)?;
             let (bus, bytes) = legacy::physical_span(
                 cpu,
                 mem.physical_mask(),
@@ -372,6 +444,7 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
                 bytes,
                 shift: consumed * 8,
                 translation,
+                dirty_complete: translation.pte & DIRTY != 0,
             });
             consumed += bytes;
         }
@@ -404,26 +477,16 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
                 )?;
             }
         }
-        if dirty {
+        if dirty && !preparing(mem) {
             // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3
             // pp. 5-21–22: PTE.D precedes the operand write; PDE.D is preserved.
             // Preflight the entire span before D, retaining even aliased frames.
-            for fragment in &fragments {
-                let t = fragment.translation;
-                if table_or(
-                    cpu,
-                    mem,
-                    fragment.linear,
-                    t.pte_address,
-                    PagingWalkLevel::Table,
-                    t.pte,
-                    DIRTY,
-                )?
-                .is_none()
-                {
-                    continue 'restart;
-                }
+            if !complete_dirty(cpu, mem, &mut fragments)? {
+                continue 'restart;
             }
+        }
+        if let Some(tx) = mem.transaction() {
+            tx.borrow_mut().plans.push((key, fragments.clone()));
         }
         return Ok(fragments);
     }
@@ -441,7 +504,37 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     let fragments = plan(cpu, mem, addr, size, access, false)?;
     let mut value = 0;
     for f in fragments {
-        value |= read_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes)? << f.shift;
+        let part = match read_physical(cpu, mem, u64::from(f.linear), f.bus, f.bytes) {
+            Err(Exit::MmioRead { .. }) if preparing(mem) => {
+                if !mem.transaction().unwrap().borrow().device_dummy {
+                    return Err(refusal(
+                        cpu,
+                        crate::UnsupportedSystemOperation::PagingSplitDevice,
+                    ));
+                }
+                0
+            }
+            other => other?,
+        };
+        let part = if preparing(mem) {
+            let tx = mem.transaction().unwrap().borrow();
+            let mut part = part;
+            for byte in 0..f.bytes {
+                if let Some((_, value)) = tx
+                    .overlay
+                    .iter()
+                    .rev()
+                    .find(|(at, _)| *at == f.bus + u64::from(byte))
+                {
+                    let shift = byte * 8;
+                    part = (part & !(0xff << shift)) | (u64::from(*value) << shift);
+                }
+            }
+            part
+        } else {
+            part
+        };
+        value |= part << f.shift;
     }
     Ok(value)
 }
@@ -457,6 +550,16 @@ pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<(), Exit> {
     let fragments = plan(cpu, mem, addr, size, AccessKind::Write, true)?;
     for f in fragments {
+        if preparing(mem) {
+            let mut tx = mem.transaction().unwrap().borrow_mut();
+            for byte in 0..f.bytes {
+                tx.overlay.push((
+                    f.bus + u64::from(byte),
+                    (value >> (f.shift + byte * 8)) as u8,
+                ));
+            }
+            continue;
+        }
         write_physical(
             cpu,
             mem,
@@ -480,6 +583,34 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
 }
 
+#[cold]
+#[inline(never)]
+pub(super) fn check_write_permission<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+) -> Result<(), Exit> {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297 checks whether a write would
+    // #PF without transferring an operand. ASSUMED: no A/D updates for
+    // this check; neither ENTER nor Vol 3A §5.8 specifies them without
+    // an access. Do not retain an operand plan or check physical backing.
+    let privilege = if cpu.legacy.cpl == 3 && !mem.supervisor() {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    translate_linear(
+        cpu,
+        mem,
+        addr as u32,
+        1,
+        AccessKind::Write,
+        privilege,
+        false,
+    )
+    .map(|_| ())
+}
+
 // Fetch performs the same read-permission walk but retains execute metadata.
 // 80386 PRM §9.8.14 Fig. 9-8 pp. 9-17–18; Intel486 PRM §9.9.14
 // Fig. 9-7 pp. 9-21–22: no I/D bit exists on these models.
@@ -498,7 +629,7 @@ pub(crate) fn fetch_bus_for_test(
     let observe = |_, _| wrote.set(true);
     let mut mem = LegacyAccess::<false, 0, true>::new(memory, u32::MAX);
     mem.writes = Some(&observe);
-    let t = translate_linear(cpu, &mem, linear, 1, AccessKind::Execute, privilege)?;
+    let t = translate_linear(cpu, &mem, linear, 1, AccessKind::Execute, privilege, true)?;
     Ok(legacy::physical_span(cpu, u32::MAX, u64::from(t.physical), 1).0)
 }
 
@@ -533,7 +664,14 @@ pub(crate) fn scalar_for_test(
         model.profile(),
     )
     .map_err(|_| refusal(cpu, crate::UnsupportedSystemOperation::LegacyInstruction))?;
-    execute_for_test::<true>(&ir, cpu, memory, context, false).map(|_| ())
+    execute_for_test::<true>(
+        &ir,
+        cpu,
+        memory,
+        context,
+        &mut tasks::SwitchState::default(),
+    )
+    .map(|_| ())
 }
 
 #[cfg(feature = "test-hooks")]
@@ -542,48 +680,21 @@ pub(crate) fn execute_for_test<const PAGED: bool>(
     cpu: &mut CpuState,
     memory: &Memory,
     context: MachineContext,
-    controls: bool,
-) -> Result<Outcome, Exit> {
-    // Paging design §3.4: PUSH/POP memory forms need instruction-wide preflight;
-    // a load/store pair is scalar only when it reuses one operand address (RMW).
-    let addresses = ir
-        .ops
-        .iter()
-        .filter(|op| matches!(op, IrOp::Legacy(L::Address { .. })))
-        .count();
-    if addresses > 1
-        || ir.ops.iter().any(|op| match op {
-            IrOp::Legacy(op) => {
-                !(controls
-                    && matches!(
-                        op,
-                        L::ReadControl { .. }
-                            | L::WriteControl { .. }
-                            | L::Privileged { .. }
-                            | L::InvalidatePage { .. }
-                            | L::I486Invalidate
-                    ))
-                    && !matches!(
-                        op,
-                        L::Checkpoint | L::I486Gate | L::Address { .. } | L::ReadSelector { .. }
-                    )
-            }
-            op if machine_specific(op) => !matches!(
-                op,
-                IrOp::Load { .. }
-                    | IrOp::Store { .. }
-                    | IrOp::SegLimitCheck { .. }
-                    | IrOp::Trap { vector: 6, .. }
-            ),
-            _ => false,
-        })
-    {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyInstruction,
-        ));
-    }
+    task_switch: &mut tasks::SwitchState,
+) -> Result<(Outcome, Option<PortPlan>), Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     let mut scratch = vec![0; ir.temp_count as usize];
+    let mem = LegacyAccess::<false, 0, PAGED>::new(memory, u32::MAX);
+    let view = InstructionView {
+        guest_start: ir.guest_start,
+        guest_len: ir.guest_len,
+        ops: &ir.ops,
+    };
+    if PAGED {
+        return execute(ir, &view, cpu, &mem, &mut scratch, context, task_switch);
+    }
     execute_instruction::<false, 0, PAGED>(
         ir,
         &InstructionView {
@@ -595,6 +706,534 @@ pub(crate) fn execute_for_test<const PAGED: bool>(
         &LegacyAccess::<false, 0, PAGED>::new(memory, u32::MAX),
         &mut scratch,
         context,
-        &mut tasks::SwitchState::default(),
+        task_switch,
     )
+    .map(|outcome| (outcome, None))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PlanKey {
+    addr: u32,
+    size: u8,
+    access: AccessKind,
+    privilege: Privilege,
+    cr3: u32,
+    cr0: u32,
+}
+
+// One instruction/REP iteration owns these spans. No page-table lookup after
+// the first operand store: operand bytes may themselves alias a later PTE.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+pub(crate) struct PortPlan {
+    owner: u64,
+    spans: Vec<Fragment>,
+}
+
+#[derive(Default)]
+pub(crate) struct Transaction {
+    plans: Vec<(PlanKey, Vec<Fragment>)>,
+    overlay: Vec<(u64, u8)>,
+    preparing: bool,
+    device_dummy: bool,
+}
+
+fn preparing<const ROUTED: bool, const ORDER: u8>(mem: &impl LegacyMemory<ROUTED, ORDER>) -> bool {
+    mem.transaction().is_some_and(|tx| tx.borrow().preparing)
+}
+
+#[cold]
+#[inline(never)]
+fn finish_plan<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    tx: &std::cell::RefCell<Transaction>,
+) -> Result<bool, Exit> {
+    let tx = tx.borrow();
+    // Multiple device operands need retained completions across handoffs (design
+    // §5 step 5). Preflight has already selected any later #PF before refusal.
+    let device = tx.plans.iter().any(|(_, spans)| {
+        spans.iter().any(|f| {
+            (0..f.bytes).any(|b| {
+                mem.raw().region_kind(f.bus + u64::from(b), 1) == Ok(crate::RegionKind::Trap)
+            })
+        })
+    });
+    if device {
+        let first = &tx.plans[0].0;
+        if tx
+            .plans
+            .iter()
+            .any(|(k, _)| k.addr != first.addr || k.size != first.size || k.cr3 != first.cr3)
+        {
+            return Err(refusal(
+                cpu,
+                crate::UnsupportedSystemOperation::PagingSplitDevice,
+            ));
+        }
+    }
+    let mut dirtied = false;
+    for (key, spans) in &tx.plans {
+        if key.access != AccessKind::Write {
+            continue;
+        }
+        for f in spans {
+            dirtied |= f.translation.pte & DIRTY == 0;
+            if table_or(
+                cpu,
+                mem,
+                f.linear,
+                f.translation.pte_address,
+                PagingWalkLevel::Table,
+                f.translation.pte,
+                DIRTY,
+            )?
+            .is_none()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    // A source can alias a PTE whose D bit was just set. Re-evaluate the
+    // prepared instruction with those physical walk writes already visible.
+    Ok(!dirtied)
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+    block: &IrBlock,
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    original: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
+    temps: &mut [u64],
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+) -> Result<(Outcome, Option<PortPlan>), Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
+    loop {
+        let tx = std::cell::RefCell::new(Transaction {
+            preparing: true,
+            device_dummy: ir.ops.iter().all(|op| match op {
+                IrOp::Legacy(op) => matches!(
+                    op,
+                    L::Checkpoint
+                        | L::I486Gate
+                        | L::Address { .. }
+                        | L::ReadSelector { .. }
+                        | L::Push { .. }
+                        | L::Pop { .. }
+                        | L::AdjustStack { .. }
+                        | L::String { .. }
+                ),
+                IrOp::Jump { .. } | IrOp::Branch { .. } => false,
+                _ => true,
+            }),
+            ..Transaction::default()
+        });
+        let mut mem =
+            LegacyAccess::<ROUTED, ORDER, true>::new(&original.access.0, original.physical_mask);
+        mem.writes = original.writes;
+        mem.paging = Some(&tx);
+        let mut preview_cpu = cpu.clone();
+        let mut preview_tasks = task_switch.clone();
+        let mut preview_temps = temps.to_vec();
+        let preview = execute_instruction::<ROUTED, ORDER, true>(
+            block,
+            ir,
+            &mut preview_cpu,
+            &mem,
+            &mut preview_temps,
+            context,
+            &mut preview_tasks,
+        );
+        if let Err(exit) = preview {
+            if !preview_tasks.committed {
+                publish_cr2(cpu, &exit);
+                return Err(exit);
+            }
+            // Hardware task switches have their own commit boundary. Replay the
+            // outgoing saves and incoming commit even when the new task faults
+            // (80386 PRM §7.5 pp. 7-8–9; design §3.7).
+        }
+        if !finish_plan(cpu, &mem, &tx)? {
+            continue;
+        }
+        tx.borrow_mut().preparing = false;
+        let outcome = execute_instruction::<ROUTED, ORDER, true>(
+            block,
+            ir,
+            cpu,
+            &mem,
+            temps,
+            context,
+            task_switch,
+        )?;
+        let input = cpu.port_string_in.map(|p| {
+            let linear = (p.base as u32).wrapping_add(p.offset as u32);
+            let spans = tx
+                .borrow()
+                .plans
+                .iter()
+                .find(|(key, _)| {
+                    key.addr == linear && key.size == p.elem && key.access == AccessKind::Write
+                })
+                .expect("preflighted INS destination")
+                .1
+                .clone();
+            PortPlan {
+                owner: p.rip,
+                spans,
+            }
+        });
+        return Ok((outcome, input));
+    }
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn byte_bus<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    linear: u64,
+    access: AccessKind,
+) -> Result<u64, Exit> {
+    Ok(plan(cpu, mem, linear, 1, access, false)?[0].bus)
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    address: u32,
+) -> Result<(), Exit> {
+    let spans = plan(cpu, mem, u64::from(address), 1, AccessKind::Write, false)?;
+    if mem.raw().region_kind(spans[0].bus, 1) == Ok(crate::RegionKind::Trap) {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyInstruction,
+        ));
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    address: u32,
+    expected: u64,
+    value: u64,
+) -> Result<u64, Exit> {
+    probe_descriptor_cas(cpu, mem, address)?;
+    if preparing(mem) {
+        let observed = read(cpu, mem, u64::from(address), 1, AccessKind::Write)?;
+        if observed == expected {
+            write(cpu, mem, u64::from(address), 1, value)?;
+        }
+        return Ok(observed);
+    }
+    let f = &plan(cpu, mem, u64::from(address), 1, AccessKind::Write, true)?[0];
+    let observed = mem
+        .raw()
+        .atomic_cas(f.bus, expected, value, 1)
+        .map_err(|trap| {
+            let StepResult::Exit(exit) =
+                trap_out(cpu, cpu.rip, trap, f.bus, 1, AccessKind::Write, value).into_step()
+            else {
+                unreachable!()
+            };
+            crate::fault::qualify_legacy_bus(exit, u64::from(address), f.bus)
+        })?;
+    if observed == expected {
+        mem.note_write(f.bus, 1);
+    }
+    Ok(observed)
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn locked<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    linear: u64,
+    src: u64,
+    size: u8,
+    update: super::super::integer::LockedUpdate,
+) -> Result<u64, Exit> {
+    let spans = plan(cpu, mem, linear, size, AccessKind::Write, true)?;
+    if !preparing(mem) && spans.len() == 1 {
+        let f = &spans[0];
+        let result = match update {
+            super::super::integer::LockedUpdate::Cas(expected) => {
+                mem.raw().atomic_cas(f.bus, expected, src, size)
+            }
+            super::super::integer::LockedUpdate::Rmw(op) => {
+                mem.raw().atomic_rmw(f.bus, src, size, op)
+            }
+        };
+        match result {
+            Ok(value) => {
+                mem.note_write(f.bus, size);
+                return Ok(value);
+            }
+            Err(MemTrap::Mmio) => {}
+            Err(trap) => {
+                let StepResult::Exit(exit) =
+                    trap_out(cpu, cpu.rip, trap, f.bus, size, AccessKind::Write, src).into_step()
+                else {
+                    unreachable!()
+                };
+                return Err(crate::fault::qualify_legacy_bus(exit, linear, f.bus));
+            }
+        }
+    }
+    // SDM Vol 3A §11.1.2.2 pp. 11-4–5; design §3.4: one retained
+    // snapshot for the scatter operand, with the existing single-vCPU contract.
+    // Split device shapes were refused by plan before any transfer/D update.
+    let old = read(cpu, mem, linear, size, AccessKind::Write)?;
+    write(cpu, mem, linear, size, update.apply(old, src, size))?;
+    Ok(old)
+}
+
+struct FpBuffer {
+    base: u64,
+    bytes: std::cell::RefCell<Vec<u8>>,
+    stored: Cell<bool>,
+}
+impl crate::x87::FpMem for FpBuffer {
+    fn load(&self, addr: u64, out: &mut [u8]) -> bool {
+        let offset = (addr as u32).wrapping_sub(self.base as u32) as usize;
+        out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+        true
+    }
+    fn store(&self, addr: u64, bytes: &[u8]) -> bool {
+        let offset = (addr as u32).wrapping_sub(self.base as u32) as usize;
+        self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.stored.set(true);
+        true
+    }
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    kind: crate::x87::FpuKind,
+    address: u64,
+    sti: u8,
+) -> Result<(), Exit> {
+    let bytes = crate::x87::mem_operand_bytes_format(kind, sti) as usize;
+    let writing = crate::x87::mem_write_bytes(kind).is_some();
+    // Strong image restart is engine policy (design §3.4). SDM Vol 3A
+    // §11.1.1 pp. 11-2–3 permits partial stores for some x87 instructions.
+    let mut data = vec![0; bytes];
+    for offset in (0..bytes).step_by(8) {
+        let linear = u64::from((address as u32).wrapping_add(offset as u32));
+        let size = (bytes - offset).min(8) as u8;
+        if !writing {
+            plan(cpu, mem, linear, size, AccessKind::Read, false)?;
+        }
+    }
+    if !writing {
+        for offset in (0..bytes).step_by(8) {
+            let linear = u64::from((address as u32).wrapping_add(offset as u32));
+            let size = (bytes - offset).min(8) as u8;
+            let value = read(cpu, mem, linear, size, AccessKind::Read)?;
+            data[offset..offset + usize::from(size)]
+                .copy_from_slice(&value.to_le_bytes()[..usize::from(size)]);
+        }
+    }
+    let fp = FpBuffer {
+        base: address,
+        bytes: std::cell::RefCell::new(data),
+        stored: Cell::new(false),
+    };
+    let before = cpu.clone();
+    let fault = crate::x87::exec_x87(cpu, &fp, kind, address, sti);
+    debug_assert!(fault.is_none());
+    if fp.stored.get() {
+        for offset in (0..bytes).step_by(8) {
+            let linear = u64::from((address as u32).wrapping_add(offset as u32));
+            if let Err(exit) = probe(cpu, mem, linear, (bytes - offset).min(8) as u8) {
+                *cpu = before;
+                return Err(exit);
+            }
+        }
+        let data = fp.bytes.borrow();
+        for offset in (0..bytes).step_by(8) {
+            let size = (bytes - offset).min(8);
+            let mut value = [0; 8];
+            value[..size].copy_from_slice(&data[offset..offset + size]);
+            let linear = u64::from((address as u32).wrapping_add(offset as u32));
+            if let Err(exit) = write(cpu, mem, linear, size as u8, u64::from_le_bytes(value)) {
+                *cpu = before;
+                return Err(exit);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    event: legacy::LegacyEvent,
+    task_switch: &mut tasks::SwitchState,
+) -> Result<(), Exit> {
+    loop {
+        let tx = std::cell::RefCell::new(Transaction {
+            preparing: true,
+            ..Transaction::default()
+        });
+        let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+        mem.paging = Some(&tx);
+        let mut preview_cpu = cpu.clone();
+        let mut preview_tasks = task_switch.clone();
+        let preview = if preview_tasks.context().is_some() {
+            tasks::resume(&mut preview_cpu, &mem.address_keyed(), &mut preview_tasks)
+        } else {
+            deliver(&mut preview_cpu, &mem, context, event, &mut preview_tasks)
+        };
+        if let Err(exit) = preview {
+            if !preview_tasks.committed {
+                publish_cr2(cpu, &exit);
+                return Err(exit);
+            }
+        }
+        if !finish_plan(cpu, &mem, &tx)? {
+            continue;
+        }
+        tx.borrow_mut().preparing = false;
+        task_switch.committed = false;
+        task_switch.completed = false;
+        let result = if task_switch.context().is_some() {
+            tasks::resume(cpu, &mem.address_keyed(), task_switch)
+        } else {
+            deliver(cpu, &mem, context, event, task_switch)
+        };
+        if let Err(exit) = &result {
+            publish_cr2(cpu, exit);
+        }
+        return result;
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[cold]
+#[inline(never)]
+pub(crate) fn finish_port_input(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    plan: &mut Option<PortPlan>,
+) -> Result<(), Exit> {
+    let p = cpu.port_string_in.expect("pending input iteration");
+    let Some(value) = p.value else {
+        return Err(Exit::port_io(cpu.gpr[RDX] as u16, p.elem, PortDir::In, 0));
+    };
+    let mem = LegacyAccess::<false, 0, true>::new(memory, u32::MAX);
+    let saved = plan
+        .as_ref()
+        .filter(|saved| saved.owner == p.rip)
+        .ok_or_else(|| refusal(cpu, crate::UnsupportedSystemOperation::LegacyEntryFacility))?;
+    // The port read is irreversible. Retain this iteration's translated spans
+    // over the handoff, even if the embedder edits its PTEs before completion.
+    for f in &saved.spans {
+        write_physical(
+            cpu,
+            &mem,
+            u64::from(f.linear),
+            f.bus,
+            f.bytes,
+            value >> f.shift,
+        )?;
+    }
+    *plan = None;
+    cpu.write_gpr(RDI, p.next_index, p.addr_bits / 8);
+    if p.rep {
+        cpu.write_gpr(RCX, p.next_count, p.addr_bits / 8);
+    }
+    cpu.rip = p.next_ip;
+    cpu.port_string_in = None;
+    cpu.clear_mmio_parts();
+    Ok(())
+}
+
+// Task switches have an architectural commit seam; ordinary instruction
+// preflight must stop there rather than roll an incoming-task fault back.
+#[cold]
+#[inline(never)]
+pub(super) fn task_commit<const ROUTED: bool, const ORDER: u8>(
+    cpu: &CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+) -> Result<(), Exit> {
+    if preparing(mem) {
+        // Internal preflight stop, consumed only after SwitchState::committed.
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyTaskPaging,
+        ));
+    }
+    // Keep the outgoing plans through the incoming image read. The saves may
+    // alias its paging structures; that image was preflighted before commit.
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn task_cr3_loaded<const ROUTED: bool, const ORDER: u8>(
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+) {
+    // Even an equal CR3 load starts fresh translations. Outgoing TSS saves
+    // can alias the page tables used by incoming descriptor loads (§3.7).
+    mem.transaction()
+        .expect("paged task transaction")
+        .borrow_mut()
+        .plans
+        .clear();
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    tss: legacy::SystemSegment,
+) -> Result<(tasks::Image, Option<u32>), Exit> {
+    // SDM Vol 3A §10.3 step 5 p. 10-10: the entire incoming TSS image
+    // must be resident before saves/TR. Cover static fields as well as the
+    // register fields below; do not read unused fields from devices.
+    let bytes = if tasks::wide(tss) { 0x68 } else { 0x2c };
+    for offset in (0..bytes).step_by(8) {
+        plan(
+            cpu,
+            &mem.system(),
+            u64::from(tss.cache.base.wrapping_add(offset)),
+            (bytes - offset).min(8) as u8,
+            AccessKind::Read,
+            false,
+        )?;
+    }
+    // 80386 PRM §7.1 Fig. 7-1 pp. 7-2–3; §7.5 p. 7-8:
+    // CR3 is a static incoming field, read through the outgoing address space.
+    let cr3 = if tasks::wide(tss) {
+        Some(read(
+            cpu,
+            &mem.system(),
+            u64::from(tss.cache.base.wrapping_add(0x1c)),
+            4,
+            AccessKind::Read,
+        )? as u32)
+    } else {
+        None
+    };
+    Ok((tasks::load_image(cpu, mem, tss)?, cr3))
 }

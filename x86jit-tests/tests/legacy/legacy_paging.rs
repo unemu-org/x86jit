@@ -1,4 +1,4 @@
-//! Internal paging witnesses (paging design §5 steps 1–3). Scalar operand tests
+//! Internal paging witnesses (paging design §5 steps 1–4). Scalar operand tests
 //! supply bytes; fetch/proof tests use the private single-instruction vCPU entry.
 use x86jit_core::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultClass, FaultOrigin, Knowledge,
@@ -35,11 +35,27 @@ impl Fixture {
     fn new(model: CpuModel, code32: bool, cpl: u8) -> Self {
         Self::with_vm(Vm::new(VmConfig::flat(0x20000)), model, code32, cpl)
     }
-    fn with_vm(mut vm: Vm, model: CpuModel, code32: bool, cpl: u8) -> Self {
+    fn with_vm(vm: Vm, model: CpuModel, code32: bool, cpl: u8) -> Self {
+        Self::with_delivery(
+            vm,
+            model,
+            code32,
+            cpl,
+            x86jit_core::ExceptionDelivery::Outward,
+        )
+    }
+    fn with_delivery(
+        mut vm: Vm,
+        model: CpuModel,
+        code32: bool,
+        cpl: u8,
+        delivery: x86jit_core::ExceptionDelivery,
+    ) -> Self {
         for page in (0..vm.mem.size()).step_by(0x1000) {
             vm.map(page, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
         }
         vm.set_cpu_model(model);
+        vm.set_exception_delivery(delivery);
         let mut cpu = vm.new_vcpu();
         cpu.cpu.rip = 0x400;
         cpu.cpu.legacy.cr0 = 0x8000_0001;
@@ -633,9 +649,9 @@ fn device_region_split_within_one_page_is_also_refused() {
 }
 
 #[test]
-fn memory_push_pop_are_refused_before_either_operand_translation() {
-    // Step-1 policy, paging design §§3.4, 5: multiple operands require one
-    // instruction-wide preflight before any MMIO or operand RAM transfer.
+fn step4_memory_push_pop_preflight_both_operands() {
+    // Paging design §3.4; 80386 PRM §9.8.14 pp. 9-17–18: either
+    // operand can fault, before any stack/explicit-operand transfer.
     for model in MODELS {
         for code32 in [false, true] {
             for pop in [false, true] {
@@ -667,25 +683,23 @@ fn memory_push_pop_are_refused_before_either_operand_translation() {
                         } else {
                             code.extend((OFFSET as u16).to_le_bytes());
                         }
-                        let before = format!("{:?}", f.cpu.cpu);
-                        let directory = f.get(f.pde());
-                        let operand = f.get(f.pte());
-                        let stack = f.get(f.pte() + 4);
+                        let before = f.cpu.cpu.gpr;
                         let exit = f.execute(&code).unwrap_err();
                         assert!(
-                            matches!(
-                                exit,
-                                Exit::UnsupportedSystemContext {
-                                    operation: UnsupportedSystemOperation::LegacyInstruction,
-                                    ..
-                                }
-                            ),
+                            matches!(exit, Exit::Exception { vector: 14, .. }),
                             "{exit:?}"
                         );
-                        assert_eq!(format!("{:?}", f.cpu.cpu), before);
-                        assert_eq!(f.get(f.pde()), directory);
-                        assert_eq!(f.get(f.pte()), operand);
-                        assert_eq!(f.get(f.pte() + 4), stack);
+                        assert_eq!(f.cpu.cpu.gpr, before);
+                        assert_eq!(
+                            f.cpu.cpu.legacy.cr2,
+                            LINEAR + if absent_stack { 0x1000 } else { 0 }
+                        );
+                        assert_eq!(
+                            exit.fault_metadata().unwrap().error_code(),
+                            ErrorCode::bits(u32::from(pop != absent_stack) * 2, 7)
+                        );
+                        assert_eq!(f.get(f.pte()) & D, 0);
+                        assert_eq!(f.get(f.pte() + 4) & D, 0);
                         for (page, value) in [(DATA, 0x1234_5678), (NEXT, 0x8765_4321)] {
                             if !mmio || page != present_page {
                                 assert_eq!(f.get(u64::from(page)), value);
@@ -1655,5 +1669,1242 @@ fn paging_cas_retry_preserves_edits_and_restarts_identity_changes() {
                 }
             }
         }
+    }
+}
+
+impl Fixture {
+    fn memory_code(&self, opcode: &[u8], extension: u8, offset: u32, size: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        if (size == 4) != self.code32 {
+            code.push(0x66);
+        }
+        code.extend(opcode);
+        code.push((extension << 3) | if self.code32 { 5 } else { 6 });
+        if self.code32 {
+            code.extend(offset.to_le_bytes());
+        } else {
+            code.extend((offset as u16).to_le_bytes());
+        }
+        code
+    }
+    fn assert_pf(&mut self, code: &[u8], linear: u32, error: u32) {
+        let gpr = self.cpu.cpu.gpr;
+        let flags = format!("{:?}", self.cpu.cpu.flags);
+        let ip = self.cpu.cpu.rip;
+        let exit = self.execute(code).unwrap_err();
+        assert!(
+            matches!(exit, Exit::Exception { vector: 14, .. }),
+            "{code:02x?}: {exit:?}"
+        );
+        assert_eq!(
+            exit.fault_metadata().unwrap().error_code(),
+            ErrorCode::bits(error, 7)
+        );
+        assert_eq!(self.cpu.cpu.legacy.cr2, linear, "{code:02x?}");
+        assert_eq!(self.cpu.cpu.gpr, gpr, "{code:02x?}");
+        assert_eq!(format!("{:?}", self.cpu.cpu.flags), flags);
+        assert_eq!(self.cpu.cpu.rip, ip);
+    }
+    fn put64(&self, at: u64, value: u64) {
+        self.vm.write_bytes(at, &value.to_le_bytes()).unwrap();
+    }
+    fn system_page(&self, index: u32, frame: u32, flags: u32) {
+        self.put(u64::from(PT + index * 4), frame | flags);
+    }
+}
+
+#[test]
+fn step4_strings_preflight_each_operand_and_crossing() {
+    // 80386 PRM §14.6 pp. 14-4–5, §17 MOVS/CMPS/LODS/SCAS/STOS;
+    // §9.8.14 pp. 9-17–18: failed iterations preserve indices/count/flags.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for opcode in [0xa4, 0xa5, 0xaa, 0xab, 0xac, 0xad, 0xa6, 0xa7, 0xae, 0xaf] {
+                for missing in [0, 1] {
+                    let source = matches!(opcode, 0xa4..=0xa7 | 0xac | 0xad);
+                    let dest = !matches!(opcode, 0xac | 0xad);
+                    if (missing == 0 && !source) || (missing == 1 && !dest) {
+                        continue;
+                    }
+                    for crossing in [false, true] {
+                        let mut f = Fixture::new(model, code32, 3);
+                        let size = if opcode & 1 == 0 { 1 } else { 4 };
+                        let offset = if crossing { 0xfff } else { 0 };
+                        f.cpu.cpu.gpr[1] = 2;
+                        f.cpu.cpu.gpr[6] = u64::from(OFFSET + offset);
+                        f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0x2000 + offset);
+                        f.system_page(4, NEXT, 7);
+                        f.system_page(5, 0xe000, 7);
+                        f.system_page(6, 0xf000, 7);
+                        let page = 3 + missing * 2 + u32::from(crossing && size > 1);
+                        f.system_page(page, 0, 0);
+                        let linear =
+                            BASE + page * 0x1000 + if crossing && size > 1 { 0 } else { offset };
+                        let mut code = vec![0xf3];
+                        if size == 4 && !code32 {
+                            code.push(0x66);
+                        }
+                        code.push(opcode);
+                        f.assert_pf(
+                            &code,
+                            linear,
+                            if missing == 1 && matches!(opcode, 0xa4 | 0xa5 | 0xaa | 0xab) {
+                                6
+                            } else {
+                                4
+                            },
+                        );
+                        assert_eq!(f.get(u64::from(DATA)), 0);
+                        assert_eq!(f.get(0xe000), 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_rep_completed_iterations_survive_fault_and_checkpoint_restore() {
+    // 80386 PRM §9.2.1 pp. 9-2–3, §9.8.14.1 p. 9-18, §14.6
+    // pp. 14-4–5: REP restarts with the remaining count and advanced indices.
+    for model in MODELS {
+        for opcode in [0xa5, 0xab, 0xad, 0xa7, 0xaf] {
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.cpu.gpr[0] = 0x1234_5678;
+            f.cpu.cpu.gpr[1] = 2;
+            f.cpu.cpu.gpr[6] = u64::from(OFFSET + 0xffc);
+            f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0xffc);
+            f.put(u64::from(DATA + 0xffc), 0x1234_5678);
+            let code = [0xf3, opcode];
+            f.mapped_instruction(&code);
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[1], 1);
+            let saved = f.cpu.cpu.clone();
+            let mut ram = vec![0; f.vm.mem.size() as usize];
+            for (page, bytes) in ram.chunks_mut(0x1000).enumerate() {
+                f.vm.read_bytes(page as u64 * 0x1000, bytes).unwrap();
+            }
+            let exit = f.cpu.interpret_paged_for_test(&f.vm).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 14, .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR + 0x1000);
+            assert_eq!(f.cpu.cpu.gpr, saved.gpr);
+            f.put(f.pte() + 4, NEXT | 7);
+            f.put(u64::from(NEXT), 0x1234_5678);
+            f.cpu.interpret_paged_for_test(&f.vm).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[1], 0);
+            let finished = f.cpu.cpu.gpr;
+            // Full checkpoint: CPU and RAM, followed by derived-state invalidation.
+            f.cpu.cpu = saved;
+            for (page, bytes) in ram.chunks(0x1000).enumerate() {
+                f.vm.write_bytes(page as u64 * 0x1000, bytes).unwrap();
+            }
+            f.cpu.invalidate_paging();
+            f.put(f.pte() + 4, NEXT | 7);
+            f.put(u64::from(NEXT), 0x1234_5678);
+            f.cpu.interpret_paged_for_test(&f.vm).unwrap();
+            assert_eq!(f.cpu.cpu.gpr, finished);
+        }
+    }
+}
+
+#[test]
+fn step4_stack_frames_all_widths_preflight_before_commit() {
+    // 80386 PRM §17 PUSH/POP/PUSHA/POPA/ENTER/LEAVE/CALL/RET/IRET;
+    // SDM Vol 3A §7.15 Event 14 pp. 7-47–50. Engine whole-frame restart.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for size in [2, 4] {
+                for opcode in [
+                    0x50, 0x58, 0x9c, 0x9d, 0x60, 0x61, 0xc8, 0xc9, 0xe8, 0xc3, 0xcb, 0xcf,
+                ] {
+                    let mut f = Fixture::new(model, code32, 0);
+                    let pushing = matches!(opcode, 0x50 | 0x9c | 0x60 | 0xc8 | 0xe8);
+                    let frame = matches!(opcode, 0x60 | 0xc8);
+                    if pushing && frame {
+                        f.system_page(3, 0, 0);
+                        f.system_page(4, NEXT, 7);
+                        f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x1000 + size);
+                    } else {
+                        f.cpu.cpu.gpr[4] =
+                            u64::from(OFFSET + 0xfff + if pushing { size } else { 0 });
+                    }
+                    f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0xfff);
+                    f.cpu.cpu.gpr[0] = 0xdead_beef;
+                    f.put(u64::from(DATA + 0xffc), 0x400);
+                    f.put(u64::from(NEXT), 0xfeed_beef);
+                    let mut code = Vec::new();
+                    if (size == 4) != code32 {
+                        code.push(0x66);
+                    }
+                    code.push(opcode);
+                    if opcode == 0xc8 {
+                        code.extend([0, 0, 2]);
+                    }
+                    if opcode == 0xe8 {
+                        code.extend(vec![0; size as usize]);
+                    }
+                    f.assert_pf(
+                        &code,
+                        if pushing && frame {
+                            LINEAR + 0x1000 - size
+                        } else {
+                            LINEAR + 0x1000
+                        },
+                        if pushing { 2 } else { 0 },
+                    );
+                    assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x400);
+                    assert_eq!(f.get(u64::from(NEXT)), 0xfeed_beef);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_locked_scatter_operands_translate_and_are_restartable() {
+    // SDM Vol 3A §11.1.2.2 pp. 11-4–5; paging design §3.4 retains
+    // the existing single-vCPU scatter contract and split-device refusal.
+    for model in MODELS {
+        for opcode in [0x01, 0x87, 0xb1] {
+            if opcode == 0xb1 && model == CpuModel::I80386 {
+                continue;
+            }
+            let mut f = Fixture::new(model, true, 3);
+            f.cpu.cpu.gpr[0] = 0x1234_5678;
+            let mut code = vec![0xf0];
+            if opcode == 0xb1 {
+                code.push(0x0f);
+            }
+            code.extend(f.memory_code(&[opcode], 0, OFFSET + 0xffe, 4));
+            f.put(u64::from(DATA + 0xffc), 0x0001_0000);
+            f.assert_pf(&code, LINEAR + 0x1000, 6);
+            assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x0001_0000);
+            f.system_page(4, NEXT, 7);
+            f.execute(&code).unwrap();
+            assert_eq!(f.get(f.pte()) & D, D);
+            assert_eq!(f.get(f.pte() + 4) & D, D);
+            assert_eq!(
+                f.get(u64::from(DATA + 0xffc)) >> 16,
+                if opcode == 0xb1 {
+                    1
+                } else if opcode == 0x01 {
+                    0x5679
+                } else {
+                    0x5678
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn step4_x87_full_images_and_bcd_cross_pages_without_partial_state() {
+    // SDM Vol 3A §11.1.1 pp. 11-2–3: engine strong restart policy;
+    // Vol 1 §8.1.9 pp. 8-10–12; 486 PRM FBLD/FBSTP pp. 26-77–80.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for (opcode, extension, writing) in [
+                (0xd9, 4, false),
+                (0xdd, 4, false),
+                (0xd9, 6, true),
+                (0xdd, 6, true),
+                (0xdf, 4, false),
+                (0xdf, 6, true),
+                (0xdb, 5, false),
+                (0xdb, 7, true),
+            ] {
+                let mut f = Fixture::new(model, code32, 0);
+                f.cpu.set_fpu_model(x86jit_core::FpuModel::Present);
+                let code = f.memory_code(
+                    &[opcode],
+                    extension,
+                    OFFSET + 0xffc,
+                    if code32 { 4 } else { 2 },
+                );
+                let fp = format!("{:?}", f.cpu.cpu);
+                f.put(u64::from(DATA + 0xffc), 0x1122_3344);
+                f.assert_pf(&code, LINEAR + 0x1000, if writing { 2 } else { 0 });
+                let mut after = f.cpu.cpu.clone();
+                after.legacy.cr2 = 0xdead_beef;
+                assert_eq!(format!("{after:?}"), fp);
+                assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x1122_3344);
+                f.system_page(4, NEXT, 7);
+                f.execute(&code).unwrap();
+                assert_eq!(f.get(f.pte()) & (A | D), if writing { A | D } else { A });
+                assert_eq!(
+                    f.get(f.pte() + 4) & (A | D),
+                    if writing { A | D } else { A }
+                );
+            }
+        }
+    }
+}
+
+fn step4_descriptor(base: u32, limit: u32, attr: u16) -> u64 {
+    u64::from(limit & 0xffff)
+        | (u64::from(base & 0xffff) << 16)
+        | (u64::from((base >> 16) & 0xff) << 32)
+        | (u64::from(attr & 0xff) << 40)
+        | (u64::from((limit >> 16) & 15) << 48)
+        | (u64::from(attr >> 12) << 52)
+        | (u64::from(base >> 24) << 56)
+}
+
+impl Fixture {
+    fn system_setup(&mut self) {
+        use x86jit_core::legacy::{SegmentCache, SystemSegment};
+        self.system_page(6, 0x12000, 3);
+        self.system_page(7, 0x13000, 3);
+        self.system_page(8, 0x14000, 3);
+        self.system_page(9, 0x15000, 3);
+        self.system_page(10, 0x16000, 3);
+        self.cpu.cpu.legacy.gdtr.base = BASE + 0x6000;
+        self.cpu.cpu.legacy.gdtr.limit = 0x2f;
+        self.cpu.cpu.legacy.idtr.base = BASE + 0x7000;
+        self.cpu.cpu.legacy.idtr.limit = 0x7ff;
+        self.cpu.cpu.cs = 8;
+        self.cpu.cpu.ds = 16;
+        self.cpu.cpu.es = 16;
+        self.cpu.cpu.ss = 16;
+        self.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x800);
+        self.put64(0x12008, step4_descriptor(0, 0xfffff, 0xc09b));
+        self.put64(0x12010, step4_descriptor(BASE, 0xfffff, 0xc093));
+        self.put64(0x12018, step4_descriptor(BASE + 0x8000, 0x100, 0x8b));
+        self.put64(0x12020, step4_descriptor(BASE + 0x9000, 0x100, 0x89));
+        self.cpu.cpu.legacy.tr = SystemSegment {
+            selector: 24,
+            cache: SegmentCache {
+                base: BASE + 0x8000,
+                limit: 0x100,
+                attributes: 0x8b,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+    }
+    fn gate(&self, vector: u8, ip: u32, size: u8) {
+        self.put64(
+            0x13000 + u64::from(vector) * 8,
+            u64::from(ip & 0xffff)
+                | (8 << 16)
+                | (u64::from(if size == 4 { 0x8e_u32 } else { 0x86 }) << 40)
+                | (u64::from(ip & 0xffff_0000) << 32),
+        );
+    }
+    fn mapped_instruction(&self, code: &[u8]) {
+        self.code_mapping(0, CODE_FRAME);
+        self.vm
+            .write_bytes(u64::from(CODE_FRAME) + 0x400, code)
+            .unwrap();
+    }
+}
+
+#[test]
+fn step4_descriptor_gdt_ldt_supervisor_reads_and_accessed_cas() {
+    // SDM Vol 3A §5.6.1 p. 5-33 (implicit supervisor), §3.4.5.1
+    // p. 3-13 (A); 486 WP §5.1.3 p. 5-5, §5.6.1 pp. 5-33–35.
+    for model in MODELS {
+        for ldt in [false, true] {
+            for protected in [false, true] {
+                let mut f = Fixture::new(model, true, 3);
+                f.system_setup();
+                f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                f.cpu.cpu.gpr[0] = if ldt { 15 } else { 19 };
+                let at = if ldt { 0x12008 } else { 0x12010 };
+                f.put64(at, step4_descriptor(BASE, 0xfffff, 0xc0f2));
+                f.system_page(6, 0x12000, if protected { 1 } else { 3 });
+                if ldt {
+                    f.cpu.cpu.legacy.ldtr.selector = 40;
+                    f.cpu.cpu.legacy.ldtr.cache = x86jit_core::legacy::SegmentCache {
+                        base: BASE + 0x6000,
+                        limit: 0x2f,
+                        attributes: 0x82,
+                        ..Default::default()
+                    };
+                }
+                if protected && model != CpuModel::I80386 {
+                    f.assert_pf(&[0x8e, 0xd8], BASE + 0x6000 + (at as u32 & 0xfff) + 5, 3);
+                    assert_eq!(f.cpu.cpu.ds, 16);
+                    assert_eq!((f.get(at + 4) >> 8) & 1, 0);
+                } else {
+                    f.execute(&[0x8e, 0xd8]).unwrap();
+                    assert_eq!(f.cpu.cpu.ds, if ldt { 15 } else { 19 });
+                    assert_eq!((f.get(at + 4) >> 8) & 1, 1);
+                    assert_eq!(f.get(u64::from(PT + 6 * 4)) & D, D);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_system_descriptor_and_table_images_cross_pages() {
+    // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §9.8.14 pp. 9-17–18:
+    // implicit descriptor reads are supervisor; LGDT's operand is explicit.
+    for model in MODELS {
+        for ldt in [false, true] {
+            let mut f = Fixture::new(model, true, 3);
+            f.system_setup();
+            f.cpu.cpu.gpr[0] = if ldt { 15 } else { 19 };
+            if ldt {
+                f.cpu.cpu.legacy.ldtr.selector = 40;
+                f.cpu.cpu.legacy.ldtr.cache = x86jit_core::legacy::SegmentCache {
+                    base: BASE + 0x6ff4,
+                    limit: 0x2f,
+                    attributes: 0x82,
+                    ..Default::default()
+                };
+                f.put(0x12ffc, 0xffff);
+            } else {
+                f.cpu.cpu.legacy.gdtr.base = BASE + 0x6fec;
+                f.put(0x12ffc, 0xffff);
+            }
+            f.system_page(7, 0, 0);
+            f.assert_pf(&[0x8e, 0xd8], BASE + 0x7000, 0);
+        }
+        for load in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            let code = f.memory_code(&[0x0f, 0x01], if load { 2 } else { 0 }, OFFSET + 0xffe, 4);
+            f.put(u64::from(DATA + 0xffc), 0x1122_3344);
+            let table = f.cpu.cpu.legacy.gdtr;
+            f.assert_pf(&code, LINEAR + 0x1000, if load { 0 } else { 2 });
+            assert_eq!(f.cpu.cpu.legacy.gdtr, table);
+            assert_eq!(f.get(u64::from(DATA + 0xffc)), 0x1122_3344);
+        }
+    }
+}
+
+#[test]
+fn step4_io_bitmap_and_port_strings_use_supervisor_paging() {
+    // 386 PRM §§8.3, 17.2.2.5 pp. 8-4–6, 17-15; SDM Vol 3A
+    // §5.6.1 p. 5-33: TSS/bitmap are implicit supervisor references.
+    for model in MODELS {
+        for opcode in [0xec, 0xee, 0x6d, 0x6f] {
+            let mut f = Fixture::new(model, true, 3);
+            f.system_setup();
+            f.cpu.cpu.gpr[2] = 0x20;
+            f.cpu.cpu.gpr[1] = 2;
+            f.cpu.cpu.gpr[6] = u64::from(OFFSET);
+            f.cpu.cpu.gpr[7] = u64::from(OFFSET);
+            f.vm.write_bytes(0x14066, &0x80_u16.to_le_bytes()).unwrap();
+            let code = if opcode < 0x80 {
+                vec![0xf3, opcode]
+            } else {
+                vec![opcode]
+            };
+            f.mapped_instruction(&code);
+            // Pointer page absent: #PF before a port handoff, U=0 at CPL3.
+            f.system_page(8, 0, 0);
+            let regs = f.cpu.cpu.gpr;
+            let exit = f.fetch_at(0x400).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 14, .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0x8066);
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(0, 7)
+            );
+            assert_eq!(f.cpu.cpu.gpr, regs);
+            assert!(f.cpu.cpu.pending_port_in.is_none());
+            f.system_page(8, 0x14000, 3);
+            let exit = f.fetch_at(0x400).unwrap_err();
+            assert!(matches!(exit, Exit::PortIo { .. }), "{exit:?}");
+            if opcode == 0x6d {
+                f.cpu.complete_port_in(0x1234_5678);
+                f.cpu.interpret_paged_for_test(&f.vm).unwrap();
+                assert_eq!(f.get(u64::from(DATA)), 0x1234_5678);
+                assert_eq!(f.cpu.cpu.gpr[7], u64::from(OFFSET + 4));
+                assert_eq!(f.cpu.cpu.gpr[1], 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_port_string_crossing_fault_precedes_port_effect() {
+    // SDM Vol 2A INS pp. 3-464–465, Vol 2B OUTS pp. 4-173–175;
+    // paging design §3.4: each iteration preflights its complete operand.
+    for model in MODELS {
+        for output in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.cpu.gpr[1] = 2;
+            f.cpu.cpu.gpr[6] = u64::from(OFFSET + 0xffe);
+            f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0xffe);
+            f.mapped_instruction(&[0xf3, if output { 0x6f } else { 0x6d }]);
+            let before = f.cpu.cpu.gpr;
+            let exit = f.fetch_at(0x400).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 14, .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR + 0x1000);
+            assert_eq!(f.cpu.cpu.gpr, before);
+            assert!(f.cpu.cpu.port_string_in.is_none());
+            assert!(f.cpu.cpu.pending_port_in.is_none());
+        }
+    }
+}
+
+#[test]
+fn step4_in_guest_page_fault_frames_and_iret_both_gate_widths() {
+    // 80386 PRM §9.8.14 pp. 9-17–19; §17 INT/IRET pp. 17-70–79:
+    // #PF saves the original instruction IP and an error code at gate width.
+    for model in MODELS {
+        for size in [2, 4] {
+            let mut f = Fixture::with_delivery(
+                Vm::new(VmConfig::flat(0x20000)),
+                model,
+                true,
+                0,
+                x86jit_core::ExceptionDelivery::InGuest,
+            );
+            f.system_setup();
+            f.gate(14, 0x800, size);
+            f.mapped_instruction(&f.code(false, OFFSET + 0x1000));
+            let old_sp = f.cpu.cpu.gpr[4];
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.rip, 0x800);
+            assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR + 0x1000);
+            assert_eq!(f.cpu.cpu.gpr[4], old_sp - u64::from(4 * size));
+            let at = u64::from(DATA) + 0x800 - u64::from(4 * size);
+            assert_eq!(f.vm.mem.read(at, size).unwrap(), 0);
+            assert_eq!(f.vm.mem.read(at + u64::from(size), size).unwrap(), 0x400);
+            f.system_page(4, NEXT, 7);
+            f.cpu.cpu.gpr[4] += u64::from(size); // handler discards #PF's error code
+            let code = if size == 2 {
+                vec![0x66, 0xcf]
+            } else {
+                vec![0xcf]
+            };
+            f.execute(&code).unwrap();
+            assert_eq!(f.cpu.cpu.rip, 0x400);
+            assert_eq!(f.cpu.cpu.gpr[4], old_sp);
+        }
+    }
+}
+
+#[test]
+fn step4_nested_delivery_updates_cr2_and_obeys_double_fault_table() {
+    // 80386 PRM §9.8.8 Tables 9-3/9-4 p. 9-13; SDM Vol 3A
+    // §7.15 Event 8, Table 7-5 pp. 7-36–37: #PF→#PF is #DF;
+    // contributory→#PF is serial. CR2 is overwritten (§9.8.14 p. 9-18).
+    for model in MODELS {
+        for first_pf in [false, true] {
+            let mut f = Fixture::with_delivery(
+                Vm::new(VmConfig::flat(0x20000)),
+                model,
+                true,
+                0,
+                x86jit_core::ExceptionDelivery::InGuest,
+            );
+            f.system_setup();
+            f.cpu.cpu.gpr[0] = 0x8000_0000;
+            f.mapped_instruction(if first_pf {
+                &[0xa1, 0, 0x40, 0, 0]
+            } else {
+                &[0x0f, 0x22, 0xc0]
+            }); // MOV CR0,EAX with PE=0 → #GP
+            if first_pf {
+                // #PF's IDT entry on the absent page; #DF's entry remains mapped.
+                f.cpu.cpu.legacy.idtr.base = BASE + 0x7f90;
+                f.system_page(8, 0, 0);
+                f.put64(0x13fd0, 0x900 | (8 << 16) | (0x8e_u64 << 40));
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.cpu.cpu.rip, 0x900);
+                assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0x8000);
+                assert_eq!(f.vm.mem.read(u64::from(DATA) + 0x7f0, 4).unwrap(), 0);
+            } else {
+                // #GP's IDT entry absent; #PF's entry remains in the next page.
+                f.cpu.cpu.legacy.idtr.base = BASE + 0x6f90;
+                f.system_page(6, 0, 0);
+                // This also hides GDT: install a separate present GDT mapping.
+                f.cpu.cpu.legacy.gdtr.base = BASE + 0x9000;
+                f.put64(0x15008, step4_descriptor(0, 0xfffff, 0xc09b));
+                f.put64(0x13000, 0x900 | (8 << 16) | (0x8e_u64 << 40));
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.cpu.cpu.rip, 0x900);
+                assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0x6ff8);
+            }
+        }
+        let mut f = Fixture::with_delivery(
+            Vm::new(VmConfig::flat(0x20000)),
+            model,
+            true,
+            0,
+            x86jit_core::ExceptionDelivery::InGuest,
+        );
+        f.system_setup();
+        f.gate(14, 0x800, 4);
+        f.gate(8, 0x900, 4);
+        f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x1002);
+        f.mapped_instruction(&[0xa1, 0, 0x50, 0, 0]);
+        let exit = f.fetch_at(0x400).unwrap_err();
+        assert!(matches!(exit, Exit::Shutdown { .. }), "{exit:?}");
+        assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR + 0x1000);
+    }
+}
+
+#[test]
+fn step4_privilege_transition_tss_and_inner_stack_are_supervisor() {
+    // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §§6.5, 9.6 pp. 6-22,
+    // 9-8–9; §17 INT pp. 17-70–71: inner stack and TSS use supervisor rights.
+    for model in MODELS {
+        let mut f = Fixture::with_delivery(
+            Vm::new(VmConfig::flat(0x20000)),
+            model,
+            true,
+            3,
+            x86jit_core::ExceptionDelivery::InGuest,
+        );
+        f.system_setup();
+        f.cpu.cpu.cs = 11;
+        f.cpu.cpu.ss = 19;
+        f.cpu.cpu.legacy.cr0 |= 1 << 16;
+        f.put(0x14004, 0xa800);
+        f.put(0x14008, 16);
+        f.gate(14, 0x800, 4);
+        f.mapped_instruction(&f.code(false, OFFSET + 0x1000));
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.legacy.cpl, 0);
+        assert_eq!(f.cpu.cpu.rip, 0x800);
+        assert_eq!(f.cpu.cpu.gpr[4], 0xa800 - 24);
+        assert_eq!(f.get(0x167e8), 4); // original user #PF error
+        assert_eq!(f.get(0x167ec), 0x400);
+        assert_eq!(f.get(0x167fc), 19); // old SS
+        assert_eq!(f.get(u64::from(PT + 10 * 4)) & D, D);
+    }
+}
+
+#[test]
+fn step4_bitmap_second_page_fault_precedes_port_handoff() {
+    // 386 PRM §8.3.2 pp. 8-5–6, §17.2.2.5 p. 17-15: two-byte
+    // bitmap window, translated with implicit supervisor access at CPL3.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 3);
+        f.system_setup();
+        f.cpu.cpu.legacy.tr.cache.limit = 0x1100;
+        f.cpu.cpu.gpr[2] = 0x20;
+        f.vm.write_bytes(0x14066, &0xffb_u16.to_le_bytes()).unwrap();
+        f.system_page(9, 0, 0);
+        f.mapped_instruction(&[0xec]);
+        let exit = f.fetch_at(0x400).unwrap_err();
+        assert!(
+            matches!(exit, Exit::Exception { vector: 14, .. }),
+            "{exit:?}"
+        );
+        assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0x9000);
+        assert_eq!(
+            exit.fault_metadata().unwrap().error_code(),
+            ErrorCode::bits(0, 7)
+        );
+        assert!(f.cpu.cpu.pending_port_in.is_none());
+    }
+}
+
+impl Fixture {
+    fn incoming_task(&mut self, new_directory: u32, postcommit_fault: bool) {
+        self.system_setup();
+        self.put(0x1501c, new_directory | 0x18);
+        self.put(0x15020, 0x900);
+        self.put(0x15024, 2);
+        self.put(0x15028, 0xabcdef);
+        self.put(0x15038, OFFSET + 0x700);
+        for (offset, selector) in [(0x48, 16), (0x4c, 8), (0x50, 16), (0x54, 16)] {
+            self.put(0x15000 + offset, selector);
+        }
+        self.put(0x15066, 0x80);
+        self.put(0x1401c, 0xdead_beef);
+        self.put(u64::from(new_directory + 4 * (BASE >> 22)), OTHER_PT | 7);
+        self.put(
+            u64::from(OTHER_PT + 6 * 4),
+            0x17000 | if postcommit_fault { 0 } else { 3 },
+        );
+        self.put64(0x17008, step4_descriptor(0, 0xfffff, 0xc09b));
+        self.put64(0x17010, step4_descriptor(BASE + 0x10000, 0xfffff, 0xc093));
+        self.put(u64::from(OTHER_PT + 0x13 * 4), 0x18000 | 7);
+        self.map_code(new_directory, 0x7000, 0, OTHER_FRAME, 7);
+        self.vm
+            .write_bytes(u64::from(OTHER_FRAME) + 0x900, &self.code(false, OFFSET))
+            .unwrap();
+        self.put(0x18000, 0x7654_3210);
+        self.cpu.cpu.gpr[0] = 0x1122_3344;
+    }
+}
+
+#[test]
+fn step4_task_cr3_handoff_saves_old_space_and_loads_descriptors_in_new_space() {
+    // 80386 PRM §7.1 Fig. 7-1 pp. 7-2–3, §7.5 pp. 7-8–9;
+    // SDM Vol 3A §10.3 pp. 10-10–11: incoming PDBR precedes descriptor loads.
+    for model in MODELS {
+        for postcommit_fault in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.incoming_task(OTHER_PD, postcommit_fault);
+            let code = [0xea, 0, 0, 0, 0, 0x20, 0]; // supported far JMP to 386 TSS
+            f.mapped_instruction(&code);
+            let result = f.fetch_at(0x400);
+            // SDM Vol 3A §10.3 steps 9, 14 pp. 10-11–13: descriptor
+            // faults have the complete incoming register/selector context.
+            assert_eq!(f.cpu.cpu.rip, 0x900);
+            assert_eq!(f.cpu.cpu.gpr[0], 0xabcdef);
+            assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x700));
+            assert_eq!((f.cpu.cpu.cs, f.cpu.cpu.ss, f.cpu.cpu.ds), (8, 16, 16));
+            assert_eq!(f.cpu.cpu.legacy.cpl, 0);
+            if postcommit_fault {
+                let exit = result.unwrap_err();
+                assert!(
+                    matches!(exit, Exit::Exception { vector: 14, .. }),
+                    "{exit:?}"
+                );
+                assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0x6008);
+                assert_eq!(exit.fault_metadata().unwrap().saved_rip(), 0x900);
+            } else {
+                result.unwrap();
+                assert_eq!(f.cpu.cpu.legacy.segments[1].base, BASE + 0x10000);
+                assert_eq!(f.cpu.cpu.legacy.segments[3].base, BASE + 0x10000);
+                f.cpu.interpret_paged_for_test(&f.vm).unwrap();
+                assert_eq!(f.cpu.cpu.gpr[0], 0x7654_3210);
+            }
+            assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+            assert_eq!(
+                f.cpu.cpu.legacy.cr3,
+                OTHER_PD | if model == CpuModel::I80386 { 0 } else { 0x18 }
+            );
+            assert_eq!(f.get(0x14020), 0x407);
+            assert_eq!(f.get(0x14028), 0x1122_3344);
+            assert_eq!(f.get(0x1401c), 0xdead_beef); // CR3 is static, never saved
+            assert_eq!((f.get(0x1201c) >> 8) & 0xf, 9); // old busy cleared in old mapping
+            assert_eq!((f.get(0x12024) >> 8) & 0xf, 11);
+        }
+    }
+}
+
+#[test]
+fn step4_task_save_fault_before_commit_retains_outgoing_ownership() {
+    // 80386 PRM §7.5 p. 7-8; SDM Vol 3A §10.3 pp. 10-10–11:
+    // preflight of outgoing saves precedes the existing task commit seam.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.system_setup();
+        f.cpu.cpu.legacy.tr.cache.base = BASE + 0xafe0;
+        let old = f.cpu.cpu.legacy;
+        f.assert_pf(&[0xea, 0, 0, 0, 0, 0x20, 0], BASE + 0xb000, 2);
+        assert_eq!(f.cpu.cpu.legacy.cr3, old.cr3);
+        assert_eq!(f.cpu.cpu.legacy.tr, old.tr);
+        assert_eq!(f.get(0x14020), 0);
+        assert_eq!((f.get(0x12024) >> 8) & 0xf, 9);
+    }
+}
+
+#[test]
+fn step4_task_image_fault_before_commit_retains_outgoing_task_ownership() {
+    // SDM Vol 3A §10.3 step 5 p. 10-10 and notes p. 10-13: TSS
+    // residency precedes saves/TR. 80386 PRM §9.8.14.1 p. 9-18:
+    // later TSS-driven descriptor checks instead name the new task's IP.
+    for model in MODELS {
+        for page in [9, 10] {
+            let mut f = Fixture::new(model, true, 0);
+            f.system_setup();
+            // At 9ff0h only static fields occupy the first page. Residency
+            // includes that page even though register loads start on the next.
+            f.put64(0x12020, step4_descriptor(BASE + 0x9ff0, 0x100, 0x89));
+            f.system_page(page, 0, 0);
+            let old = f.cpu.cpu.legacy;
+            f.assert_pf(
+                &[0xea, 0, 0, 0, 0, 0x20, 0],
+                BASE + if page == 9 { 0x9ff0 } else { 0xa000 },
+                0,
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr3, old.cr3);
+            assert_eq!(f.cpu.cpu.legacy.tr, old.tr);
+            assert_eq!(f.get(0x14020), 0);
+            assert_eq!((f.get(0x1201c) >> 8) & 0xf, 11);
+            assert_eq!((f.get(0x12024) >> 8) & 0xf, 9);
+        }
+    }
+}
+
+#[test]
+fn step4_task_descriptor_accessed_writes_set_clean_gdt_page_dirty() {
+    // SDM Vol 3A §3.4.5.1 p. 3-13; 80386 PRM §5.2.4.3 p. 5-10;
+    // Intel486 PRM §5.3.4.3 pp. 5-21–22: A-bit stores require PTE.D.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.incoming_task(OTHER_PD, false);
+        f.put64(0x17008, step4_descriptor(0, 0xfffff, 0xc09a));
+        f.put64(0x17010, step4_descriptor(BASE + 0x10000, 0xfffff, 0xc092));
+        assert_eq!(f.get(u64::from(OTHER_PT + 6 * 4)) & D, 0);
+        f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+        f.fetch_at(0x400).unwrap();
+        assert_eq!((f.get(0x1700c) >> 8) & 1, 1);
+        assert_eq!((f.get(0x17014) >> 8) & 1, 1);
+        assert_eq!(f.get(u64::from(OTHER_PT + 6 * 4)) & D, D);
+    }
+}
+
+#[test]
+fn step4_task_image_page_fault_handler_repairs_page_and_retries_switch() {
+    // SDM Vol 3A §10.3 step 5 p. 10-10, notes p. 10-13: failed
+    // residency checks leave the old task restartable. Descriptor faults
+    // after step 13 instead belong to the new task (80386 PRM §9.8.14.1
+    // p. 9-18); this handler repairs the incoming image before that point.
+    for model in MODELS {
+        let mut f = Fixture::with_delivery(
+            Vm::new(VmConfig::flat(0x20000)),
+            model,
+            true,
+            0,
+            x86jit_core::ExceptionDelivery::InGuest,
+        );
+        f.incoming_task(OTHER_PD, false);
+        let mut image = [0; 0x68];
+        f.vm.read_bytes(0x15000, &mut image).unwrap();
+        f.vm.write_bytes(0x15fe0, &image[..0x20]).unwrap();
+        f.vm.write_bytes(0x16000, &image[0x20..]).unwrap();
+        f.put64(0x12020, step4_descriptor(BASE + 0x9fe0, 0x100, 0x89));
+        f.system_page(10, 0, 0);
+        f.system_page(11, PT, 3); // handler's linear alias of the page table
+        f.gate(14, 0x800, 4);
+        f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+        f.vm.write_bytes(
+            u64::from(CODE_FRAME) + 0x800,
+            &[
+                0xc7, 0x05, 0x28, 0xb0, 0, 0, 3, 0x60, 1, 0, // MOV [b028h],16003h
+                0x83, 0xc4, 4,    // discard #PF error code
+                0xcf, // IRETD retries the far JMP
+            ],
+        )
+        .unwrap();
+        let old_tr = f.cpu.cpu.legacy.tr;
+        let old_cr3 = f.cpu.cpu.legacy.cr3;
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.rip, 0x800);
+        assert_eq!(f.cpu.cpu.legacy.cr2, BASE + 0xa000);
+        assert_eq!(f.cpu.cpu.legacy.tr, old_tr);
+        assert_eq!(f.cpu.cpu.legacy.cr3, old_cr3);
+        assert_eq!(f.cpu.cpu.gpr[0], 0x1122_3344);
+        assert_eq!(f.get(0x14020), 0);
+        assert_eq!((f.get(0x12024) >> 8) & 0xf, 9);
+        f.cpu.interpret_paged_for_test(&f.vm).unwrap(); // repair
+        assert_eq!(f.get(u64::from(PT + 10 * 4)), 0x16003);
+        f.cpu.interpret_paged_for_test(&f.vm).unwrap(); // discard error
+        f.cpu.interpret_paged_for_test(&f.vm).unwrap(); // IRETD
+        assert_eq!(f.cpu.cpu.rip, 0x400);
+        f.cpu.interpret_paged_for_test(&f.vm).unwrap(); // retry JMP
+        assert_eq!(f.cpu.cpu.rip, 0x900);
+        assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+        assert_eq!(f.cpu.cpu.legacy.cr3 & !0xfff, OTHER_PD);
+        assert_eq!(f.cpu.cpu.gpr[0], 0xabcdef);
+        assert_eq!(f.get(0x14020), 0x407);
+        assert_eq!((f.get(0x12024) >> 8) & 0xf, 11);
+    }
+}
+
+#[test]
+fn step4_enter_allocation_page_fault_preserves_frame_and_registers() {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297: a write at the final SP
+    // must be permitted. Intel486 PRM §4.1.3 p. 4-7: supervisor WP.
+    for model in MODELS {
+        for cpl in [0, 3] {
+            for level in [0, 2] {
+                for present in [false, true] {
+                    if cpl == 0 && present && model == CpuModel::I80386 {
+                        continue; // 386 has no supervisor write protection.
+                    }
+                    let mut f = Fixture::new(model, true, cpl);
+                    f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                    f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x100);
+                    f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0x80);
+                    f.put(u64::from(DATA + 0xfc), 0x1122_3344);
+                    f.put(u64::from(DATA + 0xf8), 0x5566_7788);
+                    f.put(u64::from(DATA + 0xf4), 0x99aa_bbcc);
+                    f.system_page(2, NEXT, if present { 5 } else { 0 });
+                    let pushes = if level == 0 { 1 } else { 3 };
+                    let final_sp = OFFSET + 0x100 - pushes * 4 - 0x1000;
+                    let code = [0xc8, 0, 0x10, level];
+                    f.assert_pf(
+                        &code,
+                        BASE + final_sp,
+                        u32::from(present) | 2 | if cpl == 3 { 4 } else { 0 },
+                    );
+                    assert_eq!(f.get(u64::from(DATA + 0xfc)), 0x1122_3344);
+                    assert_eq!(f.get(u64::from(DATA + 0xf8)), 0x5566_7788);
+                    assert_eq!(f.get(u64::from(DATA + 0xf4)), 0x99aa_bbcc);
+                    assert_eq!(f.get(f.pte()) & D, 0);
+                    f.system_page(2, NEXT, 7);
+                    f.execute(&code).unwrap();
+                    assert_eq!(f.cpu.cpu.gpr[4], u64::from(final_sp));
+                    assert_eq!(f.cpu.cpu.gpr[5], u64::from(OFFSET + 0xfc));
+                    assert_eq!(f.get(u64::from(DATA + 0xfc)), OFFSET + 0x80);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_enter_frame_faults_precede_allocation_fault() {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297: display reads and frame
+    // pushes precede allocation. Levels 0/1 never read a display.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let size = if code32 { 4 } else { 2 };
+            for cpl in [0, 3] {
+                for level in [0u8, 1, 2, 31] {
+                    for missing_push in [false, true] {
+                        let mut f = Fixture::new(model, code32, cpl);
+                        f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x100);
+                        // For level 31 only the last display read is absent.
+                        let bp = OFFSET + 0x2000 + size * u32::from(level.saturating_sub(2));
+                        f.cpu.cpu.gpr[5] = u64::from(bp);
+                        f.system_page(2, 0, 0); // allocation
+                        f.system_page(4, 0, 0); // display
+                        f.system_page(5, NEXT, 7);
+                        if missing_push {
+                            f.system_page(3, 0, 0);
+                        }
+                        let sentinel = [0xa5; 0x100];
+                        f.vm.write_bytes(u64::from(DATA), &sentinel).unwrap();
+                        let pushes = if level == 0 { 1 } else { u32::from(level) + 1 };
+                        let final_sp = OFFSET + 0x100 - pushes * size - 0x1000;
+                        let code = [0xc8, 0, 0x10, level];
+                        let (linear, write) = if missing_push {
+                            (LINEAR + 0x100 - size, true)
+                        } else if level > 1 {
+                            (BASE + OFFSET + 0x2000 - size, false)
+                        } else {
+                            (BASE + final_sp, true)
+                        };
+                        f.assert_pf(
+                            &code,
+                            linear,
+                            (u32::from(write) << 1) | if cpl == 3 { 4 } else { 0 },
+                        );
+                        let mut stack = [0; 0x100];
+                        f.vm.read_bytes(u64::from(DATA), &mut stack).unwrap();
+                        assert_eq!(stack, sentinel);
+                        assert_eq!(f.get(f.pte()) & D, 0);
+                        if !missing_push && level > 1 {
+                            f.system_page(4, 0x19000, 7);
+                            f.assert_pf(&code, BASE + final_sp, 2 | if cpl == 3 { 4 } else { 0 });
+                            f.vm.read_bytes(u64::from(DATA), &mut stack).unwrap();
+                            assert_eq!(stack, sentinel);
+                            assert_eq!(f.get(f.pte()) & D, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_enter_allocation_checks_permissions_without_physical_access_or_ad() {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297: the allocation only checks
+    // whether a write would #PF. ASSUMED: no A/D changes for this check
+    // without an access (ENTER and Vol 3A §5.8 do not specify them).
+    const ALLOCATION_PT: u32 = 0x5000;
+    for model in MODELS {
+        for code32 in [false, true] {
+            let size = if code32 { 4 } else { 2 };
+            for level in [0, 1, 2, 31] {
+                for device in [false, true] {
+                    for preset in [0, A | D | SOFTWARE] {
+                        let mut f = Fixture::new(model, code32, 3);
+                        // Put allocation and real transfers under separate PDEs
+                        // so neither level's A/D assertion can be masked by a push.
+                        f.cpu.cpu.legacy.segments[x86jit_core::legacy::SegmentId::Ss as usize]
+                            .base = BASE - OFFSET;
+                        f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x100);
+                        f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0x80);
+                        f.system_page(0, DATA, 7);
+                        let pde = f.pde() - 4;
+                        let pte = u64::from(ALLOCATION_PT + 0xffc);
+                        f.put(pde, ALLOCATION_PT | 7 | preset);
+                        f.put(pte, NEXT | 7 | preset);
+                        f.vm.unmap(u64::from(NEXT), 0x1000).unwrap();
+                        if device {
+                            f.vm.map(u64::from(NEXT), 0x1000, Prot::RWX, RegionKind::Trap)
+                                .unwrap();
+                        }
+                        let pushes = if level == 0 { 1 } else { u32::from(level) + 1 };
+                        let final_sp = OFFSET + 0x100 - pushes * size - 0x1000;
+                        let code = [0xc8, 0, 0x10, level];
+                        // A denied hypothetical write still #PFs before a commit,
+                        // even though the physical destination has no RAM backing.
+                        f.put(pte, NEXT | 5 | preset);
+                        f.assert_pf(&code, BASE - OFFSET + final_sp, 7);
+                        assert_eq!(f.get(pde), ALLOCATION_PT | 7 | preset);
+                        assert_eq!(f.get(pte), NEXT | 5 | preset);
+                        f.put(pte, NEXT | 7 | preset);
+                        f.execute(&code).unwrap();
+                        assert_eq!(f.cpu.cpu.gpr[4], u64::from(final_sp));
+                        assert_eq!(f.cpu.cpu.gpr[5], u64::from(OFFSET + 0x100 - size));
+                        assert_eq!(
+                            f.get(u64::from(DATA + 0x100 - size))
+                                & if code32 { u32::MAX } else { 0xffff },
+                            OFFSET + 0x80
+                        );
+                        assert_eq!(f.cpu.cpu.legacy.cr2, BASE - OFFSET + final_sp);
+                        assert_eq!(f.get(pde), ALLOCATION_PT | 7 | preset);
+                        assert_eq!(f.get(pte), NEXT | 7 | preset);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_enter_nesting_push_fault_precedes_every_frame_write() {
+    // SDM Vol 2A §3.3 ENTER pp. 3-295–297: each display push requires
+    // write permission even when the allocation's final page is writable.
+    for model in MODELS {
+        for cpl in [0, 3] {
+            for present in [false, true] {
+                if cpl == 0 && present && model == CpuModel::I80386 {
+                    continue;
+                }
+                let mut f = Fixture::new(model, true, cpl);
+                f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                f.cpu.cpu.gpr[4] = u64::from(OFFSET + 4);
+                f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0x80);
+                f.put(u64::from(DATA), 0x1122_3344);
+                f.system_page(0, 0x19000, 7); // allocation ends at offset ff8h
+                f.system_page(2, NEXT, if present { 5 } else { 0 });
+                f.assert_pf(
+                    &[0xc8, 0, 0x20, 2],
+                    LINEAR - 4,
+                    u32::from(present) | 2 | if cpl == 3 { 4 } else { 0 },
+                );
+                assert_eq!(f.get(u64::from(DATA)), 0x1122_3344);
+                assert_eq!(f.get(f.pte()) & D, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn step4_protection_faults_preserve_stack_string_and_x87_destinations() {
+    // SDM Vol 3A §5.6.1 pp. 5-33–35; 80386 PRM §§6.4.1–6.4.2
+    // pp. 6-20–22: CPL3 requires U/S, and writes additionally require R/W.
+    for model in MODELS {
+        for family in 0..16 {
+            let mut f = Fixture::new(model, true, 3);
+            f.cpu.set_fpu_model(x86jit_core::FpuModel::Present);
+            f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x100);
+            f.cpu.cpu.gpr[5] = u64::from(OFFSET + 0x100);
+            f.cpu.cpu.gpr[6] = u64::from(OFFSET + 0x100);
+            f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0x200);
+            f.cpu.cpu.gpr[1] = 2;
+            let (code, writing, offset) = match family {
+                0 => (vec![0x50], true, 0xfc),
+                1 => (vec![0x58], false, 0x100),
+                2 => (vec![0x60], true, 0xfc),
+                3 => (vec![0x61], false, 0x100),
+                4 => (vec![0xc8, 0, 0, 2], true, 0xfc),
+                5 => (vec![0xc9], false, 0x100),
+                6 => (vec![0xe8, 0, 0, 0, 0], true, 0xfc),
+                7 => (vec![0xc3], false, 0x100),
+                8 => (vec![0xcf], false, 0x100),
+                9 => (vec![0xf3, 0xa5], true, 0x200),
+                10 => (vec![0xf3, 0xab], true, 0x200),
+                11 => (vec![0xf3, 0xad], false, 0x100),
+                12 => (vec![0xf3, 0xa7], false, 0x100),
+                13 => (vec![0xf3, 0xaf], false, 0x200),
+                14 => (f.memory_code(&[0xd9], 4, OFFSET + 0x100, 4), false, 0x100),
+                _ => (f.memory_code(&[0xdd], 6, OFFSET + 0x100, 4), true, 0x100),
+            };
+            f.tables(7, if writing { 5 } else { 3 });
+            f.assert_pf(&code, LINEAR + offset, if writing { 7 } else { 5 });
+            assert_eq!(f.get(u64::from(DATA)), 0);
+            assert_eq!(f.get(f.pte()) & D, 0);
+        }
+    }
+}
+
+#[test]
+fn step4_zero_count_rep_never_translates_operands_or_bitmap() {
+    // SDM Vol 2B REP Operation p. 4-564; 80386 PRM §17 REP:
+    // a zero count performs no iterations, memory references or port access.
+    for model in MODELS {
+        for opcode in [0xa5, 0xab, 0xad, 0xa7, 0xaf, 0x6d, 0x6f] {
+            let mut f = Fixture::new(model, true, 3);
+            f.cpu.cpu.gpr[1] = 0;
+            f.tables(0, 0);
+            let before = f.cpu.cpu.gpr;
+            f.execute(&[0xf3, opcode]).unwrap();
+            assert_eq!(f.cpu.cpu.gpr, before);
+            assert_eq!(f.get(f.pde()) & A, 0);
+            assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+        }
+    }
+}
+
+#[test]
+fn step4_far_call_and_return_frames_translate_every_slot() {
+    // 80386 PRM §17 CALL/RET pp. 17-40–42, 17-141–145;
+    // paging design §3.4: the whole frame precedes any operand commit.
+    for model in MODELS {
+        for size in [2, 4] {
+            let mut f = Fixture::new(model, true, 0);
+            f.system_setup();
+            let mut code = Vec::new();
+            if size == 2 {
+                code.push(0x66);
+            }
+            code.push(0x9a);
+            code.extend(0x800_u32.to_le_bytes()[..size as usize].iter());
+            code.extend(8_u16.to_le_bytes());
+            // First pushed slot mapped, second on an absent preceding page.
+            f.system_page(3, 0, 0);
+            f.system_page(4, NEXT, 7);
+            f.cpu.cpu.gpr[4] = u64::from(OFFSET + 0x1000 + size);
+            f.assert_pf(&code, LINEAR + 0x1000 - size, 2);
+            assert_eq!(f.get(u64::from(NEXT)), 0);
+            f.system_page(3, DATA, 7);
+            f.execute(&code).unwrap();
+            assert_eq!(f.cpu.cpu.rip, 0x800);
+            let mut ret = Vec::new();
+            if size == 2 {
+                ret.push(0x66);
+            }
+            ret.push(0xcb);
+            f.execute(&ret).unwrap();
+            assert_eq!(f.cpu.cpu.rip, 0x400 + code.len() as u64);
+            assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x1000 + size));
+        }
+    }
+}
+
+#[test]
+fn step4_equal_task_cr3_load_discards_private_fetch_proofs() {
+    // Design §3.2 conservative task-load invalidation, including equal CR3;
+    // 80386 PRM §§5.2.5, 7.5 pp. 5-11, 7-8; SDM Vol 3A §5.10.4 p. 5-48.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.incoming_task(OTHER_PD, false);
+        f.put(0x1501c, PD as u32 | 0x18);
+        f.mapped_instruction(&[0xea, 0, 0, 0, 0, 0x20, 0]);
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(
+            f.cpu.cpu.legacy.cr3,
+            PD as u32 | if model == CpuModel::I80386 { 0 } else { 0x18 }
+        );
+        assert_eq!(f.cpu.cpu.rip, 0x900);
+        assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+    }
+}
+
+#[test]
+fn step4_comparison_page_fault_restores_pre_rep_flags() {
+    // SDM Vol 2B §4.3 REPE/REPZ p. 4-565 and REPNE/REPNZ p. 4-567:
+    // completed comparison iterations retain indices/count; a fault restores
+    // the flags from before the whole repeated instruction.
+    for model in MODELS {
+        for opcode in [0xa7, 0xaf] {
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.cpu.flags.cf = true;
+            f.cpu.cpu.flags.of = true;
+            f.cpu.cpu.flags.zf = false;
+            let flags = f.cpu.cpu.flags;
+            f.cpu.cpu.gpr[0] = 42;
+            f.cpu.cpu.gpr[1] = 2;
+            f.cpu.cpu.gpr[6] = u64::from(OFFSET + 0xffc);
+            f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0xffc);
+            f.put(u64::from(DATA + 0xffc), 42);
+            f.mapped_instruction(&[0xf3, opcode]);
+            f.fetch_at(0x400).unwrap();
+            assert!(f.cpu.cpu.flags.zf);
+            let exit = f.cpu.interpret_paged_for_test(&f.vm).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 14, .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.flags, flags);
+            assert_eq!(f.cpu.cpu.gpr[1], 1);
+            assert_eq!(f.cpu.cpu.gpr[7], u64::from(OFFSET + 0x1000));
+        }
+    }
+}
+
+#[test]
+fn step4_handler_fetch_fault_is_separate_from_completed_delivery() {
+    // SDM Vol 3A §7.15 Event 8 p. 7-37: faults on instruction prefetch
+    // are outside the nested-delivery table; §5.7 pp. 5-37–38 defines CR2.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.system_setup();
+        f.gate(0x20, 0x1800, 4);
+        f.mapped_instruction(&[0xcd, 0x20]);
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.rip, 0x1800);
+        assert_eq!(f.cpu.cpu.gpr[4], u64::from(OFFSET + 0x800 - 12));
+        let exit = f.cpu.interpret_paged_for_test(&f.vm).unwrap_err();
+        assert!(
+            matches!(exit, Exit::Exception { vector: 14, .. }),
+            "{exit:?}"
+        );
+        assert_eq!(f.cpu.cpu.legacy.cr2, 0x1800);
+        assert_eq!(exit.fault_metadata().unwrap().saved_rip(), 0x1800);
+    }
+}
+
+#[test]
+fn step4_ins_handoff_retains_cross_page_destination_plan() {
+    // Paging design §3.4; 80386 PRM §14.6 pp. 14-4–5: one iteration
+    // owns its destination before the irreversible port input. Page-table
+    // edits during the handoff cannot redirect that already-preflighted store.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.system_page(4, NEXT, 7);
+        f.cpu.cpu.gpr[1] = 2;
+        f.cpu.cpu.gpr[7] = u64::from(OFFSET + 0xffe);
+        f.mapped_instruction(&[0xf3, 0x6d]);
+        let exit = f.fetch_at(0x400).unwrap_err();
+        assert!(matches!(exit, Exit::PortIo { .. }), "{exit:?}");
+        assert_eq!(f.get(f.pte()) & D, D);
+        assert_eq!(f.get(f.pte() + 4) & D, D);
+        f.put(f.pte(), 0);
+        f.put(f.pte() + 4, 0);
+        f.cpu.invalidate_paging();
+        f.cpu.complete_port_in(0x1122_beef);
+        f.cpu.interpret_paged_for_test(&f.vm).unwrap();
+        assert_eq!(f.get(u64::from(DATA + 0xffc)) >> 16, 0xbeef);
+        assert_eq!(f.get(u64::from(NEXT)) & 0xffff, 0x1122);
+        assert_eq!(f.get(f.pte()), 0);
+        assert_eq!(f.get(f.pte() + 4), 0);
+        assert_eq!(f.cpu.cpu.gpr[7], u64::from(OFFSET + 0x1002));
+        assert_eq!(f.cpu.cpu.gpr[1], 1);
+    }
+}
+
+#[test]
+fn step4_equal_task_cr3_load_observes_pte_written_by_outgoing_save() {
+    // 80386 PRM §§5.2.5, 7.5 pp. 5-11, 7-8; SDM Vol 3A §10.3
+    // pp. 10-10–11: save with the outgoing translation, reload CR3, then
+    // translate incoming descriptors. Engine policy flushes equal CR3 too.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.incoming_task(OTHER_PD, false);
+        f.put(0x1501c, PD as u32 | 0x18);
+        // TSS.EIP aliases PTE[6]. Saving next IP 17407h remaps the GDT
+        // from frame 12000h to 17000h, where DS has a different base.
+        f.cpu.cpu.legacy.tr.cache.base = BASE + 0x7ff8;
+        f.system_page(8, PT, 3);
+        f.cpu.cpu.gpr[0] = u64::from(PT | 3); // preserve PTE[8]
+        f.cpu.cpu.gpr[1] = 0x15003; // preserve incoming TSS PTE[9]
+        f.code_mapping(0x17000, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xea, 0, 0, 0, 0, 0x20, 0])
+            .unwrap();
+        f.fetch_at(0x17400).unwrap();
+        assert_eq!(f.get(u64::from(PT + 6 * 4)) & 0xfffff000, 0x17000);
+        assert_eq!(f.cpu.cpu.legacy.segments[1].base, BASE + 0x10000);
+        assert_eq!(f.cpu.cpu.rip, 0x900);
+        assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
     }
 }
