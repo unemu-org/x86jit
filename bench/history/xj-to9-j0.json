@@ -1,0 +1,361 @@
+{
+  "date": "2026-11-24",
+  "engine_commit": "0bc16f55e557f3a4dac12a35335b175d41a42a54",
+  "host": {
+    "cpu": "Apple M5 Pro",
+    "architecture": "aarch64",
+    "cores": 18,
+    "performance_cores": 6,
+    "efficiency_cores": 12,
+    "ram_gib": 64,
+    "os": "macOS 27.0.1 (26A434)",
+    "kernel": "Darwin 27.0.0"
+  },
+  "toolchain": {
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "llvm": "22.1.8",
+    "profile": "release",
+    "jit_opt": "Speed",
+    "linker": "LLVM clang / ld64.lld",
+    "rustc_wrapper": "disabled"
+  },
+  "protocol": {
+    "runner": "scripts/perf_campaign.py::run_process",
+    "aslr": false,
+    "parallel_processes": 1,
+    "main_processes": 3,
+    "main_rounds": 3,
+    "diagnostic_processes": 3,
+    "diagnostic_rounds": 1,
+    "iterations": 2000000,
+    "warmup_iterations": 10000,
+    "guest_consistency": "Fast",
+    "paging": "identity, uncached, ordinary RAM tables",
+    "devices": false,
+    "machine_model": "I80386",
+    "cpl": 0,
+    "counter": "proc_pid_rusage RUSAGE_INFO_V4 ri_instructions",
+    "jit_retired": "derived from finite validated loop; counter disabled",
+    "sampling": "sample denied by sandbox",
+    "frequency_pinning": false
+  },
+  "binaries": {
+    "main_sha256": "2e9ac29ec9623df0bb705ecdb4faa1b0a232f161ed72d6f5fd52ac47455aa221",
+    "diagnostics_sha256": "9634f0d1fc845a179ec6dfa107ad47298e63866ae87013890c2f14f23e113743",
+    "note": "Diagnostic-only harness modes were added after the main campaign; engine and timed execute function unchanged. Final source reproduces both modes. Final source also contains a precedence-parentheses-only lint correction.",
+    "final_build_sha256": "337b5652ba3f3658aeca4e61b832688f6fe3fceef90cd37cbb335b9638ef60b4"
+  },
+  "harness_sha256": "126899acc000635ce3db0fda066a9d5c3e1491971a48a3b52b57dd7fe07da719",
+  "summary": {
+    "xj-to9-j0.csv": {
+      "register|machine-real16": {
+        "samples": 9,
+        "mips": {
+          "median": 89.93,
+          "min": 76.523,
+          "max": 92.514
+        },
+        "host_per_step": {
+          "median": 339.854,
+          "min": 339.841,
+          "max": 339.95
+        }
+      },
+      "register|machine-protected32": {
+        "samples": 9,
+        "mips": {
+          "median": 10.193,
+          "min": 8.368,
+          "max": 10.269
+        },
+        "host_per_step": {
+          "median": 2807.009,
+          "min": 2806.853,
+          "max": 2808.056
+        }
+      },
+      "register|machine-paged32": {
+        "samples": 9,
+        "mips": {
+          "median": 1.92,
+          "min": 1.655,
+          "max": 2.094
+        },
+        "host_per_step": {
+          "median": 12384.387,
+          "min": 12384.106,
+          "max": 12386.767
+        }
+      },
+      "register|application-interp32": {
+        "samples": 9,
+        "mips": {
+          "median": 94.994,
+          "min": 90.046,
+          "max": 108.105
+        },
+        "host_per_step": {
+          "median": 316.842,
+          "min": 316.831,
+          "max": 316.981
+        }
+      },
+      "register|application-jit32": {
+        "samples": 9,
+        "mips": {
+          "median": 1256.623,
+          "min": 1067.364,
+          "max": 1281.169
+        },
+        "host_per_step": {
+          "median": 24.604,
+          "min": 24.602,
+          "max": 24.612
+        }
+      },
+      "memory|machine-real16": {
+        "samples": 9,
+        "mips": {
+          "median": 79.483,
+          "min": 65.366,
+          "max": 82.201
+        },
+        "host_per_step": {
+          "median": 417.062,
+          "min": 417.054,
+          "max": 417.301
+        }
+      },
+      "memory|machine-protected32": {
+        "samples": 9,
+        "mips": {
+          "median": 8.741,
+          "min": 7.012,
+          "max": 8.844
+        },
+        "host_per_step": {
+          "median": 3200.652,
+          "min": 3200.407,
+          "max": 3206.833
+        }
+      },
+      "memory|machine-paged32": {
+        "samples": 9,
+        "mips": {
+          "median": 1.649,
+          "min": 1.366,
+          "max": 1.768
+        },
+        "host_per_step": {
+          "median": 14511.561,
+          "min": 14510.73,
+          "max": 14515.959
+        }
+      },
+      "memory|application-interp32": {
+        "samples": 9,
+        "mips": {
+          "median": 98.33,
+          "min": 84.515,
+          "max": 105.833
+        },
+        "host_per_step": {
+          "median": 330.645,
+          "min": 330.633,
+          "max": 330.861
+        }
+      },
+      "memory|application-jit32": {
+        "samples": 9,
+        "mips": {
+          "median": 664.647,
+          "min": 580.625,
+          "max": 673.297
+        },
+        "host_per_step": {
+          "median": 48.207,
+          "min": 48.205,
+          "max": 48.328
+        }
+      },
+      "callret|machine-real16": {
+        "samples": 9,
+        "mips": {
+          "median": 45.83,
+          "min": 38.528,
+          "max": 46.916
+        },
+        "host_per_step": {
+          "median": 652.49,
+          "min": 652.472,
+          "max": 652.568
+        }
+      },
+      "callret|machine-protected32": {
+        "samples": 9,
+        "mips": {
+          "median": 7.912,
+          "min": 7.057,
+          "max": 8.053
+        },
+        "host_per_step": {
+          "median": 3417.133,
+          "min": 3416.974,
+          "max": 3417.264
+        }
+      },
+      "callret|machine-paged32": {
+        "samples": 9,
+        "mips": {
+          "median": 1.601,
+          "min": 1.338,
+          "max": 1.63
+        },
+        "host_per_step": {
+          "median": 15002.911,
+          "min": 15002.245,
+          "max": 15003.87
+        }
+      },
+      "callret|application-interp32": {
+        "samples": 9,
+        "mips": {
+          "median": 62.503,
+          "min": 52.196,
+          "max": 66.07
+        },
+        "host_per_step": {
+          "median": 489.069,
+          "min": 489.051,
+          "max": 489.17
+        }
+      },
+      "callret|application-jit32": {
+        "samples": 9,
+        "mips": {
+          "median": 316.111,
+          "min": 276.69,
+          "max": 351.223
+        },
+        "host_per_step": {
+          "median": 87.612,
+          "min": 87.604,
+          "max": 87.627
+        }
+      }
+    },
+    "xj-to9-j0-components.csv": {
+      "register-pad|machine-protected32": {
+        "samples": 3,
+        "mips": {
+          "median": 7.568,
+          "min": 7.423,
+          "max": 7.67
+        },
+        "host_per_step": {
+          "median": 3345.768,
+          "min": 3345.754,
+          "max": 3345.872
+        }
+      },
+      "register-pad|machine-paged32": {
+        "samples": 3,
+        "mips": {
+          "median": 1.74,
+          "min": 1.717,
+          "max": 1.743
+        },
+        "host_per_step": {
+          "median": 13516.299,
+          "min": 13516.206,
+          "max": 13516.307
+        }
+      },
+      "register-pad|application-interp32": {
+        "samples": 3,
+        "mips": {
+          "median": 94.489,
+          "min": 92.441,
+          "max": 98.956
+        },
+        "host_per_step": {
+          "median": 316.827,
+          "min": 316.827,
+          "max": 316.83
+        }
+      },
+      "register|application-single32": {
+        "samples": 3,
+        "mips": {
+          "median": 34.604,
+          "min": 33.301,
+          "max": 34.708
+        },
+        "host_per_step": {
+          "median": 744.312,
+          "min": 744.293,
+          "max": 744.315
+        }
+      },
+      "memory|application-single32": {
+        "samples": 3,
+        "mips": {
+          "median": 35.205,
+          "min": 35.098,
+          "max": 35.779
+        },
+        "host_per_step": {
+          "median": 758.074,
+          "min": 758.073,
+          "max": 758.119
+        }
+      },
+      "callret|application-single32": {
+        "samples": 3,
+        "mips": {
+          "median": 36.309,
+          "min": 35.847,
+          "max": 37.941
+        },
+        "host_per_step": {
+          "median": 700.686,
+          "min": 700.677,
+          "max": 700.702
+        }
+      },
+      "register|component-decode": {
+        "samples": 3,
+        "mips": {
+          "median": 32.513,
+          "min": 32.332,
+          "max": 32.657
+        },
+        "host_per_step": {
+          "median": 699.303,
+          "min": 699.291,
+          "max": 699.315
+        }
+      },
+      "register-pad|component-decode": {
+        "samples": 3,
+        "mips": {
+          "median": 18.799,
+          "min": 18.52,
+          "max": 18.97
+        },
+        "host_per_step": {
+          "median": 1162.168,
+          "min": 1162.144,
+          "max": 1162.168
+        }
+      }
+    }
+  },
+  "validation": [
+    "release build",
+    "all five default paths and component modes: finite-loop smoke assertions",
+    "135 main and 24 diagnostic raw samples: schema, counts and summaries",
+    "cargo fmt --all -- --check",
+    "release clippy for machine32_loops: -D warnings"
+  ]
+}
