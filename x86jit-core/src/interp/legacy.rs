@@ -4214,8 +4214,25 @@ where
                         let value = u64::from((value & !3) | rpl);
                         match destination {
                             SelectorDestination::Register(reg) => write_reg(cpu, *reg, value, 2),
-                            SelectorDestination::Memory(addr) => {
-                                write(cpu, mem, read_val(*addr, temps), 2, value)?
+                            SelectorDestination::Memory { addr, segment } => {
+                                // 80386 PRM §17 p. 17-25: "if the result is in a
+                                // nonwritable segment" applies when a result is written.
+                                // SDM Vol 2A §3.3 ARPL p. 3-75; Intel486 PRM §26
+                                // p. 26-27: only the raising branch writes DEST.
+                                let addr = read_val(*addr, temps);
+                                if context.segment_class == crate::SegmentClass::Checked {
+                                    let offset = (addr as u32)
+                                        .wrapping_sub(cpu.legacy.segments[*segment as usize].base);
+                                    segment_access(
+                                        cpu,
+                                        context,
+                                        *segment,
+                                        u64::from(offset),
+                                        2,
+                                        AccessKind::Write,
+                                    )?;
+                                }
+                                write(cpu, mem, addr, 2, value)?;
                             }
                         }
                     }

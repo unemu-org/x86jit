@@ -1360,7 +1360,10 @@ pub enum DescriptorQuery {
 #[derive(Clone, Copy, Debug)]
 pub enum SelectorDestination {
     Register(crate::state::Reg),
-    Memory(crate::ir::Val),
+    Memory {
+        addr: crate::ir::Val,
+        segment: SegmentId,
+    },
 }
 
 // SDM Vol 2A §3.3 LMSW; I286 PRM §10.2.2 Table 10-1 p. 10-4,

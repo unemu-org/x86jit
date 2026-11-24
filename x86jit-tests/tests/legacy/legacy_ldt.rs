@@ -583,19 +583,52 @@ fn ldt_accessed_device_update_requires_atomic_emulation() {
 }
 
 #[test]
-fn arpl_memory_fault_keeps_flags_and_unchanged_rpl_requires_writable_segment() {
-    // 286 PRM App. B p. B-21; 386 PRM §17 p. 17-25:
-    // memory destination must be writable even if its RPL needs no increase.
-    for model in MODELS {
+fn arpl_memory_write_permission_is_checked_only_when_raising_rpl() {
+    // 80386 PRM §17 p. 17-25: "if the result is in a nonwritable segment"
+    // applies only to a written result. SDM Vol 2A §3.3 ARPL p. 3-75 and
+    // Intel486 PRM §26 p. 26-27 write DEST only in the raising branch.
+    // Oracle: a public CPU test suite observes no fault for unchanged RPL.
+    for model in [
+        CpuModel::I80286,
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
         let (vm, mut cpu) = setup(model, b"\x63\x0e\xff\xff");
         cpu.cpu.gpr[1] = 3;
         cpu.cpu.flags.zf = false;
         fault(&mut cpu, &vm, 13, Some(0));
-        let (vm, mut cpu) = setup(model, b"\x63\x0e\x00\x40");
-        cpu.cpu.legacy.segments[1].attributes = 0x91;
-        vm.write_bytes(0x4000, &3u16.to_le_bytes()).unwrap();
-        cpu.cpu.gpr[1] = 1;
-        fault(&mut cpu, &vm, 13, Some(0));
+        for dest in [1u16, 2, 3] {
+            let (vm, mut cpu) = setup(model, b"\x63\x0e\x00\x40");
+            cpu.cpu.legacy.segments[1].attributes = 0x91;
+            vm.write_bytes(0x4000, &(0x1200 | dest).to_le_bytes())
+                .unwrap();
+            cpu.cpu.gpr[1] = 2;
+            cpu.cpu.flags.zf = true;
+            if dest < 2 {
+                fault(&mut cpu, &vm, 13, Some(0));
+            } else {
+                steps(&mut cpu, &vm, 1);
+                assert!(!cpu.cpu.flags.zf);
+            }
+            assert_eq!(value(&vm, 0x4000, 2), u64::from(0x1200 | dest));
+        }
+        if model != CpuModel::I80286 {
+            for dest in [1u16, 2, 3] {
+                let (vm, mut cpu) = setup(model, b"\x63\x0d\x00\x40\x00\x00");
+                for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                    segment.base = 0;
+                    segment.limit = u32::MAX;
+                    segment.attributes = if i == 0 { 0x409b } else { 0x4093 };
+                }
+                vm.write_bytes(0x4000, &(0x1200 | dest).to_le_bytes())
+                    .unwrap();
+                cpu.cpu.gpr[1] = 2;
+                steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.flags.zf, dest < 2);
+                assert_eq!(value(&vm, 0x4000, 2), u64::from(0x1200 | dest.max(2)));
+            }
+        }
     }
 }
 

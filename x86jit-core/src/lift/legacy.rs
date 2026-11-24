@@ -289,7 +289,9 @@ pub(crate) fn instruction_for_profile(
                 )
         });
         let mut pop_stack = insn.mnemonic() == Mnemonic::Pop;
-        let operand_access = if writing {
+        // SDM Vol 2A §3.3 ARPL p. 3-75: its write is conditional;
+        // AdjustRpl checks write permission only in the raising branch.
+        let operand_access = if writing && insn.mnemonic() != Mnemonic::Arpl {
             crate::AccessKind::Write
         } else {
             crate::AccessKind::Read
@@ -1284,7 +1286,13 @@ pub(super) fn lower(
                     (read_reg(reg, ops, tg), SelectorDestination::Register(reg))
                 }
                 WriteTarget::Mem { addr, .. } => {
-                    (load(ops, tg, addr, 2), SelectorDestination::Memory(addr))
+                    (
+                        load(ops, tg, addr, 2),
+                        SelectorDestination::Memory {
+                            addr,
+                            segment: segment(insn.memory_segment()).expect("memory segment"),
+                        },
+                    )
                 }
                 _ => return Err(unsupported_insn(insn)),
             };

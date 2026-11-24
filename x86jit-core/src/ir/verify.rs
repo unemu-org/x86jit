@@ -451,7 +451,8 @@ impl IrBlock {
                         destination,
                     } => {
                         check(&[*selector, *rpl], &[])?;
-                        if let crate::legacy::SelectorDestination::Memory(addr) = destination {
+                        if let crate::legacy::SelectorDestination::Memory { addr, .. } = destination
+                        {
                             check(&[*addr], &[])?;
                         }
                     }
@@ -678,7 +679,10 @@ mod tests {
             let op = LegacyOp::AdjustRpl {
                 selector: values[0],
                 rpl: values[1],
-                destination: SelectorDestination::Memory(values[2]),
+                destination: SelectorDestination::Memory {
+                    addr: values[2],
+                    segment: crate::SegmentId::Ds,
+                },
             };
             assert_eq!(
                 block(vec![IrOp::Legacy(op)])

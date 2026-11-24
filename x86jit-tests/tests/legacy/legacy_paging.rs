@@ -4474,3 +4474,42 @@ fn fetch_protection_fault_ad_is_model_specific() {
         }
     }
 }
+
+#[test]
+fn arpl_readonly_page_faults_only_when_raising_rpl() {
+    // SDM Vol 2A §3.3 ARPL p. 3-75; 80386 PRM §17 p. 17-25;
+    // Intel486 PRM §26 p. 26-27: only the raising branch writes DEST.
+    // Oracle: a public CPU test suite witnesses the conditional write.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for dest in [1u16, 2, 3] {
+                let mut f = Fixture::new(model, code32, 3);
+                f.tables(7, 5);
+                f.put(u64::from(DATA), u32::from(0x1200 | dest));
+                f.cpu.cpu.gpr[1] = 2;
+                f.cpu.cpu.flags.zf = true;
+                let code = if code32 {
+                    &b"\x63\x0d\x00\x30\x00\x00"[..]
+                } else {
+                    &b"\x63\x0e\x00\x30"[..]
+                };
+                let flags = f.cpu.cpu.flags;
+                if dest < 2 {
+                    let exit = f.execute(code).unwrap_err();
+                    assert!(matches!(exit, Exit::Exception { vector: 14, .. }));
+                    assert_eq!(
+                        exit.fault_metadata().unwrap().error_code(),
+                        ErrorCode::bits(7, 7)
+                    );
+                    assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR);
+                    assert_eq!(f.cpu.cpu.flags, flags);
+                } else {
+                    f.execute(code).unwrap();
+                    assert!(!f.cpu.cpu.flags.zf);
+                }
+                assert_eq!(f.get(u64::from(DATA)), u32::from(0x1200 | dest));
+                assert_eq!(f.get(f.pte()) & D, 0);
+            }
+        }
+    }
+}
