@@ -14,6 +14,8 @@ pub(crate) enum Cause {
 
 #[derive(Clone, Default)]
 pub(crate) struct SwitchState {
+    #[cfg(feature = "test-hooks")]
+    pub allow_virtual8086: bool,
     pub committed: bool,
     pub completed: bool,
     pending: Option<Pending>,
@@ -89,6 +91,8 @@ impl SwitchState {
     pub fn reset(&mut self) {
         *self = Self {
             record_regs: self.record_regs,
+            #[cfg(feature = "test-hooks")]
+            allow_virtual8086: self.allow_virtual8086,
             ..Self::default()
         };
     }

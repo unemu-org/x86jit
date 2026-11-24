@@ -722,6 +722,47 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     Ok(value)
 }
 
+// Control-transfer frame inputs cannot use dummy values: EFLAGS.VM selects
+// both the frame extent and the segment-loading rules (design v86 §4.2).
+#[cold]
+#[inline(never)]
+pub(super) fn read_frame<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+) -> Result<u64, Exit> {
+    if let Some(tx) = mem.transaction() {
+        tx.borrow_mut().frame_reads = true;
+    }
+    let fragments = plan(cpu, mem, addr, size, AccessKind::Read, false)?;
+    let mut value = 0;
+    for f in fragments {
+        let part = transfer_read(cpu, mem, &f).inspect_err(|exit| {
+            if matches!(exit, Exit::MmioRead { .. }) {
+                if let Some(tx) = mem.transaction() {
+                    tx.borrow_mut().pending_mmio_linear = Some(f.linear);
+                }
+            }
+        })?;
+        value |= part << f.shift;
+    }
+    Ok(value)
+}
+
+// Only bus completion outputs cross from a preparation preview. Architectural
+// destinations remain in the original image until the complete return succeeds.
+#[cold]
+#[inline(never)]
+fn retain_frame_answers(cpu: &mut CpuState, preview: &CpuState) {
+    cpu.pending_mmio = preview.pending_mmio;
+    cpu.mmio_parts = preview.mmio_parts;
+    cpu.mmio_parts_len = preview.mmio_parts_len;
+    cpu.mmio_parts_rip = preview.mmio_parts_rip;
+    cpu.mmio_retry_active = preview.mmio_retry_active;
+    cpu.mmio_retry_cs = preview.mmio_retry_cs;
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
@@ -969,6 +1010,7 @@ pub(crate) struct Transaction {
     overlay: Vec<(u64, u8)>,
     preparing: bool,
     device_dummy: bool,
+    frame_reads: bool,
     reads: Vec<(u64, u8, u64)>,
     prepared_reads: Vec<(u64, u8, Option<u64>)>,
     writes: Vec<(u64, u8, u64, bool)>,
@@ -1219,7 +1261,11 @@ where
             LegacyAccess::<ROUTED, ORDER, true>::new(&original.access.0, original.physical_mask);
         mem.writes = original.writes;
         mem.paging = Some(&tx);
-        if !resuming {
+        if !resuming || tx.borrow().preparing {
+            if resuming {
+                tx.borrow_mut().prepared_reads.clear();
+                tx.borrow_mut().overlay.clear();
+            }
             let mut preview_cpu = cpu.clone();
             let mut preview_tasks = task_switch.clone();
             let mut preview_temps = temps.to_vec();
@@ -1233,6 +1279,12 @@ where
                 &mut preview_tasks,
             );
             if let Err(exit) = preview {
+                if tx.borrow().frame_reads && matches!(exit, Exit::MmioRead { .. }) {
+                    retain_frame_answers(cpu, &preview_cpu);
+                    tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
+                    *retry = Some(tx.into_inner());
+                    return Err(exit);
+                }
                 if !preview_tasks.committed {
                     publish_cr2(cpu, &exit);
                     return Err(exit);

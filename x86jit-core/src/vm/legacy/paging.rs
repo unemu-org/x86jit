@@ -440,7 +440,14 @@ impl Vcpu {
             execution.rep_flags = None;
         }
         let state = execution.paging.get_or_insert_with(Default::default);
-        let result = execute_retained::<ROUTED, ORDER>(
+        let execute = execute_retained::<ROUTED, ORDER>;
+        #[cfg(feature = "test-hooks")]
+        let execute = if context.regime == MachineRegime::Virtual8086 {
+            crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER, true>
+        } else {
+            execute
+        };
+        let result = execute(
             ir,
             &mut self.cpu,
             &vm.mem,

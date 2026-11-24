@@ -69,6 +69,9 @@ pub struct DeliveryRecord {
     /// them (an 80286/80386 task switch handed off to the embedder across the
     /// enable). Boxed, so that a record without them stays one pointer wide.
     pub regs: Option<Box<DeliveryRegs>>,
+    /// EFLAGS.VM before delivery and in the entered handler (design v86 §9 Q4).
+    pub virtual_8086_before: bool,
+    pub virtual_8086_after: bool,
 }
 
 /// The registers of the interrupted code at one delivery (spec.md §17.10,

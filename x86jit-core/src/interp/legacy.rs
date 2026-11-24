@@ -4,6 +4,7 @@ use super::*;
 pub(crate) mod paging;
 mod privilege;
 pub(crate) mod tasks;
+pub(crate) mod virtual8086;
 use crate::legacy::{
     self, ControlRegister, DebugTestRegister, DescriptorQuery, LegacyOp as L, MachineContext,
     SegmentId, SelectorDestination, SystemRegister,
@@ -37,6 +38,7 @@ pub(crate) struct SoftwareInterrupt {
     pub ip: u32,
     pub cs_base: u32,
     pub cpl: u8,
+    pub vm: bool,
 }
 
 fn refusal(cpu: &CpuState, operation: crate::UnsupportedSystemOperation) -> Exit {
@@ -1777,7 +1779,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     deliver(cpu, mem, context, event, task_switch)
 }
 
-fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
+fn deliver_protected<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     context: MachineContext,
@@ -1817,6 +1819,13 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     if attr & 0x80 == 0 {
         return Err(fault(cpu, 11, idt_code));
     }
+    if V86 && matches!(kind, 5..=7) {
+        // SDM Vol 3B §23.3.1 p. 23-12; design v86 §9 Q2.
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
+        ));
+    }
     if kind == 5 {
         return tasks::event(
             cpu,
@@ -1841,7 +1850,10 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
         }
     })?;
     let dpl = ((d.cache.attributes >> 5) & 3) as u8;
-    if d.cache.attributes & 0x18 != 0x18 || dpl > context.cpl {
+    if d.cache.attributes & 0x18 != 0x18
+        || dpl > context.cpl
+        || (V86 && (dpl != 0 || d.cache.attributes & 4 != 0))
+    {
         return Err(fault(cpu, 13, selector_code));
     }
     if d.cache.attributes & 0x80 == 0 {
@@ -1850,6 +1862,19 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8>(
     supported_descriptor(cpu, d.cache.attributes)?;
     let size = if kind & 8 != 0 { 4 } else { 2 };
     let ip = u64::from((low & 0xffff) | if size == 4 { high & 0xffff0000 } else { 0 });
+    if V86 {
+        return privilege::virtual8086_inward(
+            cpu,
+            mem,
+            context,
+            event,
+            cs,
+            d,
+            ip,
+            kind & 1 == 0,
+            privilege::Gate { key, low, high },
+        );
+    }
     if d.cache.attributes & 4 == 0 && dpl < context.cpl {
         return privilege::inward(
             cpu,
@@ -1930,15 +1955,10 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
         task_switch.capture_regs(cpu, context.generation);
     }
     if context.regime == legacy::MachineRegime::Virtual8086 {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                legacy::MachineContextError::Virtual8086Unsupported,
-            ),
-        ));
+        return deliver_protected::<ROUTED, ORDER, true>(cpu, mem, context, event, task_switch);
     }
     if context.regime == legacy::MachineRegime::Protected {
-        return deliver_protected(cpu, mem, context, event, task_switch);
+        return deliver_protected::<ROUTED, ORDER, false>(cpu, mem, context, event, task_switch);
     }
     let vector = event.vector;
     let saved_ip = event.saved_ip;
@@ -2484,7 +2504,7 @@ impl BlockWalk {
         if SYSTEM
             && ir
                 .legacy_context
-                .is_some_and(|c| c.regime == legacy::MachineRegime::Protected)
+                .is_some_and(|c| c.regime != legacy::MachineRegime::Real)
         {
             return Self::Protected;
         }
@@ -4135,6 +4155,7 @@ where
                             ip: *saved_ip,
                             cs_base: cpu.legacy.segments[SegmentId::Cs as usize].base,
                             cpl: context.cpl,
+                            vm: V86,
                         };
                         // Stored before the delivery: a task switch handed off
                         // to the embedder completes in `tasks::resume`, whose
@@ -4451,18 +4472,23 @@ where
                 }
                 L::Iret { size } => {
                     if V86 {
-                        return Err(refusal(
-                            cpu,
-                            crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                                legacy::MachineContextError::Virtual8086Unsupported,
-                            ),
-                        ));
+                        virtual8086::iret(cpu, mem, context, *size)?;
+                        outcome.context_changed = true;
+                        outcome.preserve_rf = true;
+                        return Ok(true);
                     }
                     // SDM Vol 2A §3.3 IRET; 80386 PRM §17 pp. 17-74,
                     // 17-76–78 (scan checked): same-CPL frame, independent SS.B.
                     // Real mode wraps: I286 PRM App. B IRET p. B-53, 80386
                     // PRM §17 IRET p. 17-79 (`wraps_in_segment`).
                     pop_frame_limit(cpu, mem, context, 3, *size)?;
+                    let peek = peek::<ROUTED, ORDER>;
+                    #[cfg(feature = "test-hooks")]
+                    let peek = if task_switch.allow_virtual8086 {
+                        virtual8086::peek_frame::<ROUTED, ORDER>
+                    } else {
+                        peek
+                    };
                     let ip = peek(cpu, mem, context, 0, *size)? & mask(*size);
                     let cs = peek(cpu, mem, context, 1, *size)? as u16;
                     let image = peek(cpu, mem, context, 2, *size)? as u32;
@@ -4472,13 +4498,12 @@ where
                     if context.regime == legacy::MachineRegime::Protected
                         && *size == 4
                         && image & (1 << 17) != 0
+                        && context.cpl == 0
                     {
-                        return Err(refusal(
-                            cpu,
-                            crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                                legacy::MachineContextError::Virtual8086Unsupported,
-                            ),
-                        ));
+                        virtual8086::enter(cpu, mem, context, ip, cs, image, task_switch)?;
+                        outcome.context_changed = true;
+                        outcome.preserve_rf = true;
+                        return Ok(true);
                     }
                     let mut descriptor = if context.regime == legacy::MachineRegime::Protected {
                         if (cs & 3) as u8 > cpu.legacy.cpl {

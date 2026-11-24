@@ -71,6 +71,7 @@ that changes.
 | `time_stats` | `TimeStats`, transition timers and sampled helper timing; per-vCPU records summed without compiler locks (§2, §9.2) |
 | `interp::legacy::paging` | Uncached 386/486 physical page walker, instruction-wide operand/system preflight, A/D CAS and typed #PF; retained snapshots and transfer ledgers resume operand, event, port and task-phase bus handoffs (paging design §§3.1–3.7) |
 | `vm::legacy::paging` | Public Machine PG=1 dispatch and incremental paged fetch, bounded one-instruction proofs and counted physical source registrations in every build; control/entry reconciliation, `Vcpu::invalidate_paging` and pending-MMIO linear evidence (paging design §§3.2, 3.5–3.7, decision Q5) |
+| `interp::legacy::virtual8086` | Cold internal V86 stack entry, three-slot IRET and interpreted execution (V86 design §§4.2–4.3); public admission remains gated |
 | `interp::legacy::tasks` | Machine interpreter hardware task switches, 286/386 TSS images, task gates and descriptor-load continuations (spec.md §17; decision-24 proposal records source conflicts) |
 | `vm` | `Vm` (shared), `Vcpu` (per-thread), `run()` dispatcher loop; 48 KiB two-way private compiled cache with epoch/MXCSR flushes (§2, §9.2) |
 

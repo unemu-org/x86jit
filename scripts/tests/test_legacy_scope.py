@@ -123,6 +123,8 @@ REVIEWED_ENTRY_POINTS = {
         # Machine delivery selects the paged adapter only with CR0.PG set;
         # PG=0 retains its statically unpaged transfer helpers.
         "interp::legacy::paging",
+        # Internal V86 walk from the cold Machine block executor; test-hooks only.
+        "interp::legacy::virtual8086",
         "interp::legacy::execute_block", "interp::legacy::execute_checked",
         "interp::legacy::execute_shared20", "interp::legacy::finish_port_input",
         "interp::legacy::tasks", "lift::i8086::CONTEXT", "lift::i8086::word_bus",

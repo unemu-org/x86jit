@@ -406,7 +406,7 @@ fn catalogue_pins_current_machine_profiles() {
             ModelSystem::Cr386,
             32,
             15,
-            0xf2f853469e22b1a1,
+            0x11f31a4fa911fbc2,
             0x8000,
         ),
     ] {

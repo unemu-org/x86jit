@@ -237,6 +237,105 @@ pub(super) fn inward<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+/// SDM Vol 3B §23.3.1.1 pp. 23-12–13, Fig. 23-4; Vol 2A §3.3 INT
+/// pp. 3-475–477; 386 PRM §15.3.2 pp. 15-6–7; 486 PRM §23.3.2 pp. 23-7–8.
+/// V86 exits always use the ring-0 stack and save all six segment selectors.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn virtual8086_inward<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    event: legacy::LegacyEvent,
+    cs: u16,
+    mut code: Descriptor,
+    ip: u64,
+    interrupt_gate: bool,
+    gate: Gate,
+) -> Result<(), Exit> {
+    let size = 4;
+    let ext = u16::from(event.external);
+    let ring = ((code.cache.attributes >> 5) & 3) as u8;
+    let mut stack = inner_stack(cpu, mem, context.generation, ring, ext)?;
+    let count = 9 + u64::from(event.error_code.is_some());
+    if !stack.room(count * u64::from(size)) {
+        return Err(fault(cpu, 12, (stack.selector & !3) | ext));
+    }
+    // SDM Vol 2A INT p. 3-476: stack room precedes target offset.
+    if ip > u64::from(code.cache.limit) {
+        return Err(fault(cpu, 13, ext));
+    }
+    let slots = (1..=count)
+        .map(|k| stack.linear(stack.slot(k, size)))
+        .collect::<Vec<_>>();
+    for &at in &slots {
+        probe(cpu, &mem.system(), at, size).map_err(|exit| {
+            operand_fault(
+                exit,
+                cpu.rip,
+                at,
+                crate::ir::MemoryAccess::new(u16::from(size), false, true),
+            )
+        })?;
+    }
+    // Commit point.
+    cpu.record_mmio_part(cpu.rip, gate.key, u64::from(gate.low));
+    cpu.record_mmio_part(cpu.rip, gate.key | (1 << 32), u64::from(gate.high));
+    preflight(cpu, mem, &code)?;
+    preflight(cpu, mem, &stack.descriptor)?;
+    accessed(cpu, mem, &mut code)?;
+    accessed(cpu, mem, &mut stack.descriptor)?;
+    let mut flags = legacy::flags_image(cpu, context.generation);
+    // I386 PRM §12.3.1.1 p. 12-7: fault frames set RF; traps and INT do not.
+    if context.generation == CpuGeneration::I386 && event.fault {
+        flags |= 1 << 16;
+    }
+    // The selectors are zero-extended in a 32-bit frame, as the engine's CS
+    // pushes are (386 PRM p. 17-71 "3 words padded to 4"; ASSUMED value).
+    let mut frame = vec![
+        u64::from(cpu.gs),
+        u64::from(cpu.fs),
+        u64::from(cpu.ds),
+        u64::from(cpu.es),
+        u64::from(cpu.ss),
+        cpu.gpr[RSP] & mask(size),
+        u64::from(flags),
+        u64::from(cpu.cs),
+        u64::from(event.saved_ip),
+    ];
+    if let Some(error) = event.error_code {
+        frame.push(u64::from(error));
+    }
+    for (&at, &value) in slots.iter().zip(&frame) {
+        write(cpu, &mem.system(), at, size, value)?;
+    }
+    install(cpu, SegmentId::Ss, stack.selector, stack.descriptor.cache);
+    // SDM Vol 2A INT p. 3-476: new SS.B sets pointer arithmetic.
+    cpu.gpr[RSP] = stack.pointer;
+    cpu.write_gpr(RSP, stack.slot(count, size), stack.bytes());
+    cpu.legacy.cpl = ring;
+    if interrupt_gate {
+        cpu.flags.if_ = false;
+    }
+    // SDM Vol 3B §23.3.1.1 p. 23-13: clear VM/NT/RF/TF.
+    cpu.rflags_system &= !0x34100;
+    for segment in [SegmentId::Gs, SegmentId::Fs, SegmentId::Ds, SegmentId::Es] {
+        install(
+            cpu,
+            segment,
+            0,
+            SegmentCache {
+                unusable: 1,
+                ..SegmentCache::default()
+            },
+        );
+    }
+    install(cpu, SegmentId::Cs, (cs & !3) | u16::from(ring), code.cache);
+    cpu.rip = ip;
+    Ok(())
+}
+
 /// Retry keys for the parameters a call gate copies, packed by 64-bit word:
 /// four words or two doublewords per key, in the engine-only space of
 /// `DESCRIPTOR_RETRY`.

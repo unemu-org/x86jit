@@ -1,5 +1,5 @@
-//! Internal V86 execution witnesses (v86 design §§2, 7 steps 1–2).
-//! Transfers stay gated. Architectural expectations use SDM Vol 3B §§23.2–23.3
+//! Internal V86 execution and stack-transfer witnesses (v86 design §§2, 7 steps 1–3).
+//! Public admission stays gated. Architectural expectations use SDM Vol 3B §§23.2–23.3
 //! pp. 23-5–17, 386 PRM Ch. 15 pp. 15-1–13, and 486 PRM Ch. 23 pp. 23-1–15.
 #[path = "../support/descriptor_fixture.rs"]
 #[allow(dead_code)]
@@ -274,21 +274,14 @@ fn all_six_sensitive_families_guard_live_iopl_before_stack_or_transfer() {
                 cpu.cpu.gpr[4] = 0xabcd_ffff;
                 if iopl < 3 {
                     exception(&mut cpu, &vm, 13, Some(0));
-                } else if code.contains(&0xcf) || code.contains(&0xcd) {
-                    let exit = run(&mut cpu, &vm).unwrap_err();
-                    assert!(
-                        matches!(
-                            exit,
-                            Exit::UnsupportedSystemContext {
-                                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                                    MachineContextError::Virtual8086Unsupported
-                                ),
-                                ..
-                            }
-                        ),
-                        "{exit:?}"
+                } else if code.contains(&0xcd) {
+                    exception(
+                        &mut cpu,
+                        &vm,
+                        13,
+                        Some(u32::from(*code.last().unwrap()) * 8 + 2),
                     );
-                } else if code.contains(&0x9d) {
+                } else if code.contains(&0xcf) || code.contains(&0x9d) {
                     exception(&mut cpu, &vm, 12, Some(0));
                 } else {
                     run(&mut cpu, &vm).unwrap();
@@ -425,17 +418,19 @@ fn protected_only_and_privileged_instruction_matrix() {
 }
 
 // SDM Vol 2A INT pp. 3-467–471: CC and taken CE bypass INT n's IOPL
-// check. Gate transfer is deliberately deferred; OF=0 completes normally.
+// check. Invalid IDT entries fault; OF=0 completes normally.
 #[test]
 fn traps_and_ordinary_ret_do_not_gain_an_iopl_guard() {
     for model in MODELS {
         for code in [&[0xcc][..], &[0xce]] {
             let (vm, mut cpu) = world(model, code, 0);
             cpu.cpu.flags.of = true;
-            assert!(matches!(
-                run(&mut cpu, &vm),
-                Err(Exit::UnsupportedSystemContext { .. })
-            ));
+            exception(
+                &mut cpu,
+                &vm,
+                13,
+                Some(if code[0] == 0xcc { 26 } else { 34 }),
+            );
         }
         let (vm, mut cpu) = world(model, &[0xce], 0);
         run(&mut cpu, &vm).unwrap();
@@ -769,5 +764,882 @@ fn high_linear_paging_precedes_the_physical_a20_gate() {
         vm.write_bytes(0x9fef, &[0x5a]).unwrap();
         run(&mut cpu, &vm).unwrap();
         assert_eq!(cpu.cpu.gpr[0], 0x5a);
+    }
+}
+
+const HANDLER: u64 = 0x1800;
+const IDT: u64 = 0x3000;
+const ENTRY_IMAGE: [u32; 9] = [
+    0x1000,
+    0x20,
+    0x33203,
+    0xabcd_7000,
+    0x30,
+    0x40,
+    0x50,
+    0x60,
+    0x70,
+];
+
+fn dwords(vm: &Vm, address: u64, words: &[u32]) {
+    let bytes: Vec<_> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+    vm.write_bytes(address, &bytes).unwrap();
+}
+fn gate(vm: &Vm, vector: u8, kind: u8) {
+    dwords(
+        vm,
+        IDT + u64::from(vector) * 8,
+        &[(8 << 16) | HANDLER as u32, u32::from(kind) << 8],
+    );
+}
+fn transfers(
+    model: CpuModel,
+    delivery: x86jit_core::ExceptionDelivery,
+    code: &[u8],
+    big_stack: bool,
+) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = fixture::setup_delivery(model, &[0xcf], delivery);
+    fixture::descriptor(&vm, 0x2008, 0, 0xffff, 0x409b);
+    fixture::descriptor(&vm, 0x2010, 0, 0xffff, 0x4093);
+    cpu.cpu.cs = 8;
+    cpu.cpu.ss = 0x10;
+    cpu.cpu.legacy.segments[SegmentId::Cs as usize] = SegmentCache {
+        limit: 0xffff,
+        attributes: 0x409b,
+        ..Default::default()
+    };
+    cpu.cpu.legacy.segments[SegmentId::Ss as usize] = SegmentCache {
+        limit: 0xffff,
+        attributes: if big_stack { 0x4093 } else { 0x93 },
+        ..Default::default()
+    };
+    cpu.cpu.legacy.idtr.base = IDT as u32;
+    cpu.cpu.legacy.idtr.limit = 0x7ff;
+    bitmap(&vm, &mut cpu);
+    dwords(&vm, TSS + 4, &[0x9000, 0x10]);
+    dwords(&vm, 0x8000, &ENTRY_IMAGE);
+    vm.write_bytes(0x1200, code).unwrap();
+    vm.write_bytes(HANDLER, &[0x90, 0xcf]).unwrap();
+    cpu.enable_delivery_log_with(
+        16,
+        x86jit_core::DeliveryLogOptions::default().registers(true),
+    )
+    .unwrap();
+    (vm, cpu)
+}
+fn transfer_run(cpu: &mut Vcpu, vm: &Vm, steps: u64) -> x86jit_core::StepRun {
+    cpu.run_virtual8086_steps_for_test(vm, steps, StepOptions::default())
+        .unwrap()
+}
+fn transfer_steps(cpu: &mut Vcpu, vm: &Vm, count: u64) {
+    let result = transfer_run(cpu, vm, count);
+    assert_eq!(result.steps(), count, "{:?}", result.stop());
+    assert!(
+        matches!(result.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+        "{:?}",
+        result.stop()
+    );
+}
+fn assert_v86(cpu: &Vcpu, ip: u64, flags: u64) {
+    assert_eq!(cpu.cpu.legacy.cpl, 3);
+    assert_eq!(cpu.cpu.rip, ip);
+    assert_eq!(cpu.cpu.gpr[4], 0xabcd_7000);
+    assert_eq!(cpu.cpu.rflags_system & 0x37000, flags & 0x37000);
+    assert!(cpu.cpu.flags.if_);
+    for (id, selector) in [
+        (SegmentId::Cs, 0x20u16),
+        (SegmentId::Ss, 0x30),
+        (SegmentId::Es, 0x40),
+        (SegmentId::Ds, 0x50),
+        (SegmentId::Fs, 0x60),
+        (SegmentId::Gs, 0x70),
+    ] {
+        let cache = cpu.cpu.legacy.segments[id as usize];
+        assert_eq!(
+            cache,
+            SegmentCache {
+                base: u32::from(selector) << 4,
+                limit: 0xffff,
+                attributes: if id == SegmentId::Cs { 0x9b } else { 0x93 },
+                ..Default::default()
+            }
+        );
+    }
+}
+fn assert_handler(
+    cpu: &Vcpu,
+    vm: &Vm,
+    saved_ip: u32,
+    saved_flags: u32,
+    error: Option<u32>,
+    interrupt: bool,
+) {
+    assert_eq!(cpu.cpu.legacy.cpl, 0);
+    assert_eq!(cpu.cpu.cs, 8);
+    assert_eq!(cpu.cpu.ss, 0x10);
+    assert_eq!(cpu.cpu.rflags_system & 0x34100, 0);
+    assert_eq!(cpu.cpu.flags.if_, !interrupt);
+    let mut words = vec![
+        saved_ip,
+        0x20,
+        saved_flags,
+        0xabcd_7000,
+        0x30,
+        0x40,
+        0x50,
+        0x60,
+        0x70,
+    ];
+    if let Some(error) = error {
+        words.insert(0, error);
+    }
+    let sp = 0x9000 - words.len() as u64 * 4;
+    assert_eq!(cpu.cpu.gpr[4], sp);
+    for (i, value) in words.into_iter().enumerate() {
+        assert_eq!(fixture::value(vm, sp + i as u64 * 4, 4), u64::from(value));
+    }
+    for (id, selector) in [
+        (SegmentId::Ds, cpu.cpu.ds),
+        (SegmentId::Es, cpu.cpu.es),
+        (SegmentId::Fs, cpu.cpu.fs),
+        (SegmentId::Gs, cpu.cpu.gs),
+    ] {
+        assert_eq!(selector, 0);
+        assert_eq!(
+            cpu.cpu.legacy.segments[id as usize],
+            SegmentCache {
+                unusable: 1,
+                ..Default::default()
+            }
+        );
+    }
+}
+
+// SDM Vol 2A §3.3 IRET pp. 3-492–493; 486 PRM §26 IRET p. 26-174.
+#[test]
+fn iretd_enters_v86_from_either_stack_width_without_descriptor_lookups() {
+    for model in MODELS {
+        for big_stack in [false, true] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                big_stack,
+            );
+            cpu.cpu.legacy.gdtr.base = 0xdead0000;
+            cpu.cpu.legacy.gdtr.limit = 0;
+            // Model-specific AC/ID, plus TF/RF/IF, all loaded by IRETD.
+            let image = ENTRY_IMAGE[2] | 0x240100;
+            dwords(&vm, 0x8008, &[image]);
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_v86(&cpu, 0x1000, u64::from(image));
+            let model_bits = match model {
+                CpuModel::I80486Dx => 0x40000,
+                CpuModel::I80486DxCpuid => 0x240000,
+                _ => 0,
+            };
+            assert_eq!(cpu.cpu.rflags_system & 0x240100, model_bits | 0x100);
+            assert!(cpu.delivery_log().unwrap().is_empty());
+            let stopped = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert!(matches!(
+                stopped.stop(),
+                StepStop::Exit(Exit::UnsupportedSystemContext {
+                    operation: UnsupportedSystemOperation::InvalidLegacyContext(
+                        MachineContextError::Virtual8086Unsupported
+                    ),
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+// SDM Vol 3B §23.3.1.1 pp. 23-12–13, Fig. 23-4; 386 PRM §15.3.2 pp. 15-6–7.
+#[test]
+fn software_and_hardware_round_trips_save_nine_slots_and_log_v86_origins() {
+    use x86jit_core::{DeliveryKind, ExceptionDelivery};
+    for model in MODELS {
+        for policy in [ExceptionDelivery::Outward, ExceptionDelivery::InGuest] {
+            for hardware in [false, true] {
+                for trap in [false, true] {
+                    let (vm, mut cpu) = transfers(model, policy, &[0xcd, 0x40, 0x90], true);
+                    gate(&vm, 0x40, if trap { 0xef } else { 0xee });
+                    transfer_steps(&mut cpu, &vm, 1);
+                    if hardware {
+                        cpu.inject_irq(0x40);
+                    }
+                    transfer_steps(&mut cpu, &vm, 1);
+                    let ip = if hardware { 0x1000 } else { 0x1002 };
+                    assert_handler(&cpu, &vm, ip, ENTRY_IMAGE[2], None, !trap);
+                    let log = cpu.delivery_log().unwrap();
+                    assert_eq!(log.len(), 1);
+                    let record = log.iter().next().unwrap();
+                    assert!(record.virtual_8086_before);
+                    assert!(!record.virtual_8086_after);
+                    assert_eq!(
+                        (record.saved_cs, record.saved_ip, record.saved_linear),
+                        (0x20, ip, ip + 0x200)
+                    );
+                    assert_eq!((record.cpl_before, record.cpl_after), (3, 0));
+                    assert_eq!(
+                        record.kind,
+                        if hardware {
+                            DeliveryKind::Irq
+                        } else {
+                            DeliveryKind::Software
+                        }
+                    );
+                    let regs = record.regs.as_ref().unwrap();
+                    assert_eq!(regs.esp, 0xabcd_7000);
+                    assert_eq!(regs.flags & 0x30000, 0);
+                    if !hardware {
+                        transfer_steps(&mut cpu, &vm, 1);
+                    } // Handler NOP.
+                    transfer_steps(&mut cpu, &vm, 1);
+                    assert_v86(&cpu, u64::from(ip), u64::from(ENTRY_IMAGE[2]));
+                    assert_eq!(cpu.delivery_log().unwrap().len(), 1); // IRET is not a delivery.
+                }
+            }
+        }
+    }
+}
+
+// SDM Vol 2A §3.3 IRET pp. 3-491–492: three slots, NT does not select a task return.
+#[test]
+fn v86_iret_uses_three_slots_preserves_iopl_vm_and_restores_rf() {
+    for model in MODELS {
+        for wide in [false, true] {
+            let code = if wide { &[0x66, 0xcf][..] } else { &[0xcf][..] };
+            let (vm, mut cpu) = world(model, code, 3);
+            cpu.cpu.rflags_system |= 0x4000 | 0x10000;
+            if wide {
+                dwords(&vm, 0x8000, &[0x1234, 0x5678, 0x10203]);
+            } else {
+                vm.write_bytes(0x8000, &[0x34, 0x12, 0x78, 0x56, 3, 2])
+                    .unwrap();
+            }
+            run(&mut cpu, &vm).unwrap();
+            assert_eq!(cpu.cpu.rip, 0x1234);
+            assert_eq!(cpu.cpu.cs, 0x5678);
+            assert_eq!(cpu.cpu.legacy.segments[0].base, 0x56780);
+            assert_eq!(cpu.cpu.gpr[4], 0xabcd_8000 + if wide { 12 } else { 6 });
+            assert_eq!(cpu.cpu.rflags_system & 0x37000, VM | 0x3000 | 0x10000);
+            assert!(cpu.cpu.flags.if_);
+        }
+    }
+}
+
+// SDM Vol 3B §23.3.1.1 pp. 23-12–13; Vol 2A INT p. 3-469 (#GP(0));
+// I386 PRM §12.3.1.1 p. 12-7: a fault saves RF=1 and the faulting IP.
+#[test]
+fn exceptions_round_trip_with_error_codes_under_both_delivery_policies() {
+    use x86jit_core::ExceptionDelivery;
+    for model in MODELS {
+        for policy in [ExceptionDelivery::Outward, ExceptionDelivery::InGuest] {
+            for (code, vector, error) in [
+                (&[0xcd, 0x40][..], 13, Some(0)),
+                (&[0x0f, 0x0b][..], 6, None),
+                (&[0xf7, 0xf1][..], 0, None),
+            ] {
+                let (vm, mut cpu) = transfers(model, policy, code, true);
+                gate(&vm, vector, 0x8e); // Exceptions ignore gate DPL.
+                transfer_steps(&mut cpu, &vm, 1);
+                cpu.cpu.rflags_system &= !0x13000; // Intercept INT n with live RF clear.
+                let flags = ENTRY_IMAGE[2] & !0x13000;
+                let retired = cpu.retired_instructions();
+                if policy == ExceptionDelivery::Outward {
+                    let result = transfer_run(&mut cpu, &vm, 1);
+                    assert_eq!(result.steps(), 0);
+                    let StepStop::Exit(exit @ Exit::Exception { vector: actual, .. }) =
+                        result.stop()
+                    else {
+                        panic!("{:?}", result.stop());
+                    };
+                    assert_eq!(*actual, vector);
+                    assert_eq!(cpu.retired_instructions(), retired);
+                    assert!(cpu.delivery_log().unwrap().is_empty());
+                    // The test-only bridge supplies the outward exception to the same
+                    // delivery seam; normal Outward execution leaves it with the caller.
+                    cpu.deliver_virtual8086_fault_for_test(&vm, exit).unwrap();
+                } else {
+                    transfer_steps(&mut cpu, &vm, 1); // Handler NOP, fault takes no step.
+                    assert_eq!(cpu.cpu.rip, HANDLER + 1);
+                }
+                assert_handler(&cpu, &vm, 0x1000, flags | 0x10000, error, true);
+                let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+                assert_eq!(record.error_code, error);
+                assert_eq!(record.kind, x86jit_core::DeliveryKind::Fault);
+                assert!(record.virtual_8086_before && !record.virtual_8086_after);
+                assert_eq!(record.saved_linear, 0x1200);
+                if error.is_some() {
+                    cpu.cpu.gpr[4] += 4;
+                }
+                if policy == ExceptionDelivery::Outward {
+                    transfer_steps(&mut cpu, &vm, 1);
+                }
+                transfer_steps(&mut cpu, &vm, 1);
+                assert_v86(&cpu, 0x1000, u64::from(flags | 0x10000));
+            }
+        }
+    }
+}
+
+fn identity_paging(vm: &Vm, cpu: &mut Vcpu) {
+    cpu.cpu.legacy.cr0 |= 1 << 31;
+    cpu.cpu.legacy.cr3 = 0x10000;
+    dwords(vm, 0x10000, &[0x11007]);
+    for page in 0..32u32 {
+        // Only the V86 instruction page is user-accessible. GDT, IDT, TSS
+        // and both protected stacks stay supervisor-only.
+        dwords(
+            vm,
+            0x11000 + u64::from(page * 4),
+            &[(page * 0x1000) | if page == 1 { 7 } else { 3 }],
+        );
+    }
+}
+
+// SDM Vol 2A INT pp. 3-475–477; design v86 §4.3: supervisor preflight
+// of the complete frame precedes its first store and any cache installation.
+#[test]
+fn delivery_stack_page_fault_and_limit_leave_no_partial_frame() {
+    for model in MODELS {
+        for page_fault in [false, true] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0xcd, 0x40],
+                true,
+            );
+            gate(&vm, 0x40, 0xee);
+            if page_fault {
+                identity_paging(&vm, &mut cpu);
+                dwords(&vm, TSS + 4, &[0x8010]); // Frame straddles two pages.
+                dwords(&vm, 0x11000 + 7 * 4, &[0x7002]);
+            } else {
+                fixture::descriptor(&vm, 0x2010, 0, 0x8ff0, 0x4093);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            vm.write_bytes(0x7f00, &[0xa5; 0x200]).unwrap();
+            let before = (
+                cpu.cpu.gpr,
+                cpu.cpu.legacy.segments,
+                cpu.cpu.rflags_system,
+                cpu.cpu.cs,
+                cpu.cpu.ss,
+            );
+            let result = transfer_run(&mut cpu, &vm, 1);
+            assert_eq!(result.steps(), 0);
+            let StepStop::Exit(exit @ Exit::Exception { vector, .. }) = result.stop() else {
+                panic!("{:?}", result.stop());
+            };
+            assert_eq!(*vector, if page_fault { 14 } else { 12 });
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(
+                    if page_fault { 2 } else { 0x10 },
+                    if page_fault { 7 } else { 0xffff }
+                )
+            );
+            if page_fault {
+                assert_eq!(cpu.cpu.legacy.cr2, 0x7ffc);
+            }
+            assert_eq!(
+                (
+                    cpu.cpu.gpr,
+                    cpu.cpu.legacy.segments,
+                    cpu.cpu.rflags_system,
+                    cpu.cpu.cs,
+                    cpu.cpu.ss
+                ),
+                before
+            );
+            let mut bytes = [0; 0x200];
+            vm.read_bytes(0x7f00, &mut bytes).unwrap();
+            assert_eq!(bytes, [0xa5; 0x200]);
+            assert!(cpu.delivery_log().unwrap().is_empty());
+        }
+    }
+}
+
+// SDM Vol 3B §23.3.1 p. 23-12 and design v86 §9 Q2: a 16-bit gate
+// is a typed boundary, while conforming/nonzero-DPL targets are #GP(CS).
+#[test]
+fn v86_gate_width_and_target_privilege_are_checked_before_mutation() {
+    for model in MODELS {
+        for (gate_attr, code_attr, refusal) in [
+            (0xe6, 0x409b, true),
+            (0xe7, 0x409b, true),
+            (0xee, 0x409f, false),
+            (0xee, 0x40bb, false),
+            (0xee, 0x40fb, false),
+        ] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0xcd, 0x40],
+                true,
+            );
+            gate(&vm, 0x40, gate_attr);
+            transfer_steps(&mut cpu, &vm, 1);
+            fixture::descriptor(&vm, 0x2008, 0, 0xffff, code_attr);
+            let before = (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system);
+            let result = transfer_run(&mut cpu, &vm, 1);
+            assert_eq!(result.steps(), 0);
+            if refusal {
+                assert!(matches!(
+                    result.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::LegacyGateOrTaskTransfer,
+                        ..
+                    })
+                ));
+            } else {
+                let StepStop::Exit(exit @ Exit::Exception { vector: 13, .. }) = result.stop()
+                else {
+                    panic!("{:?}", result.stop());
+                };
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    ErrorCode::bits(8, 0xffff)
+                );
+            }
+            assert_eq!(
+                (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system),
+                before
+            );
+            assert!(cpu.delivery_log().unwrap().is_empty());
+        }
+    }
+}
+
+// SDM Vol 2A INT p. 3-476: current TSS width and new SS.B are independent
+// of gate width; a 16-bit current TSS supplies zero-extended SP0.
+#[test]
+fn paged_v86_round_trip_uses_supervisor_tables_and_accepts_a_16_bit_tss() {
+    for model in MODELS {
+        for narrow_tss in [false, true] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::InGuest,
+                &[0xcd, 0x40],
+                false,
+            );
+            gate(&vm, 0x40, 0xee);
+            identity_paging(&vm, &mut cpu);
+            if narrow_tss {
+                cpu.cpu.legacy.tr.cache.attributes = 0x83;
+                vm.write_bytes(TSS + 2, &[0, 0x90, 0x10, 0]).unwrap();
+            }
+            fixture::descriptor(&vm, 0x2010, 0, 0xffff, 0x93);
+            transfer_steps(&mut cpu, &vm, 2);
+            assert_handler(&cpu, &vm, 0x1002, ENTRY_IMAGE[2], None, true);
+            transfer_steps(&mut cpu, &vm, 2);
+            assert_v86(&cpu, 0x1002, u64::from(ENTRY_IMAGE[2]));
+        }
+    }
+}
+
+fn trap_range(vm: &mut Vm, at: u64, size: usize) {
+    use x86jit_core::{Prot, RegionKind};
+    let mut bytes = vec![0; 0x240000];
+    vm.read_bytes(0, &mut bytes).unwrap();
+    vm.unmap(0, bytes.len()).unwrap();
+    vm.map(0, at as usize, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(at, size, Prot::RW, RegionKind::Trap).unwrap();
+    vm.map(
+        at + size as u64,
+        bytes.len() - at as usize - size,
+        Prot::RWX,
+        RegionKind::Ram,
+    )
+    .unwrap();
+    vm.write_bytes(0, &bytes[..at as usize]).unwrap();
+    vm.write_bytes(at + size as u64, &bytes[at as usize + size..])
+        .unwrap();
+}
+fn zero_probe_preserves_answer(cpu: &mut Vcpu, vm: &Vm) {
+    let before = format!("{:?}", cpu.cpu);
+    let retired = cpu.retired_instructions();
+    let result = transfer_run(cpu, vm, 0);
+    assert_eq!(result.steps(), 0);
+    assert!(matches!(
+        result.stop(),
+        StepStop::Exit(Exit::BudgetExhausted)
+    ));
+    assert_eq!(format!("{:?}", cpu.cpu), before);
+    assert_eq!(cpu.retired_instructions(), retired);
+}
+
+// SDM Vol 2A IRET pp. 3-492–493; design v86 §4.2: every frame slot
+// belongs to one resumable instruction, with no early register commit.
+#[test]
+fn nine_slot_entry_and_return_resume_each_mmio_read_and_write_exactly_once() {
+    use x86jit_core::ExceptionDelivery;
+    for model in MODELS {
+        for paged in [false, true] {
+            let (mut vm, mut cpu) =
+                transfers(model, ExceptionDelivery::Outward, &[0xcd, 0x40], true);
+            gate(&vm, 0x40, 0xee);
+            if paged {
+                identity_paging(&vm, &mut cpu);
+            }
+            trap_range(&mut vm, 0x8000, 36);
+            let before = (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system);
+            for (index, value) in ENTRY_IMAGE.into_iter().enumerate() {
+                let result = transfer_run(&mut cpu, &vm, 1);
+                assert_eq!(result.steps(), 0);
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::MmioRead { addr, size: 4, .. }) if *addr == 0x8000 + index as u64 * 4),
+                    "{:?}",
+                    result.stop()
+                );
+                assert_eq!(
+                    (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system),
+                    before
+                );
+                assert_eq!(cpu.retired_instructions(), 0);
+                cpu.cpu.pending_mmio = Some(u64::from(value));
+                zero_probe_preserves_answer(&mut cpu, &vm);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_v86(&cpu, 0x1000, u64::from(ENTRY_IMAGE[2]));
+            assert_eq!(cpu.retired_instructions(), 1);
+            // The protected handler's frame is a device too. A write answer
+            // must survive replay of every later slot and every zero probe.
+            let (mut vm, mut cpu) =
+                transfers(model, ExceptionDelivery::Outward, &[0xcd, 0x40], true);
+            gate(&vm, 0x40, 0xee);
+            if paged {
+                identity_paging(&vm, &mut cpu);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            trap_range(&mut vm, 0x8fdc, 36);
+            let before = (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system);
+            let pushed = [
+                0x70,
+                0x60,
+                0x50,
+                0x40,
+                0x30,
+                0xabcd_7000,
+                ENTRY_IMAGE[2],
+                0x20,
+                0x1002,
+            ];
+            for (index, value) in pushed.into_iter().enumerate() {
+                let result = transfer_run(&mut cpu, &vm, 1);
+                assert_eq!(result.steps(), 0);
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::MmioWrite { addr, size: 4, value: actual, .. }) if *addr == 0x8ffc - index as u64 * 4 && *actual == u64::from(value)),
+                    "{:?}",
+                    result.stop()
+                );
+                assert_eq!(
+                    (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system),
+                    before
+                );
+                assert!(cpu.delivery_log().unwrap().is_empty());
+                assert_eq!(cpu.retired_instructions(), 1);
+                cpu.cpu.pending_mmio_write = true;
+                zero_probe_preserves_answer(&mut cpu, &vm);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.rip, HANDLER);
+            assert_eq!(cpu.retired_instructions(), 2);
+            let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+            assert!(record.virtual_8086_before && !record.virtual_8086_after);
+            assert_eq!(record.saved_linear, 0x1202);
+            transfer_steps(&mut cpu, &vm, 1); // Handler NOP.
+            for (index, value) in pushed.into_iter().rev().enumerate() {
+                let result = transfer_run(&mut cpu, &vm, 1);
+                assert_eq!(result.steps(), 0);
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::MmioRead { addr, size: 4, .. }) if *addr == 0x8fdc + index as u64 * 4),
+                    "{:?}",
+                    result.stop()
+                );
+                assert_eq!(cpu.cpu.legacy.cpl, 0);
+                cpu.cpu.pending_mmio = Some(u64::from(value));
+                zero_probe_preserves_answer(&mut cpu, &vm);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_v86(&cpu, 0x1002, u64::from(ENTRY_IMAGE[2]));
+            assert_eq!(cpu.retired_instructions(), 4);
+            assert_eq!(cpu.delivery_log().unwrap().len(), 1);
+        }
+    }
+}
+
+// SDM Vol 2A IRET pp. 3-492–493; engine commit-last policy (design v86 §4.2).
+#[test]
+fn nine_slot_entry_preflights_full_stack_and_reads_before_committing() {
+    for model in MODELS {
+        for slot in 0..9usize {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                true,
+            );
+            let pointer = 0x9000 - slot as u64 * 4;
+            dwords(&vm, pointer, &ENTRY_IMAGE);
+            cpu.cpu.gpr[4] = pointer;
+            identity_paging(&vm, &mut cpu);
+            dwords(&vm, 0x11000 + 9 * 4, &[0x9002]);
+            let before = (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system);
+            let result = transfer_run(&mut cpu, &vm, 1);
+            assert_eq!(result.steps(), 0);
+            let StepStop::Exit(exit @ Exit::Exception { vector: 14, .. }) = result.stop() else {
+                panic!("{:?}", result.stop());
+            };
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(0, 7)
+            );
+            assert_eq!(cpu.cpu.legacy.cr2, 0x9000);
+            assert_eq!(
+                (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system),
+                before
+            );
+            assert_eq!(cpu.retired_instructions(), 0);
+        }
+        for limit in [0x800a, 0x801f] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                false,
+            );
+            cpu.cpu.legacy.segments[SegmentId::Ss as usize].limit = limit;
+            let before = (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system);
+            let result = transfer_run(&mut cpu, &vm, 1);
+            assert!(matches!(
+                result.stop(),
+                StepStop::Exit(Exit::Exception { vector: 12, .. })
+            ));
+            assert_eq!(
+                (cpu.cpu.gpr, cpu.cpu.legacy.segments, cpu.cpu.rflags_system),
+                before
+            );
+        }
+        let (vm, mut cpu) = transfers(
+            model,
+            x86jit_core::ExceptionDelivery::Outward,
+            &[0x90],
+            true,
+        );
+        dwords(&vm, 0x8000, &[0x10000]);
+        let result = transfer_run(&mut cpu, &vm, 1);
+        assert!(matches!(
+            result.stop(),
+            StepStop::Exit(Exit::Exception { vector: 13, .. })
+        ));
+        assert_eq!(cpu.cpu.legacy.cpl, 0);
+        assert_eq!(cpu.cpu.gpr[4], 0x8000);
+    }
+}
+
+// SDM Vol 3B §§23.2.1, 23.2.5 pp. 23-6, 23-8–9: the entry loads
+// low selector words as paragraphs, including zero; CPL does not follow CS.RPL.
+#[test]
+fn entry_accepts_zero_paragraphs_and_discards_high_selector_words() {
+    for model in MODELS {
+        for cs in [0u32, 1, 2, 3] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                true,
+            );
+            dwords(
+                &vm,
+                0x8000,
+                &[
+                    0x1234,
+                    0xface_0000 | cs,
+                    ENTRY_IMAGE[2],
+                    0xdead_fffe,
+                    0xbeef_0000,
+                    0xabcd_0000,
+                    0xaaaa_0001,
+                    0x1234_0002,
+                    0xffff_0003,
+                ],
+            );
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.legacy.cpl, 3);
+            assert_eq!(cpu.cpu.cs, cs as u16);
+            assert_eq!(cpu.cpu.ss, 0);
+            assert_eq!(cpu.cpu.es, 0);
+            assert_eq!((cpu.cpu.ds, cpu.cpu.fs, cpu.cpu.gs), (1, 2, 3));
+            assert_eq!(cpu.cpu.legacy.segments[0].base, cs << 4);
+            assert_eq!(cpu.cpu.legacy.segments[SegmentId::Ss as usize].base, 0);
+            assert_eq!(cpu.cpu.legacy.segments[SegmentId::Es as usize].unusable, 0);
+            assert_eq!(cpu.cpu.gpr[4], 0xdead_fffe);
+        }
+    }
+}
+
+// SDM Vol 2A IRET pp. 3-492–493: only a CPL-0 dword frame can set VM.
+#[test]
+fn protected_iret_above_ring_zero_ignores_vm_and_word_iret_cannot_enter() {
+    for model in MODELS {
+        for cpl in 1..=3u16 {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                true,
+            );
+            let attr = 0x409b | cpl << 5;
+            fixture::descriptor(&vm, 0x2008, 0, 0xffff, attr);
+            cpu.cpu.legacy.cpl = cpl as u8;
+            cpu.cpu.cs = 8 | cpl;
+            cpu.cpu.legacy.segments[0].attributes = attr;
+            dwords(&vm, 0x8000, &[0x1234, u32::from(8 | cpl), ENTRY_IMAGE[2]]);
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.legacy.cpl, cpl as u8);
+            assert_eq!(cpu.cpu.rflags_system & VM, 0);
+            assert_eq!(cpu.cpu.gpr[4], 0x800c);
+        }
+        let (vm, mut cpu) = transfers(
+            model,
+            x86jit_core::ExceptionDelivery::Outward,
+            &[0x90],
+            true,
+        );
+        vm.write_bytes(0x1000, &[0x66, 0xcf]).unwrap();
+        vm.write_bytes(0x8000, &[0x34, 0x12, 8, 0, 3, 0x32])
+            .unwrap();
+        transfer_steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rflags_system & VM, 0);
+        assert_eq!(cpu.cpu.gpr[4], 0x8006);
+        assert_eq!(cpu.cpu.rip, 0x1234);
+        // Even a coherent VM=1 stack image is still refused by public entry.
+        let (vm, mut cpu) = transfers(
+            model,
+            x86jit_core::ExceptionDelivery::Outward,
+            &[0x90],
+            true,
+        );
+        let result = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        assert!(matches!(
+            result.stop(),
+            StepStop::Exit(Exit::UnsupportedSystemContext {
+                operation: UnsupportedSystemOperation::InvalidLegacyContext(
+                    MachineContextError::Virtual8086Unsupported
+                ),
+                ..
+            })
+        ));
+        assert_eq!(cpu.cpu.legacy.cpl, 0);
+        assert_eq!(cpu.cpu.gpr[4], 0x8000);
+    }
+}
+
+// Design v86 §5 and Q4: an accepted IRQ owns its source across device
+// handoffs, including another queued IRQ; only completed deliveries are logged.
+#[test]
+fn hardware_delivery_continuations_keep_the_source_and_do_not_consume_the_next_irq() {
+    for model in MODELS {
+        for paged in [false, true] {
+            let (mut vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0x90],
+                true,
+            );
+            gate(&vm, 0x40, 0x8e);
+            gate(&vm, 0x41, 0x8e);
+            if paged {
+                identity_paging(&vm, &mut cpu);
+            }
+            transfer_steps(&mut cpu, &vm, 1);
+            trap_range(&mut vm, 0x8fdc, 36);
+            cpu.inject_irq(0x40);
+            let pushed = [
+                0x70,
+                0x60,
+                0x50,
+                0x40,
+                0x30,
+                0xabcd_7000,
+                ENTRY_IMAGE[2],
+                0x20,
+                0x1000,
+            ];
+            for (index, value) in pushed.into_iter().enumerate() {
+                let result = transfer_run(&mut cpu, &vm, 1);
+                assert_eq!(result.steps(), 0);
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::MmioWrite { addr, value: actual, .. }) if *addr == 0x8ffc - index as u64 * 4 && *actual == u64::from(value)),
+                    "{:?}",
+                    result.stop()
+                );
+                if index == 0 {
+                    cpu.inject_irq(0x41);
+                }
+                cpu.cpu.pending_mmio_write = true;
+                zero_probe_preserves_answer(&mut cpu, &vm);
+                assert!(cpu.delivery_log().unwrap().is_empty());
+            }
+            transfer_steps(&mut cpu, &vm, 1); // IRQ plus handler NOP.
+            assert_eq!(cpu.cpu.rip, HANDLER + 1);
+            let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+            assert_eq!(record.vector, 0x40);
+            assert_eq!(record.kind, x86jit_core::DeliveryKind::Irq);
+            assert_eq!(
+                (record.saved_cs, record.saved_ip, record.saved_linear),
+                (0x20, 0x1000, 0x1200)
+            );
+            assert!(record.virtual_8086_before && !record.virtual_8086_after);
+            for value in pushed.into_iter().rev() {
+                let result = transfer_run(&mut cpu, &vm, 1);
+                assert!(
+                    matches!(result.stop(), StepStop::Exit(Exit::MmioRead { .. })),
+                    "{:?}",
+                    result.stop()
+                );
+                cpu.cpu.pending_mmio = Some(u64::from(value));
+            }
+            transfer_steps(&mut cpu, &vm, 1); // IRETD to the interrupted V86 IP.
+                                              // The queued successor enters on the next boundary, with its own frame.
+            let result = transfer_run(&mut cpu, &vm, 1);
+            assert!(
+                matches!(
+                    result.stop(),
+                    StepStop::Exit(Exit::MmioWrite { value: 0x70, .. })
+                ),
+                "{:?}",
+                result.stop()
+            );
+            assert_eq!(cpu.delivery_log().unwrap().len(), 1);
+        }
+    }
+}
+
+// SDM Vol 3B §23.3.1.1 p. 23-13: save old VM/TF/RF/NT, clear live
+// VM/TF/RF/NT, then allow IRETD to restore the complete V86 flag image.
+#[test]
+fn v86_delivery_saves_and_clears_live_tf_rf_nt_before_iret_restores_them() {
+    for model in MODELS {
+        for trap in [false, true] {
+            let (vm, mut cpu) = transfers(
+                model,
+                x86jit_core::ExceptionDelivery::Outward,
+                &[0xcd, 0x40],
+                true,
+            );
+            gate(&vm, 0x40, if trap { 0xef } else { 0xee });
+            transfer_steps(&mut cpu, &vm, 1);
+            cpu.cpu.rflags_system |= 0x4100;
+            let saved = ENTRY_IMAGE[2] | 0x4100;
+            transfer_steps(&mut cpu, &vm, 1);
+            assert_handler(&cpu, &vm, 0x1002, saved, None, !trap);
+            transfer_steps(&mut cpu, &vm, 2);
+            assert_v86(&cpu, 0x1002, u64::from(saved));
+            assert_eq!(cpu.cpu.rflags_system & 0x14100, 0x14100);
+        }
     }
 }

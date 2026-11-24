@@ -181,6 +181,7 @@ pub(super) struct Origin {
     ip: u32,
     cs_base: u32,
     cpl: u8,
+    vm: bool,
 }
 
 /// Where the delivery log takes the interrupted registers of a delivery
@@ -779,13 +780,17 @@ impl Execution {
         } else {
             self.rep_flags = None;
         }
-        let progress = crate::interp::legacy::execute_checked::<ROUTED, ORDER>(
-            ir,
-            cpu,
-            memory,
-            scratch,
-            &mut self.task_switch,
-        );
+        let execute = crate::interp::legacy::execute_checked::<ROUTED, ORDER>;
+        #[cfg(feature = "test-hooks")]
+        let execute = if ir
+            .legacy_context
+            .is_some_and(|c| c.regime == MachineRegime::Virtual8086)
+        {
+            crate::interp::legacy::virtual8086::execute_block::<ROUTED, ORDER>
+        } else {
+            execute
+        };
+        let progress = execute(ir, cpu, memory, scratch, &mut self.task_switch);
         if let Some(saved) = self.rep_flags.as_mut() {
             let fault = progress.outcome.as_ref().is_some_and(|outcome| {
                 outcome.as_ref().is_err_and(|exit| {
@@ -1605,6 +1610,57 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Internal transfer witnesses only; normal Machine entry keeps refusing VM=1.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn run_virtual8086_steps_for_test(
+        &mut self,
+        vm: &Vm,
+        max_steps: u64,
+        options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        let execution = self
+            .legacy_execution
+            .as_mut()
+            .ok_or(StepRunError::UnsupportedMode)?;
+        execution.task_switch.allow_virtual8086 = true;
+        let result = self.run_steps(vm, max_steps, options);
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.task_switch.allow_virtual8086 = false;
+        execution.validated = None;
+        result
+    }
+
+    /// Hand an outward exception back to the internal V86 delivery seam.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn deliver_virtual8086_fault_for_test(&mut self, vm: &Vm, exit: &Exit) -> Result<(), Exit> {
+        let context = crate::legacy::derive_virtual8086_context_for_test(
+            self.legacy_model.unwrap(),
+            &self.cpu,
+        )
+        .map_err(|e| {
+            self.unsupported_legacy(UnsupportedSystemOperation::InvalidLegacyContext(e))
+        })?;
+        let source = exception_source(exit).expect("exception witness");
+        let ip = exit
+            .fault_metadata()
+            .map_or(self.cpu.rip, |m| m.saved_rip()) as u32;
+        self.deliver_legacy_event::<false, 0>(
+            vm,
+            context,
+            PendingEvent {
+                irq_consumed: false,
+                software: false,
+                after_nmi: false,
+                source,
+                ip,
+                cs: self.cpu.cs,
+                origin: self.delivery_origin(self.cpu.cs, ip),
+            },
+        )
+    }
+
     pub(super) fn legacy_context_for_run(&self) -> Result<MachineContext, Exit> {
         self.validate_legacy_debug_state()?;
         let model = self.legacy_model.expect("legacy model");
@@ -1621,11 +1677,20 @@ impl Vcpu {
         if self.cpu.task_debug_trap != 0 {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyTaskDebugTrap));
         }
-        let context = derive_legacy_context(model, &self.cpu).map_err(|e| {
-            Exit::UnsupportedSystemContext {
-                addr: self.cpu.rip,
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
-            }
+        let derive = derive_legacy_context;
+        #[cfg(feature = "test-hooks")]
+        let derive = if self
+            .legacy_execution
+            .as_ref()
+            .is_some_and(|e| e.task_switch.allow_virtual8086)
+        {
+            crate::legacy::derive_transfer_context_for_test
+        } else {
+            derive
+        };
+        let context = derive(model, &self.cpu).map_err(|e| Exit::UnsupportedSystemContext {
+            addr: self.cpu.rip,
+            operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
         })?;
         // I286 PRM §10.4 p. 10-6; 80386 PRM §10.2.3 p. 10-3:
         // reset may fetch through the retained high CS base.
@@ -1841,7 +1906,7 @@ impl Vcpu {
             .direct_proofs
             .clear();
         // Decision-23 §5: processor exceptions can be exposed without delivery.
-        if context.regime == MachineRegime::Protected
+        if context.regime != MachineRegime::Real
             && self.exception_delivery == crate::ExceptionDelivery::Outward
             && matches!(event.source, EventSource::SingleStep)
         {
@@ -1917,7 +1982,7 @@ impl Vcpu {
                 Ok(()) => {
                     break (
                         vector,
-                        error_code.filter(|_| context.regime == MachineRegime::Protected),
+                        error_code.filter(|_| context.regime != MachineRegime::Real),
                     )
                 }
                 Err(exit) => {
@@ -2081,6 +2146,7 @@ impl Vcpu {
                 ip,
                 cs_base: u32::from(cs) << 4,
                 cpl: 0,
+                vm: false,
             }
         } else {
             Origin {
@@ -2088,6 +2154,7 @@ impl Vcpu {
                 ip,
                 cs_base: self.cpu.legacy.segments[SegmentId::Cs as usize].base,
                 cpl: self.cpu.legacy.cpl,
+                vm: self.cpu.rflags_system & (1 << 17) != 0,
             }
         }
     }
@@ -2143,6 +2210,8 @@ impl Vcpu {
             cpl_after: if twenty { 0 } else { self.cpu.legacy.cpl },
             retired: self.retired,
             regs,
+            virtual_8086_before: origin.vm,
+            virtual_8086_after: !twenty && self.cpu.rflags_system & (1 << 17) != 0,
         };
         if let Some(log) = &mut self.delivery_log {
             log.push(record);
@@ -2233,6 +2302,7 @@ impl Vcpu {
                     ip: delivered.ip,
                     cs_base: delivered.cs_base,
                     cpl: delivered.cpl,
+                    vm: delivered.vm,
                 },
                 Interrupted::Captured,
             )

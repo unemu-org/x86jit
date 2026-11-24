@@ -1883,3 +1883,26 @@ fn the_80386_records_eflags_as_pushfd_forms_it() {
     assert_eq!(regs.flags >> 16, 0, "{:#x}", regs.flags);
     assert_eq!(regs.flags & FLAGS_SET, FLAGS_SET, "{:#x}", regs.flags);
 }
+
+#[test]
+fn twenty_bit_models_never_report_virtual_8086_mode() {
+    // EFLAGS bit 17 (VM) does not exist before the 80386 (8086 Family UM
+    // §2.3 Fig. 2-10): a set bit in the image is ignored, and the record
+    // must not claim V86 on either side of the delivery.
+    for model in [
+        CpuModel::I8088,
+        CpuModel::I8086,
+        CpuModel::NecV20,
+        CpuModel::NecV30,
+    ] {
+        let (vm, mut cpu) = machine(model, false, b"\xcd\x40");
+        handler(&vm, false, 0x40, 0x4400, b"\xf4");
+        cpu.cpu.rflags_system |= 1 << 17;
+        halt(&vm, &mut cpu);
+        let batch = cpu.delivery_log_mut().unwrap().take();
+        assert_eq!(batch.records.len(), 1, "{model:?}");
+        let record = &batch.records[0];
+        assert!(!record.virtual_8086_before, "{model:?}");
+        assert!(!record.virtual_8086_after, "{model:?}");
+    }
+}

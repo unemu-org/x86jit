@@ -414,6 +414,14 @@ pub(crate) fn derive_virtual8086_context_for_test(
     derive_context::<true>(model, cpu)
 }
 
+#[cfg(feature = "test-hooks")]
+pub(crate) fn derive_transfer_context_for_test(
+    model: LegacyCpuModel,
+    cpu: &CpuState,
+) -> Result<MachineContext, MachineContextError> {
+    derive_context::<true>(model, cpu)
+}
+
 // 386 PRM §15.1.2 pp. 15-2–3; SDM Vol 3B §23.2 p. 23-5:
 // no descriptor lookup or inherited big-real attributes. ASSUMED: use the
 // existing real-cache attribute labels as the canonical internal image.
