@@ -148,12 +148,8 @@ pub enum UnsupportedSystemOperation {
     /// with a system type. Nothing is loaded. `LoadallImage::supported`
     /// states the whole policy.
     I286LoadallTable,
-    /// 80386 IN, OUT, INS or OUTS in protected mode with CPL > IOPL while TR
-    /// holds a 386 TSS. The processor then consults that TSS's I/O
-    /// permission bitmap (80386 PRM §8.3.2 p. 8-5), which the engine does
-    /// not model. Nothing is done: no operand transfer and no port exit.
-    /// With a 286 TSS in TR there is no bitmap and the access is #GP(0)
-    /// (80386 PRM §17.2.2.5 p. 17-15).
+    /// Reserved compatibility discriminant. Machine I/O now checks the live
+    /// TSS bitmap (80386 PRM §8.3.2 pp. 8-5–6) and does not produce this refusal.
     LegacyIoPermissionBitmap,
 }
 

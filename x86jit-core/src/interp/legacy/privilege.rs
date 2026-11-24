@@ -797,21 +797,26 @@ fn restricted_flags(cpu: &mut CpuState, generation: CpuGeneration, image: u32) -
 /// IOPL: IOPL can change within a context through a CPL-0 POPF.
 #[cold]
 #[inline(never)]
-pub(super) fn check(
-    cpu: &CpuState,
+pub(super) fn check<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
     generation: CpuGeneration,
     kind: legacy::PrivilegeCheck,
 ) -> Result<(), Exit> {
     let cpl = cpu.legacy.cpl;
     let iopl = ((cpu.rflags_system >> 12) & 3) as u8;
-    let (permitted, port) = match kind {
-        legacy::PrivilegeCheck::Cpl0 => (cpl == 0, false),
-        legacy::PrivilegeCheck::Iopl => (cpl <= iopl, false),
-        legacy::PrivilegeCheck::IoPort => (cpl <= iopl, true),
+    let (permitted, access) = match kind {
+        legacy::PrivilegeCheck::Cpl0 => (cpl == 0, None),
+        legacy::PrivilegeCheck::Iopl => (cpl <= iopl, None),
+        legacy::PrivilegeCheck::IoPort { port, size } => (
+            cpl <= iopl,
+            Some((port.map_or(cpu.gpr[RDX] as u16, u16::from), size)),
+        ),
         // SDM Vol 2B REP Operation p. 4-564: a zero count executes nothing.
-        legacy::PrivilegeCheck::RepIoPort { count_bytes } => {
-            (cpl <= iopl || cpu.gpr[RCX] & mask(count_bytes) == 0, true)
-        }
+        legacy::PrivilegeCheck::RepIoPort { count_bytes, size } => (
+            cpl <= iopl || cpu.gpr[RCX] & mask(count_bytes) == 0,
+            Some((cpu.gpr[RDX] as u16, size)),
+        ),
     };
     if permitted {
         return Ok(());
@@ -820,11 +825,34 @@ pub(super) fn check(
     // for a 286 TSS, which has no bitmap (SDM Vol 3A §10.6 p. 10-18), so
     // only a 386 TSS's bitmap is consulted. A TR that holds neither is
     // #GP(0) as well (ASSUMED).
-    if port && generation == CpuGeneration::I386 && tasks::wide(cpu.legacy.tr) {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyIoPermissionBitmap,
-        ));
+    let tr = cpu.legacy.tr;
+    if let Some((port, size)) = access {
+        if generation == CpuGeneration::I386 && tasks::wide(tr) && tr.cache.unusable == 0 {
+            // 386 PRM §17.2.2.5 p. 17-15 fetches the live pointer at TSS+66h;
+            // task_io_map_base is only the task-switch snapshot. SDM Vol 3A
+            // §§10.2.1–10.2.2 pp. 10-5–6: offset field and descriptor limit.
+            if tr.cache.limit < 0x67 {
+                return Err(fault(cpu, 13, 0));
+            }
+            let base = read(cpu, mem, u64::from(tr.cache.base.wrapping_add(0x66)), 2)? as u32;
+            let offset = base + u32::from(port >> 3);
+            // SDM Vol 1 §20.5.2 pp. 20-4–5; 486 PRM §8.3.2 pp. 8-7–8:
+            // always read two bytes; missing bitmap bytes deny access.
+            // 386 PRM §8.3.2 pp. 8-5–6 and §17.2.2.5 p. 17-15: test
+            // one bit for each byte of the transfer, without port wrapping.
+            if offset + 1 > tr.cache.limit {
+                return Err(fault(cpu, 13, 0));
+            }
+            let bits = read(cpu, mem, u64::from(tr.cache.base.wrapping_add(offset)), 2)?;
+            let mask = ((1u64 << size) - 1) << (port & 7);
+            // SDM Vol 2A IN p. 3-455, INS pp. 3-464–465; Vol 2B OUT
+            // p. 4-171, OUTS pp. 4-173–175: denial precedes the transfer.
+            // DERIVED: DX and width are fixed during REP, so this guard
+            // covers its iterations; each port handoff resumes through it.
+            if bits & mask == 0 {
+                return Ok(());
+            }
+        }
     }
     Err(fault(cpu, 13, 0))
 }

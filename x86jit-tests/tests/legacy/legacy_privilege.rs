@@ -123,6 +123,9 @@ fn world(model: CpuModel, ring: u8, code: &[u8], delivery: ExceptionDelivery) ->
         (0x2b, 0x83)
     };
     descriptor(&vm, 0x2000 + u64::from(TSS_SEL), TSS as u32, limit, attr);
+    if wide(model) {
+        put(&vm, TSS + 0x66, 2, 0x68); // No bitmap within the TSS limit.
+    }
     for ring in 0..3 {
         set_tss_stack(&vm, model, ring, STACK[ring as usize], TOP[ring as usize]);
     }
@@ -941,8 +944,8 @@ fn privileged_and_iopl_sensitive_instructions_check_before_any_effect() {
     // pp. 8-4–5; SDM Vol 3A §6.9 p. 6-23. The memory forms (LGDT, LIDT,
     // LLDT, LTR and LMSW [BP+0]) address an SS operand beyond the SS
     // limit: the #GP(0) of the privilege check precedes its #SS(0)
-    // (decision O10, ASSUMED). An I/O check that fails on the 80386 is the
-    // TSS I/O permission bitmap, a typed refusal. No PortIo exit is taken.
+    // (decision O10, ASSUMED). A missing I/O bitmap denies access on the
+    // 80386 too (386 PRM §8.3.2 pp. 8-5–6). No PortIo exit is taken.
     #[derive(Clone, Copy, PartialEq)]
     enum Kind {
         Cpl0,
@@ -989,13 +992,7 @@ fn privileged_and_iopl_sensitive_instructions_check_before_any_effect() {
                         Kind::Cpl0 => false,
                         Kind::Iopl | Kind::Io => u64::from(cpl) <= iopl,
                     };
-                    if !permitted && kind == Kind::Io && wide(model) {
-                        refused(
-                            &mut cpu,
-                            &vm,
-                            UnsupportedSystemOperation::LegacyIoPermissionBitmap,
-                        );
-                    } else if !permitted {
+                    if !permitted {
                         fault(&mut cpu, &vm, 13, Some(0));
                     } else if kind == Kind::Iopl {
                         steps(&mut cpu, &vm, 1);
@@ -1424,8 +1421,7 @@ fn lock_is_iopl_sensitive_on_the_80286_only() {
 fn port_io_above_iopl_on_the_80386_faults_through_a_286_tss() {
     // 386 PRM §17.2.2.5 p. 17-15, I-O-Permission: "IF TSS type is 286 THEN
     // RETURN FALSE"; a 286 TSS has no I/O map (SDM Vol 3A §10.6 p. 10-18).
-    // The access is #GP(0). With a 386 TSS the bitmap would be consulted,
-    // which stays the typed refusal LegacyIoPermissionBitmap (xj-srh.10).
+    // The access is #GP(0). With a 386 TSS, a missing bitmap denies access too.
     let forms: [&[u8]; 6] = [
         b"\xe4\x60",
         b"\xe6\x80",
@@ -1454,12 +1450,6 @@ fn port_io_above_iopl_on_the_80386_faults_through_a_286_tss() {
                         "{:?}",
                         run.stop()
                     );
-                } else if tss386 {
-                    refused(
-                        &mut cpu,
-                        &vm,
-                        UnsupportedSystemOperation::LegacyIoPermissionBitmap,
-                    );
                 } else {
                     fault(&mut cpu, &vm, 13, Some(0));
                 }
@@ -1486,15 +1476,7 @@ fn rep_ins_and_outs_with_a_zero_count_make_no_io_test() {
             // A count of 1 makes the test.
             let (vm, mut cpu) = world(model, 3, code, ExceptionDelivery::Outward);
             cpu.cpu.gpr[1] = 1;
-            if wide(model) {
-                refused(
-                    &mut cpu,
-                    &vm,
-                    UnsupportedSystemOperation::LegacyIoPermissionBitmap,
-                );
-            } else {
-                fault(&mut cpu, &vm, 13, Some(0));
-            }
+            fault(&mut cpu, &vm, 13, Some(0));
         }
     }
     // ADDR32 REP INSB counts ECX: CX = 0 with ECX = 10000h makes the test.
@@ -1510,11 +1492,7 @@ fn rep_ins_and_outs_with_a_zero_count_make_no_io_test() {
             steps(&mut cpu, &vm, 1);
             assert_eq!(cpu.cpu.rip, 0x1003);
         } else {
-            refused(
-                &mut cpu,
-                &vm,
-                UnsupportedSystemOperation::LegacyIoPermissionBitmap,
-            );
+            fault(&mut cpu, &vm, 13, Some(0));
         }
     }
 }

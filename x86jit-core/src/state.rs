@@ -461,7 +461,7 @@ pub struct CpuState {
     /// 80386 PRM Ch. 11 §11.1.3, p. 11-2).
     pub fpu_emulation: bool,
     /// 80386 PRM §7.1 Fig. 7-1 pp. 7-2–3: static incoming TSS I/O-map base.
-    /// Meaningful only with a 32-bit TSS; bitmap permission checks are deferred.
+    /// Task-switch snapshot only; I/O permission checks read the live TSS field.
     pub task_io_map_base: u16,
     /// 80386 PRM §12.3.1.5 p. 12-8: incoming TSS T bit awaiting debug support.
     pub task_debug_trap: u8,

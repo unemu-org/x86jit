@@ -52,12 +52,13 @@ switch seam; no paging reload is simulated. `LegacyTaskDebugTrap` persists until
 the embedder clears the recorded T bit or replaces state, because DR6.BT is absent.
 All these facilities are excluded from execution rather than approximated.
 
-The I/O-map base is visible in the appended CPU field. CPL 0 never needs bitmap
-permission checks, so an existing bitmap alone is not a reason to refuse a task.
-Contexts that could require those checks are already excluded by the privilege
-and VM refusals. Atomic descriptor updates against an MMIO descriptor retain
-LTR's `LegacyInstruction` refusal: separate read/write acknowledgments cannot
-implement the required CAS. Application paths do not consume the appended fields.
+The incoming I/O-map base is visible as a snapshot in the appended CPU field.
+Machine I/O at CPL > IOPL reads the live TSS pointer and bitmap through the
+cached TR base and limit (spec.md §17.10); an existing bitmap is not a reason to
+refuse a task. Virtual-8086 execution remains refused. Atomic descriptor updates
+against an MMIO descriptor retain LTR's `LegacyInstruction` refusal: separate
+read/write acknowledgments cannot implement the required CAS. Application paths
+do not consume the appended fields.
 
 ## Review corrections and reproductions
 

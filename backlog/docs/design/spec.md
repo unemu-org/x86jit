@@ -2410,9 +2410,17 @@ unchanged and the instruction or event replays.
   MOVS, INS or OUTS that passes keeps its typed handoff (`UnknownInstruction`).
   The 386 has no such rule: its LOCK page lists #UD only (386 PRM §17 LOCK
   pp. 17-100-101). On `I80386` an I/O instruction with CPL > IOPL consults
-  the I/O permission bitmap of a 386 TSS (386 PRM §8.3.2 p. 8-5), which is
-  not modelled: the typed refusal `LegacyIoPermissionBitmap`, with nothing
-  done (xj-srh.10). With a 286 TSS in TR the I/O permission function returns
+  the I/O permission bitmap of a 386 TSS (386 PRM §8.3.2 pp. 8-5–6;
+  486 PRM §8.3.2 pp. 8-7–8 for the 486 entries). The live pointer is read
+  at TSS+66h (386 PRM §17.2.2.5 p. 17-15), using the cached TR base and
+  limit (SDM Vol 3A §§10.2.1–10.2.2 pp. 10-4–6). The task-switch snapshot
+  `task_io_map_base` does not govern access. Two bitmap bytes must fit in
+  the TSS limit, and every bit for the transfer must be clear; otherwise
+  #GP(0) precedes any operand or port transfer (SDM Vol 1 §20.5.2
+  pp. 20-4–5; Vol 2A IN p. 3-455, INS pp. 3-464–465; Vol 2B OUT p. 4-171,
+  OUTS pp. 4-173–175). DERIVED: DX and width stay fixed during REP, so
+  the instruction guard covers its iterations; every port handoff resumes
+  through the guard. With a 286 TSS in TR the I/O permission function returns
   FALSE (386 PRM §17.2.2.5 p. 17-15; a 16-bit TSS has no I/O map, SDM Vol 3A
   §10.6 p. 10-18), so the access is #GP(0), as it is with a TR that holds no
   TSS (ASSUMED). REP INS and REP OUTS with a zero count (CX, or ECX with a
@@ -2471,7 +2479,7 @@ unchanged and the instruction or event replays.
   (decision-24); RETF and RETF n from the called procedure are the outward
   return above.
 - **Still refused:** a VM image, paging, the 386 TSS T bit, LOADALL with a
-  CS DPL of 1-3, the I/O bitmap of a 386 TSS and an inward call-gate CALL
+  CS DPL of 1-3 and an inward call-gate CALL
   whose frame copy exceeds the retry ledger. `LegacyPrivilegeTransition`
   and `LegacyGateOrTaskTransfer` are no longer produced.
 

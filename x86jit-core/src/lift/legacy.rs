@@ -500,6 +500,7 @@ fn privilege_guard(
             if insn.has_rep_prefix() || insn.has_repne_prefix() =>
         {
             PrivilegeCheck::RepIoPort {
+                size: insn.memory_size().size() as u8,
                 count_bytes: if insn
                     .op_kinds()
                     .any(|k| matches!(k, OpKind::MemorySegSI | OpKind::MemoryESDI))
@@ -510,7 +511,21 @@ fn privilege_guard(
                 },
             }
         }
-        In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd => PrivilegeCheck::IoPort,
+        In | Out => {
+            let (acc, port) = if insn.mnemonic() == In {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
+            PrivilegeCheck::IoPort {
+                port: (insn.op_kind(port) == OpKind::Immediate8).then(|| insn.immediate8()),
+                size: operand_size(insn, acc),
+            }
+        }
+        Insb | Insw | Insd | Outsb | Outsw | Outsd => PrivilegeCheck::IoPort {
+            port: None,
+            size: insn.memory_size().size() as u8,
+        },
         // 286 PRM App. B LOCK p. B-68 and §3.11.2 p. 3-29: LOCK in protected
         // mode is #GP(0) when CPL > IOPL. The 386 has no such rule (386 PRM
         // §17 LOCK pp. 17-100–101 lists #UD only).

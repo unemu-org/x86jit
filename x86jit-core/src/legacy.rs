@@ -1113,14 +1113,17 @@ pub enum PrivilegeCheck {
     /// CPL <= IOPL for IN, OUT, INS and OUTS. Otherwise the 80286 raises
     /// #GP(0) (286 PRM App. B pp. B-45, B-47, B-81, B-82). The 80386
     /// consults the I/O permission bitmap of a 386 TSS (386 PRM §8.3.2
-    /// p. 8-5), which the engine refuses with `LegacyIoPermissionBitmap`;
-    /// with any other TR its I/O permission function returns FALSE and the
+    /// pp. 8-5–6); with any other TR its I/O permission function returns FALSE and the
     /// result is #GP(0) (386 PRM §17.2.2.5 p. 17-15).
-    IoPort,
+    IoPort {
+        /// Immediate port, or DX when absent.
+        port: Option<u8>,
+        size: u8,
+    },
     /// REP INS or REP OUTS: the `IoPort` test, made only when the count
     /// register (CX, or ECX when `count_bytes` is 4) is not zero. A zero
     /// count executes nothing (SDM Vol 2B REP Operation p. 4-564).
-    RepIoPort { count_bytes: u8 },
+    RepIoPort { count_bytes: u8, size: u8 },
 }
 
 /// The REPC/REPNC test and the data-bus width of a `LegacyOp::WrappedString`.

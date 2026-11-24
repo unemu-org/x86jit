@@ -25,6 +25,7 @@ mod legacy_i386_x87;
 mod legacy_i486;
 mod legacy_i8086;
 mod legacy_idt;
+mod legacy_io_bitmap;
 mod legacy_ldt;
 mod legacy_model_decode;
 mod legacy_nec_v20;

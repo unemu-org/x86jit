@@ -3451,7 +3451,7 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
                     }
                 }
                 L::Checkpoint | L::SharedWalk => {}
-                L::Privileged { kind } => privilege::check(cpu, context.generation, *kind)?,
+                L::Privileged { kind } => privilege::check(cpu, mem, context.generation, *kind)?,
                 L::LockedTransfer => return Err(atomic_device_exit(cpu, mem, ir)),
                 L::DirectStackAddress {
                     dst,
