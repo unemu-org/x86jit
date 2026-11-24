@@ -354,8 +354,15 @@ the instruction's starting IP. Fetch itself can set A; it never sets D.
 Start with one-instruction paged blocks using the Checked cache. Each lookup is
 guarded by model/decode/segment identity, linear start/decode IP, translation
 generation, CR3 identity, PG/WP assumptions and the ordered physical source spans
-actually fetched. Revalidate page permission/fetch policy and bytes even on a
-hit. A block lifted at linear L under directory A cannot execute under directory
+actually fetched. Decision-27 order 1 permits a warm singleton to reuse these
+checks while its context, translation token, physical source publication generation
+and fetch permit remain valid. Keep its physical source registration alive rather
+than walking, fetching and registering again. The VM namespace issues non-reused
+tokens across all vCPUs; TLB replacement conservatively expires retained source
+proofs, and physical SMC invalidation expires their publication generation. This
+also permits the architecturally allowed stale mapping until invalidation or
+replacement; ordinary page-table stores do not independently revoke a token.
+A block lifted at linear L under directory A cannot execute under directory
 B; CR3 alone is also insufficient after equal-value reload, INVLPG or remapping.
 If a TLB eviction causes a new mapping inside one generation, fresh fetch and
 physical-span identity must reject the old proof even when the bytes are equal.

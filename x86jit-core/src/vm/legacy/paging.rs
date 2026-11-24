@@ -21,12 +21,15 @@ struct Proof {
     bytes: Vec<u8>,
     // Ordered post-A20 bus spans, never a linear length applied to one frame.
     sources: Vec<(u64, u32)>,
+    permit: Option<crate::FetchPermit>,
     _registration: crate::memory::CodeRegistration,
 }
 
 #[derive(Default)]
 pub(super) struct State {
     generation: u64,
+    pub(super) tlb: std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
+    mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
     memory: usize,
     source_generation: u64,
@@ -48,24 +51,73 @@ impl State {
 
     pub(super) fn invalidate(&mut self) {
         self.blocks.clear();
-        // Dropping entries before wrap prevents identifier reuse retaining proofs.
-        self.generation = self.generation.wrapping_add(1);
+        self.tlb.get_mut().invalidate();
+        self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
     }
 
-    fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
+    pub(super) fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
         let stamp = LegacyContextStamp::new(cpu, model);
         let memory = &vm.mem as *const Memory as usize;
         let source_generation = vm.cache.publication_generation();
+        let mapping = vm.mem.mapping_identity();
         if self.stamp != Some(stamp)
             || self.memory != memory
             || self.source_generation != source_generation
+            || self
+                .mapping
+                .as_ref()
+                .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
         {
             self.invalidate();
             self.stamp = Some(stamp);
             self.memory = memory;
             self.source_generation = source_generation;
+            self.mapping = Some(mapping);
         }
+        self.tlb.get_mut().reconcile(cpu);
+        self.reconcile_generation();
+    }
+
+    fn reconcile_generation(&mut self) {
+        let generation = self.tlb.get_mut().generation;
+        if self.generation != generation {
+            self.blocks.clear();
+            self.generation = generation;
+        }
+    }
+
+    fn key(
+        &self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        context: MachineContext,
+        owner_id: u64,
+    ) -> Result<Key, Exit> {
+        let linear_fetch = crate::legacy::access(
+            cpu,
+            context.generation,
+            SegmentId::Cs,
+            cpu.rip,
+            1,
+            crate::AccessKind::Execute,
+        )? as u32;
+        Ok(Key {
+            decode: LegacyBlockKey {
+                owner_id,
+                context_id: self.generation,
+                model_semantics_id: model.model_semantics_id,
+                decode_bits: context.default_operand_bits,
+                stack_bits: context.stack_address_bits,
+                regime: context.regime,
+                decode_ip: cpu.rip as u32,
+                linear_fetch,
+                mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+            },
+            generation: self.generation,
+            cr3: cpu.legacy.cr3,
+            cr0: cpu.legacy.cr0,
+        })
     }
 
     #[cold]
@@ -83,11 +135,19 @@ impl State {
         loop {
             vm.handle_smc(exit_word);
             self.reconcile(vm, cpu, model);
+            let key = self.key(cpu, model, context, owner_id)?;
+            if let Some(proof) = self
+                .blocks
+                .get(&key)
+                .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
+            {
+                return Ok(proof.ir.clone());
+            }
             let source = crate::memory::LiftSource::new(&vm.mem);
             let generation = vm.cache.publication_generation();
             let permit = vm.mem.fetch_permit();
-            let (bytes, sources) =
-                fetch(vm, cpu, context, &source, &walk_wrote).map_err(|mut exit| {
+            let (bytes, sources) = fetch(vm, cpu, context, &source, &walk_wrote, &self.tlb)
+                .map_err(|mut exit| {
                     if walk_wrote.get() {
                         if let Exit::UnmappedMemory {
                             metadata: Some(m), ..
@@ -115,30 +175,8 @@ impl State {
             if vm.cache.publication_generation() != generation {
                 continue;
             }
-            let linear_fetch = crate::legacy::access(
-                cpu,
-                context.generation,
-                SegmentId::Cs,
-                cpu.rip,
-                1,
-                crate::AccessKind::Execute,
-            )? as u32;
-            let key = Key {
-                decode: LegacyBlockKey {
-                    owner_id,
-                    context_id: self.generation,
-                    model_semantics_id: model.model_semantics_id,
-                    decode_bits: context.default_operand_bits,
-                    stack_bits: context.stack_address_bits,
-                    regime: context.regime,
-                    decode_ip: cpu.rip as u32,
-                    linear_fetch,
-                    mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-                },
-                generation: self.generation,
-                cr3: cpu.legacy.cr3,
-                cr0: cpu.legacy.cr0,
-            };
+            self.reconcile_generation();
+            let key = self.key(cpu, model, context, owner_id)?;
             let ir = if let Some(proof) = self
                 .blocks
                 .get(&key)
@@ -177,6 +215,7 @@ impl State {
                     ir: ir.clone(),
                     bytes,
                     sources,
+                    permit,
                     _registration: registration.unwrap(),
                 },
             );
@@ -195,6 +234,7 @@ fn fetch(
     context: MachineContext,
     source: &crate::memory::LiftSource<'_>,
     walk_wrote: &Cell<bool>,
+    tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
 ) -> Result<Fetched, Exit> {
     let ip = cpu.rip;
     let mut bytes = Vec::with_capacity(15);
@@ -211,7 +251,7 @@ fn fetch(
             crate::AccessKind::Execute,
         )?;
         let bus = if context.paging_enabled {
-            fetch_bus_for_test(cpu, &vm.mem, linear as u32, walk_wrote)?
+            fetch_bus_for_test(cpu, &vm.mem, linear as u32, walk_wrote, Some(tlb))?
         } else {
             crate::legacy::physical_span(cpu, u32::MAX, linear, 1).0
         };
@@ -450,6 +490,7 @@ impl Vcpu {
                 context,
                 &mut execution.task_switch,
                 &mut state.transaction,
+                &state.tlb,
             )
         } else {
             execute_retained::<ROUTED, ORDER>(
@@ -459,6 +500,7 @@ impl Vcpu {
                 context,
                 &mut execution.task_switch,
                 &mut state.transaction,
+                &state.tlb,
             )
         };
         let outcome = result.map(|(outcome, input)| {
@@ -643,6 +685,7 @@ impl Vcpu {
                 context,
                 &mut execution.task_switch,
                 &mut state.transaction,
+                &state.tlb,
             )
         } else {
             execute_for_test::<false, V86>(
@@ -760,6 +803,7 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
     context: MachineContext,
     task_switch: &mut crate::interp::legacy::tasks::SwitchState,
     retry: &mut Option<crate::interp::legacy::paging::Transaction>,
+    tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
 ) -> Result<
     (
         crate::interp::legacy::Outcome,
@@ -774,5 +818,6 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
         context,
         task_switch,
         retry,
+        tlb,
     )
 }

@@ -675,16 +675,20 @@ fn paged_fetch_nonidentity_mapping_and_historical_fault_bits() {
                 assert_eq!(f.cpu.cpu.rip, 0x402);
                 assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7 | A);
                 assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
-                // Permission and presence must be revalidated on a cache hit.
+                // SDM Vol 3A §5.10.4.2: invalidate after table edits
+                // before requiring the new permissions/presence.
                 f.put(u64::from(CODE_PT), CODE_FRAME | 3 | A);
+                f.cpu.invalidate_paging();
                 if cpl == 3 {
                     f.fetch_pf(0x400, 0x400, 5);
                 } else {
                     f.fetch_at(0x400).unwrap();
                 }
                 f.put(u64::from(CODE_PT), 0);
+                f.cpu.invalidate_paging();
                 f.fetch_pf(0x400, 0x400, if cpl == 3 { 4 } else { 0 });
                 f.put(PD, 0);
+                f.cpu.invalidate_paging();
                 f.fetch_pf(0x400, 0x400, if cpl == 3 { 4 } else { 0 });
             }
         }
@@ -982,9 +986,9 @@ fn paged_fetch_publication_write_race_retries_the_complete_source() {
 }
 
 #[test]
-fn paged_fetch_equal_bytes_in_new_frame_replace_physical_proof_without_flush() {
-    // Paging design §3.5: an uncached re-walk may observe a new frame within
-    // one generation; equal instruction bytes alone cannot validate old sources.
+fn paged_fetch_tlb_eviction_replaces_equal_byte_physical_proof() {
+    // Paging design §§3.2, 3.5: replacement may observe a new frame;
+    // equal instruction bytes alone cannot validate old physical sources.
     for model in MODELS {
         for code32 in [false, true] {
             let mut f = Fixture::new(model, code32, 0);
@@ -996,11 +1000,16 @@ fn paged_fetch_equal_bytes_in_new_frame_replace_physical_proof_without_flush() {
             f.fetch_at(0x400).unwrap();
             let before = f.cpu.paging_cache_for_test();
             f.code_mapping(0, OTHER_FRAME);
+            // Force a direct-mapped TLB collision without a guest flush.
+            f.code_mapping(0x40000, OTHER_FRAME);
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x90])
+                .unwrap();
+            f.fetch_at(0x40500).unwrap();
             f.fetch_at(0x400).unwrap();
             let after = f.cpu.paging_cache_for_test();
-            assert_eq!(after.0, before.0);
+            assert!(after.0 > before.0);
             assert_eq!(after.1, before.1);
-            assert_eq!(after.2, before.2 + 1);
+            assert_eq!(after.2, before.2 + 2);
             assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
             assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x401, &[0x22])
@@ -1332,8 +1341,8 @@ fn paging_invlpg_is_addressed_privileged_and_drops_proofs() {
 #[test]
 fn paging_read_then_write_sets_dirty_and_rewalks_changed_entries() {
     // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3 pp. 5-21–22:
-    // a read translation is not evidence that D has been set. With the
-    // uncached walker (design §5), each first write revalidates the mapping.
+    // a read translation is not evidence that D has been set. The first
+    // write through a clean TLB entry revalidates the mapping (design §3.2).
     for model in MODELS {
         for code32 in [false, true] {
             for remap in [false, true] {
@@ -4094,5 +4103,272 @@ fn public_instruction_and_event_retries_cover_additional_cpu_inputs() {
                 assert_eq!(f.get(if event { 0x87fc } else { u64::from(DATA) }), 0);
             }
         }
+    }
+}
+
+#[test]
+fn tlb_permissions_match_walks_for_every_combined_right_and_wp() {
+    // 80386 PRM §§6.4.1–6.4.2 Table 6-5; SDM Vol 3A §5.6.1:
+    // CPL0–2 bypass R/W only with WP clear, CPL3 requires combined U/S.
+    for model in MODELS {
+        for cpl in 0..4 {
+            for wp in [false, true] {
+                let mut f = Fixture::new(model, true, cpl);
+                if wp && model != CpuModel::I80386 {
+                    f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                }
+                f.code_mapping(0, CODE_FRAME);
+                for (ip, write) in [(0x400, false), (0x500, true)] {
+                    f.vm.write_bytes(u64::from(CODE_FRAME) + ip, &f.code(write, OFFSET))
+                        .unwrap();
+                }
+                for pde in [1, 3, 5, 7] {
+                    for pte in [1, 3, 5, 7] {
+                        f.cpu.invalidate_paging();
+                        f.tables(pde | A, pte | A | D);
+                        for write in [false, true] {
+                            let allowed = (cpl != 3 || pde & pte & 4 != 0)
+                                && (!write
+                                    || (cpl != 3 && (!wp || model == CpuModel::I80386))
+                                    || pde & pte & 2 != 0);
+                            for _ in 0..2 {
+                                f.cpu.cpu.gpr[0] = 0x1234_5678;
+                                f.put(u64::from(DATA), 0x8765_4321);
+                                let result = f.fetch_at(if write { 0x500 } else { 0x400 });
+                                if allowed {
+                                    result.unwrap();
+                                    assert_eq!(
+                                        f.cpu.cpu.gpr[0],
+                                        if write { 0x1234_5678 } else { 0x8765_4321 }
+                                    );
+                                    assert_eq!(
+                                        f.get(u64::from(DATA)),
+                                        if write { 0x1234_5678 } else { 0x8765_4321 }
+                                    );
+                                } else {
+                                    let exit = result.unwrap_err();
+                                    assert!(
+                                        matches!(exit, Exit::Exception { vector: 14, .. }),
+                                        "{exit:?}"
+                                    );
+                                    assert_eq!(
+                                        exit.fault_metadata().unwrap().error_code(),
+                                        ErrorCode::bits(
+                                            1 | (u32::from(write) << 1)
+                                                | (u32::from(cpl == 3) << 2),
+                                            7
+                                        )
+                                    );
+                                    assert_eq!(f.cpu.cpu.gpr[0], 0x1234_5678);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tlb_stale_mapping_and_accessed_bits_last_until_explicit_invalidation() {
+    // SDM Vol 3A §5.10.2.3: cached frame/rights may survive table stores;
+    // clearing A requires invalidation before predictable re-setting.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
+            .unwrap();
+        f.put(u64::from(DATA), 0x11);
+        f.put(u64::from(NEXT), 0x22);
+        f.fetch_at(0x400).unwrap();
+        let proof = f.cpu.paging_cache_for_test();
+        f.put(f.pte(), NEXT | 7);
+        f.put(f.pde(), PT | 7);
+        f.put(u64::from(CODE_PT), OTHER_FRAME); // not present, warm code proof survives
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+        assert_eq!(f.get(f.pte()), NEXT | 7);
+        assert_eq!(f.get(f.pde()), PT | 7);
+        assert_eq!(f.cpu.paging_cache_for_test(), proof);
+        f.code_mapping(0, CODE_FRAME);
+        f.cpu.invalidate_paging();
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x22);
+        assert_eq!(f.get(f.pte()), NEXT | 7 | A);
+        assert_eq!(f.get(f.pde()), PT | 7 | A);
+    }
+}
+
+#[test]
+fn tlb_embedder_edits_map_identity_and_reset_flush_data_translations() {
+    // Paging design §3.2: conservative flush on positive-entry edits/restore.
+    for model in MODELS {
+        for trigger in 0..7 {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
+                .unwrap();
+            f.put(u64::from(DATA), 0x11);
+            f.put(u64::from(NEXT), 0x22);
+            f.fetch_at(0x400).unwrap();
+            let old = f.cpu.paging_cache_for_test().0;
+            f.put(f.pte(), NEXT | 7);
+            match trigger {
+                0 => f.cpu.invalidate_paging(),
+                1 => f.cpu.cpu.legacy.segments[1].limit -= 1,
+                2 => f.cpu.set_a20_enabled(false),
+                3 => f.cpu.cpu.legacy.cr3 ^= 8,
+                4 => {
+                    f.vm.unmap(0x1f000, 0x1000).unwrap();
+                }
+                5 => f.cpu.reset_execution_state(Default::default()),
+                6 => {
+                    let mut replacement = Fixture::new(model, true, 0);
+                    replacement.code_mapping(0, CODE_FRAME);
+                    replacement
+                        .vm
+                        .write_bytes(
+                            u64::from(CODE_FRAME) + 0x400,
+                            &replacement.code(false, OFFSET),
+                        )
+                        .unwrap();
+                    replacement.put(replacement.pte(), NEXT | 7);
+                    replacement.put(u64::from(NEXT), 0x22);
+                    std::mem::swap(&mut f.vm.mem, &mut replacement.vm.mem);
+                }
+                _ => unreachable!(),
+            }
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x22, "trigger {trigger}");
+            assert!(f.cpu.paging_cache_for_test().0 > old);
+        }
+    }
+}
+
+#[test]
+fn tlb_vcpu_tokens_and_invalidation_are_independent() {
+    // Decision-27: equal local epochs never authorize sharing different CR3s.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
+            .unwrap();
+        f.put(u64::from(DATA), 0x11);
+        f.put(u64::from(NEXT), 0x22);
+        f.fetch_at(0x400).unwrap();
+        let mut other = f.vm.new_vcpu();
+        other.cpu = f.cpu.cpu.clone();
+        other.cpu.rip = 0x400;
+        other.interpret_paged_for_test(&f.vm).unwrap();
+        assert_ne!(
+            other.paging_cache_for_test().0,
+            f.cpu.paging_cache_for_test().0
+        );
+        let other_proof = other.paging_cache_for_test();
+        f.put(f.pte(), NEXT | 7);
+        f.cpu.invalidate_paging();
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x22);
+        other.cpu.rip = 0x400;
+        other.interpret_paged_for_test(&f.vm).unwrap();
+        assert_eq!(other.cpu.gpr[0], 0x11);
+        assert_eq!(other.paging_cache_for_test(), other_proof);
+        other.invalidate_paging();
+        other.cpu.rip = 0x400;
+        other.interpret_paged_for_test(&f.vm).unwrap();
+        assert_eq!(other.cpu.gpr[0], 0x22);
+    }
+}
+
+#[test]
+fn tlb_guest_control_invalidations_observe_edited_data_pte() {
+    // Paging design §3.2; 80386 PRM §5.2.5; SDM Vol 3A §5.10.4.1.
+    for model in MODELS {
+        for trigger in 0..5 {
+            if model == CpuModel::I80386 && (trigger == 2 || trigger == 3) {
+                continue;
+            }
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.cpu.legacy.cr3 = PD as u32;
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
+                .unwrap();
+            let control: &[u8] = match trigger {
+                0 | 1 => &[0x0f, 0x22, 0xd8],         // MOV CR3,EAX
+                2 | 4 => &[0x0f, 0x22, 0xc0],         // MOV CR0,EAX
+                3 => &[0x0f, 0x01, 0x3d, 0, 0, 0, 0], // INVLPG [0], full flush
+                _ => unreachable!(),
+            };
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x600, control)
+                .unwrap();
+            f.put(u64::from(DATA), 0x11);
+            f.put(u64::from(NEXT), 0x22);
+            f.fetch_at(0x400).unwrap();
+            let old = f.cpu.paging_cache_for_test().0;
+            f.put(f.pte(), NEXT | 7);
+            f.cpu.cpu.gpr[0] = match trigger {
+                0 => PD,
+                1 => {
+                    f.map_code(OTHER_PD, CODE_PT, 0, CODE_FRAME, 7 | A);
+                    f.put(u64::from(OTHER_PD + 4 * (LINEAR >> 22)), PT | 7 | A);
+                    u64::from(OTHER_PD)
+                }
+                2 => u64::from(f.cpu.cpu.legacy.cr0 ^ (1 << 16)),
+                3 => 0,
+                4 => 1,
+                _ => unreachable!(),
+            };
+            f.fetch_at(0x600).unwrap();
+            assert!(f.cpu.paging_cache_for_test().0 > old);
+            if trigger == 4 {
+                // Re-enable PG through the unpaged instruction path.
+                f.vm.write_bytes(0x600, control).unwrap();
+                f.cpu.cpu.gpr[0] = 0x8000_0001;
+                f.fetch_at(0x600).unwrap();
+            }
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x22, "trigger {trigger}");
+        }
+    }
+}
+
+#[test]
+fn tlb_warm_fetch_preserves_cr2_and_zero_budget_and_rechecks_fetch_policy() {
+    // Paging design §3.2: CR2 is output-only and zero budget has no effects.
+    // The embedder fetch policy remains a physical source proof dimension (§3.5).
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+            .unwrap();
+        f.fetch_at(0x400).unwrap();
+        let proof = f.cpu.paging_cache_for_test();
+        f.cpu.cpu.legacy.cr2 = 0x1234_5678;
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.paging_cache_for_test(), proof);
+        assert_eq!(f.cpu.cpu.legacy.cr2, 0x1234_5678);
+        f.put(u64::from(CODE_PT), 0);
+        f.cpu.cpu.rip = 0x400;
+        let cr2 = f.cpu.cpu.legacy.cr2;
+        let run = f.cpu.run_steps(&f.vm, 0, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 0);
+        assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert_eq!(f.cpu.cpu.legacy.cr2, cr2);
+        assert_eq!(f.get(u64::from(CODE_PT)), 0);
+        assert_eq!(f.cpu.paging_cache_for_test(), proof);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.set_fetch_policy(Box::new(|_| x86jit_core::FetchVerdict::DenyProtection));
+        let exit = f.fetch_at(0x400).unwrap_err();
+        assert!(
+            matches!(
+                exit,
+                Exit::UnmappedMemory {
+                    access: x86jit_core::AccessKind::Execute,
+                    ..
+                }
+            ),
+            "{exit:?}"
+        );
     }
 }

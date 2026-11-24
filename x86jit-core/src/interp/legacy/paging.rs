@@ -1,5 +1,5 @@
 //! Internal Machine translation boundary (paging design §§3.1–3.4, spec §17.10).
-//! No translation cache: each instruction/iteration owns its physical spans.
+//! A functional TLB shares its proof generation with paged instruction sources.
 use super::*;
 use crate::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAddress, FaultCause, FaultClass, FaultMetadata,
@@ -14,6 +14,94 @@ const ACCESSED: u32 = 0x20;
 const DIRTY: u32 = 0x40;
 const FRAME: u32 = 0xffff_f000;
 const IDENTITY: u32 = FRAME | PRESENT | WRITE | USER;
+
+/// Storage exists only in the paged adapter; PG=0 still carries `()`.
+#[derive(Default)]
+pub(crate) struct AdapterState<'a> {
+    pub(super) transaction: Option<&'a std::cell::RefCell<Transaction>>,
+    pub(super) tlb: Option<&'a std::cell::RefCell<Tlb>>,
+}
+
+#[derive(Clone, Copy)]
+struct Entry {
+    page: u32,
+    translation: Translation,
+    rights: u32,
+}
+
+/// Paging design §3.2 / decision-27: tokens are issued by the VM namespace,
+/// never per-vCPU counters. Replacement conservatively expires source proofs.
+pub(crate) struct Tlb {
+    entries: [Option<Entry>; 64],
+    pub(crate) generation: u64,
+    context: Option<(u32, u32, u8, u32)>,
+}
+impl Default for Tlb {
+    fn default() -> Self {
+        Self {
+            entries: [None; 64],
+            generation: 0,
+            context: None,
+        }
+    }
+}
+impl Tlb {
+    pub(crate) fn invalidate(&mut self) {
+        self.entries.fill(None);
+        self.context = None;
+        self.generation = crate::vm::paging_generation();
+    }
+
+    pub(crate) fn reconcile(&mut self, cpu: &CpuState) {
+        let context = (
+            cpu.legacy.cr3,
+            cpu.legacy.cr0,
+            cpu.legacy.a20_enabled,
+            cpu.machine_flags_mask,
+        );
+        if self.context != Some(context) {
+            self.invalidate();
+            self.context = Some(context);
+        }
+    }
+
+    fn remove(&mut self, linear: u32) {
+        let slot = &mut self.entries[(linear >> 12) as usize & 63];
+        if slot.take().is_some() {
+            self.generation = crate::vm::paging_generation();
+        }
+    }
+
+    fn insert(&mut self, linear: u32, translation: Translation, rights: u32) {
+        let index = (linear >> 12) as usize & 63;
+        if self.entries[index].is_some_and(|e| e.page != linear >> 12) {
+            self.generation = crate::vm::paging_generation();
+        }
+        self.entries[index] = Some(Entry {
+            page: linear >> 12,
+            translation,
+            rights,
+        });
+    }
+
+    fn dirty(&mut self, linear: u32, t: Translation) {
+        if let Some(e) = &mut self.entries[(linear >> 12) as usize & 63] {
+            if e.page == linear >> 12
+                && e.translation.pte_address == t.pte_address
+                && (e.translation.pte ^ t.pte) & IDENTITY == 0
+            {
+                e.translation.pte |= DIRTY;
+            }
+        }
+    }
+}
+
+fn permitted(cpu: &CpuState, access: AccessKind, privilege: Privilege, rights: u32) -> bool {
+    // 80386 PRM §§6.4.1–6.4.2 Table 6-5; SDM Vol 3A §5.6.1.
+    let wp = cpu.machine_flags_mask != 0 && cpu.legacy.cr0 & (1 << 16) != 0;
+    (!privilege.user() || rights & USER != 0)
+        && (access != AccessKind::Write || (!privilege.user() && !wp) || rights & WRITE != 0)
+}
 
 #[cfg(feature = "test-hooks")]
 type CasHook = Box<dyn FnMut(&Memory, u64, u32, u32, Option<u32>)>;
@@ -280,6 +368,33 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     privilege: Privilege,
     set_accessed: bool,
 ) -> Result<Translation, Exit> {
+    if let Some(tlb) = mem.tlb() {
+        let mut tlb = tlb.borrow_mut();
+        tlb.reconcile(cpu);
+        if let Some(e) =
+            tlb.entries[(linear >> 12) as usize & 63].filter(|e| e.page == linear >> 12)
+        {
+            if !permitted(cpu, access, privilege, e.rights) {
+                return Err(PageFault {
+                    linear,
+                    access,
+                    privilege,
+                    protection: true,
+                }
+                .exit(cpu));
+            }
+            // Paging design §3.2: re-walk a clean read fill before D-setting.
+            // SDM Vol 3A §5.10.2 permits eviction and observing edited tables.
+            if access != AccessKind::Write || e.translation.pte & DIRTY != 0 {
+                return Ok(Translation {
+                    physical: (e.translation.physical & FRAME) | (linear & 0xfff),
+                    bytes: u32::from(bytes).min(0x1000 - (linear & 0xfff)) as u8,
+                    ..e.translation
+                });
+            }
+            tlb.remove(linear);
+        }
+    }
     loop {
         // 80386 PRM §5.2, Figs. 5-8–10 pp. 5-7–9; SDM Vol 3A §5.3
         // pp. 5-9–13: two 1024-entry levels and 4 KiB frames, no PSE.
@@ -343,18 +458,21 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         // SDM Vol 3A §§5.1.3, 5.6.1 pp. 5-5, 5-33–35 applies WP to
         // both mapping classes (paging design Q3).
         let rights = pde & pte;
-        let wp = cpu.machine_flags_mask != 0 && cpu.legacy.cr0 & (1 << 16) != 0;
-        if (privilege.user() && rights & USER == 0)
-            || (access == AccessKind::Write && (privilege.user() || wp) && rights & WRITE == 0)
-        {
+        if !permitted(cpu, access, privilege, rights) {
             return Err(fault(true).exit(cpu));
         }
-        return Ok(Translation {
+        let translation = Translation {
             physical: (pte & FRAME) | (linear & 0xfff),
             bytes: u32::from(bytes).min(0x1000 - (linear & 0xfff)) as u8,
             pte_address,
             pte,
-        });
+        };
+        if set_accessed {
+            if let Some(tlb) = mem.tlb() {
+                tlb.borrow_mut().insert(linear, translation, rights);
+            }
+        }
+        return Ok(translation);
     }
 }
 
@@ -391,7 +509,13 @@ fn complete_dirty<const ROUTED: bool, const ORDER: u8>(
         )?
         .is_none()
         {
+            if let Some(tlb) = mem.tlb() {
+                tlb.borrow_mut().remove(f.linear);
+            }
             return Ok(false);
+        }
+        if let Some(tlb) = mem.tlb() {
+            tlb.borrow_mut().dirty(f.linear, t);
         }
         f.dirty_complete = true;
     }
@@ -839,11 +963,12 @@ pub(crate) fn fetch_bus_for_test(
     memory: &Memory,
     linear: u32,
     wrote: &Cell<bool>,
+    tlb: Option<&std::cell::RefCell<Tlb>>,
 ) -> Result<u64, Exit> {
     if memory.host_fault_recovery() {
-        fetch_bus::<true>(cpu, memory, linear, wrote)
+        fetch_bus::<true>(cpu, memory, linear, wrote, tlb)
     } else {
-        fetch_bus::<false>(cpu, memory, linear, wrote)
+        fetch_bus::<false>(cpu, memory, linear, wrote, tlb)
     }
 }
 
@@ -852,6 +977,7 @@ fn fetch_bus<const ROUTED: bool>(
     memory: &Memory,
     linear: u32,
     wrote: &Cell<bool>,
+    tlb: Option<&std::cell::RefCell<Tlb>>,
 ) -> Result<u64, Exit> {
     let privilege = if cpu.legacy.cpl == 3 {
         Privilege::User
@@ -861,6 +987,7 @@ fn fetch_bus<const ROUTED: bool>(
     let observe = |_, _| wrote.set(true);
     let mut mem = LegacyAccess::<ROUTED, 0, true>::new(memory, u32::MAX);
     mem.writes = Some(&observe);
+    mem.paging.tlb = tlb;
     let t = translate_linear(cpu, &mem, linear, 1, AccessKind::Execute, privilege, true)?;
     Ok(legacy::physical_span(cpu, u32::MAX, u64::from(t.physical), 1).0)
 }
@@ -1130,6 +1257,9 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
             continue;
         }
         for f in spans {
+            if f.dirty_complete {
+                continue;
+            }
             dirtied |= f.translation.pte & DIRTY == 0;
             if table_or(
                 cpu,
@@ -1142,7 +1272,13 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
             )?
             .is_none()
             {
+                if let Some(tlb) = mem.tlb() {
+                    tlb.borrow_mut().remove(f.linear);
+                }
                 return Ok(false);
+            }
+            if let Some(tlb) = mem.tlb() {
+                tlb.borrow_mut().dirty(f.linear, f.translation);
             }
         }
     }
@@ -1263,7 +1399,8 @@ where
         let mut mem =
             LegacyAccess::<ROUTED, ORDER, true>::new(&original.access.0, original.physical_mask);
         mem.writes = original.writes;
-        mem.paging = Some(&tx);
+        mem.paging.transaction = Some(&tx);
+        mem.paging.tlb = original.tlb();
         if !resuming || tx.borrow().preparing {
             if resuming {
                 tx.borrow_mut().prepared_reads.clear();
@@ -1582,6 +1719,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     event: legacy::LegacyEvent,
     task_switch: &mut tasks::SwitchState,
     retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
 ) -> Result<(), Exit> {
     // A preflight fault belongs to this delivery, even after a previous task
     // completed. Match the unpaged delivery's per-attempt completion boundary.
@@ -1618,7 +1756,8 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             tx.write_cursor = write;
         }
         let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
-        mem.paging = Some(&tx);
+        mem.paging.transaction = Some(&tx);
+        mem.paging.tlb = Some(tlb);
         if !resuming {
             let mut preview_cpu = cpu.clone();
             let mut preview_tasks = task_switch.clone();
@@ -1800,6 +1939,9 @@ pub(super) fn task_commit<const ROUTED: bool, const ORDER: u8>(
 pub(super) fn task_cr3_loaded<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
 ) {
+    if let Some(tlb) = mem.tlb() {
+        tlb.borrow_mut().invalidate();
+    }
     // Even an equal CR3 load starts fresh translations. Outgoing TSS saves
     // can alias the page tables used by incoming descriptor loads (§3.7).
     mem.transaction()
@@ -1894,9 +2036,11 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
     retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
 ) -> Result<(Outcome, Option<PortPlan>), Exit> {
     let mut scratch = vec![0; ir.temp_count as usize];
-    let mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    mem.paging.tlb = Some(tlb);
     let view = InstructionView {
         guest_start: ir.guest_start,
         guest_len: ir.guest_len,

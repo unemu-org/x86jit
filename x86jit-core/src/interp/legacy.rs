@@ -405,22 +405,29 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 pub(crate) struct PagingMode<const PAGED: bool>;
 pub(crate) trait PagingStorage {
     type State<'a>: Default;
+    fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>>;
     fn transaction<'a>(
         state: &Self::State<'a>,
     ) -> Option<&'a std::cell::RefCell<paging::Transaction>>;
 }
 impl PagingStorage for PagingMode<false> {
     type State<'a> = ();
+    fn tlb<'a>(_: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
+        None
+    }
     fn transaction<'a>(_: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Transaction>> {
         None
     }
 }
 impl PagingStorage for PagingMode<true> {
-    type State<'a> = Option<&'a std::cell::RefCell<paging::Transaction>>;
+    type State<'a> = paging::AdapterState<'a>;
+    fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
+        state.tlb
+    }
     fn transaction<'a>(
         state: &Self::State<'a>,
     ) -> Option<&'a std::cell::RefCell<paging::Transaction>> {
-        *state
+        state.transaction
     }
 }
 
@@ -496,6 +503,9 @@ trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     fn paged(&self) -> bool {
         Self::PAGED
     }
+    fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
+        None
+    }
     fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
         None
     }
@@ -534,6 +544,9 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.memory.raw()
     }
+    fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
+        self.memory.tlb()
+    }
     fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
         self.memory.transaction()
     }
@@ -569,6 +582,9 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.0.raw()
     }
+    fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
+        self.0.tlb()
+    }
     fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
         self.0.transaction()
     }
@@ -601,6 +617,9 @@ where
     PagingMode<PAGED>: PagingStorage,
 {
     const PAGED: bool = PAGED;
+    fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
+        PagingMode::<PAGED>::tlb(&self.paging)
+    }
     fn transaction(&self) -> Option<&std::cell::RefCell<paging::Transaction>> {
         PagingMode::<PAGED>::transaction(&self.paging)
     }

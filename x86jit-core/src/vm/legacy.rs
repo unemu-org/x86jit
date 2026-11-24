@@ -12,6 +12,15 @@ use iced_x86::{Decoder, DecoderError};
 // this module's hot dispatcher code keeps its code-generation unit.
 mod nmi;
 mod paging;
+
+/// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
+/// domains distinct even when a vCPU moves between VMs; zero is never issued.
+pub(crate) fn paging_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .expect("paging proof identifiers exhausted")
+}
+
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
@@ -1976,6 +1985,7 @@ impl Vcpu {
             let result = if PAGED {
                 let execution = self.legacy_execution.as_mut().unwrap();
                 let state = execution.paging.get_or_insert_with(Default::default);
+                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap());
                 if !self.cpu.mmio_retry_active {
                     state.event_transaction = None;
                 }
@@ -1986,6 +1996,7 @@ impl Vcpu {
                     delivery,
                     &mut execution.task_switch,
                     &mut state.event_transaction,
+                    &state.tlb,
                 )
             } else {
                 crate::interp::legacy::deliver_interrupt::<ROUTED, ORDER>(

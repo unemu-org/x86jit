@@ -17,6 +17,7 @@ use crate::jit_abi::{
 };
 mod i8086;
 mod legacy;
+pub(crate) use legacy::paging_generation;
 mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
