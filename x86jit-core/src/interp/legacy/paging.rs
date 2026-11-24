@@ -294,6 +294,14 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         if pde & PRESENT == 0 {
             return Err(fault(false).exit(cpu));
         }
+        let pte_address = (pde & FRAME) + 4 * ((linear >> 12) & 0x3ff);
+        let pte = table_read(cpu, mem, linear, pte_address, PagingWalkLevel::Table)?;
+        if pte & PRESENT == 0 {
+            return Err(fault(false).exit(cpu));
+        }
+        // ASSUMED (paging design §3.3): 80386 PRM §5.2.4.3 p. 5-10
+        // sets A before a page read/write but leaves failed walks unspecified.
+        // A public CPU test suite falsified setting PDE.A with PTE.P=0.
         let pde = if set_accessed {
             let Some(pde) = table_or(
                 cpu,
@@ -311,13 +319,8 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         } else {
             pde
         };
-        let pte_address = (pde & FRAME) + 4 * ((linear >> 12) & 0x3ff);
-        let pte = table_read(cpu, mem, linear, pte_address, PagingWalkLevel::Table)?;
-        if pte & PRESENT == 0 {
-            return Err(fault(false).exit(cpu));
-        }
         // Intel486 PRM §9.9.14 p. 9-21 requires both A bits on operand
-        // protection faults. The same order on the 386 is engine policy (§3.3).
+        // protection faults. The same order on the 386 is ASSUMED policy (§3.3).
         let pte = if set_accessed {
             let Some(pte) = table_or(
                 cpu,

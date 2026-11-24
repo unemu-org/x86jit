@@ -77,7 +77,7 @@ p. 4-6). PSE, PAE, global pages, PAT and NX are absent.
 | H6 | SDM Vol. 3A §5.7, pp. 5-37–5-38; §7.15, Event 14, pp. 7-47–7-50 (PDF 3396–3399). 386 PRM §9.8.14, pp. 9-17–9-19, Fig. 9-8 (PDF 193–195); 486 PRM §9.9.14, pp. 9-21–9-23, Fig. 9-7 (PDF 241–243) | #PF is fault vector 14. CR2 receives the faulting **linear** address. Error bits 0, 1, 2 describe protection versus not-present, write versus read, and user versus supervisor access. The original instruction is restartable; the saved IP normally identifies that instruction. A later #PF can overwrite CR2, including during delivery. |
 | H7 | 386 PRM §9.2.1, pp. 9-2–9-3; §9.8.14.1, p. 9-18; §14.6, pp. 14-4–14-5. SDM Vol. 3A §7.15, Event 14, p. 7-50 | Fault restart restores instruction state; REP may retain completed iterations. Task-switch faults have a distinct outgoing/incoming-task boundary and can name the new task's first instruction. The 386's real-mode exception rules do not make paging legal with PE clear. |
 | H8 | SDM Vol. 3A §5.8, p. 5-39 (PDF 3298); 386 PRM §5.2.4.3, p. 5-10 (PDF 122); 486 PRM §5.3.4.3, pp. 5-21–5-22 (PDF 157–158) | Hardware sets A (bit 5) in both levels used by a translation, and PTE.D (bit 6) before a write to the mapped page. Hardware does not clear them. The historical PRMs leave PDE.D undefined. Clearing A/D in memory while a translation is cached need not make a later access set them again without invalidation. |
-| H9 | 486 PRM §9.9.14, p. 9-21 (PDF 241); SDM Vol. 3A §§5.10.2.3, 5.10.3.1, pp. 5-43–5-46 | On a 486 protection #PF, **both PDE.A and PTE.A are set**. The SDM permits upper-level accessed entries/cache entries even when no complete translation exists below them. A/D effects are therefore not universally rolled back with a faulting operand. The cited 386 PRM does not specify every failed-walk A-bit intermediate state. |
+| H9 | 486 PRM §9.9.14, p. 9-21 (PDF 241); SDM Vol. 3A §§5.10.2.3, 5.10.3.1, pp. 5-43–5-46 | On a 486 protection #PF, **both PDE.A and PTE.A are set**. The SDM permits upper-level accessed entries/cache entries even when no complete translation exists below them. A/D effects are therefore not universally rolled back with a faulting operand. ASSUMED (§3.3): on all three models, a not-present PDE or PTE leaves A/D unchanged at both levels. 386 PRM §5.2.4.3, p. 5-10, sets A before a page read/write but is silent on failed walks; a public CPU test suite (an oracle) falsified the previous PDE.A-on-absent-PTE choice. The 386 A-on-protection-fault behavior is also ASSUMED. |
 | H10 | SDM Vol. 3A §11.1.2.1, p. 11-3 (PDF 3464); 386 PRM §11.2.2, p. 11-5 (PDF 223); 486 PRM §13.1.2, p. 13-3 (PDF 295) | A/D updates use locked memory cycles. Each update must preserve competing edits to the entry. This does not make the two-level walk, all its updates and the operand one indivisible transaction. |
 
 For this feature the architected error-code calculation is
@@ -259,12 +259,16 @@ Use this deterministic order on a TLB miss:
 
 1. Read the PDE physically. On a physical-bus failure return that failure; on
    PDE.P=0 produce not-present #PF without touching its other bits or reading a PTE.
-2. Atomically OR PDE.A, preserving other bits, then read the PTE physically.
-   On PTE.P=0 produce not-present #PF. PDE.A may remain set.
-3. Atomically OR PTE.A. Check combined permissions only after both present entries
+2. Read the PTE physically. On PTE.P=0 produce not-present #PF without
+   changing A/D at either level. ASSUMED for all three models: 386 PRM
+   §5.2.4.3, p. 5-10, sets A before a page read/write but leaves failed walks
+   unspecified. A public CPU test suite (an oracle) falsified the previous
+   choice to set PDE.A before discovering a not-present PTE.
+3. Atomically OR PDE.A, preserving other bits, then atomically OR PTE.A.
+   Check combined permissions only after both present entries
    have been obtained. A protection fault therefore leaves both A bits set, as
    explicitly required by the 486 manual. Use the same deterministic choice for
-   the 386; its failed-walk intermediate states are not fully specified here.
+   the 386, labelled ASSUMED under the same PRM wording.
 4. Finish translation/preflight of the access's remaining fragments and other
    potentially faulting operand requirements. For an allowed write, atomically OR
    PTE.D for every writable fragment before the first operand write. A permission
@@ -471,7 +475,7 @@ and byte-defined tables; inspect both the outward fault and an InGuest handler.
 | Walk and precedence | Nonidentity CR3 mapping for data/fetch; distinct PDE indices and PTE indices; P=0 independently at each level with other bits filled; segment limit/type failure before page walk; PG/PE invalid combination leaves control state unchanged. Physical table hole is an outward bus failure, not #PF. |
 | Permissions/model | All 16 PDE/PTE U/S/R/W combinations × CPL 0/1/2/3 × read/write/fetch. Separate 386 and both 486 models, WP off/on where present. Pin that 386 supervisor writes ignore R/W; 486 WP write faults have P=1/W=1/U=0. Include read-only supervisor mappings to witness Q3. |
 | Error and CR2 | Low-bit errors 0/2/4/6 for not-present accesses and 1/3/5/7 for the corresponding protection classes where reachable; no fake protection case for an always-allowed supervisor read. Check metadata known-mask `0x7` and deterministic upper zeros. Cross-page CR2 names the first failing required byte; implicit access at CPL3 reports U=0; non-#PF faults leave CR2 unchanged. |
-| A/D | Fetch/read sets PDE.A/PTE.A without D; allowed write sets PTE.D before operand storage; preserve PDE.D and software bits; 486 protection #PF sets both A bits; PTE-not-present may leave PDE.A, never modifies the not-present PTE. CAS-race injection preserves competing frame/permission/software edits. Clear A/D with/without invalidation; first write after a read-only TLB fill sets D. |
+| A/D | Fetch/read sets PDE.A/PTE.A without D; allowed write sets PTE.D before operand storage; preserve PDE.D and software bits; 486 protection #PF sets both A bits; Not-present PDE or PTE leaves A/D unchanged at both levels. CAS-race injection preserves competing frame/permission/software edits. Clear A/D with/without invalidation; first write after a read-only TLB fill sets D. |
 | Restart | Boundary scalar load/store and aliased register-source RMW; full stack frame and system multi-read; REP with a completed iteration followed by #PF; zero-count REP; locked noncontiguous-frame operand; x87 10-byte operand and save/environment image. Assert unchanged operand destinations on fault and correct one-time completion after repair. Allow the specified A/D effects. |
 | Fetch and blocks | One-byte instruction at `L+0xfff` with next page absent; instruction genuinely split across two mapped nonadjacent frames; needed second-page #PF; same L under two CR3 mappings; equal CR3 reload after a PTE edit; INVLPG, PG/WP changes and embedder invalidation. Same bytes in a different physical frame must not reuse old source coverage. |
 | System/delivery | GDT/LDT/IDT/TSS straddling pages; descriptor accessed/busy write to a read-only page under WP; supervisor bitmap permission read on a supervisor page at CPL3, including bitmap #PF before any port effect; 16/32-bit #PF error frames; fault while delivering #PF updates CR2 and reaches the existing #DF/shutdown rules. |
@@ -557,3 +561,14 @@ mappings alike; a small per-vCPU functional TLB, a full flush on INVLPG and
 one-instruction paged blocks; an explicit embedder paging-invalidation call; the
 CR3 handoff on 386-TSS switches and the I/O bitmap read through the adapter; and
 PG=1 publicly refused until step 5 of §5 enables it.
+
+Q2 amended 2026-11-24: set PDE.A and PTE.A only after reading a present PTE
+on the 386 and both 486 entries. A not-present PDE or PTE changes no A/D bits
+at either level. This is ASSUMED: 80386 PRM §5.2.4.3, p. 5-10, specifies A
+before a page read/write, without specifying failed walks; a public CPU test
+suite (an oracle) falsified the previous PDE.A-on-absent-PTE choice. Both A bits
+still become set on protection faults with both entries present, required by
+Intel486 PRM §9.9.14, p. 9-21, and retained as ASSUMED policy on the 386.
+Individual entry updates remain CAS operations with translation restart on
+competing frame/presence/permission edits. Fetch uses the same walk; ENTER's
+translation-only permission check retains its separate no-A/D-update policy.

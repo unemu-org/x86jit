@@ -237,12 +237,54 @@ fn not_present_levels_and_low_three_error_bits() {
                                 LINEAR,
                                 (u32::from(write) << 1) | if cpl == 3 { 4 } else { 0 },
                             );
-                            assert_eq!(f.get(f.pde()), pd | if directory { 0 } else { A });
+                            assert_eq!(f.get(f.pde()), pd);
                             assert_eq!(f.get(f.pte()), pt);
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+// ASSUMED (paging design §3.3): 80386 PRM §5.2.4.3 p. 5-10
+// sets A before a page access, without specifying failed walks. A public CPU
+// test suite falsified the previous PDE.A-on-absent-PTE choice.
+#[test]
+fn absent_pte_preserves_both_entries_for_read_write_and_fetch() {
+    let mut changed = Vec::new();
+    for model in MODELS {
+        for code32 in [false, true] {
+            for access in 0..3 {
+                let mut f = Fixture::new(model, code32, 0);
+                f.tables(3, 2);
+                if access == 2 {
+                    f.cpu.cpu.legacy.segments[0].base = BASE;
+                    f.fetch_pf(u64::from(OFFSET), LINEAR, 0);
+                } else {
+                    f.pf(access == 1, OFFSET, LINEAR, if access == 1 { 2 } else { 0 });
+                }
+                if f.get(f.pde()) != PT | 3 || f.get(f.pte()) != DATA | 2 {
+                    changed.push((model, code32, access, f.get(f.pde()), f.get(f.pte())));
+                }
+            }
+        }
+    }
+    assert!(changed.is_empty(), "page-table changes: {changed:?}");
+}
+
+#[test]
+fn present_protection_fault_sets_both_accessed_bits() {
+    // Intel486 PRM §9.9.14 p. 9-21 requires both A bits. ASSUMED on
+    // the 386 (80386 PRM §5.2.4.3 p. 5-10; paging design §3.3):
+    // retain the same A-on-protection-fault policy, with D unchanged.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 3);
+            f.tables(3, 3);
+            f.pf(false, OFFSET, LINEAR, 5);
+            assert_eq!(f.get(f.pde()), PT | 3 | A);
+            assert_eq!(f.get(f.pte()), DATA | 3 | A);
         }
     }
 }
