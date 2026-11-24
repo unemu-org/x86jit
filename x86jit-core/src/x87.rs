@@ -540,6 +540,11 @@ pub enum FpuKind {
     Fnsave,
     /// Restore environment and logical ST(0)..ST(7).
     Frstor,
+    // Machine-only forms; append to preserve the compiled helper discriminants.
+    Fbld,
+    Fbstp,
+    Ffreep,
+    Fstpnce,
 }
 
 /// Environment format bits in an X87 op's `sti` (SDM Vol 1 §8.1.10).
@@ -1213,7 +1218,7 @@ pub fn mem_write_bytes(kind: FpuKind) -> Option<usize> {
     Some(match kind {
         FstpF32 | FstF32 => 4,
         FstpF64 | FstF64 => 8,
-        FstpF80 => 10,
+        FstpF80 | Fbstp => 10,
         FistI16 | FistpI16 | FisttpI16 => 2,
         FistI32 | FistpI32 | FisttpI32 => 4,
         FistpI64 | FisttpI64 => 8,
@@ -1235,7 +1240,7 @@ pub fn mem_operand_bytes(kind: FpuKind) -> u64 {
         return bytes as u64;
     }
     match kind {
-        FldF80 => 10,
+        FldF80 | Fbld => 10,
         FldF64 | FildI64 | FaddMemF64 | FsubMemF64 | FsubrMemF64 | FmulMemF64 | FdivMemF64
         | FdivrMemF64 | FcomMemF64 | FcompMemF64 => 8,
         FldF32 | FildI32 | FaddMemF32 | FsubMemF32 | FsubrMemF32 | FmulMemF32 | FdivMemF32
@@ -1366,6 +1371,67 @@ fn exec_x87_inner<M: FpMem>(
     // Transcendental precision: Extended = full-80-bit F80 series, else f64.
     let ext = cpu.x87_precision == crate::state::X87Precision::Extended;
     match kind {
+        Fbld => {
+            // SDM Vol 1 §8.2 Fig. 8-13 p. 8-13; Vol 2A §3.3 FBLD
+            // p. 3-314: exact conversion, including negative zero; no digit check.
+            // 287 PRM Part II Ch. 2, Data Transfer Instructions, p. 2-4; 486 PRM FBLD pp. 26-77–78.
+            // DERIVED for 387: 486 PRM §25.1 pp. 25-1–2 lists its
+            // differences from 387, with no BCD conversion difference.
+            let Some(bytes) = read_n(mem, addr, 10) else {
+                return Some((mem.fault_addr(addr), false));
+            };
+            // ASSUMED: for undefined A–F digits, evaluate each nibble at its
+            // decimal place value. Even eighteen F digits fit in signed i64.
+            let mut magnitude = 0i64;
+            for byte in bytes[..9].iter().rev() {
+                magnitude = magnitude * 100 + i64::from(byte >> 4) * 10 + i64::from(byte & 15);
+            }
+            let mut value = F80::from_i64(magnitude);
+            value.sign = bytes[9] & 0x80 != 0;
+            push(cpu, value);
+        }
+        Fbstp => {
+            // SDM Vol 2A §3.3 FBSTP pp. 3-316–317: round using RC before
+            // checking the 18-digit range; invalid suppresses precision.
+            // 486 PRM FBSTP p. 26-79. ASSUMED for 287: use this RC
+            // contract; 287 PRM Part II Ch. 2, Data Transfer Instructions, p. 2-4 describes +.5 then chop.
+            cpu.fpu_sw &= !(1 << 9);
+            let value = operand!(cpu, 0);
+            let (integer, mut exc, mut up) = value.to_int_rc(64, rc(cpu));
+            if integer.unsigned_abs() > 999_999_999_999_999_999 {
+                exc = Exc::IE;
+                up = false;
+            }
+            if raise(cpu, exc) && exc.has(Exc::IE) {
+                return None;
+            }
+            // SDM Vol 1 §8.2.1 p. 8-13 refers to §4.7 Table 4-5 p. 4-12:
+            // packed BCD indefinite = FFFFC000000000000000H.
+            // The 287's Table 1-14 p. 1-30 leaves the low 64 bits undefined;
+            // ASSUMED: store the SDM's fixed bytes on every Machine model.
+            let mut bytes = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+            if !exc.has(Exc::IE) {
+                let mut magnitude = integer.unsigned_abs();
+                for byte in &mut bytes[..9] {
+                    *byte = (magnitude % 10) as u8;
+                    magnitude /= 10;
+                    *byte |= ((magnitude % 10) as u8) << 4;
+                    magnitude /= 10;
+                }
+                bytes[9] = u8::from(value.sign) << 7;
+            }
+            if up {
+                cpu.fpu_sw |= 1 << 9;
+            }
+            // ASSUMED: retain whole-operand fault atomicity on 486 too;
+            // 486 PRM §25.1 p. 25-2 permits partially completed stores.
+            if !mem.store(addr, &bytes) {
+                return Some((mem.fault_addr(addr), true));
+            }
+            // SDM Vol 1 §4.9.1.6 p. 4-24: unmasked precision retains the
+            // rounded destination. Pop only after the entire store succeeds.
+            pop(cpu);
+        }
         FldF64 => {
             let Some(b) = read_n(mem, addr, 8) else {
                 return Some((mem.fault_addr(addr), false));
@@ -1610,6 +1676,22 @@ fn exec_x87_inner<M: FpMem>(
         // Vol 2D §6.1 WAIT/FWAIT: pending #MF is checked before this helper.
         Fnop | Fwait => {}
         Ffree => cpu.fpu_empty |= 1 << ((cpu.fpu_top + sti as u32) & 7),
+        Ffreep => {
+            // 287 PRM Part II App. A Table A-2 pp. A-4–5 note 6;
+            // SDM Vol 3B §25.18.9 p. 25-15: free ST(i), then pop.
+            cpu.fpu_empty |= 1 << ((cpu.fpu_top + sti as u32) & 7);
+            pop(cpu);
+        }
+        Fstpnce => {
+            // SDM Vol 3B §25.18.9 p. 25-15: D9 D8+i is FSTP without
+            // stack underflow. ASSUMED for an empty source: copy its retained
+            // payload and mark the destination occupied, as a normal store does.
+            let dst = ((cpu.fpu_top + u32::from(sti)) & 7) as usize;
+            cpu.fpr[dst] = cpu.fpr[cpu.fpu_top as usize];
+            cpu.fpu_empty &= !(1 << dst);
+            cpu.fpu_sw &= !(1 << 9);
+            pop(cpu);
+        }
         Fincstp | Fdecstp => {
             cpu.fpu_top = (cpu.fpu_top + if kind == Fincstp { 1 } else { 7 }) & 7;
             cpu.fpu_sw &= !(1 << 9);

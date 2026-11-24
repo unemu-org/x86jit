@@ -2777,6 +2777,16 @@ identity and compacts large-image acknowledgements inside the fixed retry ledger
 `set_fpu_emulation` requests a typed ESC handoff, with no fabricated interrupt 7.
 Pending numeric-error delivery also remains a typed refusal, with no processor
 interrupt 16. Generation-faithful `I8087` pairing is deferred to decision-23 §4.
+FBLD/FBSTP remain `UnknownInstruction` with `Present` on I8086, I8088 and
+NEC V20/V30. This is an engine availability policy: the pinned October 1979
+8086 Family User's Manual §1.2 p. 1-4 describes future coprocessor hooks and
+does not define the 8087 numeric instructions. FFREEP/FSTPNCE remain refused
+on these models as well. The witnesses are in `legacy_x87_bcd`.
+On I80286, packed-decimal transfers and alternate x87 register forms retain
+the existing protected-mode coprocessor refusal; their real-mode execution
+uses the 287 definitions (287 PRM Part II Ch. 2, Data Transfer Instructions,
+pp. 2-3–4, App. A Table A-2 pp. A-2–5). This regime restriction is engine
+policy, witnessed under both exception-delivery options in `legacy_i286_quirks`.
 WAIT completes with an empty socket under the engine's ready-TEST policy.
 
 UM Appendix B, "The 8088 Compared to the 8086", pp. B-31–32 states that

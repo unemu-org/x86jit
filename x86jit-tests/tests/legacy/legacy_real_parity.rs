@@ -312,6 +312,61 @@ fn conflict_expectation(
     cpu.rip = insn.next_ip();
     let result = (|| -> Result<(), Exit> {
         match insn.code() {
+            Fbld_m80bcd | Fbstp_m80bcd | Ffreep_sti | Fstpnce_sti => {
+                // SDM Vol 2A FBLD/FBSTP pp. 3-314–317; 287 PRM Part II
+                // App. A pp. A-2–5 notes 1/6; SDM Vol 3B §25.18.9 p. 25-15.
+                // This fixture seeds a full stack with ST(0)=1, so FBLD
+                // overflows, FBSTP stores exactly 1, and register forms pop.
+                assert_eq!(
+                    (initial.fpu_top, initial.fpu_empty, initial.fpu_sw),
+                    (0, 0, 0)
+                );
+                let memory_form = matches!(insn.code(), Fbld_m80bcd | Fbstp_m80bcd);
+                if memory_form {
+                    let at = address();
+                    if mmio && (0x4000..0x5000).contains(&at) {
+                        return Err(Exit::unmapped_memory(
+                            at,
+                            if insn.code() == Fbld_m80bcd {
+                                x86jit_core::AccessKind::Read
+                            } else {
+                                x86jit_core::AccessKind::Write
+                            },
+                        ));
+                    }
+                    cpu.fpu_fdp = at;
+                    cpu.fpu_fds = initial.ds;
+                    if insn.code() == Fbld_m80bcd {
+                        // SDM Vol 1 §8.5.1.1 pp. 8-26–27: masked #IS.
+                        cpu.fpu_top = 7;
+                        cpu.fpu_sw = 0x241;
+                        cpu.fpr[7] = [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff];
+                    } else {
+                        memory[at as usize..at as usize + 10]
+                            .copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                        cpu.fpu_top = 1;
+                        cpu.fpu_empty = 1;
+                    }
+                } else {
+                    let index = insn.op0_register().number();
+                    cpu.fpu_top = 1;
+                    cpu.fpu_empty = 1;
+                    if insn.code() == Ffreep_sti {
+                        cpu.fpu_empty |= 1 << index;
+                    } else {
+                        cpu.fpr[index] = initial.fpr[0];
+                    }
+                }
+                // SDM Vol 1 §§8.1.8–8.1.9 p. 8-10; Intel486 PRM
+                // §15.1.6 p. 15-8 (387 witness, §25.1 pp. 25-1–2).
+                cpu.fpu_fip = initial.rip;
+                cpu.fpu_fcs = initial.cs;
+                if generation == CpuGeneration::I386 {
+                    let raw = &original[initial.rip as usize..insn.next_ip() as usize];
+                    let esc = raw.iter().position(|b| (0xd8..=0xdf).contains(b)).unwrap();
+                    cpu.fpu_fop = (u16::from(raw[esc] & 7) << 8) | u16::from(raw[esc + 1]);
+                }
+            }
             // SDM Vol 2B §4.3 PUSH/POP: 66h selects a dword slot.
             Pushd_ES | Pushd_CS | Pushd_SS | Pushd_DS | Pushd_imm32 => {
                 let value = match insn.code() {
@@ -607,10 +662,16 @@ fn application_real16_forms_have_legacy_parity() {
                     (alias, machine)
                 });
                 let expected = expected.or_else(|| {
-                    (generation == CpuGeneration::I386
-                        && !absent
+                    (!absent
                         && !emulation
-                        && matches!(code, Code::Fnsave_m108byte | Code::Frstor_m108byte))
+                        && (matches!(
+                            code,
+                            Code::Fbld_m80bcd
+                                | Code::Fbstp_m80bcd
+                                | Code::Ffreep_sti
+                                | Code::Fstpnce_sti
+                        ) || generation == CpuGeneration::I386
+                            && matches!(code, Code::Fnsave_m108byte | Code::Frstor_m108byte)))
                     .then(|| {
                         architectural.insert(format!("{code:?} {bytes:02x?}"));
                         let mut refused = [0; 15];

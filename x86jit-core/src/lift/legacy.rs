@@ -1063,6 +1063,24 @@ pub(super) fn lower(
         size
     };
     let next = insn.next_ip() as u32;
+    // 287 PRM Part II App. A Table A-2 pp. A-2–5 notes 1/4/6–9;
+    // SDM Vol 3B §25.18.9 p. 25-15: these register aliases execute on
+    // the attached FPU. Engine policy retains the 286 protected-mode
+    // coprocessor refusal, including for packed-decimal transfers.
+    if (context.generation != crate::CpuGeneration::I286
+        || context.regime == crate::MachineRegime::Real)
+        && (matches!(insn.mnemonic(), Fbld | Fbstp | Ffreep | Fstpnce)
+            || matches!(
+                insn.code(),
+                iced_x86::Code::Fxch_st0_sti_DDC8
+                    | iced_x86::Code::Fxch_st0_sti_DFC8
+                    | iced_x86::Code::Fstp_sti_DFD0
+                    | iced_x86::Code::Fstp_sti_DFD8
+            ))
+    {
+        control::lift_x87(insn, ops, tg)?;
+        return Ok(false);
+    }
     // 286 PRM App. B pp. B-21/60/66/71/72/102/108/111;
     // 386 PRM §17 pp. 17-25/89/98/106/108/159/166/169 (scans checked):
     // these instructions are protected-only, before any operand access.

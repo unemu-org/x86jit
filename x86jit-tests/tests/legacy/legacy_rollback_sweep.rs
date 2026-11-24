@@ -16,14 +16,16 @@ use x86jit_core::{
 // stops at its device read before any state commits; so does a wider one, over
 // the device byte and RAM, since xj-ir6.34 (spec.md §5.2), which until then
 // kept UnknownInstruction.
+// FBSTP reaches two failing memory kinds under each of four size-prefix
+// combinations, contributing eight faults per mode.
 #[test]
 fn checked_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_714));
+    assert_eq!(fault_atomicity_sweep(false), (19_194, 6_722));
 }
 
 #[test]
 fn protected_code32_fault_atomicity_sweep() {
-    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_902));
+    assert_eq!(fault_atomicity_sweep(true), (19_062, 6_910));
 }
 
 fn fault_atomicity_sweep(protected: bool) -> (usize, usize) {

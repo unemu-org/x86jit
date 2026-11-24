@@ -906,6 +906,14 @@ fn protected_mode_coprocessor_instructions_stay_refused() {
             &[0xd9, 0x26, 0xf8, 0xff],       // FLDENV [FFF8]
             &[0xdd, 0x06, 0x00, 0x00],       // FLD QWORD [0000]
             &[0xdd, 0x06, 0x00, 0x00, 0x9b], // FLD QWORD [0000]; WAIT
+            &[0xdf, 0x26, 0xf8, 0xff],       // FBLD [FFF8]
+            &[0xdf, 0x36, 0xf8, 0xff],       // FBSTP [FFF8]
+            &[0xdd, 0xc8],                   // Alternate FXCH
+            &[0xdf, 0xc8],                   // Alternate FXCH
+            &[0xdf, 0xd0],                   // Alternate FSTP
+            &[0xdf, 0xd8],                   // Alternate FSTP
+            &[0xdf, 0xc0],                   // FFREEP
+            &[0xd9, 0xd8],                   // FSTPNCE
         ] {
             let mut vm = Vm::with_backend(VmConfig::flat(0x2_0000), Box::new(NoBackend));
             vm.set_cpu_model(CpuModel::I80286);
@@ -914,6 +922,7 @@ fn protected_mode_coprocessor_instructions_stay_refused() {
             vm.write_bytes(0x1000, code).unwrap();
             let mut cpu = vm.new_vcpu();
             cpu.cpu = CpuState::legacy_real_entry([0, 0x200, 0, 0x300, 0, 0]);
+            cpu.set_fpu_model(FpuModel::Present);
             cpu.cpu.rip = 0x1000;
             cpu.cpu.gpr[4] = 0x8000;
             protected(&vm, &mut cpu);
@@ -922,7 +931,9 @@ fn protected_mode_coprocessor_instructions_stay_refused() {
             vm.write_bytes(0x4000 + 9 * 8, &[0x00, 0x18, 0x08, 0x00, 0, 0x86, 0, 0])
                 .unwrap();
             vm.write_bytes(0x1800, &[0xf4]).unwrap();
+            let before = cpu.cpu.clone();
             let run = cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 0, "{delivery:?} {code:02x?}");
             assert!(
                 matches!(
                     run.stop(),
@@ -930,6 +941,12 @@ fn protected_mode_coprocessor_instructions_stay_refused() {
                 ),
                 "{delivery:?} {code:02x?}: {:?}",
                 run.stop()
+            );
+            assert_eq!(cpu.cpu.rip, before.rip);
+            assert_eq!(cpu.cpu.fpr, before.fpr);
+            assert_eq!(
+                (cpu.cpu.fpu_top, cpu.cpu.fpu_empty, cpu.cpu.fpu_sw),
+                (before.fpu_top, before.fpu_empty, before.fpu_sw)
             );
         }
     }

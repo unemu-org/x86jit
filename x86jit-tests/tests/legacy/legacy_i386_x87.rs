@@ -14,7 +14,7 @@ fn setup(wide: bool, real: bool, code: &[u8]) -> (Vm, Vcpu) {
     setup_model(CpuModel::I80386, wide, real, code)
 }
 
-fn setup_model(model: CpuModel, wide: bool, real: bool, code: &[u8]) -> (Vm, Vcpu) {
+pub(super) fn setup_model(model: CpuModel, wide: bool, real: bool, code: &[u8]) -> (Vm, Vcpu) {
     setup_model_delivery(
         model,
         wide,
@@ -64,7 +64,7 @@ fn setup_model_delivery(
     (vm, cpu)
 }
 
-fn mem(wide: bool, op: u8, group: u8, p66: bool, p67: bool) -> Vec<u8> {
+pub(super) fn mem(wide: bool, op: u8, group: u8, p66: bool, p67: bool) -> Vec<u8> {
     let mut code = Vec::new();
     if p66 {
         code.push(0x66);
@@ -128,6 +128,7 @@ fn every_memory_format_and_size_prefix_matches_real_mode() {
         (0xdf, 0, 0xdf, 3, 3i16.to_le_bytes().to_vec()),
         (0xdb, 0, 0xdb, 3, 3i32.to_le_bytes().to_vec()),
         (0xdf, 5, 0xdf, 7, 3i64.to_le_bytes().to_vec()),
+        (0xdf, 4, 0xdf, 6, vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
     ];
     for wide in [false, true] {
         for p66 in [false, true] {

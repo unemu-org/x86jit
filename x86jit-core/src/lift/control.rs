@@ -362,6 +362,43 @@ pub(crate) fn lift_x87<B: LiftBuffer>(
     };
 
     match insn.mnemonic() {
+        // Application lowering excludes these forms (§14). The October 1979
+        // 8086 UM §1.2 p. 1-4 describes future coprocessor hooks, not 8087
+        // instructions; keep that generation refused pending a pinned source.
+        Fbld | Fbstp
+            if ops
+                .legacy_context()
+                .is_some_and(|c| c.generation != crate::CpuGeneration::I8086) =>
+        {
+            emit(
+                if insn.mnemonic() == Fbld {
+                    K::Fbld
+                } else {
+                    K::Fbstp
+                },
+                ops,
+                tg,
+            )?
+        }
+        Ffreep | Fstpnce
+            if ops
+                .legacy_context()
+                .is_some_and(|c| c.generation != crate::CpuGeneration::I8086) =>
+        {
+            // 287 PRM Part II App. A Table A-2 pp. A-2–5 notes 1/6;
+            // SDM Vol 2D §A.5.2 Tables A-10/18/22 pp. A-23/27/29 reserve
+            // the alternate forms; Vol 3B §25.18.9 p. 25-15 defines them.
+            // The 287 documents ordinary FSTP for D9 D8+i; only 32-bit FPUs
+            // have the documented suppression of stack underflow.
+            let kind = if insn.mnemonic() == Ffreep {
+                K::Ffreep
+            } else if ops.legacy_context().unwrap().generation == crate::CpuGeneration::I286 {
+                K::FstpSti
+            } else {
+                K::Fstpnce
+            };
+            emit(kind, ops, tg)?;
+        }
         Fld => {
             let k = if mem {
                 match msz {
