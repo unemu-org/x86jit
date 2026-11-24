@@ -198,7 +198,7 @@ pub(crate) fn instruction_for_profile(
     ops.push(IrOp::InsnStart {
         guest_addr: u64::from(ip),
     });
-    let action = profile.isa.decode(code, &insn);
+    let action = profile.decode(code, &insn);
     if let crate::model::decode::DecodeAction::Alias(canonical) = action {
         insn.set_code(canonical);
     }
@@ -373,7 +373,7 @@ fn relock(
     *insn = locked;
     // A form the decode set does not define keeps its #UD.
     if matches!(
-        profile.isa.decode(code, insn),
+        profile.decode(code, insn),
         crate::model::decode::DecodeAction::Absent(_)
     ) {
         return Ok(false);

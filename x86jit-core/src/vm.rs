@@ -728,6 +728,7 @@ pub struct Vm {
     cpu_model: Option<crate::CpuModel>,
     fpu_model: crate::FpuModel,
     numeric_error_route: crate::NumericErrorRoute,
+    model_profile: Option<&'static crate::ModelProfile>,
     profile_locked: std::sync::atomic::AtomicBool,
 }
 
@@ -1226,6 +1227,7 @@ impl Vm {
         self.profile = ExecutionProfile::Application(mode);
         self.legacy_model = None;
         self.cpu_model = None;
+        self.model_profile = None;
         self.mode = mode;
     }
 
@@ -1237,7 +1239,47 @@ impl Vm {
     pub fn set_cpu_model(&mut self, model: crate::CpuModel) {
         self.select_machine_model(model.legacy_model());
         self.cpu_model = Some(model);
+        self.model_profile = Some(model.profile());
         self.exception_delivery = crate::ExceptionDelivery::InGuest;
+    }
+
+    /// Select ASSUMED ignored REP/REPNE on 386 non-string instructions
+    /// (spec.md §17.10). Defaults to false (#UD per 386 PRM §17 REP p. 17-141).
+    /// Requires [`crate::CpuModel::I80386`], even when disabling the option.
+    /// Panics after any vCPU has been created, including after it is dropped.
+    /// Selecting a CPU model again resets this option to its default.
+    pub fn set_i386_ignore_rep_non_string(
+        &mut self,
+        ignore: bool,
+    ) -> Result<(), crate::I386RepQuirkError> {
+        assert!(
+            !self.profile_locked.load(Ordering::Relaxed),
+            "select model quirks before vCPU creation"
+        );
+        if self.cpu_model != Some(crate::CpuModel::I80386) {
+            return Err(crate::I386RepQuirkError {
+                model: self.cpu_model,
+            });
+        }
+        let profile = if ignore {
+            &crate::model::I80386_IGNORE_REP_NON_STRING
+        } else {
+            crate::CpuModel::I80386.profile()
+        };
+        self.model_profile = Some(profile);
+        self.legacy_model = Some(LegacyCpuModel {
+            generation: profile.isa.generation(),
+            model_semantics_id: profile.semantics_id,
+        });
+        Ok(())
+    }
+
+    fn machine_model_profile(
+        &self,
+        generation: crate::CpuGeneration,
+    ) -> &'static crate::ModelProfile {
+        self.model_profile
+            .unwrap_or_else(|| crate::model::profile_for_generation(generation))
     }
 
     /// Set the FPU default inherited by new vCPUs (decision-23 §4).
@@ -1284,6 +1326,7 @@ impl Vm {
     pub fn set_legacy_cpu_model(&mut self, model: LegacyCpuModel) {
         self.select_machine_model(model);
         self.cpu_model = None;
+        self.model_profile = None;
     }
 
     fn select_machine_model(&mut self, model: LegacyCpuModel) {
@@ -1374,6 +1417,7 @@ impl Vm {
             cpu_model: self.cpu_model,
             fpu_model: self.fpu_model,
             numeric_error_route: self.numeric_error_route,
+            model_profile: self.model_profile,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: self.lockstep_trace.clone(),
         })
@@ -1439,6 +1483,7 @@ impl Vm {
             cpu_model: None,
             fpu_model: crate::FpuModel::Present,
             numeric_error_route: crate::NumericErrorRoute::Internal,
+            model_profile: None,
             profile_locked: std::sync::atomic::AtomicBool::new(false),
             lockstep_trace: None,
         }

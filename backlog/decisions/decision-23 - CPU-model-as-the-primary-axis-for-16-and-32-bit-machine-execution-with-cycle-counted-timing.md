@@ -258,6 +258,22 @@ lowering. The interpreter's per-op code contains no model test. Adding a model
 therefore adds no work to the hot loop of any other model. This is the central
 rule of spec.md §16 — encode a semantic trap once, centrally — applied to models.
 
+**Amendment (2026-11-24): selectable 386 non-string REP policy.** The
+maintainer accepts one named quirk, `i386_ignore_rep_non_string`, on the public
+`I80386` catalogue entry. Default false preserves #UD from 80386 PRM §17 REP
+p. 17-141; true executes the underlying instruction once with REP/REPNE ignored,
+labelled **ASSUMED**. An embedder reports REP RET working on real 386 parts.
+The PRM's #UD and SDM Vol 2A §2.1.1 p. 2-2's reserved/unpredictable warning
+do not license ignored prefixes as a hardware fact; this is an explicit
+compatibility choice. F3 90 / F2 90 remain NOP and F3 BSF/BSR retain their
+existing meanings in both settings. Other models and Application profiles
+are unchanged. `Vm::set_i386_ignore_rep_non_string(bool)` selects the variant
+after CPU model selection, locks at first vCPU creation, and returns typed
+`I386RepQuirkError` outside `I80386`. Model reselection resets it; forks and
+new vCPUs inherit it. It changes the catalogue semantics identity used by
+code caches, resolved at decode/lift time without a per-op interpreter test.
+See spec.md §17.10 for the API and identity contract.
+
 Licensed by sources that are pinned today:
 
 | Quirk | 8086/8088 | 80286 | 80386 | Source |

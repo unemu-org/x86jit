@@ -50,6 +50,10 @@ CORE_SRC = "x86jit-core/src/"
 #     CpuModel; set_cpu_model and the CpuModel accessors serve an
 #     embedder-selected model; has_pending_nmi reads NmiNesting only after its
 #     ExecutionProfile::Machine check.
+#     The 386 REP setter selects a static ModelProfile before vCPU creation,
+#     returning I386RepQuirkError outside I80386. machine_model_profile is
+#     called only by the Machine resolvers in vm/legacy.rs; Application runs
+#     do not read the selected profile.
 #   vm/legacy/nmi.rs: the NMI helpers of the Machine dispatcher. They are
 #     called only in the KIND >= MACHINE_DISPATCH branch or from Vcpu methods
 #     that return early outside ExecutionProfile::Machine.
@@ -92,7 +96,7 @@ REVIEWED_ENTRY_POINTS = {
         "model::CpuModel", "model::EARLY_FLAGS_FIXED_ZERO",
     },
     "x86jit-core/src/lib.rs": {
-        "model::CpuModel", "model::ModelIsa", "model::ModelProfile",
+        "model::CpuModel", "model::I386RepQuirkError", "model::ModelIsa", "model::ModelProfile",
         "model::ModelQuirks", "model::ModelSystem", "model::ModelTiming",
         "model::NmiNesting", "model::mod",
     },
@@ -104,6 +108,8 @@ REVIEWED_ENTRY_POINTS = {
     },
     "x86jit-core/src/vm.rs": {
         "lift::i8086::CONTEXT", "model::CpuModel", "model::NmiNesting",
+        "model::I386RepQuirkError", "model::I80386_IGNORE_REP_NON_STRING",
+        "model::ModelProfile", "model::profile_for_generation",
         "vm::i8086::mod", "vm::nec::mod",
     },
     "x86jit-core/src/vm/legacy.rs": {
@@ -115,7 +121,7 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::tasks", "lift::i8086::CONTEXT", "lift::i8086::word_bus",
         "lift::legacy::alias_context",
         "lift::legacy::instruction_for_profile", "lift::legacy::shared_helper", "model::CpuModel",
-        "model::decode", "model::profile_for_generation", "vm::i8086::resolve",
+        "model::decode", "vm::i8086::resolve",
     },
     "x86jit-core/src/vm/legacy/nmi.rs": {
         "interp::legacy::Progress", "model::CpuModel", "model::NmiNesting",

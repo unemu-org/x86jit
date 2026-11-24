@@ -693,10 +693,7 @@ impl Execution {
             &bytes,
             cpu.rip as u32,
             context,
-            vm.cpu_model.map_or_else(
-                || crate::model::profile_for_generation(context.generation),
-                crate::CpuModel::profile,
-            ),
+            vm.machine_model_profile(context.generation),
         )
         .map_err(|error| match error {
             crate::lift::LiftError::Unsupported { addr, bytes, len } => {
@@ -1116,10 +1113,7 @@ fn resolve_direct_uncached(
                 let bytes = &code[position..decoder.position()];
                 // Match incremental Machine fetch: an unavailable I286 opcode
                 // byte wins before a later ESC can reach its MSW gate.
-                let profile = vm.cpu_model.map_or_else(
-                    || crate::model::profile_for_generation(context.generation),
-                    crate::CpuModel::profile,
-                );
+                let profile = vm.machine_model_profile(context.generation);
                 let isa = profile.isa;
                 // The catalogue's length limit (xj-50w.13; I286 PRM App. C
                 // item 10 p. C-2): a fetch holds at most that many bytes, so
@@ -1181,10 +1175,7 @@ fn resolve_direct_uncached(
                         &bytes,
                         cpu.rip as u32,
                         context,
-                        vm.cpu_model.map_or_else(
-                            || crate::model::profile_for_generation(context.generation),
-                            crate::CpuModel::profile,
-                        ),
+                        vm.machine_model_profile(context.generation),
                     )
                     .map_err(|error| direct_refusal(cpu, error))?
                 }
@@ -1240,10 +1231,7 @@ fn resolve_direct_uncached(
                 &bytes,
                 cpu.rip as u32,
                 context,
-                vm.cpu_model.map_or_else(
-                    || crate::model::profile_for_generation(context.generation),
-                    crate::CpuModel::profile,
-                ),
+                vm.machine_model_profile(context.generation),
             )
             .map_err(|error| direct_refusal(cpu, error))?
         };

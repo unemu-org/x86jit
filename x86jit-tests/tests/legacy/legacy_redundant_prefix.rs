@@ -11,7 +11,10 @@
 #[path = "../support/descriptor_fixture.rs"]
 #[allow(dead_code)]
 mod fixture;
-use x86jit_core::{CpuModel, ModelSystem, SegmentCache, Vcpu, Vm};
+use x86jit_core::{
+    CpuMode, CpuModel, ExceptionDelivery, I386RepQuirkError, InterpreterBackend, ModelSystem, Prot,
+    RegionKind, SegmentCache, Vcpu, Vm, VmConfig,
+};
 
 const MODELS: [CpuModel; 8] = [
     CpuModel::I8088,
@@ -39,7 +42,19 @@ fn modes(model: CpuModel) -> &'static [Mode] {
     }
 }
 fn setup(model: CpuModel, mode: Mode, code: &[u8]) -> (Vm, Vcpu) {
-    let (vm, mut cpu) = fixture::setup(model, code);
+    setup_quirk(model, mode, code, None)
+}
+fn setup_quirk(model: CpuModel, mode: Mode, code: &[u8], ignore: Option<bool>) -> (Vm, Vcpu) {
+    let mut vm = Vm::new(VmConfig::flat(0x10000));
+    vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.set_cpu_model(model);
+    if let Some(ignore) = ignore {
+        vm.set_i386_ignore_rep_non_string(ignore).unwrap();
+    }
+    vm.set_exception_delivery(ExceptionDelivery::Outward);
+    vm.write_bytes(0x1000, code).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.rip = 0x1000;
     let protected = mode != Mode::Real;
     cpu.cpu.legacy.cr0 = u32::from(protected);
     cpu.cpu.cs = if protected { 8 } else { 0 };
@@ -94,7 +109,7 @@ fn rep_nop_retires_once_without_changing_state() {
 fn ignored_prefixes_preserve_the_unprefixed_operation() {
     // Segment prefixes select memory only: 8086 UM §2.3 p. 2-13;
     // 286 PRM §2.4.3.1 pp. 2-18–19; 386 PRM §2.5.3.1 p. 2-16;
-    // Intel486 PRM §2.4 p. 2-16; NEC UM §12 p. 12-177.
+    // Intel486 PRM §2.4 p. 2-16; NEC UM §12 p. 12-176 (Segment Override Prefixes).
     // 66/67 apply only to the respective size attributes: 386 PRM
     // §17.1.2 p. 17-1; Intel486 PRM §2.4 p. 2-16.
     for model in MODELS {
@@ -165,4 +180,162 @@ fn rep_wbinvd_keeps_the_486_operation() {
             assert_eq!(cpu.cpu.rip, 0x1003);
         }
     }
+}
+
+#[test]
+fn i386_rep_non_string_quirk_matches_the_unprefixed_instruction() {
+    // Default: 386 PRM §17 REP p. 17-141, in real and protected mode.
+    // Ignoring is ASSUMED: SDM Vol 2A §2.1.1 p. 2-2 calls this use reserved
+    // with unpredictable behavior; decision-23 §3 permits this compatibility option.
+    for &mode in modes(CpuModel::I80386) {
+        for bare in [&[0xc3][..], &[0x40], &[0x88, 0xd8], &[0x00, 0xd8], &[0xf8]] {
+            for prefix in [0xf3, 0xf2] {
+                let mut code = vec![prefix];
+                code.extend(bare);
+                for ignore in [None, Some(false), Some(true)] {
+                    let (vm, mut cpu) = setup_quirk(CpuModel::I80386, mode, &code, ignore);
+                    vm.write_bytes(0x8000, &0x1800u32.to_le_bytes()).unwrap();
+                    if ignore != Some(true) {
+                        fixture::fault(&mut cpu, &vm, 6, None);
+                        continue;
+                    }
+                    let (plain_vm, mut plain) = setup(CpuModel::I80386, mode, bare);
+                    plain_vm
+                        .write_bytes(0x8000, &0x1800u32.to_le_bytes())
+                        .unwrap();
+                    fixture::steps(&mut cpu, &vm, 1);
+                    fixture::steps(&mut plain, &plain_vm, 1);
+                    assert_eq!(cpu.cpu.rip, plain.cpu.rip + u64::from(bare != [0xc3]));
+                    if bare == [0xc3] {
+                        assert_eq!(cpu.cpu.rip, 0x1800);
+                    }
+                    cpu.cpu.rip = plain.cpu.rip;
+                    assert_eq!(
+                        format!("{:?}", cpu.cpu),
+                        format!("{:?}", plain.cpu),
+                        "{mode:?}/{code:02x?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn i386_rep_compatibility_exceptions_survive_both_quirk_settings() {
+    // SDM Vol 2B §4.3 PAUSE p. 4-226 / TZCNT p. 4-730;
+    // Vol 2A §3.3 LZCNT p. 3-578. F2 90 remains ASSUMED NOP.
+    for &mode in modes(CpuModel::I80386) {
+        for ignore in [false, true] {
+            for bare in [&[0x90][..], &[0x0f, 0xbc, 0xc3], &[0x0f, 0xbd, 0xc3]] {
+                let prefixes: &[u8] = if bare == [0x90] {
+                    &[0xf3, 0xf2]
+                } else {
+                    &[0xf3]
+                };
+                for &prefix in prefixes {
+                    let mut code = vec![prefix];
+                    code.extend(bare);
+                    let (vm, mut cpu) = setup_quirk(CpuModel::I80386, mode, &code, Some(ignore));
+                    let (plain_vm, mut plain) = setup(CpuModel::I80386, mode, bare);
+                    fixture::steps(&mut cpu, &vm, 1);
+                    fixture::steps(&mut plain, &plain_vm, 1);
+                    assert_eq!(cpu.cpu.rip, plain.cpu.rip + 1);
+                    cpu.cpu.rip = plain.cpu.rip;
+                    assert_eq!(
+                        format!("{:?}", cpu.cpu),
+                        format!("{:?}", plain.cpu),
+                        "{mode:?}/{code:02x?}/{ignore}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn i386_rep_quirk_rejects_other_models_and_application_profiles() {
+    for model in MODELS.into_iter().map(Some).chain([None]) {
+        let mut vm = Vm::new(VmConfig::flat(0x1000));
+        if let Some(model) = model {
+            vm.set_cpu_model(model);
+        }
+        for ignore in [false, true] {
+            let result = vm.set_i386_ignore_rep_non_string(ignore);
+            if model == Some(CpuModel::I80386) {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert_eq!(result, Err(I386RepQuirkError { model }));
+            }
+        }
+    }
+    #[allow(deprecated)]
+    {
+        let mut vm = Vm::new(VmConfig::flat(0x1000));
+        vm.set_legacy_cpu_model(x86jit_core::LegacyCpuModel {
+            generation: x86jit_core::CpuGeneration::I386,
+            model_semantics_id: CpuModel::I80386.profile().semantics_id,
+        });
+        assert_eq!(
+            vm.set_i386_ignore_rep_non_string(true),
+            Err(I386RepQuirkError { model: None })
+        );
+    }
+    for mode in [CpuMode::Long64, CpuMode::Compat32, CpuMode::Real16] {
+        let mut vm = Vm::new(VmConfig::flat(0x1000));
+        vm.set_cpu_mode(mode);
+        assert_eq!(
+            vm.set_i386_ignore_rep_non_string(true),
+            Err(I386RepQuirkError { model: None })
+        );
+    }
+}
+
+#[test]
+fn i386_rep_quirk_identity_is_inherited_and_resets_with_model_selection() {
+    let mut vm = Vm::new(VmConfig::flat(0x1000));
+    vm.set_cpu_model(CpuModel::I80386);
+    let default = vm.legacy_cpu_model().unwrap();
+    assert_eq!(
+        default.model_semantics_id,
+        CpuModel::I80386.profile().semantics_id
+    );
+    vm.set_i386_ignore_rep_non_string(true).unwrap();
+    let ignored = vm.legacy_cpu_model().unwrap();
+    assert_ne!(ignored.model_semantics_id, default.model_semantics_id);
+    assert_eq!(ignored.generation, default.generation);
+    let fork = vm.fork_with_backend(Box::new(InterpreterBackend)).unwrap();
+    assert_eq!(fork.legacy_cpu_model(), Some(ignored));
+    assert_eq!(fork.new_vcpu().legacy_cpu_model(), Some(ignored));
+    vm.set_i386_ignore_rep_non_string(false).unwrap();
+    assert_eq!(vm.legacy_cpu_model(), Some(default));
+    vm.set_i386_ignore_rep_non_string(true).unwrap();
+    vm.set_cpu_model(CpuModel::I80386);
+    assert_eq!(vm.legacy_cpu_model(), Some(default));
+    vm.set_i386_ignore_rep_non_string(true).unwrap();
+    vm.set_cpu_model(CpuModel::I80486Dx);
+    assert_eq!(
+        vm.legacy_cpu_model().unwrap().model_semantics_id,
+        CpuModel::I80486Dx.profile().semantics_id
+    );
+}
+
+#[test]
+#[should_panic(expected = "select model quirks before vCPU creation")]
+fn i386_rep_quirk_locks_after_vcpu_creation_even_after_drop() {
+    let mut vm = Vm::new(VmConfig::flat(0x1000));
+    vm.set_cpu_model(CpuModel::I80386);
+    drop(vm.new_vcpu());
+    vm.set_i386_ignore_rep_non_string(true).unwrap();
+}
+
+#[test]
+fn i386_rep_quirk_fork_preserves_decode_policy() {
+    let (vm, cpu) = setup_quirk(CpuModel::I80386, Mode::Real, &[0xf3, 0x40], Some(true));
+    let fork = vm.fork_with_backend(Box::new(InterpreterBackend)).unwrap();
+    let mut child = fork.new_vcpu();
+    child.cpu = cpu.cpu.clone();
+    fixture::steps(&mut child, &fork, 1);
+    assert_eq!(child.cpu.gpr[0], 0x1235);
+    assert_eq!(child.cpu.rip, 0x1002);
 }

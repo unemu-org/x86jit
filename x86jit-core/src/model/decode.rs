@@ -899,6 +899,38 @@ pub(crate) fn unavailable_prefix_for_generation(
     }
 }
 
+impl super::ModelProfile {
+    pub(crate) fn decode(&self, bytes: &[u8], insn: &Instruction) -> DecodeAction {
+        // 386 PRM §17 REP p. 17-141: #UD on non-strings. The SDM
+        // explicitly defines F3 90 and F3 0F BC/BD on older CPUs (above).
+        // F2 90 is ASSUMED to share NOP's ignored-prefix behavior.
+        if self.isa == ModelIsa::I80386 && !self.quirks.i386_ignore_rep_non_string {
+            let repeat = bytes
+                .iter()
+                .take_while(|b| {
+                    matches!(
+                        b,
+                        0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+                    )
+                })
+                .filter(|b| matches!(b, 0xf2 | 0xf3))
+                .last();
+            if repeat.is_some()
+                && !insn.is_string_instruction()
+                && !matches!(insn.code(), Code::Nopw | Code::Nopd)
+                && !(repeat == Some(&0xf3)
+                    && matches!(
+                        insn.mnemonic(),
+                        iced_x86::Mnemonic::Bsf | iced_x86::Mnemonic::Bsr
+                    ))
+            {
+                return DecodeAction::Absent(self.isa.absent_encoding());
+            }
+        }
+        self.isa.decode(bytes, insn)
+    }
+}
+
 impl ModelIsa {
     const fn set(self) -> &'static DecodeSet {
         match self {
@@ -971,32 +1003,6 @@ impl ModelIsa {
             .unwrap_or(0);
         if models & mask == 0 {
             return absent;
-        }
-        // 386 PRM §17 REP p. 17-141: #UD on non-strings. The SDM
-        // explicitly defines F3 90 and F3 0F BC/BD on older CPUs (above).
-        // F2 90 is ASSUMED to share NOP's ignored-prefix behavior.
-        if self == Self::I80386 {
-            let repeat = bytes
-                .iter()
-                .take_while(|b| {
-                    matches!(
-                        b,
-                        0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
-                    )
-                })
-                .filter(|b| matches!(b, 0xf2 | 0xf3))
-                .last();
-            if repeat.is_some()
-                && !insn.is_string_instruction()
-                && !matches!(insn.code(), Code::Nopw | Code::Nopd)
-                && !(repeat == Some(&0xf3)
-                    && matches!(
-                        insn.mnemonic(),
-                        iced_x86::Mnemonic::Bsf | iced_x86::Mnemonic::Bsr
-                    ))
-            {
-                return absent;
-            }
         }
         if self.set().legacy_segments_only
             && (self.unavailable_prefix(bytes)

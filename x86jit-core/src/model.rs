@@ -147,6 +147,10 @@ pub struct ModelQuirks {
     /// What an NMI edge does while an earlier NMI is being serviced
     /// (spec.md §17.10).
     pub nmi_nesting: NmiNesting,
+    /// ASSUMED 386 compatibility option: ignore REP/REPNE on non-strings.
+    /// Default false follows 386 PRM §17 REP p. 17-141 (#UD); SDM Vol 2A
+    /// §2.1.1 p. 2-2 instead reserves this use with unpredictable behavior.
+    pub i386_ignore_rep_non_string: bool,
 }
 
 /// What a rising edge on the NMI input does while an earlier NMI is being
@@ -268,6 +272,7 @@ static I80286: ModelProfile = identified(ModelProfile {
         ei_delay_unconditional: false,
         lock_data_movement: true,
         coprocessor_overrun_vector: Some(9),
+        i386_ignore_rep_non_string: false,
         nmi_nesting: NmiNesting::BlockedRemember,
     },
     system: ModelSystem::Msw286,
@@ -310,6 +315,7 @@ static I80386: ModelProfile = identified(ModelProfile {
         ei_delay_unconditional: false,
         lock_data_movement: false,
         coprocessor_overrun_vector: None,
+        i386_ignore_rep_non_string: false,
         nmi_nesting: NmiNesting::BlockedIgnore,
     },
     system: ModelSystem::Cr386,
@@ -360,6 +366,33 @@ const fn i486_model(cpuid: bool) -> ModelProfile {
     p.fpu = &[FpuModel::Present];
     identified(p)
 }
+pub(crate) static I80386_IGNORE_REP_NON_STRING: ModelProfile = identified(ModelProfile {
+    quirks: ModelQuirks {
+        i386_ignore_rep_non_string: true,
+        ..I80386.quirks
+    },
+    ..I80386
+});
+
+/// The REP compatibility option requires the public I80386 catalogue entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I386RepQuirkError {
+    /// Selected catalogue model; `None` for Application or the legacy selector.
+    pub model: Option<CpuModel>,
+}
+
+impl std::fmt::Display for I386RepQuirkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "386 REP quirk requires CpuModel::I80386, selected {:?}",
+            self.model
+        )
+    }
+}
+
+impl std::error::Error for I386RepQuirkError {}
+
 static I80486_DX: ModelProfile = i486_model(false);
 static I80486_DX_CPUID: ModelProfile = i486_model(true);
 // ASSUMED model-1 stepping 0; Embedded 486 DM §D.2/Table D-2 pp. D-2–3.
@@ -394,6 +427,7 @@ const fn early_model(identity: u64, data_bus_bits: u8) -> ModelProfile {
             ei_delay_unconditional: false,
             lock_data_movement: false,
             coprocessor_overrun_vector: None,
+            i386_ignore_rep_non_string: false,
             nmi_nesting: NmiNesting::Nested,
         },
         system: ModelSystem::None,
@@ -461,6 +495,7 @@ const fn nec_model(identity: u64, data_bus_bits: u8) -> ModelProfile {
             ei_delay_unconditional: true,
             lock_data_movement: false,
             coprocessor_overrun_vector: None,
+            i386_ignore_rep_non_string: false,
             nmi_nesting: NmiNesting::Nested,
         },
         system: ModelSystem::None,
@@ -715,6 +750,12 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
             hash = word(hash, I486_DX_CPUID_FEATURES as u64);
         }
     }
+    // Preserve canonical catalogue identities; only the selectable 386 variant
+    // adds this domain word and its quirk value (decision-23 §3).
+    if p.quirks.i386_ignore_rep_non_string {
+        hash = word(hash, 0x726570333836);
+        hash = word(hash, p.quirks.i386_ignore_rep_non_string as u64);
+    }
     p.semantics_id = hash;
     p
 }
@@ -745,7 +786,7 @@ mod tests {
         for model in [CpuModel::I80286, CpuModel::I80386] {
             let p = model.profile();
             assert_eq!(identified(copy(p)).semantics_id, p.semantics_id);
-            for change in 0..25 {
+            for change in 0..26 {
                 let mut changed = copy(p);
                 match change {
                     0 => changed.quirks.push_sp_after_decrement = true,
@@ -778,6 +819,7 @@ mod tests {
                     }
                     22 => changed.quirks.nmi_nesting = NmiNesting::Nested,
                     23 => changed.data_bus_bits = 8,
+                    24 => changed.quirks.i386_ignore_rep_non_string = true,
                     _ => changed.quirks.step_interrupt_handler = true,
                 }
                 assert_ne!(identified(changed).semantics_id, p.semantics_id);

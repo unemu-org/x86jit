@@ -2578,9 +2578,36 @@ prefixes on ordinary non-strings is **ASSUMED** for those models. The 386
 PRM §17 REP p. 17-141 specifies #UD on non-strings: for F3 90 the engine
 follows the SDM's explicit backward-compatibility statement, as it does for
 F3 BSF/BSR. F2 90 is an **ASSUMED** NOP compatibility case. Other 386
-non-string REP forms raise #UD as specified by its PRM. ESC, NEC extensions,
-string-repeat combinations and LOCK retain their separate policies. The
-witnesses live in `legacy_redundant_prefix`; the ignored
+non-string REP forms raise #UD by default as specified by its PRM.
+
+For the public `CpuModel::I80386` entry only,
+`Vm::set_i386_ignore_rep_non_string(true)` selects the named
+`ModelQuirks::i386_ignore_rep_non_string` compatibility option. It ignores
+REP/REPNE on non-strings (including F3 C3 / F2 C3 RET and F3 40 INC),
+executing the underlying instruction once in real and protected mode. This
+behavior is **ASSUMED**: an embedder reports REP RET working on real 386
+parts, but the 386 PRM §17 REP p. 17-141 specifies #UD, while SDM Vol 2A
+§2.1.1 p. 2-2 reserves non-string repeat prefixes and warns of unpredictable
+behavior. The SDM does not establish ignored prefixes as a 386 hardware fact.
+F3 90 / F2 90 and F3 BSF/BSR keep the compatibility meanings above in both
+settings. ESC, NEC extensions, string-repeat combinations and LOCK retain
+their separate policies.
+
+Select the option after `set_cpu_model` and before creating any vCPU;
+`false` restores the default, and selecting a CPU model again resets the
+option. Calls after any vCPU creation panic, including after those vCPUs
+are dropped, just like CPU model selection. Both values return the typed
+`I386RepQuirkError` on other models, Application profiles and the deprecated
+legacy selector. New vCPUs inherit the selection; there is no per-vCPU
+setter because decode policy is fixed with the VM's CPU model. Forks preserve
+it. The enabled setting selects a static 386 profile variant and hashes its
+named quirk into a distinct `semantics_id`; the VM and vCPUs carry that
+identity in their existing `LegacyCpuModel`, so checked code-cache keys and
+context stamps distinguish the settings. Direct translations remain scoped
+to the immutable VM model. Default catalogue identities, other models,
+Application profiles, CpuState and jit_abi are unchanged.
+
+The witnesses live in `legacy_redundant_prefix`; the ignored
 `legacy_census_386::redundant_prefix_census` reports the one-byte/0F CPU
 forms under REP/REPNE, segment, operand-size and address-size prefixes.
 

@@ -232,7 +232,8 @@ pub use memory::{
 };
 pub use memory_stats::{BackendMemoryStats, CacheMemoryStats, MemoryStats, VcpuMemoryStats};
 pub use model::{
-    CpuModel, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming, NmiNesting,
+    CpuModel, I386RepQuirkError, ModelIsa, ModelProfile, ModelQuirks, ModelSystem, ModelTiming,
+    NmiNesting,
 };
 pub use state::{
     CpuSource, CpuState, ExternalNumericErrorState, Flags, FpuModel, NumericErrorConfigError,
