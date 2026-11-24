@@ -21,6 +21,16 @@ Update this when a milestone advances, a feature lands, or something breaks. Sta
 
 ## Works
 
+- **386/486 virtual-8086 Machine execution.** Public canonical VM=1 entry,
+  IRETD/task entry, protected IDT/task exit and return, live I/O bitmap and paging
+  work on I80386 and both 486 entries. The census, sources, checkpoint and cache
+  witnesses are in [v86.md §11](design/v86.md#11-step-5-census-and-boundary-acceptance).
+  No unexplained fault, refusal, unknown instruction or panic was found. Typed
+  boundaries remain for 16-bit V86 interrupt/trap gates and invalid VM contexts;
+  V86 task images require 32-bit TSSs. Both 486 entries retain the AM+AC refusal
+  and internal-only numeric routing, including with NE=0. These limitations and
+  later VME facilities are listed in [deferred.md](deferred.md).
+
 - **M0 — Skeleton (complete).** Cargo workspace with four crates builds clean. Public API types defined across `state`/`memory`/`ir`/`exit`/`cache`/`vm`/`lift`. Dispatcher `run()` loop wired (§9.2). Nix flake devShell verified (toolchain + nextest).
   - Register numbering centralized: `Reg::gpr_index` + `iced_gpr_index` map to `gpr[]` in x86 encoding order, one place (§3.1). `Vcpu::set_reg`/`reg` route through it (rip/fs_base/gs_base handled).
   - `Memory` Flat model live: `map` (tags region prot/kind + bounds/overlap check, no allocation), `write_bytes`/`read_bytes` (mapped-checked), `unmap`.

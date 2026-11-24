@@ -12,8 +12,15 @@ The target is interpreted Machine execution on `I80386`, `I80486Dx` and
 CR3, PDE/PTE P/U/S/R/W/A/D, CR2, restartable #PF, and the 486's WP and INVLPG.
 Instruction fetch, explicit operands and implicit system accesses all participate.
 Application profiles retain their existing memory contract and execution paths.
-V86, PSE/PAE/PGE, debug registers and extensions to hardware task switching beyond
+PSE/PAE/PGE, debug registers and extensions to hardware task switching beyond
 the existing switch engine's paged CR3 handoff are outside this proposal.
+V86 was outside the original paging proposal and is now supported through the
+same walker and continuations ([v86.md](v86.md) §§2.1, 4.4, 11). V86 fetch,
+data and stack accesses are user accesses at every IOPL; implicit IDT/GDT/TSS
+accesses remain supervisor accesses. Authority: SDM Vol 3B §§23.2.3–23.2.4
+pp. 23-7–8; 386 PRM §15.2 pp. 15-3–4; Intel486 PRM §23.2 pp. 23-4–5.
+Run-boundary CpuState/RAM restores call `invalidate_paging` even with unchanged
+CR0/CR3; retained proofs and same-CR3 remapping restores have V86 witnesses.
 
 ## 1. Sources and hardware contract
 

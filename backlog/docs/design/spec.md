@@ -2375,7 +2375,13 @@ attributes=009Bh for CS and 0093h for DS/ES/SS/FS/GS, unusable=0 and reserved=0.
 These attributes are internal labels (ASSUMED), not descriptor permissions.
 Entry validates rather than repairs the image; inconsistent storage or CPL
 returns a typed `InvalidLegacyContext` error. No TSS is required just to execute
-ordinary V86 instructions. Boundary checkpoints restore these fields together;
+ordinary V86 instructions. Boundary checkpoints restore these fields together
+with RAM/page tables and board/device state, then call `Vcpu::invalidate_paging`
+on every affected vCPU before resuming, even when CR0/CR3 are unchanged.
+Completed run boundaries retain checked instruction blocks and paged fetch
+proofs; invalidation discards the derived paging proofs. Retirement and delivery
+diagnostics are not rewound by a CpuState copy. The boundary and retention
+witnesses are in `legacy_v86` and `vm::legacy::tests` (v86.md §11).
 CpuState copies with pending mid-instruction task/page/event continuations
 remain unsupported (decision-24). No CpuState or JIT ABI field is added.
 
@@ -2402,7 +2408,10 @@ V86 interrupts/exceptions use the protected IDT under the existing delivery
 policy. Supported 32-bit interrupt/trap gates target nonconforming DPL-0 code,
 use the current TSS ring-0 stack (either TSS width), save nine dwords plus
 an optional error code, clear live VM/NT/RF/TF, and null DS/ES/FS/GS caches.
-16-bit interrupt/trap gates retain a typed unsupported-operation boundary.
+16-bit interrupt/trap gates retain `LegacyGateOrTaskTransfer` before mutation.
+V86 task images require a 32-bit TSS: a 16-bit TSS has no VM bit and loads
+VM=0, rather than entering V86 (v86.md §4.4). Unsupported-model or incoherent
+public VM images retain typed `InvalidLegacyContext` refusals.
 Task gates use the task contract above. Implicit system accesses are supervisor;
 V86 fetches and operands are user accesses. Paging precedes physical A20/bus
 gating; segment operands never wrap at 64 KiB. Port I/O always consults the
@@ -2415,7 +2424,13 @@ may inject its chosen IRQ through the V86 protected IDT. Acknowledgement does
 not clear x87 status. 386 PRM §§11.1.2, 11.1.5.3 pp. 11-1, 11-4; §15.6
 p. 15-12; [fpu-error-routing.md](fpu-error-routing.md). Both 486 entries retain
 the AM+AC alignment-check refusal and their existing internal-only numeric
-routing limitation; VME/CR4/VIF/VIP remain outside these models.
+routing limitation, including internal #MF with CR0.NE=0. AM=AC=1 refuses
+before instruction execution even for aligned/register-only instructions;
+External route selection is rejected on both 486 entries. These are deliberate
+engine limitations (v86.md §9/Q5), not the hardware's NE=0 behavior: Intel486
+PRM §§4.1.3, 19.2.4 pp. 4-7, 19-4. VME/CR4/VIF/VIP remain outside these models.
+The V86 and V86+paging runtime census, counts and every observed fault/refusal
+are recorded in v86.md §11; no new execution gap was found.
 
 Held task/page/event continuations own VM and all six segment caches alongside
 their existing inputs. Edited inputs abandon replay under decision-24;

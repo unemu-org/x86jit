@@ -258,6 +258,25 @@ as ordinary defects rather than listed here.
   concrete; do not add speculative mode traits or abstractions.
 - **History:** task-143 was closed into this entry before Real16 shipped.
 
+### Remaining V86 and Intel486 Machine boundaries
+
+- **What ships:** interpreted V86 on I80386 and both 486 entries, with paging,
+  32-bit interrupt/trap gates, task gates and 32-bit V86 task images. See
+  [v86.md](design/v86.md) §§9, 11 and spec.md §17.10.
+- **Still deferred:** 16-bit interrupt/trap gates from V86 retain the typed
+  `LegacyGateOrTaskTransfer` refusal before mutation while their manual conflict
+  remains unresolved. A 16-bit TSS cannot encode VM and is not a V86 task image;
+  it loads VM=0. A 16-bit current TSS may supply the ring-0 stack for
+  IRETD-created V86. Sources: SDM Vol 3B §§23.2.5, 23.3.1 pp. 23-8–9, 23-12–14;
+  Intel486 PRM §23.3.1 p. 23-6.
+- **486 facilities:** AM=AC=1 retains `LegacyAlignmentCheck`, even for aligned
+  instructions. Numeric errors use internal #MF with either NE value; external
+  route selection is rejected until FERR#/IGNNE#/CR0.NE routing is implemented
+  (Intel486 PRM §§4.1.3, 19.2.4 pp. 4-7, 19-4). VME, CR4 and VIF/VIP belong to
+  later models. V86 support does not implement these independent facilities.
+- **Revisit when:** the corresponding facility is requested; accepted V86 scope
+  explicitly preserves these boundaries (v86.md §9/Q2/Q5).
+
 ### Other guest architectures (ARM/MIPS/6502) as a second front-end
 
 - **Why deferred:** the IR already supports this — a new decoder + lift targeting the same IR reuses every backend (§17.1). Not a seam question, just unwritten work; don't scaffold for it speculatively.

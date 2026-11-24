@@ -1,4 +1,4 @@
-//! V86 execution and transfer witnesses (v86 design §§2, 7 steps 1–4).
+//! V86 execution, transfer and boundary witnesses (v86 design §§2, 7 steps 1–5).
 //! Architectural expectations use SDM Vol 3B §§23.2–23.3
 //! pp. 23-5–17, 386 PRM Ch. 15 pp. 15-1–13, and 486 PRM Ch. 23 pp. 23-1–15.
 #[path = "../support/descriptor_fixture.rs"]
@@ -698,17 +698,149 @@ fn public_entry_validates_embedder_supplied_canonical_images() {
 
 #[test]
 fn i486_alignment_boundary_is_retained_in_v86() {
+    // Intel486 PRM §4.1.3 p. 4-7: AM+AC at CPL=3 enables #AC.
+    // V86 §9/Q5 deliberately retains the typed entry refusal instead.
     for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
-        let (vm, mut cpu) = world(model, &[0x90], 3);
-        cpu.cpu.legacy.cr0 |= 1 << 18;
-        cpu.cpu.rflags_system |= 1 << 18;
-        assert!(matches!(
-            run(&mut cpu, &vm),
-            Err(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::LegacyAlignmentCheck,
-                ..
-            })
-        ));
+        for paged in [false, true] {
+            for (am, ac) in [(true, false), (false, true), (true, true)] {
+                let (vm, mut cpu) = world(model, &[0x90], 3);
+                if paged {
+                    identity_paging(&vm, &mut cpu);
+                }
+                cpu.cpu.legacy.cr0 |= u32::from(am) << 18;
+                cpu.cpu.rflags_system |= u64::from(ac) << 18;
+                let before = format!("{:?}", cpu.cpu);
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                if am && ac {
+                    assert_eq!(r.steps(), 0);
+                    assert!(matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::UnsupportedSystemContext {
+                            operation: UnsupportedSystemOperation::LegacyAlignmentCheck,
+                            ..
+                        })
+                    ));
+                    assert_eq!(format!("{:?}", cpu.cpu), before);
+                    assert_eq!(cpu.retired_instructions(), 0);
+                } else {
+                    assert_eq!(r.steps(), 1, "{:?}", r.stop());
+                    assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+                }
+            }
+        }
+    }
+}
+
+// Intel486 PRM §§4.1.3, 19.2.4 pp. 4-7, 19-4: NE selects internal #MF
+// versus FERR#/IGNNE#. V86 §9/Q5 keeps internal routing even with NE=0
+// until that independent facility is implemented; this is an engine boundary.
+#[test]
+fn public_i486_v86_keeps_internal_numeric_routing_even_with_ne_clear() {
+    use x86jit_core::{NumericErrorConfigError, NumericErrorRoute};
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        for paged in [false, true] {
+            for ne in [false, true] {
+                let (vm, mut cpu) = world(model, &[0x9b], 3); // WAIT
+                if paged {
+                    identity_paging(&vm, &mut cpu);
+                }
+                cpu.cpu.legacy.cr0 |= u32::from(ne) << 5;
+                cpu.set_fpu_model(FpuModel::Present);
+                assert_eq!(
+                    cpu.set_numeric_error_route(NumericErrorRoute::External),
+                    Err(NumericErrorConfigError::UnsupportedModel)
+                );
+                assert_eq!(cpu.numeric_error_route(), NumericErrorRoute::Internal);
+                cpu.cpu.fpu_cw = 0x37b; // Unmask divide-by-zero.
+                cpu.cpu.fpu_sw = 0x84; // ES + ZE pending.
+                fixture::fault(&mut cpu, &vm, 16, None);
+                assert_eq!(cpu.cpu.legacy.cr0 & (1 << 5), u32::from(ne) << 5);
+                assert_eq!(cpu.retired_instructions(), 0);
+            }
+        }
+    }
+}
+
+// V86 §4.1/Q3 and paging §3.7: a checkpoint owns CpuState and RAM,
+// not derived translations. Restore at a completed run boundary and invalidate
+// even when CR0/CR3 are unchanged. SDM Vol 3B §23.2.2 p. 23-7 and
+// 386 PRM §15.1.2 pp. 15-2–3 supply paragraph addressing and the 64-KiB limit.
+#[test]
+fn public_v86_boundary_checkpoint_restores_cpu_ram_and_paging() {
+    for model in MODELS {
+        for paged in [false, true] {
+            // MOV AX,[6000h]; INC word [6000h]; MOV BX,[6000h].
+            let (vm, mut cpu) = world(
+                model,
+                &[0xa1, 0, 0x60, 0xff, 0x06, 0, 0x60, 0x8b, 0x1e, 0, 0x60],
+                3,
+            );
+            if paged {
+                identity_paging(&vm, &mut cpu);
+                dwords(&vm, 0x11000 + 6 * 4, &[0x6007]);
+                dwords(&vm, 0x11000 + 7 * 4, &[0x7007]);
+            }
+            vm.write_bytes(0x6000, &41u16.to_le_bytes()).unwrap();
+            vm.write_bytes(0x7000, &99u16.to_le_bytes()).unwrap();
+            fixture::steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.gpr[0] as u16, 41);
+            let checkpoint = cpu.cpu.clone();
+            let mut ram = vec![0; 0x20000];
+            vm.read_bytes(0, &mut ram).unwrap();
+            fixture::steps(&mut cpu, &vm, 2);
+            let expected = format!("{:?}", cpu.cpu);
+            assert_eq!(cpu.cpu.gpr[3] as u16, 42);
+
+            cpu.cpu = checkpoint.clone();
+            if paged {
+                // Same CR3, different PTE and physical operand backing.
+                dwords(&vm, 0x11000 + 6 * 4, &[0x7007]);
+            } else {
+                canonical(&mut cpu, SegmentId::Ds, 0x100);
+            }
+            cpu.invalidate_paging();
+            fixture::steps(&mut cpu, &vm, 2);
+            assert_eq!(cpu.cpu.gpr[3] as u16, 100);
+            assert_eq!(cpu.cpu.legacy.cr0, checkpoint.legacy.cr0);
+            assert_eq!(cpu.cpu.legacy.cr3, checkpoint.legacy.cr3);
+
+            vm.write_bytes(0, &ram).unwrap();
+            cpu.cpu = checkpoint;
+            let generation = cpu.paging_cache_for_test().0;
+            cpu.invalidate_paging();
+            if paged {
+                assert!(cpu.paging_cache_for_test().0 > generation);
+                assert_eq!(cpu.paging_cache_for_test().1, 0);
+            }
+            fixture::steps(&mut cpu, &vm, 2);
+            assert_eq!(format!("{:?}", cpu.cpu), expected);
+            assert_eq!(fixture::value(&vm, 0x6000, 2), 42);
+            assert_eq!(fixture::value(&vm, 0x7000, 2), 99);
+            // Execution diagnostics are deliberately not rewound by CpuState.
+            assert_eq!(cpu.retired_instructions(), 7);
+        }
+    }
+}
+
+#[test]
+fn public_paged_v86_run_boundaries_retain_fetch_proofs() {
+    for model in MODELS {
+        let (vm, mut cpu) = world(model, &[0xeb, 0xfe], 3);
+        identity_paging(&vm, &mut cpu);
+        fixture::steps(&mut cpu, &vm, 1);
+        let warm = cpu.paging_cache_for_test();
+        assert_eq!(warm.1, 1);
+        assert_eq!(warm.2, 1);
+        for budget in [1, 2, 17] {
+            fixture::steps(&mut cpu, &vm, budget);
+            assert_eq!(cpu.paging_cache_for_test(), warm);
+        }
+        let checkpoint = cpu.cpu.clone();
+        cpu.cpu = checkpoint;
+        cpu.invalidate_paging();
+        assert_eq!(cpu.paging_cache_for_test().1, 0);
+        fixture::steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.paging_cache_for_test().2, warm.2 + 1);
     }
 }
 

@@ -8,12 +8,22 @@ type: specification
 The legacy Machine interpreter runs protected-mode code at CPL 0-3 on `I80286`
 and `I80386`. The helpers live in `x86jit-core/src/interp/legacy/privilege.rs`;
 the run-time CPL and IOPL test is `LegacyOp::Privileged`, emitted by
-`lift/legacy.rs` in the protected regime only. The first landing added
+`lift/legacy.rs` for protected and V86 execution. The first landing added
 execution at CPL 1-3, inward interrupts, outward returns and the CPL and IOPL
 checks; the second adds far CALL and JMP through call gates
 (`privilege::call_gate`), so `LegacyGateOrTaskTransfer` is no longer produced.
 spec.md §17.10 holds the rules and the source rows that disagree, with the
 engine's choice for each.
+
+The 386 and both 486 models now also execute V86 at CPL=3. Its paragraph
+segments, six IOPL-sensitive families, forced live I/O bitmap, nine-slot ring-0
+delivery and IRETD entry, and three-slot V86 IRET are specified in
+[v86.md](v86.md) §§2, 4, 11. Authority: SDM Vol 3B §§23.2–23.3 pp. 23-5–17;
+386 PRM Ch. 15 pp. 15-1–13; Intel486 PRM Ch. 23 pp. 23-1–15. The protected
+call-gate rules below do not apply to ordinary V86 far transfers. A 16-bit
+V86 interrupt/trap gate retains `LegacyGateOrTaskTransfer` before mutation;
+32-bit gates and task gates are supported. V86 task images require a 32-bit
+TSS; a 16-bit current TSS may supply the ring-0 stack for IRET-created V86.
 
 Sources are the pinned Intel 80286/80287 PRM 210498-005 ("286 PRM"), 80386 PRM
 230985-001 ("386 PRM") and SDM 325462-092US, cited by printed page. ASSUMED and

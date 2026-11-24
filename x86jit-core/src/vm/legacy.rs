@@ -4605,6 +4605,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v86_boundary_restores_reuse_retained_checked_contexts() {
+        // V86 design §4.1/Q3: full canonical images form checked contexts;
+        // completed run boundaries retain IR, while context edits isolate it.
+        for model in [
+            crate::CpuModel::I80386,
+            crate::CpuModel::I80486Dx,
+            crate::CpuModel::I80486DxCpuid,
+        ] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, &[0xeb, 0xfe]).unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu = CpuState::legacy_real_entry([0; 6]);
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.legacy.cr0 = 1;
+            cpu.cpu.legacy.cpl = 3;
+            cpu.cpu.rflags_system = (1 << 17) | 0x3000;
+            let checkpoint = cpu.cpu.clone();
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1, "{:?}", run.stop());
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert_eq!(execution.blocks.len(), 1);
+            let (key, ir) = execution
+                .blocks
+                .iter()
+                .next()
+                .map(|(key, block)| (*key, block.ir.clone()))
+                .unwrap();
+            for budget in [1, 2, 17] {
+                let run = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), budget, "{:?}", run.stop());
+                assert_eq!(cpu.legacy_execution.as_ref().unwrap().lifts, 1);
+            }
+            cpu.cpu.ds = 0x100;
+            cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = 0x1000;
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1, "{:?}", run.stop());
+            assert_eq!(cpu.legacy_execution.as_ref().unwrap().lifts, 2);
+            cpu.cpu = checkpoint;
+            cpu.invalidate_paging();
+            let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 1, "{:?}", run.stop());
+            let execution = cpu.legacy_execution.as_ref().unwrap();
+            assert_eq!(execution.lifts, 2);
+            assert!(Arc::ptr_eq(&ir, &execution.blocks[&key].ir));
+        }
+    }
+
+    #[test]
     fn cached_direct_bus_revalidates_selectors_and_a20() {
         // SDM Vol 3A §11.7.13.4; decision-22 §3: the board gate masks bit 20;
         // entry edits must invalidate both context and bus-derived metadata.

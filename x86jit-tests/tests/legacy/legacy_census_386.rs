@@ -18,12 +18,20 @@ use x86jit_core::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
+    V86,
+    PagedV86,
     PagedP32,
     P32,
     P16,
     Real,
 }
 impl Mode {
+    fn v86(self) -> bool {
+        matches!(self, Self::V86 | Self::PagedV86)
+    }
+    fn paged(self) -> bool {
+        matches!(self, Self::PagedP32 | Self::PagedV86)
+    }
     fn bits(self) -> u32 {
         if matches!(self, Self::P32 | Self::PagedP32) {
             32
@@ -316,13 +324,14 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     cpu.cpu.legacy.gdtr.limit = 0x3f;
     cpu.cpu.legacy.idtr.base = if mode == Mode::Real { 0 } else { 0x3000 };
     cpu.cpu.legacy.idtr.limit = if mode == Mode::Real { 0x3ff } else { 0x7ff };
-    let wide = matches!(mode, Mode::P32 | Mode::PagedP32);
+    let wide = matches!(mode, Mode::P32 | Mode::PagedP32) || mode.v86();
     descriptor(&vm, 8, 0, 0xffff_ffff, if wide { 0xc09b } else { 0x809b });
     descriptor(&vm, 16, 0, 0xffff_ffff, if wide { 0xc093 } else { 0x8093 });
     descriptor(&vm, 24, 0x4000, 0xff, 0x82); // LDT
     descriptor(&vm, 32, 0x5000, 0x67, 0x89); // available 386 TSS
-    cpu.cpu.cs = if mode == Mode::Real { 0 } else { 8 };
-    let data = if mode == Mode::Real { 0 } else { 16 };
+    let paragraphs = mode == Mode::Real || mode.v86();
+    cpu.cpu.cs = if paragraphs { 0 } else { 8 };
+    let data = if paragraphs { 0 } else { 16 };
     cpu.cpu.ds = data;
     cpu.cpu.es = data;
     cpu.cpu.ss = data;
@@ -331,11 +340,11 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
         *cache = SegmentCache {
             base: 0,
-            limit: if mode == Mode::Real { 0xffff } else { u32::MAX },
+            limit: if paragraphs { 0xffff } else { u32::MAX },
             attributes: if i == 0 { 0x9b } else { 0x93 }
-                | if wide {
+                | if wide && !mode.v86() {
                     0xc000
-                } else if mode != Mode::Real {
+                } else if !paragraphs {
                     0x8000
                 } else {
                     0
@@ -350,8 +359,11 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
             vm.write_bytes(vector * 4, &0x1800u32.to_le_bytes())
                 .unwrap();
         } else {
-            vm.write_bytes(0x3000 + vector * 8, &[0, 0x18, 8, 0, 0, 0x8e, 0, 0])
-                .unwrap();
+            vm.write_bytes(
+                0x3000 + vector * 8,
+                &[0, 0x18, 8, 0, 0, if mode.v86() { 0xee } else { 0x8e }, 0, 0],
+            )
+            .unwrap();
         }
     }
     vm.write_bytes(0x6000, &0x89abcdefu32.to_le_bytes())
@@ -376,7 +388,7 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     }
     let operand32 = p.insn.code().op_code().operand_size() == 32;
     let size = if operand32 { 4 } else { 2 };
-    let selector = if mode == Mode::Real { 0u16 } else { 8 };
+    let selector = if paragraphs { 0u16 } else { 8 };
     vm.write_bytes(0x8000, &0x1800u32.to_le_bytes()[..size])
         .unwrap();
     vm.write_bytes(0x8000 + size as u64, &selector.to_le_bytes())
@@ -430,7 +442,27 @@ fn setup(model: CpuModel, p: &Probe, mode: Mode, application: bool) -> (Vm, Vcpu
     if m == M::Into {
         cpu.cpu.flags.of = true;
     }
-    if mode == Mode::PagedP32 && !application {
+    if mode.v86() && !application {
+        // SDM Vol 3B §§23.2.1–23.2.8 pp. 23-6–11; 386 PRM
+        // §§15.2–15.5 pp. 15-4–10: canonical paragraphs, CPL=3,
+        // IOPL=3, and a live permissive bitmap (also required at IOPL=3).
+        cpu.cpu.legacy.cpl = 3;
+        cpu.cpu.rflags_system = (1 << 17) | 0x3000;
+        cpu.cpu.legacy.tr = x86jit_core::legacy::SystemSegment {
+            selector: 0x28,
+            cache: SegmentCache {
+                base: 0x9000,
+                limit: 0x2100,
+                attributes: 0x8b,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        vm.write_bytes(0x9004, &0x18000u32.to_le_bytes()).unwrap();
+        vm.write_bytes(0x9008, &16u16.to_le_bytes()).unwrap();
+        vm.write_bytes(0x9066, &0x100u16.to_le_bytes()).unwrap();
+    }
+    if mode.paged() && !application {
         // 80386 PRM §5.2 pp. 5-7–11; Intel486 PRM §5.3 pp. 5-18–22:
         // one identity-mapped directory/table, separate from probe storage.
         vm.write_bytes(0x1e000, &0x1f007u32.to_le_bytes()).unwrap();
@@ -584,14 +616,14 @@ fn compare(p: &Probe, mode: Mode, cpu: &Vcpu, vm: &Vm) -> String {
 #[test]
 #[ignore = "manual 386 opcode census; emits a TSV runtime artifact"]
 fn runtime_census() {
-    runtime_census_for(CpuModel::I80386, false);
+    runtime_census_for(CpuModel::I80386, &[Mode::P32, Mode::P16, Mode::Real]);
 }
 
 #[test]
 #[ignore = "manual 486 opcode census; emits TSV runtime artifacts"]
 fn runtime_census_i486() {
     for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
-        runtime_census_for(model, false);
+        runtime_census_for(model, &[Mode::P32, Mode::P16, Mode::Real]);
     }
 }
 
@@ -603,20 +635,92 @@ fn runtime_census_paged() {
         CpuModel::I80486Dx,
         CpuModel::I80486DxCpuid,
     ] {
-        runtime_census_for(model, true);
+        runtime_census_for(model, &[Mode::PagedP32]);
     }
 }
 
-fn runtime_census_for(model: CpuModel, paged: bool) {
-    let mut report = String::from("model\tmode\tbytes\tmnemonic\tshape\tclass\texit\tcomparison\n");
+#[test]
+#[ignore = "manual V86 and paged V86 census; emits TSV runtime artifacts"]
+fn runtime_census_v86() {
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        runtime_census_for(model, &[Mode::V86, Mode::PagedV86]);
+    }
+}
+
+// Fail the manual census on any unexplained V86 outcome, including reserved
+// controls. This is a runtime audit, not an instruction-membership oracle.
+fn v86_rule(p: &Probe, stop: &StepStop, steps: u64) -> &'static str {
+    match stop {
+        StepStop::Exit(Exit::Exception { vector, .. }) => {
+            assert_eq!(steps, 0);
+            let rule = if p.reserved {
+                assert_eq!(*vector, 6);
+                "reserved encoding: 386 PRM App. A pp. A-4–8; 486 PRM App. A pp. A-4–7"
+            } else {
+                let (expected, rule) = match p.insn.mnemonic() {
+                    M::Arpl => (6, "protected-only #UD: SDM Vol 2A ARPL pp. 3-75–76"),
+                    M::Lar => (6, "protected-only #UD: SDM Vol 2A LAR p. 3-536"),
+                    M::Lsl => (6, "protected-only #UD: SDM Vol 2A LSL p. 3-575"),
+                    M::Verr | M::Verw => (6, "protected-only #UD: SDM Vol 2C VERR/VERW p. 5-163"),
+                    M::Lldt => (6, "protected-only #UD: SDM Vol 2A LLDT p. 3-559"),
+                    M::Sldt => (6, "protected-only #UD: SDM Vol 2B SLDT p. 4-657"),
+                    M::Ltr => (6, "protected-only #UD: SDM Vol 2A LTR p. 3-577"),
+                    M::Str => (6, "protected-only #UD: SDM Vol 2B STR p. 4-679"),
+                    M::Hlt | M::Lgdt | M::Lidt | M::Lmsw | M::Clts
+                    | M::Invd | M::Wbinvd | M::Invlpg => (
+                        13,
+                        "CPL=3 privileged #GP(0): SDM Vol 3B §23.2.6 pp. 23-9–10; 486 PRM §23.7.1 p. 23-14",
+                    ),
+                    M::Mov if p.insn.op0_register().is_cr()
+                        || p.insn.op1_register().is_cr()
+                        || p.insn.op0_register().is_dr()
+                        || p.insn.op1_register().is_dr()
+                        || p.insn.op0_register().is_tr()
+                        || p.insn.op1_register().is_tr() => (
+                        13,
+                        "special-register #GP(0): SDM Vol 2B MOV CR/DR pp. 4-32–36; 386 PRM §10.6.2 pp. 10-15–16; 486 PRM §10.7.2 pp. 10-13–17",
+                    ),
+                    _ => panic!("unexplained V86 fault: {}: {stop:?}", p.insn),
+                };
+                assert_eq!(*vector, expected, "{}: {stop:?}", p.insn);
+                rule
+            };
+            if *vector == 13 {
+                let StepStop::Exit(exit) = stop else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    x86jit_core::fault::ErrorCode::bits(0, 0xffff)
+                );
+            }
+            rule
+        }
+        StepStop::Exit(Exit::UnsupportedSystemContext { operation, .. }) => {
+            assert_eq!(steps, 0);
+            assert!(!p.reserved && p.insn.mnemonic() == M::Bswap);
+            assert_eq!(p.insn.code().op_code().operand_size(), 16);
+            assert_eq!(
+                *operation,
+                x86jit_core::UnsupportedSystemOperation::LegacyInstruction
+            );
+            "undefined 16-bit BSWAP refused: 486 PRM §26 BSWAP p. 26-35"
+        }
+        StepStop::Exit(Exit::BudgetExhausted | Exit::PortIo { .. }) => "",
+        _ => panic!("unexplained V86 outcome: {}: {stop:?}", p.insn),
+    }
+}
+
+fn runtime_census_for(model: CpuModel, modes: &[Mode]) {
+    let mut report =
+        String::from("model\tmode\tbytes\tmnemonic\tshape\tclass\texit\tcomparison\trule\n");
     let mut summary = String::from(
         "model\tmode\tinteger total\texecutes\trefused\tfault\tport I/O\tunknown\tpanic\n",
     );
-    let modes: &[Mode] = if paged {
-        &[Mode::PagedP32]
-    } else {
-        &[Mode::P32, Mode::P16, Mode::Real]
-    };
     for &mode in modes {
         let mut counts = BTreeMap::<String, usize>::new();
         let mut comparisons = BTreeMap::<String, usize>::new();
@@ -649,6 +753,12 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
             let (vm, mut cpu) = setup(model, &p, mode, false);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let run = cpu.run_steps(&vm, 1, StepOptions::default());
+                let rule = if mode.v86() {
+                    let r = run.as_ref().expect("V86 stepping failed");
+                    v86_rule(&p, r.stop(), r.steps())
+                } else {
+                    ""
+                };
                 let (class, exit) = match run {
                     Ok(r) => {
                         match r.stop() {
@@ -685,9 +795,9 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
                 } else {
                     "excluded".into()
                 };
-                (class, exit, comparison)
+                (class, exit, comparison, rule)
             }));
-            let (class, exit, comparison) = outcome.unwrap_or_else(|e| {
+            let (class, exit, comparison, rule) = outcome.unwrap_or_else(|e| {
                 (
                     "panic".into(),
                     e.downcast_ref::<String>()
@@ -695,8 +805,17 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
                         .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                         .unwrap_or_default(),
                     "excluded".into(),
+                    "panic",
                 )
             });
+            if mode.v86() {
+                assert!(
+                    !matches!(class.as_str(), "panic" | "unknown" | "step-error" | "other"),
+                    "{model:?}/{mode:?}: {}: {exit}",
+                    p.insn
+                );
+                assert!(!comparison.starts_with("DIFF:"), "{}: {comparison}", p.insn);
+            }
             let category = if p.reserved {
                 format!("reserved-{class}")
             } else if p.x87 {
@@ -724,7 +843,7 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
             let bytes: String = p.bytes.iter().map(|b| format!("{b:02X}")).collect();
             writeln!(
                 report,
-                "{model:?}\t{mode:?}\t{bytes}\t{}\t{}\t{category}\t{exit}\t{comparison}",
+                "{model:?}\t{mode:?}\t{bytes}\t{}\t{}\t{category}\t{exit}\t{comparison}\t{rule}",
                 p.insn, p.shape
             )
             .unwrap();
@@ -734,7 +853,7 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
             0,
             "x87 must not refuse the Machine context in {mode:?}"
         );
-        if paged {
+        if mode.paged() && !mode.v86() {
             // Existing explicit limitations: test-register commands (386 PRM
             // §10.6.2 p. 10-14; Intel486 PRM §4.5 pp. 4-14–17), and
             // undefined 16-bit BSWAP (Intel486 PRM §26 p. 26-35).
@@ -787,7 +906,13 @@ fn runtime_census_for(model: CpuModel, paged: bool) {
         std::env::temp_dir()
             .join(format!(
                 "census-{model:?}-runtime{}.tsv",
-                if paged { "-paged" } else { "" }
+                if modes[0].v86() {
+                    "-v86"
+                } else if modes[0].paged() {
+                    "-paged"
+                } else {
+                    ""
+                }
             ))
             .display()
             .to_string()
