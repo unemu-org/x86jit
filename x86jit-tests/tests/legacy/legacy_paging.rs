@@ -197,12 +197,17 @@ fn present_permissions_all_pde_pte_combinations() {
                                     assert_eq!(f.get(u64::from(DATA)), 0x7654_3210);
                                 }
                                 // 386 PRM §5.2.4.3 p. 5-10; 486 PRM §5.3.4.3
-                                // pp. 5-21–22 and §9.9.14 p. 9-21: A on both;
+                                // pp. 5-21–22 and §9.9.14 p. 9-21; paging design §3.3:
                                 // D only on an allowed write; preserve all other bits.
-                                assert_eq!(f.get(f.pde()), PT | pde | preset | A);
+                                let a = if allowed || model != CpuModel::I80386 {
+                                    A
+                                } else {
+                                    0
+                                };
+                                assert_eq!(f.get(f.pde()), PT | pde | preset | a);
                                 assert_eq!(
                                     f.get(f.pte()),
-                                    DATA | pte | preset | A | if allowed && write { D } else { 0 }
+                                    DATA | pte | preset | a | if allowed && write { D } else { 0 }
                                 );
                                 f.cpu.cpu.legacy.cr2 = 0xdead_beef;
                             }
@@ -273,18 +278,80 @@ fn absent_pte_preserves_both_entries_for_read_write_and_fetch() {
     assert!(changed.is_empty(), "page-table changes: {changed:?}");
 }
 
+// ASSUMED for the 386 (paging design §3.3; 80386 PRM §5.2.4.3 p. 5-10):
+// a public CPU test suite for the 386 falsified A updates on protection faults.
+// Intel486 PRM §9.9.14 p. 9-21 requires both A bits on the 486.
 #[test]
-fn present_protection_fault_sets_both_accessed_bits() {
-    // Intel486 PRM §9.9.14 p. 9-21 requires both A bits. ASSUMED on
-    // the 386 (80386 PRM §5.2.4.3 p. 5-10; paging design §3.3):
-    // retain the same A-on-protection-fault policy, with D unchanged.
+fn present_protection_fault_ad_is_model_specific() {
     for model in MODELS {
         for code32 in [false, true] {
-            let mut f = Fixture::new(model, code32, 3);
-            f.tables(3, 3);
-            f.pf(false, OFFSET, LINEAR, 5);
-            assert_eq!(f.get(f.pde()), PT | 3 | A);
-            assert_eq!(f.get(f.pte()), DATA | 3 | A);
+            for (flags, write) in [(5, true), (3, false)] {
+                let mut f = Fixture::new(model, code32, 3);
+                f.tables(flags, flags);
+                f.pf(write, OFFSET, LINEAR, if write { 7 } else { 5 });
+                let a = if model == CpuModel::I80386 { 0 } else { A };
+                assert_eq!(f.get(f.pde()), PT | flags | a);
+                assert_eq!(f.get(f.pte()), DATA | flags | a);
+            }
+        }
+    }
+}
+
+#[test]
+fn tlb_protection_fault_ad_is_model_specific() {
+    for model in MODELS {
+        for warm in [false, true] {
+            for case in 0..3 {
+                if case == 2 && model == CpuModel::I80386 {
+                    continue; // 386 has no supervisor WP.
+                }
+                let mut f = Fixture::new(model, true, 0);
+                let flags = if case == 1 { 3 } else { 5 };
+                f.tables(flags, flags);
+                f.code_mapping(0, CODE_FRAME);
+                for (ip, write) in [(0x400, false), (0x500, case != 1)] {
+                    f.vm.write_bytes(u64::from(CODE_FRAME) + ip, &f.code(write, OFFSET))
+                        .unwrap();
+                }
+                if case == 2 {
+                    f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                }
+                if warm {
+                    f.fetch_at(0x400).unwrap();
+                    f.tables(flags, flags); // Clear A without invalidating the cached rights.
+                }
+                if case == 2 {
+                    f.cpu.cpu.legacy.cr0 |= 1 << 16;
+                } else {
+                    f.cpu.cpu.legacy.cpl = 3;
+                }
+                let exit = f.fetch_at(0x500).unwrap_err();
+                assert!(
+                    matches!(exit, Exit::Exception { vector: 14, .. }),
+                    "{exit:?}"
+                );
+                assert_eq!(
+                    exit.fault_metadata().unwrap().error_code(),
+                    ErrorCode::bits(
+                        if case == 2 {
+                            3
+                        } else if case == 1 {
+                            5
+                        } else {
+                            7
+                        },
+                        7
+                    )
+                );
+                assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR);
+                let a = if model == CpuModel::I80386 { 0 } else { A };
+                assert_eq!(
+                    f.get(f.pde()),
+                    PT | flags | a,
+                    "{model:?} warm={warm} case={case}"
+                );
+                assert_eq!(f.get(f.pte()), DATA | flags | a);
+            }
         }
     }
 }
@@ -313,7 +380,11 @@ fn second_page_fault_preflights_load_and_store_before_operand_commit() {
                     assert_eq!(f.get(f.pte()), DATA | 7 | A); // no premature D
                     assert_eq!(
                         f.get(f.pte() + 4),
-                        NEXT | if protection { 1 | A } else { SOFTWARE }
+                        NEXT | if protection {
+                            1 | if model == CpuModel::I80386 { 0 } else { A }
+                        } else {
+                            SOFTWARE
+                        }
                     );
                     // Repair and restart the very same instruction.
                     f.put(f.pte() + 4, NEXT | 7);
@@ -373,7 +444,10 @@ fn rmw_load_checks_write_rights_and_rollback_preserves_new_cr2() {
             );
             assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR);
             assert_eq!(f.cpu.cpu.rip, 0x400);
-            assert_eq!(f.get(f.pte()), DATA | 5 | A);
+            assert_eq!(
+                f.get(f.pte()),
+                DATA | 5 | if model == CpuModel::I80386 { 0 } else { A }
+            );
         }
     }
 }
@@ -1552,7 +1626,14 @@ fn paging_cas_retry_preserves_edits_and_restarts_identity_changes() {
                             );
                             assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR);
                             assert_eq!(f.get(bus) & D, 0);
-                            assert_eq!(f.get(bus) & A, if edit == 2 || stage == 2 { A } else { 0 });
+                            assert_eq!(
+                                f.get(bus) & A,
+                                if stage == 2 || (edit == 2 && model != CpuModel::I80386) {
+                                    A
+                                } else {
+                                    0
+                                }
+                            );
                             assert_eq!(f.get(u64::from(DATA)), 0x1122_3344);
                             assert_eq!(f.get(u64::from(NEXT)), 0x5566_7788);
                         }
@@ -4370,5 +4451,26 @@ fn tlb_warm_fetch_preserves_cr2_and_zero_budget_and_rechecks_fetch_policy() {
             ),
             "{exit:?}"
         );
+    }
+}
+
+#[test]
+fn fetch_protection_fault_ad_is_model_specific() {
+    for model in MODELS {
+        for warm in [false, true] {
+            let mut f = Fixture::new(model, true, 0);
+            f.cpu.cpu.legacy.segments[0].base = BASE;
+            f.tables(3, 3);
+            f.vm.write_bytes(u64::from(DATA), &[0x90]).unwrap();
+            if warm {
+                f.fetch_at(u64::from(OFFSET)).unwrap();
+                f.tables(3, 3);
+            }
+            f.cpu.cpu.legacy.cpl = 3;
+            f.fetch_pf(u64::from(OFFSET), LINEAR, 5);
+            let a = if model == CpuModel::I80386 { 0 } else { A };
+            assert_eq!(f.get(f.pde()), PT | 3 | a);
+            assert_eq!(f.get(f.pte()), DATA | 3 | a);
+        }
     }
 }

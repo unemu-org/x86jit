@@ -374,7 +374,9 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         if let Some(e) =
             tlb.entries[(linear >> 12) as usize & 63].filter(|e| e.page == linear >> 12)
         {
-            if !permitted(cpu, access, privilege, e.rights) {
+            if !permitted(cpu, access, privilege, e.rights)
+                && (cpu.machine_flags_mask == 0 || !set_accessed)
+            {
                 return Err(PageFault {
                     linear,
                     access,
@@ -383,9 +385,12 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
                 }
                 .exit(cpu));
             }
-            // Paging design §3.2: re-walk a clean read fill before D-setting.
+            // Paging design §§3.2–3.3: re-walk a clean read fill before D-setting
+            // and a 486 protection failure to perform both A updates.
             // SDM Vol 3A §5.10.2 permits eviction and observing edited tables.
-            if access != AccessKind::Write || e.translation.pte & DIRTY != 0 {
+            if permitted(cpu, access, privilege, e.rights)
+                && (access != AccessKind::Write || e.translation.pte & DIRTY != 0)
+            {
                 return Ok(Translation {
                     physical: (e.translation.physical & FRAME) | (linear & 0xfff),
                     bytes: u32::from(bytes).min(0x1000 - (linear & 0xfff)) as u8,
@@ -417,6 +422,12 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         // ASSUMED (paging design §3.3): 80386 PRM §5.2.4.3 p. 5-10
         // sets A before a page read/write but leaves failed walks unspecified.
         // A public CPU test suite falsified setting PDE.A with PTE.P=0.
+        // ASSUMED for I80386 (paging design §3.3): a public CPU test suite
+        // for the 386 falsified A updates on protection faults. Intel486 PRM
+        // §9.9.14 p. 9-21 requires both A bits on those faults on the 486.
+        if cpu.machine_flags_mask == 0 && !permitted(cpu, access, privilege, pde & pte) {
+            return Err(fault(true).exit(cpu));
+        }
         let pde = if set_accessed {
             let Some(pde) = table_or(
                 cpu,
@@ -434,8 +445,6 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         } else {
             pde
         };
-        // Intel486 PRM §9.9.14 p. 9-21 requires both A bits on operand
-        // protection faults. The same order on the 386 is ASSUMED policy (§3.3).
         let pte = if set_accessed {
             let Some(pte) = table_or(
                 cpu,
