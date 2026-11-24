@@ -1185,9 +1185,8 @@ fn iret_through_a_device_unblocks_at_completion_and_a_faulting_iret_unblocks() {
 }
 
 #[test]
-fn a_refused_iret_keeps_blocking() {
-    // 80386: IRETD to VM = 1 is refused with no effect (V86 is not
-    // supported); it does not end NMI blocking.
+fn iretd_into_v86_ends_nmi_blocking() {
+    // SDM Vol 2A IRET pp. 3-490–493: V86 entry ends NMI blocking.
     let (vm, mut cpu) = nmi_machine(
         CpuModel::I80386,
         true,
@@ -1202,15 +1201,12 @@ fn a_refused_iret_keeps_blocking() {
     vm.mem.write(sp, 0x1000, 4).unwrap();
     vm.mem.write(sp + 4, 8, 4).unwrap();
     vm.mem.write(sp + 8, 0x2_0002, 4).unwrap();
-    let before = cpu.cpu.clone();
     let (n, s) = stop(&mut cpu, &vm, 1);
-    assert!(
-        matches!(s, StepStop::Exit(Exit::UnsupportedSystemContext { .. })),
-        "{s:?}"
-    );
-    assert_eq!(n, 0);
-    assert_eq!(nmi_state(&cpu.cpu), nmi_state(&before));
-    assert!(!cpu.nmi_ready(), "still blocked");
+    assert!(matches!(s, StepStop::Exit(Exit::BudgetExhausted)), "{s:?}");
+    assert_eq!(n, 1);
+    assert_eq!(cpu.cpu.rflags_system & 0x20000, 0x20000);
+    assert_eq!(cpu.cpu.legacy.cpl, 3);
+    assert!(cpu.nmi_ready());
 }
 
 #[test]

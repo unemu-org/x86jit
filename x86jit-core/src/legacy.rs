@@ -250,7 +250,7 @@ pub fn derive_legacy_context(
     model: LegacyCpuModel,
     cpu: &CpuState,
 ) -> Result<MachineContext, MachineContextError> {
-    derive_context::<false>(model, cpu)
+    derive_context::<true>(model, cpu)
 }
 
 fn derive_context<const V86: bool>(
@@ -371,7 +371,6 @@ fn derive_context<const V86: bool>(
 
 // SDM Vol 3B §§23.2.1, 23.2.4 pp. 23-6–8; 386 PRM §§15.1–15.2
 // pp. 15-1–4: VM requires PE, CPL is 3, and the defaults are all 16 bits.
-// The public entry retains its refusal until V86 transfers are implemented.
 #[cold]
 fn virtual8086_context(
     model: LegacyCpuModel,
@@ -411,14 +410,6 @@ pub(crate) fn derive_virtual8086_context_for_test(
     if cpu.rflags_system & (1 << 17) == 0 {
         return Err(MachineContextError::Virtual8086Unsupported);
     }
-    derive_context::<true>(model, cpu)
-}
-
-#[cfg(feature = "test-hooks")]
-pub(crate) fn derive_transfer_context_for_test(
-    model: LegacyCpuModel,
-    cpu: &CpuState,
-) -> Result<MachineContext, MachineContextError> {
     derive_context::<true>(model, cpu)
 }
 
@@ -568,6 +559,7 @@ impl CpuState {
         } = selector;
         proposed.legacy.segments[segment as usize] = cache;
         if proposed.legacy.cr0 & 1 != 0
+            && proposed.rflags_system & (1 << 17) == 0
             && matches!(segment, SegmentId::Cs | SegmentId::Ss)
             && selector & 3 != u16::from(proposed.legacy.cpl)
         {
@@ -843,10 +835,7 @@ mod tests {
                 ),
                 (16, 16, 16, 3)
             );
-            assert_eq!(
-                derive_legacy_context(model, &cpu),
-                Err(MachineContextError::Virtual8086Unsupported)
-            );
+            assert_eq!(derive_legacy_context(model, &cpu).unwrap(), v86);
             let checkpoint = cpu.clone();
             cpu.legacy.cr0 |= 1 << 31;
             assert!(derive_context::<true>(model, &cpu).unwrap().paging_enabled);

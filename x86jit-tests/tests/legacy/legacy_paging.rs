@@ -2730,23 +2730,40 @@ fn step4_equal_task_cr3_load_observes_pte_written_by_outgoing_save() {
     // pp. 10-10–11: save with the outgoing translation, reload CR3, then
     // translate incoming descriptors. Engine policy flushes equal CR3 too.
     for model in MODELS {
-        let mut f = Fixture::new(model, true, 0);
-        f.incoming_task(OTHER_PD, false);
-        f.put(0x1501c, PD as u32 | 0x18);
-        // TSS.EIP aliases PTE[6]. Saving next IP 17407h remaps the GDT
-        // from frame 12000h to 17000h, where DS has a different base.
-        f.cpu.cpu.legacy.tr.cache.base = BASE + 0x7ff8;
-        f.system_page(8, PT, 3);
-        f.cpu.cpu.gpr[0] = u64::from(PT | 3); // preserve PTE[8]
-        f.cpu.cpu.gpr[1] = 0x15003; // preserve incoming TSS PTE[9]
-        f.code_mapping(0x17000, CODE_FRAME);
-        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xea, 0, 0, 0, 0, 0x20, 0])
-            .unwrap();
-        f.fetch_at(0x17400).unwrap();
-        assert_eq!(f.get(u64::from(PT + 6 * 4)) & 0xfffff000, 0x17000);
-        assert_eq!(f.cpu.cpu.legacy.segments[1].base, BASE + 0x10000);
-        assert_eq!(f.cpu.cpu.rip, 0x900);
-        assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+        for v86 in [false, true] {
+            for incoming_pte in [0, 0x18003] {
+                let mut f = Fixture::new(model, true, 0);
+                f.incoming_task(OTHER_PD, false);
+                f.put(0x1501c, PD as u32 | 0x18);
+                f.put(0x15024, if v86 { 0x20002 } else { 2 });
+                // TSS.EIP aliases PTE[6]. Saving next IP 17407h remaps the GDT
+                // from frame 12000h to 17000h, where DS has a different base.
+                f.cpu.cpu.legacy.tr.cache.base = BASE + 0x7ff8;
+                f.system_page(8, PT, 3);
+                // Preserve PTE[8]; the ECX save removes or redirects TSS PTE[9].
+                f.cpu.cpu.gpr[0] = u64::from(PT | 3);
+                f.cpu.cpu.gpr[1] = incoming_pte;
+                f.code_mapping(0x17000, CODE_FRAME);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xea, 0, 0, 0, 0, 0x20, 0])
+                    .unwrap();
+                f.fetch_at(0x17400).unwrap();
+                assert_eq!(f.get(u64::from(PT + 6 * 4)) & 0xfffff000, 0x17000);
+                assert_eq!(f.get(u64::from(PT + 9 * 4)), incoming_pte as u32);
+                assert_eq!(f.cpu.cpu.gpr[0], 0xabcdef);
+                assert_eq!(f.cpu.cpu.task_io_map_base, 0x80);
+                assert_eq!(
+                    f.cpu.cpu.rflags_system & 0x20000,
+                    if v86 { 0x20000 } else { 0 }
+                );
+                assert_eq!(f.cpu.cpu.legacy.cpl, if v86 { 3 } else { 0 });
+                assert_eq!(
+                    f.cpu.cpu.legacy.segments[1].base,
+                    if v86 { 0x100 } else { BASE + 0x10000 }
+                );
+                assert_eq!(f.cpu.cpu.rip, 0x900);
+                assert_eq!(f.cpu.cpu.legacy.tr.selector, 32);
+            }
+        }
     }
 }
 

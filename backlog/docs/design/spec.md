@@ -2360,6 +2360,70 @@ not modelled. p. 2 gives both "195 clocks" and "190 clocks with no wait
 states"; neither is modelled, with the rest of the timing model. Word
 registers keep their bits above 15 as any 16-bit write does.
 
+**386/486 virtual-8086 mode.** Normal Machine entry on `I80386`,
+`I80486Dx` and `I80486DxCpuid` accepts coherent VM=1 images. The regime is
+selected from existing CR0.PE and EFLAGS.VM, with CPL=3, Checked segmentation,
+and 16-bit operand, address and stack defaults. The 286 and 8086 families
+have no V86 regime. Application profiles retain their existing contract.
+Sources and historical-manual conflicts are recorded in [v86.md](v86.md)
+§§1–2, with accepted decisions in §9: SDM Vol 3B §§23.2–23.3 pp. 23-5–17;
+80386 PRM Ch. 15 pp. 15-1–13; Intel486 PRM Ch. 23 pp. 23-1–15.
+
+An embedder supplying VM=1 must also supply PE=1, CPL=3, reset_fetch=0,
+and all six canonical segment caches: base=selector<<4, limit=FFFFh,
+attributes=009Bh for CS and 0093h for DS/ES/SS/FS/GS, unusable=0 and reserved=0.
+These attributes are internal labels (ASSUMED), not descriptor permissions.
+Entry validates rather than repairs the image; inconsistent storage or CPL
+returns a typed `InvalidLegacyContext` error. No TSS is required just to execute
+ordinary V86 instructions. Boundary checkpoints restore these fields together;
+CpuState copies with pending mid-instruction task/page/event continuations
+remain unsupported (decision-24). No CpuState or JIT ABI field is added.
+
+CPL-0 IRETD with NT=0 and VM=1 in its image reads nine dwords:
+EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS. It checks the full old-stack frame
+and EIP<=FFFFh before installing fresh canonical caches, full ESP, CPL=3 and
+model-filtered flags including VM/IOPL/RF. Selectors use their low words.
+An IRET already in V86 at IOPL=3 uses three slots and remains there even with
+NT=1; IOPL<3 faults before stack access. Protected NT returns instead follow
+the existing task backlink. SDM Vol 2A IRET pp. 3-491–493.
+
+A 32-bit TSS image with VM=1 enters V86 through JMP, CALL, a task gate or a
+nested-task return. VM loads before segment interpretation, CPL becomes 3
+independently of CS.RPL, and the six paragraph values bypass descriptor
+checks. LDTR remains validated system state; CR3, busy/backlink/NT, TS,
+error pushes and the committed-task fault boundary keep their task-switch
+contracts. A 16-bit TSS clears upper EFLAGS, including VM. A task gate from
+V86 saves VM and the six selectors in the outgoing TSS, without a nine-slot
+stack frame or data-cache nulling; NT IRET can restore that V86 task.
+SDM Vol 3B §§23.2.5, 23.3.1.3 pp. 23-8–9, 23-14; 386 PRM §15.3.1 p. 15-6;
+486 PRM §23.3.1 p. 23-6.
+
+V86 interrupts/exceptions use the protected IDT under the existing delivery
+policy. Supported 32-bit interrupt/trap gates target nonconforming DPL-0 code,
+use the current TSS ring-0 stack (either TSS width), save nine dwords plus
+an optional error code, clear live VM/NT/RF/TF, and null DS/ES/FS/GS caches.
+16-bit interrupt/trap gates retain a typed unsupported-operation boundary.
+Task gates use the task contract above. Implicit system accesses are supervisor;
+V86 fetches and operands are user accesses. Paging precedes physical A20/bus
+gating; segment operands never wrap at 64 KiB. Port I/O always consults the
+live TSS bitmap, even at IOPL=3. SDM Vol 3B §§23.2.3–23.2.8, 23.3.1
+pp. 23-7–13. Other instruction rules and flags are in v86.md §2.
+
+I80386 external numeric-error Asserted notifications retire no additional
+instruction; Waiting holds leave the numeric instruction unretired. The board
+may inject its chosen IRQ through the V86 protected IDT. Acknowledgement does
+not clear x87 status. 386 PRM §§11.1.2, 11.1.5.3 pp. 11-1, 11-4; §15.6
+p. 15-12; [fpu-error-routing.md](fpu-error-routing.md). Both 486 entries retain
+the AM+AC alignment-check refusal and their existing internal-only numeric
+routing limitation; VME/CR4/VIF/VIP remain outside these models.
+
+Held task/page/event continuations own VM and all six segment caches alongside
+their existing inputs. Edited inputs abandon replay under decision-24;
+zero-budget probes consume neither ownership nor completion inputs. Successful
+transfers retire exactly once; architectural faults, hardware deliveries and
+numeric holds do not add retired instructions. Delivery logs retain the
+outgoing origin and report VM before/after completion (v86.md §5).
+
 **386/486 paging.** `I80386`, `I80486Dx` and `I80486DxCpuid` support
 CR0.PG through normal Machine entry and guest MOV CR0. PG requires PE;
 PG=1/PE=0 raises #GP(0) before the control write commits. The 80286 and
@@ -2538,7 +2602,7 @@ unchanged and the instruction or event replays.
   Task gates and TSSs named by CALL and JMP switch tasks as before
   (decision-24); RETF and RETF n from the called procedure are the outward
   return above.
-- **Still refused:** a VM image, the 386 TSS T bit, LOADALL with a
+- **Still refused:** the 386 TSS T bit, LOADALL with a
   CS DPL of 1-3 and an inward call-gate CALL
   whose frame copy exceeds the retry ledger. `LegacyPrivilegeTransition`
   and `LegacyGateOrTaskTransfer` are no longer produced.
@@ -2589,9 +2653,9 @@ The source rows that disagree, and the engine's choice (decisions O1-O14):
 - **VM = 1 in an IRET image at CPL > 0.** 386 PRM §17 IRET p. 17-74 goes to
   STACK-RETURN-TO-V86 whenever the image has VM = 1; SDM Vol 2A IRET
   p. 3-492 requires "tempEFLAGS(VM) = 1 and CPL = 0" and otherwise takes the
-  protected-mode return, ignoring VM. The engine keeps the typed refusal
-  `InvalidLegacyContext(Virtual8086Unsupported)` at any CPL (the
-  maintainer's decision, 2026-11-18), as for a VM image in a task.
+  protected-mode return, ignoring VM. The engine follows the SDM rule
+  (V86 design §9, superseding the intermediate refusal). At CPL 0 a dword
+  return can enter V86; a word return cannot.
 - **ESP after a 16-bit outward return.** The SDM pops tempESP with "16-bit
   pop; clear upper bits" and assigns ESP := tempESP (IRET pp. 3-493-494;
   RET p. 4-573), so the engine zero-extends SP into ESP. Processors that

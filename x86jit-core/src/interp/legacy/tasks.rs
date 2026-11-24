@@ -14,8 +14,6 @@ pub(crate) enum Cause {
 
 #[derive(Clone, Default)]
 pub(crate) struct SwitchState {
-    #[cfg(feature = "test-hooks")]
-    pub allow_virtual8086: bool,
     pub committed: bool,
     pub completed: bool,
     pending: Option<Pending>,
@@ -91,8 +89,6 @@ impl SwitchState {
     pub fn reset(&mut self) {
         *self = Self {
             record_regs: self.record_regs,
-            #[cfg(feature = "test-hooks")]
-            allow_virtual8086: self.allow_virtual8086,
             ..Self::default()
         };
     }
@@ -105,18 +101,27 @@ enum Completion {
     Write,
 }
 #[derive(Clone)]
-struct Owner {
+pub(crate) struct Owner {
     cpu: Box<CpuState>,
     completion: Completion,
 }
 impl Owner {
-    fn new(cpu: &CpuState) -> Self {
+    pub(crate) fn new(cpu: &CpuState) -> Self {
         Self {
             cpu: Box::new(cpu.clone()),
             completion: Completion::None,
         }
     }
-    fn matches(&self, cpu: &CpuState) -> bool {
+    pub(crate) fn at_exit(cpu: &CpuState, exit: &Exit) -> Self {
+        let mut owner = Self::new(cpu);
+        owner.completion = match exit {
+            Exit::MmioRead { .. } => Completion::Read,
+            Exit::MmioWrite { .. } => Completion::Write,
+            _ => Completion::None,
+        };
+        owner
+    }
+    pub(crate) fn matches(&self, cpu: &CpuState) -> bool {
         // Exhaustive destructuring makes appended CPU state part of the owner
         // contract. Only the completion requested by this exit may differ.
         macro_rules! same_fields {
@@ -525,7 +530,7 @@ fn start<const ROUTED: bool, const ORDER: u8>(
             // §9.8.14.1 p. 9-18 likewise assigns TSS-driven descriptor/LDT
             // check faults to the new task's IP. Preflight avoids a fault
             // halfway through establishing that context.
-            paging::task_image(cpu, mem, incoming)?;
+            paging::task_resident(cpu, mem, incoming)?;
         }
         // Acquire with the same locked, A20-gated byte CAS as LTR. Retry the
         // whole descriptor validation if another CPU changes the access byte.
@@ -707,10 +712,13 @@ fn save_image(
 /// invalid. Normal entry validation deliberately rejects such intermediate state.
 pub(crate) fn fault_context(cpu: &CpuState, generation: CpuGeneration) -> MachineContext {
     MachineContext {
-        // A task switch loads protected-mode state.
         segment_class: crate::SegmentClass::Checked,
         generation,
-        regime: legacy::MachineRegime::Protected,
+        regime: if cpu.rflags_system & (1 << 17) != 0 {
+            legacy::MachineRegime::Virtual8086
+        } else {
+            legacy::MachineRegime::Protected
+        },
         default_operand_bits: if cpu.legacy.segments[0].attributes & 0x4000 != 0 {
             32
         } else {
@@ -882,16 +890,25 @@ impl Pending {
                     cpu.task_io_map_base = image.io_map_base;
                     cpu.task_debug_trap = image.debug_trap;
                     cpu.legacy.cr0 |= 8;
+                    // SDM Vol 3B §23.2.5 pp. 23-8–9; 386 PRM §15.3.1
+                    // p. 15-6; 486 PRM §23.3.1 p. 23-6: VM is loaded before
+                    // segments. Only a 32-bit TSS contains its flag image.
                     if image.flags & (1 << 17) != 0 {
-                        return Err(refusal(
-                            cpu,
-                            crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                                legacy::MachineContextError::Virtual8086Unsupported,
-                            ),
-                        ));
+                        cpu.legacy.cpl = 3;
+                        cpu.legacy.reset_fetch = 0;
+                        for segment in [
+                            SegmentId::Cs,
+                            SegmentId::Ds,
+                            SegmentId::Es,
+                            SegmentId::Ss,
+                            SegmentId::Fs,
+                            SegmentId::Gs,
+                        ] {
+                            reload_virtual8086(cpu, segment, selector(cpu, segment));
+                        }
                     }
-                    // The incoming CPL is CS.RPL, at any level: the segment
-                    // loads below check CS, SS and the data DPLs against it
+                    // For VM=0 the incoming CPL is CS.RPL: descriptor loads
+                    // below check CS, SS and the data DPLs against it
                     // (286 PRM App. B SWITCH_TASKS p. B-13; 386 PRM
                     // Table 7-1 p. 7-9).
                     self.stage = Stage::Ldt;
@@ -954,7 +971,9 @@ impl Pending {
                             Stage::Ip
                         };
                     } else {
-                        load_segment(cpu, mem, self.context.generation, order[i], self.ext)?;
+                        if cpu.rflags_system & (1 << 17) == 0 {
+                            load_segment(cpu, mem, self.context.generation, order[i], self.ext)?;
+                        }
                         self.stage = Stage::Segment(i + 1);
                     }
                 }

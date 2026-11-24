@@ -860,7 +860,7 @@ fn iret_to_an_outer_ring_restores_nt_tf_and_the_386_rf() {
             );
             steps(&mut cpu, &vm, 1);
             assert_eq!(cpu.cpu.rflags_system & 0x10000, 0x10000);
-            // A frame with VM = 1 keeps its refusal.
+            // SDM Vol 2A IRET pp. 3-492–493: a VM image selects V86 entry.
             let (vm, mut cpu) = world(model, 0, b"\x66\xcf", ExceptionDelivery::Outward);
             outer_frame(
                 &vm,
@@ -872,13 +872,10 @@ fn iret_to_an_outer_ring_restores_nt_tf_and_the_386_rf() {
                 0x7000,
                 U_DATA,
             );
-            refused(
-                &mut cpu,
-                &vm,
-                UnsupportedSystemOperation::InvalidLegacyContext(
-                    x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
-                ),
-            );
+            steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.legacy.cpl, 3);
+            assert_eq!(cpu.cpu.rflags_system & 0x20000, 0x20000);
+            assert_eq!(cpu.cpu.rip, 0x1234);
         }
     }
 }

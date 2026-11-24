@@ -1,4 +1,4 @@
-//! Stack transfers for internal V86 execution (design v86 §§4.2–4.3).
+//! Stack transfers for V86 execution (design v86 §§4.2–4.3).
 use super::*;
 
 /// A frame read whose value can select a different return personality.
@@ -42,21 +42,7 @@ pub(super) fn enter<const ROUTED: bool, const ORDER: u8>(
     ip: u64,
     cs: u16,
     image: u32,
-    task_switch: &tasks::SwitchState,
 ) -> Result<(), Exit> {
-    #[cfg(not(feature = "test-hooks"))]
-    let allowed = false;
-    #[cfg(feature = "test-hooks")]
-    let allowed = task_switch.allow_virtual8086;
-    let _ = task_switch;
-    if !allowed {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::InvalidLegacyContext(
-                legacy::MachineContextError::Virtual8086Unsupported,
-            ),
-        ));
-    }
     pop_frame_limit(cpu, mem, context, 9, 4)?;
     let esp = peek_frame(cpu, mem, context, 3, 4)?;
     let ss = peek_frame(cpu, mem, context, 4, 4)? as u16;
@@ -120,7 +106,6 @@ pub(super) fn iret<const ROUTED: bool, const ORDER: u8>(
 
 #[cold]
 #[inline(never)]
-#[cfg(feature = "test-hooks")]
 pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,
     cpu: &mut CpuState,

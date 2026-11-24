@@ -1580,6 +1580,10 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     task_switch: &mut tasks::SwitchState,
     retry: &mut Option<Transaction>,
 ) -> Result<(), Exit> {
+    // A preflight fault belongs to this delivery, even after a previous task
+    // completed. Match the unpaged delivery's per-attempt completion boundary.
+    task_switch.committed = false;
+    task_switch.completed = false;
     loop {
         if retry.as_ref().is_some_and(|tx| !tx.matches_memory(memory)) {
             return Err(refusal(
@@ -1633,8 +1637,6 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             tx.preparing = false;
             tx.read_cursor = 0;
         }
-        task_switch.committed = false;
-        task_switch.completed = false;
         let before_commit = cpu.clone();
         let mut result = if task_switch.context().is_some() {
             tasks::resume(cpu, &mem.address_keyed(), task_switch)
@@ -1806,11 +1808,11 @@ pub(super) fn task_cr3_loaded<const ROUTED: bool, const ORDER: u8>(
 
 #[cold]
 #[inline(never)]
-pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
+pub(super) fn task_resident<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     tss: legacy::SystemSegment,
-) -> Result<(tasks::Image, Option<u32>), Exit> {
+) -> Result<(), Exit> {
     // SDM Vol 3A §10.3 step 5 p. 10-10: the entire incoming TSS image
     // must be resident before saves/TR. Cover static fields as well as the
     // register fields below; do not read unused fields from devices.
@@ -1825,6 +1827,45 @@ pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
             false,
         )?;
     }
+    // Plans are keyed by exact span. Retain each image read's translation
+    // across outgoing saves that can overwrite the incoming TSS's PTE.
+    let mut field = |offset, size| {
+        plan(
+            cpu,
+            &mem.system(),
+            u64::from(tss.cache.base.wrapping_add(offset)),
+            size,
+            AccessKind::Read,
+            false,
+        )
+        .map(|_| ())
+    };
+    if tasks::wide(tss) {
+        // 386 PRM §7.1 Fig. 7-1 pp. 7-2–3: CR3, EIP, EFLAGS,
+        // eight GPRs, six selectors, LDTR, T and I/O-map base.
+        for offset in (0x1c..0x48).step_by(4) {
+            field(offset, 4)?;
+        }
+        for offset in (0x48..=0x60).step_by(4).chain([0x64, 0x66]) {
+            field(offset, 2)?;
+        }
+    } else {
+        // 286 PRM §8.2 Fig. 8-1 pp. 8-2–3: IP through LDTR.
+        for offset in (0x0e..0x2c).step_by(2) {
+            field(offset, 2)?;
+        }
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    tss: legacy::SystemSegment,
+) -> Result<(tasks::Image, Option<u32>), Exit> {
+    task_resident(cpu, mem, tss)?;
     // 80386 PRM §7.1 Fig. 7-1 pp. 7-2–3; §7.5 p. 7-8:
     // CR3 is a static incoming field, read through the outgoing address space.
     let cr3 = if tasks::wide(tss) {

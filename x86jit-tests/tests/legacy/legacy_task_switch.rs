@@ -841,24 +841,15 @@ fn full_386_registers_and_static_tss_fields_survive() {
 }
 
 #[test]
-fn typed_refusals_for_v86_and_task_debug_trap() {
+fn v86_task_admission_and_task_debug_refusal() {
     // VM exists only in a 386 TSS image. A task whose CS.RPL is 1–3 is no
     // longer refused: a_task_with_cs_rpl_3_runs_at_cpl_3_or_faults_on_its_segments.
     for (model, wide) in formats().into_iter().filter(|&(_, wide)| wide) {
         let (vm, mut cpu) = setup_tasks(model, wide, &far(false, B));
         put(&vm, base(B) + 0x24, 4, 0x20002);
-        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        let StepStop::Exit(Exit::UnsupportedSystemContext { operation, .. }) = run.stop() else {
-            panic!("{:?}", run.stop())
-        };
-        assert_eq!(
-            *operation,
-            x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
-                x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
-            )
-        );
-        // Incoming state is read only after acquiring B and saving A.
-        // Unsupported incoming execution is reported at that committed boundary.
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.legacy.cpl, 3);
+        assert_eq!(cpu.cpu.rflags_system & 0x20000, 0x20000);
         assert_eq!(
             (cpu.cpu.legacy.tr.selector, cpu.cpu.rip, cpu.cpu.legacy.cr0),
             (B, 0x1800, 9)
@@ -2372,34 +2363,16 @@ fn a_task_with_cs_rpl_3_runs_at_cpl_3_or_faults_on_its_segments() {
 }
 
 #[test]
-fn review4_image_refusals_keep_committed_state_until_input_is_corrected() {
-    // An image with CS.RPL 3 now runs at CPL 3; only VM = 1 is refused.
-    let wide = true;
-    let (vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &far(true, B));
-    let (offset, size, bad, good, operation) = (
-        0x24,
-        4,
-        0x20002,
-        2,
-        x86jit_core::UnsupportedSystemOperation::InvalidLegacyContext(
-            x86jit_core::legacy::MachineContextError::Virtual8086Unsupported,
-        ),
-    );
-    put(&vm, base(B) + offset, size, bad);
-    expect_task_refusal(&mut cpu, &vm, operation);
-    assert_eq!(cpu.cpu.legacy.tr.selector, B);
-    put(&vm, base(B) + offset, size, good);
+fn vm_task_images_enter_with_canonical_segments() {
+    // SDM Vol 3B §23.2.5 pp. 23-8–9 supersedes the intermediate VM refusal.
+    let (vm, mut cpu) = setup_tasks(CpuModel::I80386, true, &far(true, B));
+    put(&vm, base(B) + 0x24, 4, 0x20002);
     steps(&mut cpu, &vm, 1);
     assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1800));
-    assert_eq!(
-        value(
-            &vm,
-            base(A) + if wide { 0x20 } else { 0x0e },
-            if wide { 4 } else { 2 }
-        ),
-        0x100b
-    );
-    assert_eq!(cpu.cpu.rflags_system & 0x4000, 0x4000);
+    assert_eq!(cpu.cpu.legacy.cpl, 3);
+    assert_eq!(cpu.cpu.rflags_system & 0x24000, 0x24000);
+    assert_eq!(cpu.cpu.legacy.segments[0].base, u32::from(CODE) << 4);
+    assert_eq!(value(&vm, base(A) + 0x20, 4), 0x100b);
 }
 
 #[test]

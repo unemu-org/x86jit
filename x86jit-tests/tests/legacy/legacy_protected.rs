@@ -93,17 +93,6 @@ fn fault(cpu: &mut Vcpu, vm: &Vm, vector: u8, code: u32) {
     assert_eq!(details.error_code().bit(16), None);
     assert_eq!(format!("{:?}", cpu.cpu), before);
 }
-fn refused(cpu: &mut Vcpu, vm: &Vm, operation: UnsupportedSystemOperation) {
-    let before = format!("{:?}", cpu.cpu);
-    let run = cpu.run_steps(vm, 1, StepOptions::default()).unwrap();
-    assert_eq!(run.steps(), 0);
-    assert!(
-        matches!(run.stop(), StepStop::Exit(Exit::UnsupportedSystemContext { operation: op, .. }) if *op == operation),
-        "{:?}",
-        run.stop()
-    );
-    assert_eq!(format!("{:?}", cpu.cpu), before);
-}
 
 #[test]
 fn enter_use32_reload_all_caches_execute_and_return_to_real_in_step_slices_cpu_model() {
@@ -711,12 +700,12 @@ fn protected_strings_stack_and_far_pointers_use_the_same_access_boundary() {
 }
 
 #[test]
-fn iret_checks_task_return_and_refuses_v86_before_changing_the_frame_cpu_model() {
-    model_api::with_cpu_model(iret_checks_task_return_and_refuses_v86_before_changing_the_frame);
+fn iret_checks_task_return_and_enters_v86_before_descriptor_checks_cpu_model() {
+    model_api::with_cpu_model(iret_checks_task_return_and_enters_v86_before_descriptor_checks);
 }
 
 #[test]
-fn iret_checks_task_return_and_refuses_v86_before_changing_the_frame() {
+fn iret_checks_task_return_and_enters_v86_before_descriptor_checks() {
     // Decision-18 §2; SDM Vol 2A §3.3 IRET; PRM §17 pp. 17-74, 17-78.
     let (vm, mut cpu) = setup(b"\xcf", true, false);
     descriptor(&vm, 8, 0, 0xffff, 0x9a);
@@ -726,13 +715,10 @@ fn iret_checks_task_return_and_refuses_v86_before_changing_the_frame() {
     vm.write_bytes(0x8000, b"\x00\x12\x00\x00\x08\x00\x00\x00")
         .unwrap();
     vm.write_bytes(0x8008, &0x20002u32.to_le_bytes()).unwrap();
-    refused(
-        &mut cpu,
-        &vm,
-        UnsupportedSystemOperation::InvalidLegacyContext(
-            x86jit_core::MachineContextError::Virtual8086Unsupported,
-        ),
-    );
+    steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.legacy.cpl, 3);
+    assert_eq!(cpu.cpu.rflags_system & 0x20000, 0x20000);
+    assert_eq!(cpu.cpu.rip, 0x1200);
     assert_eq!(value(&vm, 0x200d, 1), 0x9a);
 }
 
@@ -846,16 +832,14 @@ fn far_call_mmio_frame_retry_finishes_the_consumed_instruction_after_self_modifi
 }
 
 #[test]
-fn far_call_mmio_frame_retry_survives_context_eviction_after_self_modification_cpu_model() {
-    model_api::with_cpu_model(
-        far_call_mmio_frame_retry_survives_context_eviction_after_self_modification,
-    );
+fn far_call_mmio_frame_retry_abandons_after_descriptor_cache_edit_cpu_model() {
+    model_api::with_cpu_model(far_call_mmio_frame_retry_abandons_after_descriptor_cache_edit);
 }
 
 #[test]
-fn far_call_mmio_frame_retry_survives_context_eviction_after_self_modification() {
-    // SDM Vol 2A §3.3 CALL; decision-16 §3: the consumed instruction and
-    // completed transfers survive context churn while its frame write is pending.
+fn far_call_mmio_frame_retry_abandons_after_descriptor_cache_edit() {
+    // SDM Vol 2A §3.3 CALL; decision-16 §3 / decision-24: an edited
+    // descriptor cache abandons the consumed instruction and its transfers.
     let code = b"\x9a\x00\x12\x00\x00\x08\x00";
     let (mut vm, mut cpu) = setup(code, true, true);
     vm.unmap(0, 0x40000).unwrap();
@@ -880,38 +864,44 @@ fn far_call_mmio_frame_retry_survives_context_eviction_after_self_modification()
     let parts = cpu.cpu.mmio_parts;
     let parts_len = cpu.cpu.mmio_parts_len;
     assert!(parts_len > 0);
+    cpu.complete_mmio_write();
     vm.set_fetch_policy(Box::new(|_| x86jit_core::FetchVerdict::DenyNotPresent));
     let original_base = cpu.cpu.legacy.segments[1].base;
-    for base in 1..=16 {
-        cpu.cpu.legacy.segments[1].base = original_base + base;
-        let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert_eq!(run.steps(), 0);
-        assert!(
-            matches!(run.stop(), StepStop::Exit(Exit::UnmappedMemory { .. })),
-            "{:?}",
-            run.stop()
-        );
-        assert_eq!(
-            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
-            (16, 0x1000, 0x1004)
-        );
-        assert!(cpu.cpu.mmio_retry_active);
-        assert_eq!(
-            (cpu.cpu.mmio_retry_cs, cpu.cpu.mmio_parts_rip),
-            (16, 0x1000)
-        );
-        assert_eq!(cpu.cpu.mmio_parts_len, parts_len);
-        assert_eq!(cpu.cpu.mmio_parts, parts);
-        assert!(!cpu.cpu.pending_mmio_write);
-    }
+    cpu.cpu.legacy.segments[1].base = original_base + 1;
+    let run = cpu.run_steps(&vm, 0, StepOptions::default()).unwrap();
+    assert_eq!(run.steps(), 0);
+    assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+    assert!(cpu.cpu.mmio_retry_active);
+    assert_eq!(cpu.cpu.mmio_parts_len, parts_len);
+    assert_eq!(cpu.cpu.mmio_parts, parts);
+    assert!(cpu.cpu.pending_mmio_write);
+    let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    assert_eq!(run.steps(), 0);
+    assert!(
+        matches!(run.stop(), StepStop::Exit(Exit::UnmappedMemory { .. })),
+        "{:?}",
+        run.stop()
+    );
+    assert!(!cpu.cpu.mmio_retry_active);
+    assert_eq!(cpu.cpu.mmio_parts_len, 0);
+    assert!(!cpu.cpu.pending_mmio_write);
+    assert_eq!(
+        (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+        (16, 0x1000, 0x1004)
+    );
+    assert_eq!(cpu.retired_instructions(), 0);
+    // The committed first push remains, but restoring the cache cannot
+    // resurrect the abandoned CALL or its completion.
+    assert_eq!(value(&vm, 0x1000, 4), 16);
     cpu.cpu.legacy.segments[1].base = original_base;
     vm.set_fetch_policy(Box::new(|_| x86jit_core::FetchVerdict::Allow));
-    cpu.complete_mmio_write();
+    vm.write_bytes(0x1000, b"\xb8\x78\x56\x34\x12").unwrap();
     steps(&mut cpu, &vm, 1);
     assert_eq!(
         (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
-        (8, 0x1200, 0xffc)
+        (16, 0x1005, 0x1004)
     );
+    assert_eq!(cpu.cpu.gpr[0], 0x12345678);
     assert_eq!(cpu.retired_instructions(), 1);
     assert!(!cpu.cpu.mmio_retry_active);
     assert_eq!(cpu.cpu.mmio_parts_len, 0);

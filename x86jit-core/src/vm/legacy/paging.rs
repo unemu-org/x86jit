@@ -440,21 +440,25 @@ impl Vcpu {
             execution.rep_flags = None;
         }
         let state = execution.paging.get_or_insert_with(Default::default);
-        let execute = execute_retained::<ROUTED, ORDER>;
-        #[cfg(feature = "test-hooks")]
-        let execute = if context.regime == MachineRegime::Virtual8086 {
-            crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER, true>
+        let result = if context.regime == MachineRegime::Virtual8086 {
+            crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER, true>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+                &mut state.transaction,
+            )
         } else {
-            execute
+            execute_retained::<ROUTED, ORDER>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+                &mut state.transaction,
+            )
         };
-        let result = execute(
-            ir,
-            &mut self.cpu,
-            &vm.mem,
-            context,
-            &mut execution.task_switch,
-            &mut state.transaction,
-        );
         let outcome = result.map(|(outcome, input)| {
             state.port_input = input;
             if outcome.context_changed || outcome.translations_invalidated {

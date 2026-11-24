@@ -495,6 +495,7 @@ pub(super) struct Execution {
     stall_retired: u64,
     stall_count: u32,
     paging: Option<Box<paging::State>>,
+    event_owner: Option<crate::interp::legacy::tasks::Owner>,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -522,6 +523,7 @@ impl Execution {
             #[cfg(test)]
             lifts: 0,
             event_retry: None,
+            event_owner: None,
             handoff_service: 0,
             shutdown: false,
             pending_a20_enabled: None,
@@ -543,6 +545,7 @@ impl Execution {
     }
     pub(super) fn reset_execution_state(&mut self) {
         self.event_retry = None;
+        self.event_owner = None;
         self.rep_flags = None;
         self.rep_restart20 = None;
         self.nec_escape = None;
@@ -780,17 +783,26 @@ impl Execution {
         } else {
             self.rep_flags = None;
         }
-        let execute = crate::interp::legacy::execute_checked::<ROUTED, ORDER>;
-        #[cfg(feature = "test-hooks")]
-        let execute = if ir
+        let progress = if ir
             .legacy_context
             .is_some_and(|c| c.regime == MachineRegime::Virtual8086)
         {
-            crate::interp::legacy::virtual8086::execute_block::<ROUTED, ORDER>
+            crate::interp::legacy::virtual8086::execute_block::<ROUTED, ORDER>(
+                ir,
+                cpu,
+                memory,
+                scratch,
+                &mut self.task_switch,
+            )
         } else {
-            execute
+            crate::interp::legacy::execute_checked::<ROUTED, ORDER>(
+                ir,
+                cpu,
+                memory,
+                scratch,
+                &mut self.task_switch,
+            )
         };
-        let progress = execute(ir, cpu, memory, scratch, &mut self.task_switch);
         if let Some(saved) = self.rep_flags.as_mut() {
             let fault = progress.outcome.as_ref().is_some_and(|outcome| {
                 outcome.as_ref().is_err_and(|exit| {
@@ -1610,7 +1622,7 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Internal transfer witnesses only; normal Machine entry keeps refusing VM=1.
+    /// Compatibility alias for transfer witnesses; uses normal Machine entry.
     #[doc(hidden)]
     #[cfg(feature = "test-hooks")]
     pub fn run_virtual8086_steps_for_test(
@@ -1619,16 +1631,7 @@ impl Vcpu {
         max_steps: u64,
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
-        let execution = self
-            .legacy_execution
-            .as_mut()
-            .ok_or(StepRunError::UnsupportedMode)?;
-        execution.task_switch.allow_virtual8086 = true;
-        let result = self.run_steps(vm, max_steps, options);
-        let execution = self.legacy_execution.as_mut().unwrap();
-        execution.task_switch.allow_virtual8086 = false;
-        execution.validated = None;
-        result
+        self.run_steps(vm, max_steps, options)
     }
 
     /// Hand an outward exception back to the internal V86 delivery seam.
@@ -1677,20 +1680,11 @@ impl Vcpu {
         if self.cpu.task_debug_trap != 0 {
             return Err(self.unsupported_legacy(UnsupportedSystemOperation::LegacyTaskDebugTrap));
         }
-        let derive = derive_legacy_context;
-        #[cfg(feature = "test-hooks")]
-        let derive = if self
-            .legacy_execution
-            .as_ref()
-            .is_some_and(|e| e.task_switch.allow_virtual8086)
-        {
-            crate::legacy::derive_transfer_context_for_test
-        } else {
-            derive
-        };
-        let context = derive(model, &self.cpu).map_err(|e| Exit::UnsupportedSystemContext {
-            addr: self.cpu.rip,
-            operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
+        let context = derive_legacy_context(model, &self.cpu).map_err(|e| {
+            Exit::UnsupportedSystemContext {
+                addr: self.cpu.rip,
+                operation: UnsupportedSystemOperation::InvalidLegacyContext(e),
+            }
         })?;
         // I286 PRM §10.4 p. 10-6; 80386 PRM §10.2.3 p. 10-3:
         // reset may fetch through the retained high CS base.
@@ -1748,14 +1742,35 @@ impl Vcpu {
         // entry validation can reject its deliberately unfinished segment caches.
         // A zero-budget probe leaves continuations and completion inputs intact.
         if limit != Some(0)
-            && self
+            && (self
                 .legacy_execution
-                .as_mut()
+                .as_ref()
                 .unwrap()
-                .task_switch
-                .abandon_if_changed(&self.cpu)
+                .event_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.matches(&self.cpu))
+                || (self.cpu.mmio_retry_active
+                    && self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .instruction_retry
+                        .as_ref()
+                        .is_some_and(|retry| {
+                            !retry.stamp.matches(&self.cpu, self.legacy_model.unwrap())
+                                || retry.ip != self.cpu.rip
+                                || retry.mxcsr_mode
+                                    != self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK
+                        }))
+                || self
+                    .legacy_execution
+                    .as_mut()
+                    .unwrap()
+                    .task_switch
+                    .abandon_if_changed(&self.cpu))
         {
             self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+            self.legacy_execution.as_mut().unwrap().task_switch.reset();
             self.abandon_legacy_event();
             self.cpu.clear_mmio_parts();
             self.cpu.pending_mmio = None;
@@ -1867,6 +1882,11 @@ impl Vcpu {
                 .unwrap()
                 .task_switch
                 .seal_exit(&self.cpu, exit);
+            let execution = self.legacy_execution.as_mut().unwrap();
+            execution.event_owner = execution
+                .event_retry
+                .filter(|event| event.origin.vm)
+                .map(|_| crate::interp::legacy::tasks::Owner::at_exit(&self.cpu, exit));
         }
     }
 
@@ -2022,6 +2042,17 @@ impl Vcpu {
                         self.release_legacy_event_boundary();
                     }
                     if completed {
+                        if self.delivery_log.is_some()
+                            && (event.origin.vm || self.cpu.rflags_system & (1 << 17) != 0)
+                        {
+                            self.record_delivery(
+                                vector,
+                                delivery_kind(event.source),
+                                event.origin,
+                                error_code,
+                                Interrupted::Captured,
+                            );
+                        }
                         self.finish_legacy_event(event, Some(&exit));
                         return Err(exit);
                     }
@@ -2332,6 +2363,7 @@ impl Vcpu {
         // Clear private boundary state; architectural TF belongs to CpuState.
         let execution = self.legacy_execution.as_mut().unwrap();
         execution.event_retry = None;
+        execution.event_owner = None;
         execution.handoff_service &= !HANDOFF_DEBUG;
         self.sti_shadow = false;
         self.ss_shadow = 0;

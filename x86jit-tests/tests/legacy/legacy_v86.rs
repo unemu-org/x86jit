@@ -1,5 +1,5 @@
-//! Internal V86 execution and stack-transfer witnesses (v86 design §§2, 7 steps 1–3).
-//! Public admission stays gated. Architectural expectations use SDM Vol 3B §§23.2–23.3
+//! V86 execution and transfer witnesses (v86 design §§2, 7 steps 1–4).
+//! Architectural expectations use SDM Vol 3B §§23.2–23.3
 //! pp. 23-5–17, 386 PRM Ch. 15 pp. 15-1–13, and 486 PRM Ch. 23 pp. 23-1–15.
 #[path = "../support/descriptor_fixture.rs"]
 #[allow(dead_code)]
@@ -618,44 +618,82 @@ fn x87_environment_and_save_images_use_real_formats_at_both_sizes() {
 }
 
 #[test]
-fn public_entry_remains_refused_and_private_entry_validates_canonical_images() {
+fn public_entry_validates_embedder_supplied_canonical_images() {
     for model in MODELS {
-        let (vm, mut cpu) = world(model, &[0x90], 3);
-        let before = format!("{:?}", cpu.cpu);
-        let result = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert!(matches!(
-            result.stop(),
-            StepStop::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    MachineContextError::Virtual8086Unsupported
-                ),
-                ..
-            })
-        ));
-        assert_eq!(format!("{:?}", cpu.cpu), before);
-        assert_eq!(cpu.retired_instructions(), 0);
-        cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = u32::MAX;
-        assert!(matches!(
-            run(&mut cpu, &vm),
-            Err(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    MachineContextError::InvalidStorage
-                ),
-                ..
-            })
-        ));
-        cpu.cpu.legacy.segments[SegmentId::Ds as usize].limit = 0xffff;
-        cpu.cpu.legacy.cpl = 0;
-        assert!(matches!(
-            run(&mut cpu, &vm),
-            Err(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    MachineContextError::InvalidPrivilege
-                ),
-                ..
-            })
-        ));
+        let (vm, mut cpu) = world(model, &[0x90; 8], 3);
+        fixture::steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rip, 0x1001);
+        for segment in [
+            SegmentId::Cs,
+            SegmentId::Ds,
+            SegmentId::Es,
+            SegmentId::Ss,
+            SegmentId::Fs,
+            SegmentId::Gs,
+        ] {
+            let before = cpu.cpu.legacy.segments[segment as usize];
+            for edit in 0..5 {
+                let cache = &mut cpu.cpu.legacy.segments[segment as usize];
+                match edit {
+                    0 => cache.limit = u32::MAX,
+                    1 => cache.base += 16,
+                    2 => cache.attributes |= 0x4000,
+                    3 => cache.attributes ^= 1,
+                    _ => cache.unusable = 1,
+                }
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), 0);
+                assert!(matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext { .. })
+                ));
+                cpu.cpu.legacy.segments[segment as usize] = before;
+            }
+        }
+        for (segment, selector) in [(SegmentId::Cs, 0x10), (SegmentId::Ss, 0x20)] {
+            // V86 paragraph values need no RPL/CPL pairing, including through
+            // the public coherent cache setter (SDM Vol 3B §23.2 p. 23-5).
+            let cache = SegmentCache {
+                base: u32::from(selector) << 4,
+                limit: 0xffff,
+                attributes: if segment == SegmentId::Cs { 0x9b } else { 0x93 },
+                ..Default::default()
+            };
+            cpu.cpu
+                .set_legacy_segment(vm.legacy_cpu_model().unwrap(), segment, selector, cache)
+                .unwrap();
+        }
+        for (pe, cpl, reset, expected) in [
+            (1, 0, 0, MachineContextError::InvalidPrivilege),
+            (0, 0, 0, MachineContextError::Virtual8086Unsupported),
+            (1, 3, 1, MachineContextError::InvalidStorage),
+        ] {
+            cpu.cpu.legacy.cr0 = pe;
+            cpu.cpu.legacy.cpl = cpl;
+            cpu.cpu.legacy.reset_fetch = reset;
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::UnsupportedSystemContext {
+                operation: UnsupportedSystemOperation::InvalidLegacyContext(e), ..
+            }) if *e == expected),
+                "{:?}",
+                r.stop()
+            );
+        }
     }
+    let (vm, mut cpu) = world(CpuModel::I80286, &[0x90], 3);
+    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+    assert_eq!(r.steps(), 0);
+    assert!(matches!(
+        r.stop(),
+        StepStop::Exit(Exit::UnsupportedSystemContext {
+            operation: UnsupportedSystemOperation::InvalidLegacyContext(
+                MachineContextError::Virtual8086Unsupported
+            ),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -828,8 +866,7 @@ fn transfers(
     (vm, cpu)
 }
 fn transfer_run(cpu: &mut Vcpu, vm: &Vm, steps: u64) -> x86jit_core::StepRun {
-    cpu.run_virtual8086_steps_for_test(vm, steps, StepOptions::default())
-        .unwrap()
+    cpu.run_steps(vm, steps, StepOptions::default()).unwrap()
 }
 fn transfer_steps(cpu: &mut Vcpu, vm: &Vm, count: u64) {
     let result = transfer_run(cpu, vm, count);
@@ -941,14 +978,10 @@ fn iretd_enters_v86_from_either_stack_width_without_descriptor_lookups() {
             assert_eq!(cpu.cpu.rflags_system & 0x240100, model_bits | 0x100);
             assert!(cpu.delivery_log().unwrap().is_empty());
             let stopped = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(stopped.steps(), 1);
             assert!(matches!(
                 stopped.stop(),
-                StepStop::Exit(Exit::UnsupportedSystemContext {
-                    operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                        MachineContextError::Virtual8086Unsupported
-                    ),
-                    ..
-                })
+                StepStop::Exit(Exit::Exception { vector: 1, .. })
             ));
         }
     }
@@ -1516,25 +1549,6 @@ fn protected_iret_above_ring_zero_ignores_vm_and_word_iret_cannot_enter() {
         assert_eq!(cpu.cpu.rflags_system & VM, 0);
         assert_eq!(cpu.cpu.gpr[4], 0x8006);
         assert_eq!(cpu.cpu.rip, 0x1234);
-        // Even a coherent VM=1 stack image is still refused by public entry.
-        let (vm, mut cpu) = transfers(
-            model,
-            x86jit_core::ExceptionDelivery::Outward,
-            &[0x90],
-            true,
-        );
-        let result = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-        assert!(matches!(
-            result.stop(),
-            StepStop::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(
-                    MachineContextError::Virtual8086Unsupported
-                ),
-                ..
-            })
-        ));
-        assert_eq!(cpu.cpu.legacy.cpl, 0);
-        assert_eq!(cpu.cpu.gpr[4], 0x8000);
     }
 }
 
@@ -1642,4 +1656,840 @@ fn v86_delivery_saves_and_clears_live_tf_rf_nt_before_iret_restores_them() {
             assert_eq!(cpu.cpu.rflags_system & 0x14100, 0x14100);
         }
     }
+}
+
+// SDM Vol 2A §3.3 IRET pp. 3-492–493; Vol 3B §23.2.5 pp. 23-8–9.
+#[test]
+fn public_test386_shaped_iretd_enters_the_first_v86_test() {
+    for model in MODELS {
+        let (vm, mut cpu) = transfers(
+            model,
+            x86jit_core::ExceptionDelivery::Outward,
+            &[0x90],
+            true,
+        );
+        cpu.cpu.cs = 0xd0;
+        cpu.cpu.legacy.segments[0].base = 0xf0000;
+        cpu.cpu.rip = 0x2ca0;
+        vm.write_bytes(0xf2ca0, &[0xcf]).unwrap();
+        dwords(
+            &vm,
+            0x8000,
+            &[
+                0x5630, 0xf000, 0x20246, 0x7fff, 0x1000, 0x3040, 0x2010, 0x5060, 0x7080,
+            ],
+        );
+        let before = cpu.retired_instructions();
+        fixture::steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.retired_instructions() - before, 1);
+        assert_eq!(
+            (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.legacy.cpl),
+            (0xf000, 0x5630, 3)
+        );
+        assert_eq!((cpu.cpu.ss, cpu.cpu.gpr[4]), (0x1000, 0x7fff));
+        assert_eq!(
+            (cpu.cpu.es, cpu.cpu.ds, cpu.cpu.fs, cpu.cpu.gs),
+            (0x3040, 0x2010, 0x5060, 0x7080)
+        );
+        assert_eq!(
+            u64::from(cpu.cpu.flags.to_flags16()) | cpu.cpu.rflags_system,
+            0x20246
+        );
+        let selectors = [
+            cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs, cpu.cpu.gs,
+        ];
+        for (i, selector) in selectors.into_iter().enumerate() {
+            assert_eq!(
+                cpu.cpu.legacy.segments[i],
+                SegmentCache {
+                    base: u32::from(selector) << 4,
+                    limit: 0xffff,
+                    attributes: if i == 0 { 0x9b } else { 0x93 },
+                    ..Default::default()
+                }
+            );
+        }
+    }
+}
+
+const TASK_A: u16 = 0x28;
+const TASK_B: u16 = 0x30;
+const TASK_B_BASE: u64 = 0x5000;
+
+fn task_image(vm: &Vm, selector: u16, base: u64, v86: bool, wide: bool) {
+    // 386 PRM §7.1 Figs. 7-1/7-2 pp. 7-2–4; SDM Vol 3A §10.2.1.
+    fixture::descriptor(
+        vm,
+        0x2000 + u64::from(selector),
+        base as u32,
+        if wide { 0x67 } else { 0x2b },
+        if wide { 0x89 } else { 0x81 },
+    );
+    if wide {
+        dwords(vm, base + 0x20, &[0x1000, if v86 { 0x23202 } else { 2 }]);
+        dwords(vm, base + 0x38, &[if v86 { 0xabcd_7000 } else { 0x9000 }]);
+        dwords(
+            vm,
+            base + 0x48,
+            &if v86 {
+                [0x40, 0x20, 0x30, 0x50, 0x60, 0x70]
+            } else {
+                [0x10, 8, 0x10, 0x10, 0, 0]
+            },
+        );
+        vm.write_bytes(base + 0x66, &0x68u16.to_le_bytes()).unwrap();
+    } else {
+        for (at, value) in [
+            (0x0e, 0x1800u16),
+            (0x10, 2),
+            (0x1a, 0x9000),
+            (0x22, 0x10),
+            (0x24, 8),
+            (0x26, 0x10),
+            (0x28, 0x10),
+        ] {
+            vm.write_bytes(base + at, &value.to_le_bytes()).unwrap();
+        }
+    }
+}
+fn task_gate(vm: &Vm, vector: u8, selector: u16) {
+    dwords(
+        vm,
+        IDT + u64::from(vector) * 8,
+        &[u32::from(selector) << 16, 0x8500],
+    );
+}
+fn task_world(model: CpuModel, call: bool, via_gate: bool) -> (Vm, Vcpu) {
+    task_world_delivery(
+        model,
+        call,
+        via_gate,
+        x86jit_core::ExceptionDelivery::Outward,
+    )
+}
+fn task_world_delivery(
+    model: CpuModel,
+    call: bool,
+    via_gate: bool,
+    delivery: x86jit_core::ExceptionDelivery,
+) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = transfers(model, delivery, &[0x90; 8], true);
+    task_image(&vm, TASK_A, TSS, false, true);
+    fixture::descriptor(&vm, 0x2000 + u64::from(TASK_A), TSS as u32, 0x67, 0x8b);
+    cpu.cpu.legacy.tr = SystemSegment {
+        selector: TASK_A,
+        cache: SegmentCache {
+            base: TSS as u32,
+            limit: 0x67,
+            attributes: 0x8b,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    task_image(&vm, TASK_B, TASK_B_BASE, true, true);
+    let target = if via_gate {
+        dwords(&vm, 0x2038, &[u32::from(TASK_B) << 16, 0x8500]);
+        0x38u16
+    } else {
+        TASK_B
+    };
+    let mut code = vec![if call { 0x9a } else { 0xea }, 0, 0, 0, 0];
+    code.extend(target.to_le_bytes());
+    vm.write_bytes(0x1000, &code).unwrap();
+    (vm, cpu)
+}
+
+// SDM Vol 3B §§23.2.5, 23.3.1.3 pp. 23-8–9, 23-14;
+// 386 PRM §15.3.1 p. 15-6; 486 PRM §23.3.1 p. 23-6.
+#[test]
+fn public_task_jump_call_and_task_gate_install_v86_without_descriptor_reads() {
+    for model in MODELS {
+        for call in [false, true] {
+            for via_gate in [false, true] {
+                let (vm, mut cpu) = task_world(model, call, via_gate);
+                fixture::steps(&mut cpu, &vm, 1);
+                assert_v86(&cpu, 0x1000, if call { 0x27202 } else { 0x23202 });
+                assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+                assert_eq!(cpu.cpu.legacy.cr0 & 8, 8);
+                assert_eq!(fixture::value(&vm, 0x2035, 1) & 2, 2);
+                assert_eq!(fixture::value(&vm, 0x202d, 1) & 2, if call { 2 } else { 0 });
+                assert_eq!(fixture::value(&vm, TSS + 0x20, 4), 0x1007);
+                assert_eq!(
+                    fixture::value(&vm, TASK_B_BASE, 2),
+                    if call { u64::from(TASK_A) } else { 0 }
+                );
+                fixture::steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.rip, 0x1001);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_v86_irq_task_gate_and_nested_iret_restore_v86_once() {
+    for model in MODELS {
+        for wide in [false, true] {
+            let (vm, mut cpu) = task_world(model, false, false);
+            fixture::steps(&mut cpu, &vm, 1);
+            task_image(&vm, TASK_A, TSS, false, wide);
+            vm.write_bytes(if wide { 0x1000 } else { 0x1800 }, &[0xcf])
+                .unwrap();
+            task_gate(&vm, 0x40, TASK_A);
+            cpu.inject_irq(0x40);
+            let retired = cpu.retired_instructions();
+            // Delivery costs no step; IRET is the one retired instruction.
+            fixture::steps(&mut cpu, &vm, 1);
+            assert_v86(&cpu, 0x1000, 0x23202);
+            assert_eq!(cpu.retired_instructions() - retired, 1);
+            assert_eq!(fixture::value(&vm, TASK_B_BASE + 0x24, 4) & VM, VM);
+            assert_eq!(fixture::value(&vm, TSS, 2), u64::from(TASK_B));
+            assert_eq!(fixture::value(&vm, 0x202d, 1) & 2, 0);
+            assert!(!cpu.has_pending_irq());
+            let log = cpu.delivery_log().unwrap();
+            assert_eq!(log.total(), 1);
+            let record = log.iter().next().unwrap();
+            assert!(record.virtual_8086_before);
+            assert!(!record.virtual_8086_after);
+        }
+    }
+}
+
+#[test]
+fn public_v86_task_faults_stay_in_the_reached_task() {
+    for model in MODELS {
+        for phase in 0..5 {
+            let (vm, mut cpu) = task_world(model, false, false);
+            let (vector, code, committed) = match phase {
+                0 => {
+                    fixture::descriptor(&vm, 0x2030, TASK_B_BASE as u32, 0x67, 0x09);
+                    (11, 0x30, false)
+                }
+                1 => {
+                    fixture::descriptor(&vm, 0x2030, TASK_B_BASE as u32, 0x20, 0x89);
+                    (10, 0x30, false)
+                }
+                2 => {
+                    dwords(&vm, TASK_B_BASE + 0x60, &[0x78]);
+                    (10, 0x78, true)
+                }
+                3 => {
+                    dwords(&vm, TASK_B_BASE + 0x20, &[0x10000]);
+                    (13, 0, true)
+                }
+                _ => {
+                    fixture::descriptor(&vm, 0x2078, 0, 0xffff, 0x82);
+                    dwords(&vm, TASK_B_BASE + 0x60, &[0x78]);
+                    // A valid LDT is loaded despite V86 paragraphs bypassing it.
+                    fixture::steps(&mut cpu, &vm, 1);
+                    assert_eq!(cpu.cpu.legacy.ldtr.selector, 0x78);
+                    assert_eq!(cpu.cpu.legacy.ldtr.cache.unusable, 0);
+                    continue;
+                }
+            };
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            let StepStop::Exit(e @ Exit::Exception { vector: actual, .. }) = r.stop() else {
+                panic!("{:?}", r.stop());
+            };
+            assert_eq!(*actual, vector);
+            assert_eq!(
+                e.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(code, 0xffff)
+            );
+            assert_eq!(
+                cpu.cpu.legacy.tr.selector,
+                if committed { TASK_B } else { TASK_A }
+            );
+            assert_eq!(cpu.retired_instructions(), 0);
+            if phase >= 2 {
+                assert_eq!(cpu.cpu.legacy.cpl, 3);
+                assert_ne!(cpu.cpu.rflags_system & VM, 0);
+            }
+        }
+    }
+}
+
+// 386 PRM §§11.1.2, 11.1.5.3 pp. 11-1, 11-4; §15.6 p. 15-12.
+// The assertion/wait/ack handshake is the board contract of fpu-error-routing.md.
+#[test]
+fn public_v86_external_numeric_assertion_wait_and_irq_round_trip() {
+    use x86jit_core::{NumericErrorEvent as E, NumericErrorRoute as R};
+    let (vm, mut cpu) = transfers(
+        CpuModel::I80386,
+        x86jit_core::ExceptionDelivery::InGuest,
+        &[0xd8, 0xf1, 0x9b, 0x90],
+        true,
+    );
+    fixture::steps(&mut cpu, &vm, 1);
+    cpu.set_fpu_model(FpuModel::Present);
+    cpu.set_numeric_error_route(R::External).unwrap();
+    cpu.cpu.fpu_top = 0;
+    cpu.cpu.fpu_empty = !3;
+    cpu.cpu.fpr[0] = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f];
+    cpu.cpu.fpr[1] = [0; 10];
+    cpu.cpu.fpu_cw = 0x37b;
+    cpu.cpu.fpu_sw = 0;
+    let retired = cpu.retired_instructions();
+    for (event, steps, budget) in [(E::Asserted, 1, 1), (E::Waiting, 0, 8), (E::Waiting, 0, 1)] {
+        let r = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+        assert_eq!(r.steps(), steps, "{:?}", r.stop());
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::ExternalNumericError { addr: 0x1002, event: e }) if *e == event),
+            "{:?}",
+            r.stop()
+        );
+        assert_eq!(cpu.cpu.rip, 0x1002);
+        assert_eq!(cpu.retired_instructions() - retired, 1);
+        assert!(cpu.numeric_error_pending());
+        zero_probe_preserves_answer(&mut cpu, &vm);
+    }
+    gate(&vm, 0x40, 0x8e);
+    vm.write_bytes(HANDLER, &[0xdb, 0xe2, 0xcf]).unwrap(); // FNCLEX; IRETD.
+    cpu.inject_irq(0x40);
+    fixture::steps(&mut cpu, &vm, 1);
+    assert!(!cpu.numeric_error_pending());
+    cpu.ack_external_numeric_error().unwrap();
+    fixture::steps(&mut cpu, &vm, 1);
+    assert_v86(&cpu, 0x1002, u64::from(ENTRY_IMAGE[2] & !0x10000));
+    fixture::steps(&mut cpu, &vm, 1);
+    assert_eq!(cpu.cpu.rip, 0x1003);
+    assert_eq!(cpu.retired_instructions() - retired, 4);
+    assert_eq!(cpu.delivery_log().unwrap().total(), 1);
+}
+
+// Decision-24: accepted event ownership includes VM and every hidden cache;
+// zero-budget probes retain the completion, edited inputs abandon the event.
+#[test]
+fn held_v86_event_vm_and_segment_edits_abandon_the_accepted_irq() {
+    for model in MODELS {
+        for paged in [false, true] {
+            for edit in 0..7 {
+                let (mut vm, mut cpu) = transfers(
+                    model,
+                    x86jit_core::ExceptionDelivery::InGuest,
+                    &[0x90; 8],
+                    true,
+                );
+                gate(&vm, 0x40, 0x8e);
+                if paged {
+                    identity_paging(&vm, &mut cpu);
+                }
+                fixture::steps(&mut cpu, &vm, 1);
+                trap_range(&mut vm, 0x8ffc, 4);
+                cpu.inject_irq(0x40);
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), 0);
+                assert!(
+                    matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::MmioWrite { addr: 0x8ffc, .. })
+                    ),
+                    "{:?}",
+                    r.stop()
+                );
+                cpu.complete_mmio_write();
+                zero_probe_preserves_answer(&mut cpu, &vm);
+                if edit == 0 {
+                    cpu.cpu.rflags_system &= !VM;
+                    cpu.cpu.legacy.cpl = 0;
+                } else {
+                    cpu.cpu.legacy.segments[edit - 1].limit = 0xfffe;
+                }
+                let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert!(!cpu.has_pending_irq());
+                assert_eq!(cpu.delivery_log().unwrap().total(), 0);
+                assert_eq!(cpu.cpu.rip, if edit == 0 { 0x1001 } else { 0x1000 });
+                if edit == 0 {
+                    assert_eq!(r.steps(), 1, "{:?}", r.stop());
+                } else {
+                    assert_eq!(r.steps(), 0);
+                    assert!(matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::UnsupportedSystemContext { .. })
+                    ));
+                }
+                assert_eq!(cpu.cpu.rflags_system & VM, if edit == 0 { 0 } else { VM });
+            }
+        }
+    }
+}
+
+#[test]
+fn v86_task_image_and_outgoing_saves_resume_every_bus_transfer_once() {
+    for model in MODELS {
+        for paged in [false, true] {
+            for incoming in [false, true] {
+                let (mut vm, mut cpu) = task_world(model, true, false);
+                if paged {
+                    identity_paging(&vm, &mut cpu);
+                }
+                if paged {
+                    dwords(&vm, TASK_B_BASE + 0x1c, &[0x10000]);
+                }
+                let at = if incoming { TASK_B_BASE } else { TSS };
+                let mut bytes = [0; 0x68];
+                vm.read_bytes(at, &mut bytes).unwrap();
+                trap_range(&mut vm, at, bytes.len());
+                let retired = cpu.retired_instructions();
+                let mut seen = std::collections::BTreeMap::new();
+                for _ in 0..100 {
+                    let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                    match r.stop() {
+                        StepStop::Exit(Exit::MmioRead { addr, size, .. }) => {
+                            assert_eq!(r.steps(), 0);
+                            let visits = seen.entry((*addr, *size, false)).or_insert(0);
+                            *visits += 1;
+                            assert_eq!(*visits, 1, "repeated task-image read {addr:x}");
+                            let start = (*addr - at) as usize;
+                            let mut value = [0; 8];
+                            value[..*size as usize]
+                                .copy_from_slice(&bytes[start..start + *size as usize]);
+                            cpu.complete_mmio_read(u64::from_le_bytes(value));
+                        }
+                        StepStop::Exit(Exit::MmioWrite {
+                            addr, size, value, ..
+                        }) => {
+                            assert_eq!(r.steps(), 0);
+                            assert!(
+                                seen.insert((*addr, *size, true), 1).is_none(),
+                                "repeated write {addr:x}"
+                            );
+                            let start = (*addr - at) as usize;
+                            bytes[start..start + *size as usize]
+                                .copy_from_slice(&value.to_le_bytes()[..*size as usize]);
+                            cpu.complete_mmio_write();
+                        }
+                        StepStop::Exit(Exit::BudgetExhausted) => {
+                            assert_eq!(r.steps(), 1);
+                            break;
+                        }
+                        stop => panic!("{model:?} paged={paged} incoming={incoming}: {stop:?}"),
+                    }
+                    zero_probe_preserves_answer(&mut cpu, &vm);
+                }
+                assert_eq!(cpu.retired_instructions() - retired, 1);
+                assert_v86(&cpu, 0x1000, 0x27202);
+                assert!(!seen.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn public_task_switch_loads_cr3_before_v86_ldt_checks_and_fetch() {
+    for model in MODELS {
+        for bad_ldt in [false, true] {
+            let (vm, mut cpu) = task_world(model, false, false);
+            identity_paging(&vm, &mut cpu);
+            dwords(&vm, TASK_B_BASE + 0x1c, &[0x12000]);
+            dwords(&vm, 0x12000, &[0x13007]);
+            for page in 0..32u32 {
+                dwords(&vm, 0x13000 + u64::from(page * 4), &[(page * 0x1000) | 7]);
+            }
+            // In the new address space GDT is physically elsewhere; old GDT
+            // has no valid LDT. Both tables/TSS are supervisor in the old map.
+            dwords(&vm, 0x13008, &[0x14003]);
+            fixture::descriptor(&vm, 0x14078, 0x16000, 7, if bad_ldt { 0x92 } else { 0x82 });
+            dwords(&vm, TASK_B_BASE + 0x60, &[0x78]);
+            dwords(&vm, 0x13004, &[0x15007]);
+            vm.write_bytes(0x15200, &[0x43]).unwrap(); // INC BX, in V86.
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(cpu.cpu.legacy.cr3, 0x12000);
+            assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+            assert_eq!(cpu.cpu.legacy.cpl, 3);
+            if bad_ldt {
+                assert_eq!(r.steps(), 0);
+                assert!(
+                    matches!(r.stop(), StepStop::Exit(Exit::Exception { vector: 10, .. })),
+                    "{:?}",
+                    r.stop()
+                );
+            } else {
+                assert_eq!(r.steps(), 1, "{:?}", r.stop());
+                assert_eq!(cpu.cpu.legacy.ldtr.cache.base, 0x16000);
+                fixture::steps(&mut cpu, &vm, 1);
+                assert_eq!(cpu.cpu.gpr[3], 1);
+                assert_eq!(cpu.cpu.rip, 0x1001);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_task_gate_from_protected_code_and_v86_exception_error_push() {
+    for model in MODELS {
+        for source_v86 in [false, true] {
+            let (vm, mut cpu) =
+                task_world_delivery(model, false, false, x86jit_core::ExceptionDelivery::InGuest);
+            if source_v86 {
+                fixture::steps(&mut cpu, &vm, 1);
+                task_image(&vm, TASK_A, TSS, false, true);
+                vm.write_bytes(0x1000, &[0x90]).unwrap();
+                vm.write_bytes(0x1200, &[0xfa]).unwrap(); // CLI at IOPL=0: #GP(0).
+                cpu.cpu.rflags_system &= !0x3000;
+                task_gate(&vm, 13, TASK_A);
+                let retired = cpu.retired_instructions();
+                fixture::steps(&mut cpu, &vm, 1); // fault costs zero, handler NOP costs one.
+                assert_eq!(cpu.retired_instructions() - retired, 1);
+                assert_eq!(cpu.cpu.legacy.tr.selector, TASK_A);
+                assert_eq!(cpu.cpu.rflags_system & VM, 0);
+                assert_eq!(cpu.cpu.rflags_system & 0x4000, 0x4000);
+                assert_eq!(cpu.cpu.gpr[4], 0x8ffc);
+                assert_eq!(fixture::value(&vm, 0x8ffc, 4), 0);
+                assert_eq!(fixture::value(&vm, TASK_B_BASE + 0x20, 4), 0x1000);
+                assert_ne!(fixture::value(&vm, TASK_B_BASE + 0x24, 4) & VM, 0);
+                let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+                assert_eq!(record.vector, 13);
+                assert!(record.virtual_8086_before);
+                assert!(!record.virtual_8086_after);
+            } else {
+                vm.write_bytes(0x1000, &[0xcd, 0x40]).unwrap();
+                task_gate(&vm, 0x40, TASK_B);
+                fixture::steps(&mut cpu, &vm, 1);
+                assert_v86(&cpu, 0x1000, 0x27202);
+                assert_eq!(fixture::value(&vm, TSS + 0x20, 4), 0x1002);
+                let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+                assert!(!record.virtual_8086_before);
+                assert!(record.virtual_8086_after);
+            }
+        }
+    }
+}
+
+#[test]
+fn faults_leaving_v86_through_a_task_gate_use_old_or_committed_context() {
+    for model in MODELS {
+        for phase in 0..4 {
+            let (vm, mut cpu) = task_world(model, false, false);
+            fixture::steps(&mut cpu, &vm, 1);
+            task_image(&vm, TASK_A, TSS, false, true);
+            task_gate(&vm, 0x40, TASK_A);
+            let (vector, code, committed) = match phase {
+                0 => {
+                    fixture::descriptor(&vm, 0x2028, TSS as u32, 0x67, 0x09);
+                    (11, 0x29, false)
+                }
+                1 => {
+                    dwords(&vm, TSS + 0x60, &[0x78]);
+                    (10, 0x79, true)
+                }
+                2 => {
+                    dwords(&vm, TSS + 0x4c, &[0]);
+                    (10, 1, true)
+                }
+                _ => {
+                    dwords(&vm, TSS + 0x20, &[0x10000]);
+                    (13, 1, true)
+                }
+            };
+            cpu.inject_irq(0x40);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            let StepStop::Exit(exit @ Exit::Exception { vector: actual, .. }) = r.stop() else {
+                panic!("{:?}", r.stop());
+            };
+            assert_eq!(*actual, vector);
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(code, 0xffff)
+            );
+            assert_eq!(
+                cpu.cpu.legacy.tr.selector,
+                if committed { TASK_A } else { TASK_B }
+            );
+            assert_eq!(cpu.cpu.rflags_system & VM, if committed { 0 } else { VM });
+            assert!(!cpu.has_pending_irq());
+            assert_eq!(cpu.retired_instructions(), 1);
+            assert_eq!(cpu.delivery_log().unwrap().total(), 0);
+        }
+    }
+}
+
+#[test]
+fn held_committed_v86_task_vm_edit_discards_switch_and_consumed_event_together() {
+    for model in MODELS {
+        for paged in [false, true] {
+            let (mut vm, mut cpu) = task_world(model, false, false);
+            task_gate(&vm, 0x40, TASK_B);
+            dwords(&vm, TASK_B_BASE + 0x60, &[0x1078]);
+            cpu.cpu.legacy.gdtr.limit = 0x107f;
+            fixture::descriptor(&vm, 0x3078, 0x6000, 7, 0x82);
+            if paged {
+                identity_paging(&vm, &mut cpu);
+                dwords(&vm, TASK_B_BASE + 0x1c, &[0x10000]);
+            }
+            trap_range(&mut vm, 0x3078, 8);
+            cpu.cpu.flags.if_ = true;
+            cpu.inject_irq(0x40);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::MmioRead { addr: 0x3078, .. })
+                ),
+                "{:?}",
+                r.stop()
+            );
+            cpu.complete_mmio_read(0x60000007);
+            assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+            assert_eq!(cpu.cpu.rflags_system & VM, VM);
+            assert!(!cpu.has_pending_irq());
+            zero_probe_preserves_answer(&mut cpu, &vm);
+            cpu.cpu.rflags_system &= !VM;
+            cpu.cpu.legacy.cpl = 0;
+            fixture::steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.rip, 0x1001);
+            assert_eq!(cpu.retired_instructions(), 1);
+            assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+            assert_eq!(cpu.delivery_log().unwrap().total(), 0);
+            assert!(!cpu.has_pending_irq());
+        }
+    }
+}
+
+#[test]
+fn incoming_v86_task_error_push_uses_its_stack_and_t_bit_completes_once() {
+    for model in MODELS {
+        for task_debug in [false, true] {
+            let (mut vm, mut cpu) =
+                task_world_delivery(model, false, false, x86jit_core::ExceptionDelivery::InGuest);
+            vm.write_bytes(0x1000, &[0x8e, 0xd0]).unwrap(); // MOV SS,AX: #GP(0).
+            task_gate(&vm, 13, TASK_B);
+            if task_debug {
+                vm.write_bytes(TASK_B_BASE + 0x64, &[1, 0]).unwrap();
+            }
+            trap_range(&mut vm, 0x72fc, 4);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::MmioWrite {
+                        addr: 0x72fc,
+                        size: 4,
+                        value: 0,
+                        ..
+                    })
+                ),
+                "{:?}",
+                r.stop()
+            );
+            assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+            assert_eq!(cpu.cpu.rflags_system & VM, VM);
+            cpu.complete_mmio_write();
+            zero_probe_preserves_answer(&mut cpu, &vm);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(cpu.cpu.gpr[4], 0xabcd_6ffc);
+            assert_eq!(cpu.delivery_log().unwrap().total(), 1);
+            assert!(
+                cpu.delivery_log()
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .virtual_8086_after
+            );
+            if task_debug {
+                assert_eq!(r.steps(), 0);
+                assert!(
+                    matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::UnsupportedSystemContext {
+                            operation: UnsupportedSystemOperation::LegacyTaskDebugTrap,
+                            ..
+                        })
+                    ),
+                    "{:?}",
+                    r.stop()
+                );
+                let again = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+                assert_eq!(again.steps(), 0);
+                assert_eq!(cpu.cpu.gpr[4], 0xabcd_6ffc);
+                assert_eq!(cpu.retired_instructions(), 0);
+            } else {
+                assert_eq!(r.steps(), 1, "{:?}", r.stop());
+                assert_eq!(cpu.retired_instructions(), 1);
+                assert_eq!(cpu.cpu.rip, 0x1001);
+            }
+        }
+    }
+}
+
+// SDM Vol 3A §10.3 pp. 10-10–13; 386 PRM §9.8.14.1 p. 9-18:
+// outgoing saves and incoming TSS residency faults precede task commit.
+#[test]
+fn v86_task_gate_precommit_page_faults_keep_the_outgoing_v86_context() {
+    for model in MODELS {
+        for (page, linear, code) in [
+            (2, 0x2028, 0),
+            (4, 0x4000, 2),
+            (5, 0x5020, 2),
+            (7, 0x7000, 0),
+        ] {
+            let (vm, mut cpu) = task_world(model, false, false);
+            fixture::steps(&mut cpu, &vm, 1);
+            task_image(&vm, TASK_A, TSS, false, true);
+            if page == 7 {
+                task_image(&vm, TASK_A, 0x6fa0, false, true);
+            }
+            task_gate(&vm, 0x40, TASK_A);
+            identity_paging(&vm, &mut cpu);
+            dwords(&vm, 0x11000 + page * 4, &[0]);
+            cpu.cpu.rip = 0x1003;
+            cpu.inject_irq(0x40);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0, "{model:?} page={page}: {:?}", r.stop());
+            let StepStop::Exit(exit @ Exit::Exception { vector: 14, .. }) = r.stop() else {
+                panic!("{:?}", r.stop());
+            };
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                ErrorCode::bits(code, 7)
+            );
+            assert_eq!(cpu.cpu.legacy.cr2, linear);
+            assert_eq!(cpu.cpu.legacy.tr.selector, TASK_B);
+            assert_eq!(cpu.cpu.legacy.cpl, 3);
+            assert_eq!(cpu.cpu.rflags_system & VM, VM);
+            assert_eq!(cpu.cpu.rip, 0x1003);
+            assert_eq!(fixture::value(&vm, TASK_B_BASE + 0x20, 4), 0x1000);
+            assert_eq!(cpu.delivery_log().unwrap().total(), 0);
+            assert!(!cpu.has_pending_irq());
+        }
+    }
+}
+
+#[test]
+fn incoming_v86_task_error_push_fault_delivers_ss_in_the_committed_task() {
+    for model in MODELS {
+        let (vm, mut cpu) =
+            task_world_delivery(model, false, false, x86jit_core::ExceptionDelivery::InGuest);
+        fixture::steps(&mut cpu, &vm, 1);
+        task_image(&vm, TASK_A, TSS, true, true);
+        dwords(&vm, TSS + 4, &[0x9000, 0x10]);
+        dwords(&vm, TSS + 0x38, &[0xabcd_0001]);
+        task_gate(&vm, 13, TASK_A);
+        gate(&vm, 12, 0x8e);
+        vm.write_bytes(0x1200, &[0xfa]).unwrap(); // Source V86 CLI: #GP(0).
+        cpu.cpu.rflags_system &= !0x3000;
+        let before = cpu.retired_instructions();
+        // The incoming V86 task cannot push a dword at SP=1. Its #SS(0)
+        // enters the ring-0 handler; the original task-gate event never completes.
+        fixture::steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.retired_instructions() - before, 1);
+        assert_eq!(cpu.cpu.legacy.tr.selector, TASK_A);
+        assert_eq!(cpu.cpu.legacy.cpl, 0);
+        assert_eq!(cpu.cpu.rflags_system & VM, 0);
+        assert_eq!(cpu.cpu.rip, HANDLER + 1);
+        let sp = 0x9000 - 40;
+        assert_eq!(cpu.cpu.gpr[4], sp);
+        assert_eq!(fixture::value(&vm, sp, 4), 0);
+        assert_eq!(fixture::value(&vm, sp + 4, 4), 0x1000);
+        assert_eq!(fixture::value(&vm, sp + 16, 4), 0xabcd_0001);
+        assert_eq!(fixture::value(&vm, sp + 12, 4) & VM, VM);
+        assert_eq!(fixture::value(&vm, TASK_B_BASE + 0x24, 4) & VM, VM);
+        assert_eq!(cpu.delivery_log().unwrap().total(), 1);
+        let record = cpu.delivery_log().unwrap().iter().next().unwrap();
+        assert_eq!(record.vector, 12);
+        assert!(record.virtual_8086_before);
+        assert!(!record.virtual_8086_after);
+    }
+}
+
+// Decision-16 §3 / decision-24: a completion belongs to the suspended
+// instruction's segment context; zero-budget entry cannot abandon it.
+fn instruction_retry_with_edited_context(edit: u8) {
+    for model in MODELS {
+        for changed in [false, true] {
+            let code = [0xa1, 0x00, 0x02]; // MOV AX,[0200h].
+            let (mut vm, mut cpu) = if edit == 2 {
+                fixture::setup(model, &code)
+            } else {
+                world(model, &code, 0)
+            };
+            vm.unmap(0, 0x240000).unwrap();
+            for (at, size, kind) in [
+                (0, 0x200, x86jit_core::RegionKind::Ram),
+                (0x200, 2, x86jit_core::RegionKind::Trap),
+                (0x202, 0x2ffe, x86jit_core::RegionKind::Ram),
+                (0x3200, 2, x86jit_core::RegionKind::Trap),
+                (0x3202, 0x240000 - 0x3202, x86jit_core::RegionKind::Ram),
+            ] {
+                vm.map(at, size, x86jit_core::Prot::RWX, kind).unwrap();
+            }
+            vm.write_bytes(0x1000, &code).unwrap();
+            let retired = cpu.retired_instructions();
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 0);
+            assert!(
+                matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::MmioRead {
+                        addr: 0x200,
+                        size: 2,
+                        ..
+                    })
+                ),
+                "{:?}",
+                r.stop()
+            );
+            cpu.complete_mmio_read(0x1234);
+            if changed {
+                match edit {
+                    0 => canonical(&mut cpu, SegmentId::Ds, 0x300),
+                    1 => {
+                        cpu.cpu.rflags_system &= !VM;
+                        cpu.cpu.legacy.cpl = 0;
+                    }
+                    2 => cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = 0x3000,
+                    _ => unreachable!(),
+                }
+            }
+            zero_probe_preserves_answer(&mut cpu, &vm);
+            let r = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+            if changed {
+                assert_eq!(r.steps(), 0);
+                let expected = if edit == 1 { 0x200 } else { 0x3200 };
+                assert!(
+                    matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::MmioRead {
+                            addr,
+                            size: 2,
+                            ..
+                        }) if *addr == expected
+                    ),
+                    "{:?}",
+                    r.stop()
+                );
+                assert_eq!(cpu.cpu.pending_mmio, None);
+                assert_eq!(cpu.cpu.mmio_parts_len, 0);
+                assert_eq!(cpu.cpu.gpr[0], 0);
+                assert_eq!(cpu.retired_instructions(), retired);
+                cpu.complete_mmio_read(0x5678);
+                fixture::steps(&mut cpu, &vm, 1);
+            } else {
+                assert_eq!(r.steps(), 1, "{:?}", r.stop());
+            }
+            assert_eq!(cpu.cpu.gpr[0], if changed { 0x5678 } else { 0x1234 });
+            assert_eq!(cpu.cpu.rip, 0x1003);
+            assert_eq!(cpu.retired_instructions(), retired + 1);
+            assert!(!cpu.cpu.mmio_retry_active);
+        }
+    }
+}
+
+#[test]
+fn held_v86_instruction_ds_edit_abandons_mmio_answer() {
+    instruction_retry_with_edited_context(0);
+}
+
+#[test]
+fn held_v86_instruction_vm_edit_abandons_mmio_answer() {
+    instruction_retry_with_edited_context(1);
+}
+
+#[test]
+fn held_protected_instruction_cache_edit_abandons_mmio_answer() {
+    instruction_retry_with_edited_context(2);
 }

@@ -1819,7 +1819,7 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     if attr & 0x80 == 0 {
         return Err(fault(cpu, 11, idt_code));
     }
-    if V86 && matches!(kind, 5..=7) {
+    if V86 && matches!(kind, 6 | 7) {
         // SDM Vol 3B §23.3.1 p. 23-12; design v86 §9 Q2.
         return Err(refusal(
             cpu,
@@ -4482,13 +4482,7 @@ where
                     // Real mode wraps: I286 PRM App. B IRET p. B-53, 80386
                     // PRM §17 IRET p. 17-79 (`wraps_in_segment`).
                     pop_frame_limit(cpu, mem, context, 3, *size)?;
-                    let peek = peek::<ROUTED, ORDER>;
-                    #[cfg(feature = "test-hooks")]
-                    let peek = if task_switch.allow_virtual8086 {
-                        virtual8086::peek_frame::<ROUTED, ORDER>
-                    } else {
-                        peek
-                    };
+                    let peek = virtual8086::peek_frame::<ROUTED, ORDER>;
                     let ip = peek(cpu, mem, context, 0, *size)? & mask(*size);
                     let cs = peek(cpu, mem, context, 1, *size)? as u16;
                     let image = peek(cpu, mem, context, 2, *size)? as u32;
@@ -4500,7 +4494,7 @@ where
                         && image & (1 << 17) != 0
                         && context.cpl == 0
                     {
-                        virtual8086::enter(cpu, mem, context, ip, cs, image, task_switch)?;
+                        virtual8086::enter(cpu, mem, context, ip, cs, image)?;
                         outcome.context_changed = true;
                         outcome.preserve_rf = true;
                         return Ok(true);
