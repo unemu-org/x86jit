@@ -5857,3 +5857,38 @@ mod tests {
         assert_eq!(execution.lifts, 5);
     }
 }
+
+#[cfg(test)]
+mod virtual8086_key_tests {
+    use super::*;
+
+    #[test]
+    fn virtual8086_key_and_stamp_separate_identical_fetch_addresses() {
+        let model = crate::CpuModel::I80386.legacy_model();
+        let mut cpu = CpuState::legacy_real_entry([0; 6]);
+        let real = LegacyContextStamp::new(&cpu, model);
+        let key = LegacyBlockKey {
+            owner_id: 1,
+            context_id: 1,
+            model_semantics_id: model.model_semantics_id,
+            decode_bits: 16,
+            stack_bits: 16,
+            regime: MachineRegime::Real,
+            decode_ip: 0x1000,
+            linear_fetch: 0x1000,
+            mxcsr_mode: 0,
+        };
+        let v86_key = LegacyBlockKey {
+            regime: MachineRegime::Virtual8086,
+            ..key
+        };
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(key);
+        keys.insert(v86_key);
+        assert_eq!(keys.len(), 2);
+        cpu.rflags_system |= 1 << 17;
+        assert!(LegacyContextStamp::new(&cpu, model) != real);
+        cpu.rflags_system = 0;
+        assert!(LegacyContextStamp::new(&cpu, model) == real);
+    }
+}

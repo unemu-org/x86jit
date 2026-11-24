@@ -756,6 +756,11 @@ const fn identified(mut p: ModelProfile) -> ModelProfile {
         hash = word(hash, 0x726570333836);
         hash = word(hash, p.quirks.i386_ignore_rep_non_string as u64);
     }
+    // V86 execution personality revision. Application identities are independent.
+    if matches!(p.system, ModelSystem::Cr386) {
+        hash = word(hash, 0x563836);
+        hash = word(hash, 1);
+    }
     p.semantics_id = hash;
     p
 }
@@ -834,7 +839,7 @@ mod tests {
     #[test]
     fn machine_identities_include_historical_prefix_policy() {
         for (model, identity) in [
-            (CpuModel::I80386, 0xc82b_1bb8_08a6_d958_u64),
+            (CpuModel::I80386, 0xf2f853469e22b1a1_u64),
             (CpuModel::I8088, 0x0b71_3477_b270_a8b9),
             (CpuModel::I8086, 0xe283_0b47_9d3b_74e5),
             (CpuModel::NecV20, 0xd70e_6f86_6f32_e09c),

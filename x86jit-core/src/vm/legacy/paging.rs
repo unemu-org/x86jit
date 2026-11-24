@@ -509,6 +509,20 @@ impl Vcpu {
     #[inline(never)]
     #[cfg(feature = "test-hooks")]
     pub fn interpret_paged_for_test(&mut self, vm: &Vm) -> Result<(), Exit> {
+        self.interpret_personality_for_test::<false>(vm)
+    }
+
+    /// Private V86 boundary for coherent images; public Machine entry stays gated.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    #[cfg(feature = "test-hooks")]
+    pub fn interpret_virtual8086_for_test(&mut self, vm: &Vm) -> Result<(), Exit> {
+        self.interpret_personality_for_test::<true>(vm)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn interpret_personality_for_test<const V86: bool>(&mut self, vm: &Vm) -> Result<(), Exit> {
         let model = vm
             .cpu_model
             .filter(|m| {
@@ -530,13 +544,23 @@ impl Vcpu {
             });
         }
         self.cpu.machine_flags_mask = model.machine_flags_mask();
-        let context = derive_legacy_context(model.legacy_model(), &self.cpu).map_err(|error| {
-            Exit::UnsupportedSystemContext {
-                addr: self.cpu.rip,
-                operation: UnsupportedSystemOperation::InvalidLegacyContext(error),
-            }
+        let context = if V86 {
+            crate::legacy::derive_virtual8086_context_for_test(model.legacy_model(), &self.cpu)
+        } else {
+            derive_legacy_context(model.legacy_model(), &self.cpu)
+        }
+        .map_err(|error| Exit::UnsupportedSystemContext {
+            addr: self.cpu.rip,
+            operation: UnsupportedSystemOperation::InvalidLegacyContext(error),
         })?;
         if self.cpu.port_string_in.is_some() {
+            if !context.paging_enabled {
+                return crate::interp::legacy::finish_port_input::<false, 0>(
+                    &mut self.cpu,
+                    &vm.mem,
+                    u32::MAX,
+                );
+            }
             let state = self
                 .legacy_execution
                 .as_mut()
@@ -599,7 +623,7 @@ impl Vcpu {
             execution.rep_flags = None;
         }
         let outcome = if context.paging_enabled {
-            execute_retained::<false, 0>(
+            crate::interp::legacy::paging::execute_retained::<false, 0, V86>(
                 &ir,
                 &mut self.cpu,
                 &vm.mem,
@@ -608,7 +632,7 @@ impl Vcpu {
                 &mut state.transaction,
             )
         } else {
-            execute_for_test::<false>(
+            execute_for_test::<false, V86>(
                 &ir,
                 &mut self.cpu,
                 &vm.mem,
@@ -730,7 +754,7 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
     ),
     Exit,
 > {
-    crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER>(
+    crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER, false>(
         ir,
         cpu,
         memory,

@@ -238,6 +238,17 @@ fn reload(cpu: &mut CpuState, segment: SegmentId, value: u16) {
     }
 }
 
+// SDM Vol 3B §23.2 p. 23-5; 386 PRM §15.1.2 pp. 15-2–3:
+// segment values are paragraph numbers, including zero, for all six loads.
+fn reload_virtual8086(cpu: &mut CpuState, segment: SegmentId, value: u16) {
+    install(
+        cpu,
+        segment,
+        value,
+        legacy::virtual8086_cache(value, segment == SegmentId::Cs),
+    );
+}
+
 /// A real-mode segment load. On the 80286 it also resets the limit to FFFFH
 /// and "access rights is changed to a writable segment", which ends a cache
 /// that LOADALL loaded (Intel, "Undocumented iAPX 286 Test Instruction",
@@ -1918,6 +1929,14 @@ fn deliver<const ROUTED: bool, const ORDER: u8>(
     if task_switch.record_regs {
         task_switch.capture_regs(cpu, context.generation);
     }
+    if context.regime == legacy::MachineRegime::Virtual8086 {
+        return Err(refusal(
+            cpu,
+            crate::UnsupportedSystemOperation::InvalidLegacyContext(
+                legacy::MachineContextError::Virtual8086Unsupported,
+            ),
+        ));
+    }
     if context.regime == legacy::MachineRegime::Protected {
         return deliver_protected(cpu, mem, context, event, task_switch);
     }
@@ -2263,7 +2282,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
         ir.verify_temp_defs()
     );
     let context = ir.legacy_context.expect("legacy interpreter context");
-    execute_instruction::<ROUTED, ORDER, false>(
+    execute_instruction::<ROUTED, ORDER, false, false>(
         ir,
         &InstructionView {
             guest_start: ir.guest_start,
@@ -2278,7 +2297,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
     )
 }
 
-fn execute_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+fn execute_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>(
     block: &IrBlock,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -2291,8 +2310,16 @@ where
     PagingMode<PAGED>: PagingStorage,
 {
     if PAGED && mem.transaction().is_none() {
-        return paging::execute(block, ir, cpu, mem, temps, context, task_switch)
-            .map(|(outcome, _)| outcome);
+        return paging::execute::<ROUTED, ORDER, PAGED, V86>(
+            block,
+            ir,
+            cpu,
+            mem,
+            temps,
+            context,
+            task_switch,
+        )
+        .map(|(outcome, _)| outcome);
     }
     mem.read_index.set(0);
     let checked = context.segment_class == crate::SegmentClass::Checked;
@@ -2330,7 +2357,7 @@ where
             ..Outcome::default()
         })
     } else {
-        let mut execution = InstructionExecution {
+        let mut execution = InstructionExecution::<ROUTED, ORDER, PAGED, V86> {
             ir,
             mem,
             context,
@@ -2530,7 +2557,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
             _ => ir.guest_start + u64::from(ir.guest_len),
         };
         cpu.rip = guest_addr;
-        match execute_instruction::<ROUTED, ORDER, false>(
+        match execute_instruction::<ROUTED, ORDER, false, false>(
             ir,
             &InstructionView {
                 guest_start: guest_addr,
@@ -2964,7 +2991,7 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
         retired: true,
         ..Outcome::default()
     };
-    let result = execute_op::<ROUTED, ORDER, false>(
+    let result = execute_op::<ROUTED, ORDER, false, false>(
         &ops[0],
         &InstructionView {
             guest_start: ip,
@@ -3126,7 +3153,7 @@ fn loop_ip(
 // The shared opcode iterator delegates only the Machine-specific accesses and
 // system helpers here; scalar arithmetic has one interpretation (spec.md §8.1).
 #[allow(clippy::too_many_arguments)]
-fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>(
     op: &IrOp,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -3641,7 +3668,9 @@ where
                     }
                 }
                 L::Checkpoint | L::SharedWalk => {}
-                L::Privileged { kind } => privilege::check(cpu, mem, context.generation, *kind)?,
+                L::Privileged { kind } => {
+                    privilege::check::<ROUTED, ORDER, V86>(cpu, mem, context.generation, *kind)?
+                }
                 L::LockedTransfer => return Err(atomic_device_exit(cpu, mem, ir)),
                 L::DirectStackAddress {
                     dst,
@@ -4151,14 +4180,24 @@ where
                     bytes,
                     access,
                 } => {
-                    temps[*dst as usize] = segment_access(
-                        cpu,
-                        context,
-                        *segment,
-                        read_val(*offset, temps),
-                        *bytes,
-                        *access,
-                    )?
+                    temps[*dst as usize] = if V86 {
+                        legacy::virtual8086_access(
+                            cpu,
+                            *segment,
+                            read_val(*offset, temps),
+                            *bytes,
+                            *access,
+                        )?
+                    } else {
+                        segment_access(
+                            cpu,
+                            context,
+                            *segment,
+                            read_val(*offset, temps),
+                            *bytes,
+                            *access,
+                        )?
+                    };
                 }
                 L::ReadSelector { dst, segment } => {
                     temps[*dst as usize] = u64::from(selector(cpu, *segment))
@@ -4168,13 +4207,17 @@ where
                     value,
                     inhibit,
                 } => {
-                    load_segment(
-                        cpu,
-                        mem,
-                        *segment,
-                        read_val(*value, temps) as u16,
-                        context.generation,
-                    )?;
+                    if V86 {
+                        reload_virtual8086(cpu, *segment, read_val(*value, temps) as u16);
+                    } else {
+                        load_segment(
+                            cpu,
+                            mem,
+                            *segment,
+                            read_val(*value, temps) as u16,
+                            context.generation,
+                        )?;
+                    }
                     outcome.context_changed = true;
                     // spec.md §17.10: an SS load also holds the NMI input.
                     outcome.arm_ss = if *inhibit {
@@ -4330,7 +4373,11 @@ where
                                 d.cache,
                             );
                         } else {
-                            reload_real(cpu, SegmentId::Cs, cs, context.generation);
+                            if V86 {
+                                reload_virtual8086(cpu, SegmentId::Cs, cs);
+                            } else {
+                                reload_real(cpu, SegmentId::Cs, cs, context.generation);
+                            }
                         }
                         outcome.context_changed = true;
                     }
@@ -4391,7 +4438,11 @@ where
                         if let Some(d) = descriptor {
                             install(cpu, SegmentId::Cs, cs, d.cache);
                         } else {
-                            reload_real(cpu, SegmentId::Cs, cs, context.generation);
+                            if V86 {
+                                reload_virtual8086(cpu, SegmentId::Cs, cs);
+                            } else {
+                                reload_real(cpu, SegmentId::Cs, cs, context.generation);
+                            }
                         }
                         outcome.context_changed = true;
                     }
@@ -4399,6 +4450,14 @@ where
                     return Ok(true);
                 }
                 L::Iret { size } => {
+                    if V86 {
+                        return Err(refusal(
+                            cpu,
+                            crate::UnsupportedSystemOperation::InvalidLegacyContext(
+                                legacy::MachineContextError::Virtual8086Unsupported,
+                            ),
+                        ));
+                    }
                     // SDM Vol 2A §3.3 IRET; 80386 PRM §17 pp. 17-74,
                     // 17-76–78 (scan checked): same-CPL frame, independent SS.B.
                     // Real mode wraps: I286 PRM App. B IRET p. B-53, 80386
@@ -4786,8 +4845,15 @@ pub(super) fn machine_specific(op: &IrOp) -> bool {
     )
 }
 
-struct InstructionExecution<'a, 'b, 'memory, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
-where
+struct InstructionExecution<
+    'a,
+    'b,
+    'memory,
+    const ROUTED: bool,
+    const ORDER: u8,
+    const PAGED: bool,
+    const V86: bool,
+> where
     PagingMode<PAGED>: PagingStorage,
 {
     ir: &'a InstructionView<'a>,
@@ -4796,8 +4862,9 @@ where
     task_switch: &'b mut tasks::SwitchState,
     outcome: Outcome,
 }
-impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> super::InstructionExecutor<'_>
-    for &mut InstructionExecution<'_, '_, '_, ROUTED, ORDER, PAGED>
+impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>
+    super::InstructionExecutor<'_>
+    for &mut InstructionExecution<'_, '_, '_, ROUTED, ORDER, PAGED, V86>
 where
     PagingMode<PAGED>: PagingStorage,
 {
@@ -4811,7 +4878,7 @@ where
             & 0xffff_ffff
     }
     fn execute(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
-        match execute_op(
+        match execute_op::<ROUTED, ORDER, PAGED, V86>(
             op,
             self.ir,
             cpu,

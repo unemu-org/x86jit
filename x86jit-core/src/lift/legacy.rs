@@ -318,8 +318,14 @@ pub(crate) fn instruction_for_profile(
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
-        if context.regime == crate::MachineRegime::Protected {
-            privilege_guard(&insn, locked_mov, context.generation, &mut ops.values);
+        if context.regime != crate::MachineRegime::Real {
+            privilege_guard(
+                &insn,
+                locked_mov,
+                context.generation,
+                context.regime,
+                &mut ops.values,
+            );
         }
     }
     if context.segment_class == crate::SegmentClass::Direct {
@@ -470,7 +476,7 @@ fn coprocessor_overrun(
 // The CPL and IOPL tests that protected mode makes (286 PRM App. B; 386 PRM
 // §6.3.5.1 p. 6-17, §8.3.1 pp. 8-4–5; SDM Vol 3A §6.9 p. 6-23). The test
 // runs first, ahead of any memory operand (decision O10: ASSUMED, as LOADALL
-// does; the sources give no order), and only in the protected regime, so the
+// does; the sources give no order), and only in protected or V86 contexts, so the
 // Real and Direct lowering is unchanged. A #UD that the lowering raised (a
 // reserved control register, or a LOCK prefix on a form the decode set does
 // not lock) keeps its place ahead of it (ASSUMED).
@@ -480,6 +486,7 @@ fn privilege_guard(
     insn: &Instruction,
     locked_mov: bool,
     generation: crate::CpuGeneration,
+    regime: crate::MachineRegime,
     ops: &mut Vec<IrOp>,
 ) {
     use crate::legacy::PrivilegeCheck;
@@ -493,6 +500,13 @@ fn privilege_guard(
             PrivilegeCheck::Cpl0
         }
         Mov if special(0) || special(1) => PrivilegeCheck::Cpl0,
+        // SDM Vol 3B §23.2.7 p. 23-10: six sensitive families. Valid
+        // LOCK and RET gain no V86 IOPL test (SDM Vol 2A LOCK pp. 3-565–566).
+        Pushf | Pushfd | Popf | Popfd | Int | Iret | Iretd
+            if regime == crate::MachineRegime::Virtual8086 =>
+        {
+            PrivilegeCheck::Iopl
+        }
         Cli | Sti => PrivilegeCheck::Iopl,
         // SDM Vol 2B REP Operation p. 4-564: with a zero count the string
         // instruction does not execute, so it makes no I/O test.
@@ -1099,7 +1113,10 @@ pub(super) fn lower(
     // 286 PRM App. B pp. B-21/60/66/71/72/102/108/111;
     // 386 PRM §17 pp. 17-25/89/98/106/108/159/166/169 (scans checked):
     // these instructions are protected-only, before any operand access.
-    if context.regime == crate::MachineRegime::Real
+    // SDM Vol 2A ARPL pp. 3-75–76, LAR p. 3-536, LLDT p. 3-559,
+    // LSL p. 3-575, LTR p. 3-577; Vol 2B SLDT p. 4-657, STR p. 4-679;
+    // Vol 2C VERR/VERW p. 5-163: V86 also raises #UD before operands.
+    if context.regime != crate::MachineRegime::Protected
         && matches!(
             insn.mnemonic(),
             Lldt | Sldt | Ltr | Str | Lar | Lsl | Verr | Verw | Arpl
@@ -1901,7 +1918,8 @@ pub(super) fn lower(
         {
             // 80386 PRM §§11.1.1–11.1.2 p. 11-1: ESC uses the attached
             // 387 in either regime. SDM Vol 1 §8.1.10, Figs. 8-9–8-12
-            // pp. 8-11–12: PE and operand size select the environment image.
+            // pp. 8-11–12; 486 PRM §15.1.6 pp. 15-8–10: V86 uses real
+            // formats, independently of operand size and PE.
             use crate::x87::{FpuKind as K, X87_ENV_REAL, X87_ENV16};
             let environment = match insn.mnemonic() {
                 Fldenv => Some(K::Fldenv),
@@ -1918,7 +1936,7 @@ pub(super) fn lower(
                     operand_offset,
                     instruction: 0,
                     fault: Default::default(),
-                    sti: if context.regime == crate::MachineRegime::Real {
+                    sti: if context.regime != crate::MachineRegime::Protected {
                         X87_ENV_REAL
                     } else {
                         0

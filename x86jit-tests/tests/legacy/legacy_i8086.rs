@@ -2460,11 +2460,7 @@ fn prefix_policy_changes_machine_identities() {
             0x7357_723a_3f16_2910,
             0xa812_1b75_802e_461b,
         ),
-        (
-            CpuModel::I80386,
-            0xe8d0_0c17_f97e_b71f,
-            0xc82b_1bb8_08a6_d958,
-        ),
+        (CpuModel::I80386, 0xe8d0_0c17_f97e_b71f, 0xf2f853469e22b1a1),
     ] {
         assert_eq!(model.profile().semantics_id, after, "{model:?}");
         assert_ne!(before, after, "{model:?}");

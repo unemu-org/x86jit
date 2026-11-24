@@ -852,7 +852,7 @@ pub(crate) fn scalar_for_test(
         model.profile(),
     )
     .map_err(|_| refusal(cpu, crate::UnsupportedSystemOperation::LegacyInstruction))?;
-    execute_for_test::<true>(
+    execute_for_test::<true, false>(
         &ir,
         cpu,
         memory,
@@ -863,7 +863,7 @@ pub(crate) fn scalar_for_test(
 }
 
 #[cfg(feature = "test-hooks")]
-pub(crate) fn execute_for_test<const PAGED: bool>(
+pub(crate) fn execute_for_test<const PAGED: bool, const V86: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -881,9 +881,17 @@ where
         ops: &ir.ops,
     };
     if PAGED {
-        return execute(ir, &view, cpu, &mem, &mut scratch, context, task_switch);
+        return execute::<false, 0, PAGED, V86>(
+            ir,
+            &view,
+            cpu,
+            &mem,
+            &mut scratch,
+            context,
+            task_switch,
+        );
     }
-    execute_instruction::<false, 0, PAGED>(
+    execute_instruction::<false, 0, PAGED, V86>(
         ir,
         &InstructionView {
             guest_start: ir.guest_start,
@@ -1110,7 +1118,7 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn execute<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+pub(super) fn execute<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>(
     block: &IrBlock,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -1122,7 +1130,7 @@ pub(super) fn execute<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
 where
     PagingMode<PAGED>: PagingStorage,
 {
-    execute_with_retry(
+    execute_with_retry::<ROUTED, ORDER, PAGED, V86>(
         block,
         ir,
         cpu,
@@ -1137,7 +1145,7 @@ where
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn execute_with_retry<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+fn execute_with_retry<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>(
     block: &IrBlock,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -1215,7 +1223,7 @@ where
             let mut preview_cpu = cpu.clone();
             let mut preview_tasks = task_switch.clone();
             let mut preview_temps = temps.to_vec();
-            let preview = execute_instruction::<ROUTED, ORDER, true>(
+            let preview = execute_instruction::<ROUTED, ORDER, true, V86>(
                 block,
                 ir,
                 &mut preview_cpu,
@@ -1241,7 +1249,7 @@ where
             tx.read_cursor = 0;
         }
         let before_commit = cpu.clone();
-        let result = execute_instruction::<ROUTED, ORDER, true>(
+        let result = execute_instruction::<ROUTED, ORDER, true, V86>(
             block,
             ir,
             cpu,
@@ -1783,7 +1791,7 @@ pub(super) fn task_image<const ROUTED: bool, const ORDER: u8>(
 
 #[cold]
 #[inline(never)]
-pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8>(
+pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -1798,7 +1806,7 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8>(
         guest_len: ir.guest_len,
         ops: &ir.ops,
     };
-    execute_with_retry(
+    execute_with_retry::<ROUTED, ORDER, true, V86>(
         ir,
         &view,
         cpu,

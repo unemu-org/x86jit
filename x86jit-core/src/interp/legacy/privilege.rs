@@ -798,7 +798,7 @@ fn restricted_flags(cpu: &mut CpuState, generation: CpuGeneration, image: u32) -
 /// IOPL: IOPL can change within a context through a CPL-0 POPF.
 #[cold]
 #[inline(never)]
-pub(super) fn check<const ROUTED: bool, const ORDER: u8>(
+pub(super) fn check<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     generation: CpuGeneration,
@@ -806,16 +806,18 @@ pub(super) fn check<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<(), Exit> {
     let cpl = cpu.legacy.cpl;
     let iopl = ((cpu.rflags_system >> 12) & 3) as u8;
+    // SDM Vol 3B §23.2.8.1 p. 23-11: V86 never bypasses the bitmap,
+    // even at IOPL=3. The false specialization keeps protected checks intact.
     let (permitted, access) = match kind {
         legacy::PrivilegeCheck::Cpl0 => (cpl == 0, None),
         legacy::PrivilegeCheck::Iopl => (cpl <= iopl, None),
         legacy::PrivilegeCheck::IoPort { port, size } => (
-            cpl <= iopl,
+            !V86 && cpl <= iopl,
             Some((port.map_or(cpu.gpr[RDX] as u16, u16::from), size)),
         ),
         // SDM Vol 2B REP Operation p. 4-564: a zero count executes nothing.
         legacy::PrivilegeCheck::RepIoPort { count_bytes, size } => (
-            cpl <= iopl || cpu.gpr[RCX] & mask(count_bytes) == 0,
+            (!V86 && cpl <= iopl) || cpu.gpr[RCX] & mask(count_bytes) == 0,
             Some((cpu.gpr[RDX] as u16, size)),
         ),
     };

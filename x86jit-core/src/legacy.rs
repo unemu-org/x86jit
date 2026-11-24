@@ -62,6 +62,7 @@ pub struct LegacyCpuModel {
 pub enum MachineRegime {
     Real,
     Protected,
+    Virtual8086,
 }
 
 /// Lift-time segment-access proof (decision-23 §5).
@@ -76,7 +77,7 @@ pub struct MachineContext {
     pub segment_class: SegmentClass,
     /// Instruction-generation policy, independent of decoder width.
     pub generation: CpuGeneration,
-    /// Real or protected execution regime derived from the retained CPU state.
+    /// Real, protected or virtual-8086 execution regime derived from the retained CPU state.
     pub regime: MachineRegime,
     /// Default operand width (16 or 32 bits) before instruction prefixes.
     pub default_operand_bits: u8,
@@ -249,6 +250,13 @@ pub fn derive_legacy_context(
     model: LegacyCpuModel,
     cpu: &CpuState,
 ) -> Result<MachineContext, MachineContextError> {
+    derive_context::<false>(model, cpu)
+}
+
+fn derive_context<const V86: bool>(
+    model: LegacyCpuModel,
+    cpu: &CpuState,
+) -> Result<MachineContext, MachineContextError> {
     use MachineContextError::*;
     let state = &cpu.legacy;
     let protected = state.cr0 & 1 != 0;
@@ -308,6 +316,9 @@ pub fn derive_legacy_context(
     // authoritative; guest reloads and the coherent setter validate proposed pairs.
     // SDM Vol 1 §3.4.3.3: VM and TF are stored separately from arithmetic flags.
     if cpu.rflags_system & (1 << 17) != 0 {
+        if V86 {
+            return virtual8086_context(model, cpu);
+        }
         return Err(Virtual8086Unsupported);
     }
     let bits = if cs.attributes & (1 << 14) != 0 {
@@ -356,6 +367,91 @@ pub fn derive_legacy_context(
         cpl: state.cpl,
         paging_enabled: paging,
     })
+}
+
+// SDM Vol 3B §§23.2.1, 23.2.4 pp. 23-6–8; 386 PRM §§15.1–15.2
+// pp. 15-1–4: VM requires PE, CPL is 3, and the defaults are all 16 bits.
+// The public entry retains its refusal until V86 transfers are implemented.
+#[cold]
+fn virtual8086_context(
+    model: LegacyCpuModel,
+    cpu: &CpuState,
+) -> Result<MachineContext, MachineContextError> {
+    use MachineContextError::*;
+    if model.generation != CpuGeneration::I386 || cpu.legacy.cr0 & 1 == 0 {
+        return Err(Virtual8086Unsupported);
+    }
+    if cpu.legacy.cpl != 3 {
+        return Err(InvalidPrivilege);
+    }
+    if cpu.legacy.reset_fetch != 0
+        || cpu.legacy.segments.iter().enumerate().any(|(i, cache)| {
+            *cache != virtual8086_cache([cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs][i], i == 0)
+        })
+    {
+        return Err(InvalidStorage);
+    }
+    Ok(MachineContext {
+        segment_class: SegmentClass::Checked,
+        generation: model.generation,
+        regime: MachineRegime::Virtual8086,
+        default_operand_bits: 16,
+        default_address_bits: 16,
+        stack_address_bits: 16,
+        cpl: 3,
+        paging_enabled: cpu.legacy.cr0 & (1 << 31) != 0,
+    })
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn derive_virtual8086_context_for_test(
+    model: LegacyCpuModel,
+    cpu: &CpuState,
+) -> Result<MachineContext, MachineContextError> {
+    if cpu.rflags_system & (1 << 17) == 0 {
+        return Err(MachineContextError::Virtual8086Unsupported);
+    }
+    derive_context::<true>(model, cpu)
+}
+
+// 386 PRM §15.1.2 pp. 15-2–3; SDM Vol 3B §23.2 p. 23-5:
+// no descriptor lookup or inherited big-real attributes. ASSUMED: use the
+// existing real-cache attribute labels as the canonical internal image.
+pub(crate) fn virtual8086_cache(selector: u16, code: bool) -> SegmentCache {
+    SegmentCache {
+        base: u32::from(selector) << 4,
+        limit: 0xffff,
+        attributes: if code { 0x9b } else { 0x93 },
+        ..SegmentCache::default()
+    }
+}
+
+// SDM Vol 3B §23.2 p. 23-5 incorporates §23.1.1 pp. 23-1–2;
+// Vol 2A BOUND p. 3-106: overrides never relax the whole-operand 64-KiB
+// bound, and SS faults use #SS(0), other segments #GP(0).
+pub(crate) fn virtual8086_access(
+    cpu: &CpuState,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+    access: crate::AccessKind,
+) -> Result<u64, crate::Exit> {
+    if offset
+        .checked_add(u64::from(bytes.saturating_sub(1)))
+        .is_none_or(|last| last > 0xffff)
+    {
+        return Err(segment_fault(
+            cpu,
+            if segment == SegmentId::Ss { 12 } else { 13 },
+            offset,
+            bytes,
+            access,
+        ));
+    }
+    Ok(
+        (u64::from([cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs][segment as usize]) << 4)
+            + offset,
+    )
 }
 
 impl CpuState {
@@ -709,6 +805,53 @@ mod tests {
             let mut cpu = CpuState::legacy_real_entry([0; 6]);
             edit(&mut cpu);
             assert_eq!(derive_legacy_context(model, &cpu), Err(*error));
+        }
+    }
+
+    #[test]
+    fn virtual8086_context_round_trips_without_new_state_or_widths() {
+        // SDM Vol 3B §§23.2.1, 23.2.4 pp. 23-6–8: CPL=3 independent
+        // of selector low bits. Internal admission validates, never repairs.
+        for model in [
+            crate::CpuModel::I80386,
+            crate::CpuModel::I80486Dx,
+            crate::CpuModel::I80486DxCpuid,
+        ] {
+            let model = model.legacy_model();
+            let mut cpu = CpuState::legacy_real_entry([0x100, 0, 1, 2, 3, 0xffff]);
+            let real = derive_legacy_context(model, &cpu).unwrap();
+            cpu.legacy.cr0 = 1;
+            cpu.legacy.cpl = 3;
+            cpu.rflags_system = 1 << 17;
+            let v86 = derive_context::<true>(model, &cpu).unwrap();
+            assert_eq!(v86.regime, MachineRegime::Virtual8086);
+            assert_eq!(v86.segment_class, SegmentClass::Checked);
+            assert_eq!(
+                (
+                    v86.default_operand_bits,
+                    v86.default_address_bits,
+                    v86.stack_address_bits,
+                    v86.cpl
+                ),
+                (16, 16, 16, 3)
+            );
+            assert_eq!(
+                derive_legacy_context(model, &cpu),
+                Err(MachineContextError::Virtual8086Unsupported)
+            );
+            let checkpoint = cpu.clone();
+            cpu.legacy.cr0 |= 1 << 31;
+            assert!(derive_context::<true>(model, &cpu).unwrap().paging_enabled);
+            cpu = checkpoint;
+            assert_eq!(derive_context::<true>(model, &cpu).unwrap(), v86);
+            cpu.rflags_system = 0;
+            cpu.legacy.cpl = 0;
+            assert_eq!(
+                derive_legacy_context(model, &cpu).unwrap().regime,
+                MachineRegime::Protected
+            );
+            cpu.legacy.cr0 = 0;
+            assert_eq!(derive_legacy_context(model, &cpu).unwrap(), real);
         }
     }
 

@@ -106,11 +106,22 @@ fn encode_probe(code: Code, bits: u8, memory_operand: Option<u32>) -> Option<Vec
 fn every_legacy_probe_defines_temps_before_use() {
     let mut total = 0;
     for segment_class in [crate::SegmentClass::Checked, crate::SegmentClass::Direct] {
-        for regime in [MachineRegime::Real, MachineRegime::Protected] {
+        for regime in [
+            MachineRegime::Real,
+            MachineRegime::Protected,
+            MachineRegime::Virtual8086,
+        ] {
             for default_operand_bits in [16, 32] {
                 for stack_address_bits in [16, 32] {
                     if segment_class == crate::SegmentClass::Direct
                         && (regime != MachineRegime::Real
+                            || default_operand_bits != 16
+                            || stack_address_bits != 16)
+                    {
+                        continue;
+                    }
+                    if regime == MachineRegime::Virtual8086
+                        && (segment_class != crate::SegmentClass::Checked
                             || default_operand_bits != 16
                             || stack_address_bits != 16)
                     {
@@ -123,7 +134,11 @@ fn every_legacy_probe_defines_temps_before_use() {
                         default_operand_bits,
                         default_address_bits: default_operand_bits,
                         stack_address_bits,
-                        cpl: 0,
+                        cpl: if regime == MachineRegime::Virtual8086 {
+                            3
+                        } else {
+                            0
+                        },
                         paging_enabled: false,
                     };
                     let mut checked = 0;

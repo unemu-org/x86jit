@@ -135,11 +135,12 @@ REVIEWED_ENTRY_POINTS = {
         "model::profile_for_generation",
     },
     "x86jit-core/src/vm/legacy/paging.rs": {
-        # Machine-only paged dispatch and incoming-task fault ownership.
+        # Machine-only paged dispatch, incoming-task fault ownership, and the
+        # test-hooks-only unpaged INS completion at a coherent Machine boundary.
         "interp::legacy::tasks", "interp::legacy::BlockWalk",
         "interp::legacy::Outcome", "interp::legacy::Progress",
-        "interp::legacy::paging", "lift::legacy::instruction_for_profile",
-        "model::CpuModel", "model::decode",
+        "interp::legacy::paging", "interp::legacy::finish_port_input",
+        "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
     },
 }
 
