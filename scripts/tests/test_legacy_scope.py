@@ -76,6 +76,8 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::unified_read_retry",
     },
     "x86jit-core/src/interp/mod.rs": {
+        # Feature-gated internal scalar paging witnesses; Machine profiles only.
+        "interp::legacy::paging", "model::CpuModel",
         "interp::i8086::Nec", "interp::i8086::bus_evidence",
         "interp::i8086::mod", "interp::i8086::nec", "interp::i8086::physical",
         "interp::i8086::port_string_fault", "interp::i8086::primitive",

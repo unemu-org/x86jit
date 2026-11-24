@@ -151,6 +151,11 @@ pub enum UnsupportedSystemOperation {
     /// Reserved compatibility discriminant. Machine I/O now checks the live
     /// TSS bitmap (80386 PRM §8.3.2 pp. 8-5–6) and does not produce this refusal.
     LegacyIoPermissionBitmap,
+    /// Engine policy: page-directory/table storage must be ordinary RAM.
+    PagingTableStorage,
+    /// Internal paging policy: split device operands require a retained bus
+    /// continuation plan (paging design §5 step 5).
+    PagingSplitDevice,
 }
 
 /// Reason `run()` returned control to the user (§5.2).

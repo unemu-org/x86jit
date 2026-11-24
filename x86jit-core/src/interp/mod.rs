@@ -13847,3 +13847,16 @@ mod legacy_refusal_tests {
         }
     }
 }
+
+/// Internal paging witness entry. Instruction bytes are supplied without fetching.
+/// Only scalar data instructions are accepted; public Machine PG=1 stays refused.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn interpret_paged_scalar_for_test(
+    code: &[u8],
+    model: crate::CpuModel,
+    cpu: &mut CpuState,
+    memory: &Memory,
+) -> Result<(), Exit> {
+    legacy::paging::scalar_for_test(code, model, cpu, memory)
+}

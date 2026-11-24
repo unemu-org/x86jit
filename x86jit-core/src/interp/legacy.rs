@@ -1,6 +1,7 @@
 //! Machine memory and transactional system helpers for the shared interpreter
 //! (decision-18 §§1, 4; spec.md §§8.1, 17).
 use super::*;
+pub(super) mod paging;
 mod privilege;
 pub(crate) mod tasks;
 use crate::legacy::{
@@ -396,7 +397,7 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 // cursor restarts with the instruction, including reads served from the ledger.
 // Writes retain their separate bit-63 namespace; descriptor snapshots use bit 62.
 // `physical_mask` is the context model's bus mask (`legacy::physical_mask`).
-struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
+struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool = false> {
     access: &'a Access<ROUTED, ORDER>,
     read_index: Cell<u16>,
     writes: Option<&'a dyn Fn(u64, u8)>,
@@ -405,7 +406,9 @@ struct LegacyAccess<'a, const ROUTED: bool, const ORDER: u8> {
     /// checks; see `wraps_in_segment`.
     frozen_alias: bool,
 }
-impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
+impl<'a, const ROUTED: bool, const ORDER: u8, const PAGED: bool>
+    LegacyAccess<'a, ROUTED, ORDER, PAGED>
+{
     fn new(memory: &'a Memory, physical_mask: u32) -> Self {
         Self {
             access: Access::new(memory),
@@ -424,7 +427,9 @@ impl<'a, const ROUTED: bool, const ORDER: u8> LegacyAccess<'a, ROUTED, ORDER> {
         }
     }
 }
-impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for LegacyAccess<'_, ROUTED, ORDER> {
+impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> std::ops::Deref
+    for LegacyAccess<'_, ROUTED, ORDER, PAGED>
+{
     type Target = Access<ROUTED, ORDER>;
     fn deref(&self) -> &Self::Target {
         self.access
@@ -447,6 +452,11 @@ impl<const ROUTED: bool, const ORDER: u8> std::ops::Deref for AddressKeyed<'_, R
 // stages, whose existing transfers retain address-based retry keys. Every
 // view carries its model's physical-address mask (`legacy::physical_mask`).
 trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
+    const PAGED: bool = false;
+    #[inline(always)]
+    fn paged(&self) -> bool {
+        Self::PAGED
+    }
     fn raw(&self) -> &Access<ROUTED, ORDER>;
     fn read_key(&self, addr: u64) -> u64;
     /// The key `read_key` gives the read of `addr` that comes `ahead` reads
@@ -483,9 +493,10 @@ impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
         self.physical_mask
     }
 }
-impl<const ROUTED: bool, const ORDER: u8> LegacyMemory<ROUTED, ORDER>
-    for LegacyAccess<'_, ROUTED, ORDER>
+impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> LegacyMemory<ROUTED, ORDER>
+    for LegacyAccess<'_, ROUTED, ORDER, PAGED>
 {
+    const PAGED: bool = PAGED;
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.access
     }
@@ -519,6 +530,9 @@ fn read<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
+    if mem.paged() {
+        return paging::read(cpu, mem, addr, size, AccessKind::Read);
+    }
     let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     let low = read_physical(cpu, mem, addr, physical, part)?;
     if part == size {
@@ -803,6 +817,9 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
+    if mem.paged() {
+        return paging::write(cpu, mem, addr, size, value);
+    }
     let value = value & mask(size);
     let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     if part == size {
@@ -893,6 +910,9 @@ fn probe<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
+    if mem.paged() {
+        return paging::probe(cpu, mem, addr, size);
+    }
     let (physical, part) = legacy::physical_span(cpu, mem.physical_mask(), addr, size);
     probe_physical(cpu, mem, addr, physical, part)?;
     if part < size {
@@ -1974,9 +1994,9 @@ struct InstructionView<'a> {
 // no region faults before any transfer (`integer::locked_pieces`).
 #[cold]
 #[inline(never)]
-fn locked_split<const ROUTED: bool, const ORDER: u8>(
+fn locked_split<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     cpu: &mut CpuState,
-    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
     ir: &InstructionView<'_>,
     linear: u64,
     src: u64,
@@ -2139,7 +2159,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
         ir.verify_temp_defs()
     );
     let context = ir.legacy_context.expect("legacy interpreter context");
-    execute_instruction::<ROUTED, ORDER>(
+    execute_instruction::<ROUTED, ORDER, false>(
         ir,
         &InstructionView {
             guest_start: ir.guest_start,
@@ -2154,11 +2174,11 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
     )
 }
 
-fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
+fn execute_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     block: &IrBlock,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
-    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
     temps: &mut [u64],
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
@@ -2306,6 +2326,11 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8>(
         // SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1: retirement clears RF.
         cpu.rflags_system &= !(1 << 16);
     }
+    if PAGED {
+        if let Err(exit) = &result {
+            paging::publish_cr2(cpu, exit);
+        }
+    }
     result
 }
 
@@ -2394,7 +2419,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
             _ => ir.guest_start + u64::from(ir.guest_len),
         };
         cpu.rip = guest_addr;
-        match execute_instruction::<ROUTED, ORDER>(
+        match execute_instruction::<ROUTED, ORDER, false>(
             ir,
             &InstructionView {
                 guest_start: guest_addr,
@@ -2828,7 +2853,7 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
         retired: true,
         ..Outcome::default()
     };
-    let result = execute_op::<ROUTED, ORDER>(
+    let result = execute_op::<ROUTED, ORDER, false>(
         &ops[0],
         &InstructionView {
             guest_start: ip,
@@ -2990,11 +3015,11 @@ fn loop_ip(
 // The shared opcode iterator delegates only the Machine-specific accesses and
 // system helpers here; scalar arithmetic has one interpretation (spec.md §8.1).
 #[allow(clippy::too_many_arguments)]
-fn execute_op<const ROUTED: bool, const ORDER: u8>(
+fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
     op: &IrOp,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
-    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
     temps: &mut [u64],
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
@@ -3335,8 +3360,26 @@ fn execute_op<const ROUTED: bool, const ORDER: u8>(
             size,
         } => {
             let address = read_val(*addr, temps);
-            temps[*dst as usize] = read(cpu, mem, address, *size)
-                .map_err(|exit| operand_fault(exit, cpu.rip, address, *fault))?;
+            temps[*dst as usize] = if PAGED {
+                let write = ir
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, IrOp::Store { addr: stored, .. } if stored == addr));
+                paging::read(
+                    cpu,
+                    mem,
+                    address,
+                    *size,
+                    if write {
+                        AccessKind::Write
+                    } else {
+                        AccessKind::Read
+                    },
+                )
+            } else {
+                read(cpu, mem, address, *size)
+            }
+            .map_err(|exit| operand_fault(exit, cpu.rip, address, *fault))?;
             None
         }
         IrOp::Store {
@@ -4561,15 +4604,15 @@ pub(super) fn machine_specific(op: &IrOp) -> bool {
     )
 }
 
-struct InstructionExecution<'a, 'b, const ROUTED: bool, const ORDER: u8> {
+struct InstructionExecution<'a, 'b, const ROUTED: bool, const ORDER: u8, const PAGED: bool> {
     ir: &'a InstructionView<'a>,
-    mem: &'a LegacyAccess<'a, ROUTED, ORDER>,
+    mem: &'a LegacyAccess<'a, ROUTED, ORDER, PAGED>,
     context: MachineContext,
     task_switch: &'b mut tasks::SwitchState,
     outcome: Outcome,
 }
-impl<const ROUTED: bool, const ORDER: u8> super::InstructionExecutor<'_>
-    for &mut InstructionExecution<'_, '_, ROUTED, ORDER>
+impl<const ROUTED: bool, const ORDER: u8, const PAGED: bool> super::InstructionExecutor<'_>
+    for &mut InstructionExecution<'_, '_, ROUTED, ORDER, PAGED>
 {
     fn enabled(&self) -> bool {
         true

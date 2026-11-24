@@ -87,6 +87,7 @@ pub enum FaultCause {
     PendingX87,
     Breakpoint,
     DebugTrap,
+    PageTranslation,
     Unknown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +140,19 @@ impl FaultAddress {
         self.space
     }
 }
+/// Physical table transfer that failed before a paging result was available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagingWalkLevel {
+    Directory,
+    Table,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagingWalk {
+    pub level: PagingWalkLevel,
+    /// Address before the model bus mask and A20 gate.
+    pub physical_address: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferUnit {
     Bytes,
@@ -386,6 +400,7 @@ pub struct FaultMetadata {
     pub(crate) raw_host_fault: Option<RawHostFault>,
     pub(crate) progress: FaultProgress,
     pub(crate) physical_address: Knowledge<u64>,
+    pub(crate) paging_walk: Option<PagingWalk>,
 }
 impl FaultMetadata {
     /// Unqualified evidence; useful to custom backends without a complete model.
@@ -417,6 +432,7 @@ impl FaultMetadata {
                 acknowledged: Box::new([]),
             },
             physical_address: Knowledge::Unknown,
+            paging_walk: None,
         }
     }
     /// Cause-specific architectural evidence. Unsupported causes remain Unknown.
@@ -477,6 +493,10 @@ impl FaultMetadata {
         m.instruction_rip = Knowledge::Known(instruction_rip);
         m.error_code = error_code;
         m
+    }
+
+    pub fn paging_walk(&self) -> Option<PagingWalk> {
+        self.paging_walk
     }
 
     /// Execution evidence; legacy/custom exits without a witness remain Unknown.
@@ -1412,6 +1432,7 @@ pub fn cause_to_wire(cause: FaultCause) -> u64 {
         FaultCause::PendingX87 => 9,
         FaultCause::Breakpoint => 10,
         FaultCause::DebugTrap => 11,
+        FaultCause::PageTranslation => 12,
         FaultCause::Unknown => 0,
     }
 }
@@ -1428,6 +1449,7 @@ pub(crate) fn cause_from_wire(value: u64) -> FaultCause {
         9 => FaultCause::PendingX87,
         10 => FaultCause::Breakpoint,
         11 => FaultCause::DebugTrap,
+        12 => FaultCause::PageTranslation,
         _ => FaultCause::Unknown,
     }
 }
