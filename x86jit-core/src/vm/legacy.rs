@@ -7,11 +7,14 @@ use crate::legacy::{
 };
 use crate::IrOp;
 use iced_x86::{Decoder, DecoderError};
+use std::hash::{Hash, Hasher};
 
 // The NMI input's cold helpers (spec.md §17.10), in their own module so that
 // this module's hot dispatcher code keeps its code-generation unit.
 mod nmi;
 mod paging;
+
+mod flat32;
 
 /// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
 /// domains distinct even when a vCPU moves between VMs; zero is never issued.
@@ -24,7 +27,9 @@ pub(crate) fn paging_generation() -> u64 {
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// The retained context stamp guards the segment class. Flat32 and paging
+// also own separate proof maps, so the shared key need not hash that class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LegacyBlockKey {
     owner_id: u64,
     context_id: u64,
@@ -35,6 +40,18 @@ struct LegacyBlockKey {
     decode_ip: u32,
     linear_fetch: u32,
     mxcsr_mode: u32,
+}
+impl Hash for LegacyBlockKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.owner_id.hash(state);
+        self.context_id.hash(state);
+        self.model_semantics_id.hash(state);
+        // Preserve RandomState's byte stream without three short hasher calls.
+        state.write(&[self.decode_bits, self.stack_bits, self.regime as u8]);
+        self.decode_ip.hash(state);
+        self.linear_fetch.hash(state);
+        self.mxcsr_mode.hash(state);
+    }
 }
 // `eq` below is the derived field-by-field comparison, so the derived `Hash` agrees.
 #[allow(clippy::derived_hash_with_manual_eq)]
@@ -504,6 +521,7 @@ pub(super) struct Execution {
     stall_retired: u64,
     stall_count: u32,
     paging: Option<Box<paging::State>>,
+    flat32: flat32::State,
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
 }
 impl Execution {
@@ -542,6 +560,7 @@ impl Execution {
             stall_retired: 0,
             stall_count: 0,
             paging: None,
+            flat32: flat32::State::default(),
         }
     }
     // Whether deliveries copy the registers they begin with for the delivery
@@ -598,6 +617,7 @@ impl Execution {
         self.invalidate_paging();
         self.direct_proofs.clear();
         self.blocks.clear();
+        self.flat32 = flat32::State::default();
         self.contexts.clear();
         self.stamp = None;
         self.validated = None;
@@ -648,6 +668,7 @@ impl Execution {
                         .0;
                     let evicted = self.contexts.remove(&oldest).unwrap();
                     self.blocks.retain(|key, _| key.context_id != evicted.id);
+                    self.flat32.evict_context(evicted.id);
                     evicted.id
                 } else {
                     self.contexts.len() as u64
@@ -676,6 +697,9 @@ impl Execution {
             if let Some(retry) = &self.instruction_retry {
                 return Ok((retry.ir.clone(), retry.walk));
             }
+        }
+        if context.segment_class == crate::SegmentClass::Flat32 {
+            return self.resolve_flat32(vm, cpu, model, context, _exit_word);
         }
         let linear_fetch = crate::legacy::access(
             cpu,
@@ -2954,7 +2978,9 @@ impl Vcpu {
                         MachineContext {
                             // The masked bus lowering retains the Direct proof;
                             // SMC uses the cheaper original Checked instruction IR.
-                            segment_class: if direct && !direct_bus {
+                            segment_class: if context.segment_class == crate::SegmentClass::Flat32 {
+                                crate::SegmentClass::Flat32
+                            } else if direct && !direct_bus {
                                 crate::SegmentClass::Direct
                             } else {
                                 crate::SegmentClass::Checked
@@ -3262,17 +3288,20 @@ impl Vcpu {
                                 .context()
                                 .is_some()
                         {
-                            let retry = if direct {
-                                retry_instruction(&ir, self.cpu.rip)
-                            } else {
-                                ir
-                            };
+                            let retry =
+                                if direct || context.segment_class == crate::SegmentClass::Flat32 {
+                                    retry_instruction(&ir, self.cpu.rip)
+                                } else {
+                                    ir
+                                };
                             self.legacy_execution.as_mut().unwrap().instruction_retry =
                                 Some(InstructionRetry {
                                     stamp: LegacyContextStamp::new(&self.cpu, model),
                                     ip: self.cpu.rip,
                                     mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-                                    walk: if direct {
+                                    walk: if context.segment_class == crate::SegmentClass::Flat32 {
+                                        BlockWalk::for_flat32(&retry)
+                                    } else if direct {
                                         BlockWalk::for_ir::<false>(&retry)
                                     } else {
                                         walk

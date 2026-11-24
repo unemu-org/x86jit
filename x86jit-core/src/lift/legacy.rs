@@ -344,8 +344,11 @@ pub(crate) fn instruction_for_profile(
             }));
         }
     }
+    if context.segment_class == crate::SegmentClass::Flat32 {
+        flat32_addresses(&mut ops.values);
+    }
     defer_store_flags(&mut ops.values, &mut tg);
-    if context.segment_class == crate::SegmentClass::Checked && rollback_required(&ops.values) {
+    if context.segment_class != crate::SegmentClass::Direct && rollback_required(&ops.values) {
         ops.values.insert(1, IrOp::Legacy(L::Checkpoint));
     }
     Ok(IrBlock {
@@ -593,6 +596,33 @@ fn locked_transfer(code: &[u8], ip: u32, context: MachineContext, error: LiftErr
     }
 }
 
+#[cold]
+#[inline(never)]
+fn flat32_addresses(ops: &mut [IrOp]) {
+    for op in ops {
+        if let IrOp::Legacy(L::Address {
+            dst,
+            segment,
+            offset,
+            bytes,
+            access,
+        }) = *op
+        {
+            if !matches!(segment, SegmentId::Fs | SegmentId::Gs)
+                && !(segment == SegmentId::Cs && access == crate::AccessKind::Write)
+            {
+                *op = IrOp::Legacy(L::Flat32Address {
+                    dst,
+                    segment,
+                    offset,
+                    bytes,
+                    access,
+                });
+            }
+        }
+    }
+}
+
 // spec.md §16: only a fault after a CPU-state commit needs rollback. Helper
 // transactions retain their own memory evidence and task partial-commit rules.
 fn rollback_required(ops: &[IrOp]) -> bool {
@@ -644,6 +674,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
             IrOp::Legacy(op) => !matches!(
                 op,
                 L::Address { .. }
+                    | L::Flat32Address { .. }
                     | L::CoprocessorOverrun { .. }
                     | L::DirectStackAddress { .. }
                     | L::ReadSelector { .. }

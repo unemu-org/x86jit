@@ -356,6 +356,49 @@ fn loadall<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+// 80386 PRM §§6.3.1.1–6.3.1.2 pp. 6-4–6: retain Checked's
+// whole-operand limit policy, including at FFFFFFFFh (decision-27).
+#[inline]
+fn flat32_address(
+    cpu: &CpuState,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+    access: AccessKind,
+) -> Result<u64, Exit> {
+    if offset
+        .checked_add(u64::from(bytes.saturating_sub(1)))
+        .is_none_or(|last| last > u64::from(u32::MAX))
+    {
+        return Err(legacy::segment_fault(
+            cpu,
+            if segment == SegmentId::Ss { 12 } else { 13 },
+            offset,
+            bytes,
+            access,
+        ));
+    }
+    Ok(offset)
+}
+
+#[cold]
+#[inline(never)]
+fn flat32_segment_access(
+    cpu: &CpuState,
+    context: MachineContext,
+    segment: SegmentId,
+    offset: u64,
+    bytes: u8,
+    access: AccessKind,
+) -> Result<u64, Exit> {
+    if !matches!(segment, SegmentId::Fs | SegmentId::Gs)
+        && !(segment == SegmentId::Cs && access == AccessKind::Write)
+    {
+        return flat32_address(cpu, segment, offset, bytes, access);
+    }
+    legacy::access(cpu, context.generation, segment, offset, bytes, access)
+}
+
 #[inline]
 fn segment_access(
     cpu: &CpuState,
@@ -367,6 +410,9 @@ fn segment_access(
 ) -> Result<u64, Exit> {
     if context.segment_class == crate::SegmentClass::Checked {
         return legacy::access(cpu, context.generation, segment, offset, bytes, access);
+    }
+    if context.segment_class == crate::SegmentClass::Flat32 {
+        return flat32_segment_access(cpu, context, segment, offset, bytes, access);
     }
     // Direct proof was derived at the context boundary (decision-23 §5).
     // Fault vectors: I286 PRM Appendix B MOV p. B-74; I386 PRM §14.6 Table 14-1.
@@ -2361,7 +2407,7 @@ where
         .map(|(outcome, _)| outcome);
     }
     mem.read_index.set(0);
-    let checked = context.segment_class == crate::SegmentClass::Checked;
+    let checked = context.segment_class != crate::SegmentClass::Direct;
     if checked && !ir.ops.iter().all(supported) {
         return Err(refusal(
             cpu,
@@ -2511,6 +2557,23 @@ where
     result
 }
 
+pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
+    ir.ops.iter().all(|op| match op {
+        IrOp::Legacy(op) => matches!(
+            op,
+            L::Address { .. }
+                | L::Flat32Address { .. }
+                | L::I486Gate
+                | L::Checkpoint
+                | L::ReadSelector { .. }
+                | L::Transfer { cs: None, .. }
+                | L::Return { far: false, .. }
+                | L::Loop { .. }
+        ),
+        _ => supported(op),
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BlockWalk {
     Shared,
@@ -2519,6 +2582,16 @@ pub(crate) enum BlockWalk {
     Protected,
 }
 impl BlockWalk {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn for_flat32(ir: &IrBlock) -> Self {
+        if flat32_ordinary(ir) {
+            Self::Direct
+        } else {
+            Self::Protected
+        }
+    }
+
     pub(crate) fn for_ir<const SYSTEM: bool>(ir: &IrBlock) -> Self {
         if SYSTEM
             && ir
@@ -4212,6 +4285,16 @@ where
                         outcome.software_interrupt = true;
                         return Ok(true);
                     }
+                }
+                L::Flat32Address {
+                    dst,
+                    segment,
+                    offset,
+                    bytes,
+                    access,
+                } => {
+                    temps[*dst as usize] =
+                        flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access)?;
                 }
                 L::Address {
                     dst,

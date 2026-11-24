@@ -136,6 +136,11 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::Progress", "model::CpuModel", "model::NmiNesting",
         "model::profile_for_generation",
     },
+    "x86jit-core/src/vm/legacy/flat32.rs": {
+        # Reached only from Machine PG=0 after deriving the Flat32 proof.
+        "interp::legacy::flat32_ordinary", "lift::legacy::instruction_for_profile",
+        "model::CpuModel", "model::decode",
+    },
     "x86jit-core/src/vm/legacy/paging.rs": {
         # Machine-only paged dispatch, incoming-task fault ownership, and the
         # test-hooks-only unpaged INS completion at a coherent Machine boundary.

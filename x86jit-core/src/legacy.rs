@@ -66,10 +66,11 @@ pub enum MachineRegime {
 }
 
 /// Lift-time segment-access proof (decision-23 §5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SegmentClass {
     Direct,
     Checked,
+    Flat32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +349,21 @@ fn derive_context<const V86: bool>(
                         }
                 }) {
             SegmentClass::Direct
+        } else if protected
+            && !paging
+            && state.cpl == 0
+            && bits == 32
+            && ss.attributes & (1 << 14) != 0
+            && state.segments[..4].iter().enumerate().all(|(i, c)| {
+                // SDM Vol 3A §§3.4.5–3.4.5.1: ordinary present,
+                // nonconforming readable code and expand-up writable data.
+                c.base == 0
+                    && c.limit == u32::MAX
+                    && c.unusable == 0
+                    && c.attributes & 0x9e == if i == 0 { 0x9a } else { 0x92 }
+            })
+        {
+            SegmentClass::Flat32
         } else {
             SegmentClass::Checked
         },
@@ -904,6 +920,14 @@ pub enum LegacyOp {
     /// Architectural rollback is required by this instruction's helper lowering.
     Checkpoint,
     Address {
+        dst: crate::ir::Temp,
+        segment: SegmentId,
+        offset: crate::ir::Val,
+        bytes: u8,
+        access: crate::AccessKind,
+    },
+    /// Flat32 retains the whole-operand boundary check (decision-27).
+    Flat32Address {
         dst: crate::ir::Temp,
         segment: SegmentId,
         offset: crate::ir::Val,

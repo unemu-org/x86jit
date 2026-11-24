@@ -3262,3 +3262,32 @@ fn an_edited_state_abandons_an_nmi_task_switch_and_its_blocking() {
         assert!(cpu.nmi_ready(), "no blocking left");
     }
 }
+
+#[test]
+fn flat32_task_switch_reselects_from_incoming_caches() {
+    use x86jit_core::{derive_legacy_context, SegmentClass};
+    let model = CpuModel::I80386;
+    let (vm, mut cpu) = setup_tasks(model, true, b"\x90");
+    for (i, c) in cpu.cpu.legacy.segments[..4].iter_mut().enumerate() {
+        c.base = 0;
+        c.limit = u32::MAX;
+        c.attributes = if i == 0 { 0x409b } else { 0x4093 };
+    }
+    vm.write_bytes(cpu.cpu.rip, b"\x40\x66\xea\x00\x00\x20\x00")
+        .unwrap();
+    assert_eq!(
+        derive_legacy_context(cpu.legacy_cpu_model().unwrap(), &cpu.cpu)
+            .unwrap()
+            .segment_class,
+        SegmentClass::Flat32
+    );
+    steps(&mut cpu, &vm, 2);
+    assert_eq!(cpu.cpu.legacy.tr.selector, B);
+    assert_eq!(cpu.cpu.rip, 0x1800);
+    assert_eq!(
+        derive_legacy_context(cpu.legacy_cpu_model().unwrap(), &cpu.cpu)
+            .unwrap()
+            .segment_class,
+        SegmentClass::Checked
+    );
+}

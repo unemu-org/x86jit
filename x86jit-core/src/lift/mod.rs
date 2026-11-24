@@ -5205,7 +5205,7 @@ pub(crate) fn add_addr(a: Val, b: Val, ops: &mut impl LiftBuffer, tg: &mut TempG
     // fits the ordinary 64-KiB segment, so its linear sum cannot overflow 32 bits.
     let size = if ops
         .legacy_context()
-        .is_some_and(|context| context.segment_class == crate::SegmentClass::Checked)
+        .is_some_and(|context| context.segment_class != crate::SegmentClass::Direct)
     {
         4
     } else {

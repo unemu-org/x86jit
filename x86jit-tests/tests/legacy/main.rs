@@ -16,6 +16,7 @@ mod legacy_delivery_liveness;
 mod legacy_delivery_log;
 mod legacy_direct;
 mod legacy_direct_parity;
+mod legacy_flat32;
 mod legacy_i286;
 mod legacy_i286_loadall;
 mod legacy_i286_quirks;

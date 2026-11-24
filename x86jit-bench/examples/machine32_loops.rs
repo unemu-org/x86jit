@@ -1,5 +1,6 @@
 //! Warm, finite five-instruction loops for the compiled-Machine J0 decision.
 //! Arguments: iterations (default 2M), rounds (default 5), optional path/workload.
+//! MACHINE32_MODEL=486 selects I80486Dx; the default is I80386.
 //! Application retirement is derived from the validated finite guest loop.
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,7 +87,10 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     let machine = path.starts_with("machine");
     let real = path == "machine-real16";
     if machine {
-        vm.set_cpu_model(CpuModel::I80386);
+        vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
+            Ok("486") => CpuModel::I80486Dx,
+            _ => CpuModel::I80386,
+        });
     }
     vm.set_exception_delivery(ExceptionDelivery::Outward);
     vm.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();

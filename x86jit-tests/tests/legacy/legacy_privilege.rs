@@ -2655,3 +2655,26 @@ fn jmp_through_a_gate_faults_in_order_and_sets_the_accessed_bit() {
         }
     }
 }
+
+#[test]
+fn flat32_call_gate_entry_and_outer_return_reselect_the_class() {
+    use x86jit_core::{derive_legacy_context, SegmentClass};
+    let model = CpuModel::I80386;
+    let (vm, mut cpu) = gate_world(model, 0x9a, 12, K_CODE, 0);
+    descriptor(&vm, 0x2008, 0, u32::MAX, 0xc09b);
+    descriptor(&vm, 0x2010, 0, u32::MAX, 0xc093);
+    vm.write_bytes(0x5000, b"\x66\xb8\x10\x00\x8e\xd8\x8e\xc0\x40\xcb")
+        .unwrap();
+    let class = |cpu: &Vcpu| {
+        derive_legacy_context(cpu.legacy_cpu_model().unwrap(), &cpu.cpu)
+            .unwrap()
+            .segment_class
+    };
+    assert_eq!(class(&cpu), SegmentClass::Checked);
+    steps(&mut cpu, &vm, 4); // gate, MOV AX, MOV DS, MOV ES
+    assert_eq!(cpu.cpu.legacy.cpl, 0);
+    assert_eq!(class(&cpu), SegmentClass::Flat32);
+    steps(&mut cpu, &vm, 2); // INC and outer RETF
+    assert_eq!(cpu.cpu.legacy.cpl, 3);
+    assert_eq!(class(&cpu), SegmentClass::Checked);
+}

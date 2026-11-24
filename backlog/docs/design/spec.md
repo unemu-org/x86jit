@@ -2495,6 +2495,24 @@ reset abandons it. The retry fingerprint conservatively includes all GPR
 storage and stored flags; editing any of these, or the owning translation
 context, abandons its operand snapshot and completion inputs before restarting.
 
+**Interpreted Flat32 (decision-27, order 2a).** Unpaged protected CPL 0 with
+CS.D=SS.B=1 and usable, ordinary present CS/DS/ES/SS caches with zero bases,
+full 32-bit limits, readable nonconforming code and writable expand-up data
+selects a third segment-access lowering. FS/GS and writes through CS retain
+Checked accesses. Whole-operand boundary checks, including #GP/#SS at the
+4-GiB edge, retain the Checked contract. The complete retained context stamp
+and private Machine key guard selection; context-changing instructions terminate
+blocks and entry revalidates embedder edits. Physical source registrations,
+mapping identity, fetch permits and publication generation guard a bounded
+private cache, separate from Application and Direct identity.
+
+Ordinary Flat32 instructions share interpreted blocks bounded by a linear page
+and 32 instructions; a straddling first instruction remains a singleton with
+its ordered physical spans. System, REP and event helpers retain singleton
+execution. The existing instruction walk finishes partial budgets exactly,
+charges only completed units and rolls back the faulting instruction at its
+own IP. SMC stops before a stale successor. Paging retains Checked singletons.
+
 PG=0 keeps its statically selected unpaged adapter;
 paged walks, transactions and proofs live in cold, non-inlined functions.
 

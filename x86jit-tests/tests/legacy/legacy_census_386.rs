@@ -1066,3 +1066,62 @@ fn runtime_census_x87_absent() {
     std::fs::write(&path, report).unwrap();
     println!("{}", path.display());
 }
+
+#[test]
+fn flat32_checked_census_forms_are_equal() {
+    use x86jit_core::{derive_legacy_context, SegmentClass};
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        let mut count = 0;
+        let mut sequences = 0;
+        // Retain register, absolute and SIB forms, both size overrides and
+        // string policies from the same public opcode census generator.
+        for mut p in probes(model, Mode::P32)
+            .into_iter()
+            .filter(comparable)
+            .step_by(17)
+        {
+            // Carry each result into INC EBX; XOR EDX,EBX; HLT. Budgets
+            // stop both within the sequence and after its terminal exit.
+            p.bytes.extend_from_slice(b"\x43\x31\xda\xf4");
+            for budget in [1, 3, 5] {
+                let (avm, mut a) = setup(model, &p, Mode::P32, false);
+                let (bvm, mut b) = setup(model, &p, Mode::P32, false);
+                assert_eq!(
+                    derive_legacy_context(a.legacy_cpu_model().unwrap(), &a.cpu)
+                        .unwrap()
+                        .segment_class,
+                    SegmentClass::Flat32
+                );
+                b.cpu.legacy.segments[2].limit -= 1;
+                let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                assert_eq!(
+                    format!("{ar:?}"),
+                    format!("{br:?}"),
+                    "{:02x?} budget={budget}",
+                    p.bytes
+                );
+                sequences += usize::from(ar.steps() > 1);
+                b.cpu.legacy.segments[2].limit += 1;
+                assert_eq!(
+                    format!("{:?}", a.cpu),
+                    format!("{:?}", b.cpu),
+                    "{:02x?}",
+                    p.bytes
+                );
+                assert_eq!(a.retired_instructions(), b.retired_instructions());
+                let mut am = vec![0; 0x20000];
+                let mut bm = vec![0; 0x20000];
+                avm.read_bytes(0, &mut am).unwrap();
+                bvm.read_bytes(0, &mut bm).unwrap();
+                assert_eq!(am, bm, "{:02x?}", p.bytes);
+            }
+            count += 1;
+        }
+        assert!(count > 100, "census unexpectedly small: {count}");
+        assert!(
+            sequences > 100,
+            "too few multi-instruction runs: {sequences}"
+        );
+    }
+}
