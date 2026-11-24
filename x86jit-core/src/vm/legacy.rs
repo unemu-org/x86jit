@@ -2916,9 +2916,7 @@ impl Vcpu {
                     }
                 }
                 let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
-                let resolved = if KIND == MACHINE_DISPATCH && context.paging_enabled {
-                    self.resolve_paged(vm, context)
-                } else if direct20 {
+                let resolved = if direct20 {
                     super::i8086::resolve(vm, &self.cpu, exit_word, physical)
                 } else if direct && !retained && !boundary.instruction_retry {
                     resolve_direct(
@@ -2929,6 +2927,10 @@ impl Vcpu {
                         physical,
                         &mut self.legacy_execution.as_mut().unwrap().direct_proofs,
                     )
+                } else if KIND == MACHINE_DISPATCH && context.paging_enabled {
+                    // Paged contexts are Checked. Keep their selection behind
+                    // the existing Direct source-proof fast path.
+                    self.resolve_paged(vm, context)
                 } else {
                     let execution = self.legacy_execution.as_mut().unwrap();
                     if execution.context_id == u64::MAX {
@@ -2996,9 +2998,7 @@ impl Vcpu {
                 } else {
                     limit.map_or(u64::MAX, |limit| limit - steps)
                 };
-                let progress = if KIND == MACHINE_DISPATCH && context.paging_enabled {
-                    self.execute_paged::<ROUTED, ORDER>(vm, &ir, context)
-                } else if direct20 {
+                let progress = if direct20 {
                     crate::interp::legacy::execute_shared20::<ROUTED, ORDER>(
                         &ir,
                         &mut self.cpu,
@@ -3013,17 +3013,21 @@ impl Vcpu {
                         false,
                     )
                 } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
-                    self.legacy_execution
-                        .as_mut()
-                        .unwrap()
-                        .execute_protected_block::<ROUTED, ORDER>(
-                            &ir,
-                            &mut self.cpu,
-                            &vm.mem,
-                            &mut self.interp_scratch,
-                            model,
-                            self.retired,
-                        )
+                    if context.paging_enabled {
+                        self.execute_paged::<ROUTED, ORDER>(vm, &ir, context)
+                    } else {
+                        self.legacy_execution
+                            .as_mut()
+                            .unwrap()
+                            .execute_protected_block::<ROUTED, ORDER>(
+                                &ir,
+                                &mut self.cpu,
+                                &vm.mem,
+                                &mut self.interp_scratch,
+                                model,
+                                self.retired,
+                            )
+                    }
                 } else {
                     crate::interp::legacy::execute_block::<ROUTED, ORDER>(
                         walk,

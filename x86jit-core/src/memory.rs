@@ -935,7 +935,7 @@ pub struct Memory {
     // byte ranges written since the last drain; `dirty_flag` lets the hot path skip the lock.
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
-    code_page: Arc<Box<[AtomicU64]>>,
+    code_page: CodePages,
     code_aliases: Arc<Mutex<CodeAliases>>,
     code_tag_epoch: AtomicU64,
     code_barrier_epoch: AtomicU64,
@@ -981,10 +981,47 @@ pub struct Memory {
 // flat byte buffer (bounds-checked per access).
 unsafe impl Sync for Memory {}
 
+/// Shared bitmap ownership with ordinary slice metadata on the store path.
+/// The allocation never moves or resizes. Keep the data pointer and length
+/// together so probes have the same loads as an owned boxed slice.
+#[repr(C)]
+struct CodePages {
+    data: *const AtomicU64,
+    len: usize,
+    owner: Arc<[AtomicU64]>,
+}
+
+// SAFETY: data points into owner, which keeps the fixed allocation alive.
+// Its elements are atomic and can be shared or moved between threads.
+unsafe impl Send for CodePages {}
+// SAFETY: the same owned atomic allocation is safe to access concurrently.
+unsafe impl Sync for CodePages {}
+
+impl CodePages {
+    fn new(words: Box<[AtomicU64]>) -> Self {
+        let owner: Arc<[AtomicU64]> = Arc::from(words);
+        Self {
+            data: owner.as_ptr(),
+            len: owner.len(),
+            owner,
+        }
+    }
+}
+
+impl std::ops::Deref for CodePages {
+    type Target = [AtomicU64];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: data/len describe owner's fixed allocation. Borrowing the
+        // slice from self keeps owner alive for the entire returned borrow.
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
 /// Counted source tags for private proofs. Tracking storage can outlive Memory:
 /// a vCPU may be dropped after its VM, or reused with a different VM.
 pub(crate) struct CodeRegistration {
-    code_page: Arc<Box<[AtomicU64]>>,
+    code_page: Arc<[AtomicU64]>,
     aliases: Arc<Mutex<CodeAliases>>,
     base_page: u64,
     pages: BTreeSet<u64>,
@@ -1563,7 +1600,7 @@ impl Memory {
     ) -> Self {
         let guest_base = backing.guest_base();
         let source_barrier = crate::process_barrier::ProcessBarrier::new();
-        let code_page = Arc::new(code_page);
+        let code_page = CodePages::new(code_page);
         let code_aliases = Mutex::new(CodeAliases::default());
         let code_aliases = Arc::new(code_aliases);
         Self {
@@ -1707,7 +1744,7 @@ impl Memory {
             self.refresh_code_page(&aliases, page);
         }
         CodeRegistration {
-            code_page: self.code_page.clone(),
+            code_page: self.code_page.owner.clone(),
             aliases: self.code_aliases.clone(),
             base_page: self.guest_base >> CODE_PAGE_BITS,
             pages,
@@ -5232,7 +5269,7 @@ mod tests {
         m.map(base, LEN, Prot::RWX, RegionKind::Ram).unwrap();
         assert!(is_canonical(TOP - 1));
         assert!(!is_canonical(TOP));
-        for table in [&m.code_page, &m.watch.watch, &m.watch.dirty] {
+        for table in [&*m.code_page, &*m.watch.watch, &*m.watch.dirty] {
             assert_eq!(table.len(), 8, "512 backed pages need eight bitmap words");
         }
         assert!(m.watch_bits_cover_size());
@@ -5280,7 +5317,7 @@ mod tests {
         // The backing is never accessed; mark/clear only touch the page tables.
         let mut m = Memory::new(MemoryModel::SoftMmu);
         let code_page = fresh_code_pages(0, TOP);
-        let code_page = Arc::new(code_page);
+        let code_page = CodePages::new(code_page);
         m.code_page = code_page;
         m.watch = WatchPages::new(0, TOP);
         assert_eq!(m.code_page.len() * 8, 4usize << 30);

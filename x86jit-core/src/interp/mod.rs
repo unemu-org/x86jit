@@ -11143,6 +11143,8 @@ pub fn narrow_store_run<M: StrMem>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cold]
+#[inline(never)]
 fn trap(
     cpu: &mut CpuState,
     cur_addr: u64,

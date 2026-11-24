@@ -397,7 +397,9 @@ impl Vcpu {
                 execution.owner_id,
                 &self.exit_request.word,
             )
-            .map(|ir| (ir, crate::interp::legacy::BlockWalk::Checked))
+            // Paging always uses a protected or V86 context. Reuse the
+            // dispatcher's system-walk gate before selecting paged execution.
+            .map(|ir| (ir, crate::interp::legacy::BlockWalk::Protected))
             .inspect_err(|exit| publish_cr2(&mut self.cpu, exit))
     }
 
