@@ -281,9 +281,7 @@ impl Vcpu {
                 addr: self.cpu.rip,
                 operation: UnsupportedSystemOperation::LegacyEntryFacility,
             })?;
-        if self.legacy_execution.is_none()
-            || (model != crate::CpuModel::I80386 && self.cpu.legacy.cr0 & (1 << 16) != 0)
-        {
+        if self.legacy_execution.is_none() {
             return Err(Exit::UnsupportedSystemContext {
                 addr: self.cpu.rip,
                 operation: UnsupportedSystemOperation::LegacyEntryFacility,

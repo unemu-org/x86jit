@@ -13860,3 +13860,12 @@ pub fn interpret_paged_scalar_for_test(
 ) -> Result<(), Exit> {
     legacy::paging::scalar_for_test(code, model, cpu, memory)
 }
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn with_paging_cas_hook_for_test<R>(
+    hook: impl FnMut(&Memory, u64, u32, u32, Option<u32>) + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    legacy::paging::with_cas_hook_for_test(hook, run)
+}

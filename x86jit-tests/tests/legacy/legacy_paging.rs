@@ -1,4 +1,4 @@
-//! Internal paging witnesses (paging design §5 steps 1–2). Scalar operand tests
+//! Internal paging witnesses (paging design §5 steps 1–3). Scalar operand tests
 //! supply bytes; fetch/proof tests use the private single-instruction vCPU entry.
 use x86jit_core::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultClass, FaultOrigin, Knowledge,
@@ -1245,11 +1245,14 @@ fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_stays_refused() {
             assert_eq!(f.get(PD), CODE_PT | 7);
             assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7);
             f.cpu.cpu.legacy.segments[0].limit = u32::MAX;
-            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x0f, 0x22, 0xc0])
-                .unwrap();
+            f.vm.write_bytes(0x400, &[0x0f, 0x22, 0xc0]).unwrap();
+            f.cpu.cpu.legacy.cr0 &= !0x8000_0000;
             let before = f.cpu.cpu.legacy.cr0;
             f.cpu.cpu.gpr[0] = 0x8000_0001;
-            let exit = f.fetch_at(0x400).unwrap_err();
+            let run = f.cpu.run_steps(&f.vm, 1, StepOptions::default()).unwrap();
+            let StepStop::Exit(exit) = run.stop() else {
+                panic!("expected PG-setting refusal: {run:?}");
+            };
             assert!(
                 matches!(
                     exit,
@@ -1262,6 +1265,395 @@ fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_stays_refused() {
             );
             assert_eq!(f.cpu.cpu.legacy.cr0, before);
             assert_eq!(f.cpu.cpu.rip, 0x400);
+        }
+    }
+}
+
+#[test]
+fn paging_wp_supervisor_writes_both_mapping_classes() {
+    // Intel486 PRM §4.1.3 p. 4-7; SDM Vol 3A §§5.1.3, 5.6.1
+    // pp. 5-5, 5-33–35: WP protects user AND supervisor read-only pages.
+    // 80386 PRM §6.4.2 p. 6-21: supervisor writes ignore R/W.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for user in [0, 4] {
+                for (pd_rw, pt_rw) in [(0, 0), (0, 2), (2, 0), (2, 2)] {
+                    for wp in [false, true] {
+                        let mut f = Fixture::new(model, code32, 0);
+                        f.cpu.cpu.legacy.cr0 |= u32::from(wp) << 16;
+                        let protected = wp && model != CpuModel::I80386;
+                        f.tables(1 | user | pd_rw, 1 | user | pt_rw);
+                        f.put(u64::from(DATA), 0x1122_3344);
+                        f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
+                        if protected && (pd_rw == 0 || pt_rw == 0) {
+                            f.pf(true, OFFSET, LINEAR, 3); // P=1, W=1, U=0
+                            assert_eq!(f.get(u64::from(DATA)), 0x1122_3344);
+                            assert_eq!(f.get(f.pte()) & (A | D), A);
+                        } else {
+                            f.mov(true, OFFSET).unwrap();
+                            assert_eq!(f.get(u64::from(DATA)), 0xaabb_ccdd);
+                            assert_eq!(f.get(f.pte()) & (A | D), A | D);
+                        }
+                        assert_eq!(f.get(f.pde()) & (A | D), A);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paging_wp_changes_drop_proofs_and_public_cr0_still_refuses_pg() {
+    // Paging design §3.2, Q3: conservative generation change on WP changes.
+    // 80386 PRM §4.1.3 p. 4-3: bit 16 is outside the 386 CR0 mask.
+    // Public PG-setting remains refused until §5 step 5.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, &[0x0f, 0x22, 0xc0])
+                .unwrap();
+            for wp in [true, false] {
+                f.fetch_at(0x400).unwrap();
+                let before = f.cpu.paging_cache_for_test();
+                f.cpu.cpu.gpr[0] = u64::from(f.cpu.cpu.legacy.cr0) ^ (1 << 16);
+                f.fetch_at(0x500).unwrap();
+                if model != CpuModel::I80386 {
+                    assert_eq!(f.cpu.cpu.legacy.cr0 & (1 << 16) != 0, wp);
+                    assert!(f.cpu.paging_cache_for_test().0 > before.0);
+                    assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+                } else {
+                    assert_eq!(f.cpu.cpu.legacy.cr0 & (1 << 16), 0);
+                }
+            }
+            // WP edited at positive entry must also invalidate.
+            if model != CpuModel::I80386 {
+                f.fetch_at(0x400).unwrap();
+                let before = f.cpu.paging_cache_for_test();
+                f.cpu.cpu.legacy.cr0 ^= 1 << 16;
+                f.fetch_at(0x400).unwrap();
+                assert!(f.cpu.paging_cache_for_test().0 > before.0);
+                assert!(f.cpu.paging_cache_for_test().2 > before.2);
+            }
+            f.cpu.cpu.legacy.cr0 &= !0x8000_0000;
+            f.cpu.cpu.gpr[0] = 0x8000_0001;
+            f.vm.write_bytes(0x500, &[0x0f, 0x22, 0xc0]).unwrap();
+            let before = f.cpu.cpu.legacy.cr0;
+            let exit = f.fetch_at(0x500).unwrap_err();
+            assert!(
+                matches!(exit, Exit::UnsupportedSystemContext { .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr0, before);
+        }
+    }
+}
+
+#[test]
+fn paging_invlpg_is_addressed_privileged_and_drops_proofs() {
+    // Intel486 PRM §26 INVLPG p. 26-172; SDM Vol 3A §5.10.4.1
+    // pp. 5-48–49: an address, no operand read; full flush is allowed.
+    for model in [
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+        CpuModel::I80386,
+    ] {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x400, &[0xb0, 0x22])
+                .unwrap();
+            // A nonzero DS base, address override and indexed addressing. The
+            // target page has no PTE; INVLPG must neither walk nor read it.
+            let invlpg: &[u8] = if code32 {
+                &[0x67, 0x0f, 0x01, 0x78, 0x10] // [BX+SI+10h]
+            } else {
+                &[0x67, 0x0f, 0x01, 0x7c, 0x8b, 0x10] // [EBX+ECX*4+10h]
+            };
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, invlpg)
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, invlpg)
+                .unwrap();
+            f.cpu.cpu.gpr[3] = 0x2000;
+            f.cpu.cpu.gpr[6] = 0x30;
+            f.cpu.cpu.gpr[1] = 0x0c;
+            // INVLPG generates an address without accessing DS or its page.
+            f.cpu.cpu.legacy.segments[1].limit = 0;
+            f.cpu.cpu.legacy.segments[1].unusable = 1;
+            f.fetch_at(0x400).unwrap();
+            let before = f.cpu.paging_cache_for_test();
+            let flags = format!("{:?}", f.cpu.cpu.flags);
+            let cr2 = f.cpu.cpu.legacy.cr2;
+            let tables = (f.get(f.pde()), f.get(f.pte()));
+            if model == CpuModel::I80386 {
+                let exit = f.fetch_at(0x500).unwrap_err();
+                assert!(
+                    matches!(exit, Exit::Exception { vector: 6, .. }),
+                    "{exit:?}"
+                );
+            } else {
+                f.put(u64::from(CODE_PT), OTHER_FRAME | 7 | A);
+                f.fetch_at(0x500).unwrap();
+                assert!(f.cpu.paging_cache_for_test().0 > before.0);
+                assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x22);
+            }
+            assert_eq!(format!("{:?}", f.cpu.cpu.flags), flags);
+            assert_eq!(f.cpu.cpu.legacy.cr2, cr2);
+            assert_eq!((f.get(f.pde()), f.get(f.pte())), tables);
+            for cpl in 1..4 {
+                f.cpu.cpu.legacy.cpl = cpl;
+                for segment in &mut f.cpu.cpu.legacy.segments {
+                    segment.attributes = (segment.attributes & !0x60) | (u16::from(cpl) << 5);
+                }
+                let exit = f.fetch_at(0x500).unwrap_err();
+                assert!(
+                    matches!(exit, Exit::Exception { vector, .. }
+                    if vector == if model == CpuModel::I80386 { 6 } else { 13 }),
+                    "{exit:?}"
+                );
+            }
+            f.cpu.cpu.legacy.cpl = 0;
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x600, &[0x0f, 0x01, 0xff])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x600, &[0x0f, 0x01, 0xff])
+                .unwrap();
+            let exit = f.fetch_at(0x600).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 6, .. }),
+                "{exit:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn paging_read_then_write_sets_dirty_and_rewalks_changed_entries() {
+    // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3 pp. 5-21–22:
+    // a read translation is not evidence that D has been set. With the
+    // uncached walker (design §5), each first write revalidates the mapping.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for remap in [false, true] {
+                let mut f = Fixture::new(model, code32, 0);
+                f.code_mapping(0, CODE_FRAME);
+                let read = f.code(false, OFFSET);
+                let write = f.code(true, OFFSET);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &read)
+                    .unwrap();
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, &write)
+                    .unwrap();
+                f.put(u64::from(DATA), 0x1122_3344);
+                f.put(u64::from(NEXT), 0x5566_7788);
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.get(f.pte()), DATA | 7 | A);
+                if remap {
+                    f.put(f.pte(), NEXT | 7 | A);
+                }
+                f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
+                f.fetch_at(0x500).unwrap();
+                assert_eq!(
+                    f.get(f.pte()),
+                    (if remap { NEXT } else { DATA }) | 7 | A | D
+                );
+                assert_eq!(
+                    f.get(u64::from(DATA)),
+                    if remap { 0x1122_3344 } else { 0xaabb_ccdd }
+                );
+                assert_eq!(
+                    f.get(u64::from(NEXT)),
+                    if remap { 0xaabb_ccdd } else { 0x5566_7788 }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn paging_a20_change_drops_proofs_and_reselects_directory_and_frame() {
+    // Paging design §§3.2, 3.6: A20 gates table traffic and final physical
+    // traffic after translation; a changed gate invalidates retained proofs.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::with_vm(Vm::new(VmConfig::flat(0x200000)), model, code32, 0);
+            f.cpu.cpu.legacy.cr3 = PD as u32 | 0x100000;
+            f.map_code(PD as u32, CODE_PT, 0, CODE_FRAME, 7 | A);
+            f.map_code(
+                PD as u32 | 0x100000,
+                OTHER_PT,
+                0,
+                OTHER_FRAME | 0x100000,
+                7 | A,
+            );
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x100400, &[0xb0, 0x22])
+                .unwrap();
+            for (enabled, value) in [(1, 0x22), (0, 0x11), (1, 0x22)] {
+                let before = f.cpu.paging_cache_for_test();
+                f.cpu.cpu.legacy.a20_enabled = enabled;
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.cpu.cpu.gpr[0] & 0xff, value);
+                assert!(f.cpu.paging_cache_for_test().0 > before.0);
+                assert!(f.cpu.paging_cache_for_test().2 > before.2);
+                assert_eq!(f.cpu.paging_cache_for_test().1, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn paging_two_vcpus_set_each_accessed_and_dirty_bit_once() {
+    // SDM Vol 3A §11.1.2.1 p. 11-3; 80386 PRM §11.2.2 p. 11-5;
+    // Intel486 PRM §13.1.2 p. 13-3: individual A/D updates are locked.
+    // This witnesses shared table CAS, not multi-vCPU Machine execution.
+    use std::sync::{Arc, Barrier, Mutex};
+    for model in MODELS {
+        for code32 in [false, true] {
+            let f = Fixture::new(model, code32, 0);
+            let barriers = Arc::new([Barrier::new(2), Barrier::new(2), Barrier::new(2)]);
+            let counts = Arc::new(Mutex::new([(0, 0); 3])); // attempts, successful updates
+            std::thread::scope(|scope| {
+                for cpu_index in 0..2 {
+                    let barriers = barriers.clone();
+                    let counts = counts.clone();
+                    let mut cpu = f.cpu.cpu.clone();
+                    let code = f.code(true, OFFSET + cpu_index * 4);
+                    let memory = &f.vm.mem;
+                    let directory = f.pde();
+                    let table = f.pte();
+                    cpu.gpr[0] = 0x1234_5678;
+                    scope.spawn(move || {
+                        let mut first = [true; 3];
+                        x86jit_core::interp::with_paging_cas_hook_for_test(
+                            move |_, bus, expected, bits, observed| {
+                                let i = match (bus, bits) {
+                                    (b, A) if b == directory => 0,
+                                    (b, A) if b == table => 1,
+                                    (b, D) if b == table => 2,
+                                    _ => panic!("unexpected CAS"),
+                                };
+                                if let Some(old) = observed {
+                                    let mut counts = counts.lock().unwrap();
+                                    counts[i].0 += 1;
+                                    counts[i].1 += usize::from(old == expected);
+                                } else if first[i] {
+                                    first[i] = false;
+                                    barriers[i].wait();
+                                }
+                            },
+                            || {
+                                x86jit_core::interp::interpret_paged_scalar_for_test(
+                                    &code, model, &mut cpu, memory,
+                                )
+                                .unwrap()
+                            },
+                        );
+                    });
+                }
+            });
+            assert_eq!(*counts.lock().unwrap(), [(2, 1); 3]);
+            assert_eq!(f.get(f.pde()), PT | 7 | A);
+            assert_eq!(f.get(f.pte()), DATA | 7 | A | D);
+            assert_eq!(f.get(u64::from(DATA)), 0x1234_5678);
+            assert_eq!(f.get(u64::from(DATA) + 4), 0x1234_5678);
+        }
+    }
+}
+
+#[test]
+fn paging_cas_retry_preserves_edits_and_restarts_identity_changes() {
+    // Locked updates preserve competing edits (80386 PRM §11.2.2 p. 11-5;
+    // Intel486 PRM §13.1.2 p. 13-3). Restart-on-identity-change and the
+    // 386's failed-walk A order are engine policies, paging design §3.3 Q2.
+    use std::cell::Cell;
+    use std::rc::Rc;
+    for model in MODELS {
+        for code32 in [false, true] {
+            for stage in 0..3 {
+                for edit in 0..4 {
+                    let mut f = Fixture::new(model, code32, 3);
+                    f.put(u64::from(DATA), 0x1122_3344);
+                    f.put(u64::from(NEXT), 0x5566_7788);
+                    f.put(u64::from(OTHER_PT + 4 * ((LINEAR >> 12) & 0x3ff)), NEXT | 7);
+                    let bus = if stage == 0 { f.pde() } else { f.pte() };
+                    let bits = if stage == 2 { D } else { A };
+                    let raced = Rc::new(Cell::new(false));
+                    let flag = raced.clone();
+                    let result = x86jit_core::interp::with_paging_cas_hook_for_test(
+                        move |memory, at, expected, setting, observed| {
+                            if at == bus
+                                && setting == bits
+                                && observed.is_none()
+                                && !flag.replace(true)
+                            {
+                                let next = match edit {
+                                    0 => expected | SOFTWARE | if stage == 0 { D } else { 0 },
+                                    1 => {
+                                        (expected & 0xfff)
+                                            | if stage == 0 { OTHER_PT } else { NEXT }
+                                    }
+                                    2 => expected & !2, // revoke write permission
+                                    3 => expected & !1, // remove presence
+                                    _ => unreachable!(),
+                                };
+                                assert_eq!(
+                                    memory
+                                        .atomic_cas(at, u64::from(expected), u64::from(next), 4)
+                                        .unwrap(),
+                                    u64::from(expected)
+                                );
+                            }
+                        },
+                        || {
+                            f.cpu.cpu.gpr[0] = 0xaabb_ccdd;
+                            f.mov(true, OFFSET)
+                        },
+                    );
+                    assert!(raced.get());
+                    match edit {
+                        0 => {
+                            result.unwrap();
+                            assert_eq!(f.get(bus) & SOFTWARE, SOFTWARE);
+                            assert_eq!(f.get(f.pde()) & D, if stage == 0 { D } else { 0 });
+                            assert_eq!(f.get(f.pte()) & (A | D), A | D);
+                        }
+                        1 => {
+                            result.unwrap();
+                            assert_eq!(f.get(u64::from(DATA)), 0x1122_3344);
+                            assert_eq!(f.get(u64::from(NEXT)), 0xaabb_ccdd);
+                            let pte = if stage == 0 {
+                                u64::from(OTHER_PT + 4 * ((LINEAR >> 12) & 0x3ff))
+                            } else {
+                                f.pte()
+                            };
+                            assert_eq!(f.get(pte) & (A | D), A | D);
+                        }
+                        2 | 3 => {
+                            let exit = result.unwrap_err();
+                            assert!(
+                                matches!(exit, Exit::Exception { vector: 14, .. }),
+                                "{exit:?}"
+                            );
+                            assert_eq!(
+                                exit.fault_metadata().unwrap().error_code(),
+                                ErrorCode::bits(if edit == 2 { 7 } else { 6 }, 7)
+                            );
+                            assert_eq!(f.cpu.cpu.legacy.cr2, LINEAR);
+                            assert_eq!(f.get(bus) & D, 0);
+                            assert_eq!(f.get(bus) & A, if edit == 2 || stage == 2 { A } else { 0 });
+                            assert_eq!(f.get(u64::from(DATA)), 0x1122_3344);
+                            assert_eq!(f.get(u64::from(NEXT)), 0x5566_7788);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
         }
     }
 }

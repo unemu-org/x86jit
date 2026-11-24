@@ -1096,6 +1096,11 @@ pub enum LegacyOp {
     /// (`UnknownInstruction`) before any effect (80286 PRM App. C item 11
     /// p. C-2, App. B LOCK p. B-68).
     LockedTransfer,
+    /// Intel486 PRM §26 INVLPG p. 26-172: linear address, no operand transfer.
+    InvalidatePage {
+        segment: SegmentId,
+        offset: crate::ir::Val,
+    },
 }
 
 /// What a [`LegacyOp::Privileged`] test requires of the running program.

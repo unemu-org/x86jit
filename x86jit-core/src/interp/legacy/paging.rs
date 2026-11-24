@@ -15,6 +15,54 @@ const DIRTY: u32 = 0x40;
 const FRAME: u32 = 0xffff_f000;
 const IDENTITY: u32 = FRAME | PRESENT | WRITE | USER;
 
+#[cfg(feature = "test-hooks")]
+type CasHook = Box<dyn FnMut(&Memory, u64, u32, u32, Option<u32>)>;
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static CAS_HOOK: std::cell::RefCell<Option<CasHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe/inject table CAS races on this thread only. `None` precedes the CAS;
+/// `Some(observed)` follows it, including failed comparisons.
+#[cfg(feature = "test-hooks")]
+pub fn with_cas_hook_for_test<R>(
+    hook: impl FnMut(&Memory, u64, u32, u32, Option<u32>) + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<CasHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAS_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(CAS_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    run()
+}
+
+#[cfg(feature = "test-hooks")]
+fn cas_hook(memory: &Memory, bus: u64, expected: u32, bits: u32, observed: Option<u32>) {
+    CAS_HOOK.with(|slot| {
+        if let Some(hook) = &mut *slot.borrow_mut() {
+            hook(memory, bus, expected, bits, observed);
+        }
+    });
+}
+
+// Only an already-paged private interpreter reaches this helper. Public
+// PG-setting writes continue through write_cr0 and its facility refusal.
+#[cold]
+#[inline(never)]
+pub(super) fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
+    // SDM Vol 3A §5.1.1 p. 5-2; Intel486 PRM §12.2.1 p. 12-3:
+    // PG requires PE and NW requires CD.
+    if value & 1 == 0 || (cpu.machine_flags_mask != 0 && value & 0x6000_0000 == 0x2000_0000) {
+        return Err(exception(cpu, 13));
+    }
+    let changed = cpu.legacy.cr0 != value;
+    cpu.legacy.cr0 = value;
+    Ok(changed)
+}
+
 #[derive(Clone, Copy)]
 enum Privilege {
     Supervisor,
@@ -180,6 +228,8 @@ fn table_or<const ROUTED: bool, const ORDER: u8>(
         // SDM Vol 3A §11.1.2.1 p. 11-3; 80386 PRM §11.2.2 p. 11-5:
         // individual A/D updates are locked and preserve competing edits.
         let value = expected | bits;
+        #[cfg(feature = "test-hooks")]
+        cas_hook(mem.raw(), bus, expected, bits, None);
         let observed = mem
             .raw()
             .atomic_cas(bus, u64::from(expected), u64::from(value), 4)
@@ -195,6 +245,8 @@ fn table_or<const ROUTED: bool, const ORDER: u8>(
                     u64::from(value),
                 )
             })? as u32;
+        #[cfg(feature = "test-hooks")]
+        cas_hook(mem.raw(), bus, expected, bits, Some(observed));
         if observed == expected {
             mem.note_write(bus, 4);
             return Ok(Some(value));
@@ -261,10 +313,13 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
             continue;
         };
         // 80386 PRM §§6.4.1–6.4.2 pp. 6-20–22, Table 6-5;
-        // Intel486 PRM §§6.8.1–6.8.2 pp. 6-23–25, Table 6-4 (WP=0).
+        // Intel486 PRM §4.1.3 p. 4-7 describes WP for user pages.
+        // SDM Vol 3A §§5.1.3, 5.6.1 pp. 5-5, 5-33–35 applies WP to
+        // both mapping classes (paging design Q3).
         let rights = pde & pte;
-        if privilege.user()
-            && (rights & USER == 0 || (access == AccessKind::Write && rights & WRITE == 0))
+        let wp = cpu.machine_flags_mask != 0 && cpu.legacy.cr0 & (1 << 16) != 0;
+        if (privilege.user() && rights & USER == 0)
+            || (access == AccessKind::Write && (privilege.user() || wp) && rights & WRITE == 0)
         {
             return Err(fault(true).exit(cpu));
         }
@@ -374,6 +429,8 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
+#[cold]
+#[inline(never)]
 pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -389,6 +446,8 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     Ok(value)
 }
 
+#[cold]
+#[inline(never)]
 pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -410,6 +469,8 @@ pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+#[cold]
+#[inline(never)]
 pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -452,13 +513,13 @@ pub(crate) fn scalar_for_test(
         model,
         crate::CpuModel::I80386 | crate::CpuModel::I80486Dx | crate::CpuModel::I80486DxCpuid
     ) || cpu.legacy.cr0 & 0x8000_0001 != 0x8000_0001
-        || (model != crate::CpuModel::I80386 && cpu.legacy.cr0 & (1 << 16) != 0)
     {
         return Err(refusal(
             cpu,
             crate::UnsupportedSystemOperation::LegacyEntryFacility,
         ));
     }
+    cpu.machine_flags_mask = model.machine_flags_mask();
     let context = legacy::derive_legacy_context(model.legacy_model(), cpu).map_err(|error| {
         refusal(
             cpu,
@@ -496,7 +557,11 @@ pub(crate) fn execute_for_test<const PAGED: bool>(
                 !(controls
                     && matches!(
                         op,
-                        L::ReadControl { .. } | L::WriteControl { .. } | L::Privileged { .. }
+                        L::ReadControl { .. }
+                            | L::WriteControl { .. }
+                            | L::Privileged { .. }
+                            | L::InvalidatePage { .. }
+                            | L::I486Invalidate
                     ))
                     && !matches!(
                         op,
@@ -505,7 +570,10 @@ pub(crate) fn execute_for_test<const PAGED: bool>(
             }
             op if machine_specific(op) => !matches!(
                 op,
-                IrOp::Load { .. } | IrOp::Store { .. } | IrOp::SegLimitCheck { .. }
+                IrOp::Load { .. }
+                    | IrOp::Store { .. }
+                    | IrOp::SegLimitCheck { .. }
+                    | IrOp::Trap { vector: 6, .. }
             ),
             _ => false,
         })

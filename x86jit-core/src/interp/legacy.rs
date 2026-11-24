@@ -3481,6 +3481,18 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                         ));
                     }
                 }
+                L::InvalidatePage { segment, offset } => {
+                    // Intel486 PRM §26 INVLPG p. 26-172; SDM Vol 3A
+                    // §5.10.4.1 pp. 5-48–49 permits conservative invalidation.
+                    // Central address lowering supplies the wrapped offset.
+                    // There is no segment access, page walk or operand read.
+                    if PAGED {
+                        let _linear = cpu.legacy.segments[*segment as usize]
+                            .base
+                            .wrapping_add(read_val(*offset, temps) as u32);
+                        outcome.translations_invalidated = true;
+                    }
+                }
                 L::I486Cpuid { signature } => {
                     // Embedded 486 DM §§D.2–D.3 pp. D-1–2. ASSUMED:
                     // reserved bits zero; model-1 DX exposes only on-chip FPU.
@@ -3764,7 +3776,11 @@ fn execute_op<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
                             } else {
                                 value & 0x8000_001f
                             };
-                            outcome.context_changed = write_cr0(cpu, value)?;
+                            outcome.context_changed = if PAGED && value & 0x8000_0000 != 0 {
+                                paging::write_cr0(cpu, value)?
+                            } else {
+                                write_cr0(cpu, value)?
+                            };
                         }
                         ControlRegister::Cr2 => cpu.legacy.cr2 = value,
                         ControlRegister::Cr3 => {

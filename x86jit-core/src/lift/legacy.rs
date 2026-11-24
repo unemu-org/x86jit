@@ -1113,7 +1113,14 @@ pub(super) fn lower(
     }
     match insn.mnemonic() {
         // Intel486 PRM §26 INVD/INVLPG/WBINVD pp. 26-171–172, 26-281.
-        // DERIVED: no cache/TLB state exists with paging off; CPL is gated above.
+        Invlpg if context.paging_enabled => {
+            let offset = effective_address_no_segment(insn, ops, tg)?;
+            emit(ops, L::InvalidatePage {
+                segment: segment(insn.memory_segment()).expect("memory segment"),
+                offset,
+            });
+        }
+        // No paged state with PG off: preserve the existing lowering and walk.
         Invd | Wbinvd | Invlpg => emit(ops, L::I486Invalidate),
         // PRM §26 BSWAP p. 26-35: 16-bit result is undefined.
         Bswap if size == 2 => emit(ops, L::Refuse { operation: crate::UnsupportedSystemOperation::LegacyInstruction }),
