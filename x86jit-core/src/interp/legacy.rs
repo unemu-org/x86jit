@@ -1,7 +1,7 @@
 //! Machine memory and transactional system helpers for the shared interpreter
 //! (decision-18 §§1, 4; spec.md §§8.1, 17).
 use super::*;
-pub(super) mod paging;
+pub(crate) mod paging;
 mod privilege;
 pub(crate) mod tasks;
 use crate::legacy::{

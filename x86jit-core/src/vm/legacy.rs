@@ -11,6 +11,8 @@ use iced_x86::{Decoder, DecoderError};
 // The NMI input's cold helpers (spec.md §17.10), in their own module so that
 // this module's hot dispatcher code keeps its code-generation unit.
 mod nmi;
+#[cfg(feature = "test-hooks")]
+mod paging;
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
@@ -492,6 +494,8 @@ pub(super) struct Execution {
     // delivery, and the deliveries completed since it last moved.
     stall_retired: u64,
     stall_count: u32,
+    #[cfg(feature = "test-hooks")]
+    paging: Option<Box<paging::State>>,
 }
 impl Execution {
     pub(super) fn new() -> Self {
@@ -527,6 +531,8 @@ impl Execution {
             last_direct_fetch: None,
             stall_retired: 0,
             stall_count: 0,
+            #[cfg(feature = "test-hooks")]
+            paging: None,
         }
     }
     // Whether deliveries copy the registers they begin with for the delivery
@@ -552,6 +558,8 @@ impl Execution {
         self.smc_pages.clear();
         self.last_direct_fetch = None;
         self.stall_count = 0;
+        #[cfg(feature = "test-hooks")]
+        self.invalidate_paging();
     }
     #[inline(always)]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
@@ -573,12 +581,24 @@ impl Execution {
     pub(super) fn debug_handoff_pending(&self) -> bool {
         self.handoff_service & HANDOFF_DEBUG != 0
     }
+    #[cfg_attr(feature = "test-hooks", cold)]
+    #[cfg_attr(feature = "test-hooks", inline(never))]
     fn invalidate_translations(&mut self) {
+        #[cfg(feature = "test-hooks")]
+        self.invalidate_paging();
         self.direct_proofs.clear();
         self.blocks.clear();
         self.contexts.clear();
         self.stamp = None;
         self.validated = None;
+    }
+    #[cold]
+    #[inline(never)]
+    pub(super) fn invalidate_paging(&mut self) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(paging) = &mut self.paging {
+            paging.invalidate();
+        }
     }
     #[cfg(test)]
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {

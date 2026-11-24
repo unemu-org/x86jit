@@ -1,5 +1,5 @@
-//! Internal scalar paging witnesses. Paging design §5 step 1; bytes are supplied
-//! directly to the private entry, so these tests make no paged-fetch claim.
+//! Internal paging witnesses (paging design §5 steps 1–2). Scalar operand tests
+//! supply bytes; fetch/proof tests use the private single-instruction vCPU entry.
 use x86jit_core::fault::{
     AddressPrecision, AddressSpace, ErrorCode, FaultAccess, FaultClass, FaultOrigin, Knowledge,
     MemoryEffects,
@@ -33,8 +33,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(model: CpuModel, code32: bool, cpl: u8) -> Self {
-        let mut vm = Vm::new(VmConfig::flat(0x20000));
-        for page in (0..0x20000).step_by(0x1000) {
+        Self::with_vm(Vm::new(VmConfig::flat(0x20000)), model, code32, cpl)
+    }
+    fn with_vm(mut vm: Vm, model: CpuModel, code32: bool, cpl: u8) -> Self {
+        for page in (0..vm.mem.size()).step_by(0x1000) {
             vm.map(page, 0x1000, Prot::RWX, RegionKind::Ram).unwrap();
         }
         vm.set_cpu_model(model);
@@ -692,6 +694,574 @@ fn memory_push_pop_are_refused_before_either_operand_translation() {
                     }
                 }
             }
+        }
+    }
+}
+
+const CODE_PT: u32 = 0x5000;
+const CODE_FRAME: u32 = 0xc000;
+const OTHER_FRAME: u32 = 0x10000;
+const OTHER_PD: u32 = 0x2000;
+const OTHER_PT: u32 = 0x6000;
+
+impl Fixture {
+    fn map_code(&self, directory: u32, table: u32, linear: u32, frame: u32, flags: u32) {
+        self.put(u64::from(directory + 4 * (linear >> 22)), table | 7 | A);
+        self.put(
+            u64::from(table + 4 * ((linear >> 12) & 0x3ff)),
+            frame | flags,
+        );
+    }
+    fn code_mapping(&self, linear: u32, frame: u32) {
+        self.map_code(PD as u32, CODE_PT, linear, frame, 7 | A);
+    }
+    fn fetch_at(&mut self, ip: u64) -> Result<(), Exit> {
+        self.cpu.cpu.rip = ip;
+        self.cpu.interpret_paged_for_test(&self.vm)
+    }
+    fn fetch_pf(&mut self, ip: u64, linear: u32, code: u32) {
+        let registers = self.cpu.cpu.gpr;
+        let flags = format!("{:?}", self.cpu.cpu.flags);
+        let exit = self.fetch_at(ip).unwrap_err();
+        assert!(
+            matches!(exit, Exit::Exception { vector: 14, .. }),
+            "{exit:?}"
+        );
+        let m = exit.fault_metadata().unwrap();
+        assert_eq!(m.class(), FaultClass::Fault);
+        assert_eq!(m.saved_rip(), ip);
+        assert_eq!(m.instruction_rip(), Knowledge::Known(ip));
+        assert_eq!(m.error_code(), ErrorCode::bits(code, 7));
+        assert_eq!(m.error_code().bit(4), None); // no historical I/D bit
+        assert_eq!(m.access(), Knowledge::Known(FaultAccess::Execute));
+        let Knowledge::Known(address) = m.linear_address() else {
+            panic!("linear evidence")
+        };
+        assert_eq!(address.value(), u64::from(linear));
+        assert_eq!(self.cpu.cpu.legacy.cr2, linear);
+        assert_eq!(self.cpu.cpu.rip, ip);
+        assert_eq!(self.cpu.cpu.gpr, registers);
+        assert_eq!(format!("{:?}", self.cpu.cpu.flags), flags);
+    }
+}
+
+#[test]
+fn paged_fetch_nonidentity_mapping_and_historical_fault_bits() {
+    // 80386 PRM §5.2 pp. 5-7–10, §9.8.14 Fig. 9-8 pp. 9-17–18;
+    // Intel486 PRM §9.9.14 Fig. 9-7 pp. 9-21–22: fetch reads, no I/D bit.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for cpl in [0, 3] {
+                let mut f = Fixture::new(model, code32, cpl);
+                f.code_mapping(0, CODE_FRAME);
+                f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x5a])
+                    .unwrap();
+                f.vm.write_bytes(0x400, &[0xb0, 0x11]).unwrap();
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(f.cpu.cpu.gpr[0], 0x5a);
+                assert_eq!(f.cpu.cpu.rip, 0x402);
+                assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7 | A);
+                assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+                // Permission and presence must be revalidated on a cache hit.
+                f.put(u64::from(CODE_PT), CODE_FRAME | 3 | A);
+                if cpl == 3 {
+                    f.fetch_pf(0x400, 0x400, 5);
+                } else {
+                    f.fetch_at(0x400).unwrap();
+                }
+                f.put(u64::from(CODE_PT), 0);
+                f.fetch_pf(0x400, 0x400, if cpl == 3 { 4 } else { 0 });
+                f.put(PD, 0);
+                f.fetch_pf(0x400, 0x400, if cpl == 3 { 4 } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_physical_failures_report_actual_walk_writes() {
+    // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3 pp. 5-21–22:
+    // A updates precede the physical fetch; progress must retain their effects.
+    for model in MODELS {
+        for code32 in [false, true] {
+            for failure in 0..5 {
+                for pde_a in [0, A] {
+                    for pte_a in [0, A] {
+                        let mut f = Fixture::new(model, code32, 0);
+                        f.put(PD, CODE_PT | 7 | pde_a);
+                        f.put(u64::from(CODE_PT), CODE_FRAME | 7 | pte_a);
+                        let origin = match failure {
+                            0 => {
+                                f.vm.unmap(u64::from(CODE_FRAME), 0x1000).unwrap();
+                                f.vm.map(
+                                    u64::from(CODE_FRAME),
+                                    0x1000,
+                                    Prot::RWX,
+                                    RegionKind::Trap,
+                                )
+                                .unwrap();
+                                FaultOrigin::TrapFetch
+                            }
+                            1 => {
+                                f.vm.unmap(u64::from(CODE_FRAME), 0x1000).unwrap();
+                                FaultOrigin::GuestMap
+                            }
+                            2 | 3 => {
+                                f.vm.set_fetch_policy(Box::new(move |_| {
+                                    if failure == 2 {
+                                        x86jit_core::FetchVerdict::DenyNotPresent
+                                    } else {
+                                        x86jit_core::FetchVerdict::DenyProtection
+                                    }
+                                }));
+                                FaultOrigin::GuestMap
+                            }
+                            _ => {
+                                f.vm.mem.set_host_fault_recovery(true);
+                                FaultOrigin::HostAccess
+                            }
+                        };
+                        let exit = if failure == 4 {
+                            let host = f.vm.mem.host_base() as usize + CODE_FRAME as usize + 0x400;
+                            x86jit_core::with_copy_out_fault(host..host + 1, usize::MAX, || {
+                                f.fetch_at(0x400)
+                            })
+                        } else {
+                            f.fetch_at(0x400)
+                        }
+                        .unwrap_err();
+                        assert!(matches!(exit, Exit::UnmappedMemory { .. }), "{exit:?}");
+                        let m = exit.fault_metadata().unwrap();
+                        assert_eq!(m.origin(), origin);
+                        assert_eq!(m.access(), Knowledge::Known(FaultAccess::Execute));
+                        let wrote = pde_a == 0 || pte_a == 0;
+                        assert_eq!(
+                            m.progress().ram(),
+                            if wrote {
+                                MemoryEffects::PossiblyPartial
+                            } else {
+                                MemoryEffects::None
+                            }
+                        );
+                        assert_eq!(m.progress().device(), MemoryEffects::None);
+                        assert_eq!(
+                            m.progress().had_partial_progress(),
+                            if wrote {
+                                Knowledge::Unknown
+                            } else {
+                                Knowledge::Known(false)
+                            }
+                        );
+                        assert_eq!(f.get(PD), CODE_PT | 7 | A);
+                        assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7 | A);
+                        assert_eq!(f.cpu.cpu.rip, 0x400);
+                        assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_does_not_speculate_past_one_byte_instruction() {
+    // 80386 PRM §9.8.14 pp. 9-17–18: a required not-present translation
+    // faults; paging design §3.5 requires incremental, one-instruction fetch.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.map_code(PD as u32, CODE_PT, 0, CODE_FRAME, 7);
+            f.put(PD, CODE_PT | 7);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0xfff, &[0x40])
+                .unwrap();
+            f.cpu.cpu.gpr[0] = 7;
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 8);
+            assert_eq!(f.cpu.cpu.rip, 0x1000);
+            assert_eq!(f.get(PD), CODE_PT | 7 | A);
+            assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7 | A);
+            assert_eq!(f.get(u64::from(CODE_PT + 4)), 0);
+            assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_cross_page_fault_restarts_before_execution() {
+    // 80386 PRM §9.8.14 pp. 9-17–19; Intel486 PRM §9.9.14 pp. 9-21–23:
+    // CR2 names the failing linear byte, saved IP the instruction start.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0xfff, &[0xb0])
+                .unwrap();
+            f.cpu.cpu.gpr[0] = 0x1122;
+            f.fetch_pf(0xfff, 0x1000, 0);
+            f.code_mapping(0x1000, OTHER_FRAME);
+            f.vm.write_bytes(u64::from(OTHER_FRAME), &[0x5a]).unwrap();
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x115a);
+            assert_eq!(f.cpu.cpu.rip, 0x1001);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_two_directories_and_equal_cr3_reload() {
+    // 80386 PRM §5.2.3 p. 5-9, §5.2.5 p. 5-11;
+    // Intel486 PRM §5.3.5 p. 5-22: CR3 selects the directory; reload flushes.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.cpu.cpu.legacy.cr3 = PD as u32;
+            f.code_mapping(0, CODE_FRAME);
+            f.map_code(OTHER_PD, OTHER_PT, 0, OTHER_FRAME, 7 | A);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x400, &[0xb0, 0x22])
+                .unwrap();
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, &[0x0f, 0x22, 0xd8])
+                .unwrap(); // MOV CR3,EAX
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x0f, 0x22, 0xd8])
+                .unwrap();
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            let old = f.cpu.paging_cache_for_test();
+            f.cpu.cpu.legacy.cr3 = OTHER_PD;
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x22);
+            assert!(f.cpu.paging_cache_for_test().0 > old.0);
+            f.cpu.cpu.legacy.cr3 = PD as u32;
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            let before = f.cpu.paging_cache_for_test();
+            f.cpu.cpu.gpr[0] = PD;
+            f.fetch_at(0x500).unwrap();
+            assert_eq!(f.cpu.cpu.legacy.cr3, PD as u32);
+            let after = f.cpu.paging_cache_for_test();
+            assert!(after.0 > before.0);
+            assert_eq!(after.1, 0);
+            f.put(u64::from(CODE_PT), OTHER_FRAME | 7 | A);
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], PD | 0x22);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_pg_transitions_and_explicit_embedder_invalidation() {
+    // 80386 PRM §5.2 p. 5-7: PG selects translation. Equal-byte embedder
+    // invalidation and bounded retention are engine policies, design §§3.2, 3.5.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.vm.write_bytes(0x400, &[0xb0, 0x22]).unwrap();
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x500, &[0x0f, 0x22, 0xc0])
+                .unwrap(); // MOV CR0,EAX
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            let before = f.cpu.paging_cache_for_test().0;
+            f.cpu.cpu.gpr[0] = 1;
+            f.fetch_at(0x500).unwrap();
+            assert_eq!(f.cpu.cpu.legacy.cr0 & 0x8000_0000, 0);
+            assert!(f.cpu.paging_cache_for_test().0 > before);
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x22);
+            let before = f.cpu.paging_cache_for_test().0;
+            f.cpu.cpu.legacy.cr0 |= 0x8000_0000; // private setup, no public enable
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
+            assert!(f.cpu.paging_cache_for_test().0 > before);
+            let before = f.cpu.paging_cache_for_test();
+            f.cpu.invalidate_paging();
+            assert!(f.cpu.paging_cache_for_test().0 > before.0);
+            assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+            f.fetch_at(0x400).unwrap();
+            assert!(f.cpu.paging_cache_for_test().2 > before.2);
+            // Identical bytes in another frame still require new physical proof.
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x400, &[0xb0, 0x11])
+                .unwrap();
+            f.put(u64::from(CODE_PT), OTHER_FRAME | 7 | A);
+            f.cpu.invalidate_paging();
+            let lifts = f.cpu.paging_cache_for_test().2;
+            f.fetch_at(0x400).unwrap();
+            assert!(f.cpu.paging_cache_for_test().2 > lifts);
+            assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
+            assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_physical_and_linear_alias_smc_cover_both_frames() {
+    // Both linear aliases converge on one physical frame (80386 PRM §5.2
+    // Fig. 5-9 pp. 5-8–9). Physical SMC invalidation is engine policy, §3.5.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.code_mapping(0x1000, OTHER_FRAME);
+            f.code_mapping(0x4000, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0xfff, &[0xb0])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME), &[0x11]).unwrap();
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            assert!(f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+            assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
+            f.vm.write_bytes(u64::from(OTHER_FRAME), &[0x22]).unwrap();
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x22);
+            // A scalar store through a distinct linear alias modifies opcode.
+            f.cpu.cpu.legacy.segments[1].base = 0;
+            let store = if code32 {
+                vec![0xc6, 0x05, 0xff, 0x4f, 0, 0, 0xb3]
+            } else {
+                vec![0xc6, 0x06, 0xff, 0x4f, 0xb3]
+            }; // MOV byte [4fff],b3
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x600, &store)
+                .unwrap();
+            f.fetch_at(0x600).unwrap();
+            f.cpu.cpu.gpr[0] = 0;
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0);
+            assert_eq!(f.cpu.cpu.gpr[3] & 0xff, 0x22);
+            // Exercise the other fetch alias after a physical opcode write.
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x33])
+                .unwrap();
+            f.fetch_at(0x4400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x33);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x401, &[0x44])
+                .unwrap();
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x44);
+            f.fetch_at(0x4400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x44);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_publication_write_race_retries_the_complete_source() {
+    // Paging design §3.5: physical source registration rejects a fetched
+    // snapshot invalidated before publication, including the second frame.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.code_mapping(0x1000, OTHER_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0xfff, &[0xb0])
+                .unwrap();
+            f.vm.write_bytes(u64::from(OTHER_FRAME), &[0x11]).unwrap();
+            f.cpu.paging_publication_hook_for_test(|vm| {
+                vm.write_bytes(u64::from(OTHER_FRAME), &[0x55]).unwrap();
+            });
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x55);
+            f.fetch_at(0xfff).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x55);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_equal_bytes_in_new_frame_replace_physical_proof_without_flush() {
+    // Paging design §3.5: an uncached re-walk may observe a new frame within
+    // one generation; equal instruction bytes alone cannot validate old sources.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.code_mapping(0, CODE_FRAME);
+            for frame in [CODE_FRAME, OTHER_FRAME] {
+                f.vm.write_bytes(u64::from(frame) + 0x400, &[0xb0, 0x11])
+                    .unwrap();
+            }
+            f.fetch_at(0x400).unwrap();
+            let before = f.cpu.paging_cache_for_test();
+            f.code_mapping(0, OTHER_FRAME);
+            f.fetch_at(0x400).unwrap();
+            let after = f.cpu.paging_cache_for_test();
+            assert_eq!(after.0, before.0);
+            assert_eq!(after.1, before.1);
+            assert_eq!(after.2, before.2 + 1);
+            assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
+            assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x401, &[0x22])
+                .unwrap();
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x22);
+        }
+    }
+}
+
+#[test]
+fn paged_fetch_ad_write_to_already_fetched_code_retries() {
+    // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3 pp. 5-21–22:
+    // fetch sets A. Visibility to translated code follows design §§3.3, 3.5.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.cpu.cpu.legacy.segments[0].base = 0x3fe000;
+        // First code frame is its own PTE table. The next page's entry at
+        // table+ffc initially decodes as ADD EAX,imm32 (05 00 01 00 ...).
+        // Walking the needed last immediate byte sets A in that same opcode,
+        // changing it to AND EAX,imm32 (25 00 01 00 ...), so re-fetch is required.
+        f.code_mapping(0x3fe000, CODE_PT);
+        f.map_code(PD as u32, CODE_PT, 0x3ff000, OTHER_FRAME, 5);
+        f.vm.write_bytes(u64::from(OTHER_FRAME), &[0]).unwrap();
+        f.cpu.cpu.gpr[0] = 0xff;
+        f.fetch_at(0xffc).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0);
+        assert_eq!(f.cpu.cpu.rip, 0x1001);
+        assert_eq!(f.get(u64::from(CODE_PT + 4 * 1023)), OTHER_FRAME | 5 | A);
+    }
+}
+
+#[test]
+fn paged_fetch_proofs_are_bounded_and_reset_discards_them() {
+    // Bounded retention/reset are derived-state policies (paging design §§3.5, 3.7).
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x40; 128])
+            .unwrap();
+        for ip in 0x400..0x480 {
+            f.fetch_at(ip).unwrap();
+            assert!(f.cpu.paging_cache_for_test().1 <= 64);
+        }
+        let before = f.cpu.paging_cache_for_test();
+        f.cpu.reset_execution_state(Default::default());
+        let after = f.cpu.paging_cache_for_test();
+        assert!(after.0 > before.0);
+        assert_eq!(after.1, 0);
+        assert_eq!(after.2, before.2);
+        assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+    }
+}
+
+#[test]
+fn paged_fetch_eviction_releases_pages_but_preserves_shared_cache_tags() {
+    // Paging design §3.5: physical source ownership is bounded with the proofs.
+    use std::sync::Arc;
+    use x86jit_core::{
+        lift::{lift_block, FetchAddr},
+        BlockKey, CachedBlock, CpuMode,
+    };
+    for model in MODELS {
+        let mut f = Fixture::with_vm(Vm::new(VmConfig::flat(0x80000)), model, true, 0);
+        let first = 0x10000;
+        for index in 0..65 {
+            let frame = first + index * 0x1000;
+            f.code_mapping(index * 0x1000, frame);
+            f.vm.write_bytes(u64::from(frame) + 0x400, &[0x40, 0xeb, 0xfd])
+                .unwrap();
+        }
+        let bus = u64::from(first) + 0x400;
+        let key = BlockKey::new(bus, CpuMode::Compat32);
+        let ir = lift_block(&f.vm.mem, FetchAddr::flat(bus), CpuMode::Compat32).unwrap();
+        f.vm.cache.insert(
+            key,
+            CachedBlock::Interpreted(Arc::new(ir)),
+            vec![(bus, 3)],
+            |spans| {
+                for &(start, len) in spans {
+                    f.vm.mem.mark_code(start, len);
+                }
+            },
+        );
+        for index in 0..65 {
+            f.fetch_at(index * 0x1000 + 0x400).unwrap();
+            assert!(f.cpu.paging_cache_for_test().1 <= 64);
+        }
+        assert_eq!(f.cpu.paging_cache_for_test().1, 1);
+        assert!(f.vm.mem.is_code_page(u64::from(first >> 12)));
+        assert!(f.vm.cache.get(key).is_some());
+        for index in 1..64 {
+            assert!(!f.vm.mem.is_code_page(u64::from((first >> 12) + index)));
+        }
+        let before = f.cpu.paging_cache_for_test();
+        let generation = f.vm.cache.publication_generation();
+        f.vm.write_bytes(u64::from(first) + 0x1400, &[0x48])
+            .unwrap();
+        f.fetch_at(64 * 0x1000 + 0x400).unwrap();
+        assert_eq!(f.cpu.paging_cache_for_test(), before);
+        assert_eq!(f.vm.cache.publication_generation(), generation);
+        assert!(f.vm.cache.get(key).is_some());
+        f.cpu.invalidate_paging();
+        assert!(!f.vm.mem.is_code_page(u64::from((first >> 12) + 64)));
+        assert!(f.vm.mem.is_code_page(u64::from(first >> 12)));
+    }
+}
+
+#[test]
+fn paged_fetch_private_tags_follow_vcpu_lifetimes() {
+    // Paging design §§3.5, 3.7: releasing one owner preserves other vCPUs.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x40, 0x40])
+            .unwrap();
+        f.fetch_at(0x400).unwrap();
+        f.fetch_at(0x401).unwrap();
+        let mut other = f.vm.new_vcpu();
+        other.cpu.legacy = f.cpu.cpu.legacy;
+        other.cpu.rip = 0x400;
+        other.interpret_paged_for_test(&f.vm).unwrap();
+        f.cpu.invalidate_paging();
+        assert!(f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        other.reset_execution_state(Default::default());
+        assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        other.cpu.rip = 0x400;
+        other.interpret_paged_for_test(&f.vm).unwrap();
+        assert!(f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        drop(other);
+        assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        f.fetch_at(0x400).unwrap();
+        // The registration owns only tracking metadata, so VM-first drop is safe.
+        drop(f.vm);
+        drop(f.cpu);
+    }
+}
+
+#[test]
+fn paged_fetch_segment_fault_precedes_walk_and_public_pg_write_stays_refused() {
+    // 80386 PRM §§6.4.3–6.5 pp. 6-21–22; Intel486 PRM §§6.8.3–6.9
+    // pp. 6-24–25: segmentation precedes paging. Public enablement is step 5.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::new(model, code32, 0);
+            f.map_code(PD as u32, CODE_PT, 0, CODE_FRAME, 7);
+            f.put(PD, CODE_PT | 7);
+            f.cpu.cpu.legacy.segments[0].limit = 0x3ff;
+            let exit = f.fetch_at(0x400).unwrap_err();
+            assert!(
+                matches!(exit, Exit::Exception { vector: 13, .. }),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr2, 0xdead_beef);
+            assert_eq!(f.get(PD), CODE_PT | 7);
+            assert_eq!(f.get(u64::from(CODE_PT)), CODE_FRAME | 7);
+            f.cpu.cpu.legacy.segments[0].limit = u32::MAX;
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x0f, 0x22, 0xc0])
+                .unwrap();
+            let before = f.cpu.cpu.legacy.cr0;
+            f.cpu.cpu.gpr[0] = 0x8000_0001;
+            let exit = f.fetch_at(0x400).unwrap_err();
+            assert!(
+                matches!(
+                    exit,
+                    Exit::UnsupportedSystemContext {
+                        operation: UnsupportedSystemOperation::LegacyExecution,
+                        ..
+                    }
+                ),
+                "{exit:?}"
+            );
+            assert_eq!(f.cpu.cpu.legacy.cr0, before);
+            assert_eq!(f.cpu.cpu.rip, 0x400);
         }
     }
 }

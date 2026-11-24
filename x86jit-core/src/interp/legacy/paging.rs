@@ -63,7 +63,7 @@ impl PageFault {
     }
 }
 
-pub(super) fn publish_cr2(cpu: &mut CpuState, exit: &Exit) {
+pub(crate) fn publish_cr2(cpu: &mut CpuState, exit: &Exit) {
     if let Some(m) = exit.fault_metadata() {
         if m.origin == FaultOrigin::GuestException(FaultCause::PageTranslation) {
             if let Knowledge::Known(address) = m.address {
@@ -419,6 +419,28 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
 }
 
+// Fetch performs the same read-permission walk but retains execute metadata.
+// 80386 PRM §9.8.14 Fig. 9-8 pp. 9-17–18; Intel486 PRM §9.9.14
+// Fig. 9-7 pp. 9-21–22: no I/D bit exists on these models.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn fetch_bus_for_test(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    linear: u32,
+    wrote: &Cell<bool>,
+) -> Result<u64, Exit> {
+    let privilege = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let observe = |_, _| wrote.set(true);
+    let mut mem = LegacyAccess::<false, 0, true>::new(memory, u32::MAX);
+    mem.writes = Some(&observe);
+    let t = translate_linear(cpu, &mem, linear, 1, AccessKind::Execute, privilege)?;
+    Ok(legacy::physical_span(cpu, u32::MAX, u64::from(t.physical), 1).0)
+}
+
 #[cfg(feature = "test-hooks")]
 pub(crate) fn scalar_for_test(
     code: &[u8],
@@ -450,8 +472,17 @@ pub(crate) fn scalar_for_test(
         model.profile(),
     )
     .map_err(|_| refusal(cpu, crate::UnsupportedSystemOperation::LegacyInstruction))?;
-    // Fetch and multi-operand/system consumers are separate implementation steps.
-    // Refuse before execution rather than allowing any untranslated transfer.
+    execute_for_test::<true>(&ir, cpu, memory, context, false).map(|_| ())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn execute_for_test<const PAGED: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    controls: bool,
+) -> Result<Outcome, Exit> {
     // Paging design §3.4: PUSH/POP memory forms need instruction-wide preflight;
     // a load/store pair is scalar only when it reuses one operand address (RMW).
     let addresses = ir
@@ -461,10 +492,17 @@ pub(crate) fn scalar_for_test(
         .count();
     if addresses > 1
         || ir.ops.iter().any(|op| match op {
-            IrOp::Legacy(op) => !matches!(
-                op,
-                L::Checkpoint | L::I486Gate | L::Address { .. } | L::ReadSelector { .. }
-            ),
+            IrOp::Legacy(op) => {
+                !(controls
+                    && matches!(
+                        op,
+                        L::ReadControl { .. } | L::WriteControl { .. } | L::Privileged { .. }
+                    ))
+                    && !matches!(
+                        op,
+                        L::Checkpoint | L::I486Gate | L::Address { .. } | L::ReadSelector { .. }
+                    )
+            }
             op if machine_specific(op) => !matches!(
                 op,
                 IrOp::Load { .. } | IrOp::Store { .. } | IrOp::SegLimitCheck { .. }
@@ -478,18 +516,17 @@ pub(crate) fn scalar_for_test(
         ));
     }
     let mut scratch = vec![0; ir.temp_count as usize];
-    execute_instruction::<false, 0, true>(
-        &ir,
+    execute_instruction::<false, 0, PAGED>(
+        ir,
         &InstructionView {
             guest_start: ir.guest_start,
             guest_len: ir.guest_len,
             ops: &ir.ops,
         },
         cpu,
-        &LegacyAccess::<false, 0, true>::new(memory, u32::MAX),
+        &LegacyAccess::<false, 0, PAGED>::new(memory, u32::MAX),
         &mut scratch,
         context,
         &mut tasks::SwitchState::default(),
     )
-    .map(|_| ())
 }

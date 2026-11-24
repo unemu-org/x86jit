@@ -2265,6 +2265,23 @@ impl Drop for DispatchGuard<'_> {
 }
 
 impl Vcpu {
+    /// Discard this vCPU's derived guest-paging translations and fetch proofs.
+    /// Call between runs after page-table edits or checkpoint restore, including
+    /// when CR0/CR3 have unchanged values. Synchronize edits with every affected
+    /// vCPU and call this on each; this does not synchronize physical RAM writes.
+    /// Report physical code/DMA writes with [`Memory::note_write`] as usual.
+    /// CPU registers and pending device completions are preserved; restore must
+    /// occur at a quiescent boundary (paging design §§3.2, 3.7, decision Q5).
+    /// Application profiles have no guest-paging state. Public Machine PG=1
+    /// execution remains refused until the complete paging contract is enabled.
+    #[cold]
+    #[inline(never)]
+    pub fn invalidate_paging(&mut self) {
+        if let Some(execution) = &mut self.legacy_execution {
+            execution.invalidate_paging();
+        }
+    }
+
     /// Abandon pending execution and device completions between runs, in any
     /// execution profile. Clears queued IRQs, STI/SS interrupt shadows, IN/INS and
     /// MMIO handoffs, accepted legacy IRQ deliveries, host exit requests and their
@@ -2279,10 +2296,11 @@ impl Vcpu {
     /// reset register table. Architectural state is preserved except for the optional
     /// FNINIT environment selected by [`ResetOptions::with_x87_init`].
     /// Retirement, step/execution and diagnostic accounting, source identity,
-    /// configuration, memory mappings, and code caches are preserved, and so is
+    /// configuration, memory mappings, and shared code caches are preserved, and so is
     /// the delivery log ([`Self::enable_delivery_log`]) with its records and
-    /// counts: a reset is not a delivery, and nothing is recorded for it. The embedder's
-    /// A20 request is preserved because it is a board signal; a queued change
+    /// counts: a reset is not a delivery, and nothing is recorded for it.
+    /// Machine guest-paging translations and private fetch proofs are discarded.
+    /// The embedder's A20 request is preserved because it is a board signal; a queued change
     /// applies when reset abandons its instruction. Existing exit
     /// and fault handles remain valid. An exit request racing with this call is
     /// discarded if it precedes the atomic request clear; later requests remain pending.

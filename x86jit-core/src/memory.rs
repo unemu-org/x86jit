@@ -932,8 +932,14 @@ pub struct Memory {
     // byte ranges written since the last drain; `dirty_flag` lets the hot path skip the lock.
     /// Bit set = page backs a translated block. Page indices are relative to
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
+    #[cfg(not(feature = "test-hooks"))]
     code_page: Box<[AtomicU64]>,
+    #[cfg(feature = "test-hooks")]
+    code_page: Arc<Box<[AtomicU64]>>,
+    #[cfg(not(feature = "test-hooks"))]
     code_aliases: Mutex<CodeAliases>,
+    #[cfg(feature = "test-hooks")]
+    code_aliases: Arc<Mutex<CodeAliases>>,
     code_tag_epoch: AtomicU64,
     code_barrier_epoch: AtomicU64,
     pub(crate) source_barrier: crate::process_barrier::ProcessBarrier,
@@ -977,6 +983,47 @@ pub struct Memory {
 // aliasing rules. No host-side invariant is broken by concurrent access to the
 // flat byte buffer (bounds-checked per access).
 unsafe impl Sync for Memory {}
+
+/// Counted source tags for private proofs. Tracking storage can outlive Memory:
+/// a vCPU may be dropped after its VM, or reused with a different VM.
+#[cfg(feature = "test-hooks")]
+pub(crate) struct CodeRegistration {
+    code_page: Arc<Box<[AtomicU64]>>,
+    aliases: Arc<Mutex<CodeAliases>>,
+    base_page: u64,
+    pages: BTreeSet<u64>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for CodeRegistration {
+    fn drop(&mut self) {
+        let mut aliases = self.aliases.lock().unwrap();
+        for page in &self.pages {
+            let count = aliases.lifting.get_mut(page).unwrap();
+            *count -= 1;
+            if *count != 0 {
+                continue;
+            }
+            aliases.lifting.remove(page);
+            let connected = aliases.connected(*page);
+            if connected.iter().any(|p| {
+                aliases.translated.contains(p)
+                    || aliases.lifting.contains_key(p)
+                    || aliases.fetching.contains(p)
+            }) {
+                continue;
+            }
+            for page in connected {
+                if !aliases.retained_code.contains(&page) {
+                    let (w, m) = word_bit(page.wrapping_sub(self.base_page));
+                    if let Some(word) = self.code_page.get(w) {
+                        word.fetch_and(!m, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Temporary source ownership lasts through registration/publication. It is
 /// separate from durable cache/request/fetch-policy tags, so discarded lookahead
@@ -1521,6 +1568,11 @@ impl Memory {
     ) -> Self {
         let guest_base = backing.guest_base();
         let source_barrier = crate::process_barrier::ProcessBarrier::new();
+        #[cfg(feature = "test-hooks")]
+        let code_page = Arc::new(code_page);
+        let code_aliases = Mutex::new(CodeAliases::default());
+        #[cfg(feature = "test-hooks")]
+        let code_aliases = Arc::new(code_aliases);
         Self {
             model,
             sparse: matches!(backing.owner, Owner::Sparse(_)),
@@ -1528,7 +1580,7 @@ impl Memory {
             regions: Vec::new(),
             trap_intervals: Vec::new(),
             code_page,
-            code_aliases: Mutex::new(CodeAliases::default()),
+            code_aliases,
             code_tag_epoch: AtomicU64::new(0),
             code_barrier_epoch: AtomicU64::new(0),
             source_barrier,
@@ -1643,6 +1695,25 @@ impl Memory {
                 aliases.translated.insert(page);
                 self.refresh_code_page(&aliases, page);
             }
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn register_code_sources(&self, sources: &[(u64, u32)]) -> CodeRegistration {
+        let mut aliases = self.code_aliases.lock().unwrap();
+        let pages: BTreeSet<_> = sources
+            .iter()
+            .flat_map(|&(addr, len)| code_page_range(addr, u64::from(len)))
+            .collect();
+        for &page in &pages {
+            *aliases.lifting.entry(page).or_default() += 1;
+            self.refresh_code_page(&aliases, page);
+        }
+        CodeRegistration {
+            code_page: self.code_page.clone(),
+            aliases: self.code_aliases.clone(),
+            base_page: self.guest_base >> CODE_PAGE_BITS,
+            pages,
         }
     }
 
@@ -5209,7 +5280,10 @@ mod tests {
         // Exercise the full-span metadata without reserving 128 TiB of host RAM.
         // The backing is never accessed; mark/clear only touch the page tables.
         let mut m = Memory::new(MemoryModel::SoftMmu);
-        m.code_page = fresh_code_pages(0, TOP);
+        let code_page = fresh_code_pages(0, TOP);
+        #[cfg(feature = "test-hooks")]
+        let code_page = Arc::new(code_page);
+        m.code_page = code_page;
         m.watch = WatchPages::new(0, TOP);
         assert_eq!(m.code_page.len() * 8, 4usize << 30);
         m.clear_all_code_pages();

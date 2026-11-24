@@ -57,6 +57,8 @@ CORE_SRC = "x86jit-core/src/"
 #   vm/legacy/nmi.rs: the NMI helpers of the Machine dispatcher. They are
 #     called only in the KIND >= MACHINE_DISPATCH branch or from Vcpu methods
 #     that return early outside ExecutionProfile::Machine.
+#   vm/legacy/paging.rs: test-hooks-only one-instruction paging entry. It
+#     requires an I80386/486 Machine model and never enters shared dispatch.
 #   vm/legacy.rs: run_dispatch is also the application dispatch loop, so this
 #     file is shared. Its legacy calls sit in the KIND >= MACHINE_DISPATCH
 #     branch or in methods that need legacy_execution, which only a Machine
@@ -128,6 +130,10 @@ REVIEWED_ENTRY_POINTS = {
     "x86jit-core/src/vm/legacy/nmi.rs": {
         "interp::legacy::Progress", "model::CpuModel", "model::NmiNesting",
         "model::profile_for_generation",
+    },
+    "x86jit-core/src/vm/legacy/paging.rs": {
+        "interp::legacy::paging", "lift::legacy::instruction_for_profile",
+        "model::CpuModel", "model::decode",
     },
 }
 
