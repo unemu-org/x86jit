@@ -11,6 +11,12 @@ cheaper Exit/resume path is xj-to9.15 and lands first. It amends spec.md §5.1
 (the core did not call the embedder in the hot path) and extends decision-23's
 device timing seam; decisions 18, 23 and 27 otherwise stand.
 
+Amended the same day (maintainer, 2026-11-25) after an embedder's review: the
+handler object is borrowed for one run call instead of being registered as a
+shared `Send + Sync` object; a device asserts INTR as a line instead of
+queuing a vector; and the effect of a device deadline on the current run is
+stated explicitly. The sections below carry the amended text.
+
 # In-process device access on Machine profiles
 
 ## Context
@@ -25,7 +31,7 @@ This proposal amends the callback prohibition in spec.md §5.1. It preserves the
 
 ### Registration and API
 
-Add a synchronous, object-safe `DeviceIo` trait with one access method receiving a request and a borrowed `DeviceContext`. Register `Arc<dyn DeviceIo + Send + Sync>` objects in a **per-VM** registry. Closures may use an adapter.
+Add a synchronous, object-safe `DeviceIo` trait with one access method taking `&mut self`, a request and a borrowed `DeviceContext`. A **per-VM** registry records only which port and MMIO ranges are served in process. The handler object itself is supplied per run call (for example `run_steps(max, options, Option<&mut dyn DeviceIo>)`); it is borrowed for that call only, so it needs neither `Send` nor `Sync`, and no handler exists between calls. A registered range reached during a call without a handler takes the ordinary Exit. Embedders with shared device objects (`Arc`, closures) implement the same trait through an adapter.
 
 Use separate, non-overlapping half-open ranges:
 
@@ -50,9 +56,9 @@ Results are:
 
 Fallback and DeviceFault require no effects from the current callback, including RAM writes or queued signals. Earlier acknowledged transfers remain effective. DeviceFault preserves the underlying handoff’s counts and pending state; it is not a guest #PF/#GP. Recovery uses explicit completion or abandonment, never automatic redispatch.
 
-`DeviceContext` permits checked physical RAM reads/writes, queuing a vector through existing IRQ semantics, NMI assertion, host-stop requests, and deferred A20/paging-invalidation requests. Device-controller arbitration remains external. RAM writes use normal dirty/SMC notification. No raw pointers, recursive MMIO, CPU-register mutation, mapping changes, registry changes, completion calls or nested execution are permitted.
+`DeviceContext` permits checked physical RAM reads/writes, asserting or deasserting INTR, NMI assertion, host-stop requests, and deferred A20/paging-invalidation requests. Device-controller arbitration remains external. RAM writes use normal dirty/SMC notification. No raw pointers, recursive MMIO, CPU-register mutation, mapping changes, registry changes, completion calls or nested execution are permitted.
 
-Callbacks execute synchronously without engine locks held. They must be bounded and non-reentrant. `&self` plus `Send + Sync` leaves device synchronization with the embedder; the engine promises per-vCPU transfer order, not deterministic ordering between vCPUs or new SMP guarantees.
+Callbacks execute synchronously without engine locks held. They must be bounded and non-reentrant. Because the handler is borrowed `&mut` for one call on one vCPU, device synchronization across vCPUs stays with the embedder (each vCPU's call passes its own handler); the engine promises per-vCPU transfer order, not deterministic ordering between vCPUs or new SMP guarantees.
 
 Catch unwinding panics before crossing a compiled helper ABI. Report a terminal handler failure and poison execution: effects may be unknown, so normal resume is forbidden. Abort panics remain process termination.
 
@@ -74,7 +80,7 @@ REP INS/OUTS remain one port access per element. INS retains its answer across d
 
 Keep existing transfer widths, unaligned splits, A20/page fragments, RAM/device write order, locked read/write sequences and typed refusals. Registration neither merges transfers nor upgrades atomicity. No interrupt is accepted between pieces of an unfinished unit. Existing LOCK#/DMA and cross-vCPU limitations remain.
 
-Device-raised interrupts become pending immediately and are considered at the next eligible instruction or REP boundary, respecting completion holds, IF, shadows, NMI rules, debug handling and budget precedence. Host-stop requests use existing deferral rules.
+A device asserts INTR as a level, not a vector: while INTR is asserted, the run ends at the first boundary where a maskable interrupt is acceptable (IF=1, no interrupt shadow, no pending completion hold), with a typed stop, and the embedder's interrupt controller chooses the vector at acknowledge time and delivers it through the existing injection path. While IF=0 the run continues. NMI assertion keeps the engine's NMI rules. Host-stop requests use existing deferral rules.
 
 Delivery logging remains exclusively in the normal delivery sites: identical entered deliveries, order, saved state and retired values; device accesses add no delivery records. Preserve the log’s existing checkpoint and overflow behavior (spec.md, delivery log).
 
@@ -88,9 +94,9 @@ RAM writes retain physical-alias SMC and watched-data tracking. `watch_range` re
 
 Preserve `Fast`/`AcqRel`/`FullTso` access/helper ordering, including failure paths. A callback call alone is not a memory fence.
 
-Provide device-only extra-cycle charging and an optional next-service deadline checked at eligible boundaries. Report unknown timing explicitly where cycle accounting is unavailable; never substitute host elapsed time. This narrowly extends decision-23’s device timing seam, without adding callbacks to ordinary RAM accesses.
+Provide device-only extra-cycle charging and an optional next-service deadline, expressed in the run's exact position (retired instructions and iterations), that a handler may set or move earlier during the call. A deadline earlier than the end of the remaining budget ends the run at the first eligible boundary at or after it; no host time is involved. Report unknown timing explicitly where cycle accounting is unavailable; never substitute host elapsed time. This narrowly extends decision-23’s device timing seam, without adding callbacks to ordinary RAM accesses.
 
-Snapshots require quiescent CPUs and completed handoffs, or explicit abandonment. Device state, pending board events and registration reconstruction belong to the embedder. Trait objects and private continuations are not serialized; restore invalidates derived paging/code state.
+Snapshots require quiescent CPUs and completed handoffs, or explicit abandonment. Device state, pending board events and registration reconstruction belong to the embedder. Handler objects and private continuations are not serialized; restore invalidates derived paging/code state.
 
 Application profiles, including the Real16 alias, remain outside this proposal. `x86jit-core` dependencies stay exactly `{iced-x86}`.
 
@@ -98,11 +104,12 @@ Application profiles, including the Real16 alias, remain outside this proposal. 
 
 | Choice | Recommendation and reason |
 |---|---|
-| Trait objects, closures, or built-in devices | **Trait objects**, with closure adapters: shared ownership and one future compiled helper contract; no core device models. |
+| Registered `Arc<dyn DeviceIo + Send + Sync>`, a handler borrowed per run call, or built-in devices | **Borrowed per call** (`&mut dyn DeviceIo`), with adapters for shared objects: single-threaded device graphs need no synchronization, lifetime and quiescence follow from the borrow, and the compiled helpers get one contract; no core device models. |
 | Per-VM or per-vCPU registration | **Per-VM**, with vCPU identity in requests: one physical device map without duplicated routing. |
 | Byte ranges, pages, or individual addresses | **Byte ranges**: supports narrow registers without forcing page-sized devices. |
 | Overlap priority or rejection | **Reject overlap**: deterministic routing without hidden precedence. |
 | Live registration or quiescent changes | **Quiescent changes**: avoids callback-lifetime and stale-routing hazards. |
+| Queue a vector or assert INTR as a line | **Assert INTR**: a PC-class interrupt controller picks the vector at acknowledge time and priorities may change before acceptance. |
 | Unrestricted VM access or limited context | **Limited context**: supports RAM/device signaling while preserving transaction ownership. |
 | New transfer semantics or existing ledgers | **Existing ledgers**: preserves fault priority, partial effects and exact completion. |
 | Mandatory callbacks or optional acceleration | **Optional acceleration**: unregistered and declined transfers retain Exit behavior. |
