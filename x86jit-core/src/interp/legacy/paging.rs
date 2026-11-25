@@ -70,6 +70,14 @@ impl Default for Tlb {
     }
 }
 impl Tlb {
+    #[inline]
+    fn index(linear: u32) -> usize {
+        let page = linear >> 12;
+        // Fold the whole page number: descriptor tables and data separated by
+        // 256 KiB must not repeatedly expire each other's instruction proofs.
+        ((page ^ (page >> 6) ^ (page >> 12) ^ (page >> 18)) & 63) as usize
+    }
+
     pub(crate) fn invalidate(&mut self) {
         self.entries.fill(None);
         self.context = None;
@@ -93,14 +101,14 @@ impl Tlb {
     }
 
     fn remove(&mut self, linear: u32) {
-        let slot = &mut self.entries[(linear >> 12) as usize & 63];
+        let slot = &mut self.entries[Self::index(linear)];
         if slot.take().is_some() {
             self.generation = crate::vm::paging_generation();
         }
     }
 
     fn insert(&mut self, linear: u32, translation: Translation, rights: u32) {
-        let index = (linear >> 12) as usize & 63;
+        let index = Self::index(linear);
         if self.entries[index].is_some_and(|e| e.page != linear >> 12) {
             self.generation = crate::vm::paging_generation();
         }
@@ -112,7 +120,7 @@ impl Tlb {
     }
 
     fn dirty(&mut self, linear: u32, t: Translation) {
-        if let Some(e) = &mut self.entries[(linear >> 12) as usize & 63] {
+        if let Some(e) = &mut self.entries[Self::index(linear)] {
             if e.page == linear >> 12
                 && e.translation.pte_address == t.pte_address
                 && (e.translation.pte ^ t.pte) & IDENTITY == 0
@@ -398,9 +406,7 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     if let Some(tlb) = mem.tlb() {
         let mut tlb = tlb.borrow_mut();
         tlb.reconcile(cpu);
-        if let Some(e) =
-            tlb.entries[(linear >> 12) as usize & 63].filter(|e| e.page == linear >> 12)
-        {
+        if let Some(e) = tlb.entries[Tlb::index(linear)].filter(|e| e.page == linear >> 12) {
             if !permitted(cpu, access, privilege, e.rights)
                 && (cpu.machine_flags_mask == 0 || !set_accessed)
             {
@@ -2204,7 +2210,7 @@ fn fast_operand(
     {
         return None;
     }
-    let entry = tlb.entries[(linear >> 12) as usize & 63]
+    let entry = tlb.entries[Tlb::index(linear as u32)]
         .filter(|entry| u64::from(entry.page) == linear >> 12)?;
     let privilege = if cpu.legacy.cpl == 3 {
         Privilege::User

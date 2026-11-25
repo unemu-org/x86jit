@@ -6,7 +6,10 @@ use crate::interp::legacy::paging::execute_for_test;
 use crate::interp::legacy::paging::{fetch_bus_for_test, publish_cr2};
 use std::cell::Cell;
 
-const MAX_BLOCKS: usize = 64;
+// Checked V86 loops retain one proof per instruction, including multiple
+// unrolled bodies. Keep their working set independently of context identities.
+const MAX_BLOCKS: usize = 256;
+const MAX_CONTEXTS: usize = 64;
 
 #[derive(PartialEq, Eq, Hash)]
 struct Key {
@@ -86,7 +89,7 @@ impl State {
             } else {
                 // Bound context identities as well as blocks. Clear both before
                 // reusing an ID; this does not expire cached translations.
-                if self.contexts.len() == MAX_BLOCKS {
+                if self.contexts.len() == MAX_CONTEXTS {
                     self.blocks.clear();
                     self.contexts.clear();
                 }
@@ -935,6 +938,137 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sliced_far_calls_retain_blocks_and_translations_with_distant_data() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let mut vm = Vm::new(crate::VmConfig::flat(0x80000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x80000, crate::Prot::RWX, crate::RegionKind::Ram)
+                .unwrap();
+            vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+            for page in 0..128u32 {
+                vm.write_bytes(
+                    0x2000 + u64::from(page * 4),
+                    &((page * 4096) | 7).to_le_bytes(),
+                )
+                .unwrap();
+            }
+            // Descriptor page 0 and data page 64 must coexist in the TLB.
+            for index in 1..=4 {
+                let descriptor = if index <= 2 {
+                    0x00cf_fb00_0000_ffffu64
+                } else {
+                    0x00cf_f300_0000_ffffu64
+                };
+                vm.write_bytes(0x800 + index * 8, &descriptor.to_le_bytes())
+                    .unwrap();
+            }
+            let mut code = vec![0xa1, 0, 0, 4, 0]; // MOV EAX,[0x40000].
+            code.extend([0x90; 8]);
+            code.extend([0x9a, 0, 0x10, 1, 0, 0x13, 0]); // CALL FAR 13:11000.
+            code.extend([0xeb, 0xea]); // JMP 10000.
+            vm.write_bytes(0x10000, &code).unwrap();
+            vm.write_bytes(0x11000, &[0x90, 0xcb]).unwrap();
+            vm.write_bytes(0x40000, &0x12345678u32.to_le_bytes())
+                .unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.legacy.cr0 = 0x80000001;
+            cpu.cpu.legacy.cr3 = 0x1000;
+            cpu.cpu.legacy.cpl = 3;
+            cpu.cpu.legacy.gdtr.base = 0x800;
+            cpu.cpu.legacy.gdtr.limit = 39;
+            cpu.cpu.cs = 11;
+            cpu.cpu.ds = 27;
+            cpu.cpu.es = 27;
+            cpu.cpu.ss = 35;
+            for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                cache.limit = u32::MAX;
+                cache.attributes = if i == 0 { 0xc0fb } else { 0xc0f3 };
+            }
+            cpu.set_a20_enabled(true);
+            cpu.set_reg(Reg::Rip, 0x10000);
+            cpu.set_reg(Reg::Rsp, 0x8800);
+            let slice = |cpu: &mut Vcpu, budget| {
+                cpu.disable_delivery_log();
+                cpu.set_a20_enabled(true);
+                for reg in [Reg::Rip, Reg::Rax, Reg::Rsp] {
+                    cpu.set_reg(reg, cpu.reg(reg));
+                }
+                let run = cpu
+                    .run_steps(&vm, budget, crate::StepOptions::default())
+                    .unwrap();
+                assert_eq!(run.steps(), budget);
+                assert!(matches!(
+                    run.into_stop(),
+                    crate::StepStop::Exit(Exit::BudgetExhausted)
+                ));
+            };
+            for budget in [1, 17, 64, 3].into_iter().cycle().take(104) {
+                slice(&mut cpu, budget);
+            }
+            let snapshot = |cpu: &Vcpu| {
+                let state = cpu
+                    .legacy_execution
+                    .as_ref()
+                    .unwrap()
+                    .paging
+                    .as_ref()
+                    .unwrap();
+                (state.generation, state.lifts)
+            };
+            let warm = snapshot(&cpu);
+            let retired = cpu.retired_instructions();
+            for budget in [1, 17, 64, 3].into_iter().cycle().take(104) {
+                slice(&mut cpu, budget);
+                assert_eq!(snapshot(&cpu), warm, "{model:?}: warm slice rebuilt proofs");
+            }
+            assert_eq!(cpu.retired_instructions() - retired, 2210);
+            assert_eq!(cpu.reg(Reg::Rax), 0x12345678);
+            assert_eq!(cpu.reg(Reg::Rsp), 0x8800);
+            assert_eq!(cpu.reg(Reg::Rip), 0x10000);
+        }
+    }
+
+    #[test]
+    fn unrolled_v86_slices_fit_the_retained_block_map() {
+        let mut vm = Vm::new(crate::VmConfig::flat(0x8000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x8000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+        vm.write_bytes(0x2010, &0x4007u32.to_le_bytes()).unwrap();
+        let mut code = vec![0x90; 200];
+        code.extend([0xe9, 0x35, 0xff]); // JMP back across 203 bytes.
+        vm.write_bytes(0x4000, &code).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu = CpuState::legacy_real_entry([0x400, 0, 0, 0, 0, 0]);
+        cpu.cpu.legacy.cr0 = 0x80000001;
+        cpu.cpu.legacy.cr3 = 0x1000;
+        cpu.cpu.legacy.cpl = 3;
+        cpu.cpu.rflags_system = 0x23000;
+        let options = crate::StepOptions::default();
+        assert_eq!(cpu.run_steps(&vm, 402, options).unwrap().steps(), 402);
+        let snapshot = |cpu: &Vcpu| {
+            let state = cpu
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .paging
+                .as_ref()
+                .unwrap();
+            (state.generation, state.lifts, state.blocks.len())
+        };
+        let warm = snapshot(&cpu);
+        assert_eq!((warm.1, warm.2), (201, 201));
+        for _ in 0..201 {
+            cpu.disable_delivery_log();
+            cpu.set_a20_enabled(true);
+            assert_eq!(cpu.run_steps(&vm, 64, options).unwrap().steps(), 64);
+            assert_eq!(snapshot(&cpu), warm);
+        }
+        assert_eq!(cpu.cpu.rip, 0);
+    }
 
     #[test]
     fn paged_flat32_warm_block_retains_translation_and_physical_registration() {

@@ -1074,11 +1074,12 @@ fn paged_fetch_tlb_eviction_replaces_equal_byte_physical_proof() {
             f.fetch_at(0x400).unwrap();
             let before = f.cpu.paging_cache_for_test();
             f.code_mapping(0, OTHER_FRAME);
-            // Force a direct-mapped TLB collision without a guest flush.
-            f.code_mapping(0x40000, OTHER_FRAME);
+            // Pages 0 and 65 share the folded TLB index; force eviction
+            // without a guest flush.
+            f.code_mapping(0x41000, OTHER_FRAME);
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x90])
                 .unwrap();
-            f.fetch_at(0x40500).unwrap();
+            f.fetch_at(0x41500).unwrap();
             f.fetch_at(0x400).unwrap();
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
@@ -1122,11 +1123,11 @@ fn paged_fetch_proofs_are_bounded_and_reset_discards_them() {
     for model in MODELS {
         let mut f = Fixture::new(model, true, 0);
         f.code_mapping(0, CODE_FRAME);
-        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x40; 128])
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0x40; 384])
             .unwrap();
-        for ip in 0x400..0x480 {
+        for ip in 0x400..0x580 {
             f.fetch_at(ip).unwrap();
-            assert!(f.cpu.paging_cache_for_test().1 <= 64);
+            assert!(f.cpu.paging_cache_for_test().1 <= 256);
         }
         let before = f.cpu.paging_cache_for_test();
         f.cpu.reset_execution_state(Default::default());
