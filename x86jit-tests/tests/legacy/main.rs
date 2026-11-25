@@ -46,6 +46,7 @@ mod legacy_seg16;
 mod legacy_sse_integer;
 mod legacy_task_registers;
 mod legacy_task_switch;
+mod legacy_tf_loop;
 mod legacy_u3_review;
 mod legacy_upper_audit;
 mod legacy_v86;
