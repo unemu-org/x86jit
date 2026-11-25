@@ -361,8 +361,11 @@ actually fetched. Decision-27 order 1 permits a warm singleton to reuse these
 checks while its context, translation token, physical source publication generation
 and fetch permit remain valid. Keep its physical source registration alive rather
 than walking, fetching and registering again. The VM namespace issues non-reused
-tokens across all vCPUs; TLB replacement conservatively expires retained source
-proofs, and physical SMC invalidation expires their publication generation. This
+tokens across all vCPUs; removing or replacing a TLB entry that an instruction
+fetch used conservatively expires retained source proofs, and physical SMC
+invalidation expires their publication generation. Replacing a data or stack
+entry expires nothing: no proof depends on it, and a fetch through that page
+later walks and marks its own entry (xj-to9.21). This
 also permits the architecturally allowed stale mapping until invalidation or
 replacement; ordinary page-table stores do not independently revoke a token.
 A block lifted at linear L under directory A cannot execute under directory

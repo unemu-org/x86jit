@@ -4658,7 +4658,13 @@ fn cached_denial_handler_repairs_and_retries(rights: u32, write: bool, fetch: bo
                 ip + len,
                 "{model:?}/{code32}/{rights}/{write}/{fetch}"
             );
-            assert_ne!(f.cpu.paging_cache_for_test().0, generation);
+            // Paging design §3.2: only a fetch translation's removal expires
+            // source proofs; a data translation backs none.
+            if fetch {
+                assert_ne!(f.cpu.paging_cache_for_test().0, generation);
+            } else {
+                assert_eq!(f.cpu.paging_cache_for_test().0, generation);
+            }
             assert_eq!(f.get(u64::from(DATA)), if write { 0x55 } else { 0x11 });
             if !fetch && !write {
                 assert_eq!(f.cpu.cpu.gpr[0], 0x11);

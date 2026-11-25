@@ -6,6 +6,9 @@
 //! farcall-sliced and farseg-sliced use 64-step calls and board-style writes.
 //! These cases place data 256 KiB from the descriptor page.
 //! Application retirement is derived from the validated finite guest loop.
+//! Path machine-paged-v86-gp (workloads v86gp, v86gp-free) runs paged V86 at
+//! IOPL 0 with an IN every 266 retired that a ring-0 #GP monitor emulates;
+//! v86gp-free replaces the IN and monitor with the same count of V86 work.
 use std::sync::Arc;
 use std::time::Instant;
 use x86jit_core::{
@@ -331,6 +334,10 @@ fn main() {
         components(n, rounds);
         return;
     }
+    if args.get(3).is_some_and(|s| s == "machine-paged-v86-gp") {
+        v86gp(n, rounds, args.get(4).map(String::as_str));
+        return;
+    }
     println!(
         "workload,path,round,iterations,instructions,retired_counter,seconds,mips,host_per_step"
     );
@@ -434,6 +441,211 @@ fn components(n: u64, rounds: usize) {
             let count = 5 * n;
             println!(
                 "{work},component-decode,{round},{n},{count},0,{seconds:.9},{:.3},{:.3}",
+                count as f64 / seconds / 1e6,
+                host as f64 / count as f64
+            );
+        }
+    }
+}
+
+// Paged V86 at IOPL 0 with a ring-0 #GP monitor. The I/O bitmap base lies
+// beyond the TSS limit, so IN is #GP(0) (SDM Vol 3B §23.2.8.1 p. 23-11). The
+// fault enters a 32-bit interrupt gate on the TSS ring-0 stack with the
+// nine-dword V86 frame and an error code (Vol 3B §23.3.1.1 pp. 23-12–13);
+// the monitor loads DS, reads saved CS:EIP, checks the opcode, advances EIP
+// and IRETDs to V86 (Vol 2A IRET pp. 3-492–493). V86 HLT also traps; the
+// monitor then halts at CPL 0.
+const GP_BODIES: usize = 10;
+const GP_V86_CS: u16 = 0x1000;
+const GP_V86_DS: u16 = 0x2000;
+const GP_V86_SS: u16 = 0x4000;
+const GP_MONITOR: u64 = 0x9000;
+const GP_COUNTER: u64 = 0x6000;
+
+fn v86gp_code(free: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use iced_x86::code_asm::*;
+    let mut a = CodeAssembler::new(16).unwrap();
+    let mut top = a.create_label();
+    let mut near = a.create_label();
+    a.set_label(&mut top).unwrap();
+    for _ in 0..GP_BODIES {
+        // 25 retired per body, including both callees.
+        a.mov(bx, GP_V86_DS as u32).unwrap();
+        a.mov(ds, bx).unwrap();
+        a.mov(es, bx).unwrap();
+        a.mov(ax, word_ptr(0x100)).unwrap();
+        a.add(ax, 3).unwrap();
+        a.mov(word_ptr(0x100), ax).unwrap();
+        a.push(ax).unwrap();
+        a.xor(ax, 0x55aa).unwrap();
+        a.pop(ax).unwrap();
+        a.call(near).unwrap();
+        a.db(&[0x9a, 0, 0, 0x00, 0x11]).unwrap(); // CALL FAR 1100h:0.
+        a.mov(word_ptr(0x102).es(), ax).unwrap();
+        a.inc(bp).unwrap();
+        a.add(si, ax).unwrap();
+        a.rol(dx, 1).unwrap();
+        a.add(bx, 7).unwrap();
+        a.xor(bx, 0x1234).unwrap();
+        a.add(si, bx).unwrap();
+        a.inc(di).unwrap();
+        a.xor(di, si).unwrap();
+        a.ror(bx, 1).unwrap();
+    }
+    if free {
+        a.mov(al, 0x5a).unwrap();
+        for _ in 0..13 {
+            a.nop().unwrap();
+        }
+    } else {
+        a.in_(al, 0x80).unwrap();
+    }
+    a.dec(cx).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.set_label(&mut near).unwrap();
+    a.add(ax, 1).unwrap();
+    a.ret().unwrap();
+    let v86 = a.assemble(0).unwrap();
+    // Far callee at 1100h:0: XOR DX,AX; RETF.
+    let far = vec![0x31, 0xc2, 0xcb];
+    let mut m = CodeAssembler::new(32).unwrap();
+    let mut halt = m.create_label();
+    m.push(eax).unwrap();
+    m.mov(ax, 0x10).unwrap();
+    m.mov(ds, ax).unwrap();
+    m.mov(eax, dword_ptr(esp + 12)).unwrap(); // Saved CS.
+    m.shl(eax, 4).unwrap();
+    m.add(eax, dword_ptr(esp + 8)).unwrap(); // Saved EIP.
+    m.cmp(byte_ptr(eax), 0xe4).unwrap(); // IN AL,imm8.
+    m.jne(halt).unwrap();
+    m.inc(dword_ptr(GP_COUNTER)).unwrap();
+    m.add(dword_ptr(esp + 8), 2).unwrap();
+    m.pop(eax).unwrap();
+    m.mov(al, 0x5a).unwrap();
+    m.add(esp, 4).unwrap(); // Error code.
+    m.iretd().unwrap();
+    m.set_label(&mut halt).unwrap();
+    m.hlt().unwrap();
+    (v86, far, m.assemble(GP_MONITOR).unwrap())
+}
+
+fn v86gp_setup(free: bool, paged: bool) -> (Vm, x86jit_core::Vcpu) {
+    use x86jit_core::legacy::{SegmentCache, SystemSegment};
+    let memory_size = 0x50000;
+    let mut vm = Vm::new(VmConfig::flat(memory_size));
+    vm.set_cpu_mode(CpuMode::Compat32);
+    vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
+        Ok("486") => CpuModel::I80486Dx,
+        _ => CpuModel::I80386,
+    });
+    vm.map(0, memory_size as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    let (v86, far, monitor) = v86gp_code(free);
+    vm.write_bytes(u64::from(GP_V86_CS) << 4, &v86).unwrap();
+    vm.write_bytes(0x11000, &far).unwrap();
+    vm.write_bytes(GP_MONITOR, &monitor).unwrap();
+    // GDT at 3800h: flat ring-0 code and data, accessed (SDM Vol 3A §3.4.5).
+    vm.write_bytes(0x3808, &0x00cf_9b00_0000_ffffu64.to_le_bytes())
+        .unwrap();
+    vm.write_bytes(0x3810, &0x00cf_9300_0000_ffffu64.to_le_bytes())
+        .unwrap();
+    // IDT vector 13 at 3000h: 32-bit interrupt gate, DPL 0, to 8:monitor.
+    let gate = (GP_MONITOR & 0xffff) | (8 << 16) | (0x8e00 << 32) | ((GP_MONITOR >> 16) << 48);
+    vm.write_bytes(0x3000 + 13 * 8, &gate.to_le_bytes())
+        .unwrap();
+    // TSS at 5000h: ESP0=7000h, SS0=10h, I/O map base 68h past limit 67h.
+    vm.write_bytes(0x5004, &0x7000u32.to_le_bytes()).unwrap();
+    vm.write_bytes(0x5008, &0x10u32.to_le_bytes()).unwrap();
+    vm.write_bytes(0x5066, &0x68u16.to_le_bytes()).unwrap();
+    if paged {
+        // Only the V86 code, callee, data and stack pages are user pages. The
+        // V86 stack page 47h and the ring-0 stack page 6 share a TLB set, as
+        // in the embedder's fixture.
+        vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+        for page in 0..(memory_size / 4096) as u32 {
+            let user = matches!(page, 0x10 | 0x11 | 0x20 | 0x47);
+            let entry = (page * 4096) | if user { 7 } else { 3 };
+            vm.write_bytes(0x2000 + u64::from(4 * page), &entry.to_le_bytes())
+                .unwrap();
+        }
+    }
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu = CpuState::legacy_real_entry([GP_V86_CS, GP_V86_DS, GP_V86_DS, GP_V86_SS, 0, 0]);
+    cpu.cpu.legacy.cr0 = if paged { 0x80000001 } else { 1 };
+    cpu.cpu.legacy.cr3 = 0x1000;
+    cpu.cpu.legacy.cpl = 3;
+    cpu.cpu.rflags_system = 0x20000; // VM=1, IOPL=0 (SDM Vol 3B §23.2.1).
+    cpu.cpu.legacy.gdtr.base = 0x3800;
+    cpu.cpu.legacy.gdtr.limit = 0x17;
+    cpu.cpu.legacy.idtr.base = 0x3000;
+    cpu.cpu.legacy.idtr.limit = 0x7ff;
+    cpu.cpu.legacy.tr = SystemSegment {
+        selector: 0x18,
+        cache: SegmentCache {
+            base: 0x5000,
+            limit: 0x67,
+            attributes: 0x8b,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cpu.set_a20_enabled(true);
+    (vm, cpu)
+}
+
+fn v86gp_execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, entry: &CpuState, n: u64) {
+    cpu.cpu = entry.clone();
+    cpu.set_reg(Reg::Rip, 0);
+    cpu.set_reg(Reg::Rsp, 0x8000);
+    cpu.set_reg(Reg::Rcx, n);
+    let exit = cpu.run(vm, None);
+    assert!(matches!(exit, Exit::Hlt), "{exit:?}");
+    assert_eq!(cpu.cpu.legacy.cpl, 0);
+    assert_eq!(cpu.reg(Reg::Rcx) & 0xffff, 0);
+}
+
+fn v86gp(n: u64, rounds: usize, only: Option<&str>) {
+    assert!(n <= 0xffff, "CX counts the iterations");
+    let path = "machine-paged-v86-gp";
+    println!(
+        "workload,path,round,iterations,instructions,retired_counter,seconds,mips,host_per_step"
+    );
+    for round in 0..rounds {
+        for work in ["v86gp", "v86gp-free"] {
+            if only.is_some_and(|o| o != work) {
+                continue;
+            }
+            let free = work == "v86gp-free";
+            let (vm, mut cpu) = v86gp_setup(free, true);
+            let entry = cpu.cpu.clone();
+            v86gp_execute(&vm, &mut cpu, &entry, 100);
+            vm.write_bytes(GP_COUNTER, &[0; 4]).unwrap();
+            vm.write_bytes(0x20100, &[0; 2]).unwrap();
+            let retired_before = cpu.retired_instructions();
+            let host_before = instructions();
+            let start = Instant::now();
+            v86gp_execute(&vm, &mut cpu, &entry, n);
+            let seconds = start.elapsed().as_secs_f64();
+            let host = instructions() - host_before;
+            let retired = cpu.retired_instructions() - retired_before;
+            // 252 V86 + 14 monitor per iteration; the final HLT traps and the
+            // monitor retires 8 plus its own HLT.
+            let count = 266 * n + 9;
+            assert_eq!(retired, count);
+            let mut word = [0; 4];
+            vm.read_bytes(GP_COUNTER, &mut word).unwrap();
+            assert_eq!(
+                u64::from(u32::from_le_bytes(word)),
+                if free { 0 } else { n }
+            );
+            vm.read_bytes(0x20100, &mut word[..2]).unwrap();
+            assert_eq!(
+                u64::from(u16::from_le_bytes([word[0], word[1]])),
+                (30 * n) & 0xffff
+            );
+            println!(
+                "{work},{path},{round},{n},{count},{retired},{seconds:.9},{:.3},{:.3}",
                 count as f64 / seconds / 1e6,
                 host as f64 / count as f64
             );

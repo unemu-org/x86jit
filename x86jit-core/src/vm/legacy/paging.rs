@@ -1030,6 +1030,134 @@ mod tests {
         }
     }
 
+    /// Paged V86 at IOPL 0 with a ring-0 #GP monitor (SDM Vol 3B §23.2.8.1
+    /// p. 23-11, §23.3.1.1 pp. 23-12–13; Vol 2A IRET pp. 3-492–493). The
+    /// V86 stack page 47h and the ring-0 stack page 6 share a TLB set.
+    fn v86_monitor(model: crate::CpuModel, v86: &[u8], paged: bool) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(crate::VmConfig::flat(0x60000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x60000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        if paged {
+            vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+            for page in 0..0x60u32 {
+                let user = matches!(page, 0x10 | 0x30 | 0x47 | 0x51);
+                let entry = (page << 12) | if user { 7 } else { 3 };
+                vm.write_bytes(0x2000 + u64::from(page * 4), &entry.to_le_bytes())
+                    .unwrap();
+            }
+        }
+        vm.write_bytes(0x3808, &0x00cf_9b00_0000_ffffu64.to_le_bytes())
+            .unwrap();
+        vm.write_bytes(0x3810, &0x00cf_9300_0000_ffffu64.to_le_bytes())
+            .unwrap();
+        // Vector 13: 32-bit interrupt gate, DPL 0, to 8:9000h.
+        vm.write_bytes(0x3000 + 13 * 8, &0x00008e00_00089000u64.to_le_bytes())
+            .unwrap();
+        vm.write_bytes(0x5004, &[0, 0x70, 0, 0, 0x10, 0]).unwrap();
+        vm.write_bytes(0x5066, &0x68u16.to_le_bytes()).unwrap();
+        // PUSH EAX; MOV AX,10h; MOV DS,AX; INC DWORD [6000h];
+        // ADD DWORD [ESP+8],2; POP EAX; ADD ESP,4; IRETD.
+        vm.write_bytes(
+            0x9000,
+            &[
+                0x50, 0x66, 0xb8, 0x10, 0x00, 0x8e, 0xd8, 0xff, 0x05, 0x00, 0x60, 0x00, 0x00, 0x83,
+                0x44, 0x24, 0x08, 0x02, 0x58, 0x83, 0xc4, 0x04, 0xcf,
+            ],
+        )
+        .unwrap();
+        vm.write_bytes(0x10000, v86).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu = CpuState::legacy_real_entry([0x1000, 0x5100, 0x5100, 0x4000, 0, 0]);
+        cpu.cpu.legacy.cr0 = if paged { 0x80000001 } else { 1 };
+        cpu.cpu.legacy.cr3 = 0x1000;
+        cpu.cpu.legacy.cpl = 3;
+        cpu.cpu.rflags_system = 0x20000;
+        cpu.cpu.legacy.gdtr.base = 0x3800;
+        cpu.cpu.legacy.gdtr.limit = 0x17;
+        cpu.cpu.legacy.idtr.base = 0x3000;
+        cpu.cpu.legacy.idtr.limit = 0x7ff;
+        cpu.cpu.legacy.tr.selector = 0x18;
+        cpu.cpu.legacy.tr.cache = crate::SegmentCache {
+            base: 0x5000,
+            limit: 0x67,
+            attributes: 0x8b,
+            ..Default::default()
+        };
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.set_a20_enabled(true);
+        (vm, cpu)
+    }
+
+    fn proof_snapshot(cpu: &Vcpu) -> (u64, u64) {
+        let state = cpu
+            .legacy_execution
+            .as_ref()
+            .unwrap()
+            .paging
+            .as_ref()
+            .unwrap();
+        (state.generation, state.lifts)
+    }
+
+    #[test]
+    fn v86_monitor_round_trips_keep_both_contexts_proofs() {
+        // IN AL,80h (#GP to the monitor); PUSH AX; POP AX; JMP to the IN.
+        let v86 = [0xe4, 0x80, 0x50, 0x58, 0xeb, 0xfa];
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let (vm, mut cpu) = v86_monitor(model, &v86, true);
+            let options = crate::StepOptions::default();
+            // One period: three V86 steps and the monitor's eight.
+            assert_eq!(cpu.run_steps(&vm, 22, options).unwrap().steps(), 22);
+            let warm = proof_snapshot(&cpu);
+            let retired = cpu.retired_instructions();
+            for _ in 0..50 {
+                for budget in [11, 5, 6] {
+                    cpu.disable_delivery_log();
+                    assert_eq!(cpu.run_steps(&vm, budget, options).unwrap().steps(), budget);
+                }
+                assert_eq!(
+                    proof_snapshot(&cpu),
+                    warm,
+                    "{model:?}: round trip rebuilt proofs"
+                );
+            }
+            assert_eq!(cpu.retired_instructions() - retired, 50 * 22);
+            assert_eq!(cpu.cpu.rflags_system & 0x20000, 0x20000);
+            assert_eq!(
+                (cpu.cpu.cs, cpu.cpu.rip, cpu.cpu.gpr[4]),
+                (0x1000, 0, 0x8000)
+            );
+            let mut count = [0; 4];
+            vm.read_bytes(0x6000, &mut count).unwrap();
+            assert_eq!(u32::from_le_bytes(count), 102);
+        }
+    }
+
+    #[test]
+    fn replacing_a_fetch_translation_still_expires_its_proofs() {
+        // SDM Vol 3A §5.10.2: an edited PTE may stay unobserved until its
+        // translation leaves the TLB. Data page 51h shares code page 10h's
+        // set, so MOV AL,[0] replaces the fetch entry each iteration and the
+        // next fetch must walk to the edited frame.
+        // MOV AL,[0]; INC CX (DEC CX at frame 30h); JMP to the MOV.
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let (vm, mut cpu) = v86_monitor(model, &[0xa0, 0, 0, 0x41, 0xeb, 0xfa], true);
+            vm.write_bytes(0x30000, &[0xa0, 0, 0, 0x49, 0xeb, 0xfa])
+                .unwrap();
+            let options = crate::StepOptions::default();
+            assert_eq!(cpu.run_steps(&vm, 30, options).unwrap().steps(), 30);
+            assert_eq!(cpu.cpu.gpr[1], 10);
+            vm.write_bytes(0x2000 + 0x10 * 4, &0x30007u32.to_le_bytes())
+                .unwrap();
+            assert_eq!(cpu.run_steps(&vm, 30, options).unwrap().steps(), 30);
+            assert_eq!(
+                cpu.cpu.gpr[1], 0,
+                "{model:?}: stale proof after replacement"
+            );
+        }
+    }
+
     #[test]
     fn unrolled_v86_slices_fit_the_retained_block_map() {
         let mut vm = Vm::new(crate::VmConfig::flat(0x8000));

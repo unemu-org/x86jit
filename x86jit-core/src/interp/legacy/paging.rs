@@ -51,10 +51,16 @@ struct Entry {
     page: u32,
     translation: Translation,
     rights: u32,
+    /// An instruction fetch used this translation, so retained source proofs
+    /// may depend on it.
+    fetched: bool,
 }
 
 /// Paging design §3.2 / decision-27: tokens are issued by the VM namespace,
-/// never per-vCPU counters. Replacement conservatively expires source proofs.
+/// never per-vCPU counters. Removing or replacing an entry that an instruction
+/// fetch used conservatively expires source proofs. A data or stack entry
+/// backs no proof: fetch translates through its own entries, and a page
+/// whose fetch entry was replaced walks again and takes a new token.
 pub(crate) struct Tlb {
     entries: [Option<Entry>; 64],
     pub(crate) generation: u64,
@@ -102,20 +108,21 @@ impl Tlb {
 
     fn remove(&mut self, linear: u32) {
         let slot = &mut self.entries[Self::index(linear)];
-        if slot.take().is_some() {
+        if slot.take().is_some_and(|e| e.fetched) {
             self.generation = crate::vm::paging_generation();
         }
     }
 
-    fn insert(&mut self, linear: u32, translation: Translation, rights: u32) {
+    fn insert(&mut self, linear: u32, translation: Translation, rights: u32, fetched: bool) {
         let index = Self::index(linear);
-        if self.entries[index].is_some_and(|e| e.page != linear >> 12) {
+        if self.entries[index].is_some_and(|e| e.fetched && e.page != linear >> 12) {
             self.generation = crate::vm::paging_generation();
         }
         self.entries[index] = Some(Entry {
             page: linear >> 12,
             translation,
             rights,
+            fetched,
         });
     }
 
@@ -406,7 +413,8 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     if let Some(tlb) = mem.tlb() {
         let mut tlb = tlb.borrow_mut();
         tlb.reconcile(cpu);
-        if let Some(e) = tlb.entries[Tlb::index(linear)].filter(|e| e.page == linear >> 12) {
+        let index = Tlb::index(linear);
+        if let Some(e) = tlb.entries[index].filter(|e| e.page == linear >> 12) {
             if !permitted(cpu, access, privilege, e.rights)
                 && (cpu.machine_flags_mask == 0 || !set_accessed)
             {
@@ -427,6 +435,9 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
             if permitted(cpu, access, privilege, e.rights)
                 && (access != AccessKind::Write || e.translation.pte & DIRTY != 0)
             {
+                if access == AccessKind::Execute {
+                    tlb.entries[index].as_mut().unwrap().fetched = true;
+                }
                 return Ok(Translation {
                     physical: (e.translation.physical & FRAME) | (linear & 0xfff),
                     bytes: u32::from(bytes).min(0x1000 - (linear & 0xfff)) as u8,
@@ -514,7 +525,8 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
         };
         if set_accessed {
             if let Some(tlb) = mem.tlb() {
-                tlb.borrow_mut().insert(linear, translation, rights);
+                tlb.borrow_mut()
+                    .insert(linear, translation, rights, access == AccessKind::Execute);
             }
         }
         return Ok(translation);
@@ -2677,6 +2689,65 @@ mod tests {
     }
 
     #[test]
+    fn only_fetched_entries_expire_source_proofs_on_replacement() {
+        // Paging design §3.2: replacing a data or stack translation leaves
+        // every fetch translation, and so every retained source proof, intact.
+        // Pages 6 and 47h share a set (`Tlb::index`).
+        assert_eq!(Tlb::index(0x6000), Tlb::index(0x47000));
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x50000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x50000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+        for page in 0..0x50u32 {
+            vm.write_bytes(
+                0x2000 + u64::from(page * 4),
+                &(page << 12 | 7).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        let mut cpu = vm.new_vcpu().cpu;
+        cpu.legacy.cr0 = 0x80000001;
+        cpu.legacy.cr3 = 0x1000;
+        let tlb = std::cell::RefCell::new(Tlb::default());
+        let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
+        mem.paging.tlb = Some(&tlb);
+        let mut translate = |linear, access| {
+            translate_linear(
+                &mut cpu,
+                &mem,
+                linear,
+                1,
+                access,
+                Privilege::Supervisor,
+                true,
+            )
+            .unwrap()
+        };
+        translate(0x6000, AccessKind::Write);
+        let token = tlb.borrow().generation;
+        for _ in 0..3 {
+            translate(0x47000, AccessKind::Read);
+            translate(0x6000, AccessKind::Write);
+        }
+        assert_eq!(tlb.borrow().generation, token);
+        // A fetch through the set makes its replacement expire the token,
+        // also when the fetch only hit an entry a data access filled.
+        for fill in [AccessKind::Execute, AccessKind::Read] {
+            let phys = translate(0x47000, fill).physical;
+            if fill == AccessKind::Read {
+                assert_eq!(translate(0x47000, AccessKind::Execute).physical, phys);
+            }
+            let token = tlb.borrow().generation;
+            translate(0x6000, AccessKind::Read);
+            assert_ne!(tlb.borrow().generation, token);
+            let token = tlb.borrow().generation;
+            translate(0x47000, AccessKind::Read);
+            assert_eq!(tlb.borrow().generation, token);
+        }
+    }
+
+    #[test]
     fn user_access_rechecks_supervisor_tlb_fills_and_model_fault_ad() {
         // SDM Vol 3A §5.6.1; paging design §3.3: implicit supervisor
         // translations never grant user access, including on a warm hit.
@@ -2697,17 +2768,18 @@ mod tests {
                     let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
                     mem.paging.tlb = Some(&tlb);
                     if warm {
+                        // A supervisor fetch fill, which can back a source proof.
                         assert!(translate_linear(
                             &mut cpu,
                             &mem,
                             0x1000,
                             1,
-                            AccessKind::Read,
+                            AccessKind::Execute,
                             Privilege::Supervisor,
                             true
                         )
                         .is_ok());
-                        assert!(tlb.borrow().entries[1].is_some());
+                        assert!(tlb.borrow().entries[1].is_some_and(|e| e.fetched));
                         // Leave A clear in RAM while retaining the supervisor fill.
                         // A 486 denial must rewalk to perform its A updates.
                         vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
