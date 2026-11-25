@@ -493,6 +493,8 @@ pub(super) struct Execution {
     contexts: HashMap<LegacyContextStamp, RetainedContext>,
     blocks: HashMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
+    // Immutable slice of the last exiting source block; never a fetch proof.
+    retry_slice: Option<(Arc<IrBlock>, Arc<IrBlock>)>,
     rep_flags: Option<Box<RepFlags>>,
     rep_restart20: Option<(u16, u16, u16)>,
     rep_inputs20: RepInputs20,
@@ -540,6 +542,7 @@ impl Execution {
             contexts: HashMap::new(),
             blocks: HashMap::new(),
             instruction_retry: None,
+            retry_slice: None,
             rep_flags: None,
             rep_restart20: None,
             rep_inputs20: RepInputs20::default(),
@@ -583,6 +586,7 @@ impl Execution {
         self.handoff_service &= !HANDOFF_DEBUG;
         self.shutdown = false;
         self.instruction_retry = None;
+        self.retry_slice = None;
         self.direct_proofs.clear();
         self.smc_pages.clear();
         self.last_direct_fetch = None;
@@ -590,6 +594,16 @@ impl Execution {
         if let Some(paging) = &mut self.paging {
             paging.reset();
         }
+    }
+    fn retry_slice(&mut self, ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
+        if let Some((source, slice)) = &self.retry_slice {
+            if Arc::ptr_eq(source, ir) && slice.guest_start == ip {
+                return slice.clone();
+            }
+        }
+        let slice = retry_instruction(ir, ip);
+        self.retry_slice = Some((ir.clone(), slice.clone()));
+        slice
     }
     #[inline(always)]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
@@ -1734,14 +1748,24 @@ impl Vcpu {
     }
 
     #[inline(always)]
-    pub(super) fn warm_machine_context(&mut self, limit: Option<u64>) -> Option<MachineContext> {
+    pub(super) fn warm_machine_context(
+        &mut self,
+        limit: Option<u64>,
+        retry_validated: bool,
+    ) -> Option<MachineContext> {
         if limit != Some(0)
-            && !self.cpu.mmio_retry_active
+            && (!self.cpu.mmio_retry_active || retry_validated)
             && self.cpu.task_debug_trap == 0
             && self.cpu.rip <= u64::from(u32::MAX)
         {
             let execution = self.legacy_execution.as_mut().unwrap();
-            if !execution.shutdown && !execution.has_continuation() {
+            if !execution.shutdown
+                && if retry_validated {
+                    execution.event_retry.is_none() && execution.task_switch.context().is_none()
+                } else {
+                    !execution.has_continuation()
+                }
+            {
                 if let Some(context) =
                     execution.validated_context(&self.cpu, self.legacy_model.unwrap())
                 {
@@ -1816,6 +1840,22 @@ impl Vcpu {
             self.cpu.mmio_retry_active = false;
             self.cpu.mmio_retry_cs = 0;
             self.apply_pending_a20();
+        }
+        // Ownership and paged transaction inputs have been checked above. Reuse
+        // only the decode context; the retry still executes its retained IR and
+        // transfer ledger (spec.md §5.2). Public edits keep the cold path.
+        if self.cpu.mmio_retry_active
+            && self.cpu.owns_mmio_retry(self.cpu.rip)
+            && self
+                .legacy_execution
+                .as_ref()
+                .unwrap()
+                .instruction_retry
+                .is_some()
+        {
+            if let Some(context) = self.warm_machine_context(limit, true) {
+                return Ok(context);
+            }
         }
         let context = self.legacy_context_for_run()?;
         if limit == Some(0) {
@@ -3302,7 +3342,10 @@ impl Vcpu {
                                         context.segment_class,
                                         crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
                                     )) {
-                                retry_instruction(&ir, self.cpu.rip)
+                                self.legacy_execution
+                                    .as_mut()
+                                    .unwrap()
+                                    .retry_slice(&ir, self.cpu.rip)
                             } else {
                                 ir
                             };
@@ -6111,3 +6154,7 @@ mod virtual8086_key_tests {
         assert!(LegacyContextStamp::new(&cpu, model) == real);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy/exit_census.rs"]
+mod exit_census;

@@ -3412,7 +3412,7 @@ impl Vcpu {
                     });
                 }
                 crate::lift::i8086::CONTEXT
-            } else if let Some(context) = self.warm_machine_context(budget) {
+            } else if let Some(context) = self.warm_machine_context(budget, false) {
                 context
             } else {
                 match self.prepare_machine_entry_cold(budget) {
