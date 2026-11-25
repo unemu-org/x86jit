@@ -672,3 +672,81 @@ fn lldt_memory_source_is_a_word_and_invalid_operand_faults_before_loading() {
         fault(&mut cpu, &vm, 13, Some(0));
     }
 }
+
+#[test]
+fn reserved_bit21_loads_and_queries() {
+    // ASSUMED: ignore the reserved bit when executing, witnessed by a
+    // protected-mode desktop operating system's setup as software oracle.
+    // 80386 PRM §5.1.1 Fig. 5-3 p. 5-3; Intel486 PRM §5.2.3
+    // Fig. 5-8 p. 5-11: bit 21 is reserved. LAR preserves it:
+    // 80386 PRM §17 p. 17-89; Intel486 PRM §26 p. 26-188,
+    // mask 00FxFF00H (x undefined); SDM Vol 2A §3.3 p. 3-533.
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        let (vm, mut cpu) = setup(model, b"\x0f\x00\xd0\x8e\xd9\x8e\xd2\xea\x00\x12\x14\x00");
+        descriptor(&vm, 0x2008, 0x3000, 0x3f, 0x2082);
+        descriptor(&vm, 0x3000, 0x4000, 0xffff, 0x2092);
+        descriptor(&vm, 0x3008, 0x5000, 0xffff, 0x2092);
+        descriptor(&vm, 0x3010, 0, 0xffff, 0x209a);
+        cpu.cpu.gpr[0] = 8;
+        cpu.cpu.gpr[1] = 4;
+        cpu.cpu.gpr[2] = 12;
+        steps(&mut cpu, &vm, 4);
+        assert_eq!(cpu.cpu.legacy.ldtr.cache.attributes, 0x2082);
+        assert_eq!(cpu.cpu.legacy.segments[0].attributes, 0x209b);
+        vm.write_bytes(0x1200, b"\xa1\x00\x00\x50").unwrap();
+        vm.write_bytes(0x4000, &[0x34, 0x12]).unwrap();
+        steps(&mut cpu, &vm, 2);
+        assert_eq!(cpu.cpu.gpr[0], 0x1234);
+        assert_eq!(value(&vm, 0xcffe, 2), 0x1234);
+        for (code, expected) in [
+            (&b"\x66\x0f\x02\xc1"[..], Some(0x209300)),
+            (&b"\x66\x0f\x03\xc1"[..], Some(0xffff)),
+            (&b"\x0f\x00\xe1"[..], None),
+            (&b"\x0f\x00\xe9"[..], None),
+        ] {
+            vm.write_bytes(0x1300, code).unwrap();
+            cpu.cpu.rip = 0x1300;
+            steps(&mut cpu, &vm, 1);
+            assert!(cpu.cpu.flags.zf);
+            if let Some(expected) = expected {
+                assert_eq!(cpu.cpu.gpr[0], expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn reserved_bit21_cpl3_mov_es_bx() {
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        let (vm, mut cpu) = setup(model, b"\x8e\xc3\x26\xa1\x00\x00");
+        cpu.cpu.legacy.cpl = 3;
+        cpu.cpu.cs = 3;
+        cpu.cpu.ss = 3;
+        cpu.cpu.legacy.segments[0].attributes = 0xfb;
+        cpu.cpu.legacy.segments[3].attributes = 0xf3;
+        cpu.cpu.legacy.ldtr = SystemSegment {
+            selector: 8,
+            cache: SegmentCache {
+                base: 0x3000,
+                limit: 0x3ff,
+                attributes: 0x2082,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        descriptor(&vm, 0x3310, 0x4000, 0xffff, 0x20f2);
+        vm.write_bytes(0x4000, &[0x78, 0x56]).unwrap();
+        cpu.cpu.gpr[3] = 0x317;
+        steps(&mut cpu, &vm, 2);
+        assert_eq!(cpu.cpu.es, 0x317);
+        assert_eq!(cpu.cpu.gpr[0], 0x5678);
+    }
+}

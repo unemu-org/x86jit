@@ -1514,3 +1514,19 @@ fn cpl1_and_cpl2_flat32_operands_keep_supervisor_paging_rights() {
         }
     }
 }
+
+#[test]
+fn reserved_bit21_preserves_flat32_selection() {
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        let (vm, mut cpu) = setup(model, b"\x90", false);
+        for cache in &mut cpu.cpu.legacy.segments {
+            cache.attributes |= 0x2000;
+        }
+        assert_eq!(class(&cpu, model), SegmentClass::Flat32);
+        fixture::steps(&mut cpu, &vm, 1);
+    }
+}

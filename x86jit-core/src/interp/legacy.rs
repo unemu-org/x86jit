@@ -1508,7 +1508,9 @@ fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
     if visible && valid_type {
         match query {
             DescriptorQuery::Rights { dst, size } => {
-                // SDM Vol 2A §3.3 LAR: undefined bits 19:16 use zero as
+                // 80386 PRM §17 p. 17-89; Intel486 PRM §26 p. 26-188:
+                // 00FxFF00H includes reserved bit 21. SDM Vol 2A §3.3
+                // LAR p. 3-533: undefined bits 19:16 use zero as
                 // deterministic engine policy. Access byte/flags retain their bits.
                 write_reg(cpu, dst, u64::from(attr) << 8, size);
             }
@@ -1578,7 +1580,6 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
             value & !3,
         ));
     }
-    supported_descriptor(cpu, attr)?;
     accessed(cpu, mem, &mut d)?;
     install(cpu, segment, value, d.cache);
     Ok(())
@@ -1649,20 +1650,7 @@ fn far_descriptor<const ROUTED: bool, const ORDER: u8>(
     if attr & 0x80 == 0 {
         return Err(fault(cpu, 11, value & !3));
     }
-    supported_descriptor(cpu, attr)?;
     Ok((d, false))
-}
-
-fn supported_descriptor(cpu: &CpuState, attributes: u16) -> Result<(), Exit> {
-    // Decision-18 §1: an unsupported retained size attribute is an engine
-    // refusal, after architectural type/privilege/presence checks succeed.
-    if attributes & 0x2000 != 0 {
-        return Err(refusal(
-            cpu,
-            crate::UnsupportedSystemOperation::LegacyEntryFacility,
-        ));
-    }
-    Ok(())
 }
 
 fn code_limit(cpu: &CpuState, cache: legacy::SegmentCache, ip: u64) -> Result<(), Exit> {
@@ -1937,7 +1925,6 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     if d.cache.attributes & 0x80 == 0 {
         return Err(fault(cpu, 11, selector_code));
     }
-    supported_descriptor(cpu, d.cache.attributes)?;
     let size = if kind & 8 != 0 { 4 } else { 2 };
     let ip = u64::from((low & 0xffff) | if size == 4 { high & 0xffff0000 } else { 0 });
     if V86 {

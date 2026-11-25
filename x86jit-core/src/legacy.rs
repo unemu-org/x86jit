@@ -295,7 +295,14 @@ fn derive_context<const V86: bool>(
         if cache.attributes & 0x0f00 != 0 || cache.unusable > 1 || cache.reserved != 0 {
             return Err(InvalidStorage);
         }
-        if cache.attributes & (1 << 13) != 0 {
+        // ASSUMED: retain raw bit 21 but ignore it on 386/486, with a
+        // protected-mode desktop operating system's setup as software oracle.
+        // 80386 PRM §5.1.1 Fig. 5-3 p. 5-3; Intel486 PRM §5.2.3
+        // Fig. 5-8 p. 5-11 reserve this bit. LAR includes it in 00FxFF00H
+        // (386 PRM §17 p. 17-89; 486 PRM §26 p. 26-188).
+        // SDM Vol 3A §3.4.5 p. 3-12 assigns L for later processors;
+        // Application/long-mode profiles do not enter this Machine path.
+        if model.generation != CpuGeneration::I386 && cache.attributes & (1 << 13) != 0 {
             return Err(LongModeUnsupported);
         }
         if model.generation != CpuGeneration::I386 && cache.attributes & (1 << 14) != 0 {
@@ -801,10 +808,6 @@ mod tests {
             (
                 |c| c.legacy.segments[0].attributes |= 0x100,
                 MachineContextError::InvalidStorage,
-            ),
-            (
-                |c| c.legacy.segments[0].attributes |= 0x2000,
-                MachineContextError::LongModeUnsupported,
             ),
             (
                 |c| c.legacy.segments[0].unusable = 1,

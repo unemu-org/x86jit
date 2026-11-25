@@ -929,7 +929,6 @@ impl Pending {
                         if d.cache.attributes & 0x9f != 0x82 {
                             return Err(selector_fault(cpu, 10, value, self.ext));
                         }
-                        supported_descriptor(cpu, d.cache.attributes)?;
                         d.cache.unusable = 0;
                         cpu.legacy.ldtr.cache = d.cache;
                     }
@@ -1073,7 +1072,6 @@ fn load_segment<const ROUTED: bool, const ORDER: u8>(
         return Err(selector_fault(cpu, 10, value, ext));
     }
     presence(cpu)?;
-    supported_descriptor(cpu, attr)?;
     accessed(cpu, mem, &mut d)?;
     install(cpu, segment, value, d.cache);
     Ok(())

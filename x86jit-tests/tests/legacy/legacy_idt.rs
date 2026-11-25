@@ -1403,11 +1403,9 @@ fn a_released_nmi_taken_out_of_shutdown_restores_the_shutdown() {
 }
 
 #[test]
-fn a_nonresumable_refusal_during_nmi_delivery_latches_the_edge_again() {
-    // spec.md §17.10: an accepted NMI that never entered the guest leaves no
-    // blocking behind. An engine refusal with no continuation (the 80386
-    // gate's target code descriptor sets L: `LegacyEntryFacility`) puts the
-    // edge back, as a queued IRQ stays queued there.
+fn reserved_bit21_during_nmi_delivery_is_ignored() {
+    // ASSUMED reserved-bit execution policy: see legacy_ldt's bit21 witness.
+    // Delivery consumes the edge and blocks NMI after entering the handler.
     let (vm, mut cpu) = nmi_machine(
         CpuModel::I80386,
         true,
@@ -1420,25 +1418,6 @@ fn a_nonresumable_refusal_during_nmi_delivery_latches_the_edge_again() {
         .unwrap();
     vm.mem.write(0x3010, (0x18 << 16) | HANDLER, 4).unwrap();
     cpu.raise_nmi().unwrap();
-    let before = cpu.cpu.clone();
-    let (n, s) = stop(&mut cpu, &vm, 1);
-    assert!(
-        matches!(
-            s,
-            StepStop::Exit(Exit::UnsupportedSystemContext {
-                operation: UnsupportedSystemOperation::LegacyEntryFacility,
-                ..
-            })
-        ),
-        "{s:?}"
-    );
-    assert_eq!(n, 0);
-    assert_eq!(nmi_state(&cpu.cpu), nmi_state(&before));
-    assert!(
-        cpu.has_pending_nmi() && cpu.nmi_ready(),
-        "latched again, unblocked"
-    );
-    vm.write_bytes(0x201e, &[0]).unwrap();
     assert_eq!(halted(&mut cpu, &vm, 4), 1);
     assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (0x18, HANDLER + 1));
     assert_eq!(word(&vm, 0x7ffa, 2), 0x1000);

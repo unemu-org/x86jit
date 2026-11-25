@@ -2065,17 +2065,11 @@ fn review4_accessed_refusals_keep_each_incoming_segment_continuation() {
 }
 
 #[test]
-fn review4_ldt_facility_refusal_keeps_committed_continuation() {
+fn reserved_bit21_task_switch_loads_ldt() {
     for wide in [false, true] {
         let (vm, mut cpu) = setup_tasks(CpuModel::I80386, wide, &far(false, B));
         descriptor(&vm, 0x2038, 0x6000, 7, 0x2082);
         put(&vm, base(B) + if wide { 0x60 } else { 0x2a }, 2, 56);
-        expect_task_refusal(
-            &mut cpu,
-            &vm,
-            x86jit_core::UnsupportedSystemOperation::LegacyEntryFacility,
-        );
-        descriptor(&vm, 0x2038, 0x6000, 7, 0x82);
         steps(&mut cpu, &vm, 1);
         assert_eq!((cpu.cpu.legacy.tr.selector, cpu.cpu.rip), (B, 0x1800));
         assert_eq!(cpu.cpu.legacy.ldtr.cache.base, 0x6000);
@@ -3040,9 +3034,9 @@ fn review6_outward_debug_event_exit_releases_sti_shadow() {
 }
 
 #[test]
-fn review6_nonresumable_debug_delivery_refusal_releases_sti_shadow() {
+fn reserved_bit21_debug_delivery_enters_handler() {
     for wide in [false, true] {
-        let (mut vm, mut cpu) =
+        let (vm, mut cpu) =
             setup_tasks_delivery(CpuModel::I80386, wide, b"\xfb", ExceptionDelivery::InGuest);
         cpu.cpu.legacy.idtr.base = 0x7000;
         cpu.cpu.legacy.idtr.limit = 0x7ff;
@@ -3056,33 +3050,9 @@ fn review6_nonresumable_debug_delivery_refusal_releases_sti_shadow() {
         cpu.cpu.rflags_system = 0x100;
         let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
         assert_eq!(run.steps(), 1);
-        assert!(
-            matches!(
-                run.stop(),
-                StepStop::Exit(Exit::UnsupportedSystemContext {
-                    operation: x86jit_core::UnsupportedSystemOperation::LegacyEntryFacility,
-                    ..
-                })
-            ),
-            "{:?}",
-            run.stop()
-        );
-        cpu.cpu.rflags_system &= !0x100;
-        cpu.cpu.rip = 0x3000;
-        split_task_pages(&mut vm);
-        vm.unmap(0x3000, 0x3000).unwrap();
-        vm.map(
-            0x4000,
-            0x2000,
-            x86jit_core::Prot::RWX,
-            x86jit_core::RegionKind::Ram,
-        )
-        .unwrap();
-        cpu.inject_irq(0x30);
-        steps(&mut cpu, &vm, 1);
-        assert_eq!(cpu.cpu.rip, 0x1b01);
-        assert_eq!(value(&vm, 0x7ffa, 2), 0x3000);
-        assert!(!cpu.has_pending_irq());
+        assert!(matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        assert_eq!((cpu.cpu.cs, cpu.cpu.rip), (64, 0x1a00));
+        assert_eq!(cpu.cpu.legacy.segments[0].attributes, 0x209b);
     }
 }
 
@@ -3290,4 +3260,28 @@ fn flat32_task_switch_reselects_from_incoming_caches() {
             .segment_class,
         SegmentClass::Checked
     );
+}
+
+#[test]
+fn reserved_bit21_task_switch() {
+    // ASSUMED reserved-bit execution policy: see legacy_ldt's bit21 witness.
+    // 80386 PRM §§7.1–7.6 pp. 7-1–10: JMP task switch.
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        let (vm, mut cpu) = setup_tasks(model, true, &far(false, B));
+        for sel in [CODE, DATA, A, B] {
+            let at = 0x2006 + u64::from(sel);
+            let byte = value(&vm, at, 1) as u8;
+            vm.write_bytes(at, &[byte | 0x20]).unwrap();
+        }
+        steps(&mut cpu, &vm, 1);
+        assert_eq!(cpu.cpu.rip, 0x1800);
+        assert_eq!(cpu.cpu.legacy.tr.selector, B);
+        assert!(busy(&vm, B));
+        vm.write_bytes(0x1800, b"\x50\x58").unwrap();
+        steps(&mut cpu, &vm, 2);
+    }
 }

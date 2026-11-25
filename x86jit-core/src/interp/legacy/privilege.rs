@@ -115,7 +115,6 @@ fn inner_stack<const ROUTED: bool, const ORDER: u8>(
     if attr & 0x80 == 0 {
         return Err(fault(cpu, 12, (selector & !3) | ext));
     }
-    supported_descriptor(cpu, attr)?;
     Ok(Stack {
         selector,
         descriptor,
@@ -431,7 +430,6 @@ pub(super) fn call_gate<const ROUTED: bool, const ORDER: u8>(
     if code_attr & 0x80 == 0 {
         return Err(fault(cpu, 11, cs & !3));
     }
-    supported_descriptor(cpu, code_attr)?;
     // A 16-bit gate supplies offset 15:0 only (SDM p. 3-132 "CallGate
     // (InstructionPointer) AND FFFFH").
     let ip = u64::from(offset) & mask(size);
@@ -781,8 +779,6 @@ pub(super) fn outward<const ROUTED: bool, const ORDER: u8>(
     if frame.ip > u64::from(code.cache.limit) {
         return Err(fault(cpu, 13, 0));
     }
-    supported_descriptor(cpu, attr)?;
-    supported_descriptor(cpu, stack_attr)?;
     // Commit point.
     preflight(cpu, mem, &code)?;
     preflight(cpu, mem, &stack)?;
