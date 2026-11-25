@@ -20,6 +20,30 @@ const IDENTITY: u32 = FRAME | PRESENT | WRITE | USER;
 pub(crate) struct AdapterState<'a> {
     pub(super) transaction: Option<&'a std::cell::RefCell<Transaction>>,
     pub(super) tlb: Option<&'a std::cell::RefCell<Tlb>>,
+    pub(super) fast_operand: Option<FastOperand>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FastOperand {
+    linear: u64,
+    bus: u64,
+    size: u8,
+}
+
+impl FastOperand {
+    fn bus(self, linear: u64, size: u8) -> u64 {
+        debug_assert_eq!((linear, size), (self.linear, self.size));
+        self.bus
+    }
+
+    fn failure(self, cpu: &mut CpuState, trap: MemTrap, access: AccessKind, value: u64) -> Exit {
+        let StepResult::Exit(exit) =
+            trap_out(cpu, cpu.rip, trap, self.bus, self.size, access, value).into_step()
+        else {
+            unreachable!()
+        };
+        crate::fault::qualify_legacy_bus(exit, self.linear, self.bus)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -806,9 +830,25 @@ fn transfer_write<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+    access: AccessKind,
+) -> Result<u64, Exit> {
+    if let Some(operand) = mem.fast_operand() {
+        return mem
+            .raw()
+            .read(operand.bus(addr, size), size)
+            .map_err(|trap| operand.failure(cpu, trap, AccessKind::Read, 0));
+    }
+    read_slow(cpu, mem, addr, size, access)
+}
+
 #[cold]
 #[inline(never)]
-pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
+fn read_slow<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
@@ -899,9 +939,27 @@ fn retain_frame_answers(cpu: &mut CpuState, preview: &CpuState) {
     cpu.mmio_retry_cs = preview.mmio_retry_cs;
 }
 
+pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+    value: u64,
+) -> Result<(), Exit> {
+    if let Some(operand) = mem.fast_operand() {
+        let value = value & mask(size);
+        mem.raw()
+            .write(operand.bus(addr, size), value, size)
+            .map_err(|trap| operand.failure(cpu, trap, AccessKind::Write, value))?;
+        mem.note_write(operand.bus, size);
+        return Ok(());
+    }
+    write_slow(cpu, mem, addr, size, value)
+}
+
 #[cold]
 #[inline(never)]
-pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
+fn write_slow<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
@@ -933,6 +991,10 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<(), Exit> {
+    if let Some(operand) = mem.fast_operand() {
+        operand.bus(addr, size);
+        return Ok(());
+    }
     plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
 }
 
@@ -943,6 +1005,10 @@ pub(super) fn check_write_permission<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     addr: u64,
 ) -> Result<(), Exit> {
+    if mem.fast_operand().is_some() {
+        // The single-push ENTER lane checked the allocation address too.
+        return Ok(());
+    }
     // SDM Vol 2A §3.3 ENTER pp. 3-295–297 checks whether a write would
     // #PF without transferring an operand. ASSUMED: no A/D updates for
     // this check; neither ENTER nor Vol 3A §5.8 specifies them without
@@ -2114,8 +2180,195 @@ fn nonfaulting(ops: &[IrOp]) -> bool {
     })
 }
 
-/// Paged Flat32 keeps the shared instruction walk and the operand transaction
-/// ledger. Only the effect-proved lane can use the ordinary executor directly.
+// Paging design §§3.2–3.6: use only an existing translation; a miss must not
+// walk, update A/D, consume a device answer or change fault precedence.
+fn fast_operand(
+    cpu: &CpuState,
+    memory: &Memory,
+    tlb: &Tlb,
+    linear: u64,
+    size: u8,
+    access: AccessKind,
+) -> Option<FastOperand> {
+    if size == 0
+        || size > 8
+        || linear > u64::from(u32::MAX)
+        || u64::from(size) > 0x1000 - (linear & 0xfff)
+    {
+        return None;
+    }
+    let entry = tlb.entries[(linear >> 12) as usize & 63]
+        .filter(|entry| u64::from(entry.page) == linear >> 12)?;
+    let privilege = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    // 80386 PRM §5.2.4.3; SDM Vol 3A §5.8: a cached translation needs
+    // no A update, but the first write to a clean fill must set D slowly.
+    if !permitted(cpu, access, privilege, entry.rights)
+        || (access == AccessKind::Write && entry.translation.pte & DIRTY == 0)
+    {
+        return None;
+    }
+    let physical = (entry.translation.physical & FRAME) | (linear as u32 & 0xfff);
+    let (bus, part) = legacy::physical_span(cpu, u32::MAX, u64::from(physical), size);
+    if part != size
+        || memory.region_kind(bus, size) != Ok(crate::RegionKind::Ram)
+        || (access == AccessKind::Write && memory.is_code_page(bus >> 12))
+    {
+        return None;
+    }
+    Some(FastOperand { linear, bus, size })
+}
+
+/// Prove the entire instruction before transferring RAM. Address preparation
+/// reuses the shared integer helpers with flags disabled and changes only temps.
+/// A second operand, a locked operation or an unclassified effect falls back.
+fn fast_instruction(
+    ops: &[IrOp],
+    cpu: &mut CpuState,
+    memory: &Memory,
+    tlb: &Tlb,
+    temps: &mut [u64],
+) -> Option<FastOperand> {
+    if memory.host_fault_recovery() || cpu.mmio_retry_active {
+        return None;
+    }
+    let mut operand = None;
+    let mut loaded_target = None;
+    for op in ops {
+        if operand.is_some() {
+            // A near RET checks its target immediately after loading a 16/32-bit
+            // offset. Flat32 CS admits every such offset (decision-27).
+            if loaded_target.take().is_some_and(|target| {
+                matches!(op,
+                    IrOp::Legacy(L::Flat32Address { segment: SegmentId::Cs,
+                        offset, bytes: 1, access: AccessKind::Execute, .. }) if *offset == target
+                )
+            }) {
+                continue;
+            }
+            if !nonfaulting(std::slice::from_ref(op)) {
+                return None;
+            }
+            continue;
+        }
+        match op {
+            // execute_flat32 excluded the alignment-refusal regime first.
+            IrOp::InsnStart { .. } | IrOp::Legacy(L::Checkpoint | L::I486Gate) => {}
+            IrOp::ReadReg { dst, reg } => temps[*dst as usize] = crate::interp::read_reg(cpu, *reg),
+            IrOp::Add {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } if *set_flags == FlagMask::NONE => {
+                crate::interp::integer::exec_add(cpu, temps, dst, a, b, size, set_flags);
+            }
+            IrOp::Sub {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } if *set_flags == FlagMask::NONE => {
+                crate::interp::integer::exec_sub(cpu, temps, dst, a, b, size, set_flags);
+            }
+            IrOp::And {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } if *set_flags == FlagMask::NONE => {
+                crate::interp::integer::exec_and(cpu, temps, dst, a, b, size, set_flags);
+            }
+            IrOp::Shl {
+                dst,
+                a,
+                b,
+                size,
+                set_flags,
+            } if *set_flags == FlagMask::NONE => {
+                crate::interp::integer::exec_shl(cpu, temps, dst, a, b, size, set_flags);
+            }
+            IrOp::Legacy(L::Flat32Address {
+                dst,
+                segment,
+                offset,
+                bytes,
+                access,
+            }) => {
+                temps[*dst as usize] =
+                    flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access)
+                        .ok()?;
+            }
+            IrOp::Load {
+                dst, addr, size, ..
+            } => {
+                operand = Some(fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    read_val(*addr, temps),
+                    *size,
+                    AccessKind::Read,
+                )?);
+                loaded_target = (*size <= 4).then_some(Val::Temp(*dst));
+            }
+            IrOp::Store { addr, size, .. } => {
+                operand = Some(fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    read_val(*addr, temps),
+                    *size,
+                    AccessKind::Write,
+                )?);
+            }
+            IrOp::Legacy(L::Leave { size }) => {
+                operand = Some(fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    cpu.gpr[RBP] & u64::from(u32::MAX),
+                    *size,
+                    AccessKind::Read,
+                )?);
+            }
+            IrOp::Legacy(L::Enter {
+                size,
+                alloc,
+                level: 0,
+            }) => {
+                let frame = (cpu.gpr[RSP] as u32).wrapping_sub(u32::from(*size));
+                fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    u64::from(frame.wrapping_sub(u32::from(*alloc))),
+                    1,
+                    AccessKind::Write,
+                )?;
+                operand = Some(fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    u64::from(frame),
+                    *size,
+                    AccessKind::Write,
+                )?);
+            }
+            _ => return None,
+        }
+    }
+    operand
+}
+
+/// Paged Flat32 executes effect-proved registers and preflighted RAM once;
+/// all other instructions retain the full operand transaction ledger.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,
@@ -2155,12 +2408,26 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
             guest_len: (next - guest_addr) as u32,
             ops: &ir.ops[start..end],
         };
-        let result = if retry.is_none()
+        mem.paging.fast_operand = None;
+        let once = retry.is_none()
             && !(cpu.legacy.cpl == 3
                 && cpu.legacy.cr0 & (1 << 18) != 0
-                && cpu.rflags_system & (1 << 18) != 0)
-            && nonfaulting(view.ops)
-        {
+                && cpu.rflags_system & (1 << 18) != 0);
+        let registers_only = once && nonfaulting(view.ops);
+        if once && !registers_only {
+            mem.paging.fast_operand = fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps);
+        }
+        let result = if mem.paging.fast_operand.is_some() {
+            execute_instruction::<ROUTED, ORDER, true, false>(
+                ir,
+                &view,
+                cpu,
+                &mem,
+                temps,
+                context,
+                task_switch,
+            )
+        } else if registers_only {
             execute_instruction::<ROUTED, ORDER, false, false>(
                 ir,
                 &view,
@@ -2223,6 +2490,169 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_data_requires_dirty_permitted_ram_hits_and_preserves_cached_ad() {
+        // 80386 PRM §§5.2.4.3, 5.2.5, 6.4.1–6.4.2; SDM Vol 3A
+        // §§5.6.1, 5.8: cached rights/D, supervisor WP and no repeated A update.
+        for model in [
+            crate::CpuModel::I80386,
+            crate::CpuModel::I80486Dx,
+            crate::CpuModel::I80486DxCpuid,
+        ] {
+            for cpl in [0, 3] {
+                for wp in [false, true] {
+                    for rights in [1, 3, 5, 7] {
+                        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x8000));
+                        vm.set_cpu_model(model);
+                        vm.map(0, 0x6000, crate::Prot::RWX, crate::RegionKind::Ram)
+                            .unwrap();
+                        vm.map(0x6000, 0x1000, crate::Prot::RW, crate::RegionKind::Trap)
+                            .unwrap();
+                        vm.map(0x7000, 0x1000, crate::Prot::RX, crate::RegionKind::Rom)
+                            .unwrap();
+                        vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+                        vm.write_bytes(0x3004, &(0x4000u32 | rights).to_le_bytes())
+                            .unwrap();
+                        let mut cpu = vm.new_vcpu().cpu;
+                        cpu.legacy.cr0 = 0x80000001 | if wp { 1 << 16 } else { 0 };
+                        cpu.legacy.cr3 = 0x2000;
+                        cpu.legacy.cpl = cpl;
+                        cpu.legacy.a20_enabled = 1;
+                        let tlb = std::cell::RefCell::new(Tlb::default());
+                        let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
+                        mem.paging.tlb = Some(&tlb);
+                        assert!(fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1000,
+                            4,
+                            AccessKind::Read
+                        )
+                        .is_none());
+                        // An implicit supervisor read fills even supervisor-only pages.
+                        translate_linear(
+                            &mut cpu,
+                            &mem,
+                            0x1000,
+                            4,
+                            AccessKind::Read,
+                            Privilege::Supervisor,
+                            true,
+                        )
+                        .unwrap();
+                        let user_allowed = cpl == 0 || rights & 4 != 0;
+                        assert_eq!(
+                            fast_operand(&cpu, &vm.mem, &tlb.borrow(), 0x1000, 4, AccessKind::Read)
+                                .is_some(),
+                            user_allowed
+                        );
+                        assert!(
+                            fast_operand(
+                                &cpu,
+                                &vm.mem,
+                                &tlb.borrow(),
+                                0x1000,
+                                4,
+                                AccessKind::Write
+                            )
+                            .is_none(),
+                            "clean read fill"
+                        );
+                        let write_allowed = user_allowed
+                            && (rights & 2 != 0
+                                || (cpl == 0 && (model == crate::CpuModel::I80386 || !wp)));
+                        let result = write(&mut cpu, &mem, 0x1000, 4, 41);
+                        assert_eq!(result.is_ok(), write_allowed);
+                        if !write_allowed {
+                            continue;
+                        }
+                        // Clear stored A/D without invalidating the dirty cached entry.
+                        vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+                        vm.write_bytes(0x3004, &(0x4000u32 | rights).to_le_bytes())
+                            .unwrap();
+                        mem.paging.fast_operand = fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1000,
+                            4,
+                            AccessKind::Write,
+                        );
+                        assert!(mem.paging.fast_operand.is_some());
+                        write(&mut cpu, &mem, 0x1000, 4, 42).unwrap();
+                        assert_eq!(
+                            read(&mut cpu, &mem, 0x1000, 4, AccessKind::Read).unwrap(),
+                            42
+                        );
+                        let mut bytes = [0; 4];
+                        for at in [0x2000, 0x3004] {
+                            vm.read_bytes(at, &mut bytes).unwrap();
+                            assert_eq!(u32::from_le_bytes(bytes) & 0x60, 0);
+                        }
+                        mem.paging.fast_operand = None;
+                        assert!(fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1fff,
+                            4,
+                            AccessKind::Read
+                        )
+                        .is_none());
+                        vm.mem.mark_code(0x4000, 1);
+                        assert!(fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1000,
+                            4,
+                            AccessKind::Write
+                        )
+                        .is_none());
+                        assert!(fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1000,
+                            4,
+                            AccessKind::Read
+                        )
+                        .is_some());
+                        for physical in [0x6000, 0x7000, 0x8000] {
+                            tlb.borrow_mut().entries[1]
+                                .as_mut()
+                                .unwrap()
+                                .translation
+                                .physical = physical;
+                            for access in [AccessKind::Read, AccessKind::Write] {
+                                assert!(fast_operand(
+                                    &cpu,
+                                    &vm.mem,
+                                    &tlb.borrow(),
+                                    0x1000,
+                                    4,
+                                    access
+                                )
+                                .is_none());
+                            }
+                        }
+                        tlb.borrow_mut().invalidate();
+                        assert!(fast_operand(
+                            &cpu,
+                            &vm.mem,
+                            &tlb.borrow(),
+                            0x1000,
+                            4,
+                            AccessKind::Read
+                        )
+                        .is_none());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn user_access_rechecks_supervisor_tlb_fills_and_model_fault_ad() {

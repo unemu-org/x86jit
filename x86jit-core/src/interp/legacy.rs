@@ -451,6 +451,7 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 pub(crate) struct PagingMode<const PAGED: bool>;
 pub(crate) trait PagingStorage {
     type State<'a>: Default;
+    fn fast_operand(state: &Self::State<'_>) -> Option<paging::FastOperand>;
     fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>>;
     fn transaction<'a>(
         state: &Self::State<'a>,
@@ -458,6 +459,9 @@ pub(crate) trait PagingStorage {
 }
 impl PagingStorage for PagingMode<false> {
     type State<'a> = ();
+    fn fast_operand(_: &()) -> Option<paging::FastOperand> {
+        None
+    }
     fn tlb<'a>(_: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
         None
     }
@@ -467,6 +471,9 @@ impl PagingStorage for PagingMode<false> {
 }
 impl PagingStorage for PagingMode<true> {
     type State<'a> = paging::AdapterState<'a>;
+    fn fast_operand(state: &Self::State<'_>) -> Option<paging::FastOperand> {
+        state.fast_operand
+    }
     fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
         state.tlb
     }
@@ -545,6 +552,9 @@ struct Supervisor<'a, M>(&'a M);
 // view carries its model's physical-address mask (`legacy::physical_mask`).
 trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     const PAGED: bool = false;
+    fn fast_operand(&self) -> Option<paging::FastOperand> {
+        None
+    }
     #[inline(always)]
     fn paged(&self) -> bool {
         Self::PAGED
@@ -663,6 +673,9 @@ where
     PagingMode<PAGED>: PagingStorage,
 {
     const PAGED: bool = PAGED;
+    fn fast_operand(&self) -> Option<paging::FastOperand> {
+        PagingMode::<PAGED>::fast_operand(&self.paging)
+    }
     fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
         PagingMode::<PAGED>::tlb(&self.paging)
     }
@@ -2394,7 +2407,7 @@ fn execute_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool, c
 where
     PagingMode<PAGED>: PagingStorage,
 {
-    if PAGED && mem.transaction().is_none() {
+    if PAGED && mem.transaction().is_none() && mem.fast_operand().is_none() {
         return paging::execute::<ROUTED, ORDER, PAGED, V86>(
             block,
             ir,

@@ -424,6 +424,205 @@ fn paged_same(a: &Vcpu, b: &mut Vcpu, avm: &Vm, bvm: &Vm) {
 }
 
 #[test]
+fn paged_warm_data_and_stack_transfers_equal_checked_at_every_budget() {
+    // SDM Vol 2A ENTER/LEAVE; Vol 2B PUSH/POP/RET; 80386 PRM §5.2.4.3.
+    let mut code = b"\xa1\x00\x60\x00\x00\xa3\x04\x60\x00\x00\x50\x5b\xe8".to_vec();
+    let call = code.len();
+    code.extend([0; 4]);
+    code.extend_from_slice(b"\xc8\x08\x00\x00\xc9\x4f\x75");
+    code.push((-(code.len() as i8 + 1)) as u8);
+    code.extend_from_slice(b"\x0f\x0b");
+    let sub = code.len();
+    code[call..call + 4].copy_from_slice(&((sub - call - 4) as u32).to_le_bytes());
+    code.extend_from_slice(b"\x40\xc3");
+    for model in [
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+        CpuModel::I80486DxCpuid,
+    ] {
+        for cpl in [0, 3] {
+            for dirty in [false, true] {
+                for budget in 0..36 {
+                    let make = |checked| {
+                        let (vm, mut cpu) = if cpl == 3 {
+                            user_setup(model, &code, true, checked)
+                        } else {
+                            paged_setup(model, &code, checked)
+                        };
+                        cpu.cpu.gpr[4] = 0x7ff0;
+                        cpu.cpu.gpr[5] = 0x7fe0;
+                        cpu.cpu.gpr[7] = 3;
+                        put(&vm, 0x6000, 41);
+                        if dirty {
+                            for page in [6, 7] {
+                                put(&vm, PT + 4 * page, (page * 4096) as u32 | 0x67);
+                            }
+                        }
+                        (vm, cpu)
+                    };
+                    let (avm, mut a) = make(false);
+                    let (bvm, mut b) = make(true);
+                    assert_eq!(class(&a, model), SegmentClass::Flat32);
+                    assert_eq!(class(&b, model), SegmentClass::Checked);
+                    let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                    let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                    assert_eq!(
+                        format!("{ar:?}"),
+                        format!("{br:?}"),
+                        "{model:?} CPL{cpl} dirty={dirty} budget={budget}"
+                    );
+                    paged_same(&a, &mut b, &avm, &bvm);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paged_warm_multi_operand_second_fault_and_locked_transfers_equal_checked() {
+    // 80386 PRM §9.8.14: restartable #PF; SDM Vol 3A §11.1.2: LOCK.
+    let cases: &[(&[u8], u64, bool)] = &[
+        (
+            b"\xa1\x00\x60\x00\x00\xff\x35\x00\x60\x00\x00",
+            0x8004,
+            true,
+        ), // PUSH [mem]: stack faults second
+        (
+            b"\xa1\xf0\x7f\x00\x00\x8f\x05\x00\x60\x00\x00",
+            0x7ff0,
+            false,
+        ), // POP [mem]: destination faults second
+        (
+            b"\xa1\x00\x60\x00\x00\xf0\x01\x05\x00\x60\x00\x00\x0f\x0b",
+            0x7ff0,
+            false,
+        ),
+        (
+            b"\xa1\xfe\x6f\x00\x00\xf0\x01\x05\xfe\x6f\x00\x00\x0f\x0b",
+            0x7ff0,
+            false,
+        ),
+    ];
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for cpl in [0, 3] {
+            for (index, &(code, stack, stack_fault)) in cases.iter().enumerate() {
+                let make = |checked| {
+                    let (vm, mut cpu) = if cpl == 3 {
+                        user_setup(model, code, true, checked)
+                    } else {
+                        paged_setup(model, code, checked)
+                    };
+                    cpu.cpu.gpr[4] = stack;
+                    cpu.cpu.gpr[0] = 11;
+                    put(&vm, 0x6000, 41);
+                    put(&vm, 0x7ff0, 123);
+                    if index == 3 {
+                        put(&vm, PT + 7 * 4, 0x9007);
+                        vm.write_bytes(0x6ffe, &[0x78, 0x56]).unwrap();
+                        vm.write_bytes(0x9000, &[0x34, 0x12]).unwrap();
+                    }
+                    if index < 2 {
+                        put(&vm, PT + 4 * if stack_fault { 8 } else { 6 }, 0);
+                    }
+                    (vm, cpu)
+                };
+                let (avm, mut a) = make(false);
+                let (bvm, mut b) = make(true);
+                assert_eq!(class(&b, model), SegmentClass::Checked);
+                let ar = a.run_steps(&avm, 8, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, 8, StepOptions::default()).unwrap();
+                assert_eq!(format!("{ar:?}"), format!("{br:?}"));
+                if index < 2 {
+                    assert_eq!(ar.steps(), 1);
+                    assert_eq!(a.cpu.gpr[4], stack);
+                    assert_eq!(a.cpu.legacy.cr2, if stack_fault { 0x8000 } else { 0x6000 });
+                    let StepStop::Exit(exit @ Exit::Exception { vector: 14, .. }) = ar.stop()
+                    else {
+                        panic!("{ar:?}");
+                    };
+                    assert_eq!(
+                        exit.fault_metadata().unwrap().error_code(),
+                        x86jit_core::fault::ErrorCode::bits(2 | if cpl == 3 { 4 } else { 0 }, 7)
+                    );
+                } else {
+                    assert_eq!(ar.steps(), 2);
+                    if index == 2 {
+                        assert_eq!(get(&avm, 0x6000), 82);
+                    } else {
+                        let mut low = [0; 2];
+                        let mut high = [0; 2];
+                        avm.read_bytes(0x6ffe, &mut low).unwrap();
+                        avm.read_bytes(0x9000, &mut high).unwrap();
+                        assert_eq!(
+                            u32::from_le_bytes([low[0], low[1], high[0], high[1]]),
+                            0x2468acf0
+                        );
+                        assert_eq!(get(&avm, PT + 6 * 4) & 0x60, 0x60);
+                        assert_eq!(get(&avm, PT + 7 * 4) & 0x60, 0x60);
+                    }
+                }
+                paged_same(&a, &mut b, &avm, &bvm);
+            }
+        }
+    }
+}
+
+#[test]
+fn paged_dirty_code_alias_stores_refresh_current_and_following_blocks() {
+    // Paging design §3.5: both linear aliases register the physical source;
+    // an already-dirty TLB hit must still pass through the physical SMC barrier.
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for cpl in [0, 3] {
+            for following in [false, true] {
+                let target = if following { 16 } else { 13 };
+                let mut code = b"\x8b\x1d\x00\x90\x00\x00\xc6\x05".to_vec();
+                // Six-byte load + seven-byte store: fallthrough is offset 13.
+                code.extend((0x9000u32 + target).to_le_bytes());
+                code.push(0x43); // Replace INC EAX with INC EBX.
+                if following {
+                    code.extend_from_slice(b"\xeb\x01\x90");
+                }
+                code.extend_from_slice(b"\x40\x0f\x0b");
+                let make = |checked| {
+                    let (vm, mut cpu) = if cpl == 3 {
+                        user_setup(model, &code, true, checked)
+                    } else {
+                        paged_setup(model, &code, checked)
+                    };
+                    put(&vm, PT + 9 * 4, 0x1067);
+                    // Precache the old following block before the alias store.
+                    if following {
+                        cpu.cpu.rip = 0x1000 + u64::from(target);
+                        assert_eq!(
+                            cpu.run_steps(&vm, 1, StepOptions::default())
+                                .unwrap()
+                                .steps(),
+                            1
+                        );
+                        cpu.cpu.gpr[0] = 0;
+                        cpu.cpu.rip = 0x1000;
+                    }
+                    (vm, cpu)
+                };
+                let (avm, mut a) = make(false);
+                let (bvm, mut b) = make(true);
+                assert_eq!(class(&b, model), SegmentClass::Checked);
+                let ar = a.run_steps(&avm, 10, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, 10, StepOptions::default()).unwrap();
+                assert_eq!(format!("{ar:?}"), format!("{br:?}"));
+                assert_eq!(a.cpu.gpr[0], 0);
+                // EBX was loaded from the source before its successor changed.
+                assert_eq!(
+                    a.cpu.gpr[3],
+                    u64::from(u32::from_le_bytes(code[..4].try_into().unwrap())) + 1
+                );
+                paged_same(&a, &mut b, &avm, &bvm);
+            }
+        }
+    }
+}
+
+#[test]
 fn arpl_conditional_segment_write_checks_equal_checked() {
     // SDM Vol 2A §3.3 ARPL pp. 3-75–76: only a raised RPL writes DEST;
     // a write through a non-writable segment raises #GP(0).
