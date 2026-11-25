@@ -2910,6 +2910,11 @@ impl Vcpu {
         }
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
+        // Decision-28 stage 3: a handled MMIO transfer of a shared walk can
+        // complete inside its block (`device::in_block_access`).
+        let in_block = (DEVICES && devices.handler.is_some() && vm.device_table.has_mmio())
+            .then(|| super::device::InBlock::new(vm, self.device_cpu().id));
+        let _in_block_scope = in_block.as_ref().map(super::device::InBlock::publish);
         macro_rules! machine_exit {
             ($exit:expr) => {{
                 let exit = $exit;
@@ -2919,7 +2924,8 @@ impl Vcpu {
                     if matches!(
                         exit,
                         Exit::PortIo { .. } | Exit::MmioRead { .. } | Exit::MmioWrite { .. }
-                    ) {
+                    ) && devices.serves(vm, &exit)
+                    {
                         let mut run = StepRun {
                             steps,
                             stop: StepStop::Exit(exit),
@@ -3322,7 +3328,20 @@ impl Vcpu {
                             )
                     }
                 } else {
-                    crate::interp::legacy::execute_block::<ROUTED, ORDER>(
+                    if DEVICES && matches!(walk, BlockWalk::Shared) {
+                        if let Some(hook) = &in_block {
+                            if self
+                                .legacy_execution
+                                .as_ref()
+                                .unwrap()
+                                .event_retry
+                                .is_none()
+                            {
+                                hook.arm(devices, self, &ir, steps);
+                            }
+                        }
+                    }
+                    let progress = crate::interp::legacy::execute_block::<ROUTED, ORDER>(
                         walk,
                         &ir,
                         &mut self.cpu,
@@ -3335,7 +3354,13 @@ impl Vcpu {
                         self.ss_shadow,
                         boundary.irq_pending,
                         self.nmi_state & NMI_BLOCKED != 0,
-                    )
+                    );
+                    if DEVICES {
+                        if let Some(hook) = &in_block {
+                            hook.disarm();
+                        }
+                    }
+                    progress
                 };
                 if DEVICES {
                     let port = progress.outcome.as_ref().is_some_and(|o| {
@@ -3344,15 +3369,18 @@ impl Vcpu {
                     });
                     // Port operations terminate their IR block. INS holds its
                     // IP until the store; a non-final OUTS element also holds it.
-                    let port_ip = ir
-                        .ops
-                        .iter()
-                        .rev()
-                        .find_map(|op| match op {
-                            IrOp::InsnStart { guest_addr } => Some(*guest_addr),
-                            _ => None,
-                        })
-                        .unwrap_or(ir.guest_start);
+                    let port_ip = if port {
+                        ir.ops
+                            .iter()
+                            .rev()
+                            .find_map(|op| match op {
+                                IrOp::InsnStart { guest_addr } => Some(*guest_addr),
+                                _ => None,
+                            })
+                            .unwrap_or(ir.guest_start)
+                    } else {
+                        self.cpu.rip
+                    };
                     let final_retired = port
                         && self
                             .cpu
@@ -3364,7 +3392,7 @@ impl Vcpu {
                             - u64::from(final_retired),
                         steps: steps + progress.steps - u64::from(port),
                     };
-                    devices.instruction_ip = if port { port_ip } else { self.cpu.rip };
+                    devices.instruction_ip = port_ip;
                     devices.code_segment = self.cpu.cs;
                 }
                 if direct20 {

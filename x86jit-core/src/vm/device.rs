@@ -223,11 +223,13 @@ pub(super) struct Cpu {
     pub intr: bool,
     pub invalidate: bool,
 }
+/// Marks a vCPU as executing for `Registry::quiescent` for one run. It owns a
+/// reference to the registration because the run borrows the vCPU mutably.
 pub(super) struct Active(Arc<CpuRegistration>);
 impl Active {
     pub fn enter(cpu: &Arc<CpuRegistration>) -> Self {
         cpu.active.store(true, Ordering::Release);
-        Self(cpu.clone())
+        Self(Arc::clone(cpu))
     }
 }
 impl Drop for Active {
@@ -237,24 +239,18 @@ impl Drop for Active {
 }
 #[derive(Default)]
 pub(super) struct Registry {
-    entries: Mutex<Vec<(DeviceHandle, DeviceRange)>>,
-    /// Whether `entries` is non-empty, so an access with no registered range
-    /// takes no lock. Entries change only while every vCPU is quiescent.
-    any: AtomicBool,
     cpus: Mutex<Vec<Weak<CpuRegistration>>>,
     poison: AtomicBool,
 }
 impl Registry {
-    pub fn add_cpu(&self, word: &Arc<AtomicU64>) -> Arc<CpuRegistration> {
+    pub fn add_cpu(&self, word: &Arc<AtomicU64>, registered: bool) -> Arc<CpuRegistration> {
         let cpu = Arc::new(CpuRegistration {
             word: Arc::downgrade(word),
-            status: AtomicU8::new(
-                if self.entries.lock().unwrap().is_empty() && !self.poisoned() {
-                    0
-                } else {
-                    2
-                },
-            ),
+            status: AtomicU8::new(if !registered && !self.poisoned() {
+                0
+            } else {
+                OBSERVED
+            }),
             ..CpuRegistration::default()
         });
         let mut cpus = self.cpus.lock().unwrap();
@@ -270,9 +266,6 @@ impl Registry {
             .filter_map(Weak::upgrade)
             .all(|p| !p.active.load(Ordering::Acquire) && !p.pending())
     }
-    pub fn mapping_busy(&self, address: u64, len: usize) -> bool {
-        self.entries.lock().unwrap().iter().any(|(_, r)| matches!(r, DeviceRange::Mmio(r) if address < r.end && r.start < address.saturating_add(len as u64))) && !self.quiescent()
-    }
     fn poison_execution(&self) {
         self.poison.store(true, Ordering::Release);
         for cpu in self.cpus.lock().unwrap().iter().filter_map(Weak::upgrade) {
@@ -282,32 +275,86 @@ impl Registry {
             }
         }
     }
+    #[inline(always)]
     pub fn poisoned(&self) -> bool {
         self.poison.load(Ordering::Acquire)
     }
-    fn matches(&self, r: &DeviceRequest) -> bool {
-        if !self.any.load(Ordering::Acquire) {
-            return false;
+}
+/// The VM's registered ranges. Registration takes `&mut Vm` and every run
+/// borrows `&Vm`, so no run can overlap a change: runs read this without a
+/// lock or an atomic. Ports are a bitmap over the 16-bit namespace, MMIO a
+/// sorted list of disjoint ranges.
+#[derive(Default)]
+pub(super) struct Table {
+    pub(super) entries: Vec<(DeviceHandle, DeviceRange)>,
+    ports: Vec<u64>,
+    mmio: Vec<Range<u64>>,
+}
+impl Table {
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    #[inline(always)]
+    pub fn has_mmio(&self) -> bool {
+        !self.mmio.is_empty()
+    }
+    fn rebuild(&mut self) {
+        self.ports.clear();
+        self.mmio.clear();
+        for (_, range) in &self.entries {
+            match range {
+                DeviceRange::Ports(r) => {
+                    self.ports.resize(1024, 0);
+                    for port in r.clone() {
+                        self.ports[port as usize / 64] |= 1 << (port % 64);
+                    }
+                }
+                DeviceRange::Mmio(r) => self.mmio.push(r.clone()),
+            }
         }
-        self.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, range)| match range {
-                DeviceRange::Ports(range) => {
-                    r.space == DeviceSpace::Port
-                        && range.contains(&(r.address as u32))
-                        && matches!(r.size, 1 | 2 | 4)
+        self.mmio.sort_by_key(|r| r.start);
+    }
+    /// Whether one registration serves this transfer: the addressed port for a
+    /// 1/2/4-byte port access, or the whole 1/2/4/8-byte MMIO transfer.
+    #[inline]
+    pub fn serves(&self, space: DeviceSpace, address: u64, size: u8) -> bool {
+        match space {
+            DeviceSpace::Port => {
+                matches!(size, 1 | 2 | 4)
+                    && self
+                        .ports
+                        .get(address as usize / 64)
+                        .is_some_and(|word| word & (1 << (address % 64)) != 0)
+            }
+            DeviceSpace::Mmio => {
+                if !matches!(size, 1 | 2 | 4 | 8) {
+                    return false;
                 }
-                DeviceRange::Mmio(range) => {
-                    r.space == DeviceSpace::Mmio
-                        && matches!(r.size, 1 | 2 | 4 | 8)
-                        && r.address >= range.start
-                        && r.address
-                            .checked_add(u64::from(r.size))
-                            .is_some_and(|end| end <= range.end)
-                }
-            })
+                let i = self.mmio.partition_point(|r| r.start <= address);
+                i != 0
+                    && address
+                        .checked_add(u64::from(size))
+                        .is_some_and(|end| end <= self.mmio[i - 1].end)
+            }
+        }
+    }
+    /// The space, address and size of an issued port or MMIO handoff.
+    #[inline]
+    pub fn serves_exit(&self, exit: &Exit) -> bool {
+        match *exit {
+            Exit::PortIo { port, size, .. } => {
+                self.serves(DeviceSpace::Port, u64::from(port), size)
+            }
+            Exit::MmioRead { addr, size, .. } | Exit::MmioWrite { addr, size, .. } => {
+                self.serves(DeviceSpace::Mmio, addr, size)
+            }
+            _ => false,
+        }
+    }
+    fn overlaps_mmio(&self, address: u64, len: usize) -> bool {
+        let end = address.saturating_add(len as u64);
+        self.mmio.iter().any(|r| address < r.end && r.start < end)
     }
 }
 impl Vm {
@@ -339,25 +386,18 @@ impl Vm {
             }
             _ => return Err(DeviceRegistrationError::InvalidRange),
         }
-        if self
-            .devices()
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, old)| {
-                Some(*id) != replacing
-                    && match (range, old) {
-                        (DeviceRange::Ports(a), DeviceRange::Ports(b)) => {
-                            a.start < b.end && b.start < a.end
-                        }
-                        (DeviceRange::Mmio(a), DeviceRange::Mmio(b)) => {
-                            a.start < b.end && b.start < a.end
-                        }
-                        _ => false,
+        if self.device_table.entries.iter().any(|(id, old)| {
+            Some(*id) != replacing
+                && match (range, old) {
+                    (DeviceRange::Ports(a), DeviceRange::Ports(b)) => {
+                        a.start < b.end && b.start < a.end
                     }
-            })
-        {
+                    (DeviceRange::Mmio(a), DeviceRange::Mmio(b)) => {
+                        a.start < b.end && b.start < a.end
+                    }
+                    _ => false,
+                }
+        }) {
             return Err(DeviceRegistrationError::Overlap);
         }
         Ok(())
@@ -372,10 +412,8 @@ impl Vm {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| DeviceRegistrationError::Exhausted)?,
         );
-        let mut entries = self.devices().entries.lock().unwrap();
-        entries.push((id, range));
-        self.devices().any.store(true, Ordering::Release);
-        drop(entries);
+        self.device_table.entries.push((id, range));
+        self.device_table.rebuild();
         for cpu in self
             .devices()
             .cpus
@@ -395,22 +433,22 @@ impl Vm {
     ) -> Result<(), DeviceRegistrationError> {
         if self.profile == ExecutionProfile::Machine
             && !self
-                .devices()
+                .device_table
                 .entries
-                .lock()
-                .unwrap()
                 .iter()
                 .any(|(id, _)| *id == handle)
         {
             return Err(DeviceRegistrationError::UnknownHandle);
         }
         self.validate_device_range(&range, Some(handle))?;
-        let mut entries = self.devices().entries.lock().unwrap();
-        let entry = entries
+        let entry = self
+            .device_table
+            .entries
             .iter_mut()
             .find(|(id, _)| *id == handle)
             .ok_or(DeviceRegistrationError::UnknownHandle)?;
         entry.1 = range;
+        self.device_table.rebuild();
         Ok(())
     }
     pub fn unregister_device_range(
@@ -420,19 +458,23 @@ impl Vm {
         if !self.devices().quiescent() {
             return Err(DeviceRegistrationError::Busy);
         }
-        let mut entries = self.devices().entries.lock().unwrap();
-        let i = entries
+        let i = self
+            .device_table
+            .entries
             .iter()
             .position(|(id, _)| *id == handle)
             .ok_or(DeviceRegistrationError::UnknownHandle)?;
-        entries.remove(i);
-        self.devices()
-            .any
-            .store(!entries.is_empty(), Ordering::Release);
+        self.device_table.entries.remove(i);
+        self.device_table.rebuild();
         Ok(())
     }
     pub fn device_poisoned(&self) -> bool {
         self.devices().poisoned()
+    }
+    /// A mapping change over registered MMIO while a vCPU executes or owns an
+    /// outstanding handoff.
+    pub(super) fn device_mapping_busy(&self, address: u64, len: usize) -> bool {
+        self.device_table.overlaps_mmio(address, len) && !self.devices().quiescent()
     }
 }
 
@@ -441,6 +483,10 @@ impl Vm {
 /// notification. No CPU, mappings, completion or execution APIs are exposed.
 pub struct DeviceContext<'a> {
     vm: &'a Vm,
+    fx: Effects,
+}
+/// The staged effects of one callback, committed only on Handled.
+struct Effects {
     writes: Vec<(u64, Vec<u8>)>,
     intr: Option<bool>,
     nmi: bool,
@@ -448,6 +494,32 @@ pub struct DeviceContext<'a> {
     a20: Option<bool>,
     invalidate: bool,
     deadline: Option<DeviceDeadline>,
+}
+impl Effects {
+    fn new(deadline: Option<DeviceDeadline>) -> Self {
+        Self {
+            writes: Vec::new(),
+            intr: None,
+            nmi: false,
+            stop: false,
+            a20: None,
+            invalidate: false,
+            deadline,
+        }
+    }
+    /// Whether committing these effects changes nothing the rest of a block
+    /// depends on: no RAM write (code or data a later instruction reads), no
+    /// INTR level change, NMI, host stop, A20 or paging request, and the same
+    /// deadline (the block's step cap was computed from it).
+    fn none(&self, intr: bool, deadline: Option<DeviceDeadline>) -> bool {
+        self.writes.is_empty()
+            && self.intr.is_none_or(|level| level == intr)
+            && !self.nmi
+            && !self.stop
+            && self.a20.is_none()
+            && !self.invalidate
+            && self.deadline == deadline
+    }
 }
 impl DeviceContext<'_> {
     fn check_ram(&self, address: u64, len: usize) -> Result<(), DeviceError> {
@@ -478,7 +550,7 @@ impl DeviceContext<'_> {
                 .map_err(|_| DeviceError::new(1))?;
             offset += len;
         }
-        for (at, data) in &self.writes {
+        for (at, data) in &self.fx.writes {
             let lo = address.max(*at);
             let hi = (address + bytes.len() as u64).min(*at + data.len() as u64);
             if lo < hi {
@@ -490,33 +562,33 @@ impl DeviceContext<'_> {
     }
     pub fn write_ram(&mut self, address: u64, bytes: &[u8]) -> Result<(), DeviceError> {
         self.check_ram(address, bytes.len())?;
-        self.writes.push((address, bytes.to_vec()));
+        self.fx.writes.push((address, bytes.to_vec()));
         Ok(())
     }
     pub fn set_intr(&mut self, asserted: bool) {
-        self.intr = Some(asserted);
+        self.fx.intr = Some(asserted);
     }
     pub fn assert_nmi(&mut self) {
-        self.nmi = true;
+        self.fx.nmi = true;
     }
     pub fn request_host_stop(&mut self) {
-        self.stop = true;
+        self.fx.stop = true;
     }
     pub fn set_a20_enabled(&mut self, enabled: bool) {
-        self.a20 = Some(enabled);
+        self.fx.a20 = Some(enabled);
     }
     pub fn invalidate_paging(&mut self) {
-        self.invalidate = true;
+        self.fx.invalidate = true;
     }
     /// Set a deadline or move the same coordinate earlier. Changing coordinates
     /// or moving later is refused, preserving the already-promised service time.
     pub fn set_deadline(&mut self, deadline: DeviceDeadline) -> Result<(), DeviceError> {
-        if self.deadline.is_some_and(|old| !matches!((old, deadline),
+        if self.fx.deadline.is_some_and(|old| !matches!((old, deadline),
             (DeviceDeadline::Steps(a), DeviceDeadline::Steps(b)) |
             (DeviceDeadline::RetiredInstructions(a), DeviceDeadline::RetiredInstructions(b)) if b <= a)) {
             return Err(DeviceError::new(2));
         }
-        self.deadline = Some(deadline);
+        self.fx.deadline = Some(deadline);
         Ok(())
     }
     /// Unknown until modeled cycle accounting is available. Adds no host time.
@@ -566,9 +638,35 @@ pub(super) struct Run<'a> {
     pub unit_start: DevicePosition,
     pub instruction_ip: u64,
     pub code_segment: u16,
+    /// A callback the in-block path made that the block could not continue
+    /// past: the walk then issued this transfer's ordinary handoff, which
+    /// settles this result instead of calling the handler again.
+    decided: Option<Box<Decided>>,
+}
+struct Decided {
+    request: DeviceRequest,
+    result: std::thread::Result<DeviceResult>,
+    effects: Effects,
 }
 impl Run<'_> {
+    /// Whether this run's handler is consulted for an issued handoff: a
+    /// registered transfer, or any transfer once the VM is poisoned. Others
+    /// take the ordinary Exit without building a request.
+    #[inline(always)]
+    pub fn serves(&self, vm: &Vm, exit: &Exit) -> bool {
+        vm.devices().poisoned() || (self.handler.is_some() && vm.device_table.serves_exit(exit))
+    }
+    #[inline(always)]
     pub fn boundary(&self, cpu: &mut Vcpu, steps: u64) -> Option<Exit> {
+        // Nothing to decide without a deadline, an asserted INTR or a queued
+        // paging invalidation.
+        if self.deadline.is_none() && !cpu.device_cpu().intr && !cpu.device_cpu().invalidate {
+            return None;
+        }
+        self.boundary_slow(cpu, steps)
+    }
+    #[inline(never)]
+    fn boundary_slow(&self, cpu: &mut Vcpu, steps: u64) -> Option<Exit> {
         if cpu.legacy_memory_in_flight() || cpu.cpu.pending_port_in.is_some() {
             return None;
         }
@@ -621,6 +719,9 @@ impl Run<'_> {
     /// block, so such a block runs one unit at a time.
     #[inline(always)]
     pub fn cap(&self, cpu: &Vcpu, ir: &crate::ir::IrBlock, steps: u64, remaining: u64) -> u64 {
+        if self.deadline.is_none() && !cpu.device_cpu().intr {
+            return remaining;
+        }
         let mut remaining = match self.deadline {
             Some(DeviceDeadline::Steps(n)) => remaining.min(n.saturating_sub(steps).max(1)),
             Some(DeviceDeadline::RetiredInstructions(n)) => {
@@ -694,6 +795,29 @@ impl Run<'_> {
             ),
             _ => return None,
         };
+        if let Some(decided) = self.decided.take() {
+            // The in-block path called the handler for this transfer, and the
+            // walk issues its handoff next. Any other handoff drops that result
+            // and takes the ordinary path.
+            let Decided {
+                request,
+                result,
+                effects,
+            } = *decided;
+            if (
+                request.space,
+                request.address,
+                request.direction,
+                request.size,
+                request.value,
+            ) == (space, address, direction, size, value)
+            {
+                return self.settle(cpu, vm, exit, &request, result, effects);
+            }
+        }
+        if !vm.device_table.serves(space, address, size) {
+            return None;
+        }
         let request = DeviceRequest {
             space,
             address,
@@ -714,38 +838,48 @@ impl Run<'_> {
             unit_start: self.unit_start,
             cycles: None,
         };
-        if !vm.devices().matches(&request) {
-            return None;
-        }
+        let (result, effects) = self.call(vm, &request);
+        self.settle(cpu, vm, exit, &request, result, effects)
+    }
+    fn call(
+        &mut self,
+        vm: &Vm,
+        request: &DeviceRequest,
+    ) -> (std::thread::Result<DeviceResult>, Effects) {
         let mut context = DeviceContext {
             vm,
-            writes: Vec::new(),
-            intr: None,
-            nmi: false,
-            stop: false,
-            a20: None,
-            invalidate: false,
-            deadline: self.deadline,
+            fx: Effects::new(self.deadline),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.handler
                 .as_deref_mut()
                 .unwrap()
-                .access(&request, &mut context)
+                .access(request, &mut context)
         }));
+        (result, context.fx)
+    }
+    fn settle(
+        &mut self,
+        cpu: &mut Vcpu,
+        vm: &Vm,
+        exit: &Exit,
+        request: &DeviceRequest,
+        result: std::thread::Result<DeviceResult>,
+        effects: Effects,
+    ) -> Option<Result<(), Exit>> {
         match result {
             Ok(DeviceResult::Fallback) => None,
             Ok(DeviceResult::DeviceFault(error)) => {
-                cpu.device_cpu_mut().request = Some(Box::new(request));
+                cpu.device_cpu_mut().request = Some(Box::new(request.clone()));
                 Some(Err(Exit::Device(crate::DeviceStop::Fault { error })))
             }
             Err(_) => {
                 vm.devices().poison_execution();
-                cpu.device_cpu_mut().request = Some(Box::new(request));
+                cpu.device_cpu_mut().request = Some(Box::new(request.clone()));
                 Some(Err(Exit::Device(crate::DeviceStop::HandlerFailed)))
             }
             Ok(DeviceResult::Handled(value)) => {
-                for (address, bytes) in &context.writes {
+                for (address, bytes) in &effects.writes {
                     let mut offset = 0;
                     while offset < bytes.len() {
                         let at = address + offset as u64;
@@ -754,26 +888,26 @@ impl Run<'_> {
                             as usize;
                         if vm.write_bytes(at, &bytes[offset..offset + len]).is_err() {
                             vm.devices().poison_execution();
-                            cpu.device_cpu_mut().request = Some(Box::new(request));
+                            cpu.device_cpu_mut().request = Some(Box::new(request.clone()));
                             return Some(Err(Exit::Device(crate::DeviceStop::HandlerFailed)));
                         }
                         offset += len;
                     }
                 }
-                if let Some(asserted) = context.intr {
+                if let Some(asserted) = effects.intr {
                     cpu.device_cpu_mut().intr = asserted;
                 }
-                if context.nmi {
+                if effects.nmi {
                     let _ = cpu.raise_nmi();
                 }
-                if context.stop {
+                if effects.stop {
                     cpu.exit_request.request_exit();
                 }
-                if let Some(enabled) = context.a20 {
+                if let Some(enabled) = effects.a20 {
                     cpu.set_a20_enabled(enabled);
                 }
-                cpu.device_cpu_mut().invalidate |= context.invalidate;
-                self.deadline = context.deadline;
+                cpu.device_cpu_mut().invalidate |= effects.invalidate;
+                self.deadline = effects.deadline;
                 match exit {
                     Exit::PortIo {
                         dir: PortDir::In, ..
@@ -788,6 +922,301 @@ impl Run<'_> {
             }
         }
     }
+}
+
+/// Decision-28 stage 3 inside a block: the shared real-mode walk meets a
+/// registered MMIO transfer and calls the handler where it stands, instead of
+/// abandoning the instruction for a handoff, a completion and a re-execution.
+/// The dispatcher arms this for one walk that starts with no handoff state
+/// open (no MMIO retry, pending answer or port input); only the walk's memory
+/// provider reads it, at a Trap-region miss, so RAM accesses and unarmed
+/// walks pay nothing.
+///
+/// The walk continues past the transfer only when that is the re-execution's
+/// result exactly: a scalar transfer inside one registration that is its
+/// instruction's only memory access, preceded by operations that fault before
+/// it or not at all and followed by register operations that cannot fault (no
+/// later stop of the instruction re-executes it), and a Handled callback with
+/// no effects (`Effects::none`). Any other result is kept in `Run::decided` and
+/// the walk issues the ordinary handoff, which settles it as if the handler
+/// were called there: the handler is never called twice for one transfer, and
+/// Fallback, DeviceFault, a panic and every effect keep the stage-2 behavior.
+/// An IR block, an instruction IP in it and its `sole_access` result.
+type Verdict = (Arc<crate::ir::IrBlock>, u64, Option<u64>);
+pub(super) struct InBlock {
+    run: std::cell::Cell<*mut Run<'static>>,
+    ir: std::cell::Cell<*const Arc<crate::ir::IrBlock>>,
+    /// The last `sole_access` verdict, for an IR this entry keeps alive.
+    verdict: std::cell::RefCell<Option<Verdict>>,
+    vm: *const Vm,
+    vcpu_id: u64,
+    code_segment: std::cell::Cell<u16>,
+    intr: std::cell::Cell<bool>,
+    retired: std::cell::Cell<u64>,
+    steps: std::cell::Cell<u64>,
+}
+thread_local! {
+    static IN_BLOCK: std::cell::Cell<*const InBlock> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+/// Published hooks on all threads: a Trap miss with none published (every
+/// run without a handler) returns before the thread-local lookup. Kept over a
+/// lookup alone, which costs the Exit path about 22 host instructions per MMIO
+/// transfer (`machine_exits`, real16 store and planar, two Trap misses each);
+/// the counter changes once per handler run, not per access.
+static PUBLISHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    /// Tests only: whether the in-block path is disabled, how many callbacks
+    /// it made, and how many transfers it completed inside their block.
+    pub(super) static IN_BLOCK_TEST: std::cell::Cell<(bool, u64, u64)> =
+        const { std::cell::Cell::new((false, 0, 0)) };
+}
+/// Publishes an `InBlock` for one dispatch call and withdraws it on return.
+pub(super) struct InBlockScope<'a> {
+    hook: &'a InBlock,
+    previous: *const InBlock,
+}
+impl InBlock {
+    pub fn new(vm: &Vm, vcpu_id: u64) -> Self {
+        Self {
+            run: std::cell::Cell::new(std::ptr::null_mut()),
+            ir: std::cell::Cell::new(std::ptr::null()),
+            verdict: std::cell::RefCell::new(None),
+            vm,
+            vcpu_id,
+            code_segment: std::cell::Cell::new(0),
+            intr: std::cell::Cell::new(false),
+            retired: std::cell::Cell::new(0),
+            steps: std::cell::Cell::new(0),
+        }
+    }
+    pub fn publish(&self) -> InBlockScope<'_> {
+        PUBLISHED.fetch_add(1, Ordering::Relaxed);
+        InBlockScope {
+            hook: self,
+            previous: IN_BLOCK.with(|slot| slot.replace(self)),
+        }
+    }
+    /// Arm for one walk of `ir` that starts at this exact run position, when
+    /// no transfer of the vCPU awaits completion or re-execution. The caller
+    /// arms no walk that an event delivery owns.
+    #[inline(always)]
+    pub fn arm(&self, run: &mut Run<'_>, cpu: &Vcpu, ir: &Arc<crate::ir::IrBlock>, steps: u64) {
+        let state = &cpu.cpu;
+        if state.mmio_retry_active
+            || state.pending_mmio.is_some()
+            || state.pending_mmio_write
+            || state.pending_port_in.is_some()
+            || state.port_string_in.is_some()
+        {
+            return;
+        }
+        debug_assert!(run.decided.is_none());
+        self.run.set((run as *mut Run<'_>).cast());
+        self.ir.set(ir);
+        self.code_segment.set(state.cs);
+        self.intr.set(cpu.device_cpu().intr);
+        self.retired.set(cpu.retired);
+        self.steps.set(steps);
+    }
+    #[inline(always)]
+    pub fn disarm(&self) {
+        self.run.set(std::ptr::null_mut());
+        self.ir.set(std::ptr::null());
+    }
+}
+impl Drop for InBlockScope<'_> {
+    fn drop(&mut self) {
+        self.hook.disarm();
+        IN_BLOCK.with(|slot| slot.set(self.previous));
+        PUBLISHED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+/// The completed instructions before the one at `ip` in `ir`, when its only
+/// memory access is a Load or Store preceded by operations that fault before
+/// it or not at all and followed by register operations that cannot fault.
+/// Every earlier instruction of an armed walk completed, retiring once and
+/// charging one step, unless a string operation counted its iterations; such
+/// a block declines.
+fn sole_access(ir: &crate::ir::IrBlock, ip: u64) -> Option<u64> {
+    use crate::ir::IrOp;
+    use crate::legacy::LegacyOp as L;
+    let pure = |op: &IrOp| {
+        matches!(
+            op,
+            IrOp::ReadReg { .. }
+                | IrOp::WriteReg { .. }
+                | IrOp::Add { .. }
+                | IrOp::Sub { .. }
+                | IrOp::Adc { .. }
+                | IrOp::Sbb { .. }
+                | IrOp::And { .. }
+                | IrOp::Or { .. }
+                | IrOp::Xor { .. }
+                | IrOp::Shl { .. }
+                | IrOp::Shr { .. }
+                | IrOp::Sar { .. }
+                | IrOp::Rol { .. }
+                | IrOp::Ror { .. }
+                | IrOp::Rcl { .. }
+                | IrOp::Rcr { .. }
+                | IrOp::Sext { .. }
+                | IrOp::Bswap { .. }
+                | IrOp::Mul { .. }
+                | IrOp::GetCond { .. }
+                | IrOp::Fence { .. }
+                | IrOp::Legacy(L::SharedWalk)
+        )
+    };
+    let mut completed = 0u64;
+    let mut ops = ir.ops.iter();
+    loop {
+        match ops.next()? {
+            IrOp::InsnStart { guest_addr } if *guest_addr == ip => break,
+            IrOp::InsnStart { .. } => completed += 1,
+            IrOp::RepString { .. }
+            | IrOp::RepStringReal { .. }
+            | IrOp::Legacy(L::String { .. } | L::WrappedString { .. }) => return None,
+            _ => {}
+        }
+    }
+    let mut accessed = false;
+    for op in ops {
+        match op {
+            IrOp::InsnStart { .. } => break,
+            IrOp::Load { .. } | IrOp::Store { .. } if !accessed => accessed = true,
+            // A segment limit check faults before the access, so before any call.
+            IrOp::SegLimitCheck { .. } if !accessed => {}
+            op if pure(op) => {}
+            _ => return None,
+        }
+    }
+    accessed.then_some(completed)
+}
+/// Disarms a hook while its handler runs. Decision-28 forbids execution from
+/// inside a callback, but a handler holding the VM and another vCPU can still
+/// run it: that run publishes no hook without a handler of its own, so its walk
+/// would find this one, armed for the same cached block, and call the running
+/// handler again through a second `&mut Run`. Disarmed, the nested run takes
+/// the ordinary handoff. It is not refused: once nothing aliases it is sound,
+/// and detecting it would add a thread-local check and an error to every run.
+struct Disarmed<'a>(&'a InBlock, *mut Run<'static>);
+impl<'a> Disarmed<'a> {
+    fn new(hook: &'a InBlock) -> Self {
+        Self(hook, hook.run.replace(std::ptr::null_mut()))
+    }
+}
+impl Drop for Disarmed<'_> {
+    fn drop(&mut self) {
+        self.0.run.set(self.1);
+    }
+}
+/// Called by the walk's memory provider at a Trap-region miss. Returns the
+/// read value (zero for a write) when the walk continues; None issues the
+/// ordinary handoff.
+#[cold]
+#[inline(never)]
+pub(crate) fn in_block_access(
+    ir: &crate::ir::IrBlock,
+    ip: u64,
+    write: bool,
+    address: u64,
+    size: u8,
+    value: u64,
+) -> Option<u64> {
+    if PUBLISHED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    #[cfg(test)]
+    if IN_BLOCK_TEST.with(|t| t.get().0) {
+        return None;
+    }
+    let hook = IN_BLOCK.with(|slot| slot.get());
+    if hook.is_null() {
+        return None;
+    }
+    // SAFETY: a published hook outlives its scope, which the dispatch call that
+    // owns it holds. `run` is non-null only while the walk of `ir` it armed
+    // runs, during which the dispatcher touches neither the Run nor the VM,
+    // and never while its handler runs (`Disarmed`).
+    let hook = unsafe { &*hook };
+    let run = hook.run.get();
+    if run.is_null() {
+        return None;
+    }
+    // SAFETY: as `run`: the dispatcher's block handle outlives the walk.
+    let block = unsafe { &*hook.ir.get() };
+    if !std::ptr::eq(&**block, ir) {
+        return None;
+    }
+    let run = unsafe { &mut *run };
+    let vm = unsafe { &*hook.vm };
+    if run.decided.is_some()
+        || run.handler.is_none()
+        || vm.devices().poisoned()
+        || !vm.device_table.serves(DeviceSpace::Mmio, address, size)
+    {
+        return None;
+    }
+    let completed = {
+        let mut verdict = hook.verdict.borrow_mut();
+        match &*verdict {
+            Some((cached, at, completed)) if Arc::ptr_eq(cached, block) && *at == ip => *completed,
+            _ => {
+                let completed = sole_access(ir, ip);
+                *verdict = Some((block.clone(), ip, completed));
+                completed
+            }
+        }
+    }?;
+    let mask = u64::MAX >> (64 - u32::from(size) * 8);
+    let position = DevicePosition {
+        retired_instructions: hook.retired.get() + completed,
+        steps: hook.steps.get() + completed,
+    };
+    let request = DeviceRequest {
+        space: DeviceSpace::Mmio,
+        address,
+        direction: if write {
+            DeviceDirection::Write
+        } else {
+            DeviceDirection::Read
+        },
+        size,
+        value: if write { value & mask } else { 0 },
+        total_size: u16::from(size),
+        part: 0,
+        // An armed walk runs an unpaged real-mode block.
+        linear_address: None,
+        instruction_ip: ip,
+        code_segment: hook.code_segment.get(),
+        event: None,
+        vcpu_id: hook.vcpu_id,
+        position,
+        // An MMIO transfer's unit is its own instruction.
+        unit_start: position,
+        cycles: None,
+    };
+    let (result, effects) = {
+        let _disarmed = Disarmed::new(hook);
+        run.call(vm, &request)
+    };
+    #[cfg(test)]
+    IN_BLOCK_TEST.with(|t| t.set((t.get().0, t.get().1 + 1, t.get().2)));
+    if let Ok(DeviceResult::Handled(answer)) = result {
+        if effects.none(hook.intr.get(), run.deadline) {
+            #[cfg(test)]
+            IN_BLOCK_TEST.with(|t| t.set((t.get().0, t.get().1, t.get().2 + 1)));
+            return Some(if write { 0 } else { answer & mask });
+        }
+    }
+    run.decided = Some(Box::new(Decided {
+        request,
+        result,
+        effects,
+    }));
+    None
 }
 /// Counts and stop from the borrowed-device entry. Error evidence is owned by
 /// this result; ordinary StepRun/Exit values retain their existing drop paths.
@@ -936,7 +1365,9 @@ impl Vcpu {
         }
         vm.sync_backing_policy();
         self.sync_dispatch_word(vm);
-        self.device_cpu().state.observe();
+        if !self.device_cpu().state.observed() {
+            self.device_cpu().state.observe();
+        }
         let mut devices = Run {
             handler,
             unit_start: DevicePosition {

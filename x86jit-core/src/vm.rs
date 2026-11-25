@@ -672,6 +672,8 @@ pub struct Vm {
     time_enabled: bool,
     time_registry: Mutex<crate::time_stats::Registry>,
     vcpu_lifetime: Arc<VmLifetime>,
+    /// Registered device ranges, read by runs without synchronization.
+    device_table: device::Table,
     vcpu_memory: Mutex<Vec<std::sync::Weak<VcpuAllocations>>>,
     precise_split_stores: bool,
     compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
@@ -1404,6 +1406,7 @@ impl Vm {
             time_enabled: false,
             time_registry: Mutex::default(),
             vcpu_lifetime: Arc::new(VmLifetime::default()),
+            device_table: device::Table::default(),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: self.precise_split_stores,
             compile_hold: None,
@@ -1471,6 +1474,7 @@ impl Vm {
             time_enabled: false,
             time_registry: Mutex::default(),
             vcpu_lifetime: Arc::new(VmLifetime::default()),
+            device_table: device::Table::default(),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: false,
             compile_hold: None,
@@ -1574,7 +1578,7 @@ impl Vm {
         prot: Prot,
         kind: RegionKind,
     ) -> Result<(), MapError> {
-        if self.devices().mapping_busy(guest_addr, size) {
+        if self.device_mapping_busy(guest_addr, size) {
             return Err(MapError::DeviceBusy);
         }
         self.mem.map(guest_addr, size, prot, kind)?;
@@ -1621,7 +1625,7 @@ impl Vm {
     }
 
     pub fn unmap(&mut self, guest_addr: u64, size: usize) -> Result<(), MapError> {
-        if self.devices().mapping_busy(guest_addr, size) {
+        if self.device_mapping_busy(guest_addr, size) {
             return Err(MapError::DeviceBusy);
         }
         let result = self.mem.unmap(guest_addr, size);
@@ -1842,7 +1846,8 @@ impl Vm {
         drop(registry);
         let mut fault_entry = Box::<VcpuCold>::default();
         if self.profile == ExecutionProfile::Machine {
-            fault_entry.devices.state = self.devices().add_cpu(&word);
+            fault_entry.devices.state =
+                self.devices().add_cpu(&word, !self.device_table.is_empty());
             fault_entry.devices.id = id;
         }
         let legacy_execution =

@@ -316,7 +316,7 @@ fn registration_quiescence_and_no_handler() {
     cpu.complete_port_in(7);
     assert!(vm.devices().quiescent());
     cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
-    let id = vm.devices().entries.lock().unwrap()[0].0;
+    let id = vm.device_table.entries[0].0;
     vm.replace_device_range(id, DeviceRange::Ports(0x80..0x81))
         .unwrap();
     vm.unregister_device_range(id).unwrap();
@@ -568,7 +568,7 @@ fn fallback_mid_rep_and_mmio_fault_keep_acknowledged_transfers() {
 #[test]
 fn preflight_and_registration_boundaries_never_add_device_calls() {
     let (mut vm, mut cpu) = setup(CpuModel::I80386, 0, &[0x8b, 0x04, 0xf4]);
-    let id = vm.devices().entries.lock().unwrap()[1].0;
+    let id = vm.device_table.entries[1].0;
     vm.unregister_device_range(id).unwrap();
     vm.register_device_range(DeviceRange::Mmio(MMIO..MMIO + 1))
         .unwrap();
@@ -706,7 +706,7 @@ fn delivery_frame_mmio_and_log_overflow_equal_exit() {
 fn range_handles_are_vm_local_and_restore_rebuilds_registration() {
     let (mut vm, mut cpu) = setup(CpuModel::I80386, 0, &[0xe4, 0x80, 0xf4]);
     let (mut other, _) = setup(CpuModel::I80386, 0, &[0xf4]);
-    let foreign = other.devices().entries.lock().unwrap()[0].0;
+    let foreign = other.device_table.entries[0].0;
     assert_eq!(
         vm.unregister_device_range(foreign),
         Err(DeviceRegistrationError::UnknownHandle)
@@ -721,7 +721,7 @@ fn range_handles_are_vm_local_and_restore_rebuilds_registration() {
     let mut child = vm
         .try_fork_with_backend(Box::new(super::super::InterpreterBackend))
         .unwrap();
-    assert!(child.devices().entries.lock().unwrap().is_empty());
+    assert!(child.device_table.is_empty());
     child
         .register_device_range(DeviceRange::Ports(0x80..0x81))
         .unwrap();
@@ -1097,7 +1097,7 @@ fn completed_handoffs_leave_fork_and_registration_available() {
             )
             .unwrap();
         assert!(matches!(r.stop(), StepStop::Exit(Exit::PortIo { .. })));
-        let id = vm.devices().entries.lock().unwrap()[0].0;
+        let id = vm.device_table.entries[0].0;
         vm.replace_device_range(id, DeviceRange::Ports(0..0x100))
             .unwrap();
         vm.register_device_range(DeviceRange::Ports(0x100..0x101))
@@ -1124,7 +1124,7 @@ fn completed_handoffs_leave_fork_and_registration_available() {
             cpu.complete_mmio_write();
         }
         assert!(fork_ok(&vm));
-        let id = vm.devices().entries.lock().unwrap()[0].0;
+        let id = vm.device_table.entries[0].0;
         vm.unregister_device_range(id).unwrap();
         let r = cpu.run_steps(&vm, 10, StepOptions::default()).unwrap();
         assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)));
@@ -1256,7 +1256,7 @@ fn handled_access_rewriting_the_running_block_executes_the_new_bytes() {
 fn registration_errors_display_and_unknown_handle_wins() {
     let (mut vm, _) = setup(CpuModel::I80386, 0, &[0xe6, 0x80, 0xf4]);
     let (other, _) = setup(CpuModel::I80386, 0, &[0xf4]);
-    let foreign = other.devices().entries.lock().unwrap()[0].0;
+    let foreign = other.device_table.entries[0].0;
     assert_eq!(
         vm.replace_device_range(foreign, DeviceRange::Ports(0x80..0x81)),
         Err(DeviceRegistrationError::UnknownHandle)
@@ -1267,14 +1267,7 @@ fn registration_errors_display_and_unknown_handle_wins() {
         "device range overlaps a registered range"
     );
     // With every range removed, a handler is never consulted.
-    let ids: Vec<_> = vm
-        .devices()
-        .entries
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|e| e.0)
-        .collect();
+    let ids: Vec<_> = vm.device_table.entries.iter().map(|e| e.0).collect();
     for id in ids {
         vm.unregister_device_range(id).unwrap();
     }
@@ -1318,7 +1311,7 @@ fn event_continuation_and_held_trap_keep_fork_and_registration_busy() {
     }
     assert_eq!((writes, cpu.cpu.cs), (3, 0));
     assert!(fork_ok(&vm));
-    let id = vm.devices().entries.lock().unwrap()[0].0;
+    let id = vm.device_table.entries[0].0;
     vm.replace_device_range(id, DeviceRange::Ports(0..0x100))
         .unwrap();
 
@@ -1508,4 +1501,492 @@ fn external_numeric_error_precedes_intr_ready() {
         "{r:?}"
     );
     assert_eq!(r.steps(), 0);
+}
+
+/// Run `f` with the in-block path of decision-28 stage 3 disabled: every
+/// handled transfer then takes the stage-2 handoff inside the dispatcher.
+fn stage_two<T>(f: impl FnOnce() -> T) -> T {
+    IN_BLOCK_TEST.with(|t| t.set((true, t.get().1, t.get().2)));
+    let result = f();
+    IN_BLOCK_TEST.with(|t| t.set((false, t.get().1, t.get().2)));
+    result
+}
+/// Callbacks the in-block path made, and transfers it completed in block.
+fn in_block_counts() -> (u64, u64) {
+    IN_BLOCK_TEST.with(|t| (t.get().1, t.get().2))
+}
+fn in_block_completions() -> u64 {
+    in_block_counts().1
+}
+fn assert_same_machine(tag: &str, (v1, c1): (&Vm, &Vcpu), (v2, c2): (&Vm, &Vcpu)) {
+    assert_eq!(architectural(c1), architectural(c2), "{tag}");
+    assert_eq!(
+        c1.executed_instructions(),
+        c2.executed_instructions(),
+        "{tag}"
+    );
+    for (addr, len) in [(0, MMIO as usize), (0xb000, 0x15000)] {
+        let mut a = vec![0; len];
+        let mut b = a.clone();
+        v1.read_bytes(addr, &mut a).unwrap();
+        v2.read_bytes(addr, &mut b).unwrap();
+        assert_eq!(a, b, "RAM {tag}");
+    }
+    assert_eq!(
+        format!("{:?}", c1.delivery_log()),
+        format!("{:?}", c2.delivery_log()),
+        "{tag}"
+    );
+}
+
+/// Decision-28 stage 3 inside a block: a handled scalar MMIO transfer of a
+/// real-mode shared walk completes where the walk stands. The result equals the
+/// Exit/completion protocol and the stage-2 handoff (in-block path disabled):
+/// state, RAM, device effect order, counts, the stop and the delivery log, and
+/// stage 2's exact requests (positions, unit start, IP).
+#[test]
+fn in_block_equals_exit_and_stage_two() {
+    // mov [si],al; inc bx; mov bl,[si]; mov [si+2],ax; mov cx,[si+2];
+    // mov [0xa020],al; mov ax,[0xa022]; inc bx
+    let scalar = [
+        0x88, 0x04, 0x43, 0x8a, 0x1c, 0x89, 0x44, 0x02, 0x8b, 0x4c, 0x02, 0xa2, 0x20, 0xa0, 0xa1,
+        0x22, 0xa0, 0x43,
+    ];
+    let scenarios: [&[u8]; 6] = [
+        // Scalar transfers between register instructions.
+        &[],
+        // A later instruction of the block faults after handled transfers:
+        // a word at offset 0xffff (#GP on the 80286 and later).
+        &[0x8b, 0x1e, 0xff, 0xff],
+        // A fault on the instruction's later operand after its device read:
+        // PUSH [SI] with the stack outside mapped memory.
+        &[0x8e, 0xd2, 0xff, 0x34],
+        // A divide of the device answer that faults (#DE).
+        &[0xb8, 0xff, 0xff, 0xf6, 0x34],
+        // A software interrupt delivered between transfers.
+        &[0xcd, 0x20, 0x88, 0x04],
+        // Read-modify-write and a locked form: two transfers, never in block.
+        &[0x00, 0x04, 0xf0, 0x01, 0x04],
+    ];
+    for model in [
+        CpuModel::I8086,
+        CpuModel::I80286,
+        CpuModel::I80386,
+        CpuModel::I80486Dx,
+    ] {
+        for (scenario, tail) in scenarios.iter().enumerate() {
+            let mut code = scalar.to_vec();
+            code.extend_from_slice(tail);
+            code.push(0xf4);
+            for budget in [1, 2, 7, 100] {
+                let tag = format!("{model:?}/{scenario}/{budget}");
+                let machine = || {
+                    let (vm, mut cpu) = setup(model, 0, &code);
+                    // DX selects an unmapped stack segment for PUSH.
+                    cpu.set_reg(Reg::Rdx, 0x3000);
+                    vm.write_bytes(0x80, &[0, 1, 0, 0]).unwrap();
+                    vm.write_bytes(0x100, &[0x43, 0xcf]).unwrap();
+                    (vm, cpu)
+                };
+                let (v1, mut c1) = machine();
+                let (v2, mut c2) = machine();
+                let (v3, mut c3) = machine();
+                let r1 = finish(&v1, &mut c1, false, budget);
+                let r2 = stage_two(|| finish(&v2, &mut c2, true, budget));
+                let before = in_block_completions();
+                let r3 = finish(&v3, &mut c3, true, budget);
+                let completed = in_block_completions() - before;
+                assert_eq!((r1.1, &r1.2), (r3.1, &r3.2), "{tag}");
+                assert_eq!((r2.1, &r2.2), (r3.1, &r3.2), "{tag}");
+                assert_eq!(r1.0.effects, r3.0.effects, "{tag}");
+                assert_eq!(r2.0.effects, r3.0.effects, "{tag}");
+                assert_eq!(r2.0.requests, r3.0.requests, "{tag}");
+                assert_same_machine(&tag, (&v1, &c1), (&v3, &c3));
+                assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+                // The twenty-bit walk keeps the handoff; the others complete
+                // the scalar transfers of shared-walk blocks inside them.
+                if model == CpuModel::I8086 {
+                    assert_eq!(completed, 0, "{tag}");
+                } else if scenario <= 1 {
+                    assert!(completed >= 6, "{tag}: {completed}");
+                }
+            }
+        }
+    }
+}
+
+/// A handler that rewrites the next instruction makes its RAM write an effect:
+/// the walk issues the ordinary handoff, which settles the same callback, and
+/// the rewritten instruction executes. Equal to an embedder that writes the
+/// code at the Exit, and to stage 2.
+#[test]
+fn in_block_handler_code_write_matches_exit() {
+    // mov [si],al; inc bx (rewritten to dec bx); mov [si],al; inc bx; hlt
+    let code = [0x88, 0x04, 0x43, 0x88, 0x04, 0x43, 0xf4];
+    for model in [CpuModel::I80286, CpuModel::I80386] {
+        for budget in [1, 2, 100] {
+            let tag = format!("{model:?}/{budget}");
+            let (v1, mut c1) = setup(model, 0, &code);
+            let mut writes = 0;
+            loop {
+                let run = c1.run_steps(&v1, budget, StepOptions::default()).unwrap();
+                match run.into_stop() {
+                    StepStop::Exit(Exit::BudgetExhausted) => {}
+                    StepStop::Exit(Exit::MmioWrite { .. }) => {
+                        if writes == 0 {
+                            v1.write_bytes(CODE + 2, &[0x4b]).unwrap();
+                        }
+                        writes += 1;
+                        c1.complete_mmio_write();
+                    }
+                    StepStop::Exit(Exit::Hlt) => break,
+                    stop => panic!("{tag}: {stop:?}"),
+                }
+            }
+            let handler = |two: bool| {
+                let (vm, mut cpu) = setup(model, 0, &code);
+                let mut calls = Vec::new();
+                let mut h = Callback(|r: &DeviceRequest, c: &mut DeviceContext<'_>| {
+                    if calls.is_empty() {
+                        c.write_ram(CODE + 2, &[0x4b]).unwrap();
+                    }
+                    calls.push(r.clone());
+                    DeviceResult::Handled(0)
+                });
+                let mut go = || loop {
+                    let r = run(&mut cpu, &vm, budget, &mut h);
+                    match r.into_stop() {
+                        StepStop::Exit(Exit::BudgetExhausted) => {}
+                        StepStop::Exit(Exit::Hlt) => break,
+                        stop => panic!("{tag}: {stop:?}"),
+                    }
+                };
+                if two {
+                    stage_two(go);
+                } else {
+                    go();
+                }
+                (vm, cpu, calls)
+            };
+            let (v2, c2, calls2) = handler(true);
+            let before = in_block_counts();
+            let (v3, c3, calls3) = handler(false);
+            let after = in_block_counts();
+            // The writing callback is made inside its block and settles at
+            // the handoff. A page with written code then runs the checked
+            // walk, which takes the stage-2 handoff.
+            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "{tag}");
+            assert_eq!(writes, 2, "{tag}");
+            assert_eq!(calls2, calls3, "{tag}");
+            assert_eq!(calls3.len(), 2, "{tag}");
+            assert_eq!(c3.reg(Reg::Rbx), 0, "{tag}");
+            assert_same_machine(&tag, (&v1, &c1), (&v3, &c3));
+            assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+        }
+    }
+}
+
+/// Fallback, DeviceFault and a panic inside a block call the handler once and
+/// keep stage 2's results: the ordinary Exit, a latched fault with its
+/// request, and terminal poisoning.
+#[test]
+fn in_block_declined_results_call_once() {
+    for result in 0..3 {
+        let (vm, mut cpu) = setup(CpuModel::I80286, 0, &[0x43, 0x88, 0x04, 0x43, 0xf4]);
+        let mut calls = 0;
+        let mut h = Callback(|_: &DeviceRequest, _: &mut DeviceContext<'_>| {
+            calls += 1;
+            match result {
+                0 => DeviceResult::Fallback,
+                1 => DeviceResult::DeviceFault(DeviceError::new(5)),
+                _ => panic!("device failed"),
+            }
+        });
+        let before = in_block_counts();
+        let r = run(&mut cpu, &vm, 100, &mut h);
+        assert_eq!(in_block_counts().0 - before.0, 1);
+        assert_eq!(in_block_counts().1, before.1);
+        assert_eq!(r.steps(), 1);
+        match result {
+            0 => assert!(matches!(r.stop(), StepStop::Exit(Exit::MmioWrite { .. }))),
+            1 => {
+                assert!(matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::Device(crate::DeviceStop::Fault { .. }))
+                ));
+                let request = r.request().unwrap();
+                assert_eq!(request.instruction_ip, 1);
+                assert_eq!(request.position.retired_instructions, 1);
+            }
+            _ => {
+                assert!(matches!(
+                    r.stop(),
+                    StepStop::Exit(Exit::Device(crate::DeviceStop::HandlerFailed))
+                ));
+                assert!(vm.device_poisoned());
+            }
+        }
+        assert_eq!(calls, 1);
+        assert_eq!(cpu.cpu.rip, 1);
+    }
+}
+
+/// A handler that runs another vCPU of its VM from inside a callback breaks
+/// decision-28's contract, but safe code must stay sound: the hook armed for
+/// the outer walk is disarmed while its handler runs, so the nested walk of the
+/// same cached block takes the ordinary handoff instead of calling the running
+/// handler again. Both vCPUs end as the Exit path leaves them.
+#[test]
+fn in_block_handler_running_another_vcpu_is_not_reentered() {
+    // mov [si],al; inc bx; mov [si],al; inc bx; hlt
+    let code = [0x88, 0x04, 0x43, 0x88, 0x04, 0x43, 0xf4];
+    for model in [CpuModel::I80286, CpuModel::I80386, CpuModel::I80486Dx] {
+        let (v1, mut c1) = setup(model, 0, &code);
+        let exit = finish(&v1, &mut c1, false, 100);
+        let (vm, mut cpu) = setup(model, 0, &code);
+        let mut nested = vm.new_vcpu();
+        nested.cpu = cpu.cpu.clone();
+        let depth = std::cell::Cell::new(0);
+        let mut deepest = 0;
+        let mut calls = Vec::new();
+        let mut nested_exits = Vec::new();
+        let mut h = Callback(|r: &DeviceRequest, _: &mut DeviceContext<'_>| {
+            depth.set(depth.get() + 1);
+            deepest = deepest.max(depth.get());
+            calls.push((r.vcpu_id, r.position.retired_instructions));
+            if depth.get() == 1 && calls.len() == 1 {
+                loop {
+                    let r = nested.run_steps(&vm, 100, StepOptions::default()).unwrap();
+                    match r.into_stop() {
+                        StepStop::Exit(Exit::BudgetExhausted) => {}
+                        StepStop::Exit(Exit::MmioWrite { addr, .. }) => {
+                            nested_exits.push(addr);
+                            nested.complete_mmio_write();
+                        }
+                        StepStop::Exit(Exit::Hlt) => break,
+                        stop => panic!("{model:?}: {stop:?}"),
+                    }
+                }
+            }
+            depth.set(depth.get() - 1);
+            DeviceResult::Handled(0)
+        });
+        let before = in_block_counts();
+        let r = run(&mut cpu, &vm, 100, &mut h);
+        let after = in_block_counts();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)), "{r:?}");
+        let id = cpu.device_cpu().id;
+        assert_eq!(deepest, 1, "{model:?}");
+        assert_eq!(calls, [(id, 0), (id, 2)], "{model:?}");
+        assert_eq!(nested_exits, [MMIO, MMIO], "{model:?}");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (2, 2),
+            "{model:?}"
+        );
+        assert_eq!(exit.1, 5, "{model:?}");
+        assert_same_machine(&format!("{model:?}"), (&v1, &c1), (&vm, &cpu));
+        assert_eq!(architectural(&nested), architectural(&c1), "{model:?}");
+    }
+}
+
+/// A result kept for the handoff settles only the transfer it was made for;
+/// any other handoff drops it and takes the ordinary path.
+#[test]
+fn decided_result_settles_only_its_own_transfer() {
+    let (vm, mut cpu) = setup(CpuModel::I80286, 0, &[0x88, 0x04, 0xf4]);
+    let mut seen = Vec::new();
+    let mut h = Callback(|r: &DeviceRequest, _: &mut DeviceContext<'_>| {
+        seen.push(r.address);
+        DeviceResult::Fallback
+    });
+    let request = |address| DeviceRequest {
+        space: DeviceSpace::Mmio,
+        address,
+        direction: DeviceDirection::Write,
+        size: 1,
+        value: 0x5a,
+        total_size: 1,
+        part: 0,
+        linear_address: None,
+        instruction_ip: 0,
+        code_segment: 0x1000,
+        event: None,
+        vcpu_id: cpu.device_cpu().id,
+        position: DevicePosition::default(),
+        unit_start: DevicePosition::default(),
+        cycles: None,
+    };
+    let mut devices = Run {
+        handler: Some(&mut h),
+        decided: Some(Box::new(Decided {
+            request: request(MMIO),
+            result: Ok(DeviceResult::Handled(0)),
+            effects: Effects::new(None),
+        })),
+        ..Run::default()
+    };
+    let other = request(MMIO + 4).handoff();
+    assert!(devices.access(&mut cpu, &vm, 0, &other).is_none());
+    assert!(devices.decided.is_none());
+    drop(devices);
+    assert_eq!(seen, [MMIO + 4]);
+}
+
+/// A run without a handler still reports a VM poisoned during it at an issued
+/// handoff, whatever the registration.
+#[test]
+fn poisoned_handoff_is_served_without_a_handler() {
+    let (vm, _) = setup(CpuModel::I80286, 0, &[0xf4]);
+    let devices = Run::default();
+    let unregistered = Exit::port_io(0x80, 1, PortDir::Out, 0);
+    let registered = Exit::MmioWrite {
+        addr: MMIO,
+        size: 1,
+        value: 0,
+        total_size: 1,
+        part: 0,
+    };
+    assert!(!devices.serves(&vm, &registered));
+    vm.devices().poison_execution();
+    assert!(devices.serves(&vm, &registered));
+    assert!(devices.serves(&vm, &unregistered));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    None,
+    Intr,
+    Deadline,
+    A20,
+    HostStop,
+    Nmi,
+}
+/// Run to HLT or IntrReady: with a handler applying `effect` at its first
+/// callback, or as an embedder applying it at the first Exit. Returns the
+/// stops other than budget and MMIO handoffs, the steps, and the requests.
+fn effect_run(
+    vm: &Vm,
+    cpu: &mut Vcpu,
+    budget: u64,
+    effect: Effect,
+    handler: bool,
+) -> (Vec<String>, u64, Vec<DeviceRequest>) {
+    let first = std::cell::Cell::new(true);
+    let mut requests = Vec::new();
+    let mut stops = Vec::new();
+    let mut steps = 0;
+    let mut h = Callback(|r: &DeviceRequest, c: &mut DeviceContext<'_>| {
+        requests.push(r.clone());
+        if first.replace(false) {
+            match effect {
+                Effect::None => {}
+                Effect::Intr => c.set_intr(true),
+                Effect::Deadline => c.set_deadline(DeviceDeadline::Steps(3)).unwrap(),
+                Effect::A20 => c.set_a20_enabled(false),
+                Effect::HostStop => c.request_host_stop(),
+                Effect::Nmi => c.assert_nmi(),
+            }
+        }
+        DeviceResult::Handled(0)
+    });
+    for _ in 0..200 {
+        let r = if handler {
+            run(cpu, vm, budget, &mut h)
+        } else {
+            cpu.run_steps_with_devices(vm, budget, StepOptions::default(), None)
+                .unwrap()
+        };
+        steps += r.steps();
+        match r.into_stop() {
+            StepStop::Exit(Exit::BudgetExhausted) => {}
+            StepStop::Exit(Exit::MmioWrite { .. }) if !handler => {
+                cpu.complete_mmio_write();
+                if first.replace(false) {
+                    match effect {
+                        Effect::None => {}
+                        Effect::Intr => cpu.set_intr(true),
+                        Effect::Deadline => unreachable!("a deadline is a handler's"),
+                        Effect::A20 => cpu.set_a20_enabled(false),
+                        Effect::HostStop => cpu.exit_request().request_exit(),
+                        Effect::Nmi => cpu.raise_nmi().unwrap(),
+                    }
+                }
+            }
+            StepStop::Exit(stop @ (Exit::Hlt | Exit::Device(crate::DeviceStop::IntrReady))) => {
+                stops.push(format!("{stop:?}"));
+                return (stops, steps, requests);
+            }
+            StepStop::Exit(
+                stop @ (Exit::Interrupted | Exit::Device(crate::DeviceStop::Deadline { .. })),
+            ) => stops.push(format!("{stop:?}")),
+            stop => panic!("{stop:?}"),
+        }
+    }
+    panic!("did not finish")
+}
+
+/// Handled results with a context effect (INTR, a deadline, an A20 request, a
+/// host stop, an NMI) are made inside the block and settled at the ordinary
+/// handoff; a result with none completes in the block. Both equal the stage-2
+/// handoff and, for the effects an embedder can apply, the Exit path: stops,
+/// steps, state, RAM and delivery logs, with and without single-step traps
+/// after the handled transfers.
+#[test]
+fn in_block_effects_and_single_step_take_the_handoff_and_equal_exit() {
+    // inc bx; mov [si],al; inc bx; mov [si],al; inc bx; inc bx; jmp $+2;
+    // then, in a block of its own, pushf; pop ax; and ah,0xfe; push ax; popf
+    // (TF=0, so HLT stops); hlt
+    let code = [
+        0x43, 0x88, 0x04, 0x43, 0x88, 0x04, 0x43, 0x43, 0xeb, 0x00, 0x9c, 0x58, 0x80, 0xe4, 0xfe,
+        0x50, 0x9d, 0xf4,
+    ];
+    let effects = [
+        Effect::None,
+        Effect::Intr,
+        Effect::Deadline,
+        Effect::A20,
+        Effect::HostStop,
+        Effect::Nmi,
+    ];
+    for model in [CpuModel::I80286, CpuModel::I80386, CpuModel::I80486Dx] {
+        for tf in [false, true] {
+            for effect in effects {
+                for budget in [1, 2, 100] {
+                    let tag = format!("{model:?}/tf={tf}/{effect:?}/{budget}");
+                    let machine = || {
+                        let (vm, mut cpu) = setup(model, 0, &code);
+                        // #DB at 0000:0600 and NMI at 0000:0700: INC DX; IRET.
+                        vm.write_bytes(4, &[0x00, 0x06, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00])
+                            .unwrap();
+                        vm.write_bytes(0x600, &[0x42, 0xcf]).unwrap();
+                        vm.write_bytes(0x700, &[0x42, 0xcf]).unwrap();
+                        cpu.cpu.flags.if_ = true;
+                        if tf {
+                            cpu.cpu.rflags_system |= 0x100;
+                        }
+                        (vm, cpu)
+                    };
+                    let (v2, mut c2) = machine();
+                    let r2 = stage_two(|| effect_run(&v2, &mut c2, budget, effect, true));
+                    let (v3, mut c3) = machine();
+                    let before = in_block_counts();
+                    let r3 = effect_run(&v3, &mut c3, budget, effect, true);
+                    let after = in_block_counts();
+                    let (calls, completed) = (after.0 - before.0, after.1 - before.1);
+                    assert_eq!(r2, r3, "{tag}");
+                    assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+                    assert!(calls >= 1, "{tag}");
+                    let declined = u64::from(effect != Effect::None);
+                    assert_eq!(calls - completed, declined, "{tag}");
+                    if effect != Effect::Deadline {
+                        let (v1, mut c1) = machine();
+                        let r1 = effect_run(&v1, &mut c1, budget, effect, false);
+                        assert_eq!((&r1.0, r1.1), (&r3.0, r3.1), "{tag}");
+                        assert_same_machine(&tag, (&v1, &c1), (&v3, &c3));
+                    }
+                }
+            }
+        }
+    }
 }

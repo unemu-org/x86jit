@@ -874,6 +874,16 @@ Real16, Flat32, Segmented, Checked, V86 and paged interpretation continue intern
 after Handled. The dispatcher drains SMC and revalidates source/context before
 executing successors; owned incomplete instructions retain their original bytes
 and transfer snapshots. Compiled device helpers remain stage 4 (decision-27).
+A real-mode shared-walk block completes a handled scalar MMIO load or store
+inside the block, without the handoff, completion and re-execution, when the
+re-execution's result is exact: the transfer fits one registration and is its
+instruction's only memory access, followed only by register operations that
+cannot fault; the walk began with no completion, retry or port input open; and
+the callback returned Handled with no context effect (no RAM write, INTR level
+change, NMI, host stop, A20 or paging request, or deadline change). Any other
+result is settled at the ordinary handoff that the walk then issues, with the
+same request and without calling the handler again. Registered ranges are an
+immutable table read without synchronization, since registration takes `&mut Vm`.
 An unwinding callback panic is caught and returns
 `Exit::Device(DeviceStop::HandlerFailed)`; the VM is terminally poisoned and
 subsequent execution returns `Exit::Device(DeviceStop::Poisoned)`, even after

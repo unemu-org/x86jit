@@ -5939,6 +5939,12 @@ pub(crate) struct RunningMemory<'a> {
 impl RunningMemory<'_> {
     #[cold]
     #[inline(never)]
+    fn device(&self, write: bool, addr: u64, size: u8, value: u64) -> Result<u64, ()> {
+        crate::vm::device::in_block_access(self.ir, self.current.get(), write, addr, size, value)
+            .ok_or(())
+    }
+    #[cold]
+    #[inline(never)]
     fn overlap(&self, addr: u64, len: usize) {
         // SDM Vol 3A §14.6: discard decoded bytes after the storing instruction.
         // Scan only after an overlap; ordinary instruction markers do no extra work.
@@ -5975,14 +5981,29 @@ impl InterpreterMemory for RunningMemory<'_> {
     // The interpreter walk's transfers are containment-only. A miss over adjacent
     // regions ends the attempt with its usual exit; the instruction is then
     // re-executed through `SplitMemory` (`interp::split_block`).
+    // A Trap miss may be a registered device transfer that a Machine walk
+    // completes in place (decision-28 stage 3, `vm::device::in_block_access`).
     #[inline(always)]
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
-        self.memory.read_mode::<ROUTED>(addr, size)
+        match self.memory.read_mode::<ROUTED>(addr, size) {
+            Err(MemTrap::Mmio) => self
+                .device(false, addr, size, 0)
+                .map_err(|()| MemTrap::Mmio),
+            result => result,
+        }
     }
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
-        self.memory
+        match self
+            .memory
             .write_mode_observed::<ROUTED, false>(addr, value, size, self)
+        {
+            Err(MemTrap::Mmio) => self
+                .device(true, addr, size, value)
+                .map(drop)
+                .map_err(|()| MemTrap::Mmio),
+            result => result,
+        }
     }
     #[inline(always)]
     fn write_preflighted<const ROUTED: bool>(

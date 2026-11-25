@@ -1,11 +1,18 @@
 //! Exit/completion and borrowed-handler transfers (spec.md §5.4, decision-28).
 //! Usage: machine_exits [iterations=20000] [rounds=3] [mode] [workload].
-//! EXIT_MODEL=486 selects I80486Dx (default I80386); EXIT_SPLITS=1 times
+//! EXIT_MODEL=486 or 286 selects I80486Dx or I80286 (default I80386; 286 runs
+//! the sixteen-bit modes only); EXIT_SPLITS=1 times
 //! individual run/completion calls separately; EXIT_TRACE=1 emits exact traces.
 //! EXIT_COMPLETION_BUDGET=10000000 demonstrates continuing with the existing
 //! run_steps budget after MMIO completion (default 1, matching a one-step shim).
 //! EXIT_LOG=1 enables the delivery-log epilogue (off by default).
+//! EXIT_PATH=exit|handler|exit-noreg runs only that path (for host profiling).
 //! Timings include guest execution: ns/exit is amortized round-trip cost.
+//! Workloads: out/in/store/load at N=10/25/100; `planar`, a handled byte
+//! MMIO store every N=3/4/5 instructions; `unserved-out`/`unserved-in`, port
+//! accesses outside the one registered port range, so every one takes the Exit.
+//! Unserved cells add an `exit-noreg` path, the same loop on a VM with no
+//! registered range, to compare the registry's cost against none.
 use std::time::{Duration, Instant};
 use x86jit_core::{
     CpuModel, CpuState, DeviceContext, DeviceIo, DeviceRange, DeviceRequest, DeviceResult,
@@ -37,9 +44,17 @@ fn host_instructions() -> u64 {
 const CODE: u64 = 0x10000;
 const DEVICE: u64 = 0xa000;
 const MODES: [&str; 4] = ["real16", "flat32", "paged32", "seg16"];
-const WORKS: [&str; 4] = ["out", "in", "store", "load"];
+const WORKS: [&str; 7] = [
+    "out",
+    "in",
+    "store",
+    "load",
+    "planar",
+    "unserved-out",
+    "unserved-in",
+];
 
-fn setup(mode: &str, work: &str, interval: usize) -> (Vm, Vcpu) {
+fn setup(mode: &str, work: &str, interval: usize, register: bool) -> (Vm, Vcpu) {
     let mut vm = Vm::new(VmConfig::flat(0x20000));
     vm.set_cpu_model(match std::env::var("EXIT_MODEL").as_deref() {
         Ok("486") => CpuModel::I80486Dx,
@@ -60,17 +75,27 @@ fn setup(mode: &str, work: &str, interval: usize) -> (Vm, Vcpu) {
     vm.map(DEVICE, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
     vm.map(DEVICE + 0x1000, 0x15000, Prot::RWX, RegionKind::Ram)
         .unwrap();
-    vm.register_device_range(DeviceRange::Ports(0x80..0x81))
+    let unserved = work.starts_with("unserved");
+    if register {
+        // An unserved loop's port 0x80 lies outside the one registered range.
+        vm.register_device_range(DeviceRange::Ports(if unserved {
+            0x90..0x91
+        } else {
+            0x80..0x81
+        }))
         .unwrap();
-    vm.register_device_range(DeviceRange::Mmio(DEVICE..DEVICE + 0x1000))
-        .unwrap();
+        if !unserved {
+            vm.register_device_range(DeviceRange::Mmio(DEVICE..DEVICE + 0x1000))
+                .unwrap();
+        }
+    }
     let short = mode == "real16" || mode == "seg16";
     // INC BX/EBX fillers; one device instruction, DEC DI/EDI, JNZ start.
     let mut code = vec![0x43; interval - 3];
     match work {
-        "out" | "delivery" => code.extend([0xe6, 0x80]),
-        "in" => code.extend([0xe4, 0x80]),
-        "store" => code.extend([0x88, if short { 0x04 } else { 0x06 }]),
+        "out" | "delivery" | "unserved-out" => code.extend([0xe6, 0x80]),
+        "in" | "unserved-in" => code.extend([0xe4, 0x80]),
+        "store" | "planar" => code.extend([0x88, if short { 0x04 } else { 0x06 }]),
         "load" => code.extend([0x8a, if short { 0x04 } else { 0x06 }]),
         _ => unreachable!(),
     }
@@ -234,22 +259,41 @@ fn main() {
         return;
     }
     println!("path,mode,work,n,round,retired,exits,calls,completion_calls,mips,ns_exit,run_ns_exit,completion_ns_exit,host_instructions_exit");
+    let i286 = std::env::var("EXIT_MODEL").as_deref() == Ok("286");
     for round in 0..rounds {
         for mode in MODES {
-            if args.get(3).is_some_and(|s| s != mode) {
+            if args.get(3).is_some_and(|s| s != mode) || (i286 && mode.contains("32")) {
                 continue;
             }
             for work in WORKS {
                 if args.get(4).is_some_and(|s| s != work) {
                     continue;
                 }
-                for n in [10, 25, 100] {
-                    for handler in if round % 2 == 0 {
-                        [false, true]
-                    } else {
-                        [true, false]
-                    } {
-                        let (vm, mut cpu) = setup(mode, work, n);
+                let unserved = work.starts_with("unserved");
+                let intervals: &[usize] = if work == "planar" {
+                    &[3, 4, 5]
+                } else {
+                    &[10, 25, 100]
+                };
+                for &n in intervals {
+                    // (handler, registered); rotated by round.
+                    let mut paths = vec![(false, true), (true, true)];
+                    if unserved {
+                        paths.push((false, false));
+                    }
+                    if round % 2 == 1 {
+                        paths.reverse();
+                    }
+                    for (handler, register) in paths {
+                        let path = match (handler, register) {
+                            (true, _) => "handler",
+                            (false, true) => "exit",
+                            (false, false) => "exit-noreg",
+                        };
+                        if std::env::var("EXIT_PATH").is_ok_and(|p| p != path) {
+                            continue;
+                        }
+                        let (vm, mut cpu) = setup(mode, work, n, register);
                         execute(
                             &vm,
                             &mut cpu,
@@ -279,8 +323,7 @@ fn main() {
                         assert_eq!(retired, iterations * n as u64 + iterations.div_ceil(60000));
                         let exits = counts.exits as f64;
                         println!(
-                        "{},{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
-                        if handler { "handler" } else { "exit" },
+                        "{path},{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
                         counts.exits,
                         counts.calls,
                         counts.completion_calls,
@@ -322,6 +365,7 @@ fn census() {
                     "out"
                 },
                 10,
+                true,
             );
             cpu.enable_delivery_log_with(
                 2,

@@ -4359,3 +4359,44 @@ cuts at a plain `InsnStart` (budget, IRQ, TF, exit word, lockstep) to a cold rec
   `InsnStart` cut, from the writer's inputs (nothing checks that temps are assigned once, so that
   needs a check or a saved recipe). That is a new `IrBlock` member and changes in lift, dispatch and
   `walk_ops`, for at most the v2 column.
+
+## Device access cost and the in-block handled path (xj-to9.23) — MEASURED (2026-11-25)
+
+`machine_exits` (new cells: `planar`, a handled byte MMIO store every N=3/4/5
+instructions; `unserved-out`, port accesses outside the one registered range,
+with an `exit-noreg` path on a VM with no registration). Real16, interpreter,
+Fast consistency, macOS ARM64, default Cargo release, 20,000 iterations, three
+rounds, median. Host instructions per access (`proc_pid_rusage` ri_instructions)
+are the reliable column; wall time was taken while another build ran.
+
+Profile (`sample`, handled planar store, before): the first walk 25 %, the
+dispatcher 23 %, the retry walk 8 %, translation lookups for the retry slice and
+the suffix block 10 %, context stamps, `finish_mmio_retry` and the boundary
+refresh most of the rest; `Run::access` with the registry lock 4 %. The unserved
+port with a handler spent its extra time in the request construction, the lock
+and the per-block device bookkeeping (port IP scan, boundary checks).
+
+Changes: (1) registered ranges are a `Vm`-owned table (port bitmap, sorted MMIO
+ranges) read without a lock, consulted before a request is built, and an
+unserved transfer skips the in-dispatcher seal; the per-boundary and per-block
+device checks run only with a deadline, INTR or queued invalidation; (2) a
+handled scalar MMIO transfer of a real-mode shared walk completes inside the
+block (spec.md §5.4).
+
+| Model | Cell | N | base | final |
+|---|---|---:|---:|---:|
+| I80286 | planar handler | 3 | 4874 | 1728 |
+| I80286 | planar handler | 5 | 5371 | 2222 |
+| I80286 | store handler | 10 | 6606 | 3457 |
+| I80286 | store handler | 100 | 28839 | 25688 |
+| I80286 | out handler | 10 | 4405 | 4314 |
+| I80286 | unserved-out handler | 10 | 6419 | 6002 |
+| I80286 | unserved-out exit-noreg | 10 | 5575 | 5602 |
+| I80286 | store exit (no handler) | 10 | 9891 | 10002 |
+| I80386 | planar handler | 3 | 4874 | 1728 |
+| I80386 | out exit (no handler) | 100 | 27900 | 27894 |
+
+Handled planar stores rise from 16.9 to 41.7 M retired/s (I80286, N=3). The
+unserved port with a handler keeps 427 instructions (7.7 %) over no registration;
+the Exit path pays 0.3–1.1 % for the Trap-miss check of the walk's memory
+provider. The decision-23 campaign is not part of this entry.
