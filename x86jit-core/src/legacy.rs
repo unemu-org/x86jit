@@ -350,7 +350,6 @@ fn derive_context<const V86: bool>(
                 }) {
             SegmentClass::Direct
         } else if protected
-            && !paging
             && state.cpl == 0
             && bits == 32
             && ss.attributes & (1 << 14) != 0

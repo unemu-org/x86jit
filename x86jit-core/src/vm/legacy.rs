@@ -2963,7 +2963,7 @@ impl Vcpu {
                         &mut self.legacy_execution.as_mut().unwrap().direct_proofs,
                     )
                 } else if KIND == MACHINE_DISPATCH && context.paging_enabled {
-                    // Paged contexts are Checked. Keep their selection behind
+                    // Keep paged selection behind
                     // the existing Direct source-proof fast path.
                     self.resolve_paged(vm, context)
                 } else {
@@ -3051,7 +3051,7 @@ impl Vcpu {
                     )
                 } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
                     if context.paging_enabled {
-                        self.execute_paged::<ROUTED, ORDER>(vm, &ir, context)
+                        self.execute_paged::<ROUTED, ORDER>(vm, &ir, context, remaining)
                     } else {
                         self.legacy_execution
                             .as_mut()
@@ -3299,7 +3299,9 @@ impl Vcpu {
                                     stamp: LegacyContextStamp::new(&self.cpu, model),
                                     ip: self.cpu.rip,
                                     mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-                                    walk: if context.segment_class == crate::SegmentClass::Flat32 {
+                                    walk: if context.paging_enabled {
+                                        BlockWalk::Protected
+                                    } else if context.segment_class == crate::SegmentClass::Flat32 {
                                         BlockWalk::for_flat32(&retry)
                                     } else if direct {
                                         BlockWalk::for_ir::<false>(&retry)

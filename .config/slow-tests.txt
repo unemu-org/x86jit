@@ -55,6 +55,7 @@ x86jit-tests::isa x87_rest::fist_nonpop_widths_rounding_invalid_and_empty
 x86jit-tests::isa x87_rest::fnop_ffree_and_stack_pointer_rotations
 x86jit-tests::isa x87_rest::frndint_exact_rounding_classes_and_precision_independence
 x86jit-tests::isa x87_rest::fxtract_exact_components_and_special_values
+x86jit-tests::legacy legacy_census_386::flat32_checked_census_forms_are_equal
 x86jit-tests::legacy legacy_direct_parity::r5_string_families_match_over_ram_and_devices
 x86jit-tests::legacy legacy_i8086::a_locked_odd_word_inside_a_granule_is_atomic
 x86jit-tests::legacy legacy_i8086::every_locked_form_runs_as_its_unlocked_form_or_is_refused

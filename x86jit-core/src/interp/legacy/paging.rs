@@ -1369,6 +1369,7 @@ where
                     L::Checkpoint
                         | L::I486Gate
                         | L::Address { .. }
+                        | L::Flat32Address { .. }
                         | L::ReadSelector { .. }
                         | L::Push { .. }
                         | L::Pop { .. }
@@ -2065,4 +2066,151 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
         task_switch,
         retry,
     )
+}
+
+/// Effect proof for the once-only lane (decision-27 order 2). Every accepted
+/// operation is register/flags computation or near control flow: no operand
+/// memory, fault or handoff. Jump/Branch mask their checked target to 32 bits;
+/// Flat32 proves that every such CS offset is usable (decision-27 Flat32 proof).
+/// Its CPL-0 proof also makes I486Gate's CPL-3 alignment refusal unreachable.
+/// New IR operations default to the existing transaction path.
+fn nonfaulting(ops: &[IrOp]) -> bool {
+    ops.iter().all(|op| {
+        matches!(
+            op,
+            IrOp::InsnStart { .. }
+                | IrOp::ReadReg { .. }
+                | IrOp::WriteReg { .. }
+                | IrOp::ReadSelector { .. }
+                | IrOp::Add { .. }
+                | IrOp::Adc { .. }
+                | IrOp::Sub { .. }
+                | IrOp::Sbb { .. }
+                | IrOp::And { .. }
+                | IrOp::Or { .. }
+                | IrOp::Xor { .. }
+                | IrOp::Shl { .. }
+                | IrOp::Shr { .. }
+                | IrOp::Sar { .. }
+                | IrOp::Rol { .. }
+                | IrOp::Ror { .. }
+                | IrOp::Rcl { .. }
+                | IrOp::Rcr { .. }
+                | IrOp::DoubleShift { .. }
+                | IrOp::Sext { .. }
+                | IrOp::Mul { .. }
+                | IrOp::GetCond { .. }
+                | IrOp::Jump { .. }
+                | IrOp::Branch { .. }
+                | IrOp::BitScan { .. }
+                | IrOp::Bt { .. }
+                | IrOp::Bswap { .. }
+                | IrOp::SetCf { .. }
+                | IrOp::SetDf { .. }
+                | IrOp::Lahf
+                | IrOp::Sahf
+                | IrOp::Legacy(L::Checkpoint | L::ReadSelector { .. } | L::I486Gate)
+        )
+    })
+}
+
+/// Paged Flat32 keeps the shared instruction walk and the operand transaction
+/// ledger. Only the effect-proved lane can use the ordinary executor directly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Progress {
+    let context = ir.legacy_context.expect("Flat32 context");
+    let temps = scratch.reused(ir.temp_count as usize);
+    let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    mem.paging.tlb = Some(tlb);
+    let registers = LegacyAccess::<ROUTED, ORDER>::new(memory, u32::MAX);
+    let token = tlb.borrow().generation;
+    let mut start = 0;
+    let mut steps = 0;
+    let mut retired = 0;
+    let outcome = loop {
+        let end = ir.ops[start + 1..]
+            .iter()
+            .position(|op| matches!(op, IrOp::InsnStart { .. }))
+            .map_or(ir.ops.len(), |offset| start + 1 + offset);
+        let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
+            unreachable!("instruction marker")
+        };
+        let next = match ir.ops.get(end) {
+            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+            _ => ir.guest_start + u64::from(ir.guest_len),
+        };
+        cpu.rip = guest_addr;
+        let view = InstructionView {
+            guest_start: guest_addr,
+            guest_len: (next - guest_addr) as u32,
+            ops: &ir.ops[start..end],
+        };
+        let result = if retry.is_none() && nonfaulting(view.ops) {
+            execute_instruction::<ROUTED, ORDER, false, false>(
+                ir,
+                &view,
+                cpu,
+                &registers,
+                temps,
+                context,
+                task_switch,
+            )
+        } else {
+            execute_with_retry::<ROUTED, ORDER, true, false>(
+                ir,
+                &view,
+                cpu,
+                &mem,
+                temps,
+                context,
+                task_switch,
+                retry,
+            )
+            .map(|(outcome, input)| {
+                debug_assert!(input.is_none(), "ordinary Flat32 has no port strings");
+                outcome
+            })
+        };
+        match result {
+            Err(exit) => break Err(exit),
+            Ok(outcome) => {
+                steps += 1;
+                retired += u64::from(outcome.retired);
+                if cpu.mmio_retry_active {
+                    cpu.finish_mmio_retry(None);
+                }
+                if end == ir.ops.len()
+                    || steps == limit
+                    || outcome.exit.is_some()
+                    || outcome.context_changed
+                    || outcome.translations_invalidated
+                    || outcome.arm_sti
+                    || outcome.arm_ss != 0
+                    || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    || memory.has_dirty_code()
+                    || tlb.borrow().generation != token
+                {
+                    break Ok(outcome);
+                }
+            }
+        }
+        start = end;
+    };
+    Progress {
+        sti_shadow: false,
+        ss_shadow: 0,
+        steps,
+        retired,
+        outcome: Some(outcome),
+    }
 }

@@ -1,4 +1,4 @@
-//! Internal one-instruction paging fetch/proofs (paging design §§3.2, 3.5;
+//! Internal paging fetch/proofs (paging design §§3.2, 3.5;
 //! spec.md §17.10). No shared dispatch entry or compiled materialization.
 use super::*;
 #[cfg(feature = "test-hooks")]
@@ -10,6 +10,7 @@ const MAX_BLOCKS: usize = 64;
 
 #[derive(PartialEq, Eq, Hash)]
 struct Key {
+    segment_class: crate::SegmentClass,
     decode: LegacyBlockKey,
     generation: u64,
     cr3: u32,
@@ -18,10 +19,8 @@ struct Key {
 
 struct Proof {
     ir: Arc<IrBlock>,
-    bytes: Vec<u8>,
-    // Ordered post-A20 bus spans, never a linear length applied to one frame.
-    sources: Vec<(u64, u32)>,
     permit: Option<crate::FetchPermit>,
+    // Ordered post-A20 bus spans, never a linear length applied to one frame.
     _registration: crate::memory::CodeRegistration,
 }
 
@@ -103,6 +102,7 @@ impl State {
             crate::AccessKind::Execute,
         )? as u32;
         Ok(Key {
+            segment_class: context.segment_class,
             decode: LegacyBlockKey {
                 owner_id,
                 context_id: self.generation,
@@ -146,8 +146,8 @@ impl State {
             let source = crate::memory::LiftSource::new(&vm.mem);
             let generation = vm.cache.publication_generation();
             let permit = vm.mem.fetch_permit();
-            let (bytes, sources) = fetch(vm, cpu, context, &source, &walk_wrote, &self.tlb)
-                .map_err(|mut exit| {
+            let (ir, sources) =
+                lift(vm, cpu, context, &source, &walk_wrote, &self.tlb).map_err(|mut exit| {
                     if walk_wrote.get() {
                         if let Exit::UnmappedMemory {
                             metadata: Some(m), ..
@@ -177,27 +177,12 @@ impl State {
             }
             self.reconcile_generation();
             let key = self.key(cpu, model, context, owner_id)?;
-            let ir = if let Some(proof) = self
-                .blocks
-                .get(&key)
-                .filter(|p| p.bytes == bytes && p.sources == sources)
-            {
-                proof.ir.clone()
-            } else {
-                let ir = crate::lift::legacy::instruction_for_profile(
-                    &bytes,
-                    cpu.rip as u32,
-                    context,
-                    vm.machine_model_profile(context.generation),
-                )
-                .map_err(|e| direct_refusal(cpu, e))?;
-                self.lifts += 1;
-                Arc::new(ir)
-            };
+            self.lifts += 1;
+            let ir = Arc::new(ir);
             if !source.publishable() {
                 // The interpreter may use this snapshot once, without a proof.
                 self.blocks.remove(&key);
-                return Ok(ir);
+                return Ok(retry_instruction(&ir, cpu.rip));
             }
             let mut registration = None;
             if !vm.cache.register_private_sources(generation, || {
@@ -213,13 +198,83 @@ impl State {
                 key,
                 Proof {
                     ir: ir.clone(),
-                    bytes,
-                    sources,
                     permit,
                     _registration: registration.unwrap(),
                 },
             );
             return Ok(ir);
+        }
+    }
+}
+
+// Decision-27 order 2: use the singleton fetch boundary for every required
+// instruction, retaining one TLB token and physical publication for the block.
+fn lift(
+    vm: &Vm,
+    cpu: &CpuState,
+    context: MachineContext,
+    source: &crate::memory::LiftSource<'_>,
+    walk_wrote: &Cell<bool>,
+    tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
+) -> Result<(IrBlock, Vec<(u64, u32)>), Exit> {
+    let mut cursor = cpu.clone();
+    let page_end = (cpu.rip | 4095) + 1;
+    let mut block: Option<IrBlock> = None;
+    let mut sources = Vec::new();
+    loop {
+        if cursor.rip + 15 > page_end {
+            if let Some(block) = block.take() {
+                return Ok((block, sources));
+            }
+        }
+        let fetched = fetch(vm, &mut cursor, context, source, walk_wrote, tlb);
+        let (bytes, spans) = match fetched {
+            Ok(fetched) => fetched,
+            Err(exit) => return block.map(|b| (b, sources)).ok_or(exit),
+        };
+        let instruction = match crate::lift::legacy::instruction_for_profile(
+            &bytes,
+            cursor.rip as u32,
+            context,
+            vm.machine_model_profile(context.generation),
+        ) {
+            Ok(ir) => ir,
+            Err(error) => {
+                return block
+                    .map(|b| (b, sources))
+                    .ok_or_else(|| direct_refusal(&cursor, error))
+            }
+        };
+        let ordinary = context.segment_class == crate::SegmentClass::Flat32
+            && crate::interp::legacy::flat32_ordinary(&instruction);
+        if !ordinary {
+            if let Some(block) = block.take() {
+                return Ok((block, sources));
+            }
+        }
+        sources.extend(spans);
+        let mut decoder = Decoder::with_ip(
+            u32::from(context.default_operand_bits),
+            &bytes,
+            cursor.rip,
+            crate::model::decode::SYSTEM_DECODER_OPTIONS,
+        );
+        let insn = decoder.decode();
+        cursor.rip += u64::from(instruction.guest_len);
+        if let Some(block) = &mut block {
+            block.guest_len += instruction.guest_len;
+            block.icount += 1;
+            block.temp_count = block.temp_count.max(instruction.temp_count);
+            block.ops.extend(instruction.ops);
+        } else {
+            block = Some(instruction);
+        }
+        if !ordinary
+            || insn.flow_control() != iced_x86::FlowControl::Next
+            || cursor.rip >= page_end
+            || block.as_ref().unwrap().icount == 32
+        {
+            return Ok((block.unwrap(), sources));
         }
     }
 }
@@ -450,8 +505,26 @@ impl Vcpu {
         vm: &Vm,
         ir: &Arc<IrBlock>,
         context: MachineContext,
+        limit: u64,
     ) -> crate::interp::legacy::Progress {
         let execution = self.legacy_execution.as_mut().unwrap();
+        if context.segment_class == crate::SegmentClass::Flat32
+            && crate::interp::legacy::flat32_ordinary(ir)
+        {
+            execution.rep_flags = None;
+            let state = execution.paging.get_or_insert_with(Default::default);
+            return crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                &mut self.interp_scratch,
+                limit,
+                &self.exit_request.word,
+                &mut execution.task_switch,
+                &mut state.transaction,
+                &state.tlb,
+            );
+        }
         let comparing = ir.ops.iter().any(|op| {
             matches!(
                 op,
@@ -608,6 +681,11 @@ impl Vcpu {
             addr: self.cpu.rip,
             operation: UnsupportedSystemOperation::InvalidLegacyContext(error),
         })?;
+        // This test entry remains the singleton Checked reference tier.
+        let context = MachineContext {
+            segment_class: crate::SegmentClass::Checked,
+            ..context
+        };
         if self.cpu.port_string_in.is_some() {
             if !context.paging_enabled {
                 return crate::interp::legacy::finish_port_input::<false, 0>(
@@ -820,4 +898,75 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
         retry,
         tlb,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paged_flat32_warm_block_retains_translation_and_physical_registration() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let mut vm = Vm::new(crate::VmConfig::flat(0x8000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x8000, crate::Prot::RWX, crate::RegionKind::Ram)
+                .unwrap();
+            // Linear code page 1 maps physical frame 4.
+            vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+            vm.write_bytes(0x3004, &0x4007u32.to_le_bytes()).unwrap();
+            vm.write_bytes(0x4000, b"\x40\x43\x42\xeb\x00").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.legacy.cr0 = 0x80000001;
+            cpu.cpu.legacy.cr3 = 0x2000;
+            for (i, cache) in cpu.cpu.legacy.segments[..4].iter_mut().enumerate() {
+                cache.base = 0;
+                cache.limit = u32::MAX;
+                cache.attributes = if i == 0 { 0x409b } else { 0x4093 };
+            }
+            let context = derive_legacy_context(model.legacy_model(), &cpu.cpu).unwrap();
+            assert_eq!(context.segment_class, crate::SegmentClass::Flat32);
+            let mut state = State::default();
+            let exit = AtomicU64::new(0);
+            *vm.source_read_hook.lock().unwrap() = Some(|vm| {
+                vm.write_bytes(0x4001, b"\x90").unwrap();
+            });
+            let a = state
+                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
+                .unwrap();
+            assert_eq!(a.icount, 4);
+            assert!(!a.ops.iter().any(|op| matches!(
+                op,
+                IrOp::WriteReg {
+                    reg: crate::Reg::Rbx,
+                    ..
+                }
+            )));
+            assert!(vm.mem.is_code_page(4));
+            let token = state.generation;
+            let lifts = state.lifts;
+            let registration = &state.blocks.values().next().unwrap()._registration as *const _;
+            // SDM Vol 3A §5.8 / paging design §3.2: A may stay clear on a
+            // retained translation. Clearing it also witnesses no warm walk.
+            vm.write_bytes(0x3004, &0x4007u32.to_le_bytes()).unwrap();
+            let b = state
+                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
+                .unwrap();
+            assert!(Arc::ptr_eq(&a, &b));
+            assert_eq!(state.generation, token);
+            assert_eq!(state.lifts, lifts);
+            assert_eq!(
+                &state.blocks.values().next().unwrap()._registration as *const _,
+                registration
+            );
+            let mut pte = [0; 4];
+            vm.read_bytes(0x3004, &mut pte).unwrap();
+            assert_eq!(u32::from_le_bytes(pte), 0x4007);
+            vm.write_bytes(0x4001, b"\x43").unwrap();
+            let c = state
+                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
+                .unwrap();
+            assert!(!Arc::ptr_eq(&a, &c));
+        }
+    }
 }

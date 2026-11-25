@@ -137,7 +137,7 @@ REVIEWED_ENTRY_POINTS = {
         "model::profile_for_generation",
     },
     "x86jit-core/src/vm/legacy/flat32.rs": {
-        # Reached only from Machine PG=0 after deriving the Flat32 proof.
+        # Reached only from Machine after deriving the Flat32 proof.
         "interp::legacy::flat32_ordinary", "lift::legacy::instruction_for_profile",
         "model::CpuModel", "model::decode",
     },
@@ -147,6 +147,8 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::tasks", "interp::legacy::BlockWalk",
         "interp::legacy::Outcome", "interp::legacy::Progress",
         "interp::legacy::paging", "interp::legacy::finish_port_input",
+        # Paged Flat32 blocks reuse the Flat32 proof of ordinary IR.
+        "interp::legacy::flat32_ordinary",
         "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
     },
 }
