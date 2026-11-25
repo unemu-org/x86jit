@@ -25,6 +25,12 @@ pub(crate) struct AdapterState<'a> {
     pub(super) fast_missed: Cell<bool>,
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// A strict lane committed its descriptor's accessed bit (`strict_lane`).
+    static LANE_COMMITTED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// RAM proved before execution from existing TLB entries, for an access of
 /// one privilege and kind. A write window also admits reads of its bytes.
 #[derive(Clone, Copy)]
@@ -39,7 +45,12 @@ struct Window {
 /// The proved operand windows of one instruction: the scalar operand, or a
 /// segment load's descriptor and a far transfer's stack frame. A strict
 /// (system-lane) instruction stops at the first access outside its windows,
-/// before any window write, and replays on the transaction path.
+/// before any window write, and replays on the transaction path. Its only
+/// earlier commit is the descriptor's accessed-bit CAS (`strict_lane`).
+///
+/// A non-strict operand is installed only by `fast_instruction`, whose
+/// admitted operations make no system (`Supervisor`) or task-stage
+/// (`AddressKeyed`) access; those views assert that they never meet one.
 #[derive(Clone, Copy)]
 pub(crate) struct FastOperand {
     windows: [Option<Window>; 2],
@@ -47,6 +58,11 @@ pub(crate) struct FastOperand {
 }
 
 impl FastOperand {
+    /// A system lane's descriptor and frame windows (`strict_lane`).
+    pub(super) fn is_strict(&self) -> bool {
+        self.strict
+    }
+
     fn single(linear: u64, bus: u64, size: u8, access: AccessKind, cpu: &CpuState) -> Self {
         Self {
             windows: [
@@ -94,6 +110,8 @@ impl FastOperand {
     ) -> Option<Window> {
         let found = self.windows[1].filter(fits);
         if found.is_none() {
+            // A non-strict operand covers the whole access set of the
+            // instructions `fast_instruction` admits; no system access.
             debug_assert!(self.strict, "an access outside the proved operand");
             if self.strict {
                 mem.fast_miss();
@@ -1743,6 +1761,12 @@ pub(super) fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
         return Ok(observed);
     }
     let f = &plan(cpu, mem, u64::from(address), 1, AccessKind::Write, true)?[0];
+    // Inside a strict lane this plan commits the page's A/D and the CAS the
+    // descriptor's A before the frame stores; no later access may miss.
+    #[cfg(debug_assertions)]
+    if mem.fast_operand().is_some() {
+        LANE_COMMITTED.with(|committed| committed.set(true));
+    }
     let observed = mem
         .raw()
         .atomic_cas(f.bus, expected, value, 1)
@@ -2579,8 +2603,12 @@ fn strict_instruction<const ROUTED: bool, const ORDER: u8, const V86: bool>(
 }
 
 /// Run a strict lane; after an access outside its windows restore the inputs
-/// it may have changed and return None. No lane writes a window before its
-/// last possible miss: every read and probe precedes the frame stores.
+/// it may have changed and return None. Every read and probe precedes the
+/// frame stores, so no lane writes a window before its last possible miss.
+/// One write does precede them: `accessed` commits the descriptor's A bit
+/// (and the descriptor page's A/D) through `descriptor_cas`, which is not
+/// undone. That is safe only because every access after `accessed` is inside
+/// a proved window and cannot miss; a debug build asserts it.
 fn strict_lane<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &LegacyAccess<'_, ROUTED, ORDER, true>,
@@ -2597,10 +2625,17 @@ fn strict_lane<const ROUTED: bool, const ORDER: u8>(
     );
     let saved_tasks = task_switch.clone();
     mem.paging.fast_missed.set(false);
+    #[cfg(debug_assertions)]
+    LANE_COMMITTED.with(|committed| committed.set(false));
     let result = run(cpu, task_switch);
     if !mem.paging.fast_missed.get() {
         return Some(result);
     }
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !LANE_COMMITTED.with(Cell::get),
+        "a strict lane missed after its descriptor CAS committed"
+    );
     (
         cpu.gpr,
         cpu.flags,
@@ -2807,8 +2842,9 @@ fn fast_instruction(
     operand
 }
 
-/// Paged Flat32/Seg16 execute effect-proved registers and preflighted RAM once;
-/// all other instructions retain the full operand transaction ledger.
+/// Paged Flat32, Seg16 and V86 blocks execute effect-proved registers and
+/// preflighted RAM once; all other instructions retain the full operand
+/// transaction ledger. V86 takes the same walk with V86 address checks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,

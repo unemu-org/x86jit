@@ -2714,7 +2714,14 @@ outer level, gates, task switches, faults on these proofs and every other
 form keep the transaction path. The lane runs the same helper on the live
 state. Every read and probe of these helpers precedes their frame stores,
 so an access outside the windows stops before any store, restores the
-instruction's inputs and replays on the transaction path. A near RET's Seg16 or V86 CS target check runs after its
+instruction's inputs and replays on the transaction path. The one write
+that precedes the frame stores is the descriptor's accessed bit: its
+locked update takes the ordinary walk, commits A (and the descriptor
+page's A and D) in memory and is not undone. That order is safe only
+because every access after the accessed-bit update lies inside a proved
+window and cannot miss; a fault of the update itself (a #PF on a
+write-protected descriptor page) precedes every store, as on the
+transaction path. A near RET's Seg16 or V86 CS target check runs after its
 proved stack load, which can fault only before any effect.
 
 PG=0 keeps its statically selected unpaged adapter;

@@ -606,7 +606,12 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
 {
     const PAGED: bool = M::PAGED;
     fn fast_operand(&self) -> Option<&paging::FastOperand> {
-        self.memory.fast_operand()
+        let operand = self.memory.fast_operand();
+        debug_assert!(
+            operand.is_none_or(paging::FastOperand::is_strict),
+            "a task-stage access under a scalar operand window"
+        );
+        operand
     }
     fn fast_miss(&self) {
         self.memory.fast_miss()
@@ -650,9 +655,15 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
 {
     const PAGED: bool = M::PAGED;
     // Windows carry their privilege; a supervisor access finds only a
-    // supervisor-proved window (`paging::FastOperand`).
+    // supervisor-proved window (`paging::FastOperand`). Only strict lanes
+    // make system accesses: `fast_instruction` admits none.
     fn fast_operand(&self) -> Option<&paging::FastOperand> {
-        self.0.fast_operand()
+        let operand = self.0.fast_operand();
+        debug_assert!(
+            operand.is_none_or(paging::FastOperand::is_strict),
+            "a system access under a scalar operand window"
+        );
+        operand
     }
     fn fast_miss(&self) {
         self.0.fast_miss()
@@ -2648,7 +2659,8 @@ pub(crate) enum BlockWalk {
     Direct,
     Checked,
     Protected,
-    /// A paged Flat32/Seg16 block whose ordinary walk was proved at lift.
+    /// A paged Flat32, Seg16 or V86 block whose ordinary walk was proved at
+    /// lift (`paging::execute_flat32`).
     Paged,
 }
 impl BlockWalk {
