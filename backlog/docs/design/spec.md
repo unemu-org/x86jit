@@ -370,6 +370,8 @@ Setting the entry point = simply `set_reg(Reg::Rip, entry)`. Stack: the user all
 
 The core **does not call the user through a trait** in the hot path. Instead, `run()` executes until it encounters an event it can't handle, and **returns a reason**. The user handles the reason in a loop and calls `run()` again.
 
+> **Amended by decision-28 (2026-11-25).** On the Machine profiles an embedder may register `DeviceIo` handlers for port and MMIO ranges; a registered access is served in-process and execution continues. Unregistered or declined accesses keep the return-based `Exit` path described here.
+
 ```rust
 impl Vcpu {
     /// Execute guest code until an exit event or exhaustion of the budget.
