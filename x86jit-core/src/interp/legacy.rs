@@ -454,7 +454,8 @@ fn adjust(cpu: &mut CpuState, context: MachineContext, bytes: u32) {
 pub(crate) struct PagingMode<const PAGED: bool>;
 pub(crate) trait PagingStorage {
     type State<'a>: Default;
-    fn fast_operand(state: &Self::State<'_>) -> Option<paging::FastOperand>;
+    fn fast_operand<'s>(state: &'s Self::State<'_>) -> Option<&'s paging::FastOperand>;
+    fn fast_miss(_: &Self::State<'_>) {}
     fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>>;
     fn transaction<'a>(
         state: &Self::State<'a>,
@@ -462,7 +463,7 @@ pub(crate) trait PagingStorage {
 }
 impl PagingStorage for PagingMode<false> {
     type State<'a> = ();
-    fn fast_operand(_: &()) -> Option<paging::FastOperand> {
+    fn fast_operand(_: &()) -> Option<&paging::FastOperand> {
         None
     }
     fn tlb<'a>(_: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
@@ -474,8 +475,11 @@ impl PagingStorage for PagingMode<false> {
 }
 impl PagingStorage for PagingMode<true> {
     type State<'a> = paging::AdapterState<'a>;
-    fn fast_operand(state: &Self::State<'_>) -> Option<paging::FastOperand> {
-        state.fast_operand
+    fn fast_operand<'s>(state: &'s Self::State<'_>) -> Option<&'s paging::FastOperand> {
+        state.fast_operand.as_ref()
+    }
+    fn fast_miss(state: &Self::State<'_>) {
+        state.fast_missed.set(true);
     }
     fn tlb<'a>(state: &Self::State<'a>) -> Option<&'a std::cell::RefCell<paging::Tlb>> {
         state.tlb
@@ -555,9 +559,10 @@ struct Supervisor<'a, M>(&'a M);
 // view carries its model's physical-address mask (`legacy::physical_mask`).
 trait LegacyMemory<const ROUTED: bool, const ORDER: u8> {
     const PAGED: bool = false;
-    fn fast_operand(&self) -> Option<paging::FastOperand> {
+    fn fast_operand(&self) -> Option<&paging::FastOperand> {
         None
     }
+    fn fast_miss(&self) {}
     #[inline(always)]
     fn paged(&self) -> bool {
         Self::PAGED
@@ -600,6 +605,12 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     LegacyMemory<ROUTED, ORDER> for AddressKeyed<'_, M>
 {
     const PAGED: bool = M::PAGED;
+    fn fast_operand(&self) -> Option<&paging::FastOperand> {
+        self.memory.fast_operand()
+    }
+    fn fast_miss(&self) {
+        self.memory.fast_miss()
+    }
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.memory.raw()
     }
@@ -638,6 +649,14 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     LegacyMemory<ROUTED, ORDER> for Supervisor<'_, M>
 {
     const PAGED: bool = M::PAGED;
+    // Windows carry their privilege; a supervisor access finds only a
+    // supervisor-proved window (`paging::FastOperand`).
+    fn fast_operand(&self) -> Option<&paging::FastOperand> {
+        self.0.fast_operand()
+    }
+    fn fast_miss(&self) {
+        self.0.fast_miss()
+    }
     fn raw(&self) -> &Access<ROUTED, ORDER> {
         self.0.raw()
     }
@@ -676,8 +695,11 @@ where
     PagingMode<PAGED>: PagingStorage,
 {
     const PAGED: bool = PAGED;
-    fn fast_operand(&self) -> Option<paging::FastOperand> {
+    fn fast_operand(&self) -> Option<&paging::FastOperand> {
         PagingMode::<PAGED>::fast_operand(&self.paging)
+    }
+    fn fast_miss(&self) {
+        PagingMode::<PAGED>::fast_miss(&self.paging)
     }
     fn tlb(&self) -> Option<&std::cell::RefCell<paging::Tlb>> {
         PagingMode::<PAGED>::tlb(&self.paging)
@@ -2562,20 +2584,62 @@ where
 
 pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
     ir.ops.iter().all(|op| match op {
-        IrOp::Legacy(op) => matches!(
-            op,
-            L::Address { .. }
-                | L::Flat32Address { .. }
-                | L::Seg16Address { .. }
-                | L::I486Gate
-                | L::Checkpoint
-                | L::ReadSelector { .. }
-                | L::Transfer { cs: None, .. }
-                | L::Return { far: false, .. }
-                | L::Loop { .. }
-        ),
+        IrOp::Legacy(op) => {
+            matches!(
+                op,
+                L::Address { .. }
+                    | L::Flat32Address { .. }
+                    | L::Seg16Address { .. }
+                    | L::I486Gate
+                    | L::Checkpoint
+                    | L::ReadSelector { .. }
+                    | L::Transfer { cs: None, .. }
+                    | L::Return { far: false, .. }
+                    | L::Loop { .. }
+            ) || data_segment_load(op).is_some()
+        }
         _ => supported(op),
     })
+}
+
+/// A DS, ES, FS or GS load (MOV, POP, LDS, LES, LFS, LGS). It performs the
+/// complete architectural load with its own faults and may continue an
+/// ordinary block: no event shadow (SDM Vol 3A §7.8.3 p. 7-8 names only SS), and
+/// neither the stack width nor CS changes. SS loads keep ending the block.
+#[inline]
+pub(crate) fn data_segment_load(op: &L) -> Option<SegmentId> {
+    match op {
+        L::LoadSegment {
+            segment: segment @ (SegmentId::Ds | SegmentId::Es | SegmentId::Fs | SegmentId::Gs),
+            inhibit: false,
+            ..
+        } => Some(*segment),
+        _ => None,
+    }
+}
+
+/// Whether an ordinary block continues after an instruction whose outcome
+/// changed the context. In an ordinary walk only a data-segment load does
+/// that. Seg16 and V86 stay admissible after every successful load (later
+/// operands of the reloaded segment were lifted as live checks); Flat32
+/// continues only if a reloaded DS or ES cache still proves Flat32.
+#[cold]
+#[inline(never)]
+pub(crate) fn reload_continues(ops: &[IrOp], context: MachineContext, cpu: &CpuState) -> bool {
+    ops.iter().all(|op| match op {
+        IrOp::Legacy(op @ L::LoadSegment { .. }) => data_segment_load(op).is_some_and(|segment| {
+            context.segment_class != crate::SegmentClass::Flat32
+                || matches!(segment, SegmentId::Fs | SegmentId::Gs)
+                || legacy::flat32_cache(
+                    &cpu.legacy.segments[segment as usize],
+                    segment as usize,
+                    cpu.legacy.cpl,
+                )
+        }),
+        _ => true,
+    }) && ops
+        .iter()
+        .any(|op| matches!(op, IrOp::Legacy(op) if data_segment_load(op).is_some()))
 }
 
 #[derive(Clone, Copy)]
@@ -2584,6 +2648,8 @@ pub(crate) enum BlockWalk {
     Direct,
     Checked,
     Protected,
+    /// A paged Flat32/Seg16 block whose ordinary walk was proved at lift.
+    Paged,
 }
 impl BlockWalk {
     #[cold]
@@ -2704,6 +2770,28 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
                     || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
                     || memory.has_dirty_code()
                 {
+                    if outcome.context_changed {
+                        let mut progress = Progress {
+                            sti_shadow: false,
+                            ss_shadow: 0,
+                            steps,
+                            retired,
+                            outcome: Some(Ok(outcome)),
+                        };
+                        continue_after_reload::<ROUTED, ORDER>(
+                            ir,
+                            cpu,
+                            memory,
+                            mem,
+                            temps,
+                            start,
+                            limit,
+                            exit_word,
+                            task_switch,
+                            &mut progress,
+                        );
+                        return progress;
+                    }
                     break Ok(outcome);
                 }
                 if !outcome.retired {
@@ -2719,6 +2807,105 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
         steps,
         retired,
         outcome: Some(outcome),
+    }
+}
+
+/// An in-block data-segment load leaves the block running when nothing else
+/// ends it (`reload_continues`); the dispatcher reselects the context once,
+/// where the block ends (spec.md §17.10). `start` is the load's first op.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn continue_after_reload<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    mem: &LegacyAccess<'_, ROUTED, ORDER>,
+    temps: &mut [u64],
+    mut start: usize,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    progress: &mut Progress,
+) {
+    let context = ir.legacy_context.expect("Direct context");
+    let instruction_end = |start: usize| {
+        ir.ops[start + 1..]
+            .iter()
+            .position(|op| matches!(op, IrOp::InsnStart { .. }))
+            .map_or(ir.ops.len(), |offset| start + 1 + offset)
+    };
+    loop {
+        let Some(Ok(outcome)) = &mut progress.outcome else {
+            return;
+        };
+        let end = instruction_end(start);
+        if !outcome.context_changed
+            || !outcome.retired
+            || end == ir.ops.len()
+            || progress.steps == limit
+            || outcome.exit.is_some()
+            || outcome.arm_sti
+            || outcome.arm_ss != 0
+            || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
+            || memory.has_dirty_code()
+            || !reload_continues(&ir.ops[start..end], context, cpu)
+        {
+            // The block reloaded a segment; reselect where it ends.
+            outcome.context_changed = true;
+            return;
+        }
+        start = end;
+        // The next instruction, then those after it, as the walk above.
+        loop {
+            let end = instruction_end(start);
+            let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
+                unreachable!("instruction marker")
+            };
+            let next = match ir.ops.get(end) {
+                Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+                _ => ir.guest_start + u64::from(ir.guest_len),
+            };
+            cpu.rip = guest_addr;
+            let result = execute_instruction::<ROUTED, ORDER, false, false>(
+                ir,
+                &InstructionView {
+                    guest_start: guest_addr,
+                    guest_len: (next - guest_addr) as u32,
+                    ops: &ir.ops[start..end],
+                },
+                cpu,
+                mem,
+                temps,
+                context,
+                task_switch,
+            );
+            let Ok(outcome) = &result else {
+                progress.outcome = Some(result);
+                return;
+            };
+            progress.steps += 1;
+            progress.retired += u64::from(outcome.retired);
+            if cpu.mmio_retry_active {
+                cpu.finish_mmio_retry(None);
+            }
+            let stop = (outcome.retired && end == ir.ops.len())
+                || progress.steps == limit
+                || outcome.exit.is_some()
+                || outcome.context_changed
+                || outcome.arm_sti
+                || outcome.arm_ss != 0
+                || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
+                || memory.has_dirty_code();
+            let retired = outcome.retired;
+            progress.outcome = Some(result);
+            if stop {
+                break;
+            }
+            if retired {
+                start = end;
+            }
+        }
     }
 }
 
@@ -3033,7 +3220,7 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
             exit_word,
             task_switch,
         ),
-        BlockWalk::Checked | BlockWalk::Protected => {
+        BlockWalk::Checked | BlockWalk::Protected | BlockWalk::Paged => {
             execute_checked::<ROUTED, ORDER>(ir, cpu, memory, scratch, task_switch)
         }
     }

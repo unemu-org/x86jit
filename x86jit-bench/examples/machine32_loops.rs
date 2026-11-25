@@ -3,6 +3,9 @@
 //! MACHINE32_MODEL=486 selects I80486Dx; the default is I80386.
 //! farcall uses MACHINE32_FAR_INTERVAL guest instructions per call (default 25).
 //! farseg reloads DS/ES and calls far in protected16 or paged V86.
+//! segmix mirrors a PC-class embedder's 16-bit protected and V86 body: per 25
+//! retired, one DS and one ES reload, a near and a far CALL/RET pair (the far
+//! callee in a second code segment) and three memory operands.
 //! farcall-sliced and farseg-sliced use 64-step calls and board-style writes.
 //! These cases place data 256 KiB from the descriptor page.
 //! Application retirement is derived from the validated finite guest loop.
@@ -54,7 +57,9 @@ const PATHS: [&str; 12] = [
     "application-interp32",
     "application-jit32",
 ];
-const WORKS: [&str; 5] = ["register", "memory", "callret", "farseg", "farcall"];
+const WORKS: [&str; 6] = [
+    "register", "memory", "callret", "farseg", "farcall", "segmix",
+];
 
 fn farcall_interval() -> u64 {
     let n = std::env::var("MACHINE32_FAR_INTERVAL").map_or(25, |s| s.parse().unwrap());
@@ -124,7 +129,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     vm.set_exception_delivery(ExceptionDelivery::Outward);
     vm.map(0, memory_size as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();
-    let bytes = if work == "farseg" || work == "farcall" {
+    let bytes = if work == "segmix" {
+        if v86 {
+            segmix_code((data >> 4) as u16, 0x1100)
+        } else {
+            let rpl = if user { 3 } else { 0 };
+            segmix_code(16 | rpl, 32 | rpl)
+        }
+    } else if work == "farseg" || work == "farcall" {
         let short = seg16 || v86;
         let mut bytes = if work == "farseg" {
             // MOV DX,DS; MOV DS,DX; MOV ES,DX.
@@ -169,6 +181,10 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         code(work, real || seg16 || v86)
     };
     vm.write_bytes(CODE, &bytes).unwrap();
+    if work == "segmix" {
+        // Far callee at offset 0 of the second code segment: XOR DX,AX; RETF.
+        vm.write_bytes(CODE + 0x1000, &[0x31, 0xc2, 0xcb]).unwrap();
+    }
     if path == "application-single32" {
         let bytes = code(work, false);
         let mut decoder =
@@ -224,7 +240,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         cpu.cpu.es = cpu.cpu.ds;
         cpu.cpu.ss = if user { 27 } else { 24 };
         cpu.cpu.legacy.gdtr.base = gdt as u32;
-        cpu.cpu.legacy.gdtr.limit = 31;
+        cpu.cpu.legacy.gdtr.limit = 39;
         for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
             segment.base = if !seg16 {
                 0
@@ -254,6 +270,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
                 vm.write_bytes(gdt + index * 8, &low.to_le_bytes()).unwrap();
                 vm.write_bytes(gdt + 4 + index * 8, &high.to_le_bytes())
                     .unwrap();
+                if i == 0 {
+                    // Index 4: the same code segment, based one page higher.
+                    let base = segment.base + 0x1000;
+                    let low = (limit & 0xffff) | (base << 16);
+                    let high = (high & !0xff00_00ff) | ((base >> 16) & 0xff) | (base & 0xff00_0000);
+                    vm.write_bytes(gdt + 32, &low.to_le_bytes()).unwrap();
+                    vm.write_bytes(gdt + 36, &high.to_le_bytes()).unwrap();
+                }
             }
         }
     }
@@ -359,7 +383,8 @@ fn main() {
             for path in paths {
                 let v86 = path == "machine-paged-v86";
                 let seg16 = path.contains("protected16") || path.contains("paged16");
-                if (base_work == "farseg" && !seg16 && !v86)
+                if ((base_work == "farseg" || base_work == "segmix") && !seg16 && !v86)
+                    || (base_work == "segmix" && sliced)
                     || (base_work == "farcall"
                         && (!path.starts_with("machine") || path == "machine-real16"))
                 {
@@ -372,16 +397,27 @@ fn main() {
                 cpu.set_reg(Reg::Rbx, 0);
                 cpu.set_reg(Reg::Rdx, 0);
                 vm.write_bytes(DATA, &[0; 4]).unwrap();
+                vm.write_bytes(DATA + 0x100, &[0; 2]).unwrap();
                 let retired_before = cpu.retired_instructions();
+                #[cfg(feature = "test-hooks")]
+                x86jit_core::Vcpu::take_machine_counters_for_test();
                 let host_before = instructions();
                 let start = Instant::now();
                 execute(&vm, &mut cpu, real, n, sliced);
                 let seconds = start.elapsed().as_secs_f64();
                 let host = instructions() - host_before;
                 let retired = cpu.retired_instructions() - retired_before;
+                // Per 1000 retired, on stderr: blocks, reselections, lifts, proof hits.
+                #[cfg(feature = "test-hooks")]
+                eprintln!(
+                    "counters {work} {path}: {:?}",
+                    x86jit_core::Vcpu::take_machine_counters_for_test()
+                        .map(|c| (c * 1000) as f64 / retired.max(1) as f64)
+                );
                 let count = (match base_work {
                     "farseg" => 8 + u64::from(sliced),
                     "farcall" => farcall_interval(),
+                    "segmix" => 25,
                     _ => 5,
                 }) * n
                     + if real {
@@ -393,7 +429,14 @@ fn main() {
                     assert_eq!(retired, count);
                 }
                 let mask = if real { 0xffff } else { 0xffff_ffff };
-                assert_eq!(cpu.reg(Reg::Rax) & mask, n & mask);
+                if base_work == "segmix" {
+                    let mut word = [0; 2];
+                    vm.read_bytes(DATA + 0x100, &mut word).unwrap();
+                    assert_eq!(u64::from(u16::from_le_bytes(word)), (3 * n) & 0xffff);
+                    assert_eq!(cpu.reg(Reg::Rax) & 0xffff, (3 * n + 1) & 0xffff);
+                } else {
+                    assert_eq!(cpu.reg(Reg::Rax) & mask, n & mask);
+                }
                 if work == "memory" {
                     let mut data = [0; 4];
                     vm.read_bytes(DATA, &mut data).unwrap();
@@ -407,6 +450,43 @@ fn main() {
             }
         }
     }
+}
+
+// 25 retired per iteration (see the module comment). DS and ES reload `data`
+// (a selector, or a V86 paragraph); the far callee is 1100h:0 in V86 and
+// selector 20h | RPL otherwise, both one page above the loop's code.
+fn segmix_code(data: u16, far: u16) -> Vec<u8> {
+    use iced_x86::code_asm::*;
+    let mut a = CodeAssembler::new(16).unwrap();
+    let mut top = a.create_label();
+    let mut near = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.mov(bx, u32::from(data)).unwrap();
+    a.add(bx, 0).unwrap();
+    a.mov(ds, bx).unwrap();
+    a.mov(es, bx).unwrap();
+    a.mov(ax, word_ptr(0x100)).unwrap();
+    a.add(ax, 3).unwrap();
+    a.mov(word_ptr(0x100), ax).unwrap();
+    a.push(ax).unwrap();
+    a.xor(ax, 0x55aa).unwrap();
+    a.pop(ax).unwrap();
+    a.call(near).unwrap();
+    a.db(&[0x9a, 0, 0, far as u8, (far >> 8) as u8]).unwrap(); // CALL FAR far:0.
+    a.mov(word_ptr(0x102).es(), ax).unwrap();
+    a.inc(ebp).unwrap();
+    a.add(si, ax).unwrap();
+    a.rol(dx, 1).unwrap();
+    a.add(cx, 7).unwrap();
+    a.xor(cx, 0x1234).unwrap();
+    a.inc(bx).unwrap();
+    a.dec(di).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.set_label(&mut near).unwrap();
+    a.add(ax, 1).unwrap();
+    a.ret().unwrap();
+    a.assemble(0).unwrap()
 }
 
 // Isolate the public decoder work repeated by Checked fetch. This excludes

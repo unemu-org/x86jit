@@ -2642,7 +2642,8 @@ fn paged_v86_segment_loads_retain_translations_and_prior_context_blocks() {
             assert_eq!(cpu.cpu.legacy.segments[1].base, 0x2000);
             assert_eq!(cpu.cpu.legacy.segments[2].base, 0x2000);
             let proof = cpu.paging_cache_for_test();
-            assert_eq!(proof.1, 2);
+            // Both loads share one ordinary V86 block (spec.md §17.10).
+            assert_eq!(proof.1, 1);
             if round == 0 {
                 warm = Some(proof);
             } else {

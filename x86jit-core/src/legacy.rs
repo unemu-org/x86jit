@@ -361,30 +361,10 @@ fn derive_context<const V86: bool>(
         } else if protected
             && bits == 32
             && ss.attributes & (1 << 14) != 0
-            && state.segments[..4].iter().enumerate().all(|(i, c)| {
-                // SDM Vol 3A §§3.4.5–3.4.5.1: present readable code
-                // and expand-up writable data. §§6.6–6.7, 6.8.1.1–6.8.1.2:
-                // prove cached rights at this CPL; selector load checks stay
-                // at the load boundary, not at each operand access.
-                let dpl = ((c.attributes >> 5) & 3) as u8;
-                let rights = if state.cpl == 0 {
-                    c.attributes & 0x9e == if i == 0 { 0x9a } else { 0x92 }
-                } else {
-                    match i {
-                        0 => {
-                            c.attributes & 0x9a == 0x9a
-                                && if c.attributes & 4 != 0 {
-                                    dpl <= state.cpl
-                                } else {
-                                    dpl == state.cpl
-                                }
-                        }
-                        3 => c.attributes & 0x9e == 0x92 && dpl == state.cpl,
-                        _ => c.attributes & 0x9e == 0x92 && dpl >= state.cpl,
-                    }
-                };
-                c.base == 0 && c.limit == u32::MAX && c.unusable == 0 && rights
-            })
+            && state.segments[..4]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| flat32_cache(c, i, state.cpl))
         {
             SegmentClass::Flat32
         } else if protected
@@ -416,6 +396,34 @@ fn derive_context<const V86: bool>(
         cpl: state.cpl,
         paging_enabled: paging,
     })
+}
+
+/// Whether cache `i` (CS, DS, ES or SS) satisfies the Flat32 proof at `cpl`.
+/// A data-segment load inside a Flat32 block keeps the block only when the
+/// loaded DS or ES cache still satisfies it (spec.md §17.10).
+pub(crate) fn flat32_cache(c: &SegmentCache, i: usize, cpl: u8) -> bool {
+    // SDM Vol 3A §§3.4.5–3.4.5.1: present readable code
+    // and expand-up writable data. §§6.6–6.7, 6.8.1.1–6.8.1.2:
+    // prove cached rights at this CPL; selector load checks stay
+    // at the load boundary, not at each operand access.
+    let dpl = ((c.attributes >> 5) & 3) as u8;
+    let rights = if cpl == 0 {
+        c.attributes & 0x9e == if i == 0 { 0x9a } else { 0x92 }
+    } else {
+        match i {
+            0 => {
+                c.attributes & 0x9a == 0x9a
+                    && if c.attributes & 4 != 0 {
+                        dpl <= cpl
+                    } else {
+                        dpl == cpl
+                    }
+            }
+            3 => c.attributes & 0x9e == 0x92 && dpl == cpl,
+            _ => c.attributes & 0x9e == 0x92 && dpl >= cpl,
+        }
+    };
+    c.base == 0 && c.limit == u32::MAX && c.unusable == 0 && rights
 }
 
 // SDM Vol 3B §§23.2.1, 23.2.4 pp. 23-6–8; 386 PRM §§15.1–15.2

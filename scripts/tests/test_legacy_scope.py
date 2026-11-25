@@ -141,9 +141,10 @@ REVIEWED_ENTRY_POINTS = {
         "model::profile_for_generation",
     },
     "x86jit-core/src/vm/legacy/flat32.rs": {
-        # Reached only from Machine after deriving the Flat32 or Seg16 proof.
-        "interp::legacy::flat32_ordinary", "lift::legacy::instruction_for_profile",
-        "model::CpuModel", "model::decode",
+        # Reached only from Machine after deriving the Flat32 or Seg16 proof;
+        # the lifter's in-block segment-load mask (xj-to9.18) too.
+        "interp::legacy::flat32_ordinary", "interp::legacy::data_segment_load",
+        "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
     },
     "x86jit-core/src/vm/legacy/paging.rs": {
         # Machine-only paged dispatch, incoming-task fault ownership, and the

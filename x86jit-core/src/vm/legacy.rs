@@ -27,6 +27,42 @@ pub(crate) fn paging_generation() -> u64 {
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
+/// Machine dispatch counters for cost probes, compiled only with
+/// `test-hooks`: blocks executed, context reselections, lifts and proof hits.
+#[cfg(feature = "test-hooks")]
+pub(crate) mod probes {
+    use std::cell::Cell;
+    pub(crate) const BLOCKS: usize = 0;
+    pub(crate) const RESELECTIONS: usize = 1;
+    pub(crate) const LIFTS: usize = 2;
+    pub(crate) const PROOFS: usize = 3;
+    thread_local! {
+        pub(crate) static COUNTS: [Cell<u64>; 4] = const {
+            [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)]
+        };
+    }
+    pub(crate) fn bump(index: usize) {
+        COUNTS.with(|c| c[index].set(c[index].get() + 1));
+    }
+}
+macro_rules! probe {
+    ($index:ident) => {
+        #[cfg(feature = "test-hooks")]
+        crate::vm::legacy::probes::bump(crate::vm::legacy::probes::$index);
+    };
+}
+use probe;
+
+impl Vcpu {
+    /// Thread-local Machine dispatch counters since the last call: blocks
+    /// executed, context reselections, lifts and proof hits. Cost probes only.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn take_machine_counters_for_test() -> [u64; 4] {
+        probes::COUNTS.with(|c| c.each_ref().map(|c| c.replace(0)))
+    }
+}
+
 // The retained context stamp guards the segment class. Flat32 and paging
 // also own separate proof maps, so the shared key need not hash that class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +182,7 @@ impl LegacyContextStamp {
 // Decision-20: the firmware-style transition loop uses four contexts. Sixteen
 // leaves room for a handful of code/stack configurations while bounding churn.
 const MAX_RETAINED_CONTEXTS: usize = 16;
+const RECENT_CONTEXTS: usize = 4;
 
 struct RetainedContext {
     id: u64,
@@ -525,6 +562,12 @@ pub(super) struct Execution {
     paging: Option<Box<paging::State>>,
     flat32: flat32::State,
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
+    // The last few retained identities, most recent first, with the epoch of
+    // their last use: segment reloads and far transfers alternate between
+    // them without hashing the stamp. Every entry names a live member of
+    // `contexts`; its epoch returns to the LRU when it leaves this list.
+    // Boxed, off the dispatcher's hot fields.
+    recent: Box<[Option<(LegacyContextStamp, u64, u64)>; RECENT_CONTEXTS]>,
 }
 impl Execution {
     pub(super) fn device_event(&self) -> Option<crate::DeviceEvent> {
@@ -557,6 +600,7 @@ impl Execution {
             validated: None,
             validated_direct_bus: false,
             contexts: HashMap::new(),
+            recent: Box::new([None; RECENT_CONTEXTS]),
             blocks: HashMap::new(),
             instruction_retry: None,
             retry_slice: None,
@@ -661,6 +705,7 @@ impl Execution {
         self.blocks.clear();
         self.flat32 = flat32::State::default();
         self.contexts.clear();
+        *self.recent = [None; RECENT_CONTEXTS];
         self.stamp = None;
         self.validated = None;
     }
@@ -697,11 +742,27 @@ impl Execution {
             self.context_id = if class == crate::SegmentClass::Direct {
                 // Direct states do not consume decision-20's Checked LRU slots.
                 u64::MAX
+            } else if let Some(slot) = self
+                .recent
+                .iter()
+                .position(|r| r.as_ref().is_some_and(|(s, ..)| *s == stamp))
+            {
+                self.recent[..=slot].rotate_right(1);
+                let entry = self.recent[0].as_mut().unwrap();
+                entry.2 = self.context_epoch;
+                entry.1
             } else if let Some(context) = self.contexts.get_mut(&stamp) {
                 context.last_used = self.context_epoch;
-                context.id
+                let id = context.id;
+                self.remember_recent(stamp, id);
+                id
             } else {
                 let id = if self.contexts.len() == MAX_RETAINED_CONTEXTS {
+                    // The LRU sees every recent use before choosing.
+                    for (stamp, _, epoch) in std::mem::take(&mut *self.recent).into_iter().flatten()
+                    {
+                        self.contexts.get_mut(&stamp).unwrap().last_used = epoch;
+                    }
                     let oldest = *self
                         .contexts
                         .iter()
@@ -722,10 +783,18 @@ impl Execution {
                         last_used: self.context_epoch,
                     },
                 );
+                self.remember_recent(stamp, id);
                 id
             };
             self.stamp = Some(stamp);
         }
+    }
+    fn remember_recent(&mut self, stamp: LegacyContextStamp, id: u64) {
+        if let Some((old, _, epoch)) = self.recent[RECENT_CONTEXTS - 1].take() {
+            self.contexts.get_mut(&old).unwrap().last_used = epoch;
+        }
+        self.recent.rotate_right(1);
+        self.recent[0] = Some((stamp, id, self.context_epoch));
     }
     fn resolve<const KIND: u8>(
         &mut self,
@@ -784,9 +853,11 @@ impl Execution {
         let bytes = fetch(vm, cpu, context)?;
         if let Some(block) = self.blocks.get(&key) {
             if block.bytes == bytes {
+                probe!(PROOFS);
                 return Ok((block.ir.clone(), block.walk));
             }
         }
+        probe!(LIFTS);
         let ir = crate::lift::legacy::instruction_for_profile(
             &bytes,
             cpu.rip as u32,
@@ -3145,6 +3216,7 @@ impl Vcpu {
                 };
                 self.legacy_execution.as_mut().unwrap().last_direct_fetch =
                     (direct && !retained).then_some(linear_fetch);
+                probe!(BLOCKS);
                 let (ir, walk) = match resolved {
                     Ok(ir) => ir,
                     Err(exit) => {
@@ -3203,9 +3275,17 @@ impl Vcpu {
                         // A twenty-bit model is never blocked (`nmi.rs`).
                         false,
                     )
-                } else if KIND >= MACHINE_DISPATCH && matches!(walk, BlockWalk::Protected) {
+                } else if KIND >= MACHINE_DISPATCH
+                    && matches!(walk, BlockWalk::Protected | BlockWalk::Paged)
+                {
                     if context.paging_enabled {
-                        self.execute_paged::<ROUTED, ORDER>(vm, &ir, context, remaining)
+                        self.execute_paged::<ROUTED, ORDER>(
+                            vm,
+                            &ir,
+                            context,
+                            remaining,
+                            matches!(walk, BlockWalk::Paged),
+                        )
                     } else {
                         self.legacy_execution
                             .as_mut()
@@ -3394,6 +3474,7 @@ impl Vcpu {
                             direct_bus = raw_direct(&self.cpu);
                         }
                         if !direct20 && outcome.context_changed {
+                            probe!(RESELECTIONS);
                             let execution = self.legacy_execution.as_mut().unwrap();
                             if outcome.translations_invalidated {
                                 execution.invalidate_translations();
@@ -3467,6 +3548,7 @@ impl Vcpu {
                             // IP. Its original singleton must keep that ownership.
                             let retry = if ir.icount > 1
                                 && (direct
+                                    || context.regime == MachineRegime::Virtual8086
                                     || matches!(
                                         context.segment_class,
                                         crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16

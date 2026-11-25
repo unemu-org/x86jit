@@ -2661,14 +2661,61 @@ Each complete operand checks that interval before paging or physical access
 
 Seg16 shares the bounded Flat32 proof cache and accounting walk. Linear-page
 boundaries include CS.base; a straddling first instruction is a singleton.
-Segment loads, far transfers (including gates), privileged/IOPL-sensitive
-instructions and REP remain checked singletons, ending the block and reselecting
-the context. Near transfers end blocks and retain CS target checks. Paged scalar
+Data-segment loads continue the block (below). SS loads, far transfers
+(including gates), privileged/IOPL-sensitive instructions and REP remain
+checked singletons, ending the block and reselecting the context. Near
+transfers end blocks and retain CS target checks. Paged scalar
 RAM accesses reuse the existing permission/D-bit TLB fast path after proving
 their segment interval; faults, misses, split operands, code stores and devices
 retain the transaction path. In particular, a near RET cannot skip its loaded
 CS target check under Seg16. The Machine context identity carries this class;
 BlockKey hashing, Application dispatch and CpuState remain unchanged.
+
+**Segment loads and far transfers inside blocks (xj-to9.18).** A MOV, POP,
+LDS, LES, LFS or LGS into DS, ES, FS or GS is an ordinary instruction of a
+Seg16, Flat32 or paged V86 block. It performs the complete architectural
+load through the shared helper: descriptor fetch from the GDT or LDT with
+supervisor privilege, every type, privilege and presence check with its
+error code (#GP, #NP; SDM Vol 2B MOV, Protected Mode Exceptions; Vol 3A
+§§6.3–6.4; 80386 PRM §17 MOV pp. 17-109–110), #PF and CR2 when the
+descriptor page is missing (SDM Vol 3A §5.6.1; 80386 PRM §6.5 p. 6-22) and
+the accessed-bit write (SDM Vol 3A §3.4.5.1). SS loads stay singletons: MOV
+and POP SS arm the event shadow (SDM Vol 3A §7.8.3 p. 7-8) and SS.B is part
+of the block's stack lowering. After a load of segment S the lifter keeps
+every later operand of S in the same block as the live Checked access, which
+reads the cache that load installed; operands lifted before it, and other
+segments, keep their entry-stamped Seg16 interval. Seg16 stays admissible
+after every successful load (null caches are unusable, every loaded
+descriptor has P=S=1). Flat32 continues only while a reloaded DS or ES still
+proves Flat32; otherwise the block ends after the load and reselection picks
+Checked. V86 loads install base = selector × 16 without a descriptor (SDM
+Vol 3B §23.2 p. 23-5; 80386 PRM §15.1.2 pp. 15-2–3) and V86 operands are
+always live. A block that reloaded a segment reports a context change where
+it ends, and the dispatcher reselects once. A fault after the load retires
+the load and the instructions before it, as Checked does.
+
+Paged V86 at any IOPL shares ordinary blocks, with the Flat32 walk and its
+TLB operand lane, in the Checked segment class; sensitive instructions, far
+transfers and REP stay singletons. Unpaged V86 keeps singletons.
+
+Reselection retains the four most recent context identities, compared by
+stamp before the retained-context map is hashed; their last use returns to
+the LRU before an eviction. Paged blocks carry their ordinary-walk
+classification from lift.
+
+Two paged lanes skip the operand transaction when existing TLB entries
+prove every access as RAM with the needed privilege, kind and dirty state:
+MOV of a register into DS/ES/FS/GS (the eight-byte descriptor, supervisor
+read) and a same-level far CALL or JMP with an immediate pointer or a far
+RET whose popped CS has RPL = CPL, in Seg16, Flat32 and V86 (the descriptor,
+which must name a code segment, not a call gate, TSS or task gate, SDM Vol 3A
+§6.8 p. 6-10; and the CS:IP frame, which must not wrap SP). A far RET to an
+outer level, gates, task switches, faults on these proofs and every other
+form keep the transaction path. The lane runs the same helper on the live
+state. Every read and probe of these helpers precedes their frame stores,
+so an access outside the windows stops before any store, restores the
+instruction's inputs and replays on the transaction path. A near RET's Seg16 or V86 CS target check runs after its
+proved stack load, which can fault only before any effect.
 
 PG=0 keeps its statically selected unpaged adapter;
 paged walks, transactions and proofs live in cold, non-inlined functions.

@@ -21,19 +21,91 @@ pub(crate) struct AdapterState<'a> {
     pub(super) transaction: Option<&'a std::cell::RefCell<Transaction>>,
     pub(super) tlb: Option<&'a std::cell::RefCell<Tlb>>,
     pub(super) fast_operand: Option<FastOperand>,
+    /// A strict lane's access found no proved window (`FastOperand::strict`).
+    pub(super) fast_missed: Cell<bool>,
 }
 
+/// RAM proved before execution from existing TLB entries, for an access of
+/// one privilege and kind. A write window also admits reads of its bytes.
 #[derive(Clone, Copy)]
-pub(crate) struct FastOperand {
+struct Window {
     linear: u64,
     bus: u64,
     size: u8,
+    write: bool,
+    supervisor: bool,
+}
+
+/// The proved operand windows of one instruction: the scalar operand, or a
+/// segment load's descriptor and a far transfer's stack frame. A strict
+/// (system-lane) instruction stops at the first access outside its windows,
+/// before any window write, and replays on the transaction path.
+#[derive(Clone, Copy)]
+pub(crate) struct FastOperand {
+    windows: [Option<Window>; 2],
+    strict: bool,
 }
 
 impl FastOperand {
-    fn bus(self, linear: u64, size: u8) -> u64 {
-        debug_assert_eq!((linear, size), (self.linear, self.size));
-        self.bus
+    fn single(linear: u64, bus: u64, size: u8, access: AccessKind, cpu: &CpuState) -> Self {
+        Self {
+            windows: [
+                Some(Window {
+                    linear,
+                    bus,
+                    size,
+                    write: access == AccessKind::Write,
+                    supervisor: cpu.legacy.cpl != 3,
+                }),
+                None,
+            ],
+            strict: false,
+        }
+    }
+
+    #[inline(always)]
+    fn window<const ROUTED: bool, const ORDER: u8>(
+        &self,
+        cpu: &CpuState,
+        mem: &impl LegacyMemory<ROUTED, ORDER>,
+        linear: u64,
+        size: u8,
+        write: bool,
+    ) -> Option<Window> {
+        let supervisor = cpu.legacy.cpl != 3 || mem.supervisor();
+        let fits = |w: &Window| {
+            w.supervisor == supervisor
+                && (w.write || !write)
+                && linear >= w.linear
+                && linear + u64::from(size) <= w.linear + u64::from(w.size)
+        };
+        if let Some(w) = self.windows[0].filter(fits) {
+            return Some(w);
+        }
+        self.second_window(mem, fits)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn second_window<const ROUTED: bool, const ORDER: u8>(
+        &self,
+        mem: &impl LegacyMemory<ROUTED, ORDER>,
+        fits: impl Fn(&Window) -> bool,
+    ) -> Option<Window> {
+        let found = self.windows[1].filter(fits);
+        if found.is_none() {
+            debug_assert!(self.strict, "an access outside the proved operand");
+            if self.strict {
+                mem.fast_miss();
+            }
+        }
+        found
+    }
+}
+
+impl Window {
+    fn bus(self, linear: u64) -> u64 {
+        self.bus + (linear - self.linear)
     }
 
     fn failure(self, cpu: &mut CpuState, trap: MemTrap, access: AccessKind, value: u64) -> Exit {
@@ -44,6 +116,12 @@ impl FastOperand {
         };
         crate::fault::qualify_legacy_bus(exit, self.linear, self.bus)
     }
+}
+
+/// The stop of a strict lane's unproved access; never leaves the lane.
+#[cold]
+fn fast_miss_exit(cpu: &CpuState) -> Exit {
+    refusal(cpu, crate::UnsupportedSystemOperation::LegacyExecution)
 }
 
 #[derive(Clone, Copy)]
@@ -862,10 +940,13 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
     access: AccessKind,
 ) -> Result<u64, Exit> {
     if let Some(operand) = mem.fast_operand() {
+        let Some(window) = operand.window(cpu, mem, addr, size, false) else {
+            return Err(fast_miss_exit(cpu));
+        };
         return mem
             .raw()
-            .read(operand.bus(addr, size), size)
-            .map_err(|trap| operand.failure(cpu, trap, AccessKind::Read, 0));
+            .read(window.bus(addr), size)
+            .map_err(|trap| window.failure(cpu, trap, AccessKind::Read, 0));
     }
     read_slow(cpu, mem, addr, size, access)
 }
@@ -971,11 +1052,15 @@ pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
     value: u64,
 ) -> Result<(), Exit> {
     if let Some(operand) = mem.fast_operand() {
+        let Some(window) = operand.window(cpu, mem, addr, size, true) else {
+            return Err(fast_miss_exit(cpu));
+        };
         let value = value & mask(size);
+        let bus = window.bus(addr);
         mem.raw()
-            .write(operand.bus(addr, size), value, size)
-            .map_err(|trap| operand.failure(cpu, trap, AccessKind::Write, value))?;
-        mem.note_write(operand.bus, size);
+            .write(bus, value, size)
+            .map_err(|trap| window.failure(cpu, trap, AccessKind::Write, value))?;
+        mem.note_write(bus, size);
         return Ok(());
     }
     write_slow(cpu, mem, addr, size, value)
@@ -1016,8 +1101,10 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     size: u8,
 ) -> Result<(), Exit> {
     if let Some(operand) = mem.fast_operand() {
-        operand.bus(addr, size);
-        return Ok(());
+        return match operand.window(cpu, mem, addr, size, true) {
+            Some(_) => Ok(()),
+            None => Err(fast_miss_exit(cpu)),
+        };
     }
     plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
 }
@@ -2215,6 +2302,24 @@ fn fast_operand(
     size: u8,
     access: AccessKind,
 ) -> Option<FastOperand> {
+    let privilege = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let window = fast_window(cpu, memory, tlb, linear, size, access, privilege)?;
+    Some(FastOperand::single(linear, window.bus, size, access, cpu))
+}
+
+fn fast_window(
+    cpu: &CpuState,
+    memory: &Memory,
+    tlb: &Tlb,
+    linear: u64,
+    size: u8,
+    access: AccessKind,
+    privilege: Privilege,
+) -> Option<Window> {
     if size == 0
         || size > 8
         || linear > u64::from(u32::MAX)
@@ -2224,11 +2329,6 @@ fn fast_operand(
     }
     let entry = tlb.entries[Tlb::index(linear as u32)]
         .filter(|entry| u64::from(entry.page) == linear >> 12)?;
-    let privilege = if cpu.legacy.cpl == 3 {
-        Privilege::User
-    } else {
-        Privilege::Supervisor
-    };
     // 80386 PRM §5.2.4.3; SDM Vol 3A §5.8: a cached translation needs
     // no A update, but the first write to a clean fill must set D slowly.
     if !permitted(cpu, access, privilege, entry.rights)
@@ -2244,7 +2344,274 @@ fn fast_operand(
     {
         return None;
     }
-    Some(FastOperand { linear, bus, size })
+    Some(Window {
+        linear,
+        bus,
+        size,
+        write: access == AccessKind::Write,
+        supervisor: privilege == Privilege::Supervisor,
+    })
+}
+
+/// The descriptor window of a protected segment or CS load: the eight bytes
+/// `descriptor_address` names, read with supervisor privilege (80386 PRM
+/// §6.5 p. 6-22; SDM Vol 3A §5.6.1). None if no descriptor is read (a null
+/// selector, a V86 paragraph, or a selector beyond its table: #GP first).
+fn descriptor_window(
+    cpu: &CpuState,
+    memory: &Memory,
+    tlb: &Tlb,
+    selector: u16,
+    context: MachineContext,
+) -> Result<Option<Window>, ()> {
+    if context.regime == legacy::MachineRegime::Virtual8086 || selector & !3 == 0 {
+        return Ok(None);
+    }
+    let Some(address) = super::descriptor_address(cpu, selector, context.generation) else {
+        return Ok(None);
+    };
+    fast_window(
+        cpu,
+        memory,
+        tlb,
+        u64::from(address),
+        8,
+        AccessKind::Read,
+        Privilege::Supervisor,
+    )
+    .map(Some)
+    .ok_or(())
+}
+
+/// A far CALL or JMP with an immediate pointer, or a far RET, that stays at
+/// the current privilege level: prove its descriptor and its stack frame as
+/// RAM windows from existing TLB entries. A gate, TSS or outward return, an
+/// unproved access or a wrapping frame keeps the transaction path.
+fn fast_far(
+    ops: &[IrOp],
+    cpu: &CpuState,
+    memory: &Memory,
+    tlb: &Tlb,
+    context: MachineContext,
+) -> Option<FastOperand> {
+    let mut far = None;
+    for op in ops {
+        match op {
+            IrOp::InsnStart { .. } | IrOp::Legacy(L::Checkpoint | L::I486Gate) => {}
+            IrOp::Legacy(
+                op @ (L::Transfer {
+                    cs: Some(Val::Imm(_)),
+                    ip: Val::Imm(_),
+                    ..
+                }
+                | L::Return { far: true, .. }),
+            ) if far.is_none() => far = Some(op),
+            _ => return None,
+        }
+    }
+    let v86 = context.regime == legacy::MachineRegime::Virtual8086;
+    let user = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let sp = cpu.gpr[RSP] & mask(context.stack_address_bits / 8);
+    let stack = |offset: u64, bytes: u8, access: AccessKind| {
+        let linear = if v86 {
+            legacy::virtual8086_access(cpu, SegmentId::Ss, offset, bytes, access)
+        } else {
+            legacy::access(
+                cpu,
+                context.generation,
+                SegmentId::Ss,
+                offset,
+                bytes,
+                access,
+            )
+        }
+        .ok()?;
+        fast_window(cpu, memory, tlb, linear, bytes, access, user)
+    };
+    // A code-segment descriptor: no call gate, TSS or task gate (SDM Vol 3A
+    // §6.8 p. 6-10 lists the four targets of a far CALL or JMP).
+    let code = |window: Option<Window>| {
+        window.is_none_or(|w| {
+            memory
+                .read(w.bus + 5, 1)
+                .is_ok_and(|attributes| attributes & 0x18 == 0x18)
+        })
+    };
+    let (stack, descriptor) = match far? {
+        L::Transfer {
+            cs: Some(Val::Imm(cs)),
+            size,
+            return_ip,
+            ..
+        } => {
+            let frame = 2 * *size;
+            let stack = if return_ip.is_some() {
+                // The pushed CS and IP slots do not wrap the stack pointer.
+                Some(stack(
+                    sp.checked_sub(u64::from(frame))?,
+                    frame,
+                    AccessKind::Write,
+                )?)
+            } else {
+                None
+            };
+            (
+                stack,
+                descriptor_window(cpu, memory, tlb, *cs as u16, context).ok()?,
+            )
+        }
+        L::Return { size, .. } => {
+            let frame = 2 * *size;
+            let stack = stack(sp, frame, AccessKind::Read)?;
+            let cs = memory.read(stack.bus + u64::from(*size), 2).ok()? as u16;
+            // An outward return loads SS:SP too (`privilege::outward`).
+            if !v86 && (cs & 3) as u8 != cpu.legacy.cpl {
+                return None;
+            }
+            (
+                Some(stack),
+                descriptor_window(cpu, memory, tlb, cs, context).ok()?,
+            )
+        }
+        _ => unreachable!(),
+    };
+    if !code(descriptor) {
+        return None;
+    }
+    Some(FastOperand {
+        windows: [stack, descriptor],
+        strict: true,
+    })
+}
+
+/// Paged far transfers at the current privilege level, without the operand
+/// transaction when `fast_far` proves every access (spec.md §17.10). Faults
+/// are those of the same helper and order; an access outside the windows
+/// restores the instruction's inputs and returns None for the transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_far_fast<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Option<Result<Outcome, Exit>> {
+    if retry.is_some()
+        || task_switch.context().is_some()
+        || memory.host_fault_recovery()
+        || cpu.mmio_retry_active
+        || (cpu.legacy.cpl == 3
+            && cpu.legacy.cr0 & (1 << 18) != 0
+            && cpu.rflags_system & (1 << 18) != 0)
+    {
+        return None;
+    }
+    let windows = fast_far(&ir.ops, cpu, memory, &tlb.borrow(), context)?;
+    let mut temps = [0u64; 16];
+    let temps = temps.get_mut(..ir.temp_count as usize)?;
+    let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    mem.paging.tlb = Some(tlb);
+    mem.paging.fast_operand = Some(windows);
+    let view = InstructionView {
+        guest_start: ir.guest_start,
+        guest_len: ir.guest_len,
+        ops: &ir.ops,
+    };
+    strict_lane(cpu, &mem, task_switch, |cpu, task_switch| {
+        execute_instruction::<ROUTED, ORDER, true, V86>(
+            ir,
+            &view,
+            cpu,
+            &mem,
+            temps,
+            context,
+            task_switch,
+        )
+    })
+}
+
+/// A strict (system) lane inside an ordinary walk, or its transaction replay.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn strict_instruction<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    view: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    mem: &mut LegacyAccess<'_, ROUTED, ORDER, true>,
+    temps: &mut [u64],
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+) -> Result<Outcome, Exit> {
+    let lane = strict_lane(cpu, mem, task_switch, |cpu, task_switch| {
+        execute_instruction::<ROUTED, ORDER, true, V86>(
+            ir,
+            view,
+            cpu,
+            mem,
+            temps,
+            context,
+            task_switch,
+        )
+    });
+    if let Some(result) = lane {
+        return result;
+    }
+    mem.paging.fast_operand = None;
+    execute_with_retry::<ROUTED, ORDER, true, V86>(
+        ir,
+        view,
+        cpu,
+        mem,
+        temps,
+        context,
+        task_switch,
+        retry,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// Run a strict lane; after an access outside its windows restore the inputs
+/// it may have changed and return None. No lane writes a window before its
+/// last possible miss: every read and probe precedes the frame stores.
+fn strict_lane<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, true>,
+    task_switch: &mut tasks::SwitchState,
+    run: impl FnOnce(&mut CpuState, &mut tasks::SwitchState) -> Result<Outcome, Exit>,
+) -> Option<Result<Outcome, Exit>> {
+    let saved = (
+        cpu.gpr,
+        cpu.flags,
+        cpu.rflags_system,
+        cpu.legacy,
+        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        cpu.rip,
+    );
+    let saved_tasks = task_switch.clone();
+    mem.paging.fast_missed.set(false);
+    let result = run(cpu, task_switch);
+    if !mem.paging.fast_missed.get() {
+        return Some(result);
+    }
+    (
+        cpu.gpr,
+        cpu.flags,
+        cpu.rflags_system,
+        cpu.legacy,
+        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        cpu.rip,
+    ) = saved;
+    *task_switch = saved_tasks;
+    cpu.clear_mmio_parts();
+    None
 }
 
 /// Prove the entire instruction before transferring RAM. Address preparation
@@ -2256,6 +2623,7 @@ fn fast_instruction(
     memory: &Memory,
     tlb: &Tlb,
     temps: &mut [u64],
+    context: MachineContext,
 ) -> Option<FastOperand> {
     if memory.host_fault_recovery() || cpu.mmio_retry_active {
         return None;
@@ -2265,10 +2633,17 @@ fn fast_instruction(
     for op in ops {
         if operand.is_some() {
             // A near RET checks its target immediately after loading a 16/32-bit
-            // offset. Flat32 CS admits every such offset (decision-27).
+            // offset. Flat32 CS admits every such offset (decision-27). A Seg16
+            // or V86 target check still runs, and can fault, in the execution: it
+            // follows only the load, so a fault leaves RAM and registers as
+            // they were (SDM Vol 2B RET, Protected Mode Exceptions).
             if loaded_target.take().is_some_and(|target| {
                 matches!(op,
                     IrOp::Legacy(L::Flat32Address { segment: SegmentId::Cs,
+                        offset, bytes: 1, access: AccessKind::Execute, .. }
+                    | L::Seg16Address { segment: SegmentId::Cs,
+                        offset, bytes: 1, access: AccessKind::Execute, .. }
+                    | L::Address { segment: SegmentId::Cs,
                         offset, bytes: 1, access: AccessKind::Execute, .. }) if *offset == target
                 )
             }) {
@@ -2339,6 +2714,23 @@ fn fast_instruction(
                     flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access)
                         .ok()?;
             }
+            // The live Checked access: Flat32 FS/GS, Seg16 operands after an
+            // in-block reload of their segment, and V86 (`execute_op`).
+            IrOp::Legacy(L::Address {
+                dst,
+                segment,
+                offset,
+                bytes,
+                access,
+            }) => {
+                let offset = read_val(*offset, temps);
+                temps[*dst as usize] = if context.regime == legacy::MachineRegime::Virtual8086 {
+                    legacy::virtual8086_access(cpu, *segment, offset, *bytes, *access)
+                } else {
+                    legacy::access(cpu, context.generation, *segment, offset, *bytes, *access)
+                }
+                .ok()?;
+            }
             IrOp::Load {
                 dst, addr, size, ..
             } => {
@@ -2371,6 +2763,20 @@ fn fast_instruction(
                     *size,
                     AccessKind::Read,
                 )?);
+            }
+            // MOV Sreg from a register: the selector is known before the
+            // load, so its descriptor is proved here (`descriptor_window`).
+            IrOp::Legacy(op @ L::LoadSegment { value, .. })
+                if super::data_segment_load(op).is_some() =>
+            {
+                let selector = read_val(*value, temps) as u16;
+                operand = Some(FastOperand {
+                    windows: [
+                        descriptor_window(cpu, memory, tlb, selector, context).ok()?,
+                        None,
+                    ],
+                    strict: true,
+                });
             }
             IrOp::Legacy(L::Enter {
                 size,
@@ -2415,6 +2821,49 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     retry: &mut Option<Transaction>,
     tlb: &std::cell::RefCell<Tlb>,
 ) -> Progress {
+    if ir
+        .legacy_context
+        .is_some_and(|c| c.regime == legacy::MachineRegime::Virtual8086)
+    {
+        return execute_ordinary::<ROUTED, ORDER, true>(
+            ir,
+            cpu,
+            memory,
+            scratch,
+            limit,
+            exit_word,
+            task_switch,
+            retry,
+            tlb,
+        );
+    }
+    execute_ordinary::<ROUTED, ORDER, false>(
+        ir,
+        cpu,
+        memory,
+        scratch,
+        limit,
+        exit_word,
+        task_switch,
+        retry,
+        tlb,
+    )
+}
+
+/// The ordinary paged walk of Flat32, Seg16 and V86 blocks.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Progress {
     let context = ir.legacy_context.expect("protected block context");
     let temps = scratch.reused(ir.temp_count as usize);
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
@@ -2424,6 +2873,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     let mut start = 0;
     let mut steps = 0;
     let mut retired = 0;
+    let mut reloaded = false;
     let outcome = loop {
         let end = ir.ops[start + 1..]
             .iter()
@@ -2449,10 +2899,22 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
                 && cpu.rflags_system & (1 << 18) != 0);
         let registers_only = once && register_effects(view.ops);
         if once && !registers_only {
-            mem.paging.fast_operand = fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps);
+            mem.paging.fast_operand =
+                fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps, context);
         }
-        let result = if mem.paging.fast_operand.is_some() {
-            execute_instruction::<ROUTED, ORDER, true, false>(
+        let result = if mem.paging.fast_operand.is_some_and(|o| o.strict) {
+            strict_instruction::<ROUTED, ORDER, V86>(
+                ir,
+                &view,
+                cpu,
+                &mut mem,
+                temps,
+                context,
+                task_switch,
+                retry,
+            )
+        } else if mem.paging.fast_operand.is_some() {
+            execute_instruction::<ROUTED, ORDER, true, V86>(
                 ir,
                 &view,
                 cpu,
@@ -2462,7 +2924,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
                 task_switch,
             )
         } else if registers_only {
-            execute_instruction::<ROUTED, ORDER, false, false>(
+            execute_instruction::<ROUTED, ORDER, false, V86>(
                 ir,
                 &view,
                 cpu,
@@ -2472,7 +2934,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
                 task_switch,
             )
         } else {
-            execute_with_retry::<ROUTED, ORDER, true, false>(
+            execute_with_retry::<ROUTED, ORDER, true, V86>(
                 ir,
                 &view,
                 cpu,
@@ -2489,7 +2951,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
         };
         match result {
             Err(exit) => break Err(exit),
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 steps += 1;
                 retired += u64::from(outcome.retired);
                 if cpu.mmio_retry_active {
@@ -2498,7 +2960,6 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
                 if end == ir.ops.len()
                     || steps == limit
                     || outcome.exit.is_some()
-                    || outcome.context_changed
                     || outcome.translations_invalidated
                     || outcome.arm_sti
                     || outcome.arm_ss != 0
@@ -2506,7 +2967,16 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
                     || memory.has_dirty_code()
                     || tlb.borrow().generation != token
                 {
+                    outcome.context_changed |= reloaded;
                     break Ok(outcome);
+                }
+                // An in-block data-segment load continues the block; the
+                // dispatcher reselects once where it ends (spec.md §17.10).
+                if outcome.context_changed {
+                    if !super::reload_continues(view.ops, context, cpu) {
+                        break Ok(outcome);
+                    }
+                    reloaded = true;
                 }
             }
         }
@@ -2524,6 +2994,43 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_strict_lane_miss_restores_the_instruction_inputs() {
+        // A system lane stops at an access outside its proved windows and
+        // replays on the transaction path from the original inputs.
+        let vm = crate::Vm::new(crate::VmConfig::flat(0x1000));
+        let mut cpu = vm.new_vcpu().cpu;
+        cpu.rip = 0x10;
+        let before = cpu.clone();
+        let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
+        mem.paging.fast_operand = Some(FastOperand {
+            windows: [None, None],
+            strict: true,
+        });
+        let mut tasks = tasks::SwitchState::default();
+        let result = strict_lane(&mut cpu, &mem, &mut tasks, |cpu, _| {
+            cpu.gpr[0] = 7;
+            cpu.ds = 0x20;
+            cpu.legacy.segments[1].base = 0x1234;
+            cpu.record_mmio_part(cpu.rip, 1, 2);
+            cpu.rip = 0x20;
+            read(cpu, &mem, 0x100, 2, AccessKind::Read).map(|_| Outcome::default())
+        });
+        assert!(result.is_none());
+        assert_eq!(
+            (cpu.gpr, cpu.ds, cpu.legacy, cpu.rip),
+            (before.gpr, before.ds, before.legacy, before.rip)
+        );
+        assert!(!cpu.mmio_retry_active && cpu.mmio_parts_len == 0);
+        // A lane without a miss keeps its result.
+        let result = strict_lane(&mut cpu, &mem, &mut tasks, |cpu, _| {
+            cpu.gpr[0] = 7;
+            Ok(Outcome::default())
+        });
+        assert!(result.is_some_and(|r| r.is_ok()));
+        assert_eq!(cpu.gpr[0], 7);
+    }
 
     #[test]
     fn fast_data_requires_dirty_permitted_ram_hits_and_preserves_cached_ad() {

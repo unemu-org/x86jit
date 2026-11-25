@@ -91,8 +91,10 @@ impl State {
                 .get(&key)
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
+                probe!(PROOFS);
                 return Ok((proof.ir.clone(), proof.walk));
             }
+            probe!(LIFTS);
             let source = crate::memory::LiftSource::new(&vm.mem);
             let permit = vm.mem.fetch_permit();
             let ir = lift(vm, cpu, context, &source)?;
@@ -173,6 +175,7 @@ fn lift(
     // retains incremental fetch and has its complete physical source span.
     let linear = cpu.legacy.segments[0].base.wrapping_add(ip as u32);
     let page_end = ip + (4096 - u64::from(linear & 4095));
+    let mut reloaded = 0;
     loop {
         // Do not speculatively fetch a successor across this page. A first
         // instruction may straddle and is fetched incrementally as Checked.
@@ -192,7 +195,7 @@ fn lift(
             Ok(ir) => ir,
             Err(error) => return block.ok_or_else(|| direct_refusal(cpu, error)),
         };
-        specialize_segments(&mut instruction, cpu);
+        let loads = specialize_segments(&mut instruction, cpu, reloaded);
         let ordinary = crate::interp::legacy::flat32_ordinary(&instruction);
         if !ordinary || ip + u64::from(instruction.guest_len) > page_end {
             if let Some(block) = block.take() {
@@ -207,6 +210,7 @@ fn lift(
         );
         let insn = decoder.decode();
         ip += u64::from(instruction.guest_len);
+        reloaded = loads;
         if let Some(block) = &mut block {
             block.guest_len += instruction.guest_len;
             block.icount += 1;
@@ -226,14 +230,23 @@ fn lift(
     }
 }
 
-/// Only scalar address IR is specialized. Context-changing helpers remain
-/// singleton Checked instructions and cannot execute under an old cache proof.
-pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState) {
+/// Only scalar address IR is specialized. Context-changing helpers other
+/// than data-segment loads remain singleton Checked instructions. `reloaded`
+/// holds the segments an earlier instruction of the same block loads: their
+/// later operands keep the live Checked access, which reads the cache that
+/// load installed, never the entry stamp's proof (spec.md §17.10).
+/// Returns `reloaded` extended by this instruction's own loads.
+pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState, reloaded: u8) -> u8 {
+    let loads = ir.ops.iter().fold(reloaded, |mask, op| match op {
+        IrOp::Legacy(op) => crate::interp::legacy::data_segment_load(op)
+            .map_or(mask, |segment| mask | (1 << segment as u8)),
+        _ => mask,
+    });
     if ir
         .legacy_context
         .is_none_or(|c| c.segment_class != crate::SegmentClass::Seg16)
     {
-        return;
+        return loads;
     }
     for op in &mut ir.ops {
         if let IrOp::Legacy(crate::legacy::LegacyOp::Address {
@@ -244,6 +257,9 @@ pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState) {
             access,
         }) = *op
         {
+            if reloaded & (1 << segment as u8) != 0 {
+                continue;
+            }
             *op = IrOp::Legacy(crate::legacy::LegacyOp::Seg16Address {
                 dst,
                 segment,
@@ -257,6 +273,7 @@ pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState) {
             });
         }
     }
+    loads
 }
 
 #[cfg(test)]

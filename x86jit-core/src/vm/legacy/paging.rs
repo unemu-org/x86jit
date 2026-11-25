@@ -14,6 +14,9 @@ const MAX_CONTEXTS: usize = 64;
 #[derive(PartialEq, Eq, Hash)]
 struct Key {
     segment_class: crate::SegmentClass,
+    // The singleton reference entry (`interpret_*_for_test`) never shares
+    // an ordinary multi-instruction block.
+    ordinary: bool,
     decode: LegacyBlockKey,
     generation: u64,
     cr3: u32,
@@ -22,6 +25,8 @@ struct Key {
 
 struct Proof {
     ir: Arc<IrBlock>,
+    // Computed once at lift: whether the block takes the ordinary walk.
+    ordinary: bool,
     permit: Option<crate::FetchPermit>,
     // Ordered post-A20 bus spans, never a linear length applied to one frame.
     _registration: crate::memory::CodeRegistration,
@@ -44,6 +49,8 @@ pub(super) struct State {
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
     transaction: Option<crate::interp::legacy::paging::Transaction>,
     pub(super) event_transaction: Option<crate::interp::legacy::paging::Transaction>,
+    // Most recent first; every entry is a member of `contexts`.
+    recent: Box<[Option<(LegacyContextStamp, u64)>; 4]>,
 }
 
 impl State {
@@ -60,6 +67,7 @@ impl State {
         self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
         self.contexts.clear();
+        *self.recent = [None; 4];
     }
 
     pub(super) fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
@@ -84,17 +92,30 @@ impl State {
             self.source_generation = source_generation;
         }
         if self.stamp != Some(stamp) {
-            self.context_id = if let Some(id) = self.contexts.get(&stamp) {
-                *id
+            self.context_id = if let Some(slot) = self
+                .recent
+                .iter()
+                .position(|r| r.as_ref().is_some_and(|(s, _)| *s == stamp))
+            {
+                self.recent[..=slot].rotate_right(1);
+                self.recent[0].unwrap().1
             } else {
-                // Bound context identities as well as blocks. Clear both before
-                // reusing an ID; this does not expire cached translations.
-                if self.contexts.len() == MAX_CONTEXTS {
-                    self.blocks.clear();
-                    self.contexts.clear();
-                }
-                let id = self.contexts.len() as u64;
-                self.contexts.insert(stamp, id);
+                let id = if let Some(id) = self.contexts.get(&stamp) {
+                    *id
+                } else {
+                    // Bound context identities as well as blocks. Clear both before
+                    // reusing an ID; this does not expire cached translations.
+                    if self.contexts.len() == MAX_CONTEXTS {
+                        self.blocks.clear();
+                        self.contexts.clear();
+                        *self.recent = [None; 4];
+                    }
+                    let id = self.contexts.len() as u64;
+                    self.contexts.insert(stamp, id);
+                    id
+                };
+                self.recent.rotate_right(1);
+                self.recent[0] = Some((stamp, id));
                 id
             };
             self.stamp = Some(stamp);
@@ -117,6 +138,7 @@ impl State {
         model: LegacyCpuModel,
         context: MachineContext,
         owner_id: u64,
+        ordinary: bool,
     ) -> Result<Key, Exit> {
         let linear_fetch = crate::legacy::access(
             cpu,
@@ -128,6 +150,7 @@ impl State {
         )? as u32;
         Ok(Key {
             segment_class: context.segment_class,
+            ordinary,
             decode: LegacyBlockKey {
                 owner_id,
                 context_id: self.context_id,
@@ -147,6 +170,7 @@ impl State {
 
     #[cold]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         &mut self,
         vm: &Vm,
@@ -155,37 +179,40 @@ impl State {
         context: MachineContext,
         owner_id: u64,
         exit_word: &AtomicU64,
-    ) -> Result<Arc<IrBlock>, Exit> {
+        ordinary: bool,
+    ) -> Result<(Arc<IrBlock>, bool), Exit> {
         let walk_wrote = Cell::new(false);
         loop {
             vm.handle_smc(exit_word);
             self.reconcile(vm, cpu, model);
-            let key = self.key(cpu, model, context, owner_id)?;
+            let key = self.key(cpu, model, context, owner_id, ordinary)?;
             if let Some(proof) = self
                 .blocks
                 .get(&key)
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
-                return Ok(proof.ir.clone());
+                probe!(PROOFS);
+                return Ok((proof.ir.clone(), proof.ordinary));
             }
+            probe!(LIFTS);
             let source = crate::memory::LiftSource::new(&vm.mem);
             let generation = vm.cache.publication_generation();
             let permit = vm.mem.fetch_permit();
-            let (ir, sources) =
-                lift(vm, cpu, context, &source, &walk_wrote, &self.tlb).map_err(|mut exit| {
-                    if walk_wrote.get() {
-                        if let Exit::UnmappedMemory {
-                            metadata: Some(m), ..
-                        }
-                        | Exit::Exception {
-                            metadata: Some(m), ..
-                        } = &mut exit
-                        {
-                            m.progress.ram = crate::fault::MemoryEffects::PossiblyPartial;
-                        }
+            let (ir, sources) = lift(vm, cpu, context, &source, &walk_wrote, &self.tlb, ordinary)
+                .map_err(|mut exit| {
+                if walk_wrote.get() {
+                    if let Exit::UnmappedMemory {
+                        metadata: Some(m), ..
                     }
-                    exit
-                })?;
+                    | Exit::Exception {
+                        metadata: Some(m), ..
+                    } = &mut exit
+                    {
+                        m.progress.ram = crate::fault::MemoryEffects::PossiblyPartial;
+                    }
+                }
+                exit
+            })?;
             if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
                 continue;
             }
@@ -201,14 +228,17 @@ impl State {
                 continue;
             }
             self.reconcile_generation();
-            let key = self.key(cpu, model, context, owner_id)?;
+            let key = self.key(cpu, model, context, owner_id, ordinary)?;
             self.lifts += 1;
             let ir = Arc::new(ir);
             if !source.publishable() {
                 // The interpreter may use this snapshot once, without a proof.
                 self.blocks.remove(&key);
-                return Ok(retry_instruction(&ir, cpu.rip));
+                let ir = retry_instruction(&ir, cpu.rip);
+                let ordinary = ordinary && ordinary_block(context, &ir);
+                return Ok((ir, ordinary));
             }
+            let ordinary = ordinary && ordinary_block(context, &ir);
             let mut registration = None;
             if !vm.cache.register_private_sources(generation, || {
                 registration = Some(vm.mem.register_code_sources(&sources));
@@ -223,13 +253,29 @@ impl State {
                 key,
                 Proof {
                     ir: ir.clone(),
+                    ordinary,
                     permit,
                     _registration: registration.unwrap(),
                 },
             );
-            return Ok(ir);
+            return Ok((ir, ordinary));
         }
     }
+}
+
+/// Whether a paged block takes the ordinary Flat32, Seg16 or V86 walk.
+fn ordinary_block(context: MachineContext, ir: &IrBlock) -> bool {
+    ordinary_context(context) && crate::interp::legacy::flat32_ordinary(ir)
+}
+
+/// Paged contexts whose ordinary instructions share blocks. V86 addresses
+/// are live paragraph arithmetic (`legacy::virtual8086_access`), so it needs
+/// no segment proof; its sensitive instructions stay singletons.
+fn ordinary_context(context: MachineContext) -> bool {
+    matches!(
+        context.segment_class,
+        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+    ) || context.regime == MachineRegime::Virtual8086
 }
 
 // Decision-27 order 2: use the singleton fetch boundary for every required
@@ -241,12 +287,14 @@ fn lift(
     source: &crate::memory::LiftSource<'_>,
     walk_wrote: &Cell<bool>,
     tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
+    blocks: bool,
 ) -> Result<(IrBlock, Vec<(u64, u32)>), Exit> {
     let mut cursor = cpu.clone();
     let linear = cpu.legacy.segments[0].base.wrapping_add(cpu.rip as u32);
     let page_end = cpu.rip + (4096 - u64::from(linear & 4095));
     let mut block: Option<IrBlock> = None;
     let mut sources = Vec::new();
+    let mut reloaded = 0;
     loop {
         if cursor.rip + 15 > page_end {
             if let Some(block) = block.take() {
@@ -271,11 +319,10 @@ fn lift(
                     .ok_or_else(|| direct_refusal(&cursor, error))
             }
         };
-        super::flat32::specialize_segments(&mut instruction, cpu);
-        let ordinary = matches!(
-            context.segment_class,
-            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
-        ) && crate::interp::legacy::flat32_ordinary(&instruction);
+        let loads = super::flat32::specialize_segments(&mut instruction, cpu, reloaded);
+        let ordinary = blocks
+            && ordinary_context(context)
+            && crate::interp::legacy::flat32_ordinary(&instruction);
         if !ordinary {
             if let Some(block) = block.take() {
                 return Ok((block, sources));
@@ -290,6 +337,7 @@ fn lift(
         );
         let insn = decoder.decode();
         cursor.rip += u64::from(instruction.guest_len);
+        reloaded = loads;
         if let Some(block) = &mut block {
             block.guest_len += instruction.guest_len;
             block.icount += 1;
@@ -520,10 +568,20 @@ impl Vcpu {
                 context,
                 execution.owner_id,
                 &self.exit_request.word,
+                true,
             )
             // Paging always uses a protected or V86 context. Reuse the
             // dispatcher's system-walk gate before selecting paged execution.
-            .map(|ir| (ir, crate::interp::legacy::BlockWalk::Protected))
+            .map(|(ir, ordinary)| {
+                (
+                    ir,
+                    if ordinary {
+                        crate::interp::legacy::BlockWalk::Paged
+                    } else {
+                        crate::interp::legacy::BlockWalk::Protected
+                    },
+                )
+            })
             .inspect_err(|exit| publish_cr2(&mut self.cpu, exit))
     }
 
@@ -535,13 +593,11 @@ impl Vcpu {
         ir: &Arc<IrBlock>,
         context: MachineContext,
         limit: u64,
+        ordinary: bool,
     ) -> crate::interp::legacy::Progress {
         let execution = self.legacy_execution.as_mut().unwrap();
-        if matches!(
-            context.segment_class,
-            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
-        ) && crate::interp::legacy::flat32_ordinary(ir)
-        {
+        // A retained retry slice arrives as Protected; classify it here.
+        if ordinary || ordinary_block(context, ir) {
             execution.rep_flags = None;
             let state = execution.paging.get_or_insert_with(Default::default);
             return crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
@@ -586,7 +642,38 @@ impl Vcpu {
             execution.rep_flags = None;
         }
         let state = execution.paging.get_or_insert_with(Default::default);
-        let result = if context.regime == MachineRegime::Virtual8086 {
+        let v86 = context.regime == MachineRegime::Virtual8086;
+        // Same-level far transfers of the ordinary classes skip the operand
+        // transaction when their descriptor and frame are proved RAM.
+        let fast = if v86 {
+            crate::interp::legacy::paging::execute_far_fast::<ROUTED, ORDER, true>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+                &state.transaction,
+                &state.tlb,
+            )
+        } else if matches!(
+            context.segment_class,
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+        ) {
+            crate::interp::legacy::paging::execute_far_fast::<ROUTED, ORDER, false>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                context,
+                &mut execution.task_switch,
+                &state.transaction,
+                &state.tlb,
+            )
+        } else {
+            None
+        };
+        let result = if let Some(result) = fast {
+            result.map(|outcome| (outcome, None))
+        } else if v86 {
             crate::interp::legacy::paging::execute_retained::<ROUTED, ORDER, true>(
                 ir,
                 &mut self.cpu,
@@ -748,9 +835,10 @@ impl Vcpu {
             context,
             execution.owner_id,
             &self.exit_request.word,
+            false,
         );
         let ir = match result {
-            Ok(ir) => ir,
+            Ok((ir, _)) => ir,
             Err(exit) => {
                 publish_cr2(&mut self.cpu, &exit);
                 if let Some(saved) = execution.rep_flags.take() {
@@ -1187,12 +1275,22 @@ mod tests {
                 .unwrap();
             (state.generation, state.lifts, state.blocks.len())
         };
-        let warm = snapshot(&cpu);
-        assert_eq!((warm.1, warm.2), (201, 201));
-        for _ in 0..201 {
+        // Ordinary V86 blocks start wherever a 64-step slice begins: after
+        // one pass over every start (64 is prime to 201) the working set,
+        // at most one block per instruction, stays retained.
+        let slice = |cpu: &mut Vcpu| {
             cpu.disable_delivery_log();
             cpu.set_a20_enabled(true);
             assert_eq!(cpu.run_steps(&vm, 64, options).unwrap().steps(), 64);
+        };
+        for _ in 0..201 {
+            slice(&mut cpu);
+        }
+        let warm = snapshot(&cpu);
+        assert_eq!(warm.1, warm.2 as u64);
+        assert!(warm.2 <= 201, "{warm:?}");
+        for _ in 0..201 {
+            slice(&mut cpu);
             assert_eq!(snapshot(&cpu), warm);
         }
         assert_eq!(cpu.cpu.rip, 0);
@@ -1226,8 +1324,17 @@ mod tests {
                 vm.write_bytes(0x4001, b"\x90").unwrap();
             });
             let a = state
-                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
-                .unwrap();
+                .resolve(
+                    &vm,
+                    &mut cpu.cpu,
+                    model.legacy_model(),
+                    context,
+                    1,
+                    &exit,
+                    true,
+                )
+                .unwrap()
+                .0;
             assert_eq!(a.icount, 4);
             assert!(!a.ops.iter().any(|op| matches!(
                 op,
@@ -1244,8 +1351,17 @@ mod tests {
             // retained translation. Clearing it also witnesses no warm walk.
             vm.write_bytes(0x3004, &0x4007u32.to_le_bytes()).unwrap();
             let b = state
-                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
-                .unwrap();
+                .resolve(
+                    &vm,
+                    &mut cpu.cpu,
+                    model.legacy_model(),
+                    context,
+                    1,
+                    &exit,
+                    true,
+                )
+                .unwrap()
+                .0;
             assert!(Arc::ptr_eq(&a, &b));
             assert_eq!(state.generation, token);
             assert_eq!(state.lifts, lifts);
@@ -1258,8 +1374,17 @@ mod tests {
             assert_eq!(u32::from_le_bytes(pte), 0x4007);
             vm.write_bytes(0x4001, b"\x43").unwrap();
             let c = state
-                .resolve(&vm, &mut cpu.cpu, model.legacy_model(), context, 1, &exit)
-                .unwrap();
+                .resolve(
+                    &vm,
+                    &mut cpu.cpu,
+                    model.legacy_model(),
+                    context,
+                    1,
+                    &exit,
+                    true,
+                )
+                .unwrap()
+                .0;
             assert!(!Arc::ptr_eq(&a, &c));
         }
     }
