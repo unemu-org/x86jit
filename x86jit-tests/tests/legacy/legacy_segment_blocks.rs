@@ -1,4 +1,4 @@
-//! Data-segment loads inside Seg16, Flat32 and V86 blocks, and same-level
+//! Data-segment loads inside Segmented, Flat32 and V86 blocks, and same-level
 //! far transfers on the paged lanes, against the Checked reference
 //! (spec.md §17.10, xj-to9.18).
 #[path = "../support/descriptor_fixture.rs"]
@@ -26,7 +26,7 @@ fn exit(run: &x86jit_core::StepRun) -> &Exit {
     exit
 }
 
-/// Seg16 at `cpl`: CS 08h (base 1000h), DS 10h (A000h, limit FFh), SS 18h,
+/// Segmented at `cpl`: CS 08h (base 1000h), DS 10h (A000h, limit FFh), SS 18h,
 /// with the extra descriptors the witnesses load. `checked` clears an unused
 /// GS cache's P bit, which keeps the same program on the Checked class.
 fn seg16(model: CpuModel, code: &[u8], cpl: u8, paged: bool, checked: bool) -> (Vm, Vcpu) {
@@ -106,7 +106,7 @@ fn seg16_delivery(
         if checked {
             SegmentClass::Checked
         } else {
-            SegmentClass::Seg16
+            SegmentClass::Segmented
         }
     );
     (vm, cpu)
@@ -367,8 +367,10 @@ fn flat32(model: CpuModel, code: &[u8], paged: bool, checked: bool) -> (Vm, Vcpu
         }
     }
     if checked {
-        // ES:FFFFFFFF is never reached; this cache cannot prove Flat32.
+        // ES:FFFFFFFF is never reached; this cache cannot prove Flat32. The
+        // unused GS cache, not present, keeps the state off Segmented too.
         cpu.cpu.legacy.segments[2].limit -= 1;
+        cpu.cpu.legacy.segments[5].attributes &= !0x80;
     }
     cpu.set_a20_enabled(true);
     assert_eq!(
@@ -408,8 +410,10 @@ fn flat32_in_block_loads_keep_the_block_only_while_flat() {
                     let what = format!("{model:?} PG={paged} DS={selector:#x} budget={budget}");
                     assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what}");
                     b.cpu.legacy.segments[2].limit += 1;
+                    b.cpu.legacy.segments[5].attributes |= 0x80;
                     assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu), "{what}");
                     b.cpu.legacy.segments[2].limit -= 1;
+                    b.cpu.legacy.segments[5].attributes &= !0x80;
                     assert_eq!(a.retired_instructions(), b.retired_instructions());
                     let mut am = vec![0; 0x240000];
                     let mut bm = vec![0; 0x240000];
@@ -422,7 +426,7 @@ fn flat32_in_block_loads_keep_the_block_only_while_flat() {
                             if selector == 0x10 {
                                 SegmentClass::Flat32
                             } else {
-                                SegmentClass::Checked
+                                SegmentClass::Segmented
                             },
                             "{what}"
                         );

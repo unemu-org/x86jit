@@ -1,4 +1,4 @@
-//! Interpreted unpaged Flat32 and Seg16 blocks (decision-27; spec.md §17.10).
+//! Interpreted unpaged Flat32 and Segmented blocks (decision-27; spec.md §17.10).
 use super::*;
 
 impl Execution {
@@ -244,7 +244,7 @@ pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState, reloaded: u8
     });
     if ir
         .legacy_context
-        .is_none_or(|c| c.segment_class != crate::SegmentClass::Seg16)
+        .is_none_or(|c| c.segment_class != crate::SegmentClass::Segmented)
     {
         return loads;
     }
@@ -260,7 +260,7 @@ pub(super) fn specialize_segments(ir: &mut IrBlock, cpu: &CpuState, reloaded: u8
             if reloaded & (1 << segment as u8) != 0 {
                 continue;
             }
-            *op = IrOp::Legacy(crate::legacy::LegacyOp::Seg16Address {
+            *op = IrOp::Legacy(crate::legacy::LegacyOp::SegmentedAddress {
                 dst,
                 segment,
                 offset,
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn flat32_proof_publishes_and_reuses_multi_instruction_ir() {
         for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
-            for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Seg16] {
+            for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
                 let mut vm = Vm::new(crate::VmConfig::flat(0x4000));
                 vm.set_cpu_model(model);
                 vm.map(0, 0x4000, crate::Prot::RWX, crate::RegionKind::Ram)

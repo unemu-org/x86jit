@@ -36,7 +36,11 @@ fn setup_delivery(
     if checked {
         // These programs never reach ES:FFFFFFFF. All their accesses have
         // identical rights/addresses, while this cache cannot prove Flat32.
+        // A non-present hidden GS cache also keeps the state off Segmented:
+        // P is checked on a descriptor load, not on an access (SDM Vol 3A
+        // §3.4.5).
         cpu.cpu.legacy.segments[2].limit -= 1;
+        cpu.cpu.legacy.segments[5].attributes &= !0x80;
     }
     cpu.set_a20_enabled(true);
     (vm, cpu)
@@ -48,6 +52,7 @@ fn class(cpu: &Vcpu, _model: CpuModel) -> SegmentClass {
 }
 fn same(a: &Vcpu, b: &mut Vcpu, avm: &Vm, bvm: &Vm) {
     b.cpu.legacy.segments[2].limit = a.cpu.legacy.segments[2].limit;
+    b.cpu.legacy.segments[5].attributes = a.cpu.legacy.segments[5].attributes;
     assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu));
     assert_eq!(a.retired_instructions(), b.retired_instructions());
     let mut am = vec![0; 0x10000];
@@ -180,7 +185,7 @@ fn smc_stops_before_a_modified_successor_and_embedder_edits_reselect() {
         same(&a, &mut b, &avm, &bvm);
         a.cpu.rip = 0x1000;
         a.cpu.legacy.segments[1].base = 0x100;
-        assert_eq!(class(&a, model), SegmentClass::Checked);
+        assert_eq!(class(&a, model), SegmentClass::Segmented);
         avm.write_bytes(0x1000, b"\xa1\x00\x60\x00\x00\xf4")
             .unwrap();
         avm.write_bytes(0x6100, &42u32.to_le_bytes()).unwrap();
@@ -228,7 +233,7 @@ fn segment_load_cr0_and_interrupt_delivery_end_the_proof() {
             descriptor(&vm, 0x2018, 0x100, u32::MAX, 0xc093);
             cpu.cpu.gpr[0] = 23; // INC produces selector 24
             fixture::steps(&mut cpu, &vm, 2);
-            assert_eq!(class(&cpu, model), SegmentClass::Checked);
+            assert_eq!(class(&cpu, model), SegmentClass::Segmented);
             assert_eq!(cpu.cpu.legacy.segments[1].base, 0x100);
         } else if code[1] == 0x0f {
             cpu.cpu.gpr[0] = u32::MAX as u64; // INC wraps EAX to zero, clears PE
@@ -247,7 +252,7 @@ fn segment_load_cr0_and_interrupt_delivery_end_the_proof() {
             // Software INT uses the architectural gate even with Outward faults.
             fixture::steps(&mut cpu, &vm, 2);
             assert_eq!(cpu.cpu.rip, 0x1800);
-            assert_eq!(class(&cpu, model), SegmentClass::Seg16);
+            assert_eq!(class(&cpu, model), SegmentClass::Segmented);
         }
     }
 }
@@ -275,7 +280,7 @@ fn hardware_interrupt_and_debug_boundaries_reselect_before_successors() {
     assert_eq!(cpu.retired_instructions(), retired + 1);
     assert_eq!(cpu.cpu.rip, 0x1801);
     assert_eq!(cpu.cpu.gpr[2], 0); // pre-interrupt successor never ran
-    assert_eq!(class(&cpu, model), SegmentClass::Seg16);
+    assert_eq!(class(&cpu, model), SegmentClass::Segmented);
 
     for budget in 0..5 {
         let (avm, mut a) = setup(model, b"\x40\x43\x42\xf4", false);
@@ -353,6 +358,7 @@ fn a_mid_block_mmio_retry_owns_only_its_faulting_instruction() {
     assert_eq!(a.cpu.gpr[0], 42);
     assert_eq!(a.retired_instructions(), 4);
     b.cpu.legacy.segments[2].limit += 1;
+    b.cpu.legacy.segments[5].attributes |= 0x80;
     assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu));
     assert_eq!(a.retired_instructions(), b.retired_instructions());
 }
@@ -940,6 +946,7 @@ fn paged_flat32_alias_smc_and_device_retry_equal_checked() {
             );
         }
         b.cpu.legacy.segments[2].limit += 1;
+        b.cpu.legacy.segments[5].attributes |= 0x80;
         assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu));
     }
 }
@@ -1311,7 +1318,7 @@ fn cpl3_int_and_call_gate_return_reselect_before_successors() {
                     assert_eq!(
                         class(&a, model),
                         if (2..4).contains(&budget) {
-                            SegmentClass::Checked
+                            SegmentClass::Segmented
                         } else {
                             SegmentClass::Flat32
                         }
@@ -1434,7 +1441,7 @@ fn cpl3_task_gate_reselects_before_the_incoming_task() {
                 if budget >= 2 {
                     assert_eq!(a.cpu.legacy.cpl, 0);
                     assert_eq!(a.cpu.legacy.tr.selector, 0x38);
-                    assert_eq!(class(&a, model), SegmentClass::Checked);
+                    assert_eq!(class(&a, model), SegmentClass::Segmented);
                     assert_eq!(a.cpu.gpr[0], if budget == 2 { 41 } else { 42 });
                 }
                 // The incoming task has null ES in both executions.
@@ -1478,7 +1485,7 @@ fn cpl3_exception_delivery_reselects_before_the_ring0_handler() {
             assert_eq!(a.cpu.rip, 0x4001);
             assert_eq!(a.cpu.gpr[2], 0);
             assert_eq!(a.cpu.gpr[3], 1);
-            assert_eq!(class(&a, model), SegmentClass::Checked);
+            assert_eq!(class(&a, model), SegmentClass::Segmented);
             paged_same(&a, &mut b, &avm, &bvm);
         }
     }

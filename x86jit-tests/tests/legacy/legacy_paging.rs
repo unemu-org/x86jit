@@ -4570,7 +4570,7 @@ fn cached_denial_handler_repairs_and_retries(rights: u32, write: bool, fetch: bo
                 x86jit_core::ExceptionDelivery::InGuest,
             );
             f.system_setup();
-            // Exercise Seg16 and Flat32 through public dispatch, including the
+            // Exercise Segmented and Flat32 through public dispatch, including the
             // fast operand helper's fallback when cached rights deny access.
             let data_base = if code32 { 0 } else { BASE };
             for segment in &mut f.cpu.cpu.legacy.segments[1..] {

@@ -1113,7 +1113,11 @@ fn flat32_checked_census(cpl: u8) {
                             .segment_class,
                         SegmentClass::Flat32
                     );
+                    // ES fails the Flat32 proof; a non-present hidden GS
+                    // keeps Segmented off (SDM Vol 3A §3.4.5: P is checked
+                    // on a load). No probe reloads GS.
                     b.cpu.legacy.segments[2].limit -= 1;
+                    b.cpu.legacy.segments[5].attributes &= !0x80;
                     assert_eq!(
                         derive_legacy_context(b.legacy_cpu_model().unwrap(), &b.cpu)
                             .unwrap()
@@ -1130,6 +1134,7 @@ fn flat32_checked_census(cpl: u8) {
                     );
                     sequences += usize::from(ar.steps() > 1);
                     b.cpu.legacy.segments[2].limit += 1;
+                    b.cpu.legacy.segments[5].attributes |= 0x80;
                     assert_eq!(
                         format!("{:?}", a.cpu),
                         format!("{:?}", b.cpu),
@@ -1146,6 +1151,107 @@ fn flat32_checked_census(cpl: u8) {
                 count += 1;
             }
             eprintln!("{model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons, {sequences} multi-instruction runs", count * 3);
+            assert!(count > 100, "census unexpectedly small: {count}");
+            assert!(
+                sequences > 100,
+                "too few multi-instruction runs: {sequences}"
+            );
+        }
+    }
+}
+
+#[test]
+fn seg32_checked_census_forms_are_equal() {
+    seg32_checked_census(0);
+}
+
+#[test]
+fn seg32_cpl3_checked_census_forms_are_equal() {
+    seg32_checked_census(3);
+}
+
+/// CS.D=1 in 64 KiB segments with a non-zero CS base: the Segmented class
+/// against Checked over every comparable form, including the 66h/67h
+/// variants (16-bit addressing in 32-bit code). Alternate forms run with
+/// SS.B=0 (SP, SDM Vol 1 §6.2.3 p. 6-3) and with G=1 DS/ES caches whose
+/// scaled limit is 1FFFFh (SDM Vol 3A §3.4.5 p. 3-11).
+fn seg32_checked_census(cpl: u8) {
+    use x86jit_core::{derive_legacy_context, SegmentClass};
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for mode in [Mode::P32, Mode::PagedP32] {
+            let mut count = 0;
+            let mut sequences = 0;
+            for (index, mut p) in probes(model, mode)
+                .into_iter()
+                .filter(comparable)
+                .enumerate()
+                .filter(|(i, _)| mode.paged() || i % 3 == 0)
+            {
+                p.bytes.extend_from_slice(b"\x43\x31\xda\xf4");
+                for budget in [1, 3, 5] {
+                    let (avm, mut a) = setup(model, &p, mode, false);
+                    let (bvm, mut b) = setup(model, &p, mode, false);
+                    for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                        cpu.cpu.legacy.cpl = cpl;
+                        for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                            cache.attributes |= u16::from(cpl) << 5;
+                            cache.attributes &= !0x8000;
+                            cache.limit = 0xffff;
+                            cache.base = if i == 0 { 0x100 } else { 0 };
+                            if index % 4 == 1 && (i == 1 || i == 2) {
+                                cache.attributes |= 0x8000;
+                                cache.limit = 0x1_ffff;
+                            }
+                        }
+                        if index % 2 == 1 {
+                            cpu.cpu.legacy.segments[3].attributes &= !0x4000;
+                        }
+                        cpu.cpu.cs |= u16::from(cpl);
+                        cpu.cpu.ss |= u16::from(cpl);
+                        cpu.cpu.ds |= u16::from(cpl);
+                        cpu.cpu.es |= u16::from(cpl);
+                        vm.write_bytes(0x1100, &p.bytes).unwrap();
+                    }
+                    let context =
+                        derive_legacy_context(a.legacy_cpu_model().unwrap(), &a.cpu).unwrap();
+                    assert_eq!(context.segment_class, SegmentClass::Segmented);
+                    assert_eq!(context.default_operand_bits, 32);
+                    b.cpu.legacy.segments[5].attributes &= !0x80;
+                    assert_eq!(
+                        derive_legacy_context(b.legacy_cpu_model().unwrap(), &b.cpu)
+                            .unwrap()
+                            .segment_class,
+                        SegmentClass::Checked
+                    );
+                    let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                    let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                    assert_eq!(
+                        format!("{ar:?}"),
+                        format!("{br:?}"),
+                        "{model:?}/{mode:?} CPL{cpl} {:02x?} budget={budget}",
+                        p.bytes
+                    );
+                    sequences += usize::from(ar.steps() > 1);
+                    b.cpu.legacy.segments[5].attributes |= 0x80;
+                    assert_eq!(
+                        format!("{:?}", a.cpu),
+                        format!("{:?}", b.cpu),
+                        "{:02x?}",
+                        p.bytes
+                    );
+                    assert_eq!(a.retired_instructions(), b.retired_instructions());
+                    let mut am = vec![0; 0x20000];
+                    let mut bm = vec![0; 0x20000];
+                    avm.read_bytes(0, &mut am).unwrap();
+                    bvm.read_bytes(0, &mut bm).unwrap();
+                    assert_eq!(am, bm, "{:02x?}", p.bytes);
+                }
+                count += 1;
+            }
+            eprintln!(
+                "Segmented CS.D=1 {model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons, {sequences} multi-instruction runs",
+                count * 3
+            );
             assert!(count > 100, "census unexpectedly small: {count}");
             assert!(
                 sequences > 100,
@@ -1192,7 +1298,7 @@ fn seg16_checked_census(cpl: u8) {
                         derive_legacy_context(a.legacy_cpu_model().unwrap(), &a.cpu)
                             .unwrap()
                             .segment_class,
-                        SegmentClass::Seg16
+                        SegmentClass::Segmented
                     );
                     // P is checked on segment load, not cached operand access
                     // (SDM Vol 3A §3.4.5). No probe reloads GS in this census.
@@ -1228,7 +1334,7 @@ fn seg16_checked_census(cpl: u8) {
                 count += 1;
             }
             eprintln!(
-                "Seg16 {model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons",
+                "Segmented {model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons",
                 count * 3
             );
             assert!(count > 100);

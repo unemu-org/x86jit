@@ -410,7 +410,7 @@ fn segment_access(
 ) -> Result<u64, Exit> {
     if matches!(
         context.segment_class,
-        crate::SegmentClass::Checked | crate::SegmentClass::Seg16
+        crate::SegmentClass::Checked | crate::SegmentClass::Segmented
     ) {
         return legacy::access(cpu, context.generation, segment, offset, bytes, access);
     }
@@ -2600,7 +2600,7 @@ pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
                 op,
                 L::Address { .. }
                     | L::Flat32Address { .. }
-                    | L::Seg16Address { .. }
+                    | L::SegmentedAddress { .. }
                     | L::I486Gate
                     | L::Checkpoint
                     | L::ReadSelector { .. }
@@ -2631,7 +2631,7 @@ pub(crate) fn data_segment_load(op: &L) -> Option<SegmentId> {
 
 /// Whether an ordinary block continues after an instruction whose outcome
 /// changed the context. In an ordinary walk only a data-segment load does
-/// that. Seg16 and V86 stay admissible after every successful load (later
+/// that. Segmented and V86 stay admissible after every successful load (later
 /// operands of the reloaded segment were lifted as live checks); Flat32
 /// continues only if a reloaded DS or ES cache still proves Flat32.
 #[cold]
@@ -2659,7 +2659,7 @@ pub(crate) enum BlockWalk {
     Direct,
     Checked,
     Protected,
-    /// A paged Flat32, Seg16 or V86 block whose ordinary walk was proved at
+    /// A paged Flat32, Segmented or V86 block whose ordinary walk was proved at
     /// lift (`paging::execute_flat32`).
     Paged,
 }
@@ -4504,7 +4504,7 @@ where
                         return Ok(true);
                     }
                 }
-                L::Seg16Address {
+                L::SegmentedAddress {
                     dst,
                     segment,
                     offset,

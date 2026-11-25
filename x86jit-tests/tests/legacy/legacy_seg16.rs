@@ -1,4 +1,5 @@
-//! Seg16 cached access proofs and exact block boundaries (decision-27).
+//! Segmented-class (CS.D=0) cached access proofs and exact block boundaries
+//! (decision-27).
 #[path = "../support/descriptor_fixture.rs"]
 #[allow(dead_code)]
 mod fixture;
@@ -55,7 +56,7 @@ fn setup(model: CpuModel, code: &[u8], cpl: u8, paged: bool, checked: bool) -> (
         }
     }
     if checked {
-        // An unobserved non-present hidden GS cache rejects Seg16 admission.
+        // An unobserved non-present hidden GS cache rejects Segmented admission.
         // Checked's access policy uses cached type/limit/unusable, not P:
         // SDM Vol 3A §3.4.5 (P is checked on descriptor load), §§6.3–6.4.
         cpu.cpu.legacy.segments[5].attributes &= !0x80;
@@ -65,7 +66,7 @@ fn setup(model: CpuModel, code: &[u8], cpl: u8, paged: bool, checked: bool) -> (
         if checked {
             SegmentClass::Checked
         } else {
-            SegmentClass::Seg16
+            SegmentClass::Segmented
         }
     );
     (vm, cpu)
@@ -206,7 +207,7 @@ fn far_calls_and_call_gates_end_blocks_and_reselect() {
                         }
                     );
                     same(&a, &mut b, &avm, &bvm);
-                    assert_eq!(class(&a), SegmentClass::Seg16);
+                    assert_eq!(class(&a), SegmentClass::Segmented);
                     assert_eq!(class(&b), SegmentClass::Checked);
                 }
             }
@@ -267,7 +268,7 @@ fn smc_and_device_retries_stop_before_successors() {
             vm.map(0x5000, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
         }
         for cpu in [&mut a, &mut b] {
-            let vm = if class(cpu) == SegmentClass::Seg16 {
+            let vm = if class(cpu) == SegmentClass::Segmented {
                 &avm
             } else {
                 &bvm
@@ -503,7 +504,7 @@ fn stack_width_and_near_target_faults_preserve_predecessors() {
 
 #[test]
 fn paged_cpl3_segment_reloads_and_far_returns_retain_context_blocks() {
-    // SDM Vol 2A CALL/MOV, Vol 2B RET; spec.md §17.10 Seg16.
+    // SDM Vol 2A CALL/MOV, Vol 2B RET; spec.md §17.10 Segmented.
     for model in [CpuModel::I80386, CpuModel::I80486Dx] {
         let code = b"\x8e\xd8\x8e\xc0\x9a\x20\x01\x0b\x00";
         let (vm, mut cpu) = setup(model, code, 3, true, false);

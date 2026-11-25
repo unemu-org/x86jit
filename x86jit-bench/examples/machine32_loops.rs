@@ -6,6 +6,9 @@
 //! segmix mirrors a PC-class embedder's 16-bit protected and V86 body: per 25
 //! retired, one DS and one ES reload, a near and a far CALL/RET pair (the far
 //! callee in a second code segment) and three memory operands.
+//! The 32seg paths run CS.D=1 code in 64 KiB segments with non-zero bases
+//! (SS.B=1), as extended-memory runtimes and 16:32 driver-style code do;
+//! their segmix is the same body in 32-bit code.
 //! farcall-sliced and farseg-sliced use 64-step calls and board-style writes.
 //! These cases place data 256 KiB from the descriptor page.
 //! Application retirement is derived from the validated finite guest loop.
@@ -43,7 +46,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 12] = [
+const PATHS: [&str; 16] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -54,6 +57,10 @@ const PATHS: [&str; 12] = [
     "machine-protected16-cpl3",
     "machine-paged16-cpl3",
     "machine-paged-v86",
+    "machine-protected32seg",
+    "machine-paged32seg",
+    "machine-protected32seg-cpl3",
+    "machine-paged32seg-cpl3",
     "application-interp32",
     "application-jit32",
 ];
@@ -117,6 +124,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     let machine = path.starts_with("machine");
     let real = path == "machine-real16";
     let seg16 = path.contains("protected16") || path.contains("paged16");
+    let seg32 = path.contains("32seg");
     let v86 = path == "machine-paged-v86";
     let user = path.ends_with("-cpl3") || v86;
     let paged = path.starts_with("machine-paged");
@@ -131,10 +139,10 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         .unwrap();
     let bytes = if work == "segmix" {
         if v86 {
-            segmix_code((data >> 4) as u16, 0x1100)
+            segmix_code((data >> 4) as u16, 0x1100, 16)
         } else {
             let rpl = if user { 3 } else { 0 };
-            segmix_code(16 | rpl, 32 | rpl)
+            segmix_code(16 | rpl, 32 | rpl, if seg32 { 32 } else { 16 })
         }
     } else if work == "farseg" || work == "farcall" {
         let short = seg16 || v86;
@@ -162,6 +170,8 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         bytes.push(0x9a); // CALL FAR sub.
         if short {
             bytes.extend(((target - CODE) as u16).to_le_bytes());
+        } else if seg32 {
+            bytes.extend(((target - CODE) as u32).to_le_bytes());
         } else {
             bytes.extend((target as u32).to_le_bytes());
         }
@@ -234,7 +244,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             segment.unusable = 0;
         }
     }
-    if seg16 || (work == "farcall" && machine) {
+    if seg16 || seg32 || (work == "farcall" && machine) {
         cpu.cpu.cs = if user { 11 } else { 8 };
         cpu.cpu.ds = if user { 19 } else { 16 };
         cpu.cpu.es = cpu.cpu.ds;
@@ -242,7 +252,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         cpu.cpu.legacy.gdtr.base = gdt as u32;
         cpu.cpu.legacy.gdtr.limit = 39;
         for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
-            segment.base = if !seg16 {
+            segment.base = if !seg16 && !seg32 {
                 0
             } else {
                 match i {
@@ -254,6 +264,9 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             if seg16 {
                 segment.limit = if i == 3 { 0x3fff } else { 0xfff };
                 segment.attributes &= !0x4000;
+            } else if seg32 {
+                // Byte-granular 64 KiB limits; CS.D and SS.B stay 1.
+                segment.limit = 0xffff;
             }
             if i < 4 && i != 2 {
                 let index = match i {
@@ -261,12 +274,16 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
                     1 => 2,
                     _ => 3,
                 };
-                let limit = if seg16 { segment.limit } else { 0xfffff };
+                let limit = if seg16 || seg32 {
+                    segment.limit
+                } else {
+                    0xfffff
+                };
                 let low = (limit & 0xffff) | (segment.base << 16);
                 let high = ((segment.base >> 16) & 0xff)
                     | (u32::from(segment.attributes) << 8)
                     | (limit & 0xf0000)
-                    | if seg16 { 0 } else { 0x800000 };
+                    | if seg16 || seg32 { 0 } else { 0x800000 };
                 vm.write_bytes(gdt + index * 8, &low.to_le_bytes()).unwrap();
                 vm.write_bytes(gdt + 4 + index * 8, &high.to_le_bytes())
                     .unwrap();
@@ -309,7 +326,7 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64, sliced: boo
             remaining
         };
         let seg16 = cpu.cpu.legacy.cr0 & 1 != 0 && cpu.cpu.legacy.segments[0].base == CODE as u32;
-        cpu.set_reg(Reg::Rip, if real { 0 } else { CODE });
+        cpu.set_reg(Reg::Rip, if real || seg16 { 0 } else { CODE });
         cpu.set_reg(Reg::Rdi, count);
         cpu.set_reg(Reg::Rsi, if seg16 { 0 } else { DATA });
         cpu.set_reg(Reg::Rsp, if seg16 { 0x3000 } else { STACK });
@@ -383,7 +400,8 @@ fn main() {
             for path in paths {
                 let v86 = path == "machine-paged-v86";
                 let seg16 = path.contains("protected16") || path.contains("paged16");
-                if ((base_work == "farseg" || base_work == "segmix") && !seg16 && !v86)
+                let seg32 = path.contains("32seg");
+                if ((base_work == "farseg" || base_work == "segmix") && !seg16 && !seg32 && !v86)
                     || (base_work == "segmix" && sliced)
                     || (base_work == "farcall"
                         && (!path.starts_with("machine") || path == "machine-real16"))
@@ -454,9 +472,13 @@ fn main() {
 
 // 25 retired per iteration (see the module comment). DS and ES reload `data`
 // (a selector, or a V86 paragraph); the far callee is 1100h:0 in V86 and
-// selector 20h | RPL otherwise, both one page above the loop's code.
-fn segmix_code(data: u16, far: u16) -> Vec<u8> {
+// selector 20h | RPL otherwise, both one page above the loop's code. `bits`
+// 32 assembles the same instructions with 32-bit operands and addresses.
+fn segmix_code(data: u16, far: u16, bits: u32) -> Vec<u8> {
     use iced_x86::code_asm::*;
+    if bits == 32 {
+        return segmix32_code(data, far);
+    }
     let mut a = CodeAssembler::new(16).unwrap();
     let mut top = a.create_label();
     let mut near = a.create_label();
@@ -485,6 +507,42 @@ fn segmix_code(data: u16, far: u16) -> Vec<u8> {
     a.hlt().unwrap();
     a.set_label(&mut near).unwrap();
     a.add(ax, 1).unwrap();
+    a.ret().unwrap();
+    a.assemble(0).unwrap()
+}
+
+fn segmix32_code(data: u16, far: u16) -> Vec<u8> {
+    use iced_x86::code_asm::*;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    let mut near = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.mov(ebx, u32::from(data)).unwrap();
+    a.add(ebx, 0).unwrap();
+    a.mov(ds, ebx).unwrap();
+    a.mov(es, ebx).unwrap();
+    a.mov(eax, dword_ptr(0x100)).unwrap();
+    a.add(eax, 3).unwrap();
+    a.mov(dword_ptr(0x100), eax).unwrap();
+    a.push(eax).unwrap();
+    a.xor(eax, 0x55aa).unwrap();
+    a.pop(eax).unwrap();
+    a.call(near).unwrap();
+    // CALL FAR far:0, with a 32-bit offset.
+    a.db(&[0x9a, 0, 0, 0, 0, far as u8, (far >> 8) as u8])
+        .unwrap();
+    a.mov(dword_ptr(0x104).es(), eax).unwrap();
+    a.inc(ebp).unwrap();
+    a.add(esi, eax).unwrap();
+    a.rol(edx, 1).unwrap();
+    a.add(ecx, 7).unwrap();
+    a.xor(ecx, 0x1234).unwrap();
+    a.inc(ebx).unwrap();
+    a.dec(edi).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.set_label(&mut near).unwrap();
+    a.add(eax, 1).unwrap();
     a.ret().unwrap();
     a.assemble(0).unwrap()
 }

@@ -811,7 +811,7 @@ impl Execution {
         }
         if matches!(
             context.segment_class,
-            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
         ) {
             return self.resolve_flat32(vm, cpu, model, context, _exit_word);
         }
@@ -3201,7 +3201,7 @@ impl Vcpu {
                             // SMC uses the cheaper original Checked instruction IR.
                             segment_class: if matches!(
                                 context.segment_class,
-                                crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                                crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
                             ) {
                                 context.segment_class
                             } else if direct && !direct_bus {
@@ -3551,7 +3551,8 @@ impl Vcpu {
                                     || context.regime == MachineRegime::Virtual8086
                                     || matches!(
                                         context.segment_class,
-                                        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                                        crate::SegmentClass::Flat32
+                                            | crate::SegmentClass::Segmented
                                     )) {
                                 self.legacy_execution
                                     .as_mut()
@@ -3569,7 +3570,8 @@ impl Vcpu {
                                         BlockWalk::Protected
                                     } else if matches!(
                                         context.segment_class,
-                                        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                                        crate::SegmentClass::Flat32
+                                            | crate::SegmentClass::Segmented
                                     ) {
                                         BlockWalk::for_flat32(&retry)
                                     } else if direct {
@@ -6200,7 +6202,7 @@ mod tests {
     #[test]
     fn pe_transitions_reuse_both_regimes_without_relifting_or_flushing_other_contexts() {
         let (vm, mut cpu) = pe_transition_loop();
-        // Exercise the retained Checked cache, independently of Seg16 admission.
+        // Exercise the retained Checked cache, independently of Segmented admission.
         cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
         let warm = cpu.run_steps(&vm, 6, StepOptions::default()).unwrap();
         assert_eq!(warm.steps(), 6, "{:?}", warm.stop());
@@ -6269,7 +6271,7 @@ mod tests {
     #[test]
     fn reused_contexts_revalidate_code_bytes_and_between_run_cache_edits() {
         let (vm, mut cpu) = pe_transition_loop();
-        // Exercise the retained Checked cache, independently of Seg16 admission.
+        // Exercise the retained Checked cache, independently of Segmented admission.
         cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
         let model = cpu.legacy_model.unwrap();
         let mut execution = Execution::new();

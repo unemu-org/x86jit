@@ -1724,7 +1724,7 @@ pub(super) fn lower(
                 Loopne => LoopKind::Loopne,
                 _ => LoopKind::Jcxz,
             };
-            let check_target = matches!(context.segment_class, crate::SegmentClass::Checked | crate::SegmentClass::Seg16)
+            let check_target = matches!(context.segment_class, crate::SegmentClass::Checked | crate::SegmentClass::Segmented)
                 || insn.near_branch_target() > 0xffff;
             if count_bits == 16 && !check_target {
                 // Both Direct paths use the compact, statically word-sized form.

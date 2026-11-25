@@ -141,7 +141,7 @@ REVIEWED_ENTRY_POINTS = {
         "model::profile_for_generation",
     },
     "x86jit-core/src/vm/legacy/flat32.rs": {
-        # Reached only from Machine after deriving the Flat32 or Seg16 proof;
+        # Reached only from Machine after deriving the Flat32 or Segmented proof;
         # the lifter's in-block segment-load mask (xj-to9.18) too.
         "interp::legacy::flat32_ordinary", "interp::legacy::data_segment_load",
         "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
@@ -152,7 +152,7 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::tasks", "interp::legacy::BlockWalk",
         "interp::legacy::Outcome", "interp::legacy::Progress",
         "interp::legacy::paging", "interp::legacy::finish_port_input",
-        # Paged Flat32 and Seg16 blocks reuse the ordinary-IR effect proof.
+        # Paged Flat32 and Segmented blocks reuse the ordinary-IR effect proof.
         "interp::legacy::flat32_ordinary",
         "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
     },

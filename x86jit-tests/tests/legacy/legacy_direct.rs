@@ -81,7 +81,7 @@ fn direct_proof_checks_all_six_caches_and_ignores_the_board_line() {
                         .unwrap()
                         .segment_class,
                     if !reset && generation == CpuGeneration::I386 {
-                        SegmentClass::Seg16
+                        SegmentClass::Segmented
                     } else {
                         SegmentClass::Checked
                     }

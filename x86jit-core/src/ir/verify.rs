@@ -410,7 +410,7 @@ impl IrBlock {
                     | crate::legacy::LegacyOp::HoldExternal20 => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::Flat32Address { dst, offset, .. }
-                    | crate::legacy::LegacyOp::Seg16Address { dst, offset, .. }
+                    | crate::legacy::LegacyOp::SegmentedAddress { dst, offset, .. }
                     | crate::legacy::LegacyOp::DirectStackAddress { dst, offset, .. } => {
                         check(&[*offset], &[*dst])?
                     }

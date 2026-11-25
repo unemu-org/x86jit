@@ -71,8 +71,10 @@ pub enum SegmentClass {
     Direct,
     Checked,
     Flat32,
-    /// Protected CS.D=0 with cache-derived operand bounds (decision-27).
-    Seg16,
+    /// Protected code (CS.D=0 or 1) outside Flat32, with operand bounds
+    /// derived from the entry-stamped caches (decision-27). Operand, address
+    /// and stack widths come from the context, not the class.
+    Segmented,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,7 +370,6 @@ fn derive_context<const V86: bool>(
         {
             SegmentClass::Flat32
         } else if protected
-            && bits == 16
             && model.generation == CpuGeneration::I386
             && cs.attributes & 0x98 == 0x98
             && state
@@ -376,7 +377,7 @@ fn derive_context<const V86: bool>(
                 .iter()
                 .all(|c| c.unusable != 0 || c.attributes & 0x90 == 0x90)
         {
-            SegmentClass::Seg16
+            SegmentClass::Segmented
         } else {
             SegmentClass::Checked
         },
@@ -694,11 +695,11 @@ mod tests {
                                     assert_eq!(
                                         context,
                                         MachineContext {
+                                            // No case is flat: CS.base is non-zero.
                                             segment_class: if pe
-                                                && !cs_d
                                                 && generation == CpuGeneration::I386
                                             {
-                                                SegmentClass::Seg16
+                                                SegmentClass::Segmented
                                             } else {
                                                 SegmentClass::Checked
                                             },
@@ -979,7 +980,7 @@ pub enum LegacyOp {
         access: crate::AccessKind,
     },
     /// Bounds derived from the entry-stamped hidden cache, including access rights.
-    Seg16Address {
+    SegmentedAddress {
         dst: crate::ir::Temp,
         segment: SegmentId,
         offset: crate::ir::Val,

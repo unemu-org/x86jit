@@ -263,7 +263,7 @@ impl State {
     }
 }
 
-/// Whether a paged block takes the ordinary Flat32, Seg16 or V86 walk.
+/// Whether a paged block takes the ordinary Flat32, Segmented or V86 walk.
 fn ordinary_block(context: MachineContext, ir: &IrBlock) -> bool {
     ordinary_context(context) && crate::interp::legacy::flat32_ordinary(ir)
 }
@@ -274,7 +274,7 @@ fn ordinary_block(context: MachineContext, ir: &IrBlock) -> bool {
 fn ordinary_context(context: MachineContext) -> bool {
     matches!(
         context.segment_class,
-        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+        crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
     ) || context.regime == MachineRegime::Virtual8086
 }
 
@@ -657,7 +657,7 @@ impl Vcpu {
             )
         } else if matches!(
             context.segment_class,
-            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
         ) {
             crate::interp::legacy::paging::execute_far_fast::<ROUTED, ORDER, false>(
                 ir,
@@ -1197,13 +1197,20 @@ mod tests {
             let options = crate::StepOptions::default();
             // One period: three V86 steps and the monitor's eight.
             assert_eq!(cpu.run_steps(&vm, 22, options).unwrap().steps(), 22);
-            let warm = proof_snapshot(&cpu);
-            let retired = cpu.retired_instructions();
-            for _ in 0..50 {
+            // The monitor (null DS on entry from V86) is Segmented, with
+            // blocks that start where a slice starts: one sliced period
+            // lifts them, and every later period reuses them.
+            let period = |cpu: &mut Vcpu| {
                 for budget in [11, 5, 6] {
                     cpu.disable_delivery_log();
                     assert_eq!(cpu.run_steps(&vm, budget, options).unwrap().steps(), budget);
                 }
+            };
+            period(&mut cpu);
+            let warm = proof_snapshot(&cpu);
+            let retired = cpu.retired_instructions();
+            for _ in 0..50 {
+                period(&mut cpu);
                 assert_eq!(
                     proof_snapshot(&cpu),
                     warm,
@@ -1218,7 +1225,7 @@ mod tests {
             );
             let mut count = [0; 4];
             vm.read_bytes(0x6000, &mut count).unwrap();
-            assert_eq!(u32::from_le_bytes(count), 102);
+            assert_eq!(u32::from_le_bytes(count), 104);
         }
     }
 

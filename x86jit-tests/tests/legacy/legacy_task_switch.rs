@@ -3258,7 +3258,7 @@ fn flat32_task_switch_reselects_from_incoming_caches() {
         derive_legacy_context(cpu.legacy_cpu_model().unwrap(), &cpu.cpu)
             .unwrap()
             .segment_class,
-        SegmentClass::Seg16
+        SegmentClass::Segmented
     );
 }
 

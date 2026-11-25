@@ -870,7 +870,7 @@ exhaustion, including INS's required store, without starting another unit.
 Fallback still returns its port Exit on the last step. Split/locked transfer
 order, partial effects, typed refusals and memory-order tiers remain unchanged.
 
-Real16, Flat32, Seg16, Checked, V86 and paged interpretation continue internally
+Real16, Flat32, Segmented, Checked, V86 and paged interpretation continue internally
 after Handled. The dispatcher drains SMC and revalidates source/context before
 executing successors; owned incomplete instructions retain their original bytes
 and transfer snapshots. Compiled device helpers remain stage 4 (decision-27).
@@ -2648,18 +2648,30 @@ Privileged and IOPL-sensitive instructions, POPF, and privilege transitions use
 singleton helpers. Transitions end the block and reselect the segment class.
 The 486 alignment-refusal regime retains the checked transaction path.
 
-**Interpreted Seg16 (decision-27 interpreter checkpoint).** On 386/486,
-protected CS.D=0 selects Seg16 at CPL 0–3, paged or unpaged, when CS is
-present executable application code and every usable segment cache has P=S=1.
-Unusable data caches remain admissible and fault on access. Other retained
-states keep Checked; V86 and Flat32 retain their separate classes. The full
+**Interpreted Segmented (decision-27 interpreter checkpoint).** On 386/486,
+protected code that Flat32 does not admit, with CS.D=0 (xj-to9.13) or
+CS.D=1 (xj-to9.24), selects Segmented at CPL 0–3, paged or unpaged, when CS
+is present executable application code and every usable segment cache has
+P=S=1. Unusable data caches remain admissible and fault on access. Other
+retained states keep Checked; V86 and Flat32 retain their separate classes.
+One class serves both code widths: the interval proof below is
+width-independent, and the operand, address and stack widths come from the
+context (CS.D, SS.B), which the context identity and every block key
+already carry. Each instruction's offset is formed at its own address size,
+16-bit (CS.D=0, or 67h in CS.D=1 code) or 32-bit, before the interval check
+(SDM Vol 1 §3.6 p. 3-18); implicit stack accesses use SP or ESP by SS.B
+(Vol 1 §6.2.3 p. 6-3). The interval is the scaled limit (G is applied when
+the descriptor is loaded) and, for expand-down data, the B-dependent upper
+bound FFFFh or FFFFFFFFh (Vol 3A §3.4.5 p. 3-11). The public
+`SegmentClass::Seg16` of xj-to9.13 is renamed `SegmentClass::Segmented`;
+witnesses are `legacy_seg16.rs`, `legacy_seg32.rs` and the census. The full
 entry stamp guards base, limit, type/rights, expand-down and D/B for all six
 caches. Scalar address IR embeds the derived inclusive offset interval and
 wrapping base; inaccessible types and null caches embed an empty interval.
 Each complete operand checks that interval before paging or physical access
 (SDM Vol 3A §§3.4.5.1, 6.3–6.4). Helpers retain live Checked accesses.
 
-Seg16 shares the bounded Flat32 proof cache and accounting walk. Linear-page
+Segmented shares the bounded Flat32 proof cache and accounting walk. Linear-page
 boundaries include CS.base; a straddling first instruction is a singleton.
 Data-segment loads continue the block (below). SS loads, far transfers
 (including gates), privileged/IOPL-sensitive instructions and REP remain
@@ -2668,12 +2680,12 @@ transfers end blocks and retain CS target checks. Paged scalar
 RAM accesses reuse the existing permission/D-bit TLB fast path after proving
 their segment interval; faults, misses, split operands, code stores and devices
 retain the transaction path. In particular, a near RET cannot skip its loaded
-CS target check under Seg16. The Machine context identity carries this class;
+CS target check under Segmented. The Machine context identity carries this class;
 BlockKey hashing, Application dispatch and CpuState remain unchanged.
 
 **Segment loads and far transfers inside blocks (xj-to9.18).** A MOV, POP,
 LDS, LES, LFS or LGS into DS, ES, FS or GS is an ordinary instruction of a
-Seg16, Flat32 or paged V86 block. It performs the complete architectural
+Segmented, Flat32 or paged V86 block. It performs the complete architectural
 load through the shared helper: descriptor fetch from the GDT or LDT with
 supervisor privilege, every type, privilege and presence check with its
 error code (#GP, #NP; SDM Vol 2B MOV, Protected Mode Exceptions; Vol 3A
@@ -2684,11 +2696,12 @@ and POP SS arm the event shadow (SDM Vol 3A §7.8.3 p. 7-8) and SS.B is part
 of the block's stack lowering. After a load of segment S the lifter keeps
 every later operand of S in the same block as the live Checked access, which
 reads the cache that load installed; operands lifted before it, and other
-segments, keep their entry-stamped Seg16 interval. Seg16 stays admissible
+segments, keep their entry-stamped Segmented interval. Segmented stays admissible
 after every successful load (null caches are unusable, every loaded
 descriptor has P=S=1). Flat32 continues only while a reloaded DS or ES still
 proves Flat32; otherwise the block ends after the load and reselection picks
-Checked. V86 loads install base = selector × 16 without a descriptor (SDM
+Segmented, or Checked when another cache fails its admission. V86 loads
+install base = selector × 16 without a descriptor (SDM
 Vol 3B §23.2 p. 23-5; 80386 PRM §15.1.2 pp. 15-2–3) and V86 operands are
 always live. A block that reloaded a segment reports a context change where
 it ends, and the dispatcher reselects once. A fault after the load retires
@@ -2707,7 +2720,7 @@ Two paged lanes skip the operand transaction when existing TLB entries
 prove every access as RAM with the needed privilege, kind and dirty state:
 MOV of a register into DS/ES/FS/GS (the eight-byte descriptor, supervisor
 read) and a same-level far CALL or JMP with an immediate pointer or a far
-RET whose popped CS has RPL = CPL, in Seg16, Flat32 and V86 (the descriptor,
+RET whose popped CS has RPL = CPL, in Segmented, Flat32 and V86 (the descriptor,
 which must name a code segment, not a call gate, TSS or task gate, SDM Vol 3A
 §6.8 p. 6-10; and the CS:IP frame, which must not wrap SP). A far RET to an
 outer level, gates, task switches, faults on these proofs and every other
@@ -2721,7 +2734,7 @@ page's A and D) in memory and is not undone. That order is safe only
 because every access after the accessed-bit update lies inside a proved
 window and cannot miss; a fault of the update itself (a #PF on a
 write-protected descriptor page) precedes every store, as on the
-transaction path. A near RET's Seg16 or V86 CS target check runs after its
+transaction path. A near RET's Segmented or V86 CS target check runs after its
 proved stack load, which can fault only before any effect.
 
 PG=0 keeps its statically selected unpaged adapter;

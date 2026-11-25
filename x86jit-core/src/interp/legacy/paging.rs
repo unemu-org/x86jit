@@ -1565,7 +1565,7 @@ where
                         | L::I486Gate
                         | L::Address { .. }
                         | L::Flat32Address { .. }
-                        | L::Seg16Address { .. }
+                        | L::SegmentedAddress { .. }
                         | L::ReadSelector { .. }
                         | L::Push { .. }
                         | L::Pop { .. }
@@ -2272,7 +2272,7 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
 
 /// Effect proof for the RAM-free lane (decision-27 interpreter checkpoint).
 /// Every accepted operation is register/flags computation or near control flow:
-/// no operand memory or handoff. Seg16 near targets may raise a segment fault;
+/// no operand memory or handoff. Segmented near targets may raise a segment fault;
 /// the instruction walk retains their checks and rollback before retirement.
 /// The caller excludes the 486 alignment-refusal regime before this lane.
 /// New IR operations default to the existing transaction path.
@@ -2668,7 +2668,7 @@ fn fast_instruction(
     for op in ops {
         if operand.is_some() {
             // A near RET checks its target immediately after loading a 16/32-bit
-            // offset. Flat32 CS admits every such offset (decision-27). A Seg16
+            // offset. Flat32 CS admits every such offset (decision-27). A Segmented
             // or V86 target check still runs, and can fault, in the execution: it
             // follows only the load, so a fault leaves RAM and registers as
             // they were (SDM Vol 2B RET, Protected Mode Exceptions).
@@ -2676,7 +2676,7 @@ fn fast_instruction(
                 matches!(op,
                     IrOp::Legacy(L::Flat32Address { segment: SegmentId::Cs,
                         offset, bytes: 1, access: AccessKind::Execute, .. }
-                    | L::Seg16Address { segment: SegmentId::Cs,
+                    | L::SegmentedAddress { segment: SegmentId::Cs,
                         offset, bytes: 1, access: AccessKind::Execute, .. }
                     | L::Address { segment: SegmentId::Cs,
                         offset, bytes: 1, access: AccessKind::Execute, .. }) if *offset == target
@@ -2729,7 +2729,7 @@ fn fast_instruction(
             } if *set_flags == FlagMask::NONE => {
                 crate::interp::integer::exec_shl(cpu, temps, dst, a, b, size, set_flags);
             }
-            IrOp::Legacy(L::Seg16Address {
+            IrOp::Legacy(L::SegmentedAddress {
                 dst,
                 offset,
                 bytes,
@@ -2749,7 +2749,7 @@ fn fast_instruction(
                     flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access)
                         .ok()?;
             }
-            // The live Checked access: Flat32 FS/GS, Seg16 operands after an
+            // The live Checked access: Flat32 FS/GS, Segmented operands after an
             // in-block reload of their segment, and V86 (`execute_op`).
             IrOp::Legacy(L::Address {
                 dst,
@@ -2842,7 +2842,7 @@ fn fast_instruction(
     operand
 }
 
-/// Paged Flat32, Seg16 and V86 blocks execute effect-proved registers and
+/// Paged Flat32, Segmented and V86 blocks execute effect-proved registers and
 /// preflighted RAM once; all other instructions retain the full operand
 /// transaction ledger. V86 takes the same walk with V86 address checks.
 #[allow(clippy::too_many_arguments)]
@@ -2886,7 +2886,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     )
 }
 
-/// The ordinary paged walk of Flat32, Seg16 and V86 blocks.
+/// The ordinary paged walk of Flat32, Segmented and V86 blocks.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
