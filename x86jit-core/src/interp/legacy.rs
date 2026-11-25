@@ -4220,18 +4220,16 @@ where
                                 // SDM Vol 2A §3.3 ARPL p. 3-75; Intel486 PRM §26
                                 // p. 26-27: only the raising branch writes DEST.
                                 let addr = read_val(*addr, temps);
-                                if context.segment_class == crate::SegmentClass::Checked {
-                                    let offset = (addr as u32)
-                                        .wrapping_sub(cpu.legacy.segments[*segment as usize].base);
-                                    segment_access(
-                                        cpu,
-                                        context,
-                                        *segment,
-                                        u64::from(offset),
-                                        2,
-                                        AccessKind::Write,
-                                    )?;
-                                }
+                                let offset = (addr as u32)
+                                    .wrapping_sub(cpu.legacy.segments[*segment as usize].base);
+                                segment_access(
+                                    cpu,
+                                    context,
+                                    *segment,
+                                    u64::from(offset),
+                                    2,
+                                    AccessKind::Write,
+                                )?;
                                 write(cpu, mem, addr, 2, value)?;
                             }
                         }

@@ -33,10 +33,12 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 5] = [
+const PATHS: [&str; 7] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
+    "machine-protected32-cpl3",
+    "machine-paged32-cpl3",
     "application-interp32",
     "application-jit32",
 ];
@@ -86,6 +88,8 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     vm.set_cpu_mode(CpuMode::Compat32);
     let machine = path.starts_with("machine");
     let real = path == "machine-real16";
+    let user = path.ends_with("-cpl3");
+    let paged = path.starts_with("machine-paged32");
     if machine {
         vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
             Ok("486") => CpuModel::I80486Dx,
@@ -116,12 +120,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             );
         }
     }
-    if path == "machine-paged32" {
-        vm.write_bytes(0x1000, &0x2003u32.to_le_bytes()).unwrap();
+    if paged {
+        let rights = if user { 7 } else { 3 };
+        vm.write_bytes(0x1000, &(0x2000u32 | rights).to_le_bytes())
+            .unwrap();
         for page in 0..32u32 {
             vm.write_bytes(
                 0x2000 + u64::from(4 * page),
-                &((page * 4096) | 3).to_le_bytes(),
+                &((page * 4096) | rights).to_le_bytes(),
             )
             .unwrap();
         }
@@ -131,17 +137,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         cpu.cpu = CpuState::legacy_real_entry([0x1000, 0, 0, 0, 0, 0]);
     } else if machine {
         // Same retained-cache fixture as legacy_paging.rs, with flat bases.
-        cpu.cpu.legacy.cr0 = if path == "machine-paged32" {
-            0x80000001
-        } else {
-            1
-        };
+        cpu.cpu.legacy.cr0 = if paged { 0x80000001 } else { 1 };
         cpu.cpu.legacy.cr3 = 0x1000;
-        cpu.cpu.legacy.cpl = 0;
+        cpu.cpu.legacy.cpl = if user { 3 } else { 0 };
         for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
             segment.base = 0;
             segment.limit = u32::MAX;
-            segment.attributes = (if i == 0 { 0x9b } else { 0x93 }) | 0x4000;
+            segment.attributes =
+                (if i == 0 { 0x9b } else { 0x93 }) | 0x4000 | (u16::from(cpu.cpu.legacy.cpl) << 5);
             segment.unusable = 0;
         }
     }
@@ -162,7 +165,17 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64) {
         cpu.set_reg(Reg::Rdi, count);
         cpu.set_reg(Reg::Rsi, DATA);
         cpu.set_reg(Reg::Rsp, STACK);
-        assert!(matches!(cpu.run(vm, None), Exit::Hlt));
+        let exit = cpu.run(vm, None);
+        if cpu.cpu.legacy.cpl == 3 {
+            // SDM Vol 2A HLT: CPL 3 stops at #GP(0), without retiring HLT.
+            assert!(matches!(exit, Exit::Exception { vector: 13, .. }));
+            assert_eq!(
+                exit.fault_metadata().unwrap().error_code(),
+                x86jit_core::fault::ErrorCode::bits(0, 0xffff)
+            );
+        } else {
+            assert!(matches!(exit, Exit::Hlt));
+        }
         assert_eq!(cpu.reg(Reg::Rdi), 0);
         assert_eq!(cpu.reg(Reg::Rsp), STACK);
         remaining -= count;
@@ -209,7 +222,12 @@ fn main() {
                 let seconds = start.elapsed().as_secs_f64();
                 let host = instructions() - host_before;
                 let retired = cpu.retired_instructions() - retired_before;
-                let count = 5 * n + if real { n.div_ceil(60000) } else { 1 };
+                let count = 5 * n
+                    + if real {
+                        n.div_ceil(60000)
+                    } else {
+                        u64::from(!path.ends_with("-cpl3"))
+                    };
                 if path.starts_with("machine") {
                     assert_eq!(retired, count);
                 }

@@ -123,3 +123,4 @@ x86jit-tests::threads interp_ordering::fulltso_interpreter_message_passing
 x86jit-tests::threads mt::pthreads_counter_interp
 x86jit-tests::threads mt_atomic_store_coherence::plain_store_release_spinlock_excludes_interp
 x86jit-tests::threads mt_atomic_store_coherence::plain_store_release_spinlock_routed_interp
+x86jit-tests::legacy legacy_census_386::flat32_cpl3_checked_census_forms_are_equal

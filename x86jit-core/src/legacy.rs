@@ -350,16 +350,31 @@ fn derive_context<const V86: bool>(
                 }) {
             SegmentClass::Direct
         } else if protected
-            && state.cpl == 0
             && bits == 32
             && ss.attributes & (1 << 14) != 0
             && state.segments[..4].iter().enumerate().all(|(i, c)| {
-                // SDM Vol 3A §§3.4.5–3.4.5.1: ordinary present,
-                // nonconforming readable code and expand-up writable data.
-                c.base == 0
-                    && c.limit == u32::MAX
-                    && c.unusable == 0
-                    && c.attributes & 0x9e == if i == 0 { 0x9a } else { 0x92 }
+                // SDM Vol 3A §§3.4.5–3.4.5.1: present readable code
+                // and expand-up writable data. §§6.6–6.7, 6.8.1.1–6.8.1.2:
+                // prove cached rights at this CPL; selector load checks stay
+                // at the load boundary, not at each operand access.
+                let dpl = ((c.attributes >> 5) & 3) as u8;
+                let rights = if state.cpl == 0 {
+                    c.attributes & 0x9e == if i == 0 { 0x9a } else { 0x92 }
+                } else {
+                    match i {
+                        0 => {
+                            c.attributes & 0x9a == 0x9a
+                                && if c.attributes & 4 != 0 {
+                                    dpl <= state.cpl
+                                } else {
+                                    dpl == state.cpl
+                                }
+                        }
+                        3 => c.attributes & 0x9e == 0x92 && dpl == state.cpl,
+                        _ => c.attributes & 0x9e == 0x92 && dpl >= state.cpl,
+                    }
+                };
+                c.base == 0 && c.limit == u32::MAX && c.unusable == 0 && rights
             })
         {
             SegmentClass::Flat32

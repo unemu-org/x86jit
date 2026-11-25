@@ -2072,7 +2072,7 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
 /// operation is register/flags computation or near control flow: no operand
 /// memory, fault or handoff. Jump/Branch mask their checked target to 32 bits;
 /// Flat32 proves that every such CS offset is usable (decision-27 Flat32 proof).
-/// Its CPL-0 proof also makes I486Gate's CPL-3 alignment refusal unreachable.
+/// The caller excludes the 486 alignment-refusal regime before this lane.
 /// New IR operations default to the existing transaction path.
 fn nonfaulting(ops: &[IrOp]) -> bool {
     ops.iter().all(|op| {
@@ -2155,7 +2155,12 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
             guest_len: (next - guest_addr) as u32,
             ops: &ir.ops[start..end],
         };
-        let result = if retry.is_none() && nonfaulting(view.ops) {
+        let result = if retry.is_none()
+            && !(cpu.legacy.cpl == 3
+                && cpu.legacy.cr0 & (1 << 18) != 0
+                && cpu.rflags_system & (1 << 18) != 0)
+            && nonfaulting(view.ops)
+        {
             execute_instruction::<ROUTED, ORDER, false, false>(
                 ir,
                 &view,
@@ -2212,5 +2217,78 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
         steps,
         retired,
         outcome: Some(outcome),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_access_rechecks_supervisor_tlb_fills_and_model_fault_ad() {
+        // SDM Vol 3A §5.6.1; paging design §3.3: implicit supervisor
+        // translations never grant user access, including on a warm hit.
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            for access in [AccessKind::Read, AccessKind::Write, AccessKind::Execute] {
+                for warm in [false, true] {
+                    let mut vm = crate::Vm::new(crate::VmConfig::flat(0x8000));
+                    vm.set_cpu_model(model);
+                    vm.map(0, 0x8000, crate::Prot::RWX, crate::RegionKind::Ram)
+                        .unwrap();
+                    vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+                    vm.write_bytes(0x3004, &0x4003u32.to_le_bytes()).unwrap();
+                    let mut cpu = vm.new_vcpu().cpu;
+                    cpu.legacy.cr0 = 0x80000001;
+                    cpu.legacy.cr3 = 0x2000;
+                    cpu.legacy.cpl = 3;
+                    let tlb = std::cell::RefCell::new(Tlb::default());
+                    let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
+                    mem.paging.tlb = Some(&tlb);
+                    if warm {
+                        assert!(translate_linear(
+                            &mut cpu,
+                            &mem,
+                            0x1000,
+                            1,
+                            AccessKind::Read,
+                            Privilege::Supervisor,
+                            true
+                        )
+                        .is_ok());
+                        assert!(tlb.borrow().entries[1].is_some());
+                        // Leave A clear in RAM while retaining the supervisor fill.
+                        // A 486 denial must rewalk to perform its A updates.
+                        vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+                        vm.write_bytes(0x3004, &0x4003u32.to_le_bytes()).unwrap();
+                    }
+                    let exit = match translate_linear(
+                        &mut cpu,
+                        &mem,
+                        0x1000,
+                        1,
+                        access,
+                        Privilege::User,
+                        true,
+                    ) {
+                        Err(exit) => exit,
+                        Ok(_) => panic!("supervisor fill authorized a user access"),
+                    };
+                    assert_eq!(
+                        exit.fault_metadata().unwrap().error_code(),
+                        ErrorCode::bits(if access == AccessKind::Write { 7 } else { 5 }, 7)
+                    );
+                    let mut bytes = [0; 4];
+                    let ad = if model == crate::CpuModel::I80386 {
+                        0
+                    } else {
+                        ACCESSED
+                    };
+                    for addr in [0x2000, 0x3004] {
+                        vm.read_bytes(addr, &mut bytes).unwrap();
+                        assert_eq!(u32::from_le_bytes(bytes) & (ACCESSED | DIRTY), ad);
+                    }
+                }
+            }
+        }
     }
 }

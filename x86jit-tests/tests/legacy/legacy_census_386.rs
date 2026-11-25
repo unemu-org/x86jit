@@ -1069,6 +1069,15 @@ fn runtime_census_x87_absent() {
 
 #[test]
 fn flat32_checked_census_forms_are_equal() {
+    flat32_checked_census(0);
+}
+
+#[test]
+fn flat32_cpl3_checked_census_forms_are_equal() {
+    flat32_checked_census(3);
+}
+
+fn flat32_checked_census(cpl: u8) {
     use x86jit_core::{derive_legacy_context, SegmentClass};
     for model in [CpuModel::I80386, CpuModel::I80486Dx] {
         for mode in [Mode::P32, Mode::PagedP32] {
@@ -1087,6 +1096,16 @@ fn flat32_checked_census_forms_are_equal() {
                 for budget in [1, 3, 5] {
                     let (avm, mut a) = setup(model, &p, mode, false);
                     let (bvm, mut b) = setup(model, &p, mode, false);
+                    for cpu in [&mut a, &mut b] {
+                        cpu.cpu.legacy.cpl = cpl;
+                        for cache in &mut cpu.cpu.legacy.segments {
+                            cache.attributes |= u16::from(cpl) << 5;
+                        }
+                        cpu.cpu.cs |= u16::from(cpl);
+                        cpu.cpu.ss |= u16::from(cpl);
+                        cpu.cpu.ds |= u16::from(cpl);
+                        cpu.cpu.es |= u16::from(cpl);
+                    }
                     assert_eq!(
                         derive_legacy_context(a.legacy_cpu_model().unwrap(), &a.cpu)
                             .unwrap()
@@ -1125,7 +1144,7 @@ fn flat32_checked_census_forms_are_equal() {
                 }
                 count += 1;
             }
-            eprintln!("{model:?}/{mode:?}: {count} forms, {} comparisons, {sequences} multi-instruction runs", count * 3);
+            eprintln!("{model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons, {sequences} multi-instruction runs", count * 3);
             assert!(count > 100, "census unexpectedly small: {count}");
             assert!(
                 sequences > 100,

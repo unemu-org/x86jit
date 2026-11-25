@@ -2495,10 +2495,14 @@ reset abandons it. The retry fingerprint conservatively includes all GPR
 storage and stored flags; editing any of these, or the owning translation
 context, abandons its operand snapshot and completion inputs before restarting.
 
-**Interpreted Flat32 (decision-27, order 2a).** Unpaged protected CPL 0 with
-CS.D=SS.B=1 and usable, ordinary present CS/DS/ES/SS caches with zero bases,
-full 32-bit limits, readable nonconforming code and writable expand-up data
-selects a third segment-access lowering. FS/GS and writes through CS retain
+**Interpreted Flat32 (decision-27, order 2).** Protected CPL 0–3, with or
+without paging, selects a third segment-access lowering when CS.D=SS.B=1 and
+usable, present CS/DS/ES/SS caches have zero bases, full 32-bit limits, readable
+code and writable expand-up data. CPL 0 retains its nonconforming-code proof.
+At CPL 1–3, cached CS.DPL equals CPL for nonconforming code or is at most CPL
+for conforming code; DS/ES.DPL is at least CPL and SS.DPL equals CPL (SDM
+Vol 3A §§6.6–6.7, 6.8.1.1–6.8.1.2). Selector privilege checks belong to segment
+loads; selection proves the retained caches. FS/GS and writes through CS retain
 Checked accesses. Whole-operand boundary checks, including #GP/#SS at the
 4-GiB edge, retain the Checked contract. The complete retained context stamp
 and private Machine key guard selection; context-changing instructions terminate
@@ -2511,7 +2515,13 @@ and 32 instructions; a straddling first instruction remains a singleton with
 its ordered physical spans. System, REP and event helpers retain singleton
 execution. The existing instruction walk finishes partial budgets exactly,
 charges only completed units and rolls back the faulting instruction at its
-own IP. SMC stops before a stale successor. Paging retains Checked singletons.
+own IP. SMC stops before a stale successor. Paged Flat32 reuses physical source
+and translation proofs; every operand translation, including a TLB hit, checks
+its access privilege. CPL 3 operands and fetches require user pages; implicit
+descriptor, TSS, IDT and I/O-bitmap accesses retain supervisor translation.
+Privileged and IOPL-sensitive instructions, POPF, and privilege transitions use
+singleton helpers. Transitions end the block and reselect the segment class.
+The 486 alignment-refusal regime retains the checked transaction path.
 
 PG=0 keeps its statically selected unpaged adapter;
 paged walks, transactions and proofs live in cold, non-inlined functions.
