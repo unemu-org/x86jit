@@ -1,6 +1,8 @@
 //! Warm, finite five-instruction loops for the compiled-Machine J0 decision.
 //! Arguments: iterations (default 2M), rounds (default 5), optional path/workload.
 //! MACHINE32_MODEL=486 selects I80486Dx; the default is I80386.
+//! farcall uses MACHINE32_FAR_INTERVAL guest instructions per call (default 25).
+//! farseg reloads DS/ES and calls far in protected16 or paged V86.
 //! Application retirement is derived from the validated finite guest loop.
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,7 +35,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 11] = [
+const PATHS: [&str; 12] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -43,10 +45,17 @@ const PATHS: [&str; 11] = [
     "machine-paged16",
     "machine-protected16-cpl3",
     "machine-paged16-cpl3",
+    "machine-paged-v86",
     "application-interp32",
     "application-jit32",
 ];
-const WORKS: [&str; 4] = ["register", "memory", "callret", "farseg"];
+const WORKS: [&str; 5] = ["register", "memory", "callret", "farseg", "farcall"];
+
+fn farcall_interval() -> u64 {
+    let n = std::env::var("MACHINE32_FAR_INTERVAL").map_or(25, |s| s.parse().unwrap());
+    assert!((5..=100).contains(&n));
+    n
+}
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x4000;
 const STACK: u64 = 0x8000;
@@ -93,7 +102,8 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     let machine = path.starts_with("machine");
     let real = path == "machine-real16";
     let seg16 = path.contains("protected16") || path.contains("paged16");
-    let user = path.ends_with("-cpl3");
+    let v86 = path == "machine-paged-v86";
+    let user = path.ends_with("-cpl3") || v86;
     let paged = path.starts_with("machine-paged");
     if machine {
         vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
@@ -103,27 +113,35 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     }
     vm.set_exception_delivery(ExceptionDelivery::Outward);
     vm.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
-    let bytes = if work == "farseg" {
-        // MOV DX,DS; MOV DS,DX; CALL FAR sub; DEC DI; JNZ; HLT; INC AX; RETF.
-        vec![
-            0x8c,
-            0xda,
-            0x8e,
-            0xda,
-            0x9a,
-            13,
-            0,
-            if user { 11 } else { 8 },
-            0,
-            0x4f,
-            0x75,
-            0xf4,
-            0xf4,
-            0x40,
-            0xcb,
-        ]
+    let bytes = if work == "farseg" || work == "farcall" {
+        let short = seg16 || v86;
+        let mut bytes = if work == "farseg" {
+            // MOV DX,DS; MOV DS,DX; MOV ES,DX.
+            vec![0x8c, 0xda, 0x8e, 0xda, 0x8e, 0xc2]
+        } else {
+            vec![0x90; (farcall_interval() - 5) as usize]
+        };
+        let target = CODE + bytes.len() as u64 + if short { 9 } else { 11 };
+        bytes.push(0x9a); // CALL FAR sub.
+        if short {
+            bytes.extend(((target - CODE) as u16).to_le_bytes());
+        } else {
+            bytes.extend((target as u32).to_le_bytes());
+        }
+        let selector: u16 = if v86 {
+            0x1000
+        } else if user {
+            11
+        } else {
+            8
+        };
+        bytes.extend(selector.to_le_bytes());
+        bytes.extend([0x4f, 0x75]); // DEC DI; JNZ start.
+        bytes.push((-(bytes.len() as i16 + 1)) as u8);
+        bytes.extend([0xf4, 0x40, 0xcb]); // HLT; sub: INC A; RETF.
+        bytes
     } else {
-        code(work, real || seg16)
+        code(work, real || seg16 || v86)
     };
     vm.write_bytes(CODE, &bytes).unwrap();
     if path == "application-single32" {
@@ -175,7 +193,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             segment.unusable = 0;
         }
     }
-    if seg16 {
+    if seg16 || (work == "farcall" && machine) {
         cpu.cpu.cs = if user { 11 } else { 8 };
         cpu.cpu.ds = if user { 19 } else { 16 };
         cpu.cpu.es = cpu.cpu.ds;
@@ -183,27 +201,44 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         cpu.cpu.legacy.gdtr.base = 0x3000;
         cpu.cpu.legacy.gdtr.limit = 31;
         for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
-            segment.base = match i {
-                0 => CODE as u32,
-                3 => 0x5000,
-                _ => DATA as u32,
+            segment.base = if !seg16 {
+                0
+            } else {
+                match i {
+                    0 => CODE as u32,
+                    3 => 0x5000,
+                    _ => DATA as u32,
+                }
             };
-            segment.limit = if i == 3 { 0x3fff } else { 0xfff };
-            segment.attributes &= !0x4000;
+            if seg16 {
+                segment.limit = if i == 3 { 0x3fff } else { 0xfff };
+                segment.attributes &= !0x4000;
+            }
             if i < 4 && i != 2 {
                 let index = match i {
                     0 => 1,
                     1 => 2,
                     _ => 3,
                 };
-                let low = segment.limit | (segment.base << 16);
-                let high = (segment.base >> 16) | (u32::from(segment.attributes) << 8);
+                let limit = if seg16 { segment.limit } else { 0xfffff };
+                let low = (limit & 0xffff) | (segment.base << 16);
+                let high = ((segment.base >> 16) & 0xff)
+                    | (u32::from(segment.attributes) << 8)
+                    | (limit & 0xf0000)
+                    | if seg16 { 0 } else { 0x800000 };
                 vm.write_bytes(0x3000 + index * 8, &low.to_le_bytes())
                     .unwrap();
                 vm.write_bytes(0x3004 + index * 8, &high.to_le_bytes())
                     .unwrap();
             }
         }
+    }
+    if v86 {
+        cpu.cpu = CpuState::legacy_real_entry([0x1000, 0x400, 0x400, 0x500, 0, 0]);
+        cpu.cpu.legacy.cr0 = 0x80000001;
+        cpu.cpu.legacy.cr3 = 0x1000;
+        cpu.cpu.legacy.cpl = 3;
+        cpu.cpu.rflags_system = 0x23000; // VM=1, IOPL=3 (SDM Vol 3A §21.2).
     }
     cpu.set_a20_enabled(true);
     (vm, cpu)
@@ -266,11 +301,15 @@ fn main() {
                 |s| vec![s.as_str()],
             );
             for path in paths {
+                let v86 = path == "machine-paged-v86";
                 let seg16 = path.contains("protected16") || path.contains("paged16");
-                if work == "farseg" && !seg16 {
+                if (work == "farseg" && !seg16 && !v86)
+                    || (work == "farcall"
+                        && (!path.starts_with("machine") || path == "machine-real16"))
+                {
                     continue;
                 }
-                let real = path == "machine-real16" || seg16;
+                let real = path == "machine-real16" || seg16 || v86;
                 let (vm, mut cpu) = setup(path, work);
                 execute(&vm, &mut cpu, real, 10000);
                 cpu.set_reg(Reg::Rax, 0);
@@ -284,11 +323,15 @@ fn main() {
                 let seconds = start.elapsed().as_secs_f64();
                 let host = instructions() - host_before;
                 let retired = cpu.retired_instructions() - retired_before;
-                let count = (if work == "farseg" { 7 } else { 5 }) * n
+                let count = (match work {
+                    "farseg" => 8,
+                    "farcall" => farcall_interval(),
+                    _ => 5,
+                }) * n
                     + if real {
-                        n.div_ceil(60000) * u64::from(!path.ends_with("-cpl3"))
+                        n.div_ceil(60000) * u64::from(!path.ends_with("-cpl3") && !v86)
                     } else {
-                        u64::from(!path.ends_with("-cpl3"))
+                        u64::from(!path.ends_with("-cpl3") && !v86)
                     };
                 if path.starts_with("machine") {
                     assert_eq!(retired, count);

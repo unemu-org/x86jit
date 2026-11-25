@@ -30,6 +30,9 @@ pub(super) struct State {
     pub(super) tlb: std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
+    context_id: u64,
+    contexts: HashMap<LegacyContextStamp, u64>,
+    model: Option<LegacyCpuModel>,
     memory: usize,
     source_generation: u64,
     blocks: HashMap<Key, Proof>,
@@ -53,6 +56,7 @@ impl State {
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
+        self.contexts.clear();
     }
 
     pub(super) fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
@@ -60,19 +64,37 @@ impl State {
         let memory = &vm.mem as *const Memory as usize;
         let source_generation = vm.cache.publication_generation();
         let mapping = vm.mem.mapping_identity();
-        if self.stamp != Some(stamp)
+        if self.model != Some(model)
             || self.memory != memory
-            || self.source_generation != source_generation
             || self
                 .mapping
                 .as_ref()
                 .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
         {
             self.invalidate();
-            self.stamp = Some(stamp);
+            self.model = Some(model);
             self.memory = memory;
-            self.source_generation = source_generation;
             self.mapping = Some(mapping);
+        }
+        if self.source_generation != source_generation {
+            self.blocks.clear();
+            self.source_generation = source_generation;
+        }
+        if self.stamp != Some(stamp) {
+            self.context_id = if let Some(id) = self.contexts.get(&stamp) {
+                *id
+            } else {
+                // Bound context identities as well as blocks. Clear both before
+                // reusing an ID; this does not expire cached translations.
+                if self.contexts.len() == MAX_BLOCKS {
+                    self.blocks.clear();
+                    self.contexts.clear();
+                }
+                let id = self.contexts.len() as u64;
+                self.contexts.insert(stamp, id);
+                id
+            };
+            self.stamp = Some(stamp);
         }
         self.tlb.get_mut().reconcile(cpu);
         self.reconcile_generation();
@@ -105,7 +127,7 @@ impl State {
             segment_class: context.segment_class,
             decode: LegacyBlockKey {
                 owner_id,
-                context_id: self.generation,
+                context_id: self.context_id,
                 model_semantics_id: model.model_semantics_id,
                 decode_bits: context.default_operand_bits,
                 stack_bits: context.stack_address_bits,
@@ -584,8 +606,10 @@ impl Vcpu {
         };
         let outcome = result.map(|(outcome, input)| {
             state.port_input = input;
-            if outcome.context_changed || outcome.translations_invalidated {
+            if outcome.translations_invalidated {
                 state.invalidate();
+            } else if outcome.context_changed {
+                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap());
             }
             outcome
         });
@@ -807,8 +831,10 @@ impl Vcpu {
         state.port_input = input;
         // 80386 PRM §5.2.5 p. 5-11; Intel486 PRM §5.3.5 p. 5-22:
         // loading CR3 flushes even when its value is unchanged.
-        if outcome.translations_invalidated || outcome.context_changed {
+        if outcome.translations_invalidated {
             state.invalidate();
+        } else if outcome.context_changed {
+            state.reconcile(vm, &self.cpu, model.legacy_model());
         }
         self.cpu.finish_mmio_retry(outcome.exit.as_ref());
         outcome.exit.map_or(Ok(()), Err)

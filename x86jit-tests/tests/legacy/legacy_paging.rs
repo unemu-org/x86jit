@@ -3569,7 +3569,7 @@ fn public_device_write_acknowledgement_invalidates_declared_code_alias() {
     f.cpu.cpu.rip = 0x400;
     assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
     let after = f.cpu.paging_cache_for_test();
-    assert!(after.0 > before.0);
+    assert_eq!(after.0, before.0); // SMC expires source proofs, not translations.
     assert!(after.2 > before.2);
 }
 
@@ -4285,7 +4285,7 @@ fn tlb_stale_mapping_and_accessed_bits_last_until_explicit_invalidation() {
 fn tlb_embedder_edits_map_identity_and_reset_flush_data_translations() {
     // Paging design §3.2: conservative flush on positive-entry edits/restore.
     for model in MODELS {
-        for trigger in 0..7 {
+        for trigger in [0, 2, 3, 4, 5, 6] {
             let mut f = Fixture::new(model, true, 0);
             f.code_mapping(0, CODE_FRAME);
             f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
@@ -4297,7 +4297,6 @@ fn tlb_embedder_edits_map_identity_and_reset_flush_data_translations() {
             f.put(f.pte(), NEXT | 7);
             match trigger {
                 0 => f.cpu.invalidate_paging(),
-                1 => f.cpu.cpu.legacy.segments[1].limit -= 1,
                 2 => f.cpu.set_a20_enabled(false),
                 3 => f.cpu.cpu.legacy.cr3 ^= 8,
                 4 => {
@@ -4511,5 +4510,198 @@ fn arpl_readonly_page_faults_only_when_raising_rpl() {
                 assert_eq!(f.get(f.pte()) & D, 0);
             }
         }
+    }
+}
+
+#[test]
+fn tlb_context_edits_keep_stale_translations_and_reuse_prior_blocks() {
+    // Paging design §3.2; SDM Vol 3A §5.10.2.3: segment/CPL/flags
+    // edits select different proofs without expiring cached translations.
+    for model in MODELS {
+        for edit in 0..5 {
+            let mut f = Fixture::new(model, true, 0);
+            f.code_mapping(0, CODE_FRAME);
+            f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &f.code(false, OFFSET))
+                .unwrap();
+            f.put(u64::from(DATA), 0x11);
+            f.put(u64::from(NEXT), 0x22);
+            f.fetch_at(0x400).unwrap();
+            let before = f.cpu.paging_cache_for_test();
+            let old = f.cpu.cpu.clone();
+            f.put(f.pte(), NEXT | 7);
+            match edit {
+                0 => f.cpu.cpu.legacy.segments[1].limit -= 1,
+                1 => f.cpu.cpu.ds ^= 8,
+                2 => {
+                    f.cpu.cpu.legacy.cpl = 3;
+                    for s in &mut f.cpu.cpu.legacy.segments {
+                        s.attributes |= 0x60;
+                    }
+                }
+                3 => f.cpu.cpu.rflags_system ^= 0x3000,
+                4 => f.cpu.cpu.legacy.cr0 ^= 8, // TS is not a walk input.
+                _ => unreachable!(),
+            }
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            let changed = f.cpu.paging_cache_for_test();
+            assert_eq!(changed, (before.0, before.1 + 1, before.2 + 1));
+            f.cpu.cpu = old;
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            assert_eq!(f.cpu.paging_cache_for_test(), changed);
+            assert_eq!(f.get(f.pte()), NEXT | 7); // No walk or A update.
+        }
+    }
+}
+
+fn cached_denial_handler_repairs_and_retries(rights: u32, write: bool, fetch: bool) {
+    // SDM Vol 3A §5.10.4.1 p. 5-49: #PF invalidates the faulting
+    // translation so repairing its PTE suffices when the instruction retries.
+    // 80386 PRM §§6.4.1–6.4.2 Table 6-5; SDM Vol 3A §5.6.1: U/S, R/W.
+    for model in MODELS {
+        for code32 in [false, true] {
+            let mut f = Fixture::with_delivery(
+                Vm::new(VmConfig::flat(0x20000)),
+                model,
+                code32,
+                0,
+                x86jit_core::ExceptionDelivery::InGuest,
+            );
+            f.system_setup();
+            // Exercise Seg16 and Flat32 through public dispatch, including the
+            // fast operand helper's fallback when cached rights deny access.
+            let data_base = if code32 { 0 } else { BASE };
+            for segment in &mut f.cpu.cpu.legacy.segments[1..] {
+                segment.base = data_base;
+            }
+            let offset = LINEAR - data_base;
+            let user_sp = u64::from(BASE + 0x4800 - data_base);
+            f.cpu.cpu.gpr[4] = user_sp;
+            f.system_page(4, NEXT, 7);
+            f.put(0x14004, 0xa800); // ESP0, SS0 in the TSS
+            f.put(0x14008, 16);
+            f.cpu.cpu.legacy.gdtr.limit = 0x37;
+            let attr = if code32 { 0xc000 } else { 0x8000 };
+            f.put64(0x12028, step4_descriptor(0, 0xfffff, attr | 0xfb));
+            f.put64(0x12030, step4_descriptor(data_base, 0xfffff, attr | 0xf3));
+            f.gate(14, 0x1800, 4);
+            f.code_mapping(0, CODE_FRAME);
+            f.code_mapping(0x1000, OTHER_FRAME);
+            for (ip, store) in [(0x400, false), (0x500, true)] {
+                let code = if fetch {
+                    vec![0x90]
+                } else {
+                    f.code(store, offset)
+                };
+                f.vm.write_bytes(u64::from(CODE_FRAME) + ip, &code).unwrap();
+            }
+            let (pde, pte, table, frame, repair_offset) = if fetch {
+                (PD, u64::from(CODE_PT), CODE_PT, CODE_FRAME, 0xb000)
+            } else {
+                (f.pde(), f.pte(), PT, DATA, 0xb00c)
+            };
+            f.put(pte, frame | rights);
+            f.put(u64::from(DATA), 0x11);
+            let exit = public_step(&mut f);
+            assert!(matches!(exit, Exit::BudgetExhausted), "{exit:?}");
+            let generation = f.cpu.paging_cache_for_test().0;
+            // Clear A/D in RAM without expiring the supervisor fill. Paging
+            // design Q2: a denied 386 hit leaves A/D; a 486 rewalk sets A.
+            f.put(pde, table | 7);
+            f.put(pte, frame | rights);
+            f.system_page(11, table, 3);
+            let mut handler = vec![0x90, 0xc7, 0x05]; // NOP; MOV dword [PTE alias], repaired PTE
+            handler.extend((BASE + repair_offset - data_base).to_le_bytes());
+            handler.extend((frame | 7).to_le_bytes());
+            handler.extend([0x83, 0xc4, 4, 0xcf]); // discard error code; IRETD
+            f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x800, &handler)
+                .unwrap();
+            f.cpu.cpu.legacy.cpl = 3;
+            f.cpu.cpu.cs = 0x2b;
+            f.cpu.cpu.ss = 0x33;
+            f.cpu.cpu.ds = 0x33;
+            f.cpu.cpu.es = 0x33;
+            for segment in &mut f.cpu.cpu.legacy.segments {
+                segment.attributes |= 0x60;
+            }
+            f.cpu.cpu.gpr[0] = 0x55;
+            let ip = if write { 0x500 } else { 0x400 };
+            f.cpu.cpu.rip = ip;
+            let exit = public_step(&mut f);
+            assert!(matches!(exit, Exit::BudgetExhausted), "{exit:?}");
+            assert_eq!((f.cpu.cpu.legacy.cpl, f.cpu.cpu.rip), (0, 0x1801));
+            assert_eq!(f.cpu.cpu.legacy.cr2, if fetch { ip as u32 } else { LINEAR });
+            assert_eq!(f.get(0x167e8), if write { 7 } else { 5 });
+            assert_eq!(f.get(0x167ec), ip as u32);
+            assert_eq!(f.get(u64::from(DATA)), 0x11);
+            let a = if model == CpuModel::I80386 { 0 } else { A };
+            assert_eq!(f.get(pde), table | 7 | A);
+            assert_eq!(f.get(pte), frame | rights | a);
+            for _ in 0..3 {
+                // handler repair, discard, IRETD
+                let exit = public_step(&mut f);
+                assert!(matches!(exit, Exit::BudgetExhausted), "{exit:?}");
+            }
+            assert_eq!((f.cpu.cpu.legacy.cpl, f.cpu.cpu.rip), (3, ip));
+            assert_eq!(f.cpu.cpu.gpr[4], user_sp);
+            let exit = public_step(&mut f);
+            assert!(matches!(exit, Exit::BudgetExhausted), "{exit:?}");
+            let len = if fetch {
+                1
+            } else {
+                f.code(write, offset).len() as u64
+            };
+            assert_eq!(
+                f.cpu.cpu.rip,
+                ip + len,
+                "{model:?}/{code32}/{rights}/{write}/{fetch}"
+            );
+            assert_ne!(f.cpu.paging_cache_for_test().0, generation);
+            assert_eq!(f.get(u64::from(DATA)), if write { 0x55 } else { 0x11 });
+            if !fetch && !write {
+                assert_eq!(f.cpu.cpu.gpr[0], 0x11);
+            }
+        }
+    }
+}
+
+#[test]
+fn tlb_cpl_denial_handler_repairs_pte_and_iret_retries_data() {
+    for (rights, write) in [(3, false), (3, true)] {
+        cached_denial_handler_repairs_and_retries(rights, write, false);
+    }
+}
+
+#[test]
+fn tlb_cpl_denial_handler_repairs_pte_and_iret_retries_readonly_write() {
+    cached_denial_handler_repairs_and_retries(5, true, false);
+}
+
+#[test]
+fn tlb_cpl_denial_handler_repairs_pte_and_iret_retries_fetch() {
+    cached_denial_handler_repairs_and_retries(3, false, true);
+}
+
+#[test]
+fn paged_context_capacity_is_bounded_without_expiring_translations() {
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, b"\x90")
+            .unwrap();
+        f.fetch_at(0x400).unwrap();
+        let generation = f.cpu.paging_cache_for_test().0;
+        for selector in 1..=80 {
+            f.cpu.cpu.ds = selector;
+            f.fetch_at(0x400).unwrap();
+            let proof = f.cpu.paging_cache_for_test();
+            assert_eq!(proof.0, generation);
+            assert!(proof.1 <= 64);
+        }
+        f.cpu.cpu.ds = 0;
+        let lifts = f.cpu.paging_cache_for_test().2;
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.paging_cache_for_test().2, lifts + 1);
     }
 }

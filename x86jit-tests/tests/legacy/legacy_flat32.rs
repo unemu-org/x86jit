@@ -1530,3 +1530,107 @@ fn reserved_bit21_preserves_flat32_selection() {
         fixture::steps(&mut cpu, &vm, 1);
     }
 }
+
+#[test]
+fn paged_context_instructions_keep_translation_and_reuse_blocks() {
+    // SDM Vol 2A CALL/IRET/MOV, Vol 2B POPF/RET; paging design §3.2.
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for event in 0..4 {
+            let code: &[u8] = match event {
+                0 => b"\x8e\xd8\x8e\xc0",             // MOV DS,AX; MOV ES,AX
+                1 => b"\x9a\x00\x11\x00\x00\x08\x00", // CALL FAR
+                2 => b"\x50\x9d",                     // PUSH EAX; POPFD (change IOPL)
+                3 => b"\xcf",                         // IRETD (change IOPL)
+                _ => unreachable!(),
+            };
+            let (vm, mut cpu) = paged_setup(model, code, false);
+            vm.write_bytes(0x1100, b"\xcb").unwrap();
+            let mut warm = None;
+            // Initial segment-cache descriptor encoding can normalize on reload.
+            // Two full passes warm both the initial and normalized contexts.
+            for round in 0..4 {
+                cpu.cpu.rip = 0x1000;
+                cpu.cpu.gpr[4] = 0x7000;
+                cpu.cpu.gpr[0] = if event == 0 { 16 } else { 0x3002 };
+                cpu.cpu.rflags_system = 0;
+                if event == 3 {
+                    put(&vm, 0x7000, 0x1100);
+                    put(&vm, 0x7004, 8);
+                    put(&vm, 0x7008, 0x3002);
+                }
+                let count = if event == 3 { 1 } else { 2 };
+                fixture::steps(&mut cpu, &vm, count);
+                if event >= 2 {
+                    assert_eq!(cpu.cpu.rflags_system & 0x3000, 0x3000);
+                }
+                let proof = cpu.paging_cache_for_test();
+                assert!(proof.1 >= 1);
+                if round == 1 {
+                    warm = Some(proof);
+                } else if round > 1 {
+                    assert_eq!(Some(proof), warm, "event {event}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paged_smc_expires_blocks_in_every_retained_context_without_flushing_tlb() {
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        let (vm, mut cpu) = paged_setup(model, b"\x40\xeb\xfd", false);
+        for flags in [0, 0x3000] {
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.rflags_system = flags;
+            fixture::steps(&mut cpu, &vm, 1);
+        }
+        let before = cpu.paging_cache_for_test();
+        assert_eq!(before.1, 2);
+        vm.write_bytes(0x1000, b"\x43").unwrap(); // INC EBX in both contexts.
+        for flags in [0, 0x3000] {
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.rflags_system = flags;
+            let eax = cpu.cpu.gpr[0];
+            let ebx = cpu.cpu.gpr[3];
+            fixture::steps(&mut cpu, &vm, 1);
+            assert_eq!(cpu.cpu.gpr[0], eax);
+            assert_eq!(cpu.cpu.gpr[3], ebx + 1);
+        }
+        let after = cpu.paging_cache_for_test();
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1, 2);
+        assert_eq!(after.2, before.2 + 2);
+    }
+}
+
+#[test]
+fn paged_privilege_gate_round_trips_reuse_prior_context_blocks() {
+    // SDM Vol 3A §§6.8.5, 6.12.1; Vol 2A IRET and Vol 2B RET.
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for call in [false, true] {
+            let code: &[u8] = if call {
+                b"\x40\x9a\x00\x00\x00\x00\x33\x00\x42\x0f\x0b"
+            } else {
+                b"\x40\xcd\x20\x42\x0f\x0b"
+            };
+            let (vm, mut cpu) = user_setup(model, code, true, false);
+            vm.write_bytes(0x2030, &[0, 0x40, 8, 0, 0, 0xec, 0, 0])
+                .unwrap();
+            vm.write_bytes(0x4000, if call { b"\x43\xcb" } else { b"\x43\xcf" })
+                .unwrap();
+            let mut warm = None;
+            for round in 0..4 {
+                cpu.cpu.rip = 0x1000;
+                fixture::steps(&mut cpu, &vm, 5);
+                assert_eq!(cpu.cpu.legacy.cpl, 3);
+                let proof = cpu.paging_cache_for_test();
+                assert!(proof.1 > 0, "{proof:?}");
+                if round == 1 {
+                    warm = Some(proof);
+                } else if round > 1 {
+                    assert_eq!(Some(proof), warm, "call={call}");
+                }
+            }
+        }
+    }
+}

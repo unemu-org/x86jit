@@ -2625,3 +2625,29 @@ fn held_v86_instruction_vm_edit_abandons_mmio_answer() {
 fn held_protected_instruction_cache_edit_abandons_mmio_answer() {
     instruction_retry_with_edited_context(2);
 }
+
+#[test]
+fn paged_v86_segment_loads_retain_translations_and_prior_context_blocks() {
+    // SDM Vol 3B §23.2; paging design §3.2.
+    for model in MODELS {
+        let (vm, mut cpu) = world(model, b"\x8e\xd8\x8e\xc0", 3);
+        identity_paging(&vm, &mut cpu);
+        let mut warm = None;
+        for round in 0..4 {
+            cpu.cpu.rip = 0x1000;
+            canonical(&mut cpu, SegmentId::Ds, 0);
+            canonical(&mut cpu, SegmentId::Es, 0);
+            cpu.cpu.gpr[0] = 0x200;
+            transfer_steps(&mut cpu, &vm, 2);
+            assert_eq!(cpu.cpu.legacy.segments[1].base, 0x2000);
+            assert_eq!(cpu.cpu.legacy.segments[2].base, 0x2000);
+            let proof = cpu.paging_cache_for_test();
+            assert_eq!(proof.1, 2);
+            if round == 0 {
+                warm = Some(proof);
+            } else {
+                assert_eq!(Some(proof), warm);
+            }
+        }
+    }
+}

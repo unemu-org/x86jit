@@ -500,3 +500,29 @@ fn stack_width_and_near_target_faults_preserve_predecessors() {
         }
     }
 }
+
+#[test]
+fn paged_cpl3_segment_reloads_and_far_returns_retain_context_blocks() {
+    // SDM Vol 2A CALL/MOV, Vol 2B RET; spec.md §17.10 Seg16.
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        let code = b"\x8e\xd8\x8e\xc0\x9a\x20\x01\x0b\x00";
+        let (vm, mut cpu) = setup(model, code, 3, true, false);
+        vm.write_bytes(0x1120, b"\xcb").unwrap();
+        let mut warm = None;
+        for round in 0..4 {
+            cpu.cpu.rip = 0x100;
+            cpu.cpu.gpr[0] = 19;
+            fixture::steps(&mut cpu, &vm, 4);
+            assert_eq!(cpu.cpu.rip, 0x109);
+            assert_eq!(cpu.cpu.legacy.segments[1].base, 0xa000);
+            assert_eq!(cpu.cpu.legacy.segments[2].base, 0xa000);
+            let proof = cpu.paging_cache_for_test();
+            assert!(proof.1 > 0, "{proof:?}");
+            if round == 1 {
+                warm = Some(proof);
+            } else if round > 1 {
+                assert_eq!(Some(proof), warm);
+            }
+        }
+    }
+}

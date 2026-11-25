@@ -79,7 +79,10 @@ impl Tlb {
     pub(crate) fn reconcile(&mut self, cpu: &CpuState) {
         let context = (
             cpu.legacy.cr3,
-            cpu.legacy.cr0,
+            // Paging design §3.2: segment/CPL/flags and CR0's execution
+            // controls do not identify translations. Retain PE/CD/NW as
+            // conservative walk inputs alongside PG/WP. No model has CR4.
+            cpu.legacy.cr0 & 0xe001_0001,
             cpu.legacy.a20_enabled,
             cpu.machine_flags_mask,
         );
@@ -401,6 +404,9 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
             if !permitted(cpu, access, privilege, e.rights)
                 && (cpu.machine_flags_mask == 0 || !set_accessed)
             {
+                // SDM Vol 3A §5.10.4.1 p. 5-49: #PF invalidates the
+                // faulting translation, including its instruction-source proof.
+                tlb.remove(linear);
                 return Err(PageFault {
                     linear,
                     access,
@@ -2701,6 +2707,7 @@ mod tests {
                         vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
                         vm.write_bytes(0x3004, &0x4003u32.to_le_bytes()).unwrap();
                     }
+                    let generation = tlb.borrow().generation;
                     let exit = match translate_linear(
                         &mut cpu,
                         &mem,
@@ -2713,6 +2720,10 @@ mod tests {
                         Err(exit) => exit,
                         Ok(_) => panic!("supervisor fill authorized a user access"),
                     };
+                    if warm {
+                        assert!(tlb.borrow().entries[1].is_none());
+                        assert_ne!(tlb.borrow().generation, generation);
+                    }
                     assert_eq!(
                         exit.fault_metadata().unwrap().error_code(),
                         ErrorCode::bits(if access == AccessKind::Write { 7 } else { 5 }, 7)
