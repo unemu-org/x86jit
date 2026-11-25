@@ -546,6 +546,8 @@ fn last_host_fault() -> u64 {
 
 #[derive(Debug)]
 pub enum MapError {
+    /// A vCPU is executing or owns an outstanding device handoff.
+    DeviceBusy,
     Overlap,
     OutOfBounds,
     BadAlign,

@@ -42,3 +42,23 @@ loop {
 ```
 
 <TBD: expand with a runnable end-to-end example once M2 (static ELF hello-world) lands.>
+
+
+## In-process Machine devices
+
+Select a `CpuModel`, map MMIO as `RegionKind::Trap`, and register physical MMIO
+and/or port ranges with `Vm::register_device_range`. Lend your `DeviceIo`
+implementation to `cpu.run_steps_with_devices(&vm, budget, options, Some(&mut
+board))`; the same board may borrow a single-threaded device graph for the call.
+Return `Handled(value)` to continue, `Fallback` for ordinary Exit/completion, or
+`DeviceFault(error)` for explicit host recovery. Make no device-private changes
+when declining/faulting. Use the restricted context for tracked RAM writes and
+board signals. INTR is a level: on `Exit::Device(DeviceStop::IntrReady)`, let
+your interrupt controller
+choose a vector and use `inject_irq`; deassert with `set_intr(false)` when the
+controller lowers the line. Set an exact step/retirement deadline when a device
+needs service before the run budget ends. Drain the normal delivery log at your
+chosen scheduling boundaries. Registration changes and snapshots require
+quiescence with completed or explicitly abandoned handoffs; reconstruct ranges
+and device state on restore. Treat handler panic poisoning as terminal for that
+VM. See [spec §5.4](../design/spec.md#54-borrowed-machine-devices-decision-28-stages-23).

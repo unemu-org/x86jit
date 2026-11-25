@@ -71,6 +71,8 @@ CORE_SRC = "x86jit-core/src/"
 #   lib.rs, ir/verify.rs: declarations and public re-exports (legacy_probes is
 #     compiled for unit tests only).
 REVIEWED_ENTRY_POINTS = {
+    # Device callback witnesses explicitly select Machine catalogue entries.
+    "x86jit-core/src/vm/device/tests.rs": {"model::CpuModel"},
     # Machine-only Exit/completion census across catalogue families.
     "x86jit-core/src/vm/legacy/exit_census.rs": {"model::CpuModel"},
     "x86jit-core/src/interp/control.rs": {

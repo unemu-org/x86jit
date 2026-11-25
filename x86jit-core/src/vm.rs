@@ -15,6 +15,7 @@ use crate::jit_abi::{
     RET_MMIO_DEFER, RET_MXCSR_CHANGED, RET_PORTIO_DEFER, RET_RETURN_MISS, RET_SYSCALL,
     RET_UNMAPPED, RET_UNMAPPED_DETAIL,
 };
+pub(crate) mod device;
 mod i8086;
 mod legacy;
 pub(crate) use legacy::paging_generation;
@@ -537,12 +538,14 @@ pub struct VmConfig {
 pub enum ForkError {
     SparseBacking,
     UnsupportedBacking,
+    DeviceBusy,
 }
 impl std::fmt::Display for ForkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::SparseBacking => "fork of sparse backing is unsupported",
             Self::UnsupportedBacking => "guest backing cannot be copied by the core",
+            Self::DeviceBusy => "device execution must be quiescent and coherent before fork",
         })
     }
 }
@@ -659,11 +662,16 @@ impl std::fmt::Display for ShutdownError {
 
 impl std::error::Error for ShutdownError {}
 
+#[derive(Default)]
+struct VmLifetime {
+    devices: device::Registry,
+}
+
 /// Shared per-machine state: guest memory + translation cache + backend (§2).
 pub struct Vm {
     time_enabled: bool,
     time_registry: Mutex<crate::time_stats::Registry>,
-    vcpu_lifetime: Arc<()>,
+    vcpu_lifetime: Arc<VmLifetime>,
     vcpu_memory: Mutex<Vec<std::sync::Weak<VcpuAllocations>>>,
     precise_split_stores: bool,
     compile_hold: Option<(std::time::Duration, Arc<std::sync::atomic::AtomicBool>)>,
@@ -734,6 +742,11 @@ pub struct Vm {
 }
 
 impl Vm {
+    #[inline(always)]
+    fn devices(&self) -> &device::Registry {
+        &self.vcpu_lifetime.devices
+    }
+
     /// Sum cumulative vCPU counters without a compiler lock. See [`crate::TimeStats`]
     /// for units, timing methods, snapshot lag and overlapping categories.
     pub fn time_stats(&self) -> crate::TimeStats {
@@ -1384,10 +1397,13 @@ impl Vm {
     /// sparse backing and caller-owned `Reserved` spans. Use
     /// [`Self::try_fork_with_backend`] for a typed refusal.
     pub fn fork_with_backend(&self, backend: Box<dyn Backend>) -> Option<Vm> {
+        if !self.devices().quiescent() || self.devices().poisoned() {
+            return None;
+        }
         Some(Vm {
             time_enabled: false,
             time_registry: Mutex::default(),
-            vcpu_lifetime: Arc::new(()),
+            vcpu_lifetime: Arc::new(VmLifetime::default()),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: self.precise_split_stores,
             compile_hold: None,
@@ -1454,7 +1470,7 @@ impl Vm {
         Self {
             time_enabled: false,
             time_registry: Mutex::default(),
-            vcpu_lifetime: Arc::new(()),
+            vcpu_lifetime: Arc::new(VmLifetime::default()),
             vcpu_memory: Mutex::new(Vec::new()),
             precise_split_stores: false,
             compile_hold: None,
@@ -1522,6 +1538,9 @@ impl Vm {
     /// Typed alternative to [`Self::fork_with_backend`]. Sparse backing cannot
     /// be deep-copied by the existing whole-buffer fork implementation.
     pub fn try_fork_with_backend(&self, backend: Box<dyn Backend>) -> Result<Vm, ForkError> {
+        if !self.devices().quiescent() || self.devices().poisoned() {
+            return Err(ForkError::DeviceBusy);
+        }
         if self.mem.is_sparse() {
             return Err(ForkError::SparseBacking);
         }
@@ -1555,6 +1574,9 @@ impl Vm {
         prot: Prot,
         kind: RegionKind,
     ) -> Result<(), MapError> {
+        if self.devices().mapping_busy(guest_addr, size) {
+            return Err(MapError::DeviceBusy);
+        }
         self.mem.map(guest_addr, size, prot, kind)?;
         // Mapping a Trap (MMIO) region changes the compile-time window a JIT bakes
         // into its Trap-range check (§5.2). Any block already compiled with
@@ -1599,6 +1621,9 @@ impl Vm {
     }
 
     pub fn unmap(&mut self, guest_addr: u64, size: usize) -> Result<(), MapError> {
+        if self.devices().mapping_busy(guest_addr, size) {
+            return Err(MapError::DeviceBusy);
+        }
         let result = self.mem.unmap(guest_addr, size);
         // A sparse decommit error occurs after the region tag has been removed.
         // Its translations must still be invalidated before returning the error.
@@ -1815,6 +1840,13 @@ impl Vm {
         registry.retain(|weak| weak.strong_count() != 0);
         registry.push(Arc::downgrade(&allocations));
         drop(registry);
+        let mut fault_entry = Box::<VcpuCold>::default();
+        if self.profile == ExecutionProfile::Machine {
+            fault_entry.devices.state = self.devices().add_cpu(&word);
+            fault_entry.devices.id = id;
+        }
+        let legacy_execution =
+            (self.profile == ExecutionProfile::Machine).then(|| Box::new(legacy::Execution::new()));
         Vcpu {
             time_dispatch: crate::time_stats::DispatchCounts::default(),
             time_record: self.time_registry.lock().unwrap().register(),
@@ -1835,8 +1867,7 @@ impl Vm {
                 self.exception_delivery
             },
             cpu_model: self.cpu_model,
-            legacy_execution: (self.profile == ExecutionProfile::Machine)
-                .then(|| Box::new(legacy::Execution::new())),
+            legacy_execution,
             fast: Box::new(
                 [FastEntry {
                     rip: 0,
@@ -1852,7 +1883,7 @@ impl Vm {
             fast_empty_reason: PrivateMiss::Cold,
             ibtc_refills: HashMap::new(),
             ret_stack: Box::new(RetStack::new()),
-            fault_entry: Box::default(),
+            fault_entry,
             fast_hits: 0,
             chained: 0,
             executed: 0,
@@ -2088,7 +2119,7 @@ pub struct Vcpu {
     time_record: Arc<crate::time_stats::Record>,
     time_outside: crate::time_stats::Outside,
     allocations: Arc<VcpuAllocations>,
-    _vm_lifetime: Arc<()>,
+    _vm_lifetime: Arc<VmLifetime>,
     pub cpu: CpuState,
     exit_request: ExitRequest,
     interruption_evidence: Option<crate::InterruptionEvidence>,
@@ -2131,7 +2162,7 @@ pub struct Vcpu {
     /// calls (syscall exits re-enter `run()` constantly); its `sp` resets on an
     /// invalidation-epoch change. Boxed for a stable address and a small `Vcpu`.
     ret_stack: Box<RetStack>,
-    fault_entry: Box<crate::jit_abi::fault::EntryRecord>,
+    fault_entry: Box<VcpuCold>,
     /// Fast-resolve cache hits over this vcpu's lifetime. A plain counter, not atomic —
     /// a shared atomic here would reintroduce exactly the contention the private cache
     /// removes. Read via [`Vcpu::fast_hits`].
@@ -2190,6 +2221,26 @@ pub struct Vcpu {
     /// diagnostics, outside `CpuState` and `jit_abi`; written only by the cold
     /// recording calls at the Machine delivery sites.
     delivery_log: Option<Box<crate::DeliveryLog>>,
+}
+
+// Cold host-owned state shares the existing fault-record allocation. Keep
+// device bookkeeping out of the frequently accessed Machine execution layout.
+#[derive(Default)]
+#[repr(C)]
+struct VcpuCold {
+    record: crate::jit_abi::fault::EntryRecord,
+    devices: device::Cpu,
+}
+impl std::ops::Deref for VcpuCold {
+    type Target = crate::jit_abi::fault::EntryRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+impl std::ops::DerefMut for VcpuCold {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
 }
 
 const APPLICATION_DISPATCH: u8 = 0;
@@ -2266,6 +2317,15 @@ impl Drop for DispatchGuard<'_> {
 }
 
 impl Vcpu {
+    #[inline(always)]
+    fn device_cpu(&self) -> &device::Cpu {
+        &self.fault_entry.devices
+    }
+    #[inline(always)]
+    fn device_cpu_mut(&mut self) -> &mut device::Cpu {
+        &mut self.fault_entry.devices
+    }
+
     /// Discard this vCPU's derived guest-paging translations and fetch proofs.
     /// Call between runs after page-table edits or checkpoint restore, including
     /// when CR0/CR3 have unchanged values. Synchronize edits with every affected
@@ -2301,11 +2361,17 @@ impl Vcpu {
     /// the delivery log ([`Self::enable_delivery_log`]) with its records and
     /// counts: a reset is not a delivery, and nothing is recorded for it.
     /// Machine guest-paging translations and private fetch proofs are discarded.
-    /// The embedder's A20 request is preserved because it is a board signal; a queued change
+    /// The embedder's A20 and INTR levels are preserved as board signals; a queued A20 change
     /// applies when reset abandons its instruction. Existing exit
     /// and fault handles remain valid. An exit request racing with this call is
     /// discarded if it precedes the atomic request clear; later requests remain pending.
     pub fn reset_execution_state(&mut self, options: ResetOptions) {
+        self.device_cpu().state.set_pending(false);
+        self.device_cpu_mut().published = false;
+        self.device_cpu_mut().fault = None;
+        self.device_cpu_mut().request = None;
+        self.device_cpu_mut().mmio = false;
+        self.device_cpu_mut().invalidate = false;
         crate::interruption::consume(&self.exit_request.word, &self.engine_sections);
         // spec.md §17.10: reset ends NMI blocking (ASSUMED; no PRM states it).
         self.exit_request
@@ -2330,7 +2396,7 @@ impl Vcpu {
         self.cpu.mmio_retry_active = false;
         self.cpu.mmio_retry_cs = 0;
         self.apply_pending_a20();
-        *self.fault_entry = Default::default();
+        self.fault_entry.record = Default::default();
         self.fast_clear();
         if options.x87_init {
             crate::x87::fninit(&mut self.cpu);
@@ -3006,12 +3072,26 @@ impl Vcpu {
     /// JIT-side MMIO trap/resume is deferred, and the JIT never emits an
     /// `Exit::MmioRead` for an inlined load, so this is only reached under the interp.
     pub fn complete_mmio_read(&mut self, value: u64) {
+        if let Some(Exit::Device(crate::DeviceStop::Fault { .. })) =
+            self.device_cpu().fault.as_ref()
+        {
+            if !matches!(
+                self.device_request().unwrap().handoff(),
+                Exit::MmioRead { .. }
+            ) {
+                return;
+            }
+        }
+        self.device_cpu_mut().fault = None;
+        self.device_cpu_mut().request = None;
+        self.device_cpu_mut().mmio = false;
         // Preserve the owner recorded at the exit, even if public state changed
         // before completion. The next interpreter entry validates that owner.
         if !self.cpu.mmio_retry_active {
             self.cpu.begin_mmio_retry(self.cpu.rip);
         }
         self.cpu.pending_mmio = Some(value);
+        self.refresh_device_pending();
     }
 
     /// Acknowledge an `Exit::MmioWrite` after performing its side effect, then
@@ -3033,10 +3113,24 @@ impl Vcpu {
     /// operand inside one Trap region; Long64 and Compat32 return
     /// `Exit::UnknownInstruction` for those (spec.md §5.2).
     pub fn complete_mmio_write(&mut self) {
+        if let Some(Exit::Device(crate::DeviceStop::Fault { .. })) =
+            self.device_cpu().fault.as_ref()
+        {
+            if !matches!(
+                self.device_request().unwrap().handoff(),
+                Exit::MmioWrite { .. }
+            ) {
+                return;
+            }
+        }
+        self.device_cpu_mut().fault = None;
+        self.device_cpu_mut().request = None;
+        self.device_cpu_mut().mmio = false;
         if !self.cpu.mmio_retry_active {
             self.cpu.begin_mmio_retry(self.cpu.rip);
         }
         self.cpu.pending_mmio_write = true;
+        self.refresh_device_pending();
     }
 
     /// Supply the value for an outstanding IN or INS (§5.2).
@@ -3047,6 +3141,21 @@ impl Vcpu {
     /// the port again. IRQ acceptance stays blocked until the store completes.
     /// Calling this without an outstanding input request is a no-op.
     pub fn complete_port_in(&mut self, value: u64) {
+        if let Some(Exit::Device(crate::DeviceStop::Fault { .. })) =
+            self.device_cpu().fault.as_ref()
+        {
+            if !matches!(
+                self.device_request().unwrap().handoff(),
+                Exit::PortIo {
+                    dir: crate::PortDir::In,
+                    ..
+                }
+            ) {
+                return;
+            }
+        }
+        self.device_cpu_mut().fault = None;
+        self.device_cpu_mut().request = None;
         if let Some(size) = self.cpu.pending_port_in.take() {
             if let Some(p) = &mut self.cpu.port_string_in {
                 p.value = Some(value & (u64::MAX >> (64 - u32::from(size) * 8)));
@@ -3057,6 +3166,7 @@ impl Vcpu {
                 self.ss_shadow = 0;
             }
         }
+        self.refresh_device_pending();
     }
 
     fn finish_port_string_in<const ROUTED: bool>(&mut self, vm: &Vm) -> Result<(), Exit> {
@@ -3103,6 +3213,9 @@ impl Vcpu {
     /// Legacy real execution performs one run_steps unit, including one REP iteration.
     pub fn step_instruction(&mut self, vm: &Vm) -> StepResult {
         if self.profile == ExecutionProfile::Machine {
+            if vm.devices().poisoned() {
+                return StepResult::Exit(Exit::Device(crate::DeviceStop::Poisoned));
+            }
             return match self.run_steps(vm, 1, StepOptions::default()) {
                 Ok(run) => match run.stop {
                     StepStop::Exit(Exit::BudgetExhausted) | StepStop::IrqReady => {
@@ -3352,12 +3465,78 @@ impl Vcpu {
         budget: Option<u64>,
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
+        if KIND >= MACHINE_DISPATCH && self.device_cpu().state.observed() {
+            return self.run_observed_engine::<KIND, STEPPED>(vm, budget, options);
+        }
+        self.run_engine_devices::<KIND, STEPPED, false, false>(
+            vm,
+            budget,
+            options,
+            &mut device::Run::default(),
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn run_observed_engine<const KIND: u8, const STEPPED: bool>(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        options: StepOptions,
+    ) -> Result<StepRun, StepRunError> {
+        if self.device_cpu().intr || self.device_cpu().invalidate {
+            self.run_engine_devices::<KIND, STEPPED, true, true>(
+                vm,
+                budget,
+                options,
+                &mut device::Run::default(),
+            )
+        } else {
+            self.run_engine_devices::<KIND, STEPPED, false, true>(
+                vm,
+                budget,
+                options,
+                &mut device::Run::default(),
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn run_engine_devices<
+        const KIND: u8,
+        const STEPPED: bool,
+        const DEVICES: bool,
+        const OBSERVED: bool,
+    >(
+        &mut self,
+        vm: &Vm,
+        budget: Option<u64>,
+        options: StepOptions,
+        devices: &mut device::Run<'_>,
+    ) -> Result<StepRun, StepRunError> {
+        if OBSERVED && KIND >= MACHINE_DISPATCH && vm.devices().poisoned() {
+            return Ok(StepRun {
+                steps: 0,
+                stop: StepStop::Exit(Exit::Device(crate::DeviceStop::Poisoned)),
+            });
+        }
+        if OBSERVED && KIND >= MACHINE_DISPATCH {
+            if let Some(exit) = &self.device_cpu().fault {
+                return Ok(StepRun {
+                    steps: 0,
+                    stop: StepStop::Exit(exit.clone()),
+                });
+            }
+        }
+        let _active = (OBSERVED && KIND >= MACHINE_DISPATCH)
+            .then(|| device::Active::enter(&self.device_cpu().state));
         // Decision-16 §3: every execution exit passes the attempt's ownership
         // boundary. Only explicit continuations can return a REP flag origin.
         // The twenty-bit walk never sets a REP flag origin (only
         // `execute_protected_block` does); its REP restart pair is recorded
         // at the end of `run_engine_attempt` (xj-50w.15).
-        let result = self.run_engine_attempt::<KIND, STEPPED>(vm, budget, options);
+        let result = self
+            .run_engine_attempt::<KIND, STEPPED, DEVICES, OBSERVED>(vm, budget, options, devices);
         if KIND >= MACHINE_DISPATCH && KIND != DIRECT20_DISPATCH && budget != Some(0) {
             self.finish_comparison_attempt(&result);
         }
@@ -3365,11 +3544,17 @@ impl Vcpu {
     }
 
     #[inline(always)]
-    fn run_engine_attempt<const KIND: u8, const STEPPED: bool>(
+    fn run_engine_attempt<
+        const KIND: u8,
+        const STEPPED: bool,
+        const DEVICES: bool,
+        const OBSERVED: bool,
+    >(
         &mut self,
         vm: &Vm,
         budget: Option<u64>,
         options: StepOptions,
+        devices: &mut device::Run<'_>,
     ) -> Result<StepRun, StepRunError> {
         if KIND == ALIAS_DISPATCH && STEPPED && budget == Some(0) {
             let time_run = crate::time_stats::RunGuard::enter(
@@ -3455,7 +3640,7 @@ impl Vcpu {
                 }
             }
         }
-        let guard = FaultRunGuard(&mut *cpu.fault_entry);
+        let guard = FaultRunGuard(&mut cpu.fault_entry.record);
         let mut result = if KIND == APPLICATION_DISPATCH {
             let exit = if vm.mem.host_fault_recovery() {
                 cpu.run_inner::<true>(vm, budget, &mut fp_mode)
@@ -3469,13 +3654,14 @@ impl Vcpu {
         } else if KIND == ALIAS_DISPATCH {
             macro_rules! alias {
                 ($routed:literal, $bounded:literal, $stop:literal) => {
-                    cpu.run_dispatch::<$routed, true, $bounded, ALIAS_DISPATCH, STEPPED, $stop, 0, false>(
+                    cpu.run_dispatch::<$routed, true, $bounded, ALIAS_DISPATCH, STEPPED, $stop, 0, false, false>(
                         vm,
                         budget.unwrap_or(u64::MAX),
                         &mut fp_mode,
                         SharedReason::Entry,
                         options,
                         None,
+                        devices,
                     )
                     .stepped()
                 };
@@ -3496,7 +3682,7 @@ impl Vcpu {
         } else {
             macro_rules! enter {
                 ($routed:literal, $order:literal, $single:literal) => {
-                    cpu.run_dispatch::<$routed, true, false, KIND, false, false, $order, $single>(
+                    cpu.run_dispatch::<$routed, true, false, KIND, false, false, $order, $single, DEVICES>(
                         vm,
                         if $single {
                             1
@@ -3507,6 +3693,7 @@ impl Vcpu {
                         SharedReason::Entry,
                         options,
                         context,
+                        devices,
                     )
                     .stepped()
                 };
@@ -3528,6 +3715,16 @@ impl Vcpu {
             }
         };
         drop(guard);
+        if OBSERVED
+            && KIND >= MACHINE_DISPATCH
+            && vm.devices().poisoned()
+            && !matches!(
+                result.stop,
+                StepStop::Exit(Exit::Device(crate::DeviceStop::HandlerFailed))
+            )
+        {
+            result.stop = StepStop::Exit(Exit::Device(crate::DeviceStop::Poisoned));
+        }
         if KIND == ALIAS_DISPATCH {
             if let StepStop::Exit(exit) = result.stop {
                 result.stop = StepStop::Exit(crate::fault::qualify_real16(exit, &cpu.cpu));
@@ -3565,6 +3762,15 @@ impl Vcpu {
                 StepStop::IrqReady => None,
             },
         );
+        // Outstanding device state is created only at a run's exit or at an
+        // in-process completion, which publishes it. A budget stop with none
+        // published therefore has nothing to recompute.
+        if KIND >= MACHINE_DISPATCH
+            && (self.device_cpu().published
+                || !matches!(result.stop, StepStop::Exit(Exit::BudgetExhausted)))
+        {
+            self.finish_device_pending(&result);
+        }
         self.time_outside = outside;
         Ok(result)
     }
@@ -3664,13 +3870,14 @@ impl Vcpu {
         fp_mode: &mut crate::jit_abi::fp::RunMode,
         origin: SharedReason,
     ) -> Result<Exit, u64> {
-        self.run_dispatch::<ROUTED, DEFAULT, BOUNDED, APPLICATION_DISPATCH, false, false, 0, false>(
+        self.run_dispatch::<ROUTED, DEFAULT, BOUNDED, APPLICATION_DISPATCH, false, false, 0, false, false>(
             vm,
             budget,
             fp_mode,
             origin,
             StepOptions::default(),
             None,
+            &mut device::Run::default(),
         )
         .application()
     }

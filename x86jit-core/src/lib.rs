@@ -243,6 +243,11 @@ pub use state::{
 pub use time_stats::{
     BackendTimeStats, ExitTimeStats, ExitsTimeStats, SampledTimeStats, TimeStats,
 };
+pub use vm::device::{
+    DeviceContext, DeviceDeadline, DeviceDirection, DeviceError, DeviceEvent, DeviceHandle,
+    DeviceIo, DevicePosition, DeviceRange, DeviceRegistrationError, DeviceRequest, DeviceResult,
+    DeviceRun, DeviceSpace, DeviceStop,
+};
 pub use vm::{
     Backend, CompileFailureReason, ExitRequest, ForceRegionError, ForkError, InterpreterBackend,
     MemConsistency, NmiLine, NmiUnsupported, ResetOptions, ShutdownError, ShutdownReport,

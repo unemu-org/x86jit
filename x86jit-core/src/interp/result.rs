@@ -164,8 +164,9 @@ impl InterpExit {
             // the dispatcher's 8080-mode boundary in vm/nec.rs, which returns
             // it directly (pinned by `i8080_mode_exit_has_one_producer`).
             // Sharing an arm keeps this conversion, inlined into every walk,
-            // free of a panic path.
-            Exit::Interrupted | Exit::I8080Mode { .. } => Self::Interrupted,
+            // free of a panic path. Device stops likewise originate only at
+            // dispatcher boundaries; instruction walks cannot produce them.
+            Exit::Interrupted | Exit::I8080Mode { .. } | Exit::Device(_) => Self::Interrupted,
             Exit::CodeSpaceExhausted { addr } => Self::CodeSpaceExhausted { addr },
         }
     }
@@ -298,7 +299,7 @@ mod tests {
             ),
             (
                 "interp/result.rs",
-                "Exit::Interrupted | Exit::I8080Mode { .. } => Self::Interrupted,",
+                "Exit::Interrupted | Exit::I8080Mode { .. } | Exit::Device(_) => Self::Interrupted,",
             ),
             ("vm/nec.rs", "Err(Exit::I8080Mode {"),
         ]

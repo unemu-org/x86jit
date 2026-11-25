@@ -401,6 +401,9 @@ pub enum Exit {
     /// core's stop test ORs in [`crate::ExitRequest::is_requested`].
     #[non_exhaustive]
     I8080Mode { view: I8080View, entry: I8080Entry },
+    /// A Machine device-service boundary. These stops originate in the
+    /// dispatcher, after instruction preflight and completion-ledger updates.
+    Device(crate::DeviceStop),
 }
 
 /// How a NEC V20/V30 vCPU reached the boundary of an [`Exit::I8080Mode`].

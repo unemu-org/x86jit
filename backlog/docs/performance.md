@@ -3924,3 +3924,70 @@ is over in any profile of any landing.
   `Cargo.toml` and the script's fallback for older commits are the same profile. Measured against
   itself in that campaign, the cells change by −0.134..+0.088 %, the path means by at most
   ±0.013 %, the spread within a side is p50 0.054 %, max 0.231 %, and the verdict is PASS.
+
+
+## Borrowed Machine device transfers — MEASURED (2026-11-25)
+
+Decision-28 stages 2–3, `machine_exits`: I80386, interpreter, Fast consistency,
+macOS ARM64, default Cargo release. Three fresh processes, three rounds each,
+20,000 iterations per cell after 100 warm-up iterations, ASLR disabled through
+`scripts/perf_campaign.py::run_process`. Exit and handler order rotates by round.
+N is the total retired instructions per device-loop iteration; final HLT is
+also asserted. Scalar IN/OUT and byte MMIO loads/stores use identical guest
+bytes and answers. The Exit path uses the existing `run_steps` and explicit
+completion APIs, with the benchmark's default MMIO completion budget of one.
+The handler path borrows one `DeviceIo` for the run; setup and warm-up are
+outside measurement. No delivery logging, periodic interrupts or cycle timing.
+
+Each cell is **Exit → handler, M retired instructions/s**, median of nine samples.
+These compare transfer handling within one candidate binary; the separate
+no-device decision-23 campaign compares existing execution against its baseline.
+
+| Mode | Transfer | N=10 | N=25 | N=100 |
+|---|---|---:|---:|---:|
+| real16 | out | 40.72 → 61.40 | 69.37 → 92.45 | 107.51 → 117.13 |
+| real16 | in | 40.04 → 60.83 | 69.69 → 91.06 | 108.15 → 119.42 |
+| real16 | store | 23.11 → 40.75 | 45.23 → 70.19 | 91.23 → 107.51 |
+| real16 | load | 22.80 → 38.95 | 46.28 → 67.66 | 90.26 → 109.14 |
+| flat32 | out | 21.90 → 25.75 | 33.77 → 37.41 | 42.95 → 44.62 |
+| flat32 | in | 21.13 → 25.93 | 34.62 → 37.08 | 42.27 → 43.22 |
+| flat32 | store | 15.09 → 21.78 | 27.52 → 34.52 | 40.89 → 42.91 |
+| flat32 | load | 15.61 → 23.04 | 27.18 → 34.15 | 39.43 → 45.33 |
+| paged32 | out | 12.71 → 13.42 | 21.82 → 22.90 | 32.16 → 31.88 |
+| paged32 | in | 12.51 → 13.91 | 22.14 → 22.98 | 31.91 → 31.86 |
+| paged32 | store | 6.38 → 8.27 | 13.48 → 15.84 | 25.45 → 27.35 |
+| paged32 | load | 6.85 → 8.60 | 13.67 → 16.34 | 25.43 → 27.45 |
+| seg16 | out | 21.98 → 25.55 | 34.21 → 38.22 | 42.73 → 44.00 |
+| seg16 | in | 20.56 → 25.12 | 31.77 → 37.42 | 42.01 → 43.49 |
+| seg16 | store | 15.88 → 21.91 | 26.74 → 33.69 | 39.52 → 42.86 |
+| seg16 | load | 15.11 → 21.89 | 26.20 → 33.62 | 39.69 → 42.83 |
+
+Host instruction counts, measured with `proc_pid_rusage().ri_instructions`,
+fall in every cell: port transfers by 4.7–22.9% in Real16, 0.9–10.0% in Flat32
+and Seg16, and 0.8–6.2% paged; MMIO by 10.4–33.6%, 3.9–22.4%, and 4.7–15.7%
+respectively. Wall throughput includes guest execution; ns/transfer is an
+amortized loop cost. The handler's advantage decreases as ordinary instructions
+between transfers dominate. Counts support the work reduction independently of
+frequency/load variation. Paged port cells at N=100 have wall medians
+0.2–0.8% below Exit, despite about 0.8% fewer host instructions.
+
+Reproduce with `machine_exits 20000 3` in three fresh processes through
+`run_process`; the CSV's `path` column distinguishes `exit` and `handler`.
+`EXIT_COMPLETION_BUDGET` retains its existing optional larger-budget comparison.
+Raw CSV/metadata are outside the repository; no `bench/history` files were
+written. Measured binary SHA-256: `782fea2295d643b49723cb038770aeebc07bac95764f4e867b22fb1717ad45e5`.
+
+The decision-23 campaign against `6289334b`, with both `release` and `perf`,
+three processes per cell and side and the standard +0.5% combined gate, reports
+**DRIFT (exit 3): zero blocking cells, eleven release-only drift cells**. The
+largest is the I386 one-step entry at +1.045% in release and +0.068% in perf;
+the remaining release-only cells are twenty-bit one-step entries, Application
+call/return and IP-boundary loops, and the Application store loop. Store-probe
+gates pass in both profiles, with no measurement problems. This is a drift
+verdict, not a claim that every release cell improved.
+
+The Nix launcher was blocked by a sandbox cache-write denial. The fallback used
+Cargo on PATH (Rust 1.98.1), no compiler wrapper, LLVM's Darwin linker and the
+same flags for candidate profiles. Both baseline profiles came from the campaign
+cache. Reproduce with `scripts/perf-campaign.sh --build-qos default --cache CACHE
+--out OUT 6289334b TREE`; retain both profile reports and `combined.json`.

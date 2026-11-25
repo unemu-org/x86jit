@@ -1,4 +1,4 @@
-//! Exit/completion round trips (spec.md §5, decision-28 stage 1).
+//! Exit/completion and borrowed-handler transfers (spec.md §5.4, decision-28).
 //! Usage: machine_exits [iterations=20000] [rounds=3] [mode] [workload].
 //! EXIT_MODEL=486 selects I80486Dx (default I80386); EXIT_SPLITS=1 times
 //! individual run/completion calls separately; EXIT_TRACE=1 emits exact traces.
@@ -8,8 +8,9 @@
 //! Timings include guest execution: ns/exit is amortized round-trip cost.
 use std::time::{Duration, Instant};
 use x86jit_core::{
-    CpuModel, CpuState, ExceptionDelivery, Exit, PortDir, Prot, Reg, RegionKind, StepOptions,
-    StepStop, Vcpu, Vm, VmConfig,
+    CpuModel, CpuState, DeviceContext, DeviceIo, DeviceRange, DeviceRequest, DeviceResult,
+    ExceptionDelivery, Exit, PortDir, Prot, Reg, RegionKind, StepOptions, StepStop, Vcpu, Vm,
+    VmConfig,
 };
 
 #[cfg(target_os = "macos")]
@@ -58,6 +59,10 @@ fn setup(mode: &str, work: &str, interval: usize) -> (Vm, Vcpu) {
         .unwrap();
     vm.map(DEVICE, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
     vm.map(DEVICE + 0x1000, 0x15000, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    vm.register_device_range(DeviceRange::Ports(0x80..0x81))
+        .unwrap();
+    vm.register_device_range(DeviceRange::Mmio(DEVICE..DEVICE + 0x1000))
         .unwrap();
     let short = mode == "real16" || mode == "seg16";
     // INC BX/EBX fillers; one device instruction, DEC DI/EDI, JNZ start.
@@ -119,6 +124,18 @@ struct Counts {
     completion_time: Duration,
 }
 
+#[derive(Default)]
+struct BenchDevice {
+    transfers: u64,
+}
+impl DeviceIo for BenchDevice {
+    fn access(&mut self, _: &DeviceRequest, _: &mut DeviceContext<'_>) -> DeviceResult {
+        self.transfers += 1;
+        DeviceResult::Handled(0xa5)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute(
     vm: &Vm,
     cpu: &mut Vcpu,
@@ -127,8 +144,10 @@ fn execute(
     splits: bool,
     trace: bool,
     completion_budget: u64,
+    handler: bool,
 ) -> Counts {
     let mut counts = Counts::default();
+    let mut device = BenchDevice::default();
     let mut left = iterations;
     while left != 0 {
         let batch = left.min(60000);
@@ -142,17 +161,18 @@ fn execute(
         let mut completing = false;
         loop {
             let start = splits.then(Instant::now);
-            let result = cpu
-                .run_steps(
-                    vm,
-                    if completing {
-                        completion_budget
-                    } else {
-                        10_000_000
-                    },
-                    StepOptions::default(),
-                )
-                .unwrap();
+            let budget = if completing {
+                completion_budget
+            } else {
+                10_000_000
+            };
+            let result = if handler {
+                cpu.run_steps_with_devices(vm, budget, StepOptions::default(), Some(&mut device))
+                    .map(|run| run.into_run())
+            } else {
+                cpu.run_steps(vm, budget, StepOptions::default())
+            }
+            .unwrap();
             if let Some(start) = start {
                 if completing {
                     counts.completion_time += start.elapsed();
@@ -195,6 +215,7 @@ fn execute(
             }
         }
     }
+    counts.exits += device.transfers;
     assert_eq!(counts.exits, iterations);
     counts
 }
@@ -212,7 +233,7 @@ fn main() {
         census();
         return;
     }
-    println!("mode,work,n,round,retired,exits,calls,completion_calls,mips,ns_exit,run_ns_exit,completion_ns_exit,host_instructions_exit");
+    println!("path,mode,work,n,round,retired,exits,calls,completion_calls,mips,ns_exit,run_ns_exit,completion_ns_exit,host_instructions_exit");
     for round in 0..rounds {
         for mode in MODES {
             if args.get(3).is_some_and(|s| s != mode) {
@@ -223,27 +244,43 @@ fn main() {
                     continue;
                 }
                 for n in [10, 25, 100] {
-                    let (vm, mut cpu) = setup(mode, work, n);
-                    execute(&vm, &mut cpu, mode, 100, false, false, completion_budget);
-                    let retired = cpu.retired_instructions();
-                    let host = host_instructions();
-                    let start = Instant::now();
-                    let counts = execute(
-                        &vm,
-                        &mut cpu,
-                        mode,
-                        iterations,
-                        splits,
-                        trace,
-                        completion_budget,
-                    );
-                    let seconds = start.elapsed().as_secs_f64();
-                    let host = host_instructions() - host;
-                    let retired = cpu.retired_instructions() - retired;
-                    assert_eq!(retired, iterations * n as u64 + iterations.div_ceil(60000));
-                    let exits = counts.exits as f64;
-                    println!(
-                        "{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                    for handler in if round % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        let (vm, mut cpu) = setup(mode, work, n);
+                        execute(
+                            &vm,
+                            &mut cpu,
+                            mode,
+                            100,
+                            false,
+                            false,
+                            completion_budget,
+                            handler,
+                        );
+                        let retired = cpu.retired_instructions();
+                        let host = host_instructions();
+                        let start = Instant::now();
+                        let counts = execute(
+                            &vm,
+                            &mut cpu,
+                            mode,
+                            iterations,
+                            splits,
+                            trace,
+                            completion_budget,
+                            handler,
+                        );
+                        let seconds = start.elapsed().as_secs_f64();
+                        let host = host_instructions() - host;
+                        let retired = cpu.retired_instructions() - retired;
+                        assert_eq!(retired, iterations * n as u64 + iterations.div_ceil(60000));
+                        let exits = counts.exits as f64;
+                        println!(
+                        "{},{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                        if handler { "handler" } else { "exit" },
                         counts.exits,
                         counts.calls,
                         counts.completion_calls,
@@ -253,6 +290,7 @@ fn main() {
                         counts.completion_time.as_nanos() as f64 / exits,
                         host as f64 / exits
                     );
+                    }
                 }
             }
         }

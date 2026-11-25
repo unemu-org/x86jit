@@ -368,7 +368,7 @@ Setting the entry point = simply `set_reg(Reg::Rip, entry)`. Stack: the user all
 
 ### 5.1 Return-based model
 
-The core **does not call the user through a trait** in the hot path. Instead, `run()` executes until it encounters an event it can't handle, and **returns a reason**. The user handles the reason in a loop and calls `run()` again.
+Application execution uses a return-based model: `run()` executes until it encounters an event it cannot handle and **returns a reason**. The user handles the reason in a loop and calls `run()` again. Machine execution optionally uses the borrowed handler described in §5.4.
 
 > **Amended by decision-28 (2026-11-25).** On the Machine profiles an embedder may register port and MMIO ranges to be served in process by a `DeviceIo` handler it lends to the run call; such an access is served in-process and execution continues. Unregistered or declined accesses keep the return-based `Exit` path described here.
 
@@ -760,6 +760,129 @@ match cpu.run(Some(100_000)) {
     other => { /* ... */ }
 }
 ```
+
+### 5.4 Borrowed Machine devices (decision-28 stages 2–3)
+
+Machine profiles optionally serve issued port and MMIO transfers synchronously,
+inside the interpreter dispatcher. Application profiles, including Application
+Real16, retain §5.1's return model. These APIs are re-exported by `x86jit_core`:
+
+```rust
+trait DeviceIo {
+    fn access(&mut self, request: &DeviceRequest,
+              context: &mut DeviceContext<'_>) -> DeviceResult;
+}
+impl Vm {
+    fn register_device_range(&mut self, range: DeviceRange)
+        -> Result<DeviceHandle, DeviceRegistrationError>;
+    fn replace_device_range(&mut self, handle: DeviceHandle, range: DeviceRange)
+        -> Result<(), DeviceRegistrationError>;
+    fn unregister_device_range(&mut self, handle: DeviceHandle)
+        -> Result<(), DeviceRegistrationError>;
+    fn device_poisoned(&self) -> bool;
+}
+impl Vcpu {
+    fn run_steps_with_devices(&mut self, vm: &Vm, max_steps: u64,
+        options: StepOptions, handler: Option<&mut dyn DeviceIo>)
+        -> Result<DeviceRun, StepRunError>;
+    fn set_intr(&mut self, asserted: bool);
+    fn intr_asserted(&self) -> bool;
+    fn complete_device_fault(&mut self, value: u64) -> bool;
+    fn device_request(&self) -> Option<&DeviceRequest>;
+}
+impl DeviceRun {
+    fn steps(&self) -> u64;
+    fn stop(&self) -> &StepStop;
+    fn request(&self) -> Option<&DeviceRequest>;
+    fn into_run(self) -> StepRun;
+}
+```
+
+`Exit::Device(DeviceStop)` distinguishes `Fault { error }`, `HandlerFailed`,
+`Poisoned`, `IntrReady`, and `Deadline { position }`. The extensible `DeviceRun`
+owns fault/failure request evidence alongside the ordinary counts and stop.
+
+The per-VM registry contains ranges only. `DeviceRange::Ports` uses half-open
+`Range<u32>` values within `0..65536`; lookup uses the addressed port, with widths
+1/2/4. `DeviceRange::Mmio` uses half-open physical `Range<u64>` values wholly
+covered by Trap mappings, after the existing translation, physical masking and
+A20 gate. An issued MMIO transfer of width 1/2/4/8 must fit wholly within one
+registration. Empty, out-of-namespace, overlapping and non-Trap registrations
+are refused. Registrations never split or merge bus transfers. Replacement,
+removal and relevant `Vm::map`/`unmap` changes require every vCPU to be stopped
+with no outstanding handoff; explicit execution-state reset abandons one.
+The exclusive VM borrow also prevents registration during execution/callbacks.
+
+`DeviceRequest` is non-exhaustive and preserves space, address, direction,
+transfer size/value, operand total width/part, available linear evidence,
+instruction CS:IP or delivery-event evidence, immutable VM-issued vCPU identity,
+and `DevicePosition` at handoff and unit start. A position contains cumulative
+retirement and call-local steps (including REP iterations). Modeled `cycles` is
+`None` until cycle accounting exists. Devices need neither `Send` nor `Sync`:
+the handler is borrowed for this call only, and no engine locks span its call.
+It must be bounded and non-reentrant. Cross-vCPU arbitration remains external.
+
+`DeviceResult::Handled(value)` supplies low read bytes or acknowledges a write.
+`Fallback` returns the ordinary Exit. `DeviceFault(error)` returns
+`Exit::Device(DeviceStop::Fault { error })` with the original counts and
+pending handoff. The additive `DeviceRun::request()` owns the request evidence;
+`Vcpu::device_request()` also exposes it until completion/abandonment. Its
+`handoff()` reconstructs the ordinary Exit. Existing `StepRun` and `Exit`
+retain their original owned-payload drop paths.
+`complete_device_fault(value)` acknowledges any of its transfer
+kinds after host service; matching existing completion methods also work. The
+fault remains latched until explicit completion or
+`reset_execution_state` abandonment; running again never redispatches it.
+Fallback and DeviceFault must have no device-private effects. Context effects
+are staged and discarded for both. Earlier acknowledged transfers remain effective.
+
+`DeviceContext` offers `read_ram`/`write_ram` on checked physical RAM only
+(including adjacent RAM mappings), with read-your-writes inside the callback;
+Handled publishes writes through normal dirty/physical-alias SMC tracking.
+It offers `set_intr`, `assert_nmi`, `request_host_stop`, `set_a20_enabled`,
+`invalidate_paging`, `set_deadline` and `charge_extra_cycles`. A20 and paging
+invalidation wait until the owned instruction/iteration finishes or is abandoned.
+Extra cycle charging returns `None` (unknown) where accounting is unavailable.
+The context exposes no CPU register writes, raw pointers, recursive device
+access, mappings, registry, completion calls or execution entry.
+
+INTR is a persistent level. At the first eligible boundary with IF set, no
+shadow and no completion hold, `Exit::Device(DeviceStop::IntrReady)` returns
+control for external controller arbitration and `inject_irq`; the line can also be changed between
+runs with `set_intr`. NMI, host stop and delivery logging use their normal sites
+and deferral rules; device calls create no delivery records. A deadline is
+`DeviceDeadline::Steps(n)` (call-local instructions/iterations) or
+`RetiredInstructions(n)` (cumulative whole instructions). The handler may set it
+or move its coordinate earlier; moving later or replacing its coordinate is
+refused. It stops this run at the first eligible boundary at or after the
+position, via `Exit::Device(DeviceStop::Deadline { position })`. No host time
+is involved.
+Deadlines expire with the call; INTR remains asserted across calls.
+
+Dispatch occurs only at actual issued handoffs, including INS destination and
+event-frame transfers, after all existing preflight. Handled results use the
+same completion/visit ledgers as Exit/resume; replay never calls a device twice.
+REP INS/OUTS issue one port transfer per element and retain their answers/source
+results; MMIO strings clear their ledger between iterations. Port steps are
+charged at handoff, MMIO at completed instruction/iteration. A zero budget calls
+no handler and consumes no completion. An issued port transfer is serviced before
+exhaustion, including INS's required store, without starting another unit.
+Fallback still returns its port Exit on the last step. Split/locked transfer
+order, partial effects, typed refusals and memory-order tiers remain unchanged.
+
+Real16, Flat32, Seg16, Checked, V86 and paged interpretation continue internally
+after Handled. The dispatcher drains SMC and revalidates source/context before
+executing successors; owned incomplete instructions retain their original bytes
+and transfer snapshots. Compiled device helpers remain stage 4 (decision-27).
+An unwinding callback panic is caught and returns
+`Exit::Device(DeviceStop::HandlerFailed)`; the VM is terminally poisoned and
+subsequent execution returns `Exit::Device(DeviceStop::Poisoned)`, even after
+execution-state reset. Abort panics terminate the process.
+
+Snapshots require stopped CPUs and completed handoffs or explicit abandonment.
+Device state, board signals and range reconstruction belong to the embedder;
+handler objects and private continuations are not serialized. Restore into a
+coherent VM/CPU/RAM/device image and invalidate paging/code proofs as usual.
 
 ---
 

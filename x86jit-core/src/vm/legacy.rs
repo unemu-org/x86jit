@@ -527,6 +527,23 @@ pub(super) struct Execution {
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
 }
 impl Execution {
+    pub(super) fn device_event(&self) -> Option<crate::DeviceEvent> {
+        let event = self.event_retry?;
+        let (vector, error_code) = match event.source {
+            EventSource::SingleStep => (1, None),
+            EventSource::Irq(vector) => (vector, None),
+            EventSource::Nmi { .. } => (2, None),
+            EventSource::Exception { vector, error_code } => (vector, error_code),
+        };
+        Some(crate::DeviceEvent {
+            vector,
+            kind: delivery_kind(event.source),
+            saved_cs: event.cs,
+            saved_ip: event.ip,
+            error_code,
+        })
+    }
+
     pub(super) fn new() -> Self {
         static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
         let owner_id = NEXT_OWNER
@@ -621,6 +638,17 @@ impl Execution {
         self.instruction_retry.is_some()
             || self.event_retry.is_some()
             || self.task_switch.context().is_some()
+    }
+    /// A held single-step trap or an event continuation awaits delivery.
+    pub(super) fn event_waiting(&self) -> bool {
+        self.debug_handoff_pending() || self.event_retry.is_some()
+    }
+    /// Private state a fork or registration change would lose: an accepted
+    /// event's continuation, a task switch's context or a held single-step trap.
+    pub(super) fn device_outstanding(&self) -> bool {
+        self.event_retry.is_some()
+            || self.task_switch.context().is_some()
+            || self.debug_handoff_pending()
     }
     pub(super) fn debug_handoff_pending(&self) -> bool {
         self.handoff_service & HANDOFF_DEBUG != 0
@@ -1641,8 +1669,13 @@ impl Vcpu {
                 stop: StepStop::Exit(exit),
                 ..
             }) => match exit {
-                Exit::BudgetExhausted | Exit::Interrupted => true,
-                Exit::MmioRead { .. } | Exit::MmioWrite { .. } => {
+                Exit::BudgetExhausted
+                | Exit::Interrupted
+                | Exit::Device(crate::DeviceStop::IntrReady)
+                | Exit::Device(crate::DeviceStop::Deadline { .. }) => true,
+                Exit::MmioRead { .. }
+                | Exit::MmioWrite { .. }
+                | Exit::Device(crate::DeviceStop::Fault { .. }) => {
                     self.cpu.mmio_retry_active && self.cpu.owns_mmio_retry(self.cpu.rip)
                 }
                 _ => false,
@@ -1918,6 +1951,14 @@ impl Vcpu {
     }
 
     pub(super) fn finish_machine_run(&mut self, result: &mut StepRun) {
+        if let StepStop::Exit(Exit::Device(crate::DeviceStop::Fault { .. })) = &result.stop {
+            let mut underlying = StepRun {
+                steps: result.steps,
+                stop: StepStop::Exit(self.device_request().expect("fault request").handoff()),
+            };
+            self.finish_machine_run(&mut underlying);
+            return;
+        }
         if matches!(result.stop, StepStop::Exit(Exit::BudgetExhausted))
             && !self.cpu.mmio_retry_active
         {
@@ -1928,6 +1969,12 @@ impl Vcpu {
             {
                 return;
             }
+        }
+        if matches!(
+            result.stop,
+            StepStop::Exit(Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+        ) {
+            self.device_cpu_mut().mmio = true;
         }
         // The Machine bus handoff exposes only this transfer's bytes, including
         // stores whose source register or split operand contains higher bits.
@@ -2653,6 +2700,7 @@ impl Vcpu {
 
     // Profile constants keep compiled chaining free of interpreted context checks.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_dispatch<
         const ROUTED: bool,
         const DEFAULT: bool,
@@ -2662,6 +2710,7 @@ impl Vcpu {
         const STOP: bool,
         const ORDER: u8,
         const SINGLE: bool,
+        const DEVICES: bool,
     >(
         &mut self,
         vm: &Vm,
@@ -2670,6 +2719,7 @@ impl Vcpu {
         origin: SharedReason,
         options: StepOptions,
         initial_context: Option<(MachineContext, Option<u64>)>,
+        devices: &mut super::device::Run<'_>,
     ) -> DispatchResult {
         if KIND != APPLICATION_DISPATCH {
             self.cpu.machine_flags_mask =
@@ -2767,6 +2817,54 @@ impl Vcpu {
         }
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
+        macro_rules! machine_exit {
+            ($exit:expr) => {{
+                let exit = $exit;
+                if DEVICES {
+                    // Only issued handoffs reach here, after the existing access
+                    // and transaction preflight. Seal ownership before completion.
+                    if matches!(
+                        exit,
+                        Exit::PortIo { .. } | Exit::MmioRead { .. } | Exit::MmioWrite { .. }
+                    ) {
+                        let mut run = StepRun {
+                            steps,
+                            stop: StepStop::Exit(exit),
+                        };
+                        self.finish_machine_run(&mut run);
+                        let StepStop::Exit(exit) = run.stop else {
+                            unreachable!()
+                        };
+                        match devices.access(self, vm, steps, &exit) {
+                            Some(Ok(())) => {
+                                direct_bus = direct20 || raw_direct(&self.cpu);
+                                refresh_boundary = true;
+                                continue;
+                            }
+                            Some(Err(stop)) => {
+                                if matches!(stop, Exit::Device(crate::DeviceStop::Fault { .. })) {
+                                    self.device_cpu_mut().fault = Some(stop.clone());
+                                }
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(stop),
+                                });
+                            }
+                            None => {
+                                return DispatchResult::Stepped(StepRun {
+                                    steps,
+                                    stop: StepStop::Exit(exit),
+                                })
+                            }
+                        }
+                    }
+                }
+                return DispatchResult::Stepped(StepRun {
+                    steps,
+                    stop: StepStop::Exit(exit),
+                });
+            }};
+        }
         loop {
             if direct20 {
                 // spec.md §17.10: the twenty-bit entries have a permanent
@@ -2775,6 +2873,33 @@ impl Vcpu {
                 context = crate::lift::i8086::CONTEXT;
             }
             if KIND >= MACHINE_DISPATCH {
+                if DEVICES {
+                    if self
+                        .cpu
+                        .port_string_in
+                        .as_ref()
+                        .is_some_and(|p| p.value.is_some())
+                    {
+                        if let Err(exit) = self.finish_port_string::<ROUTED, ORDER, SINGLE, KIND>(
+                            vm,
+                            options,
+                            physical_mask,
+                            &mut boundary,
+                            &mut direct_bus,
+                        ) {
+                            machine_exit!(exit);
+                        }
+                    }
+                    if let Some(exit) = devices.boundary(self, steps) {
+                        machine_exit!(exit);
+                    }
+                    devices.unit_start = crate::DevicePosition {
+                        retired_instructions: self.retired,
+                        steps,
+                    };
+                    devices.instruction_ip = self.cpu.rip;
+                    devices.code_segment = self.cpu.cs;
+                }
                 if limit.is_some_and(|limit| steps >= limit) {
                     return DispatchResult::Stepped(StepRun {
                         steps,
@@ -2792,6 +2917,9 @@ impl Vcpu {
                 // Only an ordinary completed shared block can retain this proof.
                 // Helpers, faults and event continuations refresh on the next turn.
                 refresh_boundary = true;
+                if DEVICES && devices.single_step(self) {
+                    boundary.one_step = true;
+                }
                 let task_pending = boundary.task_pending;
                 // A host request, or an NMI edge (spec.md §17.10), in one load.
                 // Both are decided out of line, the NMI step included.
@@ -2820,10 +2948,7 @@ impl Vcpu {
                             context = match self.legacy_context_for_run() {
                                 Ok(context) => context,
                                 Err(exit) => {
-                                    return DispatchResult::Stepped(StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    })
+                                    machine_exit!(exit);
                                 }
                             };
                             direct_bus = raw_direct(&self.cpu);
@@ -2836,10 +2961,7 @@ impl Vcpu {
                             continue;
                         }
                         External::Stop(exit) => {
-                            return DispatchResult::Stepped(StepRun {
-                                steps,
-                                stop: StepStop::Exit(exit),
-                            })
+                            machine_exit!(exit);
                         }
                     }
                 }
@@ -2852,10 +2974,7 @@ impl Vcpu {
                             &mut boundary,
                             &mut direct_bus,
                         ) {
-                            return DispatchResult::Stepped(StepRun {
-                                steps,
-                                stop: StepStop::Exit(exit),
-                            });
+                            machine_exit!(exit);
                         }
                     }
                     // This is the existing deferred-debug service gate, with
@@ -2870,10 +2989,7 @@ impl Vcpu {
                         if service & HANDOFF_NUMERIC != 0 && !self.machine_pending_io(task_pending)
                         {
                             if let Some(exit) = self.cpu.reconcile_numeric_error(self.cpu.rip) {
-                                return DispatchResult::Stepped(StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                });
+                                machine_exit!(exit);
                             }
                         }
                         if service & HANDOFF_DEBUG != 0 {
@@ -2909,19 +3025,13 @@ impl Vcpu {
                         if let Err(exit) =
                             self.deliver_legacy_event::<ROUTED, ORDER>(vm, context, event)
                         {
-                            return DispatchResult::Stepped(StepRun {
-                                steps,
-                                stop: StepStop::Exit(exit),
-                            });
+                            machine_exit!(exit);
                         }
                         // Delivery costs no instruction unit. Re-derive after the CS reload.
                         context = match self.legacy_context_for_run() {
                             Ok(context) => context,
                             Err(exit) => {
-                                return DispatchResult::Stepped(StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                })
+                                machine_exit!(exit);
                             }
                         };
                         direct_bus = raw_direct(&self.cpu);
@@ -2946,10 +3056,7 @@ impl Vcpu {
                     if direct20 && self.cpu.legacy.reserved & crate::legacy::NEC_EMULATION != 0 {
                         // RETEM or CALLN completed as one unit; otherwise stop.
                         if let Err(exit) = self.nec_boundary::<ROUTED, ORDER>(vm) {
-                            return DispatchResult::Stepped(StepRun {
-                                steps,
-                                stop: StepStop::Exit(exit),
-                            });
+                            machine_exit!(exit);
                         }
                         steps += 1;
                         continue;
@@ -3051,10 +3158,7 @@ impl Vcpu {
                                 context = match self.legacy_context_for_run() {
                                     Ok(context) => context,
                                     Err(exit) => {
-                                        return DispatchResult::Stepped(StepRun {
-                                            steps,
-                                            stop: StepStop::Exit(exit),
-                                        })
+                                        machine_exit!(exit);
                                     }
                                 };
                                 direct_bus = raw_direct(&self.cpu);
@@ -3067,10 +3171,7 @@ impl Vcpu {
                                 continue;
                             }
                             Err(exit) => {
-                                return DispatchResult::Stepped(StepRun {
-                                    steps,
-                                    stop: StepStop::Exit(exit),
-                                })
+                                machine_exit!(exit);
                             }
                         }
                     }
@@ -3078,6 +3179,13 @@ impl Vcpu {
                 let single_step = boundary.single_step;
                 let remaining = if boundary.one_step {
                     1
+                } else if DEVICES {
+                    devices.cap(
+                        self,
+                        &ir,
+                        steps,
+                        limit.map_or(u64::MAX, |limit| limit - steps),
+                    )
                 } else {
                     limit.map_or(u64::MAX, |limit| limit - steps)
                 };
@@ -3127,6 +3235,36 @@ impl Vcpu {
                         self.nmi_state & NMI_BLOCKED != 0,
                     )
                 };
+                if DEVICES {
+                    let port = progress.outcome.as_ref().is_some_and(|o| {
+                        o.as_ref()
+                            .is_ok_and(|o| matches!(o.exit, Some(Exit::PortIo { .. })))
+                    });
+                    // Port operations terminate their IR block. INS holds its
+                    // IP until the store; a non-final OUTS element also holds it.
+                    let port_ip = ir
+                        .ops
+                        .iter()
+                        .rev()
+                        .find_map(|op| match op {
+                            IrOp::InsnStart { guest_addr } => Some(*guest_addr),
+                            _ => None,
+                        })
+                        .unwrap_or(ir.guest_start);
+                    let final_retired = port
+                        && self
+                            .cpu
+                            .port_string_in
+                            .as_ref()
+                            .map_or(self.cpu.rip != port_ip, |p| p.next_ip != p.rip);
+                    devices.unit_start = crate::DevicePosition {
+                        retired_instructions: self.retired + progress.retired
+                            - u64::from(final_retired),
+                        steps: steps + progress.steps - u64::from(port),
+                    };
+                    devices.instruction_ip = if port { port_ip } else { self.cpu.rip };
+                    devices.code_segment = self.cpu.cs;
+                }
                 if direct20 {
                     self.cpu.rip &= 0xffff;
                     let restart = ir.ops.iter().find_map(|op| match op {
@@ -3263,10 +3401,7 @@ impl Vcpu {
                             context = match self.legacy_context_for_run() {
                                 Ok(context) => context,
                                 Err(exit) => {
-                                    return DispatchResult::Stepped(StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    })
+                                    machine_exit!(exit);
                                 }
                             };
                             direct_bus = raw_direct(&self.cpu);
@@ -3301,10 +3436,7 @@ impl Vcpu {
                                     match self.deliver_step_trap::<ROUTED, ORDER, KIND>(vm, &ir) {
                                         Ok(context) => context,
                                         Err(exit) => {
-                                            return DispatchResult::Stepped(StepRun {
-                                                steps,
-                                                stop: StepStop::Exit(exit),
-                                            })
+                                            machine_exit!(exit);
                                         }
                                     };
                                 direct_bus = raw_direct(&self.cpu);
@@ -3315,10 +3447,7 @@ impl Vcpu {
                             }
                         }
                         if let Some(exit) = outcome.exit {
-                            return DispatchResult::Stepped(StepRun {
-                                steps,
-                                stop: StepStop::Exit(exit),
-                            });
+                            machine_exit!(exit);
                         }
                     }
                     Err(exit) => {
@@ -3404,10 +3533,7 @@ impl Vcpu {
                                     context = match self.legacy_context_for_run() {
                                         Ok(context) => context,
                                         Err(exit) => {
-                                            return DispatchResult::Stepped(StepRun {
-                                                steps,
-                                                stop: StepStop::Exit(exit),
-                                            })
+                                            machine_exit!(exit);
                                         }
                                     };
                                     direct_bus = raw_direct(&self.cpu);
@@ -3420,17 +3546,11 @@ impl Vcpu {
                                     continue;
                                 }
                                 Err(exit) => {
-                                    return DispatchResult::Stepped(StepRun {
-                                        steps,
-                                        stop: StepStop::Exit(exit),
-                                    })
+                                    machine_exit!(exit);
                                 }
                             }
                         }
-                        return DispatchResult::Stepped(StepRun {
-                            steps,
-                            stop: StepStop::Exit(exit),
-                        });
+                        machine_exit!(exit);
                     }
                 }
             } else if KIND == ALIAS_DISPATCH {
