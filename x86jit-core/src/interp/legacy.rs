@@ -408,7 +408,10 @@ fn segment_access(
     bytes: u8,
     access: AccessKind,
 ) -> Result<u64, Exit> {
-    if context.segment_class == crate::SegmentClass::Checked {
+    if matches!(
+        context.segment_class,
+        crate::SegmentClass::Checked | crate::SegmentClass::Seg16
+    ) {
         return legacy::access(cpu, context.generation, segment, offset, bytes, access);
     }
     if context.segment_class == crate::SegmentClass::Flat32 {
@@ -2563,6 +2566,7 @@ pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
             op,
             L::Address { .. }
                 | L::Flat32Address { .. }
+                | L::Seg16Address { .. }
                 | L::I486Gate
                 | L::Checkpoint
                 | L::ReadSelector { .. }
@@ -4300,6 +4304,25 @@ where
                         outcome.software_interrupt = true;
                         return Ok(true);
                     }
+                }
+                L::Seg16Address {
+                    dst,
+                    segment,
+                    offset,
+                    bytes,
+                    access,
+                    proof,
+                } => {
+                    let offset = read_val(*offset, temps);
+                    temps[*dst as usize] = proof.address(offset, *bytes).ok_or_else(|| {
+                        legacy::segment_fault(
+                            cpu,
+                            if *segment == SegmentId::Ss { 12 } else { 13 },
+                            offset,
+                            *bytes,
+                            *access,
+                        )
+                    })?;
                 }
                 L::Flat32Address {
                     dst,

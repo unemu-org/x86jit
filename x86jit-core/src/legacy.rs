@@ -71,6 +71,8 @@ pub enum SegmentClass {
     Direct,
     Checked,
     Flat32,
+    /// Protected CS.D=0 with cache-derived operand bounds (decision-27).
+    Seg16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +387,16 @@ fn derive_context<const V86: bool>(
             })
         {
             SegmentClass::Flat32
+        } else if protected
+            && bits == 16
+            && model.generation == CpuGeneration::I386
+            && cs.attributes & 0x98 == 0x98
+            && state
+                .segments
+                .iter()
+                .all(|c| c.unusable != 0 || c.attributes & 0x90 == 0x90)
+        {
+            SegmentClass::Seg16
         } else {
             SegmentClass::Checked
         },
@@ -674,7 +686,14 @@ mod tests {
                                     assert_eq!(
                                         context,
                                         MachineContext {
-                                            segment_class: SegmentClass::Checked,
+                                            segment_class: if pe
+                                                && !cs_d
+                                                && generation == CpuGeneration::I386
+                                            {
+                                                SegmentClass::Seg16
+                                            } else {
+                                                SegmentClass::Checked
+                                            },
                                             generation,
                                             regime: if pe {
                                                 MachineRegime::Protected
@@ -950,6 +969,15 @@ pub enum LegacyOp {
         offset: crate::ir::Val,
         bytes: u8,
         access: crate::AccessKind,
+    },
+    /// Bounds derived from the entry-stamped hidden cache, including access rights.
+    Seg16Address {
+        dst: crate::ir::Temp,
+        segment: SegmentId,
+        offset: crate::ir::Val,
+        bytes: u8,
+        access: crate::AccessKind,
+        proof: SegmentAccessProof,
     },
     ReadSelector {
         dst: crate::ir::Temp,
@@ -1581,6 +1609,55 @@ pub(crate) fn access(
     Ok(u64::from(cache.base.wrapping_add(offset as u32)))
 }
 
+/// A protected operand's inclusive offset range and wrapping linear base.
+/// The retained context stamp guards the entire source cache (decision-27).
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentAccessProof {
+    lower: u64,
+    upper: u32,
+    base: u32,
+}
+impl SegmentAccessProof {
+    pub(crate) fn new(cache: SegmentCache, access: crate::AccessKind) -> Self {
+        // SDM Vol 3A §§3.4.5.1, 6.3–6.4: whole-operand bounds,
+        // expand-down B-dependent upper bound and cached type permissions.
+        let code = cache.attributes & 8 != 0;
+        let down = !code && cache.attributes & 4 != 0;
+        let permitted = cache.unusable == 0
+            && match access {
+                crate::AccessKind::Execute => code,
+                crate::AccessKind::Read => !code || cache.attributes & 2 != 0,
+                crate::AccessKind::Write => !code && cache.attributes & 2 != 0,
+            };
+        Self {
+            lower: if !permitted {
+                u64::MAX
+            } else if down {
+                u64::from(cache.limit) + 1
+            } else {
+                0
+            },
+            upper: if down {
+                if cache.attributes & 0x4000 != 0 {
+                    u32::MAX
+                } else {
+                    0xffff
+                }
+            } else {
+                cache.limit
+            },
+            base: cache.base,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn address(self, offset: u64, bytes: u8) -> Option<u64> {
+        let last = offset.checked_add(u64::from(bytes.saturating_sub(1)))?;
+        (offset >= self.lower && last <= u64::from(self.upper))
+            .then(|| u64::from(self.base.wrapping_add(offset as u32)))
+    }
+}
+
 /// Preserve the operand evidence for cached and proven ordinary segments alike.
 #[cold]
 pub(crate) fn segment_fault(
@@ -1975,4 +2052,72 @@ pub(crate) fn reported_interrupt20(report: u64) -> Option<(u8, u16, u16, u16)> {
         report as u16,
         (report >> 48) as u16,
     ))
+}
+
+#[cfg(test)]
+mod segment_access_proof_tests {
+    use super::*;
+
+    #[test]
+    fn specialized_bounds_match_checked_types_widths_and_wrap() {
+        // SDM Vol 3A §§3.4.5.1, 6.3–6.4: access rights, inclusive
+        // byte limits, expand-down D/B upper bound and complete operands.
+        let mut cpu = CpuState::default();
+        cpu.legacy.cr0 = 1;
+        for attr in 0x90..=0x9fu16 {
+            for wide in [0, 0x4000] {
+                for unusable in [0, 1] {
+                    for limit in [0, 0xff, 0xffff, u32::MAX] {
+                        let cache = SegmentCache {
+                            base: 0xffff_f000,
+                            limit,
+                            attributes: attr | wide,
+                            unusable,
+                            reserved: 0,
+                        };
+                        for segment in [
+                            SegmentId::Cs,
+                            SegmentId::Ds,
+                            SegmentId::Es,
+                            SegmentId::Ss,
+                            SegmentId::Fs,
+                            SegmentId::Gs,
+                        ] {
+                            cpu.legacy.segments[segment as usize] = cache;
+                            for kind in [
+                                crate::AccessKind::Read,
+                                crate::AccessKind::Write,
+                                crate::AccessKind::Execute,
+                            ] {
+                                let proof = SegmentAccessProof::new(cache, kind);
+                                for offset in [
+                                    0,
+                                    0xfc,
+                                    0xfd,
+                                    0xfe,
+                                    0xff,
+                                    0x100,
+                                    0xfffc,
+                                    0xfffd,
+                                    0xfffe,
+                                    0xffff,
+                                    0x10000,
+                                    0xffff_fffc,
+                                    0xffff_fffd,
+                                    0xffff_fffe,
+                                    0xffff_ffff,
+                                    0x1_0000_0000,
+                                    u64::MAX,
+                                ] {
+                                    for bytes in [1, 2, 4] {
+                                        assert_eq!(proof.address(offset, bytes), access(&cpu, CpuGeneration::I386, segment, offset, bytes, kind).ok(), "attr={attr:x} B={wide:x} limit={limit:x} offset={offset:x} bytes={bytes}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

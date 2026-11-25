@@ -42,6 +42,7 @@ mod legacy_real_sp_wrap;
 mod legacy_redundant_prefix;
 mod legacy_rep_fault_flags;
 mod legacy_rollback_sweep;
+mod legacy_seg16;
 mod legacy_sse_integer;
 mod legacy_task_registers;
 mod legacy_task_switch;

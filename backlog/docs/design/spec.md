@@ -2523,6 +2523,28 @@ Privileged and IOPL-sensitive instructions, POPF, and privilege transitions use
 singleton helpers. Transitions end the block and reselect the segment class.
 The 486 alignment-refusal regime retains the checked transaction path.
 
+**Interpreted Seg16 (decision-27 interpreter checkpoint).** On 386/486,
+protected CS.D=0 selects Seg16 at CPL 0–3, paged or unpaged, when CS is
+present executable application code and every usable segment cache has P=S=1.
+Unusable data caches remain admissible and fault on access. Other retained
+states keep Checked; V86 and Flat32 retain their separate classes. The full
+entry stamp guards base, limit, type/rights, expand-down and D/B for all six
+caches. Scalar address IR embeds the derived inclusive offset interval and
+wrapping base; inaccessible types and null caches embed an empty interval.
+Each complete operand checks that interval before paging or physical access
+(SDM Vol 3A §§3.4.5.1, 6.3–6.4). Helpers retain live Checked accesses.
+
+Seg16 shares the bounded Flat32 proof cache and accounting walk. Linear-page
+boundaries include CS.base; a straddling first instruction is a singleton.
+Segment loads, far transfers (including gates), privileged/IOPL-sensitive
+instructions and REP remain checked singletons, ending the block and reselecting
+the context. Near transfers end blocks and retain CS target checks. Paged scalar
+RAM accesses reuse the existing permission/D-bit TLB fast path after proving
+their segment interval; faults, misses, split operands, code stores and devices
+retain the transaction path. In particular, a near RET cannot skip its loaded
+CS target check under Seg16. The Machine context identity carries this class;
+BlockKey hashing, Application dispatch and CpuState remain unchanged.
+
 PG=0 keeps its statically selected unpaged adapter;
 paged walks, transactions and proofs live in cold, non-inlined functions.
 

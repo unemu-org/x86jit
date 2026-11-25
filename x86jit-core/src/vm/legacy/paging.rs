@@ -218,7 +218,8 @@ fn lift(
     tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
 ) -> Result<(IrBlock, Vec<(u64, u32)>), Exit> {
     let mut cursor = cpu.clone();
-    let page_end = (cpu.rip | 4095) + 1;
+    let linear = cpu.legacy.segments[0].base.wrapping_add(cpu.rip as u32);
+    let page_end = cpu.rip + (4096 - u64::from(linear & 4095));
     let mut block: Option<IrBlock> = None;
     let mut sources = Vec::new();
     loop {
@@ -232,7 +233,7 @@ fn lift(
             Ok(fetched) => fetched,
             Err(exit) => return block.map(|b| (b, sources)).ok_or(exit),
         };
-        let instruction = match crate::lift::legacy::instruction_for_profile(
+        let mut instruction = match crate::lift::legacy::instruction_for_profile(
             &bytes,
             cursor.rip as u32,
             context,
@@ -245,8 +246,11 @@ fn lift(
                     .ok_or_else(|| direct_refusal(&cursor, error))
             }
         };
-        let ordinary = context.segment_class == crate::SegmentClass::Flat32
-            && crate::interp::legacy::flat32_ordinary(&instruction);
+        super::flat32::specialize_segments(&mut instruction, cpu);
+        let ordinary = matches!(
+            context.segment_class,
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+        ) && crate::interp::legacy::flat32_ordinary(&instruction);
         if !ordinary {
             if let Some(block) = block.take() {
                 return Ok((block, sources));
@@ -508,8 +512,10 @@ impl Vcpu {
         limit: u64,
     ) -> crate::interp::legacy::Progress {
         let execution = self.legacy_execution.as_mut().unwrap();
-        if context.segment_class == crate::SegmentClass::Flat32
-            && crate::interp::legacy::flat32_ordinary(ir)
+        if matches!(
+            context.segment_class,
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+        ) && crate::interp::legacy::flat32_ordinary(ir)
         {
             execution.rep_flags = None;
             let state = execution.paging.get_or_insert_with(Default::default);

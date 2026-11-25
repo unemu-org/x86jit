@@ -21,6 +21,7 @@ enum Mode {
     V86,
     PagedV86,
     PagedP32,
+    PagedP16,
     P32,
     P16,
     Real,
@@ -30,7 +31,7 @@ impl Mode {
         matches!(self, Self::V86 | Self::PagedV86)
     }
     fn paged(self) -> bool {
-        matches!(self, Self::PagedP32 | Self::PagedV86)
+        matches!(self, Self::PagedP32 | Self::PagedP16 | Self::PagedV86)
     }
     fn bits(self) -> u32 {
         if matches!(self, Self::P32 | Self::PagedP32) {
@@ -1150,6 +1151,87 @@ fn flat32_checked_census(cpl: u8) {
                 sequences > 100,
                 "too few multi-instruction runs: {sequences}"
             );
+        }
+    }
+}
+
+#[test]
+fn seg16_checked_census_forms_are_equal() {
+    seg16_checked_census(0);
+}
+
+#[test]
+fn seg16_cpl3_checked_census_forms_are_equal() {
+    seg16_checked_census(3);
+}
+
+fn seg16_checked_census(cpl: u8) {
+    use x86jit_core::{derive_legacy_context, SegmentClass};
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        for mode in [Mode::P16, Mode::PagedP16] {
+            let mut count = 0;
+            for mut p in probes(model, mode).into_iter().filter(comparable) {
+                p.bytes.extend_from_slice(b"\x43\x31\xda\xf4");
+                for budget in [1, 3, 5] {
+                    let (avm, mut a) = setup(model, &p, mode, false);
+                    let (bvm, mut b) = setup(model, &p, mode, false);
+                    for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                        cpu.cpu.legacy.cpl = cpl;
+                        for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                            cache.attributes |= u16::from(cpl) << 5;
+                            cache.limit = 0xffff;
+                            cache.base = if i == 0 { 0x100 } else { 0 };
+                        }
+                        cpu.cpu.cs |= u16::from(cpl);
+                        cpu.cpu.ss |= u16::from(cpl);
+                        cpu.cpu.ds |= u16::from(cpl);
+                        cpu.cpu.es |= u16::from(cpl);
+                        vm.write_bytes(0x1100, &p.bytes).unwrap();
+                    }
+                    assert_eq!(
+                        derive_legacy_context(a.legacy_cpu_model().unwrap(), &a.cpu)
+                            .unwrap()
+                            .segment_class,
+                        SegmentClass::Seg16
+                    );
+                    // P is checked on segment load, not cached operand access
+                    // (SDM Vol 3A §3.4.5). No probe reloads GS in this census.
+                    b.cpu.legacy.segments[5].attributes &= !0x80;
+                    assert_eq!(
+                        derive_legacy_context(b.legacy_cpu_model().unwrap(), &b.cpu)
+                            .unwrap()
+                            .segment_class,
+                        SegmentClass::Checked
+                    );
+                    let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                    let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                    assert_eq!(
+                        format!("{ar:?}"),
+                        format!("{br:?}"),
+                        "{model:?}/{mode:?} CPL{cpl} {:02x?} budget={budget}",
+                        p.bytes
+                    );
+                    b.cpu.legacy.segments[5].attributes |= 0x80;
+                    assert_eq!(
+                        format!("{:?}", a.cpu),
+                        format!("{:?}", b.cpu),
+                        "{:02x?}",
+                        p.bytes
+                    );
+                    assert_eq!(a.retired_instructions(), b.retired_instructions());
+                    let mut am = vec![0; 0x20000];
+                    let mut bm = vec![0; 0x20000];
+                    avm.read_bytes(0, &mut am).unwrap();
+                    bvm.read_bytes(0, &mut bm).unwrap();
+                    assert_eq!(am, bm, "{:02x?}", p.bytes);
+                }
+                count += 1;
+            }
+            eprintln!(
+                "Seg16 {model:?}/{mode:?}/CPL{cpl}: {count} forms, {} comparisons",
+                count * 3
+            );
+            assert!(count > 100);
         }
     }
 }

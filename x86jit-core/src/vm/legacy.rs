@@ -698,7 +698,10 @@ impl Execution {
                 return Ok((retry.ir.clone(), retry.walk));
             }
         }
-        if context.segment_class == crate::SegmentClass::Flat32 {
+        if matches!(
+            context.segment_class,
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+        ) {
             return self.resolve_flat32(vm, cpu, model, context, _exit_word);
         }
         let linear_fetch = crate::legacy::access(
@@ -2978,8 +2981,11 @@ impl Vcpu {
                         MachineContext {
                             // The masked bus lowering retains the Direct proof;
                             // SMC uses the cheaper original Checked instruction IR.
-                            segment_class: if context.segment_class == crate::SegmentClass::Flat32 {
-                                crate::SegmentClass::Flat32
+                            segment_class: if matches!(
+                                context.segment_class,
+                                crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                            ) {
+                                context.segment_class
                             } else if direct && !direct_bus {
                                 crate::SegmentClass::Direct
                             } else {
@@ -3288,12 +3294,18 @@ impl Vcpu {
                                 .context()
                                 .is_some()
                         {
-                            let retry =
-                                if direct || context.segment_class == crate::SegmentClass::Flat32 {
-                                    retry_instruction(&ir, self.cpu.rip)
-                                } else {
-                                    ir
-                                };
+                            // A task-switch handoff may already own the incoming
+                            // IP. Its original singleton must keep that ownership.
+                            let retry = if ir.icount > 1
+                                && (direct
+                                    || matches!(
+                                        context.segment_class,
+                                        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                                    )) {
+                                retry_instruction(&ir, self.cpu.rip)
+                            } else {
+                                ir
+                            };
                             self.legacy_execution.as_mut().unwrap().instruction_retry =
                                 Some(InstructionRetry {
                                     stamp: LegacyContextStamp::new(&self.cpu, model),
@@ -3301,7 +3313,10 @@ impl Vcpu {
                                     mxcsr_mode: self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
                                     walk: if context.paging_enabled {
                                         BlockWalk::Protected
-                                    } else if context.segment_class == crate::SegmentClass::Flat32 {
+                                    } else if matches!(
+                                        context.segment_class,
+                                        crate::SegmentClass::Flat32 | crate::SegmentClass::Seg16
+                                    ) {
                                         BlockWalk::for_flat32(&retry)
                                     } else if direct {
                                         BlockWalk::for_ir::<false>(&retry)
@@ -5858,6 +5873,8 @@ mod tests {
             let mut cpu = vm.new_vcpu();
             cpu.cpu.rip = 0x1000;
             cpu.cpu.legacy.cr0 = 1;
+            // Keep this a Checked-cache identity witness on both models.
+            cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
             let initial = cpu.cpu.legacy;
             let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert_eq!(run.steps(), 1);
@@ -5938,6 +5955,8 @@ mod tests {
     #[test]
     fn pe_transitions_reuse_both_regimes_without_relifting_or_flushing_other_contexts() {
         let (vm, mut cpu) = pe_transition_loop();
+        // Exercise the retained Checked cache, independently of Seg16 admission.
+        cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
         let warm = cpu.run_steps(&vm, 6, StepOptions::default()).unwrap();
         assert_eq!(warm.steps(), 6, "{:?}", warm.stop());
         let execution = cpu.legacy_execution.as_ref().unwrap();
@@ -6005,6 +6024,8 @@ mod tests {
     #[test]
     fn reused_contexts_revalidate_code_bytes_and_between_run_cache_edits() {
         let (vm, mut cpu) = pe_transition_loop();
+        // Exercise the retained Checked cache, independently of Seg16 admission.
+        cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
         let model = cpu.legacy_model.unwrap();
         let mut execution = Execution::new();
         let mut original = Vec::new();

@@ -1436,6 +1436,7 @@ where
                         | L::I486Gate
                         | L::Address { .. }
                         | L::Flat32Address { .. }
+                        | L::Seg16Address { .. }
                         | L::ReadSelector { .. }
                         | L::Push { .. }
                         | L::Pop { .. }
@@ -2134,13 +2135,13 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
     )
 }
 
-/// Effect proof for the once-only lane (decision-27 order 2). Every accepted
-/// operation is register/flags computation or near control flow: no operand
-/// memory, fault or handoff. Jump/Branch mask their checked target to 32 bits;
-/// Flat32 proves that every such CS offset is usable (decision-27 Flat32 proof).
+/// Effect proof for the RAM-free lane (decision-27 interpreter checkpoint).
+/// Every accepted operation is register/flags computation or near control flow:
+/// no operand memory or handoff. Seg16 near targets may raise a segment fault;
+/// the instruction walk retains their checks and rollback before retirement.
 /// The caller excludes the 486 alignment-refusal regime before this lane.
 /// New IR operations default to the existing transaction path.
-fn nonfaulting(ops: &[IrOp]) -> bool {
+fn register_effects(ops: &[IrOp]) -> bool {
     ops.iter().all(|op| {
         matches!(
             op,
@@ -2249,7 +2250,7 @@ fn fast_instruction(
             }) {
                 continue;
             }
-            if !nonfaulting(std::slice::from_ref(op)) {
+            if !register_effects(std::slice::from_ref(op)) {
                 return None;
             }
             continue;
@@ -2293,6 +2294,15 @@ fn fast_instruction(
                 set_flags,
             } if *set_flags == FlagMask::NONE => {
                 crate::interp::integer::exec_shl(cpu, temps, dst, a, b, size, set_flags);
+            }
+            IrOp::Legacy(L::Seg16Address {
+                dst,
+                offset,
+                bytes,
+                proof,
+                ..
+            }) => {
+                temps[*dst as usize] = proof.address(read_val(*offset, temps), *bytes)?;
             }
             IrOp::Legacy(L::Flat32Address {
                 dst,
@@ -2367,7 +2377,7 @@ fn fast_instruction(
     operand
 }
 
-/// Paged Flat32 executes effect-proved registers and preflighted RAM once;
+/// Paged Flat32/Seg16 execute effect-proved registers and preflighted RAM once;
 /// all other instructions retain the full operand transaction ledger.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
@@ -2381,7 +2391,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     retry: &mut Option<Transaction>,
     tlb: &std::cell::RefCell<Tlb>,
 ) -> Progress {
-    let context = ir.legacy_context.expect("Flat32 context");
+    let context = ir.legacy_context.expect("protected block context");
     let temps = scratch.reused(ir.temp_count as usize);
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
     mem.paging.tlb = Some(tlb);
@@ -2413,7 +2423,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
             && !(cpu.legacy.cpl == 3
                 && cpu.legacy.cr0 & (1 << 18) != 0
                 && cpu.rflags_system & (1 << 18) != 0);
-        let registers_only = once && nonfaulting(view.ops);
+        let registers_only = once && register_effects(view.ops);
         if once && !registers_only {
             mem.paging.fast_operand = fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps);
         }

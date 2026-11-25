@@ -2670,11 +2670,11 @@ fn flat32_call_gate_entry_and_outer_return_reselect_the_class() {
             .unwrap()
             .segment_class
     };
-    assert_eq!(class(&cpu), SegmentClass::Checked);
+    assert_eq!(class(&cpu), SegmentClass::Seg16);
     steps(&mut cpu, &vm, 4); // gate, MOV AX, MOV DS, MOV ES
     assert_eq!(cpu.cpu.legacy.cpl, 0);
     assert_eq!(class(&cpu), SegmentClass::Flat32);
     steps(&mut cpu, &vm, 2); // INC and outer RETF
     assert_eq!(cpu.cpu.legacy.cpl, 3);
-    assert_eq!(class(&cpu), SegmentClass::Checked);
+    assert_eq!(class(&cpu), SegmentClass::Seg16);
 }

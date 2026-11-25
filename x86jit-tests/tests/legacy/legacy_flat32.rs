@@ -247,7 +247,7 @@ fn segment_load_cr0_and_interrupt_delivery_end_the_proof() {
             // Software INT uses the architectural gate even with Outward faults.
             fixture::steps(&mut cpu, &vm, 2);
             assert_eq!(cpu.cpu.rip, 0x1800);
-            assert_eq!(class(&cpu, model), SegmentClass::Checked);
+            assert_eq!(class(&cpu, model), SegmentClass::Seg16);
         }
     }
 }
@@ -275,7 +275,7 @@ fn hardware_interrupt_and_debug_boundaries_reselect_before_successors() {
     assert_eq!(cpu.retired_instructions(), retired + 1);
     assert_eq!(cpu.cpu.rip, 0x1801);
     assert_eq!(cpu.cpu.gpr[2], 0); // pre-interrupt successor never ran
-    assert_eq!(class(&cpu, model), SegmentClass::Checked);
+    assert_eq!(class(&cpu, model), SegmentClass::Seg16);
 
     for budget in 0..5 {
         let (avm, mut a) = setup(model, b"\x40\x43\x42\xf4", false);

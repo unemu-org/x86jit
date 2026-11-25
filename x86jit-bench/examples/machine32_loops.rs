@@ -33,16 +33,20 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 7] = [
+const PATHS: [&str; 11] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
     "machine-protected32-cpl3",
     "machine-paged32-cpl3",
+    "machine-protected16",
+    "machine-paged16",
+    "machine-protected16-cpl3",
+    "machine-paged16-cpl3",
     "application-interp32",
     "application-jit32",
 ];
-const WORKS: [&str; 3] = ["register", "memory", "callret"];
+const WORKS: [&str; 4] = ["register", "memory", "callret", "farseg"];
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x4000;
 const STACK: u64 = 0x8000;
@@ -88,8 +92,9 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     vm.set_cpu_mode(CpuMode::Compat32);
     let machine = path.starts_with("machine");
     let real = path == "machine-real16";
+    let seg16 = path.contains("protected16") || path.contains("paged16");
     let user = path.ends_with("-cpl3");
-    let paged = path.starts_with("machine-paged32");
+    let paged = path.starts_with("machine-paged");
     if machine {
         vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
             Ok("486") => CpuModel::I80486Dx,
@@ -98,7 +103,29 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     }
     vm.set_exception_delivery(ExceptionDelivery::Outward);
     vm.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.write_bytes(CODE, &code(work, real)).unwrap();
+    let bytes = if work == "farseg" {
+        // MOV DX,DS; MOV DS,DX; CALL FAR sub; DEC DI; JNZ; HLT; INC AX; RETF.
+        vec![
+            0x8c,
+            0xda,
+            0x8e,
+            0xda,
+            0x9a,
+            13,
+            0,
+            if user { 11 } else { 8 },
+            0,
+            0x4f,
+            0x75,
+            0xf4,
+            0xf4,
+            0x40,
+            0xcb,
+        ]
+    } else {
+        code(work, real || seg16)
+    };
+    vm.write_bytes(CODE, &bytes).unwrap();
     if path == "application-single32" {
         let bytes = code(work, false);
         let mut decoder =
@@ -148,6 +175,36 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             segment.unusable = 0;
         }
     }
+    if seg16 {
+        cpu.cpu.cs = if user { 11 } else { 8 };
+        cpu.cpu.ds = if user { 19 } else { 16 };
+        cpu.cpu.es = cpu.cpu.ds;
+        cpu.cpu.ss = if user { 27 } else { 24 };
+        cpu.cpu.legacy.gdtr.base = 0x3000;
+        cpu.cpu.legacy.gdtr.limit = 31;
+        for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+            segment.base = match i {
+                0 => CODE as u32,
+                3 => 0x5000,
+                _ => DATA as u32,
+            };
+            segment.limit = if i == 3 { 0x3fff } else { 0xfff };
+            segment.attributes &= !0x4000;
+            if i < 4 && i != 2 {
+                let index = match i {
+                    0 => 1,
+                    1 => 2,
+                    _ => 3,
+                };
+                let low = segment.limit | (segment.base << 16);
+                let high = (segment.base >> 16) | (u32::from(segment.attributes) << 8);
+                vm.write_bytes(0x3000 + index * 8, &low.to_le_bytes())
+                    .unwrap();
+                vm.write_bytes(0x3004 + index * 8, &high.to_le_bytes())
+                    .unwrap();
+            }
+        }
+    }
     cpu.set_a20_enabled(true);
     (vm, cpu)
 }
@@ -161,10 +218,11 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64) {
         } else {
             remaining
         };
+        let seg16 = cpu.cpu.legacy.cr0 & 1 != 0 && cpu.cpu.legacy.segments[0].base == CODE as u32;
         cpu.set_reg(Reg::Rip, if real { 0 } else { CODE });
         cpu.set_reg(Reg::Rdi, count);
-        cpu.set_reg(Reg::Rsi, DATA);
-        cpu.set_reg(Reg::Rsp, STACK);
+        cpu.set_reg(Reg::Rsi, if seg16 { 0 } else { DATA });
+        cpu.set_reg(Reg::Rsp, if seg16 { 0x3000 } else { STACK });
         let exit = cpu.run(vm, None);
         if cpu.cpu.legacy.cpl == 3 {
             // SDM Vol 2A HLT: CPL 3 stops at #GP(0), without retiring HLT.
@@ -177,7 +235,7 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64) {
             assert!(matches!(exit, Exit::Hlt));
         }
         assert_eq!(cpu.reg(Reg::Rdi), 0);
-        assert_eq!(cpu.reg(Reg::Rsp), STACK);
+        assert_eq!(cpu.reg(Reg::Rsp), if seg16 { 0x3000 } else { STACK });
         remaining -= count;
     }
 }
@@ -208,7 +266,11 @@ fn main() {
                 |s| vec![s.as_str()],
             );
             for path in paths {
-                let real = path == "machine-real16";
+                let seg16 = path.contains("protected16") || path.contains("paged16");
+                if work == "farseg" && !seg16 {
+                    continue;
+                }
+                let real = path == "machine-real16" || seg16;
                 let (vm, mut cpu) = setup(path, work);
                 execute(&vm, &mut cpu, real, 10000);
                 cpu.set_reg(Reg::Rax, 0);
@@ -222,9 +284,9 @@ fn main() {
                 let seconds = start.elapsed().as_secs_f64();
                 let host = instructions() - host_before;
                 let retired = cpu.retired_instructions() - retired_before;
-                let count = 5 * n
+                let count = (if work == "farseg" { 7 } else { 5 }) * n
                     + if real {
-                        n.div_ceil(60000)
+                        n.div_ceil(60000) * u64::from(!path.ends_with("-cpl3"))
                     } else {
                         u64::from(!path.ends_with("-cpl3"))
                     };
