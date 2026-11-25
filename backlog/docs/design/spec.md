@@ -2657,9 +2657,11 @@ retained states keep Checked; V86 and Flat32 retain their separate classes.
 One class serves both code widths: the interval proof below is
 width-independent, and the operand, address and stack widths come from the
 context (CS.D, SS.B), which the context identity and every block key
-already carry. Each instruction's offset is formed at its own address size,
-16-bit (CS.D=0, or 67h in CS.D=1 code) or 32-bit, before the interval check
-(SDM Vol 1 §3.6 p. 3-18); implicit stack accesses use SP or ESP by SS.B
+already carry. Each instruction's offset is formed at its own address size
+before the interval check: 67h selects the non-default size, so CS.D=0 code
+addresses with 16 bits and with 32 bits under 67h, and CS.D=1 code with
+32 bits and with 16 bits under 67h (SDM Vol 1 §3.6 pp. 3-18–3-19, Table
+3-3; Vol 2A §2.1.1 p. 2-2); implicit stack accesses use SP or ESP by SS.B
 (Vol 1 §6.2.3 p. 6-3). The interval is the scaled limit (G is applied when
 the descriptor is loaded) and, for expand-down data, the B-dependent upper
 bound FFFFh or FFFFFFFFh (Vol 3A §3.4.5 p. 3-11). The public

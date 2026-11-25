@@ -533,6 +533,17 @@ fn comparable(p: &Probe) -> bool {
         && !(matches!(p.insn.mnemonic(), Call | Jmp) && p.insn.is_jmp_far_indirect()
             || p.insn.is_call_far_indirect())
 }
+/// `comparable` plus the far-pointer loads and the x87 forms: the Segmented
+/// census compares two legacy classes, not the application lowering, so
+/// both stay exact (an x87 probe runs with `FpuModel::Present`).
+fn seg32_comparable(p: &Probe) -> bool {
+    comparable(p)
+        || p.x87
+        || matches!(
+            p.insn.mnemonic(),
+            M::Lds | M::Les | M::Lss | M::Lfs | M::Lgs
+        )
+}
 fn same_application_decode(p: &Probe) -> bool {
     let app = Decoder::with_ip(32, &p.bytes, 0x1000, DecoderOptions::NONE).decode();
     !app.is_invalid()
@@ -1171,8 +1182,9 @@ fn seg32_cpl3_checked_census_forms_are_equal() {
 }
 
 /// CS.D=1 in 64 KiB segments with a non-zero CS base: the Segmented class
-/// against Checked over every comparable form, including the 66h/67h
-/// variants (16-bit addressing in 32-bit code). Alternate forms run with
+/// against Checked over every comparable form, far-pointer loads and x87
+/// forms included (`seg32_comparable`), with the 66h/67h variants (16-bit
+/// addressing in 32-bit code). Alternate forms run with
 /// SS.B=0 (SP, SDM Vol 1 §6.2.3 p. 6-3) and with G=1 DS/ES caches whose
 /// scaled limit is 1FFFFh (SDM Vol 3A §3.4.5 p. 3-11).
 fn seg32_checked_census(cpl: u8) {
@@ -1183,7 +1195,7 @@ fn seg32_checked_census(cpl: u8) {
             let mut sequences = 0;
             for (index, mut p) in probes(model, mode)
                 .into_iter()
-                .filter(comparable)
+                .filter(seg32_comparable)
                 .enumerate()
                 .filter(|(i, _)| mode.paged() || i % 3 == 0)
             {

@@ -10,8 +10,8 @@ mod fixture;
 use fixture::descriptor;
 use x86jit_core::fault::ErrorCode;
 use x86jit_core::{
-    derive_legacy_context, CpuModel, ExceptionDelivery, Exit, Prot, RegionKind, SegmentClass,
-    StepOptions, StepRun, StepStop, Vcpu, Vm, VmConfig,
+    derive_legacy_context, CpuModel, ExceptionDelivery, Exit, FpuModel, Prot, RegionKind,
+    SegmentClass, StepOptions, StepRun, StepStop, Vcpu, Vm, VmConfig,
 };
 
 const MODELS: [CpuModel; 2] = [CpuModel::I80386, CpuModel::I80486Dx];
@@ -697,6 +697,208 @@ fn paged_segment_reloads_and_far_returns_retain_context_blocks() {
                     warm = Some(proof);
                 } else if round > 1 {
                     assert_eq!(Some(proof), warm);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn operand_size_16_near_transfers_truncate_eip_under_both_cs_limits() {
+    // 80386 PRM §17.2 CALL p. 17-37, Jcc p. 17-81, JMP p. 17-83, RET
+    // p. 17-142; SDM Vol 2A CALL p. 3-125, Jcc p. 3-503, JMP p. 3-506,
+    // Vol 2B RET p. 4-570: with a 16-bit operand size (66h in CS.D=1 code)
+    // the new EIP is ANDed with 0000FFFFh, and RET pops only IP.
+    // INC EBX first, so each transfer sits inside a block.
+    let cases: &[(&[u8], &str)] = &[
+        // JMP rel16: 105h + FF00h = 10005h -> 0005h.
+        (b"\x43\x66\xe9\x00\xff", "jmp"),
+        // CALL rel16 to the same target; pushes IP 0105h.
+        (b"\x43\x66\xe8\x00\xff", "call"),
+        // JNZ rel16 (ZF=0 after INC EBX): 106h + FEFFh = 10005h -> 0005h.
+        (b"\x43\x66\x0f\x85\xff\xfe", "jcc"),
+        // JMP AX with EAX = 10005h: DEST AND 0000FFFFh.
+        (b"\x43\x66\xff\xe0", "jmp r16"),
+        // RET pops the word 0005h of the dword 00010005h.
+        (b"\x43\x66\xc3", "ret"),
+    ];
+    for model in MODELS {
+        for cpl in [0, 3] {
+            for paged in [false, true] {
+                for four_gib in [false, true] {
+                    for &(code, what) in cases {
+                        let mut fixtures = pair(model, code, cpl, paged);
+                        for (vm, cpu) in &mut fixtures {
+                            if four_gib {
+                                let cs = &mut cpu.cpu.legacy.segments[0];
+                                cs.limit = u32::MAX;
+                                cs.attributes |= 0x8000;
+                            }
+                            cpu.cpu.gpr[0] = 0x1_0005;
+                            // CS:0005h is INC EDX; CS:10005h would be INC ECX.
+                            vm.write_bytes(0x1005, b"\x42\xf4").unwrap();
+                            vm.write_bytes(0x11005, b"\x41\xf4").unwrap();
+                            vm.write_bytes(0x8000, &0x1_0005u32.to_le_bytes()).unwrap();
+                        }
+                        assert_eq!(
+                            (class(&fixtures[0].1), class(&fixtures[1].1)),
+                            (SegmentClass::Segmented, SegmentClass::Checked)
+                        );
+                        let what = format!("{model:?} PG={paged} CPL{cpl} 4G={four_gib} {what}");
+                        let run = compare(&mut fixtures, 3, &what);
+                        let a = &fixtures[0].1;
+                        assert_eq!(run.steps(), 3, "{what}");
+                        assert_eq!(a.cpu.rip, 6, "{what}");
+                        assert_eq!((a.cpu.gpr[2], a.cpu.gpr[1]), (1, 0), "{what}");
+                        let esp = match code[2] {
+                            0xe8 => 0xffe,
+                            0xc3 => 0x1002,
+                            _ => 0x1000,
+                        };
+                        assert_eq!(a.cpu.gpr[4], esp, "{what}");
+                        if code[2] == 0xe8 {
+                            let mut pushed = [0; 4];
+                            fixtures[0].0.read_bytes(0x7ffe, &mut pushed).unwrap();
+                            assert_eq!(pushed, [0x05, 0x01, 0x05, 0x00], "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn far_pointer_loads_inside_a_block_check_the_whole_pointer() {
+    // SDM Vol 2A LDS/LES/LFS/LGS/LSS p. 3-541, Protected Mode Exceptions:
+    // #GP(0) if the memory operand is outside the DS limit. The m16:32
+    // pointer is six bytes and the m16:16 one four; DS limit FFh admits the
+    // last byte at FFh only (SDM Vol 3A §3.4.5 p. 3-11).
+    // (opcode bytes, loaded segment)
+    let loads: &[(&[u8], usize)] = &[
+        (b"\xc5", 1),
+        (b"\xc4", 2),
+        (b"\x0f\xb4", 4),
+        (b"\x0f\xb5", 5),
+    ];
+    for model in MODELS {
+        for cpl in [0u8, 3] {
+            for paged in [false, true] {
+                for &(opcode, segment) in loads {
+                    for operand32 in [false, true] {
+                        for address32 in [false, true] {
+                            let size = if operand32 { 6u32 } else { 4 };
+                            for offset in [0xff - size, 0x100 - size, 0x101 - size, 0x100] {
+                                let allowed = offset + size - 1 <= 0xff;
+                                // INC EBX; LxS EAX,[offset]; INC EDX.
+                                let mut code = vec![0x43];
+                                if !operand32 {
+                                    code.push(0x66);
+                                }
+                                if !address32 {
+                                    code.push(0x67);
+                                }
+                                code.extend_from_slice(opcode);
+                                if address32 {
+                                    code.push(0x05);
+                                    code.extend_from_slice(&offset.to_le_bytes());
+                                } else {
+                                    code.push(0x06);
+                                    code.extend_from_slice(&(offset as u16).to_le_bytes());
+                                }
+                                code.push(0x42);
+                                let mut fixtures = pair(model, &code, cpl, paged);
+                                let selector = 0x10 | u16::from(cpl);
+                                for (vm, _) in &mut fixtures {
+                                    let at = 0x5000 + u64::from(offset);
+                                    let pointer = 0x1234_5678u32;
+                                    vm.write_bytes(at, &pointer.to_le_bytes()[..size as usize - 2])
+                                        .unwrap();
+                                    vm.write_bytes(
+                                        at + u64::from(size) - 2,
+                                        &selector.to_le_bytes(),
+                                    )
+                                    .unwrap();
+                                }
+                                let what = format!(
+                                    "{model:?} PG={paged} CPL{cpl} {code:02x?} o32={operand32} a32={address32}"
+                                );
+                                let run = compare(&mut fixtures, 3, &what);
+                                let a = &fixtures[0].1;
+                                if allowed {
+                                    assert_eq!(run.steps(), 3, "{what}");
+                                    assert_eq!(
+                                        a.cpu.gpr[0],
+                                        if operand32 { 0x1234_5678 } else { 0x5678 },
+                                        "{what}"
+                                    );
+                                    assert_eq!(a.cpu.legacy.segments[segment].base, 0xa000);
+                                    assert_eq!(a.cpu.gpr[2], 1, "{what}");
+                                } else {
+                                    assert_eq!(run.steps(), 1, "{what}");
+                                    assert_eq!(vector(&run), Some(13), "{what}");
+                                    assert_eq!(error_code(&run), ErrorCode::bits(0, 0xffff));
+                                    assert_ne!(a.cpu.legacy.segments[segment].base, 0xa000);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn x87_ten_byte_operands_check_the_whole_operand_against_the_limit() {
+    // SDM Vol 2A FLD p. 3-353 and FST/FSTP p. 3-387, Protected Mode
+    // Exceptions: #GP(0) if the memory operand is outside the DS limit. An
+    // m80 at DS limit FFh fits at offset F6h and not at F7h.
+    // (FLD m80 /5, FSTP m80 /7)
+    for model in MODELS {
+        for cpl in [0, 3] {
+            for paged in [false, true] {
+                for reg in [5u8, 7] {
+                    for address32 in [false, true] {
+                        for offset in [0xf6u32, 0xf7, 0xff, 0x100] {
+                            let allowed = offset <= 0xf6;
+                            let mut code = vec![0x43];
+                            if !address32 {
+                                code.push(0x67);
+                            }
+                            code.push(0xdb);
+                            if address32 {
+                                code.push(0x05 | reg << 3);
+                                code.extend_from_slice(&offset.to_le_bytes());
+                            } else {
+                                code.push(0x06 | reg << 3);
+                                code.extend_from_slice(&(offset as u16).to_le_bytes());
+                            }
+                            code.push(0x42);
+                            let mut fixtures = pair(model, &code, cpl, paged);
+                            for (vm, cpu) in &mut fixtures {
+                                cpu.set_fpu_model(FpuModel::Present);
+                                // 1.0 as an m80 (SDM Vol 1 §4.2.2 Table 4-3).
+                                let mut one = [0u8; 10];
+                                one[7] = 0x80;
+                                one[8] = 0xff;
+                                one[9] = 0x3f;
+                                vm.write_bytes(0x5000 + u64::from(offset), &one).unwrap();
+                            }
+                            let what = format!(
+                                "{model:?} PG={paged} CPL{cpl} {code:02x?} a32={address32}"
+                            );
+                            let run = compare(&mut fixtures, 3, &what);
+                            if allowed {
+                                assert_eq!(run.steps(), 3, "{what}");
+                                assert_eq!(fixtures[0].1.cpu.gpr[2], 1, "{what}");
+                            } else {
+                                assert_eq!(run.steps(), 1, "{what}");
+                                assert_eq!(vector(&run), Some(13), "{what}");
+                                assert_eq!(error_code(&run), ErrorCode::bits(0, 0xffff));
+                            }
+                        }
+                    }
                 }
             }
         }

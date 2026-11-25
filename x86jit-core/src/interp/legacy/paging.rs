@@ -2652,6 +2652,8 @@ fn strict_lane<const ROUTED: bool, const ORDER: u8>(
 /// Prove the entire instruction before transferring RAM. Address preparation
 /// reuses the shared integer helpers with flags disabled and changes only temps.
 /// A second operand, a locked operation or an unclassified effect falls back.
+/// ENTER and LEAVE never arrive: `flat32_ordinary` keeps them out of ordinary
+/// blocks, and their SS-relative frames go through the transaction path.
 fn fast_instruction(
     ops: &[IrOp],
     cpu: &mut CpuState,
@@ -2789,16 +2791,6 @@ fn fast_instruction(
                     AccessKind::Write,
                 )?);
             }
-            IrOp::Legacy(L::Leave { size }) => {
-                operand = Some(fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    cpu.gpr[RBP] & u64::from(u32::MAX),
-                    *size,
-                    AccessKind::Read,
-                )?);
-            }
             // MOV Sreg from a register: the selector is known before the
             // load, so its descriptor is proved here (`descriptor_window`).
             IrOp::Legacy(op @ L::LoadSegment { value, .. })
@@ -2812,29 +2804,6 @@ fn fast_instruction(
                     ],
                     strict: true,
                 });
-            }
-            IrOp::Legacy(L::Enter {
-                size,
-                alloc,
-                level: 0,
-            }) => {
-                let frame = (cpu.gpr[RSP] as u32).wrapping_sub(u32::from(*size));
-                fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    u64::from(frame.wrapping_sub(u32::from(*alloc))),
-                    1,
-                    AccessKind::Write,
-                )?;
-                operand = Some(fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    u64::from(frame),
-                    *size,
-                    AccessKind::Write,
-                )?);
             }
             _ => return None,
         }
@@ -3030,6 +2999,31 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_and_leave_keep_blocks_off_the_ordinary_walk() {
+        // `fast_instruction` has no ENTER/LEAVE lane: their frames are
+        // SS-relative, so they must stay out of ordinary blocks.
+        for op in [
+            L::Enter {
+                size: 4,
+                alloc: 8,
+                level: 0,
+            },
+            L::Leave { size: 4 },
+        ] {
+            let ir = IrBlock {
+                ops: vec![IrOp::InsnStart { guest_addr: 0 }, IrOp::Legacy(op)],
+                guest_start: 0,
+                temp_count: 0,
+                guest_len: 1,
+                icount: 1,
+                mode: crate::CpuMode::Compat32,
+                legacy_context: None,
+            };
+            assert!(!super::super::flat32_ordinary(&ir), "{ir:?}");
+        }
+    }
 
     #[test]
     fn a_strict_lane_miss_restores_the_instruction_inputs() {
