@@ -976,6 +976,7 @@ fn block_suffix(ir: &IrBlock, ip: u64) -> Option<IrBlock> {
         temp_count: ir.temp_count,
         ops,
         legacy_context: ir.legacy_context,
+        direct_exit: false,
     })
 }
 

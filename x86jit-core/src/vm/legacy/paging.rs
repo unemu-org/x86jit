@@ -48,7 +48,7 @@ pub(super) struct State {
     pub(super) tlb: std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
-    context_id: u64,
+    pub(super) context_id: u64,
     contexts: EngineMap<LegacyContextStamp, u64>,
     model: Option<LegacyCpuModel>,
     memory: usize,
@@ -57,10 +57,14 @@ pub(super) struct State {
     lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
-    transaction: Option<crate::interp::legacy::paging::Transaction>,
+    pub(super) transaction: Option<crate::interp::legacy::paging::Transaction>,
     pub(super) event_transaction: Option<crate::interp::legacy::paging::Transaction>,
     // Most recent first; every entry is a member of `contexts`.
     recent: Box<[Option<(LegacyContextStamp, u64)>; 4]>,
+    // Advances whenever `blocks` may drop or replace a proof, and with it
+    // its registration, or `contexts` may give an identity to another stamp;
+    // successor links (`links.rs`) name it.
+    pub(super) version: u64,
 }
 
 impl State {
@@ -71,7 +75,13 @@ impl State {
         self.port_input = None;
     }
 
+    /// Whether a proof holds this very block.
+    pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
+        self.blocks.values().any(|proof| Arc::ptr_eq(&proof.ir, ir))
+    }
+
     pub(super) fn invalidate(&mut self) {
+        self.version = self.version.wrapping_add(1);
         self.blocks.clear();
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
@@ -98,6 +108,7 @@ impl State {
             self.mapping = Some(mapping);
         }
         if self.source_generation != source_generation {
+            self.version = self.version.wrapping_add(1);
             self.blocks.clear();
             self.source_generation = source_generation;
         }
@@ -116,6 +127,7 @@ impl State {
                     // Bound context identities as well as blocks. Clear both before
                     // reusing an ID; this does not expire cached translations.
                     if self.contexts.len() == MAX_CONTEXTS {
+                        self.version = self.version.wrapping_add(1);
                         self.blocks.clear();
                         self.contexts.clear();
                         *self.recent = [None; 4];
@@ -137,6 +149,7 @@ impl State {
     fn reconcile_generation(&mut self) {
         let generation = self.tlb.get_mut().generation;
         if self.generation != generation {
+            self.version = self.version.wrapping_add(1);
             self.blocks.clear();
             self.generation = generation;
         }
@@ -240,9 +253,11 @@ impl State {
             self.reconcile_generation();
             let key = self.key(cpu, model, context, owner_id, ordinary)?;
             self.lifts += 1;
-            let ir = Arc::new(ir);
+            let direct_exit = ir.ends_direct();
+            let ir = Arc::new(IrBlock { direct_exit, ..ir });
             if !source.publishable() {
                 // The interpreter may use this snapshot once, without a proof.
+                self.version = self.version.wrapping_add(1);
                 self.blocks.remove(&key);
                 let ir = retry_instruction(&ir, cpu.rip);
                 let ordinary = ordinary && ordinary_block(context, &ir);
@@ -257,17 +272,24 @@ impl State {
                 continue;
             }
             if self.blocks.len() == MAX_BLOCKS && !self.blocks.contains_key(&key) {
+                self.version = self.version.wrapping_add(1);
                 self.blocks.clear();
             }
-            self.blocks.insert(
-                key,
-                Proof {
-                    ir: ir.clone(),
-                    ordinary,
-                    permit,
-                    _registration: registration.unwrap(),
-                },
-            );
+            if self
+                .blocks
+                .insert(
+                    key,
+                    Proof {
+                        ir: ir.clone(),
+                        ordinary,
+                        permit,
+                        _registration: registration.unwrap(),
+                    },
+                )
+                .is_some()
+            {
+                self.version = self.version.wrapping_add(1);
+            }
             return Ok((ir, ordinary));
         }
     }

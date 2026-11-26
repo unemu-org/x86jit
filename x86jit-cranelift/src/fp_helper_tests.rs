@@ -432,6 +432,7 @@ fn every_helper_has_an_explicit_classification_and_integer_witness() {
         temp_count: 0,
         ops: vec![IrOp::Hlt],
         legacy_context: None,
+        direct_exit: false,
     };
     assert!(matches!(
         JitBackend::new().materialize(&block, MemConsistency::Fast, None, 0),

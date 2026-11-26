@@ -3588,6 +3588,11 @@ pub struct IrBlock {
     pub mode: crate::CpuMode,
     /// Authoritative legacy context; application lifting always leaves this absent.
     pub legacy_context: Option<crate::legacy::MachineContext>,
+    /// Whether the last transfer has a lift-time target ([`Self::ends_direct`]),
+    /// recorded when the Machine dispatcher publishes the block. Only the
+    /// cost of consulting its successor links reads it (xj-to9.27); a block
+    /// that leaves it `false` takes the full lookup after it.
+    pub direct_exit: bool,
 }
 
 impl core::fmt::Debug for IrBlock {
@@ -3605,6 +3610,27 @@ impl core::fmt::Debug for IrBlock {
 }
 
 impl IrBlock {
+    /// Whether the block's last transfer has a lift-time target: a
+    /// conditional branch, a CX or ECX loop, or a jump to an immediate other
+    /// than the block's sequential end. A block cut at the lifter's length,
+    /// page or instruction-class bound continues there; its successor lookup
+    /// is amortised over the whole block and is not worth a link.
+    pub fn ends_direct(&self) -> bool {
+        for op in self.ops.iter().rev() {
+            match op {
+                IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk) => {}
+                IrOp::Branch { .. }
+                | IrOp::LoopCx { .. }
+                | IrOp::Legacy(crate::legacy::LegacyOp::Loop { .. }) => return true,
+                IrOp::Jump {
+                    target: Val::Imm(target),
+                } => return *target != self.next_ip(),
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Sequential successor, distinct from the byte span used for invalidation.
     pub fn next_ip(&self) -> u64 {
         let end = self.guest_start.wrapping_add(u64::from(self.guest_len));

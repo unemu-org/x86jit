@@ -111,6 +111,7 @@ fn codemap_preserves_noncontiguous_region_rips() {
                 target: Val::Imm(target),
             },
         ],
+        direct_exit: false,
     };
     let region = IrRegion {
         entry: first,

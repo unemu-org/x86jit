@@ -15,6 +15,7 @@ mod nmi;
 mod paging;
 
 mod flat32;
+mod links;
 
 /// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
 /// domains distinct even when a vCPU moves between VMs; zero is never issued.
@@ -28,7 +29,8 @@ use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
 /// Machine dispatch counters for cost probes, compiled only with
-/// `test-hooks`: blocks executed, context reselections, lifts and proof hits.
+/// `test-hooks`: blocks executed, context reselections, lifts, proof hits
+/// and successor links followed.
 #[cfg(feature = "test-hooks")]
 pub(crate) mod probes {
     use std::cell::Cell;
@@ -36,9 +38,10 @@ pub(crate) mod probes {
     pub(crate) const RESELECTIONS: usize = 1;
     pub(crate) const LIFTS: usize = 2;
     pub(crate) const PROOFS: usize = 3;
+    pub(crate) const LINKS: usize = 4;
     thread_local! {
-        pub(crate) static COUNTS: [Cell<u64>; 4] = const {
-            [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)]
+        pub(crate) static COUNTS: [Cell<u64>; 5] = const {
+            [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)]
         };
     }
     pub(crate) fn bump(index: usize) {
@@ -55,15 +58,16 @@ use probe;
 
 impl Vcpu {
     /// Thread-local Machine dispatch counters since the last call: blocks
-    /// executed, context reselections, lifts, proof hits and the op walks of
-    /// the protected and paged instruction walks. Cost probes only.
+    /// executed, context reselections, lifts, proof hits, the op walks of
+    /// the protected and paged instruction walks and successor links
+    /// followed. Cost probes only.
     #[doc(hidden)]
     #[cfg(feature = "test-hooks")]
-    pub fn take_machine_counters_for_test() -> [u64; 5] {
-        let [blocks, reselections, lifts, proofs] =
+    pub fn take_machine_counters_for_test() -> [u64; 6] {
+        let [blocks, reselections, lifts, proofs, links] =
             probes::COUNTS.with(|c| c.each_ref().map(|c| c.replace(0)));
         let walks = crate::interp::legacy::WALKS.with(|walks| walks.replace(0));
-        [blocks, reselections, lifts, proofs, walks]
+        [blocks, reselections, lifts, proofs, walks, links]
     }
 }
 
@@ -585,6 +589,8 @@ pub(super) struct Execution {
     stall_count: u32,
     paging: Option<Box<paging::State>>,
     flat32: flat32::State,
+    // Successor links (`links.rs`).
+    links: Box<links::Links>,
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
     // The last few retained identities, most recent first, with the epoch of
     // their last use: segment reloads and far transfers alternate between
@@ -650,6 +656,7 @@ impl Execution {
             stall_count: 0,
             paging: None,
             flat32: flat32::State::default(),
+            links: Box::default(),
         }
     }
     // Whether deliveries copy the registers they begin with for the delivery
@@ -674,6 +681,7 @@ impl Execution {
         self.instruction_retry = None;
         self.retry_slice = None;
         self.direct_proofs.clear();
+        self.links.clear();
         self.smc_pages.clear();
         self.retained20.clear();
         self.last_direct_fetch = None;
@@ -726,6 +734,8 @@ impl Execution {
     #[cold]
     #[inline(never)]
     fn invalidate_translations(&mut self) {
+        // Context identities restart: no link may name one.
+        self.links.clear();
         self.invalidate_paging();
         self.direct_proofs.clear();
         self.blocks.clear();
@@ -796,6 +806,12 @@ impl Execution {
                         .unwrap()
                         .0;
                     let evicted = self.contexts.remove(&oldest).unwrap();
+                    // Its identity is reused: no link may name it. Redundant
+                    // today: the Flat32 proof map's version advances below
+                    // (`evict_context`) and a paged link also names the paging
+                    // state's own identity; kept so no link outlives the
+                    // identity it names.
+                    self.links.clear();
                     self.blocks.retain(|key, _| key.context_id != evicted.id);
                     self.flat32.evict_context(evicted.id);
                     evicted.id
@@ -1191,6 +1207,7 @@ fn retry_instruction(ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
         temp_count: ir.temp_count,
         ops,
         legacy_context: ir.legacy_context,
+        direct_exit: false,
     })
 }
 
@@ -1460,7 +1477,8 @@ fn resolve_direct_uncached(
             };
             return Ok(ir);
         }
-        let ir = Arc::new(ir);
+        let direct_exit = ir.ends_direct();
+        let ir = Arc::new(IrBlock { direct_exit, ..ir });
         #[cfg(test)]
         vm.after_source_read();
         vm.handle_smc(exit_word);
@@ -2938,6 +2956,19 @@ impl Vcpu {
                 .then(|| super::device::InBlock::new(vm, self.device_cpu().id))
         });
         let _in_block_scope = in_block.get().map(super::device::InBlock::publish);
+        // Successor links (`links.rs`), for Machine runs of more than one
+        // step. Set by an ordinary completed block whose last transfer is
+        // direct, and taken by the next turn: only that turn's lookup consults
+        // the links.
+        let linking = KIND >= MACHINE_DISPATCH && !SINGLE && !links::off();
+        if linking {
+            self.legacy_execution
+                .as_mut()
+                .unwrap()
+                .links
+                .begin_run(vm.mem.fetch_policy.is_none());
+        }
+        let mut link_from = false;
         macro_rules! machine_exit {
             ($exit:expr) => {{
                 let exit = $exit;
@@ -2995,6 +3026,7 @@ impl Vcpu {
                 context = crate::lift::i8086::CONTEXT;
             }
             if KIND >= MACHINE_DISPATCH {
+                let mut linked = std::mem::take(&mut link_from);
                 if DEVICES {
                     if self
                         .cpu
@@ -3047,6 +3079,7 @@ impl Vcpu {
                 // Both are decided out of line, the NMI step included.
                 if self.exit_request.word.load(Ordering::Relaxed) & (EXIT_REQUESTED | NMI_EDGE) != 0
                 {
+                    linked = false;
                     match self.machine_external::<ROUTED, ORDER, SINGLE, KIND>(
                         vm,
                         options,
@@ -3089,6 +3122,7 @@ impl Vcpu {
                 }
                 if boundary.service {
                     if self.cpu.port_string_in.is_some() {
+                        linked = false;
                         if let Err(exit) = self.finish_port_string::<ROUTED, ORDER, SINGLE, KIND>(
                             vm,
                             options,
@@ -3108,6 +3142,7 @@ impl Vcpu {
                         && self.cpu.pending_port_in.is_none()
                         && self.cpu.port_string_in.is_none()
                     {
+                        linked = false;
                         if service & HANDOFF_NUMERIC != 0 && !self.machine_pending_io(task_pending)
                         {
                             if let Some(exit) = self.cpu.reconcile_numeric_error(self.cpu.rip) {
@@ -3231,9 +3266,42 @@ impl Vcpu {
                 // pages do. Such a block is invalidated by no store and is
                 // checked against its bytes only in `resolve_retained`: a
                 // memo or block link that skips resolve must not keep a
-                // block resolved while this is set.
+                // block resolved while this is set. The successor links
+                // refuse every retained twenty-bit page (`links.rs`), this
+                // one included.
                 let retained20 = direct20 && retained && vm.mem.fetch_policy.is_none();
-                let resolved = if direct20 {
+                // A turn after a direct exit consults the successor links
+                // (`links.rs`) before the resolver; a turn that drained a
+                // store into a code page does not. That test is a cost filter
+                // only: such a store advanced the publication generation,
+                // which every link names (`Link::generation`).
+                let mut record = false;
+                let followed = if linked && !dirty {
+                    match execution.follow_link(
+                        vm,
+                        &self.cpu,
+                        links::Lookup {
+                            context,
+                            physical,
+                            twenty: direct20,
+                            direct,
+                            retained,
+                            retry: boundary.instruction_retry,
+                            paged: KIND == MACHINE_DISPATCH && context.paging_enabled,
+                        },
+                    ) {
+                        Ok(found) => Some(found),
+                        Err(pending) => {
+                            record = pending;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let resolved = if let Some(found) = followed {
+                    Ok(found)
+                } else if direct20 {
                     if retained20 {
                         let execution = self.legacy_execution.as_mut().unwrap();
                         super::i8086::resolve_retained(
@@ -3287,6 +3355,12 @@ impl Vcpu {
                         exit_word,
                     )
                 };
+                if record {
+                    self.legacy_execution
+                        .as_mut()
+                        .unwrap()
+                        .record_link(vm, &self.cpu, &resolved);
+                }
                 self.legacy_execution.as_mut().unwrap().last_direct_fetch =
                     (direct && !retained).then_some(linear_fetch);
                 probe!(BLOCKS);
@@ -3506,6 +3580,7 @@ impl Vcpu {
                         || self.sti_shadow
                         || self.ss_shadow & SS_HOLD != 0
                         || (direct20 && self.cpu.rflags_system & 0x100 != 0);
+                    link_from = linking && ir.direct_exit;
                     if boundary.cold_epilogue {
                         if self.delivery_log.is_some() {
                             self.record_unit(direct20, &ir, &progress);
@@ -3515,6 +3590,7 @@ impl Vcpu {
                         if self.machine_epilogue(&ir, progress.retired) {
                             direct_bus = raw_direct(&self.cpu);
                             refresh_boundary = true;
+                            link_from = false;
                         }
                     }
                     if SINGLE && steps != 0 {
@@ -3583,6 +3659,13 @@ impl Vcpu {
                         // SDM Vol 2B REP, p. 4-564: a completed iteration is an
                         // interruption window with updated registers (decision-22).
                         self.legacy_execution.as_mut().unwrap().instruction_retry = None;
+                        // The protected walks report every completion here; an
+                        // ordinary one links its successor as the fast arm does.
+                        link_from = linking
+                            && ir.direct_exit
+                            && outcome.exit.is_none()
+                            && !outcome.context_changed
+                            && !single_step;
                         if self
                             .legacy_execution
                             .as_ref()
@@ -3592,6 +3675,7 @@ impl Vcpu {
                         {
                             self.apply_pending_a20();
                             direct_bus = raw_direct(&self.cpu);
+                            link_from = false;
                         }
                         if !direct20 && outcome.context_changed {
                             probe!(RESELECTIONS);
@@ -6611,3 +6695,7 @@ mod virtual8086_key_tests {
 #[cfg(test)]
 #[path = "legacy/exit_census.rs"]
 mod exit_census;
+
+#[cfg(test)]
+#[path = "legacy/link_witness.rs"]
+mod link_witness;

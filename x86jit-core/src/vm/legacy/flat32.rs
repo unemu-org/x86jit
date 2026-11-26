@@ -55,10 +55,19 @@ pub(super) struct State {
     generation: u64,
     mapping: Option<Arc<()>>,
     blocks: EngineMap<LegacyBlockKey, Proof>,
+    // Advances whenever `blocks` may drop or replace a proof, and with it
+    // its registration; successor links (`links.rs`) name it.
+    pub(super) version: u64,
 }
 
 impl State {
+    /// Whether a proof holds this very block.
+    pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
+        self.blocks.values().any(|proof| Arc::ptr_eq(&proof.ir, ir))
+    }
+
     pub(super) fn evict_context(&mut self, id: u64) {
+        self.version = self.version.wrapping_add(1);
         self.blocks.retain(|key, _| key.context_id != id);
     }
 
@@ -82,6 +91,7 @@ impl State {
                     .as_ref()
                     .is_none_or(|old| !Arc::ptr_eq(old, &mapping))
             {
+                self.version = self.version.wrapping_add(1);
                 self.blocks.clear();
                 self.generation = generation;
                 self.mapping = Some(mapping);
@@ -102,6 +112,7 @@ impl State {
                 continue;
             }
             if !source.publishable() {
+                self.version = self.version.wrapping_add(1);
                 self.blocks.remove(&key);
                 let CachedBlock::Interpreted(ir) = source.uncached(ir) else {
                     unreachable!()
@@ -148,18 +159,26 @@ impl State {
             // Keep retention bounded independently of the context LRU. Each
             // proof owns its counted physical registration until eviction.
             if self.blocks.len() == 64 {
+                self.version = self.version.wrapping_add(1);
                 self.blocks.clear();
             }
-            let ir = Arc::new(ir);
-            self.blocks.insert(
-                key,
-                Proof {
-                    ir: ir.clone(),
-                    walk,
-                    permit,
-                    _registration: registration.unwrap(),
-                },
-            );
+            let direct_exit = ir.ends_direct();
+            let ir = Arc::new(IrBlock { direct_exit, ..ir });
+            if self
+                .blocks
+                .insert(
+                    key,
+                    Proof {
+                        ir: ir.clone(),
+                        walk,
+                        permit,
+                        _registration: registration.unwrap(),
+                    },
+                )
+                .is_some()
+            {
+                self.version = self.version.wrapping_add(1);
+            }
             return Ok((ir, walk));
         }
     }

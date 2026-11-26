@@ -617,7 +617,7 @@ fn a_warm_block_is_one_op_walk_and_a_budget_cut_keeps_it_one() {
                     a.cpu = initial;
                     x86jit_core::Vcpu::take_machine_counters_for_test();
                     let run = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
-                    let [blocks, _, lifts, _, walks] =
+                    let [blocks, _, lifts, _, walks, _] =
                         x86jit_core::Vcpu::take_machine_counters_for_test();
                     assert_eq!(run.steps(), budget, "{what}: {run:?}");
                     assert_eq!(lifts, 0, "{what}: warm");
@@ -765,7 +765,8 @@ fn a_strict_lane_step_out_resumes_the_walk() {
                 // A warm loop: every pass after the first steps out once.
                 x86jit_core::Vcpu::take_machine_counters_for_test();
                 let ar = a.run_steps(&avm, 24, StepOptions::default()).unwrap();
-                let [blocks, _, _, _, walks] = x86jit_core::Vcpu::take_machine_counters_for_test();
+                let [blocks, _, _, _, walks, _] =
+                    x86jit_core::Vcpu::take_machine_counters_for_test();
                 let br = b.run_steps(&bvm, 24, StepOptions::default()).unwrap();
                 assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what} warm");
                 same(world, &a, &b, &avm, &bvm, &format!("{what} warm"));

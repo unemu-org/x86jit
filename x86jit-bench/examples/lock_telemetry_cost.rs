@@ -34,6 +34,7 @@ fn main() {
             temp_count: 0,
             guest_len: 1,
             icount: 1,
+            direct_exit: false,
         };
         for i in 0..1000 {
             ir.guest_start = 0x1000 + i;

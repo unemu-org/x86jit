@@ -489,6 +489,7 @@ pub(crate) fn nec_form(
         temp_count: tg.count(),
         ops: result,
         legacy_context: Some(CONTEXT),
+        direct_exit: false,
     })
 }
 
@@ -710,6 +711,7 @@ fn brkem(
             IrOp::Legacy(L::SharedWalk),
         ],
         legacy_context: Some(CONTEXT),
+        direct_exit: false,
     }
 }
 
@@ -1097,6 +1099,7 @@ pub(crate) fn instruction(
         temp_count: tg.count(),
         ops: result,
         legacy_context: Some(CONTEXT),
+        direct_exit: false,
     })
 }
 

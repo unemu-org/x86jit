@@ -75,6 +75,8 @@ REVIEWED_ENTRY_POINTS = {
     "x86jit-core/src/vm/device/tests.rs": {"model::CpuModel"},
     # Machine-only Exit/completion census across catalogue families.
     "x86jit-core/src/vm/legacy/exit_census.rs": {"model::CpuModel"},
+    # Machine-only successor-link witnesses across catalogue families.
+    "x86jit-core/src/vm/legacy/link_witness.rs": {"model::CpuModel"},
     "x86jit-core/src/interp/control.rs": {
         "interp::legacy::execute_loop", "lift::legacy::alias_context",
     },

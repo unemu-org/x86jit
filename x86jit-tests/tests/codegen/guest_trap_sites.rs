@@ -579,6 +579,7 @@ fn cached_block_public_variants_remain_exhaustive() {
         temp_count: 0,
         guest_len: 0,
         icount: 0,
+        direct_exit: false,
     };
     assert!(!embedder_match(CachedBlock::Interpreted(
         std::sync::Arc::new(ir)

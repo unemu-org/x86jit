@@ -809,6 +809,7 @@ mod tests {
                 icount: 1,
                 temp_count: 0,
                 ops: Vec::new(),
+                direct_exit: false,
             })),
             vec![(0x2000, 16)],
             |_| {},

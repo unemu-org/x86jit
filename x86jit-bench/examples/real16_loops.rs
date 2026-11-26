@@ -273,6 +273,7 @@ impl Workload {
                     temp_count: 0,
                     ops: vec![IrOp::Hlt],
                     legacy_context: None,
+                    direct_exit: false,
                 })),
                 vec![(pc, 1)],
                 |_| vm.mem.mark_code(pc, 1),

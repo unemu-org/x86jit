@@ -756,6 +756,7 @@ fn generic_ir_does_not_prove_a_decode_cause() {
             ],
             temp_count: 0,
             icount: 1,
+            direct_exit: false,
         };
         let mem = Memory::new(MemoryModel::Flat { size: 0x2000 });
         let mut cpu = CpuState {
