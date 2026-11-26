@@ -209,7 +209,7 @@ across machines). `performance.md` (Backlog.md doc-21) shows each snapshot's Δ 
 `scripts/perf-campaign.sh` measures the decision-23 performance requirement: host instructions
 per guest step of `real16_loops` on all 16 workloads × 9 paths, and the counted store probe,
 base against candidate, in two build profiles, and gives the two-profile verdict. Run it in
-the dev shell at default QoS; it lowers only its builds.
+the dev shell at default QoS.
 
 ```sh
 nix develop --command scripts/perf-campaign.sh origin/main          # candidate = this working tree
@@ -217,6 +217,8 @@ nix develop --command scripts/perf-campaign.sh cf32ec2e f14e9d1c    # two commit
 scripts/perf-campaign.sh --profile perf BASE CAND                   # one profile only, for exploration
 scripts/perf-campaign.sh --profile release --processes 10 BASE CAND # the shipped profile, 10 processes
 scripts/perf-campaign.sh --build-only BASE                          # fill the cache only
+scripts/perf-campaign.sh --build-qos background BASE                # builds on lowered priority
+scripts/perf-campaign.sh --prebuilt DIR BASE CAND                   # measure prebuilt binaries only
 python3 scripts/perf_campaign.py analyze <out>/perf/raw             # analyse kept raw data again
 python3 scripts/perf_campaign.py combine release=<out>/release/analysis.json perf=<out>/perf/analysis.json
 python3 scripts/perf_campaign.py summary <out>                      # the verdict as Markdown (CI job summary)
@@ -230,15 +232,32 @@ What it does:
   measuring after the other. `--profile NAME` runs one profile alone; its verdict is that
   profile's own.
 - **Builds** each side and profile with `cargo build --locked --profile <profile> -p x86jit-bench
-  --example real16_loops --example interpreter_store_probe`, one at a time, under `taskpolicy -c background`
-  (`nice` elsewhere), `CARGO_BUILD_JOBS=4`, `RUSTC_WRAPPER=` and `CARGO_INCREMENTAL=0`. A commit
+  --example real16_loops --example interpreter_store_probe`, `RUSTC_WRAPPER=` and
+  `CARGO_INCREMENTAL=0`. Every build the campaign needs (up to four: base and candidate ×
+  release and `perf`; one per profile when both sides are the same commit) runs at the same
+  time, each in its own slot, `<cache>/src-<side>-<profile>` for the source and
+  `<cache>/target-<side>-<profile>` for cargo's target directory, so no build waits for
+  cargo's lock on another's target directory. A slot's target directory is kept, so its
+  dependencies stay built for the next campaign; the workspace crates are rebuilt every time.
+  `CARGO_BUILD_JOBS` is `--jobs`, else the CPU count divided by the number of builds at once,
+  rounded up. The builds run at default priority (`--build-qos default`), the supervisor's
+  normal choice; `--build-qos background` puts them under `taskpolicy -c background` on macOS
+  (efficiency cores only, several times slower) or `nice -n 19` elsewhere, for a machine
+  that other work shares. The measuring starts only after every build has finished. A commit
   is built from `git archive`; a working tree from a copy of its tracked and untracked, not
   ignored, files. A clean working tree counts as its HEAD commit.
 - **Caches** the binaries of every commit under `<cache>/bin/<commit>-<profile>-<toolchain>`, so
   a `main` commit used as the base is built once. The cache is `--cache DIR`, else
-  `$X86JIT_PERF_CACHE`, else `$TMPDIR/x86jit-perf-cache`; it also holds the shared target
-  directory (dependencies are reused) and a lock that serialises builds. Working-tree binaries
-  are not cached; they are kept in the run directory.
+  `$X86JIT_PERF_CACHE`, else `$TMPDIR/x86jit-perf-cache`; it also holds the slots and a lock
+  that lets one campaign build at a time (a campaign whose sides are all cached does not
+  take it). Working-tree binaries are not cached; they are kept in the run directory. A cache
+  from before the slots keeps its `bin/` entries, which are found as before; its shared
+  `target/` and `src/` directories are removed at the next build.
+- **Measure only.** `--prebuilt DIR BASE CAND` builds nothing and needs no cargo: it measures
+  `DIR/base-<profile>/` against `DIR/candidate-<profile>/`, each holding `real16_loops`,
+  `interpreter_store_probe` and the `meta.txt` of their build, whose `source=` and `profile=`
+  must match BASE, CAND and the profile. BASE and CAND are only names here. The CI measuring
+  job runs it.
 - **The `perf` profile** (workspace `Cargo.toml`) is release with `codegen-units = 1` for
   `x86jit-core` and `x86jit-bench`. A commit from before the profile gets the same profile on the
   cargo command line. Base binaries are cached per profile.
@@ -286,22 +305,28 @@ What it does:
   for a Linux base from before that counter, the script runs but reports a problem.
 
 A campaign with cached bases takes two candidate builds and a few minutes of measuring; the
-timings are in `performance.md` § "Short campaign protocol".
+timings are in `performance.md` § "Short campaign protocol". The builds' wall time on an
+18-CPU Apple workstation that other builds shared (load 10–13), slots cold, default QoS: one
+commit in both profiles 271 s side by side (release 210 s, `perf` 271 s) against 455 s one
+after the other at `--jobs 4`; all four builds of a pair 381 s side by side (release about
+310 s, `perf` about 380 s, the `perf` build of `x86jit-core` with its one codegen unit the
+longest), where one after the other they take an estimated 15 min at default QoS and up to an hour
+under `taskpolicy -c background`.
 
 ### Performance campaign in CI
 
-`.github/workflows/perf-gate.yml` runs `scripts/perf-campaign.sh BASE CANDIDATE` on a
-GitHub-hosted aarch64 Linux runner (`ubuntu-24.04-arm`), the only hosted runner whose VM has a
-hardware PMU: the benchmarks count host instructions with `perf_event_open` there, while the
-x86-64 Linux runner has no PMU and the macOS runner's `proc_pid_rusage` `ri_instructions`
-reads 0. It starts by hand or on a push to a `ci/perf-*`
-branch; it is not part of `ci.yml` and does not gate `main` by itself.
+`.github/workflows/perf-gate.yml` runs the campaign on GitHub-hosted aarch64 Linux runners
+(`ubuntu-24.04-arm`), the only hosted runners whose VM has a hardware PMU: the benchmarks
+count host instructions with `perf_event_open` there, while the x86-64 Linux runner has no
+PMU and the macOS runner's `proc_pid_rusage` `ri_instructions` reads 0. It starts by hand or
+on a push to a `ci/perf-*` branch; it is not part of `ci.yml` and does not gate `main` by
+itself.
 
 ```sh
 gh workflow run perf-gate.yml -f base=<sha> -f candidate=<sha>   # any two commits or refs
 gh workflow run perf-gate.yml -f candidate=<sha>                 # base: merge base with origin/main
 gh run list --workflow perf-gate.yml                             # find the run
-gh run watch <run-id>; gh run download <run-id>                  # follow it; fetch the artifact
+gh run watch <run-id>; gh run download <run-id>                  # follow it; fetch the artifacts
 git push origin HEAD:ci/perf-<name>                              # pushed commit vs its merge base
 ```
 
@@ -309,35 +334,48 @@ git push origin HEAD:ci/perf-<name>                              # pushed commit
   `origin/main`, a branch name); a commit on no branch is fetched by SHA. An empty `candidate`
   is the commit of the ref the run starts on (`--ref`, default `main`); an empty `base` is the
   candidate's merge base with `origin/main`. Dispatch from `main` (the default): its scripts
-  and toolchain then measure, and the caches it saves serve every ref.
-- **Steps.** A counter check first: `kernel.perf_event_paranoid` goes from the image's 4 to 2
-  (`sudo sysctl`), then `perf_campaign.py counter-check`; when the counter does not count, the
-  job stops with an error before any build. Then pinned Nix, the Nix store cache and the
-  `no-freebsd` dev shell, as in `ci.yml`'s aarch64 job; the
-  builds (`--build-only`, `--build-qos default`, `--jobs` = the runner's CPUs); the campaign
-  with `--parallel` = the runner's CPUs, otherwise the defaults.
+  and toolchain then build and measure, and the caches it saves serve every ref.
+- **Jobs.** `sides` resolves the two commits and checks the counter on a runner of the
+  measuring kind (`kernel.perf_event_paranoid` from the image's 4 to 2 with `sudo sysctl`,
+  then `perf_campaign.py counter-check`), so a runner without a counting PMU stops the run
+  before any build. Then four `build` jobs at once, a matrix of side × profile, each on its
+  own runner: it restores its side's binaries from the cache, or else installs pinned Nix,
+  restores the Nix store and enters the `no-freebsd` dev shell as `ci.yml`'s aarch64 job
+  does, fetches its commit and runs `perf-campaign.sh --build-only --profile <profile>
+  <commit> <commit>` with every CPU of the runner; it uploads the binaries as the artifact
+  `perf-bin-<side>-<profile>` (7 days). A candidate equal to the base builds nothing. Last,
+  `measure`, on its own runner: the counter check again, the Nix store and the dev shell
+  (the binaries are linked against its glibc in the Nix store), the four artifacts, and
+  `perf-campaign.sh --prebuilt` with `--parallel` = the runner's CPUs, otherwise the
+  defaults. No build runs on the measuring runner.
 - **Randomization** is off as on any Linux host: `setarch <machine> -R`, which needs no
-  privilege, so the hosted runner needs no change to the script.
-- **Caches.** The binaries of each side are cached per commit with `actions/cache`, key
-  `perf-bin-v1-Linux-aarch64-<commit>-<toolchain>-<Cargo.lock hash>`, the toolchain being the
-  campaign's own hash of `rustc -vV`; both profiles share one entry. Base and candidate are
-  saved, from any ref (an entry is a few tens of MB), so a candidate that lands on `main` is a
-  later campaign's cached base, and several candidates against one `main` commit build that
-  base once. The Nix store entry is `ci.yml`'s aarch64 one,
+  privilege.
+- **Caches.** Each build job caches its binaries with `actions/cache`, key
+  `perf-bin-v2-Linux-aarch64-<commit>-<profile>-<toolchain>-<Cargo.lock hash>`, the toolchain
+  being the hash of the checkout's `flake.nix` and `flake.lock`, which pin it, so a cached side
+  needs no Nix. Every run saves what it built (an entry is a few tens of MB), but GitHub
+  scopes an entry to the ref that saved it: an entry saved by a run on `main` (a dispatch from
+  `main`, the default) serves every ref, so several candidates against one `main` commit
+  build that base once, while an entry saved by a push to a `ci/perf-*` branch serves only
+  that branch's later runs. The Nix store entry is `ci.yml`'s aarch64 one,
   `nix-v1-Linux-aarch64-no-freebsd-<flake hash>`, saved from `main` only.
-- **Result.** The job summary holds the combined verdict, the blocking and drift cells with
-  each profile's change, the problems, the path means and each profile's `report.txt`. The
-  artifact `perf-gate-<base>-<candidate>` (30 days) holds the `--out` directory (`raw/`,
-  `report.txt`, `analysis.json`, `cells.csv` per profile; `combined.txt`, `combined.json`,
-  `campaign.log`), the build logs and each side's `meta.txt`. The job fails on BLOCK (exit 1)
-  and on a problem (exit 2); DRIFT (exit 3) passes with a warning annotation; PASS adds a
-  notice.
-- **Duration.** A hosted runner has 3 CPUs. One side's builds of both profiles take an
-  estimated 15–30 min (a loaded workstation took 8–15 min per profile and side), measuring
-  both profiles 3–5 min, the Nix setup a few minutes. Both sides cached: about 10 min; a
-  cached base: about 30 min; nothing cached: about an hour. The timeout is 180 min.
-
-
+- **Concurrency.** One run per pair: a push to a `ci/perf-*` branch cancels that branch's
+  older run; dispatches of different (base, candidate) inputs run side by side, and a repeat of
+  the same pair waits.
+- **Result.** The `measure` job summary holds the combined verdict, the blocking and drift
+  cells with each profile's change, the problems, the path means and each profile's
+  `report.txt`. The artifact `perf-gate-<base>-<candidate>` (30 days) holds the `--out`
+  directory (`raw/`, `report.txt`, `analysis.json`, `cells.csv` per profile; `combined.txt`,
+  `combined.json`, `campaign.log`) and each binary's `meta.txt` and build log. The run fails
+  on BLOCK (exit 1) and on a problem (exit 2); DRIFT (exit 3) passes with a warning
+  annotation; PASS adds a notice.
+- **Duration**, measured on a smoke run (base = candidate, every cell +0.000 %, PASS): with
+  nothing cached about 14 min — two build jobs at once, each 1–2 min of Nix setup then the
+  build (release about 5.5 min, `perf` about 7.5 min, on every CPU of the runner), then `measure`
+  about 4 min (Nix setup about 1 min, measuring both profiles under 3 min). With both sides
+  cached about 5 min: the build jobs take seconds each, and `measure` is the rest. A cached
+  base and a new candidate take the cold time, since the candidate's builds are the longest
+  path either way. The timeouts are 120 min per build job and 60 min for `measure`.
 
 ### Build profiles for tests
 

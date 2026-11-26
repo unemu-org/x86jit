@@ -373,6 +373,167 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(Path(dest, "a.rs").read_text(), "edited")
 
 
+SCRIPTS = Path(__file__).resolve().parents[1]
+
+# Stand-ins for cargo and rustc: the fake cargo records its target directory, its jobs
+# and its start and end times, waits a second so that builds run at once can be seen to
+# overlap, and writes the two examples where cargo would.
+FAKE_CARGO = """#!/bin/sh
+profile=
+while [ $# -gt 0 ]; do
+  [ "$1" = --profile ] && profile=$2
+  shift
+done
+start=$(python3 -c 'import time; print(time.time())')
+sleep 1
+mkdir -p "$CARGO_TARGET_DIR/$profile/examples"
+for n in real16_loops interpreter_store_probe; do
+  printf '#!/bin/sh\\n' > "$CARGO_TARGET_DIR/$profile/examples/$n"
+  chmod +x "$CARGO_TARGET_DIR/$profile/examples/$n"
+done
+end=$(python3 -c 'import time; print(time.time())')
+echo "$profile $CARGO_TARGET_DIR $CARGO_BUILD_JOBS $start $end" >> "$FAKE_CARGO_LOG"
+"""
+FAKE_RUSTC = """#!/bin/sh
+echo "rustc 0.0.0-fake"
+"""
+# Benchmarks that print the same counts and values every run.
+FAKE_LOOPS = """#!/bin/sh
+echo "%s"
+echo "$3,legacy-i286,1000,2000,100,3,100.000,100.000,100.000,1.0,1.0,1.0"
+""" % HEADER.strip()
+FAKE_STORE = """#!/bin/sh
+echo "$1,$2,$3,1,1.0,300.0"
+"""
+
+
+def write_exe(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+class ShellTests(unittest.TestCase):
+    """scripts/perf-campaign.sh's builds and its measure-only mode, with fake tools."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        d = Path(self.temp.name)
+        self.repo, self.cache, self.tools = d / "repo", d / "cache", d / "tools"
+        self.log = d / "cargo.log"
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                        FAKE_CARGO_LOG=str(self.log),
+                        PATH=f"{self.tools}{os.pathsep}{os.environ['PATH']}")
+        self.env.pop("X86JIT_PERF_CACHE", None)
+        write_exe(self.tools / "cargo", FAKE_CARGO)
+        write_exe(self.tools / "rustc", FAKE_RUSTC)
+
+    def make_repo(self, commits=2):
+        """A repository holding the campaign scripts; returns its commits."""
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+               "-c", "commit.gpgsign=false"]
+        (self.repo / "scripts").mkdir(parents=True)
+        for name in ("perf-campaign.sh", "perf_campaign.py"):
+            (self.repo / "scripts" / name).write_bytes((SCRIPTS / name).read_bytes())
+        probe = self.repo / "x86jit-bench" / "examples" / "interpreter_store_probe.rs"
+        probe.parent.mkdir(parents=True)
+        probe.write_text("// instructions_per_store\n")
+        subprocess.run(git + ["init", "-q"], check=True, env=self.env)
+        shas = []
+        for i in range(commits):
+            (self.repo / "Cargo.toml").write_text(f"[profile.perf]\n# {i}\n")
+            subprocess.run(git + ["add", "."], check=True, env=self.env)
+            subprocess.run(git + ["commit", "-q", "-m", str(i)], check=True, env=self.env)
+            shas.append(subprocess.run(git + ["rev-parse", "HEAD"], check=True, env=self.env,
+                                       capture_output=True, text=True).stdout.strip())
+        return shas
+
+    def campaign(self, *args):
+        return subprocess.run(["bash", str(self.repo / "scripts" / "perf-campaign.sh"), *args],
+                              env=self.env, capture_output=True, text=True, timeout=120)
+
+    def builds(self):
+        if not self.log.exists():
+            return []
+        return [line.split() for line in self.log.read_text().splitlines()]
+
+    def test_builds_run_at_once_each_in_its_own_target_directory(self):
+        base, cand = self.make_repo()
+        (self.cache / "target").mkdir(parents=True)  # the layout before the slots
+        r = self.campaign("--build-only", "--cache", str(self.cache), base, cand)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        builds = self.builds()
+        self.assertEqual(sorted(b[0] for b in builds), ["perf", "perf", "release", "release"])
+        self.assertEqual(sorted(Path(b[1]).name for b in builds),
+                         ["target-base-perf", "target-base-release",
+                          "target-candidate-perf", "target-candidate-release"])
+        cpus = int(subprocess.run(["getconf", "_NPROCESSORS_ONLN"], capture_output=True,
+                                  text=True).stdout)
+        self.assertEqual({b[2] for b in builds}, {str((cpus + 3) // 4)})
+        # Every build started before the first one ended.
+        self.assertLess(max(float(b[3]) for b in builds), min(float(b[4]) for b in builds))
+        self.assertFalse((self.cache / "target").exists())
+        for sha in (base, cand):
+            for profile in ("release", "perf"):
+                [d] = self.cache.glob(f"bin/{sha}-{profile}-*")
+                meta = (d / "meta.txt").read_text()
+                self.assertIn(f"source={sha}\nprofile={profile}\n", meta)
+        self.assertFalse((self.cache / "lock").exists())
+
+        # A second campaign of the same pair takes all four from the cache.
+        r = self.campaign("--build-only", "--cache", str(self.cache), base, cand)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.builds()), 4)
+        self.assertEqual(r.stderr.count("from the cache"), 4)
+
+    def test_the_same_commit_on_both_sides_builds_once_per_profile(self):
+        [sha] = self.make_repo(commits=1)
+        r = self.campaign("--build-only", "--cache", str(self.cache), "--jobs", "3", sha, sha)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        builds = self.builds()
+        self.assertEqual(sorted(b[0] for b in builds), ["perf", "release"])
+        self.assertEqual({b[2] for b in builds}, {"3"})
+        lines = r.stdout.splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[0].split()[-1], lines[1].split()[-1])
+
+    def test_a_failed_build_is_a_problem_and_releases_the_lock(self):
+        base, cand = self.make_repo()
+        write_exe(self.tools / "cargo", "#!/bin/sh\necho broken >&2\nexit 101\n")
+        r = self.campaign("--build-only", "--cache", str(self.cache), base, cand)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("4 build(s) failed", r.stderr)
+        self.assertFalse((self.cache / "lock").exists())
+
+    def prebuilt(self, base="aaaa1111", cand="bbbb2222"):
+        root = Path(self.temp.name, "prebuilt")
+        for side, sha in (("base", base), ("candidate", cand)):
+            for profile in ("release", "perf"):
+                d = root / f"{side}-{profile}"
+                write_exe(d / "real16_loops", FAKE_LOOPS)
+                write_exe(d / "interpreter_store_probe", FAKE_STORE)
+                (d / "meta.txt").write_text(f"source={sha}\nprofile={profile}\n")
+        return root
+
+    def test_prebuilt_measures_without_building(self):
+        self.make_repo(commits=1)
+        write_exe(self.tools / "cargo", "#!/bin/sh\nexit 99\n")
+        out = Path(self.temp.name, "out")
+        r = self.campaign("--prebuilt", str(self.prebuilt()), "--out", str(out),
+                          "--processes", "1", "--parallel", "8", "aaaa1111", "bbbb2222")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(Path(out, "combined.json").read_text())["verdict"], "PASS")
+        self.assertIn("aaaa1111", Path(out, "release", "report.txt").read_text())
+
+    def test_prebuilt_binaries_of_another_commit_are_a_problem(self):
+        self.make_repo(commits=1)
+        r = self.campaign("--prebuilt", str(self.prebuilt(cand="cccc3333")),
+                          "--out", str(Path(self.temp.name, "out")), "aaaa1111", "bbbb2222")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("built from 'cccc3333', not 'bbbb2222'", r.stderr)
+
+
 class SummaryTests(unittest.TestCase):
     def write(self, d, release, perf, rstore=None, pstore=None):
         results = {}

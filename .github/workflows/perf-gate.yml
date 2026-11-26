@@ -1,13 +1,18 @@
 name: perf gate
 
-# The decision-23 performance campaign, scripts/perf-campaign.sh BASE CANDIDATE, on a
-# GitHub-hosted aarch64 Linux runner (backlog/docs/commands.md § Performance campaign in
+# The decision-23 performance campaign, scripts/perf-campaign.sh BASE CANDIDATE, on
+# GitHub-hosted aarch64 Linux runners (backlog/docs/commands.md § Performance campaign in
 # CI). real16_loops and the store probe read host instructions through perf_event_open;
 # of the hosted runners only ubuntu-24.04-arm gives its VM a hardware PMU (the x86-64
 # Linux and the macOS runners count nothing). Started by hand (`gh workflow run
-# perf-gate.yml -f base=<sha> -f candidate=<sha>`) or by a push to a ci/perf-* branch, which measures the pushed
-# commit against its merge base with origin/main. The job fails on BLOCK and on a
-# problem, and passes with a warning on DRIFT.
+# perf-gate.yml -f base=<sha> -f candidate=<sha>`) or by a push to a ci/perf-* branch,
+# which measures the pushed commit against its merge base with origin/main.
+#
+# Three stages: `sides` resolves the two commits; four `build` jobs, one per side and
+# profile, each on its own runner, build (or restore from the cache) one side's
+# binaries and upload them; `measure` downloads the four and only measures, with no
+# build beside it. The run fails on BLOCK and on a problem, and passes with a warning
+# on DRIFT.
 on:
   workflow_dispatch:
     inputs:
@@ -26,39 +31,46 @@ on:
 permissions:
   contents: read
 
-# A newer push to a ci/perf-* branch cancels that branch's older run; dispatches of
-# different pairs run side by side, and a repeat of the same pair waits.
+# One run per pair: a newer push to a ci/perf-* branch cancels that branch's older run;
+# dispatches of different pairs run side by side, and a repeat of the same pair waits.
 concurrency:
-  group: perf-gate-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || format('{0}-{1}', inputs.base, inputs.candidate) }}
+  group: perf-gate-${{ github.event_name == 'push' && format('push-{0}', github.ref) || format('pair-{0}-{1}', inputs.base, inputs.candidate || github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 defaults:
   run:
     shell: bash
 
+env:
+  CARGO_TERM_COLOR: never
+  # The aarch64 Linux host cannot load the aarch64 FreeBSD std (flake.nix), as in ci.yml.
+  XJ_DEVSHELL: no-freebsd
+
 jobs:
-  campaign:
-    name: perf campaign (Linux arm64)
+  sides:
+    name: resolve base and candidate
     runs-on: ubuntu-24.04-arm
-    # Four builds without cached binaries take most of it; a cached base halves that.
-    timeout-minutes: 180
-    env:
-      CARGO_TERM_COLOR: never
-      # The aarch64 Linux host cannot load the aarch64 FreeBSD std (flake.nix), as in ci.yml.
-      XJ_DEVSHELL: no-freebsd
+    timeout-minutes: 15
+    outputs:
+      base: ${{ steps.sides.outputs.base }}
+      candidate: ${{ steps.sides.outputs.candidate }}
+      base_lock: ${{ steps.sides.outputs.base_lock }}
+      candidate_lock: ${{ steps.sides.outputs.candidate_lock }}
+      same: ${{ steps.sides.outputs.same }}
+      toolchain: ${{ steps.sides.outputs.toolchain }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
           submodules: false
-          # Both sides are built from `git archive` of their commits.
+          # The merge base and each side's Cargo.lock.
           fetch-depth: 0
 
-      # Before anything is built: the benchmarks need a counting PMU, and a virtual machine
-      # may not provide one. The image sets kernel.perf_event_paranoid to 4, which refuses
-      # perf_event_open to unprivileged processes; 2 allows a process to count its own
-      # user-mode instructions. The setting lasts for the job's later steps.
+      # An early look at the counter, on a runner of the measuring job's kind, so that a
+      # runner image without a counting PMU stops the run before any build. The image sets
+      # kernel.perf_event_paranoid to 4, which refuses perf_event_open to unprivileged
+      # processes; 2 allows a process to count its own user-mode instructions.
       - name: Host instruction counter
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=2
@@ -67,11 +79,15 @@ jobs:
             exit 2
           }
 
-      - name: Resolve base and candidate
+      # The toolchain of every build is the dev shell of this checkout, pinned by
+      # flake.nix and flake.lock: their hash stands for it in the cache keys, so a
+      # cached side needs no Nix at all.
+      - name: Resolve
         id: sides
         env:
           BASE_INPUT: ${{ inputs.base }}
           CANDIDATE_INPUT: ${{ inputs.candidate }}
+          TOOLCHAIN: ${{ hashFiles('flake.nix', 'flake.lock') }}
         run: |
           set -euo pipefail
           resolve() {
@@ -93,15 +109,54 @@ jobs:
             echo "candidate=$cand_sha"
             echo "base_lock=$(lock "$base_sha")"
             echo "candidate_lock=$(lock "$cand_sha")"
-            echo "cpus=$(nproc)"
+            echo "same=$([ "$base_sha" = "$cand_sha" ] && echo true || echo false)"
+            echo "toolchain=${TOOLCHAIN:0:12}"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "X86JIT_PERF_CACHE=$RUNNER_TEMP/perf-cache"
-            echo "PERF_OUT=$RUNNER_TEMP/perf-out"
-          } >> "$GITHUB_ENV"
-          echo "base $base_sha, candidate $cand_sha, $(nproc) CPUs"
+          echo "base $base_sha, candidate $cand_sha"
+
+  # One job per side and profile, each on its own runner with all of its CPUs. A side
+  # whose binaries are in the cache only restores and uploads them; a candidate equal
+  # to the base does nothing (measure uses the base's binaries for both).
+  build:
+    name: build ${{ matrix.side }} (${{ matrix.profile }})
+    needs: sides
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        side: [base, candidate]
+        profile: [release, perf]
+    env:
+      COMMIT: ${{ matrix.side == 'base' && needs.sides.outputs.base || needs.sides.outputs.candidate }}
+      LOCK: ${{ matrix.side == 'base' && needs.sides.outputs.base_lock || needs.sides.outputs.candidate_lock }}
+      SKIP: ${{ matrix.side == 'candidate' && needs.sides.outputs.same == 'true' }}
+      PROFILE: ${{ matrix.profile }}
+    steps:
+      - name: Same commit as the base
+        if: ${{ env.SKIP == 'true' }}
+        run: echo "candidate = base = $COMMIT; nothing to build"
+
+      # The binaries are a few tens of MB per commit and profile, so every run saves
+      # them. An entry serves the ref that saved it: one saved on main (a dispatch from
+      # main) serves every ref, one saved on a ci/perf-* branch only that branch.
+      - name: Restore binaries
+        id: bin
+        if: ${{ env.SKIP != 'true' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/perf-bin
+          key: perf-bin-v2-${{ runner.os }}-aarch64-${{ env.COMMIT }}-${{ matrix.profile }}-${{ needs.sides.outputs.toolchain }}-${{ env.LOCK }}
+
+      - name: Checkout
+        if: ${{ env.SKIP != 'true' && steps.bin.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: false
 
       - name: Install Nix
+        if: ${{ env.SKIP != 'true' && steps.bin.outputs.cache-hit != 'true' }}
         uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
         with:
           nix_version: "2.29.2"
@@ -111,6 +166,7 @@ jobs:
       # The same entry as ci.yml's aarch64 test job.
       - name: Restore Nix store
         id: nix_cache
+        if: ${{ env.SKIP != 'true' && steps.bin.outputs.cache-hit != 'true' }}
         uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: nix-v1-${{ runner.os }}-aarch64-no-freebsd-${{ hashFiles('flake.nix', 'flake.lock') }}
@@ -118,94 +174,136 @@ jobs:
 
       - name: Dev shell
         id: devshell
+        if: ${{ env.SKIP != 'true' && steps.bin.outputs.cache-hit != 'true' }}
         run: bash scripts/ci-gate.sh devshell
 
       # As in ci.yml, only main saves: other refs restore main's entry.
       - name: Save Nix store
-        if: ${{ github.ref == 'refs/heads/main' && steps.devshell.outcome == 'success' && steps.nix_cache.outputs.hit-primary-key != 'true' }}
+        if: ${{ env.SKIP != 'true' && github.ref == 'refs/heads/main' && steps.devshell.outcome == 'success' && steps.nix_cache.outputs.hit-primary-key != 'true' }}
         uses: nix-community/cache-nix-action/save@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
           primary-key: ${{ steps.nix_cache.outputs.primary-key }}
 
-      # The campaign names its cached binaries <commit>-<profile>-<toolchain>, the
-      # toolchain being a hash of `rustc -vV`; the cache keys name the same three things
-      # and the side's Cargo.lock.
-      - name: Toolchain
-        id: toolchain
-        run: |
-          set -euo pipefail
-          tc=$(nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command rustc -vV | shasum -a 256 | cut -c1-12)
-          echo "hash=$tc" >> "$GITHUB_OUTPUT"
-          echo "toolchain $tc"
-
-      - name: Restore base binaries
-        id: base_bin
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-release-${{ steps.toolchain.outputs.hash }}
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-perf-${{ steps.toolchain.outputs.hash }}
-          key: perf-bin-v1-${{ runner.os }}-aarch64-${{ steps.sides.outputs.base }}-${{ steps.toolchain.outputs.hash }}-${{ steps.sides.outputs.base_lock }}
-
-      # A candidate that later lands on main is a later campaign's base.
-      - name: Restore candidate binaries
-        id: cand_bin
-        if: ${{ steps.sides.outputs.candidate != steps.sides.outputs.base }}
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-release-${{ steps.toolchain.outputs.hash }}
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-perf-${{ steps.toolchain.outputs.hash }}
-          key: perf-bin-v1-${{ runner.os }}-aarch64-${{ steps.sides.outputs.candidate }}-${{ steps.toolchain.outputs.hash }}-${{ steps.sides.outputs.candidate_lock }}
-
-      # Builds what the caches did not hold, at normal priority with every CPU: nothing
-      # else runs on the runner.
+      # The side is built from `git archive` of its commit, at normal priority with
+      # every CPU (one build, nothing else on the runner).
       - name: Build
         id: build
-        env:
-          BASE: ${{ steps.sides.outputs.base }}
-          CANDIDATE: ${{ steps.sides.outputs.candidate }}
-          CPUS: ${{ steps.sides.outputs.cpus }}
+        if: ${{ env.SKIP != 'true' && steps.bin.outputs.cache-hit != 'true' }}
         run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$COMMIT"
+          cache=$RUNNER_TEMP/perf-cache
           nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command \
-            scripts/perf-campaign.sh --build-only --build-qos default --jobs "$CPUS" "$BASE" "$CANDIDATE"
+            scripts/perf-campaign.sh --build-only --profile "$PROFILE" --cache "$cache" \
+            "$COMMIT" "$COMMIT" | tee "$RUNNER_TEMP/build-only.txt"
+          dir=$(awk '$2 == "base" { print $3 }' "$RUNNER_TEMP/build-only.txt")
+          mkdir -p "$RUNNER_TEMP/perf-bin"
+          cp "$dir"/real16_loops "$dir"/interpreter_store_probe "$dir"/meta.txt "$RUNNER_TEMP/perf-bin/"
+          cp "$cache/build-base-$PROFILE.log" "$RUNNER_TEMP/perf-bin/build.log"
+          cat "$RUNNER_TEMP/perf-bin/meta.txt"
 
-      # The binaries are a few tens of MB per commit, so every ref saves them; an entry
-      # saved on main serves every ref.
-      - name: Save base binaries
-        if: ${{ steps.build.outcome == 'success' && steps.base_bin.outputs.cache-hit != 'true' }}
+      - name: Save binaries
+        if: ${{ env.SKIP != 'true' && steps.build.outcome == 'success' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: |
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-release-${{ steps.toolchain.outputs.hash }}
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-perf-${{ steps.toolchain.outputs.hash }}
-          key: ${{ steps.base_bin.outputs.cache-primary-key }}
+          path: ${{ runner.temp }}/perf-bin
+          key: ${{ steps.bin.outputs.cache-primary-key }}
 
-      - name: Save candidate binaries
-        if: ${{ steps.build.outcome == 'success' && steps.sides.outputs.candidate != steps.sides.outputs.base && steps.cand_bin.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - name: Upload binaries
+        if: ${{ env.SKIP != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: |
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-release-${{ steps.toolchain.outputs.hash }}
-            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-perf-${{ steps.toolchain.outputs.hash }}
-          key: ${{ steps.cand_bin.outputs.cache-primary-key }}
+          name: perf-bin-${{ matrix.side }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/perf-bin
+          if-no-files-found: error
+          retention-days: 7
 
-      # Both sides come from the cache filled above, so this step only measures: the
-      # processes start with randomization off (`setarch <machine> -R`, which needs no
-      # privilege), one per CPU at once. The verdict step below turns the
-      # campaign's exit status into the job's.
+      - name: Upload the build log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-build-log-${{ matrix.side }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/perf-cache/build-*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Measuring only, no build. The binaries come from the build jobs; they are linked
+  # against the dev shell's glibc in the Nix store, so they run inside the dev shell.
+  measure:
+    name: perf campaign (Linux arm64)
+    needs: [sides, build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      BASE: ${{ needs.sides.outputs.base }}
+      CANDIDATE: ${{ needs.sides.outputs.candidate }}
+      SAME: ${{ needs.sides.outputs.same }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      # As in `sides`, on this job's own runner: the setting lasts for the later steps.
+      - name: Host instruction counter
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=2
+          python3 -B scripts/perf_campaign.py counter-check || {
+            echo '::error title=perf gate::perf_event_open does not count instructions on this runner; the campaign cannot measure here'
+            exit 2
+          }
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        with:
+          nix_version: "2.29.2"
+          github_access_token: ""
+          enable_kvm: false
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-aarch64-no-freebsd-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-aarch64-no-freebsd-
+
+      - name: Dev shell
+        run: bash scripts/ci-gate.sh devshell
+
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: perf-bin-*
+          path: ${{ runner.temp }}/artifacts
+
+      # --prebuilt's layout: <side>-<profile>/. An artifact does not keep the executable bit.
+      - name: Arrange binaries
+        run: |
+          set -euo pipefail
+          pre=$RUNNER_TEMP/prebuilt
+          mkdir -p "$pre"
+          for profile in release perf; do
+            mv "$RUNNER_TEMP/artifacts/perf-bin-base-$profile" "$pre/base-$profile"
+            if [ "$SAME" = true ]; then
+              cp -R "$pre/base-$profile" "$pre/candidate-$profile"
+            else
+              mv "$RUNNER_TEMP/artifacts/perf-bin-candidate-$profile" "$pre/candidate-$profile"
+            fi
+          done
+          chmod +x "$pre"/*/real16_loops "$pre"/*/interpreter_store_probe
+          echo "PERF_OUT=$RUNNER_TEMP/perf-out" >> "$GITHUB_ENV"
+
+      # The processes start with randomization off (`setarch <machine> -R`, which needs
+      # no privilege), one per CPU at once. The verdict step below turns the campaign's
+      # exit status into the job's.
       - name: Campaign
         id: campaign
-        env:
-          BASE: ${{ steps.sides.outputs.base }}
-          CANDIDATE: ${{ steps.sides.outputs.candidate }}
-          CPUS: ${{ steps.sides.outputs.cpus }}
         run: |
           mkdir -p "$PERF_OUT"
           set +e
           nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command \
-            scripts/perf-campaign.sh --out "$PERF_OUT" --build-qos default --jobs "$CPUS" \
-            --parallel "$CPUS" "$BASE" "$CANDIDATE" 2>&1 | tee "$PERF_OUT/campaign.log"
+            scripts/perf-campaign.sh --prebuilt "$RUNNER_TEMP/prebuilt" --out "$PERF_OUT" \
+            --parallel "$(nproc)" "$BASE" "$CANDIDATE" 2>&1 | tee "$PERF_OUT/campaign.log"
           status=${PIPESTATUS[0]}
           set -e
           echo "status=$status" >> "$GITHUB_OUTPUT"
@@ -229,10 +327,10 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: perf-gate-${{ steps.sides.outputs.base }}-${{ steps.sides.outputs.candidate }}
+          name: perf-gate-${{ needs.sides.outputs.base }}-${{ needs.sides.outputs.candidate }}
           path: |
             ${{ runner.temp }}/perf-out
-            ${{ runner.temp }}/perf-cache/build-*.log
-            ${{ runner.temp }}/perf-cache/bin/*/meta.txt
+            ${{ runner.temp }}/prebuilt/*/meta.txt
+            ${{ runner.temp }}/prebuilt/*/build.log
           if-no-files-found: ignore
           retention-days: 30
