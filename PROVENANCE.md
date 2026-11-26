@@ -13,8 +13,8 @@ commit:
 
 ```sh
 git submodule update --init
-cd oracles && ./fetch-oracles.sh verify   # offline; the vendored sources are already there
-cd oracles && ./fetch-oracles.sh fetch    # adds the fetch-only ones (the Intel SDM, the APM, the psABI)
+cd oracles && ./fetch-oracles.sh verify --for x86jit   # offline; the vendored sources are already there
+cd oracles && ./fetch-oracles.sh fetch --for x86jit    # adds the fetch-only ones (the Intel SDM, the APM, the psABI)
 ```
 
 ## 1. What is authoritative

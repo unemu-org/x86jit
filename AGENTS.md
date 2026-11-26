@@ -86,14 +86,16 @@ Full list: [`backlog/docs/commands.md`](backlog/docs/commands.md).
 
 ## The clean-oracle stash (`oracles/`)
 
-The manuals and tables the code cites live in **`oracles/`, a git SUBMODULE** — its own repository at [`unemu-org/oracles`](https://github.com/unemu-org/oracles) (MIT), shared with a second project. Citation paths are stable: `oracles/linux-x86/syscall_64.tbl`, `oracles/psabi/kernel.tex`, `oracles/intel/sdm.pdf`.
+The manuals and tables the code cites live in **`oracles/`, a git SUBMODULE** — its own repository at [`unemu-org/oracles`](https://github.com/unemu-org/oracles) (MIT), shared with other projects. Citation paths are stable: `oracles/linux-x86/syscall_64.tbl`, `oracles/psabi/kernel.tex`, `oracles/intel/sdm.pdf`.
 
 ```sh
 git submodule update --init                     # the VENDORED sources arrive with this — no download
-./oracles/fetch-oracles.sh verify               # OFFLINE: committed copies vs recorded sha256
-./oracles/fetch-oracles.sh fetch                # adds the fetch-only sources (the PDFs, the psABI)
-./oracles/fetch-oracles.sh verify --upstream    # re-download at the pins and DIFF against the copies
+./oracles/fetch-oracles.sh verify --for x86jit               # OFFLINE: committed copies vs recorded sha256
+./oracles/fetch-oracles.sh fetch --for x86jit                # adds this project's fetch-only sources (the PDFs, the psABI)
+./oracles/fetch-oracles.sh verify --upstream --for x86jit    # re-download at the pins and DIFF against the copies
 ```
+
+`--for x86jit` limits a command to the sources this project cites; without it the script fetches and checks every consumer's sources (several GB). `./oracles/fetch-oracles.sh --help` lists the groups. A new source this project cites goes into the `x86jit` group in the script's `groups()` together with its table row — `verify` fails on a source that belongs to no group.
 
 **Vendored** (arrive with the submodule, no network): the Linux x86 syscall tables and process/signal uapi headers, the MOO container format, the SingleStepTests 80286 documentation and revocation list. **Fetch-only**, because they may not be redistributed: the **Intel SDM** and **AMD64 APM** (© Intel / © AMD, no redistribution licence) and the **x86-64 psABI** (its repository carries no licence file at all).
 
