@@ -196,60 +196,76 @@ impl StepContext {
         if self.remaining == 0 {
             return Some(WalkResult::exit(Exit::BudgetExhausted));
         }
-        let pending = cpu.mmio_retry_active
-            || cpu.pending_mmio.is_some()
-            || cpu.pending_mmio_write
-            || cpu.pending_port_in.is_some()
-            || cpu.port_string_in.is_some();
-        // A host request, or a latched NMI (spec.md §17.10): one load and one
-        // test (`NMI_EDGE` keeps the mask one immediate); the decision is out
-        // of line.
+        // Every rarely-true condition behind two tests: the vCPU's dispatch
+        // word, which every other thread's event sets (a host request, a
+        // latched NMI, spec.md §17.10; one load and one test, `NMI_EDGE`
+        // keeping the mask one immediate), and an interrupt request pending
+        // at walk entry. The outstanding-I/O state that holds both back is
+        // read only when one of them is there.
         if let Some(word) = exit_request {
             if word.load(std::sync::atomic::Ordering::Relaxed)
                 & (crate::vm::EXIT_REQUESTED | crate::vm::NMI_EDGE)
                 != 0
             {
-                if let Some(stop) = self.external(word, shadows.bits, pending) {
-                    return Some(stop);
-                }
+                return self.external(cpu, word, shadows.bits);
             }
         }
-        if self.pending_irq
-            && cpu.flags.if_
-            && shadows.bits & (ShadowState::STI | ShadowState::SS) == 0
-            && !pending
-        {
-            // Return to the dispatcher to deliver; no guest instruction is in flight.
-            // Reuse the no-retirement result so unstepped result layout stays fixed.
-            // Inhibition is already empty at this boundary.
+        if self.pending_irq && self.irq_window(cpu, shadows.bits) {
             return Some(WalkResult::FaultDelivered);
         }
         None
+    }
+
+    /// Whether the interrupt request pending at walk entry is taken here: IF
+    /// set, no STI or MOV SS inhibition and no I/O completion outstanding.
+    /// The walk then returns to the dispatcher to deliver; no guest
+    /// instruction is in flight. It reuses the no-retirement result so the
+    /// unstepped result layout stays fixed; inhibition is already empty at
+    /// this boundary.
+    #[inline(always)]
+    fn irq_window(&self, cpu: &CpuState, shadows: u8) -> bool {
+        cpu.flags.if_ && shadows & (ShadowState::STI | ShadowState::SS) == 0 && !io_outstanding(cpu)
     }
 
     // The word held a host request or an NMI edge. The walk applies the
     // dispatcher's `nmi_gate`, NMI blocking (I80286, I80386) included, so it
     // stops only for an NMI the dispatcher accepts. A blocked edge does not
     // stop it: the edge leaves the word at the dispatcher's next test, which
-    // remembers or ignores it (spec.md §17.10).
+    // remembers or ignores it (spec.md §17.10). Neither stops it while an I/O
+    // completion is outstanding; a pending interrupt request is then decided
+    // as at any other boundary.
     #[cold]
     #[inline(never)]
     fn external(
         &self,
+        cpu: &CpuState,
         exit_request: &std::sync::atomic::AtomicU64,
         shadows: u8,
-        pending: bool,
     ) -> Option<WalkResult> {
-        if pending {
-            return None;
+        let pending = io_outstanding(cpu);
+        if !pending {
+            let word = exit_request.load(std::sync::atomic::Ordering::Relaxed);
+            if word & crate::vm::EXIT_REQUESTED != 0 {
+                return Some(WalkResult::exit(Exit::Interrupted));
+            }
+            if nmi_gate(self.nmi_blocked, shadows & ShadowState::NMI != 0, pending) {
+                return Some(WalkResult::FaultDelivered);
+            }
         }
-        let word = exit_request.load(std::sync::atomic::Ordering::Relaxed);
-        if word & crate::vm::EXIT_REQUESTED != 0 {
-            return Some(WalkResult::exit(Exit::Interrupted));
-        }
-        nmi_gate(self.nmi_blocked, shadows & ShadowState::NMI != 0, pending)
-            .then_some(WalkResult::FaultDelivered)
+        (self.pending_irq && self.irq_window(cpu, shadows)).then_some(WalkResult::FaultDelivered)
     }
+}
+
+/// An IN, INS or MMIO completion the instruction at this boundary still owes:
+/// no host request, NMI or interrupt is taken before it (spec.md §5.2,
+/// §17.10).
+#[inline(always)]
+fn io_outstanding(cpu: &CpuState) -> bool {
+    cpu.mmio_retry_active
+        || cpu.pending_mmio.is_some()
+        || cpu.pending_mmio_write
+        || cpu.pending_port_in.is_some()
+        || cpu.port_string_in.is_some()
 }
 
 /// Whether a latched NMI is accepted at a boundary, as far as the walk can

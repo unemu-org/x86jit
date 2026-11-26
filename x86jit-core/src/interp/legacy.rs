@@ -3233,10 +3233,12 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
             cpu.finish_mmio_retry(None);
         }
         let last = self.end == self.ir.ops.len();
-        let polled = || {
-            self.exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
-                || self.memory.has_dirty_code()
-        };
+        // One load for every event of another thread or of this instruction:
+        // a host request, an NMI edge, and a code write, whose notice
+        // (`DISPATCH_DIRTY`, `DISPATCH_CHILD_DIRTY`) every writer sets in
+        // each registered dispatch word, this one included, before it
+        // returns (`Memory::note_code_write`, `ChildDispatch::notify`).
+        let polled = || self.exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0;
         if LANES {
             let (tlb, token) = self.tlb.expect("paged walk");
             if last

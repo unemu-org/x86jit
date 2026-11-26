@@ -2745,8 +2745,9 @@ instruction keeps its own commit point at the next `InsnStart`: its entry
 marks) is taken there, and its exit applies, unchanged, RF clearing on
 retirement, the rollback to its first byte with its evidence and CR2 on
 failure, the finished MMIO retry, and the block-ending tests: block end,
-budget, exit, STI/SS shadow, the exit word, dirty code, and on the paged walk
-an invalidated translation or a new TLB generation. A failing instruction
+budget, exit, STI/SS shadow, the exit word (which also carries every code
+write's dirty-code notice, so one load tests both; xj-to9.38), and on the
+paged walk an invalidated translation or a new TLB generation. A failing instruction
 therefore leaves exactly the state, retired count and replay point of its
 own walk. On the paged walk the lane is chosen per instruction as before;
 register and preflighted (TLB-window) instructions run inside the pass, and

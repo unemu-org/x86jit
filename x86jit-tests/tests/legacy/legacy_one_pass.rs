@@ -8,8 +8,8 @@
 mod fixture;
 use fixture::descriptor;
 use x86jit_core::{
-    derive_legacy_context, CpuModel, CpuState, ExceptionDelivery, Exit, Prot, RegionKind,
-    SegmentClass, StepOptions, StepStop, Vcpu, Vm, VmConfig,
+    derive_legacy_context, CpuModel, CpuState, ExceptionDelivery, Exit, Memory, MemoryModel, Prot,
+    RegionKind, SegmentClass, StepOptions, StepStop, Vcpu, Vm, VmConfig,
 };
 
 const MODELS: [CpuModel; 2] = [CpuModel::I80386, CpuModel::I80486Dx];
@@ -348,17 +348,75 @@ fn mid_block_faults_exits_budgets_and_single_steps_equal_the_reference() {
     }
 }
 
+/// The guest memory `make` built, copied into a new `Memory` that replaces
+/// `vm.mem` while the vCPU that ran on the old one stays live.
+fn replace_memory(world: World, vm: &mut Vm) {
+    let size = if world.wide() { 0x240000 } else { 0x20000 };
+    let mut bytes = vec![0; size];
+    vm.read_bytes(0, &mut bytes).unwrap();
+    let mut memory = Memory::new(MemoryModel::Flat { size: size as u64 });
+    memory.map(0, size, Prot::RWX, RegionKind::Ram).unwrap();
+    memory.write_bytes(0, &bytes).unwrap();
+    vm.mem = memory;
+}
+
+/// INC; a store of HLT over the INC that follows it; INC; HLT. Flat32 stores
+/// through DS, Segmented through an ES that covers the code (its cache is
+/// set to CS's base, as a load of a data alias would), V86 through CS.
+fn store_into_next(world: World) -> Vec<u8> {
+    match world {
+        Flat32 { .. } => b"\x40\xc6\x05\x08\x10\x00\x00\xf4\x40\x40\xf4".to_vec(),
+        Segmented { .. } => b"\x40\x26\xc6\x06\x07\x01\xf4\x40\x40\xf4".to_vec(),
+        V86 => b"\x40\x2e\xc6\x06\x07\x01\xf4\x40\x40\xf4".to_vec(),
+    }
+}
+
+/// The HLT at `ip` ran: it stops after itself, and in V86 (CPL 3) it raises
+/// #GP(0) at itself (SDM Vol 2A HLT, Protected Mode Exceptions; Vol 3B
+/// §20.2.7, the V86 sensitive instructions).
+fn halted(world: World, run: &x86jit_core::StepRun, cpu: &Vcpu, ip: u64, what: &str) {
+    if world == V86 {
+        assert!(
+            matches!(run.stop(), StepStop::Exit(Exit::Exception { vector: 13, addr, .. }) if *addr == ip),
+            "{what}: {run:?}"
+        );
+        assert_eq!(cpu.cpu.rip, ip, "{what}");
+    } else {
+        assert!(
+            matches!(run.stop(), StepStop::Exit(Exit::Hlt)),
+            "{what}: {run:?}"
+        );
+        assert_eq!(cpu.cpu.rip, ip + 1, "{what}");
+    }
+}
+
 #[test]
 fn a_store_into_the_next_instruction_stops_the_block_before_it() {
     // SDM Vol 3A §11.6: a write to the code of the next instruction is
-    // observed by that instruction. INC; MOV BYTE [1008h], F4h (HLT over the
-    // INC that follows); INC; HLT. The block holds all four instructions.
-    let code = b"\x40\xc6\x05\x08\x10\x00\x00\xf4\x40\x40\xf4";
-    for world in [Flat32 { paged: false }, Flat32 { paged: true }] {
+    // observed by that instruction. The block holds all four instructions.
+    // `swapped` replaces `Vm::mem` after the vCPU was created: the walk polls
+    // only the vCPU's dispatch word, which the run registers with the new
+    // memory.
+    for world in WORLDS {
+        let code = store_into_next(world);
         for model in MODELS {
-            for budget in [1, 2, 3, 20] {
-                let ((avm, mut a), (bvm, mut b)) = pair(world, model, code, false);
-                let what = format!("{world:?} {model:?} budget={budget}");
+            for (budget, swapped) in [1, 2, 3, 20]
+                .into_iter()
+                .flat_map(|budget| [(budget, false), (budget, true)])
+            {
+                let ((mut avm, mut a), (mut bvm, mut b)) = pair(world, model, &code, false);
+                if let Segmented { .. } = world {
+                    for cpu in [&mut a, &mut b] {
+                        let es = &mut cpu.cpu.legacy.segments[2];
+                        (es.base, es.limit, es.attributes) = (0x1000, 0x1fff, 0x93);
+                    }
+                    assert_eq!(class(&a), world.class(), "{world:?}");
+                }
+                if swapped {
+                    replace_memory(world, &mut avm);
+                    replace_memory(world, &mut bvm);
+                }
+                let what = format!("{world:?} {model:?} budget={budget} swapped={swapped}");
                 let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
                 let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
                 assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what}");
@@ -366,11 +424,61 @@ fn a_store_into_the_next_instruction_stops_the_block_before_it() {
                 if budget == 20 {
                     // INC and the store retire, then the stored HLT: the
                     // overwritten INC never runs.
-                    assert!(matches!(ar.stop(), StepStop::Exit(Exit::Hlt)), "{what}");
-                    assert_eq!(ar.steps(), 3, "{what}");
+                    let ip = if world.wide() { 0x1008 } else { 0x107 };
+                    halted(world, &ar, &a, ip, &what);
+                    assert_eq!(ar.steps(), if world == V86 { 2 } else { 3 }, "{what}");
                     assert_eq!(a.cpu.gpr[0], 0x11, "{what}");
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn a_code_write_racing_with_the_walk_is_seen_at_a_later_boundary() {
+    // SDM Vol 3A §11.6: another thread overwrites the first instruction of a
+    // running loop (INC BX; MOV [mem],BX; INC DX; JMP back) with HLT once the
+    // loop has stored BX at least once. The walk polls the dispatch word at
+    // each boundary; whichever boundary sees the notice, the loop's next pass
+    // runs the HLT and never the stale INC BX after it.
+    for world in WORLDS {
+        let (code, marker, at): (&[u8], u64, u64) = if world.wide() {
+            (b"\x40\x43\x89\x1d\x00\x60\x00\x00\x42\xeb\xf6", 0x6000, 1)
+        } else {
+            (b"\x40\x43\x89\x1e\x10\x00\x42\xeb\xf8", 0xa010, 1)
+        };
+        for model in MODELS {
+            let what = format!("{world:?} {model:?}");
+            let ((vm, mut a), _) = pair(world, model, code, false);
+            let hlt = world.code() + at;
+            let stop = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let mut stored = [0; 2];
+                    while stored == [0; 2] && std::time::Instant::now() < deadline {
+                        vm.read_bytes(marker, &mut stored).unwrap();
+                        std::thread::yield_now();
+                    }
+                    vm.write_bytes(hlt, b"\xf4").unwrap();
+                });
+                loop {
+                    let run = a.run_steps(&vm, 1 << 20, StepOptions::default()).unwrap();
+                    if !matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+                        break run;
+                    }
+                }
+            });
+            let ip = if world.wide() { 0x1000 } else { 0x100 };
+            halted(world, &stop, &a, ip + at, &what);
+            // The HLT stopped the loop at its top: BX, stored, and DX agree.
+            let mut stored = [0; 2];
+            vm.read_bytes(marker, &mut stored).unwrap();
+            assert_eq!(u16::from_le_bytes(stored), a.cpu.gpr[3] as u16, "{what}");
+            assert_eq!(
+                a.cpu.gpr[2] as u16,
+                (a.cpu.gpr[3] as u16).wrapping_add(3),
+                "{what}"
+            );
         }
     }
 }

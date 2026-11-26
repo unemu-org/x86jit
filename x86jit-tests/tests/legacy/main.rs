@@ -8,6 +8,7 @@
 
 mod legacy_a20;
 mod legacy_alias;
+mod legacy_boundary_events;
 mod legacy_bus_width;
 mod legacy_census_386;
 mod legacy_contract;

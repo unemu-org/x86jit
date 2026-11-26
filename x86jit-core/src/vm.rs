@@ -1855,6 +1855,7 @@ impl Vm {
             _vm_lifetime: self.vcpu_lifetime.clone(),
             cpu,
             exit_request: ExitRequest { word },
+            dispatch_memory: self.mem.dispatch_identity(),
             interruption_evidence: None,
             syscall_evidence: None,
             engine_sections: AtomicU64::new(0),
@@ -2122,6 +2123,11 @@ pub struct Vcpu {
     _vm_lifetime: Arc<VmLifetime>,
     pub cpu: CpuState,
     exit_request: ExitRequest,
+    /// The `Memory::dispatch_identity` the dispatch word is registered with.
+    /// Code writes notify only registered words, and the walks and compiled
+    /// chain edges poll only the word, so a run on a replaced `Vm::mem`
+    /// registers it there first (`sync_dispatch_word`).
+    dispatch_memory: u64,
     interruption_evidence: Option<crate::InterruptionEvidence>,
     syscall_evidence: Option<crate::ExecutionEvidence>,
     engine_sections: AtomicU64,
@@ -3347,6 +3353,7 @@ impl Vcpu {
         options: StepOptions,
     ) -> Result<StepRun, StepRunError> {
         vm.sync_backing_policy();
+        self.sync_dispatch_word(vm);
         if self.profile == ExecutionProfile::Machine {
             if self
                 .legacy_model
@@ -3381,6 +3388,7 @@ impl Vcpu {
     /// is available through [`Self::interruption_evidence`] until `run` is next entered.
     pub fn run(&mut self, vm: &Vm, budget: Option<u64>) -> Exit {
         vm.sync_backing_policy();
+        self.sync_dispatch_word(vm);
         self.interruption_evidence = None;
         self.syscall_evidence = None;
         if self.profile != ExecutionProfile::Machine
@@ -3428,6 +3436,23 @@ impl Vcpu {
             Ok(_) => unreachable!(),
             Err(_) => self.unsupported_legacy(UnsupportedSystemOperation::LegacyExecution),
         }
+    }
+
+    /// Register the dispatch word with `vm.mem` when the embedder replaced it
+    /// since the word was registered: one compare at run entry. No vCPU runs
+    /// during a replacement, which needs `&mut Vm`.
+    #[inline(always)]
+    pub(crate) fn sync_dispatch_word(&mut self, vm: &Vm) {
+        if self.dispatch_memory != vm.mem.dispatch_identity() {
+            self.register_dispatch_word(vm);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn register_dispatch_word(&mut self, vm: &Vm) {
+        vm.mem.register_dispatch_word(&self.exit_request.word);
+        self.dispatch_memory = vm.mem.dispatch_identity();
     }
 
     // I8088/I8086 run in a permanent Direct context. The deprecated selector's

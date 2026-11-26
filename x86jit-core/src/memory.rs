@@ -785,6 +785,9 @@ impl WatchPages {
 
 pub(crate) const DISPATCH_DIRTY: u64 = 1;
 
+/// The next `Memory::dispatch_identity`; 64 bits never wrap in practice.
+static NEXT_DISPATCH_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
 type AliasRegistrations = BTreeMap<u64, BTreeSet<(u64, u64, usize)>>;
 
 #[derive(Default)]
@@ -955,6 +958,9 @@ pub struct Memory {
     dirty: Mutex<Vec<(u64, u64)>>,
     dirty_flag: AtomicBool,
     dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
+    // Distinguishes this instance from every other Memory of the process, so
+    // a vCPU notices a replaced `Vm::mem` and registers its word again.
+    dispatch_identity: u64,
     child_dispatch: crate::child::ChildDispatch,
     child_writes: Mutex<Vec<Weak<crate::child::ChildWrites>>>,
     // Embedder-registered DATA-range dirty tracking — a parallel facility to the SMC
@@ -1627,6 +1633,7 @@ impl Memory {
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
             dispatch_words: Mutex::new(Vec::new()),
+            dispatch_identity: NEXT_DISPATCH_IDENTITY.fetch_add(1, Ordering::Relaxed),
             child_dispatch: crate::child::ChildDispatch::default(),
             child_writes: Mutex::new(Vec::new()),
             watch,
@@ -2147,6 +2154,13 @@ impl Memory {
                 false
             }
         });
+    }
+
+    /// This instance's identity among the process's Memory instances, never
+    /// reused: the one a dispatch word was registered with (`Vcpu::run`).
+    #[inline(always)]
+    pub(crate) fn dispatch_identity(&self) -> u64 {
+        self.dispatch_identity
     }
 
     pub(crate) fn register_dispatch_word(&self, word: &Arc<AtomicU64>) {

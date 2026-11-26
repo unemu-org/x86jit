@@ -935,6 +935,7 @@ impl Vcpu {
             return self.device_run(result);
         }
         vm.sync_backing_policy();
+        self.sync_dispatch_word(vm);
         self.device_cpu().state.observe();
         let mut devices = Run {
             handler,
