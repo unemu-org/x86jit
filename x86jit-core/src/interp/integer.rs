@@ -40,7 +40,13 @@ pub(crate) fn exec_add(
     size: &u8,
     set_flags: &FlagMask,
 ) -> Option<InterpResult> {
-    let r = alu_add(read_val(*a, &*temps), read_val(*b, &*temps), 0, *size);
+    let (a, b) = (read_val(*a, &*temps), read_val(*b, &*temps));
+    if set_flags.is_none() {
+        // No flag written (address arithmetic): the masked result alone.
+        temps[*dst as usize] = a.wrapping_add(b) & mask(*size);
+        return None;
+    }
+    let r = alu_add(a, b, 0, *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
     None
@@ -75,7 +81,13 @@ pub(crate) fn exec_sub(
     size: &u8,
     set_flags: &FlagMask,
 ) -> Option<InterpResult> {
-    let r = alu_sub(read_val(*a, &*temps), read_val(*b, &*temps), 0, *size);
+    let (a, b) = (read_val(*a, &*temps), read_val(*b, &*temps));
+    if set_flags.is_none() {
+        // No flag written (address arithmetic): the masked result alone.
+        temps[*dst as usize] = a.wrapping_sub(b) & mask(*size);
+        return None;
+    }
+    let r = alu_sub(a, b, 0, *size);
     temps[*dst as usize] = r.res;
     apply(&mut cpu.flags, *set_flags, &r);
     None
@@ -436,8 +448,8 @@ pub(crate) fn exec_mul(
         let r = AluResult {
             res: lo_v,
             cf: overflow,
-            pf: false,
-            af: false,
+            pf_src: PF_SRC_ZERO,
+            af_src: AF_SRC_ZERO,
             zf: false,
             sf: false,
             of: overflow,

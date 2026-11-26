@@ -23,7 +23,7 @@ use crate::ir::{
     PackedBinOp, RepKind, StrOp, VLogicOp, Val,
 };
 use crate::memory::{Access, InterpreterMemory, MemTrap, Memory, RunningMemory, SplitMemory};
-use crate::state::{CpuState, Flags, Reg};
+use crate::state::{CpuState, Flags, Reg, AF_SRC_ZERO, PF_SRC_ZERO};
 
 /// `gpr[]` slot for RSP (used by push/pop-style stack ops in Call/Ret).
 const RSP: usize = 4;
@@ -1843,6 +1843,7 @@ fn walk_ops<
                 kind,
                 to_mmx,
             } => {
+                std::hint::cold_path();
                 let v = u128::from(read_val(*lo, temps)) | (u128::from(read_val(*hi, temps)) << 64);
                 let r = vector::packed_cvt128_mode_specialized::<DEFAULT>(
                     v,
@@ -1861,20 +1862,24 @@ fn walk_ops<
                 }
             }
             IrOp::MmxRead { dst, reg } => {
+                std::hint::cold_path();
                 temps[*dst as usize] =
                     u64::from_le_bytes(cpu.fpr[*reg as usize][..8].try_into().unwrap());
             }
             IrOp::MmxWrite { reg, src } => {
+                std::hint::cold_path();
                 let slot = &mut cpu.fpr[*reg as usize];
                 slot[..8].copy_from_slice(&read_val(*src, temps).to_le_bytes());
                 slot[8..].fill(0xff);
             }
             IrOp::MmxState { empty } => {
+                std::hint::cold_path();
                 // SDM Vol 3A §15.2 Table 15-2: only TOP and tags change.
                 cpu.fpu_top = 0;
                 cpu.fpu_empty = if *empty { 0xff } else { 0 };
             }
             IrOp::MmxCompute { dst, a, b, op } => {
+                std::hint::cold_path();
                 temps[*dst as usize] = mmx::compute(read_val(*a, temps), read_val(*b, temps), *op);
             }
             IrOp::ReadReg { dst, reg } => {
@@ -2298,6 +2303,7 @@ fn walk_ops<
                 }
             }
             IrOp::Cpuid => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
@@ -2306,6 +2312,7 @@ fn walk_ops<
                 }
             }
             IrOp::ReadTsc { aux } => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
@@ -2317,12 +2324,14 @@ fn walk_ops<
                 size,
                 set_flags,
             } => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
                 temps[*dst as usize] = random_run(cpu, *kind, *size, *set_flags);
             }
             IrOp::Xgetbv => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
@@ -2338,6 +2347,7 @@ fn walk_ops<
                 operand_offset,
                 ..
             } => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
@@ -2376,6 +2386,7 @@ fn walk_ops<
             }
             IrOp::GetMxcsr { dst } => temps[*dst as usize] = cpu.mxcsr as u64,
             IrOp::SetMxcsr { src } => {
+                std::hint::cold_path();
                 let mxcsr = read_val(*src, temps) as u32;
                 if mxcsr & !crate::state::MXCSR_MASK != 0 {
                     if CHILD {
@@ -2404,6 +2415,7 @@ fn walk_ops<
                 kind,
                 wide,
             } => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("XSAVE family refused before child execution");
                 }
@@ -2435,6 +2447,7 @@ fn walk_ops<
                 restore,
                 wide,
             } => {
+                std::hint::cold_path();
                 if CHILD {
                     unreachable!("helper refused before child execution");
                 }
@@ -2467,6 +2480,7 @@ fn walk_ops<
                 src,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_crc32(temps, dst, crc, src, bytes) {
                     return r.into();
                 }
@@ -2499,6 +2513,7 @@ fn walk_ops<
                 addr,
                 size,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_load(cpu, mem, temps, cur_addr.get(), dst, addr, size) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
@@ -2509,16 +2524,19 @@ fn walk_ops<
                 src,
                 size,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_store(cpu, mem, temps, cur_addr.get(), addr, src, size) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VMov { dst, src } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_mov(cpu, dst, src) {
                     return r.into();
                 }
             }
             IrOp::VMov256 { dst, src } => {
+                std::hint::cold_path();
                 cpu.xmm[*dst as usize] = cpu.xmm[*src as usize];
                 cpu.ymm_hi[*dst as usize] = cpu.ymm_hi[*src as usize];
             }
@@ -2528,6 +2546,7 @@ fn walk_ops<
                 addr,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_load_wide(cpu, mem, temps, cur_addr.get(), dst, addr, bytes)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
@@ -2539,6 +2558,7 @@ fn walk_ops<
                 src,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_store_wide(cpu, mem, temps, cur_addr.get(), addr, src, bytes)
                 {
@@ -2546,6 +2566,7 @@ fn walk_ops<
                 }
             }
             IrOp::VMovWide { dst, src, bytes } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_mov_wide(cpu, dst, src, bytes) {
                     return r.into();
                 }
@@ -2558,6 +2579,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_mask_mov(cpu, dst, src, k, elem, zeroing, bytes) {
                     return r.into();
                 }
@@ -2572,6 +2594,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_mask_load_mem(
                     cpu,
@@ -2604,6 +2627,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) = exec_v_mask_store_mem(
                     cpu,
@@ -2639,6 +2663,7 @@ fn walk_ops<
                 scale,
                 addr32,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some((f, ea)) = gather_run(
                     cpu,
@@ -2671,6 +2696,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_vecmask_load_mem(
                     cpu,
@@ -2701,6 +2727,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) = exec_v_vecmask_store_mem(
                     cpu,
@@ -2724,6 +2751,7 @@ fn walk_ops<
                 }
             }
             IrOp::VLogic256 { dst, a, b, op } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_logic256(cpu, dst, a, b, op) {
                     return r.into();
                 }
@@ -2735,6 +2763,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_logic_wide(cpu, dst, a, b, op, bytes) {
                     return r.into();
                 }
@@ -2747,6 +2776,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_logic_wide_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, op, bytes)
                 {
@@ -2759,6 +2789,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_popcnt(cpu, dst, a, lane, bytes) {
                     return r.into();
                 }
@@ -2770,6 +2801,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_popcnt_m(cpu, mem, temps, cur_addr.get(), dst, addr, lane, bytes)
                 {
@@ -2783,6 +2815,7 @@ fn walk_ops<
                 to,
                 signed,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_mov_extend(cpu, dst, src, from, to, signed) {
                     return r.into();
                 }
@@ -2795,6 +2828,7 @@ fn walk_ops<
                 to,
                 signed,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_mov_extend_m(
                     cpu,
                     mem,
@@ -2819,6 +2853,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_mov_extend_wide(
                     cpu, dst, src, from, to, signed, dst_width, writemask, zeroing,
                 ) {
@@ -2833,6 +2868,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_abs(cpu, dst, src, elem, dst_width, writemask, zeroing) {
                     return r.into();
                 }
@@ -2876,6 +2912,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_shuf_lane(cpu, dst, a, b, imm, elem, dst_width, writemask, zeroing)
                 {
@@ -2897,6 +2934,7 @@ fn walk_ops<
                 }
             }
             IrOp::VPBlendV { dst, src, lane } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_blend_v(cpu, dst, src, lane) {
                     return r.into();
                 }
@@ -2907,6 +2945,7 @@ fn walk_ops<
                 addr,
                 lane,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_p_blend_v_m(cpu, mem, temps, cur_addr.get(), dst, addr, lane)
                 {
@@ -2921,6 +2960,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_blend_v_x(cpu, dst, a, b, mask, lane, bytes) {
                     return r.into();
                 }
@@ -2934,6 +2974,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_blend_v_xm(
                     cpu,
                     mem,
@@ -2957,6 +2998,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_blend_i(cpu, dst, a, b, imm, lane, bytes) {
                     return r.into();
                 }
@@ -2970,6 +3012,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_blend_i_m(
                     cpu,
                     mem,
@@ -2994,6 +3037,7 @@ fn walk_ops<
                 scalar,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_p_round::<DEFAULT>(cpu, dst, a, src, prec, mode, scalar, bytes)
                 {
@@ -3009,6 +3053,7 @@ fn walk_ops<
                 scalar,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_round_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -3034,6 +3079,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_masked_logic(cpu, dst, a, b, op, k, elem, zeroing, bytes) {
                     return r.into();
                 }
@@ -3048,6 +3094,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_masked_packed(cpu, dst, a, b, op, k, elem, zeroing, bytes) {
                     return r.into();
                 }
@@ -3060,6 +3107,7 @@ fn walk_ops<
                 num_lanes,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_lane_wide(cpu, dst, src, ins, idx, num_lanes, bytes)
                 {
                     return r.into();
@@ -3071,6 +3119,7 @@ fn walk_ops<
                 idx,
                 num_lanes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_extract_lane_wide(cpu, dst, src, idx, num_lanes) {
                     return r.into();
                 }
@@ -3082,6 +3131,7 @@ fn walk_ops<
                 idx,
                 num_lanes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_extract_lane_wide_m(
                     cpu,
                     mem,
@@ -3101,6 +3151,7 @@ fn walk_ops<
                 imm,
                 explicit,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pcmp_str(cpu, a, b, imm, explicit) {
                     return r.into();
                 }
@@ -3112,6 +3163,7 @@ fn walk_ops<
                 imm,
                 explicit,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_pcmp_str_m(cpu, mem, temps, cur_addr.get(), a, addr, imm, explicit)
                 {
@@ -3124,6 +3176,7 @@ fn walk_ops<
                 imm,
                 explicit,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pcmp_str_mask(cpu, a, b, imm, explicit) {
                     return r.into();
                 }
@@ -3135,6 +3188,7 @@ fn walk_ops<
                 imm,
                 explicit,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_pcmp_str_mask_m(cpu, mem, temps, cur_addr.get(), a, addr, imm, explicit)
                 {
@@ -3142,6 +3196,7 @@ fn walk_ops<
                 }
             }
             IrOp::VInsertPs { dst, src, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_ps(cpu, dst, src, imm) {
                     return r.into();
                 }
@@ -3152,12 +3207,14 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_ps_m(cpu, mem, temps, cur_addr.get(), dst, addr, imm)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VInsertPs3 { dst, a, src, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_ps3(cpu, dst, a, src, imm) {
                     return r.into();
                 }
@@ -3169,6 +3226,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_insert_ps_m3(cpu, mem, temps, cur_addr.get(), dst, a, addr, imm)
                 {
@@ -3182,6 +3240,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dpps::<DEFAULT>(cpu, dst, a, b, imm, bytes) {
                     return r.into();
                 }
@@ -3194,6 +3253,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dpps_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -3209,6 +3269,7 @@ fn walk_ops<
                 }
             }
             IrOp::VDppd { dst, b, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dppd::<DEFAULT>(cpu, dst, b, imm) {
                     return r.into();
                 }
@@ -3219,6 +3280,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dppd_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -3238,6 +3300,7 @@ fn walk_ops<
                 imm,
                 prec,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dp3::<DEFAULT>(cpu, dst, a, b, imm, prec) {
                     return r.into();
                 }
@@ -3250,6 +3313,7 @@ fn walk_ops<
                 imm,
                 prec,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_dp3_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -3272,6 +3336,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_align(cpu, dst, a, b, shift, elem, bytes) {
                     return r.into();
                 }
@@ -3283,6 +3348,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_ternlog(cpu, dst, b, c, imm, bytes) {
                     return r.into();
                 }
@@ -3295,6 +3361,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_p_ternlog_m(cpu, mem, temps, cur_addr.get(), dst, b, addr, imm, bytes)
                 {
@@ -3308,6 +3375,7 @@ fn walk_ops<
                 addr,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_logic256_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, op)
                 {
@@ -3321,6 +3389,7 @@ fn walk_ops<
                 lane,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_bin256(cpu, dst, a, b, lane, op) {
                     return r.into();
                 }
@@ -3333,6 +3402,7 @@ fn walk_ops<
                 lane,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_packed_bin256_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, lane, op)
                 {
@@ -3347,6 +3417,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_wide(cpu, dst, a, b, lane, op, bytes) {
                     return r.into();
                 }
@@ -3360,6 +3431,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_wide_m(
                     cpu,
                     mem,
@@ -3376,20 +3448,24 @@ fn walk_ops<
                 }
             }
             IrOp::VMoveMaskB256 { dst, src } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_move_mask_b256(cpu, temps, dst, src) {
                     return r.into();
                 }
             }
             IrOp::VFromGpr { dst, src, size } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_from_gpr(cpu, temps, dst, src, size) {
                     return r.into();
                 }
             }
             IrOp::VReadChunk { dst, src, chunk } => {
+                std::hint::cold_path();
                 temps[*dst as usize] = (cpu.vec_lanes(*src as usize)[*chunk as usize / 2]
                     >> ((*chunk % 2) * 64)) as u64;
             }
             IrOp::VWriteChunk { dst, src, chunk } => {
+                std::hint::cold_path();
                 let mut lanes = cpu.vec_lanes(*dst as usize);
                 let shift = (*chunk % 2) * 64;
                 let mask = (u64::MAX as u128) << shift;
@@ -3398,11 +3474,13 @@ fn walk_ops<
                 cpu.set_vec(*dst as usize, lanes, 64);
             }
             IrOp::VToGpr { dst, src, size } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_to_gpr(cpu, temps, dst, src, size) {
                     return r.into();
                 }
             }
             IrOp::VLogic { dst, a, b, op } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_logic(cpu, dst, a, b, op) {
                     return r.into();
                 }
@@ -3414,6 +3492,7 @@ fn walk_ops<
                 lane,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_bin(cpu, dst, a, b, lane, op) {
                     return r.into();
                 }
@@ -3425,6 +3504,7 @@ fn walk_ops<
                 lane,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_packed_bin_m(cpu, mem, temps, cur_addr.get(), dst, addr, lane, op)
                 {
@@ -3437,6 +3517,7 @@ fn walk_ops<
                 addr,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_logic_m(cpu, mem, temps, cur_addr.get(), dst, addr, op) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
@@ -3449,6 +3530,7 @@ fn walk_ops<
                 right,
                 arith,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_shift(cpu, dst, a, imm, lane, right, arith) {
                     return r.into();
                 }
@@ -3464,6 +3546,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_masked_shift(cpu, dst, a, imm, elem, right, arith, k, zeroing, bytes)
                 {
@@ -3481,6 +3564,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 exec_shift_reg(
                     cpu, *dst, *a, *count, *elem, *right, *arith, *k, *zeroing, *bytes,
                 );
@@ -3496,6 +3580,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 exec_var_shift(
                     cpu, *dst, *a, *count, *elem, *right, *arith, *k, *zeroing, *bytes,
                 );
@@ -3510,6 +3595,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 exec_gf2p8(cpu, *dst, *a, *b, *imm, *mode, *k, *zeroing, *bytes);
             }
             IrOp::VGf2p8M {
@@ -3523,6 +3609,7 @@ fn walk_ops<
                 zeroing,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_gf2p8_m(
                     cpu,
@@ -3560,11 +3647,13 @@ fn walk_ops<
                 right,
                 width,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_byte_shift(cpu, dst, a, shift, right, width) {
                     return r.into();
                 }
             }
             IrOp::VShuffle32 { dst, a, imm, bytes } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shuffle32(cpu, dst, a, imm, bytes) {
                     return r.into();
                 }
@@ -3576,6 +3665,7 @@ fn walk_ops<
                 imm,
                 high,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload(cpu, mem, cur_addr.get(), ea, 16) {
                     Ok(v) => v,
@@ -3600,6 +3690,7 @@ fn walk_ops<
                 right,
                 arith,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload(cpu, mem, cur_addr.get(), ea, 16) {
                     Ok(v) => v,
@@ -3631,6 +3722,7 @@ fn walk_ops<
                 bytes,
                 elem,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -3664,6 +3756,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -3686,6 +3779,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -3711,6 +3805,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_blend_w(cpu, dst, a, b, imm, bytes) {
                     return r.into();
                 }
@@ -3722,6 +3817,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_blend_d(cpu, dst, a, b, imm, bytes) {
                     return r.into();
                 }
@@ -3740,6 +3836,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_fma::<DEFAULT>(
                     cpu, dst, x, y, z, prec, scalar, neg_prod, neg_add, bytes, alt_sign, writemask,
                     zeroing,
@@ -3764,6 +3861,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_fma_m::<DEFAULT, ROUTED>(
                     cpu,
@@ -3806,6 +3904,7 @@ fn walk_ops<
                 signed,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pack_wide(cpu, dst, a, b, from_elem, signed, bytes) {
                     return r.into();
                 }
@@ -3819,6 +3918,7 @@ fn walk_ops<
                 signed,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -3846,6 +3946,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shuffle32_wide(cpu, dst, a, imm, bytes, writemask, zeroing)
                 {
                     return r.into();
@@ -3857,6 +3958,7 @@ fn walk_ops<
                 dst_high,
                 src_high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_move_half(cpu, dst, src, dst_high, src_high) {
                     return r.into();
                 }
@@ -3867,6 +3969,7 @@ fn walk_ops<
                 addr,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_load_half(cpu, mem, temps, cur_addr.get(), dst, addr, high)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
@@ -3878,12 +3981,14 @@ fn walk_ops<
                 src,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_store_half(cpu, mem, temps, cur_addr.get(), addr, src, high)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VExtractW { dst, src, index } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_extract_w(cpu, temps, dst, src, index) {
                     return r.into();
                 }
@@ -3894,11 +3999,13 @@ fn walk_ops<
                 index,
                 size,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_extract_lane(cpu, temps, dst, src, index, size) {
                     return r.into();
                 }
             }
             IrOp::VMoveMaskB { dst, src } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_move_mask_b(cpu, temps, dst, src) {
                     return r.into();
                 }
@@ -3909,6 +4016,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_move_mask_fp(cpu, temps, dst, src, elem, bytes) {
                     return r.into();
                 }
@@ -3919,6 +4027,7 @@ fn walk_ops<
                 elem,
                 w256,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_broadcast(cpu, dst, src, elem, w256) {
                     return r.into();
                 }
@@ -3930,6 +4039,7 @@ fn walk_ops<
                 elem,
                 w256,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_broadcast_m(cpu, mem, temps, cur_addr.get(), dst, addr, elem, w256)
                 {
@@ -3942,6 +4052,7 @@ fn walk_ops<
                 elem,
                 width,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_broadcast_gpr(cpu, temps, dst, src, elem, width) {
                     return r.into();
                 }
@@ -3955,6 +4066,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_broadcast_lane(cpu, dst, src, chunk, elem, dst_width, writemask, zeroing)
                 {
@@ -3971,6 +4083,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_broadcast_lane_m(
                     cpu,
@@ -4018,6 +4131,7 @@ fn walk_ops<
                 signed,
                 writemask,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_p_cmp_to_mask(cpu, k, a, b, elem, width, pred, signed, writemask)
                 {
@@ -4035,6 +4149,7 @@ fn walk_ops<
                 signed,
                 writemask,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_cmp_to_mask_m(
                     cpu,
                     mem,
@@ -4061,6 +4176,7 @@ fn walk_ops<
                 neg,
                 writemask,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_test_to_mask(cpu, k, a, b, elem, width, neg, writemask) {
                     return r.into();
                 }
@@ -4075,6 +4191,7 @@ fn walk_ops<
                 neg,
                 writemask,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_p_test_to_mask_m(
                     cpu,
                     mem,
@@ -4092,26 +4209,31 @@ fn walk_ops<
                 }
             }
             IrOp::VKOrTest { a, b, width } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_or_test(cpu, a, b, width) {
                     return r.into();
                 }
             }
             IrOp::VKFromGpr { k, src, width } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_from_gpr(cpu, temps, k, src, width) {
                     return r.into();
                 }
             }
             IrOp::VKToGpr { dst, k, width } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_to_gpr(cpu, temps, dst, k, width) {
                     return r.into();
                 }
             }
             IrOp::VKMovKK { dst, src, width } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_mov_k_k(cpu, dst, src, width) {
                     return r.into();
                 }
             }
             IrOp::VKUnpack { dst, a, b, half } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_unpack(cpu, dst, a, b, half) {
                     return r.into();
                 }
@@ -4123,11 +4245,13 @@ fn walk_ops<
                 op,
                 width,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_bin_op(cpu, dst, a, b, op, width) {
                     return r.into();
                 }
             }
             IrOp::VKNot { dst, a, width } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_not(cpu, dst, a, width) {
                     return r.into();
                 }
@@ -4139,6 +4263,7 @@ fn walk_ops<
                 width,
                 left,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_k_shift(cpu, dst, a, amount, width, left) {
                     return r.into();
                 }
@@ -4152,6 +4277,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_pmov_narrow(cpu, dst, src, from, to, src_width, writemask, zeroing)
                 {
@@ -4166,6 +4292,7 @@ fn walk_ops<
                 to,
                 src_width,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Write));
                 if let Some(r) = exec_v_pmov_narrow_mem(
                     cpu,
@@ -4191,6 +4318,7 @@ fn walk_ops<
                 bytes,
                 imode,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_perm_t2(cpu, dst, idx, tbl, elem, writemask, zeroing, bytes, imode)
                 {
@@ -4208,6 +4336,7 @@ fn walk_ops<
                 bytes,
                 imode,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_perm_t2_m(
                     cpu,
@@ -4235,6 +4364,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_perm1(cpu, dst, idx, src, elem, bytes, writemask, zeroing) {
                     return r.into();
                 }
@@ -4249,6 +4379,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 let (mem, _ordering) = mem.helper(Some(ordering::Direction::Read));
                 if let Some(r) = exec_v_perm1_m(
                     cpu,
@@ -4267,6 +4398,7 @@ fn walk_ops<
                 }
             }
             IrOp::VInsert128 { dst, src, ins, hi } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert128(cpu, dst, src, ins, hi) {
                     return r.into();
                 }
@@ -4278,6 +4410,7 @@ fn walk_ops<
                 addr,
                 hi,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_insert128_m(cpu, mem, temps, cur_addr.get(), dst, src, addr, hi)
                 {
@@ -4285,11 +4418,13 @@ fn walk_ops<
                 }
             }
             IrOp::VExtract128 { dst, src, hi } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_extract128(cpu, dst, src, hi) {
                     return r.into();
                 }
             }
             IrOp::VPshufb256 { dst, a, idx } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pshufb256(cpu, dst, a, idx) {
                     return r.into();
                 }
@@ -4302,6 +4437,7 @@ fn walk_ops<
                 writemask,
                 zeroing,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pshufb_wide(cpu, dst, a, idx, bytes, writemask, zeroing) {
                     return r.into();
                 }
@@ -4312,6 +4448,7 @@ fn walk_ops<
                 a,
                 addr,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pshufb256_m(cpu, mem, temps, cur_addr.get(), dst, a, addr) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
@@ -4324,16 +4461,19 @@ fn walk_ops<
                 right,
                 arith,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_shift256(cpu, dst, a, imm, lane, right, arith) {
                     return r.into();
                 }
             }
             IrOp::VPermq { dst, src, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_permq(cpu, dst, src, imm) {
                     return r.into();
                 }
             }
             IrOp::VPermd { dst, ctrl, src } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_permd(cpu, dst, ctrl, src) {
                     return r.into();
                 }
@@ -4345,51 +4485,61 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_permil_var(cpu, dst, src, ctrl, elem, bytes) {
                     return r.into();
                 }
             }
             IrOp::VPerm2i128 { dst, a, b, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_perm2i128(cpu, dst, a, b, imm) {
                     return r.into();
                 }
             }
             IrOp::VPalignr256 { dst, a, b, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_palignr256(cpu, dst, a, b, imm) {
                     return r.into();
                 }
             }
             IrOp::VPtest { a, b, w256 } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_ptest(cpu, a, b, w256) {
                     return r.into();
                 }
             }
             IrOp::VTestFp { a, b, elem, bytes } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_test_fp(cpu, a, b, elem, bytes) {
                     return r.into();
                 }
             }
             IrOp::VZeroUpper { reg } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_zero_upper(cpu, reg) {
                     return r.into();
                 }
             }
             IrOp::VZeroUpperAll { clear_low } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_zero_upper_all(cpu, *clear_low) {
                     return r.into();
                 }
             }
             IrOp::VPshufb { dst, a, idx } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pshufb(cpu, dst, a, idx) {
                     return r.into();
                 }
             }
             IrOp::VPshufbM { fault, dst, addr } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pshufb_m(cpu, mem, temps, cur_addr.get(), dst, addr) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAlignr { dst, a, src, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_alignr(cpu, dst, a, src, imm) {
                     return r.into();
                 }
@@ -4402,6 +4552,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -4426,6 +4577,7 @@ fn walk_ops<
                 }
             }
             IrOp::VAes { dst, a, b, op } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_aes(cpu, dst, a, b, op) {
                     return r.into();
                 }
@@ -4437,21 +4589,25 @@ fn walk_ops<
                 addr,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_aes_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, op) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAesImc { dst, src } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_aes_imc(cpu, dst, src) {
                     return r.into();
                 }
             }
             IrOp::VAesImcM { fault, dst, addr } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_aes_imc_m(cpu, mem, temps, cur_addr.get(), dst, addr) {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
                 }
             }
             IrOp::VAesKeygen { dst, src, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_aes_keygen(cpu, dst, src, imm) {
                     return r.into();
                 }
@@ -4462,6 +4618,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_aes_keygen_m(cpu, mem, temps, cur_addr.get(), dst, addr, imm)
                 {
@@ -4469,6 +4626,7 @@ fn walk_ops<
                 }
             }
             IrOp::VSha { dst, a, b, imm, op } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_sha(cpu, dst, a, b, imm, op) {
                     return r.into();
                 }
@@ -4481,6 +4639,7 @@ fn walk_ops<
                 imm,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_sha_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, imm, op)
                 {
@@ -4488,6 +4647,7 @@ fn walk_ops<
                 }
             }
             IrOp::VGfni { dst, a, b, imm, op } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_gfni(cpu, dst, a, b, imm, op) {
                     return r.into();
                 }
@@ -4500,6 +4660,7 @@ fn walk_ops<
                 imm,
                 op,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_gfni_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, imm, op)
                 {
@@ -4509,6 +4670,7 @@ fn walk_ops<
             IrOp::Movq2dq { dst, src_mm } => exec_movq2dq(cpu, *dst, *src_mm),
             IrOp::Movdq2q { dst_mm, src_xmm } => exec_movdq2q(cpu, *dst_mm, *src_xmm),
             IrOp::VPclmul { dst, a, b, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pclmul(cpu, dst, a, b, imm) {
                     return r.into();
                 }
@@ -4520,6 +4682,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pclmul_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, imm)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
@@ -4532,6 +4695,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_psign(cpu, dst, a, b, lane, bytes) {
                     return r.into();
                 }
@@ -4544,6 +4708,7 @@ fn walk_ops<
                 lane,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_psign_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, lane, bytes)
                 {
@@ -4551,6 +4716,7 @@ fn walk_ops<
                 }
             }
             IrOp::VShufps { dst, a, b, imm } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shufps(cpu, dst, a, b, imm) {
                     return r.into();
                 }
@@ -4562,6 +4728,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shufps_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, imm)
                 {
                     return walk_classify_access(r, cur_addr.get(), read_val(*addr, temps), *fault);
@@ -4574,6 +4741,7 @@ fn walk_ops<
                 high,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shuffle16(cpu, dst, a, imm, high, bytes) {
                     return r.into();
                 }
@@ -4585,6 +4753,7 @@ fn walk_ops<
                 lane,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_unpack_low(cpu, dst, a, b, lane, high) {
                     return r.into();
                 }
@@ -4597,6 +4766,7 @@ fn walk_ops<
                 lane,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_unpack_low_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, lane, high)
                 {
@@ -4604,11 +4774,13 @@ fn walk_ops<
                 }
             }
             IrOp::VPackUsWB { dst, a, b } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_pack_us_w_b(cpu, dst, a, b) {
                     return r.into();
                 }
             }
             IrOp::VPMAddWd { dst, a, b } => {
+                std::hint::cold_path();
                 exec_pmaddwd(cpu, *dst, *a, *b);
             }
             IrOp::VPMadd {
@@ -4618,6 +4790,7 @@ fn walk_ops<
                 ubsw,
                 bytes,
             } => {
+                std::hint::cold_path();
                 exec_v_pmadd(cpu, *dst, *a, *b, *ubsw, *bytes);
             }
             IrOp::VPMaddM {
@@ -4628,6 +4801,7 @@ fn walk_ops<
                 ubsw,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_pmadd_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, ubsw, bytes)
                 {
@@ -4707,6 +4881,7 @@ fn walk_ops<
                 }
             }
             IrOp::VInsertW { dst, src, index } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_w(cpu, temps, dst, src, index) {
                     return r.into();
                 }
@@ -4718,11 +4893,13 @@ fn walk_ops<
                 index,
                 size,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_insert_lane(cpu, temps, dst, base, src, index, size) {
                     return r.into();
                 }
             }
             IrOp::VFloatMov { dst, a, src, prec } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_mov(cpu, dst, a, src, prec) {
                     return r.into();
                 }
@@ -4735,6 +4912,7 @@ fn walk_ops<
                 prec,
                 scalar,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_bin::<DEFAULT>(cpu, dst, a, b, op, prec, scalar) {
                     return r.into();
                 }
@@ -4747,6 +4925,7 @@ fn walk_ops<
                 prec,
                 scalar,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_bin_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4769,6 +4948,7 @@ fn walk_ops<
                 prec,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_h_float::<DEFAULT>(cpu, dst, a, b, op, prec, bytes) {
                     return r.into();
                 }
@@ -4782,6 +4962,7 @@ fn walk_ops<
                 prec,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_h_float_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4804,6 +4985,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_h_int(cpu, dst, a, b, op, bytes) {
                     return r.into();
                 }
@@ -4816,6 +4998,7 @@ fn walk_ops<
                 op,
                 bytes,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_h_int_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, op, bytes)
                 {
@@ -4830,6 +5013,7 @@ fn walk_ops<
                 scalar,
                 pred,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_float_cmp_mask::<DEFAULT>(cpu, dst, a, b, prec, scalar, pred)
                 {
@@ -4844,6 +5028,7 @@ fn walk_ops<
                 scalar,
                 pred,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_cmp_mask_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4865,6 +5050,7 @@ fn walk_ops<
                 prec,
                 pred,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_cmp_mask256::<DEFAULT>(cpu, dst, a, b, prec, pred) {
                     return r.into();
                 }
@@ -4877,6 +5063,7 @@ fn walk_ops<
                 prec,
                 pred,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_cmp_mask256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4892,6 +5079,7 @@ fn walk_ops<
                 }
             }
             IrOp::VFloatCmp { a, b, prec } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_cmp::<DEFAULT>(cpu, temps, a, b, prec) {
                     return r.into();
                 }
@@ -4903,6 +5091,7 @@ fn walk_ops<
                 prec,
                 signed,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_cvt_from_int::<DEFAULT>(cpu, temps, dst, src, int_size, prec, signed)
                 {
@@ -4917,6 +5106,7 @@ fn walk_ops<
                 trunc,
                 signed,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_cvt_to_int::<DEFAULT>(
                     cpu, temps, dst, src, int_size, prec, trunc, signed,
                 ) {
@@ -4924,11 +5114,13 @@ fn walk_ops<
                 }
             }
             IrOp::VCvtFloat { dst, src, from, to } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_cvt_float::<DEFAULT>(cpu, temps, dst, src, from, to) {
                     return r.into();
                 }
             }
             IrOp::VPackedCvt { dst, src, kind } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_cvt::<DEFAULT>(cpu, dst, src, kind) {
                     return r.into();
                 }
@@ -4940,6 +5132,7 @@ fn walk_ops<
                 op,
                 prec,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_bin256::<DEFAULT>(cpu, dst, a, b, op, prec) {
                     return r.into();
                 }
@@ -4952,6 +5145,7 @@ fn walk_ops<
                 op,
                 prec,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_bin256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4967,6 +5161,7 @@ fn walk_ops<
                 }
             }
             IrOp::VFloatUnary256 { dst, src, op, prec } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_unary256::<DEFAULT>(cpu, dst, src, op, prec) {
                     return r.into();
                 }
@@ -4978,6 +5173,7 @@ fn walk_ops<
                 op,
                 prec,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_unary256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -4992,6 +5188,7 @@ fn walk_ops<
                 }
             }
             IrOp::VPackedCvt256 { dst, src, kind } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_cvt256::<DEFAULT>(cpu, dst, src, kind) {
                     return r.into();
                 }
@@ -5002,6 +5199,7 @@ fn walk_ops<
                 addr,
                 kind,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_cvt256_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -5015,6 +5213,7 @@ fn walk_ops<
                 }
             }
             IrOp::VPackedCvtWide256 { dst, src, kind } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_packed_cvt_wide256::<DEFAULT>(cpu, dst, src, kind) {
                     return r.into();
                 }
@@ -5026,6 +5225,7 @@ fn walk_ops<
                 imm_lo,
                 imm_hi,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shufps256(cpu, dst, a, b, imm_lo, imm_hi) {
                     return r.into();
                 }
@@ -5038,6 +5238,7 @@ fn walk_ops<
                 imm_lo,
                 imm_hi,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_shufps256_m(
                     cpu,
                     mem,
@@ -5059,6 +5260,7 @@ fn walk_ops<
                 lane,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_unpack256(cpu, dst, a, b, lane, high) {
                     return r.into();
                 }
@@ -5071,6 +5273,7 @@ fn walk_ops<
                 lane,
                 high,
             } => {
+                std::hint::cold_path();
                 if let Some(r) =
                     exec_v_unpack256_m(cpu, mem, temps, cur_addr.get(), dst, a, addr, lane, high)
                 {
@@ -5078,6 +5281,7 @@ fn walk_ops<
                 }
             }
             IrOp::VCvtPh2Ps { dst, src, lanes } => {
+                std::hint::cold_path();
                 let (lo, hi) = cvtph2ps(cpu.xmm[*src as usize], *lanes as usize);
                 cpu.xmm[*dst as usize] = lo;
                 cpu.ymm_hi[*dst as usize] = hi; // 0 for the 4-lane form
@@ -5090,6 +5294,7 @@ fn walk_ops<
                 elem,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -5116,6 +5321,7 @@ fn walk_ops<
                 addr,
                 imm,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, 32) {
                     Ok(v) => v,
@@ -5143,6 +5349,7 @@ fn walk_ops<
                 arith,
                 bytes,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let bv = match vload_lanes(cpu, mem, cur_addr.get(), ea, *bytes) {
                     Ok(v) => v,
@@ -5169,6 +5376,7 @@ fn walk_ops<
                 lanes,
                 rc,
             } => {
+                std::hint::cold_path();
                 let ea = read_val(*addr, temps);
                 let mxcsr = interp_mxcsr::<DEFAULT>(cpu);
                 let rc = if rc & 4 != 0 {
@@ -5258,6 +5466,7 @@ fn walk_ops<
                 lanes,
                 rc,
             } => {
+                std::hint::cold_path();
                 let out = cvtps2ph_with_mxcsr(
                     cpu.xmm[*src as usize],
                     cpu.ymm_hi[*src as usize],
@@ -5273,6 +5482,7 @@ fn walk_ops<
                 cpu.ymm_hi[*dst as usize] = 0;
             }
             IrOp::VPhMinPosUw { dst, src } => {
+                std::hint::cold_path();
                 cpu.xmm[*dst as usize] = phminposuw(cpu.xmm[*src as usize]);
             }
             IrOp::VMpsadbw {
@@ -5282,6 +5492,7 @@ fn walk_ops<
                 imm,
                 bytes,
             } => {
+                std::hint::cold_path();
                 cpu.xmm[*dst as usize] = mpsadbw(cpu.xmm[*a as usize], cpu.xmm[*b as usize], *imm);
                 if *bytes == 32 {
                     // Per 128-bit lane; imm[5:3] is the high-lane control (imm[2:0] the low).
@@ -5299,6 +5510,7 @@ fn walk_ops<
                 prec,
                 scalar,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_unary::<DEFAULT>(cpu, dst, a, src, op, prec, scalar) {
                     return r.into();
                 }
@@ -5312,6 +5524,7 @@ fn walk_ops<
                 prec,
                 scalar,
             } => {
+                std::hint::cold_path();
                 if let Some(r) = exec_v_float_unary_m::<DEFAULT, ROUTED, ORDER>(
                     cpu,
                     mem,
@@ -9412,7 +9625,7 @@ fn trap_out(
 
 #[inline(always)]
 pub(crate) fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
-    match reg.gpr_index() {
+    match reg.gpr_slot() {
         Some(i) => cpu.gpr[i],
         None => match reg {
             Reg::Rip => cpu.rip,
@@ -9431,7 +9644,7 @@ pub(crate) fn read_reg(cpu: &CpuState, reg: Reg) -> u64 {
 
 #[inline(always)]
 fn write_reg(cpu: &mut CpuState, reg: Reg, val: u64, size: u8) {
-    match reg.gpr_index() {
+    match reg.gpr_slot() {
         Some(i) => cpu.write_gpr(i, val, size),
         None => match reg {
             Reg::Rip => cpu.rip = val,
@@ -9459,8 +9672,10 @@ fn read_val(v: Val, temps: &[u64]) -> u64 {
 struct AluResult {
     res: u64,
     cf: bool,
-    pf: bool,
-    af: bool,
+    /// The `Flags::pf_src` byte: the result's low byte, or a constant.
+    pf_src: u8,
+    /// The `Flags::af_src` byte: `a ^ b ^ result`, or a constant.
+    af_src: u8,
     zf: bool,
     sf: bool,
     of: bool,
@@ -11355,8 +11570,8 @@ pub fn random_run(
         &AluResult {
             res,
             cf: value.is_some(),
-            pf: false,
-            af: false,
+            pf_src: PF_SRC_ZERO,
+            af_src: AF_SRC_ZERO,
             zf: false,
             sf: false,
             of: false,
@@ -12216,17 +12431,26 @@ fn float_compare_mode<const DEFAULT: bool>(
     }
 }
 
+/// `carry_in` is 0 or 1 (ADC's CF, ADOX's OF).
 fn alu_add(a: u64, b: u64, carry_in: u64, size: u8) -> AluResult {
     let m = mask(size);
     let (a, b) = (a & m, b & m);
-    let wide = a as u128 + b as u128 + carry_in as u128;
-    let res = (wide as u64) & m;
+    let (sum, carry) = a.overflowing_add(b);
+    let (wide, carry_in_out) = sum.overflowing_add(carry_in);
+    let res = wide & m;
     let sb = sign_bit(size);
     AluResult {
         res,
-        cf: (wide >> (size * 8)) & 1 != 0,
-        pf: parity(res),
-        af: ((a & 0xf) + (b & 0xf) + carry_in) & 0x10 != 0,
+        // The carry out of the top bit: the u64 carry at size 8; below it the
+        // masked operands cannot overflow u64, so a carry leaves `wide` above `m`.
+        cf: if size >= 8 {
+            carry | carry_in_out
+        } else {
+            wide > m
+        },
+        pf_src: res as u8,
+        // Bit 4 of `a ^ b ^ res` is the carry out of bit 3 (Flags::af_src).
+        af_src: (a ^ b ^ res) as u8,
         zf: res == 0,
         sf: res & sb != 0,
         // signed overflow: operands same sign, result differs.
@@ -12245,8 +12469,9 @@ fn alu_sub(a: u64, b: u64, borrow_in: u64, size: u8) -> AluResult {
     AluResult {
         res,
         cf: (a as u128) < (b as u128 + borrow_in as u128),
-        pf: parity(res),
-        af: (a & 0xf) < (b & 0xf) + borrow_in,
+        pf_src: res as u8,
+        // Bit 4 of `a ^ b ^ res` is the borrow into bit 3 (Flags::af_src).
+        af_src: (a ^ b ^ res) as u8,
         zf: res == 0,
         sf: res & sb != 0,
         // signed overflow: operands differ in sign, result sign != a's sign.
@@ -12304,8 +12529,8 @@ fn cf_of(res: u64, cf: bool, of: bool) -> AluResult {
     AluResult {
         res,
         cf,
-        pf: false,
-        af: false,
+        pf_src: PF_SRC_ZERO,
+        af_src: AF_SRC_ZERO,
         zf: false,
         sf: false,
         of,
@@ -12318,8 +12543,8 @@ fn shift_result(res: u64, size: u8, cf: bool, of: bool) -> AluResult {
     AluResult {
         res,
         cf,
-        pf: parity(res),
-        af: false,
+        pf_src: res as u8,
+        af_src: AF_SRC_ZERO,
         zf: res == 0,
         sf: res & sign_bit(size) != 0,
         of,
@@ -12332,8 +12557,8 @@ fn alu_logic(res: u64, size: u8) -> AluResult {
     AluResult {
         res,
         cf: false,
-        pf: parity(res),
-        af: false,
+        pf_src: res as u8,
+        af_src: AF_SRC_ZERO,
         zf: res == 0,
         sf: res & sign_bit(size) != 0,
         of: false,
@@ -12349,10 +12574,10 @@ fn apply(flags: &mut Flags, mask: FlagMask, r: &AluResult) {
         flags.cf = r.cf;
     }
     if m & 0b00_0010 != 0 {
-        flags.set_pf(r.pf);
+        flags.pf_src = r.pf_src;
     }
     if m & 0b00_0100 != 0 {
-        flags.set_af(r.af);
+        flags.af_src = r.af_src;
     }
     if m & 0b00_1000 != 0 {
         flags.zf = r.zf;
@@ -13232,6 +13457,64 @@ mod bmi_tests {
         assert_eq!(bmi_result(0b1011, 0b1_0110, 4, Pdep), (0b0_0110, false));
         // pext: pack a's bits at mask positions (1,2,4) low.
         assert_eq!(bmi_result(0b1_0110, 0b1_0110, 4, Pext), (0b111, false));
+    }
+}
+
+/// `AluResult` carries the PF and AF source bytes (`Flags::pf_src`, `af_src`)
+/// rather than the flag values; pins that the bytes decode to the flags SDM Vol 1
+/// §3.4.3.1 defines: PF set when the result's least-significant byte has an even
+/// number of 1 bits, AF set on a carry out of (borrow into) bit 3, and that the
+/// addition's CF is the carry out of the operand width.
+#[cfg(test)]
+mod alu_flag_source_tests {
+    use super::*;
+
+    fn decoded(r: &AluResult) -> (bool, bool) {
+        let mut flags = CpuState::new().flags;
+        apply(&mut flags, FlagMask::ALL, r);
+        (flags.pf(), flags.af())
+    }
+
+    #[test]
+    fn add_and_sub_sources_decode_to_the_defined_pf_and_af() {
+        for size in [1u8, 2, 4, 8] {
+            for a in (0..=0x1ffu64).chain([u64::MAX, 0x8000_0000_0000_000f]) {
+                for b in (0..=0x2fu64).chain([0xff, 0xffff, u64::MAX >> 1]) {
+                    for c in [0, 1] {
+                        let (am, bm) = (a & mask(size), b & mask(size));
+                        let even = |v: u64| (v as u8).count_ones().is_multiple_of(2);
+                        let r = alu_add(a, b, c, size);
+                        let wide = u128::from(am) + u128::from(bm) + u128::from(c);
+                        assert_eq!(r.res, wide as u64 & mask(size));
+                        assert_eq!(
+                            r.cf,
+                            wide >> (size * 8) != 0,
+                            "add {size} {a:#x} {b:#x} {c}"
+                        );
+                        let carry3 = (am & 0xf) + (bm & 0xf) + c > 0xf;
+                        assert_eq!(
+                            decoded(&r),
+                            (even(r.res), carry3),
+                            "add {size} {a:#x} {b:#x} {c}"
+                        );
+                        let r = alu_sub(a, b, c, size);
+                        let borrow3 = (am & 0xf) < (bm & 0xf) + c;
+                        assert_eq!(
+                            decoded(&r),
+                            (even(r.res), borrow3),
+                            "sub {size} {a:#x} {b:#x} {c}"
+                        );
+                    }
+                }
+            }
+        }
+        for v in [0u64, 1, 3, 0x80, 0x1ff, u64::MAX] {
+            let r = alu_logic(v, 8);
+            assert_eq!(
+                decoded(&r),
+                ((v as u8).count_ones().is_multiple_of(2), false)
+            );
+        }
     }
 }
 

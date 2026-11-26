@@ -15,14 +15,16 @@ use iced_x86::Register;
 /// thread-local storage (§3.1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Reg {
+    // Declared in x86 encoding order, so a general-purpose register's
+    // discriminant is its `gpr[]` slot (`Reg::gpr_slot`).
     Rax,
-    Rbx,
     Rcx,
     Rdx,
+    Rbx,
+    Rsp,
+    Rbp,
     Rsi,
     Rdi,
-    Rbp,
-    Rsp,
     R8,
     R9,
     R10,
@@ -70,12 +72,12 @@ impl Reg {
     }
 
     /// Index into [`CpuState::gpr`] in x86 ENCODING order (RAX=0, RCX=1, RDX=2,
-    /// RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8=8 … R15=15) — NOT this enum's
-    /// declaration order. `None` for registers that aren't in `gpr[]`
+    /// RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8=8 … R15=15), which is also this
+    /// enum's declaration order. `None` for registers that aren't in `gpr[]`
     /// (`Rip`/`FsBase`/`GsBase` live in their own `CpuState` fields). (§3.1)
     ///
     /// This and [`iced_gpr_index`] are the ONE place register numbering lives.
-    pub fn gpr_index(self) -> Option<usize> {
+    pub const fn gpr_index(self) -> Option<usize> {
         Some(match self {
             Reg::Rax => 0,
             Reg::Rcx => 1,
@@ -98,7 +100,62 @@ impl Reg {
             Reg::Cs | Reg::Ds | Reg::Es | Reg::Ss => return None,
         })
     }
+
+    /// [`Self::gpr_index`] without the `match`, which compiles to a table load
+    /// or an indirect branch per access: the general-purpose registers are
+    /// declared first and in slot order (checked at compile time below `REGS`).
+    #[inline(always)]
+    pub(crate) fn gpr_slot(self) -> Option<usize> {
+        let slot = self as usize;
+        if slot < 16 {
+            Some(slot)
+        } else {
+            None
+        }
+    }
 }
+
+/// Every [`Reg`], in declaration (discriminant) order.
+const REGS: [Reg; 23] = [
+    Reg::Rax,
+    Reg::Rcx,
+    Reg::Rdx,
+    Reg::Rbx,
+    Reg::Rsp,
+    Reg::Rbp,
+    Reg::Rsi,
+    Reg::Rdi,
+    Reg::R8,
+    Reg::R9,
+    Reg::R10,
+    Reg::R11,
+    Reg::R12,
+    Reg::R13,
+    Reg::R14,
+    Reg::R15,
+    Reg::Rip,
+    Reg::FsBase,
+    Reg::GsBase,
+    Reg::Cs,
+    Reg::Ds,
+    Reg::Es,
+    Reg::Ss,
+];
+
+/// `Reg::gpr_slot` agrees with `Reg::gpr_index`, the one place the numbering
+/// lives: every register's discriminant is its `gpr[]` slot or 16 and above.
+const _: () = {
+    assert!(Reg::Ss as usize + 1 == REGS.len());
+    let mut i = 0;
+    while i < REGS.len() {
+        assert!(REGS[i] as usize == i);
+        match REGS[i].gpr_index() {
+            Some(slot) => assert!(slot == i),
+            None => assert!(i >= 16),
+        }
+        i += 1;
+    }
+};
 
 /// Map an iced `Register` of any width (RAX/EAX/AX/AL/AH, R8/R8D/R8W/R8L, …) to
 /// its [`CpuState::gpr`] index in x86 encoding order. Sub-width and high-byte
@@ -1090,16 +1147,25 @@ impl CpuState {
     /// This asymmetry (4 zero-extends, 1/2 merge) is exactly the trap. High-byte
     /// registers (AH/BH/CH/DH, which write bits 8–15) are NOT expressible here —
     /// the lift rejects them rather than mis-lowering to the low byte.
+    #[inline]
     pub fn write_gpr(&mut self, index: usize, val: u64, size: u8) {
-        let cur = self.gpr[index];
-        self.gpr[index] = match size {
-            8 => val,
-            4 => val & 0xFFFF_FFFF,
-            2 => (cur & !0xFFFF) | (val & 0xFFFF),
-            1 => (cur & !0xFF) | (val & 0xFF),
-            _ => unreachable!("gpr write size must be 1/2/4/8, got {size}"),
+        // The bits taken from `val` by size; zero marks a size that is not 1/2/4/8.
+        const TAKE: [u64; 9] = [0, 0xFF, 0xFFFF, 0, 0xFFFF_FFFF, 0, 0, 0, u64::MAX];
+        let take = match TAKE.get(usize::from(size)) {
+            Some(&take) if take != 0 => take,
+            _ => gpr_write_size(size),
         };
+        // 1/2 merge into the old value; 4/8 replace all of it.
+        let keep = if size < 4 { !take } else { 0 };
+        let cur = self.gpr[index];
+        self.gpr[index] = (cur & keep) | (val & take);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn gpr_write_size(size: u8) -> ! {
+    unreachable!("gpr write size must be 1/2/4/8, got {size}")
 }
 
 /// Ledger namespace of the answers that application walks and locked device
@@ -1180,6 +1246,19 @@ mod tests {
         // 8-byte write replaces everything.
         c.write_gpr(0, 0xDEAD_BEEF_CAFE_BABE, 8);
         assert_eq!(c.gpr[0], 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    #[should_panic(expected = "gpr write size must be 1/2/4/8, got 3")]
+    fn write_gpr_rejects_other_sizes() {
+        CpuState::new().write_gpr(0, 0, 3);
+    }
+
+    #[test]
+    fn gpr_slot_is_gpr_index() {
+        for reg in REGS {
+            assert_eq!(reg.gpr_slot(), reg.gpr_index(), "{reg:?}");
+        }
     }
 
     #[test]
