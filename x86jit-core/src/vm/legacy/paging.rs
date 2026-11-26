@@ -22,6 +22,24 @@ struct Key {
     cr3: u32,
     cr0: u32,
 }
+#[cfg(feature = "test-hooks")]
+impl super::diag::DiagKey for Key {
+    fn site(&self) -> u64 {
+        super::diag::DiagKey::site(&self.decode)
+    }
+    fn fields(&self) -> Vec<(&'static str, u64)> {
+        let mut fields = super::diag::DiagKey::fields(&self.decode);
+        fields.extend([
+            ("class", self.segment_class as u64),
+            ("ordinary", u64::from(self.ordinary)),
+            ("tlb_generation", self.generation),
+            ("cr3", u64::from(self.cr3)),
+            ("cr0", u64::from(self.cr0)),
+        ]);
+        fields
+    }
+}
+
 impl Hash for Key {
     // Every field, packed losslessly: one `BlockHasher` round per word.
     #[inline]
@@ -53,6 +71,8 @@ pub(super) struct State {
     model: Option<LegacyCpuModel>,
     memory: usize,
     blocks: super::proof_map::ProofMap<Key, Proof>,
+    // The key `resolve` last returned a proof for: `holds` looks it up.
+    last: Option<Key>,
     pub(super) lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
@@ -78,12 +98,16 @@ impl State {
     }
 
     /// Whether a proof holds this very block.
+    /// Links record the block the last resolve returned, so its key is
+    /// looked up rather than every proof scanned.
     pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
-        self.blocks.values().any(|proof| Arc::ptr_eq(&proof.ir, ir))
+        self.last
+            .and_then(|key| self.blocks.get(&key))
+            .is_some_and(|proof| Arc::ptr_eq(&proof.ir, ir))
     }
 
     pub(super) fn invalidate(&mut self) {
-        self.blocks.clear();
+        self.blocks.clear(why!(Paging));
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
@@ -102,12 +126,19 @@ impl State {
                 .as_ref()
                 .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
         {
+            self.blocks
+                .reset(vm.cache.proof_generation(), why!(Mapping));
             self.invalidate();
-            self.blocks.reset(vm.cache.proof_generation());
             self.model = Some(model);
             self.memory = memory;
             self.mapping = Some(mapping);
         }
+        // The diagnostics remember a drop across TLB generations.
+        #[cfg(feature = "test-hooks")]
+        self.blocks.set_history_key(|key| Key {
+            generation: 0,
+            ..*key
+        });
         // A write drops the proofs whose bus sources it overlaps.
         self.blocks.reconcile(&vm.cache);
         if self.stamp != Some(stamp) {
@@ -125,7 +156,7 @@ impl State {
                     // Bound context identities as well as blocks. Clear both before
                     // reusing an ID; this does not expire cached translations.
                     if self.contexts.len() == MAX_CONTEXTS {
-                        self.blocks.clear();
+                        self.blocks.clear(why!(Paging));
                         self.contexts.clear();
                         *self.recent = [None; 4];
                     }
@@ -146,7 +177,7 @@ impl State {
     fn reconcile_generation(&mut self) {
         let generation = self.tlb.get_mut().generation;
         if self.generation != generation {
-            self.blocks.clear();
+            self.blocks.clear(why!(Paging));
             self.generation = generation;
         }
     }
@@ -201,6 +232,8 @@ impl State {
         ordinary: bool,
     ) -> Result<(Arc<IrBlock>, bool), Exit> {
         let walk_wrote = Cell::new(false);
+        #[cfg(feature = "test-hooks")]
+        let mut retry = None;
         loop {
             vm.handle_smc(exit_word);
             self.reconcile(vm, cpu, model);
@@ -211,9 +244,19 @@ impl State {
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
                 probe!(PROOFS);
+                self.last = Some(key);
                 return Ok((proof.ir.clone(), proof.ordinary));
             }
             probe!(LIFTS);
+            #[cfg(feature = "test-hooks")]
+            self.blocks.record_lift(
+                vm,
+                super::diag::ProofClass::Paged,
+                &key,
+                retry.take(),
+                key.decode.decode_ip,
+                context,
+            );
             let source = crate::memory::LiftSource::new(&vm.mem);
             let generation = vm.cache.proof_generation();
             let permit = vm.mem.fetch_permit();
@@ -243,6 +286,10 @@ impl State {
                 exit
             })?;
             if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(super::diag::RetryKind::SourceChanged);
+                }
                 continue;
             }
             if let Some(hook) = self.before_publication.take() {
@@ -254,9 +301,23 @@ impl State {
             // A/D CAS can touch executable table storage during this fetch.
             // Its notifications must be drained before physical registration.
             if vm.cache.proof_generation() != generation {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(super::diag::RetryKind::Registration);
+                }
                 continue;
             }
+            #[cfg(feature = "test-hooks")]
+            let promoting = live.promotes();
             if !vm.live_fields.commit(&vm.cache, &vm.mem, live) {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(if promoting {
+                        super::diag::RetryKind::Promotion
+                    } else {
+                        super::diag::RetryKind::Demotion
+                    });
+                }
                 continue;
             }
             self.reconcile_generation();
@@ -265,8 +326,11 @@ impl State {
             let link_exit = super::links::link_exit(&ir);
             let ir = Arc::new(IrBlock { link_exit, ..ir });
             if !source.publishable() {
+                #[cfg(feature = "test-hooks")]
+                vm.live_fields.diag.uncached(super::diag::ProofClass::Paged);
                 // The interpreter may use this snapshot once, without a proof.
-                self.blocks.remove(&key);
+                self.blocks.remove_unpublished(&key);
+                self.last = None;
                 let ir = retry_instruction(&ir, cpu.rip);
                 let ordinary = ordinary && ordinary_block(context, &ir);
                 return Ok((ir, ordinary));
@@ -277,10 +341,16 @@ impl State {
                 registration = Some(vm.mem.register_code_sources(&sources));
             }) || permit.as_ref().is_some_and(|p| !p.is_current())
             {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(super::diag::RetryKind::Registration);
+                }
                 continue;
             }
-            if self.blocks.len() == MAX_BLOCKS && !self.blocks.contains_key(&key) {
-                self.blocks.clear();
+            if !self.blocks.contains_key(&key) {
+                self.blocks.make_room(MAX_BLOCKS, why!(Bound), |proof| {
+                    Arc::strong_count(&proof.ir) > 1
+                });
             }
             self.blocks.insert(
                 key,
@@ -292,6 +362,7 @@ impl State {
                 },
                 &sources,
             );
+            self.last = Some(key);
             return Ok((ir, ordinary));
         }
     }

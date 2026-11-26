@@ -761,6 +761,42 @@ const WRITTEN_LOG: usize = 256;
 #[derive(Default)]
 struct WrittenLog {
     ranges: std::collections::VecDeque<(u64, u64, u64)>,
+    // Every advance's generation, bytes and kind (`advance_kind`), for the
+    // relift diagnostics (xj-to9.53).
+    #[cfg(feature = "test-hooks")]
+    kinds: std::collections::VecDeque<(u64, u64, u64, u8)>,
+}
+
+/// The kind of a publication-generation advance, for the relift diagnostics
+/// (xj-to9.53, `vm/legacy/diag.rs`). An unrecorded advance is a
+/// `Invalidate` unless the advancing call tags it (`Tag`).
+#[cfg(feature = "test-hooks")]
+pub(crate) mod advance_kind {
+    use std::cell::Cell;
+    pub(crate) const STORE: u8 = 0;
+    pub(crate) const PROMOTION: u8 = 1;
+    pub(crate) const INVALIDATE: u8 = 2;
+    pub(crate) const UNRECORDED_DRAIN: u8 = 3;
+    pub(crate) const CHILD: u8 = 4;
+    pub(crate) const RESET: u8 = 5;
+    // Advances retained for the diagnostics.
+    pub(super) const RETAINED: usize = 4096;
+    thread_local! {
+        pub(super) static TAG: Cell<Option<u8>> = const { Cell::new(None) };
+    }
+    /// Tags this thread's advances until dropped.
+    pub(super) struct Tag;
+    impl Tag {
+        pub(super) fn new(kind: u8) -> Self {
+            TAG.with(|t| t.set(Some(kind)));
+            Self
+        }
+    }
+    impl Drop for Tag {
+        fn drop(&mut self) {
+            TAG.with(|t| t.set(None));
+        }
+    }
 }
 
 impl TranslationCache {
@@ -1120,6 +1156,8 @@ impl TranslationCache {
         self.hotness.write().unwrap().clear();
         self.region_decision.write().unwrap().clear();
         // Every source is dropped: no record covers this advance.
+        #[cfg(feature = "test-hooks")]
+        let _tag = advance_kind::Tag::new(advance_kind::RESET);
         self.advance_publication::<false>(0, 0);
         // Closed domains can still own deferred teardown workers. Keep them
         // reachable so VM shutdown joins every replaced backend's workers.
@@ -1199,16 +1237,64 @@ impl TranslationCache {
     // reconciled after the fact (`invalidate_child_written`).
     #[inline(always)]
     fn advance_publication<const RECORD: bool>(&self, lo: u64, hi: u64) {
-        if !RECORD {
+        #[cfg(feature = "test-hooks")]
+        self.advance_publication_for_diag::<RECORD>(lo, hi);
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            if !RECORD {
+                self.publication_generation.fetch_add(1, Ordering::Release);
+                return;
+            }
+            let mut log = self.written_log.lock().unwrap();
+            let generation = self.publication_generation.fetch_add(1, Ordering::Release) + 1;
+            if log.ranges.len() == WRITTEN_LOG {
+                log.ranges.pop_front();
+            }
+            log.ranges.push_back((generation, lo, hi));
+        }
+    }
+
+    // `advance_publication`, also logging every advance's kind once a
+    // private proof exists (`records_written`): only proof maps read the
+    // kinds, and before then an unrecorded advance takes no lock and
+    // allocates nothing, as without the feature.
+    #[cfg(feature = "test-hooks")]
+    fn advance_publication_for_diag<const RECORD: bool>(&self, lo: u64, hi: u64) {
+        if !RECORD && !self.records_written() {
             self.publication_generation.fetch_add(1, Ordering::Release);
             return;
         }
         let mut log = self.written_log.lock().unwrap();
         let generation = self.publication_generation.fetch_add(1, Ordering::Release) + 1;
-        if log.ranges.len() == WRITTEN_LOG {
-            log.ranges.pop_front();
+        if RECORD {
+            if log.ranges.len() == WRITTEN_LOG {
+                log.ranges.pop_front();
+            }
+            log.ranges.push_back((generation, lo, hi));
         }
-        log.ranges.push_back((generation, lo, hi));
+        let default = if RECORD {
+            advance_kind::STORE
+        } else {
+            advance_kind::INVALIDATE
+        };
+        let kind = advance_kind::TAG.with(|t| t.get()).unwrap_or(default);
+        if log.kinds.len() == advance_kind::RETAINED {
+            log.kinds.pop_front();
+        }
+        log.kinds.push_back((generation, lo, hi, kind));
+    }
+
+    /// The advances after `since` up to `until`: their bytes and kind
+    /// (`advance_kind`), for the relift diagnostics. Older advances than
+    /// the diagnostics retain are missing.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn advances_for_diag(&self, since: u64, until: u64) -> Vec<(u64, u64, u8)> {
+        let log = self.written_log.lock().unwrap();
+        log.kinds
+            .iter()
+            .filter(|&&(g, ..)| since < g && g <= until)
+            .map(|&(_, lo, hi, kind)| (lo, hi, kind))
+            .collect()
     }
 
     /// Whether drained writes should go through
@@ -1676,6 +1762,8 @@ impl TranslationCache {
     /// may no longer hold (they may bake the field), so it may record.
     pub(crate) fn advance_for_promotion(&self, lo: u64, hi: u64) {
         let _spans = self.spans.read().unwrap();
+        #[cfg(feature = "test-hooks")]
+        let _tag = advance_kind::Tag::new(advance_kind::PROMOTION);
         self.advance_publication::<true>(lo, hi);
     }
 
@@ -1733,6 +1821,8 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
+        #[cfg(feature = "test-hooks")]
+        let _tag = advance_kind::Tag::new(advance_kind::CHILD);
         self.invalidate_range::<true, false>(lo, hi, |empty| {
             if empty {
                 on_clear_page();
@@ -1747,6 +1837,8 @@ impl TranslationCache {
         hi: u64,
         on_write: impl FnOnce(bool),
     ) -> Vec<BlockKey> {
+        #[cfg(feature = "test-hooks")]
+        let _tag = advance_kind::Tag::new(advance_kind::UNRECORDED_DRAIN);
         self.invalidate_range::<false, false>(lo, hi, on_write)
     }
 

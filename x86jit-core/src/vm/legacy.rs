@@ -14,6 +14,8 @@ use std::hash::{Hash, Hasher};
 mod nmi;
 mod paging;
 
+#[cfg(feature = "test-hooks")]
+pub(crate) mod diag;
 mod flat32;
 pub(super) mod links;
 pub(super) mod live;
@@ -58,6 +60,22 @@ macro_rules! probe {
 }
 use probe;
 
+/// A proof-map drop cause (`proof_map::Why`): the named
+/// `diag::ReliftCause` with `test-hooks`, `()` otherwise.
+#[cfg(feature = "test-hooks")]
+macro_rules! why {
+    ($($cause:tt)*) => {
+        crate::vm::legacy::diag::ReliftCause::$($cause)*
+    };
+}
+#[cfg(not(feature = "test-hooks"))]
+macro_rules! why {
+    ($($cause:tt)*) => {
+        ()
+    };
+}
+use why;
+
 impl Vcpu {
     /// Thread-local Machine dispatch counters since the last call: blocks
     /// executed, context reselections, lifts, proof hits, the op walks of
@@ -86,6 +104,26 @@ impl Vcpu {
 // so the stamp carries no cached hash.
 type EngineMap<K, V> =
     HashMap<K, V, std::hash::BuildHasherDefault<crate::cache::cache_hash::BlockHasher>>;
+
+#[cfg(feature = "test-hooks")]
+impl diag::DiagKey for LegacyBlockKey {
+    fn site(&self) -> u64 {
+        u64::from(self.linear_fetch)
+    }
+    fn fields(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("owner", self.owner_id),
+            ("context", self.context_id),
+            ("model", self.model_semantics_id),
+            ("decode_bits", u64::from(self.decode_bits)),
+            ("stack_bits", u64::from(self.stack_bits)),
+            ("regime", self.regime as u64),
+            ("ip", u64::from(self.decode_ip)),
+            ("linear", u64::from(self.linear_fetch)),
+            ("mxcsr_mode", u64::from(self.mxcsr_mode)),
+        ]
+    }
+}
 
 // The retained context stamp guards the segment class. Flat32 and paging
 // also own separate proof maps, so the shared key need not hash that class.
@@ -137,7 +175,68 @@ impl PartialEq for LegacyContextStamp {
             && self.system_flags == other.system_flags
     }
 }
+#[cfg(feature = "test-hooks")]
 impl LegacyContextStamp {
+    /// Every guarded field, named, for the relift diagnostics (xj-to9.53).
+    fn diag_fields(&self) -> Vec<(&'static str, String)> {
+        const SELECTORS: [&str; 6] = ["cs", "ds", "es", "ss", "fs", "gs"];
+        const CACHES: [&str; 6] = [
+            "cs.cache", "ds.cache", "es.cache", "ss.cache", "fs.cache", "gs.cache",
+        ];
+        let s = &self.state;
+        let cache = |c: &crate::legacy::SegmentCache| {
+            format!(
+                "{:x}/{:x}/{:x}{}{}",
+                c.base,
+                c.limit,
+                c.attributes,
+                if c.unusable != 0 { "/unusable" } else { "" },
+                if c.reserved != 0 { "/reserved" } else { "" }
+            )
+        };
+        let system =
+            |t: &crate::legacy::SystemSegment| format!("{:x}:{}", t.selector, cache(&t.cache));
+        let mut fields = vec![
+            ("model", format!("{:x}", self.model.model_semantics_id)),
+            ("cr0", format!("{:x}", s.cr0)),
+            ("cr3", format!("{:x}", s.cr3)),
+            ("gdtr", format!("{:x}/{:x}", s.gdtr.base, s.gdtr.limit)),
+            ("idtr", format!("{:x}/{:x}", s.idtr.base, s.idtr.limit)),
+            ("ldtr", system(&s.ldtr)),
+            ("tr", system(&s.tr)),
+            ("cpl", s.cpl.to_string()),
+            ("a20", s.a20_enabled.to_string()),
+            ("reset_fetch", s.reset_fetch.to_string()),
+            ("reserved", s.reserved.to_string()),
+            ("eflags", format!("{:x}", self.system_flags)),
+        ];
+        for i in 0..6 {
+            fields.push((SELECTORS[i], format!("{:x}", self.selectors[i])));
+            fields.push((CACHES[i], cache(&s.segments[i])));
+        }
+        fields
+    }
+}
+
+impl LegacyContextStamp {
+    /// The stamp a context identity of `class` names (xj-to9.53). Flat32
+    /// IR reads FS and GS only through checked `Address` ops of their live
+    /// caches (`lift::legacy::flat32_addresses`), and their caches take no
+    /// part in Flat32 admission (`legacy::derive_context` reads CS, DS, ES
+    /// and SS), so Flat32 identities leave both segments out: code that
+    /// reloads FS or GS keeps one identity and its proofs. Every other class
+    /// keeps the whole stamp: Segmented proofs bake FS and GS caches
+    /// (`flat32::specialize_segments`).
+    fn identity(mut self, class: crate::SegmentClass) -> Self {
+        if class == crate::SegmentClass::Flat32 {
+            for i in [SegmentId::Fs as usize, SegmentId::Gs as usize] {
+                self.selectors[i] = 0;
+                self.state.segments[i] = crate::legacy::SegmentCache::default();
+            }
+        }
+        self
+    }
+
     fn new(cpu: &CpuState, model: LegacyCpuModel) -> Self {
         let mut state = cpu.legacy;
         state.cr2 = 0; // Output register, not a translation assumption.
@@ -207,9 +306,12 @@ impl LegacyContextStamp {
         diff == 0
     }
 }
-// Decision-20: the firmware-style transition loop uses four contexts. Sixteen
-// leaves room for a handful of code/stack configurations while bounding churn.
-const MAX_RETAINED_CONTEXTS: usize = 16;
+// Decision-20: the firmware-style transition loop uses four contexts. An
+// extended-memory runtime's interrupt reflection walks through more than
+// sixteen stamps (code, data and stack selectors, CR0.PE, IDTR) on every
+// reflection (xj-to9.53); 64 keeps their identities, and so their proofs'
+// keys, stable while still bounding churn.
+const MAX_RETAINED_CONTEXTS: usize = 64;
 const RECENT_CONTEXTS: usize = 4;
 
 struct RetainedContext {
@@ -765,7 +867,11 @@ impl Execution {
         force: bool,
         class: crate::SegmentClass,
     ) {
-        let stamp = LegacyContextStamp::new(cpu, model);
+        let stamp = LegacyContextStamp::new(cpu, model).identity(class);
+        #[cfg(feature = "test-hooks")]
+        if self.stamp != Some(stamp) {
+            diag::note_context(diag::ContextNote::Switch);
+        }
         if force || self.stamp != Some(stamp) {
             self.context_epoch = if let Some(next) = self.context_epoch.checked_add(1) {
                 next
@@ -785,11 +891,15 @@ impl Execution {
                 .iter()
                 .position(|r| r.as_ref().is_some_and(|(s, ..)| *s == stamp))
             {
+                #[cfg(feature = "test-hooks")]
+                diag::note_context(diag::ContextNote::Recent);
                 self.recent[..=slot].rotate_right(1);
                 let entry = self.recent[0].as_mut().unwrap();
                 entry.2 = self.context_epoch;
                 entry.1
             } else if let Some(context) = self.contexts.get_mut(&stamp) {
+                #[cfg(feature = "test-hooks")]
+                diag::note_context(diag::ContextNote::Retained);
                 context.last_used = self.context_epoch;
                 let id = context.id;
                 self.remember_recent(stamp, id);
@@ -816,10 +926,21 @@ impl Execution {
                     self.links.clear();
                     self.blocks.retain(|key, _| key.context_id != evicted.id);
                     self.flat32.evict_context(evicted.id);
+                    #[cfg(feature = "test-hooks")]
+                    diag::note_context(diag::ContextNote::Evicted {
+                        id: evicted.id,
+                        fields: oldest.diag_fields(),
+                    });
                     evicted.id
                 } else {
                     self.contexts.len() as u64
                 };
+                #[cfg(feature = "test-hooks")]
+                diag::note_context(diag::ContextNote::Created {
+                    id,
+                    previous: self.stamp.map(|s| s.diag_fields()),
+                    fields: stamp.diag_fields(),
+                });
                 self.contexts.insert(
                     stamp,
                     RetainedContext {
@@ -848,6 +969,8 @@ impl Execution {
         context: MachineContext,
         _exit_word: &AtomicU64,
     ) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
+        #[cfg(feature = "test-hooks")]
+        diag::drain_contexts(&vm.live_fields.diag);
         if self.task_switch.context().is_some() {
             if let Some(retry) = &self.instruction_retry {
                 return Ok((retry.ir.clone(), retry.walk));
@@ -3699,6 +3822,8 @@ impl Vcpu {
                             probe!(RESELECTIONS);
                             let execution = self.legacy_execution.as_mut().unwrap();
                             if outcome.translations_invalidated {
+                                #[cfg(feature = "test-hooks")]
+                                diag::note_context(diag::ContextNote::Invalidated);
                                 execution.invalidate_translations();
                             }
                             context = match self.legacy_context_for_run() {

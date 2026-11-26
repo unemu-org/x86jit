@@ -43,6 +43,13 @@ impl Execution {
     }
 }
 
+/// Proofs retained per vCPU (xj-to9.53): a program's working set across
+/// its renderer, game logic and an extended-memory runtime's interrupt
+/// path, which enters its blocks under many contexts, exceeds 256 blocks.
+/// A proof is its IR (72 bytes per op, about 2–8 KiB for a typical block)
+/// and a counted source registration.
+const MAX_PROOFS: usize = 1024;
+
 struct Proof {
     ir: Arc<IrBlock>,
     walk: BlockWalk,
@@ -54,6 +61,8 @@ struct Proof {
 pub(super) struct State {
     mapping: Option<Arc<()>>,
     blocks: super::proof_map::ProofMap<LegacyBlockKey, Proof>,
+    // The key `resolve` last returned a proof for: `holds` looks it up.
+    last: Option<LegacyBlockKey>,
     #[cfg(test)]
     pub(super) lifts: u64,
 }
@@ -65,15 +74,20 @@ impl State {
         self.blocks.version()
     }
 
-    /// Whether a proof holds this very block.
+    /// Whether a proof holds this very block. Links record the block the
+    /// last resolve returned, so its key is looked up rather than every
+    /// proof scanned.
     pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
-        self.blocks.values().any(|proof| Arc::ptr_eq(&proof.ir, ir))
+        self.last
+            .and_then(|key| self.blocks.get(&key))
+            .is_some_and(|proof| Arc::ptr_eq(&proof.ir, ir))
     }
 
     #[cold]
     #[inline(never)]
     pub(super) fn evict_context(&mut self, id: u64) {
-        self.blocks.retain(|key| key.context_id != id);
+        self.blocks
+            .retain(|key| key.context_id != id, why!(ContextEvicted));
     }
 
     #[cold]
@@ -86,6 +100,10 @@ impl State {
         key: LegacyBlockKey,
         exit_word: &AtomicU64,
     ) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
+        #[cfg(feature = "test-hooks")]
+        let class = super::diag::ProofClass::of(context.segment_class, false);
+        #[cfg(feature = "test-hooks")]
+        let mut retry = None;
         loop {
             vm.handle_smc(exit_word);
             let mapping = vm.mem.mapping_identity();
@@ -94,7 +112,8 @@ impl State {
                 .as_ref()
                 .is_none_or(|old| !Arc::ptr_eq(old, &mapping))
             {
-                self.blocks.reset(vm.cache.proof_generation());
+                self.blocks
+                    .reset(vm.cache.proof_generation(), why!(Mapping));
                 self.mapping = Some(mapping);
             }
             // A write drops the proofs whose physical sources it overlaps.
@@ -105,9 +124,13 @@ impl State {
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
                 probe!(PROOFS);
+                self.last = Some(key);
                 return Ok((proof.ir.clone(), proof.walk));
             }
             probe!(LIFTS);
+            #[cfg(feature = "test-hooks")]
+            self.blocks
+                .record_lift(vm, class, &key, retry.take(), key.decode_ip, context);
             #[cfg(test)]
             {
                 self.lifts += 1;
@@ -117,10 +140,17 @@ impl State {
             let mut live = super::live::Plan::default();
             let ir = lift(vm, cpu, context, &source, &mut live)?;
             if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(super::diag::RetryKind::SourceChanged);
+                }
                 continue;
             }
             if !source.publishable() {
-                self.blocks.remove(&key);
+                #[cfg(feature = "test-hooks")]
+                vm.live_fields.diag.uncached(class);
+                self.blocks.remove_unpublished(&key);
+                self.last = None;
                 let CachedBlock::Interpreted(ir) = source.uncached(ir) else {
                     unreachable!()
                 };
@@ -134,7 +164,17 @@ impl State {
             #[cfg(test)]
             vm.after_source_read();
             vm.handle_smc(exit_word);
+            #[cfg(feature = "test-hooks")]
+            let promoting = live.promotes();
             if !vm.live_fields.commit(&vm.cache, &vm.mem, live) {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(if promoting {
+                        super::diag::RetryKind::Promotion
+                    } else {
+                        super::diag::RetryKind::Demotion
+                    });
+                }
                 continue;
             }
             let mut sources = Vec::new();
@@ -164,13 +204,17 @@ impl State {
                 registration = Some(vm.mem.register_code_sources(&sources));
             }) || permit.as_ref().is_some_and(|p| !p.is_current())
             {
+                #[cfg(feature = "test-hooks")]
+                {
+                    retry = Some(super::diag::RetryKind::Registration);
+                }
                 continue;
             }
             // Keep retention bounded independently of the context LRU. Each
             // proof owns its counted physical registration until eviction.
-            if self.blocks.len() == 64 {
-                self.blocks.clear();
-            }
+            self.blocks.make_room(MAX_PROOFS, why!(Bound), |proof| {
+                Arc::strong_count(&proof.ir) > 1
+            });
             let link_exit = super::links::link_exit(&ir);
             let ir = Arc::new(IrBlock { link_exit, ..ir });
             self.blocks.insert(
@@ -183,6 +227,7 @@ impl State {
                 },
                 &sources,
             );
+            self.last = Some(key);
             return Ok((ir, walk));
         }
     }
@@ -489,6 +534,78 @@ mod tests {
                 assert_eq!(execution.flat32.lifts, 5);
             }
         }
+    }
+
+    // xj-to9.53: a working set of more blocks than the old bound of 64
+    // proofs relifted every block it entered once the map cleared.
+    #[test]
+    fn a_working_set_past_the_bound_keeps_most_of_its_proofs() {
+        for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
+            let model = crate::CpuModel::I80486Dx;
+            let (vm, mut cpu, context) = proof_fixture(model, class);
+            // INC EAX; JMP $+2, 1300 times from 0x2000.
+            vm.write_bytes(0x2000, &b"\x40\xeb\x00".repeat(1300))
+                .unwrap();
+            let exit = AtomicU64::new(0);
+            for (blocks, most) in [(80, 0), (300, 0), (1300, 650)] {
+                let mut execution = Execution::new();
+                execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+                let mut pass = |e: &mut Execution| {
+                    let before = e.flat32.lifts;
+                    for i in 0..blocks {
+                        resolve_at(e, &vm, &mut cpu, context, &exit, 0x2000 + 3 * i);
+                    }
+                    e.flat32.lifts - before
+                };
+                assert_eq!(pass(&mut execution), blocks);
+                let again = pass(&mut execution);
+                assert!(again <= most, "{class:?}: {again} of {blocks} relifted");
+            }
+        }
+    }
+
+    // xj-to9.53: a full map evicts the proofs no lookup returned since its
+    // last sweep first. Twenty hot blocks entered between blocks entered
+    // once (an interrupt path through many contexts) stay proved.
+    #[test]
+    fn a_flood_of_cold_blocks_keeps_the_hot_proofs() {
+        let model = crate::CpuModel::I80486Dx;
+        let class = crate::SegmentClass::Flat32;
+        let (vm, mut cpu, context) = proof_fixture(model, class);
+        // INC EAX; JMP $+2: 1300 cold blocks from 0x2000 and 20 hot ones
+        // from 0x3800.
+        vm.write_bytes(0x2000, &b"\x40\xeb\x00".repeat(1300))
+            .unwrap();
+        vm.write_bytes(0x3800, &b"\x40\xeb\x00".repeat(20)).unwrap();
+        let exit = AtomicU64::new(0);
+        let mut execution = Execution::new();
+        execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+        let mut hot_lifts = 0;
+        for i in 0..1300 {
+            if i % 10 == 0 {
+                for h in 0..20 {
+                    let before = execution.flat32.lifts;
+                    resolve_at(
+                        &mut execution,
+                        &vm,
+                        &mut cpu,
+                        context,
+                        &exit,
+                        0x3800 + 3 * h,
+                    );
+                    hot_lifts += execution.flat32.lifts - before;
+                }
+            }
+            resolve_at(
+                &mut execution,
+                &vm,
+                &mut cpu,
+                context,
+                &exit,
+                0x2000 + 3 * i,
+            );
+        }
+        assert_eq!(hot_lifts, 20, "only the first lift of each hot block");
     }
 
     #[test]

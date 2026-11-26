@@ -254,4 +254,9 @@ pub use vm::{
     SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest,
     TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
+#[cfg(feature = "test-hooks")]
+pub use vm::{
+    GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
+    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
+};
 pub use x87::FpuKind;

@@ -185,6 +185,13 @@ REVIEWED_ENTRY_POINTS = {
         "lift::legacy::instruction_for_profile", "lift::legacy::live_fields",
         "lift::legacy::live_instruction", "model::CpuModel", "model::ModelProfile",
     },
+    "x86jit-core/src/vm/legacy/diag.rs": {
+        # The test-hooks-only relift diagnostics (xj-to9.53): reached from the
+        # Flat32, Segmented and paged Machine proof lifts and `live.rs`; they
+        # classify a store against the live-capable fields with the Machine
+        # decoder options.
+        "lift::legacy::ProbeRefusal", "lift::legacy::live_fields", "model::decode",
+    },
 }
 
 # Legacy functions that Long64 and Compat32 execution calls, pinned by their

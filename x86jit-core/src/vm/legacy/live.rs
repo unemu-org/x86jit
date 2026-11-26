@@ -86,6 +86,17 @@ pub(crate) struct LiveFields {
     /// queued and drained, as before xj-to9.48.
     #[cfg(test)]
     drained: AtomicBool,
+    /// The VM's relift diagnostics (xj-to9.53).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) diag: super::diag::Diag,
+}
+
+/// Count a live-field event in the VM's relift diagnostics.
+macro_rules! live_probe {
+    ($self:expr, $counter:ident) => {
+        #[cfg(feature = "test-hooks")]
+        $self.diag.live(super::diag::Live::$counter);
+    };
 }
 
 // The VM of this thread's Machine run that may absorb a store at its store
@@ -235,18 +246,28 @@ impl LiveFields {
         }
         self.active.store(true, Ordering::Relaxed);
         let mut table = self.table.lock().unwrap();
+        #[cfg(feature = "test-hooks")]
+        let before = table.live.len();
         let settled = table.settle(lo, hi);
+        #[cfg(feature = "test-hooks")]
+        for _ in table.live.len()..before {
+            self.diag.demote(super::diag::LiveDemotion::StoreAround);
+        }
         self.sync(&table, memory);
         if settled.is_some() {
             if cache.absorb_written(lo, hi) {
+                live_probe!(self, Absorbed);
                 return true;
             }
+            live_probe!(self, SharedCovered);
             // A shared translation covers the field: invalidate as before.
             return false;
         }
         if table.writes.len() == MAX_WRITES && !table.writes.contains_key(&lo) {
+            live_probe!(self, CountClears);
             table.writes.clear();
         }
+        live_probe!(self, Counted);
         let count = table.writes.entry(lo).or_insert((hi, 0));
         if count.0 != hi {
             *count = (hi, 0);
@@ -283,17 +304,33 @@ impl LiveFields {
         // Under the table lock, as in `absorb`: a field is absorbed only once
         // its promotion is committed (`commit`).
         let mut table = self.table.lock().unwrap();
+        #[cfg(feature = "test-hooks")]
+        let before = table.live.len();
         let settled = table.settle(lo, hi);
+        #[cfg(feature = "test-hooks")]
+        for _ in table.live.len()..before {
+            self.diag.demote(super::diag::LiveDemotion::StoreAround);
+        }
         self.sync(&table, memory);
-        settled.is_some() && cache.absorb_written(lo, hi)
+        let absorbed = settled.is_some() && cache.absorb_written(lo, hi);
+        if absorbed {
+            live_probe!(self, Absorbed);
+        }
+        absorbed
     }
 
     #[cold]
     fn demote_overlapping(&self, memory: &crate::Memory, lo: u64, hi: u64) {
         let mut table = self.table.lock().unwrap();
+        #[cfg(feature = "test-hooks")]
+        let before = table.live.len();
         table
             .live
             .retain(|_, field| !(lo < field.instruction.1 && hi.max(lo + 1) > field.instruction.0));
+        #[cfg(feature = "test-hooks")]
+        for _ in table.live.len()..before {
+            self.diag.demote(super::diag::LiveDemotion::WideStore);
+        }
         self.sync(&table, memory);
     }
 
@@ -334,7 +371,9 @@ impl LiveFields {
         if !self.armed.load(Ordering::Relaxed) {
             self.armed.store(true, Ordering::Relaxed);
         }
+        live_probe!(self, Calls);
         if !self.active.load(Ordering::Relaxed) || code.is_empty() {
+            live_probe!(self, Inactive);
             return plain();
         }
         let first = bus(0);
@@ -356,6 +395,7 @@ impl LiveFields {
                 page.min(lo).saturating_sub(MAX_WRITE),
                 (page + 0x1000).max(hi),
             );
+            live_probe!(self, Snapshots);
             let table = self.table.lock().unwrap();
             plan.snapshot = Snapshot {
                 range,
@@ -403,8 +443,10 @@ impl LiveFields {
                 .any(|&(lo, hi)| (0..code.len() as u32).any(|i| (lo..hi).contains(&bus(i))))
         };
         if overlapping.is_empty() && !patched_here {
+            live_probe!(self, Plain);
             return plain();
         }
+        live_probe!(self, Slow);
         let fields = contiguous
             .then(|| crate::lift::legacy::live_fields(code, ip, context))
             .flatten();
@@ -447,18 +489,36 @@ impl LiveFields {
             };
             if inside && !read_live {
                 plan.refuse.push((lo, hi));
+                #[cfg(feature = "test-hooks")]
+                self.refused(
+                    if !contiguous {
+                        super::diag::LiveRefusal::NonContiguous
+                    } else if fields.is_none() {
+                        super::diag::LiveRefusal::IneligibleForm
+                    } else {
+                        super::diag::LiveRefusal::OutsideField
+                    },
+                    (lo, hi),
+                    first,
+                    code,
+                    ip,
+                    context,
+                );
             }
         }
         // A live field this lift would bake must return to normal.
         for start in overlapping {
             if !requested.contains(&Some(start)) && !plan.demote.contains(&start) {
+                #[cfg(feature = "test-hooks")]
+                self.diag.demote(super::diag::LiveDemotion::Baked);
                 plan.demote.push(start);
             }
         }
         let Some(fields) = fields.filter(|_| requested.iter().any(Option::is_some)) else {
             return plain();
         };
-        if let Some(ir) = crate::lift::legacy::live_instruction(
+        live_probe!(self, Probes);
+        let probed = crate::lift::legacy::live_instruction(
             code,
             ip,
             context,
@@ -466,7 +526,11 @@ impl LiveFields {
             alignment_mask,
             fields,
             requested,
-        ) {
+        );
+        #[cfg(feature = "test-hooks")]
+        let refusal = probed.as_ref().err().copied();
+        if let Ok(ir) = probed {
+            live_probe!(self, Lowered);
             for (kind, start) in requested.iter().enumerate() {
                 if let (Some(start), true, Some((_, bytes))) =
                     (*start, fresh[kind], fields.fields[kind])
@@ -491,8 +555,21 @@ impl LiveFields {
                         .patched
                         .iter()
                         .filter(|&&(lo, hi)| start <= lo && hi <= end);
+                    #[cfg(feature = "test-hooks")]
+                    for &range in inside.clone() {
+                        self.refused(
+                            super::diag::LiveRefusal::Probe(refusal.unwrap().into()),
+                            range,
+                            first,
+                            code,
+                            ip,
+                            context,
+                        );
+                    }
                     plan.refuse.extend(inside);
                 } else {
+                    #[cfg(feature = "test-hooks")]
+                    self.diag.demote(super::diag::LiveDemotion::ProbeFailed);
                     plan.demote.push(start);
                 }
             }
@@ -543,10 +620,21 @@ impl LiveFields {
                 });
             }
             if table.live.len() < MAX_LIVE || table.live.contains_key(&start) {
+                live_probe!(self, Promotions);
                 table.clear_writes(start, field.end);
                 table.reach = table.reach.max(field.instruction.1 - field.instruction.0);
                 table.live.insert(start, field);
             } else {
+                #[cfg(feature = "test-hooks")]
+                self.diag.refuse(super::diag::RefusalRecord {
+                    reason: super::diag::LiveRefusal::TableFull,
+                    patched: (start, (field.end - start) as u32),
+                    instruction: (
+                        field.instruction.0,
+                        Vec::new(),
+                        String::from("(live table full)"),
+                    ),
+                });
                 // A table of live code promotes nothing more: those fields
                 // keep the ordinary relift, and are not examined again.
                 for (_, count) in table.writes.range_mut(start..field.end) {
@@ -558,6 +646,46 @@ impl LiveFields {
         self.sync(&table, memory);
         drop(table);
         plan.demote.is_empty() && !promoted
+    }
+}
+
+impl Plan {
+    /// Whether committing this plan promotes a field.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn promotes(&self) -> bool {
+        !self.promote.is_empty()
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl LiveFields {
+    #[allow(clippy::too_many_arguments)]
+    fn refused(
+        &self,
+        reason: super::diag::LiveRefusal,
+        (lo, hi): (u64, u64),
+        first: u64,
+        code: &[u8],
+        ip: u32,
+        context: MachineContext,
+    ) {
+        let (len, text) = super::diag::text(code, ip, context.default_operand_bits);
+        self.diag.refuse(super::diag::RefusalRecord {
+            reason,
+            patched: (lo, (hi - lo) as u32),
+            instruction: (first, code[..len.clamp(1, code.len())].to_vec(), text),
+        });
+    }
+
+    /// The table's sizes: live fields, counted ranges, refused ranges.
+    pub(crate) fn table_sizes(&self) -> (usize, usize, usize) {
+        let table = self.table.lock().unwrap();
+        let refused = table
+            .writes
+            .values()
+            .filter(|&&(_, c)| c == REFUSED)
+            .count();
+        (table.live.len(), table.writes.len() - refused, refused)
     }
 }
 

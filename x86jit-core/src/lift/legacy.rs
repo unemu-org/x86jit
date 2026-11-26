@@ -147,11 +147,22 @@ fn decoded_field(code: &[u8], ip: u32, context: MachineContext, kind: LiveFieldK
     }
 }
 
+/// Why `live_instruction` refused a field (the relift diagnostics read it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeRefusal {
+    Length,
+    Extension,
+    NoLiveRead,
+    Trap,
+    ValueDependent,
+    LiftFailed,
+}
+
 /// The instruction at the start of `code` with each `requested` field
 /// (`LiveFields::fields` index → the bus address of its first byte) read
-/// when it executes, or `None` when that cannot be exact. Exactness is
-/// checked, not assumed: the field's extension must reproduce the decoder's
-/// value, and the lift must be identical for the field's current bytes, their
+/// when it executes, or why that cannot be exact. Exactness is checked, not
+/// assumed: the field's extension must reproduce the decoder's value, and
+/// the lift must be identical for the field's current bytes, their
 /// complement and zero, so no op other than `LiveField` depends on them.
 #[cold]
 #[inline(never)]
@@ -163,9 +174,9 @@ pub(crate) fn live_instruction(
     alignment_mask: bool,
     fields: LiveFields,
     requested: [Option<u64>; 2],
-) -> Option<IrBlock> {
+) -> Result<IrBlock, ProbeRefusal> {
     if code.len() != usize::from(fields.len) {
-        return None;
+        return Err(ProbeRefusal::Length);
     }
     let probe = |fill: fn(u8) -> u8| {
         let mut probe = code.to_vec();
@@ -190,14 +201,17 @@ pub(crate) fn live_instruction(
             continue;
         };
         let range = usize::from(offset)..usize::from(offset + bytes);
-        let extend = [0, 64, 32, 16].into_iter().find(|&extend| {
-            probes.iter().all(|code| {
-                let mut raw = [0; 8];
-                raw[..range.len()].copy_from_slice(&code[range.clone()]);
-                crate::legacy::live_field_value(u64::from_le_bytes(raw), bytes, extend)
-                    == decoded_field(code, ip, context, kind)
+        let extend = [0, 64, 32, 16]
+            .into_iter()
+            .find(|&extend| {
+                probes.iter().all(|code| {
+                    let mut raw = [0; 8];
+                    raw[..range.len()].copy_from_slice(&code[range.clone()]);
+                    crate::legacy::live_field_value(u64::from_le_bytes(raw), bytes, extend)
+                        == decoded_field(code, ip, context, kind)
+                })
             })
-        })?;
+            .ok_or(ProbeRefusal::Extension)?;
         *slot = Some((LiveSpec { bus, bytes, extend }, None));
     }
     let mut lifts = probes.iter().map(|code| {
@@ -210,31 +224,36 @@ pub(crate) fn live_instruction(
             Some(Box::new(live)),
         )
     });
-    let first = lifts.next()?.ok()?;
+    let first = lifts
+        .next()
+        .unwrap()
+        .map_err(|_| ProbeRefusal::LiftFailed)?;
     let image = format!("{:?}", first.ops);
     if !first
         .ops
         .iter()
         .any(|op| matches!(op, IrOp::Legacy(L::LiveField { .. })))
-        || first.ops.iter().any(|op| {
-            matches!(
-                op,
-                IrOp::Trap { .. } | IrOp::Unsupported { .. } | IrOp::Legacy(L::Refuse { .. })
-            )
-        })
     {
-        return None;
+        return Err(ProbeRefusal::NoLiveRead);
+    }
+    if first.ops.iter().any(|op| {
+        matches!(
+            op,
+            IrOp::Trap { .. } | IrOp::Unsupported { .. } | IrOp::Legacy(L::Refuse { .. })
+        )
+    }) {
+        return Err(ProbeRefusal::Trap);
     }
     for lift in lifts {
-        let lift = lift.ok()?;
+        let lift = lift.map_err(|_| ProbeRefusal::LiftFailed)?;
         if lift.guest_len != first.guest_len
             || lift.temp_count != first.temp_count
             || format!("{:?}", lift.ops) != image
         {
-            return None;
+            return Err(ProbeRefusal::ValueDependent);
         }
     }
-    Some(first)
+    Ok(first)
 }
 
 // The live-field exactness witness: a lowering that bakes its immediate
@@ -302,7 +321,7 @@ mod live_tests {
         let requested = [Some(0x1001), None];
         for (bake, live) in [(0, true), (1, false), (2, false)] {
             BAKE.with(|b| b.set(bake));
-            let ir = live_instruction(code, 0x1000, context, profile, true, fields, requested);
+            let ir = live_instruction(code, 0x1000, context, profile, true, fields, requested).ok();
             BAKE.with(|b| b.set(0));
             assert_eq!(ir.is_some(), live, "bake {bake}");
         }

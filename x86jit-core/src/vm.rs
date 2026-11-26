@@ -18,6 +18,11 @@ use crate::jit_abi::{
 pub(crate) mod device;
 mod i8086;
 mod legacy;
+#[cfg(feature = "test-hooks")]
+pub use legacy::diag::{
+    GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
+    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
+};
 pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;
 mod nec;
@@ -1675,6 +1680,21 @@ impl Vm {
     /// atomic journal. Both expand writes through declared aliases when drained.
     /// Registration/publication also drain here: a queued notification has not yet
     /// advanced the source generation or canceled pending source spans.
+    /// Relift diagnostics of this VM's Machine private proofs (xj-to9.53),
+    /// compiled only with the `test-hooks` feature: Flat32, Segmented and
+    /// paged proof lifts by cause, live-field statistics, and the last 64
+    /// relifts and refused fields with the bytes and text of the instruction
+    /// a triggering store hit. Print it with `{}`. With `take`, every
+    /// counter and ring restarts from zero (the table sizes are current
+    /// values). Counting costs a little: run cost measurements without the
+    /// feature.
+    #[cfg(feature = "test-hooks")]
+    pub fn relift_diagnostics(&self, take: bool) -> ReliftDiagnostics {
+        self.live_fields
+            .diag
+            .snapshot(take, self.live_fields.table_sizes())
+    }
+
     fn handle_smc(&self, word: &AtomicU64) {
         self.mem.dispatch_smc(word, |dirty| {
             // Once a private proof exists, record the written bytes, so

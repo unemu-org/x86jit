@@ -3,7 +3,8 @@
 use super::*;
 
 // A proof and its registered source byte ranges `[lo, hi)`.
-type Entry<V> = (V, Box<[(u64, u64)]>);
+// and whether a lookup returned it since the last eviction sweep.
+type Entry<V> = (V, Box<[(u64, u64)]>, std::cell::Cell<bool>);
 
 /// A per-vCPU proof map with a page index of each proof's registered source
 /// bytes (xj-to9.45). A source-generation advance drops only the proofs whose
@@ -23,7 +24,33 @@ pub(super) struct ProofMap<K, V> {
 struct SourceIndex<K> {
     pages: EngineMap<u64, Vec<K>>,
     written: Vec<(u64, u64)>,
+    // Why each dropped proof went, for the relift diagnostics (xj-to9.53).
+    #[cfg(feature = "test-hooks")]
+    history: EngineMap<K, Dropped>,
+    // The history's key for a proof's key (`set_history_key`).
+    #[cfg(feature = "test-hooks")]
+    history_key: Option<fn(&K) -> K>,
 }
+
+/// Why a proof left the map (`ProofMap::dropped`), with the store that
+/// dropped it and its registered source bytes.
+#[cfg(feature = "test-hooks")]
+pub(super) struct Dropped {
+    pub(super) cause: super::diag::ReliftCause,
+    pub(super) write: Option<(u64, u64)>,
+    pub(super) sources: Box<[(u64, u64)]>,
+}
+
+/// The cause a proof map records for a drop: a `diag::ReliftCause` with
+/// `test-hooks`, nothing otherwise (`why!`).
+#[cfg(feature = "test-hooks")]
+pub(super) type Why = super::diag::ReliftCause;
+#[cfg(not(feature = "test-hooks"))]
+pub(super) type Why = ();
+
+// Keys whose drop the diagnostics remember per map.
+#[cfg(feature = "test-hooks")]
+const HISTORY: usize = 1 << 16;
 
 impl<K, V> Default for ProofMap<K, V> {
     fn default() -> Self {
@@ -34,6 +61,10 @@ impl<K, V> Default for ProofMap<K, V> {
             index: Box::new(SourceIndex {
                 pages: EngineMap::default(),
                 written: Vec::new(),
+                #[cfg(feature = "test-hooks")]
+                history: EngineMap::default(),
+                #[cfg(feature = "test-hooks")]
+                history_key: None,
             }),
         }
     }
@@ -51,13 +82,17 @@ fn source_pages(sources: &[(u64, u64)]) -> impl Iterator<Item = u64> + '_ {
 impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     #[inline(always)]
     pub(super) fn get(&self, key: &K) -> Option<&V> {
-        self.proofs.get(key).map(|(proof, _)| proof)
+        self.proofs.get(key).map(|(proof, _, used)| {
+            used.set(true);
+            proof
+        })
     }
 
     pub(super) fn contains_key(&self, key: &K) -> bool {
         self.proofs.contains_key(key)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn len(&self) -> usize {
         self.proofs.len()
     }
@@ -66,21 +101,43 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.version
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear(&mut self, _why: Why) {
         self.version = self.version.wrapping_add(1);
+        #[cfg(feature = "test-hooks")]
+        for (key, (_, sources, _)) in self.proofs.drain() {
+            self.index.remember(key, _why, None, sources);
+        }
         self.proofs.clear();
         self.index.pages.clear();
     }
 
     /// Drop every proof; later advances are compared from `generation`.
-    pub(super) fn reset(&mut self, generation: u64) {
-        self.clear();
+    pub(super) fn reset(&mut self, generation: u64, why: Why) {
+        self.clear(why);
         self.generation = generation;
     }
 
-    pub(super) fn remove(&mut self, key: &K) {
+    /// Drop the proof for `key`, if any, after a lift that could not be
+    /// published: its next lift is counted as `Unpublished`.
+    pub(super) fn remove_unpublished(&mut self, key: &K) {
+        self.remove_because(key, why!(Unpublished), None);
+        // A key with no proof still names why it lifts again.
+        #[cfg(feature = "test-hooks")]
+        if let Some(entry) = self
+            .index
+            .history
+            .get_mut(&self.index.history_key.map_or(*key, |f| f(key)))
+        {
+            entry.cause = why!(Unpublished);
+        } else {
+            self.index
+                .remember(*key, why!(Unpublished), None, Box::default());
+        }
+    }
+
+    fn remove_because(&mut self, key: &K, _why: Why, _write: Option<(u64, u64)>) {
         self.version = self.version.wrapping_add(1);
-        let Some((_, sources)) = self.proofs.remove(key) else {
+        let Some((_, sources, _)) = self.proofs.remove(key) else {
             return;
         };
         for page in source_pages(&sources) {
@@ -91,35 +148,100 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
                 }
             }
         }
+        #[cfg(feature = "test-hooks")]
+        self.index.remember(*key, _why, _write, sources);
+    }
+
+    /// Why the proof for `key` was last dropped; `None` for a key this map
+    /// never held (or has forgotten). Relift diagnostics only.
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn dropped(&self, key: &K) -> Option<&Dropped> {
+        let key = self.index.history_key.map_or(*key, |f| f(key));
+        self.index.history.get(&key)
+    }
+
+    /// Remember drops under `f(key)`: a paged proof's key names its TLB
+    /// generation, which a CR3 load or INVLPG advances.
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn set_history_key(&mut self, f: fn(&K) -> K) {
+        self.index.history_key = Some(f);
     }
 
     /// Insert a proof registered over `sources` (address, length).
     pub(super) fn insert(&mut self, key: K, proof: V, sources: &[(u64, u32)]) {
         if self.proofs.contains_key(&key) {
-            self.remove(&key);
+            self.remove_because(&key, why!(First), None);
         }
         let sources: Box<[(u64, u64)]> = sources
             .iter()
             .map(|&(start, len)| (start, start.saturating_add(u64::from(len))))
             .collect();
+        #[cfg(feature = "test-hooks")]
+        {
+            let key = self.index.history_key.map_or(key, |f| f(&key));
+            self.index.history.remove(&key);
+        }
         for page in source_pages(&sources) {
             let keys = self.index.pages.entry(page).or_default();
             if !keys.contains(&key) {
                 keys.push(key);
             }
         }
-        self.proofs.insert(key, (proof, sources));
+        self.proofs
+            .insert(key, (proof, sources, std::cell::Cell::new(false)));
     }
 
+    #[cfg(test)]
     pub(super) fn values(&self) -> impl Iterator<Item = &V> {
-        self.proofs.values().map(|(proof, _)| proof)
+        self.proofs.values().map(|(proof, ..)| proof)
     }
 
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+    /// Make room for one more proof in a map of at most `bound` proofs:
+    /// once full, drop a quarter of them rather than all (xj-to9.53), by
+    /// second chance: first the proofs no lookup returned since the last
+    /// sweep and that `hot` (a successor link or a running walk holding the
+    /// block) does not name, then, every flag cleared, the rest in map order.
+    /// A hot loop under pressure from blocks entered once (an interrupt
+    /// path through many contexts) keeps its proofs. Among equally cold
+    /// proofs the order is the map's bucket order, which the fixed hasher
+    /// makes the same keys every time rather than the oldest: a loop over
+    /// more blocks than the bound keeps a stable three quarters proved,
+    /// where evicting by age would evict each block just before its reuse.
+    pub(super) fn make_room(&mut self, bound: usize, why: Why, hot: impl Fn(&V) -> bool) {
+        if self.proofs.len() < bound {
+            return;
+        }
+        let quarter = bound / 4;
+        let mut gone: Vec<K> = self
+            .proofs
+            .iter()
+            .filter(|(_, (proof, _, used))| !used.get() && !hot(proof))
+            .map(|(key, _)| *key)
+            .take(quarter)
+            .collect();
+        for (_, _, used) in self.proofs.values() {
+            used.set(false);
+        }
+        if gone.len() < quarter {
+            let more: Vec<K> = self
+                .proofs
+                .keys()
+                .filter(|key| !gone.contains(key))
+                .take(quarter - gone.len())
+                .copied()
+                .collect();
+            gone.extend(more);
+        }
+        for key in gone {
+            self.remove_because(&key, why, None);
+        }
+    }
+
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool, why: Why) {
         self.version = self.version.wrapping_add(1);
         let gone: Vec<K> = self.proofs.keys().filter(|k| !keep(k)).copied().collect();
         for key in gone {
-            self.remove(&key);
+            self.remove_because(&key, why, None);
         }
     }
 
@@ -138,10 +260,31 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     #[inline(never)]
     fn drop_written(&mut self, cache: &crate::cache::TranslationCache) -> u64 {
         let mut written = std::mem::take(&mut self.index.written);
+        #[cfg(feature = "test-hooks")]
+        let since = self.generation;
         let (generation, complete) = cache.written_since(self.generation, &mut written);
         self.generation = generation;
+        #[cfg(feature = "test-hooks")]
+        let kinds = cache.advances_for_diag(since, generation);
         if !complete {
-            self.clear();
+            #[cfg(feature = "test-hooks")]
+            let why = {
+                use super::diag::GapKind;
+                use crate::cache::advance_kind as k;
+                // The first unrecorded advance names the gap; none (or none
+                // retained) means the log overflowed.
+                let gap = kinds.iter().find_map(|&(.., kind)| match kind {
+                    k::INVALIDATE => Some(GapKind::Invalidate),
+                    k::UNRECORDED_DRAIN => Some(GapKind::UnrecordedDrain),
+                    k::CHILD => Some(GapKind::ChildArena),
+                    k::RESET => Some(GapKind::Reset),
+                    _ => None,
+                });
+                super::diag::ReliftCause::Gap(gap.unwrap_or(GapKind::Overflow))
+            };
+            #[cfg(not(feature = "test-hooks"))]
+            let why = ();
+            self.clear(why);
         } else if !self.proofs.is_empty() {
             let mut victims = Vec::new();
             // Recorded writes are drained notices, each within one code page
@@ -149,19 +292,103 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
             for &(lo, hi) in &written {
                 for page in source_pages(&[(lo, hi)]) {
                     for key in self.index.pages.get(&page).into_iter().flatten() {
-                        let (_, sources) = &self.proofs[key];
+                        let (_, sources, _) = &self.proofs[key];
                         if sources.iter().any(|&(a, b)| a < hi && lo < b) {
-                            victims.push(*key);
+                            victims.push((*key, (lo, hi)));
                         }
                     }
                 }
             }
-            for key in &victims {
-                self.remove(key);
+            for (key, _write) in &victims {
+                #[cfg(feature = "test-hooks")]
+                let why = if kinds.iter().any(|&(l, h, kind)| {
+                    (l, h) == *_write && kind == crate::cache::advance_kind::PROMOTION
+                }) {
+                    super::diag::ReliftCause::Promotion
+                } else {
+                    // Classified when the key relifts (`diag::classify`).
+                    super::diag::ReliftCause::Store(super::diag::StoreClass::Outside)
+                };
+                #[cfg(not(feature = "test-hooks"))]
+                let why = ();
+                self.remove_because(key, why, Some(*_write));
             }
         }
         written.clear();
         self.index.written = written;
         generation
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl<K: Copy + Eq + Hash> SourceIndex<K> {
+    fn remember(
+        &mut self,
+        key: K,
+        cause: Why,
+        write: Option<(u64, u64)>,
+        sources: Box<[(u64, u64)]>,
+    ) {
+        let key = self.history_key.map_or(key, |f| f(&key));
+        if self.history.len() >= HISTORY && !self.history.contains_key(&key) {
+            self.history.clear();
+        }
+        self.history.insert(
+            key,
+            Dropped {
+                cause,
+                write,
+                sources,
+            },
+        );
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl<K: Copy + Eq + Hash + super::diag::DiagKey, V> ProofMap<K, V> {
+    pub(super) fn record_lift(
+        &self,
+        vm: &Vm,
+        class: super::diag::ProofClass,
+        key: &K,
+        retry: Option<super::diag::RetryKind>,
+        ip: u32,
+        context: MachineContext,
+    ) {
+        use super::diag::{ReliftCause, ReliftRecord};
+        let diag = &vm.live_fields.diag;
+        let dropped = self.dropped(key);
+        let mut cause = if let Some(retry) = retry {
+            ReliftCause::Retry(retry)
+        } else if self.proofs.contains_key(key) {
+            ReliftCause::Permit
+        } else {
+            dropped.map_or(ReliftCause::First, |d| d.cause)
+        };
+        let mut instruction = None;
+        let sources = dropped.map(|d| &d.sources[..]);
+        let write = dropped.and_then(|d| d.write);
+        if let (ReliftCause::Store(_) | ReliftCause::Promotion, Some(sources), Some(write)) =
+            (cause, sources, write)
+        {
+            if let Some((class, found)) = super::diag::classify(vm, sources, write, ip, context) {
+                if let ReliftCause::Store(_) = cause {
+                    cause = ReliftCause::Store(class);
+                }
+                instruction = found;
+            }
+        }
+        diag.lift(class, cause);
+        let (key, key_diff) = diag.key(key);
+        diag.record(ReliftRecord {
+            class,
+            cause,
+            block_ip: ip,
+            block_bus: sources.and_then(|s| s.first()).map(|&(lo, _)| lo),
+            write: write.map(|(lo, hi)| (lo, (hi - lo) as u32)),
+            instruction,
+            key,
+            key_diff,
+        });
     }
 }

@@ -7,7 +7,7 @@ use crate::{CpuModel, Prot, Reg, RegionKind, VmConfig};
 
 const CODE: u64 = 0x1000;
 const GDT: u64 = 0xa000;
-const DATA_SELECTORS: usize = 20;
+const DATA_SELECTORS: usize = 72;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Setup {
@@ -567,22 +567,22 @@ fn a_block_entered_in_two_contexts_follows_each_context_s_own_link() {
 
 #[test]
 fn a_reused_context_identity_is_never_followed() {
-    // Each outer iteration loads DS with twenty data selectors in turn (bases
-    // 0, 10h, .. 130h), more contexts than are retained
-    // (MAX_RETAINED_CONTEXTS): the first context's identity is evicted and
-    // given to a later one. S, a self-loop entered by direct branches, adds
-    // DS:[7000h] = k + 1 three times under the first selector (k = 0) and
-    // under the seventeenth (k = 16), which receives the first one's
+    // Each outer iteration loads DS with 72 data selectors in turn (bases
+    // 0, 10h, .. 470h), more contexts than are retained
+    // (MAX_RETAINED_CONTEXTS, 64): the first context's identity is evicted
+    // and given to a later one. S, a self-loop entered by direct branches,
+    // adds DS:[7000h] = k + 1 three times under the first selector (k = 0)
+    // and under the sixty-fifth (k = 64), which receives the first one's
     // identity; a link of S made under the first must not be followed there.
     //   mov cx,30; O: mov dx,10h; P: mov ax,dx; mov ds,ax; mov bp,3;
-    //   cmp dx,10h; je S; cmp dx,90h; je S; jmp Q; nop; nop;
+    //   cmp dx,10h; je S; cmp dx,210h; je S; jmp Q; nop; nop;
     //   S: add si,[7000h]; dec bp; jnz S; jmp Q; nop; nop;
-    //   Q: add dx,8; cmp dx,0B0h; jb P; loop O; jmp $
+    //   Q: add dx,8; cmp dx,250h; jb P; loop O; jmp $
     let code = [
         0xb9, 30, 0, 0xba, 0x10, 0, 0x89, 0xd0, 0x8e, 0xd8, 0xbd, 3, 0, 0x83, 0xfa, 0x10, 0x74,
-        0x0a, 0x81, 0xfa, 0x90, 0, 0x74, 0x04, 0xeb, 0x0d, 0x90, 0x90, 0x03, 0x36, 0, 0x70, 0x4d,
-        0x75, 0xf9, 0xeb, 0x02, 0x90, 0x90, 0x83, 0xc2, 0x08, 0x81, 0xfa, 0xb0, 0, 0x72, 0xd6,
-        0xe2, 0xd1, 0xeb, 0xfe,
+        0x0a, 0x81, 0xfa, 0x10, 0x02, 0x74, 0x04, 0xeb, 0x0d, 0x90, 0x90, 0x03, 0x36, 0, 0x70,
+        0x4d, 0x75, 0xf9, 0xeb, 0x02, 0x90, 0x90, 0x83, 0xc2, 0x08, 0x81, 0xfa, 0x50, 0x02, 0x72,
+        0xd6, 0xe2, 0xd1, 0xeb, 0xfe,
     ];
     let words: Vec<[u8; 2]> = (0..DATA_SELECTORS as u16)
         .map(|k| (k + 1).to_le_bytes())
@@ -595,8 +595,9 @@ fn a_reused_context_identity_is_never_followed() {
     const { assert!(DATA_SELECTORS > MAX_RETAINED_CONTEXTS) };
     for model in [CpuModel::I80386, CpuModel::I80286] {
         let setup = Setup::Segmented(model);
-        let outcome = witness(setup, &code, &data, 7200, Some(true), |_| {});
-        assert_eq!(outcome.gpr[6] & 0xffff, 30 * (3 + 3 * 17), "{model:?}");
+        // 30 outer iterations of 2 + 18 + 20 + 70 * 11 steps.
+        let outcome = witness(setup, &code, &data, 24400, Some(true), |_| {});
+        assert_eq!(outcome.gpr[6] & 0xffff, 30 * (3 + 3 * 65), "{model:?}");
         assert_ne!(outcome.cleared, 0, "{model:?}: no identity was reused");
     }
 }
