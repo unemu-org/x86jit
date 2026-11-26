@@ -1007,7 +1007,12 @@ fn split_store_policy_flushes_vcpu_predictions_and_forks() {
         .unwrap();
         let mut cpus = [vm.new_vcpu(), vm.new_vcpu()];
         assert!(!vm.precise_split_stores());
+        // Exit-chain slot addresses are baked in as immediates, and an AArch64
+        // constant takes one instruction per nonzero 16-bit chunk, so a recompile
+        // of the same block can differ by a few bytes with heap layout. Compare the
+        // policies' code paths, not exact sizes: the cold helper path is ~120 bytes.
         let mut default_size = None;
+        let mut precise_size = None;
         for precise in [false, true, false] {
             vm.set_precise_split_stores(precise);
             let epoch = vm.cache.epoch();
@@ -1031,8 +1036,14 @@ fn split_store_policy_flushes_vcpu_predictions_and_forks() {
                     size > default_size.unwrap(),
                     "enabled preflight adds a cold helper path"
                 );
+                precise_size = Some(size);
+            } else if let (Some(default), Some(enabled)) = (default_size, precise_size) {
+                assert!(
+                    size.abs_diff(default) * 2 < enabled - default,
+                    "disabled preflight drops the cold helper path: {size} vs {default}/{enabled}"
+                );
             } else {
-                assert_eq!(size, *default_size.get_or_insert(size));
+                default_size = Some(size);
             }
             drop(counts);
             let child = vm.fork_with_backend(Box::new(JitBackend::new())).unwrap();
