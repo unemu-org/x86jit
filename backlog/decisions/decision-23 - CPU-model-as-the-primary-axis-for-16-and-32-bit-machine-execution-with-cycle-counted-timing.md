@@ -1080,6 +1080,26 @@ and show drift only in release, on data-next-to-code and data-next-to-dense-code
 of their code. Release drift on those cells accumulates across landings. The pinned-reference
 trend of bead xj-193.8 is the instrument for it; step two of the plan sets that rule.
 
+**Amendment (where the gate runs, 2026-11-26, accepted by the maintainer).**
+The campaign of the measurement-protocol amendment above runs on GitHub Actions
+(`.github/workflows/perf-gate.yml`; commands.md, "Performance campaign in CI"), and its verdict
+there is the gate. The rule, threshold, profiles, process counts and cell values are unchanged.
+- Runner: `ubuntu-24.04-arm` (Neoverse-N2 with a virtual PMU), with `perf_event_paranoid` lowered
+  to 2; the bench examples count user-mode host instructions with `perf_event_open` on Linux and
+  with `proc_pid_rusage` on macOS. GitHub's macOS runners do not count instructions, and its
+  x86-64 pool mixes hosts without a PMU, so neither is used.
+- Builds: base and candidate in both profiles as four parallel jobs, each with its own cache
+  entry; one job measures the prebuilt binaries. A base must contain the Linux counter (main
+  from 11014b6a on); an older base reports a problem.
+- Dispatch: `gh workflow run perf-gate.yml -f base=<main commit> -f candidate=<commit>`, with the
+  candidate rebased onto the base so the base side comes from the cache.
+- Local runs: `scripts/perf-campaign.sh` keeps working and is used when CI is unavailable and to
+  confirm a cell within 0.2 pp of the threshold. Different hosts give different absolute counts,
+  so a base and its candidate are always measured on the same host.
+Evidence: a smoke run with base = candidate gave +0.000 % on every cell (13:39 with cold caches,
+4:42 warm). xj-to9.42 (26913662 against 64d49e28) passed on CI and on the workstation; on CI the
+per-cell spread across processes was p50 0.000 %, p90 0.000 %, max 0.18 %.
+
 ## Migration
 
 Steps are ordered, not dated. Each is one or more beads from the plan below and
