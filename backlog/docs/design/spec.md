@@ -2737,6 +2737,23 @@ Paged V86 at any IOPL shares ordinary blocks, with the Flat32 walk and its
 TLB operand lane, in the Checked segment class; sensitive instructions, far
 transfers and REP stay singletons. Unpaged V86 keeps singletons.
 
+**One op walk per block (xj-to9.35).** The unpaged Direct walk (Direct-class
+and Flat32/Segmented ordinary blocks) and the paged ordinary walk run a block
+as one pass of the shared op walk, not one walk per instruction. Each
+instruction keeps its own commit point at the next `InsnStart`: its entry
+(rollback image of a `Checkpoint` instruction, read cursor, task-switch
+marks) is taken there, and its exit applies, unchanged, RF clearing on
+retirement, the rollback to its first byte with its evidence and CR2 on
+failure, the finished MMIO retry, and the block-ending tests: block end,
+budget, exit, STI/SS shadow, the exit word, dirty code, and on the paged walk
+an invalidated translation or a new TLB generation. A failing instruction
+therefore leaves exactly the state, retired count and replay point of its
+own walk. On the paged walk the lane is chosen per instruction as before;
+register and preflighted (TLB-window) instructions run inside the pass, and
+strict-lane and transaction instructions, like a pending task continuation,
+run on their own walk, after which the pass resumes. An incomplete REP
+iteration of a Direct-class block restarts the pass at its instruction.
+
 Reselection retains the four most recent context identities, compared by
 stamp before the retained-context map is hashed; their last use returns to
 the LRU before an eviction. Paged blocks carry their ordinary-walk

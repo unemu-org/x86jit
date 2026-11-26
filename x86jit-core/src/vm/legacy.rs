@@ -55,11 +55,15 @@ use probe;
 
 impl Vcpu {
     /// Thread-local Machine dispatch counters since the last call: blocks
-    /// executed, context reselections, lifts and proof hits. Cost probes only.
+    /// executed, context reselections, lifts, proof hits and the op walks of
+    /// the protected and paged instruction walks. Cost probes only.
     #[doc(hidden)]
     #[cfg(feature = "test-hooks")]
-    pub fn take_machine_counters_for_test() -> [u64; 4] {
-        probes::COUNTS.with(|c| c.each_ref().map(|c| c.replace(0)))
+    pub fn take_machine_counters_for_test() -> [u64; 5] {
+        let [blocks, reselections, lifts, proofs] =
+            probes::COUNTS.with(|c| c.each_ref().map(|c| c.replace(0)));
+        let walks = crate::interp::legacy::WALKS.with(|walks| walks.replace(0));
+        [blocks, reselections, lifts, proofs, walks]
     }
 }
 

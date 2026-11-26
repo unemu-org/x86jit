@@ -2457,21 +2457,8 @@ where
             crate::UnsupportedSystemOperation::LegacyInstruction,
         ));
     }
-    let checkpoint = matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint)));
-    let before = if checkpoint {
-        Some((
-            cpu.gpr,
-            cpu.flags,
-            cpu.rflags_system,
-            cpu.legacy,
-            [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
-        ))
-    } else {
-        None
-    };
-    task_switch.committed = false;
-    task_switch.completed = false;
-    let mut result = if task_switch.context().is_some() {
+    let before = enter_instruction(ir, cpu, task_switch);
+    let result = if task_switch.context().is_some() {
         let suppress_debug = task_switch.suppress_debug();
         // A software interrupt whose task switch was handed off delivers here,
         // with the origin its INT stored (spec.md §17.10, Delivery log).
@@ -2485,6 +2472,7 @@ where
             ..Outcome::default()
         })
     } else {
+        count_walk();
         let mut execution = InstructionExecution::<ROUTED, ORDER, PAGED, V86> {
             ir,
             mem,
@@ -2506,6 +2494,54 @@ where
         )
         .map(|()| execution.outcome)
     };
+    leave_instruction(result, ir, cpu, mem, temps, context, task_switch, before)
+}
+
+/// The registers a `Checkpoint` instruction restores when it fails before its
+/// task switch commits.
+type Rollback = ([u64; 16], Flags, u64, legacy::LegacyCpuState, [u16; 6]);
+
+/// An instruction's entry: its rollback image and fresh task-switch marks.
+#[inline(always)]
+fn enter_instruction(
+    ir: &InstructionView<'_>,
+    cpu: &CpuState,
+    task_switch: &mut tasks::SwitchState,
+) -> Option<Rollback> {
+    let checkpoint = matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint)));
+    let before = if checkpoint {
+        Some((
+            cpu.gpr,
+            cpu.flags,
+            cpu.rflags_system,
+            cpu.legacy,
+            [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        ))
+    } else {
+        None
+    };
+    task_switch.committed = false;
+    task_switch.completed = false;
+    before
+}
+
+/// An instruction's exit: a failed instruction rolls back to its first byte
+/// with its evidence, a retired one clears RF, and a page fault publishes CR2.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn leave_instruction<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+    mut result: Result<Outcome, Exit>,
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
+    temps: &mut [u64],
+    context: MachineContext,
+    task_switch: &tasks::SwitchState,
+    before: Option<Rollback>,
+) -> Result<Outcome, Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
     if task_switch.committed
         && matches!(
             result,
@@ -2523,74 +2559,15 @@ where
             ..Outcome::default()
         });
     }
-    if result.is_err() && !task_switch.committed {
-        if let Some(before) = before {
-            cpu.gpr = before.0;
-            cpu.flags = before.1;
-            cpu.rflags_system = before.2;
-            cpu.legacy = before.3;
-            [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs] = before.4;
+    match result {
+        Err(exit) if !task_switch.committed => {
+            result = Err(roll_back(exit, ir, cpu, mem, temps, context, before));
         }
-        cpu.rip = ir.guest_start;
-        if let Err(exit) = result {
-            // Match the shared walk's evidence only where the instruction's
-            // memory effects are represented. Opaque frame/system helpers keep
-            // their existing evidence; generic scalar analysis cannot prove
-            // that those helpers left RAM untouched.
-            let scalar_evidence = context.regime == legacy::MachineRegime::Real
-                && ir.ops.iter().all(|op| match op {
-                    IrOp::Legacy(op) => matches!(
-                        op,
-                        L::SharedWalk
-                            | L::Checkpoint
-                            | L::Address { .. }
-                            | L::ReadSelector { .. }
-                            | L::DirectStackAddress { .. }
-                            | L::Push { .. }
-                            | L::Pop { .. }
-                            | L::AdjustStack { .. }
-                            | L::Transfer { cs: None, .. }
-                            | L::Return { far: false, .. }
-                            | L::Loop { .. }
-                            | L::String { .. }
-                            | L::Coprocessor { .. }
-                    ),
-                    _ => true,
-                });
-            let mut exit = if scalar_evidence {
-                super::finish_instruction_fault::<true>(
-                    exit,
-                    ir.ops,
-                    ir.guest_start,
-                    Some(ir.guest_start + u64::from(ir.guest_len)),
-                    crate::CpuMode::Real16,
-                    cpu,
-                    mem.0.normal(),
-                    temps,
-                    false,
-                )
-            } else {
-                exit
-            };
-            if let Exit::Exception {
-                metadata: Some(m), ..
-            }
-            | Exit::UnmappedMemory {
-                metadata: Some(m), ..
-            } = &mut exit
-            {
-                if cpu.owns_mmio_retry(cpu.rip) {
-                    m.progress.acknowledged = mmio_evidence(cpu);
-                }
-            }
-            result = Err(exit);
+        Ok(ref outcome) if outcome.retired && !outcome.preserve_rf => {
+            // SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1: retirement clears RF.
+            cpu.rflags_system &= !(1 << 16);
         }
-    } else if result
-        .as_ref()
-        .is_ok_and(|outcome| outcome.retired && !outcome.preserve_rf)
-    {
-        // SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1: retirement clears RF.
-        cpu.rflags_system &= !(1 << 16);
+        _ => {}
     }
     if PAGED {
         if let Err(exit) = &result {
@@ -2598,6 +2575,81 @@ where
         }
     }
     result
+}
+
+#[cold]
+#[inline(never)]
+fn roll_back<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+    exit: Exit,
+    ir: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
+    temps: &mut [u64],
+    context: MachineContext,
+    before: Option<Rollback>,
+) -> Exit
+where
+    PagingMode<PAGED>: PagingStorage,
+{
+    if let Some(before) = before {
+        cpu.gpr = before.0;
+        cpu.flags = before.1;
+        cpu.rflags_system = before.2;
+        cpu.legacy = before.3;
+        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs] = before.4;
+    }
+    cpu.rip = ir.guest_start;
+    // Match the shared walk's evidence only where the instruction's
+    // memory effects are represented. Opaque frame/system helpers keep
+    // their existing evidence; generic scalar analysis cannot prove
+    // that those helpers left RAM untouched.
+    let scalar_evidence = context.regime == legacy::MachineRegime::Real
+        && ir.ops.iter().all(|op| match op {
+            IrOp::Legacy(op) => matches!(
+                op,
+                L::SharedWalk
+                    | L::Checkpoint
+                    | L::Address { .. }
+                    | L::ReadSelector { .. }
+                    | L::DirectStackAddress { .. }
+                    | L::Push { .. }
+                    | L::Pop { .. }
+                    | L::AdjustStack { .. }
+                    | L::Transfer { cs: None, .. }
+                    | L::Return { far: false, .. }
+                    | L::Loop { .. }
+                    | L::String { .. }
+                    | L::Coprocessor { .. }
+            ),
+            _ => true,
+        });
+    let mut exit = if scalar_evidence {
+        super::finish_instruction_fault::<true>(
+            exit,
+            ir.ops,
+            ir.guest_start,
+            Some(ir.guest_start + u64::from(ir.guest_len)),
+            crate::CpuMode::Real16,
+            cpu,
+            mem.0.normal(),
+            temps,
+            false,
+        )
+    } else {
+        exit
+    };
+    if let Exit::Exception {
+        metadata: Some(m), ..
+    }
+    | Exit::UnmappedMemory {
+        metadata: Some(m), ..
+    } = &mut exit
+    {
+        if cpu.owns_mmio_retry(cpu.rip) {
+            m.progress.acknowledged = mmio_evidence(cpu);
+        }
+    }
+    exit
 }
 
 pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
@@ -2726,7 +2778,8 @@ impl Progress {
 }
 
 /// Instruction boundaries for system helpers and their transaction state. All
-/// instruction bodies use the shared opcode walk (spec.md §8.1).
+/// instruction bodies use the shared opcode walk (spec.md §8.1), in one pass
+/// over the block ([`BlockPass`]).
 pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -2741,193 +2794,596 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
     debug_assert!(ir.verify_temp_defs().is_ok(), "{:?}", ir.verify_temp_defs());
     let context = ir.legacy_context.expect("Direct context");
     let temps = scratch.reused(ir.temp_count as usize);
-    let mem = &LegacyAccess::new(memory, legacy::physical_mask(context.generation));
-    let mut steps = 0;
-    let mut retired = 0;
-    let mut start = 0;
-    let outcome = loop {
-        let end = ir.ops[start + 1..]
-            .iter()
-            .position(|op| matches!(op, IrOp::InsnStart { .. }))
-            .map_or(ir.ops.len(), |offset| start + 1 + offset);
-        let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
-            unreachable!("instruction marker")
-        };
-        let next = match ir.ops.get(end) {
-            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
-            _ => ir.guest_start + u64::from(ir.guest_len),
-        };
-        cpu.rip = guest_addr;
-        match execute_instruction::<ROUTED, ORDER, false, false>(
-            ir,
-            &InstructionView {
-                guest_start: guest_addr,
-                guest_len: (next - guest_addr) as u32,
-                ops: &ir.ops[start..end],
-                // `BlockWalk::Direct`: a Direct-class or `flat32_ordinary` block.
-                proven: true,
-            },
-            cpu,
-            mem,
-            temps,
-            context,
-            task_switch,
-        ) {
-            Err(exit) => break Err(exit),
-            Ok(outcome) => {
-                steps += 1;
-                retired += u64::from(outcome.retired);
-                if cpu.mmio_retry_active {
-                    cpu.finish_mmio_retry(None);
-                }
-                // Never execute stale successors after a code write. Dispatch
-                // drains the notification and invalidates physical byte spans.
-                if (outcome.retired && end == ir.ops.len())
-                    || steps == limit
-                    || outcome.exit.is_some()
-                    || outcome.context_changed
-                    || outcome.arm_sti
-                    || outcome.arm_ss != 0
-                    || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
-                    || memory.has_dirty_code()
-                {
-                    if outcome.context_changed {
-                        let mut progress = Progress {
-                            sti_shadow: false,
-                            ss_shadow: 0,
-                            steps,
-                            retired,
-                            outcome: Some(Ok(outcome)),
-                        };
-                        continue_after_reload::<ROUTED, ORDER>(
-                            ir,
-                            cpu,
-                            memory,
-                            mem,
-                            temps,
-                            start,
-                            limit,
-                            exit_word,
-                            task_switch,
-                            &mut progress,
-                        );
-                        return progress;
-                    }
-                    break Ok(outcome);
-                }
-                if !outcome.retired {
-                    continue;
-                }
-            }
-        }
-        start = end;
-    };
+    let mask = legacy::physical_mask(context.generation);
+    let mut pass = BlockPass::<ROUTED, ORDER, false, false>::new(
+        ir,
+        context,
+        memory,
+        LegacyAccess::new(memory, mask),
+        None,
+        task_switch,
+        exit_word,
+        limit,
+    );
+    let outcome = pass.run(cpu, temps, &mut None);
     Progress {
         sti_shadow: false,
         ss_shadow: 0,
-        steps,
-        retired,
+        steps: pass.steps,
+        retired: pass.retired,
         outcome: Some(outcome),
     }
 }
 
-/// An in-block data-segment load leaves the block running when nothing else
-/// ends it (`reload_continues`); the dispatcher reselects the context once,
-/// where the block ends (spec.md §17.10). `start` is the load's first op.
-#[cold]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn continue_after_reload<const ROUTED: bool, const ORDER: u8>(
-    ir: &IrBlock,
-    cpu: &mut CpuState,
-    memory: &Memory,
-    mem: &LegacyAccess<'_, ROUTED, ORDER>,
-    temps: &mut [u64],
-    mut start: usize,
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Op walks the Machine instruction walks started, for the dispatch
+    /// counters (`Vcpu::take_machine_counters_for_test`).
+    pub(crate) static WALKS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[inline(always)]
+fn count_walk() {
+    #[cfg(feature = "test-hooks")]
+    WALKS.with(|walks| walks.set(walks.get() + 1));
+}
+
+/// How one instruction of an ordinary block executes. The unpaged walk has
+/// only `Registers`; the paged walk chooses per instruction
+/// (`paging::ordinary_lane`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lane {
+    /// The unpaged adapter: no paged operand.
+    Registers,
+    /// Paged operands preflighted from the TLB (`paging::FastOperand`).
+    Fast,
+    /// A system lane over proved windows that replays on a miss.
+    Strict,
+    /// The two-phase operand transaction.
+    Transaction,
+}
+
+/// Where a [`BlockPass`] continues after an instruction commits.
+#[derive(Clone, Copy)]
+enum Flow {
+    /// The block continues at this op index: the next instruction, or the
+    /// same one after an incomplete REP iteration.
+    Next(usize),
+    /// The block ends with this instruction's outcome (`BlockPass::outcome`).
+    Stop,
+    /// The prepared instruction runs on its own, outside the walk: a pending
+    /// task continuation, or a strict or transaction lane.
+    Yield,
+}
+
+/// One pass of the shared opcode walk over a Direct-walk block (a Direct-class
+/// or `flat32_ordinary` block) or a paged ordinary block. Every instruction
+/// keeps its own commit point: it starts at its `InsnStart` (rollback image,
+/// read cursor, task-switch marks, outcome) and commits at the next
+/// `InsnStart` or where the walk returns, with the same rollback, retirement,
+/// budget, exit-word and dirty-code tests at each boundary as an instruction
+/// walked by itself (`execute_instruction`). An instruction that fails leaves
+/// state as its own walk would; one that cannot run in the walk yields to that
+/// walk. `LANES` selects the paged walk (`paging::execute_ordinary`).
+pub(super) struct BlockPass<
+    'a,
+    const ROUTED: bool,
+    const ORDER: u8,
+    const LANES: bool,
+    const V86: bool,
+> {
+    ir: &'a IrBlock,
+    context: MachineContext,
+    memory: &'a Memory,
+    registers: LegacyAccess<'a, ROUTED, ORDER>,
+    /// The paged lanes' adapter; the unpaged walk has none.
+    paged: Option<LegacyAccess<'a, ROUTED, ORDER, true>>,
+    task_switch: &'a mut tasks::SwitchState,
+    exit_word: &'a std::sync::atomic::AtomicU64,
     limit: u64,
-    exit_word: &std::sync::atomic::AtomicU64,
-    task_switch: &mut tasks::SwitchState,
-    progress: &mut Progress,
-) {
-    let context = ir.legacy_context.expect("Direct context");
-    let instruction_end = |start: usize| {
-        ir.ops[start + 1..]
+    /// The paged walk's TLB and its generation at block entry.
+    tlb: Option<(&'a std::cell::RefCell<paging::Tlb>, u64)>,
+    /// No transaction is retained; read where each walk segment starts, as
+    /// only a yielded instruction changes it.
+    retry_none: bool,
+    pub(super) steps: u64,
+    pub(super) retired: u64,
+    reloaded: bool,
+    /// The op index where the current walk segment started.
+    base: usize,
+    view: InstructionView<'a>,
+    start: usize,
+    end: usize,
+    lane: Lane,
+    fast: Option<paging::FastOperand>,
+    before: Option<Rollback>,
+    outcome: Outcome,
+    in_flight: bool,
+    flow: Option<Flow>,
+}
+
+impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
+    BlockPass<'a, ROUTED, ORDER, LANES, V86>
+{
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn new(
+        ir: &'a IrBlock,
+        context: MachineContext,
+        memory: &'a Memory,
+        registers: LegacyAccess<'a, ROUTED, ORDER>,
+        paged: Option<LegacyAccess<'a, ROUTED, ORDER, true>>,
+        task_switch: &'a mut tasks::SwitchState,
+        exit_word: &'a std::sync::atomic::AtomicU64,
+        limit: u64,
+    ) -> Self {
+        let tlb = paged
+            .as_ref()
+            .and_then(|paged| paged.paging.tlb)
+            .map(|tlb| (tlb, tlb.borrow().generation));
+        Self {
+            ir,
+            context,
+            memory,
+            registers,
+            paged,
+            task_switch,
+            exit_word,
+            limit,
+            tlb,
+            retry_none: true,
+            steps: 0,
+            retired: 0,
+            reloaded: false,
+            base: 0,
+            view: InstructionView {
+                guest_start: ir.guest_start,
+                guest_len: 0,
+                ops: &[],
+                proven: true,
+            },
+            start: 0,
+            end: 0,
+            lane: Lane::Registers,
+            fast: None,
+            before: None,
+            outcome: Outcome::default(),
+            in_flight: false,
+            flow: None,
+        }
+    }
+
+    /// The block from its first instruction to the outcome that ends it.
+    #[inline(always)]
+    pub(super) fn run(
+        &mut self,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+        retry: &mut Option<paging::Transaction>,
+    ) -> Result<Outcome, Exit> {
+        let ir = self.ir;
+        let access = self.registers.access;
+        let mut at = 0;
+        loop {
+            let IrOp::InsnStart { guest_addr } = ir.ops[at] else {
+                unreachable!("instruction marker")
+            };
+            self.base = at;
+            self.retry_none = retry.is_none();
+            count_walk();
+            let walked = super::walk_instruction::<ROUTED, ORDER>(
+                ir,
+                &ir.ops[at..],
+                guest_addr,
+                cpu,
+                access,
+                temps,
+                &mut *self,
+            );
+            let flow = match self.flow.take() {
+                Some(Flow::Next(next)) => {
+                    at = next;
+                    continue;
+                }
+                Some(Flow::Stop) => return Ok(std::mem::take(&mut self.outcome)),
+                Some(Flow::Yield) => {
+                    self.outcome = self.yielded(cpu, temps, retry)?;
+                    self.commit(cpu)
+                }
+                // The instruction returned from the walk or ran off the block.
+                None => {
+                    if let Err(exit) = walked {
+                        self.outcome = self.fail(exit, cpu, temps)?;
+                    } else {
+                        self.locate();
+                        self.complete(cpu);
+                    }
+                    self.commit(cpu)
+                }
+            };
+            match flow {
+                Flow::Next(next) => at = next,
+                Flow::Stop => return Ok(std::mem::take(&mut self.outcome)),
+                Flow::Yield => unreachable!("commit never yields"),
+            }
+        }
+    }
+
+    /// Enter the instruction at `at`. The paged walk locates it and chooses
+    /// its lane at once; the unpaged walk locates it only when an op of its
+    /// own, a failure or the walk's end needs its bounds (`locate`), and
+    /// otherwise learns its end at the next instruction's marker.
+    #[inline(always)]
+    fn prepare(&mut self, at: usize, guest_addr: u64, cpu: &mut CpuState, temps: &mut [u64]) {
+        self.start = at;
+        self.end = 0;
+        self.view = InstructionView {
+            guest_start: guest_addr,
+            guest_len: 0,
+            ops: &[],
+            // `BlockWalk::Direct`: a Direct-class or `flat32_ordinary` block;
+            // the paged ordinary block's `ordinary_block`, decided at lift,
+            // implies `flat32_ordinary`.
+            proven: true,
+        };
+        if LANES {
+            self.locate();
+            let (tlb, _) = self.tlb.expect("paged walk");
+            (self.lane, self.fast) = paging::ordinary_lane(
+                &self.view,
+                cpu,
+                self.memory,
+                tlb,
+                temps,
+                self.context,
+                self.retry_none,
+            );
+        }
+    }
+
+    /// The current instruction's bounds: its ops end at the next `InsnStart`,
+    /// whose address is where it ends, or with the block.
+    #[inline(always)]
+    fn locate(&mut self) {
+        if self.end != 0 {
+            return;
+        }
+        let ops = &self.ir.ops;
+        let at = self.start;
+        let end = ops[at + 1..]
             .iter()
             .position(|op| matches!(op, IrOp::InsnStart { .. }))
-            .map_or(ir.ops.len(), |offset| start + 1 + offset)
-    };
-    loop {
-        let Some(Ok(outcome)) = &mut progress.outcome else {
-            return;
+            .map_or(ops.len(), |offset| at + 1 + offset);
+        let next = match ops.get(end) {
+            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+            _ => self.ir.guest_start + u64::from(self.ir.guest_len),
         };
-        let end = instruction_end(start);
-        if !outcome.context_changed
-            || !outcome.retired
-            || end == ir.ops.len()
-            || progress.steps == limit
+        self.bound(end, next);
+    }
+
+    /// The current instruction ends at op `end` and guest address `next`.
+    #[inline(always)]
+    fn bound(&mut self, end: usize, next: u64) {
+        self.end = end;
+        self.view.ops = &self.ir.ops[self.start..end];
+        self.view.guest_len = (next - self.view.guest_start) as u32;
+        debug_assert!(
+            self.context.segment_class == crate::SegmentClass::Direct
+                || self.view.ops.iter().all(supported)
+        );
+    }
+
+    /// `execute_instruction`'s entry for an instruction the walk runs.
+    #[inline(always)]
+    fn begin(&mut self, cpu: &CpuState) {
+        if LANES && self.lane == Lane::Fast {
+            let paged = self.paged.as_mut().expect("paged walk");
+            paged.paging.fast_operand = self.fast;
+            paged.read_index.set(0);
+        } else {
+            self.registers.read_index.set(0);
+        }
+        // `enter_instruction`, writing the rollback image in place: `before`
+        // is None between instructions. The op after the marker is the
+        // instruction's own, or the next instruction's marker.
+        debug_assert!(self.before.is_none());
+        if matches!(
+            self.ir.ops.get(self.start + 1),
+            Some(IrOp::Legacy(L::Checkpoint))
+        ) {
+            self.before = Some((
+                cpu.gpr,
+                cpu.flags,
+                cpu.rflags_system,
+                cpu.legacy,
+                [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+            ));
+        }
+        self.task_switch.committed = false;
+        self.task_switch.completed = false;
+        self.outcome = Outcome {
+            retired: true,
+            ..Outcome::default()
+        };
+        self.in_flight = true;
+    }
+
+    /// `execute_instruction`'s exit for an instruction the walk completed:
+    /// retirement clears RF (SDM Vol 3B §20.3.1.1; 80386 PRM §12.3.1.1).
+    #[inline(always)]
+    fn complete(&mut self, cpu: &mut CpuState) {
+        debug_assert!(self.in_flight, "an instruction in the walk");
+        self.in_flight = false;
+        if self.before.is_some() {
+            self.before = None;
+        }
+        if self.outcome.retired && !self.outcome.preserve_rf {
+            cpu.rflags_system &= !(1 << 16);
+        }
+    }
+
+    /// `execute_instruction`'s exit for an instruction that failed in the walk.
+    #[cold]
+    #[inline(never)]
+    fn fail(&mut self, exit: Exit, cpu: &mut CpuState, temps: &mut [u64]) -> Result<Outcome, Exit> {
+        debug_assert!(self.in_flight, "an instruction in the walk");
+        self.in_flight = false;
+        self.locate();
+        let before = self.before.take();
+        if LANES && self.lane == Lane::Fast {
+            leave_instruction(
+                Err(exit),
+                &self.view,
+                cpu,
+                self.paged.as_ref().expect("paged walk"),
+                temps,
+                self.context,
+                self.task_switch,
+                before,
+            )
+        } else {
+            leave_instruction(
+                Err(exit),
+                &self.view,
+                cpu,
+                &self.registers,
+                temps,
+                self.context,
+                self.task_switch,
+                before,
+            )
+        }
+    }
+
+    /// The prepared instruction on its own walk, as before the one-pass walk.
+    #[cold]
+    #[inline(never)]
+    fn yielded(
+        &mut self,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+        retry: &mut Option<paging::Transaction>,
+    ) -> Result<Outcome, Exit> {
+        let (ir, view, context) = (self.ir, &self.view, self.context);
+        match self.lane {
+            Lane::Registers => execute_instruction::<ROUTED, ORDER, false, V86>(
+                ir,
+                view,
+                cpu,
+                &self.registers,
+                temps,
+                context,
+                self.task_switch,
+            ),
+            Lane::Fast => {
+                self.paged.as_mut().expect("paged walk").paging.fast_operand = self.fast;
+                execute_instruction::<ROUTED, ORDER, true, V86>(
+                    ir,
+                    view,
+                    cpu,
+                    self.paged.as_ref().expect("paged walk"),
+                    temps,
+                    context,
+                    self.task_switch,
+                )
+            }
+            Lane::Strict => {
+                self.paged.as_mut().expect("paged walk").paging.fast_operand = self.fast;
+                paging::strict_instruction::<ROUTED, ORDER, V86>(
+                    ir,
+                    view,
+                    cpu,
+                    self.paged.as_mut().expect("paged walk"),
+                    temps,
+                    context,
+                    self.task_switch,
+                    retry,
+                )
+            }
+            Lane::Transaction => {
+                self.paged.as_mut().expect("paged walk").paging.fast_operand = None;
+                paging::execute_with_retry::<ROUTED, ORDER, true, V86>(
+                    ir,
+                    view,
+                    cpu,
+                    self.paged.as_ref().expect("paged walk"),
+                    temps,
+                    context,
+                    self.task_switch,
+                    retry,
+                )
+                .map(|(outcome, input)| {
+                    debug_assert!(input.is_none(), "ordinary Flat32 has no port strings");
+                    outcome
+                })
+            }
+        }
+    }
+
+    /// The boundary after a completed instruction: its retirement, then
+    /// whether the block goes on. Never execute stale successors after a code
+    /// write; dispatch drains the notification and invalidates physical spans.
+    #[inline(always)]
+    fn commit(&mut self, cpu: &mut CpuState) -> Flow {
+        debug_assert!(self.end != 0, "a located instruction");
+        let outcome = &mut self.outcome;
+        self.steps += 1;
+        self.retired += u64::from(outcome.retired);
+        if cpu.mmio_retry_active {
+            cpu.finish_mmio_retry(None);
+        }
+        let last = self.end == self.ir.ops.len();
+        let polled = || {
+            self.exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
+                || self.memory.has_dirty_code()
+        };
+        if LANES {
+            let (tlb, token) = self.tlb.expect("paged walk");
+            if last
+                || self.steps == self.limit
+                || outcome.exit.is_some()
+                || outcome.translations_invalidated
+                || outcome.arm_sti
+                || outcome.arm_ss != 0
+                || polled()
+                || tlb.borrow().generation != token
+            {
+                outcome.context_changed |= self.reloaded;
+                return Flow::Stop;
+            }
+            // An in-block data-segment load continues the block; the
+            // dispatcher reselects once where it ends (spec.md §17.10).
+            if outcome.context_changed {
+                if !reload_continues(self.view.ops, self.context, cpu) {
+                    return Flow::Stop;
+                }
+                self.reloaded = true;
+            }
+            return Flow::Next(self.end);
+        }
+        let stop = (outcome.retired && last)
+            || self.steps == self.limit
             || outcome.exit.is_some()
             || outcome.arm_sti
             || outcome.arm_ss != 0
-            || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
-            || memory.has_dirty_code()
-            || !reload_continues(&ir.ops[start..end], context, cpu)
-        {
+            || polled();
+        if outcome.context_changed {
+            // An in-block data-segment load leaves the block running when
+            // nothing else ends it (`reload_continues`); the dispatcher
+            // reselects the context once, where the block ends (spec.md §17.10).
+            if stop || !outcome.retired || !reload_continues(self.view.ops, self.context, cpu) {
+                return Flow::Stop;
+            }
+            self.reloaded = true;
+            return Flow::Next(self.end);
+        }
+        if stop {
             // The block reloaded a segment; reselect where it ends.
-            outcome.context_changed = true;
-            return;
+            outcome.context_changed |= self.reloaded;
+            return Flow::Stop;
         }
-        start = end;
-        // The next instruction, then those after it, as the walk above.
-        loop {
-            let end = instruction_end(start);
-            let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
-                unreachable!("instruction marker")
-            };
-            let next = match ir.ops.get(end) {
-                Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
-                _ => ir.guest_start + u64::from(ir.guest_len),
-            };
-            cpu.rip = guest_addr;
-            let result = execute_instruction::<ROUTED, ORDER, false, false>(
-                ir,
-                &InstructionView {
-                    guest_start: guest_addr,
-                    guest_len: (next - guest_addr) as u32,
-                    ops: &ir.ops[start..end],
-                    proven: true,
-                },
+        // An incomplete REP iteration runs again at the same instruction.
+        Flow::Next(if outcome.retired {
+            self.end
+        } else {
+            self.start
+        })
+    }
+}
+
+impl<const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
+    super::InstructionExecutor<'_> for &mut BlockPass<'_, ROUTED, ORDER, LANES, V86>
+{
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn next_ip(&self) -> u64 {
+        // Unlocated, the instruction ran off the block: it is the last one.
+        let end = if self.end == 0 {
+            self.ir.guest_start + u64::from(self.ir.guest_len)
+        } else {
+            self.view
+                .guest_start
+                .wrapping_add(u64::from(self.view.guest_len))
+        };
+        end & 0xffff_ffff
+    }
+    #[inline(always)]
+    fn execute(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
+        self.locate();
+        let result = if LANES && self.lane == Lane::Fast {
+            execute_op::<ROUTED, ORDER, true, V86>(
+                op,
+                &self.view,
                 cpu,
-                mem,
+                self.paged.as_ref().expect("paged walk"),
                 temps,
-                context,
-                task_switch,
-            );
-            let Ok(outcome) = &result else {
-                progress.outcome = Some(result);
-                return;
-            };
-            progress.steps += 1;
-            progress.retired += u64::from(outcome.retired);
-            if cpu.mmio_retry_active {
-                cpu.finish_mmio_retry(None);
+                self.context,
+                self.task_switch,
+                &mut self.outcome,
+            )
+        } else {
+            execute_op::<ROUTED, ORDER, false, V86>(
+                op,
+                &self.view,
+                cpu,
+                &self.registers,
+                temps,
+                self.context,
+                self.task_switch,
+                &mut self.outcome,
+            )
+        };
+        match result {
+            Ok(false) => None,
+            Ok(true) => Some(WalkResult::Continue),
+            Err(exit) => Some(WalkResult::exit(exit)),
+        }
+    }
+    fn boundaries(&self) -> bool {
+        true
+    }
+    #[inline(always)]
+    fn boundary(
+        &mut self,
+        op_index: usize,
+        guest_addr: u64,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        let at = self.base + op_index;
+        let first = !self.in_flight;
+        if self.in_flight {
+            // The instruction's ops ran out at this marker: it falls through
+            // to this instruction, as its own walk would have ended (`walk_ops`).
+            if self.end == 0 {
+                self.bound(at, guest_addr);
             }
-            let stop = (outcome.retired && end == ir.ops.len())
-                || progress.steps == limit
-                || outcome.exit.is_some()
-                || outcome.context_changed
-                || outcome.arm_sti
-                || outcome.arm_ss != 0
-                || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
-                || memory.has_dirty_code();
-            let retired = outcome.retired;
-            progress.outcome = Some(result);
-            if stop {
-                break;
-            }
-            if retired {
-                start = end;
+            cpu.rip = self.next_ip();
+            self.complete(cpu);
+            match self.commit(cpu) {
+                Flow::Next(next) if next == at => {}
+                flow => {
+                    self.flow = Some(flow);
+                    return Some(WalkResult::Continue);
+                }
             }
         }
+        cpu.rip = guest_addr;
+        self.prepare(at, guest_addr, cpu, temps);
+        // A task continuation is pending only where a walk starts: no
+        // instruction of an ordinary block (`flat32_ordinary`, or the real-mode
+        // Direct class) switches tasks.
+        debug_assert!(first || self.task_switch.context().is_none());
+        if (first && self.task_switch.context().is_some())
+            || (LANES && matches!(self.lane, Lane::Strict | Lane::Transaction))
+        {
+            self.locate();
+            self.flow = Some(Flow::Yield);
+            return Some(WalkResult::Continue);
+        }
+        self.begin(cpu);
+        None
     }
 }
 
@@ -5222,9 +5678,10 @@ fn coprocessor_overrun(
     ))
 }
 
-pub(super) fn machine_specific(op: &IrOp) -> bool {
-    matches!(
-        op,
+/// The operations a Machine instruction walk executes itself (`execute_op`),
+/// as a pattern: `walk_ops` matches them in its one op dispatch.
+macro_rules! machine_specific_ops {
+    () => {
         IrOp::AtomicRmw { .. }
             | IrOp::AtomicCas { .. }
             | IrOp::BoundGate { .. }
@@ -5241,8 +5698,9 @@ pub(super) fn machine_specific(op: &IrOp) -> bool {
             | IrOp::Unsupported { .. }
             | IrOp::X87 { .. }
             | IrOp::Legacy(_)
-    )
+    };
 }
+pub(super) use machine_specific_ops;
 
 struct InstructionExecution<
     'a,

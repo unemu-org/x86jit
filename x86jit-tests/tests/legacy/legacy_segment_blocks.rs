@@ -585,7 +585,7 @@ fn in_block_reloads_keep_retained_proofs_warm() {
             fixture::steps(&mut cpu, &vm, 70);
             x86jit_core::Vcpu::take_machine_counters_for_test();
             fixture::steps(&mut cpu, &vm, 700);
-            let [blocks, reselections, lifts, _] =
+            let [blocks, reselections, lifts, _, _] =
                 x86jit_core::Vcpu::take_machine_counters_for_test();
             assert_eq!(lifts, 0, "{blocks} {reselections}");
             // Per seven-instruction iteration, five blocks: the loads with

@@ -1388,6 +1388,23 @@ trait InstructionExecutor<'ir> {
     ) -> Option<WalkResult> {
         unreachable!("disabled instruction adapter")
     }
+    /// Whether every `InsnStart` of the walk is offered to [`Self::boundary`]:
+    /// a walk over several instructions of one block that commits each of
+    /// them at the next instruction's marker (`legacy::execute_instructions`).
+    fn boundaries(&self) -> bool {
+        false
+    }
+    /// At the `InsnStart` at `op_index` of [`Self::ops`], before the walk
+    /// touches any state for it. `Some` ends the walk there.
+    fn boundary(
+        &mut self,
+        _op_index: usize,
+        _guest_addr: u64,
+        _cpu: &mut CpuState,
+        _temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        None
+    }
 }
 impl InstructionExecutor<'_> for () {}
 
@@ -1407,6 +1424,18 @@ impl<'ir, E: InstructionExecutor<'ir>> InstructionExecutor<'ir> for InstructionS
     }
     fn execute(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
         self.executor.execute(op, cpu, temps)
+    }
+    fn boundaries(&self) -> bool {
+        self.executor.boundaries()
+    }
+    fn boundary(
+        &mut self,
+        op_index: usize,
+        guest_addr: u64,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        self.executor.boundary(op_index, guest_addr, cpu, temps)
     }
 }
 
@@ -1482,16 +1511,20 @@ fn walk_ops<
     let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
     for (op_index, op) in instruction.ops(ir).iter().enumerate() {
-        if instruction.enabled() && legacy::machine_specific(op) {
-            if let Some(stop) = instruction.execute(op, cpu, temps) {
-                return stop;
-            }
-            continue;
-        }
         if CHILD {
+            // A child walk has no instruction executor.
+            debug_assert!(!instruction.enabled());
             mem.0.begin_op(op, temps, cpu);
         }
         match op {
+            // The Machine instruction walks' own operations, in the same
+            // dispatch as every other op.
+            op @ (legacy::machine_specific_ops!()) if instruction.enabled() => {
+                if let Some(stop) = instruction.execute(op, cpu, temps) {
+                    return stop;
+                }
+                continue;
+            }
             IrOp::Legacy(legacy_op) => match legacy_op {
                 op @ (L::WrappedLoad { .. }
                 | L::WrappedStore { .. }
@@ -1736,6 +1769,11 @@ fn walk_ops<
                 }
             },
             IrOp::InsnStart { guest_addr } => {
+                if instruction.boundaries() {
+                    if let Some(stop) = instruction.boundary(op_index, *guest_addr, cpu, temps) {
+                        return stop;
+                    }
+                }
                 if !CHILD && started.get() == 0 {
                     // The store completed; leave cur_addr on it for retirement.
                     started.set(2);

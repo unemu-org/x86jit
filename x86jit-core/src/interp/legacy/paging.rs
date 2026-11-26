@@ -1532,7 +1532,12 @@ where
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn execute_with_retry<const ROUTED: bool, const ORDER: u8, const PAGED: bool, const V86: bool>(
+pub(super) fn execute_with_retry<
+    const ROUTED: bool,
+    const ORDER: u8,
+    const PAGED: bool,
+    const V86: bool,
+>(
     block: &IrBlock,
     ir: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -2609,7 +2614,7 @@ pub(crate) fn execute_far_fast<const ROUTED: bool, const ORDER: u8, const V86: b
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn strict_instruction<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+pub(super) fn strict_instruction<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     ir: &IrBlock,
     view: &InstructionView<'_>,
     cpu: &mut CpuState,
@@ -2900,7 +2905,43 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     )
 }
 
-/// The ordinary paged walk of Flat32, Segmented and V86 blocks.
+/// The lane of one ordinary paged instruction: register effects alone, RAM
+/// operands preflighted from existing translations (strict for a system
+/// lane), or the full operand transaction. Address preparation by
+/// `fast_instruction` changes only temps.
+#[inline(always)]
+pub(super) fn ordinary_lane(
+    view: &InstructionView<'_>,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    tlb: &std::cell::RefCell<Tlb>,
+    temps: &mut [u64],
+    context: MachineContext,
+    retry_none: bool,
+) -> (super::Lane, Option<FastOperand>) {
+    let once = retry_none
+        && !(cpu.legacy.cpl == 3
+            && cpu.legacy.cr0 & (1 << 18) != 0
+            && cpu.rflags_system & (1 << 18) != 0);
+    // A near JMP's CS target check stays on the register lane (`register_lane`).
+    let registers_only = once && register_lane(view.ops);
+    let fast = if once && !registers_only {
+        fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps, context)
+    } else {
+        None
+    };
+    let lane = match fast {
+        Some(operand) if operand.strict => super::Lane::Strict,
+        Some(_) => super::Lane::Fast,
+        None if registers_only => super::Lane::Registers,
+        None => super::Lane::Transaction,
+    };
+    (lane, fast)
+}
+
+/// The ordinary paged walk of Flat32, Segmented and V86 blocks, in one pass
+/// (`super::BlockPass`): register and preflighted instructions run in the
+/// walk, strict and transaction instructions on their own.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
@@ -2918,127 +2959,22 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     let temps = scratch.reused(ir.temp_count as usize);
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
     mem.paging.tlb = Some(tlb);
-    let registers = LegacyAccess::<ROUTED, ORDER>::new(memory, u32::MAX);
-    let token = tlb.borrow().generation;
-    let mut start = 0;
-    let mut steps = 0;
-    let mut retired = 0;
-    let mut reloaded = false;
-    let outcome = loop {
-        let end = ir.ops[start + 1..]
-            .iter()
-            .position(|op| matches!(op, IrOp::InsnStart { .. }))
-            .map_or(ir.ops.len(), |offset| start + 1 + offset);
-        let IrOp::InsnStart { guest_addr } = ir.ops[start] else {
-            unreachable!("instruction marker")
-        };
-        let next = match ir.ops.get(end) {
-            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
-            _ => ir.guest_start + u64::from(ir.guest_len),
-        };
-        cpu.rip = guest_addr;
-        let view = InstructionView {
-            guest_start: guest_addr,
-            guest_len: (next - guest_addr) as u32,
-            ops: &ir.ops[start..end],
-            // `ordinary_block`, decided at lift, implies `flat32_ordinary`.
-            proven: true,
-        };
-        mem.paging.fast_operand = None;
-        let once = retry.is_none()
-            && !(cpu.legacy.cpl == 3
-                && cpu.legacy.cr0 & (1 << 18) != 0
-                && cpu.rflags_system & (1 << 18) != 0);
-        let registers_only = once && register_lane(view.ops);
-        if once && !registers_only {
-            mem.paging.fast_operand =
-                fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps, context);
-        }
-        let result = if mem.paging.fast_operand.is_some_and(|o| o.strict) {
-            strict_instruction::<ROUTED, ORDER, V86>(
-                ir,
-                &view,
-                cpu,
-                &mut mem,
-                temps,
-                context,
-                task_switch,
-                retry,
-            )
-        } else if mem.paging.fast_operand.is_some() {
-            execute_instruction::<ROUTED, ORDER, true, V86>(
-                ir,
-                &view,
-                cpu,
-                &mem,
-                temps,
-                context,
-                task_switch,
-            )
-        } else if registers_only {
-            execute_instruction::<ROUTED, ORDER, false, V86>(
-                ir,
-                &view,
-                cpu,
-                &registers,
-                temps,
-                context,
-                task_switch,
-            )
-        } else {
-            execute_with_retry::<ROUTED, ORDER, true, V86>(
-                ir,
-                &view,
-                cpu,
-                &mem,
-                temps,
-                context,
-                task_switch,
-                retry,
-            )
-            .map(|(outcome, input)| {
-                debug_assert!(input.is_none(), "ordinary Flat32 has no port strings");
-                outcome
-            })
-        };
-        match result {
-            Err(exit) => break Err(exit),
-            Ok(mut outcome) => {
-                steps += 1;
-                retired += u64::from(outcome.retired);
-                if cpu.mmio_retry_active {
-                    cpu.finish_mmio_retry(None);
-                }
-                if end == ir.ops.len()
-                    || steps == limit
-                    || outcome.exit.is_some()
-                    || outcome.translations_invalidated
-                    || outcome.arm_sti
-                    || outcome.arm_ss != 0
-                    || exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0
-                    || memory.has_dirty_code()
-                    || tlb.borrow().generation != token
-                {
-                    outcome.context_changed |= reloaded;
-                    break Ok(outcome);
-                }
-                // An in-block data-segment load continues the block; the
-                // dispatcher reselects once where it ends (spec.md §17.10).
-                if outcome.context_changed {
-                    if !super::reload_continues(view.ops, context, cpu) {
-                        break Ok(outcome);
-                    }
-                    reloaded = true;
-                }
-            }
-        }
-        start = end;
-    };
+    let mut pass = super::BlockPass::<ROUTED, ORDER, true, V86>::new(
+        ir,
+        context,
+        memory,
+        LegacyAccess::<ROUTED, ORDER>::new(memory, u32::MAX),
+        Some(mem),
+        task_switch,
+        exit_word,
+        limit,
+    );
+    let outcome = pass.run(cpu, temps, retry);
     Progress {
         sti_shadow: false,
         ss_shadow: 0,
-        steps,
-        retired,
+        steps: pass.steps,
+        retired: pass.retired,
         outcome: Some(outcome),
     }
 }

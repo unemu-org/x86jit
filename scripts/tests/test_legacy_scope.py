@@ -92,7 +92,9 @@ REVIEWED_ENTRY_POINTS = {
         "interp::i8086::string_load", "interp::i8086::string_store",
         "interp::legacy::direct_stack_address", "interp::legacy::execute_loop_op",
         "interp::legacy::execute_shared_op", "interp::legacy::execute_shared_string",
-        "interp::legacy::machine_specific", "interp::legacy::mmio_evidence",
+        # The Machine walks' op set, matched only when an instruction
+        # executor is enabled (Machine instruction walks).
+        "interp::legacy::machine_specific_ops", "interp::legacy::mmio_evidence",
         "interp::legacy::mod", "interp::legacy::scalar_limit_access",
         "interp::legacy::selector", "interp::legacy::stack_fault_access",
         "lift::legacy::shared_helper",
@@ -124,6 +126,8 @@ REVIEWED_ENTRY_POINTS = {
         "Vcpu::nec_boundary", "interp::i8086::finish_port_input",
         "interp::i8086::interrupt", "interp::legacy::BlockWalk",
         "interp::legacy::Progress", "interp::legacy::deliver_interrupt",
+        # The op-walk counter of the test-hooks dispatch counters.
+        "interp::legacy::WALKS",
         # Machine delivery selects the paged adapter only with CR0.PG set;
         # PG=0 retains its statically unpaged transfer helpers.
         "interp::legacy::paging",
