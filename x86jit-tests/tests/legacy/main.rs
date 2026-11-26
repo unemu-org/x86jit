@@ -43,6 +43,7 @@ mod legacy_redundant_prefix;
 mod legacy_rep_fault_flags;
 mod legacy_rollback_sweep;
 mod legacy_seg16;
+mod legacy_seg286;
 mod legacy_seg32;
 mod legacy_segment_blocks;
 mod legacy_sse_integer;

@@ -2648,7 +2648,8 @@ Privileged and IOPL-sensitive instructions, POPF, and privilege transitions use
 singleton helpers. Transitions end the block and reselect the segment class.
 The 486 alignment-refusal regime retains the checked transaction path.
 
-**Interpreted Segmented (decision-27 interpreter checkpoint).** On 386/486,
+**Interpreted Segmented (decision-27 interpreter checkpoint).** On the
+80286 (xj-to9.36, below) and on 386/486,
 protected code that Flat32 does not admit, with CS.D=0 (xj-to9.13) or
 CS.D=1 (xj-to9.24), selects Segmented at CPL 0–3, paged or unpaged, when CS
 is present executable application code and every usable segment cache has
@@ -2666,12 +2667,35 @@ addresses with 16 bits and with 32 bits under 67h, and CS.D=1 code with
 the descriptor is loaded) and, for expand-down data, the B-dependent upper
 bound FFFFh or FFFFFFFFh (Vol 3A §3.4.5 p. 3-11). The public
 `SegmentClass::Seg16` of xj-to9.13 is renamed `SegmentClass::Segmented`;
-witnesses are `legacy_seg16.rs`, `legacy_seg32.rs` and the census. The full
+witnesses are `legacy_seg16.rs`, `legacy_seg32.rs`, `legacy_seg286.rs` and the census. The full
 entry stamp guards base, limit, type/rights, expand-down and D/B for all six
 caches. Scalar address IR embeds the derived inclusive offset interval and
 wrapping base; inaccessible types and null caches embed an empty interval.
 Each complete operand checks that interval before paging or physical access
 (SDM Vol 3A §§3.4.5.1, 6.3–6.4). Helpers retain live Checked accesses.
+
+The `I80286` selects Segmented under the same admission; its contexts are
+always unpaged with CS.D = SS.B = 0, since the context check refuses PG, D/B
+and G on that generation. No part of the proof is 386-specific. The 286
+hidden cache is a 24-bit base, a 16-bit limit and the access byte (I286 PRM
+§6.3 Fig. 6-3 p. 6-5). Offsets are checked whole-operand against the cached
+limit and type before any memory reference, an expand-down segment admitting
+limit+1 to FFFFh (§7.4.1 pp. 7-12–13, §11.2.2 p. 11-2), with #SS(0) through
+SS and #GP(0) otherwise (App. B MOV p. B-74). The 24-bit sum of base and
+offset wraps at the bus (§6.4 p. 6-6): operands, fetches and the block's
+code-source registration all use the model's physical mask, so a store to the
+wrapped bytes of a running block stops it before a stale successor. In-block
+DS/ES loads run the shared descriptor helper with the 286 format and faults
+(App. B MOV pp. B-73–74), as Checked does. LOADALL, LMSW, the task-switching
+and gated transfers and the IOPL-sensitive instructions stay checked
+singletons that reselect from the caches they leave. An instruction longer
+than ten bytes (App. B #GP p. B-9) ends the block before it and faults as a
+singleton, after its predecessors retire. The far-transfer lanes are paged-only, so the 286 has
+none. Witnesses: `legacy_seg286.rs`, a census of every one-byte and 0F xx
+form against Checked at CPL 0 and 3, limit and expand-down edges, null
+selectors, segment-load and task-switch faults with their error codes, far
+calls and gates, budgets, TF, interrupt boundaries, SMC across the 24-bit
+wrap and LOADALL.
 
 Segmented shares the bounded Flat32 proof cache and accounting walk. Linear-page
 boundaries include CS.base; a straddling first instruction is a singleton.

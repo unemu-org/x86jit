@@ -1,6 +1,7 @@
 //! Warm, finite five-instruction loops for the compiled-Machine J0 decision.
 //! Arguments: iterations (default 2M), rounds (default 5), optional path/workload.
-//! MACHINE32_MODEL=486 selects I80486Dx; the default is I80386.
+//! MACHINE32_MODEL=486 selects I80486Dx, 286 the I80286 (the unpaged
+//! protected16 paths only); the default is I80386.
 //! farcall uses MACHINE32_FAR_INTERVAL guest instructions per call (default 25).
 //! farseg reloads DS/ES and calls far in protected16 or paged V86.
 //! segmix mirrors a PC-class embedder's 16-bit protected and V86 body: per 25
@@ -131,6 +132,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     if machine {
         vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
             Ok("486") => CpuModel::I80486Dx,
+            Ok("286") => CpuModel::I80286,
             _ => CpuModel::I80386,
         });
     }
@@ -496,7 +498,12 @@ fn segmix_code(data: u16, far: u16, bits: u32) -> Vec<u8> {
     a.call(near).unwrap();
     a.db(&[0x9a, 0, 0, far as u8, (far >> 8) as u8]).unwrap(); // CALL FAR far:0.
     a.mov(word_ptr(0x102).es(), ax).unwrap();
-    a.inc(ebp).unwrap();
+    if std::env::var("MACHINE32_MODEL").as_deref() == Ok("286") {
+        // The 80286 has no operand-size prefix: the same unit on BP.
+        a.inc(bp).unwrap();
+    } else {
+        a.inc(ebp).unwrap();
+    }
     a.add(si, ax).unwrap();
     a.rol(dx, 1).unwrap();
     a.add(cx, 7).unwrap();

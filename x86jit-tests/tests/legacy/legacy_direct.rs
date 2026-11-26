@@ -80,7 +80,7 @@ fn direct_proof_checks_all_six_caches_and_ignores_the_board_line() {
                     derive_legacy_context(model, &changed)
                         .unwrap()
                         .segment_class,
-                    if !reset && generation == CpuGeneration::I386 {
+                    if !reset {
                         SegmentClass::Segmented
                     } else {
                         SegmentClass::Checked

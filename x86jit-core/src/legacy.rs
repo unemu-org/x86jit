@@ -370,7 +370,12 @@ fn derive_context<const V86: bool>(
         {
             SegmentClass::Flat32
         } else if protected
-            && model.generation == CpuGeneration::I386
+            // Both protected generations (xj-to9.36). The proof reads the cached
+            // base, limit, type and ED, plus B, which the 80286 storage check
+            // above keeps clear: its expand-down bound is FFFFh (I286 PRM
+            // §7.4.1 p. 7-13, §11.2.2 p. 11-2). Its whole-operand checks precede
+            // any reference (§7.4.1 p. 7-13); the 24-bit sum wraps at the bus
+            // mask (§6.4 p. 6-6). Loads keep the shared descriptor checks.
             && cs.attributes & 0x98 == 0x98
             && state
                 .segments
@@ -696,9 +701,8 @@ mod tests {
                                         context,
                                         MachineContext {
                                             // No case is flat: CS.base is non-zero.
-                                            segment_class: if pe
-                                                && generation == CpuGeneration::I386
-                                            {
+                                            // Every valid protected case is Segmented.
+                                            segment_class: if pe {
                                                 SegmentClass::Segmented
                                             } else {
                                                 SegmentClass::Checked

@@ -118,9 +118,11 @@ impl State {
             vm.handle_smc(exit_word);
             let mut sources = Vec::new();
             for offset in 0..ir.guest_len {
+                // The model's bus mask, as fetch used it: an 80286 CS.base + IP
+                // past FFFFFFh wraps to the first megabyte (I286 PRM §6.4 p. 6-6).
                 let (physical, _) = crate::legacy::physical_span(
                     cpu,
-                    u32::MAX,
+                    crate::legacy::physical_mask(context.generation),
                     u64::from(
                         cpu.legacy.segments[0]
                             .base
