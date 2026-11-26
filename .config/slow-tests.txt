@@ -130,3 +130,4 @@ x86jit-tests::legacy legacy_census_386::seg16_cpl3_checked_census_forms_are_equa
 x86jit-tests::legacy legacy_census_386::seg32_checked_census_forms_are_equal
 x86jit-tests::legacy legacy_census_386::seg32_cpl3_checked_census_forms_are_equal
 x86jit-tests::legacy legacy_seg32::whole_operand_edges_with_both_address_sizes_and_expand_down_b
+x86jit-tests::legacy legacy_rollback_sweep::protected_code32_fault_atomicity_sweep
