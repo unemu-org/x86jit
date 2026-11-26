@@ -16,6 +16,7 @@ mod paging;
 
 mod flat32;
 pub(super) mod links;
+pub(super) mod live;
 mod proof_map;
 
 /// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
@@ -3273,9 +3274,10 @@ impl Vcpu {
                 let retained20 = direct20 && retained && vm.mem.fetch_policy.is_none();
                 // A turn after a direct exit or a near RET consults the
                 // successor links (`links.rs`) before the resolver; a turn
-                // that drained a store into a code page does not. That test is a cost filter
-                // only: such a store advanced the publication generation,
-                // which every link names (`Link::generation`).
+                // that drained a store into a code page does not. That test
+                // is a cost filter only: such a store advanced the proof
+                // generation, which every link names (`Link::generation`),
+                // unless a live instruction field absorbed it (`live.rs`).
                 let mut record = false;
                 let followed = if linked && !dirty {
                     match execution.follow_link(

@@ -409,6 +409,24 @@ fn derive_context<const V86: bool>(
     })
 }
 
+/// The value of a live field (`LegacyOp::LiveField`) whose little-endian
+/// bytes are the low `bytes` of `raw`: sign-extended from that width to
+/// `extend` bits and zero-extended above, or zero-extended for `extend` 0.
+#[inline]
+pub(crate) fn live_field_value(raw: u64, bytes: u8, extend: u8) -> u64 {
+    let unused = 64 - 8 * u32::from(bytes);
+    let value = (raw << unused) >> unused;
+    if extend == 0 {
+        return value;
+    }
+    let signed = (((raw << unused) as i64) >> unused) as u64;
+    if extend >= 64 {
+        signed
+    } else {
+        signed & ((1 << extend) - 1)
+    }
+}
+
 /// Whether cache `i` (CS, DS, ES or SS) satisfies the Flat32 proof at `cpl`.
 /// A data-segment load inside a Flat32 block keeps the block only when the
 /// loaded DS or ES cache still satisfies it (spec.md §17.10).
@@ -973,6 +991,25 @@ pub enum LegacyOp {
     SharedWalk,
     /// Architectural rollback is required by this instruction's helper lowering.
     Checkpoint,
+    /// A live instruction field (xj-to9.46): the `bytes`-wide immediate or
+    /// displacement of the executing instruction, read when it executes from
+    /// `bus`, the bus address its fetch translated it to (the private proof
+    /// holding this op lives no longer than that translation). The
+    /// little-endian value is sign-extended from its width to `extend` bits
+    /// and zero-extended above, or zero-extended when `extend` is 0: the
+    /// value the decoder reports for the field. It reads RAM or ROM the
+    /// proof's mapping keeps mapped, so it does not fail; if the copy ever
+    /// came up short it would report an execute access to `bus`, a bus
+    /// address. One copy of the field, not one atomic access: a concurrent
+    /// multi-byte patch from another vCPU can be seen torn, as SDM Vol 3A
+    /// §11.1.3 pp. 11-5–11-6 leaves cross-modifying code without its
+    /// synchronization algorithm model-specific.
+    LiveField {
+        dst: crate::ir::Temp,
+        bus: u64,
+        bytes: u8,
+        extend: u8,
+    },
     Address {
         dst: crate::ir::Temp,
         segment: SegmentId,

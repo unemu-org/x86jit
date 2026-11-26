@@ -684,6 +684,8 @@ pub struct Vm {
     pub backend: Box<dyn Backend>,
     pub cache: TranslationCache,
     pub mem: Memory,
+    /// Live instruction fields of Machine proofs (xj-to9.46).
+    live_fields: legacy::live::LiveFields,
     /// Cached policy byte (0 = ordinary, 1 = sparse); the mutex serializes a switch.
     /// An integer lets run entry compare bytes without normalizing an atomic bool.
     sparse_backing: (std::sync::atomic::AtomicU8, Mutex<()>),
@@ -1414,6 +1416,7 @@ impl Vm {
             source_read_hook: Mutex::new(None),
             sparse_backing: (std::sync::atomic::AtomicU8::new(0), Mutex::new(())),
             mem: self.mem.deep_copy()?,
+            live_fields: legacy::live::LiveFields::default(),
             cache: {
                 let mut cache = TranslationCache::with_code_lifetime(backend.code_lifetime());
                 cache.invalidate_pending_fetches = self.mem.fetch_policy.is_some();
@@ -1485,6 +1488,7 @@ impl Vm {
                 Mutex::new(()),
             ),
             mem,
+            live_fields: legacy::live::LiveFields::default(),
             cache: TranslationCache::with_code_lifetime(backend.code_lifetime()),
             backend,
             consistency,
@@ -1697,6 +1701,17 @@ impl Vm {
     fn invalidate_dirty<const RECORD: bool>(&self, dirty: Vec<(u64, u64)>) -> bool {
         let mut invalidated = false;
         for (lo, hi) in dirty {
+            // A patch inside a live Machine instruction field (xj-to9.46).
+            // Only a recording drain can meet one: a live field exists only
+            // once a private proof has. Fetch approvals are page-wide: a
+            // fetch policy never absorbs.
+            if RECORD
+                && self.live_fields.armed()
+                && self.mem.fetch_policy.is_none()
+                && self.live_fields.absorb(&self.cache, lo, hi)
+            {
+                continue;
+            }
             let page = lo >> crate::memory::CODE_PAGE_BITS;
             let (lo, hi) = if self.mem.fetch_policy.is_some() {
                 let start = page << crate::memory::CODE_PAGE_BITS;

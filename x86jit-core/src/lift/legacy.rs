@@ -9,7 +9,11 @@ struct Ops {
     values: Vec<IrOp>,
     context: MachineContext,
     profile: &'static crate::ModelProfile,
+    /// The fields read live, by `LiveFieldKind`, and the temporary each
+    /// defines at its first use.
+    live: Option<Box<LiveRequest>>,
 }
+type LiveRequest = [Option<(LiveSpec, Option<Temp>)>; 2];
 impl std::ops::Deref for Ops {
     type Target = [IrOp];
     fn deref(&self) -> &[IrOp] {
@@ -30,6 +34,265 @@ impl LiftBuffer for Ops {
     }
     fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
         Some(self.profile)
+    }
+    fn live_field(&mut self, kind: LiveFieldKind, tg: &mut TempGen) -> Option<Val> {
+        let (spec, temp) = self.live.as_mut()?[kind as usize].as_mut()?;
+        // One read per instruction: every use sees the same value.
+        let dst = *temp.get_or_insert_with(|| {
+            let dst = tg.fresh();
+            self.values.push(IrOp::Legacy(L::LiveField {
+                dst,
+                bus: spec.bus,
+                bytes: spec.bytes,
+                extend: spec.extend,
+            }));
+            dst
+        });
+        Some(Val::Temp(dst))
+    }
+}
+
+/// Where a live field's bytes are and how the decoder extends them.
+#[derive(Clone, Copy, Debug)]
+struct LiveSpec {
+    bus: u64,
+    bytes: u8,
+    extend: u8,
+}
+
+/// The immediate and displacement fields of an instruction whose lowering
+/// can read them live (xj-to9.46): `(offset, bytes)` in the instruction,
+/// indexed by `LiveFieldKind`, and its length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveFields {
+    pub len: u8,
+    pub fields: [Option<(u8, u8)>; 2],
+}
+
+/// The live-capable fields of the instruction at the start of `code`. Only
+/// the scalar forms whose immediate and displacement reach the IR through
+/// the central operand lowering (`lower_read`, `effective_address_no_segment`)
+/// qualify; `live_instruction` still proves that no other op depends on the
+/// bytes. Branch displacements, ENTER/RET counts, ports, vectors and shift
+/// counts stay baked.
+#[cold]
+#[inline(never)]
+pub(crate) fn live_fields(code: &[u8], ip: u32, context: MachineContext) -> Option<LiveFields> {
+    use Mnemonic::*;
+    let mut decoder = Decoder::with_ip(
+        u32::from(context.default_operand_bits),
+        code,
+        u64::from(ip),
+        crate::model::decode::decoder_options_for_generation(context.generation),
+    );
+    let insn = decoder.decode();
+    if insn.is_invalid()
+        || !matches!(
+            insn.mnemonic(),
+            Mov | Lea | Add | Adc | Sub | Sbb | And | Or | Xor | Cmp | Test
+        )
+        || (0..insn.op_count()).any(|i| {
+            let register = insn.op_register(i);
+            register.is_segment_register()
+                || register.is_cr()
+                || register.is_dr()
+                || register.is_tr()
+        })
+    {
+        return None;
+    }
+    let offsets = decoder.get_constant_offsets(&insn);
+    if offsets.has_immediate2() {
+        return None;
+    }
+    let mut fields = [None; 2];
+    if offsets.has_immediate() {
+        fields[LiveFieldKind::Immediate as usize] = Some((
+            offsets.immediate_offset() as u8,
+            offsets.immediate_size() as u8,
+        ));
+    }
+    if offsets.has_displacement() {
+        fields[LiveFieldKind::Displacement as usize] = Some((
+            offsets.displacement_offset() as u8,
+            offsets.displacement_size() as u8,
+        ));
+    }
+    fields.iter().any(Option::is_some).then_some(LiveFields {
+        len: insn.len() as u8,
+        fields,
+    })
+}
+
+/// The decoder's value of the `kind` field of the instruction at the start
+/// of `code`.
+fn decoded_field(code: &[u8], ip: u32, context: MachineContext, kind: LiveFieldKind) -> u64 {
+    let insn = Decoder::with_ip(
+        u32::from(context.default_operand_bits),
+        code,
+        u64::from(ip),
+        crate::model::decode::decoder_options_for_generation(context.generation),
+    )
+    .decode();
+    match kind {
+        LiveFieldKind::Immediate => (0..insn.op_count())
+            .find(|&i| is_immediate(insn.op_kind(i)))
+            .map_or(0, |i| insn.immediate(i)),
+        LiveFieldKind::Displacement => insn.memory_displacement64(),
+    }
+}
+
+/// The instruction at the start of `code` with each `requested` field
+/// (`LiveFields::fields` index → the bus address of its first byte) read
+/// when it executes, or `None` when that cannot be exact. Exactness is
+/// checked, not assumed: the field's extension must reproduce the decoder's
+/// value, and the lift must be identical for the field's current bytes, their
+/// complement and zero, so no op other than `LiveField` depends on them.
+#[cold]
+#[inline(never)]
+pub(crate) fn live_instruction(
+    code: &[u8],
+    ip: u32,
+    context: MachineContext,
+    profile: &'static crate::ModelProfile,
+    fields: LiveFields,
+    requested: [Option<u64>; 2],
+) -> Option<IrBlock> {
+    if code.len() != usize::from(fields.len) {
+        return None;
+    }
+    let probe = |fill: fn(u8) -> u8| {
+        let mut probe = code.to_vec();
+        for (field, bus) in fields.fields.iter().zip(requested) {
+            if let (Some((offset, bytes)), Some(_)) = (field, bus) {
+                for byte in &mut probe[usize::from(*offset)..usize::from(offset + bytes)] {
+                    *byte = fill(*byte);
+                }
+            }
+        }
+        probe
+    };
+    let probes = [code.to_vec(), probe(|b| !b), probe(|_| 0)];
+    let mut live = [None; 2];
+    for (kind, slot) in [LiveFieldKind::Immediate, LiveFieldKind::Displacement]
+        .into_iter()
+        .zip(&mut live)
+    {
+        let (Some((offset, bytes)), Some(bus)) =
+            (fields.fields[kind as usize], requested[kind as usize])
+        else {
+            continue;
+        };
+        let range = usize::from(offset)..usize::from(offset + bytes);
+        let extend = [0, 64, 32, 16].into_iter().find(|&extend| {
+            probes.iter().all(|code| {
+                let mut raw = [0; 8];
+                raw[..range.len()].copy_from_slice(&code[range.clone()]);
+                crate::legacy::live_field_value(u64::from_le_bytes(raw), bytes, extend)
+                    == decoded_field(code, ip, context, kind)
+            })
+        })?;
+        *slot = Some((LiveSpec { bus, bytes, extend }, None));
+    }
+    let mut lifts = probes
+        .iter()
+        .map(|code| instruction_with(code, ip, context, profile, Some(Box::new(live))));
+    let first = lifts.next()?.ok()?;
+    let image = format!("{:?}", first.ops);
+    if !first
+        .ops
+        .iter()
+        .any(|op| matches!(op, IrOp::Legacy(L::LiveField { .. })))
+        || first.ops.iter().any(|op| {
+            matches!(
+                op,
+                IrOp::Trap { .. } | IrOp::Unsupported { .. } | IrOp::Legacy(L::Refuse { .. })
+            )
+        })
+    {
+        return None;
+    }
+    for lift in lifts {
+        let lift = lift.ok()?;
+        if lift.guest_len != first.guest_len
+            || lift.temp_count != first.temp_count
+            || format!("{:?}", lift.ops) != image
+        {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+// The live-field exactness witness: a lowering that bakes its immediate
+// somewhere `live_field` does not reach (1: its value, 2: whether it is 0).
+#[cfg(test)]
+thread_local! {
+    static BAKE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bake_for_test(insn: &Instruction, ops: &mut Vec<IrOp>, tg: &mut TempGen) {
+    let Some(value) = (0..insn.op_count())
+        .find(|&i| is_immediate(insn.op_kind(i)))
+        .map(|i| insn.immediate(i))
+    else {
+        return;
+    };
+    let baked = match BAKE.with(std::cell::Cell::get) {
+        1 => value,
+        2 => u64::from(value == 0),
+        _ => return,
+    };
+    ops.push(IrOp::Add {
+        dst: tg.fresh(),
+        a: Val::Imm(baked),
+        b: Val::Imm(0),
+        size: 4,
+        set_flags: FlagMask::NONE,
+    });
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// `live_instruction` reads a field live only if no op other than its
+    /// `LiveField` depends on the field's bytes: a lowering that bakes the
+    /// value, or a predicate on it that the probes (the current bytes,
+    /// their complement and zero) distinguish, stays baked. A predicate the
+    /// probes cannot tell apart (say, `== 1` with the value 5) would not be
+    /// caught; only the forms `live_fields` admits, whose lowering reaches
+    /// the field through `lower_read` and `effective_address_no_segment`
+    /// alone, are ever probed.
+    #[test]
+    fn a_lowering_that_bakes_the_field_stays_baked() {
+        let context =
+            crate::legacy::derive_legacy_context(crate::CpuModel::I80486Dx.legacy_model(), &{
+                let mut cpu = crate::CpuState::default();
+                cpu.legacy.cr0 = 1;
+                for (i, cache) in cpu.legacy.segments.iter_mut().enumerate() {
+                    cache.limit = u32::MAX;
+                    cache.attributes = if i == 0 { 0x409b } else { 0x4093 };
+                }
+                cpu
+            })
+            .unwrap();
+        let profile = crate::model::profile_for_generation(context.generation);
+        // MOV EAX, 5.
+        let code = b"\xb8\x05\x00\x00\x00";
+        let fields = live_fields(code, 0x1000, context).unwrap();
+        assert_eq!(
+            fields.fields[LiveFieldKind::Immediate as usize],
+            Some((1, 4))
+        );
+        let requested = [Some(0x1001), None];
+        for (bake, live) in [(0, true), (1, false), (2, false)] {
+            BAKE.with(|b| b.set(bake));
+            let ir = live_instruction(code, 0x1000, context, profile, fields, requested);
+            BAKE.with(|b| b.set(0));
+            assert_eq!(ir.is_some(), live, "bake {bake}");
+        }
     }
 }
 
@@ -125,6 +388,9 @@ impl<B: LiftBuffer> LiftBuffer for ContextOps<'_, B> {
     fn push(&mut self, op: IrOp) {
         self.ops.push(op);
     }
+    fn live_field(&mut self, kind: LiveFieldKind, tg: &mut TempGen) -> Option<Val> {
+        self.ops.live_field(kind, tg)
+    }
     fn legacy_context(&self) -> Option<MachineContext> {
         Some(self.context)
     }
@@ -166,6 +432,16 @@ pub(crate) fn instruction_for_profile(
     context: MachineContext,
     profile: &'static crate::ModelProfile,
 ) -> Result<IrBlock, LiftError> {
+    instruction_with(code, ip, context, profile, None)
+}
+
+fn instruction_with(
+    code: &[u8],
+    ip: u32,
+    context: MachineContext,
+    profile: &'static crate::ModelProfile,
+    live: Option<Box<LiveRequest>>,
+) -> Result<IrBlock, LiftError> {
     let mut decoder = Decoder::with_ip(
         u32::from(context.default_operand_bits),
         code,
@@ -193,6 +469,7 @@ pub(crate) fn instruction_for_profile(
         values: Vec::new(),
         context,
         profile,
+        live,
     };
     let mut tg = TempGen::new();
     ops.push(IrOp::InsnStart {
@@ -324,6 +601,10 @@ pub(crate) fn instruction_for_profile(
         }
         if locked_mov {
             lock_stores(&mut ops.values, &mut tg);
+        }
+        #[cfg(test)]
+        if ops.live.is_some() {
+            bake_for_test(&insn, &mut ops.values, &mut tg);
         }
         mark_memory_accesses(&insn, mode, &mut ops.values);
         fill_ir_bytes(&insn, code, u64::from(ip), &mut ops.values);
@@ -646,7 +927,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
                 | IrOp::Jump { .. }
                 | IrOp::Branch { .. }
                 | IrOp::Legacy(_)
-        );
+        ) && !matches!(op, IrOp::Legacy(L::LiveField { .. }));
         if committed && faultable {
             return true;
         }
@@ -679,6 +960,7 @@ fn rollback_required(ops: &[IrOp]) -> bool {
                 op,
                 L::Address { .. }
                     | L::Flat32Address { .. }
+                    | L::LiveField { .. }
                     | L::CoprocessorOverrun { .. }
                     | L::DirectStackAddress { .. }
                     | L::ReadSelector { .. }

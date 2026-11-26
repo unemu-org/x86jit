@@ -2658,12 +2658,32 @@ where
     exit
 }
 
+/// A live field's value (`LegacyOp::LiveField`, xj-to9.46): its bytes
+/// now, in one copy from the bus address the fetch translated, extended as
+/// the decoder extends them. The proof holding the op lives no longer than
+/// that RAM or ROM mapping (`Memory::mapping_identity`), so the copy cannot
+/// come up short; if it did, it would report an execute access to the bus
+/// address (`LegacyOp::LiveField`).
+#[inline]
+pub(super) fn live_field(memory: &Memory, bus: u64, bytes: u8, extend: u8) -> Result<u64, Exit> {
+    let mut raw = [0; 8];
+    match memory.fetch_code(bus, &mut raw[..usize::from(bytes)]) {
+        Ok(copied) if copied == usize::from(bytes) => Ok(legacy::live_field_value(
+            u64::from_le_bytes(raw),
+            bytes,
+            extend,
+        )),
+        _ => Err(Exit::unmapped_memory(bus, AccessKind::Execute)),
+    }
+}
+
 pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
     ir.ops.iter().all(|op| match op {
         IrOp::Legacy(op) => {
             matches!(
                 op,
                 L::Address { .. }
+                    | L::LiveField { .. }
                     | L::Flat32Address { .. }
                     | L::SegmentedAddress { .. }
                     | L::I486Gate
@@ -5050,6 +5070,12 @@ where
                 L::ReadSelector { dst, segment } => {
                     temps[*dst as usize] = u64::from(selector(cpu, *segment))
                 }
+                L::LiveField {
+                    dst,
+                    bus,
+                    bytes,
+                    extend,
+                } => temps[*dst as usize] = live_field(mem.raw(), *bus, *bytes, *extend)?,
                 L::LoadSegment {
                     segment,
                     value,

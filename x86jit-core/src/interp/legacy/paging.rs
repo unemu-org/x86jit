@@ -1907,6 +1907,7 @@ where
                         | L::Flat32Address { .. }
                         | L::SegmentedAddress { .. }
                         | L::ReadSelector { .. }
+                        | L::LiveField { .. }
                         | L::Push { .. }
                         | L::Pop { .. }
                         | L::AdjustStack { .. }
@@ -2696,7 +2697,9 @@ fn register_effect(op: &IrOp) -> bool {
             | IrOp::SetDf { .. }
             | IrOp::Lahf
             | IrOp::Sahf
-            | IrOp::Legacy(L::Checkpoint | L::ReadSelector { .. } | L::I486Gate)
+            | IrOp::Legacy(
+                L::Checkpoint | L::ReadSelector { .. } | L::I486Gate | L::LiveField { .. }
+            )
     )
 }
 
@@ -3419,6 +3422,12 @@ fn fast_instruction(
             // execute_flat32 excluded the alignment-refusal regime first.
             IrOp::InsnStart { .. } | IrOp::Legacy(L::Checkpoint | L::I486Gate) => {}
             IrOp::ReadReg { dst, reg } => temps[*dst as usize] = crate::interp::read_reg(cpu, *reg),
+            IrOp::Legacy(L::LiveField {
+                dst,
+                bus,
+                bytes,
+                extend,
+            }) => temps[*dst as usize] = super::live_field(memory, *bus, *bytes, *extend).ok()?,
             IrOp::Add {
                 dst,
                 a,

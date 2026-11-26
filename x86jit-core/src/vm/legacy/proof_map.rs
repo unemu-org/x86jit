@@ -127,7 +127,7 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     /// overlapped, and return the current source generation.
     #[inline(always)]
     pub(super) fn reconcile(&mut self, cache: &crate::cache::TranslationCache) -> u64 {
-        let generation = cache.publication_generation();
+        let generation = cache.proof_generation();
         if generation == self.generation {
             return generation;
         }

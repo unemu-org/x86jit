@@ -94,7 +94,7 @@ impl State {
                 .as_ref()
                 .is_none_or(|old| !Arc::ptr_eq(old, &mapping))
             {
-                self.blocks.reset(vm.cache.publication_generation());
+                self.blocks.reset(vm.cache.proof_generation());
                 self.mapping = Some(mapping);
             }
             // A write drops the proofs whose physical sources it overlaps.
@@ -114,7 +114,8 @@ impl State {
             }
             let source = crate::memory::LiftSource::new(&vm.mem);
             let permit = vm.mem.fetch_permit();
-            let ir = lift(vm, cpu, context, &source)?;
+            let mut live = super::live::Plan::default();
+            let ir = lift(vm, cpu, context, &source, &mut live)?;
             if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
                 continue;
             }
@@ -133,6 +134,9 @@ impl State {
             #[cfg(test)]
             vm.after_source_read();
             vm.handle_smc(exit_word);
+            if !vm.live_fields.commit(&vm.cache, &vm.mem, live) {
+                continue;
+            }
             let mut sources = Vec::new();
             for offset in 0..ir.guest_len {
                 // The model's bus mask, as fetch used it: an 80286 CS.base + IP
@@ -189,6 +193,7 @@ fn lift(
     cpu: &CpuState,
     context: MachineContext,
     source: &crate::memory::LiftSource<'_>,
+    live: &mut super::live::Plan,
 ) -> Result<IrBlock, Exit> {
     let mut ip = cpu.rip;
     let mut block: Option<IrBlock> = None;
@@ -207,11 +212,27 @@ fn lift(
             Ok(bytes) => bytes,
             Err(exit) => return block.ok_or(exit),
         };
-        let mut instruction = match crate::lift::legacy::instruction_for_profile(
+        // Each byte's bus address, as fetch and the registered sources use it.
+        let bus = |offset: u32| {
+            crate::legacy::physical_span(
+                cpu,
+                crate::legacy::physical_mask(context.generation),
+                u64::from(
+                    cpu.legacy.segments[0]
+                        .base
+                        .wrapping_add((ip as u32).wrapping_add(offset)),
+                ),
+                1,
+            )
+            .0
+        };
+        let mut instruction = match vm.live_fields.instruction(
             &bytes,
             ip as u32,
             context,
             vm.machine_model_profile(context.generation),
+            bus,
+            live,
         ) {
             Ok(ir) => ir,
             Err(error) => return block.ok_or_else(|| direct_refusal(cpu, error)),

@@ -45,6 +45,20 @@ pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
     fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
         None
     }
+    /// The instruction's `kind` field as a value read when it executes
+    /// (`LegacyOp::LiveField`), or `None` to bake the decoded value. Only a
+    /// Machine proof lift asks for live fields (xj-to9.46).
+    fn live_field(&mut self, _kind: LiveFieldKind, _tg: &mut TempGen) -> Option<Val> {
+        None
+    }
+}
+
+/// An instruction field that a lowering can read live (xj-to9.46): the
+/// immediate operand, or the memory operand's displacement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LiveFieldKind {
+    Immediate,
+    Displacement,
 }
 impl LiftBuffer for Vec<IrOp> {
     #[inline(always)]
@@ -4737,7 +4751,9 @@ pub(crate) fn lower_read(
             });
             Ok(Val::Temp(t))
         }
-        kind if is_immediate(kind) => Ok(Val::Imm(insn.immediate(op_idx))),
+        kind if is_immediate(kind) => Ok(ops
+            .live_field(LiveFieldKind::Immediate, tg)
+            .unwrap_or(Val::Imm(insn.immediate(op_idx)))),
         _ => Err(unsupported_insn(insn)),
     }
 }
@@ -5044,10 +5060,15 @@ pub(crate) fn effective_address_no_segment(
         });
     }
 
-    let addr = match acc {
-        None => Val::Imm(disp),
-        Some(a) if disp == 0 => a,
-        Some(a) => add_addr(a, Val::Imm(disp), ops, tg),
+    // A live displacement keeps its addition whatever value it holds now.
+    // Only a displacement field is ever requested live.
+    let live = ops.live_field(LiveFieldKind::Displacement, tg);
+    let addr = match (acc, live) {
+        (None, Some(disp)) => disp,
+        (Some(a), Some(disp)) => add_addr(a, disp, ops, tg),
+        (None, None) => Val::Imm(disp),
+        (Some(a), None) if disp == 0 => a,
+        (Some(a), None) => add_addr(a, Val::Imm(disp), ops, tg),
     };
 
     // Address-size truncation (§17.5). The effective address wraps modulo the

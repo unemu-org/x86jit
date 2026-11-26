@@ -718,6 +718,9 @@ pub struct TranslationCache {
     // Every invalidation cancels source reads still in flight, even if no cached
     // span overlaps. Keep this separate so data writes preserve dispatch predictors.
     publication_generation: AtomicU64,
+    // Drained writes absorbed by live instruction fields (xj-to9.46). They
+    // advance `publication_generation()` but not `proof_generation()`.
+    absorbed: AtomicU64,
     // The bytes behind recent generation advances, so private proof maps can
     // drop only the proofs a write overlapped (xj-to9.45). Drained writes are
     // recorded once a private proof exists (`private_sources`); any other
@@ -884,6 +887,7 @@ impl TranslationCache {
             lifetime: RwLock::default(),
             previous_lifetimes: Mutex::default(),
             publication_generation: AtomicU64::new(0),
+            absorbed: AtomicU64::new(0),
             written_log: Mutex::default(),
             private_sources: std::sync::atomic::AtomicBool::new(false),
             invalidate_pending_fetches: false,
@@ -947,7 +951,7 @@ impl TranslationCache {
         // publication atomic with respect to invalidation.
         let mut spans = self.spans.write().unwrap();
         let mut map = self.map.write();
-        if self.publication_generation.load(Ordering::Acquire) != since_generation {
+        if self.publication_generation() != since_generation {
             self.code_lifetime().discard(&block);
             return false;
         }
@@ -982,7 +986,7 @@ impl TranslationCache {
     ) -> bool {
         let mut sp = self.spans.write().unwrap();
         let mut mp = self.map.write();
-        if self.publication_generation.load(Ordering::Acquire) != since_generation {
+        if self.publication_generation() != since_generation {
             self.code_lifetime().discard(&block);
             return false;
         }
@@ -1116,7 +1120,7 @@ impl TranslationCache {
         self.hotness.write().unwrap().clear();
         self.region_decision.write().unwrap().clear();
         // Every source is dropped: no record covers this advance.
-        self.publication_generation.fetch_add(1, Ordering::Release);
+        self.advance_publication::<false>(0, 0);
         // Closed domains can still own deferred teardown workers. Keep them
         // reachable so VM shutdown joins every replaced backend's workers.
         self.previous_lifetimes
@@ -1152,12 +1156,27 @@ impl TranslationCache {
         self.code_lifetime().epoch()
     }
 
+    /// The proof generation (xj-to9.46): every invalidation advances it but
+    /// a drained store that only live instruction fields observe, on which
+    /// no private proof or successor link depends (`absorb_written`). The
+    /// write log (`written_since`), the private proof maps and the links
+    /// (`vm/legacy/links.rs`) name it.
+    #[inline(always)]
+    pub(crate) fn proof_generation(&self) -> u64 {
+        self.publication_generation.load(Ordering::Acquire)
+    }
+
     /// Source-publication generation. Snapshot before fetching source bytes or
     /// cached IR; insertion and upgrades check it under the spans lock. Every
     /// invalidation advances it, including writes with no overlapping cached unit.
     /// This does not flush vCPU dispatch predictors (see [`Self::epoch`]).
     pub fn publication_generation(&self) -> u64 {
-        self.publication_generation.load(Ordering::Acquire)
+        // Each counter only grows: a read between two absorbed writes is a
+        // value the sum held, or one between them.
+        let absorbed = self.absorbed.load(Ordering::Acquire);
+        self.publication_generation
+            .load(Ordering::Acquire)
+            .wrapping_add(absorbed)
     }
 
     // Advance the source generation for a write of `[lo, hi)`. `RECORD`
@@ -1166,7 +1185,11 @@ impl TranslationCache {
     //
     // Only `Vm::handle_smc`'s drain of byte stores records
     // (`invalidate_written_recorded`): its range is exactly the bytes that
-    // changed, so a proof over other bytes stays valid. Every other advance
+    // changed, so a proof over other bytes stays valid. A drained store that
+    // only live instruction fields observe does not advance it at all
+    // (`absorb_written`): no private proof bakes those bytes. A live-field
+    // promotion records its instruction's bytes (`advance_for_promotion`),
+    // over which a proof may bake the field. Every other advance
     // must stay a gap, which makes every private proof revalidate: an
     // `invalidate_overlapping` for a mapping, protection, region-kind,
     // backing or fetch-policy change, or one an embedder issues after editing
@@ -1208,7 +1231,7 @@ impl TranslationCache {
     pub(crate) fn written_since(&self, since: u64, out: &mut Vec<(u64, u64)>) -> (u64, bool) {
         let log = self.written_log.lock().unwrap();
         // Recorded advances hold this lock; an unrecorded one makes a gap.
-        let now = self.publication_generation();
+        let now = self.proof_generation();
         let Some(wanted) = now.checked_sub(since) else {
             return (now, false);
         };
@@ -1604,12 +1627,13 @@ impl TranslationCache {
         });
     }
 
-    /// Private interpreted proofs use the global source generation rather than
-    /// shared dispatch keys. Serialize physical source tagging with SMC drains;
-    /// any later invalidation rejects the entire private proof generation.
+    /// Private interpreted proofs use the proof generation
+    /// ([`Self::proof_generation`]) rather than shared dispatch keys.
+    /// Serialize physical source tagging with SMC drains; any later
+    /// invalidation rejects the entire private proof generation.
     pub(crate) fn register_private_sources(&self, generation: u64, on_mark: impl FnOnce()) -> bool {
         let _spans = self.spans.write().unwrap();
-        if self.publication_generation() != generation {
+        if self.proof_generation() != generation {
             return false;
         }
         // Drained writes from here on record their bytes (`written_since`).
@@ -1617,6 +1641,41 @@ impl TranslationCache {
         self.private_sources.store(true, Ordering::Relaxed);
         on_mark();
         true
+    }
+
+    /// A drained code write `[lo, hi)` lying inside a live instruction field
+    /// (xj-to9.46), from `Vm::handle_smc`'s recording drain. Every private
+    /// proof over those bytes reads them when it executes (`vm/legacy/live.rs`),
+    /// so if no shared unit or pending shared source covers them either, the
+    /// write advances only the shared publication generation, cancelling
+    /// in-flight shared lifts, and not the proof generation: no proof map
+    /// drops a proof and no link ends. Returns whether it was absorbed;
+    /// otherwise the caller invalidates as for any code write.
+    pub(crate) fn absorb_written(&self, lo: u64, hi: u64) -> bool {
+        let spans = self.spans.read().unwrap();
+        // Conservative: a wide or uncertain overlap takes the ordinary path.
+        if spans.cached.coverage_overlap(lo, hi).0
+            || (spans.pending_sources.coverage.root.is_some()
+                && spans.pending_sources.coverage_overlap(lo, hi).0)
+        {
+            return false;
+        }
+        self.absorbed.fetch_add(1, Ordering::Release);
+        if self.invalidate_pending_fetches {
+            self.code_lifetime().flush_predictions();
+        }
+        true
+    }
+
+    /// A live-field promotion (xj-to9.46, `vm/legacy/live.rs`): a recorded
+    /// advance of the proof generation over the promoted instruction's bus
+    /// bytes `[lo, hi)`, so every private proof over them drops and a lift
+    /// that read the generation before it fails registration. It is not a
+    /// drained store; like one, its range is exactly the bytes whose proofs
+    /// may no longer hold (they may bake the field), so it may record.
+    pub(crate) fn advance_for_promotion(&self, lo: u64, hi: u64) {
+        let _spans = self.spans.read().unwrap();
+        self.advance_publication::<true>(lo, hi);
     }
 
     pub(crate) fn insert_checked(

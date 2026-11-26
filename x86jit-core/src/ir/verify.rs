@@ -420,6 +420,7 @@ impl IrBlock {
                         check(&[*offset], &[*dst])?
                     }
                     crate::legacy::LegacyOp::ReadSelector { dst, .. }
+                    | crate::legacy::LegacyOp::LiveField { dst, .. }
                     | crate::legacy::LegacyOp::ReadSystemSegment { dst, .. }
                     | crate::legacy::LegacyOp::Pop { dst, .. } => check(&[], &[*dst])?,
                     crate::legacy::LegacyOp::LoadSegment { value, .. }

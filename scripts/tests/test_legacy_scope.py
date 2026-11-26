@@ -157,7 +157,7 @@ REVIEWED_ENTRY_POINTS = {
         # Reached only from Machine after deriving the Flat32 or Segmented proof;
         # the lifter's in-block segment-load mask (xj-to9.18) too.
         "interp::legacy::flat32_ordinary", "interp::legacy::data_segment_load",
-        "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
+        "model::CpuModel", "model::decode",
     },
     "x86jit-core/src/vm/legacy/paging.rs": {
         # Machine-only paged dispatch, incoming-task fault ownership, and the
@@ -166,8 +166,13 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::Outcome", "interp::legacy::Progress",
         "interp::legacy::paging", "interp::legacy::finish_port_input",
         # Paged Flat32 and Segmented blocks reuse the ordinary-IR effect proof.
-        "interp::legacy::flat32_ordinary",
-        "lift::legacy::instruction_for_profile", "model::CpuModel", "model::decode",
+        "interp::legacy::flat32_ordinary", "model::CpuModel", "model::decode",
+    },
+    "x86jit-core/src/vm/legacy/live.rs": {
+        # Live instruction fields (xj-to9.46): called only by the Flat32,
+        # Segmented and paged Machine proof lifts; its witnesses select models.
+        "lift::legacy::instruction_for_profile", "lift::legacy::live_fields",
+        "lift::legacy::live_instruction", "model::CpuModel", "model::ModelProfile",
     },
 }
 

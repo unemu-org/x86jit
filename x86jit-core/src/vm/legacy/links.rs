@@ -14,9 +14,11 @@
 //!   translation flush, empties the links. The paged path also names the
 //!   paging state's identity, proof-map version and TLB generation, so the
 //!   paging reconciliation a full lookup performs would change nothing.
-//! * **Bytes.** The source publication generation read before the lookup
-//!   that made the link, after this turn's `handle_smc`: every drained store
-//!   into a tagged code page advances it (cache.rs `invalidate_range`). A
+//! * **Bytes.** The proof generation read before the lookup that made the
+//!   link, after this turn's `handle_smc`: every drained store into a tagged
+//!   code page advances it (cache.rs `invalidate_range`) except one absorbed
+//!   by a live instruction field (xj-to9.46, `live.rs`), which every block
+//!   over those bytes reads when it executes and no shared block covers. A
 //!   twenty-bit or Direct link names a block of the shared cache, whose
 //!   blocks leave only by an invalidation that advances it; an unpaged
 //!   protected or paged link names a block of a proof map, whose version
@@ -81,7 +83,7 @@ pub(super) struct Lookup {
 }
 
 /// A consultation that found no link and may make one: the path, the lookup
-/// inputs and the publication generation read before the full lookup.
+/// inputs and the proof generation read before the full lookup.
 #[derive(Clone, Copy)]
 struct Miss {
     path: LinkPath,
@@ -292,7 +294,7 @@ impl Execution {
             return Err(false);
         };
         // After this turn's `handle_smc`.
-        let generation = vm.cache.publication_generation();
+        let generation = vm.cache.proof_generation();
         let identity = self.link_identity(path, cpu);
         let run = self.links.run;
         let index = slot(cpu.rip);

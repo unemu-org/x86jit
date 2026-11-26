@@ -103,7 +103,7 @@ impl State {
                 .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
         {
             self.invalidate();
-            self.blocks.reset(vm.cache.publication_generation());
+            self.blocks.reset(vm.cache.proof_generation());
             self.model = Some(model);
             self.memory = memory;
             self.mapping = Some(mapping);
@@ -215,10 +215,20 @@ impl State {
             }
             probe!(LIFTS);
             let source = crate::memory::LiftSource::new(&vm.mem);
-            let generation = vm.cache.publication_generation();
+            let generation = vm.cache.proof_generation();
             let permit = vm.mem.fetch_permit();
-            let (ir, sources) = lift(vm, cpu, context, &source, &walk_wrote, &self.tlb, ordinary)
-                .map_err(|mut exit| {
+            let mut live = super::live::Plan::default();
+            let (ir, sources) = lift(
+                vm,
+                cpu,
+                context,
+                &source,
+                &walk_wrote,
+                &self.tlb,
+                ordinary,
+                &mut live,
+            )
+            .map_err(|mut exit| {
                 if walk_wrote.get() {
                     if let Exit::UnmappedMemory {
                         metadata: Some(m), ..
@@ -243,7 +253,10 @@ impl State {
             vm.handle_smc(exit_word);
             // A/D CAS can touch executable table storage during this fetch.
             // Its notifications must be drained before physical registration.
-            if vm.cache.publication_generation() != generation {
+            if vm.cache.proof_generation() != generation {
+                continue;
+            }
+            if !vm.live_fields.commit(&vm.cache, &vm.mem, live) {
                 continue;
             }
             self.reconcile_generation();
@@ -301,6 +314,7 @@ fn ordinary_context(context: MachineContext) -> bool {
 
 // Decision-27 order 2: use the singleton fetch boundary for every required
 // instruction, retaining one TLB token and physical publication for the block.
+#[allow(clippy::too_many_arguments)]
 fn lift(
     vm: &Vm,
     cpu: &CpuState,
@@ -309,6 +323,7 @@ fn lift(
     walk_wrote: &Cell<bool>,
     tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     blocks: bool,
+    live: &mut super::live::Plan,
 ) -> Result<(IrBlock, Vec<(u64, u32)>), Exit> {
     let mut cursor = cpu.clone();
     let linear = cpu.legacy.segments[0].base.wrapping_add(cpu.rip as u32);
@@ -327,11 +342,24 @@ fn lift(
             Ok(fetched) => fetched,
             Err(exit) => return block.map(|b| (b, sources)).ok_or(exit),
         };
-        let mut instruction = match crate::lift::legacy::instruction_for_profile(
+        // Each byte's bus address, as this fetch translated it.
+        let bus = |offset: u32| {
+            let mut offset = u64::from(offset);
+            for &(start, len) in &spans {
+                if offset < u64::from(len) {
+                    return start + offset;
+                }
+                offset -= u64::from(len);
+            }
+            unreachable!("a fetched byte has a bus span")
+        };
+        let mut instruction = match vm.live_fields.instruction(
             &bytes,
             cursor.rip as u32,
             context,
             vm.machine_model_profile(context.generation),
+            bus,
+            live,
         ) {
             Ok(ir) => ir,
             Err(error) => {
