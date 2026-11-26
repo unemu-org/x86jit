@@ -992,6 +992,16 @@ impl Vcpu {
             .map_or((0, 0, 0), |s| (s.generation, s.blocks.len(), s.lifts))
     }
 
+    /// Internal TLB contents: slot, page, frame, PTE, rights, fetched.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn paging_tlb_for_test(&self) -> Vec<(usize, u32, u32, u32, u32, bool)> {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.paging.as_ref())
+            .map_or_else(Vec::new, |s| s.tlb.borrow().entries_for_test())
+    }
+
     /// Inject a physical write after fetch and before source registration.
     #[doc(hidden)]
     #[cfg(feature = "test-hooks")]

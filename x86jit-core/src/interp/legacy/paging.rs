@@ -25,6 +25,42 @@ pub(crate) struct AdapterState<'a> {
     pub(super) fast_missed: Cell<bool>,
 }
 
+/// The pages a `tlb_lane` has translated. A later access to one reuses its
+/// translation, as the transaction's plans reuse theirs (`plan`): a store
+/// never depends on a TLB entry that a later walk of the lane replaced, and
+/// the frame's slots, the descriptors of one table page and the TSS fields
+/// cost one translation each.
+#[derive(Default)]
+struct LaneWindows {
+    pages: [Option<LanePage>; 8],
+    len: usize,
+    stored: bool,
+    /// The TLB slots the lane's translations may have changed, as they were,
+    /// and the generation: a lane that replays puts them back, so that the
+    /// transaction path meets the TLB, stale entries included, that it would
+    /// have met (SDM Vol 3A §5.10.2: a stale entry may still be used).
+    saved: [Option<(usize, Option<Entry>)>; 8],
+    generation: u64,
+}
+
+/// One translated page of a `tlb_lane`, with the rights it was proved for.
+#[derive(Clone, Copy)]
+struct LanePage {
+    page: u32,
+    frame: u32,
+    /// Proved for writes: write permission and PTE.D (`lane_proof`).
+    write: bool,
+    supervisor: bool,
+}
+
+/// What a `tlb_lane` access does with its window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaneAccess {
+    Read,
+    Probe,
+    Store,
+}
+
 #[cfg(debug_assertions)]
 thread_local! {
     /// A strict lane committed its descriptor's accessed bit (`strict_lane`).
@@ -55,12 +91,30 @@ struct Window {
 pub(crate) struct FastOperand {
     windows: [Option<Window>; 2],
     strict: bool,
+    /// A strict lane that proves each access when it is made, through the
+    /// TLB and the pages it already translated (`lane_window`), instead of
+    /// from the two windows (`tlb_lane`). It makes no descriptor CAS.
+    tlb: bool,
 }
 
 impl FastOperand {
     /// A system lane's descriptor and frame windows (`strict_lane`).
     pub(super) fn is_strict(&self) -> bool {
         self.strict
+    }
+
+    /// The strict lane of `tlb_lane`, proved access by access.
+    pub(super) fn proves_each_access(&self) -> bool {
+        self.tlb
+    }
+
+    /// Every access proved from the TLB when it is made (`tlb_lane`).
+    const fn each_access() -> Self {
+        Self {
+            windows: [None, None],
+            strict: true,
+            tlb: true,
+        }
     }
 
     fn single(linear: u64, bus: u64, size: u8, access: AccessKind, cpu: &CpuState) -> Self {
@@ -76,6 +130,7 @@ impl FastOperand {
                 None,
             ],
             strict: false,
+            tlb: false,
         }
     }
 
@@ -113,7 +168,9 @@ impl FastOperand {
             // A non-strict operand covers the whole access set of the
             // instructions `fast_instruction` admits; no system access.
             debug_assert!(self.strict, "an access outside the proved operand");
-            if self.strict {
+            // A lane proved access by access has no windows: its caller
+            // proves the access (`lane_access`).
+            if self.strict && !self.tlb {
                 mem.fast_miss();
             }
         }
@@ -134,6 +191,186 @@ impl Window {
         };
         crate::fault::qualify_legacy_bus(exit, self.linear, self.bus)
     }
+}
+
+/// The access of a lane proved access by access (`tlb_lane`), which its
+/// operand's windows (none) did not cover; for any other lane, the miss that
+/// `FastOperand::window` has already reported.
+#[cold]
+#[inline(never)]
+fn lane_access<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    linear: u64,
+    size: u8,
+    access: LaneAccess,
+) -> Result<Window, Exit> {
+    if mem
+        .fast_operand()
+        .is_some_and(FastOperand::proves_each_access)
+    {
+        if let Some(window) = lane_window(cpu, mem, linear, size, access) {
+            return Ok(window);
+        }
+    }
+    Err(fast_miss_exit(cpu))
+}
+
+/// `read` outside the operand's windows (`lane_access`).
+#[cold]
+#[inline(never)]
+fn lane_read<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+) -> Result<u64, Exit> {
+    let window = lane_access(cpu, mem, addr, size, LaneAccess::Read)?;
+    mem.raw()
+        .read(window.bus(addr), size)
+        .map_err(|trap| window.failure(cpu, trap, AccessKind::Read, 0))
+}
+
+/// `write` outside the operand's windows (`lane_access`).
+#[cold]
+#[inline(never)]
+fn lane_write<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    addr: u64,
+    size: u8,
+    value: u64,
+) -> Result<(), Exit> {
+    let window = lane_access(cpu, mem, addr, size, LaneAccess::Store)?;
+    let value = value & mask(size);
+    let bus = window.bus(addr);
+    mem.raw()
+        .write(bus, value, size)
+        .map_err(|trap| window.failure(cpu, trap, AccessKind::Write, value))?;
+    mem.note_write(bus, size);
+    Ok(())
+}
+
+/// The window of one `tlb_lane` access: through a page the lane translated
+/// already, or one it translates as `plan` does, through `translate_linear`
+/// (a TLB hit, or a walk that sets A and fills the entry, as the transaction
+/// preview's walk would). The access must lie in one page and in RAM, and a
+/// write needs D already set and no registered code. Anything else, a fault
+/// included, is a miss: the lane replays on the transaction path, which
+/// repeats the same walks. A store needs no new translation: every lane
+/// probes its frame first. Host fault recovery is off (`tlb_lane_admits`),
+/// so RAM needs no write probe (`Memory::probe_write`).
+#[cold]
+#[inline(never)]
+fn lane_window<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    linear: u64,
+    size: u8,
+    access: LaneAccess,
+) -> Option<Window> {
+    let found = lane_proof(cpu, mem, linear, size, access);
+    if found.is_none() {
+        mem.fast_miss();
+    }
+    found
+}
+
+fn lane_proof<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    linear: u64,
+    size: u8,
+    access: LaneAccess,
+) -> Option<Window> {
+    let cell = mem.tlb()?;
+    if size == 0 || linear > u64::from(u32::MAX) || u64::from(size) > 0x1000 - (linear & 0xfff) {
+        return None;
+    }
+    // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §6.5 p. 6-22: implicit table,
+    // TSS and inner-stack accesses are supervisor at any CPL (`plan`).
+    let privilege = if cpu.legacy.cpl == 3 && !mem.supervisor() {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let supervisor = privilege == Privilege::Supervisor;
+    let write = access != LaneAccess::Read;
+    let page = (linear >> 12) as u32;
+    let known = {
+        let tlb = cell.borrow();
+        let lane = &tlb.lane;
+        // Before a store, a page whose entry a later walk of the lane
+        // replaced is translated again, as the preview's next access to it
+        // would be; after one, the committing phase reuses its plans.
+        let present = tlb.entries[Tlb::index(linear as u32)].is_some_and(|e| e.page == page);
+        lane.pages[..lane.len]
+            .iter()
+            .flatten()
+            .copied()
+            .find(|p| p.page == page && p.supervisor == supervisor && (p.write || !write))
+            .filter(|_| present || lane.stored)
+    };
+    let frame = if let Some(known) = known {
+        known.frame
+    } else {
+        {
+            let lane = &cell.borrow().lane;
+            debug_assert!(!lane.stored, "a TLB lane proved an access after a store");
+            if lane.stored || lane.len == lane.pages.len() {
+                return None;
+            }
+        }
+        let kind = if write {
+            AccessKind::Write
+        } else {
+            AccessKind::Read
+        };
+        {
+            let tlb = &mut *cell.borrow_mut();
+            let index = Tlb::index(linear as u32);
+            let lane = &mut tlb.lane;
+            if !lane.saved.iter().flatten().any(|(at, _)| *at == index) {
+                let at = lane.len;
+                lane.saved[at] = Some((index, tlb.entries[index]));
+            }
+        }
+        let t = translate_linear(cpu, mem, linear as u32, size, kind, privilege, true).ok()?;
+        // 80386 PRM §5.2.4.3 p. 5-10: D is set by the first write, which
+        // the transaction path performs after its preview (`finish_plan`).
+        if write && t.pte & DIRTY == 0 {
+            return None;
+        }
+        let lane = &mut cell.borrow_mut().lane;
+        let at = lane.len;
+        lane.pages[at] = Some(LanePage {
+            page,
+            frame: t.physical & FRAME,
+            write,
+            supervisor,
+        });
+        lane.len += 1;
+        t.physical & FRAME
+    };
+    let physical = u64::from(frame | (linear as u32 & 0xfff));
+    let (bus, part) = legacy::physical_span(cpu, mem.physical_mask(), physical, size);
+    let memory = &mem.raw().0;
+    if part != size
+        || memory.region_kind(bus, size) != Ok(crate::RegionKind::Ram)
+        || (write && memory.is_code_page(bus >> 12))
+    {
+        return None;
+    }
+    if access == LaneAccess::Store {
+        cell.borrow_mut().lane.stored = true;
+    }
+    Some(Window {
+        linear,
+        bus,
+        size,
+        write,
+        supervisor,
+    })
 }
 
 /// The stop of a strict lane's unproved access; never leaves the lane.
@@ -161,6 +398,8 @@ pub(crate) struct Tlb {
     entries: [Option<Entry>; 64],
     pub(crate) generation: u64,
     context: Option<(u32, u32, u8, u32)>,
+    /// The pages of the running `tlb_lane`, reset when one starts.
+    lane: LaneWindows,
 }
 impl Default for Tlb {
     fn default() -> Self {
@@ -168,6 +407,7 @@ impl Default for Tlb {
             entries: [None; 64],
             generation: 0,
             context: None,
+            lane: LaneWindows::default(),
         }
     }
 }
@@ -200,6 +440,48 @@ impl Tlb {
             self.invalidate();
             self.context = Some(context);
         }
+    }
+
+    /// A `tlb_lane` starts: the translation context is current, as its
+    /// first walk would make it, and nothing is saved yet.
+    fn begin_lane(&mut self, cpu: &CpuState) {
+        self.reconcile(cpu);
+        self.lane = LaneWindows {
+            generation: self.generation,
+            ..LaneWindows::default()
+        };
+    }
+
+    /// A `tlb_lane` replays: restore the slots its translations changed.
+    fn undo_lane(&mut self) {
+        let saved = std::mem::take(&mut self.lane.saved);
+        for (index, entry) in saved.into_iter().flatten().rev() {
+            self.entries[index] = entry;
+        }
+        self.generation = self.lane.generation;
+    }
+
+    /// The valid entries, for the witnesses: slot, page, frame, PTE, rights
+    /// and whether a fetch used it. The cached physical address keeps the
+    /// offset of the access that filled the entry, which no lookup uses.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn entries_for_test(&self) -> Vec<(usize, u32, u32, u32, u32, bool)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(at, e)| {
+                e.map(|e| {
+                    (
+                        at,
+                        e.page,
+                        e.translation.physical & FRAME,
+                        e.translation.pte,
+                        e.rights,
+                        e.fetched,
+                    )
+                })
+            })
+            .collect()
     }
 
     fn remove(&mut self, linear: u32) {
@@ -239,6 +521,54 @@ fn permitted(cpu: &CpuState, access: AccessKind, privilege: Privilege, rights: u
     let wp = cpu.machine_flags_mask != 0 && cpu.legacy.cr0 & (1 << 16) != 0;
     (!privilege.user() || rights & USER != 0)
         && (access != AccessKind::Write || (!privilege.user() && !wp) || rights & WRITE != 0)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    /// The lanes that skip the transaction (`tlb_lane`, and the
+    /// read-modify-write operand of `fast_instruction`) are off.
+    static FAST_LANES_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline(always)]
+fn fast_lanes_off() -> bool {
+    #[cfg(any(test, feature = "test-hooks"))]
+    return FAST_LANES_OFF.with(Cell::get);
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    false
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static FAST_LANE_HITS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One delivery, IRET or refused instruction completed in a `tlb_lane`,
+/// for the witnesses.
+#[inline(always)]
+fn count_fast_lane() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    FAST_LANE_HITS.with(|hits| hits.set(hits.get() + 1));
+}
+
+/// The lanes of `without_fast_lanes_for_test` completed on this thread.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn fast_lane_hits_for_test() -> u64 {
+    FAST_LANE_HITS.with(Cell::get)
+}
+
+/// Run `run` on this thread with every delivery, IRET, refused instruction
+/// and read-modify-write on the transaction path, for parity witnesses.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn without_fast_lanes_for_test<R>(run: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAST_LANES_OFF.with(|off| off.set(self.0));
+        }
+    }
+    let _reset = Reset(FAST_LANES_OFF.with(|off| off.replace(true)));
+    run()
 }
 
 #[cfg(feature = "test-hooks")]
@@ -959,7 +1289,7 @@ pub(super) fn read<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<u64, Exit> {
     if let Some(operand) = mem.fast_operand() {
         let Some(window) = operand.window(cpu, mem, addr, size, false) else {
-            return Err(fast_miss_exit(cpu));
+            return lane_read(cpu, mem, addr, size);
         };
         return mem
             .raw()
@@ -1031,6 +1361,9 @@ pub(super) fn read_frame<const ROUTED: bool, const ORDER: u8>(
     addr: u64,
     size: u8,
 ) -> Result<u64, Exit> {
+    if mem.fast_operand().is_some() {
+        return read(cpu, mem, addr, size, AccessKind::Read);
+    }
     if let Some(tx) = mem.transaction() {
         tx.borrow_mut().frame_reads = true;
     }
@@ -1071,7 +1404,7 @@ pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<(), Exit> {
     if let Some(operand) = mem.fast_operand() {
         let Some(window) = operand.window(cpu, mem, addr, size, true) else {
-            return Err(fast_miss_exit(cpu));
+            return lane_write(cpu, mem, addr, size, value);
         };
         let value = value & mask(size);
         let bus = window.bus(addr);
@@ -1121,7 +1454,7 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
     if let Some(operand) = mem.fast_operand() {
         return match operand.window(cpu, mem, addr, size, true) {
             Some(_) => Ok(()),
-            None => Err(fast_miss_exit(cpu)),
+            None => lane_access(cpu, mem, addr, size, LaneAccess::Probe).map(|_| ()),
         };
     }
     plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
@@ -1733,6 +2066,15 @@ pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
     address: u32,
 ) -> Result<(), Exit> {
+    // A lane proved access by access (`tlb_lane`) never walks: a descriptor
+    // whose A bit is clear replays on the transaction path before any write.
+    if mem
+        .fast_operand()
+        .is_some_and(FastOperand::proves_each_access)
+    {
+        mem.fast_miss();
+        return Err(fast_miss_exit(cpu));
+    }
     let spans = plan(cpu, mem, u64::from(address), 1, AccessKind::Write, false)?;
     if mem.raw().region_kind(spans[0].bus, 1) == Ok(crate::RegionKind::Trap) {
         return Err(refusal(
@@ -1944,6 +2286,13 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
     // completed. Match the unpaged delivery's per-attempt completion boundary.
     task_switch.committed = false;
     task_switch.completed = false;
+    if retry.is_none() && task_switch.context().is_none() {
+        if let Some(result) =
+            deliver_fast::<ROUTED, ORDER>(cpu, memory, context, event, task_switch, tlb)
+        {
+            return result;
+        }
+    }
     loop {
         if retry.as_ref().is_some_and(|tx| !tx.matches_memory(memory)) {
             return Err(refusal(
@@ -2257,6 +2606,30 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
     retry: &mut Option<Transaction>,
     tlb: &std::cell::RefCell<Tlb>,
 ) -> Result<(Outcome, Option<PortPlan>), Exit> {
+    // Two shapes, told apart by one op each: a privilege check first
+    // (`lift::legacy` inserts it after `InsnStart`), or an IRET last. A V86
+    // IRET has both: refused below IOPL 3, otherwise an IRET.
+    let iret = matches!(ir.ops.last(), Some(IrOp::Legacy(L::Iret { .. })));
+    let lane = if matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Privileged { .. }))) {
+        execute_denied_fast::<ROUTED, ORDER, V86>(ir, cpu, memory, context, task_switch, retry, tlb)
+    } else {
+        None
+    };
+    let lane = match lane {
+        None if iret => execute_iret_fast::<ROUTED, ORDER, V86>(
+            ir,
+            cpu,
+            memory,
+            context,
+            task_switch,
+            retry,
+            tlb,
+        ),
+        lane => lane,
+    };
+    if let Some(result) = lane {
+        return result.map(|outcome| (outcome, None));
+    }
     let mut scratch = vec![0; ir.temp_count as usize];
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
     mem.paging.tlb = Some(tlb);
@@ -2558,6 +2931,7 @@ fn fast_far(
     Some(FastOperand {
         windows: [stack, descriptor],
         strict: true,
+        tlb: false,
     })
 }
 
@@ -2608,6 +2982,276 @@ pub(crate) fn execute_far_fast<const ROUTED: bool, const ORDER: u8, const V86: b
             task_switch,
         )
     })
+}
+
+/// Whether a lane may skip the two-phase transaction at all: no retained
+/// bus handoff or task continuation, no host fault recovery, and not the
+/// 486 alignment-check regime the ordinary lanes also exclude.
+fn tlb_lane_admits(
+    cpu: &CpuState,
+    memory: &Memory,
+    task_switch: &tasks::SwitchState,
+    retry: &Option<Transaction>,
+) -> bool {
+    !fast_lanes_off()
+        && retry.is_none()
+        && task_switch.context().is_none()
+        && !memory.host_fault_recovery()
+        && !cpu.mmio_retry_active
+        && !(cpu.legacy.cpl == 3
+            && cpu.legacy.cr0 & (1 << 18) != 0
+            && cpu.rflags_system & (1 << 18) != 0)
+}
+
+/// Run `run` once, without the two-phase transaction, with every access
+/// proved when it is made (`FastOperand::each_access`, `lane_window`). Its
+/// callers run only helpers whose reads and probes all precede their first
+/// memory write, and whose only other write, a descriptor's accessed bit,
+/// misses before it is made (`probe_descriptor_cas`); so a miss leaves
+/// memory as it was, but for the walks' A bits, which the transaction
+/// path's preview sets in the same order. After a miss, and after an exit
+/// unless `keep_exits`, the lane restores what the helpers change
+/// (`strict_lane`) and returns None: the transaction path then produces the
+/// exact result, faults, CR2 and replay state included. A lane that succeeds
+/// made the transfers of that path's committing phase, which needs no
+/// further walk, D update or device answer when every access hits RAM with
+/// D already set (paging design §§3.2–3.4).
+fn tlb_lane<const ROUTED: bool, const ORDER: u8, T>(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    tlb: &std::cell::RefCell<Tlb>,
+    task_switch: &mut tasks::SwitchState,
+    keep_exits: bool,
+    run: impl FnOnce(
+        &mut CpuState,
+        &LegacyAccess<'_, ROUTED, ORDER, true>,
+        &mut tasks::SwitchState,
+    ) -> Result<T, Exit>,
+) -> Option<Result<T, Exit>> {
+    tlb.borrow_mut().begin_lane(cpu);
+    let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
+    mem.paging.tlb = Some(tlb);
+    mem.paging.fast_operand = Some(FastOperand::each_access());
+    let saved = (
+        cpu.gpr,
+        cpu.flags,
+        cpu.rflags_system,
+        cpu.legacy,
+        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        cpu.rip,
+    );
+    let saved_tasks = task_switch.clone();
+    let result = run(cpu, &mem, task_switch);
+    let missed = mem.paging.fast_missed.get();
+    if !missed && result.is_ok() {
+        return Some(result);
+    }
+    (
+        cpu.gpr,
+        cpu.flags,
+        cpu.rflags_system,
+        cpu.legacy,
+        [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs],
+        cpu.rip,
+    ) = saved;
+    *task_switch = saved_tasks;
+    cpu.clear_mmio_parts();
+    if missed || !keep_exits {
+        tlb.borrow_mut().undo_lane();
+        return None;
+    }
+    // The transaction path's preview fails on a copy and leaves the inputs
+    // as they were, CR2 apart, and its walks' TLB fills (`execute_with_retry`).
+    let exit = result.err()?;
+    publish_cr2(cpu, &exit);
+    Some(Err(exit))
+}
+
+/// A paged delivery through an interrupt or trap gate, once and without the
+/// transaction, when `tlb_lane` proves every access: the gate, descriptors
+/// and TSS stack fields it reads and the frame it pushes, V86 exits to ring
+/// 0 included (`privilege::virtual8086_inward`). Every delivery helper reads
+/// and probes its whole frame before the commit point. A task gate (type 5)
+/// writes the outgoing TSS before it reads the incoming one, so it keeps the
+/// transaction path (80386 PRM §9.6.1 Fig. 9-4 p. 9-9, §7.5 pp. 7-8–9).
+fn deliver_fast<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    event: legacy::LegacyEvent,
+    task_switch: &mut tasks::SwitchState,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Option<Result<(), Exit>> {
+    if !tlb_lane_admits(cpu, memory, task_switch, &None)
+        || context.regime == legacy::MachineRegime::Real
+    {
+        return None;
+    }
+    let offset = u32::from(event.vector) * 8;
+    if offset + 7 > u32::from(cpu.legacy.idtr.limit) {
+        return None;
+    }
+    let high = cpu.legacy.idtr.base.wrapping_add(offset).wrapping_add(4);
+    let result = tlb_lane::<ROUTED, ORDER, ()>(
+        cpu,
+        memory,
+        tlb,
+        task_switch,
+        false,
+        |cpu, mem, task_switch| {
+            // The gate type, bits 12:8 of its high doubleword (80386 PRM
+            // §9.5 Fig. 9-3 p. 9-7): 6/7 and 14/15 are interrupt and trap
+            // gates. The gate's page is the one `deliver` reads it from.
+            let image = read(cpu, &mem.system(), u64::from(high), 4, AccessKind::Read)?;
+            if !matches!((image >> 8) & 0x17, 6 | 7) {
+                return Err(fast_miss_exit(cpu));
+            }
+            deliver(cpu, mem, context, event, task_switch)
+        },
+    )?;
+    count_fast_lane();
+    Some(result)
+}
+
+/// IRET without a task return, once and without the transaction, when
+/// `tlb_lane` proves its frame and descriptor reads. Every IRET path short
+/// of a task return reads and writes no memory but descriptor accessed bits:
+/// the same-level, outward and V86 returns and the IRETD that enters V86
+/// (SDM Vol 2A §3.3 IRET pp. 3-491–497; 386 PRM §17 IRET pp. 17-74–78).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_iret_fast<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Option<Result<Outcome, Exit>> {
+    // NT selects the task return in protected mode (`L::CheckTaskReturn`;
+    // 386 PRM §17 IRET p. 17-74); V86 IRET ignores NT.
+    if !tlb_lane_admits(cpu, memory, task_switch, retry)
+        || (!V86 && cpu.rflags_system & 0x4000 != 0)
+        || !ir.ops.iter().all(|op| {
+            matches!(
+                op,
+                IrOp::InsnStart { .. }
+                    | IrOp::Fence { .. }
+                    | IrOp::Legacy(
+                        L::Checkpoint
+                            | L::I486Gate
+                            | L::Privileged { .. }
+                            | L::CheckTaskReturn
+                            | L::Iret { .. }
+                    )
+            )
+        })
+    {
+        return None;
+    }
+    let mut temps = [0u64; 16];
+    let temps = temps.get_mut(..ir.temp_count as usize)?;
+    let view = InstructionView {
+        guest_start: ir.guest_start,
+        guest_len: ir.guest_len,
+        ops: &ir.ops,
+        proven: false,
+    };
+    let result = tlb_lane::<ROUTED, ORDER, Outcome>(
+        cpu,
+        memory,
+        tlb,
+        task_switch,
+        false,
+        |cpu, mem, task_switch| {
+            execute_instruction::<ROUTED, ORDER, true, V86>(
+                ir,
+                &view,
+                cpu,
+                mem,
+                temps,
+                context,
+                task_switch,
+            )
+        },
+    )?;
+    count_fast_lane();
+    Some(result)
+}
+
+/// An instruction whose privilege check (`L::Privileged`, its first effect)
+/// refuses it: CPL-0 and IOPL-sensitive instructions, and IN, OUT, INS and
+/// OUTS that the I/O permission bitmap denies, V86 included. Each is #GP(0)
+/// before any operand or port access (spec.md §17.10; SDM Vol 3B §23.2.8.1
+/// p. 23-11; 386 PRM §8.3 pp. 8-4–5). The check reads at most the TSS's I/O
+/// map base and two bitmap bytes, proved by `tlb_lane`; when it refuses, the
+/// instruction runs there to its fault, which is returned with the inputs
+/// restored, as the transaction path's preview returns it. A permitted
+/// instruction keeps that path, which owns its port handoff.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_denied_fast<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    context: MachineContext,
+    task_switch: &mut tasks::SwitchState,
+    retry: &Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+) -> Option<Result<Outcome, Exit>> {
+    let Some(IrOp::Legacy(L::Privileged { kind })) = ir.ops.get(1) else {
+        return None;
+    };
+    if !tlb_lane_admits(cpu, memory, task_switch, retry)
+        || cpu.pending_port_in.is_some()
+        || cpu.port_string_in.is_some()
+    {
+        return None;
+    }
+    let refused =
+        tlb_lane::<ROUTED, ORDER, bool>(cpu, memory, tlb, task_switch, false, |cpu, mem, _| {
+            match privilege::check::<ROUTED, ORDER, V86>(cpu, mem, context.generation, *kind) {
+                Ok(()) => Ok(false),
+                Err(Exit::Exception { vector: 13, .. }) => Ok(true),
+                Err(exit) => Err(exit),
+            }
+        })?
+        .ok()?;
+    if !refused {
+        return None;
+    }
+    let mut temps = [0u64; 16];
+    let temps = temps.get_mut(..ir.temp_count as usize)?;
+    let view = InstructionView {
+        guest_start: ir.guest_start,
+        guest_len: ir.guest_len,
+        ops: &ir.ops,
+        proven: false,
+    };
+    let result = tlb_lane::<ROUTED, ORDER, Outcome>(
+        cpu,
+        memory,
+        tlb,
+        task_switch,
+        true,
+        |cpu, mem, task_switch| {
+            execute_instruction::<ROUTED, ORDER, true, V86>(
+                ir,
+                &view,
+                cpu,
+                mem,
+                temps,
+                context,
+                task_switch,
+            )
+        },
+    )?;
+    debug_assert!(result.is_err(), "a refused instruction retired");
+    count_fast_lane();
+    Some(result)
 }
 
 /// A strict (system) lane inside an ordinary walk, or its transaction replay.
@@ -2717,6 +3361,7 @@ fn fast_instruction(
     }
     let mut operand = None;
     let mut loaded_target = None;
+    let mut stored = false;
     for op in ops {
         if operand.is_some() {
             // A near RET checks its target immediately after loading a 16/32-bit
@@ -2737,7 +3382,36 @@ fn fast_instruction(
                 continue;
             }
             if !register_effects(std::slice::from_ref(op)) {
-                return None;
+                // A read-modify-write (ADD, INC, shifts and the like to
+                // memory) stores to the operand it loaded: the same address
+                // temporary and width. Prove that operand again for the
+                // write, whose window also admits the load before it; both
+                // transfers then hit RAM through one translation, as the
+                // transaction path's would (SDM Vol 3A §5.6.1; 80386 PRM
+                // §6.4.1 p. 6-20). One store only.
+                if stored || fast_lanes_off() {
+                    return None;
+                }
+                let IrOp::Store { addr, size, .. } = op else {
+                    return None;
+                };
+                // The operand is the instruction's first and only Load:
+                // `fast_instruction` stops at any other memory operation.
+                if !ops
+                    .iter()
+                    .any(|op| matches!(op, IrOp::Load { addr: a, size: s, .. } if a == addr && s == size))
+                {
+                    return None;
+                }
+                operand = Some(fast_operand(
+                    cpu,
+                    memory,
+                    tlb,
+                    read_val(*addr, temps),
+                    *size,
+                    AccessKind::Write,
+                )?);
+                stored = true;
             }
             continue;
         }
@@ -2853,6 +3527,7 @@ fn fast_instruction(
                         None,
                     ],
                     strict: true,
+                    tlb: false,
                 });
             }
             _ => return None,
@@ -3020,6 +3695,7 @@ mod tests {
         mem.paging.fast_operand = Some(FastOperand {
             windows: [None, None],
             strict: true,
+            tlb: false,
         });
         let mut tasks = tasks::SwitchState::default();
         let result = strict_lane(&mut cpu, &mem, &mut tasks, |cpu, _| {

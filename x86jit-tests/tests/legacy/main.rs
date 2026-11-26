@@ -57,5 +57,6 @@ mod legacy_tf_loop;
 mod legacy_u3_review;
 mod legacy_upper_audit;
 mod legacy_v86;
+mod legacy_v86_round_trip;
 mod legacy_x87_absent;
 mod legacy_x87_bcd;

@@ -338,6 +338,27 @@ for another walk or another REP iteration. Changed inputs invalidate a retry
 plan only at a documented abandonment boundary; do not silently remap an
 already-partially-completed device instruction on retry.
 
+**RAM-only system lanes (xj-to9.42).** An exception or interrupt delivery
+through an interrupt or trap gate, an IRET without a task return, and an
+instruction its `Privileged` check refuses (IOPL-sensitive instructions, and
+IN/OUT/INS/OUTS that the I/O bitmap denies, V86 included) first run once,
+without the two-phase transaction (`interp::legacy::paging::tlb_lane`). Each
+access is translated when it is made, through the TLB or a walk that sets A as
+the preview's walk would, and is admitted only in one page of RAM; a write
+needs PTE.D already set and no registered code. A page translated once serves
+the lane's later accesses, as the transaction's plans do. These helpers read
+and probe their whole frame before their first store, and a descriptor whose
+accessed bit is clear misses before its CAS, so any miss or exit restores the
+inputs and the TLB slots its translations changed and replays on the
+transaction path, which repeats the same walks and meets the same entries,
+stale ones included, and produces the exact fault, CR2 and replay state; a
+page whose entry a later lane walk replaced is translated again before any
+store, as the preview's next access would; a refused instruction returns
+its fault from the lane with the inputs restored, as the preview does. Task
+gates and task returns keep the transaction path. A read-modify-write whose
+load and store name one operand proves it once for the write
+(`fast_instruction`). `legacy_v86_round_trip` runs every case both ways.
+
 Page tables that alias operand storage require special care: resolve and retain
 the complete transfer plan before committing operand writes, so the first piece
 cannot rewrite the PTE used to locate the next piece. Concurrent embedder/DMA

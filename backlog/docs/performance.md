@@ -4504,3 +4504,69 @@ low: a fused stack instruction saves about 170 (I80286), 200 (alias) and 250 (tw
 instructions, against the four to six dispatches at about 20 each that it assumed. The
 header also skips the operand plumbing of the sequence (temporary reads and operand matches)
 and the out-of-line stack gate call.
+
+## V86 at IOPL 0: the ring-0 monitor round trip (xj-to9.42) — MEASURED 2026-11-26
+
+Base `1554ae98`, candidate the same tree with the change. Default release profile (the far
+and twenty-bit cells also in the `perf` profile), host instructions per guest step
+(`proc_pid_rusage`); `machine32_loops` `machine-paged-v86-gp` (an IN every 266 retired that a
+ring-0 #GP monitor emulates and IRETDs back from; `v86gp-free` does the same V86 work without
+it) and every other `machine32_loops` cell at 100,000 iterations, three rounds, I80386 and
+I80486Dx; `real16_loops` at divisor 8; and the PC-class embedder's speed-ceiling example in a
+copy of its tree pointed at each tree, with a host-instruction count around each sample. No
+wall time is used.
+
+### Where the round trip went — MEASURED
+
+`v86gp` cost 1854 against 1273 for `v86gp-free` on the I80386: 581 per step, about 155,000
+host instructions per round trip. Single-stepping the loop with a count around every step
+(throwaway probe) and sampled profiles attribute it:
+
+| Part | Host instructions per round trip | Why |
+|---|---:|---|
+| #GP delivery from V86 (nine-slot frame, error code) | ~68,000 | `paging::deliver_interrupt` runs `deliver` twice (preview on a `CpuState` clone, then commit), every gate, descriptor, TSS and frame access through `plan` (a `Vec<Fragment>` per access, cached plans cloned) |
+| the monitor's IRETD to V86 | ~37,000 | `execute_retained` → `execute_with_retry`: the same two-phase transaction for nine frame reads |
+| the IN, refused by the I/O bitmap | ~11,000 | the same transaction for two TSS reads, ending in #GP |
+| the monitor's `INC [mem]` and `ADD [ESP+8],2` | ~26,000 | `fast_instruction` admits one memory access; a read-modify-write took the transaction lane |
+| the first V86 PUSH after the return | ~10,000 | the fixture's ring-0 stack page and V86 stack page share a TLB set (by design), so the PUSH misses the TLB and takes the transaction lane |
+| context reselection, the monitor's 14 instructions | the rest | the recent-context list already serves both contexts; the monitor runs on the Segmented ordinary walk with its null ES/FS/GS |
+
+### Change — READ
+
+- **RAM-only system lanes** (`interp::legacy::paging::tlb_lane`): a delivery through an
+  interrupt or trap gate, an IRET without a task return, and an instruction its `Privileged`
+  check refuses run once, without the transaction. Each access is translated when it is made
+  (TLB hit, or a walk that sets A as the preview would) and admitted only in one RAM page, a
+  write only with PTE.D already set and no registered code; a page translated once serves the
+  lane's later accesses. A descriptor with its accessed bit clear, any other miss and any exit
+  restore the inputs and replay on the transaction path; a refused instruction's fault is
+  returned with the inputs restored. Task gates and task returns keep the transaction. paging
+  design §3.4 has the rule.
+- **Read-modify-write operands** in `fast_instruction`: a store to the operand the load named
+  re-proves it for the write.
+- `privilege::virtual8086_inward` builds its slot and frame lists on the stack.
+
+### Host instructions per guest step, before → after — MEASURED
+
+| Case | I80386 | I80486Dx |
+|---|---:|---:|
+| `machine32_loops` `v86gp` | 1854 → 1462 (−21.2 %) | 2070 → 1674 (−19.2 %) |
+| … after the review fixes (TLB undo on replay), base `26913662` | 1856 → 1471 (−20.8 %) | 2073 → 1684 (−18.8 %) |
+| `machine32_loops` `v86gp-free` | 1273 → 1270 (−0.2 %) | 1477 → 1474 (−0.2 %) |
+| embedder `paged-v86-iopl0` | 1941 → 1530 (−21.2 %) | 2167 → 1752 (−19.2 %) |
+| embedder `paged-v86` (IOPL 3) | 1343 → 1342 | 1559 → 1557 |
+
+The round trip now costs about 51,000 host instructions (192 per step over `v86gp-free`, from
+581). On the embedder that is 13.8 → about 17.5 M/s at IOPL 0 against 21.0 at IOPL 3 on the
+386, from the same rate scaling. Every other `machine32_loops` cell moves −0.8..+0.1 % (paged
+`memory` −0.6..−0.8 %, far transfers +0.04..+0.08 %); every other embedder case −0.16..+0.12 %.
+`application-jit32` moves +0.2 host instructions per step (+0.8 %) in the release profile only;
+the `perf` profile, one codegen unit, measures it unchanged, so it is layout, not work.
+
+### Remaining — MEASURED / READ
+
+Per round trip: the delivery lane ~11,000 (ten probes and writes, the TLB-set conflict's walk
+of the ring-0 stack page), the post-return V86 PUSH's transaction ~10,000 (an ordinary-lane
+TLB miss, not specific to V86), the monitor's instructions ~15,000, context reselection on
+both transfers. Letting the ordinary paged lane walk on a TLB miss instead of taking the
+transaction is the next item for this workload and for any paged loop with conflicting pages.

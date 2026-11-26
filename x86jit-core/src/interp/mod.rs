@@ -14519,6 +14519,21 @@ pub fn interpret_paged_scalar_for_test(
     legacy::paging::scalar_for_test(code, model, cpu, memory)
 }
 
+/// Run `run` with the paged deliveries, IRETs, refused instructions and
+/// read-modify-writes of this thread on the two-phase transaction path.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn without_paging_fast_lanes_for_test<R>(run: impl FnOnce() -> R) -> R {
+    legacy::paging::without_fast_lanes_for_test(run)
+}
+
+/// How many of those lanes have completed on this thread.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn paging_fast_lane_hits_for_test() -> u64 {
+    legacy::paging::fast_lane_hits_for_test()
+}
+
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub fn with_paging_cas_hook_for_test<R>(

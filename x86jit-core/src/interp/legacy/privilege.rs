@@ -265,10 +265,13 @@ pub(super) fn virtual8086_inward<const ROUTED: bool, const ORDER: u8>(
     if ip > u64::from(code.cache.limit) {
         return Err(fault(cpu, 13, ext));
     }
-    let slots = (1..=count)
-        .map(|k| stack.linear(stack.slot(k, size)))
-        .collect::<Vec<_>>();
-    for &at in &slots {
+    // At most ten slots: no heap traffic on the V86 exit path.
+    let mut slots = [0u64; 10];
+    for (k, at) in (1..=count).zip(&mut slots) {
+        *at = stack.linear(stack.slot(k, size));
+    }
+    let slots = &slots[..count as usize];
+    for &at in slots {
         probe(cpu, &mem.system(), at, size).map_err(|exit| {
             operand_fault(
                 exit,
@@ -292,7 +295,7 @@ pub(super) fn virtual8086_inward<const ROUTED: bool, const ORDER: u8>(
     }
     // The selectors are zero-extended in a 32-bit frame, as the engine's CS
     // pushes are (386 PRM p. 17-71 "3 words padded to 4"; ASSUMED value).
-    let mut frame = vec![
+    let frame = [
         u64::from(cpu.gs),
         u64::from(cpu.fs),
         u64::from(cpu.ds),
@@ -302,10 +305,8 @@ pub(super) fn virtual8086_inward<const ROUTED: bool, const ORDER: u8>(
         u64::from(flags),
         u64::from(cpu.cs),
         u64::from(event.saved_ip),
+        event.error_code.map_or(0, u64::from),
     ];
-    if let Some(error) = event.error_code {
-        frame.push(u64::from(error));
-    }
     for (&at, &value) in slots.iter().zip(&frame) {
         write(cpu, &mem.system(), at, size, value)?;
     }
