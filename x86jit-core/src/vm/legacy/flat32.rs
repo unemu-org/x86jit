@@ -167,8 +167,8 @@ impl State {
             if self.blocks.len() == 64 {
                 self.blocks.clear();
             }
-            let direct_exit = ir.ends_direct();
-            let ir = Arc::new(IrBlock { direct_exit, ..ir });
+            let link_exit = super::links::link_exit(&ir);
+            let ir = Arc::new(IrBlock { link_exit, ..ir });
             self.blocks.insert(
                 key,
                 Proof {

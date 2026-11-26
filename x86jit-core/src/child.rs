@@ -548,7 +548,7 @@ impl ChildArena {
                 icount: 1,
                 ops: Vec::with_capacity(1024),
                 temp_count: 0,
-                direct_exit: false,
+                link_exit: false,
             },
             temps: Vec::with_capacity(1024),
             cpu: CpuState::default(),

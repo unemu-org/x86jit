@@ -516,7 +516,7 @@ mod tests {
             guest_len: 8,
             icount: 2,
             legacy_context: None,
-            direct_exit: false,
+            link_exit: false,
         }
     }
 

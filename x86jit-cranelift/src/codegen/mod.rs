@@ -6090,7 +6090,7 @@ mod barrier_tests {
             guest_start: 0,
             guest_len: 1,
             icount: 1,
-            direct_exit: false,
+            link_exit: false,
         };
         let offsets = cpu_offsets();
 
@@ -6197,7 +6197,7 @@ mod barrier_tests {
                     ops: vec![IrOp::Jump {
                         target: Val::Imm(1 - addr),
                     }],
-                    direct_exit: false,
+                    link_exit: false,
                 })
                 .collect(),
         };

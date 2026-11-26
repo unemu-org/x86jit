@@ -922,7 +922,7 @@ fn lift_block_attempt(
         temp_count: tg.count(),
         guest_len,
         icount,
-        direct_exit: false,
+        link_exit: false,
     })
 }
 
@@ -1002,7 +1002,7 @@ fn lift_one_attempt(
                 temp_count: tg.count(),
                 guest_len: insn.len() as u32,
                 icount: 1,
-                direct_exit: false,
+                link_exit: false,
             });
         }
         *details = window.failure;
@@ -1022,7 +1022,7 @@ fn lift_one_attempt(
             temp_count: tg.count(),
             guest_len: insn.len() as u32,
             icount: 1,
-            direct_exit: false,
+            link_exit: false,
         });
     }
     if let Err(error) = lower_one::<false>(&insn, code, start, mode, &mut ops, &mut tg) {
@@ -1040,7 +1040,7 @@ fn lift_one_attempt(
         temp_count: tg.count(),
         guest_len: insn.len() as u32,
         icount: 1,
-        direct_exit: false,
+        link_exit: false,
     })
 }
 

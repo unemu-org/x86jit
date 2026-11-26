@@ -361,7 +361,7 @@ pub(crate) fn instruction_for_profile(
         temp_count: tg.count(),
         ops: ops.values,
         legacy_context: Some(context),
-        direct_exit: false,
+        link_exit: false,
     })
 }
 
@@ -596,7 +596,7 @@ fn locked_transfer(code: &[u8], ip: u32, context: MachineContext, error: LiftErr
             IrOp::Legacy(L::LockedTransfer),
         ],
         legacy_context: Some(context),
-        direct_exit: false,
+        link_exit: false,
     }
 }
 

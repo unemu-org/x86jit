@@ -2518,7 +2518,7 @@ mod tests {
             icount: 1,
             temp_count: 0,
             ops: Vec::new(),
-            direct_exit: false,
+            link_exit: false,
         });
         c.insert(
             k(0x1000),

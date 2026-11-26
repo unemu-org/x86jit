@@ -77,6 +77,11 @@ REVIEWED_ENTRY_POINTS = {
     "x86jit-core/src/vm/legacy/exit_census.rs": {"model::CpuModel"},
     # Machine-only successor-link witnesses across catalogue families.
     "x86jit-core/src/vm/legacy/link_witness.rs": {"model::CpuModel"},
+    # Machine-only return-link witnesses (test-only, under vm/legacy): they
+    # select catalogue models and lift single instructions for the classifier.
+    "x86jit-core/src/vm/legacy/return_witness.rs": {
+        "lift::legacy::instruction_for_profile", "model::CpuModel",
+    },
     "x86jit-core/src/interp/control.rs": {
         "interp::legacy::execute_loop", "lift::legacy::alias_context",
     },

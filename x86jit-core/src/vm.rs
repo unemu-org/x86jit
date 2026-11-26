@@ -5084,7 +5084,7 @@ mod tests {
             guest_len: 0,
             icount: 0,
             legacy_context: Some(context),
-            direct_exit: false,
+            link_exit: false,
         };
         let region = IrRegion {
             entry: 0,

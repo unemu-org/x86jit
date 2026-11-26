@@ -723,8 +723,8 @@ pub(super) fn resolve(
             };
             return Ok((ir, BlockWalk::Shared));
         }
-        let direct_exit = ir.ends_direct();
-        let ir = Arc::new(IrBlock { direct_exit, ..ir });
+        let link_exit = super::legacy::links::link_exit(&ir);
+        let ir = Arc::new(IrBlock { link_exit, ..ir });
         vm.handle_smc(word);
         if vm
             .cache
@@ -916,7 +916,7 @@ pub(super) fn resolve_retained(
                     ops: Vec::new(),
                     legacy_context: block.ir.legacy_context,
                     // Retained blocks are never linked (`legacy/links.rs`).
-                    direct_exit: false,
+                    link_exit: false,
                 },
                 tg: crate::ir::TempGen::starting_at(last.temps),
                 ip: last.next,

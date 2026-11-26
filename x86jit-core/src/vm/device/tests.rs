@@ -1354,7 +1354,7 @@ fn near_transfers_and_a_last_flags_load_keep_the_block_whole() {
         icount: 0,
         mode: crate::CpuMode::Real16,
         legacy_context: None,
-        direct_exit: false,
+        link_exit: false,
     };
     let insn = |guest_addr| IrOp::InsnStart { guest_addr };
     let near_call = IrOp::Legacy(L::Transfer {

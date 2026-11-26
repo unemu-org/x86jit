@@ -79,7 +79,7 @@ fn main() {
         temp_count: 0,
         guest_len: 1,
         icount: 0,
-        direct_exit: false,
+        link_exit: false,
     }));
     let map: HashMap<_, _, BuildHasherDefault<BlockHasher>> =
         keys.iter().map(|&key| (key, compiled.clone())).collect();

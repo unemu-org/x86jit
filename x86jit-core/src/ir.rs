@@ -3588,11 +3588,12 @@ pub struct IrBlock {
     pub mode: crate::CpuMode,
     /// Authoritative legacy context; application lifting always leaves this absent.
     pub legacy_context: Option<crate::legacy::MachineContext>,
-    /// Whether the last transfer has a lift-time target ([`Self::ends_direct`]),
-    /// recorded when the Machine dispatcher publishes the block. Only the
-    /// cost of consulting its successor links reads it (xj-to9.27); a block
-    /// that leaves it `false` takes the full lookup after it.
-    pub direct_exit: bool,
+    /// Whether the last transfer has a lift-time target or is a near RET
+    /// (`vm/legacy/links.rs`, `link_exit`), recorded when the Machine dispatcher
+    /// publishes the block. Only the cost of consulting its successor links
+    /// reads it (xj-to9.27, xj-to9.30); a block that leaves it `false` takes
+    /// the full lookup after it.
+    pub link_exit: bool,
 }
 
 impl core::fmt::Debug for IrBlock {

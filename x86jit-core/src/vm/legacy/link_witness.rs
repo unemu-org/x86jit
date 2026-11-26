@@ -106,6 +106,8 @@ struct Outcome {
     log: String,
     followed: u64,
     cleared: u64,
+    // Links followed after a near RET (`return_witness.rs`).
+    returns: u64,
 }
 
 /// Runs `steps` units in runs of `slice` (one run when `None`), with links
@@ -144,7 +146,7 @@ fn run(
     }
     links::OFF.with(|off| off.set(false));
     let links = &cpu.legacy_execution.as_ref().unwrap().links;
-    let (followed, cleared) = (links.followed, links.cleared);
+    let (followed, cleared, returns) = (links.followed, links.cleared, links.returns);
     Outcome {
         gpr: cpu.cpu.gpr,
         state: format!("{:?}", cpu.cpu),
@@ -152,6 +154,7 @@ fn run(
         log: format!("{:?}", cpu.delivery_log()),
         followed,
         cleared,
+        returns,
     }
 }
 
@@ -871,3 +874,6 @@ fn device_transfers_between_linked_blocks_keep_their_order() {
         assert!(outcomes[0].2.contains("Mmio"), "{model:?}");
     }
 }
+
+#[path = "return_witness.rs"]
+mod returns;

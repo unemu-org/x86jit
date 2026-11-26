@@ -15,7 +15,7 @@ mod nmi;
 mod paging;
 
 mod flat32;
-mod links;
+pub(super) mod links;
 mod proof_map;
 
 /// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
@@ -1208,7 +1208,7 @@ fn retry_instruction(ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
         temp_count: ir.temp_count,
         ops,
         legacy_context: ir.legacy_context,
-        direct_exit: false,
+        link_exit: false,
     })
 }
 
@@ -1478,8 +1478,8 @@ fn resolve_direct_uncached(
             };
             return Ok(ir);
         }
-        let direct_exit = ir.ends_direct();
-        let ir = Arc::new(IrBlock { direct_exit, ..ir });
+        let link_exit = links::link_exit(&ir);
+        let ir = Arc::new(IrBlock { link_exit, ..ir });
         #[cfg(test)]
         vm.after_source_read();
         vm.handle_smc(exit_word);
@@ -2959,8 +2959,8 @@ impl Vcpu {
         let _in_block_scope = in_block.get().map(super::device::InBlock::publish);
         // Successor links (`links.rs`), for Machine runs of more than one
         // step. Set by an ordinary completed block whose last transfer is
-        // direct, and taken by the next turn: only that turn's lookup consults
-        // the links.
+        // direct or a near RET (`IrBlock::link_exit`), and taken by the next
+        // turn: only that turn's lookup consults the links.
         let linking = KIND >= MACHINE_DISPATCH && !SINGLE && !links::off();
         if linking {
             self.legacy_execution
@@ -3271,9 +3271,9 @@ impl Vcpu {
                 // refuse every retained twenty-bit page (`links.rs`), this
                 // one included.
                 let retained20 = direct20 && retained && vm.mem.fetch_policy.is_none();
-                // A turn after a direct exit consults the successor links
-                // (`links.rs`) before the resolver; a turn that drained a
-                // store into a code page does not. That test is a cost filter
+                // A turn after a direct exit or a near RET consults the
+                // successor links (`links.rs`) before the resolver; a turn
+                // that drained a store into a code page does not. That test is a cost filter
                 // only: such a store advanced the publication generation,
                 // which every link names (`Link::generation`).
                 let mut record = false;
@@ -3581,7 +3581,9 @@ impl Vcpu {
                         || self.sti_shadow
                         || self.ss_shadow & SS_HOLD != 0
                         || (direct20 && self.cpu.rflags_system & 0x100 != 0);
-                    link_from = linking && ir.direct_exit;
+                    link_from = linking && ir.link_exit;
+                    #[cfg(test)]
+                    self.note_link_exit(&ir);
                     if boundary.cold_epilogue {
                         if self.delivery_log.is_some() {
                             self.record_unit(direct20, &ir, &progress);
@@ -3663,10 +3665,12 @@ impl Vcpu {
                         // The protected walks report every completion here; an
                         // ordinary one links its successor as the fast arm does.
                         link_from = linking
-                            && ir.direct_exit
+                            && ir.link_exit
                             && outcome.exit.is_none()
                             && !outcome.context_changed
                             && !single_step;
+                        #[cfg(test)]
+                        self.note_link_exit(&ir);
                         if self
                             .legacy_execution
                             .as_ref()
@@ -6696,6 +6700,16 @@ mod virtual8086_key_tests {
 #[cfg(test)]
 #[path = "legacy/exit_census.rs"]
 mod exit_census;
+
+// The return-link witnesses count the links followed after a near RET.
+#[cfg(test)]
+impl Vcpu {
+    fn note_link_exit(&mut self, ir: &IrBlock) {
+        if let Some(execution) = self.legacy_execution.as_mut() {
+            execution.links.after_return = links::ends_near_return(ir);
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "legacy/link_witness.rs"]

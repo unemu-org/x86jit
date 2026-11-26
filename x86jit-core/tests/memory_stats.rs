@@ -60,7 +60,7 @@ fn cache_replacements_and_stale_upgrades_preserve_accounting() {
         temp_count: 0,
         guest_len: 1,
         icount: 1,
-        direct_exit: false,
+        link_exit: false,
     });
     let interpreted = CachedBlock::Interpreted(ir);
     let compiled = CachedBlock::Compiled {

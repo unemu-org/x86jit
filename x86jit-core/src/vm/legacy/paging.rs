@@ -249,8 +249,8 @@ impl State {
             self.reconcile_generation();
             let key = self.key(cpu, model, context, owner_id, ordinary)?;
             self.lifts += 1;
-            let direct_exit = ir.ends_direct();
-            let ir = Arc::new(IrBlock { direct_exit, ..ir });
+            let link_exit = super::links::link_exit(&ir);
+            let ir = Arc::new(IrBlock { link_exit, ..ir });
             if !source.publishable() {
                 // The interpreter may use this snapshot once, without a proof.
                 self.blocks.remove(&key);

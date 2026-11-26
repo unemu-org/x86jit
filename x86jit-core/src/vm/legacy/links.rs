@@ -1,9 +1,9 @@
 //! Successor links (xj-to9.27): a small direct-mapped memo, per vCPU, of the
 //! blocks that the Machine dispatcher's lookups returned, consulted on the
-//! turn after a block whose last transfer is direct, before the resolver that
-//! turn would call. A link stands in for that resolver only when every input
-//! the resolver reads is the one the link was made under, so it returns a
-//! block the resolver would return:
+//! turn after a block whose last transfer is direct or a near RET (xj-to9.30),
+//! before the resolver that turn would call. A link stands in for that
+//! resolver only when every input the resolver reads is the one the link was
+//! made under, so it returns a block the resolver would return:
 //!
 //! * **Address.** The IP, the physical fetch address and MXCSR, and the
 //!   resolver path (twenty-bit, Direct, unpaged Flat32/Segmented, paged).
@@ -27,17 +27,25 @@
 //!   fetch policy made between runs.
 //!
 //! Only the turn directly after an ordinary completed block whose last
-//! transfer is direct (`IrBlock::direct_exit`: a `Branch`, `LoopCx` or an
-//! immediate `Jump`) consults the links. Event delivery, faults, context
-//! changes, device handoffs and completed port-string inputs, the host
-//! request and NMI word, a service step that runs a handoff's numeric or
-//! debug service, single-step traps, A20 changes and a turn that drained a
-//! store into a code page take the full lookup. A one-step turn (an interrupt
-//! or SS shadow, a pending IRQ the guest masks) and a service turn that
-//! delivers nothing still consult the links: neither changes an input a
-//! link names. A retained instruction (self-modifying code), a
-//! continuation, a pending task switch and, under a fetch policy, the
-//! protected proofs, whose permits are checked on every hit, are never linked.
+//! transfer is direct or a near RET (`IrBlock::link_exit`: a `Branch`,
+//! `LoopCx`, an immediate `Jump`, or a jump to the IP a near RET popped)
+//! consults the links. Nothing about the transfer that reached a turn is
+//! part of a link: it is found by the IP the turn starts at, and validated
+//! by the inputs above, so a near RET needs no return-address stack. A
+//! rewritten return address, a stack switch, a `longjmp` past pending
+//! returns and recursion of any depth only make a RET land on another IP,
+//! whose own link, or full lookup, serves it (xj-to9.30). Far returns load
+//! CS and are not linked; indirect jumps and calls are not linked either.
+//! Event delivery, faults, context changes, device handoffs and completed
+//! port-string inputs, the host request and NMI word, a service step that
+//! runs a handoff's numeric or debug service, single-step traps, A20 changes
+//! and a turn that drained a store into a code page take the full lookup. A
+//! one-step turn (an interrupt or SS shadow, a pending IRQ the guest masks)
+//! and a service turn that delivers nothing still consult the links: neither
+//! changes an input a link names. A retained instruction (self-modifying
+//! code), a continuation, a pending task switch and, under a fetch policy,
+//! the protected proofs, whose permits are checked on every hit, are never
+//! linked.
 //! Twenty-bit blocks of retained pages are checked against their bytes on
 //! every lookup and are never linked either.
 //!
@@ -47,7 +55,8 @@
 //! or proof map keeps turning over, makes none, and two blocks that share a
 //! slot keep one link instead of replacing each other. A block cut at the
 //! lifter's bound continues sequentially and is not a direct exit
-//! (`IrBlock::ends_direct`). This bears on cost, not validity.
+//! (`IrBlock::ends_direct`). The return sites of a subroutine take one slot
+//! each, as any successor does. This bears on cost, not validity.
 use super::*;
 
 const SLOTS: usize = 32;
@@ -115,6 +124,12 @@ pub(super) struct Links {
     pub(super) made: u64,
     #[cfg(test)]
     pub(super) cleared: u64,
+    // Whether the block whose exit the next consultation follows ended in a
+    // near RET, and the links followed after one (`return_witness.rs`).
+    #[cfg(test)]
+    pub(super) after_return: bool,
+    #[cfg(test)]
+    pub(super) returns: u64,
 }
 
 impl Links {
@@ -147,6 +162,55 @@ pub(super) fn off() -> bool {
     return OFF.with(std::cell::Cell::get);
     #[cfg(not(test))]
     false
+}
+
+/// Whether the block ends in a near RET (`lift/legacy.rs`, `Ret`, with
+/// or without imm16): the IP loaded from the stack (a twenty-bit model's
+/// wrapped load included), SP written, then a jump to the loaded IP, with
+/// no store after the load. An indirect near CALL pushes after it loads
+/// its target, an indirect JMP writes no SP, and a far return or IRET
+/// loads CS (a legacy operation, or a CS write after SP), so none of them
+/// is a near return. This bears on cost only: a successor link is keyed
+/// on the IP the RET popped, not on the block that made the transfer.
+pub(in crate::vm) fn ends_near_return(ir: &IrBlock) -> bool {
+    let mut ops = ir
+        .ops
+        .iter()
+        .rev()
+        .skip_while(|op| matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk)));
+    let (
+        Some(IrOp::Jump {
+            target: crate::ir::Val::Temp(ip),
+        }),
+        Some(IrOp::WriteReg {
+            reg: crate::Reg::Rsp,
+            ..
+        }),
+    ) = (ops.next(), ops.next())
+    else {
+        return false;
+    };
+    for op in ops {
+        match op {
+            IrOp::Load { dst, .. }
+            | IrOp::Legacy(crate::legacy::LegacyOp::WrappedLoad { dst, .. })
+                if dst == ip =>
+            {
+                return true;
+            }
+            IrOp::Store { .. } | IrOp::Legacy(crate::legacy::LegacyOp::WrappedStore { .. }) => {
+                return false
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the Machine dispatcher consults the successor links after
+/// `ir` (`IrBlock::link_exit`): a direct exit or a near RET.
+pub(in crate::vm) fn link_exit(ir: &IrBlock) -> bool {
+    ir.ends_direct() || ends_near_return(ir)
 }
 
 // The derived comparison is out of line; a context is eight bytes.
@@ -251,6 +315,10 @@ impl Execution {
             // generation and identity: code whose stores advance the
             // generation, or whose TLB or proof map turns over, every
             // iteration, or that runs once, makes no link it cannot follow.
+            // One miss is remembered per slot: two unlinked successors that
+            // share a slot and miss in turn, such as a RET's changing
+            // targets and a direct successor, keep each other from linking.
+            // That costs a full lookup per visit, never a wrong block.
             let tag = identity
                 .iter()
                 .fold(run, |tag, word| tag.rotate_left(16) ^ word);
@@ -278,6 +346,7 @@ impl Execution {
         #[cfg(test)]
         {
             self.links.followed += 1;
+            self.links.returns += u64::from(self.links.after_return);
         }
         Ok(found)
     }

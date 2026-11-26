@@ -769,16 +769,17 @@ pub fn synchronize_instruction_stream() {
         // before observing the publisher's generation.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let generation = CODE_PUBLICATION.load(std::sync::atomic::Ordering::Acquire);
-        SEEN.with(|seen| {
-            if seen.get() != generation {
-                // SAFETY: Arm ARM DDI0487J.a §B2.2.5, instruction synchronization
-                // after another PE's cache maintenance and pointer publication.
-                unsafe {
-                    core::arch::asm!("isb", options(nostack, preserves_flags));
-                }
-                seen.set(generation);
+        // `get` and `set`, not a `with` closure: the closure's instantiation
+        // was left out of line by some release codegen-unit partitions, a
+        // call and a TLS lookup on every block entry (xj-to9.30).
+        if SEEN.get() != generation {
+            // SAFETY: Arm ARM DDI0487J.a §B2.2.5, instruction synchronization
+            // after another PE's cache maintenance and pointer publication.
+            unsafe {
+                core::arch::asm!("isb", options(nostack, preserves_flags));
             }
-        });
+            SEEN.set(generation);
+        }
     }
 }
 

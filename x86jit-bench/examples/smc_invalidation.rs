@@ -62,7 +62,7 @@ fn main() {
             icount: 1,
             temp_count: 0,
             ops: vec![IrOp::Hlt],
-            direct_exit: false,
+            link_exit: false,
         };
         vm.cache.insert(
             BlockKey::new(pc, CpuMode::Long64),

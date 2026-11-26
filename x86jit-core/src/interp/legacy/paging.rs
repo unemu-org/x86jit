@@ -3678,7 +3678,7 @@ mod tests {
                 icount: 1,
                 mode: crate::CpuMode::Compat32,
                 legacy_context: None,
-                direct_exit: false,
+                link_exit: false,
             };
             assert!(!super::super::flat32_ordinary(&ir), "{ir:?}");
         }
