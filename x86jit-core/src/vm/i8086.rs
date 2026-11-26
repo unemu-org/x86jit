@@ -202,6 +202,24 @@ enum Sink<'s, 'm> {
     Retained(&'s mut Vec<u8>),
 }
 
+/// Drop the last `len` fetched bytes, of an instruction the block leaves
+/// out: a store into them does not change the block.
+fn unfetch(spans: &mut Vec<(u64, u32)>, sink: &mut Sink<'_, '_>, len: u32) {
+    if let Sink::Retained(snapshot) = sink {
+        snapshot.truncate(snapshot.len() - len as usize);
+    }
+    let mut left = len;
+    while left != 0 {
+        let last = spans.last_mut().expect("the instruction's fetched bytes");
+        let take = last.1.min(left);
+        last.1 -= take;
+        left -= take;
+        if last.1 == 0 {
+            spans.pop();
+        }
+    }
+}
+
 /// A fetch's byte strings, kept by the lift of one block so that its
 /// instructions reuse them: the fetched bytes (the first fifteen, the
 /// evidence), the bytes after the prefixes, and the decoded form.
@@ -544,7 +562,10 @@ fn lift_block(
         }
         let mut part = match lifted {
             Ok(ir) => ir,
-            Err(_) if combined.is_some() => break,
+            Err(_) if combined.is_some() => {
+                unfetch(spans, sink, len);
+                break;
+            }
             Err(_) => return Err(refusal(cpu.rip, evidence)),
         };
         if carry {
@@ -561,6 +582,7 @@ fn lift_block(
                 )
             })
         {
+            unfetch(spans, sink, len);
             break;
         }
         // RunningMemory's active block range is contiguous: an instruction
@@ -571,6 +593,7 @@ fn lift_block(
         if combined.is_some()
             && (u64::from(ip) + u64::from(len) > 0x10000 || linear + u64::from(len) > 0x100000)
         {
+            unfetch(spans, sink, len);
             break;
         }
         let terminates = nec.is_some_and(|form| form.terminates())
@@ -731,6 +754,8 @@ struct Retained {
     alias_epoch: u64,
     /// Entries since the block was lifted, all finding its bytes unchanged.
     matched: u32,
+    /// `RetainedBlocks::clock` at the block's last entry.
+    used: u64,
 }
 
 /// One vCPU's retained twenty-bit blocks, by physical entry address, and
@@ -743,6 +768,8 @@ pub(super) struct RetainedBlocks {
         std::hash::BuildHasherDefault<crate::cache::cache_hash::BlockHasher>,
     >,
     ops: Vec<IrOp>,
+    /// Counts entries; the least recently entered block is evicted.
+    clock: u64,
     /// Lifts that kept the instructions before a changed byte.
     #[cfg(test)]
     resumed: usize,
@@ -764,7 +791,7 @@ const RETAINED_BLOCKS: usize = 128;
 const RETAINED_BYTES: usize = 256;
 // Entries of one block with unchanged bytes after which its page returns to
 // the shared cache; a store that drops a block there marks it again.
-const RETAINED_MATCHES: u32 = 1 << 16;
+pub(super) const RETAINED_MATCHES: u32 = 1 << 16;
 
 /// The first fetched byte of `retained` that no longer reads as it did, or
 /// that no longer reads at all.
@@ -844,6 +871,8 @@ pub(super) fn resolve_retained(
             block.alias_epoch = alias_epoch;
         }
         let Some(at) = changed(vm, block) else {
+            retained.clock += 1;
+            block.used = retained.clock;
             block.matched += 1;
             let ir = block.ir.clone();
             let tired = block.matched >= RETAINED_MATCHES;
@@ -901,6 +930,38 @@ pub(super) fn resolve_retained(
         block.bounds.truncate(kept);
         entry = Some(block);
     }
+    lift_retained(
+        vm,
+        cpu,
+        word,
+        physical,
+        retained,
+        smc_pages,
+        (entry, resume),
+        (profile, mxcsr, alias_epoch),
+    )
+}
+
+/// `resolve_retained`'s lift: of the block's rest after `resume`, or of the
+/// whole block without an `entry`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn lift_retained(
+    vm: &Vm,
+    cpu: &CpuState,
+    word: &AtomicU64,
+    physical: u64,
+    retained: &mut RetainedBlocks,
+    smc_pages: &mut Vec<u64>,
+    (entry, resume): (Option<Retained>, Option<Resume>),
+    (profile, mxcsr, alias_epoch): (&'static crate::ModelProfile, u32, u64),
+) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
+    let page = physical >> crate::memory::CODE_PAGE_BITS;
+    if entry.is_none() && vm.mem.code_aliased(&[(physical, 1)]) {
+        // Checked before a lift: the shared path would lift it again.
+        demote(retained, smc_pages, physical);
+        return resolve(vm, cpu, word, physical);
+    }
     // The previous block's vectors, reused.
     let (mut spans, mut snapshot, mut bounds) = match entry {
         Some(block) => (block.spans, block.bytes, block.bounds),
@@ -917,18 +978,27 @@ pub(super) fn resolve_retained(
         resume,
         Some(&mut bounds),
     )?;
-    if vm.mem.code_aliased(&spans) {
+    // The entry page was checked at this epoch, through the kept block's
+    // spans or before the lift.
+    let elsewhere = spans.iter().any(|&(pa, len)| {
+        pa >> crate::memory::CODE_PAGE_BITS != page
+            || (pa + u64::from(len) - 1) >> crate::memory::CODE_PAGE_BITS != page
+    });
+    if elsewhere && vm.mem.code_aliased(&spans) {
         demote(retained, smc_pages, physical);
         return resolve(vm, cpu, word, physical);
     }
     let ir = Arc::new(ir);
+    retained.clock += 1;
+    let retained_clock = retained.clock;
     let blocks = &mut retained.blocks;
     // A block cut short by a failed fetch could grow once that fetch
     // succeeds, which its bytes do not show: lift it again on each entry.
     if complete && snapshot.len() <= RETAINED_BYTES {
         if blocks.len() >= RETAINED_BLOCKS && !blocks.contains_key(&physical) {
-            // Make room by one block; an evicted block is lifted again.
-            let victim = *blocks.keys().next().unwrap();
+            // Make room by the least recently entered block; an evicted
+            // block is lifted again.
+            let victim = *blocks.iter().min_by_key(|(_, block)| block.used).unwrap().0;
             blocks.remove(&victim);
         }
         blocks.insert(
@@ -943,6 +1013,7 @@ pub(super) fn resolve_retained(
                 bounds,
                 alias_epoch,
                 matched: 0,
+                used: retained_clock,
             },
         );
     } else {
@@ -1079,5 +1150,78 @@ mod tests {
         assert!(pages.is_empty());
         assert_eq!(retained.len(), 0);
         assert!(vm.mem.is_code_page(0));
+        // Marked again with no retained block: the entry page's alias is
+        // found before a lift for retention, which leaves its buffer unused.
+        let mut retained = RetainedBlocks::default();
+        let mut pages = vec![IP >> crate::memory::CODE_PAGE_BITS];
+        let (ir, _) =
+            resolve_retained(&vm, &cpu.cpu, &word, IP, &mut retained, &mut pages).unwrap();
+        assert_eq!(format!("{ir:?}"), shown(resolve(&vm, &cpu.cpu, &word, IP)));
+        assert!(pages.is_empty());
+        assert_eq!(retained.ops.capacity(), 0);
+    }
+
+    #[test]
+    fn bytes_of_an_instruction_left_out_of_a_block_are_not_checked() {
+        // NOP; REP STOSB (a string starts its own block), and NOP at FFFDh
+        // before MOV AX,imm16 across the IP wrap (which starts its own
+        // block): the next instruction's fetched bytes leave the snapshot,
+        // so a store into them keeps the retained block.
+        let word = AtomicU64::new(0);
+        for (ip, code, store) in [
+            (
+                IP,
+                &b"\x90\xf3\xaa"[..],
+                &[(IP + 1, 0x90), (IP + 2, 0x90)][..],
+            ),
+            (
+                0xfffd,
+                &b"\x90\xb8\x01"[..],
+                &[(0xfffe, 0x90), (0xffff, 0x02), (0, 0x03)][..],
+            ),
+        ] {
+            let (vm, mut cpu) = self::vm(crate::CpuModel::I8086, &[]);
+            vm.write_bytes(ip, code).unwrap();
+            cpu.cpu.rip = ip;
+            let mut retained = RetainedBlocks::default();
+            let mut pages = vec![ip >> crate::memory::CODE_PAGE_BITS];
+            let (first, _) =
+                resolve_retained(&vm, &cpu.cpu, &word, ip, &mut retained, &mut pages).unwrap();
+            assert_eq!(first.icount, 1);
+            assert_eq!(retained.blocks[&ip].bytes, [0x90]);
+            assert_eq!(retained.blocks[&ip].spans, [(ip, 1)]);
+            for &(at, value) in store {
+                vm.write_bytes(at, &[value]).unwrap();
+                let (again, _) =
+                    resolve_retained(&vm, &cpu.cpu, &word, ip, &mut retained, &mut pages).unwrap();
+                assert!(Arc::ptr_eq(&first, &again), "{ip:#x}: store at {at:#x}");
+            }
+            assert_eq!(retained.resumed, 0);
+        }
+    }
+
+    #[test]
+    fn eviction_takes_the_least_recently_entered_block() {
+        let word = AtomicU64::new(0);
+        let (vm, mut cpu) = self::vm(crate::CpuModel::I8086, &[0xf4; 0x400]);
+        let mut retained = RetainedBlocks::default();
+        let mut pages = vec![IP >> crate::memory::CODE_PAGE_BITS];
+        let mut enter = |cpu: &mut Vcpu, at: u64, retained: &mut RetainedBlocks| {
+            cpu.cpu.rip = at;
+            resolve_retained(&vm, &cpu.cpu, &word, at, retained, &mut pages).unwrap();
+        };
+        for i in 0..RETAINED_BLOCKS as u64 {
+            enter(&mut cpu, IP + i, &mut retained);
+        }
+        // The first block, entered again, outlives the second; every new
+        // block evicts the oldest entered one.
+        for i in 0..4 {
+            enter(&mut cpu, IP, &mut retained);
+            enter(&mut cpu, IP + RETAINED_BLOCKS as u64 + i, &mut retained);
+            assert!(retained.blocks.contains_key(&IP));
+            assert!(!retained.blocks.contains_key(&(IP + 1 + i)));
+            assert!(retained.blocks.contains_key(&(IP + 2 + i)));
+        }
+        assert_eq!(retained.len(), RETAINED_BLOCKS);
     }
 }

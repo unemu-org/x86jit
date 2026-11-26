@@ -3470,7 +3470,7 @@ impl Vcpu {
                 }
                 if direct20 {
                     self.cpu.rip &= 0xffff;
-                    // A string is its block's only instruction (`i8086::resolve`
+                    // A string is its block's only instruction (`i8086::lift_block`
                     // ends the block before and after one), so a longer block, or
                     // one left at another IP, holds no pair: no scan of its ops.
                     let restart = if ir.icount == 1 && self.cpu.rip == ir.guest_start {
@@ -5448,6 +5448,43 @@ mod tests {
             cpu.reset_execution_state(crate::ResetOptions::default());
             assert_eq!(cpu.legacy_execution.as_ref().unwrap().retained20.len(), 0);
         }
+    }
+
+    #[test]
+    fn a_twenty_bit_page_returned_to_the_shared_cache_still_notices_a_store() {
+        // MOV [BX],CL; INC AX; JMP back. A store of the same byte over INC AX
+        // marks the page; stores elsewhere leave its block unchanged until
+        // the page returns to the shared cache; a store of INC DX over INC AX
+        // is then noticed, the page is marked again and the new instruction
+        // runs.
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I8086);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(0x1000, b"\x88\x0f\x40\xeb\xfb").unwrap();
+        let mut cpu = vm.new_vcpu();
+        let phase = |cpu: &mut Vcpu, bx: u64, cl: u64, steps: u64| {
+            cpu.cpu.rip = 0x1000;
+            cpu.cpu.gpr[3] = bx;
+            cpu.cpu.gpr[1] = cl;
+            let run = cpu.run_steps(&vm, steps, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), steps);
+        };
+        phase(&mut cpu, 0x1002, 0x40, 30);
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert!(execution.smc_pages.contains(&1));
+        assert_ne!(execution.retained20.len(), 0);
+        let entries = u64::from(super::super::i8086::RETAINED_MATCHES) + 16;
+        phase(&mut cpu, 0x2000, 0x40, 3 * entries);
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert!(!execution.smc_pages.contains(&1));
+        assert_eq!(execution.retained20.len(), 0);
+        assert!(vm.mem.is_code_page(1));
+        let ax = cpu.cpu.gpr[0];
+        phase(&mut cpu, 0x1002, 0x42, 30);
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert!(execution.smc_pages.contains(&1));
+        assert_eq!(cpu.cpu.gpr[0], ax);
+        assert_eq!(cpu.cpu.gpr[2], 10);
     }
 
     #[test]
