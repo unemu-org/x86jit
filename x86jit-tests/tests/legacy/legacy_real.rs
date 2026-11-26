@@ -1456,7 +1456,7 @@ fn application_real16_ir_matches_frozen_parent_snapshots() {
         vm.set_cpu_mode(CpuMode::Real16);
         vm.map(0, 0x100000, Prot::RWX, RegionKind::Ram).unwrap();
         vm.write_bytes(0x1000, code).unwrap();
-        let ir = x86jit_core::lift::lift_block(
+        let mut ir = x86jit_core::lift::lift_block(
             &vm.mem,
             x86jit_core::lift::FetchAddr {
                 pa: 0x1000,
@@ -1465,6 +1465,17 @@ fn application_real16_ir_matches_frozen_parent_snapshots() {
             CpuMode::Real16,
         )
         .unwrap();
+        // The interpreter's fused stack headers (xj-to9.29) precede the frozen
+        // ops unchanged; `legacy_fused_stack` witnesses them.
+        ir.ops.retain(|op| {
+            !matches!(
+                op,
+                x86jit_core::IrOp::Legacy(
+                    x86jit_core::legacy::LegacyOp::FusedPush { .. }
+                        | x86jit_core::legacy::LegacyOp::FusedPop { .. }
+                )
+            )
+        });
         snapshot.push_str(&format!("{name}\n{ir:?}\n"));
     }
     assert_eq!(snapshot, include_str!("../fixtures/real16_parent_ir.snap"));

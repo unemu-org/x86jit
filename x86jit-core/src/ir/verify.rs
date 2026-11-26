@@ -408,6 +408,11 @@ impl IrBlock {
                     | crate::legacy::LegacyOp::BcdString20 { .. }
                     | crate::legacy::LegacyOp::InhibitIrq20
                     | crate::legacy::LegacyOp::HoldExternal20 => {}
+                    // A header reads and defines through the ops it precedes.
+                    crate::legacy::LegacyOp::FusedPush { .. }
+                    | crate::legacy::LegacyOp::FusedPop { .. }
+                    | crate::legacy::LegacyOp::FusedPush20 { .. }
+                    | crate::legacy::LegacyOp::FusedPop20 { .. } => {}
                     crate::legacy::LegacyOp::Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::Flat32Address { dst, offset, .. }
                     | crate::legacy::LegacyOp::SegmentedAddress { dst, offset, .. }

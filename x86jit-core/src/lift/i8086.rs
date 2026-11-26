@@ -1082,6 +1082,9 @@ pub(crate) fn instruction(
         });
     }
     result.push(IrOp::Legacy(L::SharedWalk));
+    if super::fused::candidate(insn) {
+        super::fused::fuse_instruction(&mut result, 0);
+    }
     Ok(IrBlock {
         mode: CpuMode::Real16,
         guest_start: u64::from(start),

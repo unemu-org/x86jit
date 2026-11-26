@@ -2614,6 +2614,10 @@ where
                     | L::Address { .. }
                     | L::ReadSelector { .. }
                     | L::DirectStackAddress { .. }
+                    | L::FusedPush { .. }
+                    | L::FusedPop { .. }
+                    | L::FusedPush20 { .. }
+                    | L::FusedPop20 { .. }
                     | L::Push { .. }
                     | L::Pop { .. }
                     | L::AdjustStack { .. }
@@ -4453,7 +4457,13 @@ where
                         cpu.gpr[reg] = u64::from(value);
                     }
                 }
-                L::Checkpoint | L::SharedWalk => {}
+                // The instruction executor runs the sequence a header stands for.
+                L::Checkpoint
+                | L::SharedWalk
+                | L::FusedPush { .. }
+                | L::FusedPop { .. }
+                | L::FusedPush20 { .. }
+                | L::FusedPop20 { .. } => {}
                 L::Privileged { kind } => {
                     privilege::check::<ROUTED, ORDER, V86>(cpu, mem, context.generation, *kind)?
                 }

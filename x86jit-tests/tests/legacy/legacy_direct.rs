@@ -414,11 +414,12 @@ fn unified_stack_and_loop_ir_has_only_model_vector_differences() {
         )
     });
     for op in &mut observed {
-        if let x86jit_core::IrOp::Legacy(x86jit_core::legacy::LegacyOp::DirectStackAddress {
-            vector,
-            bytes,
-            ..
-        }) = op
+        // The fused stack headers (xj-to9.29) carry the gate's vector too.
+        if let x86jit_core::IrOp::Legacy(
+            x86jit_core::legacy::LegacyOp::DirectStackAddress { vector, bytes, .. }
+            | x86jit_core::legacy::LegacyOp::FusedPush { vector, bytes, .. }
+            | x86jit_core::legacy::LegacyOp::FusedPop { vector, bytes, .. },
+        ) = op
         {
             assert_eq!((*vector, *bytes), (12, 4));
             *vector = 13;

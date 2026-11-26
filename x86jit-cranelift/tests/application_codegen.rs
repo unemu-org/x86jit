@@ -84,8 +84,19 @@ pub(crate) mod fixtures;
 
 #[test]
 fn real16_lifted_ir_matches_main() {
-    for (name, ir) in fixtures::real16() {
+    for (name, mut ir) in fixtures::real16() {
         assert!(ir.legacy_context.is_none());
+        // The interpreter's fused stack headers (xj-to9.29) precede the
+        // frozen ops unchanged; x86jit-tests `legacy_fused_stack` witnesses them.
+        ir.ops.retain(|op| {
+            !matches!(
+                op,
+                x86jit_core::IrOp::Legacy(
+                    x86jit_core::legacy::LegacyOp::FusedPush { .. }
+                        | x86jit_core::legacy::LegacyOp::FusedPop { .. }
+                )
+            )
+        });
         let observed = format!("{ir:#?}\n").replace("    legacy_context: None,\n", "");
         let path = format!(
             "{}/tests/snapshots/real16/{name}.txt",

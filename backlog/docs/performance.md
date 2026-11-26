@@ -4413,3 +4413,94 @@ the slot and the handler-less `Run` have no drop. The 16 cells are within ±0.2 
 the base in both profiles; `machine_exits` against the change above: the Exit path
 (no handler) store and planar at N=10 or less −1.0 to −1.5 %, the handled planar
 store −0.1 to −0.3 %, every cell within +0.24 % (release and perf).
+
+## Fused real-mode stack sequences (xj-to9.29) — MEASURED 2026-11-26
+
+Base `6d9000e7` (xj-to9.35 and xj-to9.26), candidate the same tree with the change. Default
+release profile, host instructions per guest step (`proc_pid_rusage`), `real16_loops` at
+divisor 8 with three rounds and `machine32_loops` at 100,000 iterations with three rounds, one
+process per workload, base and candidate alternating. The host was shared (load 15–40), so no
+wall time is used.
+
+### What the walk executes — MEASURED
+
+A throwaway counter in `walk_ops` (reverted) recorded every op and the op sequence of every
+instruction. Share of executed guest instructions, ops after `InsnStart`:
+
+| Workload | Instruction | Ops (alias, I80286/I80386) | Ops (twenty-bit) | Share |
+|---|---|---:|---:|---:|
+| `push-pop` | PUSH AX | 7 | 9 | 25 % |
+| `push-pop` | POP BX | 10 | 12 | 25 % |
+| `push-pop` | ADD AX,BX | 4 | 4 | 25 % |
+| `push-pop` | LOOP | 1 (`LoopCx`) | 1 | 25 % |
+| `call-ret` | CALL near | 8 | 10 | 33 % |
+| `call-ret` | RET | 10 | 12 | 33 % |
+| `call-ret` | LOOP | 1 | 1 | 33 % |
+| `dos-mixed` | 26 distinct sequences, 4–5 % each; PUSH, POP, CALL, RET 6 of 26 | | | |
+| `alu`, `load`, `store` | no stack instruction | | | |
+| `machine32_loops` | DEC DI; JNZ: `ReadReg Sub WriteReg`, then `Branch` (1 op) | | | 20 % each |
+
+Per pair, the most frequent pairs are inside an instruction (`ReadReg → ReadReg`,
+`ReadReg → Add`, `Add → WriteReg`); every pair across instructions has an `InsnStart` between.
+The stack sequences are the longest straight runs: PUSH is `ReadReg SP`, `Add −n`, `And FFFFh`,
+`DirectStackAddress`, `Store`, `WriteReg SP` (twenty-bit: `ReadReg SS`, `Shl 36`, `Add` and
+`WrappedStore` in place of the gate and the store); POP the same around a `Load`, with a second
+`ReadReg SP`.
+
+### What was fused, and what was not
+
+- **Fused: the 16-bit-SP push and pop sequences** of PUSH, POP, the return-address push of a
+  near CALL and the pop of a near RET (RET imm16 included), on the alias, the I80286/I80386
+  Direct class and the twenty-bit models. The lift (`lift::fused`) puts a `LegacyOp::FusedPush`,
+  `FusedPop`, `FusedPush20` or `FusedPop20` header in front of an exact sequence and leaves the
+  sequence in place; the ordinary walk runs the header, which performs the sequence's ops in
+  order through the same helpers (the stack gate's in-segment case inline), and steps over them.
+  Child walks and walks with an instruction executor treat the header as nothing and run the
+  sequence. Fault reconstruction, retry fingerprints and the other IR readers see the same ops
+  as before. A header never crosses an `InsnStart`. Real16 IR never reaches a JIT backend, so the
+  JIT is untouched. Only PUSH, POP, CALL and RET are matched at lift (one mnemonic test per
+  instruction); POP to memory and the protected and paged stack forms are not fused.
+- **Not fused: CMP/TEST + Jcc, DEC/INC + Jcc, LOOP.** Jcc is already one op (`Branch`) and LOOP
+  one op (`LoopCx`). A pair spans an instruction boundary, whose budget, TF, interrupt, exit-word
+  and SMC checks must stay; with them kept, a fused pair saves one dispatch (about 7–10 host
+  instructions). Taking only the needed condition requires dead flags after the branch, and the
+  block-end liveness keeps every flag live there, so the condition-only form never applies on
+  these loops (that is .28's question).
+- **Walk loop form.** Stepping over the sequence needs a loop whose position can advance.
+  `enumerate()` with `nth` cost the alias +0.2..+2.6 % on `alu`; indexing by position (`get(i)`)
+  +4 % on every Machine `alu`; a slice iterator with the instruction index derived from the
+  element address +2.2 % on protected walks with long NOP runs (the index is computed at every
+  boundary there). Kept: a slice iterator plus a counter that only the instruction executor's
+  boundary reads, which the walks without an executor drop. Outlined (`#[inline(never)]`)
+  header bodies gave back 15–25 host instructions per stack instruction against inlined ones.
+
+### Host instructions per guest step, before → after — MEASURED
+
+`real16_loops` (alias / I8086 / I80286; I8088 and the NEC paths track I8086, I80386 and the
+A20-off paths track I80286 within 0.3 %):
+
+| Workload | Alias | I8086 | I80286 |
+|---|---:|---:|---:|
+| `push-pop` | 445 → 346 (−22.3 %) | 628 → 502 (−20.1 %) | 453 → 370 (−18.5 %) |
+| `call-ret` | 801 → 675 (−15.8 %) | 1123 → 958 (−14.7 %) | 891 → 781 (−12.4 %) |
+| `dos-mixed` | 420 → 362 (−13.7 %) | 635 → 568 (−10.5 %) | 417 → 374 (−10.2 %) |
+| `straight-line` | 357 → 337 (−5.7 %) | 471 → 464 (−1.5 %) | 339 → 339 |
+| `alu` | 322 → 311 (−3.4 %) | 369 → 365 (−1.0 %) | 336 → 336 (+0.1 %) |
+| `load`, `load-odd`, `store` | −3.3..−3.5 % | −0.5..−0.8 % | +0.1..+0.2 % |
+| `data-next-to-*` | −1.4 % | −0.2 % | 0.0 % |
+| `ip-boundary-1`, `ip-boundary-64` | −0.2 %, −1.3 % | 0.0 %, −0.1 % | +0.1 %, +0.2..+0.3 % |
+| `smc-next-1`, `smc-next-64`, `smc-rmw-64` | +0.1..+0.2 % | −0.0..+0.1 % | 0.0 % |
+| `rep-movsw` | 0.0 % | 0.0 % | 0.0 % |
+
+`machine32_loops`: `callret` on `machine-real16` 619 → 553 (−10.7 %); `application-interp32`
+−3.1 % (`register`), −2.7 % (`memory`), −0.9 % (`callret`); every protected, paged and V86
+cell −0.3..+0.1 %; `application-jit32` unchanged. The worst cells are `ip-boundary-64` on the
+I80286/I80386 Direct class at +0.14..+0.30 % and the alias SMC cells at +0.14..+0.17 %; the
+alias, twenty-bit and other Direct gains outside the stack workloads are code-layout effects of
+the new walk loop, not fused work.
+
+The study's estimate (−10..−13 % `push-pop`, −8..−11 % `call-ret`, −4..−7 % `dos-mixed`) was
+low: a fused stack instruction saves about 170 (I80286), 200 (alias) and 250 (twenty-bit) host
+instructions, against the four to six dispatches at about 20 each that it assumed. The
+header also skips the operand plumbing of the sequence (temporary reads and operand matches)
+and the out-of-line stack gate call.

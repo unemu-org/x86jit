@@ -781,7 +781,15 @@ impl OperandAddress {
         };
         for op in self.prefix.iter() {
             let (dst, value) = match *op {
-                IrOp::InsnStart { .. } | IrOp::CheckAlign { .. } => continue,
+                // A fused stack header computes through the ops after it.
+                IrOp::InsnStart { .. }
+                | IrOp::CheckAlign { .. }
+                | IrOp::Legacy(
+                    crate::legacy::LegacyOp::FusedPush { .. }
+                    | crate::legacy::LegacyOp::FusedPop { .. }
+                    | crate::legacy::LegacyOp::FusedPush20 { .. }
+                    | crate::legacy::LegacyOp::FusedPop20 { .. },
+                ) => continue,
                 IrOp::ReadReg { dst, reg } => (dst, crate::interp::read_reg(cpu, reg)),
                 IrOp::Legacy(crate::legacy::LegacyOp::DirectStackAddress {
                     dst, offset, ..

@@ -1149,6 +1149,49 @@ pub enum LegacyOp {
         bytes: u8,
         vector: u8,
     },
+    /// The interpreter's one-dispatch form of the real-mode push sequence
+    /// that follows it unchanged ([`crate::lift::fused`]): `ReadReg` SP,
+    /// SP − `bytes`, `& 0xffff`, [`Self::DirectStackAddress`], the `Store` of
+    /// `src` and the SP write, with temporaries `first`..`first + 3`. Every
+    /// other reader of the IR sees those six ops; walks that do not take the
+    /// fast path run them in its place.
+    FusedPush {
+        first: crate::ir::Temp,
+        src: crate::ir::Val,
+        bytes: u8,
+        vector: u8,
+        fault: crate::ir::MemoryAccess,
+    },
+    /// The same for the real-mode pop sequence: `ReadReg` SP, `& 0xffff`,
+    /// [`Self::DirectStackAddress`], the `Load`, `ReadReg` SP, SP + `adjust`,
+    /// `& 0xffff` and the SP write, with temporaries `first`..`first + 6`.
+    /// The value's consumer (a register write or the RET `Jump`) follows.
+    FusedPop {
+        first: crate::ir::Temp,
+        adjust: u16,
+        bytes: u8,
+        vector: u8,
+        fault: crate::ir::MemoryAccess,
+    },
+    /// The twenty-bit push sequence (`lift::i8086`), eight ops: `ReadReg`
+    /// SP, SP − `bytes`, `& 0xffff`, the SS segment tag (`ReadReg` SS,
+    /// `<< 36`, `+` offset), the [`Self::WrappedStore`] of `src` and the SP
+    /// write, with temporaries `first`..`first + 5`.
+    FusedPush20 {
+        first: crate::ir::Temp,
+        src: crate::ir::Val,
+        bytes: u8,
+        word_bus: bool,
+    },
+    /// The twenty-bit pop sequence, ten ops: `ReadReg` SP, `& 0xffff`, the SS
+    /// segment tag, the [`Self::WrappedLoad`], `ReadReg` SP, SP + `adjust`,
+    /// `& 0xffff` and the SP write, with temporaries `first`..`first + 8`.
+    FusedPop20 {
+        first: crate::ir::Temp,
+        adjust: u16,
+        bytes: u8,
+        word_bus: bool,
+    },
 
     /// Bytewise transfers through a segment-wrapping twenty-bit address.
     /// `word_bus` is the catalogue's sixteen-bit data bus (`data_bus_bits`):

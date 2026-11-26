@@ -5,6 +5,10 @@
 //! before an op is emitted; memory operands expand to effective-address arithmetic
 //! (the single `effective_address` helper, §17.5) plus `Load`/`Store`.
 
+pub(crate) mod fused;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use fused::{set_stack_fusion_for_test, take_fused_headers_for_test};
 pub(crate) mod i8086;
 pub(crate) mod legacy;
 mod mmx;
@@ -900,6 +904,9 @@ fn lift_block_attempt(
             break;
         }
         descriptors += instruction_descriptors;
+        if mode == CpuMode::Real16 && fused::candidate(&insn) {
+            fused::fuse_instruction(&mut ops, ops_start);
+        }
         icount += 1;
         guest_len += insn.len() as u32;
         if terminated || (mode.wraps_16() && insn.next_ip() == 0x1_0000) {

@@ -1541,7 +1541,15 @@ fn walk_ops<
     use crate::legacy::LegacyOp as L;
     let mut bracket = crate::lockstep::begin_with_trace(if CHILD { None } else { trace });
     let mut entry_flags = cpu.flags;
-    for (op_index, op) in instruction.ops(ir).iter().enumerate() {
+    let ops = instruction.ops(ir);
+    // Fused stack headers step over the sequence they stand for.
+    let mut walk = ops.iter();
+    // Only the instruction executor's boundaries read the index, so walks
+    // without one keep no counter.
+    let mut walk_index = 0;
+    while let Some(op) = walk.next() {
+        let op_index = walk_index;
+        walk_index += 1;
         if CHILD {
             // A child walk has no instruction executor.
             debug_assert!(!instruction.enabled());
@@ -1753,6 +1761,66 @@ fn walk_ops<
                         }
                     }
                 }
+                op @ L::FusedPush { .. } if !CHILD && !DIRECT20 => {
+                    if let Err(stop) = fused_push::<ROUTED, ORDER, MACHINE>(
+                        op,
+                        ir,
+                        cpu,
+                        mem,
+                        temps,
+                        cur_addr.get(),
+                        entry_flags,
+                    ) {
+                        return stop;
+                    }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::lift::fused::note_taken();
+                    walk.nth(crate::lift::fused::PUSH_OPS - 1);
+                    walk_index += crate::lift::fused::PUSH_OPS;
+                }
+                op @ L::FusedPop { .. } if !CHILD && !DIRECT20 => {
+                    if let Err(stop) = fused_pop::<RETRY, ROUTED, ORDER, MACHINE>(
+                        op,
+                        ir,
+                        cpu,
+                        mem,
+                        temps,
+                        cur_addr.get(),
+                    ) {
+                        return stop;
+                    }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::lift::fused::note_taken();
+                    walk.nth(crate::lift::fused::POP_OPS - 1);
+                    walk_index += crate::lift::fused::POP_OPS;
+                }
+                op @ L::FusedPush20 { .. } if MACHINE && DIRECT20 && !CHILD => {
+                    if let Err(exit) =
+                        fused_push20::<ROUTED, ORDER>(op, cpu, mem, temps, cur_addr.get())
+                    {
+                        return WalkResult::exit(exit);
+                    }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::lift::fused::note_taken();
+                    walk.nth(crate::lift::fused::PUSH20_OPS - 1);
+                    walk_index += crate::lift::fused::PUSH20_OPS;
+                }
+                op @ L::FusedPop20 { .. } if MACHINE && DIRECT20 && !CHILD => {
+                    if let Err(exit) =
+                        fused_pop20::<ROUTED, ORDER>(op, cpu, mem, temps, cur_addr.get())
+                    {
+                        return WalkResult::exit(exit);
+                    }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::lift::fused::note_taken();
+                    walk.nth(crate::lift::fused::POP20_OPS - 1);
+                    walk_index += crate::lift::fused::POP20_OPS;
+                }
+                // Another walk runs the sequence the header stands for.
+                L::FusedPush { .. }
+                | L::FusedPop { .. }
+                | L::FusedPush20 { .. }
+                | L::FusedPop20 { .. } => {}
                 op @ L::Loop { .. } => {
                     return match legacy::execute_loop_op(
                         cpu,
@@ -1869,7 +1937,9 @@ fn walk_ops<
                     && ir.mode == crate::CpuMode::Real16
                     && (cpu.fpu_emulation || cpu.fpu_model == crate::FpuModel::None)
                 {
-                    if let Some(result) = real16_x87_gate(cpu, mem, ir, op_index, *guest_addr) {
+                    if let Some(result) =
+                        real16_x87_gate(cpu, mem, ir, op_position(ops, op), *guest_addr)
+                    {
                         return result;
                     }
                 }
@@ -9444,6 +9514,233 @@ fn vstore_parts<M: StrMem>(
 fn stack_fault_return(rip: u64, base: u64, fault: crate::ir::MemoryAccess) -> WalkResult {
     let exit = result::consume_current().expect("stack failure must initialize its cold record");
     classify_access(InterpResult::exit(exit), rip, base, fault).into()
+}
+
+/// The six ops of [`crate::lift::fused::push_header`], in order, as their
+/// own arms in [`walk_ops`] run them. `Err` is the walk's stop.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fused_push<const ROUTED: bool, const ORDER: u8, const MACHINE: bool>(
+    op: &crate::legacy::LegacyOp,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    ip: u64,
+    entry_flags: Flags,
+) -> Result<(), WalkResult> {
+    let crate::legacy::LegacyOp::FusedPush {
+        first,
+        src,
+        bytes,
+        vector,
+        fault,
+    } = *op
+    else {
+        unreachable!("fused push header")
+    };
+    let t = first as usize;
+    let sp = cpu.gpr[RSP];
+    let sum = sp.wrapping_add(u64::from(bytes).wrapping_neg());
+    let offset = sum & 0xffff;
+    temps[t] = sp;
+    temps[t + 1] = sum;
+    temps[t + 2] = offset;
+    let address = fused_stack_address(cpu, offset, bytes, vector, ip).map_err(|exit| {
+        fused_stack_fault::<MACHINE, ROUTED, ORDER>(exit, ir, cpu, mem, vector, ip)
+    })?;
+    temps[t + 3] = address;
+    // The `Store` arm: entry flags are visible during the write.
+    let result = cpu.flags;
+    cpu.flags = entry_flags;
+    if let Some(r) = exec_store(cpu, mem, temps, ip, &Val::Imm(address), &src, &bytes) {
+        return Err(walk_classify_access(r, ip, address, fault));
+    }
+    cpu.flags = result;
+    cpu.write_gpr(RSP, offset, 2);
+    Ok(())
+}
+
+/// The eight ops of [`crate::lift::fused::pop_header`], in order, as their
+/// own arms in [`walk_ops`] run them. `Err` is the walk's stop.
+#[inline(always)]
+fn fused_pop<const RETRY: bool, const ROUTED: bool, const ORDER: u8, const MACHINE: bool>(
+    op: &crate::legacy::LegacyOp,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    ip: u64,
+) -> Result<(), WalkResult> {
+    let crate::legacy::LegacyOp::FusedPop {
+        first,
+        adjust,
+        bytes,
+        vector,
+        fault,
+    } = *op
+    else {
+        unreachable!("fused pop header")
+    };
+    let t = first as usize;
+    let sp = cpu.gpr[RSP];
+    let offset = sp & 0xffff;
+    temps[t] = sp;
+    temps[t + 1] = offset;
+    let address = fused_stack_address(cpu, offset, bytes, vector, ip).map_err(|exit| {
+        fused_stack_fault::<MACHINE, ROUTED, ORDER>(exit, ir, cpu, mem, vector, ip)
+    })?;
+    temps[t + 2] = address;
+    let dst = first + 3;
+    let at = Val::Imm(address);
+    let result = if !MACHINE && RETRY {
+        exec_load_retry::<ROUTED, ORDER>(cpu, mem, temps, ip, ir, &dst, &at, &bytes)
+    } else {
+        exec_load::<MACHINE, ROUTED, ORDER>(cpu, mem, temps, ip, &dst, &at, &bytes)
+    };
+    if let Some(r) = result {
+        return Err(walk_classify_access(r, ip, address, fault));
+    }
+    let sp = cpu.gpr[RSP];
+    let sum = sp.wrapping_add(u64::from(adjust));
+    let offset = sum & 0xffff;
+    temps[t + 4] = sp;
+    temps[t + 5] = sum;
+    temps[t + 6] = offset;
+    cpu.write_gpr(RSP, offset, 2);
+    Ok(())
+}
+
+/// The eight ops of [`crate::lift::fused::push20_header`], in order, as their
+/// own arms in [`walk_ops`] run them (the `WrappedStore` arm's included).
+#[inline(always)]
+fn fused_push20<const ROUTED: bool, const ORDER: u8>(
+    op: &crate::legacy::LegacyOp,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    ip: u64,
+) -> Result<(), Exit> {
+    let crate::legacy::LegacyOp::FusedPush20 {
+        first,
+        src,
+        bytes,
+        word_bus,
+    } = *op
+    else {
+        unreachable!("fused twenty-bit push header")
+    };
+    let t = first as usize;
+    let sp = cpu.gpr[RSP];
+    let sum = sp.wrapping_add(u64::from(bytes).wrapping_neg());
+    let offset = sum & 0xffff;
+    let selector = u64::from(cpu.ss);
+    let base = selector << 36;
+    let tag = base.wrapping_add(offset);
+    temps[t] = sp;
+    temps[t + 1] = sum;
+    temps[t + 2] = offset;
+    temps[t + 3] = selector;
+    temps[t + 4] = base;
+    temps[t + 5] = tag;
+    let store = crate::legacy::LegacyOp::WrappedStore {
+        addr: Val::Imm(tag),
+        value: src,
+        size: bytes,
+        word_bus,
+    };
+    i8086::primitive::<ROUTED, ORDER>(&store, cpu, mem.0.normal(), temps, ip)?;
+    for i in 0..bytes {
+        mem.0.note_block_write(i8086::physical(tag, i), 1);
+    }
+    cpu.write_gpr(RSP, offset, 2);
+    Ok(())
+}
+
+/// The ten ops of [`crate::lift::fused::pop20_header`], in order, as their
+/// own arms in [`walk_ops`] run them.
+#[inline(always)]
+fn fused_pop20<const ROUTED: bool, const ORDER: u8>(
+    op: &crate::legacy::LegacyOp,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    temps: &mut [u64],
+    ip: u64,
+) -> Result<(), Exit> {
+    let crate::legacy::LegacyOp::FusedPop20 {
+        first,
+        adjust,
+        bytes,
+        word_bus,
+    } = *op
+    else {
+        unreachable!("fused twenty-bit pop header")
+    };
+    let t = first as usize;
+    let sp = cpu.gpr[RSP];
+    let offset = sp & 0xffff;
+    let selector = u64::from(cpu.ss);
+    let base = selector << 36;
+    let tag = base.wrapping_add(offset);
+    temps[t] = sp;
+    temps[t + 1] = offset;
+    temps[t + 2] = selector;
+    temps[t + 3] = base;
+    temps[t + 4] = tag;
+    let load = crate::legacy::LegacyOp::WrappedLoad {
+        dst: first + 5,
+        addr: Val::Imm(tag),
+        size: bytes,
+        word_bus,
+    };
+    i8086::primitive::<ROUTED, ORDER>(&load, cpu, mem.0.normal(), temps, ip)?;
+    let sp = cpu.gpr[RSP];
+    let sum = sp.wrapping_add(u64::from(adjust));
+    let offset = sum & 0xffff;
+    temps[t + 6] = sp;
+    temps[t + 7] = sum;
+    temps[t + 8] = offset;
+    cpu.write_gpr(RSP, offset, 2);
+    Ok(())
+}
+
+/// The index in `ops` of `op`, an element of it.
+#[inline(always)]
+fn op_position(ops: &[IrOp], op: &IrOp) -> usize {
+    (op as *const IrOp as usize - ops.as_ptr() as usize) / std::mem::size_of::<IrOp>()
+}
+
+/// [`legacy::direct_stack_address`] with its in-segment case inline.
+#[inline(always)]
+fn fused_stack_address(
+    cpu: &mut CpuState,
+    offset: u64,
+    bytes: u8,
+    vector: u8,
+    ip: u64,
+) -> Result<u64, Exit> {
+    if offset + u64::from(bytes) <= 0x10000 {
+        Ok((u64::from(cpu.ss) << 4) + offset)
+    } else {
+        legacy::direct_stack_address(cpu, offset, bytes, vector, ip)
+    }
+}
+
+/// The `DirectStackAddress` arm's fault, for a fused stack sequence.
+#[cold]
+#[inline(never)]
+fn fused_stack_fault<const MACHINE: bool, const ROUTED: bool, const ORDER: u8>(
+    exit: Exit,
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    mem: &Access<ROUTED, ORDER, impl InterpreterMemory>,
+    vector: u8,
+    ip: u64,
+) -> WalkResult {
+    if !MACHINE {
+        return WalkResult::delivered_fault(deliver_interrupt_mode(cpu, mem, ip, vector, ip));
+    }
+    WalkResult::exit(legacy::stack_fault_access(exit, &ir.ops, ip))
 }
 
 // Only scalar fault keys cross the cold boundary. Passing a whole carrier to
