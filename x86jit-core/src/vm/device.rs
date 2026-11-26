@@ -643,6 +643,15 @@ pub(super) struct Run<'a> {
     /// settles this result instead of calling the handler again.
     decided: Option<Box<Decided>>,
 }
+impl Run<'static> {
+    /// The Run of a dispatch call with no handler. No callback is made, so
+    /// `decided` stays empty and the Run owns nothing: it is held without a
+    /// drop, which keeps unwind cleanup out of the dispatch loops that carry it.
+    #[inline(always)]
+    pub fn unhandled() -> std::mem::ManuallyDrop<Self> {
+        std::mem::ManuallyDrop::new(Self::default())
+    }
+}
 struct Decided {
     request: DeviceRequest,
     result: std::thread::Result<DeviceResult>,
@@ -971,6 +980,38 @@ thread_local! {
     /// it made, and how many transfers it completed inside their block.
     pub(super) static IN_BLOCK_TEST: std::cell::Cell<(bool, u64, u64)> =
         const { std::cell::Cell::new((false, 0, 0)) };
+}
+/// A dispatch call's `InBlock`. A run without devices (`DEVICES` false) holds
+/// an empty slot whose drop compiles to nothing, so its dispatch loop carries
+/// no trace of the hook.
+pub(super) struct InBlockSlot<const DEVICES: bool>(std::mem::ManuallyDrop<Option<InBlock>>);
+impl<const DEVICES: bool> InBlockSlot<DEVICES> {
+    #[inline(always)]
+    pub fn new(make: impl FnOnce() -> Option<InBlock>) -> Self {
+        Self(std::mem::ManuallyDrop::new(if DEVICES {
+            make()
+        } else {
+            None
+        }))
+    }
+    #[inline(always)]
+    pub fn get(&self) -> Option<&InBlock> {
+        if DEVICES {
+            self.0.as_ref()
+        } else {
+            None
+        }
+    }
+}
+impl<const DEVICES: bool> Drop for InBlockSlot<DEVICES> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if DEVICES {
+            // SAFETY: the slot is dropped once, here; `new` stored `None`
+            // otherwise, which owns nothing.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.0) }
+        }
+    }
 }
 /// Publishes an `InBlock` for one dispatch call and withdraws it on return.
 pub(super) struct InBlockScope<'a> {

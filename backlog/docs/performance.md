@@ -4400,3 +4400,16 @@ Handled planar stores rise from 16.9 to 41.7 M retired/s (I80286, N=3). The
 unserved port with a handler keeps 427 instructions (7.7 %) over no registration;
 the Exit path pays 0.3–1.1 % for the Trap-miss check of the walk's memory
 provider. The decision-23 campaign is not part of this entry.
+
+Follow-up: that campaign blocked 16 cells with no device registered (real16_loops
+`call-ret`, `ip-boundary-64`, `load`, `push-pop` on the four legacy paths: +0.5 to
++1.1 % release, +0.9 to +1.7 % perf). Two costs reached runs without devices: the
+dispatch loop held an `Option<InBlock>` and a `Run` with an owned `decided` box,
+whose drops put unwind cleanup into the loop (the perf share), and every walk's
+`RunningMemory` carried the Trap-miss hook (most of the release share). The hook is
+now a const parameter of the provider, taken only by a run whose handler serves
+MMIO (its twenty-bit walk too, so the transfer helpers keep one out-of-line copy);
+the slot and the handler-less `Run` have no drop. The 16 cells are within ±0.2 % of
+the base in both profiles; `machine_exits` against the change above: the Exit path
+(no handler) store and planar at N=10 or less −1.0 to −1.5 %, the handled planar
+store −0.1 to −0.3 %, every cell within +0.24 % (release and perf).

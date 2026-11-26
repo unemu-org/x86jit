@@ -2912,9 +2912,12 @@ impl Vcpu {
         let mut refresh_boundary = true;
         // Decision-28 stage 3: a handled MMIO transfer of a shared walk can
         // complete inside its block (`device::in_block_access`).
-        let in_block = (DEVICES && devices.handler.is_some() && vm.device_table.has_mmio())
-            .then(|| super::device::InBlock::new(vm, self.device_cpu().id));
-        let _in_block_scope = in_block.as_ref().map(super::device::InBlock::publish);
+        // A run without devices holds an empty slot that has no drop.
+        let in_block = super::device::InBlockSlot::<DEVICES>::new(|| {
+            (devices.handler.is_some() && vm.device_table.has_mmio())
+                .then(|| super::device::InBlock::new(vm, self.device_cpu().id))
+        });
+        let _in_block_scope = in_block.get().map(super::device::InBlock::publish);
         macro_rules! machine_exit {
             ($exit:expr) => {{
                 let exit = $exit;
@@ -3289,20 +3292,35 @@ impl Vcpu {
                 } else {
                     limit.map_or(u64::MAX, |limit| limit - steps)
                 };
+                // Only a run whose handler serves MMIO walks with the Trap-miss
+                // hook in its memory provider; every other walk keeps its
+                // accesses free of it. The twenty-bit walk is never armed, but
+                // takes the same provider in such a run, so the hook's
+                // transfer helpers keep one out-of-line copy for both walks.
+                let hook = in_block.get();
                 let progress = if direct20 {
-                    crate::interp::legacy::execute_shared20::<ROUTED, ORDER>(
-                        &ir,
-                        &mut self.cpu,
-                        &vm.mem,
-                        &mut self.interp_scratch,
-                        remaining,
-                        exit_word,
-                        self.sti_shadow,
-                        self.ss_shadow,
-                        boundary.irq_pending,
-                        // A twenty-bit model is never blocked (`nmi.rs`).
-                        false,
-                    )
+                    macro_rules! execute_shared20 {
+                        ($device:literal) => {
+                            crate::interp::legacy::execute_shared20::<ROUTED, ORDER, $device>(
+                                &ir,
+                                &mut self.cpu,
+                                &vm.mem,
+                                &mut self.interp_scratch,
+                                remaining,
+                                exit_word,
+                                self.sti_shadow,
+                                self.ss_shadow,
+                                boundary.irq_pending,
+                                // A twenty-bit model is never blocked (`nmi.rs`).
+                                false,
+                            )
+                        };
+                    }
+                    if hook.is_some() {
+                        execute_shared20!(true)
+                    } else {
+                        execute_shared20!(false)
+                    }
                 } else if KIND >= MACHINE_DISPATCH
                     && matches!(walk, BlockWalk::Protected | BlockWalk::Paged)
                 {
@@ -3329,7 +3347,7 @@ impl Vcpu {
                     }
                 } else {
                     if DEVICES && matches!(walk, BlockWalk::Shared) {
-                        if let Some(hook) = &in_block {
+                        if let Some(hook) = hook {
                             if self
                                 .legacy_execution
                                 .as_ref()
@@ -3341,26 +3359,31 @@ impl Vcpu {
                             }
                         }
                     }
-                    let progress = crate::interp::legacy::execute_block::<ROUTED, ORDER>(
-                        walk,
-                        &ir,
-                        &mut self.cpu,
-                        &vm.mem,
-                        &mut self.interp_scratch,
-                        remaining,
-                        exit_word,
-                        &mut self.legacy_execution.as_mut().unwrap().task_switch,
-                        self.sti_shadow,
-                        self.ss_shadow,
-                        boundary.irq_pending,
-                        self.nmi_state & NMI_BLOCKED != 0,
-                    );
-                    if DEVICES {
-                        if let Some(hook) = &in_block {
-                            hook.disarm();
-                        }
+                    macro_rules! execute_block {
+                        ($device:literal) => {
+                            crate::interp::legacy::execute_block::<ROUTED, ORDER, $device>(
+                                walk,
+                                &ir,
+                                &mut self.cpu,
+                                &vm.mem,
+                                &mut self.interp_scratch,
+                                remaining,
+                                exit_word,
+                                &mut self.legacy_execution.as_mut().unwrap().task_switch,
+                                self.sti_shadow,
+                                self.ss_shadow,
+                                boundary.irq_pending,
+                                self.nmi_state & NMI_BLOCKED != 0,
+                            )
+                        };
                     }
-                    progress
+                    if let Some(hook) = hook {
+                        let progress = execute_block!(true);
+                        hook.disarm();
+                        progress
+                    } else {
+                        execute_block!(false)
+                    }
                 };
                 if DEVICES {
                     let port = progress.outcome.as_ref().is_some_and(|o| {

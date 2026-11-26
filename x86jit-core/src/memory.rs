@@ -5925,7 +5925,10 @@ pub(crate) trait InterpreterMemory {
         unreachable!("child string on normal memory")
     }
 }
-pub(crate) struct RunningMemory<'a> {
+/// `DEVICE` selects the walk that may complete a registered device transfer in
+/// place (decision-28 stage 3): only a Machine walk with handled MMIO ranges
+/// instantiates it, so a walk with no such range carries no Trap-miss hook.
+pub(crate) struct RunningMemory<'a, const DEVICE: bool = false> {
     pub memory: &'a Memory,
     pub ir: &'a crate::IrBlock,
     pub start: u64,
@@ -5936,7 +5939,7 @@ pub(crate) struct RunningMemory<'a> {
     pub started: &'a Cell<u8>,
 }
 
-impl RunningMemory<'_> {
+impl<const DEVICE: bool> RunningMemory<'_, DEVICE> {
     #[cold]
     #[inline(never)]
     fn device(&self, write: bool, addr: u64, size: u8, value: u64) -> Result<u64, ()> {
@@ -5961,7 +5964,7 @@ impl RunningMemory<'_> {
     }
 }
 
-impl InterpreterMemory for RunningMemory<'_> {
+impl<const DEVICE: bool> InterpreterMemory for RunningMemory<'_, DEVICE> {
     #[inline(always)]
     fn normal(&self) -> &Memory {
         self.memory
@@ -5981,10 +5984,14 @@ impl InterpreterMemory for RunningMemory<'_> {
     // The interpreter walk's transfers are containment-only. A miss over adjacent
     // regions ends the attempt with its usual exit; the instruction is then
     // re-executed through `SplitMemory` (`interp::split_block`).
-    // A Trap miss may be a registered device transfer that a Machine walk
-    // completes in place (decision-28 stage 3, `vm::device::in_block_access`).
+    // With `DEVICE`, a Trap miss may be a registered device transfer that a
+    // Machine walk completes in place (decision-28 stage 3,
+    // `vm::device::in_block_access`).
     #[inline(always)]
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {
+        if !DEVICE {
+            return self.memory.read_mode::<ROUTED>(addr, size);
+        }
         match self.memory.read_mode::<ROUTED>(addr, size) {
             Err(MemTrap::Mmio) => self
                 .device(false, addr, size, 0)
@@ -5994,6 +6001,11 @@ impl InterpreterMemory for RunningMemory<'_> {
     }
     #[inline(always)]
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap> {
+        if !DEVICE {
+            return self
+                .memory
+                .write_mode_observed::<ROUTED, false>(addr, value, size, self);
+        }
         match self
             .memory
             .write_mode_observed::<ROUTED, false>(addr, value, size, self)

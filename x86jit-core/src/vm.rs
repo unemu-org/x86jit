@@ -3502,7 +3502,7 @@ impl Vcpu {
             vm,
             budget,
             options,
-            &mut device::Run::default(),
+            &mut device::Run::unhandled(),
         )
     }
 
@@ -3519,14 +3519,14 @@ impl Vcpu {
                 vm,
                 budget,
                 options,
-                &mut device::Run::default(),
+                &mut device::Run::unhandled(),
             )
         } else {
             self.run_engine_devices::<KIND, STEPPED, false, true>(
                 vm,
                 budget,
                 options,
-                &mut device::Run::default(),
+                &mut device::Run::unhandled(),
             )
         }
     }
@@ -3907,7 +3907,7 @@ impl Vcpu {
             origin,
             StepOptions::default(),
             None,
-            &mut device::Run::default(),
+            &mut device::Run::unhandled(),
         )
         .application()
     }

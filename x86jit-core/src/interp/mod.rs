@@ -365,6 +365,7 @@ fn interpret_steps_ordered<
             false,
             STR_MMIO,
             false,
+            false,
         >(ir, cpu, mem, scratch, info, steps)
     } else {
         interpret_block_inner::<
@@ -377,13 +378,19 @@ fn interpret_steps_ordered<
             false,
             STR_MMIO,
             false,
+            false,
         >(ir, cpu, mem, scratch, info, steps)
     }
 }
 
 /// Machine specialization of the same stepped walk used by Application Real16.
 #[inline(always)]
-pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
+pub(crate) fn interpret_direct_steps<
+    const ROUTED: bool,
+    const ORDER: u8,
+    const DIRECT20: bool,
+    const DEVICE: bool,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     mem: &Memory,
@@ -392,12 +399,14 @@ pub(crate) fn interpret_direct_steps<const ROUTED: bool, const ORDER: u8, const 
     steps: &mut StepContext,
 ) -> BlockResult {
     let mem = Access::<ROUTED, ORDER>::new(mem);
+    // An MMIO retry walk is never armed for the in-block path
+    // (`device::InBlock::arm`), so it keeps the provider without the hook.
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, true, ORDER, true, false, true, true, DIRECT20>(
+        interpret_block_inner::<true, ROUTED, true, ORDER, true, false, true, true, DIRECT20, false>(
             ir, cpu, mem, scratch, info, steps,
         )
     } else {
-        interpret_block_inner::<false, ROUTED, true, ORDER, true, false, true, true, DIRECT20>(
+        interpret_block_inner::<false, ROUTED, true, ORDER, true, false, true, true, DIRECT20, DEVICE>(
             ir, cpu, mem, scratch, info, steps,
         )
     }
@@ -664,7 +673,7 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
     }
     let mem = Access::<ROUTED, ORDER>::new(mem);
     if cpu.mmio_retry_active {
-        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false, false, true, false>(
+        interpret_block_inner::<true, ROUTED, DEFAULT, ORDER, false, false, false, true, false, false>(
             ir,
             cpu,
             mem,
@@ -673,14 +682,18 @@ fn interpret_block_ordered<const ROUTED: bool, const DEFAULT: bool, const ORDER:
             &mut StepContext::default(),
         )
     } else {
-        interpret_block_inner::<false, ROUTED, DEFAULT, ORDER, false, false, false, true, false>(
-            ir,
-            cpu,
-            mem,
-            scratch,
-            info,
-            &mut StepContext::default(),
-        )
+        interpret_block_inner::<
+            false,
+            ROUTED,
+            DEFAULT,
+            ORDER,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        >(ir, cpu, mem, scratch, info, &mut StepContext::default())
     }
 }
 
@@ -703,6 +716,7 @@ fn interpret_block_inner<
     const MACHINE: bool,
     const STR_MMIO: bool,
     const DIRECT20: bool,
+    const DEVICE: bool,
 >(
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -755,7 +769,7 @@ fn interpret_block_inner<
     }
     let start = info.code_base.wrapping_add(ir.guest_start);
     let host_start = (mem.host_base() as u64).wrapping_add(start.wrapping_sub(mem.guest_base()));
-    let running = RunningMemory {
+    let running = RunningMemory::<DEVICE> {
         memory: mem,
         ir,
         start,
@@ -1020,6 +1034,7 @@ fn split_block<
         MACHINE,
         STR_MMIO,
         DIRECT20,
+        false,
     >(
         &rest,
         cpu,

@@ -3468,7 +3468,12 @@ fn shared_string_fault<const ROUTED: bool, M: InterpreterMemory>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
+pub(crate) fn execute_shared<
+    const ROUTED: bool,
+    const ORDER: u8,
+    const DIRECT20: bool,
+    const DEVICE: bool,
+>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -3496,7 +3501,7 @@ pub(crate) fn execute_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20
         sti_shadow,
         ..Default::default()
     };
-    let result = super::interpret_direct_steps::<ROUTED, ORDER, DIRECT20>(
+    let result = super::interpret_direct_steps::<ROUTED, ORDER, DIRECT20, DEVICE>(
         ir, cpu, memory, scratch, &mut info, &mut steps,
     );
     if info.retired != 0 {
@@ -3636,7 +3641,7 @@ fn split_shared<const ROUTED: bool, const ORDER: u8, const DIRECT20: bool>(
 // Keep the new operation shapes out of existing walks while sharing their source.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
+pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8, const DEVICE: bool>(
     ir: &IrBlock,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -3648,7 +3653,7 @@ pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
     pending_irq: bool,
     nmi_blocked: bool,
 ) -> Progress {
-    execute_shared::<ROUTED, ORDER, true>(
+    execute_shared::<ROUTED, ORDER, true, DEVICE>(
         ir,
         cpu,
         memory,
@@ -3664,7 +3669,9 @@ pub(crate) fn execute_shared20<const ROUTED: bool, const ORDER: u8>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
+/// `DEVICE` selects the Shared walk whose memory provider may complete a
+/// registered MMIO transfer in its block (`RunningMemory`).
+pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8, const DEVICE: bool>(
     walk: BlockWalk,
     ir: &IrBlock,
     cpu: &mut CpuState,
@@ -3679,7 +3686,7 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
     nmi_blocked: bool,
 ) -> Progress {
     match walk {
-        BlockWalk::Shared => execute_shared::<ROUTED, ORDER, false>(
+        BlockWalk::Shared => execute_shared::<ROUTED, ORDER, false, DEVICE>(
             ir,
             cpu,
             memory,
@@ -6189,7 +6196,7 @@ mod walk_verdict {
         let mut scratch = Vec::new();
         let mut tasks = tasks::SwitchState::default();
         let mut run = |ir: &IrBlock, cpu: &mut CpuState| {
-            execute_block::<false, 0>(
+            execute_block::<false, 0, false>(
                 BlockWalk::for_flat32(ir),
                 ir,
                 cpu,
