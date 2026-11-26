@@ -219,6 +219,8 @@ scripts/perf-campaign.sh --profile release --processes 10 BASE CAND # the shippe
 scripts/perf-campaign.sh --build-only BASE                          # fill the cache only
 python3 scripts/perf_campaign.py analyze <out>/perf/raw             # analyse kept raw data again
 python3 scripts/perf_campaign.py combine release=<out>/release/analysis.json perf=<out>/perf/analysis.json
+python3 scripts/perf_campaign.py summary <out>                      # the verdict as Markdown (CI job summary)
+python3 scripts/perf_campaign.py counter-check                      # exit 0 when the host counter counts
 ```
 
 What it does:
@@ -241,7 +243,7 @@ What it does:
   `x86jit-core` and `x86jit-bench`. A commit from before the profile gets the same profile on the
   cargo command line. Base binaries are cached per profile.
 - **The store probe** is the bench example `interpreter_store_probe`, which prints host
-  instructions per store on macOS as its sixth column; nothing is patched into the tree. For a
+  instructions per store (macOS and Linux) as its sixth column; nothing is patched into the tree. For a
   commit from before that column, the script builds this checkout's copy of the example in its
   place and records that in the binaries' `meta.txt`.
 - **Measures** with address-space randomization off for every process: on macOS through
@@ -278,11 +280,62 @@ What it does:
   rule.
 - **Exit status:** 0 pass, 1 block, 2 a usage, build or measuring problem (a failed process,
   unequal counts, a zero counter, a cell missing in one profile), 3 drift only. With
-  `--profile NAME`: 0 pass, 1 a cell over, 2 a problem. The instruction counter exists on macOS
-  only; on Linux the script runs but reports a problem.
+  `--profile NAME`: 0 pass, 1 a cell over, 2 a problem. The instruction counter is
+  `proc_pid_rusage` on macOS and `perf_event_open` (user-mode instructions of the measuring
+  thread; `kernel.perf_event_paranoid` at most 2, and a hardware PMU) on Linux; elsewhere, and
+  for a Linux base from before that counter, the script runs but reports a problem.
 
 A campaign with cached bases takes two candidate builds and a few minutes of measuring; the
 timings are in `performance.md` § "Short campaign protocol".
+
+### Performance campaign in CI
+
+`.github/workflows/perf-gate.yml` runs `scripts/perf-campaign.sh BASE CANDIDATE` on a
+GitHub-hosted aarch64 Linux runner (`ubuntu-24.04-arm`), the only hosted runner whose VM has a
+hardware PMU: the benchmarks count host instructions with `perf_event_open` there, while the
+x86-64 Linux runner has no PMU and the macOS runner's `proc_pid_rusage` `ri_instructions`
+reads 0. It starts by hand or on a push to a `ci/perf-*`
+branch; it is not part of `ci.yml` and does not gate `main` by itself.
+
+```sh
+gh workflow run perf-gate.yml -f base=<sha> -f candidate=<sha>   # any two commits or refs
+gh workflow run perf-gate.yml -f candidate=<sha>                 # base: merge base with origin/main
+gh run list --workflow perf-gate.yml                             # find the run
+gh run watch <run-id>; gh run download <run-id>                  # follow it; fetch the artifact
+git push origin HEAD:ci/perf-<name>                              # pushed commit vs its merge base
+```
+
+- **Inputs.** `base` and `candidate` take a commit (full or short SHA) or a ref (`main`,
+  `origin/main`, a branch name); a commit on no branch is fetched by SHA. An empty `candidate`
+  is the commit of the ref the run starts on (`--ref`, default `main`); an empty `base` is the
+  candidate's merge base with `origin/main`. Dispatch from `main` (the default): its scripts
+  and toolchain then measure, and the caches it saves serve every ref.
+- **Steps.** A counter check first: `kernel.perf_event_paranoid` goes from the image's 4 to 2
+  (`sudo sysctl`), then `perf_campaign.py counter-check`; when the counter does not count, the
+  job stops with an error before any build. Then pinned Nix, the Nix store cache and the
+  `no-freebsd` dev shell, as in `ci.yml`'s aarch64 job; the
+  builds (`--build-only`, `--build-qos default`, `--jobs` = the runner's CPUs); the campaign
+  with `--parallel` = the runner's CPUs, otherwise the defaults.
+- **Randomization** is off as on any Linux host: `setarch <machine> -R`, which needs no
+  privilege, so the hosted runner needs no change to the script.
+- **Caches.** The binaries of each side are cached per commit with `actions/cache`, key
+  `perf-bin-v1-Linux-aarch64-<commit>-<toolchain>-<Cargo.lock hash>`, the toolchain being the
+  campaign's own hash of `rustc -vV`; both profiles share one entry. Base and candidate are
+  saved, from any ref (an entry is a few tens of MB), so a candidate that lands on `main` is a
+  later campaign's cached base, and several candidates against one `main` commit build that
+  base once. The Nix store entry is `ci.yml`'s aarch64 one,
+  `nix-v1-Linux-aarch64-no-freebsd-<flake hash>`, saved from `main` only.
+- **Result.** The job summary holds the combined verdict, the blocking and drift cells with
+  each profile's change, the problems, the path means and each profile's `report.txt`. The
+  artifact `perf-gate-<base>-<candidate>` (30 days) holds the `--out` directory (`raw/`,
+  `report.txt`, `analysis.json`, `cells.csv` per profile; `combined.txt`, `combined.json`,
+  `campaign.log`), the build logs and each side's `meta.txt`. The job fails on BLOCK (exit 1)
+  and on a problem (exit 2); DRIFT (exit 3) passes with a warning annotation; PASS adds a
+  notice.
+- **Duration.** A hosted runner has 3 CPUs. One side's builds of both profiles take an
+  estimated 15–30 min (a loaded workstation took 8–15 min per profile and side), measuring
+  both profiles 3–5 min, the Nix setup a few minutes. Both sides cached: about 10 min; a
+  cached base: about 30 min; nothing cached: about an hour. The timeout is 180 min.
 
 
 
@@ -489,6 +542,9 @@ only on GitHub Actions, and the workflow publishes nothing.
   A newer run on the same ref cancels an older one (concurrency group
   `ci-<workflow>-<ref>`), except on `main`: a `main` run classifies only the paths
   since the previous push, so each one finishes.
+- **Perf gate**: `.github/workflows/perf-gate.yml` runs the decision-23 performance campaign
+  on a hosted aarch64 Linux runner, on dispatch or a push to a `ci/perf-*` branch
+  (§ Performance campaign in CI).
 - **Local macOS**: `cargo nextest`, clippy and fmt additionally cover
   aarch64-apple-darwin. The Linux hosted lanes do not replace checks of Darwin-specific
   code. The native x86-64 Linux oracle and the real-program ladder do not run on macOS.

@@ -25,6 +25,8 @@ Subcommands:
   validate-divisors  compare each workload's divisors against divisor 1 on one binary
   compare-record     compare a campaign's analysis with a recorded campaign
   combine            combine a release and a perf analysis into the two-profile verdict
+  summary            Markdown of a two-profile campaign's verdict, for a CI job summary
+  counter-check      check that the host instruction counter counts on this machine
   snapshot           copy a working tree's tracked and untracked, not ignored, files
 
 Exit status of campaign and analyze (one profile): 0 pass, 1 a cell misses the gate, 2 a
@@ -44,6 +46,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -518,7 +521,196 @@ def cmd_combine(args):
     return combined_status(c)
 
 
+def cell_label(key, store=False):
+    """`workload` Path for a cell key, `store` W P R for a store-probe cell."""
+    if store:
+        return f"store {key}"
+    workload, path = key.split("|", 1)
+    return f"`{workload}` {PATH_LABELS.get(path, path)}"
+
+
+def summary_markdown(out):
+    """Markdown for a CI job summary from a campaign's --out directory: the combined verdict,
+    the blocking and drift cells, the problems, the path means and each profile's report."""
+    combined_path = os.path.join(out, "combined.json")
+    if not os.path.exists(combined_path):
+        return ("## Perf gate: no verdict\n\nThe campaign stopped before the two-profile verdict "
+                "(a usage, build or measuring problem); see the job log and the artifact.\n")
+    with open(combined_path) as f:
+        combined = json.load(f)
+    profiles = combined["profiles"]
+    results = {}
+    for p in profiles:
+        path = os.path.join(out, p, "analysis.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                results[p] = json.load(f)
+    meta = next((r.get("meta", {}) for r in results.values()), {})
+
+    def name(value):  # "abc123 (/path/to/bin)" -> "abc123"
+        return str(value).split(" (", 1)[0]
+
+    lines = [f"## Perf gate: {combined['verdict']} (exit {combined_status(combined)})", ""]
+    if meta:
+        lines.append(f"Base `{name(meta.get('base', '?'))}`, candidate "
+                     f"`{name(meta.get('candidate', '?'))}`; {meta.get('processes', '?')} "
+                     f"processes per cell and side, randomization {meta.get('aslr', '?')}.")
+    lines.append(f"Profiles {' and '.join(profiles)}, gate +{combined['gate']}% per cell: a cell "
+                 "blocks when it is over in every profile; over in some only, it is drift.")
+    lines.append("")
+    rows = [(title, e, store) for title, key, store in (
+        ("BLOCK", "block", False), ("BLOCK", "store_block", True),
+        ("DRIFT", "drift", False), ("DRIFT", "store_drift", True)) for e in combined[key]]
+    if rows:
+        lines.append("| Verdict | Cell | Over in | " + " | ".join(profiles) + " |")
+        lines.append("|---|---|---|" + "---:|" * len(profiles))
+        for title, e, store in rows:
+            lines.append(f"| {title} | {cell_label(e['cell'], store)} | {'+'.join(e['over'])} | "
+                         + " | ".join(f"{e['deltas'][p]:+.3f}%" for p in profiles) + " |")
+    else:
+        lines.append("No cell is over the gate in any profile.")
+    if combined["problems"]:
+        lines += ["", "Problems:", ""] + [f"- {p}" for p in combined["problems"]]
+    if results and all(r.get("paths") for r in results.values()):
+        paths = ordered_paths(next(iter(results.values()))["cells"])
+        lines += ["", "Path means, change in host instructions per guest step:", ""]
+        lines.append("| Path | " + " | ".join(results) + " |")
+        lines.append("|---|" + "---:|" * len(results))
+        for path in paths:
+            vals = [f"{r['paths'][path]['delta']:+.3f}%" if path in r["paths"] else "-"
+                    for r in results.values()]
+            lines.append(f"| {PATH_LABELS.get(path, path)} | " + " | ".join(vals) + " |")
+    for p in profiles:
+        path = os.path.join(out, p, "report.txt")
+        if os.path.exists(path):
+            with open(path) as f:
+                text = f.read().rstrip("\n")
+            lines += ["", f"<details><summary>{p} profile report</summary>", "", "```text",
+                      text, "```", "", "</details>"]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_summary(args):
+    sys.stdout.write(summary_markdown(args.out))
+    return 0
+
+
 # --------------------------------------------------------------------------- running
+
+# Apple SDK sys/resource.h, rusage_info_v4: 16 bytes of uuid, then 35 u64s, of which
+# ri_instructions follows 29 (x86jit-bench/examples/dispatch_support/usage.rs reads the same).
+RUSAGE_INFO_V4 = 4
+RUSAGE_V4_WORDS = 2 + 35
+RUSAGE_V4_INSTRUCTIONS = 2 + 29
+
+
+def host_instructions():
+    """This process's retired host instructions (proc_pid_rusage ri_instructions), macOS only."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    buf = (ctypes.c_uint64 * RUSAGE_V4_WORDS)()
+    if libc.proc_pid_rusage(os.getpid(), RUSAGE_INFO_V4, ctypes.byref(buf)) != 0:
+        raise OSError(ctypes.get_errno(), "proc_pid_rusage")
+    return buf[RUSAGE_V4_INSTRUCTIONS]
+
+
+# Linux uapi include/uapi/linux/perf_event.h: struct perf_event_attr up to
+# PERF_ATTR_SIZE_VER0 (type, size, config, sample_period, sample_type, read_format, the
+# flag bitfield, wakeup_events, bp_type, config1), the event the benchmark examples open.
+PERF_ATTR_VER0 = "<IIQQQQQIIQ"
+PERF_TYPE_HARDWARE = 0
+PERF_COUNT_HW_INSTRUCTIONS = 1
+PERF_ATTR_PINNED = 1 << 2
+PERF_ATTR_EXCLUDE_KERNEL = 1 << 5
+PERF_ATTR_EXCLUDE_HV = 1 << 6
+PERF_FLAG_FD_CLOEXEC = 1 << 3
+# __NR_perf_event_open: oracles/linux-x86/syscall_64.tbl (298, x86-64) and
+# include/uapi/asm-generic/unistd.h (241, the generic table arm64 uses).
+PERF_EVENT_OPEN_NR = {"x86_64": 298, "aarch64": 241, "arm64": 241}
+PERF_EVENT_PARANOID = "/proc/sys/kernel/perf_event_paranoid"
+
+
+def perf_event_paranoid():
+    try:
+        with open(PERF_EVENT_PARANOID) as f:
+            return f.read().strip()
+    except OSError:
+        return "unreadable"
+
+
+def perf_instruction_counter(machine=None):
+    """A perf_event_open file descriptor counting this thread's user-mode instructions."""
+    machine = machine or platform.machine()
+    nr = PERF_EVENT_OPEN_NR.get(machine)
+    if nr is None:
+        raise OSError(f"no perf_event_open syscall number known for {machine}")
+    attr = ctypes.create_string_buffer(struct.pack(
+        PERF_ATTR_VER0, PERF_TYPE_HARDWARE, struct.calcsize(PERF_ATTR_VER0),
+        PERF_COUNT_HW_INSTRUCTIONS, 0, 0, 0,
+        PERF_ATTR_PINNED | PERF_ATTR_EXCLUDE_KERNEL | PERF_ATTR_EXCLUDE_HV, 0, 0, 0))
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    fd = libc.syscall(ctypes.c_long(nr), attr, ctypes.c_long(0), ctypes.c_long(-1),
+                      ctypes.c_long(-1), ctypes.c_long(PERF_FLAG_FD_CLOEXEC))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"perf_event_open(PERF_COUNT_HW_INSTRUCTIONS): {os.strerror(err)}")
+    return fd
+
+
+def read_counter(fd):
+    data = os.read(fd, 8)
+    if len(data) != 8:
+        # A pinned event that lost its counter reads as end of file.
+        raise OSError("the perf counter is in error state")
+    return struct.unpack("<Q", data)[0]
+
+
+def _check_counts(name, before, after):
+    print(f"counter-check: {name} {before} -> {after} (+{after - before})")
+    if after <= before:
+        print("counter-check: the host instruction counter does not count on this machine",
+              file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_counter_check(args):
+    """Exit 0 when the host instruction counter the benchmarks read counts; 2 when it does not
+    (another OS, or a virtual machine without the counter), so CI can stop before building."""
+    system = platform.system()
+    if system == "Linux":
+        paranoid = perf_event_paranoid()
+        print(f"counter-check: kernel.perf_event_paranoid {paranoid}")
+        try:
+            fd = perf_instruction_counter()
+            try:
+                before = read_counter(fd)
+                sum(range(2_000_000))
+                after = read_counter(fd)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            print(f"counter-check: {e} (kernel.perf_event_paranoid {paranoid}; a virtual "
+                  "machine without a PMU fails here too)", file=sys.stderr)
+            return 2
+        return _check_counts("perf_event_open instructions", before, after)
+    if system != "Darwin":
+        print(f"counter-check: no host instruction counter on {system}; "
+              "the campaign measures on macOS and Linux", file=sys.stderr)
+        return 2
+    try:
+        before = host_instructions()
+        sum(range(2_000_000))
+        after = host_instructions()
+    except (OSError, AttributeError) as e:
+        print(f"counter-check: proc_pid_rusage failed: {e}", file=sys.stderr)
+        return 2
+    if before == 0:
+        print(f"counter-check: ri_instructions {before} -> {after}")
+        print("counter-check: the host instruction counter does not count on this machine",
+              file=sys.stderr)
+        return 2
+    return _check_counts("ri_instructions", before, after)
 
 _libc = None
 
@@ -898,6 +1090,13 @@ def main(argv=None):
     p.add_argument("--gate", type=float, default=GATE)
     p.add_argument("--out", help="directory for combined.txt and combined.json")
     p.set_defaults(func=cmd_combine)
+
+    p = sub.add_parser("summary", help="Markdown job summary of a two-profile campaign")
+    p.add_argument("out", help="the campaign's --out directory")
+    p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser("counter-check", help="check that the host instruction counter counts")
+    p.set_defaults(func=cmd_counter_check)
 
     p = sub.add_parser("snapshot", help="copy a working tree's files")
     p.add_argument("tree")

@@ -1,0 +1,238 @@
+name: perf gate
+
+# The decision-23 performance campaign, scripts/perf-campaign.sh BASE CANDIDATE, on a
+# GitHub-hosted aarch64 Linux runner (backlog/docs/commands.md § Performance campaign in
+# CI). real16_loops and the store probe read host instructions through perf_event_open;
+# of the hosted runners only ubuntu-24.04-arm gives its VM a hardware PMU (the x86-64
+# Linux and the macOS runners count nothing). Started by hand (`gh workflow run
+# perf-gate.yml -f base=<sha> -f candidate=<sha>`) or by a push to a ci/perf-* branch, which measures the pushed
+# commit against its merge base with origin/main. The job fails on BLOCK and on a
+# problem, and passes with a warning on DRIFT.
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base commit or ref (empty: the candidate's merge base with origin/main)"
+        required: false
+        default: ""
+      candidate:
+        description: "Candidate commit or ref (empty: the commit of the ref the run is started on)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - "ci/perf-*"
+
+permissions:
+  contents: read
+
+# A newer push to a ci/perf-* branch cancels that branch's older run; dispatches of
+# different pairs run side by side, and a repeat of the same pair waits.
+concurrency:
+  group: perf-gate-${{ github.ref }}-${{ github.event_name == 'push' && 'push' || format('{0}-{1}', inputs.base, inputs.candidate) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  campaign:
+    name: perf campaign (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    # Four builds without cached binaries take most of it; a cached base halves that.
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: never
+      # The aarch64 Linux host cannot load the aarch64 FreeBSD std (flake.nix), as in ci.yml.
+      XJ_DEVSHELL: no-freebsd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: false
+          # Both sides are built from `git archive` of their commits.
+          fetch-depth: 0
+
+      # Before anything is built: the benchmarks need a counting PMU, and a virtual machine
+      # may not provide one. The image sets kernel.perf_event_paranoid to 4, which refuses
+      # perf_event_open to unprivileged processes; 2 allows a process to count its own
+      # user-mode instructions. The setting lasts for the job's later steps.
+      - name: Host instruction counter
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=2
+          python3 -B scripts/perf_campaign.py counter-check || {
+            echo '::error title=perf gate::perf_event_open does not count instructions on this runner; the campaign cannot measure here'
+            exit 2
+          }
+
+      - name: Resolve base and candidate
+        id: sides
+        env:
+          BASE_INPUT: ${{ inputs.base }}
+          CANDIDATE_INPUT: ${{ inputs.candidate }}
+        run: |
+          set -euo pipefail
+          resolve() {
+            git rev-parse --verify --quiet "$1^{commit}" \
+              || git rev-parse --verify --quiet "origin/$1^{commit}" \
+              || { git fetch --quiet --no-tags origin "$1" 2>/dev/null \
+                   && git rev-parse --verify --quiet "FETCH_HEAD^{commit}"; }
+          }
+          cand=${CANDIDATE_INPUT:-$GITHUB_SHA}
+          cand_sha=$(resolve "$cand") || { echo "::error title=perf gate::candidate '$cand' is not a commit"; exit 2; }
+          if [ -n "${BASE_INPUT:-}" ]; then
+            base_sha=$(resolve "$BASE_INPUT") || { echo "::error title=perf gate::base '$BASE_INPUT' is not a commit"; exit 2; }
+          else
+            base_sha=$(git merge-base origin/main "$cand_sha") || { echo '::error title=perf gate::no merge base with origin/main'; exit 2; }
+          fi
+          lock() { git show "$1:Cargo.lock" | shasum -a 256 | cut -c1-12; }
+          {
+            echo "base=$base_sha"
+            echo "candidate=$cand_sha"
+            echo "base_lock=$(lock "$base_sha")"
+            echo "candidate_lock=$(lock "$cand_sha")"
+            echo "cpus=$(nproc)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "X86JIT_PERF_CACHE=$RUNNER_TEMP/perf-cache"
+            echo "PERF_OUT=$RUNNER_TEMP/perf-out"
+          } >> "$GITHUB_ENV"
+          echo "base $base_sha, candidate $cand_sha, $(nproc) CPUs"
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        with:
+          nix_version: "2.29.2"
+          github_access_token: ""
+          enable_kvm: false
+
+      # The same entry as ci.yml's aarch64 test job.
+      - name: Restore Nix store
+        id: nix_cache
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-aarch64-no-freebsd-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-aarch64-no-freebsd-
+
+      - name: Dev shell
+        id: devshell
+        run: bash scripts/ci-gate.sh devshell
+
+      # As in ci.yml, only main saves: other refs restore main's entry.
+      - name: Save Nix store
+        if: ${{ github.ref == 'refs/heads/main' && steps.devshell.outcome == 'success' && steps.nix_cache.outputs.hit-primary-key != 'true' }}
+        uses: nix-community/cache-nix-action/save@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: ${{ steps.nix_cache.outputs.primary-key }}
+
+      # The campaign names its cached binaries <commit>-<profile>-<toolchain>, the
+      # toolchain being a hash of `rustc -vV`; the cache keys name the same three things
+      # and the side's Cargo.lock.
+      - name: Toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          tc=$(nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command rustc -vV | shasum -a 256 | cut -c1-12)
+          echo "hash=$tc" >> "$GITHUB_OUTPUT"
+          echo "toolchain $tc"
+
+      - name: Restore base binaries
+        id: base_bin
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-release-${{ steps.toolchain.outputs.hash }}
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-perf-${{ steps.toolchain.outputs.hash }}
+          key: perf-bin-v1-${{ runner.os }}-aarch64-${{ steps.sides.outputs.base }}-${{ steps.toolchain.outputs.hash }}-${{ steps.sides.outputs.base_lock }}
+
+      # A candidate that later lands on main is a later campaign's base.
+      - name: Restore candidate binaries
+        id: cand_bin
+        if: ${{ steps.sides.outputs.candidate != steps.sides.outputs.base }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-release-${{ steps.toolchain.outputs.hash }}
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-perf-${{ steps.toolchain.outputs.hash }}
+          key: perf-bin-v1-${{ runner.os }}-aarch64-${{ steps.sides.outputs.candidate }}-${{ steps.toolchain.outputs.hash }}-${{ steps.sides.outputs.candidate_lock }}
+
+      # Builds what the caches did not hold, at normal priority with every CPU: nothing
+      # else runs on the runner.
+      - name: Build
+        id: build
+        env:
+          BASE: ${{ steps.sides.outputs.base }}
+          CANDIDATE: ${{ steps.sides.outputs.candidate }}
+          CPUS: ${{ steps.sides.outputs.cpus }}
+        run: |
+          nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command \
+            scripts/perf-campaign.sh --build-only --build-qos default --jobs "$CPUS" "$BASE" "$CANDIDATE"
+
+      # The binaries are a few tens of MB per commit, so every ref saves them; an entry
+      # saved on main serves every ref.
+      - name: Save base binaries
+        if: ${{ steps.build.outcome == 'success' && steps.base_bin.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-release-${{ steps.toolchain.outputs.hash }}
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.base }}-perf-${{ steps.toolchain.outputs.hash }}
+          key: ${{ steps.base_bin.outputs.cache-primary-key }}
+
+      - name: Save candidate binaries
+        if: ${{ steps.build.outcome == 'success' && steps.sides.outputs.candidate != steps.sides.outputs.base && steps.cand_bin.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-release-${{ steps.toolchain.outputs.hash }}
+            ${{ runner.temp }}/perf-cache/bin/${{ steps.sides.outputs.candidate }}-perf-${{ steps.toolchain.outputs.hash }}
+          key: ${{ steps.cand_bin.outputs.cache-primary-key }}
+
+      # Both sides come from the cache filled above, so this step only measures: the
+      # processes start with randomization off (`setarch <machine> -R`, which needs no
+      # privilege), one per CPU at once. The verdict step below turns the
+      # campaign's exit status into the job's.
+      - name: Campaign
+        id: campaign
+        env:
+          BASE: ${{ steps.sides.outputs.base }}
+          CANDIDATE: ${{ steps.sides.outputs.candidate }}
+          CPUS: ${{ steps.sides.outputs.cpus }}
+        run: |
+          mkdir -p "$PERF_OUT"
+          set +e
+          nix develop ".#$XJ_DEVSHELL" --no-update-lock-file --command \
+            scripts/perf-campaign.sh --out "$PERF_OUT" --build-qos default --jobs "$CPUS" \
+            --parallel "$CPUS" "$BASE" "$CANDIDATE" 2>&1 | tee "$PERF_OUT/campaign.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "campaign exit $status"
+
+      # Exit 0 pass, 1 block, 2 problem, 3 drift (scripts/perf-campaign.sh).
+      - name: Verdict
+        if: ${{ !cancelled() && steps.campaign.outcome == 'success' }}
+        env:
+          STATUS: ${{ steps.campaign.outputs.status }}
+        run: |
+          python3 -B scripts/perf_campaign.py summary "$PERF_OUT" >> "$GITHUB_STEP_SUMMARY"
+          case $STATUS in
+            0) echo '::notice title=perf gate::PASS in both profiles' ;;
+            3) echo '::warning title=perf gate::DRIFT: cells over the gate in one profile only (job summary); it does not block' ;;
+            1) echo '::error title=perf gate::BLOCK: cells over the gate in both profiles (job summary)'; exit 1 ;;
+            *) echo "::error title=perf gate::PROBLEM (campaign exit $STATUS): a build or measuring problem (job log)"; exit 1 ;;
+          esac
+
+      - name: Upload raw data and reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-gate-${{ steps.sides.outputs.base }}-${{ steps.sides.outputs.candidate }}
+          path: |
+            ${{ runner.temp }}/perf-out
+            ${{ runner.temp }}/perf-cache/build-*.log
+            ${{ runner.temp }}/perf-cache/bin/*/meta.txt
+          if-no-files-found: ignore
+          retention-days: 30

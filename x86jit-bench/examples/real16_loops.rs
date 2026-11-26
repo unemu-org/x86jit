@@ -1,7 +1,8 @@
 //! Real16 embedder loop benchmarks using only the core API. Release mode;
 //! warmup excluded. Arguments: step-count divisor (default 1), rounds (default 5).
 //! Each round rotates the nine paths; every sample starts from a fresh VM.
-//! macOS reports proc_pid_rusage host instructions around each measured region.
+//! Host instructions around each measured region: proc_pid_rusage on macOS,
+//! perf_event_open on Linux, zero elsewhere.
 use std::time::Instant;
 use x86jit_core::{
     BlockKey, CachedBlock, CpuMode, CpuModel, CpuState, ExecutionProfile, Exit, IrBlock, IrOp,
@@ -30,7 +31,86 @@ fn instructions() -> u64 {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// Linux: perf_event_open(2) on the calling thread, user-mode instructions only. The
+// measured code runs on this thread (the interpreter; no compile worker). Layout and
+// constants: Linux uapi include/uapi/linux/perf_event.h, struct perf_event_attr up to
+// PERF_ATTR_SIZE_VER0 (64 bytes), the flag bitfield following read_format.
+#[cfg(target_os = "linux")]
+fn instructions() -> u64 {
+    #[repr(C)]
+    struct PerfEventAttr {
+        kind: u32,
+        size: u32,
+        config: u64,
+        sample_period: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup_events: u32,
+        bp_type: u32,
+        config1: u64,
+    }
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+    const PINNED: u64 = 1 << 2;
+    const EXCLUDE_KERNEL: u64 = 1 << 5;
+    const EXCLUDE_HV: u64 = 1 << 6;
+    const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 1 << 3;
+    thread_local! {
+        static COUNTER: libc::c_int = {
+            let attr = PerfEventAttr {
+                kind: PERF_TYPE_HARDWARE,
+                size: std::mem::size_of::<PerfEventAttr>() as u32,
+                config: PERF_COUNT_HW_INSTRUCTIONS,
+                sample_period: 0,
+                sample_type: 0,
+                read_format: 0,
+                flags: PINNED | EXCLUDE_KERNEL | EXCLUDE_HV,
+                wakeup_events: 0,
+                bp_type: 0,
+                config1: 0,
+            };
+            // SAFETY: attr is a complete VER0 perf_event_attr that outlives the call;
+            // pid 0 and cpu -1 select the calling thread on any CPU, group -1 none.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    &attr as *const PerfEventAttr,
+                    0 as libc::pid_t,
+                    -1 as libc::c_int,
+                    -1 as libc::c_int,
+                    PERF_FLAG_FD_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_else(|_| "unreadable".into());
+                panic!(
+                    "host instruction counter unavailable: perf_event_open(PERF_COUNT_HW_INSTRUCTIONS): {} \
+                     (kernel.perf_event_paranoid {paranoid}; no PMU in a virtual machine also fails here)",
+                    std::io::Error::last_os_error()
+                );
+            }
+            fd as libc::c_int
+        };
+    }
+    COUNTER.with(|&fd| {
+        let mut count = 0u64;
+        // SAFETY: reads at most 8 bytes into a live u64.
+        let n = unsafe { libc::read(fd, (&mut count as *mut u64).cast(), 8) };
+        // A pinned event that lost its counter reads as end of file.
+        assert_eq!(
+            n,
+            8,
+            "host instruction counter unreadable: {}",
+            std::io::Error::last_os_error()
+        );
+        count
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn instructions() -> u64 {
     0
 }

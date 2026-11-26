@@ -373,5 +373,106 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(Path(dest, "a.rs").read_text(), "edited")
 
 
+class SummaryTests(unittest.TestCase):
+    def write(self, d, release, perf, rstore=None, pstore=None):
+        results = {}
+        for name, cells, store in (("release", release, rstore), ("perf", perf, pstore)):
+            r = profile_result(cells, store)
+            r["paths"] = pc.path_means(r["cells"])
+            r["meta"] = {"base": "aaaa1111 (/tmp/bin/a)", "candidate": "bbbb2222 (/tmp/bin/b)",
+                         "processes": 3, "aslr": "off"}
+            os.makedirs(Path(d, name))
+            Path(d, name, "analysis.json").write_text(json.dumps(r))
+            Path(d, name, "report.txt").write_text(f"VERDICT: {name}\n")
+            results[name] = r
+        Path(d, "combined.json").write_text(json.dumps(pc.combine(results)))
+
+    def test_summary_lists_blocking_and_drift_cells_and_path_means(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"alu|legacy-i286": 0.8, "load|legacy-i286": 0.7},
+                       {"alu|legacy-i286": 0.6, "load|legacy-i286": 0.1},
+                       {"8 single off": 0.9}, {"8 single off": 0.1})
+            text = pc.summary_markdown(d)
+        self.assertIn("## Perf gate: BLOCK (exit 1)", text)
+        self.assertIn("Base `aaaa1111`, candidate `bbbb2222`", text)
+        self.assertIn("| BLOCK | `alu` I286 | release+perf | +0.800% | +0.600% |", text)
+        self.assertIn("| DRIFT | `load` I286 | release | +0.700% | +0.100% |", text)
+        self.assertIn("| DRIFT | store 8 single off | release | +0.900% | +0.100% |", text)
+        self.assertIn("| I286 | +0.750% | +0.350% |", text)
+        self.assertIn("<details><summary>perf profile report</summary>", text)
+        self.assertNotIn("/tmp/bin", text)
+
+    def test_summary_of_a_pass_and_of_a_run_without_a_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"alu|legacy-i286": 0.1}, {"alu|legacy-i286": 0.2})
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(pc.main(["summary", d]), 0)
+            self.assertIn("## Perf gate: PASS (exit 0)", out.getvalue())
+            self.assertIn("No cell is over the gate in any profile.", out.getvalue())
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIn("## Perf gate: no verdict", pc.summary_markdown(d))
+
+
+class CounterCheckTests(unittest.TestCase):
+    def check(self, system, **patches):
+        saved = {"system": pc.platform.system}
+        pc.platform.system = lambda: system
+        for name, value in patches.items():
+            saved[name] = getattr(pc, name)
+            setattr(pc, name, value)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                status = pc.main(["counter-check"])
+        finally:
+            pc.platform.system = saved.pop("system")
+            for name, value in saved.items():
+                setattr(pc, name, value)
+        return status, out.getvalue(), err.getvalue()
+
+    def test_no_counter_outside_macos_and_linux(self):
+        status, _, err = self.check("FreeBSD")
+        self.assertEqual(status, 2)
+        self.assertIn("no host instruction counter on FreeBSD", err)
+
+    def test_linux_without_perf_events_is_a_problem(self):
+        def refuse(machine=None):
+            raise OSError(2, "perf_event_open(PERF_COUNT_HW_INSTRUCTIONS): No such file")
+        status, out, err = self.check("Linux", perf_instruction_counter=refuse,
+                                      perf_event_paranoid=lambda: "4")
+        self.assertEqual(status, 2)
+        self.assertIn("kernel.perf_event_paranoid 4", out)
+        self.assertIn("No such file", err)
+
+    def test_linux_counter_that_does_not_move_is_a_problem(self):
+        r, w = os.pipe()
+        os.close(w)
+        reads = iter([5, 5])
+        status, _, err = self.check("Linux", perf_instruction_counter=lambda: r,
+                                    read_counter=lambda fd: next(reads),
+                                    perf_event_paranoid=lambda: "2")
+        self.assertEqual(status, 2)
+        self.assertIn("does not count", err)
+
+    def test_linux_counter_that_counts_passes(self):
+        r, w = os.pipe()
+        os.close(w)
+        reads = iter([5, 9_000_000])
+        status, out, _ = self.check("Linux", perf_instruction_counter=lambda: r,
+                                    read_counter=lambda fd: next(reads),
+                                    perf_event_paranoid=lambda: "2")
+        self.assertEqual(status, 0)
+        self.assertIn("perf_event_open instructions 5 -> 9000000", out)
+
+    def test_the_counter_is_read_from_the_v4_layout(self):
+        # Apple SDK sys/resource.h, rusage_info_v4: 16-byte uuid, 29 u64s, ri_instructions.
+        self.assertEqual(pc.RUSAGE_V4_INSTRUCTIONS * 8, 16 + 29 * 8)
+
+    def test_the_perf_attr_is_the_ver0_layout(self):
+        # Linux uapi linux/perf_event.h: PERF_ATTR_SIZE_VER0 is 64.
+        self.assertEqual(pc.struct.calcsize(pc.PERF_ATTR_VER0), 64)
+        self.assertEqual(pc.PERF_EVENT_OPEN_NR["x86_64"], 298)
+
+
 if __name__ == "__main__":
     unittest.main()
