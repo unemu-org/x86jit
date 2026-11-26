@@ -3991,3 +3991,325 @@ Cargo on PATH (Rust 1.98.1), no compiler wrapper, LLVM's Darwin linker and the
 same flags for candidate profiles. Both baseline profiles came from the campaign
 cache. Reproduce with `scripts/perf-campaign.sh --build-qos default --cache CACHE
 --out OUT 6289334b TREE`; retain both profile reports and `combined.json`.
+
+
+## Interpreter ceiling study — MEASURED 2026-11-26
+
+xj-uv7: where the Machine-profile interpreter spends host instructions per guest step, and how
+much each planned speed item can remove at most. Tree `c2cc119e` (main `e21be823` plus the
+segmented-class change under review), default release profile with
+`debug = "line-tables-only"` added for symbols. Host: the Apple-silicon workstation of the
+earlier sections, macOS 27, rustc 1.98.1 (the embedder copy built with its pinned 1.99.1).
+Other work kept the load average at 15–46 throughout, so every conclusion below rests on host
+instruction counts (`proc_pid_rusage` `ri_instructions`, as the benches report them) and on
+sample shares. No wall time is used.
+
+### Method — MEASURED / READ
+
+- **Counts.** `real16_loops` at divisor 8, three rounds, one path per process (a throwaway path
+  filter); `machine32_loops` at 100,000 iterations, three rounds, I80386; and a PC-class
+  embedder's CPU speed-ceiling example, run in a copy of the embedder's tree whose CPU
+  dependency pointed at this worktree, with a host-instruction count added around each
+  10,000,000-instruction sample (three samples). The embedder's own tree was not built or
+  edited; the copy is deleted.
+- **Samples.** `xctrace` Time Profiler attached for 3 s (2,000–3,400 samples at 1 kHz) to a
+  one-path process inside its measured loop. Each leaf PC was symbolized with its inline chain
+  (`atos -i` against a dSYM) and assigned to a category by its innermost frames and source
+  lines. Shares are of time, not of instructions. Where an experiment measures the same cost
+  the two agree within a few points (block lookup: 14–20 % of samples, 12–16 % of host
+  instructions).
+- **Ceiling experiments.** Throwaway runtime switches, one relaxed atomic load per site, so
+  that one binary measures every variant; each delta is against the same binary with every
+  switch off. The switches cost +8 to +60 host instructions per step against the clean build
+  (mostly the memo bookkeeping in the dispatcher), so percentages are of a slightly heavier
+  step. Everything was reverted; no code change is left.
+- **The experiments.** *REP-restart scan off*: skip the twenty-bit dispatcher's per-block
+  `find_map` over the block's ops for a repeated string. *Static links*: an eight-entry
+  direct-mapped memo of `(physical, Arc<IrBlock>, walk)` in the dispatcher, consulted before
+  the shared cache, not filled by blocks that end in an indirect `Jump`; *RET target* is the
+  extra gain when those blocks are memoized too. Both still clone and drop the `Arc`, as a
+  linked successor would hold one. *SMC/dirty poll off*: skip the per-block `DISPATCH_DIRTY`
+  load and `handle_smc`. *Exit-request poll off*: skip the per-block `EXIT_REQUESTED | NMI_EDGE`
+  test (xj-193.2). *Per-instruction checks off*: `StepContext::boundary` keeps only its budget
+  test and skips the pending-I/O, exit-word and IRQ tests at every `InsnStart`. *Dead flags*:
+  the JIT's backward flag liveness applied at lift to the interpreter's IR, live-out all at
+  block end, and once more with live-out none (an upper bound for "also at block exit").
+  *One more op*: four extra `ReadReg` ops after every `InsnStart`, divided by four: the
+  marginal cost of the cheapest op. *Protected scan off*: skip `execute_instruction`'s
+  per-instruction `ir.ops.iter().all(supported)`. *Fast hash*: a multiply-rotate hasher in
+  place of SipHash for the Checked, Flat32/Segmented and paged block and context maps. *Paged
+  lane*: `register_effects` also accepts `SegmentedAddress` and `Flat32Address` with
+  `access: Execute`, the near-target check of a JMP or CALL in protected code; measured both
+  as a switch and as a plain build.
+
+### Baseline: host instructions per guest step — MEASURED
+
+`real16_loops`, clean build (the I8088 is within 0.5 % of the I8086 or below it, the NEC paths track the
+Intel twenty-bit paths, the I80386 equals the I80286, and the A20-off paths equal their A20-on
+paths):
+
+| Workload | Alias | I8086 | I8088 | I80286 | I8086 / alias |
+|---|---:|---:|---:|---:|---:|
+| `alu` | 357 | 400 | 400 | 365 | +12.0 % |
+| `load` | 469 | 576 | 552 | 482 | +22.7 % |
+| `store` | 433 | 545 | 545 | 449 | +26.0 % |
+| `push-pop` | 491 | 674 | 656 | 491 | +37.3 % |
+| `call-ret` | 844 | 1166 | 1142 | 922 | +38.2 % |
+| `dos-mixed` | 453 | 666 | 646 | 442 | +47.1 % |
+| `rep-movsw` | 187 | 419 | 357 | 187 | +124.0 % |
+| `ip-boundary-64` | 344 | 403 | 402 | 380 | +17.1 % |
+| `straight-line` (divisor 1) | 408 | 514 | 516 | 379 | +26.1 % |
+| `smc-next-64` | 9079 | 18878 | 18888 | 3700 | +107.9 % |
+| `smc-rmw-64` | 9186 | 19599 | 19593 | 4961 | +113.4 % |
+
+`machine32_loops`, I80386, five guest instructions per iteration (`segmix` 25):
+
+| Path | `register` | `memory` | `callret` | `farcall` | `farseg` | `segmix` |
+|---|---:|---:|---:|---:|---:|---:|
+| `machine-real16` | 338 | 415 | 647 | — | — | — |
+| `machine-protected32` (Flat32) | 823 | 953 | 1656 | 844 | — | — |
+| `machine-protected16` (Segmented) | 821 | 948 | 1641 | 836 | 2224 | 1365 |
+| `machine-protected32seg` (Segmented) | 819 | 946 | 1638 | 839 | 2237 | 1367 |
+| `machine-paged32` | 1055 | 1369 | 2465 | 1123 | — | — |
+| `machine-paged16` | 1053 | 1364 | 2448 | 1117 | 3103 | 1899 |
+| `machine-paged-v86` | 1055 | 1385 | 2483 | 1019 | 2653 | 1756 |
+| `application-interp32` | 319 | 333 | 495 | — | — | — |
+| `application-jit32` | 18 | 42 | 68 | — | — | — |
+
+The CPL 3 paths equal their CPL 0 paths within 1 %. The same five register instructions cost
+338 host instructions in real mode and 819–823 in every unpaged protected class: the
+protected walk, not the guest work, is the difference.
+
+The PC-class embedder's ceiling ROM (INC, ADD, XOR, DEC and a near JMP on registers, devices
+attached and clocked), host instructions per retired instruction, median of three samples:
+
+| Board class | real16 | protected16 | protected32 | flat32 | paged32 | flat-paged32 | paged-v86 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 80286 board | 377 | **3045** | — | — | — | — | — |
+| 386 ISA | 377 | — | 860 | 866 | **2046** | 2057 | 1728 |
+| 486 ISA | 377 | — | 1034 | 1040 | 2311 | 2322 | 1977 |
+
+Its user-mode cases on the 386: `flat32-cpl3` 1104, `flat-paged32-cpl3` 1745,
+`flat-paged32-cpl3-farcall` 2005, `paged-protected16-cpl3` 2116, `paged-v86-iopl0` 2337.
+
+### Where the time goes — MEASURED (percent of samples)
+
+The stepped real-mode walk (alias, twenty-bit, and the I80286/I80386 Direct class):
+
+| Category | `alu` alias | `alu` I8086 | `alu` I286 | `store` alias | `store` I8086 | `push-pop` I8086 | `call-ret` alias | `call-ret` I8086 | `call-ret` I286 | `dos-mixed` I8086 | `dos-mixed` I286 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Op dispatch: walk loop, `match`, op fields | 21 | 17 | 17 | 17 | 16 | 17 | 16 | 13 | 11 | 15 | 17 |
+| Register and temporary access | 14 | 13 | 15 | 6 | 5 | 12 | 6 | 5 | 5 | 14 | 13 |
+| ALU results and flags | 13 | 10 | 11 | 14 | 9 | 12 | 5 | 9 | 5 | 12 | 14 |
+| Memory access path | · | · | 1 | 9 | 15 | 17 | 10 | 13 | 11 | 17 | 18 |
+| Control-transfer helpers | 2 | 2 | 2 | 2 | 2 | 1 | 3 | 1 | 3 | 2 | 2 |
+| Instruction boundary: budget, pending state, exit word, `InsnStart` | 16 | 15 | 16 | 13 | 12 | 9 | 8 | 7 | 6 | 10 | 11 |
+| Walk entry/exit, lockstep bracket included | 10 | 11 | 12 | 12 | 12 | 6 | 17 | 17 | 20 | 8 | 6 |
+| Block lookup: shared cache, locks, `Arc` | 16 | 15 | 16 | 20 | 14 | 9 | 26 | 20 | 23 | 10 | 10 |
+| Dispatcher loop | 4 | 4 | 6 | 5 | 3 | 2 | 6 | 6 | 10 | 3 | 4 |
+| Block end: SMC/dirty poll | 2 | 2 | 2 | 2 | 2 | 1 | 3 | 3 | 4 | 1 | 1 |
+| Block end: twenty-bit REP-restart scan | · | 8 | · | · | 7 | 11 | · | 7 | · | 6 | · |
+| Other | 1 | 1 | 3 | 1 | 3 | 1 | 1 | 1 | 2 | 3 | 4 |
+
+The protected and paged walks (`machine32_loops` `register` unless named, and the embedder's
+ceiling cases):
+
+| Category | real16 | protected32 | protected16 | paged32 | `segmix` paged V86 | embedder 286 real16 | embedder 286 protected16 | embedder 386 flat32 | embedder 386 paged32 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Op dispatch: walk loop, `match`, op fields | 15 | 5 | 5 | 4 | 3 | 16 | 4 | 9 | 5 |
+| Register and temporary access | 15 | 6 | 6 | 4 | 4 | 16 | 5 | 9 | 3 |
+| ALU results and flags | 13 | 6 | 6 | 4 | 2 | 10 | 1 | 6 | 3 |
+| Memory access path | 2 | 2 | 2 | 4 | 9 | 4 | 8 | 3 | 4 |
+| Instruction boundary | 19 | 1 | 1 | 1 | · | 16 | · | 1 | · |
+| Walk entry/exit | 13 | 2 | 2 | 3 | 5 | 9 | 1 | 3 | 4 |
+| Protected walk: per-instruction restart and IR scans | · | 56 | 55 | 46 | 33 | · | 13 | 46 | 21 |
+| Block lookup: shared cache, locks, `Arc` | 13 | 6 | 4 | 7 | 6 | 13 | · | 4 | 4 |
+| Block lookup: SipHash of block and context keys | · | 9 | 9 | 15 | 9 | · | 13 | 9 | 8 |
+| Dispatcher loop | 6 | 4 | 4 | 3 | 2 | 9 | 7 | 4 | 2 |
+| Block end: SMC/dirty poll | 2 | 2 | 2 | 1 | 1 | 2 | 1 | 1 | 1 |
+| Decode and lift | · | · | · | · | · | · | 17 | · | · |
+| Other | 2 | 2 | 3 | 7 | 25 | 7 | 31 | 4 | 45 |
+
+- **Real mode.** No single cost dominates. The walk itself (op dispatch, register access, ALU
+  and flags) is 27–48 %, the memory path up to 18 %, the per-instruction boundary 6–16 %, and
+  the per-block overhead (walk entry/exit, lookup, dispatcher loop, polls, the twenty-bit scan)
+  30–55 %, the high end on one-instruction blocks (`call-ret`: CALL, LOOP and RET each end a
+  block).
+- **Protected and paged.** `execute_instructions` and `paging::execute_ordinary` run each
+  instruction as its own `execute_instruction` → `walk_instruction` → `walk_ops` call. Per
+  instruction that is a `position` scan for the next `InsnStart`, an
+  `ops.iter().all(supported)` scan (`register_effects` and `fast_instruction` on paged
+  blocks), a checkpoint and task-switch preamble, a lockstep bracket, an executor test per op
+  (`machine_specific`), and the exit-word and dirty-code tests between instructions. The block
+  and context maps (`LegacyBlockKey`, `LegacyContextStamp`) hash with SipHash.
+- **Embedder 286 protected16.** The 80286 never gets the Segmented class (`legacy.rs`: only
+  `CpuGeneration::I386` qualifies), so its protected mode is Checked: one-instruction blocks,
+  the instruction bytes fetched and decoded again on every hit (`Execution::resolve`, decode
+  17 % of samples), a SipHash lookup, and the one-instruction walk. Its "other" is copies and
+  allocation in that path.
+- **Embedder 386 paged32.** The loop's near JMP lowers to a `Jump` after either
+  `SegmentedAddress { access: Execute }` (non-flat code segment) or
+  `Flat32Address { access: Execute }` (`flat-paged32`). `register_effects` lists neither, so that instruction takes
+  `execute_with_retry`, the two-phase paged transaction, which clones `CpuState` twice
+  (`interp/legacy/paging.rs`: the preview and `before_commit`). Those clones and their copies
+  are 34 % of the samples ("other" 45 %). `machine32_loops` ends its loop with JNZ (`Branch`),
+  which is listed: 1055 there against 2046 here.
+- **Twenty-bit memory.** Every RAM byte goes through a one-byte transfer: a region lookup
+  (`region_at`), an MMIO-part test (`CpuState::mmio_part`, not inlined) and a write
+  observation per byte. That is the remaining `push-pop`, `call-ret` and `rep-movsw` gap to the
+  alias.
+- **SMC.** Twenty-bit `smc-next-64`: decode 13 %, lift 7 %, allocator (`libsystem_malloc`)
+  24 %, cache insert and code-span maps (SipHash, page counts) about 10 %; it relifts a block
+  of up to 16 instructions after every store. I80286 `smc-next-64`: decode 35 %, the walk 14 %;
+  its retained SMC pages relift one Checked instruction.
+
+### What each item removes — MEASURED (host instructions per guest step)
+
+Real mode, the switch build (I80386 within 1 of I80286 in every cell). "All" is every switch
+of the first round together, the RET memo included:
+
+| Workload | Path | Step | REP-restart scan | Static links (.27) | RET target (.30) | SMC/dirty poll | Exit poll (xj-193.2) | Per-instruction checks | Dead flags (.28) | … live-out none | One more op | All |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `alu` | alias | 365 | 0 | −50 (−13.8 %) | 0 | −8 | 0 | −21 (−5.7 %) | −16 (−4.4 %) | −16 | +28 | −95 (−26.0 %) |
+| `alu` | I8086 | 412 | −29 (−7.0 %) | −52 (−12.6 %) | 0 | −9 | 0 | −21 (−5.1 %) | −16 (−4.0 %) | −16 | +31 | −127 (−30.9 %) |
+| `alu` | I80286 | 383 | 0 | −55 (−14.4 %) | 0 | −9 | 0 | −21 (−5.5 %) | −16 (−4.2 %) | −16 | +25 | −102 (−26.7 %) |
+| `load` | alias | 478 | 0 | −67 (−14.0 %) | 0 | −11 | 0 | −21 (−4.4 %) | −11 (−2.3 %) | −11 | +28 | −109 (−22.8 %) |
+| `load` | I8086 | 590 | −38 (−6.4 %) | −69 (−11.8 %) | 0 | −12 | 0 | −20 (−3.4 %) | −11 (−1.9 %) | −11 | +31 | −152 (−25.8 %) |
+| `load` | I80286 | 505 | 0 | −74 (−14.6 %) | 0 | −12 | 0 | −21 (−4.2 %) | −11 (−2.2 %) | −11 | +25 | −119 (−23.5 %) |
+| `store` | alias | 442 | 0 | −67 (−15.2 %) | 0 | −11 | 0 | −21 (−4.7 %) | 0 | 0 | +28 | −98 (−22.2 %) |
+| `store` | I8086 | 559 | −34 (−6.1 %) | −70 (−12.4 %) | 0 | −12 | 0 | −20 (−3.6 %) | 0 | 0 | +31 | −137 (−24.5 %) |
+| `store` | I80286 | 472 | 0 | −74 (−15.6 %) | 0 | −12 | 0 | −21 (−4.5 %) | 0 | 0 | +25 | −108 (−22.8 %) |
+| `push-pop` | alias | 498 | 0 | −50 (−10.1 %) | 0 | −8 | 0 | −21 (−4.2 %) | 0 | 0 | +28 | −79 (−15.8 %) |
+| `push-pop` | I8086 | 686 | −51 (−7.4 %) | −53 (−7.7 %) | 0 | −9 | 0 | −21 (−3.0 %) | 0 | 0 | +31 | −134 (−19.5 %) |
+| `push-pop` | I80286 | 509 | 0 | −55 (−10.8 %) | 0 | −9 | 0 | −21 (−4.2 %) | 0 | 0 | +25 | −86 (−17.0 %) |
+| `call-ret` | alias | 863 | 0 | −126 (−14.6 %) | −75 (−8.7 %) | −32 (−3.7 %) | 0 | −19 (−2.2 %) | 0 | 0 | +28 | −252 (−29.2 %) |
+| `call-ret` | I8086 | 1198 | −70 (−5.8 %) | −130 (−10.8 %) | −79 (−6.6 %) | −35 (−2.9 %) | −4 | −20 (−1.7 %) | 0 | 0 | +31 | −339 (−28.3 %) |
+| `call-ret` | I80286 | 983 | 0 | −136 (−13.9 %) | −85 (−8.6 %) | −35 (−3.5 %) | −4 | −21 (−2.1 %) | 0 | 0 | +25 | −281 (−28.6 %) |
+| `dos-mixed` | alias | 460 | 0 | −23 (−5.0 %) | −9 (−1.9 %) | −6 | 0 | −21 (−4.6 %) | −8 (−1.7 %) | −11 | +25 | −67 (−14.7 %) |
+| `dos-mixed` | I8086 | 680 | −43 (−6.4 %) | −46 (−6.8 %) | +8 | −11 | 0 | −22 (−3.3 %) | −8 (−1.2 %) | −10 | +28 | −129 (−19.0 %) |
+| `dos-mixed` | I80286 | 456 | 0 | −23 (−5.1 %) | −10 (−2.1 %) | −6 | 0 | −21 (−4.6 %) | −8 (−1.7 %) | −11 | +23 | −72 (−15.8 %) |
+| `ip-boundary-64` | alias | 355 | 0 | −72 (−20.2 %) | 0 | −13 | 0 | −21 (−5.9 %) | 0 | −6 | +28 | −113 (−31.7 %) |
+| `ip-boundary-64` | I8086 | 419 | −20 (−4.8 %) | −75 (−17.9 %) | 0 | −14 | −2 | −21 (−5.0 %) | 0 | −6 | +31 | −139 (−33.1 %) |
+| `ip-boundary-64` | I80286 | 407 | 0 | −79 (−19.4 %) | 0 | −14 | 0 | −21 (−5.1 %) | 0 | −6 | +25 | −122 (−29.9 %) |
+| `rep-movsw` | all paths | 189 / 423 | 0 | 0 | 0 | 0 | 0 | −19 / −20 | 0 | 0 | 0 | −19 / −20 |
+
+The embedder's real16 ceiling moves the same way: static links −45 of 377 (−12 %),
+per-instruction checks −19, dead flags −15 (−23 with live-out none), SMC/dirty poll −7,
+exit poll −1, all of them together 377 → 282 (−25 %). They barely reach its protected, flat
+and paged cases (−7..−23 there, from the SMC/dirty poll and dead flags only).
+
+Protected and paged walks, `machine32_loops`, the third switch build:
+
+| Workload | Path | Step | Protected scan | Fast hash | Both |
+|---|---|---:|---:|---:|---:|
+| `register` | protected32, protected16, protected32seg | 853–858 | −64 | −75 | −139 (−16.2 %) |
+| `register` | paged32, paged16, paged32seg, paged V86 | 1088–1092 | −64 | −135 | −199 (−18.2 %) |
+| `memory` | protected | 980–987 | −69 | −75 | −143 (−14.6 %) |
+| `memory` | paged and V86 | 1398–1420 | −69 | −135 | −203 (−14.5 %) |
+| `callret` | protected | 1719–1737 | −90 | −224 | −314 (−18.2 %) |
+| `callret` | paged and V86 | 2533–2570 | −90 | −404 | −495 (−19.4 %) |
+| `farcall` | protected / paged | 870–877 / 1055–1160 | −35 | −75 / −135 | −110 / −170 (−12.6 / −15 %) |
+| `segmix` | protected16, protected32seg / paged | 1403–1406 / 1794–1931 | −70 | −89 / −160 | −160 / −233 (−11.4 / −12.5 %) |
+| any | `machine-real16` | 355–691 | 0 | 0 | 0 |
+
+The embedder's ceiling cases, the same two switches in its copy: fast hash −72..−74 on
+protected32 and flat32, −131..−160 on the paged and V86 cases, −368 (−12 %) on the 80286
+protected16; protected scan −64..−102. Their sum (additive in `machine32_loops`) is about
+−10..−16 % on every protected case.
+
+The paged lane, measured on its own: `register_effects` accepting `SegmentedAddress` and
+`Flat32Address` with `access: Execute`, built into the embedder copy against its clean
+baseline (the other cases move −8..−12 between the two builds, the build-to-build noise of
+this comparison):
+
+| Case | 386 before → after | 486 before → after |
+|---|---:|---:|
+| `paged32` | 2046 → 1098 (−46.3 %) | 2310 → 1294 (−44.0 %) |
+| `flat-paged32` | 2057 → 1105 (−46.3 %) | 2322 → 1301 (−44.0 %) |
+| `flat-paged32-cpl3` | 1745 → 1554 (−11.0 %) | 1976 → 1772 (−10.3 %) |
+| `flat-paged32-cpl3-farcall` | 2005 → 1809 (−9.8 %) | 2252 → 2043 (−9.3 %) |
+| `paged-protected16-cpl3` | 2116 → 1922 (−9.2 %) | 2384 → 2176 (−8.7 %) |
+| `paged-v86`, `paged-v86-iopl0` | −0.4..−0.5 % | −0.4 % |
+
+After it the embedder's paged32 costs what `machine32_loops` paged32 costs (1098 against
+1055). Whether a segmented or flat near target may skip the transaction (its CS limit check
+can fault; the comment on `register_effects` says the walk keeps that check and its rollback)
+is for the change to show; the measurement only bounds the gain.
+
+### The planned items — MEASURED / ASSUMED
+
+Gains are host instructions per guest step at most, from the experiments above; "ASSUMED"
+marks a derived estimate.
+
+| Item | Ceiling where it applies | Evidence | Confidence |
+|---|---|---|---|
+| .27 link interpreted blocks | real mode: −12..−15 % (`alu`, `load`, `store`), −18..−20 % (`ip-boundary-64`), −8..−11 % (`push-pop`), −11..−15 % (`call-ret`, static targets), −5..−7 % (`dos-mixed`); embedder real16 −12 %. Protected and paged lookups are a different structure (see the hash below) | memo experiment; the shared-cache lookup costs about 190–220 host instructions per block (`code_lifetime` and shard `RwLock` reads, an `Arc` clone and drop of the lifetime and of the block, a hash probe) | high for the ceiling; a real link also needs an invalidation check the memo skipped |
+| .26 cheaper op dispatch | the cheapest op (`ReadReg`) costs 25 (I80286/I80386), 28 (alias), 31 (twenty-bit) host instructions; ops per guest instruction 4.3 (`alu`), 5–6 (`load`, `store`), 6.5–7.5 (`push-pop`), 7.7–9 (`call-ret`), so dispatch and operand plumbing are 20–32 % of a step. With a compact pre-resolved encoding at about 10 per op (ASSUMED): −12..−22 % in real mode | one-more-op experiment; IR dumps; sample shares (op dispatch plus register access 16–35 %) | medium for the share, low for the post-change floor |
+| xj-50w.16 twenty-bit cost over the alias | the per-block REP-restart `find_map` is −20..−70 per step (−5..−7.5 % on every twenty-bit workload). The rest of the gap is the byte-wise memory path: after the scan, I8086 over alias is +5 % (`alu`), +15 % (`load`), +19 % (`store`), +27 % (`push-pop`), +31 % (`call-ret`), +38 % (`dos-mixed`), +124 % (`rep-movsw`); SMC is +108 %, the 16-instruction relift with its allocations | REP-restart experiment; twenty-bit profiles | high (scan), medium (byte path) |
+| .30 return-address prediction | `call-ret` −6.6..−8.7 % beyond the static links, `dos-mixed` −2 %, zero elsewhere; needs .27 | RET part of the memo | medium-high |
+| .29 fused ops | LOOP is already one op (`LoopCx`); a near CALL is 8–10 ops, RET 9–12, PUSH and POP 6–8. Removing four to six dispatches per stack instruction at about 20 each (ASSUMED): `push-pop` −10..−13 %, `call-ret` −8..−11 %, `dos-mixed` −4..−7 %, `alu` about 0. CMP/TEST+Jcc fusion keeps its flag writes unless .28 proves them dead | per-op cost, IR dumps | low-medium |
+| .28 live flags only, also at block exit | in-block liveness: −16 (`alu`, −4.4 %), −11 (`load`), −8 (`dos-mixed`), 0 (`store`, `push-pop`, `call-ret`); live-out none adds 0..−6 more. The interpreter computes flags eagerly per op and has no block-exit materialization step, so the earlier ~30 cycles per instruction at block exit does not apply to this walk. It must also recover exact flags at budget cuts and faults inside a block | dead-flag experiments | high; small |
+| xj-193.2 per-block exit-request poll | 0..−5 per step (≤ 0.5 %) on every Machine and alias workload, the embedder included | exit-poll experiment | high; negligible |
+| .31 cheaper decode/lift for cold and self-modifying code | steady loops 0. `smc-next-64`: twenty-bit 18,888 against 3,700 on the I80286, so relifting one instruction on SMC pages as the Direct class does could remove up to 80 % there; decode is 35 % of the I80286's SMC step | baselines, SMC profiles | medium |
+
+### Not on the list — MEASURED
+
+1. **The protected and paged walk restarts per instruction.** On the same five register
+   instructions, real mode costs 338 and every unpaged protected class 819–823, paged
+   1050–1055, embedder flat32 866. 33–56 % of the protected and paged samples (46–56 % of
+   the unpaged ones) are the per-instruction restart (`execute_instructions` → `execute_instruction` → `walk_instruction`), its IR scans
+   (`position`, `all(supported)`, `register_effects`, `fast_instruction`) and the per-op
+   executor test. Proving `supported` at lift alone is −35..−91 per step (−4..−7.5 %). One
+   pass over a proven block, as the real-mode Shared walk does, has a ceiling near the
+   real-mode step: about −55..−60 % unpaged (ASSUMED from 823 → 338, less whatever checks
+   protected mode keeps).
+2. **SipHash on the protected block and context maps.** A cheap hasher on
+   `Execution::{blocks, contexts}`, `flat32::State::blocks` and `paging::State::{contexts,
+   blocks}` is −75 per step unpaged and −135 paged (−9 % / −12 %), −224 / −404 on `callret`
+   (−13 % / −16 %).
+3. **The 80286 has no Segmented class.** Its protected mode is Checked: one-instruction
+   blocks, bytes fetched and decoded again on every hit, a SipHash lookup. The embedder's
+   80286 protected16 ceiling costs 3045 per instruction, 8.1× its real mode. The I80386
+   Segmented class runs the same kind of loop at 821–860, so extending it (decision-27 scope)
+   is worth about −72 % there (ASSUMED from those two figures), more with items 1 and 2.
+4. **The paged register lane misses near JMP and CALL targets in protected code.**
+   `SegmentedAddress` and `Flat32Address` with `access: Execute` send the instruction through
+   the two-phase transaction with two `CpuState` clones. Accepting them halves the embedder's
+   paged ceilings (−44..−46 % on `paged32` and `flat-paged32`, −9..−11 % on its user-mode
+   paged cases), the largest measured single change of the study.
+5. **Per-instruction boundary checks.** `StepContext::boundary` tests the pending MMIO and
+   port state, the exit word and the IRQ condition at every `InsnStart`: 19–22 per guest
+   step on every stepped workload (2–6 %, −10 % on `rep-movsw`, where each iteration pays it).
+   Deciding these once per block when the budget covers the block, and on the cold paths that
+   change them, keeps the budget test only.
+6. **Per-block SMC/dirty poll.** −6..−36 per step (1.3–3.7 %), the larger on one-instruction
+   blocks. It is a load plus an out-of-line `handle_smc` call per block, separate from the
+   exit-word test of xj-193.2.
+7. **The lockstep bracket.** `lockstep::begin_with_trace` and the `Bracket` drop are 1.2–3.6 %
+   of the samples on the alias and the I80286/I80386 Direct class and 0.1–1.2 % on the
+   twenty-bit walk, with no trace configured.
+
+### Recommended order
+
+1. **Twenty-bit REP-restart flag at lift** (part of xj-50w.16): −5..−7.5 % on every
+   twenty-bit workload for a per-block bool.
+2. **The paged register lane for near targets** (new): −44..−46 % on the embedder's paged
+   ceilings, −9..−11 % on its user-mode paged cases; a few lines, if the target check keeps its
+   fault behaviour.
+3. **A cheap hasher and lift-time `supported` for the protected maps and walk** (new):
+   −8..−19 % on every protected, paged and V86 workload, the embedder's included; small and
+   local.
+4. **The Segmented class for the 80286** (new): about −72 % on 80286 protected mode.
+5. **One pass over proven Flat32, Segmented and paged blocks** (new): up to about −55 % on all
+   32-bit and V86 protected work, the largest remaining item for those regimes.
+6. **.27 links, then .30** on top: −5..−20 % in real mode and a further −7..−9 % on
+   call-heavy code.
+7. **Per-instruction boundary checks once per block** (new): −2..−6 %.
+8. **.26 compact dispatch**, then **.29** in the same encoding: −12..−22 % (ASSUMED), the
+   largest real-mode item after .27 but the largest change.
+9. **The twenty-bit word path** (rest of xj-50w.16): up to the +15..+124 % memory-path gap.
+10. **.28**, the SMC/dirty poll, **.31** and **xj-193.2**: each under 5 % on these workloads
+    (.31 matters only for self-modifying code; xj-193.2 is ≤ 0.5 % and can be dropped).
+
+Items 1–5 are where the PC-class embedder's ceilings are lowest (80286 protected 3045, 386
+paged 2046); items 6–8 lift real mode, which is already the cheapest regime.
